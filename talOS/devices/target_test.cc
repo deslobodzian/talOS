@@ -847,88 +847,112 @@ struct Operator {
   bool saw_stale = false;
 };
 
-// A button held through any break in what the operator saw must be released
-// once, in the new view, before the lane drives again.
-// REQ-SAFE-31: started with the input held, it never arms
-// REQ-SAFE-13: a held input is released once after each break, then re-arms
-TEST(OperatorArming, HeldInputWaitsForNeutralAfterEveryBreak) {
-  enum class Break { kDisable, kReboot, kEvaluationGap, kUnsampledRecovery };
-  for (const Break disturbance :
-       {Break::kDisable, Break::kReboot, Break::kEvaluationGap,
-        Break::kUnsampledRecovery}) {
-    SCOPED_TRACE(static_cast<int>(disturbance));
-    auto sim = Sim::FromToml(std::string{kRobotToml} +
-                             "[subsystems.operator]\nperiod_us = 20000\n");
-    auto& op = sim.add<Operator>("operator");
-    auto& lift = sim.add<Consumer<Goal>>("lift");
-    SimHardware hw{sim};
-    hw.enable();
-    const auto packet = [](std::uint32_t flags, bool held) {
-      auto data = DsPacket(flags);
-      data.joysticks[0].connected = true;
-      data.joysticks[0].button_count = 1;
-      data.joysticks[0].buttons = held ? 1u : 0u;
-      return data;
-    };
-    const auto active = [&] {
-      const auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
-      return envelope.has_value() && envelope->active != 0;
-    };
+// The Operator above driving the lift, its button held or not.
+class OperatorArmingTest : public ::testing::Test {
+ protected:
+  OperatorArmingTest() { hw.enable(); }
 
-    // Held from startup: never armed.
-    hw.set_driver_station(packet(kTeleop, true));
-    sim.step(60ms);
-    EXPECT_FALSE(active());
-    EXPECT_EQ(lift.seen, std::nullopt);
-    hw.set_driver_station(packet(kTeleop, false));
+  // A teleop (or `flags`) packet with joystick 0's button 1 held or not.
+  void Packet(std::uint32_t flags, bool held) {
+    auto data = DsPacket(flags);
+    data.joysticks[0].connected = true;
+    data.joysticks[0].button_count = 1;
+    data.joysticks[0].buttons = held ? 1u : 0u;
+    hw.set_driver_station(data);
+  }
+  bool Active() {
+    const auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+    return envelope.has_value() && envelope->active != 0;
+  }
+  // Neutral from startup, then held: armed and driving at 140 ms.
+  void ArmAndHold() {
+    Packet(kTeleop, false);
+    sim.step(100ms);
+    Packet(kTeleop, true);
     sim.step(40ms);
-    hw.set_driver_station(packet(kTeleop, true));
-    sim.step(40ms);
-    ASSERT_TRUE(active());
+    ASSERT_TRUE(Active());
     ASSERT_NE(lift.seen, std::nullopt);
-
-    switch (disturbance) {
-      case Break::kDisable:
-        hw.set_driver_station(packet(0, true));
-        sim.step(40ms);
-        hw.set_driver_station(packet(kTeleop, true));
-        break;
-      case Break::kReboot:
-        hw.reboot();
-        break;
-      case Break::kEvaluationGap:  // the Driver Station stays fresh
-        op.paused = true;
-        sim.step(120ms);
-        op.paused = false;
-        break;
-      case Break::kUnsampledRecovery: {
-        // Silent just past command_timeout_us, stale only between two of
-        // the operator's 20 ms evaluations (the last packet near 150 ms and
-        // the next near 255 ms, evaluations at 240 and 260 ms): the same
-        // generation and boot come back.
-        const std::uint64_t generation = DriverStationGeneration(sim);
-        sim.step(10ms);
-        op.saw_stale = false;
-        hw.stop_driver_station();
-        sim.step(102ms);
-        hw.set_driver_station(packet(kTeleop, true));
-        sim.step(20ms);
-        ASSERT_FALSE(op.saw_stale);
-        ASSERT_EQ(DriverStationGeneration(sim), generation);
-        break;
-      }
-    }
+  }
+  // After a break with the button still held: released until the operator
+  // lets go once, then driving again on the next hold.
+  void ExpectReleasedUntilNeutralThenDriving() {
     sim.step(60ms);
-    EXPECT_FALSE(active());
+    EXPECT_FALSE(Active());
     EXPECT_EQ(lift.seen, std::nullopt);
-
-    hw.set_driver_station(packet(kTeleop, false));
+    Packet(kTeleop, false);
     sim.step(40ms);
-    hw.set_driver_station(packet(kTeleop, true));
+    Packet(kTeleop, true);
     sim.step(40ms);
-    EXPECT_TRUE(active());
+    EXPECT_TRUE(Active());
     EXPECT_NE(lift.seen, std::nullopt);
   }
+
+  Sim sim = Sim::FromToml(std::string{kRobotToml} +
+                          "[subsystems.operator]\nperiod_us = 20000\n");
+  Operator& op = sim.add<Operator>("operator");
+  Consumer<Goal>& lift = sim.add<Consumer<Goal>>("lift");
+  SimHardware hw{sim};
+};
+
+// REQ-SAFE-31: started with the input held, it never arms; one release arms
+// it.
+TEST_F(OperatorArmingTest, InputHeldFromStartupNeverDrivesUntilReleased) {
+  Packet(kTeleop, true);
+  sim.step(60ms);
+  EXPECT_FALSE(Active());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  Packet(kTeleop, false);
+  sim.step(40ms);
+  Packet(kTeleop, true);
+  sim.step(40ms);
+  EXPECT_TRUE(Active());
+  EXPECT_NE(lift.seen, std::nullopt);
+}
+
+// REQ-SAFE-13: a button held through a disable is released once, in the new
+// view, before the lane drives again.
+TEST_F(OperatorArmingTest, InputHeldThroughADisableWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  Packet(0, true);
+  sim.step(40ms);
+  Packet(kTeleop, true);
+  ExpectReleasedUntilNeutralThenDriving();
+}
+
+// REQ-SAFE-13: held through a gateway reboot (a new boot's generation).
+TEST_F(OperatorArmingTest, InputHeldThroughAGatewayRebootWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  hw.reboot();
+  ExpectReleasedUntilNeutralThenDriving();
+}
+
+// REQ-SAFE-13: held while the producer's evaluations stopped for longer than
+// command_timeout_us; the Driver Station stays fresh throughout.
+TEST_F(OperatorArmingTest, InputHeldThroughAnEvaluationGapWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  op.paused = true;
+  sim.step(120ms);
+  op.paused = false;
+  ExpectReleasedUntilNeutralThenDriving();
+}
+
+// REQ-SAFE-13: held through a stale spell no evaluation sampled. Silent just
+// past command_timeout_us, stale only between two of the operator's 20 ms
+// evaluations (the last packet near 150 ms and the next near 255 ms,
+// evaluations at 240 and 260 ms): the same generation and boot come back.
+TEST_F(OperatorArmingTest,
+       InputHeldThroughAnUnsampledStaleSpellWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  const std::uint64_t generation = DriverStationGeneration(sim);
+  sim.step(10ms);
+  op.saw_stale = false;
+  hw.stop_driver_station();
+  sim.step(102ms);
+  Packet(kTeleop, true);
+  sim.step(20ms);
+  ASSERT_FALSE(op.saw_stale);
+  ASSERT_EQ(DriverStationGeneration(sim), generation);
+  ExpectReleasedUntilNeutralThenDriving();
 }
 
 // The live-target gate at the devices flush (RULES.md 1): a tick drives only
