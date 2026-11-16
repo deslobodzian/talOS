@@ -215,6 +215,8 @@ RecordedSession::RecordedSession(const std::string& path,
       }
     }
     ReadLog read{.path = log_path};
+    // Whether a record of a dispatch has been read from this file.
+    bool dispatched = false;
     for (const Registration& registration : reader.manifest()) {
       if (registration.kind == SourceKind::TIMER && registration.armed &&
           registration.id < timer_offset.size()) {
@@ -301,6 +303,7 @@ RecordedSession::RecordedSession(const std::string& path,
         }
       }
       last_now = header.now_ns;
+      if (header.dispatch_index != 0) dispatched = true;
       end_ = std::max(end_, MonotonicTime::from_nanos(header.now_ns));
       if (own_log) {
         replayed_end = std::max(replayed_end.value_or(reader.start_time()),
@@ -374,8 +377,19 @@ RecordedSession::RecordedSession(const std::string& path,
                       record.payload.end());
         continue;
       }
+      // A send made before the loop's first dispatch (a constructor's) is
+      // recorded with no clock (LogWriter::send from an empty Context:
+      // now_ns and publish_time_ns 0), but the transport stamped it with
+      // the loop's origin (monotonic_now() before the run), as its readers
+      // recorded: a restarted writer's initial message is fed at its
+      // restart, not at the session's start.
+      const bool before_first_dispatch = send && !dispatched &&
+                                         header.dispatch_index == 0 &&
+                                         header.now_ns == 0;
       const MonotonicTime time =
-          MonotonicTime::from_nanos(header.publish_time_ns);
+          before_first_dispatch
+              ? reader.start_time()
+              : MonotonicTime::from_nanos(header.publish_time_ns);
       const auto [it, inserted] =
           seen.try_emplace({topic, header.sequence}, messages_.size());
       if (!inserted) {
