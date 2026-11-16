@@ -306,7 +306,13 @@ them), and the first `--describe-only` after it 0.4 to 0.5 s idle
 member that exits nonzero, or is still running after 60 s (then its process group is killed),
 is a `deploy: warning: warm-up: <name>: ...` line and the command still
 succeeds: install's [graph check](#graph-check), and rollback's launch, judge
-the members. A member that detaches a process
+the members. The warm-up's last line counts what finished, members that
+exited 0 and native libraries whose load returned (failing or not), and
+names each member that did not with how it ended:
+`deploy: warmed 4 of 5 members and 40 of 58 native libraries in 6.2 s; not
+warmed: vision (exited 1), native libraries (killed by SIGSEGV)`;
+when everything finished it reads `deploy: warmed 5 members and 58 native
+libraries in 9.8 s`. A member that detaches a process
 into a new session (`setsid()`) leaves the group that kill reaches. Stopping
 `deploy.sh` during the warm-up (Ctrl-C, SIGTERM, SIGHUP) kills the running
 member's process group, selects nothing and exits 1. Linux has no such
