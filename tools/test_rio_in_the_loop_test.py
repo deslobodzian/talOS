@@ -1,10 +1,12 @@
-"""Tests for tools/test_rio_in_the_loop.py's subject config.
+"""Tests for tools/test_rio_in_the_loop.py's subject config and bring-up.
 
 REQ-DEV-06: the RoboRIO-in-the-loop run (the real RoboRIO program against
 the Bazel-built bridge and node) judges the subject on the robot's own
 settings. subject_config narrows the bench config to the subject's
 subsystem by text; it must keep every robot table, and refuse a table it
-does not know rather than drop it unseen.
+does not know rather than drop it unseen. Each scenario's RoboRIO program
+must start unconfigured: one that restored a saved configuration enables on
+it and refuses the bridge's push of another, so the run is refused.
 """
 
 import os
@@ -65,6 +67,17 @@ class SubjectConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"\[can_buses\.rio\]"):
             self.narrow(text)
         self.assertFalse(os.path.exists(self.dir / "subject.toml"))
+
+
+class NothingRestoredTest(unittest.TestCase):
+    def test_refuses_a_program_that_restored_a_configuration(self):
+        saved = Path("talos_config.bin")
+        line = ("banner\n[13967.318] hardware gateway config={} "
+                "commissioned={} (waiting for config push)\n")
+        rio.check_nothing_restored(line.format(0, 0), saved)
+        with self.assertRaisesRegex(RuntimeError, "9664505023115029081"):
+            rio.check_nothing_restored(
+                line.format(9664505023115029081, 1), saved)
 
 
 if __name__ == "__main__":

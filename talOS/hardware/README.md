@@ -839,7 +839,12 @@ reaches the RoboRIO), and the RoboRIO program alone must neutralize every
 output on its first tick at or past the last command's expiry, which the
 harness reads from the RoboRIO's own States at the relay. That scenario
 runs `robot.toml` whole, so the bench's undriven devices must read neutral
-too. It runs Gradle `--offline`, so the first run needs one online
+too. Each `--wpilib` scenario first deletes the simulation's saved
+configuration (`controller_processor/rio/talos_config.bin`) and fails if the
+program still restores one: a restored configuration configures the
+gateway before the bridge's push, the simulated Driver Station enables on
+it, and a push of the other configuration is then refused while enabled. It
+runs Gradle `--offline`, so the first run needs one online
 `./gradlew simulateNative` beforehand. CI's `rio-in-the-loop` job runs
 `--wpilib` on Linux with `--output-dir`, which puts each scenario's log
 directory under a directory it keeps when the run fails. Ports 5802/5803

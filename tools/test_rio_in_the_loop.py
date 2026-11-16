@@ -77,6 +77,19 @@ LOOP_INTERVAL_LIMIT_US = 250_000
 # the wrong reason.
 WPILIB_STARTUP_TIMEOUT = 180
 
+# Where the RoboRIO program, under desktop simulation, saves each acknowledged
+# configuration and restores it from at startup (Robot.cpp kConfigPath,
+# relative to the Gradle project simulateNative runs in). A restored
+# configuration makes the gateway configured before the bridge's push lands,
+# so TALOS_SIM_DS=auto enables on it, and a push of another configuration is
+# then refused while enabled: the scenarios run two configurations (narrowed
+# and whole), so each would inherit the last one's. Every WPILib scenario
+# therefore starts the program with none saved, and refuses one that
+# restored anything anyway (the startup line's "config=", 0 for none).
+SIM_SAVED_CONFIG = "controller_processor/rio/talos_config.bin"
+GATEWAY_STARTED = re.compile(r"hardware gateway config=(\d+) commissioned=\d+ "
+                             r"\(waiting for config push\)")
+
 SUMMARY = re.compile(r"^sim_(?:gateway|robot):.*$", re.MULTILINE)
 
 # RioLog's periodic timing report and LoopWatchdog's stall report (through
@@ -227,6 +240,8 @@ class Scenario:
         environment["TALOS_SIM_RUN_MS"] = str(seconds * 1000)
         if disable_after_ms is not None:
             environment["TALOS_SIM_DS_DISABLE_AFTER_MS"] = str(disable_after_ms)
+        # A fresh RoboRIO: nothing to restore (SIM_SAVED_CONFIG).
+        (self.root / SIM_SAVED_CONFIG).unlink(missing_ok=True)
 
         gateway = self.start(
             "gateway",
@@ -242,7 +257,9 @@ class Scenario:
         )
         # The robot prints this once its gateway socket is open, which is the
         # only moment it is safe to start the bridge.
-        self.wait_for("hardware gateway config=", gateway)
+        self.wait_for("(waiting for config push)", gateway)
+        check_nothing_restored((self.output / "gateway.txt").read_text(),
+                               self.root / SIM_SAVED_CONFIG)
         return gateway
 
     def wait_for(self, needle, process, others=()):
@@ -418,6 +435,25 @@ def check_ports():
     for port in (5802, 5803):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.bind(("0.0.0.0", port))
+
+
+def check_nothing_restored(gateway_text, saved):
+    """Refuse a RoboRIO program that restored a saved configuration.
+
+    Each scenario's bring-up (start disabled, the bridge's push lands, then
+    the Driver Station enables) holds only for a program that starts
+    unconfigured; see SIM_SAVED_CONFIG.
+    """
+    started = GATEWAY_STARTED.search(gateway_text)
+    if started is None:
+        raise RuntimeError("the RoboRIO program printed no startup line "
+                           "naming the configuration it restored")
+    restored = int(started.group(1))
+    if restored != 0:
+        raise RuntimeError(
+            f"the RoboRIO program restored configuration {restored} at "
+            f"startup, though {saved} was removed first: it would enable on "
+            f"that configuration and refuse the bridge's push of another")
 
 
 def robot_settings(config, *keys):
