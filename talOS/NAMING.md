@@ -58,13 +58,20 @@ subsystem's target policy, and an `hw` topic written by anything but the
 hardware bridge (the launcher's `hardware_node` roster entry, whatever binary
 `[robot] hardware_node` names and whatever name it describes), except
 `/hw/request/<node>`, which only `<node>`'s devices-layer flush writes (its
-endpoint carries the `hardware_request` attribute; RULES.md 2). Independently
+endpoint carries the `hardware_request` attribute; RULES.md 2). Under
+`[robot] require_target_coverage` (which `commissioned = true` sets) it also
+rejects a node whose hardware request carries the `untargeted_outputs`
+attribute (its constructor called `talos::AllowUntargetedOutputs`, so its
+outputs drive with no live target; REQ-SAFE-42). Independently
 of the lint, which `--allow-graph-errors` overrides (accepted only with
 `--sim`; [launcher](launcher/README.md#two-phases)), a node's `publish` and
 `publish_bytes` (C++, or Python through `talOS/node_api`) refuse any topic
 under `/hw/request`, remapped or not, at construction. A topic nobody reads, a
-policy lane nobody writes yet, or a topic whose owner is not a node in the
-session, is a warning.
+policy lane nobody writes yet, a topic whose owner is not a node in the
+session, a node whose hardware request carries `untargeted_outputs` without
+that coverage, or a node that writes its hardware request but reads no target
+lane and has not opted out (its outputs never drive; REQ-SAFE-41), is a
+warning; each of the last two names the node.
 
 Examples: `/drivetrain/state`, `/drivetrain/target/teleop` (written by the
 operator interface), `/drivetrain/target/auto`, `/hw/state`,
