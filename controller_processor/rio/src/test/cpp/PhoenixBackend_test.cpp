@@ -1036,6 +1036,33 @@ TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
       motor.GetFaultField(false).GetAppliedUpdateFrequency().value(), 50);
 }
 
+// A Phoenix Follower copies its leader's output status signal, whose rate is
+// the follower's update rate and must be no slower than 20 Hz
+// (controls/Follower.hpp). A master outputs DutyCycle in duty-cycle mode and
+// MotorVoltage in the voltage-based ones; at the slowest status rate config
+// load allows (status_hz 8 at the 500 ms timeout cap) both must still reach
+// 20 Hz.
+TEST_F(PhoenixBackendRecovery, AMasterWithFollowersSendsItsOutputAt20Hz) {
+  EnsureHal();
+  for (const double status_hz : {200.0, 8.0}) {
+    SCOPED_TRACE(status_hz);
+    hw::Config config;
+    config.status_hz = status_hz;
+    config.command_timeout_us = 500'000;
+    auto follower = TestMotor(20, "follower", 2);
+    follower.master_id = 10;
+    config.motors = {TestMotor(10, "lift", 1), follower};
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+    auto& master = Motor(backend, 0);
+    EXPECT_GE(master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    EXPECT_GE(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+  }
+}
+
 // The TalonFX enforces its limit pins itself, so the motor config must reach
 // the device: a normally closed forward switch, a disabled reverse one.
 TEST_F(PhoenixBackendRecovery, AppliesConfiguredHardwareLimitSwitches) {

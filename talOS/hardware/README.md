@@ -302,8 +302,12 @@ sample reads 0 while its output sends no pulse.
 CAN bus load and measured sensor age must be checked on the actual bus before
 choosing production frequencies. Motion feedback requests the manifest status
 rate; motor voltage, stator current and fault field request
-`min(status_hz, 50)` Hz. Phoenix applies the highest requested rate to signals
-sharing a frame: with the pinned vendor library, voltage/current still apply
+`min(status_hz, 50)` Hz. A motor another motor follows also requests its duty
+cycle, and its voltage and duty cycle at no less than 20 Hz: a Phoenix
+follower copies its master's output signal (DutyCycle for duty-cycle
+requests, MotorVoltage for the others) at that signal's rate, which must be
+no slower than 20 Hz, while `status_hz` may be lower. Phoenix applies the
+highest requested rate to signals sharing a frame: with the pinned vendor library, voltage/current still apply
 at 200 Hz alongside 200 Hz motion feedback, while the fault field applies at
 50 Hz. See [vendor signal frequency semantics](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html#changing-update-frequency).
 The backend then calls
