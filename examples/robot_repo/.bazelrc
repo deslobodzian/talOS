@@ -1,24 +1,12 @@
-# The lines of talOS's own .bazelrc that a robot repository needs: a
-# .bazelrc belongs to the workspace, so none of talOS's reach a repository
-# that depends on it. Keep them equal to talOS's.
-common --enable_bzlmod
-# Never generate empty __init__.py files in runfiles (talOS's .bazelrc says
-# why).
-common --incompatible_default_to_explicit_init_py
+# talOS's build flags (C++23, the Python runfiles flags, the sanitizer,
+# release and test-lane configs), imported from the talOS checkout that
+# MODULE.bazel's local_path_override names, by the same path (with talOS as
+# the git submodule talos/: `import %workspace%/talos/talos.bazelrc`).
+# //:talos_pin_test fails when the two name different checkouts.
+import %workspace%/../../talos.bazelrc
 
-build --enable_platform_specific_config
+# This repository's own flags follow.
 
-# Parallel Python tests share runfiles directories; no __pycache__ races.
-build --test_env=PYTHONDONTWRITEBYTECODE=1
-
-# talOS is C++23. The exec configuration (the config resolver that the bundle
-# and manifest actions run) ignores --cxxopt, so it gets --host_cxxopt too.
-build:linux --cxxopt=-std=c++23 --cxxopt=-O3
-build:linux --host_cxxopt=-std=c++23 --host_cxxopt=-O3
-# Needed once a node links OpenCV (a camera): talOS's .bazelrc says why.
-build:linux --@@libjpeg_turbo+//:noasm=yes
-build:macos --cxxopt=-std=c++23 --cxxopt=-O3
-build:macos --cxxopt=-fexperimental-library --linkopt=-fexperimental-library
-build:macos --host_cxxopt=-std=c++23 --host_cxxopt=-O3
-build:macos --host_cxxopt=-fexperimental-library --host_linkopt=-fexperimental-library
-build:macos --macos_minimum_os=13.4 --host_macos_minimum_os=13.4
+# `bazel build --config=release //:robot_bundle` records this repository's
+# git revision in the bundle (talOS's status script, run from here).
+build:release --workspace_status_command=../../tools/workspace_status.sh

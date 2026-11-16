@@ -170,6 +170,6 @@ bazel run @hedron_compile_commands//:refresh_all
 | Symptom | Fix |
 |---|---|
 | `std::format` / `jthread` not found, `-std=c++23` unknown | GCC < 13. Install `g++-13`+ or use a supported distro |
-| macOS libc++ / availability errors | `-fexperimental-library` and min macOS 13.4 are already in `.bazelrc`; update Xcode CLT |
+| macOS libc++ / availability errors | `-fexperimental-library` and min macOS 13.4 are already in `talos.bazelrc` (which `.bazelrc` imports); update Xcode CLT |
 | RIO build can't find the roboRIO compiler | `cd controller_processor/rio && ./gradlew installRoboRioToolchain` (JDK 17). Setup also recognizes a toolchain from the WPILib installer; see `tools/setup.sh` for discovery paths |
 | `$'\r': command not found`, `/usr/bin/env: 'bash\r'` | CRLF working copy. WSL/Linux: `git ls-files -z -- '*.sh' '*gradlew' \| xargs -0 sed -i 's/\r$//'` |

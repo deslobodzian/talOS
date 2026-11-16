@@ -653,9 +653,11 @@ class NewSubsystemTest(unittest.TestCase):
     def test_standalone_from_a_robot_repository_builds_against_talos(self):
         # --standalone run from a robot repository writes a repository that
         # overrides @talos with the talOS checkout the tool runs from (the
-        # robot's talos/ submodule) and takes its .bazelrc, not the robot
-        # repository's; when that talOS is Bazel's copy of a fetched module
-        # (under an output base's external/), it refuses and writes nothing.
+        # robot's talos/ submodule) and whose .bazelrc imports that
+        # checkout's talos.bazelrc by the same path, not the robot
+        # repository's flags (TODO TOOLS-10: no copied talOS-only lines);
+        # when that talOS is Bazel's copy of a fetched module (under an
+        # output base's external/), it refuses and writes nothing.
         def write(path, text):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
@@ -676,7 +678,7 @@ class NewSubsystemTest(unittest.TestCase):
                                          "robot")):
                     write(os.path.join(directory, "MODULE.bazel"),
                           f'module(name = "{name}")\n')
-                    write(os.path.join(directory, ".bazelrc"),
+                    write(os.path.join(directory, "talos.bazelrc"),
                           f"# {name}\n")
                     write(os.path.join(directory, ".bazelversion"), "8.4.2\n")
                 script = os.path.join(talos, "tools", "new_subsystem.py")
@@ -696,9 +698,6 @@ class NewSubsystemTest(unittest.TestCase):
                     self.assertFalse(os.path.exists(target), out.getvalue())
                     continue
                 self.assertEqual(status, 0, out.getvalue())
-                with open(os.path.join(target, ".bazelrc"),
-                          encoding="utf-8") as f:
-                    self.assertEqual(f.read(), "# talos\n")
                 with open(os.path.join(target, "MODULE.bazel"),
                           encoding="utf-8") as f:
                     (path,) = re.findall(
@@ -707,6 +706,15 @@ class NewSubsystemTest(unittest.TestCase):
                 self.assertEqual(
                     os.path.realpath(os.path.join(target, path)),
                     os.path.realpath(talos))
+                # Bazel's reading of the import: %workspace% is the new
+                # repository's root.
+                with open(os.path.join(target, ".bazelrc"),
+                          encoding="utf-8") as f:
+                    (imported,) = re.findall(r"^import (\S+)$", f.read(),
+                                             re.MULTILINE)
+                imported = imported.replace("%workspace%", target)
+                with open(imported, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "# talos\n", imported)
 
     # REQ-DEV-01
     def test_robot_repository_simulation_steps_run_the_simulation_config(self):

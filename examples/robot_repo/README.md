@@ -27,7 +27,7 @@ this fixture means saying there whether a robot repository gets the file.
 
 ```sh
 cd examples/robot_repo
-bazel test //...                       # graph test, node tests, sim smoke, Studio and session_report tests
+bazel test //...                       # graph test, node tests, sim smoke, Studio, pin and session_report tests
 bazel build //:robot_bundle            # the deployable bundle
 bazel run //:sim -- --duration-s 10    # the robot against the simulator
 bazel run //:sim -- --start-studio-bridge   # with Studio (below)
@@ -141,15 +141,34 @@ bridge`, and every talOS node (`teleop`, `telemetry`) in its subsystem file.
 Their defaults are labels of the main repository, which in a robot
 repository name nothing.
 
-## What it copies from talOS by hand
+## What it shares with talOS
 
-| Copied | From | Stale or missing |
+A `.bazelrc` belongs to the workspace Bazel runs in, so none of talOS's
+reaches a repository that depends on it. `.bazelrc` therefore imports the
+flags talOS's code needs from talOS's [`talos.bazelrc`](../../talos.bazelrc)
+(C++23 for the target and exec configurations, macOS's libc++ flags, the
+Python runfiles flags, libjpeg-turbo's `noasm`, and the `asan`, `tsan`,
+`release` and test-lane configs), from the checkout `MODULE.bazel`'s
+`local_path_override` names, by the same path: `../..` here,
+`%workspace%/talos/talos.bazelrc` with talOS as the git submodule `talos/`,
+an absolute path where `new_robot` had to write one. The repository's own
+flags go below the import. Bazel's `import` takes a path, never a label, so
+a talOS that `git_override` fetches has no file to import: such a
+repository commits a copy of that commit's `talos.bazelrc` and imports it.
+
+Two more things belong to the workspace and are kept equal by hand:
+
+| Kept equal | To | Stale |
 |---|---|---|
-| `.bazelrc`'s C++23 `--cxxopt` and `--host_cxxopt` lines (and macOS's `-fexperimental-library` and minimum OS) | talOS's `.bazelrc` | talOS stops compiling once it uses a newer language feature, or the config resolver the bundle and manifest actions run fails to build (exec configuration) |
-| `--incompatible_default_to_explicit_init_py`, `--test_env=PYTHONDONTWRITEBYTECODE=1` | talOS's `.bazelrc` | parallel Python tests can corrupt shared runfiles |
-| `build:linux --@@libjpeg_turbo+//:noasm=yes` | talOS's `.bazelrc` | a node linking OpenCV fails to load on x86-64 Linux |
 | `.bazelversion` | talOS's | a different Bazel can resolve the module graph differently |
 | `python.toolchain(python_version = "3.11", is_default = True)` | talOS's `MODULE.bazel` | the root module picks the interpreter, and talOS's 3.11 wheels run under another |
+
+`talos_pin_test` fails when `.bazelrc` imports no `talos.bazelrc`, or
+another checkout's than the one `@talos` is built from (for a fetched talOS,
+a copy whose text differs), when either row above differs from that
+talOS's, or when `--workspace_status_command` names no executable file. It
+reads that talOS's files directly, which Bazel does not track, so it runs
+every time (`external`); it runs no Bazel.
 
 Nothing is copied for talOS's patched toml++: talOS fetches it as its own
 patched archive. talOS's OpenCV patch is a `single_version_override`, which

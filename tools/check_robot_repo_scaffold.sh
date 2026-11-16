@@ -28,8 +28,8 @@
 #              `bazel build --nobuild //...`, which loads every package and
 #              fails if //... descends into talos/ (the .bazelignore
 #              new_robot writes keeps it out).
-# The copy's MODULE.bazel points @talos (and studio_web) at the talOS
-# checkout holding this script. BAZEL_FLAGs go to every `bazel run` and
+# The copy's MODULE.bazel points @talos (and studio_web), and its .bazelrc
+# its import of talos.bazelrc, at the talOS checkout holding this script. BAZEL_FLAGs go to every `bazel run` and
 # `bazel test` (tools/prepush.sh passes its --disk_cache and
 # --nocache_test_results; CI's disk cache comes from its bazelrc).
 #
@@ -115,6 +115,14 @@ reset_copy() {
     -e "s|^    path = \"\\.\\./\\.\\./bazel-bin/studio/dist\",\$|    path = \"$talos/bazel-bin/studio/dist\",|" \
     "$module" > "$module.new" && mv "$module.new" "$module" ||
     die "cannot rewrite $module"
+  # .bazelrc takes talOS's flags from the same checkout (talos_pin_test).
+  local rc="$copy/.bazelrc"
+  grep -qxF 'import %workspace%/../../talos.bazelrc' "$rc" &&
+    grep -qF -- '--workspace_status_command=../../tools/workspace_status.sh' "$rc" ||
+    die "$fixture/.bazelrc no longer imports talOS from ../..; update this script"
+  sed -e "s|^import %workspace%/\\.\\./\\.\\./talos\\.bazelrc\$|import $talos/talos.bazelrc|" \
+    -e "s|--workspace_status_command=\\.\\./\\.\\./tools/|--workspace_status_command=$talos/tools/|" \
+    "$rc" > "$rc.new" && mv "$rc.new" "$rc" || die "cannot rewrite $rc"
 }
 
 # [robot] require_target_coverage = true, and the empty [targets] policy
@@ -142,8 +150,8 @@ new_robot() {
     rm -rf "$fresh"
 }
 
-# talOS held at talos/ as a submodule is, the overrides pointed there, and
-# every package of //... loaded.
+# talOS held at talos/ as a submodule is, the overrides and .bazelrc's
+# import pointed there, and every package of //... loaded.
 as_submodule() {
   mkdir talos && git -C "$talos" archive HEAD | tar -xf - -C talos ||
     return 1
@@ -154,6 +162,11 @@ as_submodule() {
   grep -qxF '    path = "talos",' MODULE.bazel &&
     grep -qxF '    path = "talos/bazel-bin/studio/dist",' MODULE.bazel ||
     { echo "MODULE.bazel: no override to point at talos/" >&2; return 1; }
+  sed -e 's|^import .*/talos\.bazelrc$|import %workspace%/talos/talos.bazelrc|' \
+    -e 's|--workspace_status_command=.*/tools/workspace_status\.sh$|--workspace_status_command=talos/tools/workspace_status.sh|' \
+    .bazelrc > .bazelrc.new && mv .bazelrc.new .bazelrc || return 1
+  grep -qxF 'import %workspace%/talos/talos.bazelrc' .bazelrc ||
+    { echo ".bazelrc: no import of talos.bazelrc to point at talos/" >&2; return 1; }
   bazel build --nobuild ${bazel_flags[@]+"${bazel_flags[@]}"} //...
 }
 

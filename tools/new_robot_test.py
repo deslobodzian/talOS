@@ -317,6 +317,12 @@ studio_web(
 )
 '''
 
+FIXTURE_BAZELRC = '''# talOS's flags.
+import %workspace%/../../talos.bazelrc
+
+build:release --workspace_status_command=../../tools/workspace_status.sh
+'''
+
 FIXTURE_ROBOT = '''[robot]
 name = "robot_repo"
 hardware_node = "@talos//talOS/bridge:hardware_node"
@@ -376,6 +382,7 @@ def fake_talos(tmp, tracked=True):
     talos = os.path.join(tmp, "talos")
     fixture = os.path.join(talos, new_robot.FIXTURE)
     files = {
+        ".bazelrc": FIXTURE_BAZELRC,
         "MODULE.bazel": FIXTURE_MODULE,
         "robot.toml": FIXTURE_ROBOT,
         "robot_manifest.bzl": FIXTURE_MANIFEST,
@@ -421,9 +428,10 @@ class RobotRepositoryTest(unittest.TestCase):
             self.assertEqual(sorted(files), [
                 ".bazelignore", ".bazelrc", ".bazelversion", ".gitignore",
                 "BUILD.bazel",
-                "MODULE.bazel", "README.md", "robot.toml",
-                "robot_manifest.bzl", "studio_test.py",
-                "subsystems/telemetry.toml", "subsystems/teleop.toml"])
+                "MODULE.bazel", "README.md",
+                "robot.toml", "robot_manifest.bzl", "studio_test.py",
+                "subsystems/telemetry.toml", "subsystems/teleop.toml",
+                "talos_pin_test.py"])
             for path, action in new_robot.TEMPLATE.items():
                 if action == new_robot.COPY:
                     with open(os.path.join(fixture, path),
@@ -439,6 +447,14 @@ class RobotRepositoryTest(unittest.TestCase):
             self.assertEqual(
                 os.path.normpath(os.path.join(target, pages)),
                 os.path.join(talos, "bazel-bin", "studio", "dist"))
+            # .bazelrc takes talOS's flags and status script from the same
+            # checkout (talos_pin_test checks the import in the repository).
+            imported, script = re_bazelrc_paths(files[".bazelrc"])
+            self.assertEqual(os.path.normpath(imported.replace(
+                "%workspace%", target)), os.path.join(talos, "talos.bazelrc"))
+            self.assertEqual(
+                os.path.normpath(os.path.join(target, script)),
+                os.path.join(talos, "tools", "workspace_status.sh"))
             self.assertIn('name = "my_robot"', files["robot.toml"])
             for gone in ("roller", "gate"):
                 self.assertNotIn(gone, files["robot.toml"])
@@ -524,6 +540,13 @@ class RobotRepositoryTest(unittest.TestCase):
                          ("../talos", False))
         self.assertEqual(new_robot.talos_path("/home/a/talos", "/tmp/r"),
                          ("/home/a/talos", True))
+        # An absolute checkout is imported as itself: %workspace% before it
+        # would name a path under the repository.
+        self.assertEqual(
+            re_bazelrc_paths(new_robot.substitute(
+                ".bazelrc", FIXTURE_BAZELRC, "my_robot", "/home/a/talos")),
+            ("/home/a/talos/talos.bazelrc",
+             "/home/a/talos/tools/workspace_status.sh"))
 
     # REQ-DEV-23
     def test_a_write_that_fails_leaves_nothing_at_the_directory(self):
@@ -559,6 +582,14 @@ class RobotRepositoryTest(unittest.TestCase):
 
 def rel_path(base, path):
     return os.path.relpath(path, base).replace(os.sep, "/")
+
+
+def re_bazelrc_paths(bazelrc):
+    """The talos.bazelrc a .bazelrc imports and its status command."""
+    (imported,) = re.findall(r"^import (\S+)$", bazelrc, re.MULTILINE)
+    (script,) = re.findall(r"--workspace_status_command=(\S+)$", bazelrc,
+                           re.MULTILINE)
+    return imported, script
 
 
 def re_paths(module):
