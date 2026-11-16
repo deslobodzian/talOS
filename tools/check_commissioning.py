@@ -53,6 +53,7 @@ and the job fails, naming why, when no such base exists
 """
 
 import argparse
+import codecs
 import re
 import subprocess
 import sys
@@ -104,6 +105,17 @@ def git(*args):
                           check=True).stdout
 
 
+def diff_name(name):
+    """A `--- `/`+++ ` line's file name as a path: git ends a name holding
+    a space with a tab and C-quotes one holding a non-ASCII or control byte
+    (core.quotePath), so a config named either way is still checked."""
+    name = name.removesuffix("\t")
+    if name.startswith('"') and name.endswith('"'):
+        raw = codecs.escape_decode(name[1:-1].encode("utf-8"))[0]
+        name = raw.decode("utf-8", "surrogateescape")
+    return name
+
+
 def findings_in_diff(diff):
     """(file, line, what) for each guarded line a unified -U0 diff changes."""
     path, old, new = None, 0, 0
@@ -111,7 +123,7 @@ def findings_in_diff(diff):
         if line.startswith(("--- ", "+++ ")):
             # `--- a/<path>` then `+++ b/<path>`; a created or deleted
             # file has /dev/null on one side and keeps the other's path.
-            name = line[4:]
+            name = diff_name(line[4:])
             if name.startswith(("a/", "b/")):
                 path = name[2:]
             continue

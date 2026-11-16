@@ -115,6 +115,20 @@ class CheckCommissioningTest(unittest.TestCase):
         self.commit("bench: tidy the config")
         self.assertEqual(len(check_commissioning.check(self.base)), 3)
 
+    # REQ-DEV-33, RULES.md 4: git quotes a path with a non-ASCII byte and
+    # tab-terminates one with a space; neither hides the config.
+    def test_config_path_git_quotes_or_tab_terminates_fails(self):
+        for root in ("bench/main_processor/configuración", "bench/robot two"):
+            with self.subTest(root=root):
+                self.put(f"{root}/motor.toml", MOTOR)
+                self.commit("bench: add")
+                before = self.git("rev-parse", "HEAD").strip()
+                self.put(f"{root}/motor.toml", MOTOR.replace("= 1", "= 7"))
+                self.commit("bench: renumber")
+                found = check_commissioning.check(before)
+                self.assertEqual(len(found), 2, found)
+                self.assertIn(f" {root}/motor.toml:3: ", found[0])
+
     def branch_and_merge(self, side_edit, resolve=None):
         """Commits side_edit on a branch and an unrelated change here, then
         merges the branch; resolve() edits the merge result before its
