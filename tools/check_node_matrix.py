@@ -5,10 +5,10 @@
 
 Each PATH is a node test file (`*_test.cc`, `*_test.py`) or a directory,
 relative to the workspace. With none it checks every node package under
-2026-robot/main_processor, examples, bench and tools/scaffold_testdata, and
-every package a config's manifest (`*_manifest.bzl` `NODES`) under them
-launches, such as //talOS/teleop and //talOS/telemetry. A node package is a
-directory whose BUILD file declares a node (talos_cc_node, talos_py_node,
+examples, bench and tools/scaffold_testdata, and every package a config's
+manifest (`*_manifest.bzl` `NODES`) under them launches, such as
+//talOS/teleop and //talOS/telemetry. A node package is a directory whose
+BUILD file declares a node (talos_cc_node, talos_py_node,
 talos_cc_shared_node). Each of its test files in the language of its nodes (a
 Python test of a C++ node tests the binding), or each file given, is checked
 for the cases its role requires, by the matrix's names (Python:
@@ -58,8 +58,7 @@ import os
 import re
 import sys
 
-DEFAULT_ROOTS = ("2026-robot/main_processor", "examples", "bench",
-                 "tools/scaffold_testdata")
+DEFAULT_ROOTS = ("examples", "bench", "tools/scaffold_testdata")
 
 # Case number -> name, per role. The observer's stale-input case takes the
 # number of the actuator's stale case.

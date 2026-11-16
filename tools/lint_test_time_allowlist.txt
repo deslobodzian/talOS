@@ -9,16 +9,6 @@ controller_processor/rio/src/test/cpp/ConfigStore_test.cpp clock integration: th
 controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp clock integration: CTRE's Phoenix 6 simulator advances on the real clock; reads poll its status frames until a 10 s deadline that bounds a hang
 controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp sleep integration: CTRE's Phoenix 6 simulator advances on the real clock; reads are paced 10 ms apart as PumpReads paces them
 controller_processor/rio/src/test/cpp/RioLog_test.cpp clock integration: the logger's real thread held in a blocked write; the elapsed bound shows a burst of posts did not wait for it
-2026-robot/main_processor/drivetrain/monitor.cc clock operator CLI beside the node, paced on the real clock through a Clock alias; not node code
-2026-robot/main_processor/drivetrain/monitor.cc sleep operator CLI beside the node, paced on the real clock; not node code
-2026-robot/main_processor/drivetrain/send_target.cc clock operator CLI beside the node, sends for a wall-clock duration; not node code
-2026-robot/main_processor/drivetrain/send_target.cc sleep operator CLI beside the node, sends for a wall-clock duration; not node code
-2026-robot/main_processor/simulation/match_rehearsal_test.py clock e2e: paces scripted inputs against the running graph (TESTING.md §2)
-2026-robot/main_processor/simulation/match_rehearsal_test.py sleep e2e: paces scripted inputs against the running graph (TESTING.md §2)
-2026-robot/main_processor/simulation/startup_test.py clock e2e: waits on the launched graph with deadlines (TESTING.md §2)
-2026-robot/main_processor/simulation/startup_test.py sleep e2e: waits on the launched graph with deadlines (TESTING.md §2)
-2026-robot/main_processor/vision/node_test.cc clock seeded: integration cases (capture threads) in a node logic target; move them to their own target (TESTING.md §2)
-2026-robot/main_processor/vision/node_test.cc sleep seeded: integration cases (capture threads) in a node logic target; move them to their own target (TESTING.md §2)
 bench/main_processor/simulation/soak_test.py clock soak: injected kills and stalls on the real clock (TESTING.md §2)
 bench/main_processor/simulation/soak_test.py sleep soak: injected kills and stalls on the real clock (TESTING.md §2)
 bench/main_processor/swerve_module/send_target.cc clock operator CLI beside the node, sends for a wall-clock duration; not node code

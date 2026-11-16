@@ -1,7 +1,0 @@
-[subsystem]
-name = "neighbor"
-
-[motors.wheel]
-type = "TalonFX"
-bus = "rio"
-can_id = 10

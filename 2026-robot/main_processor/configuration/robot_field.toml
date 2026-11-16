@@ -1,5 +1,0 @@
-include = "robot.toml"
-
-[robot]
-require_target_coverage = true
-controller_address = "10.56.87.2"

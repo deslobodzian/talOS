@@ -34,8 +34,8 @@ class LintTestTimeTest(unittest.TestCase):
                  "Loop_test.cpp", CLOCK, {}),
                 ("talOS/python/test_node.py", PY_CLOCK, {}),
                 ("studio/bridge/thing_test.py", PY_SLEEP, {}),
-                ("2026-robot/main_processor/shooter/shooter.cc", CLOCK,
-                 {"2026-robot/main_processor/shooter/BUILD": NODE_BUILD}),
+                ("bench/main_processor/motor/motor.cc", CLOCK,
+                 {"bench/main_processor/motor/BUILD": NODE_BUILD}),
                 ("examples/arm/arm.py", PY_SLEEP,
                  {"examples/arm/BUILD.bazel":
                   "talos_py_node(name = 'node')\n"}),

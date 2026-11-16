@@ -27,31 +27,32 @@ GRAPH = {
                                     "//talOS/teleop:libteleop.so"]),
     "//talOS/geometry:geometry": (None, []),
     "//talOS/vision:vision": (None, ["//talOS/geometry:geometry"]),
-    "//2026-robot/main_processor/drivetrain:messages": ("talos_messages", []),
-    "//2026-robot/main_processor/drivetrain:drivetrain": (
-        None, ["//2026-robot/main_processor/drivetrain:messages",
+    "//bench/main_processor/swerve_module:messages": ("talos_messages", []),
+    "//bench/main_processor/swerve_module:swerve_module": (
+        None, ["//bench/main_processor/swerve_module:messages",
                "//talOS/devices:devices"]),
-    "//2026-robot/main_processor/drivetrain:node": (
-        "talos_cc_node", ["//2026-robot/main_processor/drivetrain:drivetrain"]),
-    "//2026-robot/main_processor/driver:driver": (
-        None, ["//2026-robot/main_processor/drivetrain:messages",
+    "//bench/main_processor/swerve_module:node": (
+        "talos_cc_node",
+        ["//bench/main_processor/swerve_module:swerve_module"]),
+    "//bench/main_processor/motor:motor": (
+        None, ["//bench/main_processor/swerve_module:messages",
                "//talOS/devices:devices"]),
-    "//2026-robot/main_processor/driver:node": (
-        "talos_cc_node", ["//2026-robot/main_processor/driver:driver"]),
-    "//2026-robot/main_processor/driver:node_test": (
-        None, ["//2026-robot/main_processor/driver:driver"]),
-    "//2026-robot/main_processor/autonomous:autonomous": (
-        None, ["//2026-robot/main_processor/drivetrain:messages",
+    "//bench/main_processor/motor:node": (
+        "talos_cc_node", ["//bench/main_processor/motor:motor"]),
+    "//bench/main_processor/motor:node_test": (
+        None, ["//bench/main_processor/motor:motor"]),
+    "//bench/main_processor/gyro:gyro": (
+        None, ["//bench/main_processor/swerve_module:messages",
                "//talOS/devices:devices"]),
-    "//2026-robot/main_processor/autonomous:node": (
-        "talos_cc_node", ["//2026-robot/main_processor/autonomous:autonomous"]),
-    "//2026-robot/main_processor/integration:closed_loop_test": (
-        None, ["//2026-robot/main_processor/autonomous:autonomous",
-               "//2026-robot/main_processor/drivetrain:drivetrain"]),
-    "//2026-robot/main_processor/configuration:config_golden_test": (
-        None, ["//2026-robot/main_processor/drivetrain:drivetrain"]),
-    "//2026-robot/main_processor:robot_bundle": (
-        None, ["//2026-robot/main_processor/drivetrain:node"]),
+    "//bench/main_processor/gyro:node": (
+        "talos_py_node", ["//bench/main_processor/gyro:gyro"]),
+    "//bench/main_processor/simulation:closed_loop_test": (
+        None, ["//bench/main_processor/gyro:gyro",
+               "//bench/main_processor/swerve_module:swerve_module"]),
+    "//bench/main_processor/configuration:config_golden_test": (
+        None, ["//bench/main_processor/swerve_module:swerve_module"]),
+    "//bench/main_processor:bench_bundle": (
+        None, ["//bench/main_processor/swerve_module:node"]),
     "//examples/superstructure/cpp:mechanisms": (
         None, ["//talOS/devices:devices"]),
     "//examples/superstructure/cpp:libmechanisms.so": (
@@ -63,9 +64,9 @@ GRAPH = {
 
 # What `attr(testonly, 1, ...)` returns: every test rule.
 TESTONLY = frozenset({
-    "//2026-robot/main_processor/driver:node_test",
-    "//2026-robot/main_processor/integration:closed_loop_test",
-    "//2026-robot/main_processor/configuration:config_golden_test",
+    "//bench/main_processor/motor:node_test",
+    "//bench/main_processor/simulation:closed_loop_test",
+    "//bench/main_processor/configuration:config_golden_test",
 })
 
 
@@ -147,21 +148,21 @@ class CheckLayersTest(unittest.TestCase):
                 ("//talOS/events:events", "//talOS/hardware:config"),
                 ("//talOS/devices:devices", "//talOS/teleop:libteleop.so"),
                 ("//talOS/launcher:launcher",
-                 "//2026-robot/main_processor/driver:driver"),
+                 "//bench/main_processor/motor:motor"),
                 ("//talOS/telemetry:node", "//studio:bridge"),
                 ("//talOS/geometry:geometry", "//talOS/vision:vision"),
                 ("//talOS/python:talos", "//talOS/node:node"),
-                ("//2026-robot/main_processor/drivetrain:drivetrain",
-                 "//2026-robot/main_processor/driver:driver"),
+                ("//bench/main_processor/swerve_module:swerve_module",
+                 "//bench/main_processor/motor:motor"),
                 # A node's production library, and a node's own test, never
                 # link another node's class.
-                ("//2026-robot/main_processor/autonomous:autonomous",
-                 "//2026-robot/main_processor/drivetrain:drivetrain"),
-                ("//2026-robot/main_processor/driver:node_test",
-                 "//2026-robot/main_processor/drivetrain:drivetrain"),
+                ("//bench/main_processor/gyro:gyro",
+                 "//bench/main_processor/swerve_module:swerve_module"),
+                ("//bench/main_processor/motor:node_test",
+                 "//bench/main_processor/swerve_module:swerve_module"),
                 # Outside node packages only a testonly target links one.
-                ("//2026-robot/main_processor/integration:harness",
-                 "//2026-robot/main_processor/drivetrain:drivetrain"),
+                ("//bench/main_processor/simulation:harness",
+                 "//bench/main_processor/swerve_module:swerve_module"),
                 ("//examples/superstructure/py:elevator",
                  "//examples/superstructure/cpp:mechanisms")):
             with self.subTest(frm=frm, to=to):
@@ -184,11 +185,11 @@ class CheckLayersTest(unittest.TestCase):
         # exported for talos.cpp_node.
         for frm, to, generator in (
                 ("//talOS/python:talos", "//talOS/msgs:control_py", None),
-                ("//2026-robot/main_processor/drivetrain:drivetrain",
+                ("//bench/main_processor/swerve_module:swerve_module",
                  "//examples/superstructure/cpp:libmechanisms.so",
                  "talos_cc_shared_node"),
                 ("//examples/superstructure/py:elevator",
-                 "//2026-robot/main_processor/drivetrain:messages",
+                 "//bench/main_processor/swerve_module:messages",
                  "talos_messages")):
             with self.subTest(frm=frm, to=to):
                 failures, out = run(with_edge(frm, to, generator))
