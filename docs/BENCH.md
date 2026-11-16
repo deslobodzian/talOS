@@ -75,7 +75,7 @@ release all controls, and explicitly re-enable only after checking recovery.
   memory; it does not prove physical safety or voltage dynamics. Record manifest.
 - [ ] Deploy the RIO program from either host. From the Linux workstation:
   `(cd controller_processor/rio && ./gradlew deploy -Pcompanion=10.0.0.37)`;
-  from the Mini, whose Gradle needs a JDK and no daemon (TODO.md DEPLOY-5):
+  from the Mini, whose Gradle needs a JDK and no daemon:
   `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -Pcompanion=10.0.0.37)`.
   Expected: Gradle prints
   `RoboRIO companion address built in: 10.0.0.37 (from -Pcompanion)`, the
@@ -783,8 +783,7 @@ Mini between sessions.
    it on either host: from the workstation
    `(cd controller_processor/rio && ./gradlew deploy -Pcompanion=10.0.0.37)`,
    from the Mini
-   `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -Pcompanion=10.0.0.37)`
-   (TODO.md DEPLOY-5).
+   `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -Pcompanion=10.0.0.37)`.
    Pass: Gradle prints `RoboRIO companion address built in: 10.0.0.37 (from
    -Pcompanion)`, and the RoboRIO console prints `hardware gateway build
    <HEAD> companion 10.0.0.37:5803` without `(dirty)`, `hardware gateway
