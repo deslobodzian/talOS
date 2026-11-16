@@ -7,11 +7,21 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "../driver_station/driver_station.h"
 
 namespace talos::hardware {
 namespace {
+bool EqualIgnoringAsciiCase(std::string_view a, std::string_view b) {
+  const auto lower = [](char ch) {
+    return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch;
+  };
+  return a.size() == b.size() &&
+         std::equal(a.begin(), a.end(), b.begin(),
+                    [&](char x, char y) { return lower(x) == lower(y); });
+}
+
 void Require(bool ok, const char* message) {
   if (!ok) throw std::invalid_argument(message);
 }
@@ -230,15 +240,31 @@ void Validate(const Config& c) {
 }
 
 CanBusList CanBuses(const Config& c) {
-  std::vector<std::string_view> others;
-  const auto add = [&](std::string_view bus) {
-    if (bus != "rio" &&
-        std::find(others.begin(), others.end(), bus) == others.end()) {
-      others.push_back(bus);
+  // Each distinct bus with the first device naming it; "rio" is always
+  // there. Names compare byte for byte, as the wire carries them, but two
+  // that differ only by case are refused: Phoenix may resolve both to one
+  // CANivore, whose load and health would then be split over two slots.
+  std::vector<std::pair<std::string_view, std::string_view>> buses{
+      {"rio", "the RoboRIO itself"}};
+  const auto add = [&](std::string_view bus, std::string_view device) {
+    for (const auto& [name, first_device] : buses) {
+      if (name == bus) return;
+      if (EqualIgnoringAsciiCase(name, bus)) {
+        throw std::invalid_argument(
+            "CAN buses \"" + std::string{name} + "\" (" +
+            std::string{first_device} + ") and \"" + std::string{bus} + "\" (" +
+            std::string{device} +
+            ") differ only by case; spell one bus one way");
+      }
     }
+    buses.emplace_back(bus, device);
   };
-  for (const auto& m : c.motors) add(m.bus);
-  for (const auto& s : c.sensors) add(s.bus);
+  for (const auto& m : c.motors) add(m.bus, m.name);
+  for (const auto& s : c.sensors) add(s.bus, s.name);
+  std::vector<std::string_view> others;
+  for (std::size_t i = 1; i < buses.size(); ++i) {
+    others.push_back(buses[i].first);
+  }
   // std::string_view compares as unsigned bytes (char_traits<char>).
   std::sort(others.begin(), others.end());
   if (others.size() > kMaxCanBuses - 1) {

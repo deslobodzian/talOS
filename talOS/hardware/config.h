@@ -220,7 +220,8 @@ struct Config {
 
 // Throws before any device is opened. Unknown references and duplicate names,
 // logical IDs, or CAN addresses on a bus are rejected, and so is a config
-// naming more than kMaxCanBuses - 1 CAN buses besides "rio" (CanBuses).
+// naming more than kMaxCanBuses - 1 CAN buses besides "rio" or two that
+// differ only by case (CanBuses).
 void Validate(const Config& config);
 uint64_t ConfigurationId(const Config& config);
 
@@ -236,6 +237,7 @@ struct CanBusList {
 };
 // The names view `config`'s own strings ("rio" excepted), so they live as
 // long as `config` does not change. Throws std::invalid_argument naming the
-// buses when there are more than kMaxCanBuses - 1 besides "rio".
+// buses when there are more than kMaxCanBuses - 1 besides "rio", or two names
+// (with "rio") that differ only by ASCII case, naming a device on each.
 CanBusList CanBuses(const Config& config);
 }  // namespace talos::hardware

@@ -370,7 +370,11 @@ The CAN buses are `CanBuses(config)` (`config.h`): slot 0 is the RoboRIO's
 own bus, `"rio"`, whether or not a device names it (the power distribution
 and pneumatics modules share it), then each other bus a motor or sensor
 names (a CANivore), in byte order. A config naming more than three buses
-besides `"rio"` is refused. Each State carries one slot, `sequence % count`
+besides `"rio"` is refused, and so is one naming two buses that differ only
+by case (`"Shooter"` and `"shooter"`, or `"RIO"` beside the implicit
+`"rio"`): Phoenix may resolve them to one bus, whose health and load would
+then be split over two slots. Names are never folded, since the wire
+carries them as written. Each State carries one slot, `sequence % count`
 (`HealthSample::can_bus_index`, `can_bus_count`), with the bus's read state,
 utilization, bus-off and transmit-buffer-full counts, receive and transmit
 error counters (saturated at 255) and the failed reads since the
