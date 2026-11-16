@@ -277,7 +277,8 @@ divergence that converges again within a step still fails. The lint accepts a cl
 test or its class, no `skipTest` in it), the C++ file has that case as a
 test, and every named step is a step of the scenario that call is given
 (a list literal, or the list a name is assigned where Python resolves it
-from the call: the calling function, an enclosing one, the module). Whether a named
+from the call: the calling function, an enclosing one, the module); a call
+whose scenario is built otherwise counts no steps. Whether a named
 step exercises its case the lint cannot check: that is a review item
 **[review]**. The scenario includes a Driver Station mode change (teleop, disabled, autonomous, teleop) with targets
 stamped under each earlier generation. Cases 9 and 12 cannot be claimed (a

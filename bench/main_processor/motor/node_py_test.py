@@ -4,7 +4,9 @@ robot_py.toml also launches) plus a neighbor motor that stays connected.
 
 node_test.cc carries the node test matrix (docs/TESTING.md §7) for the C++
 node. ParityTest runs that C++ node (motor.h, hosted through
-libbench_motor.so) and motor.py on SCENARIO through talos.parity, which
+libbench_motor.so) and motor.py on SCENARIO through talos.parity, at the
+config's 5 ms period and at 20 ms (a Python motor owner's minimum on a
+robot, REQ-RT-23), which
 requires the same /motor/state bytes and the same requested and applied
 motor output after every step; the `matrix: parity` comments name the steps
 that cover each case. What a parity run cannot compare is tested here:
@@ -255,6 +257,38 @@ class ParityTest(unittest.TestCase):
     def test_publishes_and_requests_what_the_cpp_node_does(self):
         parity.assert_same_behaviour(
             CppBenchMotor, bench.BenchMotor, CONFIG, "motor", SCENARIO,
+            topics=[(MotorState, topics.STATE)], motors=["kraken"])
+
+    # REQ-CONTRACT-14 at the period a Python motor owner runs at on a robot
+    # (20 ms minimum, REQ-RT-23; robot_py.toml's motor_py.toml): the same
+    # scenario on CONFIG with the motor's period_us 20000. (CONFIG is
+    # itself an include, which cannot be included again: this is a copy.)
+    # Most steps last 10 ms, half a period, so each gains a 10 ms wait:
+    # otherwise every other step's target is overwritten before a tick
+    # runs the nodes on it, and that step compares nothing new.
+    def test_publishes_and_requests_what_the_cpp_node_does_at_20_ms(self):
+        with open(CONFIG, encoding="utf-8") as f:
+            text = f.read()
+        bench_config = os.path.normpath(os.path.join(
+            os.path.dirname(CONFIG), "../../configuration/robot.toml"))
+        for old, new in (
+                ('include = "../../configuration/robot.toml"',
+                 f'include = "{bench_config}"'),
+                ("[subsystems.motor]\n",
+                 "[subsystems.motor]\nperiod_us = 20000\n")):
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        config = os.path.join(os.environ["TEST_TMPDIR"], "motor_20ms.toml")
+        with open(config, "w", encoding="utf-8") as f:
+            f.write(text)
+        sim = Sim(config)
+        sim.add(bench.BenchMotor, "motor")
+        self.assertEqual(sim.node("motor").period, 0.02)
+        del sim
+        scenario = [(name, *actions, parity.wait(0.01))
+                    for name, *actions in SCENARIO]
+        parity.assert_same_behaviour(
+            CppBenchMotor, bench.BenchMotor, config, "motor", scenario,
             topics=[(MotorState, topics.STATE)], motors=["kraken"])
 
 

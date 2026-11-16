@@ -149,6 +149,15 @@ class CheckNodeMatrixTest(unittest.TestCase):
         _, result = check_node_matrix.check(
             claim + local, "py", "actuator", sibling({"node_test.cc": cpp}))
         self.assertEqual(result[3][0], "parity")
+        # A second run on a scenario built from the first (the same steps at
+        # another period) counts no steps of its own but refuses nothing.
+        derived = run + (
+            "def test_parity_slow():\n"
+            "    slow = [(name, *a, wait(0.01)) for name, *a in SCENARIO]\n"
+            "    parity.assert_same_behaviour(Cpp, Py, SLOW, \"arm\", slow)\n")
+        _, result = check_node_matrix.check(
+            claim + derived, "py", "actuator", sibling({"node_test.cc": cpp}))
+        self.assertEqual(result[3][0], "parity")
         for why, text, files in (
                 ("no parity run", claim + run.split("def test_parity")[0],
                  {"node_test.cc": cpp}),
