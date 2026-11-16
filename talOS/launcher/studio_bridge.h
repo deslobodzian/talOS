@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
@@ -21,27 +22,29 @@ namespace talos::launcher {
 // Studio bridge
 //
 // The one roster member supervised differently. It takes positional args
-// rather than the node flags, and logs plaintext to studio_bridge.log rather
-// than a .tlog. It waits for the telemetry topic itself, so an attempt that
-// exits quickly failed for some other reason. It is retried at most once per
-// interval, inside the supervision loop, within a bounded window; while it is
-// still starting it neither holds the session open nor reports its exits. A
-// bridge that survives one interval is stable and supervised like any node,
-// except that a crash is not restarted (see Restarts in supervision_policy.h).
-// One that never comes up is a degraded session, not a broken robot: it is
-// marked failed and the session runs on without Studio.
+// rather than the node flags, logs plaintext to studio_bridge.log rather than
+// a .tlog, and takes no registry row, so the launcher sees it only through
+// its exits (a bridge that hangs without exiting is not noticed). It is an
+// observer: nothing it does starts, stops, restarts or delays another
+// member, and how it ended never sets the session's exit status.
+//
+// Every ending of a run while the session is not stopping -- a nonzero
+// exit, a signal, or exit 0, since a server that ends before the stop has
+// failed -- and every spawn that fails is restarted on the restart schedule
+// a non-critical member has (RestartSchedule: 50 ms, doubling to 1 s, at
+// most max_restarts starts per rolling restart window, inside the
+// supervision loop), with the restart line a node's restart prints. Where a
+// node would be quarantined, the bridge is left: one line says it will not
+// be restarted again, it is marked failed, and the session runs on without
+// Studio. --max-restarts 0 leaves it at its first ending. A stop cancels a
+// pending restart, so no bridge is spawned once the stop has begun.
+//
+// A run counts as up once it has run for kStudioBridgeSettleInterval: until
+// then, and while a restart is pending, the bridge does not hold the session
+// open, and a run still settling when the session ends is SIGKILLed.
 // ---------------------------------------------------------------------------
 
-inline constexpr int kStudioBridgeMaxAttempts = 60;
-inline constexpr std::chrono::seconds kStudioBridgeRetryInterval{1};
-inline constexpr std::chrono::seconds kStudioBridgeStartupWindow{60};
-
-// True while the bridge still has startup budget, its last spawn is at least
-// one interval old, and the session is not stopping.
-bool ShouldRetryStudioBridge(
-    int attempts_made, std::chrono::steady_clock::time_point first_attempt,
-    std::chrono::steady_clock::time_point last_spawn,
-    std::chrono::steady_clock::time_point now, bool stopping);
+inline constexpr std::chrono::seconds kStudioBridgeSettleInterval{1};
 
 // Removes Studio's bridge from `specs` and `described` (index for index)
 // when its --describe probe did not answer, missing binary included:
@@ -62,49 +65,64 @@ std::string StudioBridgeWatchTopic(const NodeDescription& bridge,
 
 class StudioBridge {
  public:
-  using Clock = std::chrono::steady_clock;
-
   // `proc` is the bridge's roster entry, and described[index] its
-  // description; it keeps no .tlog.
+  // description; it keeps no .tlog. `limits` are the session's restart
+  // limits, which the bridge's restarts count against as a node's do.
   StudioBridge(std::size_t index, const NodeSpec& spec, NodeProcessInfo& proc,
                const config::RobotConfig& robot_config,
-               const LauncherOptions& options,
+               const LauncherOptions& options, const RestartLimits& limits,
                const std::vector<NodeDescription>& described,
                const std::string& graph_path, ChildOutput& output);
 
   std::size_t index() const { return index_; }
 
-  // Still racing telemetry: exits are expected and the session does not wait.
+  // A run of the bridge is live but not yet up a settle interval: its exit
+  // is expected to be possible, and the session does not wait for it.
   bool Starting(std::size_t index) const {
-    return index == index_ && active_ && !stable_;
+    return index == index_ && running_ && !settled_;
   }
 
-  // The first attempt, spawned alongside every other node without waiting,
-  // at the time `clock` reads after the spawn.
+  // The first run, spawned alongside every other node without waiting, at
+  // the time `clock` reads after the spawn.
   void Start(NodeProcessInfo& proc, const SupervisionClock& clock);
 
-  // One supervision tick, after the loop has reaped exits: stabilize a
-  // survivor, respawn a startup failure, or give up when budget runs out.
-  void Supervise(NodeProcessInfo& proc, Clock::time_point now, bool stopping);
+  // The supervision loop reaped the current run at `now` (waitpid `status`;
+  // the run already ended in `proc`): schedules its restart, or leaves the
+  // bridge, unless the session is `stopping`.
+  void Exited(NodeProcessInfo& proc, int status, SupervisionTime now,
+              bool stopping);
 
-  // When Supervise next has something to decide without an exit: one retry
-  // interval after the last spawn while the bridge is starting (stabilize,
-  // retry or give up); time_point::max() once it is stable or given up.
-  Clock::time_point NextCheck() const {
-    return active_ && !stable_ ? last_spawn_ + kStudioBridgeRetryInterval
-                               : Clock::time_point::max();
-  }
+  // One supervision pass, after the loop has reaped exits: marks a run that
+  // has been up a settle interval as up, cancels a pending restart once the
+  // session is `stopping`, and starts one that is due.
+  void Supervise(NodeProcessInfo& proc, SupervisionTime now, bool stopping);
 
-  // The session ended while the bridge was still starting: it never served
-  // Studio. An attempt still running is killed and reaped, so its run ends
-  // with the session. A stop-driven ending is not a bridge failure.
+  // When Supervise next has something to decide without an exit: the
+  // settle interval's end of a run still settling, and a pending restart's
+  // start; time_point::max() for neither.
+  SupervisionTime NextCheck() const;
+
+  // The session ended. A pending restart is dropped; a run still settling
+  // is killed and reaped, so its run ends with the session. A bridge none
+  // of whose runs came up is marked failed unless the session ended on a
+  // requested stop (`stop_requested`), which is not a bridge failure.
   void Finish(NodeProcessInfo& proc, bool stop_requested);
 
  private:
-  // One attempt, its output drained into log_path_ only, never echoed.
+  // One run, its output drained into log_path_ only, never echoed.
   pid_t Spawn(std::string& error);
 
-  void GiveUp(NodeProcessInfo& proc);
+  // Starts the pending restart at `now`; one that cannot be spawned fails
+  // like a run.
+  void Restart(NodeProcessInfo& proc, SupervisionTime now);
+
+  // A run ended, or a spawn failed (`what`, for the line), at `now` while
+  // the session runs: schedules the next start, or leaves the bridge.
+  void Failed(NodeProcessInfo& proc, std::string_view what,
+              SupervisionTime now);
+
+  // Not restarted again this session: marked failed.
+  void Leave(NodeProcessInfo& proc);
 
   std::size_t index_;
   std::string target_;
@@ -112,11 +130,13 @@ class StudioBridge {
   ChildOutput& output_;
   uint16_t http_port_;
   std::vector<std::string> args_;
-  int attempts_{0};
-  Clock::time_point first_attempt_{};
-  Clock::time_point last_spawn_{};
-  bool active_{false};
-  bool stable_{false};
+  RestartLimits limits_;
+  // Its restarts: one schedule, a non-critical member's.
+  RestartSchedule restart_{/*critical=*/false};
+  SupervisionTime last_spawn_{};
+  bool running_{false};  // A run was spawned and is not yet reaped.
+  bool settled_{false};  // That run has been up a settle interval.
+  bool came_up_{false};  // Some run has.
 };
 
 }  // namespace talos::launcher

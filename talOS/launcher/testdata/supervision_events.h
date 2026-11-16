@@ -79,7 +79,7 @@ class SupervisionPasses {
 // steady_clock plus however far the test has moved it ahead, or, while the
 // test holds it, exactly where the test holds it: for
 // LauncherOptions::supervision_clock, so that a deadline the launcher
-// measures on it (restart backoff, the Studio bridge's retry interval, the
+// measures on it (restart backoff, the Studio bridge's settle interval, the
 // session duration, the stop's SIGKILL) passes when the test says, neither
 // after a real wait nor, while held, before. It never reads less than it
 // has read. Every move wakes the supervision loop (SupervisionWakeup::Wake),

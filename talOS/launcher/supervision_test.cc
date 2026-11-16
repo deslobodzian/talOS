@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
@@ -2686,17 +2687,20 @@ TEST(Supervision, StopTimeoutAloneWakesTheLoop) {
   ::remove(runs.c_str());
 }
 
-// The Studio bridge's retry is a deadline of its own: its first attempt
-// exits at once, nothing else is due, and the loop wakes one retry
-// interval later to spawn the second. A loop that did not sleep until it
-// would not retry for an hour; 10 s bounds the wait (docs/TESTING.md §6.3).
+// The Studio bridge's restart is a deadline of its own: its first run
+// exits at once, nothing else is due, and the loop wakes one restart
+// backoff later to spawn the second. A loop that did not sleep until it
+// would not restart it for an hour; 10 s bounds the wait (docs/TESTING.md
+// §6.3).
 // REQ-OPS-30, REQ-OPS-45
-TEST(Supervision, StudioBridgeRetryAloneWakesTheLoop) {
+TEST(Supervision, StudioBridgeRestartAloneWakesTheLoop) {
   const auto runs = TempPath("studio_wake_runs");
   const auto attempts = TempPath("studio_wake_attempts");
   ::remove(runs.c_str());
   ::remove(attempts.c_str());
   auto options = NothingDueOptions("studio_wake", runs);
+  // One restart: its second run's end leaves it, and nothing else is due.
+  options.max_restarts = 1;
   options.start_studio_bridge = true;
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStub("studio_wake_bridge", "echo x >> " + attempts + "\nexit 1\n",
@@ -2712,10 +2716,338 @@ TEST(Supervision, StudioBridgeRetryAloneWakesTheLoop) {
   }};
   RunSession(options);
   driver.join();
-  EXPECT_TRUE(retried) << "the bridge's retry waited for an unrelated wake";
+  EXPECT_TRUE(retried) << "the bridge's restart waited for an unrelated wake";
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
   ::remove(attempts.c_str());
+}
+
+// The integer `key` of a member's manifest object (ManifestEntry), or -1.
+int64_t EntryInteger(const std::string& entry, std::string_view key) {
+  const std::string name = "\"" + std::string{key} + "\": ";
+  const std::size_t at = entry.find(name);
+  if (at == std::string::npos) return -1;
+  return std::strtoll(entry.c_str() + at + name.size(), nullptr, 10);
+}
+
+// A Studio bridge stub's body: once its stop trap is set, appends its pid
+// to `record` (one line per run), then runs `then`.
+std::string BridgeRun(const std::string& record, std::string_view then) {
+  return "trap 'exit 0' INT TERM\necho $$ >> " + record + "\n" +
+         std::string{then};
+}
+
+// Studio bridge sessions for the tests below: NothingDueOptions (no member
+// ends, stalls or misses a deadline on its own) with the bridge started, a
+// restart budget of 3 and a supervision clock the test holds from before
+// the launch, so every restart decision reads a time the test chose.
+LauncherOptions BridgeOptions(std::string_view tag, const std::string& runs,
+                              testing::SteppedClock& clock) {
+  auto options = NothingDueOptions(tag, runs);
+  options.max_restarts = 3;
+  options.start_studio_bridge = true;
+  options.supervision_clock = clock.clock();
+  return options;
+}
+
+// A Studio bridge that crashes mid-session (SIGKILL, once it has been up a
+// settle interval) is started again on the restart backoff, and no node is
+// disturbed: each keeps its one run and its pid, with restart_count 0, and
+// the operator's stop ends the session with 0. The supervision clock is held
+// until the crash has been reaped, then runs on, so the backoff passes.
+// REQ-OPS-30
+TEST(Supervision, CrashedStudioBridgeRestartsAndNoNodeIsDisturbed) {
+  const auto runs = TempPath("bridge_crash_runs");
+  const auto bridge_runs = TempPath("bridge_crash_bridge_runs");
+  const auto crash = TempPath("bridge_crash_now");
+  for (const auto* path : {&runs, &bridge_runs, &crash})
+    ::remove(path->c_str());
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  auto options = BridgeOptions("bridge_crash", runs, clock);
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("bridge_crash_bridge",
+                BridgeRun(bridge_runs, "if [ \"$(wc -l < '" + bridge_runs +
+                                           "')\" -eq 1 ]; then\n"
+                                           "  while [ ! -e '" +
+                                           crash +
+                                           "' ]; do sleep 0.01; done\n"
+                                           "  kill -KILL $$\n"
+                                           "fi\n"
+                                           "while :; do sleep 0.05; done\n"),
+                "studio_bridge");
+  // RunSession rewrites options.output_dir on return; not read concurrently.
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  constexpr std::array kNodes{"hardware_node", "alpha", "beta"};
+  testing::SupervisionPasses passes;
+  std::string before;  // The live manifest once every member ran.
+  bool crashed = false;
+  bool restarted = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    const auto wait = [&](const std::function<bool()>& done) {
+      const auto give_up =
+          std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
+      while (!stop.stop_requested() && !done() &&
+             std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(2ms);
+      return !stop.stop_requested() && done();
+    };
+    const auto every_member_ran = [&] {
+      if (ReadLines(runs).size() != 3 || ReadLines(bridge_runs).size() != 1)
+        return false;
+      before = ReadFile(live);
+      return std::ranges::all_of(kNodes, [&](const char* name) {
+        return EntryInteger(ManifestEntry(before, name), "pid") > 0;
+      });
+    };
+    if (wait(every_member_ran)) {
+      // Up one settle interval: a running bridge, not one still starting.
+      clock.HoldAt(start + kStudioBridgeSettleInterval);
+      const uint64_t settled = passes.Started() + 2;
+      if (wait([&] {
+            SupervisionWakeup::Wake();
+            return passes.Started() >= settled;
+          })) {
+        std::ofstream{crash}.close();
+        crashed = wait([&] {
+          const auto history = ManifestRuns(ReadFile(live), "studio_bridge");
+          return !history.empty() &&
+                 history.front().find("\"reason\": \"crash\"") !=
+                     std::string::npos;
+        });
+      }
+    }
+    if (crashed) {
+      clock.Release();
+      restarted = wait([&] { return ReadLines(bridge_runs).size() == 2; });
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  const int status = RunSession(options);
+  driver.join();
+  ASSERT_TRUE(crashed) << "the bridge's crash was not recorded";
+  EXPECT_TRUE(restarted) << "the crashed bridge was not started again";
+  EXPECT_EQ(status, 0);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string bridge = ManifestEntry(manifest, "studio_bridge");
+  EXPECT_EQ(EntryInteger(bridge, "restart_count"), 1) << bridge;
+  EXPECT_EQ(ManifestRuns(manifest, "studio_bridge").size(), 2u) << manifest;
+  EXPECT_EQ(ReadLines(runs).size(), 3u) << "a node was started again";
+  for (const char* name : kNodes) {
+    SCOPED_TRACE(name);
+    const std::string entry = ManifestEntry(manifest, name);
+    EXPECT_EQ(EntryInteger(entry, "restart_count"), 0) << entry;
+    EXPECT_EQ(EntryInteger(entry, "pid"),
+              EntryInteger(ManifestEntry(before, name), "pid"))
+        << entry;
+    EXPECT_EQ(ManifestRuns(manifest, name).size(), 1u) << manifest;
+  }
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&runs, &bridge_runs, &crash})
+    ::remove(path->c_str());
+}
+
+// A Studio bridge that ends at once on every run, even with exit 0 (a server
+// that ends before the stop has failed), is restarted max_restarts times
+// (3) on the non-critical member's backoff, 50, 100 and 200 ms, then left
+// for the rest of the session: recorder_failed, nothing pending, and no
+// retry even a restart window later, where a quarantined node would have
+// one. Each gap is read from the manifest's retry_at_monotonic_ns on a
+// supervision clock held at every reap, so it is exact. No node is touched,
+// and the operator's stop ends the session with 0, as without Studio.
+// REQ-OPS-30
+TEST(Supervision, FailingStudioBridgeRestartsBoundedTimesThenIsLeft) {
+  const auto runs = TempPath("bridge_bound_runs");
+  const auto bridge_runs = TempPath("bridge_bound_bridge_runs");
+  for (const auto* path : {&runs, &bridge_runs}) ::remove(path->c_str());
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  auto options = BridgeOptions("bridge_bound", runs, clock);
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("bridge_bound_bridge", BridgeRun(bridge_runs, "exit 0\n"),
+                "studio_bridge");
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  testing::SupervisionPasses passes;
+  std::vector<SupervisionTime> retries;  // Each restart's scheduled start.
+  bool left = false;
+  bool looked_later = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    const auto wait = [&](const std::function<bool()>& done) {
+      const auto give_up =
+          std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
+      while (!stop.stop_requested() && !done() &&
+             std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(2ms);
+      return !stop.stop_requested() && done();
+    };
+    const auto bridge_runs_ended = [&](std::size_t count, int64_t& retry_at) {
+      const std::string manifest = ReadFile(live);
+      retry_at = EntryInteger(ManifestEntry(manifest, "studio_bridge"),
+                              "retry_at_monotonic_ns");
+      const auto history = ManifestRuns(manifest, "studio_bridge");
+      return history.size() == count &&
+             history.back().find("\"reason\": \"running\"") ==
+                 std::string::npos;
+    };
+    for (std::size_t run = 1; run <= 3; ++run) {
+      int64_t retry_at = 0;
+      if (!wait(
+              [&] { return bridge_runs_ended(run, retry_at) && retry_at > 0; }))
+        break;
+      retries.emplace_back(std::chrono::nanoseconds{retry_at});
+      clock.HoldAt(retries.back());
+    }
+    if (retries.size() == 3) {
+      left = wait([&] {
+        int64_t retry_at = 0;
+        return bridge_runs_ended(4, retry_at) && retry_at == 0 &&
+               ManifestEntry(ReadFile(live), "studio_bridge")
+                       .find("\"recorder_failed\": true") != std::string::npos;
+      });
+    }
+    if (left) {
+      clock.HoldAt(retries.back() +
+                   std::chrono::milliseconds{options.restart_window_ms} +
+                   kRestartMaxBackoff);
+      const uint64_t later = passes.Started() + 2;
+      looked_later = wait([&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= later;
+      });
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  const int status = RunSession(options);
+  driver.join();
+  ASSERT_EQ(retries.size(), 3u)
+      << "restart " << retries.size() + 1 << " was never scheduled";
+  // The non-critical backoff: kRestartInitialBackoff, doubling.
+  const std::array<std::chrono::nanoseconds, 3> gaps{
+      retries[0] - start, retries[1] - retries[0], retries[2] - retries[1]};
+  EXPECT_EQ(gaps[0], 50ms);
+  EXPECT_EQ(gaps[1], 100ms);
+  EXPECT_EQ(gaps[2], 200ms);
+  ASSERT_TRUE(left) << "the fourth run's end did not leave the bridge";
+  EXPECT_TRUE(looked_later);
+  EXPECT_EQ(ReadLines(bridge_runs).size(), 4u)
+      << "a bridge that was left was started again";
+  EXPECT_EQ(status, 0);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string bridge = ManifestEntry(manifest, "studio_bridge");
+  EXPECT_EQ(EntryInteger(bridge, "restart_count"), 3) << bridge;
+  EXPECT_EQ(EntryInteger(bridge, "retry_at_monotonic_ns"), 0) << bridge;
+  EXPECT_NE(bridge.find("\"recorder_failed\": true"), std::string::npos)
+      << bridge;
+  EXPECT_EQ(ReadLines(runs).size(), 3u) << "a node was started again";
+  for (const char* name : {"hardware_node", "alpha", "beta"}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(EntryInteger(ManifestEntry(manifest, name), "restart_count"), 0);
+    EXPECT_EQ(ManifestRuns(manifest, name).size(), 1u) << manifest;
+  }
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&runs, &bridge_runs}) ::remove(path->c_str());
+}
+
+// A stop that arrives while the bridge waits out its restart backoff cancels
+// the restart: no bridge is spawned once the stop has begun, and the session
+// ends as soon as its members have, waiting neither for the backoff nor for
+// the stop timeout. The supervision clock is held at the bridge's exit until
+// the stop is under way (hardware_node ignores the stop's SIGINT and holds
+// the session open until the test releases it), then moved past the
+// restart's due time but short of the stop timeout, so a pass that still
+// started the restart would start a bridge during the stop.
+// REQ-OPS-30
+TEST(Supervision, StopDuringStudioBridgeBackoffStartsNoBridge) {
+  const auto runs = TempPath("bridge_stop_runs");
+  const auto bridge_runs = TempPath("bridge_stop_bridge_runs");
+  const auto release = TempPath("bridge_stop_release");
+  for (const auto* path : {&runs, &bridge_runs, &release})
+    ::remove(path->c_str());
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  auto options = BridgeOptions("bridge_stop", runs, clock);
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStub(
+      "bridge_stop_hardware",
+      "trap '' INT\n" +
+          RecordLogArgThen(runs, "while [ ! -e '" + release +
+                                     "' ]; do sleep 0.01; done\nexit 0\n"),
+      "hardware_node");
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("bridge_stop_bridge", BridgeRun(bridge_runs, "exit 1\n"),
+                "studio_bridge");
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  testing::SupervisionPasses passes;
+  std::atomic<bool> returned{false};
+  bool pending = false;
+  bool stopping = false;
+  bool rescued = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release_clock{clock};
+    const auto wait = [&](const std::function<bool()>& done) {
+      const auto give_up =
+          std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
+      while (!stop.stop_requested() && !done() &&
+             std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(2ms);
+      return !stop.stop_requested() && done();
+    };
+    const auto stopped = [&](const std::string& manifest, const char* name) {
+      const auto history = ManifestRuns(manifest, name);
+      return !history.empty() &&
+             history.back().find("\"reason\": \"stop\"") != std::string::npos;
+    };
+    pending = wait([&] {
+      return ReadLines(runs).size() == 3 &&
+             EntryInteger(ManifestEntry(ReadFile(live), "studio_bridge"),
+                          "retry_at_monotonic_ns") > 0;
+    });
+    ::kill(::getpid(), SIGTERM);
+    if (pending) {
+      stopping = wait([&] {
+        const std::string manifest = ReadFile(live);
+        return stopped(manifest, "alpha") && stopped(manifest, "beta");
+      });
+    }
+    if (stopping) {
+      // Past the restart's due time, short of the stop timeout.
+      clock.HoldAt(start + kRestartMaxBackoff);
+      const uint64_t later = passes.Started() + 2;
+      wait([&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= later;
+      });
+    }
+    std::ofstream{release}.close();
+    if (!wait([&] { return returned.load(); })) rescued = true;
+  }};
+  const int status = RunSession(options);
+  returned = true;
+  driver.join();
+  ASSERT_TRUE(pending) << "the bridge's restart was never scheduled";
+  ASSERT_TRUE(stopping) << "the stop did not end alpha and beta";
+  EXPECT_FALSE(rescued);
+  EXPECT_EQ(ReadLines(bridge_runs).size(), 1u)
+      << "a bridge was started after the stop began";
+  EXPECT_EQ(status, 0);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string bridge = ManifestEntry(manifest, "studio_bridge");
+  EXPECT_EQ(EntryInteger(bridge, "retry_at_monotonic_ns"), 0) << bridge;
+  EXPECT_EQ(EntryInteger(bridge, "restart_count"), 0) << bridge;
+  const auto hardware = ManifestRuns(manifest, "hardware_node");
+  ASSERT_EQ(hardware.size(), 1u) << manifest;
+  EXPECT_NE(hardware.back().find("\"reason\": \"stop\""), std::string::npos)
+      << hardware.back();
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&runs, &bridge_runs, &release})
+    ::remove(path->c_str());
 }
 
 }  // namespace

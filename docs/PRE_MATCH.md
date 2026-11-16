@@ -31,7 +31,7 @@ check below.
   | Status line | Meaning | Do |
   |---|---|---|
   | **CONNECTING** | the page is opening its feed, or waiting for the first telemetry | wait a few seconds |
-  | **BRIDGE LINK** `Dashboard to bridge link down` or `nothing heard` | the laptop does not reach the main processor's port 5800: main processor off, still booting, off the robot network, or started with `--no-studio` | check the main processor's power and Ethernet; if it persists, [main processor not reachable](#main-processor-not-reachable) |
+  | **BRIDGE LINK** `Dashboard to bridge link down` or `nothing heard` | the laptop does not reach the main processor's port 5800: main processor off, still booting, off the robot network, or started with `--no-studio`; or the Studio bridge that serves the page died. The launcher restarts a dead bridge within about a second, a few times ([Studio bridge](../talOS/launcher/README.md#studio-bridge)), and the page reconnects by itself; one that keeps dying is left down for the rest of the session while the robot drives on | wait a few seconds; if it persists, [main processor not reachable](#main-processor-not-reachable) |
   | **TELEMETRY** `Telemetry stale` | the bridge is up but the telemetry node publishes nothing new: every value is stale | check the telemetry node in Studio at `/` (the pit); the robot can drive, but the dashboard shows nothing current. With `the page missed time (laptop asleep)`: the laptop slept, wait a second for a new tick |
   | **TELEMETRY** `Telemetry feed could not be decoded: reload the page` | the page could not decode what the bridge sent (a page built for another bridge version, or a corrupt message); it reconnects by itself, every 5 s after 3 failures in a row | reload the page; if it persists, the page and the bridge come from different builds: redeploy the bundle |
   | **ROBORIO LINK** `RoboRIO link lost` | the main processor accepts no hardware state from the RoboRIO: RoboRIO off, its program not running, a wrong address, or another protocol version; every output is neutral | read the Driver Station message log; on a protocol error redeploy both sides from one checkout ([DEPLOYMENT.md](DEPLOYMENT.md#roborio)) |
@@ -91,9 +91,18 @@ laptop. They tell whether the RoboRIO hears the main processor at all:
 
 - `companion/connected` true and `companion/frame_age_s` below 0.5: the main
   processor's hardware bridge reaches the RoboRIO, so only the dashboard's
-  link is down (the bridge's port 5800, or `--no-studio`). False: the main
-  processor is off, still booting, or not on the robot network; the RoboRIO
-  drives nothing without it.
+  link is down: the Studio bridge died and the launcher left it after its
+  restarts, it hangs, or the session runs with `--no-studio`; check power and
+  cables only when this is false. The robot drives without the dashboard. In
+  the pit, the session's `talos.log` on the main processor
+  (`<prefix>/logs/<session-id>/`, [DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor);
+  `journalctl -u talos` on Linux) has a `studio_bridge exited` line for each
+  death and one saying it `will not be restarted again`, its
+  `studio_bridge.log` beside it says why, and the session manifest's
+  `studio_bridge` entry and `session_report` count its restarts. A bridge
+  that hangs without exiting is not restarted: restart the service with the
+  robot disabled. False: the main processor is off, still booting, or not on
+  the robot network; the RoboRIO drives nothing without it.
 - `companion/command_age_s` above 0.5, or -1, with `connected` true: the
   main processor is up but its actuator nodes are not commanding (down or
   crash-looping).

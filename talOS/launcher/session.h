@@ -169,10 +169,11 @@ struct NodeProcessInfo {
   bool exited{false};
   bool quarantined{false};
   int64_t retry_at_monotonic_ns{0};  // Zero when no restart is pending.
-  // `recorder_failed`: a run could not be spawned (or the Studio bridge never
-  // came up), or a run's event log failed -- seen live in the node's registry
-  // row (introspect::kFlagRecorderFailed), or unreadable, truncated or
-  // damaged (event::log::LogDamage) at shutdown.
+  // `recorder_failed`: a run could not be spawned, or a run's event log
+  // failed -- seen live in the node's registry row
+  // (introspect::kFlagRecorderFailed), or unreadable, truncated or damaged
+  // (event::log::LogDamage) at shutdown. For the Studio bridge, which keeps
+  // no event log: it was left, out of restarts or never up (StudioBridge).
   bool failed{false};
   // A run's event log reached its share of the session log budget and lost
   // records: its oldest segments were deleted to keep the newest, or, with a

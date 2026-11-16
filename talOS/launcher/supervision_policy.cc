@@ -55,6 +55,16 @@ void RestartSchedule::Cancel() {
   quarantined_ = false;
 }
 
+void ShowRestart(NodeProcessInfo& proc, const RestartSchedule& restart) {
+  proc.quarantined = restart.quarantined();
+  // steady_clock's epoch, which introspect::monotonic_now_ns() shares.
+  proc.retry_at_monotonic_ns =
+      restart.pending() ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              restart.due_at().time_since_epoch())
+                              .count()
+                        : 0;
+}
+
 std::chrono::nanoseconds LivenessLookInterval(const LivenessLimits& limits) {
   return limits.heartbeat_timeout / kLivenessLooksPerTimeout;
 }

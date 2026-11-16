@@ -9,9 +9,9 @@
 //
 // Restarts
 //
-// A roster member other than the Studio bridge that crashes -- exits nonzero
-// or by a signal -- while the session is not stopping is respawned after a
-// backoff of 50 ms, doubling within a rolling restart window, capped at 1 s.
+// A roster member that crashes -- exits nonzero or by a signal -- while the
+// session is not stopping is respawned after a backoff of 50 ms, doubling
+// within a rolling restart window, capped at 1 s.
 // A critical member's first crash in that window restarts it at once: the
 // robot cannot run without it, and a crash loop still backs off from its
 // second restart on.
@@ -29,6 +29,9 @@
 // members the time to exit. The backoff is scheduled inside the
 // supervision loop, so a restarting node never delays another node or the
 // session deadline. Every run writes its own event log.
+// The Studio bridge, an observer, runs this non-critical schedule after any
+// ending, exit 0 included, and is left for the rest of the session where a
+// node would be quarantined (StudioBridge).
 
 #include <chrono>
 #include <cstdint>
@@ -37,6 +40,8 @@
 #include <string_view>
 
 namespace talos::launcher {
+
+struct NodeProcessInfo;  // session.h
 
 using SupervisionTime = std::chrono::steady_clock::time_point;
 // The supervisor's one clock (LauncherOptions::supervision_clock):
@@ -104,6 +109,11 @@ class RestartSchedule {
   SupervisionTime at_{};
   std::deque<SupervisionTime> starts_;
 };
+
+// The manifest's view of `restart` in `proc`: `quarantined`, and
+// `retry_at_monotonic_ns` (0 with no pending start). Written after every
+// change to it.
+void ShowRestart(NodeProcessInfo& proc, const RestartSchedule& restart);
 
 // What one pass read from a run's registry row (WatchRun).
 struct RowObservation {
