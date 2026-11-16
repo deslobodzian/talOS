@@ -653,15 +653,43 @@ class SessionReportTest(unittest.TestCase):
         self.assertIn("running | -1 | 9 | running", rows[2])
         self.assertIn("2 runs after the first dropped", rows[3])
 
-    def test_target_lanes_follow_the_naming_grammar(self):
-        # Mirrors naming::IsTargetLane: only a lane's records count as target
-        # traffic.
-        for topic in ("/lift/target/teleop", "/drivetrain/target/align_2"):
-            self.assertTrue(session_report.is_target_lane(topic), topic)
-        for topic in ("/Lift/target/teleop", "/lift/target/tele__op",
-                      "/lift/target/teleop_", "/lift/target/2nd",
-                      "/lift/target/" + "s" * 19, "/lift/target/teleop/x"):
-            self.assertFalse(session_report.is_target_lane(topic), topic)
+    # REQ-RT-15: only a lane's records count as target traffic, so
+    # session_report's copy of the lane grammar must agree with
+    # naming::IsTargetLane (talOS/introspection/names.h), the authority, run
+    # here through target_lane_probe on the same names.
+    def test_target_lanes_agree_with_names_h(self):
+        agree = [
+            "/lift/target/teleop", "/drivetrain/target/align_2",
+            "/a/target/b", "/x1/target/y2", "/hw/target/teleop",
+            "/lift/target/" + "s" * 18,  # 31 bytes, kMaxTopicBytes
+            "/" + "o" * 21 + "/target/s",  # 31 bytes
+            "/lift/target/" + "s" * 19, "/" + "o" * 22 + "/target/s",
+            "/Lift/target/teleop", "/lift/target/Teleop",
+            "/lift/target/tele__op", "/lift/target/teleop_",
+            "/lift/target/_teleop", "/lift/target/2nd", "/lift/target/tele-op",
+            "/lift/target/teleop/x", "/lift/target/teleop/", "/lift/target/",
+            "/lift/target", "/lift/targets/teleop", "/lift/state/teleop",
+            "lift/target/teleop", "//target/teleop", "/lift//target/teleop",
+            "/lift/target//teleop", "", "/", "/lift/target/télé",
+        ]
+        # names.h refuses these for an abbreviation or a direction suffix;
+        # session_report.py does not re-check those, since the launcher
+        # refuses a graph that uses them.
+        relaxed = ["/lift/target/cmd", "/drive/target/teleop",
+                   "/lift/target/teleop_out", "/lift/target/align_tx"]
+        probe = runfiles.Create().Rlocation("_main/talOS/launcher/target_lane_probe")
+        names = agree + relaxed
+        verdicts = subprocess.run([probe], input="\n".join(names) + "\n",
+                                  capture_output=True, text=True,
+                                  check=True).stdout.split()
+        self.assertEqual(len(verdicts), len(names))
+        authority = dict(zip(names, (v == "1" for v in verdicts)))
+        self.assertEqual(sum(authority[t] for t in agree), 7)
+        for topic in agree:
+            self.assertEqual(session_report.is_target_lane(topic),
+                             authority[topic], repr(topic))
+        for topic in relaxed:
+            self.assertFalse(authority[topic], repr(topic))
 
     def test_empty_session_has_no_pass(self):
         report = session_report.analyze({"nodes": []}, [])

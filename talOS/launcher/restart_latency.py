@@ -30,6 +30,7 @@ import time
 import uuid
 
 from python.runfiles import runfiles
+from talOS.memory.shm_name import shm_name
 
 # talOS/events/log/format.h (versions 7 and 8). EventKind (events/context.h)
 # and SourceKind (events/manifest.h) both number TIMER 1; EventKind SEND is 4.
@@ -203,15 +204,6 @@ def evict_cache(binary):
             finally:
                 os.close(fd)
     return True
-
-
-def shm_name(topic, namespace):
-    """talos::ShmObjectName (talOS/memory/shared_memory_ptr.h) in a namespace."""
-    mapped = "/" + topic.lstrip("/").replace("/", ".")
-    value = 0xCBF29CE484222325
-    for byte in namespace.encode() + b"\0" + mapped.encode():
-        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return f"/~{value:016x}"
 
 
 REGISTRY = "/talos_registry.6"  # talOS/introspection/registry.h kRegistryPath
