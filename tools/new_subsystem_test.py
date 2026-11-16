@@ -925,6 +925,29 @@ class NewSubsystemTest(unittest.TestCase):
                     self.assertIn("--config $PWD/cfg/robot_sim.toml --sim",
                                   run)
 
+    # REQ-DEV-05
+    def test_sim_run_outlasts_its_schedule_however_late_the_gateway_starts(
+            self):
+        # The launcher counts --duration-s from its first spawn, but
+        # sim_gateway counts its schedules from its own loop start, which
+        # the launcher bounds only by killing a member that has not
+        # registered by its startup grace (talOS/launcher/roster.h
+        # heartbeat_startup_grace_ms, 5000 ms). Each printed run must
+        # outlast that grace plus the joystick schedule's last event, or a
+        # slow start ends the session before the button is held (TOOLS-18).
+        startup_grace_s = 5
+        for run in (new_subsystem.sim_run(3),
+                    new_subsystem.launcher_sim_run("@talos", "robot_sim.toml",
+                                                   3),
+                    new_subsystem.dependent_sim_run(3)):
+            duration_s = int(re.search(r"--duration-s (\d+)", run).group(1))
+            schedule = re.search(
+                r"--joystick-schedule (?:--sim-gateway-arg )?'([^']*)'",
+                run).group(1)
+            last_s = max(float(event.split(":", 1)[0])
+                         for event in schedule.split("|"))
+            self.assertGreater(duration_s, startup_grace_s + last_s, run)
+
     # REQ-DEV-01
     def test_simulation_test_loads_keep_the_build_parsing(self):
         # The loads the first mechanism adds to a robot repository's config

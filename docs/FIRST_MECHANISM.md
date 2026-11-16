@@ -242,7 +242,7 @@ as `Next:` prints it (`//:sim` runs `robot.toml`, which binds no button):
 
 ```sh
 bazel test //...
-bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 8 \
+bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 13 \
     --start-sim-gateway --sim-gateway-arg --physics \
     --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
     --sim-gateway-arg --joystick-schedule --sim-gateway-arg '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|6:axes=0;buttons=0;pov=-1'
@@ -275,6 +275,11 @@ and the RoboRIO with `sim_gateway`: disabled for 1 s, then teleop
 (`--mode-schedule`), with joystick 0's button 3 (bit 2 of the mask,
 `buttons=4`) held from second 3 to second 6
 ([syntax](../talOS/simulation/README.md#scripted-joystick-and-fault-schedules)).
+Those seconds count from the gateway's start, but `--duration-s` counts
+from the launcher's first spawn, so the 13 s are the schedules' 8 s plus
+the 5 s the launcher gives a member to register before it kills it (its
+startup grace, [restarts](../talOS/launcher/README.md#restarts)), so a
+slow gateway start cuts nothing off the end of the schedules.
 A **session** is one run of the launcher; its directory, the `Output Dir`
 it prints last, holds each node's log, its text output and the graph.
 `log_dump` reads the logs; its summary answers "did the flywheel move":
@@ -285,9 +290,7 @@ bazel run @talos//talOS/launcher:log_dump -- --format summary --node flywheel --
 
 ```text
 topic /flywheel/state flywheel.FlywheelState
-  records flywheel SEND 397
-  first_ms 58.410
-  last_ms 7978.421
+  ...
   latest {enabled: false, velocity_rps: 0, connected: true}
   range enabled false true
   range velocity_rps 0 19.999999999999986
@@ -392,7 +395,7 @@ session the launcher printed (`<session>`, its `Output Dir`); the full dump,
 sampled, shows the trajectory:
 
 ```sh
-bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 8 \
+bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 13 \
     --start-sim-gateway --sim-gateway-arg --physics \
     --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
     --sim-gateway-arg --joystick-schedule --sim-gateway-arg '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=8;pov=-1|6:axes=0;buttons=0;pov=-1'
@@ -574,7 +577,7 @@ with the bridge:
 ```sh
 (cd ../talos && bazel build //studio:web_dist)
 bazel build //:sim
-bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 10 --start-studio-bridge \
+bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 15 --start-studio-bridge \
     --start-sim-gateway --sim-gateway-arg --physics \
     --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
     --sim-gateway-arg --joystick-schedule --sim-gateway-arg '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|6:axes=0;buttons=0;pov=-1'
