@@ -621,11 +621,12 @@ the others keep driving, and only a request observed after the last such
 State drives it again; a follower's sample reads invalid while its master's
 does. An invalid motor or CAN sensor sample reads zero in every measured
 field. As on the gateway, a State in which every motor and CAN sensor sample
-the RoboRIO reports is invalid (disconnected, too old, or a motor of a chain
-`reset_device` is restoring) raises the hardware fault (`robot_enabled`
-false) and starts a new epoch with every output neutral, digital and PWM
-included, until feedback returns; a follower or a reset CANcoder that only
-the gateway's masks invalidate still counts as feedback. Inspection never refreshes
+is invalid as published (disconnected, too old, masked by `reset_device`,
+or a follower of an invalid master) raises the hardware fault
+(`robot_enabled` false) and starts a new epoch with every output neutral,
+digital and PWM included, until feedback returns: `reset_device` on every
+motor and CAN sensor (a CAN brownout) is total loss until the restore ends.
+Inspection never refreshes
 freshness. With `ideal_motors()`, neutral velocity decays each tick by
 `min(1, period/tau)`, with `tau = 50 ms` for brake and `1 s` for coast;
 velocity below `0.01 rps` snaps to zero. Position continues integrating during

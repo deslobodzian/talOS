@@ -25,8 +25,8 @@ constexpr uint64_t kBootId = 0xB0071DULL;
 
 // The roller and a motor its reset leaves alone, whose valid feedback keeps
 // the roller's restore from being total feedback loss: with the roller alone,
-// the State read while it restores would fault and end every command
-// (SimBackend.RestoringChainIsInvalidAsOnTheRobot).
+// every State from its reset until its restore ends would fault and end every
+// command (SimBackend.RestoringChainIsInvalidAsOnTheRobot).
 Config RollerConfig() {
   Config c;
   c.commissioned = true;

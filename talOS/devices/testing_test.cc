@@ -721,20 +721,19 @@ dio = 0
   EXPECT_TRUE(hw.applied_digital_output("lights", "led"));
 }
 
-// REQ-SAFE-22, REQ-DEV-07: the gateway judges total loss on the samples the
-// RoboRIO reports, before it masks a follower of an invalid master or the
-// motor a reset CANcoder feeds (Gateway::Tick judges, PollResets masks
-// after). With such a pair as the only CAN devices, disconnecting the master
-// or resetting the CANcoder leaves the other sample valid where the gateway
-// judges: the dependent reads invalid, but there is no kHardwareFault, no new
-// epoch, and the digital output keeps its request. The gateway's side of the
-// same two scenarios: Gateway.AMaskedDependentIsNotTotalLoss.
-TEST(SimHardwareTotalLoss, AMaskedDependentIsNotTotalLoss) {
+// REQ-SAFE-22, REQ-DEV-07: the gateway judges total loss on the State as
+// published, after it masks a follower of an invalid master or the motor a
+// reset CANcoder feeds. With such a pair as the only CAN devices,
+// disconnecting the master or resetting the CANcoder leaves no valid sample:
+// the dependent reads invalid, the State carries kHardwareFault and a new
+// epoch, and the digital output goes neutral. The gateway's side of the same
+// two scenarios: Gateway.EverySampleMaskedIsTotalLoss.
+TEST(SimHardwareTotalLoss, EverySampleMaskedIsTotalLoss) {
   struct Case {
     const char* name;
     std::string_view toml;
     const char* lost;       // disconnected (a motor) or reset (a CANcoder)
-    const char* dependent;  // masked with it, after the judgment
+    const char* dependent;  // masked with it by the gateway
   };
   constexpr std::string_view kFollowed = R"(
 [robot]
@@ -792,10 +791,103 @@ dio = 0
         EXPECT_FALSE(state.motors[i].valid) << c.dependent;
       }
     }
-    EXPECT_EQ(state.flags & hardware::kHardwareFault, 0u);
-    EXPECT_EQ(state.epoch, epoch);
-    EXPECT_TRUE(hw.applied_digital_output("mech", "led"));
+    EXPECT_NE(state.flags & hardware::kHardwareFault, 0u);
+    EXPECT_EQ(state.epoch, epoch + 1);
+    EXPECT_FALSE(hw.applied_digital_output("mech", "led"));
   }
+}
+
+// REQ-SAFE-22, REQ-SAFE-24, REQ-DEV-07: a CAN brownout resets every CAN
+// device at once. The RoboRIO reads the restoring Pigeon valid, but the
+// gateway masks it with the motor until the restore ends, so no State in
+// between carries a valid motion sample: total loss. The State carries
+// kHardwareFault and one new epoch, the node's robot_enabled() is false, and
+// every output is neutral, the digital and PWM outputs no feedback gates
+// included. The first State after the restore clears the fault, and the node
+// drives everything again. The gateway's side:
+// SimBackend.EveryDeviceResetIsTotalLoss.
+TEST(SimHardwareTotalLoss, EveryDeviceResetIsTotalLossUntilTheRestoreEnds) {
+  struct Mech {
+    explicit Mech(Node& n)
+        : node{n},
+          roller{n, "roller"},
+          imu{n, "imu"},
+          led{n, "led"},
+          servo{n, "servo"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      enabled = robot_enabled(node);
+      roller.set_voltage(3.0);
+      led.set(true);
+      servo.set(0.5);
+    }
+    Node& node;
+    Motor roller;
+    Gyro imu;
+    DigitalOutput led;
+    PwmOutput servo;
+    bool enabled = false;
+  };
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 50000
+
+[subsystems.mech.motors.roller]
+can_id = 1
+[subsystems.mech.sensors.imu]
+type = "Pigeon2"
+can_id = 30
+[subsystems.mech.digital_outputs.led]
+dio = 0
+[subsystems.mech.pwm_outputs.servo]
+channel = 0
+)");
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  const auto faulted = [&] {
+    return (LatestState(sim).flags & hardware::kHardwareFault) != 0;
+  };
+  const auto expect_outputs = [&](bool driving) {
+    EXPECT_EQ(hw.applied_motor("mech", "roller").mode,
+              driving ? Mode::kVoltage : Mode::kNeutral);
+    EXPECT_EQ(hw.applied_digital_output("mech", "led"), driving);
+    EXPECT_EQ(hw.applied_pwm("mech", "servo"),
+              driving ? std::optional{0.5} : std::nullopt);
+  };
+  sim.step(20ms);
+  ASSERT_TRUE(mech.enabled);
+  ASSERT_FALSE(faulted());
+  expect_outputs(true);
+  const std::uint64_t epoch = LatestState(sim).epoch;
+
+  hw.reset_device("mech", "roller");
+  hw.reset_device("mech", "imu");
+  sim.step(5ms);  // the first of two masking States
+  EXPECT_TRUE(faulted());
+  EXPECT_EQ(LatestState(sim).epoch, epoch + 1);
+  EXPECT_FALSE(LatestState(sim).sensors[0].valid);
+  expect_outputs(false);
+  sim.step(5ms);  // the second
+  EXPECT_TRUE(faulted());
+  EXPECT_FALSE(mech.enabled);
+  expect_outputs(false);
+  for (const auto& sample : LatestState(sim).digital_outputs) {
+    EXPECT_FALSE(sample.value);
+  }
+  for (const auto& sample : LatestState(sim).pwm_outputs) {
+    EXPECT_DOUBLE_EQ(sample.output, 0.0);
+  }
+  EXPECT_EQ(LatestState(sim).epoch, epoch + 1);  // one new epoch
+
+  sim.step(5ms);  // restored: no fault, same epoch
+  EXPECT_FALSE(faulted());
+  EXPECT_EQ(LatestState(sim).epoch, epoch + 1);
+  sim.step(10ms);
+  EXPECT_TRUE(mech.enabled);
+  expect_outputs(true);
 }
 
 // The RoboRIO observes the mode every tick, delivered or not: a disable lost

@@ -499,7 +499,8 @@ gateway cannot see, and their position steps legitimately when the TalonFX's rem
 whose positions are not physical (the ideal `SimBackend`) opts out through
 `Backend::PositionsArePhysical()`. A reset neutralizes only affected motors and
 their followers or remote-feedback dependents before starting
-`BeginRestoreAfterReset(ids)`. The global epoch and unrelated commands survive;
+`BeginRestoreAfterReset(ids)`. The global epoch and unrelated commands survive,
+unless the reset leaves no valid motion sample, which is total loss (below);
 observations up to the last State that masked the affected motors cannot
 authorize them after recovery.
 `PollRestore()` never blocks: Phoenix reapplies only the affected device chain
@@ -514,7 +515,9 @@ neutral tick, without relying on the backend to report a restoring chain
 invalid.
 `Gateway::restore_attempt_count()` counts all restore starts per boot. Motors whose control send failed join the
 same unavailable set: their followers and dependents go neutral at once, the
-rest of the command keeps applying, and restore re-applies the chain's config
+rest of the command keeps applying (unless the isolation leaves the State
+Accept publishes no valid motion sample: total loss, below, judged there
+too), and restore re-applies the chain's config
 before a fresh command retries the send. A motor that keeps failing is
 re-isolated on that retry, at the restore backoff rate, without a global fault;
 repeat failures do not count as `apply_failure_count`, but the motor stays
@@ -561,20 +564,23 @@ remains healthy while any configured motor or CAN sensor has valid feedback
 feedback neutralizes every output and advances
 the command epoch on the tick it is found, whether or not a command is in
 force; the fault is not latched, and clears in the same epoch on the first
-State with valid feedback. Total loss is judged on the samples
-`Backend::Read` reports, after the age bound and before the gateway's masks
-(unavailable, restoring or send-failed devices, their followers and
-remote-feedback motors, a chain whose restore ends that tick). A State can
-therefore carry every motor and CAN-sensor sample invalid with
-`kHardwareFault` clear: the tick in which a reset of every device is found
-(its samples read before the gateway learned of the reset), a master whose feedback is invalid with only its
-followers configured, and a restore of every motor and CAN sensor at once,
-since `PhoenixBackend` and both simulated backends read a restoring CAN
-sensor valid (only a restoring motor invalid). Each masked motor still goes
-neutral and drives again only on a command observing a later State, while
-digital and PWM outputs keep applying and `robot_enabled` stays true. With
-no CAN sensor configured, a reset of every motor is
-total loss from the tick after it is found until its restore ends. Failed
+State with valid feedback. Total loss is judged on the State as published:
+after the age bound and after the gateway's masks (unavailable, restoring or
+send-failed devices, their followers and remote-feedback motors, a chain
+whose restore ends that tick), so a State of a configured gateway with at
+least one motor or CAN sensor, none of them valid, always carries
+`kHardwareFault`. A reset of every motor and
+CAN sensor at once (a CAN brownout) is therefore total loss from the tick
+that finds it through the tick whose `PollRestore` ends the restore, whatever
+the backend reads for a restoring device (`PhoenixBackend` and both simulated
+backends read a restoring CAN sensor valid, a restoring motor invalid): for
+that time every output, DIO and PWM included, is neutral and `robot_enabled`
+is false, and the first State read after the restore clears the fault. So is
+a master whose feedback is invalid with only its followers configured. A
+reset that leaves any motor or CAN sensor valid (one motor beside a valid
+Pigeon 2) is not total loss: each masked motor goes neutral and drives again
+only on a command observing a later State, while digital and PWM outputs keep
+applying and `robot_enabled` stays true. Failed
 global Apply or backend configuration failure also neutralizes every output;
 individual device configuration or control-send failures do not. A rejected configuration push need not invalidate the active
 configuration.
@@ -981,7 +987,7 @@ or without a live command. Both keep each PWM output's last request
 | Stator current | Zero | (applied volts - back-EMF) / R, clamped to `stator_limit_a`; R and free speed from the motor type's published 12 V stall current and free speed (`MotorModelFor`: Kraken X60 366 A and 6000 rpm, the default; Kraken X44 275 A and 7530 rpm; Falcon 500 257 A and 6380 rpm). A motor held at a soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid, its age growing), per-device disconnect, controller restart |
-| Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it, so a config of only that chain is total feedback loss for that State; completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
+| Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it (the gateway masks it in those States either way); completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
 
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see

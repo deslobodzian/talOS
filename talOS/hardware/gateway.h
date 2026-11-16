@@ -32,8 +32,7 @@ class Backend {
   // value or an isolated device, and reports each sample's ages. The gateway
   // invalidates a motor or CAN-sensor sample whose position or velocity age is
   // at least `command_timeout_us` (UINT32_MAX: unknown; FeedbackFresh in
-  // gate.h) and treats every configured motor and CAN sensor invalid as total
-  // loss. Return false for a failed read pass or total motor/CAN-sensor
+  // gate.h). Return false for a failed read pass or total motor/CAN-sensor
   // feedback loss, not an individual dropout. With no such devices configured,
   // return true. An invalid sample gates only the affected motor and its
   // followers and dependents: neutral from the Tick that finds it, and driven
@@ -41,14 +40,14 @@ class Backend {
   // Read also fills `state.health.can_bus`, the health of CAN bus
   // `state.health.can_bus_index` (CanBuses order), or leaves it kNone; the
   // gateway sets the index and count and clears the slot before each Read.
-  // Total loss is judged on the samples Read returns, after the age bound and
-  // before the gateway's own masks (an unavailable, restoring or send-failed
-  // device, a follower or remote-feedback motor of one, a chain whose restore
-  // ends that tick): a sample Read reports valid counts there even when the
-  // published State carries it invalid. So whether a reset that masks every
-  // motor and CAN sensor faults depends on the backend: PhoenixBackend and
-  // both simulated backends read a restoring motor invalid and a restoring
-  // CAN sensor valid. The mask alone keeps each masked motor neutral.
+  // Total loss is judged on the State as published (AnyFeedbackValid,
+  // feedback.h): after the age bound and after the gateway's own masks (an
+  // unavailable, restoring or send-failed device, a follower or
+  // remote-feedback motor of one, a chain whose restore ends that tick). A
+  // reset that masks every motor and CAN sensor is total loss until its
+  // restore ends, whatever Read reports for a restoring device (PhoenixBackend
+  // and both simulated backends read a restoring motor invalid and a
+  // restoring CAN sensor valid).
   virtual bool Read(State&) = 0;
   // Followers ignore demand values, but kNeutral explicitly gates their output.
   // Gateway resolves a live follower's mode from its sanitized master.
@@ -81,7 +80,8 @@ class Backend {
   }
   // Individual device resets. Returns true and fills reset_ids with
   // the logical IDs of devices that reset since the last poll. The gateway
-  // neutralizes only affected motors and their dependents before restoring;
+  // neutralizes only affected motors and their dependents before restoring
+  // (every output, when the masks leave no valid motion sample: total loss);
   // their old observations cannot authorize motion after recovery. It masks
   // the restored chain in every State read before PollRestore reports the
   // restore ended, that tick's included, whatever Read reported for it, so
@@ -151,13 +151,16 @@ class Gateway {
   bool configuring() const { return configuring_; }
   void Tick(uint64_t now_us, bool driver_station_enabled);
   // Structural errors reject all outputs; range errors or invalid motor/remote
-  // CANcoder feedback neutralize only that motor. Total backend loss
-  // neutralizes all outputs and invalidates outstanding commands by advancing
-  // the epoch. A device-local send failure (ApplyFailedDevices) isolates only
-  // that motor's chain and the command is still accepted. Global apply
-  // failures (Apply/ApplyOutputs false, or every motor failing) invalidate
-  // commands and retry until the consecutive limit; re-enabling or any
-  // successful Reconfigure clears the apply-failure latch.
+  // CANcoder feedback neutralize only that motor. Total loss (no valid motor or
+  // CAN-sensor sample in the State Tick publishes, its masks included)
+  // neutralizes all outputs, refuses every command and invalidates
+  // outstanding commands by advancing the epoch; it is not latched, and the
+  // first State with a valid sample clears it. A device-local send failure
+  // (ApplyFailedDevices) isolates only that motor's chain and the command is
+  // still accepted, unless the isolation leaves no valid sample, which is
+  // total loss: Accept then returns false. Global apply failures (Apply/ApplyOutputs false, or every
+  // motor failing) invalidate commands and retry until the consecutive limit;
+  // re-enabling or any successful Reconfigure clears the apply-failure latch.
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
   // The State to publish. Every invalid motor or CAN-sensor sample carries
   // zero measurements (MarkInvalid); while unconfigured (configuring, or the
@@ -188,6 +191,10 @@ class Gateway {
   // before returning while a configure is pending.
   void PlaceCanBusSlot();
   bool JudgeFeedbackAge();
+  // Total loss on this tick's State after the gateway's masks
+  // (AnyFeedbackValid): healthy_ false and, when `was_healthy` or a command
+  // is in force, Invalidate.
+  void JudgeMaskedLoss(bool was_healthy);
   void PollResets();
   void FindPositionJumps(std::vector<uint16_t>& reset_ids);
   bool DeviceUnavailable(uint16_t id) const;
