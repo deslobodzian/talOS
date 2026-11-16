@@ -1,10 +1,11 @@
 """Tests for tools/check_robot_repository.sh with a stub `bazel`.
 
 REQ-DEV-32: a talOS change is checked against a robot repository that
-consumes it. The check must refuse a path that is not a git repository and
-must never write into the robot repository it reads (it builds a copy of its
-committed tree). The Bazel path itself is proved by running the script
-against a real robot repository by hand.
+consumes it. The check must refuse a path that is not a git repository, or
+one whose MODULE.bazel does not depend on talOS, and must never write into
+the robot repository it reads (it builds a copy of its committed tree). The
+Bazel path itself is proved by running the script against a real robot
+repository by hand.
 """
 
 import os
@@ -76,7 +77,8 @@ class CheckRobotRepositoryTest(unittest.TestCase):
                         GIT_CONFIG_NOSYSTEM="1")
 
         self.robot = os.path.join(self.tmp, "robot")
-        put(os.path.join(self.robot, "MODULE.bazel"), 'module(name = "robot")\n')
+        put(os.path.join(self.robot, "MODULE.bazel"),
+            'module(name = "robot")\n\nbazel_dep(\n    name = "talos",\n    version = "0.0.0",\n)\n')
         put(os.path.join(self.robot, "BUILD"), "")
         git(self.robot, "init", "-q")
         git(self.robot, "-c", "user.name=t", "-c", "user.email=t@t",
@@ -103,6 +105,19 @@ class CheckRobotRepositoryTest(unittest.TestCase):
         result = self.run_script(plain)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("not a git repository", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    # REQ-DEV-32
+    def test_refuses_a_repository_that_does_not_depend_on_talos(self):
+        # Built with Bzlmod off, Bazel would ignore --override_module and
+        # report a pass that never read this checkout.
+        put(os.path.join(self.robot, "MODULE.bazel"),
+            'module(name = "robot")\n# bazel_dep(name = "talos", version = "0.0.0")\n')
+        git(self.robot, "-c", "user.name=t", "-c", "user.email=t@t",
+            "commit", "-q", "-m", "no talos", "MODULE.bazel")
+        result = self.run_script(self.robot)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("not a talOS-dependent repository", result.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_builds_a_copy_and_never_writes_the_source(self):

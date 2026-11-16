@@ -6,7 +6,9 @@
 #
 #   tools/check_robot_repository.sh PATH [BAZEL_FLAG...]
 #
-# PATH is the robot repository's git checkout. Its committed tree (`git
+# PATH is the robot repository's git checkout, whose committed MODULE.bazel
+# has a `bazel_dep(name = "talos")` (otherwise the check refuses it, exit
+# 2: nothing there would read this checkout). Its committed tree (`git
 # archive HEAD`, which holds no submodule content) is copied to
 # ${TMPDIR:-/tmp}/talos-robot-check-<uid>; PATH itself is only read, never
 # built in or written to (its git commands take no optional locks, so not
@@ -52,6 +54,16 @@ top="$(git --no-optional-locks -C "$source_repo" rev-parse --show-toplevel 2>/de
 robot_commit="$(git --no-optional-locks -C "$source_repo" rev-parse --short --verify --quiet 'HEAD^{commit}')" ||
   die "$source_repo has no commit"
 [ "$source_repo" != "$talos" ] || die "$source_repo is this talOS checkout, not a robot repository"
+# Bazel ignores --override_module for a repository that builds with Bzlmod
+# off (its .bazelrc can say so), and would then report a pass that never
+# read this checkout; so the committed MODULE.bazel must name talOS.
+# Comments are dropped and lines joined, so a bazel_dep spread over lines
+# counts and one commented out does not.
+module="$(git --no-optional-locks -C "$source_repo" show 'HEAD:MODULE.bazel' 2>/dev/null)" ||
+  die "$source_repo is not a talOS-dependent repository: its commit $robot_commit has no MODULE.bazel"
+printf '%s\n' "$module" | sed 's/#.*//' | tr '\n' ' ' |
+  grep -Eq 'bazel_dep\([[:space:]]*name[[:space:]]*=[[:space:]]*"talos"' ||
+  die "$source_repo is not a talOS-dependent repository: the MODULE.bazel of its commit $robot_commit has no bazel_dep(name = \"talos\")"
 talos_commit="$(git -C "$talos" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 [ -n "$(git -C "$talos" status --porcelain 2>/dev/null)" ] && talos_commit="$talos_commit+changes"
 tmp="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" ||

@@ -284,6 +284,7 @@ py_test(
         "check_host_includes.py",
         "make_sources_read_only.py",
         "prepush.sh",
+        "prepush_robot_repository.sh",
     ],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
@@ -301,6 +302,17 @@ py_test(
         "check_copy_lock.sh",
         "check_robot_repository.sh",
     ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)
+
+# tools/prepush.sh sources prepush_robot_repository.sh for whether its
+# robot-repository step runs, is skipped or fails (TALOS_ROBOT_REPOSITORY).
+py_test(
+    name = "prepush_robot_repository_test",
+    size = "small",
+    srcs = ["prepush_robot_repository_test.py"],
+    data = ["prepush_robot_repository.sh"],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
 )
