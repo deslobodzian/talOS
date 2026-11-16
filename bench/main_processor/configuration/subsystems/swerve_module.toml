@@ -10,6 +10,13 @@ node = "//bench/main_processor/swerve_module:node"
 period_us = 5000
 # Provisional: the node's own cap on the asked drive velocity, in the drive
 # motor's mechanism unit (rotor rps until the drive reduction is entered).
+# tools/test_rio_in_the_loop.py asks this module for 10 rps (DRIVE_RPS, so
+# capped here) and its driving scenario needs some State with the drive at
+# >= 1.0 V and >= 1.0 rps (DRIVEN_VOLTS, DRIVEN_RPS). With the drive's
+# provisional slot0 (v = 0.12 V/rps, p = 0.1) it settles near 1.2 V; a cap
+# below about 8.3 rps, a lower v or p, a lower max_voltage, or a
+# sensor_to_mechanism_ratio that rescales the asked velocity can keep it
+# under 1.0 V and fail that scenario: retune its thresholds with these.
 max_drive_velocity_rps = 10.0
 
 [motors.drive]

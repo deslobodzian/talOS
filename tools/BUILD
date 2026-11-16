@@ -301,6 +301,19 @@ py_test(
     deps = ["@rules_python//python/runfiles"],
 )
 
+# python3 tools/test_rio_in_the_loop.py: its narrowing of the bench config
+# to the subject's subsystem (subject_config), pure text in and out.
+py_test(
+    name = "test_rio_in_the_loop_test",
+    size = "small",
+    srcs = [
+        "test_rio_in_the_loop.py",
+        "test_rio_in_the_loop_test.py",
+    ],
+    legacy_create_init = False,
+    main = "test_rio_in_the_loop_test.py",
+)
+
 # python3 tools/check_host_includes.py DIR (tools/prepush.sh, after the build)
 # No compile read a header from the host's include tree but the C library's,
 # the kernel's and the C++ standard library's.

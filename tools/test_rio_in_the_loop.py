@@ -448,16 +448,21 @@ def subject_config(config, output):
     subject's [[subsystems]] entry with its paths made absolute, so its
     subsystem file is read in place: the same robot settings, devices, CAN
     ids and buses, with the subject's drive motor first, and nothing copied
-    by hand. It is cut line by line, not through tomllib, which the system
-    python3 the sim_gateway mode supports (3.8) lacks; a top-level key or a
-    missing entry fails the run, and anything else the node and bridge
-    cannot load fails it there.
+    by hand. [studio] is left out (no Studio runs here). It is cut line by
+    line, not through tomllib, which the system python3 the sim_gateway mode
+    supports (3.8) lacks, and it fails closed: a top-level key, a table it
+    does not know (a future hardware table must not be dropped unseen), a
+    header it cannot read or a missing entry fails the run, and anything
+    else the node and bridge cannot load fails it there.
     """
     blocks = []  # (bracket, table name, lines)
     for line in config.read_text().splitlines():
         header = TOML_HEADER.match(line)
         if header:
             blocks.append((header.group(1), header.group(2), [line]))
+        elif line.lstrip().startswith("["):
+            raise RuntimeError(f"{config}: cannot read the header "
+                               f"{line.strip()!r}")
         elif blocks:
             blocks[-1][2].append(line)
         elif line.strip() and not line.lstrip().startswith("#"):
@@ -466,9 +471,16 @@ def subject_config(config, output):
     kept = []
     entries = 0
     for bracket, name, lines in blocks:
-        if bracket == "[" and (name == "robot" or name.startswith("robot.")):
+        if name == "robot" or name.startswith("robot."):
             kept += lines
-        elif bracket == "[[" and name == "subsystems":
+        elif bracket == "[" and name == "studio":
+            continue
+        elif bracket != "[[" or name != "subsystems":
+            raise RuntimeError(f"{config}: {lines[0].strip()} is not "
+                               f"[robot], [robot.*], [studio] or "
+                               f"[[subsystems]], so the subject config "
+                               f"would drop it")
+        else:
             names = [m.group(1) for m in map(TOML_NAME.match, lines) if m]
             if names != [SUBJECT]:
                 continue
