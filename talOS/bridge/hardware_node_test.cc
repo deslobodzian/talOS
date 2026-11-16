@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -61,6 +62,14 @@ namespace talos::hardware {
 namespace {
 using namespace bridge_test;  // NOLINT(google-build-using-namespace)
 
+// Waits until a datagram is queued on the bridge's socket, so the next Tick
+// reads it: a loopback send can complete before the datagram is queued
+// (notably on BSD). The 10 s deadline only bounds a hang (TESTING.md 6.3).
+bool DatagramQueued(const HardwareNode& node) {
+  pollfd readable{node.udp_fd(), POLLIN, 0};
+  return ::poll(&readable, 1, 10'000) == 1 && (readable.revents & POLLIN) != 0;
+}
+
 TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
   Link link;
@@ -79,11 +88,8 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
                                    dummy_payload.data(), dummy_payload.size()),
             protocol::UdpStatus::kOk);
 
-  for (int i = 0; i < 20; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    node.Tick(2000 + i * 1000);
-    if (node.driver_station_packets_received() > 0) break;
-  }
+  ASSERT_TRUE(DatagramQueued(node));
+  node.Tick(2000);
 
   EXPECT_EQ(node.driver_station_packets_received(), 1u);
   auto pkt = ds_sub.read();
@@ -98,7 +104,7 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
     ASSERT_EQ(gateway_peer.SendFrame(protocol::FrameType::kDriverStation, 2,
                                      2000, bytes, size),
               protocol::UdpStatus::kOk);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    ASSERT_TRUE(DatagramQueued(node));
     node.Tick(30000);
   };
   const uint8_t malformed[] = {1, 2, 3};
@@ -836,10 +842,8 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
                               999500, ack_bytes.data(), ack_bytes.size()),
             protocol::UdpStatus::kOk);
-  for (int i = 0; i < 200 && !node.is_configured(); ++i) {
-    node.Tick(999500);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
+  ASSERT_TRUE(DatagramQueued(node));
+  node.Tick(999500);
   ASSERT_TRUE(node.is_configured());
   EXPECT_TRUE(node.Status(999500).configured());
 
