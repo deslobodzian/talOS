@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -136,6 +137,17 @@ RecordedSession::RecordedSession(const std::string& path,
     std::vector<std::pair<std::uint32_t, bool>> topics;
   };
   std::vector<ReadLog> logs;
+  // Each file read, by path: its origin, then the now_ns of its last intact
+  // record and by source id its watchers' last intact receipts' publication
+  // times. A segment of the same log (LogSegmentFiles: the next one, with
+  // its origin and manifest) starts from them, so damage right after its
+  // header is bounded as it would be in one file.
+  struct Carried {
+    MonotonicTime origin;
+    std::optional<std::int64_t> last_now;
+    std::vector<std::optional<std::int64_t>> last_receipt;
+  };
+  std::map<std::string, Carried> carried;
   bool first = true;
 
   for (const std::string& log_path : log_paths_) {
@@ -188,6 +200,20 @@ RecordedSession::RecordedSession(const std::string& path,
     std::optional<std::int64_t> last_now;
     std::vector<std::optional<std::int64_t>> last_receipt(
         reader.manifest().size());
+    {
+      const std::vector<std::string> segments =
+          log::LogSegmentFiles(LogOfFile(log_path));
+      const auto at = std::find(segments.begin(), segments.end(), log_path);
+      if (at != segments.end() && at != segments.begin()) {
+        const auto previous = carried.find(*std::prev(at));
+        if (previous != carried.end() &&
+            previous->second.origin == reader.start_time() &&
+            previous->second.last_receipt.size() == last_receipt.size()) {
+          last_now = previous->second.last_now;
+          last_receipt = previous->second.last_receipt;
+        }
+      }
+    }
     ReadLog read{.path = log_path};
     for (const Registration& registration : reader.manifest()) {
       if (registration.kind == SourceKind::TIMER && registration.armed &&
@@ -375,6 +401,7 @@ RecordedSession::RecordedSession(const std::string& path,
                           "damaged stretch, or is refused\n"
                         : "; its intact records replay\n");
     }
+    carried[log_path] = {reader.start_time(), last_now, last_receipt};
     read.gap = gap;
     read.topics = std::move(recorded);
     logs.push_back(std::move(read));

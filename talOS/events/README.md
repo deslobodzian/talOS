@@ -394,6 +394,9 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   intact record's `now_ns`. A reader's receipt is fed at its publication
   time, and a watcher receives its topic in sequence order, whose
   publication times never decrease: the bound is its last intact receipt's.
+  Both carry across the segments of one capped log: damage right after a
+  later segment's header is bounded by the segment before it, when that one
+  was read.
   `first_gap_damage_offset` and `InputReplayReport::Gap::damage_offset` give
   the stretch's byte offset. A node binary prints `replay-inputs: stopped
   before damaged records in <log> at byte <offset>, <t> s after the session

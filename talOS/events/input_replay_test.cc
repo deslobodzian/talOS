@@ -884,6 +884,34 @@ TEST(InputReplay, StopsAtOrRefusesDamageByWhenItsLostRecordsWereFed) {
     std::filesystem::remove_all(out);
   }
   {
+    // The bound carries across the segments of one log: damage right after
+    // a later segment's header is bounded by the previous segment's last
+    // intact record, as it would be in one file.
+    SCOPED_TRACE("a writer's sends, at a later segment's head");
+    const std::string dir = TempDir("damage_segment");
+    const std::string out = TempDir("damage_segment_out");
+    WriterLog(dir);
+    const std::string path = dir + "/writer.tlog";
+    RotateAt(path, {kOrigin + 3ms});  // the third tick starts a segment
+    const std::uint64_t head = RecordOffsets(path).front();
+    DamageRecord(path, head);
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/watcher.tlog", "watcher"},
+              Loop::Options{.start = session.start()}};
+    SensorWatcher watcher{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    ASSERT_TRUE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.stopped_at_gap->log, path);
+    // The second send's now, the previous segment's last record.
+    EXPECT_EQ(report.stopped_at_gap->at, kOrigin + 2ms);
+    ASSERT_TRUE(report.stopped_at_gap->damage_offset.has_value());
+    EXPECT_EQ(report.stopped_at_gap->damage_offset.value(), head);
+    EXPECT_EQ(watcher.readings, 1);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
     SCOPED_TRACE("its own receipts");
     const std::string dir = TempDir("damage_own");
     const std::string out = TempDir("damage_own_out");
