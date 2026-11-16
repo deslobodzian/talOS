@@ -677,13 +677,19 @@ export function topicEnds(nodes: readonly EndHolder[]): Map<string, TopicEnds> {
 // allowed to be waiting for one. Calling either a fault is how an attention
 // list earns the habit of being ignored, which costs more than the two states
 // it would have reported.
+//
+// An observer (a source with `observer` set, naming::kSourceFlagObserver in
+// talOS/introspection/names.h: telemetry) counts as a reader here and nowhere
+// else, as the launcher's "published but nothing subscribes to it" counts it,
+// so this badge and that lint agree.
 export function topicHealth(topic: SystemTopic,
                             ends: TopicEnds = PLAIN_ENDS): TopicHealth {
-  const halfWired = !topic.publishers.length || !topic.subscribers.length;
+  const read = topic.subscribers.length > 0 || topic.observers.length > 0;
+  const halfWired = !topic.publishers.length || !read;
   if (halfWired && ends.external) return 'bridged';
   if (halfWired && ends.optional) return 'unconnected';
   if (!topic.publishers.length) return 'orphaned';
-  if (!topic.subscribers.length) return 'unread';
+  if (!read) return 'unread';
   if (topic.dropped !== '0') return 'lossy';
   if (topic.published === '0') return 'idle';
   return 'ok';

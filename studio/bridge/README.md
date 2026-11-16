@@ -145,7 +145,10 @@ can never be sent: the bridge logs that once when the graph crosses the
 burst, sends no notice (the client's graph goes stale, which is the truth),
 and still serves it at `/system.json`. It opens the registry lazily. Topic health is
 computed in [`system.h`](system.h): missing ends are `bridged` when external,
-otherwise `unconnected` when optional, otherwise `orphaned` or `unread`;
+otherwise `unconnected` when optional, otherwise `orphaned` or `unread`
+(an observer counts as a reader for `unread`, as in the launcher's
+[graph lint](../../talOS/NAMING.md#topics), so Studio and the launcher name the
+same unread topics);
 connected topics are `lossy` when an end lost messages, `idle` before
 publication, and `ok` otherwise. A topic's `dropped` sums every end except
 latest-only watchers (source `latest_only: true`): the registry records one

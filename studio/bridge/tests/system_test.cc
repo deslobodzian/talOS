@@ -294,6 +294,46 @@ TEST(TopicHealth, SeparatesADesignedDeadEndFromABrokenOne) {
   EXPECT_EQ(HealthOf(*teleop), TopicHealth::ORPHANED);
 }
 
+// REQ-CONTRACT-09
+TEST(TopicHealth, AnObservedTopicIsReadAsTheLaunchersLintCountsIt) {
+  // The lint's "published but nothing subscribes to it" counts observers
+  // (naming::kSourceFlagObserver, telemetry) as readers; this verdict must
+  // agree, or Studio names a topic the launcher has stopped naming.
+  introspect::NodeSnapshot gyro;
+  gyro.name = "gyro";
+  gyro.alive = true;
+  gyro.sources = {{.id = 0,
+                   .kind = event::SourceKind::SENDER,
+                   .name = "/gyro/state",
+                   .message_bytes = 32,
+                   .events = 10},
+                  {.id = 1,
+                   .kind = event::SourceKind::SENDER,
+                   .name = "/gyro/status",
+                   .message_bytes = 16,
+                   .events = 10}};
+  introspect::NodeSnapshot telemetry;
+  telemetry.name = "telemetry";
+  telemetry.alive = true;
+  telemetry.sources = {{.id = 0,
+                        .kind = event::SourceKind::WATCHER,
+                        .name = "/gyro/state",
+                        .message_bytes = 32,
+                        .flags = naming::kSourceFlagObserver,
+                        .events = 10}};
+
+  const std::vector<TopicRow> topics = TopicsOf({gyro, telemetry});
+  const TopicRow* observed = Row(topics, "/gyro/state");
+  ASSERT_NE(observed, nullptr);
+  // Still listed apart from subscribers: only the verdict counts it.
+  EXPECT_TRUE(observed->subscribers.empty());
+  EXPECT_EQ(observed->observers, std::vector<std::string>{"telemetry"});
+  EXPECT_EQ(HealthOf(*observed), TopicHealth::OK);
+
+  // Nobody reads it and nobody observes it: still unread.
+  EXPECT_EQ(HealthOf(*Row(topics, "/gyro/status")), TopicHealth::UNREAD);
+}
+
 TEST(TopicHealth, ExternalOutranksOptionalOnTheSameTopic) {
   // Both flags on one topic is not a contradiction: an end can be outside
   // talOS and not yet wired up. `bridged` wins because it is the more specific
