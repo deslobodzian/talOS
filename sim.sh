@@ -253,7 +253,10 @@ if [ "$WANT_GATEWAY" = "1" ] && [ -z "$(target sim_gateway)" ]; then
   die "$CONFIG sets no [robot] sim_gateway for --sim-gateway to start"
 fi
 
-SESSION_ID="$(date +%s)"
+# The launcher takes a number (uint64). The second alone collides for two
+# starts in one second; the shell's pid (below 2^22 on Linux, 99999 on macOS,
+# so seven digits) makes the key unique among concurrent runs.
+SESSION_ID="$(date +%s)$(printf '%07d' "$$")"
 OUT_DIR="/tmp/talos_logs"
 SESSION_DIR="${OUT_DIR}/${SESSION_ID}"
 LOG_DIR="${SESSION_DIR}/sim"
