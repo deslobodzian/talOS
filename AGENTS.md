@@ -25,7 +25,7 @@ bazel build //...
 bazel test //...                      # CI runs build and test with --test_output=errors
 bazel test //examples/superstructure/...
 bazel test //path/to/package:all      # narrow loop while iterating
-bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configuration/robot.toml --describe-only
+bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --describe-only
 ```
 
 - Packet/slot size changes: follow RULES.md 9 (`docs/DATA_FLOW.md` and the size assert).
@@ -46,9 +46,11 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
 ## Run in simulation
 
 ```sh
-./sim.sh --sim-gateway --no-studio   # lightweight simulator, no WPILib
-./sim.sh                             # WPILib RoboRIO sim + Studio
+./sim.sh --sim-gateway --no-studio   # the bench robot on the lightweight simulator, no WPILib
+./sim.sh                             # the bench robot on the WPILib RoboRIO sim + Studio
 ```
+
+A robot in its own repository (the 2026 robot) runs there: `bazel run //:sim`.
 
 ## Agent roles
 

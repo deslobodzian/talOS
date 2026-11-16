@@ -65,7 +65,7 @@ setup warns about this.
 | `--no-studio` | skip Node 22/pnpm |
 | `--no-rio` | skip JDK 17 and `./gradlew installRoboRioToolchain` |
 | `--no-lint` | skip clang-format/clang-tidy 18 wheels, buildifier |
-| `--verify` | build the launcher, `//talOS/bridge:hardware_node` and every node the 2026 config names, then run `--describe-only` on it |
+| `--verify` | build the launcher, `//talOS/bridge:hardware_node` and every node the bench robot's config (`bench/main_processor/configuration/robot.toml`) names, then run `--describe-only` on it |
 | `-h`, `--help` | usage |
 
 Package managers: apt (Ubuntu/Debian), dnf (Fedora), pacman (Arch), brew (macOS).

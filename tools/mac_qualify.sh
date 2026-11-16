@@ -9,10 +9,12 @@
 # with nobody logged in needs (tools/deploy.sh boot-check: FileVault off,
 # pmset autorestart 1 and sleep 0, automatic updates reported; read-only, no
 # sudo); bazel build //...; bazel test --test_output=errors //...; launcher
-# --describe-only on every robot config;
-# restart latency on the physics simulation, idle and under disk load
-# (//talOS/launcher:restart_latency); the pose_estimator update() benchmark
-# for both backends. Every step runs even after a failure; a summary lists
+# --describe-only on every robot and example config in this checkout;
+# restart latency on the bench's physics simulation, idle and under disk
+# load (//talOS/launcher:restart_latency: the C++ swerve_module at 5 ms, and
+# the Python motor and gyro nodes' spawns). A robot in its own repository
+# (the 2026 robot) qualifies its own nodes, such as its pose_estimator
+# benchmark, there. Every step runs even after a failure; a summary lists
 # each step's result, and the exit status is 1 if any failed. All output is
 # also written to the log (default /tmp/talos-qualify-<host>-<time>.log).
 #
@@ -55,14 +57,15 @@ if [ "$(uname -s)" = "Darwin" ]; then
   caffeinate -s -i -w $$ &
 fi
 
-CONFIGS="2026-robot/main_processor/configuration/robot.toml
-2026-robot/main_processor/configuration/robot_field.toml
-2026-robot/main_processor/configuration/robot_physics_sim.toml
-bench/main_processor/configuration/robot.toml
+CONFIGS="bench/main_processor/configuration/robot.toml
+bench/main_processor/configuration/robot_py.toml
 bench/main_processor/configuration/robot_bench.toml
+bench/main_processor/configuration/robot_physics_sim.toml
 examples/superstructure/config/robot.toml
 examples/superstructure/config/robot_py.toml"
-PHYSICS_SIM=2026-robot/main_processor/configuration/robot_physics_sim.toml
+PHYSICS_SIM=bench/main_processor/configuration/robot_physics_sim.toml
+# The critical node restart_latency SIGKILLs; it sends /hw/request/<node>.
+RESTART_NODE=swerve_module
 
 SUMMARY=""
 FAILED=0
@@ -131,14 +134,11 @@ GATEWAY="--start-sim-gateway --sim-gateway-arg=--physics"
 # shellcheck disable=SC2086
 run_step "restart latency, idle" \
   bazel run //talOS/launcher:restart_latency -- --config "$PHYSICS_SIM" \
-  --evict-cache $GATEWAY
+  --node "$RESTART_NODE" --evict-cache $GATEWAY
 # shellcheck disable=SC2086
 run_step "restart latency, 8 disk writers" \
   bazel run //talOS/launcher:restart_latency -- --config "$PHYSICS_SIM" \
-  --disk-load 8 --python-kills 0 $GATEWAY
-
-run_step "pose_estimator update() benchmark" \
-  bazel run //2026-robot/main_processor/pose_estimator:update_benchmark -- --backend both
+  --node "$RESTART_NODE" --disk-load 8 --python-kills 0 $GATEWAY
 
 section "summary"
 printf '%s' "$SUMMARY"
