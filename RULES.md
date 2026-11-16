@@ -10,9 +10,12 @@ at; they are not restated here.
 Breaking one of these is a review blocker.
 
 1. Actuation is gated on `robot_enabled(node)` and a live target
-   (`talos::Target::get()` non-null). No motor keeps driving after disable, on
-   hardware state older than `command_timeout_us`, or on a target that is not
-   `fresh()`.
+   (`talos::Target::get()` non-null in that `update()`), and the devices
+   flush enforces both. No motor keeps driving after disable, on hardware
+   state older than `command_timeout_us`, or on a target that is not
+   `fresh()`. `talos::AllowUntargetedOutputs` lifts the target half for a
+   test or bench fixture only; a robot node that calls it is a rule change
+   to ask about.
 2. Hardware requests leave only through the devices-layer flush after
    `update()`. Never write `/hw/request/<node>` directly or send a request from
    outside `update()`.
