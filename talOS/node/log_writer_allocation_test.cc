@@ -83,7 +83,9 @@ void Dispatch(LogWriter& writer, std::uint64_t d,
 
 // A disk that stops returning fills the pool; the loop thread then drops
 // hundreds of records into one gap, and once half the pool is written
-// resumes with a GAP record, allocating nothing in either window.
+// resumes with a GAP record. A record larger than the chunks opens a gap of
+// its own, a dispatch whose record is too large to resume with is dropped,
+// and the next dispatch resumes. None of it allocates.
 // REQ-RT-11
 TEST(LogWriterAllocation, DroppingAndResumingAllocateNothingOnTheLoopThread) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
@@ -93,6 +95,7 @@ TEST(LogWriterAllocation, DroppingAndResumingAllocateNothingOnTheLoopThread) {
   const std::string path = ::testing::TempDir() + "/log_writer_allocation_" +
                            std::to_string(::getpid()) + ".tlog";
   const std::vector<std::byte> payload(64, std::byte{0x5a});
+  const std::vector<std::byte> oversized(8192, std::byte{0x5a});
   WriteGate gate;
   LogWriter::Options options{4096, 4, /*background=*/true};
   options.write_interval = std::chrono::hours{24};
@@ -124,6 +127,16 @@ TEST(LogWriterAllocation, DroppingAndResumingAllocateNothingOnTheLoopThread) {
     EXPECT_EQ(resuming, 0u) << probe.sites();
     EXPECT_FALSE(writer.losing());
     EXPECT_EQ(writer.gaps(), 1u);
+
+    probe.start();
+    Dispatch(writer, 267, oversized);  // too large: a gap of its own
+    Dispatch(writer, 268, oversized);  // could resume, but too large
+    Dispatch(writer, 269, payload);    // resumes
+    const std::uint64_t too_large = probe.stop();
+    EXPECT_EQ(too_large, 0u) << probe.sites();
+    EXPECT_FALSE(writer.losing());
+    EXPECT_EQ(writer.gaps(), 2u);
+    EXPECT_EQ(writer.lost_records(), 2u * 200 + 4);
     gate.open();
   }
   ::unlink(path.c_str());

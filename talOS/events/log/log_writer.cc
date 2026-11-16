@@ -552,7 +552,7 @@ void LogWriter::State::lose(const RecordHeader& header,
                      std::memory_order_relaxed);
 }
 
-// Capture resumes only with half the pool free (at least one chunk): a gap
+// Capture resumes only with half the pool free, rounded up (2 of 3): a gap
 // opens only once every chunk is handed over, so between two GAP records of
 // a full pool the loop hands over at least half the pool, and the writer
 // still has the other half queued when capture resumes.
@@ -560,7 +560,7 @@ bool LogWriter::State::room_to_resume() const noexcept {
   if (!options.background) return true;
   const std::uint64_t outstanding = submitted.load(std::memory_order_relaxed) -
                                     completed.load(std::memory_order_acquire);
-  const std::uint64_t half = std::max<std::uint64_t>(1, pool.size() / 2);
+  const std::uint64_t half = (pool.size() + 1) / 2;
   return outstanding + half <= pool.size();
 }
 
@@ -1024,6 +1024,8 @@ std::uint64_t LogWriter::gaps() const noexcept {
 std::uint64_t LogWriter::lost_records() const noexcept {
   return state_->lost_records.load(std::memory_order_relaxed);
 }
+
+bool LogWriter::incomplete() const noexcept { return failed() || gaps() > 0; }
 
 bool LogWriter::losing() const noexcept {
   return state_->losing_flag.load(std::memory_order_relaxed);
