@@ -647,8 +647,7 @@ uint64_t ChildOutput::Dropped(const std::string& path) const {
 
 void ChildOutput::Wake() { WakeUp(wake_); }
 
-void ChildOutput::Deliver(const Stream& stream, const char* data,
-                          std::size_t size) {
+void ChildOutput::Deliver(Stream& stream, const char* data, std::size_t size) {
   {
     const std::lock_guard lock{mutex_};
     Pending& pending = pending_[stream.path];
@@ -662,14 +661,41 @@ void ChildOutput::Deliver(const Stream& stream, const char* data,
     dirty_ = true;
   }
   arrived_.notify_all();
-  if (stream.echo && echo_ != nullptr) echo_->Echo({data, size});
+  if (!stream.echo || echo_ == nullptr) return;
+  // Whole lines only, so that nothing lands inside one on the console.
+  const std::string_view bytes{data, size};
+  const std::size_t last = bytes.rfind('\n');
+  if (last != std::string_view::npos) {
+    if (stream.echo_held.empty()) {
+      echo_->Echo(bytes.substr(0, last + 1));
+    } else {
+      stream.echo_held.append(bytes.substr(0, last + 1));
+      echo_->Echo(stream.echo_held);
+      stream.echo_held.clear();
+    }
+  }
+  stream.echo_held.append(
+      last == std::string_view::npos ? bytes : bytes.substr(last + 1));
+  // A line that never ends would hold memory without bound: forward it,
+  // split, as a line of its own.
+  if (stream.echo_held.size() > kChildOutputReadBytes) EndEcho(stream);
+}
+
+void ChildOutput::EndEcho(Stream& stream) {
+  if (stream.echo_held.empty()) return;
+  // A line of its own on the console, so that the next line (the launcher's
+  // "exited", which can come first) does not join it. Only the echo: the
+  // log has every byte as it was read.
+  stream.echo_held += '\n';
+  if (echo_ != nullptr) echo_->Echo(stream.echo_held);
+  stream.echo_held.clear();
 }
 
 void ChildOutput::ReadLoop() {
   std::vector<Stream> streams;
   std::vector<Stream> picked;
   std::vector<::pollfd> fds;
-  std::vector<char> buffer(std::size_t{64} * 1024);
+  std::vector<char> buffer(kChildOutputReadBytes);
   std::optional<Clock::time_point> give_up;
   for (;;) {
     {
@@ -691,6 +717,7 @@ void ChildOutput::ReadLoop() {
             continue;
           } else {
             if (got == 0 || errno != EAGAIN) {
+              EndEcho(earlier);
               ::close(earlier.fd);
               earlier.fd = -1;
             }
@@ -744,12 +771,17 @@ void ChildOutput::ReadLoop() {
         if (kept != i) streams[kept] = std::move(streams[i]);
         ++kept;
       } else {
+        EndEcho(streams[i]);
         ::close(streams[i].fd);
       }
     }
     streams.resize(kept);
   }
-  for (const auto& stream : streams) ::close(stream.fd);
+  // The session's end: what a member left of a line is shown, as a line.
+  for (auto& stream : streams) {
+    EndEcho(stream);
+    ::close(stream.fd);
+  }
 }
 
 void ChildOutput::WriteLoop() {

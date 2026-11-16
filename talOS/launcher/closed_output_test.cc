@@ -36,6 +36,7 @@
 #include <string_view>
 
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/launcher/child_output.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/testdata/first_exec.h"
 
@@ -615,6 +616,103 @@ TEST(ClosedOutput, StreamNoteWaitsForTheLineInProgress) {
   const std::size_t note = talos_log.find("[launcher] stdout: ");
   ASSERT_NE(note, std::string::npos) << "talos.log:\n" << talos_log;
   EXPECT_EQ(note, whole + line.size()) << "talos.log:\n" << talos_log;
+}
+
+// REQ-OPS-33
+// A member's stdio to its pipe is fully buffered, so one line can reach the
+// launcher in two reads. The echo holds the first part, and the launcher's
+// stdout shows a launcher line printed between the reads before the member's
+// line, whole. A forked launcher-to-be drains two member pipes the test
+// writes, `a` and `b`, echoing both. Steps: `a` "abc"; `b` "one\n", which
+// the reader reads after "abc" unless poll() scans `a` just before "abc"
+// arrives; the launcher prints its line; `a` "def\n" and then more than
+// kChildOutputReadBytes of a line without a newline, which must show, ended
+// by a newline, before its end once the held part exceeds that bound; `a`
+// "tail" and its end, which must show as "tail\n": a partial line forwarded
+// is a console line of its own, so the launcher's next line (an "exited")
+// never joins it. Before the line hold the stdout read
+// "abcone\n[launcher] between\ndef\n...". `a`'s log takes every byte, as
+// before, and no newline the member did not write.
+TEST(ClosedOutput, EchoForwardsAMembersLinesWhole) {
+  const std::string a_log = TempPath("echo_a.log");
+  const std::string b_log = TempPath("echo_b.log");
+  ::remove(a_log.c_str());
+  ::remove(b_log.c_str());
+  int output[2];
+  int a[2];
+  int b[2];
+  int go[2];
+  ASSERT_EQ(::pipe(output), 0);
+  ASSERT_EQ(::pipe(a), 0);
+  ASSERT_EQ(::pipe(b), 0);
+  ASSERT_EQ(::pipe(go), 0);
+  std::fflush(nullptr);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(output[0]);
+    ::close(a[1]);
+    ::close(b[1]);
+    ::close(go[1]);
+    const int null = ::open("/dev/null", O_WRONLY);
+    if (null < 0 || ::dup2(output[1], STDOUT_FILENO) < 0 ||
+        ::dup2(null, STDERR_FILENO) < 0)
+      ::_exit(100);
+    ::close(output[1]);
+    {
+      LauncherOutput launcher;
+      ChildOutput members{&launcher};
+      members.Add(a[0], a_log, "a", 1, /*echo=*/true);
+      members.Add(b[0], b_log, "b", 2, /*echo=*/true);
+      char byte = 0;
+      if (::read(go[0], &byte, 1) != 1) ::_exit(101);
+      std::cout << "[launcher] between\n";
+      // Until the test has closed every pipe.
+      if (::read(go[0], &byte, 1) != 0) ::_exit(102);
+      members.Stop(std::chrono::milliseconds{kHangMs});
+      launcher.Stop(std::chrono::milliseconds{kHangMs});
+    }
+    ::_exit(0);
+  }
+  ::close(output[1]);
+  ::close(a[0]);
+  ::close(b[0]);
+  ::close(go[0]);
+  const auto put = [](int fd, std::string_view bytes) {
+    return ::write(fd, bytes.data(), bytes.size()) ==
+           static_cast<ssize_t>(bytes.size());
+  };
+  const std::string unended(kChildOutputReadBytes + 1, 'x');
+  const std::string lines = "one\n[launcher] between\nabcdef\n";
+  std::string seen;
+  bool steps = put(a[1], "abc") && put(b[1], "one\n") &&
+               AwaitText(output[0], seen, "one\n") && put(go[1], "g") &&
+               AwaitText(output[0], seen, "between\n") && put(a[1], "def\n") &&
+               put(a[1], unended) && AwaitText(output[0], seen, unended + "\n");
+  steps = steps && put(a[1], "tail");
+  ::close(a[1]);
+  ::close(b[1]);
+  ::close(go[1]);
+  const bool ended = AwaitEnd(output[0], seen);
+  ::close(output[0]);
+  const int status = Reap(child);
+  const std::string a_written = ReadFile(a_log);
+  ::remove(a_log.c_str());
+  ::remove(b_log.c_str());
+
+  // Without the bound, the unended line never shows before the end.
+  ASSERT_TRUE(steps) << "stdout so far:\n" << seen.substr(0, 200);
+  EXPECT_TRUE(ended);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  // A member's line split on the console, or its end's remainder lost.
+  EXPECT_EQ(seen.substr(0, lines.size()), lines);
+  EXPECT_TRUE(seen == lines + unended + "\ntail\n")
+      << "stdout ends: "
+      << seen.substr(seen.size() - std::min<std::size_t>(seen.size(), 16));
+  EXPECT_TRUE(a_written ==
+              "[launcher] a run 0, pid 1\nabcdef\n" + unended + "tail")
+      << a_log << " starts: " << a_written.substr(0, 48);
 }
 
 std::string Runfile(const char* env) {
