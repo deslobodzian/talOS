@@ -452,10 +452,14 @@ inline std::string read_name(const char* value, std::size_t capacity) {
 // mapping or registration, with RegistryLock held. Production callers leave
 // these null; tests stop a child while it owns the lock, before either
 // commit, or act between a registration's map and its claim (`mapped`).
+// `lock_file_opened` is RegistryLock's alone, called without the lock once
+// it has opened the lock file the first time, before it locks it: the point
+// after which unlinking the path leaves that acquirer on a stale file.
 struct RegistryTestHooks {
   void (*initializing)(RegistryHeader*){nullptr};
   void (*mapped)(RegistryHeader*){nullptr};
   void (*claiming)(NodeRecord*){nullptr};
+  void (*lock_file_opened)(){nullptr};
 };
 
 // Serializes the writers: segment creation, sizing and initialization
@@ -479,7 +483,8 @@ class RegistryLock {
   // Waits at most `wait` when it is set, then throws: a holder that keeps
   // the lock that long is stuck (stopped mid-registration), not registering.
   RegistryLock(const std::string& mapped_path,
-               std::optional<std::chrono::milliseconds> wait) {
+               std::optional<std::chrono::milliseconds> wait,
+               const RegistryTestHooks* test_hooks = nullptr) {
     // Namespace selection is entirely ShmObjectName's job: the lock file is
     // named after its mapped result.
     const std::string file_path = LockFilePath(mapped_path);
@@ -497,6 +502,10 @@ class RegistryLock {
       if (fd_ < 0) {
         throw std::runtime_error("registry lock open failed for " + file_path +
                                  ": " + std::strerror(errno));
+      }
+      if (test_hooks != nullptr && test_hooks->lock_file_opened != nullptr) {
+        test_hooks->lock_file_opened();
+        test_hooks = nullptr;
       }
       while (::flock(fd_, operation) < 0) {
         const int error = errno;
