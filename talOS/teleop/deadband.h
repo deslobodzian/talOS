@@ -14,10 +14,12 @@ inline double Deadband(double value, double deadband_frac) {
 }
 
 // Whether an axis reading is neutral for arming a talos::OperatorArming:
-// finite and inside its deadband, the band Deadband maps to zero, so the
-// reading that arms commands nothing. Config load refuses a teleop deadband
-// below config::kTeleopMinDeadbandFrac, wide enough for a real stick resting
-// a few counts off zero.
+// finite and inside its deadband, the band Deadband maps to zero. So an
+// axis's arming-neutral band is its output dead zone, and an axis resting
+// inside the band that armed it commands nothing on the armed evaluations
+// that follow (the evaluation that arms never sends). Config load refuses a
+// teleop deadband below config::kTeleopMinDeadbandFrac, wide enough for a
+// real stick resting a few counts off zero.
 inline bool ArmingNeutral(double value, double deadband_frac) {
   return std::isfinite(value) && std::abs(value) <= deadband_frac;
 }

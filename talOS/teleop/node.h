@@ -363,11 +363,11 @@ class Teleop {
         binding.is_button = false;
         binding.axis = *parsed_binding.axis;
         binding.scale = parsed_binding.scale;
+        // ParseTeleop, the only source of a binding, already refused a
+        // deadband_frac outside [kTeleopMinDeadbandFrac, 1).
         binding.deadband_frac = parsed_binding.deadband_frac;
-        if (!std::isfinite(binding.scale) ||
-            !std::isfinite(binding.deadband_frac)) {
-          throw std::invalid_argument(
-              entry_where + ": scale and deadband_frac must be finite");
+        if (!std::isfinite(binding.scale)) {
+          throw std::invalid_argument(entry_where + ": scale must be finite");
         }
 
         const std::string field_where = entry_where + ".field";
