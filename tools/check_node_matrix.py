@@ -23,6 +23,11 @@ test_<snake_case>). The role comes from the package's non-test sources:
 - hosted: a Python package whose nodes are only `talos.cpp_node` wrappers,
   which is checked in the C++ package it hosts, so it requires no case.
 
+A package whose node rules all set `testonly = True` is a test fixture: no
+robot's bundle can carry it, since Bazel refuses a target that is not
+testonly depending on one. It is skipped with a `[fixture]` row saying so.
+A package with one ordinary node rule is checked.
+
 Comments in the test file, each on its own line (`//` in C++, `#` in Python):
 
 - `matrix: n/a <case>[, <case>] (reason)`: those cases do not apply.
@@ -93,11 +98,14 @@ CASES = {
     },
     "hosted": {},
 }
+# Not a role: a package of testonly nodes only (is_fixture), skipped.
+FIXTURE = "fixture"
 PYTHON_EXEMPT = {12: "a Python tick allocates in the interpreter"}
 CELL = {"present": "ok", "n/a": "na", "parity": "pa",
         "missing": "MISSING"}
 
 NODE_RULE = re.compile(r"^\s*talos_(cc|py|cc_shared)_node\(", re.MULTILINE)
+TESTONLY = re.compile(r"\btestonly\s*=\s*True\b")
 NODES = re.compile(r"^NODES = \[(.*?)\]", re.MULTILINE | re.DOTALL)
 LABEL = re.compile(r'"//([^:"]*):[^"]*"')
 ACTUATORS = r"(?:Motor|DigitalOutput|PwmOutput)"
@@ -318,18 +326,59 @@ def package_sources(directory):
             and os.path.isfile(os.path.join(directory, f))]
 
 
-def node_languages(directory):
-    """The languages of the nodes `directory`'s BUILD file declares."""
+def own_arguments(text, start):
+    """The text of the call whose `(` ends at `start`, keeping only its own
+    level: string literals emptied, comments, nested calls, lists and
+    dicts dropped, so none of them passes for one of its arguments."""
+    kept, depth, i = [], 1, start
+    while i < len(text) and depth:
+        c = text[i]
+        if c in "\"'":
+            end = text.find(c, i + 1)
+            while end > 0 and text[end - 1] == "\\":
+                end = text.find(c, end + 1)
+            i = len(text) if end < 0 else end + 1
+            continue
+        if c == "#":
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 1:
+            kept.append(c)
+        i += 1
+    return "".join(kept)
+
+
+def node_rules(directory):
+    """[(language, testonly)] of the nodes `directory`'s BUILD file
+    declares."""
     for build in ("BUILD", "BUILD.bazel"):
         path = os.path.join(directory, build)
         if os.path.isfile(path):
-            return {"py" if rule == "py" else "cpp"
-                    for rule in NODE_RULE.findall(read(path))}
-    return set()
+            text = read(path)
+            return [("py" if rule.group(1) == "py" else "cpp",
+                     bool(TESTONLY.search(own_arguments(text, rule.end()))))
+                    for rule in NODE_RULE.finditer(text)]
+    return []
+
+
+def node_languages(directory):
+    """The languages of the nodes `directory`'s BUILD file declares."""
+    return {lang for lang, _ in node_rules(directory)}
 
 
 def declares_node(directory):
-    return bool(node_languages(directory))
+    return bool(node_rules(directory))
+
+
+def is_fixture(directory):
+    """Every node rule `directory`'s BUILD file declares is testonly."""
+    rules = node_rules(directory)
+    return bool(rules) and all(testonly for _, testonly in rules)
 
 
 def walk(root):
@@ -356,7 +405,8 @@ def node_packages(workspace, root):
 
 
 def targets(workspace, paths):
-    """[(test file, or a node package without one, its inferred role)]."""
+    """[(test file, or a node package without one, its inferred role)]; a
+    package of testonly nodes (is_fixture) is listed with FIXTURE."""
     found, seen = [], set()
     for path in paths or DEFAULT_ROOTS:
         full = os.path.join(workspace, path)
@@ -369,6 +419,9 @@ def targets(workspace, paths):
                 if key in seen:
                     continue
                 seen.add(key)
+                if is_fixture(package):
+                    found.append((package, FIXTURE))
+                    continue
                 role = infer_role(package_sources(package))
                 # A test in another language than the package's nodes (a
                 # Python test of a C++ node's binding) is not a node test.
@@ -428,6 +481,10 @@ def main(argv):
     for path, role in found:
         shown = os.path.relpath(path, workspace)
         checked.add(shown)
+        if role == FIXTURE:
+            print(f"{shown}  [{FIXTURE}]  skipped: every node rule is "
+                  f"testonly = True")
+            continue
         if os.path.isdir(path):
             # A node package with no test file has no case at all.
             result = {case: ("missing", "no test file")

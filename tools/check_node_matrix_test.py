@@ -187,6 +187,41 @@ class CheckNodeMatrixTest(unittest.TestCase):
                                  {"BUILD_WORKSPACE_DIRECTORY": root}):
                 self.assertEqual(check_node_matrix.main(["bot"]), 1)
 
+    def test_a_package_of_testonly_nodes_is_skipped_and_listed(self):
+        # A fixture node no robot bundle can carry (bundle_testdata's
+        # native_wheel) needs no matrix, and the run says it skipped it; a
+        # package with one ordinary node rule, or testonly = False, is
+        # still checked.
+        packages = {
+            "fixture": "talos_py_node(\n    name = \"a\",\n"
+                       "    testonly = True,\n)\n",
+            "mixed": "talos_cc_node(\n    name = \"node\",\n)\n"
+                     "talos_cc_shared_node(\n    name = \"lib.so\",\n"
+                     "    testonly = True,\n)\n",
+            "explicit": "talos_cc_node(\n    name = \"node\",\n"
+                        "    testonly = False,\n)\n",
+            # A testonly inside another call's arguments is not the node's.
+            "nested": "talos_cc_node(\n    name = \"node\",\n"
+                      "    deps = select({\"x\": [f(testonly = True)]}),\n"
+                      ")\n"}
+        with tempfile.TemporaryDirectory() as root:
+            for name, build in packages.items():
+                os.makedirs(os.path.join(root, "bot", name))
+                with open(os.path.join(root, "bot", name, "BUILD"), "w",
+                          encoding="utf-8") as f:
+                    f.write(build)
+            self.assertEqual(
+                check_node_matrix.targets(root, ["bot"]),
+                [(os.path.join(root, "bot", name), role) for name, role in (
+                    ("explicit", "observer"), ("fixture", "fixture"),
+                    ("mixed", "observer"), ("nested", "observer"))])
+            out = io.StringIO()
+            with mock.patch.dict(os.environ,
+                                 {"BUILD_WORKSPACE_DIRECTORY": root}), \
+                    contextlib.redirect_stdout(out):
+                self.assertEqual(check_node_matrix.main(["bot/fixture"]), 0)
+            self.assertIn("bot/fixture  [fixture]  skipped", out.getvalue())
+
     def test_baseline_fails_on_a_new_missing_case_and_a_stale_entry(self):
         # CI runs the lint over a baseline of the cases missing today,
         # which may only shrink: an unlisted missing case fails,
