@@ -173,6 +173,12 @@ RecordedSession::RecordedSession(const std::string& path,
   std::string replayed_run_file;
   bool replayed_run_fired = false;
   std::string replayed_run_broken;
+  // The now_ns of that run's first record of a dispatch (a TIMER, MESSAGE
+  // or EXIT record), and the earliest loss of its timeline (gap_start), read
+  // while the log continued from its first segment: a dispatch, or the EXIT
+  // that ends the run, is made only inside run().
+  std::optional<MonotonicTime> replayed_run_dispatch;
+  std::optional<MonotonicTime> replayed_run_loss;
   bool replayed_run_timed = false;
   // The latest time any of its logs recorded: its last run's exit.
   std::optional<MonotonicTime> replayed_end;
@@ -261,6 +267,8 @@ RecordedSession::RecordedSession(const std::string& path,
         reader.manifest().size());
     std::optional<MonotonicTime> run_start;
     bool timed = false;
+    // The now_ns of this file's first record of a dispatch.
+    std::optional<MonotonicTime> first_dispatch;
     // The topics this log recorded, and whether the replayed program
     // watched each in it.
     std::vector<std::pair<std::uint32_t, bool>> recorded;
@@ -424,6 +432,14 @@ RecordedSession::RecordedSession(const std::string& path,
       }
       const auto kind = static_cast<EventKind>(header.kind);
       if (kind == EventKind::EXIT) read.exit = true;
+      // A dispatch's own record, or the run's EXIT; not a GAP record (above),
+      // which carries a dropped record's dispatch index and the resuming
+      // record's now_ns, nor an operation record of a dispatch already seen.
+      if (!first_dispatch && header.dispatch_index != 0 &&
+          (kind == EventKind::TIMER || kind == EventKind::MESSAGE ||
+           kind == EventKind::EXIT)) {
+        first_dispatch = MonotonicTime::from_nanos(header.now_ns);
+      }
       if (kind == EventKind::MESSAGE &&
           header.source_id < last_receipt.size()) {
         last_receipt[header.source_id] = header.publish_time_ns;
@@ -544,7 +560,8 @@ RecordedSession::RecordedSession(const std::string& path,
     // the same origin) held none, as when the byte cap rotated the log
     // before the first deadline, but only while each file read continued
     // the one before it: a segment missing or unread between them may have
-    // held the first firing. With no firing in any, it is the origin.
+    // held the first firing. With no firing in any, it is the first dispatch
+    // (below).
     if (own_log &&
         (!replayed_run || reader.start_time() < replayed_run->first)) {
       replayed_run.emplace(reader.start_time(),
@@ -555,18 +572,43 @@ RecordedSession::RecordedSession(const std::string& path,
       replayed_run_file = log_path;
       replayed_run_fired = run_start.has_value();
       replayed_run_broken.clear();
+      replayed_run_dispatch = first_dispatch;
+      replayed_run_loss = gap_start;
       replayed_run_timed = timed;
     } else if (own_log && !replayed_run_fired &&
                reader.start_time() == replayed_run->first &&
                LogOfFile(log_path) == replayed_run_log) {
       if (continued == nullptr || !next_segment) {
         if (replayed_run_broken.empty()) replayed_run_broken = log_path;
-      } else if (run_start && replayed_run_broken.empty()) {
-        replayed_run->second = std::max(reader.start_time(), *run_start);
-        replayed_run_file = log_path;
-        replayed_run_fired = true;
+      } else if (replayed_run_broken.empty()) {
+        if (!replayed_run_dispatch) replayed_run_dispatch = first_dispatch;
+        // Carried from the segment before: the loss so far.
+        replayed_run_loss = gap_start;
+        if (run_start) {
+          replayed_run->second = std::max(reader.start_time(), *run_start);
+          replayed_run_file = log_path;
+          replayed_run_fired = true;
+        }
       }
     }
+  }
+  // A run whose log arms a timer and holds no firing that gives its run
+  // start (none recorded, or only of timers it re-armed first) starts at its
+  // first record of a dispatch. That record is made inside run(), so at or
+  // after the live run start: every timer armed before the run, at the run
+  // start plus its offset, then falls no earlier than it did live, and live
+  // fired none up to that run's last record, so neither does the replay up
+  // to there; a program that ran once ends there (loop_end()), unless its
+  // loop was late when it stopped (a due deadline it never fired before its
+  // EXIT, which the replay fires); a restarted program replays as one run.
+  // A timer it re-armed in a dispatch is re-armed at that dispatch's time,
+  // as live. The origin would fire such a timer the whole construction time
+  // early, at deadlines live never reached. Its log is refused (below) when
+  // a loss in it may hold its firings, or when it holds no such record.
+  if (replayed_run && replayed_run_timed && !replayed_run_fired &&
+      !replayed_run_loss && replayed_run_dispatch) {
+    replayed_run->second =
+        std::max(replayed_run->first, *replayed_run_dispatch);
   }
   if (first) throw std::runtime_error("no readable .tlog files in " + path);
 
@@ -728,6 +770,21 @@ RecordedSession::RecordedSession(const std::string& path,
           " read before it (a segment between them is missing or could not "
           "be read), which may have held the first timer firing the run "
           "start is read from, and none was read before it";
+    } else if (!replayed_run_fired && !replayed_run_dispatch) {
+      // Its run began (its writer starts with run()) and left no record: a
+      // replay would run its timers from the origin to the session's end.
+      run_start_refused_log_ = replayed_run_first_read;
+      run_start_refused_reason_ =
+          "it holds no record of its run: nothing gives its start or its end";
+    } else if (!replayed_run_fired && replayed_run_loss) {
+      // The firings that give the run start may be in the loss; its first
+      // dispatch would then replay none of them.
+      run_start_refused_log_ = replayed_run_first_read;
+      run_start_refused_reason_ =
+          "it holds no timer firing that gives its run start, and a loss in "
+          "it (a GAP record or damaged stretch, from " +
+          std::to_string(replayed_run_loss->nanos()) +
+          " ns) may hold the run's firings";
     }
   }
   for (const RecordedMessage& message : messages_) {

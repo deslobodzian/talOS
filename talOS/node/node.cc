@@ -1243,7 +1243,8 @@ class OfflinePort final : public LoopPortFor<Loop> {
 // stretch nothing bounds. So is the node's own first-run log when it arms a
 // timer and its first segment, or a segment before its first firing read,
 // is gone or unreadable: the firing its run start is read from may have been
-// in it.
+// in it; and, with no firing that gives the run start, when it holds no
+// record of its run or a loss that may hold its firings.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
