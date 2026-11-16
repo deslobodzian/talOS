@@ -623,7 +623,7 @@ void Robot::StartCompetition() {
 
   // Only after the outputs are neutral: a save handed over finishes first
   // (the file stays whole either way), and its wait must not hold them. One
-  // still waiting for a disabled tick is dropped; it was never handed over.
+  // still waiting for a disabled tick is saved too: the loop has stopped.
   persister.Stop();
   if (persister.Tick(false) > 0) {
     Report(*log_, kPersistMessage, "cannot persist hardware configuration");

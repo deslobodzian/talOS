@@ -105,8 +105,10 @@ class ConfigPersister {
   // on the loop would still give it the default scheduling. Throws
   // std::system_error when the thread cannot be created.
   void Start();
-  // Saves what was handed over and not yet saved, then joins the thread.
-  // Called after the loop has stopped ticking (also by the destructor).
+  // Saves the newest acknowledged configuration not yet saved, whether or
+  // not a tick handed it over (a clean exit right after an acknowledgement,
+  // or while enabled), then joins the thread. Called on the loop thread after
+  // the loop has stopped ticking (also by the destructor).
   //
   // The join is unbounded: a save stuck in fsync keeps Stop() from
   // returning. Bounding it could not let the program exit sooner: Linux does
