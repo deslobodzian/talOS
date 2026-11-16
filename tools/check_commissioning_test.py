@@ -129,6 +129,14 @@ class CheckCommissioningTest(unittest.TestCase):
                 self.assertEqual(len(found), 2, found)
                 self.assertIn(f" {root}/motor.toml:3: ", found[0])
 
+    # REQ-DEV-33, RULES.md 4: a gitattributes `-diff` (binary) mark, which
+    # the same commit can add, does not hide a changed line.
+    def test_config_marked_binary_still_fails(self):
+        self.put(".gitattributes", "*.toml -diff\n")
+        self.edit_configs("bench/main_processor/configuration")
+        self.commit("bench: tidy the config")
+        self.assertEqual(len(check_commissioning.check(self.base)), 3)
+
     def branch_and_merge(self, side_edit, resolve=None):
         """Commits side_edit on a branch and an unrelated change here, then
         merges the branch; resolve() edits the merge result before its

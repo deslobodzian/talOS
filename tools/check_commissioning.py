@@ -156,10 +156,12 @@ def findings_in_diff(diff):
             old += 1
 
 
-# Fixed prefixes and no external diff: the output must not depend on the
-# user's git configuration (diff.noprefix, diff.external).
-DIFF_FLAGS = ("-U0", "--no-color", "--no-ext-diff", "--no-renames",
-              "--src-prefix=a/", "--dst-prefix=b/")
+# Fixed prefixes, no external diff or text conversion, and every file read
+# as text: the output must not depend on the user's git configuration
+# (diff.noprefix, diff.external, a textconv driver) or on a gitattributes
+# `-diff`/`binary` mark, which the checked commit itself can add.
+DIFF_FLAGS = ("-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+              "--no-renames", "--src-prefix=a/", "--dst-prefix=b/")
 
 
 # `git show --remerge-diff` (git 2.36) re-merges a merge's parents and
