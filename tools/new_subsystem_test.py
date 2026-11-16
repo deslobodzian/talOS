@@ -774,6 +774,23 @@ class NewSubsystemTest(unittest.TestCase):
                 with open(imported, encoding="utf-8") as f:
                     self.assertEqual(f.read(), "# talos\n", imported)
 
+    # REQ-DEV-02
+    def test_standalone_refuses_a_checkout_without_a_bazel_version(self):
+        # The new repository takes the checkout's .bazelversion; a checkout
+        # without one is refused, naming the file, not a traceback.
+        with tempfile.TemporaryDirectory() as top:
+            talos = os.path.join(top, "talos")
+            os.makedirs(talos)
+            for name, text in (("MODULE.bazel", 'module(name = "talos")\n'),
+                               ("talos.bazelrc", "# talos\n")):
+                with open(os.path.join(talos, name), "w",
+                          encoding="utf-8") as f:
+                    f.write(text)
+            with self.assertRaisesRegex(new_subsystem.Refused,
+                                        r"\.bazelversion"):
+                new_subsystem.plan_standalone(os.path.join(top, "arm"),
+                                              "arm", "py", talos)
+
     # REQ-DEV-01
     def test_talos_checkout_flag_is_held_to_the_checkout_check(self):
         # --talos-checkout DIR (relative to the robot repository's root)
