@@ -170,9 +170,15 @@ A relative `--prefix` is resolved against the working directory.
   that climbs out, or one that resolves outside) as the file or directory
   it names, and says how many in one line, `deploy: copied <n> links that
   leave the bundle as the files they name`; a relative link that stays
-  inside stays a link. A link that names nothing (dangling, or a loop)
-  refuses the install before anything is copied, naming it, and `current`
-  and `previous` stay as they were.
+  inside stays a link. Before anything is copied, install follows each
+  leaving link as the copy would, through every directory it names and
+  every link there, and refuses the install, naming each such link
+  relative to the bundle (`deploy: error: <path> -> <target>: ...`), when
+  one names nothing (dangling, or a loop of links), names neither a
+  regular file nor a directory (a FIFO, socket or device), or names a
+  directory holding the link itself, the bundle or the install (which the
+  copy would follow until it failed or the disk filled); `current` and
+  `previous` stay as they were.
 - **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
   boot as `--user` (default `talos`; the account must exist), so a booted
   robot serves the Studio its bundle carries ([above](#build-a-bundle)).
