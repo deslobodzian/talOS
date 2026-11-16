@@ -224,6 +224,7 @@ cc_library(
         "//talOS/memory:shared_memory",
         "//talOS/process",
         "//talOS/rtms",
+        "//talOS/rtms:process_liveness",
         "@tomlplusplus//:toml++",
     ],
 )
@@ -728,6 +729,7 @@ cc_test(
         ":stop_signal_guard",
         ":supervision_events",
         "//talOS/introspection:registry",
+        "//talOS/rtms:process_liveness",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],

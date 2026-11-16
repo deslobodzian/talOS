@@ -50,6 +50,7 @@
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
+#include "talOS/rtms/process_liveness.h"
 
 namespace talos::launcher {
 namespace {
@@ -2501,6 +2502,46 @@ TEST(Supervision, AHeldRegistryLockKeepsTheRegistry) {
       << "removed while its lock was held: " << registry;
   EXPECT_TRUE(std::filesystem::exists(registry_lock)) << registry_lock;
   held.reset();
+  RemoveRegistry();
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// A row an earlier session left active, its claimant gone (SIGKILLed: its
+// heartbeat still fresh, its row not yet swept by a claim), is no live
+// session's and does not keep the registry for good. The planted row's
+// claimant word is this process's with its start time changed, which reads
+// as the pid reused by a later process (process_liveness.h).
+// REQ-OPS-03
+TEST(Supervision, ARowWhoseProcessIsGoneDoesNotKeepTheRegistry) {
+  const std::string registry = ShmObjectName(introspect::kRegistryPath);
+  auto options = BaseOptions("gone_row");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("gone_row_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("gone_row_beta", "exit 0\n");
+  const uint64_t gone = talos::OwnProcessWord() ^ (1ULL << kProcessPidBits);
+  ASSERT_FALSE(talos::ProcessWordAlive(gone));
+  // Held across the session and released at its end, so the row is freed
+  // whether or not the registry was removed.
+  const introspect::NodeRegistration registration{
+      {"gone", "//example/gone:node", options.session_id + 1, 0}};
+  bool planted = false;
+  {
+    introspect::RegistryMapping mapping;
+    for (auto& row : mapping.header()->nodes) {
+      if (row.state.load(std::memory_order_acquire) !=
+              static_cast<uint64_t>(introspect::SlotState::ACTIVE) ||
+          row.session_id != options.session_id + 1)
+        continue;
+      row.pid_start = gone >> kProcessPidBits;
+      planted = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(planted) << "no row to plant";
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_FALSE(SegmentExists(registry))
+      << "kept for a row whose process is gone: " << registry;
   RemoveRegistry();
   std::filesystem::remove_all(options.output_dir);
 }
