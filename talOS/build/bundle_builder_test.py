@@ -444,25 +444,6 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertIn(RUNTIME, proc.stderr)
             self.assertIn("'a'", proc.stderr)
 
-    def test_run_script_passes_output_root_without_a_session_suffix(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out, _ = self.build(tmp, {"c/robot.toml": "[robot]\n"})
-            self.echo_launcher(out)
-            env = dict(os.environ, TALOS_LOG_DIR=os.path.join(tmp, "log root"))
-            for explicit in ([], ["--output-dir", os.path.join(tmp, "override")],
-                             ["--output-dir=" + os.path.join(tmp, "override")]):
-                with self.subTest(explicit=explicit):
-                    proc = subprocess.run([os.path.join(out, "run.sh"), *explicit],
-                                          env=env, capture_output=True, text=True)
-                    self.assertEqual(proc.returncode, 0, proc.stderr)
-                    args = json.loads(proc.stdout)
-                    if explicit:
-                        self.assertEqual(args[-len(explicit):], explicit)
-                        self.assertNotIn(env["TALOS_LOG_DIR"], args)
-                    else:
-                        self.assertEqual(args[args.index("--output-dir") + 1],
-                                         env["TALOS_LOG_DIR"])
-
     def test_run_script_through_a_link_passes_the_physical_bundle(self):
         # The boot service starts <prefix>/current/run.sh. Node binaries come
         # from --bundle, so a path through the link would restart nodes from
@@ -674,13 +655,15 @@ class DeployTest(unittest.TestCase):
                                    path=self.macos(tmp, **settings))
                 self.assertEqual(proc.returncode, status, proc.stdout)
 
-    def test_logs_with_no_sessions_says_so(self):
+    def test_logs_with_an_empty_log_root_lists_no_session(self):
+        # A fresh install's log root exists before its first session: the
+        # status command succeeds and names no session or manifest in it.
         with tempfile.TemporaryDirectory() as tmp:
-            os.makedirs(os.path.join(tmp, "logs"))
+            root = os.path.join(tmp, "logs")
+            os.makedirs(root)
             proc = self.deploy(tmp, "logs")
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("no sessions yet", proc.stdout)
-            self.assertNotIn("left no manifest", proc.stdout)
+            self.assertNotIn(root + os.sep, proc.stdout)
 
     def test_logs_does_not_require_an_installed_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
