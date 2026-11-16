@@ -817,7 +817,7 @@ TEST(Config, CanBusesListRioThenTheOthersInByteOrderAndRefuseAFifth) {
         list.names.begin() + static_cast<std::ptrdiff_t>(list.count)};
   };
   EXPECT_EQ(names(Config{}), std::vector<std::string>{"rio"});
-  auto c = BusConfig({"b", "rio", "B", "b"});
+  auto c = BusConfig({"b", "rio", "C", "b"});
   SensorConfig sensor;
   sensor.id = 99;
   sensor.name = "encoder";
@@ -825,18 +825,39 @@ TEST(Config, CanBusesListRioThenTheOthersInByteOrderAndRefuseAFifth) {
   sensor.bus = "a";
   c.sensors.push_back(sensor);
   EXPECT_NO_THROW(Validate(c));
-  EXPECT_EQ(names(c), (std::vector<std::string>{"rio", "B", "a", "b"}));
+  EXPECT_EQ(names(c), (std::vector<std::string>{"rio", "C", "a", "b"}));
 
   c.motors[1].bus = "Shooter";
   try {
     Validate(c);
     FAIL() << "four buses besides rio were accepted";
   } catch (const std::invalid_argument& e) {
-    for (const char* bus : {"B", "Shooter", "a", "b"}) {
+    for (const char* bus : {"C", "Shooter", "a", "b"}) {
       EXPECT_NE(std::string{e.what()}.find(bus), std::string::npos)
           << bus << " is not named: " << e.what();
     }
   }
+}
+
+// Bus names are compared byte for byte (the wire carries them so), but
+// "Shooter" and "shooter" may be one CANivore to Phoenix: two status slots
+// and two load estimates for it would split its load. Config load refuses
+// two names that differ only by case, naming both and a device on each;
+// "rio" counts as named even when no device names it.
+// REQ-OPS-20
+TEST(Config, RefusesCanBusNamesThatDifferOnlyByCase) {
+  auto c = BusConfig({"Shooter", "rio", "shooter"});
+  try {
+    Validate(c);
+    FAIL() << "Shooter and shooter were accepted as two buses";
+  } catch (const std::invalid_argument& e) {
+    for (const char* text : {"Shooter", "shooter", "motor1", "motor3"}) {
+      EXPECT_NE(std::string{e.what()}.find(text), std::string::npos)
+          << text << " is not named: " << e.what();
+    }
+  }
+  c = BusConfig({"RIO"});
+  EXPECT_THROW(Validate(c), std::invalid_argument);
 }
 
 // The gateway reports one bus per State, in turn (index = sequence % count),
