@@ -200,7 +200,7 @@ class WarmUpTest(unittest.TestCase):
 
     # REQ-OPS-47: the warm-up's last line is what was warmed. A member that
     # died or failed is counted as not warmed and named with how it ended,
-    # not only in a warning above (DEPLOY-11).
+    # not only in a warning above.
     def test_summary_counts_only_members_that_finished(self):
         proc = self.install("bundle", ("alpha", "dies", "fails"))
         summary = [line for line in proc.stdout.splitlines()
@@ -228,7 +228,7 @@ class WarmUpTest(unittest.TestCase):
                          proc.stdout + proc.stderr)
 
     # REQ-OPS-47: a native-library pass that dies counts only the libraries
-    # it loaded and is named as not warmed (DEPLOY-11).
+    # it loaded and is named as not warmed.
     @unittest.skipUnless(sys.platform == "darwin",
                          "only macOS charges a native library's first load")
     def test_summary_counts_only_native_libraries_loaded(self):

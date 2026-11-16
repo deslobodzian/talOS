@@ -1,9 +1,10 @@
 """Installed bundles describe their graph and keep their config identity.
 
-Each bundle is installed the way the robot gets it: its files copied as
-real files (Bazel's sandbox hands the test a tree of links into the build
-tree, which deploy.sh would copy as links), then tools/deploy.sh install
-into a fresh prefix, which runs every member once without a warning. Then
+Each bundle is installed the way the robot gets it: tools/deploy.sh install
+into a fresh prefix, which copies it as real files (Bazel's sandbox hands
+the test a tree of links into the build tree, and install copies a link
+that leaves the bundle as the file it names) and runs every member once
+without a warning. Then
 --describe runs every node binary from there, so a C++ node that cannot
 load a shared library it links, or a Python node that cannot import its
 wheels or start its interpreter (as when Bazel restored the bundle from its
@@ -35,7 +36,6 @@ import json
 import os
 import plistlib
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -124,18 +124,6 @@ def boot_command(prefix, system):
     return shlex.split(line.removeprefix("ExecStart="))
 
 
-def as_shipped(src, tmp):
-    """`src` as real files. Bazel's Linux sandbox links each file of a
-    bundle into the test's runfiles, and deploy.sh install copies links as
-    links (cp -RP), so installing `src` itself would run the build tree's
-    files; a talos_bundle holds no links of its own (REQ-OPS-48)."""
-    if not os.path.islink(os.path.join(src, "run.sh")):
-        return src
-    copy = os.path.join(tmp, os.path.basename(src))
-    shutil.copytree(src, copy, symlinks=False)
-    return copy
-
-
 def python_venvs(bundle, node):
     """The venv interpreters under a Python node's runfiles in `bundle`."""
     return [os.path.join(parent, "python3")
@@ -178,7 +166,6 @@ class BundleTest(unittest.TestCase):
                     ignore_cleanup_errors=True) as tmp:
                 src = r.Rlocation(f"_main/{name}")
                 self.assertTrue(src and os.path.isdir(src), src)
-                src = as_shipped(src, tmp)
                 with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
                     manifest = tomllib.load(f)
                 studio = manifest.get("studio")
