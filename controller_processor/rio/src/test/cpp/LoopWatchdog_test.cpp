@@ -148,18 +148,21 @@ class BlockingReportOutputs final : public talos::rio::WatchdogOutputs {
   }
   void Report(std::string_view) override {
     std::unique_lock lock{mutex_};
-    ++reports_started_;
+    if (++reports_started_ == 1) calls_before_report_ = neutralize_calls_;
     changed_.notify_all();
     // The deadline only bounds a hang.
     changed_.wait_for(lock, std::chrono::seconds{10},
                       [&] { return released_; });
   }
-  // Waits until `n` Neutralize calls while the first Report is still blocked;
-  // false if they do not come within 5 s (the bound of a hang, not a timing).
+  // Waits until `n` Neutralize calls made after the first Report started
+  // blocking (polls before the reporter's first delivery do not count);
+  // false if they do not come within 5 s (the bound of a hang, not a
+  // timing).
   bool NeutralizedWhileReportBlocked(int n) {
     std::unique_lock lock{mutex_};
     return changed_.wait_for(lock, std::chrono::seconds{5}, [&] {
-      return reports_started_ > 0 && neutralize_calls_ >= n;
+      return reports_started_ > 0 &&
+             neutralize_calls_ - calls_before_report_ >= n;
     });
   }
   void Release() {
@@ -177,13 +180,16 @@ class BlockingReportOutputs final : public talos::rio::WatchdogOutputs {
   std::condition_variable changed_;
   int neutralize_calls_{0};
   int reports_started_{0};
+  int calls_before_report_{0};
   bool released_{false};
 };
 
 // The stall's Driver Station report is a NetComm call that can block for
 // milliseconds; made on the watchdog's thread it would hold the next polls'
 // neutrals behind it. So the polls go on, neutralizing each time, while the
-// report is still blocked.
+// report is still blocked: three neutrals after it started blocking, since
+// the polls before the reporter's first delivery would pass even with polls
+// that wait on a delivery in progress.
 // REQ-SAFE-25
 TEST(LoopWatchdog, PollsKeepNeutralizingWhileTheReportBlocks) {
   BlockingReportOutputs outputs;
