@@ -376,7 +376,11 @@ rebuilt bundle and restarting the service. The build command names a
 directory only when the webroot says which: `studio_webroot` writes
 `NOT_BUILT.txt` there with the talOS checkout its `studio_web` `path` lies
 in, and the bridge answers with that line; otherwise it names the checkout
-the workspace uses, as MODULE.bazel's `talos` override says. `talos_bundle` refuses a `studio_webroot` with no `index.html`
+the workspace uses, as MODULE.bazel's `talos` override says. The bridge
+serves only files inside its webroot's real tree: a page that links out of
+it (as each file does in a sandboxed Bazel test's runfiles; `bazel run`
+links the webroot whole, and a bundle holds no links) is answered 503
+naming where it links, never read. `talos_bundle` refuses a `studio_webroot` with no `index.html`
 or `drive.html`.
 
 See the [bridge README](bridge/README.md) for serving the frontend with a live

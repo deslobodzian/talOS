@@ -71,10 +71,13 @@ talos_sim_test(
 )
 
 # e2e: //:sim with --start-studio-bridge until the bridge is up; /drive
-# answers (the page, or how to build it), and after the stop the bridge ran
-# once and exited 0. About 2 s of real time plus startup. Not a
-# talos_sim_test: that check waits for every member's registry row, and the
-# Studio bridge takes none.
+# answers with the page when the talOS checkout built it, else how to build
+# it, and after the stop the bridge ran once and exited 0. About 2 s of real
+# time plus startup. Not a talos_sim_test: that check waits for every
+# member's registry row, and the Studio bridge takes none. no-sandbox: the
+# sandbox stages each file of //:studio_webroot as a link out of it, which
+# the bridge does not serve; outside it the webroot is linked whole, as
+# `bazel run //:sim` sees it.
 py_test(
     name = "studio_test",
     size = "small",
@@ -83,6 +86,7 @@ py_test(
     tags = [
         "e2e",
         "exclusive",
+        "no-sandbox",
     ],
     deps = ["@rules_python//python/runfiles"],
 )

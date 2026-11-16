@@ -626,6 +626,23 @@ std::string NotBuiltCommand(const fs::path& webroot) {
          "repository's MODULE.bazel `talos` override names)";
 }
 
+// Where `page`, a file name in the webroot, resolves when it is a regular
+// file there that links out of the webroot's real tree (empty otherwise).
+// The bridge serves only files inside that tree, so such a page is present
+// but never served: a sandboxed Bazel test's runfiles stage each file of a
+// tree artifact as a link to the execroot. `bazel run` links the webroot
+// directory itself, and an installed bundle holds no links.
+fs::path LinkedOut(const fs::path& webroot, std::string_view page) {
+  std::error_code error;
+  const fs::path root = fs::weakly_canonical(webroot, error);
+  if (error) return {};
+  const fs::path file = fs::weakly_canonical(root / page, error);
+  if (error || !fs::is_regular_file(file, error)) return {};
+  const fs::path relative = file.lexically_relative(root);
+  if (!relative.empty() && *relative.begin() != "..") return {};
+  return file;
+}
+
 // What `/` and `/drive` answer, 503, while the webroot holds no such page,
 // and what the bridge logs at startup. Two readers see it: a developer whose
 // talOS checkout never built the pages, and
@@ -633,7 +650,17 @@ std::string NotBuiltCommand(const fs::path& webroot) {
 // webroot at `<bundle>/studio/webroot` beside `bundle_manifest.toml`, so a
 // webroot with that manifest two levels up is served from a bundle and the
 // answer leads with installing it again; it names both remedies either way.
+// A page that is there but links out of the webroot (LinkedOut) is not
+// missing, and the answer says so instead.
 std::string MissingPage(const fs::path& webroot, std::string_view page) {
+  if (const fs::path out = LinkedOut(webroot, page); !out.empty()) {
+    return "Studio's pages are not served: " + (webroot / page).string() +
+           " links to " + out.string() +
+           ", outside the webroot, and the bridge serves only files inside "
+           "the webroot's real tree. Serve a webroot that holds the pages "
+           "themselves (`bazel run` and an installed bundle do; a sandboxed "
+           "Bazel test's runfiles link each file out).\n";
+  }
   std::error_code absent;
   const bool bundle =
       webroot.filename() == "webroot" &&
@@ -831,7 +858,10 @@ int main(int argc, char** argv) try {
   std::string missing_pages;
   constexpr std::array<std::string_view, 2> kPages{"index.html", "drive.html"};
   for (const std::string_view page : kPages) {
-    if (std::error_code absent; !fs::is_regular_file(webroot / page, absent)) {
+    if (!LinkedOut(webroot, page).empty()) {
+      std::cerr << MissingPage(webroot, page);
+    } else if (std::error_code absent;
+               !fs::is_regular_file(webroot / page, absent)) {
       missing_pages +=
           (missing_pages.empty() ? "" : " or ") + std::string(page);
     }
