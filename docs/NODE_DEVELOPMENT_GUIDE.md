@@ -199,6 +199,19 @@ threads, which the library creates, each call it from a task
 (`EnsureBackgroundWorkerPool`). Threads a Python node starts have no such
 call: start none whose work is unbounded.
 
+A Python node's `update()` also needs the interpreter lock, which a worker
+thread holding it gives up only at the switch interval
+(`sys.getswitchinterval()`, 5 ms) or, inside one C call that keeps the lock,
+when that call returns. Measured on the Mac mini
+([2026-11-16](BENCH_RESULTS.md#2026-11-16)): a worker running pure-Python
+code delayed a 5 ms `update()` by up to 7.5 ms (half its ticks over 1 ms
+late) and a 20 ms one by up to 2.3 ms; a worker inside one 224 ms `sorted()`
+delayed `update()` by the whole 224 ms; a worker blocked in a call that
+releases the lock (a socket read, `time.sleep`) delayed it by nothing
+measurable. So a Python node's worker thread only waits in such calls (I/O,
+or a C extension that releases the lock while it computes); computation
+goes to another process, which hands its result over a topic.
+
 ### Stopping
 
 Once `talos::Run` / `talos.run` starts a live node, SIGINT or SIGTERM stops it
