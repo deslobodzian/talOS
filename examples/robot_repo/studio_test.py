@@ -111,6 +111,15 @@ class StudioBridgeInSession(unittest.TestCase):
                                  body)
                 self.assertTrue(os.path.isdir(folder[1]),
                                 f"{folder[1]} is not a directory: {body}")
+                # The checkout to build in is the one this repository's
+                # studio_web reads (here MODULE.bazel's ../..), named as a
+                # directory that exists and is talOS's, not a fixed `talos`
+                # (a submodule this repository does not have).
+                checkout = re.search(
+                    r"\(cd (.+?) && bazel build //studio:web_dist\)", body)
+                self.assertIsNotNone(checkout, body)
+                self.assertTrue(os.path.isfile(os.path.join(
+                    checkout[1], "studio", "bridge", "webroot.bzl")), body)
             launch.send_signal(signal.SIGINT)
             self.assertEqual(launch.wait(timeout=STOP_WAIT_S), 0,
                              "".join(output))

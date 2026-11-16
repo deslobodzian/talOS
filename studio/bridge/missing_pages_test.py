@@ -53,6 +53,10 @@ class MissingPages(unittest.TestCase):
                         # robot installs its bundle again.
                         self.assertIn("//studio:web_dist", body)
                         self.assertIn("tools/deploy.sh install", body)
+                        # REQ-DEV-30: no directory this bridge cannot know
+                        # exists. `cd talos` was right only for a robot
+                        # repository holding talOS as a submodule there.
+                        self.assertNotIn("cd talos", body)
                 # Any other file is simply absent.
                 with self.assertRaises(urllib.error.HTTPError) as other:
                     urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.svg",
