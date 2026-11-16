@@ -234,12 +234,17 @@ test('topic health names the fault, worst first', () => {
 
 // REQ-CONTRACT-09
 test('an observed topic is read, as the launcher\'s lint counts it', () => {
-  // The lint's "published but nothing subscribes to it" counts observers
-  // (telemetry) as readers; a badge that did not would name a topic the
-  // launcher no longer names.
+  // The lint counts observers (telemetry) as readers of an owner's feed
+  // (state, status, event, telemetry) and of no instruction (target, request,
+  // command); a badge that disagreed would contradict the launcher.
   assert.equal(
       topicHealth(healthRow({subscribers: [], observers: ['telemetry']})), 'ok');
   assert.equal(topicHealth(healthRow({subscribers: [], observers: []})), 'unread');
+  for (const name of ['/shooter/target/auto', '/arm/request', '/arm/command']) {
+    assert.equal(
+        topicHealth(healthRow({name, subscribers: [], observers: ['telemetry']})),
+        'unread', name);
+  }
 });
 
 test('a graph too old to carry endpoint attributes is read, and marked as such',
