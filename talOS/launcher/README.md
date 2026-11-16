@@ -504,7 +504,10 @@ the members' pipes into memory; others write the logs, `talos.log`, and the
 launcher's stdout and stderr, and only that last one ever waits on them.
 The launcher's own lines (`std::cout`, `std::cerr`) go into memory as well,
 so supervision (restarts, stall kills, the stop) goes on whatever its
-stdout does. While a writer is behind, up to 2 MiB per member, 2 MiB for
+stdout does. Each launcher line goes into that memory in one piece
+(`ConsoleLine`, `console_line.h`), so a member's echoed output never lands
+inside it; a member's own line can still be split where its output reached
+the pipe in more than one write. While a writer is behind, up to 2 MiB per member, 2 MiB for
 `talos.log` and 2 MiB for each of the launcher's stdout and stderr (one
 buffer when they are the same file, as with `2>&1` or a terminal) wait in
 memory: a 1 MiB batch the writer has taken and a refilled 1 MiB pending

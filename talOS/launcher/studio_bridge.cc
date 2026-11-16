@@ -10,6 +10,7 @@
 #include <iostream>
 #include <string_view>
 
+#include "talOS/launcher/console_line.h"
 #include "talOS/launcher/spawn.h"
 
 namespace talos::launcher {
@@ -66,15 +67,15 @@ StudioBridge::StudioBridge(std::size_t index, const NodeSpec& spec,
 void StudioBridge::Start(NodeProcessInfo& proc, const SupervisionClock& clock) {
   const std::string& binary = args_.front();
   if (binary.empty() || ::access(binary.c_str(), X_OK) != 0) {
-    std::cerr << "[launcher] studio_bridge not executable at '"
-              << (binary.empty() ? target_ : binary)
-              << "'; session runs without Studio\n";
+    ConsoleLine(std::cerr) << "[launcher] studio_bridge not executable at '"
+                           << (binary.empty() ? target_ : binary)
+                           << "'; session runs without Studio\n";
     proc.RecordSpawnFailure();
     Leave(proc);
     return;
   }
-  std::cout << "[launcher] Starting studio_bridge (target " << target_
-            << ")...\n";
+  ConsoleLine(std::cout) << "[launcher] Starting studio_bridge (target "
+                         << target_ << ")...\n";
   std::string error;
   const pid_t pid = Spawn(error);
   const SupervisionTime now = clock();
@@ -95,8 +96,9 @@ void StudioBridge::Exited(NodeProcessInfo& proc, int status,
   running_ = false;
   settled_ = false;
   if (stopping) {
-    std::cout << "[launcher] Process studio_bridge (pid " << proc.pid
-              << ") exited (" << ExitReason(status) << ")\n";
+    ConsoleLine(std::cout) << "[launcher] Process studio_bridge (pid "
+                           << proc.pid << ") exited (" << ExitReason(status)
+                           << ")\n";
     return;
   }
   Failed(proc, "studio_bridge exited (" + ExitReason(status) + ")", now);
@@ -108,8 +110,9 @@ void StudioBridge::Supervise(NodeProcessInfo& proc, SupervisionTime now,
       now - last_spawn_ >= kStudioBridgeSettleInterval) {
     settled_ = true;
     came_up_ = true;
-    std::cout << "[launcher] Started studio_bridge (pid " << proc.pid
-              << ") on http://localhost:" << http_port_ << "\n";
+    ConsoleLine(std::cout) << "[launcher] Started studio_bridge (pid "
+                           << proc.pid << ") on http://localhost:" << http_port_
+                           << "\n";
   }
   if (!restart_.pending()) return;
   // Nothing is started once the stop has begun.
@@ -183,11 +186,12 @@ void StudioBridge::Failed(NodeProcessInfo& proc, std::string_view what,
   // A server that ends before the stop has failed, whatever its status.
   if (!ShouldRestartNode(/*clean_exit=*/false, restart_.critical(),
                          limits_.max_restarts, /*stopping=*/false)) {
-    std::cerr << "[launcher] " << what
-              << "; restarts are disabled (--max-restarts 0): studio_bridge "
-                 "will not be restarted again; session runs without Studio "
-                 "(see "
-              << log_path_ << ")\n";
+    ConsoleLine(std::cerr)
+        << "[launcher] " << what
+        << "; restarts are disabled (--max-restarts 0): studio_bridge "
+           "will not be restarted again; session runs without Studio "
+           "(see "
+        << log_path_ << ")\n";
     Leave(proc);
     return;
   }
@@ -197,17 +201,19 @@ void StudioBridge::Failed(NodeProcessInfo& proc, std::string_view what,
     // Where a node would wait out the window, an observer is left.
     restart_.Cancel();
     ShowRestart(proc, restart_);
-    std::cerr << "[launcher] " << what << "; " << limits_.max_restarts
-              << " restarts within " << limits_.window.count()
-              << " ms: studio_bridge will not be restarted again; session "
-                 "runs without Studio (see "
-              << log_path_ << ")\n";
+    ConsoleLine(std::cerr)
+        << "[launcher] " << what << "; " << limits_.max_restarts
+        << " restarts within " << limits_.window.count()
+        << " ms: studio_bridge will not be restarted again; session "
+           "runs without Studio (see "
+        << log_path_ << ")\n";
     Leave(proc);
     return;
   }
   ShowRestart(proc, restart_);
-  std::cout << "[launcher] " << what << "; restart " << proc.restart_count + 1
-            << " in " << delay.count() << " ms\n";
+  ConsoleLine(std::cout) << "[launcher] " << what << "; restart "
+                         << proc.restart_count + 1 << " in " << delay.count()
+                         << " ms\n";
 }
 
 void StudioBridge::Leave(NodeProcessInfo& proc) { proc.failed = true; }

@@ -17,6 +17,7 @@
 #include <system_error>
 #include <utility>
 
+#include "talOS/launcher/console_line.h"
 #include "talOS/launcher/spawn.h"
 
 namespace talos::launcher {
@@ -61,8 +62,9 @@ uint64_t WriteLog(LogFile& file, const std::string& path, std::string bytes) {
         ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (file.fd < 0) {
       if (!file.reported)
-        std::cerr << "[launcher] cannot open " << path << " ("
-                  << std::strerror(errno) << "); its output is dropped\n";
+        ConsoleLine(std::cerr)
+            << "[launcher] cannot open " << path << " (" << std::strerror(errno)
+            << "); its output is dropped\n";
       file.reported = true;
       return bytes.size();
     }
@@ -83,8 +85,8 @@ uint64_t WriteLog(LogFile& file, const std::string& path, std::string bytes) {
   const std::size_t unwritten = WriteAll(file.fd, bytes);
   file.written += bytes.size() - unwritten;
   if (unwritten != 0 && !file.reported) {
-    std::cerr << "[launcher] cannot write " << path << " ("
-              << std::strerror(errno) << "); output is dropped\n";
+    ConsoleLine(std::cerr) << "[launcher] cannot write " << path << " ("
+                           << std::strerror(errno) << "); output is dropped\n";
     file.reported = true;
   }
   return lost + unwritten;
