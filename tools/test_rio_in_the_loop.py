@@ -430,11 +430,16 @@ def rotations_of(summary):
     return float(found.group(1))
 
 
-def check_ports():
+def check_ports(ports=(5802, 5803)):
     """Refuse to run if another gateway or bridge holds the demo's ports."""
-    for port in (5802, 5803):
+    for port in ports:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.bind(("0.0.0.0", port))
+            try:
+                probe.bind(("0.0.0.0", port))
+            except OSError as error:
+                raise RuntimeError(
+                    f"UDP port {port} is taken ({error.strerror}): another "
+                    "gateway, bridge or sim.sh is running") from None
 
 
 def check_nothing_restored(gateway_text, saved):

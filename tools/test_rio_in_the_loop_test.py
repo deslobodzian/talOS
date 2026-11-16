@@ -10,6 +10,7 @@ it and refuses the bridge's push of another, so the run is refused.
 """
 
 import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,6 +79,19 @@ class NothingRestoredTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "9664505023115029081"):
             rio.check_nothing_restored(
                 line.format(9664505023115029081, 1), saved)
+
+
+class PortsTest(unittest.TestCase):
+    # REQ-DEV-06: a held port fails the run naming the port and its likely
+    # holder, not with a bare OSError traceback.
+    def test_a_held_port_is_named_with_its_likely_holder(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as holder:
+            holder.bind(("0.0.0.0", 0))
+            port = holder.getsockname()[1]
+            with self.assertRaisesRegex(
+                    RuntimeError, rf"UDP port {port} .*another gateway, "
+                    r"bridge or sim\.sh is running"):
+                rio.check_ports((port,))
 
 
 if __name__ == "__main__":
