@@ -197,6 +197,19 @@ class PrepushTest(unittest.TestCase):
             "prepush: robot-repository skipped (TALOS_ROBOT_REPOSITORY unset)",
             out)
 
+    # REQ-DEV-32: set but empty, as `TALOS_ROBOT_REPOSITORY="$MISSPELT"`
+    # passes it, the run fails the step rather than skipping it or checking
+    # the directory prepush was started in.
+    def test_robot_repository_set_empty_fails_the_step(self):
+        code, out, _ = self.prepush(TALOS_ROBOT_REPOSITORY="")
+        self.assertEqual(code, 1, out)
+        self.assertIn("prepush: robot-repository FAILED (TALOS_ROBOT_REPOSITORY"
+                      " names no robot repository: '' is not a directory)",
+                      out)
+        self.assertNotIn("prepush: robot-repository skipped", out)
+        self.assertIn("prepush: test ok", out)
+        self.assert_cleaned_up()
+
     # REQ-DEV-25
     def test_a_failing_step_fails_the_run_naming_it(self):
         put(os.path.join(self.built, "y.d"),
