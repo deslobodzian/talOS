@@ -178,7 +178,11 @@ A relative `--prefix` is resolved against the working directory.
   regular file nor a directory (a FIFO, socket or device), or names a
   directory holding the link itself, the bundle or the install (which the
   copy would follow until it failed or the disk filled); `current` and
-  `previous` stay as they were.
+  `previous` stay as they were. Stopping `deploy.sh` (Ctrl-C, SIGTERM,
+  SIGHUP) while it copies, or makes the copy read-only and syncs it, stops
+  the copy's processes, removes the copy and exits 128 plus the signal's
+  number; a stop during the warm-up or the graph check selects nothing but
+  leaves the complete copy for `prune`.
 - **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
   boot as `--user` (default `talos`; the account must exist), so a booted
   robot serves the Studio its bundle carries ([above](#build-a-bundle)).

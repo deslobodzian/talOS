@@ -7,7 +7,9 @@ parameter is refused with the launcher's own finding, and `current` stays
 on the bundle installed before."""
 
 import os
+import select
 import shutil
+import signal
 import subprocess
 import tempfile
 import tomllib
@@ -179,6 +181,60 @@ class InstallCheckTest(unittest.TestCase):
                 self.assertEqual(os.readlink(current), installed, out)
                 self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
                                  [os.path.basename(installed)], out)
+
+    # REQ-OPS-48: a stop during install's copy (Ctrl-C, SIGTERM, SIGHUP to
+    # deploy.sh) stops the copy's processes and removes the partial copy,
+    # so no stray bundles/<stamp> is left for prune to count among the
+    # newest, and deploy.sh exits 128 + the signal. A `cp` first on PATH
+    # copies, then reports its pid and blocks, so the stop lands at a known
+    # point with the copy written.
+    def test_a_stopped_copy_is_removed(self):
+        real_cp = shutil.which("cp")
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=number.name), tempfile.TemporaryDirectory(
+                    ignore_cleanup_errors=True) as tmp:
+                src = os.path.join(tmp, "bundle")
+                os.makedirs(src)
+                with open(os.path.join(src, "run.sh"), "w",
+                          encoding="utf-8") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(os.path.join(src, "run.sh"), 0o755)
+                fake = os.path.join(tmp, "fake")
+                os.makedirs(fake)
+                with open(os.path.join(fake, "cp"), "w",
+                          encoding="utf-8") as f:
+                    f.write(f'#!/bin/sh\n"{real_cp}" "$@" || exit\n'
+                            'echo $$ > "$COPY_FIFO"\n'
+                            "exec tail -f /dev/null\n")
+                os.chmod(os.path.join(fake, "cp"), 0o755)
+                fifo = os.path.join(tmp, "copied")
+                os.mkfifo(fifo)
+                # Read and write: the fake's open never blocks.
+                reader = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+                self.addCleanup(os.close, reader)
+                prefix = os.path.join(tmp, "prefix")
+                deploy = subprocess.Popen(
+                    ["bash", deploy_script(), "install", src, "--prefix",
+                     prefix, "--no-warm-up"],
+                    env=dict(os.environ, COPY_FIFO=fifo,
+                             PATH=fake + os.pathsep + os.environ["PATH"]),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.addCleanup(deploy.kill)
+                ready, _, _ = select.select([reader], [], [], 60)
+                self.assertTrue(ready, "the copy never reached its end")
+                copier = int(os.read(reader, 64).split()[0])
+                deploy.send_signal(number)
+                # Bounds a hang only: before the fix, SIGINT and SIGHUP left
+                # deploy.sh waiting on the blocked copy.
+                out, err = deploy.communicate(timeout=20)
+                self.assertEqual(deploy.returncode, 128 + number, out + err)
+                self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
+                                 [], out + err)
+                self.assertFalse(os.path.lexists(
+                    os.path.join(prefix, "current")), out + err)
+                with self.assertRaises(ProcessLookupError,
+                                       msg="the copy outlived deploy.sh"):
+                    os.kill(copier, 0)
 
 
 if __name__ == "__main__":

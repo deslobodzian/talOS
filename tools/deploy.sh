@@ -392,15 +392,40 @@ check_graph() {
 # directory that holds the link itself, the bundle or the install (a loop
 # the copy would follow until ELOOP or a full disk). Python, as elsewhere
 # here: BSD's readlink has no -f before macOS 12.3, and macOS's bash is 3.2.
+# Run it only in the background (`copy_bundle ... &`): it execs Python, so
+# that $! is the copy's own process, which a stop signals; a subshell in
+# between would die of the signal alone and leave the copy running.
 copy_bundle() {
-  python3 - "$1" "$2" <<'EOF'
+  exec python3 - "$1" "$2" <<'EOF'
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 
 bundle, dest = sys.argv[1:]
+
+
+class Stopped(Exception):
+    pass
+
+
+STOPS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def stopped(signum, frame):
+    # Once: Ctrl-C reaches this process and install's forwarded SIGTERM
+    # follows, which must not interrupt stopping `cp`.
+    for number in STOPS:
+        signal.signal(number, signal.SIG_IGN)
+    raise Stopped(signum)
+
+
+# install forwards its stop as SIGTERM; the copy stops where it is and
+# install removes what it wrote.
+for number in STOPS:
+    signal.signal(number, stopped)
 
 
 def contains(outer, path):
@@ -484,9 +509,18 @@ for refusal in refusals:
     print(f"deploy: error: {refusal}", file=sys.stderr)
 if refusals:
     sys.exit(1)
-if subprocess.call(["cp", "-RP", bundle, dest]) != 0:
-    sys.exit(1)
+copier = None
 try:
+    # Held while `cp` starts, so a stop cannot fall between its start and
+    # `copier` naming it; `cp` inherits the mask, and is stopped with
+    # SIGKILL.
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
+    try:
+        copier = subprocess.Popen(["cp", "-RP", bundle, dest])
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)
+    if copier.wait() != 0:
+        sys.exit(1)
     for rel in leaving:
         path = os.path.join(dest, rel)
         # cp gives a copied directory its source's mode, read-only in a
@@ -499,6 +533,11 @@ try:
             shutil.copytree(source, path, symlinks=False)
         else:
             shutil.copy2(source, path)
+except Stopped:
+    if copier is not None and copier.poll() is None:
+        copier.kill()
+        copier.wait()
+    sys.exit(1)
 except (OSError, shutil.Error) as e:
     print(f"deploy: error: copying a link's target: {e}", file=sys.stderr)
     sys.exit(1)
@@ -506,6 +545,12 @@ if leaving:
     print(f"deploy: copied {len(leaving)} links that leave the bundle as "
           "the files they name", flush=True)
 EOF
+}
+
+# Removes an install's copy, which install made read-only.
+discard_copy() {
+  chmod -R u+w "$1" 2>/dev/null || true
+  rm -rf "$1"
 }
 
 # What stays selected when an install fails.
@@ -517,13 +562,32 @@ kept_selection() {
   fi
 }
 
+# A stop's trap while install copies: stops the copy (its Python, which
+# kills its `cp`), removes what it wrote and exits $1. Reads cmd_install's
+# `copier` and `dest`.
+stop_install() {
+  trap - TERM INT HUP
+  if [ -n "$copier" ]; then
+    kill -TERM "$copier" 2>/dev/null || true
+    wait "$copier" 2>/dev/null || true
+  fi
+  discard_copy "$dest"
+  printf 'deploy: error: stopped during the copy; %s removed, %s\n' \
+    "$dest" "$(kept_selection)" >&2
+  exit "$1"
+}
+
 # --- install ---------------------------------------------------------------
 # Copies the bundle (copy_bundle), warms it in place, checks its graph and
 # flips `current` atomically, keeping `previous` for rollback. Selects only a
 # complete copy, synced to disk first: a power cut right after the flip must
 # not boot a half-written bundle. A copy that fails, or that the launcher
-# refuses, is removed, so neither a selection nor prune's newest --keep N
-# ever counts it.
+# refuses, is removed, as is one stopped (SIGTERM, SIGINT or SIGHUP to
+# deploy.sh) while it is copied, made read-only or synced: the copy's
+# processes are stopped first, and deploy.sh exits 128 + the signal. So
+# neither a selection nor prune's newest --keep N ever counts it. Not
+# covered: SIGKILL, and a stop during the warm-up or graph check, which
+# select nothing but leave the complete copy for prune.
 cmd_install() {
   local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
@@ -538,19 +602,31 @@ cmd_install() {
   bundle="$(cd "$bundle" && pwd -P)" || die "cannot resolve $bundle"
   if [ "$DRY_RUN" = "1" ]; then
     printf '+ copy %s %s\n' "$bundle" "$dest"
-  elif ! copy_bundle "$bundle" "$dest"; then
-    chmod -R u+w "$dest" 2>/dev/null || true
-    rm -rf "$dest"
-    die "$bundle not installed; $(kept_selection)"
+  else
+    # In the background, as the warm-up, so that a stop reaches the copy;
+    # a stop during the foreground chmod or sync below runs once it ends.
+    local copier="" status=0
+    trap 'stop_install 143' TERM
+    trap 'stop_install 130' INT
+    trap 'stop_install 129' HUP
+    copy_bundle "$bundle" "$dest" &
+    copier=$!
+    wait "$copier" || status=$?
+    copier=""
+    if [ "$status" != "0" ]; then
+      trap - TERM INT HUP
+      discard_copy "$dest"
+      die "$bundle not installed; $(kept_selection)"
+    fi
   fi
   run chmod -R a-w "$dest" 2>/dev/null || true
   [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
     die "copy has no executable run.sh; current unchanged: $dest"
   run sync
+  trap - TERM INT HUP
   warm_up "$dest" install
   if ! check_graph "$dest"; then
-    chmod -R u+w "$dest" 2>/dev/null || true
-    rm -rf "$dest"
+    discard_copy "$dest"
     # The launcher's paths name the removed copy and check directory; the
     # bundle given holds the same files at the same relative paths.
     die "$bundle not installed (the paths above were its removed copy, $dest); $(kept_selection)"
