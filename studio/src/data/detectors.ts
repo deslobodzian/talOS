@@ -242,9 +242,9 @@ export function createFrameDetectors(): FrameDetector[] {
   // Brownout: start is an error, recovery is info.
   boolEdge('power-brownout', 'hw/status/brownout', 'power',
            'Brownout', 'Brownout cleared', 'error', 'info'),
-  // Link configuration lost/regained.
+  // The RoboRIO's acknowledgement of the configuration push lost/regained.
   boolEdge('link-configured', 'hw/status/configured', 'hardware',
-           'Link configured', 'Link not configured', 'info', 'warn'),
+           'Config acknowledged', 'Config not acknowledged', 'info', 'warn'),
   // Motor faults distinguish newly set bits from resolved bits.
   {
     id: 'link-fault-mask',
