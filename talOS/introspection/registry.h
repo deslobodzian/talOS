@@ -1496,6 +1496,8 @@ class RegistryReader {
         const std::uint64_t generation =
             record.generation.load(std::memory_order_acquire);
         auto node = copy_stable(record, i);
+        const std::uint64_t claimant =
+            (record.pid_start << kProcessPidBits) | record.pid;
         if (!node ||
             record.state.load(std::memory_order_acquire) !=
                 static_cast<std::uint64_t>(SlotState::ACTIVE) ||
@@ -1503,8 +1505,11 @@ class RegistryReader {
           continue;
         }
         node->generation = generation;
+        // A crashed owner's heartbeat stays fresh for kLivenessTimeout, so
+        // its process is checked too, as the claim sweep checks it.
         node->alive = now - node->heartbeat_monotonic_ns < timeout &&
-                      (node->flags & kFlagConstructing) == 0;
+                      (node->flags & kFlagConstructing) == 0 &&
+                      talos::ProcessWordAlive(claimant);
         out.push_back(std::move(*node));
         break;
       }
