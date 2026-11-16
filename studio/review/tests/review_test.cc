@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +36,8 @@
 #include "studio/review/testdata/fixture.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
+#include "talOS/events/log/gap_testing.h"
+#include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/protocol/types.h"
 
@@ -753,6 +756,163 @@ TEST_F(ReviewTest, ChannelsCarryEachAlertLevelAsTheBridgeDoes) {
                                R"("kind":"bool","labels":[],"alert":"none"})"),
             std::string::npos)
       << channels.body;
+}
+
+// The 0-based index of the first intact record of the log at `path` that
+// `match` accepts (CopyWithGap's record numbering).
+std::size_t RecordIndex(
+    const std::string& path,
+    const std::function<bool(const talos::event::log::RecordHeader&)>& match) {
+  talos::event::log::LogReader reader{path};
+  talos::event::log::LogReader::Record record;
+  for (std::size_t i = 0; reader.next(record); ++i) {
+    if (match(record.header)) return i;
+  }
+  throw std::runtime_error("no such record in " + path);
+}
+
+// The fixture session copied to `dir` with two gaps, made as the writer
+// would make them (CopyWithGap): the observer's records of Driver Station
+// packets 60..64 (published 6.0 s to 6.4 s; capture resumed with packet 65,
+// received at 6.502 s), and the shooter restart's ticks 490..499 to its end
+// (a gap closed at the stop: 30 records, ending at tick 499's 9.9805 s).
+// Returns the session directory.
+std::string WriteGappedSession(const std::string& dir) {
+  namespace tlog = talos::event::log;
+  const std::string source = dir + ".source";
+  testing::WriteFixtureSession(source);
+  std::filesystem::create_directories(dir);
+  for (const auto& entry : std::filesystem::directory_iterator{source}) {
+    std::filesystem::copy(entry.path(),
+                          std::filesystem::path{dir} / entry.path().filename());
+  }
+  const std::string observer = source + "/observer.tlog";
+  const std::size_t packet60 =
+      RecordIndex(observer, [](const tlog::RecordHeader& h) {
+        return h.publish_time_ns == kStartNs + 6 * kSecond;
+      });
+  tlog::CopyWithGap(observer, dir + "/observer.tlog", packet60, packet60 + 5);
+  const std::string restart = source + "/shooter.restart1.tlog";
+  const std::size_t tick490 =
+      RecordIndex(restart, [](const tlog::RecordHeader& h) {
+        return h.kind ==
+                   static_cast<std::uint16_t>(talos::event::EventKind::TIMER) &&
+               h.event_time_ns == kStartNs + 490 * 20 * kMs;
+      });
+  std::size_t records = 0;
+  {
+    tlog::LogReader reader{restart};
+    tlog::LogReader::Record record;
+    while (reader.next(record)) ++records;
+  }
+  tlog::CopyWithGap(restart, dir + "/shooter.restart1.tlog", tick490, records);
+  std::filesystem::remove_all(source);
+  return dir;
+}
+
+// Guards REQ-OPS-41's gap list and REQ-OPS-42's per-gap heap term:
+// bounds.json lists every GAP record of the session, from two processes, in
+// order of start (then process), each with the process, its start and end
+// (resumed, or the stop) as decimal strings, the records, dispatches and
+// sends it lost and whether the stop closed it; a session without one has
+// an empty list (the golden bounds.json). A gap's records are never values:
+// a series bucket inside the shooter's gap holds no sample, and a snapshot
+// in it holds the last value published before it (tick 489's), as for any
+// stretch a topic was not published, never one from the gap's own record.
+// The index keeps 48 B per gap beside its checkpoints.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, BoundsListEveryGap) {
+  const std::string dir = WriteGappedSession(Library() + "/gapped");
+  Review review{Library(), 1u << 20};
+  const Response response = review.Get("/review/gapped/bounds.json", "");
+  ASSERT_EQ(response.status, 200) << response.body;
+  const json bounds = json::parse(response.body);
+  ASSERT_TRUE(bounds.contains("gaps")) << response.body;
+  const json expected = json::parse(
+      R"([{"process":"observer","start_ns":"1006000000000",)"
+      R"("end_ns":"1006502000000","records":5,"dispatches":5,"sends":0,)"
+      R"("closed_at_flush":false},)"
+      R"({"process":"shooter","start_ns":"1009800000000",)"
+      R"("end_ns":"1009980500000","records":30,"dispatches":10,"sends":20,)"
+      R"("closed_at_flush":true}])");
+  EXPECT_EQ(bounds["gaps"], expected);
+  EXPECT_EQ(bounds["start_ns"], std::to_string(kStartNs));
+  EXPECT_EQ(bounds["end_ns"],
+            std::to_string(kStartNs + 10 * kSecond + 2 * kMs));
+
+  const std::int64_t gap_start = kStartNs + 9 * kSecond + 800 * kMs;
+  const Response series = review.Get(
+      "/review/gapped/series",
+      "c=shooter/state/position_m&start_ns=" + std::to_string(gap_start) +
+          "&end_ns=" + std::to_string(gap_start + 200 * kMs) + "&points=2");
+  ASSERT_EQ(series.status, 200) << series.body;
+  for (const Bucket& bucket : ParseSeries(series.body)[0]) {
+    EXPECT_EQ(bucket.count, 0u);
+  }
+  const Response snapshot =
+      review.Get("/review/gapped/snapshot",
+                 "t_ns=" + std::to_string(kStartNs + 9 * kSecond + 950 * kMs));
+  ASSERT_EQ(snapshot.status, 200) << snapshot.body;
+  const json position =
+      json::parse(snapshot.body)["channels"]["shooter/state/position_m"];
+  EXPECT_EQ(position["value"], testing::ShotPosition(489));
+  EXPECT_EQ(position["sample_ns"],
+            std::to_string(kStartNs + 489 * 20 * kMs + kMs / 2));
+
+  const auto session = Session::Open(dir);
+  EXPECT_EQ(session->index_bytes(),
+            session->log_seconds() * sizeof(Checkpoint) + 2 * 48);
+  std::filesystem::remove_all(dir);
+}
+
+// Guards that a damaged GAP record is damage, as log_dump reads it: skipped
+// and warned about naming its log, never listed as a gap (log_dump returns
+// no GAP record either), and the rest of the session is served.
+// REQ-OPS-41
+TEST_F(ReviewTest, DamagedGapIsDamageNotAGap) {
+  namespace tlog = talos::event::log;
+  const std::string dir = Library() + "/damaged_gap";
+  testing::WriteFixtureSession(dir);
+  const std::string path = dir + "/shooter.restart1.tlog";
+  const std::string copy = dir + "/copy.tmp";
+  tlog::CopyWithGap(path, copy, 30, 60);  // ticks 360..369
+  std::filesystem::rename(copy, path);
+  std::uint64_t offset = 0;
+  {
+    tlog::WindowedLogReader reader{path};
+    tlog::LogReader::Record record;
+    while (reader.next(record)) {
+      if (record.header.kind ==
+          static_cast<std::uint16_t>(talos::event::EventKind::GAP)) {
+        offset = record.offset;
+      }
+    }
+  }
+  ASSERT_NE(offset, 0u);
+  {
+    std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
+    const auto at =
+        static_cast<std::streamoff>(offset + sizeof(tlog::RecordHeader) +
+                                    offsetof(tlog::GapRecord, records));
+    file.seekp(at);
+    const char byte = 0x7F;
+    file.write(&byte, 1);
+    ASSERT_TRUE(file);
+  }
+
+  Review review{Library(), 1u << 20};
+  ::testing::internal::CaptureStderr();
+  const Response response = review.Get("/review/damaged_gap/bounds.json", "");
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  ASSERT_EQ(response.status, 200) << response.body;
+  EXPECT_EQ(json::parse(response.body)["gaps"], json::array()) << response.body;
+  EXPECT_NE(stderr_text.find("warning: damaged log " + path + ": "),
+            std::string::npos)
+      << stderr_text;
+  for (const json& record : LogDump(dir)) {
+    EXPECT_NE(record["kind"], "GAP") << record.dump();
+  }
+  std::filesystem::remove_all(dir);
 }
 
 // The golden responses (testdata/golden), by file name, and the request each

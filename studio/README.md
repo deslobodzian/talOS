@@ -482,8 +482,22 @@ a session whose bridge and launcher recorded different protocols. The Studio pag
 the session id in its status (the header, where hovering shows it whole, and
 the Health panel's Status).
 
+`bounds.json`'s `gaps` lists every GAP record of the session's logs
+(version 8; [log format](../talOS/events/README.md)), where a writer dropped
+records and capture resumed: its process, `start_ns` (the earliest time a
+dropped record named) and `end_ns` (when capture resumed, or when the
+writer was stopped for one `closed_at_flush`), and the records, dispatches
+and sends it lost, ordered by start, then process; the session's
+`start_ns`..`end_ns` covers each gap. A gap holds no value: a series bucket
+inside one holds no value of a topic read from that process's logs, and a snapshot at a `t`
+inside one gives each topic its latest value published at or before `t`
+that a log holds (from before the gap, with that publication time in
+`sample_ns`), as for any stretch a topic was not published. A damaged GAP
+record is damage like any other, warned about and not listed.
+
 Opening a session streams it once, merged, and keeps per log file one
-24-byte checkpoint per second of event time that holds records (where that
+24-byte checkpoint per second of event time that holds records other than
+GAP records (where that
 second starts, and which sources recorded a value in it, a SEND or MESSAGE
 record). A series seeks to the checkpoints it needs and reads those seconds
 only, one second either side of its range by event time: a message received
@@ -503,7 +517,7 @@ time and the response), so at most 20 MiB (`kMaxSeriesRequestBytes`). At
 most 4 sessions are open at once (`kMaxOpenSessions`); opening another
 closes the least recently used, whose index is rebuilt when it is opened
 again. So the heap is the open sessions' indexes (24 B per log-file second,
-plus their channel names), plus that cache, plus one request's ceiling (a
+48 B per GAP record, plus their channel names), plus that cache, plus one request's ceiling (a
 series' 20 MiB; a snapshot's answer, about 100 B per channel of its
 session), plus one read window per log being read (REQ-OPS-42). On a
 generated 203 MiB session (8 logs, 2.75 million records; `bazel run -c opt //studio/review:review_bench`,
