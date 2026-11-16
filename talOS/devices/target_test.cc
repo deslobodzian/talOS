@@ -122,6 +122,8 @@ TEST_F(TargetTest, NeverSentIsNull) {
   EXPECT_EQ(lift.source, "");
 }
 
+// REQ-SAFE-07: of two live lanes of one mode, the first in its policy order
+// is selected; a released lane is not active and falls through
 TEST_F(TargetTest, HigherPriorityLaneWinsAndReleaseFallsThroughInOneTick) {
   PublishTarget(sim, "lift", "teleop", Goal{1.0});
   PublishTarget(sim, "lift", "align", Goal{2.0});
@@ -141,6 +143,7 @@ TEST_F(TargetTest, HigherPriorityLaneWinsAndReleaseFallsThroughInOneTick) {
   EXPECT_EQ(Seen(), std::nullopt);
 }
 
+// REQ-SAFE-07: a lane is selected only while fresh
 TEST_F(TargetTest, StaleLaneIsNull) {
   Hold("teleop", 1.0, 20ms);
   ASSERT_EQ(Seen(), 1.0);
@@ -307,6 +310,7 @@ can_id = 1
   EXPECT_EQ(lift.source, "");
 }
 
+// REQ-SAFE-07: only the current mode's policy lists the lanes
 TEST_F(TargetTest, ModeSwitchIgnoresTheOldModesLane) {
   Mode(kAuto);
   Hold("auto", 3.0, 20ms);
@@ -319,6 +323,8 @@ TEST_F(TargetTest, ModeSwitchIgnoresTheOldModesLane) {
   EXPECT_EQ(Seen(), std::nullopt);
 }
 
+// REQ-SAFE-07: a lane is selected only when stamped with the generation the
+// consumer last drained
 TEST_F(TargetTest, LaneFromBeforeTheModeChangeIsIgnored) {
   Hold("teleop", 1.0, 20ms);
   ASSERT_EQ(Seen(), 1.0);
@@ -464,6 +470,7 @@ TEST_F(TargetTest, TargetFromAProducerWithNoModeIsRejected) {
   EXPECT_EQ(Seen(), std::nullopt);
 }
 
+// REQ-SAFE-07: a lane is selected only while robot_enabled
 TEST_F(TargetTest, RobotDisabledIsNull) {
   Hold("teleop", 1.0, 20ms);
   ASSERT_EQ(Seen(), 1.0);
@@ -516,6 +523,7 @@ TEST_F(TargetTest, ReattachStartsANewGenerationTheOldLaneCannotDrive) {
   EXPECT_EQ(Seen(), 1.25);
 }
 
+// REQ-SAFE-07: a stale lane is skipped for the next fresh one in policy order
 TEST_F(TargetTest, StaleHigherPriorityLaneFallsBackToTheNext) {
   PublishTarget(sim, "lift", "align", Goal{2.0});
   Hold("teleop", 1.0, 50ms);
