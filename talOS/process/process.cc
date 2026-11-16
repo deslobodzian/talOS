@@ -170,7 +170,12 @@ bool StackBounds(char*& low, char*& high) {
 // call. Read, not locked: macOS refuses mlock of executable pages (EPERM),
 // even unprivileged within the wired limit. System libraries and the Python
 // interpreter are left as they are.
-void PrefaultText(Problems& problems) {
+// Not address-sanitized: a page's first byte may fall in the redzone ASan
+// pads a global in __TEXT,__cstring with, which ASan would report although
+// the page is mapped and the read is meant. Not inlined, so the exemption
+// cannot be folded into an instrumented caller.
+[[gnu::noinline]] __attribute__((no_sanitize("address"))) void PrefaultText(
+    Problems& problems) {
   Dl_info info{};
   if (::dladdr(reinterpret_cast<const void*>(&ConfigureRealtime), &info) == 0 ||
       info.dli_fbase == nullptr) {
