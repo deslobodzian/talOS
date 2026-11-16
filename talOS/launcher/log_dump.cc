@@ -475,11 +475,14 @@ class TopicSummary {
     first_ms_ = std::min(first_ms_, ToMillis(base_ns, published));
     last_ms_ = std::max(last_ms_, ToMillis(base_ns, published));
     if (r.source == nullptr || r.payload.empty()) return;
+    if (!r.source->schema.name.empty()) schema_ = r.source->schema.name;
     if (const auto hardware = HardwareJson(r, decoding); !hardware.empty()) {
+      // Decoded, a hardware packet is read by name: its hex is no `latest`.
       hardware_ = hardware;
+      latest_.clear();
+      return;
     }
     if (r.source->schema.name.empty()) return;
-    schema_ = r.source->schema.name;
     latest_ = talos::schema::DecodeToText(r.source->schema, r.payload);
     if (latest_.starts_with("bytes=")) return;  // A byte layout: no fields.
     DecodedFields::Walk(
@@ -502,6 +505,11 @@ class TopicSummary {
       std::printf("  range %s %s %s\n", range.path.c_str(),
                   range.min_text.c_str(), range.max_text.c_str());
     }
+    for (const auto& values : values_) {
+      std::printf("  values %s", values.path.c_str());
+      for (const auto& value : values.seen) std::printf(" %s", value.c_str());
+      std::printf("\n");
+    }
   }
 
  private:
@@ -513,8 +521,16 @@ class TopicSummary {
     std::string max_text;
   };
 
+  // The names a field took, each once, in the order first seen; at most
+  // its enum's count of names.
+  struct Values {
+    std::string path;
+    std::vector<std::string> seen;
+  };
+
   // A number or a bool (false below true) widens its field's range; an
-  // enum's name or an undecodable payload has none.
+  // enum's name is added to its field's values; an undecodable payload
+  // (`<...>`) is neither.
   void Widen(const std::string& path, std::string_view token) {
     double value = 0;
     if (token == "true" || token == "false") {
@@ -527,6 +543,11 @@ class TopicSummary {
       value = std::strtod(text.c_str(), &end);
       if (text.empty() || end != text.c_str() + text.size() ||
           std::isnan(value)) {
+        // Not a number (to_chars's NaN is one): an enum's name, unless
+        // undecodable.
+        if (end != text.c_str() + text.size() && !text.starts_with('<')) {
+          See(path, text);
+        }
         return;
       }
     }
@@ -547,6 +568,16 @@ class TopicSummary {
     }
   }
 
+  // Adds `name` to the values of the field at `path`, once.
+  void See(const std::string& path, const std::string& name) {
+    const auto [at, added] = values_index_.try_emplace(path, values_.size());
+    if (added) values_.push_back({path, {}});
+    auto& seen = values_[at->second].seen;
+    if (std::find(seen.begin(), seen.end(), name) == seen.end()) {
+      seen.push_back(name);
+    }
+  }
+
   std::map<std::pair<std::string, std::string>, std::size_t> records_;
   double first_ms_{std::numeric_limits<double>::infinity()};
   double last_ms_{-std::numeric_limits<double>::infinity()};
@@ -555,6 +586,8 @@ class TopicSummary {
   std::string hardware_;
   std::vector<Range> ranges_;  // In the order their fields first appeared.
   std::map<std::string, std::size_t> range_index_;
+  std::vector<Values> values_;  // In the order their fields first appeared.
+  std::map<std::string, std::size_t> values_index_;
 };
 
 // --format summary: one process's GAP records folded into totals, so a

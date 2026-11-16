@@ -1,0 +1,9 @@
+// A message with an enum and an array, for log_dump_test's summary.
+namespace summary_test;
+
+enum Phase : ubyte { IDLE, HOMED, FAILED }
+
+struct Arm {
+  position_m:[float:2];
+  phase:Phase;
+}
