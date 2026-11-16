@@ -448,23 +448,29 @@ inline std::string read_name(const char* value, std::size_t capacity) {
   return std::string{value, n};
 }
 
-// Optional startup-only fault-injection seams. Production callers leave these
-// null; tests stop a child while it owns the lock, before either commit.
+// Optional startup-only fault-injection seams, each called at most once per
+// mapping or registration, with RegistryLock held. Production callers leave
+// these null; tests stop a child while it owns the lock, before either
+// commit, or act between a registration's map and its claim (`mapped`).
 struct RegistryTestHooks {
   void (*initializing)(RegistryHeader*){nullptr};
+  void (*mapped)(RegistryHeader*){nullptr};
   void (*claiming)(NodeRecord*){nullptr};
 };
 
 // Serializes the writers: segment creation, sizing and initialization
-// (RegistryMapping) and slot claims (NodeRegistration); a reader never takes
-// it. Use a regular file (LockFilePath): Darwin's shm descriptors are not
-// vnodes, so flock on them fails with ENOTSUP. Each acquisition opens a
-// separate file description, which also serializes threads in one process.
-// close (including process death) releases the lock. Only a launcher
-// session in a shared-memory namespace unlinks this file, under the lock,
-// once its members are reaped and no other session holds a row
-// (NamespaceNames, launcher.cc); if anything unlinks it, an acquirer that
-// wins the old inode finds it no longer current and starts over.
+// (RegistryMapping, PrepareRegistry), a registration's map and slot claim,
+// taken once for both (NodeRegistration), and a namespaced launcher
+// session's removal of the registry; a reader never takes it. No holder
+// waits for another lock; the launcher holds its session locks while it
+// takes this one, and no holder of this one takes those. Use a regular file
+// (LockFilePath): Darwin's shm descriptors are not vnodes, so flock on them
+// fails with ENOTSUP. Each acquisition opens a separate file description, which
+// also serializes threads in one process. close (including process death)
+// releases the lock. Only a launcher session in a shared-memory namespace
+// unlinks this file, under the lock, once its members are reaped and no other
+// session holds a row (NamespaceNames, launcher.cc); if anything unlinks it, an
+// acquirer that wins the old inode finds it no longer current and starts over.
 class RegistryLock {
  public:
   explicit RegistryLock(const std::string& mapped_path)
@@ -565,11 +571,13 @@ class RegistryMapping {
   }
 
   // A writer's mapping for a caller that already holds `held`, this path's
-  // RegistryLock (PrepareRegistry); taking it again would wait on itself.
-  RegistryMapping(std::string_view path, const RegistryLock& held)
+  // RegistryLock (PrepareRegistry, NodeRegistration); taking it again would
+  // wait on itself.
+  RegistryMapping(std::string_view path, const RegistryLock& held,
+                  const RegistryTestHooks* test_hooks = nullptr)
       : path_{ShmObjectName(path)} {
     static_cast<void>(held);
-    map(false, nullptr);
+    map(false, test_hooks);
   }
 
   ~RegistryMapping() {
@@ -789,20 +797,19 @@ class NodeRegistration {
     std::uint32_t flags{0};
   };
 
+  // Maps the registry and claims a slot under one RegistryLock acquisition,
+  // so a claim lands in the segment the path names: a launcher session that
+  // removes the registry (NamespaceNames, launcher.cc) does so under that
+  // lock, either before the map, and the map creates a new segment, or after
+  // the claim, when the row keeps it. Locked for microseconds: shm_open,
+  // mmap, a header check and a scan of kMaxNodes rows, all before the node's
+  // constructor and its loop run.
   explicit NodeRegistration(Identity identity,
                             std::string_view path = kRegistryPath,
                             const RegistryTestHooks* test_hooks = nullptr)
-      : mapping_{path, false, test_hooks}, identity_{std::move(identity)} {
-    const RegistryLock lock{mapping_.path()};
-    record_ = claim(mapping_.header(), identity_, test_hooks);
-    if (record_ == nullptr) {
-      throw std::runtime_error(
-          "registry is full: " + std::to_string(kMaxNodes) +
-          " nodes are already registered");
-    }
-    generation_ = record_->generation.load(std::memory_order_acquire);
-    pid_ = record_->pid;
-  }
+      // The temporary lock lives until the delegated constructor returns.
+      : NodeRegistration(std::move(identity), path, test_hooks,
+                         RegistryLock{ShmObjectName(path)}) {}
 
   ~NodeRegistration() { release(); }
 
@@ -1035,6 +1042,25 @@ class NodeRegistration {
   }
 
  private:
+  // The public constructor's work, with `held` taken for the map and the
+  // claim alike.
+  NodeRegistration(Identity identity, std::string_view path,
+                   const RegistryTestHooks* test_hooks,
+                   const RegistryLock& held)
+      : mapping_{path, held, test_hooks}, identity_{std::move(identity)} {
+    if (test_hooks != nullptr && test_hooks->mapped != nullptr) {
+      test_hooks->mapped(mapping_.header());
+    }
+    record_ = claim(mapping_.header(), identity_, test_hooks);
+    if (record_ == nullptr) {
+      throw std::runtime_error(
+          "registry is full: " + std::to_string(kMaxNodes) +
+          " nodes are already registered");
+    }
+    generation_ = record_->generation.load(std::memory_order_acquire);
+    pid_ = record_->pid;
+  }
+
   bool owns_slot() const noexcept {
     return record_ != nullptr &&
            record_->generation.load(std::memory_order_relaxed) == generation_ &&
