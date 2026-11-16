@@ -147,15 +147,27 @@ RecordedSession::RecordedSession(const std::string& path,
         continue;
       }
       const auto kind = static_cast<EventKind>(header.kind);
-      // A timer firing after a gap may follow dropped re-arms: only one
-      // before the first gap says when the run began.
-      if (own_log && !run_start && !gap_start &&
-          header.source_id < timer_offset.size()) {
+      // The first firing of a timer the run had not re-armed is at the run
+      // start plus its manifest offset. A firing after a gap is one the live
+      // loop made, so it fixes that timer's phase, but not the run start:
+      // the gap may have dropped earlier firings (the start is then whole
+      // periods earlier) or a re-arm. It is still a sound start before the
+      // gap: every live firing before the gap was recorded and none was, and
+      // the start it gives (never before the gap less the offset) fires no
+      // replayed timer before the gap either, where a run fed from this log
+      // stops. A run nothing stops at the gap replays that timer at its live
+      // times from this firing on, and the others that many periods late.
+      if (own_log && !run_start && header.source_id < timer_offset.size()) {
+        const std::optional<std::int64_t>& offset =
+            timer_offset[header.source_id];
         if (kind == EventKind::ARM_TIMER || kind == EventKind::DISARM_TIMER) {
           timer_offset[header.source_id].reset();
-        } else if (kind == EventKind::TIMER && timer_offset[header.source_id]) {
-          run_start = MonotonicTime::from_nanos(
-              header.event_time_ns - *timer_offset[header.source_id]);
+        } else if (kind == EventKind::TIMER && offset.has_value()) {
+          std::int64_t start_ns = header.event_time_ns - *offset;
+          if (gap_start.has_value()) {
+            start_ns = std::max(start_ns, gap_start->nanos() - *offset);
+          }
+          run_start = MonotonicTime::from_nanos(start_ns);
         }
       }
       // A watcher's receipt, or a writer's accepted send.

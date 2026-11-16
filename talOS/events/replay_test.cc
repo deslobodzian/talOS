@@ -699,6 +699,69 @@ TEST(Replay, StopsBeforeTheDispatchAGapStartsIn) {
   std::remove(original_path.c_str());
 }
 
+// Sends three commands from its constructor, outside any dispatch, as a
+// node announcing its initial state does, then ticks.
+template <typename Loop>
+struct StartupSender {
+  Sender<Loop, EventsTest::CommandMessage> command;
+  Timer<Loop> tick;
+  int ticks{0};
+
+  explicit StartupSender(Loop& loop)
+      : command{make_sender<EventsTest::CommandMessage>(loop,
+                                                        "/replay/startup")},
+        tick{make_timer<&StartupSender::on_tick>(loop, "tick", this)} {
+    for (int i = 0; i < 3; ++i) {
+      command.send(EventsTest::CommandMessage{i, static_cast<float>(i), 1});
+    }
+    tick.setup_periodic(MonotonicTime::from_nanos(1'000'000), 1ms);
+  }
+  void on_tick(const Context&) { ++ticks; }
+};
+
+// A gap that starts outside any dispatch (a constructor's sends dropped) is a
+// gap like any: the replayed constructor's sends past it are not divergences,
+// no dispatch replays, and the stop names the gap.
+// REQ-OPS-13
+TEST(Replay, AGapOutsideAnyDispatchStopsBeforeTheFirstDispatch) {
+  const std::string original_path = temp_path("startup_original");
+  const std::string gapped_path = temp_path("startup_gapped");
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<log::LogWriter> loop{
+        environment, log::LogWriter{original_path, "startup"}};
+    StartupSender program{loop};
+    loop.run_for(3ms);
+    loop.finish();
+    ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+    ASSERT_GT(program.ticks, 0);
+  }
+  const LogRecords original = read_records(original_path);
+  ASSERT_GE(original.headers.size(), 4u);
+  for (std::size_t i = 0; i < 3; ++i) {
+    ASSERT_EQ(original.headers[i].kind,
+              static_cast<std::uint16_t>(EventKind::SEND));
+    ASSERT_EQ(original.headers[i].dispatch_index, 0u);
+  }
+  // The second send dropped; capture resumes at the third.
+  const log::LogGap gap = log::CopyWithGap(original_path, gapped_path, 1, 2);
+  ASSERT_EQ(gap.first_dispatch_index, 0u);
+
+  log::LogReader reader{gapped_path};
+  ReplayEventLoop<> loop{reader};
+  std::optional<StartupSender<ReplayEventLoop<>>> program;
+  EXPECT_NO_THROW(program.emplace(loop));
+  ASSERT_TRUE(program.has_value());
+  EXPECT_NO_THROW(loop.run());
+  EXPECT_FALSE(loop.diverged());
+  EXPECT_FALSE(loop.reached_exit());
+  ASSERT_TRUE(loop.stopped_at_gap().has_value());
+  EXPECT_EQ(loop.stopped_at_gap().value().start_ns, gap.start_ns);
+  EXPECT_EQ(program->ticks, 0);
+  std::remove(original_path.c_str());
+  std::remove(gapped_path.c_str());
+}
+
 // Records lost between intact ones would replay a run the program never
 // made, so exact replay refuses the log; input replay is what uses the rest.
 TEST(Replay, RefusesALogMissingADamagedRecord) {

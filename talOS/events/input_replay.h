@@ -73,8 +73,10 @@ struct RecordedMessage {
 //
 // A log with a GAP record (log/format.h) lost records there: each topic
 // notes the earliest gap start in a log it is fed from (first_gap), which is
-// where ReplayInputs ends a run that feeds it. A timer firing after its own
-// log's first gap does not set run_start(), as re-arms before it may be lost.
+// where ReplayInputs ends a run that feeds it. When the replayed program's
+// own log has a gap before any timer firing, run_start() comes from the
+// first firing after it, never before the gap's start less that timer's
+// offset: no replayed timer then fires before the gap, as none did live.
 class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)

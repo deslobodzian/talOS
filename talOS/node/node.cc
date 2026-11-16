@@ -1414,14 +1414,16 @@ int RunMain(int argc, char** argv, const char* node_name,
                node_name, flags, make);
       loop.run();
       // The log ends at its first gap for replay: what came before it
-      // replayed, and nothing after it did.
+      // replayed, and nothing after it did. A gap outside any dispatch
+      // (index 0, during construction) stops it before the first.
       const std::optional<event::log::LogGap>& gap = loop.stopped_at_gap();
       if (gap.has_value()) {
         std::printf(
             "replay: stopped at a log gap in %s before dispatch %llu: "
             "%s\n",
             flags.replay_path.c_str(),
-            static_cast<unsigned long long>(gap->first_dispatch_index),
+            static_cast<unsigned long long>(
+                std::max<std::uint64_t>(gap->first_dispatch_index, 1)),
             event::log::DescribeGap(*gap).c_str());
       }
       std::printf("replay: diverged=%d clean_exit=%d stopped_at_gap=%d\n",

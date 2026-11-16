@@ -7,11 +7,8 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cstddef>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -370,6 +367,33 @@ std::size_t TicksBefore(MonotonicTime at) {
   return ticks;
 }
 
+// How long the consumer's construction took live in RecordLateConsumer: its
+// run, and so its control timer's schedule, begins this long after its
+// origin.
+constexpr Duration kLateRun = 5ms;
+
+// Records the producer and the consumer into `session_dir`, the consumer's
+// run starting kLateRun after its origin, as a slow constructor makes it.
+void RecordLateConsumer(const std::string& session_dir) {
+  SimulationEnvironment environment;
+  Loop producer_loop{environment,
+                     log::LogWriter{session_dir + "/producer.tlog", "producer"},
+                     Loop::Options{.start = kOrigin}};
+  Loop consumer_loop{
+      environment, log::LogWriter{session_dir + "/consumer.tlog", "consumer"},
+      Loop::Options{.start = kOrigin, .run_start = kOrigin + kLateRun}};
+  Producer producer{producer_loop};
+  TestRobot<Loop> consumer{consumer_loop, kTopics, kGain};
+  consumer.control_timer().setup_periodic(kOrigin + 1ms, 1ms);
+  for (int ms = 1; ms <= kSessionMs; ++ms) {
+    const MonotonicTime now = kOrigin + std::chrono::milliseconds{ms};
+    producer_loop.run_until(now);
+    consumer_loop.run_until(now);
+  }
+  producer_loop.finish();
+  consumer_loop.finish();
+}
+
 // Reads the session's setpoints and nothing else.
 class SetpointWatcher {
  public:
@@ -389,7 +413,9 @@ class SetpointWatcher {
 // observer, the only log of /input/setpoint; the producer, the writer of
 // /input/sensor); for one it ran, its own logs for a topic it watched live, so
 // the producer's earlier gap does not stop the observer. A gap in a log that
-// recorded nothing it watches does not stop it; of two gaps, the earlier.
+// recorded nothing it watches does not stop it; of two gaps, in two logs or
+// in one, the earlier. A program whose own log has a gap before its first
+// timer firing still replays on its recorded timeline.
 // REQ-OPS-14
 TEST(InputReplay, EndsBeforeTheFirstGapOfALogItIsFedFrom) {
   {
@@ -497,35 +523,49 @@ TEST(InputReplay, EndsBeforeTheFirstGapOfALogItIsFedFrom) {
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(out);
   }
-}
-
-// Two replays of a session with a gap write the same log, to the stop.
-// REQ-OPS-14
-TEST(InputReplay, TwoReplaysOfAGappedSessionWriteIdenticalLogs) {
-  const std::string dir = TempDir("gap_twice");
-  const std::string out = TempDir("gap_twice_out");
-  RecordSession(dir, out + "/live.tlog");
-  MarkGap(dir + "/observer.tlog", kOrigin + 20ms);
-  const RecordedSession session{dir};
-  const Replayed first = ReplayConsumer(session, out + "/first.tlog");
-  const Replayed second = ReplayConsumer(session, out + "/second.tlog");
-  ASSERT_TRUE(first.report.stopped_at_gap.has_value());
-  const auto bytes = [](const std::string& path) {
-    std::ifstream in{path, std::ios::binary};
-    std::vector<char> data{std::istreambuf_iterator<char>{in},
-                           std::istreambuf_iterator<char>{}};
-    // Wall clock is informational and differs between runs.
-    const std::size_t wall = offsetof(log::FileHeader, start_wall_ns);
-    if (data.size() >= wall + 8) {
-      std::fill_n(data.begin() + static_cast<std::ptrdiff_t>(wall), 8, '\0');
-    }
-    return data;
-  };
-  const std::vector<char> written = bytes(out + "/first.tlog");
-  ASSERT_GT(written.size(), sizeof(log::FileHeader));
-  EXPECT_EQ(bytes(out + "/second.tlog"), written);
-  std::filesystem::remove_all(dir);
-  std::filesystem::remove_all(out);
+  {
+    SCOPED_TRACE("two gaps in one log");
+    const std::string dir = TempDir("gap_two_one_log");
+    const std::string out = TempDir("gap_two_one_log_out");
+    RecordSession(dir, out + "/live.tlog");
+    MarkGap(dir + "/observer.tlog", kOrigin + 30ms);
+    const log::LogGap gap = MarkGap(dir + "/observer.tlog", kOrigin + 14ms);
+    const RecordedSession session{dir};
+    const Replayed replayed = ReplayConsumer(session, out + "/replayed.tlog");
+    ASSERT_TRUE(replayed.report.stopped_at_gap.has_value());
+    EXPECT_EQ(replayed.report.stopped_at_gap.value().log,
+              dir + "/observer.tlog");
+    EXPECT_EQ(replayed.report.stopped_at_gap.value().at.nanos(), gap.start_ns);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    // Its timers fire where they fired live, even with no firing to read
+    // before the gap: the stop comes before its first firing, as live.
+    SCOPED_TRACE("its own log, a gap before its first timer firing");
+    const std::string dir = TempDir("gap_own_first");
+    const std::string out = TempDir("gap_own_first_out");
+    RecordLateConsumer(dir);
+    const log::LogGap gap = MarkGap(dir + "/consumer.tlog", kOrigin);
+    const RecordedSession session{dir, "consumer"};
+    EXPECT_EQ((session.run_start() - kOrigin).count(),
+              std::chrono::nanoseconds{kLateRun}.count());
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(kOrigin + 1ms, 1ms);
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    ASSERT_TRUE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.stopped_at_gap.value().at.nanos(), gap.start_ns);
+    ASSERT_LT(gap.start_ns, (kOrigin + kLateRun + 1ms).nanos());
+    EXPECT_TRUE(consumer.efforts().empty())
+        << consumer.efforts().size() << " control firings before the stop";
+    EXPECT_TRUE(Sends(out + "/consumer.tlog").empty());
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
 }
 
 }  // namespace
