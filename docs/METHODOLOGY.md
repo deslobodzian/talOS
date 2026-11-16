@@ -266,20 +266,13 @@ Rules:
   recorded are listed (`talOS/launcher/README.md`). **[enforced:
   `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
-  initial state must be safe with every input present. One-shot autonomous
-  resumes its predecessor's recorded progress in the same match; otherwise it
-  starts `INHIBITED` and arms only after this process observes a fresh disabled
-  or non-autonomous mode, and an unreadable record holds it in `HOLD`.
-  Driver Station outages and new generations within one match release lanes
-  without restarting routine progress; only another match resets the routine
-  (rule in `2026-robot/README.md`).
-  Shooter readiness continuously gates feeding, whose accumulated duration
-  excludes released intervals. The preload deadline runs from the routine's
-  first `SPINUP` entry, including feed and readiness retries; it and the
-  `DRIVE` deadline include all outages and pauses. Autonomous field driving
-  requires a fresh, valid, localized pose; pose outages pause trajectory
-  progress but not the deadline.
-  **[enforced: `autonomous` `node_test`]**
+  initial state must be safe with every input present: an actuator node
+  drives only on a lane `Target::get` accepts, judged by its publication
+  time even on the node's first drain, and an operator producer starts
+  disarmed (REQ-SAFE-31). A robot's own restart rules for its nodes (an
+  autonomous routine's progress across restarts, for one) are in its
+  repository. **[enforced: `//talOS/devices:target_test`,
+  `//talOS/teleop:node_test`]**
 - Config errors throw in the constructor, so the launcher reports them before
   the robot is enabled. **[review]**
 
@@ -289,7 +282,7 @@ Rules:
 | Rule | Budget | Status |
 |---|---|---|
 | `update()` p99 wall time | ≤ 10 % of `period_us` | [review; gap: SPEC-4, no benchmark asserts it]; measure callback entry-to-exit duration in a dedicated benchmark, using a monotonic wall clock, and compute the percentile from those durations. Registry / Studio `max_latency` measures maximum dispatch-start lateness, not callback duration or p99. Benchmark clocks must not replace `node.now()` in control logic. |
-| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members); one exception, inside talOS: a publish may send one 1-byte wake datagram to each reader armed on that topic, non-blocking, and connects that reader's endpoint on first use or when the reader's receiver changes ([data flow](DATA_FLOW.md#link-rates-and-endpoints)) | allocations [enforced: `talos::testing::AllocationProbe` (`//talOS/node:allocation_probe`) counts the loop thread's allocations over a window of steady-state ticks in the `drivetrain`, `shooter`, `autonomous`, `driver`, `vision` (live camera and direct-projection sim), `talOS/teleop` and `talOS/telemetry` `node_test`s, and over the bridge's `Tick()` on a live gateway link in `talOS/bridge`'s `hardware_node_test`; macOS and glibc, skipped under sanitizers ([TESTING.md §7](TESTING.md#7-the-node-test-matrix))]; the rest [review] |
+| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members); one exception, inside talOS: a publish may send one 1-byte wake datagram to each reader armed on that topic, non-blocking, and connects that reader's endpoint on first use or when the reader's receiver changes ([data flow](DATA_FLOW.md#link-rates-and-endpoints)) | allocations [enforced: `talos::testing::AllocationProbe` (`//talOS/node:allocation_probe`) counts the loop thread's allocations over a window of steady-state ticks in the bench `motor` and `swerve_module`, `talOS/teleop`, `talOS/telemetry` and the examples' C++ node tests and the `talOS/mechanisms` blocks' tests, and over the bridge's `Tick()` on a live gateway link in `talOS/bridge`'s `hardware_node_test`; macOS and glibc, skipped under sanitizers ([TESTING.md §7](TESTING.md#7-the-node-test-matrix))]; the rest [review] |
 | Python nodes | cost memory (≈ 30 MB) and add GC/interpreter jitter: a Python node whose own subsystem owns a motor, digital output or PWM output runs at `period_us` ≥ 20000, so hard 5 ms actuator loops belong in C++ (a `talos.cpp_node` counts as C++); 20 ms supervisory/estimator nodes monitor age and watchdog timeouts | the actuator period [enforced: the launcher's graph lint, `--describe-only` and `talos_graph_test` ([launcher](../talOS/launcher/README.md#python-actuator-periods))]; the rest [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
@@ -340,8 +333,8 @@ A dependency is adopted when it meets all of these:
 | Serialization, schemas, reflection | FlatBuffers (structs, and `reflection.fbs`/`.bfbs` for runtime schemas) | in use: `.bfbs` descriptors, schema hashes, hash-checked attach, descriptor-bearing logs and reflection codec |
 | Config | TOML: toml++ (C++), `tomllib` (Python stdlib) | in use |
 | Tests | googletest, `unittest` | in use |
-| Geometry, kinematics and pose estimation | C++: header-only `talos::geometry` SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); drivetrain inverse/forward swerve kinematics use it with per-module speed limits. Python: `robotpy-wpimath` 2026.2.1.1 | in use: shared C++ frame math and the Python pose estimator's `kalman` backend; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy native/wrapper wheels only |
+| Geometry, kinematics and pose estimation | C++: header-only `talos::geometry` SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); drivetrain inverse/forward swerve kinematics use it with per-module speed limits. Python: `robotpy-wpimath` 2026.2.1.1 | in use: shared C++ frame math and the 2026 robot's Python pose estimator's `kalman` backend; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy native/wrapper wheels only |
 | Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | the pose estimator's `factor_graph` backend (`IncrementalFixedLagSmoother`) |
-| Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: typed detector options, decode-margin/Hamming validity gates before localization, undistorted homography, robust joint single/multi-tag corner solving with floor/tilt priors, marginalized field-frame x/y/yaw covariance and configured uncertainty floors; ambiguity unknown=1, verified unique=0; one robot node per camera, 100 Hz status and up to 60 fps live observations, no side-channel server |
-| Autonomous paths | Choreo `.traj` files (JSON, read with nlohmann/json 3.11.3 from the BCR, MIT), loaded and followed by `talOS/trajectory` | `autonomous` plans with `MakeStraightLine` and follows with `HolonomicFollower`. wpimath's C++ controllers have no Bazel module, so the follower is talos code |
+| Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: typed detector options, decode-margin/Hamming validity gates before localization, undistorted homography, robust joint single/multi-tag corner solving with floor/tilt priors, marginalized field-frame x/y/yaw covariance and configured uncertainty floors; ambiguity unknown=1, verified unique=0; one robot node per camera, no side-channel server |
+| Autonomous paths | Choreo `.traj` files (JSON, read with nlohmann/json 3.11.3 from the BCR, MIT), loaded and followed by `talOS/trajectory` | in use by the 2026 robot's autonomous node (its own repository), which plans with `MakeStraightLine` and follows with `HolonomicFollower`. wpimath's C++ controllers have no Bazel module, so the follower is talos code |
 | RoboRIO hardware | WPILib HAL and Phoenix 6 | in use |

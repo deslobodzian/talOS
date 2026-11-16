@@ -44,8 +44,7 @@ Allowed dependencies:
   reimplement a wire format, a memory layout, a state machine, or a C++ node
   (C++ nodes exposed to Python use `TALOS_EXPORT_NODE` and `talos.cpp_node`).
 - Adding a node in one language never requires modifying code in another
-  language: cross-cutting robot wiring (target policies, `driver` / `teleop`,
-  `telemetry`) is driven by TOML configuration.
+  language: cross-cutting robot wiring (target policies, `teleop`, `telemetry`) is driven by TOML configuration.
 - Nodes share only messages and topic names (`talos_messages`), never each
   other's classes.
 - Geometry, vision, trajectory and aiming are reusable libraries beside the
@@ -206,9 +205,8 @@ its generation.
 The generation does not stop a producer from turning a joystick held through
 a disable into a new target of the next generation. A producer of operator
 input therefore opens its lanes with a `talos::OperatorArming` (`target.h`;
-`talos.OperatorArming` in Python), as `driver` and the declarative `teleop`
-do, and evaluates it on every reading of its inputs. An evaluation that
-finds every input neutral, while the Driver Station shows a mode, arms it;
+`talos.OperatorArming` in Python), as the declarative `teleop` does, and
+evaluates it on every reading of its inputs. An evaluation that finds every input neutral, while the Driver Station shows a mode, arms it;
 until then the lane's `send()` goes out as a release. It disarms at startup;
 when the Driver Station shows no mode, a new generation or a new gateway
 boot (so after a disable, however brief, even one no evaluation sampled);

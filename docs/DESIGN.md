@@ -68,7 +68,7 @@ The rules are ARCHITECTURE.md
 |---|---|
 | Layers depend only downward (rtms → events → node → devices → robot code) | **[enforced]**: `tools/check_layers.py` in CI, whose allowlist holds today's exceptions (`talOS/devices:testing` on `talOS/bridge:merge`; `talOS/node` on `talOS/hardware` through `talOS/configuration` and `talOS/introspection`); **[gap: ARCH-2]** to remove them and make core libraries non-public |
 | `talOS/` never depends on a robot, an example or `studio/` | **[enforced]**: `tools/check_layers.py` |
-| Nodes share only messages and topic names | **[enforced]** for Bazel dependencies: `tools/check_layers.py` (a node package's targets, its tests included, depend on another node package only through its `talos_messages` targets or its `talos_cc_shared_node`; outside node packages only a testonly target, such as those in `2026-robot/main_processor/integration`, links a node's library); **[gap: ARCH-2]** for making node libraries package-private |
+| Nodes share only messages and topic names | **[enforced]** for Bazel dependencies: `tools/check_layers.py` (a node package's targets, its tests included, depend on another node package only through its `talos_messages` targets or its `talos_cc_shared_node`; outside node packages only a testonly target, such as a robot's cross-node integration test, links a node's library); **[gap: ARCH-2]** for making node libraries package-private |
 | `talOS/vision` → `talOS/geometry`, never the reverse | **[enforced]**: `tools/check_layers.py` |
 | Python reaches talOS only through `talOS/node_api` | **[enforced]** for the ABI: `//talOS/python:api_parity_test`, `node_api.cc` `static_assert`s; for Bazel dependencies: `tools/check_layers.py`; **[review]** for "reimplements no wire format" |
 | Only the devices-layer flush writes `/hw/request/<node>` | **[enforced]** for `publish`/`publish_bytes` and `LintGraph`; **[gap: ARCH-2]** for `detail::NodeAccess` and raw RTMS publishers, which node code can still reach |
@@ -116,7 +116,7 @@ the check in the same commit (RULES.md 9).
 | `update()` allocates nothing | METHODOLOGY.md §10 | **[enforced]** C++ (`AllocationProbe`); **[review]** Python |
 | `update()` p99 duration | METHODOLOGY.md §10 | **[gap: SPEC-4]** no benchmark |
 | Node hops from driver input to actuator | METHODOLOGY.md §10 | **[gap: LINT-2]** computable from `graph.json` |
-| `/hw/request` gap in simulation | the simulation README | asserted in simulation by `startup_test` and `match_rehearsal_test`; no requirement states it (**[gap: SPEC-4]**) |
+| `/hw/request` gap in simulation | the [bench simulation README](../bench/main_processor/simulation/README.md) | asserted in simulation by the bench `soak_test` (`manual`); no requirement states it (**[gap: SPEC-4]**) |
 | Target age at the selecting tick | launcher README "Session measurements" | `session_report --strict` on a recorded session; bench run open (TIME-3) |
 | Fast-lane time per target | [TESTING.md §9](TESTING.md#9-lanes-and-ci) | **[gap: LANE-1]** |
 

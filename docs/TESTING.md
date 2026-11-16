@@ -234,8 +234,8 @@ Required cases by role:
 | Role | Cases |
 |---|---|
 | actuator node (owns a motor, DIO or PWM) | 1 to 12 |
-| producer (`TargetLane` writer: `driver`, `teleop`, `autonomous`) | 1 as `SendsAtALiveInput`; 2 and 6 as `DisabledRobotReleasesItsLanes` and `DriverStationLossReleasesItsLanes`; 9; 11 as `NewGenerationDisarms`; 12 |
-| observer (`vision`, `pose_estimator`) | 1 as `PublishesFromALiveInput`; 3 as `StaleInputClearsValidity` (`state` still published, validity cleared, when its input is stale); 9; 12 |
+| producer (`TargetLane` writer: `teleop`, a robot's driver or autonomous node) | 1 as `SendsAtALiveInput`; 2 and 6 as `DisabledRobotReleasesItsLanes` and `DriverStationLossReleasesItsLanes`; 9; 11 as `NewGenerationDisarms`; 12 |
+| observer (the bench `gyro`, a camera node, an estimator) | 1 as `PublishesFromALiveInput`; 3 as `StaleInputClearsValidity` (`state` still published, validity cleared, when its input is stale); 9; 12 |
 
 The lint checks the node packages under the robot, example, bench and
 scaffold directories and every package their configs' manifests launch. It
@@ -324,8 +324,8 @@ the host can run it. It is never noise.
    failure the log shows (runner lost, download failed). **[enforced:
    `tools/lint_test_time.py` for `flaky = True` and `--flaky_test_attempts`;
    review for reruns]**
-2. **Diagnose from the artifact.** `soak_test` and `match_rehearsal_test`
-   write their session directories to Bazel's undeclared test outputs, and
+2. **Diagnose from the artifact.** The bench `soak_test`
+   writes its session directory to Bazel's undeclared test outputs, and
    `//studio:drive_browser_test` its session's logs, a screenshot and the
    failing elements when a check fails; the other e2e and perf tests write theirs to temporary directories that do
    not survive the run **[gap: LANE-1]**. A flake is closed by a named mechanism and a test
@@ -368,7 +368,8 @@ through the launcher (e2e), CPU-bound calibration or render-and-detect
 configuration (`manual`, `no_asan`, `no_tsan`, `no_macos_sanitizer`),
 serialize it (`exclusive`) or run it unsandboxed (`local`).
 
-Each lane has a `.bazelrc` config: `bazel test --config=fast //...` is the
+Each lane has a config in [`talos.bazelrc`](../talos.bazelrc), which talOS's
+`.bazelrc` and a robot repository's import: `bazel test --config=fast //...` is the
 everyday loop; `--config=heavy`, `--config=integration`, `--config=e2e` and
 `--config=perf` run one lane, and `--config=no_e2e` every lane but e2e.
 `bazel test //...` runs every lane but the soak; it is what runs before a

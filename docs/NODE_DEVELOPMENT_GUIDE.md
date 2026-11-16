@@ -19,7 +19,7 @@ the constructor; `update()` runs every period.
 | `node.every(period, fn)` | `node.every(seconds, fn)` | extra timer |
 | `name()`, `now()`, `tick()`, `period()`, `simulation()`, `config_path()` | same, as properties (seconds) | |
 | `now().nanos()` | `node.now_ns` | the node clock in integer ns, for a message time such as `sample_time_ns` (`round(node.now * 1e9)` is exact only below 2^51 ns, 26 days of node clock) |
-| `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests) and in every offline run, `--log` or not (`--describe`, `--replay`, `--replay-inputs`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/`; state a node keeps per session or across restarts (the 2026 autonomous node's selection and progress) is gated on it, so a replay never reads or writes the robot's copy |
+| `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests) and in every offline run, `--log` or not (`--describe`, `--replay`, `--replay-inputs`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/`; state a node keeps per session or across restarts (an autonomous node's routine selection and progress, for one) is gated on it, so a replay never reads or writes the robot's copy |
 | `trajectory_path("name")` → `std::filesystem::path` | `node.trajectory_path("name")` → `str` | the absolute path of this subsystem's [`[trajectories]`](#parameters) entry; an undeclared name is an error naming the subsystem and `trajectories.<name>` |
 | `describing()` → `bool` | `node.describing` → `bool` | true only while the binary builds the node for `--describe`, the launcher's probe, which has a deadline (`--describe-timeout-ms`) and never runs `update()`, `every()` or a callback; false under `Sim`, `--sim`, `--replay` and on the robot (a `talos.cpp_node` shares its host's node). Use it to skip building heavy native backends (the pose estimator imports neither wpimath nor gtsam then). Validate every parameter and declare every subscription and publication either way: the endpoints must be identical, since the launcher builds the graph from the probe, and it [compares each run's live endpoints with the probe](../talOS/launcher/README.md#live-endpoints) and refuses a run that differs |
 | `sub.value()`, `sub->field()`, `has_value()` | `sub.value` (`None` before the first), `has_value` | |
@@ -95,7 +95,7 @@ sees:
   them only at its tick or next packet. A backlog over the 64-per-drain cap
   is drained in further batches at once, as for a waking callback; only more
   than 1023 unread between two drains are lost (counted as dropped). The
-  `driver` takes `/drivetrain/state` headings this way: the
+  2026 robot's `driver` takes `/drivetrain/state` headings this way: the
   drivetrain's 5 ms ticks never wake it, and an invalid state cannot hide the
   valid one before it. The pose estimator queues its camera frames this way
   for `update()` to fuse.
@@ -106,7 +106,7 @@ sees:
 In each, `age()` counts from publication, not delivery, also inside a
 callback. A drain delivers in registration order, so a listener sees, in the
 same drain, the messages of the subscriptions opened before it: open those
-first (the `driver` opens `/drivetrain/state` before its Driver Station
+first (the 2026 robot's `driver` opens `/drivetrain/state` before its Driver Station
 link, so a packet is mapped with the headings delivered in its drain).
 
 ### Realtime scheduling
@@ -116,7 +116,7 @@ loop thread under a realtime policy chosen by its tier
 (`talos::process::LoopTier`), which the process decides itself: the bridge
 (`hardware_node`) is the highest tier; a node on the actuation path, whose own
 subsystem owns a motor, digital output or PWM output or which writes a target
-lane (`driver`, `teleop`, `auto`), is a control node; every other node
+lane (`teleop`, a driver or autonomous node), is a control node; every other node
 (telemetry, cameras, the pose estimator, Python observers) is an observer.
 
 - Linux: `SCHED_FIFO` priority 49 for the bridge, 45 for control nodes and 40
@@ -223,7 +223,7 @@ therefore reach `talos::Run` / `talos.run` without waiting on anything
 unbounded; one that never does is ended by the launcher's SIGKILL after its
 stop grace, as a stuck constructor is. A child process a node starts before
 then, or from a thread started before then (such a thread keeps the signals
-blocked for life), inherits the blocked signals (no 2026 node starts one).
+blocked for life), inherits the blocked signals.
 
 ### Python garbage collection
 
@@ -405,9 +405,6 @@ SimHardware judges these ages by the gateway's own rule (`FeedbackFresh`,
 any age `command_timeout_us` or more, or unknown, goes out invalid with zero
 measurements, so its
 handle reads `connected()` false and has no acquisition time.
-
-The robot-specific odometry timing policy is documented in the
-[drivetrain README](../2026-robot/main_processor/drivetrain/README.md).
 
 
 ## Targets
@@ -631,7 +628,7 @@ source)`, `sim.latest_target(M, sub, source)`, `hw.set_driver_station(enabled=Tr
 teleop=True)`, `hw.stop_driver_station()`, `sim.latest_bytes(topic)`). The
 Sim clock is `sim.now_ns`, integer nanoseconds equal to each node's
 `now_ns` (use it to compare times and build message times), and `sim.now`,
-float seconds. See `2026-robot/main_processor/intake/node_test.py`.
+float seconds. See `bench/main_processor/motor/node_py_test.py`.
 
 `talos.parity` (`//talOS/python:parity`, testonly) runs one scenario, a list
 of named steps (`parity.send`, `release`, `driver_station`,
@@ -688,7 +685,7 @@ Rules every estimator keeps:
 - Name the pose in consumers by config only:
   `[studio] pose_topic = "/localizer/state"`.
 
-`2026-robot/main_processor/pose_estimator` is the full example: swerve
+The 2026 robot's `pose_estimator`, in that robot's own repository, is a full example: swerve
 odometry plus cameras, with `backend = "kalman"` (wpimath
 `SwerveDrive4PoseEstimator`) or `"factor_graph"` (a GTSAM fixed-lag
 smoother), and tests that run its scenarios against both.

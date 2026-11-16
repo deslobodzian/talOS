@@ -77,7 +77,11 @@ write its code. What is in it:
 - `BUILD.bazel` holds the checks `bazel test //...` runs (`graph_test`,
   which lints the whole graph as the launcher does; `manifest_sync_test`;
   `sim_smoke_test`, which runs the robot against the simulator until it is
-  up; `studio_test`), `//:sim`, the robot against the simulator, and
+  up; `studio_test`; `bundle_install_test`, which installs `robot_bundle`
+  into a scratch directory and checks that the installed copy describes
+  every node; `talos_pin_test`, which checks that `.bazelrc`,
+  `.bazelversion` and the default Python match the talOS checkout `@talos`
+  is built from), `//:sim`, the robot against the simulator, and
   `robot_bundle`, what [deployment](DEPLOYMENT.md) installs.
 - `MODULE.bazel` points `@talos` at your talOS checkout, relative to the
   repository, so the two directories move together (absolute, with a
@@ -643,10 +647,10 @@ When a step fails, the launcher's message names the rule; the
 
 ## Inside talOS (framework developers)
 
-talOS's own tests and its testbed robot, `2026-robot/`, keep robots inside
-the talOS workspace. `bazel run //tools:new_robot -- <name> --mechanism
-<mech> --lang cpp|py` (or `--no-mechanism`) writes one there, beside
-`2026-robot/`, and `bazel run //tools:new_subsystem -- <name> --lang cpp|py
+talOS's own tests and its bench robot, `bench/`, keep robots inside the
+talOS workspace. `bazel run //tools:new_robot -- <name> --mechanism
+<mech> --lang cpp|py` (or `--no-mechanism`) writes one there, a directory
+at the workspace root beside `bench/`, and `bazel run //tools:new_subsystem -- <name> --lang cpp|py
 --robot <name>` adds a mechanism to it; `./sim.sh --config
 <name>/main_processor/configuration/robot_sim.toml --sim-gateway` runs it.
 `bazel run //tools:new_robot -- --help` lists the options. A team's robot
