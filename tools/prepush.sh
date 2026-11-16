@@ -20,7 +20,8 @@
 #
 # First, without --full, when more than 20 commits are to push (since
 # <ref>@{upstream}; with no upstream, those on no remote-tracking branch),
-# the line `prepush: full SKIPPED (...)`, which fails the run.
+# the line `prepush: full SKIPPED (...)`, naming the way out (pass --full,
+# or set an upstream); the steps still run, and the run exits 1.
 # Steps, in order: read-only, source-lints (tools/source_lints.sh, the
 # lints CI's "Source lints (no Bazel)" job runs: test time, links,
 # requirement trace, node test matrix; under a second; a commit without the
@@ -47,13 +48,16 @@
 # tools/test_rio_in_the_loop.py --wpilib --output-dir <logs>/rio-in-the-loop`,
 # CI's job of that name, on the build step's bazel-bin; about 30 s with a
 # warm Gradle daemon; under --full, or when the commits touch
-# tools/test_rio_in_the_loop.py, bench/, controller_processor/ or
-# talOS/{hardware,bridge,devices,node,protocol,driver_station}; a commit
+# tools/test_rio_in_the_loop.py, bench/, controller_processor/, talOS/,
+# MODULE.bazel, third_party/, .bazelversion or talos.bazelrc; a commit
 # without the tool prints `rio-in-the-loop skipped`, which does not fail
 # the run), under --full only tsan and asan (tools/sanitizer_lane.sh, CI's
-# sanitizer jobs; 5 to 10 minutes each cold) and soak (CI's soak_test with
-# seed 0 for TALOS_SOAK_SECONDS=36, the shortest run that injects every
-# fault kind), checkout-unchanged, then, when the commits touch studio/,
+# sanitizer jobs; 5 to 10 minutes each cold; a commit without the script
+# prints `<lane> skipped`, which does not fail the run) and soak (CI's
+# soak_test with seed 0 for TALOS_SOAK_SECONDS=36, the shortest run that
+# injects every fault kind); after a failed build, rio-in-the-loop, tsan,
+# asan and soak are SKIPPED; checkout-unchanged, then, when the commits
+# touch studio/,
 # studio-test and studio-build (`pnpm test`, `pnpm build`).
 # Each step prints one line (`prepush: <step> ok`, `prepush: <step> FAILED
 # (see <log>)`, `prepush: <step> SKIPPED (<reason>)`); logs stay in a
@@ -70,8 +74,8 @@
 # rather than skips; elsewhere it may skip, and the run says so. Likewise,
 # where it finds the browser //studio:drive_browser_test would use, it sets
 # TALOS_REQUIRE_BROWSER=1 (and passes TALOS_BROWSER when set); with none,
-# that test skips and the run says so. JAVA_HOME
-# defaults to ~/wpilib/2026/jdk. Studio trusts the checkout's installed
+# that test skips and the run says so. JAVA_HOME, when unset, defaults to
+# ~/wpilib/2026/jdk if that directory exists. Studio trusts the checkout's installed
 # studio/node_modules when present, unless the commits to push change
 # studio/pnpm-lock.yaml: then, as when none is installed, it runs `pnpm
 # install --frozen-lockfile --offline` and reports studio SKIPPED if that
@@ -214,12 +218,14 @@ touches() {  # touches PATH...: the pushed range changes something under PATH.
 if [ -n "$upstream" ]; then
   pushing="$(git -C "$repo" rev-list --count "$upstream..$commit")"
   pushing_from="since $upstream"
+  way_out="pass --full"
 else
   pushing="$(git -C "$repo" rev-list --count "$commit" --not --remotes)"
   pushing_from="on no remote-tracking branch"
+  way_out="set an upstream or pass --full"
 fi
 if [ "$full" = 0 ] && [ "${pushing:-0}" -gt "$full_after_commits" ]; then
-  skip full "$pushing commits $pushing_from: docs/DEVELOPMENT.md §5 requires --full for a push of more than $full_after_commits"
+  skip full "$pushing commits $pushing_from: docs/DEVELOPMENT.md §5 requires --full for a push of more than $full_after_commits; $way_out"
 fi
 
 run_step read-only python3 "$tools/make_sources_read_only.py" || {
@@ -348,7 +354,9 @@ case $? in
 esac
 # build.gradle compiles sources from talOS/protocol, talOS/hardware and
 # talOS/driver_station and exports every header under talOS/.
-export JAVA_HOME="${JAVA_HOME:-$HOME/wpilib/2026/jdk}"
+if [ -z "${JAVA_HOME:-}" ] && [ -d "$HOME/wpilib/2026/jdk" ]; then
+  export JAVA_HOME="$HOME/wpilib/2026/jdk"
+fi
 rio_paths=(controller_processor/ talOS/)
 if [ "$skip_gradle" = 1 ]; then
   report "gradle skipped (--skip-gradle)"
@@ -365,10 +373,11 @@ fi
 # RoboRIO program under WPILib desktop simulation (Gradle builds it). It
 # binds UDP ports 5802 and 5803, and in the worktree writes only ignored
 # files (Gradle's build/ and .gradle/, the simulation's ctre_sim/ and its
-# saved talos_config.bin), which checkout-unchanged then confirms.
+# saved talos_config.bin), which checkout-unchanged then confirms. Its
+# binaries are built from much of talOS/ (events, rtms, ipc, configuration,
+# schema, ...) and from the module's dependencies.
 rio_loop_paths=(tools/test_rio_in_the_loop.py bench/ controller_processor/
-  talOS/hardware/ talOS/bridge/ talOS/devices/ talOS/node/ talOS/protocol/
-  talOS/driver_station/)
+  talOS/ MODULE.bazel third_party/ .bazelversion talos.bazelrc)
 if [ "$skip_gradle" = 1 ]; then
   report "rio-in-the-loop skipped (--skip-gradle)"
 elif [ "$full" = 0 ] && ! touches "${rio_loop_paths[@]}"; then
@@ -386,8 +395,14 @@ fi
 # runs the same one), and one soak seed: CI's soak with the seed its branch
 # pushes use, for 36 s of teleop rather than 180 s, the shortest run that
 # injects every fault kind once (bench/main_processor/simulation/README.md).
-if [ "$full" = 1 ]; then
+if [ "$full" = 1 ] && [ "$built" = 0 ]; then
+  for step in tsan asan soak; do skip "$step" "the build failed"; done
+elif [ "$full" = 1 ]; then
   for lane in tsan asan; do
+    if [ ! -f "$wt/tools/sanitizer_lane.sh" ]; then
+      report "$lane skipped (this commit has no tools/sanitizer_lane.sh)"
+      continue
+    fi
     run_step "$lane" bash tools/sanitizer_lane.sh "$lane" \
       --nocache_test_results --noshow_progress "--disk_cache=$disk_cache" ||
       true

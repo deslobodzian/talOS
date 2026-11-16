@@ -103,24 +103,26 @@ cached test result (build results come from the disk cache
 push touch the RoboRIO program or anything under `talOS/` (its
 `build.gradle` takes headers from all of it), runs CI's RoboRIO-in-the-loop
 check (`tools/test_rio_in_the_loop.py --wpilib`, about 30 s) when they touch
-that tool, `bench/`, the RoboRIO program or the talOS packages on its
-command path (`talOS/{hardware,bridge,devices,node,protocol,driver_station}`),
-checks that all of these left the worktree unchanged, and runs the pnpm
+that tool, `bench/`, the RoboRIO program, anything under `talOS/`, or what
+its binaries are built with (`MODULE.bazel`, `third_party/`,
+`.bazelversion`, `talos.bazelrc`), checks that all of these left the worktree unchanged, and runs the pnpm
 checks when they touch `studio/`. With `--full` it also runs CI's sanitizer
 lanes (`tools/sanitizer_lane.sh tsan` and `asan`, the script CI's sanitizer
 jobs run; 5 to 10 minutes each cold) and CI's soak with its branch seed,
 for 36 s of teleop rather than CI's 180 s (the shortest run that injects
 every fault kind), and the RoboRIO-in-the-loop check whatever the commits
-touch. **A push of more
+touch; after a failed build those steps are SKIPPED. **A push of more
 than 20 commits runs `tools/prepush.sh --full`**: without it, such a range
-is reported as the step `full` SKIPPED and the run fails. Prepush does not
+(since the branch's upstream; with none, the commits on no remote-tracking
+branch) is reported first as the step `full` SKIPPED, the other steps still
+run, and the run exits nonzero. Prepush does not
 run clang-tidy: `tools/tidy.sh --base <upstream>` runs CI's selection on a
 host whose standard library clang 18 can parse (gap: TOOLS-15). Every robot
 and example config's
 `--describe-only` runs as its `talos_graph_test` (the bundle test's
 fixture, `bench/main_processor/bundle_testdata`, has only a
-`manifest_sync_test`). It differs from CI in three places, and says which
-applies: where the host refuses an unprivileged network namespace it
+`manifest_sync_test`). Beyond those, it differs from CI in three places
+where the host decides, and says which applies: where the host refuses an unprivileged network namespace it
 leaves `TALOS_REQUIRE_NETNS=1` unset, so
 `//talOS/protocol:udp_address_change_test` may skip where CI fails it;
 where it finds no browser
