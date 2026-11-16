@@ -128,6 +128,15 @@ void ConfigPersister::Stop() {
   if (!started_) return;
   {
     std::lock_guard lock{mutex_};
+    // The newest acknowledged configuration not yet handed over (no tick
+    // since, an enabled one, or a lost try-lock): the loop no longer ticks,
+    // so it is handed over here, superseding one not yet started, as Tick()
+    // would. Saving it now after an enable is harmless: the loop has stopped.
+    if (unsaved_) {
+      if (!pending_) ++outstanding_;
+      pending_ = std::move(unsaved_);
+      unsaved_.reset();
+    }
     stop_ = true;
   }
   wake_.notify_one();

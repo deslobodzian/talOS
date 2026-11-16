@@ -346,6 +346,24 @@ TEST(ConfigPersister, AFailedSaveIsReportedOnceAndAnIdenticalPushRetriesIt) {
                                                      hw::ConfigurationId(a)}));
 }
 
+// A configuration acknowledged on the last tick before a clean exit, with no
+// tick after it to hand it over (or only enabled ones, which never do), is
+// still saved by Stop(): otherwise the next boot restores the one before it.
+// REQ-CONTRACT-06
+TEST(ConfigPersister, StopSavesAConfigurationNeverHandedOver) {
+  const hw::Config a = ConfigWithMotor(1);
+  GatedStore store;
+  store.Release();
+  talos::rio::ConfigPersister persister{
+      [&](std::span<const uint8_t> persisted) { return store.Save(persisted); },
+      0};
+  persister.Start();
+  persister.Acknowledged(a);
+  EXPECT_EQ(persister.Tick(false), 0u);
+  persister.Stop();
+  EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a)}));
+}
+
 // The CRC32 trailer of persisted bytes, which tells configurations apart
 // without allocating.
 uint32_t Trailer(std::span<const uint8_t> persisted) {
