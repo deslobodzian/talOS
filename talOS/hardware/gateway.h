@@ -230,9 +230,10 @@ class Gateway {
   // past the last State in which it could not drive (MayDrive false), the
   // State of the tick its restore ended included (PollResets masks it).
   std::array<uint64_t, kMaxMotors> motor_drives_from_{};
-  // The earliest observation time a command's digital and PWM outputs apply
-  // on: one past the last State of total loss (healthy_ false). Before it
-  // they are sent false and off.
+  // The earliest observation time a command drives any output on: one past
+  // the last State of total loss (healthy_ false), whatever samples the
+  // backend left valid in it. Before it its motors are sent neutral, digital
+  // outputs false and PWM outputs off.
   uint64_t outputs_drive_from_{};
   // A rotor-feedback motor's last valid position since the gateway last
   // masked it, and the earliest time that sample can have been taken.

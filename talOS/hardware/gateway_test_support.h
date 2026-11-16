@@ -127,7 +127,7 @@ class FakeBackend : public Backend {
       input.value = true;
     }
     s.health = {.valid = true, .battery_v = 12};
-    return healthy;
+    return healthy && !read_fails;
   }
   bool Apply(std::span<const MotorRequest> requests) override {
     last_requests.assign(requests.begin(), requests.end());
@@ -196,6 +196,10 @@ class FakeBackend : public Backend {
   int pending_ticks{};
   bool configure_ok{true}, healthy{true}, apply_ok{true}, restore_ok{true};
   bool outputs_ok{true};
+  // Read reports a failed pass (returns false) while its samples still
+  // follow `healthy`: total loss with valid samples, which the Backend
+  // contract does not rule out.
+  bool read_fails{false};
   bool fail_all_after_neutral{false};
   std::vector<uint16_t> failing_motors, apply_failed;
   std::vector<DigitalOutputRequest> last_digital_outputs;
