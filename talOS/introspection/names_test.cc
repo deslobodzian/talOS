@@ -254,7 +254,8 @@ TEST(LintGraph, ACorrectGraphProducesNoFindings) {
        "//2026-robot/main_processor/drivetrain:node",
        {{SourceKind::TIMER, "swerve", 0, 0},
         Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
-        Watcher("/drivetrain/state/vision", 32, kSourceFlagOptional),
+        // Simulation ground truth, absent from a robot session.
+        Watcher("/sim/state", 32, kSourceFlagOptional),
         Watcher("/hw/state"),
         Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest),
         Sender("/drivetrain/state")}},
@@ -707,6 +708,53 @@ TEST(LintGraph, AnUnreadTopicWarnsUnlessAnObserverRecordsItsOwnersFeed) {
     EXPECT_EQ(Find(diagnostics, Severity::WARNING, subject) != nullptr, warned)
         << Describe(diagnostics);
     EXPECT_EQ(diagnostics.size(), warned ? 1u : 0u) << Describe(diagnostics);
+  }
+}
+
+// REQ-CONTRACT-09: the owner-published side of the case above. An `optional`
+// read of a state topic nobody writes is no error (the reader tolerates its
+// absence), and the topic the owner does write is recorded by telemetry, so
+// it has no finding either; only the owner may write a state topic, so when
+// the owner is a node in this session and writes no such topic, the read is
+// misspelled and warns, naming the reader and the owner. With the owner
+// outside the session the one finding stays the owner warning.
+TEST(LintGraph, AnOptionalReadOfAFeedItsOwnerDoesNotPublishWarns) {
+  const NodeShape motor{
+      "motor", "//robot/motor:node", {Sender("/motor/state")}};
+  const NodeShape telemetry{
+      "telemetry",
+      "//talOS/telemetry:node",
+      {Watcher("/motor/state", 32, kSourceFlagObserver),
+       Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+  const NodeShape arm{"arm",
+                      "//robot/arm:node",
+                      {Watcher("/motor/state/wheel", 32, kSourceFlagOptional)}};
+  {
+    SCOPED_TRACE("owner in the session");
+    const auto diagnostics = LintGraph({motor, telemetry, arm});
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+    const auto* warning =
+        Find(diagnostics, Severity::WARNING, "/motor/state/wheel");
+    ASSERT_NE(warning, nullptr) << Describe(diagnostics);
+    EXPECT_NE(warning->message.find("is read by arm, at least one declaring "
+                                    "it optional"),
+              std::string::npos)
+        << warning->message;
+    EXPECT_NE(warning->message.find("'motor' publishes no such topic"),
+              std::string::npos)
+        << warning->message;
+    EXPECT_EQ(diagnostics.size(), 1u) << Describe(diagnostics);
+  }
+  {
+    SCOPED_TRACE("owner outside the session");
+    const auto diagnostics = LintGraph({arm});
+    const auto* warning =
+        Find(diagnostics, Severity::WARNING, "/motor/state/wheel");
+    ASSERT_NE(warning, nullptr) << Describe(diagnostics);
+    EXPECT_NE(warning->message.find("not a node in this session"),
+              std::string::npos)
+        << warning->message;
+    EXPECT_EQ(diagnostics.size(), 1u) << Describe(diagnostics);
   }
 }
 

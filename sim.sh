@@ -310,10 +310,17 @@ fi
 if [ "$WANT_STUDIO" = "1" ]; then
   BUILD_TARGETS="$BUILD_TARGETS $(target studio_bridge) //studio:web_dist"
 fi
-# Errors still print; the per-target "up-to-date" lines and progress do not.
+# The per-target "up-to-date" lines and progress are not printed. The full
+# output goes to the session's build.log; a failure prints its last 60 lines
+# (the errors and the compiler output before them) and the log's path.
+BUILD_LOG="$LOG_DIR/build.log"
 # shellcheck disable=SC2086
-bazel build --noshow_progress --ui_event_filters=-info --show_result=0 \
-  $BUILD_TARGETS 2>&1 | tail -5 || die "build failed"
+if ! bazel build --noshow_progress --ui_event_filters=-info --show_result=0 \
+  $BUILD_TARGETS > "$BUILD_LOG" 2>&1; then
+  tail -60 "$BUILD_LOG" >&2
+  die "build failed (full output: $BUILD_LOG)"
+fi
+tail -5 "$BUILD_LOG"
 
 # --- 1. the controller processor (WPILib sim) -------------------------------
 if [ "$WANT_RIO" = "1" ]; then

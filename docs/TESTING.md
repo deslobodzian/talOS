@@ -179,7 +179,10 @@ Where RULES.md 12 is read too broadly or too narrowly:
    never sleep, read `steady_clock::now` or `time.time`, or wait on a real
    timer. Nodes use `node.now()`; `Sim` owns time. **[enforced:
    `tools/lint_test_time.py` over every test source, Studio's TypeScript
-   tests included (`setTimeout`, `Date.now`, `performance.now`); a test of
+   tests included (`setTimeout`, `Date.now`, `performance.now`), and the
+   test helpers they include (`*_test_support`, `*_test_helpers`,
+   `*_testing`, the `testing` Sim headers and module, headers under a
+   `testdata` directory); a test of
    a higher tier that uses the real clock is listed with its reason and its
    number of hit lines, which may only shrink, in
    `tools/lint_test_time_allowlist.txt`]**
@@ -444,12 +447,22 @@ them. CI's source lints (test time, links, requirement trace, node test
 matrix, METHODOLOGY.md §13's `bazel_dep` table, and the RULES.md 4
 commissioning check against the diff base) are
 one script, `tools/source_lints.sh`, which CI's lint job and
-prepush's `source-lints` step both run; CI's sanitizer jobs are
+prepush's `source-lints` step both run. One doc check needs the compiler
+and so runs in the suite instead: `//tools:check_data_flow_sizes_test`
+(`tools/check_data_flow_sizes.py`) fails unless every marked number in
+[DATA_FLOW.md](DATA_FLOW.md) equals the size `//tools:data_flow_sizes`
+prints from the defining headers (RULES.md 9). CI's sanitizer jobs are
 `tools/sanitizer_lane.sh asan|tsan`, which `tools/prepush.sh --full` also
 runs. Prepush also runs CI's clang-format and clang-tidy checks
 (`tools/format.sh`, `tools/tidy.sh`, which says when this host cannot run
 it), CI's RoboRIO-in-the-loop check, and under `--full`
-a short soak seed; when each runs, and the more-than-20-commits rule for
+a short soak seed. The clang-tidy pass covers what Bazel builds, the sources
+and headers in its `compile_commands.json`; the RoboRIO program's own
+sources under `controller_processor/rio/src` are built by Gradle and checked
+only by the compiler warnings its `build.gradle` sets (`-Wall -Wextra
+-pedantic -Werror -Wno-unused-parameter` for the RoboRIO and the Linux and
+macOS desktop builds, macOS adding `-Wno-unknown-warning-option
+-Wno-character-conversion`; `/W3 /WX` on Windows). When each runs, and the more-than-20-commits rule for
 `--full`, are in [DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder).
 
 No CI builds a robot repository that consumes talOS against a talOS change

@@ -101,11 +101,16 @@ TEST(GateTest, TorqueCurrentAllowedBoundaries) {
   }
 }
 
+// REQ-SAFE-02: each of configured and enabled is needed on its own, and a
+// latched fault vetoes both.
 TEST(GateTest, GatewayReadyNeedsConfiguredAndEnabledWithoutFault) {
   EXPECT_TRUE(GatewayReady(TestState()));
   State missing = TestState();
   missing.flags = kConfigured;
   EXPECT_FALSE(GatewayReady(missing));
+  State unconfigured = TestState();
+  unconfigured.flags = kEnabled;
+  EXPECT_FALSE(GatewayReady(unconfigured));
   State faulted = TestState();
   faulted.flags |= kHardwareFault;
   EXPECT_FALSE(GatewayReady(faulted));

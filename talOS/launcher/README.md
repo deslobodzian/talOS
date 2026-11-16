@@ -144,6 +144,17 @@ Bazel, whose `TEST_TMPDIR` holds them and is removed with the test.
 Outside a namespace the ordinary names, one set per host that tools and
 hand-run nodes share, are left in place.
 
+The session owns, creates and unlinks only the topics its probes declared
+(`DescribeGraph`). A run that opens an undeclared topic (a member whose live
+endpoints differ from its probe, or one with no description under
+`--allow-graph-errors`) creates that segment itself, as a node run without
+the launcher does ([ARCHITECTURE.md](../../ARCHITECTURE.md#topics-and-messages)):
+its last queue to close unlinks it, but a run killed while it is the last
+holder (the SIGKILL of a [live endpoint](#live-endpoints) mismatch, a stall,
+the stop timeout) leaves it in shared memory until the next queue to open
+that name reuses it, someone unlinks it, or the host restarts; neither the
+session's end nor a namespace's cleanup removes it.
+
 Locking an existing lock file allocates nothing on disk; creating an absent
 one does. macOS empties `/tmp` at boot and keeps it on the same container as
 a log root on the internal disk, so on a full disk the first launch after a
@@ -504,7 +515,18 @@ the members' pipes into memory; others write the logs, `talos.log`, and the
 launcher's stdout and stderr, and only that last one ever waits on them.
 The launcher's own lines (`std::cout`, `std::cerr`) go into memory as well,
 so supervision (restarts, stall kills, the stop) goes on whatever its
-stdout does. While a writer is behind, up to 2 MiB per member, 2 MiB for
+stdout does. Each launcher line goes into that memory in one piece
+(`ConsoleLine`, `console_line.h`), so a member's echoed output never lands
+inside it. The echo of a member's output goes in whole lines too: a line
+that reaches its pipe in more than one write (stdio to a pipe is fully
+buffered) waits for its newline, the pipe's end (once every process holding
+it has closed it, or at the session's end), or more than 64 KiB held
+(`kChildOutputReadBytes`), past which a line with no newline is shown split.
+A partial line shown at the pipe's end or at that bound is ended with a
+newline on the console, so it is a line of its own; a member's last partial
+line can therefore show after the launcher's "exited" line for that member.
+The member's `<name>.log` takes every byte as it is read, and no added
+newline. While a writer is behind, up to 2 MiB per member, 2 MiB for
 `talos.log` and 2 MiB for each of the launcher's stdout and stderr (one
 buffer when they are the same file, as with `2>&1` or a terminal) wait in
 memory: a 1 MiB batch the writer has taken and a refilled 1 MiB pending
@@ -802,7 +824,7 @@ hold and touches no disk. The times it sleeps until:
 | `--duration-s`'s end, until the stop is sent | the stop |
 | the stop timeout (2 s after the stop), until its SIGKILLs are sent | `stop_timeout` |
 | half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |
-| the hourly refresh of the session lock and of the session directory's `session.lock` | [one session per namespace](#one-session-per-namespace), [retention](#session-segments-and-logs) |
+| the hourly refresh of the session lock and of the session directory's `session.lock` and quiet files | [one session per namespace](#one-session-per-namespace), [retention](#session-segments-and-logs) |
 
 Everything else a pass does follows an event or another pass: reaping exits
 (with one more read of the run's row for its final delivery counts),
@@ -818,30 +840,19 @@ pass looks at every one.
 
 ### Restart latency
 
-From the restart's `fork` to the restarted member's first hardware request,
-measured in the 2026 robot's own repository (not dated; no BENCH_RESULTS.md
-entry) on a Linux x86-64 desktop (8 threads) by killing its `drivetrain` 20
-times in a `--sim` session with the physics gateway under
-`--restart-window-ms 1500`, so each is a first restart, session directory on
-btrfs. The stages come from `CLOCK_MONOTONIC` stamps: the launcher's `fork`
-and the restarted node's first constructor (an `LD_PRELOAD` shim), and the
-restarted run's `.tlog` origin, first tick deadline less its offset (`run()`)
-and first `/hw/request/drivetrain` send. The kill-to-reap and reap-to-`fork`
-stages (the SIGCHLD wakeup of the supervision loop; restart bookkeeping,
-where `RestartLogBudget` lists the session directory and the pass posts its
-manifest version to the writer thread) are not in it:
+No dated measurement of this path is recorded
+([BENCH_RESULTS.md](../../docs/BENCH_RESULTS.md#date-not-recorded) has only
+its macOS stalls under disk load, INC-3). What the code fixes is the
+backoff before the `fork` ([restarts](#restarts): none for a critical member's
+first crash in the window, else 50 ms doubling to 1 s) and one `period_us`
+from the restarted run's `run()` to its first tick, whose flush sends the
+first `/hw/request/<node>` once a `/hw/state` has arrived since the node
+attached. The rest (the SIGCHLD wakeup and reap, restart bookkeeping, `fork`,
+exec and dynamic loading, config parse and topic attach) depends on the host.
 
-| Stage | ms, median (range) | Set by |
-|---|---|---|
-| `fork` → first constructor | 1.2 (1.1–1.2) | group and guardian setup, exec, dynamic loading |
-| first constructor → event-loop origin | 0.4 (0.4–0.5) | flags; the event-log file is created on the log's writer thread, not here |
-| origin → `run()` | 1.5 (1.4–1.6) | robot config parse, topic attach |
-| `run()` → first tick | 5.0 | one `period_us` |
-| first tick → first `/hw/request/drivetrain` | 0.0 | that tick's flush, which needs a `/hw/state` received since the node attached |
-
-`restart_latency` repeats the `.tlog` part of this measurement on any host:
-SIGKILL → origin (the two stages above and the first two rows together), origin → `run()`, `run()` →
-first tick, first tick → first request and the total, as median (range). The
+`restart_latency` measures it from the restarted run's `.tlog` on any host:
+SIGKILL → event-loop origin, origin → `run()`, `run()` → first tick, first
+tick → first request and the total, as median (range). The
 config's nodes come from `bazel-bin`, so build them first:
 
 ```sh
@@ -895,7 +906,10 @@ every log that recorded it, the writer's `SEND`s (the hardware bridge's
 `--log` included) and readers' receipts, each publication once, with the
 sequence and publication time live readers saw. A node the session ran
 replays on its own recorded timeline: its
-timers fire at the deadlines they fired at live, and it is handed what it
+timers fire at the deadlines they fired at live (a node that fired none
+starts its run at its first dispatch and fires none up to that run's last
+record; a node that ran once ends there, unless its loop was late when it
+stopped; a restarted node replays as one run), and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and
 ages measured from it). The node is never fed across a log gap: the run ends
@@ -909,7 +923,13 @@ naming the log and the sign, and the launcher exits 1: one with a
 `log_capped`, a run's log without its EXIT record of a member it marks
 `log_gap` or `recorder_failed` ([session manifest](#session-manifest)), and
 one whose damaged
-records nothing bounds the time of. A damaged stretch in another reader's
+records nothing bounds the time of. The node's own first run's log is
+refused the same way, whatever it feeds, when the node had a timer and
+that log's first segment, or a segment before its first firing read, is
+gone or unreadable (the byte cap deleted it, or its header is incomplete):
+it may have held the firing its recorded timeline starts from. So is a
+timed node's log with no such firing that holds no record of its run, or
+a gap or damaged stretch that may hold its firings. A damaged stretch in another reader's
 log of a topic is no loss only where an intact receipt of the topic follows
 it in that file and the session's other logs (the writer's sends) hold
 every message that reader could have lost there
@@ -1211,9 +1231,19 @@ so no launch writes into a directory being removed. A
 `.talos-removing-<session_id>` directory a removal cut short goes at the
 next launch's retention. The supervision loop touches its `session.lock`
 hourly, with the session lock (one `futimens` on the held descriptor, which
-writes and syncs nothing itself), so a cleaner of `/tmp` files unused for
-days (macOS's after 3, systemd-tmpfiles' after 10) never deletes it under a
-long session in the default `/tmp/talos_logs`. If the path stops naming the
+writes and syncs nothing itself), and with it the session's files a launch
+writes once and may leave for days (`manifest.json` in a quiet session,
+`graph.json`, `declared_graph.json`, `retention.txt`, named by
+`kSessionQuietFiles`; one `utimensat` each, never creating an absent one),
+so a cleaner of `/tmp` files unused for
+days (macOS's after 3, systemd-tmpfiles' after 10) never deletes them under a
+long session in the default `/tmp/talos_logs`. A member's `<name>.log`, a
+finished run's event log and `talos.log` are not touched: a cleaner can still
+delete one that has been quiet that long. The touches, and the `fstat` and
+`lstat` that check the lock file, run one after another on the supervision
+thread; on a network log root each is a call to the server, which a dead
+server blocks for as long as the mount retries it (without end on a hard
+mount), and with it supervision and the watchdog's ping. If the path stops naming the
 locked file (removed by hand, or by a cleaner before a refresh), retention
 could take the directory from then on; the next refresh locks the file the
 path names (creating it, never the directory) and says so once on stderr. That adds
@@ -1238,12 +1268,20 @@ RPC retries, and with it supervision and the service watchdog's ping, so the
 log root should be on a local disk. Whether a log root takes no locks is
 decided once by retention, and once by the session directory's creation,
 by a shared lock of the root's `.talos-lock-probe` file, never by one
-failing call: on a root whose probe locked, a session whose `session.lock`
+failing call. A lock daemon already down at that probe therefore makes a
+root whose locks work read as one that takes none for that whole retention
+(`LogRootTakesNoLocks`): while the daemon stays down, a running session's
+`session.lock` fails the same way, reads as unheld, and that retention may
+remove the session. On a root whose probe locked, a session whose `session.lock`
 cannot be locked for such a reason (an NFS lock daemon that stops
 answering) is passed over, with a warning, and a launch whose own lock
 fails so tries again rather than running without it: up to 100 attempts
 1 ms apart (about 0.1 s), after which the launch is refused (`cannot create
-the session directory ...; nothing was started`, exit 1).
+the session directory ...; nothing was started`, exit 1). NFSv4 is reported
+to refuse an exclusive `flock` on a descriptor opened read-only, so every
+exclusive lock of a `session.lock` is taken on a read-write one (the shared
+locks, `Held` and the root's probe, stay read-only); whether NFSv4 does so
+is unverified, since no NFS root has been tested.
 
 The newest 16
 sessions (`kProtectedMatches`, `session_retention.h`) that ran a match or

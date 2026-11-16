@@ -15,7 +15,11 @@ tracked files it finds:
   file, `.bazelrc`, a workflow or a shell script.
 
 A test source is a `*_test.cc`, `*_test.cpp`, `*_test.py` or `test_*.py`
-file (`*_test.cpp`: the RoboRIO program's GradleRIO tests). A node
+file (`*_test.cpp`: the RoboRIO program's GradleRIO tests), and so is a
+test helper a test includes or imports: a source whose stem ends in
+`_test_support`, `_test_helpers` or `_testing`, or is `testing` (the
+framework's `Sim` headers and module, which own simulated time), or a
+header under a `testdata` directory. A node
 package is a directory whose BUILD declares a node (talos_cc_node,
 talos_py_node, talos_cc_shared_node) under bench, examples or
 tools/scaffold_testdata, or one of the framework nodes' packages
@@ -79,6 +83,14 @@ def is_test_source(path):
             (name.startswith("test_") and name.endswith(".py")))
 
 
+def is_test_helper(path):
+    stem, suffix = os.path.splitext(os.path.basename(path))
+    return suffix in SOURCE_SUFFIXES and (
+        stem == "testing" or
+        stem.endswith(("_test_support", "_test_helpers", "_testing")) or
+        (suffix in (".h", ".hpp") and "testdata" in path.split("/")[:-1]))
+
+
 def is_studio_test(path):
     return path.startswith(STUDIO_TESTS) and path.endswith((".ts", ".tsx"))
 
@@ -120,8 +132,9 @@ def scan(files, read):
     for path in files:
         patterns = {}
         text = None
-        if is_test_source(path) or (path.endswith(SOURCE_SUFFIXES) and
-                                    in_package(path, packages)):
+        if (is_test_source(path) or is_test_helper(path) or
+                (path.endswith(SOURCE_SUFFIXES) and
+                 in_package(path, packages))):
             patterns.update(TIME_PATTERNS)
             text = read(path)
             aliases = {a or b for a, b in CLOCK_ALIAS.findall(text)}

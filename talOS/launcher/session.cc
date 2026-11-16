@@ -18,6 +18,7 @@
 #include <utility>
 
 #include "talOS/events/session_manifest.h"
+#include "talOS/launcher/console_line.h"
 
 namespace talos::launcher {
 
@@ -123,15 +124,16 @@ void ManifestWriter::Persist(const std::string& contents,
   std::string error;
   if (!WriteFileAtomically(path_, contents, sync, error)) {
     if (!failing_) {
-      std::cerr << "[launcher] cannot persist " << path_ << " (" << error
-                << "); supervision continues and retries at the next "
-                   "change\n";
+      ConsoleLine(std::cerr)
+          << "[launcher] cannot persist " << path_ << " (" << error
+          << "); supervision continues and retries at the next "
+             "change\n";
     }
     failing_ = true;
     return;
   }
   if (failing_) {
-    std::cerr << "[launcher] " << path_ << " persisted again\n";
+    ConsoleLine(std::cerr) << "[launcher] " << path_ << " persisted again\n";
     failing_ = false;
   }
 }

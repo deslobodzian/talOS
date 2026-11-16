@@ -54,6 +54,22 @@ class LintTestTimeTest(unittest.TestCase):
                 self.assertEqual(failures, 1, out)
                 self.assertIn(f"{path}:1:", out)
 
+    # REQ-RT-17: a wait moved out of a test into the header or module it
+    # includes is still the test's wait.
+    def test_a_test_helper_is_held_to_the_same_rule(self):
+        for path, text in (
+                ("talOS/protocol/udp_test_helpers.h", SLEEP),
+                ("talOS/bridge/node_test_support.h", CLOCK),
+                ("talOS/events/log/gap_testing.h", ALIAS_CLOCK),
+                ("bench/main_processor/deploy_test_support.py", PY_SLEEP),
+                ("talOS/node/testing.h", CLOCK),
+                ("talOS/launcher/testdata/supervision_events.h", CLOCK),
+                ("talOS/python/talos/testing.py", PY_CLOCK)):
+            with self.subTest(path):
+                failures, out = lint({path: text})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{path}:1:", out)
+
     def test_real_clock_outside_tests_and_nodes_passes(self):
         # Framework code, a package without a node, and comments may name
         # the clock; only tests and node code are held to node.now().

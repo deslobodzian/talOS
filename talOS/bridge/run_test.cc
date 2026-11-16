@@ -67,6 +67,21 @@ bool StopWhileArming(ipc::Subscriber<Packet>& subscriber) {
   return subscriber.arm_wake();
 }
 
+// The wait seam of RunSendsTheCommandWhenARequestIsPublished: at the first
+// wait input can end after `publish_at_next_wait` is set, it publishes the
+// intake request with that demand from the loop thread, after every arm, so
+// the bridge is as good as asleep when the request lands.
+std::atomic<int> publish_at_next_wait{0};
+ipc::Publisher<Packet>* waiting_publisher = nullptr;
+const config::RobotConfig* waiting_config = nullptr;
+
+void PublishBeforeWait() {
+  const int demand = publish_at_next_wait.exchange(0);
+  if (demand != 0) {
+    PublishCommand(*waiting_publisher, IntakeRequest(*waiting_config, demand));
+  }
+}
+
 // The host's scheduling noise over a test: the longest a 1 ms sleep of an
 // ordinary thread overran, for a timed test to read before it judges
 // (docs/TESTING.md §6.7), so a stalled host fails as unqualified.
@@ -146,9 +161,12 @@ TEST(HardwareNodeTest, RunKeepsRegistryProgressCurrent) {
 
 // A request published while Run() is asleep wakes it: the command goes out
 // when the request is published, not at the loop's next deadline. Each
-// request waits for the previous one's command, so the bridge has gone back
-// to sleep before it, and the wakeup that finds it is counted as a
-// request's. A loop that only polled counts none.
+// request is published by the before_wait seam, after the bridge armed
+// every request subscriber and decided to sleep, so the wait it then enters
+// ends on the request's notification and the pass after it reads the
+// request: one request wakeup per request, whatever the host's timing. A
+// loop that did not wait on its request subscribers would sleep to its
+// deadline and count none.
 // REQ-RT-20
 TEST(HardwareNodeTest, RunSendsTheCommandWhenARequestIsPublished) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -160,6 +178,9 @@ TEST(HardwareNodeTest, RunSendsTheCommandWhenARequestIsPublished) {
       kStateTopic,
       RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
   ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  waiting_publisher = &pub;
+  waiting_config = &cfg;
+  node.set_seams({.before_wait = &PublishBeforeWait});
   constexpr int kRequests = 20;
   {
     RunningBridge run{node};
@@ -167,7 +188,7 @@ TEST(HardwareNodeTest, RunSendsTheCommandWhenARequestIsPublished) {
         SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 1000)));
     ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 1000); }));
     for (int i = 1; i <= kRequests; ++i) {
-      PublishCommand(pub, IntakeRequest(cfg, i));
+      publish_at_next_wait.store(i);
       std::optional<SentCommand> sent;
       do {
         sent = NextCommand(link.gateway);
@@ -176,9 +197,9 @@ TEST(HardwareNodeTest, RunSendsTheCommandWhenARequestIsPublished) {
     }
   }
   const auto& wakeups = node.wakeups();
-  EXPECT_GE(wakeups.request, uint64_t{kRequests / 2})
+  EXPECT_EQ(wakeups.request, uint64_t{kRequests})
       << "passes " << wakeups.passes << ", udp " << wakeups.udp << ", deadline "
-      << wakeups.deadline;
+      << wakeups.deadline << ", throttled " << wakeups.throttled;
 }
 
 // A State arriving while Run() is asleep wakes it and reaches /hw/state at

@@ -37,6 +37,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/context.h"
 #include "talOS/events/handles.h"
+#include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/manifest.h"
@@ -570,6 +571,87 @@ TEST_F(ReplayInputsTest, ASessionRecordedWithoutSimReplaysWithoutIt) {
                                                 : describe(found->second));
       break;
     }
+  }
+
+  std::filesystem::remove_all(out);
+  std::filesystem::remove_all(root);
+}
+
+// REQ-OPS-14: a node fed /hw/state from the bridge's log is never fed across
+// a gap in it. The session is a real one's shape (as above), its bridge log
+// holding States, then a closed GAP record where its writer's pool filled
+// (log/gap_testing.h; the bridge's own writer reaches the same record through
+// node.cc's log_options_for_test, hardware_node_test), then more States. The
+// replay stops before the gap, says so naming the bridge's log, and exits 1;
+// the node received no State published at or after the gap's start.
+TEST_F(ReplayInputsTest, AReplayFedFromTheBridgesLogStopsAtItsGap) {
+  const std::string root = TempPath("bridge_gap");
+  const std::string dir = root + "/1";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(dir);
+  const std::string whole = root + "/whole.tlog";
+  {
+    const event::MonotonicTime origin =
+        event::MonotonicTime::from_nanos(2'038'406'047'920);
+    event::SimulationEnvironment environment;
+    GatewayLoop loop{environment,
+                     event::log::LogWriter{whole, "hardware_node",
+                                           event::log::LogWriterOptions{}, 1},
+                     GatewayLoop::Options{.start = origin}};
+    RealGateway gateway{loop, config::ParseRobotConfig(config_)};
+    loop.run_until(origin + std::chrono::milliseconds{400});
+    loop.finish();
+  }
+  // Drop four gateway ticks from the middle of the run.
+  std::vector<event::log::RecordHeader> headers;
+  {
+    event::log::LogReader reader{whole};
+    event::log::LogReader::Record record;
+    while (reader.next(record)) headers.push_back(record.header);
+  }
+  const auto tick_at = [&](std::size_t from) {
+    while (from < headers.size() &&
+           headers[from].kind !=
+               static_cast<std::uint16_t>(event::EventKind::TIMER)) {
+      ++from;
+    }
+    return from;
+  };
+  const std::size_t first = tick_at(headers.size() / 2);
+  std::size_t end = first;
+  for (int ticks = 0; ticks < 4; ++ticks) end = tick_at(end + 1);
+  ASSERT_LT(end, headers.size()) << "too few records: " << headers.size();
+  const std::string bridge_log = dir + "/hardware_node.tlog";
+  const event::log::LogGap gap =
+      event::log::CopyWithGap(whole, bridge_log, first, end);
+  std::ofstream{dir + "/manifest.json"}
+      << "{\n  \"session_id\": 1,\n  \"simulation\": false\n}\n";
+  const std::vector<Sent> states = Sends(bridge_log, "/hw/state");
+  ASSERT_TRUE(
+      std::any_of(states.begin(), states.end(),
+                  [&](const Sent& s) { return s.now_ns > gap.resumed_ns; }))
+      << "no State after the gap in " << bridge_log;
+
+  const std::string out = TempPath("bridge_gap_out");
+  std::filesystem::remove_all(out);
+  ::testing::internal::CaptureStdout();
+  const int status = Replay("replay_motor", out, dir);
+  const std::string output = ::testing::internal::GetCapturedStdout();
+  EXPECT_EQ(status, 1) << output;
+  const std::size_t stop = output.find("stopped before a log gap in ");
+  ASSERT_NE(stop, std::string::npos) << output;
+  const std::string line = output.substr(stop, output.find('\n', stop) - stop);
+  EXPECT_NE(line.find(bridge_log), std::string::npos) << line;
+  EXPECT_TRUE(line.find("(topic /hw/state)") != std::string::npos ||
+              line.find("(topic /hw/status)") != std::string::npos)
+      << line;
+  const std::vector<Delivery> received =
+      Deliveries(out + "/1/replay_motor.tlog", "/hw/state");
+  ASSERT_FALSE(received.empty()) << output;
+  for (const Delivery& delivery : received) {
+    EXPECT_LT(delivery.publish_ns, gap.start_ns)
+        << "a State published " << delivery.publish_ns - gap.start_ns
+        << " ns after the gap's start was fed";
   }
 
   std::filesystem::remove_all(out);

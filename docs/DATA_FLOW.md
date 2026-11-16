@@ -5,7 +5,12 @@ Ethernet airtime. Bytes below exclude UDP/IP/Ethernet overhead unless explicitly
 included. Changes to a frame, codec, device cap, slot, or telemetry budget must
 update this document and its matching compile-time assert in the same change
 ([hard rule](../RULES.md)). Fully populated encoder tests pin the State,
-Command, and Driver Station formulas to the actual encoders.
+Command, and Driver Station formulas to the actual encoders. A number here
+that follows a hidden HTML comment `size: <name>` is checked:
+`//tools:check_data_flow_sizes_test` fails unless it equals what
+`//tools:data_flow_sizes` prints for that name from the defining headers,
+and unless every printed size is marked somewhere (a new one gets its marker
+in the same change).
 
 ## Processes and links
 
@@ -50,7 +55,7 @@ shared-memory topics only; its repository documents their rates.
 | Any publisher → the loop of a reader asleep on its topic (wake) | AF_UNIX datagram, Linux abstract address / macOS `/tmp/talos-wake-<id>`; no port ([talOS/rtms](../talOS/rtms/README.md#wake-channel)) | 1 byte, at most one per reader sleep per topic: a write sends one to each reader slot armed since the last publication (a reader of a prompt subscription under `Delivery::ON_PUBLISH`, the bridge's reader of each `/hw/request/<node>`, or `studio_bridge`'s reader of `/talos/telemetry`, between its drain and its next block), none when no reader is armed; a writer taking over a topic sends one to every reader with a receiver. A lost datagram costs a node's loop up to its 1 s backstop, the bridge up to its longest wait, 10000 µs (`HardwareNode::kMaxWaitUs`), and `studio_bridge` up to its next duty, at most its 250 ms graph refresh ([Studio bridge](../studio/bridge/README.md#waking)). A send that fails other than to a gone receiver counts in the writer's registry row (`wake_failures`), and a request the bridge's latest-value read passes over in its subsystem's request row (`requests_skipped`; [wake loss](../talOS/introspection/README.md#wake-loss)). |
 | Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz, each tick as one or more value pages; dictionary pages before the first tick and every 100th (1 Hz at this rate). |
 | studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Per client: graph, dictionary pages and a keyframe on connection, then change-only telemetry updates of at most one per producer tick and system-graph value updates of at most one per 500 ms (the whole graph again when its structure changes), deferred and coalesced when the egress budget is short. HTTP requests are not the value stream. |
-| studio_bridge → driver dashboard (`/drive`) | WebSocket, the same port | Per drive client (at most the layout's `drive_clients`, outside `max_clients`): dictionary pages and a keyframe of the feed's channels (the layout's, `hw/status/alert_error_link_lost`, and with an `alerts` widget every alert channel) on connection, then change-only updates of those channels at most `update_hz` (default 20) a second, an empty update after 100 ms without one, and the drive summary (at most 4,096 B) on change at most every 500 ms; within the layout's `budget_bytes_per_s` (default 24,000 B/s), reserved out of the bridge's 160,000 B/s ([bridge README](../studio/bridge/README.md#driver-dashboard-feed)). |
+| studio_bridge → driver dashboard (`/drive`) | WebSocket, the same port | Per drive client (at most the layout's `drive_clients`, outside `max_clients`): dictionary pages and a keyframe of the feed's channels (the layout's, `hw/status/alert_error_link_lost`, and with an `alerts` widget every alert channel) on connection, then change-only updates of those channels at most `update_hz` (default 20) a second, an empty update after 100 ms without one, and the drive summary (at most <!-- size: telemetry.drive_summary_bytes -->4,096 B) on change at most every 500 ms; within the layout's `budget_bytes_per_s` (default 24,000 B/s), reserved out of the bridge's 160,000 B/s ([bridge README](../studio/bridge/README.md#driver-dashboard-feed)). |
 
 A failed send never kills the bridge (`RuntimeUdpPeer` raises no
 `SIGPIPE`). When a send to the gateway fails with an error its socket never
@@ -107,11 +112,11 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **11**.
-The explicit little-endian header is **40 B**: magic u64 (8),
+One datagram contains exactly one protocol frame, version <!-- size: protocol.version -->**11**.
+The explicit little-endian header is <!-- size: frame.header_bytes -->**40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
-(4). Payload maximum is **1432 B**; frame maximum **1472 B** = 1500-byte MTU −
+(4). Payload maximum is <!-- size: frame.max_payload_bytes -->**1432 B**; frame maximum <!-- size: frame.max_bytes -->**1472 B** = 1500-byte MTU −
 20-byte IPv4 header − 8-byte UDP header. Under this IPv4/MTU contract talOS frames
 need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 
@@ -133,28 +138,28 @@ packet to the current version and fail on any change until it is bumped.
 
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
-| State, type 20 | `84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 47` | 1419 | 1459 | 13 |
-| Command, type 21 | `38 + 20M + 3DO + 11PWM` | 414 | 454 | 1018 |
-| Config chunk, type 22 | 24-byte header (config_id u64, total_crc32 u32, total_bytes u32, chunk_index u16, chunk_count u16, chunk_bytes u32) + ≤1408 data | 1432 | 1472 | 0 for full chunk |
-| ConfigAck, type 23 | u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
-| DriverStation, type 24 | 40 fixed + two FMS strings + six variable joysticks | 678 | 718 | 754 |
-| ClockProbe, type 25 | empty; send timestamp uses existing frame header | 0 | 40 | 1432 |
+| State, type 20 | `84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 47` | <!-- size: state.max_payload_bytes -->1419 | <!-- size: state.max_frame_bytes -->1459 | <!-- size: state.headroom_bytes -->13 |
+| Command, type 21 | `38 + 20M + 3DO + 11PWM` | <!-- size: command.max_payload_bytes -->414 | <!-- size: command.max_frame_bytes -->454 | <!-- size: command.headroom_bytes -->1018 |
+| Config chunk, type 22 | <!-- size: config.chunk_header_bytes -->24-byte header (config_id u64, total_crc32 u32, total_bytes u32, chunk_index u16, chunk_count u16, chunk_bytes u32) + ≤<!-- size: config.chunk_data_bytes -->1408 data | <!-- size: frame.max_payload_bytes -->1432 | <!-- size: frame.max_bytes -->1472 | 0 for full chunk |
+| ConfigAck, type 23 | u64 config_id + u8 status + char[64] reason | <!-- size: config_ack.payload_bytes -->73 | <!-- size: config_ack.frame_bytes -->113 | <!-- size: config_ack.headroom_bytes -->1359 |
+| DriverStation, type 24 | <!-- size: ds.fixed_bytes -->40 fixed + two FMS strings + six variable joysticks | <!-- size: ds.max_payload_bytes -->678 | <!-- size: ds.max_frame_bytes -->718 | <!-- size: ds.headroom_bytes -->754 |
+| ClockProbe, type 25 | empty; send timestamp uses existing frame header | 0 | <!-- size: frame.header_bytes -->40 | <!-- size: frame.max_payload_bytes -->1432 |
 
-State/Command maxima use caps **M=16, S=12, DI=8, DO=4, AI=4, E=4,
-PWM=4** (`talOS/hardware/config.h`). The 84-byte State prefix is seven u64,
-the gateway build (10: u64 revision, u8 program, u8 dirty), u32 flags and
-seven u16 counts; its 47-byte suffix is health (31) + four u32 counters
-(16). Health is valid u8, battery f64, brownout u8, then one CAN bus's slot:
+State/Command maxima use caps **M=<!-- size: caps.motors -->16, S=<!-- size: caps.sensors -->12, DI=<!-- size: caps.digital_inputs -->8, DO=<!-- size: caps.digital_outputs -->4, AI=<!-- size: caps.analog_inputs -->4, E=<!-- size: caps.encoders -->4,
+PWM=<!-- size: caps.pwm_outputs -->4** (`talOS/hardware/config.h`). The <!-- size: state.prefix_bytes -->84-byte State prefix is seven u64,
+the gateway build (<!-- size: state.gateway_build_bytes -->10: u64 revision, u8 program, u8 dirty), u32 flags and
+seven u16 counts; its <!-- size: state.suffix_bytes -->47-byte suffix is health (<!-- size: state.health_bytes -->31) + four u32 counters
+(<!-- size: state.counters_bytes -->16). Health is valid u8, battery f64, brownout u8, then one CAN bus's slot:
 bus count u8, bus index u8, read state u8, utilization f32, bus-off u32,
 transmit-buffer-full u32, receive and transmit error counters u8 (saturated
-at 255), failed reads u32 (19 B). All of a robot's bus slots, up to four
+at 255), failed reads u32 (<!-- size: state.can_bus_bytes -->19 B). All of a robot's bus slots, up to four
 (`hardware::kMaxCanBuses`: "rio" and three more), would not fit the
 headroom, so each State carries one, slot `sequence % count`, and the bridge
 assembles `/hw/status` `can_buses` from consecutive States
 (`CanBusTable`, `talOS/bridge/can_buses.h`); a bus's slot is refreshed every `count` States. A
-decoder rejects a count above 4, an index at or past the count (or past 0
+decoder rejects a count above <!-- size: caps.can_buses -->4, an index at or past the count (or past 0
 when the count is 0), an unknown read state and a utilization that is not
-finite. Command prefix is four u64 + three u16 counts = 38.
+finite. Command prefix is four u64 + three u16 counts = <!-- size: command.prefix_bytes -->38.
 The sixth u64 is `clock_probe_time_us`, echoing a probe received before the
 current gateway tick began. Zero means no probe yet. It does not affect
 command acceptance, ACK sequence, epoch, or actuator watchdogs.
@@ -176,13 +181,13 @@ and every State the bridge's `--log` records names its build.
 
 | Device | State bytes / device | Command bytes / device | Encoded fields |
 |---|---:|---:|---|
-| Motor | 45 | 20 | State: id2 + valid1 + position/velocity/voltage doubles24 + stator-current int16(2) + three u32 fields12 + temperature int16(2) + supply-current int16(2). Command: id2 + mode1 (0 neutral, 1 duty cycle, 2 voltage, 3 velocity, 4 position, 5 motion magic, 6 torque current; a decoder rejects any other) + slot1 + demand8 (duty ratio, volts, mechanism rotations/s, rotations, or stator amperes) + feedforward8 (volts; 0 unless velocity, position or motion magic). |
-| Sensor | 27 | — | id2 + valid1 + two doubles16 + two ages8 |
-| Digital input | 4 | — | id2 + valid1 + value1 |
-| Digital output | 4 | 3 | State id2 + valid1 + value1; command id2 + value1 |
-| Analog input | 15 | — | id2 + valid1 + voltage8 + age4 |
-| Encoder | 23 | — | id2 + valid1 + position8 + velocity8 + age4 |
-| PWM output | 11 | 11 | State id2 + valid1 + output8 (0 while it sends no pulse); command id2 + mode1 (0 off: no pulse, output +0.0; 1 a pulse, output in [-1, 1]; a decoder rejects any other mode, or an off output that is not +0.0) + output8 |
+| Motor | <!-- size: state.motor_bytes -->45 | <!-- size: command.motor_bytes -->20 | State: id2 + valid1 + position/velocity/voltage doubles24 + stator-current int16(2) + three u32 fields12 + temperature int16(2) + supply-current int16(2). Command: id2 + mode1 (0 neutral, 1 duty cycle, 2 voltage, 3 velocity, 4 position, 5 motion magic, 6 torque current; a decoder rejects any other) + slot1 + demand8 (duty ratio, volts, mechanism rotations/s, rotations, or stator amperes) + feedforward8 (volts; 0 unless velocity, position or motion magic). |
+| Sensor | <!-- size: state.sensor_bytes -->27 | — | id2 + valid1 + two doubles16 + two ages8 |
+| Digital input | <!-- size: state.digital_input_bytes -->4 | — | id2 + valid1 + value1 |
+| Digital output | <!-- size: state.digital_output_bytes -->4 | <!-- size: command.digital_output_bytes -->3 | State id2 + valid1 + value1; command id2 + value1 |
+| Analog input | <!-- size: state.analog_input_bytes -->15 | — | id2 + valid1 + voltage8 + age4 |
+| Encoder | <!-- size: state.encoder_bytes -->23 | — | id2 + valid1 + position8 + velocity8 + age4 |
+| PWM output | <!-- size: state.pwm_output_bytes -->11 | <!-- size: command.pwm_output_bytes -->11 | State id2 + valid1 + output8 (0 while it sends no pulse); command id2 + mode1 (0 off: no pulse, output +0.0; 1 a pulse, output in [-1, 1]; a decoder rejects any other mode, or an off output that is not +0.0) + output8 |
 
 These are codec sizes (`talOS/hardware/messages.h`, `messages.cc`), not native
 struct padding. Position, velocity and voltage remain binary64. Motor stator
@@ -216,14 +221,14 @@ capacity is not serialized. A State or Command is always wholly contained in
 one datagram. Invalid counts, truncated data, and trailing bytes are rejected
 by decoding; cap-sized encoder tests assert exact named worst-case lengths.
 
-**Driver Station:** The fixed portion is **40 B**: sample/mode times and the
+**Driver Station:** The fixed portion is <!-- size: ds.fixed_bytes -->**40 B**: sample/mode times and the
 gateway boot id (three u64), FMS fixed fields, and the two string-length bytes.
-Event and game message strings each transmit at most **31 B** (their storage
+Event and game message strings each transmit at most <!-- size: ds.fms_string_bytes -->**31 B** (their storage
 is 32 including NUL). Each of the six joysticks is **1 B** when disconnected.
 Connected cost is
 `1 connected + 3 counts + 4 buttons + 4×axes + 2×POVs + 1 name_length + name`.
-At caps (12 axes, 4 POVs, 31 name bytes) this is **96 B** each; maximum is
-`40 + 31 + 31 + 6×96` = **678 B**; empty strings/all disconnected is **46 B**.
+At caps (<!-- size: ds.axes -->12 axes, <!-- size: ds.povs -->4 POVs, <!-- size: ds.name_bytes -->31 name bytes) this is <!-- size: ds.joystick_max_bytes -->**96 B** each; maximum is
+`40 + 31 + 31 + 6×96` = <!-- size: ds.max_payload_bytes -->**678 B**; empty strings/all disconnected is <!-- size: ds.empty_bytes -->**46 B**.
 The boot id is the one the same gateway stamps on its State; consumers order
 packets by sample/mode time only within one boot, start over on a new one, and
 ignore the last four retired boots (`talOS/bridge/boot_history.h`); the bridge
@@ -236,11 +241,11 @@ count, chunk index/count, and chunk data length. `ConfigAssembler` accepts chunk
 out of order, ignores duplicate chunks, waits until all indices are present,
 checks CRC32, deserializes and validates caps, then reconfigures. A new config ID
 replaces the assembly; inconsistent metadata or invalid assembled data is
-rejected. Completion/backend failure or malformed data produces the 73-byte ACK
+rejected. Completion/backend failure or malformed data produces the <!-- size: config_ack.payload_bytes -->73-byte ACK
 with status/reason (`config_wire.h`, `endpoint.h`).
-Hardware configuration assembly rejects serialized totals above **10,227 B**
+Hardware configuration assembly rejects serialized totals above <!-- size: config.max_serialized_bytes -->**10,227 B**
 (`kMaxSerializedConfigSize`) before allocation. Chunk data is limited to
-**1,408 B**; chunk counts cannot exceed 10,227 or the serialized byte count.
+<!-- size: config.chunk_data_bytes -->**1,408 B**; chunk counts cannot exceed <!-- size: config.max_chunk_count -->10,227 or the serialized byte count.
 Transfer metadata and chunk geometry must remain consistent, and assembler
 exceptions reject the transfer without escaping the gateway safety loop.
 
@@ -262,10 +267,10 @@ sizes asserted above.
 
 Fixed message topics store their complete native FlatBuffers struct/envelope
 plus a writer publication timestamp; there is no UDP frame header. RTMS segment
-version **9** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
+version <!-- size: rtms.version -->**9** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
 For payload size M and alignment A, timestamp offset is `align_up(M, 8)` and
-slot stride is `align_up(align_up(M, 8) + 8, max(A, 8))`. The **2368 B** ring
-header (32 reader slots of 64 B) is additional; data starts at
+slot stride is `align_up(align_up(M, 8) + 8, max(A, 8))`. The <!-- size: rtms.header_bytes -->**2368 B** ring
+header (<!-- size: rtms.max_readers -->32 reader slots of <!-- size: rtms.reader_slot_bytes -->64 B) is additional; data starts at
 `align_up(2368, max(A, 8))`. These sizes
 are compile-time asserted in `talOS/rtms/rtms.h`.
 
@@ -295,11 +300,11 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
-| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data 320 on the bench ([actual bench robot](#actual-bench-robot)), ≤1419 |
-| `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data 98 on the bench, ≤414 |
-| `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
-| `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
-| `/hw/status`: bridge → telemetry/observers | 272 | 264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`, and the u16 `protocol_version_id` (the bridge's `kProtocolVersion`) the padding after `gateway_build_dirty`; `can_buses` is four 20 B `CanBusStatus` slots at the end. A shared-memory message, in no UDP payload: a change to it is not a hardware protocol change, but a change to its layout makes earlier sessions unreplayable into every node with devices ([replay after a schema change](../talOS/launcher/README.md#replay-after-a-schema-change)) |
+| `/hw/state`: bridge → devices/telemetry | <!-- size: packet.slot_bytes -->1448 | <!-- size: packet.bytes -->1436 B `hardware::Packet`: u32 size + <!-- size: frame.max_payload_bytes -->1432 data; occupied data 320 on the bench ([actual bench robot](#actual-bench-robot)), ≤<!-- size: state.max_payload_bytes -->1419 |
+| `/hw/command`: bridge → observers/logging | <!-- size: packet.slot_bytes -->1448 | <!-- size: packet.bytes -->1436 B Packet; merged Command occupied data 98 on the bench, ≤<!-- size: command.max_payload_bytes -->414 |
+| `/hw/state/driver_station`: bridge → DS consumers/telemetry | <!-- size: packet.slot_bytes -->1448 | <!-- size: packet.bytes -->1436 B Packet; DS occupied data <!-- size: ds.empty_bytes -->46–<!-- size: ds.max_payload_bytes -->678 |
+| `/hw/request/<node>`: device owner → bridge | <!-- size: packet.slot_bytes -->1448 | <!-- size: packet.bytes -->1436 B Packet; only that owner's actuator requests, not a full-capacity command |
+| `/hw/status`: bridge → telemetry/observers | <!-- size: bridge_status.slot_bytes -->272 | <!-- size: bridge_status.bytes -->264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`, and the u16 `protocol_version_id` (the bridge's `kProtocolVersion`) the padding after `gateway_build_dirty`; `can_buses` is four <!-- size: bridge_status.can_bus_bytes -->20 B `CanBusStatus` slots at the end. A shared-memory message, in no UDP payload: a change to it is not a hardware protocol change, but a change to its layout makes earlier sessions unreplayable into every node with devices ([replay after a schema change](../talOS/launcher/README.md#replay-after-a-schema-change)) |
 | `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; the bench's motor/swerve_module payload 56/40 B (motor's 40 B MotorTarget pinned in the bench motor node), slots 64/48 B; the superstructure example's elevator/intake/superstructure 24/17/17 B, slots 32/32/32 B |
 | `/motor/state` (bench only): motor → telemetry/logs | 104 | 96 B MotorState including device temperature, supply current and limit switches; pinned in bench motor node |
 | `/swerve_module/state` (bench only): swerve_module → telemetry/logs | 128 | 120 B ModuleState: drive, steer and CANcoder feedback, the commanded setpoint and flags; pinned in `swerve_module.h` |
@@ -308,10 +313,10 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/intake/state` (examples/superstructure): intake → superstructure/telemetry | 16 | 2 B demo.IntakeStatus |
 | `/superstructure/state` (examples/superstructure): superstructure → telemetry | 16 | 1 B demo.SuperstructureStatus |
 | `/wrist/state` (examples/external_subsystem): wrist → logs | 32 | 24 B wrist.WristState |
-| `/<camera>/state`: a robot's camera node → a `new_subsystem --type estimator` node/telemetry | 72 | 64 B geometry.PoseObservation, including padding |
-| `/<estimator>/state`: a `new_subsystem --type estimator` node → telemetry | 80 | 72 B geometry.PoseEstimate (`talOS/msgs/layout_asserts.cc`); `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
-| `/sim/state`: physics sim_gateway → telemetry and a robot's simulated sensors | 64 | 56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
-| `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.3 s at 100 Hz with the bench's two value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
+| `/<camera>/state`: a robot's camera node → a `new_subsystem --type estimator` node/telemetry | <!-- size: pose_observation.slot_bytes -->72 | <!-- size: pose_observation.bytes -->64 B geometry.PoseObservation, including padding |
+| `/<estimator>/state`: a `new_subsystem --type estimator` node → telemetry | <!-- size: pose_estimate.slot_bytes -->80 | <!-- size: pose_estimate.bytes -->72 B geometry.PoseEstimate (`talOS/msgs/layout_asserts.cc`); `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
+| `/sim/state`: physics sim_gateway → telemetry and a robot's simulated sensors | <!-- size: odometry_sample.slot_bytes -->64 | <!-- size: odometry_sample.bytes -->56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
+| `/talos/telemetry`: telemetry → studio_bridge | <!-- size: telemetry.slot_stride_bytes -->16392 × <!-- size: telemetry.slot_count -->64 slots | <!-- size: telemetry.dictionary_page_bytes -->16384 B byte payload capacity; ring = <!-- size: telemetry.ring_bytes -->1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.3 s at 100 Hz with the bench's two value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
 
 Sources: `talOS/hardware/packet.h`, `talOS/bridge/bridge_status.fbs`,
 `talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, the bench's
@@ -325,9 +330,9 @@ This truth topic is local to the main processor and never crosses hardware UDP.
 
 The live node registry ([talOS/introspection](../talOS/introspection/README.md))
 is one more segment, `/talos_registry.6` (the number is its layout version):
-a 64 B header and 32 `NodeRecord` rows of **11136 B**, alignment 64, for
-**356416 B**. A row holds its node's identity, 64 source records of 136 B,
-4 Target selection records of 524 B and, at its end, the wake counters
+a <!-- size: registry.header_bytes -->64 B header and <!-- size: registry.rows -->32 `NodeRecord` rows of <!-- size: registry.row_bytes -->**11136 B**, alignment <!-- size: registry.row_alignment -->64, for
+<!-- size: registry.total_bytes -->**356416 B**. A row holds its node's identity, <!-- size: registry.sources_per_row -->64 source records of <!-- size: registry.source_record_bytes -->136 B,
+<!-- size: registry.selections_per_row -->4 Target selection records of <!-- size: registry.selection_record_bytes -->524 B and, at its end, the wake counters
 (`wake_failures`, `stalled_arms`, `wake_fallbacks`, 3 × 8 B in what was tail
 padding). Every node writes its own row about four times a second; the
 launcher and `studio_bridge` read it. Both sizes are compile-time asserted in
@@ -338,7 +343,7 @@ launcher and `studio_bridge` read it. Both sizes are compile-time asserted in
 A writer holds one connected socket per reader slot it has notified, per
 topic it writes ([wake channel](../talOS/rtms/README.md#wake-channel)), so a
 node's wake sockets are at most the readers of the topics it writes, and never
-more than `MAX_READERS` (32) per topic: the bridge, which writes four
+more than `MAX_READERS` (<!-- size: rtms.max_readers -->32) per topic: the bridge, which writes four
 topics, could hold 4 × 32 = 128 wake sockets (plus its few other
 descriptors, under the macOS limit below) only if 32 readers of each slept
 on it; what each
@@ -391,7 +396,7 @@ feedback—is fresh and finite; invalid feedback neutralizes the follower.
 
 ## Dispatch logs
 
-`.tlog` version **8** carries a publication timestamp on each message dispatch
+`.tlog` version <!-- size: log.version -->**8** carries a publication timestamp on each message dispatch
 and send, separate from event/dispatch time. Exact replay preserves publication
 age; input replay injects with the recorded publication time, at that time,
 or, for a node the session ran, at the drain that received it. Neither crosses
@@ -402,25 +407,25 @@ the session's other logs hold what it lost:
 [the rule](../talOS/events/README.md#replaying-another-sessions-inputs)),
 and both exit 1
 ([events](../talOS/events/README.md#recording-and-replaying)).
-Readers accept versions 7 and 8 (a version-7 log is a version-8 log without a
+Readers accept versions <!-- size: log.oldest_readable_version -->7 and <!-- size: log.version -->8 (a version-7 log is a version-8 log without a
 GAP record) and reject any other with the recorded and supported versions; the
 log format version is not the hardware protocol version
 ([`kProtocolVersion`](#protocol-version)), which a log format change leaves
-unchanged. The packed file header is **120 B**, manifest entry **112 B**, and
-record header **64 B**, followed by stored payload bytes
+unchanged. The packed file header is <!-- size: log.file_header_bytes -->**120 B**, manifest entry <!-- size: log.manifest_entry_bytes -->**112 B**, and
+record header <!-- size: log.record_header_bytes -->**64 B**, followed by stored payload bytes
 (`talOS/events/log/format.h`). A GAP record (version 8), which stands where a
-writer dropped records, is a record header and a **64 B** `GapRecord`
-(`static_assert(sizeof(GapRecord) == 64)`): **128 B**, `GAP_RECORD_BYTES`,
+writer dropped records, is a record header and a <!-- size: log.gap_record_bytes -->**64 B** `GapRecord`
+(`static_assert(sizeof(GapRecord) == 64)`): <!-- size: log.gap_record_total_bytes -->**128 B**, `GAP_RECORD_BYTES`,
 less the `GapRecord`'s trailing zero bytes as stored
 ([events](../talOS/events/README.md#log-format)).
-`Target::get` adds one payload-free READ record (a 64 B header) per `Target`
+`Target::get` adds one payload-free READ record (a <!-- size: log.record_header_bytes -->64 B header) per `Target`
 per `update()` that selects a lane, however often it calls `get()` or
 `source()`: 6.4 KB/s for a 100 Hz consumer of one target.
 
 A byte-capped log (`LogWriterOptions::max_bytes`, the launcher's per-member
 share of `[robot] log_max_bytes`, in proportion to the bytes the member's log
 is expected to store per second: [log budget](../talOS/launcher/README.md#session-segments-and-logs)) is split into n = min(8, cap / (prefix +
-largest record, at least the 128 B GAP record)) segments of cap / n bytes,
+largest record, at least the <!-- size: log.gap_record_total_bytes -->128 B GAP record)) segments of cap / n bytes,
 each a complete version-8 log
 (its own header, manifest and schema block, then whole records). A segment
 ends when the next record would cross cap / n, or, with a window
@@ -434,7 +439,7 @@ exhaust the writer's pool and drop records (a gap). The newest
 is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
 `log_dump` and `--replay-inputs` read every segment in a
-session directory, and `log_dump` given one log's file
+session directory, and given one log's file each
 reads that log's kept segments with it; `--replay-inputs` refuses to feed a
 node from a log whose `<log>.capped` marker exists (or whose member the
 session manifest marks `log_capped`), since no GAP record
@@ -450,15 +455,15 @@ stops capture at the cap instead.
 
 Telemetry emits size-prefixed FlatBuffers `Frame` pages: a **4-byte**
 little-endian length followed by a `TLM3` buffer. A tick is as many **value
-pages** as its channels need, each at most **1200 B including the prefix**
-(12 B per sample); a dictionary is as many **dictionary pages** as it needs,
-each at most one **16384 B** slot; each entry (`ChannelInfo` in `telemetry.fbs`) carries a channel's name, unit, enum labels, kind and alert level (`None`, `Info`, `Warning`, `Error`: a Bool channel that is an alert, active while 1). A dictionary holds at most **2048**
-channels (`kMaxChannels`): a keyframe of that many, at most 25 pages with
-WebSocket framing, is at most 30,250 B, inside the bridge's **64,000 B** burst,
+pages** as its channels need, each at most <!-- size: telemetry.value_page_bytes -->**1200 B including the prefix**
+(<!-- size: telemetry.sample_bytes -->12 B per sample); a dictionary is as many **dictionary pages** as it needs,
+each at most one <!-- size: telemetry.dictionary_page_bytes -->**16384 B** slot; each entry (`ChannelInfo` in `telemetry.fbs`) carries a channel's name, unit, enum labels, kind and alert level (`None`, `Info`, `Warning`, `Error`: a Bool channel that is an alert, active while 1). A dictionary holds at most <!-- size: telemetry.max_channels -->**2048**
+channels (`kMaxChannels`): a keyframe of that many, at most <!-- size: telemetry.keyframe_pages -->25 pages with
+WebSocket framing, is at most <!-- size: telemetry.keyframe_bytes -->30,250 B, inside the bridge's <!-- size: telemetry.client_burst_bytes -->**64,000 B** burst,
 which an update must fit to be sent whole (`static_assert` in `wire.h`). The
 producer refuses construction past the cap, naming the largest sources, and
-refuses a channel whose dictionary entry alone cannot fit one page. Each dictionary name, unit and enum label is at most **256 B**, and an
-enum channel carries at most **1024** labels (`wire.h`); Studio's decoder
+refuses a channel whose dictionary entry alone cannot fit one page. Each dictionary name, unit and enum label is at most <!-- size: telemetry.dictionary_string_bytes -->**256 B**, and an
+enum channel carries at most <!-- size: telemetry.enum_labels -->**1024** labels (`wire.h`); Studio's decoder
 accepts exactly these limits, and the producer never emits past them
 ([telemetry README](../talOS/telemetry/README.md#transport-budget)). Dictionary
 pages before the first tick and every 100th allow late join and recovery in
@@ -629,5 +634,5 @@ wrong-identity commands, and disabled/stale-target actuation is neutralized.
 The configured command timeout is **100 ms**; a single loss does not imply an
 immediate timeout. The maximum frame fits the IPv4 MTU without fragmentation.
 
-The device caps are a hard one-datagram budget: State has **13 B**
+The device caps are a hard one-datagram budget: State has <!-- size: state.headroom_bytes -->**13 B**
 worst-case payload headroom.

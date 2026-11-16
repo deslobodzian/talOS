@@ -71,7 +71,10 @@ under `/hw/request`, remapped or not, at construction. A topic nobody reads
 `state`, `status`, `event` or `telemetry`, so a topic published for display
 is no finding, while a `target`, `request` or `command` that only telemetry
 records still is), a policy lane nobody writes yet, a topic whose owner is not a node in the
-session, a node whose hardware request carries `untargeted_outputs` without
+session, an `optional` read of an owner-published topic that its owner, a node
+in the session, does not publish (only the owner may, so the read is
+misspelled or the owner does not publish it in this configuration; the
+finding names the readers and the owner), a node whose hardware request carries `untargeted_outputs` without
 that coverage, or a node that writes its hardware request but reads no target
 lane of its own and has not opted out (its outputs never drive; REQ-SAFE-41), is a
 warning; each of the last two names the node.

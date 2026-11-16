@@ -62,6 +62,14 @@ jobs:
       # ancestor of HEAD) falls back to the merge base with main. Where
       # that merge base is HEAD itself (main, or a branch at main's tip),
       # the base is HEAD's first parent.
+      #
+      # The commissioning check takes COMMISSIONING_BASE, which must cover
+      # every commit the event adds: BASE, except on a push to main that is
+      # not a fast-forward. A force push diffs against the merge base with
+      # the old tip (fetched by id: no ref holds it any more); when that tip
+      # cannot be fetched or shares no history with HEAD, or the push
+      # creates main (all-zero `before`), COMMISSIONING_GAP names why and
+      # the lint job fails rather than check only HEAD's first parent.
       env:
         EVENT: ${{ github.event_name }}
         BEFORE: ${{ github.event.before }}
@@ -83,6 +91,25 @@ jobs:
         fi
         echo "Diff base: $(git log -1 --format='%H %s' "$base")"
         echo "BASE=$base" >> "$GITHUB_ENV"
+        commissioning_base="$base"
+        gap=
+        if [ "$EVENT" != pull_request ] &&
+           [ "$GITHUB_REF" = refs/heads/main ]; then
+          if [ -z "$BEFORE" ] ||
+             [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+            gap="this push creates main: no earlier main to diff against"
+          elif ! git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null; then
+            git cat-file -e "$BEFORE^{commit}" 2>/dev/null ||
+              git fetch -q --no-tags origin "$BEFORE" || true
+            if ! commissioning_base="$(git merge-base "$BEFORE" HEAD)"; then
+              gap="force push: the previous main $BEFORE cannot be fetched or shares no history with HEAD"
+              commissioning_base="$base"
+            fi
+          fi
+        fi
+        echo "Commissioning base: $commissioning_base${gap:+ (gap: $gap)}"
+        echo "COMMISSIONING_BASE=$commissioning_base" >> "$GITHUB_ENV"
+        echo "COMMISSIONING_GAP=$gap" >> "$GITHUB_ENV"
 
     - name: Setup bazel-action
       uses: bazel-contrib/setup-bazel@0.19.0
@@ -717,7 +744,8 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v7
       with:
-        # Full history: the commissioning lint reads each commit since $BASE.
+        # Full history: the commissioning lint reads each commit since
+        # $COMMISSIONING_BASE.
         fetch-depth: 0
 
     - *diff-base
@@ -726,8 +754,16 @@ jobs:
       # tools/source_lints.sh, which tools/prepush.sh's source-lints step
       # also runs, so the two cannot drift; its header lists each lint. It
       # runs every lint whatever the others find and prints one line per
-      # lint.
-      run: bash tools/source_lints.sh --base "$BASE"
+      # lint. The commissioning lint takes COMMISSIONING_BASE; a
+      # COMMISSIONING_GAP (no base covers every pushed commit) fails the job.
+      run: |
+        status=0
+        bash tools/source_lints.sh --base "$COMMISSIONING_BASE" || status=1
+        if [ -n "$COMMISSIONING_GAP" ]; then
+          echo "::error::commissioning: not every pushed commit was checked: $COMMISSIONING_GAP"
+          status=1
+        fi
+        exit "$status"
 
   gate:
     name: CI gate

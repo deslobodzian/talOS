@@ -151,6 +151,8 @@ TEST(Devices, NothingIsSentBeforeTheFirstAcceptedState) {
   EXPECT_TRUE(mech.a.connected());
 }
 
+// REQ-SAFE-01: a motor update() did not set (b throughout, a once its demand
+// is dropped) goes out neutral in that tick's request.
 // REQ-SAFE-02
 // REQ-SAFE-42: the opt-out keeps the robot_enabled half of the gate.
 TEST(Devices, MotorsAreNeutralUntilEnabledAndEchoTheStateIdentity) {
@@ -242,6 +244,45 @@ TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   EXPECT_EQ(command->motors[0].demand, 0.0);
 }
 
+// REQ-SAFE-02: the flush drives on the last accepted State while it is younger
+// than command_timeout_us and sends neutral from the tick at which it is that
+// old, not some margin later. States stop (a link outage) while the node keeps
+// ticking every 5 ms; each tick's request is judged against the State's age at
+// that tick.
+TEST(Devices, StaleStateBoundaryIsTheCommandTimeout) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  const auto& link = sim.node("mech").extension<HardwareLink>();
+  SimHardware hw{sim};
+  hw.enable();
+  mech.a_velocity = 20;
+  sim.step(20ms);
+  ASSERT_EQ(hw.motor_request("mech", "a").mode, Mode::kVelocity);
+
+  hw.lose_states(1000);
+  bool drove_late = false;
+  bool went_neutral = false;
+  for (int tick = 0; tick < 40; ++tick) {
+    const std::uint64_t sent = Sent(sim);
+    sim.step(5ms);
+    ASSERT_GT(Sent(sim), sent) << "the flush stopped at tick " << tick;
+    const auto age = link.age();
+    const Mode mode =
+        LastCommand(sim).value_or(hardware::Command{}).motors[0].mode;
+    if (age < 100ms) {
+      EXPECT_EQ(mode, Mode::kVelocity)
+          << "a State " << age.count() << " ns old must still drive";
+      drove_late = drove_late || age >= 95ms;
+    } else {
+      EXPECT_EQ(mode, Mode::kNeutral)
+          << "a State " << age.count() << " ns old must not drive";
+      went_neutral = true;
+    }
+  }
+  EXPECT_TRUE(drove_late) << "no tick sampled the last 5 ms before the bound";
+  EXPECT_TRUE(went_neutral);
+}
+
 TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
   std::string toml{kRobotToml};
   toml.insert(toml.find("[subsystems.mech.digital_outputs"),
@@ -271,6 +312,42 @@ TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
   EXPECT_GT(mech.a.clamped_count(), count);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
+}
+
+// REQ-SAFE-04: clamped_count() rises exactly once per adjusted setter call,
+// counted per call, not per tick or per clamped field: two calls in one
+// update() that each clamp both demand and feedforward add two, and an
+// in-range call adds none.
+TEST(Devices, ClampedCountRisesOncePerAdjustedCall) {
+  struct Twice {
+    explicit Twice(Node& node) : motor{node, "a"} {
+      AllowUntargetedOutputs(node);
+    }
+    void update() {
+      for (int i = 0; i < calls; ++i) motor.set_velocity(demand, ff);
+      ++updates;
+    }
+    Motor motor;
+    int updates = 0;
+    int calls = 2;
+    double demand = 1000;  // past max_velocity_rps
+    double ff = 1000;      // past max_voltage
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& twice = sim.add<Twice>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(5ms);
+  const std::uint64_t before = twice.motor.clamped_count();
+  const int updates = twice.updates;
+  sim.step(5ms);  // one update(), two clamping calls
+  ASSERT_EQ(twice.updates, updates + 1);
+  EXPECT_EQ(twice.motor.clamped_count(), before + 2);
+  twice.calls = 1;
+  twice.demand = 1;
+  twice.ff = 0.5;
+  sim.step(5ms);  // in range
+  EXPECT_EQ(twice.motor.clamped_count(), before + 2);
 }
 
 TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
