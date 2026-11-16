@@ -435,7 +435,9 @@ bazel run -c opt //studio/review:studio_review -- --library /tmp/talos_logs [--p
 session holding its `manifest.json` and event logs, rotated segments and
 restarts included ([session segments and logs](../talOS/launcher/README.md#session-segments-and-logs)).
 Relative paths are taken from where `bazel run` was invoked. The server
-listens on 127.0.0.1 only (there is no flag to change that). It serves the
+listens on 127.0.0.1 only (there is no flag to change that), and refuses a
+port another listener holds, exiting with `cannot listen on 127.0.0.1:<port>`
+(it never shares a port, as uSockets' `SO_REUSEPORT` default would). It serves the
 review API under `/review/`: `sessions.json`, and per session
 `channels.json`, `bounds.json`, `snapshot?t_ns=` and
 `series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes are in

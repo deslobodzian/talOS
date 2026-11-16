@@ -31,7 +31,10 @@ a rebuilt bundle and restarting the service (first when the web directory is an 
 either way. Once listening, the
 bridge prints `listening <port>` on stdout; port 0 asks the OS for a free port,
 which that line reports (how the bridge tests avoid racing other processes for
-a port).
+a port). The port is held exclusively (uSockets' `LIBUS_LISTEN_EXCLUSIVE_PORT`:
+`SO_REUSEADDR`, never `SO_REUSEPORT`), so a port another listener holds, such
+as another session's bridge, is refused: the bridge prints `cannot listen on
+port <port>` and exits 1 (`//studio/bridge:listen_test`).
 
 These named options are removed before positional parsing:
 
