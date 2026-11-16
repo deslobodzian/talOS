@@ -3,20 +3,20 @@ module(
     version = "0.1.0",
 )
 
-# talOS, pinned at the commit of the checkout two directories up. A robot
-# repository holds talOS the same way, as a git submodule at the commit it
-# builds against, and points path at that submodule.
+# talOS, as the checkout `path` names builds it (relative to this
+# directory). A team's robot repository usually holds talOS as a git
+# submodule at the commit it builds against and points path at it
+# (`path = "talos"`); README.md says how.
 bazel_dep(name = "talos", version = "0.1.0")
 local_path_override(
     module_name = "talos",
     path = "../..",
 )
 
-# Studio's pages (/ and /drive), as the talOS checkout builds them: in a robot
-# repository `path = "talos/bazel-bin/studio/dist"`, built by
-# `cd talos && bazel build //studio:web_dist`. Until then //:studio_webroot
-# holds only NOT_BUILT.txt and the bridge answers its pages with that
-# command (README.md "Studio").
+# Studio's pages (/ and /drive), as the talOS checkout above builds them:
+# its bazel-bin/studio/dist, written by `bazel build //studio:web_dist` run
+# in that checkout. Until then //:studio_webroot holds only NOT_BUILT.txt
+# and the bridge answers its pages with that command (README.md "Studio").
 studio_web = use_repo_rule("@talos//studio/bridge:webroot.bzl", "studio_web")
 
 studio_web(

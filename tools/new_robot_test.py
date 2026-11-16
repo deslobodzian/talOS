@@ -1,9 +1,16 @@
 """Tests for //tools:new_robot: the generated robot, with a mechanism or
 none, passes the launcher's graph lint as generated, the edits its `Next:` output lists make its
-mechanism drivable, and a name that cannot be a robot is refused."""
+mechanism drivable, and a name that cannot be a robot is refused.
+
+With --standalone (RobotRepositoryTest), on a stand-in fixture: the
+repository is the fixture as TEMPLATE places it, a directory in talOS or
+already used is refused, and a fixture the template does not match refuses
+the copy. tools/check_robot_repo_scaffold.sh builds and tests what it makes
+of the real fixture, which a Bazel test cannot read (.bazelignore)."""
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -290,6 +297,214 @@ class NewRobotTest(unittest.TestCase):
                                         "outside the workspace"):
                 new_robot.plan(root, "my_robot", "wrist", "py", parent="..")
             self.assertEqual(os.listdir(root), ["taken"])
+
+
+FIXTURE_MODULE = '''module(
+    name = "robot",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "talos", version = "0.1.0")
+local_path_override(
+    module_name = "talos",
+    path = "../..",
+)
+
+studio_web(
+    name = "studio_web",
+    path = "../../bazel-bin/studio/dist",
+)
+'''
+
+FIXTURE_ROBOT = '''[robot]
+name = "robot_repo"
+hardware_node = "@talos//talOS/bridge:hardware_node"
+
+[[subsystems]]
+name = "teleop"
+path = "subsystems/teleop.toml"
+
+[[subsystems]]
+name = "telemetry"
+path = "subsystems/telemetry.toml"
+
+[[subsystems]]
+name = "roller"
+path = "subsystems/roller.toml"
+
+[[subsystems]]
+name = "gate"
+path = "subsystems/gate.toml"
+'''
+
+FIXTURE_MANIFEST = '''"""Generated from robot.toml by @talos//tools:sync_manifest. Do not edit.
+
+Regenerate after changing the config:
+
+    bazel run @talos//tools:sync_manifest -- robot.toml
+"""
+
+# Every node label robot.toml launches.
+NODES = [
+    "//gate:node",
+    "//roller:node",
+    "@talos//talOS/telemetry:node",
+    "@talos//talOS/teleop:node",
+]
+
+# Every file robot.toml reads besides itself.
+CONFIG_FILES = [
+    "//:subsystems/gate.toml",
+    "//:subsystems/roller.toml",
+    "//:subsystems/telemetry.toml",
+    "//:subsystems/teleop.toml",
+]
+'''
+
+
+def subsystem(name, node):
+    return (f'[subsystem]\nname = "{name}"\nnode = "{node}"\n'
+            "period_us = 20000\n")
+
+
+def fake_talos(tmp):
+    """A talOS checkout at tmp/talos whose examples/robot_repo has a file at
+    every TEMPLATE entry, shaped as the real fixture's where new_robot
+    substitutes; returns (checkout, fixture)."""
+    talos = os.path.join(tmp, "talos")
+    fixture = os.path.join(talos, new_robot.FIXTURE)
+    files = {
+        "MODULE.bazel": FIXTURE_MODULE,
+        "robot.toml": FIXTURE_ROBOT,
+        "robot_manifest.bzl": FIXTURE_MANIFEST,
+        "subsystems/teleop.toml": subsystem("teleop",
+                                            "@talos//talOS/teleop:node"),
+        "subsystems/telemetry.toml": subsystem(
+            "telemetry", "@talos//talOS/telemetry:node"),
+        "subsystems/roller.toml": subsystem("roller", "//roller:node"),
+        "subsystems/gate.toml": subsystem("gate", "//gate:node"),
+    }
+    for key in new_robot.TEMPLATE:
+        path = key + "BUILD.bazel" if key.endswith("/") else key
+        files.setdefault(path, f"# {path}\n")
+    for path, content in files.items():
+        write(os.path.join(fixture, path), content)
+    return talos, fixture
+
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+class RobotRepositoryTest(unittest.TestCase):
+    """--standalone: a robot repository copied from talOS's fixture."""
+
+    # REQ-DEV-23, REQ-DEV-30
+    def test_repository_is_the_fixture_without_its_mechanisms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            talos, fixture = fake_talos(tmp)
+            target = os.path.join(tmp, "robots", "my_robot")
+            files = {rel_path(target, path): content for path, content in
+                     new_robot.plan_repository(talos, target, "my_robot")}
+            self.assertEqual(sorted(files), [
+                ".bazelrc", ".bazelversion", ".gitignore", "BUILD.bazel",
+                "MODULE.bazel", "README.md", "robot.toml",
+                "robot_manifest.bzl", "studio_test.py",
+                "subsystems/telemetry.toml", "subsystems/teleop.toml"])
+            for path, action in new_robot.TEMPLATE.items():
+                if action == new_robot.COPY:
+                    with open(os.path.join(fixture, path),
+                              encoding="utf-8") as f:
+                        self.assertEqual(files[path], f.read(), path)
+            # @talos and Studio's pages are the checkout's, from the new
+            # repository's directory.
+            module = files["MODULE.bazel"]
+            self.assertIn('name = "my_robot"', module)
+            override, pages = re_paths(module)
+            self.assertEqual(
+                os.path.normpath(os.path.join(target, override)), talos)
+            self.assertEqual(
+                os.path.normpath(os.path.join(target, pages)),
+                os.path.join(talos, "bazel-bin", "studio", "dist"))
+            self.assertIn('name = "my_robot"', files["robot.toml"])
+            for gone in ("roller", "gate"):
+                self.assertNotIn(gone, files["robot.toml"])
+                self.assertNotIn(gone, files["robot_manifest.bzl"])
+            # What the repository's manifest_sync_test checks.
+            for path, content in files.items():
+                write(os.path.join(target, path), content)
+            nodes, read = sync_manifest.resolve(target, "robot.toml")
+            self.assertEqual(nodes, ["@talos//talOS/telemetry:node",
+                                     "@talos//talOS/teleop:node"])
+            self.assertEqual(sorted(read), ["subsystems/telemetry.toml",
+                                            "subsystems/teleop.toml"])
+
+    # REQ-DEV-23
+    def test_refuses_a_bad_name_a_directory_in_talos_or_a_used_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            talos, _ = fake_talos(tmp)
+            used = os.path.join(tmp, "used")
+            write(os.path.join(used, "notes.txt"), "mine\n")
+            free = os.path.join(tmp, "free")
+            cases = (
+                ("My_robot", free, "robot name"),
+                ("hw", free, "robot name"),
+                ("my_robot", talos, "inside the talOS checkout"),
+                ("my_robot", os.path.join(talos, "robots", "my_robot"),
+                 "inside the talOS checkout"),
+                ("my_robot", used, "not empty"),
+                ("my_robot", os.path.join(used, "notes.txt"), "not empty"),
+            )
+            for name, target, why in cases:
+                with self.subTest(name=name, target=target):
+                    with self.assertRaisesRegex(new_subsystem.Refused, why):
+                        new_robot.plan_repository(talos, target, name)
+            self.assertFalse(os.path.exists(free))
+            self.assertFalse(os.path.exists(os.path.join(talos, "robots")))
+
+    # REQ-DEV-23
+    def test_a_fixture_the_template_does_not_match_refuses_the_copy(self):
+        # The template is the fixture: a file it does not place, a place
+        # the fixture lost, or a line a substitution no longer finds stops
+        # the copy, naming the path, before anything is written.
+        def add(fixture, path):
+            write(os.path.join(fixture, path), "# new\n")
+
+        def remove(fixture, path):
+            os.remove(os.path.join(fixture, path))
+
+        def edit_module(fixture, path):
+            edit(os.path.join(fixture, path),
+                 [('    path = "../..",\n', '    path = "../../..",\n')])
+
+        cases = (
+            (add, "intake/BUILD.bazel"),
+            (add, "talos_test.py"),
+            (add, "subsystems/intake.toml"),
+            (remove, "studio_test.py"),
+            (edit_module, "MODULE.bazel"),
+        )
+        for change, path in cases:
+            with self.subTest(change=change.__name__, path=path), \
+                    tempfile.TemporaryDirectory() as tmp:
+                talos, fixture = fake_talos(tmp)
+                change(fixture, path)
+                target = os.path.join(tmp, "my_robot")
+                with self.assertRaisesRegex(new_subsystem.Refused,
+                                            re.escape(path)):
+                    new_robot.plan_repository(talos, target, "my_robot")
+                self.assertFalse(os.path.exists(target))
+
+
+def rel_path(base, path):
+    return os.path.relpath(path, base).replace(os.sep, "/")
+
+
+def re_paths(module):
+    """The local_path_override and studio_web paths of a MODULE.bazel."""
+    return re.findall(r'^    path = "([^"]*)",$', module, re.MULTILINE)
 
 
 if __name__ == "__main__":

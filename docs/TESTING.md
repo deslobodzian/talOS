@@ -298,7 +298,10 @@ packages (`tools/scaffold_testdata/*`) are the reference, checked by
 (`check_node_matrix_test` **[enforced]**). What it writes into a robot
 repository builds and passes `bazel test //...` there, with and without
 target coverage required (`tools/check_robot_repo_scaffold.sh`, in a copy
-of `examples/robot_repo`) **[enforced: CI's dependent-repositories job and
+of `examples/robot_repo`), and in the repository
+`bazel run //tools:new_robot -- <name> --standalone DIR` makes of that
+fixture, which also fails when the fixture has a file `new_robot`'s
+template does not place **[enforced: CI's dependent-repositories job and
 `tools/prepush.sh`]**.
 
 ## 8. Flakes

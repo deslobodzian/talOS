@@ -11,7 +11,7 @@ Terms: [docs/GLOSSARY.md](docs/GLOSSARY.md).
 
 **Adding a mechanism (a student).**
 
-1. [Install](docs/INSTALL.md), then [your first mechanism](docs/FIRST_MECHANISM.md): clone to a simulated mechanism.
+1. [Install](docs/INSTALL.md), then [your first mechanism](docs/FIRST_MECHANISM.md): from a talOS clone to a robot repository of your own with a mechanism moving in simulation and in Studio.
 2. [Glossary](docs/GLOSSARY.md), when a word is new.
 3. [Node anatomy](docs/METHODOLOGY.md#2-anatomy-of-a-node) and [units](docs/METHODOLOGY.md#6-units).
 4. [examples/superstructure](examples/superstructure/README.md): three mechanisms that cooperate.
@@ -59,8 +59,11 @@ change is made and verified: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 ./sim.sh --sim-gateway --no-studio   # lightweight simulator, no WPILib needed
 ./sim.sh                             # WPILib simulation of the RoboRIO + Studio
 ./sim.sh --help
-./sim.sh --config my_robot/main_processor/configuration/robot.toml --sim-gateway --no-studio  # another robot
+./sim.sh --config my_robot/main_processor/configuration/robot.toml --sim-gateway --no-studio  # another robot inside talOS
 ```
+
+A team's robot lives in its own repository and runs there with
+`bazel run //:sim` ([docs/FIRST_MECHANISM.md](docs/FIRST_MECHANISM.md)).
 
 Check a robot's graph without starting it:
 

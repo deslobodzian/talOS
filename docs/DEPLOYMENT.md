@@ -26,7 +26,10 @@ subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
 (`//studio:web_dist`, the built site), both or neither; the build fails when
 `studio_bridge` is not the config's `[studio] bridge` (when it sets one) or
 the site has no `index.html`. The 2026 robot, the bench rig and
-`tools/new_robot`'s scaffold set both, which add about 2.5 MB. It writes
+`tools/new_robot`'s robots inside talOS set both, which add about 2.5 MB; a
+robot repository's (`new_robot --standalone`) sets neither until it builds
+the pages ([examples/robot_repo](../examples/robot_repo/README.md#studio)).
+It writes
 `bazel-bin/2026-robot/main_processor/robot_bundle/`:
 
 | Entry | What |

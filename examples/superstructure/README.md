@@ -258,20 +258,18 @@ between them. The control can be a
 `cpp/elevator.h` and `cpp/intake.h` (the library's README has a minimal
 node), or your own code driving the node's `Motor` directly: the library
 is an optional helper
-([the library, or your own code](../../docs/FIRST_MECHANISM.md#6-position-mechanisms-the-library-or-your-own-code)).
+([the library, or your own code](../../docs/FIRST_MECHANISM.md#9-position-mechanisms-the-library-or-your-own-code)).
 
-Generate a robot of your own whose first mechanism is a position-controlled
-wrist, from the repo root:
+Give a robot repository of your own
+([first mechanism](../../docs/FIRST_MECHANISM.md#2-make-your-robot-repository))
+a position-controlled wrist, from that repository's root:
 
 ```sh
-bazel run //tools:new_robot -- my_robot --mechanism wrist --lang cpp --type position
+bazel run @talos//tools:new_subsystem -- wrist --lang cpp --type position
 ```
 
-To add the wrist to a robot that exists, run
-`bazel run //tools:new_subsystem -- wrist --lang cpp --type position --robot my_robot`
-instead. Do not scaffold into `2026-robot`, the project's testbed: its graph
-is full ([first mechanism](../../docs/FIRST_MECHANISM.md#2-make-your-robot)).
-`--dry-run` inspects the changes without writing them. Use `--lang py` for a
+Do not scaffold into `2026-robot`, the project's testbed: its graph is
+full. `--dry-run` inspects the changes without writing them. Use `--lang py` for a
 Python implementation. Omitting `--type position` generates a velocity
 mechanism, not an angle-controlled wrist. With `new_subsystem`, adding
 `--raw` to `--type position` writes the wrist's homing and limits in
@@ -279,7 +277,7 @@ mechanism, not an angle-controlled wrist. With `new_subsystem`, adding
 ([writing the arm yourself](../../docs/FIRST_MECHANISM.md#writing-the-arm-yourself));
 the rest of this section describes the library version.
 
-The generator writes `my_robot/main_processor/wrist/`:
+The generator writes `wrist/`:
 
 ```text
 BUILD
@@ -306,9 +304,8 @@ home switch, `wrist_home`, at the reverse end of travel that zeroes it,
 `position_frame = "rezero"` holding its goals until then, and goals clamped
 to `min_rot..max_rot`; the motor has no hardware soft limits.
 
-The subsystem file is
-`my_robot/main_processor/configuration/subsystems/wrist.toml`: it contains
-`node = "//my_robot/main_processor/wrist:node"`, a 20000 µs node period,
+The subsystem file is `subsystems/wrist.toml`: it contains
+`node = "//wrist:node"`, a 20000 µs node period,
 the mechanism's `[wrist]` parameter table, a TalonFX with the lowest unused
 CAN id in `1..62` and a home switch with the lowest unused DIO channel in
 `0..31`, both explicitly marked as placeholders. The rest of its homing
@@ -316,21 +313,21 @@ setup is placeholder too: `max_rot = 0.001` confines every target to within
 0.001 rotations of the switch until you set the measured travel, and
 `homing_v = -0.5` (with `homing_timeout_us`, 3 s by default) needs its
 direction checked before the first enable. The generator appends the
-subsystem name and path to `configuration/robot.toml` and regenerates that
-config's manifest plus manifests of configs that include it.
-`./sim.sh --config my_robot/main_processor/configuration/robot_sim.toml --sim-gateway`
-runs the robot in simulation. `robot_sim.toml` is the simulation-only config
-`new_robot` writes: it includes `robot.toml`, which never reads it back. The
-wrist moves there only after you append the block the generator's `Next:`
-output prints to it: a teleop binding on button 3 (`position_rot = 1.0`), a
+subsystem name and path to `robot.toml` and regenerates that config's
+manifest plus manifests of configs that include it. In simulation the robot
+runs `robot_sim.toml`, the simulation-only config, which includes
+`robot.toml`, which never reads it back; the generator's `Next:` prints it
+(or, once it exists, the block to append to it), its manifest command and
+the launcher command that runs it. The wrist moves there only with that
+block: on a robot with no other binding, a teleop binding on button 3 (`position_rot = 1.0`), a
 `[targets]` override for an autonomous policy with no writer, a simulated
 travel (`max_rot`), a simulated home switch on `wrist_home` that closes just
 below where the motor starts (`sim_motor`, `sim_closed_at_rot`; see
 [the hardware README](../../talOS/hardware/README.md)), so homing drives to
 it, and simulated `slot0` gains.
 `subsystems/wrist.toml` keeps its binding commented and its gains zero, so
-none of these values reaches the robot. `Next:` also prints the `sim.sh`
-command that holds button 3.
+none of these values reaches the robot. `Next:`'s launcher command holds
+button 3 from second 3 to second 6.
 
 The Python variant puts `wrist.py` and `node_test.py` in the same package,
 not in a separate `py/` directory. It uses the same schema, `:node` target

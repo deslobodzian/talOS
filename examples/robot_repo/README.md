@@ -10,7 +10,19 @@ It holds a C++ node (`roller/`) and a Python node (`gate/`), written as
 `@talos//tools:new_subsystem` writes them, each with its Sim test, plus talOS's
 teleop and telemetry nodes, all listed in `robot.toml`. talOS's own
 `bazel build //...` skips this directory (`.bazelignore`); it is a separate
-workspace.
+workspace. `talos_checks/` checks talOS itself from a dependent repository
+(`session_report` on a session talOS's fixture records), nothing of this
+robot's.
+
+It is also the template of a team's robot repository:
+`bazel run //tools:new_robot -- <name> --standalone DIR`, from a talOS
+checkout, copies it to DIR as `TEMPLATE` in `tools/new_robot.py` places each
+file, without `roller/`, `gate/` and `talos_checks/`, naming the new robot
+and pointing `@talos` at that checkout
+([docs/FIRST_MECHANISM.md](../../docs/FIRST_MECHANISM.md) walks it). A file
+added here that `TEMPLATE` does not place makes `new_robot` refuse, which
+`tools/check_robot_repo_scaffold.sh` (prepush and CI) catches, so changing
+this fixture means saying there whether a robot repository gets the file.
 
 ```sh
 cd examples/robot_repo
@@ -54,9 +66,10 @@ that list a lane, and with none the node stays neutral. Listing
 `teleop = ["teleop"]` there goes with uncommenting its teleop binding. This
 fixture does not require coverage, so its file keeps `[targets]` commented
 and `[robot.targets]` applies. `tools/check_robot_repo_scaffold.sh`
-(prepush and CI) holds both cases: it scaffolds a C++ and a Python
-subsystem into a copy of this fixture, as it is and with coverage required,
-and runs `bazel test //...` there.
+(prepush and CI) holds both cases, and the repository `new_robot` makes: it
+scaffolds a C++ and a Python subsystem into a copy of this fixture, as it is
+and with coverage required, and into `new_robot --standalone`'s copy of it,
+and runs `bazel test //...` in each.
 
 ## Simulation
 

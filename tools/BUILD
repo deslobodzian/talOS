@@ -43,6 +43,9 @@ py_test(
     deps = [":sync_manifest_lib"],
 )
 
+# bazel run //tools:new_robot -- <name> --standalone DIR
+# Creates DIR, outside this checkout, as a robot repository depending on
+# talOS: a copy of examples/robot_repo as new_robot.py's TEMPLATE places it.
 # bazel run //tools:new_robot -- <name> --mechanism M --lang cpp|py [--dir DIR]
 # Writes a robot beside 2026-robot/: its configuration (teleop, telemetry),
 # generated manifest, graph test and bundle, and its first mechanism through

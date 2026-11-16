@@ -1,7 +1,7 @@
-# A robot in its own repository, written as //tools:new_robot writes one,
-# naming talOS's programs by @talos// labels. The robot's only list of nodes
-# is [[subsystems]] below; after adding or removing an entry, regenerate
-# robot_manifest.bzl:
+# A robot in its own repository, naming talOS's programs by @talos// labels
+# (talOS's `//tools:new_robot --standalone` starts one from a copy of this
+# file). The robot's only list of nodes is [[subsystems]] below; after
+# adding or removing an entry, regenerate robot_manifest.bzl:
 #   bazel run @talos//tools:sync_manifest -- robot.toml
 [robot]
 name = "robot_repo"
