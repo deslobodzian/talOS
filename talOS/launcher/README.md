@@ -1396,6 +1396,18 @@ hardware packets of a session recorded under its own hardware protocol
 (`protocol::kProtocolVersion`;
 [DATA_FLOW.md](../../docs/DATA_FLOW.md)).
 
+<a id="replay-after-a-schema-change"></a>Reading is not replaying:
+`--replay-inputs` feeds a node a topic only when the node reads it as the
+schema the session recorded, hash included, and otherwise refuses the
+session naming the topic and both schemas
+([input replay](../events/README.md#replaying-another-sessions-inputs)).
+So adding a field to any message a replayed node subscribes to makes every
+session recorded before the change unreplayable into that node by a later
+build; replay such a session with the build that recorded it (a stamped
+bundle's session names its `git_revision`). For `/hw/status`
+(`bridge.BridgeStatus`), which every node with devices reads through
+`HardwareLink`, that is every node with devices.
+
 The packets do not say which version they are of (a recorded Packet holds
 a frame's payload without its header, and its schema identity hashes only
 its size). A session records it twice: the bridge puts its own build's
