@@ -4,18 +4,25 @@
 # repository: in a copy of examples/robot_repo (the fixture is never
 # modified), it scaffolds a C++ and a Python subsystem and runs
 # `bazel test //...`, the graph test, node tests and sim smoke test included.
-# REQ-DEV-01, REQ-DEV-30.
+# REQ-DEV-01, REQ-DEV-23, REQ-DEV-30.
 #
 #   tools/check_robot_repo_scaffold.sh [BAZEL_FLAG...]
 #
-# Two variants run in one copy, reset between them:
-#   plain     the fixture as it is (target coverage not required);
-#   coverage  [robot] require_target_coverage = true set before scaffolding,
-#             as a commissioned robot resolves it. The fixture's own
-#             mechanisms (roller, gate) have no producer, so that variant
-#             first gives each the empty [targets] policy the scaffold
-#             writes under coverage; otherwise their lanes fail the lint
-#             before the scaffold is judged.
+# Three variants run in one copy, reset between them:
+#   plain      the fixture as it is (target coverage not required);
+#   coverage   [robot] require_target_coverage = true set before scaffolding,
+#              as a commissioned robot resolves it. The fixture's own
+#              mechanisms (roller, gate) have no producer, so that variant
+#              first gives each the empty [targets] policy the scaffold
+#              writes under coverage; otherwise their lanes fail the lint
+#              before the scaffold is judged;
+#   new_robot  the repository `new_robot --standalone` makes of the fixture
+#              (it refuses a fixture file its TEMPLATE does not place)
+#              replaces the copy's files: run as @talos//tools:new_robot in
+#              the copy, whose output base has built it, into a sibling
+#              directory, then moved into the copy's path so that the
+#              build reuses that output base (its talOS path, relative to
+#              a sibling or absolute, holds there too).
 # The copy's MODULE.bazel points @talos (and studio_web) at the talOS
 # checkout holding this script. BAZEL_FLAGs go to every `bazel run` and
 # `bazel test` (tools/prepush.sh passes its --disk_cache and
@@ -26,7 +33,7 @@
 # On every exit its Bazel server is shut down and the copy removed. Each
 # phase prints its time.
 #
-# Exit: 0 both variants passed, 1 a phase failed, 2 usage or setup error.
+# Exit: 0 every variant passed, 1 a phase failed, 2 usage or setup error.
 set -uo pipefail
 
 die() { echo "scaffold-check: $*" >&2; exit 2; }
@@ -41,6 +48,7 @@ fixture="$talos/examples/robot_repo"
 tmp="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" ||
   die "TMPDIR is not a directory: ${TMPDIR:-/tmp}"
 copy="$tmp/talos-scaffold-check-$(id -u)"
+fresh="$tmp/talos-scaffold-new-$(id -u)"
 lock="$copy.lock"
 start=$SECONDS
 
@@ -71,6 +79,7 @@ cleanup() {
     (cd "$copy" && bazel shutdown >/dev/null 2>&1)
   fi
   remove_copy
+  rm -rf "$fresh"
   rm -rf "$lock"
 }
 trap cleanup EXIT
@@ -128,19 +137,32 @@ require_coverage() {
   done
 }
 
+# The repository new_robot makes, in place of the fixture copy's files.
+new_robot() {
+  rm -rf "$fresh" &&
+    bazel run ${bazel_flags[@]+"${bazel_flags[@]}"} @talos//tools:new_robot -- \
+      my_robot --standalone "$fresh" || return 1
+  find "$copy" -mindepth 1 -maxdepth 1 ! -name 'bazel-*' -exec rm -rf {} + &&
+    (cd "$fresh" && tar -cf - .) | (cd "$copy" && tar -xf -) &&
+    rm -rf "$fresh"
+}
+
 scaffold() {  # scaffold NAME LANG
   bazel run ${bazel_flags[@]+"${bazel_flags[@]}"} @talos//tools:new_subsystem -- "$1" --lang "$2"
 }
 
-for variant in plain coverage; do
+for variant in plain coverage new_robot; do
   reset_copy
   if [ "$variant" = coverage ]; then
     phase "$variant: require target coverage" require_coverage
   fi
   bazel_started=1
+  if [ "$variant" = new_robot ]; then
+    phase "$variant: new_robot --standalone" new_robot
+  fi
   phase "$variant: scaffold intake (cpp)" scaffold intake cpp
   phase "$variant: scaffold feeder (py)" scaffold feeder py
   phase "$variant: bazel test //..." \
     bazel test --test_output=errors ${bazel_flags[@]+"${bazel_flags[@]}"} //...
 done
-echo "scaffold-check: both variants passed in $((SECONDS - start)) s"
+echo "scaffold-check: every variant passed in $((SECONDS - start)) s"

@@ -1,5 +1,21 @@
-"""Scaffolds a talos robot, a sibling of 2026-robot/, with its first
-mechanism or with none.
+"""Starts a talos robot: its own repository, or a sibling of 2026-robot/.
+
+    bazel run //tools:new_robot -- <name> --standalone DIR [--dry-run]
+
+creates DIR, outside this talOS checkout, as a robot repository that depends
+on talOS as @talos: a copy of examples/robot_repo, the fixture talOS's CI
+builds and tests, as TEMPLATE below places each of its files. Only what must
+differ is substituted: the module and robot name, and where talOS is (a
+`local_path_override` to this checkout, relative to DIR unless the two share
+only the filesystem's root, and Studio's built pages under it). DIR is
+relative to the directory bazel runs from. The fixture's example mechanisms and its checks of talOS
+itself are left out, so the robot starts with the hardware bridge, teleop
+and telemetry; `bazel run @talos//tools:new_subsystem` adds a mechanism
+there. A fixture file TEMPLATE does not place refuses the copy, so the
+template cannot drift from the fixture. It writes a README and .gitignore
+of its own, runs no git command, and prints the next commands.
+
+Inside talOS (the layout of 2026-robot/, which talOS's own tests use):
 
     bazel run //tools:new_robot -- <name> --mechanism <mech> --lang cpp|py \\
         [--type velocity|position] [--dir DIR] [--dry-run]
@@ -41,8 +57,10 @@ resolver in Bazel runfiles, so `python3 tools/new_robot.py` fails with
 """
 
 import argparse
+import difflib
 import os
 import posixpath
+import re
 import sys
 import tempfile
 
@@ -344,42 +362,371 @@ Next:
     bazel run //tools:new_subsystem -- <name> --lang cpp|py --robot {robot}"""
 
 
+# --standalone: the fixture a robot repository is copied from, relative to
+# the talOS checkout.
+FIXTURE = "examples/robot_repo"
+
+COPY = "copy"
+SUBSTITUTE = "substitute"
+REPLACE = "replace"
+LEAVE_OUT = "leave out"
+
+# Every path of the fixture, and what a new robot repository takes of it. A
+# key ending in "/" is a directory and everything under it. A fixture file
+# no key covers, or a key the fixture no longer has, refuses the copy.
+TEMPLATE = {
+    ".bazelrc": COPY,
+    ".bazelversion": COPY,
+    "BUILD.bazel": COPY,
+    # The module name, and talOS's checkout and its Studio pages' folder.
+    "MODULE.bazel": SUBSTITUTE,
+    # [robot] name; the left-out mechanisms' [[subsystems]] entries go.
+    "robot.toml": SUBSTITUTE,
+    # The left-out mechanisms' nodes and files go; the rest is checked
+    # against the configuration resolver.
+    "robot_manifest.bzl": SUBSTITUTE,
+    # The fixture's describes the fixture; the robot gets REPOSITORY_README.
+    "README.md": REPLACE,
+    # //:sim with Studio's bridge serves /drive: the robot's own Studio
+    # wiring (robot.toml's [studio] webroot, //:sim's data).
+    "studio_test.py": COPY,
+    "subsystems/teleop.toml": COPY,
+    "subsystems/telemetry.toml": COPY,
+    # The fixture's example mechanisms: the robot gets the mechanisms its
+    # team scaffolds and writes, with the first free CAN id and button.
+    "gate/": LEAVE_OUT,
+    "roller/": LEAVE_OUT,
+    "subsystems/gate.toml": LEAVE_OUT,
+    "subsystems/roller.toml": LEAVE_OUT,
+    # Checks of talOS from a dependent repository (session_report on
+    # talOS's recorded fixture session), nothing of the robot's.
+    "talos_checks/": LEAVE_OUT,
+}
+
+# What a build in the fixture leaves there; never part of the template.
+BUILD_LEFTOVERS = ("MODULE.bazel.lock",)
+
+REPOSITORY_README = """\
+# @NAME@
+
+A talos robot in its own repository. talOS's
+`bazel run //tools:new_robot -- @NAME@ --standalone DIR` started it as a copy
+of talOS's `examples/robot_repo` without that fixture's example mechanisms:
+the hardware bridge, `teleop` and `telemetry` run, and nothing moves until
+you add a mechanism.
+
+| File | What it is |
+|---|---|
+| `robot.toml` | the robot: tick, timeouts, target policy, Studio, and `[[subsystems]]`, the only list of its nodes |
+| `subsystems/*.toml` | one file per subsystem: its node, period, devices and parameters |
+| `robot_manifest.bzl` | generated from `robot.toml` (`bazel run @talos//tools:sync_manifest -- robot.toml`); Bazel reads it because it cannot read TOML |
+| `BUILD.bazel` | `manifest_sync_test`, `graph_test`, `robot_bundle`, `//:sim` (the robot against the simulator), `sim_smoke_test`, `studio_test` |
+| `MODULE.bazel` | talOS as `@talos`, and where Studio's pages are |
+
+```sh
+bazel test //...                                              # every check above
+bazel run //:sim -- --duration-s 10                           # the robot in simulation for 10 s
+bazel run @talos//tools:new_subsystem -- <name> --lang cpp    # a mechanism (or --lang py)
+(cd @TALOS@ && bazel build //studio:web_dist)                 # Studio's pages, once per talOS version
+bazel run //:sim -- --start-studio-bridge                     # Studio at http://localhost:5800, /drive
+```
+
+The walkthrough is talOS's
+[docs/FIRST_MECHANISM.md](@TALOS@/docs/FIRST_MECHANISM.md).
+Device ids in subsystem files are placeholders until a person checks them
+at the robot and sets `commissioned = true`.
+
+## Where talOS comes from
+
+`MODULE.bazel` points `@talos` at the talOS checkout this repository was
+made from, `@TALOS@`, with
+`local_path_override`, and `studio_web` at the pages that checkout builds
+(`@TALOS@/bazel-bin/studio/dist`). Moving one directory without the other
+breaks both paths. Two other ways to hold talOS:
+
+- **A git submodule** (what a team's robot repository does): `git submodule
+  add <talOS URL> talos`, then `path = "talos"` in `local_path_override`
+  and `path = "talos/bazel-bin/studio/dist"` in `studio_web`. The
+  repository records the talOS commit it builds against, and a clone with
+  `--recurse-submodules` builds anywhere; Studio's pages are built with
+  `(cd talos && bazel build //studio:web_dist)`.
+- **`git_override`** in place of `local_path_override`:
+  `git_override(module_name = "talos", remote = "<talOS URL>", commit =
+  "<commit>")`. Bazel fetches talOS itself, but there is no checkout to
+  build Studio's pages in (`studio_web` then needs some other checkout's
+  folder, else Studio answers 503), and `new_subsystem --standalone`
+  refuses a fetched talOS.
+"""
+
+GITIGNORE = """\
+# Bazel's output links.
+/bazel-*
+"""
+
+
+def template_sources(fixture):
+    """{fixture-relative path: TEMPLATE action} of every file of the fixture
+    at `fixture`; refuses one TEMPLATE does not place, or a TEMPLATE key the
+    fixture no longer has."""
+    found = {}
+    unplaced = []
+    for current, dirs, files in os.walk(fixture):
+        relative = rel(fixture, current)
+        top = relative == "."
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__"
+                         and not (top and d.startswith("bazel-")))
+        for f in sorted(files):
+            if top and (f.startswith("bazel-") or f in BUILD_LEFTOVERS):
+                continue
+            if f.endswith(".pyc"):
+                continue
+            path = f if top else f"{relative}/{f}"
+            action = TEMPLATE.get(path)
+            if action is None:
+                action = next((TEMPLATE[key] for key in TEMPLATE
+                               if key.endswith("/") and path.startswith(key)),
+                              None)
+            if action is None:
+                unplaced.append(path)
+            else:
+                found[path] = action
+    if unplaced:
+        raise Refused(f"{FIXTURE} has {', '.join(unplaced)}, which "
+                      "TEMPLATE (tools/new_robot.py) does not place; say "
+                      "there whether a robot repository copies it")
+    missing = [key for key in TEMPLATE
+               if not any(path == key or (key.endswith("/")
+                                          and path.startswith(key))
+                          for path in found)]
+    if missing:
+        raise Refused(f"TEMPLATE (tools/new_robot.py) places "
+                      f"{', '.join(missing)}, which {FIXTURE} no longer has")
+    return found
+
+
+def left_out(path):
+    """Whether TEMPLATE leaves fixture `path` (a file, or a node package's
+    path such as `gate/node`) out of a robot repository."""
+    return any(path == key or (key.endswith("/") and path.startswith(key))
+               for key, action in TEMPLATE.items() if action == LEAVE_OUT)
+
+
+def replace_once(path, text, old, new):
+    count = text.count(old) if isinstance(old, str) else len(
+        old.findall(text))
+    if count != 1:
+        shown_old = old if isinstance(old, str) else old.pattern
+        raise Refused(f"{FIXTURE}/{path} holds {count} copies of "
+                      f"{shown_old!r}, not one; update TEMPLATE's "
+                      "substitutions (tools/new_robot.py)")
+    if isinstance(old, str):
+        return text.replace(old, new)
+    return old.sub(new, text)
+
+
+def substitute(path, text, name, talos):
+    """The fixture's `path` as robot `name`'s repository holds it, with
+    talOS's checkout at `talos` relative to it."""
+    if path == "MODULE.bazel":
+        text = replace_once(path, text, 'module(\n    name = "robot",\n',
+                            f'module(\n    name = "{name}",\n')
+        text = replace_once(path, text, '    path = "../..",\n',
+                            f'    path = "{talos}",\n')
+        return replace_once(path, text,
+                            '    path = "../../bazel-bin/studio/dist",\n',
+                            f'    path = "{talos}/bazel-bin/studio/dist",\n')
+    if path == "robot.toml":
+        text = replace_once(path, text, '\nname = "robot_repo"\n',
+                            f'\nname = "{name}"\n')
+        for subsystem in sorted(TEMPLATE):
+            if (subsystem.startswith("subsystems/")
+                    and TEMPLATE[subsystem] == LEAVE_OUT):
+                entry = re.compile(
+                    r'\n\[\[subsystems\]\]\nname = "[a-z0-9_]+"\n'
+                    f'path = "{re.escape(subsystem)}"\n')
+                text = replace_once(path, text, entry, "")
+        return text
+    if path == "robot_manifest.bzl":
+        def kept(line):
+            match = re.fullmatch(r'    "(//[^"]*)",\n', line)
+            return not (match and left_out(
+                sync_manifest.label_path(match[1])))
+        return "".join(line for line in text.splitlines(keepends=True)
+                       if kept(line))
+    raise AssertionError(f"TEMPLATE substitutes {path}, which substitute() "
+                         "does not handle")
+
+
+def check_manifest(files):
+    """Refuses unless `files`' robot_manifest.bzl lists exactly what its
+    robot.toml reads, as the repository's manifest_sync_test will check
+    (its regenerate command, @talos//, is the repository's)."""
+    manifest = files["robot_manifest.bzl"]
+    known = {sync_manifest.label_path(lbl): lbl
+             for lbl in sync_manifest.listed_labels(manifest)}
+    with tempfile.TemporaryDirectory() as scratch:
+        for path, content in files.items():
+            full = os.path.join(scratch, path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(content)
+        try:
+            nodes, read = sync_manifest.resolve(scratch, "robot.toml",
+                                                available=set(known))
+        except (sync_manifest.ManifestError, sync_manifest.Stale) as err:
+            raise Refused(f"the copied robot.toml does not resolve: {err}")
+    expected = sync_manifest.render("robot.toml", nodes,
+                                    [known[path] for path in read])
+    # Past the docstring, which names the regenerate command.
+    body = manifest.split('"""\n', 2)[-1]
+    if expected.split('"""\n', 2)[-1] != body:
+        diff = "".join(difflib.unified_diff(
+            body.splitlines(keepends=True),
+            expected.split('"""\n', 2)[-1].splitlines(keepends=True),
+            "robot_manifest.bzl (copied)", "robot_manifest.bzl (robot.toml)"))
+        raise Refused("the copied robot_manifest.bzl does not match its "
+                      f"robot.toml; update TEMPLATE (tools/new_robot.py):\n"
+                      f"{diff}")
+
+
+def plan_repository(talos_root, target_dir, name, fixture=None):
+    """[(path, content)] of robot `name`'s repository at `target_dir`,
+    copied from the fixture (default: `talos_root`'s), naming the talOS
+    checkout at `talos_root`."""
+    if problem := check_robot_name(name):
+        raise Refused(problem)
+    talos_real = os.path.realpath(talos_root)
+    target = os.path.realpath(target_dir)
+    if target == talos_real or target.startswith(talos_real + os.sep):
+        raise Refused(f"{target_dir} is inside the talOS checkout "
+                      f"{talos_real}; a robot repository is a workspace "
+                      "of its own, outside it")
+    if os.path.lexists(target) and (not os.path.isdir(target)
+                                    or os.listdir(target)):
+        raise Refused(f"{target_dir} already exists and is not empty")
+    fixture = fixture or os.path.join(talos_real, FIXTURE)
+    # Relative, so the two directories can move together, as
+    # new_subsystem --standalone writes it; absolute when the only common
+    # ancestor is the filesystem's root.
+    talos = (talos_real if os.path.dirname(os.path.commonpath(
+        [talos_real, target])) == os.path.commonpath([talos_real, target])
+        else os.path.relpath(talos_real, target).replace(os.sep, "/"))
+    files = {}
+    for path, action in template_sources(fixture).items():
+        if action in (LEAVE_OUT, REPLACE):
+            continue
+        with open(os.path.join(fixture, path), encoding="utf-8") as f:
+            text = f.read()
+        if action == SUBSTITUTE:
+            text = substitute(path, text, name, talos)
+        files[path] = text
+    files["README.md"] = fill(REPOSITORY_README, NAME=name, TALOS=talos)
+    files[".gitignore"] = GITIGNORE
+    check_manifest(files)
+    return [(os.path.join(target, path), content)
+            for path, content in sorted(files.items())]
+
+
+def repository_next_steps(target, talos):
+    """The commands after --standalone: `target`, the new repository, and
+    `talos`, the talOS checkout, as the person typed or sees them."""
+    return f"""\
+Next:
+  cd {target}
+  bazel test //...                      # graph, manifest, simulation and Studio checks
+  bazel run //:sim -- --duration-s 10   # the robot against the simulator for 10 s
+  Add a mechanism, then write its node (docs/FIRST_MECHANISM.md):
+    bazel run @talos//tools:new_subsystem -- <name> --lang cpp|py
+  Studio: its pages are built in the talOS checkout, once and after each talOS
+  update; until then / and /drive answer 503 with the build command (it reads
+  `cd talos`; here the checkout is {talos}):
+    (cd {talos} && bazel build //studio:web_dist)
+    bazel run //:sim -- --start-studio-bridge   # http://localhost:5800, /drive
+  Nothing is under version control yet: `git init` when you want it
+  (README.md: talOS as a submodule)."""
+
+
+def main_repository(args):
+    try:
+        talos_root = new_subsystem.talos_checkout(__file__)
+        if talos_root is None:
+            raise Refused("the talOS this tool runs from is Bazel's copy of a "
+                          "fetched module, not a checkout a robot repository "
+                          "can point at; run it from a talOS checkout")
+        base = (os.environ.get("BUILD_WORKING_DIRECTORY")
+                or os.environ["BUILD_WORKSPACE_DIRECTORY"])
+        target = os.path.join(base, os.path.expanduser(args.standalone))
+        writes = plan_repository(talos_root, target, args.name)
+    except Refused as refused:
+        print(f"new_robot: refused: {refused}", file=sys.stderr)
+        return 1
+    target = os.path.abspath(target)
+    if args.dry_run:
+        new_subsystem.show(target, [(p, None, c) for p, c in writes])
+    else:
+        for path, content in writes:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+            print(f"wrote {path}")
+    print(repository_next_steps(target, talos_root))
+    return 0
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         prog="bazel run //tools:new_robot --",
-        description="Scaffold a talos robot with its first mechanism, or "
-        "none: configuration, manifest, graph test and bundle.")
-    parser.add_argument("name", help="robot name and directory, e.g. "
-                        "my_robot (talOS/NAMING.md node-name rules)")
-    first = parser.add_mutually_exclusive_group(required=True)
+        description="Start a talos robot: its own repository (--standalone), "
+        "or a robot inside talOS with its first mechanism or none: "
+        "configuration, manifest, graph test and bundle.")
+    parser.add_argument("name", help="robot name, e.g. my_robot "
+                        "(talOS/NAMING.md node-name rules)")
+    first = parser.add_mutually_exclusive_group()
+    first.add_argument("--standalone", metavar="DIR",
+                       help="create DIR, outside this checkout, as a robot "
+                       "repository that depends on talOS (relative to the "
+                       "directory you run bazel from)")
     first.add_argument("--mechanism",
-                       help="its first mechanism, as new_subsystem's name")
+                       help="inside talOS: its first mechanism, as "
+                       "new_subsystem's name")
     first.add_argument("--no-mechanism", action="store_true",
-                       help="no mechanism and no device: the hardware "
-                       "bridge, teleop and telemetry only")
+                       help="inside talOS: no mechanism and no device: the "
+                       "hardware bridge, teleop and telemetry only")
     parser.add_argument("--lang", choices=("cpp", "py"),
                         help="the mechanism's language (with --mechanism)")
     parser.add_argument("--type", dest="kind",
                         choices=KINDS,
                         help="the mechanism's archetype (default: velocity)")
-    parser.add_argument("--dir", default=".",
-                        help="directory to create the robot in, relative to "
-                        "the workspace root (default: the root)")
+    parser.add_argument("--dir",
+                        help="inside talOS: directory to create the robot "
+                        "in, relative to the workspace root (default: the "
+                        "root)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every file without writing")
     args = parser.parse_args(argv)
+    if args.standalone is not None:
+        if args.lang is not None or args.kind is not None or args.dir:
+            parser.error("--standalone takes no --lang, --type or --dir: the "
+                         "repository starts with no mechanism; add one there "
+                         "with @talos//tools:new_subsystem")
+    elif args.mechanism is None and not args.no_mechanism:
+        parser.error("one of --standalone, --mechanism or --no-mechanism "
+                     "is required")
     if args.mechanism is not None and args.lang is None:
         parser.error("--mechanism needs --lang")
     if args.no_mechanism and (args.lang is not None
                               or args.kind is not None):
         parser.error("--no-mechanism takes no --lang or --type")
     args.kind = args.kind or "velocity"
+    args.dir = args.dir or "."
 
     root = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
     if not root:
         print("new_robot: BUILD_WORKSPACE_DIRECTORY is unset; run it with "
               "`bazel run //tools:new_robot -- ...`", file=sys.stderr)
         return 2
+    if args.standalone is not None:
+        return main_repository(args)
     try:
         writes, can_id = plan(root, args.name, args.mechanism, args.lang,
                               args.kind, args.dir)

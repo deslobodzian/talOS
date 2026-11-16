@@ -86,20 +86,3 @@ py_test(
     ],
     deps = ["@rules_python//python/runfiles"],
 )
-
-# talOS's session_report finds its log_dump with talOS as a dependency: it
-# reports on a session talOS's fixture records.
-py_test(
-    name = "session_report_test",
-    size = "small",
-    srcs = ["session_report_test.py"],
-    data = [
-        "@talos//talOS/launcher:session_report",
-        "@talos//talOS/launcher:session_report_fixture",
-    ],
-    env = {
-        "SESSION_REPORT": "$(rlocationpath @talos//talOS/launcher:session_report)",
-        "SESSION_REPORT_FIXTURE": "$(rlocationpath @talos//talOS/launcher:session_report_fixture)",
-    },
-    deps = ["@rules_python//python/runfiles"],
-)
