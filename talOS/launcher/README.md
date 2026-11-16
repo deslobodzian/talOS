@@ -1409,7 +1409,9 @@ whole, so memory grows with the number of logs, not with their length. Each
 mode reads the session twice: once for the earliest event time every printed
 time is relative to and for the record count, printing the gap and damage
 warnings then, before any output; once to print. That baseline is the
-inputs' own: a log file named alone is timed from its first kept record, so
+earliest event time over every record of the logs named, before any
+`--node`, `--topic`, `--since-ms` or `--until-ms` filter, so a filter never
+moves it: a log file named alone is timed from its own earliest record, so
 its times are not session-relative; name the session directory (with
 `--node` to keep the one process) for times from the session's earliest
 record. The text dump names the baseline under its file list
