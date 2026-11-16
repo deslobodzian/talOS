@@ -36,6 +36,9 @@ class PhoenixBackend final : public talos::hardware::Backend {
   // They and PollDeviceResets and ApplyOutputs also time their phases into
   // `log` (RioLog::AddPhase, TickPhase): one steady-clock read per phase
   // boundary, ten per disabled tick on the RoboRIO.
+  // Under desktop simulation (`is_simulation`) it sets WPILib's simulated
+  // battery to hardware::kSimRestingSupplyV, the charged supply sim_gateway
+  // reports, in place of WPILib's 12 V.
   explicit PhoenixBackend(bool is_simulation = false,
                           talos::rio::RioLog* log = nullptr);
 
