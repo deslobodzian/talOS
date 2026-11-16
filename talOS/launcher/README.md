@@ -346,7 +346,12 @@ loading the config, before anything is probed or spawned:
 
 `--describe-only` and `--replay-inputs`, which touch no hardware, still run
 it, except `--describe-only --describe-as-launch`, which refuses it as the
-launch would ([two phases](#two-phases)). The key passes through `include` like every `[robot]` key, so a
+launch would ([two phases](#two-phases)), saying what that means for an
+install:
+
+    launcher: /path/robot_sim.toml sets [robot] simulation_only = true; a launch of it without --sim is refused, so it cannot be installed as the robot's; nothing was started
+
+The key passes through `include` like every `[robot]` key, so a
 simulation config that includes `robot.toml` sets it in its own `[robot]`;
 config load refuses a file that sets it `false` over an included file that
 sets it `true`, naming both files.

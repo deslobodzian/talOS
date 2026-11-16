@@ -599,8 +599,13 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   if (robot_config.simulation_only && !options_.simulation &&
       (starts_roster || options_.describe_as_launch)) {
     std::cerr << "launcher: " << options_.config_path
-              << " sets [robot] simulation_only = true; run it with --sim "
-                 "(or --describe-only); nothing was started\n";
+              << " sets [robot] simulation_only = true; "
+              << (options_.describe_as_launch
+                      ? "a launch of it without --sim is refused, so it "
+                        "cannot be installed as the robot's; nothing was "
+                        "started\n"
+                      : "run it with --sim (or --describe-only); nothing "
+                        "was started\n");
     return 1;
   }
   std::string effective_remote;
