@@ -119,29 +119,46 @@ RecordedSession::RecordedSession(const std::string& path,
   std::optional<std::pair<MonotonicTime, MonotonicTime>> replayed_run;
   // The latest time any of its logs recorded: its last run's exit.
   std::optional<MonotonicTime> replayed_end;
-  // Each log read: the earliest time a GAP record of it names; its first
-  // damaged stretch's offset, and for each topic it recorded the earliest
-  // time a record lost there could be fed at (none where nothing bounds it);
-  // whether it holds its EXIT; and the topics it recorded (with whether the
-  // replayed program watched them in it).
+  // What one damaged stretch of a log cost one of its topic sources: the
+  // earliest time a record lost there could be fed at (none where nothing
+  // bounds it) and the stretch's byte offset. For a watcher in a log other
+  // than the replayed program's, whose receipts are fed only as its topic's
+  // messages, also the sequences its lost receipts lie in: a watcher
+  // receives in sequence order, so after its last intact receipt before the
+  // stretch (from the topic's first, 0, when none precedes it) and before
+  // its first intact receipt after it in the same file (`to`, unknown until
+  // read). The session's logs holding every message there, it lost nothing
+  // the feed lacks.
+  struct Stretch {
+    std::uint32_t topic{0};
+    std::optional<MonotonicTime> bound;
+    std::uint64_t offset{0};
+    bool receipts{false};
+    std::uint64_t from{0};
+    std::optional<std::uint64_t> to;
+  };
+  // Each log read: the earliest time a GAP record of it names; what each of
+  // its damaged stretches cost each topic source; whether it holds its EXIT;
+  // and the topics it recorded (with whether the replayed program watched
+  // them in it).
   struct ReadLog {
     std::string path;
     std::optional<MonotonicTime> gap;
-    std::optional<std::uint64_t> damage_offset;
-    std::map<std::uint32_t, std::optional<MonotonicTime>> damage_bound;
+    std::vector<Stretch> damage;
     bool exit{false};
     std::vector<std::pair<std::uint32_t, bool>> topics;
   };
   std::vector<ReadLog> logs;
   // Each file read, by path: its origin, then the now_ns of its last intact
   // record and by source id its watchers' last intact receipts' publication
-  // times. A segment of the same log (LogSegmentFiles: the next one, with
-  // its origin and manifest) starts from them, so damage right after its
-  // header is bounded as it would be in one file.
+  // times and sequences. A segment of the same log (LogSegmentFiles: the
+  // next one, with its origin and manifest) starts from them, so damage
+  // right after its header is bounded as it would be in one file.
   struct Carried {
     MonotonicTime origin;
     std::optional<std::int64_t> last_now;
     std::vector<std::optional<std::int64_t>> last_receipt;
+    std::vector<std::optional<std::uint64_t>> last_sequence;
   };
   std::map<std::string, Carried> carried;
   bool first = true;
@@ -191,10 +208,12 @@ RecordedSession::RecordedSession(const std::string& path,
     std::optional<MonotonicTime> gap;
     std::optional<MonotonicTime> gap_start;
     // The now_ns of the last intact record, and by source id the
-    // publication time of a watcher's last intact receipt: what bounds the
-    // records a damaged stretch after them lost.
+    // publication time and sequence of a watcher's last intact receipt:
+    // what bounds the records a damaged stretch after them lost.
     std::optional<std::int64_t> last_now;
     std::vector<std::optional<std::int64_t>> last_receipt(
+        reader.manifest().size());
+    std::vector<std::optional<std::uint64_t>> last_sequence(
         reader.manifest().size());
     {
       const std::vector<std::string> segments =
@@ -207,12 +226,23 @@ RecordedSession::RecordedSession(const std::string& path,
             previous->second.last_receipt.size() == last_receipt.size()) {
           last_now = previous->second.last_now;
           last_receipt = previous->second.last_receipt;
+          last_sequence = previous->second.last_sequence;
         }
       }
     }
     ReadLog read{.path = log_path};
     // Whether a record of a dispatch has been read from this file.
     bool dispatched = false;
+    // The damaged stretches counted so far, and where the last intact
+    // record ends: where a stretch found after it starts.
+    std::size_t spans = 0;
+    std::uint64_t record_end = 0;
+    // By source id, its open stretch (an index into read.damage), which a
+    // later one adds nothing to: a writer's or the replayed program's
+    // watcher's first (a later one is bounded no earlier, or unbounded
+    // alike); another watcher's until its next receipt closes it (a stretch
+    // before that lost receipts in the same range, bounded alike).
+    std::vector<std::optional<std::size_t>> open(reader.manifest().size());
     for (const Registration& registration : reader.manifest()) {
       if (registration.kind == SourceKind::TIMER && registration.armed &&
           registration.id < timer_offset.size()) {
@@ -256,11 +286,12 @@ RecordedSession::RecordedSession(const std::string& path,
     log::LogReader::Record record;
     while (reader.next(record)) {
       const log::RecordHeader& header = record.header;
-      // The reader skipped a damaged stretch just before this record: the
-      // first one bounds what each topic's records lost there can be fed
-      // at (a later one bounds them no earlier).
-      if (reader.damage().spans != 0 && !read.damage_offset.has_value()) {
-        read.damage_offset = reader.damage().first_offset;
+      // The reader skipped a damaged stretch just before this record: what
+      // it lost of each topic source, by when that could be fed at.
+      if (reader.damage().spans != spans) {
+        const std::uint64_t offset =
+            spans == 0 ? reader.damage().first_offset : record_end;
+        spans = reader.damage().spans;
         // Every record's now_ns is its dispatch's sample of the loop clock,
         // which never decreases along the log, except a send made before
         // the first dispatch, whose now_ns is 0.
@@ -270,7 +301,8 @@ RecordedSession::RecordedSession(const std::string& path,
                 : std::min(MonotonicTime::from_nanos(0), reader.start_time());
         gap_start = std::min(gap_start.value_or(since_last), since_last);
         for (const Registration& source : reader.manifest()) {
-          if (source.id >= topic_of.size() || topic_of[source.id] == kNone) {
+          if (source.id >= topic_of.size() || topic_of[source.id] == kNone ||
+              open[source.id].has_value()) {
             continue;
           }
           // A writer's send is fed at its publication time, which is its
@@ -282,22 +314,24 @@ RecordedSession::RecordedSession(const std::string& path,
           // receipt is fed at its drain's event time (a tick's deadline, or
           // a prompt watcher's publication time), which need not follow the
           // log's order: nothing bounds it.
-          std::optional<MonotonicTime> bound;
+          Stretch lost{.topic = topic_of[source.id], .offset = offset};
           if (source.kind == SourceKind::SENDER) {
-            bound = since_last;
-          } else if (!own_log && last_receipt[source.id].has_value()) {
-            bound = MonotonicTime::from_nanos(*last_receipt[source.id]);
+            lost.bound = since_last;
+          } else if (!own_log) {
+            if (last_receipt[source.id].has_value()) {
+              lost.bound = MonotonicTime::from_nanos(*last_receipt[source.id]);
+            }
+            lost.receipts = true;
+            lost.from = last_sequence[source.id].has_value()
+                            ? *last_sequence[source.id] + 1
+                            : 0;
           }
-          const std::uint32_t topic = topic_of[source.id];
-          const auto [it, inserted] =
-              read.damage_bound.try_emplace(topic, bound);
-          if (!inserted) {
-            it->second = it->second && bound
-                             ? std::optional{std::min(*it->second, *bound)}
-                             : std::nullopt;
-          }
+          open[source.id] = read.damage.size();
+          read.damage.push_back(lost);
         }
       }
+      record_end =
+          record.offset + sizeof(log::RecordHeader) + header.stored_bytes;
       last_now = header.now_ns;
       if (header.dispatch_index != 0) dispatched = true;
       end_ = std::max(end_, MonotonicTime::from_nanos(header.now_ns));
@@ -316,6 +350,12 @@ RecordedSession::RecordedSession(const std::string& path,
       if (kind == EventKind::MESSAGE &&
           header.source_id < last_receipt.size()) {
         last_receipt[header.source_id] = header.publish_time_ns;
+        last_sequence[header.source_id] = header.sequence;
+        std::optional<std::size_t>& stretch = open[header.source_id];
+        if (stretch.has_value() && read.damage[*stretch].receipts) {
+          read.damage[*stretch].to = header.sequence;
+          stretch.reset();
+        }
       }
       // The first firing of a timer the run had not re-armed is at the run
       // start plus its manifest offset. A firing after a gap is one the live
@@ -407,11 +447,13 @@ RecordedSession::RecordedSession(const std::string& path,
         !damage.empty()) {
       std::cerr << "warning: damaged log " << log_path << ": " << damage
                 << (reader.damage().spans != 0
-                        ? "; a replay fed from it stops before the first "
-                          "damaged stretch, or is refused\n"
+                        ? "; a replay fed from it stops before a damaged "
+                          "stretch, or is refused, unless the session's logs "
+                          "hold every message the stretch could have lost\n"
                         : "; its intact records replay\n");
     }
-    carried[log_path] = {reader.start_time(), last_now, last_receipt};
+    carried[log_path] = {reader.start_time(), last_now, last_receipt,
+                         last_sequence};
     read.gap = gap;
     read.topics = std::move(recorded);
     logs.push_back(std::move(read));
@@ -476,10 +518,23 @@ RecordedSession::RecordedSession(const std::string& path,
     }
     return {};
   };
+  // Whether the session's logs hold every message of `topic` with a
+  // sequence from `from` to before `to`. One writer per topic: a session's
+  // transport numbers a topic's messages 0, 1, 2, ..., no two alike, as the
+  // merge by sequence above assumes.
+  const auto held = [&](std::uint32_t topic, std::uint64_t from,
+                        std::uint64_t to) {
+    if (to < from) return false;
+    const auto first = seen.lower_bound({topic, from});
+    const auto last = seen.lower_bound({topic, to});
+    return static_cast<std::uint64_t>(std::distance(first, last)) == to - from;
+  };
   // Where each topic's feed ends, and whether it is refused: the earliest
   // loss, and the first refused log, among the logs it is fed from, which
   // for a topic the program watched live are its own logs that watched it,
-  // and otherwise every log that recorded it.
+  // and otherwise every log that recorded it. A reader's damaged stretch
+  // whose lost receipts' messages the session's logs all hold (the writer's
+  // sends) lost nothing the feed lacks, and is no loss.
   for (const ReadLog& log : logs) {
     const std::string sign = refusal(log.path);
     for (const auto& [topic, watched_here] : log.topics) {
@@ -495,18 +550,23 @@ RecordedSession::RecordedSession(const std::string& path,
       };
       if (log.gap.has_value()) loss(*log.gap, std::nullopt);
       std::string reason = sign;
-      if (log.damage_offset.has_value()) {
-        const auto bound = log.damage_bound.find(topic);
-        if (bound != log.damage_bound.end() && bound->second.has_value()) {
-          loss(*bound->second, log.damage_offset);
+      for (const Stretch& stretch : log.damage) {
+        if (stretch.topic != topic ||
+            (stretch.receipts && stretch.to.has_value() &&
+             held(topic, stretch.from, *stretch.to))) {
+          continue;
+        }
+        if (stretch.bound.has_value()) {
+          loss(*stretch.bound, stretch.offset);
         } else if (reason.empty()) {
           reason = "records are lost between intact ones at byte " +
-                   std::to_string(*log.damage_offset) + ", and nothing " +
+                   std::to_string(stretch.offset) + ", and nothing " +
                    "bounds when they were to be fed (" +
                    (watched_here ? "the program's own receipts, fed at their "
                                    "drains' times"
                                  : "no intact receipt of the topic precedes "
-                                   "them") +
+                                   "them, and the session's logs do not hold "
+                                   "every message they could be") +
                    ")";
         }
       }

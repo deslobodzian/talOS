@@ -397,7 +397,10 @@ age; input replay injects with the recorded publication time, at that time,
 or, for a node the session ran, at the drain that received it. Neither crosses
 a GAP record: exact replay stops before the gap's first dropped dispatch,
 input replay before the earliest gap or damaged stretch in a log it feeds
-from, and both exit 1
+from (another reader's stretch too, unless an intact receipt follows it and
+the session's other logs hold what it lost:
+[the rule](../talOS/events/README.md#replaying-another-sessions-inputs)),
+and both exit 1
 ([events](../talOS/events/README.md#recording-and-replaying)).
 Readers accept versions 7 and 8 (a version-7 log is a version-8 log without a
 GAP record) and reject any other with the recorded and supported versions; the
