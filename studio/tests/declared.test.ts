@@ -12,10 +12,15 @@
 //   bazel run @talos//talOS/launcher:launcher -- --describe-only \
 //     --config $PWD/main_processor/configuration/robot.toml
 //
-// in the 2026 robot's repository (talOS overridden to this checkout), with only `session_id` pinned so a diff is a diff in
-// shape rather than in session. If the launcher's envelope changes, this test
-// fails and names the field -- regenerate the fixture and fix the parser
-// together, in one commit.
+// in the 2026 robot's repository (talOS overridden to this checkout), with only
+// `session_id` pinned so a diff is a diff in shape rather than in session. A
+// talOS type's schema hash and size (`talos.hardware.Packet`,
+// `bridge.BridgeStatus`, `talos.Bytes`, `geometry.PoseEstimate`) can be
+// refreshed from this repository alone, from the same fields of a current
+// `--describe-only` graph.json (any config here, such as the bench's); the
+// robot's own types come only from a run in its repository. If the launcher's
+// envelope changes, this test fails and names the field -- regenerate the
+// fixture and fix the parser together, in one commit.
 
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
@@ -76,7 +81,7 @@ test('every topic end names its schema, and the ends of a topic agree', () => {
     }
   }
   assert.equal(schemas.get('/hw/state'),
-               'talos.hardware.Packet 0x33d3c5e0cdc00979');
+               'talos.hardware.Packet 0x33d751e0cdc32d34');
 });
 
 test('endpoint attributes survive the crossing', () => {
