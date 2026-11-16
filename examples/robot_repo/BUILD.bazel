@@ -64,6 +64,27 @@ talos_bundle(
     nodes = ["@talos//talOS/bridge:hardware_node"] + NODES,
 )
 
+# e2e: talOS's deploy.sh installs robot_bundle into a scratch prefix, and
+# the installed run.sh describes every node with the build out of reach
+# (bundle_install_test.py says how). About 2 s of real time. Launches a
+# Python node, which cannot load the sanitizer runtimes through ctypes.
+py_test(
+    name = "bundle_install_test",
+    size = "small",
+    srcs = ["bundle_install_test.py"],
+    data = [
+        "robot_manifest.bzl",
+        ":robot_bundle",
+        "@talos//tools:deploy.sh",
+    ],
+    tags = [
+        "e2e",
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
 # `bazel run //:sim -- [launcher arguments]` runs the robot against the
 # simulator, e.g. `bazel run //:sim -- --duration-s 10`, and with
 # `-- --start-studio-bridge` serves Studio on http://localhost:5800

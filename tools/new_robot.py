@@ -388,6 +388,10 @@ TEMPLATE = {
     # .bazelrc's import, .bazelversion and the default Python agree with the
     # talOS @talos is: every robot repository checks its own pin.
     "talos_pin_test.py": COPY,
+    # robot_bundle installed by talOS's deploy.sh and described from the
+    # install, away from the build: what the robot gets, which only the
+    # robot's own repository builds.
+    "bundle_install_test.py": COPY,
     "BUILD.bazel": COPY,
     # The module name, and talOS's checkout and its Studio pages' folder.
     "MODULE.bazel": SUBSTITUTE,
@@ -428,7 +432,7 @@ you add a mechanism.
 | `robot.toml` | the robot: tick, timeouts, target policy, Studio, and `[[subsystems]]`, the only list of its nodes |
 | `subsystems/*.toml` | one file per subsystem: its node, period, devices and parameters |
 | `robot_manifest.bzl` | generated from `robot.toml` (`bazel run @talos//tools:sync_manifest -- robot.toml`); Bazel reads it because it cannot read TOML |
-| `BUILD.bazel` | `manifest_sync_test`, `graph_test`, `robot_bundle`, `//:sim` (the robot against the simulator), `sim_smoke_test`, `studio_test`, `talos_pin_test` |
+| `BUILD.bazel` | `manifest_sync_test`, `graph_test`, `robot_bundle`, `bundle_install_test` (the bundle installed with talOS's `deploy.sh` and run from there), `//:sim` (the robot against the simulator), `sim_smoke_test`, `studio_test`, `talos_pin_test` |
 | `MODULE.bazel` | talOS as `@talos`, and where Studio's pages are |
 | `.bazelrc` | imports talOS's build flags (`talos.bazelrc`) from the same checkout; add this repository's own flags below the import |
 | `.bazelversion` | the Bazel version, talOS's (`talos_pin_test` checks it, the import and the default Python) |
