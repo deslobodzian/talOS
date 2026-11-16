@@ -17,6 +17,16 @@
 
 namespace talos::hardware {
 
+// PhoenixBackend::Read reports a motor's temperature as 0 once its signal is
+// this old (Fresh(temperature, 500_ms), controller_processor/rio/src/main/
+// cpp/PhoenixBackend.cpp:975). testing::SimHardware and PhysicsSimBackend
+// age a device that stopped answering by it.
+inline constexpr uint64_t kTemperatureMaxAgeUs = 500'000;
+// PhoenixBackend::Read clears a motor's limit and limiter bits
+// (kMotorNotFaultFlags) and keeps its fault bits once its FaultField is this
+// old (Fresh's 50 ms default, PhoenixBackend.cpp:53 and :953).
+inline constexpr uint64_t kFaultFieldMaxAgeUs = 50'000;
+
 // An invalid motor or CAN-sensor sample: `valid` false and zero in every
 // measured field (position, velocity, applied voltage, stator and supply
 // current), so no consumer can read a stale measurement as current. Ages,
