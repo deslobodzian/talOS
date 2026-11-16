@@ -38,13 +38,13 @@ shared-memory topics only; its repository documents their rates.
 | Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Phoenix motion feedback requests `status_hz`; voltage/stator-current/supply-current/fault diagnostics request `min(status_hz, 50)` Hz; device temperature requests `min(status_hz, 4)` Hz. Shared vendor frames apply their highest requested rate: voltage/current/temperature remain 200 Hz with 200 Hz feedback; fault field applies 50 Hz. Disabled one-shot neutral refresh remains every hardware tick. |
 | Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz. The RIO program's `talos-ds` thread refreshes WPILib's cache on each new DS packet, or 20000 µs after the last without one, snapshots it whole and reports the program's mode while the hardware loop ticks; the loop observes the mode generation each hardware tick from the latest snapshot, and sends that snapshot as the DriverStation packet, as no Driver Station (no mode, no joystick input) once its refresh is `command_timeout_us` old ([hardware README](../talOS/hardware/README.md#roborio)); snapshot cadence is in row DriverStation (24). Native FRC packet layouts are external to this repo. |
 | RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz; echoes clock probe send time only after a subsequent gateway tick. |
-| hardware_node → RIO: Command (21) | UDP 5803 → 5802 | The bridge sleeps until a gateway datagram, a `/hw/request/<node>` publication or its next time-driven duty, and merges each request when it is published, within a CPU budget of 8 passes and 64 received datagrams per 1000 µs window (`HardwareNode::kDatagramBudget`), past which it sleeps through input to the window's end (`HardwareNode::kCpuWindowUs`); one pass receives at most 32 (`HardwareNode::kReceiveBudget`). While the latest State says the gateway can take a command (configured and commissioned, enabled, no fault), send immediately when the merged command changes, its observation included, so one command per accepted request that changes the merge; actuator nodes publish on their own `period_us`, each request carrying a new observation or demand, so at most motor 200 + swerve_module 200 = 400 commands/s, each a 138 B frame (3 motors: 98 B payload) ≈ 55 kB/s. Otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. While the latest State says it cannot (disabled, unconfigured, uncommissioned or faulted), a change of the observation alone waits for that heartbeat, so the bridge sends exactly one command per heartbeat (50/s, ≈ 13.9 kB/s) plus one at once per change of a demand, output or identity word, whatever the owners' periods and phases (`HardwareNode::CommandDueUs`). Only after observed state and while a subsystem request is active. The RIO receives at most 64 frames per 5000 µs hardware tick and applies only the highest-sequence command of each tick's batch (`endpoint.h` `kReceiveBudget`), about 2 commands per tick at 400/s, so a backlog queued during a RIO stall is skipped, not replayed. |
+| hardware_node → RIO: Command (21) | UDP 5803 → 5802 | The bridge sleeps until a gateway datagram, a `/hw/request/<node>` publication or its next time-driven duty, and merges each request when it is published, within a CPU budget of 8 passes and 64 received datagrams per 1000 µs window (`HardwareNode::kDatagramBudget`), past which it sleeps through input to the window's end (`HardwareNode::kCpuWindowUs`); one pass receives at most 32 (`HardwareNode::kReceiveBudget`). While the latest State says the gateway can take a command (configured and commissioned, enabled, no fault), send immediately when the merged command changes, its observation included, so one command per accepted request that changes the merge; actuator nodes publish on their own `period_us`, each request carrying a new observation or demand, so in `robot.toml` at most motor 200 + swerve_module 200 = 400 commands/s, each a 138 B frame (3 motors: 98 B payload) ≈ 55 kB/s (in `robot_py.toml`, whose Python motor runs at 20000 µs, 50 + 200 = 250/s ≈ 34.5 kB/s). Otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. While the latest State says it cannot (disabled, unconfigured, uncommissioned or faulted), a change of the observation alone waits for that heartbeat, so the bridge sends exactly one command per heartbeat (50/s × 138 B ≈ 6.9 kB/s) plus one at once per change of a demand, output or identity word, whatever the owners' periods and phases (`HardwareNode::CommandDueUs`). Only after observed state and while a subsystem request is active. The RIO receives at most 64 frames per 5000 µs hardware tick and applies only the highest-sequence command of each tick's batch (`endpoint.h` `kReceiveBudget`), about 2 commands per tick at 400/s, so a backlog queued during a RIO stall is skipped, not replayed. |
 | hardware_node → RIO: Config chunks (22) | UDP 5803 → 5802 | Whole config push on observed boot/config mismatch or while unacknowledged; retry on State after ≥50000 µs, doubling after rejected ACKs from 100 ms to 2 s. A changed boot ID pushes immediately and resets backoff. Commands continue during backoff; no pushes after successful matching acknowledgment. |
 | RIO → hardware_node: ConfigAck (23) | UDP 5802 → 5803 | On completed assembly and asynchronous reconfiguration, or rejected chunk/config; no per-chunk ACK for incomplete assemblies. An assembly completed while a configure is pending (every boot restore) gets no ACK; the bridge's ≥50000 µs retry pushes again. Per-device degraded configure succeeds, with invalid samples identifying unavailable devices. |
 | RIO → hardware_node: DriverStation (24) | UDP 5802 → 5803 | 50 Hz on real RIO and standalone `sim_gateway`, independently of the hardware tick: snapshots are ≥20000 µs apart, except that the tick observing a new mode sends one at once. An enabled mode switch (autonomous to teleop) changes no State; only the new generation retires the old mode's target lanes. |
 | hardware_node → RIO: ClockProbe (25) | UDP 5803 → 5802 | Empty payload; bridge send time in frame header. At most 50 Hz, one outstanding, replaced after 100 ms unanswered (a lost probe or echo), well inside the 1 s exchange lifetime; independent of enable, commissioning and active requests. |
 | hardware_node → device-owning nodes / DS consumers / telemetry | Shared-memory `/hw/state`, `/hw/state/driver_station`, `/hw/status`; no port | State/DS when their frame arrives; bridge status first tick then every 20000 µs (50 Hz, `node.h`'s `kStatusPeriodUs`). Consumers run at their own periods. |
-| actuator-owning nodes (`motor`, `swerve_module`) → hardware_node | Shared-memory `/hw/request/<node>` | Devices-layer flush each update, on the node's `period_us`: 5000 µs (200 Hz) for both. A node that owns only inputs (`gyro`) publishes no request. Bridge neutralizes an owner silent past its [owner timeout](../ARCHITECTURE.md#the-tick) (50 ms for each of these). |
+| actuator-owning nodes (`motor`, `swerve_module`) → hardware_node | Shared-memory `/hw/request/<node>` | Devices-layer flush each update, on the node's `period_us`: 5000 µs (200 Hz) for both (20000 µs for the Python motor of `robot_py.toml`). A node that owns only inputs (`gyro`) publishes no request. Bridge neutralizes an owner silent past its [owner timeout](../ARCHITECTURE.md#the-tick) (50 ms for each of these). |
 | target producers (`teleop`) → actuator nodes | Shared-memory target lanes | On the producer's `period_us`, `teleop`'s 5000 µs (200 Hz); mode/freshness policy selects one lane. |
 | `sim_gateway --physics` → simulated sensors (a robot's simulated cameras) / telemetry | Shared-memory `/sim/state` | Every physics/hardware tick (200 Hz); main-processor node-clock timestamp, true field pose and field-frame velocity. No writer under ideal or WPILib/RoboRIO simulation. |
 | Any publisher → the loop of a reader asleep on its topic (wake) | AF_UNIX datagram, Linux abstract address / macOS `/tmp/talos-wake-<id>`; no port ([talOS/rtms](../talOS/rtms/README.md#wake-channel)) | 1 byte, at most one per reader sleep per topic: a write sends one to each reader slot armed since the last publication (a reader of a prompt subscription under `Delivery::ON_PUBLISH`, the bridge's reader of each `/hw/request/<node>`, or `studio_bridge`'s reader of `/talos/telemetry`, between its drain and its next block), none when no reader is armed; a writer taking over a topic sends one to every reader with a receiver. A lost datagram costs a node's loop up to its 1 s backstop, the bridge up to its longest wait, 10000 µs (`HardwareNode::kMaxWaitUs`), and `studio_bridge` up to its next duty, at most its 250 ms graph refresh ([Studio bridge](../studio/bridge/README.md#waking)). A send that fails other than to a gone receiver counts in the writer's registry row (`wake_failures`), and a request the bridge's latest-value read passes over in its subsystem's request row (`requests_skipped`; [wake loss](../talOS/introspection/README.md#wake-loss)). |
@@ -74,13 +74,11 @@ open-retry cadence ([talOS/hardware](../talOS/hardware/README.md#roborio)).
 
 Camera observation timestamps describe exposure, not publication. Measure
 timestamp bias during [camera bring-up](BRINGUP.md#camera-intrinsics-calibration).
-Every live and simulated stamp subtracts `camera.latency_offset_us`, after
-the per-kind exposure/readout correction (`talOS/vision/frame.h`; step 6
-of [camera calibration](BRINGUP.md#camera-intrinsics-calibration)).
-Sim-only `camera.sim_timestamp_lag_us` adds stamp bias and delays delivery;
-an equal offset restores the truth stamp without removing delivery delay.
-Both offsets default to zero and must be finite, nonnegative and below one
-second. Underflow/future stamps publish invalid.
+`talOS/vision/frame.h`'s `CaptureMidpoint` maps a frame's stamp to the
+exposure midpoint: the per-kind exposure/readout correction, then the
+camera's measured stamp bias, `latency_offset_ns`, subtracted from every
+kind (step 6 of [camera calibration](BRINGUP.md#camera-intrinsics-calibration));
+it gives no stamp on overflow or underflow.
 
 Timing sources: `bench/main_processor/configuration/robot.toml`, its
 `subsystems/*.toml`, `talOS/bridge/node.cc` (`Tick`, `PushConfig`,
@@ -297,28 +295,29 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
-| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 724, ≤1419 |
-| `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
+| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data 320 on the bench ([actual bench robot](#actual-bench-robot)), ≤1419 |
+| `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data 98 on the bench, ≤410 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
 | `/hw/status`: bridge → telemetry/observers | 272 | 264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`, and the u16 `protocol_version_id` (the bridge's `kProtocolVersion`) the padding after `gateway_build_dirty`; `can_buses` is four 20 B `CanBusStatus` slots at the end. A shared-memory message, in no UDP payload: a change to it is not a hardware protocol change |
-| `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; chassis/shooter/intake payload 40/24/20 B, slots 48/32/32 B |
-| `/autonomous/state`: autonomous → telemetry | 16 | 2 B AutonomousState: phase enum and selected/latched routine_index (ubyte); routine adds one 8 B telemetry scalar |
-| `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
-| `/intake/state`: intake → telemetry | 32 | 20 B IntakeState, including FlatBuffers padding |
-| `/shooter/state`: shooter → telemetry | 40 | 32 B ShooterState, including FlatBuffers padding |
+| `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; the bench's motor/swerve_module payload 48/40 B, slots 56/48 B; the superstructure example's elevator/intake/superstructure 24/17/17 B, slots 32/32/32 B |
 | `/motor/state` (bench only): motor → telemetry/logs | 104 | 96 B MotorState including device temperature, supply current and limit switches; pinned in bench motor node |
 | `/swerve_module/state` (bench only): swerve_module → telemetry/logs | 128 | 120 B ModuleState: drive, steer and CANcoder feedback, the commanded setpoint and flags; pinned in `swerve_module.h` |
 | `/gyro/state` (bench only): gyro → telemetry/logs | 56 | 48 B GyroState: yaw, yaw rate, their ages and two flags, including padding; Python node, size pinned at import by `bench/main_processor/gyro/node_py_test.py` |
-| `/<camera>/state`: each camera → estimator/telemetry | 72 | 64 B geometry.PoseObservation, including padding |
-| `/<camera>/status`: each camera → telemetry | 96 | 88 B vision.VisionStatus, pinned in vision.h; every field, counters included, reaches telemetry |
-| `/pose_estimator/state`: estimator → telemetry | 80 | 72 B geometry.PoseEstimate; `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
-| `/sim/state`: physics sim_gateway → four simulated cameras / telemetry | 64 | 56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
-| `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.2 s at 100 Hz with three value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
+| `/elevator/state` (examples/superstructure): elevator → superstructure/telemetry | 40 | 32 B demo.ElevatorStatus |
+| `/intake/state` (examples/superstructure): intake → superstructure/telemetry | 16 | 2 B demo.IntakeStatus |
+| `/superstructure/state` (examples/superstructure): superstructure → telemetry | 16 | 1 B demo.SuperstructureStatus |
+| `/wrist/state` (examples/external_subsystem): wrist → logs | 32 | 24 B wrist.WristState |
+| `/<camera>/state`: a robot's camera node → a `new_subsystem --type estimator` node/telemetry | 72 | 64 B geometry.PoseObservation, including padding |
+| `/<estimator>/state`: a `new_subsystem --type estimator` node → telemetry | 80 | 72 B geometry.PoseEstimate (`talOS/msgs/layout_asserts.cc`); `valid` = fresh usable odometry, `localized` = established field-frame trust; `localized` sits in existing payload padding |
+| `/sim/state`: physics sim_gateway → telemetry and a robot's simulated sensors | 64 | 56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
+| `/talos/telemetry`: telemetry → studio_bridge | 16392 × 64 slots | 16384 B byte payload capacity; ring = 1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.3 s at 100 Hz with the bench's two value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
 
 Sources: `talOS/hardware/packet.h`, `talOS/bridge/bridge_status.fbs`,
-`talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, robot `*_message.fbs`,
-`vision/vision.fbs`, and `talOS/telemetry/wire.h`. Struct sizes include alignment
+`talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, the bench's
+`*_message.fbs` and the examples' `.fbs` files, and `talOS/telemetry/wire.h`;
+each size is the `message_bytes` the `--describe-only` graph (`graph.json`)
+of the bench's and examples' configs reports. Struct sizes include alignment
 padding: they must not be inferred by simply adding scalar field widths.
 The `/sim/state` payload is pinned by `static_assert(sizeof(geometry::OdometrySample)
 == 56)` in `talOS/simulation/sim_gateway.cc`; RTMS adds its 8 B publication timestamp.
@@ -346,15 +345,17 @@ armed reader adds to a publication is measured under "Publish cost" in the
 [wake channel](../talOS/rtms/README.md#wake-channel). In a robot's
 `--describe-only` graph, counting every reader as armed, the bridge is the
 peak: its wake sockets are the readers of `/hw/state`,
-`/hw/state/driver_station` and `/hw/status` (16 in the 2026 robot's field
-graph, whose configuration is in its own repository), and every other node's
+`/hw/state/driver_station` and `/hw/status` (in the bench's
+`robot_bench.toml` graph 3 + 4 + 5 = 12, the reader endpoints of each in its
+`graph.json`; `motor` reads `/hw/status` twice), and every other node's
 are its own topics' readers, a few each.
 
 Every node held 9 to 11 descriptors otherwise in a running `--sim` session on
 Linux (`/proc/<pid>/fd`: stdio and log pipes, the event-log file, the poller,
-the stop pipe, its wake receiver; the bridge's UDP socket). The 2026 robot's
-peak, the bridge's 27, leaves 229 of macOS's default soft `RLIMIT_NOFILE` of
-256 (and 997 of Linux's usual 1024), so nodes do not raise the limit. A node
+the stop pipe, its wake receiver; the bridge's UDP socket). The bench's
+peak, the bridge's 11 + 12 = 23, leaves 233 of macOS's default soft
+`RLIMIT_NOFILE` of 256 (and 1001 of Linux's usual 1024), so nodes do not
+raise the limit. A node
 that did run out would show it in its registry row's `wake_failures`, and in
 the session manifest, where `session_report --strict` rejects it.
 
@@ -451,6 +452,7 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
 | Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 129 | 2, 1864 B (largest 1168 / 1200 B) | 1 page, 8400 B |
+| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 136 | 2, 1944 B (largest 1168 / 1200 B) | 1 page, 8784 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):
@@ -530,20 +532,12 @@ this budget.
 bandwidth limit that WPILib's networking documentation and the FMS whitepaper
 state, citing 2026 manual rule R704. Both the figure and the rule number are
 unverified against the 2026 manual text itself; the event's current
-allocation is authoritative. Before
-TCP/IP and WebSocket overhead, measured in a scripted physics-sim match
-of the 2026 robot (its own repository's `robot_physics_sim.toml`, disabled
-3 s / autonomous 14 s / teleop 30 s, one viewer):
-
-| Viewer budget | Telemetry bytes/s | System graph bytes/s | Telemetry updates/s | Total, whole run |
-|---|---:|---:|---:|---:|
-| 160,000 B/s (`max_clients = 1`) | 46,700–72,200 disabled/autonomous; 57,700–62,600 teleop | 5,500–12,000 | 96–100 (every tick) | 69,500 B/s |
-| 40,000 B/s (4-client share, no dashboard layout) | 27,500–34,300 | 5,600–11,900 | 37–94, typically 45–55 | 39,700 B/s |
-
-In that match a full keyframe every tick would be 2552 B, 255,200 B/s. The system graph
-(about 40 KB whole: 15 nodes, 94 sources, 28 topics) goes to a client whole
-only on connect and when its structure changes; otherwise its fast values
-(about 5.5 KB) go at most every 500 ms when they changed
+allocation is authoritative. A full keyframe every tick of the bench's
+physics-simulation graph would be its 1944 B worst case (the telemetry
+table above), 194,400 B/s at 100 Hz, more than the whole budget; the
+change-only updates carry only what changed. The system graph goes to a
+client whole only on connect and when its structure changes; otherwise its
+fast values go at most every 500 ms when they changed
 (`GraphFeed` in [`studio/bridge/system.h`](../studio/bridge/system.h);
 protocol in the [bridge README](../studio/bridge/README.md)). A client's graph
 messages go before its telemetry (`ClientFeeds` in
@@ -556,7 +550,7 @@ framed bytes therefore goes within
 (G + n) / (ρ / 2 − n / 0.75 s)
 
 on a client share of ρ B/s, where n is one framed deferral notice (71 B, sent
-at most every 750 ms while it waits): **2.0 s** for the 40 KB whole graph at
+at most every 750 ms while it waits): **2.0 s** for a 40 KB whole graph at
 the 40,000 B/s share of 4 clients without a dashboard layout (**2.9 s** at
 the 28,000 B/s share with the default one), and **55.5 s** for a graph at the
 64,000 B burst at the 2,500 B/s share of `max_clients = 64` (**82.1 s** at
@@ -566,12 +560,10 @@ only while other clients spend bursts they saved, and a client whose socket
 still has output buffered is sent nothing until it drains. Telemetry keeps
 flowing beside the waiting graph, change-only, so the thinning skips samples,
 never values; while a graph waits, a reading goes stale only when one update costs more than
-about half of what the share refills in a second. At the 40,000 B/s share updates
-arrived every 500–720 ms and no deferral notice was needed. Both rows stay
-within their budget over the run; a single second can exceed the rate by up to
-the 64,000 B burst.
+about half of what the share refills in a second. A single second can
+exceed a share's rate by up to the 64,000 B burst.
 
-The cost falls on structure changes. A whole graph is about a second of a
+The cost falls on structure changes. A 40 KB whole graph is a second of a
 40,000 B/s share (1.4 s of the 28,000 B/s one), so after a node starts, stops
 or restarts, that client's telemetry runs at four updates a second for about
 that long (at most the bound above) while the graph goes. A whole graph goes at most every 2 s: in
@@ -590,8 +582,8 @@ telemetry and video. RIO↔main-processor UDP stays on the robot's wired switch 
 is not charged against wireless throughput. Local USB camera images also do not
 consume that budget unless separately streamed off-robot (this path does not).
 
-The rates above are WebSocket payload plus frame headers, measured on
-loopback; they exclude TCP/IP overhead and retransmission.
+The budget's rates count WebSocket payload plus frame headers; they
+exclude TCP/IP overhead and retransmission.
 
 ## What never crosses the hardware UDP link
 
