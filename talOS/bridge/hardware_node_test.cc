@@ -49,6 +49,7 @@
 #include "talOS/hardware/endpoint.h"
 #include "talOS/hardware/gateway.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/launcher/hardware_record.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
@@ -509,6 +510,7 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   while (reader.next(record)) {
     ASSERT_LT(record.header.source_id, reader.manifest().size());
     const auto& source = reader.manifest()[record.header.source_id];
+    if (source.name == bridge::topics::kStatus) continue;
     ASSERT_EQ(record.payload.size(), sizeof(Packet));
     Packet logged{};
     std::memcpy(&logged, record.payload.data(), sizeof(logged));
@@ -822,6 +824,39 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   EXPECT_EQ(later.timed_out_mask(), 0u);
   EXPECT_EQ(later.state_age_us(), 19000u);
   EXPECT_TRUE(later.configured());
+}
+
+// Guards: a session whose launcher is of another build than its bridge (a
+// manifest naming another hardware protocol) is read under the protocol the
+// bridge spoke, which the bridge's own --log records in its /hw/status SENDs;
+// the log tools then say the two disagree and decode the packets.
+// REQ-OPS-51
+TEST(HardwareNodeTest, ASessionIsReadUnderTheProtocolItsBridgeLogged) {
+  constexpr uint64_t kSession = 43;
+  constexpr uint16_t kLauncher = protocol::kProtocolVersion - 1;
+  const std::filesystem::path session = ::testing::TempDir() +
+                                        "/bridge_protocol_session_" +
+                                        std::to_string(::getpid());
+  std::filesystem::remove_all(session);
+  std::filesystem::create_directories(session);
+  std::ofstream{session / "manifest.json"}
+      << "{\"session_id\": " << kSession
+      << ", \"hardware_protocol_version\": " << kLauncher << "}\n";
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, true, (session / "hardware_node.tlog").string(),
+                        kSession));
+  link.node->Tick(1000);
+  link.node.reset();  // flushes the bridge's log
+
+  const launcher::RecordedProtocol recorded =
+      launcher::RecordedProtocolVersion({session.string()});
+  EXPECT_EQ(recorded.manifest, kLauncher);
+  EXPECT_EQ(recorded.bridge, std::vector<uint16_t>{protocol::kProtocolVersion});
+  EXPECT_EQ(recorded.version(), protocol::kProtocolVersion);
+  EXPECT_FALSE(recorded.refused());
+  EXPECT_FALSE(recorded.Disagreement().empty());
+  std::filesystem::remove_all(session);
 }
 
 // REQ-OPS-20: /hw/status.configured is the current gateway boot's

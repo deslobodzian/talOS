@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include "bridge/topics.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
@@ -158,8 +159,8 @@ std::vector<std::string> KeptFiles(const std::string& session,
 }
 
 // Every message and send record in a member's kept log is on a topic the
-// model counts for that member (the bridge: only /hw/state and
-// /hw/command) and stores no more bytes than the model gives it, so the
+// model counts for that member (the bridge: only /hw/state, /hw/command and
+// /hw/status) and stores no more bytes than the model gives it, so the
 // model never under-sizes this member's records.
 void ExpectRecordsWithinModel(const std::string& session,
                               const std::string& member, bool bridge,
@@ -183,7 +184,8 @@ void ExpectRecordsWithinModel(const std::string& session,
     for (const auto& [topic, bytes] : largest) {
       if (bridge) {
         EXPECT_TRUE(topic == hardware::kStateTopic ||
-                    topic == hardware::kCommandTopic)
+                    topic == hardware::kCommandTopic ||
+                    topic == ::bridge::topics::kStatus)
             << "the bridge logs " << topic << ", which the model omits";
       }
       const auto load = loads.find(topic);

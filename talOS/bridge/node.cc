@@ -602,7 +602,8 @@ void HardwareNode::Tick(uint64_t now_us) {
   // 4. Bridge health, on the bridge clock.
   if (status_pub_ && (statuses_published_ == 0 ||
                       now_us - last_status_us_ >= kStatusPeriodUs)) {
-    status_pub_->write(Status(now_us));
+    // Source 3: /hw/status in BuildIntrospectionManifest's fixed ids.
+    Publish(*status_pub_, 3, Status(now_us), now_us);
     ++statuses_published_;
     last_status_us_ = now_us;
   }
@@ -862,13 +863,13 @@ void HardwareNode::ReportGatewayBuild(const State& state) {
                state.build.dirty ? " (dirty)" : "");
 }
 
-void HardwareNode::Publish(ipc::Publisher<Packet>& publisher,
-                           uint16_t source_id, const Packet& packet,
-                           uint64_t now_us) {
+template <class M>
+void HardwareNode::Publish(ipc::Publisher<M>& publisher, uint16_t source_id,
+                           const M& message, uint64_t now_us) {
   // RTMS stamps a publication with the Poller clock when not given one; the
   // stamp is taken here so the log can carry it.
   const event::MonotonicTime published = event::Poller::now();
-  const WriteStatus status = publisher.write(packet, published.nanos());
+  const WriteStatus status = publisher.write(message, published.nanos());
   if (!log_) return;
   // The SEND record's aux is the event loop's SendStatus
   // (talOS/events/event_loop_base.h): 0 OK, 1 refused, 2 failed.
@@ -884,7 +885,7 @@ void HardwareNode::Publish(ipc::Publisher<Packet>& publisher,
       .now = published,
   };
   log_->send(context, source_id,
-             std::as_bytes(std::span{&packet, std::size_t{1}}), aux,
+             std::as_bytes(std::span{&message, std::size_t{1}}), aux,
              status.sequence);
   ReportLogFailure();
 }

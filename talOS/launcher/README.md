@@ -1029,9 +1029,10 @@ payload without trailing zeros: a user topic's message size, and for a
 hardware packet its size word and encoded bytes from the config's devices,
 not the 1436 B `hardware::Packet` (`/hw/state` once per gateway tick, the
 Driver Station and `/hw/status` at 50 Hz, `/hw/request/<node>` at its node's
-rate). The hardware bridge logs only the State it publishes and the commands
-it sends, so only those count for it, the commands at one per actuator
-owner's request: the rate while owners change their demands. Byte topics are never logged. A member that did not answer `--describe`
+rate). The hardware bridge logs only the State it publishes, the commands
+it sends and its `/hw/status`, so only those count for it, the commands at
+one per actuator owner's request: the rate while owners change their
+demands. Byte topics are never logged. A member that did not answer `--describe`
 weighs as the mean of the others, and every member gets at least the
 smallest share at which its log rotates (two segments of its prefix and
 largest record) while those fit in the budget.
@@ -1408,9 +1409,13 @@ when no log does: a session from before the field, one with no bridge, or
 a bridge from before the field, whose `/hw/status` has another schema
 (`RecordedProtocolVersion`, `hardware_record.h`). Finding the bridge's
 costs a read of each log's header, and of the bridge's logs up to their
-first status, which the bridge publishes on its first tick, not a pass over
-the session. A session is a directory's own `manifest.json` and logs, or
-for a `.tlog` file named on its own, the `manifest.json` beside it and that
+first status, never past their first second of records: the bridge's
+`--log` records every status it publishes, on its first pass and every
+20 ms after, so each segment holds one within its first 20 ms unless the
+bridge stalled. A bridge log with none in its first second (one from
+before the bridge logged its statuses) records no version. A session is a
+directory's own `manifest.json` and logs, or for a `.tlog` file named on
+its own, the `manifest.json` beside it and that
 session's logs beside it when the manifest's `session_id` is the log
 header's (otherwise the file alone: a manifest of another session, or
 without a `session_id`, records nothing for it). When the bridge's and the

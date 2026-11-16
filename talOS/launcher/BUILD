@@ -240,7 +240,11 @@ cc_library(
     name = "hardware_record",
     srcs = ["hardware_record.cc"],
     hdrs = ["hardware_record.h"],
-    visibility = ["//studio/review:__pkg__"],
+    visibility = [
+        # node_test reads a real bridge log with it (REQ-OPS-51).
+        "//talOS/bridge:__pkg__",
+        "//studio/review:__pkg__",
+    ],
     deps = [
         "//talOS/bridge:messages",
         "//talOS/configuration",
@@ -545,6 +549,7 @@ cc_test(
         ":session",
         ":stop_signal_guard",
         ":supervision_events",
+        "//talOS/bridge:messages",
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/events:input_replay",
@@ -590,6 +595,7 @@ cc_test(
         ":log_budget",
         ":registry_cleanup",
         ":stop_signal_guard",
+        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_log",

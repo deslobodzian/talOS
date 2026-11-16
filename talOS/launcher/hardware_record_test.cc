@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -103,11 +104,12 @@ void WriteNodeLog(const std::string& path, std::uint64_t session_id) {
   ASSERT_FALSE(writer.failed()) << writer.error();
 }
 
-// The bridge's log at `path` of session `session_id`: a State, then two
-// /hw/status SENDs whose protocol_version_id is `version`, the topic
-// registered as a BridgeStatus layout of `schema_hash`.
+// The bridge's log at `path` of session `session_id`: a State, then, `late`
+// after it, two /hw/status SENDs whose protocol_version_id is `version`, the
+// topic registered as a BridgeStatus layout of `schema_hash`.
 void WriteBridgeLog(const std::string& path, std::uint64_t session_id,
-                    std::uint16_t version, std::uint64_t schema_hash) {
+                    std::uint16_t version, std::uint64_t schema_hash,
+                    std::chrono::nanoseconds late) {
   using Packet = talos::Descriptor<talos::hardware::Packet>;
   talos::event::Registration state;
   state.id = 0;
@@ -129,6 +131,10 @@ void WriteBridgeLog(const std::string& path, std::uint64_t session_id,
   ctx.now = ctx.event_time;
   ctx.publish_time = ctx.event_time;
   writer.send(ctx, 0, Encoded(talos::hardware::State{}), 0, 1);
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(
+      ctx.event_time.nanos() + late.count());
+  ctx.now = ctx.event_time;
+  ctx.publish_time = ctx.event_time;
   bridge::BridgeStatus status{};
   status.mutate_protocol_version_id(version);
   for (const std::uint64_t sequence : {1, 2}) {
@@ -520,24 +526,29 @@ TEST(HardwareProtocolCheck, ALogNamedAloneTakesItsSessionsManifest) {
   std::filesystem::remove_all(dir);
 }
 
-// Guards: a session is read under the hardware protocol its bridge recorded
-// on /hw/status, not the launcher's in its manifest, and a disagreement is
-// said in one line naming both; the manifest's is used only when no log
-// records a /hw/status of this build's BridgeStatus schema (none at all, a
-// node's copy, or one from before protocol_version_id: here another
-// layout's schema hash, its bytes this build's version); bridge runs of two
-// versions in one session refuse it, naming both. A log named alone is
-// read with its session's bridge log.
+// Guards: the manifest's version is used only when no log records a
+// /hw/status SEND of this build's BridgeStatus schema within its first
+// second: none at all, a node's copy, one from before protocol_version_id
+// (here another layout's schema hash, its bytes this build's version), or
+// one past the first second (the search is bounded); a bridge version other
+// than this build's refuses the session though the manifest's is this
+// build's; bridge runs of two versions in one session refuse it. A log named
+// alone is read with its session's bridge log. (A real bridge's log read
+// under its version over the manifest's: //talOS/bridge:node_test
+// ASessionIsReadUnderTheProtocolItsBridgeLogged.)
 // REQ-OPS-51
 TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
   constexpr std::uint16_t kBuild = talos::protocol::kProtocolVersion;
   constexpr std::uint16_t kOther = kBuild - 1;
   constexpr std::uint64_t kHash =
       talos::Descriptor<bridge::BridgeStatus>::kHash;
+  using std::chrono::milliseconds;
   struct Bridge {
     const char* file;
     std::uint16_t version;
     std::uint64_t schema_hash;
+    // The status SENDs' time after the log's first record.
+    milliseconds late{20};
   };
   struct Case {
     const char* label;
@@ -545,36 +556,41 @@ TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
     std::vector<Bridge> bridge;
     std::optional<std::uint16_t> version;
     bool refused;
-    // The bridge's and the launcher's versions the disagreement line names.
-    std::optional<std::pair<std::uint16_t, std::uint16_t>> disagreement;
+    // RecordedProtocol::bridge, ascending.
+    std::vector<std::uint16_t> bridge_versions;
+    bool disagreement;
   };
   const std::vector<Case> cases{
-      {"the launcher's another, the bridge's this",
-       kOther,
-       {{"hardware_node.tlog", kBuild, kHash}},
-       kBuild,
-       false,
-       std::pair{kBuild, kOther}},
       {"the launcher's this, the bridge's another",
        kBuild,
        {{"hardware_node.tlog", kOther, kHash}},
        kOther,
        true,
-       std::pair{kOther, kBuild}},
-      {"no /hw/status", kOther, {}, kOther, true, std::nullopt},
+       {kOther},
+       true},
+      {"no /hw/status", kOther, {}, kOther, true, {}, false},
       {"an old-schema /hw/status",
        kOther,
        {{"hardware_node.tlog", kBuild, kHash ^ 1}},
        kOther,
        true,
-       std::nullopt},
+       {},
+       false},
+      {"a /hw/status past the first second",
+       kOther,
+       {{"hardware_node.tlog", kBuild, kHash, milliseconds{1001}}},
+       kOther,
+       true,
+       {},
+       false},
       {"bridge runs of two versions",
        kBuild,
        {{"hardware_node.tlog", kBuild, kHash},
         {"hardware_node.restart1.tlog", kOther, kHash}},
        std::nullopt,
        true,
-       std::nullopt},
+       {kOther, kBuild},
+       false},
   };
   const std::string dir = testing::TempDir() + "/bridge_protocol";
   for (const auto& c : cases) {
@@ -588,35 +604,18 @@ TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
     WriteNodeLog(dir + "/drivetrain.tlog", 42);
     for (const auto& bridge : c.bridge) {
       WriteBridgeLog(dir + "/" + bridge.file, 42, bridge.version,
-                     bridge.schema_hash);
+                     bridge.schema_hash, bridge.late);
     }
     for (const auto& input : {dir, dir + "/drivetrain.tlog"}) {
       SCOPED_TRACE(input);
       const auto recorded = talos::launcher::RecordedProtocolVersion({input});
+      std::vector<std::uint16_t> bridge_versions = recorded.bridge;
+      std::sort(bridge_versions.begin(), bridge_versions.end());
+      EXPECT_EQ(bridge_versions, c.bridge_versions);
       EXPECT_EQ(recorded.version(), c.version);
       EXPECT_EQ(recorded.refused(), c.refused);
-      const std::string refusal = recorded.Refusal();
-      EXPECT_EQ(refusal.empty(), !c.refused) << refusal;
-      if (c.bridge.size() > 1) {
-        const std::string a = std::to_string(kBuild);
-        const std::string b = std::to_string(kOther);
-        EXPECT_TRUE(
-            refusal.find("protocols " + a + " and " + b) != std::string::npos ||
-            refusal.find("protocols " + b + " and " + a) != std::string::npos)
-            << refusal;
-      }
-      const std::string line = recorded.Disagreement();
-      EXPECT_EQ(line.empty(), !c.disagreement) << line;
-      if (c.disagreement) {
-        EXPECT_NE(line.find("bridge recorded hardware protocol " +
-                            std::to_string(c.disagreement->first)),
-                  std::string::npos)
-            << line;
-        EXPECT_NE(
-            line.find("its launcher " + std::to_string(c.disagreement->second)),
-            std::string::npos)
-            << line;
-      }
+      EXPECT_EQ(recorded.Refusal().empty(), !c.refused);
+      EXPECT_EQ(recorded.Disagreement().empty(), !c.disagreement);
     }
   }
   std::filesystem::remove_all(dir);

@@ -29,6 +29,8 @@
 #include <thread>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/input_replay.h"
 #include "talOS/events/log/log_writer.h"
@@ -931,8 +933,9 @@ TEST(LauncherTest, SessionReadersSkipALogCutBeforeItsHeader) {
 // REQ-OPS-32: a member's expected log bytes count what its log stores, at
 // the rate it stores it: /hw/state once per gateway tick and trimmed to its
 // encoded State (not the 1436 B Packet), for a 10 ms member too; a
-// latest-only watcher at most once per tick; the bridge only the State and
-// commands it logs, not the ends it declares and never logs.
+// latest-only watcher at most once per tick; the bridge only the State,
+// commands and statuses it logs (the statuses at 50 Hz, whatever its tick),
+// not the ends it declares and never logs.
 TEST(LauncherTest, ExpectedLogRateCountsWhatEachLogStoresAtItsRate) {
   const auto robot = config::ParseRobotConfigString(kFixtureToml);
   using event::SourceKind;
@@ -957,6 +960,8 @@ TEST(LauncherTest, ExpectedLogRateCountsWhatEachLogStoresAtItsRate) {
       {packet(SourceKind::SENDER, hardware::kStateTopic),
        packet(SourceKind::SENDER, hardware::kCommandTopic),
        packet(SourceKind::SENDER, hardware::kDriverStationTopic),
+       Endpoint(SourceKind::SENDER, ::bridge::topics::kStatus,
+                sizeof(::bridge::BridgeStatus)),
        packet(SourceKind::FETCHER, hardware::RequestTopic("alpha")),
        packet(SourceKind::FETCHER, hardware::RequestTopic("beta"))}};
   const TopicLoads loads = DeclaredTopicLoads({alpha, beta, bridge}, robot);
@@ -979,10 +984,12 @@ TEST(LauncherTest, ExpectedLogRateCountsWhatEachLogStoresAtItsRate) {
   EXPECT_DOUBLE_EQ(
       ExpectedLogRate(beta.declared, 10000, false, loads),
       200 * (64 + state.stored_bytes) + 100 * (64 + 48) + 100 * (64 + 62));
-  // The bridge: the States it publishes and the commands it sends, nothing
-  // for the Driver Station packets or the requests it only relays.
+  // The bridge: the States it publishes, the commands it sends and its
+  // statuses, nothing for the Driver Station packets or the requests it only
+  // relays.
   EXPECT_DOUBLE_EQ(ExpectedLogRate(bridge.declared, 5000, true, loads),
-                   200 * (64 + state.stored_bytes) + 100 * (64 + 62));
+                   200 * (64 + state.stored_bytes) + 100 * (64 + 62) +
+                       50 * (64 + sizeof(::bridge::BridgeStatus)));
 }
 
 // A control loop the OS kept at timeshare is warned about and recorded in the

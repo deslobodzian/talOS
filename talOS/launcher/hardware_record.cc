@@ -457,11 +457,21 @@ std::string ManifestConfigPath(const std::filesystem::path& session) {
   return "";
 }
 
+// How far into a log FirstBridgeStatusVersion looks, in record event time
+// from its first record. The bridge logs a /hw/status SEND on its first pass
+// and every 20 ms after (HardwareNode::kStatusPeriodUs), so each of its log
+// segments holds one within its first 20 ms unless the bridge stalled; a
+// bridge from before it logged its statuses holds none, and costs this much
+// of each segment, not the whole log.
+constexpr std::int64_t kBridgeStatusSearchNs = 1'000'000'000;
+
 // The protocol_version_id of the first /hw/status SEND in the log at `path`,
 // when its manifest registers /hw/status as a sender of this build's
-// BridgeStatus schema (and, with `session`, its header has that session id);
+// BridgeStatus schema (and, with `session`, its header has that session id)
+// and the SEND is within kBridgeStatusSearchNs of the log's first record;
 // nullopt otherwise, and for a log that will not open. Reads records only
-// of a log that registers such a sender, and only to that record.
+// of a log that registers such a sender, and only to that record or that
+// bound.
 std::optional<std::uint16_t> FirstBridgeStatusVersion(
     const std::string& path, std::optional<std::uint64_t> session) {
   using Status = ::bridge::BridgeStatus;
@@ -480,7 +490,12 @@ std::optional<std::uint16_t> FirstBridgeStatusVersion(
     }
     if (!id) return std::nullopt;
     event::log::LogReader::Record record;
+    std::optional<std::int64_t> first_ns;
     while (reader.next(record)) {
+      if (!first_ns) first_ns = record.header.event_time_ns;
+      if (record.header.event_time_ns - *first_ns > kBridgeStatusSearchNs) {
+        return std::nullopt;
+      }
       if (record.header.source_id != *id ||
           record.header.kind !=
               static_cast<std::uint16_t>(event::EventKind::SEND)) {
