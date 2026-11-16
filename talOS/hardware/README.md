@@ -306,15 +306,20 @@ sample reads 0 while its output sends no pulse.
 
 CAN bus load and measured sensor age must be checked on the actual bus before
 choosing production frequencies. Motion feedback requests the manifest status
-rate; motor voltage, stator current and fault field request
-`min(status_hz, 50)` Hz. A motor another motor follows also requests its duty
-cycle, and its voltage and duty cycle at no less than 20 Hz: a Phoenix
+rate; motor voltage, stator and supply current and fault field request
+`min(status_hz, 50)` Hz, device temperature `min(status_hz, 4)` Hz. A motor
+another motor follows also requests its duty cycle, at motor voltage's rate
+(the two share the TalonFX's MotorOutput status frame, `PRO_MotorOutput_*`
+in Phoenix's `SpnValue.hpp`, so a faster duty cycle would undo voltage's cap
+on a CAN 2.0 bus), and its voltage and duty cycle at no less than 20 Hz: a Phoenix
 follower copies its master's output signal (DutyCycle for duty-cycle
 requests, MotorVoltage for the others) at that signal's rate, which must be
 no slower than 20 Hz, while `status_hz` may be lower. Phoenix applies the
-highest requested rate to signals sharing a frame: with the pinned vendor library, voltage/current still apply
-at 200 Hz alongside 200 Hz motion feedback, while the fault field applies at
-50 Hz. See [vendor signal frequency semantics](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html#changing-update-frequency).
+highest requested rate to signals sharing a frame: under the pinned vendor
+library's simulation, where every signal but the fault field shares one
+frame, voltage/current still apply at 200 Hz alongside 200 Hz motion
+feedback, while the fault field applies at 50 Hz. Which signals share a
+frame on a physical bus has not been measured. See [vendor signal frequency semantics](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html#changing-update-frequency).
 The backend then calls
 `OptimizeBusUtilization()` on each TalonFX, CANcoder, and Pigeon2. Per-device
 optimization keeps the explicitly selected signals while stopping unused
