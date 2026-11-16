@@ -14,8 +14,8 @@
 #   --no-rio     skip JDK 17 and ./gradlew installRoboRioToolchain
 #   --no-lint    skip clang-format/clang-tidy 18 (pip wheels, used by
 #                tools/format.sh and tools/tidy.sh), buildifier
-#   --verify     afterwards build the launcher and the robot's nodes, then run
-#                the launcher with --describe-only on the 2026 robot config
+#   --verify     afterwards build the launcher and the bench robot's nodes,
+#                then run the launcher with --describe-only on its config
 #   -h, --help   this text
 #
 # Default installs everything. Re-running is safe: present components at an
@@ -25,7 +25,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RIO_DIR="$ROOT/controller_processor/rio"
-ROBOT_CONFIG="2026-robot/main_processor/configuration/robot.toml"
+# talOS's own robot (a team's robot lives in its own repository).
+ROBOT_CONFIG="bench/main_processor/configuration/robot.toml"
 
 # Pins. Bazel itself, Python 3.11, Node 22.14.0 and pnpm inside Bazel are
 # hermetic (MODULE.bazel); these are the tools that live outside it.

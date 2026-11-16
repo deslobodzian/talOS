@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# One command to run a robot in simulation (2026-robot unless --config).
+# One command to run a robot in simulation: talOS's bench robot
+# (bench/main_processor/configuration/) unless --config names another robot
+# in this checkout. A robot in its own repository, such as the 2026 robot,
+# runs there with `bazel run //:sim` (docs/FIRST_MECHANISM.md).
 #
 # Starts the WPILib simulation (which stands in for the RoboRIO and is the
 # Driver Station), the talOS node graph, and Studio, in dependency order.
@@ -22,9 +25,18 @@
 #   ./sim.sh --duration-s 30 stop the node graph after 30 seconds
 #   ./sim.sh --config my_robot/main_processor/configuration/robot.toml \
 #       --sim-gateway --no-studio
-#                            another robot (bazel run //tools:new_robot)
+#                            another robot in this checkout
+#                            (bazel run //tools:new_robot)
 #
 set -uo pipefail
+
+# The configs run without --config, relative to the repository root. Studio
+# needs no [studio] table: every key it reads has a default
+# (talOS/launcher/README.md "Studio bridge").
+#   the WPILib simulation, or --no-rio: the bench on the loopback controller
+DEFAULT_CONFIG="bench/main_processor/configuration/robot.toml"
+#   --sim-gateway: the bench against the physics simulator
+DEFAULT_SIM_CONFIG="bench/main_processor/configuration/robot_physics_sim.toml"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CALLER_DIR="$PWD"
@@ -51,15 +63,19 @@ die() { printf '\033[1;31msim.sh:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
   sed -n '3,${/^[^#]/q;p;}' "$0" | sed 's/^# \{0,1\}//'
-  cat <<'USAGE'
+  cat <<USAGE
 
 Options:
   --config FILE     the robot config to run, inside the repository: absolute,
                     or relative to the repository root, else to the current
                     directory (refused when it names a different file under
-                    each); default: 2026-robot's robot.toml, or
-                    robot_physics_sim.toml with --sim-gateway. Its generated
-                    manifest must be current
+                    each); its generated manifest must be current.
+                    Default, the bench robot:
+                      $DEFAULT_CONFIG
+                    and with --sim-gateway:
+                      $DEFAULT_SIM_CONFIG
+                    A robot in its own repository runs there instead:
+                    bazel run //:sim
   --headless       run the WPILib sim without its GUI (sets TALOS_SIM_DS=auto)
   --mode-schedule S script the Driver Station as mode:seconds phases
                     (disabled, auto, teleop, test; the last is held). With
@@ -177,9 +193,9 @@ fi
 # hardware_node and sim_gateway, and its [studio] bridge. Bazel and the
 # launcher take it relative to the repository root.
 if [ -z "$CONFIG" ]; then
-  CONFIG="2026-robot/main_processor/configuration/robot.toml"
+  CONFIG="$DEFAULT_CONFIG"
   if [ "$WANT_GATEWAY" = "1" ]; then
-    CONFIG="2026-robot/main_processor/configuration/robot_physics_sim.toml"
+    CONFIG="$DEFAULT_SIM_CONFIG"
   fi
 else
   # A relative path names the file under the repository root, else the one

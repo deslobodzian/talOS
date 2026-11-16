@@ -56,8 +56,8 @@ change is made and verified: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 ## Run in simulation
 
 ```sh
-./sim.sh --sim-gateway --no-studio   # lightweight simulator, no WPILib needed
-./sim.sh                             # WPILib simulation of the RoboRIO + Studio
+./sim.sh --sim-gateway --no-studio   # the bench robot on the lightweight simulator, no WPILib needed
+./sim.sh                             # the bench robot on WPILib's simulation of the RoboRIO + Studio
 ./sim.sh --help
 ./sim.sh --config my_robot/main_processor/configuration/robot.toml --sim-gateway --no-studio  # another robot inside talOS
 ```
@@ -68,7 +68,7 @@ A team's robot lives in its own repository and runs there with
 Check a robot's graph without starting it:
 
 ```sh
-bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configuration/robot.toml --describe-only
+bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --describe-only
 ```
 
 ## Debugging
