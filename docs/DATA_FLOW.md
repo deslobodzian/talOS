@@ -107,7 +107,7 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **9**.
+One datagram contains exactly one protocol frame, version **10**.
 The explicit little-endian header is **40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
@@ -128,8 +128,8 @@ classification and `--replay-inputs`
 So a bump makes earlier sessions' hardware packets unreadable to this build's
 tools, and a change without one decodes them wrongly with no warning. The
 `wire_golden_test`s in `talOS/hardware` and `talOS/driver_station` pin the
-bytes of a fully populated State, Command and Driver Station packet to the
-current version and fail on any change until it is bumped.
+bytes of a fully populated State, Command, configuration and Driver Station
+packet to the current version and fail on any change until it is bumped.
 
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
@@ -238,9 +238,9 @@ checks CRC32, deserializes and validates caps, then reconfigures. A new config I
 replaces the assembly; inconsistent metadata or invalid assembled data is
 rejected. Completion/backend failure or malformed data produces the 73-byte ACK
 with status/reason (`config_wire.h`, `endpoint.h`).
-Hardware configuration assembly rejects serialized totals above **10,083 B**
+Hardware configuration assembly rejects serialized totals above **10,099 B**
 (`kMaxSerializedConfigSize`) before allocation. Chunk data is limited to
-**1,408 B**; chunk counts cannot exceed 10,083 or the serialized byte count.
+**1,408 B**; chunk counts cannot exceed 10,099 or the serialized byte count.
 Transfer metadata and chunk geometry must remain consistent, and assembler
 exceptions reject the transfer without escaping the gateway safety loop.
 

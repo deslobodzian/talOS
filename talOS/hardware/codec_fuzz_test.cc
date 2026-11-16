@@ -113,6 +113,7 @@ TEST(HardwareCodecFuzzTest, BoundedMutations) {
   }
   Config config;
   config.motors.push_back({1, "drive", 1, "rio"});
+  config.motors.back().foc = true;  // Mutations reach a foc byte of 1.
   config.sensors.push_back({2, "encoder", SensorKind::kCANcoder, 2, "rio"});
   config.digital_inputs.push_back({3, "limit", 0});
   config.digital_outputs.push_back({4, "solenoid", 1});

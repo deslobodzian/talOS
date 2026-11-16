@@ -167,6 +167,7 @@ inline std::vector<uint8_t> SerializeConfig(const Config& c) {
       for (double val : {g.p, g.i, g.d, g.s, g.v, g.a, g.g}) w.Real(val);
       w.Int(static_cast<uint8_t>(g.gravity_type), 1);
     }
+    w.Int(m.foc ? 1 : 0, 1);
   }
 
   w.Int(c.sensors.size(), 2);
@@ -285,6 +286,9 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
         return false;
       g.gravity_type = static_cast<GravityType>(gravity_type);
     }
+    const auto foc = r.Int(1);
+    if (foc > 1) return false;
+    m.foc = foc != 0;
   }
 
   const auto sensor_count = r.Int(2);
@@ -440,13 +444,13 @@ inline ConfigChunkHeader DecodeConfigChunkHeader(const uint8_t* in) {
 // also carry a two-byte length; the remaining sizes mirror SerializeConfig.
 inline constexpr std::size_t kMaxConfigTextBytes = 2 + 63;
 inline constexpr std::size_t kMaxSerializedConfigSize =
-    17 + 7 * 2 + kMaxMotors * (277 + 2 * kMaxConfigTextBytes) +
+    17 + 7 * 2 + kMaxMotors * (278 + 2 * kMaxConfigTextBytes) +
     kMaxSensors * (16 + 2 * kMaxConfigTextBytes) +
     (kMaxDigitalInputs + kMaxDigitalOutputs + kMaxAnalogInputs +
      kMaxPwmOutputs) *
         (6 + kMaxConfigTextBytes) +
     kMaxEncoders * (27 + kMaxConfigTextBytes);
-static_assert(kMaxSerializedConfigSize == 10083,
+static_assert(kMaxSerializedConfigSize == 10099,
               "Serialized config maximum changed; update docs/DATA_FLOW.md");
 inline constexpr std::size_t kMaxConfigChunkData =
     protocol::kMaxPayloadSize - sizeof(ConfigChunkHeader);
