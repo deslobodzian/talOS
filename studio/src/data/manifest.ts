@@ -40,6 +40,10 @@ export type ManifestNode = {
   exit_signal: number;
   restart_count: number;
   recorder_failed: boolean;
+  // The run's event log has a marked gap: it dropped records and capture
+  // resumed (REQ-OPS-41); recorder_failed is set too. Absent in manifests
+  // written before the launcher recorded it, which parse as false.
+  log_gap?: boolean;
   described: boolean;
   // A run's live endpoints differed from its --describe probe (the launcher
   // README's "Live endpoints").
@@ -218,6 +222,7 @@ function parseNode(value: unknown, where: string): ManifestNode {
     exit_signal: 'exit_signal' in source ? integer(source, 'exit_signal') : 0,
     restart_count: integer(source, 'restart_count'),
     recorder_failed: flag(source, 'recorder_failed'),
+    log_gap: flag(source, 'log_gap'),
     described: flag(source, 'described'),
     endpoint_mismatch: flag(source, 'endpoint_mismatch'),
     record_count: countString(source, 'record_count')

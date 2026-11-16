@@ -93,6 +93,10 @@ test('parseManifest accepts string uint64 and missing optional flags', () => {
   assert.equal(m.nodes[0].recorder_failed, false);
   assert.equal(m.nodes[0].described, false);
   assert.equal(m.nodes[0].endpoint_mismatch, false);
+  // REQ-OPS-41: a manifest from before log_gap existed reads as no gap.
+  assert.equal(m.nodes[0].log_gap, false);
+  assert.equal(parseManifest(raw.replace('"record_count":0', '"record_count":0,"log_gap":true'))
+                   .nodes[0].log_gap, true);
   // A manifest from before exit_signal existed reads as no signal death.
   assert.equal(m.nodes[0].exit_signal, 0);
 });

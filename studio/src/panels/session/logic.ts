@@ -18,7 +18,7 @@ import {rateKey, type DeclaredGraph, type SystemGraph, type SystemNode} from '..
 // A problem worth the top of the list and a visible mark, in the order a
 // person cares about them.
 export type ProcessProblem =
-    'dead'|'restarted'|'recorder_failed'|'nonzero_exit'|'killed_by_signal'|
+    'dead'|'restarted'|'recorder_failed'|'log_gap'|'nonzero_exit'|'killed_by_signal'|
     'endpoint_mismatch'|'never_registered';
 
 export type ProcessRow = {
@@ -136,6 +136,7 @@ export function mergeProcesses(
     if (r && !graphStale && !r.alive) problems.push('dead');
     if (m && m.restart_count > 0) problems.push('restarted');
     if (m && m.recorder_failed) problems.push('recorder_failed');
+    if (m && m.log_gap) problems.push('log_gap');
     if (m && m.exit_code > 0) problems.push('nonzero_exit');
     const lastRun = m?.runs?.at(-1);
     // The launcher's own stop signal ending a member before it handled stops

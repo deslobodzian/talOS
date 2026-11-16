@@ -194,10 +194,11 @@ export class RecordedSource implements DataSource {
       stats: {skipped: 0, late: 0, invalid: 0},
       // A session whose hardware packets the server refused says why, so
       // its empty hardware panels are explained (REQ-OPS-51).
-      status: this.error ? `Review error: ${this.error}` :
+      // Log gaps are counted after either (REQ-OPS-41), nothing when none.
+      status: (this.error ? `Review error: ${this.error}` :
           this.bounds.hardware_not_decoded ?
           `Recorded session ${this.id} · ${this.bounds.hardware_not_decoded}` :
-          `Recorded session ${this.id}`,
+          `Recorded session ${this.id}`) + gapCount(this.bounds.gaps.length),
       connection: this.error ? 'error' : 'replay'
     };
   }
@@ -620,4 +621,34 @@ export function bucketSeries(channels: string[], buckets: SeriesBuckets, t0_ns: 
   });
   return {t0_ns, times: Float64Array.from(rowTimes, t => (t - t0) / 1e9),
           values, min, max, count};
+}
+
+function gapCount(n: number): string {
+  return n === 0 ? '' : n === 1 ? ' · 1 log gap' : ` · ${n} log gaps`;
+}
+
+// The narrowest gap band, as a fraction of the scrub bar, so a gap of a few
+// dropped records is still visible over a long session.
+export const GAP_MIN_WIDTH = 0.004;
+
+// A gap's band on the scrub bar: left and width as fractions of the session,
+// and the tooltip naming what was lost (REQ-OPS-41).
+export type GapBand = {left: number; width: number; title: string};
+
+export function gapBands(bounds: ReviewBounds): GapBand[] {
+  const start = BigInt(bounds.start_ns);
+  const span = Number(BigInt(bounds.end_ns) - start);
+  const at = (t: string) => span <= 0 ? 0 :
+      Math.min(1, Math.max(0, Number(BigInt(t) - start) / span));
+  return bounds.gaps.map(g => {
+    const width = Math.max(GAP_MIN_WIDTH, at(g.end_ns) - at(g.start_ns));
+    const left = Math.min(at(g.start_ns), 1 - width);
+    const seconds = (Number(BigInt(g.end_ns) - BigInt(g.start_ns)) / 1e9).toFixed(3);
+    return {
+      left, width,
+      title: `log gap in ${g.process}: ${seconds} s, lost ${g.records} records, ` +
+          `${g.dispatches} dispatches, ${g.sends} sends` +
+          (g.closed_at_flush ? '; closed at the stop' : '')
+    };
+  });
 }

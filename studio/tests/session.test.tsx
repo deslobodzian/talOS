@@ -360,3 +360,16 @@ test('mergeProcesses shows a launcher-stopped member as stopped', () => {
   assert.deepEqual(row('crashed').problems, ['killed_by_signal']);
   assert.deepEqual(row('killed').problems, ['killed_by_signal']);
 });
+
+// REQ-OPS-41: a run whose event log has a marked gap is named in the problem
+// list beside "recorder failed" (the launcher sets both); a run without the
+// field shows exactly what it did before.
+test('a run with a log gap is a problem beside recorder failed', () => {
+  const rows = mergeProcesses(manifest([
+    mnode({name: 'gapped', recorder_failed: true, log_gap: true}),
+    mnode({name: 'old'})
+  ]), null, null, {}, false);
+  const row = (name: string) => rows.find(r => r.name === name)!;
+  assert.deepEqual(row('gapped').problems, ['recorder_failed', 'log_gap']);
+  assert.deepEqual(row('old').problems, []);
+});
