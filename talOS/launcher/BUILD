@@ -366,6 +366,47 @@ cc_binary(
     ],
 )
 
+# stop_paths <session> [--config robot.toml]: the lines docs/BENCH.md
+# "Reading a trial" times each stop path between.
+py_binary(
+    name = "stop_paths",
+    srcs = [
+        "session_report.py",
+        "stop_paths.py",
+    ],
+    data = [":log_dump"],
+    visibility = ["//visibility:public"],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_test(
+    name = "stop_paths_test",
+    size = "small",
+    srcs = ["stop_paths_test.py"],
+    data = [
+        ":stop_paths",
+        ":stop_paths_fixture",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+cc_binary(
+    name = "stop_paths_fixture",
+    testonly = True,
+    srcs = ["testdata/stop_paths_fixture.cc"],
+    deps = [
+        ":continuity_message",
+        ":session",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/events:events_log",
+        "//talOS/events:gap_testing",
+        "//talOS/hardware",
+        "//talOS/hardware:config",
+        "//talOS/schema:identity",
+    ],
+)
+
 # bazel run //talOS/launcher:restart_latency -- --config <robot.toml> [...]
 # Per-stage SIGKILL-to-first-request restart latency; see README "Restart
 # latency". The config's nodes come from the workspace's bazel-bin.

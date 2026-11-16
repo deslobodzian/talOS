@@ -712,6 +712,7 @@ PREFIX="$HOME/talos-bench"     # installed bundles
 ROOT="$PREFIX/logs"            # one output root per session below; never /tmp
 REPORT=bazel-bin/talOS/launcher/session_report
 DUMP=bazel-bin/talOS/launcher/log_dump
+TRIALS=bazel-bin/talOS/launcher/stop_paths
 ```
 
 Each session gets its own output root, `--output-dir "$ROOT/<letter>"`:
@@ -723,7 +724,7 @@ so in one shared root a later launch would delete session B. For each
 session set `S="$ROOT/<letter>/<id>"` from the launcher's `Starting session
 <id>` line, and note its `[launcher] Event-log window <us> us` line: a
 session longer than 7/8 of that window loses its first trials to log
-rotation, so end it sooner. `REPORT` and `DUMP` are the binaries step 3
+rotation, so end it sooner. `REPORT`, `DUMP` and `TRIALS` are the binaries step 3
 built; they run outside `bazel run`, so no Bazel server restarts on the
 Mini between sessions.
 
@@ -761,7 +762,7 @@ Mini between sessions.
    after `git fetch` the first line of `git status -sb` shows no `ahead` or
    `behind`. Record `git rev-parse HEAD`.
 3. **The bundle, stamped, and the report tools**, on the Mini:
-   `bazel build --config=release //bench/main_processor:bench_bundle //talOS/launcher:session_report //talOS/launcher:log_dump`,
+   `bazel build --config=release //bench/main_processor:bench_bundle //talOS/launcher:session_report //talOS/launcher:log_dump //talOS/launcher:stop_paths`,
    then `grep -E '^(git_revision|git_dirty|config_sha256)' bazel-bin/bench/main_processor/bench_bundle/bundle_manifest.toml`.
    Pass: `git_revision` is HEAD and `git_dirty = false`. Without
    `--config=release` every report prints `Source revision: NOT RECORDED`
@@ -966,79 +967,30 @@ off (TODO.md DEPLOY-8).
 
 ### Reading a trial
 
-Save this as `$PREFIX/stop_paths.py`. It prints, for the publishing process
-of each stream, one line when its value changes (with when the previous
-value was last seen), a `PAUSE` line for every silence of more than 30 ms
-in a stream published every tick, and a `LOG GAP` line where a log lost
-records (a pause inside one is the log's, not the robot's). Times are
-`publish_ms`, milliseconds from the start of the session's logs on the
-Mini; `sample_us` is the RoboRIO's clock. It stops if the hardware
-packets were not decoded (a session of another protocol: read it with a
-build of that protocol, as `log_dump`'s warning says) and prints
-`UNDECODED` for a packet its codecs rejected.
-
-```python
-import json, re, sys
-
-PAUSE_MS = 30
-TICKED = ("/hw/state", "/hw/request/motor", "/motor/target/teleop")
-last_key, last_ms, seq = {}, {}, {}
-for line in sys.stdin:
-    r = json.loads(line)
-    topic, ms = r["topic"], r["publish_ms"]
-    if r["kind"] == "GAP":
-        g = r["gap"]
-        print(f"{g['start_ms']:12.3f} {r['process']:<14} LOG GAP to {g['end_ms']:.3f}: "
-              f"{g['records']} records lost ({g['cause']})")
-        continue
-    if r["kind"] != "SEND":
-        continue
-    stream = (r["process"], topic)
-    if topic.startswith("/hw/") and "hardware" not in r:
-        sys.exit("hardware packets not decoded: read this session with a build of its protocol")
-    h = r.get("hardware") or {}
-    if "error" in h:
-        print(f"{ms:12.3f} {r['process']:<14} {topic:<26} UNDECODED {h['error']}")
-        continue
-    kraken = next((m for m in h.get("motors", []) if m.get("name") == "kraken"), {})
-    if h.get("type") == "state":
-        if h["last_command_sequence"] != seq.get("value"):
-            seq = {"value": h["last_command_sequence"], "since_us": h["sample_time_us"]}
-        volts = kraken.get("voltage")
-        key = (h["enabled"], h["command_active"], h["epoch"],
-               volts is not None and abs(volts) < 0.05)
-        text = (f"sample_us={h['sample_time_us']} enabled={h['enabled']} "
-                f"active={h['command_active']} epoch={h['epoch']} "
-                f"since_us={seq['since_us']} kraken_v={volts} "
-                f"kraken_rps={kraken.get('velocity_rps')}")
-    elif h.get("type") == "command":
-        key = (kraken.get("mode"),)
-        text = f"observed_us={h['observed_time_us']} kraken={kraken.get('mode')} {kraken.get('demand')}"
-    elif h.get("type") == "driver_station":
-        key = (h["enabled"], h["estop"], h["mode"])
-        text = f"enabled={h['enabled']} estop={h['estop']} mode={h['mode']}"
-    else:
-        found = re.search(r"mode_since_us: (\d+), active: (true|false)", r["decoded"])
-        key = found.groups() if found else (r["decoded"],)
-        text = r["decoded"]
-    if topic in TICKED and stream in last_ms and ms - last_ms[stream] > PAUSE_MS:
-        print(f"{ms:12.3f} {r['process']:<14} {topic:<26} PAUSE {ms - last_ms[stream]:.1f} ms after {last_ms[stream]:.3f}")
-    if last_key.get(stream) != key:
-        since = f" (previous value last at {last_ms[stream]:.3f})" if stream in last_ms else ""
-        print(f"{ms:12.3f} {r['process']:<14} {topic:<26} {text}{since}")
-        last_key[stream] = key
-    last_ms[stream] = ms
-```
-
-```sh
-"$DUMP" "$S" --format jsonl \
-  --topic /hw/state,/hw/command,/hw/state/driver_station,/hw/request/motor,/motor/target/teleop \
-  | python3 "$PREFIX/stop_paths.py" > "$S/stop_paths.txt"
-```
+`"$TRIALS" "$S" > "$S/stop_paths.txt"`
+([`stop_paths`](../talOS/launcher/stop_paths.py), which runs `log_dump` on
+`/hw/state`, `/hw/command`, `/hw/state/driver_station`,
+`/hw/request/motor` and `/motor/target/teleop`) prints, for the publishing
+process of each stream, one line when its value changes (with when the
+previous value was last seen), a `PAUSE` line for every silence of more than
+30 ms in a stream published every tick (`/hw/state`, `/hw/request/motor`,
+`/motor/target/teleop`), and a `LOG GAP` line where a log lost records (a
+pause inside one is the log's, not the robot's). Times are `publish_ms`,
+milliseconds from the start of the session's logs on the Mini; `sample_us`
+is the RoboRIO's clock. A State line reads `sample_us`, `enabled`,
+`active`, `epoch`, `since_us` (the `sample_us` of the first State that
+acknowledged the current command), `kraken_v` and `kraken_rps`, and is
+printed when the enabled or active flag, the epoch, or whether `kraken_v`
+is at 0 (under 0.05 V) changes; a command or request line reads
+`observed_us` and `kraken=<mode> <demand>`; a Driver Station line `enabled`,
+`estop` and `mode`; a lane line its decoded envelope. It exits 1, printing
+nothing on stdout, if the hardware packets were not decoded (a session of
+another protocol: read it with a build of that protocol, as `log_dump`'s
+warning says), and prints `UNDECODED` for a packet its codecs rejected.
 
 Each trial is a few lines of `stop_paths.txt`. Where `kraken_v` reads
 `None`, the log was read without the config's device names: add
-`--config "$PREFIX/current/config/robot_bench.toml"`.
+`--config "$PREFIX/current/config/robot_bench.toml"` after `"$S"`.
 
 ### After the hour
 
