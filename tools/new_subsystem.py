@@ -3685,25 +3685,6 @@ def robot_configs(root, directory):
     return found
 
 
-def resolution_chain(path):
-    """`path` made absolute, then each path one more symlink in it leads
-    to, ending at its real path."""
-    chain = [os.path.abspath(path)]
-    for _ in range(40):  # the kernel's own symlink-hop limit
-        parts = chain[-1].strip(os.sep).split(os.sep)
-        for i in range(1, len(parts) + 1):
-            prefix = os.sep + os.path.join(*parts[:i])
-            if os.path.islink(prefix):
-                target = os.path.join(os.path.dirname(prefix),
-                                      os.readlink(prefix))
-                chain.append(os.path.normpath(os.path.join(target,
-                                                           *parts[i:])))
-                break
-        else:
-            break
-    return chain + [os.path.realpath(path)]
-
-
 def in_output_base(path):
     """Whether `path` is under a Bazel output base's external/ directory
     (an `external` with an `execroot` beside it)."""
@@ -3717,13 +3698,27 @@ def in_output_base(path):
     return False
 
 
-def checkout_problem(top, found_through=None):
+def in_contents_cache(path):
+    """Whether `path` is in Bazel's repository contents cache: under a
+    `contents` directory holding the cache's `gc_lock` (by default
+    <output user root>/cache/repos/v1/contents/<hash>/<uuid>)."""
+    ancestor = path
+    while os.path.dirname(ancestor) != ancestor:
+        ancestor = os.path.dirname(ancestor)
+        if (os.path.basename(ancestor) == "contents"
+                and os.path.isfile(os.path.join(ancestor, "gc_lock"))):
+            return True
+    return False
+
+
+def checkout_problem(top):
     """Why `top` is no talOS checkout a new repository may point at, or
-    None. It needs a MODULE.bazel naming the module talos, and neither it
-    nor any path that leads to it by symlinks (from `found_through`, else
-    `top`) may be in a Bazel output base: Bazel's copy of a fetched module,
-    there or in the repository contents cache an external/ entry links to,
-    is replaced or removed by Bazel."""
+    None. It needs a MODULE.bazel naming the module talos, and its files
+    may not live in Bazel's own storage: its real path (symlinks
+    resolved) may be neither under an output base's external/ (a fetched
+    module) nor in the repository contents cache, which Bazel replaces
+    or removes. Reached through an external/ symlink that ends in a
+    checkout (a local_path_override), it is that checkout."""
     try:
         with open(os.path.join(top, "MODULE.bazel"), encoding="utf-8") as f:
             module = f.read()
@@ -3731,10 +3726,13 @@ def checkout_problem(top, found_through=None):
         module = ""
     if not re.search(r'name\s*=\s*"talos"', module):
         return 'it has no MODULE.bazel with name = "talos"'
-    if any(in_output_base(path)
-           for path in resolution_chain(found_through or top)):
+    real = os.path.realpath(top)
+    if in_output_base(real):
         return ("it is Bazel's copy of a fetched module, under an output "
                 "base's external/ directory")
+    if in_contents_cache(real):
+        return ("it is Bazel's copy of a fetched module, in its repository "
+                "contents cache")
     return None
 
 
@@ -3742,7 +3740,7 @@ def talos_checkout(script):
     """The talOS checkout `script` (this file, through its runfiles symlink)
     lives in, or None when checkout_problem refuses it."""
     top = os.path.dirname(os.path.dirname(os.path.realpath(script)))
-    return None if checkout_problem(top, found_through=script) else top
+    return None if checkout_problem(top) else top
 
 
 def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",

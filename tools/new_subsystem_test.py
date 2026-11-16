@@ -693,15 +693,17 @@ class NewSubsystemTest(unittest.TestCase):
         # robot's talos/ submodule) and whose .bazelrc imports that
         # checkout's talos.bazelrc by the same path, not the robot
         # repository's flags (no copied talOS-only lines);
-        # when that talOS is Bazel's copy of a fetched module (under an
-        # output base's external/, or a symlink there into Bazel's
-        # repository contents cache), it refuses and writes nothing.
+        # when that talOS is Bazel's copy of a fetched module (a real
+        # directory under an output base's external/, or a symlink there
+        # into Bazel's repository contents cache), it refuses and writes
+        # nothing; reached through an external/ symlink to a checkout (a
+        # local_path_override), it is that checkout.
         def write(path, text):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
 
-        for case in ("checkout", "fetched", "cached"):
+        for case in ("checkout", "fetched", "cached", "override"):
             with self.subTest(case=case), \
                     tempfile.TemporaryDirectory() as top, \
                     mock.patch.object(new_subsystem.sync_manifest,
@@ -711,16 +713,23 @@ class NewSubsystemTest(unittest.TestCase):
                     "checkout": os.path.join(top, "robot", "talos"),
                     "fetched": os.path.join(top, "base", "external",
                                             "talos+"),
-                    "cached": os.path.join(top, "cache", "contents", "ab12"),
+                    # Bazel's layout: <repository cache>/contents (with
+                    # its gc_lock) / <hash> / <uuid>.
+                    "cached": os.path.join(top, "cache", "repos", "v1",
+                                           "contents", "ab12", "cd34"),
+                    "override": os.path.join(top, "robot", "talos"),
                 }[case]
                 os.makedirs(os.path.join(top, "base", "execroot"))
                 script_root = talos
-                if case == "cached":
+                if case in ("cached", "override"):
                     script_root = os.path.join(top, "base", "external",
                                                "talos+")
                     os.makedirs(talos)
                     os.makedirs(os.path.dirname(script_root))
                     os.symlink(talos, script_root)
+                if case == "cached":
+                    write(os.path.join(top, "cache", "repos", "v1",
+                                       "contents", "gc_lock"), "")
                 for directory, name in ((talos, "talos"),
                                         (os.path.join(top, "robot"),
                                          "robot")):
@@ -742,7 +751,7 @@ class NewSubsystemTest(unittest.TestCase):
                         contextlib.redirect_stderr(out):
                     status = new_subsystem.main(
                         ["arm", "--lang", "py", "--standalone", "../arm"])
-                if case != "checkout":
+                if case in ("fetched", "cached"):
                     self.assertNotEqual(status, 0, out.getvalue())
                     self.assertFalse(os.path.exists(target), out.getvalue())
                     continue
@@ -777,8 +786,11 @@ class NewSubsystemTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
 
+        # ../base/external/linked+ is a local_path_override's symlink to
+        # the checkout.
         cases = {".": False, "missing": False,
-                 "../base/external/talos+": False, "talos": True}
+                 "../base/external/talos+": False, "talos": True,
+                 "../base/external/linked+": True}
         for flag, accepted in cases.items():
             with self.subTest(flag=flag), \
                     tempfile.TemporaryDirectory() as top, \
@@ -797,6 +809,8 @@ class NewSubsystemTest(unittest.TestCase):
                     write(os.path.join(directory, "talos.bazelrc"),
                           f"# {name}\n")
                     write(os.path.join(directory, ".bazelversion"), "8.4.2\n")
+                os.symlink(os.path.join(robot, "talos"),
+                           os.path.join(top, "base", "external", "linked+"))
                 script = os.path.join(robot, "talos", "tools",
                                       "new_subsystem.py")
                 write(script, "")
