@@ -102,8 +102,13 @@ class InstallCheckTest(unittest.TestCase):
     # A bundle whose files link into a build tree (Bazel's sandbox stages a
     # test's runfiles so; a bundle copied with its links) must not install
     # as links that dangle once that tree is cleaned; a link that stays
-    # inside the bundle stays a link; a dangling link refuses the install
-    # before anything is copied, and the bundle installed before stays.
+    # inside the bundle stays a link. A link that cannot be copied as files
+    # refuses the install by its name before anything is written, and the
+    # bundle installed before stays: one that names nothing, directly or
+    # inside a directory a leaving link names; a loop inside such a
+    # directory and a link to the bundle's own ancestor, which the copy
+    # would follow until ELOOP or a full disk; and one naming a FIFO, socket
+    # or device, which the copy would block on or read forever.
     def test_install_copies_links_that_leave_the_bundle_as_files(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             src = os.path.join(tmp, "bundle")
@@ -143,15 +148,37 @@ class InstallCheckTest(unittest.TestCase):
             self.assertEqual(
                 os.readlink(os.path.join(installed, "robot.toml")),
                 "config/robot.toml", out)
+            libs = os.path.join(build_tree, "libs")
+            os.makedirs(libs)
             os.symlink(os.path.join(build_tree, "cleaned"),
-                       os.path.join(src, "missing_library"))
-            proc = install()
-            out = proc.stdout + proc.stderr
-            self.assertNotEqual(proc.returncode, 0, out)
-            self.assertIn("missing_library", out)
-            self.assertEqual(os.readlink(current), installed, out)
-            self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
-                             [os.path.basename(installed)], out)
+                       os.path.join(libs, "gone"))
+            loop = os.path.join(build_tree, "loop")
+            os.makedirs(loop)
+            os.symlink(".", os.path.join(loop, "self"))
+            os.mkfifo(os.path.join(build_tree, "pipe"))
+            # Each row's link, added alone; the name install must give.
+            # The ancestor row is last: before the fix its copy is the
+            # largest.
+            rows = (
+                ("missing_library", os.path.join(build_tree, "cleaned"),
+                 "missing_library"),
+                ("libs", libs, "libs/gone"),
+                ("loop", loop, "loop/self"),
+                ("pipe", os.path.join(build_tree, "pipe"), "pipe"),
+                ("up", tmp, "up"),
+            )
+            for link, target, named in rows:
+                os.symlink(target, os.path.join(src, link))
+                proc = install()
+                os.unlink(os.path.join(src, link))
+                out = f"{link}: " + proc.stdout + proc.stderr
+                self.assertNotEqual(proc.returncode, 0, out)
+                # Named relative to the bundle: the walk before the copy,
+                # not a failure of the copy itself.
+                self.assertIn(f"error: {named} -> ", out)
+                self.assertEqual(os.readlink(current), installed, out)
+                self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
+                                 [os.path.basename(installed)], out)
 
 
 if __name__ == "__main__":

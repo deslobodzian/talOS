@@ -383,10 +383,15 @@ check_graph() {
 # of it, or one that resolves outside it) is copied as the file or
 # directory it names, and one line counts them; a relative link that stays
 # inside is copied as a link, as cp -RP does (GNU and BSD alike), since
-# dereferencing it would duplicate its target. A link that names nothing
-# (dangling, or a loop) refuses the install before anything is written,
-# naming each. Python, as elsewhere here: BSD's readlink has no -f before
-# macOS 12.3, and macOS's bash is 3.2.
+# dereferencing it would duplicate its target. Before anything is written,
+# every leaving link is checked as the copy will follow it, through each
+# directory it names and every link there, and the install is refused,
+# naming each, for a link that names nothing (dangling, or a loop of links);
+# one naming neither a regular file nor a directory (a FIFO, socket or
+# device, which the copy would block on or read forever); and one naming a
+# directory that holds the link itself, the bundle or the install (a loop
+# the copy would follow until ELOOP or a full disk). Python, as elsewhere
+# here: BSD's readlink has no -f before macOS 12.3, and macOS's bash is 3.2.
 copy_bundle() {
   python3 - "$1" "$2" <<'EOF'
 import os
@@ -398,11 +403,64 @@ import sys
 bundle, dest = sys.argv[1:]
 
 
-def inside(path):
-    return os.path.commonpath([bundle, path]) == bundle
+def contains(outer, path):
+    return os.path.commonpath([outer, path]) == outer
 
 
-leaving, dangling = [], []
+# The install's real path: the copy must never follow a link into it.
+install = os.path.join(os.path.realpath(os.path.dirname(dest)),
+                       os.path.basename(dest))
+refusals = []
+
+
+def check_link(rel, path, holders, checked):
+    """Checks the link at `path` (`rel` in the bundle) as the copy follows
+    it: what it names, and, for a directory, everything in it. `holders`
+    are the real directories the copy is inside of when it reaches the
+    link; `checked` the directories already walked."""
+    target = os.readlink(path)
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as e:
+        refusals.append(f"{rel} -> {target}: names nothing ({e.strerror})")
+        return
+    if stat.S_ISREG(mode):
+        return
+    if not stat.S_ISDIR(mode):
+        refusals.append(f"{rel} -> {target}: names neither a regular file "
+                        "nor a directory")
+        return
+    real = os.path.realpath(path)
+    if any(contains(real, d)
+           for d in [bundle, install, os.path.realpath(os.path.dirname(path))]
+           + holders):
+        refusals.append(f"{rel} -> {target}: names a directory holding the "
+                        "link, the bundle or the install")
+        return
+    if real not in checked:
+        checked.add(real)
+        check_directory(rel, real, holders + [real], checked)
+
+
+def check_directory(rel, real, holders, checked):
+    try:
+        entries = sorted(os.scandir(real), key=lambda e: e.name)
+    except OSError as e:
+        refusals.append(f"{rel}: cannot be read ({e.strerror})")
+        return
+    for entry in entries:
+        sub = os.path.join(rel, entry.name)
+        if entry.is_symlink():
+            check_link(sub, entry.path, holders, checked)
+        elif entry.is_dir(follow_symlinks=False):
+            check_directory(sub, entry.path, holders + [entry.path], checked)
+        elif not entry.is_file(follow_symlinks=False):
+            refusals.append(f"{sub}: is neither a regular file nor a "
+                            "directory")
+
+
+leaving = []
+checked = set()
 # Does not descend into a linked directory: the link is judged whole.
 for parent, dirs, files in os.walk(bundle):
     for name in dirs + files:
@@ -412,16 +470,19 @@ for parent, dirs, files in os.walk(bundle):
         rel = os.path.relpath(path, bundle)
         target = os.readlink(path)
         if not os.path.exists(path):
-            dangling.append(f"{rel} -> {target}")
+            refusals.append(f"{rel} -> {target}: names nothing")
             continue
         named = os.path.normpath(os.path.join(os.path.dirname(rel), target))
         if (os.path.isabs(target) or named == os.pardir
                 or named.startswith(os.pardir + os.sep)
-                or not inside(os.path.realpath(path))):
-            leaving.append(rel)
-for link in dangling:
-    print(f"deploy: error: {link}: the link names nothing", file=sys.stderr)
-if dangling:
+                or not contains(bundle, os.path.realpath(path))):
+            before = len(refusals)
+            check_link(rel, path, [], checked)
+            if len(refusals) == before:
+                leaving.append(rel)
+for refusal in refusals:
+    print(f"deploy: error: {refusal}", file=sys.stderr)
+if refusals:
     sys.exit(1)
 if subprocess.call(["cp", "-RP", bundle, dest]) != 0:
     sys.exit(1)
