@@ -305,6 +305,20 @@ py_test(
     main = "trace_test.py",
 )
 
+# python3 tools/check_deps_listed.py (CI: the lint job)
+# docs/METHODOLOGY.md §13's "Bazel module" table lists exactly MODULE.bazel's
+# bazel_deps.
+py_test(
+    name = "check_deps_listed_test",
+    size = "small",
+    srcs = [
+        "check_deps_listed.py",
+        "check_deps_listed_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_deps_listed_test.py",
+)
+
 # python3 tools/check_commissioning.py --base <rev> (CI: the lint job)
 # RULES.md 4: no commit since the merge base sets `commissioned = true` or
 # changes a CAN id in a robot or bench config without the person's

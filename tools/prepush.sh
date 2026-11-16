@@ -24,8 +24,9 @@
 # or set an upstream); the steps still run, and the run exits 1.
 # Steps, in order: read-only, source-lints (tools/source_lints.sh, the
 # lints CI's "Source lints (no Bazel)" job runs: test time, links,
-# requirement trace, node test matrix, and commissioning against format's
-# base, not run when format checks every file; under a second), format
+# requirement trace, node test matrix, deps, and commissioning against
+# format's base, not run when format checks every file; under a second),
+# format
 # (tools/format.sh --check: clang-format 18 on the C/C++ files changed since
 # the merge base with origin/main, else with the upstream, else every file;
 # CI's clang-format job checks the same branch diff; FAILED also when
