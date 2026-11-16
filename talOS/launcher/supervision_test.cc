@@ -2139,6 +2139,110 @@ TEST(Supervision, SendsReadyThenWatchdogDatagrams) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// The service watchdog is what bounds a deployed session whose launcher
+// hangs (README "Supervision passes"; TODO.md LAUNCH-2): with the loop held
+// inside a pass (its clock read blocked), no WATCHDOG=1 goes out for three
+// watchdog intervals, and the pings resume once the loop does. A watchdog
+// thread, or any ping not sent by the loop itself, fails it.
+// REQ-OPS-07
+TEST(Supervision, AStalledLoopStopsFeedingTheServiceWatchdog) {
+  const std::string path = "/tmp/tw_" + std::to_string(::getpid());
+  ::unlink(path.c_str());
+  const int socket = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(socket, 0);
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+  ASSERT_EQ(::bind(socket, reinterpret_cast<const sockaddr*>(&address),
+                   static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                          path.size() + 1)),
+            0);
+  // 100 ms between pings (half of WATCHDOG_USEC).
+  constexpr auto kInterval = 100ms;
+  auto options = BaseOptions("watchdog_stall");
+  // Only bounds a hang: the test stops the session once it has judged it,
+  // and its own waits add up to at most about 30 s.
+  options.duration_s = 3 * kHangSeconds;
+  // The stubs never register; no heartbeat kill may end them meanwhile.
+  options.heartbeat_startup_grace_ms = 60'000;
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("watchdog_stall_hardware", kRunUntilStopped, "hardware_node");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("watchdog_stall_alpha", kRunUntilStopped);
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("watchdog_stall_beta", kRunUntilStopped);
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool stall = false;
+  bool stalled = false;
+  options.supervision_clock = [&] {
+    std::unique_lock lock{mutex};
+    if (stall) {
+      stalled = true;
+      changed.notify_all();
+      changed.wait(lock, [&] { return !stall; });
+    }
+    return std::chrono::steady_clock::now();
+  };
+  // Waits at most `bound` for one datagram: its text, or empty.
+  const auto receive =
+      [socket](std::chrono::milliseconds bound) -> std::string {
+    pollfd ready{socket, POLLIN, 0};
+    if (::poll(&ready, 1, static_cast<int>(bound.count())) <= 0) return {};
+    char buffer[64];
+    const auto size = ::recv(socket, buffer, sizeof(buffer), 0);
+    return size > 0 ? std::string(buffer, static_cast<std::size_t>(size))
+                    : std::string{};
+  };
+  bool pinged = false;
+  bool held = false;
+  std::string while_stalled;
+  bool resumed = false;
+  std::jthread driver{[&] {
+    for (int i = 0; i < 2 && !pinged; ++i)
+      pinged = receive(10s) == "WATCHDOG=1";
+    if (pinged) {
+      {
+        std::unique_lock lock{mutex};
+        stall = true;
+      }
+      SupervisionWakeup::Wake();
+      std::unique_lock lock{mutex};
+      held = changed.wait_for(lock, 10s, [&] { return stalled; });
+    }
+    if (held) {
+      // Sent before the loop stopped: queued already, drained here.
+      while (!receive(0ms).empty()) {
+      }
+      while_stalled = receive(3 * kInterval);
+    }
+    {
+      const std::lock_guard lock{mutex};
+      stall = false;
+    }
+    changed.notify_all();
+    if (held) resumed = receive(10s) == "WATCHDOG=1";
+    // Unpinged, the session is stuck before its loop; its deadline ends it.
+    if (pinged) ::kill(::getpid(), SIGTERM);
+  }};
+  ::setenv("NOTIFY_SOCKET", path.c_str(), 1);
+  ::setenv("WATCHDOG_USEC", "200000", 1);
+  const int status = RunSession(options);
+  ::unsetenv("NOTIFY_SOCKET");
+  ::unsetenv("WATCHDOG_USEC");
+  driver.join();
+  EXPECT_EQ(status, 0);
+  ASSERT_TRUE(pinged) << "no WATCHDOG=1 before the stall";
+  ASSERT_TRUE(held) << "the loop never read its clock once told to stall";
+  EXPECT_EQ(while_stalled, "")
+      << "a ping went out while the loop was held for "
+      << (3 * kInterval).count() << " ms (3 watchdog intervals)";
+  EXPECT_TRUE(resumed) << "no WATCHDOG=1 after the loop resumed";
+  ::close(socket);
+  ::unlink(path.c_str());
+  std::filesystem::remove_all(options.output_dir);
+}
+
 #ifdef __linux__
 TEST(Supervision, NotifierSupportsAbstractSocketNames) {
   // Abstract names live in the network namespace, which concurrent sandboxed
