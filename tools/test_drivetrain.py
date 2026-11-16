@@ -704,7 +704,7 @@ def run_disabled_scenario(root, output_root):
 
     Runs against the WPILib RoboRIO program, so it checks that program's own
     Driver Station gating; sim_gateway's disabled schedules
-    (`--mode-schedule`) are covered by simulation:startup_test.
+    (`--mode-schedule`) are covered by //talOS/simulation:sim_gateway_test.
     """
     output = Path(tempfile.mkdtemp(prefix="talos-disabled-", dir=output_root))
 

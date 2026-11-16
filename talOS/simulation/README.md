@@ -182,6 +182,9 @@ stalls timeshare work, and the nodes then correctly expire their targets.
 application. `launcher_ports_test` (integration, about 1 s) has the launcher
 start the bridge and the simulator on a config's non-default ports, with no
 port argument written by hand, and checks that the bridge publishes the
-simulator's State. A robot's full-graph tests against the simulator live
+simulator's State. `sim_gateway_test` (integration, about 1 s) runs the
+simulator alone: `--describe` and its flag checks, a run without a config,
+the Driver Station packets of a mode and joystick schedule, and the home
+switches `--physics` reads from a config. A robot's full-graph tests against the simulator live
 with the robot (the 2026 ones:
 [2026-robot simulation tests](../../2026-robot/main_processor/simulation/README.md)).
