@@ -407,9 +407,11 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   oldest segment, which may have held a GAP record, or the records after
   capture stopped) has no GAP record: `<log>.capped` beside the log, whichever
   of its segment files is read, or the session manifest's `log_capped` for
-  its member, shows it. Neither has a gap that its run's end cut short: a
-  writer that reached its `EXIT` wrote a GAP record for every gap
-  (`LogWriter::gaps`), so of a member the manifest marks `log_gap`
+  its member, shows it. Neither has a gap that its run's end cut short, nor
+  the tail a failed recorder lost (a disk error ends capture with no GAP
+  record): a writer that reached its `EXIT` wrote a GAP record for every gap
+  (`LogWriter::gaps`), so of a member the manifest marks `log_gap` or
+  `recorder_failed`
   ([session manifest](../launcher/README.md#session-manifest)), a run's log
   without its `EXIT` record is suspect and one with it is judged by its GAP
   records. Each recorded topic names the first such log it is fed from, or

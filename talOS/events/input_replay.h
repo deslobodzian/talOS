@@ -57,7 +57,8 @@ struct RecordedTopic {
   // The first log (in log_paths() order) this topic is fed from that input
   // replay refuses, and why, naming the sign it found: the log's
   // `<log>.capped` marker, the session manifest's `log_capped`, its
-  // `log_gap` for a run's log without its EXIT record, or a damaged stretch
+  // `log_gap` or `recorder_failed` for a run's log without its EXIT record,
+  // or a damaged stretch
   // (its byte offset) before which no receipt bounds the topic's lost
   // records (the replayed program's own receipts, fed at their drains'
   // event times, which need not follow the log's order; a reader's topic
@@ -104,8 +105,10 @@ struct RecordedMessage {
 // `<stem>.segment<k>.tlog` belongs to, or the session manifest's
 // `log_capped` for its member: its oldest segment deleted, which may have
 // held a GAP record, or capture stopped at the cap), and a run's log without
-// its EXIT record of a member the manifest marks `log_gap`, whose gap that
-// run's end may have cut short before its GAP record was written. A run's
+// its EXIT record of a member the manifest marks `log_gap` or
+// `recorder_failed`, whose gap that run's end may have cut short before its
+// GAP record was written, or whose recorder failed (a disk error ends
+// capture with no GAP record). A run's
 // log with its EXIT holds a GAP record for every gap (LogWriter::gaps) and
 // is judged by them. Each topic notes the first such log it is fed from
 // (refused_log), which ReplayInputs refuses, as it does a damaged stretch

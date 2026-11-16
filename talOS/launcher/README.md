@@ -850,7 +850,8 @@ may have lost records no GAP record marks is refused before the node runs,
 naming the log and the sign, and the launcher exits 1: one with a
 `<log>.capped` marker or of a member the session manifest marks
 `log_capped`, a run's log without its EXIT record of a member it marks
-`log_gap` ([session manifest](#session-manifest)), and one whose damaged
+`log_gap` or `recorder_failed` ([session manifest](#session-manifest)), and
+one whose damaged
 records nothing bounds the time of. See
 [input replay](../events/README.md#replaying-another-sessions-inputs) for
 timing and schema checks.
