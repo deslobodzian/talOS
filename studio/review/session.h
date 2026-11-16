@@ -35,10 +35,11 @@
 //
 // Hardware packets are served only from a session recorded under this
 // build's hardware protocol, decided once while indexing as log_dump decides
-// it (talos::launcher::HardwareProtocolCheck: the version manifest.json
-// records, then this build's codecs on every packet). Otherwise no hardware
-// topic is served, the Driver Station's included, and
-// hardware_not_decoded() holds log_dump's line, also printed on stderr.
+// it (talos::launcher::HardwareProtocolCheck: the version the session's
+// bridge recorded on /hw/status, else the one manifest.json records, then
+// this build's codecs on every packet). Otherwise no hardware topic is
+// served, the Driver Station's included, and hardware_not_decoded() holds
+// log_dump's line, also printed on stderr.
 //
 // A read selects records by publication time but walks a file by event
 // time, so it reads one second either side of the range: a message received

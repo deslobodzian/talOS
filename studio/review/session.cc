@@ -176,8 +176,11 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   std::size_t file = 0;
   bool any = false;
   std::vector<HardwareSample> samples;
-  talos::launcher::HardwareProtocolCheck protocol{
-      talos::launcher::RecordedProtocolVersion({dir.string()})};
+  auto recorded = talos::launcher::RecordedProtocolVersion({dir.string()});
+  if (const std::string line = recorded.Disagreement(); !line.empty()) {
+    std::cerr << "studio_review: " << dir.string() << ": " << line << '\n';
+  }
+  talos::launcher::HardwareProtocolCheck protocol{std::move(recorded)};
 
   const auto visit = [&](const talos::launcher::MergedRecord& r) {
     const auto* merged = r.log.get();

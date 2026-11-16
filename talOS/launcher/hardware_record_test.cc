@@ -14,13 +14,19 @@
 #include <utility>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/context.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/events/manifest.h"
+#include "talOS/events/time.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/launcher/session.h"
 #include "talOS/protocol/types.h"
+#include "talOS/schema/identity.h"
 
 namespace {
 
@@ -59,6 +65,77 @@ std::vector<std::byte> Encoded(const Message& message) {
   packet.size =
       static_cast<std::uint32_t>(talos::hardware::Encode(message, packet.data));
   return Record(packet);
+}
+
+// The registration of /hw/status as `kind` with this build's BridgeStatus
+// schema.
+talos::event::Registration StatusSource(std::uint16_t id,
+                                        talos::event::SourceKind kind) {
+  talos::event::Registration source;
+  source.id = id;
+  source.kind = kind;
+  source.name = std::string{bridge::topics::kStatus};
+  source.message_bytes = sizeof(bridge::BridgeStatus);
+  source.schema = talos::schema::Of<bridge::BridgeStatus>();
+  return source;
+}
+
+// A node's log at `path` of session `session_id` that reads /hw/status, as
+// every node's devices layer does, with a reader's copy of a status naming
+// protocol 1: not the bridge's own record.
+void WriteNodeLog(const std::string& path, std::uint64_t session_id) {
+  talos::event::log::LogWriter writer{
+      path, "drivetrain", talos::event::log::LogWriterOptions{4096, 1, false},
+      session_id};
+  writer.start({StatusSource(0, talos::event::SourceKind::WATCHER)},
+               talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  bridge::BridgeStatus status{};
+  status.mutate_protocol_version_id(1);
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::MESSAGE;
+  ctx.source_id = 0;
+  ctx.dispatch_index = 1;
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+  ctx.now = ctx.event_time;
+  ctx.publish_time = ctx.event_time;
+  writer.dispatch(ctx, std::as_bytes(std::span{&status, 1}));
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+}
+
+// The bridge's log at `path` of session `session_id`: a State, then two
+// /hw/status SENDs whose protocol_version_id is `version`, the topic
+// registered as a BridgeStatus layout of `schema_hash`.
+void WriteBridgeLog(const std::string& path, std::uint64_t session_id,
+                    std::uint16_t version, std::uint64_t schema_hash) {
+  using Packet = talos::Descriptor<talos::hardware::Packet>;
+  talos::event::Registration state;
+  state.id = 0;
+  state.kind = talos::event::SourceKind::SENDER;
+  state.name = std::string{talos::hardware::kStateTopic};
+  state.message_bytes = sizeof(talos::hardware::Packet);
+  state.schema = {std::string{Packet::kName}, Packet::kHash, {}};
+  talos::event::Registration status_source =
+      StatusSource(1, talos::event::SourceKind::SENDER);
+  status_source.schema.hash = schema_hash;
+  talos::event::log::LogWriter writer{
+      path, "hardware_node",
+      talos::event::log::LogWriterOptions{1 << 14, 1, false}, session_id};
+  writer.start({state, status_source},
+               talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::SEND;
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+  ctx.now = ctx.event_time;
+  ctx.publish_time = ctx.event_time;
+  writer.send(ctx, 0, Encoded(talos::hardware::State{}), 0, 1);
+  bridge::BridgeStatus status{};
+  status.mutate_protocol_version_id(version);
+  for (const std::uint64_t sequence : {1, 2}) {
+    writer.send(ctx, 1, std::as_bytes(std::span{&status, 1}), 0, sequence);
+  }
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
 }
 
 // The members of one JSON object, raw value text by key, at its top level
@@ -318,13 +395,15 @@ TEST_F(HardwareRecordTest, MalformedPayloadYieldsAnError) {
   }
 }
 
-// Guards: which sessions' hardware packets a build decodes. A manifest
-// recording another protocol refuses them all, though every packet decodes
-// under this build (the equal-length case), and the line names both
-// versions; without a recorded version a packet the codec rejects refuses
-// them; with this build's version recorded such a packet still refuses them
-// and the line names no other version; this build's version with packets
-// that decode, or no version with packets that decode, refuses none.
+// Guards: which sessions' hardware packets a build decodes. A recorded
+// version other than this build's refuses them all, though every packet
+// decodes under this build (the equal-length case), and the line names both
+// versions; so does a bridge that recorded two; the bridge's version decides
+// over the manifest's either way; without a recorded version a packet the
+// codec rejects refuses them; with this build's version recorded such a
+// packet still refuses them and the line names no other version; this
+// build's version with packets that decode, or no version with packets that
+// decode, refuses none.
 // REQ-OPS-51, REQ-OPS-15
 TEST(HardwareProtocolCheck, RecordedVersionFirstThenTheCodecs) {
   constexpr std::uint16_t kBuild = talos::protocol::kProtocolVersion;
@@ -333,21 +412,36 @@ TEST(HardwareProtocolCheck, RecordedVersionFirstThenTheCodecs) {
   const auto rejected = std::span{decodes}.first(100);
   struct Case {
     const char* label;
-    std::optional<std::uint16_t> recorded;
+    talos::launcher::RecordedProtocol recorded;
     bool reject;
     bool foreign;
     std::vector<std::uint16_t> named;
   };
   const std::vector<Case> cases{
       {"another version, packets decode",
-       kOther,
+       {kOther, {}},
        false,
        true,
        {kOther, kBuild}},
-      {"no version, a packet rejected", std::nullopt, true, true, {kBuild}},
-      {"this version, a packet rejected", kBuild, true, true, {kBuild}},
-      {"this version, packets decode", kBuild, false, false, {}},
-      {"no version, packets decode", std::nullopt, false, false, {}},
+      {"the bridge's another, the manifest's this",
+       {kBuild, {kOther}},
+       false,
+       true,
+       {kOther, kBuild}},
+      {"the bridge's two versions",
+       {std::nullopt, {kBuild, kOther}},
+       false,
+       true,
+       {kOther, kBuild}},
+      {"the bridge's this, the manifest's another",
+       {kOther, {kBuild}},
+       false,
+       false,
+       {}},
+      {"no version, a packet rejected", {}, true, true, {kBuild}},
+      {"this version, a packet rejected", {kBuild, {}}, true, true, {kBuild}},
+      {"this version, packets decode", {kBuild, {}}, false, false, {}},
+      {"no version, packets decode", {}, false, false, {}},
   };
   for (const auto& c : cases) {
     SCOPED_TRACE(c.label);
@@ -358,11 +452,18 @@ TEST(HardwareProtocolCheck, RecordedVersionFirstThenTheCodecs) {
     EXPECT_EQ(check.foreign(), c.foreign);
     const std::string line = check.Warning();
     EXPECT_EQ(line.empty(), !c.foreign) << line;
+    // The whole numbers the line names.
+    std::vector<std::string> numbers;
+    for (std::size_t at = line.find_first_of("0123456789");
+         at != std::string::npos;) {
+      const std::size_t end = line.find_first_not_of("0123456789", at);
+      numbers.push_back(line.substr(at, end - at));
+      at = end == std::string::npos ? end
+                                    : line.find_first_of("0123456789", end);
+    }
     for (const std::uint16_t version : {kOther, kBuild}) {
-      const bool named =
-          line.find("protocol " + std::to_string(version)) !=
-              std::string::npos ||
-          line.find("is " + std::to_string(version)) != std::string::npos;
+      const bool named = std::count(numbers.begin(), numbers.end(),
+                                    std::to_string(version)) > 0;
       EXPECT_EQ(named, std::count(c.named.begin(), c.named.end(), version) > 0)
           << version << ": " << line;
     }
@@ -379,11 +480,12 @@ TEST(HardwareProtocolCheck, ManifestRecordsThisBuildsVersion) {
   talos::launcher::SessionManifest manifest;
   manifest.config_path = "robot.toml";
   std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
-  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({dir}),
+  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({dir}).manifest,
             talos::protocol::kProtocolVersion);
   manifest.hardware_protocol_version.reset();
   std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
-  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({dir}), std::nullopt);
+  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({dir}).manifest,
+            std::nullopt);
 }
 
 // Guards: a .tlog named on its own (log_dump <session>/node.tlog) is read
@@ -404,15 +506,118 @@ TEST(HardwareProtocolCheck, ALogNamedAloneTakesItsSessionsManifest) {
     ASSERT_FALSE(writer.failed()) << writer.error();
   }
   const std::uint16_t other = talos::protocol::kProtocolVersion - 1;
-  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({log}), std::nullopt);
+  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({log}).version(),
+            std::nullopt);
   talos::launcher::SessionManifest manifest;
   manifest.hardware_protocol_version = other;
   for (const std::uint64_t session_id : {42, 43}) {
     SCOPED_TRACE(session_id);
     manifest.session_id = session_id;
     std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
-    EXPECT_EQ(talos::launcher::RecordedProtocolVersion({log}),
+    EXPECT_EQ(talos::launcher::RecordedProtocolVersion({log}).version(),
               session_id == 42 ? std::optional{other} : std::nullopt);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// Guards: a session is read under the hardware protocol its bridge recorded
+// on /hw/status, not the launcher's in its manifest, and a disagreement is
+// said in one line naming both; the manifest's is used only when no log
+// records a /hw/status of this build's BridgeStatus schema (none at all, a
+// node's copy, or one from before protocol_version_id: here another
+// layout's schema hash, its bytes this build's version); bridge runs of two
+// versions in one session refuse it, naming both. A log named alone is
+// read with its session's bridge log.
+// REQ-OPS-51
+TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
+  constexpr std::uint16_t kBuild = talos::protocol::kProtocolVersion;
+  constexpr std::uint16_t kOther = kBuild - 1;
+  constexpr std::uint64_t kHash =
+      talos::Descriptor<bridge::BridgeStatus>::kHash;
+  struct Bridge {
+    const char* file;
+    std::uint16_t version;
+    std::uint64_t schema_hash;
+  };
+  struct Case {
+    const char* label;
+    std::uint16_t manifest;
+    std::vector<Bridge> bridge;
+    std::optional<std::uint16_t> version;
+    bool refused;
+    // The bridge's and the launcher's versions the disagreement line names.
+    std::optional<std::pair<std::uint16_t, std::uint16_t>> disagreement;
+  };
+  const std::vector<Case> cases{
+      {"the launcher's another, the bridge's this",
+       kOther,
+       {{"hardware_node.tlog", kBuild, kHash}},
+       kBuild,
+       false,
+       std::pair{kBuild, kOther}},
+      {"the launcher's this, the bridge's another",
+       kBuild,
+       {{"hardware_node.tlog", kOther, kHash}},
+       kOther,
+       true,
+       std::pair{kOther, kBuild}},
+      {"no /hw/status", kOther, {}, kOther, true, std::nullopt},
+      {"an old-schema /hw/status",
+       kOther,
+       {{"hardware_node.tlog", kBuild, kHash ^ 1}},
+       kOther,
+       true,
+       std::nullopt},
+      {"bridge runs of two versions",
+       kBuild,
+       {{"hardware_node.tlog", kBuild, kHash},
+        {"hardware_node.restart1.tlog", kOther, kHash}},
+       std::nullopt,
+       true,
+       std::nullopt},
+  };
+  const std::string dir = testing::TempDir() + "/bridge_protocol";
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.label);
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    talos::launcher::SessionManifest manifest;
+    manifest.session_id = 42;
+    manifest.hardware_protocol_version = c.manifest;
+    std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
+    WriteNodeLog(dir + "/drivetrain.tlog", 42);
+    for (const auto& bridge : c.bridge) {
+      WriteBridgeLog(dir + "/" + bridge.file, 42, bridge.version,
+                     bridge.schema_hash);
+    }
+    for (const auto& input : {dir, dir + "/drivetrain.tlog"}) {
+      SCOPED_TRACE(input);
+      const auto recorded = talos::launcher::RecordedProtocolVersion({input});
+      EXPECT_EQ(recorded.version(), c.version);
+      EXPECT_EQ(recorded.refused(), c.refused);
+      const std::string refusal = recorded.Refusal();
+      EXPECT_EQ(refusal.empty(), !c.refused) << refusal;
+      if (c.bridge.size() > 1) {
+        const std::string a = std::to_string(kBuild);
+        const std::string b = std::to_string(kOther);
+        EXPECT_TRUE(
+            refusal.find("protocols " + a + " and " + b) != std::string::npos ||
+            refusal.find("protocols " + b + " and " + a) != std::string::npos)
+            << refusal;
+      }
+      const std::string line = recorded.Disagreement();
+      EXPECT_EQ(line.empty(), !c.disagreement) << line;
+      if (c.disagreement) {
+        EXPECT_NE(line.find("bridge recorded hardware protocol " +
+                            std::to_string(c.disagreement->first)),
+                  std::string::npos)
+            << line;
+        EXPECT_NE(
+            line.find("its launcher " + std::to_string(c.disagreement->second)),
+            std::string::npos)
+            << line;
+      }
+    }
   }
   std::filesystem::remove_all(dir);
 }

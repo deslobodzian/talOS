@@ -309,6 +309,7 @@ function HardwarePanel() {
         <Stat label="Subsystems" channel={`${HW}subsystem_count`}>
           {subsystemCount === undefined ? '—' : integer(subsystemCount)}
         </Stat>
+        <Stat label="Protocol" channel={`${HW}protocol_version_id`}>{count(num('protocol_version_id'))}</Stat>
         <Stat label="State age" channel={`${HW}state_age_us`} tone={stateAgeUs !== undefined && stateAgeUs > 20000 ? 'warn' : undefined}>
           {micros(stateAgeUs)}
         </Stat>

@@ -48,6 +48,7 @@ cc_library(
         "//talOS/hardware",
         "//talOS/introspection:names",
         "//talOS/node:testing",
+        "//talOS/protocol",
     ],
 )
 

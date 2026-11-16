@@ -20,7 +20,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -184,15 +183,17 @@ using GatewayLoop = event::SimulatedEventLoop<event::log::LogWriter>;
 // a State every 5 ms for the config's motor m2 of replay_motor, its
 // position moving, stamped with this config's id, a gateway boot id and
 // the gateway's clock, 195 s behind this host's, and on every fourth State
-// the bridge's /hw/status with the clock mapping for that boot. No Driver
-// Station.
+// the bridge's /hw/status with the clock mapping for that boot and the
+// bridge's hardware protocol (this build's unless given). No Driver Station.
 class RealGateway {
  public:
   static constexpr std::uint64_t kBootId = 1989997566370484863ULL;
   static constexpr std::int64_t kGatewayBehindUs = 195'000'000;
 
-  RealGateway(GatewayLoop& loop, const config::RobotConfig& config)
+  RealGateway(GatewayLoop& loop, const config::RobotConfig& config,
+              std::uint16_t protocol_version = protocol::kProtocolVersion)
       : config_id_{hardware::ConfigurationId(config.hardware)},
+        protocol_version_{protocol_version},
         motor_id_{config.GetDevices("replay_motor")->motors.front()},
         state_{
             event::make_sender<hardware::Packet>(loop, hardware::kStateTopic)},
@@ -228,12 +229,14 @@ class RealGateway {
       status.mutate_clock_boot_id(kBootId);
       status.mutate_clock_offset_us(kGatewayBehindUs);
       status.mutate_clock_offset_valid(true);
+      status.mutate_protocol_version_id(protocol_version_);
       status_.send(status);
     }
     ++ticks_;
   }
 
   std::uint64_t config_id_;
+  std::uint16_t protocol_version_;
   std::uint16_t motor_id_;
   event::Sender<GatewayLoop, hardware::Packet> state_;
   event::Sender<GatewayLoop, ::bridge::BridgeStatus> status_;
@@ -623,24 +626,28 @@ TEST_F(ReplayInputsTest, AReplayedNodeKeepsNoSessionState) {
   std::filesystem::remove_all(out);
 }
 
-// REQ-OPS-51: a session whose manifest records another hardware protocol is
-// not replayed: its States would reach the node's devices layer decoded
-// with this build's layout (an equal-length change decodes, wrongly), and a
+// REQ-OPS-51: a session whose bridge recorded another hardware protocol on
+// /hw/status is not replayed, though its manifest records this build's (the
+// launcher's): its States would reach the node's devices layer decoded with
+// this build's layout (an equal-length change decodes, wrongly), and a
 // replay is compared with the recording, which another protocol's run
 // cannot match. The node is not started, so it writes no log.
 TEST_F(ReplayInputsTest, ASessionOfAnotherHardwareProtocolIsRefused) {
   Record();
   const std::string session = CopyOfSession("other_protocol");
   {
-    std::ifstream in{session + "/manifest.json"};
-    std::string text{std::istreambuf_iterator<char>{in}, {}};
-    const std::string field = "\"hardware_protocol_version\": ";
-    const auto at = text.find(field);
-    ASSERT_NE(at, std::string::npos) << text;
-    const auto end = text.find(',', at);
-    text.replace(at + field.size(), end - at - field.size(),
-                 std::to_string(protocol::kProtocolVersion - 1));
-    std::ofstream{session + "/manifest.json"} << text;
+    const event::MonotonicTime origin =
+        event::MonotonicTime::from_nanos(2'038'406'047'920);
+    event::SimulationEnvironment environment;
+    GatewayLoop loop{
+        environment,
+        event::log::LogWriter{session + "/hardware_node.tlog", "hardware_node",
+                              event::log::LogWriterOptions{}, 1},
+        GatewayLoop::Options{.start = origin}};
+    RealGateway gateway{loop, config::ParseRobotConfig(config_),
+                        protocol::kProtocolVersion - 1};
+    loop.run_until(origin + std::chrono::milliseconds{20});
+    loop.finish();
   }
   const std::string out = TempPath("other_protocol_out");
   std::filesystem::remove_all(out);

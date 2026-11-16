@@ -470,13 +470,15 @@ the channel model refuses ([telemetry](../talOS/telemetry/README.md#automatic-ch
 is not reviewed and is named on stderr; a log of another format version, or
 a session with no intact record, is refused (422) naming the file, and only
 that session's requests fail. A session whose hardware packets `log_dump`
-would not decode (its manifest records another hardware protocol, or this
-build's codecs reject one of its packets:
+would not decode (its bridge, or without a bridge's its manifest, records
+another hardware protocol, or this build's codecs reject one of its
+packets:
 [which logs a build can read](../talOS/launcher/README.md#which-logs-a-build-can-read))
 serves no hardware channel, the Driver Station's included, while its other
 topics are served; its `bounds.json` carries `log_dump`'s line, without its
 `warning: ` prefix, as `hardware_not_decoded` (null otherwise), and the
-server prints it on stderr. The Studio page shows that line, as text, after
+server prints it on stderr. It also prints there the line `log_dump` gives
+a session whose bridge and launcher recorded different protocols. The Studio page shows that line, as text, after
 the session id in its status (the header, where hovering shows it whole, and
 the Health panel's Status).
 

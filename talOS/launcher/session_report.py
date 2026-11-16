@@ -67,10 +67,15 @@ TARGET_AGE_LIMIT_MS = 25
 DAMAGED_LOG = re.compile(r"^warning: (damaged log .*)$", re.MULTILINE)
 
 # log_dump's one stderr line for a session whose hardware packets it did
-# not decode: its manifest records another hardware protocol, or this
+# not decode: it records another hardware protocol, or this
 # build's codecs reject one of them (talOS/launcher/hardware_record.h).
 HARDWARE_NOT_DECODED = re.compile(r"^log_dump: warning: (hardware packets not decoded: .*)$",
                                   re.MULTILINE)
+
+# log_dump's one stderr line for a session whose bridge and launcher
+# recorded different hardware protocols; it reads the bridge's.
+HARDWARE_PROTOCOL_DISAGREES = re.compile(r"^log_dump: (warning: the session's bridge recorded .*)$",
+                                         re.MULTILINE)
 
 
 # The loops on the actuation path (talOS/process LoopTier): a gap in one is a
@@ -596,6 +601,8 @@ def main():
         result = subprocess.run([log_dump_path(), "--format", "jsonl", str(args.session)],
                                 capture_output=True, text=True, check=True)
         not_decoded = HARDWARE_NOT_DECODED.search(result.stderr)
+        for disagreement in HARDWARE_PROTOCOL_DISAGREES.findall(result.stderr):
+            print(f"session_report: {disagreement}", file=sys.stderr)
         report = analyze(manifest, [json.loads(line) for line in result.stdout.splitlines()],
                          DAMAGED_LOG.findall(result.stderr),
                          launcher_drops(args.session, manifest),

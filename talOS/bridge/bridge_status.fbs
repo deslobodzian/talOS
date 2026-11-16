@@ -177,6 +177,11 @@ struct BridgeStatus {
   // as one number (0 when unknown; print it with %016llx).
   gateway_program:GatewayProgram;
   gateway_build_dirty:bool;
+  // The hardware protocol this bridge's own build encodes and decodes
+  // (protocol::kProtocolVersion), on every status: what the log tools read a
+  // session's hardware packets under (talOS/launcher/hardware_record.h). It
+  // fills the padding after gateway_build_dirty.
+  protocol_version_id:uint16;
   gateway_build_id:uint64;
   // Causal two-way bound, including residence time, quantization and 1000 ppm
   // relative oscillator drift. Local logs only (excluded from robot radio).

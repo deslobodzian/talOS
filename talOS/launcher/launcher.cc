@@ -22,7 +22,6 @@
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/process/process.h"
-#include "talOS/protocol/types.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
@@ -935,15 +934,19 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
   // A replay of another hardware protocol's session would hand the node's
   // devices layer States in another layout, decoded with this build's (one
   // that kept every length decodes, wrongly), and could not match the
-  // recording it is compared with. A session whose manifest records no
-  // version is replayed: its States that this build's codec rejects are no
-  // State to the node (hardware_record.h, "Which logs a build can read").
-  if (const auto recorded = RecordedProtocolVersion({options_.replay_inputs});
-      recorded && *recorded != protocol::kProtocolVersion) {
+  // recording it is compared with. The version is the one the session's
+  // bridge recorded, else its manifest's. A session that records none is
+  // replayed: its States that this build's codec rejects are no State to
+  // the node (hardware_record.h, "Which logs a build can read").
+  const RecordedProtocol recorded =
+      RecordedProtocolVersion({options_.replay_inputs});
+  if (const std::string line = recorded.Disagreement(); !line.empty()) {
+    std::cerr << "launcher: --replay-inputs " << options_.replay_inputs << ": "
+              << line << "\n";
+  }
+  if (recorded.refused()) {
     std::cerr << "launcher: --replay-inputs " << options_.replay_inputs
-              << " was recorded under hardware protocol " << *recorded
-              << "; this build's is " << protocol::kProtocolVersion
-              << " (manifest.json hardware_protocol_version): not replayed\n";
+              << " was " << recorded.Refusal() << ": not replayed\n";
     return 1;
   }
 

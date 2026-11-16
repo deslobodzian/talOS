@@ -830,6 +830,7 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       latest_state_.counters.device_reset_count,
       static_cast<bridge::GatewayProgram>(latest_state_.build.program),
       latest_state_.build.dirty,
+      protocol::kProtocolVersion,
       latest_state_.build.revision,
       clock_.uncertainty_us(),
       clock_.round_trip_us(),

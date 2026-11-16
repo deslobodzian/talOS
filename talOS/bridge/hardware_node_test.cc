@@ -755,6 +755,10 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   ASSERT_TRUE(published.has_value());
   const bridge::BridgeStatus first = published.value_or(bridge::BridgeStatus{});
   EXPECT_TRUE(first == initial);
+  // Guards: every status names the hardware protocol of the bridge's own
+  // build, before any State, so a session's log tools read its packets
+  // under what the bridge spoke, not the launcher's constant. REQ-OPS-51
+  EXPECT_EQ(first.protocol_version_id(), protocol::kProtocolVersion);
 
   ASSERT_TRUE(link.OpenGateway());
   protocol::RuntimeUdpPeer& gateway = link.gateway;
