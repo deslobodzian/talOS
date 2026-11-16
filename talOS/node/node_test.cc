@@ -1740,6 +1740,7 @@ TEST(Binary, ARunWhoseOwnLogHasAGapExits1) {
       }
     }
     std::vector<char*> argv;
+    argv.reserve(words.size());
     for (std::string& word : words) argv.push_back(word.data());
     ::testing::internal::CaptureStdout();
     const int status =
