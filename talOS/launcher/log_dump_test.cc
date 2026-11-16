@@ -116,9 +116,12 @@ class LogDumpTest : public testing::Test {
     return std::find(lines.begin(), lines.end(), line) != lines.end();
   }
 
-  std::string Run(std::vector<std::string> args, bool success = true) {
+  // Dumps the session directory, or only the paths in `args` when
+  // `session` is false.
+  std::string Run(std::vector<std::string> args, bool success = true,
+                  bool session = true) {
     args.insert(args.begin(), binary_);
-    args.push_back(directory_);
+    if (session) args.push_back(directory_);
     const std::string output = directory_ + "/output.txt";
     const pid_t child = fork();
     if (child == 0) {
@@ -445,6 +448,21 @@ TEST_F(LogDumpTest, LogNamedTwiceIsReadOnce) {
   const std::string alpha = directory_ + "/alpha.tlog";
   const auto records = Run({"--format", "jsonl", alpha, alpha});
   EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 4) << records;
+}
+
+// Guards: a log file dumped alone is timed from its own first record, not
+// the session's, and the text dump names that baseline so a reader can
+// tell the two apart (beta's first record is 10 ms into the session).
+// REQ-OPS-15
+TEST_F(LogDumpTest, TextDumpNamesTheBaselineItsTimesCountFrom) {
+  const auto alone = Run({directory_ + "/beta.tlog"}, true, false);
+  EXPECT_NE(alone.find("\ntimes: ms after event time 1010000000 ns,"),
+            std::string::npos)
+      << alone;
+  const auto session = Run({});
+  EXPECT_NE(session.find("\ntimes: ms after event time 1000000000 ns,"),
+            std::string::npos)
+      << session;
 }
 
 // Guards: the summary a student reads to see whether a mechanism moved. Per

@@ -774,6 +774,12 @@ int main(int argc, char** argv) {
   for (std::size_t i = 0; i < log_files.size(); ++i) {
     std::printf("  [%zu] %s\n", i, log_files[i].c_str());
   }
+  // A file named alone has its own baseline; its session directory gives
+  // the session's.
+  std::printf(
+      "times: ms after event time %lld ns, the earliest record of these "
+      "logs\n",
+      static_cast<long long>(base_ns));
   std::printf("\nrecords (monotonic time ordered):\n");
 
   std::map<std::string, std::size_t> counts_by_process;
