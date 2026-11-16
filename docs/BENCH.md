@@ -212,8 +212,9 @@ is the same graph for the physics simulator only (`simulation_only`; launch it w
   the way `encoder_absolute_position_rot` rises, and a positive drive demand
   rolls the wheel forward at heading 0. Record the reductions, the offset
   and the directions.
-- [ ] Review supply 30 A, stator 40 A, hardware voltage ceiling 4 V, node
-  `max_bench_voltage_v = 2.0`, node `max_bench_torque_current_a = 0.0` (torque
+- [ ] Review supply 30 A, stator 40 A, hardware voltage ceiling
+  `max_voltage = 2.0` (every mode), node `max_bench_voltage_v = 2.0` (the
+  axis scale), node `max_bench_torque_current_a = 0.0` (torque
   mode off), ratio 1.0, velocity ceiling 30 rps and slot0 gains
   (measured feedforward 0.095 V/rotor-rps). Expected: these match the bare
   motor and power source. Record reviewed limits; raise deliberately only after
@@ -238,8 +239,11 @@ is the same graph for the physics simulator only (`simulation_only`; launch it w
 - [ ] With axis centred, hold button 1 (10 rps), release, then button 2
   (30 rps); release and disable. Expected: VELOCITY/TELEOP while held, neutral
   on release. Button 1 wins if both are held; buttons override axis mode.
-  Record requested/measured speed, voltage, current and overshoot. A 4 V ceiling
-  may prevent reaching 30 rps under load; do not raise limits automatically.
+  Record requested/measured speed, voltage, current and overshoot. Button 2
+  asks more than the free speed at `max_voltage` 2 V (about 21 rps,
+  [below](#torque-current-hardware-only)): expected, it levels there, less
+  under load, with applied voltage at most 2 V. That is the limit holding;
+  do not raise limits automatically.
   Then hold button 3 (torque current): NEUTRAL/NONE and no motion, since
   `max_bench_torque_current_a = 0.0` keeps torque mode off
   ([torque current](#torque-current-hardware-only) turns it on).
@@ -363,12 +367,12 @@ It runs inside or after the
 [supervised enabled session](#one-supervised-enabled-session), under its
 rule for people: a spotter whose only job is the Driver Station's disable
 and e-stop, hands on them for every enabled step. Leave `max_voltage` as
-committed (the session's commissioning commit sets it to `2.0`; it is `4.0`
-before that): torque mode is bounded only by that duty cap.
-`max_velocity_rps` (30) bounds velocity demands alone, so at
-`max_voltage = 4.0` button 3 reaches about 42 rps, faster than the velocity
-buttons. The rotor's free speed is about `max_voltage` / 0.095 rps (slot0
-`v`, 0.095 V per rps): about 21 rps at 2 V, 42 rps at 4 V.
+committed (`2.0`): torque mode is bounded only by that duty cap, not by
+`max_velocity_rps` (30), which bounds velocity demands alone. The rotor's
+free speed is about `max_voltage` / 0.095 rps (slot0 `v`, 0.095 V per
+rps): about 21 rps at 2 V, where button 3 levels as button 2 does; a raised
+`max_voltage` would take it past the velocity buttons (about 42 rps at
+4 V).
 
 - [ ] As a local change, reverted after, set in
   [the motor config](../bench/main_processor/configuration/subsystems/motor.toml)
@@ -651,17 +655,17 @@ workstation between sessions.
    before session A. Its first enabled step (axis 1, slightly) is session B's
    first spell; its button 1 and 2 step and its swerve module steps are not
    part of this hour. `commissioned = true` makes every bench device live,
-   the swerve module's drive (5) and steer (6) included. The node's
-   `max_bench_voltage_v = 2.0` bounds only VOLTAGE mode (TODO.md BENCH-1).
-   Every voltage-based request the bench sends (VoltageOut, VelocityVoltage,
+   the swerve module's drive (5) and steer (6) included. Every
+   voltage-based request the bench sends (VoltageOut, VelocityVoltage,
    PositionVoltage; no bench node sends DutyCycleOut, nor TorqueCurrentFOC
    at the committed `max_bench_torque_current_a = 0.0`) is bounded by the
    motor's `max_voltage`, which the Talon is configured with as its peak
    voltage; the gateway neutralizes that motor for a command whose VOLTAGE
-   demand or feedforward exceeds it. It is `4.0` on line 24 of `motor.toml`
-   (`[motors.kraken]`) and on lines 32 and 50 of `swerve_module.toml`
+   demand or feedforward exceeds it. The bare motor's is committed at `2.0`
+   (`[motors.kraken]` in `motor.toml`): check that it reads `2.0`. The
+   swerve module's are `4.0` on lines 32 and 50 of `swerve_module.toml`
    (`[motors.drive]`, `[motors.steer]`). In the same reviewed commit the
-   person sets all three to `2.0` and updates the golden test
+   person sets those two to `2.0` and updates the golden test
    ([`config_golden_test.cc`](../bench/main_processor/configuration/config_golden_test.cc),
    which asserts uncommissioned and each `max_voltage`), then runs the tests
    the change affects, [DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)'s

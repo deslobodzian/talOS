@@ -2,6 +2,10 @@
 name = "motor"
 node = "//bench/main_processor/motor:node"
 period_us = 5000
+# VOLTAGE mode's scale and clamp in the node: full stick on axis 1 asks this
+# many volts, and no VOLTAGE target asks more. Equal to [motors.kraken]
+# max_voltage below, which bounds every mode; this one alone keeps the axis
+# at 2 V if a person raises that.
 max_bench_voltage_v = 2.0
 # TORQUE_CURRENT's cap, stator amperes. 0 keeps torque mode off, so button 3
 # drives nothing, until a person who has confirmed the Kraken's Phoenix Pro
@@ -20,8 +24,10 @@ inverted = false
 brake = false
 supply_limit_a = 30.0
 stator_limit_a = 40.0
-# Raise deliberately only after the first supervised spin.
-max_voltage = 4.0
+# The Talon's peak voltage, so it bounds every mode: VOLTAGE, the VELOCITY
+# buttons and TORQUE_CURRENT's duty cap. Raise deliberately only after the
+# first supervised spins (docs/BENCH.md).
+max_voltage = 2.0
 sensor_to_mechanism_ratio = 1.0
 max_velocity_rps = 30.0
 cruise_velocity_rps = 10.0
@@ -39,6 +45,8 @@ defaults = { mode = "VOLTAGE", voltage_v = 0.0, velocity_rps = 0.0, voltage_frac
 button = 1
 while_held = { mode = "VELOCITY", velocity_rps = 10.0 }
 
+# 30 rps is past the free speed at max_voltage (2 V / slot0 v, about 21 rps):
+# the motor levels there, a bench check that the limit holds in VELOCITY mode.
 [[teleop.bindings]]
 button = 2
 while_held = { mode = "VELOCITY", velocity_rps = 30.0 }
