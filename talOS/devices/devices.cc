@@ -165,7 +165,10 @@ struct HardwareLink::Impl {
     Kind kind;
     std::uint16_t id;
     std::string name;  // the config key the first handle named
-    bool set = false;  // commanded in the current update()
+    // NodeAccess::next_update of the update() that last commanded it (0:
+    // never); commanded this tick only while it is the flushed update()'s,
+    // so a command from an update() that threw never reaches a later flush.
+    std::uint64_t set_update = 0;
     hardware::MotorRequest motor{};
     const hardware::MotorConfig* motor_config = nullptr;
     std::uint64_t clamped_count = 0;
@@ -367,11 +370,17 @@ struct HardwareLink::Impl {
                      .valid;
   }
 
-  // Whether update() set an output to something other than neutral: a motor
-  // mode other than neutral, a digital output true or a PWM output not 0.
-  bool SetNonNeutral() const {
+  // Records that the running update() commanded `device`.
+  void Commanded(Device& device) const {
+    device.set_update = detail::NodeAccess::next_update(node);
+  }
+
+  // Whether update() `tick` set an output to something other than neutral: a
+  // motor mode other than neutral, a digital output true or a PWM output not
+  // 0.
+  bool SetNonNeutral(std::uint64_t tick) const {
     for (const Device& device : devices) {
-      if (!device.set) continue;
+      if (device.set_update != tick) continue;
       if ((device.kind == Kind::kMotor &&
            device.motor.mode != hardware::Mode::kNeutral) ||
           (device.kind == Kind::kDigitalOutput && device.digital) ||
@@ -385,21 +394,22 @@ struct HardwareLink::Impl {
   // RULES.md 1: a tick drives only while robot_enabled and, unless the node
   // called AllowUntargetedOutputs, a talos::Target of the node returned a
   // target during the update() that just ran (NodeAccess::next_update reads
-  // that update()'s index here). A tick that does not drive sends every
-  // output neutral and still sends the request.
+  // that update()'s index here), and it sends only what that update() set.
+  // A tick that does not drive sends every output neutral and still sends
+  // the request.
   void Flush() {
-    const bool targeted =
-        detail::NodeAccess::untargeted_outputs(node) ||
-        live_target_update == detail::NodeAccess::next_update(node);
+    const std::uint64_t tick = detail::NodeAccess::next_update(node);
+    const bool targeted = detail::NodeAccess::untargeted_outputs(node) ||
+                          live_target_update == tick;
     if (have_state) {
       hardware::Command command = hardware::NeutralCommand(state, motor_ids);
       const bool drive = Enabled() && targeted;
       for (std::size_t i = 0; i < command.count; ++i) {
         const Device& motor = devices[motor_devices[i]];
-        if (drive && motor.set) command.motors[i] = motor.motor;
+        if (drive && motor.set_update == tick) command.motors[i] = motor.motor;
       }
       for (const Device& device : devices) {
-        if (!device.set) continue;
+        if (device.set_update != tick) continue;
         if (device.kind == Kind::kDigitalOutput &&
             command.digital_output_count < hardware::kMaxDigitalOutputs) {
           command.digital_outputs[command.digital_output_count++] = {
@@ -422,11 +432,10 @@ struct HardwareLink::Impl {
     // line built at registration: no allocation on the tick.
     if (!Enabled()) {
       withheld_reported = false;
-    } else if (!targeted && !withheld_reported && SetNonNeutral()) {
+    } else if (!targeted && !withheld_reported && SetNonNeutral(tick)) {
       std::fwrite(withheld_line.data(), 1, withheld_line.size(), stderr);
       withheld_reported = true;
     }
-    for (Device& device : devices) device.set = false;
   }
 };
 
@@ -528,8 +537,9 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
     impl.withheld_line =
         std::string{impl.node.name()} +
         ": held every output neutral: update() set one in a tick in which no "
-        "talos::Target returned a target (RULES.md 1); set outputs only while "
-        "a Target's get() returns one\n";
+        "talos::Target returned a target (RULES.md 1); set each output from "
+        "the target get() returned in that update(), never from a joystick "
+        "or a value kept from an earlier tick\n";
   }
   if (kind == Kind::kMotor) {
     impl.motor_ids.push_back(id);
@@ -567,7 +577,7 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
     // Other modes need no frame.
     if (!device.zeroed && !config.absolute_position_frame.value) {
       device.motor = {.id = device.id};
-      device.set = true;
+      link.impl_->Commanded(device);
       return;
     }
     demand += device.position_offset;
@@ -614,7 +624,7 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                   .slot = static_cast<std::uint8_t>(slot),
                   .demand = demand,
                   .feedforward_v = ff_volts};
-  device.set = true;
+  link.impl_->Commanded(device);
 }
 
 std::uint64_t HardwareAccess::motor_clamped_count(const HardwareLink& link,
@@ -784,14 +794,14 @@ void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
   auto& device =
       link.impl_->Output(index, Kind::kDigitalOutput, "DigitalOutput::set");
   device.digital = value;
-  device.set = true;
+  link.impl_->Commanded(device);
 }
 
 void HardwareAccess::pwm_set(HardwareLink& link, std::size_t index,
                              double output) {
   auto& device = link.impl_->Output(index, Kind::kPwm, "PwmOutput::set");
   device.pwm = std::isfinite(output) ? std::clamp(output, -1.0, 1.0) : 0.0;
-  device.set = true;
+  link.impl_->Commanded(device);
 }
 
 // --- handles -----------------------------------------------------------------
