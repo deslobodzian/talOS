@@ -536,12 +536,14 @@ int main(int argc, char** argv) {
   // The session is streamed twice, a fixed window per log, never held: once
   // for the baseline every time is relative to (the earliest event time of
   // any record, not necessarily the first merged), the record count and
-  // whether its hardware packets are of this build's protocol, warning about
+  // whether its hardware packets are of this build's protocol (by the
+  // version its manifest records, then by the codecs), warning about
   // damage and another protocol then, before any output; once to print.
   using talos::launcher::MergedRecord;
   std::int64_t base_ns = 0;
   std::size_t total_count = 0;
-  talos::launcher::HardwareProtocolCheck protocol;
+  talos::launcher::HardwareProtocolCheck protocol{
+      talos::launcher::RecordedProtocolVersion(options.paths)};
   if (!talos::launcher::MergeLogs(
           log_files,
           [&](const MergedRecord& r) {

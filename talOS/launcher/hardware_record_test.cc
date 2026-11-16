@@ -2,8 +2,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -13,6 +18,8 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/launcher/session.h"
+#include "talOS/protocol/types.h"
 
 namespace {
 
@@ -308,6 +315,73 @@ TEST_F(HardwareRecordTest, MalformedPayloadYieldsAnError) {
     EXPECT_EQ(json.count("error"), 1U) << text;
     EXPECT_EQ(json.count("motors") + json.count("joysticks"), 0U) << text;
   }
+}
+
+// Guards: which sessions' hardware packets a build decodes. A manifest
+// recording another protocol refuses them all, though every packet decodes
+// under this build (the equal-length case), and the line names both
+// versions; without a recorded version a packet the codec rejects refuses
+// them; with this build's version recorded such a packet still refuses them
+// and the line names no other version; this build's version with packets
+// that decode, or no version with packets that decode, refuses none.
+// REQ-OPS-15
+TEST(HardwareProtocolCheck, RecordedVersionFirstThenTheCodecs) {
+  constexpr std::uint16_t kBuild = talos::protocol::kProtocolVersion;
+  constexpr std::uint16_t kOther = kBuild - 1;
+  const auto decodes = Encoded(talos::hardware::State{});
+  const auto rejected = std::span{decodes}.first(100);
+  struct Case {
+    const char* label;
+    std::optional<std::uint16_t> recorded;
+    bool reject;
+    bool foreign;
+    std::vector<std::uint16_t> named;
+  };
+  const std::vector<Case> cases{
+      {"another version, packets decode",
+       kOther,
+       false,
+       true,
+       {kOther, kBuild}},
+      {"no version, a packet rejected", std::nullopt, true, true, {kBuild}},
+      {"this version, a packet rejected", kBuild, true, true, {kBuild}},
+      {"this version, packets decode", kBuild, false, false, {}},
+      {"no version, packets decode", std::nullopt, false, false, {}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.label);
+    talos::launcher::HardwareProtocolCheck check{c.recorded};
+    check.Add(HardwareRecord::kState, "/hw/state", decodes);
+    if (c.reject) check.Add(HardwareRecord::kState, "/hw/state", rejected);
+    EXPECT_EQ(check.foreign(), c.foreign);
+    const std::string line = check.Warning();
+    EXPECT_EQ(line.empty(), !c.foreign) << line;
+    for (const std::uint16_t version : {kOther, kBuild}) {
+      const bool named =
+          line.find("protocol " + std::to_string(version)) !=
+              std::string::npos ||
+          line.find("is " + std::to_string(version)) != std::string::npos;
+      EXPECT_EQ(named, std::count(c.named.begin(), c.named.end(), version) > 0)
+          << version << ": " << line;
+    }
+  }
+}
+
+// Guards: the version the launcher writes into a session's manifest.json is
+// the one the log tools read back from that session's directory, and a
+// manifest written without it (as before the field) reads as none.
+// REQ-OPS-15
+TEST(HardwareProtocolCheck, ManifestRecordsThisBuildsVersion) {
+  const std::string dir = testing::TempDir() + "/recorded_protocol";
+  std::filesystem::create_directories(dir);
+  talos::launcher::SessionManifest manifest;
+  manifest.config_path = "robot.toml";
+  std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
+  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({dir}),
+            talos::protocol::kProtocolVersion);
+  manifest.hardware_protocol_version.reset();
+  std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
+  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({dir}), std::nullopt);
 }
 
 }  // namespace

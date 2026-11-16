@@ -66,9 +66,9 @@ TARGET_AGE_LIMIT_MS = 25
 # damaged tail: the file, then its byte offsets (LogReader, DescribeDamage).
 DAMAGED_LOG = re.compile(r"^warning: (damaged log .*)$", re.MULTILINE)
 
-# log_dump's one stderr line for a session whose hardware packets this
-# build's codecs reject: recorded under another hardware protocol, so
-# log_dump decoded none of them (talOS/launcher/hardware_record.h).
+# log_dump's one stderr line for a session whose hardware packets it did
+# not decode: its manifest records another hardware protocol, or this
+# build's codecs reject one of them (talOS/launcher/hardware_record.h).
 HARDWARE_NOT_DECODED = re.compile(r"^log_dump: warning: (hardware packets not decoded: .*)$",
                                   re.MULTILINE)
 

@@ -885,10 +885,12 @@ talos::hardware::Packet EncodedDriverStation(
 // codecs' bytes. With `foreign`, the bridge also sends a State at 45 ms of
 // the length protocol 7 gave it (13 bytes shorter than this build's), as a
 // session recorded under another protocol holds. `dir`/robot.toml is the
-// run config, which manifest.json names when `manifest` is true. Returns
-// the flywheel's logical id.
-std::uint16_t WriteHardwareSession(const std::string& dir, bool manifest,
-                                   bool foreign = false) {
+// run config, which manifest.json names when `manifest` is true, with
+// `recorded` as its hardware_protocol_version when given. Returns the
+// flywheel's logical id.
+std::uint16_t WriteHardwareSession(
+    const std::string& dir, bool manifest, bool foreign = false,
+    std::optional<std::uint16_t> recorded = std::nullopt) {
   namespace hw = talos::hardware;
   namespace ds = talos::driver_station;
   using talos::event::EventKind;
@@ -898,7 +900,11 @@ std::uint16_t WriteHardwareSession(const std::string& dir, bool manifest,
   if (manifest) {
     std::ofstream{dir + "/manifest.json"}
         << "{\n  \"session_id\": 42,\n  \"config_path\": \"" << dir
-        << "/robot.toml\",\n  \"nodes\": []\n}\n";
+        << "/robot.toml\",\n"
+        << (recorded ? "  \"hardware_protocol_version\": " +
+                           std::to_string(*recorded) + ",\n"
+                     : "")
+        << "  \"nodes\": []\n}\n";
   }
   const hw::Config config =
       talos::config::ParseRobotConfigString(kHardwareToml).hardware;
@@ -1074,6 +1080,24 @@ TEST_F(TlogToWpilogTest, HardwarePacketsOfAnotherProtocolAreNotConverted) {
   EXPECT_EQ(log.entry("/hw/state/motors/flywheel/velocity_rps"), nullptr);
   EXPECT_EQ(log.entry("/hw/state/driver_station/enabled"), nullptr);
   EXPECT_EQ(log.entry("/hw/request/shooter/motors/flywheel/demand"), nullptr);
+}
+
+// Guards: tlog_to_wpilog reads the protocol version the session's manifest
+// records: a session recorded under another one converts no hardware packet
+// though every one decodes under this build, and the line names it.
+// REQ-OPS-26
+TEST_F(TlogToWpilogTest, ManifestOfAnotherProtocolRefusesPacketsThatDecode) {
+  const std::string dir = root_ + "/hardware";
+  const auto other =
+      static_cast<std::uint16_t>(talos::protocol::kProtocolVersion - 1);
+  WriteHardwareSession(dir, true, false, other);
+  const std::string out = root_ + "/hardware.wpilog";
+  const Result result = Run({dir, "-o", out});
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_NE(result.output.find("protocol " + std::to_string(other)),
+            std::string::npos)
+      << result.output;
+  EXPECT_EQ(Read(out).entry("/hw/state/driver_station/enabled"), nullptr);
 }
 
 // Guards: a session whose run config cannot be found still converts its
