@@ -65,7 +65,6 @@ cc_test(
     size = "small",
     srcs = ["node_test.cc"],
     deps = [
-        ":deadband",
         ":teleop",
         "//talOS/devices",
         "//talOS/devices:testing",

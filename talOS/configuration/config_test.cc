@@ -984,6 +984,33 @@ TEST(ConfigTest, RejectsNegativePovAndFractionalPovIndex) {
   }
 }
 
+// REQ-CONTRACT-24, REQ-SAFE-14: an axis binding's deadband is both its output
+// dead zone and the band it must return to before teleop arms; one below the
+// floor let a stick resting off zero arm and send that as its first command.
+// Config load refuses it, naming the binding, the value and the floor.
+TEST(ConfigTest, RejectsTeleopAxisDeadbandBelowTheFloor) {
+  const auto binding = [](std::string_view deadband) {
+    return "[[subsystems.test.teleop.bindings]]\naxis = 1\n"
+           "field = \"velocity_rps\"\nscale = 12.0\ndeadband_frac = " +
+           std::string{deadband} + "\n";
+  };
+  EXPECT_NO_THROW(Parse(binding("0.05")));
+  for (const std::string_view deadband : {"0.049", "nan"}) {
+    SCOPED_TRACE(deadband);
+    try {
+      Parse(binding(deadband));
+      ADD_FAILURE() << "deadband_frac = " << deadband << " accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      for (const std::string_view named :
+           {std::string_view{"[subsystems.test] teleop.bindings[0]"}, deadband,
+            std::string_view{"0.05"}}) {
+        EXPECT_NE(what.find(named), std::string::npos) << what;
+      }
+    }
+  }
+}
+
 // talOS/configuration/testdata: each case is a config tree plus expect.toml
 // (`config`, default "robot.toml"; `accept`; `nodes`; `files`, every file the
 // config reads besides itself). //tools:sync_manifest_test runs the same

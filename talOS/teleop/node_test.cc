@@ -23,7 +23,6 @@
 #include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 #include "talOS/schema/field_path.h"
-#include "talOS/teleop/deadband.h"
 #include "talOS/teleop/node.h"
 
 namespace talos::teleop {
@@ -429,7 +428,9 @@ TEST(TeleopNode, OverflowingAxisOutputReleasesEntireLaneAndRecovers) {
     auto push = [&](float axis, std::uint32_t flags = kTeleopEnabled) {
       Push(hw, sim, DsPacket(flags, MakeStick(axis, 0, 0, 1)));
     };
-    push(0.001f);
+    // Just past the default 0.05 deadband: a small output that fits.
+    constexpr float kSmall = 0.06f;
+    push(kSmall);
     ASSERT_TRUE(mechanism.seen);
     EXPECT_TRUE(mechanism.seen->flag());
     EXPECT_TRUE(std::isfinite(mechanism.seen->position_m()));
@@ -442,14 +443,14 @@ TEST(TeleopNode, OverflowingAxisOutputReleasesEntireLaneAndRecovers) {
     // even though the button binding is still live.
     push(4.0f);
     EXPECT_FALSE(mechanism.seen);
-    push(0.001f);
+    push(kSmall);
     EXPECT_TRUE(mechanism.seen);
-    push(0.001f, ds::kTeleop | ds::kDsAttached);
+    push(kSmall, ds::kTeleop | ds::kDsAttached);
     EXPECT_FALSE(mechanism.seen);
-    push(0.001f);
+    push(kSmall);
     EXPECT_FALSE(mechanism.seen);
     Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
-    push(0.001f);
+    push(kSmall);
     EXPECT_TRUE(mechanism.seen);
     hw.stop_driver_station();
     sim.step(150ms);
@@ -669,37 +670,21 @@ std::string AxisTomlWithDeadband(std::string_view frac) {
   return config;
 }
 
-// REQ-SAFE-13: a real stick rests a few counts off zero. With no
-// deadband_frac the binding outputs the raw axis, but arming still counts the
-// axis neutral inside kArmingNeutralFloorFrac, so the lane goes active at rest
-// (and its first command is under the floor's share of scale) instead of
-// never arming.
-TEST(TeleopNode, AxisWithoutDeadbandArmsWhenRestingOffZero) {
-  Sim sim = MakeSim(AxisTomlWithDeadband(""));
-  auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
-  sim.add<Teleop>("teleop");
-  SimHardware hw{sim};
-  hw.enable();
-  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.01f)));
-  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.01f)));
-  ASSERT_TRUE(arm.seen) << "axis 0 resting at 0.01, no deadband_frac: the "
-                           "teleop lane never armed";
-  EXPECT_NEAR(arm.seen->velocity_rps(), 0.01 * 10.0, 1e-6);
-  EXPECT_LE(std::abs(arm.seen->velocity_rps()), kArmingNeutralFloorFrac * 10.0);
-}
-
 // REQ-SAFE-14: after a disable with the axis held, the lane rearms only once
-// the axis returns inside the wider of its deadband_frac and
-// kArmingNeutralFloorFrac (0.05); the floor never narrows a wider deadband.
-TEST(TeleopNode, HeldAxisRearmsInsideTheWiderOfDeadbandAndFloor) {
+// the axis returns inside its deadband_frac (0.05 when the binding states
+// none), and the arming evaluation, with the stick resting off zero inside
+// that band, sends no command: the band that arms is the band the output
+// ignores, so the first command after re-enable is never the resting stick.
+TEST(TeleopNode, HeldAxisRearmsInsideItsDeadbandAndSendsNothingThere) {
   struct Row {
     const char* deadband;
     float rest;
     bool arms;
   };
   constexpr std::uint32_t kTeleopDisabled = ds::kTeleop | ds::kDsAttached;
-  for (const Row& row : {Row{"", 0.04f, true}, Row{"", 0.06f, false},
-                         Row{"0.2", 0.15f, true}, Row{"0.2", 0.25f, false}}) {
+  for (const Row& row :
+       {Row{"", 0.04f, true}, Row{"", 0.06f, false}, Row{"0.05", 0.0499f, true},
+        Row{"0.2", 0.15f, true}, Row{"0.2", 0.25f, false}}) {
     SCOPED_TRACE(std::string{"deadband_frac '"} + row.deadband +
                  "', axis returns to " + std::to_string(row.rest));
     Sim sim = MakeSim(AxisTomlWithDeadband(row.deadband));
@@ -714,6 +699,12 @@ TEST(TeleopNode, HeldAxisRearmsInsideTheWiderOfDeadbandAndFloor) {
     Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.5f)));
     EXPECT_FALSE(arm.seen) << "held at 0.5 through a disable";
     Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(row.rest)));
+    EXPECT_FALSE(arm.seen);
+    const auto lane = talos::testing::LatestTarget<control::VelocityTarget>(
+        sim, "arm", "teleop");
+    ASSERT_TRUE(lane.has_value());
+    EXPECT_EQ(lane->active, 0) << "resting at " << row.rest << " commanded "
+                               << lane->message.velocity_rps();
     Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.5f)));
     EXPECT_EQ(arm.seen.has_value(), row.arms);
   }
