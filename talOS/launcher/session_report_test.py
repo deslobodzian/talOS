@@ -505,11 +505,12 @@ class SessionReportTest(unittest.TestCase):
             node("hardware_node", "bridge", "refused", "policy")]}), {"hardware_node"})
 
     # REQ-OPS-43, REQ-OPS-16, REQ-RT-19, REQ-RT-20 (TODO.md RT-7): a wake a writer lost
-    # left a reader asleep until its backstop, a request the bridge passed
-    # over is one its subsystem never merged, and a wake fallback polled;
-    # each rejects the session, naming the node and the count. The registry
-    # row's counts as the launcher records them: absent in a manifest that
-    # predates them, recorded zeros, and recorded losses.
+    # left a reader asleep until its backstop, a stalled arm left a watcher's
+    # publications waiting for timers or the backstop, a request the bridge
+    # passed over is one its subsystem never merged, and a wake fallback
+    # polled; each rejects the session, naming the node and the count. The
+    # registry row's counts as the launcher records them: absent in a
+    # manifest that predates them, recorded zeros, and recorded losses.
     def test_delivery_loss_is_reported_and_strict_rejects_a_loss(self):
         def strict(nodes):
             report = session_report.analyze({"end_wall_ns": 1, "nodes": nodes}, [])
@@ -526,19 +527,25 @@ class SessionReportTest(unittest.TestCase):
                  ["- drivetrain: NOT RECORDED"]),
                 ("recorded zeros", [node("drivetrain", **zeros)], [],
                  ["- drivetrain: none"]),
+                # A stalled arm alone, as the bridge counts a request topic
+                # whose failed arms its idle-pass guard stopped holding.
+                ("a stalled arm", [
+                    node("drivetrain", **zeros),
+                    node("hardware_node", **{**zeros, "stalled_arms": 1})],
+                 ["hardware_node: stalled_arms=1"], ["- drivetrain: none",
+                                                      "- hardware_node: stalled_arms=1"]),
                 ("recorded losses", [
                     node("drivetrain", **{**zeros, "wake_failures": 3, "stalled_arms": 1}),
                     node("intake", **{**zeros, "wake_fallbacks": 1}),
                     node("hardware_node", **{**zeros, "requests_skipped": 2,
                                              "requests_skipped_by_subsystem": {"intake": 2}})],
-                 ["drivetrain: wake_failures=3", "intake: wake_fallbacks=1",
+                 ["drivetrain: wake_failures=3", "drivetrain: stalled_arms=1",
+                  "intake: wake_fallbacks=1",
                   "hardware_node: requests_skipped=2 (intake=2)"],
                  ["- drivetrain: wake_failures=3, stalled_arms=1",
                   "- intake: wake_fallbacks=1",
                   "- hardware_node: requests_skipped=2 (intake=2)"])):
             with self.subTest(label):
-                # A stalled arm is shown, never rejected: the loop still
-                # drains that watcher on its timers and backstop.
                 self.assertEqual(strict(nodes), (failures, shown))
 
     # REQ-OPS-10: a line the launcher could not keep leaves the terminal

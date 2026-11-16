@@ -112,16 +112,15 @@ def realtime_issue(node, simulation):
 # each should stay 0. NOT RECORDED in a manifest that predates the counts,
 # and for a member whose row the launcher never saw (Studio's bridge).
 DELIVERY_COUNTERS = ("wake_failures", "stalled_arms", "wake_fallbacks", "requests_skipped")
-# The counts --strict rejects. A wake notification a writer could not send
-# left its reader asleep until its backstop, and a request the bridge's
-# latest-value read passed over is one its subsystem never merged. A wake
-# fallback lost nothing, but its run drained on a poll tick instead of on
-# publication: the no-polling guarantee (REQ-RT-02, REQ-RT-21) and the
-# latency of every prompt handler (REQ-RT-19) did not hold for it. A stalled
-# arm is the loop's guard against a transport that misreports unread data:
-# it still drains that watcher on timers and its backstop and never polls,
-# so it is shown but not rejected.
-STRICT_DELIVERY = ("wake_failures", "requests_skipped", "wake_fallbacks")
+# --strict rejects every one of them (REQ-OPS-43). A wake notification a
+# writer could not send left its reader asleep until its backstop, and a
+# request the bridge's latest-value read passed over is one its subsystem
+# never merged. A stalled arm and a wake fallback lost nothing, but the
+# loop drained that watcher (a stalled arm) or every input (a fallback) on
+# its timers, backstop or poll tick instead of on publication: the latency
+# of every prompt handler (REQ-RT-19), and for a fallback the no-polling
+# guarantee (REQ-RT-02, REQ-RT-21), did not hold for it.
+STRICT_DELIVERY = DELIVERY_COUNTERS
 
 
 def delivery_summary(node):

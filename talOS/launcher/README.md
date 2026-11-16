@@ -1694,9 +1694,11 @@ command the RoboRIO received later or never; the bridge's `send_failures`
 (exit line, below) says whether that happened. With several owners the
 merged observation can be an older request's, overstating it. The row is
 informational: REQ-RT-20's 1 ms bound is verified by the bridge's component
-test. The bridge's wake counters (`passes`, `throttled`, `wait_fallbacks`)
-and socket counters (`send_failures`, `socket_reopens`) are only in its exit
-lines on stdout, in its [node output](#node-output) log, not in the report.
+test. The bridge's `wait_fallbacks` and stalled request topics reach the
+report as its row's `wake_fallbacks` and `stalled_arms` (delivery loss,
+above); its other wake counters (`passes`, `throttled`) and its socket
+counters (`send_failures`, `socket_reopens`) are only in its exit lines on
+stdout, in its [node output](#node-output) log, not in the report.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
 exports also carry `ds_enabled`, the Driver Station `hardware.enabled` bit,
@@ -1757,13 +1759,13 @@ only a loop that asked (`TALOS_REALTIME=1`) and was refused a step does.
 Observers, nodes that never reported, and manifests that predate the fields
 (*NOT RECORDED*) are listed but not judged. It also fails on any node's
 nonzero `wake_failures` (a reader left asleep until its backstop),
-`requests_skipped` (a request its subsystem never merged) or
-`wake_fallbacks` (a run that drained on a poll tick instead of on
-publication, so its prompt handlers' latency and the no-polling guarantee
-did not hold); `stalled_arms` (the guard against a transport misreporting
-unread data, which still drains that watcher on timers and the backstop)
-is shown but not judged, and neither is a manifest without the fields.
-It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
+`requests_skipped` (a request its subsystem never merged), `stalled_arms`
+(a watcher whose failed arms stopped holding its loop awake, so its
+publications waited for the loop's timers or backstop) or `wake_fallbacks`
+(a run that drained on a poll tick instead of on publication, so its
+prompt handlers' latency and the no-polling guarantee did not hold),
+naming the node and the count (`<node>: stalled_arms=1`); a manifest
+without the fields is not judged. It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
 runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
 lateness and bridge request-to-command rows are informational and not
 required. The enabled-only verdicts (enabled state median, p99 and gaps,
