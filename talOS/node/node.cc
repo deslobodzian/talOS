@@ -1226,7 +1226,8 @@ class OfflinePort final : public LoopPortFor<Loop> {
 // have lost records nothing in it marks or bounds is refused before anything
 // runs (a ReplayError, exit 1): one with a `.capped` marker or whose member
 // the session manifest marks log_capped, a run's log without its EXIT record
-// of a member it marks log_gap, and one whose damaged stretch nothing bounds.
+// of a member it marks log_gap or recorder_failed, and one whose damaged
+// stretch nothing bounds.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;

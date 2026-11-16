@@ -79,13 +79,13 @@ WPILIB_STARTUP_TIMEOUT = 180
 
 # Where the RoboRIO program, under desktop simulation, saves each acknowledged
 # configuration and restores it from at startup (Robot.cpp kConfigPath,
-# relative to the Gradle project simulateNative runs in). A restored
-# configuration makes the gateway configured before the bridge's push lands,
-# so TALOS_SIM_DS=auto enables on it, and a push of another configuration is
-# then refused while enabled: the scenarios run two configurations (narrowed
-# and whole), so each would inherit the last one's. Every WPILib scenario
-# therefore starts the program with none saved, and refuses one that
-# restored anything anyway (the startup line's "config=", 0 for none).
+# relative to the Gradle project simulateNative runs in). TALOS_SIM_DS=auto
+# waits for a push acknowledged in this boot, never a restored configuration
+# (SimDriverStation), but the scenarios run two configurations (narrowed and
+# whole), and each would otherwise start configured with the last one's.
+# Every WPILib scenario therefore starts the program with none saved, and
+# refuses one that restored anything anyway (the startup line's "config=", 0
+# for none).
 SIM_SAVED_CONFIG = "controller_processor/rio/talos_config.bin"
 GATEWAY_STARTED = re.compile(r"hardware gateway config=(\d+) commissioned=\d+ "
                              r"\(waiting for config push\)")

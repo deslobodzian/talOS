@@ -231,6 +231,8 @@ int32_t talos_hardware_age(TalosNode* node, int64_t* out_ns);
 // One motor command for the flush after this update() (Motor::set_* /
 // stop). TALOS_MODE_TORQUE_CURRENT is Motor::set_torque_current: it fails,
 // naming the motor and the key, unless the motor's config allows the mode.
+// A nonzero ff_volts in a mode that carries no feedforward (neutral, duty
+// cycle, voltage, torque current) fails with TALOS_ERR, the motor unset.
 // Like talos_digital_output_set and talos_pwm_set, it fails (naming the
 // device) outside the node's update() callback: the flush sends neutral for
 // every output that update() did not set.

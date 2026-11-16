@@ -459,9 +459,11 @@ struct RegistryTestHooks {
 // it. Use a regular file (LockFilePath): Darwin's shm descriptors are not
 // vnodes, so flock on them fails with ENOTSUP. Each acquisition opens a
 // separate file description, which also serializes threads in one process.
-// close (including process death) releases the lock. Nothing in talos
-// unlinks this file; if something else does, an acquirer that wins the old
-// inode finds it no longer current and starts over.
+// close (including process death) releases the lock. Only a launcher
+// session in a shared-memory namespace unlinks this file, under the lock,
+// once its members are reaped and no other session holds a row
+// (NamespaceNames, launcher.cc); if anything unlinks it, an acquirer that
+// wins the old inode finds it no longer current and starts over.
 class RegistryLock {
  public:
   explicit RegistryLock(const std::string& mapped_path)
@@ -537,9 +539,11 @@ inline void ShareRegistrySegment(int fd, const struct stat& status) {
 //
 // Deliberately not SharedMemoryPtr: that unlinks on destruction, which is right
 // for a topic owned by one publisher and wrong here. The registry outlives any
-// single node, so nothing unlinks it -- a stale segment is harmless because
-// slots are reclaimed by heartbeat or claimant death and the version is in the
-// name.
+// single node: outside a shared-memory namespace nothing unlinks it -- a
+// stale segment is harmless because slots are reclaimed by heartbeat or
+// claimant death and the version is in the name. A launcher session in a
+// namespace unlinks it once its members are reaped, unless a row of another
+// session remains (NamespaceNames, launcher.cc).
 class RegistryMapping {
  public:
   explicit RegistryMapping(std::string_view path = kRegistryPath,

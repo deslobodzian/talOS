@@ -32,8 +32,8 @@ The RoboRIO atomically and durably (synced file, rename, synced directory)
 saves acknowledged configuration bytes with a CRC32 to
 `/home/lvuser/talos_config.bin` (`talos_config.bin` in desktop simulation;
 `ConfigStore` in the RoboRIO program). The loop hands the acknowledged
-configuration over on its first disabled tick after the acknowledgement, and
-a saver thread (`talos-config`, nice 19) syncs storage while the loop ticks
+configuration over on its first disabled tick after the acknowledgement, or
+at a clean exit (`ConfigPersister::Stop`), and a saver thread (`talos-config`, nice 19) syncs storage while the loop ticks
 on: the loop only try-locks the handover, never waits on the save, and polls
 its outcome on later ticks. The loop encodes the configuration it hands over
 and frees those bytes itself once they are saved; once started, the saver
@@ -451,7 +451,8 @@ every status; a refused State is not published) as `SEND`s in a `.tlog`
 (format in [talOS/events](../events/README.md)), the command and State as
 raw `Packet`s, each with the transport sequence and
 publication time its readers receive, and the pass that produced it as its
-event time.
+event time. A clean stop ends the log with an EXIT record, as an event
+loop's does.
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python

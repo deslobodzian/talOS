@@ -134,7 +134,8 @@ py_test(
     ],
 )
 
-# Over 5 s: installs and rollbacks of stub bundles, one of which waits out a
+# Over 5 s: installs and rollbacks of stub bundles (a stop during the graph
+# check and rollback's graph check among them), one of which waits out a
 # 3 s warm-up bound for a member that never exits (about 9.5 s on macOS);
 # fast lane. Runs only stubs and deploy.sh, no node: no sanitizer tag.
 py_test(

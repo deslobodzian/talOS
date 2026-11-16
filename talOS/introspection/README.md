@@ -47,8 +47,12 @@ or initializing at that moment opens as absent, too small or uncommitted, for
 the opener to retry. It cannot repair an incomplete segment and reports that a
 writer must initialize it. A process holding the lock, even one stopped while
 holding it, therefore cannot block a reader such as the launcher's supervision
-loop. Lock files deliberately persist, even across explicit segment
-unlinks: unlinking a lock file could split waiters between two inodes.
+loop. Outside a shared-memory namespace lock files deliberately persist,
+even across explicit segment unlinks. A launcher session in a namespace
+removes the registry segment and its registry and session lock files once its
+members are reaped, unless the registry holds a row of another session; it
+unlinks the registry lock while holding it, and a waiter that then wins the
+unlinked inode finds it no longer current and retries on the new file.
 
 
 `RegistryMapping` owns its mapping but does not unlink the registry on
