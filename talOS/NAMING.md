@@ -84,7 +84,12 @@ operator interface), `/drivetrain/target/auto`, `/hw/state`,
 
 A node name follows the segment rules, is not a reserved owner, and is the
 `[subsystems.<name>]` key, the `node_name` in `talos_cc_node`/`talos_py_node`,
-the log file stem and the registry row. The node's Bazel label must match the
+the log file stem and the registry row. A subsystem cannot share its name
+with a member the launcher adds itself: `hardware_node` always, and
+`sim_gateway` or `studio_bridge` when `--start-sim-gateway` or
+`--start-studio-bridge` adds that member; the launch, `--describe-only`
+included and `--allow-graph-errors` or not, is refused naming the
+`[subsystems.<name>]` key. The node's Bazel label must match the
 name in its package leaf, its repository (at a repository root), or its rule:
 `//bench/main_processor/swerve_module:node`, `@wrist//:node`,
 `//examples/superstructure/cpp:elevator`.
