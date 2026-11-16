@@ -370,16 +370,47 @@ const char* TypeName(HardwareRecord kind) {
   return "none";
 }
 
+std::string ManifestText(const std::filesystem::path& session) {
+  std::ifstream stream{session / "manifest.json"};
+  return {std::istreambuf_iterator<char>{stream}, {}};
+}
+
+// Where the value of member `key` of a manifest.json starts (past its colon
+// and any white space), or npos.
+std::size_t ManifestValue(const std::string& text, std::string_view key) {
+  const std::string quoted = "\"" + std::string{key} + "\"";
+  auto at = text.find(quoted);
+  if (at == std::string::npos) return at;
+  at = text.find(':', at + quoted.size());
+  if (at == std::string::npos) return at;
+  return text.find_first_not_of(" \t\r\n", at + 1);
+}
+
+// The "hardware_protocol_version" of a session's manifest.json (session.cc
+// SessionManifest::ToJson): nullopt when it has none, or a value that is not
+// a version (an integer from 1 to 65535).
+std::optional<std::uint16_t> ManifestProtocolVersion(
+    const std::filesystem::path& session) {
+  const std::string text = ManifestText(session);
+  const std::size_t at = ManifestValue(text, "hardware_protocol_version");
+  if (at == std::string::npos || text[at] < '0' || text[at] > '9') {
+    return std::nullopt;
+  }
+  char* end = nullptr;
+  const unsigned long value = std::strtoul(text.c_str() + at, &end, 10);
+  if (value < 1 || value > 0xFFFF ||
+      (*end != ',' && *end != '\n' && *end != ' ' && *end != '}')) {
+    return std::nullopt;
+  }
+  return static_cast<std::uint16_t>(value);
+}
+
 // The "config_path" string of a session's manifest.json (session.cc
 // SessionManifest::ToJson, escaped by introspect::AppendJsonString), or empty.
 std::string ManifestConfigPath(const std::filesystem::path& session) {
-  std::ifstream stream{session / "manifest.json"};
-  const std::string text{std::istreambuf_iterator<char>{stream}, {}};
-  constexpr std::string_view kKey = "\"config_path\"";
-  auto at = text.find(kKey);
-  if (at == std::string::npos) return "";
-  at = text.find('"', text.find(':', at + kKey.size()));
-  if (at == std::string::npos) return "";
+  const std::string text = ManifestText(session);
+  const std::size_t at = ManifestValue(text, "config_path");
+  if (at == std::string::npos || text[at] != '"') return "";
   std::string value;
   for (std::size_t i = at + 1; i < text.size(); ++i) {
     const char c = text[i];
@@ -578,8 +609,27 @@ std::string DecodeHardwareRecord(HardwareRecord kind,
   }
 }
 
+std::optional<std::uint16_t> RecordedProtocolVersion(
+    const std::vector<std::string>& inputs) {
+  for (const auto& input : inputs) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(input, ec)) continue;
+    if (const auto version = ManifestProtocolVersion(input)) return version;
+  }
+  return std::nullopt;
+}
+
+HardwareProtocolCheck::HardwareProtocolCheck(
+    std::optional<std::uint16_t> recorded)
+    : recorded_{recorded} {}
+
+bool HardwareProtocolCheck::refused_by_version() const {
+  return recorded_ && *recorded_ != protocol::kProtocolVersion;
+}
+
 void HardwareProtocolCheck::Add(HardwareRecord kind, std::string_view topic,
                                 std::span<const std::byte> payload) {
+  if (refused_by_version()) return;
   ++packets_;
   std::string why = DecodeHardwareRecord(kind, payload, scratch_);
   if (why.empty() || rejected_++ != 0) return;
@@ -589,13 +639,26 @@ void HardwareProtocolCheck::Add(HardwareRecord kind, std::string_view topic,
 
 std::string HardwareProtocolCheck::Warning() const {
   if (!foreign()) return "";
-  return "warning: hardware packets not decoded: recorded under a hardware "
-         "protocol other than this build's protocol " +
-         std::to_string(protocol::kProtocolVersion) +
-         " (a recording does not store its protocol version); this build's "
-         "codecs reject " +
-         std::to_string(rejected_) + " of " + std::to_string(packets_) +
-         ", the first on " + first_topic_ + ": " + first_why_;
+  const std::string build = std::to_string(protocol::kProtocolVersion);
+  const std::string prefix = "warning: hardware packets not decoded: ";
+  if (refused_by_version()) {
+    return prefix + "recorded under hardware protocol " +
+           std::to_string(*recorded_) + "; this build's is " + build +
+           " (manifest.json hardware_protocol_version)";
+  }
+  const std::string rejected = "this build's codecs reject " +
+                               std::to_string(rejected_) + " of " +
+                               std::to_string(packets_) + ", the first on " +
+                               first_topic_ + ": " + first_why_;
+  if (recorded_) {
+    return prefix + "recorded under this build's hardware protocol " + build +
+           ", yet " + rejected +
+           " (packets its codec did not write, not another protocol)";
+  }
+  return prefix +
+         "recorded under a hardware protocol other than this build's "
+         "protocol " +
+         build + " (the session records no protocol version); " + rejected;
 }
 
 std::string HardwareRecordJson(HardwareRecord kind,

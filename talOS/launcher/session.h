@@ -19,6 +19,7 @@
 
 #include "talOS/introspection/describe.h"
 #include "talOS/process/realtime_outcome.h"
+#include "talOS/protocol/types.h"
 
 namespace talos::launcher {
 
@@ -243,6 +244,12 @@ struct SessionManifest {
   // for none.
   std::string launcher_log;
   bool simulation{false};
+  // The hardware protocol this build's codecs read and write
+  // (protocol::kProtocolVersion), so a later build reads the session's
+  // hardware packets only under it (hardware_record.h
+  // HardwareProtocolCheck). Not written when empty, as a manifest from
+  // before the field reads.
+  std::optional<uint16_t> hardware_protocol_version{protocol::kProtocolVersion};
   int64_t start_wall_ns{0};
   int64_t end_wall_ns{0};
   // A stop request arrived before every member was started: the members

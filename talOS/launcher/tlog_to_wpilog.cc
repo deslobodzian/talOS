@@ -1146,8 +1146,10 @@ int Convert(const Options& options) {
   if (!SelectItems(files, items, records, error)) return Fail(error);
 
   // Whether the session's hardware packets are of this build's protocol,
-  // judged on every one before any is converted (hardware_record.h).
-  talos::launcher::HardwareProtocolCheck protocol;
+  // judged by the version its manifest records, then on every one, before
+  // any is converted (hardware_record.h).
+  talos::launcher::HardwareProtocolCheck protocol{
+      talos::launcher::RecordedProtocolVersion(options.inputs)};
   for (const Item& item : items) {
     const auto kind = HardwareKind(item);
     if (item.values && kind != talos::launcher::HardwareRecord::kNone) {

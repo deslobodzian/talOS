@@ -348,6 +348,46 @@ TEST_F(LogDumpTest, HardwarePacketsOfAnotherProtocolAreNamedOnceNotDecoded) {
       << output;
 }
 
+// Guards: log_dump reads the protocol version the session's manifest
+// records: a session recorded under another one is not decoded though its
+// packets decode under this build, and the line names both versions.
+// REQ-OPS-15
+TEST_F(LogDumpTest, ManifestOfAnotherProtocolRefusesPacketsThatDecode) {
+  const std::uint16_t other = talos::protocol::kProtocolVersion - 1;
+  std::ofstream{directory_ + "/manifest.json"}
+      << "{\n  \"session_id\": 42,\n  \"hardware_protocol_version\": " << other
+      << ",\n  \"nodes\": []\n}\n";
+  using D = talos::Descriptor<talos::hardware::Packet>;
+  talos::event::Registration source;
+  source.id = 1;
+  source.kind = talos::event::SourceKind::SENDER;
+  source.name = talos::hardware::RequestTopic("shooter");
+  source.message_bytes = sizeof(talos::hardware::Packet);
+  source.schema = {std::string{D::kName}, D::kHash, {}};
+  talos::event::log::LogWriter writer{
+      directory_ + "/shooter.tlog", "shooter",
+      talos::event::log::LogWriterOptions{8192, 1, false}, 42};
+  writer.start({source},
+               talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  talos::hardware::Packet packet{};
+  packet.size = static_cast<std::uint32_t>(
+      talos::hardware::Encode(talos::hardware::Command{}, packet.data));
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::SEND;
+  ctx.source_id = 1;
+  ctx.dispatch_index = 1;
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+  ctx.now = ctx.event_time;
+  writer.dispatch(ctx, std::as_bytes(std::span{&packet, 1}));
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+
+  const auto output = Run({"--format", "jsonl", "--node", "shooter"});
+  EXPECT_EQ(output.find("\"hardware\""), std::string::npos) << output;
+  EXPECT_NE(output.find("protocol " + std::to_string(other)), std::string::npos)
+      << output;
+}
+
 // Guards: a log named more than once (as itself, twice, and through its
 // session directory) is merged once, so each record prints once.
 // REQ-OPS-15

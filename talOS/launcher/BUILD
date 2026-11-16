@@ -28,6 +28,7 @@ cc_library(
         "//talOS/introspection:lock_file",
         "//talOS/memory:shared_memory",
         "//talOS/process:realtime_outcome",
+        "//talOS/protocol",
         "//talOS/schema:identity",
     ],
 )
@@ -254,9 +255,11 @@ cc_test(
     srcs = ["hardware_record_test.cc"],
     deps = [
         ":hardware_record",
+        ":session",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/protocol",
         "@googletest//:gtest_main",
     ],
 )
@@ -338,6 +341,7 @@ cc_binary(
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/hardware",
+        "//talOS/protocol",
     ],
 )
 

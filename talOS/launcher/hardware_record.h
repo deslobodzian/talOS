@@ -25,19 +25,25 @@
 // are given only for a packet whose config_id is that config's, so a config
 // edited after the match never mislabels a device; the logical id always is.
 //
-// The codecs are this build's (protocol::kProtocolVersion), and a recording
-// does not store the protocol version it was made under: a recorded Packet
-// holds a frame's payload without its header, and the Packet's schema
-// identity hashes only its size. What a recording does show is that every
-// hardware packet in it decoded under the build that recorded it (the
-// bridge publishes only a State or Driver Station packet its codec
-// accepted; requests and commands are its codec's encodings), so a packet
-// this build's codecs reject means the session was recorded under another
-// protocol. HardwareProtocolCheck is that check, run once over a session
-// before any packet is decoded; a tool then decodes none of its hardware
-// packets. A recording of another protocol whose packets all happen to
-// decode (a change that kept every length) cannot be told apart, and
-// decodes with this build's layout.
+// The codecs are this build's (protocol::kProtocolVersion). The logs do not
+// store the protocol version a session was recorded under (a recorded
+// Packet holds a frame's payload without its header, and the Packet's schema
+// identity hashes only its size); the session's manifest.json does
+// (hardware_protocol_version, RecordedProtocolVersion), for a session
+// recorded since it was added. HardwareProtocolCheck runs once over a
+// session before any packet is decoded:
+//   - a recorded version other than this build's refuses every packet, none
+//     tried;
+//   - otherwise every packet is tried with this build's codecs. Every
+//     hardware packet decoded under the build that recorded it (the bridge
+//     publishes only a State or Driver Station packet its codec accepted;
+//     requests and commands are its codec's encodings), so a rejected one
+//     means, with no recorded version, a session of another protocol, and,
+//     with this build's version recorded, a packet its codec did not write.
+// Either way a tool then decodes none of the session's hardware packets.
+// A session without a recorded version, of another protocol whose packets
+// all happen to decode (a change that kept every length), cannot be told
+// apart, and decodes with this build's layout.
 
 #include <cstddef>
 #include <cstdint>
@@ -113,25 +119,45 @@ std::string DecodeHardwareRecord(HardwareRecord kind,
                                  std::span<const std::byte> payload,
                                  HardwarePacket& out);
 
-// Whether a session's hardware packets were recorded under this build's
-// protocol (see above), from every recorded hardware packet payload Add()ed
-// to it before the tool decodes one. Every tool that decodes recorded
-// hardware packets runs it and, when foreign(), prints Warning() once and
-// decodes none.
+// The hardware protocol version recorded in the manifest.json of the first
+// directory among `inputs` whose manifest records one; nullopt when none
+// does (a session recorded before the field, or only .tlog files named).
+std::optional<std::uint16_t> RecordedProtocolVersion(
+    const std::vector<std::string>& inputs);
+
+// Whether a session's hardware packets can be decoded with this build's
+// codecs (see above): from the version its manifest records, if any, then
+// from every recorded hardware packet payload Add()ed to it before the tool
+// decodes one. Every tool that decodes recorded hardware packets runs it
+// and, when foreign(), prints Warning() once and decodes none.
 class HardwareProtocolCheck {
  public:
+  // `recorded`: RecordedProtocolVersion of the session's inputs.
+  explicit HardwareProtocolCheck(
+      std::optional<std::uint16_t> recorded = std::nullopt);
   // One recorded payload of a hardware packet topic (`kind` not kNone).
+  // Not tried when the recorded version is not this build's.
   void Add(HardwareRecord kind, std::string_view topic,
            std::span<const std::byte> payload);
-  // A packet this build's codecs reject was added.
-  bool foreign() const { return rejected_ != 0; }
+  // The recorded version is not this build's, or a packet this build's
+  // codecs reject was added.
+  bool foreign() const { return refused_by_version() || rejected_ != 0; }
   // The one line a tool prints after its own name when foreign(), else
-  // empty: "warning: hardware packets not decoded: recorded under a
-  // hardware protocol other than this build's protocol <N> (...)", then
-  // how many packets were rejected and the first one's topic and reason.
+  // empty. It starts "warning: hardware packets not decoded: ", then:
+  //   another version recorded: "recorded under hardware protocol <R>;
+  //     this build's is <N> (manifest.json hardware_protocol_version)";
+  //   none recorded: "recorded under a hardware protocol other than this
+  //     build's protocol <N> (the session records no protocol version);
+  //     this build's codecs reject <k> of <n>, the first on <topic>: <why>";
+  //   this build's recorded: "recorded under this build's hardware
+  //     protocol <N>, yet this build's codecs reject <k> of <n>, ... (packets
+  //     its codec did not write, not another protocol)".
   std::string Warning() const;
 
  private:
+  bool refused_by_version() const;
+
+  std::optional<std::uint16_t> recorded_;
   std::uint64_t packets_{0};
   std::uint64_t rejected_{0};
   std::string first_topic_;

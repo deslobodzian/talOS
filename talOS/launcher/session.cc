@@ -240,6 +240,10 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"output_dir\": " << Quoted(output_dir) << ",\n";
   ss << "  \"launcher_log\": " << Quoted(launcher_log) << ",\n";
   ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";
+  if (hardware_protocol_version) {
+    ss << "  \"hardware_protocol_version\": " << *hardware_protocol_version
+       << ",\n";
+  }
   ss << "  \"start_wall_ns\": " << start_wall_ns << ",\n";
   ss << "  \"end_wall_ns\": " << end_wall_ns << ",\n";
   ss << "  \"stopped_before_start\": "

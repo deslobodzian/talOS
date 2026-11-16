@@ -814,6 +814,11 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 
 - `config_path`: the config, made absolute against the launcher's working
   directory (also in `graph.json`, and passed to every member as `--config`).
+- `hardware_protocol_version`: the hardware protocol of the launcher's build
+  (`protocol::kProtocolVersion`), the one its bridge and nodes speak, so a
+  later build decodes the session's hardware packets only under it
+  ([which logs a build can read](#which-logs-a-build-can-read)); absent in a
+  manifest written before the field.
 - `config_sha256`, `git_revision`, `git_dirty`: the bundle's config identity
   and the source revision of a `--config=release` build
   ([deployment](../../docs/DEPLOYMENT.md#build-a-bundle)); empty (and
@@ -1333,32 +1338,56 @@ hardware packets of a session recorded under its own hardware protocol
 (`protocol::kProtocolVersion`;
 [DATA_FLOW.md](../../docs/DATA_FLOW.md)).
 
-A recording does not store that version: a recorded Packet holds a frame's
-payload without its header, and its schema identity hashes only its size.
-What it does show is that every hardware packet in it decoded under the
-build that recorded it, since the bridge publishes only a State or Driver
-Station packet its codec accepted, and every request and command is its
-codec's encoding. So `log_dump`, `tlog_to_wpilog` and `session_report`
-(through `log_dump`) first try every hardware packet of the session with
-this build's codecs (`HardwareProtocolCheck`, `hardware_record.h`), before
-decoding any. If one is rejected, the session was recorded under another
-protocol, and the tool prints one line on stderr and decodes none of its
-hardware packets, the ones that happen to decode included:
+The logs do not store that version (a recorded Packet holds a frame's
+payload without its header, and its schema identity hashes only its size);
+the session's `manifest.json` does, as `hardware_protocol_version`
+([session manifest](#session-manifest)). `log_dump`, `tlog_to_wpilog` and
+`session_report` (through `log_dump`) decide once per session, before
+decoding any hardware packet (`HardwareProtocolCheck`,
+`hardware_record.h`), and when they refuse, print one line on stderr and
+decode none of its hardware packets, the ones that happen to decode
+included:
 
-```
-log_dump: warning: hardware packets not decoded: recorded under a hardware protocol other than this build's protocol <N> (a recording does not store its protocol version); this build's codecs reject <k> of <n>, the first on <topic>: <reason>
-```
+- **The manifest records another version.** No packet is tried:
 
-`log_dump` then exports no `hardware` and no `ds_enabled` member (JSONL),
-an empty `hardware` field (CSV) and no hardware line (text, summary);
-`payload_hex` keeps the bytes. Every other record is exported as before,
-and the exit status is 0. A session of another protocol whose hardware
-packets all happen to decode, because the change kept every length,
-cannot be told apart and decodes with this build's layout, possibly
-wrongly. Read a session's hardware packets with a build of the protocol
-it was recorded under: a stamped bundle's session names its source in
-`git_revision` ([session manifest](#session-manifest)); nothing else in a
-session does.
+  ```
+  log_dump: warning: hardware packets not decoded: recorded under hardware protocol <R>; this build's is <N> (manifest.json hardware_protocol_version)
+  ```
+
+- **No version is recorded** (a session from before the field, or a
+  `.tlog` file named on its own: the version is read only from the
+  `manifest.json` of a session directory named on the command line). Every
+  hardware packet is tried with this build's codecs. Every one decoded
+  under the build that recorded it, since the bridge publishes only a State
+  or Driver Station packet its codec accepted and every request and command
+  is its codec's encoding, so one this build rejects means another
+  protocol:
+
+  ```
+  log_dump: warning: hardware packets not decoded: recorded under a hardware protocol other than this build's protocol <N> (the session records no protocol version); this build's codecs reject <k> of <n>, the first on <topic>: <reason>
+  ```
+
+  A session of another protocol whose hardware packets all happen to
+  decode, because the change kept every length, cannot be told apart this
+  way and decodes with this build's layout, possibly wrongly.
+
+- **The manifest records this build's version.** Every packet is still
+  tried; one this build rejects was not written by its codec (made by hand,
+  or altered), which is not another protocol:
+
+  ```
+  log_dump: warning: hardware packets not decoded: recorded under this build's hardware protocol <N>, yet this build's codecs reject <k> of <n>, the first on <topic>: <reason> (packets its codec did not write, not another protocol)
+  ```
+
+`tlog_to_wpilog` prints the same lines prefixed `tlog_to_wpilog:`. A record
+damaged on disk is not among them: the log reader skips it by its checksum
+and names the log (above). When `log_dump` refuses, it exports no `hardware`
+and no `ds_enabled` member (JSONL), an empty `hardware` field (CSV) and no
+hardware line (text, summary); `payload_hex` keeps the bytes. Every other
+record is exported as before, and the exit status is 0. Read a session's
+hardware packets with a build of the protocol it was recorded under: a
+stamped bundle's session names its source in `git_revision`; nothing else
+in a session does.
 
 A node replayed from such a session (`--replay-inputs`) fails safe: its
 devices layer decodes each `/hw/state` with this build's codec, so a
