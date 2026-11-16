@@ -5,6 +5,7 @@
 #include "talOS/events/input_replay.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstddef>
@@ -949,6 +950,97 @@ TEST(InputReplay, RefusesToFeedFromACappedLogOrALogGapRunCutShort) {
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(out);
   }
+}
+
+// Closes this process's descriptor of the file at `path`, as a disk that
+// refuses every later write leaves its writer.
+bool CloseLogDescriptor(const std::string& path) {
+  struct stat target {};
+  if (::stat(path.c_str(), &target) != 0) return false;
+  const auto limit = ::sysconf(_SC_OPEN_MAX);
+  for (int fd = 0; fd < limit; ++fd) {
+    struct stat candidate {};
+    if (::fstat(fd, &candidate) == 0 && candidate.st_dev == target.st_dev &&
+        candidate.st_ino == target.st_ino) {
+      return ::close(fd) == 0;
+    }
+  }
+  return false;
+}
+
+// A recorder whose disk fails ends capture for good with no GAP record, so
+// its log holds neither the records after the failure nor its EXIT, and the
+// launcher marks its member recorder_failed without log_gap. Input replay
+// refuses, before anything runs, to feed a watched topic from such a log,
+// naming it and the sign, as it does a log_gap member's run cut short.
+// REQ-OPS-14
+TEST(InputReplay, RefusesALogWhoseRecorderFailedBeforeItsExit) {
+  const std::string dir = TempDir("recorder_failed");
+  const std::string out = TempDir("recorder_failed_out");
+  const std::string path = dir + "/reader.tlog";
+  {
+    log::LogWriter writer{path, "reader",
+                          log::LogWriterOptions{.background = false}};
+    writer.start(ManifestOf<SensorWatcher>(dir + "/unused.tlog"), kOrigin);
+    for (int i = 1; i <= 4; ++i) {
+      if (i == 3) {
+        writer.flush();
+        ASSERT_TRUE(CloseLogDescriptor(path));
+      }
+      const EventsTest::SensorMessage reading{i, 1.0F, 1.0F};
+      writer.dispatch(
+          Context{.kind = EventKind::MESSAGE,
+                  .source_id = 0,
+                  .dispatch_index = static_cast<std::uint64_t>(i),
+                  .event_time = kOrigin + std::chrono::milliseconds{i},
+                  .now = kOrigin + std::chrono::milliseconds{i},
+                  .publish_time = kOrigin + std::chrono::milliseconds{i},
+                  .sequence = static_cast<std::uint64_t>(i)},
+          std::as_bytes(std::span{&reading, 1}));
+    }
+    writer.finish(Context{.kind = EventKind::EXIT,
+                          .dispatch_index = 5,
+                          .event_time = kOrigin + 5ms,
+                          .now = kOrigin + 5ms});
+    writer.flush();
+    ASSERT_TRUE(writer.failed());
+    EXPECT_EQ(writer.gaps(), 0u);
+  }
+  // What the failed recorder left: the two readings before the failure.
+  std::size_t receipts = 0;
+  {
+    log::LogReader reader{path};
+    log::LogReader::Record record;
+    while (reader.next(record)) {
+      const auto kind = static_cast<EventKind>(record.header.kind);
+      EXPECT_FALSE(log::GapOf(record.header, record.payload).has_value());
+      EXPECT_NE(kind, EventKind::EXIT);
+      if (kind == EventKind::MESSAGE) ++receipts;
+    }
+  }
+  EXPECT_EQ(receipts, 2u);
+  std::ofstream{dir + "/manifest.json"}
+      << "{\"session_id\": " << log::LogReader{path}.session_id()
+      << ", \"nodes\": [{\"name\": \"reader\", \"log_paths\": "
+         "[\"/robot/logs/7/reader.tlog\"], \"recorder_failed\": true, "
+         "\"log_gap\": false, \"log_capped\": false}]}\n";
+
+  const RecordedSession session{dir};
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/watcher.tlog", "watcher"},
+            Loop::Options{.start = session.start()}};
+  SensorWatcher watcher{loop};
+  try {
+    ReplayInputs(loop, environment, session);
+    ADD_FAILURE() << "fed from a log whose recorder failed before its EXIT";
+  } catch (const ReplayError& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find(path), std::string::npos) << what;
+    EXPECT_NE(what.find("recorder_failed"), std::string::npos) << what;
+  }
+  EXPECT_EQ(watcher.readings, 0);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
 }
 
 }  // namespace

@@ -49,14 +49,16 @@ std::string LogOfFile(const std::string& file) {
 struct ManifestMarks {
   bool log_gap{false};
   bool log_capped{false};
+  bool recorder_failed{false};
 };
 
 // By file name, the logs of every member the session manifest beside the
 // logs (`<directory>/manifest.json`, talOS/launcher/session.cc) marks
-// `log_gap` or `log_capped`, with those marks; empty when there is no
-// manifest, or it is another session's or has no session_id. Throws
-// std::runtime_error naming a manifest that is not JSON, or whose `log_gap`,
-// `log_capped` or `log_paths` is not what the launcher writes.
+// `log_gap`, `log_capped` or `recorder_failed`, with those marks; empty when
+// there is no manifest, or it is another session's or has no session_id.
+// Throws std::runtime_error naming a manifest that is not JSON, or whose
+// `log_gap`, `log_capped`, `recorder_failed` or `log_paths` is not what the
+// launcher writes.
 std::map<std::string, ManifestMarks> MarkedLogNames(
     const std::filesystem::path& directory, std::uint64_t session_id) {
   const std::filesystem::path path = directory / "manifest.json";
@@ -75,9 +77,13 @@ std::map<std::string, ManifestMarks> MarkedLogNames(
     if (nodes == manifest.end()) return {};
     for (const nlohmann::json& node :
          nodes->get_ref<const nlohmann::json::array_t&>()) {
-      const ManifestMarks marks{.log_gap = node.value("log_gap", false),
-                                .log_capped = node.value("log_capped", false)};
-      if (!marks.log_gap && !marks.log_capped) continue;
+      const ManifestMarks marks{
+          .log_gap = node.value("log_gap", false),
+          .log_capped = node.value("log_capped", false),
+          .recorder_failed = node.value("recorder_failed", false)};
+      if (!marks.log_gap && !marks.log_capped && !marks.recorder_failed) {
+        continue;
+      }
       for (const nlohmann::json& log :
            node.at("log_paths").get_ref<const nlohmann::json::array_t&>()) {
         names[std::filesystem::path{log.get<std::string>()}
@@ -394,10 +400,12 @@ RecordedSession::RecordedSession(const std::string& path,
   // Logs that lost records nothing in them marks: a capped one (its marker
   // beside the log a segment belongs to, or the session manifest's
   // log_capped for its member), and a run's log without its EXIT of a member
-  // the manifest marks log_gap. A writer that reached its EXIT wrote a GAP
-  // record for every gap before it (LogWriter::gaps), so such a log is
-  // judged by its GAP records; one without it may have lost a gap's mark to
-  // its process's end. A run's EXIT is in its newest file, the log's path.
+  // the manifest marks log_gap or recorder_failed. A writer that reached its
+  // EXIT wrote a GAP record for every gap before it (LogWriter::gaps), so
+  // such a log is judged by its GAP records; one without it may have lost a
+  // gap's mark to its process's end, or its tail to a disk that failed (a
+  // failed recorder writes no GAP record). A run's EXIT is in its newest
+  // file, the log's path.
   const std::filesystem::path directory =
       std::filesystem::path{log_paths_.front()}.parent_path();
   const std::map<std::string, ManifestMarks> marked = MarkedLogNames(
@@ -423,6 +431,11 @@ RecordedSession::RecordedSession(const std::string& path,
       return "the session manifest marks its member log_gap, and its run's "
              "log has no EXIT record: a gap its process's end cut short has "
              "no GAP record";
+    }
+    if (marks->second.recorder_failed && !exited.contains(log)) {
+      return "the session manifest marks its member recorder_failed, and its "
+             "run's log has no EXIT record: a recorder that failed (a disk "
+             "error) ends capture with no GAP record";
     }
     return {};
   };
