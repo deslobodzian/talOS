@@ -24,6 +24,16 @@ has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
 ## 2026-11-16
 
+- **TEST-9, TEST-10, MAC-2: launcher and installing tests on macOS.** Mac mini,
+  macOS, 2026-11-16. `launcher_test` alone, uncached, three runs: 10.3, 10.0,
+  9.8 s; `supervision_test`: 13.5, 13.4, 13.1 s. `--runs_per_test=10` at load
+  about 3: `launcher_test` 40 of 40 shard runs (max 27.9 s), `supervision_test`
+  30 of 30 (max 50.7 s). Three full uncached `bazel test //...` runs after the
+  installing tests stopped overlapping: 234 of 234 each, `bundle_test` 29.4,
+  44.3, 42.0 s, `install_check_test` 13.4, 19.3, 21.2 s, `warm_up_test` 19.6,
+  14.3, 14.4 s; one run before the change: 234 of 234, 45.2, 46.2, 38.9 s.
+  `install_check_test` alone: 17.7 and 17.6 s before, 12.0 and 11.9 s after.
+  The earlier timeouts at load about 9 were not reproduced.
 - **RIO-1: stale-FaultField flake, mechanism observed.** Mac mini, macOS
   (Darwin 25.3), desktop Phoenix simulation, load 0.5 to 1.5, talOS
   6acdcf9f; one `StaleFaultFieldClearsLimitsAndKeepsFaults` per process.
