@@ -2,7 +2,7 @@ load("@aspect_bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
 exports_files([
     "uws.BUILD.bazel",
@@ -119,18 +119,21 @@ cc_test(
     ],
 )
 
-# Hermetic: it imports only integration_test.py's fast_slots. Not
-# precompiled, since the `local` tests that also list integration_test.py
-# compile it under other execution requirements (two actions, one output).
+# The Python tests' shared helpers: a stdlib WebSocket client, the fast-value
+# order and a bridge process's port and stop.
+py_library(
+    name = "bridge_client",
+    testonly = True,
+    srcs = ["bridge_client.py"],
+)
+
+# Hermetic: it imports only bridge_client's fast_slots.
 py_test(
     name = "fast_slots_test",
     size = "small",
-    srcs = [
-        "fast_slots_test.py",
-        "integration_test.py",
-    ],
+    srcs = ["fast_slots_test.py"],
     data = glob(["testdata/golden/*"]),
-    precompile = "disabled",
+    deps = [":bridge_client"],
 )
 
 cc_binary(
@@ -183,52 +186,43 @@ py_test(
         "integration",
         "local",
     ],
+    deps = [":bridge_client"],
 )
 
 py_test(
     name = "bandwidth_test",
     size = "medium",
-    srcs = [
-        "bandwidth_test.py",
-        "integration_test.py",
-    ],
+    srcs = ["bandwidth_test.py"],
     data = [
         ":studio_bridge",
         ":studio_mock",
     ],
-    main = "bandwidth_test.py",
     tags = [
         "integration",
         "local",
     ],
+    deps = [":bridge_client"],
 )
 
 # Runs the bridge at its smallest idle timeout (8 s), so it takes about 9 s.
 py_test(
     name = "client_timeout_test",
     size = "medium",
-    srcs = [
-        "client_timeout_test.py",
-        "integration_test.py",
-    ],
+    srcs = ["client_timeout_test.py"],
     data = [":studio_bridge"],
-    main = "client_timeout_test.py",
     tags = [
         "integration",
         "local",
     ],
+    deps = [":bridge_client"],
 )
 
 # The stop with each kind of connection a browser or client can leave open.
 py_test(
     name = "stop_test",
     size = "medium",
-    srcs = [
-        "integration_test.py",
-        "stop_test.py",
-    ],
+    srcs = ["stop_test.py"],
     data = [":studio_bridge"],
-    main = "stop_test.py",
     # The 0.5 s stop bound is this test's (STOP_BOUND_S); TSan adds a nearly
     # constant per-process cost, and on the hosted macOS runner every case
     # stopped in 0.48 to 0.57 s (TODO.md CI-10). The bound holds plain and
@@ -242,6 +236,7 @@ py_test(
         "local",
         "no_tsan",  # a wall-clock stop bound; the bridge has one thread
     ],
+    deps = [":bridge_client"],
 )
 
 # A webroot whose pages were never built: the bridge runs and its pages name
@@ -249,12 +244,21 @@ py_test(
 py_test(
     name = "missing_pages_test",
     size = "small",
-    srcs = [
-        "integration_test.py",
-        "missing_pages_test.py",
-    ],
+    srcs = ["missing_pages_test.py"],
     data = [":studio_bridge"],
-    main = "missing_pages_test.py",
+    tags = [
+        "integration",
+        "local",
+    ],
+    deps = [":bridge_client"],
+)
+
+# A second listener on a port another holds: the bridge refuses it and exits.
+py_test(
+    name = "listen_test",
+    size = "small",
+    srcs = ["listen_test.py"],
+    data = [":studio_bridge"],
     tags = [
         "integration",
         "local",

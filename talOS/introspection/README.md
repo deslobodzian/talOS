@@ -47,8 +47,12 @@ or initializing at that moment opens as absent, too small or uncommitted, for
 the opener to retry. It cannot repair an incomplete segment and reports that a
 writer must initialize it. A process holding the lock, even one stopped while
 holding it, therefore cannot block a reader such as the launcher's supervision
-loop. Lock files deliberately persist, even across explicit segment
-unlinks: unlinking a lock file could split waiters between two inodes.
+loop. Outside a shared-memory namespace lock files deliberately persist,
+even across explicit segment unlinks. A launcher session in a namespace
+removes the registry segment and its registry and session lock files once its
+members are reaped, unless the registry holds a row of another session; it
+unlinks the registry lock while holding it, and a waiter that then wins the
+unlinked inode finds it no longer current and retries on the new file.
 
 
 `RegistryMapping` owns its mapping but does not unlink the registry on
@@ -165,7 +169,14 @@ stopped at the cap). The `Reporter` copies them into the row's `flags` in
 each full sample, when the loop's recorder reports them, as
 `kFlagRecorderFailed`, `kFlagLogGap` and `kFlagLogCapped`; the hardware
 bridge does the same for its own log (`NodeRegistration::set_recording`;
-`NodeSnapshot::log_gap()` reads the gap bit). They are bits of the existing
+`NodeSnapshot::log_gap()` reads the gap bit). A node's log writer, and the
+bridge's, also sets `kFlagLogGap` itself as a gap opens, with one atomic OR into the row's
+`flags` word (`LogWriterOptions::gap_flags`,
+`NodeRegistration::flags_word()`, `Reporter::row_flags()`), so a run
+killed before the next sample, whose gap has no GAP record, is still
+marked. It does so only while the row's generation is still its claim's:
+a row swept from a starved owner and claimed by another node is left
+alone, and the swept owner's gap is then in no row. They are bits of the existing
 `flags` word, which needs no layout or version change: an older writer leaves
 them clear, and an older reader ignores them. Once set they stay set until
 the slot is claimed again, since what they report stays lost. The launcher records them in the session manifest while the
@@ -255,7 +266,9 @@ by the next claim, and a pid reused since does not keep it. A claimant in
 another pid namespace sharing `/dev/shm` cannot be looked up from this one, so
 its row is freed only once its heartbeat is `kLivenessTimeout` old. Both are
 rechecked after the ACTIVE-to-CLAIMING transition so a refresh observed during
-the sweep can keep the row.
+the sweep can keep the row. `RegistryReader::nodes()` makes the same process
+check, so until that claim a killed node's row reads `alive = false` at once,
+its heartbeat still fresh.
 
 Each claim bumps a generation counter before the slot goes ACTIVE. A reader
 snapshots the generation, copies the identity fields, and re-reads it; a change

@@ -1153,12 +1153,22 @@ int main(int argc, char** argv) try {
         ->writeHeader("Cache-Control", CacheControl(relative))
         ->end(body);
   });
+  // Exclusive: uSockets otherwise sets SO_REUSEPORT, and a second bridge of
+  // the same user on this port (a developer's ./sim.sh on the robot
+  // computer) would listen beside this one, the kernel splitting /drive
+  // connections between two sessions. SO_REUSEADDR stays, so a restart
+  // rebinds while the dead run's connections linger in TIME_WAIT.
+  const int http_port = count > 2 ? port(at(2)) : 5800;
   bool listening = false;
-  app.listen(count > 2 ? port(at(2)) : 5800, [&](auto* token) {
+  app.listen(http_port, LIBUS_LISTEN_EXCLUSIVE_PORT, [&](auto* token) {
     listening = token != nullptr;
     bridge.listener = token;
   });
-  if (!listening) throw std::runtime_error("HTTP listen failed");
+  if (!listening) {
+    throw std::runtime_error("cannot listen on port " +
+                             std::to_string(http_port) +
+                             " (another process holds it?)");
+  }
   std::cout << "listening "
             << us_socket_local_port(
                    0, reinterpret_cast<us_socket_t*>(bridge.listener))

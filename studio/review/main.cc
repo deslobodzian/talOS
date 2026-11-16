@@ -6,7 +6,8 @@
 //                 [--webroot DIR]
 //
 // Listens on 127.0.0.1 only; there is no flag to listen anywhere else. Port
-// 0 asks the OS for one. Once listening, the address the socket is bound to,
+// 0 asks the OS for one; a port another listener holds is refused, and the
+// server exits naming it. Once listening, the address the socket is bound to,
 // as the kernel reports it (getsockname), is printed on stdout:
 // "listening 127.0.0.1:<port>".
 //
@@ -192,8 +193,12 @@ int Run(int argc, char** argv) {
         ->writeHeader("Cache-Control", "no-store")
         ->end(response.body);
   });
+  // Exclusive: uSockets otherwise sets SO_REUSEPORT, and a second server on
+  // this port would listen beside this one, the kernel splitting
+  // connections between two libraries. SO_REUSEADDR stays, so a restart
+  // rebinds at once.
   us_listen_socket_t* listener = nullptr;
-  app.listen(kLoopback, static_cast<int>(port),
+  app.listen(kLoopback, static_cast<int>(port), LIBUS_LISTEN_EXCLUSIVE_PORT,
              [&listener](us_listen_socket_t* token) { listener = token; });
   if (listener == nullptr) {
     throw std::runtime_error("cannot listen on " + std::string{kLoopback} +

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,16 @@
 #include "talOS/process/process.h"
 
 namespace talos::hardware {
+
+// Tests only: when set, called with the options of the bridge's --log just
+// before its writer is made, so a test can hold the writer thread
+// (LogWriterOptions::before_write) until its pool fills and the log opens a
+// gap. Empty otherwise. hardware_node_test declares it where it uses it.
+std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+// Tests only, likewise: false stops the full registry sample copying the
+// --log's flags into the row (set_recording), so a test can tell the
+// writer's kFlagLogGap from a sample's copy. True otherwise.
+bool copy_log_flags_for_test = true;
 
 // The name the stock bridge describes itself by is the roster name the
 // launcher lists it under.
@@ -172,6 +183,7 @@ void HardwareNode::OpenTopics() {
     event::log::LogWriter::Options options;
     options.max_bytes = log_max_bytes_;
     options.window = log_window_;
+    if (log_options_for_test) log_options_for_test(options);
     log_ = std::make_unique<event::log::LogWriter>(log_path_, kNodeName,
                                                    options, session_id_);
     log_->start(introspection_manifest_, event::Poller::now());
@@ -191,6 +203,18 @@ void HardwareNode::OpenTopics() {
   } catch (const std::exception& e) {
     std::fprintf(stderr, "hardware_node: node registry unavailable: %s\n",
                  e.what());
+  }
+  // The log marks the row as a gap opens (kFlagLogGap), not at the next
+  // full registry sample, so a bridge killed during a gap is marked. Set on
+  // this thread, which also makes every record, before the first one;
+  // registration_ is declared before log_, so the row outlives the writer.
+  if (log_ && registration_) {
+    const introspect::NodeRegistration::FlagsWord row =
+        registration_->flags_word();
+    log_->set_gap_flags({.flags = row.flags,
+                         .bit = introspect::kFlagLogGap,
+                         .owner = row.generation,
+                         .expected = row.claimed});
   }
 }
 
@@ -278,7 +302,7 @@ void HardwareNode::PublishIntrospection() {
   registration_->begin_sample();
   registration_->heartbeat();
   registration_->set_dispatch_count(DispatchCount());
-  if (log_) {
+  if (log_ && copy_log_flags_for_test) {
     registration_->set_recording(log_->failed(), log_->capped(),
                                  log_->gaps() > 0);
   }
@@ -1232,6 +1256,12 @@ int HardwareNode::Run(int duration_s) {
   // nodes.
   bool log_incomplete = false;
   if (log_) {
+    // The run's EXIT, as an event loop's end_run writes: a log with it holds
+    // a GAP record for every gap (the flush closes one still open), so input
+    // replay judges it by them rather than refusing it as cut short.
+    const event::MonotonicTime now = event::Poller::now();
+    log_->finish(event::Context{
+        .kind = event::EventKind::EXIT, .event_time = now, .now = now});
     log_->flush();
     ReportLogFailure();
     std::printf(

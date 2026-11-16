@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -23,6 +25,12 @@
 // before each one passes. Neutralizing on every poll, not once per stall,
 // also covers a loop that resumes on a stale clock reading, re-applies a
 // command and stalls again before its next beat.
+//
+// Its reports (a Driver Station error: a NetComm round trip that can block for
+// milliseconds) never run on its thread: it copies each into a fixed ring and
+// a reporter thread of its own, at the default scheduling, delivers them, as
+// RioLog's logger thread does for the loop. The watchdog thread touches no
+// lock and makes no call for a report, so its next poll never waits on one.
 namespace talos::rio {
 
 // What the watchdog acts on: the RoboRIO's outputs, a recorder in tests.
@@ -35,7 +43,8 @@ class WatchdogOutputs {
   // watchdog retries on its next poll.
   virtual bool Neutralize() = 0;
   // Once per deadline passed, after the first Neutralize attempt. `text`
-  // starts with the acting poll's ConsoleTime (RioLog.h).
+  // starts with the acting poll's ConsoleTime (RioLog.h). Called on the
+  // watchdog's reporter thread, never the watchdog's own, so it may block.
   virtual void Report(std::string_view text) = 0;
 };
 
@@ -44,6 +53,11 @@ class LoopWatchdog {
   // How often the thread checks the beat: a passed deadline is acted on
   // within this of passing.
   static constexpr std::chrono::microseconds kPollPeriod{5000};
+  // How often the reporter thread delivers queued reports, and how many it
+  // holds: one more is dropped and counted (dropped_reports()).
+  static constexpr std::chrono::milliseconds kReportPeriod{20};
+  static constexpr std::size_t kReportSlots = 4;
+  static constexpr std::size_t kReportSize = 256;
 
   explicit LoopWatchdog(WatchdogOutputs& outputs) : outputs_{outputs} {}
   ~LoopWatchdog();
@@ -61,13 +75,20 @@ class LoopWatchdog {
   // watchdog that was not started. `now_us` is on the clock Beat uses.
   void Poll(uint64_t now_us);
 
-  // Starts the thread, which reads `clock` (microseconds, the clock the
+  // The reporter thread, every kReportPeriod: hands each queued report to
+  // WatchdogOutputs::Report, oldest first. Tests call it directly on a
+  // watchdog that was not started.
+  void DeliverReports();
+
+  // Starts the reporter thread, at the caller's scheduling, then the
+  // watchdog thread, which reads `clock` (microseconds, the clock the
   // loop beats with). `realtime_priority` 1-99 asks for SCHED_FIFO at that
   // priority (frc::SetCurrentThreadPriority); 0 keeps the default
   // scheduling. A refused request is reported once and the thread runs on.
   // Returns once the thread has made that request (or after
   // kStartHandshakeTimeout), so held_priority() is then the outcome.
-  // Stop() (also the destructor) joins it.
+  // Stop() (also the destructor) joins both, after the reporter delivered
+  // what was queued.
   void Start(std::function<uint64_t()> clock, int realtime_priority);
   void Stop();
 
@@ -85,10 +106,19 @@ class LoopWatchdog {
   uint64_t stall_count() const {
     return stalls_.load(std::memory_order_relaxed);
   }
+  // Reports dropped because kReportSlots were still undelivered: stalls
+  // with no Driver Station error. The loop prints each rise (LoopConsole.h).
+  uint64_t dropped_reports() const {
+    return dropped_reports_.load(std::memory_order_relaxed);
+  }
 
  private:
   void Run(const std::function<uint64_t()>& clock, int realtime_priority,
            std::promise<void>& requested);
+  void RunReporter();
+  // The watchdog thread (the only producer): copies `text` into the ring,
+  // or drops it when the ring is full. Atomics and a bounded copy only.
+  void Queue(const char* text);
 
   WatchdogOutputs& outputs_;
   // The latest beat's deadline, 0 while disarmed: one word, so the watchdog
@@ -104,6 +134,15 @@ class LoopWatchdog {
   std::atomic<int> held_priority_{0};
   std::atomic<bool> stop_{false};
   std::thread thread_;
+
+  // Single-producer (the watchdog thread), single-consumer (the reporter)
+  // ring: a slot below head and at or above tail holds a queued report.
+  std::array<std::array<char, kReportSize>, kReportSlots> reports_{};
+  std::atomic<uint64_t> report_head_{0};
+  std::atomic<uint64_t> report_tail_{0};
+  std::atomic<uint64_t> dropped_reports_{0};
+  std::atomic<bool> stop_reporter_{false};
+  std::thread reporter_;
 };
 
 }  // namespace talos::rio

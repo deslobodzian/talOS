@@ -1,11 +1,10 @@
-// Peak resident memory of the session readers (log_dump, tlog_to_wpilog) on
-// a synthetic session of at least 200 MB of .tlog, generated here and
-// removed after; README.md, "Filtering and exporting logs". Not a test: run by
-// hand, on an idle host.
+// Peak resident memory of the session reader log_dump on a synthetic session
+// of at least 200 MB of .tlog, generated here and removed after; README.md,
+// "Filtering and exporting logs". Not a test: run by hand, on an idle host.
 //
 //   bazel run -c opt //talOS/launcher:log_memory_bench
 //
-// Each tool runs as a child with its output discarded; its peak resident
+// Each run is a child with its output discarded; its peak resident
 // set is the child's ru_maxrss.
 
 #include <fcntl.h>
@@ -112,12 +111,11 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "log_memory_bench: %s\n", error.c_str());
     return 1;
   }
-  if (argc != 3) {
-    std::fprintf(stderr, "usage: %s <log_dump> <tlog_to_wpilog>\n", argv[0]);
+  if (argc != 2) {
+    std::fprintf(stderr, "usage: %s <log_dump>\n", argv[0]);
     return 1;
   }
   const std::string log_dump = runfiles->Rlocation(argv[1]);
-  const std::string tlog_to_wpilog = runfiles->Rlocation(argv[2]);
 
   std::string pattern =
       (std::filesystem::temp_directory_path() / "log_memory_bench.XXXXXX")
@@ -143,10 +141,7 @@ int main(int argc, char** argv) {
   std::printf("log_dump peak RSS: %.1f MiB\n", dump);
   const double jsonl = PeakMiB({log_dump, "--format", "jsonl", directory});
   std::printf("log_dump --format jsonl peak RSS: %.1f MiB\n", jsonl);
-  const double wpilog =
-      PeakMiB({tlog_to_wpilog, directory, "-o", directory + "/out.wpilog"});
-  std::printf("tlog_to_wpilog peak RSS: %.1f MiB\n", wpilog);
 
   std::filesystem::remove_all(directory);
-  return dump < 0 || jsonl < 0 || wpilog < 0 ? 1 : 0;
+  return dump < 0 || jsonl < 0 ? 1 : 0;
 }

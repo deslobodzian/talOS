@@ -346,6 +346,59 @@ TEST(ConfigPersister, AFailedSaveIsReportedOnceAndAnIdenticalPushRetriesIt) {
                                                      hw::ConfigurationId(a)}));
 }
 
+// A configuration acknowledged on the last tick before a clean exit, with no
+// tick after it to hand it over (or only enabled ones, which never do), is
+// still saved by Stop(): otherwise the next boot restores the one before it.
+// REQ-CONTRACT-06
+TEST(ConfigPersister, StopSavesAConfigurationNeverHandedOver) {
+  const hw::Config a = ConfigWithMotor(1);
+  GatedStore store;
+  store.Release();
+  talos::rio::ConfigPersister persister{
+      [&](std::span<const uint8_t> persisted) { return store.Save(persisted); },
+      0};
+  persister.Start();
+  persister.Acknowledged(a);
+  EXPECT_EQ(persister.Tick(false), 0u);
+  persister.Stop();
+  EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a)}));
+}
+
+// A save Stop() runs while the previous one is still uncollected is left
+// behind in the saver's own slot; a saver started again must still save the
+// next configuration handed over, not return at once on finding that slot
+// occupied.
+// REQ-CONTRACT-06
+TEST(ConfigPersister, ARestartAfterStopSavesTheNextConfiguration) {
+  const hw::Config a = ConfigWithMotor(1);
+  const hw::Config b = ConfigWithMotor(2);
+  const hw::Config c = ConfigWithMotor(3);
+  GatedStore store;
+  talos::rio::ConfigPersister persister{
+      [&](std::span<const uint8_t> persisted) { return store.Save(persisted); },
+      0};
+  persister.Start();
+  persister.Acknowledged(a);
+  ASSERT_TRUE(store.TickUntilStarted(persister, 1)) << "A's save never started";
+  // B is handed over while A's save runs (the saver holds no lock then).
+  persister.Acknowledged(b);
+  for (int tick = 0; tick < 10; ++tick) persister.Tick(true);
+  // A finishes uncollected; Stop() saves B behind it.
+  store.Release();
+  persister.Stop();
+  ASSERT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a),
+                                                     hw::ConfigurationId(b)}));
+
+  persister.Start();
+  persister.Acknowledged(c);
+  EXPECT_TRUE(store.TickUntilStarted(persister, 3))
+      << "the restarted saver never saved C";
+  persister.Stop();
+  EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a),
+                                                     hw::ConfigurationId(b),
+                                                     hw::ConfigurationId(c)}));
+}
+
 // The CRC32 trailer of persisted bytes, which tells configurations apart
 // without allocating.
 uint32_t Trailer(std::span<const uint8_t> persisted) {

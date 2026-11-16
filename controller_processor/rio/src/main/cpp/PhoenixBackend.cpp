@@ -21,6 +21,13 @@
 
 #include "hardware/gate.h"
 
+#ifndef __FRC_ROBORIO__
+#include <frc/simulation/RoboRioSim.h>
+#include <units/voltage.h>
+
+#include "hardware/sim_backend.h"
+#endif
+
 namespace ph = ctre::phoenix6;
 namespace hw = talos::hardware;
 using namespace units::literals;
@@ -173,8 +180,12 @@ constexpr double kSimNeutralCoastTauS = 1.0;
 // Friction holds a nearly-stopped unpowered rotor instead of creeping forever
 // (same standstill snap as StepAxis).
 constexpr double kSimNeutralStandstillRps = 0.01;
+// The slowest a master's output status signal may run under a Phoenix
+// Follower ("no slower than 20 Hz", controls/Follower.hpp).
+constexpr double kFollowerSignalMinHz = 20.0;
 // RioLog kMessage indices (rate-limit keys) of this file's lines; Robot.cpp
-// uses 1 to 6. A licence refusal's line is keyed by its motor (16 to 31),
+// uses 1 to 6, LoopConsole 9 to 11. A licence refusal's line is keyed by its
+// motor (16 to 31),
 // so the logger coalesces no motor's line into another's.
 constexpr uint16_t kConfigureFailedMessage = 0;
 constexpr uint16_t kCanBusStatusMessage = 7;
@@ -260,6 +271,13 @@ PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
                    }},
       is_simulation_{is_simulation} {
   if (owned_log_) owned_log_->Start();
+#ifndef __FRC_ROBORIO__
+  // WPILib's simulated battery defaults to 12 V, below a pre-match battery
+  // check; rest at the charged supply sim_gateway reports instead.
+  if (is_simulation_) {
+    frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{hw::kSimRestingSupplyV});
+  }
+#endif
 }
 
 std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
@@ -438,19 +456,16 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     cfg.Audio.BeepOnConfig = false;
     cfg.Voltage.PeakForwardVoltage = units::volt_t{m.max_voltage};
     cfg.Voltage.PeakReverseVoltage = units::volt_t{-m.max_voltage};
-    // TorqueCurrentFOC's peak, both ways: max_torque_current_a, or for a
-    // follower, which copies its master's torque output and may not set the
-    // key, its master's; 0 A on a motor without the mode, so a torque
-    // request produces nothing there. The stator limit above applies in
+    // TorqueCurrentFOC's peak, both ways: max_torque_current_a, 0 A on a
+    // motor without the mode, so a torque request produces nothing there.
+    // Validate refuses the key on a follower and on a motor with one, so no
+    // Follower copies a torque output. The stator limit above applies in
     // addition, the supply limit in every mode; TorqueNeutralDeadband keeps
     // Phoenix's 0 A.
-    double torque_peak_a = m.max_torque_current_a;
-    for (const auto& master : c.motors)
-      if (m.master_id != 0 && master.id == m.master_id)
-        torque_peak_a = master.max_torque_current_a;
-    cfg.TorqueCurrent.PeakForwardTorqueCurrent = units::ampere_t{torque_peak_a};
+    cfg.TorqueCurrent.PeakForwardTorqueCurrent =
+        units::ampere_t{m.max_torque_current_a};
     cfg.TorqueCurrent.PeakReverseTorqueCurrent =
-        units::ampere_t{-torque_peak_a};
+        units::ampere_t{-m.max_torque_current_a};
     cfg.Feedback.RotorToSensorRatio = m.rotor_to_sensor_ratio;
     cfg.Feedback.SensorToMechanismRatio = m.sensor_to_mechanism_ratio;
     if (m.feedback == hw::Feedback::kRemoteCANcoder) {
@@ -510,22 +525,14 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     signals_.push_back(&motor->GetFaultField(false));
     signals_.push_back(&motor->GetDeviceTemp(false));
     signals_.push_back(&motor->GetSupplyCurrent(false));
-    for (int i = 0; i < 7; ++i) signal_ids_.push_back(m.id);
-    // Phoenix's Follower contract (controls/Follower.hpp): "The leader must
-    // ensure the status signal corresponding to its control output type
-    // (DutyCycle, MotorVoltage, TorqueCurrent) is enabled ... no slower than
-    // 20 Hz." So a master that may run TorqueCurrentFOC and has a follower
-    // asks for TorqueCurrent at status_hz, which OptimizeBusUtilization then
-    // keeps. In SDK 26.3 it shares a frame the motion feedback already holds
-    // at status_hz, so no simulation test can tell; asked for, it does not
-    // depend on that layout.
-    if (m.max_torque_current_a > 0 &&
-        std::any_of(c.motors.begin(), c.motors.end(), [&m](const auto& other) {
+    // A follower copies its master's output signal (MotorVoltage above for
+    // voltage-based requests, DutyCycle for duty-cycle ones), which the rate
+    // loop below keeps at kFollowerSignalMinHz or more for a master.
+    if (std::any_of(c.motors.begin(), c.motors.end(), [&m](const auto& other) {
           return other.master_id == m.id;
-        })) {
-      signals_.push_back(&motor->GetTorqueCurrent(false));
-      signal_ids_.push_back(m.id);
-    }
+        }))
+      signals_.push_back(&motor->GetDutyCycle(false));
+    signal_ids_.resize(signals_.size(), m.id);
     motors_.push_back(std::move(motor));
   }
   // FOC needs a Phoenix Pro licence, and so does a follower of a foc master,
@@ -612,14 +619,30 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       can_id = m.can_id;
       // Diagnostics request lower rates, but Phoenix applies the highest
       // requested rate to every signal sharing a status frame. In SDK 26.3,
-      // StatorCurrent, SupplyCurrent and DeviceTemp are SupplyAndTemp SPNs.
+      // StatorCurrent, SupplyCurrent and DeviceTemp are SupplyAndTemp SPNs,
+      // and a master's DutyCycle shares the MotorOutput frame with
+      // MotorVoltage (PRO_MotorOutput_*, 100 Hz by default on CAN 2.0 where
+      // position and velocity are 50 Hz), so it takes MotorVoltage's cap.
       auto& motor = *motors_[&m - c.motors.data()];
       if (signal == &motor.GetMotorVoltage(false) ||
+          signal == &motor.GetDutyCycle(false) ||
           signal == &motor.GetStatorCurrent(false) ||
           signal == &motor.GetSupplyCurrent(false) ||
           signal == &motor.GetFaultField(false))
         hz = std::min(hz, 50.0);
       if (signal == &motor.GetDeviceTemp(false)) hz = std::min(hz, 4.0);
+      // Phoenix's Follower (controls/Follower.hpp) updates the follower's
+      // output at the rate of its master's output signal, which must be no
+      // slower than 20 Hz; a status_hz as slow as config load allows (8 Hz
+      // at the 500 ms timeout) or OptimizeBusUtilization's 4 Hz would not
+      // be. TorqueCurrent is not needed: no motor with a follower runs
+      // torque-current requests (config load).
+      const bool master = std::any_of(
+          c.motors.begin(), c.motors.end(),
+          [&m](const auto& other) { return other.master_id == m.id; });
+      if (master && (signal == &motor.GetMotorVoltage(false) ||
+                     signal == &motor.GetDutyCycle(false)))
+        hz = std::max(hz, kFollowerSignalMinHz);
     }
     for (const auto& s : c.sensors) {
       if (s.id != id) continue;

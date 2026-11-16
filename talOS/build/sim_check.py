@@ -60,10 +60,12 @@ A failure prints the launch's output.
 
 Shared memory. The launch runs in the test's namespace (TEST_TMPDIR, which
 ShmObjectName maps every name into), so it never touches a robot's. The
-launcher unlinks its session's topics when it stops in order; the live
-registry it leaves for later sessions is unlinked by registry_unlink,
-which takes the name from ShmObjectName itself. A launch killed past its
-stop leaves its topics in the namespace.
+launcher unlinks its session's topics when it stops in order, and in a
+namespace also the live registry once its members are reaped
+(talOS/launcher/README.md "One session per namespace"). A launch killed
+past its stop leaves both: registry_unlink, which takes the name from
+ShmObjectName itself, removes the registry after every check, and the
+topics stay in the namespace.
 """
 
 import argparse
@@ -119,9 +121,21 @@ def udp_ports():
         return gateway.getsockname()[1], bridge.getsockname()[1]
 
 
+def running_in_session(stat, sid):
+    """Whether `stat`, the bytes of one /proc/<pid>/stat, is a process of
+    session `sid` that has not exited. A zombie (`Z`) has exited, and so
+    has a process its reaper has taken but the kernel has not yet removed
+    (`X`, EXIT_DEAD), which a reader can see in the instant between."""
+    # pid (comm) state ppid pgrp session ...; comm may hold spaces and ")".
+    fields = stat[stat.rindex(b")") + 2:].split()
+    return fields[0] not in (b"Z", b"X") and int(fields[3]) == sid
+
+
 def session_processes(sid):
-    """The pids of session `sid`'s processes that have not exited (a zombie
-    has: it runs nothing)."""
+    """The pids of session `sid`'s processes that have not exited (one that
+    is a zombie, or is being reaped, has: it runs nothing; see
+    running_in_session). macOS's ps(1) prints no state for a process being
+    reaped but `Z`."""
     found = set()
     if os.path.isdir("/proc/self"):
         for entry in os.listdir("/proc"):
@@ -132,9 +146,7 @@ def session_processes(sid):
                     stat = f.read()
             except OSError:
                 continue
-            # pid (comm) state ppid pgrp session ...; comm may hold spaces.
-            fields = stat[stat.rindex(b")") + 2:].split()
-            if fields[0] != b"Z" and int(fields[3]) == sid:
+            if running_in_session(stat, sid):
                 found.add(int(entry))
         return found
     listing = subprocess.run(["ps", "-A", "-o", "pid=,stat="],

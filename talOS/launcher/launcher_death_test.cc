@@ -345,9 +345,9 @@ class Session {
     if (events_ >= 0) ::close(events_);
     std::filesystem::remove_all(output_dir_);
     // The launcher prepared the registry in this test's namespace, and a
-    // registry outlives its sessions by design. Not namespaced, the name is
-    // the production registry's, which a live session beside the test may
-    // be using.
+    // launcher killed before it reaps its members leaves it. Not namespaced,
+    // the name is the production registry's, which a live session beside the
+    // test may be using.
     if (Namespaced()) talos::introspect::RegistryMapping::unlink();
   }
   Session(const Session&) = delete;

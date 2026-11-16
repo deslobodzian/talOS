@@ -43,6 +43,7 @@
 
 #include "hardware/gate.h"
 #include "hardware/gateway.h"
+#include "hardware/sim_backend.h"
 
 namespace hw = talos::hardware;
 
@@ -600,6 +601,20 @@ TEST(PhoenixBackendHealth, ReportsBatteryVoltage) {
   frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{12.0});
 }
 
+// WPILib's simulated battery reads 12 V, which fails a pre-match battery
+// check (the 2026 dashboard's asks for 12.5 V). The desktop simulation's
+// backend rests it at the charged supply sim_gateway reports, so both
+// simulated gateways read the same battery at rest.
+// REQ-DEV-06
+TEST(PhoenixBackendHealth, SimulationRestsTheBatteryAtTheChargedSupply) {
+  EnsureHal();
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{12.0});  // WPILib's
+  PhoenixBackend backend(true);
+  hw::State state;
+  backend.Read(state);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, hw::kSimRestingSupplyV);
+}
+
 // Under WPILib simulation no CAN bus is read: the slot the gateway asks for
 // reads SIMULATED, never a failing bus or an idle one.
 //
@@ -1036,6 +1051,54 @@ TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
       motor.GetFaultField(false).GetAppliedUpdateFrequency().value(), 50);
 }
 
+// A Phoenix Follower copies its leader's output status signal, whose rate is
+// the follower's update rate and must be no slower than 20 Hz
+// (controls/Follower.hpp). A master outputs DutyCycle in duty-cycle mode and
+// MotorVoltage in the voltage-based ones; at the slowest status rate config
+// load allows (status_hz 8 at the 500 ms timeout cap) both must still reach
+// 20 Hz.
+//
+// Not faster than MotorVoltage either: on CAN 2.0 the two share the TalonFX
+// MotorOutput status frame (SpnValue.hpp's PRO_MotorOutput_DutyCycle and
+// PRO_MotorOutput_MotorVoltage, both 100 Hz by default where position and
+// velocity are 50 Hz), and Phoenix runs a frame at its fastest request, so
+// DutyCycle at status_hz (200 Hz on the bench) would undo MotorVoltage's
+// 50 Hz cap. The simulator runs every signal but FaultField in one frame,
+// so the master's DutyCycle request shows only with position and velocity
+// requested no faster than the capped group.
+// REQ-CONTRACT-40
+TEST_F(PhoenixBackendRecovery, AMasterWithFollowersSendsItsOutputAt20Hz) {
+  EnsureHal();
+  for (const double status_hz : {200.0, 8.0}) {
+    SCOPED_TRACE(status_hz);
+    hw::Config config;
+    config.status_hz = status_hz;
+    config.command_timeout_us = 500'000;
+    auto follower = TestMotor(20, "follower", 2);
+    follower.master_id = 10;
+    config.motors = {TestMotor(10, "lift", 1), follower};
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+    auto& master = Motor(backend, 0);
+    EXPECT_GE(master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    EXPECT_GE(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    if (status_hz <= 50.0) continue;
+    for (auto* motion :
+         std::initializer_list<ctre::phoenix6::BaseStatusSignal*>{
+             &master.GetPosition(false), &master.GetVelocity(false)}) {
+      ASSERT_TRUE(AwaitAnswer([&] {
+                    return motion->SetUpdateFrequency(units::hertz_t{50});
+                  }).IsOK());
+    }
+    EXPECT_DOUBLE_EQ(
+        master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(), 50.0)
+        << "the master's DutyCycle is requested faster than MotorVoltage";
+  }
+}
+
 // The TalonFX enforces its limit pins itself, so the motor config must reach
 // the device: a normally closed forward switch, a disabled reverse one.
 TEST_F(PhoenixBackendRecovery, AppliesConfiguredHardwareLimitSwitches) {
@@ -1171,16 +1234,25 @@ TEST_F(PhoenixBackendRecovery, LateFeedbackStaysValidAndIsReportedLate) {
 // bit, since an old switch or limiter state is a wrong display (a motor
 // driven into its pressed forward switch, or stalled at its stator limit),
 // but keeps the fault bits it last had: losing the signal never un-faults a
-// motor (BootDuringEnable here: that row's TalonFX, CAN id 57, which no other
-// test uses, first boots inside it, while enabled). Each row first waits
-// until a read shows its bit: the reads that PumpReads gates on fresh motion
-// feedback say nothing of the separate 50 Hz FaultField, and one that finds
-// it 50 ms old reports no limit by this same rule.
+// motor (BootDuringEnable here, raised by a TalonFX that boots while enabled).
+// Each row first waits until a read shows its bit: the reads that PumpReads
+// gates on fresh motion feedback say nothing of the separate 50 Hz
+// FaultField, and one that finds it 50 ms old reports no limit by this same
+// rule. A simulated TalonFX raises BootDuringEnable only on its first boot in
+// the process, and clears it about 0.5 s after that boot, driven or not; so
+// the boot row takes a CAN id no device here has used, and waits for the bit
+// straight after AwaitReady, without the limit rows' 30-read pump, which
+// takes about as long as the bit lasts.
 // REQ-CONTRACT-32
 TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
   enum class Row { kForwardHardLimit, kStatorLimiter, kBootFault };
   // FaultField bit 4, BootDuringEnable: a fault (hw::MotorFaulted).
   constexpr uint32_t kBootDuringEnableFlag = uint32_t{1} << 4;
+  // CAN ids no other test here uses: one boot row per run of this test
+  // (--gtest_repeat), up to the last TalonFX id.
+  constexpr int kFirstBootCanId = 45;
+  constexpr int kLastCanId = 62;
+  static int next_boot_can_id = kFirstBootCanId;
   for (const Row row :
        {Row::kForwardHardLimit, Row::kStatorLimiter, Row::kBootFault}) {
     const uint32_t bit =
@@ -1193,7 +1265,12 @@ TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
     EnsureHal();
     EnabledDs ds;
     hw::Config config;
-    auto motor = TestMotor(1, "motor", row == Row::kBootFault ? 57 : 1);
+    if (row == Row::kBootFault) {
+      ASSERT_LE(next_boot_can_id, kLastCanId)
+          << "every CAN id the boot row may take has booted in this process";
+    }
+    auto motor =
+        TestMotor(1, "motor", row == Row::kBootFault ? next_boot_can_id++ : 1);
     motor.stator_limit_a = 10;
     config.motors.push_back(motor);
     PhoenixBackend backend(true);
@@ -1205,7 +1282,7 @@ TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
     auto& sim = Motor(backend, 0).GetSimState();
     if (row == Row::kStatorLimiter) StallRotor(backend);
     if (row == Row::kForwardHardLimit) sim.SetForwardLimit(true);
-    PumpReads(backend, state, commands, 30);
+    if (row != Row::kBootFault) PumpReads(backend, state, commands, 30);
     auto& faults = Motor(backend, 0).GetFaultField(false);
     ASSERT_TRUE(ReadUntil(backend, state,
                           [&] {
@@ -1755,6 +1832,64 @@ TEST_F(PhoenixBackendFoc, ALicenceNotReadIsReadAgainByTheRestoreLoop) {
   EXPECT_TRUE(backend.UnavailableDevices().empty());
 }
 
+// A restore pass that fails for one device ends (kDone, so the gateway reads
+// UnavailableDevices() and retries with backoff) with that device still
+// unavailable: invalid and sent NeutralOut. A device restored in the same
+// pass leaves the set and drives. The failure here is the licence read the
+// restore repeats (no answer); any failed restore operation takes the same
+// path.
+// REQ-SAFE-24
+TEST_F(PhoenixBackendFoc, AFailedRestoreLeavesOnlyItsDeviceUnavailable) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto lift = TestMotor(10, "lift", 1);
+  lift.foc = true;
+  config.motors = {lift, TestMotor(30, "roller", 3)};
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  SetProLicensed(backend, [](std::size_t i) -> std::optional<bool> {
+    return i == 0 ? std::nullopt : std::optional<bool>{true};
+  });
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  const auto contains = [](const std::vector<uint16_t>& ids, uint16_t id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+  };
+  ASSERT_TRUE(contains(backend.UnavailableDevices(), 10));
+
+  // Both in one pass, as after a reset of the roller while the lift waits.
+  // The roller's own restore can lose a transport answer to a stalled
+  // simulator; such a pass is repeated, and each must leave the lift.
+  const std::array<uint16_t, 2> ids{10, 30};
+  const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+  do {
+    backend.BeginRestoreAfterReset(ids);
+    auto status = backend.PollRestore();
+    while (status == hw::Backend::RestoreStatus::kPending) {
+      ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+          << "restore still pending";
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      status = backend.PollRestore();
+    }
+    ASSERT_EQ(status, hw::Backend::RestoreStatus::kDone);
+    ASSERT_TRUE(contains(backend.UnavailableDevices(), 10));
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+        << "roller still unavailable";
+  } while (contains(backend.UnavailableDevices(), 30));
+
+  const std::array<hw::MotorRequest, 2> commands{
+      Request(10, hw::Mode::kVoltage, 6.0),
+      Request(30, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  EXPECT_FALSE(state.motors[0].valid);
+  EXPECT_TRUE(state.motors[1].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 1), "VoltageOut");
+}
+
 namespace {
 
 // The simulated RoboRIO's battery reading for one test; 12 V, the
@@ -1811,10 +1946,11 @@ class PhoenixBackendTorque : public PhoenixBackendFoc {
 TEST_F(PhoenixBackendTorque, ARequestIsTorqueCurrentFocCappedAtMaxVoltage) {
   EnsureHal();
   EnabledDs ds;
-  SimBattery battery{0.0};  // No reading yet.
   hw::Config config;
   config.motors.push_back(TorqueMotor(1, "gripper", 1));
   PhoenixBackend backend(true);
+  // After the backend, which rests the simulated battery at 12.8 V.
+  SimBattery battery{0.0};  // No reading yet.
   ASSERT_TRUE(backend.Configure(config));
   ASSERT_TRUE(AwaitReady(backend, config));
   ctre::phoenix6::configs::TalonFXConfiguration applied;
@@ -1888,24 +2024,36 @@ TEST_F(PhoenixBackendTorque, AnOutOfContractRequestIsNeutralOut) {
   }
 }
 
-// A follower may not set max_torque_current_a, yet its Follower copies its
-// master's torque output, so it takes its master's peak torque current: with
-// its own 0 A, Phoenix's simulation held a follower at 0 V and 0 A while its
-// master drove 2 A.
-// REQ-SAFE-43
-TEST_F(PhoenixBackendTorque, AFollowerTakesItsMastersPeakTorqueCurrent) {
+class PhoenixBackendPeakVoltage : public PhoenixBackendTorque {};
+
+// The TalonFX's peak voltage, which holds every voltage-based request
+// (VoltageOut, VelocityVoltage, PositionVoltage, MotionMagicVoltage) to
+// max_voltage on the device: configured at ±max_voltage, and applied again
+// by the restore after a reset returned the device to Phoenix's defaults.
+// REQ-SAFE-44
+TEST_F(PhoenixBackendPeakVoltage, IsMaxVoltageAfterConfigureAndRestore) {
   EnsureHal();
   hw::Config config;
-  config.motors.push_back(TorqueMotor(10, "climber", 1));
-  auto follower = TestMotor(20, "climber_follower", 2);
-  follower.master_id = 10;
-  config.motors.push_back(follower);
+  auto motor = TestMotor(1, "roller", 1);
+  motor.max_voltage = 2.0;
+  config.motors.push_back(motor);
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
   ASSERT_TRUE(AwaitReady(backend, config));
   ctre::phoenix6::configs::TalonFXConfiguration applied;
-  ASSERT_TRUE(AppliedConfig(backend, 1, applied));
-  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakForwardTorqueCurrent.value(), 5.0);
-  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakReverseTorqueCurrent.value(),
-                   -5.0);
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), 2.0);
+  EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -2.0);
+
+  const ctre::phoenix6::configs::TalonFXConfiguration defaults;
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return Motor(backend, 0).GetConfigurator().Apply(defaults);
+              }).IsOK());
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  ASSERT_NE(applied.Voltage.PeakForwardVoltage.value(), 2.0) << "not reset";
+  const std::array<uint16_t, 1> ids{1};
+  ASSERT_TRUE(RestorePass(backend, ids));
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), 2.0);
+  EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -2.0);
 }

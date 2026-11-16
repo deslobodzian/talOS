@@ -351,7 +351,13 @@ is a warning-coloured band over the slider, at least a sliver wide, whose
 tooltip names the process, the duration, the records, dispatches and sends
 lost, and whether the stop closed it; the status line adds `· N log gaps`
 (nothing when there are none). The Session panel lists a run whose manifest
-sets `log_gap` with the problem "log gap", beside "recorder failed".
+sets `log_gap` with the problem "log gap", beside "recorder failed"; its
+Delivery column shows the manifest's nonzero delivery counts (wake failures,
+stalled arms, wake fallbacks, and the bridge's skipped requests per
+subsystem; [the manifest's fields](../talOS/launcher/README.md#session-manifest)),
+"none", or "not recorded" for a node whose registry row the launcher never
+saw, and any nonzero count is the problem "delivery loss", as
+`session_report --strict` fails it.
 **Close recording**,
 going live (`L`) or connecting returns to live data. A failed request (the
 server unreachable, an HTTP error, a malformed answer) pauses playback and is
@@ -429,7 +435,9 @@ bazel run -c opt //studio/review:studio_review -- --library /tmp/talos_logs [--p
 session holding its `manifest.json` and event logs, rotated segments and
 restarts included ([session segments and logs](../talOS/launcher/README.md#session-segments-and-logs)).
 Relative paths are taken from where `bazel run` was invoked. The server
-listens on 127.0.0.1 only (there is no flag to change that). It serves the
+listens on 127.0.0.1 only (there is no flag to change that), and refuses a
+port another listener holds, exiting with `cannot listen on 127.0.0.1:<port>`
+(it never shares a port, as uSockets' `SO_REUSEPORT` default would). It serves the
 review API under `/review/`: `sessions.json`, and per session
 `channels.json`, `bounds.json`, `snapshot?t_ns=` and
 `series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes are in

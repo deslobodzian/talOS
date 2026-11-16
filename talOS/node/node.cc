@@ -9,6 +9,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -1031,6 +1032,18 @@ std::int32_t NodeAccess::selected(const Node& node, std::size_t index) {
 // --- the binary --------------------------------------------------------------
 
 namespace detail {
+
+// Tests only: when set, called with the options of the event log a run
+// writes (a live run's, or --replay-inputs' output log) just before that
+// writer is made, so an in-process test can hold the writer thread
+// (LogWriterOptions::before_write) and see what a run whose own log has a
+// gap reports. Empty otherwise. node_test declares it where it uses it.
+std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+// Tests only, likewise: called with a live run's Reporter options before the
+// Reporter is made (a test turns off its copy of the event log flags).
+// Empty otherwise.
+std::function<void(introspect::Reporter::Options&)> reporter_options_for_test;
+
 namespace {
 
 // Flags every node binary accepts.
@@ -1220,20 +1233,26 @@ class OfflinePort final : public LoopPortFor<Loop> {
 // recorded deadlines) and is handed what it received live, at the drains it
 // received it in. What it sends is logged to --log. A topic recorded with
 // another schema fails before anything runs; topics nobody recorded are
-// listed. The run ends before the earliest gap in a log it is fed from, says
-// where, and exits 1 (event::ReplayInputs), as does a run whose own output
-// log has a gap.
+// listed. The run ends before the earliest gap or damaged stretch in a log
+// it is fed from, says where, and exits 1 (event::ReplayInputs), as does a
+// run whose own output log has a gap. A log it would be fed from that may
+// have lost records nothing in it marks or bounds is refused before anything
+// runs (a ReplayError, exit 1): one with a `.capped` marker or whose member
+// the session manifest marks log_capped, a run's log without its EXIT record
+// of a member it marks log_gap or recorder_failed, and one whose damaged
+// stretch nothing bounds.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
   const event::RecordedSession session{flags.replay_inputs, node_name};
   event::SimulationEnvironment environment;
-  Loop loop{
-      environment,
-      event::log::LogWriter{flags.log_path, node_name,
-                            event::log::LogWriterOptions{}, flags.session_id},
-      Loop::Options{.start = session.loop_start(),
-                    .run_start = session.run_start()}};
+  event::log::LogWriterOptions log_options;
+  if (log_options_for_test) log_options_for_test(log_options);
+  Loop loop{environment,
+            event::log::LogWriter{flags.log_path, node_name, log_options,
+                                  flags.session_id},
+            Loop::Options{.start = session.loop_start(),
+                          .run_start = session.run_start()}};
   const Hosted hosted =
       Host(std::make_unique<OfflinePort<Loop>>(loop), node_name, flags, make);
   const event::InputReplayReport report =
@@ -1254,12 +1273,20 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   // A log it was fed from lost records there: the run ended before them.
   if (report.stopped_at_gap.has_value()) {
     const event::InputReplayReport::Gap& gap = *report.stopped_at_gap;
-    std::printf(
-        "replay-inputs: stopped before a log gap in %s at %.6f s after the "
-        "session start (topic %s)\n",
-        gap.log.c_str(),
-        static_cast<double>((gap.at - session.start()).count()) / 1e9,
-        gap.topic.c_str());
+    const double at =
+        static_cast<double>((gap.at - session.start()).count()) / 1e9;
+    if (gap.damage_offset.has_value()) {
+      std::printf(
+          "replay-inputs: stopped before damaged records in %s at byte %llu, "
+          "%.6f s after the session start (topic %s)\n",
+          gap.log.c_str(), static_cast<unsigned long long>(*gap.damage_offset),
+          at, gap.topic.c_str());
+    } else {
+      std::printf(
+          "replay-inputs: stopped before a log gap in %s at %.6f s after the "
+          "session start (topic %s)\n",
+          gap.log.c_str(), at, gap.topic.c_str());
+    }
   }
   std::printf(
       "%s: dispatches=%llu recording_failed=%d recording_gaps=%llu "
@@ -1415,7 +1442,8 @@ int RunMain(int argc, char** argv, const char* node_name,
       loop.run();
       // The log ends at its first gap for replay: what came before it
       // replayed, and nothing after it did. A gap outside any dispatch
-      // (index 0, during construction) stops it before the first.
+      // (index 0, during construction) stops it before the first. A log
+      // without its EXIT ends the same way at the dispatch it was cut in.
       const std::optional<event::log::LogGap>& gap = loop.stopped_at_gap();
       if (gap.has_value()) {
         std::printf(
@@ -1425,6 +1453,15 @@ int RunMain(int argc, char** argv, const char* node_name,
             static_cast<unsigned long long>(
                 std::max<std::uint64_t>(gap->first_dispatch_index, 1)),
             event::log::DescribeGap(*gap).c_str());
+      }
+      if (const std::optional<std::uint64_t>& cut = loop.ended_in_dispatch()) {
+        std::printf(
+            "replay: %s ends without its EXIT (cut short, its writer "
+            "killed, or a segment its byte cap rotated out) %s %llu: "
+            "replayed every dispatch before it\n",
+            flags.replay_path.c_str(),
+            *cut == 0 ? "before dispatch" : "in dispatch",
+            static_cast<unsigned long long>(std::max<std::uint64_t>(*cut, 1)));
       }
       std::printf("replay: diverged=%d clean_exit=%d stopped_at_gap=%d\n",
                   loop.diverged(), loop.reached_exit(), gap.has_value());
@@ -1453,6 +1490,7 @@ int RunMain(int argc, char** argv, const char* node_name,
     event::log::LogWriterOptions log_options;
     log_options.max_bytes = flags.log_max_bytes;
     log_options.window = flags.log_window;
+    if (log_options_for_test) log_options_for_test(log_options);
     // The loop reads the stop flag between dispatches, so a stop takes effect
     // after the current dispatch even when overdue timers never let it wait
     // (an update() that overruns its period).
@@ -1466,10 +1504,28 @@ int RunMain(int argc, char** argv, const char* node_name,
     // publishing identity before any user constructor or backend
     // initialization.
     std::optional<Hosted> hosted;
-    introspect::Reporter reporter{{.name = node_name,
-                                   .target = node_target,
-                                   .session_id = flags.session_id,
-                                   .simulation = flags.simulation}};
+    introspect::Reporter::Options reporter_options{
+        .name = node_name,
+        .target = node_target,
+        .session_id = flags.session_id,
+        .simulation = flags.simulation};
+    if (reporter_options_for_test) reporter_options_for_test(reporter_options);
+    introspect::Reporter reporter{std::move(reporter_options)};
+    // The log marks its row as a gap opens (kFlagLogGap), not at the
+    // reporter's next refresh, so a run killed during a gap is marked. The
+    // row is claimed only now, after the loop and its writer exist, so the
+    // writer takes it here, on the loop's thread, before any send; and lets
+    // go of it before the Reporter (and the row's mapping) goes, ahead of
+    // the node's destruction, which may still send.
+    const introspect::NodeRegistration::FlagsWord row = reporter.row_flags();
+    loop.recorder().set_gap_flags({.flags = row.flags,
+                                   .bit = introspect::kFlagLogGap,
+                                   .owner = row.generation,
+                                   .expected = row.claimed});
+    struct GapFlagsRelease {
+      event::log::LogWriter& writer;
+      ~GapFlagsRelease() { writer.set_gap_flags({}); }
+    } const gap_flags_release{loop.recorder()};
     hosted.emplace(Host(loop, node_name, flags, make));
     if (process::stop_requested.load()) {
       // Stopped while constructing: a clean stop, without running the loop.

@@ -35,7 +35,7 @@ shared-memory topics only; its repository documents their rates.
 
 | Link / direction | Transport / port | Trigger or rate in the bench configuration |
 |---|---|---|
-| Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Phoenix motion feedback requests `status_hz`; voltage/stator-current/supply-current/fault diagnostics request `min(status_hz, 50)` Hz; device temperature requests `min(status_hz, 4)` Hz. Shared vendor frames apply their highest requested rate: voltage/current/temperature remain 200 Hz with 200 Hz feedback; fault field applies 50 Hz. Disabled one-shot neutral refresh remains every hardware tick. |
+| Devices ↔ RIO backend | CAN / local DIO, analog, encoder, PWM; no IP port | Gateway samples/applies on `Config.period_us`: 5000 µs = 200 Hz. Phoenix motion feedback requests `status_hz`; voltage/stator-current/supply-current/fault diagnostics request `min(status_hz, 50)` Hz; device temperature requests `min(status_hz, 4)` Hz. A motor another motor follows also requests its duty cycle, and both its voltage and duty cycle at 20 Hz or more, the slowest a Phoenix follower's leader output may run. Shared vendor frames apply their highest requested rate: under the vendor library's simulation, where every signal but the fault field shares one frame, voltage/current/temperature remain 200 Hz with 200 Hz feedback and the fault field applies 50 Hz; the rates a physical bus applies have not been measured. Disabled one-shot neutral refresh remains every hardware tick. |
 | Driver Station ↔ RIO | WPILib/FRC native control/status over radio; not talOS UDP | DS produces new data at 50 Hz. The RIO program's `talos-ds` thread refreshes WPILib's cache on each new DS packet, or 20000 µs after the last without one, snapshots it whole and reports the program's mode while the hardware loop ticks; the loop observes the mode generation each hardware tick from the latest snapshot, and sends that snapshot as the DriverStation packet, as no Driver Station (no mode, no joystick input) once its refresh is `command_timeout_us` old ([hardware README](../talOS/hardware/README.md#roborio)); snapshot cadence is in row DriverStation (24). Native FRC packet layouts are external to this repo. |
 | RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz; echoes clock probe send time only after a subsequent gateway tick. |
 | hardware_node → RIO: Command (21) | UDP 5803 → 5802 | The bridge sleeps until a gateway datagram, a `/hw/request/<node>` publication or its next time-driven duty, and merges each request when it is published, within a CPU budget of 8 passes and 64 received datagrams per 1000 µs window (`HardwareNode::kDatagramBudget`), past which it sleeps through input to the window's end (`HardwareNode::kCpuWindowUs`); one pass receives at most 32 (`HardwareNode::kReceiveBudget`). While the latest State says the gateway can take a command (configured and commissioned, enabled, no fault), send immediately when the merged command changes, its observation included, so one command per accepted request that changes the merge; actuator nodes publish on their own `period_us`, each request carrying a new observation or demand, so in `robot.toml` at most motor 200 + swerve_module 200 = 400 commands/s, each a 138 B frame (3 motors: 98 B payload) ≈ 55 kB/s (in `robot_py.toml`, whose Python motor runs at 20000 µs, 50 + 200 = 250/s ≈ 34.5 kB/s). Otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. While the latest State says it cannot (disabled, unconfigured, uncommissioned or faulted), a change of the observation alone waits for that heartbeat, so the bridge sends exactly one command per heartbeat (50/s × 138 B ≈ 6.9 kB/s) plus one at once per change of a demand, output or identity word, whatever the owners' periods and phases (`HardwareNode::CommandDueUs`). Only after observed state and while a subsystem request is active. The RIO receives at most 64 frames per 5000 µs hardware tick and applies only the highest-sequence command of each tick's batch (`endpoint.h` `kReceiveBudget`), about 2 commands per tick at 400/s, so a backlog queued during a RIO stall is skipped, not replayed. |
@@ -122,7 +122,7 @@ bytes, and every reader of recorded hardware packets decodes them only under
 the version the session recorded (REQ-OPS-51): the bridge's own, on every
 `/hw/status` (`protocol_version_id`), else the launcher's in its manifest:
 `log_dump`,
-`tlog_to_wpilog` and `session_report`, `studio_review`, retention's match
+`session_report`, `studio_review`, retention's match
 classification and `--replay-inputs`
 ([which logs a build can read](../talOS/launcher/README.md#which-logs-a-build-can-read)).
 So a bump makes earlier sessions' hardware packets unreadable to this build's
@@ -395,7 +395,8 @@ and send, separate from event/dispatch time. Exact replay preserves publication
 age; input replay injects with the recorded publication time, at that time,
 or, for a node the session ran, at the drain that received it. Neither crosses
 a GAP record: exact replay stops before the gap's first dropped dispatch,
-input replay before the earliest gap in a log it feeds from, and both exit 1
+input replay before the earliest gap or damaged stretch in a log it feeds
+from, and both exit 1
 ([events](../talOS/events/README.md#recording-and-replaying)).
 Readers accept versions 7 and 8 (a version-7 log is a version-8 log without a
 GAP record) and reject any other with the recorded and supported versions; the
@@ -428,11 +429,14 @@ rotation syncs durably and takes a buffer chunk, so faster rotation could
 exhaust the writer's pool and drop records (a gap). The newest
 is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
-`log_dump`, `tlog_to_wpilog` and `--replay-inputs` read every segment in a
-session directory, and `log_dump` or `tlog_to_wpilog` given one log's file
-reads that log's kept segments with it;
-exact `--replay` needs the first segment, since a later one starts
-mid-session. Rotation syncs each finished segment and the next one's header
+`log_dump` and `--replay-inputs` read every segment in a
+session directory, and `log_dump` given one log's file
+reads that log's kept segments with it; `--replay-inputs` refuses to feed a
+node from a log whose `<log>.capped` marker exists (or whose member the
+session manifest marks `log_capped`), since no GAP record
+marks what the cap cost it (its oldest segment, or the records after
+capture stopped). Exact `--replay` refuses a log whose first
+dispatch is not 1, since a later segment starts mid-session. Rotation syncs each finished segment and the next one's header
 before renaming it into place, and the cap marker before deleting the oldest,
 so a power loss leaves whole segments; a session reader skips (with a
 warning) a file cut before its header was complete. A cap below two segments

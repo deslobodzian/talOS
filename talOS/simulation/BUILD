@@ -80,7 +80,10 @@ py_test(
         "LOG_DUMP": "$(rlocationpath //talOS/launcher:log_dump)",
     },
     tags = ["integration"],
-    deps = ["@rules_python//python/runfiles"],
+    deps = [
+        "//talOS/memory:shm_name",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 # The simulator alone, as a child process: --describe and its flag checks,

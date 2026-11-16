@@ -65,7 +65,7 @@ It writes the bundle directory `bazel-bin/<package>/<name>/`
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `studio/` | with `studio_bridge` and `studio_webroot` only: the bridge binary (`studio/studio_bridge`) and the site it serves (`studio/webroot/`) |
 | `config/` | the robot config and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
-| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
+| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; from a `testonly` `talos_bundle`, `testonly = true` ([install](#on-the-main-processor) refuses it); with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
 
 The bundle holds no symlinks. Bazel may restore a tree artifact from its
 disk or remote cache with each symlink in it replaced by a copy of its
@@ -144,6 +144,7 @@ simulation. A launch that changes the ports with `--remote-port` and
 ./tools/deploy.sh install <bundle> [--prefix /opt/talos] [--no-warm-up]
 ./tools/deploy.sh enable-boot [--prefix /opt/talos] [--user talos] [--dry-run]
 ./tools/deploy.sh boot-check
+./tools/deploy.sh run [--prefix /opt/talos] [--dry-run] [--] [run.sh arguments]
 ./tools/deploy.sh logs [--prefix /opt/talos] [LOG_ROOT]
 ./tools/deploy.sh fetch [--prefix /opt/talos] DEST
 ./tools/deploy.sh rollback [--prefix /opt/talos] [--no-warm-up]
@@ -156,14 +157,27 @@ the repository, or `talos/` as a submodule):
 `../talos/tools/deploy.sh install bazel-bin/robot_bundle`.
 A relative `--prefix` is resolved against the working directory.
 
-- **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only),
+- **install** refuses a test-only bundle, one whose `bundle_manifest.toml`
+  says `testonly = true` (a `talos_bundle` with `testonly = True`, which may
+  carry test fixtures), before writing anything: it exits 1 with
+  `deploy: error: <bundle> is a test-only bundle ...`. There is no override
+  flag. The one exception is how talOS's own tests install their fixture
+  bundles: install accepts a test-only bundle when `TEST_TARGET` is set and
+  the prefix lies inside the directory `TEST_TMPDIR` names, as Bazel sets
+  both for a test. It then refuses, also before writing anything, a bundle
+  whose `#!/usr/bin/env` interpreter (a Python node's `python3`) the boot
+  service's `PATH` cannot run ([host interpreters](#host-interpreters)).
+  Otherwise it
+  copies the bundle to `<prefix>/bundles/<stamp>/` (read-only),
   checks that the copy has an executable `run.sh`, runs
   `sync`, [warms the copy](#warm-up), [checks its graph](#graph-check),
   retains `previous`, and atomically replaces `current` using a temporary
   sibling symlink and rename (Linux and macOS). This selects the next bundle;
   restart the service to activate it. A bundle whose graph the launcher
-  refuses is not installed: its copy is removed and `current` and `previous`
-  stay as they were. A `talos_bundle` holds no symlinks, but a bundle Bazel's
+  refuses, or whose install fails after the copy (a copy without an
+  executable `run.sh`, a graph check that cannot create its temporary
+  directory), is not installed: its copy is removed and `current` and
+  `previous` stay as they were. A `talos_bundle` holds no symlinks, but a bundle Bazel's
   sandbox staged, or one copied with its links, is a tree of links into a
   build tree, which would dangle after a `bazel clean`: install copies a
   link whose target leaves the bundle (an absolute target, a relative one
@@ -179,10 +193,11 @@ A relative `--prefix` is resolved against the working directory.
   directory holding the link itself, the bundle or the install (which the
   copy would follow until it failed or the disk filled); `current` and
   `previous` stay as they were. Stopping `deploy.sh` (Ctrl-C, SIGTERM,
-  SIGHUP) while it copies, or makes the copy read-only and syncs it, stops
-  the copy's processes, removes the copy and exits 128 plus the signal's
-  number; a stop during the warm-up or the graph check selects nothing but
-  leaves the complete copy for `prune`.
+  SIGHUP) at any point before it selects the copy (while it copies, makes
+  the copy read-only and syncs it, warms it or checks its graph) stops
+  that step's processes, selects nothing, removes the copy and exits 128
+  plus the signal's number, so no stray `bundles/<stamp>` is left for
+  `prune` to count among the newest.
 - **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
   boot as `--user` (default `talos`; the account must exist), so a booted
   robot serves the Studio its bundle carries ([above](#build-a-bundle)).
@@ -206,7 +221,8 @@ A relative `--prefix` is resolved against the working directory.
   the job's CPU and I/O (`man launchd.plist`), `Background` throttles harder,
   and `Adaptive` follows XPC activity the launcher has none of.
   Both use sudo. Before enabling, it checks bundle read/traversal access as
-  the selected account and creates `<prefix>/logs` owned by that account,
+  the selected account, with the `python3` the boot service's `PATH`
+  resolves ([host interpreters](#host-interpreters)), and creates `<prefix>/logs` owned by that account,
   mode 0755. Bundles stay read-only. An inaccessible bundle fails clearly;
   fix ancestor traversal/read permissions rather than granting bundle writes.
   `--dry-run` prints these provisioning/check commands and the unit, or the
@@ -220,6 +236,33 @@ A relative `--prefix` is resolved against the working directory.
   updates install on their own (which restarts the Mini); `enable-boot`
   changes neither FileVault nor updates, which a person sets in System
   Settings. `tools/mac_qualify.sh` runs it as a step.
+- **run** starts the selected bundle by hand, in the foreground, as the
+  boot service starts it: `<prefix>/current/run.sh` with
+  `TALOS_LOG_DIR=<prefix>/logs`, every argument after `run` passed to
+  `run.sh` and so to the launcher (`deploy.sh run --remote 10.0.0.72
+  --duration-s 60` for a RoboRIO on another network; after `--`,
+  `deploy.sh`'s own `--prefix`, `--dry-run` and `--no-warm-up` are passed
+  on too). On Linux it first takes the boot unit's limits, `ulimit -r 49` and
+  `ulimit -l unlimited`, which needs no privilege once the account's hard limits allow
+  them ([the one-time grant](INSTALL.md#realtime-grant-for-deploysh-run));
+  without it, it starts nothing and exits 1 with one line naming the hard
+  limits it found, the grant and, for one terminal only, `sudo prlimit --pid
+  <its shell> --rtprio=49:49 --memlock=unlimited:unlimited`. macOS's
+  realtime policy needs no limit, so there it just starts. It prints
+  `deploy: launcher pid <pid>; its session directory is a new <session
+  id>/ under <root> ...` and then execs `run.sh`, which execs the launcher
+  in the same process, so that pid is the launcher's and Ctrl-C reaches it
+  alone; the launcher prints the session directory as `Output Dir:`. An
+  `--output-dir` argument replaces the root, as it does for `run.sh`
+  (give an absolute path: `run.sh` changes into the bundle directory, so a
+  relative one resolves inside it); a
+  root the person cannot write (`enable-boot` gives `<prefix>/logs` to the
+  service account) is refused, naming `--output-dir`. It refuses to start
+  while the boot service is running the same `run.sh` (`systemctl show
+  talos.service`, `launchctl print system/org.talos.robot`, read without
+  sudo), naming the command that stops it; one it cannot ask is left to the
+  launcher's [one session per namespace](../talOS/launcher/README.md#one-session-per-namespace).
+  `--dry-run` prints the `ulimit` (Linux) and the `exec` it would run.
 - **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`),
   oldest first by the `start_wall_ns` their manifest records (the directory's
   modification time without one; session ids are not ordered in time), each
@@ -248,7 +291,11 @@ A relative `--prefix` is resolved against the working directory.
   holds a bundle. It [warms](#warm-up) `previous` before selecting it: one
   installed by a `deploy.sh` without the warm-up and never launched has never
   run. A bundle that has already run needs none, and its warm-up costs about
-  10 ms a member. Selection does not change already-running processes: a
+  10 ms a member. It then runs install's [graph check](#graph-check) on
+  `previous` and, when the launcher refuses it (one installed by a
+  `deploy.sh` without the check, say), exits 1 with `deploy: error: not
+  rolled back: the launcher refuses <bundle>; current stays <bundle>`,
+  changing neither link. Selection does not change already-running processes: a
   running launcher restarts nodes from the bundle it started in.
   With the robot disabled, activate install/rollback with
   `sudo systemctl restart talos` on Linux, or
@@ -257,8 +304,10 @@ A relative `--prefix` is resolved against the working directory.
   and the ones `current` and `previous` select, however old. Prune after
   activating the selection, so the running bundle is among those kept.
 
-Run by hand: `/opt/talos/current/run.sh --duration-s 30`. Stop the boot
-service first (`sudo systemctl stop talos`; on macOS
+Run by hand: `./tools/deploy.sh run --duration-s 30` (above), which gives
+the launcher the boot service's realtime limits on Linux, or
+`/opt/talos/current/run.sh --duration-s 30`, which runs with the caller's
+limits. Stop the boot service first (`sudo systemctl stop talos`; on macOS
 `sudo launchctl bootout system/org.talos.robot`, and `enable-boot` again
 afterwards): only one launcher may run a session in a shared-memory namespace,
 so a second is refused with the running one's pid
@@ -268,8 +317,9 @@ Boot services set `TALOS_LOG_DIR=<prefix>/logs`. The generated `run.sh` passes
 that directory as the launcher's output **root**, unless an explicit
 `--output-dir ROOT` is supplied. The launcher appends a unique session id on
 every invocation, so recordings live in `<prefix>/logs/<session-id>/` and
-restarts of the service never reuse a previous session folder. For a manual
-run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
+restarts of the service never reuse a previous session folder. `deploy.sh run`
+sets it the same way; for a manual
+run of `run.sh` to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 `--output-dir /opt/talos/logs`; `logs LOG_ROOT` can inspect another output root.
 
 Each node's stdout and stderr, every run of it, land in
@@ -315,8 +365,7 @@ them), and the first `--describe-only` after it 0.4 to 0.5 s idle
 ([BENCH_RESULTS.md](BENCH_RESULTS.md#2026-11-13): DEPLOY-10, MAC-2). A
 member that exits nonzero, or is still running after 60 s (then its process group is killed),
 is a `deploy: warning: warm-up: <name>: ...` line and the command still
-succeeds: install's [graph check](#graph-check), and rollback's launch, judge
-the members. The warm-up's last line counts what finished, members that
+succeeds: the [graph check](#graph-check) that follows judges the members. The warm-up's last line counts what finished, members that
 exited 0 and native libraries whose load returned (failing or not), and
 names each member that did not with how it ended:
 `deploy: warmed 4 of 5 members and 40 of 58 native libraries in 6.2 s; not
@@ -325,12 +374,13 @@ when everything finished it reads `deploy: warmed 5 members and 58 native
 libraries in 9.8 s`. A member that detaches a process
 into a new session (`setsid()`) leaves the group that kill reaches. Stopping
 `deploy.sh` during the warm-up (Ctrl-C, SIGTERM, SIGHUP) kills the running
-member's process group, selects nothing and exits 1. Linux has no such
-charge; the warm-up runs there too. `--no-warm-up` skips it. After `install`, the
-[graph check](#graph-check) still runs every member and the launcher once,
-all at once inside the probes' deadline, so the first launch pays only, on
-macOS, each native library's first load; after `rollback`, which has no
-check, the first launch pays every first run.
+member's process group, selects nothing and exits 128 plus the signal's
+number; `install` also removes its copy. Linux has no such
+charge; the warm-up runs there too. `--no-warm-up` skips it. The
+[graph check](#graph-check) that `install` and `rollback` run next still
+runs every member and the launcher once, all at once inside the probes'
+deadline, so the first launch pays only, on macOS, each native library's
+first load.
 
 The members run as the user that runs `deploy.sh`, root under `sudo`: the
 bundle's code runs at install time with that privilege, so install only a
@@ -362,7 +412,8 @@ launcher or the warm-up, do not refuse; on acceptance the launcher's graph
 warnings (its `  warning: ` lines, among them a non-critical member that did
 not answer `--describe`, which the launch still starts, and a Studio bridge
 that did not, which it leaves out) are printed, prefixed the same way. Stopping `deploy.sh` during the
-check stops the launcher, selects nothing and exits 1.
+check stops the launcher, selects nothing, removes the copy and exits 128
+plus the signal's number.
 
 The check takes nothing a running robot holds: `--describe-only` takes no
 session lock, shared memory, registry row, controller link or realtime
@@ -373,8 +424,10 @@ on macOS a fresh bundle's probes then pay the first-run charge inside their
 deadline, as its first launch would, so a probe that times out there is
 answered by installing again without `--no-warm-up`. There is no override:
 the launcher accepts `--allow-graph-errors` only with `--sim`, so a robot
-could never launch such a bundle. `rollback` does not check: it selects a
-bundle that was selected before.
+could never launch such a bundle. `rollback` runs the same check on
+`previous` after warming it, and a refusal leaves `current` and `previous`
+as they were ([rollback](#on-the-main-processor)); stopping it during the
+check selects nothing.
 
 The check is not the whole launch. It does not cover:
 
@@ -383,9 +436,36 @@ The check is not the whole launch. It does not cover:
   simulation config installs and the boot service's launch then exits 1.
 - The boot service's account and environment: the check runs as the person
   running `deploy.sh`, with their environment, while the service runs as
-  its account with its own `PATH`, so a member that resolves a program
-  through `PATH` (a Python member's `#!/usr/bin/env python3`) can find a
-  different one at boot (TODO.md DEPLOY-10).
+  its account with its own environment. What members find through the
+  service's `PATH` is checked separately ([host
+  interpreters](#host-interpreters)); anything else a member reads from
+  the environment can differ at boot.
+
+### Host interpreters
+
+A bundle needs a host `python3` when it carries a Python node: each Python
+node's entry script, `bin/<name>`, starts `#!/usr/bin/env python3`, and
+that interpreter only starts the node, which then runs on the bundle's own
+runtime in `python/` ([bundle layout](#build-a-bundle)). `run.sh` starts
+`#!/usr/bin/env bash`. `env` resolves both on the `PATH` the boot service
+starts `run.sh` with, the bundle's `bin/` first and then the service
+manager's default, not the installer's: `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+under systemd, `/usr/bin:/bin:/usr/sbin:/sbin` under launchd, where neither
+Homebrew's nor a pyenv `python3` is. So `install`, before writing anything,
+runs each program that `run.sh`, the launcher, a `bin/` entry or the Studio
+bridge names after `#!/usr/bin/env`, once, as `<program> --version` with
+only that `PATH`, and refuses the bundle when one does not run, absent or
+failing (macOS's `/usr/bin/python3` without the Command Line Tools fails):
+
+```
+deploy: error: bin/<name> starts #!/usr/bin/env python3, which the boot service resolves on its PATH, <path>, where python3 does not run; nothing was written to <prefix>. Install python3 in a directory on that PATH (...)
+```
+
+The fix is a `python3` on that `PATH`: on macOS `xcode-select --install`
+(the Command Line Tools provide the `/usr/bin/python3` launchd finds), on
+Linux the distribution's `python3` package. The check runs as the
+installer; the service account resolves the same `PATH`, and `enable-boot`
+checks that account's access to the bundle.
 
 ### Boot service output
 

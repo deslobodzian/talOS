@@ -1,9 +1,12 @@
 #include "studio/review/hardware_channels.h"
 
 #include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "nlohmann/json.hpp"
+#include "talOS/hardware/messages.h"
 
 namespace studio::review {
 namespace {
@@ -22,6 +25,22 @@ std::string ElementKey(const json& element, std::size_t index) {
   return std::to_string(index);
 }
 
+// Whether `prefix` names an element of a `pwm_outputs` array:
+// ".../pwm_outputs/<id>".
+bool IsPwmOutput(std::string_view prefix) {
+  const auto slash = prefix.rfind('/');
+  return slash != std::string_view::npos &&
+         prefix.substr(0, slash).ends_with("/pwm_outputs");
+}
+
+// The wire value (hardware::PwmMode) of a PWM request's mode as log_dump
+// names it (talOS/launcher/hardware_record.cc); none for another name.
+std::optional<talos::hardware::PwmMode> PwmModeNamed(std::string_view name) {
+  if (name == "off") return talos::hardware::PwmMode::kOff;
+  if (name == "pulse") return talos::hardware::PwmMode::kPulse;
+  return std::nullopt;
+}
+
 void Flatten(const json& value, const std::string& name,
              std::vector<HardwareSample>& out);
 
@@ -30,6 +49,17 @@ void FlattenObject(const json& object, const std::string& prefix,
   for (const auto& [key, member] : object.items()) {
     // The element's own key is its path segment; its name is a string.
     if (key == "id" || key == "port") continue;
+    // A PWM request's mode is a channel of its wire value, so off (no
+    // pulse) and a centre pulse, both an output of 0, read apart.
+    if (key == "mode" && member.is_string() && IsPwmOutput(prefix)) {
+      if (const auto mode = PwmModeNamed(member.get<std::string>())) {
+        out.push_back({prefix + "/mode", Talos::Telemetry::ChannelKind_Double,
+                       talos::telemetry::RawFromDouble(
+                           static_cast<double>(static_cast<int>(*mode))),
+                       false});
+      }
+      continue;
+    }
     Flatten(member, prefix + "/" + key, out);
   }
 }

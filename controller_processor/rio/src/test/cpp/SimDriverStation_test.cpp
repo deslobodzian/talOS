@@ -56,9 +56,9 @@ class SimDriverStationTest : public ::testing::Test {
   }
 };
 
-// A schedule must not enable before the gateway is configured (the first
-// configuration push needs disabled operation), then runs each phase from
-// that moment, autonomous included, and holds the last one.
+// A schedule must not enable before the gateway acknowledges a
+// configuration push (a push needs disabled operation), then runs each phase
+// from that moment, autonomous included, and holds the last one.
 TEST_F(SimDriverStationTest, ScheduleStartsAtConfigurationAndHoldsLastPhase) {
   const auto t0 = SimDriverStation::Clock::time_point{} + 1h;
   auto settings = Active();
@@ -69,6 +69,7 @@ TEST_F(SimDriverStationTest, ScheduleStartsAtConfigurationAndHoldsLastPhase) {
   EXPECT_FALSE(Published().enabled);
 
   const auto configured = t0 + 10s + 5ms;
+  ds.ConfigurationAcknowledged();
   ds.Update(configured, true);
   EXPECT_TRUE(Published().enabled);
   EXPECT_FALSE(Published().autonomous);
@@ -95,6 +96,7 @@ TEST_F(SimDriverStationTest, AutoEnableDisablesOnceAtDeadline) {
   settings.enable_when_configured = true;
   settings.disable_after = std::chrono::milliseconds{1000};
   SimDriverStation ds{settings, t0};
+  ds.ConfigurationAcknowledged();
   ds.Update(t0 + 100ms, true);
   EXPECT_TRUE(Published().enabled);
   ds.Update(t0 + 1s, true);
@@ -103,6 +105,41 @@ TEST_F(SimDriverStationTest, AutoEnableDisablesOnceAtDeadline) {
   EXPECT_FALSE(Published().enabled);
   ds.Update(t0 + 1010ms, true);
   EXPECT_FALSE(Published().enabled);
+}
+
+// A gateway configured from the configuration a previous run left on disk
+// is not yet configured by this run's main processor: enabling then would
+// make the gateway refuse that push if it differs (a push needs disabled
+// operation), so neither TALOS_SIM_DS=auto nor a schedule may start until a
+// push is acknowledged in this boot, and a schedule's clock starts then.
+// REQ-DEV-06
+TEST_F(SimDriverStationTest, ARestoredConfigurationEnablesNothing) {
+  const auto t0 = SimDriverStation::Clock::time_point{} + 1h;
+  auto automatic = Active();
+  automatic.enable_when_configured = true;
+  {
+    SimDriverStation ds{automatic, t0};
+    ds.Update(t0 + 1s, true);
+    EXPECT_FALSE(Published().enabled)
+        << "TALOS_SIM_DS=auto enabled on a restored configuration";
+    ds.ConfigurationAcknowledged();
+    ds.Update(t0 + 2s, true);
+    EXPECT_TRUE(Published().enabled);
+  }
+
+  auto scheduled = Active();
+  scheduled.schedule = ParseModeSchedule("teleop:1,disabled:1");
+  SimDriverStation ds{scheduled, t0};
+  ds.Update(t0 + 2s, true);
+  EXPECT_FALSE(Published().enabled)
+      << "the schedule started on a restored configuration";
+  const auto acknowledged = t0 + 5s;
+  ds.ConfigurationAcknowledged();
+  ds.Update(acknowledged, true);
+  EXPECT_TRUE(Published().enabled);
+  ds.Update(acknowledged + 999ms, true);
+  EXPECT_TRUE(Published().enabled)
+      << "the schedule's clock started at the restore, not the push";
 }
 
 // What the gateway would send: a refresh, as the Driver Station reader's
@@ -131,6 +168,7 @@ TEST_F(SimDriverStationTest, ScriptedEventsLeaveTheRefreshToTheReader) {
   settings.enable_when_configured = true;
   settings.joysticks = ParseJoystickSchedule("0:axes=0.25;buttons=1;pov=-1");
   SimDriverStation sim{settings, t0};
+  sim.ConfigurationAcknowledged();
   sim.Update(t0 + 1s, true);
   ASSERT_TRUE(Published().enabled);
   EXPECT_FALSE(frc::DriverStation::IsEnabled())
@@ -144,10 +182,10 @@ TEST_F(SimDriverStationTest, ScriptedEventsLeaveTheRefreshToTheReader) {
 }
 
 // A scripted joystick must reach the gateway's Driver Station packet as a
-// real stick would: absent until the gateway is configured (no deflection
-// before the robot can be enabled), each snapshot at its time from that
-// moment, and still reported after a disable, which the packet's flags (not
-// a vanished stick) carry to the driver.
+// real stick would: absent until a configuration push is acknowledged (no
+// deflection before the robot can be enabled), each snapshot at its time from
+// that moment, and still reported after a disable, which the packet's flags
+// (not a vanished stick) carry to the driver.
 TEST_F(SimDriverStationTest, JoystickScheduleReachesDriverStationPacket) {
   namespace ds = talos::driver_station;
   const auto t0 = SimDriverStation::Clock::time_point{} + 1h;
@@ -161,6 +199,7 @@ TEST_F(SimDriverStationTest, JoystickScheduleReachesDriverStationPacket) {
   EXPECT_FALSE(Sampled().joysticks[0].connected);
 
   const auto configured = t0 + 11s;
+  sim.ConfigurationAcknowledged();
   sim.Update(configured, true);
   auto packet = Sampled();
   ASSERT_TRUE(packet.joysticks[0].connected);

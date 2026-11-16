@@ -24,6 +24,7 @@ cc_library(
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:session_manifest",
         "//talOS/hardware",
         "//talOS/introspection:describe",
         "//talOS/introspection:lock_file",
@@ -133,7 +134,7 @@ cc_test(
 )
 
 # The log files a log tool's inputs name, each once (log_dump,
-# tlog_to_wpilog).
+# Studio's review).
 cc_library(
     name = "log_inputs",
     srcs = ["log_inputs.cc"],
@@ -143,7 +144,7 @@ cc_library(
 )
 
 # One session's event logs streamed in time order, a fixed window per log,
-# for log_dump and tlog_to_wpilog.
+# for log_dump and Studio's review.
 cc_library(
     name = "log_merge",
     srcs = ["log_merge.cc"],
@@ -221,8 +222,10 @@ cc_library(
         "//talOS/introspection:lock_file",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
+        "//talOS/memory:shared_memory",
         "//talOS/process",
         "//talOS/rtms",
+        "//talOS/rtms:process_liveness",
         "@tomlplusplus//:toml++",
     ],
 )
@@ -235,7 +238,7 @@ cc_binary(
 )
 
 # The hardware packet topics decoded with their wire codecs, for log_dump
-# and tlog_to_wpilog.
+# and Studio's review.
 cc_library(
     name = "hardware_record",
     srcs = ["hardware_record.cc"],
@@ -247,6 +250,7 @@ cc_library(
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:session_manifest",
         "//talOS/hardware",
         "//talOS/hardware:config",
         "//talOS/protocol",
@@ -337,8 +341,18 @@ py_test(
     data = [
         ":session_report",
         ":session_report_fixture",
+        ":target_lane_probe",
     ],
     deps = ["@rules_python//python/runfiles"],
+)
+
+# naming::IsTargetLane over stdin, for session_report_test's comparison of
+# session_report.py's lane grammar with the authority.
+cc_binary(
+    name = "target_lane_probe",
+    testonly = True,
+    srcs = ["testdata/target_lane_probe.cc"],
+    deps = ["//talOS/introspection:names"],
 )
 
 cc_binary(
@@ -356,6 +370,47 @@ cc_binary(
     ],
 )
 
+# stop_paths <session> [--config robot.toml]: the lines docs/BENCH.md
+# "Reading a trial" times each stop path between.
+py_binary(
+    name = "stop_paths",
+    srcs = [
+        "session_report.py",
+        "stop_paths.py",
+    ],
+    data = [":log_dump"],
+    visibility = ["//visibility:public"],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_test(
+    name = "stop_paths_test",
+    size = "small",
+    srcs = ["stop_paths_test.py"],
+    data = [
+        ":stop_paths",
+        ":stop_paths_fixture",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+cc_binary(
+    name = "stop_paths_fixture",
+    testonly = True,
+    srcs = ["testdata/stop_paths_fixture.cc"],
+    deps = [
+        ":continuity_message",
+        ":session",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/events:events_log",
+        "//talOS/events:gap_testing",
+        "//talOS/hardware",
+        "//talOS/hardware:config",
+        "//talOS/schema:identity",
+    ],
+)
+
 # bazel run //talOS/launcher:restart_latency -- --config <robot.toml> [...]
 # Per-stage SIGKILL-to-first-request restart latency; see README "Restart
 # latency". The config's nodes come from the workspace's bazel-bin.
@@ -364,7 +419,10 @@ py_binary(
     srcs = ["restart_latency.py"],
     data = [":launcher"],
     visibility = ["//visibility:public"],
-    deps = ["@rules_python//python/runfiles"],
+    deps = [
+        "//talOS/memory:shm_name",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 py_test(
@@ -375,7 +433,10 @@ py_test(
         "restart_latency_test.py",
     ],
     data = [":restart_latency_fixture"],
-    deps = ["@rules_python//python/runfiles"],
+    deps = [
+        "//talOS/memory:shm_name",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 cc_binary(
@@ -388,93 +449,16 @@ cc_binary(
     ],
 )
 
-# A self-contained WPILib DataLog (.wpilog) writer: no WPILib dependency.
-cc_library(
-    name = "wpilog",
-    srcs = ["wpilog.cc"],
-    hdrs = ["wpilog.h"],
-)
-
-cc_test(
-    name = "wpilog_test",
-    size = "small",
-    srcs = ["wpilog_test.cc"],
-    deps = [
-        ":wpilog",
-        "@googletest//:gtest_main",
-    ],
-)
-
-# .tlog dispatch logs (or a session directory) as one .wpilog for
-# AdvantageScope; README.md, "Converting a session to WPILOG".
-cc_binary(
-    name = "tlog_to_wpilog",
-    srcs = ["tlog_to_wpilog.cc"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":hardware_record",
-        ":log_inputs",
-        ":log_merge",
-        ":wpilog",
-        "//talOS/driver_station",
-        "//talOS/events:events_core",
-        "//talOS/events:events_log",
-        "//talOS/hardware",
-        "//talOS/schema:identity",
-        "//talOS/schema:unit_suffix",
-        "@flatbuffers//:runtime_cc",
-    ],
-)
-
-# Peak resident memory of log_dump and tlog_to_wpilog on a generated 200 MB
+# Peak resident memory of log_dump on a generated 200 MB
 # session; run by hand (README.md, "Filtering and exporting logs").
 cc_binary(
     name = "log_memory_bench",
     srcs = ["log_memory_bench.cc"],
-    args = [
-        "$(rlocationpath :log_dump)",
-        "$(rlocationpath :tlog_to_wpilog)",
-    ],
-    data = [
-        ":log_dump",
-        ":tlog_to_wpilog",
-    ],
+    args = ["$(rlocationpath :log_dump)"],
+    data = [":log_dump"],
     deps = [
         "//talOS/events:events_core",
         "//talOS/events:events_log",
-        "@rules_cc//cc/runfiles",
-    ],
-)
-
-# Every scalar base type, fixed arrays, an enum and a nested geometry.Pose2d.
-talos_messages(
-    name = "wpilog_message",
-    srcs = ["testdata/wpilog_message.fbs"],
-    include_prefix = "wpilog_test",
-    visibility = ["//visibility:private"],
-    deps = ["//talOS/msgs:geometry"],
-)
-
-cc_test(
-    name = "tlog_to_wpilog_test",
-    size = "small",
-    srcs = ["tlog_to_wpilog_test.cc"],
-    data = [":tlog_to_wpilog"],
-    env = {"TALOS_TLOG_TO_WPILOG": "$(rlocationpath :tlog_to_wpilog)"},
-    deps = [
-        ":wpilog_message",
-        "//talOS/configuration",
-        "//talOS/driver_station",
-        "//talOS/events:events_core",
-        "//talOS/events:events_log",
-        "//talOS/events:gap_testing",
-        "//talOS/hardware",
-        "//talOS/hardware:config",
-        "//talOS/msgs:geometry",
-        "//talOS/protocol",
-        "//talOS/schema:identity",
-        "@flatbuffers//:runtime_cc",
-        "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
 )
@@ -747,6 +731,7 @@ cc_test(
         ":stop_signal_guard",
         ":supervision_events",
         "//talOS/introspection:registry",
+        "//talOS/rtms:process_liveness",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
@@ -983,5 +968,21 @@ cc_test(
         "//talOS/protocol",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
+    ],
+)
+
+# Input replay reads the session manifest the launcher's own writer wrote.
+cc_test(
+    name = "manifest_replay_test",
+    size = "small",
+    srcs = ["manifest_replay_test.cc"],
+    deps = [
+        ":replay_message",
+        ":session",
+        "//talOS/events",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/events:input_replay",
+        "@googletest//:gtest_main",
     ],
 )

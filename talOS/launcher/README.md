@@ -111,6 +111,20 @@ three days never deletes it under a long session, and reports it if the path
 stops naming the locked file; acquiring it checks that it locked the file the
 path still names.
 
+In a namespace (`TALOS_SHM_NAMESPACE`, or Bazel's `TEST_TMPDIR`) a launch
+that started the roster removes, once every member is reaped, what it leaves
+besides its topic segments: the session lock file, while it still names the
+locked file, and the namespace's registry segment with its writer lock file,
+unless the registry's writer lock is held at that instant or a row is held
+by a running process outside the session (a node or tool run without the
+launcher; a row whose process is gone, such as a SIGKILLed node's of an
+earlier session, does not count). A namespace is rarely used twice, so the
+segment would otherwise stay in shared memory (`/dev/shm` on Linux) until
+reboot, and so would the lock files in the lock directory, except under
+Bazel, whose `TEST_TMPDIR` holds them and is removed with the test.
+Outside a namespace the ordinary names, one set per host that tools and
+hand-run nodes share, are left in place.
+
 Locking an existing lock file allocates nothing on disk; creating an absent
 one does. macOS empties `/tmp` at boot and keeps it on the same container as
 a log root on the internal disk, so on a full disk the first launch after a
@@ -421,18 +435,16 @@ session panel; how it ended (a kill, a crash, its exit code) is never in
 the launcher's exit status: an operator's stop of a session whose bridge
 died still exits 0.
 
-A restart binds the same `[studio] http_port`. The bridge's listener sets
-`SO_REUSEADDR` (and `SO_REUSEPORT` where the OS has it), and the launcher
-kills a dead run's process group before it schedules the restart, so the
-port is free again for the restart. A program that holds the port without
-`SO_REUSEPORT` makes every run fail its listen and exit, which the bound
-above ends, with the reason in `studio_bridge.log`. One of the same user
-that also sets `SO_REUSEPORT`, such as another launcher's bridge on the
-same port (a developer's `./sim.sh` on the robot computer), does not: both
-listen, and new connections go to either, so a dashboard may show the
-other session. The launcher sees the bridge only through its
-exits: it takes no registry row, so a bridge that hangs without exiting is
-not detected or restarted.
+A restart binds the same `[studio] http_port`. The bridge holds its port
+exclusively (`SO_REUSEADDR`, never `SO_REUSEPORT`;
+[studio/bridge](../../studio/bridge/README.md)), and the launcher kills a dead
+run's process group before it schedules the restart, so the port is free again
+for the restart. A port another listener holds, such as another launcher's
+bridge on the same port (a developer's `./sim.sh` on the robot computer), is
+refused: every run prints `cannot listen on port <port>` and exits, which the
+bound above ends, with the reason in `studio_bridge.log`. The launcher sees
+the bridge only through its exits: it takes no registry row, so a bridge that
+hangs without exiting is not detected or restarted.
 
 ## Node output
 
@@ -566,9 +578,11 @@ decision reads the stop flag again, so a node killed by the same `systemctl
 stop` that is stopping the launcher is not restarted. The backoff is
 scheduled inside the supervision loop, so a restarting node never delays
 another node or the deadline. Each restart prints
-one line:
+one line when it is scheduled and one, with the new run's pid, when it
+starts (a first run prints `Started` in the same form):
 
     [launcher] alpha exited (signal 11 SIGSEGV); restart 1 in 0 ms
+    [launcher] Restarted alpha (pid 4243, target //example/alpha:node, restart 1)
 
 When a non-critical node's rolling budget is exhausted, it is **quarantined**, not
 permanently abandoned. Exactly one retry is scheduled for the oldest restart
@@ -603,7 +617,11 @@ When the session ends, the launcher exits with 0, or with the last nonzero
 `exit_code` among the members (-1, so 255, for one a signal ended), or 1 for
 refused [live endpoints](#live-endpoints). The [Studio bridge](#studio-bridge)
 never counts, however it ended, nor does a member a stop left unstarted
-([two phases](#two-phases)). A member whose last run ended by
+([two phases](#two-phases)). Only a member's last run counts: a critical
+member that crashed, was restarted, and whose last run then ended at the
+session's stop (exiting 0, or by the stop's own signal) leaves the status
+0, although the session lost it mid-run; the crash is in its `runs`
+(reason `crash`). A member whose last run ended by
 the stop's own signal does not count: one that was not yet handling a stop
 (between its exec and its stop handlers, which a member started with the stop
 held never is: [node output](#node-output)) when the stop's SIGINT
@@ -721,7 +739,14 @@ With `NOTIFY_SOCKET` set, the launcher sends `READY=1` on entry to supervision
 and `WATCHDOG=1` on every loop iteration, using nonblocking Unix datagrams
 (including Linux `@` abstract names), and, when systemd sets `WATCHDOG_USEC`,
 runs an iteration at least every half of it ([supervision passes](#supervision-passes)).
-A hung loop therefore stops feeding the service watchdog. The loop waits on no
+A hung loop therefore stops feeding the service watchdog. That watchdog is
+the only bound on a deployed session whose launcher hangs: nothing but the
+launcher's stop ends a member that runs well, and a member's guardian acts
+only when the launcher's process ends, so systemd's `WatchdogSec=` (set by
+the unit `deploy.sh` writes) kills the hung launcher and with it, through
+the guardians, every member. A session run by hand, or under launchd, which
+has no watchdog, has no such bound: its members run until the launcher is
+killed. The loop waits on no
 lock a node can hold: its registry attach is read-only, which
 [takes no lock](../introspection/README.md#the-segment).
 See [deployment](../../docs/DEPLOYMENT.md) for the generated systemd watchdog
@@ -842,10 +867,17 @@ timers fire at the deadlines they fired at live, and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and
 ages measured from it). The node is never fed across a log gap: the run ends
-just before the earliest gap (GAP record) in a log it is fed a watched topic
-from (its own logs for a topic it watched live, otherwise every log that
-recorded the topic), the node prints the log, the topic and the time, and
-the launcher exits 1 with it. See
+just before the earliest gap (GAP record) or damaged stretch in a log it is
+fed a watched topic from (its own logs for a topic it watched live, otherwise
+every log that recorded the topic), the node prints the log, the topic and
+the time, and the launcher exits 1 with it. A log it would be fed from that
+may have lost records no GAP record marks is refused before the node runs,
+naming the log and the sign, and the launcher exits 1: one with a
+`<log>.capped` marker or of a member the session manifest marks
+`log_capped`, a run's log without its EXIT record of a member it marks
+`log_gap` or `recorder_failed` ([session manifest](#session-manifest)), and
+one whose damaged
+records nothing bounds the time of. See
 [input replay](../events/README.md#replaying-another-sessions-inputs) for
 timing and schema checks.
 
@@ -999,9 +1031,9 @@ header:
 | `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output), and `LauncherOutput`, the launcher's own stdout, stderr and `talos.log` |
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
 | `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
-| `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and `tlog_to_wpilog`'s inputs name, each once |
-| `:hardware_record` | `hardware_record.h` | the hardware packets decoded with the wire codecs (`DecodeHardwareRecord`, `HardwareRecordJson`) and the run config's device names (`SessionConfigPath`, `LoadDeviceNames`), for `log_dump` and `tlog_to_wpilog` |
-| `:log_merge` | `log_merge.h` | `MergeLogs`, a session's records streamed to a visitor in time order; `log_dump` and `tlog_to_wpilog` link it, not the supervisor |
+| `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and Studio's review's inputs name, each once |
+| `:hardware_record` | `hardware_record.h` | the hardware packets decoded with the wire codecs (`HardwareRecordOf`, `HardwareRecordJson`), the check that a session's packets are of this build's protocol (`RecordedProtocolVersion`, `HardwareProtocolCheck`) and the run config's device names (`SessionConfigPath`, `LoadDeviceNames`), for `log_dump` and Studio's review |
+| `:log_merge` | `log_merge.h` | `MergeLogs`, a session's records streamed to a visitor in time order; `log_dump` and Studio's review link it, not the supervisor |
 | `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read, and when to look at the row next ([supervision passes](#supervision-passes)) |
 | `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
 
@@ -1345,8 +1377,9 @@ logs, 1.72 million 128-byte records; `bazel run -c opt
 //talOS/launcher:log_memory_bench`, Linux x86-64) `log_dump`'s peak resident
 memory is 5.6 MiB, text or JSONL, where reading every log whole and holding
 each record took 632 MiB. Each open log costs about 128 KiB (its window and
-header buffer) plus its manifest and schemas, and keeps a file descriptor
-open for the whole read.
+header buffer) plus its manifest and schemas. A session may hold more logs
+than `RLIMIT_NOFILE` allows open files: readers keep at most 64 descriptors
+open between them ([windowed reader](../events/README.md)).
 
 ```sh
 bazel run //talOS/launcher:log_dump -- /tmp/logs/session \
@@ -1534,7 +1567,7 @@ bridge's:
 log_dump: warning: the session's bridge recorded hardware protocol <B> (/hw/status protocol_version_id), its launcher <L> (manifest.json hardware_protocol_version): read under the bridge's
 ```
 
-`log_dump`, `tlog_to_wpilog` and
+`log_dump` and
 `session_report` (through `log_dump`) decide once per session, before
 decoding any hardware packet (`HardwareProtocolCheck`,
 `hardware_record.h`), and when they refuse, print one line on stderr and
@@ -1585,7 +1618,6 @@ included:
   log_dump: warning: hardware packets not decoded: recorded under this build's hardware protocol <N> (<whose>), yet this build's codecs reject <k> of the <n> tried, the first on <topic>: <reason>; the session's <what> may be of another build
   ```
 
-`tlog_to_wpilog` prints the same lines prefixed `tlog_to_wpilog:`, and
 `session_report` prints `log_dump`'s disagreement line prefixed
 `session_report:`. A record
 damaged on disk is not among them: the log reader skips it by its checksum
@@ -1598,9 +1630,7 @@ bundle's session also names its source revision (`git_revision`).
 
 Each publication's bytes are the same in every log that recorded it, so the
 check tries one copy: the writer's SEND records, and readers' copies only of
-a topic whose SEND it has not seen. `tlog_to_wpilog` decodes each packet
-once, as it writes it, and writes the file again without hardware entries
-when a rejected one turns up part way; `log_dump`, which streams the session
+a topic whose SEND it has not seen. `log_dump`, which streams the session
 in bounded memory, decodes a printed packet a second time.
 
 `--replay-inputs` refuses a session recorded under another hardware
@@ -1633,6 +1663,10 @@ bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
 
 A repository that depends on talOS runs `@talos//talOS/launcher:session_report`.
 
+`bazel run //talOS/launcher:stop_paths -- <session> [--config robot.toml]`
+reads the bench's stop-path trials from a session's logs (`stop_paths.py`; see
+[BENCH.md "Reading a trial"](../../docs/BENCH.md)).
+
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config
 identity and source revision, node exits/restarts/quarantine/recorder
@@ -1650,8 +1684,9 @@ RECORDED for a manifest without `launcher_log`; informational, since the
 output logs are not the measured record), an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
-lateness, the bridge's request-to-command delay, every scalar
-`/hw/status` field, and the alerts.
+lateness, the bridge's request-to-command delay in enabled and disabled
+time, the [latency rows](#latency-rows), every scalar `/hw/status` field,
+and the alerts.
 The required "controller link" verdict is whether the bridge ever accepted
 a State from the controller, which a launched session's exit status cannot
 say (the launcher ends a bounded session by stopping every member, and a
@@ -1689,11 +1724,24 @@ succeeded (its record's status is the shared-memory write's), so after a
 failed send, and while a socket is being replaced, the row still counts a
 command the RoboRIO received later or never; the bridge's `send_failures`
 (exit line, below) says whether that happened. With several owners the
-merged observation can be an older request's, overstating it. The row is
-informational: REQ-RT-20's 1 ms bound is verified by the bridge's component
-test. The bridge's wake counters (`passes`, `throttled`, `wait_fallbacks`)
-and socket counters (`send_failures`, `socket_reopens`) are only in its exit
-lines on stdout, in its [node output](#node-output) log, not in the report.
+merged observation can be an older request's, overstating it. Each sample
+is counted in enabled or disabled time (`bridge_request_to_command`
+`enabled` and `disabled` in `--json`, each with the bridge's `process`) as
+the bridge decides its send: "enabled" means the State the bridge held, the
+last of the selected `/hw/state` stream, was configured, enabled and not
+faulted (`hardware::GatewayReady`) from the request to the command, and
+"disabled" that it was not ready throughout; a sample across a change, or
+that starts before the first State, meets that stream's log gap or holds a
+State that did not decode, is in neither. Not ready, the gateway cannot
+take a command, and a merge whose only change is its observation (a
+disabled node's requests are neutral) waits for the bridge's heartbeat
+(`command_timeout_us` / 5, clamped to 5 to 20 ms), so only the enabled row
+measures its reaction. The rows are informational: REQ-RT-20's 1 ms bound is verified by
+the bridge's component test. The bridge's `wait_fallbacks` and stalled request topics reach the
+report as its row's `wake_fallbacks` and `stalled_arms` (delivery loss,
+above); its other wake counters (`passes`, `throttled`) and its socket
+counters (`send_failures`, `socket_reopens`) are only in its exit lines on
+stdout, in its [node output](#node-output) log, not in the report.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
 exports also carry `ds_enabled`, the Driver Station `hardware.enabled` bit,
@@ -1724,6 +1772,9 @@ measured when it meets (closed at both ends) a lost span of a log it reads:
 | `/hw/state` overall and enabled | two consecutive records of the selected stream | that stream's process |
 | enabled or not (enabled rows, and an active lane "while enabled" for target age at tick) | from the Driver Station record whose bit is held (from the log's start before the first) to the interval's end or the lane's time | the Driver Station stream's process: such an interval is neither enabled nor disabled |
 | bridge request to command | from the request before the first one carrying the observation in that node's `/hw/request/<node>` stream, or from the log's start before that stream's first request (where an earlier request carrying it could be missing), to the command | the bridge's, and that of every node that sent a request |
+| state to request | from the State's publication to the owner's first request carrying it | the owner's |
+| Driver Station to lane | from the packet's publication to the producer's next lane publication | the producer's |
+| Driver Station to command | from the packet's publication to the command | the bridge's, and that of every node that selected a lane or sent a request |
 | alert active time | an alert's active span (publication times) | its status stream's process; the span still counts as an activation, but is not timed (`spans_across_gap` in `--json`, NOT MEASURED when no span is left) |
 
 Target receipt age, target age at the tick and timer lateness each read one
@@ -1736,9 +1787,11 @@ rows lack those samples (`records_lost` in `--json`). The `/hw/status`
 counter deltas difference cumulative counts, so a gap leaves them whole but
 for a counter reset inside one, which goes uncounted; the report counts no
 missed ticks or overruns. A row whose intervals all meet a gap is NOT
-MEASURED, never a pass, and its detail (or, for request to command, a line
-under the timing table) names how many intervals were left out; `--json`
-gives the counts in `intervals_across_gaps`. A session without a gap reports
+MEASURED, never a pass, and its detail (or, for request to command and the
+latency rows, a line under their table) names how many intervals were left
+out; `--json` gives the counts in `intervals_across_gaps`
+(`bridge_request_to_command`, `state_to_request`, `driver_station_to_lane`,
+`driver_station_to_command`). A session without a gap reports
 exactly as before, with none of these keys.
 
 Median “about 5 ms” uses an explicitly labeled 4–6 ms analysis tolerance; p99
@@ -1754,16 +1807,16 @@ only a loop that asked (`TALOS_REALTIME=1`) and was refused a step does.
 Observers, nodes that never reported, and manifests that predate the fields
 (*NOT RECORDED*) are listed but not judged. It also fails on any node's
 nonzero `wake_failures` (a reader left asleep until its backstop),
-`requests_skipped` (a request its subsystem never merged) or
-`wake_fallbacks` (a run that drained on a poll tick instead of on
-publication, so its prompt handlers' latency and the no-polling guarantee
-did not hold); `stalled_arms` (the guard against a transport misreporting
-unread data, which still drains that watcher on timers and the backstop)
-is shown but not judged, and neither is a manifest without the fields.
-It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
+`requests_skipped` (a request its subsystem never merged), `stalled_arms`
+(a watcher whose failed arms stopped holding its loop awake, so its
+publications waited for the loop's timers or backstop) or `wake_fallbacks`
+(a run that drained on a poll tick instead of on publication, so its
+prompt handlers' latency and the no-polling guarantee did not hold),
+naming the node and the count (`<node>: stalled_arms=1`); a manifest
+without the fields is not judged. It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
 runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
-lateness and bridge request-to-command rows are informational and not
-required. The enabled-only verdicts (enabled state median, p99 and gaps,
+lateness, bridge request-to-command and latency rows are informational and
+not required. The enabled-only verdicts (enabled state median, p99 and gaps,
 target age at tick) cannot be measured in a session that never enabled, and
 the report says so in one line; `--strict` still fails them, so acceptance
 needs an enabled session. In a session whose hardware packets `log_dump`
@@ -1796,182 +1849,63 @@ DS silence, missing topics and unknown intervals limit acceptance; retain the
 raw session. Clock offset ranges measure the estimator, not absolute clock
 synchronization accuracy. See `docs/BRINGUP.md` for the bench checks.
 
-### Converting a session to WPILOG
+#### Latency rows
 
-`tlog_to_wpilog` (`//talOS/launcher:tlog_to_wpilog`) writes a session's
-`.tlog`s as one WPILib DataLog (`.wpilog`, format 1.0), the file
-AdvantageScope and WPILib's DataLogTool open. It streams the logs through
-the same `MergeLogs` as `log_dump`, decodes payloads from the
-schemas the logs carry (no recording build needed) and the hardware packets
-with `log_dump`'s wire decoder (`hardware_record.h`), and writes the file
-with its own small writer (`wpilog.h`; no WPILib dependency). Offline only.
-REQ-OPS-26 states what it guarantees.
+The Latency section (REQ-RT-25) measures the path from a sample or a Driver
+Station packet to a command, from records a session already logs. Each
+value is the difference of two readings of one clock: the report subtracts
+only main-processor times (a record's `now_ms` or `publish_ms`) from each
+other. A RoboRIO time (`sample_time_us`, `observed_time_us`) is only matched
+or ordered against another of the same `boot_id`, never subtracted from a
+main-processor one, whose mapping to it is uncertain by milliseconds
+([gateway clock accuracy](../../docs/DATA_FLOW.md#gateway-clock-accuracy)).
+Each row is p50 (median), nearest-rank p99
+and max with its count, as the timing rows are, and NOT MEASURED when it has
+no sample (never 0). The rows are informational: `--strict` judges none of
+them, since REQ-RT-26's bound is judged at the bench.
 
-```sh
-bazel run //talOS/launcher:tlog_to_wpilog -- /tmp/talos_logs/<session> \
-  -o /tmp/match.wpilog
-bazel run //talOS/launcher:tlog_to_wpilog -- a.tlog b.tlog -o /tmp/ab.wpilog
-bazel run //talOS/launcher:tlog_to_wpilog -- --config $PWD/robot.toml \
-  a.tlog -o /tmp/a.wpilog
-```
+| Row (`--json` key) | What it measures | Records | Clock |
+|---|---|---|---|
+| feedback age (`feedback_age_us`, per `"motor <id>"` and `"sensor <id>"`, µs) | the older of a motor's or CAN sensor's `position_age_us` and `velocity_age_us` in each State (a sample marked invalid is skipped). A sample with an age of 4294967295 (UINT32_MAX, the RoboRIO's value when Phoenix gave no timestamp) is left out of the figures and counted in `sentinel` (and named in the text row). A simulation session's row reads 0 by construction: the simulated backends report age 0, except for a device a fault injection froze | the selected `/hw/state` stream's decoded `hardware` | the RoboRIO's: each age is its own reading of the signal's age at the read |
+| state to request (`state_to_request_ms`, per actuator owner) | a State's publication to the tick of the owner's first request carrying it, joined (`boot_id`, `sample_time_us`) to (`boot_id`, `observed_time_us`) as request to command joins | the State stream's `publish_ms`; each `/hw/request/<node>` SEND's `now_ms` | the main processor's |
+| Driver Station to lane (`driver_station_to_lane_ms`, per producer) | a Driver Station packet's publication to the producer's next lane publication at or after it, a release included. It lists every process that publishes a target lane, whatever its source (`teleop`, `auto`, `align`, ...), so a producer whose lanes do not derive from the packet is listed too | `/hw/state/driver_station`'s `publish_ms` (a reader's copy carries the bridge's); each target-lane SEND's `publish_ms` | the main processor's |
+| bridge request to command (`bridge_request_to_command` `enabled`, `disabled`) | above | above | the main processor's |
+| Driver Station to command (`driver_station_to_command_ms`) | for each packet showing the robot enabled in teleop (the packet's `mode`; autonomous and test give no sample), its publication to the first command built from it: the earliest tick in which a `Target` selected a lane published at or after this packet and before the next one (its READ) and its node sent a request (the same dispatch of the same run: a restarted node counts its dispatches from 0 again, so a process's records start a new run after its EXIT or where its dispatch index falls), then the bridge's first command at or after that tick, of the same boot, whose observation is no older than the request's; the robot still enabled at the command. A merged command carries its oldest owner's observation, so with two actuator owners the row waits for the other owner's next request and overstates by up to that owner's period; a one-owner config gives an exact figure | the packet's `publish_ms`; READ and request records; `/hw/command` SENDs' `now_ms` | the main processor's |
+| clock drift (`clock_drift_ppm`) | the least-squares slope of the valid `clock_offset_us` (`clock_offset_valid` true) against `/hw/status` publication time, fitted within each estimator (one `clock_boot_id` and `clock_resets_count`, split at the status log's gaps) and pooled; null without two such samples | `/hw/status` records | both readings map the gateway's clock to the main processor's at one instant: their slope is the oscillators' relative drift |
 
-`--config robot.toml` names the config whose device names label the
-hardware packets, found as `log_dump --config` finds it
-([filtering and exporting](#filtering-and-exporting-logs)): without the
-flag, the `config_path` of a session directory's `manifest.json`.
+State to request ends at the tick's start, where request to command begins,
+and Driver Station to lane ends at the lane's publication, where target age
+at the tick begins, so the rows add up along each path. The spread of state
+to request over a session shows whether the node's timer phase against the
+RoboRIO tick swept the whole period; a session shorter than one sweep (one
+period divided by the drift) shows only its own band. Driver Station to
+lane is mostly the producer's timer phase against the RoboRIO's 20 ms
+Driver Station forward: `teleop` does not wake on a packet, it drains the
+Driver Station topic before its own timer and sends then. Driver Station to
+command follows only an operator path through a target lane into an
+actuator owner's request; while the lane is released (sticks neutral, or
+before `OperatorArming` arms after an enable) `Target` selects nothing and
+logs no READ, so those packets give no sample.
 
-Inputs are `.tlog` files or session directories, all from one session,
-read as [`log_dump`](#filtering-and-exporting-logs) reads them: kept
-segments and restarts included, and a log named twice read once. Then open the file in AdvantageScope
-(File > Open Log(s)...): topics appear under their names, and a pose entry
-(below) can be dragged onto the 2D Field view as a robot pose.
+A disabled bench exercises part of the path: the CAN read and feedback
+ages, the RoboRIO's read and State send, the bridge's receive and publish,
+each owner's timer, `update()` and flush (its requests are neutral but carry
+the observation, so state to request is exact), the bridge's request read
+and merge, and the Driver Station chain to the producer's lane (releases,
+which `teleop` publishes on its timer as it does a target, so Driver
+Station to lane reads as it would enabled). It does not exercise the bridge's
+change-driven send (disabled, it waits for the heartbeat, so the disabled
+request-to-command row is no reaction time), the RoboRIO's acceptance and
+apply, or `Target` selection: bridge request to command enabled and Driver
+Station to command need an enabled session. With two actuator owners a
+merged command carries the older owner's observation, so a per-owner figure
+on the RoboRIO side needs a one-owner config.
 
-Mapping:
-
-| Recorded | WPILOG entry | Type |
-|---|---|---|
-| a scalar field of a struct message | `<topic>/<field>`, nested structs joined with `/` (`/drivetrain/state/module0/angle_rad`) | from the FlatBuffers base type: `double`, `float`, `boolean`; every integer and enum `int64` |
-| a fixed array of scalars | `<topic>/<field>` | `double[]`, `float[]`, `boolean[]`, `int64[]` |
-| a fixed array of structs | `<topic>/<field>/<index>/<subfield>` | per element field, as above |
-| a target lane (`TargetEnvelope<M>`) | `<topic>/mode_since_us`, `<topic>/active`, `<topic>/message/<field>` | `int64`, `boolean`, as above |
-| a `geometry.Pose2d` (talOS/msgs), as well as its three fields | `<topic>/<path to it>`, or `<topic>/pose` when the Pose2d is the whole message | `double[]` `[x_m, y_m, yaw_rad]`, AdvantageScope's legacy number-array pose |
-| a reader's dropped count (`aux` of a MESSAGE record) | `/talos_log/dropped/<node><topic>`, cumulative | `int64` |
-| a log gap (a GAP record: records the event-log writer dropped) | `/talos_log/gap/<process>`, below | `boolean` |
-| a hardware packet (`/hw/state`, `/hw/state/driver_station`, `/hw/request/<node>`, `/hw/command`) | `<topic>/<field>`, below | `boolean`, `int64`, `double`, `string`, arrays |
-
-Field names keep their unit suffix (`position_m`), and each entry's metadata
-is JSON naming the schema and, from the suffix, the unit
-(`{"source":"talos.tlog","schema":"geometry.PoseEstimate","unit":"m"}`).
-Pose2d is the only extra mapping; other messages (a swerve module position,
-an odometry sample) appear only as their fields.
-
-The hardware packets carry no FlatBuffers schema; each is decoded with the
-wire codecs (`DecodeHardwareRecord`, the decoder behind `log_dump`'s
-`hardware` field) and written under its topic with the field names
-`log_dump` gives (schema `talos.hardware.Packet` in the metadata, units
-from the suffix, and `V` for `voltage`, `°C` for `temperature_c`, `s` for
-`match_time_s`). A device is named `<group>/<name>` by its config name when
-the packet's `config_id` is that config's (as `log_dump` names it), else
-`<group>/<logical id>`; the converter then says on stderr why ("hardware
-devices named by logical id: ..."). Integers and 64-bit ids are `int64`
-(an id keeps its bits), measurements `double`, flags `boolean`, names of
-modes and states `string`.
-
-- `/hw/state`: `config_id`, `boot_id`, `epoch`, `sample_time_us`,
-  `sequence`, `last_command_sequence`; `configured`, `enabled`,
-  `command_active`, `hardware_fault`;
-  `motors/<motor>/` `valid`, `position_rot`, `velocity_rps`, `voltage`,
-  `stator_current_a`, `supply_current_a`, `temperature_c`,
-  `position_age_us`, `velocity_age_us`, `fault_flags`, `faulted`,
-  `forward_limit`, `reverse_limit` (`/hw/state/motors/flywheel/velocity_rps`);
-  `sensors/<sensor>/` `valid`, `position_rot`, `velocity_rps` and their ages;
-  `digital_inputs/` and `digital_outputs/<device>/` `valid`, `value`;
-  `analog_inputs/<device>/` `valid`, `voltage`, `age_us`;
-  `encoders/<device>/` `valid`, `position_rot`, `velocity_rps`, `age_us`;
-  `pwm_outputs/<device>/` `valid`, `output`; `health/` `valid`, `battery_v`,
-  `brownout`, `can_bus_count`, and per CAN bus (a State reports one bus,
-  the next each time) `health/can_bus/<bus name or slot>/` `read_state`,
-  `utilization_frac` and its error counts; `counters/` the gateway's four
-  counts.
-- `/hw/request/<node>` and `/hw/command`: `config_id`, `boot_id`, `epoch`,
-  `observed_time_us`; `motors/<motor>/` `mode` (`string`: `neutral`,
-  `duty_cycle`, `voltage`, `velocity`, `position`, `motion_magic`,
-  `torque_current`), `slot`, `demand` (in the mode's unit: amperes for
-  `torque_current`), `feedforward_v`;
-  `digital_outputs/<device>/value`, `pwm_outputs/<device>/` `mode`
-  (`string`: `off`, no pulse, or `pulse`) and `output`
-  (`/hw/request/shooter/motors/flywheel/demand`).
-- `/hw/state/driver_station`: `sample_time_us`, `mode_since_us` (the mode
-  generation), `boot_id`; the flags `ds_attached`, `fms_attached`,
-  `enabled`, `autonomous`, `teleop`, `test`, `estop` as booleans, `mode`
-  (`string`, as `log_dump` names it); `alliance`, `station`, `match_type`,
-  `match_number`, `replay_number`, `match_time_s`; per joystick port
-  `joysticks/<port>/` `connected` (from the first packet the port is
-  connected in, so a disconnect shows), `axes` (`double[]`), `buttons`
-  (`boolean[]`, element i is button i + 1, `button_count` long: AdvantageScope
-  shows each element as its own on/off line, where a bit mask would read as
-  one number) and `povs` (`int64[]`, as the Driver Station reports them).
-
-Not exported, though `log_dump` prints them: the gateway build
-(`gateway_program`, `gateway_build_id`, `gateway_build_dirty`), the raw
-Driver Station `flags` word, the game-specific message, the event name and
-joystick names. A session recorded under another hardware protocol
-converts none of its hardware packets, the rest of it converts, the
-converter prints the one line `log_dump` does (prefixed `tlog_to_wpilog:`),
-and the exit status is 0; see
-[which logs a build can read](#which-logs-a-build-can-read).
-
-An entry name belongs to the first topic to publish a value under it. A
-topic whose field path lands on a name another topic owns (`/arm/state`
-field `left.angle_rad` and topic `/arm/state/left` field `angle_rad` are
-both `/arm/state/left/angle_rad`) gets `<topic>:<field path>` instead
-(`/arm/state/left:angle_rad`), which no topic or field name can spell, and
-the converter prints one warning naming both.
-
-Which records, and when:
-
-- Each publication is written once. A publication is its topic, RTMS
-  sequence and publish time, which its writer's `SEND` record and every
-  reader's `MESSAGE` record of it share. Its values come from the `SEND`
-  when the writer's log holds it, otherwise from the first `MESSAGE` of it
-  in merge order, from any reader. So a reader's copy fills what the
-  writer's log lacks (the oldest segments a byte cap deleted, a tail cut by
-  a crash or a stopped capture), and a writer that was not logged at all is
-  rebuilt from everything its readers received. A send the transport
-  refused (`aux` not OK) was never published and is skipped.
-- Each value is stamped with the message's publish time, the record's
-  `publish_time_ns` (a SEND's is the publishing dispatch's `now`; a
-  MESSAGE's is the writer's, carried with the payload), so a writer's copy
-  and a reader's copy carry the same time. That is the recording machine's
-  monotonic clock (`CLOCK_MONOTONIC` in a live session, the simulated clock
-  under `--sim` or replay), in microseconds after the earliest log start
-  (`FileHeader::start_monotonic_ns`) of the input. A dropped count is
-  stamped with the publish time of the message after the gap. Wall-clock
-  time is not used.
-- Each GAP record ([log format](../events/README.md#log-format)) sets its
-  process's `/talos_log/gap/<process>` true at the gap's start (the
-  earliest time a dropped record names) and false when capture resumed (the
-  GAP record's `now`). A gap still open when its writer stopped is closed by
-  the stop, and its GAP record's `now` is the stop's (the run's EXIT
-  record's, else the last dropped record's), so the entry goes false there.
-  The entry stays true while any gap of its process is open, since a gap can
-  start before the previous one resumed (a late dispatch resumed capture),
-  and a process with no gap has no entry. A publication the gap lost is
-  written only when another log holds it (a reader's copy, above, or its
-  writer's `SEND`); each log with gaps is named once on stderr
-  (`warning: log gap in <path>: ...`, as `log_dump` prints it).
-- Timer, exit, scheduling and READ records carry no message and are skipped. Byte
-  topics (`talos.Bytes`, such as `/talos/telemetry`) and any topic whose
-  schema cannot be read are skipped, each named once on stderr.
-
-Caveats: a `ulong` field becomes `int64` with its bits kept, so a value above
-2^63 - 1 reads negative (a `sample_time_ns` never gets there); enums are their
-numeric value, not their name. Damage is read as `log_dump` reads it: a damaged record or a cut
-tail is skipped with a warning naming the log, and a log cut inside its
-header is skipped. A file that is not a `.tlog`, a manifest that fails its
-checksum, an unsupported format version, a mismatched session id, or no
-readable log is an error: the converter prints `tlog_to_wpilog: error: ...`
-naming the file and exits 1 without writing the output. Usage errors also
-exit 1.
-
-The output is written to a temporary file in its directory
-(`.<name>.tmp.XXXXXX`) and renamed over the output only once it is complete,
-so a write that fails (a full disk) exits 1, removes the temporary file and
-leaves no partial output and any previous output unchanged. The output path
-is checked before any input is read: one that names something other than a
-regular file (a device, a directory), or a directory that cannot take a new
-file, fails with `cannot write <output>`. A symlink at the output path is
-replaced by the new file, not written through.
-
-Memory: the merge itself holds a window per log, as `log_dump`'s does
-([filtering and exporting](#filtering-and-exporting-logs)), and reads the
-session twice: once for the publications a writer logged, once to select.
-The converter keeps, per publication, its key in the dedup sets and, until
-it has sorted them by publish time, each selected value's payload and
-source. On the same generated 210 MiB session (1.72 million publications of
-64 bytes, each a value; `log_memory_bench`) its peak resident memory is
-525 MiB, where holding the whole merged session took 681 MiB. Convert on a
-development machine, not the robot.
+The RoboRIO's half of the path is in no session record: the age of a
+command's observation when the RoboRIO takes it, and a Driver Station
+refresh to its send, are printed on the RoboRIO's console as its
+`[rio] latency` line, on the RoboRIO's clock
+([RoboRIO](../hardware/README.md#roborio)).
 
 ## If you change the shape of `graph.json`
 

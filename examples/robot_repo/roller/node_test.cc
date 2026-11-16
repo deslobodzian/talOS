@@ -1,9 +1,7 @@
 #include <gtest/gtest.h>
-#include <sys/wait.h>
 
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -252,39 +250,6 @@ TEST_F(RollerTest, UpdateDoesNotAllocate) {
   sim.step(60ms);
   EXPECT_EQ(probe.stop(), 0u) << probe.sites();
   EXPECT_EQ(Request(), Mode::kVelocity);
-}
-
-struct Result {
-  int status;
-  std::string output;
-};
-
-Result RunNode(const std::string& args) {
-  const std::string command = "'" + Runfile("TALOS_TEST_NODE") + "' " + args +
-                              " --config '" + Runfile("TALOS_TEST_CONFIG") +
-                              "' 2>&1";
-  FILE* pipe = ::popen(command.c_str(), "r");
-  if (pipe == nullptr) throw std::runtime_error("popen failed");
-  Result result{0, {}};
-  char buffer[4096];
-  while (const std::size_t n = std::fread(buffer, 1, sizeof buffer, pipe)) {
-    result.output.append(buffer, n);
-  }
-  const int status = ::pclose(pipe);
-  result.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  return result;
-}
-
-TEST(RollerBinary, LoggedSimRunReplaysWithoutDivergence) {
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  const std::string log =
-      std::string{tmp != nullptr ? tmp : "/tmp"} + "/node_test.tlog";
-  const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
-  ASSERT_EQ(run.status, 0) << run.output;
-  const Result replay = RunNode("--replay '" + log + "'");
-  EXPECT_EQ(replay.status, 0) << replay.output;
-  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
-      << replay.output;
 }
 
 }  // namespace

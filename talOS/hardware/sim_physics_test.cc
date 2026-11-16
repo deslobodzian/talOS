@@ -103,6 +103,22 @@ TEST(SimGravity, ClosedLoopUsesSelectedSlotAndMechanismAngle) {
   }
 }
 
+// A velocity request whose feedforward alone (slot v times demand) exceeds
+// max_voltage applies max_voltage, as the Talon's peak voltage holds
+// VelocityVoltage: 0.1 V/rps at ±30 rps asks ±3 V of a 2 V motor.
+// REQ-DEV-10
+TEST(SimVoltageCeiling, VelocityIsClampedToMaxVoltage) {
+  MotorConfig cfg = TestMotor(1, "roller", 1);
+  cfg.max_voltage = 2.0;
+  cfg.slots[0].v = 0.1;
+  for (const double sign : {1.0, -1.0}) {
+    const MotorRequest req{1, Mode::kVelocity, 0, sign * 30.0, 0.0};
+    double volts = 0.0;
+    ASSERT_TRUE(sim::DriveVoltage(req, cfg, 0.0, 0.0, 12.0, volts));
+    EXPECT_DOUBLE_EQ(volts, sign * 2.0);
+  }
+}
+
 TEST(SimGravity, ProfiledMotionMagicIncludesGravityAndClampsVoltage) {
   for (const auto type :
        {GravityType::kElevatorStatic, GravityType::kArmCosine}) {
@@ -245,6 +261,70 @@ TEST(SimBackend, CancoderReadsItsAbsolutePositionWrapped) {
     EXPECT_DOUBLE_EQ(s.motors[0].position_rot, demand);  // continuous
     EXPECT_DOUBLE_EQ(s.sensors[0].position_rot, reported);
   }
+}
+
+// What each simulated backend's own Read reports for the chain a restore
+// reapplies, before the gateway's mask: a motor fed by the reset CANcoder and
+// its follower read invalid, zero in every measured field, from
+// BeginRestoreAfterReset until a PollRestore that succeeds (through failed
+// ones), while an unrelated motor and the CANcoder itself stay valid. The
+// gateway tests cannot see this, since the gateway masks the chain anyway.
+template <typename Sim>
+void CheckRestoringChainReadsInvalid() {
+  auto cfg = SingleMotorConfig();
+  cfg.sensors.push_back({10, "angle", SensorKind::kCANcoder, 10, "rio"});
+  cfg.motors[0].feedback = Feedback::kRemoteCANcoder;
+  cfg.motors[0].feedback_sensor_id = 10;
+  cfg.motors.push_back(TestMotor(2, "follower", 2));
+  cfg.motors[1].master_id = 1;
+  cfg.motors.push_back(TestMotor(3, "unrelated", 3));
+  Sim backend;
+  ASSERT_TRUE(backend.Configure(cfg));
+  std::array<MotorRequest, 3> command{{{1, Mode::kVoltage, 0, 6.0, 0.0},
+                                       {2, Mode::kVoltage, 0, 6.0, 0.0},
+                                       {3, Mode::kVoltage, 0, 6.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(command));
+  State s;
+  s.motor_count = 3;
+  s.sensor_count = 1;
+  uint64_t now_us = 0;
+  StepBackend(backend, s, now_us, 5000, 4);
+  for (std::size_t i = 0; i < 3; ++i) ASSERT_TRUE(s.motors[i].valid) << i;
+  const auto expect_chain_invalid = [&s](const char* phase) {
+    for (std::size_t i = 0; i < 2; ++i) {
+      SCOPED_TRACE(testing::Message() << phase << ", motor " << i);
+      EXPECT_FALSE(s.motors[i].valid);
+      EXPECT_EQ(s.motors[i].position_rot, 0.0);
+      EXPECT_EQ(s.motors[i].velocity_rps, 0.0);
+      EXPECT_EQ(s.motors[i].voltage, 0.0);
+      EXPECT_EQ(s.motors[i].stator_current_a, 0.0);
+      EXPECT_EQ(s.motors[i].supply_current_a, 0.0);
+    }
+    EXPECT_TRUE(s.motors[2].valid) << phase;
+    EXPECT_TRUE(s.sensors[0].valid) << phase;
+  };
+  const std::array<uint16_t, 1> reset{10};
+  backend.BeginRestoreAfterReset(reset);
+  StepBackend(backend, s, now_us, 5000, 1);
+  expect_chain_invalid("restoring");
+  backend.SetRestoreFails(true);
+  EXPECT_EQ(backend.PollRestore(), Backend::RestoreStatus::kFailed);
+  StepBackend(backend, s, now_us, 5000, 1);
+  expect_chain_invalid("after a failed restore");
+  backend.SetRestoreFails(false);
+  EXPECT_EQ(backend.PollRestore(), Backend::RestoreStatus::kDone);
+  StepBackend(backend, s, now_us, 5000, 1);
+  for (std::size_t i = 0; i < 3; ++i) EXPECT_TRUE(s.motors[i].valid) << i;
+}
+
+// REQ-DEV-24
+TEST(SimBackend, ReadReportsTheRestoringChainInvalid) {
+  CheckRestoringChainReadsInvalid<SimBackend>();
+}
+
+// REQ-DEV-24
+TEST(PhysicsSimBackend, ReadReportsTheRestoringChainInvalid) {
+  CheckRestoringChainReadsInvalid<PhysicsSimBackend>();
 }
 
 template <typename Sim>

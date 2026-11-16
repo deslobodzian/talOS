@@ -87,6 +87,23 @@ class PrepushTest(unittest.TestCase):
         self.full_log = os.path.join(self.tmp, "full_calls")
         put(os.path.join(self.repo, "tools", "source_lints.sh"),
             "#!/bin/sh\nexit 0\n", 0o755)
+        # format.sh and tidy.sh record their working directory, whether the
+        # tracked file is writable there, and their arguments in
+        # self.clang_log; STUB_FORMAT and STUB_TIDY are their exit codes,
+        # and tidy's 3 prints tidy.sh's own reason it cannot run.
+        self.clang_log = os.path.join(self.tmp, "clang_calls")
+        for tool, var in (("format", "STUB_FORMAT"), ("tidy", "STUB_TIDY")):
+            put(os.path.join(self.repo, "tools", f"{tool}.sh"),
+                "#!/bin/sh\n"
+                'if [ -w src/a.txt ]; then mode=writable; else mode=read-only; fi\n'
+                f'echo "$PWD|$mode|{tool} $*" >> {shlex.quote(self.clang_log)}\n'
+                f'status="${{{var}:-0}}"\n'
+                '[ "$status" = 3 ] && {\n'
+                '  echo "tidy: cannot run here: clang 18 cannot parse this'
+                ' host\'s C++ standard library:" >&2\n'
+                '  echo "  bits/atomic_wait.h:1:1: error: x" >&2; }\n'
+                f'[ "$status" = 0 ] || echo "stub: {tool} exited $status"\n'
+                'exit "$status"\n', 0o755)
         put(os.path.join(self.repo, "tools", "test_rio_in_the_loop.py"),
             "import os, sys\n"
             f"with open({self.full_log!r}, 'a', encoding='utf-8') as f:\n"
@@ -197,6 +214,19 @@ class PrepushTest(unittest.TestCase):
             "prepush: robot-repository skipped (TALOS_ROBOT_REPOSITORY unset)",
             out)
 
+    # REQ-DEV-32: set but empty, as `TALOS_ROBOT_REPOSITORY="$MISSPELT"`
+    # passes it, the run fails the step rather than skipping it or checking
+    # the directory prepush was started in.
+    def test_robot_repository_set_empty_fails_the_step(self):
+        code, out, _ = self.prepush(TALOS_ROBOT_REPOSITORY="")
+        self.assertEqual(code, 1, out)
+        self.assertIn("prepush: robot-repository FAILED (TALOS_ROBOT_REPOSITORY"
+                      " names no robot repository: '' is not a directory)",
+                      out)
+        self.assertNotIn("prepush: robot-repository skipped", out)
+        self.assertIn("prepush: test ok", out)
+        self.assert_cleaned_up()
+
     # REQ-DEV-25
     def test_a_failing_step_fails_the_run_naming_it(self):
         put(os.path.join(self.built, "y.d"),
@@ -225,6 +255,70 @@ class PrepushTest(unittest.TestCase):
         self.assertIn("lint: node-matrix FAILED", out)
         self.assertNotIn("lint: writable", out)
         self.assertIn("prepush: build ok", out)
+        self.assert_cleaned_up()
+
+    def clang_calls(self):
+        """The format.sh and tidy.sh runs recorded since the last call."""
+        if not os.path.exists(self.clang_log):
+            return []
+        with open(self.clang_log, encoding="utf-8") as f:
+            calls = [line.rstrip("\n").split("|", 2) for line in f]
+        os.remove(self.clang_log)
+        return calls
+
+    # REQ-DEV-25: CI's clang-format job failed on a pushed commit that
+    # prepush had passed, since prepush never ran clang-format.
+    def test_format_checks_the_branch_against_main_and_fails_the_run(self):
+        remote = os.path.join(self.tmp, "remote.git")
+        self.git("init", "-q", "--bare", remote)
+        self.git("remote", "add", "origin", remote)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/main")
+        self.git("fetch", "-q", "origin")
+        main = self.git("rev-parse", "origin/main").strip()
+        self.commit("talOS/x.cc", "source")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: format ok", out)
+        ran = {args.split()[0]: (cwd, mode, args.split()[1:])
+               for cwd, mode, args in self.clang_calls()}
+        for tool in ("format", "tidy"):
+            cwd, mode, args = ran[tool]
+            self.assertTrue(cwd.startswith(self.tmpdir + os.sep), cwd)
+            self.assertEqual(mode, "read-only", out)
+        self.assertEqual(ran["format"][2], ["--check", "--base", main], out)
+        self.assertEqual(ran["tidy"][2], ["--base", main], out)
+
+        # Unformatted files (1), and clang-format-18 missing or not
+        # installable (format.sh's 2), both fail the run.
+        for code in ("1", "2"):
+            status, out, _ = self.prepush(STUB_FORMAT=code)
+            self.assertEqual(status, 1, out)
+            self.assertIn("prepush: format FAILED", out)
+            self.assertIn(f"stub: format exited {code}", out)
+            self.assertIn("prepush: test ok", out)
+        self.assert_cleaned_up()
+
+    # REQ-DEV-25: tidy.sh cannot run where clang 18 cannot parse the host's
+    # standard library (exit 3); prepush says so instead of nothing, and
+    # findings fail the run.
+    def test_tidy_findings_fail_and_a_host_it_cannot_run_on_is_named(self):
+        status, out, _ = self.prepush(STUB_TIDY="3")
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: tidy NOT RUN (clang 18 cannot parse this "
+                      "host's C++ standard library)", out)
+
+        status, out, _ = self.prepush(STUB_TIDY="1")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: tidy FAILED", out)
+        self.assertIn("stub: tidy exited 1", out)
+
+        # Tidy reads the build's generated headers.
+        self.clang_calls()
+        status, out, _ = self.prepush(STUB_FAIL="build")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: tidy SKIPPED (the build failed)", out)
+        self.assertEqual([a.split()[0] for _, _, a in self.clang_calls()],
+                         ["format"], out)
         self.assert_cleaned_up()
 
     # REQ-DEV-25
@@ -479,6 +573,28 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(status, 2, out)
         self.assertEqual(calls, [], out)
         self.assertTrue(os.path.isdir(lock), out)
+
+    # REQ-DEV-25: two runs that both read a dead holder's pid must not both
+    # take the lock; the retake is one at a time.
+    def test_a_dead_holders_lock_is_retaken_by_one_run_only(self):
+        lock = os.path.join(self.tmpdir, f"talos-prepush-{os.getuid()}.lock")
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        put(os.path.join(lock, "pid"), f"{dead.pid}\n")
+        # Another run in the middle of retaking it.
+        os.makedirs(lock + ".retake")
+        status, out, calls = self.prepush()
+        self.assertEqual(status, 2, out)
+        self.assertIn("retaking", out)
+        self.assertEqual(calls, [], out)
+        with open(os.path.join(lock, "pid"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), f"{dead.pid}\n")
+
+        # Alone, a run retakes it and leaves neither directory behind.
+        os.rmdir(lock + ".retake")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assert_cleaned_up()
 
     # REQ-DEV-25
     def test_leaves_other_worktrees_registered(self):

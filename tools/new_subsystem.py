@@ -25,7 +25,8 @@ Everything is checked before anything is written, so a refused run leaves the
 tree untouched. --standalone writes the package as its own Bzlmod repository
 in DIR instead, building against this checkout (from a robot repository:
 the talOS checkout the tool runs from, such as its talos/ submodule, or
---talos-checkout DIR; it refuses when talOS is a module Bazel fetched).
+--talos-checkout DIR, relative to the repository root; either is refused
+when it is not a talOS checkout or is a module Bazel fetched).
 
 From a robot repository that depends on talOS (sync_manifest's test: this
 script runs from the talOS module, not the main repository):
@@ -323,7 +324,6 @@ cc_test(
     data = @DATA@,
     env = {
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
-        "TALOS_TEST_NODE": "$(rlocationpath :node)",
     },
     deps = [
         ":@NAME@",
@@ -593,11 +593,9 @@ TALOS_NODE(@NAME@::@PASCAL@)
 
 CC_TEST = """\
 #include <gtest/gtest.h>
-#include <sys/wait.h>
 
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -843,42 +841,12 @@ TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
   EXPECT_EQ(Request(), Mode::kVelocity);
 }
 
-struct Result {
-  int status;
-  std::string output;
-};
-
-Result RunNode(const std::string& args) {
-  const std::string command = "'" + Runfile("TALOS_TEST_NODE") + "' " + args +
-                              " --config '" + Runfile("TALOS_TEST_CONFIG") +
-                              "' 2>&1";
-  FILE* pipe = ::popen(command.c_str(), "r");
-  if (pipe == nullptr) throw std::runtime_error("popen failed");
-  Result result{0, {}};
-  char buffer[4096];
-  while (const std::size_t n = std::fread(buffer, 1, sizeof buffer, pipe)) {
-    result.output.append(buffer, n);
-  }
-  const int status = ::pclose(pipe);
-  result.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  return result;
-}
-
-TEST(@PASCAL@Binary, LoggedSimRunReplaysWithoutDivergence) {
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  const std::string log =
-      std::string{tmp != nullptr ? tmp : "/tmp"} + "/node_test.tlog";
-  const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
-  ASSERT_EQ(run.status, 0) << run.output;
-  const Result replay = RunNode("--replay '" + log + "'");
-  EXPECT_EQ(replay.status, 0) << replay.output;
-  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
-      << replay.output;
-}
-
 }  // namespace
 }  // namespace @NAME@
 """
+
+# The end of a generated node_test.cc, before which the position tests go.
+NAMESPACE_END = "}}  // namespace\n}}  // namespace {name}\n"
 
 # Inserted into CC_TEST for a position mechanism: its fixture starts on the
 # home switch, and the homing tests start off it.
@@ -908,7 +876,7 @@ CC_POSITION_PARAMETERS = """\
 # mechanism's phase reaches /@NAME@/state. The homing rules themselves are
 # talOS/mechanisms' and tested there.
 CC_POSITION_TESTS = """\
-// The mechanism library's behaviour. The tests from here to the binary test
+// The mechanism library's behaviour. The tests from here to the end
 // cover what talos::mechanisms::PositionMechanism does for this node: it
 // homes on the switch before the first goal, counts positions from there,
 // clamps goals to min_rot..max_rot and latches FAILED when homing does not
@@ -1159,7 +1127,6 @@ py_test(
     size = "small",
     srcs = ["node_test.py"],
     data = @DATA@,
-    env = {"NODE_BINARY": "$(rlocationpath :node)"},
     legacy_create_init = False,
     # ctypes cannot initialize sanitizer runtimes inside the Python host.
     tags = [
@@ -1169,7 +1136,6 @@ py_test(
     deps = [
         ":messages_py",
         "//talOS/python:testing",
-        "@rules_python//python/runfiles",
     ],
 )
 """
@@ -1394,7 +1360,7 @@ class @PASCAL@:
 '''
 
 PY_TEST = '''\
-"""Node tests: the class on talos.testing.Sim, and the binary.
+"""Node tests: the class on talos.testing.Sim.
 
 @PASCAL@Test is the node test matrix, docs/TESTING.md §7 in the talos
 repository: the case names are the matrix's, which talos's
@@ -1402,8 +1368,6 @@ repository: the case names are the matrix's, which talos's
 """
 
 import os
-import subprocess
-import tempfile
 import unittest
 
 import talos
@@ -1591,26 +1555,6 @@ class @PASCAL@Test(unittest.TestCase):
     # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
-class BinaryTest(unittest.TestCase):
-    def run_binary(self, *argv):
-        resolver = runfiles.Create()
-        binary = resolver.Rlocation(os.environ["NODE_BINARY"])
-        env = dict(os.environ, **resolver.EnvVars())
-        env.pop("PYTHONPATH", None)
-        with tempfile.TemporaryDirectory() as cwd:
-            proc = subprocess.run([binary, *argv], cwd=cwd, env=env,
-                                  capture_output=True, text=True, timeout=120)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        return proc.stdout
-
-    def test_sim_run_replays_without_divergence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, "node_test.tlog")
-            self.run_binary("--sim", "--duration-s", "1", "--config", CONFIG,
-                            "--log", log)
-            self.run_binary("--replay", log, "--config", CONFIG)
-
-
 if __name__ == "__main__":
     unittest.main()
 '''
@@ -1620,12 +1564,12 @@ PY_POSITION_PARAMETERS = '''\
     # matrix: n/a 9 (PositionMechanism parameters, tested in talos)
 '''
 
-# Inserted into PY_TEST for a position mechanism before BinaryTest: the
+# Inserted into PY_TEST for a position mechanism at its end: the
 # node's own logic over the mechanism (the config homes it, and the
 # mechanism's phase reaches /@NAME@/state). The homing rules themselves are
 # talOS/mechanisms' and tested there.
 PY_POSITION_TESTS = '''
-    # The mechanism library's behaviour. The tests from here to BinaryTest
+    # The mechanism library's behaviour. The tests from here to the end
     # cover what talos.mechanisms.PositionMechanism does for this node: it
     # homes on the switch before the first goal, counts positions from
     # there, clamps goals to min_rot..max_rot and latches FAILED when homing
@@ -2392,11 +2336,9 @@ class @PASCAL@ {
 
 CC_ESTIMATOR_TEST = """\
 #include <gtest/gtest.h>
-#include <sys/wait.h>
 
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -2561,39 +2503,6 @@ TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
   EXPECT_EQ(Latest().observation_accepted_count(), 1u);
 }
 
-struct Result {
-  int status;
-  std::string output;
-};
-
-Result RunNode(const std::string& args) {
-  const std::string command = "'" + Runfile("TALOS_TEST_NODE") + "' " + args +
-                              " --config '" + Runfile("TALOS_TEST_CONFIG") +
-                              "' 2>&1";
-  FILE* pipe = ::popen(command.c_str(), "r");
-  if (pipe == nullptr) throw std::runtime_error("popen failed");
-  Result result{0, {}};
-  char buffer[4096];
-  while (const std::size_t n = std::fread(buffer, 1, sizeof buffer, pipe)) {
-    result.output.append(buffer, n);
-  }
-  const int status = ::pclose(pipe);
-  result.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  return result;
-}
-
-TEST(@PASCAL@Binary, LoggedSimRunReplaysWithoutDivergence) {
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  const std::string log =
-      std::string{tmp != nullptr ? tmp : "/tmp"} + "/node_test.tlog";
-  const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
-  ASSERT_EQ(run.status, 0) << run.output;
-  const Result replay = RunNode("--replay '" + log + "'");
-  EXPECT_EQ(replay.status, 0) << replay.output;
-  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
-      << replay.output;
-}
-
 }  // namespace
 }  // namespace @NAME@
 """
@@ -2686,7 +2595,7 @@ class @PASCAL@:
 '''
 
 PY_ESTIMATOR_TEST = '''\
-"""Node tests: the class on talos.testing.Sim, and the binary.
+"""Node tests: the class on talos.testing.Sim.
 
 @PASCAL@Test is the node test matrix for an observer, docs/TESTING.md §7 in
 the talos repository: the case names are the matrix's, which talos's
@@ -2695,8 +2604,6 @@ the talos repository: the case names are the matrix's, which talos's
 
 import math
 import os
-import subprocess
-import tempfile
 import unittest
 
 import talos
@@ -2800,26 +2707,6 @@ class @PASCAL@Test(unittest.TestCase):
     # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
-class BinaryTest(unittest.TestCase):
-    def run_binary(self, *argv):
-        resolver = runfiles.Create()
-        binary = resolver.Rlocation(os.environ["NODE_BINARY"])
-        env = dict(os.environ, **resolver.EnvVars())
-        env.pop("PYTHONPATH", None)
-        with tempfile.TemporaryDirectory() as cwd:
-            proc = subprocess.run([binary, *argv], cwd=cwd, env=env,
-                                  capture_output=True, text=True, timeout=120)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        return proc.stdout
-
-    def test_sim_run_replays_without_divergence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, "node_test.tlog")
-            self.run_binary("--sim", "--duration-s", "1", "--config", CONFIG,
-                            "--log", log)
-            self.run_binary("--replay", log, "--config", CONFIG)
-
-
 if __name__ == "__main__":
     unittest.main()
 '''
@@ -2885,8 +2772,7 @@ def estimator_files(name, lang):
                          "talOS/node/allocation_probe.h",
                          "talOS/node/testing.h"]
         build = fill(CC_BUILD, MESSAGES=messages,
-                     DATA="[\n" + string_list(["testdata/robot.toml", ":node"],
-                                              4), **values)
+                     DATA="[\n" + string_list(["testdata/robot.toml"], 4), **values)
         # The node reads no devices; only its test drives SimHardware.
         build = build.replace('        "//talOS/devices",\n', "", 1)
         files.update({
@@ -2904,7 +2790,6 @@ def estimator_files(name, lang):
             name: "topics",
             "geometry.PoseEstimate": "PoseEstimate",
             "geometry.PoseObservation": "PoseObservation",
-            "python.runfiles": "runfiles",
             "talos.testing": "Sim, SimHardware",
         }
         from_imports = "\n".join(
@@ -2913,7 +2798,7 @@ def estimator_files(name, lang):
         files.update({
             "BUILD": fill(PY_BUILD, MESSAGES=messages,
                           DATA="[\n" + string_list(
-                              [f"{name}.py", "testdata/robot.toml", ":node"],
+                              [f"{name}.py", "testdata/robot.toml"],
                               4), **values),
             f"{name}.py": fill(PY_ESTIMATOR_NODE, DOC=doc, **values),
             "node_test.py": fill(PY_ESTIMATOR_TEST, FROM_IMPORTS=from_imports,
@@ -3004,7 +2889,7 @@ def mechanism_files(name, lang, kind, raw=False):
                          "talOS/node/testing.h"]
         neighbor = values["NEIGHBOR"]
         data = ["testdata/robot.toml", f"testdata/{name}.toml",
-                f"testdata/{neighbor}.toml", ":node"]
+                f"testdata/{neighbor}.toml"]
         build = fill(CC_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(data, 4), **values)
         hdr_template = CC_POSITION_HEADER if kind == "position" else CC_HEADER
@@ -3055,8 +2940,9 @@ def mechanism_files(name, lang, kind, raw=False):
                  '  Hold(1.0, 40ms, "auto");\n'),
                 ("  EXPECT_DOUBLE_EQ(request.demand, 20.0);\n",
                  "  EXPECT_DOUBLE_EQ(request.demand, 1.0);\n"),
-                ("struct Result {",
-                 fill(CC_POSITION_RAW_TESTS, **values) + "struct Result {"),
+                (NAMESPACE_END.format(name=name),
+                 fill(CC_POSITION_RAW_TESTS, **values)
+                 + NAMESPACE_END.format(name=name)),
             ])
             testdata_subsystem = CC_POSITION_RAW_TESTDATA_SUBSYSTEM
         elif kind == "position":
@@ -3078,8 +2964,9 @@ def mechanism_files(name, lang, kind, raw=False):
                  "    sim.step(60ms);\n"),
                 (f"// matrix: n/a 9 (the {name} reads no parameters)\n",
                  fill(CC_POSITION_PARAMETERS, **values)),
-                ("struct Result {",
-                 fill(CC_POSITION_TESTS, **values) + "struct Result {"),
+                (NAMESPACE_END.format(name=name),
+                 fill(CC_POSITION_TESTS, **values)
+                 + NAMESPACE_END.format(name=name)),
             ])
             testdata_subsystem = CC_POSITION_TESTDATA_SUBSYSTEM
         files.update({
@@ -3093,14 +2980,13 @@ def mechanism_files(name, lang, kind, raw=False):
             f"testdata/{neighbor}.toml": fill(CC_TESTDATA_NEIGHBOR, **values),
         })
     else:
-        data = [f"{name}.py", "testdata/robot.toml", ":node"]
+        data = [f"{name}.py", "testdata/robot.toml"]
         pascal_name = pascal(name)
         # isort order: by module, case-insensitively.
         imports = {
             name: "topics",
             f"{name}.{pascal_name}State": f"{pascal_name}State",
             f"{name}.{pascal_name}Target": f"{pascal_name}Target",
-            "python.runfiles": "runfiles",
             "talos.testing": "Sim, SimHardware",
         }
         if kind == "position":
@@ -3163,9 +3049,9 @@ def mechanism_files(name, lang, kind, raw=False):
                  '        self.hold(1.0, 0.04, source="auto")\n'),
                 ("        self.assertEqual(request.demand, 20.0)\n",
                  "        self.assertEqual(request.demand, 1.0)\n"),
-                ("\n\nclass BinaryTest",
+                ("\n\nif __name__",
                  fill(PY_POSITION_RAW_TESTS, **values)
-                 + "\n\nclass BinaryTest"),
+                 + "\n\nif __name__"),
             ])
             testdata_robot = PY_POSITION_RAW_TESTDATA_ROBOT
         elif kind == "position":
@@ -3189,8 +3075,8 @@ def mechanism_files(name, lang, kind, raw=False):
                 # A motor on its home switch zeroes after home_samples ticks.
                 ("        self.sim.step(0.01)\n",
                  "        self.sim.step(0.06)  # home_samples ticks on a switch\n"),
-                ("\n\nclass BinaryTest",
-                 fill(PY_POSITION_TESTS, **values) + "\n\nclass BinaryTest"),
+                ("\n\nif __name__",
+                 fill(PY_POSITION_TESTS, **values) + "\n\nif __name__"),
             ])
             testdata_robot = PY_POSITION_TESTDATA_ROBOT
         files.update({
@@ -3597,17 +3483,22 @@ def sim_target_config(root):
             module = ast.parse(f.read())
     except SyntaxError:
         return None
-    configs = {}
+    # Every talos_sim, its config None when it is no string literal: a
+    # //:sim (or an only target) whose config cannot be read runs an
+    # unknown config, never another target's.
+    configs = []
     for node in ast.walk(module):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "talos_sim"):
             keywords = {k.arg: k.value for k in node.keywords}
             name, config = keywords.get("name"), keywords.get("config")
-            if (isinstance(name, ast.Constant) and isinstance(config, ast.Constant)
-                    and isinstance(config.value, str)):
-                configs[name.value] = config.value
-    label = configs.get("sim") or (
-        next(iter(configs.values())) if len(configs) == 1 else None)
+            configs.append((
+                getattr(name, "value", None),
+                config.value if isinstance(config, ast.Constant)
+                and isinstance(config.value, str) else None))
+    sims = [config for name, config in configs if name == "sim"]
+    label = (sims[0] if len(sims) == 1 else None) if sims else (
+        configs[0][1] if len(configs) == 1 else None)
     if label is None:
         return None
     if label.startswith("//"):
@@ -3679,27 +3570,62 @@ def robot_configs(root, directory):
     return found
 
 
-def talos_checkout(script):
-    """The talOS checkout `script` (this file, through its runfiles symlink)
-    lives in, or None when it is not a durable checkout: Bazel's copy of a
-    fetched module, under an output base's external/ directory, is
-    replaced or removed by Bazel, so nothing may point at it."""
-    top = os.path.dirname(os.path.dirname(os.path.realpath(script)))
-    try:
-        with open(os.path.join(top, "MODULE.bazel"), encoding="utf-8") as f:
-            module = f.read()
-    except OSError:
-        return None
-    if not re.search(r'name\s*=\s*"talos"', module):
-        return None
-    ancestor = top
+def in_output_base(path):
+    """Whether `path` is under a Bazel output base's external/ directory
+    (an `external` with an `execroot` beside it)."""
+    ancestor = path
     while os.path.dirname(ancestor) != ancestor:
         parent = os.path.dirname(ancestor)
         if (os.path.basename(ancestor) == "external"
                 and os.path.isdir(os.path.join(parent, "execroot"))):
-            return None
+            return True
         ancestor = parent
-    return top
+    return False
+
+
+def in_contents_cache(path):
+    """Whether `path` is in Bazel's repository contents cache: under a
+    `contents` directory holding the cache's `gc_lock` (by default
+    <output user root>/cache/repos/v1/contents/<hash>/<uuid>)."""
+    ancestor = path
+    while os.path.dirname(ancestor) != ancestor:
+        ancestor = os.path.dirname(ancestor)
+        if (os.path.basename(ancestor) == "contents"
+                and os.path.isfile(os.path.join(ancestor, "gc_lock"))):
+            return True
+    return False
+
+
+def checkout_problem(top):
+    """Why `top` is no talOS checkout a new repository may point at, or
+    None. It needs a MODULE.bazel naming the module talos, and its files
+    may not live in Bazel's own storage: its real path (symlinks
+    resolved) may be neither under an output base's external/ (a fetched
+    module) nor in the repository contents cache, which Bazel replaces
+    or removes. Reached through an external/ symlink that ends in a
+    checkout (a local_path_override), it is that checkout."""
+    try:
+        with open(os.path.join(top, "MODULE.bazel"), encoding="utf-8") as f:
+            module = f.read()
+    except OSError:
+        module = ""
+    if not re.search(r'name\s*=\s*"talos"', module):
+        return 'it has no MODULE.bazel with name = "talos"'
+    real = os.path.realpath(top)
+    if in_output_base(real):
+        return ("it is Bazel's copy of a fetched module, under an output "
+                "base's external/ directory")
+    if in_contents_cache(real):
+        return ("it is Bazel's copy of a fetched module, in its repository "
+                "contents cache")
+    return None
+
+
+def talos_checkout(script):
+    """The talOS checkout `script` (this file, through its runfiles symlink)
+    lives in, or None when checkout_problem refuses it."""
+    top = os.path.dirname(os.path.dirname(os.path.realpath(script)))
+    return None if checkout_problem(top) else top
 
 
 def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
@@ -3729,6 +3655,10 @@ def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
         raise Refused(f"{talos_root} has no talos.bazelrc for the new "
                       "repository's .bazelrc to import; it is not a talOS "
                       "checkout this tool can build against")
+    if not os.path.isfile(os.path.join(talos_root, ".bazelversion")):
+        raise Refused(f"{talos_root} has no .bazelversion for the new "
+                      "repository to take its Bazel version from; it is not "
+                      "a talOS checkout this tool can build against")
     files[".bazelrc"] = (
         "# talOS's build flags, from the talOS checkout MODULE.bazel's\n"
         "# local_path_override names (the same path).\n"
@@ -3767,7 +3697,19 @@ def show(root, writes):
 # What ./sim.sh drives a scaffold with: teleop after a second disabled, and
 # joystick 0's button (button 3: bit 2) pressed from second 3 to second 6,
 # after a neutral sample that arms the teleop lane (talos::OperatorArming).
-SIM_DURATION_S = 8
+# The schedules last SIM_SCHEDULE_S from sim_gateway's loop start: the
+# release at second 6 and 2 s to see the mechanism go neutral after it.
+SIM_SCHEDULE_S = 8
+# The launcher counts --duration-s from its first spawn, sim_gateway (spawned
+# last) its schedules from its own loop start, which follows its registry
+# claim at once. The launcher kills a member that has not claimed its row by
+# the startup grace (talOS/launcher/roster.h heartbeat_startup_grace_ms, 5 s
+# by default; the printed command keeps it), so a run whose gateway was not
+# restarted starts the schedules at most that long after the duration began.
+# The printed duration adds that grace to the schedules' length, so how long
+# start-up takes, within the grace, cuts no second off the button's window.
+LAUNCHER_STARTUP_GRACE_S = 5
+SIM_DURATION_S = LAUNCHER_STARTUP_GRACE_S + SIM_SCHEDULE_S
 MODE_SCHEDULE = "disabled:1,teleop:10"
 
 
@@ -4424,9 +4366,10 @@ def main(argv):
                         "instead of wiring into --robot")
     parser.add_argument("--talos-checkout", metavar="DIR",
                         help="with --standalone in a robot repository: the "
-                        "talOS checkout the new repository builds against "
-                        "(default: the one this tool runs from, when it is "
-                        "a checkout such as the talos/ submodule)")
+                        "talOS checkout the new repository builds against, "
+                        "relative to the robot repository's root (default: "
+                        "the one this tool runs from, when it is a checkout "
+                        "such as the talos/ submodule)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every file and edit without writing")
     args = parser.parse_args(argv)
@@ -4468,10 +4411,15 @@ def main(argv):
             # takes its .bazelrc: this one in talOS; from a robot
             # repository, the checkout this tool runs from (its submodule).
             talos_root = root
-            if talos:
-                talos_root = (os.path.join(root, args.talos_checkout)
-                              if args.talos_checkout
-                              else talos_checkout(__file__))
+            if talos and args.talos_checkout:
+                talos_root = os.path.join(root, args.talos_checkout)
+                if problem := checkout_problem(talos_root):
+                    raise Refused(f"--talos-checkout {args.talos_checkout} "
+                                  f"({talos_root}) is not a talOS checkout "
+                                  f"the new repository can point at: "
+                                  f"{problem}")
+            elif talos:
+                talos_root = talos_checkout(__file__)
                 if talos_root is None:
                     raise Refused(
                         "the talOS this tool runs from is Bazel's copy of a "

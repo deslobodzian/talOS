@@ -128,6 +128,15 @@ void ConfigPersister::Stop() {
   if (!started_) return;
   {
     std::lock_guard lock{mutex_};
+    // The newest acknowledged configuration not yet handed over (no tick
+    // since, an enabled one, or a lost try-lock): the loop no longer ticks,
+    // so it is handed over here, superseding one not yet started, as Tick()
+    // would. Saving it now after an enable is harmless: the loop has stopped.
+    if (unsaved_) {
+      if (!pending_) ++outstanding_;
+      pending_ = std::move(unsaved_);
+      unsaved_.reset();
+    }
     stop_ = true;
   }
   wake_.notify_one();
@@ -136,6 +145,9 @@ void ConfigPersister::Stop() {
 #else
   pthread_join(thread_, nullptr);
 #endif
+  // A save run while stopping behind an uncollected one stays in saving_;
+  // freed here, on this thread, so a saver started again finds it empty.
+  saving_.reset();
   started_ = false;
 }
 
@@ -202,8 +214,9 @@ void ConfigPersister::Run() {
       return (pending_.has_value() && !done_.has_value()) || stop_;
     });
     // Stop saves what was handed over first. saving_ is always empty here:
-    // it stays occupied only after a save while stopping, and the loop, no
-    // longer ticking, hands over nothing after that one.
+    // it stays occupied only after a save while stopping, after which
+    // nothing is handed over until Stop() has joined this thread and freed
+    // it.
     if (!pending_ || saving_) return;
     saving_.emplace(std::move(*pending_));
     pending_.reset();

@@ -37,8 +37,17 @@
 // window had ticks: per phase the mean and longest time per tick, and the
 // device counts. The loop thread adds a tick's phases with plain arithmetic
 // and hands a finished window over on the first tick after the logger asks
-// for it: relaxed stores between an acquire fence and a release store, once
-// per window.
+// for it: relaxed stores between an acquire load of the request and a
+// release store, once per window.
+//
+// Beside that line, the same window's latency line (REQ-RT-25): the p50, p99
+// and max of each drained command's observation age (accepted and refused
+// apart) and of each sent Driver Station snapshot's refresh age, all on the
+// RoboRIO's own clock. The loop records at most one of each per tick; the
+// tick folds them into its window at RecordTick. Each figure is a fixed
+// histogram (kLatencyBuckets of kLatencyBucketUs, an overflow bucket and the
+// exact max), double-buffered: the handover only switches the loop to the
+// other buffer, which the logger cleared after printing it.
 namespace talos::rio {
 
 // Where a tick's work goes. PhoenixBackend measures the backend's phases
@@ -63,8 +72,8 @@ enum class TickPhase : uint8_t {
   // encoding that snapshot as its packet. The refresh, the snapshot and the
   // mode report are that thread's, outside every phase.
   kDriverStation,
-  // The loop's: the watchdog beat, the companion report, the config
-  // persister's tick.
+  // The loop's: the console's checks (LoopConsole), the watchdog beat, the
+  // companion report, the config persister's tick.
   kLoop,
   kCount,
 };
@@ -170,6 +179,21 @@ class RioLog {
   void SetTickDevices(std::size_t motors, std::size_t sensors);
   static constexpr uint64_t kPhaseWindowUs = 10'000'000;
 
+  // The loop thread, at most once per tick each (a second call in one tick
+  // folds the first into the window at once): the age, on the RoboRIO's
+  // clock, of the command the endpoint's tick drained, at the end of that
+  // tick, and whether the gateway accepted it; and the age of the sent Driver
+  // Station snapshot's refresh at its send. Plain stores; RecordTick adds them
+  // to the tick's window. An age of 2^63 us or more is a difference that
+  // wrapped (an observation ahead of the clock: one from before an OS
+  // reboot, a corrupt stamp) and is not recorded. A previous program run's
+  // command is no such case: the clock runs on across a program restart, so
+  // its observation lies in the past and it counts with its age.
+  void RecordCommandAge(uint64_t age_us, bool accepted);
+  void RecordDriverStationAge(uint64_t age_us);
+  static constexpr std::size_t kLatencyBuckets = 512;
+  static constexpr uint64_t kLatencyBucketUs = 100;
+
   // Starts the logger thread (nice 19 on Linux, best effort), which
   // drains every 20 ms. Stop() (also the destructor) drains, flushes the
   // coalesced lines and joins it.
@@ -266,6 +290,41 @@ class RioLog {
   std::atomic<uint32_t> published_motors_{0};
   std::atomic<uint32_t> published_sensors_{0};
   void WritePhases(uint64_t now_us, bool force);
+
+  // Latency: per figure, counts per kLatencyBucketUs bucket and one
+  // overflow bucket (ages from kLatencyBuckets * kLatencyBucketUs), with the
+  // sample count and the exact max.
+  struct LatencyHistogram {
+    std::array<uint32_t, kLatencyBuckets + 1> counts{};
+    uint64_t samples{0};
+    uint64_t max_us{0};
+    void Add(uint64_t age_us);
+    // "<p50>/<p99>/<max> us over <n>", or "-/-/- us over 0".
+    std::string Summary() const;
+  };
+  struct LatencyWindow {
+    LatencyHistogram accepted;
+    LatencyHistogram refused;
+    LatencyHistogram driver_station;
+  };
+  struct PendingAge {
+    bool present{false};
+    bool accepted{false};
+    uint64_t age_us{0};
+  };
+  void FoldCommandAge();
+  void FoldDriverStationAge();
+  // This tick's ages, folded at RecordTick after any handover.
+  PendingAge tick_command_age_{};
+  PendingAge tick_driver_station_age_{};
+  // The loop writes latency_[latency_front_]; at a handover it moves to the
+  // other buffer and names the one it left in latency_published_, which the
+  // logger reads after phase_served_'s acquire and clears before its next
+  // request (release), which the loop loads with acquire before it switches
+  // back, so that switch finds it empty.
+  std::array<LatencyWindow, 2> latency_{};
+  uint32_t latency_front_{0};
+  uint32_t latency_published_{0};
 
   // Logger-thread state.
   bool phase_clock_started_{false};

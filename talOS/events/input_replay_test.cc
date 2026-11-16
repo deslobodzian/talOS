@@ -5,12 +5,17 @@
 #include "talOS/events/input_replay.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "events_test/events_test_message_generated.h"
@@ -252,6 +257,56 @@ TEST(InputReplay, ReaderOnlyLogFeedsAtPublicationRatherThanDelayedReceipt) {
   ASSERT_EQ(replayed.contexts.size(), 1u);
   EXPECT_EQ(replayed.contexts[0].now, kOrigin + 2ms);
   EXPECT_EQ(replayed.contexts[0].publish_time, kOrigin + 2ms);
+  std::filesystem::remove_all(dir);
+}
+
+// Sends one reading from its constructor, before its loop's first dispatch.
+class InitialSender {
+ public:
+  InitialSender(Loop& loop, int value)
+      : sensor_{make_sender<EventsTest::SensorMessage>(loop, kTopics.sensor)} {
+    sensor_.send(EventsTest::SensorMessage{value, 1.0F, 1.0F});
+  }
+
+ private:
+  Sender<Loop, EventsTest::SensorMessage> sensor_;
+};
+
+// A send made before the first dispatch (a constructor's initial state) is
+// published at its loop's origin, which is what its readers saw; a node the
+// session did not run is fed it then, so a restarted writer's initial
+// message arrives at the restart, not at the session's start.
+// REQ-OPS-14
+TEST(InputReplay, FeedsAConstructorSendAtItsRunsOrigin) {
+  const std::string dir = TempDir("constructor_send");
+  const MonotonicTime restart = kOrigin + 50ms;
+  {
+    // One environment: the restarted writer continues the topic's sequence,
+    // as it does on a session's shared memory.
+    SimulationEnvironment environment;
+    for (const auto& [name, start, value] :
+         {std::tuple{"/writer.tlog", kOrigin, 1},
+          std::tuple{"/writer_restarted.tlog", restart, 2}}) {
+      Loop loop{environment, log::LogWriter{dir + name, "writer"},
+                Loop::Options{.start = start}};
+      const InitialSender sender{loop, value};
+      loop.run_until(start + 10ms);
+      loop.finish();
+      ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+    }
+  }
+  const RecordedSession session{dir};
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{
+      environment, SimulatedEventLoop<>::Options{.start = session.start()}};
+  MessageTimes replayed;
+  watch<EventsTest::SensorMessage, &MessageTimes::receive>(loop, kTopics.sensor,
+                                                           &replayed);
+  ReplayInputs(loop, environment, session);
+  ASSERT_EQ(replayed.contexts.size(), 2u);
+  EXPECT_EQ(replayed.contexts[0].publish_time, kOrigin);
+  EXPECT_EQ(replayed.contexts[1].publish_time, restart);
+  EXPECT_EQ(replayed.contexts[1].now, restart);
   std::filesystem::remove_all(dir);
 }
 
@@ -566,6 +621,629 @@ TEST(InputReplay, EndsBeforeTheFirstGapOfALogItIsFedFrom) {
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(out);
   }
+}
+
+// A program with a timer every millisecond and no input.
+class Ticker {
+ public:
+  explicit Ticker(Loop& loop)
+      : tick_{make_timer<&Ticker::on_tick>(loop, "tick", this)} {
+    tick_.setup_periodic(loop.monotonic_now() + 1ms, 1ms);
+  }
+
+ private:
+  void on_tick(const Context&) {}
+
+  Timer<Loop> tick_;
+};
+
+// A gap in a log a run is fed from that starts after the replayed program's
+// recorded exit (loop_end()) is never reached: the run neither stops at it
+// nor runs past its exit. Here the consumer ran live as a ticker that read
+// nothing and exited at kExit; the producer ran on and has a gap after that.
+// Replayed, the consumer reads the producer's sensor, every reading before
+// kExit, and ticks to kExit.
+// REQ-OPS-14
+TEST(InputReplay, AGapAfterTheReplayedRunsExitDoesNotStopIt) {
+  constexpr MonotonicTime kExit = kOrigin + 30ms;
+  const std::string dir = TempDir("gap_after_exit");
+  const std::string out = TempDir("gap_after_exit_out");
+  {
+    SimulationEnvironment environment;
+    Loop producer_loop{environment,
+                       log::LogWriter{dir + "/producer.tlog", "producer"},
+                       Loop::Options{.start = kOrigin}};
+    Loop consumer_loop{environment,
+                       log::LogWriter{dir + "/consumer.tlog", "consumer"},
+                       Loop::Options{.start = kOrigin}};
+    Producer producer{producer_loop};
+    Ticker ticker{consumer_loop};
+    consumer_loop.run_until(kExit);
+    consumer_loop.finish();
+    producer_loop.run_until(kOrigin + std::chrono::milliseconds{kSessionMs});
+    producer_loop.finish();
+  }
+  const log::LogGap gap = MarkGap(dir + "/producer.tlog", kOrigin + 40ms);
+  ASSERT_GT(gap.start_ns, kExit.nanos());
+  const RecordedSession session{dir, "consumer"};
+  ASSERT_EQ(session.loop_end(), kExit);
+  const RecordedTopic* sensor = session.find(kTopics.sensor);
+  ASSERT_NE(sensor, nullptr);
+  ASSERT_TRUE(sensor->first_gap.has_value());
+  EXPECT_EQ(sensor->first_gap->nanos(), gap.start_ns);
+
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+            Loop::Options{.start = session.loop_start(),
+                          .run_start = session.run_start()}};
+  TestRobot<Loop> consumer{loop, kTopics, kGain};
+  consumer.control_timer().setup_periodic(kOrigin + 1ms, 1ms);
+  const InputReplayReport report = ReplayInputs(loop, environment, session);
+  EXPECT_FALSE(report.stopped_at_gap.has_value());
+  ASSERT_EQ(report.fed.size(), 1u);
+  EXPECT_EQ(report.fed[0].topic, kTopics.sensor);
+  // The readings every 2 ms up to the exit, the one at it included.
+  EXPECT_EQ(report.fed[0].messages, 15u);
+  EXPECT_EQ(consumer.efforts().size(), TicksBefore(kExit + 1ns));
+  EXPECT_EQ(loop.monotonic_now(), kExit);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
+}
+
+// Flips one bit of the header of the record at `offset`, so a reader skips
+// it as damage and resumes at the next.
+void DamageRecord(const std::string& path, std::uint64_t offset) {
+  std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+  const auto at = static_cast<std::streamoff>(
+      offset + offsetof(log::RecordHeader, dispatch_index));
+  char byte = 0;
+  file.seekg(at);
+  file.read(&byte, 1);
+  byte = static_cast<char>(byte ^ 1);
+  file.seekp(at);
+  file.write(&byte, 1);
+}
+
+std::vector<std::uint64_t> RecordOffsets(const std::string& path) {
+  log::LogReader reader{path};
+  std::vector<std::uint64_t> offsets;
+  log::LogReader::Record record;
+  while (reader.next(record)) offsets.push_back(record.offset);
+  return offsets;
+}
+
+void CreateEmptyFile(const std::string& path) {
+  const std::ofstream file{path};
+  ASSERT_TRUE(file.good()) << path;
+}
+
+// Splits the log at `path` as a byte cap rotates one, once per entry of
+// `cuts` (ascending): its records before the first at or after cuts[0] (its
+// now_ns) go to `<stem>.segment0.tlog`, those from there to before cuts[1] to
+// `<stem>.segment1.tlog`, and so on; the rest stay at `path`, each behind the
+// log's header, manifest and schema block.
+void RotateAt(const std::string& path, const std::vector<MonotonicTime>& cuts) {
+  std::vector<std::uint64_t> ends;
+  {
+    log::LogReader reader{path};
+    log::LogReader::Record record;
+    while (ends.size() < cuts.size() && reader.next(record)) {
+      while (ends.size() < cuts.size() &&
+             record.header.now_ns >= cuts[ends.size()].nanos()) {
+        ends.push_back(record.offset);
+      }
+    }
+  }
+  ASSERT_EQ(ends.size(), cuts.size()) << path << " ends before a cut";
+  const std::uint64_t prefix = RecordOffsets(path).front();
+  std::vector<char> bytes;
+  {
+    std::ifstream in{path, std::ios::binary};
+    bytes.assign(std::istreambuf_iterator<char>{in},
+                 std::istreambuf_iterator<char>{});
+  }
+  const auto write = [&](const std::string& to, std::uint64_t from,
+                         std::uint64_t end) {
+    std::ofstream out{to, std::ios::binary | std::ios::trunc};
+    out.write(bytes.data(), static_cast<std::streamsize>(prefix));
+    out.write(bytes.data() + from, static_cast<std::streamsize>(end - from));
+  };
+  std::uint64_t from = prefix;
+  for (std::size_t k = 0; k < ends.size(); ++k) {
+    ASSERT_GT(ends[k], from) << "segment " << k << " would be empty";
+    write(log::LogSegmentPath(path, k), from, ends[k]);
+    from = ends[k];
+  }
+  ASSERT_LT(from, bytes.size());
+  write(path, from, bytes.size());
+}
+
+// Counts the readings it receives.
+class SensorWatcher {
+ public:
+  explicit SensorWatcher(Loop& loop) {
+    watch<EventsTest::SensorMessage, &SensorWatcher::on_sensor>(
+        loop, kTopics.sensor, this);
+  }
+  int readings{0};
+
+ private:
+  void on_sensor(const Context&, const EventsTest::SensorMessage&) {
+    ++readings;
+  }
+};
+
+// Registers what WriterLog's log records: a sender of /input/sensor (id 0)
+// and a timer (id 1).
+struct SensorWriter {
+  explicit SensorWriter(Loop& loop) {
+    make_sender<EventsTest::SensorMessage>(loop, kTopics.sensor);
+    loop.register_timer("tick", Thunk{});
+  }
+};
+
+// The manifest `Program`'s registrations make, without running it (its
+// loop's log, at `unused`, is never started, so never created).
+template <typename Program>
+Manifest ManifestOf(const std::string& unused) {
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{unused, "manifest"}};
+  Program program{loop};
+  return loop.manifest();
+}
+
+const MonotonicTime kDrain = kOrigin + 10ms;
+
+// A reader's log, as a realtime loop writes one: one drain at kDrain hands
+// its watcher four readings published 1 to 4 ms after the origin, each
+// dispatch sampling its own now 5 us after the last, so every dispatch's now
+// is after its event time. Returns each record's offset.
+std::vector<std::uint64_t> ReaderLog(const std::string& dir) {
+  const std::string path = dir + "/reader.tlog";
+  log::LogWriter writer{path, "reader",
+                        log::LogWriterOptions{.background = false}};
+  writer.start(ManifestOf<SensorWatcher>(dir + "/unused.tlog"), kOrigin);
+  for (int i = 1; i <= 4; ++i) {
+    const EventsTest::SensorMessage reading{i, 1.0F, 1.0F};
+    writer.dispatch(
+        Context{.kind = EventKind::MESSAGE,
+                .source_id = 0,
+                .dispatch_index = static_cast<std::uint64_t>(i),
+                .event_time = kDrain,
+                .now = kDrain + std::chrono::microseconds{5 * i},
+                .publish_time = kOrigin + std::chrono::milliseconds{i},
+                .sequence = static_cast<std::uint64_t>(i)},
+        std::as_bytes(std::span{&reading, 1}));
+  }
+  writer.finish(Context{.kind = EventKind::EXIT,
+                        .dispatch_index = 5,
+                        .event_time = kDrain + 25us,
+                        .now = kDrain + 25us});
+  writer.flush();
+  return RecordOffsets(path);
+}
+
+// A writer's log: a tick 1 to 4 ms after the origin, each sending a reading.
+// Returns each record's offset (tick, send, ..., EXIT).
+std::vector<std::uint64_t> WriterLog(const std::string& dir) {
+  const std::string path = dir + "/writer.tlog";
+  log::LogWriter writer{path, "writer",
+                        log::LogWriterOptions{.background = false}};
+  writer.start(ManifestOf<SensorWriter>(dir + "/unused.tlog"), kOrigin);
+  for (int i = 1; i <= 4; ++i) {
+    const Context tick{.kind = EventKind::TIMER,
+                       .source_id = 1,
+                       .dispatch_index = static_cast<std::uint64_t>(i),
+                       .event_time = kOrigin + std::chrono::milliseconds{i},
+                       .now = kOrigin + std::chrono::milliseconds{i},
+                       .sequence = 1};
+    writer.dispatch(tick, {});
+    const EventsTest::SensorMessage reading{i, 1.0F, 1.0F};
+    writer.send(tick, 0, std::as_bytes(std::span{&reading, 1}), 0,
+                static_cast<std::uint64_t>(i));
+  }
+  writer.finish(Context{.kind = EventKind::EXIT,
+                        .dispatch_index = 5,
+                        .event_time = kOrigin + 5ms,
+                        .now = kOrigin + 5ms});
+  writer.flush();
+  return RecordOffsets(path);
+}
+
+// A damaged stretch (records lost between intact ones, which no GAP record
+// marks) ends a run fed from its log as a gap does, at the earliest time a
+// record lost there could be fed at, or refuses the log where nothing bounds
+// that. Rows: a reader's receipts, fed at their publication times, are
+// bounded by the last intact receipt's, not by when its dispatch ran (a
+// drain's dispatches run after the drain's time), and by nothing when the
+// lost one was its first; a writer's sends, fed at their records' now, by
+// the last intact record's; the replayed program's own receipts, fed at
+// their drain's time, which need not follow the log's order, by nothing.
+// Nothing bounding them, the log is refused, naming it and the byte offset.
+// REQ-OPS-14
+TEST(InputReplay, StopsAtOrRefusesDamageByWhenItsLostRecordsWereFed) {
+  {
+    SCOPED_TRACE("a reader's receipts");
+    const std::string dir = TempDir("damage_reader");
+    const std::string out = TempDir("damage_reader_out");
+    const std::vector<std::uint64_t> offsets = ReaderLog(dir);
+    DamageRecord(dir + "/reader.tlog", offsets[2]);  // the third reading
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/watcher.tlog", "watcher"},
+              Loop::Options{.start = session.start()}};
+    SensorWatcher watcher{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    ASSERT_TRUE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.stopped_at_gap->log, dir + "/reader.tlog");
+    // The second reading's publication: the third's is no earlier.
+    EXPECT_EQ(report.stopped_at_gap->at, kOrigin + 2ms);
+    ASSERT_TRUE(report.stopped_at_gap->damage_offset.has_value());
+    EXPECT_EQ(report.stopped_at_gap->damage_offset.value(), offsets[2]);
+    // The first only: neither the second, at the stop, nor the fourth,
+    // past the lost third.
+    EXPECT_EQ(watcher.readings, 1);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    // Its first receipt lost: a first receipt can carry any earlier
+    // publication time, so nothing bounds it.
+    SCOPED_TRACE("a reader's receipts, its first one lost");
+    const std::string dir = TempDir("damage_first");
+    const std::string out = TempDir("damage_first_out");
+    const std::vector<std::uint64_t> offsets = ReaderLog(dir);
+    DamageRecord(dir + "/reader.tlog", offsets[0]);
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/watcher.tlog", "watcher"},
+              Loop::Options{.start = session.start()}};
+    SensorWatcher watcher{loop};
+    try {
+      ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "fed a reader's receipts after its lost first one";
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(dir + "/reader.tlog"), std::string::npos) << what;
+      EXPECT_NE(what.find("byte " + std::to_string(offsets[0])),
+                std::string::npos)
+          << what;
+    }
+    EXPECT_EQ(watcher.readings, 0);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("a writer's sends");
+    const std::string dir = TempDir("damage_writer");
+    const std::string out = TempDir("damage_writer_out");
+    const std::vector<std::uint64_t> offsets = WriterLog(dir);
+    DamageRecord(dir + "/writer.tlog", offsets[5]);  // the third send
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/watcher.tlog", "watcher"},
+              Loop::Options{.start = session.start()}};
+    SensorWatcher watcher{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    ASSERT_TRUE(report.stopped_at_gap.has_value());
+    // The third tick's now: the third send's publication is no earlier.
+    EXPECT_EQ(report.stopped_at_gap->at, kOrigin + 3ms);
+    ASSERT_TRUE(report.stopped_at_gap->damage_offset.has_value());
+    EXPECT_EQ(report.stopped_at_gap->damage_offset.value(), offsets[5]);
+    EXPECT_EQ(watcher.readings, 2);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    // The bound carries across the segments of one log: damage right after
+    // a later segment's header is bounded by the previous segment's last
+    // intact record, as it would be in one file.
+    SCOPED_TRACE("a writer's sends, at a later segment's head");
+    const std::string dir = TempDir("damage_segment");
+    const std::string out = TempDir("damage_segment_out");
+    WriterLog(dir);
+    const std::string path = dir + "/writer.tlog";
+    RotateAt(path, {kOrigin + 3ms});  // the third tick starts a segment
+    const std::uint64_t head = RecordOffsets(path).front();
+    DamageRecord(path, head);
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/watcher.tlog", "watcher"},
+              Loop::Options{.start = session.start()}};
+    SensorWatcher watcher{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    ASSERT_TRUE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.stopped_at_gap->log, path);
+    // The second send's now, the previous segment's last record.
+    EXPECT_EQ(report.stopped_at_gap->at, kOrigin + 2ms);
+    ASSERT_TRUE(report.stopped_at_gap->damage_offset.has_value());
+    EXPECT_EQ(report.stopped_at_gap->damage_offset.value(), head);
+    EXPECT_EQ(watcher.readings, 1);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("its own receipts");
+    const std::string dir = TempDir("damage_own");
+    const std::string out = TempDir("damage_own_out");
+    const std::vector<std::uint64_t> offsets = ReaderLog(dir);
+    DamageRecord(dir + "/reader.tlog", offsets[2]);
+    const RecordedSession session{dir, "reader"};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/reader.tlog", "reader"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    SensorWatcher watcher{loop};
+    try {
+      ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "fed its own receipts across damage";
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(dir + "/reader.tlog"), std::string::npos) << what;
+      EXPECT_NE(what.find("byte " + std::to_string(offsets[2])),
+                std::string::npos)
+          << what;
+    }
+    EXPECT_EQ(watcher.readings, 0);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
+// Writes the session manifest the launcher would, naming each member's log
+// by the path it had when recorded (elsewhere: matched by file name), with
+// `observer` (JSON members) for the observer.
+void WriteManifest(const std::string& dir, const std::string& observer) {
+  const std::uint64_t id = log::LogReader{dir + "/observer.tlog"}.session_id();
+  std::ofstream{dir + "/manifest.json"}
+      << "{\n  \"session_id\": " << id << ",\n  \"nodes\": [\n"
+      << "    {\"name\": \"producer\", \"log_paths\": "
+         "[\"/robot/logs/7/producer.tlog\"], \"log_gap\": false, "
+         "\"log_capped\": false},\n"
+      << "    {\"name\": \"observer\", \"log_paths\": "
+         "[\"/robot/logs/7/observer.tlog\"], "
+      << observer << "}\n  ]\n}\n";
+}
+
+// A log the byte cap cost records (its `<log>.capped` marker, beside the log
+// a segment belongs to, or the session manifest's log_capped for its member)
+// may have lost a GAP record with them, and a run's log without its EXIT
+// record, of a member the manifest marks log_gap, may have lost one to its
+// process's end: input replay refuses, before anything runs, to feed a
+// watched topic from either, naming the log and the sign it found. A
+// log_gap member's log with its EXIT holds a GAP record for every gap, so it
+// is fed up to its first, its segments a byte cap rotated out included (the
+// run's EXIT is in its newest file). A capped log that feeds the program
+// nothing does not stop it.
+// REQ-OPS-14
+TEST(InputReplay, RefusesToFeedFromACappedLogOrALogGapRunCutShort) {
+  struct Row {
+    const char* name;
+    const char* refused;  // the log named, in the session directory
+    const char* sign;
+  };
+  const Row rows[] = {
+      {"capped", "observer.tlog", "observer.tlog.capped"},
+      {"a capped log's segment", "observer.segment2.tlog",
+       "observer.tlog.capped"},
+      {"log_capped", "observer.tlog", "log_capped"},
+      {"log_gap, without its EXIT", "observer.tlog", "log_gap"},
+  };
+  for (const Row& row : rows) {
+    SCOPED_TRACE(row.name);
+    const std::string dir = TempDir("refused");
+    const std::string out = TempDir("refused_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string sign{row.sign};
+    if (sign == "log_capped") {
+      WriteManifest(dir, "\"log_gap\": false, \"log_capped\": true");
+    } else if (sign == "log_gap") {
+      WriteManifest(dir, "\"log_gap\": true, \"log_capped\": false");
+      // Its last record is its EXIT.
+      std::filesystem::resize_file(
+          dir + "/observer.tlog", RecordOffsets(dir + "/observer.tlog").back());
+    } else {
+      if (std::string{row.refused} != "observer.tlog") {
+        std::filesystem::rename(dir + "/observer.tlog",
+                                dir + "/" + row.refused);
+      }
+      CreateEmptyFile(dir + "/" + sign);
+    }
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    try {
+      ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "fed from " << row.refused;
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(dir + "/" + row.refused), std::string::npos) << what;
+      EXPECT_NE(what.find(sign), std::string::npos) << what;
+    }
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  for (const bool rotated : {false, true}) {
+    // Rotated: its run's EXIT is in its newest file, not in the segment.
+    SCOPED_TRACE(rotated ? "log_gap, rotated, with its GAP record and its EXIT"
+                         : "log_gap, with its GAP record and its EXIT");
+    const std::string dir = TempDir("log_gap_exit");
+    const std::string out = TempDir("log_gap_exit_out");
+    RecordSession(dir, out + "/live.tlog");
+    const log::LogGap gap = MarkGap(dir + "/observer.tlog", kOrigin + 20ms);
+    if (rotated) RotateAt(dir + "/observer.tlog", {kOrigin + 10ms});
+    WriteManifest(dir, "\"log_gap\": true, \"log_capped\": false");
+    const RecordedSession session{dir};
+    const Replayed replayed = ReplayConsumer(session, out + "/replayed.tlog");
+    ASSERT_TRUE(replayed.report.stopped_at_gap.has_value());
+    EXPECT_EQ(replayed.report.stopped_at_gap->log, dir + "/observer.tlog");
+    EXPECT_EQ(replayed.report.stopped_at_gap->at.nanos(), gap.start_ns);
+    EXPECT_FALSE(replayed.report.stopped_at_gap->damage_offset.has_value());
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("a capped log that feeds it nothing");
+    const std::string dir = TempDir("capped_unfed");
+    const std::string out = TempDir("capped_unfed_out");
+    RecordSession(dir, out + "/live.tlog");
+    CreateEmptyFile(dir + "/producer.tlog.capped");
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/setpoints.tlog", "setpoints"},
+              Loop::Options{.start = session.start()}};
+    SetpointWatcher watcher{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    ASSERT_EQ(report.fed.size(), 1u);
+    EXPECT_EQ(report.fed[0].messages, 6u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
+// A byte cap that rotated a log ten times or more leaves segment files
+// whose names sort as text out of segment order (segment10 before segment2).
+// The replayed program's run start still comes from its oldest segment, so a
+// late-starting run's timers fire at the deadlines they fired at live, and it
+// is fed every receipt of every segment at the drain that delivered it.
+// REQ-OPS-14
+TEST(InputReplay, ARunWhoseLogRotatedPastTenSegmentsKeepsItsTimeline) {
+  const std::string dir = TempDir("rotated_eleven");
+  const std::string out = TempDir("rotated_eleven_out");
+  RecordLateConsumer(dir);
+  const std::string path = dir + "/consumer.tlog";
+  std::size_t receipts = 0;
+  {
+    log::LogReader reader{path};
+    log::LogReader::Record record;
+    while (reader.next(record)) {
+      if (record.header.kind ==
+          static_cast<std::uint16_t>(EventKind::MESSAGE)) {
+        ++receipts;
+      }
+    }
+  }
+  const std::vector<Sent> live = Sends(path);
+  std::vector<MonotonicTime> cuts;
+  cuts.reserve(11);
+  for (int k = 0; k < 11; ++k) {
+    cuts.push_back(kOrigin + 10ms + std::chrono::milliseconds{4 * k});
+  }
+  RotateAt(path, cuts);
+  ASSERT_TRUE(std::filesystem::exists(log::LogSegmentPath(path, 10)));
+
+  const RecordedSession session{dir, "consumer"};
+  EXPECT_EQ((session.run_start() - kOrigin).count(),
+            std::chrono::nanoseconds{kLateRun}.count());
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+            Loop::Options{.start = session.loop_start(),
+                          .run_start = session.run_start()}};
+  TestRobot<Loop> consumer{loop, kTopics, kGain};
+  consumer.control_timer().setup_periodic(kOrigin + 1ms, 1ms);
+  const InputReplayReport report = ReplayInputs(loop, environment, session);
+  EXPECT_FALSE(report.stopped_at_gap.has_value());
+  std::size_t fed = 0;
+  for (const InputReplayReport::Fed& topic : report.fed) fed += topic.messages;
+  EXPECT_EQ(fed, receipts);
+  EXPECT_EQ(Sends(out + "/consumer.tlog"), live);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
+}
+
+// Closes this process's descriptor of the file at `path`, as a disk that
+// refuses every later write leaves its writer.
+bool CloseLogDescriptor(const std::string& path) {
+  struct stat target {};
+  if (::stat(path.c_str(), &target) != 0) return false;
+  const auto limit = ::sysconf(_SC_OPEN_MAX);
+  for (int fd = 0; fd < limit; ++fd) {
+    struct stat candidate {};
+    if (::fstat(fd, &candidate) == 0 && candidate.st_dev == target.st_dev &&
+        candidate.st_ino == target.st_ino) {
+      return ::close(fd) == 0;
+    }
+  }
+  return false;
+}
+
+// A recorder whose disk fails ends capture for good with no GAP record, so
+// its log holds neither the records after the failure nor its EXIT, and the
+// launcher marks its member recorder_failed without log_gap. Input replay
+// refuses, before anything runs, to feed a watched topic from such a log,
+// naming it and the sign, as it does a log_gap member's run cut short.
+// REQ-OPS-14
+TEST(InputReplay, RefusesALogWhoseRecorderFailedBeforeItsExit) {
+  const std::string dir = TempDir("recorder_failed");
+  const std::string out = TempDir("recorder_failed_out");
+  const std::string path = dir + "/reader.tlog";
+  {
+    log::LogWriter writer{path, "reader",
+                          log::LogWriterOptions{.background = false}};
+    writer.start(ManifestOf<SensorWatcher>(dir + "/unused.tlog"), kOrigin);
+    for (int i = 1; i <= 4; ++i) {
+      if (i == 3) {
+        writer.flush();
+        ASSERT_TRUE(CloseLogDescriptor(path));
+      }
+      const EventsTest::SensorMessage reading{i, 1.0F, 1.0F};
+      writer.dispatch(
+          Context{.kind = EventKind::MESSAGE,
+                  .source_id = 0,
+                  .dispatch_index = static_cast<std::uint64_t>(i),
+                  .event_time = kOrigin + std::chrono::milliseconds{i},
+                  .now = kOrigin + std::chrono::milliseconds{i},
+                  .publish_time = kOrigin + std::chrono::milliseconds{i},
+                  .sequence = static_cast<std::uint64_t>(i)},
+          std::as_bytes(std::span{&reading, 1}));
+    }
+    writer.finish(Context{.kind = EventKind::EXIT,
+                          .dispatch_index = 5,
+                          .event_time = kOrigin + 5ms,
+                          .now = kOrigin + 5ms});
+    writer.flush();
+    ASSERT_TRUE(writer.failed());
+    EXPECT_EQ(writer.gaps(), 0u);
+  }
+  // What the failed recorder left: the two readings before the failure.
+  std::size_t receipts = 0;
+  {
+    log::LogReader reader{path};
+    log::LogReader::Record record;
+    while (reader.next(record)) {
+      const auto kind = static_cast<EventKind>(record.header.kind);
+      EXPECT_FALSE(log::GapOf(record.header, record.payload).has_value());
+      EXPECT_NE(kind, EventKind::EXIT);
+      if (kind == EventKind::MESSAGE) ++receipts;
+    }
+  }
+  EXPECT_EQ(receipts, 2u);
+  std::ofstream{dir + "/manifest.json"}
+      << "{\"session_id\": " << log::LogReader{path}.session_id()
+      << ", \"nodes\": [{\"name\": \"reader\", \"log_paths\": "
+         "[\"/robot/logs/7/reader.tlog\"], \"recorder_failed\": true, "
+         "\"log_gap\": false, \"log_capped\": false}]}\n";
+
+  const RecordedSession session{dir};
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/watcher.tlog", "watcher"},
+            Loop::Options{.start = session.start()}};
+  SensorWatcher watcher{loop};
+  try {
+    ReplayInputs(loop, environment, session);
+    ADD_FAILURE() << "fed from a log whose recorder failed before its EXIT";
+  } catch (const ReplayError& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find(path), std::string::npos) << what;
+    EXPECT_NE(what.find("recorder_failed"), std::string::npos) << what;
+  }
+  EXPECT_EQ(watcher.readings, 0);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
 }
 
 }  // namespace

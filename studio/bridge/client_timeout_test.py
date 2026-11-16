@@ -13,7 +13,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from integration_test import TEXT, bound_port, fast_slots, receive, stop, upgrade
+from bridge_client import TEXT, bound_port, fast_slots, receive, stop, upgrade
 
 # Control frames (RFC 6455 section 5.5).
 PING, PONG = 0x89, 0x8A

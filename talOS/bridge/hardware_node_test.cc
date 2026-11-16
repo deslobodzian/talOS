@@ -15,12 +15,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -41,6 +44,7 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/events/input_replay.h"
+#include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/manifest.h"
@@ -50,6 +54,7 @@
 #include "talOS/hardware/gateway.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/node/allocation_probe.h"
+#include "talOS/process/process.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware {
@@ -414,9 +419,12 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
 // Guards: hardware_node --log records the merged /hw/command, the decoded
 // /hw/state and every /hw/status it publishes, each status SEND with the
 // transport sequence and publication stamp a live reader received for it
-// (what tlog_to_wpilog and input replay match a reader's copy to the
-// bridge's SEND by), its payload the status with the bridge's protocol.
-// REQ-OPS-21
+// (what input replay matches a reader's copy to the bridge's SEND by),
+// its payload the status with the bridge's protocol. A run that ends on its
+// own (here at --duration-s) ends the log with an EXIT record, as an event
+// loop's does: input replay judges a log_gap session's log with its EXIT by
+// its GAP records, and refuses one without it.
+// REQ-OPS-21, REQ-OPS-44, REQ-OPS-14
 TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   const std::string base = ::testing::TempDir() + "bridge";
   const std::string config_path = base + ".toml";
@@ -540,8 +548,13 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   bool logged_neutral = false;
   bool logged_state = false;
   std::vector<std::pair<uint64_t, int64_t>> statuses_logged;
+  std::optional<event::EventKind> last_kind;
   event::log::LogReader::Record record;
   while (reader.next(record)) {
+    const auto kind = static_cast<event::EventKind>(record.header.kind);
+    ASSERT_NE(last_kind, event::EventKind::EXIT) << "a record after the EXIT";
+    last_kind = kind;
+    if (kind == event::EventKind::EXIT) continue;
     ASSERT_LT(record.header.source_id, reader.manifest().size());
     const auto& source = reader.manifest()[record.header.source_id];
     if (source.name == bridge::topics::kStatus) {
@@ -585,6 +598,8 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   EXPECT_TRUE(logged_neutral);
   EXPECT_TRUE(logged_state);
   EXPECT_EQ(statuses_logged, statuses_seen);
+  EXPECT_EQ(last_kind, event::EventKind::EXIT)
+      << "the log of a run that ended on its own has no EXIT record";
 }
 
 // A config that declares itself for simulation only (here
@@ -1596,6 +1611,136 @@ std::int64_t BridgeHeartbeat(const introspect::RegistryReader& reader) {
     heartbeat_ns = row.heartbeat_monotonic_ns;
   }
   return heartbeat_ns;
+}
+
+}  // namespace
+
+// node.cc: tests only, applied to the options of the bridge's --log, and
+// whether its full registry sample copies the log's flags.
+extern std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+extern bool copy_log_flags_for_test;
+
+namespace {
+
+// Whether this process's newest bridge row in the live registry has
+// kFlagLogGap.
+bool BridgeHasLogGap(const introspect::RegistryReader& reader) {
+  bool gap = false;
+  std::uint64_t generation = 0;
+  for (const auto& row : reader.nodes()) {
+    if (row.name != kNodeName ||
+        row.pid != static_cast<std::uint64_t>(getpid()) ||
+        row.generation < generation)
+      continue;
+    generation = row.generation;
+    gap = row.log_gap();
+  }
+  return gap;
+}
+
+// A bridge with a --log whose writer is held before its first write, so
+// its two chunks (each sized for the largest record, a hardware packet)
+// fill with /hw/status records and the log opens a gap; its full registry
+// samples copy no log flag meanwhile, so the row's kFlagLogGap can only be
+// the writer's. Release() lets the writer go.
+struct HeldBridgeLog {
+  HeldBridgeLog() {
+    copy_log_flags_for_test = false;
+    log_options_for_test = [this](event::log::LogWriterOptions& options) {
+      options.chunk_bytes = 1;
+      options.chunk_count = kChunks;
+      options.before_write = [this] { released.wait(false); };
+    };
+  }
+  ~HeldBridgeLog() {
+    Release();
+    log_options_for_test = nullptr;
+    copy_log_flags_for_test = true;
+  }
+  HeldBridgeLog(const HeldBridgeLog&) = delete;
+  HeldBridgeLog& operator=(const HeldBridgeLog&) = delete;
+  void Release() {
+    released.store(true);
+    released.notify_all();
+  }
+  static constexpr std::size_t kChunks = 2;
+  std::atomic<bool> released{false};
+};
+
+// The /hw/status publications that fill a held HeldBridgeLog's pool and open
+// a gap, from the record sizes: each chunk is sized for the largest record
+// (LogWriter::start), a hardware packet's, and holds whole status records.
+constexpr std::size_t kStatusesToOpenAGap = [] {
+  const std::size_t chunk =
+      std::max({sizeof(event::log::RecordHeader) + sizeof(Packet),
+                sizeof(event::log::RecordHeader) + sizeof(bridge::BridgeStatus),
+                event::log::GAP_RECORD_BYTES});
+  const std::size_t status =
+      sizeof(event::log::RecordHeader) + sizeof(bridge::BridgeStatus);
+  return HeldBridgeLog::kChunks * (chunk / status) + 1;
+}();
+
+// Passes from `start_us` every 5 ms until the bridge's row shows a log gap,
+// or for twice the time a held log's pool takes to fill with /hw/status
+// (one every 20 ms). Returns whether the row showed it.
+bool PassUntilTheRowShowsAGap(HardwareNode& node, uint64_t start_us,
+                              const introspect::RegistryReader& reader) {
+  const uint64_t end_us = start_us + 2 * kStatusesToOpenAGap * 20'000;
+  for (uint64_t now_us = start_us; now_us < end_us; now_us += 5'000) {
+    node.Pass(now_us);
+    if (BridgeHasLogGap(reader)) return true;
+  }
+  return false;
+}
+
+// The bridge's registry row says its log has a gap as the gap opens, not
+// at its next full registry sample: a bridge killed in between is still
+// marked log_gap. /hw/status records, one every 20 ms, fill the held
+// writer's pool.
+// REQ-OPS-52
+TEST(HardwareNodeTest, ItsRowHasTheLogGapBitAsTheGapOpens) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const std::string log_path = ::testing::TempDir() + "/bridge_row_gap_" +
+                               std::to_string(getpid()) + ".tlog";
+  Link link;  // destroyed after `held` lets its writer go
+  HeldBridgeLog held;
+  ASSERT_TRUE(link.Open(cfg, true, log_path, 51));
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_TRUE(PassUntilTheRowShowsAGap(*link.node, 1'000'000, *reader))
+      << "no kFlagLogGap in the bridge's row once its pool filled";
+  held.Release();
+  link.node.reset();
+  std::filesystem::remove(log_path);
+}
+
+// A bridge run whose own --log has a gap exits 1 when stopped, as a node
+// does (Run()'s incomplete() call), and says recording_gaps=1. The writer
+// is held until the gap opens, then released before the stop, so no second
+// gap can open.
+// REQ-OPS-52
+TEST(HardwareNodeTest, ARunWhoseOwnLogHasAGapExits1) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const std::string log_path = ::testing::TempDir() + "/bridge_exit_gap_" +
+                               std::to_string(getpid()) + ".tlog";
+  Link link;  // destroyed after `held` lets its writer go
+  HeldBridgeLog held;
+  ASSERT_TRUE(link.Open(cfg, true, log_path, 52));
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
+  ASSERT_TRUE(PassUntilTheRowShowsAGap(*link.node, 1'000'000, *reader));
+  held.Release();
+  // Stopped before its first wait: it exits through the summary at once,
+  // having reached no duration of its own.
+  process::stop_requested.store(true);
+  ::testing::internal::CaptureStdout();
+  const int status = link.node->Run();
+  const std::string output = ::testing::internal::GetCapturedStdout();
+  process::stop_requested.store(false);
+  EXPECT_EQ(status, 1) << output;
+  EXPECT_NE(output.find("recording_gaps=1 "), std::string::npos) << output;
+  link.node.reset();
+  std::filesystem::remove(log_path);
 }
 
 // The registry's liveness sample (heartbeat and dispatch count, which the

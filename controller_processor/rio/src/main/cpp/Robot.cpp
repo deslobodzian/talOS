@@ -14,6 +14,7 @@
 
 #include "ConfigStore.h"
 #include "DriverStationReader.h"
+#include "LoopConsole.h"
 #include "LoopSchedule.h"
 #include "PhoenixBackend.h"
 #include "RioBuild.h"
@@ -57,8 +58,9 @@ constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
 constexpr const char* kConfigPath = "talos_config.bin";
 #endif
 
-// RioLog kMessage indices (rate-limit keys) of this file's reports; 0, 7 and
-// 8 are PhoenixBackend's (configure failure, CAN bus status, CAN bus reader).
+// RioLog kMessage indices (rate-limit keys) of this file's reports; 0, 7, 8
+// and 16 to 31 are PhoenixBackend's (configure failure, CAN bus status, CAN
+// bus reader, licence refusals), 9 and up LoopConsole's.
 constexpr uint16_t kSocketMessage = 1;
 constexpr uint16_t kPersistMessage = 2;
 constexpr uint16_t kSocketOpenMessage = 3;
@@ -213,6 +215,8 @@ class RioWatchdogOutputs final : public talos::rio::WatchdogOutputs {
     std::snprintf(details, sizeof(details), "%.*s",
                   static_cast<int>(text.size()), text.data());
     // printMsg also copies it to the console (the RoboRIO's netconsole log).
+    // A NetComm round trip: on the watchdog's reporter thread, at the default
+    // scheduling, never on its SCHED_FIFO thread (LoopWatchdog.h).
     HAL_SendError(1, 1, 0, details, "talos loop watchdog", "", 1);
   }
 
@@ -284,8 +288,16 @@ void Robot::StartCompetition() {
   companion_ =
       std::make_unique<talos::rio::CompanionReporter>(*companion_sink_);
   companion_->Start();
-  endpoint_->OnConfigured([&persister](const talos::hardware::Config& config) {
+#ifndef __FRC_ROBORIO__
+  // Desktop simulation: the simulated Driver Station starts only on a push
+  // acknowledged in this boot, never on the restore (SimDriverStation.h).
+  bool push_acknowledged = false;
+#endif
+  endpoint_->OnConfigured([&](const talos::hardware::Config& config) {
     persister.Acknowledged(config);
+#ifndef __FRC_ROBORIO__
+    push_acknowledged = true;
+#endif
   });
 
   // Opened from the loop, retried every SocketRetry::kPeriodUs until the
@@ -355,6 +367,9 @@ void Robot::StartCompetition() {
   // the reader's thread.
   talos::driver_station::ModeTracker ds_mode;
 
+  // Posts the loop's findings no State carries to the logger (LoopConsole.h).
+  talos::rio::LoopConsole loop_console{*log_};
+
   // Tick starts, so the logger can report a loop woken late (starved of the
   // CPU) even when each tick's own work is short.
   std::optional<uint64_t> previous_tick_start_us;
@@ -377,6 +392,7 @@ void Robot::StartCompetition() {
     next_us += period_us;
 
 #ifndef __FRC_ROBORIO__
+    if (push_acknowledged) simulated_driver_station.ConfigurationAcknowledged();
     simulated_driver_station.Update(std::chrono::steady_clock::now(),
                                     gateway_->configured());
     if (stop_at && std::chrono::steady_clock::now() >= *stop_at) {
@@ -505,7 +521,16 @@ void Robot::StartCompetition() {
           now_us, (mode_flags & talos::driver_station::kEnabled) != 0 &&
                       (mode_flags & talos::driver_station::kEStop) == 0));
       // The socket retry and the endpoint's tick.
-      log_->ClosePhase(TickPhase::kLink, NowNs());
+      const uint64_t ticked_ns = NowNs();
+      log_->ClosePhase(TickPhase::kLink, ticked_ns);
+      // The age of the drained command's observation at the end of the tick
+      // that drained it, on this clock: observed_time_us is the
+      // sample_time_us of a State this gateway sent (REQ-RT-25). RioLog drops
+      // a difference that wrapped (an observation in this clock's future).
+      if (const auto& drained = endpoint_->drained(); drained.present) {
+        log_->RecordCommandAge(ticked_ns / 1000 - drained.observed_time_us,
+                               drained.accepted);
+      }
 
       // The Driver Station only produces new data at 50 Hz, so sampling it on
       // every hardware tick would put three duplicate packets on the link, and
@@ -533,9 +558,19 @@ void Robot::StartCompetition() {
         const auto ds_size = talos::driver_station::Encode(ds, ds_buffer);
         log_->ClosePhase(TickPhase::kDriverStation, NowNs());
         if (ds_size) {
-          sent(endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
-                                    now_us, ds_buffer.data(), ds_size));
-          log_->ClosePhase(TickPhase::kLink, NowNs());
+          const auto ds_status =
+              endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
+                                   now_us, ds_buffer.data(), ds_size);
+          sent(ds_status);
+          const uint64_t ds_sent_ns = NowNs();
+          log_->ClosePhase(TickPhase::kLink, ds_sent_ns);
+          // The sent snapshot's refresh age at its send (REQ-RT-25); none
+          // for the neutral snapshot, which no refresh made.
+          if (ds_status == talos::protocol::UdpStatus::kOk &&
+              driver_station.refreshed_us() != 0) {
+            log_->RecordDriverStationAge(ds_sent_ns / 1000 -
+                                         driver_station.refreshed_us());
+          }
         }
       }
     } else {
@@ -544,6 +579,11 @@ void Robot::StartCompetition() {
       log_->ClosePhase(TickPhase::kLink, NowNs());
     }
 
+    // A console line for each command expiry this tick found (no State
+    // reaches the main processor when its loss caused the expiry) and each
+    // changed configuration it refused while enabled.
+    loop_console.ObserveGateway(*gateway_);
+
     // Arms the watchdog only while a command is in force (a tick without one
     // neutralized every output itself), with the time by which this loop's
     // next tick would have invalidated it and beaten again: the gateway's
@@ -551,6 +591,9 @@ void Robot::StartCompetition() {
     // tick's own work before its beat, so an on-time loop is never acted on.
     const uint64_t expiry_us = gateway_->command_expiry_us();
     watchdog_->Beat(now_us, expiry_us == 0 ? 0 : expiry_us + 2 * period_us);
+    // A stall report the watchdog dropped is a stall with no Driver Station
+    // error: the console says so.
+    loop_console.ObserveWatchdog(*watchdog_);
 
     // What the endpoint last heard, for the drive team's link report; atomic
     // stores only, the reporter thread does the publishing.
@@ -604,7 +647,7 @@ void Robot::StartCompetition() {
 
   // Only after the outputs are neutral: a save handed over finishes first
   // (the file stays whole either way), and its wait must not hold them. One
-  // still waiting for a disabled tick is dropped; it was never handed over.
+  // still waiting for a disabled tick is saved too: the loop has stopped.
   persister.Stop();
   if (persister.Tick(false) > 0) {
     Report(*log_, kPersistMessage, "cannot persist hardware configuration");

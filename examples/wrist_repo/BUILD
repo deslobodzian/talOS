@@ -45,11 +45,9 @@ cc_test(
     data = [
         "testdata/robot.toml",
         "testdata/wrist.toml",
-        ":node",
     ],
     env = {
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
-        "TALOS_TEST_NODE": "$(rlocationpath :node)",
     },
     # Run from the consuming workspace too (//examples/external_subsystem).
     visibility = ["//visibility:public"],

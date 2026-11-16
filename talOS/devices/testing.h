@@ -38,14 +38,13 @@
 // sample reads invalid while its master's does. An invalid motor or CAN
 // sensor sample carries zero position, velocity, voltage and stator and
 // supply current (hardware::MarkInvalid). As on the gateway, a State in which
-// every motor and CAN sensor sample the RoboRIO reports is invalid
-// (disconnected, too old, or a motor of a chain reset_device() is restoring)
-// carries kHardwareFault (so robot_enabled() is false) and, the first time,
-// starts a new epoch with every output neutral, digital and PWM included;
-// requests are refused until a State shows valid feedback again, which
-// clears the fault in that epoch. Like the gateway, it judges this before
-// masking a follower of an invalid master or a reset CANcoder, so a sample
-// only those masks invalidate still counts as feedback.
+// every motor and CAN sensor sample is invalid as published (disconnected, too
+// old, masked by reset_device(), or a follower of an invalid master) carries
+// kHardwareFault (so robot_enabled() is false) and, the first time, starts a
+// new epoch with every output neutral, digital and PWM included; requests are
+// refused until a State shows valid feedback again, which clears the fault in
+// that epoch. So reset_device() on every motor and CAN sensor is total loss
+// for the two States it masks them.
 // Unlike the gateway, enabling or disabling does not start a new epoch, and
 // requests are not checked against the config id, motor limits or soft
 // limits.
@@ -131,8 +130,12 @@ class SimHardware {
   // period or more makes the next states no newer than the last, dropped as
   // on a robot. Throws for negative latency or a gateway clock before 0.
   void set_gateway_clock(Duration gateway_offset, Duration latency);
-  // A disconnected device keeps its slot in /hw/state with valid == false
-  // and zero values, so its handle reads connected() == false. Every device
+  // A disconnected device keeps its slot in /hw/state with valid == false,
+  // so its handle reads connected() == false. A motor or CAN sensor carries
+  // what the gateway publishes for a device that stopped answering
+  // (hardware::MarkInvalid of its last readings: ages and temperature kept,
+  // every measurement zero, limit switches released); any other device
+  // carries zero values. Every device
   // of that node named `device` is affected, whatever its kind; an unknown
   // name throws std::invalid_argument.
   void set_connected(std::string_view node, std::string_view device,

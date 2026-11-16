@@ -119,11 +119,15 @@ class CheckNodeMatrixTest(unittest.TestCase):
             body + "// matrix: n/a 9, 12\n", "cpp", "observer")
         self.assertEqual(sorted(missing(result)), [9, 12])
 
+    # REQ-CONTRACT-14 (a parity claim stands for a C++ case only when the
+    # Python node really runs that step)
     def test_a_parity_claim_holds_only_with_its_run_cpp_case_and_steps(self):
         # A Python twin may cover a case by its talos.parity scenario only
         # when the file runs one, the C++ test carries the case, and the
-        # steps it names are in the scenario; otherwise the lint fails
-        # naming the case, so a case cannot be dropped by a bare comment.
+        # steps it names are in the scenario its test passes (names resolved
+        # in the calling function first) and that test is not skipped;
+        # otherwise the lint fails naming the case, so a case cannot be
+        # dropped by a bare comment.
         cpp = "TEST_F(ArmTest, StaleLaneGoesNeutral) {}\n"
         run = ('SCENARIO = [\n    ("stale lane", wait(0.2)),\n]\n'
                "def test_parity():\n"
@@ -136,6 +140,23 @@ class CheckNodeMatrixTest(unittest.TestCase):
 
         _, result = check_node_matrix.check(
             claim + run, "py", "actuator", sibling({"node_test.cc": cpp}))
+        self.assertEqual(result[3][0], "parity")
+        # A test's own scenario is the one its call runs.
+        local = run.replace('("stale lane"', '("other"', 1).replace(
+            "    parity.assert_same",
+            '    SCENARIO = [("stale lane", wait(0.2))]\n'
+            "    parity.assert_same")
+        _, result = check_node_matrix.check(
+            claim + local, "py", "actuator", sibling({"node_test.cc": cpp}))
+        self.assertEqual(result[3][0], "parity")
+        # A second run on a scenario built from the first (the same steps at
+        # another period) counts no steps of its own but refuses nothing.
+        derived = run + (
+            "def test_parity_slow():\n"
+            "    slow = [(name, *a, wait(0.01)) for name, *a in SCENARIO]\n"
+            "    parity.assert_same_behaviour(Cpp, Py, SLOW, \"arm\", slow)\n")
+        _, result = check_node_matrix.check(
+            claim + derived, "py", "actuator", sibling({"node_test.cc": cpp}))
         self.assertEqual(result[3][0], "parity")
         for why, text, files in (
                 ("no parity run", claim + run.split("def test_parity")[0],
@@ -155,6 +176,37 @@ class CheckNodeMatrixTest(unittest.TestCase):
                  {"node_test.cc": cpp}),
                 ("construction cannot be compared",
                  claim.replace("parity 3", "parity 9") + run,
+                 {"node_test.cc": cpp}),
+                # The run that names the step never runs.
+                ("skipped test",
+                 claim + run.replace("def test_parity",
+                                     '@unittest.skip("later")\n'
+                                     "def test_parity"),
+                 {"node_test.cc": cpp}),
+                ("skipped class",
+                 claim + run.split("def test_parity")[0]
+                 + '@unittest.skipIf(True, "later")\n'
+                 + "class ParityTest(unittest.TestCase):\n"
+                 + "  def test_parity(self):\n"
+                 + "    parity.assert_same_behaviour(Cpp, Py, CONFIG, "
+                 + '"arm", SCENARIO)\n',
+                 {"node_test.cc": cpp}),
+                ("skipTest in the test",
+                 claim + run.replace("    parity.assert_same",
+                                     '    self.skipTest("later")\n'
+                                     "    parity.assert_same"),
+                 {"node_test.cc": cpp}),
+                # The test passes its own SCENARIO, which has no such step.
+                ("function-local scenario shadows the module's",
+                 claim + run.replace(
+                     "    parity.assert_same",
+                     '    SCENARIO = [("other", wait(0.2))]\n'
+                     "    parity.assert_same"),
+                 {"node_test.cc": cpp}),
+                # A helper's scenario is its parameter, not the module's.
+                ("scenario is a parameter",
+                 claim + run.replace("def test_parity():",
+                                     "def run(SCENARIO):"),
                  {"node_test.cc": cpp})):
             with self.subTest(why), self.assertRaisesRegex(
                     check_node_matrix.MatrixError, r"parity [39]:"):

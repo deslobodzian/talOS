@@ -58,6 +58,28 @@ class ParityTest(unittest.TestCase):
         self.assertIn(TOPIC, message)
         self.assertIn("tick 3", message)
 
+    # REQ-CONTRACT-14: an action that moves the clock other than through
+    # Rig.advance skips the ticks it crosses, so the run fails that step
+    # rather than compare only its end (where these two nodes agree), also
+    # when the action advances through the rig afterwards.
+    def test_a_step_that_moves_the_clock_itself_fails(self):
+        def step_then_advance(rig):
+            rig.sim.step(0.05)
+            rig.advance(0.01)
+
+        for name, action in (("sim.step", lambda rig: rig.sim.step(0.05)),
+                             ("sim.step, then advance", step_then_advance)):
+            with self.subTest(name):
+                with self.assertRaises(AssertionError) as raised:
+                    parity.assert_same_behaviour(
+                        Steady, Glitch, _config(), "arm",
+                        [("warm up", parity.wait(0.005)),
+                         ("own step", action)],
+                        topics=[(Status, TOPIC)])
+                message = str(raised.exception)
+                self.assertIn("'own step'", message)
+                self.assertIn("Rig.advance", message)
+
 
 if __name__ == "__main__":
     unittest.main()

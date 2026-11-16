@@ -53,12 +53,24 @@ class ReplayDivergence : public std::runtime_error {
 //
 // It never crosses a GAP record (log/format.h), where the writer dropped
 // records: it replays every dispatch before the gap's first dropped dispatch
-// (none of a dispatch the gap split) and stops, as at the end of a truncated
-// log, with stopped_at_gap() naming the gap. Recording that replay gives the
-// log's records before that dispatch, then the replay's own EXIT. A gap that
-// starts outside any dispatch (sends during construction) stops it before
-// the first dispatch; the program's sends past the gap are refused
-// (SendStatus::FAILED), not reported.
+// (none of a dispatch the gap split) and stops, with stopped_at_gap() naming
+// the gap. Recording that replay gives the log's records before that
+// dispatch, then the replay's own EXIT. A gap that starts outside any
+// dispatch (sends during construction) stops it before the first dispatch;
+// the program's sends past the gap are refused (SendStatus::FAILED), not
+// reported. A log that ends without its EXIT (truncated, its writer killed,
+// or a segment a byte cap rotated out) may end inside its last dispatch, so
+// it is replayed the same way up to that dispatch (ended_in_dispatch()); one
+// with no record at all, or cut during construction, as a gap there.
+//
+// Construction refuses (ReplayError, naming the log) a log with records
+// missing between intact ones, and a log whose first dispatch is not 1: a
+// later segment of a rotated log (LogWriterOptions::max_bytes) starts
+// mid-run, so its dispatches cannot be the program's from its start. run()
+// refuses, naming the log, one whose manifest does not match the program's,
+// before its first dispatch; the program's construction, which registers
+// that manifest, has run by then, and a send it made that differs from the
+// log is already a divergence.
 template <RecorderPolicy Recorder = NullRecorder>
 class ReplayEventLoop
     : public EventLoopBase<ReplayEventLoop<Recorder>, Recorder> {
@@ -120,10 +132,21 @@ class ReplayEventLoop
     return stopped_at_gap_;
   }
 
+  // For a log that ends without its EXIT (cut short, its writer killed, or
+  // rotated out) and before any gap: the dispatch its last record belongs to
+  // (0 for one outside any dispatch, or no record), which the cut may have
+  // split. Every dispatch
+  // before it was replayed; its recorded part was not. Empty for a log that
+  // reached its EXIT or stops at a gap.
+  const std::optional<std::uint64_t>& ended_in_dispatch() const {
+    return ended_in_dispatch_;
+  }
+
   void run() {
     if (const auto mismatch =
             compare_manifests(reader_->manifest(), this->manifest())) {
-      throw ReplayError("log does not match this program: " + *mismatch);
+      throw ReplayError("log " + reader_->path() +
+                        " does not match this program: " + *mismatch);
     }
 
     typename Base::RunScope in_run{*this};
@@ -177,34 +200,55 @@ class ReplayEventLoop
     // is used, so a long replay holds what the file holds, not the padding.
     log::LogReader::Record record{};
     reader.rewind();
+    // The first dispatch the log records (a GAP record names its first
+    // dropped one); 0 while only records outside any dispatch were read.
+    std::uint64_t first_dispatch = 0;
+    bool exit = false;
     while (reader.next(record)) {
+      if (first_dispatch == 0) first_dispatch = record.header.dispatch_index;
       // The log is a hole-free record of the run only up to its first GAP
       // record: replay stops there, and nothing after it is read (or refused
       // as damage).
       stopped_at_gap_ = log::GapOf(record.header, record.payload);
       if (stopped_at_gap_.has_value()) break;
+      exit = static_cast<EventKind>(record.header.kind) == EventKind::EXIT;
       records_.push_back(Recorded{record.header, stored_.size()});
       const auto bytes = record.payload.first(record.header.stored_bytes);
       stored_.insert(stored_.end(), bytes.begin(), bytes.end());
     }
     // Records lost between intact ones would replay as a divergence at best,
     // and at worst as a run the program never made. A damaged tail only
-    // shortens the log, like a truncated one: the prefix still replays.
+    // shortens the log, like a truncated one (below).
     if (reader.damage().spans != 0) {
-      throw ReplayError("log is missing damaged records (" +
+      throw ReplayError("log " + reader.path() +
+                        " is missing damaged records (" +
                         log::DescribeDamage(reader.damage()) +
                         "); exact replay needs every record");
     }
+    // A later segment of a rotated log: the run's start, and whatever the
+    // program's state came from, is not in it.
+    if (first_dispatch > 1) {
+      throw ReplayError("log " + reader.path() + " starts at dispatch " +
+                        std::to_string(first_dispatch) +
+                        ", not 1 (a later segment of a rotated log?); exact "
+                        "replay needs the run from its first dispatch");
+    }
     // The dispatch the gap starts in may have its first records before it
-    // (GAP_SPLITS_DISPATCH): it was not recorded whole, so it is not
+    // (GAP_SPLITS_DISPATCH), and a log that ends without its EXIT may end
+    // inside its last dispatch: neither was recorded whole, so it is not
     // replayed, and the replay ends on the dispatch boundary before it.
+    std::uint64_t split = 0;
     if (stopped_at_gap_.has_value()) {
-      const std::uint64_t split = stopped_at_gap_->first_dispatch_index;
-      while (split != 0 && !records_.empty() &&
-             records_.back().header.dispatch_index == split) {
-        stored_.resize(records_.back().offset);
-        records_.pop_back();
-      }
+      split = stopped_at_gap_->first_dispatch_index;
+    } else if (!exit) {
+      // A log with no record at all was cut before its first one.
+      split = records_.empty() ? 0 : records_.back().header.dispatch_index;
+      ended_in_dispatch_ = split;
+    }
+    while (split != 0 && !records_.empty() &&
+           records_.back().header.dispatch_index == split) {
+      stored_.resize(records_.back().offset);
+      records_.pop_back();
     }
   }
 
@@ -312,12 +356,13 @@ class ReplayEventLoop
   // Consumes the record a handler operation must correspond to, or reports the
   // mismatch. Returns nullptr when there is nothing usable.
   const Recorded* take(EventKind expected, std::uint16_t source_id) {
-    // A gap that starts outside any dispatch (sends before the first, from
-    // the program's construction) leaves the rest of them unrecorded: they
-    // are past the replayed prefix, not divergences.
+    // A gap that starts, or a log that ends, outside any dispatch (sends
+    // before the first, from the program's construction) leaves the rest of
+    // them unrecorded: they are past the replayed prefix, not divergences.
     if (cursor_ >= records_.size() && active_dispatch_ == 0 &&
-        stopped_at_gap_.has_value() &&
-        stopped_at_gap_->first_dispatch_index == 0) {
+        ((stopped_at_gap_.has_value() &&
+          stopped_at_gap_->first_dispatch_index == 0) ||
+         ended_in_dispatch_ == std::uint64_t{0})) {
       return nullptr;
     }
     if (cursor_ >= records_.size()) {
@@ -379,6 +424,7 @@ class ReplayEventLoop
   MonotonicTime now_{};
   bool reached_exit_{false};
   std::optional<log::LogGap> stopped_at_gap_;
+  std::optional<std::uint64_t> ended_in_dispatch_;
 };
 
 }  // namespace talos::event

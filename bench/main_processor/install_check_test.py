@@ -6,11 +6,13 @@ accepts with a warning installs and shows it; a copy with a misspelled
 parameter is refused with the launcher's own finding, and `current` stays
 on the bundle installed before."""
 
+import getpass
 import os
 import select
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -31,10 +33,13 @@ class InstallCheckTest(unittest.TestCase):
             prefix = os.path.join(tmp, "prefix")
             current = os.path.join(prefix, "current")
 
+            # The graph check is the subject, not the warm-up (warm_up_test's,
+            # and bundle_test's for every real bundle): without it the check
+            # pays each member's first exec itself, about 2 s on macOS.
             def install(bundle, to=prefix):
                 return subprocess.run(
                     ["bash", deploy_script(), "install", bundle,
-                     "--prefix", to],
+                     "--prefix", to, "--no-warm-up"],
                     capture_output=True, text=True, timeout=120)
 
             def shown(proc):
@@ -182,6 +187,92 @@ class InstallCheckTest(unittest.TestCase):
                 self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
                                  [os.path.basename(installed)], out)
 
+    # REQ-OPS-48: a Python node's entry script starts `#!/usr/bin/env
+    # python3`, which the boot service resolves on its own PATH (systemd's
+    # or launchd's default, not the installer's). Install refuses, before
+    # writing anything, a bundle whose interpreter that PATH cannot run,
+    # and installs it once the PATH can.
+    def test_install_refuses_an_interpreter_the_service_cannot_find(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            src = os.path.join(tmp, "bundle")
+            os.makedirs(os.path.join(src, "bin"))
+            with open(os.path.join(src, "run.sh"), "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(os.path.join(src, "run.sh"), 0o755)
+            with open(os.path.join(src, "bin", "vision"), "w",
+                      encoding="utf-8") as f:
+                f.write("#!/usr/bin/env python3\n")
+            os.chmod(os.path.join(src, "bin", "vision"), 0o755)
+            service_bin = os.path.join(tmp, "service_bin")
+            os.makedirs(service_bin)
+            prefix = os.path.join(tmp, "prefix")
+
+            def install():
+                return subprocess.run(
+                    ["bash", deploy_script(), "install", src, "--prefix",
+                     prefix, "--no-warm-up"],
+                    env=dict(os.environ,
+                             TALOS_DEPLOY_SERVICE_PATH=service_bin),
+                    capture_output=True, text=True, timeout=60)
+
+            proc = install()
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("python3", out)
+            self.assertIn("bin/vision", out)
+            self.assertIn(service_bin, out)
+            self.assertFalse(os.path.lexists(prefix), out)
+            os.symlink(os.path.realpath(sys.executable),
+                       os.path.join(service_bin, "python3"))
+            proc = install()
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(os.path.islink(os.path.join(prefix, "current")))
+
+    # REQ-OPS-48: enable-boot checks the service account's access to the
+    # bundle with the python3 the boot service's PATH resolves, not the one
+    # on sudo's secure_path. A `sudo` first on PATH runs `-u` commands as
+    # the caller (and refuses the rest, ending the run after the check); the
+    # service PATH's python3 records that it ran.
+    def test_enable_boot_checks_access_with_the_service_python(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            current = os.path.join(tmp, "prefix", "current")
+            os.makedirs(current)
+            with open(os.path.join(current, "run.sh"), "w",
+                      encoding="utf-8") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(os.path.join(current, "run.sh"), 0o755)
+            fake = os.path.join(tmp, "fake")
+            service_bin = os.path.join(tmp, "service_bin")
+            marker = os.path.join(tmp, "service_python_ran")
+            scripts = {
+                os.path.join(fake, "sudo"):
+                    '#!/bin/sh\n[ "$1" = "-u" ] || exit 1\nshift 2\n'
+                    'exec "$@"\n',
+                # macOS's check, before the account's: FileVault is off.
+                os.path.join(fake, "fdesetup"):
+                    "#!/bin/sh\necho 'FileVault is Off.'\n",
+                os.path.join(service_bin, "python3"):
+                    f"#!/bin/sh\necho \"$@\" > '{marker}'\n"
+                    f"exec '{os.path.realpath(sys.executable)}' \"$@\"\n",
+            }
+            for path, text in scripts.items():
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.chmod(path, 0o755)
+            proc = subprocess.run(
+                ["bash", deploy_script(), "enable-boot", "--prefix",
+                 os.path.join(tmp, "prefix"), "--user",
+                 getpass.getuser()],
+                env=dict(os.environ, TALOS_DEPLOY_SERVICE_PATH=service_bin,
+                         PATH=fake + os.pathsep + os.environ["PATH"]),
+                capture_output=True, text=True, timeout=60)
+            out = proc.stdout + proc.stderr
+            self.assertTrue(os.path.exists(marker), out)
+            with open(marker, encoding="utf-8") as f:
+                self.assertIn(current, f.read(), out)
+            self.assertNotIn("service account cannot", out)
+
     # REQ-OPS-48: a stop during install's copy (Ctrl-C, SIGTERM, SIGHUP to
     # deploy.sh) stops the copy's processes and removes the partial copy,
     # so no stray bundles/<stamp> is left for prune to count among the
@@ -235,6 +326,47 @@ class InstallCheckTest(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError,
                                        msg="the copy outlived deploy.sh"):
                     os.kill(copier, 0)
+
+    # REQ-OPS-48: an install that fails after its copy, before it selects,
+    # removes the copy as a refused bundle does, so no stray bundles/<stamp>
+    # is left for prune to count: a copy whose run.sh is not executable (a
+    # `cp` first on PATH copies, then clears it), and a graph check that
+    # cannot create its temporary directory (a failing `mktemp`).
+    def test_an_install_failing_after_its_copy_removes_it(self):
+        real_cp = shutil.which("cp")
+        fakes = {
+            "run_sh": ("cp", f'#!/bin/sh\n"{real_cp}" "$@" || exit\n'
+                       'chmod a-x "$3/run.sh"\n'),
+            "mktemp": ("mktemp", "#!/bin/sh\nexit 1\n"),
+        }
+        for case, (program, script) in fakes.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                    ignore_cleanup_errors=True) as tmp:
+                src = os.path.join(tmp, "bundle")
+                os.makedirs(src)
+                with open(os.path.join(src, "run.sh"), "w",
+                          encoding="utf-8") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(os.path.join(src, "run.sh"), 0o755)
+                fake = os.path.join(tmp, "fake")
+                os.makedirs(fake)
+                with open(os.path.join(fake, program), "w",
+                          encoding="utf-8") as f:
+                    f.write(script)
+                os.chmod(os.path.join(fake, program), 0o755)
+                prefix = os.path.join(tmp, "prefix")
+                proc = subprocess.run(
+                    ["bash", deploy_script(), "install", src, "--prefix",
+                     prefix, "--no-warm-up"],
+                    env=dict(os.environ,
+                             PATH=fake + os.pathsep + os.environ["PATH"]),
+                    capture_output=True, text=True, timeout=60)
+                out = proc.stdout + proc.stderr
+                self.assertNotEqual(proc.returncode, 0, out)
+                self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
+                                 [], out)
+                self.assertFalse(os.path.lexists(
+                    os.path.join(prefix, "current")), out)
 
 
 if __name__ == "__main__":

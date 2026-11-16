@@ -1,37 +1,32 @@
 #include "gateway.h"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
 #include <gtest/gtest.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
-#include <chrono>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
-#include <map>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include "config_wire.h"
-#include "endpoint.h"
+#include "gateway_test_support.h"
 #include "sim_backend.h"
 #include "sim_physics.h"
+#include "talOS/protocol/frame.h"
 
 namespace talos::hardware {
 namespace {
+
+using namespace gateway_test;  // NOLINT(google-build-using-namespace)
 
 TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   State state;
@@ -197,7 +192,8 @@ TEST(Messages, MotorDiagnosticsUseSaturatingSignedTenths) {
 
 // A Command the main processor and the RoboRIO agree on byte for byte,
 // whatever either host's byte order: every integer and IEEE 754 double
-// little-endian, no padding.
+// little-endian, no padding. Each device count differs from the others, so
+// two counts written in each other's places fail.
 // REQ-CONTRACT-03
 TEST(Messages, CommandIsLittleEndianOnTheWire) {
   Command command;
@@ -207,23 +203,29 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
   command.observed_time_us = 0x3132333435363738ull;
   command.count = 1;
   command.motors[0] = {0x0102, Mode::kVoltage, 1, 1.0, -2.0};
-  command.digital_output_count = 1;
+  command.digital_output_count = 2;
   command.digital_outputs[0] = {0x0304, true};
-  command.pwm_output_count = 1;
+  command.digital_outputs[1] = {0x0305, false};
+  command.pwm_output_count = 3;
   command.pwm_outputs[0] = {0x0506, PwmMode::kPulse, 0.5};
+  command.pwm_outputs[1] = {0x0507, PwmMode::kOff, 0.0};
+  command.pwm_outputs[2] = {0x0508, PwmMode::kPulse, -1.0};
   const std::vector<uint8_t> expected{
       0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,   // config_id
       0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,   // boot_id
       0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,   // epoch
       0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,   // observed_time_us
-      1,    0,    1,    0,    1,    0,                  // counts
+      1,    0,    2,    0,    3,    0,                  // counts
       0x02, 0x01, 2,    1,                              // motor id, mode, slot
       0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // demand 1.0
       0,    0,    0,    0,    0,    0,    0,    0xC0,   // feedforward_v -2.0
-      0x04, 0x03, 1,                                    // digital output
-      0x06, 0x05,                                       // pwm id
-      1,                                                // pwm mode pulse
-      0,    0,    0,    0,    0,    0,    0xE0, 0x3F};  // pwm output 0.5
+      0x04, 0x03, 1,    0x05, 0x03, 0,                  // digital outputs
+      0x06, 0x05, 1,                                    // pwm id, pulse
+      0,    0,    0,    0,    0,    0,    0xE0, 0x3F,   // output 0.5
+      0x07, 0x05, 0,                                    // pwm id, off
+      0,    0,    0,    0,    0,    0,    0,    0,      // output +0.0
+      0x08, 0x05, 1,                                    // pwm id, pulse
+      0,    0,    0,    0,    0,    0,    0xF0, 0xBF};  // output -1.0
   std::array<uint8_t, kMaxCommandSize> bytes{};
   const auto size = Encode(command, bytes);
   ASSERT_EQ(size, expected.size());
@@ -236,9 +238,9 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
 // A PWM request is off (no pulse) or a pulse, and off has one byte string:
 // mode 0 and output +0.0. A pulse of 0 (the 1.5 ms centre, which centres a
 // servo) and off both round-trip as sent, never one for the other. A mode
-// byte above kLastPwmMode, or an off request whose output bytes are not all
-// zero (-0.0 included), neither encodes nor decodes: a peer reading such
-// bytes cannot know which of the two was meant.
+// above kLastPwmMode neither encodes nor decodes, and an off request whose
+// output bytes are not all zero (-0.0 included) does not decode: a peer
+// reading such bytes cannot know which of the two was meant.
 // REQ-SAFE-03, REQ-CONTRACT-03
 TEST(Messages, PwmRequestIsOffOrAPulseAndOffHasOneEncoding) {
   Command command;
@@ -258,30 +260,55 @@ TEST(Messages, PwmRequestIsOffOrAPulseAndOffHasOneEncoding) {
   const std::size_t output_at = mode_at + 1;
   const struct {
     const char* label;
-    PwmRequest request;
     std::size_t byte;
     uint8_t value;
   } rows[] = {
-      {"mode 2", {0x0506, static_cast<PwmMode>(2), 0.0}, mode_at, 2},
-      {"mode 255", {0x0506, static_cast<PwmMode>(255), 0.0}, mode_at, 255},
-      {"off with a nonzero output",
-       {0x0506, PwmMode::kOff, 0.5},
-       output_at + 7,
-       0x3F},
-      {"off with output -0.0",
-       {0x0506, PwmMode::kOff, -0.0},
-       output_at + 7,
-       0x80},
+      {"mode 2", mode_at, 2},
+      {"mode 255", mode_at, 255},
+      {"off with a nonzero output", output_at + 7, 0x3F},
+      {"off with output -0.0", output_at + 7, 0x80},
   };
   for (const auto& row : rows) {
     SCOPED_TRACE(row.label);
-    Command bad = command;
-    bad.pwm_outputs[0] = row.request;
-    std::array<uint8_t, kMaxCommandSize> refused{};
-    EXPECT_EQ(Encode(bad, refused), 0u);
+    if (row.byte == mode_at) {
+      Command bad = command;
+      bad.pwm_outputs[0].mode = static_cast<PwmMode>(row.value);
+      std::array<uint8_t, kMaxCommandSize> refused{};
+      EXPECT_EQ(Encode(bad, refused), 0u);
+    }
     auto corrupted = bytes;
     corrupted[row.byte] = row.value;
     EXPECT_FALSE(Decode(std::span{corrupted}.first(size), decoded));
+  }
+}
+
+// An off PWM request encodes as off, in off's one byte string, whatever its
+// `output` field holds (-0.0, which compares equal to +0.0, a stale pulse
+// value, NaN), and the rest of the Command goes with it: a Command whose
+// encode failed would be skipped whole, dropping every motor demand in it.
+// REQ-SAFE-03
+TEST(Messages, AnOffPwmRequestEncodesAsOffWhateverItsOutput) {
+  Command command;
+  command.count = 1;
+  command.motors[0] = {0x0102, Mode::kVoltage, 0, 3.0, 0.0};
+  command.pwm_output_count = 1;
+  command.pwm_outputs[0] = {0x0506, PwmMode::kOff, 0.0};
+  std::array<uint8_t, kMaxCommandSize> canonical{};
+  const auto size = Encode(command, canonical);
+  ASSERT_EQ(size, kCommandBaseSize + kMotorRequestSize + kPwmRequestSize);
+  for (const double output :
+       {-0.0, 0.5, std::numeric_limits<double>::quiet_NaN()}) {
+    SCOPED_TRACE(output);
+    Command sent = command;
+    sent.pwm_outputs[0].output = output;
+    std::array<uint8_t, kMaxCommandSize> bytes{};
+    ASSERT_EQ(Encode(sent, bytes), size);
+    EXPECT_EQ(bytes, canonical);
+    Command decoded;
+    ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+    EXPECT_EQ(decoded.motors[0], command.motors[0]);
+    EXPECT_EQ(decoded.pwm_outputs[0].mode, PwmMode::kOff);
+    EXPECT_EQ(std::bit_cast<uint64_t>(decoded.pwm_outputs[0].output), 0u);
   }
 }
 
@@ -306,7 +333,10 @@ TEST(Messages, MotorModeRunsToTorqueCurrentAndNoFurther) {
 }
 
 // The State the RoboRIO sends, byte for byte: integers, doubles, the float
-// CAN utilization and the signed-tenths diagnostics all little-endian.
+// CAN utilization and the signed-tenths diagnostics all little-endian. One
+// device of every kind leads its section, with the rest of its count zero
+// samples; each device count differs from the others, so two counts or two
+// sections written in each other's places fail.
 // REQ-CONTRACT-03
 TEST(Messages, StateIsLittleEndianOnTheWire) {
   State state;
@@ -319,7 +349,13 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
   state.sequence = 0x6162636465666768ull;
   state.build = {0x7172737475767778ull, GatewayProgram::kRoboRio, true};
   state.flags = 0x0A0B0C0D;
-  state.motor_count = 1;
+  state.motor_count = 5;
+  state.sensor_count = 6;
+  state.digital_input_count = 7;
+  state.digital_output_count = 4;
+  state.analog_input_count = 2;
+  state.encoder_count = 1;
+  state.pwm_output_count = 3;
   auto& motor = state.motors[0];
   motor.id = 0x0708;
   motor.valid = true;
@@ -332,6 +368,12 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
   motor.fault_flags = 0x090A0B0C;
   motor.temperature_c = -4.5;
   motor.supply_current_a = 0.1;
+  state.sensors[0] = {0x0910, true, 0.25, -0.5, 0x11121314, 0x15161718};
+  state.digital_inputs[0] = {0x0A0B, true, true};
+  state.digital_outputs[0] = {0x0C0D, true, false};
+  state.analog_inputs[0] = {0x0E0F, true, 2.5, 0x21222324};
+  state.encoders[0] = {0x1011, true, -2.0, 4.0, 0x25262728};
+  state.pwm_outputs[0] = {0x1213, true, -0.25};
   state.health.valid = true;
   state.health.battery_v = 12.5;
   state.health.can_bus_count = 2;
@@ -339,7 +381,7 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
   state.health.can_bus = {
       CanBusReadState::kOk, 0.25f, 0x11121314, 0x21222324, 5, 6, 0x31323334};
   state.counters = {0x41424344, 0x51525354, 0x61626364, 0x71727374};
-  const std::vector<uint8_t> expected{
+  std::vector<uint8_t> expected{
       0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // config_id
       0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,  // boot_id
       0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,  // epoch
@@ -350,24 +392,52 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
       0x78, 0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71,  // build.revision
       1,    1,                                         // program, dirty
       0x0D, 0x0C, 0x0B, 0x0A,                          // flags
-      1,    0,    0,    0,    0,    0,    0,    0,     // device counts
-      0,    0,    0,    0,    0,    0,                 //
-      0x08, 0x07, 1,                                   // motor id, valid
-      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,  // position_rot 1.0
-      0,    0,    0,    0,    0,    0,    0,    0xC0,  // velocity_rps -2.0
-      0,    0,    0,    0,    0,    0,    0xE0, 0x3F,  // voltage 0.5
-      123,  0,                                         // stator 12.3 A
-      0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05,  // ages
-      0x0C, 0x0B, 0x0A, 0x09,                          // fault_flags
-      0xD3, 0xFF, 1,    0,                             // -4.5 C, 0.1 A
-      1,                                               // health valid
-      0,    0,    0,    0,    0,    0,    0x29, 0x40,  // battery_v 12.5
-      0,    2,    1,    1,                             // brownout..read_state
-      0,    0,    0x80, 0x3E,                          // utilization 0.25f
-      0x14, 0x13, 0x12, 0x11, 0x24, 0x23, 0x22, 0x21,  // bus-off, buffer-full
-      5,    6,    0x34, 0x33, 0x32, 0x31,              // rx, tx, failures
-      0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51,  // counters
-      0x64, 0x63, 0x62, 0x61, 0x74, 0x73, 0x72, 0x71};
+      5,    0,    6,    0,    7,    0,    4,    0,     // motor, sensor, DI, DO
+      2,    0,    1,    0,    3,    0};                // analog, encoder, PWM
+  // `first`, then `more` samples of its size, all zero.
+  const auto section = [&expected](std::initializer_list<uint8_t> first,
+                                   std::size_t more) {
+    expected.insert(expected.end(), first);
+    expected.insert(expected.end(), more * first.size(), uint8_t{0});
+  };
+  section({0x08, 0x07, 1,                                   // motor id, valid
+           0,    0,    0,    0,    0,    0,    0xF0, 0x3F,  // position 1.0
+           0,    0,    0,    0,    0,    0,    0,    0xC0,  // velocity -2.0
+           0,    0,    0,    0,    0,    0,    0xE0, 0x3F,  // voltage 0.5
+           123,  0,                                         // stator 12.3 A
+           0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05,  // ages
+           0x0C, 0x0B, 0x0A, 0x09,                          // fault_flags
+           0xD3, 0xFF, 1,    0},                            // -4.5 C, 0.1 A
+          4);
+  section({0x10, 0x09, 1,                                    // sensor id, valid
+           0,    0,    0,    0,    0,    0,    0xD0, 0x3F,   // position 0.25
+           0,    0,    0,    0,    0,    0,    0xE0, 0xBF,   // velocity -0.5
+           0x14, 0x13, 0x12, 0x11, 0x18, 0x17, 0x16, 0x15},  // ages
+          5);
+  section({0x0B, 0x0A, 1, 1}, 6);         // digital input id, valid, value
+  section({0x0D, 0x0C, 1, 0}, 3);         // digital output id, valid, value
+  section({0x0F, 0x0E, 1,                 // analog id, valid
+           0, 0, 0, 0, 0, 0, 0x04, 0x40,  // voltage 2.5
+           0x24, 0x23, 0x22, 0x21},       // age
+          1);
+  section({0x11, 0x10, 1,                            // encoder id, valid
+           0,    0,    0,    0,   0, 0, 0,    0xC0,  // position -2.0
+           0,    0,    0,    0,   0, 0, 0x10, 0x40,  // velocity 4.0
+           0x28, 0x27, 0x26, 0x25},                  // age
+          0);
+  section({0x13, 0x12, 1,                  // PWM id, valid
+           0, 0, 0, 0, 0, 0, 0xD0, 0xBF},  // output -0.25
+          2);
+  expected.insert(
+      expected.end(),
+      {1,                                               // health valid
+       0,    0,    0,    0,    0,    0,    0x29, 0x40,  // battery_v 12.5
+       0,    2,    1,    1,                             // brownout..read_state
+       0,    0,    0x80, 0x3E,                          // utilization 0.25f
+       0x14, 0x13, 0x12, 0x11, 0x24, 0x23, 0x22, 0x21,  // bus-off, buffer-full
+       5,    6,    0x34, 0x33, 0x32, 0x31,              // rx, tx, failures
+       0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51,  // counters
+       0x64, 0x63, 0x62, 0x61, 0x74, 0x73, 0x72, 0x71});
   std::array<uint8_t, kMaxStateSize> bytes{};
   const auto size = Encode(state, bytes);
   ASSERT_EQ(size, expected.size());
@@ -377,217 +447,6 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
   EXPECT_EQ(decoded, state);
 }
 
-struct ModuleConfig {
-  const char* name;
-  uint16_t drive_id, steer_id, encoder_id;
-  double x_m, y_m;
-  double wheel_radius_m;
-  int drive_can_id, steer_can_id, encoder_can_id;
-  const char* bus{"rio"};
-  double encoder_offset_rot{0};
-  bool drive_inverted{false}, steer_inverted{false}, encoder_inverted{false};
-};
-
-inline constexpr std::array<ModuleConfig, 4> kTestSwerveModules{{
-    {"back_left", 1, 3, 2, -0.30, 0.30, 0.0508, 5, 6, 22},
-    {"back_right", 4, 6, 5, -0.30, -0.30, 0.0508, 7, 8, 23},
-    {"front_left", 8, 10, 9, 0.30, 0.30, 0.0508, 1, 2, 20},
-    {"front_right", 11, 13, 12, 0.30, -0.30, 0.0508, 3, 4, 21},
-}};
-
-inline Config SwerveConfig(bool simulation = false) {
-  Config c;
-  c.commissioned = simulation;
-  for (std::size_t i = 0; i < kTestSwerveModules.size(); ++i) {
-    const auto& module = kTestSwerveModules[i];
-    SensorConfig encoder;
-    encoder.id = module.encoder_id;
-    encoder.name = std::string{module.name} + "_encoder";
-    encoder.can_id = module.encoder_can_id;
-    encoder.bus = module.bus;
-    encoder.offset_rot = module.encoder_offset_rot;
-    encoder.inverted = module.encoder_inverted;
-    c.sensors.push_back(encoder);
-    MotorConfig drive;
-    drive.id = module.drive_id;
-    drive.name = std::string{module.name} + "_drive";
-    drive.can_id = module.drive_can_id;
-    drive.bus = module.bus;
-    drive.inverted = module.drive_inverted;
-    drive.sensor_to_mechanism_ratio = 6.75;
-    drive.max_velocity_rps = 20;
-    drive.slots[0].p = 0;
-    drive.slots[0].v = 0;
-    c.motors.push_back(drive);
-    MotorConfig steer;
-    steer.id = module.steer_id;
-    steer.name = std::string{module.name} + "_steer";
-    steer.can_id = module.steer_can_id;
-    steer.bus = module.bus;
-    steer.inverted = module.steer_inverted;
-    steer.feedback = Feedback::kRemoteCANcoder;
-    steer.feedback_sensor_id = encoder.id;
-    steer.rotor_to_sensor_ratio = 12.8;
-    steer.continuous_wrap = true;
-    steer.supply_limit_a = 20;
-    steer.stator_limit_a = 40;
-    steer.cruise_velocity_rps = 5;
-    steer.acceleration_rps2 = 20;
-    steer.slots[0].p = 0;
-    c.motors.push_back(steer);
-  }
-  c.sensors.push_back({7, "drivetrain_imu", SensorKind::kPigeon2, 30, "rio"});
-  std::sort(c.sensors.begin(), c.sensors.end(),
-            [](const auto& a, const auto& b) { return a.name < b.name; });
-  std::sort(c.motors.begin(), c.motors.end(),
-            [](const auto& a, const auto& b) { return a.name < b.name; });
-  return c;
-}
-class FakeBackend : public Backend {
- public:
-  bool Configure(const Config&) override {
-    ++configure_calls;
-    events.push_back("configure");
-    return configure_ok;
-  }
-  std::vector<uint16_t> UnavailableDevices() const override {
-    return unavailable;
-  }
-  bool Read(State& s) override {
-    for (auto& m : s.motors) {
-      m.valid = healthy && m.id != invalid_motor;
-      if (const auto it = positions.find(m.id); it != positions.end()) {
-        m.position_rot = it->second;
-      }
-      m.velocity_rps = m.voltage = m.stator_current_a = m.supply_current_a =
-          measurement;
-      m.position_age_us = m.velocity_age_us = age_us;
-      if (const auto it = position_ages.find(m.id); it != position_ages.end()) {
-        m.position_age_us = it->second;
-      }
-      if (const auto it = velocity_ages.find(m.id); it != velocity_ages.end()) {
-        m.velocity_age_us = it->second;
-      }
-    }
-    for (auto& sensor : s.sensors) {
-      sensor.valid = healthy && sensor.id != invalid_sensor;
-      sensor.position_rot = sensor.velocity_rps = measurement;
-      sensor.position_age_us = sensor.velocity_age_us = age_us;
-      if (const auto it = position_ages.find(sensor.id);
-          it != position_ages.end()) {
-        sensor.position_age_us = it->second;
-      }
-    }
-    for (auto& input : s.digital_inputs) {
-      input.valid = true;
-      input.value = true;
-    }
-    s.health = {.valid = true, .battery_v = 12};
-    return healthy;
-  }
-  bool Apply(std::span<const MotorRequest> requests) override {
-    last_requests.assign(requests.begin(), requests.end());
-    calls.push_back({Call::kApply, last_requests});
-    ++applied;
-    // Device-local send failures. last_requests keeps what the gateway asked
-    // for, so tests observe the gateway's own neutralization.
-    apply_failed.clear();
-    const bool fail_all =
-        fail_all_after_neutral &&
-        std::any_of(requests.begin(), requests.end(), [](const auto& request) {
-          return request.mode == Mode::kNeutral;
-        });
-    for (const auto& request : requests) {
-      if (fail_all || std::find(failing_motors.begin(), failing_motors.end(),
-                                request.id) != failing_motors.end())
-        apply_failed.push_back(request.id);
-    }
-    return apply_ok;
-  }
-  std::span<const uint16_t> ApplyFailedDevices() const override {
-    return apply_failed;
-  }
-  bool ApplyOutputs(std::span<const DigitalOutputRequest> digital,
-                    std::span<const PwmRequest> pwm) override {
-    last_digital_outputs.assign(digital.begin(), digital.end());
-    last_pwm_outputs.assign(pwm.begin(), pwm.end());
-    return outputs_ok;
-  }
-  void Neutral() override {
-    ++neutral;
-    events.push_back("neutral");
-    calls.push_back({Call::kNeutral, {}});
-  }
-  std::optional<ConfigError> last_config_error() const override {
-    return config_error;
-  }
-  bool PollDeviceResets(std::vector<uint16_t>& ids) override {
-    ids = resets;
-    resets.clear();
-    return !ids.empty();
-  }
-  void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
-    restoring_ids.assign(ids.begin(), ids.end());
-    events.push_back("restore");
-    calls.push_back({Call::kBeginRestore, {}});
-  }
-  RestoreStatus PollRestore() override {
-    if (pending_ticks-- > 0) return RestoreStatus::kPending;
-    if (restore_ok) {
-      std::erase_if(unavailable, [&](uint16_t id) {
-        return std::find(restoring_ids.begin(), restoring_ids.end(), id) !=
-               restoring_ids.end();
-      });
-    }
-    calls.push_back({Call::kRestoreFinished, {}});
-    return restore_ok ? RestoreStatus::kDone : RestoreStatus::kFailed;
-  }
-  // Every output and restore call in order, with the requests each Apply
-  // carried, so a test can see what reached a device around its restore.
-  struct Call {
-    enum Kind { kApply, kNeutral, kBeginRestore, kRestoreFinished } kind;
-    std::vector<MotorRequest> requests;
-  };
-  std::vector<Call> calls;
-  int pending_ticks{};
-  bool configure_ok{true}, healthy{true}, apply_ok{true}, restore_ok{true};
-  bool outputs_ok{true};
-  bool fail_all_after_neutral{false};
-  std::vector<uint16_t> failing_motors, apply_failed;
-  std::vector<DigitalOutputRequest> last_digital_outputs;
-  std::vector<PwmRequest> last_pwm_outputs;
-  int applied{}, neutral{}, configure_calls{};
-  uint16_t invalid_motor{}, invalid_sensor{};
-  std::vector<MotorRequest> last_requests{};
-  std::vector<std::string> events{};
-  std::vector<uint16_t> resets{};
-  std::vector<uint16_t> restoring_ids;
-  std::vector<uint16_t> unavailable;
-  std::optional<ConfigError> config_error{};
-  // Reported motor positions by id; others keep theirs. Every motor's and
-  // sensor's ages are `age_us`, except a position age (motor or sensor) or a
-  // motor velocity age named here. The fake never judges an age itself: the
-  // gateway does, for every backend.
-  std::map<uint16_t, double> positions;
-  // Every motor's velocity, voltage, stator and supply current, and every
-  // sensor's position and velocity, valid or not.
-  double measurement{};
-  uint32_t age_us{};
-  std::map<uint16_t, uint32_t> position_ages, velocity_ages;
-};
-Command Request(const Gateway& g) {
-  const auto s = g.snapshot();
-  Command c{};
-  c.config_id = s.config_id;
-  c.boot_id = s.boot_id;
-  c.epoch = s.epoch;
-  c.observed_time_us = s.sample_time_us;
-  c.count = s.motor_count;
-  for (std::size_t i = 0; i < c.count; ++i) {
-    c.motors[i] = {s.motors[i].id, Mode::kVelocity, 0, 1, 0};
-  }
-  return c;
-}
 std::size_t MotorIndex(const Config& config, Feedback feedback) {
   const auto motor = std::find_if(
       config.motors.begin(), config.motors.end(),
@@ -817,7 +676,7 @@ TEST(Config, CanBusesListRioThenTheOthersInByteOrderAndRefuseAFifth) {
         list.names.begin() + static_cast<std::ptrdiff_t>(list.count)};
   };
   EXPECT_EQ(names(Config{}), std::vector<std::string>{"rio"});
-  auto c = BusConfig({"b", "rio", "B", "b"});
+  auto c = BusConfig({"b", "rio", "C", "b"});
   SensorConfig sensor;
   sensor.id = 99;
   sensor.name = "encoder";
@@ -825,18 +684,39 @@ TEST(Config, CanBusesListRioThenTheOthersInByteOrderAndRefuseAFifth) {
   sensor.bus = "a";
   c.sensors.push_back(sensor);
   EXPECT_NO_THROW(Validate(c));
-  EXPECT_EQ(names(c), (std::vector<std::string>{"rio", "B", "a", "b"}));
+  EXPECT_EQ(names(c), (std::vector<std::string>{"rio", "C", "a", "b"}));
 
   c.motors[1].bus = "Shooter";
   try {
     Validate(c);
     FAIL() << "four buses besides rio were accepted";
   } catch (const std::invalid_argument& e) {
-    for (const char* bus : {"B", "Shooter", "a", "b"}) {
+    for (const char* bus : {"C", "Shooter", "a", "b"}) {
       EXPECT_NE(std::string{e.what()}.find(bus), std::string::npos)
           << bus << " is not named: " << e.what();
     }
   }
+}
+
+// Bus names are compared byte for byte (the wire carries them so), but
+// "Shooter" and "shooter" may be one CANivore to Phoenix: two status slots
+// and two load estimates for it would split its load. Config load refuses
+// two names that differ only by case, naming both and a device on each;
+// "rio" counts as named even when no device names it.
+// REQ-OPS-20
+TEST(Config, RefusesCanBusNamesThatDifferOnlyByCase) {
+  auto c = BusConfig({"Shooter", "rio", "shooter"});
+  try {
+    Validate(c);
+    FAIL() << "Shooter and shooter were accepted as two buses";
+  } catch (const std::invalid_argument& e) {
+    for (const char* text : {"Shooter", "shooter", "motor1", "motor3"}) {
+      EXPECT_NE(std::string{e.what()}.find(text), std::string::npos)
+          << text << " is not named: " << e.what();
+    }
+  }
+  c = BusConfig({"RIO"});
+  EXPECT_THROW(Validate(c), std::invalid_argument);
 }
 
 // The gateway reports one bus per State, in turn (index = sequence % count),
@@ -1368,6 +1248,10 @@ TEST(Gateway, NeutralizedMasterAlsoNeutralizesFollowerRegardlessOfOrder) {
       ASSERT_TRUE(gateway.Accept(command, 1, 1000));
       EXPECT_EQ(backend.last_requests[master].mode, Mode::kNeutral);
       EXPECT_EQ(backend.last_requests[follower].mode, Mode::kNeutral);
+      if (failure == 3) {
+        // A sanitized master takes its follower with it; both count.
+        EXPECT_EQ(gateway.snapshot().counters.neutralized_motor_count, 2u);
+      }
     }
   }
 }
@@ -1672,15 +1556,114 @@ TEST(Gateway, TotalLossWhileInactiveAdvancesTheEpoch) {
   EXPECT_TRUE(g.Accept(Request(g), 2, 11000));
 }
 
-// Total loss is judged on the backend's samples, before the gateway masks a
-// follower of an invalid master or the motor a reset CANcoder feeds. With
-// such a pair as the only CAN devices, an invalid master, or a reset
-// CANcoder, leaves the other sample valid at that judgment: the dependent is
-// published invalid, but there is no hardware fault and no new epoch.
-// SimHardwareTotalLoss.AMaskedDependentIsNotTotalLoss holds SimHardware to
-// the same two scenarios.
+// During total loss every node flushes neutral (its State carries
+// kHardwareFault, so robot_enabled is false) and the bridge keeps forwarding
+// that merge, stamped with the loss's own epoch. Refusing it is the gate
+// working, as while disabled, so it is not counted; a command of the same
+// epoch that drives an output is still refused and counted.
+// REQ-SAFE-17
+TEST(Gateway, NeutralRefusedDuringTotalLossIsNotARejection) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  backend.healthy = false;
+  g.Tick(6000, true);
+  ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+  const auto neutral = AllMotorsNeutral(Request(g));
+  ASSERT_EQ(neutral.epoch, g.snapshot().epoch);
+  for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+    EXPECT_FALSE(g.Accept(neutral, sequence, 6000));
+  }
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+  EXPECT_FALSE(g.Accept(Request(g), 4, 6000));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  EXPECT_EQ(backend.applied, 0);
+}
+
+// Total loss is not latched and clears in its own epoch, so a command built
+// on a State of the loss still matches once the feedback returns. It drives
+// nothing: its motors go neutral (motor_drives_from_) and so do its digital
+// and PWM outputs, sent false and off; a command observing the recovered
+// State applies them as sent.
+// REQ-SAFE-18, REQ-SAFE-22
+TEST(Gateway, ACommandObservingTotalLossDrivesNoOutputAfterIt) {
+  auto config = SwerveConfig(true);
+  config.digital_outputs.push_back({40, "solenoid", 1});
+  config.pwm_outputs.push_back({41, "servo", 0});
+  const auto with_outputs = [](Command c) {
+    c.digital_output_count = 1;
+    c.digital_outputs[0] = {40, true};
+    c.pwm_output_count = 1;
+    c.pwm_outputs[0] = {41, PwmMode::kPulse, 0.5};
+    return c;
+  };
+  FakeBackend backend;
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  backend.healthy = false;
+  g.Tick(6000, true);
+  ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+  const auto during = with_outputs(Request(g));
+  backend.healthy = true;
+  g.Tick(11000, true);
+  ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
+  ASSERT_EQ(g.snapshot().epoch, during.epoch);
+  ASSERT_TRUE(g.Accept(during, 1, 11000));
+  for (const auto& request : backend.last_requests) {
+    EXPECT_EQ(request.mode, Mode::kNeutral);
+  }
+  ASSERT_EQ(backend.last_digital_outputs.size(), 1u);
+  EXPECT_FALSE(backend.last_digital_outputs[0].value);
+  ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
+  EXPECT_EQ(backend.last_pwm_outputs[0].mode, PwmMode::kOff);
+  EXPECT_EQ(backend.last_pwm_outputs[0].output, 0.0);
+
+  ASSERT_TRUE(g.Accept(with_outputs(Request(g)), 2, 11000));
+  EXPECT_TRUE(backend.last_digital_outputs[0].value);
+  EXPECT_EQ(backend.last_pwm_outputs[0],
+            (PwmRequest{41, PwmMode::kPulse, 0.5}));
+}
+
+// A failed read pass is total loss whatever the samples show, and the Backend
+// contract lets Read return false with a sample still valid. A command
+// observing such a State must hold that motor once the loss clears, as it
+// holds the digital and PWM outputs: the hold may not depend on the backend
+// also marking every sample invalid.
+// REQ-SAFE-22
+TEST(Gateway, ACommandObservingAFailedReadHoldsAValidMotor) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  backend.read_fails = true;
+  g.Tick(6000, true);
+  ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+  ASSERT_TRUE(g.snapshot().motors[0].valid);
+  const auto during = Request(g);
+  backend.read_fails = false;
+  g.Tick(11000, true);
+  ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
+  ASSERT_EQ(g.snapshot().epoch, during.epoch);
+  ASSERT_TRUE(g.Accept(during, 1, 11000));
+  for (const auto& request : backend.last_requests) {
+    EXPECT_EQ(request.mode, Mode::kNeutral) << "motor " << request.id;
+  }
+
+  ASSERT_TRUE(g.Accept(Request(g), 2, 11000));
+  for (const auto& request : backend.last_requests) {
+    EXPECT_EQ(request.mode, Mode::kVelocity) << "motor " << request.id;
+    EXPECT_EQ(request.demand, 1) << "motor " << request.id;
+  }
+}
+
+// Total loss is judged on the State as published, the gateway's masks
+// included: a follower of an invalid master, or the motor a reset CANcoder
+// feeds, counts as lost though the backend reads it valid. With such a pair as
+// the only CAN devices, an invalid master, or a reset CANcoder, leaves no
+// valid sample in the State: the hardware fault, a new epoch and the command
+// in force ended. SimHardwareTotalLoss.EverySampleMaskedIsTotalLoss holds
+// SimHardware to the same two scenarios.
 // REQ-SAFE-22, REQ-DEV-07
-TEST(Gateway, AMaskedDependentIsNotTotalLoss) {
+TEST(Gateway, EverySampleMaskedIsTotalLoss) {
   for (const bool remote : {false, true}) {
     SCOPED_TRACE(remote ? "remote CANcoder reset" : "master invalid");
     Config config;
@@ -1716,8 +1699,9 @@ TEST(Gateway, AMaskedDependentIsNotTotalLoss) {
     g.Tick(6000, true);
     const auto s = g.snapshot();
     EXPECT_FALSE(s.motors[remote ? 0 : 1].valid);  // the masked dependent
-    EXPECT_FALSE(s.flags & kHardwareFault);
-    EXPECT_EQ(s.epoch, epoch);
+    EXPECT_TRUE(s.flags & kHardwareFault);
+    EXPECT_FALSE(s.flags & kCommandActive);
+    EXPECT_EQ(s.epoch, epoch + 1);
   }
 }
 
@@ -2163,6 +2147,7 @@ TEST(ConfigWire, RejectsCeilingViolations) {
 
 // Chunk headers and ACKs are little-endian on the wire whatever the host's
 // byte order, like every other payload (docs/DATA_FLOW.md).
+// REQ-CONTRACT-03
 TEST(ConfigWire, ChunkHeaderAndAckAreLittleEndian) {
   const auto config = SwerveConfig(true);
   const auto chunks = CreateConfigChunks(config);
@@ -2187,6 +2172,88 @@ TEST(ConfigWire, ChunkHeaderAndAckAreLittleEndian) {
   ASSERT_EQ(EncodeConfigAck(ack, bytes), bytes.size());
   const std::array<uint8_t, 9> expected{8, 7, 6, 5, 4, 3, 2, 1, 4};
   EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
+}
+
+// The serialized config body both ends agree on byte for byte, one device
+// of every kind: each integer (a signed one as its two's-complement bits)
+// and IEEE 754 double little-endian, each string a u16 length then its
+// bytes, each device list a u16 count.
+// REQ-CONTRACT-03
+TEST(ConfigWire, SerializedConfigIsLittleEndian) {
+  Config config;
+  config.period_us = 5000;
+  config.command_timeout_us = 100000;
+  config.status_hz = 200;
+  config.commissioned = true;
+  MotorConfig motor;
+  motor.id = 0x0102;
+  motor.name = "m";
+  motor.can_id = 0x01020304;
+  motor.feedback = Feedback::kRemoteCANcoder;
+  motor.feedback_sensor_id = 0x0506;
+  motor.reverse_limit_switch = LimitSwitch::kDisabled;
+  motor.slots[0].p = 1.5;
+  motor.slots[0].gravity_type = GravityType::kArmCosine;
+  motor.foc = true;
+  motor.max_torque_current_a = 0.5;
+  config.motors.push_back(motor);
+  config.sensors.push_back(
+      {0x0708, "s", SensorKind::kPigeon2, 0x11121314, "cv", true, -0.25});
+  config.digital_inputs.push_back({0x0901, "a", 0x21222324});
+  config.digital_outputs.push_back({0x0902, "b", 0x31323334});
+  config.analog_inputs.push_back({0x0903, "c", 0x41424344});
+  config.encoders.push_back(
+      {0x0904, "e", EncoderKind::kDutyCycle, 0x51525354, -1, 2048, 0.5});
+  config.pwm_outputs.push_back({0x0905, "p", 0x61626364});
+  std::vector<uint8_t> expected{
+      0x88, 0x13, 0,    0,    0xA0, 0x86, 0x01, 0,     // period, timeout
+      0,    0,    0,    0,    0,    0,    0x69, 0x40,  // status_hz 200
+      1,    1,    0,                                   // commissioned, motors
+      0x02, 0x01, 1,    0,    'm',                     // id, name
+      0x04, 0x03, 0x02, 0x01, 3,    0,    'r',  'i',  'o',  // can_id, bus
+      0,    1,    0,    0,    0,                            // inverted..oppose
+      0,    0,    0,    0,    0,    0,    0x44, 0x40,       // supply 40 A
+      0,    0,    0,    0,    0,    0,    0x54, 0x40,       // stator 80 A
+      0,    0,    0,    0,    0,    0,    0x28, 0x40,       // max_voltage 12 V
+      1,    0x06, 0x05,                                 // feedback, its sensor
+      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // rotor_to_sensor 1
+      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // sensor_to_mechanism 1
+      0,    0,                                          // wrap, soft limits
+      0,    0,    0,    0,    0,    0,    0xF0, 0xBF,   // reverse limit -1
+      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // forward limit 1
+      0,    2,                                          // limit switches
+      0,    0,    0,    0,    0,    0,    0x59, 0x40,   // max velocity 100
+      0,    0,    0,    0,    0,    0,    0x34, 0x40,   // cruise 20
+      0,    0,    0,    0,    0,    0,    0x44, 0x40,   // acceleration 40
+      0,    0,    0,    0,    0,    0,    0,    0,      // jerk 0
+      0,    0,    0,    0,    0,    0,    0xF8, 0x3F};  // slot 0 p 1.5
+  // Slot 0's i, d, s, v, a and g, then its gravity type; slots 1 and 2.
+  expected.insert(expected.end(), size_t{6} * 8, uint8_t{0});
+  expected.push_back(1);
+  expected.insert(expected.end(), size_t{2} * (7 * 8 + 1), uint8_t{0});
+  expected.insert(
+      expected.end(),
+      {1,                                                  // foc
+       0,    0,    0,    0,    0,    0,    0xE0, 0x3F,     // torque current 0.5
+       1,    0,    0x08, 0x07, 1,    0,    's',  2,        // sensor, Pigeon 2
+       0x14, 0x13, 0x12, 0x11, 2,    0,    'c',  'v',  1,  // can_id, bus, inv
+       0,    0,    0,    0,    0,    0,    0xD0, 0xBF,     // offset -0.25
+       1,    0,    0x01, 0x09, 1,    0,    'a',            // digital input
+       0x24, 0x23, 0x22, 0x21,                             //
+       1,    0,    0x02, 0x09, 1,    0,    'b',            // digital output
+       0x34, 0x33, 0x32, 0x31,                             //
+       1,    0,    0x03, 0x09, 1,    0,    'c',            // analog input
+       0x44, 0x43, 0x42, 0x41,                             //
+       1,    0,    0x04, 0x09, 1,    0,    'e',  2,     // encoder, duty cycle
+       0x54, 0x53, 0x52, 0x51, 0xFF, 0xFF, 0xFF, 0xFF,  // dio_a, dio_b -1
+       0,    0,    0,    0,    0,    0,    0xA0, 0x40,  // counts_per_rev 2048
+       0,    0,    0,    0,    0,    0,    0xE0, 0x3F,  // offset 0.5
+       1,    0,    0x05, 0x09, 1,    0,    'p',         // PWM output
+       0x64, 0x63, 0x62, 0x61});
+  EXPECT_EQ(SerializeConfig(config), expected);
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(expected, decoded));
+  EXPECT_EQ(decoded, config);
 }
 
 TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
@@ -2370,352 +2437,6 @@ TEST(Gateway, UnconfiguredStatesCarryNoValidSample) {
   }
   g.Tick(8000, false);
   read(g.snapshot());
-}
-
-// Polls `done` until it holds. The deadline only bounds a hang
-// (docs/TESTING.md §6.3); no test asserts how long a wait took.
-template <typename Done>
-[[nodiscard]] bool Eventually(Done done) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{10};
-  while (!done()) {
-    if (std::chrono::steady_clock::now() >= deadline) return false;
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  return true;
-}
-
-// The bridge's side of an Endpoint's link, on a raw loopback socket.
-// Connect() binds an ephemeral port, opens the endpoint toward it from an
-// ephemeral port of its own, and learns that port from a frame the endpoint
-// sends, so no test binds a fixed port (docs/TESTING.md §6.4). A raw socket,
-// since a RuntimeUdpPeer must know its peer's port before it binds, and sends
-// only this build's protocol version.
-class Companion {
- public:
-  Companion() = default;
-  ~Companion() {
-    if (fd_ >= 0) ::close(fd_);
-  }
-  Companion(const Companion&) = delete;
-  Companion& operator=(const Companion&) = delete;
-
-  ::testing::AssertionResult Connect(Endpoint& endpoint) {
-    fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd_ < 0) return Failed("socket");
-    // As a RuntimeUdpPeer's: room for the States a tick loop piles up.
-    const int buffer_bytes = 256 * 1024;
-    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &buffer_bytes,
-                     sizeof(buffer_bytes)) != 0 ||
-        ::fcntl(fd_, F_SETFL, O_NONBLOCK) != 0)
-      return Failed("configure socket");
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t length = sizeof(address);
-    if (::bind(fd_, reinterpret_cast<const sockaddr*>(&address),
-               sizeof(address)) != 0 ||
-        ::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) != 0)
-      return Failed("bind port 0");
-    const auto port = ntohs(address.sin_port);
-    if (endpoint.Open("127.0.0.1", 0, "127.0.0.1", port) !=
-        protocol::UdpStatus::kOk)
-      return ::testing::AssertionFailure()
-             << "Endpoint::Open toward port " << port;
-    // The passthrough sends without ticking the gateway.
-    const std::array<uint8_t, 1> hello{};
-    if (endpoint.SendFrame(protocol::FrameType::kDriverStation, 0, hello.data(),
-                           hello.size()) != protocol::UdpStatus::kOk)
-      return ::testing::AssertionFailure() << "the endpoint did not send";
-    sockaddr_in from{};
-    socklen_t from_length = 0;
-    const bool heard = Eventually([&] {
-      from_length = sizeof(from);
-      const auto got =
-          ::recvfrom(fd_, rx_.data(), rx_.size(), 0,
-                     reinterpret_cast<sockaddr*>(&from), &from_length);
-      protocol::DecodedFrame frame;
-      return got > 0 &&
-             protocol::DecodeFrame(rx_.data(), static_cast<std::size_t>(got),
-                                   &frame) == protocol::DecodeStatus::kOk &&
-             frame.header.type == protocol::FrameType::kDriverStation;
-    });
-    if (!heard)
-      return ::testing::AssertionFailure() << "no frame from the endpoint";
-    if (::connect(fd_, reinterpret_cast<const sockaddr*>(&from), from_length) !=
-        0)
-      return Failed("connect");
-    return ::testing::AssertionSuccess();
-  }
-
-  // Frames carry this companion's own sequence, from 1, like a
-  // RuntimeUdpPeer's; `version` stamps another protocol version.
-  protocol::UdpStatus SendFrame(protocol::FrameType type, uint16_t flags,
-                                uint64_t monotonic_time_us, const void* payload,
-                                std::size_t payload_size,
-                                uint16_t version = protocol::kProtocolVersion) {
-    std::array<uint8_t, protocol::kMaxFrameSize> frame{};
-    const auto size = protocol::EncodeFrame(
-        type, flags, next_send_sequence_, monotonic_time_us, payload,
-        payload_size, frame.data(), frame.size());
-    if (size == 0) return protocol::UdpStatus::kInvalidArgument;
-    frame[8] = static_cast<uint8_t>(version);  // The header's version field.
-    frame[9] = static_cast<uint8_t>(version >> 8);
-    if (::send(fd_, frame.data(), size, 0) != static_cast<ssize_t>(size))
-      return protocol::UdpStatus::kSocketError;
-    ++next_send_sequence_;
-    return protocol::UdpStatus::kOk;
-  }
-
-  protocol::UdpStatus TryReceive(protocol::DecodedFrame* out) {
-    const auto got = ::recv(fd_, rx_.data(), rx_.size(), 0);
-    if (got < 0)
-      return errno == EAGAIN || errno == EWOULDBLOCK
-                 ? protocol::UdpStatus::kWouldBlock
-                 : protocol::UdpStatus::kSocketError;
-    return protocol::DecodeFrame(rx_.data(), static_cast<std::size_t>(got),
-                                 out) == protocol::DecodeStatus::kOk
-               ? protocol::UdpStatus::kOk
-               : protocol::UdpStatus::kDecodeError;
-  }
-
-  // Waits for the next frame: a sent datagram need not be readable at once,
-  // even on loopback.
-  protocol::UdpStatus Receive(protocol::DecodedFrame* out) {
-    auto status = protocol::UdpStatus::kWouldBlock;
-    (void)Eventually([&] {
-      status = TryReceive(out);
-      return status != protocol::UdpStatus::kWouldBlock;
-    });
-    return status;
-  }
-
-  // Waits for the next frame of `type`, skipping the others (the State every
-  // tick sends).
-  bool Receive(protocol::FrameType type, protocol::DecodedFrame* out) {
-    while (Receive(out) == protocol::UdpStatus::kOk) {
-      if (out->header.type == type) return true;
-    }
-    return false;
-  }
-
-  uint64_t next_send_sequence() const { return next_send_sequence_; }
-
- private:
-  static ::testing::AssertionResult Failed(const char* step) {
-    return ::testing::AssertionFailure()
-           << step << ": " << std::strerror(errno);
-  }
-
-  int fd_{-1};
-  uint64_t next_send_sequence_{1};
-  std::array<uint8_t, protocol::kMaxFrameSize> rx_{};
-};
-
-// Ticks the endpoint and returns the State that tick sent, skipping the
-// frames sent before it.
-std::optional<State> TickForState(Endpoint& endpoint, Companion& companion,
-                                  uint64_t now_us, bool enabled) {
-  if (endpoint.Tick(now_us, enabled) != protocol::UdpStatus::kOk)
-    return std::nullopt;
-  protocol::DecodedFrame frame;
-  while (companion.Receive(protocol::FrameType::kHardwareState, &frame)) {
-    State state;
-    if (!Decode({frame.payload, frame.payload_size}, state))
-      return std::nullopt;
-    if (state.sample_time_us == now_us) return state;
-  }
-  return std::nullopt;
-}
-
-TEST(Endpoint, ClockProbeEchoUsesLaterSampleWhileDisabledAndUnconfigured) {
-  SimBackend backend;
-  Gateway gateway{backend, 2003};
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kClockProbe, 0, 9000,
-                                nullptr, 0),
-            protocol::UdpStatus::kOk);
-  // The State of the tick that receives the probe cannot echo it yet: that
-  // tick's sample was taken before its receive.
-  const auto expect_state = [&](uint64_t tick, uint64_t echo_us) {
-    const auto state = TickForState(endpoint, companion, tick, false);
-    ASSERT_TRUE(state.has_value()) << "tick " << tick;
-    EXPECT_EQ(state->clock_probe_time_us, echo_us) << "tick " << tick;
-    EXPECT_FALSE(state->flags & (kEnabled | kCommandActive));
-    EXPECT_EQ(state->counters.rejected_command_count, 0u);
-  };
-  uint64_t tick = 1000;
-  ASSERT_TRUE(Eventually([&] {
-    expect_state(tick++, 0);
-    return HasFailure() || endpoint.peer_contact().frame_us != 0;
-  }));
-  ASSERT_FALSE(HasFailure());
-  expect_state(6000, 9000);
-}
-
-TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
-  SimBackend backend;
-  Gateway gateway{backend, 2002};
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-
-  endpoint.SetSendEnabled(false);
-  const auto cfg = SwerveConfig(true);
-  const auto chunks = CreateConfigChunks(cfg);
-  for (std::size_t i = 0; i < chunks.size(); ++i) {
-    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig, i + 1,
-                                  1000, chunks[i].data(), chunks[i].size()),
-              protocol::UdpStatus::kOk);
-  }
-  // Receives config, but drops its ACK.
-  ASSERT_TRUE(Eventually([&] {
-    EXPECT_EQ(endpoint.Tick(2000, false), protocol::UdpStatus::kOk);
-    return gateway.configured();
-  }));
-  ASSERT_EQ(endpoint.Tick(3000, true), protocol::UdpStatus::kOk);
-  EXPECT_TRUE(gateway.snapshot().flags & kEnabled);
-  Command command = Request(gateway);
-  command.motors[0].demand = 5.0;
-  std::array<uint8_t, kMaxCommandSize> command_bytes{};
-  const auto command_size = Encode(command, command_bytes);
-  ASSERT_GT(command_size, 0u);
-  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand, 100,
-                                3000, command_bytes.data(), command_size),
-            protocol::UdpStatus::kOk);
-  ASSERT_TRUE(Eventually([&] {
-    EXPECT_EQ(endpoint.Tick(4000, true), protocol::UdpStatus::kOk);
-    return (gateway.snapshot().flags & kCommandActive) != 0;
-  }));
-  ASSERT_EQ(endpoint.Tick(5000, true), protocol::UdpStatus::kOk);
-  EXPECT_TRUE(gateway.snapshot().flags & kCommandActive);
-  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 5.0);
-  ASSERT_EQ(endpoint.Tick(5000 + cfg.command_timeout_us, true),
-            protocol::UdpStatus::kOk);
-  EXPECT_FALSE(gateway.snapshot().flags & kCommandActive);
-  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 0.0);
-  const std::array<uint8_t, 1> ds_payload{0};
-  ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation, 3000,
-                               ds_payload.data(), ds_payload.size()),
-            protocol::UdpStatus::kOk);
-
-  // One sender to one receiver on loopback keeps its order, so the first
-  // frame after the blackout shows that the ACK, every State and the Driver
-  // Station frame of the blackout were dropped, not queued.
-  endpoint.SetSendEnabled(true);
-  const uint64_t resumed_at = 6000 + cfg.command_timeout_us;
-  ASSERT_EQ(endpoint.Tick(resumed_at, false), protocol::UdpStatus::kOk);
-  ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation, resumed_at,
-                               ds_payload.data(), ds_payload.size()),
-            protocol::UdpStatus::kOk);
-  protocol::DecodedFrame frame;
-  ASSERT_EQ(companion.Receive(&frame), protocol::UdpStatus::kOk);
-  EXPECT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
-  State state;
-  ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
-  EXPECT_EQ(state.sample_time_us, resumed_at);
-  EXPECT_FALSE(state.flags & kEnabled);
-  ASSERT_EQ(companion.Receive(&frame), protocol::UdpStatus::kOk);
-  EXPECT_EQ(frame.header.type, protocol::FrameType::kDriverStation);
-  EXPECT_EQ(frame.header.monotonic_time_us, resumed_at);
-}
-
-// The RoboRIO program reports to the drive team whether its companion is
-// talking, and in which protocol. A clock probe alone (all the bridge sends
-// while nothing is commanded) is contact; a frame of another protocol version
-// is recorded with that version, not dropped unseen, and is not contact: a
-// Command from a bridge one protocol behind (whose PWM requests, for one,
-// have another layout) never reaches the gateway.
-// REQ-CONTRACT-01
-TEST(Endpoint, PeerContactRecordsProbesCommandsAndForeignProtocolVersions) {
-  SimBackend backend;
-  Gateway gateway{backend, 2004};
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-  // Ticks at `now_us` until the endpoint has received what was sent.
-  const auto tick_until = [&](uint64_t now_us, const uint64_t& heard_us) {
-    return Eventually([&] {
-      endpoint.Tick(now_us, false);
-      return heard_us != 0;
-    });
-  };
-  const auto& contact = endpoint.peer_contact();
-
-  ASSERT_EQ(
-      companion.SendFrame(protocol::FrameType::kClockProbe, 0, 0, nullptr, 0),
-      protocol::UdpStatus::kOk);
-  ASSERT_TRUE(tick_until(1000, contact.frame_us));
-  EXPECT_EQ(contact.frame_us, 1000u);
-  EXPECT_EQ(contact.command_us, 0u);
-
-  std::array<uint8_t, kMaxCommandSize> command{};
-  const auto command_size = Encode(Command{}, command);
-  ASSERT_GT(command_size, 0u);
-  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand, 0, 0,
-                                command.data(), command_size),
-            protocol::UdpStatus::kOk);
-  ASSERT_TRUE(tick_until(2000, contact.command_us));
-  EXPECT_EQ(contact.command_us, 2000u);
-  EXPECT_EQ(contact.version_mismatch_us, 0u);
-
-  const auto foreign = static_cast<uint16_t>(protocol::kProtocolVersion - 1);
-  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand, 0, 0,
-                                command.data(), command_size, foreign),
-            protocol::UdpStatus::kOk);
-  ASSERT_TRUE(tick_until(3000, contact.version_mismatch_us));
-  EXPECT_EQ(contact.version_mismatch_us, 3000u);
-  EXPECT_EQ(contact.mismatched_version, foreign);
-  EXPECT_EQ(contact.frame_us, 2000u);
-  EXPECT_EQ(contact.command_us, 2000u);
-}
-
-TEST(Endpoint, PushesConfigOverUdpAndAcknowledgesIt) {
-  SimBackend backend;
-  Gateway gateway{backend, 2002};
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-
-  // 1. Companion sees state with config_id = 0
-  auto state = TickForState(endpoint, companion, 1000, true);
-  ASSERT_TRUE(state.has_value());
-  EXPECT_EQ(state->config_id, 0u);
-  EXPECT_EQ(state->boot_id, 2002u);
-
-  // 2. Companion pushes config chunks
-  auto cfg = SwerveConfig(true);
-  auto chunks = CreateConfigChunks(cfg);
-  for (std::size_t i = 0; i < chunks.size(); ++i) {
-    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig, i + 1,
-                                  1000, chunks[i].data(), chunks[i].size()),
-              protocol::UdpStatus::kOk);
-  }
-
-  // 3. Endpoint ticks, processes chunks, sends ACK. Hardware configuration
-  // requires disabled operation, so the config push is serviced disabled.
-  ASSERT_TRUE(Eventually([&] {
-    endpoint.Tick(2000, false);
-    return gateway.configured();
-  }));
-
-  // 4. Companion receives ACK
-  protocol::DecodedFrame ack_frame;
-  ASSERT_TRUE(
-      companion.Receive(protocol::FrameType::kHardwareConfigAck, &ack_frame));
-  ConfigAckPayload ack{};
-  ASSERT_TRUE(
-      DecodeConfigAck({ack_frame.payload, ack_frame.payload_size}, ack));
-  EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
-  EXPECT_EQ(ack.config_id, ConfigurationId(cfg));
-
-  // 5. Subsequent state from endpoint has config_id set and kConfigured set
-  state = TickForState(endpoint, companion, 3000, true);
-  ASSERT_TRUE(state.has_value());
-  EXPECT_EQ(state->config_id, ConfigurationId(cfg));
-  EXPECT_TRUE(state->flags & kConfigured);
 }
 
 TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
@@ -3071,6 +2792,55 @@ TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   EXPECT_DOUBLE_EQ(restored.voltage, 0.0);
 }
 
+// The Endpoint publishes the State taken after Accept, so Accept judges total
+// loss on it too. Two motors and a solenoid: the first motor's reset masks
+// it, then a command's send to the second fails, which isolates and masks
+// that one as well. The State Accept leaves has no valid sample: the
+// hardware fault, a new epoch, the command ended and every output neutral,
+// the solenoid included.
+// REQ-SAFE-22, REQ-SAFE-23
+TEST(Gateway, ASendFailureThatMasksTheLastValidSampleIsTotalLoss) {
+  Config config;
+  config.commissioned = true;
+  MotorConfig motor;
+  motor.name = "left";
+  motor.id = 1;
+  motor.can_id = 1;
+  config.motors.push_back(motor);
+  motor.name = "right";
+  motor.id = 2;
+  motor.can_id = 2;
+  config.motors.push_back(motor);
+  config.digital_outputs = {{21, "solenoid", 1}};
+  FakeBackend backend;
+  Gateway g{config, backend, 1};
+  const auto drive = [&g] {
+    auto command = Request(g);
+    command.motors[0] = {1, Mode::kVoltage, 0, 2};
+    command.motors[1] = {2, Mode::kVoltage, 0, 2};
+    command.digital_output_count = 1;
+    command.digital_outputs[0] = {21, true};
+    return command;
+  };
+  g.Tick(1000, true);
+  ASSERT_TRUE(g.Accept(drive(), 1, 1000));
+  backend.resets = {1};
+  g.Tick(2000, true);
+  ASSERT_FALSE(g.snapshot().motors[0].valid);
+  ASSERT_TRUE(g.snapshot().motors[1].valid);
+  ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
+  const auto epoch = g.snapshot().epoch;
+  const int neutrals = backend.neutral;
+  backend.failing_motors = {2};
+  EXPECT_FALSE(g.Accept(drive(), 2, 2000));
+  const auto s = g.snapshot();
+  EXPECT_FALSE(s.motors[1].valid);
+  EXPECT_TRUE(s.flags & kHardwareFault);
+  EXPECT_FALSE(s.flags & kCommandActive);
+  EXPECT_EQ(s.epoch, epoch + 1);
+  EXPECT_GT(backend.neutral, neutrals);
+}
+
 // One master (id 1) and its follower (id 2), and nothing else.
 Config MasterFollowerConfig() {
   Config config;
@@ -3096,12 +2866,14 @@ bool DriveAtTwoVolts(Gateway& g, uint64_t sequence, uint64_t now) {
   return g.Accept(command, sequence, now);
 }
 
-// A config of one master and its follower, driving, whose master resets. On
-// the robot PhoenixBackend::Read reports both invalid from the tick after the
-// restore begins until PollRestore completes it, so that State has no valid
-// feedback: total loss, which faults, ends the command in force and starts a
-// new epoch. The next State is healthy again, and only a command of the new
-// epoch drives the pair. A simulated backend must fault the same way.
+// A config of one master and its follower, driving, whose master resets. The
+// gateway masks the pair from the tick that finds the reset until the tick
+// whose PollRestore ends the restore (whatever the backend reads for it
+// meanwhile; PhoenixBackend::Read reads it invalid), so those States have no
+// valid feedback: total loss, which faults, ends the command in force and
+// starts one new epoch. The first State read after the restore is healthy
+// again, and only a command of the new epoch drives the pair. A simulated
+// backend must fault the same way.
 template <typename SimulatedBackend>
 void ExpectRestoringPairIsTotalLoss(SimulatedBackend& backend) {
   Gateway g{MasterFollowerConfig(), backend, 1};
@@ -3111,27 +2883,29 @@ void ExpectRestoringPairIsTotalLoss(SimulatedBackend& backend) {
   g.Tick(1000, true);
   ASSERT_TRUE(drive(1, 1000));
   const auto epoch = g.snapshot().epoch;
-  backend.SimulateDeviceReset(1);
-  g.Tick(2000, true);  // Reset found: the pair neutral, the restore begun.
-  ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
   const auto before_loss = Request(g);
-
-  g.Tick(3000, true);  // Read while the pair restores.
-  auto s = g.snapshot();
-  EXPECT_FALSE(s.motors[0].valid);
-  EXPECT_FALSE(s.motors[1].valid);
-  EXPECT_TRUE(s.flags & kHardwareFault);
-  EXPECT_FALSE(s.flags & kCommandActive);
-  EXPECT_EQ(s.epoch, epoch + 1);
-  EXPECT_FALSE(g.Accept(before_loss, 2, 3000));
+  backend.SimulateDeviceReset(1);
+  // Reset found: the pair masked, the restore begun; then read while the
+  // pair restores, and the restore ended.
+  for (const uint64_t now : {uint64_t{2000}, uint64_t{3000}}) {
+    SCOPED_TRACE(now);
+    g.Tick(now, true);
+    const auto s = g.snapshot();
+    EXPECT_FALSE(s.motors[0].valid);
+    EXPECT_FALSE(s.motors[1].valid);
+    EXPECT_TRUE(s.flags & kHardwareFault);
+    EXPECT_FALSE(s.flags & kCommandActive);
+    EXPECT_EQ(s.epoch, epoch + 1);
+    EXPECT_FALSE(g.Accept(before_loss, now / 1000, now));
+  }
 
   g.Tick(4000, true);  // Restored.
-  s = g.snapshot();
+  const auto s = g.snapshot();
   EXPECT_TRUE(s.motors[0].valid);
   EXPECT_TRUE(s.motors[1].valid);
   EXPECT_FALSE(s.flags & kHardwareFault);
-  EXPECT_FALSE(g.Accept(before_loss, 3, 4000));
-  ASSERT_TRUE(drive(4, 4000));
+  EXPECT_FALSE(g.Accept(before_loss, 4, 4000));
+  ASSERT_TRUE(drive(5, 4000));
   g.Tick(5000, true);
   EXPECT_NE(g.snapshot().motors[0].voltage, 0.0);
   EXPECT_NE(g.snapshot().motors[1].voltage, 0.0);
@@ -3154,9 +2928,8 @@ TEST(PhysicsSimBackend, RestoringChainIsInvalidAsOnTheRobot) {
 // PhoenixBackend::Read reports it invalid, until a later restore completes
 // it (retried at the gateway's backoff, 250 ms then 500 ms), so every State
 // until then is total loss; the pair drives again only once a restore
-// succeeds, on a command observing a State read after it. A simulated backend
-// that reported the pair valid again after a failed restore would let the
-// gateway judge those States healthy.
+// succeeds, on a command observing a State read after it. The gateway's mask
+// of the unavailable pair decides this, whatever the backend reads for it.
 template <typename SimulatedBackend>
 void ExpectFailingRestoreKeepsPairInvalid(SimulatedBackend& backend) {
   Gateway g{MasterFollowerConfig(), backend, 1};
@@ -3208,18 +2981,8 @@ TEST(PhysicsSimBackend, FailingRestoreKeepsChainInvalidAsOnTheRobot) {
   ExpectFailingRestoreKeepsPairInvalid(backend);
 }
 
-// One motor, a Pigeon 2 and a solenoid that reset together, as a CAN
-// brownout resets every device on the bus. The gateway masks both in every
-// State until the restore ends, but judges total loss on what Backend::Read
-// reports, and the backends read a restoring CAN sensor valid (only the
-// motors of the chain invalid, as PhoenixBackend does): so no State is total
-// loss, there is no fault and no new epoch, though none carries a valid
-// motion sample. What keeps that safe is the mask itself: no command
-// observing those States drives the motor, while the solenoid, outside the
-// reset chain, keeps applying. Without the Pigeon the same reset is total
-// loss (ExpectRestoringPairIsTotalLoss).
-template <typename SimulatedBackend>
-void ExpectEveryDeviceResetDrivesNoMotor(SimulatedBackend& backend) {
+// One motor, a Pigeon 2, a solenoid and a PWM output.
+Config MotorBesideAPigeonConfig() {
   Config config;
   config.commissioned = true;
   MotorConfig motor;
@@ -3229,16 +2992,90 @@ void ExpectEveryDeviceResetDrivesNoMotor(SimulatedBackend& backend) {
   config.motors = {motor};
   config.sensors = {{11, "imu", SensorKind::kPigeon2, 30, "rio"}};
   config.digital_outputs = {{21, "solenoid", 1}};
-  Gateway g{config, backend, 1};
-  // A command driving the motor at 2 V and the solenoid on, observing the
-  // last State.
-  const auto request = [&g, &motor] {
-    auto command = Request(g);
-    command.motors[0] = {motor.id, Mode::kVoltage, 0, 2};
-    command.digital_output_count = 1;
-    command.digital_outputs[0] = {21, true};
-    return command;
-  };
+  config.pwm_outputs = {{31, "servo", 0}};
+  return config;
+}
+// A command for that robot, observing `g`'s last State, that drives the motor
+// at 2 V, the solenoid on and the PWM output at a half pulse.
+Command DriveBesideAPigeon(const Gateway& g) {
+  auto command = Request(g);
+  command.motors[0] = {1, Mode::kVoltage, 0, 2};
+  command.digital_output_count = 1;
+  command.digital_outputs[0] = {21, true};
+  command.pwm_output_count = 1;
+  command.pwm_outputs[0] = {31, PwmMode::kPulse, 0.5};
+  return command;
+}
+
+// A CAN brownout resets every CAN device at once. The gateway masks the
+// motor and the Pigeon in every State from the tick that finds the reset to
+// the tick whose PollRestore ends the restore, though the backends read the
+// restoring Pigeon valid (as PhoenixBackend does). Those States carry no
+// valid motion sample, so each is total loss, judged on the State as
+// published: the hardware fault, one new epoch, every output neutral, the
+// solenoid and PWM output included, and no command accepted. The first State
+// read after the restore clears the fault in that epoch; a command observing
+// it drives everything, one built before the brownout nothing.
+template <typename SimulatedBackend>
+void ExpectEveryDeviceResetIsTotalLoss(SimulatedBackend& backend) {
+  Gateway g{MotorBesideAPigeonConfig(), backend, 1};
+  uint64_t sequence = 0;
+  g.Tick(1000, true);
+  ASSERT_TRUE(g.Accept(DriveBesideAPigeon(g), ++sequence, 1000));
+  const auto epoch = g.snapshot().epoch;
+  const auto before = DriveBesideAPigeon(g);
+  backend.SimulateDeviceReset(1);
+  backend.SimulateDeviceReset(11);
+  // The reset found, then read while restoring and restored.
+  for (const uint64_t now : {uint64_t{6000}, uint64_t{11000}}) {
+    SCOPED_TRACE(now);
+    g.Tick(now, true);
+    const auto s = g.snapshot();
+    EXPECT_FALSE(s.motors[0].valid);
+    EXPECT_FALSE(s.sensors[0].valid);
+    EXPECT_TRUE(s.flags & kHardwareFault);
+    EXPECT_FALSE(s.flags & kCommandActive);
+    EXPECT_EQ(s.epoch, epoch + 1);
+    EXPECT_FALSE(backend.GetDigitalOutput(21));
+    EXPECT_EQ(backend.GetPwm(31).mode, PwmMode::kOff);
+    EXPECT_FALSE(g.Accept(DriveBesideAPigeon(g), ++sequence, now));
+  }
+  g.Tick(16000, true);
+  const auto s = g.snapshot();
+  EXPECT_TRUE(s.motors[0].valid);
+  EXPECT_TRUE(s.sensors[0].valid);
+  EXPECT_FALSE(s.flags & kHardwareFault);
+  EXPECT_EQ(s.epoch, epoch + 1);
+  EXPECT_FALSE(g.Accept(before, ++sequence, 16000));
+  const auto neutralized = s.counters.neutralized_motor_count;
+  ASSERT_TRUE(g.Accept(DriveBesideAPigeon(g), ++sequence, 16000));
+  EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, neutralized);
+  EXPECT_TRUE(backend.GetDigitalOutput(21));
+  EXPECT_EQ(backend.GetPwm(31).mode, PwmMode::kPulse);
+  g.Tick(21000, true);
+  EXPECT_NE(g.snapshot().motors[0].voltage, 0.0);
+}
+
+// REQ-SAFE-22, REQ-SAFE-24, REQ-DEV-24
+TEST(SimBackend, EveryDeviceResetIsTotalLoss) {
+  SimBackend backend;
+  ExpectEveryDeviceResetIsTotalLoss(backend);
+}
+
+// REQ-SAFE-22, REQ-SAFE-24, REQ-DEV-24
+TEST(PhysicsSimBackend, EveryDeviceResetIsTotalLoss) {
+  sim::PhysicsSimBackend backend;
+  ExpectEveryDeviceResetIsTotalLoss(backend);
+}
+
+// The same robot, whose motor alone resets: the Pigeon stays valid, so no
+// State is total loss: no fault and no new epoch. Only the motor is masked,
+// neutral in every command until one observes a State read after its
+// restore, while the solenoid and PWM output, outside the reset chain, keep
+// applying.
+template <typename SimulatedBackend>
+void ExpectAMotorResetBesideAValidSensorIsLocal(SimulatedBackend& backend) {
+  Gateway g{MotorBesideAPigeonConfig(), backend, 1};
   // Accepts `command`; returns how many motors it neutralized.
   uint64_t sequence = 0;
   const auto accept = [&g, &sequence](const Command& command, uint64_t now) {
@@ -3247,49 +3084,46 @@ void ExpectEveryDeviceResetDrivesNoMotor(SimulatedBackend& backend) {
     return g.snapshot().counters.neutralized_motor_count - neutralized;
   };
   g.Tick(1000, true);
-  EXPECT_EQ(accept(request(), 1000), 0u);
+  EXPECT_EQ(accept(DriveBesideAPigeon(g), 1000), 0u);
   const auto epoch = g.snapshot().epoch;
-  backend.SimulateDeviceReset(motor.id);
-  backend.SimulateDeviceReset(11);
-  // The reset found, then read while restoring and restored: neither State
-  // carries a valid motion sample, and neither is total loss.
+  backend.SimulateDeviceReset(1);
+  // The reset found, then read while restoring and restored.
   Command masked{};
   for (const uint64_t now : {uint64_t{6000}, uint64_t{11000}}) {
     SCOPED_TRACE(now);
     g.Tick(now, true);
     const auto s = g.snapshot();
     EXPECT_FALSE(s.motors[0].valid);
-    EXPECT_FALSE(s.sensors[0].valid);
+    EXPECT_TRUE(s.sensors[0].valid);
     EXPECT_FALSE(s.flags & kHardwareFault);
     EXPECT_EQ(s.epoch, epoch);
-    EXPECT_TRUE(s.digital_outputs[0].value);
-    masked = request();
-    EXPECT_EQ(accept(masked, now), 1u);  // The motor neutral, the solenoid on.
+    masked = DriveBesideAPigeon(g);
+    EXPECT_EQ(accept(masked, now), 1u);  // The motor neutral.
+    EXPECT_TRUE(backend.GetDigitalOutput(21));
+    EXPECT_EQ(backend.GetPwm(31).mode, PwmMode::kPulse);
   }
   // Read after the restore ended. A command observing the last masked State
-  // still drives nothing; one observing this State drives.
+  // still drives no motor; one observing this State does.
   g.Tick(16000, true);
   EXPECT_TRUE(g.snapshot().motors[0].valid);
-  EXPECT_TRUE(g.snapshot().sensors[0].valid);
   EXPECT_EQ(accept(masked, 16000), 1u);
   g.Tick(21000, true);
   EXPECT_DOUBLE_EQ(g.snapshot().motors[0].voltage, 0.0);
-  EXPECT_TRUE(g.snapshot().digital_outputs[0].value);
-  EXPECT_EQ(accept(request(), 21000), 0u);
+  EXPECT_EQ(accept(DriveBesideAPigeon(g), 21000), 0u);
   g.Tick(26000, true);
   EXPECT_NE(g.snapshot().motors[0].voltage, 0.0);
 }
 
 // REQ-SAFE-24, REQ-DEV-24
-TEST(SimBackend, EveryDeviceResetDrivesNoMotor) {
+TEST(SimBackend, AMotorResetBesideAValidSensorIsLocal) {
   SimBackend backend;
-  ExpectEveryDeviceResetDrivesNoMotor(backend);
+  ExpectAMotorResetBesideAValidSensorIsLocal(backend);
 }
 
 // REQ-SAFE-24, REQ-DEV-24
-TEST(PhysicsSimBackend, EveryDeviceResetDrivesNoMotor) {
+TEST(PhysicsSimBackend, AMotorResetBesideAValidSensorIsLocal) {
   sim::PhysicsSimBackend backend;
-  ExpectEveryDeviceResetDrivesNoMotor(backend);
+  ExpectAMotorResetBesideAValidSensorIsLocal(backend);
 }
 
 // A TalonFX reset restarts its rotor position at zero, and the restarted
@@ -3695,100 +3529,6 @@ TEST(Gateway, RemoteSensorResetIsolatesItsMotorAndFollower) {
   EXPECT_FALSE(g.Accept(command, 4, 200000));
 }
 
-// Pushes `cfg` and ticks until the endpoint acknowledges it or begins a
-// backend configure that has not finished (whose ACK comes later): nullopt.
-std::optional<ConfigAckPayload> PushConfig(Endpoint& endpoint,
-                                           const Gateway& gateway,
-                                           Companion& companion,
-                                           const Config& cfg,
-                                           bool enabled = false) {
-  for (const auto& chunk : CreateConfigChunks(cfg)) {
-    EXPECT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
-                                  protocol::kFlagNone, 1000, chunk.data(),
-                                  chunk.size()),
-              protocol::UdpStatus::kOk);
-  }
-  std::optional<ConfigAckPayload> ack;
-  const bool answered = Eventually([&] {
-    endpoint.Tick(2000, enabled);
-    protocol::DecodedFrame frame;
-    while (!ack && companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
-      if (frame.header.type != protocol::FrameType::kHardwareConfigAck)
-        continue;
-      ack.emplace();
-      EXPECT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, *ack));
-    }
-    return ack.has_value() || gateway.configuring();
-  });
-  EXPECT_TRUE(answered) << "no ACK, and no configure begun";
-  return ack;
-}
-
-TEST(Endpoint, FailedConfigurationAcknowledgementBoundsReason) {
-  FakeBackend backend;
-  backend.configure_ok = false;
-  ConfigError err;
-  err.device_name = "front_left_drive";
-  err.bus = "rio";
-  err.can_id = 3;
-  err.operation = "apply_talonfx_config";
-  err.vendor_status = -1;
-  err.message = "timeout waiting for device response; retries exhausted";
-  backend.config_error = err;
-  Gateway gateway{backend, 3003};
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-  const auto ack = PushConfig(endpoint, gateway, companion, SwerveConfig(true));
-  if (!ack.has_value()) {
-    FAIL() << "no config ack";
-  }
-  EXPECT_EQ(ack->status, ConfigAckStatus::kBackendFailed);
-  EXPECT_NE(std::find(std::begin(ack->reason), std::end(ack->reason), '\0'),
-            std::end(ack->reason));
-  EXPECT_EQ(ack->reason[sizeof(ack->reason) - 1], '\0');
-}
-
-// The ACK is a frame type, not a flag: its header flags stay zero no matter
-// which incoming sequence it answers.
-TEST(Endpoint, ConfigAckFlagsIgnoreIncomingSequence) {
-  FakeBackend backend;
-  Gateway gateway{backend, 3005};
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-  // Advance the companion's sequence so its low bits are nonzero flag bits if
-  // the incoming sequence leaked into the ACK header.
-  const std::array<uint8_t, 1> junk{};
-  for (int i = 0; i < 0xff; ++i) {
-    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kDriverStation,
-                                  protocol::kFlagNone, 1000, junk.data(),
-                                  junk.size()),
-              protocol::UdpStatus::kOk);
-    if (i % 16 == 15) endpoint.Tick(1000, false);
-  }
-  for (const auto& chunk : CreateConfigChunks(SwerveConfig(true))) {
-    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
-                                  protocol::kFlagNone, 1000, chunk.data(),
-                                  chunk.size()),
-              protocol::UdpStatus::kOk);
-  }
-  ASSERT_GT(companion.next_send_sequence(), 0xffu);
-  std::optional<uint16_t> ack_flags;
-  uint64_t tick = 2000;
-  ASSERT_TRUE(Eventually([&] {
-    endpoint.Tick(tick++, false);
-    protocol::DecodedFrame frame;
-    while (companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
-      EXPECT_EQ(frame.header.flags, protocol::kFlagNone);
-      if (frame.header.type == protocol::FrameType::kHardwareConfigAck)
-        ack_flags = frame.header.flags;
-    }
-    return ack_flags.has_value();
-  }));
-  EXPECT_EQ(*ack_flags, protocol::kFlagNone);
-}
-
 TEST(Gateway, PendingRestoreKeepsPollingAndNeutral) {
   FakeBackend backend;
   backend.pending_ticks = 3;
@@ -3844,8 +3584,8 @@ TEST(Gateway, RangeErrorsNeutralizeOnlyTheirMotor) {
 // foc and a positive max_torque_current_a, within that limit and with no
 // feedforward; 0 A is a driving request, applied as sent, not neutral. Any
 // other torque-current request neutralizes that motor alone (counted), while
-// the rest of the command drives. A follower takes its master's mode, torque
-// current included, and goes neutral with it.
+// the rest of the command drives. (A torque-current motor has no follower:
+// config load refuses one.)
 // REQ-SAFE-43
 TEST(Gateway, TorqueCurrentDrivesOnlyAFocMotorWithinItsLimit) {
   FakeBackend backend;
@@ -3853,8 +3593,6 @@ TEST(Gateway, TorqueCurrentDrivesOnlyAFocMotorWithinItsLimit) {
   config.motors[0].foc = true;
   config.motors[0].max_torque_current_a = 10;
   config.motors[2].foc = true;  // No limit: the mode stays refused.
-  config.motors[4].master_id = config.motors[0].id;
-  ASSERT_EQ(config.motors[4].bus, config.motors[0].bus);
   Gateway g{config, backend, 1};
   const struct {
     const char* label;
@@ -3882,13 +3620,8 @@ TEST(Gateway, TorqueCurrentDrivesOnlyAFocMotorWithinItsLimit) {
     ASSERT_EQ(backend.last_requests.size(), config.motors.size());
     const MotorRequest neutral{torque.id, Mode::kNeutral, 0, 0, 0};
     EXPECT_EQ(backend.last_requests[row.motor], row.sent ? torque : neutral);
-    // A neutralized motor 0 takes its follower with it; both count.
-    neutralized += row.sent ? 0 : row.motor == 0 ? 2 : 1;
+    neutralized += row.sent ? 0 : 1;
     EXPECT_EQ(backend.last_requests[3], command.motors[3]);
-    if (row.motor == 0) {
-      EXPECT_EQ(backend.last_requests[4].mode,
-                row.sent ? Mode::kTorqueCurrent : Mode::kNeutral);
-    }
   }
   EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, neutralized);
   EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
@@ -3917,130 +3650,6 @@ TEST(ConfigWire, PersistenceValidatesCrcAndAssemblerResetsAfterCompletion) {
   }
   EXPECT_EQ(assembler.AddChunk(chunks[0], error),
             ConfigAssembler::Status::kIncomplete);
-}
-
-// REQ-SAFE-21: an identical push succeeds enabled without device traffic
-TEST(Endpoint, RestoredGatewayAcknowledgesIdenticalConfigWhileEnabled) {
-  Config restored;
-  ASSERT_TRUE(
-      LoadPersistedConfig(PersistedConfig(SwerveConfig(true)), restored));
-  FakeBackend backend;
-  Gateway gateway{backend, 3010};
-  ASSERT_TRUE(gateway.Reconfigure(restored));
-  gateway.Tick(1000, true);
-  const auto configure_calls = backend.configure_calls;
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-  const auto ack = PushConfig(endpoint, gateway, companion, restored, true);
-  if (!ack.has_value()) {
-    FAIL() << "Expected configuration acknowledgement";
-  }
-  const auto& acknowledgement = *ack;
-  EXPECT_EQ(acknowledgement.status, ConfigAckStatus::kOk);
-  EXPECT_EQ(backend.configure_calls, configure_calls);
-  EXPECT_TRUE(gateway.Accept(Request(gateway), 1, 2000));
-}
-
-TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
-  class PendingBackend : public FakeBackend {
-   public:
-    void BeginConfigure(const Config&) override { started = true; }
-    ConfigureStatus PollConfigure() override {
-      return complete ? ConfigureStatus::kDone : ConfigureStatus::kPending;
-    }
-    bool started{}, complete{};
-  } backend;
-  const auto config = SwerveConfig(true);
-  backend.unavailable = {config.motors[0].id};
-  Gateway gateway{backend, 3011};
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-  EXPECT_FALSE(PushConfig(endpoint, gateway, companion, config).has_value());
-  EXPECT_TRUE(backend.started);
-  EXPECT_EQ(backend.configure_calls, 0);
-  EXPECT_TRUE(gateway.configuring());
-  endpoint.Tick(7000, true);
-  EXPECT_EQ(gateway.snapshot().sample_time_us, 7000u);
-  EXPECT_FALSE(gateway.Accept(Request(gateway), 1, 7000));
-  backend.complete = true;
-  endpoint.Tick(12000, true);
-  EXPECT_TRUE(gateway.configured());
-  EXPECT_FALSE(gateway.snapshot().motors[0].valid);
-  // The first ACK is the completed configure's: none went out while it was
-  // pending.
-  protocol::DecodedFrame frame;
-  ASSERT_TRUE(
-      companion.Receive(protocol::FrameType::kHardwareConfigAck, &frame));
-  ConfigAckPayload ack{};
-  ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
-  EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
-  auto command = Request(gateway);
-  for (std::size_t i = 0; i < command.count; ++i)
-    command.motors[i] = {config.motors[i].id, Mode::kDutyCycle, 0, 0.2};
-  ASSERT_TRUE(gateway.Accept(command, 2, 12000));
-  EXPECT_EQ(backend.last_requests[0].mode, Mode::kNeutral);
-  EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
-  endpoint.Tick(262000, true);
-  endpoint.Tick(267000, true);  // Restored, in a State read before it was.
-  endpoint.Tick(272000, true);
-  command.observed_time_us = 272000;
-  command.epoch = gateway.snapshot().epoch;
-  ASSERT_TRUE(gateway.Accept(command, 3, 272000));
-  EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
-}
-
-// After a stall the socket holds a command backlog; replaying it would put
-// every superseded demand on the CAN bus back-to-back.
-TEST(Endpoint, AppliesOnlyTheNewestQueuedCommand) {
-  FakeBackend backend;
-  Gateway gateway{backend, 3012};
-  ASSERT_TRUE(gateway.Reconfigure(SwerveConfig(true)));
-  gateway.Tick(1000, true);
-  Endpoint endpoint{gateway};
-  Companion companion;
-  ASSERT_TRUE(companion.Connect(endpoint));
-  auto command = Request(gateway);
-  // Each command's demand is its sequence, so the applied demand names the
-  // command it came from.
-  const auto send_backlog = [&] {
-    for (int i = 0; i < 5; ++i) {
-      command.motors[0].demand =
-          static_cast<double>(companion.next_send_sequence());
-      std::array<uint8_t, kMaxCommandSize> bytes{};
-      const auto size = Encode(command, bytes);
-      ASSERT_GT(size, 0u);
-      ASSERT_EQ(
-          companion.SendFrame(protocol::FrameType::kHardwareCommand,
-                              protocol::kFlagNone, 1000, bytes.data(), size),
-          protocol::UdpStatus::kOk);
-    }
-  };
-  send_backlog();
-  // Tick until one tick drains at least two queued commands: datagrams may
-  // become readable one at a time, and a tick that drains a single command
-  // proves nothing here. Should they all trickle in, queue another backlog.
-  ASSERT_TRUE(Eventually([&] {
-    const auto sequence_before = gateway.snapshot().last_command_sequence;
-    const int applied_before = backend.applied;
-    EXPECT_EQ(endpoint.Tick(2000, true), protocol::UdpStatus::kOk);
-    const auto sequence = gateway.snapshot().last_command_sequence;
-    if (sequence - sequence_before >= 2) {
-      EXPECT_EQ(backend.applied - applied_before, 1)
-          << "commands " << sequence_before + 1 << " to " << sequence
-          << " were drained by one tick";
-      EXPECT_FALSE(backend.last_requests.empty());
-      if (!backend.last_requests.empty()) {
-        EXPECT_DOUBLE_EQ(backend.last_requests[0].demand,
-                         static_cast<double>(sequence));
-      }
-      return true;
-    }
-    if (sequence == companion.next_send_sequence() - 1) send_backlog();
-    return HasFailure();
-  }));
-  EXPECT_EQ(gateway.snapshot().counters.rejected_command_count, 0u);
 }
 
 }  // namespace

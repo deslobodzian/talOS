@@ -249,6 +249,27 @@ and the gap (`DescribeGap`: records dropped, the first and last dropped
 dispatch), then `replay: diverged=0 clean_exit=0 stopped_at_gap=1`, and exits
 1, as it does for any replay that does not reach the recorded exit.
 
+A log that ends without its `EXIT` (cut short by a power loss, its writer
+killed, or a segment a byte cap rotated out) may end inside its last
+dispatch, which a split gap's rule covers: every dispatch before the one its
+last record belongs to replays, that dispatch's recorded part does not,
+there is no divergence for what the cut lost, and `ended_in_dispatch()`
+names it. A log with no record, or cut while the program was constructed,
+ends before the first dispatch, as a gap there does: the program's sends
+past its end are not divergences. A node binary's `--replay` prints
+`replay: <log> ends without its EXIT (cut short, its writer killed, or a
+segment its byte cap rotated out) in dispatch <n>: replayed every dispatch
+before it`, or `... before dispatch 1: ...` for one cut before its first
+dispatch, and exits 1.
+
+The loop refuses, with a `ReplayError` naming the log, a log with records
+missing between intact ones ([log format](#log-format)) and a log whose
+first dispatch is not 1 (a later segment of a rotated log starts mid-run, so
+it cannot be the program's run from its start), when it is constructed,
+before the program is; and, when `run()` starts, before the first dispatch,
+a log whose manifest does not match the program's. A node binary prints the
+error and exits 1.
+
 Log versions and byte sizes are recorded in
 [DATA_FLOW.md](../../docs/DATA_FLOW.md#dispatch-logs).
 
@@ -285,9 +306,8 @@ a dispatch `record_read()` records nothing. An early shutdown stops
 further dispatch even when collecting divergences. External shutdown is
 represented by the terminal `EXIT` record.
 
-Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`, or
-convert it for AdvantageScope with `bazel run //talOS/launcher:tlog_to_wpilog --
-/tmp/run.tlog -o /tmp/run.wpilog` (talOS/launcher/README.md).
+Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`
+(talOS/launcher/README.md).
 
 ## Replaying another session's inputs
 
@@ -315,9 +335,13 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   `/hw/status`) and its
   readers' receipts carry the same transport sequence and publication time,
   so a program that did not watch a topic live is fed each of its
-  publications once, at its publication time. One message seen
-  in several logs is kept once, by topic and transport sequence, at the
-  earliest time recorded. Logs from two sessions, or a topic recorded with
+  publications once, at its publication time. A `SEND` made before its
+  loop's first dispatch (a constructor's initial state) is recorded with no
+  clock (`now_ns` and `publish_time_ns` 0); the transport stamped it with
+  the loop's origin, which its readers recorded, so it is fed at its log's
+  origin: a restarted writer's initial message at its restart. One message
+  seen in several logs is kept once, by topic and transport sequence, at
+  the earliest time recorded. Logs from two sessions, or a topic recorded with
   two schemas, are refused.
 - A program the session ran (logs carrying its process name) replays on its
   own recorded timeline. Each process's log has its own origin, and its
@@ -365,6 +389,51 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   replays the timers after it up to that many of its periods late.
   A node binary prints `replay-inputs: stopped before a log gap in <log> at
   <t> s after the session start (topic <name>)` and exits 1.
+- A damaged stretch (records lost between intact ones,
+  [below](#log-format)) is a loss like a gap, from the earliest time a
+  record of the topic lost there could be fed at, which the log's order
+  bounds for two kinds of feed. A writer's send is fed at its publication
+  time, which is its record's `now_ns`, and `now_ns` never decreases along a
+  log (a send before the first dispatch carries 0): the bound is the last
+  intact record's `now_ns`. A reader's receipt is fed at its publication
+  time, and a watcher receives its topic in sequence order, whose
+  publication times never decrease: the bound is its last intact receipt's.
+  Both carry across the segments of one capped log: damage right after a
+  later segment's header is bounded by the segment before it, when that one
+  was read.
+  `first_gap_damage_offset` and `InputReplayReport::Gap::damage_offset` give
+  the stretch's byte offset. A node binary prints `replay-inputs: stopped
+  before damaged records in <log> at byte <offset>, <t> s after the session
+  start (topic <name>)` and exits 1. Nothing bounds the replayed program's
+  own receipts, fed at their drains' event times (a tick's deadline, or a
+  prompt watcher's publication time, which need not follow the log's
+  order), nor a reader's topic with no intact receipt before the stretch:
+  such a log is refused (below), naming it and the offset. A damaged tail
+  only shortens its log.
+- Some losses leave no mark in the log. What the byte cap cost a log (its
+  oldest segment, which may have held a GAP record, or the records after
+  capture stopped) has no GAP record: `<log>.capped` beside the log, whichever
+  of its segment files is read, or the session manifest's `log_capped` for
+  its member, shows it. Neither has a gap that its run's end cut short, nor
+  the tail a failed recorder lost (a disk error ends capture with no GAP
+  record): a writer that reached its `EXIT` wrote a GAP record for every gap
+  (`LogWriter::gaps`), so of a member the manifest marks `log_gap` or
+  `recorder_failed`
+  ([session manifest](../launcher/README.md#session-manifest)), a run's log
+  without its `EXIT` record is suspect and one with it is judged by its GAP
+  records. Each recorded topic names the first such log it is fed from, or
+  one with a damaged stretch nothing bounds (`RecordedTopic::refused_log`,
+  `refused_reason`), by the same rule as gaps, and `ReplayInputs` throws a
+  `ReplayError` before anything runs, naming the log, the sign and the topic;
+  a node binary prints it and exits 1. `RecordedSession` reads the
+  `manifest.json` in the directory holding the logs when its `session_id` is
+  the logs', and matches a member's `log_paths` to the logs by file name, so
+  a session copied elsewhere still matches; logs without one (outside a
+  launcher session) are judged by their `.capped` markers alone. A manifest
+  that is not JSON is refused, naming it. It is read with
+  `session_manifest.h`, the reader `log_dump` and Studio's review also use
+  (`talOS/launcher/hardware_record.h`) and whose key names the launcher's
+  writer uses.
 
 Replay feeds a topic the program did not watch live from the session origin,
 including messages it would have missed during startup; its output may differ
@@ -397,15 +466,22 @@ manifest's largest message; never more than `kMaxRecordPayloadBytes`, 1 MiB),
 is skipped: the reader scans to the next record magic whose header and checksum
 validate, and counts what it skipped (`LogReader::damage()`), so one damaged
 record, or a garbage or zero-filled tail left by a power loss, costs only
-itself. `--replay-inputs` replays the intact records and warns with the file
-and byte offsets; exact replay (`ReplayEventLoop`, `--replay`) refuses a log
-with records missing between intact ones, and replays a damaged tail's prefix
-as it does a truncated log's.
+itself. `--replay-inputs` warns with the file and byte offsets and, fed
+from a log with records missing between intact ones, stops before them as
+before a gap ([input replay](#replaying-another-sessions-inputs)); exact
+replay (`ReplayEventLoop`, `--replay`) refuses such a log, and replays a
+damaged tail's prefix as it does a truncated log's.
 
 `log::LogReader` holds the whole file; `log::WindowedLogReader` (and
 `VisitLog` on it) reads the same records, damage skipped the same way,
 through a fixed 64 KiB window, so a reader of a whole session (`log_dump`,
-`tlog_to_wpilog`) holds memory per log, not per record.
+Studio's review) holds memory per log, not per record. The process's
+windowed readers keep at most 64 file descriptors open between them, and an
+open that finds the process out of descriptors first closes the least
+recently read one; a reader whose descriptor was closed opens its file again
+at its next window, refusing (naming it) a path that now holds another file,
+such as a log rotated while it was read. A session of more logs than
+`RLIMIT_NOFILE` therefore reads whole.
 
 Every record a reader returns carries its byte offset in its file
 (`Record::offset`; a rotated log's segment is a file of its own, and the
@@ -479,7 +555,7 @@ later record until one that starts a new dispatch (or belongs to none, as
 the hardware bridge's do) finds at least half the pool free. That record is
 preceded in the log by one GAP record naming what was dropped, so the log
 holds every record the writer accepted, in order, and each dropped stretch is
-marked where it happened; `log_dump`, `tlog_to_wpilog` and Studio show the
+marked where it happened; `log_dump` and Studio show the
 mark ([filtering and exporting logs](../launcher/README.md#filtering-and-exporting-logs)).
 Resuming only with half the pool free (rounded up) means one GAP per half
 pool handed over at most,
@@ -495,9 +571,11 @@ is killed. Such a gap is still counted: `gaps()`, `lost_records()` and
 is what a node's and the bridge's exit status say, and the registry row's
 gap bit ([event log state](../introspection/README.md#event-log-state)),
 which the launcher reads in each supervision pass and once more from the row
-a run left when it reaps it, marks the member once a sample of the row has
-shown the gap (a run killed sooner after its pool filled leaves no trace of
-it).
+a run left when it reaps it, marks the member. A writer given
+`LogWriterOptions::gap_flags` (a node's or the bridge's, pointed at its
+row) ORs its bit into that word as it drops the gap's first record, while
+the word's owner (the row's generation) is still the one it was given, so
+a run killed at any point after that is marked.
 
 `failed()` means only that capture is over: the disk refused a write or the
 log file could not be created. **Treat it as a robot fault**, next to a

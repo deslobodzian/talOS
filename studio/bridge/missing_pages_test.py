@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from integration_test import bound_port
+from bridge_client import bound_port
 
 # Bounds only a hang: the bridge answers and stops in milliseconds.
 HANG_S = 20

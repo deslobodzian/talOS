@@ -11,6 +11,7 @@ import {renderToStaticMarkup} from 'react-dom/server';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import type {RobotEvent, Series} from '../src/data/types';
 import {AlertLevel} from '../src/data/alerts';
+import {hardwarePanel} from '../src/panels/hardware';
 import {robotPanel, maskBits, windowDelta, phaseFromSeries, badgeFor} from '../src/panels/robot';
 
 const renderPanel = (studio: Studio): string =>
@@ -40,6 +41,35 @@ test('FMS distinguishes not attached from an unknown attachment state', () => {
   assert.match(text(0), /FMSnot attached/);
   assert.match(text(1), /FMSattached/);
   assert.match(text(undefined), /FMS—/);
+});
+
+// SPEC-8, REQ-OPS-20: /hw/status `configured` means the RoboRIO acknowledged
+// the configuration push, commissioned or not; the gateway State's own
+// `configured` also requires `commissioned`. A label of plain "Configured"
+// reads as the second, so an uncommissioned robot looked ready. The robot and
+// hardware panels name it for what it is.
+test('hw/status/configured is labelled as the config acknowledgement', () => {
+  const timestamp_ns = '1000000000';
+  const studio = createStaticStudio({
+    frames: [{
+      stream_id: 'a', sequence_id: '0', timestamp_ns, dictionary_id: 1,
+      chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+      channels: {'hw/status/configured': 1, 'hw/status/commissioned': 0,
+                 'hw/status/state_age_us': 5000},
+      units: {}, labels: {}
+    }],
+    playback: {mode: 'PAUSED', cursor_ns: timestamp_ns}
+  });
+  const hardware = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  for (const html of [renderPanel(studio), hardware]) {
+    const text = html.replace(/<[^>]*>/g, '');
+    assert.match(text, /Config acknowledgedyes/);
+    assert.doesNotMatch(text, /Configuredyes/);
+  }
 });
 
 // --- pure derivations -------------------------------------------------------

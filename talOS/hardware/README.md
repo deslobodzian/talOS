@@ -24,7 +24,12 @@ addresses and bus names, inversion, encoder offsets, current/voltage limits,
 gearing, three gain slots, soft limits, TalonFX limit switches, FOC, the
 torque-current limit, and Motion Magic cruise velocity, acceleration, and
 jerk. Changed configurations
-require disabled operation. Identical pushes may succeed while enabled
+require disabled operation: the RoboRIO console names each push refused
+while enabled, `hardware gateway refused configuration <new> while enabled
+(running <old>): disable to accept the new configuration` (`<old>` is `0`
+with none in force; `Gateway::last_enabled_refusal()`, posted by the
+program's `LoopConsole`), and the bridge pushes again, backing off to once
+every 2 s. Identical pushes may succeed while enabled
 without device traffic, but not while faulted or while
 configuration/restoration is pending.
 
@@ -32,8 +37,8 @@ The RoboRIO atomically and durably (synced file, rename, synced directory)
 saves acknowledged configuration bytes with a CRC32 to
 `/home/lvuser/talos_config.bin` (`talos_config.bin` in desktop simulation;
 `ConfigStore` in the RoboRIO program). The loop hands the acknowledged
-configuration over on its first disabled tick after the acknowledgement, and
-a saver thread (`talos-config`, nice 19) syncs storage while the loop ticks
+configuration over on its first disabled tick after the acknowledgement, or
+at a clean exit (`ConfigPersister::Stop`), and a saver thread (`talos-config`, nice 19) syncs storage while the loop ticks
 on: the loop only try-locks the handover, never waits on the save, and polls
 its outcome on later ticks. The loop encodes the configuration it hands over
 and frees those bytes itself once they are saved; once started, the saver
@@ -45,8 +50,9 @@ configuration`, keeps the previous file, and an identical push saves it
 again. Startup validates
 them and starts their restoration on the configure worker without waiting for
 it, so robot code reports ready at once; the gateway stays unconfigured,
-refusing commands, until the worker finishes. Missing or corrupt files leave
-the gateway unconfigured. A file with a motor saved before `foc` or
+refusing commands, until the worker finishes. Missing or corrupt files, and
+a saved configuration this build's validation refuses, leave the gateway
+unconfigured. A file with a motor saved before `foc` or
 `max_torque_current_a` existed (protocol 10 or older) does not decode
 either, its motor records being shorter, so the RoboRIO boots unconfigured,
 printing the same `hardware gateway config=0 ... (waiting for config push)`
@@ -150,8 +156,12 @@ needs no licence and checks none.
 `max_torque_current_a` (amperes, default 0) is the largest stator current a
 torque-current demand may ask of the motor; 0 refuses the mode. Config load
 refuses a value that is negative or non-finite, above `stator_limit_a`, set
-without `foc = true` (TorqueCurrentFOC is a Phoenix Pro request) or set on a
-follower, naming the motor and the key (`hardware::Validate`). The key is in
+without `foc = true` (TorqueCurrentFOC is a Phoenix Pro request), set on a
+follower, or set on a motor another motor follows, naming the motor and the
+key, and for a follower relation both motors (`hardware::Validate`, which the
+RoboRIO also runs on a pushed config). Torque-current mode drives a single
+motor: Phoenix's Follower copies its master's torque current but not its
+`MaxAbsDutyCycle`, so `max_voltage` would not hold a follower. The key is in
 the configuration fingerprint and wire format.
 
 `position_frame` is `"rezero"` (the default) or `"absolute"`, which config
@@ -253,8 +263,7 @@ feedback divided by the configured mechanism ratio. Steering uses
 `RemoteCANcoder` with continuous wrapping. The backend uses Phoenix's voltage
 controls, which need Phoenix Pro only for a motor configured `foc = true`
 (above). A torque-current request is TorqueCurrentFOC with peak torque
-current ±`max_torque_current_a` (a follower, which copies its master's
-torque output, takes its master's; a motor without the key gets 0 A) and a
+current ±`max_torque_current_a` (0 A on a motor without the key) and a
 maximum duty cycle of `max_voltage` over the RoboRIO's last battery reading
 that was finite and above 1 V (0, no output, before the first);
 `stator_limit_a` and `supply_limit_a` apply too. Positive amperes drive the
@@ -264,11 +273,7 @@ while the demand changes, at most the bridge's command heartbeat otherwise
 ([DATA_FLOW.md](../../docs/DATA_FLOW.md)). It divides by the RoboRIO's input
 voltage reading, not the TalonFX's bus voltage, so a reading taken in a sag
 raises that interval's ceiling in proportion (read 9 V, actually 12.5 V:
-4 V becomes 5.6 V) and a stale high reading errs low. A follower of a
-torque-current master has no duty cap of its own (Phoenix's Follower copies
-the master's torque current, not its `MaxAbsDutyCycle`): a mechanically
-coupled pair is held to the cap through the master, an uncoupled follower
-is not. The gateway neutralizes a torque-current request that
+4 V becomes 5.6 V) and a stale high reading errs low. The gateway neutralizes a torque-current request that
 `TorqueCurrentAllowed` (`gate.h`) refuses: its motor lacks `foc = true` or a
 positive `max_torque_current_a`, its demand exceeds that limit, or its
 feedforward is not 0; the RoboRIO sends NeutralOut for any such request
@@ -301,11 +306,20 @@ sample reads 0 while its output sends no pulse.
 
 CAN bus load and measured sensor age must be checked on the actual bus before
 choosing production frequencies. Motion feedback requests the manifest status
-rate; motor voltage, stator current and fault field request
-`min(status_hz, 50)` Hz. Phoenix applies the highest requested rate to signals
-sharing a frame: with the pinned vendor library, voltage/current still apply
-at 200 Hz alongside 200 Hz motion feedback, while the fault field applies at
-50 Hz. See [vendor signal frequency semantics](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html#changing-update-frequency).
+rate; motor voltage, stator and supply current and fault field request
+`min(status_hz, 50)` Hz, device temperature `min(status_hz, 4)` Hz. A motor
+another motor follows also requests its duty cycle, at motor voltage's rate
+(the two share the TalonFX's MotorOutput status frame, `PRO_MotorOutput_*`
+in Phoenix's `SpnValue.hpp`, so a faster duty cycle would undo voltage's cap
+on a CAN 2.0 bus), and its voltage and duty cycle at no less than 20 Hz: a Phoenix
+follower copies its master's output signal (DutyCycle for duty-cycle
+requests, MotorVoltage for the others) at that signal's rate, which must be
+no slower than 20 Hz, while `status_hz` may be lower. Phoenix applies the
+highest requested rate to signals sharing a frame: under the pinned vendor
+library's simulation, where every signal but the fault field shares one
+frame, voltage/current still apply at 200 Hz alongside 200 Hz motion
+feedback, while the fault field applies at 50 Hz. Which signals share a
+frame on a physical bus has not been measured. See [vendor signal frequency semantics](https://v6.docs.ctr-electronics.com/en/stable/docs/api-reference/api-usage/status-signals.html#changing-update-frequency).
 The backend then calls
 `OptimizeBusUtilization()` on each TalonFX, CANcoder, and Pigeon2. Per-device
 optimization keeps the explicitly selected signals while stopping unused
@@ -347,7 +361,10 @@ buffer are both sized from that constant.
 Each `Endpoint::Tick` drains a bounded batch of frames and hands the gateway
 only the highest-sequence command among them: superseded commands queued while
 the RoboRIO loop stalled are skipped, not applied back-to-back on the CAN bus,
-and are not counted as rejected.
+and are not counted as rejected. `Endpoint::drained()` reports that command
+(its `observed_time_us` and whether `Gateway::Accept` took it), or none when
+the Tick decoded no command; the RoboRIO program ages it for its
+[latency line](#roborio).
 
 The gateway publishes its configuration ID, boot ID, control epoch, monotonic
 poll timestamp, last accepted command sequence, the echo of the last clock
@@ -367,7 +384,11 @@ The CAN buses are `CanBuses(config)` (`config.h`): slot 0 is the RoboRIO's
 own bus, `"rio"`, whether or not a device names it (the power distribution
 and pneumatics modules share it), then each other bus a motor or sensor
 names (a CANivore), in byte order. A config naming more than three buses
-besides `"rio"` is refused. Each State carries one slot, `sequence % count`
+besides `"rio"` is refused, and so is one naming two buses that differ only
+by case (`"Shooter"` and `"shooter"`, or `"RIO"` beside the implicit
+`"rio"`): Phoenix may resolve them to one bus, whose health and load would
+then be split over two slots. Names are never folded, since the wire
+carries them as written. Each State carries one slot, `sequence % count`
 (`HealthSample::can_bus_index`, `can_bus_count`), with the bus's read state,
 utilization, bus-off and transmit-buffer-full counts, receive and transmit
 error counters (saturated at 255) and the failed reads since the
@@ -416,9 +437,9 @@ does not allow (above), neutralize only that motor. Per-boot counters report ref
 commands, neutralized motors, apply failures, and device resets. The refused
 count omits two refusals of an all-neutral command (every motor neutral with
 zero demand and feedforward, every digital output off, every PWM output
-off): a current one while the gateway is disabled, uncommissioned or
-unconfigured, since the bridge keeps forwarding those while the robot cannot
-drive; and one that passes every other check but carries an earlier epoch
+off): a current one while the gateway is disabled, uncommissioned,
+unconfigured or in total feedback loss (below), since the bridge keeps
+forwarding those while the robot cannot drive; and one that passes every other check but carries an earlier epoch
 while no command is in force, since the bridge built it from a State read
 before this epoch began (at an enable or a disable, for example). Any other
 refused command counts, an earlier-epoch command that drives an output
@@ -440,7 +461,8 @@ every status; a refused State is not published) as `SEND`s in a `.tlog`
 (format in [talOS/events](../events/README.md)), the command and State as
 raw `Packet`s, each with the transport sequence and
 publication time its readers receive, and the pass that produced it as its
-event time.
+event time. A clean stop ends the log with an EXIT record, as an event
+loop's does.
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
@@ -499,7 +521,8 @@ gateway cannot see, and their position steps legitimately when the TalonFX's rem
 whose positions are not physical (the ideal `SimBackend`) opts out through
 `Backend::PositionsArePhysical()`. A reset neutralizes only affected motors and
 their followers or remote-feedback dependents before starting
-`BeginRestoreAfterReset(ids)`. The global epoch and unrelated commands survive;
+`BeginRestoreAfterReset(ids)`. The global epoch and unrelated commands survive,
+unless the reset leaves no valid motion sample, which is total loss (below);
 observations up to the last State that masked the affected motors cannot
 authorize them after recovery.
 `PollRestore()` never blocks: Phoenix reapplies only the affected device chain
@@ -514,7 +537,9 @@ neutral tick, without relying on the backend to report a restoring chain
 invalid.
 `Gateway::restore_attempt_count()` counts all restore starts per boot. Motors whose control send failed join the
 same unavailable set: their followers and dependents go neutral at once, the
-rest of the command keeps applying, and restore re-applies the chain's config
+rest of the command keeps applying (unless the isolation leaves the State
+Accept publishes no valid motion sample: total loss, below, judged there
+too), and restore re-applies the chain's config
 before a fresh command retries the send. A motor that keeps failing is
 re-isolated on that retry, at the restore backoff rate, without a global fault;
 repeat failures do not count as `apply_failure_count`, but the motor stays
@@ -561,20 +586,28 @@ remains healthy while any configured motor or CAN sensor has valid feedback
 feedback neutralizes every output and advances
 the command epoch on the tick it is found, whether or not a command is in
 force; the fault is not latched, and clears in the same epoch on the first
-State with valid feedback. Total loss is judged on the samples
-`Backend::Read` reports, after the age bound and before the gateway's masks
-(unavailable, restoring or send-failed devices, their followers and
-remote-feedback motors, a chain whose restore ends that tick). A State can
-therefore carry every motor and CAN-sensor sample invalid with
-`kHardwareFault` clear: the tick in which a reset of every device is found
-(its samples read before the gateway learned of the reset), a master whose feedback is invalid with only its
-followers configured, and a restore of every motor and CAN sensor at once,
-since `PhoenixBackend` and both simulated backends read a restoring CAN
-sensor valid (only a restoring motor invalid). Each masked motor still goes
-neutral and drives again only on a command observing a later State, while
-digital and PWM outputs keep applying and `robot_enabled` stays true. With
-no CAN sensor configured, a reset of every motor is
-total loss from the tick after it is found until its restore ends. Failed
+State with valid feedback. A command observing a State of the loss still
+matches that epoch once it clears, but drives nothing: its motors are sent
+neutral, its digital outputs false and its PWM outputs off
+(`Gateway` `outputs_drive_from_`), even a motor whose sample the backend
+left valid in a failed read pass (`Backend::Read` returning false is total
+loss whatever it read). Total loss is judged on the State as published:
+after the age bound and after the gateway's masks (unavailable, restoring or
+send-failed devices, their followers and remote-feedback motors, a chain
+whose restore ends that tick), so a State of a configured gateway with at
+least one motor or CAN sensor, none of them valid, always carries
+`kHardwareFault`. A reset of every motor and
+CAN sensor at once (a CAN brownout) is therefore total loss from the tick
+that finds it through the tick whose `PollRestore` ends the restore, whatever
+the backend reads for a restoring device (`PhoenixBackend` and both simulated
+backends read a restoring CAN sensor valid, a restoring motor invalid): for
+that time every output, DIO and PWM included, is neutral and `robot_enabled`
+is false, and the first State read after the restore clears the fault. So is
+a master whose feedback is invalid with only its followers configured. A
+reset that leaves any motor or CAN sensor valid (one motor beside a valid
+Pigeon 2) is not total loss: each masked motor goes neutral and drives again
+only on a command observing a later State, while digital and PWM outputs keep
+applying and `robot_enabled` stays true. Failed
 global Apply or backend configuration failure also neutralizes every output;
 individual device configuration or control-send failures do not. A rejected configuration push need not invalidate the active
 configuration.
@@ -642,6 +675,19 @@ socket sending again: <n> sends failed over <s> s (errno <n>[, last errno <m>])`
 raises no `SIGPIPE` on either end
 ([protocol](../protocol/README.md)).
 
+A tick that invalidates the command in force because it reached its expiry
+(`command_timeout_us` after the older of its acceptance and the State it was
+built from) prints, once per expiry, `hardware gateway command expired:
+outputs neutral at [<s>.<ms>], <x> ms after its observation, <y> ms after
+its acceptance (expiry <n>)`: that tick's time on the gateway's clock, its
+delay from the State the command was built from and from its acceptance, and
+the expiries since the program started (`Gateway::last_command_expiry()`,
+posted by `src/main/include/LoopConsole.h`). When a lost link, bridge or
+launcher caused the expiry, no State reaches the main processor and this
+line is the only record of the instant. The first expiry prints at once;
+further expiries within that second print as one line carrying the last
+one's time and the count.
+
 That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter
 post fixed-size events (fault-field, feedback-validity, late-feedback, apply
@@ -679,13 +725,50 @@ packet's send, less the backend phases inside them (link), taking the
 Driver Station reader's latest snapshot and copying and encoding it as the
 Driver Station packet (driver station; the refresh, the snapshot and the
 mode report are the reader's, outside every phase, below), and
-the watchdog beat, companion report and config persister (loop). A tick's
+the console's checks (`LoopConsole`), watchdog beat, companion report and
+config persister (loop). A tick's
 phases sum to its work, the time the loop timing line's longest work
 measures. `PhoenixBackend` takes one
 steady-clock reading per phase boundary, ten per disabled tick, and adds
 them on the loop thread without locks; the window passes to the logger at
 the loop's next tick ([bench measurement](../../docs/BENCH.md#fault-injection-and-timing)).
 `State` has no field for these, so they are RIO-local.
+
+Beside it, from the same window (REQ-RT-25):
+
+```
+[rio] latency: command age accepted p50/p99/max <a>/<b>/<c> us over <n>, refused <a>/<b>/<c> us over <n>; driver station refresh to send <a>/<b>/<c> us over <n>
+```
+
+Every figure is a difference of two readings of the RoboRIO's own clock,
+never a subtraction across processors. The command age is, for each tick
+that drained a command (`Endpoint::drained()`, the newest of the batch), the
+clock read just after the endpoint's tick less the command's
+`observed_time_us`, the `sample_time_us` of the State this gateway sent and
+the command was built from; accepted and refused (`Gateway::Accept`'s
+answer) are counted apart. An accepted age is that State's sample-to-apply
+time to within the endpoint's encode and send of its next State, which
+follows `SetControl` in the same tick; it is not the age of the CAN feedback
+in that State, nor the time the motor acts. A refused age while disabled
+includes the bridge's hold: while the gateway cannot drive, the bridge sends
+a merge whose only change is its observation on its heartbeat
+(`command_timeout_us / 5`, 5 to 20 ms), not at once. The Driver
+Station figure is, for each packet sent, the clock read after its send less
+the refresh time of the snapshot it carries (`DriverStationReader::refreshed_us`);
+the neutral snapshot sent while no refresh is current is not counted. It is
+not the Driver Station's own packet age (radio and NetComm come before the
+refresh). p50 and p99 are nearest-rank to the 100 µs bucket, never above the
+exact max; ages from 51.2 ms on land in one overflow bucket, where the
+percentiles read as the max; a figure with no samples reads `-/-/- us over
+0`. The clock runs on across a restart of the program, so a command built
+from a previous run's State (its boot id refused) is counted as refused with
+its age on this clock: after a redeploy with the launcher running, the first
+window's refused max is the restart gap. Only an observation ahead of this
+clock (one from before an OS reboot, a corrupt stamp) wraps and is dropped. The loop
+adds at most two counts a tick, reusing the phase boundaries' clock reads
+(the work falls in the phase after each); the logger takes the window by switching
+the loop to a second set of histograms (about 6 KiB each), which it clears
+after printing.
 Each of these lines, and the program's start lines, begins with
 `[<seconds>.<milliseconds>]` on the gateway's steady clock: on the RoboRIO,
 time since its kernel booted, the clock of State's `sample_time_us`, so a
@@ -730,7 +813,13 @@ time has passed it disables PWM outputs, sets DIO outputs false and sends
 `NeutralOut` to every motor, on every check until a beat moves the time (so
 outputs a resumed loop re-applies on a stale clock reading before stalling
 again are neutralized again), and sends one Driver Station error per stall,
-`talos loop watchdog`, with the silence and a stall count. It touches only
+`talos loop watchdog`, with the silence and a stall count, from a reporter
+thread of its own at the default scheduling. A stall while four reports are
+still undelivered (that Driver Station call blocked) loses its report, and
+the loop's console then prints, once per rise in that count
+(`LoopWatchdog::dropped_reports()`, posted by `LoopConsole`), `RoboRIO loop
+watchdog: <k> stall report(s) dropped (<total> since start), <n> stalls in
+all: the Driver Station error channel was not taking them`. It touches only
 the device handles (Phoenix 6 serializes each device's control sends behind
 a per-device mutex; HAL DIO and PWM writes are safe from any thread), skips
 devices a configure is rebuilding, and does not act while the loop ticks on
@@ -888,7 +977,7 @@ Build without deploying:
 ```sh
 cd controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader; and rioBuildStampTest
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, LoopConsole, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader; and rioBuildStampTest
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway
@@ -981,7 +1070,7 @@ or without a live command. Both keep each PWM output's last request
 | Stator current | Zero | (applied volts - back-EMF) / R, clamped to `stator_limit_a`; R and free speed from the motor type's published 12 V stall current and free speed (`MotorModelFor`: Kraken X60 366 A and 6000 rpm, the default; Kraken X44 275 A and 7530 rpm; Falcon 500 257 A and 6380 rpm). A motor held at a soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid, its age growing), per-device disconnect, controller restart |
-| Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it, so a config of only that chain is total feedback loss for that State; completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
+| Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it (the gateway masks it in those States either way); completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
 
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see

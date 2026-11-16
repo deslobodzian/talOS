@@ -40,10 +40,32 @@ struct RecordedTopic {
   // otherwise the first reader's that did.
   std::string recorded_by;
   std::size_t message_count{0};
-  // The earliest LogGap::start_ns in a log this topic is fed from, and that
-  // log; empty when none has a gap.
+  // The earliest loss in a log this topic is fed from, and that log; empty
+  // when none lost records. A loss is a GAP record, from its
+  // LogGap::start_ns, or a damaged stretch (records lost between intact
+  // ones), from the earliest time a record of this topic lost there could
+  // be fed at: for a writer's sends, the now_ns of the last intact record
+  // before the stretch (a send is fed at its publication time, its record's
+  // now_ns, and now_ns never decreases along a log); for a reader's
+  // receipts, the publication time of its last intact receipt of the topic
+  // (a watcher receives in sequence order); both counted along the log
+  // across its segments (a later segment starts from the one before it,
+  // when read). Where nothing bounds it, the log is refused instead (below).
   std::optional<MonotonicTime> first_gap;
   std::string first_gap_log;
+  // Where that loss is a damaged stretch: its byte offset in first_gap_log.
+  std::optional<std::uint64_t> first_gap_damage_offset;
+  // The first log (in log_paths() order) this topic is fed from that input
+  // replay refuses, and why, naming the sign it found: the log's
+  // `<log>.capped` marker, the session manifest's `log_capped`, its
+  // `log_gap` or `recorder_failed` for a run's log without its EXIT record,
+  // or a damaged stretch
+  // (its byte offset) before which no receipt bounds the topic's lost
+  // records (the replayed program's own receipts, fed at their drains'
+  // event times, which need not follow the log's order; a reader's topic
+  // with no intact receipt before it). Empty when none.
+  std::string refused_log;
+  std::string refused_reason;
 };
 
 struct RecordedMessage {
@@ -68,24 +90,48 @@ struct RecordedMessage {
 //
 // Every other topic is fed from all logs: a message's time is its producer's
 // publish time, preserved in both SEND and MESSAGE records even when only a
-// delayed reader logged it, and one message seen in several logs is kept
-// once, by topic and transport sequence.
+// delayed reader logged it (a send recorded before its loop's first
+// dispatch, with no clock, at its log's origin, the transport's stamp), and
+// one message seen in several logs is kept once, by topic and transport
+// sequence.
 //
-// A log with a GAP record (log/format.h) lost records there: each topic
-// notes the earliest gap start in a log it is fed from (first_gap), which is
-// where ReplayInputs ends a run that feeds it. When the replayed program's
-// own log has a gap before any timer firing, run_start() comes from the
-// first firing after it, never before the gap's start less that timer's
-// offset: no replayed timer then fires before the gap, as none did live.
+// A log with a GAP record (log/format.h), or a damaged stretch (records lost
+// between intact ones, log::LogDamage::spans), lost records there: each
+// topic notes the earliest such loss in a log it is fed from (first_gap),
+// which is where ReplayInputs ends a run that feeds it. When the replayed
+// program's own log has a loss before any timer firing, run_start() comes
+// from the first firing after it, never before the loss's start less that
+// timer's offset: no replayed timer then fires before it, as none did live.
+//
+// A log may also have lost records nothing in it marks: one the byte cap
+// cost records (`<log>.capped`, log::CappedMarkerPath, beside the log a
+// `<stem>.segment<k>.tlog` belongs to, or the session manifest's
+// `log_capped` for its member: its oldest segment deleted, which may have
+// held a GAP record, or capture stopped at the cap), and a run's log without
+// its EXIT record of a member the manifest marks `log_gap` or
+// `recorder_failed`, whose gap that run's end may have cut short before its
+// GAP record was written, or whose recorder failed (a disk error ends
+// capture with no GAP record). A run's
+// log with its EXIT holds a GAP record for every gap (LogWriter::gaps) and
+// is judged by them. Each topic notes the first such log it is fed from
+// (refused_log), which ReplayInputs refuses, as it does a damaged stretch
+// that nothing bounds. The manifest is `manifest.json` in the directory
+// holding the logs (talOS/launcher/README.md, "Session manifest"), used
+// when its session_id is the logs'; it names a member's logs by the paths
+// they were recorded at (`nodes[].log_paths`), matched here by file name, so
+// a session read from another directory still matches. Logs with no such
+// manifest beside them (a directory outside a launcher session, another
+// session's manifest) are judged by their `.capped` markers alone.
 class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)
   // or one log; `replayed` is the process name of the program to be
   // replayed, or empty for none. Throws std::runtime_error on an unreadable
-  // log, on logs from two sessions, and on a topic the logs record with two
-  // schemas. A log's damaged records are skipped (log::LogReader), and what
-  // was skipped is printed to stderr as a warning naming the file and byte
-  // offsets.
+  // log, on logs from two sessions, on a topic the logs record with two
+  // schemas, and on a manifest.json beside them that is not JSON. A log's
+  // damaged records are skipped (log::LogReader) and mark a loss or a
+  // refusal (above); what was skipped is printed to stderr as a warning
+  // naming the file and byte offsets.
   explicit RecordedSession(const std::string& path,
                            std::string_view replayed = {});
 
@@ -147,8 +193,12 @@ struct InputReplayReport {
     std::string topic;
     std::string log;
     MonotonicTime at;
+    // Set when the loss is a damaged stretch, not a GAP record: its byte
+    // offset in `log`.
+    std::optional<std::uint64_t> damage_offset;
   };
-  // Set when the run ended before a gap in a log it was fed from.
+  // Set when the run ended before a loss (a gap or damage) in a log it was
+  // fed from.
   std::optional<Gap> stopped_at_gap;
 };
 
@@ -162,8 +212,8 @@ const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
 // Runs `loop` to session.loop_end(), publishing every recorded message on a
 // topic the program watches with its recorded publish time, just before the
 // first drain at or after its `delivered` time, which delivers it. It never
-// feeds across a log gap: when a topic it feeds has a first_gap at or before
-// loop_end(), the run ends one nanosecond before the earliest such gap (the
+// feeds across a loss: when a topic it feeds has a first_gap at or before
+// loop_end(), the run ends one nanosecond before the earliest such loss (the
 // first fed topic's on a tie), feeding nothing delivered at or after it, and
 // the report's stopped_at_gap names it. A topic
 // the program sends itself is its own output and is not fed. `loop` must
@@ -171,7 +221,8 @@ const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
 // session.loop_start() with its run starting at session.run_start()
 // (SimulatedEventLoop::Options::start, run_start). Finishes the loop, which
 // closes its recorder's log. Throws ReplayError before running on a schema
-// mismatch.
+// mismatch, and on a topic it would feed from a refused log (refused_log),
+// naming the log, the sign and the topic.
 template <RecorderPolicy Recorder>
 InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
                                SimulationEnvironment& environment,
@@ -205,6 +256,11 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
       report.unrecorded.push_back(registration.name);
       continue;
     }
+    if (!topic->refused_log.empty()) {
+      throw ReplayError("input replay refuses " + topic->refused_log +
+                        ", which topic '" + topic->name +
+                        "' would be fed from: " + topic->refused_reason);
+    }
     const auto index =
         static_cast<std::size_t>(topic - session.topics().data());
     if (channels[index] != nullptr) continue;  // watched twice
@@ -219,7 +275,8 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
         (!report.stopped_at_gap.has_value() ||
          *topic->first_gap < report.stopped_at_gap->at)) {
       report.stopped_at_gap = InputReplayReport::Gap{
-          topic->name, topic->first_gap_log, *topic->first_gap};
+          topic->name, topic->first_gap_log, *topic->first_gap,
+          topic->first_gap_damage_offset};
     }
   }
   // Nothing at or past the gap is fed or run: the run ends one nanosecond

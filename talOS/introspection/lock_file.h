@@ -95,9 +95,9 @@ inline int OpenLockFile(const std::string& path, int access) {
 }
 
 // True while `path` names the file open on `fd`. A lock taken on a file that
-// was unlinked meanwhile (by its last holder never, but by a /tmp cleaner, or
-// by hand) excludes nobody who opens the path anew, so an acquirer that finds
-// this false closes the descriptor and acquires again.
+// was unlinked meanwhile (by a namespaced launcher session at its end, a /tmp
+// cleaner, or by hand) excludes nobody who opens the path anew, so an
+// acquirer that finds this false closes the descriptor and acquires again.
 inline bool LockFileIsCurrent(int fd, const std::string& path) {
   struct stat held {};
   struct stat named {};

@@ -1,6 +1,7 @@
 # Installing a development environment
 
-Development only. Deploying to the robot is [DEPLOYMENT.md](DEPLOYMENT.md) / `tools/deploy.sh`.
+Development only, plus the [realtime grant](#realtime-grant-for-deploysh-run) a
+hand-run bundle needs. Deploying to the robot is [DEPLOYMENT.md](DEPLOYMENT.md) / `tools/deploy.sh`.
 
 ## Quick start
 
@@ -31,7 +32,7 @@ by `.bazelversion` (8.6.0) and fetched by bazelisk.
 | `flatc` | none: `pnpm generate` runs Bazel's pinned `@flatbuffers//:flatc` (same as the `//studio:telemetry_ts` genrule) | – | – | run `pnpm generate` in WSL |
 | clang-format 18, clang-tidy 18 | lint (`tools/format.sh`, `tools/tidy.sh`) | PyPI wheels `==18.1.8` in a private venv under `~/.cache/talos/clang-18` (via `uv` if present, else `python3 -m venv`); no system package | same | in WSL |
 | buildifier | lint | GitHub release (sha256-verified) | brew | in WSL |
-| WPILib 2026 | AdvantageScope, sim GUI | optional | optional | manual installer (not on winget) |
+| WPILib 2026 | sim GUI | optional | optional | manual installer (not on winget) |
 
 CI uses clang-format/clang-tidy 18 and buildifier 8.2.1. `tools/setup.sh`
 installs the 18.1.8 wheels, which are the same upstream release line as CI's
@@ -156,6 +157,25 @@ Third-party patches in `third_party/` that sanitizer runs depend on:
   corrupt-scan variants of one fixture photograph under ASan/UBSan (memory
   safety only); intact photographs are decoded in
   `//talOS/vision/apriltag:cpu_apriltag_backend_test`.
+
+## Realtime grant for deploy.sh run
+
+On Linux, [`deploy.sh run`](DEPLOYMENT.md#on-the-main-processor) starts a
+bundle by hand with the boot service's realtime limits (`RLIMIT_RTPRIO` 49,
+the bridge's `SCHED_FIFO` priority; `RLIMIT_MEMLOCK` unlimited, for
+`mlockall`), which an account may take only when its hard limits already
+allow them. Grant them once, for the account that runs it, and log in again:
+
+```sh
+printf '%s\n' "$(id -un) - rtprio 49" "$(id -un) - memlock unlimited" |
+  sudo tee /etc/security/limits.d/talos.conf
+```
+
+Afterwards `ulimit -H -r` prints `49` and `ulimit -H -l` prints `unlimited`
+in a new login (pam_limits applies the file at login, ssh included). For one
+terminal only, without the file: `sudo prlimit --pid $$ --rtprio=49:49
+--memlock=unlimited:unlimited`. The boot service needs neither: its unit
+sets the limits itself. macOS needs no grant.
 
 ## Editor setup
 

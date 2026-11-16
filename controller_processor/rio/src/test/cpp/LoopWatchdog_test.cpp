@@ -12,8 +12,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,6 +66,7 @@ TEST(LoopWatchdog, ActsOnlyOnceTheLastArmedDeadlinePasses) {
   watchdog.Poll(deadline_us);
   EXPECT_EQ(outputs.neutralize_calls, 1);
   EXPECT_EQ(watchdog.stall_count(), 1u);
+  watchdog.DeliverReports();
   ASSERT_EQ(outputs.reports.size(), 1u);
   // Stamped with the acting poll's time on the console's clock, so the
   // Driver Station message and its console copy line up with the program's
@@ -104,6 +108,7 @@ TEST(LoopWatchdog, OutputsReappliedWithoutABeatAreNeutralizedAgain) {
        now_us < deadline_us + 1'000'000; now_us += kPeriodUs)
     watchdog.Poll(now_us);
   EXPECT_EQ(outputs.neutralize_calls, 200);
+  watchdog.DeliverReports();
   EXPECT_EQ(outputs.reports.size(), 1u);
   EXPECT_EQ(watchdog.stall_count(), 1u);
 }
@@ -127,7 +132,79 @@ TEST(LoopWatchdog, AResumedLoopReArmsIt) {
   watchdog.Poll(now_us - kPeriodUs + kDeadlineAfterUs);
   EXPECT_EQ(outputs.neutralize_calls, 2);
   EXPECT_EQ(watchdog.stall_count(), 2u);
+  watchdog.DeliverReports();
   EXPECT_EQ(outputs.reports.size(), 2u);
+}
+
+// Outputs whose Report blocks, as HAL_SendError does on a NetComm round trip
+// (13.5 ms on the bench with no Driver Station), until the test releases it.
+class BlockingReportOutputs final : public talos::rio::WatchdogOutputs {
+ public:
+  bool Neutralize() override {
+    std::lock_guard lock{mutex_};
+    ++neutralize_calls_;
+    changed_.notify_all();
+    return true;
+  }
+  void Report(std::string_view) override {
+    std::unique_lock lock{mutex_};
+    if (++reports_started_ == 1) calls_before_report_ = neutralize_calls_;
+    changed_.notify_all();
+    // The deadline only bounds a hang.
+    changed_.wait_for(lock, std::chrono::seconds{10},
+                      [&] { return released_; });
+  }
+  // Waits until `n` Neutralize calls made after the first Report started
+  // blocking (polls before the reporter's first delivery do not count);
+  // false if they do not come within 5 s (the bound of a hang, not a
+  // timing).
+  bool NeutralizedWhileReportBlocked(int n) {
+    std::unique_lock lock{mutex_};
+    return changed_.wait_for(lock, std::chrono::seconds{5}, [&] {
+      return reports_started_ > 0 &&
+             neutralize_calls_ - calls_before_report_ >= n;
+    });
+  }
+  void Release() {
+    std::lock_guard lock{mutex_};
+    released_ = true;
+    changed_.notify_all();
+  }
+  int neutralize_calls() {
+    std::lock_guard lock{mutex_};
+    return neutralize_calls_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  int neutralize_calls_{0};
+  int reports_started_{0};
+  int calls_before_report_{0};
+  bool released_{false};
+};
+
+// The stall's Driver Station report is a NetComm call that can block for
+// milliseconds; made on the watchdog's thread it would hold the next polls'
+// neutrals behind it. So the polls go on, neutralizing each time, while the
+// report is still blocked: three neutrals after it started blocking, since
+// the polls before the reporter's first delivery would pass even with polls
+// that wait on a delivery in progress.
+// REQ-SAFE-25
+TEST(LoopWatchdog, PollsKeepNeutralizingWhileTheReportBlocks) {
+  BlockingReportOutputs outputs;
+  LoopWatchdog watchdog{outputs};
+  // Armed with a deadline the watchdog's clock is already past: every poll
+  // acts.
+  watchdog.Beat(1'000'000, 1'000'000);
+  watchdog.Start([] { return uint64_t{2'000'000}; }, 0);
+  const bool kept_polling = outputs.NeutralizedWhileReportBlocked(3);
+  const int calls = outputs.neutralize_calls();
+  outputs.Release();
+  watchdog.Stop();
+  EXPECT_TRUE(kept_polling)
+      << "the polls stopped behind the blocked report after " << calls
+      << " neutral(s)";
 }
 
 #ifdef __linux__

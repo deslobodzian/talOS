@@ -107,9 +107,8 @@ struct SimHardware::Impl {
   // for; `masked` adds the chain restored with them: followers of a masked
   // motor and motors fed by a masked remote CANcoder. The RoboRIO reports a
   // motor of that chain invalid itself while it restores it (PhoenixBackend
-  // Read), so the total-loss judgment sees it; a CANcoder's own sample stays
-  // valid there, and only the gateway's MaskUnavailable, after the judgment,
-  // masks it.
+  // Read); a CANcoder's or gyro's own sample stays valid there, and the
+  // gateway's MaskUnavailable masks it (MaskUnable here).
   static constexpr int kRestoreStates = 2;
   std::map<std::pair<Kind, std::uint16_t>, int> resetting;
   std::set<std::pair<Kind, std::uint16_t>> masked;
@@ -124,9 +123,10 @@ struct SimHardware::Impl {
   // The gateway's epoch: Invalidate() moves it on, and a request built from
   // a State of another epoch never merges.
   std::uint64_t epoch = 1;
-  // As the gateway's healthy_: whether the latest State had any valid motor
-  // or CAN sensor sample (hardware::AnyFeedbackValid). While it is false the
-  // gateway refuses every request.
+  // As the gateway's healthy_: whether the latest State, as published (masks
+  // included), had any valid motor or CAN sensor sample
+  // (hardware::AnyFeedbackValid). While it is false the gateway refuses every
+  // request.
   bool healthy = false;
   // Sample time of the latest State the bridge accepted this boot, against
   // which a request's observation is admitted.
@@ -341,26 +341,26 @@ struct SimHardware::Impl {
     }
   }
 
+  // The chain the gateway restores with the reset devices, by its own rule
+  // (hardware::RestoredWith; logical ids are unique across device tables).
   void MaskResets() {
     masked.clear();
-    for (const auto& [key, states] : resetting) masked.insert(key);
-    for (std::size_t pass = 0; pass < config.hardware.motors.size(); ++pass) {
-      for (const auto& m : config.hardware.motors) {
-        const bool master =
-            m.master_id != 0 && masked.contains({Kind::kMotor, m.master_id});
-        const bool sensor =
-            m.feedback == hardware::Feedback::kRemoteCANcoder &&
-            masked.contains({Kind::kCANcoder, m.feedback_sensor_id});
-        if (master || sensor) {
-          masked.insert({Kind::kMotor, m.id});
-        }
+    std::vector<std::uint16_t> ids;
+    for (const auto& [key, states] : resetting) {
+      masked.insert(key);
+      ids.push_back(key.second);
+    }
+    const auto& motors = config.hardware.motors;
+    for (std::size_t i = 0; i < motors.size(); ++i) {
+      if (hardware::RestoredWith(motors, i, ids)) {
+        masked.insert({Kind::kMotor, motors[i].id});
       }
     }
     std::erase_if(resetting, [](auto& entry) { return --entry.second <= 0; });
   }
 
-  // The gateway's tick after its total-loss judgment (MaskUnavailable,
-  // NeutralUnavailable): a reset CANcoder's sample is invalid, and a
+  // The gateway's masks (MaskUnavailable, NeutralUnavailable), before its
+  // total-loss judgment: a reset CANcoder's or gyro's sample is invalid, and a
   // follower's while its master's is; a motor that cannot drive in this State
   // (hardware::MotorMayDrive) applies neutral now, not at the next request,
   // and only a request observing a later State drives it again. Other motors
@@ -388,11 +388,11 @@ struct SimHardware::Impl {
   }
 
   // The gateway's total-loss rule (Gateway::Tick), judged as the gateway
-  // judges it: on the samples the RoboRIO reports, after the age bound and
-  // before MaskUnable. A State with no valid motor or CAN sensor sample
-  // carries kHardwareFault, and the first such State (or one while a request
-  // is merged) starts a new epoch with every output neutral. Recovery clears
-  // the fault in the same epoch.
+  // judges it: on the State as published, after the age bound and after
+  // MaskUnable. A State with no valid motor or CAN sensor sample carries
+  // kHardwareFault, and the first such State (or one while a request is
+  // merged) starts a new epoch with every output neutral. Recovery clears the
+  // fault in the same epoch.
   void JudgeTotalLoss(hardware::State& state) {
     const bool was_healthy = healthy;
     healthy = hardware::AnyFeedbackValid(state);
@@ -441,10 +441,13 @@ struct SimHardware::Impl {
         samples[i] = sample_of(configs[i]);
       }
     };
+    // A disconnected motor or CAN sensor reads as the gateway publishes a
+    // device that stopped answering: its last readings through
+    // hardware::MarkInvalid (ages and temperature kept, every measurement
+    // zero). Its limit switches read released, as Phoenix reports a stale
+    // FaultField.
     fill(state.motors, state.motor_count, hw.motors, [&](const auto& c) {
-      if (!Connected(Kind::kMotor, c.id)) {
-        return hardware::MotorSample{.id = c.id};
-      }
+      const bool connected = Connected(Kind::kMotor, c.id);
       const MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
       hardware::MotorSample sample{
           .id = c.id,
@@ -454,18 +457,15 @@ struct SimHardware::Impl {
           .stator_current_a = axis.stator_current_a,
           .position_age_us = axis.position_age_us,
           .velocity_age_us = axis.velocity_age_us,
-          .fault_flags = ValueOr(motor_limit_flags, c.id, 0u),
+          .fault_flags = connected ? ValueOr(motor_limit_flags, c.id, 0u) : 0u,
           .temperature_c = axis.temperature_c,
           .supply_current_a = axis.supply_current_a};
-      if (!Fresh(axis) || masked.contains({Kind::kMotor, c.id})) {
+      if (!connected || !Fresh(axis) || masked.contains({Kind::kMotor, c.id})) {
         hardware::MarkInvalid(sample);
       }
       return sample;
     });
     fill(state.sensors, state.sensor_count, hw.sensors, [&](const auto& c) {
-      if (!Connected(Kind::kCANcoder, c.id)) {
-        return hardware::SensorSample{.id = c.id};
-      }
       const Axis axis = ValueOr(sensors, c.id, Axis{});
       hardware::SensorSample sample{.id = c.id,
                                     .valid = true,
@@ -473,7 +473,9 @@ struct SimHardware::Impl {
                                     .velocity_rps = axis.velocity,
                                     .position_age_us = axis.position_age_us,
                                     .velocity_age_us = axis.velocity_age_us};
-      if (!Fresh(axis)) hardware::MarkInvalid(sample);
+      if (!Connected(Kind::kCANcoder, c.id) || !Fresh(axis)) {
+        hardware::MarkInvalid(sample);
+      }
       return sample;
     });
     fill(state.digital_inputs, state.digital_input_count, hw.digital_inputs,
@@ -520,8 +522,8 @@ struct SimHardware::Impl {
            return hardware::PwmSample{c.id, true,
                                       ValueOr(applied_pwm_outputs, c.id, 0.0)};
          });
-    JudgeTotalLoss(state);
     MaskUnable(state);
+    JudgeTotalLoss(state);
 
     if (lost_states > 0) {
       // The RoboRIO samples the Driver Station mode every tick whether or not
