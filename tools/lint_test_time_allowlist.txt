@@ -26,8 +26,8 @@ talOS/bridge/run_test.cc clock 8 seeded: integration, bridge loop over UDP; wake
 talOS/bridge/run_test.cc sleep 2 seeded: integration, bridge loop over UDP; wake latency on the real clock
 talOS/events/log/log_kill_test.cc clock 2 integration: kills a writer process, waits with a deadline
 talOS/events/log/log_kill_test.cc sleep 2 integration: kills a writer process, waits with a deadline
-talOS/events/log/log_test.cc clock 6 seeded: integration, writer thread; TEST-8 replaces the IdleWriterDoesNotPoll and ProducerNeverWaitsForTheLogFile sleeps
-talOS/events/log/log_test.cc sleep 8 seeded: integration, writer thread; TEST-8 replaces the IdleWriterDoesNotPoll and ProducerNeverWaitsForTheLogFile sleeps
+talOS/events/log/log_test.cc clock 4 integration: the writer thread; Eventually's 10 s deadline only bounds a hang, and UncreatableLogFailsWithoutThrowing needs its periodic sync due
+talOS/events/log/log_test.cc sleep 6 integration: the writer thread; Eventually polls 1 ms apart, and the wakeup tests (REQ-RT-21) space records and count wakeups over a real-time window
 talOS/events/os/poller_test.cc sleep 2 integration: real kqueue/epoll timer delivery across threads
 talOS/events/realtime_event_loop_test.cc clock 4 seeded: integration, the realtime loop on the real clock; sleeps unaudited against TESTING.md §6.3
 talOS/events/realtime_event_loop_test.cc sleep 4 seeded: integration, the realtime loop on the real clock; sleeps unaudited against TESTING.md §6.3
