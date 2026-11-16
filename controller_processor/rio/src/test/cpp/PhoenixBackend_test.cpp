@@ -1042,6 +1042,7 @@ TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
 // MotorVoltage in the voltage-based ones; at the slowest status rate config
 // load allows (status_hz 8 at the 500 ms timeout cap) both must still reach
 // 20 Hz.
+// REQ-CONTRACT-40
 TEST_F(PhoenixBackendRecovery, AMasterWithFollowersSendsItsOutputAt20Hz) {
   EnsureHal();
   for (const double status_hz : {200.0, 8.0}) {
