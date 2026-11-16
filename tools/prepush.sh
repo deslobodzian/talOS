@@ -6,13 +6,21 @@
 # checkout, every test result fresh, and no header read from the host's
 # include tree (tools/check_host_includes.py). docs/DEVELOPMENT.md §5 rung 3.
 #
-#   tools/prepush.sh [--ref <commit>] [--keep] [--skip-gradle] [--skip-studio]
+#   tools/prepush.sh [--ref <commit>] [--keep] [--full] [--skip-gradle]
+#                    [--skip-studio]
 #
 #   --ref          the commit to check (default HEAD)
 #   --keep         leave the worktree in place afterwards
-#   --skip-gradle  do not run the RoboRIO program's gradle checks
+#   --full         also run CI's sanitizer lanes and one soak seed, and
+#                  rio-in-the-loop whatever the commits touch; required
+#                  for a push of more than 20 commits
+#   --skip-gradle  do not run the RoboRIO program's gradle checks or
+#                  rio-in-the-loop (refused with --full)
 #   --skip-studio  do not run Studio's pnpm checks
 #
+# First, without --full, when more than 20 commits are to push (since
+# <ref>@{upstream}; with no upstream, those on no remote-tracking branch),
+# the line `prepush: full SKIPPED (...)`, which fails the run.
 # Steps, in order: read-only, source-lints (tools/source_lints.sh, the
 # lints CI's "Source lints (no Bazel)" job runs: test time, links,
 # requirement trace, node test matrix; under a second; a commit without the
@@ -33,10 +41,20 @@
 # it; unset, one `skipped` line that does not fail the run; set, empty
 # included, to something that is not a directory, the step FAILED, since it
 # names no robot repository; tools/prepush_robot_repository.sh decides),
-# checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
-# --offline`, for controller_processor/ and talOS/, whose headers
-# the RoboRIO program's build.gradle exports) and studio-test and
-# studio-build (`pnpm test`, `pnpm build`, for studio/).
+# gradle (`phoenixTest buildRio -Pheadless --offline`, when the commits
+# touch controller_processor/ or talOS/, whose headers the RoboRIO
+# program's build.gradle exports), rio-in-the-loop (`python3
+# tools/test_rio_in_the_loop.py --wpilib --output-dir <logs>/rio-in-the-loop`,
+# CI's job of that name, on the build step's bazel-bin; about 30 s with a
+# warm Gradle daemon; under --full, or when the commits touch
+# tools/test_rio_in_the_loop.py, bench/, controller_processor/ or
+# talOS/{hardware,bridge,devices,node,protocol,driver_station}; a commit
+# without the tool prints `rio-in-the-loop skipped`, which does not fail
+# the run), under --full only tsan and asan (tools/sanitizer_lane.sh, CI's
+# sanitizer jobs; 5 to 10 minutes each cold) and soak (CI's soak_test with
+# seed 0 for TALOS_SOAK_SECONDS=36, the shortest run that injects every
+# fault kind), checkout-unchanged, then, when the commits touch studio/,
+# studio-test and studio-build (`pnpm test`, `pnpm build`).
 # Each step prints one line (`prepush: <step> ok`, `prepush: <step> FAILED
 # (see <log>)`, `prepush: <step> SKIPPED (<reason>)`); logs stay in a
 # directory under ${TMPDIR:-/tmp}.
@@ -67,12 +85,14 @@ die() { echo "prepush: $*" >&2; exit 2; }
 
 ref=HEAD
 keep=0
+full=0
 skip_gradle=0
 skip_studio=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) [ $# -ge 2 ] || die "--ref needs a commit"; ref="$2"; shift ;;
     --keep) keep=1 ;;
+    --full) full=1 ;;
     --skip-gradle) skip_gradle=1 ;;
     --skip-studio) skip_studio=1 ;;
     -h|--help) sed -n '2,/^set /p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
@@ -80,6 +100,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+[ "$full" = 0 ] || [ "$skip_gradle" = 0 ] ||
+  die "--full runs the RoboRIO program in the loop through Gradle: drop --skip-gradle"
+# More commits than this to push need --full (docs/DEVELOPMENT.md §5).
+full_after_commits=20
 
 tools="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=tools/prepush_robot_repository.sh
@@ -184,6 +208,20 @@ touches() {  # touches PATH...: the pushed range changes something under PATH.
   [ -n "$changed" ]
 }
 
+# A long range carries more than the default steps catch (the sanitizer
+# lanes and the soak run only under --full). Without an upstream, the
+# commits to push are those on no remote-tracking branch.
+if [ -n "$upstream" ]; then
+  pushing="$(git -C "$repo" rev-list --count "$upstream..$commit")"
+  pushing_from="since $upstream"
+else
+  pushing="$(git -C "$repo" rev-list --count "$commit" --not --remotes)"
+  pushing_from="on no remote-tracking branch"
+fi
+if [ "$full" = 0 ] && [ "${pushing:-0}" -gt "$full_after_commits" ]; then
+  skip full "$pushing commits $pushing_from: docs/DEVELOPMENT.md §5 requires --full for a push of more than $full_after_commits"
+fi
+
 run_step read-only python3 "$tools/make_sources_read_only.py" || {
   echo "prepush: cannot make the worktree read-only; stopping"
   exit 1
@@ -208,10 +246,12 @@ bazel_flags=(--noshow_progress "--disk_cache=$disk_cache"
 # Before the build, every `.d` in the reused output base is deleted, so
 # host-includes reads only this build's: the build rewrites or downloads
 # each one it needs, and one of a target since deleted is gone.
+built=0
 if run_step build sh -c \
     'out="$(bazel info "$@" output_path)" &&
      { [ ! -d "$out" ] || find "$out" -name "*.d" -type f -delete; } &&
      bazel build //... "$@"' _ "${bazel_flags[@]}"; then
+  built=1
   run_step host-includes sh -c \
     'python3 "$1" "$(shift; bazel info "$@" output_path)"' _ \
     "$tools/check_host_includes.py" "${bazel_flags[@]}" || true
@@ -306,23 +346,63 @@ case $? in
     failed=1
     ;;
 esac
-run_step checkout-unchanged sh -c \
-  'out="$(git status --porcelain --untracked-files=all)"; [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }' ||
-  true
-
 # build.gradle compiles sources from talOS/protocol, talOS/hardware and
 # talOS/driver_station and exports every header under talOS/.
+export JAVA_HOME="${JAVA_HOME:-$HOME/wpilib/2026/jdk}"
 rio_paths=(controller_processor/ talOS/)
 if [ "$skip_gradle" = 1 ]; then
   report "gradle skipped (--skip-gradle)"
 elif ! touches "${rio_paths[@]}"; then
   report "gradle not needed (nothing under ${rio_paths[*]} since $upstream)"
 else
-  export JAVA_HOME="${JAVA_HOME:-$HOME/wpilib/2026/jdk}"
   run_step gradle sh -c \
     'cd controller_processor/rio && ./gradlew phoenixTest buildRio -Pheadless --offline' ||
     true
 fi
+
+# CI's "RoboRIO program in the loop (WPILib sim)" job: the bench's swerve
+# module node and the bridge, from the build step's bazel-bin, against the
+# RoboRIO program under WPILib desktop simulation (Gradle builds it). It
+# binds UDP ports 5802 and 5803, and in the worktree writes only ignored
+# files (Gradle's build/ and .gradle/, the simulation's ctre_sim/ and its
+# saved talos_config.bin), which checkout-unchanged then confirms.
+rio_loop_paths=(tools/test_rio_in_the_loop.py bench/ controller_processor/
+  talOS/hardware/ talOS/bridge/ talOS/devices/ talOS/node/ talOS/protocol/
+  talOS/driver_station/)
+if [ "$skip_gradle" = 1 ]; then
+  report "rio-in-the-loop skipped (--skip-gradle)"
+elif [ "$full" = 0 ] && ! touches "${rio_loop_paths[@]}"; then
+  report "rio-in-the-loop not needed (nothing under ${rio_loop_paths[*]} since $upstream)"
+elif [ ! -f "$wt/tools/test_rio_in_the_loop.py" ]; then
+  report "rio-in-the-loop skipped (this commit has no tools/test_rio_in_the_loop.py)"
+elif [ "$built" = 0 ]; then
+  skip rio-in-the-loop "the build failed"
+else
+  run_step rio-in-the-loop python3 tools/test_rio_in_the_loop.py --wpilib \
+    --output-dir "$logs/rio-in-the-loop" || true
+fi
+
+# CI's sanitizer jobs, from the commit's own tools/sanitizer_lane.sh (CI
+# runs the same one), and one soak seed: CI's soak with the seed its branch
+# pushes use, for 36 s of teleop rather than 180 s, the shortest run that
+# injects every fault kind once (bench/main_processor/simulation/README.md).
+if [ "$full" = 1 ]; then
+  for lane in tsan asan; do
+    run_step "$lane" bash tools/sanitizer_lane.sh "$lane" \
+      --nocache_test_results --noshow_progress "--disk_cache=$disk_cache" ||
+      true
+  done
+  run_step soak bazel test //bench/main_processor/simulation:soak_test \
+    --test_output=errors --nocache_test_results \
+    --test_env=TALOS_SOAK_SECONDS=36 --test_env=TALOS_SOAK_SEED=0 \
+    --noshow_progress "--disk_cache=$disk_cache" || true
+else
+  report "tsan, asan and soak not run (they run under --full)"
+fi
+
+run_step checkout-unchanged sh -c \
+  'out="$(git status --porcelain --untracked-files=all)"; [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }' ||
+  true
 
 if [ "$skip_studio" = 1 ]; then
   report "studio skipped (--skip-studio)"

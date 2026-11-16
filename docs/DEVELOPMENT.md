@@ -74,7 +74,7 @@ Climb as far as the change reaches; never skip a rung below it.
 | 0 | `task` | the narrow target its brief names | while implementing |
 | 1 | main session | `bazel test //touched/package:all` | after integrating each slice |
 | 2 | main session | the affected tests (below), and `--describe-only` on each affected config | before each commit |
-| 3 | main session | RULES.md 11 in full: `tools/prepush.sh` | before each push, from a clean worktree of the commits to push |
+| 3 | main session | RULES.md 11 in full: `tools/prepush.sh` (`--full` for more than 20 commits) | before each push, from a clean worktree of the commits to push |
 | 4 | CI | the workflows on the pushed commit ([TESTING.md §9](TESTING.md#9-lanes-and-ci)) | on push |
 | 5 | bench or robot | the [BENCH.md](BENCH.md) or [BRINGUP.md](BRINGUP.md) check a TODO.md item names, its result recorded in [BENCH_RESULTS.md](BENCH_RESULTS.md) | for a requirement verified by measurement |
 
@@ -91,7 +91,7 @@ affected tests (docs only) skips the test step: rung 2 is then
 `--describe-only` if a config changed and `python3 tools/check_links.py`
 (every relative link and anchor resolves).
 
-Rung 3 is `tools/prepush.sh [--ref <commit>]`. It checks the commit out in a
+Rung 3 is `tools/prepush.sh [--ref <commit>] [--full]`. It checks the commit out in a
 new worktree under `${TMPDIR:-/tmp}`, makes its tracked files read-only with
 CI's own step, runs CI's source lints (`tools/source_lints.sh`: test time,
 links, requirement trace, node test matrix), then `bazel build //...`, then `tools/check_host_includes.py`
@@ -99,10 +99,24 @@ on the `.d` file of every compile in that build, cache hits included (no
 compile read a header from the host's include tree but the C library's,
 the kernel's or the C++ standard library's), then `bazel test //...` with no
 cached test result (build results come from the disk cache
-`~/.cache/talos-bazel-disk`), checks that they left the worktree unchanged,
-and runs the gradle and pnpm checks when the commits to push touch the
-RoboRIO program or anything under `talOS/` (its `build.gradle` takes
-headers from all of it) or `studio/`; every robot and example config's
+`~/.cache/talos-bazel-disk`), runs the gradle checks when the commits to
+push touch the RoboRIO program or anything under `talOS/` (its
+`build.gradle` takes headers from all of it), runs CI's RoboRIO-in-the-loop
+check (`tools/test_rio_in_the_loop.py --wpilib`, about 30 s) when they touch
+that tool, `bench/`, the RoboRIO program or the talOS packages on its
+command path (`talOS/{hardware,bridge,devices,node,protocol,driver_station}`),
+checks that all of these left the worktree unchanged, and runs the pnpm
+checks when they touch `studio/`. With `--full` it also runs CI's sanitizer
+lanes (`tools/sanitizer_lane.sh tsan` and `asan`, the script CI's sanitizer
+jobs run; 5 to 10 minutes each cold) and CI's soak with its branch seed,
+for 36 s of teleop rather than CI's 180 s (the shortest run that injects
+every fault kind), and the RoboRIO-in-the-loop check whatever the commits
+touch. **A push of more
+than 20 commits runs `tools/prepush.sh --full`**: without it, such a range
+is reported as the step `full` SKIPPED and the run fails. Prepush does not
+run clang-tidy: `tools/tidy.sh --base <upstream>` runs CI's selection on a
+host whose standard library clang 18 can parse (gap: TOOLS-15). Every robot
+and example config's
 `--describe-only` runs as its `talos_graph_test` (the bundle test's
 fixture, `bench/main_processor/bundle_testdata`, has only a
 `manifest_sync_test`). It differs from CI in three places, and says which
