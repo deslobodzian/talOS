@@ -101,7 +101,7 @@ class SessionReportTest(unittest.TestCase):
         self.assertRegex(named[0], r"protocol \d+ ")
         self.assertIsNone(report["never_enabled"])
 
-    # REQ-OPS-16 (TODO LOG-15): the default session with its enabled States at
+    # REQ-OPS-16: the default session with its enabled States at
     # 5 to 135 ms lost in a log gap. The 0 -> 140 ms interval across the hole
     # is the disk's, not the robot's: it is not measured, so the enabled rows,
     # left with no interval, are NOT MEASURED rather than a 140 ms FAIL; the
