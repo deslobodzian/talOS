@@ -224,6 +224,12 @@ inline bool LogRootTakesNoLocks(const std::filesystem::path& root,
 // flock, not a record lock: it belongs to the open file description, so a
 // probe from another descriptor conflicts with it even in the holder's own
 // process, and closing some other descriptor of the file does not drop it.
+// Every exclusive lock is taken on a descriptor open for reading and
+// writing (nothing is written): NFSv4 is reported to refuse an exclusive
+// flock on a read-only one with EBADF (not reproduced: no NFS on the test
+// hosts). The shared locks (Held, LogRootTakesNoLocks) need only reading.
+// The file's mode, kLockFileMode, lets any user open it so.
+//
 // The descriptor is close-on-exec (introspect::OpenLockFile) and a node's
 // guardian closes every descriptor, so only the launcher holds it: the
 // kernel releases it when the launcher exits or is killed, and nothing the
@@ -263,7 +269,7 @@ class SessionDirectoryLock {
       error.clear();
       create(dir, error);
       if (error) return std::nullopt;
-      const int fd = introspect::OpenLockFile(path, O_RDONLY);
+      const int fd = introspect::OpenLockFile(path, O_RDWR);
       if (fd < 0) {
         error = {errno, std::generic_category()};
         // Moved away by retention since it was created: create it again.
@@ -330,7 +336,7 @@ class SessionDirectoryLock {
       std::error_code& error, const FlockFunction& lock = ::flock) {
     held = false;
     const std::string path = (dir / kSessionDirectoryLockFile).string();
-    const int fd = introspect::OpenLockFile(path, O_RDONLY);
+    const int fd = introspect::OpenLockFile(path, O_RDWR);
     if (fd < 0) {
       error = {errno, std::generic_category()};
       return std::nullopt;
@@ -434,7 +440,7 @@ class SessionDirectoryLock {
   // The file path_ names, opened (created when absent, never its directory)
   // and exclusively locked; -1 when it cannot be.
   int TakeCurrent(const FlockFunction& lock) const {
-    const int fd = introspect::OpenLockFile(path_, O_RDONLY);
+    const int fd = introspect::OpenLockFile(path_, O_RDWR);
     if (fd < 0) return -1;
     if (lock(fd, LOCK_EX | LOCK_NB) != 0 ||
         !introspect::LockFileIsCurrent(fd, path_)) {

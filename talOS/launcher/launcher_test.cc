@@ -3217,6 +3217,46 @@ TEST(LauncherSessions, AnUnlockedSessionIsLockedAtItsNextRefresh) {
   std::filesystem::remove_all(root);
 }
 
+// A filesystem that refuses an exclusive flock on a descriptor not open for
+// writing, with EBADF, as NFSv4 is reported to (not reproduced here: no NFS
+// on the test hosts). Every exclusive lock of a session.lock still takes it:
+// the launch's own (Create), its refresh after the file was removed
+// (Refresh), and a retention's (TakeIdle).
+// REQ-OPS-11
+TEST(LauncherSessions, ExclusiveLocksHoldWhereReadOnlyDescriptorsCannot) {
+  const std::string root = TempPath("lock_write_access");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path dir = root + "/1";
+  const FlockFunction lock = [](int fd, int operation) {
+    if ((operation & LOCK_EX) != 0 &&
+        (::fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY) {
+      errno = EBADF;
+      return -1;
+    }
+    return ::flock(fd, operation);
+  };
+  std::error_code error;
+  auto session = SessionDirectoryLock::Create(
+      dir,
+      [](const std::filesystem::path& path, std::error_code& made) {
+        std::filesystem::create_directories(path, made);
+      },
+      error, lock);
+  ASSERT_TRUE(session.has_value()) << error.message();
+  EXPECT_TRUE(session->held());
+  std::filesystem::remove(session->path());
+  EXPECT_EQ(session->Refresh(lock), SessionDirectoryLock::Refreshed::kRetaken);
+  EXPECT_TRUE(SessionDirectoryLock::Held(dir, /*root_takes_no_locks=*/false));
+  session.reset();
+  bool held = false;
+  EXPECT_TRUE(SessionDirectoryLock::TakeIdle(dir, /*root_takes_no_locks=*/false,
+                                             held, error, lock)
+                  .has_value())
+      << error.message();
+  EXPECT_FALSE(held);
+  std::filesystem::remove_all(root);
+}
+
 // The flock of the launch's own session.lock failing as on a root without
 // locks (ENOLCK) while the root's probe locks: a call's refusal, not the
 // root's. The launch tries again; one whose lock keeps failing (all 100
