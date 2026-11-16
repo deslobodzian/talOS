@@ -1,0 +1,16 @@
+# Bundle relocation case for //bench/main_processor:bundle_test: a config one
+# directory away from the bench config it builds on, using every way a config
+# reaches another file. Not a robot configuration.
+include = "../configuration/robot.toml"
+
+# A custom path outside subsystems/, layered over a parent-directory
+# defaults file (the bench motor), so CAN ids and limits come from it.
+[[subsystems]]
+name = "motor"
+path = "mechanisms/motor.toml"
+defaults = "../configuration/subsystems/motor.toml"
+
+# An entry-level node override merged into the included entry by name.
+[[subsystems]]
+name = "swerve_module"
+node = "//bench/main_processor/swerve_module:node"

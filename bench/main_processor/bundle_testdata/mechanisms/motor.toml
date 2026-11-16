@@ -1,0 +1,5 @@
+# Layered over ../../configuration/subsystems/motor.toml (the entry's
+# `defaults`); only the loop period differs.
+[subsystem]
+name = "motor"
+period_us = 10000
