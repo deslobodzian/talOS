@@ -467,7 +467,20 @@ every status; a refused State is not published) as `SEND`s in a `.tlog`
 raw `Packet`s, each with the transport sequence and
 publication time its readers receive, and the pass that produced it as its
 event time. A clean stop ends the log with an EXIT record, as an event
-loop's does.
+loop's does. It holds no `/hw/state/driver_station`: the bridge forwards
+each Driver Station packet with a plain write, so a session has that topic
+only in its readers' logs (receipts), and none when no node reads it;
+`/hw/status` `driver_station_packet_count` counts the packets forwarded.
+
+The bridge's exit lines (stdout, so the session's
+`<output_dir>/<session_id>/hardware_node.log`, [node
+output](../launcher/README.md#node-output)) carry counters `/hw/status` does
+not: `passes`, the wake reasons, `wait_fallbacks`, `send_failures`,
+`socket_reopens`, and `throttled`, the passes that spent the loop's CPU
+budget (8 passes or 64 received datagrams in a 1 ms window,
+`HardwareNode::kCpuWindowUs`) and so slept through input until the window
+ended. A nonzero `throttled` means a gateway or a node flooded the bridge;
+normal traffic stays far below the budget.
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
