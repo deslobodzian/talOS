@@ -37,10 +37,12 @@ Comments in the test file, each on its own line (`//` in C++, `#` in Python):
   only): the C++ twin's test file, beside this one, carries the case, and
   this file's `talos.parity` scenario runs the Python node through the
   named steps, compared with the C++ node. It is accepted only when this
-  file calls `assert_same_behaviour`, the C++ file has the case as a test,
-  and each step names a step of the scenario that call runs (a list
-  literal, or a module-level name assigned one, read with `ast`). Whether
-  that step exercises the case is for review.
+  file calls `assert_same_behaviour` in a test that is not skipped (no
+  skip decorator on it or its class, no skipTest in it), the C++ file has
+  the case as a test, and each step names a step of the scenario that call
+  runs (a list literal, or a name assigned one in the calling function, an
+  enclosing one or the module, resolved as Python does, read with `ast`).
+  Whether that step exercises the case is for review.
   Several lines may claim one case; their steps add up. Cases 9 and 12
   cannot be claimed: a parity run compares neither construction nor
   allocation. A claim that does not hold fails, naming the case.
@@ -172,38 +174,114 @@ def infer_role(sources):
     return "observer"
 
 
+FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+# unittest's skip decorators and TestCase.skipTest, pytest's skip marks and
+# pytest.skip.
+SKIPS = {"skip", "skipIf", "skipUnless", "skipif", "skipTest"}
+
+
+def callee(node):
+    """The name a call or decorator calls (`unittest.skip(...)` -> skip)."""
+    node = node.func if isinstance(node, ast.Call) else node
+    return getattr(node, "attr", getattr(node, "id", None))
+
+
+def own_nodes(scope):
+    """The nodes of a function's or module's body outside any function or
+    class defined in it."""
+    pending = list(ast.iter_child_nodes(scope))
+    while pending:
+        node = pending.pop()
+        yield node
+        if not isinstance(node, (*FUNCTION, ast.ClassDef)):
+            pending.extend(ast.iter_child_nodes(node))
+
+
+def binding(scope, name, before):
+    """How `scope` (a function or the module) binds `name`: None when it
+    does not, else the list literal its last assignment before line
+    `before` gives it, or False when that is not readable (a parameter, a
+    non-assignment binding or a non-literal value)."""
+    if isinstance(scope, FUNCTION):
+        args = scope.args
+        if name in {a.arg for a in (*args.posonlyargs, *args.args,
+                                    *args.kwonlyargs, args.vararg,
+                                    args.kwarg) if a}:
+            return False
+    bound = []
+    for node in own_nodes(scope):
+        if isinstance(node, ast.Name) and node.id == name and isinstance(
+                node.ctx, ast.Store):
+            bound.append(node)
+    if not bound:
+        return None
+    values = {}
+    for node in own_nodes(scope):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name
+                for t in node.targets):
+            values[node.lineno] = node.value
+    # Module-level names are read when the test runs, after the module.
+    lines = [n.lineno for n in bound
+             if not isinstance(scope, FUNCTION) or n.lineno < before]
+    if not lines:
+        return False
+    value = values.get(max(lines))
+    return value if isinstance(value, (ast.List, ast.Tuple)) else False
+
+
 def scenario_steps(text):
     """The step names of the scenarios `text` passes to
     assert_same_behaviour (its fifth argument or `scenario=`): a list
-    literal there, or a module-level name last assigned one. None when the
-    file has no such call. Raises MatrixError when a call's scenario is not
-    such a literal, since its steps cannot then be read."""
+    literal there, or a name the calling function, an enclosing one or the
+    module last assigned one, resolved as Python does. None when the file
+    has no such call. Raises MatrixError when a call's scenario is not
+    such a literal, since its steps cannot then be read, or when the call
+    is in a skipped test (a skip decorator on it or its class, or a
+    skipTest call in it), since its steps then never run."""
     try:
         tree = ast.parse(text)
     except SyntaxError as error:
-        raise MatrixError(f"matrix: parity: cannot parse the file: {error}")
-    assigned = {}
-    for statement in tree.body:
-        if isinstance(statement, ast.Assign):
-            for name in statement.targets:
-                if isinstance(name, ast.Name):
-                    assigned[name.id] = statement.value
+        raise MatrixError(f"cannot parse the file: {error}")
+    parents = {child: node for node in ast.walk(tree)
+               for child in ast.iter_child_nodes(node)}
     steps = None
     for call in ast.walk(tree):
-        if not (isinstance(call, ast.Call) and getattr(
-                call.func, "attr", getattr(call.func, "id", None))
-                == "assert_same_behaviour"):
+        if not (isinstance(call, ast.Call)
+                and callee(call) == "assert_same_behaviour"):
             continue
+        enclosing = []
+        node = call
+        while node in parents:
+            node = parents[node]
+            enclosing.append(node)
+        for scope in enclosing:
+            skipped = [d for d in getattr(scope, "decorator_list", ())
+                       if callee(d) in SKIPS]
+            if isinstance(scope, FUNCTION):
+                skipped += [n for n in own_nodes(scope)
+                            if isinstance(n, ast.Call)
+                            and callee(n) in SKIPS]
+            if skipped:
+                raise MatrixError(
+                    f"line {call.lineno}: the "
+                    f"assert_same_behaviour call is in a skipped test "
+                    f"(line {skipped[0].lineno}), so its steps never run")
         scenario = next((k.value for k in call.keywords
                          if k.arg == "scenario"),
                         call.args[4] if len(call.args) > 4 else None)
         if isinstance(scenario, ast.Name):
-            scenario = assigned.get(scenario.id)
+            name, scenario = scenario.id, None
+            for scope in [s for s in enclosing
+                          if isinstance(s, (*FUNCTION, ast.Module))]:
+                if (found := binding(scope, name, call.lineno)) is not None:
+                    scenario = found or None
+                    break
         if not isinstance(scenario, (ast.List, ast.Tuple)):
             raise MatrixError(
-                f"matrix: parity: line {call.lineno}: the scenario passed to "
-                f"assert_same_behaviour is not a list literal or a "
-                f"module-level name assigned one")
+                f"line {call.lineno}: the scenario passed to "
+                f"assert_same_behaviour is not a list literal or a name "
+                f"the test or its module assigns one")
         steps = steps or set()
         steps.update(step.elts[0].value for step in scenario.elts
                      if isinstance(step, ast.Tuple) and step.elts
@@ -233,7 +311,10 @@ def parity_claims(text, role, sibling):
             raise MatrixError(f"matrix: parity {case}: not a case of the "
                               f"{role} role")
         if steps_run is None:
-            steps_run = scenario_steps(text)
+            try:
+                steps_run = scenario_steps(text)
+            except MatrixError as error:
+                raise MatrixError(f"matrix: parity {case}: {error}")
         if steps_run is None:
             raise MatrixError(f"matrix: parity {case}: the file runs no "
                               f"talos.parity assert_same_behaviour")
