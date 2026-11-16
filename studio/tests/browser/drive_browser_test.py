@@ -2,8 +2,9 @@
 
 The unit tests (studio/tests/drive.test.ts) render the page's markup against
 a fake surface; layout, clipping, scrolling and the page's own timers exist
-only in a browser. This launches the 2026 physics simulation with the Studio
-bridge (as `./sim.sh --sim-gateway` does), opens /drive in the host's headless
+only in a browser. This launches the bench robot's physics simulation with
+the Studio bridge and a dashboard of its own (studio/tests/browser/robot.toml
+and dashboard.toml), opens /drive in the host's headless
 Chromium or Chrome over the DevTools protocol, and judges the live DOM
 (studio/tests/browser/probe.js): at 1366x768 and 1280x720 nothing is hidden,
 cut, smaller than 12 px or without a value, lists show whole rows and count
@@ -36,21 +37,21 @@ import cdp  # noqa: E402
 import children  # noqa: E402
 import watch  # noqa: E402
 
-import autonomous_progress  # noqa: E402
-
-CONFIG = "2026-robot/main_processor/configuration/robot_physics_sim.toml"
+CONFIG = "studio/tests/browser/robot.toml"
+# The telemetry node's subsystem file, for its period.
+TELEMETRY_CONFIG = "bench/main_processor/configuration/subsystems/telemetry.toml"
 # Bounds only a hang (docs/TESTING.md §6.3): the whole graph builds its
-# nodes, the cameras load their models, and the bridge comes up.
+# nodes, the Python nodes load, and the bridge comes up.
 STARTUP_S = 60
 WAIT_MS = 30000
 # REQ-OPS-36: every value stale within 500 ms of its last update.
 STALE_BOUND_MS = 500
-# The viewports REQ-OPS-49 names, and one short enough that the 2026
-# subsystems list scrolls.
+# The viewports REQ-OPS-49 names, and one short enough that the
+# subsystems list of dashboard.toml scrolls.
 VIEWPORTS = ((1366, 768), (1280, 720))
 SHORT_VIEWPORT = (1366, 500)
 # A node the launcher restarts, whose row changes when it does.
-RESTARTED = "shooter"
+RESTARTED = "swerve_module"
 PRODUCER = "telemetry"
 
 
@@ -120,7 +121,7 @@ def free_ports(count):
 
 
 class Session:
-    """The launched 2026 simulation with the Studio bridge on a free port."""
+    """The launched bench simulation with the Studio bridge on a free port."""
 
     def __init__(self, root, tmp):
         self.output = tmp / "sessions"
@@ -210,7 +211,6 @@ class Session:
             self.launcher.signal_group(signal.SIGKILL)
             self.launcher.reap()
         self.log.close()
-        autonomous_progress.remove(self.namespace)
 
 
 class DriveDashboardInBrowser(unittest.TestCase):
@@ -243,7 +243,7 @@ class DriveDashboardInBrowser(unittest.TestCase):
             cls.page.evaluate(f"__probe.waitFor(() => document.querySelector('#drive .page'), "
                               f"{WAIT_MS}, 'the dashboard drawn')")
             # The session is up once every node's row reads UP (the Python
-            # pose estimator is the slowest to register).
+            # nodes are the slowest to register).
             cls.page.evaluate(f"__probe.waitFor(__probe.allUp, {STARTUP_S * 1000}, "
                               "'every subsystems row UP')")
         except BaseException:
@@ -322,13 +322,13 @@ class DriveDashboardInBrowser(unittest.TestCase):
             label = f"layout-{width}x{height}"
             with self.subTest(viewport=f"{width}x{height}"):
                 self.settle(label, (width, height))
-                # The pose, checks and summary fill in as the graph starts.
+                # The checks and summary fill in as the graph starts.
                 self.wait(label, "__probe.valued()", "every widget with a value")
                 self.call_probe("await __probe.frames(); return true")
                 # Kept whatever the result, to see what was judged.
                 self.page.screenshot(self.outputs / f"{label}-seen.png")
                 self.check(label, self.page.evaluate("__probe.audit()"))
-                # The 2026 lists fit whole at these sizes (REQ-OPS-49).
+                # dashboard.toml's lists fit whole at these sizes (REQ-OPS-49).
                 for kind in ("subsystems", "checks"):
                     state = self.page.evaluate(f"__probe.listState('{kind}')")
                     self.assertLessEqual(state["scrollHeight"], state["clientHeight"],
@@ -405,8 +405,7 @@ class DriveDashboardInBrowser(unittest.TestCase):
     def test_stopped_telemetry_reads_stale_in_time(self):
         label = "freshness"
         self.settle(label, VIEWPORTS[0])
-        robot_dir = workspace() / CONFIG.rsplit("/", 1)[0]
-        sub = tomllib.loads((robot_dir / "subsystems/telemetry.toml").read_text())["subsystem"]
+        sub = tomllib.loads((workspace() / TELEMETRY_CONFIG).read_text())["subsystem"]
         period_ms = sub["period_us"] / 1000
         pid = self.session.pid(PRODUCER)
         armed_at = self.page.evaluate(f"__probe.armStale({WAIT_MS})")

@@ -1,0 +1,26 @@
+# The graph //studio:drive_browser_test opens /drive against: the bench
+# robot as robot_physics_sim.toml runs it (the Python motor owner at 20 ms,
+# the C++ swerve_module at 5 ms, the Python gyro observer, teleop and
+# telemetry, against the physics simulator), plus a [studio] table naming
+# this directory's dashboard.toml. Config load refuses a nested include, so
+# this file includes the bench's robot.toml and repeats
+# robot_physics_sim.toml's overrides; keep them alike. Devices, CAN ids and
+# buses are the bench's, unchanged.
+include = "../../../bench/main_processor/configuration/robot.toml"
+
+[robot]
+# The physics gateway's config: the launcher and hardware_node refuse it
+# without --sim.
+simulation_only = true
+
+# The test passes --studio-http-port, and its runfiles hold
+# //studio:web_dist under bazel-bin/ of its working directory.
+[studio]
+bridge = "//studio/bridge:studio_bridge"
+webroot = "bazel-bin/studio/dist"
+topic = "/talos/telemetry"
+dashboard = "dashboard.toml"
+
+[[subsystems]]
+name = "motor"
+path = "../../../bench/main_processor/configuration/subsystems/motor_py.toml"

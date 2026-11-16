@@ -3,7 +3,9 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("@studio_npm//:defs.bzl", "npm_link_all_packages")
 load("@studio_npm//studio:typescript/package_json.bzl", tsc_bin = "bin")
 load("@studio_npm//studio:vite/package_json.bzl", vite_bin = "bin")
-load("//2026-robot/main_processor/configuration:robot_physics_sim_manifest.bzl", SIM_CONFIG_FILES = "CONFIG_FILES", SIM_NODES = "NODES")
+load("//talOS/build:contract.bzl", "talos_graph_test")
+load("//tools:sync_manifest.bzl", "manifest_sync_test")
+load(":tests/browser/robot_manifest.bzl", BROWSER_CONFIG_FILES = "CONFIG_FILES", BROWSER_NODES = "NODES")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -168,9 +170,11 @@ STUDIO_TEST_DATA = {
 ]
 
 # The driver dashboard in the host's headless Chromium or Chrome, driven over
-# the DevTools protocol, against the 2026 physics simulation with the Studio
-# bridge (README.md "Driver dashboard in a browser"). e2e lane: it launches
-# the whole graph and waits on it in real time (about 3 s on an idle host).
+# the DevTools protocol, against the bench robot's physics simulation with
+# the Studio bridge and a dashboard of its own (tests/browser/robot.toml and
+# dashboard.toml; README.md "Driver dashboard in a browser"). e2e lane: it
+# launches the whole graph and waits on it in real time (about 3 s on an idle
+# host).
 # Skips, naming why, on a host with no browser (TALOS_REQUIRE_BROWSER=1
 # fails instead).
 # local: the browser's own sandbox needs the host's namespaces.
@@ -183,13 +187,13 @@ py_test(
     ],
     data = [
         "tests/browser/probe.js",
+        "tests/browser/robot.toml",
         ":web_dist",
-        "//2026-robot/main_processor/configuration:robot_physics_sim.toml",
         "//studio/bridge:studio_bridge",
         "//talOS/bridge:hardware_node",
         "//talOS/launcher",
         "//talOS/simulation:sim_gateway",
-    ] + SIM_CONFIG_FILES + SIM_NODES,
+    ] + BROWSER_CONFIG_FILES + BROWSER_NODES,
     main = "tests/browser/drive_browser_test.py",
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
@@ -199,9 +203,29 @@ py_test(
         "no_asan",
         "no_tsan",
     ],
-    deps = [
-        ":browser_helpers",
-        "//2026-robot/main_processor/simulation:autonomous_progress",
+    deps = [":browser_helpers"],
+)
+
+# tests/browser/robot.toml's generated manifest is current, and its graph
+# (every node described, the dashboard against the telemetry dictionary)
+# passes the launcher's lint. Regenerate with `bazel run //tools:sync_manifest
+# -- studio/tests/browser/robot.toml`.
+manifest_sync_test(
+    name = "browser_manifest_sync_test",
+    config = "tests/browser/robot.toml",
+    config_files = BROWSER_CONFIG_FILES,
+    manifest = "tests/browser/robot_manifest.bzl",
+)
+
+talos_graph_test(
+    name = "browser_graph_test",
+    config = "tests/browser/robot.toml",
+    data = BROWSER_CONFIG_FILES,
+    nodes = BROWSER_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
     ],
 )
 

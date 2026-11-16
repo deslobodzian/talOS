@@ -169,8 +169,9 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   reads; `listRowsFit` computes from them that the 2026 layout's subsystems
   cell holds 20 rows at 1366x768 (two columns of 10) and 18 at 1280x720
   (two of 9), and its pre-match cell 12 and 10. The
-  [browser check](#driver-dashboard-in-a-browser) sees the 14 subsystem rows
-  and 6 checks of a simulated session whole at both sizes. A row too narrow gives up its note (restarts, drives) first, then
+  [browser check](#driver-dashboard-in-a-browser) sees the 7 subsystem rows
+  and 6 checks of a simulated bench session whole at both sizes, in a
+  layout of its own. A row too narrow gives up its note (restarts, drives) first, then
   its name down to 64 px (ellipsized; the tooltip has the whole name and the
   note); its state word never shrinks or ellipsizes, so a column narrower than
   the name's floor, the gaps and the word cuts the word at the row's edge.
@@ -203,9 +204,14 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 ### Driver dashboard in a browser
 
 `//studio:drive_browser_test` (e2e lane) checks the page as a browser lays it
-out, which the unit tests' fake surface cannot. It launches the 2026 physics
-simulation with the Studio bridge (`robot_physics_sim.toml`, as
-`./sim.sh --sim-gateway` does) on ports and a shared-memory namespace of its
+out, which the unit tests' fake surface cannot. Its subject is the bench
+robot's physics simulation with the Studio bridge and a dashboard of its own
+([`tests/browser/robot.toml`](tests/browser/robot.toml), the bench's graph as
+`robot_physics_sim.toml` runs it plus `[studio]`, and
+[`tests/browser/dashboard.toml`](tests/browser/dashboard.toml), a full 12x8
+grid whose subsystems list holds the session's seven rows; the config's
+`//studio:browser_graph_test` and `//studio:browser_manifest_sync_test` keep
+it launchable). It launches that on ports and a shared-memory namespace of its
 own, opens `/drive` in the host's headless Chromium or Chrome and drives it
 over the DevTools protocol with no dependency beyond Python
 ([`tests/browser/`](tests/browser/): `cdp.py` the client, `probe.js` the
@@ -220,13 +226,13 @@ reads OK, it asserts from the live DOM:
   STALE (the pre-match checks render whole; whether they pass is the
   simulator's data); every state word, tag and heading is whole, its text no
   wider than its box by even one 1/64 px layout unit; no text is under 12 px;
-  the subsystems and checks lists fit without scrolling; the four camera rows
-  read differently as rendered;
+  the subsystems and checks lists fit without scrolling; camera rows, where
+  the subject has any (the bench has none), read differently as rendered;
 - at 1366x500, where the subsystems list scrolls: every visible row is whole
   and the heading's `N above` / `+N below` equals the rows the boxes show,
   after a scroll by script too; scrolled to the bottom and to the middle, the
-  list keeps its `scrollTop` when SIGKILLing `shooter` (the launcher restarts
-  it) changes that row; the list's heading and words are whole;
+  list keeps its `scrollTop` when SIGKILLing `swerve_module` (the launcher
+  restarts it) changes that row; the list's heading and words are whole;
 - with the `telemetry` node SIGSTOPped, every widget but subsystems reads
   STALE within REQ-OPS-36's 500 ms of the producer's last tick at the latest
   (the page's `performance.now()` read just before the stop, plus one 10 ms
