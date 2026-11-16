@@ -395,8 +395,11 @@ TEST(LauncherTest, DescribeOutputIsBounded) {
       "#!/bin/sh\nexec dd if=/dev/zero bs=4096 count=1025 2>/dev/null\n");
   introspect::Description description;
   std::string error;
-  EXPECT_FALSE(ProbeDescribe({binary, "--describe"}, std::chrono::seconds{5},
-                             description, error));
+  // Refused for its size, not cut off by the deadline, which only bounds a
+  // hang: a refusal by deadline would pass this test without the bound.
+  EXPECT_FALSE(
+      ProbeDescribe({binary, "--describe"}, kHang, description, error));
+  EXPECT_NE(error.find("exceeds"), std::string::npos) << error;
   std::filesystem::remove(binary);
 }
 
@@ -3709,20 +3712,21 @@ TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   ASSERT_GE(child, 0);
   if (child == 0) ::_exit(Launcher{options}.Run());
   const std::string path = options.output_dir + "/1/manifest.json";
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{5};
-  std::string before;
+  const auto deadline = std::chrono::steady_clock::now() + kHang;
+  bool running = false;
   do {
-    before = ReadFile(path);
-    if (before.find("\"name\": \"alpha\"") != std::string::npos &&
-        before.find("\n      \"pid\": -1") == std::string::npos) {
-      break;
-    }
+    const std::string before = ReadFile(path);
+    running = before.find("\"name\": \"alpha\"") != std::string::npos &&
+              before.find("\n      \"pid\": -1") == std::string::npos;
+    if (running) break;
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
   } while (std::chrono::steady_clock::now() < deadline);
   ::kill(child, SIGKILL);
   int status = 0;
   ::waitpid(child, &status, 0);
+  // Killed while alpha ran, not before it started: the deadline only bounds a
+  // hang.
+  EXPECT_TRUE(running) << "the manifest never showed alpha running";
   // The killed launcher never unlinked its session's one topic segment.
   ::shm_unlink(ShmObjectName("/alpha/state").c_str());
   const std::string manifest = ReadFile(path);
