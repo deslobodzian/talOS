@@ -987,7 +987,8 @@ TEST(ConfigTest, RejectsNegativePovAndFractionalPovIndex) {
 // REQ-CONTRACT-24, REQ-SAFE-14: an axis binding's deadband is both its output
 // dead zone and the band it must return to before teleop arms; one below the
 // floor let a stick resting off zero arm and send that as its first command.
-// Config load refuses it, naming the binding, the value and the floor.
+// Config load refuses it, naming the binding, the value and the floor; the
+// value as written, so one just under the floor never reads as the floor.
 TEST(ConfigTest, RejectsTeleopAxisDeadbandBelowTheFloor) {
   const auto binding = [](std::string_view deadband) {
     return "[[subsystems.test.teleop.bindings]]\naxis = 1\n"
@@ -995,7 +996,7 @@ TEST(ConfigTest, RejectsTeleopAxisDeadbandBelowTheFloor) {
            std::string{deadband} + "\n";
   };
   EXPECT_NO_THROW(Parse(binding("0.05")));
-  for (const std::string_view deadband : {"0.049", "nan"}) {
+  for (const std::string_view deadband : {"0.049", "0.0499999999", "nan"}) {
     SCOPED_TRACE(deadband);
     try {
       Parse(binding(deadband));

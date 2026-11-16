@@ -476,7 +476,7 @@ while_held = { target_velocity_rps = 60.0 }
 axis = 1                       # axis index [0, 11]
 field = "velocity_rps"         # field in target message struct
 scale = 60.0                   # in the field's unit
-deadband_frac = 0.1            # optional, [0.05, 1), default 0.05
+deadband_frac = 0.1            # optional; range and default below
 ```
 
 Bindings select exactly one `button`, `axis` or `pov`. A `pov` is a compass
@@ -486,9 +486,12 @@ Button and POV bindings require exactly one nonempty scalar table:
 rising edge and resets on disable, leaving teleop or joystick disconnect.
 While held, toggled on or deflected past deadband, `teleop` publishes active
 targets with the bound fields encoded; released or in neutral, it calls
-`release()`. After a disable or any other disarm it publishes nothing until
-every bound input returns to neutral, an axis inside its `deadband_frac`
-([rearming](../talOS/teleop/README.md)).
+`release()`. An axis's `deadband_frac` is at least 5 % of full stick
+([range, default and rearming](../talOS/teleop/README.md)). After a disable
+or any other disarm `teleop` publishes nothing until every bound input
+returns to neutral, an axis inside its `deadband_frac`, and an axis resting
+inside the band that armed it commands nothing afterwards: that band is its
+output dead zone.
 
 Republish a lane every period; use `release()` when the producer has no target.
 In tests, `PublishTarget` / `sim.publish_target` stamp the newest Driver Station

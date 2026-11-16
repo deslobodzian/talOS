@@ -670,11 +670,14 @@ std::string AxisTomlWithDeadband(std::string_view frac) {
   return config;
 }
 
-// REQ-SAFE-14: after a disable with the axis held, the lane rearms only once
-// the axis returns inside its deadband_frac (0.05 when the binding states
-// none), and the arming evaluation, with the stick resting off zero inside
-// that band, sends no command: the band that arms is the band the output
-// ignores, so the first command after re-enable is never the resting stick.
+// REQ-CONTRACT-24, REQ-SAFE-14: after a disable with the axis held, the lane
+// rearms only once the axis returns inside its deadband_frac (0.05 when the
+// binding states none; inclusive), and an axis resting inside the band that
+// armed it commands nothing on the armed ticks that follow, since the
+// arming-neutral band is the output dead zone. The arming evaluation itself
+// never sends (talos::OperatorArming arms for the evaluations after it), so
+// the judged window must hold the first armed ticks and the consumer's view
+// of them.
 TEST(TeleopNode, HeldAxisRearmsInsideItsDeadbandAndSendsNothingThere) {
   struct Row {
     const char* deadband;
@@ -682,9 +685,23 @@ TEST(TeleopNode, HeldAxisRearmsInsideItsDeadbandAndSendsNothingThere) {
     bool arms;
   };
   constexpr std::uint32_t kTeleopDisabled = ds::kTeleop | ds::kDsAttached;
+  // The window the resting stick is held and judged for, in 20 ms periods
+  // after the rest reading is set at R. Teleop runs after the consumer and
+  // before SimHardware at each instant, so: R+20 teleop still reads the held
+  // stick, then the rest reading is published; R+40 the arming evaluation
+  // reads it and arms, sending nothing; R+60 the first armed tick, R+80 the
+  // second; the consumer sees them at R+80 and R+100. The window runs to
+  // R+200, so it holds all of that whatever the same-instant order.
+  constexpr int kWindowPeriods = 10;
+  // The upper edge: Driver Station axes are floats, compared as doubles.
+  // 0.0625f is exact, so it pins the inclusive edge; 0.05f is
+  // 0.0500000007450580596923828125, about 7.5e-10 above the double 0.05, so
+  // a reading of exactly 0.05f lies outside a 0.05 deadband and never arms.
   for (const Row& row :
        {Row{"", 0.04f, true}, Row{"", 0.06f, false}, Row{"0.05", 0.0499f, true},
-        Row{"0.2", 0.15f, true}, Row{"0.2", 0.25f, false}}) {
+        Row{"0.05", 0.05f, false}, Row{"0.05", 0.0501f, false},
+        Row{"0.0625", 0.0625f, true}, Row{"0.2", 0.15f, true},
+        Row{"0.2", 0.25f, false}}) {
     SCOPED_TRACE(std::string{"deadband_frac '"} + row.deadband +
                  "', axis returns to " + std::to_string(row.rest));
     Sim sim = MakeSim(AxisTomlWithDeadband(row.deadband));
@@ -698,13 +715,32 @@ TEST(TeleopNode, HeldAxisRearmsInsideItsDeadbandAndSendsNothingThere) {
     Push(hw, sim, DsPacket(kTeleopDisabled, MakeStick(0.5f)));
     Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.5f)));
     EXPECT_FALSE(arm.seen) << "held at 0.5 through a disable";
-    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(row.rest)));
-    EXPECT_FALSE(arm.seen);
-    const auto lane = talos::testing::LatestTarget<control::VelocityTarget>(
-        sim, "arm", "teleop");
-    ASSERT_TRUE(lane.has_value());
-    EXPECT_EQ(lane->active, 0) << "resting at " << row.rest << " commanded "
-                               << lane->message.velocity_rps();
+    hw.set_driver_station(DsPacket(kTeleopEnabled, MakeStick(row.rest)));
+    // The first period of the window (0: none) in which the lane went
+    // active, and in which the consumer got a target, with what each carried.
+    int lane_active_period = 0;
+    double lane_rps = 0.0;
+    int consumer_period = 0;
+    double consumer_rps = 0.0;
+    for (int period = 1; period <= kWindowPeriods; ++period) {
+      sim.step(20ms);
+      const auto lane = talos::testing::LatestTarget<control::VelocityTarget>(
+          sim, "arm", "teleop");
+      if (lane_active_period == 0 && lane && lane->active != 0) {
+        lane_active_period = period;
+        lane_rps = lane->message.velocity_rps();
+      }
+      if (consumer_period == 0 && arm.seen) {
+        consumer_period = period;
+        consumer_rps = arm.seen->velocity_rps();
+      }
+    }
+    EXPECT_EQ(lane_active_period, 0)
+        << "resting at " << row.rest << ", the lane went active at R+"
+        << 20 * lane_active_period << " ms with " << lane_rps << " rps";
+    EXPECT_EQ(consumer_period, 0)
+        << "resting at " << row.rest << ", the consumer got " << consumer_rps
+        << " rps at R+" << 20 * consumer_period << " ms";
     Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.5f)));
     EXPECT_EQ(arm.seen.has_value(), row.arms);
   }
@@ -911,24 +947,23 @@ TEST(TeleopNode, FloatingPointEncodingAcceptsFiniteLimitsWithoutOverflow) {
                                        std::numeric_limits<double>::max()));
 }
 
-TEST(TeleopNode, ConstructionRejectsNonFiniteAxisParameters) {
-  for (const std::string parameter : {"scale", "deadband_frac"}) {
-    for (const std::string value : {"nan", "inf", "-inf"}) {
-      SCOPED_TRACE(parameter + " = " + value);
-      std::string config{kAxisToml};
-      const std::string old_value =
-          parameter == "scale" ? "scale = 10.0" : "deadband_frac = 0.125";
-      config.replace(config.find(old_value), old_value.size(),
-                     parameter + " = " + value);
-      // Some parameter parsers reject these even before node construction.
-      EXPECT_THROW(
-          {
-            Sim sim = MakeSim(config);
-            sim.add<ConsumerNode<control::VelocityTarget>>("arm");
-            sim.add<Teleop>("teleop");
-          },
-          std::invalid_argument);
-    }
+// REQ-CONTRACT-24: config load accepts any number as an axis scale, so the
+// node's construction refuses a non-finite one. (A non-finite deadband_frac
+// is config load's: ConfigTest.RejectsTeleopAxisDeadbandBelowTheFloor.)
+TEST(TeleopNode, ConstructionRejectsNonFiniteAxisScale) {
+  for (const std::string value : {"nan", "inf", "-inf"}) {
+    SCOPED_TRACE("scale = " + value);
+    std::string config{kAxisToml};
+    const std::string old_value = "scale = 10.0";
+    config.replace(config.find(old_value), old_value.size(),
+                   "scale = " + value);
+    EXPECT_THROW(
+        {
+          Sim sim = MakeSim(config);
+          sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+          sim.add<Teleop>("teleop");
+        },
+        std::invalid_argument);
   }
 }
 

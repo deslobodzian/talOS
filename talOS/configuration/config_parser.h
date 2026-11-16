@@ -25,6 +25,7 @@
 #include <arpa/inet.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -1040,13 +1041,20 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
                              : static_cast<double>(df.as_integer()->get());
         // Negated, so NaN is refused too.
         if (!(d >= kTeleopMinDeadbandFrac && d < 1.0)) {
-          std::ostringstream message;
-          message << entry_where << ".deadband_frac = " << d << " must be in ["
-                  << kTeleopMinDeadbandFrac
-                  << ", 1): the axis counts as neutral for arming only "
-                     "inside its deadband, which is at least "
-                  << kTeleopMinDeadbandFrac << " of full stick";
-          throw std::invalid_argument(message.str());
+          // Shortest round-trip text, so a refused value never prints as an
+          // accepted one (0.0499999999 is not "0.05").
+          const auto text = [](double value) {
+            std::array<char, 32> buffer{};
+            const auto result = std::to_chars(
+                buffer.data(), buffer.data() + buffer.size(), value);
+            return std::string(buffer.data(), result.ptr);
+          };
+          throw std::invalid_argument(
+              entry_where + ".deadband_frac = " + text(d) + " must be in [" +
+              text(kTeleopMinDeadbandFrac) +
+              ", 1): the axis counts as neutral for arming only inside its "
+              "deadband, which is at least " +
+              text(kTeleopMinDeadbandFrac) + " of full stick");
         }
         b.deadband_frac = d;
       }
