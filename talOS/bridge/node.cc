@@ -28,6 +28,10 @@ namespace talos::hardware {
 // (LogWriterOptions::before_write) until its pool fills and the log opens a
 // gap. Empty otherwise. hardware_node_test declares it where it uses it.
 std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+// Tests only, likewise: false stops the full registry sample copying the
+// --log's flags into the row (set_recording), so a test can tell the
+// writer's kFlagLogGap from a sample's copy. True otherwise.
+bool copy_log_flags_for_test = true;
 
 // The name the stock bridge describes itself by is the roster name the
 // launcher lists it under.
@@ -298,7 +302,7 @@ void HardwareNode::PublishIntrospection() {
   registration_->begin_sample();
   registration_->heartbeat();
   registration_->set_dispatch_count(DispatchCount());
-  if (log_) {
+  if (log_ && copy_log_flags_for_test) {
     registration_->set_recording(log_->failed(), log_->capped(),
                                  log_->gaps() > 0);
   }

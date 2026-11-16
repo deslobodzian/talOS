@@ -1736,12 +1736,13 @@ bool RowHasLogGap() {
 
 // A live node's registry row says its log has a gap as the gap opens, not
 // at the reporter's next refresh: a run killed in between is still marked
-// log_gap. The reporter is held after its first sample (a refresh period of
-// an hour), so the bit in the row can only be the writer's.
+// log_gap. The reporter copies no event log flag here
+// (Reporter::Options::copy_recording), whenever its samples run, so the bit
+// in the row can only be the writer's.
 // REQ-OPS-52
 TEST(Binary, ANodesRowHasTheLogGapBitAsTheGapOpens) {
   detail::reporter_options_for_test = [](introspect::Reporter::Options& o) {
-    o.period = std::chrono::hours{1};
+    o.copy_recording = false;
   };
   bool seen = false;
   HeldLog held;

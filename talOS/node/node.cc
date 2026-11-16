@@ -1040,8 +1040,8 @@ namespace detail {
 // gap reports. Empty otherwise. node_test declares it where it uses it.
 std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
 // Tests only, likewise: called with a live run's Reporter options before the
-// Reporter is made (a test lengthens its refresh period to hold its
-// samples). Empty otherwise.
+// Reporter is made (a test turns off its copy of the event log flags).
+// Empty otherwise.
 std::function<void(introspect::Reporter::Options&)> reporter_options_for_test;
 
 namespace {
