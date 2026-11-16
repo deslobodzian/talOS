@@ -236,10 +236,10 @@ static_assert((kFlagOutputsHeld & kFlagRealtimeMask) == 0,
 // dropped (LogWriter gaps() > 0). Capture resumes after a GAP record that
 // marks them. The bit is set as the gap opens: the writer ORs it into the
 // row (LogWriterOptions::gap_flags, NodeRegistration::flags_word()) when it
-// drops the gap's first record, so a run killed during a gap, which has no
-// GAP record, still has the bit. Each sample also copies gaps() > 0
-// (set_recording), for a writer not given the row. An event log flag
-// (above): never cleared.
+// drops the gap's first record, while the row is still its claim's, so a
+// run killed during a gap, which has no GAP record, still has the bit. Each
+// sample also copies gaps() > 0 (set_recording), for a writer not given the
+// row. An event log flag (above): never cleared.
 inline constexpr std::uint32_t kFlagLogGap = 1u << 14;
 static_assert((kFlagLogGap & kFlagRealtimeMask) == 0,
               "kFlagLogGap must not share a bit with the realtime outcome");
@@ -1007,15 +1007,26 @@ class NodeRegistration {
 
   // The row's `flags` word, for a writer that ORs an event log flag in the
   // moment it applies (event::log::LogWriterOptions::gap_flags with
-  // kFlagLogGap) rather than at the next sample; null when the slot is not
-  // this claim's. Lives as long as this registration. Every write to the
-  // word after the claim is an atomic read-modify-write (fetch_or /
+  // kFlagLogGap) rather than at the next sample, with the row's
+  // `generation` and the value this claim took; all null when the slot is
+  // not this claim's. Lives as long as this registration. Every write to
+  // `flags` after the claim is an atomic read-modify-write (fetch_or /
   // fetch_and of the bits it owns), so a writer of another bit never clears
-  // it. A row swept from a live owner whose heartbeat went kLivenessTimeout
-  // stale, and claimed again, would take that bit on the new owner's row: a
-  // false log_gap, never a lost one.
-  std::atomic<std::uint32_t>* flags_word() noexcept {
-    return owns_slot() ? &record_->flags : nullptr;
+  // it. A writer sets its bit only while `generation` still holds
+  // `claimed`: a row swept from a live owner whose heartbeat went
+  // kLivenessTimeout stale and claimed by another node (a new generation)
+  // is left alone, so the new owner's run is not marked log_gap. The
+  // swept owner's own gap is then in no row: its row is gone, and a run
+  // the launcher kills during that gap has no GAP record either. A swept
+  // row nobody claimed keeps its generation and takes the bit.
+  struct FlagsWord {
+    std::atomic<std::uint32_t>* flags{nullptr};
+    const std::atomic<std::uint64_t>* generation{nullptr};
+    std::uint64_t claimed{0};
+  };
+  FlagsWord flags_word() noexcept {
+    if (!owns_slot()) return {};
+    return {&record_->flags, &record_->generation, generation_};
   }
 
   const std::string& name() const { return identity_.name; }

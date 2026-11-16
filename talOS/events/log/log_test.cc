@@ -1724,29 +1724,48 @@ TEST(LogGap, OversizedRecordOpensAGapTheNextDispatchCloses) {
 // The registry's log-gap flag (Options::gap_flags) is set by the record that
 // opens the gap, not by a later sample: a run killed right after that record
 // has no GAP record, and the flag is all that says its log lost records. The
-// word's other bits are kept.
+// word's other bits are kept. It is set only while the word is still the
+// writer's: a row the registry swept and gave another node (a new
+// generation) is left alone, so the new owner's run is not marked log_gap.
 // REQ-OPS-52
-TEST(LogGap, OpeningAGapSetsTheGapFlagAtOnce) {
+TEST(LogGap, OpeningAGapSetsTheGapFlagAtOnceOnlyInItsOwnRow) {
   constexpr std::uint32_t kOther = 1u << 3;
   constexpr std::uint32_t kGap = 1u << 14;
-  std::atomic<std::uint32_t> flags{kOther};
-  const std::string path = TempPath("gap_flag");
-  LogWriter::Options options;
-  options.chunk_bytes = 512;
-  options.chunk_count = 1;
-  options.background = false;
-  options.gap_flags = &flags;
-  options.gap_flag = kGap;
-  LogWriter writer{path, "gap_flag", options};
-  writer.start({}, {});
-  RecordStep(writer, {EventKind::TIMER, 1, 20}, 0);
-  RecordStep(writer, {EventKind::SEND, 1, 20}, 1);
-  EXPECT_EQ(flags.load(), kOther) << "set before any record was dropped";
-  RecordStep(writer, {EventKind::SEND, 1, 1024}, 2);
-  ASSERT_TRUE(writer.losing());
-  EXPECT_EQ(flags.load(), kOther | kGap);
-  writer.flush();
-  ::unlink(path.c_str());
+  constexpr std::uint64_t kClaimed = 5;
+  struct Row {
+    const char* name;
+    std::uint64_t generation_at_gap;
+    std::uint32_t flags_after;
+  };
+  const Row rows[] = {
+      {"its own row", kClaimed, kOther | kGap},
+      {"claimed again", kClaimed + 1, kOther},
+  };
+  for (const Row& row : rows) {
+    SCOPED_TRACE(row.name);
+    std::atomic<std::uint32_t> flags{kOther};
+    std::atomic<std::uint64_t> generation{kClaimed};
+    const std::string path = TempPath("gap_flag");
+    LogWriter::Options options;
+    options.chunk_bytes = 512;
+    options.chunk_count = 1;
+    options.background = false;
+    options.gap_flags = {.flags = &flags,
+                         .bit = kGap,
+                         .owner = &generation,
+                         .expected = kClaimed};
+    LogWriter writer{path, "gap_flag", options};
+    writer.start({}, {});
+    RecordStep(writer, {EventKind::TIMER, 1, 20}, 0);
+    RecordStep(writer, {EventKind::SEND, 1, 20}, 1);
+    EXPECT_EQ(flags.load(), kOther) << "set before any record was dropped";
+    generation.store(row.generation_at_gap);
+    RecordStep(writer, {EventKind::SEND, 1, 1024}, 2);
+    ASSERT_TRUE(writer.losing());
+    EXPECT_EQ(flags.load(), row.flags_after);
+    writer.flush();
+    ::unlink(path.c_str());
+  }
 }
 
 TEST(LogBackgroundWriter, RepeatedFlushReusesChunksInOrder) {

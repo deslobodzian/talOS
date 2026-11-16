@@ -570,9 +570,9 @@ gap bit ([event log state](../introspection/README.md#event-log-state)),
 which the launcher reads in each supervision pass and once more from the row
 a run left when it reaps it, marks the member. A writer given
 `LogWriterOptions::gap_flags` (a node's or the bridge's, pointed at its
-row) ORs its
-`gap_flag` into that word as it drops the gap's first record, so a run
-killed at any point after that is marked.
+row) ORs its bit into that word as it drops the gap's first record, while
+the word's owner (the row's generation) is still the one it was given, so
+a run killed at any point after that is marked.
 
 `failed()` means only that capture is over: the disk refused a write or the
 log file could not be created. **Treat it as a robot fault**, next to a

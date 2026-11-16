@@ -174,7 +174,9 @@ bridge's, also sets `kFlagLogGap` itself as a gap opens, with one atomic OR into
 `flags` word (`LogWriterOptions::gap_flags`,
 `NodeRegistration::flags_word()`, `Reporter::row_flags()`), so a run
 killed before the next sample, whose gap has no GAP record, is still
-marked. They are bits of the existing
+marked. It does so only while the row's generation is still its claim's:
+a row swept from a starved owner and claimed by another node is left
+alone, and the swept owner's gap is then in no row. They are bits of the existing
 `flags` word, which needs no layout or version change: an older writer leaves
 them clear, and an older reader ignores them. Once set they stay set until
 the slot is claimed again, since what they report stays lost. The launcher records them in the session manifest while the

@@ -205,7 +205,12 @@ void HardwareNode::OpenTopics() {
   // this thread, which also makes every record, before the first one;
   // registration_ is declared before log_, so the row outlives the writer.
   if (log_ && registration_) {
-    log_->set_gap_flags(registration_->flags_word(), introspect::kFlagLogGap);
+    const introspect::NodeRegistration::FlagsWord row =
+        registration_->flags_word();
+    log_->set_gap_flags({.flags = row.flags,
+                         .bit = introspect::kFlagLogGap,
+                         .owner = row.generation,
+                         .expected = row.claimed});
   }
 }
 

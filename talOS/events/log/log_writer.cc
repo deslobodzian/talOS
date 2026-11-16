@@ -512,8 +512,11 @@ void LogWriter::State::open_gap(const RecordHeader& header,
                   std::memory_order_relaxed);
   // Reported now, not at a later sample: a run killed before its GAP
   // record is written has said its log lost records.
-  if (options.gap_flags != nullptr) {
-    options.gap_flags->fetch_or(options.gap_flag, std::memory_order_relaxed);
+  const GapFlagTarget& target = options.gap_flags;
+  if (target.flags != nullptr &&
+      (target.owner == nullptr ||
+       target.owner->load(std::memory_order_acquire) == target.expected)) {
+    target.flags->fetch_or(target.bit, std::memory_order_relaxed);
   }
   gap = GapRecord{};
   gap.cause = static_cast<std::uint16_t>(cause);
@@ -1026,10 +1029,8 @@ std::uint64_t LogWriter::gaps() const noexcept {
   return state_->gap_count.load(std::memory_order_relaxed);
 }
 
-void LogWriter::set_gap_flags(std::atomic<std::uint32_t>* flags,
-                              std::uint32_t flag) noexcept {
-  state_->options.gap_flags = flags;
-  state_->options.gap_flag = flag;
+void LogWriter::set_gap_flags(const GapFlagTarget& target) noexcept {
+  state_->options.gap_flags = target;
 }
 
 std::uint64_t LogWriter::lost_records() const noexcept {
