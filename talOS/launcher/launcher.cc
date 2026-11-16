@@ -806,8 +806,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     proc.target = spec.target;
     proc.binary_path = spec.binary_path;
     proc.binary_sha256 = FileSha256(spec.binary_path);
-    // The gateway is started without --log, so it writes no event log.
-    if (spec.name != kSimGatewayName) {
+    // The launcher's gateway is started without --log, so it writes no
+    // event log.
+    if (!spec.sim_gateway) {
       proc.log_path = NodeLogPath(options_.output_dir, spec.name, 0);
     }
     proc.described = described[i].answered;
@@ -935,7 +936,7 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
       options_.construction_timeout};
   auto& args = launch.args;
   args.push_back(spec.binary_path);
-  if (proc.name == kSimGatewayName) {
+  if (spec.sim_gateway) {
     // The gateway stamps the config's config_id; unconfigured it stamps
     // 0, which every mechanism rejects.
     args.insert(args.end(), {"--config", options_.config_path, "--session-id",
@@ -1012,7 +1013,7 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
               << " names no roster member of " << options_.config_path << "\n";
     return 1;
   }
-  if (spec->name == kHardwareNodeName || spec->name == kSimGatewayName ||
+  if (spec->name == kHardwareNodeName || spec->sim_gateway ||
       spec->studio_bridge) {
     std::cerr << "launcher: " << spec->name
               << " is not a talos node and has no input replay\n";

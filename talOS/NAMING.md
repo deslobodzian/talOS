@@ -89,7 +89,8 @@ with a member the launcher adds itself: `hardware_node` always, and
 `sim_gateway` or `studio_bridge` when `--start-sim-gateway` or
 `--start-studio-bridge` adds that member; the launch, `--describe-only`
 included and `--allow-graph-errors` or not, is refused naming the
-`[subsystems.<name>]` key. The node's Bazel label must match the
+`[subsystems.<name>]` key. Without its flag, a subsystem named `sim_gateway`
+or `studio_bridge` is an ordinary node. The node's Bazel label must match the
 name in its package leaf, its repository (at a repository root), or its rule:
 `//bench/main_processor/swerve_module:node`, `@wrist//:node`,
 `//examples/superstructure/cpp:elevator`.

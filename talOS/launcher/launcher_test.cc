@@ -27,6 +27,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
@@ -3597,6 +3598,105 @@ TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
       << refused;
   EXPECT_EQ(ReadFile(invoked), "") << "the subsystem's binary was run";
   std::filesystem::remove_all(options.output_dir);
+}
+
+// The sim gateway is known by the roster flag --start-sim-gateway sets, not by
+// its name. A robot's subsystem named `sim_gateway`, in a session where the
+// launcher adds no gateway, is an ordinary node: started under --sim with
+// --log (its event log in the manifest) and --sim, and replayable. The
+// launcher's own gateway is still started with --config and no --log, and
+// with it such a subsystem is refused, naming the key. REQ-OPS-09, REQ-OPS-14
+TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
+  struct Outcome {
+    int status{-1};
+    std::string err;
+    std::string record;    // every invocation, --describe included
+    std::string launched;  // the last one that was not --describe
+    std::string manifest;
+    int replay_status{-1};
+    std::string replay_err;
+    std::string replay_line;  // the invocation --replay-inputs made
+  };
+  const auto run = [](std::string_view tag, bool subsystem, bool gateway) {
+    Outcome out;
+    auto options = SessionFixture(tag);
+    std::filesystem::remove_all(options.output_dir);
+    const std::string invoked = options.output_dir + "_invoked";
+    std::filesystem::remove(invoked);
+    std::ofstream config{options.config_path};
+    config << kFixtureToml;
+    if (subsystem) {
+      config << "\n[subsystems.sim_gateway]\nnode = "
+                "\"//example/sim_gateway:node\"\nperiod_us = 5000\n";
+    }
+    config.close();
+    options.binary_overrides["//example/sim_gateway:node"] = WriteStubNode(
+        std::string{tag} + "_subsystem",
+        RecordingStub("sim_gateway", "//example/sim_gateway:node", invoked));
+    // The stock gateway describes its own label, whose rule is its name.
+    options.binary_overrides["//example/sim:gateway"] =
+        WriteStubNode(std::string{tag} + "_gateway",
+                      RecordingStub("sim_gateway",
+                                    "//talOS/simulation:sim_gateway", invoked));
+    options.simulation = true;
+    options.remote = "127.0.0.1";
+    options.start_sim_gateway = gateway;
+    ::testing::internal::CaptureStderr();
+    out.status = Launcher{options}.Run();
+    out.err = ::testing::internal::GetCapturedStderr();
+    out.record = ReadFile(invoked);
+    std::istringstream lines{out.record};
+    for (std::string line; std::getline(lines, line);) {
+      if (line.find("--describe") == std::string::npos) out.launched = line;
+    }
+    const std::string session = options.output_dir;
+    out.manifest = ReadFile(session + "/1/manifest.json");
+    if (out.status == 0 && subsystem) {
+      options.replay_inputs = session + "/1";
+      options.only = "sim_gateway";
+      options.output_dir = session + "_replay";
+      ::testing::internal::CaptureStderr();
+      out.replay_status = Launcher{options}.Run();
+      out.replay_err = ::testing::internal::GetCapturedStderr();
+      const std::string record = ReadFile(invoked);
+      const std::string replayed =
+          "sim_gateway --replay-inputs " + options.replay_inputs + " ";
+      if (const auto at = record.find(replayed); at != std::string::npos) {
+        out.replay_line = record.substr(at, record.find('\n', at) - at);
+      }
+      std::filesystem::remove_all(options.output_dir);
+    }
+    std::filesystem::remove_all(session);
+    std::filesystem::remove(invoked);
+    return out;
+  };
+
+  const Outcome ordinary = run("subsystem_sim_gateway", true, false);
+  EXPECT_EQ(ordinary.status, 0) << ordinary.err;
+  EXPECT_NE(ordinary.launched.find(" --log "), std::string::npos)
+      << ordinary.launched;
+  EXPECT_NE(ordinary.launched.find(" --sim"), std::string::npos)
+      << ordinary.launched;
+  EXPECT_NE(ordinary.manifest.find("/sim_gateway.tlog\""), std::string::npos)
+      << ordinary.manifest;
+  // Replayable: --only sim_gateway runs it on the recorded session.
+  EXPECT_EQ(ordinary.replay_status, 0) << ordinary.replay_err;
+  EXPECT_NE(ordinary.replay_line.find(" --log "), std::string::npos)
+      << "no replay run of sim_gateway:\n"
+      << ordinary.replay_err;
+
+  const Outcome own = run("own_sim_gateway", false, true);
+  EXPECT_EQ(own.status, 0) << own.err;
+  EXPECT_EQ(own.launched.rfind("sim_gateway --config ", 0), 0u) << own.launched;
+  EXPECT_EQ(own.launched.find("--log"), std::string::npos) << own.launched;
+  EXPECT_EQ(own.manifest.find("sim_gateway.tlog"), std::string::npos)
+      << own.manifest;
+
+  const Outcome both = run("both_sim_gateway", true, true);
+  EXPECT_EQ(both.status, 1);
+  EXPECT_NE(both.err.find("[subsystems.sim_gateway]"), std::string::npos)
+      << both.err;
+  EXPECT_EQ(both.record, "") << "a member was run or probed";
 }
 
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {

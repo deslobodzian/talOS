@@ -110,8 +110,10 @@ inline constexpr std::uint32_t kSourceFlagUntargetedOutputs = 1u << 5;
 // The hardware bridge's roster name: the launcher lists the bridge under it
 // (launcher kHardwareNodeName), whatever binary `[robot] hardware_node` names,
 // and the stock bridge describes itself by it (talOS/bridge kNodeName; both
-// are held to this one). The graph lint knows the bridge by its roster slot
-// (NodeShape::hardware_bridge), not by the name a binary describes.
+// are held to this one). The graph lint knows the bridge by this roster name
+// (NodeShape::hardware_bridge), not by the name a binary describes; no
+// subsystem can take it, since Launcher::Run refuses a roster in which two
+// members share a name.
 inline constexpr std::string_view kHardwareBridgeNode = "hardware_node";
 
 inline bool IsSender(event::SourceKind kind) {
@@ -373,8 +375,8 @@ struct NodeShape {
   std::string name;
   std::string target;
   std::vector<SourceShape> sources;
-  // The roster's hardware bridge (the launcher marks the node in the
-  // kHardwareBridgeNode slot, whatever its binary calls itself): the one node
+  // The roster's hardware bridge (the launcher marks the member named
+  // kHardwareBridgeNode, whatever its binary calls itself): the one node
   // that writes the `hw` namespace, except each node's own request.
   bool hardware_bridge{false};
 };

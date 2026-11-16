@@ -207,6 +207,7 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
   if (options.start_sim_gateway && options.simulation) {
     if (auto gateway = robot_string("sim_gateway")) {
       specs.push_back(MakeNodeSpec(kSimGatewayName, *gateway, options));
+      specs.back().sim_gateway = true;
       specs.back().extra_args = SimulatorArgs(robot_config, options);
     }
   }

@@ -585,8 +585,10 @@ std::vector<naming::Diagnostic> DescribeGraph(
            "producer"});
     }
     if (described.answered) {
-      // The bridge is known by its roster slot, so a replacement bridge
-      // binary that describes itself by another name still owns `hw`.
+      // The bridge is known by its roster name, `hardware_node`, which no
+      // subsystem can take (Launcher::Run refuses two members of one name),
+      // so a replacement bridge binary that describes itself by another
+      // name still owns `hw`.
       shapes.push_back({described.declared.name, described.declared.target,
                         described.declared.sources,
                         spec.name == kHardwareNodeName});
