@@ -624,6 +624,7 @@ inline std::vector<Diagnostic> LintGraph(
     std::vector<std::string> readers;
     std::size_t reader_count{0};  // Observers also consume transport slots.
     bool exempt{false};           // Any end declared external or optional.
+    bool external{false};         // Any end declared external.
     std::uint32_t message_bytes{0};
     std::string first_size_from;
     std::string schema;  // the first end's that declared one
@@ -668,6 +669,7 @@ inline std::vector<Diagnostic> LintGraph(
 
       auto& topic = facts(source.name);
       topic.exempt = topic.exempt || source.external() || source.optional();
+      topic.external = topic.external || source.external();
       if (IsSender(source.kind)) {
         topic.writers.push_back(node.name);
         // Only the writing end makes a claim about the subject.
@@ -824,6 +826,24 @@ inline std::vector<Diagnostic> LintGraph(
       add(Severity::WARNING, topic.name,
           "is in the target policy of " + join(topic.readers) +
               " but nothing writes it yet");
+    } else if (topic.writers.empty() && !topic.readers.empty() &&
+               !topic.external &&
+               detail::OneOf(kOwnerPublishedRoles,
+                             detail::Segments(topic.name)[1]) &&
+               std::find(seen_names.begin(), seen_names.end(), owner) !=
+                   seen_names.end()) {
+      // Only its owner may write a state, status, event or telemetry topic
+      // (above), so an optional read of one the owner, a node here, does not
+      // write is misspelled or not published in this configuration. Its owner's
+      // real topic has no finding when telemetry records it (ObserverReads).
+      // One end declared external is written outside the graph. `exempt` is the
+      // whole topic's: which reader declared it optional is not kept, so the
+      // message does not say.
+      add(Severity::WARNING, topic.name,
+          "is read by " + join(topic.readers) +
+              ", at least one declaring it optional, but '" + owner +
+              "' publishes no such topic; the reader misspelled it or '" +
+              owner + "' does not publish it in this configuration");
     }
     // reader_count counts observers too (kSourceFlagObserver); readers does
     // not. An observer reads an owner's feed by design, but no instruction
