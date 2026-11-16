@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include "bridge/bridge_status_generated.h"
@@ -1214,6 +1215,61 @@ TEST(Devices, OutputSettersOutsideUpdateThrow) {
   }
   auto sim = Sim::FromToml(kRobotToml);
   EXPECT_THROW(sim.add<EagerLed>("mech"), std::logic_error);
+}
+
+// A message callback runs on the loop thread but outside update(); another
+// thread can call a setter while update() runs. Both would command the
+// hardware outside the tick that flushes it.
+// REQ-SAFE-06: a setter from a callback throws naming the device; one off
+// the loop thread throws naming the setter
+TEST(Devices, OutputSettersFromACallbackOrAnotherThreadThrow) {
+  struct Listener {
+    explicit Listener(Node& n)
+        : led{n, "led"},
+          poke{n.subscribe<::bridge::BridgeStatus>(
+              "/test/poke",
+              [this](const ::bridge::BridgeStatus&) { led.set(true); })} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {}
+    DigitalOutput led;
+    Subscription<::bridge::BridgeStatus> poke;
+  };
+  struct Threaded {
+    explicit Threaded(Node& n) : servo{n, "servo"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      std::thread other{[this] {
+        try {
+          servo.set(0.5);
+          error = "accepted";
+        } catch (const std::logic_error& thrown) {
+          error = thrown.what();
+        }
+      }};
+      other.join();
+    }
+    PwmOutput servo;
+    std::string error;
+  };
+  {
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<Listener>("mech");
+    sim.publish("/test/poke", ::bridge::BridgeStatus{});
+    try {
+      sim.step(10ms);
+      ADD_FAILURE() << "a digital output set in a callback was accepted";
+    } catch (const std::logic_error& error) {
+      EXPECT_NE(std::string{error.what()}.find("'led'"), std::string::npos)
+          << error.what();
+    }
+  }
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& threaded = sim.add<Threaded>("mech");
+  sim.step(10ms);
+  EXPECT_NE(threaded.error.find("PwmOutput::set"), std::string::npos)
+      << threaded.error;
 }
 
 // The opt-out is fixed with the node: from update() it is refused, naming
