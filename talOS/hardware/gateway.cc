@@ -514,6 +514,8 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   if (active_ && (now < accepted_at_ || now < observed_at_ ||
                   now - accepted_at_ >= config_.command_timeout_us ||
                   now - observed_at_ >= config_.command_timeout_us)) {
+    last_command_expiry_ = {last_command_expiry_.count + 1, now, observed_at_,
+                            accepted_at_};
     Invalidate();
   }
   state_.sample_time_us = now;
