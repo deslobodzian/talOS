@@ -12,7 +12,10 @@ what is out of view; at 1366x500 the subsystems list keeps its scroll
 position while a restarted node redraws it; and the page shows telemetry
 stale within REQ-OPS-36's bound once the telemetry node stops.
 
-With no browser on the host the test skips, naming why; with
+A reserved port another process takes first fails the startup at once,
+naming the member and the port, not after STARTUP_S
+(HeldHttpPortIsNamedAtOnce holds the bridge's port to prove it; it needs no
+browser). With no browser on the host the browser checks skip, naming why; with
 TALOS_REQUIRE_BROWSER=1 that is a failure. A failed check leaves a
 screenshot and the failing elements (outerHTML and geometry) in the test's
 undeclared outputs and prints their paths.
@@ -121,16 +124,22 @@ def free_ports(count):
 
 
 class Session:
-    """The launched bench simulation with the Studio bridge on a free port."""
+    """The launched bench simulation with the Studio bridge on a free port,
+    or on `http_port` when given."""
 
-    def __init__(self, root, tmp):
+    def __init__(self, root, tmp, http_port=None):
         self.output = tmp / "sessions"
         self.namespace = f"drive-browser-{uuid.uuid4().hex}"
         self.http_port, gw_port, bridge_port = free_ports(3)
+        if http_port is not None:
+            self.http_port = http_port
         # Each member that binds a reserved port, the port, and what its log
-        # says when the bind fails (studio/bridge/main.cc, sim_gateway.cc,
-        # talOS/bridge/main.cc).
-        self.binds = (("studio_bridge", self.http_port, "HTTP listen failed"),
+        # says when the bind fails (studio/bridge/main.cc, which
+        # studio/bridge/listen_test.py holds to naming the port;
+        # sim_gateway.cc; talOS/bridge/main.cc). HeldHttpPortIsNamedAtOnce
+        # below proves the bridge's still matches.
+        self.binds = (("studio_bridge", self.http_port,
+                       f"cannot listen on port {self.http_port}"),
                       ("sim_gateway", gw_port, "cannot open simulation socket"),
                       ("hardware_node", bridge_port,
                        "failed to open hardware node network/ipc resources"))
@@ -163,11 +172,13 @@ class Session:
         """The session directory, once the bridge's log says it listens."""
 
         def listening():
-            if self.launcher.exited():
-                raise RuntimeError("launcher exited during startup")
+            # A failed bind first: a critical member's can end the session,
+            # and the launcher's exit would then hide which port was lost.
             failure = self.bind_failure()
             if failure:
                 raise RuntimeError(failure)
+            if self.launcher.exited():
+                raise RuntimeError("launcher exited during startup")
             for log in self.output.glob("*/studio_bridge.log"):
                 if f"listening {self.http_port}\n" in log.read_text(errors="replace"):
                     return log.parent
@@ -439,6 +450,59 @@ class DriveDashboardInBrowser(unittest.TestCase):
                 f"{stopped_by - armed_at:.1f} ms of the page's clock read", "result": result}])
         self.assertIn("TELEMETRY", result["status"]["text"], result)
         self.wait(label, "__probe.current()", "current again after the producer resumed")
+
+
+def held_port():
+    """A listening socket on the wildcard address (dual-stack where the host
+    has IPv6), on a port the OS picked: another process's listener, as the
+    kernel sees it. Returns (socket, port)."""
+    try:
+        holder = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        holder.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        address = ("::", 0)
+    except OSError:
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        address = ("0.0.0.0", 0)
+    holder.bind(address)
+    holder.listen()
+    return holder, holder.getsockname()[1]
+
+
+# REQ-OPS-36: keeps this target from failing for a reason that is not the
+# dashboard's without saying so (helpers_test.py does the same for its
+# helpers). Needs no browser, so it runs on every host this target does.
+class HeldHttpPortIsNamedAtOnce(unittest.TestCase):
+    """The HTTP port free_ports reserved is taken by another process before
+    the bridge binds it (TODO.md TEST-24's suspected mechanism; ten agents
+    build on one host). The bridge exits naming the port (REQ-OPS-34,
+    studio/bridge/listen_test.py) and the launcher restarts it, so a harness
+    that does not recognise that line waits out STARTUP_S for a listening
+    line that never comes and reports only the timeout. The harness holds
+    the port itself here, before the launch: the wait must end on the
+    bridge's own line, naming the member and the port, not on its bound."""
+
+    def test_a_held_port_fails_the_wait_naming_it(self):
+        holder, port = held_port()
+        tmp = Path(tempfile.mkdtemp(prefix="held-port-", dir=os.environ.get("TEST_TMPDIR")))
+        session = None
+        try:
+            with holder:
+                session = Session(workspace(), tmp, http_port=port)
+                with self.assertRaises(RuntimeError) as raised:
+                    session.wait_listening()
+            print(f"held port {port}: {raised.exception}", flush=True)
+            self.assertIn("studio_bridge", str(raised.exception))
+            self.assertIn(str(port), str(raised.exception))
+        except BaseException:
+            if session is not None:
+                print("--- launcher.txt (tail)\n" + session.log_path.read_text(
+                    errors="replace")[-4000:], flush=True)
+            raise
+        finally:
+            if session is not None:
+                _stop(session.stop)
+            (tmp / "bazel-bin").unlink(missing_ok=True)
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
