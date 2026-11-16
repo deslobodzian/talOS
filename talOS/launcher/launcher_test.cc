@@ -1594,6 +1594,28 @@ TEST(LauncherGraphTest, MissingBinariesAreOneRefusalWithTheBuildCommand) {
       << "the built bridge is not to be rebuilt: " << errors[0];
 }
 
+// A bundle's reader is at the robot after deploy.sh install, with no Bazel
+// and no source tree: the refusal names the bundle and the missing binary,
+// and the cure is to rebuild and deploy it, never a `bazel build` there.
+// REQ-OPS-01
+TEST(LauncherGraphTest, MissingBundleBinaryNamesTheBundleNotABazelBuild) {
+  const NodeSpec missing{.name = "alpha",
+                         .target = "//example/alpha:node",
+                         .binary_path = "/opt/robot/bin/alpha",
+                         .owns_actuators = true};
+  const auto finding = MissingBinariesFinding({missing}, "/opt/robot");
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->severity, naming::Severity::ERROR);
+  EXPECT_NE(finding->message.find("/opt/robot/bin/alpha"), std::string::npos)
+      << finding->message;
+  EXPECT_NE(finding->message.find("bundle /opt/robot"), std::string::npos)
+      << finding->message;
+  EXPECT_NE(finding->message.find("deploy"), std::string::npos)
+      << finding->message;
+  EXPECT_EQ(finding->message.find("bazel"), std::string::npos)
+      << "a robot has no Bazel: " << finding->message;
+}
+
 // REQ-OPS-01
 TEST(LauncherGraphTest, MissingBinaryDoesNotHideOneThatDoesNotAnswer) {
   GraphFixture fixture{"half_built", kStubWithoutDescribe,
