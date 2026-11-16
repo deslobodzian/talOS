@@ -307,19 +307,54 @@ TEST(Replay, TimerOperationsAndHandlerExitReRecordIdentically) {
   std::remove(replayed_path.c_str());
 }
 
-TEST(Replay, DetectsChangedPeriodSkippedDisableAndMissingExit) {
-  const auto path = temp_path("timer_changes");
+// Replays the recorded timer program with `change` applied to the replaying
+// copy; returns the divergence replay reported, if any.
+template <typename Change>
+std::optional<Divergence> replay_changed_timer_program(const char* name,
+                                                       Change change) {
+  const auto path = temp_path(name);
   record_timer_program(path);
-  for (int change = 0; change < 3; ++change) {
+  std::optional<Divergence> diverged;
+  {
     log::LogReader reader{path};
     ReplayEventLoop<> loop{reader};
     TimerProgram program{loop};
-    if (change == 0) program.period = 3ms;
-    if (change == 1) program.disable = false;
-    if (change == 2) program.stop = false;
-    EXPECT_THROW(loop.run(), ReplayDivergence) << "change " << change;
+    change(program);
+    try {
+      loop.run();
+    } catch (const ReplayDivergence& divergence) {
+      diverged = divergence.divergence();
+    }
   }
   std::remove(path.c_str());
+  return diverged;
+}
+
+// The handler re-arms its timer with a different period than it recorded.
+// REQ-OPS-13
+TEST(Replay, DetectsAChangedTimerPeriod) {
+  const auto divergence = replay_changed_timer_program(
+      "timer_period", [](auto& program) { program.period = 3ms; });
+  ASSERT_TRUE(divergence.has_value());
+  EXPECT_EQ(divergence->dispatch_index, 1u);
+}
+
+// The handler no longer disarms its timer.
+// REQ-OPS-13
+TEST(Replay, DetectsASkippedDisarm) {
+  const auto divergence = replay_changed_timer_program(
+      "timer_disarm", [](auto& program) { program.disable = false; });
+  ASSERT_TRUE(divergence.has_value());
+  EXPECT_EQ(divergence->dispatch_index, 1u);
+}
+
+// The handler no longer exits the loop.
+// REQ-OPS-13
+TEST(Replay, DetectsAMissingExit) {
+  const auto divergence = replay_changed_timer_program(
+      "timer_exit", [](auto& program) { program.stop = false; });
+  ASSERT_TRUE(divergence.has_value());
+  EXPECT_EQ(divergence->dispatch_index, 1u);
 }
 
 TEST(Replay, RejectsChangedOrMissingInitialSchedule) {
