@@ -86,6 +86,38 @@ inline bool WriteExecutable(const std::string& path, const std::string& text,
   return ::chmod(path.c_str(), mode) == 0;
 }
 
+// This process's store of paid scripts: a directory under TEST_TMPDIR (else
+// /tmp) named after the process, removed when the process exits normally,
+// so a test binary run outside Bazel leaves no directory behind. Every link
+// a test was handed stays valid (a hard link keeps its file). A forked
+// child that writes stubs gets a store of its own, and its exit removes
+// only that one.
+class FirstExecStore {
+ public:
+  const std::string& path() {
+    if (owner_ != ::getpid()) {
+      owner_ = ::getpid();
+      const char* tmp = std::getenv("TEST_TMPDIR");
+      path_ = std::string{tmp != nullptr ? tmp : "/tmp"} +
+              "/talos_first_exec_" + std::to_string(owner_);
+    }
+    return path_;
+  }
+
+  FirstExecStore() = default;
+  FirstExecStore(const FirstExecStore&) = delete;
+  FirstExecStore& operator=(const FirstExecStore&) = delete;
+  ~FirstExecStore() {
+    if (owner_ != ::getpid()) return;
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+
+ private:
+  pid_t owner_{-1};
+  std::string path_;
+};
+
 }  // namespace detail
 
 // Makes `path` an executable holding `script` with the warm-up line, whose
@@ -95,11 +127,10 @@ inline bool WriteExecutable(const std::string& path, const std::string& text,
 inline std::string WriteWarmStub(const std::string& path,
                                  std::string_view script, mode_t mode = 0755) {
   static std::mutex mutex;
+  static detail::FirstExecStore stores;
   const std::lock_guard lock{mutex};
   const std::string text = WithFirstExecLine(script);
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  const std::string store = std::string{tmp != nullptr ? tmp : "/tmp"} +
-                            "/talos_first_exec_" + std::to_string(::getpid());
+  const std::string& store = stores.path();
   std::error_code ignored;
   std::filesystem::create_directories(store, ignored);
   const std::string paid =

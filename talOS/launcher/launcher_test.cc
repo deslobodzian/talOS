@@ -1178,6 +1178,39 @@ std::string WriteStubNode(std::string_view name, std::string_view script) {
   return testing::WriteWarmStub(dir + "/" + std::string{name}, script);
 }
 
+// first_exec.h's store of paid scripts goes with the process that made it,
+// so a test binary run outside Bazel (no TEST_TMPDIR to remove) does not
+// leave a directory per run; the stubs handed out stay runnable, and a
+// forked child's exit removes only its own store. No REQ row: test
+// infrastructure.
+TEST(FirstExecStubs, StoreIsRemovedWhenItsProcessExits) {
+  const std::string parent_stub = WriteStubNode("store_parent", "#!/bin/sh\n");
+  const std::string parent_store =
+      ::testing::TempDir() + "/talos_first_exec_" + std::to_string(::getpid());
+  ASSERT_TRUE(std::filesystem::is_directory(parent_store)) << parent_store;
+  const std::string child_tmp = TempPath("first_exec_child_tmp");
+  std::filesystem::remove_all(child_tmp);
+  std::filesystem::create_directories(child_tmp);
+  const std::string child_stub = child_tmp + "/stub";
+  std::fflush(nullptr);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0) << std::strerror(errno);
+  if (child == 0) {
+    ::setenv("TEST_TMPDIR", child_tmp.c_str(), 1);
+    testing::WriteWarmStub(child_stub, "#!/bin/sh\nexit 7\n");
+    std::exit(0);  // Runs static destructors, as a test binary's exit does.
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+  EXPECT_FALSE(std::filesystem::exists(child_tmp + "/talos_first_exec_" +
+                                       std::to_string(child)));
+  EXPECT_EQ(std::system(child_stub.c_str()), 7 << 8);
+  EXPECT_TRUE(std::filesystem::is_directory(parent_store)) << parent_store;
+  EXPECT_TRUE(std::filesystem::exists(parent_stub));
+  std::filesystem::remove_all(child_tmp);
+}
+
 // The JSON a real node prints, written by the real writer: a stub that answered
 // with hand-typed JSON would pass the day describe.h changed shape.
 std::string DescribeJson(
