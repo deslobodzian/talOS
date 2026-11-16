@@ -619,9 +619,13 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       can_id = m.can_id;
       // Diagnostics request lower rates, but Phoenix applies the highest
       // requested rate to every signal sharing a status frame. In SDK 26.3,
-      // StatorCurrent, SupplyCurrent and DeviceTemp are SupplyAndTemp SPNs.
+      // StatorCurrent, SupplyCurrent and DeviceTemp are SupplyAndTemp SPNs,
+      // and a master's DutyCycle shares the MotorOutput frame with
+      // MotorVoltage (PRO_MotorOutput_*, 100 Hz by default on CAN 2.0 where
+      // position and velocity are 50 Hz), so it takes MotorVoltage's cap.
       auto& motor = *motors_[&m - c.motors.data()];
       if (signal == &motor.GetMotorVoltage(false) ||
+          signal == &motor.GetDutyCycle(false) ||
           signal == &motor.GetStatorCurrent(false) ||
           signal == &motor.GetSupplyCurrent(false) ||
           signal == &motor.GetFaultField(false))

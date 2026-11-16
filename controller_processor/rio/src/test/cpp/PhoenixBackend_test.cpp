@@ -1057,6 +1057,15 @@ TEST_F(PhoenixBackendRecovery, DiagnosticRatesRespectPhoenixSharedFrames) {
 // MotorVoltage in the voltage-based ones; at the slowest status rate config
 // load allows (status_hz 8 at the 500 ms timeout cap) both must still reach
 // 20 Hz.
+//
+// Not faster than MotorVoltage either: on CAN 2.0 the two share the TalonFX
+// MotorOutput status frame (SpnValue.hpp's PRO_MotorOutput_DutyCycle and
+// PRO_MotorOutput_MotorVoltage, both 100 Hz by default where position and
+// velocity are 50 Hz), and Phoenix runs a frame at its fastest request, so
+// DutyCycle at status_hz (200 Hz on the bench) would undo MotorVoltage's
+// 50 Hz cap. The simulator runs every signal but FaultField in one frame,
+// so the master's DutyCycle request shows only with position and velocity
+// requested no faster than the capped group.
 // REQ-CONTRACT-40
 TEST_F(PhoenixBackendRecovery, AMasterWithFollowersSendsItsOutputAt20Hz) {
   EnsureHal();
@@ -1076,6 +1085,17 @@ TEST_F(PhoenixBackendRecovery, AMasterWithFollowersSendsItsOutputAt20Hz) {
               20.0);
     EXPECT_GE(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
               20.0);
+    if (status_hz <= 50.0) continue;
+    for (auto* motion :
+         std::initializer_list<ctre::phoenix6::BaseStatusSignal*>{
+             &master.GetPosition(false), &master.GetVelocity(false)}) {
+      ASSERT_TRUE(AwaitAnswer([&] {
+                    return motion->SetUpdateFrequency(units::hertz_t{50});
+                  }).IsOK());
+    }
+    EXPECT_DOUBLE_EQ(
+        master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(), 50.0)
+        << "the master's DutyCycle is requested faster than MotorVoltage";
   }
 }
 
