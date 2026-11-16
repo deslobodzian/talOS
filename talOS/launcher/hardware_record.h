@@ -74,6 +74,12 @@ enum class HardwareRecord : std::uint8_t {
   kDriverStation
 };
 
+// The names log_dump gives a motor request's and a PWM request's mode
+// ("neutral", "voltage", ...; "off", "pulse"); "unknown" for a value outside
+// the enum.
+const char* HardwareModeName(hardware::Mode mode);
+const char* PwmModeName(hardware::PwmMode mode);
+
 // Which packet a recorded topic carries; kNone unless `schema_name` is the
 // hardware Packet's (talOS/schema/identity.h kPacketName).
 HardwareRecord HardwareRecordOf(std::string_view topic,
