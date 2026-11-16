@@ -288,12 +288,12 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/teleop` | REQ-SAFE-13, REQ-SAFE-14, REQ-SAFE-31, REQ-CONTRACT-24 |
 | `talOS/trajectory` | REQ-DEV-13 to REQ-DEV-15, REQ-DEV-20; REQ-RT-06 for the calls an `update()` makes (`sample`, `EventCursor::advance`, `HolonomicFollower::step`, `assign` within `reserve`, `MakeStraightLine`) |
 | `talOS/mechanisms` | REQ-SAFE-36 to REQ-SAFE-38; REQ-SAFE-01, REQ-SAFE-04, REQ-SAFE-05 (the neutral half of the matrix's disabled, stale and released cases is the flush's: REQ-SAFE-02, REQ-SAFE-41), REQ-RT-06, REQ-DEV-22 |
-| `talOS/vision` (CPU pipeline, capture, `field_sim`) | none in the catalogue: the camera-node rows it served are the 2026 robot's (TODO.md SCOPE-1) |
-| `talOS/vision/metal`, `talOS/vision/recording`, `talOS/vision/playback`, `talOS/vision/evaluation` | none in the catalogue (TODO.md SCOPE-1) |
+| `talOS/vision` (CPU pipeline, capture, `field_sim`) | none in this catalogue: a library kept for robot repositories, whose evidence is the robot's own rows (the 2026 robot's REQ-CONTRACT-27 and REQ-DEV-11) |
+| `talOS/vision/metal`, `talOS/vision/recording`, `talOS/vision/playback`, `talOS/vision/evaluation` | none in this catalogue: robot-library code, as `talOS/vision` |
 | `talOS/aiming` | REQ-DEV-16 to REQ-DEV-19 |
 | `bench` | REQ-CONTRACT-19; bench procedures for REQ-RT-14, REQ-RT-15; composition evidence for REQ-SAFE-31 (the soak, `bench/main_processor/simulation`); the bench nodes: the node test matrix proves the node drives through its `Target` (REQ-SAFE-07, case 1) and reports its state (REQ-CONTRACT-25); the neutral half of REQ-SAFE-02, REQ-SAFE-07 and REQ-SAFE-09 is the flush's (REQ-SAFE-41); REQ-SAFE-04, REQ-CONTRACT-14 (motor), REQ-CONTRACT-18, REQ-RT-06, REQ-DEV-26 (swerve module) |
 | `controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29, REQ-RT-24, REQ-CONTRACT-39, REQ-SAFE-43 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-36, REQ-OPS-41, REQ-OPS-42, REQ-OPS-49, REQ-OPS-51 |
-| `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
+| `studio/agent` | none in the catalogue: kept, with no further work until a requirement names it |
 | `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23, REQ-DEV-25, REQ-DEV-30, REQ-DEV-32, REQ-OPS-47, REQ-OPS-50 |
 
