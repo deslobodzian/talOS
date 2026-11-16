@@ -21,7 +21,8 @@ Keep a spotter at DS disable and a safe power disconnect; neutral output does
 not instantly stop a coasting rotor or wheel.
 
 For every trial record operator/date, config hash, Mini/RIO versions, wiring,
-DS mode, control inputs, session directory and RIO console output. Stop and
+DS mode, control inputs, session directory and RIO console output; what was
+measured goes, dated, in [BENCH_RESULTS.md](BENCH_RESULTS.md). Stop and
 investigate any unexpected motion before proceeding. Disable between trials,
 release all controls, and explicitly re-enable only after checking recovery.
 

@@ -76,7 +76,7 @@ Climb as far as the change reaches; never skip a rung below it.
 | 2 | main session | the affected tests (below), and `--describe-only` on each affected config | before each commit |
 | 3 | main session | RULES.md 11 in full: `tools/prepush.sh` | before each push, from a clean worktree of the commits to push |
 | 4 | CI | the workflows on the pushed commit ([TESTING.md §9](TESTING.md#9-lanes-and-ci)) | on push |
-| 5 | bench or robot | the [BENCH.md](BENCH.md) or [BRINGUP.md](BRINGUP.md) check a TODO.md item names | for a requirement verified by measurement |
+| 5 | bench or robot | the [BENCH.md](BENCH.md) or [BRINGUP.md](BRINGUP.md) check a TODO.md item names, its result recorded in [BENCH_RESULTS.md](BENCH_RESULTS.md) | for a requirement verified by measurement |
 
 Rung 2's affected tests:
 
