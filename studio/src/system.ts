@@ -667,6 +667,14 @@ export function topicEnds(nodes: readonly EndHolder[]): Map<string, TopicEnds> {
   return ends;
 }
 
+// Whether an observer alone reads `topic` by design: its role (the second
+// segment) is one its owner publishes. Mirrors studio/bridge/system.h's
+// ObserverReads, which applies naming::kOwnerPublishedRoles
+// (talOS/introspection/names.h) as naming::LintGraph does; keep the set equal.
+const OWNER_PUBLISHED_ROLES = new Set(['state', 'status', 'event', 'telemetry']);
+const observerReads = (topic: string): boolean =>
+  OWNER_PUBLISHED_ROLES.has(topic.split('/')[2] ?? '');
+
 // What is worth flagging about a topic, in the order a person cares about it.
 //
 // A subscriber waiting on a topic nothing publishes cannot tell from the
@@ -680,11 +688,12 @@ export function topicEnds(nodes: readonly EndHolder[]): Map<string, TopicEnds> {
 //
 // An observer (a source with `observer` set, naming::kSourceFlagObserver in
 // talOS/introspection/names.h: telemetry) counts as a reader here and nowhere
-// else, as the launcher's "published but nothing subscribes to it" counts it,
-// so this badge and that lint agree.
+// else, and only of a role its owner publishes, as the launcher's lint counts
+// it, so this badge and that lint agree.
 export function topicHealth(topic: SystemTopic,
                             ends: TopicEnds = PLAIN_ENDS): TopicHealth {
-  const read = topic.subscribers.length > 0 || topic.observers.length > 0;
+  const read = topic.subscribers.length > 0 ||
+      (topic.observers.length > 0 && observerReads(topic.name));
   const halfWired = !topic.publishers.length || !read;
   if (halfWired && ends.external) return 'bridged';
   if (halfWired && ends.optional) return 'unconnected';
