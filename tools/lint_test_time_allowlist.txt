@@ -51,7 +51,6 @@ talOS/launcher/testdata/supervision_events.h clock 2 integration helper: Stepped
 talOS/node/node_binary_test.cc clock 4 integration: a 20 s deadline bounds the wait for a spawned node's registry row, and the stop latency shows SIGTERM did not wait out --duration-s
 talOS/node/node_binary_test.cc sleep 1 integration: paces the poll for a spawned node's registry row (no notification exists)
 talOS/protocol/udp_test_helpers.h clock 2 integration helper: ReceiveFrame's deadline (kReceiveHangBound, 10 s, by default) only bounds a hang
-talOS/protocol/udp_test_helpers.h sleep 1 integration helper: ReceiveFrame polls a real UDP socket 1 ms apart; //talOS/bridge:run_test's request-wake count relies on that latency (a poll(2) wait failed it 1 of 20)
 talOS/simulation/sim_gateway_test.py clock 4 integration: the simulator as a child process; deadlines on its UDP datagrams only bound a hang (TESTING.md §6)
 talOS/vision/pipeline_test.cc clock 2 integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/pipeline_test.cc sleep 1 integration: pipeline worker threads, condition wait with a deadline
