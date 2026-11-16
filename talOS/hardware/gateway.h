@@ -195,6 +195,20 @@ class Gateway {
   const CommandExpiry& last_command_expiry() const {
     return last_command_expiry_;
   }
+  // The last changed configuration refused because the gateway was enabled
+  // (Reconfigure, BeginReconfigure): `count` such refusals since
+  // construction, `refused_id` its ConfigurationId (0 when it would not
+  // validate) and `active_id` the configuration in force then (0 with
+  // none). Reporting only (the RoboRIO's console line); nothing in the
+  // gateway reads it.
+  struct EnabledRefusal {
+    uint64_t count{};
+    uint64_t refused_id{};
+    uint64_t active_id{};
+  };
+  const EnabledRefusal& last_enabled_refusal() const {
+    return last_enabled_refusal_;
+  }
   // Precise failure behind the last rejected configuration, if the
   // backend could say more than "it failed".
   std::optional<ConfigError> config_error() const { return config_error_; }
@@ -202,6 +216,7 @@ class Gateway {
 
  private:
   void Invalidate();
+  void RecordEnabledRefusal(const Config& refused);
   // This tick's CAN bus slot: index `sequence % count` of the applied
   // configuration's buses (state_.health.can_bus_count, set only where a
   // configuration is committed), cleared for Backend::Read to fill. Called
@@ -265,6 +280,7 @@ class Gateway {
   uint32_t consecutive_apply_failures_{};
   uint64_t accepted_at_{}, observed_at_{};
   CommandExpiry last_command_expiry_{};
+  EnabledRefusal last_enabled_refusal_{};
   std::optional<ConfigError> config_error_;
 };
 }  // namespace talos::hardware

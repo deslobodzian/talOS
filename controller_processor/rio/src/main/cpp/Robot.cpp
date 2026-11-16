@@ -589,8 +589,9 @@ void Robot::StartCompetition() {
       log_->ClosePhase(TickPhase::kLink, NowNs());
     }
 
-    // A console line for each command expiry this tick found: no State
-    // reaches the main processor when its loss caused the expiry.
+    // A console line for each command expiry this tick found (no State
+    // reaches the main processor when its loss caused the expiry) and each
+    // changed configuration it refused while enabled.
     loop_console.ObserveGateway(*gateway_);
 
     // Arms the watchdog only while a command is in force (a tick without one

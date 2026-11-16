@@ -24,7 +24,12 @@ addresses and bus names, inversion, encoder offsets, current/voltage limits,
 gearing, three gain slots, soft limits, TalonFX limit switches, FOC, the
 torque-current limit, and Motion Magic cruise velocity, acceleration, and
 jerk. Changed configurations
-require disabled operation. Identical pushes may succeed while enabled
+require disabled operation: the RoboRIO console names each push refused
+while enabled, `hardware gateway refused configuration <new> while enabled
+(running <old>): disable to accept the new configuration` (`<old>` is `0`
+with none in force; `Gateway::last_enabled_refusal()`, posted by the
+program's `LoopConsole`), and the bridge pushes again, backing off to once
+every 2 s. Identical pushes may succeed while enabled
 without device traffic, but not while faulted or while
 configuration/restoration is pending.
 
