@@ -575,7 +575,10 @@ remains healthy while any configured motor or CAN sensor has valid feedback
 feedback neutralizes every output and advances
 the command epoch on the tick it is found, whether or not a command is in
 force; the fault is not latched, and clears in the same epoch on the first
-State with valid feedback. Total loss is judged on the State as published:
+State with valid feedback. A command observing a State of the loss still
+matches that epoch once it clears, but drives nothing: its motors stay
+neutral (above), its digital outputs are sent false and its PWM outputs off
+(`Gateway` `outputs_drive_from_`). Total loss is judged on the State as published:
 after the age bound and after the gateway's masks (unavailable, restoring or
 send-failed devices, their followers and remote-feedback motors, a chain
 whose restore ends that tick), so a State of a configured gateway with at

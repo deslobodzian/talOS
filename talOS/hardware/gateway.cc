@@ -469,9 +469,11 @@ bool Gateway::JudgeFeedbackAge() {
 // it through the tick whose PollRestore ends the restore, whatever Read
 // reported for a restoring device.
 void Gateway::JudgeMaskedLoss(bool was_healthy) {
-  if (!healthy_ || AnyFeedbackValid(state_)) return;
-  healthy_ = false;
-  if (was_healthy || active_) Invalidate();
+  if (healthy_ && !AnyFeedbackValid(state_)) {
+    healthy_ = false;
+    if (was_healthy || active_) Invalidate();
+  }
+  if (!healthy_) outputs_drive_from_ = state_.sample_time_us + 1;
 }
 
 void Gateway::Tick(uint64_t now, bool enabled) {
@@ -660,9 +662,22 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     if (requests[i].mode == Mode::kNeutral && requests[i] != c.motors[i])
       ++state_.counters.neutralized_motor_count;
   }
+  // A command observing a State of total loss drives no output after the
+  // loss clears in its epoch: its motors are held by motor_drives_from_, its
+  // digital outputs go false and its PWM outputs off.
+  auto digital_outputs = c.digital_outputs;
+  auto pwm_outputs = c.pwm_outputs;
+  if (c.observed_time_us < outputs_drive_from_) {
+    for (std::size_t i = 0; i < c.digital_output_count; ++i) {
+      digital_outputs[i] = DigitalOutputRequest{digital_outputs[i].id};
+    }
+    for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
+      pwm_outputs[i] = PwmRequest{pwm_outputs[i].id};
+    }
+  }
   if (!ApplyMotors({requests.data(), c.count}) ||
-      !backend_.ApplyOutputs({c.digital_outputs.data(), c.digital_output_count},
-                             {c.pwm_outputs.data(), c.pwm_output_count})) {
+      !backend_.ApplyOutputs({digital_outputs.data(), c.digital_output_count},
+                             {pwm_outputs.data(), c.pwm_output_count})) {
     ++state_.counters.apply_failure_count;
     fault_ = ++consecutive_apply_failures_ >= kConsecutiveApplyFailureLimit;
     Invalidate();

@@ -155,7 +155,9 @@ class Gateway {
   // CAN-sensor sample in the State Tick publishes, its masks included)
   // neutralizes all outputs, refuses every command and invalidates
   // outstanding commands by advancing the epoch; it is not latched, and the
-  // first State with a valid sample clears it. A device-local send failure
+  // first State with a valid sample clears it. A command observing a State
+  // of the loss drives nothing after it clears: its motors neutral, digital
+  // outputs false, PWM outputs off. A device-local send failure
   // (ApplyFailedDevices) isolates only that motor's chain and the command is
   // still accepted, unless the isolation leaves no valid sample, which is
   // total loss: Accept then returns false. Global apply failures
@@ -194,7 +196,8 @@ class Gateway {
   bool JudgeFeedbackAge();
   // Total loss on this tick's State after the gateway's masks
   // (AnyFeedbackValid): healthy_ false and, when `was_healthy` or a command
-  // is in force, Invalidate.
+  // is in force, Invalidate. While healthy_ is false, moves
+  // outputs_drive_from_ past this tick's State.
   void JudgeMaskedLoss(bool was_healthy);
   void PollResets();
   void FindPositionJumps(std::vector<uint16_t>& reset_ids);
@@ -227,6 +230,10 @@ class Gateway {
   // past the last State in which it could not drive (MayDrive false), the
   // State of the tick its restore ended included (PollResets masks it).
   std::array<uint64_t, kMaxMotors> motor_drives_from_{};
+  // The earliest observation time a command's digital and PWM outputs apply
+  // on: one past the last State of total loss (healthy_ false). Before it
+  // they are sent false and off.
+  uint64_t outputs_drive_from_{};
   // A rotor-feedback motor's last valid position since the gateway last
   // masked it, and the earliest time that sample can have been taken.
   struct PositionReference {
