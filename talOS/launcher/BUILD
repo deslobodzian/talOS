@@ -240,11 +240,7 @@ cc_library(
     name = "hardware_record",
     srcs = ["hardware_record.cc"],
     hdrs = ["hardware_record.h"],
-    visibility = [
-        # node_test reads a real bridge log with it (REQ-OPS-51).
-        "//talOS/bridge:__pkg__",
-        "//studio/review:__pkg__",
-    ],
+    visibility = ["//studio/review:__pkg__"],
     deps = [
         "//talOS/bridge:messages",
         "//talOS/configuration",

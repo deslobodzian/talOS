@@ -1424,8 +1424,12 @@ costs a read of each log's header, and of the bridge's logs up to their
 first status, never past their first second of records: the bridge's
 `--log` records every status it publishes, on its first pass and every
 20 ms after, so each segment holds one within its first 20 ms unless the
-bridge stalled. A bridge log with none in its first second (one from
-before the bridge logged its statuses) records no version. A session is a
+bridge stalled, or unless the segment holds almost no records because the
+bridge's log share is at its floor: such a segment can hold no status and
+records no version, so a session none of whose logs records one is read
+under the manifest's. A bridge log with none in
+its first second (one from before the bridge logged its statuses) records
+no version. A session is a
 directory's own `manifest.json` and logs, or for a `.tlog` file named on
 its own, the `manifest.json` beside it and that
 session's logs beside it when the manifest's `session_id` is the log
