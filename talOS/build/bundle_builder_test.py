@@ -773,6 +773,119 @@ class DeployTest(unittest.TestCase):
                     # Refused before anything is written.
                     self.assertFalse(os.path.lexists(prefix), proc.stdout)
 
+    def selected(self, tmp):
+        """A prefix whose `current` selects a stub bundle whose run.sh
+        records its pid, TALOS_LOG_DIR and arguments, one a line, in the
+        returned file."""
+        prefix = os.path.join(tmp, "prefix")
+        record = os.path.join(tmp, "ran")
+        bundle = os.path.join(prefix, "bundles", "20260101_000000_1")
+        put(os.path.join(bundle, "run.sh"),
+            "#!/bin/sh\n{ echo \"$$\"; echo \"$TALOS_LOG_DIR\"; "
+            "for a in \"$@\"; do echo \"$a\"; done; } > " + record + "\n")
+        os.chmod(os.path.join(bundle, "run.sh"), 0o755)
+        os.symlink(bundle, os.path.join(prefix, "current"))
+        return prefix, record
+
+    def host(self, tmp, system, running=None):
+        """A PATH directory faking `uname` as `system` ("Linux" or
+        "Darwin") and a boot service (systemd's talos.service, launchd's
+        org.talos.robot) running the program `running`, or none."""
+        bin_dir = os.path.join(tmp, "fake_host")
+        if running:
+            systemctl = (
+                'case "$*" in *ActiveState*) echo active ;; '
+                f'*ExecStart*) echo "{{ path={running} ; argv[]={running} ; '
+                'ignore_errors=no }" ;; esac')
+            launchctl = (f'printf "system/org.talos.robot = {{\\n\\tstate = '
+                         f'running\\n\\tprogram = {running}\\n}}\\n"')
+        else:
+            systemctl = 'case "$*" in *ActiveState*) echo inactive ;; esac'
+            launchctl = "exit 113"
+        for name, body in (("uname", f"echo {system}"),
+                           ("systemctl", systemctl),
+                           ("launchctl", launchctl)):
+            put(os.path.join(bin_dir, name), f"#!/bin/sh\n{body}\n")
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        return bin_dir
+
+    # REQ-OPS-54
+    def test_run_dry_run_takes_the_boot_units_limits_on_linux_only(self):
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system), tempfile.TemporaryDirectory() as tmp:
+                prefix, record = self.selected(tmp)
+                # Another prefix's boot service does not refuse this one.
+                path = self.host(tmp, system, "/elsewhere/current/run.sh")
+                proc = self.deploy(prefix, "run", "--dry-run", "--remote",
+                                   "10.0.0.9", path=path)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                lines = [line for line in proc.stdout.splitlines()
+                         if line.startswith("+ ")]
+                launch = (f"+ exec env TALOS_LOG_DIR={prefix}/logs "
+                          f"{prefix}/current/run.sh --remote 10.0.0.9")
+                limits = ["+ ulimit -r 49", "+ ulimit -l unlimited"]
+                self.assertEqual(
+                    lines, (limits if system == "Linux" else []) + [launch],
+                    proc.stdout)
+                self.assertFalse(os.path.exists(record))
+
+    # REQ-OPS-54
+    def test_run_becomes_the_launcher_with_its_arguments(self):
+        # The macOS form, which takes no limit, so it runs on any host.
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, record = self.selected(tmp)
+            env = dict(os.environ, PATH=self.host(tmp, "Darwin") + os.pathsep
+                       + os.environ["PATH"])
+            # After `--`, even deploy.sh's own flags go to run.sh.
+            proc = subprocess.run(
+                ["bash", os.path.abspath(runfiles.Create().Rlocation(
+                    "_main/tools/deploy.sh")), "run", "--prefix", prefix,
+                 "--remote", "10.0.0.9", "--", "--dry-run"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(record, encoding="utf-8") as f:
+                pid, log_dir, *args = f.read().splitlines()
+            # run.sh, and the launcher it execs, run in deploy.sh's process,
+            # whose pid it printed.
+            self.assertRegex(proc.stdout, rf"\bpid {pid}\b")
+            self.assertEqual(log_dir, os.path.join(prefix, "logs"))
+            self.assertIn(log_dir, proc.stdout)
+            self.assertEqual(args, ["--remote", "10.0.0.9", "--dry-run"])
+
+    # REQ-OPS-54
+    def test_run_refuses_while_the_boot_service_runs_the_same_bundle(self):
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system), tempfile.TemporaryDirectory() as tmp:
+                prefix, record = self.selected(tmp)
+                path = self.host(tmp, system,
+                                 os.path.join(prefix, "current", "run.sh"))
+                proc = self.deploy(prefix, "run", path=path)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertIn(os.path.join(prefix, "current", "run.sh"),
+                              proc.stderr)
+                self.assertFalse(os.path.exists(record), proc.stdout)
+
+    # REQ-OPS-54
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "RLIMIT_RTPRIO is Linux's")
+    def test_run_on_linux_starts_nothing_without_the_limit_grant(self):
+        import resource
+
+        def lowered():
+            resource.setrlimit(resource.RLIMIT_RTPRIO, (0, 0))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, record = self.selected(tmp)
+            env = dict(os.environ, PATH=self.host(tmp, "Linux") + os.pathsep
+                       + os.environ["PATH"])
+            proc = subprocess.run(
+                ["bash", os.path.abspath(runfiles.Create().Rlocation(
+                    "_main/tools/deploy.sh")), "run", "--prefix", prefix],
+                capture_output=True, text=True, env=env, preexec_fn=lowered)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("rtprio", proc.stderr)
+            self.assertFalse(os.path.exists(record), proc.stdout)
+
     def test_rollback_refuses_a_previous_bundle_that_is_gone(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             current = self.bundle(tmp, "20260102_000000_1")
