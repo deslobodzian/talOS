@@ -10,7 +10,12 @@ to the flush right after it; outputs that update() did not set are neutral.
 From __init__, an every() timer or a callback they raise TalosError naming
 the device, since such a command would reach the hardware for at most one
 tick. Motors, digital outputs and PWM outputs are neutral while
-talos.robot_enabled(node) is false. Motor demands clamp to configured
+talos.robot_enabled(node) is false, and in any tick in which no talos.Target
+of the node returned a target from a get() (or source) made during that
+update(): drive only from what get() returns. The request still goes out,
+and the first such tick of an enabled spell in which update() set an output
+non-neutral prints one line on the node's stderr. talos.allow_untargeted_outputs(node) lifts the
+target half for a test or bench fixture. Motor demands clamp to configured
 limits; non-finite input neutralizes the motor. Feedback is in mechanism
 units and reads 0 (connected False) until the first state.
 """
@@ -38,6 +43,17 @@ class Mode(enum.IntEnum):
 def robot_enabled(node):
     """Whether this node's outputs reach the hardware."""
     return bool(_abi.ok(lib.talos_robot_enabled(node._handle)))
+
+
+def allow_untargeted_outputs(node):
+    """Lifts the live-target half of the flush's gate for this node
+    (talos::AllowUntargetedOutputs, RULES.md 1): its outputs are then sent
+    as set whenever talos.robot_enabled(node), whether or not a talos.Target
+    returned a target that tick. For a test or bench fixture with no
+    producer by design; --describe and the registry mark its hardware
+    request "untargeted_outputs". Call in __init__; afterwards it raises
+    TalosError."""
+    _abi.ok(lib.talos_allow_untargeted_outputs(node._handle))
 
 
 def hardware_sample_time_ns(node):

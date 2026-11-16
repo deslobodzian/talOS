@@ -90,6 +90,7 @@ class Lift:
     def __init__(self, node):
         self.node = node
         self.lift = talos.Motor(node, "lift")
+        talos.allow_untargeted_outputs(node)
         self.enabled = None
 
     def update(self):
@@ -276,6 +277,33 @@ class RunTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         described = json.loads(result.stdout[result.stdout.index("{"):])
         self.assertTrue(described["abi_update"])
+
+    # REQ-SAFE-42: the opt-out reaches --describe through the C ABI, on the
+    # hardware request only, which the graph lint and the registry read.
+    def test_describe_reports_untargeted_outputs(self):
+        probe = textwrap.dedent("""
+            import sys, tempfile
+            import talos
+
+            class Probe:
+                def __init__(self, node):
+                    self.lift = talos.Motor(node, "lift")
+                    talos.allow_untargeted_outputs(node)
+
+            with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+                config.write(sys.argv[1])
+                config.flush()
+                sys.exit(talos.run(Probe, "lift", "//talOS/python:probe",
+                                   ["probe", "--describe", "--config",
+                                    config.name]))
+        """)
+        result = subprocess.run([sys.executable, "-c", probe, ROBOT_TOML],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        described = json.loads(result.stdout[result.stdout.index("{"):])
+        marked = {source["name"] for source in described["sources"]
+                  if source.get("untargeted_outputs")}
+        self.assertEqual(marked, {"/hw/request/lift"})
 
 
 class BorrowedLifetimeTest(unittest.TestCase):

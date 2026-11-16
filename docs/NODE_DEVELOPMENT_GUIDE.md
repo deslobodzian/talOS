@@ -258,9 +258,10 @@ Handles are named by their device key in the subsystem config
 | C++ | Python |
 |---|---|
 | `talos::Motor m{node, "roller"}`: `set_duty_cycle`, `set_voltage`, `set_velocity`, `set_position`, `set_motion_magic` (`ff_volts`, `slot`), `stop`; `position()`, `velocity()`, `voltage()`, `current()` (stator A), `temperature_c()`, `supply_current_a()`, `connected()`, `clamped_count()`, `forward_limit()`, `reverse_limit()` | `talos.Motor(node, "roller")`, getters as properties; demands/feedforward clamp to configured limits, non-finite input neutralizes the motor; `clamped_count` counts adjusted setter calls |
-| `CANcoder`, `Gyro` (`yaw`, `yaw_rate`), `Encoder`, `DigitalInput` (`get()`), `AnalogInput` (`voltage()`), `DigitalOutput`, `PwmOutput` (`set()`) | same names; `DigitalInput.value`; DIO/PWM commands are gated on `robot_enabled` (false/zero while disabled or state is stale) |
+| `CANcoder`, `Gyro` (`yaw`, `yaw_rate`), `Encoder`, `DigitalInput` (`get()`), `AnalogInput` (`voltage()`), `DigitalOutput`, `PwmOutput` (`set()`) | same names; `DigitalInput.value`; DIO/PWM commands, like motor commands, are gated on `robot_enabled` and a live `Target` (false/zero while disabled, while state is stale, and in a tick in which no `Target` returned a target: see [Targets](#targets)) |
 | `talos::DriverStation ds{node}`: `connected()`, `enabled()`, `autonomous()`, `teleop()`, `test()`, `estop()`, `alliance()`, `match_time()`, `joystick(port)` → `axis(i)`, `button(n)` (1-based), `pov(i)` | `talos.DriverStation(node)`, same as properties/methods |
 | `talos::robot_enabled(node)` | `talos.robot_enabled(node)` |
+| `talos::AllowUntargetedOutputs(node)` (constructor only; a test or bench fixture with no producer): outputs drive on `robot_enabled` alone, and `--describe` marks the hardware request `untargeted_outputs` | `talos.allow_untargeted_outputs(node)` (in `__init__`; later raises `TalosError`) |
 | `node.extension<talos::HardwareLink>().sample_time()`: node-clock `Time` the latest hardware state was sampled at, `nullopt` while stale or before the bridge's clock mapping converges (8 states) | `talos.hardware_sample_time_ns(node)` (int ns, or `None`) |
 | `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
 | `Motor` / `CANcoder`: `position_time()`, `velocity_time()`; `Gyro`: `yaw_time()`, `yaw_rate_time()` | same names as properties: integer node-clock nanoseconds, or `None` |
@@ -438,6 +439,19 @@ if (arming_.evaluate(/*neutral=*/!held) && held) {
   lane_.release();
 }
 ```
+
+**Why an output stays neutral.** The devices flush sends what `update()` set
+only in a tick in which `robot_enabled(node)` holds and one of the node's
+`Target`s returned a target from a `get()` (or `source()`) made during that
+`update()`. Anything else sends every motor neutral, every digital output
+false and every PWM output 0, and the request still goes out: a node that
+drives straight from a joystick, a plain subscription or a target it kept
+from an earlier tick never moves, nor does one that asks its `Target` only
+in `every()` or a callback. The first such tick of each enabled spell in
+which `update()` set an output non-neutral prints one line on the node's stderr naming
+it. Drive only from what this tick's `get()` returned; a test or bench
+fixture with no producer by design calls `talos::AllowUntargetedOutputs`
+(`talos.allow_untargeted_outputs`) in its constructor instead.
 
 
 ### Binding joystick buttons and axes via TOML

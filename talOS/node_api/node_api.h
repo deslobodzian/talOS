@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 32u
+#define TALOS_NODE_ABI_VERSION 33u
 
 enum {
   TALOS_OK = 0,
@@ -211,6 +211,9 @@ enum {  // talos::hardware::Mode
 // "roller"). Returns its index, or -1 naming the device in the error.
 int64_t talos_device(TalosNode* node, int32_t kind, const char* name);
 int32_t talos_robot_enabled(TalosNode* node);
+// AllowUntargetedOutputs (talOS/devices/devices.h). Call while the factory
+// runs: TALOS_OK, or TALOS_ERR after it returned.
+int32_t talos_allow_untargeted_outputs(TalosNode* node);
 // HardwareLink::sample_time: the node-clock time (ns) at which the gateway
 // sampled the latest accepted hardware state. Returns 1 with *out_ns set, 0
 // when there is none (no fresh state, or the bridge's clock mapping for its

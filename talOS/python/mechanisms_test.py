@@ -96,6 +96,7 @@ class Shooter:
 class Intake:
     def __init__(self, node):
         self.roller = RollerWithSensor(node, "roller")
+        talos.allow_untargeted_outputs(node)
         self.command = None  # set by the test
 
     def update(self):

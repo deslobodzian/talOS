@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -191,6 +192,15 @@ struct HardwareLink::Impl {
   std::vector<std::size_t> motor_devices;  // devices[] index, same order
   bool has_outputs = false;
   std::size_t request = 0;  // publisher index on node
+  // NodeAccess::next_update of the update() in which a talos::Target of this
+  // node last returned a target (note_live_target; 0: never). The flush
+  // drives only when it is the update() that just ran.
+  std::uint64_t live_target_update = 0;
+  // The stderr line a flush prints when it holds outputs neutral for want
+  // of a live target, built with the first output so the tick allocates
+  // nothing; printed once per enabled spell.
+  std::string withheld_line;
+  bool withheld_reported = false;
 
   hardware::State state{};
   bool have_state = false;
@@ -357,10 +367,33 @@ struct HardwareLink::Impl {
                      .valid;
   }
 
+  // Whether update() set an output to something other than neutral: a motor
+  // mode other than neutral, a digital output true or a PWM output not 0.
+  bool SetNonNeutral() const {
+    for (const Device& device : devices) {
+      if (!device.set) continue;
+      if ((device.kind == Kind::kMotor &&
+           device.motor.mode != hardware::Mode::kNeutral) ||
+          (device.kind == Kind::kDigitalOutput && device.digital) ||
+          (device.kind == Kind::kPwm && device.pwm != 0.0)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // RULES.md 1: a tick drives only while robot_enabled and, unless the node
+  // called AllowUntargetedOutputs, a talos::Target of the node returned a
+  // target during the update() that just ran (NodeAccess::next_update reads
+  // that update()'s index here). A tick that does not drive sends every
+  // output neutral and still sends the request.
   void Flush() {
+    const bool targeted =
+        detail::NodeAccess::untargeted_outputs(node) ||
+        live_target_update == detail::NodeAccess::next_update(node);
     if (have_state) {
       hardware::Command command = hardware::NeutralCommand(state, motor_ids);
-      const bool drive = Enabled();
+      const bool drive = Enabled() && targeted;
       for (std::size_t i = 0; i < command.count; ++i) {
         const Device& motor = devices[motor_devices[i]];
         if (drive && motor.set) command.motors[i] = motor.motor;
@@ -384,6 +417,14 @@ struct HardwareLink::Impl {
         detail::NodeAccess::publisher_send(node, request, &packet,
                                            sizeof packet);
       }
+    }
+    // One line per enabled spell, written whole with one fwrite from the
+    // line built at registration: no allocation on the tick.
+    if (!Enabled()) {
+      withheld_reported = false;
+    } else if (!targeted && !withheld_reported && SetNonNeutral()) {
+      std::fwrite(withheld_line.data(), 1, withheld_line.size(), stderr);
+      withheld_reported = true;
     }
     for (Device& device : devices) device.set = false;
   }
@@ -432,6 +473,15 @@ bool robot_enabled(Node& node) {
   return node.extension<HardwareLink>().enabled();
 }
 
+void AllowUntargetedOutputs(Node& node) {
+  detail::NodeAccess::mark_untargeted_outputs(node);
+}
+
+void HardwareAccess::note_live_target(HardwareLink& link) {
+  HardwareLink::Impl& impl = *link.impl_;
+  impl.live_target_update = detail::NodeAccess::next_update(impl.node);
+}
+
 void RequireInUpdate(const Node& node, std::string_view what) {
   detail::NodeAccess::require_loop_thread(node, what);
   if (!detail::NodeAccess::in_update(node)) {
@@ -475,6 +525,11 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
         impl.node, sizeof(Packet), alignof(Packet), schema::Of<Packet>());
     impl.node.after_update([&impl] { impl.Flush(); });
     impl.has_outputs = true;
+    impl.withheld_line =
+        std::string{impl.node.name()} +
+        ": held every output neutral: update() set one in a tick in which no "
+        "talos::Target returned a target (RULES.md 1); set outputs only while "
+        "a Target's get() returns one\n";
   }
   if (kind == Kind::kMotor) {
     impl.motor_ids.push_back(id);

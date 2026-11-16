@@ -143,7 +143,7 @@ There are exactly two kinds of input, and they are treated differently.
 
 1. Every actuator call sits inside one `drive` condition that includes
    `robot_enabled(node)`, target freshness, feedback validity and finite
-   demands. **[review; the devices layer also gates motor, digital and PWM outputs]**
+   demands. **[review; the devices layer also gates every output on robot_enabled and a live Target, REQ-SAFE-41]**
 2. Neutral is reached by **not** calling the actuator. Call `stop()` only to
    override a set made earlier in the same tick. **[review]**
 3. Actuator setters apply for one flush. Unset motors default to neutral;

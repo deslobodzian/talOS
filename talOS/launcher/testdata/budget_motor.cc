@@ -13,7 +13,9 @@
 class BudgetMotor {
  public:
   explicit BudgetMotor(talos::Node& node)
-      : motor_{node, node.param<std::string>("device")} {}
+      : motor_{node, node.param<std::string>("device")} {
+    talos::AllowUntargetedOutputs(node);
+  }
 
   void update() {
     tick_ = (tick_ + 1) % 10;

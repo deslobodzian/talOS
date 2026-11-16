@@ -625,6 +625,13 @@ int32_t talos_robot_enabled(TalosNode* node) {
                         [&] { return talos::robot_enabled(AsNode(node)); });
 }
 
+int32_t talos_allow_untargeted_outputs(TalosNode* node) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    talos::AllowUntargetedOutputs(AsNode(node));
+    return TALOS_OK;
+  });
+}
+
 int32_t talos_hardware_sample_time(TalosNode* node, int64_t* out_ns) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out_ns == nullptr) throw std::invalid_argument("null out_ns");

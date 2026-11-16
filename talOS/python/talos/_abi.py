@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 32
+_EXPECTED_ABI_VERSION = 33
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -213,6 +213,7 @@ _SIGNATURES = {
     "talos_state_machine_just_entered": (c_int32, [c_void_p, c_int64]),
     "talos_device": (c_int64, [c_void_p, c_int32, c_char_p]),
     "talos_robot_enabled": (c_int32, [c_void_p]),
+    "talos_allow_untargeted_outputs": (c_int32, [c_void_p]),
     "talos_hardware_sample_time": (c_int32, [c_void_p, _P(c_int64)]),
     "talos_hardware_fresh": (c_int32, [c_void_p, c_int64]),
     "talos_hardware_age": (c_int32, [c_void_p, _P(c_int64)]),

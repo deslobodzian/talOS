@@ -7,16 +7,21 @@
 //   #include "talOS/devices/devices.h"
 //
 //   struct Intake {
-//     explicit Intake(talos::Node& n) : roller{n, "roller"}, beam{n, "beam"} {}
+//     explicit Intake(talos::Node& n)
+//         : target{n}, roller{n, "roller"}, beam{n, "beam"} {}
 //     void update() {
-//       if (!beam.get()) roller.set_voltage(6.0);
+//       const intake::IntakeTarget* t = target.get();  // null: neutral
+//       if (t != nullptr && !beam.get()) roller.set_voltage(t->roller_v());
 //     }
+//     talos::Target<intake::IntakeTarget> target;  // target.h
 //     talos::Motor roller;
 //     talos::DigitalInput beam;
 //   };
 //
 // Handles are named by their device key in this subsystem's config
-// ([motors.roller] is "roller") and are taken in the constructor.
+// ([motors.roller] is "roller") and are taken in the constructor. Outputs
+// drive only in a tick whose update() got a target from a talos::Target:
+// see the flush below.
 //
 // A layer over talos::Node: the first handle attaches this node's
 // HardwareLink (node.extension<HardwareLink>()), which subscribes to /hw/state
@@ -25,9 +30,17 @@
 // layer opens on a request topic) and flushes after every update():
 //   - one command per tick once a hardware state has been accepted, echoing
 //     that state's identity words like hardware::NeutralCommand;
-//   - every owned motor neutral unless set during that update(), and all of
-//     them neutral whenever robot_enabled() is false;
-//   - digital/PWM outputs set during that update() included as set.
+//   - the tick drives only while robot_enabled() is true and a talos::Target
+//     of the node returned a target from a get() (or source()) made during
+//     that update(), or the constructor called AllowUntargetedOutputs; a
+//     get() from the constructor, every(), a callback or an earlier
+//     update() does not count, and any one of the node's Targets will do;
+//   - in a tick that drives, every owned motor not set during that update()
+//     is neutral, and digital/PWM outputs set during it are included as set;
+//   - in a tick that does not drive, every motor is neutral, every digital
+//     output false and every PWM output 0, and the command still goes out;
+//     the first such tick of each enabled spell in which update() set an
+//     output non-neutral prints one line on stderr naming the node.
 // Incoming states pass hardware::AcceptState for this config's id and are
 // latched with their publication time; getters read the latched state (0 before
 // the first one), while connected() requires both a valid sample and a
@@ -101,6 +114,15 @@ class HardwareLink {
 // The first call attaches the link, so make it (or take a handle) in the
 // constructor.
 bool robot_enabled(Node& node);
+
+// Lifts the live-target half of the flush's gate for this node (RULES.md 1):
+// its outputs are then sent as set whenever robot_enabled(node), whether or not
+// a talos::Target returned a target that tick. For a test or bench fixture with
+// no producer by design. --describe and the registry mark its hardware request
+// "untargeted_outputs"; the graph lint warns, naming the node, and refuses the
+// graph under [robot] require_target_coverage. Call in the constructor;
+// afterwards it throws std::logic_error.
+void AllowUntargetedOutputs(Node& node);
 
 // Throws std::logic_error naming `what` unless called on `node`'s loop thread
 // inside its update(), the rule every output setter enforces. For a layer
