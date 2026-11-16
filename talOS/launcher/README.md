@@ -1653,8 +1653,9 @@ RECORDED for a manifest without `launcher_log`; informational, since the
 output logs are not the measured record), an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
-lateness, the bridge's request-to-command delay, every scalar
-`/hw/status` field, and the alerts.
+lateness, the bridge's request-to-command delay in enabled and disabled
+time, the [latency rows](#latency-rows), every scalar `/hw/status` field,
+and the alerts.
 The required "controller link" verdict is whether the bridge ever accepted
 a State from the controller, which a launched session's exit status cannot
 say (the launcher ends a bounded session by stopping every member, and a
@@ -1692,9 +1693,20 @@ succeeded (its record's status is the shared-memory write's), so after a
 failed send, and while a socket is being replaced, the row still counts a
 command the RoboRIO received later or never; the bridge's `send_failures`
 (exit line, below) says whether that happened. With several owners the
-merged observation can be an older request's, overstating it. The row is
-informational: REQ-RT-20's 1 ms bound is verified by the bridge's component
-test. The bridge's `wait_fallbacks` and stalled request topics reach the
+merged observation can be an older request's, overstating it. Each sample
+is counted in enabled or disabled time (`bridge_request_to_command`
+`enabled` and `disabled` in `--json`, each with the bridge's `process`) as
+the bridge decides its send: "enabled" means the State the bridge held, the
+last of the selected `/hw/state` stream, was configured, enabled and not
+faulted (`hardware::GatewayReady`) from the request to the command, and
+"disabled" that it was not ready throughout; a sample across a change, or
+that starts before the first State, meets that stream's log gap or holds a
+State that did not decode, is in neither. Not ready, the gateway cannot
+take a command, and a merge whose only change is its observation (a
+disabled node's requests are neutral) waits for the bridge's heartbeat
+(`command_timeout_us` / 5, clamped to 5 to 20 ms), so only the enabled row
+measures its reaction. The rows are informational: REQ-RT-20's 1 ms bound is verified by
+the bridge's component test. The bridge's `wait_fallbacks` and stalled request topics reach the
 report as its row's `wake_fallbacks` and `stalled_arms` (delivery loss,
 above); its other wake counters (`passes`, `throttled`) and its socket
 counters (`send_failures`, `socket_reopens`) are only in its exit lines on
@@ -1729,6 +1741,9 @@ measured when it meets (closed at both ends) a lost span of a log it reads:
 | `/hw/state` overall and enabled | two consecutive records of the selected stream | that stream's process |
 | enabled or not (enabled rows, and an active lane "while enabled" for target age at tick) | from the Driver Station record whose bit is held (from the log's start before the first) to the interval's end or the lane's time | the Driver Station stream's process: such an interval is neither enabled nor disabled |
 | bridge request to command | from the request before the first one carrying the observation in that node's `/hw/request/<node>` stream, or from the log's start before that stream's first request (where an earlier request carrying it could be missing), to the command | the bridge's, and that of every node that sent a request |
+| state to request | from the State's publication to the owner's first request carrying it | the owner's |
+| Driver Station to lane | from the packet's publication to the producer's next lane publication | the producer's |
+| Driver Station to command | from the packet's publication to the command | the bridge's, and that of every node that selected a lane or sent a request |
 | alert active time | an alert's active span (publication times) | its status stream's process; the span still counts as an activation, but is not timed (`spans_across_gap` in `--json`, NOT MEASURED when no span is left) |
 
 Target receipt age, target age at the tick and timer lateness each read one
@@ -1741,9 +1756,11 @@ rows lack those samples (`records_lost` in `--json`). The `/hw/status`
 counter deltas difference cumulative counts, so a gap leaves them whole but
 for a counter reset inside one, which goes uncounted; the report counts no
 missed ticks or overruns. A row whose intervals all meet a gap is NOT
-MEASURED, never a pass, and its detail (or, for request to command, a line
-under the timing table) names how many intervals were left out; `--json`
-gives the counts in `intervals_across_gaps`. A session without a gap reports
+MEASURED, never a pass, and its detail (or, for request to command and the
+latency rows, a line under their table) names how many intervals were left
+out; `--json` gives the counts in `intervals_across_gaps`
+(`bridge_request_to_command`, `state_to_request`, `driver_station_to_lane`,
+`driver_station_to_command`). A session without a gap reports
 exactly as before, with none of these keys.
 
 Median “about 5 ms” uses an explicitly labeled 4–6 ms analysis tolerance; p99
@@ -1767,8 +1784,8 @@ prompt handlers' latency and the no-polling guarantee did not hold),
 naming the node and the count (`<node>: stalled_arms=1`); a manifest
 without the fields is not judged. It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
 runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
-lateness and bridge request-to-command rows are informational and not
-required. The enabled-only verdicts (enabled state median, p99 and gaps,
+lateness, bridge request-to-command and latency rows are informational and
+not required. The enabled-only verdicts (enabled state median, p99 and gaps,
 target age at tick) cannot be measured in a session that never enabled, and
 the report says so in one line; `--strict` still fails them, so acceptance
 needs an enabled session. In a session whose hardware packets `log_dump`
@@ -1800,6 +1817,58 @@ acceptance threshold. Capped, truncated, unfinished recordings,
 DS silence, missing topics and unknown intervals limit acceptance; retain the
 raw session. Clock offset ranges measure the estimator, not absolute clock
 synchronization accuracy. See `docs/BRINGUP.md` for the bench checks.
+
+#### Latency rows
+
+The Latency section (REQ-RT-25) measures the path from a sample or a Driver
+Station packet to a command, from records a session already logs. Each
+value is the difference of two readings of one clock: the report subtracts
+only main-processor times (a record's `now_ms` or `publish_ms`) from each
+other. A RoboRIO time (`sample_time_us`, `observed_time_us`) is only matched
+or ordered against another of the same `boot_id`, never subtracted from a
+main-processor one, whose mapping to it is uncertain by milliseconds
+([gateway clock accuracy](../../docs/DATA_FLOW.md#gateway-clock-accuracy)).
+Each row is p50 (median), nearest-rank p99
+and max with its count, as the timing rows are, and NOT MEASURED when it has
+no sample (never 0). The rows are informational: `--strict` judges none of
+them, since REQ-RT-26's bound is judged at the bench.
+
+| Row (`--json` key) | What it measures | Records | Clock |
+|---|---|---|---|
+| feedback age (`feedback_age_us`, per `"motor <id>"` and `"sensor <id>"`, µs) | the older of a motor's or CAN sensor's `position_age_us` and `velocity_age_us` in each State (a sample marked invalid is skipped). A sample with an age of 4294967295 (UINT32_MAX, the RoboRIO's value when Phoenix gave no timestamp) is left out of the figures and counted in `sentinel` (and named in the text row). A simulation session's row reads 0 by construction: the simulated backends report age 0, except for a device a fault injection froze | the selected `/hw/state` stream's decoded `hardware` | the RoboRIO's: each age is its own reading of the signal's age at the read |
+| state to request (`state_to_request_ms`, per actuator owner) | a State's publication to the tick of the owner's first request carrying it, joined (`boot_id`, `sample_time_us`) to (`boot_id`, `observed_time_us`) as request to command joins | the State stream's `publish_ms`; each `/hw/request/<node>` SEND's `now_ms` | the main processor's |
+| Driver Station to lane (`driver_station_to_lane_ms`, per producer) | a Driver Station packet's publication to the producer's next lane publication at or after it, a release included. It lists every process that publishes a target lane, whatever its source (`teleop`, `auto`, `align`, ...), so a producer whose lanes do not derive from the packet is listed too | `/hw/state/driver_station`'s `publish_ms` (a reader's copy carries the bridge's); each target-lane SEND's `publish_ms` | the main processor's |
+| bridge request to command (`bridge_request_to_command` `enabled`, `disabled`) | above | above | the main processor's |
+| Driver Station to command (`driver_station_to_command_ms`) | for each packet showing the robot enabled in teleop (the packet's `mode`; autonomous and test give no sample), its publication to the first command built from it: the earliest tick in which a `Target` selected a lane published at or after this packet and before the next one (its READ) and its node sent a request (the same dispatch of the same run: a restarted node counts its dispatches from 0 again, so a process's records start a new run after its EXIT or where its dispatch index falls), then the bridge's first command at or after that tick, of the same boot, whose observation is no older than the request's; the robot still enabled at the command. A merged command carries its oldest owner's observation, so with two actuator owners the row waits for the other owner's next request and overstates by up to that owner's period; a one-owner config gives an exact figure | the packet's `publish_ms`; READ and request records; `/hw/command` SENDs' `now_ms` | the main processor's |
+| clock drift (`clock_drift_ppm`) | the least-squares slope of the valid `clock_offset_us` (`clock_offset_valid` true) against `/hw/status` publication time, fitted within each estimator (one `clock_boot_id` and `clock_resets_count`, split at the status log's gaps) and pooled; null without two such samples | `/hw/status` records | both readings map the gateway's clock to the main processor's at one instant: their slope is the oscillators' relative drift |
+
+State to request ends at the tick's start, where request to command begins,
+and Driver Station to lane ends at the lane's publication, where target age
+at the tick begins, so the rows add up along each path. The spread of state
+to request over a session shows whether the node's timer phase against the
+RoboRIO tick swept the whole period; a session shorter than one sweep (one
+period divided by the drift) shows only its own band. Driver Station to
+lane is mostly the producer's timer phase against the RoboRIO's 20 ms
+Driver Station forward: `teleop` does not wake on a packet, it drains the
+Driver Station topic before its own timer and sends then. Driver Station to
+command follows only an operator path through a target lane into an
+actuator owner's request; while the lane is released (sticks neutral, or
+before `OperatorArming` arms after an enable) `Target` selects nothing and
+logs no READ, so those packets give no sample.
+
+A disabled bench exercises part of the path: the CAN read and feedback
+ages, the RoboRIO's read and State send, the bridge's receive and publish,
+each owner's timer, `update()` and flush (its requests are neutral but carry
+the observation, so state to request is exact), the bridge's request read
+and merge, and the Driver Station chain to the producer's lane (releases,
+which `teleop` publishes on its timer as it does a target, so Driver
+Station to lane reads as it would enabled). It does not exercise the bridge's
+change-driven send (disabled, it waits for the heartbeat, so the disabled
+request-to-command row is no reaction time), the RoboRIO's acceptance and
+apply, or `Target` selection: bridge request to command enabled and Driver
+Station to command need an enabled session. With two actuator owners a
+merged command carries the older owner's observation, so a per-owner figure
+on the RoboRIO side needs a one-owner config.
 
 ## If you change the shape of `graph.json`
 
