@@ -114,7 +114,7 @@ Beside the stack:
 | `talOS/protocol` | frame and UDP wire format |
 | `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power and each CAN bus's health (assembled by `:can_buses`, which `testing::SimHardware` also runs), gateway counters and build, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `:merge` holds the request merge rules (owner timeout, merged observation) that `testing::SimHardware` also runs; `--log` records every command, State and status it publishes, with the sequence and stamp its readers see |
 | `talOS/driver_station` | Driver Station codec |
-| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph; `:log_dump` prints its `.tlog`s and `:tlog_to_wpilog` converts them to `.wpilog` |
+| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph; `:log_dump` prints its `.tlog`s |
 | `talOS/simulation` | `:sim_gateway`, the lightweight simulator that stands in for the RoboRIO for any robot config: devices from the config's hardware, ideal or `--physics` backend, scripted mode, joystick and fault schedules, `/sim/state` truth; the launcher starts it under `--start-sim-gateway` on the bridge's ports |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
 | `talOS/process` | stop handlers and the stop pipe a node's loop and the launcher's start-up watch, `ConfigureRealtime` for node binaries and `ConfigureBackgroundThread` for their helper threads; `DurableSync`, the power-loss-safe sync of the launcher's session files and event logs |
@@ -359,10 +359,8 @@ handlers.
   cleanup, the registry and Studio all use the same mapping.
 - Dispatch logs (`.tlog` format version 8; a build also reads version 7)
   carry each logged topic's schema
-  descriptor, allowing `log_dump` to decode payloads to named fields without
-  the recording build, and `tlog_to_wpilog` to convert a session to a WPILib
-  `.wpilog` that AdvantageScope opens (one entry per message field;
-  [talOS/launcher/README.md](talOS/launcher/README.md#converting-a-session-to-wpilog)).
+  descriptor, allowing `log_dump` and Studio's review to decode payloads to
+  named fields without the recording build.
 - Every user topic's slot is 8-byte aligned, matching FlatBuffers struct rules.
 - The FlatBuffers namespace is the short subsystem name (`shooter`, `intake`,
   `drivetrain`); C++ includes `<package>/<file>_generated.h`, Python imports

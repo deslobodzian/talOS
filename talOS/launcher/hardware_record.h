@@ -5,9 +5,7 @@
 // talos.hardware.Packet with no FlatBuffers schema, so the descriptor decoder
 // (talOS/schema/decode.h) can show only their bytes. This decodes them with
 // the wire codecs themselves (hardware::Decode, driver_station::Decode) into
-// one JSON object: what log_dump prints for those records. tlog_to_wpilog
-// takes the decoded structs (DecodeHardwareRecord) and writes them as
-// entries.
+// one JSON object: what log_dump prints for those records.
 //
 //   /hw/state                 {"type":"state","config_id":"...","enabled":true,
 //                              "motors":[{"id":1,"name":"flywheel",...}],...,

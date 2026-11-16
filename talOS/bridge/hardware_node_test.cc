@@ -414,8 +414,8 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
 // Guards: hardware_node --log records the merged /hw/command, the decoded
 // /hw/state and every /hw/status it publishes, each status SEND with the
 // transport sequence and publication stamp a live reader received for it
-// (what tlog_to_wpilog and input replay match a reader's copy to the
-// bridge's SEND by), its payload the status with the bridge's protocol.
+// (what input replay matches a reader's copy to the bridge's SEND by),
+// its payload the status with the bridge's protocol.
 // REQ-OPS-21
 TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   const std::string base = ::testing::TempDir() + "bridge";

@@ -133,7 +133,7 @@ cc_test(
 )
 
 # The log files a log tool's inputs name, each once (log_dump,
-# tlog_to_wpilog).
+# Studio's review).
 cc_library(
     name = "log_inputs",
     srcs = ["log_inputs.cc"],
@@ -143,7 +143,7 @@ cc_library(
 )
 
 # One session's event logs streamed in time order, a fixed window per log,
-# for log_dump and tlog_to_wpilog.
+# for log_dump and Studio's review.
 cc_library(
     name = "log_merge",
     srcs = ["log_merge.cc"],
@@ -235,7 +235,7 @@ cc_binary(
 )
 
 # The hardware packet topics decoded with their wire codecs, for log_dump
-# and tlog_to_wpilog.
+# and Studio's review.
 cc_library(
     name = "hardware_record",
     srcs = ["hardware_record.cc"],
@@ -388,93 +388,16 @@ cc_binary(
     ],
 )
 
-# A self-contained WPILib DataLog (.wpilog) writer: no WPILib dependency.
-cc_library(
-    name = "wpilog",
-    srcs = ["wpilog.cc"],
-    hdrs = ["wpilog.h"],
-)
-
-cc_test(
-    name = "wpilog_test",
-    size = "small",
-    srcs = ["wpilog_test.cc"],
-    deps = [
-        ":wpilog",
-        "@googletest//:gtest_main",
-    ],
-)
-
-# .tlog dispatch logs (or a session directory) as one .wpilog for
-# AdvantageScope; README.md, "Converting a session to WPILOG".
-cc_binary(
-    name = "tlog_to_wpilog",
-    srcs = ["tlog_to_wpilog.cc"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":hardware_record",
-        ":log_inputs",
-        ":log_merge",
-        ":wpilog",
-        "//talOS/driver_station",
-        "//talOS/events:events_core",
-        "//talOS/events:events_log",
-        "//talOS/hardware",
-        "//talOS/schema:identity",
-        "//talOS/schema:unit_suffix",
-        "@flatbuffers//:runtime_cc",
-    ],
-)
-
-# Peak resident memory of log_dump and tlog_to_wpilog on a generated 200 MB
+# Peak resident memory of log_dump on a generated 200 MB
 # session; run by hand (README.md, "Filtering and exporting logs").
 cc_binary(
     name = "log_memory_bench",
     srcs = ["log_memory_bench.cc"],
-    args = [
-        "$(rlocationpath :log_dump)",
-        "$(rlocationpath :tlog_to_wpilog)",
-    ],
-    data = [
-        ":log_dump",
-        ":tlog_to_wpilog",
-    ],
+    args = ["$(rlocationpath :log_dump)"],
+    data = [":log_dump"],
     deps = [
         "//talOS/events:events_core",
         "//talOS/events:events_log",
-        "@rules_cc//cc/runfiles",
-    ],
-)
-
-# Every scalar base type, fixed arrays, an enum and a nested geometry.Pose2d.
-talos_messages(
-    name = "wpilog_message",
-    srcs = ["testdata/wpilog_message.fbs"],
-    include_prefix = "wpilog_test",
-    visibility = ["//visibility:private"],
-    deps = ["//talOS/msgs:geometry"],
-)
-
-cc_test(
-    name = "tlog_to_wpilog_test",
-    size = "small",
-    srcs = ["tlog_to_wpilog_test.cc"],
-    data = [":tlog_to_wpilog"],
-    env = {"TALOS_TLOG_TO_WPILOG": "$(rlocationpath :tlog_to_wpilog)"},
-    deps = [
-        ":wpilog_message",
-        "//talOS/configuration",
-        "//talOS/driver_station",
-        "//talOS/events:events_core",
-        "//talOS/events:events_log",
-        "//talOS/events:gap_testing",
-        "//talOS/hardware",
-        "//talOS/hardware:config",
-        "//talOS/msgs:geometry",
-        "//talOS/protocol",
-        "//talOS/schema:identity",
-        "@flatbuffers//:runtime_cc",
-        "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
 )

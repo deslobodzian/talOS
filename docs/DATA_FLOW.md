@@ -122,7 +122,7 @@ bytes, and every reader of recorded hardware packets decodes them only under
 the version the session recorded (REQ-OPS-51): the bridge's own, on every
 `/hw/status` (`protocol_version_id`), else the launcher's in its manifest:
 `log_dump`,
-`tlog_to_wpilog` and `session_report`, `studio_review`, retention's match
+`session_report`, `studio_review`, retention's match
 classification and `--replay-inputs`
 ([which logs a build can read](../talOS/launcher/README.md#which-logs-a-build-can-read)).
 So a bump makes earlier sessions' hardware packets unreadable to this build's
@@ -428,8 +428,8 @@ rotation syncs durably and takes a buffer chunk, so faster rotation could
 exhaust the writer's pool and drop records (a gap). The newest
 is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
-`log_dump`, `tlog_to_wpilog` and `--replay-inputs` read every segment in a
-session directory, and `log_dump` or `tlog_to_wpilog` given one log's file
+`log_dump` and `--replay-inputs` read every segment in a
+session directory, and `log_dump` given one log's file
 reads that log's kept segments with it;
 exact `--replay` needs the first segment, since a later one starts
 mid-session. Rotation syncs each finished segment and the next one's header
