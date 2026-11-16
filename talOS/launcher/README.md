@@ -1946,11 +1946,11 @@ language can check the other. `studio/tests/launcher_graph.json` and
     bazel run @talos//talOS/launcher:launcher -- --describe-only \
       --config $PWD/main_processor/configuration/robot.toml
 
-in the 2026 robot's repository (talOS overridden to this checkout), with
-`session_id` pinned, and `//studio:declared_test` parses both. The talOS
-types' schema hashes and sizes are refreshed from this repository's own
-`--describe-only` graph (the bench's), so only the robot-defined types keep
-the 2026 robot's values (the header comment of `studio/tests/declared.test.ts`). So a
+in the 2026 robot's repository, with `session_id` and `config_path` pinned,
+and `//studio:declared_test` parses both. A talOS type's schema hash and size
+can be refreshed from this repository's own `--describe-only` graph (the
+bench's); the robot-defined types come only from a run there (the header
+comment of `studio/tests/declared.test.ts`). So a
 change to the envelope here fails there rather than reaching a viewer as a
 silently empty panel. Regenerate the fixtures and fix the parser in the same
 commit; the faults fixture is the same robot with `drivetrain` publishing the
