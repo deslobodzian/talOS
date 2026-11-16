@@ -404,11 +404,14 @@ track "$LAUNCHER_PID" "launcher"
 GRAPH="$SESSION_DIR/graph.json"
 for _ in $(seq 1 60); do
   [ -f "$GRAPH" ] && break
+  # A launcher that already exited (a refused graph, or another session in
+  # this shared-memory namespace) said why in its log: show it now.
+  kill -0 "$LAUNCHER_PID" 2>/dev/null || break
   sleep 0.5
 done
 if [ ! -f "$GRAPH" ]; then
   tail -25 "$LOG_DIR/launcher.log" >&2
-  die "the launcher never wrote $GRAPH; the declared graph probably has errors"
+  die "the launcher never wrote $GRAPH (its reason above)"
 fi
 say "  declared graph: $GRAPH"
 
