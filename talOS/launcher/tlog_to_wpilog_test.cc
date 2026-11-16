@@ -711,6 +711,7 @@ TEST_F(TlogToWpilogTest, CutLogConvertsItsIntactRecords) {
 std::vector<std::pair<bool, std::uint64_t>> Booleans(
     const std::vector<Value>& values) {
   std::vector<std::pair<bool, std::uint64_t>> out;
+  out.reserve(values.size());
   for (const Value& value : values) {
     out.emplace_back(value.payload == Bytes{1}, value.time_us);
   }

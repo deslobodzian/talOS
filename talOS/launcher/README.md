@@ -1309,8 +1309,8 @@ offsets>` on stderr, which `session_report` reads.
 
 A log gap, the records an event-log writer dropped and capture resumed after
 (a GAP record; [log format](../events/README.md#log-format)), is a record of
-its process with no topic (`source_id` 65535, topic `?`, as an EXIT record
-shows it), merged at its start (`event_ms`, the earliest time a dropped
+its process with no topic (`source_id` 65535 and topic `?` in the exports,
+`-` in the text dump; its `publish_ms` means nothing), merged at its start (`event_ms`, the earliest time a dropped
 record names) and ending at `now_ms`, when capture resumed (for a gap the
 writer's stop closed, the stop). It concerns every topic of its log, so no
 `--topic` pattern hides it; `--node` selects it by its process, and the time
