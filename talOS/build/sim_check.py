@@ -121,9 +121,21 @@ def udp_ports():
         return gateway.getsockname()[1], bridge.getsockname()[1]
 
 
+def running_in_session(stat, sid):
+    """Whether `stat`, the bytes of one /proc/<pid>/stat, is a process of
+    session `sid` that has not exited. A zombie (`Z`) has exited, and so
+    has a process its reaper has taken but the kernel has not yet removed
+    (`X`, EXIT_DEAD), which a reader can see in the instant between."""
+    # pid (comm) state ppid pgrp session ...; comm may hold spaces and ")".
+    fields = stat[stat.rindex(b")") + 2:].split()
+    return fields[0] not in (b"Z", b"X") and int(fields[3]) == sid
+
+
 def session_processes(sid):
-    """The pids of session `sid`'s processes that have not exited (a zombie
-    has: it runs nothing)."""
+    """The pids of session `sid`'s processes that have not exited (one that
+    is a zombie, or is being reaped, has: it runs nothing; see
+    running_in_session). macOS's ps(1) prints no state for a process being
+    reaped but `Z`."""
     found = set()
     if os.path.isdir("/proc/self"):
         for entry in os.listdir("/proc"):
@@ -134,9 +146,7 @@ def session_processes(sid):
                     stat = f.read()
             except OSError:
                 continue
-            # pid (comm) state ppid pgrp session ...; comm may hold spaces.
-            fields = stat[stat.rindex(b")") + 2:].split()
-            if fields[0] != b"Z" and int(fields[3]) == sid:
+            if running_in_session(stat, sid):
                 found.add(int(entry))
         return found
     listing = subprocess.run(["ps", "-A", "-o", "pid=,stat="],
