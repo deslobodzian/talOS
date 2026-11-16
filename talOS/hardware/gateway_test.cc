@@ -1796,28 +1796,37 @@ TEST(Gateway, ReconfigurationRequiresDisabledOperation) {
   EXPECT_TRUE(g.Reconfigure(changed));
   EXPECT_EQ(backend.configure_calls, configures + 1);
 }
-// REQ-SAFE-23: repeated global apply failures latch a fault that re-enable
-// clears
+// REQ-SAFE-23: only consecutive global apply failures latch a fault (a
+// successful apply restarts the count), and re-enable clears it
 TEST(Gateway, ApplyFailureRetriesThenLatchesAndReenableClears) {
+  constexpr uint32_t kLimit = Gateway::kConsecutiveApplyFailureLimit;
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
   g.Tick(1000, true);
+  uint32_t sequence = 0;
+  // One short of the limit, a success, then one short again: never latched.
+  for (int run = 0; run < 2; ++run) {
+    backend.apply_ok = false;
+    for (uint32_t i = 0; i + 1 < kLimit; ++i) {
+      EXPECT_FALSE(g.Accept(Request(g), ++sequence, 1000));
+    }
+    EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+    backend.apply_ok = true;
+    EXPECT_TRUE(g.Accept(Request(g), ++sequence, 1000));
+  }
+  // The limit reached consecutively latches.
   backend.apply_ok = false;
-  EXPECT_FALSE(g.Accept(Request(g), 1, 1000));
-  EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
-  backend.apply_ok = true;
-  EXPECT_TRUE(g.Accept(Request(g), 2, 1000));
-  backend.apply_ok = false;
-  for (uint32_t i = 0; i < Gateway::kConsecutiveApplyFailureLimit; ++i) {
-    EXPECT_FALSE(g.Accept(Request(g), i + 3, 1000));
+  for (uint32_t i = 0; i < kLimit; ++i) {
+    EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+    EXPECT_FALSE(g.Accept(Request(g), ++sequence, 1000));
   }
   EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
-  EXPECT_EQ(g.snapshot().counters.apply_failure_count, 4u);
+  EXPECT_EQ(g.snapshot().counters.apply_failure_count, 3 * kLimit - 2);
   backend.apply_ok = true;
-  EXPECT_FALSE(g.Accept(Request(g), 7, 1000));
+  EXPECT_FALSE(g.Accept(Request(g), ++sequence, 1000));
   g.Tick(2000, false);
   g.Tick(3000, true);
-  EXPECT_TRUE(g.Accept(Request(g), 8, 3000));
+  EXPECT_TRUE(g.Accept(Request(g), ++sequence, 3000));
 }
 // REQ-SAFE-18: a backend stop (a global apply failure) advances the epoch, so
 // a command built before it never actuates once the backend applies again;
