@@ -913,9 +913,10 @@ naming the log and the sign, and the launcher exits 1: one with a
 `log_gap` or `recorder_failed` ([session manifest](#session-manifest)), and
 one whose damaged
 records nothing bounds the time of. The node's own first run's log is
-refused the same way, whatever it feeds, when the node had a timer and the
-byte cap deleted that log's first segment, which held the firing its
-recorded timeline starts from. A damaged stretch in another reader's
+refused the same way, whatever it feeds, when the node had a timer and
+that log's first segment, or a segment before its first firing read, is
+gone or unreadable (the byte cap deleted it, or its header is incomplete):
+it may have held the firing its recorded timeline starts from. A damaged stretch in another reader's
 log of a topic is no loss only where an intact receipt of the topic follows
 it in that file and the session's other logs (the writer's sends) hold
 every message that reader could have lost there

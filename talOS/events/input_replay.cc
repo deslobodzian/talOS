@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -28,36 +30,57 @@ std::string Shape(const schema::Identity& schema, std::uint32_t bytes) {
   return schema::Describe(schema) + ", " + std::to_string(bytes) + " bytes";
 }
 
-// The log a file of it belongs to: `<stem>.tlog` for a segment the byte cap
-// rotated out (`<stem>.segment<k>.tlog`, log::LogSegmentPath), else the file.
-std::string LogOfFile(const std::string& file) {
+// The log a file of it belongs to, and the file's place in it: `<stem>.tlog`
+// and k for a segment the byte cap rotated out (`<stem>.segment<k>.tlog`,
+// log::LogSegmentPath), else the file and a place after every segment.
+std::pair<std::string, std::uint64_t> LogAndPlace(const std::string& file) {
+  constexpr std::uint64_t kLast = std::numeric_limits<std::uint64_t>::max();
   constexpr std::string_view kExtension = ".tlog";
   constexpr std::string_view kSegment = ".segment";
   std::string_view stem = file;
-  if (!stem.ends_with(kExtension)) return file;
+  if (!stem.ends_with(kExtension)) return {file, kLast};
   stem.remove_suffix(kExtension.size());
   std::size_t digits = 0;
   while (digits < stem.size() && std::isdigit(static_cast<unsigned char>(
                                      stem[stem.size() - 1 - digits])) != 0) {
     ++digits;
   }
-  if (digits == 0) return file;
+  if (digits == 0) return {file, kLast};
+  std::uint64_t k = 0;
+  const char* const end = stem.data() + stem.size();
+  if (const auto [at, error] = std::from_chars(end - digits, end, k);
+      error != std::errc{} || at != end) {
+    return {file, kLast};
+  }
   stem.remove_suffix(digits);
-  if (!stem.ends_with(kSegment)) return file;
+  if (!stem.ends_with(kSegment)) return {file, kLast};
   stem.remove_suffix(kSegment.size());
-  return std::string{stem} + std::string{kExtension};
+  return {std::string{stem} + std::string{kExtension}, k};
+}
+
+// The log a file of it belongs to (LogAndPlace).
+std::string LogOfFile(const std::string& file) {
+  return LogAndPlace(file).first;
 }
 
 // The files RecordedSession reads for `path`: every *.tlog of a directory
 // (log::FindLogFiles), or every kept file of the log a file belongs to
 // (log::LogSegmentFiles, oldest segment first): a log the byte cap rotated
 // is all of them, whichever is named, as a directory reads it. A file of no
-// such log (missing, say) is read alone, so its reader names it.
+// such log (missing, say) is read alone, so its reader names it. Each log's
+// files are read together, oldest segment first (FindLogFiles' order by name
+// puts segment10 before segment2), so what one segment carries to the next
+// is read before it.
 std::vector<std::string> SessionFiles(const std::string& path) {
   std::error_code ec;
-  if (std::filesystem::is_directory(path, ec)) return log::FindLogFiles(path);
-  // LogSegmentFiles names a segment by its directory, "." for a bare name.
-  std::filesystem::path file{path};
+  if (std::filesystem::is_directory(path, ec)) {
+    std::vector<std::string> files = log::FindLogFiles(path);
+    std::ranges::stable_sort(files, {}, LogAndPlace);
+    return files;
+  }
+  // LogSegmentFiles names a segment by its directory, "." for a bare name,
+  // joined with one separator.
+  std::filesystem::path file = std::filesystem::path{path}.lexically_normal();
   if (!file.has_parent_path()) file = std::filesystem::path{"."} / file;
   std::vector<std::string> files =
       log::LogSegmentFiles(LogOfFile(file.string()));
@@ -138,9 +161,18 @@ RecordedSession::RecordedSession(const std::string& path,
   std::vector<bool> watched_by_replayed;
   // The replayed program's first recorded run: its log's origin and run start.
   std::optional<std::pair<MonotonicTime, MonotonicTime>> replayed_run;
-  // The file of that run's log it was read from, and whether that log's
-  // manifest arms a timer (the run start is then read from a firing).
+  // The log of that run; the first file of it read; the file the run start
+  // was read from (that first file until a firing gives it); whether a
+  // firing gave it; the first file of the log read that did not continue
+  // the segment before it while none had (log::LogSegmentFiles' next one,
+  // read, of the same origin), after which a firing proves nothing; and
+  // whether that log's manifest arms a timer (the run start is then read
+  // from a firing).
+  std::string replayed_run_log;
+  std::string replayed_run_first_read;
   std::string replayed_run_file;
+  bool replayed_run_fired = false;
+  std::string replayed_run_broken;
   bool replayed_run_timed = false;
   // The latest time any of its logs recorded: its last run's exit.
   std::optional<MonotonicTime> replayed_end;
@@ -176,14 +208,19 @@ RecordedSession::RecordedSession(const std::string& path,
   std::vector<ReadLog> logs;
   // Each file read, by path: its origin, then the now_ns of its last intact
   // record and by source id its watchers' last intact receipts' publication
-  // times and sequences. A segment of the same log (LogSegmentFiles: the
-  // next one, with its origin and manifest) starts from them, so damage
-  // right after its header is bounded as it would be in one file.
+  // times and sequences, and the earliest loss of its timeline and its
+  // timers' offsets (gap_start and timer_offset, below). A segment of the
+  // same log (LogSegmentFiles: the next one, with its origin and manifest)
+  // starts from them, so damage right after its header is bounded, and a
+  // run start read from its first firing is bounded and offset, as it would
+  // be in one file.
   struct Carried {
     MonotonicTime origin;
     std::optional<std::int64_t> last_now;
     std::vector<std::optional<std::int64_t>> last_receipt;
     std::vector<std::optional<std::uint64_t>> last_sequence;
+    std::optional<MonotonicTime> gap_start;
+    std::vector<std::optional<std::int64_t>> timer_offset;
   };
   std::map<std::string, Carried> carried;
   bool first = true;
@@ -241,6 +278,11 @@ RecordedSession::RecordedSession(const std::string& path,
         reader.manifest().size());
     std::vector<std::optional<std::uint64_t>> last_sequence(
         reader.manifest().size());
+    // The segment before this one of the same log, when it was read, and
+    // whether this one is the next segment after it (a numbered segment
+    // whose number is one more; the log's own file, after its last).
+    const Carried* continued = nullptr;
+    bool next_segment = false;
     {
       const std::vector<std::string> segments =
           log::LogSegmentFiles(LogOfFile(log_path));
@@ -250,9 +292,14 @@ RecordedSession::RecordedSession(const std::string& path,
         if (previous != carried.end() &&
             previous->second.origin == reader.start_time() &&
             previous->second.last_receipt.size() == last_receipt.size()) {
-          last_now = previous->second.last_now;
-          last_receipt = previous->second.last_receipt;
-          last_sequence = previous->second.last_sequence;
+          continued = &previous->second;
+          const std::uint64_t place = LogAndPlace(log_path).second;
+          next_segment = place == std::numeric_limits<std::uint64_t>::max() ||
+                         place == LogAndPlace(*std::prev(at)).second + 1;
+          last_now = continued->last_now;
+          last_receipt = continued->last_receipt;
+          last_sequence = continued->last_sequence;
+          gap_start = continued->gap_start;
         }
       }
     }
@@ -309,6 +356,9 @@ RecordedSession::RecordedSession(const std::string& path,
       }
       recorded.emplace_back(it->second, own_log && !writer);
     }
+    // Every segment repeats the log's manifest: a timer the segment before
+    // re-armed or disarmed is as that one left it.
+    if (continued != nullptr) timer_offset = continued->timer_offset;
 
     log::LogReader::Record record;
     while (reader.next(record)) {
@@ -479,19 +529,43 @@ RecordedSession::RecordedSession(const std::string& path,
                           "hold every message the stretch could have lost\n"
                         : "; its intact records replay\n");
     }
-    carried[log_path] = {reader.start_time(), last_now, last_receipt,
-                         last_sequence};
+    carried[log_path] = Carried{.origin = reader.start_time(),
+                                .last_now = last_now,
+                                .last_receipt = last_receipt,
+                                .last_sequence = last_sequence,
+                                .gap_start = gap_start,
+                                .timer_offset = timer_offset};
     read.gap = gap;
     read.topics = std::move(recorded);
     logs.push_back(std::move(read));
     // Its first run: the earliest origin among its logs (restarts included).
+    // Its run start is read from the first firing in any file of that run's
+    // log: a later segment's, when the ones before it (read before it, with
+    // the same origin) held none, as when the byte cap rotated the log
+    // before the first deadline, but only while each file read continued
+    // the one before it: a segment missing or unread between them may have
+    // held the first firing. With no firing in any, it is the origin.
     if (own_log &&
         (!replayed_run || reader.start_time() < replayed_run->first)) {
       replayed_run.emplace(reader.start_time(),
                            std::max(reader.start_time(),
                                     run_start.value_or(reader.start_time())));
+      replayed_run_log = LogOfFile(log_path);
+      replayed_run_first_read = log_path;
       replayed_run_file = log_path;
+      replayed_run_fired = run_start.has_value();
+      replayed_run_broken.clear();
       replayed_run_timed = timed;
+    } else if (own_log && !replayed_run_fired &&
+               reader.start_time() == replayed_run->first &&
+               LogOfFile(log_path) == replayed_run_log) {
+      if (continued == nullptr || !next_segment) {
+        if (replayed_run_broken.empty()) replayed_run_broken = log_path;
+      } else if (run_start && replayed_run_broken.empty()) {
+        replayed_run->second = std::max(reader.start_time(), *run_start);
+        replayed_run_file = log_path;
+        replayed_run_fired = true;
+      }
     }
   }
   if (first) throw std::runtime_error("no readable .tlog files in " + path);
@@ -606,23 +680,33 @@ RecordedSession::RecordedSession(const std::string& path,
     }
   }
   // The replayed program's run start is its first timer firing less that
-  // timer's offset, which only its first run's log's first segment is sure
-  // to hold. Once the byte cap deleted that segment (a rotated log whose
-  // oldest kept file is not LogSegmentPath(log, 0)), the oldest kept
-  // segment's first firing may be whole periods after the run's, and every
-  // timer would replay that late: the log is refused, as a fed topic's
-  // capped log is, whether or not a topic is fed from it. With no armed
-  // timer the run start is the log's origin, which every segment holds.
+  // timer's offset, which only its first run's log read from its first
+  // segment on is sure to hold. Once that segment was not read (the byte cap
+  // deleted it, or its header is incomplete: the first file read is neither
+  // LogSegmentPath(log, 0) nor the log of a run never rotated), the first
+  // firing read may be whole periods after the run's, and every timer would
+  // replay that late: the log is refused, as a fed topic's capped log is,
+  // whether or not a topic is fed from it. So is a log in which a file read
+  // before any firing did not continue the one before it (a segment between
+  // them missing or unread). With no armed timer the run start is the log's
+  // origin, which every segment holds.
   if (replayed_run_timed) {
-    const std::string log = LogOfFile(replayed_run_file);
+    const std::string& log = replayed_run_log;
     const std::vector<std::string> files = log::LogSegmentFiles(log);
     const std::string head = log::LogSegmentPath(log, 0);
-    if (!files.empty() && files.front() != log && files.front() != head) {
+    const bool from_head =
+        LogAndPlace(replayed_run_first_read).second == 0 ||
+        (files.size() == 1 && files.front() == replayed_run_first_read);
+    if (!from_head) {
       const std::string marker = log::CappedMarkerPath(log);
       const auto marks =
           marked.find(std::filesystem::path{log}.filename().string());
       std::string sign;
-      if (std::filesystem::exists(marker)) {
+      if (std::filesystem::exists(head)) {
+        sign =
+            "its first segment could not be read (its header is "
+            "incomplete): ";
+      } else if (std::filesystem::exists(marker)) {
         sign = marker + " exists: the byte cap deleted its first segment ";
       } else if (marks != marked.end() && marks->second.log_capped) {
         sign =
@@ -631,11 +715,19 @@ RecordedSession::RecordedSession(const std::string& path,
       } else {
         sign = "its first segment is gone: ";
       }
-      run_start_refused_log_ = replayed_run_file;
+      run_start_refused_log_ = replayed_run_first_read;
       run_start_refused_reason_ =
           sign + head +
-          ", which held the first timer firing the run start is read from, "
-          "and a later segment's first firing may be whole periods after it";
+          ", which may have held the first timer firing the run start is "
+          "read from, and a later segment's first firing may be whole periods "
+          "after it";
+    } else if (!replayed_run_fired && !replayed_run_broken.empty()) {
+      run_start_refused_log_ = replayed_run_broken;
+      run_start_refused_reason_ =
+          "it does not continue the segment of " + log +
+          " read before it (a segment between them is missing or could not "
+          "be read), which may have held the first timer firing the run "
+          "start is read from, and none was read before it";
     }
   }
   for (const RecordedMessage& message : messages_) {

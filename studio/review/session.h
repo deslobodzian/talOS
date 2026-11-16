@@ -29,8 +29,9 @@
 // restarts: the writer's, whose accepted SEND records
 // (event::log::IsAcceptedSend) hold every message it published, else the
 // MESSAGE records of the reader whose log path sorts first among those that
-// logged one (event::RecordedSession orders logs by path too, but takes the
-// first whose manifest registers the topic, values or not). A value is
+// logged one (event::RecordedSession orders logs by path too (a log's
+// segments by number), but takes the first whose manifest registers the
+// topic, values or not). A value is
 // decoded as log_dump decodes it:
 // a talos_messages struct (and a target envelope's header and message) by
 // its recorded schema, named by talOS/telemetry:channels as live telemetry
