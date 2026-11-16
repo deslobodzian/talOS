@@ -1,0 +1,7 @@
+# //bench/main_processor:bundle_test's C++ node that links a shared library
+# (../linked_library.cc). No devices.
+[subsystem]
+name = "linked_library"
+node = "//bench/main_processor/bundle_testdata:linked_library"
+critical = false
+period_us = 10000

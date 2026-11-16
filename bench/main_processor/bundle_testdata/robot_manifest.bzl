@@ -7,6 +7,7 @@ Regenerate after changing the config:
 
 # Every node label robot.toml launches.
 NODES = [
+    "//bench/main_processor/bundle_testdata:linked_library",
     "//bench/main_processor/bundle_testdata:native_wheel",
     "//bench/main_processor/gyro:node",
     "//bench/main_processor/motor:node",
@@ -17,6 +18,7 @@ NODES = [
 
 # Every file robot.toml reads besides itself.
 CONFIG_FILES = [
+    "//bench/main_processor/bundle_testdata:mechanisms/linked_library.toml",
     "//bench/main_processor/bundle_testdata:mechanisms/motor.toml",
     "//bench/main_processor/bundle_testdata:mechanisms/native_wheel.toml",
     "//bench/main_processor/configuration:robot.toml",
