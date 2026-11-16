@@ -1938,14 +1938,16 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   EXPECT_EQ(graph[0].name, "alpha");
   EXPECT_EQ(graph[0].sources.at(0).schema, "launcher_test.Message48");
 
-  // An observer is not a consumer: alpha's state still has nobody reading it.
+  // The lint judged the second description: gamma's observer records
+  // alpha's state, so it is read and draws no "nothing subscribes" warning,
+  // which the first description (no sources) would.
   const bool unread =
       std::any_of(diagnostics.begin(), diagnostics.end(),
                   [](const introspect::naming::Diagnostic& d) {
                     return d.subject == "/alpha/state" &&
                            d.severity == introspect::naming::Severity::WARNING;
                   });
-  EXPECT_TRUE(unread);
+  EXPECT_FALSE(unread);
 
   std::filesystem::remove_all(record);
   std::filesystem::remove_all(options.output_dir);
