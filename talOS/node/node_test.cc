@@ -42,6 +42,7 @@
 #include "talOS/events/simulated_event_loop.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/introspection/reporter.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/node/internal.h"
 #include "talOS/node/testing.h"
@@ -1644,8 +1645,11 @@ TEST(Binary, ReplayOfALogWithAGapStopsThereAndExits1) {
 }  // namespace
 
 namespace detail {
-// node.cc: tests only, applied to the options of the log a run writes.
+// node.cc: tests only, applied to the options of the log a run writes and
+// of a live run's Reporter.
 extern std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+extern std::function<void(introspect::Reporter::Options&)>
+    reporter_options_for_test;
 }  // namespace detail
 
 namespace {
@@ -1655,7 +1659,6 @@ namespace {
 // let it go (`release_when`): never before the gap opened, and only where
 // nothing after it can open a second one.
 struct HeldLog {
-  std::atomic<std::uint32_t> gap{0};
   std::atomic<bool> released{false};
   std::function<bool(const Node&)> release_when;
 };
@@ -1680,11 +1683,91 @@ class GapProbe {
   Publisher<Count> out_;
 };
 
+// Runs a GapProbe as the binary `test_node` would, in this process, with
+// `args` (quoted as a shell would, by '...'), its log writer held by `held`.
+// Returns its exit status and what it printed.
+Result RunHeldInProcess(const std::string& args, HeldLog& held) {
+  held.released.store(false);
+  held_log = &held;
+  detail::log_options_for_test = [&held](event::log::LogWriterOptions& o) {
+    o.chunk_bytes = 1024;
+    o.chunk_count = 2;
+    o.before_write = [&held] { held.released.wait(false); };
+  };
+  std::vector<std::string> words{"test_node"};
+  {
+    std::istringstream split{args};
+    for (std::string word; split >> std::quoted(word, '\'');) {
+      words.push_back(word);
+    }
+  }
+  std::vector<char*> argv;
+  argv.reserve(words.size());
+  for (std::string& word : words) argv.push_back(word.data());
+  ::testing::internal::CaptureStdout();
+  const int status =
+      detail::RunMain(static_cast<int>(argv.size()), argv.data(), "test_node",
+                      "//test", detail::MakeInstance<GapProbe>());
+  Result result{status, ::testing::internal::GetCapturedStdout()};
+  detail::log_options_for_test = nullptr;
+  process::stop_requested.store(false);
+  held_log = nullptr;
+  return result;
+}
+
+// Whether this process's newest test_node row in the live registry has
+// kFlagLogGap.
+bool RowHasLogGap() {
+  const auto reader = introspect::RegistryReader::open();
+  if (!reader) return false;
+  bool gap = false;
+  std::uint64_t generation = 0;
+  for (const auto& row : reader->nodes()) {
+    if (row.name != "test_node" ||
+        row.pid != static_cast<std::uint64_t>(::getpid()) ||
+        row.generation < generation) {
+      continue;
+    }
+    generation = row.generation;
+    gap = row.log_gap();
+  }
+  return gap;
+}
+
+// A live node's registry row says its log has a gap as the gap opens, not
+// at the reporter's next refresh: a run killed in between is still marked
+// log_gap. The reporter is held after its first sample (a refresh period of
+// an hour), so the bit in the row can only be the writer's.
+// REQ-OPS-52
+TEST(Binary, ANodesRowHasTheLogGapBitAsTheGapOpens) {
+  detail::reporter_options_for_test = [](introspect::Reporter::Options& o) {
+    o.period = std::chrono::hours{1};
+  };
+  bool seen = false;
+  HeldLog held;
+  held.release_when = [&seen](const Node& node) {
+    seen = RowHasLogGap();
+    if (!seen && node.tick() < 300) return false;
+    process::stop_requested.store(true);
+    return true;
+  };
+  const Result run = RunHeldInProcess(
+      "--sim --duration-s 30 --log '" +
+          TempFile("talos_node_test_row_gap.tlog") + "' " + ConfigFlag(),
+      held);
+  detail::reporter_options_for_test = nullptr;
+  EXPECT_TRUE(seen) << "no kFlagLogGap in the row after 300 ticks\n"
+                    << run.output;
+  EXPECT_EQ(run.status, 1) << run.output;
+  ::shm_unlink(ShmObjectName("/test_node/state").c_str());
+}
+
 // A run whose own output log has a gap is incomplete evidence: the live run
 // (RunMain) and a --replay-inputs run (fed from a session with no loss)
 // print recording_gaps=1 and exit 1. The writer is held until its pool
-// fills; the live run then stops itself, and the replay lets it go in its
-// last update(), so no second gap can open.
+// fills; the live run then stops itself (it sees the gap in its registry
+// row), and the replay lets it go in its last update(), so no second gap
+// can open.
 // REQ-OPS-52, REQ-OPS-14
 TEST(Binary, ARunWhoseOwnLogHasAGapExits1) {
   const std::string dir = TempFile("talos_node_test_own_gap_session");
@@ -1701,13 +1784,12 @@ TEST(Binary, ARunWhoseOwnLogHasAGapExits1) {
     std::string args;
     std::function<bool(const Node&)> release_when;
   };
-  HeldLog held;
   const Row rows[] = {
       // A stop between dispatches: the rest of this one is dropped with the
       // gap, and the EXIT follows.
       {"live", "--sim --duration-s 30",
-       [&held](const Node& node) {
-         if (held.gap.load() == 0 && node.tick() < 1000) return false;
+       [](const Node& node) {
+         if (!RowHasLogGap() && node.tick() < 1000) return false;
          process::stop_requested.store(true);
          return true;
        }},
@@ -1718,42 +1800,18 @@ TEST(Binary, ARunWhoseOwnLogHasAGapExits1) {
   };
   for (const Row& row : rows) {
     SCOPED_TRACE(row.name);
-    held.gap.store(0);
-    held.released.store(false);
+    HeldLog held;
     held.release_when = row.release_when;
-    held_log = &held;
-    detail::log_options_for_test = [&held](event::log::LogWriterOptions& o) {
-      o.chunk_bytes = 1024;
-      o.chunk_count = 2;
-      o.gap_flags = &held.gap;
-      o.gap_flag = 1;
-      o.before_write = [&held] { held.released.wait(false); };
-    };
-    const std::string out = TempFile("talos_node_test_own_gap.tlog");
-    const std::string command =
-        row.args + " --log '" + out + "' " + ConfigFlag();
-    std::vector<std::string> words{"test_node"};
-    {
-      std::istringstream split{command};
-      for (std::string word; split >> std::quoted(word, '\'');) {
-        words.push_back(word);
-      }
-    }
-    std::vector<char*> argv;
-    argv.reserve(words.size());
-    for (std::string& word : words) argv.push_back(word.data());
-    ::testing::internal::CaptureStdout();
-    const int status =
-        detail::RunMain(static_cast<int>(argv.size()), argv.data(), "test_node",
-                        "//test", detail::MakeInstance<GapProbe>());
-    const std::string output = ::testing::internal::GetCapturedStdout();
-    detail::log_options_for_test = nullptr;
-    process::stop_requested.store(false);
-    EXPECT_EQ(status, 1) << output;
-    EXPECT_NE(output.find("recording_gaps=1 "), std::string::npos) << output;
-    EXPECT_EQ(output.find("stopped before"), std::string::npos) << output;
+    const Result run = RunHeldInProcess(
+        row.args + " --log '" + TempFile("talos_node_test_own_gap.tlog") +
+            "' " + ConfigFlag(),
+        held);
+    EXPECT_EQ(run.status, 1) << run.output;
+    EXPECT_NE(run.output.find("recording_gaps=1 "), std::string::npos)
+        << run.output;
+    EXPECT_EQ(run.output.find("stopped before"), std::string::npos)
+        << run.output;
   }
-  held_log = nullptr;
   ::shm_unlink(ShmObjectName("/test_node/state").c_str());
   std::filesystem::remove_all(dir);
 }

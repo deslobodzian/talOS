@@ -565,14 +565,13 @@ disk fails (`failed()`), the GAP record itself would cross the byte cap of a
 log too small to rotate (`capture_stopped()`, `<log>.capped`), or the process
 is killed. Such a gap is still counted: `gaps()`, `lost_records()` and
 `losing()` report a gap to any thread, `incomplete()` (`failed()` or a gap)
-is what a node's and the bridge's exit status say, a writer given
-`LogWriterOptions::gap_flags` ORs its `gap_flag` into that word as it drops
-the gap's first record, and the registry row's
+is what a node's and the bridge's exit status say, and the registry row's
 gap bit ([event log state](../introspection/README.md#event-log-state)),
 which the launcher reads in each supervision pass and once more from the row
-a run left when it reaps it, marks the member once a sample of the row has
-shown the gap (a run killed sooner after its pool filled leaves no trace of
-it).
+a run left when it reaps it, marks the member. A writer given
+`LogWriterOptions::gap_flags` (a node's, pointed at its row) ORs its
+`gap_flag` into that word as it drops the gap's first record, so a run
+killed at any point after that is marked.
 
 `failed()` means only that capture is over: the disk refused a write or the
 log file could not be created. **Treat it as a robot fault**, next to a

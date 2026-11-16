@@ -169,7 +169,12 @@ stopped at the cap). The `Reporter` copies them into the row's `flags` in
 each full sample, when the loop's recorder reports them, as
 `kFlagRecorderFailed`, `kFlagLogGap` and `kFlagLogCapped`; the hardware
 bridge does the same for its own log (`NodeRegistration::set_recording`;
-`NodeSnapshot::log_gap()` reads the gap bit). They are bits of the existing
+`NodeSnapshot::log_gap()` reads the gap bit). A node's log writer also
+sets `kFlagLogGap` itself as a gap opens, with one atomic OR into the row's
+`flags` word (`LogWriterOptions::gap_flags`,
+`NodeRegistration::flags_word()`, `Reporter::row_flags()`), so a run
+killed before the next sample, whose gap has no GAP record, is still
+marked. They are bits of the existing
 `flags` word, which needs no layout or version change: an older writer leaves
 them clear, and an older reader ignores them. Once set they stay set until
 the slot is claimed again, since what they report stays lost. The launcher records them in the session manifest while the

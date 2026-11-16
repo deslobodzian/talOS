@@ -250,6 +250,12 @@ class Reporter {
     return wakeups_.load(std::memory_order_relaxed);
   }
 
+  // The row's `flags` word (NodeRegistration::flags_word()), or null
+  // without a row. Valid while this Reporter lives.
+  std::atomic<std::uint32_t>* row_flags() {
+    return registration_ ? registration_->flags_word() : nullptr;
+  }
+
   const std::string& error() const { return error_; }
 
  private:
