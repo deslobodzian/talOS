@@ -234,10 +234,11 @@ static_assert((kFlagOutputsHeld & kFlagRealtimeMask) == 0,
 
 // The node's event log has a gap: records its writer could not take were
 // dropped (LogWriter gaps() > 0). Capture resumes after a GAP record that
-// marks them; the bit is set from the moment the gap opens, so a run killed
-// or stopped by a disk failure or its byte cap during one has the bit and no
-// GAP record. An event log flag (above): set by set_recording, never
-// cleared.
+// marks them. The bit is set at the first sample after the gap opens (the
+// Reporter's, every kRefreshPeriod; the bridge's), not as it opens: a run
+// stopped by a disk failure or its byte cap during a gap has the bit and no
+// GAP record, but one killed before that sample has neither. An event log
+// flag (above): set by set_recording, never cleared.
 inline constexpr std::uint32_t kFlagLogGap = 1u << 14;
 static_assert((kFlagLogGap & kFlagRealtimeMask) == 0,
               "kFlagLogGap must not share a bit with the realtime outcome");
@@ -1393,8 +1394,8 @@ struct NodeSnapshot {
   }
   // kFlagOutputsHeld: the devices flush is holding back outputs it set.
   bool outputs_held() const { return (flags & kFlagOutputsHeld) != 0; }
-  // kFlagLogGap: the node's event log has dropped records (set when a gap
-  // opens).
+  // kFlagLogGap: the node's event log has dropped records (set at the first
+  // sample after a gap opens).
   bool log_gap() const { return (flags & kFlagLogGap) != 0; }
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};
