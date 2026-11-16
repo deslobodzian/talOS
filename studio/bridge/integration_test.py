@@ -61,6 +61,8 @@ def fast_slots(document):
                       ("events", "dropped", "sequence", "last_monotonic_ns",
                        "last_latency_ns", "max_latency_ns")]
         slots += [(selection, "selected") for selection in node["selections"]]
+        if "outputs_held" in node:
+            slots.append((node, "outputs_held"))
     for topic in document["topics"]:
         slots += [(topic, key) for key in ("published", "received", "dropped", "health")]
     return slots

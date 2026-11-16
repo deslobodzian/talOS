@@ -446,7 +446,11 @@ drives straight from a joystick, a plain subscription or a target it kept
 from an earlier tick never moves, nor does one that asks its `Target` only
 in `every()` or a callback. The first such tick of each enabled spell in
 which `update()` set an output non-neutral prints one line on the node's stderr naming
-it. Drive only from what this tick's `get()` returned; a test or bench
+it. While such ticks last, Studio's system view shows the node's card
+`driven by none · outputs held: no live target` (a node that sets nothing
+shows only `none`), within a registry refresh (250 ms); it clears at the
+first tick that drives, sets nothing, or runs disabled. Drive only from what
+this tick's `get()` returned; a test or bench
 fixture with no producer by design calls `talos::AllowUntargetedOutputs`
 (`talos.allow_untargeted_outputs`) in its constructor instead.
 

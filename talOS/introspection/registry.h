@@ -12,13 +12,15 @@
  * array of slots; a node claims one at startup, writes its event-loop manifest
  * into it -- every timer, watcher, fetcher and sender, by name and message size
  * -- and then, while it runs, keeps current a heartbeat, a set of counters,
- * the lane each of its Targets selected, whether its event log stopped
- * early, the realtime scheduling its loop got, and what its wake channel
- * lost. Studio and any agent map
+ * the lane each of its Targets selected, whether the devices flush is
+ * holding back outputs it set, whether its event log stopped early, the
+ * realtime scheduling its loop got, and what its wake channel lost. Studio
+ * and any agent map
  * the segment read-only and get the whole system: which processes exist,
  * which topics each one publishes and subscribes to, how much traffic has
- * actually moved, who drives each subsystem, which recordings are incomplete
- * and which loops run without their realtime grant.
+ * actually moved, who drives each subsystem and which node asks to move
+ * with nobody driving, which recordings are incomplete and which loops run
+ * without their realtime grant.
  *
  * The layout is frozen and the version is part of the segment name, so a node
  * from an older build cannot be misread by a newer reader: it lands in a
@@ -131,6 +133,10 @@ namespace talos::introspect {
 //
 // Nor did counting a timer's missed periods in SourceRecord::dropped: a
 // timer's `dropped` was always 0, which still reads as "no overrun".
+//
+// Nor did kFlagOutputsHeld: a bit of `flags` that every earlier writer left
+// clear, which reads as "nothing held back" -- all an earlier build could
+// have said -- and every earlier reader tests only the bits it knows.
 inline constexpr std::uint32_t kRegistryVersion = 6;
 inline constexpr const char* kRegistryPath = "/talos_registry.6";
 // The segment's mode, whatever the creator's umask: every node registers,
@@ -206,6 +212,18 @@ inline constexpr std::optional<process::RealtimeOutcome> RealtimeOf(
       .requested = (bits & 4u) != 0,
       .refused = static_cast<std::uint8_t>(bits >> 3)};
 }
+
+// The devices flush is holding back outputs the node set (REQ-SAFE-41): its
+// last flush ran with the robot enabled, the node not opted out
+// (AllowUntargetedOutputs), no talos::Target returning a target in that
+// update(), and that update() setting an output non-neutral, so the flush
+// sent every output neutral. Unlike the event log flags it clears: the
+// Reporter copies the node's current answer in each full sample
+// (NodeRegistration::set_outputs_held), so it is at most one refresh behind.
+inline constexpr std::uint32_t kFlagOutputsHeld = 1u << 13;
+static_assert((kFlagOutputsHeld & kFlagRealtimeMask) == 0,
+              "kFlagOutputsHeld must not share a bit with the realtime "
+              "outcome");
 
 static_assert(process::kAllSteps < (1u << 5),
               "the refused steps must fit the five bits kFlagRealtimeMask "
@@ -930,6 +948,20 @@ class NodeRegistration {
     if (flags != 0) record_->flags.fetch_or(flags, std::memory_order_relaxed);
   }
 
+  // Sets or clears kFlagOutputsHeld, leaving every other bit of `flags` as
+  // it is. Called inside a sample; writes only when the answer changed.
+  void set_outputs_held(bool held) {
+    if (!owns_slot()) return;
+    const bool was = (record_->flags.load(std::memory_order_relaxed) &
+                      kFlagOutputsHeld) != 0;
+    if (was == held) return;
+    if (held) {
+      record_->flags.fetch_or(kFlagOutputsHeld, std::memory_order_relaxed);
+    } else {
+      record_->flags.fetch_and(~kFlagOutputsHeld, std::memory_order_relaxed);
+    }
+  }
+
   // Publishes the loop's realtime outcome (kFlagRealtimeMask). Call once,
   // from the thread that asked, right after process::ConfigureRealtime, or
   // with requested false when the node did not ask. The bits are clear
@@ -1295,6 +1327,8 @@ struct NodeSnapshot {
   std::optional<process::RealtimeOutcome> realtime() const {
     return RealtimeOf(flags);
   }
+  // kFlagOutputsHeld: the devices flush is holding back outputs it set.
+  bool outputs_held() const { return (flags & kFlagOutputsHeld) != 0; }
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};
   std::vector<SelectionSnapshot> selections;

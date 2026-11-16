@@ -134,6 +134,46 @@ test('a node card says who drives its subsystem, and none when nobody does',
        assert.ok(wiring.includes('driven by teleop'));
      });
 
+// REQ-SAFE-41: nobody drives and the node is idle, against nobody drives and
+// the devices flush is holding back outputs the node set (the registry row's
+// outputs_held), for a node with Targets and for one without; a row that is
+// not live claims neither.
+test('a node card tells a node held back by the target gate from an idle one',
+     () => {
+       const graph = parseSystemGraph(demoSystemGraph(250n));
+       const card = (name: string, outputs_held: boolean, stale = false) => {
+         const node = {...graph.nodes.find(n => n.name === name)!, outputs_held};
+         return render(<NodeCard graph={graph} stale={stale} node={node}
+                                 rates={{}} selected={false}
+                                 onSelect={() => {}}/>);
+       };
+       const idle = card('drivetrain', false);
+       assert.match(idle, /driven bynone/);
+       assert.ok(!idle.includes('outputs held'), idle);
+
+       const trying = card('drivetrain', true);
+       assert.match(trying, /driven bynone · outputs held: no live target/);
+       // What to do about it, on the card.
+       assert.match(trying, /publish a lane this mode.+target policy lists/);
+       assert.match(trying, /set outputs from what this tick.+get\(\) returned/);
+
+       // A node without Targets says nothing about who drives until the
+       // flush holds back its outputs.
+       assert.ok(!card('pose_estimator', false).includes('driven by'));
+       assert.match(card('pose_estimator', true),
+                    /driven bynone · outputs held: no live target/);
+
+       assert.ok(!card('drivetrain', true, true).includes('outputs held'));
+
+       const wiring = render(<Wiring graph={graph} stale={false}
+                                     node={{...graph.nodes.find(
+                                         n => n.name === 'drivetrain')!,
+                                            outputs_held: true}}
+                                     rates={{}}/>);
+       assert.ok(wiring.includes('driven by none · outputs held: no live target'),
+                 wiring);
+     });
+
 
 // REQ-OPS-18, TODO.md RT-7: a node whose wakes were lost, or a bridge that
 // skipped requests, says so on its card; a healthy node, or one from a

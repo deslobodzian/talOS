@@ -1,10 +1,12 @@
 // A single node card: liveness, cadence, dispatch count, who drives its
-// subsystem, and what its wake channel lost (quiet at zero). Pure at render (data arrives as props), so react-dom/server can
-// render it in tests. `stale`: the graph is last-known, so liveness is unknown.
+// subsystem (and whether the devices flush is holding back outputs it set
+// while nobody does), and what its wake channel lost (quiet at zero). Pure at
+// render (data arrives as props), so react-dom/server can render it in tests.
+// `stale`: the graph is last-known, so liveness is unknown.
 
 import {nodeLiveness} from '../../data/freshness';
-import {deliveryLoss, drivenBy, isSubscriber, rateKey, type DeliveryCounter,
-        type SystemGraph, type SystemNode} from '../../system';
+import {deliveryLoss, drivenByLine, isSubscriber, outputsHeld, rateKey,
+        type DeliveryCounter, type SystemGraph, type SystemNode} from '../../system';
 import {duration, hertz, integer, staleness} from '../../ui/formatters';
 import {Badge, StatusDot} from '../../ui/primitives';
 
@@ -35,9 +37,10 @@ export function NodeCard(
                       .map(s => rates[rateKey(node.name, s.id)])
                       .filter((r): r is number => r !== undefined)
                       .sort((a, b) => b - a)[0];
-  const driver = drivenBy(node);
   const lost = deliveryLoss(node);
   const liveness = nodeLiveness(node, {stale});
+  const held = outputsHeld(node, liveness === 'live');
+  const driver = drivenByLine(node, liveness === 'live');
 
   return <button
       className={'node-card' + (selected ? ' selected' : '') +
@@ -66,9 +69,16 @@ export function NodeCard(
       }</dd></div>
       {driver !== null &&
        <div className="driven-by"><dt>driven by</dt><dd className={
+           held ? 'held' :
            node.selections.some(s => s.selected !== null) ? 'driving' : 'idle'
        }>{driver}</dd></div>}
     </dl>
+    {held &&
+     <small className="warn">
+       update() sets outputs in ticks with no live target, so each goes out
+       neutral: publish a lane this mode's target policy lists, and set
+       outputs from what this tick's get() returned.
+     </small>}
     {node.declared_sources > node.sources.length &&
      <small className="warn">
        {node.declared_sources - node.sources.length} more sources than the

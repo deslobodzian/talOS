@@ -401,9 +401,10 @@ struct HardwareLink::Impl {
     const std::uint64_t tick = detail::NodeAccess::next_update(node);
     const bool targeted = detail::NodeAccess::untargeted_outputs(node) ||
                           live_target_update == tick;
+    const bool enabled = Enabled();
     if (have_state) {
       hardware::Command command = hardware::NeutralCommand(state, motor_ids);
-      const bool drive = Enabled() && targeted;
+      const bool drive = enabled && targeted;
       for (std::size_t i = 0; i < command.count; ++i) {
         const Device& motor = devices[motor_devices[i]];
         if (drive && motor.set_update == tick) command.motors[i] = motor.motor;
@@ -428,11 +429,17 @@ struct HardwareLink::Impl {
                                            sizeof packet);
       }
     }
-    // One line per enabled spell, written whole with one fwrite from the
-    // line built at registration: no allocation on the tick.
-    if (!Enabled()) {
+    // Outputs held back: enabled, not targeted, and update() set one
+    // non-neutral. The node's registry row carries it while it lasts
+    // (NodeAccess::set_outputs_held: a store only when it changes), and the
+    // first tick of each enabled spell that holds also writes one line,
+    // whole with one fwrite from the line built at registration: no
+    // allocation on the tick.
+    const bool held = enabled && !targeted && SetNonNeutral(tick);
+    detail::NodeAccess::set_outputs_held(node, held);
+    if (!enabled) {
       withheld_reported = false;
-    } else if (!targeted && !withheld_reported && SetNonNeutral(tick)) {
+    } else if (held && !withheld_reported) {
       std::fwrite(withheld_line.data(), 1, withheld_line.size(), stderr);
       withheld_reported = true;
     }

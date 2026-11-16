@@ -53,7 +53,8 @@
 namespace talos::introspect {
 
 // How often a running node's reporter refreshes its row: the heartbeat, the
-// source counters, the selections and the event log flags. Once a loop
+// source counters, the selections, the outputs held flag and the event log
+// flags. Once a loop
 // runs, the one deadline the heartbeat must meet is liveness: a viewer's
 // `alive`, and the next claim freeing a row whose heartbeat is
 // kLivenessTimeout old. The launcher's stall check reads the dispatch count,
@@ -139,6 +140,11 @@ class Reporter {
     // The node's Targets, in the order it opened them.
     std::vector<Selection> selections;
 
+    // Whether the devices flush is holding back outputs the node set
+    // (kFlagOutputsHeld), read once per refresh; empty for a node without
+    // outputs. The same threading rule as ExtraSource::events.
+    std::function<bool()> outputs_held;
+
     // Full refresh cadence: heartbeat, source counters and selections. The
     // dispatch count the launcher supervises is the loop thread's own.
     std::chrono::milliseconds period{kRefreshPeriod};
@@ -187,11 +193,13 @@ class Reporter {
   template <typename Loop>
   void start(Loop& loop, std::vector<ExtraSource> extra,
              std::vector<EndpointAttribute> endpoints,
-             std::vector<Selection> selections) {
+             std::vector<Selection> selections,
+             std::function<bool()> outputs_held = {}) {
     stop();
     options_.extra = std::move(extra);
     options_.endpoints = std::move(endpoints);
     options_.selections = std::move(selections);
+    options_.outputs_held = std::move(outputs_held);
     start(loop);
   }
 
@@ -365,6 +373,8 @@ class Reporter {
       registration.set_selected(static_cast<std::uint32_t>(i),
                                 selection.selected ? selection.selected() : -1);
     }
+    registration.set_outputs_held(options_.outputs_held &&
+                                  options_.outputs_held());
     registration.end_sample();
   }
 

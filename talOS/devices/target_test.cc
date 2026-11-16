@@ -1255,6 +1255,67 @@ TEST(TargetGate, AThrownUpdateLeavesNothingToTheNextTick) {
   }
 }
 
+// Sets every output each tick while `set`, from its target when get()
+// returned one and from a constant when it did not.
+struct Insisting {
+  explicit Insisting(Node& n) : node{n}, target{n}, devices{n} {}
+  void update() {
+    const Goal* goal = target.get();
+    if (set) devices.Drive(goal != nullptr ? goal->position_rot() : 0.25);
+  }
+  Node& node;
+  Target<Goal> target;
+  GateDevices devices;
+  bool set = true;
+};
+
+// What Studio's system view shows of the gate (the registry row's
+// kFlagOutputsHeld): held while the flush sends neutral what update() set
+// with no live target, and cleared by a tick that drives, a tick that sets
+// nothing, and a disable. A disabled robot holds nothing back.
+// REQ-SAFE-41
+TEST(TargetGate, TheNodeReportsOutputsHeldOnlyWhileTheFlushHoldsThem) {
+  auto sim = Sim::FromToml(kGateToml);
+  auto& gate = sim.add<Insisting>("gate");
+  SimHardware hw{sim};
+  hw.set_driver_station(DsPacket(kTeleop));
+  const auto held = [&gate] {
+    return detail::NodeAccess::outputs_held(gate.node);
+  };
+  sim.step(10ms);
+  ASSERT_FALSE(robot_enabled(gate.node));
+  ExpectNeutral(hw);
+  EXPECT_FALSE(held());
+
+  hw.enable();
+  sim.step(10ms);
+  ASSERT_TRUE(robot_enabled(gate.node));
+  ExpectNeutral(hw);
+  EXPECT_TRUE(held());
+
+  PublishTarget(sim, "gate", "teleop", Goal{0.5});
+  sim.step(5ms);
+  ExpectDriving(hw, 0.5);
+  EXPECT_FALSE(held());
+
+  ReleaseTarget<Goal>(sim, "gate", "teleop");
+  sim.step(5ms);
+  ExpectNeutral(hw);
+  EXPECT_TRUE(held());
+
+  gate.set = false;
+  sim.step(5ms);
+  EXPECT_FALSE(held());
+  gate.set = true;
+  sim.step(5ms);
+  EXPECT_TRUE(held());
+
+  hw.enable(false);
+  sim.step(20ms);
+  ASSERT_FALSE(robot_enabled(gate.node));
+  EXPECT_FALSE(held());
+}
+
 TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {
   EXPECT_EQ(detail::TargetEnvelopeBytes(24, 8), 40u);
   EXPECT_EQ(detail::TargetEnvelopeBytes(4, 4), 20u);

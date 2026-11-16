@@ -385,7 +385,14 @@ inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node,
     if (i != 0) out += ',';
     AppendSelection(out, node.selections[i], fast);
   }
-  out += "]}";
+  out += ']';
+  // The devices flush is holding back outputs the node set: nobody drives
+  // and the node is trying (introspect::kFlagOutputsHeld). Not a version
+  // bump: a reader that predates it ignores it, and one that knows it reads
+  // its absence as "not reported".
+  out += ",\"outputs_held\":";
+  AppendFast(out, fast, [&] { out += node.outputs_held() ? "true" : "false"; });
+  out += '}';
 }
 
 inline void AppendTopic(std::string& out, const TopicRow& row,
@@ -432,8 +439,9 @@ struct SystemGraphInput {
 // without being re-sent the whole document. `structure` identifies everything
 // but the fast values (names, endpoints, pids, capacities: what changes only
 // when a node starts, stops or restarts); `values` is the fast values (wall
-// time, counters, heartbeats, liveness, selected sources, topic verdicts) in
-// document order, as a JSON array of the same JSON values the document holds.
+// time, counters, heartbeats, liveness, selected sources, held outputs, topic
+// verdicts) in document order, as a JSON array of the same JSON values the
+// document holds.
 // A client holding a document of the same structure becomes current by
 // writing `values` over its fast fields in that order.
 struct SystemGraphDocument {

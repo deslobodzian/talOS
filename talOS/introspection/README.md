@@ -1,8 +1,8 @@
 # Live node registry
 
 `registry.h` exposes a shared-memory registry of node identities, endpoints,
-heartbeats, source counters, Target selections, event log state and wake
-loss.
+heartbeats, source counters, Target selections, held outputs, event log state
+and wake loss.
 `RegistryReader` maps it read-only; `Reporter` publishes a node's event-loop
 data.
 
@@ -139,6 +139,20 @@ holds `kMaxSelectionsPerNode` Targets and `kMaxSelectionSources` names each;
 the declared counts say when a node or a policy had more, and a selected source
 past the name table reads as `#<index>` rather than as nobody.
 
+`kFlagOutputsHeld` (bit 13 of `flags`) says the devices flush is holding
+back outputs the node set: its last flush ran with the robot enabled, the
+node not opted out (`AllowUntargetedOutputs`), no Target returning a target
+in that `update()`, and that `update()` setting an output non-neutral
+(REQ-SAFE-41). The flush stores the answer in the node's own atomic
+(`NodeAccess::set_outputs_held`: one relaxed load per tick, and a store only
+when it changed), and the `Reporter` copies it into the row in each refresh
+sample through `Reporter::Options::outputs_held`
+(`NodeRegistration::set_outputs_held`, which writes only on a change and
+leaves the other bits alone). Unlike the event log flags it clears with the
+node's answer. `NodeSnapshot::outputs_held()` reads it. Like those flags it
+is a bit every earlier writer left clear and every earlier reader ignores, so
+the layout and version are unchanged.
+
 ## Event log state
 
 A node's event log can stop early, and capture never resumes: `LogWriter`
@@ -273,8 +287,8 @@ before storing `running_`, synchronizing the reporter's load. The reporter
 publishes endpoints and clears the constructing flag only when the manifest
 and counters exist. The launcher bounds construction from process spawn;
 see [launcher supervision](../launcher/README.md#restarts).
-The reporter samples the heartbeat, source counters, selections and event log
-state every 250 ms (`kRefreshPeriod`, a twentieth of `kLivenessTimeout`, the
+The reporter samples the heartbeat, source counters, selections, held outputs
+and event log state every 250 ms (`kRefreshPeriod`, a twentieth of `kLivenessTimeout`, the
 one deadline the heartbeat must meet once the loop runs), and while the loop
 runs that refresh is the reporting thread's only wake. The dispatch count is not the
 reporter's: `start` attaches an `event::DispatchObserver` to the loop, and the

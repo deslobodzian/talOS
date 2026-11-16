@@ -197,6 +197,7 @@
 }
 .node-card dd.driving { color: var(--accent); }
 .node-card dd.idle { color: #7c92a7; }
+.node-card dd.held { color: var(--warn); }
 
 .ui-badge.sim { border-color: #7a6bd0; color: #c4b8ff; }
 .ui-badge.dead { border-color: #8a4a58; color: #ffb3c1; }
