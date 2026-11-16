@@ -279,7 +279,10 @@ void HardwareNode::PublishIntrospection() {
   registration_->begin_sample();
   registration_->heartbeat();
   registration_->set_dispatch_count(DispatchCount());
-  if (log_) registration_->set_recording(log_->failed(), log_->capped());
+  if (log_) {
+    registration_->set_recording(log_->failed(), log_->capped(),
+                                 log_->gaps() > 0);
+  }
 
   const auto set = [this](std::size_t index, std::uint64_t events,
                           std::uint64_t dropped = 0) {
@@ -891,13 +894,23 @@ void HardwareNode::Publish(ipc::Publisher<M>& publisher, uint16_t source_id,
 }
 
 void HardwareNode::ReportLogFailure() {
+  if (!log_) return;
   // The writer thread creates the file, so an open failure surfaces as
   // failed(), not capture_stopped(); report either once, with its reason.
-  if (!log_ || log_failure_reported_) return;
-  if (!log_->capture_stopped() && !log_->failed()) return;
-  std::fprintf(stderr, "hardware_node: log capture stopped: %s\n",
-               log_->error().c_str());
-  log_failure_reported_ = true;
+  if (!log_failure_reported_ && (log_->capture_stopped() || log_->failed())) {
+    std::fprintf(stderr, "hardware_node: log capture stopped: %s\n",
+                 log_->error().c_str());
+    log_failure_reported_ = true;
+  }
+  // The first gap, once: the GAP record marks it in the log when capture
+  // resumes (or at the stop).
+  if (!log_gap_reported_ && log_->gaps() > 0) {
+    std::fprintf(stderr,
+                 "hardware_node: event log %s is dropping records (a gap; "
+                 "capture resumes once the writer catches up)\n",
+                 log_path_.c_str());
+    log_gap_reported_ = true;
+  }
 }
 
 void HardwareNode::UpdateLinkReady(uint64_t now_us) {
@@ -1214,12 +1227,19 @@ int HardwareNode::Run(int duration_s) {
   std::printf("hardware_node: send_failures=%llu socket_reopens=%llu\n",
               static_cast<unsigned long long>(socket_counters_.send_failures),
               static_cast<unsigned long long>(socket_counters_.reopens));
-  // A log that failed exits 1, as RunMain does for event-loop nodes.
+  // A log that failed or has a gap exits 1, as RunMain does for event-loop
+  // nodes.
   bool log_failed = false;
   if (log_) {
     log_->flush();
     ReportLogFailure();
-    log_failed = log_->failed();
+    std::printf(
+        "hardware_node: recording_failed=%d recording_capped=%d "
+        "recording_gaps=%llu records_lost=%llu\n",
+        log_->failed(), log_->capped(),
+        static_cast<unsigned long long>(log_->gaps()),
+        static_cast<unsigned long long>(log_->lost_records()));
+    log_failed = log_->failed() || log_->gaps() > 0;
   }
   // A run without one State never heard the controller. It says so on
   // stderr either way, beside the summary, since under the launcher the

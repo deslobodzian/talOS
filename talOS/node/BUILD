@@ -81,6 +81,20 @@ cc_test(
     ],
 )
 
+# RULES.md 3 for the event log's gap path (talOS/events may not depend on
+# the probe's layer).
+cc_test(
+    name = "log_writer_allocation_test",
+    size = "small",
+    srcs = ["log_writer_allocation_test.cc"],
+    deps = [
+        ":allocation_probe",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "@googletest//:gtest_main",
+    ],
+)
+
 talos_messages(
     name = "test_messages",
     srcs = ["node_test_message.fbs"],

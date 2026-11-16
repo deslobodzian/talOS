@@ -421,7 +421,8 @@ class HardwareNode {
   // is fixed for its run.
   void ReportCanBuses() const;
   // Prints the packet log's error once, whether capture stopped or the log
-  // failed (e.g. its file could not be created).
+  // failed (e.g. its file could not be created), and one line for its first
+  // gap (records dropped, capture going on).
   void ReportLogFailure();
 
   config::RobotConfig robot_config_;
@@ -470,6 +471,7 @@ class HardwareNode {
   std::chrono::nanoseconds log_window_{0};  // LogWriterOptions::window
   std::unique_ptr<event::log::LogWriter> log_;
   bool log_failure_reported_{false};
+  bool log_gap_reported_{false};
   State latest_state_{};
   // /hw/status can_buses, assembled from the accepted States.
   CanBusTable can_buses_{0};

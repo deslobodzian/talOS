@@ -172,14 +172,19 @@ struct NodeProcessInfo {
   // `recorder_failed`: a run could not be spawned, or a run's event log
   // failed -- seen live in the node's registry row
   // (introspect::kFlagRecorderFailed), or unreadable, truncated or damaged
-  // (event::log::LogDamage) at shutdown. For the Studio bridge, which keeps
-  // no event log: it was left, out of restarts or never up (StudioBridge).
+  // (event::log::LogDamage) at shutdown -- or has a gap (log_gap). For the
+  // Studio bridge, which keeps no event log: it was left, out of restarts or
+  // never up (StudioBridge).
   bool failed{false};
   // A run's event log reached its share of the session log budget and lost
   // records: its oldest segments were deleted to keep the newest, or, with a
   // share too small to rotate, it stopped early (`<log>.capped`, or live,
   // introspect::kFlagLogCapped). The recording is incomplete, not corrupt.
   bool log_capped{false};
+  // A run's event log has a gap: its writer dropped records and capture went
+  // on (live, introspect::kFlagLogGap; at shutdown, a GAP record in any of
+  // its files). Set with `failed` by RecordLogGap.
+  bool log_gap{false};
   uint64_t record_count{0};
   // Whether this binary answered --describe: a session whose graph was never
   // checked otherwise reads exactly like one whose graph passed.
@@ -196,6 +201,11 @@ struct NodeProcessInfo {
   // Keeps `outcome` when it is worse than the one recorded; returns whether
   // it was.
   bool RecordRealtime(const process::RealtimeOutcome& outcome);
+
+  // Marks a run's event log gapped: log_gap and failed (a gapped log is
+  // incomplete evidence). Returns whether the member had no gap before, so
+  // its one line is printed once.
+  bool RecordLogGap();
 
   // Every run, first first, capped at kMaxRecordedRuns: the first run and
   // the newest; `runs_dropped` counts the ones between that were dropped.

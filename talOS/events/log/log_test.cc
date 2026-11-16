@@ -8,13 +8,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -1021,59 +1024,293 @@ TEST(LogDurability, IdleBackgroundWriterFsyncsWithoutExplicitFlush) {
   ::unlink(path.c_str());
 }
 
-TEST(LogBackgroundWriter, BlockedDiskStopsCaptureWithoutBlockingProducer) {
-  const auto path = TempPath("blocked_fifo");
-  ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
-  std::atomic<bool> allow_read{false};
-  std::vector<std::byte> bytes;
-  std::thread consumer{[&] {
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    std::byte header[sizeof(FileHeader)];
-    std::size_t seen = 0;
-    while (seen < sizeof(header)) {
-      const auto n = ::read(fd, header + seen, sizeof(header) - seen);
-      if (n <= 0) break;
-      seen += static_cast<std::size_t>(n);
-    }
-    bytes.insert(bytes.end(), header, header + seen);
-    // The writer cannot complete a 1 MiB chunk until this reader resumes.
-    while (!allow_read.load()) std::this_thread::yield();
-    std::byte buffer[4096];
-    for (;;) {
-      const auto n = ::read(fd, buffer, sizeof(buffer));
-      if (n <= 0) break;
-      bytes.insert(bytes.end(), buffer, buffer + n);
-    }
-    ::close(fd);
-  }};
-  constexpr std::size_t payload_size = 1u << 20;
-  {
-    LogWriter writer{
-        path, "blocked",
-        LogWriter::Options{payload_size + sizeof(RecordHeader), 1, true}};
-    writer.start({}, {});
-    const auto payload = MakePayload(payload_size, 7);
-    Context context{};
-    context.dispatch_index = 1;
-    writer.dispatch(context, payload);
-    context.dispatch_index = 2;
-    writer.dispatch(context, payload);
-    EXPECT_TRUE(writer.failed());
-    EXPECT_TRUE(writer.capture_stopped());
-    writer.finish(context);  // Failure must not leave a misleading clean EXIT.
-    allow_read.store(true);
-    writer.flush();
-    writer.flush();
+std::vector<char> FileBytes(const std::string& path) {
+  std::ifstream in{path, std::ios::binary};
+  return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
+// The bytes after the file header of a log written with no manifest: its
+// records. The header's wall-clock start differs between two logs.
+std::vector<char> RecordBytes(const std::string& path) {
+  std::vector<char> bytes = FileBytes(path);
+  bytes.erase(bytes.begin(),
+              bytes.begin() + static_cast<std::ptrdiff_t>(
+                                  std::min(bytes.size(), sizeof(FileHeader))));
+  return bytes;
+}
+
+// Holds a background writer in LogWriterOptions::before_write, standing for a
+// disk that does not return: while closed, each write waits for a permit.
+// entries() counts the writes begun, so with write_interval and
+// sync_interval too long to come due, entry n + 1 shows n chunks written.
+class WriteGate {
+ public:
+  std::function<void()> hook() {
+    return [this] { enter(); };
   }
-  consumer.join();
-  ASSERT_EQ(bytes.size(),
-            sizeof(FileHeader) + sizeof(RecordHeader) + payload_size);
-  RecordHeader record{};
-  std::memcpy(&record, bytes.data() + sizeof(FileHeader), sizeof(record));
-  EXPECT_EQ(record.dispatch_index, 1);
-  EXPECT_EQ(record.payload_bytes, payload_size);
-  EXPECT_EQ(record.stored_bytes, payload_size);
-  ::unlink(path.c_str());
+  void close() {
+    const std::lock_guard lock{mutex_};
+    open_ = false;
+  }
+  void open() {
+    const std::lock_guard lock{mutex_};
+    open_ = true;
+    changed_.notify_all();
+  }
+  void permit() {
+    const std::lock_guard lock{mutex_};
+    ++permits_;
+    changed_.notify_all();
+  }
+  std::uint64_t entries() const { return entries_.load(); }
+
+ private:
+  void enter() {
+    entries_.fetch_add(1);
+    std::unique_lock lock{mutex_};
+    changed_.wait(lock, [this] { return open_ || permits_ > 0; });
+    if (!open_) --permits_;
+  }
+
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool open_{true};
+  int permits_{0};
+  std::atomic<std::uint64_t> entries_{0};
+};
+
+// Opens the gate when it leaves scope, before the writer declared ahead of it
+// is destroyed (which waits for every write), however the test ended.
+struct OpenAtExit {
+  WriteGate& gate;
+  ~OpenAtExit() { gate.open(); }
+};
+
+// A background writer of four 4096-byte chunks behind `gate`: 32 records of
+// 128 bytes to a chunk, and nothing written but a handed-over chunk.
+LogWriter::Options GatedOptions(WriteGate& gate) {
+  LogWriter::Options options{4096, 4, /*background=*/true};
+  options.write_interval = std::chrono::hours{24};
+  options.sync_interval = std::chrono::hours{24};
+  options.before_write = gate.hook();
+  return options;
+}
+
+constexpr std::size_t kGatedPerChunk = 4096 / (sizeof(RecordHeader) + 64);
+
+// Dispatch `d`'s two records, a TIMER and a SEND of 64 bytes each, at
+// 1000 ns per dispatch and 10 ns later.
+void GatedTimer(LogWriter& writer, std::uint64_t d) {
+  Context context{};
+  context.kind = EventKind::TIMER;
+  context.dispatch_index = d;
+  context.event_time =
+      MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+  context.now = MonotonicTime::from_nanos(context.event_time.nanos() + 10);
+  context.sequence = d;
+  const std::vector<std::byte> payload(64, std::byte{0x5a});
+  writer.dispatch(context, payload);
+}
+void GatedSend(LogWriter& writer, std::uint64_t d) {
+  Context context{};  // the dispatch's, as a handler's send passes it
+  context.dispatch_index = d;
+  context.event_time =
+      MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+  context.now = MonotonicTime::from_nanos(context.event_time.nanos() + 10);
+  const std::vector<std::byte> payload(64, std::byte{0xa5});
+  writer.send(context, 2, payload, 0, d);
+}
+void GatedDispatch(LogWriter& writer, std::uint64_t d) {
+  GatedTimer(writer, d);
+  GatedSend(writer, d);
+}
+void GatedExit(LogWriter& writer, std::uint64_t d) {
+  Context context{};
+  context.kind = EventKind::EXIT;
+  context.dispatch_index = d;
+  context.event_time =
+      MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+  context.now = MonotonicTime::from_nanos(context.event_time.nanos() + 10);
+  writer.finish(context);
+}
+
+// The log `GatedDispatch` 1 to `last` and `GatedExit(last + 1)` make with
+// every record kept, synchronously.
+void WriteGatedReference(const std::string& path, std::uint64_t last) {
+  LogWriter writer{path, "gated", LogWriter::Options{4096, 1, false}};
+  writer.start({}, {});
+  for (std::uint64_t d = 1; d <= last; ++d) GatedDispatch(writer, d);
+  GatedExit(writer, last + 1);
+  writer.flush();
+}
+
+// A disk that stops returning fills the pool and the loop never waits: once
+// every chunk is handed over, records are dropped and counted, however many,
+// as one gap. With one chunk written capture still does not resume; with two
+// (half the pool) it resumes, but only at a record that starts a dispatch:
+// the SEND of a dispatch whose TIMER was dropped is dropped too. Between that
+// GAP and the next one the loop hands over half the pool again, and the
+// second gap, which splits a dispatch, resumes at the next one once the disk
+// returns. The log is every record before each gap, its GAP record, and every
+// record after, byte for byte what CopyWithGap makes of a log that kept them
+// all.
+// REQ-RT-11
+TEST(LogBackgroundWriter, FullPoolOpensAGapAndHalfAFreePoolResumesIt) {
+  const std::string path = TempPath("full_pool_gap");
+  const std::string whole = TempPath("full_pool_whole");
+  const std::string copied = TempPath("full_pool_copied");
+  const std::string copy = TempPath("full_pool_copy");
+  WriteGate gate;
+  std::uint64_t second_gap = 0;  // the dispatch the second gap splits
+  {
+    LogWriter writer{path, "gated", GatedOptions(gate)};
+    const OpenAtExit open_at_exit{gate};
+    writer.start({}, {});
+    GatedDispatch(writer, 1);
+    // Written: the writer has a write behind it, so from here on it writes
+    // only a chunk handed over.
+    writer.flush();
+    const std::uint64_t base = gate.entries();
+    gate.close();
+    // Four chunks of 16 dispatches each, handed over and not written.
+    for (std::uint64_t d = 2; d <= 65; ++d) GatedDispatch(writer, d);
+    EXPECT_FALSE(writer.losing());
+    EXPECT_EQ(writer.gaps(), 0u);
+    // Dispatch 66 finds every chunk handed over; 500 more follow it.
+    for (std::uint64_t d = 66; d <= 565; ++d) GatedDispatch(writer, d);
+    EXPECT_TRUE(writer.losing());
+    EXPECT_EQ(writer.gaps(), 1u);
+    EXPECT_EQ(writer.lost_records(), 2u * 500);
+
+    // One chunk written: three still handed over.
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 1; }));
+    gate.permit();
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 2; }));
+    GatedTimer(writer, 566);
+    EXPECT_TRUE(writer.losing()) << "resumed with one chunk free";
+    // Two written: half the pool free, but dispatch 566 lost its TIMER.
+    gate.permit();
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 3; }));
+    GatedSend(writer, 566);
+    EXPECT_TRUE(writer.losing()) << "resumed inside a dropped dispatch";
+    GatedTimer(writer, 567);
+    EXPECT_FALSE(writer.losing());
+    EXPECT_EQ(writer.gaps(), 1u);
+    EXPECT_EQ(writer.lost_records(), 2u * 501);
+
+    // Records taken until the pool is full again: two chunks, less the
+    // GAP record's room. It fills inside a dispatch, after its TIMER.
+    std::size_t taken = 1;  // dispatch 567's TIMER
+    std::uint64_t d = 567;
+    bool sent = false;
+    for (std::size_t k = 0; !writer.losing() && k < 1000; ++k) {
+      if (sent) {
+        GatedTimer(writer, ++d);
+      } else {
+        GatedSend(writer, d);
+      }
+      sent = !sent;
+      if (!writer.losing()) ++taken;
+    }
+    EXPECT_EQ(taken, 2 * kGatedPerChunk - 1);
+    ASSERT_TRUE(sent) << "the second gap did not open at a SEND";
+    second_gap = d;
+    EXPECT_EQ(writer.gaps(), 2u);
+
+    // The disk returns: once every handed-over chunk is written, the next
+    // dispatch resumes capture.
+    gate.open();
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 6; }));
+    GatedDispatch(writer, second_gap + 1);
+    EXPECT_FALSE(writer.losing());
+    GatedExit(writer, second_gap + 2);
+    writer.flush();
+    EXPECT_EQ(writer.gaps(), 2u);
+    EXPECT_EQ(writer.lost_records(), 2u * 501 + 1);
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+
+  const ReadBack back = ReadAll(path, false);
+  EXPECT_EQ(back.gaps, 2u);
+  EXPECT_TRUE(back.damage.clean());
+  // The first GAP, field by field: dispatches 66 to 566 dropped whole.
+  const std::size_t first = 2 * 65;
+  ASSERT_GT(back.records.size(), first);
+  const std::optional<LogGap> gap =
+      GapOf(back.records[first].header, back.records[first].payload);
+  ASSERT_TRUE(gap.has_value());
+  EXPECT_EQ(gap->first_dispatch_index, 66u);
+  EXPECT_EQ(gap->start_ns, 66'000);
+  EXPECT_EQ(gap->resumed_ns, 567'010);
+  EXPECT_EQ(gap->detail.cause, static_cast<std::uint16_t>(GapCause::POOL_FULL));
+  EXPECT_EQ(gap->detail.flags, 0u);
+  EXPECT_EQ(gap->detail.first_lost_ns, 66'010);
+  EXPECT_EQ(gap->detail.last_lost_ns, 566'010);
+  EXPECT_EQ(gap->detail.last_dispatch_index, 566u);
+  EXPECT_EQ(gap->detail.records, 1002u);
+  EXPECT_EQ(gap->detail.bytes, 1002u * (sizeof(RecordHeader) + 64));
+  EXPECT_EQ(gap->detail.dispatches, 501u);
+  EXPECT_EQ(gap->detail.sends, 501u);
+
+  // Byte for byte what CopyWithGap makes of the whole log: the later gap
+  // (the second dispatch's SEND) first, so the earlier indices hold.
+  const std::uint64_t last = second_gap + 1;
+  WriteGatedReference(whole, last);
+  const std::size_t split_send = 2 * (second_gap - 1) + 1;
+  const LogGap second = CopyWithGap(whole, copied, split_send, split_send + 1);
+  EXPECT_EQ(second.detail.flags, GAP_SPLITS_DISPATCH);
+  CopyWithGap(copied, copy, first, 2 * 566);
+  EXPECT_EQ(RecordBytes(path), RecordBytes(copy));
+  for (const auto& file : {path, whole, copied, copy}) ::unlink(file.c_str());
+}
+
+// A gap still open at the stop is closed there: flush() or destruction, once
+// the disk returns, writes its GAP record marked GAP_CLOSED_AT_FLUSH, with
+// the time of the run's EXIT, which found no room and was held, then that
+// EXIT, so the log ends in order. A second flush() adds nothing.
+// REQ-OPS-44
+TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
+  for (const bool flush : {true, false}) {
+    SCOPED_TRACE(flush ? "flush" : "destruction");
+    const std::string path = TempPath("closed_gap");
+    const std::string whole = TempPath("closed_gap_whole");
+    const std::string copy = TempPath("closed_gap_copy");
+    WriteGate gate;
+    {
+      LogWriter writer{path, "gated", GatedOptions(gate)};
+      const OpenAtExit open_at_exit{gate};
+      writer.start({}, {});
+      GatedDispatch(writer, 1);
+      writer.flush();
+      gate.close();
+      for (std::uint64_t d = 2; d <= 70; ++d) GatedDispatch(writer, d);
+      GatedExit(writer, 71);
+      EXPECT_TRUE(writer.losing());
+      gate.open();
+      if (flush) {
+        writer.flush();
+        EXPECT_FALSE(writer.losing());
+        const auto size = std::filesystem::file_size(path);
+        writer.flush();
+        EXPECT_EQ(std::filesystem::file_size(path), size);
+      }
+    }
+    const ReadBack back = ReadAll(path, false);
+    ASSERT_EQ(back.records.size(), 2u * 65 + 2);
+    const ReadBack::Read& read = back.records[2 * 65];
+    const std::optional<LogGap> gap = GapOf(read.header, read.payload);
+    ASSERT_TRUE(gap.has_value());
+    EXPECT_EQ(gap->detail.flags, GAP_CLOSED_AT_FLUSH);
+    EXPECT_EQ(gap->resumed_ns, 71'010);  // the held EXIT's
+    EXPECT_EQ(gap->detail.records, 2u * 5);
+    EXPECT_EQ(back.records.back().header.kind,
+              static_cast<std::uint16_t>(EventKind::EXIT));
+
+    WriteGatedReference(whole, 70);
+    CopyWithGap(whole, copy, 2 * 65, 2 * 70 + 1);
+    EXPECT_EQ(RecordBytes(path), RecordBytes(copy));
+    for (const auto& file : {path, whole, copy}) ::unlink(file.c_str());
+  }
 }
 
 // The loop thread never waits on its log file: constructing, starting and
@@ -1171,24 +1408,218 @@ TEST(LogBackgroundWriter, UncreatableLogFailsWithoutThrowing) {
   writer.reset();
 }
 
-TEST(LogCapture, OversizedRecordStopsCaptureAndPreservesPrefix) {
-  const auto path = TempPath("oversized");
-  LogWriter writer{path, "oversized", 512};
-  writer.start(MakeManifest(), {});
+// One record of a gap test: its kind, dispatch and payload size.
+struct Step {
+  EventKind kind;
+  std::uint64_t dispatch;
+  std::size_t bytes;
+};
+
+// Records step `k` of a sequence: dispatched at 1000 ns per dispatch index,
+// made (its now) 10 ns per step later, a MESSAGE published 500 ns before its
+// dispatch.
+void RecordStep(LogWriter& writer, const Step& step, std::size_t k) {
+  const auto at = static_cast<std::int64_t>(step.dispatch) * 1000;
   Context context{};
-  context.dispatch_index = 1;
-  writer.dispatch(context, MakePayload(20, 1));
-  writer.dispatch(context, MakePayload(1024, 2));
-  EXPECT_TRUE(writer.failed());
-  writer.dispatch(context, {});
-  writer.finish(context);
-  writer.flush();
-  LogReader reader{path};
-  LogReader::Record record{};
-  ASSERT_TRUE(reader.next(record));
-  EXPECT_EQ(record.payload.size(), 20);
-  EXPECT_FALSE(reader.next(record));
-  ::unlink(path.c_str());
+  context.kind = step.kind;
+  context.source_id = 1;
+  context.dispatch_index = step.dispatch;
+  context.event_time = MonotonicTime::from_nanos(at);
+  context.now =
+      MonotonicTime::from_nanos(at + 10 * static_cast<std::int64_t>(k));
+  if (step.kind == EventKind::MESSAGE) {
+    context.publish_time = MonotonicTime::from_nanos(at - 500);
+  }
+  context.sequence = k;
+  const std::vector<std::byte> payload =
+      MakePayload(step.bytes, static_cast<int>(k) + 1);
+  switch (step.kind) {
+    case EventKind::SEND:
+      writer.send(context, 2, payload, 0, k);
+      break;
+    case EventKind::EXIT:
+      writer.finish(context);
+      break;
+    default:
+      writer.dispatch(context, payload);
+      break;
+  }
+}
+
+// The record at `offset` of `path` replaced by the GAP `gap` with cause
+// `cause`, sealed as the writer seals it.
+void RewriteGapCause(const std::string& path, std::uint64_t offset,
+                     const LogGap& gap, GapCause cause) {
+  RecordHeader header{};
+  header.kind = static_cast<std::uint16_t>(EventKind::GAP);
+  header.source_id = GAP_SOURCE_ID;
+  header.dispatch_index = gap.first_dispatch_index;
+  header.event_time_ns = gap.start_ns;
+  header.now_ns = gap.resumed_ns;
+  GapRecord detail = gap.detail;
+  detail.cause = static_cast<std::uint16_t>(cause);
+  const std::span<const std::byte> stored = SealRecord(
+      header, std::span<const std::byte>{
+                  reinterpret_cast<const std::byte*>(&detail), sizeof(detail)});
+  std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+  file.seekp(static_cast<std::streamoff>(offset));
+  file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  file.write(reinterpret_cast<const char*>(stored.data()),
+             static_cast<std::streamsize>(stored.size()));
+}
+
+// A record larger than the writer's buffers is dropped whole, without
+// stopping capture: the synchronous writer opens a gap there, drops the rest
+// of that dispatch, and resumes at the next record that starts one (or that
+// belongs to none, as every record of the hardware bridge). The GAP record
+// it writes before that record names what was dropped, field by field, and
+// the log is byte for byte what CopyWithGap makes of one that kept every
+// record, cause aside. Rows: the gap starts a dispatch; it splits a dispatch
+// whose first records were taken; records of no dispatch.
+// REQ-RT-11
+TEST(LogGap, OversizedRecordOpensAGapTheNextDispatchCloses) {
+  constexpr std::size_t kBuffer = 512;
+  constexpr std::size_t kOversized = 1024;
+  struct Row {
+    const char* name;
+    std::vector<Step> steps;
+    std::size_t first;  // the oversized record, the first dropped
+    std::size_t end;    // the record capture resumes with
+    std::uint16_t flags;
+    std::uint64_t dispatches;
+    std::uint64_t sends;
+    std::int64_t start_ns;  // the earliest time a dropped record names
+  };
+  const Row rows[] = {
+      {"starts_a_dispatch",
+       {{EventKind::TIMER, 1, 20},
+        {EventKind::SEND, 1, 20},
+        {EventKind::TIMER, 2, kOversized},
+        {EventKind::SEND, 2, 20},
+        {EventKind::MESSAGE, 3, 20},
+        {EventKind::SEND, 3, 20},
+        {EventKind::EXIT, 4, 0}},
+       2,
+       4,
+       0,
+       1,
+       1,
+       2000},
+      {"splits_a_dispatch",
+       {{EventKind::TIMER, 1, 20},
+        {EventKind::SEND, 1, 20},
+        {EventKind::MESSAGE, 2, 20},
+        {EventKind::SEND, 2, kOversized},
+        {EventKind::SEND, 2, 20},
+        {EventKind::TIMER, 3, 20},
+        {EventKind::EXIT, 4, 0}},
+       3,
+       5,
+       GAP_SPLITS_DISPATCH,
+       0,
+       2,
+       2000},
+      {"no_dispatch",
+       {{EventKind::SEND, 0, 20},
+        {EventKind::SEND, 0, kOversized},
+        {EventKind::SEND, 0, 20},
+        {EventKind::SEND, 0, 20}},
+       1,
+       2,
+       0,
+       0,
+       1,
+       0},
+  };
+  for (const Row& row : rows) {
+    SCOPED_TRACE(row.name);
+    const std::string path = TempPath(std::string{"oversized_"} + row.name);
+    const std::string whole = TempPath(std::string{"whole_"} + row.name);
+    const std::string copy = TempPath(std::string{"copy_"} + row.name);
+    {
+      LogWriter writer{path, "oversized", kBuffer};
+      writer.start({}, {});
+      for (std::size_t k = 0; k < row.steps.size(); ++k) {
+        RecordStep(writer, row.steps[k], k);
+        // Dropped from the oversized record until the one that resumes.
+        EXPECT_EQ(writer.losing(), k >= row.first && k < row.end)
+            << "after step " << k;
+      }
+      writer.flush();
+      EXPECT_EQ(writer.gaps(), 1u);
+      EXPECT_EQ(writer.lost_records(), row.end - row.first);
+      EXPECT_FALSE(writer.failed()) << writer.error();
+      EXPECT_FALSE(writer.capture_stopped());
+    }
+
+    const ReadBack back = ReadAll(path, false);
+    ASSERT_EQ(back.records.size(),
+              row.steps.size() - (row.end - row.first) + 1);
+    EXPECT_EQ(back.gaps, 1u);
+    for (std::size_t i = 0; i < back.records.size(); ++i) {
+      if (i == row.first) continue;  // the GAP, below
+      // Before the gap, record i is step i; after it, the steps from `end`.
+      const std::size_t step = i < row.first ? i : i - 1 + row.end - row.first;
+      EXPECT_EQ(back.records[i].header.kind,
+                static_cast<std::uint16_t>(row.steps[step].kind))
+          << "record " << i;
+      EXPECT_EQ(back.records[i].header.dispatch_index, row.steps[step].dispatch)
+          << "record " << i;
+    }
+    const ReadBack::Read& read = back.records[row.first];
+    const std::optional<LogGap> gap = GapOf(read.header, read.payload);
+    ASSERT_TRUE(gap.has_value());
+    ASSERT_TRUE(gap->detailed);
+    const Step& lost = row.steps[row.first];
+    const auto now_of = [&](std::size_t k) {
+      return static_cast<std::int64_t>(row.steps[k].dispatch) * 1000 +
+             10 * static_cast<std::int64_t>(k);
+    };
+    EXPECT_EQ(gap->first_dispatch_index, lost.dispatch);
+    EXPECT_EQ(gap->start_ns, row.start_ns);
+    EXPECT_EQ(gap->resumed_ns, now_of(row.end));
+    const GapRecord& detail = gap->detail;
+    EXPECT_EQ(detail.cause,
+              static_cast<std::uint16_t>(GapCause::RECORD_TOO_LARGE));
+    EXPECT_EQ(detail.flags, row.flags);
+    EXPECT_EQ(detail.first_lost_ns, now_of(row.first));
+    EXPECT_EQ(detail.last_lost_ns, now_of(row.end - 1));
+    EXPECT_EQ(detail.last_dispatch_index, row.steps[row.end - 1].dispatch);
+    EXPECT_EQ(detail.records, row.end - row.first);
+    std::uint64_t bytes = 0;
+    for (std::size_t k = row.first; k < row.end; ++k) {
+      bytes += sizeof(RecordHeader) + row.steps[k].bytes;
+    }
+    EXPECT_EQ(detail.bytes, bytes);
+    EXPECT_EQ(detail.dispatches, row.dispatches);
+    EXPECT_EQ(detail.sends, row.sends);
+
+    // The same records, every one kept, then marked by CopyWithGap.
+    {
+      LogWriter writer{whole, "oversized", 4 * kOversized};
+      writer.start({}, {});
+      for (std::size_t k = 0; k < row.steps.size(); ++k) {
+        RecordStep(writer, row.steps[k], k);
+      }
+      writer.flush();
+      ASSERT_EQ(writer.gaps(), 0u);
+    }
+    std::uint64_t offset = 0;
+    {
+      LogReader reader{whole};
+      LogReader::Record record;
+      for (std::size_t i = 0; i <= row.first; ++i) {
+        ASSERT_TRUE(reader.next(record));
+      }
+      offset = record.offset;
+    }
+    const LogGap made = CopyWithGap(whole, copy, row.first, row.end);
+    RewriteGapCause(copy, offset, made, GapCause::RECORD_TOO_LARGE);
+    EXPECT_EQ(RecordBytes(path), RecordBytes(copy));
+    ::unlink(path.c_str());
+    ::unlink(whole.c_str());
+    ::unlink(copy.c_str());
+  }
 }
 
 TEST(LogBackgroundWriter, RepeatedFlushReusesChunksInOrder) {
@@ -1929,7 +2360,7 @@ TEST(LogCapture, WindowIgnoresAClockThatDoesNotAdvance) {
 // REQ-OPS-32. Every rotation syncs durably on the writer thread and takes a
 // chunk from the pool, so a window too small for that (a 1 ns window, or a
 // budget whose window collapsed) once ended a segment at every record, and
-// a pool exhausted by rotations stops capture for the session. No window
+// a pool exhausted by rotations drops records. No window
 // ends a segment sooner than sync_interval of record time after its first
 // record: 10.5 s of records every 1 ms under a 1 ns window keeps eight
 // segments that each start at least sync_interval after the one before.

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -71,7 +72,11 @@ std::uint64_t PrefixBytes() {
 // the writer's own capture_stopped().
 TEST(CappedLog, RotatingLogRecordsOnAndOneThatCannotRotateStopped) {
   const std::uint64_t record = sizeof(event::log::RecordHeader) + kMessageBytes;
-  const std::uint64_t segment = PrefixBytes() + record;
+  // The writer's segment rule: its prefix and its largest record, which is
+  // at least a GAP record.
+  const std::uint64_t segment =
+      PrefixBytes() +
+      std::max<std::uint64_t>(record, event::log::GAP_RECORD_BYTES);
   struct Row {
     const char* name;
     std::uint64_t max_bytes;

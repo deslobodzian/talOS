@@ -320,15 +320,17 @@ class Reporter {
     // (ProgressObserver).
     registration.begin_sample();
     registration.heartbeat();
-    // Whether the event log stopped early, from a recorder that can say
+    // What the event log lost, from a recorder that can say
     // (event::log::LogWriter, whose answers are lock-free loads); an
     // unlogged loop's NullRecorder cannot.
     if constexpr (requires {
                     loop.recorder().failed();
                     loop.recorder().capped();
+                    loop.recorder().gaps();
                   }) {
       registration.set_recording(loop.recorder().failed(),
-                                 loop.recorder().capped());
+                                 loop.recorder().capped(),
+                                 loop.recorder().gaps() > 0);
     }
 
     const event::SourceCounters* counters = loop.source_counters();

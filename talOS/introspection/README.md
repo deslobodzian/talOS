@@ -155,16 +155,20 @@ the layout and version are unchanged.
 
 ## Event log state
 
-A node's event log can stop early, and capture never resumes: `LogWriter`
-reports `failed()` for a disk error or for capture abandoned (the writer fell
-behind, or a record did not fit), and `capped()` for a log whose byte budget
-cost it records (its oldest segment deleted, or capture stopped at the cap). The `Reporter` copies both into the row's `flags` in each full
-sample, when the loop's recorder reports them, as `kFlagRecorderFailed` and
-`kFlagLogCapped`; the hardware bridge does the same for its own log
-(`NodeRegistration::set_recording`). They are bits of the existing `flags`
-word, which needs no layout or version change: an older writer leaves them
-clear, and an older reader ignores them. Once set they stay set until the slot
-is claimed again. The launcher records them in the session manifest while the
+A node's event log can lose records three ways: `LogWriter` reports
+`failed()` when capture is over (the disk refused a write, or the log file
+could not be created), `gaps()` when it dropped records it could not take
+and marked them with a GAP record while capture went on
+([log format](../events/README.md#log-format)), and `capped()` for a log
+whose byte budget cost it records (its oldest segment deleted, or capture
+stopped at the cap). The `Reporter` copies them into the row's `flags` in
+each full sample, when the loop's recorder reports them, as
+`kFlagRecorderFailed`, `kFlagLogGap` and `kFlagLogCapped`; the hardware
+bridge does the same for its own log (`NodeRegistration::set_recording`;
+`NodeSnapshot::log_gap()` reads the gap bit). They are bits of the existing
+`flags` word, which needs no layout or version change: an older writer leaves
+them clear, and an older reader ignores them. Once set they stay set until
+the slot is claimed again, since what they report stays lost. The launcher records them in the session manifest while the
 node runs ([launcher supervision](../launcher/README.md#restarts)).
 
 ## Realtime scheduling

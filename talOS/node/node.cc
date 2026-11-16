@@ -1470,14 +1470,19 @@ int RunMain(int argc, char** argv, const char* node_name,
     } else {
       loop.run();
     }
-    std::printf("%s: dispatches=%llu recording_failed=%d recording_capped=%d\n",
-                node_name,
-                static_cast<unsigned long long>(loop.dispatch_count()),
-                loop.recorder().failed(), loop.recorder().capped());
+    std::printf(
+        "%s: dispatches=%llu recording_failed=%d recording_capped=%d "
+        "recording_gaps=%llu records_lost=%llu\n",
+        node_name, static_cast<unsigned long long>(loop.dispatch_count()),
+        loop.recorder().failed(), loop.recorder().capped(),
+        static_cast<unsigned long long>(loop.recorder().gaps()),
+        static_cast<unsigned long long>(loop.recorder().lost_records()));
     if (loop.recorder().failed()) {
       std::fprintf(stderr, "%s\n", loop.recorder().error().c_str());
       return 1;
     }
+    // A log with a gap is incomplete evidence, like a failed one.
+    if (loop.recorder().gaps() > 0) return 1;
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());

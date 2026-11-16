@@ -59,9 +59,20 @@ namespace talos::event::log {
 // not put on the disk: once per Options::sync_interval (a second) the writer
 // fsyncs, which leaves the data in the drive's write cache on macOS. flush()
 // and destruction sync with process::DurableSync, which also flushes that
-// cache. If the pool fills, capture stops permanently and failed() becomes
-// true. Previously accepted chunks are drained, preserving a prefix without
-// holes.
+// cache.
+//
+// A record the writer cannot take -- every chunk handed over and not yet
+// written (the pool full), or the record larger than the chunks start() sized
+// -- is dropped whole, and so is every later record until one that starts a
+// new dispatch (a dispatch_index other than the last dropped record's, or 0,
+// no dispatch) finds at least half the pool free. That record is preceded in
+// the log by one GAP record (format.h) naming what was dropped, so the log
+// holds every record the writer accepted, in order, with each dropped
+// stretch marked where it happened. The loop thread does this alone, in O(1)
+// per record, without a lock, an allocation or a wait. An EXIT that finds no
+// room is held, never dropped: flush() and destruction write it after the
+// gap's GAP record (marked GAP_CLOSED_AT_FLUSH when capture had not resumed
+// by then). gaps(), lost_records() and losing() report it to any thread.
 //
 // With the background writer the thread that runs the loop never waits on
 // the log file: the writer thread creates `path` and writes the header,
@@ -88,10 +99,12 @@ inline constexpr std::size_t DEFAULT_CHUNK_COUNT = 4;
 
 struct LogWriterOptions {
   // Minimum buffer size. start() grows all chunks to fit the manifest's largest
-  // message; records exceeding that capacity fail capture without allocating.
+  // message and a GAP record; a record exceeding that capacity is dropped (a
+  // gap, cause RECORD_TOO_LARGE) without allocating.
   std::size_t chunk_bytes{DEFAULT_CHUNK_BYTES};
 
-  // How many buffers may be in flight before capture fails.
+  // How many buffers may be in flight before records are dropped (a gap,
+  // cause POOL_FULL).
   std::size_t chunk_count{DEFAULT_CHUNK_COUNT};
 
   // Write from a background thread. Turn off for tests that want writes to
@@ -103,7 +116,8 @@ struct LogWriterOptions {
   // Bytes the log's segments may take together, each segment's header,
   // manifest and schema block included. Zero is unbounded (one file, never
   // rotated). Capped, the log is split into n = min(kLogSegments,
-  // max_bytes / (prefix + largest record)) segments of max_bytes / n bytes;
+  // max_bytes / (prefix + largest record)) segments of max_bytes / n bytes,
+  // the largest record being at least a GAP record (GAP_RECORD_BYTES);
   // when the newest is full it is renamed and a new one started, and once
   // n segments exist the oldest is deleted, so the log keeps the session's
   // tail. Deleting the first segment makes capped() true and creates
@@ -124,7 +138,7 @@ struct LogWriterOptions {
   // segment's time never ends it sooner than sync_interval after its first
   // record, whatever the window: each rotation syncs durably on the writer
   // thread and takes a chunk, so faster rotation could exhaust the pool and
-  // stop capture. A smaller window is clamped, not refused, so a small
+  // drop records. A smaller window is clamped, not refused, so a small
   // budget degrades a node's tail rather than its start. Zero, or an
   // uncapped log: segments end on bytes only.
   std::chrono::nanoseconds window{0};
@@ -145,6 +159,12 @@ struct LogWriterOptions {
   // stop; a test holds it there to order a stop against that check. Empty
   // otherwise.
   std::function<void(const std::atomic<bool>& stopping)> before_stop_check;
+
+  // Tests only, like before_stop_check: the writer thread calls it before
+  // writing a chunk's records (after its nothing-to-write return, outside
+  // its mutex); a test holds it there to stand for a disk that does not
+  // return. Empty otherwise.
+  std::function<void()> before_write;
 };
 
 // LogWriterOptions::window from a `--log-window-us` value (microseconds; 0
@@ -212,21 +232,21 @@ class LogWriter {
   // Safe to call repeatedly, including after a failure.
   void flush() noexcept;
 
-  // True once anything has gone wrong: the disk refused a write, or capture
-  // stopped because the writer fell behind. Treat it as a fault on the robot;
-  // a log that stops early is a log you cannot replay the rest of the match
-  // from. Reaching the configured byte cap is policy, not a fault: it shows
-  // in capped(), not here.
+  // True once the disk refused a write or the log file could not be created:
+  // capture is over. A fault on the robot. Neither a gap nor the byte cap.
   bool failed() const noexcept;
   std::string error() const;
 
-  // True when capture was abandoned -- the loop outran the writer, a record
-  // was too large, or the byte cap was reached -- as opposed to a disk error.
-  // Sticky, because capture never resumes: doing so would leave a hole in the
-  // middle of the log and replay would silently skip it.
-  //
-  // This never waits and the producer never blocks on it, which is the whole
-  // point: a control loop must not stall behind a slow disk.
+  // Gaps opened so far, each marked by one GAP record once capture resumes or
+  // the writer is flushed or destroyed. Lock-free; any thread.
+  std::uint64_t gaps() const noexcept;
+  // Records dropped in every gap so far. Lock-free; any thread.
+  std::uint64_t lost_records() const noexcept;
+  // A gap is open: records are being dropped now. Lock-free; any thread.
+  bool losing() const noexcept;
+
+  // True once capture ended for good at the byte cap (a log that cannot
+  // rotate). Never waits.
   bool capture_stopped() const noexcept;
 
   // True once the log is missing records because of Options::max_bytes: its
@@ -278,10 +298,30 @@ class LogWriter {
   struct State {
     ~State();
 
+    // What take() did with a record.
+    enum class Take { kTaken, kPoolFull, kTooLarge, kStopped };
+
     void append(RecordHeader header,
                 std::span<const std::byte> payload) noexcept;
+    // Copies a sealed record into the active chunk, rotating the segment or
+    // handing the chunk over as needed. kStopped: the byte cap ended capture.
+    Take take(const RecordHeader& header,
+              std::span<const std::byte> stored) noexcept;
+    // Producer: the gap bookkeeping (see LogWriter).
+    void open_gap(const RecordHeader& header, GapCause cause) noexcept;
+    void lose(const RecordHeader& header, std::size_t payload_bytes) noexcept;
+    bool room_to_resume() const noexcept;
+    Take take_gap(std::int64_t now_ns) noexcept;
+    // flush() and destruction, once every chunk handed over is written:
+    // closes an open gap (GAP_CLOSED_AT_FLUSH) and takes a held EXIT.
+    // Whether it took a record.
+    bool close_at_stop() noexcept;
+    // Hands everything over and waits until it is written, closing an open
+    // gap and taking a held EXIT on the way.
+    void settle() noexcept;
+    void wait_written() noexcept;
     void submit_active() noexcept;
-    void acquire_chunk() noexcept;
+    bool acquire_chunk() noexcept;
     void write_chunk(Chunk& chunk) noexcept;
     // Writer side: ends the file's segment and starts `segment` at `path`.
     void rotate_to(std::uint64_t segment) noexcept;
@@ -345,8 +385,26 @@ class LogWriter {
     std::atomic<std::uint64_t> wakeups{0};  // See LogWriter::wakeups().
     Wakeup wake;
 
-    enum class CaptureError { NONE, POOL_FULL, RECORD_TOO_LARGE, BYTE_CAP };
+    // BYTE_CAP: a log that cannot rotate reached Options::max_bytes, and
+    // capture is over.
+    enum class CaptureError { NONE, BYTE_CAP };
     std::atomic<CaptureError> capture_error{CaptureError::NONE};
+
+    // Producer only: the open gap (losing), its first dropped dispatch, the
+    // earliest time a dropped record named (INT64_MAX while none did), and
+    // what it dropped; the dispatch of the last record taken; an EXIT that
+    // found no room.
+    bool losing{false};
+    std::uint64_t gap_first_dispatch{0};
+    std::int64_t gap_start_ns{0};
+    GapRecord gap{};
+    std::uint64_t last_accepted_dispatch{0};
+    std::optional<RecordHeader> held_exit;
+    // For observers (LogWriter::gaps() and the like). Only the producer
+    // stores them, with a relaxed load and store.
+    std::atomic<bool> losing_flag{false};
+    std::atomic<std::uint64_t> gap_count{0};
+    std::atomic<std::uint64_t> lost_records{0};
 
     mutable std::mutex mutex;
     std::condition_variable chunk_ready;

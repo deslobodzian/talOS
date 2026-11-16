@@ -212,10 +212,17 @@ LogSplit LogBudgets(const std::vector<NodeProcessInfo>& procs,
   return SplitLogBudget(session_log_budget, logs, rates, floors);
 }
 
+// The one line a member whose event log has a gap gets (RecordLogGap).
+void PrintLogGap(const std::string& member, const std::string& log) {
+  std::cerr << "[launcher] " << member << " event log " << log
+            << " lost records (a gap); the rest of this run is still "
+               "recorded\n";
+}
+
 // Totals every run's event log into `procs` once the session has ended --
-// record counts, capped and damaged logs -- and returns the session's exit
-// status before the endpoint refusal: 0, or the last nonzero exit code of a
-// member whose exit counts (`exit_not_counted`, one per member, false: not
+// record counts, capped, gapped and damaged logs -- and returns the session's
+// exit status before the endpoint refusal: 0, or the last nonzero exit code of
+// a member whose exit counts (`exit_not_counted`, one per member, false: not
 // the Studio bridge, and its last run did not end by the stop signal the
 // launcher sent it, NodeRun::stopped_by_session).
 int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
@@ -234,6 +241,10 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
           const auto summary = event::log::SummarizeLog(file);
           proc.record_count += summary.record_count;
           if (!summary.damage.clean()) proc.failed = true;
+          // A gap the live row did not show (a run killed before a sample
+          // saw it, or a reporter that never sampled) is said here.
+          if (summary.gaps > 0 && proc.RecordLogGap())
+            PrintLogGap(proc.name, file);
         } catch (const event::log::IncompleteLogHeader& e) {
           // Cut while it was being created: no records to count.
           std::cerr << "[launcher] skipping " << file << ": " << e.what()
@@ -1184,9 +1195,9 @@ bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
 
 bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
                              uint32_t flags) {
-  const uint32_t fresh =
-      flags & ~launch.recording_reported &
-      (introspect::kFlagRecorderFailed | introspect::kFlagLogCapped);
+  const uint32_t fresh = flags & ~launch.recording_reported &
+                         (introspect::kFlagRecorderFailed |
+                          introspect::kFlagLogCapped | introspect::kFlagLogGap);
   if (fresh == 0) return false;
   launch.recording_reported |= fresh;
   const std::string& log =
@@ -1195,6 +1206,9 @@ bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
     proc.failed = true;
     std::cerr << "[launcher] " << proc.name << " event log " << log
               << " failed; the rest of this run is not recorded\n";
+  }
+  if ((fresh & introspect::kFlagLogGap) != 0 && proc.RecordLogGap()) {
+    PrintLogGap(proc.name, log);
   }
   if ((fresh & introspect::kFlagLogCapped) != 0) {
     proc.log_capped = true;

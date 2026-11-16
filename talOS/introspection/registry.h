@@ -137,6 +137,11 @@ namespace talos::introspect {
 // Nor did kFlagOutputsHeld: a bit of `flags` that every earlier writer left
 // clear, which reads as "nothing held back" -- all an earlier build could
 // have said -- and every earlier reader tests only the bits it knows.
+//
+// Nor did kFlagLogGap: a bit of `flags` that every earlier writer left clear,
+// which reads as "no gap seen" -- all an earlier build could have said (its
+// writer stopped capture instead, kFlagRecorderFailed) -- and every earlier
+// reader tests only the bits it knows.
 inline constexpr std::uint32_t kRegistryVersion = 6;
 inline constexpr const char* kRegistryPath = "/talos_registry.6";
 // The segment's mode, whatever the creator's umask: every node registers,
@@ -175,12 +180,14 @@ inline constexpr std::uint32_t kFlagReplay = 1u << 1;
 inline constexpr std::uint32_t kFlagConstructing = 1u << 2;
 inline constexpr std::chrono::seconds kConstructionTimeout{30};
 
-// Event log flags: the node's event log stopped early, so the rest of its run
-// is not recorded. kFlagRecorderFailed mirrors LogWriter::failed() -- a disk
-// error, or capture abandoned because the writer fell behind or a record did
-// not fit -- and kFlagLogCapped mirrors capped(), the log reaching its byte
-// budget. Set while the node runs (NodeRegistration::set_recording) and never
-// cleared, because capture never resumes; a new claim starts without them.
+// Event log flags: what the node's event log lost. kFlagRecorderFailed
+// mirrors LogWriter::failed() -- the disk refused a write or the log file
+// could not be created, so the rest of the run is not recorded --
+// kFlagLogCapped mirrors capped(), the log reaching its byte budget, and
+// kFlagLogGap (below) mirrors gaps() > 0, records dropped and marked by a
+// GAP record while capture went on. Set while the node runs
+// (NodeRegistration::set_recording) and never cleared: each says what the
+// run's log lost, which stays lost; a new claim starts without them.
 inline constexpr std::uint32_t kFlagRecorderFailed = 1u << 3;
 inline constexpr std::uint32_t kFlagLogCapped = 1u << 4;
 
@@ -224,6 +231,16 @@ inline constexpr std::uint32_t kFlagOutputsHeld = 1u << 13;
 static_assert((kFlagOutputsHeld & kFlagRealtimeMask) == 0,
               "kFlagOutputsHeld must not share a bit with the realtime "
               "outcome");
+
+// The node's event log has a gap: records its writer could not take were
+// dropped, and capture resumed after a GAP record marking them (LogWriter
+// gaps() > 0). An event log flag (above): set by set_recording, never
+// cleared.
+inline constexpr std::uint32_t kFlagLogGap = 1u << 14;
+static_assert((kFlagLogGap & kFlagRealtimeMask) == 0,
+              "kFlagLogGap must not share a bit with the realtime outcome");
+static_assert((kFlagLogGap & kFlagOutputsHeld) == 0,
+              "kFlagLogGap must not share a bit with kFlagOutputsHeld");
 
 static_assert(process::kAllSteps < (1u << 5),
               "the refused steps must fit the five bits kFlagRealtimeMask "
@@ -939,12 +956,14 @@ class NodeRegistration {
     record_->wake_fallbacks.store(wake_fallbacks, std::memory_order_relaxed);
   }
 
-  // Sets kFlagRecorderFailed / kFlagLogCapped for an event log that failed or
-  // reached its cap; neither is ever cleared. Called inside a sample.
-  void set_recording(bool failed, bool capped) {
+  // Sets kFlagRecorderFailed / kFlagLogCapped / kFlagLogGap for an event log
+  // that failed, reached its cap or has a gap; none is ever cleared. Called
+  // inside a sample.
+  void set_recording(bool failed, bool capped, bool gap) {
     if (!owns_slot()) return;
-    const std::uint32_t flags =
-        (failed ? kFlagRecorderFailed : 0u) | (capped ? kFlagLogCapped : 0u);
+    const std::uint32_t flags = (failed ? kFlagRecorderFailed : 0u) |
+                                (capped ? kFlagLogCapped : 0u) |
+                                (gap ? kFlagLogGap : 0u);
     if (flags != 0) record_->flags.fetch_or(flags, std::memory_order_relaxed);
   }
 
@@ -1329,6 +1348,8 @@ struct NodeSnapshot {
   }
   // kFlagOutputsHeld: the devices flush is holding back outputs it set.
   bool outputs_held() const { return (flags & kFlagOutputsHeld) != 0; }
+  // kFlagLogGap: the node's event log dropped records and marked them.
+  bool log_gap() const { return (flags & kFlagLogGap) != 0; }
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};
   std::vector<SelectionSnapshot> selections;
