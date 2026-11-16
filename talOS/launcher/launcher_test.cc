@@ -3567,6 +3567,38 @@ TEST(LauncherSessions, ASubsystemNamedStudioBridgeNeverRunsTheBundledBridge) {
             options.binary_overrides[std::string{kStudioBridgeName}]);
 }
 
+// The launcher knows the hardware bridge by its roster name: the lint's `hw`
+// writer exemption, "always critical" and the bridge's log share all follow
+// it. A subsystem keyed `hardware_node` (non-critical, its own binary
+// claiming the bridge's name and `/hw/state`) would be a second member of that
+// name; it is refused before anything is probed or spawned, naming the key,
+// even with --sim --allow-graph-errors, which would override the lint's `hw`
+// writer error. REQ-SAFE-28, REQ-CONTRACT-09
+TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
+  auto options = SessionFixture("subsystem_hardware_node");
+  std::filesystem::remove_all(options.output_dir);
+  const std::string invoked = options.output_dir + "_invoked";
+  std::filesystem::remove(invoked);
+  std::ofstream{options.config_path} << kFixtureToml
+                                     << "\n[subsystems.hardware_node]\nnode = "
+                                        "\"//example/hardware_node:node\"\n"
+                                        "period_us = 5000\ncritical = false\n";
+  options.binary_overrides["//example/hardware_node:node"] = WriteStubNode(
+      "subsystem_hardware_node",
+      RecordingStub("hardware_node", "//example/hardware_node:node", invoked,
+                    {Sender("/hw/state")}));
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.allow_graph_errors = true;
+  ::testing::internal::CaptureStderr();
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  const std::string refused = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(refused.find("[subsystems.hardware_node]"), std::string::npos)
+      << refused;
+  EXPECT_EQ(ReadFile(invoked), "") << "the subsystem's binary was run";
+  std::filesystem::remove_all(options.output_dir);
+}
+
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   auto options = SessionFixture("killed_manifest");
   std::filesystem::remove_all(options.output_dir);
