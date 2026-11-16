@@ -17,7 +17,7 @@ tracked files it finds:
 A test source is a `*_test.cc`, `*_test.cpp`, `*_test.py` or `test_*.py`
 file (`*_test.cpp`: the RoboRIO program's GradleRIO tests). A node
 package is a directory whose BUILD declares a node (talos_cc_node,
-talos_py_node, talos_cc_shared_node) under 2026-robot, bench, examples or
+talos_py_node, talos_cc_shared_node) under bench, examples or
 tools/scaffold_testdata; a node package's tests are test sources. Comment
 lines are skipped.
 
@@ -35,7 +35,7 @@ import sys
 
 ALLOWLIST = "tools/lint_test_time_allowlist.txt"
 
-NODE_ROOTS = ("2026-robot/", "bench/", "examples/", "tools/scaffold_testdata/")
+NODE_ROOTS = ("bench/", "examples/", "tools/scaffold_testdata/")
 NODE_MACRO = re.compile(r"\b(talos_cc_node|talos_py_node|talos_cc_shared_node)"
                         r"\s*\(")
 SOURCE_SUFFIXES = (".cc", ".h", ".cpp", ".hpp", ".py")

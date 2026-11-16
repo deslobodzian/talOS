@@ -579,7 +579,8 @@ TEST(PhoenixBackendHealth, AnAsynchronousConfigureReportsEachBusSimulated) {
 }
 
 // A robot may put some devices on the RoboRIO's own bus and the rest on a
-// CANivore (TODO.md CAN-1's remedy for the 2026 robot's 107 % "rio" bus).
+// CANivore (the remedy for the 2026 robot's 107 % "rio" bus: CAN-1 in its
+// repository's TODO.md).
 // Phoenix refreshes the signals of one CAN network per RefreshAll: one call
 // over both returned InvalidNetwork and refreshed none, so every motor and
 // CAN sensor on both buses read invalid and the gateway saw total feedback

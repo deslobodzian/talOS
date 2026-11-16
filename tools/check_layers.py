@@ -25,9 +25,8 @@ ARCHITECTURE.md "Layers" and "Allowed dependencies"
   class;
 - outside node packages (under the same roots), only a testonly target
   links a node package's rule other than those and its node binaries: a
-  test of several nodes together, such as
-  //2026-robot/main_processor/integration, may link their libraries, and
-  nothing that ships can.
+  test of several nodes together may link their libraries, and nothing that
+  ships can.
 
 ALLOWLIST holds today's known exceptions, each with its reason and the
 TODO.md item that removes it. It may only shrink: an entry whose dependency
@@ -65,11 +64,10 @@ ON_THE_STACK = (
 HARDWARE = "talOS/hardware"
 
 # Robot code and what sits beside talOS; talOS never depends on them.
-OUTSIDE_TALOS = ("2026-robot", "bench", "controller_processor", "examples",
-                 "studio")
+OUTSIDE_TALOS = ("bench", "controller_processor", "examples", "studio")
 
 # Where robot, example and bench node packages live.
-NODE_ROOTS = ("2026-robot", "bench", "examples")
+NODE_ROOTS = ("bench", "examples")
 NODE_GENERATORS = ("talos_cc_node", "talos_py_node", "talos_cc_shared_node")
 
 # What talOS/python may depend on directly outside itself.

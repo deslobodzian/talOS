@@ -288,7 +288,7 @@ std::vector<AlertPrefixedField> AlertPrefixedFields(std::string_view bfbs,
 }  // namespace detail
 
 // The node name must match the target's package leaf
-// (`//2026-robot/main_processor/odometry:node`), its repository when at the
+// (`//bench/main_processor/motor:node`), its repository when at the
 // repository root (`@wrist//:node`), or its rule name
 // (`//talOS/bridge:hardware_node`), so a name in a viewer traces to source.
 inline std::optional<std::string> CheckNodeTarget(std::string_view name,
