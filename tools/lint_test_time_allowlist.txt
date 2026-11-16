@@ -18,7 +18,7 @@ studio/bridge/bandwidth_test.py clock 6 integration: bounds a fixed-length load 
 studio/bridge/client_timeout_test.py clock 8 integration: times a real bridge's idle-timeout close against its stated bound (main.cc kIdleTimeoutS)
 studio/bridge/integration_test.py clock 2 integration: divides a real bridge's own wake count by the run's duration (REQ-RT-21)
 studio/bridge/stop_test.py clock 3 integration: times a real bridge's stop against a quarter of the launcher's stop timeout (REQ-OPS-06, launcher.h kStopTimeout)
-talOS/bridge/hardware_node_test.cc clock 4 integration: the bridge over UDP loopback; a 20 s deadline bounds the child bridge's hang; a 200 ms receive deadline bounds the wait for a clock probe a Tick already sent (shorter than §6.3's 10 s)
+talOS/bridge/hardware_node_test.cc clock 4 integration: the bridge over UDP loopback; a 20 s deadline bounds the child bridge's hang, and kHangBound (10 s) the receive of a clock probe a Tick already sent and of the frame that ends the duty stream
 talOS/bridge/hardware_node_test.cc sleep 1 integration: the bridge as a child process; State frames are resent 5 ms apart until it answers or exits
 talOS/bridge/run_test.cc clock 8 integration: Run() on the real clock; measures registry-progress gaps (stall timeout), wakes per elapsed window (REQ-RT-20) and the host's 1 ms sleep overrun (§6.7)
 talOS/bridge/run_test.cc sleep 2 integration: samples the registry row 1 ms apart for its gaps, and StallMeter's 1 ms sleep is the host-qualification probe (§6.7)
