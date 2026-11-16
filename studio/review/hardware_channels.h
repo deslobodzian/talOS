@@ -16,7 +16,10 @@
 //   unit   from the member name's suffix (talOS/schema/unit_suffix.h)
 //
 // Strings (device names, the 64-bit ids, which are decimal strings, motor
-// modes, the gateway program) are not channels. A null is a non-finite
+// modes, the gateway program) are not channels, except a PWM request's mode:
+// it is the double channel `.../pwm_outputs/<id>/mode`, its wire value
+// (hardware::PwmMode: 0 off, no pulse; 1 a pulse), since off and a centre
+// pulse both have an output of 0. A null is a non-finite
 // number, and reads as NaN for a channel already known to be a number.
 // /hw/state/driver_station is not flattened here: its channels are the ones
 // live telemetry names (telemetry::DriverStationChannels).

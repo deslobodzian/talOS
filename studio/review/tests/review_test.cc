@@ -31,6 +31,7 @@
 #include "review_test/review_message_descriptor.h"
 #include "review_test/review_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "studio/review/hardware_channels.h"
 #include "studio/review/http.h"
 #include "studio/review/series_cache.h"
 #include "studio/review/testdata/fixture.h"
@@ -39,7 +40,11 @@
 #include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/hardware/messages.h"
+#include "talOS/hardware/packet.h"
+#include "talOS/launcher/hardware_record.h"
 #include "talOS/protocol/types.h"
+#include "talOS/telemetry/frames.h"
 
 namespace studio::review {
 namespace {
@@ -1253,6 +1258,39 @@ TEST(StaticFileTest, ServesOnlyFilesInsideTheRoot) {
   EXPECT_EQ(StaticFile(dir / "root", "/%2e%2e/secret.txt").status, 400);
   EXPECT_EQ(StaticFile({}, "/").status, 404);
   fs::remove_all(dir);
+}
+
+// Off (no pulse) and a centre pulse both have an output of 0; review reads
+// them apart by the request's mode channel, its wire value. Dropping the
+// mode, as the flattener did for every string, shows both as 0.
+// REQ-OPS-41, REQ-SAFE-03
+TEST(HardwareChannelsTest, PwmModeReadsOffApartFromACentrePulse) {
+  talos::hardware::Command command;
+  command.pwm_output_count = 2;
+  command.pwm_outputs[0] = {41, talos::hardware::PwmMode::kOff, 0.0};
+  command.pwm_outputs[1] = {42, talos::hardware::PwmMode::kPulse, 0.0};
+  talos::hardware::Packet packet{};
+  packet.size =
+      static_cast<std::uint32_t>(talos::hardware::Encode(command, packet.data));
+  ASSERT_GT(packet.size, 0u);
+  std::vector<HardwareSample> samples;
+  FlattenHardware(talos::hardware::kCommandTopic,
+                  talos::launcher::HardwareRecord::kCommand,
+                  std::as_bytes(std::span{&packet, 1}), samples);
+  std::map<std::string, double> values;
+  for (const HardwareSample& sample : samples) {
+    EXPECT_EQ(sample.kind, Talos::Telemetry::ChannelKind_Double) << sample.name;
+    values[sample.name] = talos::telemetry::DoubleFromRaw(sample.raw);
+  }
+  const std::map<std::string, double> expected{
+      {"hw/command/pwm_outputs/41/mode", 0.0},
+      {"hw/command/pwm_outputs/41/output", 0.0},
+      {"hw/command/pwm_outputs/42/mode", 1.0},
+      {"hw/command/pwm_outputs/42/output", 0.0}};
+  for (const auto& [name, value] : expected) {
+    ASSERT_TRUE(values.contains(name)) << name;
+    EXPECT_EQ(values[name], value) << name;
+  }
 }
 
 }  // namespace
