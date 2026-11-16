@@ -18,7 +18,7 @@ Each rule carries its status:
 | Goal | Means | Checked by |
 |---|---|---|
 | Robust | A node never moves a motor on a disabled robot, a stale target, missing feedback or a non-finite number; bad config fails at construction, before anything moves. | §5, §8, the [node test matrix](TESTING.md#7-the-node-test-matrix) |
-| Reliable | A node does the same thing on the robot, in `Sim` and in replay; a restart mid-match does nothing unsafe; one dead node stops only what it owns. | §9, the [node test matrix](TESTING.md#7-the-node-test-matrix) |
+| Reliable | A node does the same thing on the robot, in `Sim` and in replay; a restart mid-match does nothing unsafe; a dead node's own outputs go neutral at its owner timeout, and when the others keep driving is stated in [the tick](../ARCHITECTURE.md#the-tick). | §9, the [node test matrix](TESTING.md#7-the-node-test-matrix) |
 | Performant | `update()` is bounded, allocation-free and I/O-free; every control path has a known latency. | §10 |
 | Easy | Adding a subsystem means a node package, its TOML and one manifest line. Nothing else changes, in any language. | §12 |
 
