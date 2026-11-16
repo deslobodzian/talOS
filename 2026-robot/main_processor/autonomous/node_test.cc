@@ -169,7 +169,7 @@ class AutonomousPhaseTest
     : public AutonomousTest,
       public ::testing::WithParamInterface<autonomous::Phase> {};
 
-// REQ-SAFE-31
+// REQ-SAFE-33
 TEST_F(AutonomousTest, RestartIntoEnabledAutoIsInhibitedUntilRearmed) {
   // A fresh process cannot know whether a prior routine already fired.
   talos::testing::Sim restarted{Runfile("TALOS_TEST_CONFIG")};
@@ -1084,7 +1084,7 @@ class AutonomousRestartTest
     : public ::testing::WithParamInterface<autonomous::Phase>,
       public ::testing::Test {};
 
-// REQ-SAFE-31, REQ-SAFE-33
+// REQ-SAFE-33
 TEST_P(AutonomousRestartTest, RestartInSameMatchResumesWithoutRefiring) {
   const bool drive = GetParam() == autonomous::Phase::DRIVE;
   const auto output = OutputDir(drive ? "restart-drive" : "restart-feed");
