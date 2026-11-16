@@ -29,14 +29,19 @@ frozen producer: `teleop` is `SIGSTOP`ped, `swerve_module` `SIGKILL`ed, and
 `SIGSTOP`s one for 300 ms (`teleop`, `swerve_module`, `motor`, `telemetry`,
 `hardware_node`, Studio bridge), in an order shuffled by `TALOS_SOAK_SEED`
 (default 0); 36 s covers every kind once. From the recording it checks, over
-the whole run:
+the whole run, reading each owner's runs from their own event logs (restart
+`k` writes `<name>.restart<k>.tlog`), so a request is judged by the inputs
+and crash of the process that sent it and never by when the harness read
+its clock:
 
 - each actuator owner's request gaps stay within its bridge owner timeout
   except across a fault on that node, and a killed owner sends again within
   5 s;
-- no request actuates under a disabled Driver Station view, and no
-  `swerve_module` request actuates without a received active teleop target
-  published after its latest crash and younger than `command_timeout_us`;
+- no request actuates while the newest Driver Station view its process
+  received is disabled, or before that process received one, and no
+  `swerve_module` request actuates without an active teleop target received
+  by the same process, published after that process's crash and younger
+  than `command_timeout_us`;
 - across a stalled `teleop`, every `swerve_module` request is neutral from
   `command_timeout_us` after the newest active target it received (across a
   stalled `hardware_node`, the newest `/hw/state`), not after the `SIGSTOP`,
@@ -45,15 +50,16 @@ the whole run:
   within its owner timeout plus a period of its last request;
 - `swerve_module`, restarted under the frozen producer, sends more than five
   requests before `teleop` resumes, all neutral from the first and at most
-  30 ms apart. The restart is faster than `command_timeout_us`, so the lane's
-  newest target is still young enough for `Target::get` at the first
-  request; the requests are neutral because a subscription delivers only what
-  is published after it attached
-  ([ARCHITECTURE.md](../../../ARCHITECTURE.md#targets)): the restarted
-  owner's first requests also precede its first Driver Station packet, but
-  from that packet (one 20 ms packet period on, at most, plus a tick) until
-  the target expires, that rule alone keeps them neutral. The run prints the restart latency and that
-  target's age;
+  30 ms apart. It asserts the regime that makes this evidence: the lane's
+  newest target, the frozen producer's last and an active one, is at most
+  `command_timeout_us` less four of the owner's 5 ms periods old at the
+  restarted process's first request with an enabled Driver Station view, so
+  `Target::get` would still accept it by its age for at least those four
+  ticks. The requests are then neutral only because a subscription delivers
+  only what is published after it attached
+  ([ARCHITECTURE.md](../../../ARCHITECTURE.md#targets)). A restart too slow
+  for that regime fails the run as no evidence, naming the restart latency
+  and the target's age, which a passing run prints;
 - the launcher exits 0, nothing is quarantined, and each node's
   `restart_count` equals the number of times it was killed.
 
