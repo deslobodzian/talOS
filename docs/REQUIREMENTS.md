@@ -258,6 +258,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-29 | A build that uses talOS as a dependency compiles talOS's patched toml++; the consuming repository carries no override or patch file for it. | P1 | `MODULE.bazel`; TODO REPO-1 | the dependent repository's `MODULE.bazel`; `@talos//talOS/configuration:config_fuzz_test` built there | integration |
 | REQ-DEV-30 | A robot repository that names talOS only through `@talos//` labels and pins it with `local_path_override` passes its own `bazel test //...` (its graph test and node tests), builds its bundle, and runs `bazel run //:sim` for a bounded time with exit 0, every member of the session having run and exited 0. | P1 | ARCH "Where a new thing goes" | fixture test results; session manifest | integration |
 | REQ-DEV-31 | `//talOS/simulation:sim_gateway` stands in for the RoboRIO for any robot config. Its devices come only from the config's hardware. It listens on `[robot] controller_port` and sends to `[robot] local_port`, or the ports the launcher was given (`--remote-port`/`--local-port`), with no port argument written by hand. | P1 | ARCH "Two processors" | ports used; State received | component |
+| REQ-DEV-32 | Before a push, a talOS change can be checked against a robot repository that consumes it: `tools/check_robot_repository.sh <path>` builds and tests a copy of that repository's committed tree with `@talos` overridden to the checkout, never writing to `<path>`, exits non-zero naming the failing targets, and `tools/prepush.sh` runs it when `TALOS_ROBOT_REPOSITORY` names a directory and reports the step skipped otherwise. | P2 | `docs/DEVELOPMENT.md` §5; TEST §9 | verdict line; exit status; the source repository's `git status` | unit + manual |
 
 ## Package scope
 
@@ -301,5 +302,5 @@ serves none is listed as such with the TODO.md item that settles it
 | `controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29, REQ-RT-24 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-36, REQ-OPS-41, REQ-OPS-42, REQ-OPS-49, REQ-OPS-51 |
 | `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
-| `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23, REQ-DEV-25, REQ-DEV-30, REQ-OPS-47, REQ-OPS-50 |
+| `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23, REQ-DEV-25, REQ-DEV-30, REQ-DEV-32, REQ-OPS-47, REQ-OPS-50 |
 
