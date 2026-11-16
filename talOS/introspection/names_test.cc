@@ -665,6 +665,33 @@ TEST(LintGraph, DevelopmentGapsAreWarningsNotErrors) {
   }
 }
 
+// A topic no node reads warns; one an observer records (telemetry) is read,
+// so it is no finding: a mechanism's state published for display is a
+// design, not a dead end, and a warning on every such topic of a robot reads
+// as a fault.
+TEST(LintGraph, AnUnreadTopicWarnsUnlessAnObserverRecordsIt) {
+  const NodeShape motor{
+      "motor", "//robot/motor:node", {Sender("/motor/state")}};
+  for (const auto& [name, nodes, warned] :
+       std::vector<std::tuple<const char*, std::vector<NodeShape>, bool>>{
+           {"no reader", {motor}, true},
+           {"an observer only",
+            {motor,
+             {"telemetry",
+              "//talOS/telemetry:node",
+              {Watcher("/motor/state", 32, kSourceFlagObserver),
+               Sender("/talos/telemetry", 32, kSourceFlagExternal)}}},
+            false},
+       }) {
+    SCOPED_TRACE(name);
+    const auto diagnostics = LintGraph(nodes);
+    EXPECT_EQ(Find(diagnostics, Severity::WARNING, "/motor/state") != nullptr,
+              warned)
+        << Describe(diagnostics);
+    EXPECT_EQ(diagnostics.size(), warned ? 1u : 0u) << Describe(diagnostics);
+  }
+}
+
 // REQ-CONTRACT-33: from the writer's schema, an `alert_` field that is not a
 // bool or not of a known level is an error naming the field (nested structs
 // included), and a well-formed alert outside a `status` topic is a warning.

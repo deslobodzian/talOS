@@ -66,8 +66,9 @@ outputs drive with no live target; REQ-SAFE-42). Independently
 of the lint, which `--allow-graph-errors` overrides (accepted only with
 `--sim`; [launcher](launcher/README.md#two-phases)), a node's `publish` and
 `publish_bytes` (C++, or Python through `talOS/node_api`) refuse any topic
-under `/hw/request`, remapped or not, at construction. A topic nobody reads, a
-policy lane nobody writes yet, a topic whose owner is not a node in the
+under `/hw/request`, remapped or not, at construction. A topic nobody reads
+(telemetry's recording counts as a read, so a topic published for display
+is no finding), a policy lane nobody writes yet, a topic whose owner is not a node in the
 session, a node whose hardware request carries `untargeted_outputs` without
 that coverage, or a node that writes its hardware request but reads no target
 lane of its own and has not opted out (its outputs never drive; REQ-SAFE-41), is a
