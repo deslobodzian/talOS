@@ -394,7 +394,10 @@ the line a node's does:
 Where a node would be quarantined, the bridge is left for the rest of the
 session instead: one line names it and says it will not be restarted again,
 its manifest entry is marked `recorder_failed`, and the session runs on
-without Studio. A bridge that fails at once on every run therefore costs at
+without Studio. The bound counts starts inside the rolling restart window,
+not over the session: a bridge that dies fewer than `max_restarts` times
+per window is restarted every time, for the whole session. A bridge that
+fails at once on every run therefore costs at
 most `max_restarts` + 1 spawns, 6 by default, all within about 1.6 s of the
 first (50 + 100 + 200 + 400 + 800 ms of backoff), then none: no busy loop
 and no fork storm, and since it takes no registry row, no registry churn.
@@ -407,7 +410,9 @@ restart do not hold the session open, and a run not yet up when the session
 ends is SIGKILLed once the other members have ended. A bridge none of whose
 runs came up is marked failed when the session ends on its deadline or its
 roster's completion. Its restarts are in its manifest entry
-(`restart_count`, `retry_at_monotonic_ns` while one is pending, and each
+(`restart_count`, which counts every restart attempt, one whose spawn
+failed included, as its restart lines number them;
+`retry_at_monotonic_ns` while one is pending; and each
 run's `runs[]` entry with the reason it ended), and so in
 [`session_report`](#session-measurements)'s node and run tables and Studio's
 session panel; how it ended (a kill, a crash, its exit code) is never in
@@ -417,9 +422,13 @@ died still exits 0.
 A restart binds the same `[studio] http_port`. The bridge's listener sets
 `SO_REUSEADDR` (and `SO_REUSEPORT` where the OS has it), and the launcher
 kills a dead run's process group before it schedules the restart, so the
-port is free again for the restart; a port another program holds makes
-every run fail its listen and exit, which the bound above ends, with the
-reason in `studio_bridge.log`. The launcher sees the bridge only through its
+port is free again for the restart. A program that holds the port without
+`SO_REUSEPORT` makes every run fail its listen and exit, which the bound
+above ends, with the reason in `studio_bridge.log`. One of the same user
+that also sets `SO_REUSEPORT`, such as another launcher's bridge on the
+same port (a developer's `./sim.sh` on the robot computer), does not: both
+listen, and new connections go to either, so a dashboard may show the
+other session. The launcher sees the bridge only through its
 exits: it takes no registry row, so a bridge that hangs without exiting is
 not detected or restarted.
 

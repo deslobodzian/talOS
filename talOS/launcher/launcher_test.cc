@@ -520,6 +520,10 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
 
 // The duration deadline starts with the session, not after the viewer: a
 // failing bridge plus long-lived nodes must still end near --duration-s.
+// A bridge none of whose runs came up by then never served Studio, and its
+// manifest entry says so (recorder_failed), though its restarts were not
+// yet used up: 50 + 100 + 200 + 400 ms of backoff, the fifth 800 ms later,
+// past the 1 s deadline. REQ-OPS-30
 TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   const std::string tag = "bridge_deadline";
   const std::string out_dir = TempPath(tag + "_out");
@@ -553,8 +557,14 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
             20)
       << "deadline must fire without waiting out the bridge window";
-  EXPECT_TRUE(std::filesystem::exists(
-      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json"));
+  const std::string manifest = ReadFile(
+      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json");
+  const std::size_t bridge = manifest.find("\"name\": \"studio_bridge\"");
+  ASSERT_NE(bridge, std::string::npos) << manifest;
+  const std::string entry =
+      manifest.substr(bridge, manifest.find("\"runs\": [", bridge) - bridge);
+  EXPECT_NE(entry.find("\"recorder_failed\": true"), std::string::npos)
+      << "a bridge that never came up is not marked failed: " << entry;
 
   std::filesystem::remove_all(out_dir);
 }
