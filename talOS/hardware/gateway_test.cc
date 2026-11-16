@@ -4155,5 +4155,77 @@ TEST(Endpoint, AppliesOnlyTheNewestQueuedCommand) {
   EXPECT_EQ(gateway.snapshot().counters.rejected_command_count, 0u);
 }
 
+// The RoboRIO's latency line ages each drained command's observation on the
+// RoboRIO's own clock, accepted and refused apart, so the endpoint reports
+// the newest command a Tick decoded, what it observed and whether the gateway
+// took it; a Tick that decoded none reports none.
+// REQ-RT-25
+TEST(Endpoint, ReportsTheNewestDrainedCommandAndWhetherItWasAccepted) {
+  SimBackend backend;
+  Gateway gateway{backend, 3013};
+  ASSERT_TRUE(gateway.Reconfigure(SwerveConfig(true)));
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  ASSERT_EQ(endpoint.Tick(5000, true), protocol::UdpStatus::kOk);
+  EXPECT_FALSE(endpoint.drained().present);
+  auto command = Request(gateway);
+  ASSERT_EQ(command.observed_time_us, 5000u);
+  const auto send = [&](uint64_t observed_time_us) {
+    command.observed_time_us = observed_time_us;
+    std::array<uint8_t, kMaxCommandSize> bytes{};
+    const auto size = Encode(command, bytes);
+    ASSERT_GT(size, 0u);
+    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand,
+                                  protocol::kFlagNone, observed_time_us,
+                                  bytes.data(), size),
+              protocol::UdpStatus::kOk);
+  };
+  // Ticks at `now_us` until a Tick decodes a command.
+  const auto drain = [&](uint64_t now_us, bool enabled) {
+    return Eventually([&] {
+      EXPECT_EQ(endpoint.Tick(now_us, enabled), protocol::UdpStatus::kOk);
+      return endpoint.drained().present;
+    });
+  };
+
+  // Observed at 5000, drained by the tick at 10000 and taken.
+  send(5000);
+  ASSERT_TRUE(drain(10000, true));
+  EXPECT_TRUE(endpoint.drained().accepted);
+  EXPECT_EQ(endpoint.drained().observed_time_us, 5000u);
+  EXPECT_EQ(gateway.snapshot().last_command_sequence, 1u);
+  // Nothing sent, nothing decoded.
+  ASSERT_EQ(endpoint.Tick(15000, true), protocol::UdpStatus::kOk);
+  EXPECT_FALSE(endpoint.drained().present);
+
+  // Disabled, the gateway refuses it; the endpoint still reports it.
+  send(15000);
+  ASSERT_TRUE(drain(20000, false));
+  EXPECT_FALSE(endpoint.drained().accepted);
+  EXPECT_EQ(endpoint.drained().observed_time_us, 15000u);
+
+  // Of a backlog drained by one tick, the newest is reported. Each command's
+  // observation is 30000 plus its sequence, so the report names the command.
+  ASSERT_EQ(endpoint.Tick(40000, true), protocol::UdpStatus::kOk);
+  command = Request(gateway);
+  const auto send_backlog = [&] {
+    for (int i = 0; i < 5; ++i) send(30000 + companion.next_send_sequence());
+  };
+  send_backlog();
+  ASSERT_TRUE(Eventually([&] {
+    const auto sequence_before = gateway.snapshot().last_command_sequence;
+    EXPECT_EQ(endpoint.Tick(40000, true), protocol::UdpStatus::kOk);
+    const auto sequence = gateway.snapshot().last_command_sequence;
+    if (endpoint.drained().present) {
+      EXPECT_TRUE(endpoint.drained().accepted) << "sequence " << sequence;
+      EXPECT_EQ(endpoint.drained().observed_time_us, 30000 + sequence);
+    }
+    if (sequence - sequence_before >= 2) return true;
+    if (sequence == companion.next_send_sequence() - 1) send_backlog();
+    return HasFailure();
+  }));
+}
+
 }  // namespace
 }  // namespace talos::hardware

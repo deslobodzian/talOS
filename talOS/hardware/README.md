@@ -347,7 +347,10 @@ buffer are both sized from that constant.
 Each `Endpoint::Tick` drains a bounded batch of frames and hands the gateway
 only the highest-sequence command among them: superseded commands queued while
 the RoboRIO loop stalled are skipped, not applied back-to-back on the CAN bus,
-and are not counted as rejected.
+and are not counted as rejected. `Endpoint::drained()` reports that command
+(its `observed_time_us` and whether `Gateway::Accept` took it), or none when
+the Tick decoded no command; the RoboRIO program ages it for its
+[latency line](#roborio).
 
 The gateway publishes its configuration ID, boot ID, control epoch, monotonic
 poll timestamp, last accepted command sequence, the echo of the last clock
