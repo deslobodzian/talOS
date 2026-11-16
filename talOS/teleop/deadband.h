@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <cmath>
 
 namespace talos::teleop {
@@ -14,17 +13,13 @@ inline double Deadband(double value, double deadband_frac) {
                        value);
 }
 
-// The least band, as a fraction of full stick, an axis counts as neutral in
-// for arming a talos::OperatorArming: a real stick rests a few counts off
-// zero, so an axis mapped without a deadband would otherwise never arm.
-inline constexpr double kArmingNeutralFloorFrac = 0.05;
-
-// Whether an axis reading is neutral for arming: finite and inside the wider
-// of its deadband and kArmingNeutralFloorFrac. The output mapping (Deadband)
-// still uses the deadband alone.
+// Whether an axis reading is neutral for arming a talos::OperatorArming:
+// finite and inside its deadband, the band Deadband maps to zero, so the
+// reading that arms commands nothing. Config load refuses a teleop deadband
+// below config::kTeleopMinDeadbandFrac, wide enough for a real stick resting
+// a few counts off zero.
 inline bool ArmingNeutral(double value, double deadband_frac) {
-  return std::isfinite(value) &&
-         std::abs(value) <= std::max(deadband_frac, kArmingNeutralFloorFrac);
+  return std::isfinite(value) && std::abs(value) <= deadband_frac;
 }
 
 }  // namespace talos::teleop

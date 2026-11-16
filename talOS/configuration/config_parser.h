@@ -77,6 +77,13 @@ struct TargetPolicy {
 };
 using TeleopValue = std::variant<bool, int64_t, double, std::string>;
 
+// The narrowest teleop axis deadband config load accepts, and the default of
+// a binding that states none, as a fraction of full stick. A binding's one
+// deadband is both its output dead zone and the band it must return to
+// before teleop arms (talOS/teleop/deadband.h): a real stick rests a few
+// counts off zero, so a narrower band could keep teleop from ever arming.
+inline constexpr double kTeleopMinDeadbandFrac = 0.05;
+
 struct TeleopBinding {
   int port{0};
   std::optional<int> button;
@@ -87,7 +94,7 @@ struct TeleopBinding {
   std::vector<std::pair<std::string, TeleopValue>> while_held;
   std::string field;
   double scale{1.0};
-  double deadband_frac{0.0};
+  double deadband_frac{kTeleopMinDeadbandFrac};
 
   bool operator==(const TeleopBinding&) const = default;
 };
@@ -1031,9 +1038,15 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
         const double d = df.as_floating_point()
                              ? df.as_floating_point()->get()
                              : static_cast<double>(df.as_integer()->get());
-        if (d < 0.0 || d >= 1.0) {
-          throw std::invalid_argument(entry_where +
-                                      ".deadband_frac must be in [0, 1)");
+        // Negated, so NaN is refused too.
+        if (!(d >= kTeleopMinDeadbandFrac && d < 1.0)) {
+          std::ostringstream message;
+          message << entry_where << ".deadband_frac = " << d << " must be in ["
+                  << kTeleopMinDeadbandFrac
+                  << ", 1): the axis counts as neutral for arming only "
+                     "inside its deadband, which is at least "
+                  << kTeleopMinDeadbandFrac << " of full stick";
+          throw std::invalid_argument(message.str());
         }
         b.deadband_frac = d;
       }
