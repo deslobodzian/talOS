@@ -1,0 +1,40 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "metrics",
+    hdrs = ["metrics.h"],
+    deps = ["@eigen3//:eigen"],
+)
+
+# Hand-run evaluation of detection and tracking on a recording; README.md.
+cc_binary(
+    name = "recording_eval",
+    srcs = ["recording_eval.cc"],
+    deps = [
+        ":metrics",
+        "//talOS/geometry",
+        "//talOS/vision:calibration",
+        "//talOS/vision:localization",
+        "//talOS/vision:pipeline",
+        "//talOS/vision/field_sim",
+        "//talOS/vision/playback",
+        "@opencv//:calib3d",
+        "@opencv//:core",
+        "@opencv//:imgproc",
+    ],
+)
+
+cc_test(
+    name = "metrics_test",
+    size = "small",
+    srcs = ["metrics_test.cc"],
+    deps = [
+        ":metrics",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)

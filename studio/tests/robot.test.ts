@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
 import type {Snapshot} from '../src/core';
-import {driverStationMode, robotStatus} from '../src/data/robot';
+import {
+  canBusReading,
+  canBusUnread,
+  driverStationMode,
+  robotStatus
+} from '../src/data/robot';
 import type {SystemGraph, SystemNode} from '../src/system';
 import type {SystemState} from '../src/data/types';
 
@@ -21,7 +26,7 @@ function snap(channels: Record<string, number>, labels: Record<string, string[]>
 
 const DS = 'hw/state/driver_station/';
 const noSystem: SystemState =
-    {graph: null, rates: {}, error: '', declared: null, declaredError: ''};
+    {graph: null, stale: true, rates: {}, error: '', declared: null, declaredError: ''};
 
 function node(name: string, alive: boolean): SystemNode {
   return {
@@ -62,9 +67,13 @@ test('mode precedence: estop > disconnected > disabled > mode', () => {
   })), 'autonomous');
 });
 
-test('mode null when DS channels absent', () => {
-  assert.equal(driverStationMode(null), null);
-  assert.equal(driverStationMode(snap({'hw/status/battery_v': 12.3})), null);
+test('a mode flag without the enabled flag is unknown, not an enabled mode', () => {
+  for (const mode of ['autonomous', 'teleop', 'test'])
+    assert.equal(driverStationMode(snap({[DS + 'connected']: 1, [DS + mode]: 1})), null);
+  // E-stop and a lost link are facts without it.
+  assert.equal(driverStationMode(snap({[DS + 'estop']: 1, [DS + 'teleop']: 1})), 'estop');
+  assert.equal(driverStationMode(snap({[DS + 'connected']: 0, [DS + 'teleop']: 1})),
+               'disconnected');
 });
 
 test('robotStatus nulls when channels absent', () => {
@@ -76,7 +85,7 @@ test('robotStatus nulls when channels absent', () => {
   assert.equal(status.ds.alliance, null);
   assert.equal(status.power.battery_v, 12.3);
   assert.equal(status.power.brownout, null);
-  assert.equal(status.power.can_frac, null);
+  assert.deepEqual(status.power.canBuses, []);
   assert.equal(status.power.healthValid, null);
   assert.equal(status.link.stateAge_us, null);
   assert.equal(status.link.configured, null);
@@ -86,49 +95,41 @@ test('robotStatus nulls when channels absent', () => {
   assert.equal(status.nodes, null);
 });
 
-test('robotStatus reads DS, power, link, estimator and nodes', () => {
-  const status = robotStatus(snap({
-    [DS + 'connected']: 1,
-    [DS + 'enabled']: 1,
-    [DS + 'teleop']: 1,
-    [DS + 'fms_attached']: 1,
-    [DS + 'match_time_s']: 45.5,
-    [DS + 'alliance']: 1,
-    'hw/status/battery_v': 12.1,
-    'hw/status/brownout': 0,
-    'hw/status/can_utilization_frac': 0.3,
-    'hw/status/health_valid': 1,
-    'hw/status/state_age_us': 500,
-    'hw/status/configured': 1,
-    'hw/status/motor_fault_mask': 3,
-    'hw/status/timed_out_mask': 0,
-    'pose_estimator/state/valid': 1,
-    'pose_estimator/state/observation_accepted_count': 42,
-    'pose_estimator/state/observation_rejected_count': 3
-  }, {[DS + 'alliance']: ['red', 'blue']}), {
+test('live nodes are counted only from a fresh graph', () => {
+  const nodes = (stale: boolean) => robotStatus(snap({}), {
     graph: graph([node('a', true), node('b', false)]),
-    rates: {}, error: '', declared: null, declaredError: ''
-  });
-
-  assert.equal(status.ds.mode, 'teleop');
-  assert.equal(status.ds.enabled, true);
-  assert.equal(status.ds.matchTime_s, 45.5);
-  assert.equal(status.ds.fms, true);
-  assert.equal(status.ds.alliance, 'blue');
-  assert.equal(status.power.battery_v, 12.1);
-  assert.equal(status.power.brownout, false);
-  assert.equal(status.power.can_frac, 0.3);
-  assert.equal(status.power.healthValid, true);
-  assert.equal(status.link.stateAge_us, 500);
-  assert.equal(status.link.configured, true);
-  assert.equal(status.link.faultMask, 3);
-  assert.equal(status.link.timedOutMask, 0);
-  assert.deepEqual(status.estimator, {valid: true, accepted: 42, rejected: 3});
-  assert.deepEqual(status.nodes, {alive: 1, total: 2});
+    stale, rates: {}, error: '', declared: null, declaredError: ''
+  }).nodes;
+  assert.deepEqual(nodes(false), {alive: 1, total: 2});
+  assert.deepEqual(nodes(true), {alive: null, total: 2});
 });
 
-test('alliance is null when the enum value is out of range', () => {
-  const status = robotStatus(snap({[DS + 'alliance']: 5},
-                                  {[DS + 'alliance']: ['red', 'blue']}), noSystem);
-  assert.equal(status.ds.alliance, null);
+test('alliance is read through its enum labels; out of range is null', () => {
+  const alliance = (value: number) => robotStatus(
+      snap({[DS + 'alliance']: value}, {[DS + 'alliance']: ['red', 'blue']}),
+      noSystem).ds.alliance;
+  assert.equal(alliance(1), 'blue');
+  assert.equal(alliance(5), null);
+});
+
+// REQ-OPS-20: /hw/status lists one slot per configured CAN bus, "rio" first;
+// a bus reads as a percentage only while its last read is current, so a
+// failed or stale one (whose figure is its last good read's) never passes
+// for an idle bus.
+test('CAN buses read their utilization only while their last read is current', () => {
+  const B = 'hw/status/can_buses/';
+  const status = robotStatus(snap({
+    'hw/status/can_bus_count': 3,
+    [B + '0/read_state']: 1, [B + '0/utilization_frac']: 0.04,
+    [B + '1/read_state']: 3, [B + '1/utilization_frac']: 0,
+    [B + '1/read_failure_count']: 12,
+    [B + '2/read_state']: 4, [B + '2/utilization_frac']: 0.16,
+    [B + '3/read_state']: 1, [B + '3/utilization_frac']: 0.5
+  }), noSystem);
+  const buses = status.power.canBuses;
+  assert.deepEqual(buses.map(b => b.label), ['rio', 'CAN bus 1', 'CAN bus 2']);
+  assert.deepEqual(buses.map(b => b.state), ['ok', 'failed', 'stale']);
+  assert.deepEqual(buses.map(canBusReading), ['4%', 'failed', 'stale']);
+  assert.deepEqual(buses.map(canBusUnread), [false, true, true]);
+  assert.equal(buses[1].readFailures, 12);
 });

@@ -1,29 +1,62 @@
 /// <reference lib="webworker" />
 import {handleRpc} from '../agent/rpc';
 
-import {Coordinator, JitterBuffer, TelemetryDecoder, Timeline, type Snapshot} from './core';
+import {concatPages} from './encode';
+import {checkExportFormat, Coordinator, type Dictionary, dictionaryKey, exportPages, TelemetryDecoder, Timeline, type Snapshot} from './core';
+import {graphStale} from './data/freshness';
 import {MAX_MANIFEST_BYTES, manifestUrl, parseManifest, type SessionManifest} from './data/manifest';
 import {type Connection, type PlaybackState} from './data/types';
+import {WorkerUpdateStream} from './data/worker-stream';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
-import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, parseSystemGraph, RateWindow, type SystemGraph} from './system';
+import {type HistoryHooks, TelemetryHistory} from './history';
+import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, RateWindow, type SystemGraph, SystemGraphStream} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
-let coordinator = new Coordinator(), jitter = new JitterBuffer(10);
+const updates = new WorkerUpdateStream(message => ctx.postMessage(message));
+// When the newest timeline sample arrived, the anchor for live session time.
+// Null when its age is unknown: then no live reading is current.
+let sampleArrival: number|null = null;
+// Stream and sequence ids of snapshots whose age is unknown: the keyframe the
+// bridge sends on every open carries the latest tick it holds -- possibly from
+// long before this connection, if telemetry has stopped -- so its arrival time
+// says nothing about its values' age.
+const unknownAge = new Set<string>();
+const ageKey = (f: Snapshot) => `${f.stream_id}:${f.sequence_id}`;
+let firstUpdate = false;
+// Frames appended to the timeline since the previous `frames` post, in order.
+// `needsReset` is set whenever the timeline is replaced (connect, demo, a new
+// launcher session, import) so the next post carries `reset: true`.
+let pendingFrames: Snapshot[] = [];
+let needsReset = false;
+const historyHooks: HistoryHooks = {
+  // An arrival of 0 is Timeline's "no known arrival", so the Agent tab's
+  // get_latest reports the join keyframe's age as null too.
+  arrival: f => unknownAge.delete(ageKey(f)) ? 0 : Date.now(),
+  appended(f, arrivalMs) {
+    pendingFrames.push(f);
+    sampleArrival = arrivalMs === 0 ? null : performance.now();
+  },
+  replaced(kept) {
+    coordinator = new Coordinator(history.timeline);
+    pendingFrames = kept.slice();
+    needsReset = true;
+    // The render cache's events and manifest baseline go with its history.
+    // Posted now, the manifest follows the reset frames: a batch carries its
+    // frames before its other messages (WorkerUpdateStream.flush).
+    if (manifest) postManifest();
+  }
+};
+// The retained timeline, its jitter buffer and dictionaries, shared with the
+// headless agent (history.ts); `coordinator` plays its timeline.
+let history = new TelemetryHistory(historyHooks);
+let coordinator = new Coordinator(history.timeline);
 let decoder = new TelemetryDecoder();
-let streamId: string|null = null;
 let socket: WebSocket|null = null, demo = false, sequence = 0n,
             status = 'Disconnected';
-let packets = new Map<string, Uint8Array>(),
-    pendingBytes = new Map<string, Uint8Array>();
 let nextDemo = 0, lastTick = performance.now();
 let retry: ReturnType<typeof setTimeout>|undefined;
 let generation = 0;
 let connection: Connection = 'idle';
-// Frames appended to the timeline since the previous `frames` post, in order.
-// `needsReset` is set whenever the timeline is replaced (connect, demo, a new
-// stream_id, import) so the next post carries `reset: true`.
-let pendingFrames: Snapshot[] = [];
-let needsReset = false;
 let lastPlayback: PlaybackState|null = null;
 let lastPlaybackPost = 0;
 
@@ -36,6 +69,19 @@ let system: SystemGraph|null = null, previousSystem: SystemGraph|null = null;
 const rateWindow = new RateWindow();
 let systemError = '';
 let nextDemoSystem = 0;
+// The graph as the bridge's whole documents and updates build it, and the
+// monotonic receipt time of its last message (a graph, an update, or a notice
+// that one is deferred by the radio budget). The graph carries the
+// registry's wall clock, which is not this machine's, so its age is measured
+// from local arrival.
+const graphStream = new SystemGraphStream();
+let systemArrival: number|null = null;
+let postedSystemStale = true;
+// A held graph is only current while the source that sent it is.
+const graphConnected = () => connection === 'live' || connection === 'demo';
+function systemStale(now: number) {
+  return graphStale(systemArrival, now, graphConnected());
+}
 
 // The declared graph, fetched over HTTP rather than pushed: the launcher writes
 // it once before it spawns anything, so it does not change while a session
@@ -53,16 +99,19 @@ let nextManifestPoll = 0;
 let manifestBase: string|null = null;
 let lastManifestRaw: string|null = null;
 
-// Posted only when the graph changes, not on every telemetry tick: it is a few
-// tens of kilobytes and structure changes at 4 Hz, not at the 100 Hz frame rate.
+// Posted only when the graph changes or goes stale/fresh, not on every
+// telemetry tick: it is a few tens of kilobytes and structure changes at 4 Hz,
+// not at the 100 Hz frame rate.
 function postSystem() {
   const rates: Record<string, number> = {};
   for (const [key, value] of rateWindow.rates()) {
     rates[key] = value;
   }
-  ctx.postMessage({
+  postedSystemStale = systemStale(performance.now());
+  updates.push({
     type: 'system',
     graph: system,
+    stale: postedSystemStale,
     rates,
     error: systemError,
     declared,
@@ -73,7 +122,7 @@ function postSystem() {
 // The session manifest, posted on change: it is re-read at 1 Hz, but re-posting
 // an unchanged document would re-render the Session panel for nothing.
 function postManifest() {
-  ctx.postMessage({type: 'manifest', manifest, error: manifestError});
+  updates.push({type: 'manifest', manifest, error: manifestError});
 }
 
 // Every frame appended to the timeline since the previous post, in order,
@@ -83,7 +132,7 @@ function postFrames() {
   if (!needsReset && pendingFrames.length === 0) return;
   while (needsReset || pendingFrames.length > 0) {
     const chunk = pendingFrames.splice(0, 2000);
-    ctx.postMessage({type: 'frames', reset: needsReset, frames: chunk});
+    updates.push({type: 'frames', reset: needsReset, frames: chunk});
     needsReset = false;
     if (pendingFrames.length === 0) break;
   }
@@ -97,8 +146,13 @@ function postPlayback(now: number) {
   const state: PlaybackState = {
     mode: coordinator.mode,
     cursor_ns: snapshot?.timestamp_ns ?? null,
+    clock_ns: snapshot ? (coordinator.mode === 'LIVE_STREAMING' ?
+        (sampleArrival === null ? null :
+             (BigInt(snapshot.timestamp_ns) +
+              BigInt(Math.round((now - sampleArrival) * 1e6))).toString()) :
+        coordinator.cursor.toString()) : null,
     bounds: coordinator.timeline.bounds(),
-    stats: {...jitter.stats},
+    stats: {...history.jitter.stats},
     status,
     connection
   };
@@ -106,7 +160,7 @@ function postPlayback(now: number) {
       lastPlayback.status !== state.status ||
       lastPlayback.connection !== state.connection;
   if (discrete || now - lastPlaybackPost >= 1000 / 30) {
-    ctx.postMessage({type: 'playback', state});
+    updates.push({type: 'playback', state});
     lastPlayback = state;
     lastPlaybackPost = now;
   }
@@ -203,10 +257,15 @@ async function fetchManifest(url: string, gen: number) {
     return;
   }
   if (gen !== generation) return;
-  if (text === lastManifestRaw) return;  // unchanged since the last read
-  lastManifestRaw = text;
+  const previousError = manifestError;
+  manifestError = '';
+  if (text === lastManifestRaw) {
+    if (previousError) postManifest();
+    return;
+  }
   try {
     manifest = parseManifest(text);
+    lastManifestRaw = text;
     manifestError = '';
   } catch (e) {
     manifestError = String(e);
@@ -216,44 +275,38 @@ async function fetchManifest(url: string, gen: number) {
 
 function ingestSystem(text: string) {
   try {
-    const graph = parseSystemGraph(text);
-    previousSystem = system;
-    system = graph;
-    rateWindow.push(graph);
+    const graph = graphStream.ingest(text, performance.now());
+    if (graph) {
+      previousSystem = system;
+      system = graph;
+      rateWindow.push(graph);
+    }
     systemError = '';
+    systemArrival = graphStream.arrival;
+    if (graph) history.observe(graph);
   } catch (e) {
     // One malformed document must not blank a working view. Keep the last good
-    // graph and say why the new one was refused.
+    // graph and say why the new one was refused. It is no evidence about what
+    // runs now, so the last good graph keeps ageing toward stale.
     systemError = String(e);
   }
   postSystem();
 }
-// A new stream_id means the producer restarted: sequence and timestamp
-// restart with it, so the old timeline and jitter state would reject or
-// misorder every frame of the new stream. Dictionaries are per-stream too.
-function resetStream(next: string) {
-  streamId = next;
-  coordinator = new Coordinator();
-  jitter = new JitterBuffer(10);
-  packets.clear();
-  pendingBytes.clear();
-  needsReset = true;
-  pendingFrames = [];
-}
 function reset() {
-  coordinator = new Coordinator();
-  jitter = new JitterBuffer(10);
+  history = new TelemetryHistory(historyHooks);
+  coordinator = new Coordinator(history.timeline);
   decoder = new TelemetryDecoder();
-  streamId = null;
-  packets.clear();
-  pendingBytes.clear();
   needsReset = true;
   pendingFrames = [];
+  unknownAge.clear();
+  sampleArrival = null;
   // Whatever is being connected to next is a different system, so the old
   // topology is not evidence about it.
   system = null;
   previousSystem = null;
   rateWindow.reset();
+  graphStream.reset();
+  systemArrival = null;
   systemError = '';
   declared = null;
   declaredError = '';
@@ -269,29 +322,26 @@ function close() {
   generation++;
   clearTimeout(retry);
   if (socket) {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
     socket.onclose = null;
     socket.close();
     socket = null;
   }
   demo = false;
 }
+// One WebSocket message: a dictionary page or an update page. A snapshot
+// comes out at each update's last page.
 function ingest(bytes: Uint8Array, now: number) {
   try {
-    // A value frame whose dictionary has not arrived decodes to nothing yet;
-    // the decoder holds it and decodeAll returns it with the dictionary frame
-    // that names its channels. Held is not invalid.
-    for (const {frame, raw} of decoder.decodeFrames(bytes)) {
-      if (streamId !== null && frame.stream_id !== streamId)
-        resetStream(frame.stream_id);
-      else
-        streamId = frame.stream_id;
-      jitter.push(frame, now);
-      pendingBytes.set(frame.sequence_id, raw);
-      if (pendingBytes.size > 4096)
-        pendingBytes.delete(pendingBytes.keys().next().value!);
+    for (const frame of decoder.decodeAll(bytes)) {
+      if (!history.push(frame, decoder.currentDictionary(), now)) continue;
+      if (firstUpdate) unknownAge.add(ageKey(frame));
+      firstUpdate = false;
     }
   } catch {
-    jitter.stats.invalid++;
+    history.jitter.stats.invalid++;
   }
 }
 function connect(url: string, gen: number) {
@@ -306,8 +356,13 @@ function connect(url: string, gen: number) {
     manifestBase = url;
     nextManifestPoll = performance.now();
     socket.onopen = () => {
+      if (gen !== generation) return;
       status = 'WebSocket connected';
       connection = 'live';
+      // The bridge answers an open with its graph and then, when it has
+      // them, the dictionary and a keyframe: the first update on a socket.
+      firstUpdate = true;
+      unknownAge.clear();
       // Asked for on every open, not once per session: the bridge may have been
       // started after Studio was, and the first attempt would have found
       // nothing to answer it.
@@ -315,19 +370,22 @@ function connect(url: string, gen: number) {
       void fetchManifest(url, gen);
     };
     socket.onmessage = e => {
+      if (gen !== generation) return;
       // Binary is telemetry, text is the system graph. The bridge picks the
       // frame type, so neither side has to sniff the payload.
-      if (e.data instanceof ArrayBuffer)
+      if (e.data instanceof ArrayBuffer) {
         ingest(new Uint8Array(e.data), performance.now());
-      else if (typeof e.data === 'string')
+      } else if (typeof e.data === 'string')
         ingestSystem(e.data);
     };
     socket.onclose = () => {
+      if (gen !== generation) return;
       status = 'Disconnected · retrying';
       connection = 'connecting';
       if (gen === generation) retry = setTimeout(() => connect(url, gen), 1000);
     };
     socket.onerror = () => {
+      if (gen !== generation) return;
       status = 'WebSocket connection failed';
       connection = 'error';
     };
@@ -339,6 +397,12 @@ function connect(url: string, gen: number) {
 ctx.onmessage = ({data}) => {
   try {
     switch (data.type) {
+      case 'ack':
+        updates.ack();
+        break;
+      case 'ping':
+        ctx.postMessage({type: 'pong'});
+        break;
       case 'connect':
         close();
         reset();
@@ -366,7 +430,9 @@ ctx.onmessage = ({data}) => {
         let response: unknown;
         try {
           response = handleRpc(
-              {timeline: coordinator.timeline, system, previousSystem, declared},
+              {timeline: coordinator.timeline, system, previousSystem, declared,
+               rateWindow, systemArrivalMs: systemArrival,
+               connected: graphConnected()},
               data.request);
         } catch (e) {
           response = {
@@ -391,15 +457,10 @@ ctx.onmessage = ({data}) => {
         coordinator.step(BigInt(data.dt_ns));
         break;
       case 'export': {
-        const chunks =
-            coordinator.timeline.frames.map(f => packets.get(f.sequence_id))
-                .filter((x): x is Uint8Array => !!x);
-        const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-        let p = 0;
-        for (const c of chunks) {
-          out.set(c, p);
-          p += c.length;
-        }
+        // Each retained snapshot as a keyframe after its dictionary, so the
+        // log decodes on its own however much history was trimmed.
+        const out =
+            concatPages(exportPages(coordinator.timeline.frames, history.dictionaries));
         ctx.postMessage({type: 'export', buffer: out.buffer}, [out.buffer]);
         break;
       }
@@ -407,34 +468,24 @@ ctx.onmessage = ({data}) => {
         const bytes = new Uint8Array(data.buffer);
         if (bytes.length > 256 * 1024 * 1024)
           throw Error('Log exceeds 256 MiB');
+        checkExportFormat(bytes);
         const imported = new Timeline();
-        const raw = new Map<string, Uint8Array>();
         const importDecoder = new TelemetryDecoder();
-        let p = 0;
-        while (p < bytes.length) {
-          if (p + 4 > bytes.length) throw Error('Truncated log');
-          const size = new DataView(bytes.buffer, bytes.byteOffset + p, 4)
-                           .getUint32(0, true) +
-              4;
-          if (size < 16 || p + size > bytes.length)
-            throw Error('Truncated log frame');
-          const chunk = bytes.slice(p, p + size);
-          for (const {frame: f, raw: frameRaw} of
-               importDecoder.decodeFrames(chunk)) {
-            if (!imported.append(f))
-              throw Error('Log sequence/timestamps must strictly increase');
-            raw.set(f.sequence_id, frameRaw);
-          }
-          p += size;
+        const importedDictionaries = new Map<string, Dictionary>();
+        // A value page before the dictionary is refused by the decoder.
+        for (const f of importDecoder.decodeAll(bytes)) {
+          if (!imported.append(f))
+            throw Error('Log sequence/timestamps must strictly increase');
+          importedDictionaries.set(dictionaryKey(f),
+                                   importDecoder.currentDictionary()!);
         }
-        if (importDecoder.heldCount > 0)
-          throw Error('Log ends before its channel dictionary');
         // Commit only after the entire log validates. Deterministic import
         // ignores arrival time.
         close();
         reset();
+        history = new TelemetryHistory(historyHooks, imported,
+                                       importedDictionaries);
         coordinator = new Coordinator(imported);
-        packets = raw;
         coordinator.seek(BigInt(imported.bounds()?.start ?? '0'));
         status = 'Replay log loaded';
         connection = 'replay';
@@ -462,25 +513,7 @@ setInterval(() => {
       nextDemoSystem = now + 250;
     }
   }
-  for (const f of jitter.flush(now)) {
-    if (!coordinator.timeline.append(f)) {
-      jitter.stats.invalid++;
-      continue;
-    }
-    pendingFrames.push(f);
-    const raw = pendingBytes.get(f.sequence_id);
-    if (raw) packets.set(f.sequence_id, raw);
-    pendingBytes.delete(f.sequence_id);
-  }
-  const first = coordinator.timeline.frames[0];
-  if (first) {
-    for (const key of packets.keys()) {
-      if (BigInt(key) < BigInt(first.sequence_id))
-        packets.delete(key);
-      else
-        break;
-    }
-  }
+  history.flush(now);
   // The session manifest is re-read once a second while connected: it is a
   // live document, and the launcher replaces it atomically as nodes restart.
   if (manifestBase !== null && connection === 'live' && now >= nextManifestPoll) {
@@ -489,6 +522,10 @@ setInterval(() => {
   }
   coordinator.tick(BigInt(Math.max(0, Math.round((now - lastTick) * 1e6))));
   lastTick = now;
+  // A graph goes stale with time or a dropped socket, not only with a new
+  // document, so its freshness is re-judged every tick and posted on change.
+  if (systemStale(now) !== postedSystemStale) postSystem();
   postFrames();
   postPlayback(now);
+  updates.flush();
 }, 4);

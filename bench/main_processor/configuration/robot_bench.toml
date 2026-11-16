@@ -1,0 +1,5 @@
+include = "robot.toml"
+
+[robot]
+controller_address = "10.56.87.2"
+commissioned = false

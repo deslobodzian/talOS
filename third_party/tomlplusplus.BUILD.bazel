@@ -1,0 +1,10 @@
+# toml++ build shim for the http_archive in MODULE.bazel: the single-header
+# library, consumed as @tomlplusplus//:toml++ with `#include "toml.hpp"`.
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "toml++",
+    hdrs = ["toml.hpp"],
+)

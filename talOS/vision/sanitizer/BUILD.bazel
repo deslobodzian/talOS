@@ -1,0 +1,25 @@
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+cc_test(
+    name = "parallel_detector_test",
+    srcs = ["parallel_detector_test.cc"],
+    data = ["//talOS/vision/testdata"],
+    deps = [
+        "//talOS/vision:compute_backend",
+        "//talOS/vision:frame",
+        "@googletest//:gtest_main",
+        "@opencv//:core",
+        "@opencv//:imgcodecs",
+        "@opencv//:imgproc",
+    ],
+)
+
+cc_test(
+    name = "jpeg_loader_test",
+    srcs = ["jpeg_loader_test.cc"],
+    data = ["//talOS/vision/testdata"],
+    deps = [
+        "//talOS/vision/apriltag:cpu_apriltag_backend",
+        "@googletest//:gtest_main",
+    ],
+)

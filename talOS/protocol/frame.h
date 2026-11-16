@@ -60,6 +60,8 @@ std::size_t EncodeFrameInPlace(FrameType type, uint16_t flags,
                                std::size_t payload_size, uint8_t* frame,
                                std::size_t frame_capacity);
 
+// On kUnsupportedVersion, out->header.version holds the version received;
+// out is otherwise unchanged on any status but kOk.
 DecodeStatus DecodeFrame(const uint8_t* data, std::size_t size,
                          DecodedFrame* out);
 

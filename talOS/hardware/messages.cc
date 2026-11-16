@@ -1,5 +1,6 @@
 #include "messages.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -8,6 +9,7 @@
 
 namespace talos::hardware {
 static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
+static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
 namespace {
 struct Writer {
   std::span<uint8_t> data;
@@ -24,6 +26,16 @@ struct Writer {
     }
   }
   void Real(double x) { Int(std::bit_cast<uint64_t>(x), 8); }
+  void Float(float x) { Int(std::bit_cast<uint32_t>(x), 4); }
+  void Tenths(double x) {
+    if (!std::isfinite(x)) {
+      ok = false;
+      return;
+    }
+    const auto value =
+        static_cast<int16_t>(std::round(std::clamp(x, -3276.8, 3276.7) * 10.0));
+    Int(static_cast<uint16_t>(value), 2);
+  }
 };
 struct Reader {
   std::span<const uint8_t> data;
@@ -44,6 +56,14 @@ struct Reader {
     const double x = std::bit_cast<double>(Int(8));
     ok &= std::isfinite(x);
     return x;
+  }
+  float Float() {
+    const float x = std::bit_cast<float>(static_cast<uint32_t>(Int(4)));
+    ok &= std::isfinite(x);
+    return x;
+  }
+  double Tenths() {
+    return std::bit_cast<int16_t>(static_cast<uint16_t>(Int(2))) / 10.0;
   }
   bool Done() const { return ok && pos == data.size(); }
 };
@@ -125,7 +145,12 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
       s.digital_input_count > kMaxDigitalInputs ||
       s.digital_output_count > kMaxDigitalOutputs ||
       s.analog_input_count > kMaxAnalogInputs ||
-      s.encoder_count > kMaxEncoders || s.pwm_output_count > kMaxPwmOutputs) {
+      s.encoder_count > kMaxEncoders || s.pwm_output_count > kMaxPwmOutputs ||
+      s.build.program > kLastGatewayProgram ||
+      s.health.can_bus_count > kMaxCanBuses ||
+      s.health.can_bus_index >=
+          std::max<std::size_t>(s.health.can_bus_count, 1) ||
+      s.health.can_bus.read_state > kLastCanBusReadState) {
     return 0;
   }
   Writer w{data};
@@ -134,6 +159,11 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
   w.Int(s.epoch, 8);
   w.Int(s.sample_time_us, 8);
   w.Int(s.last_command_sequence, 8);
+  w.Int(s.clock_probe_time_us, 8);
+  w.Int(s.sequence, 8);
+  w.Int(s.build.revision, 8);
+  w.Int(static_cast<uint8_t>(s.build.program), 1);
+  w.Int(s.build.dirty ? 1 : 0, 1);
   w.Int(s.flags, 4);
   w.Int(s.motor_count, 2);
   w.Int(s.sensor_count, 2);
@@ -149,10 +179,12 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
     w.Real(m.position_rot);
     w.Real(m.velocity_rps);
     w.Real(m.voltage);
-    w.Real(m.stator_current_a);
+    w.Tenths(m.stator_current_a);
     w.Int(m.position_age_us, 4);
     w.Int(m.velocity_age_us, 4);
     w.Int(m.fault_flags, 4);
+    w.Tenths(m.temperature_c);
+    w.Tenths(m.supply_current_a);
   }
   for (std::size_t i = 0; i < s.sensor_count; ++i) {
     const auto& x = s.sensors[i];
@@ -199,7 +231,16 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
   w.Int(s.health.valid ? 1 : 0, 1);
   w.Real(s.health.battery_v);
   w.Int(s.health.brownout ? 1 : 0, 1);
-  w.Real(s.health.can_utilization_frac);
+  w.Int(s.health.can_bus_count, 1);
+  w.Int(s.health.can_bus_index, 1);
+  const CanBusSample& bus = s.health.can_bus;
+  w.Int(static_cast<uint8_t>(bus.read_state), 1);
+  w.Float(bus.utilization_frac);
+  w.Int(bus.bus_off_count, 4);
+  w.Int(bus.transmit_buffer_full_count, 4);
+  w.Int(bus.receive_error_count, 1);
+  w.Int(bus.transmit_error_count, 1);
+  w.Int(bus.read_failure_count, 4);
   w.Int(s.counters.rejected_command_count, 4);
   w.Int(s.counters.neutralized_motor_count, 4);
   w.Int(s.counters.apply_failure_count, 4);
@@ -214,6 +255,16 @@ bool Decode(std::span<const uint8_t> data, State& out) {
   s.epoch = r.Int(8);
   s.sample_time_us = r.Int(8);
   s.last_command_sequence = r.Int(8);
+  s.clock_probe_time_us = r.Int(8);
+  s.sequence = r.Int(8);
+  s.build.revision = r.Int(8);
+  const auto program = r.Int(1);
+  const auto dirty = r.Int(1);
+  if (program > static_cast<uint8_t>(kLastGatewayProgram) || dirty > 1) {
+    return false;
+  }
+  s.build.program = static_cast<GatewayProgram>(program);
+  s.build.dirty = dirty == 1;
   s.flags = r.Int(4);
   s.motor_count = r.Int(2);
   s.sensor_count = r.Int(2);
@@ -238,10 +289,12 @@ bool Decode(std::span<const uint8_t> data, State& out) {
     m.position_rot = r.Real();
     m.velocity_rps = r.Real();
     m.voltage = r.Real();
-    m.stator_current_a = r.Real();
+    m.stator_current_a = r.Tenths();
     m.position_age_us = r.Int(4);
     m.velocity_age_us = r.Int(4);
     m.fault_flags = r.Int(4);
+    m.temperature_c = r.Tenths();
+    m.supply_current_a = r.Tenths();
   }
   for (std::size_t i = 0; i < s.sensor_count; ++i) {
     auto& x = s.sensors[i];
@@ -304,10 +357,26 @@ bool Decode(std::span<const uint8_t> data, State& out) {
   const auto health_valid = r.Int(1);
   s.health.battery_v = r.Real();
   const auto brownout = r.Int(1);
-  s.health.can_utilization_frac = r.Real();
-  if (health_valid > 1 || brownout > 1) return false;
+  const auto bus_count = r.Int(1);
+  const auto bus_index = r.Int(1);
+  const auto read_state = r.Int(1);
+  CanBusSample& bus = s.health.can_bus;
+  bus.utilization_frac = r.Float();
+  bus.bus_off_count = r.Int(4);
+  bus.transmit_buffer_full_count = r.Int(4);
+  bus.receive_error_count = r.Int(1);
+  bus.transmit_error_count = r.Int(1);
+  bus.read_failure_count = r.Int(4);
+  if (health_valid > 1 || brownout > 1 || bus_count > kMaxCanBuses ||
+      bus_index >= std::max<uint64_t>(bus_count, 1) ||
+      read_state > static_cast<uint8_t>(kLastCanBusReadState)) {
+    return false;
+  }
   s.health.valid = health_valid == 1;
   s.health.brownout = brownout == 1;
+  s.health.can_bus_count = static_cast<uint8_t>(bus_count);
+  s.health.can_bus_index = static_cast<uint8_t>(bus_index);
+  bus.read_state = static_cast<CanBusReadState>(read_state);
   s.counters.rejected_command_count = r.Int(4);
   s.counters.neutralized_motor_count = r.Int(4);
   s.counters.apply_failure_count = r.Int(4);

@@ -36,7 +36,49 @@ cc_test(
     srcs = ["udp_test.cc"],
     deps = [
         ":protocol",
+        ":udp_test_helpers",
         "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# A child process in its own user and network namespace (integration: it
+# forks). Skipped where the host refuses an unprivileged one, unless
+# TALOS_REQUIRE_NETNS=1, which CI's Linux job sets after allowing them.
+cc_test(
+    name = "udp_address_change_test",
+    size = "small",
+    srcs = ["udp_address_change_test.cc"],
+    tags = ["integration"],
+    deps = [
+        ":protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "udp_test_helpers",
+    testonly = True,
+    hdrs = ["udp_test_helpers.h"],
+    visibility = ["//visibility:public"],
+    deps = [":protocol"],
+)
+
+cc_library(
+    name = "fuzz_corpus",
+    testonly = True,
+    hdrs = ["fuzz_corpus.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "frame_fuzz_test",
+    size = "small",
+    srcs = ["frame_fuzz_test.cc"],
+    deps = [
+        ":fuzz_corpus",
+        ":protocol",
         "@googletest//:gtest_main",
     ],
 )

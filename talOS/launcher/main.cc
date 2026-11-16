@@ -41,9 +41,9 @@ int main(int argc, char** argv) {
       } else if (arg == "--remote" && i + 1 < argc) {
         options.remote = argv[++i];
       } else if (arg == "--remote-port" && i + 1 < argc) {
-        options.remote_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        options.remote_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--local-port" && i + 1 < argc) {
-        options.local_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        options.local_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--duration-s" && i + 1 < argc) {
         options.duration_s = std::stoi(argv[++i]);
       } else if (arg == "--session-id" && i + 1 < argc) {
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
       } else if (arg == "--start-studio-bridge") {
         options.start_studio_bridge = true;
       } else if (arg == "--studio-http-port" && i + 1 < argc) {
-        options.studio_http_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        options.studio_http_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--allow-graph-errors") {
         options.allow_graph_errors = true;
       } else if (arg == "--describe-only") {
@@ -109,12 +109,13 @@ int main(int argc, char** argv) {
                "                         graph they describe, and exit "
                "without starting a robot\n"
                "  --allow-graph-errors   start anyway when the declared "
-               "graph has errors\n"
+               "graph has errors;\n"
+               "                         requires --sim\n"
                "  --max-restarts N       restarts per node per rolling window; "
                "overrides [robot] max_restarts (default 5, 0 disables)\n"
                "  --restart-window-ms MS rolling restart window (default "
                "60000)\n"
-               "  --heartbeat-periods N  stalled heartbeat/dispatch timeout in "
+               "  --heartbeat-periods N  stall (no progress) timeout in "
                "node "
                "periods (default 10, minimum timeout 500ms)\n"
                "  --heartbeat-startup-grace-ms MS startup grace (default "

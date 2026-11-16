@@ -1,0 +1,9 @@
+namespace roller_test;
+
+// The roller command a test node reads from its target lane; values match
+// talos::mechanisms::RollerCommand.
+enum Command : ubyte { IDLE, INTAKE, EJECT, FEED }
+
+struct Goal {
+  command:Command;
+}

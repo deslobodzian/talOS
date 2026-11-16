@@ -30,8 +30,8 @@ inline image_u8_t* LoadGrayImageU8(const std::string& path) {
   image_u8_t* im = image_u8_create(static_cast<uint32_t>(gray.cols),
                                    static_cast<uint32_t>(gray.rows));
   for (int y = 0; y < gray.rows; ++y) {
-    std::memcpy(im->buf + y * im->stride, gray.ptr<uint8_t>(y),
-                static_cast<size_t>(gray.cols));
+    std::memcpy(im->buf + static_cast<std::ptrdiff_t>(y) * im->stride,
+                gray.ptr<uint8_t>(y), static_cast<size_t>(gray.cols));
   }
   return im;
 }

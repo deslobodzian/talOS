@@ -1,10 +1,10 @@
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("//talOS/build:contract.bzl", "talos_cc_node")
+load("//talOS/build:contract.bzl", "talos_cc_node", "talos_cc_shared_node")
 
 # The three node classes, header-only so the test can host them all in one
-# simulated robot. Each <name>.cc is just TALOS_NODE(<Class>).
+# simulated robot. Each <name>.cc is just TALOS_NODE(<Class>). The intake and
+# elevator are thin wrappers over //talOS/mechanisms building blocks.
 cc_library(
     name = "mechanisms",
     hdrs = [
@@ -15,14 +15,15 @@ cc_library(
     deps = [
         "//examples/superstructure/messages",
         "//talOS/devices",
+        "//talOS/mechanisms",
+        "//talOS/msgs:control",
         "//talOS/node",
     ],
 )
 
-cc_binary(
+talos_cc_shared_node(
     name = "libmechanisms.so",
     srcs = ["mechanisms_abi.cc"],
-    linkshared = True,
     visibility = ["//examples/superstructure/py:__pkg__"],
     deps = [":mechanisms"],
 )
@@ -60,6 +61,7 @@ cc_test(
     deps = [
         ":mechanisms",
         "//talOS/devices:testing",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

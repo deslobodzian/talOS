@@ -1,0 +1,153 @@
+load("@rules_python//python:defs.bzl", "py_test")
+load("@talos//studio/bridge:webroot.bzl", "studio_webroot")
+load("@talos//talOS/build:contract.bzl", "talos_bundle", "talos_graph_test", "talos_sim", "talos_sim_test")
+load("@talos//tools:sync_manifest.bzl", "manifest_sync_test")
+load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["robot.toml"] + glob(["subsystems/*.toml"]))
+
+# The simulator robot.toml's [robot] sim_gateway names.
+SIMULATOR = "@talos//talOS/simulation:sim_gateway"
+
+# The Studio bridge robot.toml's [studio] bridge names.
+STUDIO_BRIDGE = "@talos//studio/bridge:studio_bridge"
+
+# Studio's pages, bazel-bin/studio_webroot, robot.toml's [studio] webroot:
+# only NOT_BUILT.txt until the talOS checkout builds them (MODULE.bazel's
+# studio_web).
+studio_webroot(
+    name = "studio_webroot",
+    srcs = ["@studio_web//:files"],
+)
+
+# Fails, with the regenerate command, when robot_manifest.bzl is stale.
+manifest_sync_test(
+    name = "manifest_sync_test",
+    config = "robot.toml",
+    config_files = CONFIG_FILES,
+    manifest = "robot_manifest.bzl",
+)
+
+# .bazelrc imports talos.bazelrc from the talOS checkout MODULE.bazel's
+# override names, and .bazelversion and the default Python are talOS's.
+# Reads that checkout's files, which are not Bazel inputs here, so it is
+# never cached (`external`); well under a second.
+py_test(
+    name = "talos_pin_test",
+    size = "small",
+    srcs = ["talos_pin_test.py"],
+    data = [
+        ".bazelrc",
+        ".bazelversion",
+        "MODULE.bazel",
+        "@talos//:MODULE.bazel",
+    ],
+    tags = ["external"],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+# talOS's requirement trace (docs/TESTING.md §3) on this repository: every
+# test tag names a row of talOS's catalogue or of this repository's
+# docs/REQUIREMENTS.md, and each SAFE, CONTRACT or P0 row of its own has a
+# tagged test. With no docs/REQUIREMENTS.md, as here, only tags are checked.
+# Reads this repository's tracked files and the catalogue of the talOS
+# checkout @talos is built from, which are not Bazel inputs, so it is never
+# cached (`external`); well under a second.
+py_test(
+    name = "trace_test",
+    size = "small",
+    srcs = ["@talos//tools:trace.py"],
+    args = [
+        "--check",
+        "--root-of",
+        "$(rootpath MODULE.bazel)",
+        "--talos-catalogue",
+    ],
+    data = ["MODULE.bazel"],
+    main = "@talos//tools:trace.py",
+    tags = ["external"],
+)
+
+# Runs every node with --describe and lints the graph, as
+# `launcher --describe-only` does.
+talos_graph_test(
+    name = "graph_test",
+    config = "robot.toml",
+    data = CONFIG_FILES,
+    nodes = NODES,
+)
+
+talos_bundle(
+    name = "robot_bundle",
+    config = "robot.toml",
+    config_files = CONFIG_FILES,
+    nodes = ["@talos//talOS/bridge:hardware_node"] + NODES,
+)
+
+# e2e: talOS's deploy.sh installs robot_bundle into a scratch prefix, and
+# the installed run.sh describes every node with the build out of reach
+# (bundle_install_test.py says how). About 2 s of real time. Launches a
+# Python node, which cannot load the sanitizer runtimes through ctypes.
+py_test(
+    name = "bundle_install_test",
+    size = "small",
+    srcs = ["bundle_install_test.py"],
+    data = [
+        "robot_manifest.bzl",
+        ":robot_bundle",
+        "@talos//tools:deploy.sh",
+    ],
+    tags = [
+        "e2e",
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+# `bazel run //:sim -- [launcher arguments]` runs the robot against the
+# simulator, e.g. `bazel run //:sim -- --duration-s 10`, and with
+# `-- --start-studio-bridge` serves Studio on http://localhost:5800
+# ([studio] http_port) and the driver dashboard at /drive.
+talos_sim(
+    name = "sim",
+    config = "robot.toml",
+    data = CONFIG_FILES + [
+        SIMULATOR,
+        STUDIO_BRIDGE,
+        ":studio_webroot",
+    ],
+    nodes = NODES,
+)
+
+# e2e: the robot runs against the simulator on free loopback ports until it
+# is up, then 1 s more: every member runs once and exits 0, and the bridge
+# receives State from the simulator (talos_sim_test,
+# talOS/build/contract.bzl). Takes its startup plus 1 s of real time.
+talos_sim_test(
+    name = "sim_smoke_test",
+    sim = ":sim",
+)
+
+# e2e: //:sim with --start-studio-bridge until the bridge is up; /drive
+# answers with the page when the talOS checkout built it, else how to build
+# it, and after the stop the bridge ran once and exited 0. About 2 s of real
+# time plus startup. Not a talos_sim_test: that check waits for every
+# member's registry row, and the Studio bridge takes none. no-sandbox: the
+# sandbox stages each file of //:studio_webroot as a link out of it, which
+# the bridge does not serve; outside it the webroot is linked whole, as
+# `bazel run //:sim` sees it.
+py_test(
+    name = "studio_test",
+    size = "small",
+    srcs = ["studio_test.py"],
+    data = [":sim"],
+    tags = [
+        "e2e",
+        "exclusive",
+        "no-sandbox",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)

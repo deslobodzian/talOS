@@ -93,13 +93,15 @@ inline bool EstimateTagPoseFromHomography(
     // Upstream detector p[0..3] corresponds to (-,+),(+,+),(+,-),(-,-).
     constexpr double ys[4] = {1, 1, -1, -1};
     for (int c = 0; c < 4; ++c) {
+      const Eigen::Index row = Eigen::Index{2} * c;
+      const auto corner = static_cast<std::size_t>(row);
       const auto uv = intrinsics.UndistortPoint(
-          {(*observed_corners)[2 * c], (*observed_corners)[2 * c + 1]});
+          {(*observed_corners)[corner], (*observed_corners)[corner + 1]});
       const double x = xs[c], y = ys[c], u = uv.x(), v = uv.y();
-      a.row(2 * c) << x, y, 1, 0, 0, 0, -u * x, -u * y;
-      a.row(2 * c + 1) << 0, 0, 0, x, y, 1, -v * x, -v * y;
-      b(2 * c) = u;
-      b(2 * c + 1) = v;
+      a.row(row) << x, y, 1, 0, 0, 0, -u * x, -u * y;
+      a.row(row + 1) << 0, 0, 0, x, y, 1, -v * x, -v * y;
+      b(row) = u;
+      b(row + 1) = v;
       temp_det.p[c][0] = u;
       temp_det.p[c][1] = v;
     }
@@ -289,7 +291,8 @@ constexpr std::string_view PoseInvalidReasonToString(PoseInvalidReason reason) {
 struct PoseValidity {
   bool valid{false};
   PoseInvalidReason reason{PoseInvalidReason::kValid};
-  std::string message;
+  // Always a string literal, so setting it never allocates.
+  std::string_view message;
 };
 
 struct ObservationStdDevs {
@@ -398,8 +401,7 @@ inline RobotPoseEstimate ComputeRobotFieldPose(
   out.reprojection_error_px = reprojection_error;
   out.ambiguity = ambiguity;
   auto reject = [&](PoseInvalidReason reason) {
-    out.validity = {false, reason,
-                    std::string(PoseInvalidReasonToString(reason))};
+    out.validity = {false, reason, PoseInvalidReasonToString(reason)};
     return out;
   };
   const auto field = layout.GetTagPose(tag_id);
@@ -519,15 +521,76 @@ inline bool SetCovarianceStdDevs(const PoseNormalMatrix& normal,
 
 // All observations, including single tags, share this right-increment SE(3)
 // LM solve. Pixel rows and floor rows are whitened before Huber IRLS; the
-// undamped final information matrix supplies measurement covariance.
-inline RobotPoseEstimate SolveMultiTagRobotPose(
+// undamped final information matrix, scaled by the fit's residual variance
+// factor below, supplies measurement covariance.
+//
+// The solver owns its scratch buffers and only ever grows them, so once it
+// has room for as many observations as the current call, Solve() makes no
+// heap allocation, valid or rejected. A caller that localizes every frame
+// keeps one solver; it is not thread-safe, so each thread needs its own.
+class MultiTagPoseSolver {
+ public:
+  // Reserves room for `max_observations` detections up front, so even the
+  // first Solve() with at most that many does not allocate.
+  explicit MultiTagPoseSolver(std::size_t max_observations = 0) {
+    Reserve(max_observations);
+  }
+
+  void Reserve(std::size_t observations) {
+    ids_.reserve(observations);
+    points_.reserve(4 * observations);
+    pixels_.reserve(4 * observations);
+    candidate_pixels_.reserve(4 * observations);
+    seeds_.reserve(2 * observations);
+    // Solve() sizes the rows itself; a one-shot solver skips this pass.
+    if (observations > 0)
+      ReserveRows(static_cast<Eigen::Index>(8 * observations + 3));
+  }
+
+  RobotPoseEstimate Solve(const std::vector<TagDetection3D>& observations,
+                          uint32_t camera_id, const CameraMounting& mounting,
+                          const FieldLayout& layout,
+                          const CameraIntrinsics& intrinsics,
+                          const PoseValidationOptions& options = {},
+                          const PoseSolverOptions& solver_options = {});
+
+ private:
+  static constexpr std::size_t kMaxDetectionsPerId = 3;
+  struct TagCandidates {
+    int tag_id{-1};
+    std::size_t count{0}, chosen{0}, first_pixel{0};
+    std::array<const TagDetection3D*, kMaxDetectionsPerId> detections{};
+    const TagDetection3D& Chosen() const { return *detections[chosen]; }
+  };
+  struct SeedCandidate {
+    talos::geometry::SE3<double> T_field_robot;
+    double residual;
+  };
+  // The LM residuals and Jacobians are maps over these, so their storage is
+  // laid out and aligned exactly as a VectorXd / MatrixXd of `rows` would be.
+  using ResidualMap = Eigen::Map<Eigen::VectorXd, Eigen::AlignedMax>;
+  using JacobianMap = Eigen::Map<Eigen::MatrixXd, Eigen::AlignedMax>;
+
+  void ReserveRows(Eigen::Index rows) {
+    for (auto* buffer : {&residual_, &trial_residual_, &weighted_residual_})
+      if (buffer->size() < rows) buffer->resize(rows);
+    for (auto* buffer : {&jacobian_, &weighted_jacobian_})
+      if (buffer->size() < 6 * rows) buffer->resize(6 * rows);
+  }
+
+  std::vector<TagCandidates> ids_;
+  std::vector<Eigen::Vector3d> points_;
+  std::vector<Eigen::Vector2d> candidate_pixels_, pixels_;
+  std::vector<SeedCandidate> seeds_;
+  Eigen::VectorXd residual_, trial_residual_, weighted_residual_;
+  Eigen::VectorXd jacobian_, weighted_jacobian_;
+};
+
+inline RobotPoseEstimate MultiTagPoseSolver::Solve(
     const std::vector<TagDetection3D>& observations, uint32_t camera_id,
     const CameraMounting& mounting, const FieldLayout& layout,
-    const CameraIntrinsics& intrinsics,
-    const PoseValidationOptions& options = {},
-    const PoseSolverOptions& solver_options = {}) {
-  std::vector<const TagDetection3D*> tags;
-  tags.reserve(observations.size());
+    const CameraIntrinsics& intrinsics, const PoseValidationOptions& options,
+    const PoseSolverOptions& solver_options) {
   RobotPoseEstimate out;
   out.camera_id = camera_id;
   auto reject = [&](PoseInvalidReason reason, const char* message) {
@@ -547,51 +610,158 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       noise.mount_translation_std_m < 0)
     return reject(PoseInvalidReason::kInvalidCovariance,
                   "Invalid solver noise");
-  double distance_sum = 0;
+  // Layout ids are unique, so a repeated id is at most one real tag; the rest
+  // are false decodes or printed copies elsewhere in view. Each id, in the
+  // detector's order of first appearance, keeps its kMaxDetectionsPerId
+  // strongest usable decodes (higher decision margin, then lower per-tag
+  // reprojection error), strongest first, as candidates for the seed search.
+  auto stronger = [](const TagDetection3D& a, const TagDetection3D& b) {
+    return a.decision_margin > b.decision_margin ||
+           (a.decision_margin == b.decision_margin &&
+            a.reprojection_error < b.reprojection_error);
+  };
+  auto& ids = ids_;
+  ids.clear();
+  ids.reserve(observations.size());
   for (const auto& t : observations) {
     const double d = t.T_camera_tag.translation().norm();
     if (!t.valid || !layout.HasTag(t.tag_id) || !std::isfinite(d) ||
         d < options.min_distance_m || d > options.max_distance_m ||
         t.T_camera_tag.translation().z() <= options.min_z_m)
       continue;
-    if (std::any_of(tags.begin(), tags.end(),
-                    [&](const auto* q) { return q->tag_id == t.tag_id; }))
-      continue;
-    tags.push_back(&t);
-    distance_sum += d;
+    auto id = std::find_if(ids.begin(), ids.end(),
+                           [&](const auto& c) { return c.tag_id == t.tag_id; });
+    if (id == ids.end()) {
+      ids.push_back({.tag_id = t.tag_id});
+      id = ids.end() - 1;
+    }
+    std::size_t slot = id->count;
+    while (slot > 0 && stronger(t, *id->detections[slot - 1])) --slot;
+    if (slot == kMaxDetectionsPerId) continue;  // weaker than every kept one
+    for (std::size_t k = std::min(id->count, kMaxDetectionsPerId - 1); k > slot;
+         --k)
+      id->detections[k] = id->detections[k - 1];
+    id->detections[slot] = &t;
+    id->count = std::min(id->count + 1, kMaxDetectionsPerId);
   }
-  if (tags.empty() || !intrinsics.IsValid())
+  if (ids.empty() || !intrinsics.IsValid())
     return reject(PoseInvalidReason::kDegenerateHomography,
                   "No usable PnP seed");
 
-  std::vector<Eigen::Vector3d> points;
-  std::vector<Eigen::Vector2d> pixels;
-  points.reserve(4 * tags.size());
-  pixels.reserve(4 * tags.size());
-  for (const auto* t : tags) {
-    const auto field = *layout.GetTagPose(t->tag_id);
-    const auto corners = GetTagModelCorners(layout.GetTagSize(t->tag_id));
-    for (int j = 0; j < 4; ++j) {
-      points.push_back(field.act(corners[j]));
-      pixels.push_back(intrinsics.UndistortPoint(
-          {t->corners[2 * j], t->corners[2 * j + 1]}));
+  // Field corners, four per id, and the undistorted image corners of every
+  // candidate detection, four each, starting at its id's first_pixel.
+  auto& points = points_;
+  auto& candidate_pixels = candidate_pixels_;
+  points.clear();
+  candidate_pixels.clear();
+  points.reserve(4 * ids.size());
+  candidate_pixels.reserve(4 * observations.size());
+  for (auto& id : ids) {
+    const auto field = *layout.GetTagPose(id.tag_id);
+    const auto corners = GetTagModelCorners(layout.GetTagSize(id.tag_id));
+    for (std::size_t j = 0; j < 4; ++j) points.push_back(field.act(corners[j]));
+    id.first_pixel = candidate_pixels.size();
+    for (std::size_t c = 0; c < id.count; ++c) {
+      const auto& t = *id.detections[c];
+      for (std::size_t j = 0; j < 4; ++j) {
+        candidate_pixels.push_back(intrinsics.UndistortPoint(
+            {t.corners[2 * j], t.corners[2 * j + 1]}));
+      }
     }
+  }
+  const auto camera_robot = mounting.T_robot_camera.inverse();
+
+  // Multi-tag: a single tag's primary is unreliable near the planar-ambiguity
+  // boundary, and a repeated id's stronger decode may be a printed copy
+  // elsewhere in view. So every pose candidate (primary and, when present,
+  // secondary) of every candidate detection proposes a robot pose, scored by
+  // the joint unweighted reprojection residual over all ids' corners (no LM),
+  // each id counting its best-fitting detection. The best proposal seeds the
+  // joint solve and picks each id's detection: a repeated id contributes the
+  // one consistent with the other tags, whatever its decode strength. A lone
+  // id has no other tag to check against and keeps its strongest decode.
+  auto joint_rms = [&](const talos::geometry::SE3<double>& T_field_robot,
+                       bool choose) {
+    const auto robot_field = T_field_robot.inverse();
+    double sum_sq = 0.0;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      auto& id = ids[i];
+      std::array<double, kMaxDetectionsPerId> sq{};
+      for (std::size_t j = 0; j < 4; ++j) {
+        const auto p = camera_robot.act(robot_field.act(points[4 * i + j]));
+        if (!p.allFinite() || p.z() <= options.min_z_m)
+          return std::numeric_limits<double>::infinity();
+        const Eigen::Vector2d uv(intrinsics.fx * p.x() / p.z() + intrinsics.cx,
+                                 intrinsics.fy * p.y() / p.z() + intrinsics.cy);
+        for (std::size_t c = 0; c < id.count; ++c)
+          sq[c] +=
+              (uv - candidate_pixels[id.first_pixel + 4 * c + j]).squaredNorm();
+      }
+      double best = std::numeric_limits<double>::infinity();
+      for (std::size_t c = 0; c < id.count; ++c) {
+        if (sq[c] < best) {
+          best = sq[c];
+          if (choose) id.chosen = c;
+        }
+      }
+      sum_sq += best;
+    }
+    return std::sqrt(sum_sq / static_cast<double>(points.size()));
+  };
+  auto& seeds = seeds_;
+  seeds.clear();
+  if (ids.size() > 1) {
+    seeds.reserve(2 * observations.size());
+    for (const auto& id : ids) {
+      const auto field = *layout.GetTagPose(id.tag_id);
+      auto add = [&](const talos::geometry::SE3<double>& camera_tag) {
+        const auto robot =
+            field * camera_tag.inverse() * mounting.T_robot_camera.inverse();
+        const double residual = joint_rms(robot, /*choose=*/false);
+        if (std::isfinite(residual)) seeds.push_back({robot, residual});
+      };
+      for (std::size_t c = 0; c < id.count; ++c) {
+        const auto& t = *id.detections[c];
+        add(t.T_camera_tag);
+        if (t.secondary_reprojection_error_px >= 0.0 &&
+            std::isfinite(t.secondary_reprojection_error_px))
+          add(t.secondary_T_camera_tag);
+      }
+    }
+    if (seeds.empty())
+      return reject(PoseInvalidReason::kDegenerateHomography,
+                    "No usable PnP seed");
+    std::sort(seeds.begin(), seeds.end(), [](const auto& a, const auto& b) {
+      return a.residual < b.residual;
+    });
+    joint_rms(seeds.front().T_field_robot, /*choose=*/true);
+  }
+
+  // The joint solve fits each id's chosen detection.
+  auto& pixels = pixels_;
+  pixels.clear();
+  pixels.reserve(points.size());
+  double distance_sum = 0;
+  for (const auto& id : ids) {
+    distance_sum += id.Chosen().T_camera_tag.translation().norm();
+    for (std::size_t j = 0; j < 4; ++j)
+      pixels.push_back(candidate_pixels[id.first_pixel + 4 * id.chosen + j]);
   }
   const int pixel_rows = static_cast<int>(2 * points.size());
   const int rows = pixel_rows + 3;
-  const auto camera_robot = mounting.T_robot_camera.inverse();
   const auto camera_rotation = camera_robot.rotation().rotationMatrix();
-  auto evaluate = [&](const auto& pose, Eigen::VectorXd& residual,
-                      Eigen::MatrixXd* jacobian) {
+  auto evaluate = [&](const auto& pose, ResidualMap& residual,
+                      JacobianMap* jacobian) {
     const auto robot_field = pose.inverse();
-    for (size_t i = 0; i < points.size(); ++i) {
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      const auto row = static_cast<Eigen::Index>(2 * i);
       const auto p_robot = robot_field.act(points[i]);
       const auto p = camera_robot.act(p_robot);
       if (!p.allFinite() || p.z() <= options.min_z_m) return false;
-      residual(2 * i) =
+      residual(row) =
           (intrinsics.fx * p.x() / p.z() + intrinsics.cx - pixels[i].x()) /
           noise.pixel_std_px;
-      residual(2 * i + 1) =
+      residual(row + 1) =
           (intrinsics.fy * p.y() / p.z() + intrinsics.cy - pixels[i].y()) /
           noise.pixel_std_px;
       if (jacobian) {
@@ -602,7 +772,7 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
         Eigen::Matrix<double, 3, 6> tangent;
         tangent.leftCols<3>() = talos::geometry::SO3<double>::Hat(p_robot);
         tangent.rightCols<3>() = -Eigen::Matrix3d::Identity();
-        jacobian->block<2, 6>(2 * i, 0) =
+        jacobian->block<2, 6>(row, 0) =
             projection * camera_rotation * tangent / noise.pixel_std_px;
       }
     }
@@ -625,7 +795,7 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     return residual.allFinite();
   };
   const double huber_delta = noise.huber_delta_px / noise.pixel_std_px;
-  auto cost = [&](const Eigen::VectorXd& r) {
+  auto cost = [&](const ResidualMap& r) {
     double value = r.tail<3>().squaredNorm();
     for (int i = 0; i < pixel_rows; ++i) {
       const double a = std::abs(r(i));
@@ -633,9 +803,14 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     }
     return value;
   };
-  Eigen::VectorXd residual(rows), trial_residual(rows), weighted_residual(rows);
-  Eigen::MatrixXd jacobian(rows, 6), weighted_jacobian(rows, 6);
+  ReserveRows(rows);
+  ResidualMap residual(residual_.data(), rows);
+  ResidualMap trial_residual(trial_residual_.data(), rows);
+  ResidualMap weighted_residual(weighted_residual_.data(), rows);
+  JacobianMap jacobian(jacobian_.data(), rows, 6);
+  JacobianMap weighted_jacobian(weighted_jacobian_.data(), rows, 6);
   detail::PoseNormalMatrix normal;
+  Eigen::Matrix<double, 6, 1> gradient;
 
   // Runs the joint LM from `seed`, returning the refined estimate. The scratch
   // buffers are shared across seeds; each run reinitializes them via linearize.
@@ -667,8 +842,10 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       }
       detail::PoseNormalMatrix damped = normal;
       damped.diagonal().array() += lambda;
-      const Eigen::Matrix<double, 6, 1> delta = damped.ldlt().solve(
-          -weighted_jacobian.transpose() * weighted_residual);
+      // Evaluated into a fixed-size vector: nested in solve(), the product
+      // of the dynamic-row Jacobian would be a heap temporary.
+      gradient.noalias() = -weighted_jacobian.transpose() * weighted_residual;
+      const Eigen::Matrix<double, 6, 1> delta = damped.ldlt().solve(gradient);
       if (!delta.allFinite()) {
         est.validity = {false, PoseInvalidReason::kInvalidCovariance,
                         "Invalid joint step"};
@@ -691,13 +868,29 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
       return est;
     }
     est.tag_id = -1;
-    est.tag_count = static_cast<int>(tags.size());
-    est.average_distance_m = distance_sum / tags.size();
+    est.tag_count = static_cast<int>(ids.size());
+    est.average_distance_m = distance_sum / static_cast<double>(ids.size());
     est.reprojection_error_px =
-        noise.pixel_std_px *
-        std::sqrt(residual.head(pixel_rows).squaredNorm() / points.size());
+        noise.pixel_std_px * std::sqrt(residual.head(pixel_rows).squaredNorm() /
+                                       static_cast<double>(points.size()));
     est.ambiguity = 0;
-    if (!detail::SetCovarianceStdDevs(normal, noise, &est)) return est;
+    // The information matrix assumes pixel_std_px corner noise. A worse fit
+    // scales the covariance by the a-posteriori variance factor
+    // s^2 = chi^2 / (rows - 6) of the Huber-weighted whitened residual (pixel
+    // and floor rows), clamped to [1, max_reprojection_error_px^2 /
+    // (2 pixel_std_px^2)]: never below nominal, and at most the per-coordinate
+    // variance ratio of a fit at the reprojection reject threshold.
+    const int dof = rows - 6;
+    const double threshold_ratio =
+        options.max_reprojection_error_px / noise.pixel_std_px;
+    const double variance_scale =
+        dof > 0
+            ? std::max(1.0, std::min(weighted_residual.squaredNorm() /
+                                         static_cast<double>(dof),
+                                     0.5 * threshold_ratio * threshold_ratio))
+            : 1.0;
+    const detail::PoseNormalMatrix information = normal / variance_scale;
+    if (!detail::SetCovarianceStdDevs(information, noise, &est)) return est;
     if (est.reprojection_error_px > options.max_reprojection_error_px) {
       est.validity = {false, PoseInvalidReason::kHighReprojectionError,
                       "Joint PnP residual too high"};
@@ -710,8 +903,8 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
   // A single tag keeps the ComputeRobotFieldPose path so the ambiguity gate
   // (and the floor-disambiguation override) decides the observation; the LM
   // then only refines and computes covariance.
-  if (tags.size() == 1) {
-    const auto& t = *tags.front();
+  if (ids.size() == 1) {
+    const auto& t = ids.front().Chosen();
     auto seed = ComputeRobotFieldPose(
         t.tag_id, camera_id, t.T_camera_tag, mounting, layout,
         t.reprojection_error, t.ambiguity, options, &t.secondary_T_camera_tag,
@@ -722,50 +915,6 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     result.ambiguity = t.ambiguity;
     return result;
   }
-
-  // Multi-tag: a single tag's primary is unreliable near the planar-ambiguity
-  // boundary, so evaluate every pose candidate (primary and secondary, when
-  // present) of every tag by the joint unweighted reprojection residual over
-  // all tags' corners (no LM), and seed the joint solve from the best.
-  auto joint_rms = [&](const talos::geometry::SE3<double>& T_field_robot) {
-    const auto robot_field = T_field_robot.inverse();
-    double sum_sq = 0.0;
-    for (size_t i = 0; i < points.size(); ++i) {
-      const auto p = camera_robot.act(robot_field.act(points[i]));
-      if (!p.allFinite() || p.z() <= options.min_z_m)
-        return std::numeric_limits<double>::infinity();
-      const double u = intrinsics.fx * p.x() / p.z() + intrinsics.cx;
-      const double v = intrinsics.fy * p.y() / p.z() + intrinsics.cy;
-      const double du = u - pixels[i].x(), dv = v - pixels[i].y();
-      sum_sq += du * du + dv * dv;
-    }
-    return std::sqrt(sum_sq / points.size());
-  };
-  struct SeedCandidate {
-    talos::geometry::SE3<double> T_field_robot;
-    double residual;
-  };
-  std::vector<SeedCandidate> seeds;
-  seeds.reserve(2 * tags.size());
-  for (const auto* t : tags) {
-    const auto field = *layout.GetTagPose(t->tag_id);
-    auto add = [&](const talos::geometry::SE3<double>& camera_tag) {
-      const auto robot =
-          field * camera_tag.inverse() * mounting.T_robot_camera.inverse();
-      const double residual = joint_rms(robot);
-      if (std::isfinite(residual)) seeds.push_back({robot, residual});
-    };
-    add(t->T_camera_tag);
-    if (t->secondary_reprojection_error_px >= 0.0 &&
-        std::isfinite(t->secondary_reprojection_error_px))
-      add(t->secondary_T_camera_tag);
-  }
-  if (seeds.empty())
-    return reject(PoseInvalidReason::kDegenerateHomography,
-                  "No usable PnP seed");
-  std::sort(seeds.begin(), seeds.end(), [](const auto& a, const auto& b) {
-    return a.residual < b.residual;
-  });
 
   RobotPoseEstimate best_estimate = solve_from(seeds.front().T_field_robot);
   double best_score = best_estimate.validity.valid
@@ -784,6 +933,18 @@ inline RobotPoseEstimate SolveMultiTagRobotPose(
     }
   }
   return best_estimate;
+}
+
+// One-shot form of MultiTagPoseSolver::Solve: allocates its scratch on every
+// call. A caller that localizes every frame keeps a MultiTagPoseSolver.
+inline RobotPoseEstimate SolveMultiTagRobotPose(
+    const std::vector<TagDetection3D>& observations, uint32_t camera_id,
+    const CameraMounting& mounting, const FieldLayout& layout,
+    const CameraIntrinsics& intrinsics,
+    const PoseValidationOptions& options = {},
+    const PoseSolverOptions& solver_options = {}) {
+  return MultiTagPoseSolver().Solve(observations, camera_id, mounting, layout,
+                                    intrinsics, options, solver_options);
 }
 
 }  // namespace talos::vision

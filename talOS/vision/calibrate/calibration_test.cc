@@ -18,12 +18,9 @@ Result Example() {
           0,
           20};
 }
-TEST(Calibration, TooFewViews) {
+TEST(Calibration, RefusesTooFewPoorCoverageAndDuplicateViews) {
   Calibration calibration;
   EXPECT_THROW(calibration.Solve(), std::runtime_error);
-}
-TEST(Calibration, RefusesPoorCoverageAndDuplicateViews) {
-  Calibration calibration;
   cv::Mat board;
   cv::resize(calibration.BoardImage(), board, {280, 200}, 0, 0, cv::INTER_AREA);
   for (int i = 0; i < 13; ++i) {

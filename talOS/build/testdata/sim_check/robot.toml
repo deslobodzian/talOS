@@ -1,0 +1,19 @@
+# sim_check_no_state_test's session: talOS's telemetry node, which reads
+# /hw/status, beside the bridge and a simulator that sends its State to the
+# wrong port (misaddressed_gateway.py).
+[robot]
+name = "sim_check_test"
+period_us = 5000
+command_timeout_us = 100000
+commissioned = false
+sim_gateway = "//talOS/build/testdata/sim_check:sim_gateway"
+controller_address = "127.0.0.1"
+
+[robot.targets]
+teleop = []
+autonomous = []
+test = []
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+period_us = 10000

@@ -5,7 +5,9 @@
 
 import {useEffect, useMemo, useRef, useState} from 'react';
 
-import {useActions, useEvents, usePlayback} from '../data/hooks';
+import {useActions, useEvents, usePlayback, useRecorded} from '../data/hooks';
+import {detectReviewServer} from '../data/review';
+import {useStudio} from '../data/studio';
 import {PanelNavigationProvider} from '../layout/navigation';
 import {buildPresetPage, buildPresetRoot, defaultWorkspace, PRESETS, presetByName} from '../layout/presets';
 import {
@@ -35,6 +37,8 @@ import {
 import {CommandPalette} from './CommandPalette';
 import {Header} from './Header';
 import {PageTabs} from './PageTabs';
+import {RecordedTransport} from './RecordedTransport';
+import {ReviewPicker} from './ReviewPicker';
 import {ShortcutsOverlay} from './Shortcuts';
 import {StatusStrip} from './StatusStrip';
 import {Timeline} from './Timeline';
@@ -78,14 +82,33 @@ export function Shell() {
   const [renamingPage, setRenamingPage] = useState<string|null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [focusedPanelId, setFocusedPanelId] = useState<string|null>(null);
 
+  const studio = useStudio();
+  const recorded = useRecorded();
   const actions = useActions();
   const playback = usePlayback();
   const events = useEvents();
   const importFileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => saveWorkspace(workspace), [workspace]);
+
+  // A Studio that studio_review served reviews that server's sessions: it
+  // opens straight into its picker, and offers no live connection.
+  const [reviewServer, setReviewServer] = useState<string|null>(null);
+  useEffect(() => {
+    if (typeof location === 'undefined') return;
+    let cancelled = false;
+    void detectReviewServer(location.origin, (u, init) => fetch(u, init)).then(server => {
+      if (cancelled || !server) return;
+      setReviewServer(server);
+      setReviewOpen(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const activePage = workspace.pages.find(p => p.id === workspace.activePage) ??
       workspace.pages[0] ?? null;
@@ -135,13 +158,15 @@ export function Shell() {
   // --- panel/layout actions -------------------------------------------------
 
   const callbacks: WorkspaceCallbacks = {
-    onSplit: (instanceId, direction) => setWorkspace(w => withActiveRoot(
-        w, root => {
-          const panel = findPanel(root, instanceId);
-          if (!panel) return root;
-          return split(root, instanceId, direction, panel.panelId,
-                       newInstanceId(), panel.config);
-        })),
+    onSplit: (instanceId, direction) => {
+      setMaximized(null);
+      setWorkspace(w => withActiveRoot(w, root => {
+        const panel = findPanel(root, instanceId);
+        if (!panel) return root;
+        return split(root, instanceId, direction, panel.panelId,
+                     newInstanceId(), panel.config);
+      }));
+    },
     onClose: (instanceId) => setWorkspace(w => withActiveRoot(w, root => {
       const next = close(root, instanceId);
       // A page is never left empty: closing its last panel leaves a fresh
@@ -162,27 +187,31 @@ export function Shell() {
   // Memoised so the context value is stable: the shell re-renders on every
   // playback tick, and a new navigation object would re-render every panel.
   const navigation = useMemo(() => ({
-    openPanel: (panelId: string) => setWorkspace(w => withActiveRoot(
-        w, root => {
-          const target = firstPanel(root);
-          return target ?
-              split(root, target.instanceId, 'row', panelId, newInstanceId(),
-                    undefined) :
-              panelNode(panelId, newInstanceId(), undefined);
-        }))
-  }), []);
-
-  // "Add panel" splits the last-interacted panel on the active page (falling
-  // back to the first panel), or replaces an empty root outright.
-  const addPanel = (panelId: string) => setWorkspace(w => withActiveRoot(
-      w, root => {
-        const target = (focusedPanelId && findPanel(root, focusedPanelId)) ??
-            firstPanel(root);
+    openPanel: (panelId: string) => {
+      setMaximized(null);
+      setWorkspace(w => withActiveRoot(w, root => {
+        const target = firstPanel(root);
         return target ?
             split(root, target.instanceId, 'row', panelId, newInstanceId(),
                   undefined) :
             panelNode(panelId, newInstanceId(), undefined);
       }));
+    }
+  }), []);
+
+  // "Add panel" splits the last-interacted panel on the active page (falling
+  // back to the first panel), or replaces an empty root outright.
+  const addPanel = (panelId: string) => {
+    setMaximized(null);
+    setWorkspace(w => withActiveRoot(w, root => {
+      const target = (focusedPanelId && findPanel(root, focusedPanelId)) ??
+          firstPanel(root);
+      return target ?
+          split(root, target.instanceId, 'row', panelId, newInstanceId(),
+                undefined) :
+          panelNode(panelId, newInstanceId(), undefined);
+    }));
+  };
 
   // "Open preset page" appends a fresh page built from the named preset.
   const openPresetPage = (name: string) => {
@@ -199,6 +228,7 @@ export function Shell() {
   // --- transport / workspace ------------------------------------------------
 
   const onConnect = () => {
+    if (reviewServer) return;  // a review server has no live stream
     setTransportError('');
     actions.connect(url);
   };
@@ -260,6 +290,7 @@ export function Shell() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       // ⌘/Ctrl+K toggles the palette from anywhere.
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey &&
           e.key.toLowerCase() === 'k') {
@@ -269,10 +300,10 @@ export function Shell() {
         return;
       }
 
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       const target = e.target as HTMLElement|null;
-      if (target &&
-          (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' ||
-           target.tagName === 'SELECT' || target.isContentEditable))
+      if (target?.closest(
+          'button, input, textarea, select, [contenteditable="true"], [role="menu"], [role="dialog"], [role="separator"], [role="slider"]'))
         return;
 
       // '?' toggles the shortcuts overlay.
@@ -284,7 +315,7 @@ export function Shell() {
       }
 
       // A modal owns its own keys; the transport shortcuts below stay quiet.
-      if (paletteOpen || shortcutsOpen) return;
+      if (paletteOpen || shortcutsOpen || reviewOpen) return;
 
       const playing = playback.mode === 'REPLAY_PLAYING' ||
           playback.mode === 'LIVE_STREAMING';
@@ -301,13 +332,14 @@ export function Shell() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [actions, playback.mode, stepNs, paletteOpen, shortcutsOpen]);
+  }, [actions, playback.mode, stepNs, paletteOpen, shortcutsOpen, reviewOpen]);
 
   return <PanelNavigationProvider value={navigation}>
     <div className="app">
       <Header url={url} onUrl={setUrl} onConnect={onConnect} onDemo={onDemo}
               onImportClick={onImportClick} onExport={onExport}
-              onReset={onReset}/>
+              onReset={onReset} onReview={() => setReviewOpen(true)}
+              review={reviewServer !== null}/>
       <StatusStrip/>
       <PageTabs pages={workspace.pages} activePageId={workspace.activePage}
                 renamingId={renamingPage} onSelect={setActivePage}
@@ -315,13 +347,16 @@ export function Shell() {
                 onClose={closePage} onAdd={addPage} onReset={resetPage}/>
       <main>
         {activePage ?
-             <WorkspaceArea root={activePage.root} maximized={maximized}
+             <WorkspaceArea key={activePage.id} root={activePage.root} maximized={maximized}
                             callbacks={callbacks}/> :
              <div className="empty-state">No pages. Add a page to begin.</div>}
       </main>
-      <Timeline stepNs={stepNs} onStepNs={setStepNs}
-                transportError={transportError}
-                onTransportError={setTransportError}/>
+      {recorded ?
+           <RecordedTransport source={recorded} stepNs={stepNs} onStepNs={setStepNs}
+                              onClose={studio.closeRecorded}/> :
+           <Timeline stepNs={stepNs} onStepNs={setStepNs}
+                     transportError={transportError}
+                     onTransportError={setTransportError}/>}
       <input ref={importFileRef} type="file" accept=".json" hidden
              aria-label="Import workspace JSON"
              onChange={async e => {
@@ -331,6 +366,8 @@ export function Shell() {
              }}/>
       {paletteOpen &&
        <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)}/>}
+      {reviewOpen && <ReviewPicker onClose={() => setReviewOpen(false)}
+                                   server={reviewServer ?? undefined}/>}
       {shortcutsOpen &&
        <ShortcutsOverlay onClose={() => setShortcutsOpen(false)}/>}
     </div>

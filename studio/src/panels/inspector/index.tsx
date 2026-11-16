@@ -1,20 +1,23 @@
 // The inspector: the old structured state tree, upgraded to a grouped,
 // collapsible channel table. Rows are grouped by owner/role, each showing the
 // value at the playback cursor (with the enum label when the channel declared
-// labels), its unit, its staleness (age since its newest reading), a 30 s
-// sparkline for numeric channels, and an "add to plot" affordance that copies
-// the channel name so it can be pasted into the Plot panel's channel drawer.
+// labels), its unit, its age (since its newest reading, against the reading
+// clock, marked STALE like every other panel), a 30 s sparkline for numeric
+// channels, and an "add to plot" affordance that copies the channel name so it
+// can be pasted into the Plot panel's channel drawer.
 
 import {useMemo, useState} from 'react';
 
 import {useDictionary, usePlayback, useSeries, useSnapshot} from '../../data/hooks';
+import {useStudio} from '../../data/studio';
 import type {ChannelInfo} from '../../data/types';
 import {channelDisplayName} from '../../ui/channel';
+import {FreshnessNotice} from '../../ui/FreshnessNotice';
 import {duration, integer} from '../../ui/formatters';
 import {EmptyState} from '../../ui/primitives';
 import {Sparkline} from '../../ui/Sparkline';
 import type {PanelDefinition} from '../types';
-import {channelStalenessNs} from './staleness';
+import {channelAge} from './staleness';
 import './inspector.css';
 
 export type InspectorConfig = Record<string, never>;
@@ -37,8 +40,12 @@ function kindOf(info: ChannelInfo, value: number|undefined): Kind {
 // A numeric sample with precision that follows its magnitude: integers and
 // counters print whole (with thousands separators), everything else prints
 // just enough decimals with trailing zeros trimmed — never "1204.0000".
-function formatValue(value: number): string {
-  if (!Number.isFinite(value)) return '—';
+// An integer channel shows its exact decimal (`exact`), since its number is
+// rounded past 2^53.
+function formatValue(value: number, exact?: string): string {
+  if (exact !== undefined) return integer(exact);
+  // A non-finite reading is shown as what it is: NaN, Infinity, -Infinity.
+  if (!Number.isFinite(value)) return String(value);
   if (Number.isInteger(value)) return integer(value);
   const abs = Math.abs(value);
   const places = abs >= 100 ? 1 : abs >= 10 ? 2 : abs >= 1 ? 3 :
@@ -58,6 +65,7 @@ function groupKey(name: string): string {
 const EMPTY = new Float64Array(0);
 
 function InspectorPanel() {
+  const studio = useStudio();
   const snapshot = useSnapshot();
   const dictionary = useDictionary();
   const playback = usePlayback();
@@ -66,8 +74,8 @@ function InspectorPanel() {
   const needle = filter.trim().toLowerCase();
 
   const allNames = useMemo(() => dictionary.map(c => c.name), [dictionary]);
-  // Full history for staleness, and a 30 s window for the sparklines.
-  const seriesAll = useSeries(allNames, 'all');
+  // A 30 s window for the sparklines; it also re-renders on every store change
+  // so each row's age reads the current newest sample.
   const series30 = useSeries(allNames, {seconds: 30});
 
   const groups = useMemo(() => {
@@ -111,6 +119,7 @@ function InspectorPanel() {
   const visibleCount = groups.reduce((n, g) => n + g.channels.length, 0);
 
   return <div className="inspector">
+    <FreshnessNotice/>
     <div className="system-toolbar">
       <input aria-label="Search channels" className="search"
              placeholder="Search channels or units…" value={filter}
@@ -144,7 +153,7 @@ function InspectorPanel() {
               {g.channels.map(c => {
                 const value = snapshot?.channels[c.name];
                 const kind = kindOf(c, value);
-                const ns = channelStalenessNs(seriesAll, c.name, playback.cursor_ns);
+                const age = channelAge(studio.store, c.name, playback);
                 const values = series30.values[c.name] ?? EMPTY;
                 return <tr key={c.name}>
                   <td><code>{channelDisplayName(c.name)}</code></td>
@@ -156,12 +165,16 @@ function InspectorPanel() {
                           kind === 'enum' && Number.isInteger(value) &&
                                   value >= 0 && value < c.labels.length ?
                               c.labels[value] :
-                              formatValue(value)}</b>}</td>
+                              formatValue(value, snapshot?.exact?.[c.name])}</b>}</td>
                   <td>{c.unit || <span className="text-muted">—</span>}</td>
-                  <td>{ns === null ?
+                  <td>{age === null ?
                       <span className="text-muted">—</span> :
-                      ns === '0' ? <span className="age-fresh">now</span> :
-                      duration(ns)}</td>
+                      <span className={age.stale ? 'text-warn' : undefined}>
+                        {age.age_ns === null ? 'unknown' :
+                         age.age_ns === '0' ? <span className="age-fresh">now</span> :
+                         duration(age.age_ns)}
+                        {age.stale && <em> · STALE</em>}
+                      </span>}</td>
                   <td className="right">
                     {c.labels.length === 0 &&
                         <Sparkline values={values} width={90} height={20}/>}

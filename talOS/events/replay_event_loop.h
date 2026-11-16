@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -45,11 +46,19 @@ class ReplayDivergence : public std::runtime_error {
 
 // Re-runs a recorded program from its dispatch log.
 //
-// Nothing is re-derived. Timer firings and message payloads come from the log
-// in recorded order, so the handlers see byte-identical inputs at identical
-// times no matter how the original run was scheduled. The loop then checks
-// what the handlers produce against what they produced originally: every send
-// must match, in order, byte for byte.
+// Nothing is re-derived. Timer firings, message payloads and publish times
+// come from the log in recorded order, so handlers see byte-identical inputs
+// with identical ages no matter how the original run was scheduled. The loop
+// checks every send against the original run, in order, byte for byte.
+//
+// It never crosses a GAP record (log/format.h), where the writer dropped
+// records: it replays every dispatch before the gap's first dropped dispatch
+// (none of a dispatch the gap split) and stops, as at the end of a truncated
+// log, with stopped_at_gap() naming the gap. Recording that replay gives the
+// log's records before that dispatch, then the replay's own EXIT. A gap that
+// starts outside any dispatch (sends during construction) stops it before
+// the first dispatch; the program's sends past the gap are refused
+// (SendStatus::FAILED), not reported.
 template <RecorderPolicy Recorder = NullRecorder>
 class ReplayEventLoop
     : public EventLoopBase<ReplayEventLoop<Recorder>, Recorder> {
@@ -104,6 +113,12 @@ class ReplayEventLoop
   // True when the recorded run ended with a clean exit rather than being cut
   // short by a truncated log.
   bool reached_exit() const { return reached_exit_; }
+
+  // The gap the log stops at: every dispatch before its first dropped dispatch
+  // was replayed, and none after. Empty for a log without one.
+  const std::optional<log::LogGap>& stopped_at_gap() const {
+    return stopped_at_gap_;
+  }
 
   void run() {
     if (const auto mismatch =
@@ -163,9 +178,33 @@ class ReplayEventLoop
     log::LogReader::Record record{};
     reader.rewind();
     while (reader.next(record)) {
+      // The log is a hole-free record of the run only up to its first GAP
+      // record: replay stops there, and nothing after it is read (or refused
+      // as damage).
+      stopped_at_gap_ = log::GapOf(record.header, record.payload);
+      if (stopped_at_gap_.has_value()) break;
       records_.push_back(Recorded{record.header, stored_.size()});
       const auto bytes = record.payload.first(record.header.stored_bytes);
       stored_.insert(stored_.end(), bytes.begin(), bytes.end());
+    }
+    // Records lost between intact ones would replay as a divergence at best,
+    // and at worst as a run the program never made. A damaged tail only
+    // shortens the log, like a truncated one: the prefix still replays.
+    if (reader.damage().spans != 0) {
+      throw ReplayError("log is missing damaged records (" +
+                        log::DescribeDamage(reader.damage()) +
+                        "); exact replay needs every record");
+    }
+    // The dispatch the gap starts in may have its first records before it
+    // (GAP_SPLITS_DISPATCH): it was not recorded whole, so it is not
+    // replayed, and the replay ends on the dispatch boundary before it.
+    if (stopped_at_gap_.has_value()) {
+      const std::uint64_t split = stopped_at_gap_->first_dispatch_index;
+      while (split != 0 && !records_.empty() &&
+             records_.back().header.dispatch_index == split) {
+        stored_.resize(records_.back().offset);
+        records_.pop_back();
+      }
     }
   }
 
@@ -191,10 +230,23 @@ class ReplayEventLoop
   void on_handler_exit() {
     take(EventKind::HANDLER_EXIT, this->context().source_id);
   }
+  // Hides EventLoopBase::on_read: the program must read the recorded source,
+  // and the same value of it, at the same time.
+  void on_read(std::uint16_t id, MonotonicTime now, MonotonicTime publish_time,
+               std::uint64_t sequence) {
+    const Recorded* recorded = take(EventKind::READ, id);
+    if (recorded && (recorded->header.now_ns != now.nanos() ||
+                     recorded->header.publish_time_ns != publish_time.nanos() ||
+                     recorded->header.sequence != sequence)) {
+      report(Divergence{active_dispatch_, id,
+                        "read a different value of source " + source_name(id)});
+    }
+  }
 
   static bool is_operation(EventKind kind) {
     return kind == EventKind::SEND || kind == EventKind::ARM_TIMER ||
-           kind == EventKind::DISARM_TIMER || kind == EventKind::HANDLER_EXIT;
+           kind == EventKind::DISARM_TIMER || kind == EventKind::HANDLER_EXIT ||
+           kind == EventKind::READ;
   }
 
   std::string source_name(std::uint16_t id) const {
@@ -233,7 +285,8 @@ class ReplayEventLoop
       this->dispatch_timer(header.source_id, event_time, now_, header.sequence);
     } else {
       this->dispatch_message(header.source_id, event_time, now_,
-                             header.sequence, header.aux, full_payload(record));
+                             header.sequence, header.aux, full_payload(record),
+                             MonotonicTime::from_nanos(header.publish_time_ns));
     }
 
     active_dispatch_ = 0;
@@ -259,6 +312,14 @@ class ReplayEventLoop
   // Consumes the record a handler operation must correspond to, or reports the
   // mismatch. Returns nullptr when there is nothing usable.
   const Recorded* take(EventKind expected, std::uint16_t source_id) {
+    // A gap that starts outside any dispatch (sends before the first, from
+    // the program's construction) leaves the rest of them unrecorded: they
+    // are past the replayed prefix, not divergences.
+    if (cursor_ >= records_.size() && active_dispatch_ == 0 &&
+        stopped_at_gap_.has_value() &&
+        stopped_at_gap_->first_dispatch_index == 0) {
+      return nullptr;
+    }
     if (cursor_ >= records_.size()) {
       report(Divergence{active_dispatch_, source_id,
                         std::string{"program performed an extra "} +
@@ -317,6 +378,7 @@ class ReplayEventLoop
   std::uint64_t active_dispatch_{0};
   MonotonicTime now_{};
   bool reached_exit_{false};
+  std::optional<log::LogGap> stopped_at_gap_;
 };
 
 }  // namespace talos::event

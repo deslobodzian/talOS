@@ -1,6 +1,6 @@
-// Replay re-runs recorded frames through detection + localization and must
-// reproduce the recorded valid/invalid outcomes at default settings. Uses the
-// field-sim renderer to produce a real tag image with no robot dependency.
+// Replay applies detector overrides to recorded frames rendered without a robot
+// dependency, preserving valid observations unless the quality gate rejects
+// them.
 
 #include "talOS/vision/recording/replay.h"
 
@@ -58,9 +58,8 @@ field_sim::SimCameraView MakeCamera() {
   return cam;
 }
 
-// Renders the clear tag into `gray`, then records one sidecar for it via
-// `recorder` with the given observation validity.
-void RecordTagFrame(FrameRecorder& recorder, bool valid_observation,
+// Render and record a clear tag with a valid observation.
+void RecordTagFrame(FrameRecorder& recorder,
                     std::map<int, field_sim::TagPattern>* patterns) {
   const auto layout = MakeLayout();
   const auto camera = MakeCamera();
@@ -96,15 +95,14 @@ void RecordTagFrame(FrameRecorder& recorder, bool valid_observation,
 
   FrameRecord record;
   record.capture_ns = static_cast<std::uint64_t>(1'000'000);
-  record.observation.valid = valid_observation;
+  record.observation.valid = true;
   record.observation.x_m = 2.0;
   record.observation.y_m = 2.0;
   record.observation.yaw_rad = 0.0;
   record.observation.x_std_m = 0.02;
   record.observation.y_std_m = 0.02;
   record.observation.yaw_std_rad = 0.03;
-  record.observation.tag_count =
-      valid_observation ? static_cast<int>(detections.size()) : 0;
+  record.observation.tag_count = static_cast<int>(detections.size());
   for (const auto& d : detections) {
     DetectionRecord dr;
     dr.tag_id = d.tag_id;
@@ -140,40 +138,6 @@ class ReplayTest : public ::testing::Test {
   std::string error_;
 };
 
-TEST_F(ReplayTest, ReproducesRecordedValidAndInvalidOutcomes) {
-  FrameRecorder::Options opts;
-  opts.output_dir = dir_;
-  opts.sample_hz = 1e12;
-  opts.rejected_hz = 1e12;
-  opts.context.camera = "test_camera";
-  opts.context.width = kWidth;
-  opts.context.height = kHeight;
-  opts.context.intrinsics = MakeCamera().intrinsics;
-  opts.context.mounting = {0.0, 0.0, 0.5, 0.0, 0.0, 0.0};
-  opts.context.detector = {.backend = "cpu",
-                           .decimate = 1.0,
-                           .threads = 1,
-                           .sigma = 0.0,
-                           .refine_edges = true,
-                           .hamming_threshold = 1,
-                           .min_decision_margin = 30.0};
-  {
-    FrameRecorder recorder{std::move(opts)};
-    RecordTagFrame(recorder, /*valid_observation=*/true, &patterns_);
-  }  // destructor drains the writer
-
-  const auto layout = MakeLayout();
-  ReplayStats stats;
-  std::string error;
-  ASSERT_TRUE(
-      ReplayFrames(dir_.string(), layout, DetectorOverrides{}, &stats, &error))
-      << error;
-  EXPECT_EQ(stats.frames, 1u);
-  EXPECT_EQ(stats.valid_before, 1u);
-  EXPECT_EQ(stats.valid_after, 1u);
-  EXPECT_GT(stats.rejections_after["(valid)"], 0u);
-}
-
 TEST_F(ReplayTest, RaisingMinDecisionMarginReducesValidDetections) {
   FrameRecorder::Options opts;
   opts.output_dir = dir_;
@@ -193,7 +157,7 @@ TEST_F(ReplayTest, RaisingMinDecisionMarginReducesValidDetections) {
                            .min_decision_margin = 30.0};
   {
     FrameRecorder recorder{std::move(opts)};
-    RecordTagFrame(recorder, /*valid_observation=*/true, &patterns_);
+    RecordTagFrame(recorder, &patterns_);
   }
 
   const auto layout = MakeLayout();
@@ -202,6 +166,9 @@ TEST_F(ReplayTest, RaisingMinDecisionMarginReducesValidDetections) {
   ASSERT_TRUE(ReplayFrames(dir_.string(), layout, DetectorOverrides{},
                            &default_stats, &error))
       << error;
+  EXPECT_EQ(default_stats.frames, 1u);
+  EXPECT_EQ(default_stats.valid_before, 1u);
+  EXPECT_EQ(default_stats.valid_after, 1u);
   EXPECT_GT(default_stats.rejections_after["(valid)"], 0u);
 
   DetectorOverrides high;

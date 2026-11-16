@@ -1,0 +1,8 @@
+[subsystems.test.motors.motor]
+can_id = 1
+
+[subsystems.test.encoders.duty_cycle_encoder]
+type = "DutyCycleEncoder"
+dio = 4
+offset_rot = 0.125
+counts_per_rev = 4096.0

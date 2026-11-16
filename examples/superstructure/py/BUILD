@@ -43,6 +43,11 @@ py_test(
     ],
     env = {"TALOS_TEST_CONFIG": "$(rlocationpath //examples/superstructure/config:robot_py.toml)"},
     legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         "//examples/superstructure/messages:messages_py",
         "//talOS/python:testing",

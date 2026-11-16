@@ -1,4 +1,0 @@
-include = "robot.toml"
-
-[subsystems.drivetrain]
-integrate_heading = false

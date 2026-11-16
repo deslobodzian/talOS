@@ -4,15 +4,68 @@
 
 The **main processor** (a coprocessor running Linux, or a laptop in
 simulation) runs every node. The **controller processor** (the RoboRIO,
-`2026-robot/controller_processor/rio`) is only the hardware layer: it owns the
+`controller_processor/rio`) is only the hardware layer: it owns the
 motors, sensors and the Driver Station link and runs no robot logic.
 
 They talk over UDP (`talOS/protocol`; gateway port 5802, main-processor port
 5803). On the main processor `//talOS/bridge:hardware_node` is the courier: it
 collects each node's `/hw/request/<node>`, sends the commands to the RoboRIO,
 and publishes what comes back on `/hw/state` and `/hw/state/driver_station`.
-In simulation `//2026-robot/main_processor/simulation:sim_gateway` (or the
-RoboRIO program under WPILib simulation) takes the RoboRIO's place.
+In simulation `//talOS/simulation:sim_gateway`, which the launcher starts on
+the ports it gives the bridge, or the RoboRIO program under WPILib
+simulation takes the RoboRIO's place.
+
+The split puts every motor behind the main processor. Because the RoboRIO
+runs no robot logic, anything that stops the main processor commanding (a
+pulled Ethernet cable, a brownout reset, a crash, a boot not yet finished)
+stops the whole robot: the RoboRIO neutralizes every output once the last
+command expires, and its loop watchdog does so if its own loop stalls
+([the tick](#the-tick); [watchdog](talOS/hardware/README.md#roborio)), while
+the Driver Station shows a `talos companion link` error. The robot stays
+neutral until the main processor is back with its nodes running and, for
+operator input, the sticks have returned to neutral ([targets](#targets)).
+A design that ran its control on the RoboRIO would lose only what the
+coprocessor adds, such as vision. What the split buys: robot logic runs off
+the RoboRIO's two cores, which its CAN, NetComm and gateway threads share,
+on a Linux or macOS host with realtime loop tiers and shared-memory topics;
+every node runs and is tested without WPILib, in `testing::Sim` or against
+`sim_gateway`; a node is a function of its logged inputs and their times, so
+a session replays ([talOS/events](talOS/events/README.md#recording-and-replaying));
+and Python nodes run the same framework through `talOS/node_api`. The main
+processor's power, brownout ride-through and boot time are properties of the
+robot's integration, not of this software, and are measured at the bench
+([docs/BENCH.md](docs/BENCH.md)).
+
+A controller processor is a program at the gateway end of `talOS/protocol`.
+The RoboRIO program, its WPILib simulation and `sim_gateway` all run the
+same `hardware::Gateway` and `hardware::Endpoint` (configuration, command
+checks, expiry, State, clock-probe echo) with the protocol and Driver Station
+codecs unchanged, and each supplies only:
+
+- a `hardware::Backend` (`talOS/hardware/gateway.h`) for its devices
+  (`PhoenixBackend`; `SimBackend`, `sim::PhysicsSimBackend`);
+- a fixed-period loop that ticks the `Endpoint` on a monotonic clock
+  (`Gateway::SetClock`) with the Driver Station's enable, observes the same
+  flags in one `driver_station::ModeTracker` every tick, and sends Driver
+  Station packets stamped by it and carrying the gateway's boot id (random
+  and nonzero per program start, the one its State carries);
+- its Driver Station source (the RoboRIO's NetComm reader, a scripted one in
+  simulation);
+- a UDP socket connected to one companion address (built into the RoboRIO
+  program, loopback for `sim_gateway`), on hardware reopened until a route
+  exists and replaced when `protocol::SendErrorNeedsNewSocket` says so;
+- on hardware, a watchdog outside the loop thread that neutralizes the
+  outputs when the loop stalls past the command's expiry, since the gateway
+  acts only when ticked;
+- its `hardware::GatewayProgram` in the State's build; adding one changes
+  the State codec and so `protocol::kProtocolVersion`.
+
+The wire format names RoboRIO hardware: CAN bus slot 0 is `"rio"`, and the
+device kinds are TalonFX, CANcoder, Pigeon2 and the RoboRIO's digital,
+analog, encoder and PWM I/O; a controller with other devices adds a device
+type ([where a new thing goes](#where-a-new-thing-goes)). The RoboRIO
+program's saved configuration, companion-link report and console log are
+its own; the bridge relies on none of them.
 
 See [Data flow and byte budgets](docs/DATA_FLOW.md) for every transport,
 producer/consumer, rate, dynamic payload, and shared-memory slot size.
@@ -20,8 +73,8 @@ producer/consumer, rate, dynamic payload, and shared-memory slot size.
 ## Layers
 
 ```
-robot code        2026-robot/main_processor/*, examples/*
-talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, Target, TargetLane, testing::SimHardware
+robot code        a robot repository's nodes; bench/main_processor/*, examples/*
+talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, Target, TargetLane, OperatorArming, testing::SimHardware
 talOS/node        Node, Subscription, Publisher, StateMachine, TALOS_NODE, testing::Sim
 talOS/python      the same API in Python, ctypes over talOS/node_api (libtalos_node.so)
 talOS/events      event loop, dispatch log, replay
@@ -30,21 +83,27 @@ talOS/rtms        shared-memory topics, on talOS/memory and talOS/ipc
 
 Allowed dependencies:
 
-- Each layer depends only on layers below it. `talOS/node` knows nothing about
-  hardware; `talOS/devices` is built on `Node`'s public API
-  (`extension<T>()`, `after_update()`).
+- Each layer depends only on layers below it. `talOS/node` drives no
+  hardware: it knows the hardware request topic, `/hw/request/<node>`, only to
+  open it for the devices layer's flush, carry that layer's
+  `untargeted_outputs` attribute on it, and refuse it to every other publisher
+  ([NAMING.md](talOS/NAMING.md#topics)), and reads the hardware config only
+  for timeouts and actuator ownership (its loop tier). `talOS/devices` is
+  built on `Node`'s public API (`extension<T>()`, `after_update()`) and the
+  framework hooks in `detail::NodeAccess`.
 - `talOS/` never depends on a robot, an example or `studio/`.
 - Python reaches talOS only through the C ABI in `talOS/node_api`; it does not
   reimplement a wire format, a memory layout, a state machine, or a C++ node
   (C++ nodes exposed to Python use `TALOS_EXPORT_NODE` and `talos.cpp_node`).
 - Adding a node in one language never requires modifying code in another
-  language: cross-cutting robot wiring (target policies, `driver` / `teleop`,
-  `telemetry`) is driven by TOML configuration.
+  language: cross-cutting robot wiring (target policies, `teleop`, `telemetry`) is driven by TOML configuration.
 - Nodes share only messages and topic names (`talos_messages`), never each
   other's classes.
-- Geometry and vision are reusable libraries beside the node stack:
-  robot camera nodes depend on `talOS/vision`, which depends on
-  `talOS/geometry`, never the reverse.
+- Geometry, vision, trajectory and aiming are reusable libraries beside the
+  node stack: robot camera nodes depend on `talOS/vision`, and an autonomous
+  routine may depend on `talOS/trajectory`; both depend on `talOS/geometry`,
+  never the reverse; `talOS/aiming` depends only on `talOS/geometry` and
+  `talOS/msgs`.
 
 Beside the stack:
 
@@ -53,19 +112,33 @@ Beside the stack:
 | `talOS/configuration` | parses `robot.toml` and the subsystem files |
 | `talOS/hardware` | hardware config, request/state messages, the gateway the RoboRIO and sim run |
 | `talOS/protocol` | frame and UDP wire format |
-| `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power/CAN health and gateway counters, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `--log` records every command sent and state received |
+| `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power and each CAN bus's health (assembled by `:can_buses`, which `testing::SimHardware` also runs), gateway counters and build, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `:merge` holds the request merge rules (owner timeout, merged observation) that `testing::SimHardware` also runs; `--log` records every command, State and status it publishes, with the sequence and stamp its readers see |
 | `talOS/driver_station` | Driver Station codec |
-| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes, at most `[robot] max_restarts` per restart window); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph |
+| `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph; `:log_dump` prints its `.tlog`s and `:tlog_to_wpilog` converts them to `.wpilog` |
+| `talOS/simulation` | `:sim_gateway`, the lightweight simulator that stands in for the RoboRIO for any robot config: devices from the config's hardware, ideal or `--physics` backend, scripted mode, joystick and fault schedules, `/sim/state` truth; the launcher starts it under `--start-sim-gateway` on the bridge's ports |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
-| `talOS/process` | stop handlers and `ConfigureRealtime` for node binaries |
+| `talOS/process` | stop handlers and the stop pipe a node's loop and the launcher's start-up watch, `ConfigureRealtime` for node binaries and `ConfigureBackgroundThread` for their helper threads; `DurableSync`, the power-loss-safe sync of the launcher's session files and event logs |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |
-| `talOS/telemetry` | `:node` framework node, telemetry frame schema, byte-topic wire format; schema-less `/hw/state` is excluded because `/hw/status` (`bridge::BridgeStatus`) already reports link health. |
+| `talOS/telemetry` | `:node` framework node; `:channels`, the channel model (a topic's channels by field path, kind, unit and enum labels, and their values from a message's bytes) the node's dictionary is built from; telemetry frame schema, byte-topic wire format; schema-less `/hw/state` is excluded because `/hw/status` (`bridge::BridgeStatus`) already reports link health. |
 | `talOS/teleop` | `:node` framework teleop node; `:deadband` stick deadband calculation; declarative button/axis-to-lane mapping |
-| `talOS/schema` | `talos::Descriptor<M>` (`.bfbs` bytes, name, schema hash), `talos::schema::struct_hash`, the unit-suffix table; Python `talos_schema` and upstream `reflection` classes |
-| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
+| `talOS/schema` | `talos::Descriptor<M>` (`.bfbs` bytes, name, schema hash), `talos::schema::struct_hash`, the unit-suffix table, field paths (`:field_path`: a struct's scalar by `a/b` path, encoded from TOML by `teleop`, read per tick by `telemetry`); Python `talos_schema` and upstream `reflection` classes |
+| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_cc_shared_node` (C++ nodes for `talos.cpp_node`, linked against `libtalos_node.so`), `talos_messages`, `talos_bundle`, `talos_graph_test` and `talos_sim` (`bazel run` of a config against the simulator; the last three fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`), `talos_sim_test` (runs a `talos_sim` target and fails unless every member ran once and exited 0 and the bridge received State); each names its own talOS targets by `Label`, so it works with talOS as `@talos` |
+| `talOS/mechanisms` | configured building blocks for robot nodes: `PositionMechanism`, `VelocityMechanism`, `RollerWithSensor`; depends only on `talOS/devices`' public API (handles, `robot_enabled`, `RequireInUpdate`), `talOS/node`, `talOS/configuration`, `//talOS/hardware:config` (a motor's own config: limits, frame, gains) and `//talOS/msgs:control`, and is used by robot code; a node still gates on its own `Target`. `talOS/node_api` wraps the classes in its C ABI, so Python nodes compose them as `talos.mechanisms` |
 | `talOS/geometry` | header-only SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); C++ drivetrain kinematics and vision transforms |
-| `talOS/vision` | camera/frame/backend contracts, calibration, localization and pipeline; AprilTag 3.4.5 CPU detection, macOS Metal preprocessing/CCL, AVFoundation/V4L2 capture, field simulation and fixtures; OpenCV 4.12 image conversion/IO |
+| `talOS/aiming` | shooter aiming library (no node): `ShotTable` (distance → flywheel, hood, time of flight; clamped and flagged outside its range), `TargetSolver` (static and shoot-on-the-move aim for a fixed shooter or a turret, bounded time-of-flight iteration) and `ReadinessGate` (ready to fire, first failing reason, tick debounce) |
+| `talOS/trajectory` | time-indexed holonomic trajectories (`sample(t)`, event markers, splits), the Choreo `.traj` loader (`@nlohmann_json`), straight-line moves between two poses (`MakeStraightLine`, trapezoidal, allocation-free into a reserved trajectory), alliance flips (rotate or mirror) and `HolonomicFollower` (feedforward plus PID to a chassis speed); depends only on `talOS/geometry` |
+| `talOS/vision` | camera/frame/backend contracts, calibration, localization and pipeline; AprilTag 3.4.5 CPU detection, macOS Metal preprocessing/CCL, AVFoundation/V4L2 capture, recorded-footage playback (`playback`, a `camera.device = "recording:<dir>"`) and its hand-run evaluation (`evaluation`), field simulation and fixtures; OpenCV 4.12 image conversion/IO |
 | `talOS/python/requirements.txt` | Python `robotpy-wpimath` pose estimation and GTSAM factor graphs; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy wheels, not C++ dependencies |
+
+Live node identity is registered before user construction, with the
+`kFlagConstructing` lifecycle flag and independent bookkeeping heartbeats.
+Endpoints and active-reader liveness appear only after the event loop starts;
+the launcher then compares each run's endpoints with its `--describe` probe
+once ([live endpoints](talOS/launcher/README.md#live-endpoints)).
+The launcher enforces a fixed 30-second construction deadline from spawn;
+processes with no registry row retain the ordinary 5-second startup grace.
+Neither initializing nor failed optional nodes block control peers.
+
 
 ## The tick
 
@@ -73,17 +146,63 @@ A node's `update()` runs every `period_us` (the subsystem's, else `[robot]`).
 After each tick the devices layer flushes one hardware request for the node:
 
 - a motor not set during that tick is sent neutral;
-- every motor is neutral while `robot_enabled(node)` is false (no accepted
-  hardware state, gateway not enabled, a fault, or a state older than
-  `[robot] command_timeout_us`);
-- digital and PWM outputs set during the tick are sent as set only while
-  `robot_enabled(node)` is true; otherwise DIO is false and PWM is zero;
+- the tick drives only while `robot_enabled(node)` is true (an accepted
+  hardware state, gateway enabled, no fault, and that state younger than
+  `[robot] command_timeout_us`) and one of the node's `talos::Target`s
+  returned a target from a `get()` made during that `update()`
+  ([Targets](#targets)); a node whose constructor called
+  `talos::AllowUntargetedOutputs` drives on `robot_enabled(node)` alone;
+- in a tick that does not drive every motor is neutral, DIO false and PWM
+  zero, and the request is still sent (while the robot is enabled and that
+  `update()` set an output non-neutral, Studio's system view marks the node
+  `outputs held: no live target`); in one that drives, digital and PWM
+  outputs set during it are sent as set;
 - motor demand and feedforward are clamped to that motor's configured limits;
   non-finite values neutralize only that motor. `Motor::clamped_count()` counts
-  adjusted setter calls for the lifetime of the device.
+  adjusted setter calls for the lifetime of the device;
+- a motor's position and motion-magic demands are sent neutral while no
+  `Motor::rezero` holds for it (never taken, or dropped on a gateway boot or
+  device reset that may have restarted its frame), unless its config sets
+  `position_frame = "absolute"` (a remote CANcoder's frame, which survives a
+  reset while one CANcoder rotation covers the travel; see
+  [position frames](docs/NODE_DEVELOPMENT_GUIDE.md#rezero-and-position-frames)).
+
+Output setters (motor, digital, PWM) are therefore accepted only inside
+`update()`; from the constructor, `every()` or a message callback they throw
+`std::logic_error` naming the device (`TalosError` in Python), since such a
+command would reach the hardware for at most one tick.
 
 A subscription's `fresh()` means a value younger than `command_timeout_us`, so
 a node that stops hearing its target goes neutral on its own.
+
+A node that stops sending requests goes neutral at the bridge once its last
+accepted request is older than its owner timeout,
+`max(2 × period_us, command_timeout_us / 2)` and never more than
+`command_timeout_us` (50 ms for every bench subsystem): the bridge,
+which otherwise sleeps until a gateway datagram or a request arrives, wakes
+for that instant. A shorter gap, such as a late or missed tick, keeps its
+last demand. Whatever the bridge does, the RoboRIO neutralizes it within
+`command_timeout_us` of the State its last request was built from (plus
+the RoboRIO loop's lateness; if that loop stalls, its
+[watchdog](talOS/hardware/README.md) acts two loop periods and one 5 ms
+poll later), but by invalidating every output: the merged command carries the oldest observation
+of any owner still merged. Because an actuator owner's `period_us` is at most
+`command_timeout_us / 4` (below), its owner timeout is half the timeout, so
+the owner timeout keeps one silent node from stopping the others while the
+State its last request was built from was younger than half the timeout
+(50 ms at 100 ms) when the bridge accepted it. A silent owner whose last
+request already observed an older State stops every output; that is the cost
+of tolerating request gaps up to half the timeout.
+
+Config load refuses a `command_timeout_us` shorter than two Driver Station
+packet gaps, `2 × (20000 + [robot] period_us)` µs (a node's Driver Station view
+expires at the timeout, and consecutive packets can be 20 ms plus one gateway
+tick apart), or longer than 500000 µs. It also refuses a subsystem owning a
+motor, digital output or PWM output whose `period_us` exceeds a quarter of the
+timeout, and a `[robot] status_hz` giving fewer than four status periods per
+timeout (`status_hz × command_timeout_us < 4000000`), since the gateway counts
+motion feedback that is `command_timeout_us` old as invalid
+([fault scope](talOS/hardware/README.md#runtime-contract)).
 
 ## Targets
 
@@ -96,46 +215,121 @@ has nothing to say). The consumer resolves its own lanes with
 `talos::Target<M>`: `get()` returns the first lane, in the priority order the
 config gives for the current Driver Station mode, that is active, fresh and
 stamped with the consumer's current mode generation, and only while
-`robot_enabled(node)`; otherwise null, and the node goes neutral. The policy
+`robot_enabled(node)`; otherwise null, and the node goes neutral. The devices
+flush enforces it: a tick in which no Target of the node returned a target
+sends every output neutral, whatever `update()` set.
+`talos::AllowUntargetedOutputs(node)` (`talos.allow_untargeted_outputs`)
+exempts a test or bench fixture; `--describe` marks its hardware request
+`untargeted_outputs`. The policy
 is `[robot.targets]` (defaults: teleop `["teleop"]`, autonomous `["auto"]`,
 test none) with a per-subsystem `[targets]` override. No process sits between
 a producer and its subsystem, so a subsystem's safety depends only on its own
 process and the bridge. Each `get()` records the selected source in the node's
 live registry row, which is how Studio's system view shows who drives each
-subsystem.
+subsystem. A missing optional policy lane remains a warning. With
+`[robot] require_target_coverage = true` (default: `commissioned`'s value), every described
+subsystem that reads its own target lanes must have at least one writer among
+each nonempty Driver Station mode's policy sources; missing coverage is a graph
+error naming the subsystem, mode, and lanes. `commissioned = true` requires
+target coverage as `require_target_coverage = true` does (the config file's
+`commissioned`, not `--sim`'s in-memory one), and config load refuses it
+beside an explicit `require_target_coverage = false`; a subsystem with no
+producer for a mode yet empties that mode in its `[targets]`.
 
 The mode generation is what keeps a target issued under an earlier enable or
 mode from ever actuating. The RoboRIO program (and `SimHardware`,
-`send_joystick`) stamps each Driver Station packet with `mode_since_us`, the
-sample time of the first packet in the current mode, via one
-`driver_station::ModeTracker`; disabling, re-enabling, switching mode,
+`send_joystick`) stamps each Driver Station packet with `mode_since_us` via one
+`driver_station::ModeTracker`: the time of the first observation in the current
+mode; the RoboRIO observes every hardware tick independently of the 20 ms packet
+publication cadence. Disabling, re-enabling, switching mode,
 e-stopping or re-attaching starts a new generation, and the bridge forwards it
-unchanged. `TargetLane::send` stamps the generation its own node last drained
+unchanged. Each packet also carries the gateway's boot id (the one its State
+carries): generations and sample times order packets only within one boot, so
+a consumer starts over on a RoboRIO reboot (whose clock restarts low) and
+ignores packets of recently retired boots, and the bridge forwards only the
+boot of its accepted State. `TargetLane::send` stamps the generation its own
+node last drained
 (0 while that view is stale, disabled or in no mode); `Target::get` accepts a
 lane only when its stamp is nonzero and equals the generation the consumer
 last drained. Receipt time cannot do this: a target queued before a mode
 change and the packet that changes the mode can be drained together, at one
 instant. A Driver Station link that drops and returns in the same mode keeps
-its generation, so the producer drives again once its lane is fresh.
+its generation.
 
-Messages reach a node when its loop drains its topics. A node without message
-callbacks drains right before each of its own timers (`update()`, `every()`)
-and otherwise sleeps; a node with a `subscribe` callback or a Driver Station
-listener, or with no timer, drains every 1 ms. Ages count from the drain, so
-for the first kind a message can be up to one period older than `age()`
-reports, and a silent target is judged stale at most one period after
-`command_timeout_us`. The simulated loop uses the same rule, and replay
-reproduces either from the log. Off-simulation the loop thread runs under
-`SCHED_FIFO` (Linux) or the Mach time-constraint policy (macOS) with memory
-locked, best effort (`talOS/process`).
+The generation does not stop a producer from turning a joystick held through
+a disable into a new target of the next generation. A producer of operator
+input therefore opens its lanes with a `talos::OperatorArming` (`target.h`;
+`talos.OperatorArming` in Python), as the declarative `teleop` does, and
+evaluates it on every reading of its inputs. An evaluation that finds every input neutral, while the Driver Station shows a mode, arms it;
+until then the lane's `send()` goes out as a release. It disarms at startup;
+when the Driver Station shows no mode, a new generation or a new gateway
+boot (so after a disable, however brief, even one no evaluation sampled);
+when the link recovers from a stale spell (sampled or not); when the
+producer's evaluations stop for `command_timeout_us`; and on `disarm()`. A
+`TargetLane` without an `OperatorArming` is never held: the graph lint cannot tell operator input
+from an autonomous producer, so using `OperatorArming` is the producer's
+job.
 
-Freshness counts from receipt by design: targets carry no send time. A
-consumer that stalls (a Python GC pause, CPU starvation) and then drains reads
-the producer's latest value as new, so it can act on a value as old as the
-stall for up to another `command_timeout_us`. This is accepted for C++ and
-Python nodes alike: the mode generation still refuses anything sent under an
-earlier enable or mode, and the bridge neutralizes a subsystem whose own
-requests stop (`/hw/status` `timed_out_mask`).
+Messages reach a node when its loop drains its topics. Every node drains right
+before each of its own timers (`update()`, `every()`), so a timer sees what was
+published by its deadline whether or not the node has callbacks, and otherwise
+sleeps. A `subscribe` callback (`Wake::kOnPublish`, the default), or a Driver
+Station listener, makes that topic wake the node: its publisher notifies the
+sleeping loop, which drains every subscription at once. A callback opened with
+`Wake::kAtDrain` (`wake=talos.Wake.AT_DRAIN`) still receives every message in
+sequence but wakes nothing: its messages wait for the node's next drain, before
+a timer or on another topic's wake. In a node with no timer every subscription
+wakes it, `kAtDrain` included, since nothing else would drain it.
+While it waits on such a topic the loop also drains at least once a second, in
+case a publisher died before notifying. `testing::Sim` models a wake as a
+drain at the publication's instant.
+Off-simulation the loop thread runs realtime, best effort, in one of three
+tiers the process picks itself: the bridge above control nodes (a node whose
+own subsystem owns a motor, digital or PWM output, or that writes a target
+lane) above observers (every other node). Linux gives each tier its own
+`SCHED_FIFO` priority below PREEMPT_RT's interrupt threads; macOS runs the
+bridge and control nodes under the Mach time-constraint policy, which has no
+priority among them, and observers timeshare below it. The loop's
+shared-memory rings and stack are prefaulted and locked; Linux also locks
+all other memory (`mlockall`), while macOS only prefaults the talOS code
+(`talOS/process`; the priorities, what is locked on each OS and
+`TALOS_REALTIME`'s override are in the node development guide's realtime
+scheduling paragraph). Helper threads, such as camera capture
+and AprilTag detection, run below every loop thread
+(`ConfigureBackgroundThread`).
+
+Messages become visible when the consumer drains its topics, but `age()` and
+`fresh()` count from the writer's publication timestamp. Draining an expired
+message cannot revive it. A subscription delivers only messages published
+after it attached, which it does when the node's constructor opens it (RTMS
+starts a new reader at the writer's next publication, and a simulated
+subscription likewise): a node that starts or restarts never acts on a target,
+a Driver Station packet or a hardware state published before then, however
+young, so a consumer restarted within `command_timeout_us` in an unchanged
+generation stays neutral until its producer publishes again. A node that
+attached earlier and drains late (paused, or a slow first tick) still judges
+what it drains by publication time. Subscriptions without per-message
+callbacks dispatch only the newest available message, counting skipped
+messages as dropped;
+callback subscriptions retain sequence delivery, capped at 64 messages per
+topic per drain; a drain that stops at the cap is followed at once by another,
+for a waking topic and a `kAtDrain` callback alike, with due timers between.
+Each realtime timer dispatch samples its own clock. Simulation and replay
+preserve publication-age semantics.
+Simulated topics retain RTMS's
+1024-slot overwrite window (1023 guaranteed readable messages), with identical
+latest-value skips and sequence-drop accounting. `testing::Sim::pause(name,
+duration)` stops one node's drains and timers while its clock and peers advance;
+`resume(name)` resumes early. Overdue periodic timers coalesce on their original
+phase, as after SIGSTOP/SIGCONT. Simulation dispatches nodes serially on one
+chronological frontier: each step runs every node's loop up to the earliest
+pending timer or waking publication of any of them, so no node sees a
+publication from its future, and at one instant nodes run in the order they
+were added, in rounds that repeat while a node is woken by a publication made
+there after it ran (bounded at 1000; a zero-time publish cycle fails the
+step). It does not model
+concurrent copies, torn reads, OS scheduling jitter, or the CPU cost of
+handlers.
 
 ## Topics and messages
 
@@ -158,37 +352,60 @@ requests stop (`/hw/status` `timed_out_mask`).
   an existing `/~` name is idempotent. Production runs with neither variable
   retain their ordinary names; publishers, subscribers, launcher session
   cleanup, the registry and Studio all use the same mapping.
-- Dispatch logs (`.tlog` format version 5) carry each logged topic's schema
+- Dispatch logs (`.tlog` format version 8; a build also reads version 7)
+  carry each logged topic's schema
   descriptor, allowing `log_dump` to decode payloads to named fields without
-  the recording build.
+  the recording build, and `tlog_to_wpilog` to convert a session to a WPILib
+  `.wpilog` that AdvantageScope opens (one entry per message field;
+  [talOS/launcher/README.md](talOS/launcher/README.md#converting-a-session-to-wpilog)).
 - Every user topic's slot is 8-byte aligned, matching FlatBuffers struct rules.
 - The FlatBuffers namespace is the short subsystem name (`shooter`, `intake`,
   `drivetrain`); C++ includes `<package>/<file>_generated.h`, Python imports
   `<namespace>.<Struct>`.
-- Topic names are declared once, in the package's `topics.h`, and follow
-  [talOS/NAMING.md](talOS/NAMING.md).
+- Topic names are declared once in the package's `BUILD` via
+  `talos_messages(topics = ...)`, which generates the package's `topics.h`,
+  and follow [talOS/NAMING.md](talOS/NAMING.md).
 - One writer per topic. Several producers of a target each write their own
   lane, and the consumer picks one (see "Targets").
+- Who may write the `hw` namespace (the bridge, and each node's devices
+  layer for its own request) is in [NAMING.md](talOS/NAMING.md#topics).
 - The launcher refuses to start a graph that breaks a naming or graph rule
-  (`--allow-graph-errors` overrides).
+  (`--allow-graph-errors`, accepted only with `--sim`, overrides).
 
 ## Configuration
 
 ```
 configuration/robot.toml        [robot] period, timeouts, controller address
                                 [robot.targets] target lanes per Driver Station mode
-                                [studio] viewer bridge
+                                [studio] viewer bridge; dashboard = "dashboard.toml", the driver
+                                dashboard's layout (talOS/telemetry/README.md)
                                 [[subsystems]] name + path, one per subsystem
 configuration/subsystems/*.toml [subsystem] name, node = "//...:node", period_us,
                                 custom keys (node.param), [motors.*] and other devices,
-                                [targets] lane priorities per mode
+                                [targets] lane priorities per mode,
+                                [trajectories] name = "path" data files
 ```
 
 A manifest entry may also set `node = "//...:target"`, which overrides the
 subsystem file's `node`, so one set of subsystem files can serve two manifests
 (see `examples/superstructure/config/`). A single-file `robot.toml` with
 `[subsystems.<name>]` tables also works; most test configs use it. Devices are
-addressed by name.
+addressed by name. A subsystem key the framework does not own
+(`config::kFrameworkSubsystemKeys`) is a node's parameter, so config load
+refuses only a framework section spelled in the singular (`target`, `motor`,
+`sensor`, ...), naming the key and its subsystem file (or
+`[subsystems.<name>]` in a single-file config). A node declares its
+parameters by reading them in its constructor (`param`, `param_of`), which
+its `--describe` reports, and the launcher refuses a key no node read
+([parameter keys](talOS/launcher/README.md#parameter-keys)).
+`[trajectories]` maps a name to a data file (a Choreo `.traj`), its path
+relative to the file that sets it (a subsystem file's entry overrides its
+defaults file's, and only the effective entries are required and bundled);
+config load refuses a missing file, a non-string or empty path, a name that
+is not a topic segment, a section that is not a table and a
+`[subsystem.trajectories]` under a subsystem file's header, naming the file
+and `trajectories.<name>`, and a node opens it by name
+(`Node::trajectory_path`, [talOS/trajectory](talOS/trajectory/README.md#using-it-from-a-node)).
 Example configs carry placeholder CAN ids; the robot's config carries the
 physical ones and sets `commissioned = true` only after checking them.
 
@@ -196,23 +413,27 @@ physical ones and sets `commissioned = true` only after checking them.
 so `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
 `<dir>/robot_manifest.bzl` (`<stem>_manifest.bzl` for any other config name):
 `NODES`, every node label the config launches, and `CONFIG_FILES`, every file
-it reads besides itself (`include`, `path`, `defaults`). `talos_bundle` and
+it reads besides itself (`include`, `path`, `defaults`, `[trajectories]`
+files, `[studio] dashboard`). `talos_bundle`, which ships them at the same relative layout, and
 `talos_graph_test` take those constants; no BUILD file lists nodes or
 subsystem files. Each config package has a `manifest_sync_test`
-(`tools/sync_manifest.bzl`) that fails, printing the regenerate command, when
-the config changes and the manifest does not.
+(`tools/sync_manifest.bzl`). `talos_bundle` additionally runs the same check as
+a build action and consumes its success stamp before assembly, so a stale
+manifest fails the build with the regenerate command.
 
 ## Where a new thing goes
 
 | New thing | Where |
 |---|---|
-| a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
+| a mechanism | a node package beside the robot config's other nodes, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; in a robot repository `bazel run @talos//tools:new_subsystem -- <name> --lang cpp\|py`, from its root, does all of it, putting the package in the directory that holds most of the config's own nodes (the repository root, `<name>/`, in one made from the template; `main_processor/<name>/` where they are `//main_processor/<node>:node`), else beside the config ([examples/robot_repo](examples/robot_repo/README.md#add-a-subsystem)); inside talOS `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --robot <robot>` does it for `<robot>/main_processor/<name>/` (walkthrough in [examples/superstructure](examples/superstructure/README.md)). A node is best a thin wrapper over a [`talOS/mechanisms`](talOS/mechanisms/README.md) building block (`talos.mechanisms` in Python), as `examples/superstructure/cpp/elevator.h` and the generated `--type position` node are |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
-| a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
-| a message or topic | the owning package's `.fbs` and `topics.h` |
-| a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>`, and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
+| a camera | a camera node of the robot's, built on `talOS/vision`, with its calibrated subsystem file `subsystems/<camera>.toml` beside the robot config ([calibration](docs/BRINGUP.md#camera-intrinsics-calibration)), a `[[subsystems]]` entry and regenerated manifest |
+| a trajectory | a Choreo `.traj` file (beside its `.chor` project) in a `trajectories/` directory beside the robot config, named in the following node's subsystem file under `[trajectories]` and loaded with `talOS/trajectory`; regenerate the manifest so `CONFIG_FILES`, and the bundle, carry it |
+| a message or topic | the owning package's `.fbs` and `BUILD` declaration via `talos_messages(topics = ...)`, which generates `topics.h` |
+| a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>` (opened with a `talos::OperatorArming` when it maps operator input), and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |
 | a node-API feature | `talOS/node`, mirrored in `talOS/node_api` and `talOS/python/talos` |
-| a robot | a sibling of `2026-robot/` |
+| a robot | its own repository (next row): `bazel run //tools:new_robot -- <name> --standalone DIR`, from a talOS checkout, makes one ([docs/FIRST_MECHANISM.md](docs/FIRST_MECHANISM.md)). Inside talOS, for its own tests, a directory at the workspace root like `bench/`: `bazel run //tools:new_robot -- <name> --mechanism <mech> --lang cpp\|py` writes its configuration (teleop, telemetry), simulation config `robot_sim.toml`, manifests, graph tests, bundle and first mechanism; `./sim.sh --config <name>/main_processor/configuration/robot_sim.toml --sim-gateway` runs it |
+| a robot in its own repository | a Bzlmod repository that pins a talOS checkout with `bazel_dep` + `local_path_override` (one beside the repository, `../talos`, or a git submodule `talos/`; [glossary](docs/GLOSSARY.md)), its configs naming talOS's programs by `@talos//` labels, with `talos_graph_test`, `talos_bundle`, `talos_sim` and `talos_sim_test`; [examples/robot_repo](examples/robot_repo/README.md) is one, and says what it shares with talOS (`talos.bazelrc`, imported by its `.bazelrc`; `.bazelversion`; the default Python); `new_robot --standalone` copies it without its example mechanisms |
 | a controller processor | a sibling of `controller_processor/rio/` speaking `talOS/protocol` |
 | a viewer tab | `studio/` |

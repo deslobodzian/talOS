@@ -137,3 +137,10 @@
   color: var(--muted);
   max-width: 60ch;
 }
+
+/* A CAN bus whose last read failed or went stale: its state, in the warning
+   colour, where an idle bus would read 0%. */
+.can-unread {
+  color: var(--warn);
+  font-weight: 600;
+}

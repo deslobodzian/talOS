@@ -1,0 +1,7 @@
+# Node test matrix cases (docs/TESTING.md §7) missing today, by test file:
+# `<path> <case> [<case>...]`. None today.
+#
+# CI runs `python3 tools/check_node_matrix.py --baseline <this file>`, which
+# fails on a missing case not listed here and on a listed case that is no
+# longer missing. Delete a case once its test exists or its `matrix: n/a`
+# line gives the reason; never add one.

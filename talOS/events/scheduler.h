@@ -51,6 +51,14 @@ class Scheduler {
     std::make_heap(heap_.begin(), heap_.end(), Later{});
   }
 
+  // Moves every armed deadline by `delta`. All of them move alike, so their
+  // order, and the heap, stand.
+  void shift(Duration delta) {
+    for (Entry& entry : heap_) {
+      entry.deadline += delta;
+    }
+  }
+
   bool empty() const { return heap_.empty(); }
 
   // Earliest deadline, or MonotonicTime::max() when nothing is armed.

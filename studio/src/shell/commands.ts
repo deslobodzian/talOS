@@ -51,10 +51,12 @@ export function filterCommands(commands: readonly Command[], query: string):
   const q = query.trim();
   if (!q) return [...commands];
   return commands
-      .map(command => ({
-         command,
-         rank: score(q, `${command.title} ${command.keywords ?? ''} ${command.hint ?? ''}`)
-       }))
+      .map(command => {
+        const titleRank = score(q, command.title);
+        const rank = titleRank >= 800 ? titleRank + 1000 :
+            score(q, `${command.title} ${command.keywords ?? ''} ${command.hint ?? ''}`);
+        return {command, rank};
+      })
       .filter(entry => entry.rank >= 0)
       .sort((a, b) => b.rank - a.rank ||
                      a.command.title.localeCompare(b.command.title))
@@ -105,7 +107,8 @@ export function relativeEventTime(eventNs: string,
                                   cursorNs: string|null|undefined): string {
   if (cursorNs == null) return '';
   const delta = Number(BigInt(cursorNs) - BigInt(eventNs));
-  if (delta <= 0) return 'now';
+  if (delta < 0) return '+' + duration(-delta);
+  if (delta === 0) return 'now';
   return duration(delta) + ' ago';
 }
 

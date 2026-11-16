@@ -1,6 +1,10 @@
 namespace demo;
 
-enum ElevatorState : ubyte { STOWED, MOVING, AT_GOAL }
+// HOMING: the bottom switch has not zeroed the lift (it drives down only
+// with a live target); HOMING_FAILED: homing timed out or stalled, or the
+// switch read closed well above the zero; neutral until the Driver Station
+// reports disabled.
+enum ElevatorState : ubyte { STOWED, MOVING, AT_GOAL, HOMING, HOMING_FAILED }
 
 // The height the superstructure asks for, on the lane
 // /elevator/target/superstructure.
@@ -10,7 +14,9 @@ struct ElevatorGoal {
 
 // Where the elevator is, on /elevator/state. goal_rot echoes the goal that
 // at_goal refers to, so a reader can tell "at the old goal" from "at mine";
-// with no target it is 0 and at_goal is false.
+// with no target, or while HOMING or HOMING_FAILED, it is 0 and at_goal is
+// false. height_rot counts from the bottom switch; while HOMING it is the
+// unhomed motor position, not a height.
 struct ElevatorStatus {
   state:ElevatorState;
   height_rot:double;

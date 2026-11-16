@@ -10,14 +10,17 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -34,12 +37,135 @@ int Ioctl(int fd, unsigned long request, void* arg) {
   } while (result < 0 && errno == EINTR);
   return result;
 }
+// V4L2ControlDevice over an open device.
+class DeviceControls final : public V4L2ControlDevice {
+ public:
+  explicit DeviceControls(int fd) : fd_(fd) {}
+  std::optional<Range> Query(uint32_t id) override {
+    v4l2_queryctrl query{};
+    query.id = id;
+    if (Ioctl(fd_, VIDIOC_QUERYCTRL, &query) < 0 ||
+        (query.flags & V4L2_CTRL_FLAG_DISABLED)) {
+      return std::nullopt;
+    }
+    return Range{query.minimum, query.maximum};
+  }
+  bool MenuHas(uint32_t id, int32_t value) override {
+    v4l2_querymenu menu{};
+    menu.id = id;
+    menu.index = static_cast<uint32_t>(value);
+    return value >= 0 && Ioctl(fd_, VIDIOC_QUERYMENU, &menu) == 0;
+  }
+  bool Set(uint32_t id, int32_t value) override {
+    v4l2_control control{};
+    control.id = id;
+    control.value = value;
+    return Ioctl(fd_, VIDIOC_S_CTRL, &control) == 0;
+  }
+  std::optional<int32_t> Get(uint32_t id) override {
+    v4l2_control control{};
+    control.id = id;
+    if (Ioctl(fd_, VIDIOC_G_CTRL, &control) < 0) return std::nullopt;
+    return control.value;
+  }
+
+ private:
+  int fd_;
+};
+
+// The pixel format a frame is delivered in for a V4L2 pixel format.
+PixelFormat DeliveredFormat(uint32_t pixel_format) {
+  return pixel_format == V4L2_PIX_FMT_YUYV ? PixelFormat::kYuyv
+                                           : PixelFormat::kGray8;
+}
+}  // namespace
+
+bool DecodeMjpegGray(const uint8_t* data, size_t size, uint32_t width,
+                     uint32_t height, std::vector<uint8_t>& gray) {
+  // uvcvideo pads a frame with zeros after its end-of-image marker; a frame
+  // without one was cut short on the bus.
+  while (size > 0 && data[size - 1] == 0) --size;
+  if (size < 4 || data[0] != 0xff || data[1] != 0xd8 ||
+      data[size - 2] != 0xff || data[size - 1] != 0xd9 ||
+      gray.size() != static_cast<size_t>(width) * height ||
+      size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  // Wrapping `gray` makes imdecode write into it when the JPEG has the
+  // expected size and reallocate (detected below) when it does not. A colour
+  // JPEG decodes its luma only: libjpeg skips the chroma IDCT and colour
+  // conversion for a grayscale output.
+  cv::Mat out(static_cast<int>(height), static_cast<int>(width), CV_8UC1,
+              gray.data());
+  try {
+    cv::imdecode(
+        cv::Mat(1, static_cast<int>(size), CV_8UC1, const_cast<uint8_t*>(data)),
+        cv::IMREAD_GRAYSCALE | cv::IMREAD_IGNORE_ORIENTATION, &out);
+  } catch (const cv::Exception&) {
+    return false;
+  }
+  return out.data == gray.data() && out.cols == static_cast<int>(width) &&
+         out.rows == static_cast<int>(height) && out.type() == CV_8UC1;
+}
+
+namespace {
+
+// Every discrete size and interval `fd` offers in the formats the source
+// opens. A stepwise or continuous range contributes its two ends.
+std::vector<V4L2Mode> EnumerateModes(int fd) {
+  std::vector<V4L2Mode> modes;
+  for (const uint32_t pixel : kV4L2PixelFormats) {
+    bool listed = false;
+    v4l2_fmtdesc description{};
+    description.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    for (; Ioctl(fd, VIDIOC_ENUM_FMT, &description) == 0; ++description.index) {
+      listed = listed || description.pixelformat == pixel;
+    }
+    if (!listed) continue;
+    v4l2_frmsizeenum size{};
+    size.pixel_format = pixel;
+    for (; Ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == 0; ++size.index) {
+      std::vector<std::pair<uint32_t, uint32_t>> sizes;
+      if (size.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+        sizes.emplace_back(size.discrete.width, size.discrete.height);
+      } else {
+        sizes.emplace_back(size.stepwise.min_width, size.stepwise.min_height);
+        sizes.emplace_back(size.stepwise.max_width, size.stepwise.max_height);
+      }
+      for (const auto& [width, height] : sizes) {
+        v4l2_frmivalenum interval{};
+        interval.pixel_format = pixel;
+        interval.width = width;
+        interval.height = height;
+        for (; Ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &interval) == 0;
+             ++interval.index) {
+          if (interval.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+            modes.push_back({pixel, width, height, interval.discrete.numerator,
+                             interval.discrete.denominator});
+          } else {
+            for (const auto& fraction :
+                 {interval.stepwise.min, interval.stepwise.max}) {
+              modes.push_back({pixel, width, height, fraction.numerator,
+                               fraction.denominator});
+            }
+            break;
+          }
+        }
+      }
+      if (size.type != V4L2_FRMSIZE_TYPE_DISCRETE) break;
+    }
+  }
+  return modes;
+}
+
 class Source final : public CameraSource {
  public:
   explicit Source(CameraSourceConfig config) : config_(std::move(config)) {
     mode_ = {config_.width, config_.height, config_.fps, config_.format};
     controls_.exposure_ms = config_.exposure_ms;
     controls_.gain = config_.gain;
+    controls_.auto_exposure = config_.auto_exposure;
+    controls_.auto_gain = config_.auto_gain;
   }
   ~Source() override { Stop(); }
   uint32_t camera_id() const override { return config_.camera_id; }
@@ -49,7 +175,17 @@ class Source final : public CameraSource {
                : config_.device_path;
   }
   std::string name() const override { return device_id(); }
-  std::vector<CameraMode> SupportedModes() const override { return {}; }
+  std::vector<CameraMode> SupportedModes() const override {
+    const int fd = open(device_id().c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return {};
+    std::vector<CameraMode> modes;
+    for (const auto& mode : EnumerateModes(fd)) {
+      modes.push_back({mode.width, mode.height, mode.fps(),
+                       DeliveredFormat(mode.pixel_format)});
+    }
+    close(fd);
+    return modes;
+  }
   CameraMode CurrentMode() const override { return mode_; }
   bool SetMode(const CameraMode& mode) override {
     if (worker_.joinable() || !mode.width || !mode.height ||
@@ -76,6 +212,7 @@ class Source final : public CameraSource {
   bool IsRunning() const override { return running_; }
   bool IsConnected() const override { return running_; }
   uint64_t dropped_frames() const override { return dropped_frames_.load(); }
+  bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
     if (running_) {
       return true;
@@ -83,86 +220,98 @@ class Source final : public CameraSource {
     Stop();
     if (!mode_.width || !mode_.height || !std::isfinite(mode_.fps) ||
         mode_.fps <= 0 || mode_.fps > 1000000) {
-      return false;
+      return Fail("invalid capture mode", 0);
     }
     fd_ = open(device_id().c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd_ < 0) {
-      return Fail();
+      return Fail("open", errno);
     }
     v4l2_capability caps{};
     if (Ioctl(fd_, VIDIOC_QUERYCAP, &caps) < 0) {
-      return Fail();
+      return Fail("VIDIOC_QUERYCAP", errno);
     }
     const uint32_t capabilities = caps.capabilities & V4L2_CAP_DEVICE_CAPS
                                       ? caps.device_caps
                                       : caps.capabilities;
     if (!(capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
         !(capabilities & V4L2_CAP_STREAMING)) {
-      return Fail();
+      return Fail("not a streaming video capture device", 0);
+    }
+    driver_.assign(reinterpret_cast<const char*>(caps.driver),
+                   strnlen(reinterpret_cast<const char*>(caps.driver),
+                           sizeof(caps.driver)));
+    const auto offered = EnumerateModes(fd_);
+    const auto selected =
+        SelectV4L2Mode(mode_.width, mode_.height, mode_.fps, offered);
+    if (!selected) {
+      char wanted[64];
+      std::snprintf(wanted, sizeof(wanted), "%ux%u@%g", mode_.width,
+                    mode_.height, mode_.fps);
+      std::string message = std::string("mode ") + wanted +
+                            " is not offered by the device; it offers:";
+      for (const auto& mode : offered) {
+        message += ' ' + DescribeV4L2Mode(mode) + ',';
+      }
+      if (!offered.empty()) message.pop_back();
+      return Fail(message.c_str(), 0);
     }
     v4l2_format format{};
-    bool selected = false;
-    const uint32_t preferred = mode_.format == PixelFormat::kGray8
-                                   ? V4L2_PIX_FMT_GREY
-                                   : V4L2_PIX_FMT_YUYV;
-    for (uint32_t pixel :
-         {preferred, preferred == V4L2_PIX_FMT_GREY ? V4L2_PIX_FMT_YUYV
-                                                    : V4L2_PIX_FMT_GREY}) {
-      format = {};
-      format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-      format.fmt.pix.width = mode_.width;
-      format.fmt.pix.height = mode_.height;
-      format.fmt.pix.pixelformat = pixel;
-      format.fmt.pix.field = V4L2_FIELD_ANY;
-      if (Ioctl(fd_, VIDIOC_S_FMT, &format) == 0 &&
-          (format.fmt.pix.pixelformat == V4L2_PIX_FMT_GREY ||
-           format.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV)) {
-        selected = true;
-        break;
-      }
+    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    format.fmt.pix.width = selected->width;
+    format.fmt.pix.height = selected->height;
+    format.fmt.pix.pixelformat = selected->pixel_format;
+    format.fmt.pix.field = V4L2_FIELD_NONE;
+    if (Ioctl(fd_, VIDIOC_S_FMT, &format) < 0) {
+      return Fail("VIDIOC_S_FMT", errno);
     }
-    if (!selected) {
-      return Fail();
-    }
-    mode_.width = format.fmt.pix.width;
-    mode_.height = format.fmt.pix.height;
-    mode_.format = format.fmt.pix.pixelformat == V4L2_PIX_FMT_GREY
-                       ? PixelFormat::kGray8
-                       : PixelFormat::kYuyv;
-    stride_ = format.fmt.pix.bytesperline;
-    if (!mode_.height || stride_ < mode_.width * BytesPerPixel(mode_.format)) {
-      return Fail();
-    }
-    const size_t size = static_cast<size_t>(stride_) * mode_.height;
     v4l2_streamparm parm{};
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    parm.parm.capture.timeperframe = {
-        1000, static_cast<uint32_t>(std::lround(mode_.fps * 1000))};
-    Ioctl(fd_, VIDIOC_S_PARM, &parm);
-    auto control = [this](uint32_t id, int32_t value) {
-      v4l2_control c{};
-      c.id = id;
-      c.value = value;
-      Ioctl(fd_, VIDIOC_S_CTRL, &c);
-    };
-    control(V4L2_CID_EXPOSURE_AUTO, controls_.auto_exposure
-                                        ? V4L2_EXPOSURE_AUTO
-                                        : V4L2_EXPOSURE_MANUAL);
-    if (!controls_.auto_exposure && std::isfinite(controls_.exposure_ms) &&
-        controls_.exposure_ms > 0 && controls_.exposure_ms < 214748364) {
-      control(V4L2_CID_EXPOSURE_ABSOLUTE,
-              static_cast<int32_t>(std::lround(controls_.exposure_ms * 10)));
+    parm.parm.capture.timeperframe = {selected->interval_numerator,
+                                      selected->interval_denominator};
+    if (Ioctl(fd_, VIDIOC_S_PARM, &parm) < 0) {
+      return Fail("VIDIOC_S_PARM", errno);
     }
-    if (std::isfinite(controls_.gain) && controls_.gain >= 0 &&
-        controls_.gain < 2147483647) {
-      control(V4L2_CID_GAIN, static_cast<int32_t>(std::lround(controls_.gain)));
+    if (!(parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
+      return Fail("device cannot set its frame interval", 0);
+    }
+    const V4L2Mode granted{format.fmt.pix.pixelformat, format.fmt.pix.width,
+                           format.fmt.pix.height,
+                           parm.parm.capture.timeperframe.numerator,
+                           parm.parm.capture.timeperframe.denominator};
+    if (!V4L2Granted(*selected, granted)) {
+      const std::string message = "driver granted " +
+                                  DescribeV4L2Mode(granted) + " for " +
+                                  DescribeV4L2Mode(*selected);
+      return Fail(message.c_str(), 0);
+    }
+    mode_.width = granted.width;
+    mode_.height = granted.height;
+    mode_.fps = granted.fps();
+    mode_.format = DeliveredFormat(granted.pixel_format);
+    mjpeg_ = granted.pixel_format == V4L2_PIX_FMT_MJPEG;
+    // A compressed frame's size varies; it is decoded into `decoded_`.
+    stride_ = mjpeg_ ? mode_.width : format.fmt.pix.bytesperline;
+    if (!mode_.height || stride_ < mode_.width * BytesPerPixel(mode_.format)) {
+      return Fail("driver reported an invalid stride", 0);
+    }
+    const size_t size =
+        mjpeg_ ? 1 : static_cast<size_t>(stride_) * mode_.height;
+    decoded_.assign(mjpeg_ ? static_cast<size_t>(stride_) * mode_.height : 0,
+                    0);
+    DeviceControls device(fd_);
+    if (const auto error = ApplyV4L2Controls(controls_, device);
+        !error.empty()) {
+      return Fail(("control " + error).c_str(), 0);
     }
     v4l2_requestbuffers request{};
     request.count = 4;
     request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     request.memory = V4L2_MEMORY_MMAP;
-    if (Ioctl(fd_, VIDIOC_REQBUFS, &request) < 0 || request.count < 2) {
-      return Fail();
+    if (Ioctl(fd_, VIDIOC_REQBUFS, &request) < 0) {
+      return Fail("VIDIOC_REQBUFS", errno);
+    }
+    if (request.count < 2) {
+      return Fail("driver granted fewer than 2 buffers", 0);
     }
     mappings_.resize(request.count);
     for (uint32_t i = 0; i < request.count; ++i) {
@@ -170,23 +319,23 @@ class Source final : public CameraSource {
       buffer.type = request.type;
       buffer.memory = request.memory;
       buffer.index = i;
-      if (Ioctl(fd_, VIDIOC_QUERYBUF, &buffer) < 0 || buffer.length < size) {
-        return Fail();
+      if (Ioctl(fd_, VIDIOC_QUERYBUF, &buffer) < 0) {
+        return Fail("VIDIOC_QUERYBUF", errno);
+      }
+      if (buffer.length < size) {
+        return Fail("driver buffer smaller than one frame", 0);
       }
       mappings_[i].size = buffer.length;
       mappings_[i].data = mmap(nullptr, buffer.length, PROT_READ | PROT_WRITE,
                                MAP_SHARED, fd_, buffer.m.offset);
       if (mappings_[i].data == MAP_FAILED ||
           Ioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
-        return Fail();
+        return Fail("mmap/VIDIOC_QBUF", errno);
       }
-    }
-    for (auto& buffer : pool_) {
-      buffer = std::make_shared<std::vector<uint8_t>>(size);
     }
     auto type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (Ioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
-      return Fail();
+      return Fail("VIDIOC_STREAMON", errno);
     }
     streaming_ = true;
     session_ = event::steady_now().nanos();
@@ -223,22 +372,30 @@ class Source final : public CameraSource {
   }
 
  private:
-  bool Fail() {
+  // Reports why Start failed; `error` is the errno of the failed call, or 0.
+  bool Fail(const char* step, int error) {
     Stop();
     if (connection_) {
-      connection_(ConnectionState::kError, "Unable to configure V4L2 camera");
+      std::string message = device_id() + ": " + step;
+      if (error != 0) message += std::string(": ") + std::strerror(error);
+      connection_(ConnectionState::kError, message);
     }
     return false;
   }
   void Capture(const std::stop_token& stop) {
+    std::string reason = "capture stopped";
     while (!stop.stop_requested()) {
       pollfd poll_fd{fd_, POLLIN, 0};
       const int ready = poll(&poll_fd, 1, 100);
       if (ready < 0 && errno == EINTR) {
         continue;
       }
-      if (ready < 0 ||
-          (ready > 0 && (poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL)))) {
+      if (ready < 0) {
+        reason = std::string("poll: ") + std::strerror(errno);
+        break;
+      }
+      if (ready > 0 && (poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        reason = "device error or hangup (unplugged?)";
         break;
       }
       if (!ready) {
@@ -251,6 +408,7 @@ class Source final : public CameraSource {
         if (errno == EAGAIN) {
           continue;
         }
+        reason = std::string("VIDIOC_DQBUF: ") + std::strerror(errno);
         break;
       }
       timespec now{};
@@ -267,43 +425,47 @@ class Source final : public CameraSource {
       const int64_t capture_end = driver_monotonic
                                       ? node_delivery - (delivery - driver_time)
                                       : node_delivery;
-      std::shared_ptr<std::vector<uint8_t>> bytes;
-      for (size_t i = 0; i < pool_.size(); ++i) {
-        size_t index = (next_ + i) % pool_.size();
-        if (pool_[index].use_count() == 1) {
-          bytes = pool_[index];
-          next_ = (index + 1) % pool_.size();
-          break;
-        }
-      }
-      if (bytes && buffer.index < mappings_.size() &&
+      const size_t size = static_cast<size_t>(stride_) * mode_.height;
+      const bool delivered =
+          buffer.index < mappings_.size() &&
           !(buffer.flags & V4L2_BUF_FLAG_ERROR) &&
-          buffer.bytesused >= bytes->size()) {
-        std::memcpy(bytes->data(), mappings_[buffer.index].data, bytes->size());
-        const double exposure =
-            std::isfinite(controls_.exposure_ms) && controls_.exposure_ms > 0
-                ? controls_.exposure_ms
-                : 0;
-        Frame frame(config_.camera_id, session_, sequence_++,
-                    event::MonotonicTime::from_nanos(
-                        capture_end - static_cast<int64_t>(exposure * 500000)),
-                    mode_.width, mode_.height, stride_, mode_.format, bytes);
+          (mjpeg_
+               ? DecodeMjpegGray(
+                     static_cast<const uint8_t*>(mappings_[buffer.index].data),
+                     buffer.bytesused, mode_.width, mode_.height, decoded_)
+               : buffer.bytesused >= size);
+      if (delivered) {
+        // The frame borrows the dequeued driver buffer until it is queued
+        // again below; the consumer copies what it keeps (FrameMailbox).
+        // Preserve source meaning; the camera publication boundary converts
+        // it to a midpoint once (CaptureMidpoint).
+        Frame frame(
+            config_.camera_id, session_, sequence_++,
+            event::MonotonicTime::from_nanos(capture_end), mode_.width,
+            mode_.height, stride_, mode_.format,
+            mjpeg_ ? decoded_.data()
+                   : static_cast<const uint8_t*>(mappings_[buffer.index].data),
+            size);
         frame.set_raw_timestamp_ns(driver_monotonic ? driver_time : delivery);
-        frame.set_timestamp_kind(TimestampKind::kExposure);
+        frame.set_timestamp_kind(V4L2TimestampKind(buffer.flags, driver_));
         frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
         if (callback_) {
           callback_(frame);
         }
       } else {
+        // An errored or short driver buffer, or an MJPG frame that is
+        // truncated or does not decode to the mode's size; counted by the
+        // consumer through dropped_frames().
         ++dropped_frames_;
       }
       if (Ioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
+        reason = std::string("VIDIOC_QBUF: ") + std::strerror(errno);
         break;
       }
     }
     running_ = false;
     if (!stop.stop_requested() && connection_) {
-      connection_(ConnectionState::kDisconnected, "V4L2 capture stopped");
+      connection_(ConnectionState::kDisconnected, device_id() + ": " + reason);
     }
   }
   struct Mapping {
@@ -317,14 +479,16 @@ class Source final : public CameraSource {
   ConnectionCallback connection_;
   int fd_{-1};
   bool streaming_{false};
+  bool controls_applied_{true};
   std::atomic<bool> running_{false};
   std::atomic<uint64_t> dropped_frames_{0};
   std::jthread worker_;
   std::vector<Mapping> mappings_;
-  std::array<std::shared_ptr<std::vector<uint8_t>>, 2> pool_;
-  size_t next_{0};
   uint32_t stride_{0};
   uint64_t session_{0}, sequence_{0};
+  std::string driver_;  // VIDIOC_QUERYCAP driver name; set before streaming.
+  bool mjpeg_{false};
+  std::vector<uint8_t> decoded_;  // MJPG frames decode here, gray, stride_.
 };
 }  // namespace
 std::unique_ptr<CameraSource> CreatePlatformCameraSource(

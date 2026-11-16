@@ -1,14 +1,27 @@
-// A single node card: liveness, cadence, dispatch count, and who drives its
-// subsystem. Pure at render (data arrives as props), so react-dom/server can
-// render it in tests.
+// A single node card: liveness, cadence, dispatch count, who drives its
+// subsystem (and whether the devices flush is holding back outputs it set
+// while nobody does), and what its wake channel lost (quiet at zero). Pure at
+// render (data arrives as props), so react-dom/server can render it in tests.
+// `stale`: the graph is last-known, so liveness is unknown.
 
-import {drivenBy, isSubscriber, rateKey, type SystemGraph, type SystemNode} from '../../system';
+import {nodeLiveness} from '../../data/freshness';
+import {deliveryLoss, drivenByLine, isSubscriber, outputsHeld, rateKey,
+        type DeliveryCounter, type SystemGraph, type SystemNode} from '../../system';
 import {duration, hertz, integer, staleness} from '../../ui/formatters';
 import {Badge, StatusDot} from '../../ui/primitives';
 
+// Each delivery counter as the card names it: what a person would look for.
+const DELIVERY_LABELS: Record<DeliveryCounter, string> = {
+  wake_failures: 'LOST WAKES',
+  stalled_arms: 'STALLED ARMS',
+  wake_fallbacks: 'POLLING',
+  requests_skipped: 'SKIPPED REQUESTS'
+};
+
 export function NodeCard(
-    {graph, node, rates, selected, onSelect}: {
-      graph: SystemGraph; node: SystemNode; rates: Record<string, number>;
+    {graph, node, stale, rates, selected, onSelect}: {
+      graph: SystemGraph; node: SystemNode; stale: boolean;
+      rates: Record<string, number>;
       selected: boolean;
       onSelect: () => void;
     }) {
@@ -24,18 +37,25 @@ export function NodeCard(
                       .map(s => rates[rateKey(node.name, s.id)])
                       .filter((r): r is number => r !== undefined)
                       .sort((a, b) => b - a)[0];
-  const driver = drivenBy(node);
+  const lost = deliveryLoss(node);
+  const liveness = nodeLiveness(node, {stale});
+  const held = outputsHeld(node, liveness === 'live');
+  const driver = drivenByLine(node, liveness === 'live');
 
   return <button
       className={'node-card' + (selected ? ' selected' : '') +
-                 (node.alive ? '' : ' dead')}
+                 (liveness === 'stopped' ? ' dead' : '')}
       onClick={onSelect} aria-pressed={selected}>
     <div className="node-card-head">
-      <StatusDot active={node.alive}/>
+      <StatusDot active={liveness === 'live'}/>
       <b>{node.name}</b>
       {node.simulation && <Badge tone="sim">SIM</Badge>}
       {node.replay && <Badge>REPLAY</Badge>}
-      {!node.alive && <Badge tone="dead">STALE</Badge>}
+      {liveness === 'stopped' && <Badge tone="dead">STALE</Badge>}
+      {liveness === 'unknown' &&
+       <Badge>{`UNKNOWN · last known ${node.alive ? 'alive' : 'stopped'}`}</Badge>}
+      {lost.map(([key, count]) =>
+           <Badge key={key} tone="loss">{`${DELIVERY_LABELS[key]} ${integer(count)}`}</Badge>)}
     </div>
     <code>{node.target || '—'}</code>
     <dl>
@@ -49,9 +69,16 @@ export function NodeCard(
       }</dd></div>
       {driver !== null &&
        <div className="driven-by"><dt>driven by</dt><dd className={
+           held ? 'held' :
            node.selections.some(s => s.selected !== null) ? 'driving' : 'idle'
        }>{driver}</dd></div>}
     </dl>
+    {held &&
+     <small className="warn">
+       update() sets outputs in ticks with no live target, so each goes out
+       neutral: publish a lane this mode's target policy lists, and set
+       outputs from what this tick's get() returned.
+     </small>}
     {node.declared_sources > node.sources.length &&
      <small className="warn">
        {node.declared_sources - node.sources.length} more sources than the

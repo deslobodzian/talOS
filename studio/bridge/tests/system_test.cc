@@ -2,10 +2,18 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/names.h"
 
@@ -28,7 +36,7 @@ introspect::NodeSnapshot Odometry() {
   node.generation = 3;
   node.dispatch_count = 9007199254740993ull;  // 2^53 + 1
   node.start_wall_ns = 1'700'000'000'000'000'000;
-  node.heartbeat_wall_ns = 1'700'000'000'500'000'000;
+  node.heartbeat_monotonic_ns = 500'000'000;
   node.flags = introspect::kFlagSimulation;
   node.declared_source_count = 2;
   node.alive = true;
@@ -126,6 +134,7 @@ TEST(SystemGraph, LargeCountersSurviveAsDecimalStrings) {
   input.node_capacity = 32;
   input.source_capacity = 64;
   input.wall_ns = 1'700'000'000'500'000'000;
+  input.monotonic_ns = 500'000'000;
   input.bridge = {
       .topic = "/talos/telemetry", .clients = 2, .frames_forwarded = 7};
 
@@ -152,6 +161,23 @@ TEST(SystemGraph, LargeCountersSurviveAsDecimalStrings) {
   EXPECT_NE(json.find("\"kind\":\"WATCHER\""), std::string::npos);
 }
 
+TEST(SystemGraph, ConvertsMonotonicHeartbeatAgeToWallTimeForTheViewer) {
+  SystemGraphInput input;
+  input.nodes = {Odometry()};
+  input.monotonic_ns = 750'000'000;
+  input.wall_ns = 1'700'000'000'750'000'000;
+  auto json = SystemGraphJson(input);
+  EXPECT_NE(json.find("\"heartbeat_wall_ns\":\"1700000000500000000\""),
+            std::string::npos);
+  // A wall-clock step changes the display epoch, not the heartbeat's age or
+  // the registry's already-computed liveness decision.
+  input.wall_ns += 60'000'000'000;
+  json = SystemGraphJson(input);
+  EXPECT_NE(json.find("\"heartbeat_wall_ns\":\"1700000060500000000\""),
+            std::string::npos);
+  EXPECT_NE(json.find("\"alive\":true"), std::string::npos);
+}
+
 TEST(SystemGraph, ReportsAnAbsentRegistryRatherThanFailing) {
   SystemGraphInput input;
   input.bridge.topic = "/talos/telemetry";
@@ -162,6 +188,9 @@ TEST(SystemGraph, ReportsAnAbsentRegistryRatherThanFailing) {
   EXPECT_NE(json.find("\"topics\":[]"), std::string::npos);
 }
 
+// Who drives each Target, and whether the devices flush is holding back
+// outputs the node set while nobody does (introspect::kFlagOutputsHeld).
+// REQ-SAFE-41
 TEST(SystemGraph, NamesWhoDrivesEachTargetAndNullWhenNobodyDoes) {
   introspect::NodeSnapshot drivetrain;
   drivetrain.name = "drivetrain";
@@ -170,18 +199,30 @@ TEST(SystemGraph, NamesWhoDrivesEachTargetAndNullWhenNobodyDoes) {
       {.sources = {"teleop", "auto"}, .selected = 1},
       {.sources = {"teleop", "auto"}, .selected = -1},
   };
+  introspect::NodeSnapshot intake;
+  intake.name = "intake";
+  intake.alive = true;
+  intake.flags = introspect::kFlagSimulation | introspect::kFlagOutputsHeld;
+  intake.selections = {{.sources = {"teleop"}, .selected = -1}};
   SystemGraphInput input;
-  input.nodes = {drivetrain, Telemetry()};
+  input.nodes = {drivetrain, intake, Telemetry()};
   const std::string json = SystemGraphJson(input);
 
   EXPECT_NE(json.find("\"selections\":[{\"sources\":[\"teleop\",\"auto\"],"
                       "\"selected\":\"auto\"},{\"sources\":[\"teleop\","
-                      "\"auto\"],\"selected\":null}]"),
+                      "\"auto\"],\"selected\":null}],\"outputs_held\":false}"),
+            std::string::npos)
+      << json;
+  // Nobody drives the intake, and it is trying to move.
+  EXPECT_NE(json.find("\"selections\":[{\"sources\":[\"teleop\"],"
+                      "\"selected\":null}],\"outputs_held\":true}"),
             std::string::npos)
       << json;
   // A node without Targets says so with an empty list, not a missing field.
   EXPECT_NE(json.find("\"name\":\"telemetry\""), std::string::npos);
-  EXPECT_NE(json.find("\"selections\":[]"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"selections\":[],\"outputs_held\":false}"),
+            std::string::npos)
+      << json;
 }
 
 TEST(SystemGraph, EscapesNamesThatWouldOtherwiseBreakTheDocument) {
@@ -253,6 +294,46 @@ TEST(TopicHealth, SeparatesADesignedDeadEndFromABrokenOne) {
   EXPECT_EQ(HealthOf(*teleop), TopicHealth::ORPHANED);
 }
 
+// REQ-CONTRACT-09
+TEST(TopicHealth, AnObservedTopicIsReadAsTheLaunchersLintCountsIt) {
+  // The lint's "published but nothing subscribes to it" counts observers
+  // (naming::kSourceFlagObserver, telemetry) as readers; this verdict must
+  // agree, or Studio names a topic the launcher has stopped naming.
+  introspect::NodeSnapshot gyro;
+  gyro.name = "gyro";
+  gyro.alive = true;
+  gyro.sources = {{.id = 0,
+                   .kind = event::SourceKind::SENDER,
+                   .name = "/gyro/state",
+                   .message_bytes = 32,
+                   .events = 10},
+                  {.id = 1,
+                   .kind = event::SourceKind::SENDER,
+                   .name = "/gyro/status",
+                   .message_bytes = 16,
+                   .events = 10}};
+  introspect::NodeSnapshot telemetry;
+  telemetry.name = "telemetry";
+  telemetry.alive = true;
+  telemetry.sources = {{.id = 0,
+                        .kind = event::SourceKind::WATCHER,
+                        .name = "/gyro/state",
+                        .message_bytes = 32,
+                        .flags = naming::kSourceFlagObserver,
+                        .events = 10}};
+
+  const std::vector<TopicRow> topics = TopicsOf({gyro, telemetry});
+  const TopicRow* observed = Row(topics, "/gyro/state");
+  ASSERT_NE(observed, nullptr);
+  // Still listed apart from subscribers: only the verdict counts it.
+  EXPECT_TRUE(observed->subscribers.empty());
+  EXPECT_EQ(observed->observers, std::vector<std::string>{"telemetry"});
+  EXPECT_EQ(HealthOf(*observed), TopicHealth::OK);
+
+  // Nobody reads it and nobody observes it: still unread.
+  EXPECT_EQ(HealthOf(*Row(topics, "/gyro/status")), TopicHealth::UNREAD);
+}
+
 TEST(TopicHealth, ExternalOutranksOptionalOnTheSameTopic) {
   // Both flags on one topic is not a contradiction: an end can be outside
   // talOS and not yet wired up. `bridged` wins because it is the more specific
@@ -302,6 +383,44 @@ TEST(TopicHealth, KeepsTheVerdictsThatAlreadyWorkedForConnectedTopics) {
   EXPECT_EQ(HealthOf(*Row(topics, "/odometry/state")), TopicHealth::OK);
   EXPECT_EQ(HealthOf(*Row(topics, "/odometry/status")), TopicHealth::IDLE);
   EXPECT_EQ(HealthOf(*Row(topics, "/odometry/event")), TopicHealth::LOSSY);
+}
+
+// A latest-only watcher skips to the newest message by design and counts the
+// skips as dropped: a 50 Hz reader of a 200 Hz topic drops three in four. That
+// is not loss. A sequence watcher's drops are.
+TEST(TopicHealth, LossyCountsOnlyDropsThatAreNotLatestOnlySkips) {
+  introspect::NodeSnapshot writer;
+  writer.name = "drivetrain";
+  writer.sources = {
+      {.id = 0,
+       .kind = event::SourceKind::SENDER,
+       .name = "/drivetrain/state",
+       .events = 800},
+      {.id = 1,
+       .kind = event::SourceKind::SENDER,
+       .name = "/drivetrain/event",
+       .events = 800},
+  };
+  introspect::NodeSnapshot reader;
+  reader.name = "pose_estimator";
+  reader.sources = {
+      {.id = 0,
+       .kind = event::SourceKind::WATCHER,
+       .name = "/drivetrain/state",
+       .flags = naming::kSourceFlagLatestOnly,
+       .events = 200,
+       .dropped = 600},
+      {.id = 1,
+       .kind = event::SourceKind::WATCHER,
+       .name = "/drivetrain/event",
+       .events = 798,
+       .dropped = 2},
+  };
+
+  const std::vector<TopicRow> topics = TopicsOf({writer, reader});
+  EXPECT_EQ(HealthOf(*Row(topics, "/drivetrain/state")), TopicHealth::OK);
+  EXPECT_EQ(Row(topics, "/drivetrain/state")->dropped, 0u);
+  EXPECT_EQ(HealthOf(*Row(topics, "/drivetrain/event")), TopicHealth::LOSSY);
 }
 
 TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
@@ -366,6 +485,175 @@ TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
                       "\"health\":\"unconnected\""),
             std::string::npos);
   EXPECT_NE(json.find("\"health\":\"unread\""), std::string::npos);
+}
+
+// The graph the golden files hold: three nodes whose fast values (wall time,
+// bridge counters, heartbeats, dispatch counts, liveness, delivery counters,
+// source counters, selected sources, held outputs) are numbered or flipped in
+// turn and all move on from `refresh` 0 to 1 with the structure unchanged, so
+// a value written into another slot of its type reads as a wrong value, not
+// the same one.
+SystemGraphInput GoldenGraph(int refresh) {
+  std::uint64_t next = refresh == 0 ? 1000 : 5000;
+  const auto value = [&next] { return next++; };
+  const auto signed_value = [&next] {
+    return static_cast<std::int64_t>(next++);
+  };
+  const auto counted = [&](introspect::SourceSnapshot source) {
+    source.events = value();
+    source.dropped = value();
+    source.sequence = value();
+    source.last_monotonic_ns = signed_value();
+    source.last_latency_ns = signed_value();
+    source.max_latency_ns = signed_value();
+    return source;
+  };
+  const auto row = [&](std::string name, std::uint32_t slot) {
+    introspect::NodeSnapshot node;
+    node.name = std::move(name);
+    node.target = "//golden:" + node.name;
+    node.slot = slot;
+    node.pid = 100 + slot;
+    node.session_id = 7;
+    node.generation = 1;
+    node.start_wall_ns = 1'700'000'000'000'000'000;
+    node.heartbeat_monotonic_ns = signed_value();
+    node.dispatch_count = value();
+    node.wake_failures = value();
+    node.stalled_arms = value();
+    node.wake_fallbacks = value();
+    return node;
+  };
+
+  SystemGraphInput input;
+  input.registry_available = true;
+  input.node_capacity = 64;
+  input.source_capacity = 32;
+  input.monotonic_ns = 1'000'000'000;
+  input.wall_ns = 1'700'000'000'000'000'000 + signed_value();
+  input.bridge.topic = "/talos/telemetry";
+  input.bridge.clients = refresh == 0 ? 1 : 2;
+  input.bridge.frames_forwarded = value();
+  input.bridge.invalid = value();
+  input.bridge.ws_drops = value();
+  input.bridge.refused = value();
+  input.bridge.egress_bytes = value();
+
+  introspect::NodeSnapshot shooter = row("shooter", 0);
+  shooter.alive = true;
+  shooter.declared_source_count = 3;
+  shooter.sources = {
+      counted({.id = 0,
+               .kind = event::SourceKind::SENDER,
+               .name = "/shooter/state",
+               .message_bytes = 24,
+               .alignment = 8}),
+      counted({.id = 1,
+               .kind = event::SourceKind::WATCHER,
+               .name = "/shooter/target/teleop",
+               .message_bytes = 32,
+               .alignment = 8}),
+      counted({.id = 2,
+               .kind = event::SourceKind::SENDER,
+               .name = "/hw/request/shooter",
+               .message_bytes = 1032,
+               .alignment = 8}),
+  };
+  shooter.selections = {
+      {.sources = {"teleop", "auto"}, .selected = refresh == 0 ? 0 : 1},
+      {.sources = {"teleop"}, .selected = refresh == 0 ? -1 : 0},
+  };
+  shooter.flags = refresh == 0 ? introspect::kFlagOutputsHeld : 0u;
+
+  introspect::NodeSnapshot bridge = row("hardware_bridge", 1);
+  bridge.alive = true;
+  bridge.declared_source_count = 1;
+  bridge.sources = {counted({.id = 0,
+                             .kind = event::SourceKind::FETCHER,
+                             .name = "/hw/request/shooter",
+                             .message_bytes = 1032,
+                             .alignment = 8})};
+
+  introspect::NodeSnapshot telemetry = row("telemetry", 2);
+  telemetry.alive = refresh != 0;
+  telemetry.declared_source_count = 1;
+  telemetry.sources = {counted({.id = 0,
+                                .kind = event::SourceKind::WATCHER,
+                                .name = "/shooter/state",
+                                .message_bytes = 24,
+                                .alignment = 8})};
+
+  input.nodes = {shooter, bridge, telemetry};
+  return input;
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+  std::ifstream stream{path, std::ios::binary};
+  return {std::istreambuf_iterator<char>{stream}, {}};
+}
+
+// The order of a graph's fast values has one source: the order
+// BuildSystemGraph appends them in. These golden files are its output: the
+// whole graph a client is sent first (graph.json), the update GraphFeed
+// sends it at the next refresh (update.json), and that refresh's whole graph
+// (later.json). //studio:system_test applies the update to graph.json with
+// studio/src/system.ts, and //studio/bridge:fast_slots_test with the Python
+// harness's fast_slots, each requiring later.json; so a reorder here fails
+// this test, and a consumer left in the old order fails its own. An
+// intended change regenerates them (studio/bridge/README.md, "HTTP and
+// WebSocket views"):
+//   TALOS_UPDATE_GOLDEN=1 bazel run //studio/bridge:system_test --
+//       --gtest_filter=SystemGraph.GoldenFilesHoldTheFastValueOrder
+// REQ-OPS-23
+TEST(SystemGraph, GoldenFilesHoldTheFastValueOrder) {
+  const SystemGraphDocument first = BuildSystemGraph(GoldenGraph(0));
+  const SystemGraphDocument later = BuildSystemGraph(GoldenGraph(1));
+  // The refresh changes only fast values, so the client is sent an update.
+  ASSERT_EQ(first.structure, later.structure);
+  GraphFeed feed;
+  std::vector<std::string> sent;
+  const auto afford = [](std::size_t) { return true; };
+  const auto send = [&sent](std::string_view text) {
+    sent.emplace_back(text);
+    return true;
+  };
+  constexpr std::size_t kMaxBytes = std::size_t{1} << 20;
+  feed.Pump(first, 0, kMaxBytes, afford, send);
+  feed.Pump(later, GraphFeed::kUpdateNs, kMaxBytes, afford, send);
+  ASSERT_EQ(sent.size(), 2u);
+  ASSERT_EQ(sent[0], first.json);
+  const std::pair<const char*, std::string> files[] = {
+      {"graph.json", first.json},
+      {"update.json", sent[1]},
+      {"later.json", later.json},
+  };
+
+  const char* update = std::getenv("TALOS_UPDATE_GOLDEN");
+  if (update != nullptr && std::string_view{update} == "1") {
+    const char* workspace = std::getenv("BUILD_WORKSPACE_DIRECTORY");
+    ASSERT_NE(workspace, nullptr) << "update the golden files with bazel run";
+    const std::filesystem::path golden =
+        std::filesystem::path{workspace} / "studio/bridge/testdata/golden";
+    for (const auto& [file, text] : files) {
+      std::ofstream{golden / file, std::ios::binary} << text;
+    }
+    return;
+  }
+  std::string error;
+  const std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  ASSERT_NE(runfiles, nullptr) << error;
+  const char* graph = std::getenv("TALOS_GOLDEN_GRAPH");
+  ASSERT_NE(graph, nullptr) << "TALOS_GOLDEN_GRAPH is not set";
+  const std::filesystem::path golden =
+      std::filesystem::path{runfiles->Rlocation(graph)}.parent_path();
+  for (const auto& [file, text] : files) {
+    EXPECT_EQ(text, ReadFile(golden / file))
+        << (golden / file).string()
+        << " differs from the bridge's output; regenerate it as this test's "
+           "comment says";
+  }
 }
 
 }  // namespace

@@ -1,0 +1,96 @@
+# One swerve module on the bench: drive Kraken X60, steer Kraken X44 and its
+# CANcoder, all on the CANivore bus "Shooter", at the CAN ids the bench module
+# is wired with. Every tuning value below (limits, ratios, gains, the node's
+# velocity cap, the encoder offset) is provisional: the module's gearing is
+# not known yet, and a person checks each value, and the ids, at the bench
+# before commissioning.
+[subsystem]
+name = "swerve_module"
+node = "//bench/main_processor/swerve_module:node"
+period_us = 5000
+# Provisional: the node's own cap on the asked drive velocity, in the drive
+# motor's mechanism unit (rotor rps until the drive reduction is entered).
+# tools/test_rio_in_the_loop.py asks this module for 10 rps (DRIVE_RPS, so
+# capped here) and its driving scenario needs some State with the drive at
+# >= 1.0 V and >= 1.0 rps (DRIVEN_VOLTS, DRIVEN_RPS). With the drive's
+# provisional slot0 (v = 0.12 V/rps, p = 0.1) it settles near 1.2 V; a cap
+# below about 8.3 rps, a lower v or p, a lower max_voltage, or a
+# sensor_to_mechanism_ratio that rescales the asked velocity can keep it
+# under 1.0 V and fail that scenario: retune its thresholds with these.
+max_drive_velocity_rps = 10.0
+
+[motors.drive]
+type = "TalonFX"
+bus = "Shooter"
+can_id = 5
+motor_type = "kraken_x60"
+inverted = false
+brake = true
+# Provisional limits for the first supervised spins.
+supply_limit_a = 20.0
+stator_limit_a = 40.0
+max_voltage = 4.0
+feedback = "Rotor"
+# Provisional: rotor units until the module's drive reduction is entered.
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 30.0
+# Provisional gains, not measured on this module.
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
+
+[motors.steer]
+type = "TalonFX"
+bus = "Shooter"
+can_id = 6
+motor_type = "kraken_x44"
+inverted = false
+brake = true
+# Provisional limits for the first supervised spins.
+supply_limit_a = 20.0
+stator_limit_a = 40.0
+max_voltage = 4.0
+# Closes on the CANcoder: one CANcoder rotation is one wheel heading
+# rotation, so its absolute frame survives resets (position_frame) and the
+# loop takes the short way round (continuous_wrap).
+feedback = "RemoteCANcoder"
+feedback_sensor = "encoder"
+sensor_to_mechanism_ratio = 1.0
+continuous_wrap = true
+position_frame = "absolute"
+# Provisional: the module's steer reduction (rotor rotations per CANcoder
+# rotation) is not known yet; enter it before commissioning.
+rotor_to_sensor_ratio = 1.0
+# Provisional gains, not measured on this module.
+slot0 = { p = 12.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[sensors.encoder]
+type = "CANcoder"
+bus = "Shooter"
+can_id = 3
+# Provisional: the magnet offset that makes heading 0 the module's forward is
+# measured at the bench.
+offset_rot = 0.0
+inverted = false
+
+[teleop]
+defaults = { mode = "NEUTRAL", drive_velocity_rps = 0.0, steer_angle_rot = 0.0 }
+
+# Hold-to-run: the module moves only while button 6 is held. The axes alone
+# send a NEUTRAL target, on which the node sets nothing.
+[[teleop.bindings]]
+button = 6
+while_held = { mode = "DRIVE" }
+
+# Joystick 0 axis 5: drive velocity, stick forward positive (provisional
+# scale; the node caps it at max_drive_velocity_rps).
+[[teleop.bindings]]
+axis = 5
+field = "drive_velocity_rps"
+scale = -10.0
+deadband_frac = 0.1
+
+# Joystick 0 axis 4: wheel heading, a quarter turn either way at full stick.
+[[teleop.bindings]]
+axis = 4
+field = "steer_angle_rot"
+scale = 0.25
+deadband_frac = 0.1

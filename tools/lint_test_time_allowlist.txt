@@ -1,0 +1,55 @@
+# tools/lint_test_time.py allowlist: `<path> sleep|clock|retry <reason>`.
+# A line lets that file use the real clock (sleep, clock) or a test retry
+# (retry). Only an integration, e2e, soak or perf test, or code outside a
+# node, belongs here (docs/TESTING.md §2, §6). "seeded:" marks a line
+# carried over when the lint was added and not yet audited. A line whose
+# hits are gone fails the lint, so the list only shrinks.
+
+controller_processor/rio/src/test/cpp/ConfigStore_test.cpp clock integration: the config saver's real thread; steady_clock deadlines only bound a hang (TESTING.md §6.3)
+controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp clock integration: CTRE's Phoenix 6 simulator advances on the real clock; reads poll its status frames until a 10 s deadline that bounds a hang
+controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp sleep integration: CTRE's Phoenix 6 simulator advances on the real clock; reads are paced 10 ms apart as PumpReads paces them
+controller_processor/rio/src/test/cpp/RioLog_test.cpp clock integration: the logger's real thread held in a blocked write; the elapsed bound shows a burst of posts did not wait for it
+bench/main_processor/simulation/soak_test.py clock soak: injected kills and stalls on the real clock (TESTING.md §2)
+bench/main_processor/simulation/soak_test.py sleep soak: injected kills and stalls on the real clock (TESTING.md §2)
+bench/main_processor/swerve_module/send_target.cc clock operator CLI beside the node, sends for a wall-clock duration; not node code
+bench/main_processor/swerve_module/send_target.cc sleep operator CLI beside the node, sends for a wall-clock duration; not node code
+studio/bridge/bandwidth_test.py clock seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/bandwidth_test.py sleep seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/client_timeout_test.py clock integration: times a real bridge's idle-timeout close against its stated bound (main.cc kIdleTimeoutS)
+studio/bridge/integration_test.py clock seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/integration_test.py sleep seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/stop_test.py clock integration: times a real bridge's stop against a quarter of the launcher's stop timeout (REQ-OPS-06, launcher.h kStopTimeout)
+talOS/bridge/hardware_node_test.cc clock seeded: integration, bridge over UDP loopback; sleeps unaudited against TESTING.md §6.3
+talOS/bridge/hardware_node_test.cc sleep seeded: integration, bridge over UDP loopback; sleeps unaudited against TESTING.md §6.3
+talOS/bridge/run_test.cc clock seeded: integration, bridge loop over UDP; wake latency on the real clock
+talOS/bridge/run_test.cc sleep seeded: integration, bridge loop over UDP; wake latency on the real clock
+talOS/events/log/log_kill_test.cc clock integration: kills a writer process, waits with a deadline
+talOS/events/log/log_kill_test.cc sleep integration: kills a writer process, waits with a deadline
+talOS/events/log/log_test.cc clock seeded: integration, writer thread; TEST-8 replaces the IdleWriterDoesNotPoll and ProducerNeverWaitsForTheLogFile sleeps
+talOS/events/log/log_test.cc sleep seeded: integration, writer thread; TEST-8 replaces the IdleWriterDoesNotPoll and ProducerNeverWaitsForTheLogFile sleeps
+talOS/events/os/poller_test.cc sleep integration: real kqueue/epoll timer delivery across threads
+talOS/events/realtime_event_loop_test.cc clock seeded: integration, the realtime loop on the real clock; sleeps unaudited against TESTING.md §6.3
+talOS/events/realtime_event_loop_test.cc sleep seeded: integration, the realtime loop on the real clock; sleeps unaudited against TESTING.md §6.3
+talOS/hardware/gateway_test.cc clock seeded: a UDP wait helper in a component target; move the case to its own target (TESTING.md §2)
+talOS/hardware/gateway_test.cc sleep seeded: a UDP wait helper in a component target; move the case to its own target (TESTING.md §2)
+talOS/introspection/registry_test.cc clock seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
+talOS/introspection/registry_test.cc sleep seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
+talOS/launcher/continuity_test.cc sleep seeded: integration, spawned processes; sleeps unaudited against TESTING.md §6.3
+talOS/launcher/launcher_death_test.cc clock integration: deadlines of waits on a spawned launcher's processes, and the measured kill latency
+talOS/launcher/launcher_test.cc clock seeded: integration, spawned processes and their deadlines
+talOS/launcher/launcher_test.cc sleep seeded: integration, spawned processes and their deadlines
+talOS/launcher/log_budget_test.cc clock seeded: integration, paces a real writer process
+talOS/launcher/log_budget_test.cc sleep seeded: integration, paces a real writer process
+talOS/launcher/outputs_held_test.cc clock integration: a gateway in the test process ticks a real bridge and node on the real clock; deadline of the registry poll
+talOS/launcher/outputs_held_test.cc sleep integration: paces the in-process gateway's 5 ms tick and the registry poll
+talOS/launcher/supervision_test.cc clock seeded: integration, one real spawn or kill per mechanism; sleeps unaudited against TESTING.md §6.3
+talOS/launcher/supervision_test.cc sleep seeded: integration, one real spawn or kill per mechanism; sleeps unaudited against TESTING.md §6.3
+talOS/node/node_test.cc clock seeded: an integration case (signals a spawned node) in a component target; move it to its own target
+talOS/node/node_test.cc sleep seeded: an integration case (signals a spawned node) in a component target; move it to its own target
+talOS/simulation/sim_gateway_test.py clock integration: the simulator as a child process; deadlines on its UDP datagrams only bound a hang (TESTING.md §6)
+talOS/vision/pipeline_test.cc clock integration: pipeline worker threads, condition wait with a deadline
+talOS/vision/pipeline_test.cc sleep integration: pipeline worker threads, condition wait with a deadline
+talOS/vision/recording/recorder_test.cc clock integration: recorder thread, condition wait with a deadline
+talOS/vision/recording/recorder_test.cc sleep integration: recorder thread, condition wait with a deadline
+tools/test_rio_in_the_loop.py clock e2e: the RoboRIO program in the loop on its real clock; deadlines only bound a hang (TESTING.md §2)
+tools/test_rio_in_the_loop.py sleep e2e: the RoboRIO program in the loop on its real clock; paces process bring-up (TESTING.md §2)

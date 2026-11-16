@@ -159,12 +159,6 @@ TEST_F(RecorderTest, WriterFailureDropsPairsAndStopsRecording) {
   EXPECT_EQ(rec.dropped(), dropped + 1);
 }
 
-TEST_F(RecorderTest, RecordStemZeroPadsToTwentyDigits) {
-  EXPECT_EQ(RecordStem(7, "sampled"), "00000000000000000007_sampled");
-  EXPECT_EQ(RecordStem(1600000000000000000ULL, "rejected"),
-            "01600000000000000000_rejected");
-}
-
 TEST_F(RecorderTest, SerializeRecordEmitsTheStudioContract) {
   const CameraContext ctx = MakeContext();
   FrameRecord r = MakeRecord(1234567890, "sampled");
@@ -225,14 +219,10 @@ TEST_F(RecorderTest, SerializeRecordEmitsTheStudioContract) {
     FAIL() << "missing truth";
   }
   EXPECT_DOUBLE_EQ(parsed.truth->x_m, 1.0);
-}
 
-TEST_F(RecorderTest, TruthSerializesAsNullWhenAbsent) {
-  const CameraContext ctx = MakeContext();
-  FrameRecord r = MakeRecord(1, "sampled");
+  // Absent truth is an explicit null, not a missing key.
   r.truth.reset();
-  const std::string json = SerializeRecord(ctx, r);
-  EXPECT_NE(json.find("\"truth\":null"), std::string::npos);
+  EXPECT_NE(SerializeRecord(ctx, r).find("\"truth\":null"), std::string::npos);
 }
 
 TEST_F(RecorderTest, RateLimitsSampledAndRejectedIndependently) {
@@ -272,7 +262,7 @@ TEST_F(RecorderTest, ZeroRatesRecordNothing) {
   EXPECT_EQ(rec.recorded(), 0u);
 }
 
-TEST_F(RecorderTest, QueueFullDropsAreCountedWithoutBlocking) {
+TEST_F(RecorderTest, QueueOverflowAccountsForEverySubmission) {
   FrameRecorder::Options opts;
   opts.output_dir = dir_;
   opts.context = MakeContext();

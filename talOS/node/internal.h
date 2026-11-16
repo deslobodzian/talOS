@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include "talOS/events/callback.h"
 #include "talOS/events/delivery.h"
@@ -33,6 +34,10 @@ class ByteTopic {
   // False when the message was not published (a drop_newest queue was full).
   // The caller has checked the length against max_bytes.
   virtual bool write(std::span<const std::byte> message) = 0;
+  // Wake notifications this writer could not send for a reason other than a
+  // gone receiver (RTMSQueue::wake_failures()); 0 where nothing is notified.
+  // Safe to call from any thread: the registry's thread reads it.
+  virtual std::uint64_t wake_failures() const { return 0; }
 };
 
 // The loop a Node is registered on, with the loop type erased. The three loop
@@ -49,7 +54,8 @@ class LoopPort {
                                          std::uint32_t message_bytes,
                                          std::uint32_t alignment,
                                          const schema::Identity& schema,
-                                         event::Thunk callback) = 0;
+                                         event::Thunk callback,
+                                         bool latest_only) = 0;
   virtual std::uint16_t register_sender(std::string_view topic,
                                         std::uint32_t message_bytes,
                                         std::uint32_t alignment,
@@ -57,14 +63,26 @@ class LoopPort {
   virtual void arm_timer(std::uint16_t id, Time first, Duration period) = 0;
   virtual bool send(std::uint16_t id, std::span<const std::byte> bytes) = 0;
   virtual Time now() const = 0;
+  // Logs that the running handler read watcher `source_id`'s message
+  // `sequence`, published at `publish_time` (EventKind::READ); nothing
+  // outside a dispatch.
+  virtual void record_read(std::uint16_t source_id, Time now, Time publish_time,
+                           std::uint64_t sequence) = 0;
   // Chosen by NodeAccess::start, once the node has registered everything.
   // A loop that has no choice (replay delivers what the log says) ignores it.
   virtual void set_delivery(event::Delivery delivery) = 0;
+  // Marks watcher `watcher` prompt (EventLoopBase::set_prompt): under
+  // Delivery::ON_PUBLISH its publications wake the loop. By
+  // NodeAccess::start.
+  virtual void set_prompt(std::uint16_t watcher) = 0;
 
   // The world outside the loop: a byte topic, which the loop neither
-  // dispatches nor logs. By default an RTMS queue created on the first write,
-  // so building a node (as --describe does) opens no shared memory;
-  // testing::Sim keeps byte topics in memory instead.
+  // dispatches nor logs. By default an RTMS queue, opened here while the node
+  // is built, as the realtime loop opens its typed topics, so a writer
+  // conflict fails construction rather than a send; testing::Sim keeps byte
+  // topics in memory instead, and --describe, --replay and --replay-inputs
+  // discard them (they never touch a live robot's shared memory, and replay
+  // cannot verify what was never logged).
   virtual std::unique_ptr<ByteTopic> open_byte_topic(
       std::string_view topic, std::size_t max_bytes,
       const BytePublishOptions& options);
@@ -83,9 +101,10 @@ class LoopPortFor : public LoopPort {
                                  std::uint32_t message_bytes,
                                  std::uint32_t alignment,
                                  const schema::Identity& schema,
-                                 event::Thunk callback) override {
+                                 event::Thunk callback,
+                                 bool latest_only) override {
     return loop_.register_watcher(topic, message_bytes, alignment, schema,
-                                  callback);
+                                  callback, latest_only);
   }
   std::uint16_t register_sender(std::string_view topic,
                                 std::uint32_t message_bytes,
@@ -100,22 +119,30 @@ class LoopPortFor : public LoopPort {
     return loop_.send_message(id, bytes);
   }
   Time now() const override { return loop_.monotonic_now(); }
+  void record_read(std::uint16_t source_id, Time now, Time publish_time,
+                   std::uint64_t sequence) override {
+    loop_.record_read(source_id, now, publish_time, sequence);
+  }
   void set_delivery(event::Delivery delivery) override {
     if constexpr (requires { loop_.set_delivery(delivery); }) {
       loop_.set_delivery(delivery);
     }
   }
+  void set_prompt(std::uint16_t watcher) override { loop_.set_prompt(watcher); }
 
  private:
   Loop& loop_;
 };
 
 // What `--describe` prints for `node`, built on a loop whose registrations
-// are `manifest`: every topic end with its schema (bytes included), ring
-// layout and endpoint flags, the byte topics the loop does not carry, and
-// whether the node read the declared graph. testing::Sim builds the declared
-// graph it hands its nodes the same way.
-introspect::Description DescribeNode(const Node& node, std::string_view target,
-                                     const event::Manifest& manifest);
+// are `manifest` and whose own source flags are `source_flags`
+// (introspect::LoopSourceFlags): every topic end with its schema (bytes
+// included), ring layout and endpoint flags, which watchers are latest-only,
+// the byte topics the loop does not carry, and whether the node read the
+// declared graph. testing::Sim builds the declared graph it hands its nodes
+// the same way.
+introspect::Description DescribeNode(
+    const Node& node, std::string_view target, const event::Manifest& manifest,
+    const std::vector<std::uint32_t>& source_flags);
 
 }  // namespace talos::detail

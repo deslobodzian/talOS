@@ -1,5 +1,4 @@
-// Inspector tests: the pure staleness derivation and an SSR smoke render for
-// empty and populated studios (grouping, units, enum labels).
+// Inspector: the per-channel age derivation, and readings shown as they are.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
@@ -7,109 +6,80 @@ import {test} from 'node:test';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
-import {decode} from '../src/core';
 import type {Snapshot} from '../src/core';
-import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
-import {demoPacket} from '../src/demo';
+import {createStaticStudio, StudioProvider} from '../src/data/studio';
+import {TelemetryStore} from '../src/data/store';
+import {ChannelKind} from '../src/generated/talos/telemetry/channel-kind';
 import {inspectorPanel} from '../src/panels/inspector';
-import {channelStalenessNs} from '../src/panels/inspector/staleness';
+import {channelAge} from '../src/panels/inspector/staleness';
 
-function frame(ts: string, channels: Record<string, number>,
-               units: Record<string, string>,
-               labels: Record<string, string[]> = {}): Snapshot {
+function frame(t_ns: bigint, channels: Record<string, number>): Snapshot {
   return {
-    stream_id: 's', sequence_id: '0', timestamp_ns: ts, dictionary_id: 0,
-    chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
-    channels, units, labels
+    stream_id: '1', sequence_id: String(t_ns), timestamp_ns: String(t_ns),
+    dictionary_id: 1, chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+    channels, units: {a: ''}, labels: {}
   };
 }
 
-function populatedStudio(): Studio {
-  const frames = [0n, 1n, 2n].map(n => decode(demoPacket(n))!);
-  return createStaticStudio({
-    frames,
-    playback: {
-      mode: 'PAUSED',
-      cursor_ns: frames[2].timestamp_ns,
-      bounds: {start: frames[0].timestamp_ns, end: frames[2].timestamp_ns},
-      stats: {dropped: 0, late: 0, invalid: 0},
-      status: 'Demo',
-      connection: 'demo'
-    }
-  });
-}
+test('channelAge measures against the live clock, not the cursor', () => {
+  const store = new TelemetryStore(() => {});
+  store.ingest([frame(0n, {a: 1}), frame(20_000_000n, {a: 2})], true);
+  const last = '20000000';
+  // Telemetry stopped: the cursor holds the last frame while the live clock
+  // runs on. The channel's reading at the cursor is 2 s old, and stale.
+  assert.deepEqual(channelAge(store, 'a', {cursor_ns: last, clock_ns: '2020000000'}),
+                   {age_ns: '2000000000', stale: true});
+  // A live clock at the reading is fresh.
+  assert.deepEqual(channelAge(store, 'a', {cursor_ns: last, clock_ns: last}),
+                   {age_ns: '0', stale: false});
+  // No current time known: the age is unknown, so the reading is not current.
+  assert.deepEqual(channelAge(store, 'a', {cursor_ns: last, clock_ns: null}),
+                   {age_ns: null, stale: true});
+  // A channel with no reading at the cursor has no age at all.
+  assert.equal(channelAge(store, 'missing', {cursor_ns: last, clock_ns: last}), null);
+});
 
-const renderInspector = (studio: Studio): string => renderToStaticMarkup(
-    <StudioProvider studio={studio}>
-      <inspectorPanel.component config={inspectorPanel.defaultConfig}
-                               setConfig={() => {}} instanceId="test"/>
-    </StudioProvider>);
-
-test('channelStalenessNs returns the age of the newest reading', () => {
-  const series = {
-    t0_ns: '0',
-    times: new Float64Array([0, 0.02, 0.04]),
-    values: {
-      a: new Float64Array([1, 2, NaN]),   // last reading at 0.02 s
-      b: new Float64Array([NaN, NaN, NaN])
-    }
+// A NaN or infinite reading is a reading and an integer past 2^53 is exact:
+// the store keeps both through its columns and snapshot reconstruction, a
+// channel reading Infinity every tick is current, not stale, and the
+// Inspector shows NaN, Infinity and the exact integer. Absence (the topic was
+// not published) stays absence.
+test('NaN, infinities and exact integers survive the store into the Inspector', () => {
+  const kinds = {
+    'a/state/nan': ChannelKind.Double, 'a/state/inf': ChannelKind.Double,
+    'a/state/boot': ChannelKind.UInt, 'a/state/x': ChannelKind.Double
   };
-  // cursor at 60 ms: age of channel a's 20 ms reading is 40 ms.
-  assert.equal(channelStalenessNs(series, 'a', '60000000'), '40000000');
-  // cursor at the reading itself is fresh.
-  assert.equal(channelStalenessNs(series, 'a', '20000000'), '0');
-  // a cursor before the reading clamps to fresh rather than a negative age.
-  assert.equal(channelStalenessNs(series, 'a', '10000000'), '0');
-  // a channel that never had a value, an unknown channel, and a null cursor.
-  assert.equal(channelStalenessNs(series, 'b', '60000000'), null);
-  assert.equal(channelStalenessNs(series, 'missing', '60000000'), null);
-  assert.equal(channelStalenessNs(series, 'a', null), null);
-});
-
-test('the inspector shows an empty state when there is no telemetry', () => {
-  const html = renderInspector(createStaticStudio({}));
-  assert.ok(html.includes('No channels yet.'));
-});
-
-test('the inspector renders boolean channels as on/off pills', () => {
-  const studio = createStaticStudio({
-    frames: [
-      frame('0', {enabled: 1, armed: 0}, {enabled: '', armed: ''}),
-      frame('20000000', {enabled: 0, armed: 1}, {enabled: '', armed: ''})
-    ],
-    playback: {mode: 'PAUSED', cursor_ns: '20000000'}
+  const tick = (t_ns: bigint, x?: number): Snapshot => ({
+    stream_id: '1', sequence_id: String(t_ns), timestamp_ns: String(t_ns),
+    dictionary_id: 1, chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+    channels: {
+      'a/state/nan': NaN, 'a/state/inf': Infinity,
+      'a/state/boot': Number(2n ** 53n + 1n), ...(x === undefined ? {} : {'a/state/x': x})
+    },
+    exact: {'a/state/boot': String(2n ** 53n + 1n)},
+    units: {'a/state/nan': 'm', 'a/state/inf': 'm', 'a/state/boot': 'count', 'a/state/x': 'm'},
+    labels: {}, kinds
   });
-  const html = renderInspector(studio);
-  assert.ok(html.includes('pill on'), 'the armed (1) channel shows an on pill');
-  assert.ok(html.includes('pill off'), 'the enabled (0) channel shows an off pill');
-  assert.ok(!html.includes('1.0000'), 'a boolean must not render as 1.0000');
-});
-
-test('the inspector renders numerics with magnitude-aware precision', () => {
+  const last = 1_010_000_000n;
   const studio = createStaticStudio({
-    frames: [frame('0', {count: 1204, speed: 3.5}, {count: '', speed: 'm/s'})],
-    playback: {mode: 'PAUSED', cursor_ns: '0'}
+    frames: [tick(1_000_000_000n, 2), tick(last)],
+    playback: {mode: 'PAUSED', cursor_ns: String(last)}
   });
-  const html = renderInspector(studio);
-  assert.ok(html.includes('1,204'), 'an integer counter prints whole, with separators');
-  assert.ok(html.includes('3.5'), 'a float prints only the decimals it needs');
-  assert.ok(!html.includes('1204.0000'));
-  assert.ok(!html.includes('3.5000'));
-});
+  const snapshot = studio.store.snapshotAt(String(last))!;
+  assert.ok(Object.is(snapshot.channels['a/state/nan'], NaN));
+  assert.equal(snapshot.channels['a/state/inf'], Infinity);
+  assert.equal(snapshot.exact?.['a/state/boot'], '9007199254740993');
+  assert.ok(!('a/state/x' in snapshot.channels));
+  assert.deepEqual(channelAge(studio.store, 'a/state/inf',
+                              {cursor_ns: String(last), clock_ns: String(last)}),
+                   {age_ns: '0', stale: false});
 
-test('the inspector groups channels and keeps name, unit and enum label', () => {
-  const html = renderInspector(populatedStudio());
-  // Channels, units and the enum label from the demo dictionary.
-  assert.ok(html.includes('velocity'));
-  assert.ok(html.includes('m/s'));
-  assert.ok(html.includes('pose/x_m'));
-  assert.ok(html.includes('mode'));
-  assert.ok(html.includes('disabled'));
-  // Owner/role group headers.
-  assert.ok(html.includes('(root)'));
-  assert.ok(html.includes('sim/state'));
-  // Staleness of a channel read at the cursor.
-  assert.ok(html.includes('now'));
-  // The add-to-plot affordance is present.
-  assert.ok(html.includes('Add to plot'));
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <inspectorPanel.component config={inspectorPanel.defaultConfig}
+                                  setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  assert.ok(html.includes('<b>NaN</b>'), html);
+  assert.ok(html.includes('<b>Infinity</b>'));
+  assert.ok(html.includes('<b>9,007,199,254,740,993</b>'));
 });

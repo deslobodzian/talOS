@@ -1,5 +1,4 @@
-load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//talOS/build:contract.bzl", "talos_messages")
 
 package(default_visibility = ["//visibility:public"])
@@ -19,28 +18,14 @@ talos_messages(
     include_prefix = "control",
 )
 
-cc_test(
-    name = "msgs_test",
-    size = "small",
-    srcs = ["msgs_test.cc"],
+# Compile-time checks: building it is the check (layout_asserts.cc).
+cc_library(
+    name = "layout_asserts",
+    testonly = True,
+    srcs = ["layout_asserts.cc"],
     deps = [
         ":control",
         ":geometry",
-        "//talOS/devices",
-        "//talOS/devices:testing",
-        "//talOS/node:testing",
-        "@googletest//:gtest_main",
-    ],
-)
-
-py_test(
-    name = "msgs_py_test",
-    size = "small",
-    srcs = ["msgs_py_test.py"],
-    legacy_create_init = False,
-    deps = [
-        ":control_py",
-        ":geometry_py",
-        "//talOS/python:testing",
+        "//talOS/node",
     ],
 )

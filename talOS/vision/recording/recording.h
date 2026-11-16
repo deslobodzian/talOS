@@ -1,9 +1,11 @@
 #pragma once
 
 // The on-disk frame recording contract, shared by the recorder (writer), the
-// camera node (producer) and the replay tool (reader). See
-// 2026-robot/main_processor/vision/README.md for the keys and the
-// `<session>/frames/<camera>/<capture_ns>_<reason>.{png,json}` layout.
+// camera node (producer) and the replay tool (reader): one PNG and one JSON
+// sidecar per frame, at
+// `<session>/frames/<camera>/<capture_ns>_<reason>.{png,json}`. The camera
+// node's recording keys are documented with that node (the 2026 robot's
+// vision README, in its repository).
 //
 // The JSON is deliberately produced by a tiny hand-rolled serializer in
 // recording.cc: the vision stack has no JSON writer dependency (the field-sim

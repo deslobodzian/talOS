@@ -15,6 +15,9 @@ command_timeout_us = 100000
 
 [subsystems.roller]
 
+[subsystems.roller.teleop]
+defaults = { feedforward_v = 0.0 }
+
 [[subsystems.roller.teleop.bindings]]
 button = 1
 while_held = { velocity_rps = 60.0 }
@@ -113,7 +116,12 @@ class TeleopTest(unittest.TestCase):
             self.assertIsNotNone(roller.seen)
             self.assertEqual(roller.seen.velocity_rps, 60.0)
 
+        # A button held while disabled is not a fresh request once enabled.
         packet(enabled=False)
+        assert_released()
+        packet()
+        assert_released()
+        packet(held=False)
         assert_released()
         packet()
         assert_active()
@@ -123,6 +131,9 @@ class TeleopTest(unittest.TestCase):
         assert_active()
         packet(enabled=False)
         assert_released()
+        packet()
+        assert_released()
+        packet(held=False)
         packet()
         assert_active()
         hw.stop_driver_station()

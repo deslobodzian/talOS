@@ -55,57 +55,86 @@ std::int64_t ReadInteger(reflection::BaseType base, const std::uint8_t* data) {
   }
 }
 
-void AppendStruct(const reflection::Schema& schema,
+constexpr int kMaxDepth = 32;
+
+bool ValueSize(const reflection::Schema& schema, reflection::BaseType base,
+               std::int32_t index, std::size_t& size) {
+  if (base == reflection::BaseType::Obj) {
+    const auto* objects = schema.objects();
+    if (objects == nullptr || index < 0 ||
+        static_cast<std::size_t>(index) >= objects->size())
+      return false;
+    const auto* object = objects->Get(index);
+    if (!object->is_struct() || object->bytesize() <= 0) return false;
+    size = static_cast<std::size_t>(object->bytesize());
+    return true;
+  }
+  if (base < reflection::BaseType::UType || base > reflection::BaseType::Double)
+    return false;
+  if (index >= 0 && (schema.enums() == nullptr ||
+                     static_cast<std::size_t>(index) >= schema.enums()->size()))
+    return false;
+  size = flatbuffers::GetTypeSize(base);
+  return true;
+}
+
+bool AppendStruct(const reflection::Schema& schema,
                   const reflection::Object& object, const std::uint8_t* data,
-                  std::string& out);
+                  std::string& out, int depth);
 
 // A scalar, enum or nested struct of `base`/`index` at `data`.
-void AppendValue(const reflection::Schema& schema, reflection::BaseType base,
-                 std::int32_t index, const std::uint8_t* data,
-                 std::string& out) {
+bool AppendValue(const reflection::Schema& schema, reflection::BaseType base,
+                 std::int32_t index, const std::uint8_t* data, std::string& out,
+                 int depth) {
   using reflection::BaseType;
+  std::size_t size;
+  if (!ValueSize(schema, base, index, size)) return false;
   if (base == BaseType::Obj) {
-    AppendStruct(schema, *schema.objects()->Get(index), data, out);
-    return;
+    return AppendStruct(schema, *schema.objects()->Get(index), data, out,
+                        depth);
   }
   if (base == BaseType::Float) {
     float value;
     std::memcpy(&value, data, sizeof value);
     AppendFloat(value, out);
-    return;
+    return true;
   }
   if (base == BaseType::Double) {
     double value;
     std::memcpy(&value, data, sizeof value);
     AppendDouble(value, out);
-    return;
+    return true;
   }
   if (base == BaseType::ULong) {
     std::uint64_t value;
     std::memcpy(&value, data, sizeof value);
     out += std::to_string(value);
-    return;
+    return true;
   }
   const std::int64_t value = ReadInteger(base, data);
   if (base == BaseType::Bool) {
     out += value != 0 ? "true" : "false";
-    return;
+    return true;
   }
   if (index >= 0) {
     for (const reflection::EnumVal* named :
          *schema.enums()->Get(index)->values()) {
       if (named->value() == value) {
         out += named->name()->str();
-        return;
+        return true;
       }
     }
   }
   out += std::to_string(value);
+  return true;
 }
 
-void AppendStruct(const reflection::Schema& schema,
+bool AppendStruct(const reflection::Schema& schema,
                   const reflection::Object& object, const std::uint8_t* data,
-                  std::string& out) {
+                  std::string& out, int depth) {
+  if (depth >= kMaxDepth || !object.is_struct() || object.bytesize() <= 0 ||
+      object.fields() == nullptr)
+    return false;
   // reflection lists fields by name; print them as declared.
   std::vector<const reflection::Field*> fields(object.fields()->begin(),
                                                object.fields()->end());
@@ -117,27 +146,37 @@ void AppendStruct(const reflection::Schema& schema,
   for (std::size_t i = 0; i < fields.size(); ++i) {
     const reflection::Field& field = *fields[i];
     const reflection::Type& type = *field.type();
+    const bool array = type.base_type() == reflection::BaseType::Array;
+    std::size_t element_bytes;
+    if (!ValueSize(schema, array ? type.element() : type.base_type(),
+                   type.index(), element_bytes))
+      return false;
+    const std::size_t count = array ? type.fixed_length() : 1;
+    const auto bytes = static_cast<std::size_t>(object.bytesize());
+    if (count == 0 || field.offset() > bytes ||
+        element_bytes > (bytes - field.offset()) / count)
+      return false;
     if (i != 0) out += ", ";
     out += field.name()->str();
     out += ": ";
     const std::uint8_t* at = data + field.offset();
     if (type.base_type() != reflection::BaseType::Array) {
-      AppendValue(schema, type.base_type(), type.index(), at, out);
+      if (!AppendValue(schema, type.base_type(), type.index(), at, out,
+                       depth + 1))
+        return false;
       continue;
     }
-    const std::size_t element_bytes =
-        type.element() == reflection::BaseType::Obj
-            ? schema.objects()->Get(type.index())->bytesize()
-            : flatbuffers::GetTypeSize(type.element());
     out += '[';
     for (std::uint16_t k = 0; k < type.fixed_length(); ++k) {
       if (k != 0) out += ", ";
-      AppendValue(schema, type.element(), type.index(), at + k * element_bytes,
-                  out);
+      if (!AppendValue(schema, type.element(), type.index(),
+                       at + k * element_bytes, out, depth + 1))
+        return false;
     }
     out += ']';
   }
   out += '}';
+  return true;
 }
 
 void AppendHex(std::span<const std::byte> payload, std::string& out) {
@@ -180,8 +219,13 @@ void AppendMessage(const std::string& bfbs, std::string_view name,
            ">";
     return;
   }
-  AppendStruct(schema, *object,
-               reinterpret_cast<const std::uint8_t*>(payload.data()), out);
+  const std::size_t start = out.size();
+  if (!AppendStruct(schema, *object,
+                    reinterpret_cast<const std::uint8_t*>(payload.data()), out,
+                    0)) {
+    out.resize(start);
+    out += "<invalid struct schema>";
+  }
 }
 
 }  // namespace

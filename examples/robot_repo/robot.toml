@@ -1,0 +1,68 @@
+# A robot in its own repository, naming talOS's programs by @talos// labels
+# (talOS's `//tools:new_robot --standalone` starts one from a copy of this
+# file). The robot's only list of nodes is [[subsystems]] below; after
+# adding or removing an entry, regenerate robot_manifest.bzl:
+#   bazel run @talos//tools:sync_manifest -- robot.toml
+[robot]
+name = "robot_repo"
+# The default tick: how often a node's update() runs, unless its subsystem
+# file sets its own period_us.
+period_us = 5000
+# How old hardware state, a Driver Station packet or a target may be before
+# the robot goes neutral.
+command_timeout_us = 100000
+status_hz = 200.0
+# A person sets this true at the robot, after checking every CAN id; never
+# from a desk (docs/BRINGUP.md). A commissioned robot also requires target
+# coverage: the launcher refuses a subsystem that some Driver Station mode's
+# policy lanes leave without a writer. require_target_coverage = true asks
+# for that before commissioning, once every mechanism has a teleop binding
+# or other producer.
+commissioned = false
+# talOS's hardware bridge, which the launcher starts as the courier to the
+# RoboRIO. Its default, //talOS/bridge:hardware_node, names this repository.
+hardware_node = "@talos//talOS/bridge:hardware_node"
+# The program that stands in for the RoboRIO under `bazel run //:sim`.
+sim_gateway = "@talos//talOS/simulation:sim_gateway"
+
+# Where the RoboRIO is, as seen from the main processor: loopback for
+# simulation. On the robot set its address (e.g. "10.TE.AM.2") or pass the
+# launcher --remote ADDR.
+controller_address = "127.0.0.1"
+controller_port = 5802
+local_port = 5803
+
+# Which target lanes (/<subsystem>/target/<source>) each Driver Station mode
+# obeys, highest priority first. A subsystem file's [targets] replaces the
+# modes it lists. Add "auto" to autonomous once an autonomous node writes
+# lanes.
+[robot.targets]
+teleop = ["teleop"]
+autonomous = []
+test = []
+
+# Studio, the live viewer: its bridge shows what the telemetry node
+# publishes on `topic`. `bridge` names talOS's; the default names this
+# repository. `webroot` is BUILD.bazel's //:studio_webroot, the pages the
+# talOS checkout built (until then the bridge's pages say how to build them).
+[studio]
+bridge = "@talos//studio/bridge:studio_bridge"
+webroot = "bazel-bin/studio_webroot"
+topic = "/talos/telemetry"
+
+# One entry per subsystem; `path` is relative to this file.
+[[subsystems]]
+name = "teleop"
+path = "subsystems/teleop.toml"
+
+[[subsystems]]
+name = "telemetry"
+path = "subsystems/telemetry.toml"
+
+[[subsystems]]
+name = "roller"
+path = "subsystems/roller.toml"
+
+[[subsystems]]
+name = "gate"
+path = "subsystems/gate.toml"

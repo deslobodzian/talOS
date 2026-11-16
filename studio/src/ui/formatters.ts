@@ -52,3 +52,23 @@ export const number = (value: number, places = 4): string =>
 // wire follows.
 export const timestamp = (ns: string|null|undefined): string =>
     ns == null ? '—' : integer(ns) + ' ns';
+
+// A wall-clock nanosecond time as the viewer's local date and time to the
+// millisecond.
+export function wallDateTime(ns: string|bigint): string {
+  const date = new Date(Number(BigInt(ns) / 1000000n));
+  if (Number.isNaN(date.getTime())) return '—';
+  const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+      `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.` +
+      pad(date.getMilliseconds(), 3);
+}
+
+// Nanoseconds since a session's start as m:ss.mmm.
+export function sessionTime(ns: bigint): string {
+  const sign = ns < 0n ? '-' : '';
+  const ms = (ns < 0n ? -ns : ns) / 1000000n;
+  const minutes = ms / 60000n, seconds = (ms / 1000n) % 60n, rest = ms % 1000n;
+  return `${sign}${minutes}:${String(seconds).padStart(2, '0')}.${
+      String(rest).padStart(3, '0')}`;
+}

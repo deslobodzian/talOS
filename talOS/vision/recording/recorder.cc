@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include "talOS/process/process.h"
+
 namespace talos::vision::recording {
 namespace {
 
@@ -186,7 +188,11 @@ struct FrameRecorder::Impl {
     }
     std::filesystem::create_directories(options.output_dir);
     ScanExisting();
-    writer = std::thread([this] { WriterLoop(); });
+    writer = std::thread([this] {
+      // PNG encoding and disk writes run below every node loop.
+      talos::process::ConfigureBackgroundThread();
+      WriterLoop();
+    });
   }
 
   static constexpr std::size_t kMaxDetections = 256;

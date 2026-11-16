@@ -11,7 +11,8 @@
 import {useMemo} from 'react';
 
 import {discoverSubsystems, type Subsystem} from '../../data/discovery';
-import {useDictionary, useSeries, useSnapshot, useSystem} from '../../data/hooks';
+import {nodeLiveness} from '../../data/freshness';
+import {useChannelStale, useDictionary, useSeries, useSnapshot, useSystem} from '../../data/hooks';
 import type {ChannelInfo} from '../../data/types';
 import type {SystemNode} from '../../system';
 import {rateKey} from '../../system';
@@ -22,6 +23,7 @@ import {Sparkline} from '../../ui/Sparkline';
 import {TimeSeriesChart} from '../../ui/TimeSeriesChart';
 import type {PanelDefinition, PanelProps} from '../types';
 import {pairTargets, type Pairing} from './pairing';
+import {FreshnessNotice} from '../../ui/FreshnessNotice';
 import './subsystems.css';
 
 export type SubsystemsConfig = {selected: string[] | null};
@@ -72,9 +74,10 @@ function ChannelRow(
       channel: string; info: ChannelInfo; value: number | undefined;
       seriesValues: Float64Array | undefined;
     }) {
+  const stale = useChannelStale(channel);
   const kind = kindOf(info, value);
   return <li className="channel-row">
-    <code className="channel-name">{channelDisplayName(channel)}</code>
+    <code className="channel-name">{channelDisplayName(channel)}{stale && <em className="text-warn"> · STALE</em>}</code>
     <span className={'channel-value ' + kind}>
       {kind === 'boolean' ?
            <span className={'pill ' + (value === 1 ? 'on' : 'off')}>
@@ -103,12 +106,15 @@ function PairRow(
       measuredSeries: Float64Array | undefined;
       targetSeries: Float64Array | undefined;
     }) {
+  const measuredStale = useChannelStale(pair.measured);
+  const targetStale = useChannelStale(pair.target);
   const error = measuredValue !== undefined && targetValue !== undefined ?
       measuredValue - targetValue :
       undefined;
   return <li className="pair-row">
     <div className="pair-label">
       <b>{pair.stem}</b>
+      {(measuredStale || targetStale) && <em className="text-warn">STALE {measuredStale ? 'measured' : ''} {targetStale ? 'target' : ''}</em>}
       <span className="legend">
         <i className="swatch measured"/>measured
         <i className="swatch target"/>target
@@ -132,11 +138,12 @@ function PairRow(
 }
 
 function SubsystemCard(
-    {sub, infoBy, snapshot, node, rates, series}: {
+    {sub, infoBy, snapshot, node, graphStale, rates, series}: {
       sub: Subsystem;
       infoBy: Map<string, ChannelInfo>;
       snapshot: {channels: Record<string, number>} | null;
       node: SystemNode | undefined;
+      graphStale: boolean;
       rates: Record<string, number>;
       series: {values: Record<string, Float64Array>};
     }) {
@@ -159,6 +166,7 @@ function SubsystemCard(
   }, [channels, infoBy]);
 
   const selection = sub.selection;
+  const liveness = node ? nodeLiveness(node, {stale: graphStale}) : null;
   const loop = node ? loopRate(node, rates) : undefined;
   const latency = node ? worstLatency(node) : undefined;
   const lane = (name: string) =>
@@ -168,8 +176,9 @@ function SubsystemCard(
       </span>;
 
   return <section className="subsystem-card">
+    <FreshnessNotice prefix={sub.name + '/'}/>
     <header className="subsystem-head">
-      <h3><StatusDot active={node?.alive ?? false}/>{sub.name}</h3>
+      <h3><StatusDot active={liveness === 'live'}/>{sub.name}</h3>
       <span className={
                 'subsystem-enabled' +
                 (enabledValue === 1 ? ' on' : enabledValue === 0 ? ' off' : '')}>
@@ -190,8 +199,9 @@ function SubsystemCard(
       </div>
       <dl className="subsystem-health">
         <div><dt>alive</dt>
-          <dd className={node?.alive ? 'ok' : node ? 'warn' : 'muted'}>
-            {node ? node.alive ? 'yes' : 'stale' : '—'}
+          <dd className={liveness === 'live' ? 'ok' : liveness ? 'warn' : 'muted'}>
+            {liveness === 'live' ? 'yes' : liveness === 'stopped' ? 'stale' :
+             liveness === 'unknown' ? 'unknown' : '—'}
           </dd></div>
         <div><dt>loop</dt><dd>{node ? hertz(loop) : '—'}</dd></div>
         <div><dt>latency</dt>
@@ -295,6 +305,7 @@ function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
              <SubsystemCard key={sub.name} sub={sub} infoBy={infoBy}
                             snapshot={snapshot}
                             node={system.graph?.nodes.find(n => n.name === sub.name)}
+                            graphStale={system.stale}
                             rates={system.rates} series={series}/>)}
          </div>}
   </div>;

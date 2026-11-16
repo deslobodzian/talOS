@@ -58,6 +58,7 @@ cc_test(
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
         "@talos//talOS/devices:testing",
+        "@talos//talOS/node:allocation_probe",
         "@talos//talOS/node:testing",
     ],
 )

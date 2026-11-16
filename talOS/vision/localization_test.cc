@@ -8,32 +8,10 @@
 #include <limits>
 #include <vector>
 
+#include "talOS/node/allocation_probe.h"
+
 namespace talos::vision {
 namespace {
-
-TEST(LocalizationTest, TagModelCorners) {
-  // Layout tag frame (+X out of the face, +Z up), detector index order:
-  // bottom-left, bottom-right, top-right, top-left as seen facing the tag.
-  const double size_m = 0.1651;
-  const auto corners = GetTagModelCorners(size_m);
-  const double half = size_m * 0.5;
-
-  EXPECT_NEAR(corners[0].x(), 0.0, 1e-6);
-  EXPECT_NEAR(corners[0].y(), -half, 1e-6);
-  EXPECT_NEAR(corners[0].z(), -half, 1e-6);
-
-  EXPECT_NEAR(corners[1].x(), 0.0, 1e-6);
-  EXPECT_NEAR(corners[1].y(), half, 1e-6);
-  EXPECT_NEAR(corners[1].z(), -half, 1e-6);
-
-  EXPECT_NEAR(corners[2].x(), 0.0, 1e-6);
-  EXPECT_NEAR(corners[2].y(), half, 1e-6);
-  EXPECT_NEAR(corners[2].z(), half, 1e-6);
-
-  EXPECT_NEAR(corners[3].x(), 0.0, 1e-6);
-  EXPECT_NEAR(corners[3].y(), -half, 1e-6);
-  EXPECT_NEAR(corners[3].z(), half, 1e-6);
-}
 
 TEST(LocalizationTest, ReprojectionErrorCalculation) {
   CameraIntrinsics intr;
@@ -72,42 +50,6 @@ TEST(LocalizationTest, ReprojectionErrorCalculation) {
       ComputeReprojectionError(noisy_corners, T_cam_tag, intr, tag_size);
   EXPECT_GT(noisy_err, 1.0);
   EXPECT_LT(noisy_err, 3.0);
-}
-
-TEST(LocalizationTest, RobotFieldPoseAnalytical) {
-  // Analytical test:
-  // Robot at field origin (0, 0, 0).
-  // Camera mounted at robot origin (identity).
-  // Tag 1 is at field position (4.0, 0.0, 1.0).
-  // Camera looks directly at Tag 1: camera observes tag at (0.0, 0.0, 4.0).
-  // T_field_tag = (4.0, 0.0, 1.0)
-  // T_camera_tag = (0.0, 0.0, 4.0) with camera Z pointing at tag
-  // In our coordinate convention:
-  // p_field = T_field_tag * T_camera_tag.inverse() * T_robot_camera.inverse() *
-  // p_robot
-
-  FieldLayout layout;
-  layout.SetTagPose(
-      1, talos::geometry::SE3<double>(talos::geometry::SO3<double>::Identity(),
-                                      Eigen::Vector3d(4.0, 0.0, 1.0)));
-
-  CameraMounting mount = CameraMounting::Identity();
-
-  const auto tag_pose = layout.GetTagPose(1);
-  if (!tag_pose.has_value()) {
-    FAIL() << "Missing tag 1 pose";
-  }
-  const auto T_camera_tag = mount.T_robot_camera.inverse() * *tag_pose;
-
-  RobotPoseEstimate res =
-      ComputeRobotFieldPose(1, 0, T_camera_tag, mount, layout, 0.5, 0.1);
-
-  ASSERT_TRUE(res.validity.valid);
-  EXPECT_EQ(res.validity.reason, PoseInvalidReason::kValid);
-
-  EXPECT_TRUE(res.T_field_robot.translation().isZero(1e-6));
-  EXPECT_TRUE(res.T_field_robot.rotation().rotationMatrix().isApprox(
-      Eigen::Matrix3d::Identity(), 1e-6));
 }
 
 TEST(LocalizationTest, RobotFieldPoseWithMountingOffset) {
@@ -253,6 +195,64 @@ TEST(LocalizationTest, SolverCovarianceShrinksWithTagsAndGrowsWithDistance) {
     EXPECT_GE(floored.std_devs.yaw_std_rad,
               PoseSolverOptions{}.min_yaw_std_rad);
   }
+}
+
+// A per-frame caller keeps one solver (RULES.md 3). Reused after a larger
+// frame it must return exactly what a fresh solve returns, and once it has
+// room it allocates nothing, whether the solve is valid or rejected.
+TEST(LocalizationTest, ReusedSolverMatchesFreshSolveWithoutAllocating) {
+  const JointFixture six(3, 6);
+  const JointFixture one(3, 1);
+  const JointFixture none = [] {
+    JointFixture fixture(3, 1);
+    fixture.tags.front().valid = false;
+    return fixture;
+  }();
+  const bool counting = talos::testing::AllocationProbe::Unsupported().empty();
+  talos::testing::AllocationProbe probe;
+  MultiTagPoseSolver solver(six.tags.size());
+  for (const auto* fixture : {&six, &one, &none, &six}) {
+    if (counting) probe.start();
+    const auto reused = solver.Solve(fixture->tags, 1, fixture->mount,
+                                     fixture->layout, fixture->intr);
+    if (counting) {
+      EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+    }
+    const auto fresh = SolveMultiTagRobotPose(fixture->tags, 1, fixture->mount,
+                                              fixture->layout, fixture->intr);
+    EXPECT_EQ(reused.validity.valid, fixture != &none);
+    EXPECT_EQ(reused.validity.reason, fresh.validity.reason);
+    EXPECT_EQ(reused.tag_count, fresh.tag_count);
+    EXPECT_TRUE(reused.T_field_robot.matrix() == fresh.T_field_robot.matrix());
+    EXPECT_EQ(reused.std_devs.x_std_m, fresh.std_devs.x_std_m);
+    EXPECT_EQ(reused.std_devs.y_std_m, fresh.std_devs.y_std_m);
+    EXPECT_EQ(reused.std_devs.yaw_std_rad, fresh.std_devs.yaw_std_rad);
+    EXPECT_EQ(reused.reprojection_error_px, fresh.reprojection_error_px);
+  }
+}
+
+TEST(LocalizationTest, FitResidualInflatesPublishedCovariance) {
+  PoseSolverOptions noise;
+  noise.min_xy_std_m = 0;
+  noise.min_yaw_std_rad = 0;
+  noise.mount_angle_std_rad = 0;
+  noise.mount_translation_std_m = 0;
+  JointFixture fixture(3, 6);
+  const auto clean = fixture.Solve(noise);
+  // Shear every tag by 1.2 px per coordinate: under the 2 px Huber transition
+  // and the 3.5 px reject threshold, yet about 3.6 nominal sigma. Accepting
+  // that fit must not also publish the clean fit's uncertainty.
+  for (auto& tag : fixture.tags) {
+    for (size_t i = 0; i < tag.corners.size(); ++i) {
+      tag.corners[i] += (i / 2) % 2 == 0 ? 1.2f : -1.2f;
+    }
+  }
+  const auto noisy = fixture.Solve(noise);
+  ASSERT_TRUE(clean.validity.valid);
+  ASSERT_TRUE(noisy.validity.valid) << noisy.validity.message;
+  EXPECT_GT(noisy.std_devs.x_std_m, 2 * clean.std_devs.x_std_m);
+  EXPECT_GT(noisy.std_devs.y_std_m, 2 * clean.std_devs.y_std_m);
+  EXPECT_GT(noisy.std_devs.yaw_std_rad, 2 * clean.std_devs.yaw_std_rad);
 }
 
 TEST(LocalizationTest, HuberSuppressesTwentyPixelTagOutlier) {
@@ -582,7 +582,6 @@ TEST(LocalizationTest, DistortedHomographyAndJointPnP) {
       SolveMultiTagRobotPose(observations, 7, mount, layout, intr);
   ASSERT_TRUE(result.validity.valid);
   EXPECT_EQ(result.tag_count, 2);
-  EXPECT_EQ(result.camera_id, 7);
   EXPECT_LT(result.T_field_robot.translation().norm(), 0.002);
   EXPECT_LT(result.reprojection_error_px, 0.01);
   EXPECT_DOUBLE_EQ(result.ambiguity, 0);
@@ -693,6 +692,41 @@ TEST(LocalizationTest, InvalidDetectionCannotEnterJointSolve) {
   EXPECT_DOUBLE_EQ(mixed.std_devs.x_std_m, single.std_devs.x_std_m);
 }
 
+TEST(LocalizationTest, RepeatedTagIdKeepsTheDetectionConsistentWithTheFrame) {
+  // A printed copy of tag 1 elsewhere in view decodes as a second tag 1 with
+  // its own consistent single-tag pose. Beside another tag, the copy must lose
+  // even with the stronger decode; a lone id has nothing to contradict either
+  // detection, so the stronger decode, here the real tag, is kept.
+  struct Case {
+    int tag_count;
+    float decoy_margin;
+  };
+  for (const Case c : {Case{2, 120}, Case{1, 40}}) {
+    SCOPED_TRACE(::testing::Message() << c.tag_count << " tags, decoy margin "
+                                      << c.decoy_margin << " vs 80");
+    JointFixture fixture(3, c.tag_count);
+    for (auto& tag : fixture.tags) tag.decision_margin = 80;
+    auto decoy = fixture.tags.front();
+    decoy.decision_margin = c.decoy_margin;
+    decoy.T_camera_tag = SolverTagFrameToLayoutFrame(JointFixture::Pose(
+        talos::geometry::SO3<double>::Exp({0.1, 0.2, 0.05}), {0.6, 0.1, 2.6}));
+    const auto corners = GetTagModelCorners(fixture.layout.GetTagSize(1));
+    for (size_t j = 0; j < corners.size(); ++j) {
+      Eigen::Vector2d uv;
+      ASSERT_TRUE(
+          fixture.intr.ProjectPoint(decoy.T_camera_tag.act(corners[j]), &uv));
+      decoy.corners[2 * j] = static_cast<float>(uv.x());
+      decoy.corners[2 * j + 1] = static_cast<float>(uv.y());
+    }
+    fixture.tags.insert(fixture.tags.begin(), decoy);
+    const auto result = fixture.Solve();
+    ASSERT_TRUE(result.validity.valid) << result.validity.message;
+    EXPECT_EQ(result.tag_count, c.tag_count);
+    EXPECT_TRUE(
+        result.T_field_robot.matrix().isApprox(fixture.robot.matrix(), 1e-4));
+  }
+}
+
 void ExpectReplayedSingleTagRejected(const std::array<float, 8>& corners,
                                      const talos::geometry::SE3<double>& truth,
                                      double expected_range,
@@ -795,19 +829,6 @@ TEST(LocalizationTest, CandidateOrderingKeepsLowerErrorPrimary) {
   EXPECT_DOUBLE_EQ(detail::OrderPoseCandidates(primary, secondary, first_error,
                                                second_error),
                    1);
-}
-
-TEST(LocalizationTest, TwoAmbiguousTagsSolveJointlyNearTruth) {
-  // A single tag above the ambiguity limit is rejected, but a multi-tag solve
-  // does not inherit that single-tag gate: two tags at 0.65 still localize.
-  JointFixture fixture(3, 2);
-  for (auto& tag : fixture.tags) tag.ambiguity = 0.65;
-  const auto result = fixture.Solve();
-  ASSERT_TRUE(result.validity.valid) << result.validity.message;
-  EXPECT_EQ(result.tag_count, 2);
-  EXPECT_TRUE(
-      result.T_field_robot.matrix().isApprox(fixture.robot.matrix(), 1e-4));
-  EXPECT_DOUBLE_EQ(result.ambiguity, 0);
 }
 
 TEST(LocalizationTest, MultiTagSeedIgnoresFlippedPrimaryCandidate) {

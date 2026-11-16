@@ -11,7 +11,18 @@
 #include "talOS/geometry/so3.h"
 #include "talOS/vision/calibration.h"
 
+struct apriltag_detector;
+
 namespace talos::vision::apriltag {
+
+// Creates `td`'s worker pool, unless it already has one of td->nthreads
+// threads, with every pool thread at background priority
+// (talos::process::ConfigureBackgroundThread), below the node loop threads.
+// The AprilTag library creates its pool on the first detection with default
+// thread attributes and offers no thread-start hook, and macOS does not pass
+// a QoS to a new thread, so each pool thread lowers itself from a task. Call
+// it before each detection: the library keeps a pool of the right size.
+void EnsureBackgroundWorkerPool(apriltag_detector* td);
 
 using CameraIntrinsics = talos::vision::CameraIntrinsics;
 
@@ -103,14 +114,6 @@ class CpuAprilTagBackend {
   PoseEstimation EstimatePose(const Detection& detection,
                               const CameraIntrinsics& intrinsics,
                               double tag_size_meters) const;
-
-  PoseEstimation EstimatePoseHomography(const Detection& detection,
-                                        const CameraIntrinsics& intrinsics,
-                                        double tag_size_meters) const;
-
-  PoseEstimation EstimatePoseOrthogonalIteration(
-      const Detection& detection, const CameraIntrinsics& intrinsics,
-      double tag_size_meters, int n_iters = 50) const;
 
  private:
   struct Impl;

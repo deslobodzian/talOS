@@ -1,0 +1,46 @@
+// tlog_to_wpilog_test's messages: every scalar base type a talos message
+// field can have, fixed arrays of scalars and of structs, an enum, and a
+// nested geometry.Pose2d (the converter's one pose mapping), and the
+// shapes the converter's naming rules are tested on.
+include "geometry/geometry.fbs";
+
+namespace wpilog_test;
+
+enum Phase : ubyte { IDLE, RUNNING = 4 }
+
+struct Wheel {
+  speed_mps:float;
+  slipping:bool;
+}
+
+struct Sample {
+  position_m:double;
+  ratio_frac:float;
+  offset_count:byte;
+  error_count:int;
+  sample_time_ns:ulong;
+  total_count:long;
+  ready:bool;
+  phase:Phase;
+  samples_m:[double:3];
+  gains_frac:[float:2];
+  ticks_count:[int:2];
+  flags:[bool:2];
+  wheels:[Wheel:2];
+  pose:geometry.Pose2d;
+}
+
+// Entry-name collision: /arm/state's left.angle_rad against the topic
+// /arm/state/left's angle_rad.
+struct Side {
+  angle_rad:double;
+}
+
+struct Arm {
+  left:Side;
+}
+
+// A fixed array of poses, sent on a target lane.
+struct Path {
+  poses:[geometry.Pose2d:2];
+}
