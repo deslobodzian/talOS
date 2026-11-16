@@ -233,12 +233,8 @@ blocked for life), inherits the blocked signals.
 built, before its loop runs: everything alive after construction (modules,
 config, the node and what its constructor built) moves to the collector's
 permanent generation, and later collections scan only objects allocated
-since. For the 2026 robot's pose estimator, in its own repository (about 33 000 tracked objects after
-construction with the Kalman backend, 53 000 with the factor graph) a full
-collection drops from 1.9–2.5 ms (4.9 ms for the first in a run) to under
-15 µs, and the longest middle-generation collection from about 0.25 ms to
-0.05 ms (desktop Ryzen 9 7950X3D, CPython 3.11, `update_benchmark`).
-Young-generation collections still run, about 20 µs each. A reference cycle
+since, so a full collection no longer rescans what construction built.
+Young-generation collections still run. A reference cycle
 built before the freeze and dropped afterwards is never collected, so drop
 construction-time scratch inside the constructor. `talos.testing.Sim` does
 not freeze.

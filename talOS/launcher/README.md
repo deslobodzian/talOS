@@ -787,28 +787,29 @@ pass looks at every one.
 
 ### Restart latency
 
-From SIGKILL of a critical member to its first hardware request, measured on
-a Linux x86-64 desktop (8 threads) by killing `drivetrain` 20 times in a
-`--sim` session of the 2026 robot's `robot_physics_sim.toml` with the physics gateway under
+From the restart's `fork` to the restarted member's first hardware request,
+measured in the 2026 robot's own repository (not dated; no BENCH_RESULTS.md
+entry) on a Linux x86-64 desktop (8 threads) by killing its `drivetrain` 20
+times in a `--sim` session with the physics gateway under
 `--restart-window-ms 1500`, so each is a first restart, session directory on
-btrfs. The stages come from `CLOCK_MONOTONIC` stamps: the killer's, the
-launcher's `waitpid` and `fork` and the restarted node's first constructor (an
-`LD_PRELOAD` shim), and the restarted run's `.tlog` origin, first tick deadline
-less its offset (`run()`) and first `/hw/request/drivetrain` send:
+btrfs. The stages come from `CLOCK_MONOTONIC` stamps: the launcher's `fork`
+and the restarted node's first constructor (an `LD_PRELOAD` shim), and the
+restarted run's `.tlog` origin, first tick deadline less its offset (`run()`)
+and first `/hw/request/drivetrain` send. The kill-to-reap and reap-to-`fork`
+stages (the SIGCHLD wakeup of the supervision loop; restart bookkeeping,
+where `RestartLogBudget` lists the session directory and the pass posts its
+manifest version to the writer thread) are not in it:
 
 | Stage | ms, median (range) | Set by |
 |---|---|---|
-| SIGKILL → launcher reaps the exit | not yet measured | the SIGCHLD wakeup of the supervision loop |
-| reap → `fork` of the restart | not yet measured | restart bookkeeping (`RestartLogBudget` lists the session directory); the pass posts its manifest version to the writer thread after its restarts |
 | `fork` → first constructor | 1.2 (1.1–1.2) | group and guardian setup, exec, dynamic loading |
 | first constructor → event-loop origin | 0.4 (0.4–0.5) | flags; the event-log file is created on the log's writer thread, not here |
 | origin → `run()` | 1.5 (1.4–1.6) | robot config parse, topic attach |
 | `run()` → first tick | 5.0 | one `period_us` |
 | first tick → first `/hw/request/drivetrain` | 0.0 | that tick's flush, which needs a `/hw/state` received since the node attached |
-| **total** | not yet measured | |
 
 `restart_latency` repeats the `.tlog` part of this measurement on any host:
-SIGKILL → origin (the first four rows together), origin → `run()`, `run()` →
+SIGKILL → origin (the two stages above and the first two rows together), origin → `run()`, `run()` →
 first tick, first tick → first request and the total, as median (range). The
 config's nodes come from `bazel-bin`, so build them first:
 
