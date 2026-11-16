@@ -1,6 +1,6 @@
 """Tests for tools/check_robot_repository.sh with a stub `bazel`.
 
-REQ-DEV-30: a talOS change is checked against a robot repository that
+REQ-DEV-32: a talOS change is checked against a robot repository that
 consumes it. The check must refuse a path that is not a git repository and
 must never write into the robot repository it reads (it builds a copy of its
 committed tree). The Bazel path itself is proved by running the script

@@ -160,7 +160,7 @@ class PrepushTest(unittest.TestCase):
         self.assertIn("prepush: test ok", out)
         self.assert_cleaned_up()
 
-    # REQ-DEV-30: a contributor without the robot repository is unaffected.
+    # REQ-DEV-32: a contributor without the robot repository is unaffected.
     def test_robot_repository_is_skipped_without_its_variable(self):
         code, out, _ = self.prepush()
         self.assertEqual(code, 0, out)
