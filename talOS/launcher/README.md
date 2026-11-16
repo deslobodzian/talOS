@@ -1870,6 +1870,12 @@ Station to command need an enabled session. With two actuator owners a
 merged command carries the older owner's observation, so a per-owner figure
 on the RoboRIO side needs a one-owner config.
 
+The RoboRIO's half of the path is in no session record: the age of a
+command's observation when the RoboRIO takes it, and a Driver Station
+refresh to its send, are printed on the RoboRIO's console as its
+`[rio] latency` line, on the RoboRIO's clock
+([RoboRIO](../hardware/README.md#roborio)).
+
 ## If you change the shape of `graph.json`
 
 Studio parses this document in TypeScript (`studio/src/system.ts`), and neither

@@ -199,7 +199,8 @@ TEST(RioLog, TickPhasesReportEachWindowsMeanAndMaxThenReset) {
   log.AddPhase(TickPhase::kRefresh, 9'000);
   log.RecordTick(5'000, 4'000, 5'000);
   log.Drain(RioLog::kPhaseWindowUs + 20'000);
-  ASSERT_EQ(lines.size(), 1u);
+  // The phase line, then the latency line beside it.
+  ASSERT_EQ(lines.size(), 2u);
   for (const char* expected :
        {"refresh mean/max 1.5/2.0 us", "devices 3.5/7.0 us",
         "control 1.5/3.0 us", "health 0.5/1.0 us", "other 0.2/0.4 us",
@@ -212,12 +213,12 @@ TEST(RioLog, TickPhasesReportEachWindowsMeanAndMaxThenReset) {
   log.Drain(2 * RioLog::kPhaseWindowUs + 20'000);
   log.RecordTick(5'000, 4'000, 5'000);
   log.Drain(2 * RioLog::kPhaseWindowUs + 40'000);
-  ASSERT_EQ(lines.size(), 2u);
+  ASSERT_EQ(lines.size(), 4u);
   for (const char* expected :
        {"refresh mean/max 9.0/9.0 us", "devices 0.0/0.0 us",
         "control 0.0/0.0 us", "over 1 ticks"}) {
-    EXPECT_NE(lines[1].find(expected), std::string::npos)
-        << "expected \"" << expected << "\" in: " << lines[1];
+    EXPECT_NE(lines[2].find(expected), std::string::npos)
+        << "expected \"" << expected << "\" in: " << lines[2];
   }
 }
 
@@ -276,6 +277,83 @@ TEST(RioLog, TickPhasesWindowWithoutTicksPrintsNothing) {
   log.RecordTick(0, 4'000, 5'000);
   log.Drain(RioLog::kPhaseWindowUs + 40'000);
   EXPECT_TRUE(lines.empty()) << lines.front();
+}
+
+// The RoboRIO's latency line (REQ-RT-25), one window's lines as the logger
+// writes them: the window is the phase window, handed over the same way.
+std::vector<std::string> LatencyLines(const std::vector<std::string>& lines) {
+  std::vector<std::string> latency;
+  for (const auto& line : lines) {
+    if (line.find("[rio] latency: ") != std::string::npos) {
+      latency.push_back(line);
+    }
+  }
+  return latency;
+}
+
+// Each 10 s window prints, per figure, the p50 and p99 of its samples to the
+// 100 us bucket (never above the max), the exact max and the count: here
+// accepted ages 99, 199, ..., 9999 us, one refused age past the 51.1 ms the
+// buckets cover, and a Driver Station age every fourth tick. A sample joins
+// the window of the tick that records it, as the tick's phases do, so the
+// handover tick's sample opens the next window, which holds nothing else.
+// REQ-RT-25
+TEST(RioLog, LatencyReportsEachWindowsPercentilesMaxAndCountThenResets) {
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(0);  // starts the window clock
+  for (uint64_t i = 1; i <= 100; ++i) {
+    log.RecordCommandAge(i * 100 - 1, true);
+    if (i % 4 == 0) log.RecordDriverStationAge(20'000 + i);
+    if (i == 50) log.RecordCommandAge(60'123, false);
+    log.RecordTick(5'000, 1'000, 5'000);
+  }
+  log.Drain(RioLog::kPhaseWindowUs);  // asks the loop for the window
+  log.RecordCommandAge(4'321, true);
+  log.RecordTick(5'000, 1'000, 5'000);  // hands it over
+  log.Drain(RioLog::kPhaseWindowUs + 20'000);
+  auto latency = LatencyLines(lines);
+  ASSERT_EQ(latency.size(), 1u);
+  EXPECT_EQ(latency[0],
+            "[rio] latency: command age accepted p50/p99/max 5000/9900/9999 "
+            "us over 100, refused 60123/60123/60123 us over 1; driver station "
+            "refresh to send 20100/20100/20100 us over 25\n");
+
+  log.Drain(2 * RioLog::kPhaseWindowUs + 20'000);
+  log.RecordTick(5'000, 1'000, 5'000);
+  log.Drain(2 * RioLog::kPhaseWindowUs + 40'000);
+  latency = LatencyLines(lines);
+  ASSERT_EQ(latency.size(), 2u);
+  EXPECT_EQ(latency[1],
+            "[rio] latency: command age accepted p50/p99/max 4321/4321/4321 "
+            "us over 1, refused -/-/- us over 0; driver station refresh to "
+            "send -/-/- us over 0\n");
+}
+
+// An age is a difference on the RoboRIO's clock: an observation ahead of
+// that clock (one from before an OS reboot, a corrupt stamp) wraps to an age
+// of 2^63 us or more, which is no age and is not counted, rather than a max
+// of centuries. (A previous program run's command lies in the past of the
+// same clock and counts.)
+// REQ-RT-25
+TEST(RioLog, LatencyIgnoresAnAgeThatWrapped) {
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(0);
+  const uint64_t now_us = 1'000'000;
+  log.RecordCommandAge(now_us - (now_us + 1), false);
+  log.RecordDriverStationAge(now_us - (now_us + 5'000));
+  log.RecordTick(5'000, 1'000, 5'000);
+  log.Drain(RioLog::kPhaseWindowUs);
+  log.RecordTick(5'000, 1'000, 5'000);
+  log.Drain(RioLog::kPhaseWindowUs + 20'000);
+  const auto latency = LatencyLines(lines);
+  ASSERT_EQ(latency.size(), 1u);
+  EXPECT_NE(latency[0].find("refused -/-/- us over 0"), std::string::npos)
+      << latency[0];
+  EXPECT_NE(latency[0].find("refresh to send -/-/- us over 0"),
+            std::string::npos)
+      << latency[0];
 }
 
 }  // namespace
