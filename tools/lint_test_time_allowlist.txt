@@ -52,6 +52,7 @@ talOS/launcher/supervision_test.cc clock seeded: integration, one real spawn or 
 talOS/launcher/supervision_test.cc sleep seeded: integration, one real spawn or kill per mechanism; sleeps unaudited against TESTING.md §6.3
 talOS/node/node_test.cc clock seeded: an integration case (signals a spawned node) in a component target; move it to its own target
 talOS/node/node_test.cc sleep seeded: an integration case (signals a spawned node) in a component target; move it to its own target
+talOS/simulation/sim_gateway_test.py clock integration: the simulator as a child process; deadlines on its UDP datagrams only bound a hang (TESTING.md §6)
 talOS/vision/pipeline_test.cc clock integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/pipeline_test.cc sleep integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/recording/recorder_test.cc clock integration: recorder thread, condition wait with a deadline

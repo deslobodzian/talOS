@@ -82,3 +82,18 @@ py_test(
     tags = ["integration"],
     deps = ["@rules_python//python/runfiles"],
 )
+
+# The simulator alone, as a child process: --describe and its flag checks,
+# a run without a config, and its Driver Station and State datagrams over
+# loopback UDP for configs the cases write (REQ-DEV-10: home switches).
+# Over 1 s, integration lane: two cases run the simulator for 0.6 s and
+# 0.3 s of real time.
+py_test(
+    name = "sim_gateway_test",
+    size = "small",
+    srcs = ["sim_gateway_test.py"],
+    data = [":sim_gateway"],
+    env = {"SIM_GATEWAY": "$(rlocationpath :sim_gateway)"},
+    tags = ["integration"],
+    deps = ["@rules_python//python/runfiles"],
+)
