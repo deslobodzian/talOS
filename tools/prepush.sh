@@ -24,9 +24,15 @@
 # or set an upstream); the steps still run, and the run exits 1.
 # Steps, in order: read-only, source-lints (tools/source_lints.sh, the
 # lints CI's "Source lints (no Bazel)" job runs: test time, links,
-# requirement trace, node test matrix; under a second),
-# `bazel build //...`, host-includes, `bazel test
-# --nocache_test_results //...`, then, when the commits to push
+# requirement trace, node test matrix; under a second), format
+# (tools/format.sh --check: clang-format 18 on the C/C++ files changed since
+# the merge base with origin/main, else with the upstream, else every file;
+# CI's clang-format job checks the same branch diff; FAILED also when
+# clang-format-18 cannot be installed or run), `bazel build //...`,
+# host-includes, `bazel test --nocache_test_results //...`, tidy
+# (tools/tidy.sh with format's base, CI's clang-tidy selection; where it
+# exits 3, cannot run on this host, the line `prepush: tidy NOT RUN
+# (<its reason>)`, which does not fail the run), then, when the commits to push
 # (<ref>@{upstream}..<ref>; every file when <ref> is not a branch with an
 # upstream) touch MODULE.bazel, REPO.bazel, third_party/, talOS/, tools/ or
 # the fixtures,
@@ -52,14 +58,16 @@
 # --full only tsan and asan (tools/sanitizer_lane.sh, CI's sanitizer
 # jobs; 5 to 10 minutes each cold) and soak (CI's
 # soak_test with seed 0 for TALOS_SOAK_SECONDS=36, the shortest run that
-# injects every fault kind); after a failed build, rio-in-the-loop, tsan,
-# asan and soak are SKIPPED; checkout-unchanged, then, when the commits
+# injects every fault kind); after a failed build, host-includes, test,
+# tidy, rio-in-the-loop, tsan, asan and soak are SKIPPED; checkout-unchanged, then, when the commits
 # touch studio/,
 # studio-test and studio-build (`pnpm test`, `pnpm build`).
 # Each step prints one line (`prepush: <step> ok`, `prepush: <step> FAILED
-# (see <log>)`, `prepush: <step> SKIPPED (<reason>)`); logs stay in a
+# (see <log>)`, `prepush: <step> SKIPPED (<reason>)`, tidy's `NOT RUN`
+# above); logs stay in a
 # directory under ${TMPDIR:-/tmp}. A commit without the tool a step runs
-# (source_lints.sh, test_rio_in_the_loop.py, sanitizer_lane.sh) has that
+# (source_lints.sh, format.sh, tidy.sh, test_rio_in_the_loop.py,
+# sanitizer_lane.sh) has that
 # step SKIPPED, unless --ref names another commit than the checkout's HEAD
 # and the upstream it goes to (if any) lacks the tool too: then it predates
 # the tool, and the line says `skipped`, which does not fail the run.
@@ -257,6 +265,26 @@ else
   no_tool source-lints tools/source_lints.sh
 fi
 
+# CI's clang-format and clang-tidy check a topic branch's whole diff against
+# its merge base with main; so do these, through the commit's own
+# tools/format.sh and tools/tidy.sh (which take that merge base). Without
+# origin/main, the diff is the upstream's; without either, every file.
+if main_ref="$(git -C "$repo" rev-parse --verify --quiet refs/remotes/origin/main)"; then
+  diff_base=(--base "$main_ref")
+  report "format and tidy check the changes since the merge base with origin/main"
+elif [ -n "$upstream" ]; then
+  diff_base=(--base "$(git -C "$repo" rev-parse --verify "$upstream")")
+  report "format and tidy check the changes since the merge base with $upstream (no origin/main)"
+else
+  diff_base=(--all)
+  report "format and tidy check every file (no origin/main and no upstream)"
+fi
+if [ -f "$wt/tools/format.sh" ]; then
+  run_step format bash tools/format.sh --check "${diff_base[@]}" || true
+else
+  no_tool format tools/format.sh
+fi
+
 bazel_started=1
 # A compile that hits the disk cache leaves no `.d` file on disk under
 # Bazel's defaults (it is kept in memory, and outputs that are not top-level
@@ -310,9 +338,36 @@ if run_step build sh -c \
   run_step test bazel test //... --test_output=errors --nocache_test_results \
     ${netns[@]+"${netns[@]}"} ${browser[@]+"${browser[@]}"} \
     "${bazel_flags[@]}" || true
+  # CI's clang-tidy step, through tools/tidy.sh, which reads the generated
+  # headers the build wrote. Its exit 3 is a host it cannot run on (clang 18
+  # cannot parse the host's C++ standard library, or no compilation
+  # database): said plainly, without failing the run, since CI runs it.
+  if [ ! -f "$wt/tools/tidy.sh" ]; then
+    no_tool tidy tools/tidy.sh
+  else
+    t0=$SECONDS
+    tidy_status=0
+    (cd "$wt" && bash tools/tidy.sh "${diff_base[@]}") >"$logs/tidy.log" 2>&1 ||
+      tidy_status=$?
+    case $tidy_status in
+      0) report "tidy ok ($((SECONDS - t0)) s)" ;;
+      3)
+        reason="$(sed -n 's/^tidy: cannot run here: //p' "$logs/tidy.log" | head -n 1)"
+        reason="${reason%:}"
+        reason="${reason%; tried}"
+        report "tidy NOT RUN (${reason:-tools/tidy.sh exited 3, see $logs/tidy.log})"
+        ;;
+      *)
+        report "tidy FAILED (see $logs/tidy.log)"
+        tail -n 40 "$logs/tidy.log" | sed 's/^/  | /'
+        failed=1
+        ;;
+    esac
+  fi
 else
   skip host-includes "the build failed"
   skip test "the build failed"
+  skip tidy "the build failed"
 fi
 # The repositories that depend on talOS as @talos, each its own workspace,
 # as CI's robot-repo job runs them. They write only ignored files (their

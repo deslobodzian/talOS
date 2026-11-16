@@ -94,12 +94,17 @@ affected tests (docs only) skips the test step: rung 2 is then
 Rung 3 is `tools/prepush.sh [--ref <commit>] [--full]`. It checks the commit out in a
 new worktree under `${TMPDIR:-/tmp}`, makes its tracked files read-only with
 CI's own step, runs CI's source lints (`tools/source_lints.sh`: test time,
-links, requirement trace, node test matrix), then `bazel build //...`, then `tools/check_host_includes.py`
+links, requirement trace, node test matrix) and `tools/format.sh --check`
+on the branch's diff against its merge base with `origin/main`, as CI's
+clang-format job, then `bazel build //...`, then `tools/check_host_includes.py`
 on the `.d` file of every compile in that build, cache hits included (no
 compile read a header from the host's include tree but the C library's,
 the kernel's or the C++ standard library's), then `bazel test //...` with no
 cached test result (build results come from the disk cache
-`~/.cache/talos-bazel-disk`), runs the gradle checks when the commits to
+`~/.cache/talos-bazel-disk`), then `tools/tidy.sh` on the same diff (on a
+host whose standard library clang 18 cannot parse, it prints `tidy NOT RUN`
+with the reason and does not fail the run: CI is then the first to run
+clang-tidy), runs the gradle checks when the commits to
 push touch the RoboRIO program or anything under `talOS/` (its
 `build.gradle` takes headers from all of it), runs CI's RoboRIO-in-the-loop
 check (`tools/test_rio_in_the_loop.py --wpilib`, about 30 s) when they touch
@@ -115,9 +120,7 @@ touch; after a failed build those steps are SKIPPED. **A push of more
 than 20 commits runs `tools/prepush.sh --full`**: without it, such a range
 (since the branch's upstream; with none, the commits on no remote-tracking
 branch) is reported first as the step `full` SKIPPED, the other steps still
-run, and the run exits nonzero. Prepush does not
-run clang-tidy: `tools/tidy.sh --base <upstream>` runs CI's selection on a
-host whose standard library clang 18 can parse (gap: TOOLS-15). Every robot
+run, and the run exits nonzero. Every robot
 and example config's
 `--describe-only` runs as its `talos_graph_test` (the bundle test's
 fixture, `bench/main_processor/bundle_testdata`, has only a
