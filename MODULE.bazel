@@ -58,7 +58,8 @@ configuration_http_archive(
     urls = ["https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz"],
 )
 
-# Choreo .traj (JSON) trajectories, read by //talOS/trajectory at load time.
+# Choreo .traj (JSON) trajectories, read by //talOS/trajectory at load time,
+# and a session's manifest.json, read by //talOS/events:input_replay.
 # 3.11.3 is the version the module graph already resolves transitively.
 bazel_dep(name = "nlohmann_json", version = "3.11.3")
 

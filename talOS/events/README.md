@@ -249,6 +249,27 @@ and the gap (`DescribeGap`: records dropped, the first and last dropped
 dispatch), then `replay: diverged=0 clean_exit=0 stopped_at_gap=1`, and exits
 1, as it does for any replay that does not reach the recorded exit.
 
+A log that ends without its `EXIT` (cut short by a power loss, its writer
+killed, or a segment a byte cap rotated out) may end inside its last
+dispatch, which a split gap's rule covers: every dispatch before the one its
+last record belongs to replays, that dispatch's recorded part does not,
+there is no divergence for what the cut lost, and `ended_in_dispatch()`
+names it. A log with no record, or cut while the program was constructed,
+ends before the first dispatch, as a gap there does: the program's sends
+past its end are not divergences. A node binary's `--replay` prints
+`replay: <log> ends without its EXIT (cut short, its writer killed, or a
+segment its byte cap rotated out) in dispatch <n>: replayed every dispatch
+before it`, or `... before dispatch 1: ...` for one cut before its first
+dispatch, and exits 1.
+
+The loop refuses, with a `ReplayError` naming the log, a log with records
+missing between intact ones ([log format](#log-format)) and a log whose
+first dispatch is not 1 (a later segment of a rotated log starts mid-run, so
+it cannot be the program's run from its start), when it is constructed,
+before the program is; and, when `run()` starts, before the first dispatch,
+a log whose manifest does not match the program's. A node binary prints the
+error and exits 1.
+
 Log versions and byte sizes are recorded in
 [DATA_FLOW.md](../../docs/DATA_FLOW.md#dispatch-logs).
 
@@ -364,6 +385,43 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   replays the timers after it up to that many of its periods late.
   A node binary prints `replay-inputs: stopped before a log gap in <log> at
   <t> s after the session start (topic <name>)` and exits 1.
+- A damaged stretch (records lost between intact ones,
+  [below](#log-format)) is a loss like a gap, from the earliest time a
+  record of the topic lost there could be fed at, which the log's order
+  bounds for two kinds of feed. A writer's send is fed at its publication
+  time, which is its record's `now_ns`, and `now_ns` never decreases along a
+  log (a send before the first dispatch carries 0): the bound is the last
+  intact record's `now_ns`. A reader's receipt is fed at its publication
+  time, and a watcher receives its topic in sequence order, whose
+  publication times never decrease: the bound is its last intact receipt's.
+  `first_gap_damage_offset` and `InputReplayReport::Gap::damage_offset` give
+  the stretch's byte offset. A node binary prints `replay-inputs: stopped
+  before damaged records in <log> at byte <offset>, <t> s after the session
+  start (topic <name>)` and exits 1. Nothing bounds the replayed program's
+  own receipts, fed at their drains' event times (a tick's deadline, or a
+  prompt watcher's publication time, which need not follow the log's
+  order), nor a reader's topic with no intact receipt before the stretch:
+  such a log is refused (below), naming it and the offset. A damaged tail
+  only shortens its log.
+- Some losses leave no mark in the log. What the byte cap cost a log (its
+  oldest segment, which may have held a GAP record, or the records after
+  capture stopped) has no GAP record: `<log>.capped` beside the log, whichever
+  of its segment files is read, or the session manifest's `log_capped` for
+  its member, shows it. Neither has a gap that its run's end cut short: a
+  writer that reached its `EXIT` wrote a GAP record for every gap
+  (`LogWriter::gaps`), so of a member the manifest marks `log_gap`
+  ([session manifest](../launcher/README.md#session-manifest)), a run's log
+  without its `EXIT` record is suspect and one with it is judged by its GAP
+  records. Each recorded topic names the first such log it is fed from, or
+  one with a damaged stretch nothing bounds (`RecordedTopic::refused_log`,
+  `refused_reason`), by the same rule as gaps, and `ReplayInputs` throws a
+  `ReplayError` before anything runs, naming the log, the sign and the topic;
+  a node binary prints it and exits 1. `RecordedSession` reads the
+  `manifest.json` in the directory holding the logs when its `session_id` is
+  the logs', and matches a member's `log_paths` to the logs by file name, so
+  a session copied elsewhere still matches; logs without one (outside a
+  launcher session) are judged by their `.capped` markers alone. A manifest
+  that is not JSON is refused, naming it.
 
 Replay feeds a topic the program did not watch live from the session origin,
 including messages it would have missed during startup; its output may differ
@@ -396,10 +454,11 @@ manifest's largest message; never more than `kMaxRecordPayloadBytes`, 1 MiB),
 is skipped: the reader scans to the next record magic whose header and checksum
 validate, and counts what it skipped (`LogReader::damage()`), so one damaged
 record, or a garbage or zero-filled tail left by a power loss, costs only
-itself. `--replay-inputs` replays the intact records and warns with the file
-and byte offsets; exact replay (`ReplayEventLoop`, `--replay`) refuses a log
-with records missing between intact ones, and replays a damaged tail's prefix
-as it does a truncated log's.
+itself. `--replay-inputs` warns with the file and byte offsets and, fed
+from a log with records missing between intact ones, stops before them as
+before a gap ([input replay](#replaying-another-sessions-inputs)); exact
+replay (`ReplayEventLoop`, `--replay`) refuses such a log, and replays a
+damaged tail's prefix as it does a truncated log's.
 
 `log::LogReader` holds the whole file; `log::WindowedLogReader` (and
 `VisitLog` on it) reads the same records, damage skipped the same way,

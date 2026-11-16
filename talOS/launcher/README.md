@@ -842,10 +842,16 @@ timers fire at the deadlines they fired at live, and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and
 ages measured from it). The node is never fed across a log gap: the run ends
-just before the earliest gap (GAP record) in a log it is fed a watched topic
-from (its own logs for a topic it watched live, otherwise every log that
-recorded the topic), the node prints the log, the topic and the time, and
-the launcher exits 1 with it. See
+just before the earliest gap (GAP record) or damaged stretch in a log it is
+fed a watched topic from (its own logs for a topic it watched live, otherwise
+every log that recorded the topic), the node prints the log, the topic and
+the time, and the launcher exits 1 with it. A log it would be fed from that
+may have lost records no GAP record marks is refused before the node runs,
+naming the log and the sign, and the launcher exits 1: one with a
+`<log>.capped` marker or of a member the session manifest marks
+`log_capped`, a run's log without its EXIT record of a member it marks
+`log_gap` ([session manifest](#session-manifest)), and one whose damaged
+records nothing bounds the time of. See
 [input replay](../events/README.md#replaying-another-sessions-inputs) for
 timing and schema checks.
 

@@ -265,8 +265,11 @@ Rules:
   time, its outputs go to a new log, and two runs write identical logs. A topic
   recorded with another schema fails naming both types; topics nothing
   recorded are listed (`talOS/launcher/README.md`). Inputs arrive only up to
-  the first log gap in a log that feeds the node: the run ends there, names
-  the log, and exits 1. **[enforced:
+  the first log gap or damaged stretch in a log that feeds the node: the run
+  ends there, names the log, and exits 1; a feeding log that is capped, a
+  run's log without its EXIT of a member the session manifest marks
+  `log_gap`, or one whose damage nothing bounds is refused before the node
+  runs. **[enforced:
   `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present: an actuator node
@@ -339,5 +342,5 @@ A dependency is adopted when it meets all of these:
 | Geometry, kinematics and pose estimation | C++: header-only `talos::geometry` SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); drivetrain inverse/forward swerve kinematics use it with per-module speed limits. Python: `robotpy-wpimath` 2026.2.1.1 | in use: shared C++ frame math. `robotpy-wpimath` is pinned in `talOS/python/requirements.txt` for a robot's Python nodes, and no talOS node imports it (the 2026 robot's pose estimator, in its own repository, does); `wpilib_lockstep_test` aligns GradleRIO with the RobotPy native/wrapper wheels only |
 | Smoothing and mapping (factor graphs) | GTSAM 4.3.0 (`gtsam` wheel on PyPI, BSD) | pinned in `talOS/python/requirements.txt` for a robot's Python nodes; no talOS node imports it (the 2026 robot's pose estimator, in its own repository, does) |
 | Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: typed detector options, decode-margin/Hamming validity gates before localization, undistorted homography, robust joint single/multi-tag corner solving with floor/tilt priors, marginalized field-frame x/y/yaw covariance and configured uncertainty floors; ambiguity unknown=1, verified unique=0; one robot node per camera, no side-channel server |
-| Autonomous paths | Choreo `.traj` files (JSON, read with nlohmann/json 3.11.3 from the BCR, MIT), loaded and followed by `talOS/trajectory` | in use by the 2026 robot's autonomous node (its own repository), which plans with `MakeStraightLine` and follows with `HolonomicFollower`. wpimath's C++ controllers have no Bazel module, so the follower is talos code |
+| Autonomous paths | Choreo `.traj` files (JSON, read with nlohmann/json 3.11.3 from the BCR, MIT, which `talOS/events` input replay also uses to read a session's `manifest.json`), loaded and followed by `talOS/trajectory` | in use by the 2026 robot's autonomous node (its own repository), which plans with `MakeStraightLine` and follows with `HolonomicFollower`. wpimath's C++ controllers have no Bazel module, so the follower is talos code |
 | RoboRIO hardware | WPILib HAL and Phoenix 6 | in use |
