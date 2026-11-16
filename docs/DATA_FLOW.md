@@ -350,8 +350,8 @@ peak: its wake sockets are the readers of `/hw/state`,
 `graph.json`; `motor` reads `/hw/status` twice), and every other node's
 are its own topics' readers, a few each.
 
-Every node held 9 to 11 descriptors otherwise in a running `--sim` session on
-Linux (`/proc/<pid>/fd`: stdio and log pipes, the event-log file, the poller,
+Besides its wake sockets a node holds a few descriptors (`/proc/<pid>/fd`
+on Linux: stdio and log pipes, the event-log file, the poller,
 the stop pipe, its wake receiver; the bridge's UDP socket). The bench's
 peak, the bridge's 11 + 12 = 23, leaves 233 of macOS's default soft
 `RLIMIT_NOFILE` of 256 (and 1001 of Linux's usual 1024), so nodes do not
