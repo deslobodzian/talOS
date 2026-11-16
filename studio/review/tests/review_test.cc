@@ -562,7 +562,7 @@ TEST_F(ReviewTest, UnknownLogVersionIsRefusedNamingFileAndVersions) {
 // channel, the Driver Station's included, while its schema'd topics are
 // served; bounds.json carries log_dump's line naming both versions, and the
 // fixture session, of this build's protocol, carries null.
-// REQ-OPS-41
+// REQ-OPS-51, REQ-OPS-41
 TEST_F(ReviewTest, SessionOfAnotherHardwareProtocolServesNoHardwareChannel) {
   const std::string dir = Library() + "/older";
   testing::WriteFixtureSession(dir);

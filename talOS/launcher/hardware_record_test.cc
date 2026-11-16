@@ -324,7 +324,7 @@ TEST_F(HardwareRecordTest, MalformedPayloadYieldsAnError) {
 // them; with this build's version recorded such a packet still refuses them
 // and the line names no other version; this build's version with packets
 // that decode, or no version with packets that decode, refuses none.
-// REQ-OPS-15
+// REQ-OPS-51, REQ-OPS-15
 TEST(HardwareProtocolCheck, RecordedVersionFirstThenTheCodecs) {
   constexpr std::uint16_t kBuild = talos::protocol::kProtocolVersion;
   constexpr std::uint16_t kOther = kBuild - 1;
@@ -370,7 +370,7 @@ TEST(HardwareProtocolCheck, RecordedVersionFirstThenTheCodecs) {
 // Guards: the version the launcher writes into a session's manifest.json is
 // the one the log tools read back from that session's directory, and a
 // manifest written without it (as before the field) reads as none.
-// REQ-OPS-15
+// REQ-OPS-51, REQ-OPS-15
 TEST(HardwareProtocolCheck, ManifestRecordsThisBuildsVersion) {
   const std::string dir = testing::TempDir() + "/recorded_protocol";
   std::filesystem::create_directories(dir);
