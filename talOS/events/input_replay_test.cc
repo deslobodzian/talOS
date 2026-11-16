@@ -666,21 +666,24 @@ void CreateEmptyFile(const std::string& path) {
   ASSERT_TRUE(file.good()) << path;
 }
 
-// Splits the log at `path` as a byte cap rotates one: its records before the
-// first at or after `at` (its now_ns) go to `<stem>.segment0.tlog`, the rest
-// stay at `path`, each behind the log's header, manifest and schema block.
-void RotateBefore(const std::string& path, MonotonicTime at) {
-  std::uint64_t cut = 0;
+// Splits the log at `path` as a byte cap rotates one, once per entry of
+// `cuts` (ascending): its records before the first at or after cuts[0] (its
+// now_ns) go to `<stem>.segment0.tlog`, those from there to before cuts[1] to
+// `<stem>.segment1.tlog`, and so on; the rest stay at `path`, each behind the
+// log's header, manifest and schema block.
+void RotateAt(const std::string& path, const std::vector<MonotonicTime>& cuts) {
+  std::vector<std::uint64_t> ends;
   {
     log::LogReader reader{path};
     log::LogReader::Record record;
-    while (reader.next(record)) {
-      if (record.header.now_ns >= at.nanos()) {
-        cut = record.offset;
-        break;
+    while (ends.size() < cuts.size() && reader.next(record)) {
+      while (ends.size() < cuts.size() &&
+             record.header.now_ns >= cuts[ends.size()].nanos()) {
+        ends.push_back(record.offset);
       }
     }
   }
+  ASSERT_EQ(ends.size(), cuts.size()) << path << " ends before a cut";
   const std::uint64_t prefix = RecordOffsets(path).front();
   std::vector<char> bytes;
   {
@@ -688,16 +691,20 @@ void RotateBefore(const std::string& path, MonotonicTime at) {
     bytes.assign(std::istreambuf_iterator<char>{in},
                  std::istreambuf_iterator<char>{});
   }
-  ASSERT_GT(cut, prefix);
-  ASSERT_LT(cut, bytes.size());
   const auto write = [&](const std::string& to, std::uint64_t from,
                          std::uint64_t end) {
     std::ofstream out{to, std::ios::binary | std::ios::trunc};
     out.write(bytes.data(), static_cast<std::streamsize>(prefix));
     out.write(bytes.data() + from, static_cast<std::streamsize>(end - from));
   };
-  write(log::LogSegmentPath(path, 0), prefix, cut);
-  write(path, cut, bytes.size());
+  std::uint64_t from = prefix;
+  for (std::size_t k = 0; k < ends.size(); ++k) {
+    ASSERT_GT(ends[k], from) << "segment " << k << " would be empty";
+    write(log::LogSegmentPath(path, k), from, ends[k]);
+    from = ends[k];
+  }
+  ASSERT_LT(from, bytes.size());
+  write(path, from, bytes.size());
 }
 
 // Counts the readings it receives.
@@ -989,7 +996,7 @@ TEST(InputReplay, RefusesToFeedFromACappedLogOrALogGapRunCutShort) {
     const std::string out = TempDir("log_gap_exit_out");
     RecordSession(dir, out + "/live.tlog");
     const log::LogGap gap = MarkGap(dir + "/observer.tlog", kOrigin + 20ms);
-    if (rotated) RotateBefore(dir + "/observer.tlog", kOrigin + 10ms);
+    if (rotated) RotateAt(dir + "/observer.tlog", {kOrigin + 10ms});
     WriteManifest(dir, "\"log_gap\": true, \"log_capped\": false");
     const RecordedSession session{dir};
     const Replayed replayed = ReplayConsumer(session, out + "/replayed.tlog");
@@ -1017,6 +1024,56 @@ TEST(InputReplay, RefusesToFeedFromACappedLogOrALogGapRunCutShort) {
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(out);
   }
+}
+
+// A byte cap that rotated a log ten times or more leaves segment files
+// whose names sort as text out of segment order (segment10 before segment2).
+// The replayed program's run start still comes from its oldest segment, so a
+// late-starting run's timers fire at the deadlines they fired at live, and it
+// is fed every receipt of every segment at the drain that delivered it.
+// REQ-OPS-14
+TEST(InputReplay, ARunWhoseLogRotatedPastTenSegmentsKeepsItsTimeline) {
+  const std::string dir = TempDir("rotated_eleven");
+  const std::string out = TempDir("rotated_eleven_out");
+  RecordLateConsumer(dir);
+  const std::string path = dir + "/consumer.tlog";
+  std::size_t receipts = 0;
+  {
+    log::LogReader reader{path};
+    log::LogReader::Record record;
+    while (reader.next(record)) {
+      if (record.header.kind ==
+          static_cast<std::uint16_t>(EventKind::MESSAGE)) {
+        ++receipts;
+      }
+    }
+  }
+  const std::vector<Sent> live = Sends(path);
+  std::vector<MonotonicTime> cuts;
+  cuts.reserve(11);
+  for (int k = 0; k < 11; ++k) {
+    cuts.push_back(kOrigin + 10ms + std::chrono::milliseconds{4 * k});
+  }
+  RotateAt(path, cuts);
+  ASSERT_TRUE(std::filesystem::exists(log::LogSegmentPath(path, 10)));
+
+  const RecordedSession session{dir, "consumer"};
+  EXPECT_EQ((session.run_start() - kOrigin).count(),
+            std::chrono::nanoseconds{kLateRun}.count());
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+            Loop::Options{.start = session.loop_start(),
+                          .run_start = session.run_start()}};
+  TestRobot<Loop> consumer{loop, kTopics, kGain};
+  consumer.control_timer().setup_periodic(kOrigin + 1ms, 1ms);
+  const InputReplayReport report = ReplayInputs(loop, environment, session);
+  EXPECT_FALSE(report.stopped_at_gap.has_value());
+  std::size_t fed = 0;
+  for (const InputReplayReport::Fed& topic : report.fed) fed += topic.messages;
+  EXPECT_EQ(fed, receipts);
+  EXPECT_EQ(Sends(out + "/consumer.tlog"), live);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
 }
 
 // Closes this process's descriptor of the file at `path`, as a disk that
