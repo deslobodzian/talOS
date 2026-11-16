@@ -72,8 +72,8 @@ SimDriverStation::Settings SimDriverStation::SettingsFromEnvironment() {
     settings.active = true;
     const std::string_view mode{requested};
     if (mode == "auto") {
-      // Without a persisted configuration the first push still requires
-      // disabled operation. A restored configuration can start enabled.
+      // The push requires disabled operation, so this waits for its
+      // acknowledgement, not for a configuration restored from disk.
       settings.enable_when_configured = true;
     } else {
       settings.enabled = mode != "0";
@@ -128,9 +128,11 @@ void SimDriverStation::Update(Clock::time_point now, bool configured) {
   if (!settings_.active) {
     return;
   }
-  // The schedules' clock starts when the gateway is configured, since the
-  // first configuration push requires disabled operation.
-  if (!configured_at_ && configured) {
+  // The schedules' clock starts when the gateway is configured by a push
+  // acknowledged in this boot, which requires disabled operation: a
+  // configuration restored from disk may be another robot config's, whose
+  // replacing push an enable would make the gateway refuse.
+  if (!configured_at_ && configured && acknowledged_) {
     configured_at_ = now;
   }
   if (configured_at_) {
@@ -152,9 +154,12 @@ void SimDriverStation::Update(Clock::time_point now, bool configured) {
     }
     return;
   }
-  if (settings_.enable_when_configured && !published_.enabled && configured) {
-    std::printf("%ssimulated Driver Station: enabling (gateway configured)\n",
-                TimeOf(now).c_str());
+  if (settings_.enable_when_configured && !published_.enabled &&
+      configured_at_) {
+    std::printf(
+        "%ssimulated Driver Station: enabling (configuration push "
+        "acknowledged)\n",
+        TimeOf(now).c_str());
     settings_.enable_when_configured = false;
     Publish({.enabled = true, .autonomous = false, .test = false});
   }

@@ -284,8 +284,16 @@ void Robot::StartCompetition() {
   companion_ =
       std::make_unique<talos::rio::CompanionReporter>(*companion_sink_);
   companion_->Start();
-  endpoint_->OnConfigured([&persister](const talos::hardware::Config& config) {
+#ifndef __FRC_ROBORIO__
+  // Desktop simulation: the simulated Driver Station starts only on a push
+  // acknowledged in this boot, never on the restore (SimDriverStation.h).
+  bool push_acknowledged = false;
+#endif
+  endpoint_->OnConfigured([&](const talos::hardware::Config& config) {
     persister.Acknowledged(config);
+#ifndef __FRC_ROBORIO__
+    push_acknowledged = true;
+#endif
   });
 
   // Opened from the loop, retried every SocketRetry::kPeriodUs until the
@@ -377,6 +385,7 @@ void Robot::StartCompetition() {
     next_us += period_us;
 
 #ifndef __FRC_ROBORIO__
+    if (push_acknowledged) simulated_driver_station.ConfigurationAcknowledged();
     simulated_driver_station.Update(std::chrono::steady_clock::now(),
                                     gateway_->configured());
     if (stop_at && std::chrono::steady_clock::now() >= *stop_at) {
