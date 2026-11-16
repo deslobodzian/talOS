@@ -2,7 +2,7 @@
 #
 # Builds and tests a robot repository that consumes talOS against THIS talOS
 # checkout instead of the commit its submodule pins, so a talOS change is
-# checked against its robot before a push. REQ-DEV-30.
+# checked against its robot before a push. REQ-DEV-32.
 #
 #   tools/check_robot_repository.sh PATH [BAZEL_FLAG...]
 #
@@ -58,11 +58,13 @@ robot_commit="$(git --no-optional-locks -C "$source_repo" rev-parse --short --ve
 # off (its .bazelrc can say so), and would then report a pass that never
 # read this checkout; so the committed MODULE.bazel must name talOS.
 # Comments are dropped and lines joined, so a bazel_dep spread over lines
-# counts and one commented out does not.
+# counts and one commented out does not; `name` may come at any position
+# (not `repo_name`) and either quote may delimit it.
 module="$(git --no-optional-locks -C "$source_repo" show 'HEAD:MODULE.bazel' 2>/dev/null)" ||
   die "$source_repo is not a talOS-dependent repository: its commit $robot_commit has no MODULE.bazel"
+depends_on_talos="bazel_dep[[:space:]]*\\(([^)]*[,[:space:]])?name[[:space:]]*=[[:space:]]*[\"']talos[\"']"
 printf '%s\n' "$module" | sed 's/#.*//' | tr '\n' ' ' |
-  grep -Eq 'bazel_dep\([[:space:]]*name[[:space:]]*=[[:space:]]*"talos"' ||
+  grep -Eq "$depends_on_talos" ||
   die "$source_repo is not a talOS-dependent repository: the MODULE.bazel of its commit $robot_commit has no bazel_dep(name = \"talos\")"
 talos_commit="$(git -C "$talos" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 [ -n "$(git -C "$talos" status --porcelain 2>/dev/null)" ] && talos_commit="$talos_commit+changes"
