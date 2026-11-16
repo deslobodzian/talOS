@@ -1,22 +1,12 @@
 load("@rules_python//python:defs.bzl", "py_test")
-load("//tools:sync_manifest.bzl", "manifest_sync_test")
-load(":soak_manifest.bzl", "CONFIG_FILES", "NODES")
+load("//bench/main_processor/configuration:robot_physics_sim_manifest.bzl", "CONFIG_FILES", "NODES")
 
-exports_files(["soak.toml"])
-
-# soak.toml is robot_physics_sim.toml's graph with a [studio] table; its
-# generated soak_manifest.bzl lists what it launches and reads.
-manifest_sync_test(
-    name = "manifest_sync_test",
-    config = "soak.toml",
-    config_files = CONFIG_FILES,
-    manifest = "soak_manifest.bzl",
-)
-
-# Minutes of the bench's simulated graph (Studio bridge included) under
-# SIGKILL/SIGSTOP chaos; see soak_test.py. Manual: `bazel test //...` skips
-# it, and the CI soak job runs it on its own (TALOS_SOAK_SECONDS sets the
-# teleop length).
+# Minutes of the bench's simulated graph, robot_physics_sim.toml, with the
+# Studio bridge (--start-studio-bridge and the [studio] defaults) under
+# SIGKILL/SIGSTOP chaos; see soak_test.py. Its graph test and manifest test
+# are robot_physics_sim.toml's (//bench/main_processor/configuration).
+# Manual: `bazel test //...` skips it, and the CI soak job runs it on its own
+# (TALOS_SOAK_SECONDS sets the teleop length).
 py_test(
     name = "soak_test",
     size = "large",
@@ -26,9 +16,9 @@ py_test(
         "support.py",
     ],
     data = [
-        "soak.toml",
-        # The bridge refuses to start without its webroot,
-        # [studio] webroot = bazel-bin/studio/dist.
+        "//bench/main_processor/configuration:robot_physics_sim.toml",
+        # The bridge refuses to start without its webroot, the [studio]
+        # default bazel-bin/studio/dist.
         "//studio:web_dist",
         "//studio/bridge:studio_bridge",
         "//talOS/bridge:hardware_node",
