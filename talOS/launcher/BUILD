@@ -973,6 +973,7 @@ cc_test(
         "//talOS/events",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:gap_testing",
         "//talOS/hardware",
         "//talOS/protocol",
         "@googletest//:gtest_main",
