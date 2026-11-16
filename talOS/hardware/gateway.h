@@ -158,9 +158,10 @@ class Gateway {
   // first State with a valid sample clears it. A device-local send failure
   // (ApplyFailedDevices) isolates only that motor's chain and the command is
   // still accepted, unless the isolation leaves no valid sample, which is
-  // total loss: Accept then returns false. Global apply failures (Apply/ApplyOutputs false, or every
-  // motor failing) invalidate commands and retry until the consecutive limit;
-  // re-enabling or any successful Reconfigure clears the apply-failure latch.
+  // total loss: Accept then returns false. Global apply failures
+  // (Apply/ApplyOutputs false, or every motor failing) invalidate commands and
+  // retry until the consecutive limit; re-enabling or any successful
+  // Reconfigure clears the apply-failure latch.
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
   // The State to publish. Every invalid motor or CAN-sensor sample carries
   // zero measurements (MarkInvalid); while unconfigured (configuring, or the
