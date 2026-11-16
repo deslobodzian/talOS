@@ -533,7 +533,8 @@ TEST(LintGraph, UntargetedOutputsWarnAndErrorUnderTargetCoverage) {
 // drives (the flush holds its outputs neutral without a live Target), so the
 // lint warns, naming it, before anyone enables. A lane reader of its own, even
 // of a lane nobody writes yet, silences it; so does having no outputs (no
-// request), and an observer's read of a lane is no consumer.
+// request). Another subsystem's lane is no consumer (a node's Target reads
+// only its own lanes), nor is an observer's read of a lane.
 // REQ-SAFE-41
 TEST(LintGraph, AnActuatorNodeThatReadsNoTargetLaneIsWarned) {
   struct Case {
@@ -548,6 +549,11 @@ TEST(LintGraph, AnActuatorNodeThatReadsNoTargetLaneIsWarned) {
                 "roller", 0,
                 {Watcher("/roller/target/teleop", 32, kSourceFlagOptional)}),
             false},
+           {"request and another subsystem's lane",
+            ActuatorGraph(
+                "roller", 0,
+                {Watcher("/arm/target/teleop", 32, kSourceFlagOptional)}),
+            true},
            {"request and a lane read as an observer",
             ActuatorGraph("roller", 0,
                           {Watcher("/roller/target/teleop", 32,
