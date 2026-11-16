@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import struct
 import subprocess
 import sys
@@ -72,42 +71,35 @@ class SessionReportTest(unittest.TestCase):
                           "session_report: strict: target age at tick: NOT MEASURED"])
         self.assertIn("robot never enabled", result.stdout)
 
-    # REQ-OPS-16: a session recorded under another hardware protocol is
-    # judged on no hardware packet, whether log_dump learns it from the
-    # codecs (a session before manifests named the protocol: its States
-    # rejected, its Driver Station packets would still decode) or from the
-    # manifest (every packet decodes under this build): every verdict that
-    # needs one is NOT MEASURED, not a PASS from bytes read with this
-    # build's layout, and --strict names log_dump's one line. Verdicts that
-    # read only record times (the /hw/state cadence) are still measured.
+    # REQ-OPS-16, REQ-OPS-51: a session recorded under another hardware
+    # protocol (its States rejected by this build's codec; its Driver Station
+    # packets would still decode) is judged on no hardware packet: every
+    # verdict that needs one is NOT MEASURED, not a PASS from bytes read with
+    # this build's layout, and --strict names log_dump's one line, which
+    # names this build's protocol. Verdicts that read only record times (the
+    # /hw/state cadence) are still measured. log_dump's own tests cover how
+    # it decides (the manifest's version, then the codecs).
     def test_strict_judges_no_hardware_packet_of_another_protocol(self):
         files = runfiles.Create()
         fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
         binary = files.Rlocation("_main/talOS/launcher/session_report")
-        # The protocol(s) the line names: this build's alone without a
-        # recorded version, the recorded one then this build's with one.
-        for mode, named_versions in (("foreign-protocol", r"protocol (\d+) "),
-                                     ("recorded-protocol",
-                                      r"protocol (\d+); this build's is (\d+)")):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
-                subprocess.run([fixture, directory, mode], check=True)
-                result = subprocess.run([binary, "--json", "--strict", directory],
-                                        capture_output=True, text=True)
-                self.assertEqual(result.returncode, 2, result.stderr)
-                report = json.loads(result.stdout)
-                verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
-                for name in ("enabled state median", "enabled state p99",
-                             "enabled state gaps", "target age at tick"):
-                    self.assertEqual(verdicts[name], "NOT MEASURED", name)
-                self.assertEqual(verdicts["overall state median"], "PASS")
-                named = [line for line in result.stderr.splitlines() if line.startswith(
-                    "session_report: strict: hardware packets not decoded")]
-                self.assertEqual(len(named), 1, result.stderr)
-                versions = re.search(named_versions, named[0])
-                self.assertIsNotNone(versions, named[0])
-                self.assertEqual(len(set(versions.groups())), len(versions.groups()),
-                                 named[0])
-                self.assertIsNone(report["never_enabled"])
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([fixture, directory, "foreign-protocol"], check=True)
+            result = subprocess.run([binary, "--json", "--strict", directory],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = json.loads(result.stdout)
+        verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+        for name in ("enabled state median", "enabled state p99",
+                     "enabled state gaps", "target age at tick"):
+            with self.subTest(verdict=name):
+                self.assertEqual(verdicts[name], "NOT MEASURED")
+        self.assertEqual(verdicts["overall state median"], "PASS")
+        named = [line for line in result.stderr.splitlines()
+                 if line.startswith("session_report: strict: hardware packets not decoded")]
+        self.assertEqual(len(named), 1, result.stderr)
+        self.assertRegex(named[0], r"protocol \d+ ")
+        self.assertIsNone(report["never_enabled"])
 
     # REQ-RT-20, REQ-OPS-16: an owner timeout's neutral command adopts State
     # S; the node resumes with a request observing S after that command. The

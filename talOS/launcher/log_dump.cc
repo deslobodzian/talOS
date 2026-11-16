@@ -552,7 +552,10 @@ int main(int argc, char** argv) {
             }
             if (const auto kind = HardwareKind(r);
                 kind != talos::launcher::HardwareRecord::kNone) {
-              protocol.Add(kind, r.source_name(), r.payload);
+              protocol.Add(
+                  kind, r.source_name(),
+                  r.header.kind != static_cast<std::uint16_t>(EventKind::SEND),
+                  r.payload);
             }
             return true;
           },

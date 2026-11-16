@@ -366,8 +366,10 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
                 s is not None and s["p99_ms"] < 10, "p99 < 10 ms; nearest rank",
                 needs_hardware=name == "enabled")
     gaps = sum(v >= 100 for v in enabled)
-    verdict("enabled state gaps", bool(enabled), gaps == 0, f"{gaps} gaps >= 100 ms",
-            needs_hardware=True)
+    # No count for a row that is not measured: 0 would read as a result.
+    verdict("enabled state gaps", bool(enabled), gaps == 0,
+            f"{gaps} gaps >= 100 ms" if enabled and not hardware_not_decoded
+            else "gaps >= 100 ms", needs_hardware=True)
     worst = max(((max(v), k) for k, v in tick_ages.items()), default=None)
     unselected = sorted(enabled_lane_processes - {k.split(":", 1)[0] for k in tick_ages})
     bound = (f"selected target age at the tick <= {TARGET_AGE_LIMIT_MS} ms per process:lane "

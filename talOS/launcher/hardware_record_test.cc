@@ -352,8 +352,9 @@ TEST(HardwareProtocolCheck, RecordedVersionFirstThenTheCodecs) {
   for (const auto& c : cases) {
     SCOPED_TRACE(c.label);
     talos::launcher::HardwareProtocolCheck check{c.recorded};
-    check.Add(HardwareRecord::kState, "/hw/state", decodes);
-    if (c.reject) check.Add(HardwareRecord::kState, "/hw/state", rejected);
+    check.Add(HardwareRecord::kState, "/hw/state", false, decodes);
+    if (c.reject)
+      check.Add(HardwareRecord::kState, "/hw/state", false, rejected);
     EXPECT_EQ(check.foreign(), c.foreign);
     const std::string line = check.Warning();
     EXPECT_EQ(line.empty(), !c.foreign) << line;

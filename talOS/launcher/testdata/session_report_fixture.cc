@@ -11,7 +11,6 @@
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/launcher/session.h"
-#include "talOS/protocol/types.h"
 
 namespace {
 
@@ -118,34 +117,24 @@ int DisabledBridgeSession(const std::string& directory) {
 
 }  // namespace
 
-// session_report_fixture <directory>
-//                        [disabled-bridge | foreign-protocol |
-//                        recorded-protocol]
+// session_report_fixture <directory> [disabled-bridge | foreign-protocol]
 //
 // foreign-protocol: the default session recorded before manifests named
 // their hardware protocol, its States recorded under protocol 7
 // (StatePacket); its Driver Station packets still decode.
-// recorded-protocol: the default session, every packet this build's, its
-// manifest naming the protocol before this build's.
 int main(int argc, char** argv) {
   if (argc != 2 && argc != 3) return 1;
   const std::string directory = argv[1];
   std::filesystem::create_directories(directory);
   const std::string mode = argc == 3 ? argv[2] : "";
   if (mode == "disabled-bridge") return DisabledBridgeSession(directory);
-  if (!mode.empty() && mode != "foreign-protocol" &&
-      mode != "recorded-protocol") {
-    return 1;
-  }
+  if (!mode.empty() && mode != "foreign-protocol") return 1;
   const bool foreign = mode == "foreign-protocol";
   talos::launcher::SessionManifest manifest;
   manifest.session_id = 42;
   manifest.config_sha256 = "fixture-sha256";
   manifest.end_wall_ns = 1;
   if (foreign) manifest.hardware_protocol_version.reset();
-  if (mode == "recorded-protocol") {
-    manifest.hardware_protocol_version = talos::protocol::kProtocolVersion - 1;
-  }
   talos::launcher::NodeProcessInfo node;
   node.name = "fixture";
   node.exit_code = -1;   // a signal ended it

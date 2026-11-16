@@ -39,7 +39,9 @@
 //     publishes only a State or Driver Station packet its codec accepted;
 //     requests and commands are its codec's encodings), so a rejected one
 //     means, with no recorded version, a session of another protocol, and,
-//     with this build's version recorded, a packet its codec did not write.
+//     with this build's version recorded (the launcher's), a packet the
+//     launcher's codec did not write: a bridge or node binary of another
+//     build, or one made by hand.
 // Either way a tool then decodes none of the session's hardware packets.
 // A session without a recorded version, of another protocol whose packets
 // all happen to decode (a change that kept every length), cannot be told
@@ -47,8 +49,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -139,9 +143,16 @@ class HardwareProtocolCheck {
   explicit HardwareProtocolCheck(
       std::optional<std::uint16_t> recorded = std::nullopt);
   // One recorded payload of a hardware packet topic (`kind` not kNone).
-  // Not tried when the recorded version is not this build's.
-  void Add(HardwareRecord kind, std::string_view topic,
-           std::span<const std::byte> payload);
+  // `reader_copy` for a reader's MESSAGE record when the caller also adds
+  // the writer's SEND records: each publication's bytes are the same in
+  // every copy, so a reader's copy of a topic whose SEND was already tried
+  // is not tried again (a caller that adds one copy per publication passes
+  // false). No packet is tried when the recorded version is not this
+  // build's. Returns the packet decoded when it was tried and decoded, else
+  // null; valid until the next Add.
+  const HardwarePacket* Add(HardwareRecord kind, std::string_view topic,
+                            bool reader_copy,
+                            std::span<const std::byte> payload);
   // The recorded version is not this build's, or a packet this build's
   // codecs reject was added.
   bool foreign() const { return refused_by_version() || rejected_ != 0; }
@@ -151,10 +162,12 @@ class HardwareProtocolCheck {
   //     this build's is <N> (manifest.json hardware_protocol_version)";
   //   none recorded: "recorded under a hardware protocol other than this
   //     build's protocol <N> (the session records no protocol version);
-  //     this build's codecs reject <k> of <n>, the first on <topic>: <why>";
+  //     this build's codecs reject <k> of the <n> tried, the first on
+  //     <topic>: <why>";
   //   this build's recorded: "recorded under this build's hardware
-  //     protocol <N>, yet this build's codecs reject <k> of <n>, ... (packets
-  //     its codec did not write, not another protocol)".
+  //     protocol <N> (the launcher's), yet this build's codecs reject <k> of
+  //     the <n> tried, the first on <topic>: <why>; the session's bridge or
+  //     nodes may be of another build".
   std::string Warning() const;
 
  private:
@@ -165,6 +178,8 @@ class HardwareProtocolCheck {
   std::uint64_t rejected_{0};
   std::string first_topic_;
   std::string first_why_;
+  // Hardware topics a record other than a reader's copy has been tried of.
+  std::set<std::string, std::less<>> sent_;
   HardwarePacket scratch_;
 };
 
