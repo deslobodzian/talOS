@@ -1,0 +1,9 @@
+# The bench robot launching the Python motor node (motor/motor.py) in place
+# of the C++ one. Same robot and subsystem files as robot.toml, except the
+# motor's: subsystems/motor_py.toml is motor.toml with the Python node at
+# period_us 20000. On hardware, add `--remote <roborio-ipv4>`.
+include = "robot.toml"
+
+[[subsystems]]
+name = "motor"
+path = "subsystems/motor_py.toml"

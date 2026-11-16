@@ -1,0 +1,4 @@
+# Known traceability gaps tools/trace.py --check accepts (docs/TESTING.md §3).
+# One `<REQ-ID | package path> <YYYY-MM-DD> <TODO-ID> <note>` per line: the
+# date the gap was written down and the open TODO.md item that closes it.
+# A line whose gap is closed fails the check, so this list only shrinks.

@@ -10,7 +10,7 @@
 // All browser access happens in effects and feature checks, so react-dom/server
 // renders the empty state in tests without touching a DOM API.
 
-import {useEffect, useMemo, useState, type KeyboardEvent, type ReactNode} from 'react';
+import {useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode} from 'react';
 
 import {
   filterFrames,
@@ -216,6 +216,9 @@ function FramesPanel() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [url, setUrl] = useState<string|null>(null);
+  const requestRef = useRef(0);
+
+  useEffect(() => () => { requestRef.current++; }, []);
 
   const hasDirectoryPicker = typeof window !== 'undefined' &&
       typeof (window as PickerWindow).showDirectoryPicker === 'function';
@@ -240,28 +243,39 @@ function FramesPanel() {
 
 
   const load = async (files: readonly PickedFile[]) => {
+    const request = ++requestRef.current;
     setBusy(true);
     setError('');
     try {
       const next = await loadFrameFiles(files);
+      if (request !== requestRef.current) return;
       setArchive(next);
       setCamera('');
       setReason('');
       setIndex(0);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (request === requestRef.current)
+        setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false);
+      if (request === requestRef.current) setBusy(false);
     }
   };
 
   const pickDirectory = async () => {
     const picker = (window as PickerWindow).showDirectoryPicker;
     if (typeof picker !== 'function') return;
+    const request = ++requestRef.current;
     try {
       const handle = await picker({mode: 'read'});
-      await load(await collectDirectory(handle));
+      if (request !== requestRef.current) return;
+      setBusy(true);
+      setError('');
+      const files = await collectDirectory(handle);
+      if (request !== requestRef.current) return;
+      await load(files);
     } catch (err) {
+      if (request !== requestRef.current) return;
+      setBusy(false);
       if ((err as DOMException)?.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -293,14 +307,14 @@ function FramesPanel() {
        </button>}
       <label className="file">
         Choose directory…
-        <input type="file" multiple
+        <input type="file" multiple disabled={busy}
                aria-label="Choose a recorded frames directory"
                ref={el => { if (el) el.webkitdirectory = true; }}
                onChange={e => { fromInput(e.target.files); e.target.value = ''; }}/>
       </label>
       <label className="file">
         Choose files…
-        <input type="file" multiple accept=".png,.json"
+        <input type="file" multiple accept=".png,.json" disabled={busy}
                aria-label="Choose PNG and JSON frame files"
                onChange={e => { fromInput(e.target.files); e.target.value = ''; }}/>
       </label>

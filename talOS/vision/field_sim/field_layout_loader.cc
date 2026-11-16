@@ -4,6 +4,7 @@
 #include "talOS/vision/field_sim/field_layout_loader.h"
 
 #include <cmath>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -138,9 +139,21 @@ bool LoadFieldLayoutFromJson(std::string_view text, double tag_size_m,
       if (error != nullptr) *error = "field layout: tag missing numeric ID";
       return false;
     }
+    const double raw_id = id->number;
+    if (!std::isfinite(raw_id) || std::floor(raw_id) != raw_id ||
+        raw_id < std::numeric_limits<int>::min() ||
+        raw_id > std::numeric_limits<int>::max()) {
+      if (error != nullptr) *error = "field layout: invalid tag ID";
+      return false;
+    }
+    const int tag_id = static_cast<int>(raw_id);
+    if (out->layout.HasTag(tag_id)) {
+      if (error != nullptr) *error = "field layout: duplicate tag ID";
+      return false;
+    }
     talos::geometry::SE3<double> pose;
     if (!TagPose(tag, &pose, error)) return false;
-    out->layout.SetTagPose(static_cast<int>(id->number), pose);
+    out->layout.SetTagPose(tag_id, pose);
   }
   return true;
 }

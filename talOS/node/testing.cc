@@ -23,11 +23,6 @@
 namespace talos::testing {
 namespace {
 
-using namespace std::chrono_literals;
-
-// The loops' message tick: a slice never spans two deliveries.
-constexpr Duration kSlice = 1ms;
-
 // An inline config written to a file, so config_path() means the same thing
 // in a test as under talos::Run. Removed with the Sim.
 std::string WriteTempConfig(std::string_view toml) {
@@ -50,8 +45,14 @@ class LatestBytes final : public detail::ByteTopic {
  public:
   explicit LatestBytes(std::optional<std::vector<std::byte>>& latest)
       : latest_{latest} {}
+  // Reuses the held message's buffer, so a steady stream of messages no
+  // larger than the largest seen allocates nothing (AllocationProbe windows).
   bool write(std::span<const std::byte> message) override {
-    latest_.emplace(message.begin(), message.end());
+    if (latest_) {
+      latest_->assign(message.begin(), message.end());
+    } else {
+      latest_.emplace(message.begin(), message.end());
+    }
     return true;
   }
 
@@ -60,11 +61,13 @@ class LatestBytes final : public detail::ByteTopic {
 };
 
 // A node's port in the Sim: byte topics stay in memory, where latest_bytes
-// reads them, rather than in shared memory.
+// reads them, rather than in shared memory. The loop records nothing, so the
+// port keeps what a dispatch log's READ records would say, bounded to a
+// count and the newest (SimAccess::reads).
 class SimPort final : public detail::LoopPortFor<event::SimulatedEventLoop<>> {
  public:
   SimPort(event::SimulatedEventLoop<>& loop, ByteTopics& byte_topics)
-      : LoopPortFor{loop}, byte_topics_{byte_topics} {}
+      : LoopPortFor{loop}, loop_{loop}, byte_topics_{byte_topics} {}
 
   std::unique_ptr<detail::ByteTopic> open_byte_topic(
       std::string_view topic, std::size_t, const BytePublishOptions&) override {
@@ -72,8 +75,27 @@ class SimPort final : public detail::LoopPortFor<event::SimulatedEventLoop<>> {
         byte_topics_.try_emplace(std::string{topic}).first->second);
   }
 
+  void record_read(std::uint16_t source_id, Time now, Time publish_time,
+                   std::uint64_t sequence) override {
+    LoopPortFor::record_read(source_id, now, publish_time, sequence);
+    // As the loop does: only inside a dispatch, only for a watcher.
+    const event::Manifest& manifest = loop_.manifest();
+    if (!loop_.in_dispatch() || source_id >= manifest.size() ||
+        manifest[source_id].kind != event::SourceKind::WATCHER) {
+      return;
+    }
+    ++reads_.count;
+    reads_.topic = manifest[source_id].name;
+    reads_.now = now;
+    reads_.publish_time = publish_time;
+    reads_.sequence = sequence;
+  }
+  const detail::SimReads& reads() const { return reads_; }
+
  private:
+  event::SimulatedEventLoop<>& loop_;
   ByteTopics& byte_topics_;
+  detail::SimReads reads_;
 };
 
 }  // namespace
@@ -82,11 +104,12 @@ struct Sim::Impl {
   struct Hosted {
     std::string name;
     std::unique_ptr<event::SimulatedEventLoop<>> loop;
-    std::unique_ptr<detail::LoopPort> port;
+    std::unique_ptr<SimPort> port;
     std::unique_ptr<Node> node;
     detail::Instance user;
     // What this node got from NodeAccess::declared_graph, if it asked.
     detail::DeclaredGraph graph;
+    std::optional<Time> paused_until;
     ~Hosted() {
       user.reset();
       node.reset();
@@ -111,9 +134,83 @@ struct Sim::Impl {
   Duration now{0};
   bool started = false;
 
+  // Rounds at one instant before step() gives up on nodes that keep
+  // publishing to each other's prompt subscriptions without time passing.
+  static constexpr int kMaxRoundsPerInstant = 1000;
+
   ~Impl() {
     nodes.clear();
     if (owns_config_file) std::filesystem::remove(config_path);
+  }
+
+  // Runs every node's loop up to `until` in the order the nodes were added,
+  // ending a pause that ends by then, and then the periodic hooks due by
+  // then.
+  void Round(Duration until) {
+    const Time at = Time::from_nanos(until.count());
+    for (const auto& hosted : nodes) {
+      if (hosted->paused_until) {
+        hosted->loop->advance_until(at);
+        if (at < *hosted->paused_until) continue;
+        hosted->paused_until.reset();
+      }
+      hosted->loop->run_until(at);
+    }
+    now = until;
+    RunPeriodic();
+  }
+
+  // Whether a running node has something due by now: a prompt publication
+  // made at this instant after the node had run, by a node added after it,
+  // a hook or the harness.
+  bool Due(const Hosted& hosted) const {
+    return !hosted.paused_until && hosted.loop->started() &&
+           hosted.loop->next_deadline() <= Time::from_nanos(now.count());
+  }
+
+  // Starts every loop not yet started and not paused at now, in add order,
+  // arming its timers and delivering what it is due there. A loop's start
+  // can run prompt handlers that publish to a loop started before it, so
+  // Settle() must follow before any next deadline is read.
+  void StartLoops() {
+    const Time at = Time::from_nanos(now.count());
+    for (const auto& hosted : nodes) {
+      if (!hosted->paused_until && !hosted->loop->started()) {
+        hosted->loop->run_until(at);
+      }
+    }
+  }
+
+  // Runs rounds at now until no node is due there.
+  void Settle() {
+    for (int rounds = 0;; ++rounds) {
+      bool due = false;
+      for (const auto& hosted : nodes) due = due || Due(*hosted);
+      if (!due) return;
+      if (rounds == kMaxRoundsPerInstant) {
+        throw std::runtime_error(NotSettling());
+      }
+      Round(now);
+    }
+  }
+
+  std::string NotSettling() const {
+    const Time at = Time::from_nanos(now.count());
+    std::string message = "Sim: " + std::to_string(kMaxRoundsPerInstant) +
+                          " rounds at " + std::to_string(now.count()) +
+                          " ns did not settle (a zero-time publish cycle?); "
+                          "still due:";
+    for (const auto& hosted : nodes) {
+      if (!Due(*hosted)) continue;
+      message += " node '" + hosted->name + "' (";
+      const char* separator = "";
+      for (const std::string& topic : hosted->loop->due_prompt_topics(at)) {
+        message += separator + topic;
+        separator = ", ";
+      }
+      message += ")";
+    }
+    return message;
   }
 
   void RunPeriodic() {
@@ -168,6 +265,34 @@ Node& Sim::node(std::string_view node_name) {
                               "'");
 }
 
+void Sim::pause(std::string_view node_name, Duration duration) {
+  if (duration < Duration::zero()) {
+    throw std::invalid_argument("Sim: negative pause");
+  }
+  for (const auto& hosted : impl_->nodes) {
+    if (hosted->name == node_name) {
+      hosted->paused_until = now() + duration;
+      return;
+    }
+  }
+  throw std::invalid_argument("Sim: no node named '" + std::string{node_name} +
+                              "'");
+}
+
+void Sim::resume(std::string_view node_name) {
+  for (const auto& hosted : impl_->nodes) {
+    if (hosted->name == node_name) {
+      if (hosted->paused_until) {
+        hosted->paused_until.reset();
+        hosted->loop->run_until(now());
+      }
+      return;
+    }
+  }
+  throw std::invalid_argument("Sim: no node named '" + std::string{node_name} +
+                              "'");
+}
+
 std::optional<std::vector<std::byte>> Sim::latest_bytes(
     std::string_view topic) const {
   const auto found = impl_->byte_topics.find(topic);
@@ -175,19 +300,34 @@ std::optional<std::vector<std::byte>> Sim::latest_bytes(
   return found->second;
 }
 
+// One chronological frontier: each round finds the earliest pending instant
+// across every hosted loop (a timer, or a prompt publication), Sim::every
+// hooks and pause ends, and runs each loop exactly up to it, in the order the
+// nodes were added, then the hooks. No loop therefore runs past a time
+// another has not reached, and at one instant an earlier-added node's
+// publications are visible to later ones. Rounds then repeat at that instant
+// while a node is due there, so a prompt publication reaches an earlier-added
+// node (or arrives from a hook or the harness) at the instant it was made.
 void Sim::step(Duration d) {
   if (d < Duration::zero()) throw std::invalid_argument("Sim: negative step");
   Impl& impl = *impl_;
   impl.started = true;
   const Duration end = impl.now + d;
+  impl.RunPeriodic();
+  impl.StartLoops();
   for (;;) {
-    impl.RunPeriodic();
+    impl.Settle();
     if (impl.now >= end) break;
-    Duration next = std::min(impl.now + kSlice, end);
+    Duration next = end;
     for (const auto& p : impl.periodic) next = std::min(next, p.next);
-    const Time until = Time::from_nanos(next.count());
-    for (const auto& hosted : impl.nodes) hosted->loop->run_until(until);
-    impl.now = next;
+    for (const auto& hosted : impl.nodes) {
+      if (hosted->paused_until) {
+        next = std::min(next, Duration{hosted->paused_until->nanos()});
+        continue;
+      }
+      next = std::min(next, Duration{hosted->loop->next_deadline().nanos()});
+    }
+    impl.Round(std::max(next, impl.now));
   }
 }
 
@@ -230,7 +370,8 @@ void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
         for (const auto& other : impl.nodes) {
           if (NodeAccess::reads_graph(*other->node)) continue;
           self->graph.push_back(
-              detail::DescribeNode(*other->node, "", other->loop->manifest()));
+              detail::DescribeNode(*other->node, "", other->loop->manifest(),
+                                   introspect::LoopSourceFlags(*other->loop)));
         }
         return &self->graph;
       },
@@ -258,7 +399,8 @@ void SimAccess::publish_raw(Sim& sim, std::string_view topic, const void* data,
                             std::size_t bytes) {
   sim.impl_->environment.channel(topic, static_cast<std::uint32_t>(bytes))
       .publish(std::span<const std::byte>{static_cast<const std::byte*>(data),
-                                          bytes});
+                                          bytes},
+               sim.now());
 }
 
 std::uint64_t SimAccess::message_count(const Sim& sim, std::string_view topic,
@@ -278,6 +420,21 @@ void SimAccess::read_raw(const Sim& sim, std::string_view topic,
   }
   channel.copy_to(sequence,
                   std::span<std::byte>{static_cast<std::byte*>(out), bytes});
+}
+
+SimReads SimAccess::reads(const Sim& sim, std::string_view node_name) {
+  for (const auto& hosted : sim.impl_->nodes) {
+    if (hosted->name == node_name) return hosted->port->reads();
+  }
+  throw std::invalid_argument("Sim: no node named '" + std::string{node_name} +
+                              "'");
+}
+
+Time SimAccess::publish_time(const Sim& sim, std::string_view topic,
+                             std::size_t bytes, std::uint64_t sequence) {
+  return sim.impl_->environment
+      .channel(topic, static_cast<std::uint32_t>(bytes))
+      .publish_time(sequence);
 }
 
 }  // namespace talos::detail

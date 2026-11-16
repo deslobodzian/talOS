@@ -1,9 +1,12 @@
 # Agent session worktrees: full repo checkouts nested under the workspace that
 # must never be traversed by `bazel build //...` (their BUILD files resolve
 # against the wrong output base and fail package loading).
-.muse
 .claude
 .agents
 
 # Standalone Bzlmod example; consumed through @wrist, not main-repo packages.
 examples/wrist_repo
+
+# Standalone robot repository fixture: its own workspace (cd into it), which
+# depends on this checkout through @talos.
+examples/robot_repo

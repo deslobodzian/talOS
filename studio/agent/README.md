@@ -1,42 +1,100 @@
-# Observing talOS: start with curl
+# Headless JSON-RPC agent
 
-The bridge serves plain JSON over HTTP on port 5800. No agent, no build, no
-dependencies — this is the first thing to try:
+For direct HTTP snapshots without an agent, see the
+[bridge endpoints](../bridge/README.md#http-and-websocket-views). Use this service
+for retained telemetry history and graph queries.
+
+From the repository root, alongside the bridge:
 
 ```sh
-curl localhost:5800/telemetry.json   # latest sample: values, units, labels, stream
-curl localhost:5800/channels.json    # the channel dictionary (names, units, enum labels)
-curl localhost:5800/system.json      # who is running: nodes, topics, health
+bazel run //studio:agent
 ```
 
-`/telemetry.json` is the newest frame, keyed by channel name:
-`channels["pose_estimator/state/velocity/vx_mps"]` is `{"value": 1.2, "unit": "m/s"}`; `value` is
-`null` when the channel had no fresh reading, `unit` is always present (`""`
-when unitless), and enum channels add `label` (e.g. `"TARGET_STALE"`) for an
-in-range value. Beside `channels`: `chassis`, `stream_id`, `sequence_id`,
-`timestamp_ns` (uint64 as decimal strings), `dictionary_id` and `age_ms`.
-`/channels.json` lists the dictionary (name, unit, enum labels). The WebSocket feed at
-`ws://127.0.0.1:5800/telemetry` carries the same data as binary telemetry
-wire v2 frames (system graph text frame first, then the cached dictionary
-frame, then value frames); you only need it for a live stream.
+[`server.ts`](server.ts) defaults to upstream
+`ws://127.0.0.1:5800/telemetry` (`TELEMETRY_URL`) and listens on
+`127.0.0.1:5804` (`AGENT_PORT`). It owns a `TelemetryDecoder`, `JitterBuffer` and
+bounded `Timeline`, independently of the browser. The transport-independent
+query implementation in [`rpc.ts`](rpc.ts) is also used by the Studio worker.
+It exports `dispatch`, `handleRpc`, `RPC_METHODS` and `RpcFault`.
 
-Use the JSON-RPC agent below when you need history: retained samples,
-timestamped lookup, and threshold scans over time.
+## Transports
 
-# Local headless JSON-RPC
+This is JSON-RPC 2.0, not MCP. POST requests to
+`http://127.0.0.1:5804/rpc`, or send them over
+`ws://127.0.0.1:5804/rpc`. Batches and notifications are supported; HTTP
+notifications receive 204 and WebSocket notifications receive no reply.
+A batch holds at most 16 requests (`MAX_BATCH` in [`server.ts`](server.ts));
+a larger one is rejected whole with a single `-32600` error.
+Requests are limited to 64 KiB. Requests with an Origin header or a Host other
+than `127.0.0.1` or `localhost` (optionally with a port) are rejected.
 
-Run `bazel run //studio:agent` from the repository root alongside the bridge. `TELEMETRY_URL` defaults to `ws://127.0.0.1:5800/telemetry`; `AGENT_PORT` defaults to 5804 (separate from Studio HTTP on 5800 and the hardware gateway on 5802/5803). This is a JSON-RPC 2.0 service, not an MCP implementation. It consumes the same binary decoder, jitter buffer, and bounded timeline as the UI, independently of any browser window. The query surface itself lives in `agent/rpc.ts`, which has no transport and no Node dependencies, so the Studio worker answers the Agent tab from the identical code path rather than a second implementation that would drift from this one. Import it from `agent/rpc` (`dispatch`, `handleRpc`, `RPC_METHODS`, `RpcFault`); `agent/server` is the transport, not a re-export shim. WebSocket reconnects every second. A producer restart announces itself with a new `stream_id`, and the agent drops the old stream's timeline and dictionaries when it sees one. The upstream connection carries two message families: binary telemetry frames (at most 16,384 bytes) and text system graphs. A graph describing every node on every topic is far larger, so the upstream payload cap is raised to 1 MiB and `parseSystemGraph` enforces the real bound — a cap below the message would drop the connection rather than the message. The 64 KiB limit above applies to requests coming in, which is unchanged.
+`GET /health` returns upstream connectivity, retained frame count and jitter
+statistics, plus separate `system` and `declared` blocks. The system block
+reports received/rejected graph counts (a whole graph or an update to it),
+deferral notices (`deferred`), node counts and registry availability.
+The declared block reports whether a declared graph was received and its
+comparison counts when available.
 
-POST JSON-RPC requests to `http://127.0.0.1:5804/rpc`, or send them on `ws://127.0.0.1:5804/rpc`. Batches and notifications are supported. Browser Origin headers and non-local Host headers are rejected; the socket binds only to loopback. Request size is limited to 64 KiB. GET `/health` reports upstream connectivity, retained frame count, and jitter statistics, plus a `system` block: how many system graphs have arrived, how many were rejected as malformed, and the node and topic counts from the latest one. That is reported separately from telemetry health on purpose — a node can be publishing frames while the registry is unreadable, and the reverse. A `declared` block reports the same for the declared graph, with `received: false` when the bridge was started without `--declared`; its node counts are absent rather than zero in that case, because "nobody declared anything" and "no declared graph was offered" are different answers.
+## Methods
 
-- `get_latest`, params `{}`: the newest retained sample and its dictionary context — the snapshot itself (also under `snapshot`), `units`, `labels`, `sequence_id`, `stream_id`, `timestamp_ns`, plus `age_ms`/`age_ns` saying how long ago it arrived. Fails with `-32002` when no frame has arrived yet, deliberately distinct from a sample whose channels are empty.
-- `get_schema_tree`, params `{}`: returns observed leaf topics and JavaScript value types, retained timestamp bounds, frame count, and timestamp encoding. `channels` entries also have direct topic aliases. Schema discovery describes retained data, not fields never received.
-- `query_state_at`, params `{"timestamp_ns":"123","topics":["chassis.x","intake/state/current_a"],"mode":"exact"}`: returns a complete snapshot when topics are omitted; otherwise a timestamped topic map. Nanoseconds are decimal strings to preserve uint64 precision. Exact is the default and returns error `-32001` if no retained sample has that timestamp. Explicit `at_or_before` selects the preceding sample. No interpolation is introduced into agent results.
-- `scan_channel_events`, params `{"topic":"intake/state/current_a","condition":{"op":"gt","value":40},"start_ns":"0","end_ns":"999999999999"}`: returns contiguous matching **sample** ranges with inclusive endpoints and sample counts. Missing packets are not inferred to match. Operators: `gt`, `gte`, `lt`, `lte`, `eq`, `ne`, `changed`, `rising`, `falling`. Edge comparisons use the preceding retained sample even if it precedes start_ns. No arbitrary code or expression evaluation is accepted.
+Nanosecond timestamps are uint64 decimal strings. Query results use retained
+samples without interpolation.
 
-- `get_system_graph`, params `{}`: returns the live node registry as the bridge last sent it — every node with its pid, session, liveness and full source list, every topic with both ends named, and a `summary` counting nodes alive and topics that are orphaned, unread or lossy. Each source carries `events_per_second` derived from the previous graph, or `null` when only one graph has arrived: a rate needs two samples, and "not measured yet" is not the same answer as "not moving". Each topic carries a `health` of `ok`, `orphaned` (nothing publishes it), `unread` (nothing subscribes), `lossy` (messages were dropped), `idle` (wired up, nothing published yet), `bridged` or `unconnected`. The last two are half-wired topics that are not faults, and they are separated from the first two because reporting a design as a fault is what teaches people to ignore a fault report: `bridged` means the end that has no shared-memory peer declared itself `external`, so its peer is outside talOS — `/hw/command` is consumed by the RoboRIO over UDP and no subscriber will ever appear — and `unconnected` means the end declared itself `optional`, so it is allowed to be waiting, as `/drivetrain/target/auto` is until autonomous is written. Every source carries the `external` and `optional` booleans it was declared with, and `summary.topics_by_health` tallies every state so a caller can count faults without having to know which states are faults. The result also reports the graph's `version` and `summary.endpoint_attributes`: a bridge older than system-graph version 2 could not state where a far end lives, so against one of those documents `bridged` and `unconnected` are unreachable and the topics they describe are reported as faults, which is the answer that bridge always gave. This answers a question telemetry cannot: a frame shows what one node chose to publish, not the shape of the system that produced it.
-- `describe_topic`, params `{"topic":"/pose_estimator/state"}`: one topic, with every node on either end of it and that end's kind, counters and rate. Saves filtering the whole graph to ask who writes a topic and whether anyone is reading it. Unknown topic names are rejected as `-32602` rather than returning an empty result, because a typo and a topic nobody is on should not look the same.
+| Method | Parameters | Result |
+|---|---|---|
+| `get_latest` | `{}` | Latest snapshot, also under `snapshot`, plus `age_ms` and `age_ns` since timeline arrival; both are null when the latest sample is the keyframe the bridge sends on connect, whose values may be arbitrarily old |
+| `get_schema_tree` | `{}` | Observed leaf paths and JavaScript types, direct channel aliases labelled with their kind (`double`, `int`, `uint`, `bool`; values as a snapshot spells them), retained bounds, frame count and timestamp encoding |
+| `query_state_at` | `timestamp_ns`, optional `topics`, optional `mode` | Snapshot, or timestamped topic map; mode defaults to `exact`, with `at_or_before` selecting the preceding sample |
+| `scan_channel_events` | `topic`, `condition`, optional inclusive `start_ns` / `end_ns` | Contiguous matching retained-sample ranges with inclusive endpoints and sample counts |
+| `get_system_graph` | `{}` | Last received live graph, source event rates and topic-health summary, plus `age_ms` since the bridge last spoke about it and `stale` |
+| `describe_topic` | `topic` | One graph topic, its health and named endpoints with counters and rates |
+| `get_declared_graph` | `{}` | Declared nodes and diagnostics, summary and comparison against the live graph; comparison is null until a live graph arrives |
 
-- `get_declared_graph`, params `{}`: what the launcher declared before it spawned anything. It probes every node in the config with `--describe` — which builds the node on a simulated loop and prints the ends its constructor registered — assembles the results into one graph, lints it, and writes it out; the bridge serves that file at `GET /declared.json` when started with `--declared PATH`. Returns every declared node with its `target` and its ends, the launcher's lint `diagnostics` verbatim (`severity` of `error` or `warning`, the `subject` it is about, and the launcher's own sentence), and a `comparison`: how many nodes were declared, how many of them registered, which ones never did, and which running nodes were never declared. That comparison is the point. The live registry only ever holds what did start, so a name missing from it is either a node that crashed before it claimed a slot — or whose binary is missing — or a node that was never part of this session, and from the registry alone those are the same silence. `comparison` is `null` rather than a set of zeroes when no system graph has arrived, because "never registered" is not a claim that can be made without a registry to check against.
+A snapshot includes `channels`, `kinds` (name → `double`, `int`, `uint` or
+`bool`), `units`, `labels`, `sequence_id`, `stream_id` and `timestamp_ns`. A
+channel value, in a snapshot or a `topics` map, is a number, except that an
+`int` or `uint` value beyond ±2^53 − 1 (which a JSON number would round) is
+its exact decimal string, and a NaN or infinite reading is the string
+`"NaN"`, `"Infinity"` or `"-Infinity"`. A channel absent from the tick (its
+topic was not published) has no entry. Channel aliases such as
+`intake/state/current_a` can be used directly in `topics`; nested snapshot
+fields use dot paths such as `chassis.x`.
 
-All three system methods fail with `-32002` when the document they read has not been received yet, which is deliberately distinct from a graph reporting no nodes. The first means the bridge has not told this agent anything; the second means the bridge looked and nothing is running. Returning an empty graph for the former would make a disconnected agent indistinguishable from a stopped robot. `get_declared_graph` fails the same way when the bridge was started without `--declared`, and says so: everything else keeps working, because a declared graph is an extra source of truth and not a prerequisite for reading the live one.
+Scan conditions have `op` and, for comparisons, `value`. Supported operators:
+`gt`, `gte`, `lt`, `lte`, `eq`, `ne`, `changed`, `rising`, `falling`. Integer
+channels compare exactly against an integer `value`. For `eq` and `ne`, a
+`value` of `"NaN"`, `"Infinity"` or `"-Infinity"` names that reading, as
+answers spell it, and `eq "NaN"` matches NaN. NaN matches no ordering
+comparison, and NaN following NaN is not `changed`. Rising and
+falling compare truthiness, not numeric slope. Edge comparisons use the preceding
+retained sample even when it is before `start_ns`. Missing packets are not
+inferred to match. No arbitrary expression evaluation is accepted.
+
+Source rates are null until a rate can be measured. Graph queries return the
+last received graph: the bridge's whole graph with its later value updates
+applied ([bridge README](../bridge/README.md)). Its age counts from the last
+graph message, including a notice that the radio budget deferred an update.
+`get_system_graph` marks it `stale` once that is
+`GRAPH_STALE_AFTER_MS` (1 s, [`freshness.ts`](../src/data/freshness.ts)) old;
+a stale graph's `alive` flags are last-known, not current. The agent drops the
+graph when the bridge connection closes.
+For graph endpoints, health semantics and optional declared files, see the
+[bridge reference](../bridge/README.md#http-and-websocket-views).
+
+## Errors
+
+| Code | Meaning |
+|---|---|
+| `-32700` | JSON parse error |
+| `-32600` | Invalid request, empty batch or oversized batch |
+| `-32601` | Unknown method |
+| `-32602` | Invalid params, including unknown requested topics |
+| `-32603` | Internal error |
+| `-32001` | No retained sample at the requested timestamp/mode |
+| `-32002` | Required telemetry, live graph or declared graph has not arrived |
+
+`-32002` is not an empty graph or an empty channel set. In particular,
+`get_declared_graph` cannot answer when no declared graph was offered by the
+bridge; other methods remain usable.
+
+See [OBSERVING.md](OBSERVING.md) for Python examples.

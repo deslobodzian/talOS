@@ -13,7 +13,7 @@ export function Sparkline({values, width = 120, height = 28, stroke = '#48e1cf',
 }) {
   const points = useMemo(() => {
     const n = values.length;
-    if (n < 2) return null;
+    if (n < 1) return null;
     let min = Infinity, max = -Infinity, count = 0;
     for (let i = 0; i < n; i++) {
       const v = values[i];
@@ -23,23 +23,30 @@ export function Sparkline({values, width = 120, height = 28, stroke = '#48e1cf',
         count++;
       }
     }
-    if (count < 2) return null;
+    if (count < 1) return null;
     const range = max - min || 1;
     const pad = 2;
     const out: string[] = [];
     const runs: string[] = [];
+    const endRun = () => {
+      if (out.length) {
+        const single = out.length === 1 ? out[0].split(',').map(Number) : null;
+        runs.push(out.join(' ') +
+            (single ? ` ${single[0] + .01},${single[1]}` : ''));
+      }
+      out.length = 0;
+    };
     for (let i = 0; i < n; i++) {
       const v = values[i];
       if (!Number.isFinite(v)) {
-        if (out.length) runs.push(out.join(' '));
-        out.length = 0;
+        endRun();
         continue;
       }
-      const x = (i / (n - 1)) * (width - 2 * pad) + pad;
+      const x = (n === 1 ? .5 : i / (n - 1)) * (width - 2 * pad) + pad;
       const y = height - pad - ((v - min) / range) * (height - 2 * pad);
       out.push(`${x.toFixed(1)},${y.toFixed(1)}`);
     }
-    if (out.length) runs.push(out.join(' '));
+    endRun();
     return runs;
   }, [values, width, height]);
 

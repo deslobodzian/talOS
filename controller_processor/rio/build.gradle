@@ -1,0 +1,512 @@
+import org.gradle.internal.os.OperatingSystem
+import org.gradle.language.cpp.tasks.CppCompile
+
+// The RoboRIO program is deliberately small: a Driver Station loop and the
+// hardware gateway. Everything else in talOS builds with Bazel, and the tests
+// for the gateway live there (//talOS/hardware:gateway_test). The GradleRIO
+// tests (src/test/cpp) cover only this program's own sources: desktop
+// simulation regressions for the Phoenix backend, the config store, the
+// simulated Driver Station, the Driver Station reader, the logger, the
+// companion link reporter, the loop watchdog and the loop's wake schedule;
+// there is no command-based framework.
+plugins {
+    id "cpp"
+    id "google-test"
+    id "edu.wpi.first.GradleRIO" version "2026.2.1"
+}
+
+// Define my targets (RoboRIO) and artifacts (deployable files)
+// This is added by GradleRIO's backing project DeployUtils.
+deploy {
+    targets {
+        roborio(getTargetTypeClass('RoboRIO')) {
+            // Team number is loaded either from the .wpilib/wpilib_preferences.json
+            // or from command line. If not found an exception will be thrown.
+            // You can use getTeamOrDefault(team) instead of getTeamNumber if you
+            // want to store a team number in this file.
+            team = project.frc.getTeamNumber()
+            debug = project.frc.getDebugOrDefault(false)
+
+            artifacts {
+                // First part is artifact name, 2nd is artifact type
+                // getTargetTypeClass is a shortcut to get the class type using a string
+
+                frcCpp(getArtifactTypeClass('FRCNativeArtifact')) {
+                }
+            }
+        }
+    }
+}
+
+def deployArtifact = deploy.targets.roborio.artifacts.frcCpp
+
+// Set this to true to enable desktop support.
+def includeDesktopSupport = true
+
+// Set to true to run simulation in debug mode
+wpi.cpp.debugSimulation = false
+
+// The simulation GUI is the only way to enable the robot and choose Teleoperated
+// when no real Driver Station is attached, so an interactive `simulateNative`
+// gets it. Automated runs pass -Pheadless and drive the Driver Station through
+// the TALOS_SIM_DS* environment variables instead; see
+// src/main/include/SimDriverStation.h.
+if (!project.hasProperty("headless")) {
+    wpi.sim.addGui().defaultEnabled = true
+}
+wpi.sim.addDriverstation()
+
+nativeUtils.platformConfigs.named("linuxathena").configure {
+    it.cppCompiler.args.add('-Wall')
+    it.cppCompiler.args.add('-Wextra')
+    it.cppCompiler.args.add('-pedantic')
+    it.cppCompiler.args.add('-Werror')
+    it.cppCompiler.args.add('-Wno-unused-parameter')
+}
+
+if (OperatingSystem.current().isWindows()) {
+    nativeUtils.platformConfigs.named(wpi.platforms.desktop).configure {
+        it.cppCompiler.args.add('/W3')
+        it.cppCompiler.args.add('/WX')
+        it.linker.args.add('Ws2_32.lib')
+    }
+} else {
+    nativeUtils.platformConfigs.named(wpi.platforms.desktop).configure {
+        it.cppCompiler.args.add('-Wall')
+        it.cppCompiler.args.add('-Wextra')
+        it.cppCompiler.args.add('-pedantic')
+        it.cppCompiler.args.add('-Werror')
+        it.cppCompiler.args.add('-Wno-unused-parameter')
+        if (OperatingSystem.current().isMacOsX()) {
+            // Apple clang 21 warns inside WPILib's bundled gtest-printers.h
+            // (char8_t -> char32_t); older clangs do not know the flag.
+            it.cppCompiler.args.add('-Wno-unknown-warning-option')
+            it.cppCompiler.args.add('-Wno-character-conversion')
+        }
+    }
+}
+
+if (project.hasProperty("asan")) {
+    nativeUtils.platformConfigs.named("linuxx86-64").configure {
+        it.cppCompiler.args.add('-g3')
+        it.cppCompiler.args.add('-fsanitize=address')
+        it.linker.args.add('-fsanitize=address')
+    }
+}
+
+if (project.hasProperty("tsan")) {
+    nativeUtils.platformConfigs.named("linuxx86-64").configure {
+        it.cppCompiler.args.add('-g3')
+        it.cppCompiler.args.add('-fsanitize=thread')
+        it.linker.args.add('-fsanitize=thread')
+    }
+}
+
+if (project.hasProperty("ubsan")) {
+    nativeUtils.platformConfigs.named("linuxx86-64").configure {
+        it.cppCompiler.args.add('-g3')
+        it.cppCompiler.args.add('-fsanitize=undefined')
+        it.linker.args.add('-fsanitize=undefined')
+    }
+}
+
+// The companion (main processor) address the program sends State to and
+// accepts frames from: -Pcompanion=<IPv4 literal> on the command line of
+// deploy or buildRio, 10.56.87.11 without it. It is fixed in the binary,
+// never learned from a datagram, because the gateway's connected socket is
+// what keeps every other host on the network from commanding the robot
+// (talOS/protocol/README.md).
+//
+// Only the command line may set it. Gradle would also take it from
+// ~/.gradle/gradle.properties, a project gradle.properties or
+// ORG_GRADLE_PROJECT_companion, where a bench address would silently carry
+// into a later competition deploy from the same laptop; those fail the build.
+// A present but empty value (a bare -Pcompanion, or -Pcompanion=$UNSET) fails
+// too rather than falling back to the default.
+//
+// The value must be one RuntimeUdpPeer::Open can connect to and send to on
+// the RoboRIO, so the build stops here instead of every socket open failing
+// or every State going nowhere: a dotted IPv4 literal in inet_pton's form
+// (four decimal octets, no leading zeros), not in 0.0.0.0/8 ("this network",
+// 0.0.0.0 refused by Open), 127.0.0.0/8 (loopback, the RoboRIO itself) or
+// 224.0.0.0/3 (multicast, reserved, and the broadcast 255.255.255.255, whose
+// connect fails with EACCES on every retry).
+def companionFromCommandLine = gradle.startParameter.projectProperties.containsKey('companion')
+if (project.hasProperty('companion') && !companionFromCommandLine) {
+    throw new GradleException(
+            "companion=${project.property('companion')} is set outside the command line " +
+            "(gradle.properties or ORG_GRADLE_PROJECT_companion); remove it there: the " +
+            "RoboRIO companion address is accepted only as -Pcompanion=<ipv4> on the command " +
+            "line, so a bench address cannot persist into another deploy")
+}
+def companionAddress = companionFromCommandLine ?
+        gradle.startParameter.projectProperties['companion'].toString() : '10.56.87.11'
+def companionRefusal = { String text ->
+    if (text.isEmpty()) return 'it is empty (a bare -Pcompanion, or an unset variable)'
+    def octets = text.split('\\.', -1)
+    if (octets.length != 4 ||
+            !octets.every { it ==~ /0|[1-9][0-9]{0,2}/ && it.toInteger() <= 255 }) {
+        return 'it is not a dotted IPv4 literal such as 10.56.87.11 (the RoboRIO program ' +
+                'resolves no hostname; no leading zeros)'
+    }
+    def first = octets[0].toInteger()
+    if (first == 0) return 'it is in 0.0.0.0/8, which names no host'
+    if (first == 127) return 'it is a loopback address, the RoboRIO itself'
+    if (first >= 224) return 'it is a multicast, reserved or broadcast address'
+    return null
+}
+def refusal = companionRefusal(companionAddress)
+if (refusal != null) {
+    throw new GradleException("-Pcompanion=${companionAddress} refused: ${refusal}")
+}
+logger.quiet("RoboRIO companion address built in: ${companionAddress}" +
+        (companionFromCommandLine ? ' (from -Pcompanion)' :
+                ' (default, the robot network; -Pcompanion=<ipv4> to change)'))
+
+// The build this program reports in every State (talOS/hardware/messages.h,
+// GatewayBuild): RioBuild.h, written before any compile, holds the git commit
+// of this checkout and whether it has uncommitted changes, untracked files
+// included (the rule tools/workspace_status.sh applies to the main
+// processor). Without git, or outside a git checkout, the commit is "unknown"
+// and the program reports revision 0. It reads only the local repository, so
+// --offline builds get it too. The header also holds the companion address
+// above: a generated constant rather than a -D define, so no compiler's
+// quoting of a string define is involved. The task runs every build but
+// rewrites the header only when its text changes, so an unchanged checkout
+// and address recompile nothing, and a changed address recompiles Robot.cpp.
+//
+// -PtalosRevision=<16 lowercase hex digits> -PtalosDirty=true|false stamps
+// that revision and dirty state instead, for a build from a copy with no git
+// history (which would otherwise report revision 0); whoever made the copy
+// knows whether it differs from that commit. The two are required together:
+// a revision without -PtalosDirty, a -PtalosDirty without a revision, or a
+// -PtalosDirty that is not exactly true or false fails the build, so no
+// caller gets "clean" by omission. The override is refused while git sees a
+// work tree here (generateRioBuild asks before writing the header): git then
+// stamps the commit and dirty state itself, and an override could only hide
+// uncommitted changes. Like -Pcompanion both are taken only from the command
+// line, so a value left in a gradle.properties or the environment cannot
+// stamp a later build. A malformed revision fails the build, and
+// 0000000000000000 is refused: revision 0 means unknown.
+['talosRevision', 'talosDirty'].each { name ->
+    if (project.hasProperty(name) &&
+            !gradle.startParameter.projectProperties.containsKey(name)) {
+        throw new GradleException(
+                "${name}=${project.property(name)} is set outside the command line " +
+                "(gradle.properties or ORG_GRADLE_PROJECT_${name}); remove it there: " +
+                "-PtalosRevision=<16 hex digits> -PtalosDirty=true|false are accepted " +
+                "only on the command line")
+    }
+}
+def revisionOverride = gradle.startParameter.projectProperties['talosRevision']?.toString()
+def dirtyOverride = gradle.startParameter.projectProperties['talosDirty']?.toString()
+def revisionRefusal = { String text ->
+    if (!(text ==~ /[0-9a-f]{16}/)) {
+        return 'it is not exactly 16 lowercase hex digits (the first 16 of a git commit)'
+    }
+    if (text ==~ /0{16}/) return 'revision 0 means unknown'
+    return null
+}
+// Why the -PtalosRevision / -PtalosDirty pair (either may be null) is
+// refused, or null when it is accepted or absent.
+def overrideRefusal = { String revision, String dirty ->
+    if (revision == null) {
+        return dirty == null ? null :
+                "-PtalosDirty=${dirty} refused: it is given without -PtalosRevision, " +
+                'so it would stamp nothing; pass both or neither'
+    }
+    def revisionRefused = revisionRefusal(revision)
+    if (revisionRefused != null) return "-PtalosRevision=${revision} refused: ${revisionRefused}"
+    if (dirty == null) {
+        return "-PtalosRevision=${revision} refused: it needs -PtalosDirty=true|false, " +
+                'whether the copy differs from that commit'
+    }
+    if (!(dirty in ['true', 'false'])) {
+        return "-PtalosDirty=${dirty} refused: it is not exactly true or false " +
+                "(it stamps -PtalosRevision=${revision})"
+    }
+    return null
+}
+def overrideRefused = overrideRefusal(revisionOverride, dirtyOverride)
+if (overrideRefused != null) {
+    throw new GradleException(overrideRefused)
+}
+if (revisionOverride != null) {
+    logger.quiet("RoboRIO program revision stamped: ${revisionOverride}, dirty " +
+            "${dirtyOverride} (from -PtalosRevision -PtalosDirty)")
+}
+
+def rioBuildHeaderDir = layout.buildDirectory.dir('generated/talos/include').get().asFile
+def runGit = { List<String> args ->
+    try {
+        def process = (['git', '-C', projectDir.absolutePath] + args).execute()
+        def out = new StringBuilder()
+        def err = new StringBuilder()
+        process.waitForProcessOutput(out, err)
+        return process.exitValue() == 0 ? out.toString().trim() : null
+    } catch (IOException ignored) {
+        return null
+    }
+}
+
+// [commit, dirty]: the override when given, else what `git` (runGit, or a
+// stand-in in rioBuildStampTest) reports. An override is refused while git
+// sees a work tree here.
+def rioBuildStamp = { String override, String overrideDirty, Closure git ->
+    if (override != null) {
+        def workTree = git(['rev-parse', '--show-toplevel'])
+        if (workTree != null) {
+            throw new GradleException(
+                    "-PtalosRevision=${override} -PtalosDirty=${overrideDirty} refused: " +
+                    "git sees the work tree ${workTree}, which stamps its own commit and " +
+                    'uncommitted changes; drop both properties (they are for a copy ' +
+                    'with no git history)')
+        }
+        return [override, overrideDirty == 'true']
+    }
+    def head = git(['rev-parse', 'HEAD'])
+    def commit = head != null && head ==~ /[0-9a-f]{16,}/ ? head : 'unknown'
+    // A status that cannot be read is not evidence of a clean tree.
+    def status = commit == 'unknown' ? '' : git(['--no-optional-locks', 'status', '--porcelain'])
+    return [commit, status == null || !status.isEmpty()]
+}
+
+def rioBuildHeaderText = { String commit, boolean dirty, String companion ->
+    def revision = commit == 'unknown' ? '0' : "0x${commit.substring(0, 16)}"
+    return """\
+// Generated by build.gradle's generateRioBuild task; do not edit.
+#pragma once
+
+#include <cstdint>
+
+namespace talos::rio {
+// The git commit this program was built from (or the -PtalosRevision digits),
+// or "unknown".
+inline constexpr const char* kBuildCommit = "${commit}";
+// Its first 16 hex digits as one number, 0 when unknown
+// (hardware::GatewayBuild::revision).
+inline constexpr uint64_t kBuildRevision = ${revision}ull;
+// Built with uncommitted changes, untracked files included (or the
+// -PtalosDirty value).
+inline constexpr bool kBuildDirty = ${dirty};
+// The companion (main processor) this program sends State to and accepts
+// frames from, set by -Pcompanion at build time.
+inline constexpr const char* kCompanionAddress = "${companion}";
+}  // namespace talos::rio
+"""
+}
+
+tasks.register("generateRioBuild") {
+    description = 'Write the checkout\'s git commit and dirty flag (or -PtalosRevision -PtalosDirty) and companion address to RioBuild.h'
+    group = 'build'
+    def header = new File(rioBuildHeaderDir, 'RioBuild.h')
+    inputs.property('companion', companionAddress)
+    inputs.property('talosRevision', revisionOverride ?: '')
+    inputs.property('talosDirty', dirtyOverride ?: '')
+    outputs.file(header)
+    outputs.upToDateWhen { false }
+    doLast {
+        def (commit, dirty) = rioBuildStamp(revisionOverride, dirtyOverride, runGit)
+        def text = rioBuildHeaderText(commit, dirty, companionAddress)
+        if (!header.exists() || header.text != text) {
+            header.parentFile.mkdirs()
+            header.text = text
+        }
+    }
+}
+
+// REQ-CONTRACT-30: the revision and dirty state a State names are the ones
+// the build was given. In a copy git cannot see, -PtalosRevision and
+// -PtalosDirty reach kBuildRevision and kBuildDirty; a revision without
+// -PtalosDirty (or the reverse), a -PtalosDirty that is not true or false, a
+// malformed or zero revision, and an override where git sees a work tree are
+// refused, naming the properties; without the override a commit gives its
+// first 16 digits, and no git gives "unknown" and revision 0. phoenixTest
+// runs it.
+tasks.register("rioBuildStampTest") {
+    description = 'Check the RioBuild.h build stamp: -PtalosRevision -PtalosDirty, their refusals, git'
+    group = 'verification'
+    doLast {
+        def failures = []
+        def check = { boolean ok, String what -> if (!ok) failures << what }
+        // A copy with no git history: git finds no work tree, and nothing
+        // else may be asked.
+        def noWorkTree = { List<String> args ->
+            if (args != ['rev-parse', '--show-toplevel']) throw new GradleException("git ran: ${args}")
+            return null
+        }
+
+        def (commit, dirty) = rioBuildStamp('0123456789abcdef', 'true', noWorkTree)
+        def text = rioBuildHeaderText(commit, dirty, '10.0.0.5')
+        check(text.contains('kBuildRevision = 0x0123456789abcdefull;'),
+                "the -PtalosRevision revision is not in the header:\n${text}")
+        check(text.contains('kBuildCommit = "0123456789abcdef";'),
+                'the -PtalosRevision commit is not in the header')
+        check(text.contains('kBuildDirty = true;'), 'a -PtalosDirty=true build is reported clean')
+        def (cleanCommit, cleanDirty) = rioBuildStamp('0123456789abcdef', 'false', noWorkTree)
+        check(cleanCommit == '0123456789abcdef' && !cleanDirty,
+                'a -PtalosDirty=false build is not reported clean')
+
+        check(overrideRefusal('0123456789abcdef', 'true') == null &&
+                overrideRefusal('0123456789abcdef', 'false') == null &&
+                overrideRefusal(null, null) == null, 'a valid override, or none, is refused')
+        def refused = { String revision, String dirtyText, List<String> names ->
+            def why = overrideRefusal(revision, dirtyText)
+            check(why != null && names.every { why.contains(it) },
+                    "-PtalosRevision=${revision} -PtalosDirty=${dirtyText}: ${why ?: 'accepted'}")
+        }
+        refused('0123456789abcdef', null, ['-PtalosRevision', '-PtalosDirty'])
+        refused(null, 'false', ['-PtalosRevision', '-PtalosDirty'])
+        ['', 'TRUE', '1', 'yes', 'false '].each {
+            refused('0123456789abcdef', it, ['-PtalosRevision', '-PtalosDirty'])
+        }
+        ['', '0123456789ABCDEF', '0123456789abcde', '0123456789abcdef0', '0x0123456789abcd',
+         '0123456789abcdeg', '0000000000000000'].each {
+            refused(it, 'false', ['-PtalosRevision'])
+        }
+
+        // Where git sees a work tree it stamps the build itself: the override
+        // cannot hide that tree's uncommitted changes.
+        def inWorkTree = { List<String> args ->
+            args == ['rev-parse', '--show-toplevel'] ? '/robot/talos' : ''
+        }
+        try {
+            rioBuildStamp('0123456789abcdef', 'false', inWorkTree)
+            check(false, 'an override is accepted where git sees a work tree')
+        } catch (GradleException e) {
+            check(e.message.contains('/robot/talos') && e.message.contains('-PtalosRevision') &&
+                    e.message.contains('-PtalosDirty'),
+                    "the work-tree refusal names neither the tree nor both properties: ${e.message}")
+        }
+
+        def sha = '89abcdef0123456789abcdef0123456789abcdef'
+        def (gitCommit, gitDirty) = rioBuildStamp(null, null) { List<String> args ->
+            args[0] == 'rev-parse' ? sha : ''
+        }
+        check(rioBuildHeaderText(gitCommit, gitDirty, '10.0.0.5')
+                .contains('kBuildRevision = 0x89abcdef01234567ull;'), 'the git commit is not stamped')
+        check(!gitDirty, 'a clean checkout is reported dirty')
+        def (noCommit, noDirty) = rioBuildStamp(null, null) { List<String> args -> null }
+        check(noCommit == 'unknown' && !noDirty &&
+                rioBuildHeaderText(noCommit, noDirty, '10.0.0.5').contains('kBuildRevision = 0ull;'),
+                'a build without git does not report revision 0')
+
+        if (!failures.isEmpty()) {
+            throw new GradleException("rioBuildStampTest:\n  " + failures.join('\n  '))
+        }
+    }
+}
+
+tasks.withType(CppCompile).configureEach {
+    dependsOn 'generateRioBuild'
+}
+
+model {
+    components {
+        frcUserProgram(NativeExecutableSpec) {
+            targetPlatform wpi.platforms.roborio
+            if (includeDesktopSupport) {
+                targetPlatform wpi.platforms.desktop
+            }
+            sources.cpp {
+                source {
+                    srcDir 'src/main/cpp'
+                    srcDir '../../talOS/protocol'
+                    srcDir '../../talOS/hardware'
+                    srcDir '../../talOS/driver_station'
+                    // Only the gateway-side translation units; the rest of
+                    // those packages (tests, sims, companion-side nodes)
+                    // builds with Bazel.
+                    include '**/*.cpp', 'frame.cc', 'udp.cc', 'config.cc',
+                            'messages.cc', 'gateway.cc', 'driver_station.cc'
+                }
+                exportedHeaders {
+                    srcDir 'src/main/include'
+                    srcDir '../../talOS'
+                    srcDir rioBuildHeaderDir
+                    include '**/*.h', '**/*.hpp'
+                }
+            }
+
+            // Set deploy task to deploy this component
+            deployArtifact.component = it
+
+            // Enable run tasks for this component
+            wpi.cpp.enableExternalTasks(it)
+
+            // Enable simulation for this component
+            wpi.sim.enable(it)
+            // Defining my dependencies. In this case, WPILib (+ friends), and vendor libraries.
+            wpi.cpp.vendor.cpp(it)
+            wpi.cpp.deps.wpilib(it)
+        }
+    }
+    testSuites {
+        // Desktop tests of this program's sources (src/test/cpp): the
+        // PhoenixBackend simulation regressions, ConfigStore,
+        // SimDriverStation, DriverStationReader, RioLog, CompanionLink,
+        // LoopWatchdog, SocketRetry, LoopSchedule and CanBusHealth.
+        // The suite itself is auto-created per component by the google-test
+        // plugin; this only points it at our sources and dependencies.
+        frcUserProgramTest {
+            sources.cpp {
+                source {
+                    srcDir 'src/test/cpp'
+                    include '**/*.cpp'
+                }
+            }
+            wpi.cpp.vendor.cpp(it)
+            wpi.cpp.deps.wpilib(it)
+            wpi.cpp.deps.googleTest(it)
+        }
+    }
+}
+
+tasks.register("buildRio") {
+    description = 'Build release for RoboRIO only'
+    group = 'build'
+    dependsOn 'frcUserProgramLinuxathenaReleaseExecutable'
+}
+
+// Stable entry point for the desktop tests in src/test/cpp (PhoenixBackend
+// simulation regressions, ConfigStore, SimDriverStation,
+// DriverStationReader, RioLog, CompanionLink, LoopWatchdog, SocketRetry,
+// LoopSchedule, CanBusHealth). The
+// google-test plugin creates one RunTestExecutable task per desktop variant
+// (runFrcUserProgramTest<Platform><BuildType>GoogleTestExe),
+// so CI pins this aggregator instead of a platform-specific variant name.
+// It also runs rioBuildStampTest, the build's own revision-stamp check.
+tasks.register("phoenixTest") {
+    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, DriverStationReader, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth) and rioBuildStampTest'
+    group = 'verification'
+    def runTasks = tasks.matching { it.name.startsWith('runFrcUserProgramTest') }
+    dependsOn runTasks, 'rioBuildStampTest'
+    doFirst {
+        if (runTasks.empty) {
+            throw new RuntimeException('phoenixTest: no frcUserProgramTest run tasks found')
+        }
+    }
+}
+
+tasks.register("setupCompileCommands") {
+    description = 'Generate and copy compile_commands.json to project root'
+    group = 'ide'
+
+    dependsOn 'generateCompileCommands'
+
+    doLast {
+        def filePath = ""
+        if (OperatingSystem.current().isWindows()) {
+            filePath = "build/TargetedCompileCommands/windowsx86-64debug"
+        } else if (OperatingSystem.current().isMacOsX()) {
+            filePath = "build/TargetedCompileCommands/osxuniversalrelease"
+        } else if (OperatingSystem.current().isLinux()) {
+            // Todo:
+        }
+
+        copy {
+            from fileTree(filePath).include('compile_commands.json')
+            into projectDir
+        }
+    }
+}

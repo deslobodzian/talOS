@@ -40,9 +40,11 @@ std::string CpuAprilTagBackend::device_info() const {
 
 BackendExecutionResult CpuAprilTagBackend::Execute(const Frame& frame) {
   BackendExecutionResult result;
-  if (frame.empty() || frame.width() == 0 || frame.height() == 0) {
+  if (!frame.holds_image()) {
     result.success = false;
-    result.error_message = "Frame is empty or has invalid dimensions";
+    result.error_message =
+        "Frame has invalid dimensions or stores fewer than stride * height "
+        "bytes";
     return result;
   }
 

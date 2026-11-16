@@ -6,6 +6,7 @@
 import type {Snapshot} from '../core';
 import type {ChannelInfo, DriverStationMode, SystemState} from './types';
 import {discoverEstimators} from './discovery';
+import {liveNodeCount} from './freshness';
 
 export type RobotStatus = {
   ds: {
@@ -18,7 +19,9 @@ export type RobotStatus = {
   power: {
     battery_v: number|null;
     brownout: boolean|null;
-    can_frac: number|null;
+    // One row per CAN bus /hw/status lists (can_bus_count); empty when the
+    // snapshot carries no count.
+    canBuses: CanBus[];
     healthValid: boolean|null;
   };
   link: {
@@ -27,15 +30,95 @@ export type RobotStatus = {
     faultMask: number|null;
     timedOutMask: number|null;
   };
-  estimator: {valid: boolean|null; accepted: number|null; rejected: number|null}|null;
-  nodes: {alive: number; total: number}|null;
+  // `channel` names the validity channel, so the reading can be aged.
+  estimator: {valid: boolean|null; accepted: number|null; rejected: number|null;
+              channel: string}|null;
+  // `alive` is null when the graph is stale: `total` is last-known, the live
+  // count is not knowable.
+  nodes: {alive: number|null; total: number}|null;
 };
 
 const DS = 'hw/state/driver_station/';
 
+// How a CAN bus's last status read stands (bridge.CanBusReadState, by value).
+export type CanBusReadState = 'none'|'ok'|'pending'|'failed'|'stale'|'simulated';
+const CAN_BUS_READ_STATES: CanBusReadState[] =
+    ['none', 'ok', 'pending', 'failed', 'stale', 'simulated'];
+
+// A read_state channel's value as its state; null for an absent or unknown
+// value.
+export const canBusReadState = (value: number|undefined): CanBusReadState|null =>
+    value === undefined ? null : CAN_BUS_READ_STATES[value] ?? null;
+
+// One /hw/status can_buses slot. In any state but 'ok' /hw/status carries the
+// last good read's figures (0 before one), so `frac` is the utilization only
+// while the last read is current and null otherwise: a failed, stale or
+// unread bus is shown by its state, never by a figure. The counters are the
+// last good read's.
+export type CanBus = {
+  index: number;
+  label: string;
+  state: CanBusReadState|null;
+  frac: number|null;
+  busOff: number|null;
+  transmitBufferFull: number|null;
+  receiveErrors: number|null;
+  transmitErrors: number|null;
+  readFailures: number|null;
+  channel: string;  // the slot's read_state channel
+};
+
+// Slot 0 is the RoboRIO's own bus; the others are the configuration's
+// further buses in byte order, which /hw/status does not name.
+export const canBusLabel = (index: number): string =>
+    index === 0 ? 'rio' : `CAN bus ${index}`;
+
+export function canBuses(channels: Record<string, number>): CanBus[] {
+  const count = channels['hw/status/can_bus_count'];
+  if (count === undefined || !Number.isFinite(count)) return [];
+  const out: CanBus[] = [];
+  for (let index = 0; index < Math.min(count, 4); index++) {
+    const prefix = `hw/status/can_buses/${index}/`;
+    const read = (field: string): number|null => {
+      const v = channels[prefix + field];
+      return v === undefined ? null : v;
+    };
+    const state = canBusReadState(channels[prefix + 'read_state']);
+    out.push({
+      index,
+      label: canBusLabel(index),
+      state,
+      frac: state === 'ok' ? read('utilization_frac') : null,
+      busOff: read('bus_off_count'),
+      transmitBufferFull: read('transmit_buffer_full_count'),
+      receiveErrors: read('receive_error_count'),
+      transmitErrors: read('transmit_error_count'),
+      readFailures: read('read_failure_count'),
+      channel: prefix + 'read_state'
+    });
+  }
+  return out;
+}
+
+// What a bus's utilization reads as: a percentage only while its last read is
+// current ('ok'); otherwise the state itself ('not read' before any report),
+// so a bus that stopped or never started reading never looks idle.
+export function canBusReading(bus: CanBus): string {
+  if (bus.state === null) return '—';
+  if (bus.state === 'ok')
+    return bus.frac === null ? '—' : `${(bus.frac * 100).toFixed(0)}%`;
+  if (bus.state === 'none') return 'not read';
+  return bus.state;
+}
+
+export const canBusUnread = (bus: CanBus): boolean =>
+    bus.state === 'failed' || bus.state === 'stale';
+
 // Precedence: e-stop outranks a lost link, which outranks a disabled robot,
 // which outranks the chosen mode. Null when the DS channels are absent from
-// the snapshot (which is a different statement from "disconnected").
+// the snapshot (which is a different statement from "disconnected"), and when
+// `enabled` is: a mode flag names the selected mode, not that the robot is
+// enabled in it.
 export function driverStationMode(snapshot: Snapshot|null): DriverStationMode|null {
   if (!snapshot) return null;
   const ch = snapshot.channels;
@@ -48,6 +131,7 @@ export function driverStationMode(snapshot: Snapshot|null): DriverStationMode|nu
     return null;
   if (estop === 1) return 'estop';
   if (connected === 0) return 'disconnected';
+  if (enabled === undefined) return null;
   if (enabled === 0) return 'disabled';
   if (autonomous === 1) return 'autonomous';
   if (teleop === 1) return 'teleop';
@@ -97,14 +181,13 @@ export function robotStatus(snapshot: Snapshot|null, system: SystemState): Robot
     estimator = {
       valid: flag(`${owner}/state/valid`),
       accepted: num(`${owner}/state/observation_accepted_count`),
-      rejected: num(`${owner}/state/observation_rejected_count`)
+      rejected: num(`${owner}/state/observation_rejected_count`),
+      channel: `${owner}/state/valid`
     };
   }
 
   const graph = system.graph;
-  const nodes = graph ?
-      {alive: graph.nodes.filter(n => n.alive).length, total: graph.nodes.length} :
-      null;
+  const nodes = graph ? {alive: liveNodeCount(system), total: graph.nodes.length} : null;
 
   return {
     ds: {
@@ -117,7 +200,7 @@ export function robotStatus(snapshot: Snapshot|null, system: SystemState): Robot
     power: {
       battery_v: num('hw/status/battery_v'),
       brownout: flag('hw/status/brownout'),
-      can_frac: num('hw/status/can_utilization_frac'),
+      canBuses: canBuses(ch),
       healthValid: flag('hw/status/health_valid')
     },
     link: {

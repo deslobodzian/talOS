@@ -1,0 +1,13 @@
+[subsystem]
+name = "gyro"
+node = "//bench/main_processor/gyro:node"
+critical = false
+period_us = 10000
+
+# The bench Pigeon 2, on the CANivore named Shooter.
+[sensors.pigeon]
+type = "Pigeon2"
+bus = "Shooter"
+can_id = 0
+offset_rot = 0.0
+inverted = false

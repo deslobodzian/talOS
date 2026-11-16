@@ -105,21 +105,16 @@ inline int RasterizeProjectedTags(const std::map<int, TagPattern>& patterns,
     }
     for (int gr = 0; gr < 10; ++gr) {
       for (int gc = 0; gc < 10; ++gc) {
-        uint8_t color;
-        if (gc == 0 || gc == 9 || gr == 0 || gr == 9) {
-          // White quiet-zone margin OUTSIDE the quad: the detector's white
-          // border model samples there, so it must read bright.
-          color = options.white_gray;
-        } else if (gc == 1 || gc == 8 || gr == 1 || gr == 8) {
-          // Black border ring; the fitted quad is its OUTER edge.
-          color = options.black_gray;
-        } else if (pattern.bits[gr - 2][gc - 2]) {
-          color = options.white_gray;  // Set data bit.
-        } else {
-          // Unset data bit. (Every interior cell of a real family code is
-          // a data bit, so this also covers any non-bit interior cell.)
-          color = options.black_gray;
-        }
+        // White quiet-zone margin OUTSIDE the quad: the detector's white
+        // border model samples there, so it must read bright.
+        const bool quiet_zone = gc == 0 || gc == 9 || gr == 0 || gr == 9;
+        // Black border ring; the fitted quad is its OUTER edge.
+        const bool border = gc == 1 || gc == 8 || gr == 1 || gr == 8;
+        // Every interior cell of a real family code is a data bit: set bits
+        // are white, unset bits (and any non-bit interior cell) are black.
+        const bool white =
+            quiet_zone || (!border && pattern.bits[gr - 2][gc - 2]);
+        const uint8_t color = white ? options.white_gray : options.black_gray;
         // The lattice spans ±1.25 tag units in the tag's y/z plane:
         // row zero is top (+Z), column zero is left (-Y as seen by the lens).
         const int index = gr * 11 + gc;
@@ -201,9 +196,10 @@ inline void IncludeExposureTags(const std::vector<SimTagDetection>& detections,
     // A quiet-zone corner can cross the near plane while inner cells still
     // project. In that degenerate case the tag may cover the whole image.
     if (!projected) {
-      IncludeExposureRegion(cv::Rect(0, 0, cam.intrinsics.image_width,
-                                     cam.intrinsics.image_height),
-                            regions);
+      IncludeExposureRegion(
+          cv::Rect(0, 0, static_cast<int>(cam.intrinsics.image_width),
+                   static_cast<int>(cam.intrinsics.image_height)),
+          regions);
       continue;
     }
     // Cover integer polygon rounding and the rasterizer's boundary pixels.
@@ -237,8 +233,9 @@ inline int RenderFieldView(
     double yaw_rate_radps = 0.0, std::mt19937_64* rng = nullptr,
     RenderScratch* scratch = nullptr) {
   if (gray_out == nullptr) return 0;
-  if (cam.intrinsics.image_width <= 0 || cam.intrinsics.image_height <= 0 ||
-      !(tag_size_m > 0.0)) {
+  const int width = static_cast<int>(cam.intrinsics.image_width);
+  const int height = static_cast<int>(cam.intrinsics.image_height);
+  if (width <= 0 || height <= 0 || !(tag_size_m > 0.0)) {
     return 0;
   }
   const double exposure_s = std::max(0.0, cam.exposure_ms) * 0.001;
@@ -291,10 +288,8 @@ inline int RenderFieldView(
       IncludeExposureTags(scratch->start, patterns, cam, tag_size_m, &regions);
       IncludeExposureTags(scratch->end, patterns, cam, tag_size_m, &regions);
       auto& instant = scratch->instant;
-      instant.resize(static_cast<size_t>(cam.intrinsics.image_height) *
-                     cam.intrinsics.image_width);
-      cv::Mat sample_image(cam.intrinsics.image_height,
-                           cam.intrinsics.image_width, CV_8UC1, instant.data());
+      instant.resize(static_cast<size_t>(height) * width);
+      cv::Mat sample_image(height, width, CV_8UC1, instant.data());
       auto& accumulated = scratch->accumulated;
       accumulated.create(sample_image.size(), CV_32FC1);
       accumulated.setTo(0);
@@ -333,10 +328,18 @@ inline int RenderFieldView(
     std::normal_distribution<double> distribution(1.0, cam.exposure_gain_std);
     gain = std::max(0.0, distribution(*rng));
   }
-  cv::Mat output(cam.intrinsics.image_height, cam.intrinsics.image_width,
-                 CV_8UC1, gray_out->data());
+  cv::Mat output(height, width, CV_8UC1, gray_out->data());
   if (rng != nullptr && cam.sensor_noise_std_gray > 0.0) {
     scratch->sensor_noise.create(output.size(), CV_32FC1);
+    // OpenCV fills its normal-distribution tables on first use behind an
+    // unsynchronized static flag. One fill under this thread-safe static
+    // builds them before any renderer thread reads them, so cameras rendering
+    // on concurrent threads only read the tables.
+    [[maybe_unused]] static const bool normal_tables_ready = [] {
+      cv::Mat warm(1, 1, CV_32FC1);
+      cv::RNG(1).fill(warm, cv::RNG::NORMAL, 0.0, 1.0);
+      return true;
+    }();
     // Local OpenCV state avoids its thread-global RNG and derives each frame's
     // deterministic sensor stream from the camera's explicit generator.
     cv::RNG sensor_rng((*rng)());

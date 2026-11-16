@@ -11,8 +11,9 @@ namespace demo {
 
 // Sequences the intake and the elevator, which are separate nodes: it only
 // reads their states and writes their "superstructure" target lanes
-// (/intake/target/superstructure, /elevator/target/superstructure) every
-// tick. Its own goal is a Target: /superstructure/target/teleop in teleop,
+// (/intake/target/superstructure, /elevator/target/superstructure), releasing
+// both whenever either status is stale. Its own goal is a Target:
+// /superstructure/target/teleop in teleop,
 // /superstructure/target/auto in autonomous (the default policy). No live
 // goal (disabled, stale, released, never sent) counts as STOW.
 //
@@ -37,9 +38,22 @@ class Superstructure {
     const SuperstructureGoal* goal = goal_.get();
     const SuperstructureCommand command =
         goal != nullptr ? goal->command() : SuperstructureCommand::STOW;
-    // Only advance on what the mechanisms report now. If either one has gone
-    // quiet, hold the current step and keep sending its goals.
-    if (intake_.fresh() && elevator_.fresh()) advance(command);
+    const bool intake_fresh = intake_.fresh();
+    const bool fresh = intake_fresh && elevator_.fresh();
+    // Cancellation never waits for a dependency. Forget an interrupted step:
+    // recovery must start from fresh observations, not resume an old eject.
+    if (command == SuperstructureCommand::STOW || !fresh)
+      sm_.go(intake_fresh && intake_->has_piece() ? State::HOLDING
+                                                  : State::STOWED);
+    else
+      advance(command);
+
+    if (!fresh) {
+      intake_goal_.release();
+      elevator_goal_.release();
+      status_.send(SuperstructureStatus{sm_.state()});
+      return;
+    }
 
     switch (sm_.state()) {
       case State::STOWED:
@@ -70,10 +84,7 @@ class Superstructure {
           sm_.go(State::INTAKING);
         break;
       case State::INTAKING:
-        if (has_piece)
-          sm_.go(State::HOLDING);
-        else if (command == SuperstructureCommand::STOW)
-          sm_.go(State::STOWED);
+        if (has_piece) sm_.go(State::HOLDING);
         break;
       case State::HOLDING:
         if (!has_piece)
@@ -82,10 +93,10 @@ class Superstructure {
           sm_.go(State::RAISING);
         break;
       case State::RAISING:
-        if (elevator_at(high_rot_))
+        if (!has_piece)
+          sm_.go(State::STOWED);
+        else if (elevator_at(high_rot_))
           sm_.go(State::SCORING);
-        else if (command == SuperstructureCommand::STOW)
-          sm_.go(State::HOLDING);
         break;
       case State::SCORING:
         if (!has_piece) sm_.go(State::STOWED);

@@ -92,13 +92,18 @@ struct Reader {
 };
 }  // namespace
 
-void ModeTracker::Stamp(DriverStationData& ds) {
-  const uint32_t key = ModeKey(ds.fms.flags);
+void ModeTracker::Observe(uint32_t flags, uint64_t now_us) {
+  const uint32_t key = ModeKey(flags);
   if (!have_ || key != key_) {
-    since_us_ = std::max({ds.sample_time_us, since_us_ + 1, uint64_t{1}});
+    since_us_ = std::max({now_us, since_us_ + 1, uint64_t{1}});
     key_ = key;
     have_ = true;
   }
+}
+
+void ModeTracker::Stamp(DriverStationData& ds) {
+  ds.fms.flags = ShownFlags(ds.fms.flags);
+  Observe(ds.fms.flags, ds.sample_time_us);
   ds.mode_since_us = since_us_;
 }
 
@@ -106,6 +111,7 @@ std::size_t Encode(const DriverStationData& ds, std::span<uint8_t> data) {
   Writer w{data};
   w.Int(ds.sample_time_us, 8);
   w.Int(ds.mode_since_us, 8);
+  w.Int(ds.boot_id, 8);
 
   // FMS
   w.Int(ds.fms.flags, 4);
@@ -151,6 +157,7 @@ bool Decode(std::span<const uint8_t> data, DriverStationData& out) {
 
   ds.sample_time_us = r.Int(8);
   ds.mode_since_us = r.Int(8);
+  ds.boot_id = r.Int(8);
 
   // FMS
   ds.fms.flags = static_cast<uint32_t>(r.Int(4));

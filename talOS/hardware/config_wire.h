@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -103,6 +104,11 @@ struct ByteReader {
     }
     return val;
   }
+  // Signed 32-bit fields (CAN ids, DIO/PWM channels) travel as their
+  // two's-complement bits; the conversion back is modular (C++20).
+  int32_t Int32() {
+    return static_cast<int32_t>(static_cast<uint32_t>(Int(4)));
+  }
   double Real() {
     const double x = std::bit_cast<double>(Int(8));
     ok &= std::isfinite(x);
@@ -151,6 +157,8 @@ inline std::vector<uint8_t> SerializeConfig(const Config& c) {
     w.Int(m.soft_limits ? 1 : 0, 1);
     w.Real(m.reverse_limit_rot);
     w.Real(m.forward_limit_rot);
+    w.Int(static_cast<uint8_t>(m.forward_limit_switch), 1);
+    w.Int(static_cast<uint8_t>(m.reverse_limit_switch), 1);
     w.Real(m.max_velocity_rps);
     w.Real(m.cruise_velocity_rps);
     w.Real(m.acceleration_rps2);
@@ -229,7 +237,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
     auto& m = c.motors[i];
     m.id = r.Int(2);
     m.name = r.Text();
-    m.can_id = r.Int(4);
+    m.can_id = r.Int32();
     m.bus = r.Text();
     m.inverted = (r.Int(1) == 1);
     m.brake = (r.Int(1) == 1);
@@ -253,6 +261,13 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
     m.soft_limits = (r.Int(1) == 1);
     m.reverse_limit_rot = r.Real();
     m.forward_limit_rot = r.Real();
+    const auto forward_switch = r.Int(1);
+    const auto reverse_switch = r.Int(1);
+    if (forward_switch > static_cast<uint8_t>(LimitSwitch::kDisabled) ||
+        reverse_switch > static_cast<uint8_t>(LimitSwitch::kDisabled))
+      return false;
+    m.forward_limit_switch = static_cast<LimitSwitch>(forward_switch);
+    m.reverse_limit_switch = static_cast<LimitSwitch>(reverse_switch);
     m.max_velocity_rps = r.Real();
     m.cruise_velocity_rps = r.Real();
     m.acceleration_rps2 = r.Real();
@@ -285,7 +300,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
       return false;
     }
     s.kind = static_cast<SensorKind>(kind);
-    s.can_id = r.Int(4);
+    s.can_id = r.Int32();
     s.bus = r.Text();
     s.inverted = (r.Int(1) == 1);
     s.offset_rot = r.Real();
@@ -297,7 +312,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < di_count; ++i) {
     c.digital_inputs[i].id = r.Int(2);
     c.digital_inputs[i].name = r.Text();
-    c.digital_inputs[i].dio = r.Int(4);
+    c.digital_inputs[i].dio = r.Int32();
   }
 
   const auto do_count = r.Int(2);
@@ -306,7 +321,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < do_count; ++i) {
     c.digital_outputs[i].id = r.Int(2);
     c.digital_outputs[i].name = r.Text();
-    c.digital_outputs[i].dio = r.Int(4);
+    c.digital_outputs[i].dio = r.Int32();
   }
 
   const auto ai_count = r.Int(2);
@@ -315,7 +330,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < ai_count; ++i) {
     c.analog_inputs[i].id = r.Int(2);
     c.analog_inputs[i].name = r.Text();
-    c.analog_inputs[i].channel = r.Int(4);
+    c.analog_inputs[i].channel = r.Int32();
   }
 
   const auto enc_count = r.Int(2);
@@ -330,8 +345,8 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
       return false;
     }
     c.encoders[i].kind = static_cast<EncoderKind>(kind);
-    c.encoders[i].dio_a = r.Int(4);
-    c.encoders[i].dio_b = r.Int(4);
+    c.encoders[i].dio_a = r.Int32();
+    c.encoders[i].dio_b = r.Int32();
     c.encoders[i].counts_per_rev = r.Real();
     c.encoders[i].offset_rot = r.Real();
   }
@@ -342,7 +357,7 @@ inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
   for (std::size_t i = 0; i < pwm_count; ++i) {
     c.pwm_outputs[i].id = r.Int(2);
     c.pwm_outputs[i].name = r.Text();
-    c.pwm_outputs[i].channel = r.Int(4);
+    c.pwm_outputs[i].channel = r.Int32();
   }
 
   if (!r.Done()) return false;
@@ -378,6 +393,67 @@ struct ConfigAckPayload {
 static_assert(sizeof(ConfigChunkHeader) == 24, "Update docs/DATA_FLOW.md");
 static_assert(sizeof(ConfigAckPayload) == 73, "Update docs/DATA_FLOW.md");
 
+// The packed structs fix the sizes; their bytes travel field by field,
+// little-endian, like every other talOS wire payload, never as the host's
+// object representation.
+namespace detail {
+inline void PutLittleEndian(uint8_t* out, uint64_t value, int bytes) {
+  for (int i = 0; i < bytes; ++i) {
+    out[i] = static_cast<uint8_t>(value & 0xFF);
+    value >>= 8;
+  }
+}
+inline uint64_t GetLittleEndian(const uint8_t* in, int bytes) {
+  uint64_t value{};
+  for (int i = 0; i < bytes; ++i) value |= uint64_t{in[i]} << (i * 8);
+  return value;
+}
+}  // namespace detail
+
+inline void EncodeConfigChunkHeader(const ConfigChunkHeader& header,
+                                    uint8_t* out) {
+  detail::PutLittleEndian(out + 0, header.config_id, 8);
+  detail::PutLittleEndian(out + 8, header.total_crc32, 4);
+  detail::PutLittleEndian(out + 12, header.total_bytes, 4);
+  detail::PutLittleEndian(out + 16, header.chunk_index, 2);
+  detail::PutLittleEndian(out + 18, header.chunk_count, 2);
+  detail::PutLittleEndian(out + 20, header.chunk_bytes, 4);
+}
+
+inline ConfigChunkHeader DecodeConfigChunkHeader(const uint8_t* in) {
+  ConfigChunkHeader header;
+  header.config_id = detail::GetLittleEndian(in + 0, 8);
+  header.total_crc32 =
+      static_cast<uint32_t>(detail::GetLittleEndian(in + 8, 4));
+  header.total_bytes =
+      static_cast<uint32_t>(detail::GetLittleEndian(in + 12, 4));
+  header.chunk_index =
+      static_cast<uint16_t>(detail::GetLittleEndian(in + 16, 2));
+  header.chunk_count =
+      static_cast<uint16_t>(detail::GetLittleEndian(in + 18, 2));
+  header.chunk_bytes =
+      static_cast<uint32_t>(detail::GetLittleEndian(in + 20, 4));
+  return header;
+}
+
+// Validate() limits device names and CAN bus names to 63 bytes. Text fields
+// also carry a two-byte length; the remaining sizes mirror SerializeConfig.
+inline constexpr std::size_t kMaxConfigTextBytes = 2 + 63;
+inline constexpr std::size_t kMaxSerializedConfigSize =
+    17 + 7 * 2 + kMaxMotors * (277 + 2 * kMaxConfigTextBytes) +
+    kMaxSensors * (16 + 2 * kMaxConfigTextBytes) +
+    (kMaxDigitalInputs + kMaxDigitalOutputs + kMaxAnalogInputs +
+     kMaxPwmOutputs) *
+        (6 + kMaxConfigTextBytes) +
+    kMaxEncoders * (27 + kMaxConfigTextBytes);
+static_assert(kMaxSerializedConfigSize == 10083,
+              "Serialized config maximum changed; update docs/DATA_FLOW.md");
+inline constexpr std::size_t kMaxConfigChunkData =
+    protocol::kMaxPayloadSize - sizeof(ConfigChunkHeader);
+// A custom payload budget may leave only one data byte per chunk.
+inline constexpr std::size_t kMaxConfigChunkCount = kMaxSerializedConfigSize;
+static_assert(kMaxConfigChunkCount <= std::numeric_limits<uint16_t>::max());
+
 inline std::vector<std::vector<uint8_t>> CreateConfigChunks(
     const Config& config, std::size_t max_payload = protocol::kMaxPayloadSize) {
   const auto serialized = SerializeConfig(config);
@@ -406,7 +482,7 @@ inline std::vector<std::vector<uint8_t>> CreateConfigChunks(
     hdr.chunk_count = chunk_count;
     hdr.chunk_bytes = static_cast<uint32_t>(chunk_size);
 
-    std::memcpy(chunk.data(), &hdr, sizeof(hdr));
+    EncodeConfigChunkHeader(hdr, chunk.data());
     std::memcpy(chunk.data() + sizeof(hdr), serialized.data() + offset,
                 chunk_size);
     chunks.push_back(std::move(chunk));
@@ -425,22 +501,48 @@ class ConfigAssembler {
     kCeilingExceeded,
   };
 
-  Status AddChunk(std::span<const uint8_t> payload, std::string& error_reason) {
+  Status AddChunk(std::span<const uint8_t> payload,
+                  std::string& error_reason) noexcept try {
     if (payload.size() < sizeof(ConfigChunkHeader)) {
       error_reason = "chunk payload smaller than header";
       return Status::kInvalidChunk;
     }
 
-    ConfigChunkHeader hdr;
-    std::memcpy(&hdr, payload.data(), sizeof(hdr));
+    const ConfigChunkHeader hdr = DecodeConfigChunkHeader(payload.data());
 
-    if (payload.size() != sizeof(ConfigChunkHeader) + hdr.chunk_bytes) {
+    if (hdr.chunk_bytes == 0 || hdr.chunk_bytes > kMaxConfigChunkData ||
+        payload.size() != sizeof(ConfigChunkHeader) + hdr.chunk_bytes) {
       error_reason = "chunk byte count mismatch";
       return Status::kInvalidChunk;
     }
 
-    if (hdr.chunk_count == 0 || hdr.chunk_index >= hdr.chunk_count) {
+    if (hdr.total_bytes == 0 || hdr.total_bytes > kMaxSerializedConfigSize ||
+        hdr.chunk_count == 0 || hdr.chunk_count > kMaxConfigChunkCount ||
+        hdr.chunk_count > hdr.total_bytes ||
+        hdr.chunk_index >= hdr.chunk_count) {
       error_reason = "invalid chunk index or count";
+      return Status::kInvalidChunk;
+    }
+
+    // Every non-final chunk has the same stride. Infer it from a final
+    // chunk too, so out-of-order delivery gets the same bounds checks.
+    const bool final_chunk = hdr.chunk_index == hdr.chunk_count - 1;
+    std::size_t stride = hdr.chunk_bytes;
+    if (final_chunk && hdr.chunk_count > 1) {
+      if (hdr.chunk_bytes >= hdr.total_bytes ||
+          (hdr.total_bytes - hdr.chunk_bytes) % (hdr.chunk_count - 1) != 0) {
+        error_reason = "invalid final chunk size";
+        return Status::kInvalidChunk;
+      }
+      stride = (hdr.total_bytes - hdr.chunk_bytes) / (hdr.chunk_count - 1);
+    }
+    const std::size_t offset = std::size_t{hdr.chunk_index} * stride;
+    if (stride == 0 || stride > kMaxConfigChunkData ||
+        hdr.chunk_count != (hdr.total_bytes + stride - 1) / stride ||
+        offset >= hdr.total_bytes ||
+        hdr.chunk_bytes !=
+            std::min(stride, std::size_t{hdr.total_bytes} - offset)) {
+      error_reason = "chunk data exceeds transfer bounds";
       return Status::kInvalidChunk;
     }
 
@@ -450,29 +552,17 @@ class ConfigAssembler {
       total_crc32_ = hdr.total_crc32;
       total_bytes_ = hdr.total_bytes;
       chunk_count_ = hdr.chunk_count;
+      chunk_stride_ = stride;
       received_chunks_.assign(chunk_count_, false);
       assembled_buffer_.assign(total_bytes_, 0);
       received_count_ = 0;
     } else {
       if (hdr.total_bytes != total_bytes_ || hdr.total_crc32 != total_crc32_ ||
-          hdr.chunk_count != chunk_count_) {
+          hdr.chunk_count != chunk_count_ || stride != chunk_stride_) {
         error_reason = "inconsistent chunk metadata";
         Reset();
         return Status::kInvalidChunk;
       }
-    }
-
-    std::size_t offset = 0;
-    if (hdr.chunk_index < chunk_count_ - 1) {
-      offset = hdr.chunk_index * hdr.chunk_bytes;
-    } else {
-      offset = total_bytes_ - hdr.chunk_bytes;
-    }
-
-    if (offset + hdr.chunk_bytes > assembled_buffer_.size()) {
-      error_reason = "chunk data exceeds buffer bounds";
-      Reset();
-      return Status::kInvalidChunk;
     }
 
     if (!received_chunks_[hdr.chunk_index]) {
@@ -516,6 +606,12 @@ class ConfigAssembler {
     Reset();
     active_config_id_ = completed_id;
     return Status::kComplete;
+  } catch (...) {
+    // Allocation/deserialization failures must not escape the gateway's
+    // safety loop. Even reporting an error must remain allocation-free here.
+    Reset();
+    error_reason.clear();
+    return Status::kInvalidChunk;
   }
 
   const Config& config() const { return config_; }
@@ -527,6 +623,7 @@ class ConfigAssembler {
     total_bytes_ = 0;
     chunk_count_ = 0;
     received_count_ = 0;
+    chunk_stride_ = 0;
     received_chunks_.clear();
     assembled_buffer_.clear();
   }
@@ -537,6 +634,7 @@ class ConfigAssembler {
   uint32_t total_bytes_{0};
   uint16_t chunk_count_{0};
   uint16_t received_count_{0};
+  std::size_t chunk_stride_{0};
   std::vector<bool> received_chunks_{};
   std::vector<uint8_t> assembled_buffer_{};
   Config config_{};
@@ -571,14 +669,18 @@ inline bool LoadPersistedConfig(std::span<const uint8_t> bytes,
 inline std::size_t EncodeConfigAck(const ConfigAckPayload& ack,
                                    std::span<uint8_t> out) {
   if (out.size() < sizeof(ConfigAckPayload)) return 0;
-  std::memcpy(out.data(), &ack, sizeof(ack));
-  return sizeof(ack);
+  detail::PutLittleEndian(out.data(), ack.config_id, 8);
+  out[8] = static_cast<uint8_t>(ack.status);
+  std::memcpy(out.data() + 9, ack.reason, sizeof(ack.reason));
+  return sizeof(ConfigAckPayload);
 }
 
 inline bool DecodeConfigAck(std::span<const uint8_t> in,
                             ConfigAckPayload& out) {
   if (in.size() < sizeof(ConfigAckPayload)) return false;
-  std::memcpy(&out, in.data(), sizeof(out));
+  out.config_id = detail::GetLittleEndian(in.data(), 8);
+  out.status = static_cast<ConfigAckStatus>(in[8]);
+  std::memcpy(out.reason, in.data() + 9, sizeof(out.reason));
   return true;
 }
 

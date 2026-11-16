@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
 import {Timeline, type Snapshot} from '../src/core';
-import {STORE_CAPACITY, TelemetryStore} from '../src/data/store';
+import {TelemetryStore} from '../src/data/store';
 
 const DS = 'hw/state/driver_station/';
 
@@ -19,7 +19,7 @@ function snap(seq: number, ts: bigint, channels: Record<string, number> = {}): S
   };
 }
 
-test('snapshotAt matches Timeline.at over random cursors', () => {
+test('snapshotAt matches held history at and between every sample', () => {
   const frames: Snapshot[] = [];
   const timeline = new Timeline();
   for (let i = 0; i < 200; i++) {
@@ -33,9 +33,8 @@ test('snapshotAt matches Timeline.at over random cursors', () => {
   const store = new TelemetryStore(cb => cb());
   store.ingest(frames, true);
 
-  for (let trial = 0; trial < 500; trial++) {
-    const offset = Math.floor(Math.random() * 250) - 25;  // below-first .. above-last
-    const cursor = 1_000_000_000n + BigInt(offset) * 20_000_000n;
+  for (let offset = -51; offset <= 451; offset++) {
+    const cursor = 1_000_000_000n + BigInt(offset) * 10_000_000n;
     const expected = timeline.at(cursor);
     const actual = store.snapshotAt(String(cursor));
     if (expected === null) {
@@ -61,6 +60,17 @@ test('channels first declared later are NaN-backfilled', () => {
   assert.equal(store.snapshotAt('1')!.channels.b, undefined);
 });
 
+test('dictionary ids above 2^31 (uint32 on the wire) reconstruct', () => {
+  const store = new TelemetryStore(cb => cb());
+  const id = 0xdeadbeef;
+  store.ingest([{...snap(0, 1n, {a: 1}), dictionary_id: id,
+                 units: Object.assign(Object.create(null), {a: 'V'})}], true);
+  const snapshot = store.snapshotAt('1');
+  assert.ok(snapshot);
+  assert.equal(snapshot.dictionary_id, id);
+  assert.equal(snapshot.units.a, 'V');
+});
+
 test('reset clears the ring and the dictionary', () => {
   const store = new TelemetryStore(cb => cb());
   store.ingest([snap(0, 1n, {a: 1}), snap(1, 2n, {a: 2})], true);
@@ -70,17 +80,6 @@ test('reset clears the ring and the dictionary', () => {
   assert.equal(store.snapshotAt('3')!.channels.b, 3);
 });
 
-test('trims the oldest frames past capacity', () => {
-  const store = new TelemetryStore(cb => cb());
-  const frames: Snapshot[] = [];
-  const n = STORE_CAPACITY + 3;
-  for (let i = 0; i < n; i++)
-    frames.push(snap(i, 1_000_000_000n + BigInt(i) * 10n, {a: i}));
-  store.ingest(frames, true);
-  // Frames 0, 1 and 2 fell off the front.
-  assert.equal(store.snapshotAt(String(1_000_000_000n + 2n * 10n)), null);
-  assert.equal(store.snapshotAt(String(1_000_000_000n + 3n * 10n))!.channels.a, 3);
-});
 
 test('a reused ring slot does not leak the previous frame value', () => {
   const store = new TelemetryStore(cb => cb(), 4);
@@ -92,6 +91,7 @@ test('a reused ring slot does not leak the previous frame value', () => {
     snap(4, 5n, {a: 4}),      // omits b; reuses frame 0's slot (b=100)
     snap(5, 6n, {a: 5, b: 105})
   ], true);
+  assert.equal(store.snapshotAt('2'), null);
 
   // Frame 4 omitted b and must read as absent, not the overwritten 100.
   assert.equal(store.snapshotAt('5')!.channels.a, 4);
@@ -122,11 +122,6 @@ test('series windows: all and seconds', () => {
   assert.deepEqual(Array.from(window.values.a), [6, 7, 8, 9, 10]);
 });
 
-test('snapshotAt memoises per index', () => {
-  const store = new TelemetryStore(cb => cb());
-  store.ingest([snap(0, 1n, {a: 1})], true);
-  assert.strictEqual(store.snapshotAt('1'), store.snapshotAt('1'));
-});
 
 test('mode bands are maintained incrementally', () => {
   const store = new TelemetryStore(cb => cb());

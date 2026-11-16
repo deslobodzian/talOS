@@ -69,13 +69,9 @@ test('subsystem state and status channels are split by role', () => {
   assert.deepEqual(subsystems[0].statusChannels, ['drivetrain/status/temperature']);
 });
 
-test('selection is attached from the node whose name equals the owner', () => {
+test('selection comes from the node whose name equals the owner, else null', () => {
   const g = graph([node('drivetrain', [{sources: ['teleop', 'auto'], selected: 'teleop'}])]);
-  const subsystems = discoverSubsystems(dictionary, g);
-  assert.deepEqual(subsystems[0].selection, {sources: ['teleop', 'auto'], selected: 'teleop'});
-});
-
-test('selection is null when the graph has no matching node', () => {
-  const subsystems = discoverSubsystems(dictionary, graph([node('other', [])]));
-  assert.equal(subsystems[0].selection, null);
+  assert.deepEqual(discoverSubsystems(dictionary, g)[0].selection,
+                   {sources: ['teleop', 'auto'], selected: 'teleop'});
+  assert.equal(discoverSubsystems(dictionary, graph([node('other', [])]))[0].selection, null);
 });

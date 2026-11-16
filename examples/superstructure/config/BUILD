@@ -34,6 +34,11 @@ talos_graph_test(
     config = "robot_py.toml",
     data = PY_CONFIG_FILES,
     nodes = PY_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 manifest_sync_test(

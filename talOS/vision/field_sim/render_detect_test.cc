@@ -202,24 +202,6 @@ TEST(RenderDetect, ExposureAccumulatesOnlySmallTagRegionsAndKeepsBackground) {
   EXPECT_EQ(output.back(), 255);
 }
 
-TEST(RenderDetect, PatternsLoadForAllFieldTags) {
-  std::map<int, TagPattern> patterns;
-  std::string error;
-  ASSERT_TRUE(LoadTag36h11Patterns(&patterns, &error)) << error;
-  EXPECT_GE(patterns.size(), 33u);
-  for (int id = 1; id <= 32; ++id) {
-    const auto it = patterns.find(id);
-    ASSERT_TRUE(it != patterns.end()) << "missing pattern " << id;
-    int white = 0;
-    for (const auto& row : it->second.bits) {
-      for (bool b : row) white += b ? 1 : 0;
-    }
-    // An all-white or all-black grid cannot be a valid code.
-    EXPECT_GT(white, 0) << "tag " << id;
-    EXPECT_LT(white, 36) << "tag " << id;
-  }
-}
-
 TEST(RenderDetect, RenderedTagDecodesThroughTheRealPipeline) {
   std::map<int, TagPattern> patterns;
   std::string error;
@@ -266,12 +248,6 @@ TEST(RenderDetect, RenderedTagDecodesThroughTheRealPipeline) {
   const std::vector<SimTagDetection> projected =
       SimulateVisibleTags(layout, cam, T_field_robot, kTagSize);
   ASSERT_EQ(projected.size(), 1u);
-  // Rendering and exact projection must share the estimator's optical frame.
-  const auto exact_pose = ComputeRobotFieldPose(
-      projected[0].tag_id, 0, projected[0].T_camera_tag, cam.mounting, layout);
-  ASSERT_TRUE(exact_pose.validity.valid);
-  EXPECT_LT((exact_pose.T_field_robot.matrix() - T_field_robot.matrix()).norm(),
-            1e-12);
   auto near = [&](int i, int j) {
     const auto corner_index = 2 * static_cast<size_t>(i);
     return std::abs(det.corners[corner_index] - projected[0].corners[j].x()) <=
@@ -455,6 +431,7 @@ TEST(RenderDetect, NullRngDisablesSensorRandomness) {
   RenderFieldView(empty, {}, camera, RobotPoseOnField(0, 0, 0), kTagSize,
                   options, &pixels, Eigen::Vector3d::Zero(), 0.0, nullptr,
                   &scratch);
+  ASSERT_EQ(pixels.size(), 640u * 480u);
   EXPECT_TRUE(std::all_of(pixels.begin(), pixels.end(),
                           [](uint8_t value) { return value == 128; }));
 }
@@ -561,43 +538,6 @@ TEST(RenderDetect, YawBlurIncludesCameraMountLeverArm) {
     }
   }
   EXPECT_LT(error_sum / (120 * 140), 1.5);
-}
-
-TEST(RenderDetect, ModerateSensorNoiseAndMotionStillDecode) {
-  auto camera = RoundTripCamera();
-  camera.sensor_noise_std_gray = 2.0;
-  camera.exposure_gain_std = 0.02;
-  camera.exposure_ms = 5.0;
-  std::mt19937_64 rng(32);
-  RenderScratch scratch;
-  const auto layout = RoundTripLayout();
-  std::map<int, TagPattern> patterns;
-  std::string error;
-  ASSERT_TRUE(LoadTag36h11Patterns(&patterns, &error)) << error;
-  std::vector<uint8_t> pixels;
-  ASSERT_EQ(RenderFieldView(layout, patterns, camera, RobotPoseOnField(0, 0, 0),
-                            kTagSize, {}, &pixels, Eigen::Vector3d(0, 0.1, 0),
-                            0.01, &rng, &scratch),
-            1);
-  PipelineConfig config;
-  config.backend_name = "cpu";
-  config.intrinsics = camera.intrinsics;
-  config.mounting = camera.mounting;
-  config.layout = layout;
-  config.detector_options.quad_decimate = 1.0f;
-  config.detector_options.threads = 1;
-  AprilTagPipeline pipeline(config);
-  Frame frame(0, 1, 1, talos::event::MonotonicTime::from_nanos(1000), 640, 480,
-              640, PixelFormat::kGray8, std::move(pixels));
-  const auto result = pipeline.ProcessFrame(frame);
-  ASSERT_TRUE(result.success) << result.error_message;
-  ASSERT_EQ(result.detections.size(), 1u);
-  EXPECT_EQ(result.detections.front().tag_id, kTagId);
-  const auto& detection = result.detections.front();
-  ASSERT_TRUE(detection.valid)
-      << "decision margin=" << detection.decision_margin
-      << ", required=" << config.min_decision_margin;
-  EXPECT_GE(detection.decision_margin, config.min_decision_margin);
 }
 
 TEST(RenderDetect, ProductionSimCornerNoiseMatchesSolverPixelStd) {

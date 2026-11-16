@@ -1,0 +1,6 @@
+[subsystems.test.motors.motor]
+can_id = 1
+
+[subsystems.test.digital_inputs.digital_input]
+dio = 0
+ido = 1

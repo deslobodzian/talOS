@@ -1,0 +1,15 @@
+namespace gate;
+
+// What a producer asks for on its lane, /gate/target/<source>. The node
+// drives the motor only while the robot is enabled and a lane of its target
+// policy is live.
+struct GateTarget {
+  velocity_rps:double;
+}
+
+// What the gate is doing, published every tick.
+struct GateState {
+  enabled:bool;
+  velocity_rps:double;
+  connected:bool;
+}

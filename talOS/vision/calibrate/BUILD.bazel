@@ -21,6 +21,7 @@ cc_binary(
     srcs = ["main.cc"],
     deps = [
         ":calibration",
+        "//talOS/vision:frame_mailbox",
         "//talOS/vision/capture",
         "@opencv//:imgcodecs",
         "@opencv//:imgproc",
@@ -29,8 +30,12 @@ cc_binary(
 
 cc_test(
     name = "calibration_test",
-    size = "medium",
+    # Full-resolution rendering, ChArUco detection and SVD calibration also
+    # instrument OpenCV under ASan; keep the complete accuracy fixture.
+    # Over 5 s, heavy lane: CPU-bound rendering and calibration.
+    size = "large",
     srcs = ["calibration_test.cc"],
+    tags = ["heavy"],
     deps = [
         ":calibration",
         "@googletest//:gtest_main",

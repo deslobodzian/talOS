@@ -9,13 +9,18 @@
 // shows each series' value at the cursor. uPlot is created and torn down in
 // effects; the render body only lays out the toolbar, the channel drawer and
 // the plot container, so react-dom/server can render the empty panel in tests.
+//
+// From a recorded session the series is decimated to the plot's pixel width
+// (rounded up to a bucket size, recorded.ts POINT_SIZES):
+// each point is a bucket's last sample, and a bucket of more than one sample
+// also draws its min..max range as a vertical bar in the series colour.
 
 import {useEffect, useMemo, useRef, useState} from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 
 import {useActions, useDictionary, useEvents, usePlayback, useSeries} from '../../data/hooks';
-import type {ChannelInfo, RobotEvent} from '../../data/types';
+import type {ChannelInfo, RobotEvent, Series} from '../../data/types';
 import {channelDisplayName} from '../../ui/channel';
 import {number} from '../../ui/formatters';
 import {EmptyState} from '../../ui/primitives';
@@ -87,6 +92,36 @@ function drawEvents(u: uPlot, events: RobotEvent[], origin: bigint|null,
   }
 }
 
+// The min..max envelope of every decimated bucket that held more than one
+// sample. The live store's series carries no envelope, so nothing is drawn.
+function drawEnvelope(u: uPlot, series: Series, ordered: string[],
+                      scaleOf: Map<string, string>) {
+  if (!series.min || !series.max || !series.count) return;
+  const ctx = u.ctx;
+  const {left, top, width, height} = u.bbox;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(left, top, width, height);
+  ctx.clip();
+  ctx.globalAlpha = 0.35;
+  ctx.lineWidth = Math.max(1, globalThis.devicePixelRatio ?? 1);
+  ordered.forEach((name, k) => {
+    const min = series.min![name], max = series.max![name], count = series.count![name];
+    if (!min || !max || !count) return;
+    const scale = scaleOf.get(name) ?? 'y';
+    ctx.strokeStyle = palette[k % palette.length];
+    ctx.beginPath();
+    for (let j = 0; j < count.length; j++) {
+      if (count[j] < 2 || !Number.isFinite(min[j]) || !Number.isFinite(max[j])) continue;
+      const x = u.valToPos(series.times[j], 'x', true);
+      ctx.moveTo(x, u.valToPos(min[j], scale, true));
+      ctx.lineTo(x, u.valToPos(max[j], scale, true));
+    }
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
 function ChannelDrawer({channels, selected, onToggle}: {
   channels: ChannelInfo[];
   selected: string[];
@@ -151,9 +186,14 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
   const playback = usePlayback();
   const actions = useActions();
   const events = useEvents();
+  // The plot's width in CSS pixels: a recorded source's bucket count.
+  const [points, setPoints] = useState<number|undefined>(undefined);
   const series = useSeries(
       config.channels,
-      config.windowSeconds === null ? 'all' : {seconds: config.windowSeconds});
+      config.windowSeconds === null ? 'all' : {seconds: config.windowSeconds},
+      points);
+  const seriesRef = useRef<Series>(series);
+  seriesRef.current = series;
 
   const [drawerOpen, setDrawerOpen] = useState(true);
 
@@ -186,6 +226,8 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
         return `${k}\u0001${c?.unit ?? ''}\u0001${(c?.labels ?? []).join('\u0002')}`;
       }).join('\u0000'),
       [keySig, info]);
+  const prevWindowRef = useRef<number|null>(config.windowSeconds);
+  const prevChannelSigRef = useRef<string>(channelSig);
 
   const axes = useMemo(() => {
     const plotChannels: PlotChannel[] = keys.map(k => ({
@@ -203,6 +245,8 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     for (const a of axes) for (const ch of a.channels) m.set(ch, a.scale);
     return m;
   }, [axes]);
+  const orderedRef = useRef({ordered, scaleOf});
+  orderedRef.current = {ordered, scaleOf};
 
   const toggle = (name: string) => setConfig({
     ...config,
@@ -286,8 +330,11 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
                     originRef.current + BigInt(Math.round(sample * 1e9))) -
                     anchor.current) / 1e9);
             }],
-            draw: [u => drawEvents(
-                u, eventsRef.current, originRef.current, enabledRef.current)]
+            draw: [u => {
+              drawEnvelope(u, seriesRef.current, orderedRef.current.ordered,
+                           orderedRef.current.scaleOf);
+              drawEvents(u, eventsRef.current, originRef.current, enabledRef.current);
+            }]
           }
         },
         [[], ...ordered.map(() => [])], container);
@@ -315,12 +362,15 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     };
     container.addEventListener('wheel', pan, {passive: false});
 
-    const resize = new ResizeObserver(
-        () => plot.setSize({
-          width: Math.max(200, container.clientWidth - 24),
-          height: Math.max(160, container.clientHeight - 12)
-        }));
+    const resize = new ResizeObserver(() => {
+      plot.setSize({
+        width: Math.max(200, container.clientWidth - 24),
+        height: Math.max(160, container.clientHeight - 12)
+      });
+      setPoints(Math.max(200, container.clientWidth - 24));
+    });
     resize.observe(container);
+    setPoints(Math.max(200, container.clientWidth - 24));
 
     return () => {
       resize.disconnect();
@@ -336,6 +386,10 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
   useEffect(() => {
     const plot = chart.current;
     if (!plot) return;
+    const windowChanged = prevWindowRef.current !== config.windowSeconds ||
+        prevChannelSigRef.current !== channelSig;
+    prevWindowRef.current = config.windowSeconds;
+    prevChannelSigRef.current = channelSig;
     if (ordered.length === 0) {
       plot.setData([[], ...ordered.map(() => [])]);
       originRef.current = null;
@@ -346,9 +400,12 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     const times = Array.from(series.times);
     const values = ordered.map(
         name => Array.from(series.values[name] ?? new Float64Array(0)));
-    plot.setData(
-        [times, ...values],
-        playback.mode === 'LIVE_STREAMING' || times.length === 0);
+    const resetScales = windowChanged || playback.mode === 'LIVE_STREAMING' ||
+        times.length === 0;
+    plot.setData([times, ...values], resetScales);
+    if (windowChanged && config.windowSeconds !== null && times.length > 0 &&
+        times[0] < times[times.length - 1])
+      plot.setScale('x', {min: times[0], max: times[times.length - 1]});
     if (playback.cursor_ns && playback.mode !== 'LIVE_STREAMING')
       plot.setCursor({
         left: plot.valToPos(
@@ -356,7 +413,7 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
             'x'),
         top: 0
       });
-  }, [series, channelSig, playback.cursor_ns, playback.mode, ordered]);
+  }, [series, channelSig, config.windowSeconds, playback.cursor_ns, playback.mode, ordered]);
 
   // Redraw when events arrive or the marker toggle flips, without rebuilding.
   useEffect(() => {
@@ -380,6 +437,9 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
               value={w.value === null ? 'all' : String(w.value)}>
             {w.label}
           </option>)}
+          {config.windowSeconds !== null &&
+           !WINDOWS.some(w => w.value === config.windowSeconds) &&
+           <option value={String(config.windowSeconds)}>{config.windowSeconds} s</option>}
         </select>
       </label>
       <label className="events-toggle">
@@ -422,5 +482,6 @@ export const plotPanel: PanelDefinition<PlotConfig> = {
   description: 'Plot channels over time, with a cursor that follows playback.',
   defaultConfig,
   parseConfig,
-  component: PlotPanel
+  component: PlotPanel,
+  recorded: true
 };

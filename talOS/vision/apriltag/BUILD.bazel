@@ -9,6 +9,7 @@ cc_library(
     hdrs = ["cpu_apriltag_backend.h"],
     deps = [
         "//talOS/geometry",
+        "//talOS/process",
         "//talOS/vision:calibration",
         "//talOS/vision:localization",
         "//third_party:apriltag",
@@ -39,6 +40,8 @@ cc_test(
         ":cpu_apriltag_backend",
         ":test_image_loader",
         "//talOS/geometry",
+        "//talOS/process",
+        "//third_party:apriltag",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

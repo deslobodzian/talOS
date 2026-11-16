@@ -2,7 +2,9 @@
 // far end of each. The question this answers is the one a topic table cannot:
 // not "what topics exist" but "who is this process actually talking to".
 
-import {drivenBy, isSubscriber, rateKey, type SystemGraph, type SystemNode, type SystemSource} from '../../system';
+import {nodeLiveness} from '../../data/freshness';
+import {drivenByLine, isSubscriber, outputsHeld, rateKey, type SystemGraph, type SystemNode,
+        type SystemSource} from '../../system';
 import {hertz, integer} from '../../ui/formatters';
 import {EmptyState, StatusDot} from '../../ui/primitives';
 
@@ -14,8 +16,10 @@ const KIND_LABEL = {
 } as const;
 
 export function Wiring(
-    {graph, node, rates}:
-        {graph: SystemGraph; node: SystemNode; rates: Record<string, number>}) {
+    {graph, node, stale, rates}: {
+      graph: SystemGraph; node: SystemNode; stale: boolean;
+      rates: Record<string, number>;
+    }) {
   const peersOf = (topic: string, want: 'publishers'|'subscribers') =>
       graph.topics.find(t => t.name === topic)?.[want].filter(
           n => n !== node.name) ??
@@ -23,7 +27,8 @@ export function Wiring(
 
   const incoming = node.sources.filter(s => isSubscriber(s.kind));
   const outgoing = node.sources.filter(s => s.kind === 'SENDER');
-  const driver = drivenBy(node);
+  const live = nodeLiveness(node, {stale}) === 'live';
+  const driver = drivenByLine(node, live);
 
   // A missing peer is only dangling when nobody said it would be missing. The
   // node holding this end declared whether its far end lives outside talOS or
@@ -62,11 +67,13 @@ export function Wiring(
                          <EmptyState>Reads nothing.</EmptyState>}
     </section>
     <div className="wiring-node">
-      <StatusDot active={node.alive}/>
+      <StatusDot active={live}/>
       <b>{node.name}</b>
       <small>{node.sources.filter(s => s.kind === 'TIMER').length} timers</small>
       {driver !== null &&
-       <small className="driven-by">{`driven by ${driver}`}</small>}
+       <small className={'driven-by' + (outputsHeld(node, live) ? ' text-warn' : '')}>
+         {`driven by ${driver}`}
+       </small>}
     </div>
     <section>
       <h4>Publishes <small>{outgoing.length}</small></h4>

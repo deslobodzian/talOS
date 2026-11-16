@@ -1,0 +1,112 @@
+# The driver dashboard //studio:drive_browser_test judges (robot.toml's
+# [studio] dashboard). Format: talOS/telemetry/README.md "Dashboard layout".
+# The 12x8 grid is filled but for its bottom-right 2x2 corner, with every
+# widget kind the bench's messages can feed (a field widget needs a pose,
+# and a routine an autonomous node, which the bench has not), and every
+# channel is in the bench graph's telemetry dictionary. The subsystems
+# cell is one list column
+# wide, so the session's 7 rows (5 nodes, hardware_node, sim_gateway) show
+# whole at 1366x768 (10 fit) and 1280x720 (9), and at 1366x500 (5 fit) two
+# rows are out of view, so the test can scroll to the bottom and to a middle
+# row.
+#
+# The feed's worst case: 32 named channels (the match widget's 12 included)
+# plus the seven /hw/status alerts the alerts widget carries, 39 channels at
+# 20 Hz, is 23,872 B/s of the 24,000 budget, which covers 39 channels: one
+# more channel or alert needs a larger budget.
+
+[dashboard]
+title = "Drive"
+columns = 12
+rows = 8
+update_hz = 20
+budget_bytes_per_s = 24000
+drive_clients = 2
+
+[[widgets]]
+kind = "match"
+at = [0, 0, 4, 2]
+
+[[widgets]]
+kind = "power"
+at = [4, 0, 2, 2]
+warn_below_v = 12.0
+
+[[widgets]]
+kind = "text"
+at = [6, 0, 3, 1]
+title = "Motor mode"
+channel = "motor/state/mode"
+
+[[widgets]]
+kind = "text"
+at = [6, 1, 3, 1]
+title = "Module mode"
+channel = "swerve_module/state/mode"
+
+[[widgets]]
+kind = "alerts"
+at = [9, 0, 3, 3]
+
+[[widgets]]
+kind = "graph"
+at = [0, 2, 5, 4]
+title = "Steer"
+channels = ["swerve_module/state/steer_position_rot", "swerve_module/state/commanded_steer_position_rot", "swerve_module/state/encoder_absolute_position_rot"]
+window_s = 10
+
+[[widgets]]
+kind = "number"
+at = [5, 2, 2, 1]
+title = "Motor"
+channel = "motor/state/velocity_rps"
+precision = 1
+
+[[widgets]]
+kind = "boolean"
+at = [7, 2, 2, 1]
+title = "Motor enabled"
+channel = "motor/state/enabled"
+
+[[widgets]]
+kind = "boolean"
+at = [5, 3, 2, 1]
+title = "Module enabled"
+channel = "swerve_module/state/enabled"
+
+[[widgets]]
+kind = "boolean"
+at = [7, 3, 3, 1]
+title = "Gyro fresh"
+channel = "gyro/state/hardware_fresh"
+
+[[widgets]]
+kind = "subsystems"
+at = [10, 3, 2, 3]
+
+[[widgets]]
+kind = "number"
+at = [5, 4, 5, 1]
+title = "Yaw"
+channel = "gyro/state/yaw_rad"
+precision = 3
+
+[[widgets]]
+kind = "graph"
+at = [5, 5, 5, 3]
+title = "Drive"
+channels = ["swerve_module/state/drive_velocity_rps", "swerve_module/state/commanded_drive_velocity_rps"]
+window_s = 10
+
+[[widgets]]
+kind = "checks"
+at = [0, 6, 5, 2]
+title = "Pre-match"
+items = [
+  { label = "Battery", channel = "hw/status/battery_v", at_least = 12.5 },
+  { label = "Hardware configured", channel = "hw/status/configured", equals = true },
+  { label = "Commissioned", channel = "hw/status/commissioned", equals = true },
+  { label = "Motor", channel = "motor/state/connected", equals = true },
+  { label = "Swerve encoder", channel = "swerve_module/state/encoder_connected", equals = true },
+  { label = "Gyro", channel = "gyro/state/connected", equals = true },
+]

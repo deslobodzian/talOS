@@ -1,0 +1,6 @@
+[subsystems.test.motors.motor]
+can_id = 1
+
+[subsystems.test.pwm_outputs.pwm_output]
+channel = 0
+chanel = 1

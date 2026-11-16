@@ -2,7 +2,8 @@ import {createServer} from 'node:http';
 import {pathToFileURL} from 'node:url';
 import {WebSocket, WebSocketServer} from 'ws';
 
-import {JitterBuffer, TelemetryDecoder, Timeline} from '../src/core';
+import {type Snapshot, TelemetryDecoder} from '../src/core';
+import {TelemetryHistory} from '../src/history';
 import {
   type DeclaredGraph,
   declaredStatus,
@@ -10,12 +11,17 @@ import {
   MAX_DECLARED_BYTES,
   MAX_SYSTEM_BYTES,
   parseDeclaredGraph,
-  parseSystemGraph,
   RateWindow,
   type SystemGraph,
+  SystemGraphStream,
 } from '../src/system';
 
 import {handleRpc, type RpcContext} from './rpc';
+
+// The most requests one JSON-RPC batch may carry. 64 KiB of text holds
+// hundreds of scan_channel_events requests, each a pass over the whole
+// retained timeline on the one thread that also ingests telemetry.
+export const MAX_BATCH = 16;
 
 export function startAgent(
     port = Number(process.env.AGENT_PORT ?? 5804),
@@ -23,10 +29,19 @@ export function startAgent(
   // Reject DNS rebinding to loopback as well as browser-originated requests.
   const allowedHost = (host: string|undefined) =>
       !!host && /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
-  const timeline = new Timeline();
-  let jitter = new JitterBuffer(10);
   const decoder = new TelemetryDecoder();
-  let streamId: string|null = null;
+  // Stream and sequence ids whose age is unknown, as in the Studio worker: the
+  // keyframe the bridge sends on every open carries the latest tick it holds
+  // -- possibly long before this connection, if telemetry has stopped.
+  const unknownAge = new Set<string>();
+  const ageKey = (f: Snapshot) => `${f.stream_id}:${f.sequence_id}`;
+  // The same retained history as the Studio worker's (history.ts): a producer
+  // restart within a launcher session continues it, a new session replaces
+  // it. An arrival of 0 is Timeline's "no known arrival": get_latest then
+  // reports the age as null rather than as the age of the connection.
+  const history = new TelemetryHistory(
+      {arrival: f => unknownAge.delete(ageKey(f)) ? 0 : Date.now()});
+  let firstUpdate = false;
 
   // `previousSystem` is the sample just before this one: what changed since
   // the last refresh. Rates need a wider baseline than that -- one refresh
@@ -34,7 +49,13 @@ export function startAgent(
   let system: SystemGraph|null = null;
   let previousSystem: SystemGraph|null = null;
   const rateWindow = new RateWindow();
-  const graphs = {received: 0, invalid: 0};
+  // Whole graphs and their change-only updates, applied in order.
+  const graphStream = new SystemGraphStream();
+  // Graphs received (whole or updated), deferral notices, and rejects.
+  const graphs = {received: 0, deferred: 0, invalid: 0};
+  // performance.now() when `system` arrived: a hung bridge sends nothing, and
+  // only the graph's age can say so.
+  let systemArrivalMs: number|null = null;
 
   // What the launcher declared before it spawned anything. Fetched over HTTP
   // from the same origin as the telemetry socket rather than pushed: the
@@ -43,8 +64,15 @@ export function startAgent(
   let declared: DeclaredGraph|null = null;
   let declaredError = '';
 
-  const context = (): RpcContext =>
-      ({timeline, system, previousSystem, rateWindow, declared});
+  const context = (): RpcContext => ({
+    timeline: history.timeline,
+    system,
+    previousSystem,
+    rateWindow,
+    declared,
+    systemArrivalMs,
+    connected: socket?.readyState === WebSocket.OPEN
+  });
 
   // A malformed document is reported and dropped, keeping the last good graph:
   // the same rule the live graph follows, for the same reason.
@@ -66,7 +94,11 @@ export function startAgent(
     if (!target) return;
     try {
       const response = await fetch(target, {cache: 'no-store'});
-      if (response.status === 404) return;
+      if (response.status === 404) {
+        declared = null;
+        declaredError = '';
+        return;
+      }
       if (!response.ok) {
         declaredError = `Declared graph unavailable: HTTP ${response.status}`;
         return;
@@ -87,11 +119,17 @@ export function startAgent(
 
   const ingestSystemGraph = (text: string) => {
     try {
-      const parsed = parseSystemGraph(text);
+      const parsed = graphStream.ingest(text, performance.now());
+      systemArrivalMs = graphStream.arrival;
+      if (!parsed) {  // deferred by the budget, not lost
+        graphs.deferred++;
+        return;
+      }
+      graphs.received++;
       previousSystem = system;
       system = parsed;
       rateWindow.push(parsed);
-      graphs.received++;
+      history.observe(parsed);
     } catch {
       // A malformed document is counted and dropped. Blanking the last good
       // graph would turn one bad frame into "nothing is running", which is a
@@ -109,6 +147,15 @@ export function startAgent(
             jsonrpc: '2.0',
             id: null,
             error: {code: -32600, message: 'Empty batch'}
+          };
+        if (input.length > MAX_BATCH)
+          return {
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32600,
+              message: `Batch exceeds ${MAX_BATCH} requests`
+            }
           };
         // One context for the whole batch, so every request in it sees the
         // same system state.
@@ -137,14 +184,15 @@ export function startAgent(
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({
         connected: socket?.readyState === WebSocket.OPEN,
-        frames: timeline.frames.length,
-        stats: jitter.stats,
+        frames: history.timeline.frames.length,
+        stats: history.jitter.stats,
         // Whether the shape of the system is known, separately from whether
         // telemetry is arriving: a node can be publishing frames while the
         // registry is unreadable, and the reverse.
         system: {
           received: graphs.received > 0,
           graphs: graphs.received,
+          deferred: graphs.deferred,
           invalid: graphs.invalid,
           nodes: system?.nodes.length ?? 0,
           nodes_alive: system?.nodes.filter(node => node.alive).length ?? 0,
@@ -197,11 +245,16 @@ export function startAgent(
     ws.handleUpgrade(
         req, socket, head, client => ws.emit('connection', client, req));
   });
-  ws.on('connection', client => client.on('message', raw => {
-    const response = parse(raw.toString());
-    if (response !== undefined && client.bufferedAmount < 1024 * 1024)
-      client.send(JSON.stringify(response));
-  }));
+  ws.on('connection', client => {
+    client.on('error', () => {
+      try { client.close(); } catch {}
+    });
+    client.on('message', raw => {
+      const response = parse(raw.toString());
+      if (response !== undefined && client.bufferedAmount < 1024 * 1024)
+        client.send(JSON.stringify(response));
+    });
+  });
   let socket: WebSocket|undefined;
   let retry: NodeJS.Timeout|undefined;
   let stopped = false;
@@ -209,7 +262,7 @@ export function startAgent(
     // The upstream carries two message families now. A telemetry frame is at
     // most 16,384 bytes, but a system graph describing every node on every
     // topic is far larger, and a payload cap below it would drop the
-    // connection instead of the message. parseSystemGraph enforces the real
+    // connection instead of the message. SystemGraphStream enforces the real
     // bound.
     socket = new WebSocket(upstream, {maxPayload: MAX_SYSTEM_BYTES});
     socket.on('message', (raw, binary) => {
@@ -224,31 +277,39 @@ export function startAgent(
             raw instanceof ArrayBuffer   ? new Uint8Array(raw) :
                                            raw;
         for (const frame of decoder.decodeAll(bytes)) {
-          // A new stream restarts sequence and timestamp, so retained history
-          // from the old producer would reject every new frame. Drop it.
-          if (streamId !== null && frame.stream_id !== streamId) {
-            timeline.clear();
-            jitter = new JitterBuffer(10);
-          }
-          streamId = frame.stream_id;
-          jitter.push(frame, performance.now());
+          if (!history.push(frame, decoder.currentDictionary(),
+                            performance.now()))
+            continue;
+          if (firstUpdate) unknownAge.add(ageKey(frame));
+          firstUpdate = false;
         }
       } catch {
-        jitter.stats.invalid++;
+        history.jitter.stats.invalid++;
       }
     });
     socket.on('open', () => {
+      // The bridge answers an open with its graph and then, when it has
+      // them, the dictionary and a keyframe of its latest tick, whose age is
+      // unknown: the first update on a socket.
+      firstUpdate = true;
+      unknownAge.clear();
       // Asked for on every open: the bridge may have started after this
       // process did, and the first attempt would have had nothing to answer it.
       void fetchDeclaredGraph();
     });
     socket.on('error', () => {});
     socket.on('close', () => {
+      // A graph from a lost connection would keep reporting its nodes alive;
+      // get_system_graph answers "no graph" until the bridge sends a new one.
+      system = null;
+      previousSystem = null;
+      systemArrivalMs = null;
+      graphStream.reset();
       if (!stopped) retry = setTimeout(connect, 1000);
     });
   }
   const tick = setInterval(() => {
-    for (const frame of jitter.flush(performance.now())) timeline.append(frame);
+    history.flush(performance.now());
   }, 5);
   server.listen(
       port, '127.0.0.1',
@@ -266,7 +327,9 @@ export function startAgent(
   };
   return {
     server,
-    timeline,
+    get timeline() {
+      return history.timeline;
+    },
     close,
     graphs,
     // Exposed so a caller can inject a graph or read the current one without

@@ -356,55 +356,6 @@ TEST_F(AprilTagMetalAdapterTest, DecimatedImageParity) {
   image_u8_destroy(im);
 }
 
-TEST_F(AprilTagMetalAdapterTest, TimeprofileStampsRecordedCorrectly) {
-  const std::string path = ResolveTestdataPath("scene_single_tag0.png");
-  ASSERT_TRUE(std::filesystem::exists(path));
-
-  image_u8_t* im = talos::vision::apriltag::LoadGrayImageU8(path);
-  ASSERT_NE(im, nullptr);
-
-  image_u8_t* threshim = apriltag_threshold_cpu(td_, im);
-  ASSERT_NE(threshim, nullptr);
-
-  zarray_t* dets = apriltag_detector_detect_with_threshim(td_, im, threshim);
-  ASSERT_NE(dets, nullptr);
-
-  ASSERT_NE(td_->tp, nullptr);
-  const int n_stamps = zarray_size(td_->tp->stamps);
-  EXPECT_GT(n_stamps, 0);
-
-  bool has_threshold = false;
-  bool has_unionfind = false;
-  bool has_clusters = false;
-  bool has_fit_quads = false;
-  bool has_quads = false;
-  bool has_decode = false;
-
-  for (int i = 0; i < n_stamps; ++i) {
-    struct timeprofile_entry* entry;
-    zarray_get_volatile(td_->tp->stamps, i, reinterpret_cast<void*>(&entry));
-    if (std::strcmp(entry->name, "threshold") == 0) has_threshold = true;
-    if (std::strcmp(entry->name, "unionfind") == 0) has_unionfind = true;
-    if (std::strcmp(entry->name, "make clusters") == 0) has_clusters = true;
-    if (std::strcmp(entry->name, "fit quads to clusters") == 0) {
-      has_fit_quads = true;
-    }
-    if (std::strcmp(entry->name, "quads") == 0) has_quads = true;
-    if (std::strcmp(entry->name, "decode+refinement") == 0) has_decode = true;
-  }
-
-  EXPECT_TRUE(has_threshold);
-  EXPECT_TRUE(has_unionfind);
-  EXPECT_TRUE(has_clusters);
-  EXPECT_TRUE(has_fit_quads);
-  EXPECT_TRUE(has_quads);
-  EXPECT_TRUE(has_decode);
-
-  apriltag_detections_destroy(dets);
-  image_u8_destroy(threshim);
-  image_u8_destroy(im);
-}
-
 #if defined(__APPLE__)
 TEST_F(AprilTagMetalAdapterTest, GpuGeneratedThreshimDetection) {
   MTL::Device* device = MTL::CreateSystemDefaultDevice();

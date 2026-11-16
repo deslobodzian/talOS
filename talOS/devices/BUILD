@@ -19,12 +19,12 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//talOS/bridge:boot_history",
         "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/hardware",
-        "//talOS/hardware:gate",
         "//talOS/introspection:names",
         "//talOS/node",
     ],
@@ -39,12 +39,32 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":devices",
+        "//talOS/bridge:can_buses",
         "//talOS/bridge:clock_offset",
+        "//talOS/bridge:merge",
+        "//talOS/bridge:messages",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/introspection:names",
+        "//talOS/node:testing",
+        "//talOS/protocol",
+    ],
+)
+
+cc_test(
+    name = "testing_test",
+    size = "small",
+    srcs = ["testing_test.cc"],
+    deps = [
+        ":devices",
+        ":testing",
         "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/node:testing",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -78,6 +98,7 @@ cc_test(
         ":target_test_message",
         ":testing",
         "//talOS/driver_station",
+        "//talOS/hardware",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],

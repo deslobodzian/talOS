@@ -1,8 +1,10 @@
+#include <chrono>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
 
 #include "node.h"
+#include "talOS/events/log/log_writer.h"
 #include "talOS/introspection/describe.h"
 
 int main(int argc, char** argv) {
@@ -20,6 +22,8 @@ int main(int argc, char** argv) {
     uint64_t session_id = 0;
     bool describe = false;
     std::string log_path;
+    uint64_t log_max_bytes = 0;
+    std::chrono::nanoseconds log_window{0};
 
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
@@ -28,9 +32,9 @@ int main(int argc, char** argv) {
       } else if (arg == "--remote" && i + 1 < argc) {
         remote_cli = argv[++i];
       } else if (arg == "--remote-port" && i + 1 < argc) {
-        remote_port_cli = static_cast<uint16_t>(std::stoi(argv[++i]));
+        remote_port_cli = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--local-port" && i + 1 < argc) {
-        local_port_cli = static_cast<uint16_t>(std::stoi(argv[++i]));
+        local_port_cli = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--duration-s" && i + 1 < argc) {
         duration_s = std::stoi(argv[++i]);
       } else if (arg == "--sim") {
@@ -39,13 +43,18 @@ int main(int argc, char** argv) {
         describe = true;
       } else if (arg == "--log" && i + 1 < argc) {
         log_path = argv[++i];
+      } else if (arg == "--log-max-bytes" && i + 1 < argc) {
+        log_max_bytes = std::stoull(argv[++i]);
+      } else if (arg == "--log-window-us" && i + 1 < argc) {
+        log_window = talos::event::log::ParseLogWindowUs(argv[++i]);
       } else if (arg == "--session-id" && i + 1 < argc) {
         session_id = std::stoull(argv[++i]);
       } else {
         throw std::invalid_argument(
             "usage: hardware_node --config PATH [--remote IP] "
             "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
-            "[--sim] [--log PATH] [--session-id ID] [--describe]");
+            "[--sim] [--log PATH] [--log-max-bytes N] [--log-window-us N] "
+            "[--session-id ID] [--describe]");
       }
     }
 
@@ -53,10 +62,21 @@ int main(int argc, char** argv) {
       throw std::invalid_argument(
           "usage: hardware_node --config PATH [--remote IP] "
           "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
-          "[--sim] [--log PATH] [--session-id ID] [--describe]");
+          "[--sim] [--log PATH] [--log-max-bytes N] [--log-window-us N] "
+          "[--session-id ID] [--describe]");
     }
 
     auto robot_config = talos::config::ParseRobotConfig(config_path);
+    // A simulation config (its gains, bindings and travel) never reaches a
+    // controller, whoever started this bridge (REQ-SAFE-40): refused before a
+    // socket opens. --describe opens nothing, so the launcher's
+    // --describe-only probe without --sim still answers.
+    if (robot_config.simulation_only && !simulation && !describe) {
+      throw std::invalid_argument(
+          config_path +
+          " sets [robot] simulation_only = true; hardware_node runs it only "
+          "with --sim");
+    }
     const std::string remote_ip =
         talos::config::ResolveControllerAddress(robot_config, remote_cli);
     const uint16_t remote_port =
@@ -69,7 +89,9 @@ int main(int argc, char** argv) {
                                        local_port,
                                        simulation,
                                        session_id,
-                                       std::move(log_path)};
+                                       std::move(log_path),
+                                       log_max_bytes,
+                                       log_window};
 
     // --describe answers out of the constructor alone: no socket, no shared
     // memory, no registry slot, nothing the real node holds. That is what lets

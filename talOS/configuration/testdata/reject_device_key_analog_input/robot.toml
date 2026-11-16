@@ -1,0 +1,6 @@
+[subsystems.test.motors.motor]
+can_id = 1
+
+[subsystems.test.analog_inputs.analog_input]
+channel = 0
+chanel = 1

@@ -1,7 +1,9 @@
 // Pure derivations for the vision panel: no React, no store, no worker. Each
 // helper takes plain aligned arrays (or scalars) so the panel and its tests
 // call them identically. NaN / absent is "no reading", never zero; a counter
-// that reset is "unknown", never a negative delta.
+// that reset contributes no increment, never a negative delta.
+
+import {STALE_AFTER_NS} from '../../data/freshness';
 
 export type Planar = {x: number; y: number};
 
@@ -37,32 +39,37 @@ export function disagreement(camera: Planar, estimator: Planar): number {
   return Math.hypot(camera.x - estimator.x, camera.y - estimator.y);
 }
 
-// The most recent pose whose `valid` sample is 1, walking back from the cursor.
+// The most recent pose whose `valid` sample is 1, walking back from the cursor
+// (the window's last sample). An observation as old as the stale threshold is
+// not compared with the current estimate: the robot has moved since. `times`
+// are seconds, aligned with the other columns.
 export function latestValidPose(
-    x: ArrayLike<number>, y: ArrayLike<number>,
+    times: ArrayLike<number>, x: ArrayLike<number>, y: ArrayLike<number>,
     valid: ArrayLike<number>): Planar|null {
-  for (let i = valid.length - 1; i >= 0; i--) {
+  const now = times[times.length - 1];
+  const maxAge = Number(STALE_AFTER_NS) / 1e9;
+  for (let i = valid.length - 1; i >= 0 && now - times[i] < maxAge; i--) {
     if (valid[i] === 1 && finite(x[i]) && finite(y[i]))
       return {x: x[i] as number, y: y[i] as number};
   }
   return null;
 }
 
-// Change in a monotonic counter over a window: last finite reading minus the
-// first. Null when there are no readings or the counter went backwards (a
-// reset, which a viewer must not render as a negative drop).
+// Increase of a monotonic counter over a window: the sum of the nonnegative
+// steps between consecutive finite readings. A reset (a step down) adds
+// nothing, so neither a negative drop nor a fake jump across the reset is
+// reported; increments before the first reading or hidden by a reset are
+// unknown and excluded. Null when there are no readings.
 export function counterDelta(values: ArrayLike<number>): number|null {
-  let first: number | undefined;
-  let last: number | undefined;
+  let prev: number | undefined;
+  let delta = 0;
   for (let i = 0; i < values.length; i++) {
     const v = values[i];
     if (!finite(v)) continue;
-    if (first === undefined) first = v;
-    last = v;
+    if (prev !== undefined && v > prev) delta += v - prev;
+    prev = v;
   }
-  if (first === undefined || last === undefined) return null;
-  const delta = last - first;
-  return delta < 0 ? null : delta;
+  return prev === undefined ? null : delta;
 }
 
 // Frame rate from a frame period in microseconds; null when absent/nonpositive.

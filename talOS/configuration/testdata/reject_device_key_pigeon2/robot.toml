@@ -1,0 +1,10 @@
+[subsystems.test.motors.motor]
+can_id = 1
+
+[subsystems.test.sensors.pigeon2]
+type = "Pigeon2"
+bus = "rio"
+can_id = 3
+inverted = true
+offset_rot = -0.125
+offest_rot = 0.25

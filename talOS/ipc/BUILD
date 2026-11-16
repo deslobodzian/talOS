@@ -33,6 +33,7 @@ cc_test(
     deps = [
         ":ipc",
         ":ipc_test_message",
+        "//talOS/rtms:wake",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],

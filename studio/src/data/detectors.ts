@@ -166,6 +166,10 @@ function incrementDetector(options: IncrementOptions): FrameDetector & {reset():
           run.lastAdvance_ns = ts;
         } else {
           run.stillIncreasing = false;
+          if (value < run.lastValue) {
+            run.lastValue = value;
+            run.lastAdvance_ns = ts;
+          }
         }
 
         if (run.pending) {
@@ -241,20 +245,27 @@ export function createFrameDetectors(): FrameDetector[] {
   // Link configuration lost/regained.
   boolEdge('link-configured', 'hw/status/configured', 'hardware',
            'Link configured', 'Link not configured', 'info', 'warn'),
-  // Fault and timeout masks: any change, with the set bits in the detail.
+  // Motor faults distinguish newly set bits from resolved bits.
   {
     id: 'link-fault-mask',
     detect(prev, next) {
       const a = val(prev, 'hw/status/motor_fault_mask'),
             b = val(next, 'hw/status/motor_fault_mask');
       if (a === undefined || b === undefined || a === b) return [];
-      return [{
-        severity: 'warn',
-        category: 'hardware',
-        title: 'Motor fault mask changed',
-        detail: maskDetail(b),
-        channel: 'hw/status/motor_fault_mask'
-      }];
+      const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
+      const added = after & ~before, cleared = before & ~after;
+      return [
+        ...(added ? [{
+          severity: 'warn' as const, category: 'hardware' as const,
+          title: 'Motor fault bits set', detail: maskDetail(Number(added)),
+          channel: 'hw/status/motor_fault_mask'
+        }] : []),
+        ...(cleared ? [{
+          severity: 'info' as const, category: 'hardware' as const,
+          title: 'Motor fault bits resolved', detail: maskDetail(Number(cleared)),
+          channel: 'hw/status/motor_fault_mask'
+        }] : [])
+      ];
     }
   },
   {
@@ -263,22 +274,41 @@ export function createFrameDetectors(): FrameDetector[] {
       const a = val(prev, 'hw/status/timed_out_mask'),
             b = val(next, 'hw/status/timed_out_mask');
       if (a === undefined || b === undefined || a === b) return [];
-      return [{
-        severity: 'warn',
-        category: 'hardware',
-        title: 'Timed-out mask changed',
-        detail: maskDetail(b),
-        channel: 'hw/status/timed_out_mask'
-      }];
+      // A bit is set only while that subsystem's requests have been silent
+      // for its owner timeout on a ready link (bit i: the i-th
+      // actuator-owning subsystem in sorted name order), and every bit
+      // clears while the gateway is not configured: a set bit is the
+      // problem, a cleared one its end.
+      const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
+      const added = after & ~before, cleared = before & ~after;
+      return [
+        ...(added ? [{
+          severity: 'warn' as const, category: 'hardware' as const,
+          title: 'Subsystem requests timed out',
+          detail: `subsystem ${maskDetail(Number(added))}`,
+          channel: 'hw/status/timed_out_mask'
+        }] : []),
+        ...(cleared ? [{
+          severity: 'info' as const, category: 'hardware' as const,
+          title: 'Subsystem request timeouts cleared',
+          detail: `subsystem ${maskDetail(Number(cleared))}`,
+          channel: 'hw/status/timed_out_mask'
+        }] : [])
+      ];
     }
   },
   // Link counters, reported as runs: gateway counts and identity rejections
   // (warn: an obsolete request from before a reconfiguration or epoch change
   // is dropped by design), ownership rejections (error: a subsystem
   // addressed a device it does not own), clock resets (info). `gateway_rejected_command_count`
-  // is deferred and classified: while the robot is not enabled the gateway
-  // refuses commands as designed, so the run is only a warning when the Driver
-  // Station stays enabled for half a second of continuous increments.
+  // is deferred and classified. The gateway does not count an all-neutral
+  // command that lost a race with an epoch change, nor a neutral of the
+  // current epoch while it is unconfigured, uncommissioned or disabled
+  // (Gateway::Accept); it counts every other refused command and,
+  // while it could drive but is faulted, configuring or unhealthy, every
+  // refused neutral (TODO RT-12). The run is only a warning
+  // when the Driver Station stays enabled for half a second of continuous
+  // increments.
   incrementDetector({
     id: 'counter-gateway',
     match: name => /^hw\/status\/gateway_[^/]*_count$/.test(name),
@@ -418,7 +448,8 @@ export const SYSTEM_DETECTORS: SystemDetector[] = [
       return drafts;
     }
   },
-  // pid or generation change: the node was replaced.
+  // pid or generation change within one launcher session: the node was
+  // replaced. A different session id is a new launch, not a restart.
   {
     id: 'node-restarted',
     detect(prev, next) {
@@ -426,7 +457,14 @@ export const SYSTEM_DETECTORS: SystemDetector[] = [
       for (const node of next.nodes) {
         const before = prev?.nodes.find(n => n.name === node.name);
         if (!before) continue;
-        if (before.pid !== node.pid || before.generation !== node.generation) {
+        if (before.session_id !== node.session_id) {
+          drafts.push({
+            severity: 'info',
+            category: 'system',
+            title: `${node.name} started in a new session`,
+            detail: `session ${before.session_id} → ${node.session_id}`
+          });
+        } else if (before.pid !== node.pid || before.generation !== node.generation) {
           drafts.push({
             severity: 'warn',
             category: 'system',
@@ -446,9 +484,10 @@ export const SYSTEM_DETECTORS: SystemDetector[] = [
       for (const node of next.nodes) {
         const before = prev?.nodes.find(n => n.name === node.name);
         if (!before) continue;
-        const beforeSelections = new Map(before.selections.map(s => [selectionKey(s), s]));
-        for (const selection of node.selections) {
-          const prior = beforeSelections.get(selectionKey(selection));
+        const beforeSelections = new Map(before.selections.map(
+            (s, i) => [`${i}:${selectionKey(s)}`, s]));
+        for (const [i, selection] of node.selections.entries()) {
+          const prior = beforeSelections.get(`${i}:${selectionKey(selection)}`);
           if (prior && prior.selected !== selection.selected) {
             drafts.push({
               severity: 'info',

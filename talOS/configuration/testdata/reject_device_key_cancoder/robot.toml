@@ -1,0 +1,10 @@
+[subsystems.test.motors.motor]
+can_id = 1
+
+[subsystems.test.sensors.cancoder]
+type = "CANcoder"
+bus = "rio"
+can_id = 2
+inverted = true
+offset_rot = 0.25
+offest_rot = 0.25

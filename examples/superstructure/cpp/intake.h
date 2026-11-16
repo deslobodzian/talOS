@@ -1,83 +1,77 @@
 #pragma once
 
-#include <chrono>
-#include <optional>
-
 #include "demo/intake_generated.h"
 #include "demo/topics.h"
 #include "talOS/devices/devices.h"
+#include "talOS/mechanisms/roller_with_sensor.h"
 #include "talOS/node/node.h"
 
 namespace demo {
 
-// Roller + beam break. Pulls a piece in, holds it once the beam breaks, and
-// spits it out for a fixed time when asked, on its target lane
-// (/intake/target/<source>, see [targets] in intake.toml).
+// Roller + beam break, as a talos::mechanisms::RollerWithSensor named
+// "roller": [motors.roller], and its [roller] parameters (voltages, eject
+// time, the beam break's device name) in intake.toml. Pulls a piece in,
+// holds it once the beam breaks, and spits it out for a fixed time when
+// asked, on its target lane (/intake/target/<source>, see [targets] in
+// intake.toml).
 //
-// With no target (robot disabled, lane stale, released or never sent) it
-// behaves as asked for IDLE and drives nothing: the roller is neutral, while
-// the state machine still tracks the beam break and finishes a timed eject.
+// With no target (lane stale, released or never sent) it behaves as asked
+// for IDLE and drives nothing: the roller is neutral, while the state
+// machine still tracks the beam break and finishes a timed eject. Losing
+// enable (robot disabled, stale link) also cancels an eject or intake in
+// progress; a held piece stays HOLDING.
 class Intake {
  public:
-  using State = IntakeState;  // IDLE, INTAKING, HOLDING, EJECTING
-
   explicit Intake(talos::Node& node)
       : roller_{node, "roller"},
-        beam_break_{node, "beam_break"},
         goal_{node},
-        status_{node.publish<IntakeStatus>(topics::kIntakeStatus)},
-        sm_{node, State::IDLE},
-        intake_volts_{node.param<double>("intake_v")},
-        hold_volts_{node.param<double>("hold_v")},
-        eject_volts_{node.param<double>("eject_v")},
-        eject_time_{std::chrono::microseconds{node.param<int>("eject_us")}} {}
+        status_{node.publish<IntakeStatus>(topics::kIntakeStatus)} {}
 
   void update() {
-    const IntakeGoal* goal = goal_.get();
-    const IntakeCommand command =
-        goal != nullptr ? goal->command() : IntakeCommand::IDLE;
-    const bool has_piece = beam_break_.get();
-    std::optional<double> volts;  // IDLE: none, neutral
-
-    switch (sm_.state()) {
-      case State::IDLE:
-        if (command == IntakeCommand::INTAKE) sm_.go(State::INTAKING);
-        break;
-      case State::INTAKING:
-        volts = intake_volts_;
-        if (has_piece)
-          sm_.go(State::HOLDING);
-        else if (command == IntakeCommand::IDLE)
-          sm_.go(State::IDLE);
-        else if (command == IntakeCommand::EJECT)
-          sm_.go(State::EJECTING);
-        break;
-      case State::HOLDING:
-        volts = hold_volts_;
-        if (command == IntakeCommand::EJECT)
-          sm_.go(State::EJECTING);
-        else if (!has_piece)
-          sm_.go(State::IDLE);  // dropped it
-        break;
-      case State::EJECTING:
-        volts = eject_volts_;
-        if (sm_.time_in_state() >= eject_time_) sm_.go(State::IDLE);
-        break;
+    if (const IntakeGoal* goal = goal_.get()) {
+      roller_.set_goal(ToRoller(goal->command()));
+    } else {
+      roller_.stop();
     }
-    // Only a live target drives the roller; anything not set this tick is
-    // neutral.
-    if (goal != nullptr && volts) roller_.set_voltage(*volts);
-    status_.send(IntakeStatus{sm_.state(), has_piece});
+    roller_.update();
+    status_.send(IntakeStatus{ToState(roller_.phase()), roller_.has_piece()});
   }
 
  private:
-  talos::Motor roller_;
-  talos::DigitalInput beam_break_;
+  using RollerCommand = talos::mechanisms::RollerCommand;
+  using RollerPhase = talos::mechanisms::RollerPhase;
+
+  static RollerCommand ToRoller(IntakeCommand command) {
+    switch (command) {
+      case IntakeCommand::INTAKE:
+        return RollerCommand::kIntake;
+      case IntakeCommand::EJECT:
+        return RollerCommand::kEject;
+      case IntakeCommand::IDLE:
+        break;
+    }
+    return RollerCommand::kIdle;
+  }
+  // The intake never asks to feed, so kFeeding does not occur; it would
+  // read as EJECTING (a timed run).
+  static IntakeState ToState(RollerPhase phase) {
+    switch (phase) {
+      case RollerPhase::kIntaking:
+        return IntakeState::INTAKING;
+      case RollerPhase::kHolding:
+        return IntakeState::HOLDING;
+      case RollerPhase::kEjecting:
+      case RollerPhase::kFeeding:
+        return IntakeState::EJECTING;
+      case RollerPhase::kIdle:
+        break;
+    }
+    return IntakeState::IDLE;
+  }
+
+  talos::mechanisms::RollerWithSensor roller_;
   talos::Target<IntakeGoal> goal_;
   talos::Publisher<IntakeStatus> status_;
-  talos::StateMachine<State> sm_;
-  double intake_volts_, hold_volts_, eject_volts_;
-  talos::Duration eject_time_;
 };
 
 }  // namespace demo

@@ -1,0 +1,12 @@
+# talOS's build flags (C++23, the Python runfiles flags, the sanitizer,
+# release and test-lane configs), imported from the talOS checkout that
+# MODULE.bazel's local_path_override names, by the same path (with talOS as
+# the git submodule talos/: `import %workspace%/talos/talos.bazelrc`).
+# //:talos_pin_test fails when the two name different checkouts.
+import %workspace%/../../talos.bazelrc
+
+# This repository's own flags follow.
+
+# `bazel build --config=release //:robot_bundle` records this repository's
+# git revision in the bundle (talOS's status script, run from here).
+build:release --workspace_status_command=../../tools/workspace_status.sh

@@ -32,7 +32,8 @@ import {
   split,
   splitNode,
 } from '../src/layout/tree';
-import type {SplitNode} from '../src/layout/types';
+import type {LayoutNode, SplitNode} from '../src/layout/types';
+import {exportWorkspace, importWorkspace} from '../src/layout/workspace';
 
 const p = (panelId: string, instanceId: string) =>
     panelNode(panelId, instanceId, undefined);
@@ -48,13 +49,6 @@ test('normalizeSizes turns arbitrary values into fractions that sum to 1',
 
        // Non-finite and non-positive values fall back to an equal share.
        assert.deepEqual(normalizeSizes([NaN, -1]), [0.5, 0.5]);
-     });
-
-test('normalizeSizes holds every share at or above the minimum when possible',
-     () => {
-       const [small, large] = normalizeSizes([0.001, 1]);
-       assert.ok(small >= MIN_PANEL_SIZE - 1e-9, `small=${small}`);
-       assert.ok(Math.abs(small + large - 1) < 1e-9);
      });
 
 test('normalizeSizes pins small shares and redistributes proportionally until stable', () => {
@@ -129,14 +123,6 @@ test('nudge shifts a share from one neighbour to the other', () => {
   const next = nudge(root, [], 0, 0.1) as SplitNode;
   assert.ok(next.sizes[0] > root.sizes[0]);
   assert.ok(Math.abs(next.sizes[0] + next.sizes[1] - 1) < 1e-9);
-});
-
-test('parseWorkspace round-trips a valid workspace unchanged', () => {
-  const root = splitNode('row', [p('health', 'a'), p('field', 'b')]);
-  const ws = {version: 1 as const, activePage: 'pg', pages: [
-    {id: 'pg', title: 'Robot', root}
-  ]};
-  assert.deepEqual(parseWorkspace(JSON.parse(serialize(ws))), ws);
 });
 
 test('parseWorkspace rejects unreadable documents with an empty workspace',
@@ -242,3 +228,42 @@ test('the default workspace opens one page per default preset, first active',
        assert.equal(workspace.activePage, workspace.pages[0].id);
        for (const page of workspace.pages) assert.ok(countPanels(page.root) >= 1);
      });
+
+test('parseWorkspace gives duplicate panel instances unique ids across all pages', () => {
+  const root = splitNode('row', [
+    p('health', 'duplicate'),
+    splitNode('column', [p('plot', 'duplicate'), p('field', 'unique')])
+  ]);
+  const workspace = parseWorkspace({
+    version: 1,
+    activePage: 'one',
+    pages: [
+      {id: 'one', title: 'One', root},
+      {id: 'two', title: 'Two', root: p('timing', 'duplicate')}
+    ]
+  });
+  const ids: string[] = [];
+  const collect = (node: LayoutNode): void => {
+    if (node.type === 'panel') ids.push(node.instanceId);
+    else node.children.forEach(collect);
+  };
+  workspace.pages.forEach(page => collect(page.root));
+  assert.equal(ids.length, 4);
+  assert.equal(new Set(ids).size, 4);
+  assert.equal(ids[0], 'duplicate');
+  assert.equal(ids[2], 'unique');
+  assert.deepEqual(workspace.pages.map(page => listPanelIds(page.root)),
+                   [['health', 'plot', 'field'], ['timing']]);
+  assert.deepEqual(parseWorkspace(JSON.parse(serialize(workspace))), workspace);
+});
+
+test('workspace import rejects invalid documents without substituting defaults', () => {
+  for (const raw of [
+    {}, null, [], {version: 2, pages: []}, {version: 1, pages: []},
+    {version: 1, pages: [{id: 'broken', root: {type: 'panel'}}]}
+  ]) {
+    assert.throws(() => importWorkspace(JSON.stringify(raw)));
+  }
+  const workspace = defaultWorkspace();
+  assert.deepEqual(importWorkspace(exportWorkspace(workspace)), workspace);
+});

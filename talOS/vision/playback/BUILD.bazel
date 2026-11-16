@@ -1,0 +1,43 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# A recording on disk (image files plus their timeline) and the CameraSource
+# that plays it into the camera node. Video files are decoded to an image
+# sequence first (decode_video.sh): the repo's OpenCV videoio has no FFmpeg.
+cc_library(
+    name = "playback",
+    srcs = [
+        "image_sequence.cc",
+        "recorded_source.cc",
+    ],
+    hdrs = [
+        "image_sequence.h",
+        "recorded_source.h",
+    ],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/vision:camera_source",
+        "//talOS/vision:frame",
+        "//talOS/vision/capture",
+        "@opencv//:core",
+        "@opencv//:imgcodecs",
+    ],
+)
+
+cc_test(
+    name = "playback_test",
+    size = "small",
+    srcs = ["playback_test.cc"],
+    deps = [
+        ":playback",
+        "//talOS/vision:pipeline",
+        "//talOS/vision/field_sim",
+        "//talOS/vision/field_sim:field_sim_patterns",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@opencv//:core",
+        "@opencv//:imgcodecs",
+    ],
+)
