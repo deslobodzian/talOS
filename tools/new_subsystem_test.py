@@ -1,5 +1,7 @@
 """Unit tests for //tools:new_subsystem."""
 
+import ast
+import collections
 import contextlib
 import io
 import os
@@ -832,6 +834,78 @@ class NewSubsystemTest(unittest.TestCase):
                 else:
                     self.assertIn("--config $PWD/cfg/robot_sim.toml --sim",
                                   run)
+
+    # REQ-DEV-01
+    def test_simulation_test_loads_keep_the_build_parsing(self):
+        # The loads the first mechanism adds to a robot repository's config
+        # BUILD (sim_test_loads) never leave it unparsable, never bind a
+        # name twice, keep its comments, and go below a header comment or
+        # docstring. A load the merger does not rewrite (a comment inside,
+        # single quotes) gains a separate load of the missing symbols; a
+        # name bound to something else leaves the BUILD alone (None: the
+        # scaffold writes nothing to it and `Next:` says nothing checks the
+        # simulation config).
+        contract = 'load("@talos//talOS/build:contract.bzl", "talos_graph_test")'
+        sync = 'load("@talos//tools:sync_manifest.bzl", "manifest_sync_test")'
+        manifest = ('load(":robot_sim_manifest.bzl", SIM_CONFIG_FILES = '
+                    '"CONFIG_FILES", SIM_NODES = "NODES")')
+        body = 'exports_files(["robot.toml"])\n'
+        rows = (
+            ("comment inside a multi-line load",
+             'load(\n    "@talos//talOS/build:contract.bzl",\n'
+             '    "talos_bundle",  # the robot bundle\n)\n\n' + body,
+             'load(\n    "@talos//talOS/build:contract.bzl",\n'
+             '    "talos_bundle",  # the robot bundle\n)\n'
+             f"{contract}\n{sync}\n{manifest}\n\n" + body),
+            ("comment after the load",
+             f"{contract}  # the graph lint\n\n" + body,
+             f"{contract}  # the graph lint\n{sync}\n{manifest}\n\n" + body),
+            ("single quotes",
+             "load('@talos//talOS/build:contract.bzl', 'talos_graph_test')\n"
+             "\n" + body,
+             "load('@talos//talOS/build:contract.bzl', 'talos_graph_test')\n"
+             f"{sync}\n{manifest}\n\n" + body),
+            ("no final newline", contract,
+             f"{contract}\n{sync}\n{manifest}\n"),
+            ("no loads below a header and docstring",
+             '# The robot configuration.\n\n"""Its configs."""\n\n' + body,
+             '# The robot configuration.\n\n"""Its configs."""\n\n'
+             f"{contract}\n{sync}\n{manifest}\n\n" + body),
+            ("plain load merged",
+             'load("@talos//talOS/build:contract.bzl", "talos_bundle")\n\n'
+             + body,
+             'load("@talos//talOS/build:contract.bzl", "talos_bundle", '
+             f'"talos_graph_test")\n{sync}\n{manifest}\n\n' + body),
+            ("name bound elsewhere",
+             'load("//rules:graph.bzl", talos_graph_test = "graph_test")\n\n'
+             + body, None),
+        )
+
+        def comments(text):
+            return [line.split("#", 1)[1] for line in text.splitlines()
+                    if "#" in line]
+
+        def bindings(text):
+            bound = collections.Counter()
+            for call in ast.walk(ast.parse(text)):
+                if (isinstance(call, ast.Call)
+                        and getattr(call.func, "id", None) == "load"):
+                    bound.update(arg.value for arg in call.args[1:])
+                    bound.update(keyword.arg for keyword in call.keywords)
+            return bound
+
+        for shape, before, after in rows:
+            with self.subTest(shape=shape):
+                build = new_subsystem.sim_test_loads(
+                    before, "@talos", "robot_sim_manifest.bzl")
+                self.assertEqual(build, after)
+                if after is None:
+                    continue
+                bound = bindings(build)  # parses
+                for name in ("talos_graph_test", "manifest_sync_test",
+                             "SIM_CONFIG_FILES", "SIM_NODES"):
+                    self.assertEqual(bound[name], 1, name)
+                self.assertEqual(comments(build), comments(before))
 
     def test_plan_wires_an_estimator_without_a_can_id(self):
         with tempfile.TemporaryDirectory() as root:
