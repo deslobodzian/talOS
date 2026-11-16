@@ -37,9 +37,11 @@ the trailer `Commissioned-By: <name>` (`git commit --trailer
 earlier one, so it marks exactly the commit a person checked at the robot.
 Agents never write this trailer.
 
-Not checked: a squash that keeps a person's `Commissioned-By`
-trailer exempts everything folded into it (only the commit's last trailer
-block is read).
+Accepted, since no diff tells it apart: the trailer vouches for its whole
+commit, so a squash or amend that keeps a person's `Commissioned-By` in its
+last trailer block (the only one read) exempts everything folded into it,
+whoever wrote it. A person's commissioning commit therefore holds nothing
+but what that person checked at the robot.
 
 Prints each finding as `<commit> <file>:<line>: <what>`; exits 1 when there
 is one, 2 on a usage or git error. CI's lint job and tools/prepush.sh run it
