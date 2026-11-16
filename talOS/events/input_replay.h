@@ -162,8 +162,13 @@ class RecordedSession {
   // its first recorded run's loop origin, and the instant that run's loop
   // began running, which its construction put after the origin (the first
   // timer firing's deadline minus its manifest offset, in whichever segment
-  // of that run's log holds it; the origin when it had no timer, or none
-  // fired). For a program the session did not log, start() for both.
+  // of that run's log holds it; when it armed a timer and fired none that
+  // gives it, the now of its first dispatch, at or after the live run start,
+  // so no timer armed before the run fires up to that run's last record, as
+  // none did live; a program that ran once ends there, unless its loop was
+  // late when it stopped, and a restarted one replays as one run; the
+  // origin when it had no timer).
+  // For a program the session did not log, start() for both.
   // Where the replay ends: the latest time the program's own logs recorded
   // (its exit), or end().
   MonotonicTime loop_start() const { return loop_start_; }
@@ -180,7 +185,10 @@ class RecordedSession {
   // between them missing or unread) while no firing was read before it. The
   // run start's firing may have been in the segment not read; a later one's
   // first firing may be whole periods later, so ReplayInputs refuses the
-  // log, whatever it feeds. Empty when none.
+  // log, whatever it feeds. With no firing that gives the run start, also
+  // the first file read when the log holds no record of its run (nothing
+  // gives its start or its end) or a GAP record or damaged stretch (which
+  // may hold its firings). Empty when none.
   const std::string& run_start_refused_log() const {
     return run_start_refused_log_;
   }

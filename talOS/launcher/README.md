@@ -898,7 +898,10 @@ every log that recorded it, the writer's `SEND`s (the hardware bridge's
 `--log` included) and readers' receipts, each publication once, with the
 sequence and publication time live readers saw. A node the session ran
 replays on its own recorded timeline: its
-timers fire at the deadlines they fired at live, and it is handed what it
+timers fire at the deadlines they fired at live (a node that fired none
+starts its run at its first dispatch and fires none up to that run's last
+record; a node that ran once ends there, unless its loop was late when it
+stopped; a restarted node replays as one run), and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and
 ages measured from it). The node is never fed across a log gap: the run ends
@@ -916,7 +919,9 @@ records nothing bounds the time of. The node's own first run's log is
 refused the same way, whatever it feeds, when the node had a timer and
 that log's first segment, or a segment before its first firing read, is
 gone or unreadable (the byte cap deleted it, or its header is incomplete):
-it may have held the firing its recorded timeline starts from. A damaged stretch in another reader's
+it may have held the firing its recorded timeline starts from. So is a
+timed node's log with no such firing that holds no record of its run, or
+a gap or damaged stretch that may hold its firings. A damaged stretch in another reader's
 log of a topic is no loss only where an intact receipt of the topic follows
 it in that file and the session's other logs (the writer's sends) hold
 every message that reader could have lost there
