@@ -115,7 +115,12 @@ skips where CI fails it; and Studio's checks use the checkout's installed `studi
 (an offline `pnpm install` when there is none or the commits change
 `studio/pnpm-lock.yaml`, and studio SKIPPED if that fails). It prints one
 line per step and exits nonzero if any failed; the script's header lists
-its flags and steps.
+its flags and steps. With `TALOS_ROBOT_REPOSITORY` set to the checkout of
+a robot repository that consumes talOS, it also runs
+`tools/check_robot_repository.sh` on it: `bazel build //...` and `bazel
+test //...` in a copy of that repository's committed tree, with `@talos`
+overridden to the commit being pushed (the repository itself is only read).
+Unset, the step prints SKIPPED and does not fail the run.
 
 A local macOS run does not exercise the Linux paths (`epoll`, glibc
 allocation counting, `clang-tidy`): say so in `Tests:`; such a change is

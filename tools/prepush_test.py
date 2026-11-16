@@ -71,7 +71,8 @@ class PrepushTest(unittest.TestCase):
             0o755)
 
         self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith("GIT_")}
+                    if not k.startswith("GIT_")
+                    and k != "TALOS_ROBOT_REPOSITORY"}
         self.env.update(
             PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""),
             TMPDIR=self.tmpdir, HOME=self.tmp, GIT_CONFIG_GLOBAL=os.devnull,
@@ -158,6 +159,14 @@ class PrepushTest(unittest.TestCase):
         self.assertIn("prepush: host-includes ok", out)
         self.assertIn("prepush: test ok", out)
         self.assert_cleaned_up()
+
+    # REQ-DEV-30: a contributor without the robot repository is unaffected.
+    def test_robot_repository_is_skipped_without_its_variable(self):
+        code, out, _ = self.prepush()
+        self.assertEqual(code, 0, out)
+        self.assertIn(
+            "prepush: robot-repository skipped (TALOS_ROBOT_REPOSITORY unset)",
+            out)
 
     # REQ-DEV-25
     def test_a_failing_step_fails_the_run_naming_it(self):

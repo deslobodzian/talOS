@@ -409,6 +409,13 @@ compiles against a workstation's installed package and fails in CI
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them.
 
+No CI builds a robot repository that consumes talOS against a talOS change
+while that repository has no CI of its own. The check runs on the
+developer's machine: `tools/check_robot_repository.sh <path>` builds and
+tests a copy of the repository's committed tree with
+`--override_module=talos=<this checkout>`, and `tools/prepush.sh` runs it
+when `TALOS_ROBOT_REPOSITORY` names that checkout.
+
 ## 10. Running tests locally
 
 Which tests to run before a commit or a push is the
