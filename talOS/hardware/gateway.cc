@@ -442,8 +442,9 @@ void Gateway::FindPositionJumps(std::vector<uint16_t>& reset_ids) {
 
 // The backend judged each sample's status, value and isolation; the age bound
 // is the gateway's, the same for every backend. Returns whether any configured
-// motor or CAN sensor still has valid feedback (true with none configured):
-// false is total loss.
+// motor or CAN sensor still has valid feedback (true with none configured)
+// before the gateway's masks: false is total loss already, which Tick acts on
+// before PollResets. Tick judges the State again after the masks.
 bool Gateway::JudgeFeedbackAge() {
   const uint64_t bound = config_.command_timeout_us;
   const auto fresh = [bound](const auto& sample) {
@@ -459,6 +460,18 @@ bool Gateway::JudgeFeedbackAge() {
     sample.valid = sample.valid && fresh(sample);
   }
   return AnyFeedbackValid(state_);
+}
+
+// Total loss is judged on the State as published, the gateway's masks
+// included (an unavailable, restoring or send-failed device, a follower or
+// remote-feedback motor of one, a chain whose restore ends this tick): a
+// reset of every motor and CAN sensor is total loss from the tick that finds
+// it through the tick whose PollRestore ends the restore, whatever Read
+// reported for a restoring device.
+void Gateway::JudgeMaskedLoss(bool was_healthy) {
+  if (!healthy_ || AnyFeedbackValid(state_)) return;
+  healthy_ = false;
+  if (was_healthy || active_) Invalidate();
 }
 
 void Gateway::Tick(uint64_t now, bool enabled) {
@@ -503,17 +516,19 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   }
   state_.sample_time_us = now;
   const bool was_healthy = healthy_;
-  // Judged before PollResets masks anything (Backend::Read).
   const bool read = configured_ && backend_.Read(state_);
   // The slot's place is the gateway's, whatever Read wrote over it.
   state_.health.can_bus_count = buses;
   state_.health.can_bus_index = bus_index;
+  // A failed read pass, or no valid sample in what Read reported: total loss
+  // before any mask, ended here so PollResets applies nothing more.
   healthy_ = configured_ && JudgeFeedbackAge() && read;
   read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
   // Total loss starts a new epoch whether or not a command is in force: a
   // request built from a State before it must never drive after it.
   if (!healthy_ && (was_healthy || active_)) Invalidate();
   PollResets();
+  JudgeMaskedLoss(was_healthy);
   // A watchdog stop is not a one-shot: with no accepted command in force,
   // refresh neutral every tick (as disabled/fault do) so a dropped neutral is
   // retried until a fresh command supersedes it.
@@ -657,6 +672,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   if (IsolateFailedMotors()) {
     MaskUnavailable();
     NeutralUnavailable();
+    // The Endpoint publishes the State as Accept leaves it.
+    JudgeMaskedLoss(true);
   }
   if (active_) consecutive_apply_failures_ = 0;
   return active_;
