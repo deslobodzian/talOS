@@ -864,13 +864,14 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 - `config_path`: the config, made absolute against the launcher's working
   directory (also in `graph.json`, and passed to every member as `--config`).
 - `hardware_protocol_version`: the hardware protocol of the launcher's build
-  (`protocol::kProtocolVersion`), so a later build decodes the session's
-  hardware packets only under it
-  ([which logs a build can read](#which-logs-a-build-can-read)); absent in a
-  manifest written before the field. It is the launcher's constant: the
-  bridge and node binaries it ran are not asked, and are of another build
-  when they were not rebuilt with it (`bazel run //talOS/launcher` rebuilds
-  the launcher only); a bundle builds them all from one checkout.
+  (`protocol::kProtocolVersion`); absent in a manifest written before the
+  field. It is the launcher's constant: the bridge and node binaries it ran
+  are of another build when they were not rebuilt with it (`bazel run
+  //talOS/launcher` rebuilds the launcher only; a bundle builds them all
+  from one checkout), so the log tools read a session under the version its
+  bridge recorded on `/hw/status`, and under this one only when no bridge
+  recorded one
+  ([which logs a build can read](#which-logs-a-build-can-read)).
 - `config_sha256`, `git_revision`, `git_dirty`: the bundle's config identity
   and the source revision of a `--config=release` build
   ([deployment](../../docs/DEPLOYMENT.md#build-a-bundle)); empty (and
@@ -1197,8 +1198,9 @@ decode, cannot be classified. The verdict is cached in the session's
 (dropping one could only let a match go first), `other` and `unknown` until
 the session's event log bytes change or this build's log format, `Packet`
 size, Driver Station codec sizes or hardware protocol differs. A session
-whose manifest records a hardware protocol other than this build's is
-`unknown` without its logs being read
+recorded under a hardware protocol other than this build's (its bridge's
+version, else its manifest's) is `unknown` without its Driver Station
+packets being read
 ([which logs a build can read](#which-logs-a-build-can-read)). A session's
 logs are therefore read once while that file can be written.
 
@@ -1393,13 +1395,32 @@ hardware packets of a session recorded under its own hardware protocol
 (`protocol::kProtocolVersion`;
 [DATA_FLOW.md](../../docs/DATA_FLOW.md)).
 
-The logs do not store that version (a recorded Packet holds a frame's
-payload without its header, and its schema identity hashes only its size);
-the session's `manifest.json` does, as `hardware_protocol_version`
-([session manifest](#session-manifest)): a session directory's own, or for
-a `.tlog` file named on its own the `manifest.json` beside it when its
-`session_id` is the log header's (one of another session, or without a
-`session_id`, is not that log's and records nothing for it).
+The packets do not say which version they are of (a recorded Packet holds
+a frame's payload without its header, and its schema identity hashes only
+its size). A session records it twice: the bridge puts its own build's
+version on every `/hw/status` (`bridge.BridgeStatus` `protocol_version_id`),
+and the launcher puts its build's in `manifest.json`, as
+`hardware_protocol_version` ([session manifest](#session-manifest)). The
+tools read a session under the bridge's: the first `/hw/status` the bridge
+sent in each of its logs (each run and segment), when its log records the
+topic with this build's `BridgeStatus` schema. They use the manifest's only
+when no log does: a session from before the field, one with no bridge, or
+a bridge from before the field, whose `/hw/status` has another schema
+(`RecordedProtocolVersion`, `hardware_record.h`). Finding the bridge's
+costs a read of each log's header, and of the bridge's logs up to their
+first status, which the bridge publishes on its first tick, not a pass over
+the session. A session is a directory's own `manifest.json` and logs, or
+for a `.tlog` file named on its own, the `manifest.json` beside it and that
+session's logs beside it when the manifest's `session_id` is the log
+header's (otherwise the file alone: a manifest of another session, or
+without a `session_id`, records nothing for it). When the bridge's and the
+launcher's versions differ, each tool says so in one line and uses the
+bridge's:
+
+```
+log_dump: warning: the session's bridge recorded hardware protocol <B> (/hw/status protocol_version_id), its launcher <L> (manifest.json hardware_protocol_version): read under the bridge's
+```
+
 `log_dump`, `tlog_to_wpilog` and
 `session_report` (through `log_dump`) decide once per session, before
 decoding any hardware packet (`HardwareProtocolCheck`,
@@ -1407,14 +1428,25 @@ decoding any hardware packet (`HardwareProtocolCheck`,
 decode none of its hardware packets, the ones that happen to decode
 included:
 
-- **The manifest records another version.** No packet is tried:
+- **Another version is recorded.** No packet is tried; `<where>` is
+  `/hw/status protocol_version_id, the bridge's` or `manifest.json
+  hardware_protocol_version`:
 
   ```
-  log_dump: warning: hardware packets not decoded: recorded under hardware protocol <R>; this build's is <N> (manifest.json hardware_protocol_version)
+  log_dump: warning: hardware packets not decoded: recorded under hardware protocol <R>; this build's is <N> (<where>)
   ```
 
-- **No version is recorded** (a session from before the field, or a
-  `.tlog` file with no manifest of its session beside it). Every
+- **The bridge recorded two versions**, by runs of two builds (a bridge
+  restarted from another build, which one bundle cannot do). No packet is
+  tried:
+
+  ```
+  log_dump: warning: hardware packets not decoded: recorded under hardware protocols <A> and <B> by bridge runs of different builds (/hw/status protocol_version_id); this build's is <N>
+  ```
+
+- **No version is recorded** (a session from before the manifest field
+  with no bridge version, or a `.tlog` file with neither its session's
+  manifest nor a bridge's status). Every
   hardware packet is tried with this build's codecs. Every one decoded
   under the build that recorded it, since the bridge publishes only a State
   or Driver Station packet its codec accepted and every request and command
@@ -1429,24 +1461,27 @@ included:
   decode, because the change kept every length, cannot be told apart this
   way and decodes with this build's layout, possibly wrongly.
 
-- **The manifest records this build's version.** Every packet is still
-  tried, since the version is the launcher's: one this build rejects was
-  written by another codec than the launcher's (a bridge or node binary of
-  another build) or by hand:
+- **This build's version is recorded.** Every packet is still tried, since
+  the version is one binary's: one this build rejects was written by
+  another codec (a node binary of another build, or, with only the
+  launcher's version recorded, the bridge's too) or by hand. `<whose>` and
+  `<what>` are `the bridge's` and `nodes` when the bridge recorded the
+  version, else `the launcher's` and `bridge or nodes`:
 
   ```
-  log_dump: warning: hardware packets not decoded: recorded under this build's hardware protocol <N> (the launcher's), yet this build's codecs reject <k> of the <n> tried, the first on <topic>: <reason>; the session's bridge or nodes may be of another build
+  log_dump: warning: hardware packets not decoded: recorded under this build's hardware protocol <N> (<whose>), yet this build's codecs reject <k> of the <n> tried, the first on <topic>: <reason>; the session's <what> may be of another build
   ```
 
-`tlog_to_wpilog` prints the same lines prefixed `tlog_to_wpilog:`. A record
+`tlog_to_wpilog` prints the same lines prefixed `tlog_to_wpilog:`, and
+`session_report` prints `log_dump`'s disagreement line prefixed
+`session_report:`. A record
 damaged on disk is not among them: the log reader skips it by its checksum
 and names the log (above). When `log_dump` refuses, it exports no `hardware`
 and no `ds_enabled` member (JSONL), an empty `hardware` field (CSV) and no
 hardware line (text, summary); `payload_hex` keeps the bytes. Every other
 record is exported as before, and the exit status is 0. Read a session's
-hardware packets with a build of the protocol its manifest names
-(`hardware_protocol_version`); a stamped bundle's session also names its
-source revision (`git_revision`).
+hardware packets with a build of the protocol the line names; a stamped
+bundle's session also names its source revision (`git_revision`).
 
 Each publication's bytes are the same in every log that recorded it, so the
 check tries one copy: the writer's SEND records, and readers' copies only of
@@ -1455,20 +1490,26 @@ once, as it writes it, and writes the file again without hardware entries
 when a rejected one turns up part way; `log_dump`, which streams the session
 in bounded memory, decodes a printed packet a second time.
 
-`--replay-inputs` refuses a session whose manifest records another
-hardware protocol, before it starts the node, with one line naming both
-versions and exit status 1: the node would get States of another layout,
-and its run could not match the recording. A session with no recorded
-version is replayed: the node's devices layer decodes each `/hw/state`
+`--replay-inputs` refuses a session recorded under another hardware
+protocol (the bridge's version, else the manifest's, as above), or whose
+bridge recorded two, before it starts the node, with one line,
+`launcher: --replay-inputs <session> was <refusal>: not replayed`, where
+`<refusal>` is the text after `hardware packets not decoded: ` above, and
+exit status 1: the node would get States of another layout, and its run
+could not match the recording. It prints the disagreement line above,
+prefixed `launcher: --replay-inputs <session>: `, when the bridge's and the
+launcher's versions differ. A session with no recorded version is
+replayed: the node's devices layer decodes each `/hw/state`
 with this build's codec, so a State it rejects is no State,
 `robot_enabled` stays false and every output is neutral, but a State of
 another protocol that kept its length is decoded, wrongly.
 
 Retention's match classification ([above](#session-segments-and-logs))
-reads Driver Station packets the same way: a session whose manifest
-records another protocol is `unknown` (kept like a match) without its
-packets being read, and one with no recorded version is read with this
-build's codec, `unknown` when that rejects a packet.
+reads Driver Station packets the same way: a session recorded under
+another protocol (the bridge's version, else the manifest's), or whose
+bridge recorded two, is `unknown` (kept like a match) without its packets
+being read, and one with no recorded version is read with this build's
+codec, `unknown` when that rejects a packet.
 
 ### Session measurements
 
@@ -1576,8 +1617,8 @@ target age at tick) cannot be measured in a session that never enabled, and
 the report says so in one line; `--strict` still fails them, so acceptance
 needs an enabled session. In a session whose hardware packets `log_dump`
 does not decode ([which logs a build can read](#which-logs-a-build-can-read):
-its manifest records another hardware protocol, or this build's codecs
-reject one of its packets, whatever version it records), `log_dump`
+it records another hardware protocol, or this build's codecs reject one
+of its packets, whatever version it records), `log_dump`
 decodes no Driver Station packet, so the same verdicts are NOT
 MEASURED with `log_dump`'s line in their detail (target age at tick too:
 without the enabled bit a lane `Target` never selected cannot be found),

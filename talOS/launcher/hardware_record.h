@@ -25,23 +25,28 @@
 // are given only for a packet whose config_id is that config's, so a config
 // edited after the match never mislabels a device; the logical id always is.
 //
-// The codecs are this build's (protocol::kProtocolVersion). The logs do not
-// store the protocol version a session was recorded under (a recorded
+// The codecs are this build's (protocol::kProtocolVersion). A recorded
 // Packet holds a frame's payload without its header, and the Packet's schema
-// identity hashes only its size); the session's manifest.json does
-// (hardware_protocol_version, RecordedProtocolVersion), for a session
-// recorded since it was added. HardwareProtocolCheck runs once over a
-// session before any packet is decoded:
-//   - a recorded version other than this build's refuses every packet, none
-//     tried;
+// identity hashes only its size, so the packets do not say which protocol
+// they are of. A session records it twice (RecordedProtocolVersion): the
+// bridge's own build's version in every /hw/status it publishes
+// (bridge.BridgeStatus protocol_version_id), and the launcher's build's in
+// manifest.json (hardware_protocol_version). The bridge's, when recorded, is
+// the session's version; the manifest's only when no log of the session
+// records a /hw/status of this build's BridgeStatus schema (a session from
+// before the field, one with no bridge, or a .tlog read without its
+// session's). HardwareProtocolCheck runs once over a session before any
+// packet is decoded:
+//   - a recorded version other than this build's, or a bridge that recorded
+//     two, refuses every packet, none tried;
 //   - otherwise every packet is tried with this build's codecs. Every
 //     hardware packet decoded under the build that recorded it (the bridge
 //     publishes only a State or Driver Station packet its codec accepted;
 //     requests and commands are its codec's encodings), so a rejected one
 //     means, with no recorded version, a session of another protocol, and,
-//     with this build's version recorded (the launcher's), a packet the
-//     launcher's codec did not write: a bridge or node binary of another
-//     build, or one made by hand.
+//     with this build's version recorded, a packet a codec of another build
+//     wrote (a node binary of another build, or, with only the launcher's
+//     version, the bridge's), or one made by hand.
 // Either way a tool then decodes none of the session's hardware packets.
 // A session without a recorded version, of another protocol whose packets
 // all happen to decode (a change that kept every length), cannot be told
@@ -123,25 +128,63 @@ std::string DecodeHardwareRecord(HardwareRecord kind,
                                  std::span<const std::byte> payload,
                                  HardwarePacket& out);
 
-// The hardware protocol version a session's manifest.json records, for the
-// first of `inputs` that has one: a directory's own manifest.json, or for a
-// log file the manifest.json beside it when its session_id is the log
-// header's (not when it names another session, or has none, or the file has
-// no log header). nullopt when none does: a session recorded before the
-// field, or a log with no manifest of its session beside it.
-std::optional<std::uint16_t> RecordedProtocolVersion(
+// The hardware protocol versions a session records (see above).
+struct RecordedProtocol {
+  // manifest.json's hardware_protocol_version: the launcher build's.
+  std::optional<std::uint16_t> manifest;
+  // The bridge's: the protocol_version_id of the first /hw/status SEND in
+  // each of the session's logs whose manifest registers /hw/status as a
+  // sender of this build's BridgeStatus schema, the distinct values in log
+  // path order. One bridge build writes one value, so two mean bridge runs
+  // of different builds in one session (which one bundle cannot launch).
+  // A /hw/status of another schema (a bridge from before the field), or
+  // whose field is 0 (no version: one a test wrote), adds none.
+  std::vector<std::uint16_t> bridge;
+
+  // The version the session's packets are read under: the bridge's when it
+  // recorded exactly one, else the manifest's when the bridge recorded none.
+  std::optional<std::uint16_t> version() const;
+  // Its packets are refused untried: the bridge recorded two versions, or
+  // version() is not this build's.
+  bool refused() const;
+  // Why, when refused(), else empty: "recorded under hardware protocol <R>;
+  // this build's is <N> (<where>)", <where> "/hw/status protocol_version_id,
+  // the bridge's" or "manifest.json hardware_protocol_version"; for two
+  // bridge versions "recorded under hardware protocols <A> and <B> by bridge
+  // runs of different builds (/hw/status protocol_version_id); this build's
+  // is <N>".
+  std::string Refusal() const;
+  // The one line a tool prints after its own name when the manifest's and
+  // the bridge's one version differ, else empty: "warning: the session's
+  // bridge recorded hardware protocol <B> (/hw/status protocol_version_id),
+  // its launcher <L> (manifest.json hardware_protocol_version): read under
+  // the bridge's".
+  std::string Disagreement() const;
+};
+
+// The hardware protocol versions a session records, for the first of
+// `inputs` that records any. A directory is a session: its manifest.json and
+// its logs (event::log::FindLogFiles). A log file is read with its session
+// when the manifest.json beside it has the log header's session_id: that
+// manifest and the logs beside it of that session; otherwise (another
+// session's manifest, none, or no log header) the file alone. Each log is
+// read only to its first /hw/status record, and a log that registers no
+// /hw/status sender only to its manifest: the bridge publishes a status on
+// its first tick, so this costs about one header read per log, not a pass
+// over the session. Never throws: an unreadable log records nothing.
+RecordedProtocol RecordedProtocolVersion(
     const std::vector<std::string>& inputs);
 
 // Whether a session's hardware packets can be decoded with this build's
-// codecs (see above): from the version its manifest records, if any, then
-// from every recorded hardware packet payload Add()ed to it before the tool
-// decodes one. Every tool that decodes recorded hardware packets runs it
-// and, when foreign(), prints Warning() once and decodes none.
+// codecs (see above): from the versions it records, if any, then from every
+// recorded hardware packet payload Add()ed to it before the tool decodes
+// one. Every tool that decodes recorded hardware packets runs it, prints
+// the RecordedProtocol's Disagreement() if any, and, when foreign(), prints
+// Warning() once and decodes none.
 class HardwareProtocolCheck {
  public:
   // `recorded`: RecordedProtocolVersion of the session's inputs.
-  explicit HardwareProtocolCheck(
-      std::optional<std::uint16_t> recorded = std::nullopt);
+  explicit HardwareProtocolCheck(RecordedProtocol recorded = {});
   // One recorded payload of a hardware packet topic (`kind` not kNone).
   // `reader_copy` for a reader's MESSAGE record when the caller also adds
   // the writer's SEND records: each publication's bytes are the same in
@@ -153,27 +196,26 @@ class HardwareProtocolCheck {
   const HardwarePacket* Add(HardwareRecord kind, std::string_view topic,
                             bool reader_copy,
                             std::span<const std::byte> payload);
-  // The recorded version is not this build's, or a packet this build's
-  // codecs reject was added.
-  bool foreign() const { return refused_by_version() || rejected_ != 0; }
+  // The recorded versions refuse the packets (RecordedProtocol::refused), or
+  // a packet this build's codecs reject was added.
+  bool foreign() const { return recorded_.refused() || rejected_ != 0; }
   // The one line a tool prints after its own name when foreign(), else
   // empty. It starts "warning: hardware packets not decoded: ", then:
-  //   another version recorded: "recorded under hardware protocol <R>;
-  //     this build's is <N> (manifest.json hardware_protocol_version)";
+  //   refused by the recorded versions: RecordedProtocol::Refusal();
   //   none recorded: "recorded under a hardware protocol other than this
   //     build's protocol <N> (the session records no protocol version);
   //     this build's codecs reject <k> of the <n> tried, the first on
   //     <topic>: <why>";
   //   this build's recorded: "recorded under this build's hardware
-  //     protocol <N> (the launcher's), yet this build's codecs reject <k> of
-  //     the <n> tried, the first on <topic>: <why>; the session's bridge or
-  //     nodes may be of another build".
+  //     protocol <N> (<whose>), yet this build's codecs reject <k> of the
+  //     <n> tried, the first on <topic>: <why>; the session's <what> may be
+  //     of another build", <whose> and <what> "the bridge's" and "nodes"
+  //     when the bridge recorded it, else "the launcher's" and "bridge or
+  //     nodes".
   std::string Warning() const;
 
  private:
-  bool refused_by_version() const;
-
-  std::optional<std::uint16_t> recorded_;
+  RecordedProtocol recorded_;
   std::uint64_t packets_{0};
   std::uint64_t rejected_{0};
   std::string first_topic_;

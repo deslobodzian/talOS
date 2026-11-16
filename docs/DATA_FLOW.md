@@ -121,7 +121,9 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 what it accepts (State, Command, config, ConfigAck, Driver Station), bumps
 `kProtocolVersion`, even when every length stays. Sessions keep the payload
 bytes, and every reader of recorded hardware packets decodes them only under
-the version the session's manifest records (REQ-OPS-51): `log_dump`,
+the version the session recorded (REQ-OPS-51): the bridge's own, on every
+`/hw/status` (`protocol_version_id`), else the launcher's in its manifest:
+`log_dump`,
 `tlog_to_wpilog` and `session_report`, `studio_review`, retention's match
 classification and `--replay-inputs`
 ([which logs a build can read](../talOS/launcher/README.md#which-logs-a-build-can-read)).
@@ -299,7 +301,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
-| `/hw/status`: bridge → telemetry/observers | 272 | 264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`; `can_buses` is four 20 B `CanBusStatus` slots at the end |
+| `/hw/status`: bridge → telemetry/observers | 272 | 264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`, and the u16 `protocol_version_id` (the bridge's `kProtocolVersion`) the padding after `gateway_build_dirty`; `can_buses` is four 20 B `CanBusStatus` slots at the end. A shared-memory message, in no UDP payload: a change to it is not a hardware protocol change |
 | `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; chassis/shooter/intake payload 40/24/20 B, slots 48/32/32 B |
 | `/autonomous/state`: autonomous → telemetry | 16 | 2 B AutonomousState: phase enum and selected/latched routine_index (ubyte); routine adds one 8 B telemetry scalar |
 | `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
@@ -448,7 +450,7 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
-| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 128 | 2, 1856 B (largest 1168 / 1200 B) | 1 page, 8344 B |
+| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 129 | 2, 1864 B (largest 1168 / 1200 B) | 1 page, 8400 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):

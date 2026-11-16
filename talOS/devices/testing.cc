@@ -24,6 +24,7 @@
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/names.h"
+#include "talOS/protocol/types.h"
 
 namespace talos::testing {
 namespace {
@@ -570,6 +571,7 @@ struct SimHardware::Impl {
         state.counters.device_reset_count,
         static_cast<::bridge::GatewayProgram>(state.build.program),
         state.build.dirty,
+        protocol::kProtocolVersion,
         state.build.revision,
         0,
         0};

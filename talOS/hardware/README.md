@@ -337,8 +337,11 @@ included. Each command supplies every configured motor in manifest
 order.
 The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
 latest accepted health sample, motor fault mask, gateway counters and gateway
-build (`gateway_program`, `gateway_build_id`, `gateway_build_dirty`), and the
-bridge prints the build once for each new gateway boot
+build (`gateway_program`, `gateway_build_id`, `gateway_build_dirty`) and the
+bridge's own `kProtocolVersion` (`protocol_version_id`, which the log tools
+read a session under:
+[which logs a build can read](../launcher/README.md#which-logs-a-build-can-read)),
+and the bridge prints the build once for each new gateway boot
 (`hardware_node: gateway boot <id>: roborio build <revision>`). A State
 that does not decode is dropped, with one stderr line until a State decodes
 again.

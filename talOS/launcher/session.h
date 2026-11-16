@@ -245,11 +245,11 @@ struct SessionManifest {
   // for none.
   std::string launcher_log;
   bool simulation{false};
-  // The hardware protocol this build's codecs read and write
-  // (protocol::kProtocolVersion), so a later build reads the session's
-  // hardware packets only under it (hardware_record.h
-  // HardwareProtocolCheck). Not written when empty, as a manifest from
-  // before the field reads.
+  // The hardware protocol this (the launcher's) build's codecs read and
+  // write (protocol::kProtocolVersion): what a later build reads the
+  // session's hardware packets under when its bridge recorded no version of
+  // its own on /hw/status (hardware_record.h RecordedProtocolVersion). Not
+  // written when empty, as a manifest from before the field reads.
   std::optional<uint16_t> hardware_protocol_version{protocol::kProtocolVersion};
   int64_t start_wall_ns{0};
   int64_t end_wall_ns{0};

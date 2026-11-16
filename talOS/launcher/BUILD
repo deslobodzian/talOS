@@ -222,7 +222,6 @@ cc_library(
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
         "//talOS/process",
-        "//talOS/protocol",
         "//talOS/rtms",
         "@tomlplusplus//:toml++",
     ],
@@ -243,8 +242,10 @@ cc_library(
     hdrs = ["hardware_record.h"],
     visibility = ["//studio/review:__pkg__"],
     deps = [
+        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
+        "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/hardware",
         "//talOS/hardware:config",
@@ -260,12 +261,14 @@ cc_test(
     deps = [
         ":hardware_record",
         ":session",
+        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/hardware",
         "//talOS/protocol",
+        "//talOS/schema:identity",
         "@googletest//:gtest_main",
     ],
 )

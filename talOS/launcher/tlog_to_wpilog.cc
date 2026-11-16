@@ -1147,10 +1147,13 @@ int Convert(const Options& options) {
   if (!SelectItems(files, items, records, error)) return Fail(error);
 
   // Whether the session's hardware packets are of this build's protocol:
-  // by the version its manifest records, then as WriteItems decodes each
-  // (hardware_record.h).
-  talos::launcher::HardwareProtocolCheck protocol{
-      talos::launcher::RecordedProtocolVersion(options.inputs)};
+  // by the versions its bridge and manifest record, then as WriteItems
+  // decodes each (hardware_record.h).
+  auto recorded = talos::launcher::RecordedProtocolVersion(options.inputs);
+  if (const std::string line = recorded.Disagreement(); !line.empty()) {
+    std::fprintf(stderr, "tlog_to_wpilog: %s\n", line.c_str());
+  }
+  talos::launcher::HardwareProtocolCheck protocol{std::move(recorded)};
 
   // Device names for the hardware packets, as log_dump finds them: --config,
   // else the config the session's manifest names. Without one, a device's

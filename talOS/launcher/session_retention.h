@@ -68,8 +68,10 @@ std::optional<bool> SessionSimulation(const std::filesystem::path& dir);
 // Nodes are read smallest first, each log streamed, until one holds such a
 // packet (event::log::VisitLog). kUnknown when none does but a log is of
 // another format version (or not a log), or holds a packet this build cannot
-// decode; and when the session's manifest records a hardware protocol other
-// than this build's (its Driver Station packets are not decoded). The verdict
+// decode; and when the session was recorded under a hardware protocol other
+// than this build's, by its bridge's version or else its manifest's, or its
+// bridge recorded two (hardware_record.h RecordedProtocol::refused; its
+// Driver Station packets are not decoded). The verdict
 // is cached in kSessionClassFile and read before any log is opened: a match for
 // good, kOther and kUnknown until the session's event log bytes change or this
 // build's reader (log format, Packet size, Driver Station codec sizes, hardware

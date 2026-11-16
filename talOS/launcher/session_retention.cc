@@ -181,10 +181,10 @@ MatchVerdict RecordedMatch(const fs::path& dir, ClassCache cache_mode) {
     }
   }
   // Packets of another protocol are not read with this build's codec
-  // (REQ-OPS-51). A session whose manifest records no version is read as
+  // (REQ-OPS-51): the version the session's bridge recorded, else its
+  // manifest's (hardware_record.h). A session that records none is read as
   // before: a packet the codec rejects makes it unknown.
-  if (const auto recorded = RecordedProtocolVersion({dir.string()});
-      recorded && *recorded != protocol::kProtocolVersion) {
+  if (RecordedProtocolVersion({dir.string()}).refused()) {
     return MatchVerdict::kUnknown;
   }
 

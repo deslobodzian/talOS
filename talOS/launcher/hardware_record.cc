@@ -1,5 +1,6 @@
 #include "talOS/launcher/hardware_record.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -12,9 +13,14 @@
 #include <system_error>
 #include <utility>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
+#include "talOS/events/log/log_reader.h"
+#include "talOS/events/manifest.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/protocol/types.h"
@@ -451,6 +457,46 @@ std::string ManifestConfigPath(const std::filesystem::path& session) {
   return "";
 }
 
+// The protocol_version_id of the first /hw/status SEND in the log at `path`,
+// when its manifest registers /hw/status as a sender of this build's
+// BridgeStatus schema (and, with `session`, its header has that session id);
+// nullopt otherwise, and for a log that will not open. Reads records only
+// of a log that registers such a sender, and only to that record.
+std::optional<std::uint16_t> FirstBridgeStatusVersion(
+    const std::string& path, std::optional<std::uint64_t> session) {
+  using Status = ::bridge::BridgeStatus;
+  try {
+    event::log::WindowedLogReader reader{path};
+    if (session && reader.session_id() != *session) return std::nullopt;
+    const schema::Identity expected = schema::Of<Status>();
+    std::optional<std::uint16_t> id;
+    for (const auto& source : reader.manifest()) {
+      if (source.kind == event::SourceKind::SENDER &&
+          source.name == ::bridge::topics::kStatus &&
+          source.schema == expected) {
+        id = source.id;
+        break;
+      }
+    }
+    if (!id) return std::nullopt;
+    event::log::LogReader::Record record;
+    while (reader.next(record)) {
+      if (record.header.source_id != *id ||
+          record.header.kind !=
+              static_cast<std::uint16_t>(event::EventKind::SEND)) {
+        continue;
+      }
+      if (record.payload.size() != sizeof(Status)) return std::nullopt;
+      Status status;
+      std::memcpy(&status, record.payload.data(), sizeof status);
+      if (status.protocol_version_id() == 0) return std::nullopt;
+      return status.protocol_version_id();
+    }
+  } catch (const std::exception&) {
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 const char* CanBusReadStateName(hardware::CanBusReadState state) {
@@ -632,41 +678,97 @@ std::string DecodeHardwareRecord(HardwareRecord kind,
   }
 }
 
-std::optional<std::uint16_t> RecordedProtocolVersion(
-    const std::vector<std::string>& inputs) {
-  for (const auto& input : inputs) {
-    std::error_code ec;
-    if (std::filesystem::is_directory(input, ec)) {
-      if (const auto version = ManifestProtocolVersion(ManifestText(input))) {
-        return version;
-      }
-      continue;
-    }
-    // A log named alone: the manifest beside it, if it is that log's
-    // session's.
-    const std::filesystem::path file{input};
-    const std::string text =
-        ManifestText(file.has_parent_path() ? file.parent_path()
-                                            : std::filesystem::path{"."});
-    const auto manifest_session = ManifestInteger(text, "session_id");
-    if (!manifest_session || manifest_session != LogSessionId(file)) continue;
-    if (const auto version = ManifestProtocolVersion(text)) return version;
-  }
+std::optional<std::uint16_t> RecordedProtocol::version() const {
+  if (bridge.size() == 1) return bridge.front();
+  if (bridge.empty()) return manifest;
   return std::nullopt;
 }
 
-HardwareProtocolCheck::HardwareProtocolCheck(
-    std::optional<std::uint16_t> recorded)
-    : recorded_{recorded} {}
-
-bool HardwareProtocolCheck::refused_by_version() const {
-  return recorded_ && *recorded_ != protocol::kProtocolVersion;
+bool RecordedProtocol::refused() const {
+  const auto recorded = version();
+  return bridge.size() > 1 ||
+         (recorded && *recorded != protocol::kProtocolVersion);
 }
+
+std::string RecordedProtocol::Refusal() const {
+  if (!refused()) return "";
+  const std::string build = std::to_string(protocol::kProtocolVersion);
+  if (bridge.size() > 1) {
+    std::string versions;
+    for (std::size_t i = 0; i < bridge.size(); ++i) {
+      if (i != 0) versions += i + 1 == bridge.size() ? " and " : ", ";
+      versions += std::to_string(bridge[i]);
+    }
+    return "recorded under hardware protocols " + versions +
+           " by bridge runs of different builds (/hw/status "
+           "protocol_version_id); this build's is " +
+           build;
+  }
+  return "recorded under hardware protocol " + std::to_string(*version()) +
+         "; this build's is " + build +
+         (bridge.empty() ? " (manifest.json hardware_protocol_version)"
+                         : " (/hw/status protocol_version_id, the bridge's)");
+}
+
+std::string RecordedProtocol::Disagreement() const {
+  if (bridge.size() != 1 || !manifest || *manifest == bridge.front()) {
+    return "";
+  }
+  return "warning: the session's bridge recorded hardware protocol " +
+         std::to_string(bridge.front()) +
+         " (/hw/status protocol_version_id), its launcher " +
+         std::to_string(*manifest) +
+         " (manifest.json hardware_protocol_version): read under the "
+         "bridge's";
+}
+
+RecordedProtocol RecordedProtocolVersion(
+    const std::vector<std::string>& inputs) {
+  for (const auto& input : inputs) {
+    RecordedProtocol found;
+    std::vector<std::string> logs;
+    std::optional<std::uint64_t> session;
+    std::error_code ec;
+    if (std::filesystem::is_directory(input, ec)) {
+      found.manifest = ManifestProtocolVersion(ManifestText(input));
+      logs = event::log::FindLogFiles(input);
+    } else {
+      // A log named alone: with its session when the manifest beside it is
+      // that log's session's, else alone.
+      const std::filesystem::path file{input};
+      const std::filesystem::path dir = file.has_parent_path()
+                                            ? file.parent_path()
+                                            : std::filesystem::path{"."};
+      const std::string text = ManifestText(dir);
+      const auto manifest_session = ManifestInteger(text, "session_id");
+      session = LogSessionId(file);
+      if (manifest_session && manifest_session == session) {
+        found.manifest = ManifestProtocolVersion(text);
+        logs = event::log::FindLogFiles(dir.string());
+      } else {
+        logs = {input};
+        session.reset();
+      }
+    }
+    for (const auto& log : logs) {
+      const auto version = FirstBridgeStatusVersion(log, session);
+      if (version && std::find(found.bridge.begin(), found.bridge.end(),
+                               *version) == found.bridge.end()) {
+        found.bridge.push_back(*version);
+      }
+    }
+    if (found.manifest || !found.bridge.empty()) return found;
+  }
+  return {};
+}
+
+HardwareProtocolCheck::HardwareProtocolCheck(RecordedProtocol recorded)
+    : recorded_{std::move(recorded)} {}
 
 const HardwarePacket* HardwareProtocolCheck::Add(
     HardwareRecord kind, std::string_view topic, bool reader_copy,
     std::span<const std::byte> payload) {
-  if (refused_by_version()) return nullptr;
+  if (recorded_.refused()) return nullptr;
   if (!reader_copy) {
     if (!sent_.contains(topic)) sent_.emplace(topic);
   } else if (sent_.contains(topic)) {
@@ -686,19 +788,17 @@ std::string HardwareProtocolCheck::Warning() const {
   if (!foreign()) return "";
   const std::string build = std::to_string(protocol::kProtocolVersion);
   const std::string prefix = "warning: hardware packets not decoded: ";
-  if (refused_by_version()) {
-    return prefix + "recorded under hardware protocol " +
-           std::to_string(*recorded_) + "; this build's is " + build +
-           " (manifest.json hardware_protocol_version)";
-  }
+  if (recorded_.refused()) return prefix + recorded_.Refusal();
   const std::string rejected =
       "this build's codecs reject " + std::to_string(rejected_) + " of the " +
       std::to_string(packets_) + " tried, the first on " + first_topic_ + ": " +
       first_why_;
-  if (recorded_) {
+  if (recorded_.version()) {
+    const bool bridge = !recorded_.bridge.empty();
     return prefix + "recorded under this build's hardware protocol " + build +
-           " (the launcher's), yet " + rejected +
-           "; the session's bridge or nodes may be of another build";
+           (bridge ? " (the bridge's), yet " : " (the launcher's), yet ") +
+           rejected + "; the session's " +
+           (bridge ? "nodes" : "bridge or nodes") + " may be of another build";
   }
   return prefix +
          "recorded under a hardware protocol other than this build's "
