@@ -574,6 +574,28 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(calls, [], out)
         self.assertTrue(os.path.isdir(lock), out)
 
+    # REQ-DEV-25: two runs that both read a dead holder's pid must not both
+    # take the lock; the retake is one at a time.
+    def test_a_dead_holders_lock_is_retaken_by_one_run_only(self):
+        lock = os.path.join(self.tmpdir, f"talos-prepush-{os.getuid()}.lock")
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        put(os.path.join(lock, "pid"), f"{dead.pid}\n")
+        # Another run in the middle of retaking it.
+        os.makedirs(lock + ".retake")
+        status, out, calls = self.prepush()
+        self.assertEqual(status, 2, out)
+        self.assertIn("retaking", out)
+        self.assertEqual(calls, [], out)
+        with open(os.path.join(lock, "pid"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), f"{dead.pid}\n")
+
+        # Alone, a run retakes it and leaves neither directory behind.
+        os.rmdir(lock + ".retake")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assert_cleaned_up()
+
     # REQ-DEV-25
     def test_leaves_other_worktrees_registered(self):
         # Another worktree whose directory is missing for now (an unmounted

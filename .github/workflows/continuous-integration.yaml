@@ -96,7 +96,24 @@ jobs:
 
     - name: Build
       id: build
-      run: bazel build //... --noshow_progress --test_output=errors
+      # The two flags write every compile's `.d` file to the output path,
+      # cache hits included, for the host-include step below (as
+      # tools/prepush.sh builds); the Test step repeats them so it keeps
+      # this build's analysis.
+      run: >-
+        bazel build //... --noshow_progress --test_output=errors
+        --experimental_inmemory_dotd_files=false '--remote_download_regex=.*\.d$'
+
+    - name: No compile read a host package header
+      # tools/check_host_includes.py over this build's `.d` files: a header
+      # under /usr/include (or another host prefix) that is not the C
+      # library's, the kernel's or the C++ standard library's compiled here
+      # only because the runner has the package (tools/prepush.sh's
+      # host-includes step).
+      run: >-
+        python3 tools/check_host_includes.py "$(bazel info
+        --experimental_inmemory_dotd_files=false '--remote_download_regex=.*\.d$'
+        output_path)"
 
     - name: Layer check (ARCHITECTURE.md "Allowed dependencies")
       # bazel query paths that must be empty; known exceptions are
@@ -147,6 +164,7 @@ jobs:
       run: |
         set -o pipefail
         bazel test //... --noshow_progress --test_output=errors \
+          --experimental_inmemory_dotd_files=false '--remote_download_regex=.*\.d$' \
           --test_env=TALOS_REQUIRE_NETNS=1 \
           --test_env=TALOS_REQUIRE_BROWSER=1 \
           --build_event_json_file="$RUNNER_TEMP/test-events.json" 2>&1 \

@@ -3,7 +3,7 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//bench/main_processor/bundle_testdata:robot_manifest.bzl", RELOCATION_CONFIG_FILES = "CONFIG_FILES", RELOCATION_NODES = "NODES")
 load("//bench/main_processor/configuration:robot_bench_manifest.bzl", "CONFIG_FILES", "NODES")
 load("//bench/main_processor/configuration:robot_py_manifest.bzl", PY_CONFIG_FILES = "CONFIG_FILES", PY_NODES = "NODES")
-load("//talOS/build:contract.bzl", "talos_bundle")
+load("//talOS/build:contract.bzl", "talos_bundle", "talos_graph_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -35,6 +35,21 @@ talos_bundle(
     config = "//bench/main_processor/bundle_testdata:robot.toml",
     config_files = RELOCATION_CONFIG_FILES,
     nodes = ["//talOS/bridge:hardware_node"] + RELOCATION_NODES,
+)
+
+# relocation_bundle's config, described and linted like every robot
+# config's: a graph error in it would otherwise surface only as an install
+# failure inside bundle_test.
+talos_graph_test(
+    name = "relocation_graph_test",
+    config = "//bench/main_processor/bundle_testdata:robot.toml",
+    data = RELOCATION_CONFIG_FILES,
+    nodes = RELOCATION_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 # bundle_test only: prints the launcher's stop timeout in seconds.
