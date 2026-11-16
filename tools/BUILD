@@ -44,6 +44,13 @@ py_test(
     ],
     legacy_create_init = False,
     main = "new_subsystem_test.py",
+    # Its only instrumented code is the configuration resolver, which it
+    # starts about 70 times (three per scaffold's plan). Under TSan on the
+    # hosted macOS runner each start costs most of a second, past the small
+    # timeout (TODO.md CI-10); plain it takes 0.2 s. The resolver starts no
+    # thread; its library runs under TSan in //talOS/configuration:test and
+    # :config_fuzz_test.
+    tags = ["no_tsan"],  # ~70 resolver starts; single-threaded; see above
     deps = [":sync_manifest_lib"],
 )
 
