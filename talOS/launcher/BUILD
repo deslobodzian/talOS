@@ -601,6 +601,51 @@ cc_test(
     ],
 )
 
+# A node that sets its motor with no talos::Target (outputs_held_test).
+talos_cc_node(
+    name = "held_motor",
+    srcs = ["testdata/held_motor.cc"],
+    node_name = "held_motor",
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/devices"],
+)
+
+# REQ-SAFE-41: a running node's registry row carries outputs_held while the
+# flush holds its outputs, through the real bridge and talos::Run, against a
+# gateway in the test process.
+cc_test(
+    name = "outputs_held_test",
+    size = "small",
+    srcs = ["outputs_held_test.cc"],
+    data = [
+        ":held_motor",
+        "//talOS/bridge:hardware_node",
+    ],
+    env = {
+        "TALOS_BRIDGE": "$(rlocationpath //talOS/bridge:hardware_node)",
+        "TALOS_HELD_MOTOR": "$(rlocationpath :held_motor)",
+    },
+    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
+    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
+    # The Linux sanitizer legs still run this test.
+    tags = [
+        "integration",
+        "no_macos_sanitizer",
+    ],
+    deps = [
+        ":launcher_lib",
+        ":registry_cleanup",
+        ":stop_signal_guard",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/introspection:registry",
+        "//talOS/protocol",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 talos_cc_node(
     name = "alpha",
     srcs = ["testdata/construction_node.cc"],

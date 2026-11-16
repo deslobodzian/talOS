@@ -40,6 +40,8 @@ talOS/launcher/launcher_test.cc clock seeded: integration, spawned processes and
 talOS/launcher/launcher_test.cc sleep seeded: integration, spawned processes and their deadlines
 talOS/launcher/log_budget_test.cc clock seeded: integration, paces a real writer process
 talOS/launcher/log_budget_test.cc sleep seeded: integration, paces a real writer process
+talOS/launcher/outputs_held_test.cc clock integration: a gateway in the test process ticks a real bridge and node on the real clock; deadline of the registry poll
+talOS/launcher/outputs_held_test.cc sleep integration: paces the in-process gateway's 5 ms tick and the registry poll
 talOS/launcher/supervision_test.cc clock seeded: integration, one real spawn or kill per mechanism; sleeps unaudited against TESTING.md §6.3
 talOS/launcher/supervision_test.cc sleep seeded: integration, one real spawn or kill per mechanism; sleeps unaudited against TESTING.md §6.3
 talOS/node/node_test.cc clock seeded: an integration case (signals a spawned node) in a component target; move it to its own target
