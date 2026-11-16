@@ -405,10 +405,13 @@ TEST_F(MotorTest, ReportsInjectedFeedbackAndAcquisitionAges) {
   sim.step(10ms);
   EXPECT_FALSE(State().connected());
   EXPECT_FALSE(State().acquisition_valid());
-  // An invalid sample zeroes what was measured and keeps the last
-  // temperature (hardware::MarkInvalid).
+  // An invalid sample zeroes what was measured (hardware::MarkInvalid); the
+  // temperature signal keeps its last value until it is 500 ms old, then
+  // reads 0, as PhoenixBackend reports it.
   EXPECT_DOUBLE_EQ(State().temperature_degc(), 42.5);
   EXPECT_DOUBLE_EQ(State().supply_current_a(), 0.0);
+  sim.step(500ms);
+  EXPECT_DOUBLE_EQ(State().temperature_degc(), 0.0);
 }
 
 TEST_F(MotorTest, HealthFeedbackRemainsVisibleWithStaleTargetAndWhileDisabled) {

@@ -542,6 +542,28 @@ TEST_F(SimHardwareTest, AMotorThatCannotDriveIsNeutralFromThatTick) {
   }
 }
 
+// REQ-DEV-07: a disconnected motor's temperature is a signal that stopped
+// updating, as PhoenixBackend::Read reads it: its last value while younger
+// than 500 ms, then 0 (docs/DATA_FLOW.md). Its age counts from the last
+// State that read the motor connected.
+TEST_F(SimHardwareTest, ADisconnectedMotorsTemperatureReadsZeroAt500Ms) {
+  hw.set_motor("mech", "braked", 0, 0, 0, 0, 62.5);
+  sim.step(5ms);
+  const std::uint64_t read_us = State().sample_time_us;
+  ASSERT_DOUBLE_EQ(Motor("braked").temperature_c, 62.5);
+  hw.set_connected("mech", "braked", false);
+  sim.step(495ms);
+  ASSERT_EQ(State().sample_time_us - read_us, 495'000u);
+  EXPECT_FALSE(Motor("braked").valid);
+  EXPECT_DOUBLE_EQ(Motor("braked").temperature_c, 62.5);
+  sim.step(5ms);
+  ASSERT_EQ(State().sample_time_us - read_us, 500'000u);
+  EXPECT_DOUBLE_EQ(Motor("braked").temperature_c, 0.0);
+  hw.set_connected("mech", "braked", true);
+  sim.step(5ms);
+  EXPECT_DOUBLE_EQ(Motor("braked").temperature_c, 62.5);
+}
+
 // The RoboRIO reports a CANcoder's absolute position with
 // AbsoluteSensorDiscontinuityPoint = 0.5, so in [-0.5, 0.5) rotations;
 // set_cancoder's position goes out wrapped the same way.
