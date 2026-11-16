@@ -50,7 +50,12 @@ Breaking one of these is a review blocker.
    consumer in the same change (Studio bindings: `pnpm generate`). A change to
    a UDP frame, payload codec, device cap, shared-memory slot size or
    telemetry frame budget also updates `docs/DATA_FLOW.md` and its matching
-   compile-time size assert.
+   compile-time size assert. A change to any hardware payload codec's bytes
+   or to what it decodes, even one that keeps every length, bumps
+   `protocol::kProtocolVersion` and regenerates the `wire_golden_test`
+   constants in the same change: recorded sessions are decoded only under the
+   version their manifest records
+   ([protocol version](docs/DATA_FLOW.md#protocol-version)).
 
 ## Verification
 
