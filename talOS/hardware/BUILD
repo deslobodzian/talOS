@@ -87,6 +87,19 @@ cc_test(
     ],
 )
 
+# The State and Command bytes of the current hardware protocol: an encoding
+# change fails it until kProtocolVersion is bumped (REQ-OPS-51).
+cc_test(
+    name = "wire_golden_test",
+    size = "small",
+    srcs = ["wire_golden_test.cc"],
+    deps = [
+        ":hardware",
+        "//talOS/protocol",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "gate_test",
     size = "small",

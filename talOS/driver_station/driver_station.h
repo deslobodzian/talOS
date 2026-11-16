@@ -147,6 +147,9 @@ class ModeTracker {
   uint64_t since_us_{0};
 };
 
+// The wire codec of the Driver Station frame's payload. A change to its
+// bytes or to what Decode accepts bumps protocol::kProtocolVersion, even one
+// that keeps every length (docs/DATA_FLOW.md#protocol-version).
 std::size_t Encode(const DriverStationData& ds, std::span<uint8_t> out);
 bool Decode(std::span<const uint8_t> data, DriverStationData& out);
 

@@ -39,6 +39,19 @@ cc_test(
     ],
 )
 
+# The Driver Station packet's bytes of the current hardware protocol: an
+# encoding change fails it until kProtocolVersion is bumped (REQ-OPS-51).
+cc_test(
+    name = "wire_golden_test",
+    size = "small",
+    srcs = ["wire_golden_test.cc"],
+    deps = [
+        ":driver_station",
+        "//talOS/protocol",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_binary(
     name = "send_joystick",
     srcs = ["send_joystick.cc"],

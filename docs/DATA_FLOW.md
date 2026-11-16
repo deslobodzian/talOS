@@ -124,6 +124,20 @@ sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
 20-byte IPv4 header − 8-byte UDP header. Under this IPv4/MTU contract talOS frames
 need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 
+<a id="protocol-version"></a>A change to any payload codec's bytes, or to
+what it accepts (State, Command, config, ConfigAck, Driver Station), bumps
+`kProtocolVersion`, even when every length stays. Sessions keep the payload
+bytes, and every reader of recorded hardware packets decodes them only under
+the version the session's manifest records (REQ-OPS-51): `log_dump`,
+`tlog_to_wpilog` and `session_report`, `studio_review`, retention's match
+classification and `--replay-inputs`
+([which logs a build can read](../talOS/launcher/README.md#which-logs-a-build-can-read)).
+So a bump makes earlier sessions' hardware packets unreadable to this build's
+tools, and a change without one decodes them wrongly with no warning. The
+`wire_golden_test`s in `talOS/hardware` and `talOS/driver_station` pin the
+bytes of a fully populated State, Command and Driver Station packet to the
+current version and fail on any change until it is bumped.
+
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
 | State, type 20 | `84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 47` | 1419 | 1459 | 13 |
