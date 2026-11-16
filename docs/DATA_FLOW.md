@@ -393,7 +393,10 @@ feedback—is fresh and finite; invalid feedback neutralizes the follower.
 `.tlog` version **8** carries a publication timestamp on each message dispatch
 and send, separate from event/dispatch time. Exact replay preserves publication
 age; input replay injects with the recorded publication time, at that time,
-or, for a node the session ran, at the drain that received it.
+or, for a node the session ran, at the drain that received it. Neither crosses
+a GAP record: exact replay stops before the gap's first dropped dispatch,
+input replay before the earliest gap in a log it feeds from, and both exit 1
+([events](../talOS/events/README.md#recording-and-replaying)).
 Readers accept versions 7 and 8 (a version-7 log is a version-8 log without a
 GAP record) and reject any other with the recorded and supported versions; the
 log format version is not the hardware protocol version

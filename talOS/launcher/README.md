@@ -836,7 +836,11 @@ replays on its own recorded timeline: its
 timers fire at the deadlines they fired at live, and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and
-ages measured from it). See
+ages measured from it). The node is never fed across a log gap: the run ends
+just before the earliest gap (GAP record) in a log it is fed a watched topic
+from (its own logs for a topic it watched live, otherwise every log that
+recorded the topic), the node prints the log, the topic and the time, and
+the launcher exits 1 with it. See
 [input replay](../events/README.md#replaying-another-sessions-inputs) for
 timing and schema checks.
 

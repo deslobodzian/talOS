@@ -164,6 +164,7 @@ cc_test(
         "//talOS/configuration",
         "//talOS/events",
         "//talOS/events:events_log",
+        "//talOS/events:gap_testing",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
         "//talOS/memory:shared_memory",

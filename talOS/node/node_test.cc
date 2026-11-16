@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -29,6 +30,7 @@
 #include "node_test/node_test_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/simulated_event_loop.h"
@@ -1534,6 +1536,103 @@ TEST(Binary, LoggedSimRunReplaysOfflineWithoutDivergence) {
   EXPECT_NE(diverged.status, 0) << diverged.output;
   // Only the --sim run wrote the node's byte topic to shared memory.
   ::shm_unlink(ShmObjectName("/test_node/frames").c_str());
+}
+
+// A node binary's replay of a log with a gap (a GAP record, as the writer
+// leaves where its pool filled) stops and exits 1, naming the log and the
+// gap: --replay before the gap's first dropped dispatch, with no divergence;
+// --replay-inputs, fed /test_node/target from its own log (it watched the
+// topic live), before the gap's start.
+// REQ-OPS-13, REQ-OPS-14
+TEST(Binary, ReplayOfALogWithAGapStopsThereAndExits1) {
+  const std::string log = TempFile("talos_node_test_gap_whole.tlog");
+  const Result run =
+      RunBinary("--sim --duration-s 1 --log '" + log + "' " + ConfigFlag());
+  ASSERT_EQ(run.status, 0) << run.output;
+  // Only the --sim run wrote the node's byte topic to shared memory.
+  ::shm_unlink(ShmObjectName("/test_node/frames").c_str());
+
+  // Drop an update() dispatch past the middle and the two after it.
+  std::vector<event::log::RecordHeader> headers;
+  std::uint16_t update = 0;
+  {
+    event::log::LogReader reader{log};
+    for (const event::Registration& source : reader.manifest()) {
+      if (source.kind == event::SourceKind::TIMER &&
+          source.name == "test_node") {
+        update = source.id;
+      }
+    }
+    event::log::LogReader::Record record;
+    while (reader.next(record)) headers.push_back(record.header);
+  }
+  const auto starts = [&](std::size_t i) {
+    return headers[i].dispatch_index != headers[i - 1].dispatch_index;
+  };
+  std::size_t first = headers.size() / 2;
+  while (first < headers.size() &&
+         !(headers[first].kind ==
+               static_cast<std::uint16_t>(event::EventKind::TIMER) &&
+           headers[first].source_id == update)) {
+    ++first;
+  }
+  std::size_t end = first + 1;
+  for (int dispatches = 0; end < headers.size(); ++end) {
+    if (starts(end) && ++dispatches == 3) break;
+  }
+  ASSERT_LT(end, headers.size() - 1) << "too few records: " << headers.size();
+  const std::string dir = TempFile("talos_node_test_gap_session");
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string gapped = dir + "/test_node.tlog";
+  const event::log::LogGap gap =
+      event::log::CopyWithGap(log, gapped, first, end);
+
+  {
+    SCOPED_TRACE("--replay");
+    const Result replay =
+        RunBinary("--replay '" + gapped + "' " + ConfigFlag());
+    EXPECT_EQ(replay.status, 1) << replay.output;
+    EXPECT_NE(replay.output.find("diverged=0 clean_exit=0 stopped_at_gap=1"),
+              std::string::npos)
+        << replay.output;
+    // The stop line names the log, the dropped dispatches and records.
+    const std::size_t named = replay.output.find(gapped);
+    ASSERT_NE(named, std::string::npos) << replay.output;
+    const std::string line =
+        replay.output.substr(named, replay.output.find('\n', named) - named);
+    const auto names = [&line](std::uint64_t value) {
+      const std::string number = " " + std::to_string(value);
+      for (std::size_t at = line.find(number); at != std::string::npos;
+           at = line.find(number, at + 1)) {
+        const std::size_t after = at + number.size();
+        if (after == line.size() ||
+            std::isdigit(static_cast<unsigned char>(line[after])) == 0) {
+          return true;
+        }
+      }
+      return false;
+    };
+    for (const std::uint64_t value :
+         {gap.first_dispatch_index, gap.detail.last_dispatch_index,
+          gap.detail.records}) {
+      EXPECT_TRUE(names(value)) << value << " in " << line;
+    }
+  }
+  {
+    SCOPED_TRACE("--replay-inputs");
+    const Result replay = RunBinary(
+        "--replay-inputs '" + dir + "' --log '" +
+        TempFile("talos_node_test_gap_inputs.tlog") + "' " + ConfigFlag());
+    EXPECT_EQ(replay.status, 1) << replay.output;
+    // The stop line names the log and the topic.
+    const std::size_t named = replay.output.find(gapped);
+    ASSERT_NE(named, std::string::npos) << replay.output;
+    const std::string line =
+        replay.output.substr(named, replay.output.find('\n', named) - named);
+    EXPECT_NE(line.find("/test_node/target"), std::string::npos) << line;
+  }
+  std::filesystem::remove_all(dir);
 }
 
 bool ShmSegmentExists(const std::string& topic) {

@@ -233,6 +233,18 @@ binary's `--replay` (`talOS/node/node.cc`) discards them, exactly as
 `--replay-inputs` does below. Replay is offline either way: it never attaches
 to or writes the shared memory of a robot that may be running on this machine.
 
+Replay never crosses a GAP record (the writer's mark where it dropped
+records, [below](#log-format)): it replays every dispatch before the gap's
+first dropped dispatch and stops there, with no divergence, `reached_exit()`
+false and `stopped_at_gap()` naming the gap. A dispatch the gap split (its
+first records kept, the rest dropped) is not replayed at all, since it was
+not recorded whole. Recording that replay gives the log's records before that
+dispatch, byte for byte, then the replay's own `EXIT`. A node binary's
+`--replay` prints `replay: stopped at a log gap in <log> before dispatch <n>:`
+and the gap (`DescribeGap`: records dropped, the first and last dropped
+dispatch), then `replay: diverged=0 clean_exit=0 stopped_at_gap=1`, and exits
+1, as it does for any replay that does not reach the recorded exit.
+
 Log versions and byte sizes are recorded in
 [DATA_FLOW.md](../../docs/DATA_FLOW.md#dispatch-logs).
 
@@ -319,7 +331,8 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   skipped message, so its dropped count is zero. The replay ends at the program's
   last record (`loop_end()`).
 - `ReplayInputs` runs the loop on its virtual clock to `loop_end()`, the end
-  of the session for a program it did not run. Each recorded message on a
+  of the session for a program it did not run (or to a gap, below). Each
+  recorded message on a
   topic the program watches is published with its publication time at its
   delivery instant (`RecordedMessage::delivered`: its publication time, or
   its live drain), so the drain there delivers it with its original age.
@@ -329,6 +342,20 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   per-topic descriptors) throws `ReplayError` before anything runs, naming
   both types and who recorded it. Watched topics no log recorded are listed in
   `InputReplayReport::unrecorded`; nothing arrives on them.
+- Input replay never feeds across a log gap. Each recorded topic carries the
+  earliest start of a GAP record (the earliest time its dropped records
+  name) in a log it is fed from (`RecordedTopic::first_gap` and
+  `first_gap_log`): for a topic the program watched live, its own logs that
+  watched it; otherwise every log that recorded the topic. `ReplayInputs`
+  ends the run one nanosecond before the earliest of those among the topics
+  it feeds, feeding nothing delivered at or after it, and names the topic,
+  log and time in `InputReplayReport::stopped_at_gap`. A gap in a log that
+  feeds the program nothing does not stop it; a gap after the run's end
+  (`loop_end()`) is never reached. The stop is conservative: another log may
+  hold what the gapped one dropped. A timer firing after its own log's first
+  gap does not set `run_start()`, since the re-arms before it may be lost.
+  A node binary prints `replay-inputs: stopped before a log gap in <log> at
+  <t> s after the session start (topic <name>)` and exits 1.
 
 Replay feeds a topic the program did not watch live from the session origin,
 including messages it would have missed during startup; its output may differ

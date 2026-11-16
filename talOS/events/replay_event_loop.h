@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -49,6 +50,12 @@ class ReplayDivergence : public std::runtime_error {
 // come from the log in recorded order, so handlers see byte-identical inputs
 // with identical ages no matter how the original run was scheduled. The loop
 // checks every send against the original run, in order, byte for byte.
+//
+// It never crosses a GAP record (log/format.h), where the writer dropped
+// records: it replays every dispatch before the gap's first dropped dispatch
+// (none of a dispatch the gap split) and stops, as at the end of a truncated
+// log, with stopped_at_gap() naming the gap. Recording that replay gives the
+// log's records before that dispatch, then the replay's own EXIT.
 template <RecorderPolicy Recorder = NullRecorder>
 class ReplayEventLoop
     : public EventLoopBase<ReplayEventLoop<Recorder>, Recorder> {
@@ -103,6 +110,12 @@ class ReplayEventLoop
   // True when the recorded run ended with a clean exit rather than being cut
   // short by a truncated log.
   bool reached_exit() const { return reached_exit_; }
+
+  // The gap the log stops at: every dispatch before its first dropped dispatch
+  // was replayed, and none after. Empty for a log without one.
+  const std::optional<log::LogGap>& stopped_at_gap() const {
+    return stopped_at_gap_;
+  }
 
   void run() {
     if (const auto mismatch =
@@ -162,6 +175,11 @@ class ReplayEventLoop
     log::LogReader::Record record{};
     reader.rewind();
     while (reader.next(record)) {
+      // The log is a hole-free record of the run only up to its first GAP
+      // record: replay stops there, and nothing after it is read (or refused
+      // as damage).
+      stopped_at_gap_ = log::GapOf(record.header, record.payload);
+      if (stopped_at_gap_.has_value()) break;
       records_.push_back(Recorded{record.header, stored_.size()});
       const auto bytes = record.payload.first(record.header.stored_bytes);
       stored_.insert(stored_.end(), bytes.begin(), bytes.end());
@@ -173,6 +191,17 @@ class ReplayEventLoop
       throw ReplayError("log is missing damaged records (" +
                         log::DescribeDamage(reader.damage()) +
                         "); exact replay needs every record");
+    }
+    // The dispatch the gap starts in may have its first records before it
+    // (GAP_SPLITS_DISPATCH): it was not recorded whole, so it is not
+    // replayed, and the replay ends on the dispatch boundary before it.
+    if (stopped_at_gap_.has_value()) {
+      const std::uint64_t split = stopped_at_gap_->first_dispatch_index;
+      while (split != 0 && !records_.empty() &&
+             records_.back().header.dispatch_index == split) {
+        stored_.resize(records_.back().offset);
+        records_.pop_back();
+      }
     }
   }
 
@@ -338,6 +367,7 @@ class ReplayEventLoop
   std::uint64_t active_dispatch_{0};
   MonotonicTime now_{};
   bool reached_exit_{false};
+  std::optional<log::LogGap> stopped_at_gap_;
 };
 
 }  // namespace talos::event

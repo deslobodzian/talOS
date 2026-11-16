@@ -40,6 +40,10 @@ struct RecordedTopic {
   // otherwise the first reader's that did.
   std::string recorded_by;
   std::size_t message_count{0};
+  // The earliest LogGap::start_ns in a log this topic is fed from, and that
+  // log; empty when none has a gap.
+  std::optional<MonotonicTime> first_gap;
+  std::string first_gap_log;
 };
 
 struct RecordedMessage {
@@ -66,6 +70,11 @@ struct RecordedMessage {
 // publish time, preserved in both SEND and MESSAGE records even when only a
 // delayed reader logged it, and one message seen in several logs is kept
 // once, by topic and transport sequence.
+//
+// A log with a GAP record (log/format.h) lost records there: each topic
+// notes the earliest gap start in a log it is fed from (first_gap), which is
+// where ReplayInputs ends a run that feeds it. A timer firing after its own
+// log's first gap does not set run_start(), as re-arms before it may be lost.
 class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)
@@ -132,6 +141,13 @@ struct InputReplayReport {
   // Topics the program watches that no log recorded: nothing arrives on
   // them, as if their writer had never run.
   std::vector<std::string> unrecorded;
+  struct Gap {
+    std::string topic;
+    std::string log;
+    MonotonicTime at;
+  };
+  // Set when the run ended before a gap in a log it was fed from.
+  std::optional<Gap> stopped_at_gap;
 };
 
 // The topic `registration` (a watcher of the program) reads, matched against
@@ -143,7 +159,11 @@ const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
 
 // Runs `loop` to session.loop_end(), publishing every recorded message on a
 // topic the program watches with its recorded publish time, just before the
-// first drain at or after its `delivered` time, which delivers it. A topic
+// first drain at or after its `delivered` time, which delivers it. It never
+// feeds across a log gap: when a topic it feeds has a first_gap at or before
+// loop_end(), the run ends one nanosecond before the earliest such gap (the
+// first fed topic's on a tie), feeding nothing delivered at or after it, and
+// the report's stopped_at_gap names it. A topic
 // the program sends itself is its own output and is not fed. `loop` must
 // have finished registration, not have run, and start at
 // session.loop_start() with its run starting at session.run_start()
@@ -190,11 +210,25 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
         registration.name, registration.message_bytes, registration.schema);
     fed_index[index] = report.fed.size();
     report.fed.push_back({topic->name, topic->recorded_by, 0});
+    // The earliest gap among the fed topics' logs, the first fed topic's on
+    // a tie, ends the run, unless the run ends before it anyway.
+    if (topic->first_gap.has_value() &&
+        *topic->first_gap <= session.loop_end() &&
+        (!report.stopped_at_gap.has_value() ||
+         *topic->first_gap < report.stopped_at_gap->at)) {
+      report.stopped_at_gap = InputReplayReport::Gap{
+          topic->name, topic->first_gap_log, *topic->first_gap};
+    }
   }
+  // Nothing at or past the gap is fed or run: the run ends one nanosecond
+  // before it, so no drain there runs.
+  const MonotonicTime end = report.stopped_at_gap.has_value()
+                                ? report.stopped_at_gap->at - Duration{1}
+                                : session.loop_end();
 
   std::optional<MonotonicTime> instant;
   for (const RecordedMessage& message : session.messages()) {
-    if (message.delivered > session.loop_end()) break;
+    if (message.delivered > end) break;
     SimulatedChannel* channel = channels[message.topic];
     if (channel == nullptr) continue;
     // Everything due before the message's delivery happens first; then the
@@ -211,7 +245,7 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
     channel->publish(session.payload(message), message.time);
     ++report.fed[fed_index[message.topic]].messages;
   }
-  loop.run_until(session.loop_end());
+  loop.run_until(end);
   loop.finish();
   return report;
 }
