@@ -78,7 +78,7 @@ class StudioBridgeInSession(unittest.TestCase):
             for line in launch.stdout:
                 output.append(line)
                 if ("Started studio_bridge" in line
-                        or "studio_bridge never came up" in line
+                        or "studio_bridge will not be restarted again" in line
                         or "studio_bridge not executable" in line):
                     up.set()
             up.set()  # the launch ended: nothing more will come

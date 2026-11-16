@@ -234,7 +234,8 @@ def check_studio(spec, resolved):
             sys.exit(f"bundle: studio_webroot {studio['webroot_path']} holds "
                      f"no {page}; build Studio's pages with `bazel build "
                      "//studio:web_dist` in talOS's checkout (from a robot "
-                     "repository: `cd talos && bazel build //studio:web_dist`)")
+                     "repository: the checkout its MODULE.bazel `talos` "
+                     "override names)")
 
 
 def source_revision(path):
