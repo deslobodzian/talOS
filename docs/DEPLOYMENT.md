@@ -27,8 +27,11 @@ subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
 `studio_bridge` is not the config's `[studio] bridge` (when it sets one) or
 the site has no `index.html`. The 2026 robot, the bench rig and
 `tools/new_robot`'s robots inside talOS set both, which add about 2.5 MB; a
-robot repository's (`new_robot --standalone`) sets neither until it builds
-the pages ([examples/robot_repo](../examples/robot_repo/README.md#studio)).
+robot repository's (`new_robot --standalone`) sets neither, so its deployed
+robot has no driver dashboard until someone builds the pages and adds
+`studio_bridge = "@talos//studio/bridge:studio_bridge"` and
+`studio_webroot = ":studio_webroot"` to its `talos_bundle`
+([examples/robot_repo](../examples/robot_repo/README.md#studio)).
 It writes
 `bazel-bin/2026-robot/main_processor/robot_bundle/`:
 

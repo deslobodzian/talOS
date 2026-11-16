@@ -1,20 +1,17 @@
 # Your first mechanism
 
 From nothing to a robot repository of your own with a new mechanism, a
-"flywheel" with one motor, running in simulation and following a scripted
-joystick button, seen in Studio, then changed into your own. A robot lives
-in its own repository and uses talOS as a Bazel module, `@talos`; talOS
-itself stays a separate checkout you do not edit.
+"flywheel" with one motor, following a scripted joystick button in
+simulation, seen in Studio, then changed into your own. A robot lives in its
+own repository and uses talOS as a Bazel module, `@talos`; talOS stays a
+separate checkout you do not edit. Every command here was run on Linux;
+macOS differs only in how `tools/setup.sh` installs tools.
 
-Every command here was run on Linux; macOS differs only in how
-`tools/setup.sh` installs tools. The Python track comes first because it is
-shorter; the C++ track reuses everything but the node.
-[Make it yours](#7-make-it-yours) changes the flywheel's code, and
-[position mechanisms](#9-position-mechanisms-the-library-or-your-own-code)
-covers an arm with or without the mechanism library.
-
-Terms are explained where they first matter; [the glossary](GLOSSARY.md) has
-all of them.
+The main path, sections [1](#1-set-up) to [4](#4-make-it-move-in-simulation),
+is seven commands, the first of them the install, and one file you paste.
+When a step fails,
+[section 5](#5-if-it-does-not-work) lists the checks. Terms are explained
+where they first matter; [the glossary](GLOSSARY.md) has all of them.
 
 ## 1. Set up
 
@@ -22,40 +19,30 @@ Clone talOS, then, from that checkout:
 
 ```sh
 ./tools/setup.sh          # Linux or macOS; on Windows run it inside WSL2
-./tools/setup.sh --check  # lists each tool and whether it is acceptable
 ```
 
-`setup.sh` installs the compiler, Bazel (through Bazelisk), Python, Node and
-the linters ([INSTALL.md](INSTALL.md) has flags and troubleshooting). Bazel is
-the build tool: a *target* such as `//tools:new_robot` names something it
-can build or run. A *workspace* is a directory with a `MODULE.bazel`; talOS is
-one, and your robot repository will be another. The first build in a
-workspace compiles what it needs of talOS, which takes the longest of
-anything here; later builds reuse that work.
+It installs the compiler, Bazel (through Bazelisk), Python and Node
+([INSTALL.md](INSTALL.md) has flags and troubleshooting). Bazel is the build
+tool: a *target* such as `//tools:new_robot` names something it can build or
+run, and a *workspace* is a directory with a `MODULE.bazel`. talOS is one;
+your robot repository will be another.
 
 ## 2. Make your robot repository
 
-From the talOS checkout, make the repository beside it:
+From the talOS checkout, make the repository beside it, then go there:
 
 ```sh
 bazel run //tools:new_robot -- my_robot --standalone ../my_robot
+cd ../my_robot
 ```
 
 ```text
+wrote /home/you/my_robot/.bazelignore
 wrote /home/you/my_robot/.bazelrc
-wrote /home/you/my_robot/.bazelversion
-wrote /home/you/my_robot/.gitignore
-wrote /home/you/my_robot/BUILD.bazel
-wrote /home/you/my_robot/MODULE.bazel
-wrote /home/you/my_robot/README.md
-wrote /home/you/my_robot/robot.toml
-wrote /home/you/my_robot/robot_manifest.bzl
-wrote /home/you/my_robot/studio_test.py
-wrote /home/you/my_robot/subsystems/telemetry.toml
+...
 wrote /home/you/my_robot/subsystems/teleop.toml
 Next:
   cd /home/you/my_robot
-  bazel test //...                      # graph, manifest, simulation and Studio checks
   ...
 ```
 
@@ -63,107 +50,41 @@ Next:
 tool refuses a directory inside the talOS checkout, one that already holds
 files, and a name that breaks the [naming rules](../talOS/NAMING.md#nodes);
 it runs no git command (`git init` when you want history; the repository's
-README says how to hold talOS as a git submodule instead).
+`README.md` says how to hold talOS as a git submodule instead).
 
 The repository is a copy of talOS's
 [`examples/robot_repo`](../examples/robot_repo/README.md), the robot
-repository talOS's own CI builds and tests, without its two example
-mechanisms: a robot starts with no mechanism, so the first one you add gets
-the first CAN id and joystick button, and you write its code. The files that
-matter now:
+repository talOS's own CI builds and tests, without its example mechanisms:
+your first mechanism gets the first CAN id and joystick button, and you
+write its code. What is in it:
 
-- A **node** is one program (one process) that does one job; a **subsystem**
-  is the robot's name for a node plus its configuration. `[[subsystems]]` in
-  `robot.toml` is the only list of a robot's nodes: here `teleop` and
-  `telemetry`. `teleop` is the framework's node that turns Driver Station
-  buttons and sticks into targets, and `telemetry` feeds the logs and
-  Studio; neither needs code from you
-  ([architecture: configuration](../ARCHITECTURE.md#configuration)). The
-  hardware bridge, the courier to the RoboRIO, joins every launch on its own.
-- `[robot] period_us` is the default **tick**: how often a node's `update()`
-  runs. `command_timeout_us` is how old data may be before the robot goes
-  neutral ([architecture: the tick](../ARCHITECTURE.md#the-tick)).
-- `[robot.targets]` says which **target lanes** each Driver Station mode
-  listens to. Here a subsystem obeys the `teleop` lane in teleop and nothing in
-  autonomous. `require_target_coverage = true`, once every mechanism has a
-  producer, makes the launcher refuse a subsystem nobody can drive; a
-  commissioned robot always requires it
-  ([architecture: targets](../ARCHITECTURE.md#targets)).
-- `sim_gateway` names the program that stands in for the RoboRIO, the robot's
-  hardware layer, when you simulate. Everything of talOS is named by an
-  `@talos//` label.
-- `robot_manifest.bzl` is the **manifest**: a generated list of the node
-  binaries and config files the robot needs. Bazel cannot read TOML, so it
-  reads this file instead. Edit `robot.toml` or a subsystem file in a way
-  that adds or removes a node or file, and regenerate it with
-  `bazel run @talos//tools:sync_manifest -- robot.toml` (a stale manifest
-  fails `manifest_sync_test` with that command).
-- `BUILD.bazel` holds the robot's checks (`manifest_sync_test`,
-  `graph_test`, `sim_smoke_test`, `studio_test`), `//:sim`, the robot against
-  the simulator, and `robot_bundle`, what [deployment](DEPLOYMENT.md)
-  installs on the main processor.
-- `MODULE.bazel` points `@talos` at your talOS checkout with
-  `local_path_override` (relative to the repository, so the two directories
-  move together), and Studio's pages at that checkout's build of them.
+- `robot.toml` is the robot. `[[subsystems]]` is the only list of its
+  nodes: here `teleop`, the framework's node that turns Driver Station
+  buttons and sticks into targets, and `telemetry`, which feeds the logs
+  and Studio. A **node** is one program that does one job; a **subsystem**
+  is a node plus its configuration, one file each in `subsystems/`. The
+  hardware bridge, the courier to the RoboRIO, joins every launch on its
+  own ([architecture: configuration](../ARCHITECTURE.md#configuration)).
+  `[robot] period_us` is the default **tick**, how often a node's
+  `update()` runs; `command_timeout_us` is how old data may be before the
+  robot goes neutral ([the tick](../ARCHITECTURE.md#the-tick));
+  `[robot.targets]` says which **target lanes** each Driver Station mode
+  obeys ([targets](../ARCHITECTURE.md#targets)).
+- `robot_manifest.bzl` is the **manifest**, the node binaries and config
+  files `robot.toml` needs, generated because Bazel cannot read TOML. The
+  tools regenerate it; a stale one fails `manifest_sync_test` with the
+  command that fixes it.
+- `BUILD.bazel` holds the checks `bazel test //...` runs (`graph_test`,
+  which lints the whole graph as the launcher does; `manifest_sync_test`;
+  `sim_smoke_test`, which runs the robot against the simulator until it is
+  up; `studio_test`), `//:sim`, the robot against the simulator, and
+  `robot_bundle`, what [deployment](DEPLOYMENT.md) installs.
+- `MODULE.bazel` points `@talos` at your talOS checkout, relative to the
+  repository, so the two directories move together (absolute, with a
+  warning that it holds only on this machine, when they share nothing
+  but `/`).
 
-## 3. Build and test it
-
-From here on, every command runs in your robot repository:
-
-```sh
-cd ../my_robot
-bazel test //...
-```
-
-```text
-//:graph_test                                                            PASSED in 0.2s
-//:manifest_sync_test                                                    PASSED in 0.1s
-//:sim_smoke_test                                                        PASSED in 1.5s
-//:studio_test                                                           PASSED in 1.4s
-
-Executed 4 out of 4 tests: 4 tests pass.
-```
-
-The first run took about a minute on an eight-core workstation whose
-downloads were already cached; a later run takes seconds.
-`graph_test` runs every node with `--describe` and checks the whole graph
-against the naming and graph rules
-([launcher: two phases](../talOS/launcher/README.md#two-phases)).
-`sim_smoke_test` runs `//:sim` until the robot is up, then one second more,
-and fails unless every member ran once and exited 0 and the bridge received
-State from the simulator. `studio_test` starts Studio's bridge with it and
-asks for the driver dashboard ([section 8](#8-see-it-in-studio)).
-
-## 4. Run it in simulation
-
-```sh
-bazel run //:sim -- --duration-s 5
-```
-
-```text
-================ Declared Graph ==================
-Nodes described: 4/4, topics: 6
-  • hardware_node (4 sources)
-  • telemetry (5 sources)
-  • teleop (2 sources)
-  • sim_gateway (1 sources)
-  ...
-================ Session Manifest ================
-Session ID: 16301377678527133833
-Output Dir: /tmp/talos_logs/16301377678527133833
-...
-  • teleop (pid=19396, exit=0, records=476, restarts=0, failed=no, log=/tmp/talos_logs/16301377678527133833/teleop.tlog)
-  • sim_gateway (pid=19398, exit=0, records=0, restarts=0, failed=no, log=)
-```
-
-`//:sim` runs the launcher on `robot.toml` with the simulator,
-`sim_gateway`, which plays the Driver Station and the RoboRIO. Without
-`--duration-s` it runs until Ctrl-C. A **session** is one run of the
-launcher; its directory, `Output Dir`, holds each node's log (`teleop.tlog`),
-its text output and the graph. Nothing moves yet: the robot has no
-mechanism.
-
-## 5. Add a mechanism: the Python track
+## 3. Add a mechanism
 
 ```sh
 bazel run @talos//tools:new_subsystem -- flywheel --lang py
@@ -179,21 +100,15 @@ wrote subsystems/flywheel.toml
 wrote robot.toml
 wrote robot_manifest.bzl
 Type: velocity, a motor held at a speed, such as a flywheel or roller.
-  Other types (--type velocity|position|estimator):
-    position: a motor moved to a position counted from a home switch, such as an arm, wrist or elevator
-    estimator: a pose estimator from camera observations, with no device
-Next:
-  bazel test //flywheel:all
-  ...
+...
 ```
 
 It wrote the node package `flywheel/`, its subsystem file, its
-`[[subsystems]]` entry, and the regenerated manifest. `--type` picks the
-mechanism's archetype: `velocity` (the default, a motor driven at a speed: a
-flywheel, a roller) or `position` (a motor homed and driven to a position:
-an arm, an elevator; see [section 9](#9-position-mechanisms-the-library-or-your-own-code)).
-The package is yours: the scaffold is a starting point, not a framework you
-must keep ([section 7](#7-make-it-yours)).
+`[[subsystems]]` entry and the regenerated manifest. `--type position` makes
+an arm or elevator instead ([section 9](#9-position-mechanisms-the-library-or-your-own-code)),
+and `--lang cpp` a C++ node ([section 6](#6-the-c-track)). The package is
+yours: the scaffold is a starting point, not a framework you must keep
+([section 7](#7-make-it-yours)).
 
 ### The message
 
@@ -215,12 +130,9 @@ struct FlywheelState {
 
 A **topic** is a named shared-memory slot, `/flywheel/state`, holding the
 latest **message** of one fixed type; nodes talk only through topics.
-Messages are FlatBuffers *structs*: fixed-size records, which is what lets
-them sit in shared memory. Every number carries its unit as a suffix (`_rps`,
-`_m`, `_us`, `_v`), and the build fails on one without. Topic names follow
-[NAMING.md](../talOS/NAMING.md#topics): `/owner/role[/qualifier]`, where the
-role says who may write it (`state` is published by its owner; `target` is
-written by anyone else).
+Messages are FlatBuffers *structs*, fixed-size records. Every number carries
+its unit as a suffix (`_rps`, `_m`, `_us`, `_v`), and the build fails on one
+without. Topic names follow [NAMING.md](../talOS/NAMING.md#topics).
 
 ### The node
 
@@ -248,49 +160,34 @@ class Flywheel:
   `/flywheel/state`.
 - `update()` runs every tick. After it returns, the framework sends one
   hardware request for the node: a motor not set during that tick is sent
-  neutral. That is why **motor setters work only inside `update()`**: a command
-  from anywhere else would reach the motor for at most one tick, so the
-  framework refuses it with an error
+  neutral. That is why **motor setters work only inside `update()`**; from
+  anywhere else the framework refuses them with an error
   ([node guide: threads](NODE_DEVELOPMENT_GUIDE.md#threads)).
 - A **target lane** is `/flywheel/target/<source>`, one per producer
-  (`teleop`, `auto`, ...). `Target.get()` returns the message from the first
-  lane in the mode's priority list that is active, fresh, and issued under
-  the current Driver Station mode, and only while `robot_enabled(node)` holds
-  (the robot is enabled, with no fault and a hardware state younger than
-  `command_timeout_us`). Otherwise it returns `None`, nothing is set, and the
-  motor goes neutral. Safety needs no code from you; it is the shape of the
-  node ([architecture: targets](../ARCHITECTURE.md#targets), and rule 1 of
-  [RULES.md](../RULES.md)).
+  (`teleop`, `auto`, ...). `Target.get()` returns the first lane in the
+  mode's priority list that is active, fresh and issued under the current
+  Driver Station mode, and only while the robot is enabled with a hardware
+  state younger than `command_timeout_us`; otherwise `None`, nothing is
+  set, and the motor goes neutral. Safety needs no code from you; it is the
+  shape of the node ([architecture: targets](../ARCHITECTURE.md#targets),
+  rule 1 of [RULES.md](../RULES.md)).
 
-### Run the generated test
-
-```sh
-bazel test //flywheel:all
-```
-
-```text
-//flywheel:node_test                                                     PASSED in 1.3s
-```
-
-The scaffold already tests the case list every node must pass: a disabled
-robot, a stale or released lane, a lost Driver Station, a disconnected motor, a
-NaN demand, another mode's lane, a target left over from an earlier enable
-([node test matrix](TESTING.md#7-the-node-test-matrix)). The test runs your
+`node_test.py` already tests the case list every node must pass: a disabled
+robot, a stale or released lane, a lost Driver Station, a disconnected
+motor, a NaN demand, another mode's lane, a target left over from an earlier
+enable ([node test matrix](TESTING.md#7-the-node-test-matrix)). It runs your
 class on `talos.testing.Sim`, a simulated clock with in-memory topics, and
 `SimHardware`, a stand-in for the hardware bridge; neither needs a robot or a
-process. When you change what the node does, change `node_test.py` with it.
-`bazel test //...` runs it with the robot's other checks; the graph test now
-describes the flywheel too.
+process. When you change what the node does, change the test with it.
 
-### Make it move in simulation
+## 4. Make it move in simulation
 
-`subsystems/flywheel.toml` describes the motor and the node's inputs. The
-scaffold leaves it unable to move: its teleop binding is commented out and
-every gain is zero ("untuned"), so it never drives a real mechanism on
-values nobody measured. To see it move in simulation, put what its `Next:`
-output prints in `robot_sim.toml`, the **simulation config**, beside
-`robot.toml`; the subsystem file stays as it is. The first mechanism's
-`Next:` prints the whole file:
+`subsystems/flywheel.toml` describes the motor and the node's inputs, and
+leaves it unable to move: its teleop binding is commented out and every
+gain is zero ("untuned"), so it never drives a real mechanism on values
+nobody measured. What makes it move in simulation goes in `robot_sim.toml`,
+the **simulation config**, beside `robot.toml`. The first mechanism's
+`Next:` prints the whole file; paste it:
 
 ```toml
 # Simulation only: the launcher runs it with --sim
@@ -319,63 +216,17 @@ autonomous = []
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 ```
 
-`include = "robot.toml"` takes the whole robot, and `[subsystems.flywheel]`
-is the flywheel's subsystem file as `robot.toml` loads it, with these tables
-merged over it. `robot.toml` never reads `robot_sim.toml`, so nothing you put
-there reaches the robot, and `simulation_only = true` makes the launcher and
-`hardware_node` refuse it without `--sim`
-([launcher](../talOS/launcher/README.md#lightweight-simulation-gateway)).
-The binding tells the framework's `teleop` node to write a target on
-`/flywheel/target/teleop` while Driver Station joystick button 3 is held.
-Without it nothing writes the flywheel's lane, and the launcher warns. The
-feedforward is there because with every gain zero the physics simulation
-stalls the motor
-([simulation backends](../talOS/hardware/README.md#simulation-backends-ideal-vs-physics-backed)).
+`include = "robot.toml"` takes the whole robot, and these tables are merged
+over the flywheel's subsystem file. The binding tells the `teleop` node to
+write a target on `/flywheel/target/teleop` while joystick button 3 is held.
+`Next:` also prints a `sync_manifest` command for this file; nothing in the
+repository reads that manifest yet, so this page skips it.
 
-The new config needs its own manifest, and the launcher checks its graph:
+Build and test everything, then run the simulation config with the launcher,
+as `Next:` prints it (`//:sim` runs `robot.toml`, which binds no button):
 
 ```sh
-bazel run @talos//tools:sync_manifest -- robot_sim.toml
-bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --describe-only
-```
-
-```text
-wrote robot_sim_manifest.bzl
-...
-================ Declared Graph ==================
-Nodes described: 4/4, topics: 8
-  • hardware_node (5 sources)
-  • flywheel (7 sources)
-  • telemetry (5 sources)
-  • teleop (3 sources)
-  warning: /flywheel/state: is published but nothing subscribes to it
-Graph written to: /tmp/talos_logs/<session>/graph.json
-==================================================
-```
-
-A warning is fine; an `error:` line means the launcher would refuse to
-start. The launcher runs the built node binaries with `--describe`; before
-`bazel test //...` has built them, one `error:` line names the nodes that are
-`not built`.
-
-The `can_id` in the subsystem file is a placeholder. On a real robot a
-person sets the physical id and `commissioned = true` at the robot; nobody
-does it from a desk ([bring-up](BRINGUP.md#human-commissioning)). A
-commissioned robot requires target coverage, so by then every mechanism needs
-a producer in each mode its policy lists. The binding goes into the
-subsystem file only once its gains are tuned on the mechanism. In a robot
-that already requires coverage, the scaffold writes the subsystem file's
-`[targets]` uncommented with every mode empty, since the coverage check
-judges only a mode that lists a lane: the graph passes and the mechanism
-stays neutral.
-
-### Run it
-
-`//:sim` runs `robot.toml`, so the simulation config runs with the launcher
-itself, as `Next:` prints it:
-
-```sh
-bazel build @talos//talOS/bridge:hardware_node @talos//talOS/simulation:sim_gateway
+bazel test //...
 bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 8 \
     --start-sim-gateway --sim-gateway-arg --physics \
     --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
@@ -383,64 +234,74 @@ bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duratio
 ```
 
 ```text
+//:graph_test                                                            PASSED in 0.2s
+//:manifest_sync_test                                                    PASSED in 0.1s
+//:sim_smoke_test                                                        PASSED in 1.5s
+//:studio_test                                                           PASSED in 1.8s
+//flywheel:node_test                                                     PASSED in 1.4s
+
+Executed 5 out of 5 tests: 5 tests pass.
 ...
-Session ID: 4330296920975887547
-Output Dir: /tmp/talos_logs/4330296920975887547
+[launcher] Started flywheel (pid 343890, target //flywheel:node)
 ...
-  • flywheel (pid=24972, exit=0, records=4036, restarts=0, failed=no, log=/tmp/talos_logs/4330296920975887547/flywheel.tlog)
+Output Dir: /tmp/talos_logs/3500574835644784081
+...
+  • flywheel (pid=343890, exit=0, records=4040, restarts=0, failed=no, log=/tmp/talos_logs/3500574835644784081/flywheel.tlog)
 ```
 
-The mode schedule is `mode:seconds` phases (disabled for 1 s, then teleop).
-The joystick schedule is `seconds:axes=...;buttons=MASK;pov=DEG` snapshots
-of joystick 0, each held until the next: button 3 is bit 2 of the mask, so
-`buttons=4` presses it from second 3 to second 6
+The first `bazel test //...` in a new repository compiles what it needs of
+talOS: 169 s on an eight-core Linux workstation after `bazel clean --expunge`, with every download already in Bazel's repository cache and other builds loading the host (224 s in another run on the same machine); without cached downloads, longer. Later runs take seconds. The launcher plays the Driver Station
+and the RoboRIO with `sim_gateway`: disabled for 1 s, then teleop
+(`--mode-schedule`), with joystick 0's button 3 (bit 2 of the mask,
+`buttons=4`) held from second 3 to second 6
 ([syntax](../talOS/simulation/README.md#scripted-joystick-and-fault-schedules)).
-
-### See the result
-
-`log_dump` reads a session's logs and decodes every message. Its summary
-answers "did the flywheel move" in a few lines:
+A **session** is one run of the launcher; its directory, the `Output Dir`
+it prints last, holds each node's log, its text output and the graph.
+`log_dump` reads the logs; its summary answers "did the flywheel move":
 
 ```sh
-bazel run @talos//talOS/launcher:log_dump -- --format summary --node flywheel --topic /flywheel/state /tmp/talos_logs/4330296920975887547
+bazel run @talos//talOS/launcher:log_dump -- --format summary --node flywheel --topic /flywheel/state <session>
 ```
 
 ```text
 topic /flywheel/state flywheel.FlywheelState
   records flywheel SEND 397
-  first_ms 56.644
-  last_ms 7976.627
+  first_ms 66.434
+  last_ms 7986.430
   latest {enabled: false, velocity_rps: 0, connected: true}
   range enabled false true
   range velocity_rps 0 19.999999999999986
   range connected true true
 ```
 
-`range velocity_rps 0 ...` with a maximum near 20 means it spun up,
-`range enabled false true` that it was enabled at some point
+`<session>` is the `Output Dir` the launcher printed
+(`/tmp/talos_logs/<id>`). `range velocity_rps 0 ...` with a maximum near 20
+means it spun up while button 3 was held, `range enabled false true` that it
+was enabled at some point
 ([summary format](../talOS/launcher/README.md#filtering-and-exporting-logs)).
-To see the trajectory, sample the full dump:
+Remove the `buttons=4` snapshot, or the mode schedule's `teleop`, and it
+stays neutral: that is the safety path working.
 
-```sh
-bazel run @talos//talOS/launcher:log_dump -- --node flywheel --topic /flywheel/state /tmp/talos_logs/4330296920975887547 \
-  | grep FlywheelState | awk 'NR%50==1'
-```
+## 5. If it does not work
 
-```text
-      flywheel.FlywheelState {enabled: false, velocity_rps: 0, connected: true}
-      flywheel.FlywheelState {enabled: false, velocity_rps: 0, connected: true}
-      flywheel.FlywheelState {enabled: false, velocity_rps: 0, connected: true}
-      flywheel.FlywheelState {enabled: true, velocity_rps: 5.41967602880064, connected: true}
-      flywheel.FlywheelState {enabled: true, velocity_rps: 19.999999989713697, connected: true}
-      flywheel.FlywheelState {enabled: true, velocity_rps: 19.999999999999986, connected: true}
-      flywheel.FlywheelState {enabled: false, velocity_rps: 8.436937462502495, connected: true}
-      flywheel.FlywheelState {enabled: false, velocity_rps: 0, connected: true}
-```
-
-The flywheel sat neutral while disabled, spun up to 20 rps while button 3
-was held, and coasted down when the button released. Remove the `buttons=4`
-snapshot, or the mode schedule's `teleop`, and it stays neutral: that is the
-safety path working.
+- `./tools/setup.sh --check` (in talOS) lists each tool and whether it is
+  acceptable.
+- `bazel run //:sim -- --duration-s 5` runs `robot.toml` alone against the
+  simulator; every member should exit 0.
+- `bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml
+  --describe-only` lints the simulation config's graph without starting
+  it. A warning is fine; an `error:` line names the rule the launcher would
+  refuse to start on ([launcher: two phases](../talOS/launcher/README.md#two-phases)),
+  and a node not built yet is named with the `bazel build` command that
+  builds it.
+- A stale manifest fails `manifest_sync_test` with
+  `bazel run @talos//tools:sync_manifest -- robot.toml`, the command that
+  regenerates it.
+- The `can_id` in a subsystem file is a placeholder. On a real robot a
+  person sets the physical id and `commissioned = true` at the robot,
+  never from a desk ([bring-up](BRINGUP.md#human-commissioning)); a
+  commissioned robot then requires a producer for every mechanism in each
+  mode its policy lists.
 
 ## 6. The C++ track
 
@@ -462,12 +323,10 @@ wrote claw/testdata/neighbor.toml
 wrote subsystems/claw.toml
 wrote robot.toml
 wrote robot_manifest.bzl
-wrote robot_sim_manifest.bzl
 ...
 ```
 
-It regenerates `robot_sim_manifest.bzl` too, since `robot_sim.toml` includes
-`robot.toml`. The message file has the same shape as the Python one. The
+The message file has the same shape as the Python one. The
 node is a header plus a one-line entry point, `TALOS_NODE(claw::Claw)` in
 `claw.cc`:
 
@@ -507,14 +366,15 @@ bazel test //...
 The run and `log_dump` commands work for the claw, with the claw's button in
 the joystick schedule's mask (button `n` is bit `n-1`, so button 4 is
 `buttons=8`, as the claw's `Next:` prints) and the `claw` node read from the
-session the launcher printed:
+session the launcher printed (`<session>`, its `Output Dir`); the full dump,
+sampled, shows the trajectory:
 
 ```sh
 bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 8 \
     --start-sim-gateway --sim-gateway-arg --physics \
     --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
     --sim-gateway-arg --joystick-schedule --sim-gateway-arg '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=8;pov=-1|6:axes=0;buttons=0;pov=-1'
-bazel run @talos//talOS/launcher:log_dump -- --node claw --topic /claw/state /tmp/talos_logs/<session> \
+bazel run @talos//talOS/launcher:log_dump -- --node claw --topic /claw/state <session> \
   | grep ClawState | awk 'NR%50==1'
 ```
 
@@ -681,38 +541,16 @@ and the state `Latest().at_speed()`.
 
 ## 8. See it in Studio
 
-[Studio](../studio/README.md) is the live viewer, and its driver dashboard
-is at `/drive`. Its bridge is a C++ program your repository builds from
-`@talos`; its pages are built by talOS's own workspace, in your talOS
-checkout, once and again after each talOS update (`../talos` here, a
-checkout named `talos` beside the repository; `new_robot`'s `Next:` printed
-the command with your checkout's path):
+[Studio](../studio/README.md) is the live viewer, with the driver dashboard
+at `/drive`. Its bridge is built in your repository from `@talos`; its pages
+are built by talOS's own workspace, in your talOS checkout, once and again
+after each talOS update. `new_robot`'s `Next:` printed the command with your
+checkout's path (here `../talos`). Then build `//:sim`, which gathers the
+bridge and the pages into `//:studio_webroot`, and run the simulation config
+with the bridge:
 
 ```sh
 (cd ../talos && bazel build //studio:web_dist)
-```
-
-```text
-Target //studio:web_dist up-to-date:
-  bazel-bin/studio/dist
-```
-
-That folder is what `MODULE.bazel`'s `studio_web` names. Until it is built,
-the robot still runs and `bazel test //...` passes, but Studio's `/` and
-`/drive` answer 503 with "Studio's pages are not built" and the build
-command for the talOS checkout `studio_web` reads: the command above.
-`studio_test` passes
-either way: it accepts that 503 as long as it names the folder `robot.toml`
-gives the bridge. Bazel notices the pages when they appear, so the next run
-serves them.
-
-`bazel run //:sim -- --start-studio-bridge` starts Studio with `robot.toml`,
-where nothing is bound to a button. To watch the flywheel move, run the
-simulation config with the bridge, after building `//:sim`, which builds
-the bridge and the pages' folder (`//:studio_webroot`, `robot.toml`'s
-`[studio] webroot`):
-
-```sh
 bazel build //:sim
 bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 10 --start-studio-bridge \
     --start-sim-gateway --sim-gateway-arg --physics \
@@ -721,13 +559,17 @@ bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duratio
 ```
 
 ```text
-[launcher] Started studio_bridge (pid 39754) on http://localhost:5800
+[launcher] Started studio_bridge (pid 369029) on http://localhost:5800
 ```
 
-Open `http://localhost:5800` while it runs (raise `--duration-s`, or leave
-it out and stop with Ctrl-C), and `http://localhost:5800/drive` for the
-driver dashboard. Reading a log is the same on every robot
-([launcher: filtering and exporting logs](../talOS/launcher/README.md#filtering-and-exporting-logs)).
+Open `http://localhost:5800` and `http://localhost:5800/drive` while it runs
+(raise `--duration-s`, or leave it out and stop with Ctrl-C). Until the
+pages are built, everything else runs and `bazel test //...` passes, but
+`/` and `/drive` answer 503 with "Studio's pages are not built" and the
+build command for the talOS checkout `studio_web` reads: the first command
+above. A deployed robot has no
+dashboard until its `robot_bundle` carries Studio (your repository's
+`README.md`).
 
 ## 9. Position mechanisms: the library, or your own code
 
@@ -769,102 +611,13 @@ topic /arm/state arm.ArmState
 
 ### Writing the arm yourself
 
-A node may drive its `Motor` directly instead. Then the cases the library
-handles for you are yours: owning the node means owning them. An arm that
-homes on a switch must at least bound its push toward the switch, check
-that the switch opens when the arm leaves it, latch a failure, and push
-gently. To start from a node that does all four in your own code, scaffold
-the arm with `--raw` instead of the command above:
+`--raw` writes the arm without the library: every line of its homing and
+limits in `arm/arm.h` (`arm.py` with `--lang py`), on the node's own
+`Motor`, with a test of each rule. Owning the node means owning those
+rules: [writing the arm yourself](../talOS/mechanisms/README.md#writing-the-arm-yourself)
+says what each constant bounds, what is still not caught, and how to watch
+the bounded push fail safe in simulation.
 
-```sh
-bazel run @talos//tools:new_subsystem -- arm --lang cpp --type position --raw
-```
-
-Every line of the homing and limits is then in `arm/arm.h` (`arm.py` with
-`--lang py`, line for line the same), on the node's own `Motor`, home
-switch `arm_home` and `talos::DriverStation`; the package does not depend
-on `talOS/mechanisms`. The summary line adds `Written with --raw: every
-line of homing and limits written in your own file, with its tests.`
-
-The node zeroes the motor on the switch once the arm is at rest
-(`Motor::rezero`), then runs Motion Magic to the goal inside a fixed
-travel, and reports `FAILED` in `ArmState`'s `homing` field on either fault
-below. It reads the Driver Station only to clear a failure. The constants at
-the end of the class (`kMaxRot`, `kHomingVolts`, `kMaxPushTicks`,
-`kHomeMarginRot`; upper case at the top of the Python file) are
-placeholders sized for the simulation; set each for your mechanism:
-
-- **The push is bounded.** A switch that never closes (a cut wire reads
-  open) would otherwise push the arm into its bottom stop for as long as
-  the button is held. In the simulation the push moves the arm about
-  4 rot/s, so it crosses the 2-rotation travel (`kMaxRot`) and the 0.1
-  rotations to the switch in about half a second; `kMaxPushTicks` allows
-  twice that. On your mechanism, time a push across the full travel at
-  `kHomingVolts` and allow about twice that, in ticks of the subsystem's
-  `period_us`.
-- **A stuck switch is caught early.** A switch stuck or shorted closed
-  with the arm mid-travel at power-on zeroes the arm there, and Motion
-  Magic would then take it up to `kMaxRot` past the real top. So after
-  each zero, the arm goes no farther than `kHomeMarginRot` above it until
-  the switch has read open; still closed within 0.05 of that, the switch
-  cannot be right, and the arm fails. That is what is not caught: from a
-  wrong zero the arm can still move up to `kHomeMarginRot`, which from a
-  zero near the top is into the far stop, at the stator limit. Keep
-  `kHomeMarginRot` as small as your switch allows: the distance from
-  the zero at which it reliably opens, plus a little. In the simulation
-  it opens about 0.06 rotations up.
-- **Failed stays failed** (neutral) until the Driver Station reports
-  disabled. Releasing the button, a stale lane, a non-finite target or a
-  motor that briefly reads disconnected does not clear it, so none of
-  them starts another push into the stop. `Target::get()` returns null for
-  a release and a stale lane alike, so the node cannot tell them apart.
-- **The push is gentle.** `kHomingVolts` is low, and the motor's
-  `stator_limit_a` bounds how hard any command, the push included, can
-  drive the arm into a stop. The subsystem file sets a provisional 20 A,
-  not the motor's 80 A; choose the real value for your mechanism. Soft
-  limits do not bound this travel: they stay in the motor's power-on
-  frame, which a rezero does not move, and config load refuses them
-  unless `position_frame = "absolute"`.
-
-The subsystem file has no `[arm]` table, and the `Next:` simulation block
-no `[subsystems.arm.arm]`: those keys are the library's parameters, and
-the launcher refuses a key no node reads. `node_test.cc` carries the node
-test matrix, with goals inside the travel, and five tests of the node's
-own homing and limits: `HomingThatNeverReachesTheSwitchFails`,
-`FailureLatchesUntilDisabled`, `StuckSwitchStopsWithinTheMargin`,
-`GoalOutsideTheTravelClampsToIt` (goals of 5.0 and -1.0 demand 2.0 and 0)
-and `ZeroWaitsForRest` (no zero while the motor still moves on the
-switch). The
-fixture starts the arm on its switch (closed); `StartOffHome()` opens it.
-`hw.ideal_motors()` makes the simulated motor reach each demand at once,
-so in the last test the switch, never opened, is still closed with the arm
-0.15 above a zero taken 1.9 rotations up its travel. The tests' times and
-positions follow the constants: change them together. The
-[mechanisms README](../talOS/mechanisms/README.md#positionmechanism)
-treats each case more fully (homing stall checks, settling, timeouts).
-
-The raw arm's `Next:` also gives it button 6. To see the bounded push, set
-`sim_closed_at_rot = -10.0` in the arm's block, a switch the push never
-reaches, run with `buttons=32`, and read the session:
-
-```sh
-bazel run @talos//talOS/launcher:log_dump -- --node arm --topic /arm/state /tmp/talos_logs/<session> \
-  | grep -E 'enabled: true|FAILED' | awk 'NR%10==1' | head -7
-```
-
-```text
-      arm.ArmState {enabled: true, position_rot: 0, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: true, position_rot: -0.6280817140569875, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: true, position_rot: -1.4583854001985153, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: true, position_rot: -2.29171139162933, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: true, position_rot: -3.12503989562298, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: false, position_rot: -3.9583273858280004, connected: true, at_goal: false, homing: FAILED}
-      arm.ArmState {enabled: false, position_rot: -4.041465745773393, connected: true, at_goal: false, homing: FAILED}
-```
-
-It pushed for one second, stopped and reported `FAILED`, neutral, and still
-reported `FAILED` after the button was released: only a disable clears it.
-Put `sim_closed_at_rot` back to `-0.1` afterwards.
 
 Whatever your code does, a position or Motion Magic demand goes out neutral
 until `Motor::rezero` holds for the motor, unless its config sets

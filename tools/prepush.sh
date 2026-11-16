@@ -22,8 +22,9 @@
 # @talos//talOS/configuration:config_fuzz_test` inside examples/robot_repo
 # and examples/wrist_repo, the repositories that depend on talOS) and
 # scaffold-robot_repo (tools/check_robot_repo_scaffold.sh: a C++ and a
-# Python subsystem scaffolded into a copy of examples/robot_repo, then
-# `bazel test //...` there), robot-repository (when TALOS_ROBOT_REPOSITORY
+# Python subsystem scaffolded into a copy of examples/robot_repo, with and
+# without target coverage required, and into new_robot --standalone's copy
+# of it, then `bazel test //...` in each), robot-repository (when TALOS_ROBOT_REPOSITORY
 # names a robot repository's checkout: tools/check_robot_repository.sh on
 # it; otherwise one SKIPPED line that does not fail the run),
 # checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless

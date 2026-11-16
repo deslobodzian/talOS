@@ -4,7 +4,7 @@ Optional configured building blocks for the common FRC mechanisms: a
 subsystem node that uses one is a thin wrapper (a target lane in, a state out,
 and one library object that does the control, homing, readiness and fault
 handling), and a node may instead drive its devices directly
-([writing the arm yourself](../../docs/FIRST_MECHANISM.md#writing-the-arm-yourself)).
+([writing the arm yourself](#writing-the-arm-yourself)).
 `new_subsystem --type position` generates a node on `PositionMechanism`;
 with `--raw` it writes the homing and limits out in the node's own file
 instead.
@@ -223,6 +223,108 @@ switch reads closed, on a valid sample, with the homed mechanism more than
 
 `hold()` drives to the position the mechanism had when the current run of
 `hold()` calls began; it too needs a live target.
+
+## Writing the arm yourself
+
+A node may drive its `Motor` directly instead. Then the cases the library
+handles for you are yours: owning the node means owning them. An arm that
+homes on a switch must at least bound its push toward the switch, check
+that the switch opens when the arm leaves it, latch a failure, and push
+gently. To start from a node that does all four in your own code, scaffold
+the arm with `--raw`, from a robot repository:
+
+```sh
+bazel run @talos//tools:new_subsystem -- arm --lang cpp --type position --raw
+```
+
+Every line of the homing and limits is then in `arm/arm.h` (`arm.py` with
+`--lang py`, line for line the same), on the node's own `Motor`, home
+switch `arm_home` and `talos::DriverStation`; the package does not depend
+on `talOS/mechanisms`. The summary line adds `Written with --raw: every
+line of homing and limits written in your own file, with its tests.`
+
+The node zeroes the motor on the switch once the arm is at rest
+(`Motor::rezero`), then runs Motion Magic to the goal inside a fixed
+travel, and reports `FAILED` in `ArmState`'s `homing` field on either fault
+below. It reads the Driver Station only to clear a failure. The constants at
+the end of the class (`kMaxRot`, `kHomingVolts`, `kMaxPushTicks`,
+`kHomeMarginRot`; upper case at the top of the Python file) are
+placeholders sized for the simulation; set each for your mechanism:
+
+- **The push is bounded.** A switch that never closes (a cut wire reads
+  open) would otherwise push the arm into its bottom stop for as long as
+  the button is held. In the simulation the push moves the arm about
+  4 rot/s, so it crosses the 2-rotation travel (`kMaxRot`) and the 0.1
+  rotations to the switch in about half a second; `kMaxPushTicks` allows
+  twice that. On your mechanism, time a push across the full travel at
+  `kHomingVolts` and allow about twice that, in ticks of the subsystem's
+  `period_us`.
+- **A stuck switch is caught early.** A switch stuck or shorted closed
+  with the arm mid-travel at power-on zeroes the arm there, and Motion
+  Magic would then take it up to `kMaxRot` past the real top. So after
+  each zero, the arm goes no farther than `kHomeMarginRot` above it until
+  the switch has read open; still closed within 0.05 of that, the switch
+  cannot be right, and the arm fails. That is what is not caught: from a
+  wrong zero the arm can still move up to `kHomeMarginRot`, which from a
+  zero near the top is into the far stop, at the stator limit. Keep
+  `kHomeMarginRot` as small as your switch allows: the distance from
+  the zero at which it reliably opens, plus a little. In the simulation
+  it opens about 0.06 rotations up.
+- **Failed stays failed** (neutral) until the Driver Station reports
+  disabled. Releasing the button, a stale lane, a non-finite target or a
+  motor that briefly reads disconnected does not clear it, so none of
+  them starts another push into the stop. `Target::get()` returns null for
+  a release and a stale lane alike, so the node cannot tell them apart.
+- **The push is gentle.** `kHomingVolts` is low, and the motor's
+  `stator_limit_a` bounds how hard any command, the push included, can
+  drive the arm into a stop. The subsystem file sets a provisional 20 A,
+  not the motor's 80 A; choose the real value for your mechanism. Soft
+  limits do not bound this travel: they stay in the motor's power-on
+  frame, which a rezero does not move, and config load refuses them
+  unless `position_frame = "absolute"`.
+
+The subsystem file has no `[arm]` table, and the `Next:` simulation block
+no `[subsystems.arm.arm]`: those keys are the library's parameters, and
+the launcher refuses a key no node reads. `node_test.cc` carries the node
+test matrix, with goals inside the travel, and five tests of the node's
+own homing and limits: `HomingThatNeverReachesTheSwitchFails`,
+`FailureLatchesUntilDisabled`, `StuckSwitchStopsWithinTheMargin`,
+`GoalOutsideTheTravelClampsToIt` (goals of 5.0 and -1.0 demand 2.0 and 0)
+and `ZeroWaitsForRest` (no zero while the motor still moves on the
+switch). The
+fixture starts the arm on its switch (closed); `StartOffHome()` opens it.
+`hw.ideal_motors()` makes the simulated motor reach each demand at once,
+so in the last test the switch, never opened, is still closed with the arm
+0.15 above a zero taken 1.9 rotations up its travel. The tests' times and
+positions follow the constants: change them together. The
+[mechanisms README](#positionmechanism)
+treats each case more fully (homing stall checks, settling, timeouts).
+
+Its `Next:` prints a simulation block for `robot_sim.toml` and the
+launcher command that runs it with the arm's button held. To see the
+bounded push, set `sim_closed_at_rot = -10.0` in that block, a switch the
+push never reaches, run that command, and read the session it prints
+([first mechanism](../../docs/FIRST_MECHANISM.md#4-make-it-move-in-simulation)
+has the walk; here the arm held button 6, `buttons=32`):
+
+```sh
+bazel run @talos//talOS/launcher:log_dump -- --node arm --topic /arm/state /tmp/talos_logs/<session> \
+  | grep -E 'enabled: true|FAILED' | awk 'NR%10==1' | head -7
+```
+
+```text
+      arm.ArmState {enabled: true, position_rot: 0, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -0.6280817140569875, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -1.4583854001985153, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -2.29171139162933, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -3.12503989562298, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: false, position_rot: -3.9583273858280004, connected: true, at_goal: false, homing: FAILED}
+      arm.ArmState {enabled: false, position_rot: -4.041465745773393, connected: true, at_goal: false, homing: FAILED}
+```
+
+It pushed for one second, stopped and reported `FAILED`, neutral, and still
+reported `FAILED` after the button was released: only a disable clears it.
+Put `sim_closed_at_rot` back to `-0.1` afterwards.
 
 ## VelocityMechanism
 
