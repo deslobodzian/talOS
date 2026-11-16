@@ -104,6 +104,9 @@ struct Node::Impl {
   std::string hardware_request;
   // NodeAccess::mark_untargeted_outputs was called.
   bool untargeted_outputs = false;
+  // NodeAccess::set_outputs_held: written by the loop's thread at each
+  // devices flush, read by the registry's.
+  std::atomic<bool> outputs_held{false};
   Duration period{};
   Duration timeout{};
 
@@ -854,6 +857,19 @@ bool NodeAccess::untargeted_outputs(const Node& node) {
   return node.impl_->untargeted_outputs;
 }
 
+void NodeAccess::set_outputs_held(Node& node, bool held) {
+  std::atomic<bool>& outputs_held = node.impl_->outputs_held;
+  // The loop's thread is the only writer; skipping an unchanged store keeps
+  // the registry thread's cache line clean on every tick the answer holds.
+  if (outputs_held.load(std::memory_order_relaxed) != held) {
+    outputs_held.store(held, std::memory_order_relaxed);
+  }
+}
+
+bool NodeAccess::outputs_held(const Node& node) {
+  return node.impl_->outputs_held.load(std::memory_order_relaxed);
+}
+
 bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
                                 std::size_t bytes) {
   require_loop_thread(node, "Publisher::send");
@@ -1433,8 +1449,10 @@ int RunMain(int argc, char** argv, const char* node_name,
     loop.watch_fd(stop_fd, [&loop] {
       if (process::ConsumeStopWake()) loop.exit();
     });
-    reporter.start(loop, ByteTopicSources(*hosted->node),
-                   Endpoints(*hosted->node), Selections(*hosted->node));
+    reporter.start(
+        loop, ByteTopicSources(*hosted->node), Endpoints(*hosted->node),
+        Selections(*hosted->node),
+        [&node = *hosted->node] { return NodeAccess::outputs_held(node); });
 
     // Last, from this thread: the reporter is bookkeeping and must not
     // inherit the loop's realtime policy. The row carries the outcome, where

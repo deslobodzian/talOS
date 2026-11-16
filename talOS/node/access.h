@@ -248,6 +248,15 @@ struct NodeAccess {
   // throws std::logic_error naming the node.
   static void mark_untargeted_outputs(Node& node);
   static bool untargeted_outputs(const Node& node);
+  // Whether the devices flush is holding back outputs this node set: its
+  // last flush ran enabled, not opted out, with no Target returning a target
+  // in that update(), and that update() set an output non-neutral
+  // (REQ-SAFE-41). The flush records it on every tick, so it is one relaxed
+  // load, and a store only when the answer changed; the registry's row
+  // carries it as introspect::kFlagOutputsHeld. outputs_held() is safe to
+  // call from any thread.
+  static void set_outputs_held(Node& node, bool held);
+  static bool outputs_held(const Node& node);
   static bool publisher_send(Node& node, std::size_t index, const void* data,
                              std::size_t bytes);
 

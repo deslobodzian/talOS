@@ -337,6 +337,33 @@ TEST_F(Registry, ATargetsSelectedSourceReadsBackAndClearsToNone) {
   EXPECT_EQ(selection().selected_source(), std::nullopt);
 }
 
+// The flag Studio shows as "outputs held" sets and clears with the node's
+// answer, and clearing it leaves the bits written once beside it (the
+// realtime outcome, the event log flags).
+// REQ-SAFE-41
+TEST_F(Registry, OutputsHeldSetsAndClearsWithoutTouchingTheOtherFlags) {
+  NodeRegistration registration{{.name = "gate"}, path_};
+  registration.publish(sample_manifest());
+  registration.set_realtime({.tier = process::LoopTier::kControl});
+  registration.set_recording(/*failed=*/false, /*capped=*/true);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto row = [&reader] {
+    const auto nodes = reader->nodes();
+    EXPECT_EQ(nodes.size(), 1u);
+    return nodes.front();
+  };
+  const std::uint32_t before = row().flags;
+  EXPECT_FALSE(row().outputs_held());
+
+  registration.set_outputs_held(true);
+  EXPECT_TRUE(row().outputs_held());
+  EXPECT_EQ(row().flags, before | kFlagOutputsHeld);
+  registration.set_outputs_held(false);
+  EXPECT_FALSE(row().outputs_held());
+  EXPECT_EQ(row().flags, before);
+}
+
 TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
   {
     std::vector<Policy> policies(kMaxSelectionsPerNode + 1,

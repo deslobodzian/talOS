@@ -89,6 +89,12 @@ export type SystemNode = {
   // Null (or absent) from a bridge that predates the counters: not
   // reported, not zero.
   delivery?: DeliveryLoss|null;
+  // The devices flush is holding back outputs the node set: robot enabled,
+  // no Target returned a target in its last update(), and that update() set
+  // an output non-neutral, so every output went out neutral
+  // (introspect::kFlagOutputsHeld). False (or absent) for an idle node, a
+  // driving one, and a bridge that predates the field.
+  outputs_held?: boolean;
 };
 
 // The node's nonzero delivery counters, in DELIVERY_COUNTERS order; empty
@@ -306,7 +312,8 @@ function parseNode(value: unknown, where: string): SystemNode {
         list(node, 'sources', MAX_SOURCES)
             .map((entry, i) => parseSource(entry, `${where}.sources[${i}]`)),
     selections: selections(node, where),
-    delivery: delivery(node)
+    delivery: delivery(node),
+    outputs_held: flag(node, 'outputs_held')
   };
 }
 
@@ -364,11 +371,12 @@ function graphOf(root: Record<string, unknown>): SystemGraph {
 //
 // The bridge sends a client the whole graph on connect and when its structure
 // changes (a node starts, stops or restarts), and otherwise only its fast
-// values -- wall time, counters, heartbeats, liveness, selected sources, topic
-// verdicts -- as `talos.system_graph.update`, at most twice a second, for the
-// structure the client holds (studio/bridge/system.h, BuildSystemGraph). When
-// the radio budget defers an update it sends `talos.system_graph.deferred`
-// instead, so a graph that is late, not lost, is not marked stale.
+// values -- wall time, counters, heartbeats, liveness, selected sources, held
+// outputs, topic verdicts -- as `talos.system_graph.update`, at most twice a
+// second, for the structure the client holds (studio/bridge/system.h,
+// BuildSystemGraph). When the radio budget defers an update it sends
+// `talos.system_graph.deferred` instead, so a graph that is late, not lost,
+// is not marked stale.
 
 // The fast fields, in the order the bridge appends their values (its
 // BuildSystemGraph is the one source of that order). //studio:system_test
@@ -395,6 +403,7 @@ function fastSlots(root: Record<string, unknown>): [Record<string, unknown>, str
     });
     list(node, 'selections', MAX_SOURCES).forEach((selection, j) =>
         slots.push([record(selection, `nodes[${i}].selections[${j}]`), 'selected']));
+    if (node.outputs_held !== undefined) slots.push([node, 'outputs_held']);
   });
   list(root, 'topics', MAX_TOPICS).forEach((entry, i) => {
     const topic = record(entry, `topics[${i}]`);
@@ -737,6 +746,22 @@ export const isSubscriber = (kind: SourceKind) =>
 export function drivenBy(node: SystemNode): string|null {
   if (!node.selections.length) return null;
   return node.selections.map(s => s.selected ?? 'none').join(' · ');
+}
+
+// Whether to say the flush is holding back the node's outputs: only while
+// the node is live, since a stopped or unknown row's last answer is not
+// something happening now.
+export const outputsHeld = (node: SystemNode, live: boolean): boolean =>
+    live && node.outputs_held === true;
+
+// The "driven by" line of a node: drivenBy, and while the flush holds back
+// outputs the node set, 'none' (for a node without Targets too) and why its
+// outputs go out neutral, so "nobody drives, node idle" and "nobody drives,
+// node is trying" read differently. Null when there is nothing to say.
+export function drivenByLine(node: SystemNode, live: boolean): string|null {
+  const driver = drivenBy(node);
+  if (!outputsHeld(node, live)) return driver;
+  return `${driver ?? 'none'} · outputs held: no live target`;
 }
 
 export const rateKey = (node: string, sourceId: number) => `${node} ${sourceId}`;

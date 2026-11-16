@@ -101,7 +101,9 @@ After each tick the devices layer flushes one hardware request for the node:
   ([Targets](#targets)); a node whose constructor called
   `talos::AllowUntargetedOutputs` drives on `robot_enabled(node)` alone;
 - in a tick that does not drive every motor is neutral, DIO false and PWM
-  zero, and the request is still sent; in one that drives, digital and PWM
+  zero, and the request is still sent (while the robot is enabled and that
+  `update()` set an output non-neutral, Studio's system view marks the node
+  `outputs held: no live target`); in one that drives, digital and PWM
   outputs set during it are sent as set;
 - motor demand and feedforward are clamped to that motor's configured limits;
   non-finite values neutralize only that motor. `Motor::clamped_count()` counts

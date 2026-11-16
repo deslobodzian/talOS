@@ -78,6 +78,21 @@ guarantees for a short activation, is in
 [`src/data/alerts.ts`](src/data/alerts.ts). The demo cycles through numbered
 matches with one alert of each level.
 
+### System view
+
+The System panel's node cards
+([`src/panels/system/NodeCard.tsx`](src/panels/system/NodeCard.tsx)) show
+each node's liveness, cadence and dispatch count, a badge per nonzero
+delivery counter, and who drives its subsystem: each Target's selected
+source, `none` when its last `get()` returned null. While a live node's
+`update()` sets outputs with no live target, so the devices flush sends them
+neutral (the registry row's `outputs_held`;
+"Why an output stays neutral" in the guide's
+[Targets](../docs/NODE_DEVELOPMENT_GUIDE.md#targets)),
+the card reads `driven by none · outputs held: no live target`, for a node
+without Targets too, with what to do beneath; an idle node that sets nothing
+reads only `none`. The node's wiring view shows the same line.
+
 ## Driver dashboard
 
 The page the drive team watches during a match: `drive.html`, served by the

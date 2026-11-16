@@ -40,7 +40,10 @@
 //   - in a tick that does not drive, every motor is neutral, every digital
 //     output false and every PWM output 0, and the command still goes out;
 //     the first such tick of each enabled spell in which update() set an
-//     output non-neutral prints one line on stderr naming the node.
+//     output non-neutral prints one line on stderr naming the node, and
+//     every such tick marks the node's registry row outputs held
+//     (detail::NodeAccess::set_outputs_held), which the next flush that
+//     drives, sets nothing or runs disabled clears.
 // Incoming states pass hardware::AcceptState for this config's id and are
 // latched with their publication time; getters read the latched state (0 before
 // the first one), while connected() requires both a valid sample and a

@@ -188,6 +188,9 @@ TEST(SystemGraph, ReportsAnAbsentRegistryRatherThanFailing) {
   EXPECT_NE(json.find("\"topics\":[]"), std::string::npos);
 }
 
+// Who drives each Target, and whether the devices flush is holding back
+// outputs the node set while nobody does (introspect::kFlagOutputsHeld).
+// REQ-SAFE-41
 TEST(SystemGraph, NamesWhoDrivesEachTargetAndNullWhenNobodyDoes) {
   introspect::NodeSnapshot drivetrain;
   drivetrain.name = "drivetrain";
@@ -196,18 +199,30 @@ TEST(SystemGraph, NamesWhoDrivesEachTargetAndNullWhenNobodyDoes) {
       {.sources = {"teleop", "auto"}, .selected = 1},
       {.sources = {"teleop", "auto"}, .selected = -1},
   };
+  introspect::NodeSnapshot intake;
+  intake.name = "intake";
+  intake.alive = true;
+  intake.flags = introspect::kFlagSimulation | introspect::kFlagOutputsHeld;
+  intake.selections = {{.sources = {"teleop"}, .selected = -1}};
   SystemGraphInput input;
-  input.nodes = {drivetrain, Telemetry()};
+  input.nodes = {drivetrain, intake, Telemetry()};
   const std::string json = SystemGraphJson(input);
 
   EXPECT_NE(json.find("\"selections\":[{\"sources\":[\"teleop\",\"auto\"],"
                       "\"selected\":\"auto\"},{\"sources\":[\"teleop\","
-                      "\"auto\"],\"selected\":null}]"),
+                      "\"auto\"],\"selected\":null}],\"outputs_held\":false}"),
+            std::string::npos)
+      << json;
+  // Nobody drives the intake, and it is trying to move.
+  EXPECT_NE(json.find("\"selections\":[{\"sources\":[\"teleop\"],"
+                      "\"selected\":null}],\"outputs_held\":true}"),
             std::string::npos)
       << json;
   // A node without Targets says so with an empty list, not a missing field.
   EXPECT_NE(json.find("\"name\":\"telemetry\""), std::string::npos);
-  EXPECT_NE(json.find("\"selections\":[]"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"selections\":[],\"outputs_held\":false}"),
+            std::string::npos)
+      << json;
 }
 
 TEST(SystemGraph, EscapesNamesThatWouldOtherwiseBreakTheDocument) {
@@ -434,9 +449,10 @@ TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
 
 // The graph the golden files hold: three nodes whose fast values (wall time,
 // bridge counters, heartbeats, dispatch counts, liveness, delivery counters,
-// source counters, selected sources) are numbered in turn and all move on
-// from `refresh` 0 to 1 with the structure unchanged, so a value written into
-// another slot of its type reads as a wrong value, not the same one.
+// source counters, selected sources, held outputs) are numbered or flipped in
+// turn and all move on from `refresh` 0 to 1 with the structure unchanged, so
+// a value written into another slot of its type reads as a wrong value, not
+// the same one.
 SystemGraphInput GoldenGraph(int refresh) {
   std::uint64_t next = refresh == 0 ? 1000 : 5000;
   const auto value = [&next] { return next++; };
@@ -507,6 +523,7 @@ SystemGraphInput GoldenGraph(int refresh) {
       {.sources = {"teleop", "auto"}, .selected = refresh == 0 ? 0 : 1},
       {.sources = {"teleop"}, .selected = refresh == 0 ? -1 : 0},
   };
+  shooter.flags = refresh == 0 ? introspect::kFlagOutputsHeld : 0u;
 
   introspect::NodeSnapshot bridge = row("hardware_bridge", 1);
   bridge.alive = true;
