@@ -1,7 +1,8 @@
 """e2e: a robot scaffolded with a C++ velocity mechanism (gripper) and a
 position mechanism (position_cpp), edited exactly as their `Next:` output
-says and run the way it says (the launcher with sim_gateway --physics and
-its mode schedule, as `./sim.sh --sim-gateway` starts them), moves each
+says and run with its schedules (the launcher with sim_gateway --physics
+and its mode and joystick schedules, as `./sim.sh --sim-gateway` starts
+them; the test supplies the schedules' start itself, below), moves each
 motor to the goal its teleop binding holds while the button its `Next:`
 names is held, the position mechanism after homing on its simulated home
 switch. The joystick schedule holds each mechanism's button in turn, so it
@@ -11,18 +12,31 @@ new_subsystem_test keeps equal to its output.
 
 A robot scaffolded with --no-mechanism runs the same way: every member
 exits 0, and the bridge's last /hw/status is configured with no alert,
-reject or fault."""
+reject or fault.
+
+The test times the match itself (sim_gateway's --schedule-start-file)
+rather than with the `--duration-s 8` the printed command passes, which
+counts from the launcher's first spawn while the schedules count from the
+gateway's start, spawned last: every second of start-up (a sanitizer
+build, a loaded host) would come off the last mechanism's window (TODO.md
+TOOLS-18). Once every member's loop has started and the bridge has
+accepted a State (talOS/build/sim_check.py wait_ready), it writes the
+schedules' time zero for sim_gateway's --schedule-start-file, and stops the
+session with SIGINT, as Ctrl-C does, the schedule's length after it."""
 
 import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 from _posixshmem import shm_unlink  # what multiprocessing.shared_memory uses
 from python.runfiles import runfiles
 
+from talOS.build import sim_check
 from tools import new_robot_test as harness
 from tools import new_subsystem
 from tools import sync_manifest
@@ -36,15 +50,30 @@ MECHANISMS = (("position_cpp", "position"), ("gripper", "velocity"))
 REGISTRY = "/talos_registry.6"
 
 # Bounds on a hang, not on a run (which lasts SIM_DURATION_S or
-# NO_MECHANISM_DURATION_S): a hang in one case, with the other case's
-# ordinary run, stays below Bazel's 60 s `short` timeout, so it fails with
-# the test's diagnostics instead of being killed by Bazel.
-LAUNCH_TIMEOUT_S = 40
-NO_MECHANISM_LAUNCH_TIMEOUT_S = 12
+# NO_MECHANISM_DURATION_S from the schedules' time zero), so that one hang
+# fails with the test's diagnostics instead of being killed at Bazel's 60 s
+# `short` timeout. Per case: the wait for the session to be up, then the
+# stop: STOP_WAIT_S for the launcher to exit on SIGINT (its members get
+# 2 s, launcher.h kStopTimeout), as long again after SIGTERM to its group,
+# then EXIT_WAIT_S for its session's processes and sim_check.KILL_WAIT_S
+# after SIGKILL. A launcher that neither starts nor stops: 15 + 8 + 8 + 3
+# + 5 = 39 s; one that starts and then ignores SIGINT: start-up + 8 + 24
+# s. Either, with the other case's ordinary run (about 10 s plain), leaves
+# at least 10 s of the timeout on a plain build.
+READY_TIMEOUT_S = 15
+STOP_WAIT_S = 8
+EXIT_WAIT_S = 3
 LOG_DUMP_TIMEOUT_S = 5
 # The no-mechanism run: past the mode schedule's 1 s disabled spell, so
 # the gateway is enabled for the last records.
 NO_MECHANISM_DURATION_S = 3
+# The launcher's --duration-s: only a backstop for a test killed outright,
+# which could stop nothing; it lies past every bound above.
+BACKSTOP_S = READY_TIMEOUT_S + new_subsystem.SIM_DURATION_S + 10
+# The main-processor node clock sim_gateway reads a schedule start on
+# (talOS/simulation/README.md): CLOCK_MONOTONIC_RAW on macOS.
+NODE_CLOCK = (time.CLOCK_MONOTONIC_RAW if sys.platform == "darwin"
+              else time.CLOCK_MONOTONIC)
 
 
 def shm_name(topic, namespace):
@@ -144,13 +173,23 @@ def timed_records(log_dump, session, topic, node):
     return decoded
 
 
+def start_schedule(path):
+    """Writes now on the node clock as the schedules' time zero, atomically
+    (by rename), as sim_gateway's --schedule-start-file reads it."""
+    pending = path + ".pending"
+    with open(pending, "w", encoding="utf-8") as f:
+        f.write(str(time.clock_gettime_ns(NODE_CLOCK)))
+    os.rename(pending, path)
+
+
 class ScaffoldSimTest(unittest.TestCase):
     def launch(self, tmp, work, launcher, env, config, gateway_extra,
-               duration_s, timeout_s=LAUNCH_TIMEOUT_S):
-        """Runs `config` for `duration_s` the way `./sim.sh --sim-gateway`
-        does: the launcher starting sim_gateway --physics on its mode
-        schedule. Asserts the launcher exits 0; returns (session directory,
-        launcher output)."""
+               duration_s):
+        """Runs `config` the way `./sim.sh --sim-gateway` does: the
+        launcher starting sim_gateway --physics on its mode schedule, whose
+        time zero is when the session is up; stops it `duration_s` after
+        that (module docstring). Asserts the launcher stops in order and
+        exits 0; returns (session directory, launcher output)."""
         gateway_port, bridge_port = udp_ports()
         # Bazel's TEST_TMPDIR is the shared-memory namespace
         # (ARCHITECTURE.md "Topics and messages") and holds the lock files,
@@ -160,27 +199,45 @@ class ScaffoldSimTest(unittest.TestCase):
         env.pop("TALOS_SHM_NAMESPACE", None)
         env["TEST_TMPDIR"] = namespace
         self.addCleanup(unlink_registry, namespace)
+        start_file = os.path.join(tmp, "schedule_start")
         gateway_args = [
-            "--physics", "--mode-schedule",
-            new_subsystem.MODE_SCHEDULE] + gateway_extra
+            "--physics", "--mode-schedule", new_subsystem.MODE_SCHEDULE,
+            "--schedule-start-file", start_file] + gateway_extra
         args = [launcher, "--config", config, "--sim", "--start-sim-gateway"]
         for arg in gateway_args:
             args += ["--sim-gateway-arg", arg]
         output = os.path.join(tmp, "sessions")
         args += ["--remote", "127.0.0.1", "--remote-port", str(gateway_port),
                  "--local-port", str(bridge_port), "--output-dir", output,
-                 "--duration-s", str(duration_s)]
-        # The timeout only bounds a hang; the run lasts duration_s.
-        try:
-            run = subprocess.run(args, cwd=work, env=env,
-                                 capture_output=True, text=True,
-                                 timeout=timeout_s)
-        except subprocess.TimeoutExpired as hung:
-            self.fail(f"launcher still running after {hung.timeout:.0f} s: "
-                      f"{hung.stdout!r} {hung.stderr!r}")
-        diagnostics = run.stdout + run.stderr
-        self.assertEqual(run.returncode, 0, diagnostics)
-        (session,) = os.listdir(output)
+                 "--duration-s", str(BACKSTOP_S)]
+        os.makedirs(output)
+        log = os.path.join(tmp, "launch.log")
+        with open(log, "wb") as out, \
+                sim_check.Launch(args, out, cwd=work, env=env) as launch:
+            unready = sim_check.wait_ready(launch, output, READY_TIMEOUT_S)
+            ended = launch.process.poll()
+            if not unready and ended is None:
+                start_schedule(start_file)
+                try:
+                    ended = launch.process.wait(timeout=duration_s)
+                except subprocess.TimeoutExpired:
+                    pass
+            in_order, killed = launch.finish(STOP_WAIT_S, EXIT_WAIT_S)
+        with open(log, encoding="utf-8", errors="replace") as f:
+            diagnostics = f.read()
+        self.assertEqual(unready, "", diagnostics)
+        self.assertIsNone(ended, f"the launch ended on its own (exit "
+                          f"{ended}) before the test stopped it: "
+                          f"{diagnostics}")
+        self.assertTrue(in_order, f"the launch did not stop within "
+                        f"{STOP_WAIT_S} s of SIGINT: "
+                        f"{diagnostics}")
+        self.assertEqual(killed, [], diagnostics)
+        self.assertEqual(launch.process.returncode, 0, diagnostics)
+        sessions = [d for d in os.listdir(output)
+                    if os.path.isdir(os.path.join(output, d))]
+        self.assertEqual(len(sessions), 1, os.listdir(output))
+        (session,) = sessions
         return os.path.join(output, session), diagnostics
 
     # REQ-CONTRACT-35
@@ -195,7 +252,7 @@ class ScaffoldSimTest(unittest.TestCase):
             harness.generate(work, None, None)
             session, diagnostics = self.launch(
                 tmp, work, launcher, env, harness.SIM_CONFIG, [],
-                NO_MECHANISM_DURATION_S, NO_MECHANISM_LAUNCH_TIMEOUT_S)
+                NO_MECHANISM_DURATION_S)
             with open(os.path.join(session, "manifest.json"),
                       encoding="utf-8") as f:
                 nodes = json.load(f)["nodes"]

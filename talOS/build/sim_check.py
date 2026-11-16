@@ -375,11 +375,11 @@ class Launch:
     a check that raises, or is ended by a signal, leaves no process of the
     launch behind."""
 
-    def __init__(self, args, output, pass_fds=()):
+    def __init__(self, args, output, pass_fds=(), cwd=None, env=None):
         self.process = subprocess.Popen(
             args, stdin=subprocess.DEVNULL, stdout=output,
             stderr=subprocess.STDOUT, start_new_session=True,
-            pass_fds=pass_fds)
+            pass_fds=pass_fds, cwd=cwd, env=env)
         # setsid made the child its session's and process group's leader.
         self.sid = self.process.pid
         self.stopped = None
