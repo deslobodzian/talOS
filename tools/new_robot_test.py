@@ -8,6 +8,7 @@ already used is refused, and a fixture the template does not match refuses
 the copy. tools/check_robot_repo_scaffold.sh builds and tests what it makes
 of the real fixture, which a Bazel test cannot read (.bazelignore)."""
 
+import io
 import json
 import os
 import re
@@ -578,6 +579,38 @@ class RobotRepositoryTest(unittest.TestCase):
             finally:
                 os.chmod(locked, 0o700)
             self.assertEqual(os.listdir(locked), [])
+
+    # REQ-DEV-23
+    def test_a_directory_reached_through_a_symlink_is_written(self):
+        """Before, the plan named the resolved target and the write the
+        typed one, so a target under a symlink (macOS /tmp, $TMPDIR) was
+        refused: each file's path relative to the typed target climbed out
+        of the scratch directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            talos, _ = fake_talos(tmp)
+            os.makedirs(os.path.join(tmp, "real"))
+            os.symlink(os.path.join(tmp, "real"), os.path.join(tmp, "link"))
+            target = os.path.join(tmp, "link", "my_robot")
+            expected = sorted(rel_path(target, path) for path, _ in
+                              new_robot.plan_repository(talos, target,
+                                                        "my_robot"))
+            with mock.patch.object(new_subsystem, "talos_checkout",
+                                   return_value=talos), \
+                    mock.patch.dict(os.environ,
+                                    {"BUILD_WORKSPACE_DIRECTORY": talos,
+                                     "BUILD_WORKING_DIRECTORY": tmp}), \
+                    mock.patch("sys.stdout"), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                code = new_robot.main(["my_robot", "--standalone",
+                                       os.path.join("link", "my_robot")])
+            self.assertEqual(code, 0, f"{target}: {err.getvalue()}")
+            written = sorted(
+                rel_path(target, os.path.join(directory, name))
+                for directory, _, names in os.walk(target) for name in names)
+            self.assertEqual(written, expected)
+            # Renamed into place: no scratch directory is left beside it.
+            self.assertEqual(os.listdir(os.path.join(tmp, "real")),
+                             ["my_robot"])
 
 
 def rel_path(base, path):
