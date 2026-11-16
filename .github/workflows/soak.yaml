@@ -1,5 +1,5 @@
-# Minutes of the full simulated graph under SIGKILL/SIGSTOP chaos
-# (2026-robot/main_processor/simulation/README.md). Called by
+# Minutes of the bench's simulated graph under SIGKILL/SIGSTOP chaos
+# (bench/main_processor/simulation/README.md). Called by
 # continuous-integration.yaml (Linux, every push) and nightly.yaml (macOS).
 # The target is `manual`, so `bazel test //...` never runs it.
 name: Soak
@@ -41,7 +41,7 @@ jobs:
     # Built first, so the host recording below covers only the test.
     - name: Build
       run: >-
-        bazel build //2026-robot/main_processor/simulation:soak_test
+        bazel build //bench/main_processor/simulation:soak_test
         --noshow_progress
 
     - name: Soak
@@ -55,7 +55,7 @@ jobs:
       # host shows there and in no log of the test's own. The test's `long`
       # timeout bounds the recording to 15 minutes, a few MB.
       run: |
-        logs=bazel-testlogs/2026-robot/main_processor/simulation/soak_test
+        logs=bazel-testlogs/bench/main_processor/simulation/soak_test
         host="$RUNNER_TEMP/soak-host"
         mkdir -p "$host"
         # Job control puts each recorder pipeline in its own process group.
@@ -83,7 +83,7 @@ jobs:
           top -b -d 1 -w 200 -o %CPU 2>&1 \
             | awk '/^top -/ { n = 0 } n++ < 47' > "$host/top.log" &
         fi
-        bazel test //2026-robot/main_processor/simulation:soak_test \
+        bazel test //bench/main_processor/simulation:soak_test \
           --noshow_progress --test_output=all \
           --test_env=TALOS_SOAK_SECONDS=180 \
           --test_env=TALOS_SOAK_SEED="$SOAK_SEED"
@@ -93,5 +93,5 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: soak-${{ inputs.os }}-seed-${{ inputs.seed }}
-        path: bazel-testlogs/2026-robot/main_processor/simulation/soak_test/
+        path: bazel-testlogs/bench/main_processor/simulation/soak_test/
         if-no-files-found: ignore

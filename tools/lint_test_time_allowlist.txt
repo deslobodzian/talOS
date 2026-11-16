@@ -15,12 +15,12 @@ controller_processor/rio/src/test/cpp/RioLog_test.cpp clock integration: the log
 2026-robot/main_processor/drivetrain/send_target.cc sleep operator CLI beside the node, sends for a wall-clock duration; not node code
 2026-robot/main_processor/simulation/match_rehearsal_test.py clock e2e: paces scripted inputs against the running graph (TESTING.md §2)
 2026-robot/main_processor/simulation/match_rehearsal_test.py sleep e2e: paces scripted inputs against the running graph (TESTING.md §2)
-2026-robot/main_processor/simulation/soak_test.py clock soak: injected kills and stalls on the real clock (TESTING.md §2)
-2026-robot/main_processor/simulation/soak_test.py sleep soak: injected kills and stalls on the real clock (TESTING.md §2)
 2026-robot/main_processor/simulation/startup_test.py clock e2e: waits on the launched graph with deadlines (TESTING.md §2)
 2026-robot/main_processor/simulation/startup_test.py sleep e2e: waits on the launched graph with deadlines (TESTING.md §2)
 2026-robot/main_processor/vision/node_test.cc clock seeded: integration cases (capture threads) in a node logic target; move them to their own target (TESTING.md §2)
 2026-robot/main_processor/vision/node_test.cc sleep seeded: integration cases (capture threads) in a node logic target; move them to their own target (TESTING.md §2)
+bench/main_processor/simulation/soak_test.py clock soak: injected kills and stalls on the real clock (TESTING.md §2)
+bench/main_processor/simulation/soak_test.py sleep soak: injected kills and stalls on the real clock (TESTING.md §2)
 bench/main_processor/swerve_module/send_target.cc clock operator CLI beside the node, sends for a wall-clock duration; not node code
 bench/main_processor/swerve_module/send_target.cc sleep operator CLI beside the node, sends for a wall-clock duration; not node code
 studio/bridge/bandwidth_test.py clock seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)

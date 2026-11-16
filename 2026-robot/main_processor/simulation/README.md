@@ -46,7 +46,7 @@ clean process exits and no restarts/recorder failures.
 It then reads hardware requests, States and Driver Station packets from the
 JSONL `hardware` objects `log_dump` decodes with the wire codecs
 ([log_dump export](../../../talOS/launcher/README.md#filtering-and-exporting-logs));
-`match_rehearsal_test` and `soak_test` use the same helpers.
+`match_rehearsal_test` uses the same helpers.
 
 The match proves nonzero drivetrain velocity requests before each injection:
 
@@ -99,53 +99,13 @@ bazel test --test_output=errors --runs_per_test=3 \
   //2026-robot/main_processor/simulation:match_rehearsal_test
 ```
 
-## Soak and chaos test
-
-```sh
-bazel test --test_output=errors --test_env=TALOS_SOAK_SECONDS=180 \
-  //2026-robot/main_processor/simulation:soak_test
-```
-
-`soak_test` is tagged `manual` (`bazel test //...` and `:all` skip it); CI's
-soak job runs it for 180 s of teleop on Linux for `hardening/**` and
-`feature/**` pushes (seed 0) and for pushes to `main` (seed 1), and on macOS
-nightly (seed 1, `nightly.yaml`). It launches the
-same full graph plus the Studio bridge, holds teleop for `TALOS_SOAK_SECONDS`
-(3 to 600; the test refuses more, so a
-run fits Bazel's 900 s `long` timeout) with the stick centred for the first
-0.5 s of every 3 s cycle, and each cycle either `SIGKILL`s a node
-(drivetrain, driver, intake, teleop, telemetry, `hardware_node`) or
-`SIGSTOP`s one for 300 ms (driver, drivetrain, shooter, telemetry,
-`hardware_node`, Studio bridge), in an order shuffled by `TALOS_SOAK_SEED`
-(default 0). From the recording it checks, over the whole run:
-
-- each actuator owner's request gaps stay within its bridge owner timeout
-  except across a fault on that node, and a killed owner sends again within
-  5 s;
-- no request actuates under a disabled Driver Station view, and no drivetrain
-  request actuates without a received active teleop target published after
-  its latest crash and younger than `command_timeout_us`;
-- across a stalled driver, every drivetrain request is neutral from
-  `command_timeout_us` after the newest active target the drivetrain received
-  (across a stalled `hardware_node`, the newest `/hw/state`), not after the
-  `SIGSTOP`, and the first of them was due (`event_ms`) before that expiry
-  plus the drivetrain's `period_us`; a stalled drivetrain is neutralized in
-  `/hw/command` within its owner timeout plus a period of its last request;
-- the launcher exits 0, nothing is quarantined, and each node's
-  `restart_count` equals the number of times it was killed.
-
-It prints each owner's request-gap p99 and maximum. Failure artifacts are
-retained in the test's undeclared outputs, and a failure prints the tails of
-the launcher's and the Studio bridge's logs (the bridge's own exit reason is
-only in its log). The CI job also records the host once a second during the
-test (`vm_stat`/`vmstat`, `top`, and on macOS the busiest threads' priority
-and scheduling policy from `ps -M`) into `host/` beside the test's logs, kept
-with a failed session.
+The soak, which uses the bench robot as its subject, is
+[`//bench/main_processor/simulation:soak_test`](../../../bench/main_processor/simulation/README.md).
 
 ## Realtime scheduling in the full-graph tests on macOS
 
-`--sim` does not request realtime scheduling, so on macOS `startup_test`,
-`match_rehearsal_test` and `soak_test` set `TALOS_REALTIME=1`, the production
+`--sim` does not request realtime scheduling, so on macOS `startup_test` and
+`match_rehearsal_test` set `TALOS_REALTIME=1`, the production
 policy (see the node development guide's realtime scheduling paragraph). The
 graph alone uses about 2.5 cores (p90 about 4.6), more than a 3-vCPU macOS
 runner has free; at timeshare priority 5 ms loops then waited 10–50 ms and
