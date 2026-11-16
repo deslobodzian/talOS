@@ -1220,8 +1220,8 @@ TEST(Devices, OutputSettersOutsideUpdateThrow) {
 // A message callback runs on the loop thread but outside update(); another
 // thread can call a setter while update() runs. Both would command the
 // hardware outside the tick that flushes it.
-// REQ-SAFE-06: a setter from a callback throws naming the device; one off
-// the loop thread throws naming the setter
+// REQ-SAFE-06: a setter from a callback or off the loop thread throws naming
+// the device
 TEST(Devices, OutputSettersFromACallbackOrAnotherThreadThrow) {
   struct Listener {
     explicit Listener(Node& n)
@@ -1269,6 +1269,8 @@ TEST(Devices, OutputSettersFromACallbackOrAnotherThreadThrow) {
   auto& threaded = sim.add<Threaded>("mech");
   sim.step(10ms);
   EXPECT_NE(threaded.error.find("PwmOutput::set"), std::string::npos)
+      << threaded.error;
+  EXPECT_NE(threaded.error.find("'servo'"), std::string::npos)
       << threaded.error;
 }
 
