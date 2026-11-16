@@ -53,8 +53,10 @@ class Endpoint {
   void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
   // Ticks the gateway, drains received frames and sends this tick's State.
   // A configuration ACK whose send fails is kept and sent again at the start
-  // of each later Tick until a send succeeds or a newer ACK replaces it (the
-  // bridge would otherwise wait for its next push). Returns the State send's
+  // of each later Tick until a send succeeds or a newer transfer completes
+  // (its ACK replaces it, or, while its configure is pending, none is sent),
+  // so only the newest completed transfer's ACK ever goes out (the bridge
+  // would otherwise wait for its next push). Returns the State send's
   // status, or, when that succeeded, the first failed ACK send's: either way a
   // send that found the socket unable to send reaches the caller.
   protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
@@ -123,6 +125,9 @@ class Endpoint {
           if (ok && gateway_.configuring()) {
             pending_ack_ = true;
             pending_config_id_ = assembler_.config_id();
+            // An ACK still unsent answers a superseded push: only this
+            // configure's goes out.
+            ack_size_ = 0;
             continue;
           }
           ConfigAckPayload ack{};
