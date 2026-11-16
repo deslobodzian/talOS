@@ -22,10 +22,12 @@ tools/scaffold_testdata; a node package's tests are test sources. Comment
 lines are skipped.
 
 An integration, e2e, soak or perf test may use the real clock (§2); it is
-listed in tools/lint_test_time_allowlist.txt, one `<path> <kind> <reason>`
-per line, where kind is sleep, clock or retry. A hit not listed fails, and
-so does a listed (path, kind) with no hit left, so the list only shrinks.
-Exits 1 on either.
+listed in tools/lint_test_time_allowlist.txt, one `<path> <kind> [<count>]
+<reason>` per line, where kind is sleep, clock or retry and count, a
+positive number, is how many lines of that file hit that kind (a reason
+therefore does not start with a digit). A hit not listed fails, and so does
+a listed (path, kind) with no hit left; with a count, so do more hits than
+it, or fewer (lower the count), so the list only shrinks. Exits 1 on any.
 """
 
 import os
@@ -125,18 +127,24 @@ def scan(files, read):
 
 
 def parse_allowlist(text):
-    """({(path, kind): reason}, [errors]) from the allowlist's text."""
+    """({(path, kind): count or None}, [errors]) from the allowlist's text."""
     entries, errors = {}, []
     for number, line in enumerate(text.splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         fields = line.split(None, 2)
-        if len(fields) < 3 or fields[1] not in ("sleep", "clock", "retry"):
+        count = None
+        if len(fields) == 3 and fields[2][:1].isdigit():
+            first, _, reason = fields[2].partition(" ")
+            count = int(first) if first.isdigit() and int(first) > 0 else 0
+            fields[2] = reason.strip()
+        if (len(fields) < 3 or not fields[2] or count == 0 or
+                fields[1] not in ("sleep", "clock", "retry")):
             errors.append(f"{ALLOWLIST}:{number}: want `<path> sleep|clock|"
-                          f"retry <reason>`: {line}")
+                          f"retry [<count>] <reason>`: {line}")
             continue
-        entries[(fields[0], fields[1])] = fields[2]
+        entries[(fields[0], fields[1])] = count
     return entries, errors
 
 
@@ -148,13 +156,24 @@ def lint(files, read, allowlist_text, out=sys.stdout):
         print(error, file=out)
     failures = len(errors)
     for (path, kind), lines in sorted(hits.items()):
+        where = ", ".join(str(n) for n in lines)
         if (path, kind) not in allowed:
             failures += 1
-            where = ", ".join(str(n) for n in lines)
             print(f"{path}:{where}: {kind} (docs/TESTING.md §6.1, §8.1; "
                   f"METHODOLOGY.md §9). Wait on an event, take the clock as "
                   f"a parameter, or list it in {ALLOWLIST} with its reason.",
                   file=out)
+            continue
+        count = allowed[(path, kind)]
+        if count is not None and len(lines) > count:
+            failures += 1
+            print(f"{path}:{where}: {len(lines)} {kind} hits, {count} allowed "
+                  f"by {ALLOWLIST} (docs/TESTING.md §6.1, §8.1). Wait on an "
+                  f"event or take the clock as a parameter.", file=out)
+        elif count is not None and len(lines) < count:
+            failures += 1
+            print(f"{ALLOWLIST}: `{path} {kind} {count}` allows more than "
+                  f"its {len(lines)} hits; lower it to {len(lines)}", file=out)
     for path, kind in sorted(set(allowed) - set(hits)):
         failures += 1
         print(f"{ALLOWLIST}: stale entry `{path} {kind}`: no such hit left; "
