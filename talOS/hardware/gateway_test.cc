@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <optional>
@@ -197,7 +198,8 @@ TEST(Messages, MotorDiagnosticsUseSaturatingSignedTenths) {
 
 // A Command the main processor and the RoboRIO agree on byte for byte,
 // whatever either host's byte order: every integer and IEEE 754 double
-// little-endian, no padding.
+// little-endian, no padding. Each device count differs from the others, so
+// two counts written in each other's places fail.
 // REQ-CONTRACT-03
 TEST(Messages, CommandIsLittleEndianOnTheWire) {
   Command command;
@@ -207,23 +209,29 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
   command.observed_time_us = 0x3132333435363738ull;
   command.count = 1;
   command.motors[0] = {0x0102, Mode::kVoltage, 1, 1.0, -2.0};
-  command.digital_output_count = 1;
+  command.digital_output_count = 2;
   command.digital_outputs[0] = {0x0304, true};
-  command.pwm_output_count = 1;
+  command.digital_outputs[1] = {0x0305, false};
+  command.pwm_output_count = 3;
   command.pwm_outputs[0] = {0x0506, PwmMode::kPulse, 0.5};
+  command.pwm_outputs[1] = {0x0507, PwmMode::kOff, 0.0};
+  command.pwm_outputs[2] = {0x0508, PwmMode::kPulse, -1.0};
   const std::vector<uint8_t> expected{
       0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,   // config_id
       0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,   // boot_id
       0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,   // epoch
       0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,   // observed_time_us
-      1,    0,    1,    0,    1,    0,                  // counts
+      1,    0,    2,    0,    3,    0,                  // counts
       0x02, 0x01, 2,    1,                              // motor id, mode, slot
       0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // demand 1.0
       0,    0,    0,    0,    0,    0,    0,    0xC0,   // feedforward_v -2.0
-      0x04, 0x03, 1,                                    // digital output
-      0x06, 0x05,                                       // pwm id
-      1,                                                // pwm mode pulse
-      0,    0,    0,    0,    0,    0,    0xE0, 0x3F};  // pwm output 0.5
+      0x04, 0x03, 1,    0x05, 0x03, 0,                  // digital outputs
+      0x06, 0x05, 1,                                    // pwm id, pulse
+      0,    0,    0,    0,    0,    0,    0xE0, 0x3F,   // output 0.5
+      0x07, 0x05, 0,                                    // pwm id, off
+      0,    0,    0,    0,    0,    0,    0,    0,      // output +0.0
+      0x08, 0x05, 1,                                    // pwm id, pulse
+      0,    0,    0,    0,    0,    0,    0xF0, 0xBF};  // output -1.0
   std::array<uint8_t, kMaxCommandSize> bytes{};
   const auto size = Encode(command, bytes);
   ASSERT_EQ(size, expected.size());
@@ -306,7 +314,10 @@ TEST(Messages, MotorModeRunsToTorqueCurrentAndNoFurther) {
 }
 
 // The State the RoboRIO sends, byte for byte: integers, doubles, the float
-// CAN utilization and the signed-tenths diagnostics all little-endian.
+// CAN utilization and the signed-tenths diagnostics all little-endian. One
+// device of every kind leads its section, with the rest of its count zero
+// samples; each device count differs from the others, so two counts or two
+// sections written in each other's places fail.
 // REQ-CONTRACT-03
 TEST(Messages, StateIsLittleEndianOnTheWire) {
   State state;
@@ -319,7 +330,13 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
   state.sequence = 0x6162636465666768ull;
   state.build = {0x7172737475767778ull, GatewayProgram::kRoboRio, true};
   state.flags = 0x0A0B0C0D;
-  state.motor_count = 1;
+  state.motor_count = 5;
+  state.sensor_count = 6;
+  state.digital_input_count = 7;
+  state.digital_output_count = 4;
+  state.analog_input_count = 2;
+  state.encoder_count = 1;
+  state.pwm_output_count = 3;
   auto& motor = state.motors[0];
   motor.id = 0x0708;
   motor.valid = true;
@@ -332,6 +349,12 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
   motor.fault_flags = 0x090A0B0C;
   motor.temperature_c = -4.5;
   motor.supply_current_a = 0.1;
+  state.sensors[0] = {0x0910, true, 0.25, -0.5, 0x11121314, 0x15161718};
+  state.digital_inputs[0] = {0x0A0B, true, true};
+  state.digital_outputs[0] = {0x0C0D, true, false};
+  state.analog_inputs[0] = {0x0E0F, true, 2.5, 0x21222324};
+  state.encoders[0] = {0x1011, true, -2.0, 4.0, 0x25262728};
+  state.pwm_outputs[0] = {0x1213, true, -0.25};
   state.health.valid = true;
   state.health.battery_v = 12.5;
   state.health.can_bus_count = 2;
@@ -339,7 +362,7 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
   state.health.can_bus = {
       CanBusReadState::kOk, 0.25f, 0x11121314, 0x21222324, 5, 6, 0x31323334};
   state.counters = {0x41424344, 0x51525354, 0x61626364, 0x71727374};
-  const std::vector<uint8_t> expected{
+  std::vector<uint8_t> expected{
       0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // config_id
       0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,  // boot_id
       0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,  // epoch
@@ -350,24 +373,52 @@ TEST(Messages, StateIsLittleEndianOnTheWire) {
       0x78, 0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71,  // build.revision
       1,    1,                                         // program, dirty
       0x0D, 0x0C, 0x0B, 0x0A,                          // flags
-      1,    0,    0,    0,    0,    0,    0,    0,     // device counts
-      0,    0,    0,    0,    0,    0,                 //
-      0x08, 0x07, 1,                                   // motor id, valid
-      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,  // position_rot 1.0
-      0,    0,    0,    0,    0,    0,    0,    0xC0,  // velocity_rps -2.0
-      0,    0,    0,    0,    0,    0,    0xE0, 0x3F,  // voltage 0.5
-      123,  0,                                         // stator 12.3 A
-      0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05,  // ages
-      0x0C, 0x0B, 0x0A, 0x09,                          // fault_flags
-      0xD3, 0xFF, 1,    0,                             // -4.5 C, 0.1 A
-      1,                                               // health valid
-      0,    0,    0,    0,    0,    0,    0x29, 0x40,  // battery_v 12.5
-      0,    2,    1,    1,                             // brownout..read_state
-      0,    0,    0x80, 0x3E,                          // utilization 0.25f
-      0x14, 0x13, 0x12, 0x11, 0x24, 0x23, 0x22, 0x21,  // bus-off, buffer-full
-      5,    6,    0x34, 0x33, 0x32, 0x31,              // rx, tx, failures
-      0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51,  // counters
-      0x64, 0x63, 0x62, 0x61, 0x74, 0x73, 0x72, 0x71};
+      5,    0,    6,    0,    7,    0,    4,    0,     // motor, sensor, DI, DO
+      2,    0,    1,    0,    3,    0};                // analog, encoder, PWM
+  // `first`, then `more` samples of its size, all zero.
+  const auto section = [&expected](std::initializer_list<uint8_t> first,
+                                   std::size_t more) {
+    expected.insert(expected.end(), first);
+    expected.insert(expected.end(), more * first.size(), uint8_t{0});
+  };
+  section({0x08, 0x07, 1,                                   // motor id, valid
+           0,    0,    0,    0,    0,    0,    0xF0, 0x3F,  // position 1.0
+           0,    0,    0,    0,    0,    0,    0,    0xC0,  // velocity -2.0
+           0,    0,    0,    0,    0,    0,    0xE0, 0x3F,  // voltage 0.5
+           123,  0,                                         // stator 12.3 A
+           0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05,  // ages
+           0x0C, 0x0B, 0x0A, 0x09,                          // fault_flags
+           0xD3, 0xFF, 1,    0},                            // -4.5 C, 0.1 A
+          4);
+  section({0x10, 0x09, 1,                                    // sensor id, valid
+           0,    0,    0,    0,    0,    0,    0xD0, 0x3F,   // position 0.25
+           0,    0,    0,    0,    0,    0,    0xE0, 0xBF,   // velocity -0.5
+           0x14, 0x13, 0x12, 0x11, 0x18, 0x17, 0x16, 0x15},  // ages
+          5);
+  section({0x0B, 0x0A, 1, 1}, 6);         // digital input id, valid, value
+  section({0x0D, 0x0C, 1, 0}, 3);         // digital output id, valid, value
+  section({0x0F, 0x0E, 1,                 // analog id, valid
+           0, 0, 0, 0, 0, 0, 0x04, 0x40,  // voltage 2.5
+           0x24, 0x23, 0x22, 0x21},       // age
+          1);
+  section({0x11, 0x10, 1,                            // encoder id, valid
+           0,    0,    0,    0,   0, 0, 0,    0xC0,  // position -2.0
+           0,    0,    0,    0,   0, 0, 0x10, 0x40,  // velocity 4.0
+           0x28, 0x27, 0x26, 0x25},                  // age
+          0);
+  section({0x13, 0x12, 1,                  // PWM id, valid
+           0, 0, 0, 0, 0, 0, 0xD0, 0xBF},  // output -0.25
+          2);
+  expected.insert(
+      expected.end(),
+      {1,                                               // health valid
+       0,    0,    0,    0,    0,    0,    0x29, 0x40,  // battery_v 12.5
+       0,    2,    1,    1,                             // brownout..read_state
+       0,    0,    0x80, 0x3E,                          // utilization 0.25f
+       0x14, 0x13, 0x12, 0x11, 0x24, 0x23, 0x22, 0x21,  // bus-off, buffer-full
+       5,    6,    0x34, 0x33, 0x32, 0x31,              // rx, tx, failures
+       0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51,  // counters
+       0x64, 0x63, 0x62, 0x61, 0x74, 0x73, 0x72, 0x71});
   std::array<uint8_t, kMaxStateSize> bytes{};
   const auto size = Encode(state, bytes);
   ASSERT_EQ(size, expected.size());
