@@ -7,7 +7,9 @@ import {test} from 'node:test';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
-import type {SessionManifest} from '../src/data/manifest';
+import {readFileSync} from 'node:fs';
+
+import {parseManifest, type SessionManifest} from '../src/data/manifest';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {sessionPanel} from '../src/panels/session';
 import {mergeProcesses, summarize, worstLatency} from '../src/panels/session/logic';
@@ -372,4 +374,44 @@ test('a run with a log gap is a problem beside recorder failed', () => {
   const row = (name: string) => rows.find(r => r.name === name)!;
   assert.deepEqual(row('gapped').problems, ['recorder_failed', 'log_gap']);
   assert.deepEqual(row('old').problems, []);
+});
+
+// REQ-OPS-43: what each node lost in delivery, as the launcher records it
+// (talOS/launcher/session.cc), is shown per process, and any nonzero count is
+// a problem, as `session_report --strict` fails it: a lost wake, a stalled
+// arm, a wake fallback, or the bridge's skipped requests with the subsystem
+// each was skipped for. A node whose registry row the launcher never saw
+// carries none of the fields, which is "not recorded", never "none".
+// session_manifest.json is a real simulation session's manifest
+// (bench/main_processor/configuration/robot_physics_sim.toml), its paths
+// shortened, with three counts set nonzero.
+test('a node\'s delivery loss from the manifest is shown and is a problem', () => {
+  const raw = readFileSync(new URL('./session_manifest.json', import.meta.url), 'utf8');
+  const parsed = parseManifest(raw);
+  const rows = mergeProcesses(parsed, null, null, {}, false);
+  const row = (name: string) => rows.find(r => r.name === name)!;
+  assert.deepEqual(row('telemetry').delivery, {
+    wake_failures: 1, stalled_arms: 2, wake_fallbacks: 0, requests_skipped: 0,
+    requests_skipped_by_subsystem: {}
+  });
+  assert.deepEqual(row('telemetry').problems, ['delivery_loss']);
+  assert.deepEqual(row('hardware_node').delivery?.requests_skipped_by_subsystem,
+                   {swerve_module: 3});
+  assert.deepEqual(row('hardware_node').problems, ['delivery_loss']);
+  assert.deepEqual(row('gyro').problems, []);
+
+  const unseen = JSON.parse(raw) as {nodes: Record<string, unknown>[]};
+  for (const key of ['wake_failures', 'stalled_arms', 'wake_fallbacks',
+                     'requests_skipped', 'requests_skipped_by_subsystem']) {
+    delete unseen.nodes[1][key];
+  }
+  const gyro = parseManifest(JSON.stringify(unseen)).nodes[1];
+  assert.equal(gyro.name, 'gyro');
+  assert.equal(gyro.delivery, undefined);
+
+  const text = renderPanel(createStaticStudio({manifest: parsed}))
+                   .replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+  assert.match(text, /telemetry delivery loss .*wake failures 1 · stalled arms 2/);
+  assert.match(text, /hardware_node delivery loss .*skipped requests 3 \(swerve_module 3\)/);
+  assert.match(text, /gyro .* none /);
 });

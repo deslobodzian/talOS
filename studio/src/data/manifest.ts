@@ -24,6 +24,19 @@ export type ManifestRun = {
   stopped_by_session?: boolean;
 };
 
+// What a node's registry rows said it lost in delivery, summed over its runs
+// (REQ-OPS-43; talOS/introspection README "Wake loss"). Each should stay 0;
+// `session_report --strict` fails a session with any of them nonzero.
+export type ManifestDelivery = {
+  wake_failures: number;
+  stalled_arms: number;
+  wake_fallbacks: number;
+  // The bridge's requests its latest-value read passed over, in total and
+  // per subsystem; 0 and empty for every other node.
+  requests_skipped: number;
+  requests_skipped_by_subsystem: Record<string, number>;
+};
+
 export type ManifestNode = {
   name: string;
   target: string;
@@ -48,6 +61,10 @@ export type ManifestNode = {
   // A run's live endpoints differed from its --describe probe (the launcher
   // README's "Live endpoints").
   endpoint_mismatch: boolean;
+  // Absent when the launcher never saw a run's registry row (so nothing was
+  // watched, which is not "nothing lost"), and in manifests written before
+  // the launcher recorded it.
+  delivery?: ManifestDelivery;
   record_count: string;
 };
 
@@ -72,6 +89,7 @@ const MAX_STRING = 512;
 const MAX_PATH = 4096;
 const MAX_LOG_PATHS = 64;
 const MAX_RUNS = 64;
+const MAX_SUBSYSTEMS = 256;
 
 const fail = (what: string): never => {
   throw Error(what);
@@ -197,8 +215,43 @@ function parseRun(value: unknown, where: string): ManifestRun {
   };
 }
 
+// A count the launcher always writes once it writes any of them.
+function count(source: Record<string, unknown>, key: string): number {
+  const value = source[key];
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
+    fail(`${key} must be a non-negative integer`);
+  return value as number;
+}
+
+// The launcher writes all five fields or none (talOS/launcher/session.cc).
+function parseDelivery(source: Record<string, unknown>,
+                       where: string): ManifestDelivery|undefined {
+  if (!('wake_failures' in source)) return undefined;
+  const split = record(source['requests_skipped_by_subsystem'],
+                       `${where}.requests_skipped_by_subsystem`);
+  const subsystems = Object.keys(split);
+  if (subsystems.length > MAX_SUBSYSTEMS)
+    fail(`requests_skipped_by_subsystem must hold at most ${MAX_SUBSYSTEMS} entries`);
+  // fromEntries defines each key as its own property, so no key (not even
+  // "__proto__") reaches the object's prototype.
+  const bySubsystem: Record<string, number> = Object.fromEntries(
+      subsystems.map(subsystem => {
+        if (subsystem.length > MAX_STRING)
+          fail(`requests_skipped_by_subsystem key must be at most ${MAX_STRING} characters`);
+        return [subsystem, count(split, subsystem)];
+      }));
+  return {
+    wake_failures: count(source, 'wake_failures'),
+    stalled_arms: count(source, 'stalled_arms'),
+    wake_fallbacks: count(source, 'wake_fallbacks'),
+    requests_skipped: count(source, 'requests_skipped'),
+    requests_skipped_by_subsystem: bySubsystem
+  };
+}
+
 function parseNode(value: unknown, where: string): ManifestNode {
   const source = record(value, where);
+  const delivery = parseDelivery(source, where);
   const runs = 'runs' in source ?
       list(source, 'runs', MAX_RUNS).map(
           (entry, i) => parseRun(entry, `${where}.runs[${i}]`)) :
@@ -225,6 +278,7 @@ function parseNode(value: unknown, where: string): ManifestNode {
     log_gap: flag(source, 'log_gap'),
     described: flag(source, 'described'),
     endpoint_mismatch: flag(source, 'endpoint_mismatch'),
+    ...(delivery ? {delivery} : {}),
     record_count: countString(source, 'record_count')
   };
 }
