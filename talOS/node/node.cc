@@ -1275,7 +1275,7 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   }
   // An output log with a gap is incomplete evidence, like a failed one; and
   // a run that stopped before a gap did not replay the whole session.
-  if (loop.recorder().gaps() > 0 || report.stopped_at_gap.has_value()) {
+  if (loop.recorder().incomplete() || report.stopped_at_gap.has_value()) {
     return 1;
   }
   return 0;
