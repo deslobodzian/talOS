@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -1419,7 +1420,7 @@ TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
   const auto path = TempPath("unopened_fifo");
   ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
   std::optional<LogWriter> writer;
-  std::atomic<bool> recorded{false};
+  std::promise<void> recorded;
   std::thread producer{[&] {
     writer.emplace(path, "unopened", LogWriter::Options{4096, 2, true}, 9);
     writer->start(MakeManifest(), MonotonicTime::from_nanos(42));
@@ -1428,14 +1429,14 @@ TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
       context.dispatch_index = i;
       writer->dispatch(context, MakePayload(16, static_cast<int>(i)));
     }
-    recorded.store(true);
+    recorded.set_value();
   }};
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{2};
-  while (!recorded.load() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{5});
-  }
-  const bool waited = !recorded.load();
+  // Nothing opens the FIFO's read end before this wait ends, so a producer
+  // that waits for the file never records; the deadline only bounds that
+  // failure (docs/TESTING.md §6.3).
+  const bool waited =
+      recorded.get_future().wait_for(std::chrono::seconds{10}) !=
+      std::future_status::ready;
   // The reader lets the open finish, whichever thread is blocked in it.
   std::vector<std::byte> bytes;
   std::thread consumer{[&] {
@@ -2850,10 +2851,13 @@ TEST(LogBackgroundWriter, IdleWriterDoesNotPoll) {
     const std::set<pid_t> before = ThreadIds();
     LogWriter writer{path, "idle", LogWriter::Options{}};
     writer.start({}, {});
-    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    // Returns once the writer thread has created the file and synced it;
+    // all it can do next is go idle.
+    writer.flush();
     const pid_t id = NewThread(before);
     ASSERT_NE(id, 0);
     const long start = VoluntarySwitches(id);
+    // The window is the subject: how often an idle writer wakes in 500 ms.
     std::this_thread::sleep_for(std::chrono::milliseconds{500});
     const long wakeups = VoluntarySwitches(id) - start;
     ASSERT_GE(start, 0);
