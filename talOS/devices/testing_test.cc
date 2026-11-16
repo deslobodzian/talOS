@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -88,7 +89,8 @@ hardware::Command DriveAll(const hardware::State& state,
     command.digital_outputs[command.digital_output_count++] = {id, true};
   }
   for (const auto id : devices.pwm_outputs) {
-    command.pwm_outputs[command.pwm_output_count++] = {id, 0.75};
+    command.pwm_outputs[command.pwm_output_count++] = {
+        .id = id, .mode = hardware::PwmMode::kPulse, .output = 0.75};
   }
   return command;
 }
@@ -160,7 +162,7 @@ TEST_F(SimHardwareTest, SilenceExpiresAllAppliedOutputsAtTheOwnerTimeout) {
   sim.step(25ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.75);
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), 0.75);
   EXPECT_DOUBLE_EQ(Motor("braked").velocity_rps, 40.0);
   EXPECT_DOUBLE_EQ(Motor("coasting").velocity_rps, 40.0);
 
@@ -168,7 +170,7 @@ TEST_F(SimHardwareTest, SilenceExpiresAllAppliedOutputsAtTheOwnerTimeout) {
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.0);
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
   sim.step(4ms);  // the first hardware tick after the deadline
   EXPECT_NEAR(Motor("braked").velocity_rps, 40.0 * (1.0 - 0.005 / 0.05), 1e-12);
   EXPECT_NEAR(Motor("coasting").velocity_rps, 40.0 * (1.0 - 0.005 / 1.0),
@@ -183,7 +185,7 @@ TEST_F(SimHardwareTest, SilenceExpiresAllAppliedOutputsAtTheOwnerTimeout) {
   EXPECT_EQ(hw.motor_request("mech", "braked").mode, Mode::kVelocity);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "braked").demand, 40.0);
   EXPECT_TRUE(hw.digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.pwm("mech", "servo"), 0.75);
+  EXPECT_EQ(hw.pwm("mech", "servo"), 0.75);
 }
 
 TEST_F(SimHardwareTest, OneNodesPublicationsCannotRefreshAnotherNodesRequest) {
@@ -194,14 +196,14 @@ TEST_F(SimHardwareTest, OneNodesPublicationsCannotRefreshAnotherNodesRequest) {
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("other", "other_led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("other", "other_servo"), 0.75);
+  EXPECT_EQ(hw.applied_pwm("other", "other_servo"), 0.75);
 
   sim.step(19ms);
   EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kVelocity);
   sim.step(1ms);
   EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("other", "other_led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("other", "other_servo"), 0.0);
+  EXPECT_EQ(hw.applied_pwm("other", "other_servo"), std::nullopt);
 }
 
 TEST_F(SimHardwareTest, IdenticalPublicationRenewsOnlyItsOwnDeadline) {
@@ -212,11 +214,11 @@ TEST_F(SimHardwareTest, IdenticalPublicationRenewsOnlyItsOwnDeadline) {
   sim.step(25ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.applied_digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.75);
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), 0.75);
   sim.step(1ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.0);
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
 }
 
 TEST_F(SimHardwareTest,
@@ -256,7 +258,7 @@ TEST_F(SimHardwareTest, SilentOwnerWithAnOldObservationStopsEveryOutput) {
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("other", "other_led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("other", "other_servo"), 0.0);
+  EXPECT_EQ(hw.applied_pwm("other", "other_servo"), std::nullopt);
 
   Send("other", before);
   EXPECT_EQ(hw.applied_motor("other", "motor").mode, Mode::kNeutral);
@@ -289,7 +291,7 @@ TEST_F(SimHardwareTest, LatestRequestNeutralizesOmittedOutputsButPreservesRaw) {
   sim.step(5ms);
   ASSERT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kVelocity);
   ASSERT_TRUE(hw.applied_digital_output("mech", "led"));
-  ASSERT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.75);
+  ASSERT_EQ(hw.applied_pwm("mech", "servo"), 0.75);
 
   auto command = Drive();
   command.count = 1;
@@ -301,11 +303,11 @@ TEST_F(SimHardwareTest, LatestRequestNeutralizesOmittedOutputsButPreservesRaw) {
   EXPECT_DOUBLE_EQ(hw.applied_motor("mech", "braked").demand, 11.0);
   EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.0);
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
   EXPECT_EQ(hw.motor_request("mech", "coasting").mode, Mode::kVelocity);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "coasting").demand, 40.0);
   EXPECT_TRUE(hw.digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.pwm("mech", "servo"), 0.75);
+  EXPECT_EQ(hw.pwm("mech", "servo"), 0.75);
   EXPECT_FALSE(State().digital_outputs[0].value);
   EXPECT_DOUBLE_EQ(State().pwm_outputs[0].output, 0.0);
 
@@ -314,6 +316,28 @@ TEST_F(SimHardwareTest, LatestRequestNeutralizesOmittedOutputsButPreservesRaw) {
   sim.step(5ms);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "braked").demand, 11.0);
+}
+
+// A PWM request is off (no pulse) or a pulse, and a pulse of 0 is the centre
+// pulse, not off: inspection keeps them apart, while the State's sample
+// reads 0 for both, as the RoboRIO's PWM::GetSpeed does.
+// REQ-SAFE-03
+TEST_F(SimHardwareTest, PwmOffIsNoPulseAndAPulseOfZeroIsCentre) {
+  auto command = Drive();
+  command.pwm_outputs[0].output = 0.0;
+  Send("mech", command);
+  sim.step(5ms);
+  EXPECT_EQ(hw.pwm("mech", "servo"), 0.0);
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), 0.0);
+
+  command = Drive();
+  command.pwm_outputs[0] = {.id = command.pwm_outputs[0].id};
+  Send("mech", command);
+  sim.step(5ms);
+  EXPECT_EQ(hw.pwm("mech", "servo"), std::nullopt);
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
+  EXPECT_TRUE(State().pwm_outputs[0].valid);
+  EXPECT_EQ(State().pwm_outputs[0].output, 0.0);
 }
 
 // Disabled hardware applies neutral, so even ideal motors decay instead of
@@ -328,10 +352,10 @@ TEST_F(SimHardwareTest, DisableNeutralizesAppliedOutputsWithoutChangingRaw) {
   hw.enable(false);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_FALSE(hw.applied_digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.applied_pwm("mech", "servo"), 0.0);
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
   EXPECT_EQ(hw.motor_request("mech", "braked").mode, Mode::kVelocity);
   EXPECT_TRUE(hw.digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw.pwm("mech", "servo"), 0.75);
+  EXPECT_EQ(hw.pwm("mech", "servo"), 0.75);
   sim.step(5ms);
   EXPECT_NEAR(Motor("braked").velocity_rps, 36.0, 1e-12);
   EXPECT_NEAR(Motor("coasting").velocity_rps, 39.8, 1e-12);
@@ -583,8 +607,8 @@ TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
     EXPECT_EQ(hw.applied_motor("other", "motor").mode,
               driving ? Mode::kVoltage : Mode::kNeutral);
     EXPECT_EQ(hw.applied_digital_output("other", "other_led"), driving);
-    EXPECT_DOUBLE_EQ(hw.applied_pwm("other", "other_servo"),
-                     driving ? 0.5 : 0.0);
+    EXPECT_EQ(hw.applied_pwm("other", "other_servo"),
+              driving ? std::optional{0.5} : std::nullopt);
   };
   sim.step(20ms);
   ASSERT_TRUE(other.enabled);

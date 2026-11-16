@@ -631,6 +631,7 @@ class HardwareValues {
     Each(c.pwm_outputs, c.pwm_output_count, "pwm_outputs/",
          n ? &n->pwm_outputs : nullptr,
          [&](const std::string& p, const hw::PwmRequest& x) {
+           Text(p + "mode", talos::launcher::PwmModeName(x.mode));
            Double(p + "output", x.output);
          });
   }

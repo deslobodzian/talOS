@@ -5,11 +5,12 @@
     self.ds = talos.DriverStation(node)          # what the bridge forwards
 
 Take handles in __init__. Output commands (Motor.set_* and stop(),
-DigitalOutput.set, PwmOutput.set) are taken only inside update() and apply
-to the flush right after it; outputs that update() did not set are neutral.
-From __init__, an every() timer or a callback they raise TalosError naming
-the device, since such a command would reach the hardware for at most one
-tick. Motors, digital outputs and PWM outputs are neutral while
+DigitalOutput.set, PwmOutput.set and stop()) are taken only inside update()
+and apply to the flush right after it; outputs that update() did not set are
+neutral (a PWM output's neutral is off: no pulse; set(0.0) is the centre
+pulse). From __init__, an every() timer or a callback they raise TalosError
+naming the device, since such a command would reach the hardware for at most
+one tick. Motors, digital outputs and PWM outputs are neutral while
 talos.robot_enabled(node) is false, and in any tick in which no talos.Target
 of the node returned a target from a get() (or source) made during that
 update(): drive only from what get() returns. The request still goes out,
@@ -38,6 +39,7 @@ class Mode(enum.IntEnum):
     VELOCITY = _abi.MODE_VELOCITY
     POSITION = _abi.MODE_POSITION
     MOTION_MAGIC = _abi.MODE_MOTION_MAGIC
+    TORQUE_CURRENT = _abi.MODE_TORQUE_CURRENT
 
 
 def robot_enabled(node):
@@ -221,6 +223,16 @@ class Motor(_Input):
     def set_motion_magic(self, rot, ff_volts=0.0, slot=0):  # onboard profile
         self._set(Mode.MOTION_MAGIC, rot, ff_volts, slot)
 
+    def set_torque_current(self, amperes):
+        """Stator current, amperes, through Phoenix TorqueCurrentFOC
+        (Motor::set_torque_current). Raises TalosError naming the motor and
+        the key unless its config sets foc = true and
+        max_torque_current_a > 0; clamped to +-max_torque_current_a
+        (clamped_count counts it); non-finite is neutral. 0.0 is a driving
+        request, not neutral; stop() is neutral. What the motor does at
+        exactly 0 A: talOS/hardware/README.md, Supported Hardware Requests."""
+        self._set(Mode.TORQUE_CURRENT, amperes)
+
     def stop(self):
         self._set(Mode.NEUTRAL, 0.0)
 
@@ -357,7 +369,14 @@ class PwmOutput(_Device):
     _KIND = _abi.DEVICE_PWM
 
     def set(self, output):
+        """A pulse for `output`, clamped to [-1, 1]: 0 is the 1.5 ms centre
+        pulse. A non-finite output sends no pulse."""
         _abi.ok(lib.talos_pwm_set(self._node, self._index, output))
+
+    def stop(self):
+        """No pulse in this tick's flush, the same as not calling set() in
+        this update()."""
+        _abi.ok(lib.talos_pwm_stop(self._node, self._index))
 
 
 class Alliance(enum.IntEnum):

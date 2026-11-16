@@ -511,7 +511,7 @@ State still names the build; from a git checkout the build refuses them
 ([build stamp](../talOS/hardware/README.md#roborio)).
 Deploy it from the talOS checkout the main-processor bundle was built
 against (the one a robot repository's `MODULE.bazel` names): each side
-rejects frames of another protocol version (currently 8; see
+rejects frames of another protocol version (currently 11; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once
 when that happens; the RoboRIO reports it in the Driver Station message log
 (a `talos companion link` error naming both versions,

@@ -14,8 +14,11 @@ enum class Mode : uint8_t {
   kVoltage,
   kVelocity,
   kPosition,
-  kMotionMagic
+  kMotionMagic,
+  kTorqueCurrent,  // stator amperes: Phoenix TorqueCurrentFOC (needs foc)
 };
+// Decode rejects a mode above it; adding one bumps protocol::kProtocolVersion.
+inline constexpr Mode kLastMode = Mode::kTorqueCurrent;
 enum StateFlags : uint32_t {
   kConfigured = 1,  // a config applied and commissioned
   kEnabled = 2,
@@ -26,7 +29,9 @@ struct MotorRequest {
   uint16_t id{};
   Mode mode{Mode::kNeutral};
   uint8_t slot{};
-  double demand{};  // duty ratio, volts, mechanism rotations/s, or rotations.
+  // Duty ratio, volts, mechanism rotations/s, rotations, or stator amperes.
+  double demand{};
+  // Volts; 0 unless velocity, position or motion magic.
   double feedforward_v{};
   bool operator==(const MotorRequest&) const = default;
 };
@@ -35,9 +40,18 @@ struct DigitalOutputRequest {
   bool value{false};
   bool operator==(const DigitalOutputRequest&) const = default;
 };
+// What a PWM output's request asks of it. Wire values, never renumbered:
+// decode rejects a value above kLastPwmMode. kOff is the zero byte, so a
+// value-initialized request sends no pulse.
+enum class PwmMode : uint8_t {
+  kOff = 0,    // no pulse (frc::PWM::SetDisabled): the output's neutral
+  kPulse = 1,  // the pulse frc::PWM::SetSpeed(output) gives; 0 is the centre
+};
+inline constexpr PwmMode kLastPwmMode = PwmMode::kPulse;
 struct PwmRequest {
   uint16_t id{};
-  double output{};
+  PwmMode mode{PwmMode::kOff};
+  double output{};  // [-1, 1] under kPulse; +0.0 under kOff
   bool operator==(const PwmRequest&) const = default;
 };
 struct Command {
@@ -237,7 +251,7 @@ struct State {
 inline constexpr std::size_t kCommandBaseSize = 4 * 8 + 3 * 2;
 inline constexpr std::size_t kMotorRequestSize = 2 + 1 + 1 + 2 * 8;
 inline constexpr std::size_t kDigitalOutputRequestSize = 2 + 1;
-inline constexpr std::size_t kPwmRequestSize = 2 + 8;
+inline constexpr std::size_t kPwmRequestSize = 2 + 1 + 8;
 inline constexpr std::size_t kMaxCommandSize =
     kCommandBaseSize + kMaxMotors * kMotorRequestSize +
     kMaxDigitalOutputs * kDigitalOutputRequestSize +
@@ -271,7 +285,7 @@ inline constexpr std::size_t kMaxStateSize =
     kMaxAnalogInputs * kAnalogInputSampleSize +
     kMaxEncoders * kEncoderSampleSize + kMaxPwmOutputs * kPwmSampleSize;
 
-static_assert(kMaxCommandSize == 410, "Update docs/DATA_FLOW.md");
+static_assert(kMaxCommandSize == 414, "Update docs/DATA_FLOW.md");
 static_assert(kStateBaseSize - kHealthSampleSize - kGatewayCountersSize == 84,
               "Update docs/DATA_FLOW.md");
 static_assert(kHealthSampleSize == 31, "Update docs/DATA_FLOW.md");

@@ -64,7 +64,7 @@ detail::DeviceKind DeviceKindOf(std::int32_t kind) {
 }
 
 hardware::Mode MotorMode(std::int32_t mode) {
-  if (mode < TALOS_MODE_NEUTRAL || mode > TALOS_MODE_MOTION_MAGIC) {
+  if (mode < TALOS_MODE_NEUTRAL || mode > TALOS_MODE_TORQUE_CURRENT) {
     throw std::invalid_argument("unknown motor mode " + std::to_string(mode));
   }
   return static_cast<hardware::Mode>(mode);
@@ -93,7 +93,11 @@ static_assert(SameMode(TALOS_MODE_NEUTRAL, hardware::Mode::kNeutral) &&
               SameMode(TALOS_MODE_VOLTAGE, hardware::Mode::kVoltage) &&
               SameMode(TALOS_MODE_VELOCITY, hardware::Mode::kVelocity) &&
               SameMode(TALOS_MODE_POSITION, hardware::Mode::kPosition) &&
-              SameMode(TALOS_MODE_MOTION_MAGIC, hardware::Mode::kMotionMagic));
+              SameMode(TALOS_MODE_MOTION_MAGIC, hardware::Mode::kMotionMagic) &&
+              SameMode(TALOS_MODE_TORQUE_CURRENT,
+                       hardware::Mode::kTorqueCurrent));
+static_assert(hardware::kLastMode == hardware::Mode::kTorqueCurrent,
+              "a new hardware::Mode needs its TALOS_MODE_* and MotorMode()");
 static_assert(TALOS_WAKE_ON_PUBLISH == static_cast<int>(Wake::kOnPublish) &&
               TALOS_WAKE_AT_DRAIN == static_cast<int>(Wake::kAtDrain));
 
@@ -719,6 +723,13 @@ int32_t talos_digital_output_set(TalosNode* node, int64_t index,
 int32_t talos_pwm_set(TalosNode* node, int64_t index, double output) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     HardwareAccess::pwm_set(Link(node), Index(index), output);
+    return TALOS_OK;
+  });
+}
+
+int32_t talos_pwm_stop(TalosNode* node, int64_t index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    HardwareAccess::pwm_stop(Link(node), Index(index));
     return TALOS_OK;
   });
 }

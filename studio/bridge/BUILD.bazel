@@ -229,9 +229,18 @@ py_test(
     ],
     data = [":studio_bridge"],
     main = "stop_test.py",
+    # The 0.5 s stop bound is this test's (STOP_BOUND_S); TSan adds a nearly
+    # constant per-process cost, and on the hosted macOS runner every case
+    # stopped in 0.48 to 0.57 s (TODO.md CI-10). The bound holds plain and
+    # under ASan, where these stops with open client connections still run.
+    # TSan has nothing to find on them: the bridge runs one loop thread and
+    # starts no other (no std::thread or pthread_create in studio/bridge or
+    # its deps; uSockets runs on the calling thread), so its only concurrency
+    # is the stop signal's handler, which talOS/process's tests cover.
     tags = [
         "integration",
         "local",
+        "no_tsan",  # a wall-clock stop bound; the bridge has one thread
     ],
 )
 

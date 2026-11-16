@@ -84,6 +84,12 @@ TEST(HardwareCodecFuzzTest, BoundedMutations) {
       command.count = kMaxMotors;
       command.digital_output_count = kMaxDigitalOutputs;
       command.pwm_output_count = kMaxPwmOutputs;
+      // A pulse of 0 beside outputs that send no pulse (every other request
+      // is value-initialized off).
+      command.pwm_outputs[1] = {1, PwmMode::kPulse, 0.0};
+      // Mutations reach the last motor mode, torque current, and the byte
+      // past it.
+      command.motors[1] = {2, Mode::kTorqueCurrent, 0, 2.5, 0.0};
       state.motor_count = kMaxMotors;
       state.sensor_count = kMaxSensors;
       state.digital_input_count = kMaxDigitalInputs;
@@ -110,6 +116,8 @@ TEST(HardwareCodecFuzzTest, BoundedMutations) {
   }
   Config config;
   config.motors.push_back({1, "drive", 1, "rio"});
+  config.motors.back().foc = true;  // Mutations reach a foc byte of 1.
+  config.motors.back().max_torque_current_a = 20.0;
   config.sensors.push_back({2, "encoder", SensorKind::kCANcoder, 2, "rio"});
   config.digital_inputs.push_back({3, "limit", 0});
   config.digital_outputs.push_back({4, "solenoid", 1});

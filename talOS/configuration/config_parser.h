@@ -589,7 +589,7 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
         k != "feedback" && k != "feedback_sensor" && k != "slot0" &&
         k != "slot1" && k != "slot2" && k != "position_frame" &&
         k != "forward_limit_switch" && k != "reverse_limit_switch" &&
-        k != "motor_type") {
+        k != "motor_type" && k != "foc" && k != "max_torque_current_a") {
       throw std::invalid_argument("unknown motor key '" + std::string(k) +
                                   "' for " + name);
     }
@@ -663,6 +663,18 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   if (t.contains("oppose_master") && raw.follow_motor.empty()) {
     throw std::invalid_argument("oppose_master requires follow for " + name);
   }
+  // A follower copies its master's output, FOC commutation included
+  // (MotorConfig::foc).
+  m.foc = Read(t, "foc", m.foc);
+  if (m.foc && !raw.follow_motor.empty()) {
+    throw std::invalid_argument("foc for " + name +
+                                ": a follower follows its master's output; "
+                                "set foc on " +
+                                raw.follow_motor);
+  }
+  // Its range, foc and follower rules are hardware::Validate's.
+  m.max_torque_current_a =
+      Read(t, "max_torque_current_a", m.max_torque_current_a);
   const std::string feedback = Read<std::string>(t, "feedback", "Rotor");
   raw.feedback_sensor = Read<std::string>(t, "feedback_sensor", "");
   if (feedback == "RemoteCANcoder") {

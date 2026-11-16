@@ -12,6 +12,7 @@
 #include <ctre/phoenix6/controls/MotionMagicVoltage.hpp>
 #include <ctre/phoenix6/controls/NeutralOut.hpp>
 #include <ctre/phoenix6/controls/PositionVoltage.hpp>
+#include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
 #include <ctre/phoenix6/controls/VelocityVoltage.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <limits>
@@ -84,6 +85,15 @@ bool ValidMotionFeedback(const Position& position, const Velocity& velocity,
          hw::FeedbackFresh(Age(velocity), command_timeout_us) &&
          std::isfinite(position.GetValue().value()) &&
          std::isfinite(velocity.GetValue().value());
+}
+
+// TorqueCurrentFOC's MaxAbsDutyCycle: max_voltage over the battery voltage,
+// so the mode never applies more than max_voltage, the ceiling
+// PeakForwardVoltage sets for every voltage-based request but not for this
+// one. 0 (no output) while no battery reading has been taken.
+double TorqueDutyCap(double max_voltage, double battery_v) {
+  if (!(battery_v > 0)) return 0.0;
+  return std::clamp(max_voltage / battery_v, 0.0, 1.0);
 }
 
 // Posts a feedback validity change: the loop thread only copies it.
@@ -164,10 +174,13 @@ constexpr double kSimNeutralCoastTauS = 1.0;
 // (same standstill snap as StepAxis).
 constexpr double kSimNeutralStandstillRps = 0.01;
 // RioLog kMessage indices (rate-limit keys) of this file's lines; Robot.cpp
-// uses 1 to 6.
+// uses 1 to 6. A licence refusal's line is keyed by its motor (16 to 31),
+// so the logger coalesces no motor's line into another's.
 constexpr uint16_t kConfigureFailedMessage = 0;
 constexpr uint16_t kCanBusStatusMessage = 7;
 constexpr uint16_t kCanBusReaderMessage = 8;
+constexpr uint16_t kProLicenceRefusedMessage = 16;
+static_assert(kProLicenceRefusedMessage + hw::kMaxMotors <= 32);
 
 // One CAN bus's status, utilization from 0 to 1 (the unit of State's
 // CanBusSample::utilization_frac) and its controller's counters: the
@@ -275,6 +288,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   const std::lock_guard devices_lock{devices_mutex_};
   restore_operations_.clear();
   unavailable_.clear();
+  foc_unlicensed_.clear();
   signal_ids_.clear();
   last_error_.reset();
   last_fault_flags_.fill(0);
@@ -424,6 +438,19 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     cfg.Audio.BeepOnConfig = false;
     cfg.Voltage.PeakForwardVoltage = units::volt_t{m.max_voltage};
     cfg.Voltage.PeakReverseVoltage = units::volt_t{-m.max_voltage};
+    // TorqueCurrentFOC's peak, both ways: max_torque_current_a, or for a
+    // follower, which copies its master's torque output and may not set the
+    // key, its master's; 0 A on a motor without the mode, so a torque
+    // request produces nothing there. The stator limit above applies in
+    // addition, the supply limit in every mode; TorqueNeutralDeadband keeps
+    // Phoenix's 0 A.
+    double torque_peak_a = m.max_torque_current_a;
+    for (const auto& master : c.motors)
+      if (m.master_id != 0 && master.id == m.master_id)
+        torque_peak_a = master.max_torque_current_a;
+    cfg.TorqueCurrent.PeakForwardTorqueCurrent = units::ampere_t{torque_peak_a};
+    cfg.TorqueCurrent.PeakReverseTorqueCurrent =
+        units::ampere_t{-torque_peak_a};
     cfg.Feedback.RotorToSensorRatio = m.rotor_to_sensor_ratio;
     cfg.Feedback.SensorToMechanismRatio = m.sensor_to_mechanism_ratio;
     if (m.feedback == hw::Feedback::kRemoteCANcoder) {
@@ -484,8 +511,58 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     signals_.push_back(&motor->GetDeviceTemp(false));
     signals_.push_back(&motor->GetSupplyCurrent(false));
     for (int i = 0; i < 7; ++i) signal_ids_.push_back(m.id);
+    // Phoenix's Follower contract (controls/Follower.hpp): "The leader must
+    // ensure the status signal corresponding to its control output type
+    // (DutyCycle, MotorVoltage, TorqueCurrent) is enabled ... no slower than
+    // 20 Hz." So a master that may run TorqueCurrentFOC and has a follower
+    // asks for TorqueCurrent at status_hz, which OptimizeBusUtilization then
+    // keeps. In SDK 26.3 it shares a frame the motion feedback already holds
+    // at status_hz, so no simulation test can tell; asked for, it does not
+    // depend on that layout.
+    if (m.max_torque_current_a > 0 &&
+        std::any_of(c.motors.begin(), c.motors.end(), [&m](const auto& other) {
+          return other.master_id == m.id;
+        })) {
+      signals_.push_back(&motor->GetTorqueCurrent(false));
+      signal_ids_.push_back(m.id);
+    }
     motors_.push_back(std::move(motor));
   }
+  // FOC needs a Phoenix Pro licence, and so does a follower of a foc master,
+  // which copies its master's output. Read after each device's
+  // configuration. A motor read unlicensed is a failed device until the next
+  // Configure, with its followers: never sent a request, never reported
+  // valid, and not retried, since a licence does not arrive by retrying. A
+  // read that got no answer (the device absent, or its frame late) is an
+  // unavailable device, and its restore reads the licence again.
+  licence_refused_.fill(false);
+  licence_read_.fill(false);
+  foc_unlicensed_.reserve(hw::kMaxMotors);
+  bool first_error_posted = false;
+  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+    const auto& m = c.motors[i];
+    const bool master_foc =
+        m.master_id != 0 &&
+        std::any_of(c.motors.begin(), c.motors.end(), [&](const auto& other) {
+          return other.id == m.master_id && other.foc;
+        });
+    if (!m.foc && !master_foc) continue;
+    restore_operations_.push_back(
+        {m.id, [this, i] { return RestoreProLicence(i); }});
+    if (licence_refused_[i]) continue;  // Its master's refusal took it.
+    ctre::phoenix::StatusCode status;
+    const auto licensed = ReadProLicence(i, status);
+    if (!licensed) {
+      ok &= note_failure(m.name, m.bus, m.can_id, "check_pro_license", status);
+    } else if (!*licensed) {
+      ok = false;
+      const bool had_error = last_error_.has_value();
+      RefuseProLicence(i, true);
+      first_error_posted |= !had_error && last_error_.has_value();
+    }
+  }
+  for (std::size_t i = 0; i < c.motors.size(); ++i)
+    if (licence_refused_[i]) foc_unlicensed_.push_back(c.motors[i].id);
   GroupSignalsByNetwork(c);
 
   if (is_simulation_) {
@@ -582,7 +659,8 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     restore_operations_.push_back(
         {s.id, [operation] { return operation().IsOK(); }});
   }
-  if (!ok && last_error_) {
+  // A licence refusal posted its own line already.
+  if (!ok && last_error_ && !first_error_posted) {
     const auto& error = *last_error_;
     // Configure runs on the configure worker; it still posts, so its line
     // stays ordered with the loop thread's.
@@ -622,6 +700,65 @@ void PhoenixBackend::GroupSignalsByNetwork(const hw::Config& c) {
       refresh_groups_[refresh_group_count_++] = {
           begin, refresh_signals_.size() - begin};
   }
+}
+
+std::optional<bool> PhoenixBackend::ReadProLicence(
+    std::size_t index, ctre::phoenix::StatusCode& status) {
+  status = ctre::phoenix::StatusCode::OK;
+  std::optional<bool> licensed;
+  if (pro_licensed_) {
+    licensed = pro_licensed_(index);
+    if (!licensed) status = ctre::phoenix::StatusCode::RxTimeout;
+  } else if (is_simulation_) {
+    licensed = true;
+  } else {
+    auto& signal = motors_[index]->GetIsProLicensed(false);
+    status = signal.WaitForUpdate(500_ms).GetStatus();
+    if (status.IsOK()) licensed = signal.GetValue();
+  }
+  licence_read_[index] = licensed.has_value();
+  return licensed;
+}
+
+void PhoenixBackend::RefuseProLicence(std::size_t index, bool record_error) {
+  const auto& master = config_.motors[index];
+  // On a worker thread: the line is formatted here and posted, never written.
+  const auto refuse = [&](std::size_t i, std::string message) {
+    licence_refused_[i] = true;
+    const auto& m = config_.motors[i];
+    hw::ConfigError err;
+    err.device_name = m.name;
+    err.bus = m.bus;
+    err.can_id = m.can_id;
+    err.operation = "check_pro_license";
+    err.message = std::move(message);
+    talos::rio::LogEvent event;
+    event.index = static_cast<uint16_t>(kProLicenceRefusedMessage + i);
+    event.SetText("[phoenix] " + hw::FormatConfigError(err));
+    log_->Post(event);
+    if (record_error && !last_error_) last_error_ = std::move(err);
+  };
+  // LogEvent::text keeps 159 bytes. With 15-byte motor names, a 16-byte bus
+  // and a two-digit CAN id, the line up to the message takes 123 bytes
+  // ("[phoenix] config failed for '<name>' on bus '<bus>' CAN <id> during
+  // check_pro_license (vendor status 0): "), so each message stays within
+  // 36: the follower's 33, the motor's own 31.
+  refuse(index, "foc needs a Phoenix Pro licence");
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    if (config_.motors[i].master_id == master.id && !licence_refused_[i])
+      refuse(i, "master " + master.name + " unlicensed");
+  }
+}
+
+bool PhoenixBackend::RestoreProLicence(std::size_t index) {
+  // Refused: failed until the next Configure. Read licensed: a reset does
+  // not take the licence, so the restore reads only an unanswered one.
+  if (licence_refused_[index] || licence_read_[index]) return true;
+  ctre::phoenix::StatusCode status;
+  const auto licensed = ReadProLicence(index, status);
+  if (!licensed) return false;  // Still unread: unavailable, retried.
+  if (!*licensed) RefuseProLicence(index, false);
+  return true;
 }
 
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
@@ -705,6 +842,16 @@ PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
   if (restore_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
     return RestoreStatus::kPending;
   const auto failures = restore_.get();
+  // A licence the restore read unlicensed fails its motor before the motor
+  // leaves unavailable_, so it is never reported valid in between. Reserved
+  // at Configure: no allocation on the loop thread.
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    const uint16_t id = config_.motors[i].id;
+    if (licence_refused_[i] &&
+        std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), id) ==
+            foc_unlicensed_.end())
+      foc_unlicensed_.push_back(id);
+  }
   std::erase_if(unavailable_, [this, &failures](uint16_t id) {
     return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
                restoring_ids_.end() &&
@@ -725,6 +872,10 @@ bool PhoenixBackend::Read(hw::State& s) {
                    });
   s.health.valid = true;
   s.health.battery_v = frc::RobotController::GetBatteryVoltage().value();
+  // The torque-current duty cap's divisor (TorqueDutyCap): a lost reading
+  // keeps the last real one.
+  if (std::isfinite(s.health.battery_v) && s.health.battery_v > 1.0)
+    last_battery_v_ = s.health.battery_v;
   s.health.brownout = frc::RobotController::IsBrownedOut();
   s.health.can_bus = can_health_.Slot(s.health.can_bus_index);
   uint64_t refresh_start_ns = NowNs();
@@ -837,7 +988,9 @@ bool PhoenixBackend::Read(hw::State& s) {
         p.GetStatus().IsOK() && v.GetStatus().IsOK() &&
         std::isfinite(out.position_rot) && std::isfinite(out.velocity_rps) &&
         std::find(unavailable_.begin(), unavailable_.end(), motor_config.id) ==
-            unavailable_.end();
+            unavailable_.end() &&
+        std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(),
+                  motor_config.id) == foc_unlicensed_.end();
     if (out.valid != last_motor_valid_[i]) {
       LogFeedbackChange(*log_, talos::rio::LogKind::kMotorFeedback, i,
                         motor_config.name, motor_config.id, motor_config.bus,
@@ -1029,9 +1182,12 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
     ctre::phoenix::StatusCode result;
     const auto& config = config_.motors[i];
     if (std::find(unavailable_.begin(), unavailable_.end(), config.id) !=
-        unavailable_.end()) {
+            unavailable_.end() ||
+        std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), config.id) !=
+            foc_unlicensed_.end()) {
       // A missing device cannot acknowledge NeutralOut. Keep trying neutral,
       // but do not turn its transport failure into a whole-robot Apply failure.
+      // A foc motor not read licensed (or its follower) is held the same way.
       m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
       sim_neutral_[i] = true;
       continue;
@@ -1085,12 +1241,12 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
         break;
       case hw::Mode::kDutyCycle:
         result = m.SetControl(ph::controls::DutyCycleOut{r.demand}
-                                  .WithEnableFOC(false)
+                                  .WithEnableFOC(config.foc)
                                   .WithUpdateFreqHz(0_Hz));
         break;
       case hw::Mode::kVoltage:
         result = m.SetControl(ph::controls::VoltageOut{units::volt_t{r.demand}}
-                                  .WithEnableFOC(false)
+                                  .WithEnableFOC(config.foc)
                                   .WithUpdateFreqHz(0_Hz));
         break;
       case hw::Mode::kVelocity:
@@ -1098,7 +1254,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
             ph::controls::VelocityVoltage{units::turns_per_second_t{r.demand}}
                 .WithSlot(r.slot)
                 .WithFeedForward(units::volt_t{r.feedforward_v})
-                .WithEnableFOC(false)
+                .WithEnableFOC(config.foc)
                 .WithUpdateFreqHz(0_Hz));
         break;
       case hw::Mode::kPosition:
@@ -1106,7 +1262,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
             m.SetControl(ph::controls::PositionVoltage{units::turn_t{r.demand}}
                              .WithSlot(r.slot)
                              .WithFeedForward(units::volt_t{r.feedforward_v})
-                             .WithEnableFOC(false)
+                             .WithEnableFOC(config.foc)
                              .WithUpdateFreqHz(0_Hz));
         break;
       case hw::Mode::kMotionMagic:
@@ -1114,7 +1270,26 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
             ph::controls::MotionMagicVoltage{units::turn_t{r.demand}}
                 .WithSlot(r.slot)
                 .WithFeedForward(units::volt_t{r.feedforward_v})
-                .WithEnableFOC(false)
+                .WithEnableFOC(config.foc)
+                .WithUpdateFreqHz(0_Hz));
+        break;
+      case hw::Mode::kTorqueCurrent:
+        // Stator amperes, within the peak Configure set. The other fields
+        // keep Phoenix's defaults: Deadband 0 A, OverrideCoastDurNeutral
+        // false, limit switches and soft limits honoured, no timesync. A
+        // 0 A demand is sent as TorqueCurrentFOC, not NeutralOut; what the
+        // motor does at exactly 0 A is unmeasured (talOS/hardware/README.md,
+        // "Supported Hardware Requests"). A request the gateway would have
+        // neutralized is this motor's neutral here too.
+        if (!hw::TorqueCurrentAllowed(config, r)) {
+          sim_neutral_[i] = true;
+          result = m.SetControl(ph::controls::NeutralOut{});
+          break;
+        }
+        result = m.SetControl(
+            ph::controls::TorqueCurrentFOC{units::ampere_t{r.demand}}
+                .WithMaxAbsDutyCycle(
+                    TorqueDutyCap(config.max_voltage, last_battery_v_))
                 .WithUpdateFreqHz(0_Hz));
         break;
       default:
@@ -1132,9 +1307,17 @@ bool PhoenixBackend::ApplyOutputs(
        i < digital_outputs.size() && i < digital_outputs_.size(); ++i) {
     digital_outputs_[i]->Set(digital_outputs[i].value);
   }
+  // Off is the output's neutral, no pulse; SetSpeed(0) would be the 1.5 ms
+  // centre pulse, which drives a servo to its centre. The gateway has refused
+  // any other mode.
   for (std::size_t i = 0; i < pwm_outputs.size() && i < pwm_outputs_.size();
        ++i) {
-    pwm_outputs_[i]->SetSpeed(pwm_outputs[i].output);
+    const auto& request = pwm_outputs[i];
+    if (request.mode == hw::PwmMode::kPulse) {
+      pwm_outputs_[i]->SetSpeed(request.output);
+    } else {
+      pwm_outputs_[i]->SetDisabled();
+    }
   }
   return true;
 }
@@ -1203,7 +1386,11 @@ void PhoenixBackend::UpdateSimulation(double dt) {
     // coasts to a stop here instead of jumping to the requested demand. Never
     // consult the request demand for physics: that shortcut hides bad tuning.
     // Neutral is unpowered: velocity decays per the brake config and the
-    // position keeps integrating while the rotor rolls on.
+    // position keeps integrating while the rotor rolls on. Under
+    // TorqueCurrentFOC Phoenix reports the volts its current loop applies
+    // against this rotor's speed, up to the duty cap, so a demand
+    // accelerates the rotor; at 0 A it reports 0 V, and this model then
+    // stops the rotor (talOS/hardware/README.md says what is known of 0 A).
     double target_rotor_rps = 0.0;
     double tau = 0.01;
     if (sim_neutral_[i]) {

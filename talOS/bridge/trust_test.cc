@@ -111,7 +111,8 @@ TEST(HardwareNodeTrustTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   request.digital_output_count = 1;
   request.digital_outputs[0] = {cfg.hardware.digital_outputs[0].id, true};
   request.pwm_output_count = 1;
-  request.pwm_outputs[0] = {cfg.hardware.pwm_outputs[0].id, 0.7};
+  request.pwm_outputs[0] = {cfg.hardware.pwm_outputs[0].id, PwmMode::kPulse,
+                            0.7};
   PublishCommand(pub, request);
   node.Tick(1001000);
   ASSERT_EQ(node.commands_sent(), 1u);
@@ -141,7 +142,9 @@ TEST(HardwareNodeTrustTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   ASSERT_EQ(neutral.digital_output_count, 1u);
   EXPECT_FALSE(neutral.digital_outputs[0].value);
   ASSERT_EQ(neutral.pwm_output_count, 1u);
-  EXPECT_DOUBLE_EQ(neutral.pwm_outputs[0].output, 0);
+  // No pulse, not a pulse of 0 (a servo's centre).
+  EXPECT_EQ(neutral.pwm_outputs[0],
+            (PwmRequest{.id = cfg.hardware.pwm_outputs[0].id}));
 
   for (uint64_t now_us = 1052000; now_us <= 1152000; now_us += 1000) {
     node.Tick(now_us);
@@ -150,7 +153,9 @@ TEST(HardwareNodeTrustTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   EXPECT_TRUE(Commands(gateway.TakeSent()).empty());
 }
 
-// REQ-SAFE-03, REQ-SAFE-19: omitted DIO, PWM and motors go neutral
+// REQ-SAFE-03, REQ-SAFE-19: omitted DIO, PWM and motors go neutral. A PWM
+// output its owner pulses at 0 (the 1.5 ms centre) merges as that pulse; once
+// omitted it sends no pulse, not that pulse.
 TEST(HardwareNodeTrustTest, LatestRequestNeutralizesOmittedOutputs) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Bridge bridge{cfg};
@@ -165,11 +170,13 @@ TEST(HardwareNodeTrustTest, LatestRequestNeutralizesOmittedOutputs) {
   request.digital_output_count = 1;
   request.digital_outputs[0] = {cfg.hardware.digital_outputs[0].id, true};
   request.pwm_output_count = 1;
-  request.pwm_outputs[0] = {cfg.hardware.pwm_outputs[0].id, 0.7};
+  const PwmRequest centred{cfg.hardware.pwm_outputs[0].id, PwmMode::kPulse,
+                           0.0};
+  request.pwm_outputs[0] = centred;
   PublishCommand(pub, request);
   node.Tick(1001000);
   EXPECT_TRUE(node.current_command().digital_outputs[0].value);
-  EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.7);
+  EXPECT_EQ(node.current_command().pwm_outputs[0], centred);
   // Driven before it is omitted, so the neutral below is the omission's.
   EXPECT_EQ(node.current_command().motors[1].mode, Mode::kVoltage);
   request.count = 0;
@@ -179,7 +186,8 @@ TEST(HardwareNodeTrustTest, LatestRequestNeutralizesOmittedOutputs) {
   node.Tick(1002000);
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_FALSE(node.current_command().digital_outputs[0].value);
-  EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.0);
+  EXPECT_EQ(node.current_command().pwm_outputs[0],
+            (PwmRequest{.id = centred.id}));
   EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
 }
 
@@ -254,12 +262,12 @@ TEST(HardwareNodeTrustTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {
   cross_pwm.count = 1;
   cross_pwm.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
   cross_pwm.pwm_output_count = 1;
-  cross_pwm.pwm_outputs[0] = {strip, 0.9};
+  cross_pwm.pwm_outputs[0] = {strip, PwmMode::kPulse, 0.9};
   PublishCommand(drive_pub, cross_pwm);
   node.Tick(1003000);
 
   EXPECT_EQ(node.ownership_rejected(), 3u);
-  EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.0);
+  EXPECT_EQ(node.current_command().pwm_outputs[0], (PwmRequest{.id = strip}));
 
   // Positive control: requests that stay inside their own ownership still
   // merge.
@@ -273,7 +281,7 @@ TEST(HardwareNodeTrustTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {
   intake_ok.digital_output_count = 1;
   intake_ok.digital_outputs[0] = {beacon, true};
   intake_ok.pwm_output_count = 1;
-  intake_ok.pwm_outputs[0] = {strip, 0.5};
+  intake_ok.pwm_outputs[0] = {strip, PwmMode::kPulse, 0.5};
   PublishCommand(intake_pub, intake_ok);
   Command drive_ok{};
   drive_ok.config_id = config_id;
@@ -476,10 +484,15 @@ TEST(HardwareNodeTrustTest,
   EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
 }
 
+// A reboot, an epoch change and a disable edge each drop every cached
+// demand: motors neutral and the intake's PWM output, which it pulsed at its
+// centre, sending no pulse, until fresh requests of the new identity.
+// REQ-SAFE-18, REQ-SAFE-03
 TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint16_t drive = cfg.hardware.motors[0].id;
   const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint16_t strip = cfg.hardware.pwm_outputs[0].id;
   const uint64_t config_id = NodeConfigId(cfg);
 
   Bridge bridge{cfg};
@@ -506,7 +519,12 @@ TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {
     r.observed_time_us = observed;
     r.count = 1;
     r.motors[0] = {roller, Mode::kVelocity, 0, roller_demand, 0.0};
+    r.pwm_output_count = 1;
+    r.pwm_outputs[0] = {strip, PwmMode::kPulse, 0.0};
     PublishCommand(intake_pub, r);
+  };
+  const auto pwm_mode = [&] {
+    return node.current_command().pwm_outputs[0].mode;
   };
 
   ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 1000), 1000000));
@@ -516,6 +534,7 @@ TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 15.0);
   EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
+  EXPECT_EQ(pwm_mode(), PwmMode::kPulse);
   // Single tick, single send. Later phases count from the sends after each
   // State's own tick.
   const uint64_t sent_after_first_merge = node.commands_sent();
@@ -530,6 +549,7 @@ TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {
   EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
   EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
+  EXPECT_EQ(pwm_mode(), PwmMode::kOff);
   EXPECT_EQ(node.commands_sent(), sent_after_reboot);
 
   // Fresh requests stamped with the new identity resume motion.
@@ -548,6 +568,7 @@ TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {
   EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
   EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(pwm_mode(), PwmMode::kOff);
   EXPECT_EQ(node.commands_sent(), sent_after_epoch);
 
   publish_valid(12, 2, 3000, 17.0, 32.0);
@@ -566,6 +587,7 @@ TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {
   EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
   EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(pwm_mode(), PwmMode::kOff);
   EXPECT_EQ(node.commands_sent(), sent_after_disable);
 
   // Re-enable (enabled bit returns, epoch advances) needs fresh requests too.
@@ -782,7 +804,7 @@ TEST(HardwareNodeTrustTest,
   intake_ok.digital_output_count = 1;
   intake_ok.digital_outputs[0] = {beacon, true};
   intake_ok.pwm_output_count = 1;
-  intake_ok.pwm_outputs[0] = {strip, 0.5};
+  intake_ok.pwm_outputs[0] = {strip, PwmMode::kPulse, 0.5};
   PublishCommand(drive_pub, drive_ok);
   PublishCommand(intake_pub, intake_ok);
   node.Tick(1001000);
@@ -818,8 +840,7 @@ TEST(HardwareNodeTrustTest,
   EXPECT_DOUBLE_EQ(neutral.motors[1].demand, 0.0);
   EXPECT_EQ(neutral.digital_outputs[0].id, beacon);
   EXPECT_FALSE(neutral.digital_outputs[0].value);
-  EXPECT_EQ(neutral.pwm_outputs[0].id, strip);
-  EXPECT_DOUBLE_EQ(neutral.pwm_outputs[0].output, 0.0);
+  EXPECT_EQ(neutral.pwm_outputs[0], (PwmRequest{.id = strip}));
   EXPECT_EQ(node.Status(1051001).timed_out_mask(), 0b10u);
   PublishCommand(intake_pub, intake_ok);
   node.Tick(1052000);

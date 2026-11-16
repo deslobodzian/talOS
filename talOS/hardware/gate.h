@@ -15,6 +15,7 @@
 // What stays in the node: device presence (which samples a subsystem needs is
 // node policy), the command law itself, and the state it publishes.
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -92,6 +93,20 @@ inline bool MotorMayDrive(std::span<const MotorConfig> motors,
     }
   }
   return false;
+}
+
+// Whether a torque-current request may drive motor `m` (REQ-SAFE-43): `m`
+// has foc and a positive max_torque_current_a, |demand| is at most that
+// limit, and feedforward_v is 0. The whole rule for the mode, feedforward
+// included: Gateway::Accept neutralizes a request that fails it, and
+// PhoenixBackend::Apply sends NeutralOut for one that reaches it anyway.
+// A NaN demand, feedforward or limit fails its comparison; an infinite demand
+// exceeds the limit, which Validate holds finite. It does not govern a
+// follower: the gateway replaces a follower's request with its master's mode
+// whatever this says, and Apply sends a follower Follower without asking it.
+inline bool TorqueCurrentAllowed(const MotorConfig& m, const MotorRequest& r) {
+  return m.foc && m.max_torque_current_a > 0 &&
+         std::abs(r.demand) <= m.max_torque_current_a && r.feedforward_v == 0;
 }
 
 // Whether the gateway is ready to be commanded: configured and enabled, with

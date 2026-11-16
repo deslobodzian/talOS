@@ -33,6 +33,8 @@ mixed = [1.0, "back"]
 can_id = 1
 [subsystems.roller.digital_inputs.beam]
 dio = 0
+[subsystems.roller.pwm_outputs.servo]
+channel = 0
 [subsystems.roller.sensors.gyro]
 type = "Pigeon2"
 can_id = 2
@@ -433,6 +435,111 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
             TALOS_OK);
   EXPECT_EQ(request.mode, TALOS_MODE_NEUTRAL);
   talos_sim_hardware_destroy(hw);
+}
+
+// A PWM output set to 0 pulses at the centre; after talos_pwm_stop it sends
+// no pulse, and the inspection calls tell the two apart. Like every setter,
+// talos_pwm_stop fails outside update().
+// REQ-SAFE-03
+TEST_F(NodeApi, PwmStopSendsNoPulseAndSetZeroIsTheCentrePulse) {
+  struct Servo {
+    TalosNode* node = nullptr;
+    int64_t servo = -1;
+    bool stop = false;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& s = *static_cast<Servo*>(user);
+    s.node = node;
+    s.servo = talos_device(node, TALOS_DEVICE_PWM, "servo");
+    if (s.servo < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* u) -> int32_t {
+          auto& servo = *static_cast<Servo*>(u);
+          return servo.stop ? talos_pwm_stop(servo.node, servo.servo)
+                            : talos_pwm_set(servo.node, servo.servo, 0.0);
+        },
+        &s);
+  };
+  Servo servo;
+  TalosNode* node = talos_sim_add(sim_, "roller", build, &servo);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  EXPECT_EQ(talos_pwm_stop(node, servo.servo), TALOS_ERR);
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
+  double out = -1;
+  EXPECT_EQ(talos_sim_hardware_pwm(hw, "roller", "servo", &out), 1);
+  EXPECT_EQ(out, 0.0);
+  out = -1;
+  EXPECT_EQ(talos_sim_hardware_applied_pwm(hw, "roller", "servo", &out), 1);
+  EXPECT_EQ(out, 0.0);
+
+  servo.stop = true;
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
+  out = -1;
+  EXPECT_EQ(talos_sim_hardware_pwm(hw, "roller", "servo", &out), 0);
+  EXPECT_EQ(out, 0.0);
+  out = -1;
+  EXPECT_EQ(talos_sim_hardware_applied_pwm(hw, "roller", "servo", &out), 0);
+  EXPECT_EQ(out, 0.0);
+  talos_sim_hardware_destroy(hw);
+}
+
+// TALOS_MODE_TORQUE_CURRENT, the last mode, reaches the request as stator
+// amperes; the value past it is refused.
+// REQ-SAFE-43
+TEST(NodeApiTorque, TorqueCurrentModeReachesTheRequestAndTheNextIsRefused) {
+  struct Torquer {
+    TalosNode* node = nullptr;
+    int64_t wheel = -1;
+    int32_t mode = TALOS_MODE_TORQUE_CURRENT;
+    int32_t result = TALOS_OK;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& t = *static_cast<Torquer*>(user);
+    t.node = node;
+    t.wheel = talos_device(node, TALOS_DEVICE_MOTOR, "wheel");
+    if (t.wheel < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* u) -> int32_t {
+          auto& torquer = *static_cast<Torquer*>(u);
+          torquer.result = talos_motor_set(torquer.node, torquer.wheel,
+                                           torquer.mode, 2.5, 0, 0);
+          return 0;
+        },
+        &t);
+  };
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("can_id = 1\n") + 11,
+              "foc = true\nmax_torque_current_a = 5\n");
+  TalosSim* sim = talos_sim_from_toml(toml.c_str());
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+  Torquer torquer;
+  ASSERT_NE(talos_sim_add(sim, "roller", build, &torquer), nullptr)
+      << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim, 30 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(torquer.result, TALOS_OK) << talos_last_error();
+  TalosMotorRequest request{};
+  ASSERT_EQ(talos_sim_hardware_motor_request(hw, "roller", "wheel", &request),
+            TALOS_OK);
+  EXPECT_EQ(request.mode, TALOS_MODE_TORQUE_CURRENT);
+  EXPECT_EQ(request.demand, 2.5);
+  EXPECT_EQ(request.ff_volts, 0.0);
+  EXPECT_EQ(request.slot, 0);
+
+  torquer.mode = TALOS_MODE_TORQUE_CURRENT + 1;
+  ASSERT_EQ(talos_sim_step(sim, 30 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(torquer.result, TALOS_ERR);
+  talos_sim_hardware_destroy(hw);
+  talos_sim_destroy(sim);
 }
 
 // The ABI takes raw handles, so it refuses an unknown device name and a

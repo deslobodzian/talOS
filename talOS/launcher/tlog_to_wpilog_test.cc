@@ -983,6 +983,9 @@ period_us = 10000
 [subsystems.shooter.motors.flywheel]
 type = "TalonFX"
 can_id = 2
+
+[subsystems.shooter.pwm_outputs.hood]
+channel = 0
 )";
 
 template <class Message>
@@ -1096,6 +1099,8 @@ std::uint16_t WriteHardwareSession(
     command.config_id = hw::ConfigurationId(config);
     command.count = 1;
     command.motors[0] = {flywheel, hw::Mode::kVelocity, 0, 50.0, 1.5};
+    command.pwm_output_count = 1;
+    command.pwm_outputs[0] = {.id = config.pwm_outputs.at(0).id};
     writer.send(At(EventKind::TIMER, 9, 1, 35, 35, 35, 1), 1,
                 BytesOf(Encoded(command)), 0, 1);
     writer.flush();
@@ -1111,7 +1116,8 @@ bool Boolean(const Value& value) { return value.payload == Bytes{1}; }
 // from the config the session's manifest names: the Driver Station's
 // enabled flag as a boolean timeline at each packet's publish time, a
 // joystick's axes, buttons and POVs as arrays, a motor's measured velocity
-// and currents with their units, and a request's mode and demand.
+// and currents with their units, and a request's mode and demand, and
+// whether its PWM output pulsed or sent no pulse.
 // REQ-OPS-26
 TEST_F(TlogToWpilogTest, HardwarePacketsBecomeNamedTypedEntries) {
   const std::string dir = root_ + "/hardware";
@@ -1173,6 +1179,10 @@ TEST_F(TlogToWpilogTest, HardwarePacketsBecomeNamedTypedEntries) {
   EXPECT_EQ(std::string(mode[0].payload.begin(), mode[0].payload.end()),
             "velocity");
   EXPECT_EQ(AsDouble(log.of(request + "demand")[0].payload), 50.0);
+  const auto pwm_mode = log.of("/hw/request/shooter/pwm_outputs/hood/mode");
+  ASSERT_EQ(pwm_mode.size(), 1u);
+  EXPECT_EQ(std::string(pwm_mode[0].payload.begin(), pwm_mode[0].payload.end()),
+            "off");
 }
 
 // Guards: a session recorded under another hardware protocol (a State this

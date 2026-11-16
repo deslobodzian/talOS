@@ -3,7 +3,12 @@
 // and connection validity, no demand teleport when controller voltage is zero
 // (missing gains exposed), neutral keeping rotor momentum with
 // brake/coast-dependent decay, follower gating, late feedback left valid for
-// the gateway to judge, per-device recovery and the loop watchdog's neutral.
+// the gateway to judge, per-device recovery, the loop watchdog's neutral, and
+// a PWM output that is off sending no pulse rather than the centre pulse,
+// and a motor's foc setting: EnableFOC on its requests, and a motor not read
+// Phoenix Pro licensed held failed until the next configure; and a
+// torque-current request: TorqueCurrentFOC within its peak and duty cap, and
+// NeutralOut for one out of contract.
 #include "PhoenixBackend.h"
 
 #include <frc/simulation/DriverStationSim.h>
@@ -19,14 +24,21 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
+#include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <filesystem>
+#include <functional>
+#include <initializer_list>
 #include <iostream>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "hardware/gate.h"
@@ -427,6 +439,13 @@ TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
   EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
 }
 
+// The HAL's default PWM centre pulse, which frc::PWM::SetSpeed(0) gives: the
+// backend sets no bounds of its own.
+constexpr int32_t kCentrePulseUs = 1500;
+
+// Neutral stops the pulse, the centre pulse included: a servo goes limp
+// rather than to its centre.
+// REQ-SAFE-03
 TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   EnsureHal();
   hw::Config c;
@@ -448,7 +467,8 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
 
   const std::array<hw::DigitalOutputRequest, 1> dos{
       hw::DigitalOutputRequest{20, true}};
-  const std::array<hw::PwmRequest, 1> pwms{hw::PwmRequest{30, 0.75}};
+  const std::array<hw::PwmRequest, 1> pwms{
+      hw::PwmRequest{30, hw::PwmMode::kPulse, 0.0}};
   ASSERT_TRUE(backend.ApplyOutputs(dos, pwms));
 
   // Read back through the real HAL adapter path: outputs are driven.
@@ -456,10 +476,8 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   ASSERT_TRUE(backend.Read(s));
   EXPECT_TRUE(s.digital_outputs[0].valid);
   EXPECT_TRUE(s.digital_outputs[0].value);
-  EXPECT_TRUE(s.pwm_outputs[0].valid);
-  EXPECT_GT(s.pwm_outputs[0].output, 0.5);
   frc::sim::PWMSim pwm_sim{0};
-  EXPECT_GT(pwm_sim.GetPulseMicrosecond(), 0);
+  ASSERT_EQ(pwm_sim.GetPulseMicrosecond(), kCentrePulseUs);
 
   backend.Neutral();
 
@@ -469,6 +487,60 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   EXPECT_TRUE(s.pwm_outputs[0].valid);
   EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
   EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
+}
+
+// A PWM request's mode decides whether its output pulses: off sends no pulse
+// (frc::PWM::SetDisabled), even right after a pulse, and its State sample
+// reads 0; a pulse of 0 is the centre pulse and 0.75 lies above it; a pulse
+// after off pulses again; each output follows only its own request.
+// REQ-SAFE-03
+TEST(PhoenixBackendPwm, OffSendsNoPulseAndAPulseOfZeroIsTheCentre) {
+  EnsureHal();
+  hw::Config c;
+  hw::PwmConfig servo;
+  servo.id = 30;
+  servo.name = "servo";
+  servo.channel = 0;
+  hw::PwmConfig blower;
+  blower.id = 31;
+  blower.name = "blower";
+  blower.channel = 1;
+  c.pwm_outputs = {servo, blower};
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(c));
+  ASSERT_TRUE(AwaitReady(backend, c));
+  const frc::sim::PWMSim servo_sim{0};
+  const frc::sim::PWMSim blower_sim{1};
+  hw::State s;
+  const auto apply = [&](hw::PwmRequest a, hw::PwmRequest b) {
+    ASSERT_TRUE(backend.ApplyOutputs({}, std::array{a, b}));
+    ASSERT_TRUE(backend.Read(s));
+  };
+
+  {
+    SCOPED_TRACE("servo pulse 0.0, blower pulse 0.75");
+    apply({30, hw::PwmMode::kPulse, 0.0}, {31, hw::PwmMode::kPulse, 0.75});
+    EXPECT_EQ(servo_sim.GetPulseMicrosecond(), kCentrePulseUs);
+    EXPECT_GT(blower_sim.GetPulseMicrosecond(), kCentrePulseUs);
+    EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
+    EXPECT_NEAR(s.pwm_outputs[1].output, 0.75, 0.01);
+  }
+  {
+    SCOPED_TRACE("both off after their pulses");
+    apply({30}, {31});
+    EXPECT_EQ(servo_sim.GetPulseMicrosecond(), 0);
+    EXPECT_EQ(blower_sim.GetPulseMicrosecond(), 0);
+    for (std::size_t i = 0; i < 2; ++i) {
+      EXPECT_TRUE(s.pwm_outputs[i].valid) << i;
+      EXPECT_DOUBLE_EQ(s.pwm_outputs[i].output, 0.0) << i;
+    }
+  }
+  {
+    SCOPED_TRACE("servo pulse 0.0 again, blower stays off");
+    apply({30, hw::PwmMode::kPulse, 0.0}, {31});
+    EXPECT_EQ(servo_sim.GetPulseMicrosecond(), kCentrePulseUs);
+    EXPECT_EQ(blower_sim.GetPulseMicrosecond(), 0);
+  }
 }
 
 // A configuration with no motor, or no device at all, is valid: the backend
@@ -1301,7 +1373,7 @@ TEST_F(PhoenixBackendWatchdog, NeutralizesEveryOutputUnlessAConfigureHoldsIt) {
       Request(20, hw::Mode::kVoltage, 6.0)};
   ASSERT_TRUE(backend.ApplyOutputs(
       std::array<hw::DigitalOutputRequest, 1>{{{40, true}}},
-      std::array<hw::PwmRequest, 1>{{{50, 0.75}}}));
+      std::array<hw::PwmRequest, 1>{{{50, hw::PwmMode::kPulse, 0.75}}}));
   hw::State state;
   PumpReads(backend, state, commands, 5);
   frc::sim::PWMSim pwm_sim{0};
@@ -1329,4 +1401,511 @@ TEST_F(PhoenixBackendWatchdog, NeutralizesEveryOutputUnlessAConfigureHoldsIt) {
   EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
   for (std::size_t i = 0; i < c.motors.size(); ++i)
     EXPECT_EQ(AppliedControl(backend, i), "NeutralOut") << i;
+}
+
+class PhoenixBackendFoc : public ::testing::Test {
+ protected:
+  static std::string AppliedControl(PhoenixBackend& backend, std::size_t i) {
+    const auto control = backend.motors_[i]->GetAppliedControl();
+    return std::string{control->GetName()};
+  }
+  // Motor `i`'s last control request, every field as Phoenix reports it.
+  static std::map<std::string, std::string> AppliedFields(
+      PhoenixBackend& backend, std::size_t i) {
+    return backend.motors_[i]->GetAppliedControl()->GetControlInfo();
+  }
+  // The EnableFOC field of motor `i`'s last control request.
+  static std::string AppliedEnableFoc(PhoenixBackend& backend, std::size_t i) {
+    const auto info = AppliedFields(backend, i);
+    const auto field = info.find("EnableFOC");
+    return field == info.end() ? "(no EnableFOC field)" : field->second;
+  }
+  static ctre::phoenix6::hardware::TalonFX& Motor(PhoenixBackend& backend,
+                                                  std::size_t i) {
+    return *backend.motors_[i];
+  }
+  static std::string EnableFoc(bool enabled) {
+    return ctre::phoenix6::controls::VoltageOut{units::volt_t{0}}
+        .WithEnableFOC(enabled)
+        .GetControlInfo()
+        .at("EnableFOC");
+  }
+  // Stands in for each motor's IsProLicensed read: true or false as read,
+  // nullopt when the read gets no answer.
+  static void SetProLicensed(
+      PhoenixBackend& backend,
+      std::function<std::optional<bool>(std::size_t)> licensed) {
+    backend.pro_licensed_ = std::move(licensed);
+  }
+  // Configures until no device's answer was lost to a stalled simulator
+  // (AwaitAnswer's rule), so the first configure error is the one under
+  // test, not a transport timeout recorded before it. A licence read the
+  // seam leaves unanswered is the one under test.
+  static ::testing::AssertionResult ConfigureAnswered(
+      PhoenixBackend& backend, const hw::Config& config) {
+    const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+    for (;;) {
+      if (!backend.Configure(config))
+        return ::testing::AssertionFailure() << "Configure refused";
+      const auto error = backend.last_config_error();
+      if (!error || !IsTransportTimeout(error->vendor_status) ||
+          error->operation == "check_pro_license")
+        return ::testing::AssertionSuccess();
+      if (std::chrono::steady_clock::now() >= deadline)
+        return ::testing::AssertionFailure() << hw::FormatConfigError(*error);
+    }
+  }
+  // One restore pass of `ids`, as the gateway runs one after a reset.
+  static ::testing::AssertionResult RestorePass(PhoenixBackend& backend,
+                                                std::span<const uint16_t> ids) {
+    const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+    backend.BeginRestoreAfterReset(ids);
+    while (backend.PollRestore() == hw::Backend::RestoreStatus::kPending) {
+      if (std::chrono::steady_clock::now() >= deadline)
+        return ::testing::AssertionFailure() << "restore still pending";
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return ::testing::AssertionSuccess();
+  }
+  // Restores the devices a stalled simulator left unavailable, as AwaitReady
+  // does; AwaitReady itself refuses a configure error that is not a
+  // transport timeout, and check_pro_license is one.
+  static ::testing::AssertionResult RestoreUnavailable(
+      PhoenixBackend& backend) {
+    const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+    while (!backend.UnavailableDevices().empty()) {
+      backend.BeginRestoreAfterReset(backend.UnavailableDevices());
+      while (backend.PollRestore() == hw::Backend::RestoreStatus::kPending) {
+        if (std::chrono::steady_clock::now() >= deadline)
+          return ::testing::AssertionFailure() << "restore still pending";
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      if (std::chrono::steady_clock::now() >= deadline)
+        return ::testing::AssertionFailure() << "devices still unavailable";
+    }
+    return ::testing::AssertionSuccess();
+  }
+  // Applies `commands` until no send fails: a stalled simulator can fail
+  // one (TxFailed), and the backend then sends that motor NeutralOut.
+  static ::testing::AssertionResult ApplySent(
+      PhoenixBackend& backend, std::span<const hw::MotorRequest> commands) {
+    const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+    for (;;) {
+      if (!backend.Apply(commands))
+        return ::testing::AssertionFailure() << "Apply refused";
+      if (backend.ApplyFailedDevices().empty())
+        return ::testing::AssertionSuccess();
+      if (std::chrono::steady_clock::now() >= deadline)
+        return ::testing::AssertionFailure() << "a send kept failing";
+    }
+  }
+};
+
+class PhoenixBackendFocModes : public PhoenixBackendFoc,
+                               public ::testing::WithParamInterface<bool> {};
+
+// Every request that has the flag carries EnableFOC exactly when the motor's
+// config sets foc: duty cycle included, one rule for all five.
+// REQ-CONTRACT-39
+TEST_P(PhoenixBackendFocModes, EveryVoltageFamilyRequestCarriesTheMotorsFoc) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto motor = TestMotor(1, "motor", 1);
+  motor.foc = GetParam();
+  config.motors.push_back(motor);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  ASSERT_NE(EnableFoc(true), EnableFoc(false));
+  const std::array<std::pair<hw::Mode, std::string_view>, 5> modes{{
+      {hw::Mode::kDutyCycle, "DutyCycleOut"},
+      {hw::Mode::kVoltage, "VoltageOut"},
+      {hw::Mode::kVelocity, "VelocityVoltage"},
+      {hw::Mode::kPosition, "PositionVoltage"},
+      {hw::Mode::kMotionMagic, "MotionMagicVoltage"},
+  }};
+  for (const auto& [mode, control] : modes) {
+    const std::array<hw::MotorRequest, 1> commands{Request(1, mode, 0.0)};
+    ASSERT_TRUE(ApplySent(backend, commands)) << control;
+    EXPECT_EQ(AppliedControl(backend, 0), control);
+    EXPECT_EQ(AppliedEnableFoc(backend, 0), EnableFoc(GetParam())) << control;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(Foc, PhoenixBackendFocModes, ::testing::Bool());
+
+// The RoboRIO console of a backend: its RioLog, not started, so the test
+// drains it on its own thread.
+class Console {
+ public:
+  Console()
+      : log_{[this](std::string_view line) { lines_.emplace_back(line); }} {}
+  talos::rio::RioLog* log() { return &log_; }
+  // Every line written so far that contains each of `words`.
+  std::vector<std::string> Lines(
+      std::initializer_list<std::string_view> words) {
+    log_.Flush(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count()));
+    std::vector<std::string> found;
+    for (const auto& line : lines_) {
+      if (std::all_of(words.begin(), words.end(), [&](std::string_view word) {
+            return line.find(word) != std::string::npos;
+          }))
+        found.push_back(line);
+    }
+    return found;
+  }
+
+ private:
+  std::vector<std::string> lines_;
+  talos::rio::RioLog log_;
+};
+
+// A foc motor read not Phoenix Pro licensed at configure is a failed device:
+// invalid, zeroed samples, NeutralOut whatever it is asked, a console line
+// naming it, and its follower with it, while a licensed foc motor drives.
+// A follower of a licensed master is read for itself: read unlicensed, it
+// fails alone and its master drives. Each failed motor gets its own line,
+// though only the first is the configure's error. It is not left to the
+// restore loop. The next configure that reads it licensed clears it. The
+// intake asks for torque current, which needs the licence too: NeutralOut
+// all the same.
+// REQ-CONTRACT-39
+// REQ-SAFE-43
+TEST_F(PhoenixBackendFoc,
+       AnUnlicensedMotorAndItsFollowerFailUntilReconfigured) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto lift = TestMotor(10, "lift", 1);
+  lift.foc = true;
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  auto roller = TestMotor(30, "roller", 3);
+  roller.foc = true;
+  auto intake = TestMotor(40, "intake", 4);
+  intake.foc = true;
+  intake.max_torque_current_a = 5.0;
+  auto roller_follower = TestMotor(50, "roller_follower", 5);
+  roller_follower.master_id = 30;
+  config.motors = {lift, follower, roller, intake, roller_follower};
+  Console console;
+  PhoenixBackend backend(true, console.log());
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  std::vector<std::size_t> checked;
+  SetProLicensed(backend, [&checked](std::size_t i) {
+    checked.push_back(i);
+    // The lift, the intake and the roller's follower are unlicensed.
+    return i != 0 && i != 3 && i != 4;
+  });
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  // The last configure read the lift, the roller and the intake for their
+  // own foc, and the roller's follower for its master's; the lift's
+  // follower failed with the lift unread. (A stalled simulator can make
+  // ConfigureAnswered configure more than once.)
+  ASSERT_GE(checked.size(), 4u);
+  EXPECT_EQ(std::vector<std::size_t>(checked.end() - 4, checked.end()),
+            (std::vector<std::size_t>{0, 2, 3, 4}));
+  const auto error = backend.last_config_error();
+  ASSERT_TRUE(error);
+  EXPECT_EQ(error->operation, "check_pro_license");
+  EXPECT_EQ(error->device_name, "lift");
+  EXPECT_EQ(error->can_id, 1);
+  for (const auto* motor :
+       {"'lift'", "'follower'", "'intake'", "'roller_follower'"}) {
+    EXPECT_FALSE(
+        console.Lines({"[phoenix]", "check_pro_license", motor}).empty())
+        << motor;
+  }
+  EXPECT_TRUE(console.Lines({"check_pro_license", "'roller'"}).empty());
+  ASSERT_TRUE(RestoreUnavailable(backend));
+
+  const std::array<hw::MotorRequest, 5> commands{
+      Request(10, hw::Mode::kVoltage, 6.0),
+      Request(20, hw::Mode::kVoltage, 0.0),
+      Request(30, hw::Mode::kVoltage, 6.0),
+      Request(40, hw::Mode::kTorqueCurrent, 2.0),
+      Request(50, hw::Mode::kVoltage, 0.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  for (const std::size_t i : {0U, 1U, 3U, 4U}) {
+    EXPECT_FALSE(state.motors[i].valid) << i;
+    EXPECT_EQ(state.motors[i].position_rot, 0.0) << i;
+    EXPECT_EQ(state.motors[i].voltage, 0.0) << i;
+  }
+  EXPECT_TRUE(state.motors[2].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 2), "VoltageOut");
+  EXPECT_EQ(AppliedControl(backend, 3), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 4), "NeutralOut");
+  EXPECT_TRUE(backend.UnavailableDevices().empty());
+  ctre::phoenix6::hardware::TalonFX lift_device{1,
+                                                ctre::phoenix6::CANBus{"rio"}};
+  ctre::phoenix6::hardware::TalonFX roller_device{
+      3, ctre::phoenix6::CANBus{"rio"}};
+  EXPECT_NEAR(lift_device.GetSimState().GetMotorVoltage().value(), 0.0, 0.5);
+  EXPECT_GT(roller_device.GetSimState().GetMotorVoltage().value(), 3.0);
+
+  SetProLicensed(backend, nullptr);  // Simulation: licensed.
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  PumpReads(backend, state, commands, 30);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "VoltageOut");
+  EXPECT_EQ(AppliedEnableFoc(backend, 0), EnableFoc(true));
+  EXPECT_GT(state.motors[0].voltage, 3.0);
+  EXPECT_GT(state.motors[1].voltage, 3.0);
+}
+
+// A licence read that gets no answer (the device absent, or its frame late)
+// is not a refusal: the motor is an unavailable device, invalid and
+// neutral, and each restore reads the licence again with the rest of its
+// configuration until one gets an answer. Read licensed, it drives, and a
+// later restore (a device reset) reads it no more; read unlicensed, it
+// fails with its follower until the next configure, named on the console.
+// REQ-CONTRACT-39
+TEST_F(PhoenixBackendFoc, ALicenceNotReadIsReadAgainByTheRestoreLoop) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto lift = TestMotor(10, "lift", 1);
+  lift.foc = true;
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  config.motors = {lift, follower};
+  Console console;
+  PhoenixBackend backend(true, console.log());
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  std::optional<bool> lift_licence;  // No answer.
+  int reads = 0;
+  SetProLicensed(backend, [&lift_licence, &reads](std::size_t i) {
+    ++reads;
+    return i == 0 ? lift_licence : std::optional<bool>{true};
+  });
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  const auto error = backend.last_config_error();
+  ASSERT_TRUE(error);
+  EXPECT_EQ(error->operation, "check_pro_license");
+  EXPECT_EQ(error->device_name, "lift");
+  const auto unavailable = backend.UnavailableDevices();
+  EXPECT_NE(std::find(unavailable.begin(), unavailable.end(), 10),
+            unavailable.end());
+  const std::array<hw::MotorRequest, 2> commands{
+      Request(10, hw::Mode::kVoltage, 6.0),
+      Request(20, hw::Mode::kVoltage, 0.0)};
+  hw::State state;
+  // A restore pass that still gets no answer leaves it so, unrefused.
+  ASSERT_TRUE(RestorePass(backend, backend.UnavailableDevices()));
+  const auto still_unavailable = backend.UnavailableDevices();
+  EXPECT_NE(std::find(still_unavailable.begin(), still_unavailable.end(), 10),
+            still_unavailable.end());
+  backend.Read(state);
+  EXPECT_FALSE(state.motors[0].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_TRUE(console.Lines({"foc needs a Phoenix Pro licence"}).empty());
+
+  // The restore pass reads it licensed: it drives, its follower with it.
+  lift_licence = true;
+  ASSERT_TRUE(AwaitReady(backend, config));
+  PumpReads(backend, state, commands, 30);
+  EXPECT_TRUE(state.motors[0].valid);
+  EXPECT_GT(state.motors[0].voltage, 3.0);
+  EXPECT_GT(state.motors[1].voltage, 3.0);
+
+  // A reset of the licensed motor (and so of its follower): the restore
+  // reads neither licence again, and both drive.
+  const int reads_before_reset = reads;
+  ASSERT_TRUE(RestorePass(backend, std::array<uint16_t, 1>{10}));
+  EXPECT_EQ(reads, reads_before_reset);
+  EXPECT_TRUE(backend.UnavailableDevices().empty());
+  PumpReads(backend, state, commands, 30);
+  EXPECT_GT(state.motors[0].voltage, 3.0);
+  EXPECT_GT(state.motors[1].voltage, 3.0);
+
+  // Unanswered again, then read unlicensed: a failed device with its
+  // follower, no longer retried.
+  lift_licence.reset();
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  ASSERT_TRUE(console.Lines({"foc needs a Phoenix Pro licence"}).empty());
+  lift_licence = false;
+  ASSERT_TRUE(RestoreUnavailable(backend));
+  EXPECT_EQ(console
+                .Lines({"[phoenix]", "check_pro_license", "'lift'",
+                        "foc needs a Phoenix Pro licence"})
+                .size(),
+            1u);
+  EXPECT_FALSE(
+      console.Lines({"[phoenix]", "check_pro_license", "'follower'"}).empty());
+  PumpReads(backend, state, commands, 30);
+  EXPECT_FALSE(state.motors[0].valid);
+  EXPECT_FALSE(state.motors[1].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
+  EXPECT_TRUE(backend.UnavailableDevices().empty());
+}
+
+namespace {
+
+// The simulated RoboRIO's battery reading for one test; 12 V, the
+// simulator's default, again when it goes.
+class SimBattery {
+ public:
+  explicit SimBattery(double volts) { Set(volts); }
+  ~SimBattery() { Set(12.0); }
+  SimBattery(const SimBattery&) = delete;
+  SimBattery& operator=(const SimBattery&) = delete;
+  static void Set(double volts) {
+    frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{volts});
+  }
+};
+
+}  // namespace
+
+class PhoenixBackendTorque : public PhoenixBackendFoc {
+ protected:
+  // A motor that may run torque current: foc, up to 5 A, at most 4 V.
+  static hw::MotorConfig TorqueMotor(uint16_t id, const std::string& name,
+                                     int can_id) {
+    auto m = TestMotor(id, name, can_id);
+    m.foc = true;
+    m.max_torque_current_a = 5.0;
+    m.max_voltage = 4.0;
+    return m;
+  }
+  // Every field of the request Apply should send for `amperes` under the
+  // duty cap `duty`.
+  static std::map<std::string, std::string> TorqueCurrentFoc(double amperes,
+                                                             double duty) {
+    return ctre::phoenix6::controls::TorqueCurrentFOC{units::ampere_t{amperes}}
+        .WithMaxAbsDutyCycle(duty)
+        .WithUpdateFreqHz(units::hertz_t{0})
+        .GetControlInfo();
+  }
+  static ::testing::AssertionResult AppliedConfig(
+      PhoenixBackend& backend, std::size_t i,
+      ctre::phoenix6::configs::TalonFXConfiguration& applied) {
+    const auto status = AwaitAnswer(
+        [&] { return Motor(backend, i).GetConfigurator().Refresh(applied); });
+    if (status.IsOK()) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << status.GetName();
+  }
+};
+
+// A torque-current request is TorqueCurrentFOC with the demand in amperes,
+// peak torque current +-max_torque_current_a, and a duty cap of max_voltage
+// over the last battery reading: none before the first reading (cap 0, no
+// output), following the battery, and kept over a lost reading. A neutral
+// after it is NeutralOut.
+// REQ-SAFE-43
+TEST_F(PhoenixBackendTorque, ARequestIsTorqueCurrentFocCappedAtMaxVoltage) {
+  EnsureHal();
+  EnabledDs ds;
+  SimBattery battery{0.0};  // No reading yet.
+  hw::Config config;
+  config.motors.push_back(TorqueMotor(1, "gripper", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  ctre::phoenix6::configs::TalonFXConfiguration applied;
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakForwardTorqueCurrent.value(), 5.0);
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakReverseTorqueCurrent.value(),
+                   -5.0);
+
+  const std::array<hw::MotorRequest, 1> torque{
+      Request(1, hw::Mode::kTorqueCurrent, -2.5)};
+  ASSERT_TRUE(ApplySent(backend, torque));
+  EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 0.0))
+      << "before a battery reading";
+  hw::State state;
+  for (const double battery_v : {12.5, 8.0}) {
+    battery.Set(battery_v);
+    backend.Read(state);
+    ASSERT_TRUE(ApplySent(backend, torque));
+    EXPECT_EQ(AppliedFields(backend, 0),
+              TorqueCurrentFoc(-2.5, 4.0 / battery_v))
+        << battery_v << " V";
+  }
+  battery.Set(0.0);
+  backend.Read(state);
+  ASSERT_TRUE(ApplySent(backend, torque));
+  EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 4.0 / 8.0))
+      << "a lost reading keeps the last";
+
+  const std::array<hw::MotorRequest, 1> neutral{
+      Request(1, hw::Mode::kNeutral, 0.0)};
+  ASSERT_TRUE(ApplySent(backend, neutral));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+}
+
+// A torque-current request the gateway would have neutralized never drives
+// when it reaches Apply anyway: over the limit, not finite, with a
+// feedforward, or for a motor whose config does not allow the mode (foc
+// without max_torque_current_a; config load refuses the limit without foc).
+// Each is that motor's NeutralOut, not an apply failure.
+// REQ-SAFE-43
+TEST_F(PhoenixBackendTorque, AnOutOfContractRequestIsNeutralOut) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  config.motors.push_back(TorqueMotor(1, "gripper", 1));
+  auto no_limit = TorqueMotor(2, "roller", 2);
+  no_limit.max_torque_current_a = 0;
+  config.motors.push_back(no_limit);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  auto with_feedforward = Request(1, hw::Mode::kTorqueCurrent, 2.0);
+  with_feedforward.feedforward_v = 1.0;
+  const std::array<std::pair<hw::MotorRequest, std::string_view>, 4> bad{{
+      {Request(1, hw::Mode::kTorqueCurrent, 5.5), "over the limit"},
+      {Request(1, hw::Mode::kTorqueCurrent, -5.5), "under the limit"},
+      {Request(1, hw::Mode::kTorqueCurrent, std::nan("")), "not finite"},
+      {with_feedforward, "with a feedforward"},
+  }};
+  for (const auto& [request, why] : bad) {
+    const std::array<hw::MotorRequest, 2> good{
+        Request(1, hw::Mode::kTorqueCurrent, 5.0),
+        Request(2, hw::Mode::kTorqueCurrent, 1.0)};
+    ASSERT_TRUE(ApplySent(backend, good)) << why;
+    ASSERT_EQ(AppliedControl(backend, 0), "TorqueCurrentFOC") << why;
+    EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut") << "without a limit";
+    const std::array<hw::MotorRequest, 2> commands{request, good[1]};
+    ASSERT_TRUE(ApplySent(backend, commands)) << why;
+    EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut") << why;
+  }
+}
+
+// A follower may not set max_torque_current_a, yet its Follower copies its
+// master's torque output, so it takes its master's peak torque current: with
+// its own 0 A, Phoenix's simulation held a follower at 0 V and 0 A while its
+// master drove 2 A.
+// REQ-SAFE-43
+TEST_F(PhoenixBackendTorque, AFollowerTakesItsMastersPeakTorqueCurrent) {
+  EnsureHal();
+  hw::Config config;
+  config.motors.push_back(TorqueMotor(10, "climber", 1));
+  auto follower = TestMotor(20, "climber_follower", 2);
+  follower.master_id = 10;
+  config.motors.push_back(follower);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  ctre::phoenix6::configs::TalonFXConfiguration applied;
+  ASSERT_TRUE(AppliedConfig(backend, 1, applied));
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakForwardTorqueCurrent.value(), 5.0);
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakReverseTorqueCurrent.value(),
+                   -5.0);
 }

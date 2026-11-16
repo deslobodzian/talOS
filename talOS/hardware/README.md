@@ -21,10 +21,12 @@ while a configure is still pending (every boot restore) is dropped without an
 ACK; the bridge pushes again after its 50 ms retry gate. The manifest holds
 logical device IDs, names, CAN
 addresses and bus names, inversion, encoder offsets, current/voltage limits,
-gearing, three gain slots, soft limits, TalonFX limit switches, and Motion
-Magic cruise velocity, acceleration, and jerk. Changed configurations require
-disabled operation. Identical pushes may succeed while enabled without device
-traffic, but not while faulted or while configuration/restoration is pending.
+gearing, three gain slots, soft limits, TalonFX limit switches, FOC, the
+torque-current limit, and Motion Magic cruise velocity, acceleration, and
+jerk. Changed configurations
+require disabled operation. Identical pushes may succeed while enabled
+without device traffic, but not while faulted or while
+configuration/restoration is pending.
 
 The RoboRIO atomically and durably (synced file, rename, synced directory)
 saves acknowledged configuration bytes with a CRC32 to
@@ -44,8 +46,13 @@ again. Startup validates
 them and starts their restoration on the configure worker without waiting for
 it, so robot code reports ready at once; the gateway stays unconfigured,
 refusing commands, until the worker finishes. Missing or corrupt files leave
-the gateway unconfigured. A stale file cannot accept commands from a different
-configuration ID.
+the gateway unconfigured. A file with a motor saved before `foc` or
+`max_torque_current_a` existed (protocol 10 or older) does not decode
+either, its motor records being shorter, so the RoboRIO boots unconfigured,
+printing the same `hardware gateway config=0 ... (waiting for config push)`
+line as for a missing file, until the bridge pushes its configuration on
+link.
+A stale file cannot accept commands from a different configuration ID.
 
 A structurally valid configuration succeeds in degraded mode when individual
 Phoenix devices time out or are absent. Failed devices publish invalid samples;
@@ -106,6 +113,46 @@ the same subsystem on the same CAN bus; self-follow and follower chains are
 rejected. Followers use the master's output rather than their own demand,
 and neutralize when the master is neutral or loses valid feedback.
 Both simulation backends support same-direction and opposed followers.
+
+`foc = true` (default false) makes the RoboRIO send that motor every
+duty-cycle, voltage, velocity, position and Motion Magic request with
+Phoenix's `EnableFOC` set (FOC commutation; without it, none is). FOC needs a
+Phoenix Pro licence; the device reports whether it is licensed (whether a
+CANivore's licence shows there is a bench check). Config load refuses
+`foc` on a follower (`foc for <follower>: a follower follows its master's
+output; set foc on <master>`): the follower copies its master's output. The
+key is in the configuration fingerprint and wire format.
+
+At each configure the RoboRIO reads the `IsProLicensed` signal (waiting up
+to 0.5 s, one motor after another) of each motor whose own or whose
+master's `foc` is set, except a follower whose master was already read
+unlicensed. A restore reads it again only for a motor whose read got no
+answer, so a reset of a motor read licensed or unlicensed costs no read.
+A motor read not licensed is a failed device until
+the next configure, which is a changed configuration or a restart of the
+RoboRIO program (a push of the same configuration touches no device):
+invalid samples, `NeutralOut` whatever it is asked, and its bit in
+`/hw/status` `motor_fault_mask`. A follower of such a master fails with it,
+licensed or not; a master whose follower alone is unlicensed drives while
+the follower stays neutral, as with an absent follower. Each failed motor
+is named on the RoboRIO console (`[phoenix] config failed for '<motor>' ...
+during check_pro_license`). The configure still succeeds and is
+acknowledged, so no configure error crosses the link; the backend keeps the
+configure's first error (`last_config_error`, RoboRIO-side) only. A read
+that gets no answer (the device absent, or its frame late) is not a refusal:
+the motor is an unavailable device, and each restore, with the rest of its
+configuration, reads the licence again until one gets an answer. The rest
+of the robot drives,
+unless every motor and CAN sensor has failed: then the gateway's total
+feedback loss also holds DIO and PWM outputs neutral. Desktop simulation
+needs no licence and checks none.
+
+`max_torque_current_a` (amperes, default 0) is the largest stator current a
+torque-current demand may ask of the motor; 0 refuses the mode. Config load
+refuses a value that is negative or non-finite, above `stator_limit_a`, set
+without `foc = true` (TorqueCurrentFOC is a Phoenix Pro request) or set on a
+follower, naming the motor and the key (`hardware::Validate`). The key is in
+the configuration fingerprint and wire format.
 
 `position_frame` is `"rezero"` (the default) or `"absolute"`, which config
 load accepts only with `feedback = "RemoteCANcoder"`, since a TalonFX reset
@@ -199,17 +246,58 @@ message. Rejections before backend configuration need not populate it.
 | Velocity | Mechanism rotations/second | Volts |
 | Position | Mechanism rotations | Volts |
 | Motion Magic position | Mechanism rotations | Volts |
+| Torque current | Stator amperes, within ±`max_torque_current_a` | Zero |
 
 Each closed-loop request selects gain slot 0, 1, or 2. Drive motors use rotor
 feedback divided by the configured mechanism ratio. Steering uses
-`RemoteCANcoder` with continuous wrapping. The backend uses standard voltage
-controls and does not require Phoenix Pro. TorqueCurrentFOC, FusedCANcoder,
-and dynamic Motion Magic requests are not implemented. Duty-cycle
+`RemoteCANcoder` with continuous wrapping. The backend uses Phoenix's voltage
+controls, which need Phoenix Pro only for a motor configured `foc = true`
+(above). A torque-current request is TorqueCurrentFOC with peak torque
+current ±`max_torque_current_a` (a follower, which copies its master's
+torque output, takes its master's; a motor without the key gets 0 A) and a
+maximum duty cycle of `max_voltage` over the RoboRIO's last battery reading
+that was finite and above 1 V (0, no output, before the first);
+`stator_limit_a` and `supply_limit_a` apply too. Positive amperes drive the
+direction positive volts do, after `inverted`. The request is one-shot, so
+its cap is as old as the last command the RoboRIO applied: one node period
+while the demand changes, at most the bridge's command heartbeat otherwise
+([DATA_FLOW.md](../../docs/DATA_FLOW.md)). It divides by the RoboRIO's input
+voltage reading, not the TalonFX's bus voltage, so a reading taken in a sag
+raises that interval's ceiling in proportion (read 9 V, actually 12.5 V:
+4 V becomes 5.6 V) and a stale high reading errs low. A follower of a
+torque-current master has no duty cap of its own (Phoenix's Follower copies
+the master's torque current, not its `MaxAbsDutyCycle`): a mechanically
+coupled pair is held to the cap through the master, an uncoupled follower
+is not. The gateway neutralizes a torque-current request that
+`TorqueCurrentAllowed` (`gate.h`) refuses: its motor lacks `foc = true` or a
+positive `max_torque_current_a`, its demand exceeds that limit, or its
+feedforward is not 0; the RoboRIO sends NeutralOut for any such request
+that reaches it. A 0 A demand is a driving request, not talOS's neutral:
+without a live target the devices flush holds it like any set output
+(`outputs held`), otherwise it is applied as sent, as TorqueCurrentFOC; only
+`NeutralOut` is neutral. What the motor does at exactly 0 A is not yet
+measured: zero torque by CTRE's `Deadband` description, or its `brake`
+NeutralMode by `OverrideCoastDurNeutral`'s. The physics simulator models
+zero torque (a free rotor spins on); the RoboRIO's desktop simulation stops
+the rotor.
+FusedCANcoder, dynamic Motion Magic, and velocity or position
+TorqueCurrentFOC requests are not implemented. Duty-cycle
 encoder velocity is finite-difference across Reads.
 
 Besides motors and CAN sensors, the manifest accepts RIO digital inputs and
 outputs, analog inputs, quadrature and duty-cycle encoders, and PWM outputs.
 Phoenix and both sims implement all of them.
+
+A PWM output's request is off or a pulse (`PwmMode`, `messages.h`). Off sends
+no pulse (`PWM::SetDisabled`): a servo goes limp and a PWM motor controller
+sees no signal. A pulse is `output` on `PWM::SetSpeed`'s scale, -1 to +1,
+where 0 is the 1.5 ms centre pulse that centres a servo and holds a PWM motor
+controller at neutral. Off is the PWM output's neutral, as `kNeutral` is a
+motor's: the bridge sends it for an output its owner's request omits, after
+the owner timeout and when a transition invalidates the cached requests, and
+the gateway's own neutral turns every PWM output off. A pulse that is not
+finite or lies outside -1 to +1 rejects the whole command. A State's PWM
+sample reads 0 while its output sends no pulse.
 
 CAN bus load and measured sensor age must be checked on the actual bus before
 choosing production frequencies. Motion feedback requests the manifest status
@@ -323,11 +411,12 @@ Commands echo the gateway's boot ID, epoch, and poll timestamp. Expiry is checke
 using only the gateway clock, so it does not assume synchronized host clocks.
 Duplicate/reordered command sequences, old sessions, expired observations, and
 structural errors reject the whole command. Non-finite or out-of-range motor
-demands/feedforward neutralize only that motor. Per-boot counters report refused
+demands/feedforward, and a torque-current request the motor's configuration
+does not allow (above), neutralize only that motor. Per-boot counters report refused
 commands, neutralized motors, apply failures, and device resets. The refused
 count omits two refusals of an all-neutral command (every motor neutral with
 zero demand and feedforward, every digital output off, every PWM output
-zero): a current one while the gateway is disabled, uncommissioned or
+off): a current one while the gateway is disabled, uncommissioned or
 unconfigured, since the bridge keeps forwarding those while the robot cannot
 drive; and one that passes every other check but carries an earlier epoch
 while no command is in force, since the bridge built it from a State read
@@ -870,14 +959,12 @@ battery's 12.8 V (`kSimRestingSupplyV`, `sim_backend.h`), so a healthy
 simulated robot passes the pre-match battery check;
 `SetPowerHealth(volts, brownout)` injects low-power telemetry. Physics also uses
 the reported voltage as its motor supply: a duty-cycle demand applies that
-fraction of it (0.5 is 6.4 V at rest), while voltage and closed-loop modes are
-clamped to `max_voltage` (12 V when unset) and the motor models keep their 12 V
+fraction of it (0.5 is 6.4 V at rest), while voltage, closed-loop and
+torque-current modes are clamped to `max_voltage` (12 V when unset) and the motor models keep their 12 V
 free-speed and stall ratings. Health is observable while disabled
-or without a live command. On the real backend, the gateway's own neutral (disabled, expired command,
-watchdog) disables PWM pulses (`PWM::SetDisabled`) and de-energizes DIO. A PWM
-output that a node did not set, or that the bridge neutralized for a silent
-owner, while the robot stays enabled is commanded 0 instead (`SetSpeed(0)`, a
-1.5 ms pulse): neutral for a motor controller, centre for a servo.
+or without a live command. Both keep each PWM output's last request
+(`GetPwm`, off when there is none) and read an output that sends no pulse as
+0, as the RoboRIO's `PWM::GetSpeed()` does after `SetDisabled`.
 
 | | Ideal (`SimBackend`) | Physics-backed (`sim::PhysicsSimBackend`) |
 |---|---|---|
@@ -890,6 +977,7 @@ owner, while the robot stays enabled is commanded 0 instead (`SetSpeed(0)`, a
 | CANcoder position | Its motor's position, wrapped to [-0.5, 0.5) rotations as the RoboRIO reports it | The linked mechanism's, wrapped the same way |
 | Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
+| Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero torque, so a free rotor spins on (hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
 | Stator current | Zero | (applied volts - back-EMF) / R, clamped to `stator_limit_a`; R and free speed from the motor type's published 12 V stall current and free speed (`MotorModelFor`: Kraken X60 366 A and 6000 rpm, the default; Kraken X44 275 A and 7530 rpm; Falcon 500 257 A and 6380 rpm). A motor held at a soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid, its age growing), per-device disconnect, controller restart |

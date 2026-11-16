@@ -92,6 +92,7 @@ struct HardwareAccess {
   static void digital_output_set(HardwareLink& link, std::size_t index,
                                  bool value);
   static void pwm_set(HardwareLink& link, std::size_t index, double output);
+  static void pwm_stop(HardwareLink& link, std::size_t index);
   // A talos::Target of the link's node returned a target inside the
   // update() running now: the flush right after it may send that update()'s
   // outputs (devices.h). Target::get() calls it on every selecting call made

@@ -3,6 +3,11 @@ name = "motor"
 node = "//bench/main_processor/motor:node"
 period_us = 5000
 max_bench_voltage_v = 2.0
+# TORQUE_CURRENT's cap, stator amperes. 0 keeps torque mode off, so button 3
+# drives nothing, until a person who has confirmed the Kraken's Phoenix Pro
+# licence sets foc = true and max_torque_current_a under [motors.kraken] and
+# raises this (docs/BENCH.md "Torque current (hardware only)").
+max_bench_torque_current_a = 0.0
 
 [motors.kraken]
 type = "TalonFX"
@@ -26,9 +31,10 @@ acceleration_rps2 = 20.0
 slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.095, a = 0.0, g = 0.0 }
 
 [teleop]
-defaults = { mode = "VOLTAGE", voltage_v = 0.0, velocity_rps = 0.0, voltage_frac = 0.0 }
+defaults = { mode = "VOLTAGE", voltage_v = 0.0, velocity_rps = 0.0, voltage_frac = 0.0, torque_current_a = 0.0 }
 
-# Buttons take precedence over the axis; button 1 wins when both are held.
+# Buttons take precedence over the axis; among held buttons the lowest wins
+# (1, then 2, then 3: the first binding listed).
 [[teleop.bindings]]
 button = 1
 while_held = { mode = "VELOCITY", velocity_rps = 10.0 }
@@ -36,6 +42,11 @@ while_held = { mode = "VELOCITY", velocity_rps = 10.0 }
 [[teleop.bindings]]
 button = 2
 while_held = { mode = "VELOCITY", velocity_rps = 30.0 }
+
+# Stator current, capped by max_bench_torque_current_a (0: drives nothing).
+[[teleop.bindings]]
+button = 3
+while_held = { mode = "TORQUE_CURRENT", torque_current_a = 2.0 }
 
 # Joystick 0 axis 1: normalized fraction scaled by max_bench_voltage_v.
 [[teleop.bindings]]

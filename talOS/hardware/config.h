@@ -79,6 +79,18 @@ struct MotorConfig {
   std::array<Gains, 3> slots{};
   uint16_t master_id{0};  // Zero denotes an independent motor.
   bool oppose_master{false};
+  // [motors.*] foc: FOC commutation (Phoenix EnableFOC) on every duty-cycle,
+  // voltage, velocity, position and motion-magic request the RoboRIO sends
+  // this motor. Needs a Phoenix Pro licence, which the RoboRIO checks at
+  // configure by reading the device's IsProLicensed signal (whether a
+  // CANivore's licence shows there is unconfirmed). On the config wire and in
+  // ConfigurationId; refused on a follower, which copies its master's output.
+  bool foc{false};
+  // [motors.*] max_torque_current_a: the largest stator current a
+  // torque-current demand may ask for, amperes; 0 (the default) refuses the
+  // mode. Needs foc, at most stator_limit_a, refused on a follower. On the
+  // config wire and in ConfigurationId.
+  double max_torque_current_a{0};
   // Main processor only (talOS/devices), not sent to the controller and not
   // part of ConfigurationId: [motors.*] position_frame = "absolute" (true)
   // or "rezero" (false, the default). A rezero-frame motor's position and
