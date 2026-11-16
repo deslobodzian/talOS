@@ -27,8 +27,8 @@ this fixture means saying there whether a robot repository gets the file.
 
 ```sh
 cd examples/robot_repo
-bazel test //...                       # graph test, node tests, sim smoke, Studio, pin and session_report tests
-bazel build //:robot_bundle            # the deployable bundle
+bazel test //...                       # graph test, node tests, sim smoke, Studio, bundle install, pin and session_report tests
+bazel build //:robot_bundle            # the deployable bundle (--config=release records the revision)
 bazel run //:sim -- --duration-s 10    # the robot against the simulator
 bazel run //:sim -- --start-studio-bridge   # with Studio (below)
 bazel run @talos//talOS/launcher:session_report -- <session dir>   # a recorded session's report
@@ -140,6 +140,24 @@ A robot repository that builds them adds
 bridge`, and every talOS node (`teleop`, `telemetry`) in its subsystem file.
 Their defaults are labels of the main repository, which in a robot
 repository name nothing.
+
+## Deployment
+
+`bazel build --config=release //:robot_bundle` builds what the robot's main
+processor installs, stamped with this repository's git revision
+(`.bazelrc`'s `--workspace_status_command`, talOS's
+`tools/workspace_status.sh` run here), and `@talos//tools:deploy.sh install`
+installs it ([docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)).
+`bundle_install_test` (e2e, about 2 s) does that into a scratch prefix: the
+install exits 0 with no warm-up warning (its graph check ran the bundle's
+own `run.sh --describe-only`), and the installed `run.sh --describe-only`
+describes every node of `robot_manifest.bzl` and the hardware bridge. It
+installs from a copy of `bazel-bin/robot_bundle` that it removes first,
+runs without Bazel's runfiles variables, and fails on a link in the install
+that leaves it or a file naming Bazel's output base or either checkout, so
+the bundle runs where the build tree is not. A robot repository gets the
+same test: talOS's own bundle tests install bundles built inside talOS,
+never one built under `@talos`'s external name.
 
 ## What it shares with talOS
 

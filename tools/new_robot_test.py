@@ -428,7 +428,7 @@ class RobotRepositoryTest(unittest.TestCase):
             self.assertEqual(sorted(files), [
                 ".bazelignore", ".bazelrc", ".bazelversion", ".gitignore",
                 "BUILD.bazel",
-                "MODULE.bazel", "README.md",
+                "MODULE.bazel", "README.md", "bundle_install_test.py",
                 "robot.toml", "robot_manifest.bzl", "studio_test.py",
                 "subsystems/telemetry.toml", "subsystems/teleop.toml",
                 "talos_pin_test.py"])
