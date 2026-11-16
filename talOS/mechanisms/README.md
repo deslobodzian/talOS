@@ -351,9 +351,8 @@ mapping. Any other sample, an unknown age included, loses at speed and
 restarts the entry count.
 During a CAN gap the gateway keeps reporting the last velocity, valid until
 its age reaches `command_timeout_us`; this rule keeps a frozen in-band
-reading from holding at speed. The 2026 shooter
-(`2026-robot/main_processor/shooter`) is one `VelocityMechanism`, keyed by
-its `[flywheel]` table.
+reading from holding at speed. The 2026 robot's shooter (in that robot's
+repository) is one `VelocityMechanism`, keyed by its `[flywheel]` table.
 `VelocityMechanism` drives nothing with a disconnected motor.
 
 ## RollerWithSensor

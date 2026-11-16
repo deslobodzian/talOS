@@ -18,8 +18,8 @@ as 8-bit grayscale; 16-bit images are reduced to 8 bits) and its timeline:
   `camera.fps` (the tool's `--fps`).
 
 A camera node's frame recorder output (`<session>/frames/<camera>/`) is not
-such a directory; replay it with `frame_replay`
-([camera node README](../../../2026-robot/main_processor/vision/README.md#frame-recording)).
+such a directory; replay it with `//talOS/vision/recording:frame_replay`
+(its layout: [`recording.h`](../recording/recording.h)).
 
 ## Video files
 
@@ -60,4 +60,5 @@ instead of opening a camera:
 Under `testing::Sim`, construct the source with `Pacing::kManual` through the
 node's source factory and call `DeliverUntil(sim.now())` between steps: no
 thread, no wall clock, and the same frames at the same simulated instants on
-every run (`2026-robot/main_processor/vision/recorded_footage_test.cc`).
+every run (`playback_test.cc` steps a source so; the 2026 robot's
+`recorded_footage_test` runs its camera node on one).

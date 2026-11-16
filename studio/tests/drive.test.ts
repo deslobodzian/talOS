@@ -1,7 +1,7 @@
 // The driver dashboard page (src/drive): its feed model on an injected clock
 // and a fake socket, and its rendering of the 2026 layout. The layout fixture
-// is what the bridge serves at /drive/layout.json for
-// 2026-robot/main_processor/configuration/dashboard.toml (DashboardLayoutJson,
+// is what the bridge serves at /drive/layout.json for the 2026 robot's
+// dashboard.toml, in that robot's repository (DashboardLayoutJson,
 // the shape //talOS/telemetry:dashboard_layout_test pins); the telemetry is
 // real TLM3 pages, decoded by the same TelemetryDecoder Studio uses.
 

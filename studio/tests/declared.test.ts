@@ -9,10 +9,10 @@
 //
 // `launcher_graph.json` is therefore not hand-written. It is the output of
 //
-//   bazel run //talOS/launcher:launcher -- --describe-only \
-//     --config 2026-robot/main_processor/configuration/robot.toml
+//   bazel run @talos//talOS/launcher:launcher -- --describe-only \
+//     --config $PWD/main_processor/configuration/robot.toml
 //
-// against the real robot, with only `session_id` pinned so a diff is a diff in
+// in the 2026 robot's repository (talOS overridden to this checkout), with only `session_id` pinned so a diff is a diff in
 // shape rather than in session. If the launcher's envelope changes, this test
 // fails and names the field -- regenerate the fixture and fix the parser
 // together, in one commit.

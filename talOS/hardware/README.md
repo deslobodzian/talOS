@@ -435,8 +435,8 @@ velocity sample is `command_timeout_us` old or older (an unknown age,
 `UINT32_MAX`, included); the gateway applies that age bound after
 `Backend::Read`, the same for every backend (`FeedbackFresh`, `gate.h`), so a
 gap shorter than that bound does not invalidate the feedback at the gateway;
-a consumer's own, tighter age bound still applies (the drivetrain drops
-odometry samples older than 50 ms, see its [README](../../2026-robot/main_processor/drivetrain/README.md)).
+a consumer's own, tighter age bound still applies (the 2026 robot's
+drivetrain drops odometry samples older than 50 ms).
 A motor or CAN sensor sample marked invalid, by the backend, the age bound
 or the gateway's mask of an unavailable device, its follower, or a chain whose
 restore ended in that tick (above), carries zero

@@ -261,8 +261,8 @@ local_port = 5803                  # bind port on the companion
 
 
 ```sh
-bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/configuration/robot.toml
-bazel run //talOS/launcher:launcher -- --config 2026-robot/main_processor/configuration/robot.toml --remote 10.56.87.2
+bazel run //talOS/launcher:launcher -- --config bench/main_processor/configuration/robot.toml
+bazel run //talOS/launcher:launcher -- --config bench/main_processor/configuration/robot.toml --remote 10.56.87.2
 ```
 
 `--remote` overrides `[robot] controller_address`; `--remote-port` and
@@ -299,7 +299,7 @@ flags instead. For example:
 
 ```sh
 bazel run //talOS/launcher -- \
-  --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
+  --config "$PWD/bench/main_processor/configuration/robot.toml" \
   --sim --start-sim-gateway --sim-gateway-arg --physics \
   --sim-gateway-arg --wheel-radius-error --sim-gateway-arg 0.1
 ```
@@ -750,7 +750,7 @@ pass looks at every one.
 
 From SIGKILL of a critical member to its first hardware request, measured on
 a Linux x86-64 desktop (8 threads) by killing `drivetrain` 20 times in a
-`--sim` session of `robot_physics_sim.toml` with the physics gateway under
+`--sim` session of the 2026 robot's `robot_physics_sim.toml` with the physics gateway under
 `--restart-window-ms 1500`, so each is a first restart, session directory on
 btrfs. The stages come from `CLOCK_MONOTONIC` stamps: the killer's, the
 launcher's `waitpid` and `fork` and the restarted node's first constructor (an
@@ -805,10 +805,10 @@ node, no shared-memory segment, no hardware bridge, no gateway.
 ```sh
 ./sim.sh --sim-gateway --no-studio --no-open --duration-s 15   # /tmp/talos_logs/<id>
 bazel run //talOS/launcher -- \
-  --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
-  --replay-inputs /tmp/talos_logs/<id> --only pose_estimator \
-  --output-dir /tmp/pose_estimator_replay
-bazel run //talOS/launcher:log_dump -- /tmp/pose_estimator_replay/<new-session-id>
+  --config "$PWD/bench/main_processor/configuration/robot_physics_sim.toml" \
+  --replay-inputs /tmp/talos_logs/<id> --only swerve_module \
+  --output-dir /tmp/swerve_module_replay
+bazel run //talOS/launcher:log_dump -- /tmp/swerve_module_replay/<new-session-id>
 ```
 
 Only the selected node starts; its output is a new log, not a comparison with
@@ -1772,10 +1772,10 @@ Studio parses this document in TypeScript (`studio/src/system.ts`), and neither
 language can check the other. `studio/tests/launcher_graph.json` and
 `launcher_graph_faults.json` are real output from
 
-    bazel run //talOS/launcher:launcher -- --describe-only \
-      --config 2026-robot/main_processor/configuration/robot.toml
+    bazel run @talos//talOS/launcher:launcher -- --describe-only \
+      --config $PWD/main_processor/configuration/robot.toml
 
-with only `session_id` pinned, and `//studio:declared_test` parses both. So a
+in the 2026 robot's repository (talOS overridden to this checkout), with only `session_id` pinned, and `//studio:declared_test` parses both. So a
 change to the envelope here fails there rather than reaching a viewer as a
 silently empty panel. Regenerate the fixtures and fix the parser in the same
 commit; the faults fixture is the same robot with `drivetrain` publishing the
