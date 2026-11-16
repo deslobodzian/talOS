@@ -4,6 +4,22 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
+# One launcher console line composed and handed to its stream in one write.
+cc_library(
+    name = "console_line",
+    hdrs = ["console_line.h"],
+)
+
+cc_test(
+    name = "console_line_test",
+    size = "small",
+    srcs = ["console_line_test.cc"],
+    deps = [
+        ":console_line",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # A session's records: its manifest, run history, lock, retention facts and
 # the atomic writes that keep them.
 cc_library(
@@ -20,6 +36,7 @@ cc_library(
     ],
     visibility = ["//studio/review:__pkg__"],
     deps = [
+        ":console_line",
         ":hardware_record",
         "//talOS/driver_station",
         "//talOS/events:events_core",
@@ -40,7 +57,10 @@ cc_library(
     name = "spawn",
     srcs = ["spawn.cc"],
     hdrs = ["spawn.h"],
-    deps = ["//talOS/process"],
+    deps = [
+        ":console_line",
+        "//talOS/process",
+    ],
 )
 
 # Drains every roster member's stdout and stderr into its <name>.log, and
@@ -49,7 +69,10 @@ cc_library(
     name = "child_output",
     srcs = ["child_output.cc"],
     hdrs = ["child_output.h"],
-    deps = [":spawn"],
+    deps = [
+        ":console_line",
+        ":spawn",
+    ],
 )
 
 # LauncherOptions, the bundle manifest, and the roster a config names.
@@ -74,6 +97,7 @@ cc_library(
     srcs = ["describe_graph.cc"],
     hdrs = ["describe_graph.h"],
     deps = [
+        ":console_line",
         ":roster",
         ":session",
         ":spawn",
@@ -208,6 +232,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":child_output",
+        ":console_line",
         ":describe_graph",
         ":hardware_record",
         ":log_budget",
@@ -546,6 +571,7 @@ cc_test(
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/events:input_replay",
+        "//talOS/events:session_manifest",
         "//talOS/hardware",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
@@ -782,6 +808,7 @@ cc_test(
         "no_macos_sanitizer",
     ],
     deps = [
+        ":child_output",
         ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
@@ -973,6 +1000,7 @@ cc_test(
         "//talOS/events",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:gap_testing",
         "//talOS/hardware",
         "//talOS/protocol",
         "@googletest//:gtest_main",

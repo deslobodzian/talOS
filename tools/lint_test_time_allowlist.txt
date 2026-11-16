@@ -17,12 +17,13 @@ bench/main_processor/swerve_module/send_target.cc sleep 1 operator CLI beside th
 studio/bridge/bandwidth_test.py clock 6 integration: bounds a fixed-length load window on a real bridge and reports its measured rate (--measure)
 studio/bridge/client_timeout_test.py clock 8 integration: times a real bridge's idle-timeout close against its stated bound (main.cc kIdleTimeoutS)
 studio/bridge/integration_test.py clock 2 integration: divides a real bridge's own wake count by the run's duration (REQ-RT-21)
-studio/tests/agent.test.ts clock 2 component: get_system_graph judges staleness against performance.now() itself (no clock parameter), so the test stamps arrivals relative to that clock
-studio/tests/agent.test.ts sleep 2 integration: the agent against a fake bridge over a real WebSocket; settle() polls it 10 ms apart for at most 2 s (below §6.3's 10 s), and a 150 ms sleep precedes the check that a 404 left no declared graph (a sleep then an expectation; TODO.md LINT-1)
+studio/tests/agent.test.ts sleep 1 integration: the agent against a fake bridge over a real WebSocket; settle() polls agent state nothing announces 10 ms apart, for at least 10 s, a bound on a hang only
 studio/tests/recorded.test.tsx sleep 1 component: settle() is setTimeout(0), one macrotask turn for the fake fetch's promises to resolve; it waits for no duration
 studio/bridge/stop_test.py clock 3 integration: times a real bridge's stop against a quarter of the launcher's stop timeout (REQ-OPS-06, launcher.h kStopTimeout)
 talOS/bridge/hardware_node_test.cc clock 4 integration: the bridge over UDP loopback; a 20 s deadline bounds the child bridge's hang, and kHangBound (10 s) the receive of a clock probe a Tick already sent and of the frame that ends the duty stream
 talOS/bridge/hardware_node_test.cc sleep 1 integration: the bridge as a child process; State frames are resent 5 ms apart until it answers or exits
+talOS/bridge/node_test_support.h clock 6 integration helpers: the bridge over UDP loopback; kHangBound (10 s) deadlines only bound a hang
+talOS/bridge/node_test_support.h sleep 1 integration helpers: WaitFor polls 100 us apart a condition the bridge's Run() thread makes true without notifying the test
 talOS/bridge/run_test.cc clock 8 integration: Run() on the real clock; measures registry-progress gaps (stall timeout), wakes per elapsed window (REQ-RT-20) and the host's 1 ms sleep overrun (§6.7)
 talOS/bridge/run_test.cc sleep 2 integration: samples the registry row 1 ms apart for its gaps, and StallMeter's 1 ms sleep is the host-qualification probe (§6.7)
 talOS/events/log/log_kill_test.cc clock 2 integration: kills a writer process, waits with a deadline
@@ -46,8 +47,10 @@ talOS/launcher/outputs_held_test.cc clock 4 integration: a gateway in the test p
 talOS/launcher/outputs_held_test.cc sleep 2 integration: paces the in-process gateway's 5 ms tick and the registry poll
 talOS/launcher/supervision_test.cc clock 46 integration: one real spawn or kill per mechanism; deadlines (10-20 s) bound polls of the manifest, registry and pid files, and a measured supervision-pass window
 talOS/launcher/supervision_test.cc sleep 28 integration: paces polls of files the spawned processes write (no notification exists) and stub registry heartbeats every 5 ms for the launcher's real-time stall check
-talOS/node/node_stop_test.cc clock 4 integration: a 20 s deadline bounds the wait for a spawned node's registry row, and the stop latency shows SIGTERM did not wait out --duration-s
-talOS/node/node_stop_test.cc sleep 1 integration: paces the poll for a spawned node's registry row (no notification exists)
+talOS/launcher/testdata/supervision_events.h clock 2 integration helper: SteppedClock runs on the real clock when a test is not holding it (Release, Now), as the launcher under test does
+talOS/node/node_binary_test.cc clock 4 integration: a 20 s deadline bounds the wait for a spawned node's registry row, and the stop latency shows SIGTERM did not wait out --duration-s
+talOS/node/node_binary_test.cc sleep 1 integration: paces the poll for a spawned node's registry row (no notification exists)
+talOS/protocol/udp_test_helpers.h clock 2 integration helper: ReceiveFrame's deadline (kReceiveHangBound, 10 s, by default) only bounds a hang
 talOS/simulation/sim_gateway_test.py clock 4 integration: the simulator as a child process; deadlines on its UDP datagrams only bound a hang (TESTING.md §6)
 talOS/vision/pipeline_test.cc clock 2 integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/pipeline_test.cc sleep 1 integration: pipeline worker threads, condition wait with a deadline

@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 # manifest_sync_test (sync_manifest.bzl) runs the script as its main;
@@ -317,6 +318,45 @@ py_test(
     ],
     legacy_create_init = False,
     main = "check_deps_listed_test.py",
+)
+
+# bazel run //tools:data_flow_sizes
+# Prints the sizes docs/DATA_FLOW.md states (frames, payloads, device caps,
+# shared-memory slots, log records, telemetry budgets) as `name value`, from
+# the headers that define and assert them.
+cc_binary(
+    name = "data_flow_sizes",
+    srcs = ["data_flow_sizes.cc"],
+    deps = [
+        "//talOS/bridge:messages",
+        "//talOS/driver_station",
+        "//talOS/events:events_log",
+        "//talOS/hardware",
+        "//talOS/introspection:registry",
+        "//talOS/msgs:geometry",
+        "//talOS/protocol",
+        "//talOS/rtms",
+        "//talOS/telemetry:wire",
+    ],
+)
+
+# RULES.md 9: every `<!-- size: name -->` number in docs/DATA_FLOW.md equals
+# what :data_flow_sizes prints, and every printed size has a marker. Reads
+# docs/DATA_FLOW.md from the source tree beside this file (the root package
+# exports no docs), which is not a Bazel input, so it is never cached
+# (`external`); well under a second.
+py_test(
+    name = "check_data_flow_sizes_test",
+    size = "small",
+    srcs = [
+        "check_data_flow_sizes.py",
+        "check_data_flow_sizes_test.py",
+    ],
+    data = [":data_flow_sizes"],
+    env = {"DATA_FLOW_SIZES": "$(rootpath :data_flow_sizes)"},
+    legacy_create_init = False,
+    main = "check_data_flow_sizes_test.py",
+    tags = ["external"],
 )
 
 # python3 tools/check_commissioning.py --base <rev> (CI: the lint job)

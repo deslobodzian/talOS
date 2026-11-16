@@ -124,23 +124,30 @@ struct RecordedMessage {
 // log with its EXIT holds a GAP record for every gap (LogWriter::gaps) and
 // is judged by them. Each topic notes the first such log it is fed from
 // (refused_log), which ReplayInputs refuses, as it does a damaged stretch
-// that nothing bounds. The manifest is `manifest.json` in the directory
-// holding the logs (talOS/launcher/README.md, "Session manifest"), used
-// when its session_id is the logs'; it names a member's logs by the paths
-// they were recorded at (`nodes[].log_paths`), matched here by file name, so
-// a session read from another directory still matches. Logs with no such
+// that nothing bounds. The replayed program's run start is read from its
+// first run's log: one whose first segment was not read (the byte cap
+// deleted it, or its header is incomplete) may have lost the firing it is
+// read from, as may one with a segment missing or unread before its first
+// firing read, and ReplayInputs refuses it (run_start_refused_log), fed
+// topic or not. The manifest is
+// `manifest.json` in the directory holding the logs
+// (talOS/launcher/README.md, "Session manifest"), used when its session_id
+// is the logs'; it names a member's logs by the paths they were recorded at
+// (`nodes[].log_paths`), matched here by file name, so a session read from
+// another directory still matches. Logs with no such
 // manifest beside them (a directory outside a launcher session, another
 // session's manifest) are judged by their `.capped` markers alone.
 class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)
-  // or one log; `replayed` is the process name of the program to be
-  // replayed, or empty for none. Throws std::runtime_error on an unreadable
-  // log, on logs from two sessions, on a topic the logs record with two
-  // schemas, and on a manifest.json beside them that is not JSON. A log's
-  // damaged records are skipped (log::LogReader) and mark a loss or a
-  // refusal (above); what was skipped is printed to stderr as a warning
-  // naming the file and byte offsets.
+  // or one log: any file of a log the byte cap rotated reads every kept
+  // file of it (log::LogSegmentFiles), as a directory does; `replayed` is the
+  // process name of the program to be replayed, or empty for none. Throws
+  // std::runtime_error on an unreadable log, on logs from two sessions, on a
+  // topic the logs record with two schemas, and on a manifest.json beside them
+  // that is not JSON. A log's damaged records are skipped (log::LogReader) and
+  // mark a loss or a refusal (above); what was skipped is printed to stderr as
+  // a warning naming the file and byte offsets.
   explicit RecordedSession(const std::string& path,
                            std::string_view replayed = {});
 
@@ -154,13 +161,40 @@ class RecordedSession {
   // Where the replayed program's loop starts (SimulatedEventLoop::Options):
   // its first recorded run's loop origin, and the instant that run's loop
   // began running, which its construction put after the origin (the first
-  // timer firing's deadline minus its manifest offset; the origin when it
-  // had no timer). For a program the session did not log, start() for both.
+  // timer firing's deadline minus its manifest offset, in whichever segment
+  // of that run's log holds it; when it armed a timer and fired none that
+  // gives it, the now of its first dispatch, at or after the live run start,
+  // so no timer armed before the run fires up to that run's last record, as
+  // none did live; a program that ran once ends there, unless its loop was
+  // late when it stopped, and a restarted one replays as one run; the
+  // origin when it had no timer).
+  // For a program the session did not log, start() for both.
   // Where the replay ends: the latest time the program's own logs recorded
   // (its exit), or end().
   MonotonicTime loop_start() const { return loop_start_; }
   MonotonicTime run_start() const { return run_start_; }
   MonotonicTime loop_end() const { return loop_end_; }
+
+  // When the replayed program's first run's log arms a timer: the first
+  // file of it read, when that is not its first segment
+  // (log::LogSegmentPath(log, 0); a rotated log keeps its later ones) nor
+  // the log of a run never rotated, and why, naming the sign: that segment's
+  // incomplete header, the log's `<log>.capped` marker, the session
+  // manifest's `log_capped`, or else only that the segment is gone; or the
+  // first file read that does not continue the segment before it (one
+  // between them missing or unread) while no firing was read before it. The
+  // run start's firing may have been in the segment not read; a later one's
+  // first firing may be whole periods later, so ReplayInputs refuses the
+  // log, whatever it feeds. With no firing that gives the run start, also
+  // the first file read when the log holds no record of its run (nothing
+  // gives its start or its end) or a GAP record or damaged stretch (which
+  // may hold its firings). Empty when none.
+  const std::string& run_start_refused_log() const {
+    return run_start_refused_log_;
+  }
+  const std::string& run_start_refused_reason() const {
+    return run_start_refused_reason_;
+  }
 
   const std::vector<RecordedTopic>& topics() const { return topics_; }
   // The topic called `name`, or null when no log recorded it.
@@ -181,6 +215,8 @@ class RecordedSession {
   MonotonicTime loop_start_;
   MonotonicTime run_start_;
   MonotonicTime loop_end_;
+  std::string run_start_refused_log_;
+  std::string run_start_refused_reason_;
   std::vector<RecordedTopic> topics_;
   std::vector<RecordedMessage> messages_;
   std::vector<std::byte> bytes_;
@@ -230,8 +266,9 @@ const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
 // session.loop_start() with its run starting at session.run_start()
 // (SimulatedEventLoop::Options::start, run_start). Finishes the loop, which
 // closes its recorder's log. Throws ReplayError before running on a schema
-// mismatch, and on a topic it would feed from a refused log (refused_log),
-// naming the log, the sign and the topic.
+// mismatch, on a topic it would feed from a refused log (refused_log),
+// naming the log, the sign and the topic, and on a run start read from a
+// refused log (run_start_refused_log), naming the log and the sign.
 template <RecorderPolicy Recorder>
 InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
                                SimulationEnvironment& environment,
@@ -240,6 +277,13 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
     throw std::logic_error(
         "input replay needs a loop that starts at the recorded origin "
         "(RecordedSession::loop_start)");
+  }
+  if (!session.run_start_refused_log().empty()) {
+    throw ReplayError("input replay refuses " +
+                      session.run_start_refused_log() +
+                      ", which the replayed program's run start would be "
+                      "read from: " +
+                      session.run_start_refused_reason());
   }
 
   InputReplayReport report;

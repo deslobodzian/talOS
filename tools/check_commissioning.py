@@ -4,9 +4,9 @@
 
 RULES.md 4: an agent never sets `commissioned = true` or changes a physical
 CAN id in a robot config; a person does that at the robot
-(docs/BRINGUP.md "Human commissioning"). This checks each non-merge commit
-in `merge-base(<rev>, HEAD)..HEAD` on its own and reports every robot or
-bench config line it
+(docs/BRINGUP.md "Human commissioning"). This checks each commit in
+`merge-base(<rev>, HEAD)..HEAD` (a merged branch's commits included) on its
+own and reports every robot or bench config line it
 
 - adds that sets `commissioned = true`, or
 - adds or removes that holds a `can_id` key (the only key talOS/hardware
@@ -15,7 +15,23 @@ bench config line it
 in any spelling TOML accepts (bare, quoted or dotted key, inline table,
 trailing comment), but not in a comment or a string value. It over-reports
 rather than miss one: a config file moved, renamed or added whole, or a
-`can_id` line moved between files, also needs the trailer below.
+`can_id` line moved between files, also needs the trailer below. A merge
+commit's own change is its diff against git's automatic re-merge of its
+parents (`git show --remerge-diff`). A clean merge has none; a line
+written while resolving a conflict, or a stale copy of a config kept from
+one side (which can revert a person's change made on the other), shows.
+It over-reports a conflict resolved by picking one side of a `can_id`
+line: the side not picked reads as removed, and the merge then carries the
+trailer. git cannot re-merge an octopus merge, so one reports what its
+diff against any parent shows.
+
+Every diff reads attributes from the empty tree and no attributes file
+(`--attr-source`), so a committed `.gitattributes` (`-diff`, `binary`,
+`-merge`, `merge=<driver>`) neither hides a line nor makes the re-merge
+keep the side the merge kept; external diff, textconv and renormalization
+are off. A local `.git/info/attributes`, which git reads whatever the
+attribute source, must hold no rule. The check needs git 2.40 or later;
+otherwise it exits 2 naming why.
 
 A robot or bench config is any tracked `.toml` outside an `examples`,
 `tests` or `fixtures` directory and outside any directory whose name ends
@@ -28,18 +44,24 @@ the trailer `Commissioned-By: <name>` (`git commit --trailer
 earlier one, so it marks exactly the commit a person checked at the robot.
 Agents never write this trailer.
 
-Not checked: a change made while resolving a conflict in a merge commit
-(merges are skipped); a squash that keeps a person's `Commissioned-By`
-trailer exempts everything folded into it (only the commit's last trailer
-block is read); a force push to `main` checks only its last commit (CI's
-diff base for main is that push's parent).
+Accepted, since no diff tells it apart: the trailer vouches for its whole
+commit, so a squash or amend that keeps a person's `Commissioned-By` in its
+last trailer block (the only one read) exempts everything folded into it,
+whoever wrote it. A person's commissioning commit therefore holds nothing
+but what that person checked at the robot.
 
 Prints each finding as `<commit> <file>:<line>: <what>`; exits 1 when there
 is one, 2 on a usage or git error. CI's lint job and tools/prepush.sh run it
-through tools/source_lints.sh --base.
+through tools/source_lints.sh --base. CI's base covers every commit the
+event adds (a pull request's or topic branch's merge base with main; on
+main, the previous tip, or after a force push its merge base with HEAD),
+and the job fails, naming why, when no such base exists
+(.github/workflows/continuous-integration.yaml, "Choose the diff base").
 """
 
 import argparse
+import codecs
+import os
 import re
 import subprocess
 import sys
@@ -91,6 +113,17 @@ def git(*args):
                           check=True).stdout
 
 
+def diff_name(name):
+    """A `--- `/`+++ ` line's file name as a path: git ends a name holding
+    a space with a tab and C-quotes one holding a non-ASCII or control byte
+    (core.quotePath), so a config named either way is still checked."""
+    name = name.removesuffix("\t")
+    if name.startswith('"') and name.endswith('"'):
+        raw = codecs.escape_decode(name[1:-1].encode("utf-8"))[0]
+        name = raw.decode("utf-8", "surrogateescape")
+    return name
+
+
 def findings_in_diff(diff):
     """(file, line, what) for each guarded line a unified -U0 diff changes."""
     path, old, new = None, 0, 0
@@ -98,7 +131,7 @@ def findings_in_diff(diff):
         if line.startswith(("--- ", "+++ ")):
             # `--- a/<path>` then `+++ b/<path>`; a created or deleted
             # file has /dev/null on one side and keeps the other's path.
-            name = line[4:]
+            name = diff_name(line[4:])
             if name.startswith(("a/", "b/")):
                 path = name[2:]
             continue
@@ -110,6 +143,13 @@ def findings_in_diff(diff):
             old, new = int(match.group(1)), int(match.group(2))
             continue
         if path is None or not is_robot_config(path):
+            continue
+        if CONFLICT_MARKER.match(line):
+            # A re-merge's conflict marker: not config, but a line.
+            if line.startswith("+"):
+                new += 1
+            else:
+                old += 1
             continue
         if line.startswith("+"):
             text = code(line[1:])
@@ -124,24 +164,97 @@ def findings_in_diff(diff):
             old += 1
 
 
+# Fixed prefixes, no external diff or text conversion, and every file read
+# as text: the output must not depend on the user's git configuration
+# (diff.noprefix, diff.external, a textconv driver) or on a gitattributes
+# `-diff`/`binary` mark, which the checked commit itself can add.
+DIFF_FLAGS = ("-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+              "--no-renames", "--src-prefix=a/", "--dst-prefix=b/")
+
+
+# `git show --remerge-diff` (2.36) re-merges a merge's parents and diffs
+# the merge against that: exactly what the merge itself changed.
+# `--attr-source` (2.40) reads attributes from a tree instead of the work
+# tree, which is HEAD, the commit being checked.
+NEEDED_GIT = (2, 40)
+# A conflict marker in the re-merge, never a TOML line; the plain style,
+# whatever merge.conflictStyle says, so no base section is shown.
+CONFLICT_MARKER = re.compile(r"^[-+](?:<{7}|>{7}|\|{7})(?: |$)|^[-+]={7}$")
+
+
+class CannotCheck(Exception):
+    pass
+
+
+def pinned_git():
+    """The git options every diff here runs with: attributes from the empty
+    tree (git knows its id without storing it, so nothing is written) and
+    from no user file, so neither a committed `.gitattributes` (`-merge`,
+    `merge=<driver>`, `binary`) nor core.attributesFile changes a diff or
+    makes the re-merge keep the side a merge kept; no renormalization and
+    the plain conflict style in the re-merge."""
+    version = git("version")
+    match = re.search(r"(\d+)\.(\d+)", version)
+    if not match or tuple(map(int, match.groups())) < NEEDED_GIT:
+        raise CannotCheck(
+            f"needs git {'.'.join(map(str, NEEDED_GIT))} or later "
+            f"(--attr-source, --remerge-diff); this is {version.strip()}")
+    info = git("rev-parse", "--git-path", "info/attributes").strip()
+    try:
+        with open(info, encoding="utf-8", errors="replace") as f:
+            rules = [r for r in f.read().splitlines()
+                     if r.strip() and not r.lstrip().startswith("#")]
+    except FileNotFoundError:
+        rules = []
+    if rules:
+        raise CannotCheck(f"{info} sets attributes, which git applies to every "
+                        f"diff whatever the attribute source; empty it")
+    empty_tree = git("hash-object", "-t", "tree", os.devnull).strip()
+    return (f"--attr-source={empty_tree}",
+            "-c", f"core.attributesFile={os.devnull}",
+            "-c", "merge.renormalize=false",
+            "-c", "merge.conflictStyle=merge")
+
+
+def merge_findings(pinned, commit, parents):
+    """The merge's own changes: its diff against git's automatic re-merge
+    of its parents. A clean merge's is empty; a resolution that writes a
+    new line, or keeps one side's stale copy of a file the other side
+    changed, shows. git cannot re-merge more than two parents, so an
+    octopus merge reports what its diff against any parent shows."""
+    if len(parents) > 2:
+        found = {}
+        for parent in parents:
+            diff = git(*pinned, "diff", *DIFF_FLAGS, parent, commit, "--",
+                       "*.toml")
+            for path, line, what in findings_in_diff(diff):
+                found.setdefault((path, what), line)
+        return [(path, line, what) for (path, what), line in found.items()]
+    diff = git(*pinned, "show", "--remerge-diff", "--format=", *DIFF_FLAGS,
+               commit, "--", "*.toml")
+    return findings_in_diff(diff)
+
+
 def check(base):
     """Every finding in merge-base(base, HEAD)..HEAD not covered by a trailer."""
+    pinned = pinned_git()
     start = git("merge-base", base, "HEAD").strip()
-    commits = git("rev-list", "--no-merges", "--reverse",
-                  f"{start}..HEAD").split()
     found = []
-    for commit in commits:
+    for entry in git("rev-list", "--parents", "--reverse",
+                     f"{start}..HEAD").splitlines():
+        commit, *parents = entry.split()
         trailer = git("log", "-1",
                       f"--format=%(trailers:key={TRAILER},valueonly)",
                       commit).strip()
         if trailer:
             continue
-        # Fixed prefixes and no external diff: the output must not depend
-        # on the user's git configuration (diff.noprefix, diff.external).
-        diff = git("show", "--format=", "-U0", "--no-color", "--no-ext-diff",
-                   "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
-                   commit, "--", "*.toml")
-        for path, line, what in findings_in_diff(diff):
+        if len(parents) > 1:
+            findings = merge_findings(pinned, commit, parents)
+        else:
+            findings = findings_in_diff(git(*pinned, "show", "--format=",
+                                            *DIFF_FLAGS, commit, "--",
+                                            "*.toml"))
+        for path, line, what in findings:
             found.append(f"{commit[:12]} {path}:{line}: {what}")
     return found
 
@@ -153,6 +266,9 @@ def main(argv):
     args = parser.parse_args(argv)
     try:
         found = check(args.base)
+    except CannotCheck as error:
+        print(f"check_commissioning: {error}", file=sys.stderr)
+        return 2
     except subprocess.CalledProcessError as error:
         print(f"check_commissioning: git {' '.join(error.cmd[1:])}: "
               f"{error.stderr.strip()}", file=sys.stderr)

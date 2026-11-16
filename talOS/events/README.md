@@ -328,7 +328,13 @@ Estimator estimator{loop};                 // registers its watchers
 const InputReplayReport report = ReplayInputs(loop, environment, session);
 ```
 
-- `RecordedSession` reads every log of a session directory. A topic's
+Under these default Options (`Delivery::POLL`), a run with no timer firing
+that gives its run start (below) gets its first drain one tick late; nodes
+replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
+
+- `RecordedSession` reads every log of a session directory, or one log:
+  named by any of its files, a log the byte cap rotated is read whole (every
+  kept segment and the log), as in a directory. A topic's
   messages come from whichever logs recorded them: the writer's accepted
   `SEND`s or readers' receipts. A writer's `SEND` (an event loop's, or the
   hardware bridge's `--log` of `/hw/state`, `/hw/command` and
@@ -348,8 +354,19 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   loop's schedule counts from when its `run()` began, after construction
   (`RealtimeEventLoop`), so the loop starts at its first run's origin
   (`loop_start()`) with its run starting where that run's did (`run_start()`:
-  its first timer firing's deadline minus the timer's manifest offset): its
-  timers fire at the recorded deadlines. A topic it watched live is fed from
+  its first timer firing's deadline minus the timer's manifest offset, in
+  whichever segment of that run's log holds it): its timers fire at the
+  recorded deadlines. A run that arms a timer and fired none that gives the
+  run start (it exited before the first deadline, or re-armed its timers
+  first) starts at its first dispatch, which live made inside `run()`, so
+  at or after its run start: a timer armed before the run fires no earlier
+  than live, so the replay fires none up to that run's last record; a
+  program that ran once ends there, unless its loop was late when it
+  stopped (a due deadline it never fired before its `EXIT`, which the
+  replay fires); a restarted program replays as one run, through the time
+  it was down. Such a run's log is refused (below) when it holds no record
+  of its run, or a loss that may hold its firings. A run with no timer
+  starts at its origin. A topic it watched live is fed from
   its own receipts alone, each at the drain that delivered it live (its
   `MESSAGE` record's event time), with its recorded publication time; the
   replayed drain runs at its deadline, without the live loop's wake-up
@@ -430,7 +447,20 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   one with a damaged stretch nothing bounds (`RecordedTopic::refused_log`,
   `refused_reason`), by the same rule as gaps, and `ReplayInputs` throws a
   `ReplayError` before anything runs, naming the log, the sign and the topic;
-  a node binary prints it and exits 1. `RecordedSession` reads the
+  a node binary prints it and exits 1. The replayed program's own first
+  run's log is refused the same way, fed topic or not, when its manifest
+  arms a timer and its first segment (`<stem>.segment0.tlog`) was not read
+  (the byte cap deleted it, or its header is incomplete), or a segment
+  before the first firing read is missing or unreadable: the firing
+  `run_start()` is read from may have been there, and a later segment's
+  first firing may be whole periods later
+  (`RecordedSession::run_start_refused_log`, naming the first file read, or
+  the one that does not continue the segment before it, and the sign). So
+  is such a log with no firing that gives the run start when it holds no
+  record of its run (no dispatch nor `EXIT`: nothing gives its start or its
+  end), or a GAP record or damaged stretch, which may hold its firings. A
+  capped log that kept its first segment (capture stopped at the cap) still
+  gives the run start. `RecordedSession` reads the
   `manifest.json` in the directory holding the logs when its `session_id` is
   the logs', and matches a member's `log_paths` to the logs by file name, so
   a session copied elsewhere still matches; logs without one (outside a

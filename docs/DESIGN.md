@@ -87,7 +87,7 @@ check first, then the implementations:
 | A message or topic | the package's `.fbs` and `talos_messages(topics = ...)` | unit-suffix lint; schema hash; `--describe-only`; the Studio bindings diff |
 | A node-API feature | `talOS/node_api/node_api.h` | `api_parity_test` (ABI version, exports, return and parameter types, `TALOS_*` constants; `talos.Mode` takes its values from `_abi.py`); then `node_api_test` and `talos_test` exercise the new symbol, one case each |
 | A device type | `talOS/hardware` config and wire structs | wire `static_assert`s; codec round trip; `phoenixTest` |
-| A UDP frame, slot size or telemetry budget | DATA_FLOW.md and its size assert | the `static_assert`; the Studio decoder test |
+| A UDP frame, slot size or telemetry budget | DATA_FLOW.md and its size assert | the `static_assert`; the Studio decoder test; `//tools:check_data_flow_sizes_test` (DATA_FLOW.md's marked sizes equal the compiled values) |
 | A config key | the node constructor's `param` | the launcher refuses a key no node read; `talos_graph_test` and `--describe-only` on every affected config |
 | A naming rule | `talOS/introspection/names.h` | `names_test`; `topic_grammar_test` |
 

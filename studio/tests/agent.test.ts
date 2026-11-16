@@ -465,14 +465,18 @@ test('get_latest returns the newest sample with its dictionary and age', () => {
 
 test('get_system_graph says when the graph no longer describes now', () => {
   const system = demoGraph();
+  // The judgment's clock is fixed, so no pause of the test's own can age the
+  // fresh graph past the threshold.
+  const nowMs = 50_000;
   const at = (systemArrivalMs: number) =>
       dispatch({...systemContext(system), systemArrivalMs, connected: true},
-               'get_system_graph', {}) as {stale: boolean|null; age_ms: number|null};
+               'get_system_graph', {}, nowMs) as
+      {stale: boolean|null; age_ms: number|null};
   // A hung bridge sends nothing; a graph past the threshold is last-known.
-  const old = at(performance.now() - GRAPH_STALE_AFTER_MS - 1);
+  const old = at(nowMs - GRAPH_STALE_AFTER_MS - 1);
   assert.equal(old.stale, true);
-  assert.ok(old.age_ms! > GRAPH_STALE_AFTER_MS);
-  assert.equal(at(performance.now()).stale, false);
+  assert.equal(old.age_ms, GRAPH_STALE_AFTER_MS + 1);
+  assert.equal(at(nowMs - GRAPH_STALE_AFTER_MS + 1).stale, false);
 });
 
 test('every advertised method exists, and nothing else does', () => {
@@ -536,8 +540,13 @@ async function fakeBridge(declared: string|null, greeting?: Uint8Array) {
   };
 }
 
+// Bounds a hang only (docs/TESTING.md §6.3); never the assertion.
+const HANG_BOUND_MS = 10_000;
+
+// Polls agent state that nothing announces. Turns of at least 10 ms each
+// bound a hang at HANG_BOUND_MS or more.
 const settle = async (until: () => boolean, what: string) => {
-  for (let attempt = 0; attempt < 200; attempt++) {
+  for (let attempt = 0; attempt < HANG_BOUND_MS / 10; attempt++) {
     if (until()) return;
     await new Promise(resolve => setTimeout(resolve, 10));
   }
@@ -564,18 +573,37 @@ test('the agent fetches the declared graph from the bridge it follows',
        }
      });
 
+// Resolves with the HTTP status of the agent's next fetch once the agent has
+// handled the answer: its handling runs in microtasks after the fetch
+// settles, so by this setImmediate turn it is done. The real fetch is
+// restored on the first call; call the returned `restore` if none came.
+function nextFetch() {
+  const real = globalThis.fetch;
+  const restore = () => {
+    globalThis.fetch = real;
+  };
+  const handled = new Promise<number|null>(resolve => {
+    globalThis.fetch = (input, init) => {
+      restore();
+      const response = real(input, init);
+      response.then(r => setImmediate(resolve, r.status),
+                    () => setImmediate(resolve, null));
+      return response;
+    };
+  });
+  return {handled, restore};
+}
+
 test('a bridge started without --declared leaves everything else working',
-     async () => {
+     {timeout: HANG_BOUND_MS}, async () => {
        const bridge = await fakeBridge(null);
+       // The socket opening is what triggers the fetch, so waiting for a
+       // parsed graph would pass vacuously; wait for the agent to have
+       // handled the 404.
+       const declaredFetch = nextFetch();
        const agent = startAgent(0, bridge.url);
        try {
-         // The socket opening is what triggers the fetch, so waiting for a
-         // parsed graph would pass vacuously; wait for the 404 to have been
-         // asked for and answered.
-         await settle(() => agent.graphs.received === 0 &&
-                         !!agent.context().timeline,
-                     'the agent never came up');
-         await new Promise(resolve => setTimeout(resolve, 150));
+         assert.equal(await declaredFetch.handled, 404);
          assert.equal(agent.context().declared, null);
          // Not an error, and not an empty graph: a question nobody answered.
          assert.throws(
@@ -587,6 +615,7 @@ test('a bridge started without --declared leaves everything else working',
              dispatch(agent.context(), 'get_system_graph', {}) as any;
          assert.equal(graph.summary.nodes, 6);
        } finally {
+         declaredFetch.restore();
          agent.close();
          bridge.close();
        }

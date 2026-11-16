@@ -39,7 +39,13 @@ namespace talos::launcher {
 // ChildOutput drains every roster member's stdout and stderr, one pipe per
 // run, into the member's `<name>.log`, every run appended after a line naming
 // the run and its pid, and, except for the Studio bridge, echoes it to the
-// launcher's stdout through the LauncherOutput. Its reading thread never
+// launcher's stdout through the LauncherOutput. The echo goes in whole lines
+// per pipe: a trailing partial line waits for its newline, the pipe's end,
+// or more than kChildOutputReadBytes held, so that a member's line that
+// reaches the pipe in two writes (stdio to a pipe is fully buffered) is not
+// split on the console by a launcher line or another member's output. A
+// partial line forwarded without its newline gets one on the console. The
+// log gets every byte as it is read, and nothing more. Its reading thread never
 // waits for a disk: it only moves what arrives into a bounded buffer in
 // memory, and a second thread writes the logs. A one-line write to a file on
 // a loaded disk can take hundreds of milliseconds (222 ms at p99 with eight
@@ -67,6 +73,10 @@ inline constexpr std::size_t kChildOutputBufferBytes = std::size_t{1} << 20;
 // What one member's output log, or talos.log, may hold in a session; later
 // output is dropped, counted, and the log says so.
 inline constexpr uint64_t kChildOutputLogMaxBytes = uint64_t{64} << 20;
+// What ChildOutput reads from a member's pipe at once, and the most of a
+// line without its newline the echo holds per pipe before it forwards it
+// anyway (splitting that line).
+inline constexpr std::size_t kChildOutputReadBytes = std::size_t{64} << 10;
 // The launcher's own lines in a session directory. The launcher refuses a
 // roster member whose name breaks the node-name rule, `talos` (a reserved
 // owner) and `Talos` included, so no member's `<name>.log` takes this name;
@@ -125,7 +135,8 @@ class LauncherOutput {
 
   // A streambuf that hands every byte written to it to State::Say.
   // Unbuffered, so several threads may write through one (each call is
-  // atomic, as on a descriptor; their lines can interleave).
+  // atomic, as on a descriptor; a line written in several calls can
+  // interleave with another thread's, so launcher lines use ConsoleLine).
   class Sink : public std::streambuf {
    public:
     Sink(State& state, int fd) : state_{state}, fd_{fd} {}
@@ -186,6 +197,8 @@ class ChildOutput {
     std::string path;
     bool echo;
     std::string header;  // Written to the log when the reader picks it up.
+    // The reader's only: a partial line the echo has not forwarded yet.
+    std::string echo_held;
   };
   // Output bound for one path that the writer has not taken yet.
   struct Pending {
@@ -199,8 +212,12 @@ class ChildOutput {
   void Wake();
 
   // Moves `size` bytes read from `stream` into its buffers, dropping what
-  // they cannot hold.
-  void Deliver(const Stream& stream, const char* data, std::size_t size);
+  // they cannot hold, and echoes the whole lines among them.
+  void Deliver(Stream& stream, const char* data, std::size_t size);
+
+  // `stream` has ended, or holds more than kChildOutputReadBytes: echoes the
+  // partial line it held, ended with a newline the member did not write.
+  void EndEcho(Stream& stream);
 
   // Reads every registered pipe until it ends, or, once stopping, until
   // `linger_` has passed. Touches no file.

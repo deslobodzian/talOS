@@ -22,6 +22,7 @@
 #include "talOS/events/log/format.h"
 #include "talOS/introspection/lock_file.h"
 #include "talOS/launcher/child_output.h"
+#include "talOS/launcher/console_line.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/session_retention.h"
 
@@ -188,11 +189,11 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
   // manifest stays an abandoned launch (Classify), whatever else it saw.
   const auto note = [&record](const std::string& line, bool warn) {
     record += line + "\n";
-    if (warn) std::cerr << "[launcher] " << line << "\n";
+    if (warn) ConsoleLine(std::cerr) << "[launcher] " << line << "\n";
   };
   // Everything else retention has to say goes to stderr only.
   const auto say = [](const std::string& line) {
-    std::cerr << "[launcher] " << line << "\n";
+    ConsoleLine(std::cerr) << "[launcher] " << line << "\n";
   };
   const auto report = [&say](std::string_view what, const fs::path& path,
                              const std::error_code& error) {
@@ -481,19 +482,20 @@ bool Launcher::CreateSessionDirectory(const config::RobotConfig& config,
     return false;
   }
   if (!session_directory_->held()) {
-    std::cerr << "[launcher] WARNING: cannot lock " << current.string() << "/"
-              << kSessionDirectoryLockFile << " (" << error.message()
-              << "; its filesystem takes no advisory locks): retention in "
-                 "another shared-memory namespace may remove this session "
-                 "while it runs\n";
+    ConsoleLine(std::cerr)
+        << "[launcher] WARNING: cannot lock " << current.string() << "/"
+        << kSessionDirectoryLockFile << " (" << error.message()
+        << "; its filesystem takes no advisory locks): retention in "
+           "another shared-memory namespace may remove this session "
+           "while it runs\n";
   }
   if (record.empty()) return true;
   const std::string path =
       (current / std::string{kRetentionRecordFile}).string();
   std::string write_error;
   if (!WriteFileAtomically(path, record, options_.sync_file, write_error)) {
-    std::cerr << "[launcher] retention cannot write " << path << " ("
-              << write_error << ")\n";
+    ConsoleLine(std::cerr) << "[launcher] retention cannot write " << path
+                           << " (" << write_error << ")\n";
     ReportUnwrittenRetention(record);
   }
   return true;
@@ -514,7 +516,8 @@ bool Launcher::LockSharesLogFilesystem() const {
 
 void Launcher::ReportUnwrittenRetention(const std::string& record) {
   if (record.empty()) return;
-  std::cerr << "[launcher] retention record, not written:\n" << record;
+  ConsoleLine(std::cerr) << "[launcher] retention record, not written:\n"
+                         << record;
 }
 
 }  // namespace talos::launcher

@@ -1819,6 +1819,25 @@ TEST(Gateway, ApplyFailureRetriesThenLatchesAndReenableClears) {
   g.Tick(3000, true);
   EXPECT_TRUE(g.Accept(Request(g), 8, 3000));
 }
+// REQ-SAFE-18: a backend stop (a global apply failure) advances the epoch, so
+// a command built before it never actuates once the backend applies again;
+// only a command built on the new epoch does.
+TEST(Gateway, ABackendStopRefusesACommandBuiltBeforeIt) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  const auto before = Request(g);
+  ASSERT_TRUE(g.Accept(before, 1, 1000));
+  backend.apply_ok = false;
+  EXPECT_FALSE(g.Accept(Request(g), 2, 1000));  // the backend stops
+  EXPECT_GT(g.snapshot().epoch, before.epoch);
+  EXPECT_FALSE(g.snapshot().flags & kCommandActive);
+  backend.apply_ok = true;
+  const int applied = backend.applied;
+  EXPECT_FALSE(g.Accept(before, 3, 1000));
+  EXPECT_EQ(backend.applied, applied);
+  EXPECT_TRUE(g.Accept(Request(g), 4, 1000));
+}
 
 TEST(Gateway, IdenticalEnabledConfigPreservesLatchedApplyFault) {
   for (bool reconfigure_disabled : {false, true}) {
@@ -2750,6 +2769,7 @@ TEST(Gateway, RestoredCANcoderIsInvalidInTheTickItsRestoreEnds) {
 // A dropped watchdog neutral must not leave the last demand in force: every
 // Tick without an accepted command refreshes neutral until a fresh command
 // supersedes it, matching the disabled and unhealthy paths.
+// REQ-SAFE-17
 TEST(Gateway, WatchdogNeutralRefreshesEveryTickUntilFreshCommand) {
   FakeBackend backend;
   const auto config = SwerveConfig(true);
