@@ -69,7 +69,7 @@ struct Reader {
 };
 // A PWM request off or a pulse, and off in its one encoding: mode 0 and
 // output +0.0 (all eight bytes zero), so off and a pulse of 0 never read as
-// each other.
+// each other. Decode admits only this; Encode writes off this way itself.
 bool PwmRequestCanonical(const PwmRequest& p) {
   return p.mode <= kLastPwmMode &&
          (p.mode != PwmMode::kOff || std::bit_cast<uint64_t>(p.output) == 0);
@@ -103,10 +103,16 @@ std::size_t Encode(const Command& c, std::span<uint8_t> data) {
   }
   for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
     const auto& p = c.pwm_outputs[i];
-    if (!PwmRequestCanonical(p)) return 0;
+    if (p.mode > kLastPwmMode) return 0;
     w.Int(p.id, 2);
     w.Int(static_cast<uint8_t>(p.mode), 1);
-    w.Real(p.output);
+    // Off is written in its one encoding whatever `output` holds (-0.0
+    // compares equal to +0.0), so an off request never fails the Command.
+    if (p.mode == PwmMode::kOff) {
+      w.Int(0, 8);
+    } else {
+      w.Real(p.output);
+    }
   }
   return w.ok ? w.pos : 0;
 }

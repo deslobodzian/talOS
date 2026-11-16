@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -237,9 +238,9 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
 // A PWM request is off (no pulse) or a pulse, and off has one byte string:
 // mode 0 and output +0.0. A pulse of 0 (the 1.5 ms centre, which centres a
 // servo) and off both round-trip as sent, never one for the other. A mode
-// byte above kLastPwmMode, or an off request whose output bytes are not all
-// zero (-0.0 included), neither encodes nor decodes: a peer reading such
-// bytes cannot know which of the two was meant.
+// above kLastPwmMode neither encodes nor decodes, and an off request whose
+// output bytes are not all zero (-0.0 included) does not decode: a peer
+// reading such bytes cannot know which of the two was meant.
 // REQ-SAFE-03, REQ-CONTRACT-03
 TEST(Messages, PwmRequestIsOffOrAPulseAndOffHasOneEncoding) {
   Command command;
@@ -259,30 +260,55 @@ TEST(Messages, PwmRequestIsOffOrAPulseAndOffHasOneEncoding) {
   const std::size_t output_at = mode_at + 1;
   const struct {
     const char* label;
-    PwmRequest request;
     std::size_t byte;
     uint8_t value;
   } rows[] = {
-      {"mode 2", {0x0506, static_cast<PwmMode>(2), 0.0}, mode_at, 2},
-      {"mode 255", {0x0506, static_cast<PwmMode>(255), 0.0}, mode_at, 255},
-      {"off with a nonzero output",
-       {0x0506, PwmMode::kOff, 0.5},
-       output_at + 7,
-       0x3F},
-      {"off with output -0.0",
-       {0x0506, PwmMode::kOff, -0.0},
-       output_at + 7,
-       0x80},
+      {"mode 2", mode_at, 2},
+      {"mode 255", mode_at, 255},
+      {"off with a nonzero output", output_at + 7, 0x3F},
+      {"off with output -0.0", output_at + 7, 0x80},
   };
   for (const auto& row : rows) {
     SCOPED_TRACE(row.label);
-    Command bad = command;
-    bad.pwm_outputs[0] = row.request;
-    std::array<uint8_t, kMaxCommandSize> refused{};
-    EXPECT_EQ(Encode(bad, refused), 0u);
+    if (row.byte == mode_at) {
+      Command bad = command;
+      bad.pwm_outputs[0].mode = static_cast<PwmMode>(row.value);
+      std::array<uint8_t, kMaxCommandSize> refused{};
+      EXPECT_EQ(Encode(bad, refused), 0u);
+    }
     auto corrupted = bytes;
     corrupted[row.byte] = row.value;
     EXPECT_FALSE(Decode(std::span{corrupted}.first(size), decoded));
+  }
+}
+
+// An off PWM request encodes as off, in off's one byte string, whatever its
+// `output` field holds (-0.0, which compares equal to +0.0, a stale pulse
+// value, NaN), and the rest of the Command goes with it: a Command whose
+// encode failed would be skipped whole, dropping every motor demand in it.
+// REQ-SAFE-03
+TEST(Messages, AnOffPwmRequestEncodesAsOffWhateverItsOutput) {
+  Command command;
+  command.count = 1;
+  command.motors[0] = {0x0102, Mode::kVoltage, 0, 3.0, 0.0};
+  command.pwm_output_count = 1;
+  command.pwm_outputs[0] = {0x0506, PwmMode::kOff, 0.0};
+  std::array<uint8_t, kMaxCommandSize> canonical{};
+  const auto size = Encode(command, canonical);
+  ASSERT_EQ(size, kCommandBaseSize + kMotorRequestSize + kPwmRequestSize);
+  for (const double output :
+       {-0.0, 0.5, std::numeric_limits<double>::quiet_NaN()}) {
+    SCOPED_TRACE(output);
+    Command sent = command;
+    sent.pwm_outputs[0].output = output;
+    std::array<uint8_t, kMaxCommandSize> bytes{};
+    ASSERT_EQ(Encode(sent, bytes), size);
+    EXPECT_EQ(bytes, canonical);
+    Command decoded;
+    ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+    EXPECT_EQ(decoded.motors[0], command.motors[0]);
+    EXPECT_EQ(decoded.pwm_outputs[0].mode, PwmMode::kOff);
+    EXPECT_EQ(std::bit_cast<uint64_t>(decoded.pwm_outputs[0].output), 0u);
   }
 }
 
