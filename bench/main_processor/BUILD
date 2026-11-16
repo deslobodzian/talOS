@@ -82,6 +82,14 @@ cc_binary(
 
 # The deploy.sh that bundle_test, install_check_test and warm_up_test
 # install with.
+#
+# Each of the three carries "cpu:7", more than half of a 12-CPU Mac mini or
+# an 8-core workstation (a smaller host runs it when it has no other test):
+# Bazel then never runs two of them at once, nor much else beside one.
+# Every install copies a bundle as new files, and macOS charges each new
+# file's first exec about 100 ms one file at a time host-wide (MAC-2): three
+# installers at once under a full suite (load about 9) took over 60 s where
+# each alone takes under 30 s.
 py_library(
     name = "deploy_test_support",
     testonly = True,
@@ -106,6 +114,7 @@ py_test(
     legacy_create_init = False,
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
+        "cpu:7",
         "no_asan",
         "no_tsan",
     ],
@@ -116,7 +125,7 @@ py_test(
 )
 
 # Over 5 s: three real installs of bench_bundle, each paying deploy.sh's
-# warm-up and graph check (about 11 s on macOS); fast lane.
+# graph check without its warm-up (about 12 s on macOS); fast lane.
 py_test(
     name = "install_check_test",
     size = "small",
@@ -125,6 +134,7 @@ py_test(
     legacy_create_init = False,
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
+        "cpu:7",
         "no_asan",
         "no_tsan",
     ],
@@ -144,6 +154,7 @@ py_test(
     srcs = ["warm_up_test.py"],
     data = [":bundle_test_native_mark.so"],
     legacy_create_init = False,
+    tags = ["cpu:7"],
     deps = [
         ":deploy_test_support",
         "@rules_python//python/runfiles",
