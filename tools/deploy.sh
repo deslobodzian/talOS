@@ -57,7 +57,7 @@ finally:
 # native pass runs only the libraries' static initializers, in a process of its
 # own. A member that fails or outlives its bound (TALOS_DEPLOY_WARM_UP_TIMEOUT_S
 # seconds, default 60; tests shorten it) is a warning naming it and never fails
-# the command: install's graph check judges members. The last line counts what
+# the command: the graph check that follows judges members. The last line counts what
 # finished (members that exited 0, native libraries whose load returned) and
 # names each member that did not, with how it ended. A stop signal to deploy.sh kills the
 # running member's group and selects nothing (stop traps, below). Members run
@@ -66,15 +66,12 @@ finally:
 # the native pass.
 WARM_UP=1
 warm_up() {
-  local bundle="$1" command="$2"
+  local bundle="$1"
   if [ "$WARM_UP" != "1" ]; then
-    # install's graph check that follows runs every member and the launcher
-    # (all at once, inside the probes' deadline) but loads no native library.
-    if [ "$command" = "install" ]; then
-      say "warm-up skipped (--no-warm-up): the graph check pays each member's first run, all at once; on macOS the first launch pays each native library's first load"
-    else
-      say "warm-up skipped (--no-warm-up): the first launch pays each member's first run"
-    fi
+    # The graph check that follows (install's and rollback's) runs every
+    # member and the launcher (all at once, inside the probes' deadline) but
+    # loads no native library.
+    say "warm-up skipped (--no-warm-up): the graph check pays each member's first run, all at once; on macOS the first launch pays each native library's first load"
     return 0
   fi
   if [ "$DRY_RUN" = "1" ]; then
@@ -332,8 +329,8 @@ EOF
 # --no-warm-up does not skip it; on macOS a fresh bundle's probes then pay
 # the first-run charge inside their deadline. There is no override: the
 # launcher accepts --allow-graph-errors only with --sim, so a robot could
-# never launch such a bundle. A stop stops the launcher and removes the
-# temporary root (stop traps, below).
+# never launch such a bundle. rollback runs it too, on `previous`. A stop
+# stops the launcher and removes the temporary root (stop traps, below).
 check_graph() {
   local bundle="$1"
   if [ "$DRY_RUN" = "1" ]; then
@@ -722,7 +719,7 @@ cmd_install() {
   [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
     die "copy has no executable run.sh; current unchanged: $dest"
   run sync
-  warm_up "$dest" install
+  warm_up "$dest"
   if ! check_graph "$dest"; then
     release_stops
     discard_copy "$dest"
@@ -1208,12 +1205,19 @@ EOF
 # never selects a `previous` that no longer holds a bundle. Warms `previous`
 # first: one installed by a deploy.sh without the warm-up, and never
 # launched, has never run (an already-run one costs about 10 ms a member).
+# Then runs install's graph check on it and refuses, changing neither link,
+# a bundle its launcher refuses, such as one installed by a deploy.sh
+# without the check. A stop selects nothing.
 cmd_rollback() {
   [ -L "$PREFIX/current" ] || die "no current bundle at $PREFIX/current"
   [ -L "$PREFIX/previous" ] && [ -x "$PREFIX/previous/run.sh" ] ||
     die "no previous bundle to roll back to ($PREFIX/previous missing or not a bundle)"
-  local cur; cur="$(readlink "$PREFIX/current")"
-  warm_up "$(cd "$PREFIX/previous" && pwd -P)" rollback
+  local cur previous
+  cur="$(readlink "$PREFIX/current")"
+  previous="$(cd "$PREFIX/previous" && pwd -P)"
+  warm_up "$previous"
+  check_graph "$previous" ||
+    die "not rolled back: the launcher refuses $previous; $(kept_selection)"
   release_stops
   select_bundle "$(readlink "$PREFIX/previous")" "$PREFIX/current"
   select_bundle "$cur" "$PREFIX/previous"
