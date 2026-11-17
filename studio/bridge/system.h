@@ -149,11 +149,13 @@ struct TopicRow {
   // still carries the whole count.
   std::uint64_t dropped{0};
 
-  // True when any end of this topic said so, which is how naming::LintGraph
-  // aggregates the same flags. A flag describes one endpoint's expectation
-  // about its far side, and a topic only needs one end to make the claim: the
-  // sender of `/hw/command` is the only party that knows its subscriber lives
-  // across a UDP link.
+  // True when any end of this topic said so. Topic health treats both flags
+  // as the whole topic's. naming::LintGraph does so for `external` only: its
+  // `optional` exempts just the reader that declared it, so a required read
+  // beside an optional one is a lint error while this row shows UNCONNECTED.
+  // A flag describes one endpoint's expectation about its far side: the
+  // sender of `/hw/command` is the only party that knows its subscriber
+  // lives across a UDP link.
   bool external{false};
   bool optional{false};
 };
