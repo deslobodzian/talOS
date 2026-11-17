@@ -279,6 +279,21 @@ py_test(
     main = "lint_test_time_test.py",
 )
 
+# tools/format.sh --check (tools/prepush.sh; CI: the clang-format job)
+# lists the C/C++ files changed since the base, untracked ones included. The
+# test runs it on a throwaway repository with a stub clang-format.
+py_test(
+    name = "format_test",
+    size = "small",
+    srcs = ["format_test.py"],
+    data = [
+        "clang18.sh",
+        "format.sh",
+    ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)
+
 # python3 tools/check_links.py (CI: the lint job)
 # Every relative markdown link and #anchor in the tracked files resolves.
 py_test(
