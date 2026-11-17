@@ -456,6 +456,60 @@ void Gateway::FindPositionJumps(std::vector<uint16_t>& reset_ids) {
   }
 }
 
+// Whatever the backend: Decode refuses a whole State for one non-finite value
+// (and Encode one for a non-finite current or temperature), so one device's
+// NaN on the wire would read at the bridge as total loss. A motor or CAN
+// sensor whose position or velocity is not finite is invalid (MarkInvalid);
+// any other non-finite reading becomes 0, its sample invalid where the wire
+// carries a validity for it (a RIO device's, the health sample's for the
+// battery voltage), and a CAN bus slot with a non-finite utilization is a
+// failed read, as the RoboRIO's CanBusHealth counts one: utilization 0, a kOk
+// or kPending read state kFailed, its counters kept (cleared to kNone, the
+// bridge would keep the bus's last report however long the reads failed).
+void Gateway::ReplaceNonFinite() {
+  const auto finite = [](double x) { return std::isfinite(x); };
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    auto& m = state_.motors[i];
+    if (!finite(m.position_rot) || !finite(m.velocity_rps)) MarkInvalid(m);
+    for (double* x : {&m.voltage, &m.stator_current_a, &m.temperature_c,
+                      &m.supply_current_a}) {
+      if (!finite(*x)) *x = 0;
+    }
+  }
+  for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
+    auto& sensor = state_.sensors[i];
+    if (!finite(sensor.position_rot) || !finite(sensor.velocity_rps)) {
+      MarkInvalid(sensor);
+    }
+  }
+  for (std::size_t i = 0; i < config_.analog_inputs.size(); ++i) {
+    auto& input = state_.analog_inputs[i];
+    if (!finite(input.voltage)) input = {input.id, false, 0, input.age_us};
+  }
+  for (std::size_t i = 0; i < config_.encoders.size(); ++i) {
+    auto& encoder = state_.encoders[i];
+    if (!finite(encoder.position_rot) || !finite(encoder.velocity_rps)) {
+      encoder = {encoder.id, false, 0, 0, encoder.age_us};
+    }
+  }
+  for (std::size_t i = 0; i < config_.pwm_outputs.size(); ++i) {
+    auto& output = state_.pwm_outputs[i];
+    if (!finite(output.output)) output = {output.id, false, 0};
+  }
+  if (!finite(state_.health.battery_v)) {
+    state_.health.valid = false;
+    state_.health.battery_v = 0;
+  }
+  auto& bus = state_.health.can_bus;
+  if (!std::isfinite(bus.utilization_frac)) {
+    bus.utilization_frac = 0;
+    if (bus.read_state == CanBusReadState::kOk ||
+        bus.read_state == CanBusReadState::kPending) {
+      bus.read_state = CanBusReadState::kFailed;
+    }
+  }
+}
+
 // The backend judged each sample's status, value and isolation; the age bound
 // is the gateway's, the same for every backend. Returns whether any configured
 // motor or CAN sensor still has valid feedback (true with none configured)
@@ -540,6 +594,7 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   // The slot's place is the gateway's, whatever Read wrote over it.
   state_.health.can_bus_count = buses;
   state_.health.can_bus_index = bus_index;
+  if (configured_) ReplaceNonFinite();
   // A failed read pass, or no valid sample in what Read reported: total loss
   // before any mask, ended here so PollResets applies nothing more.
   healthy_ = configured_ && JudgeFeedbackAge() && read;
