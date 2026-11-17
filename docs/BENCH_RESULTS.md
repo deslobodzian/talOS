@@ -129,7 +129,7 @@ the head revision.
   the three Talon FX, 6.1 ms for the CANcoder and Pigeon 2. Realtime
   `full` on the six nodes. `/hw/state` interval median 5.001 ms, p99
   5.220 ms. Load 1.9 to 3.1 at the end: timing not acceptance evidence.
-- **RT-28: 82 consecutive States missing with both ends running.** Session
+- **RT-28: 81 consecutive States missing with both ends running.** Session
   W, one interval of 410.2 ms (the only one over 20 ms in the kept
   window, 767.7 s into it, about RoboRIO `[2083]`, some 22 minutes after
   the cable pull): `sample_time_us` stepped 410004 us, so the States were
@@ -170,6 +170,37 @@ the head revision.
   against session V's bridge (c6c04a67) showed every node stale; the
   bridge's `/system.json` listed all seven alive and it sent a
   `talos.system_graph.update` every 0.5 s (STUDIO-12).
+- **RT-28: the hole read from the kept log and the RoboRIO, the same
+  evening.** Session W's `/hw/state` on each side of the 410.2 ms
+  interval: `sequence` 410256 then 410338 (a step of 82: the gateway
+  ticked through and 81 States are missing), `sample_time_us` 2082239941
+  then 2082649945, same boot and epoch, feedback ages 4.5 to 5.3 ms after
+  it (not the CAN silence of RESET-3), `counters.rejected_command_count`
+  1 on both (2 from the next `/hw/status`, 20 ms later). `/hw/status` kept
+  its 20 ms cadence across it with `clock_ignored_count` 0; from 767.033 s
+  to 767.693 s it counted 33 commands sent, 51 States received (132 due)
+  and 13 Driver Station packets (33 due). RoboRIO console: 483
+  refused commands in the window ending `[2082.591]` and 496 in the next
+  (about 500 each otherwise), the second with a max age of 415658 us: about
+  21 commands never arrived and the first after the hole carried the
+  frozen observation, so both directions were out. RoboRIO, 96 minutes
+  after boot, not rebooted since: `dmesg` shows eth0 link down at
+  `[401.4]` and up at `[407.95]` (the first cable pull) and no link event
+  after; `Udp: SndbufErrors 0`, `RcvbufErrors 83`, `InErrors 83`; eth0 TX
+  errors and dropped 0, RX errors 1. Mini: `netstat -I en0` errors 0 in and
+  out, `netstat -s -p udp` 0 dropped for full socket buffers; its unified
+  log returned nothing over ssh. The hole was at about 17:08:57 EST. Not
+  placed further than the switch or the Mini's Ethernet side.
+- **RT-27: both pulls reopened the bridge's socket.** Session V's bridge
+  exit line: `send_failures=2 socket_reopens=2`; its log has one
+  `cannot send (Can't assign requested address)` line and
+  `sends again (2 reopened so far)`. The first reopen took 10.0.0.37 and
+  the link returned; the second took 10.0.0.25.
+- **TIME-5: session U re-read with the corrected row** (`session_report` as of the commit "launcher: take
+  Driver Station to lane only from a producer that answers", run on the
+  Linux workstation on a copy of the session): Driver Station
+  to lane, teleop: 1685 samples, median 2.929 ms, p99 3.075 ms, max
+  7.547 ms; 0 enabled packets unanswered, 11546 disabled.
 
 ## 2026-11-16
 
