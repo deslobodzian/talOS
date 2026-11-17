@@ -16,7 +16,13 @@ import {healthPanel} from '../src/panels/health';
 import type {AnyPanelDefinition} from '../src/panels/types';
 import {NodeCard, systemPanel, Wiring} from '../src/panels/system';
 import {timingPanel} from '../src/panels/timing';
-import {eventRates, parseDeclaredGraph, parseSystemGraph} from '../src/system';
+import {
+  eventRates,
+  GraphVersionMismatch,
+  parseDeclaredGraph,
+  parseSystemGraph,
+  SYSTEM_GRAPH_VERSION
+} from '../src/system';
 import {panelNode, splitNode} from '../src/layout/tree';
 import {Timeline} from '../src/shell/Timeline';
 import {WorkspaceArea, type WorkspaceCallbacks} from '../src/shell/WorkspaceArea';
@@ -424,3 +430,31 @@ test('timeline slider is focusable and its arrows seek once within bounds', () =
   }
   assert.equal(sought.length, 4);
 });
+
+// REQ-OPS-23: a bridge of another graph version leaves the page no graph.
+// The system and health panels name the mismatch by both versions, and the
+// attention list says the graph is unreadable rather than that nothing needs
+// attention.
+test('a graph version mismatch is named by both versions, never as nothing wrong',
+     () => {
+       const system: SystemState = {
+         graph: null,
+         stale: true,
+         rates: {},
+         error: String(new GraphVersionMismatch(SYSTEM_GRAPH_VERSION + 1)),
+         declared: null,
+         declaredError: ''
+       };
+       for (const def of [systemPanel, healthPanel]) {
+         const html = renderToStaticMarkup(
+             <StudioProvider studio={createStaticStudio({system, playback: emptyPlayback})}>
+               <def.component config={def.defaultConfig} setConfig={() => {}}
+                              instanceId="test"/>
+             </StudioProvider>);
+         assert.ok(html.includes(`data-bridge-version="${SYSTEM_GRAPH_VERSION + 1}"`),
+                   def.id);
+         assert.ok(html.includes(`data-page-version="${SYSTEM_GRAPH_VERSION}"`), def.id);
+         if (def === healthPanel)
+           assert.ok(html.includes('data-code="graph-version-mismatch"'));
+       }
+     });

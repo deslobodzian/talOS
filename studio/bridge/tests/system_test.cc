@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -465,7 +467,9 @@ TEST(SystemGraph, CarriesEndpointAttributesOnEverySourceAndTopic) {
 
   // The version says the document has fields a classifier must respect. A
   // reader still on version 1 would go on calling /hw/command orphaned.
-  EXPECT_NE(json.find("\"version\":2"), std::string::npos);
+  EXPECT_GE(kSystemGraphVersion, 2);
+  EXPECT_NE(json.find("\"version\":" + std::to_string(kSystemGraphVersion)),
+            std::string::npos);
 
   // Per source, so a viewer can explain one endpoint without re-deriving the
   // topic table.
@@ -671,6 +675,96 @@ TEST(SystemGraph, GoldenFilesHoldTheFastValueOrder) {
         << " differs from the bridge's output; regenerate it as this test's "
            "comment says";
   }
+}
+
+// The update's value list as a layout: the path of each fast value of
+// `document` (object keys from the root, array indices dropped, so
+// "nodes.sources.events"), each path once, in the order the values first
+// reach it. It does not depend on how many nodes, sources or topics the
+// graph holds, only on what BuildSystemGraph appends as fast values and in
+// which order.
+std::string FastLayout(const SystemGraphDocument& document) {
+  const std::string& json = document.json;
+  std::vector<std::string> enclosing;  // each container's key, "" in an array
+  std::string key;                     // the last key read
+  std::vector<std::string> paths;
+  std::size_t next = 0;
+  for (std::size_t i = 0; i < json.size(); ++i) {
+    if (next < document.fast.size() && i == document.fast[next].first) {
+      std::string path;
+      for (const std::string& name : enclosing) {
+        if (!name.empty()) path += name + ".";
+      }
+      path += key;
+      if (std::find(paths.begin(), paths.end(), path) == paths.end()) {
+        paths.push_back(path);
+      }
+      i = document.fast[next++].second - 1;
+      continue;
+    }
+    const char c = json[i];
+    if (c == '"') {
+      const std::size_t begin = i + 1;
+      for (++i; json[i] != '"'; ++i) {
+        if (json[i] == '\\') ++i;
+      }
+      if (i + 1 < json.size() && json[i + 1] == ':') {
+        key = json.substr(begin, i - begin);
+      }
+    } else if (c == '{' || c == '[') {
+      enclosing.push_back(key);
+      key.clear();
+    } else if (c == '}' || c == ']') {
+      enclosing.pop_back();
+      key.clear();
+    }
+  }
+  std::string layout;
+  for (const std::string& path : paths) {
+    if (!layout.empty()) layout += ' ';
+    layout += path;
+  }
+  return layout;
+}
+
+// The update's value list of each graph version, as FastLayout states it.
+// A page walks an update's values by position (studio/src/system.ts,
+// fastSlots) and refuses a graph of another version, so a page of one build
+// and a bridge of another tell they cannot read each other only if a change
+// to the list is a new version. To change it: bump kSystemGraphVersion and
+// Studio's SYSTEM_GRAPH_VERSION, and add a line. Never edit a line: pages of
+// that version walk that list.
+constexpr std::pair<int, std::string_view> kFastLayouts[] = {
+    {3,
+     "wall_ns bridge.clients bridge.frames_forwarded bridge.invalid "
+     "bridge.ws_drops bridge.refused bridge.egress_bytes "
+     "nodes.heartbeat_wall_ns nodes.dispatch_count nodes.alive "
+     "nodes.delivery.wake_failures nodes.delivery.stalled_arms "
+     "nodes.delivery.wake_fallbacks nodes.delivery.requests_skipped "
+     "nodes.sources.events nodes.sources.dropped nodes.sources.sequence "
+     "nodes.sources.last_monotonic_ns nodes.sources.last_latency_ns "
+     "nodes.sources.max_latency_ns nodes.selections.selected "
+     "nodes.outputs_held topics.published topics.received topics.dropped "
+     "topics.health"},
+};
+
+// REQ-OPS-23: a page of another build would read the bridge's updates into
+// the wrong fields, or refuse them and show every node stale while the
+// bridge is still sending, unless the version it checks changes with the
+// value list.
+TEST(SystemGraph, UpdateValueListChangesOnlyWithTheVersion) {
+  const std::string layout = FastLayout(BuildSystemGraph(GoldenGraph(0)));
+  const auto* pinned = std::find_if(
+      std::begin(kFastLayouts), std::end(kFastLayouts),
+      [](const auto& entry) { return entry.first == kSystemGraphVersion; });
+  ASSERT_NE(pinned, std::end(kFastLayouts))
+      << "graph version " << kSystemGraphVersion
+      << " has no value list in kFastLayouts; add this line: " << layout;
+  EXPECT_EQ(layout, pinned->second)
+      << "the update's value list changed without a version bump: bump "
+         "kSystemGraphVersion (studio/bridge/system.h) and "
+         "SYSTEM_GRAPH_VERSION (studio/src/system.ts), and add a line to "
+         "kFastLayouts";
 }
 
 }  // namespace

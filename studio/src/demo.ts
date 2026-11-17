@@ -524,9 +524,8 @@ export function demoSystemGraph(sequence: bigint = 0n): string {
 
   const graph: SystemGraph&{kind: string} = {
     kind: 'talos.system_graph',
-    // The demo states endpoint attributes on every end, so it is a version-2
-    // document; claiming version 1 while carrying them would make the demo the
-    // one graph the viewer cannot trust about them.
+    // The demo reaches the views through the same SystemGraphStream as a
+    // bridge's graph, which refuses any version but the page's.
     version: SYSTEM_GRAPH_VERSION,
     wall_ns: String(wallNs),
     registry: {

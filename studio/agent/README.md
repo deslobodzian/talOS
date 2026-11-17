@@ -92,6 +92,7 @@ For graph endpoints, health semantics and optional declared files, see the
 | `-32603` | Internal error |
 | `-32001` | No retained sample at the requested timestamp/mode |
 | `-32002` | Required telemetry, live graph or declared graph has not arrived |
+| `-32003` | The bridge sends a system graph version this reader cannot read; `data` is `{bridge_version, reader_version}` |
 
 `-32002` is not an empty graph or an empty channel set. In particular,
 `get_declared_graph` cannot answer when no declared graph was offered by the

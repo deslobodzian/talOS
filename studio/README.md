@@ -41,7 +41,10 @@ The complete panel list is [`src/panels/registry.ts`](src/panels/registry.ts).
 >= 1 second, or when its sample timestamp or reading clock is unknown.
 The system graph is stale while disconnected or when the bridge has said
 nothing about it (a whole graph, an update, or a notice that the radio budget
-deferred one) for 1 second.
+deferred one) for 1 second. A bridge whose system graph `version` is not the
+page's (`SYSTEM_GRAPH_VERSION` in [`src/system.ts`](src/system.ts); a page and
+a bridge of different builds) is not stale: the page shows no graph and names
+both versions, since it cannot read that bridge's updates.
 [`src/data/studio.ts`](src/data/studio.ts) also invalidates the live clock and
 system graph when the worker has posted nothing for one second.
 

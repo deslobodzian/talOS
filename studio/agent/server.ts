@@ -8,6 +8,7 @@ import {
   type DeclaredGraph,
   declaredStatus,
   declaredUrl,
+  GraphVersionMismatch,
   MAX_DECLARED_BYTES,
   MAX_SYSTEM_BYTES,
   parseDeclaredGraph,
@@ -56,6 +57,8 @@ export function startAgent(
   // performance.now() when `system` arrived: a hung bridge sends nothing, and
   // only the graph's age can say so.
   let systemArrivalMs: number|null = null;
+  // Set while the bridge sends a graph version this agent cannot read.
+  let systemMismatch: GraphVersionMismatch|null = null;
 
   // What the launcher declared before it spawned anything. Fetched over HTTP
   // from the same origin as the telemetry socket rather than pushed: the
@@ -71,6 +74,7 @@ export function startAgent(
     rateWindow,
     declared,
     systemArrivalMs,
+    systemMismatch,
     connected: socket?.readyState === WebSocket.OPEN
   });
 
@@ -130,11 +134,22 @@ export function startAgent(
       system = parsed;
       rateWindow.push(parsed);
       history.observe(parsed);
-    } catch {
+      systemMismatch = null;
+    } catch (e) {
       // A malformed document is counted and dropped. Blanking the last good
       // graph would turn one bad frame into "nothing is running", which is a
       // worse answer than a slightly stale one.
       graphs.invalid++;
+      // A graph of another version is not one bad frame: nothing this bridge
+      // sends can be read, so no graph is kept, and get_system_graph names
+      // both versions rather than saying none arrived.
+      if (e instanceof GraphVersionMismatch) {
+        systemMismatch = e;
+        system = null;
+        previousSystem = null;
+        rateWindow.reset();
+        systemArrivalMs = null;
+      }
     }
   };
 
@@ -304,6 +319,7 @@ export function startAgent(
       system = null;
       previousSystem = null;
       systemArrivalMs = null;
+      systemMismatch = null;
       graphStream.reset();
       if (!stopped) retry = setTimeout(connect, 1000);
     });

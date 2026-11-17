@@ -28,6 +28,7 @@ import type {SystemGraph} from '../../system';
 import {duration, hertz, integer} from '../../ui/formatters';
 import {EmptyState, StatusDot} from '../../ui/primitives';
 import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
+import {GraphVersionNotice} from '../system/GraphVersionNotice';
 import type {PanelDefinition} from '../types';
 import {deliveryText, mergeProcesses, summarize, type ProcessProblem} from './logic';
 import './session.css';
@@ -191,8 +192,10 @@ function SessionPanel() {
         <h2>Processes</h2><span>MANIFEST ∪ REGISTRY ∪ DECLARED</span>
       </div>
       <GraphFreshnessNotice/>
+      <GraphVersionNotice/>
       <div className="system-counts session-counts">
-        <span>{system.graph && system.stale ? '?' : summary.running}/{summary.total} processes running</span>
+        {/* Without a current graph nothing says which processes run. */}
+        <span>{!system.graph || system.stale ? '?' : summary.running}/{summary.total} processes running</span>
         <span>{summary.restarts} restart{summary.restarts === 1 ? '' : 's'}</span>
       </div>
       {rows.length === 0 ?

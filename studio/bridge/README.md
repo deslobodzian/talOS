@@ -127,7 +127,11 @@ WebSocket client (`GraphFeed` in [`system.h`](system.h)) is sent the whole
 document on connect and when the structure changes (a node starts, stops or
 restarts), and otherwise `{"kind":"talos.system_graph.update","structure":...,
 "values":[...]}`: the fast values in document order, written over the
-client's document, at most every 500 ms and only when they changed. A whole
+client's document, at most every 500 ms and only when they changed. The
+document's `version` (`kSystemGraphVersion`) changes whenever that value list
+does, and `:system_test` pins each version's list, since Studio writes the
+values by position and reads only its own version (see
+[Freshness](../README.md#freshness)). A whole
 document goes at most every 2 s (`GraphFeed::kResendNs`); structure changes
 in between, as in a crash loop, coalesce into the next. Graph messages go
 before telemetry (`ClientFeeds` in [`telemetry.h`](telemetry.h)): while one

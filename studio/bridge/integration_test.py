@@ -302,7 +302,7 @@ class BridgeIntegration(unittest.TestCase):
                         f"http://127.0.0.1:{http_port}/system.json", timeout=3) as response:
                     graph = json.loads(response.read())
                     self.assertEqual(graph["kind"], "talos.system_graph")
-                    self.assertEqual(graph["version"], 2)
+                    self.assertEqual(graph["version"], 3)
                     # Every source and topic carries the endpoint attributes,
                     # so a viewer never has to guess whether a missing end is a
                     # fault or the design.

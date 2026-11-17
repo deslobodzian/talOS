@@ -14,20 +14,37 @@
 
 export const MAX_SYSTEM_BYTES = 1 << 20;
 
-// studio/bridge/system.h's kSystemGraphVersion. Version 2 is where a source
-// began stating what its far end is: without it a document cannot say that
-// /hw/command's consumer is the RoboRIO, and a viewer reading one will call
-// that topic unread.
-//
-// An older document is read rather than refused. Reporting two designed
-// dead-ends as faults is what the older bridge always did, and it is a better
-// answer than an empty viewer -- but it is not the truth, so the views say
-// which of the two they are looking at instead of leaving the difference
-// invisible.
-export const SYSTEM_GRAPH_VERSION = 2;
+// studio/bridge/system.h's kSystemGraphVersion: the document's fields and
+// the order of the fast values a `talos.system_graph.update` carries, which
+// fastSlots walks by position. The bridge bumps it whenever that value list
+// changes (//studio/bridge:system_test pins each version's list), so a page
+// and a bridge of different builds can tell. The live stream reads only this
+// version and names any other (GraphVersionMismatch).
+export const SYSTEM_GRAPH_VERSION = 3;
 
-export const endpointAttributesKnown = (graph: SystemGraph) =>
-    graph.version >= SYSTEM_GRAPH_VERSION;
+// A graph, or an update for one, from a bridge whose graph version is not this
+// page's. Neither can be read (an update's values are positional), so the page
+// holds no graph rather than one it cannot keep current, which would age to
+// stale while the bridge is still sending.
+export class GraphVersionMismatch extends Error {
+  readonly page = SYSTEM_GRAPH_VERSION;
+  constructor(readonly bridge: number) {
+    super(`System graph version mismatch: the bridge sends version ${bridge}, ` +
+          `this page reads version ${SYSTEM_GRAPH_VERSION}. Load Studio from ` +
+          `this bridge, or build both from one revision.`);
+  }
+}
+
+export type GraphVersions = {bridge: number; page: number};
+
+// The two versions a GraphVersionMismatch named, read back from the error text
+// the worker posts (the system state carries the error as a string); null for
+// any other error.
+export function graphVersionMismatch(error: string): GraphVersions|null {
+  const match = /System graph version mismatch: the bridge sends version (\d+), this page reads version (\d+)\./
+                    .exec(error);
+  return match ? {bridge: Number(match[1]), page: Number(match[2])} : null;
+}
 
 export type SourceKind = 'TIMER'|'WATCHER'|'FETCHER'|'SENDER';
 const KINDS: SourceKind[] = ['TIMER', 'WATCHER', 'FETCHER', 'SENDER'];
@@ -419,17 +436,34 @@ const jsonType = (value: unknown) =>
 export class SystemGraphStream {
   // The document as last applied, so the next update can be written over it.
   private document: Record<string, unknown>|null = null;
+  // The last whole graph was of another version: what its updates and
+  // notices are refused as, until a graph of this page's version arrives.
+  private mismatch: GraphVersionMismatch|null = null;
   // performance.now() when the bridge last spoke about the graph: a graph,
-  // an update or a deferral notice.
+  // an update or a deferral notice. Null while it speaks another version.
   arrival: number|null = null;
 
   // The graph a message makes current, or null for a deferral notice (the
   // graph held is still the latest the budget let through). Throws, changing
-  // nothing, on a malformed message or one for a structure not held.
+  // nothing, on a malformed message or one for a structure not held. Throws
+  // GraphVersionMismatch, dropping the graph held, on a graph of another
+  // version, and on every update or notice after it until a readable graph.
   ingest(text: string, now: number): SystemGraph|null {
-    const result = parsing('system graph', () => {
+    const root = parsing('system graph', () => {
       if (text.length > MAX_SYSTEM_BYTES) fail('document too large');
-      const root = record(JSON.parse(text), 'document');
+      return record(JSON.parse(text), 'document');
+    });
+    if (root.kind === 'talos.system_graph') {
+      const version = parsing('system graph', () => num(root, 'version'));
+      if (version !== SYSTEM_GRAPH_VERSION) {
+        this.reset();
+        this.mismatch = new GraphVersionMismatch(version);
+        throw this.mismatch;
+      }
+    } else if (this.mismatch) {
+      throw this.mismatch;
+    }
+    const result = parsing('system graph', () => {
       if (root.kind === 'talos.system_graph') {
         return {document: root, graph: graphOf(root)};
       }
@@ -459,11 +493,13 @@ export class SystemGraphStream {
     this.arrival = now;
     if (!result) return null;
     this.document = result.document;
+    this.mismatch = null;
     return result.graph;
   }
 
   reset() {
     this.document = null;
+    this.mismatch = null;
     this.arrival = null;
   }
 }
@@ -644,14 +680,14 @@ type EndHolder = {
 
 // The endpoint attributes of every topic, by name.
 //
-// Derived from the ends rather than read off a topic row. A version-2 bridge
+// Derived from the ends rather than read off a topic row. The bridge
 // aggregates the same two booleans onto each topic and sends those as well, and
 // this deliberately ignores them: the ends are the only place the answer exists
-// for a declared graph, which has no topic rows at all, and for a version-1
-// document, which has no topic attributes either. One derivation that covers
-// all three is worth more than a preference between two spellings of the same
-// aggregation -- it is the same rule naming::CheckGraph applies, so the viewer
-// and the launcher's linter agree about which half-wired topics are faults.
+// for a declared graph, which has no topic rows at all. Like the bridge's
+// HealthOf, it treats `optional` as the whole topic's when any end says so;
+// the launcher's lint (naming::CheckGraph) judges `optional` per reader, so a
+// required reader beside an optional one is a lint error that these verdicts
+// do not show.
 export function topicEnds(nodes: readonly EndHolder[]): Map<string, TopicEnds> {
   const ends = new Map<string, TopicEnds>();
   for (const node of nodes) {

@@ -40,12 +40,17 @@ namespace naming = talos::introspect::naming;
 inline constexpr std::int64_t kNeverNs =
     std::numeric_limits<std::int64_t>::max();
 
-// Bumped for the per-source `external`/`optional` booleans and the per-topic
-// `health` string. A version-1 reader would ignore the new fields and keep
-// classifying topics itself, which is exactly the wrong outcome: it would go on
-// calling `/hw/command` orphaned. The bump is what lets such a reader refuse
-// the document instead of drawing a fault that is not there.
-inline constexpr int kSystemGraphVersion = 2;
+// The graph's version, which Studio's page checks (studio/src/system.ts,
+// SYSTEM_GRAPH_VERSION) and refuses, naming both, when it is not its own.
+// Bumped when a reader of the old version would draw the wrong conclusion:
+// version 2 when sources began stating their far ends (`external`,
+// `optional`) and topics their `health`, without which a reader calls
+// `/hw/command` orphaned; and whenever the update's value list changes (a fast
+// value added, removed or moved), since a page writes an update's values over
+// its fast fields by position. //studio/bridge:system_test pins each version's
+// value list. A field that is not a fast value, and that a reader may ignore,
+// is not a bump.
+inline constexpr int kSystemGraphVersion = 3;
 
 // What the bridge itself is doing. It is a participant in the system, not a
 // neutral observer: it holds a reader slot on the telemetry topic and it is
@@ -275,9 +280,9 @@ inline void AppendSource(std::string& out,
   out += source.optional() ? "true" : "false";
   out += ",\"observer\":";
   out += source.observer() ? "true" : "false";
-  // Not a version bump: a reader that predates it ignores it. Its absence
-  // means an older bridge, whose topic `dropped` still counts latest-only
-  // skips.
+  // Not a version bump: not a fast value, and a reader that predates it
+  // ignores it. Its absence means an older bridge, whose topic `dropped`
+  // still counts latest-only skips.
   out += ",\"latest_only\":";
   out += source.latest_only() ? "true" : "false";
   out += ",\"period_ns\":";
@@ -308,9 +313,7 @@ inline void AppendNames(std::string& out,
 }
 
 // One Target of a node: its policy's sources and who drives, `null` when
-// nobody does. Not a version bump: a reader that predates it ignores the
-// field, and one that knows it reads its absence as "no Targets", which is
-// what an older bridge could say about any node.
+// nobody does. `selected` is a fast value (kSystemGraphVersion).
 inline void AppendSelection(std::string& out,
                             const introspect::SelectionSnapshot& selection,
                             FastSpans* fast = nullptr) {
@@ -357,9 +360,8 @@ inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node,
   out += ",\"alive\":";
   AppendFast(out, fast, [&] { out += node.alive ? "true" : "false"; });
   // What the node lost of what it should have been woken for or delivered,
-  // each normally 0 (introspect::DeliveryLoss). Not a version bump: a reader
-  // that predates it ignores it, and one that knows it reads its absence as
-  // "not reported", what an older bridge could say.
+  // each normally 0 (introspect::DeliveryLoss). Fast values
+  // (kSystemGraphVersion).
   const introspect::DeliveryLoss loss = node.delivery_loss();
   out += ",\"delivery\":{";
   const char* separator = "";
@@ -394,9 +396,8 @@ inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node,
   }
   out += ']';
   // The devices flush is holding back outputs the node set: nobody drives
-  // and the node is trying (introspect::kFlagOutputsHeld). Not a version
-  // bump: a reader that predates it ignores it, and one that knows it reads
-  // its absence as "not reported".
+  // and the node is trying (introspect::kFlagOutputsHeld). A fast value
+  // (kSystemGraphVersion).
   out += ",\"outputs_held\":";
   AppendFast(out, fast, [&] { out += node.outputs_held() ? "true" : "false"; });
   out += '}';
@@ -455,6 +456,7 @@ struct SystemGraphDocument {
   std::string json;       // the whole document, with its "structure" id
   std::string structure;  // 16 hex digits
   std::string values;     // "[...]"
+  FastSpans fast;         // where in `json` each of `values` sits
 };
 
 inline SystemGraphDocument BuildSystemGraph(const SystemGraphInput& input) {
@@ -534,11 +536,13 @@ inline SystemGraphDocument BuildSystemGraph(const SystemGraphInput& input) {
   std::snprintf(id, sizeof(id), "%016llx",
                 static_cast<unsigned long long>(hash));
   document.structure = id;
-  // Not a version bump: a reader that predates it ignores it.
+  // Not a version bump: not a fast value, and a reader that predates it
+  // ignores it.
   out += ",\"structure\":\"";
   out += document.structure;
   out += "\"}";
   document.json = std::move(out);
+  document.fast = std::move(fast);
   return document;
 }
 

@@ -9,7 +9,7 @@ import {type Connection, type PlaybackState} from './data/types';
 import {WorkerUpdateStream} from './data/worker-stream';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from './demo';
 import {type HistoryHooks, TelemetryHistory} from './history';
-import {type DeclaredGraph, declaredUrl, MAX_DECLARED_BYTES, parseDeclaredGraph, RateWindow, type SystemGraph, SystemGraphStream} from './system';
+import {type DeclaredGraph, declaredUrl, GraphVersionMismatch, MAX_DECLARED_BYTES, parseDeclaredGraph, RateWindow, type SystemGraph, SystemGraphStream} from './system';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 const updates = new WorkerUpdateStream(message => ctx.postMessage(message));
@@ -68,6 +68,9 @@ let lastPlaybackPost = 0;
 let system: SystemGraph|null = null, previousSystem: SystemGraph|null = null;
 const rateWindow = new RateWindow();
 let systemError = '';
+// Set while the bridge sends a graph version this page cannot read, so the
+// Agent tab answers as the headless agent does (agent/rpc.ts, -32003).
+let systemMismatch: GraphVersionMismatch|null = null;
 let nextDemoSystem = 0;
 // The graph as the bridge's whole documents and updates build it, and the
 // monotonic receipt time of its last message (a graph, an update, or a notice
@@ -282,6 +285,7 @@ function ingestSystem(text: string) {
       rateWindow.push(graph);
     }
     systemError = '';
+    systemMismatch = null;
     systemArrival = graphStream.arrival;
     if (graph) history.observe(graph);
   } catch (e) {
@@ -289,6 +293,16 @@ function ingestSystem(text: string) {
     // graph and say why the new one was refused. It is no evidence about what
     // runs now, so the last good graph keeps ageing toward stale.
     systemError = String(e);
+    // A bridge speaking another graph version is not a malformed document:
+    // nothing it sends can be read, so no graph is shown, and the view says
+    // why instead of showing nodes that age to stale while it is sending.
+    if (e instanceof GraphVersionMismatch) {
+      systemMismatch = e;
+      system = null;
+      previousSystem = null;
+      rateWindow.reset();
+      systemArrival = null;
+    }
   }
   postSystem();
 }
@@ -308,6 +322,7 @@ function reset() {
   graphStream.reset();
   systemArrival = null;
   systemError = '';
+  systemMismatch = null;
   declared = null;
   declaredError = '';
   manifest = null;
@@ -382,6 +397,14 @@ function connect(url: string, gen: number) {
       if (gen !== generation) return;
       status = 'Disconnected · retrying';
       connection = 'connecting';
+      // What the stream held, and a version mismatch, were about the bridge
+      // on this socket; the next one starts over with a whole graph, as the
+      // headless agent's close does (agent/server.ts). The last good graph
+      // stays inspectable, and is stale while disconnected.
+      graphStream.reset();
+      if (systemMismatch) systemError = '';
+      systemMismatch = null;
+      postSystem();
       if (gen === generation) retry = setTimeout(() => connect(url, gen), 1000);
     };
     socket.onerror = () => {
@@ -431,7 +454,7 @@ ctx.onmessage = ({data}) => {
         try {
           response = handleRpc(
               {timeline: coordinator.timeline, system, previousSystem, declared,
-               rateWindow, systemArrivalMs: systemArrival,
+               rateWindow, systemArrivalMs: systemArrival, systemMismatch,
                connected: graphConnected()},
               data.request);
         } catch (e) {
