@@ -565,35 +565,42 @@ TEST(Config, TorqueCurrentLimitTravelsOnTheWireAndFingerprint) {
   EXPECT_EQ(decoded, c);
 }
 
-// A RoboRIO's saved configuration written before foc existed (each motor
-// record one byte shorter) is refused at startup rather than misread, so the
-// RoboRIO boots unconfigured, as with a corrupt file, until the bridge
-// pushes its configuration.
-// REQ-CONTRACT-39
-TEST(ConfigWire, APersistedConfigWithoutTheFocByteIsRefused) {
+// The RoboRIO's saved configuration file is tagged with the protocol version
+// that wrote it, which every config codec change bumps. A file of another
+// version is refused by that tag, though its body decodes and its CRC holds;
+// so is a file written before the tag (the config bytes and their CRC32,
+// through protocol 11). Either way the RoboRIO boots unconfigured, as with a
+// corrupt file, until the bridge pushes its configuration.
+// REQ-CONTRACT-06
+TEST(ConfigWire, APersistedConfigOfAnotherFormatIsRefusedByItsTag) {
   const auto c = SwerveConfig(true);
-  ASSERT_GT(c.motors.size(), 1u);
-  auto bytes = SerializeConfig(c);
-  // Each motor's foc byte is the one that differs when only its foc does.
-  std::vector<std::ptrdiff_t> foc_offsets;
-  for (std::size_t i = 0; i < c.motors.size(); ++i) {
-    auto on = c;
-    on.motors[i].foc = true;
-    const auto on_bytes = SerializeConfig(on);
-    ASSERT_EQ(on_bytes.size(), bytes.size());
-    const auto at = std::mismatch(bytes.begin(), bytes.end(), on_bytes.begin());
-    ASSERT_NE(at.first, bytes.end());
-    foc_offsets.push_back(at.first - bytes.begin());
-  }
-  for (auto it = foc_offsets.rbegin(); it != foc_offsets.rend(); ++it)
-    bytes.erase(bytes.begin() + *it);
-  const uint32_t crc = ComputeCrc32(bytes);
-  for (int i = 0; i < 4; ++i)
-    bytes.push_back(static_cast<uint8_t>(crc >> (8 * i)));
+  const auto body = SerializeConfig(c);
+  const auto with_crc = [](std::vector<uint8_t> bytes) {
+    const uint32_t crc = ComputeCrc32(bytes);
+    for (int i = 0; i < 4; ++i)
+      bytes.push_back(static_cast<uint8_t>(crc >> (8 * i)));
+    return bytes;
+  };
+  const auto tagged = [&](uint16_t version) {
+    std::vector<uint8_t> bytes{'T', 'A', 'L', 'O', 'S', 'C', 'F', 'G'};
+    bytes.push_back(static_cast<uint8_t>(version & 0xFFu));
+    bytes.push_back(static_cast<uint8_t>(version >> 8));
+    bytes.insert(bytes.end(), body.begin(), body.end());
+    return with_crc(std::move(bytes));
+  };
   Config loaded;
-  EXPECT_FALSE(LoadPersistedConfig(bytes, loaded));
-  ASSERT_TRUE(LoadPersistedConfig(PersistedConfig(c), loaded));
+  EXPECT_FALSE(LoadPersistedConfig(with_crc(body), loaded));
+  const auto current = tagged(protocol::kProtocolVersion);
+  EXPECT_EQ(PersistedConfig(c), current);
+  ASSERT_TRUE(LoadPersistedConfig(current, loaded));
   EXPECT_EQ(loaded, c);
+  // The same body and a valid CRC; only the version differs.
+  constexpr uint16_t kVersion = protocol::kProtocolVersion;
+  for (const uint16_t other :
+       std::array<uint16_t, 3>{0, kVersion - 1, kVersion + 1}) {
+    SCOPED_TRACE(other);
+    EXPECT_FALSE(LoadPersistedConfig(tagged(other), loaded));
+  }
 }
 
 TEST(SimBackend, PigeonMountCalibrationReachesIdealBackend) {
@@ -3702,7 +3709,8 @@ TEST(ConfigWire, PersistenceValidatesCrcAndAssemblerResetsAfterCompletion) {
   Config loaded;
   ASSERT_TRUE(LoadPersistedConfig(bytes, loaded));
   EXPECT_EQ(loaded, config);
-  bytes[0] ^= 1;
+  // period_us's low bit: a body that still decodes and validates.
+  bytes[kPersistedConfigHeaderBytes] ^= 1;
   EXPECT_FALSE(LoadPersistedConfig(bytes, loaded));
   EXPECT_FALSE(LoadPersistedConfig({}, loaded));
   auto invalid = config;

@@ -132,6 +132,9 @@ classification and `--replay-inputs`
 ([which logs a build can read](../talOS/launcher/README.md#which-logs-a-build-can-read)).
 So a bump makes earlier sessions' hardware packets unreadable to this build's
 tools, and a change without one decodes them wrongly with no warning. The
+RoboRIO's saved configuration carries the version too, so after a bump it
+refuses the file it saved before and boots waiting for the bridge's push
+([configuration](../talOS/hardware/README.md#configuration)). The
 `wire_golden_test`s in `talOS/hardware` and `talOS/driver_station` pin the
 bytes of a fully populated State, Command, configuration and Driver Station
 packet to the current version and fail on any change until it is bumped.

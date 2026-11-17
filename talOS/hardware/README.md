@@ -39,7 +39,9 @@ without device traffic, but not while faulted or while
 configuration/restoration is pending.
 
 The RoboRIO atomically and durably (synced file, rename, synced directory)
-saves acknowledged configuration bytes with a CRC32 to
+saves acknowledged configuration bytes, tagged with the magic `TALOSCFG`
+and the protocol version that wrote them and followed by a CRC32
+(`PersistedConfig` in `config_wire.h` gives the layout), to
 `/home/lvuser/talos_config.bin` (`talos_config.bin` in desktop simulation;
 `ConfigStore` in the RoboRIO program). The loop hands the acknowledged
 configuration over on its first disabled tick after the acknowledgement, or
@@ -57,12 +59,13 @@ them and starts their restoration on the configure worker without waiting for
 it, so robot code reports ready at once; the gateway stays unconfigured,
 refusing commands, until the worker finishes. Missing or corrupt files, and
 a saved configuration this build's validation refuses, leave the gateway
-unconfigured. A file with a motor saved before `foc` or
-`max_torque_current_a` existed (protocol 10 or older) does not decode
-either, its motor records being shorter, so the RoboRIO boots unconfigured,
-printing the same `hardware gateway config=0 ... (waiting for config push)`
-line as for a missing file, until the bridge pushes its configuration on
-link.
+unconfigured. So does a file another protocol version wrote, refused by its
+tag whatever its body, and a file from before the tag (protocol 11 or
+older): the RoboRIO boots unconfigured, printing the same
+`hardware gateway config=0 ... (waiting for config push)` line as for a
+missing file, until the bridge pushes its configuration on link. The first
+boot after a RoboRIO program of a new protocol version is deployed therefore
+always waits for that push.
 A stale file cannot accept commands from a different configuration ID.
 
 A structurally valid configuration succeeds in degraded mode when individual
