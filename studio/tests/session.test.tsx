@@ -13,12 +13,14 @@ import {parseManifest, type SessionManifest} from '../src/data/manifest';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {sessionPanel} from '../src/panels/session';
 import {mergeProcesses, summarize, worstLatency} from '../src/panels/session/logic';
-import type {
-  DeclaredGraph,
-  DeclaredNode,
-  SystemGraph,
-  SystemNode,
-  SystemSource
+import {
+  type DeclaredGraph,
+  type DeclaredNode,
+  GraphVersionMismatch,
+  SYSTEM_GRAPH_VERSION,
+  type SystemGraph,
+  type SystemNode,
+  type SystemSource
 } from '../src/system';
 
 // --- fixtures --------------------------------------------------------------
@@ -415,3 +417,22 @@ test('a node\'s delivery loss from the manifest is shown and is a problem', () =
   assert.match(text, /hardware_node delivery loss .*skipped requests 3 \(swerve_module 3\)/);
   assert.match(text, /gyro .* none /);
 });
+
+// REQ-OPS-23: with a bridge of another graph version the page holds no
+// graph, so how many processes run is unknown, not 0, and the panel names
+// the mismatch by both versions.
+test('a graph version mismatch leaves the running count unknown and names both versions',
+     () => {
+       const html = renderPanel(createStaticStudio({
+         manifest: manifest([mnode({name: 'a'}), mnode({name: 'b'})]),
+         system: {
+           graph: null,
+           stale: true,
+           error: String(new GraphVersionMismatch(SYSTEM_GRAPH_VERSION + 1))
+         }
+       }));
+       const count = html.replace(/<!-- -->/g, '');
+       assert.ok(count.includes('?/2'), 'running count is not unknown');
+       assert.ok(html.includes(`data-bridge-version="${SYSTEM_GRAPH_VERSION + 1}"`));
+       assert.ok(html.includes(`data-page-version="${SYSTEM_GRAPH_VERSION}"`));
+     });

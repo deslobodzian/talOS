@@ -5,12 +5,13 @@ import {useMemo, useState} from 'react';
 
 import {useSystem} from '../../data/hooks';
 import {liveNodeCount} from '../../data/freshness';
-import {endpointAttributesKnown} from '../../system';
+import {graphVersionMismatch} from '../../system';
 import {EmptyState} from '../../ui/primitives';
 import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition} from '../types';
 import './system.css';
 import {DeclaredPanel} from './DeclaredPanel';
+import {GraphVersionNotice} from './GraphVersionNotice';
 import {NodeCard} from './NodeCard';
 import {TopicTable} from './TopicTable';
 import {Wiring} from './Wiring';
@@ -21,6 +22,7 @@ const defaultConfig: SystemConfig = {};
 const parseConfig = (_raw: unknown): SystemConfig => ({});
 
 function NoSystem({error}: {error: string}) {
+  if (graphVersionMismatch(error)) return <GraphVersionNotice/>;
   return <EmptyState>
     {error ? error :
              'No system graph yet. Connect to a robot bridge, or start demo data to explore the viewer.'}
@@ -63,11 +65,6 @@ function SystemPanel() {
         <span>slots {graph.nodes.length}/{graph.registry.node_capacity}</span>
         {!graph.registry.available &&
          <span className="text-warn">registry unavailable — no node has started</span>}
-        {!endpointAttributesKnown(graph) &&
-         <span className="text-warn">
-           bridge sends version {graph.version} graphs, which carry no endpoint
-           attributes: a topic whose far end is outside talOS reads as a fault
-         </span>}
         {system.error && <span className="text-warn">{system.error}</span>}
         {system.declaredError &&
          <span className="text-warn">{system.declaredError}</span>}
@@ -123,4 +120,4 @@ export const systemPanel: PanelDefinition<SystemConfig> = {
   component: SystemPanel
 };
 
-export {NodeCard, Wiring, TopicTable, DeclaredPanel};
+export {NodeCard, Wiring, TopicTable, DeclaredPanel, GraphVersionNotice};
