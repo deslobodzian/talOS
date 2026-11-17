@@ -22,6 +22,155 @@ Hosts named below: the **bench** is BENCH.md's RoboRIO (image
 FRC_roboRIO_2026_v1.2, two cores) and CAN devices; the **Linux workstation**
 has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
+## 2026-11-17
+
+Bench, RoboRIO build c6c04a67 with companion 10.0.0.37, Mac mini (12 cores,
+Darwin 25.3.0, load 1.3 to 1.6, two users logged in) as main processor over
+Ethernet, bench bundle of c6c04a67 (`git_dirty = false`), launched over ssh,
+uncommissioned throughout. Driver Station on the Linux workstation, program
+NOT RECORDED, gamepad in slot 0. Sessions
+`~/talos-bench/logs/U/7798953721310323380` (300 s, no Studio) and
+`~/talos-bench/logs/V/17289576640307273572` (with the Studio bridge). Not
+acceptance evidence for BENCH-8: uncommissioned, launched over ssh, and not
+the head revision.
+
+- **BENCH-11: enabled while uncommissioned, nothing drives.** Session U,
+  Teleoperated, enabled from 131.7 s to 169.9 s (7649 States). The teleop
+  lanes went active (`/motor/target/teleop` `voltage_frac` -1 to 1,
+  `velocity_rps` to 30, `torque_current_a` to 2). `/motor/state` stayed
+  `NEUTRAL`, `source: NONE`, `applied_voltage_v` 0 in all 59999 records and
+  no `/motor/state` or `/swerve_module/state` record shows a drive mode. The
+  RoboRIO console counts 0 accepted commands in every 10 s report and about
+  500 refused. `alert_error_uncommissioned` was active for the whole
+  session. The person at the bench saw no motion.
+- **BENCH-11: joystick numbering as the RoboRIO reports it.** Session U,
+  joystick 0: axis 1 ranged -1 to 1; buttons 1 to 10 were each seen.
+- **BENCH-3: a stick held through a disable and enable.** Session V, 796.4 s
+  to 813.1 s: six enables with axis 1 already held (five at -1, one at 1),
+  each 1.1 to 2.0 s, with a disable between. The teleop node published
+  nothing on `/motor/target/teleop` in any of them and `/motor/state` stayed
+  `NEUTRAL`, `NONE`. In the next enable (814.5 s to 815.7 s), entered with
+  the stick at neutral, the lane was written again (253 sends, none active:
+  the stick stayed inside the deadband). A lane going active on a
+  deflection after a neutral reading was seen earlier in the same session
+  (28.5 s to 33.4 s), not after the held spells.
+- **BENCH-3 (a): the persisted config after a reboot.** One minute after a
+  RoboRIO boot, `/home/lvuser/talos_config.bin` was present (1009 bytes)
+  and the console printed `hardware gateway config=9594024380816546967
+  commissioned=0 (waiting for config push)`.
+- **BENCH-3 (c): console.** Over session U the RoboRIO console shows no
+  WPILib joystick warning; `companion connected` and `companion lost` carry
+  the `[s.ms]` prefix. What the Driver Station's own message window showed
+  was not recorded.
+- **Link and realtime.** Session U: Realtime `full` on all six nodes and no
+  grant warning; 60000 States, `/hw/state` interval median 4.999 ms, p99
+  5.168 ms, max 6.283 ms (enabled: 4.999, 5.171, 5.354 ms); no recording
+  loss; `timeouts=0` for both subsystems.
+- **RESET-3: no bus silence in 300 s.** Session U: feedback age max 8.7 ms
+  for the three Talon FX (firmware 26.3.1.0) and 3.9 ms for the CANcoder
+  and Pigeon 2, over 60000 States each. The silence was seen every few
+  minutes on 2026-11-11, so one 5-minute session does not show it is gone.
+- **TIME-4: the refused-command age moved by one tick within a session.**
+  Session U, RoboRIO console `[rio] latency:` lines, robot disabled: from
+  `[102]` to `[182]` refused command age p50 10.7 to 10.8 ms, p99 15.8 to
+  16.1 ms; from `[192]` on p50 5.8 ms, p99 10.8 to 11.0 ms, max up to
+  15.7 ms; no restart, no mode change at that time. Session V at `[1213]`:
+  5.8 and 10.9 ms. REQ-RT-26's bound is on accepted commands (11 ms p99,
+  15 ms max); none was accepted here.
+- **TIME-4: the two bands alternate with the clock drift.** The same
+  RoboRIO boot's console over 70 minutes (sessions V, W and two short
+  ones), every 10 s line: refused command age p50 is either 5.8 to 6.0 ms
+  or 10.7 to 10.8 ms. In session W it read 10.7 ms from `[751]` to
+  `[1512]` (761 s), 5.8 ms to `[1712]` (200 s), then alternated window by
+  window to `[1812]` and stayed at 10.7 ms: one cycle of 961 s. The
+  measured clock drift (-5.17 ppm, session U) sweeps one 5 ms period in
+  967 s, so the band follows the node timers' phase against the RoboRIO
+  tick, as TIME-4 derived. p99 in the 10.7 ms band was 10.9 to 11.1 ms.
+  Disabled, the bridge sends on its 20 ms heartbeat (about 500 commands
+  per 10 s), so the share of time in each band here is not the enabled
+  path's.
+- **A command 11.6 s old after the cable returned.** Session W's window at
+  `[741]`, after the reconnect at `[739.2]`: refused command age max
+  11555743 us, 119 commands in the window. Refused here as every command
+  was (uncommissioned); what an enabled, commissioned RoboRIO does with it
+  was not exercised.
+- **E-stop and a RoboRIO reboot under a running session.** Session V: the
+  Driver Station showed `estop` from 518.4 s, robot disabled. A RoboRIO
+  reboot at 569.5 s (`/sbin/reboot` over ssh): the next boot's first packet
+  read `estop` false and the one 30 ms later true again, the Driver Station
+  still sending it. The bridge accepted the new boot (boot id
+  15957309938990792307) with no session restart; `configured` true again.
+  `estop` read false after the Driver Station program was restarted
+  (detached 727.0 s to 763.5 s) and the RoboRIO was rebooted a second
+  time; which of the two cleared it was not separated.
+- **RT-17, BENCH.md "The Mini's link": a pulled companion cable with the
+  Mini's Wi-Fi on does not recover.** Session V, Wi-Fi `en1` on
+  (10.0.0.25, same subnet). First pull: RoboRIO console `companion lost`
+  at `[401.9]`, `companion connected` at `[412.4]` (10.4 s). Second loss at
+  `[507.3]`: no recovery in over 80 s with the cable back. The bridge's
+  socket then read `10.0.0.25:5803->10.0.0.72:5802` (`lsof`), its sends
+  succeeded, `/hw/status` `state_age_us` grew past 82 s with
+  `alert_error_link_lost`, and the RoboRIO (built with companion
+  10.0.0.37) accepted nothing. Only stopping the session ended it.
+- **The same pull with the Mini's Wi-Fi off recovers.** Session
+  `~/talos-bench/logs/W/1111857340715075397` (1800 s, Studio bridge,
+  disabled, uncommissioned, same builds), Wi-Fi off
+  (`networksetup -setairportpower en1 off`): `companion lost` at `[728.0]`,
+  `companion connected` at `[739.2]` (11.1 s), the bridge's new socket on
+  `10.0.0.37` (`socket_reopens=1`, `send_failures=1`), no node restart.
+- **BENCH-3: the Driver Station's network pulled while enabled.** Session V:
+  twice (832.9 s and 866.9 s) the Driver Station view went from enabled to
+  detached, mode none, disabled, and returned attached and disabled (1.7 s
+  and 20.7 s later). The instant of each pull was not recorded, so no
+  detection time is stated.
+- **RESET-3: no bus silence in the 19.6 minutes session W kept.** Every
+  event log reached its byte budget (`log_capped`), so the report covers
+  235530 States, not the whole 30 minutes: feedback age max 10.4 ms over
+  the three Talon FX, 6.1 ms for the CANcoder and Pigeon 2. Realtime
+  `full` on the six nodes. `/hw/state` interval median 5.001 ms, p99
+  5.220 ms. Load 1.9 to 3.1 at the end: timing not acceptance evidence.
+- **RT-28: 82 consecutive States missing with both ends running.** Session
+  W, one interval of 410.2 ms (the only one over 20 ms in the kept
+  window, 767.7 s into it, about RoboRIO `[2083]`, some 22 minutes after
+  the cable pull): `sample_time_us` stepped 410004 us, so the States were
+  never published, not delayed. The RoboRIO's `tick phases` lines show
+  2001 to 2003 ticks in each 10 s window around it, no `loop timing`
+  report and no send failure; on the Mini every node timer's max lateness
+  was 0.38 ms or less (telemetry 1.24 ms), the bridge kept publishing
+  `/hw/status` (`state_age_us` max 391 ms) and counted no send failure.
+  Below the 0.5 s link-loss bound, so no `companion lost`. Cause not
+  established; nobody was at the bench as far as recorded.
+- **TIME-5: the report's Driver Station to lane row.** Session U: median
+  46742.6 ms, p99 129937 ms, 7500 samples. `teleop` published the motor's
+  lane only from 131.7 s to 169.9 s (7647 sends), so every packet before
+  the enable is paired with the first send at 131.7 s.
+- **RT-5: RoboRIO thread scheduling, read from `/proc`, disabled.**
+  `sched_rt_runtime_us` -1, 2 CPUs. In the robot program:
+  `talos_watchdog` `SCHED_FIFO` 30, the loop (main thread) `SCHED_FIFO`
+  10, `talos-ds` `SCHED_FIFO` 5, all three last run on CPU 1; five
+  threads `SCHED_RR` 1 to 3; `talos-companion`, `talos-canbus`,
+  `talos-config`, `talos-log`, and the vendor's `can_recv`, `can_psend`
+  and `can_stat` `SCHED_OTHER`. Kernel: interrupt threads `SCHED_FIFO` 15
+  (`irq/54-eth0`, `irq/53` and `irq/76` USB, which carries the CANivore),
+  `ksoftirqd` 8, `ktimersoftd` 1. The eth0 and USB interrupts were all
+  counted on CPU 0.
+- **RT-5: tick cost at two status rates.** Disabled, same bundle and
+  RoboRIO build; `[robot] status_hz` 50.0 from a scratch copy of the
+  bundle's config (session `~/talos-bench/logs/X1/13312505921970813578`,
+  60 s), then the bundle's own 200.0 again (session
+  `~/talos-bench/logs/X2/6288709441872347922`, 45 s). `can_buses[1]`
+  (`Shooter`) `utilization_frac` after the first 15 s: 0.08 to 0.11
+  (median 0.09) at 50, 0.16 to 0.18 (median 0.17) at 200. Three
+  consecutive `tick phases` lines each, mean/max µs: at 50, refresh
+  170.2/290.2, 167.8/309.6, 169.8/328.8 and devices 209.6/322.9,
+  204.3/362.7, 207.6/333.2; at 200, refresh 169.7/272.3, 167.9/288.9,
+  170.6/293.4 and devices 206.7/385.2, 203.6/389.0, 210.5/330.5. The
+  status rate changes the bus load, not the tick's cost.
+- **Studio from another build.** A dev Studio page built from 6a4bbd88
+  against session V's bridge (c6c04a67) showed every node stale; the
+  bridge's `/system.json` listed all seven alive and it sent a
+  `talos.system_graph.update` every 0.5 s (STUDIO-12).
+
 ## 2026-11-16
 
 - **TEST-9, TEST-10, MAC-2: launcher and installing tests on macOS.** Mac mini,
