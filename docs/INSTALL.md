@@ -39,7 +39,7 @@ installs the 18.1.8 wheels, which are the same upstream release line as CI's
 `clang-{format,tidy}-18` packages and need no system LLVM. Before committing:
 
 ```sh
-tools/format.sh --check    # or --fix; changed C/C++ files vs the merge base with origin/main
+tools/format.sh --check    # or --fix; changed and untracked C/C++ files vs the merge base with origin/main
 tools/tidy.sh              # clang-tidy over the files CI would analyze (commit first)
 ```
 
