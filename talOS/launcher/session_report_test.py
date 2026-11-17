@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -364,6 +365,50 @@ class SessionReportTest(unittest.TestCase):
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["driver_station_to_lane_ms"],
                          {"teleop": {"count": 2, "median_ms": 5.5, "p99_ms": 6, "max_ms": 6}})
+
+    # REQ-RT-25: Driver Station to lane is the reaction of
+    # a producer that is publishing. teleop released its lane once, 3 ms
+    # after the 0 ms packet, published nothing while disabled, and from
+    # 82 ms, enabled, sent every 5 ms tick but stalled from 97 to 182 ms.
+    # The disabled spell's packets at 20, 40 and 60 ms, and the enabled
+    # packets at 100 to 160 ms, which it did not answer before the next
+    # packet, are no samples of up to 82 ms: each is counted
+    # unanswered, apart by the packet's enabled bit, so an enabled stall
+    # stays visible among disabled silence. A gap in the packet stream's log
+    # could hide the next packet, so the window of the packet before it is
+    # not measured.
+    def test_driver_station_to_lane_takes_only_packets_answered_before_the_next(self):
+        def record(kind, topic, publish, process="teleop", **extra):
+            return dict(process=process, kind=kind, topic=topic, now_ms=publish + 1,
+                        event_ms=publish + 1, publish_ms=publish, decoded="", **extra)
+        packets = [record("SEND", "/hw/state/driver_station", t, "hardware_node",
+                          ds_enabled=t >= 80) for t in range(0, 200, 20)]
+        sends = [record("SEND", "/lift/target/teleop", t)
+                 for t in [3] + list(range(82, 98, 5)) + list(range(182, 200, 5))]
+        report = session_report.analyze({"nodes": []}, packets + sends)
+        self.assertEqual(report["driver_station_to_lane_ms"],
+                         {"teleop": {"count": 3, "median_ms": 2, "p99_ms": 3, "max_ms": 3}})
+        self.assertEqual(report["driver_station_to_lane_unanswered"],
+                         {"teleop": {"total": 7, "enabled": 4, "other": 3}})
+        line = next(line for line in session_report.markdown(report).splitlines()
+                    if line.startswith("Driver station to lane teleop:"))
+        # The enabled count first.
+        self.assertEqual(re.findall(r"\d+", line), ["4", "3"])
+        # Packets recorded under another hardware protocol carry no enabled
+        # bit: the split is not measured, never an enabled count of 0.
+        undecoded = [{k: v for k, v in p.items() if k != "ds_enabled"} for p in packets]
+        report = session_report.analyze({"nodes": []}, undecoded + sends,
+                                        hardware_not_decoded="not decoded")
+        self.assertEqual(report["driver_station_to_lane_unanswered"],
+                         {"teleop": {"total": 7, "enabled": None, "other": None}})
+        # The bridge's log lost the 80 ms packet: 60 -> 82 ms is no sample.
+        gap = dict(record("GAP", "?", 80, "hardware_node"), gap={
+            "start_ms": 79, "end_ms": 81, "first_lost_ms": 80, "last_lost_ms": 80,
+            "records": 1, "cause": "pool_full", "closed_at_flush": False})
+        hidden = [p for p in packets if p["publish_ms"] != 80] + [gap]
+        report = session_report.analyze({"nodes": []}, hidden + sends)
+        self.assertEqual(report["driver_station_to_lane_ms"]["teleop"]["count"], 2)
+        self.assertEqual(report["intervals_across_gaps"]["driver_station_to_lane"], 1)
 
     # Driver Station to command's records: a packet, a tick in which a
     # Target selected a lane and its node sent a request, a merged command.
