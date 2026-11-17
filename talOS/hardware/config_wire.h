@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -646,22 +647,58 @@ class ConfigAssembler {
   Config config_{};
 };
 
-// Disk envelope: config_wire bytes followed by their little-endian CRC32.
+// The RoboRIO's saved configuration file (ConfigStore in the RoboRIO
+// program), little-endian:
+//
+//   offset 0      8 B  magic "TALOSCFG" (ASCII, in this order)
+//   offset 8      2 B  u16 protocol::kProtocolVersion of the program that
+//                      wrote it
+//   offset 10     n B  SerializeConfig bytes
+//   offset 10+n   4 B  CRC32 (ComputeCrc32) of bytes [0, 10+n)
+//
+// The tag is the protocol version because every config codec change bumps it
+// (wire_golden_test pins the config bytes to it), so there is no second
+// number to remember. A file of any other version is refused by the tag
+// however its body reads, and so is a file written before the tag (the
+// config bytes and their CRC32, through protocol 11): it begins with
+// period_us, which validation has always held at or below 20000, so its
+// bytes 2 and 3 are zero where the magic's are not. A refused file is not
+// migrated: the RoboRIO boots unconfigured and waits for the bridge's push.
+inline constexpr std::array<uint8_t, 8> kPersistedConfigMagic{
+    'T', 'A', 'L', 'O', 'S', 'C', 'F', 'G'};
+inline constexpr std::size_t kPersistedConfigHeaderBytes =
+    kPersistedConfigMagic.size() + 2;
+
 inline std::vector<uint8_t> PersistedConfig(const Config& config) {
-  auto bytes = SerializeConfig(config);
-  const auto crc = ComputeCrc32(bytes);
-  detail::ByteWriter{bytes}.Int(crc, 4);
+  const auto body = SerializeConfig(config);
+  std::vector<uint8_t> bytes;
+  bytes.reserve(kPersistedConfigHeaderBytes + body.size() + 4);
+  bytes.assign(kPersistedConfigMagic.begin(), kPersistedConfigMagic.end());
+  detail::ByteWriter writer{bytes};
+  writer.Int(protocol::kProtocolVersion, 2);
+  bytes.insert(bytes.end(), body.begin(), body.end());
+  writer.Int(ComputeCrc32(bytes), 4);
   return bytes;
 }
 
+// True only for a file PersistedConfig of this protocol version wrote, whose
+// CRC holds and whose configuration decodes, keeps the ceilings and
+// validates; `config` is left unchanged otherwise.
 inline bool LoadPersistedConfig(std::span<const uint8_t> bytes,
                                 Config& config) {
-  if (bytes.size() < 4) return false;
-  const auto payload = bytes.first(bytes.size() - 4);
+  if (bytes.size() < kPersistedConfigHeaderBytes + 4) return false;
+  if (!std::equal(kPersistedConfigMagic.begin(), kPersistedConfigMagic.end(),
+                  bytes.begin()))
+    return false;
+  detail::ByteReader version{bytes.subspan(kPersistedConfigMagic.size(), 2)};
+  if (version.Int(2) != protocol::kProtocolVersion) return false;
+  const auto covered = bytes.first(bytes.size() - 4);
   detail::ByteReader trailer{bytes.last(4)};
-  if (ComputeCrc32(payload) != trailer.Int(4)) return false;
+  if (ComputeCrc32(covered) != trailer.Int(4)) return false;
   Config parsed;
-  if (!DeserializeConfig(payload, parsed) || !CheckCeilings(parsed).ok)
+  if (!DeserializeConfig(covered.subspan(kPersistedConfigHeaderBytes),
+                         parsed) ||
+      !CheckCeilings(parsed).ok)
     return false;
   try {
     Validate(parsed);
