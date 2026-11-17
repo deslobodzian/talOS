@@ -58,6 +58,7 @@ times the time and adds a source of nondeterminism.
 | Target selection, mode generations, arming | component, in `talOS/devices` | written once in the framework; a node proves only that it uses `Target` (the matrix, §7) |
 | Owner timeout, request merge, boot and epoch rejection | component on `//talOS/bridge:merge`, on `HardwareNode` through its in-process gateway (`//talOS/bridge:trust_test`), and on `SimHardware` | the bridge runs the same code; UDP adds nothing, and `//talOS/bridge:node_test` proves the socket reaches the same frame handler |
 | Feedback age bound | unit on `FeedbackFresh` (`talOS/hardware/gate.h`); a node sees it through `SimHardware`, which calls it | the gateway and `SimHardware` run the same function |
+| A non-finite reading in the State | component on `Gateway` with a fake backend; a node sees it through `SimHardware`, which calls `hardware::ReplaceNonFinite` (`gateway.h`) | the gateway and `SimHardware` run the same function |
 | Wire layout, slot size, ABI, grammar | contract + compile-time `static_assert` | a size change must fail the build (RULES.md 9) |
 | Supervision: restart, quarantine, deadlines | component with an injected clock for the policy; integration for one real spawn or kill per mechanism | a policy test should not wait out a real deadline |
 | No node moves a motor while disabled, whole graph | e2e, judged from the log | only the session log sees every process |

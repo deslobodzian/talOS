@@ -304,7 +304,11 @@ the C++ getters as properties (`phase`, `at_speed`, `position_rot`, ...),
 Motor `temperature_c` is device temperature in Celsius; `supply_current_a`
 is supply-side current, not `current` (stator current). All three use 0.1-unit
 wire resolution. They are observations, not automatic thermal derating.
-Check `connected`/link freshness before using readings. While a device's
+Check `connected`/link freshness before using readings. A motor's
+`voltage()`, `current()`, `supply_current_a()` and `temperature_c()` have
+no validity of their own: they read 0 while the device reports none (stale
+or non-finite) and `connected()` stays true, so a thermal or stall rule
+must not take that 0 for a measurement. While a device's
 sample is invalid (disconnected, aged out, masked after a reset, or the
 gateway unconfigured: [fault scope](../talOS/hardware/README.md#runtime-contract);
 for a `Motor`, `CANcoder`, `Gyro` or `Encoder`, a stale hardware link too), a position (`Motor`, `CANcoder` and `Encoder` `position()`, `Gyro` `yaw()`)
