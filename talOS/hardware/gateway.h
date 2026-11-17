@@ -11,6 +11,18 @@
 #include "messages.h"
 
 namespace talos::hardware {
+// Leaves no non-finite value in `state`'s configured samples, the gateway's
+// rule for every backend (Gateway::Tick, after Backend::Read) and
+// testing::SimHardware's for the State it publishes. A motor or CAN sensor
+// whose position or velocity is not finite is invalid (MarkInvalid); a
+// motor's non-finite voltage, current or temperature is 0 and does not by
+// itself change its validity; an analog input, encoder or PWM output sample
+// with one is invalid with 0; a non-finite battery voltage is 0 with the
+// health sample invalid; and a CAN bus slot with a non-finite utilization is
+// a failed read: utilization 0, a kOk or kPending read state kFailed, its
+// counters kept.
+void ReplaceNonFinite(State& state);
+
 // Platform-specific code owns device objects. Configure runs at startup or
 // disabled and may block; Read/Apply/Neutral and reset polling must not block.
 class Backend {
@@ -33,7 +45,7 @@ class Backend {
   // invalidates a motor or CAN-sensor sample whose position or velocity age is
   // at least `command_timeout_us` (UINT32_MAX: unknown; FeedbackFresh in
   // gate.h), and replaces any non-finite value Read leaves, whatever the
-  // backend (Gateway::ReplaceNonFinite). Return false for a failed read pass or
+  // backend (ReplaceNonFinite, above). Return false for a failed read pass or
   // total motor/CAN-sensor feedback loss, not an individual dropout. With no
   // such devices configured, return true. An invalid sample gates only the
   // affected motor and its followers and dependents: neutral from the Tick that
@@ -224,11 +236,6 @@ class Gateway {
   // once the tick knows its configuration: after a commit in the tick, or
   // before returning while a configure is pending.
   void PlaceCanBusSlot();
-  // After Read: no non-finite value stays in this tick's State. A motor or
-  // CAN sensor with a non-finite position or velocity is invalid; any other
-  // non-finite value is 0, its RIO device or health sample invalid, and a CAN
-  // bus slot with one a failed read (kOk and kPending become kFailed).
-  void ReplaceNonFinite();
   bool JudgeFeedbackAge();
   // Total loss on this tick's State after the gateway's masks
   // (AnyFeedbackValid): healthy_ false and, when `was_healthy` or a command

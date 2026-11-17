@@ -574,7 +574,8 @@ or when its position or
 velocity sample is `command_timeout_us` old or older (an unknown age,
 `UINT32_MAX`, included); the gateway judges finiteness and that age bound
 after `Backend::Read`, the same for every backend, whatever the backend
-judged itself (`Gateway::ReplaceNonFinite`; `FeedbackFresh`, `gate.h`), so a
+judged itself (`hardware::ReplaceNonFinite`, `gateway.h`; `FeedbackFresh`,
+`gate.h`), so a
 gap shorter than that bound does not invalidate the feedback at the gateway;
 a consumer's own, tighter age bound still applies (the 2026 robot's
 drivetrain drops odometry samples older than 50 ms).
@@ -587,14 +588,11 @@ temperature and fault bits are the backend's. Reset detection (above)
 skips an invalid sample, so its zero is never a position step.
 No State the gateway publishes carries a non-finite value, whatever the
 backend reads (a decoder refuses a whole State for one, which the bridge
-would take for a lost link): any other non-finite reading is sent as 0. A
-motor's non-finite voltage, currents or temperature become 0 and do not by
-themselves change its sample's validity (as for stale effort); an analog
-input, encoder or PWM output sample with one is invalid; a non-finite
-battery voltage makes the health sample invalid; and a CAN bus slot with a
-non-finite utilization is reported as a failed read with utilization 0
-(`kOk` or `kPending` becomes `kFailed`; its counters stay as the backend
-gave them).
+would take for a lost link): any other non-finite reading is sent as 0, its
+sample invalid where it has a validity of its own; a motor's voltage,
+currents and temperature have none, so they read 0 with the motor still
+valid, as for stale effort. What each field becomes is stated once, at
+`hardware::ReplaceNonFinite` (`gateway.h`).
 While the gateway is unconfigured (a configure in progress, every boot
 restore included, or the last configure failed) it reads no device, so every
 State it publishes then carries no measurement: every motor and CAN-sensor
