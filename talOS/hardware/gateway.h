@@ -32,12 +32,13 @@ class Backend {
   // value or an isolated device, and reports each sample's ages. The gateway
   // invalidates a motor or CAN-sensor sample whose position or velocity age is
   // at least `command_timeout_us` (UINT32_MAX: unknown; FeedbackFresh in
-  // gate.h). Return false for a failed read pass or total motor/CAN-sensor
-  // feedback loss, not an individual dropout. With no such devices configured,
-  // return true. An invalid sample gates only the affected motor and its
-  // followers and dependents: neutral from the Tick that finds it, and driven
-  // again only by a command observing a later State.
-  // Read also fills `state.health.can_bus`, the health of CAN bus
+  // gate.h), and replaces any non-finite value Read leaves, whatever the
+  // backend (Gateway::ReplaceNonFinite). Return false for a failed read pass or
+  // total motor/CAN-sensor feedback loss, not an individual dropout. With no
+  // such devices configured, return true. An invalid sample gates only the
+  // affected motor and its followers and dependents: neutral from the Tick that
+  // finds it, and driven again only by a command observing a later State. Read
+  // also fills `state.health.can_bus`, the health of CAN bus
   // `state.health.can_bus_index` (CanBuses order), or leaves it kNone; the
   // gateway sets the index and count and clears the slot before each Read.
   // Total loss is judged on the State as published (AnyFeedbackValid,
@@ -223,6 +224,11 @@ class Gateway {
   // once the tick knows its configuration: after a commit in the tick, or
   // before returning while a configure is pending.
   void PlaceCanBusSlot();
+  // After Read: no non-finite value stays in this tick's State. A motor or
+  // CAN sensor with a non-finite position or velocity is invalid; any other
+  // non-finite value is 0, its RIO device or health sample invalid, and a CAN
+  // bus slot with one a failed read (kOk and kPending become kFailed).
+  void ReplaceNonFinite();
   bool JudgeFeedbackAge();
   // Total loss on this tick's State after the gateway's masks
   // (AnyFeedbackValid): healthy_ false and, when `was_healthy` or a command

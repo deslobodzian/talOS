@@ -569,10 +569,12 @@ invalid and its demands count in `neutralized_motor_count`.
 Fault scope: stale motor current/voltage zeroes the effort fields but keeps the
 sample valid; an invalid RIO encoder invalidates only that sample. A motor's or
 CAN sensor's motion feedback is invalid when the backend reports a signal
-error, a non-finite value or an isolated device, or when its position or
+error or an isolated device, when its position or velocity is not finite,
+or when its position or
 velocity sample is `command_timeout_us` old or older (an unknown age,
-`UINT32_MAX`, included); the gateway applies that age bound after
-`Backend::Read`, the same for every backend (`FeedbackFresh`, `gate.h`), so a
+`UINT32_MAX`, included); the gateway judges finiteness and that age bound
+after `Backend::Read`, the same for every backend, whatever the backend
+judged itself (`Gateway::ReplaceNonFinite`; `FeedbackFresh`, `gate.h`), so a
 gap shorter than that bound does not invalidate the feedback at the gateway;
 a consumer's own, tighter age bound still applies (the 2026 robot's
 drivetrain drops odometry samples older than 50 ms).
@@ -583,6 +585,16 @@ in every measured field (position, velocity, applied voltage, stator and
 supply current; `Gateway::snapshot`), never its last values; its ages,
 temperature and fault bits are the backend's. Reset detection (above)
 skips an invalid sample, so its zero is never a position step.
+No State the gateway publishes carries a non-finite value, whatever the
+backend reads (a decoder refuses a whole State for one, which the bridge
+would take for a lost link): any other non-finite reading is sent as 0. A
+motor's non-finite voltage, currents or temperature become 0 and do not by
+themselves change its sample's validity (as for stale effort); an analog
+input, encoder or PWM output sample with one is invalid; a non-finite
+battery voltage makes the health sample invalid; and a CAN bus slot with a
+non-finite utilization is reported as a failed read with utilization 0
+(`kOk` or `kPending` becomes `kFailed`; its counters stay as the backend
+gave them).
 While the gateway is unconfigured (a configure in progress, every boot
 restore included, or the last configure failed) it reads no device, so every
 State it publishes then carries no measurement: every motor and CAN-sensor
