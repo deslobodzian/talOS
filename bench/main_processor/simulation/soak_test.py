@@ -32,30 +32,24 @@ end_wall_ns, mapped to the node clock at the kill): after the death, before
 the restart's spawn.
 
 - every actuator owner's /hw/request gaps stay within its bridge owner
-  timeout except across a fault injected into that node, and a killed owner
-  sends again within RESTART_LIMIT_MS;
-- no request actuates while the newest Driver Station view its process
-  received is disabled, or before that process received one, and no
-  swerve_module request actuates without an active teleop target received
-  by the same process, published after that process's crash and younger
-  than command_timeout;
-- across a stalled teleop (or hardware bridge) every swerve_module request is
-  neutral from command_timeout after the newest active target (or /hw/state)
-  it received, and the first was due on its first tick after that; a stalled
-  swerve_module is neutralized by the bridge's /hw/command within its owner
-  timeout plus a period of its last request;
+  timeout except across a fault injected into that node, and a killed or
+  stalled owner sends again within RESTART_LIMIT_MS;
 - swerve_module, restarted under the frozen producer, sends more than five
   requests before the producer resumes, all neutral from the first and at
-  most 30 ms apart. The lane's newest target (the frozen producer's last,
-  which must be active) is at most command_timeout less REGIME_TICKS of the
-  owner's periods old at the restarted process's first request with an
+  most RESTARTED_GAP_MS apart. The lane's newest target (the frozen producer's
+  last, which must be active) is at most command_timeout less REGIME_TICKS of
+  the owner's periods old at the restarted process's first request with an
   enabled Driver Station view, so Target::get would still accept it by its
   age: the requests are neutral because a restarted node's subscription
-  receives only what is published after it attaches. A restart too slow for
-  that fails the run as no evidence. The run prints the restart latency and
-  that target's age;
+  receives only what is published after it attaches (REQ-SAFE-31). A restart
+  too slow for that fails the run as no evidence. The run prints the restart
+  latency and that target's age;
 - the launcher exits 0, nothing is quarantined, and each node's restart_count
-  equals the number of times it was killed.
+  equals the number of times it was killed (300 ms stalls stay below the
+  500 ms progress floor and must not restart or quarantine a node).
+  Per-tick disabled-neutral, stall-to-neutral, and fresh-target bounds are
+  proven at component tier (talOS/devices, talOS/bridge, talOS/hardware) and
+  are not re-asserted here (RULES.md 12).
 """
 
 import bisect
@@ -78,13 +72,18 @@ CENTER_S = 0.5
 FAULT_AT_S = 1.8
 STALL_S = 0.3
 LEAD_S = 2.0  # disabled before and after teleop
+# REQ-OPS-04, REQ-OPS-05: 5000 ms matches the launcher's startup grace
+# (kStartupGrace in talOS/launcher/launcher.h); a restarted or resumed owner
+# must publish its first /hw/request within that startup window.
 RESTART_LIMIT_MS = 5000
-# The restarted owner's output gap while its producer is frozen: its 5 ms
-# tick with margin, as the match rehearsal bounds it.
+# REQ-SAFE-31 (no end-to-end gap budget yet: TODO SPEC-4): 6 x swerve_module's
+# 5 ms period_us (30 ms, inside its 50 ms owner_timeout under the bench's
+# 100 ms command_timeout_us), proving the restarted owner flushes neutral
+# continuously across the 300 ms frozen-producer window.
 RESTARTED_GAP_MS = 30
-# The frozen-restart phase is evidence only while a retained target would
-# still be accepted by its age for this many of the restarted owner's ticks
-# from its first enabled request.
+# REQ-SAFE-31: 4 x swerve_module's 5 ms period_us (20 ms, leaving 80 ms under
+# the bench's 100 ms command_timeout_us), requiring at least 4 enabled owner
+# ticks while a retained pre-crash target would still be accepted by age.
 REGIME_TICKS = 4
 # Teleop length cap: with startup, shutdown and log analysis the run stays
 # inside Bazel's "long" timeout (900 s).
@@ -165,25 +164,6 @@ class Soak(unittest.TestCase):
             if t >= first:
                 self.assertTrue(all(motors[i] == NEUTRAL for i in motor_ids),
                                 f"{what}: active output at {t:.1f} ms")
-
-    def neutral_from(self, rows, expiry, end, motor_ids, gap_ms, period_ms, what):
-        """rows: sorted (now_ms, motors, event_ms, ...). An input expired at
-        `expiry`: every output from then to end is neutral, and the first was
-        due (event_ms) on the node's first tick after it. A skipped flush
-        would leave the bridge holding the last demand; a late tick still
-        reports the deadline it missed, so host lateness is not bounded."""
-        window = [r for r in rows if expiry <= r[0] < end]
-        self.assertTrue(window, f"{what}: no output in [{expiry:.1f}, {end:.1f})")
-        times = [expiry] + [r[0] for r in window] + [end]
-        gap = max(b - a for a, b in zip(times, times[1:]))
-        self.assertLessEqual(gap, gap_ms, f"{what}: output gap in [{expiry:.1f}, {end:.1f})")
-        self.assertLess(window[0][2], expiry + period_ms,
-                        f"{what}: the first output after the expiry at {expiry:.1f} ms "
-                        f"was due at {window[0][2]:.1f} ms")
-        for t, motors, *_ in window:
-            self.assertTrue(all(motors[i] == NEUTRAL for i in motor_ids),
-                            f"{what}: active output at {t:.1f} ms, after the expiry "
-                            f"at {expiry:.1f} ms")
 
     @staticmethod
     def wall_minus_node_ns():
@@ -360,11 +340,13 @@ class Soak(unittest.TestCase):
             # the restart number of the process that recorded it, and is
             # judged by that process's own inputs and crash.
             requests = {name: [] for name in OWNERS}  # (now, motors, event, run)
-            ds = {name: [] for name in OWNERS}  # (now, enabled, run)
-            targets = []  # DRIVE's received active targets: (now, publish, run)
+            drive_ds = []  # DRIVE's received Driver Station views: (now, enabled, run)
             lane = f"/{DRIVE}/target/{PRODUCER}"
             empty_logs = {name: {} for name in OWNERS}  # run: its files
             for name in OWNERS:
+                topics = f"/hw/request/{name}"
+                if name == DRIVE:
+                    topics += ",/hw/state/driver_station"
                 for run, logs in support.run_logs(session, final[name]):
                     origin = support.log_baseline_ns(logs)
                     if origin is None:
@@ -372,20 +354,16 @@ class Soak(unittest.TestCase):
                         empty_logs[name][run] = logs
                         continue
                     shift = (origin - baseline) / 1e6
-                    for row in self.dump(root, logs, name, f"/hw/request/{name},"
-                                         f"/hw/state/driver_station,{lane}"):
+                    for row in self.dump(root, logs, name, topics):
                         topic, now = row["topic"], row["now_ms"] + shift
                         if topic == f"/hw/request/{name}" and row["kind"] == "SEND":
                             requests[name].append((now, support.motor_requests(row),
                                                    row["event_ms"] + shift, run))
-                        elif (topic == "/hw/state/driver_station" and
+                        elif (name == DRIVE and
+                              topic == "/hw/state/driver_station" and
                               row["kind"] == "MESSAGE"):
-                            ds[name].append((now, support.ds_snapshot(row)[0] & 4, run))
-                        elif (name == DRIVE and topic == lane and
-                              row["kind"] == "MESSAGE" and
-                              bytes.fromhex(row["payload_hex"])[8] != 0):
-                            targets.append((now, row["publish_ms"] + shift, run))
-            for rows in (*requests.values(), *ds.values(), targets):
+                            drive_ds.append((now, support.ds_snapshot(row)[0] & 4, run))
+            for rows in (*requests.values(), drive_ds):
                 rows.sort(key=lambda r: r[0])
 
             for name in OWNERS:
@@ -410,17 +388,6 @@ class Soak(unittest.TestCase):
                         self.assertLess(index, len(times), f"{name} never resumed")
                         self.assertLessEqual(times[index] - e, RESTART_LIMIT_MS,
                                              f"{name} slow to resume after {action}")
-                # Disabled Driver Station view -> neutral request: the newest
-                # view the sending process received, and none (disabled)
-                # before its first.
-                for run in {r[3] for r in rows}:
-                    views = [(t, enabled) for t, enabled, r in ds[name] if r == run]
-                    view_times = [t for t, _ in views]
-                    for t, motors, _, _ in (r for r in rows if r[3] == run):
-                        index = bisect.bisect_right(view_times, t) - 1
-                        if index < 0 or not views[index][1]:
-                            self.assertTrue(all(m == NEUTRAL for m in motors.values()),
-                                            f"{name} active while disabled at {t:.1f} ms")
 
             drive_rows = requests[DRIVE]
             # Restart k follows the k-th kill (restart_count is checked
@@ -439,6 +406,8 @@ class Soak(unittest.TestCase):
                 self.assertGreaterEqual(crashes[-1], stamps[k],
                                         f"{DRIVE} run {k} reaped before its kill")
             for action, name, s, e in events:
+                if action != "frozen_kill":
+                    continue
                 what = f"{action} {name} at {s:.1f} ms"
 
                 def commands(since, until):
@@ -447,132 +416,68 @@ class Soak(unittest.TestCase):
                         if r["kind"] == "SEND"]
                     return sorted(rows, key=lambda r: r[0])
 
-                if action == "frozen_kill":
-                    # SIGKILL loses the killed process's unflushed recording,
-                    # so pre-kill actuation is read from what the bridge sent.
-                    self.driving(commands(s - 300, s), s - 150, s, drive_ids, what)
-                    # The restarted process's requests are those its own run
-                    # log recorded before the producer resumed, from its
-                    # first: no harness stamp decides which they are.
-                    run = stamps.index(s) + 1
-                    self.assertNotIn(run, empty_logs[DRIVE],
-                                     f"{what}: the restarted owner's run log "
-                                     f"{[str(p) for p in empty_logs[DRIVE].get(run, [])]} "
-                                     "holds no record")
-                    every = [r for r in drive_rows if r[3] == run]
-                    self.assertTrue(every, f"{what}: the restarted owner's run log "
-                                    "holds no request")
-                    restarted = [r for r in every if r[0] < e]
-                    self.assertGreater(
-                        len(restarted), 5,
-                        f"{what}: the restarted owner sent {len(restarted)} requests "
-                        f"before the producer resumed (its first {every[0][0] - s:.1f} "
-                        "ms after the kill)")
-                    first = restarted[0][0]
-                    # The lane's newest value is the last target the frozen
-                    # producer published (its own record: it was stopped,
-                    # not killed), and it must be an active one.
-                    sent = [(r["now_ms"], bytes.fromhex(r["payload_hex"])[8] != 0)
-                            for r in self.dump(root, session, PRODUCER, lane, s - 300, e)
-                            if r["kind"] == "SEND" and r["now_ms"] < e]
-                    self.assertTrue(sent, f"{what}: no target published")
-                    published, active = max(sent)
-                    self.assertTrue(active, f"{what}: the frozen lane's newest target "
-                                    f"at {published:.1f} ms is a release")
-                    # A retained target would drive from the restarted
-                    # owner's first request after its first enabled Driver
-                    # Station packet until the target's age reaches
-                    # command_timeout. The phase is evidence only if that
-                    # window held REGIME_TICKS of its ticks; a slower
-                    # restart proves nothing, and fails as such.
-                    enabled = [t for t, on, r in ds[DRIVE] if r == run and on and t < e]
-                    armed = next((t for t, *_ in restarted
-                                  if enabled and t >= enabled[0]), None)
-                    self.assertIsNotNone(armed, f"{what}: the restarted owner received no "
-                                         "enabled Driver Station packet before the resume")
-                    # s precedes the kill, so each latency is an upper bound;
-                    # the crash is the instant the launcher reaped it.
-                    crash = crashes[run - 1]
-                    print(f"{what}: crash reaped {crash - s:.1f} ms after the pre-kill stamp; "
-                          f"restarted owner's first request {first - crash:.1f} ms "
-                          f"after it, its first enabled one {armed - crash:.1f} ms; the "
-                          f"lane's newest target was then {armed - published:.1f} ms old "
-                          f"(command_timeout {timeout_ms:.0f} ms)", flush=True)
-                    limit = timeout_ms - REGIME_TICKS * period_ms[DRIVE]
-                    self.assertLessEqual(
-                        armed - published, limit,
-                        f"{what}: not evidence: the restarted owner's first request "
-                        f"with an enabled Driver Station view came {armed - s:.1f} ms "
-                        f"after the kill, when the frozen target was "
-                        f"{armed - published:.1f} ms old, over the {limit:.0f} ms "
-                        f"(command_timeout less {REGIME_TICKS} ticks) that leaves "
-                        "Target::get accepting it by its age, so neutral requests do "
-                        "not show that it was never delivered")
-                    self.neutral_by(restarted, first, first, e, motor_ids[DRIVE],
-                                    RESTARTED_GAP_MS, what)
-                if action != "stop":
-                    continue
-                # Each stall is judged from the input it starves, as recorded,
-                # not from the harness's SIGSTOP: the last target (or State)
-                # can precede the stop by a producer tick or more.
-                if name == PRODUCER:
-                    self.driving(drive_rows, s - 150, s, drive_ids, what)
-                    # The lane expires a timeout after the newest active
-                    # target the owner received before the resume.
-                    newest = max((p for r, p, _ in targets if r < e), default=None)
-                    self.assertIsNotNone(newest, f"{what}: no active target received")
-                    self.neutral_from(drive_rows, newest + timeout_ms, e,
-                                      motor_ids[DRIVE], owner_timeout[DRIVE],
-                                      period_ms[DRIVE], what)
-                elif name == "hardware_node":
-                    self.driving(drive_rows, s - 150, s, drive_ids, what)
-                    # robot_enabled() turns false a timeout after the
-                    # publication of the newest /hw/state the owner
-                    # received before the resume.
-                    states = [r["publish_ms"] for r in self.dump(
-                        root, session, DRIVE, "/hw/state", s - 300, e)
-                        if r["kind"] == "MESSAGE" and r["now_ms"] < e]
-                    self.assertTrue(states, f"{what}: no /hw/state received")
-                    self.neutral_from(drive_rows, max(states) + timeout_ms, e,
-                                      motor_ids[DRIVE], owner_timeout[DRIVE],
-                                      period_ms[DRIVE], what)
-                elif name == DRIVE:
-                    sent = commands(s - 300, e + 300)
-                    self.driving(sent, s - 150, s, drive_ids, what)
-                    # The bridge times the owner out an owner timeout after
-                    # it read the last request, on its 1 ms check; it does
-                    # not record that read, so an owner period past the
-                    # request's send covers the read and the check.
-                    last = drive_rows[bisect.bisect_left(
-                        [r[0] for r in drive_rows], e) - 1][0]
-                    self.neutral_by(sent, s, last + owner_timeout[DRIVE] +
-                                    period_ms[DRIVE], e, motor_ids[DRIVE],
-                                    owner_timeout[DRIVE], what)
-
-            # No swerve_module actuation without an active target received
-            # by the process that sent the request, published after the
-            # previous run's crash (reaped, so no target published from then
-            # on was that run's) and younger than the timeout when the request
-            # was sent, as Target::get() judges. "After the crash" holds
-            # whatever the restart latency: a restarted owner's reader starts
-            # at the lane's next publication (RTMSQueue::register_reader).
-            received = {}
-            for r, p, run in targets:
-                received.setdefault(run, []).append((r, p))
-            for t, motors, _, run in drive_rows:
-                if all(m[0] == "neutral" for m in motors.values()):
-                    continue
-                crash = crashes[run - 1] if run > 0 else float("-inf")
-                own = received.get(run, [])
-                j = bisect.bisect_right(own, (t, float("inf"))) - 1
-                fresh = False
-                # A target received before t - timeout was published before it.
-                while j >= 0 and own[j][0] >= t - timeout_ms:
-                    if 0 <= t - own[j][1] < timeout_ms and own[j][1] > crash:
-                        fresh = True
-                        break
-                    j -= 1
-                self.assertTrue(fresh, f"{DRIVE} active without fresh target at {t:.1f} ms")
+                # SIGKILL loses the killed process's unflushed recording,
+                # so pre-kill actuation is read from what the bridge sent.
+                self.driving(commands(s - 300, s), s - 150, s, drive_ids, what)
+                # The restarted process's requests are those its own run
+                # log recorded before the producer resumed, from its
+                # first: no harness stamp decides which they are.
+                run = stamps.index(s) + 1
+                self.assertNotIn(run, empty_logs[DRIVE],
+                                 f"{what}: the restarted owner's run log "
+                                 f"{[str(p) for p in empty_logs[DRIVE].get(run, [])]} "
+                                 "holds no record")
+                every = [r for r in drive_rows if r[3] == run]
+                self.assertTrue(every, f"{what}: the restarted owner's run log "
+                                "holds no request")
+                restarted = [r for r in every if r[0] < e]
+                self.assertGreater(
+                    len(restarted), 5,
+                    f"{what}: the restarted owner sent {len(restarted)} requests "
+                    f"before the producer resumed (its first {every[0][0] - s:.1f} "
+                    "ms after the kill)")
+                first = restarted[0][0]
+                # The lane's newest value is the last target the frozen
+                # producer published (its own record: it was stopped,
+                # not killed), and it must be an active one.
+                sent = [(r["now_ms"], bytes.fromhex(r["payload_hex"])[8] != 0)
+                        for r in self.dump(root, session, PRODUCER, lane, s - 300, e)
+                        if r["kind"] == "SEND" and r["now_ms"] < e]
+                self.assertTrue(sent, f"{what}: no target published")
+                published, active = max(sent)
+                self.assertTrue(active, f"{what}: the frozen lane's newest target "
+                                f"at {published:.1f} ms is a release")
+                # A retained target would drive from the restarted
+                # owner's first request after its first enabled Driver
+                # Station packet until the target's age reaches
+                # command_timeout. The phase is evidence only if that
+                # window held REGIME_TICKS of its ticks; a slower
+                # restart proves nothing, and fails as such.
+                enabled = [t for t, on, r in drive_ds if r == run and on and t < e]
+                armed = next((t for t, *_ in restarted
+                              if enabled and t >= enabled[0]), None)
+                self.assertIsNotNone(armed, f"{what}: the restarted owner received no "
+                                     "enabled Driver Station packet before the resume")
+                # s precedes the kill, so each latency is an upper bound;
+                # the crash is the instant the launcher reaped it.
+                crash = crashes[run - 1]
+                print(f"{what}: crash reaped {crash - s:.1f} ms after the pre-kill stamp; "
+                      f"restarted owner's first request {first - crash:.1f} ms "
+                      f"after it, its first enabled one {armed - crash:.1f} ms; the "
+                      f"lane's newest target was then {armed - published:.1f} ms old "
+                      f"(command_timeout {timeout_ms:.0f} ms)", flush=True)
+                limit = timeout_ms - REGIME_TICKS * period_ms[DRIVE]
+                self.assertLessEqual(
+                    armed - published, limit,
+                    f"{what}: not evidence: the restarted owner's first request "
+                    f"with an enabled Driver Station view came {armed - s:.1f} ms "
+                    f"after the kill, when the frozen target was "
+                    f"{armed - published:.1f} ms old, over the {limit:.0f} ms "
+                    f"(command_timeout less {REGIME_TICKS} ticks) that leaves "
+                    "Target::get accepting it by its age, so neutral requests do "
+                    "not show that it was never delivered")
+                self.neutral_by(restarted, first, first, e, motor_ids[DRIVE],
+                                RESTARTED_GAP_MS, what)
             success = True
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)

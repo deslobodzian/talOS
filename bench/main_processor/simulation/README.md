@@ -35,19 +35,8 @@ and crash of the process that sent it and never by when the harness read
 its clock:
 
 - each actuator owner's request gaps stay within its bridge owner timeout
-  except across a fault on that node, and a killed owner sends again within
-  5 s;
-- no request actuates while the newest Driver Station view its process
-  received is disabled, or before that process received one, and no
-  `swerve_module` request actuates without an active teleop target received
-  by the same process, published after that process's crash and younger
-  than `command_timeout_us`;
-- across a stalled `teleop`, every `swerve_module` request is neutral from
-  `command_timeout_us` after the newest active target it received (across a
-  stalled `hardware_node`, the newest `/hw/state`), not after the `SIGSTOP`,
-  and the first of them was due (`event_ms`) before that expiry plus its
-  `period_us`; a stalled `swerve_module` is neutralized in `/hw/command`
-  within its owner timeout plus a period of its last request;
+  except across a fault on that node, and a killed or stalled owner sends
+  again within 5 s;
 - `swerve_module`, restarted under the frozen producer, sends more than five
   requests before `teleop` resumes, all neutral from the first and at most
   30 ms apart. It asserts the regime that makes this evidence: the lane's
@@ -61,7 +50,10 @@ its clock:
   for that regime fails the run as no evidence, naming the restart latency
   and the target's age, which a passing run prints;
 - the launcher exits 0, nothing is quarantined, and each node's
-  `restart_count` equals the number of times it was killed.
+  `restart_count` equals the number of times it was killed. Per-tick
+  disabled-neutral, stall-to-neutral and fresh-target bounds are proven at
+  component tier (`talOS/devices`, `talOS/bridge`, `talOS/hardware`) and are
+  not re-asserted here.
 
 It prints each owner's request-gap p99 and maximum. Failure artifacts are
 retained in the test's undeclared outputs, and a failure prints the tails of
