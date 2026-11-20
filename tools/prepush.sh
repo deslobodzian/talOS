@@ -49,7 +49,7 @@
 # it; unset, one `skipped` line that does not fail the run; set, empty
 # included, to something that is not a directory, the step FAILED, since it
 # names no robot repository; tools/prepush_robot_repository.sh decides),
-# gradle (`phoenixTest buildRio -Pheadless --offline`, when the commits
+# gradle (`phoenixTest buildRio -Pcompanion=10.0.0.2 -Pheadless --offline`, when the commits
 # touch controller_processor/ or talOS/, whose headers the RoboRIO
 # program's build.gradle exports), rio-in-the-loop (`python3
 # tools/test_rio_in_the_loop.py --wpilib --output-dir <logs>/rio-in-the-loop`,
@@ -462,7 +462,7 @@ elif ! touches "${rio_paths[@]}"; then
   report "gradle not needed (nothing under ${rio_paths[*]} since $upstream)"
 else
   run_step gradle sh -c \
-    'cd controller_processor/rio && ./gradlew phoenixTest buildRio -Pheadless --offline' ||
+    'cd controller_processor/rio && ./gradlew phoenixTest buildRio -Pcompanion=10.0.0.2 -Pheadless --offline' ||
     true
 fi
 

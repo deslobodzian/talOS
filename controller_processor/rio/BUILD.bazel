@@ -1,4 +1,62 @@
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load(":rio_sources.bzl", "rio_stage_manifest")
+
+# Note: the Gradle wrapper script `gradlew` shares the name of the :gradlew
+# py_binary below, so gradlew_runner.py stages it from the talOS root beside
+# MODULE.bazel rather than listing it here (which would create a label cycle).
+_RIO_PROJECT_FILES = [
+    ".wpilib/wpilib_preferences.json",
+    "build.gradle",
+    "gradlew.bat",
+    "settings.gradle",
+    "simgui-ds.json",
+    "tsan_suppressions.txt",
+] + glob([
+    "gradle/**",
+    "src/**",
+    "vendordeps/**",
+])
+
+rio_stage_manifest(
+    name = "rio_stage_manifest",
+    srcs = _RIO_PROJECT_FILES,
+    module_file = "//:MODULE.bazel",
+    talos_deps = [
+        "//talOS/driver_station",
+        "//talOS/driver_station:schedule",
+        "//talOS/hardware",
+        "//talOS/hardware:config",
+        "//talOS/process:durable_sync",
+        "//talOS/protocol",
+    ],
+)
+
+# Runs GradleRIO on a staged cache copy of controller_processor/rio and the
+# talOS sources its build.gradle reads, without mutating the talOS checkout or
+# Bazel execroot. From a robot repository:
+#   bazel run @talos//controller_processor/rio:gradlew -- deploy -Pcompanion=<ipv4>
+py_binary(
+    name = "gradlew",
+    srcs = ["gradlew_runner.py"],
+    data = [
+        ":rio_stage_manifest",
+        "//:MODULE.bazel",
+    ],
+    main = "gradlew_runner.py",
+    visibility = ["//visibility:public"],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_test(
+    name = "gradlew_test",
+    size = "small",
+    srcs = ["gradlew_test.py"],
+    data = [":gradlew"],
+    env = {
+        "RIO_GRADLEW": "$(rlocationpath :gradlew)",
+    },
+    deps = ["@rules_python//python/runfiles"],
+)
 
 # The RoboRIO program builds with GradleRIO, not Bazel. Keep its WPILib
 # release aligned with the Python wpimath native wheels and bindings.

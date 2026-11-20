@@ -33,6 +33,7 @@ bazel run //:sim -- --duration-s 10    # the robot against the simulator
 bazel run //:sim -- --start-studio-bridge   # with Studio (below)
 bazel run @talos//talOS/launcher:session_report -- <session dir>   # a recorded session's report
 bazel run @talos//tools:sync_manifest -- robot.toml   # after editing [[subsystems]]
+bazel run @talos//controller_processor/rio:gradlew -- buildRio -Pcompanion=<ipv4>  # RoboRIO binary (deploy also needs -PteamNumber or .wpilib/wpilib_preferences.json)
 ```
 
 ## Add a subsystem
@@ -164,6 +165,15 @@ that leaves it or a file naming Bazel's output base or either checkout, so
 the bundle runs where the build tree is not. A robot repository gets the
 same test: talOS's own bundle tests install bundles built inside talOS,
 never one built under `@talos`'s external name.
+
+To build or deploy the RoboRIO gateway program from this repository, run
+`bazel run @talos//controller_processor/rio:gradlew -- buildRio -Pcompanion=<ipv4>`
+or `bazel run @talos//controller_processor/rio:gradlew -- deploy -Pcompanion=<ipv4> -PteamNumber=<team>`
+(or commit `.wpilib/wpilib_preferences.json` with `"teamNumber"` in the robot
+repository; talOS carries no default team number or companion address). It
+stages the Gradle project and required `talOS/` sources into a cache directory
+without modifying the talOS checkout and stamps `-PtalosRevision` and
+`-PtalosDirty` from `@talos`.
 
 ## Requirements
 

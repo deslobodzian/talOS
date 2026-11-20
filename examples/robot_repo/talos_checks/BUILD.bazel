@@ -21,3 +21,17 @@ py_test(
     },
     deps = ["@rules_python//python/runfiles"],
 )
+
+# @talos//controller_processor/rio:gradlew stages the RoboRIO Gradle project
+# and its talOS sources from @talos into a cache directory, stamps the talOS
+# checkout's revision, and forwards this repository's .wpilib preferences.
+py_test(
+    name = "rio_gradlew_test",
+    size = "small",
+    srcs = ["rio_gradlew_test.py"],
+    data = ["@talos//controller_processor/rio:gradlew"],
+    env = {
+        "RIO_GRADLEW": "$(rlocationpath @talos//controller_processor/rio:gradlew)",
+    },
+    deps = ["@rules_python//python/runfiles"],
+)

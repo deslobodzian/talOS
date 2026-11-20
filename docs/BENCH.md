@@ -73,10 +73,12 @@ release all controls, and explicitly re-enable only after checking recovery.
   stopping every member, and a stop exits 0 whether or not a State ever
   arrived. Simulation overrides commissioning only in
   memory; it does not prove physical safety or voltage dynamics. Record manifest.
-- [ ] Deploy the RIO program from either host. From the Linux workstation:
-  `(cd controller_processor/rio && ./gradlew deploy -Pcompanion=10.0.0.37)`;
+- [ ] Deploy the RIO program from either host (talOS has no built-in team
+  number or companion address, so pass both). From the Linux workstation:
+  `(cd controller_processor/rio && ./gradlew deploy -PteamNumber=5687 -Pcompanion=10.0.0.37)`
+  (or `bazel run //controller_processor/rio:gradlew -- deploy -PteamNumber=5687 -Pcompanion=10.0.0.37`);
   from the Mini, whose Gradle needs a JDK and no daemon:
-  `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -Pcompanion=10.0.0.37)`.
+  `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -PteamNumber=5687 -Pcompanion=10.0.0.37)`.
   Expected: Gradle prints
   `RoboRIO companion address built in: 10.0.0.37 (from -Pcompanion)`, the
   generic gateway starts on the RIO and its console line
@@ -115,10 +117,10 @@ RoboRIO `10.0.0.72` across its reboot (a DHCP reservation or a manual
 address on each): the RIO program is built for the one, and every launch
 names the other.
 
-Neither checked-in default fits it: the RIO program's built-in companion
-address (`10.56.87.11`) and `robot_bench.toml`'s `controller_address`
-(`10.56.87.2`) are the robot network's. So every RIO build for this bench
-is `./gradlew deploy -Pcompanion=10.0.0.37`, and every launch on the Mini
+The RIO program has no built-in team number or companion address, and
+`robot_bench.toml`'s `controller_address` (`10.56.87.2`) is the robot
+network's. So every RIO deploy for this bench passes
+`-PteamNumber=5687 -Pcompanion=10.0.0.37`, and every launch on the Mini
 passes `--remote 10.0.0.72`.
 
 The Mini's Wi-Fi is on the same subnet. The bridge's socket takes its source
@@ -134,16 +136,19 @@ Mini's Wi-Fi off for an enabled session; `route -n get 10.0.0.72` must name
 `interface: en0`.
 
 On any other LAN, build the RIO program for the main processor's address,
-from `controller_processor/rio`:
-`./gradlew deploy -Pcompanion=<main-processor-ipv4>` (also `buildRio`), on
-the command line each time: Gradle refuses it from a `gradle.properties` or
-the environment, and an empty, hostname or unusable address stops the build. Check that the build's
+from `controller_processor/rio` (or via `bazel run //controller_processor/rio:gradlew --`):
+`./gradlew deploy -PteamNumber=<team> -Pcompanion=<main-processor-ipv4>` (for
+`buildRio`, `-Pcompanion=<main-processor-ipv4>` alone is required), on
+the command line each time: Gradle refuses `-Pcompanion` and `-PteamNumber`
+from a `gradle.properties` or the environment, and an empty, hostname or
+unusable address stops the build. Check that the build's
 `RoboRIO companion address built in:` line names it. The address is fixed in the
 binary, never learned from the network
 ([RoboRIO](../talOS/hardware/README.md#roborio)); check the console line names
-it. `deploy` still finds the RIO by its team mDNS name
-(`roboRIO-5687-FRC.local`). The main processor must accept UDP on port 5803
-from the RIO, and every launch passes `--remote <roborio-ipv4>` or a
+it. `deploy` finds the RIO by the supplied team's mDNS name
+(`roboRIO-<team>-FRC.local`, or `.wpilib/wpilib_preferences.json` when
+invoked from a robot repository). The main processor must accept UDP on port
+5803 from the RIO, and every launch passes `--remote <roborio-ipv4>` or a
 config that names it (below).
 
 To point the main processor at the RIO without editing a tracked file, write
@@ -1159,7 +1164,8 @@ this bench's RoboRIO ([bench network](#bench-network)); on the Mini it also
 needs FileVault off (TODO.md DEPLOY-8). These checks run on the robot
 network's addresses, with the bundle installed under the default prefix
 (`sudo ./tools/deploy.sh install bazel-bin/bench/main_processor/bench_bundle`)
-and a RoboRIO program built without `-Pcompanion`.
+and a RoboRIO program built with `-Pcompanion=10.56.87.11` (and deployed with
+`-PteamNumber=5687`).
 
 - [ ] Inspect `./tools/deploy.sh enable-boot --user <service-account> --dry-run`,
   then enable boot with the actual service account. Expected: bundle traversal
