@@ -1,12 +1,14 @@
-"""Tests for sim.sh --config: which file a path names, and the refusals that
-stop it before anything builds or starts.
+"""Tests for sim.sh --config and failed-build diagnostics.
 
 sim.sh runs from a copy at the root of a scratch workspace, with a `bazel`
 on PATH that runs the real manifest check (//tools:sync_manifest --check)
-and a resolver stub that stops sim.sh right after it, so no simulation
-starts and nothing is written outside the workspace.
+and a resolver stub that stops sim.sh right after it (or stubs a failing
+build into a test-local TALOS_SIM_LOG_DIR), so no simulation starts and
+nothing is written outside the workspace.
 """
 
+import glob
+import json
 import os
 import shlex
 import shutil
@@ -150,6 +152,65 @@ class SimShConfigTest(unittest.TestCase):
         self.assertEqual(checked, ["--check", CONFIG])
         self.assertIn(f"bazel run //tools:sync_manifest -- {CONFIG}", output)
         self.assertNotIn("cannot resolve", output)
+
+    # REQ-DEV-05
+    def test_failed_build_prints_last_60_lines_and_build_log_path(self):
+        # A failing `bazel build` in sim.sh writes its full output to
+        # $TALOS_SIM_LOG_DIR/<session_id>/sim/build.log, prints only the last
+        # 60 lines to stderr, and names the log's path in the fatal error.
+        resolved = json.dumps({
+            "nodes": ["//bot:node"],
+            "effective": {
+                "robot": {"sim_gateway": "//talOS/simulation:sim_gateway"},
+                "studio": {},
+            },
+        })
+        put(os.path.join(self.root, "bazel-bin", "talOS", "configuration",
+                         "resolve"),
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
+            0o755)
+        check = ("import sys; from tools import sync_manifest; "
+                 "sys.exit(sync_manifest.main(sys.argv[1:]))")
+        bin_dir = os.path.join(self.tmp, "bin")
+        put(os.path.join(bin_dir, "bazel"),
+            "#!/bin/sh\n"
+            'if [ "$1" = build ]; then\n'
+            '  i=1\n'
+            '  while [ "$i" -le 80 ]; do\n'
+            '    printf "build-line-%02d\\n" "$i"\n'
+            '    i=$((i + 1))\n'
+            '  done\n'
+            '  exit 1\n'
+            'fi\n'
+            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
+            'while [ "$1" != -- ]; do shift; done; shift\n'
+            f'printf "%s\\n" "$*" >> {shlex.quote(self.log)}\n'
+            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
+            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
+            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            0o755)
+
+        log_root = os.path.join(self.tmp, "sim_logs")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--sim-gateway",
+             "--no-studio"],
+            cwd=self.root, env=env, capture_output=True, text=True,
+            timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        logs = glob.glob(os.path.join(log_root, "*", "sim", "build.log"))
+        self.assertEqual(len(logs), 1,
+                         f"expected build.log under {log_root}: {proc.stderr}")
+        build_log = logs[0]
+        self.assertIn(build_log, proc.stderr)
+        self.assertNotIn("build-line-20", proc.stderr)
+        self.assertIn("build-line-21", proc.stderr)
+        self.assertIn("build-line-80", proc.stderr)
+        with open(build_log, encoding="utf-8") as f:
+            recorded = f.read().splitlines()
+        self.assertEqual(len(recorded), 80)
+        self.assertEqual(recorded[0], "build-line-01")
+        self.assertEqual(recorded[-1], "build-line-80")
 
 
 if __name__ == "__main__":
