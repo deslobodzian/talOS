@@ -435,7 +435,7 @@ you add a mechanism.
 | `subsystems/*.toml` | one file per subsystem: its node, period, devices and parameters |
 | `robot_manifest.bzl` | generated from `robot.toml` (`bazel run @talos//tools:sync_manifest -- robot.toml`); Bazel reads it because it cannot read TOML |
 | `BUILD.bazel` | `manifest_sync_test`, `graph_test`, `robot_bundle`, `bundle_install_test` (the bundle installed with talOS's `deploy.sh` and run from there), `//:sim` (the robot against the simulator), `sim_smoke_test`, `studio_test`, `talos_pin_test`, `trace_test` (every test tag names a requirement of talOS's catalogue, or of this repository's own `docs/REQUIREMENTS.md` once it has one, whose rows then need tagged tests) |
-| `robot_sim.toml` | the simulation-only config (it includes `robot.toml`, which never reads it): `new_subsystem` writes it with the first mechanism, with its `robot_sim_manifest.bzl` and their `sim_manifest_sync_test` and `sim_graph_test` in `BUILD.bazel` |
+| `robot_sim.toml` | the simulation-only config (it includes `robot.toml`, which never reads it): `new_subsystem` writes it with the first mechanism, with its `robot_sim_manifest.bzl` and their `sim_manifest_sync_test` and `sim_graph_test` in `BUILD.bazel`, and points `//:sim` at it |
 | `MODULE.bazel` | talOS as `@talos`, and where Studio's pages are |
 | `.bazelrc` | imports talOS's build flags (`talos.bazelrc`) from the same checkout; add this repository's own flags below the import |
 | `.bazelversion` | the Bazel version, talOS's (`talos_pin_test` checks it, the import and the default Python) |

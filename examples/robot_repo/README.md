@@ -57,11 +57,13 @@ package elsewhere. A repository without a simulation config gets one with
 its first mechanism: `robot_sim.toml` beside the config (it includes the
 config, which never reads it), `robot_sim_manifest.bzl`, and its
 `sim_manifest_sync_test` and `sim_graph_test` in the config's `BUILD`, so
-`bazel test //...` checks it. Its `Next:` lists the placeholders to replace
-(the CAN id) and simulation-only lines to append to `robot_sim.toml`, then
-the command that
-runs it: `bazel run //:sim` when the root `talos_sim` names that file, else
-(as here, where `//:sim` runs `robot.toml`) `@talos//talOS/launcher` on it
+`bazel test //...` checks it. When the root `BUILD` has a `talos_sim(name =
+"sim")` pointed at the robot config with its manifest's `CONFIG_FILES` and
+`NODES` (as here), the scaffold also points `//:sim` at `robot_sim.toml`,
+`SIM_CONFIG_FILES` and `SIM_NODES`. Its `Next:` lists the placeholders to
+replace (the CAN id) and simulation-only lines to append to
+`robot_sim.toml`, then the command that runs it: `bazel run //:sim` when
+the root `talos_sim` names that file, else `@talos//talOS/launcher` on it
 with `--sim --start-sim-gateway`.
 
 `bazel test //...` passes right after the scaffold. In a robot whose config
