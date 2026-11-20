@@ -2099,6 +2099,47 @@ TEST(Gateway, NeutralRefusedDuringTotalLossIsNotARejection) {
   EXPECT_EQ(backend.applied, 0);
 }
 
+// While enabled and faulted (e.g. after consecutive global apply failures
+// latch fault_), State carries kHardwareFault, so every node flushes neutral
+// and the bridge forwards that merge with the fault's epoch. Refusing those
+// current neutrals is the gate working and must not inflate
+// rejected_command_count; a driving or misidentified command still counts.
+// REQ-OPS-20
+TEST(Gateway, NeutralRefusedWhileFaultedIsNotARejection) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  backend.apply_ok = false;
+  uint64_t seq = 1;
+  uint64_t now = 1000;
+  for (uint32_t i = 0; i < Gateway::kConsecutiveApplyFailureLimit; ++i) {
+    now += 5000;
+    g.Tick(now, true);
+    EXPECT_FALSE(g.Accept(Request(g), seq++, now));
+  }
+  ASSERT_TRUE((g.snapshot().flags & kHardwareFault) != 0u);
+  ASSERT_EQ(g.snapshot().counters.apply_failure_count,
+            Gateway::kConsecutiveApplyFailureLimit);
+  ASSERT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+
+  const int applied_before = backend.applied;
+  const auto neutral = AllMotorsNeutral(Request(g));
+  ASSERT_EQ(neutral.epoch, g.snapshot().epoch);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_FALSE(g.Accept(neutral, seq++, now));
+  }
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+
+  // Driving or misidentified commands while faulted still count as rejections.
+  EXPECT_FALSE(g.Accept(Request(g), seq++, now));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  auto misidentified = neutral;
+  ++misidentified.config_id;
+  EXPECT_FALSE(g.Accept(misidentified, seq++, now));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
+  EXPECT_EQ(backend.applied, applied_before);
+}
+
 // Total loss is not latched and clears in its own epoch, so a command built
 // on a State of the loss still matches once the feedback returns. It drives
 // nothing: its motors go neutral (motor_drives_from_) and so do its digital

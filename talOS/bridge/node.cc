@@ -509,6 +509,10 @@ void HardwareNode::Tick(uint64_t now_us) {
     HandleGatewayFrame(frame, now_us);
   }
 
+  // Refresh link readiness before evaluating owner silence in case no State
+  // arrived and the last accepted State has gone stale.
+  UpdateLinkReady(now_us);
+
   // 2. Read subsystem requests and perform timeout neutralization
   bool any_subsystem_active = false;
   for (auto& [name, tracker] : subsystems_) {
@@ -753,6 +757,12 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
       pending_probe_send_us_ = state.clock_probe_time_us;
       pending_probe_sample_us_ = state.sample_time_us;
       pending_probe_boot_id_ = state.boot_id;
+    }
+    // If the previous State had gone stale before this one arrived, drop
+    // link_ready_ first so the UpdateLinkReady() below treats this as a link
+    // recovery and restarts each owner's silence window.
+    if (link_ready_ && !StateFresh(now_us)) {
+      UpdateLinkReady(now_us);
     }
     last_state_receipt_us_ = now_us;
     state_accepted_ = true;
@@ -1003,8 +1013,15 @@ void HardwareNode::ReportLogFailure() {
   }
 }
 
+bool HardwareNode::StateFresh(uint64_t now_us) const {
+  if (!state_accepted_) return false;
+  const uint64_t age_us =
+      now_us > last_state_receipt_us_ ? now_us - last_state_receipt_us_ : 0;
+  return age_us < config_.command_timeout_us;
+}
+
 void HardwareNode::UpdateLinkReady(uint64_t now_us) {
-  const bool ready = state_accepted_ && is_configured_;
+  const bool ready = state_accepted_ && is_configured_ && StateFresh(now_us);
   if (ready && !link_ready_) {
     for (auto& [name, tracker] : subsystems_) {
       tracker.silence_from_us = now_us;
@@ -1016,7 +1033,10 @@ void HardwareNode::UpdateLinkReady(uint64_t now_us) {
 
 bool HardwareNode::OwnerSilent(const SubsystemTracker& tracker,
                                uint64_t now_us) const {
-  if (!link_ready_ || !tracker.heard || !tracker.silence_from_us) return false;
+  if (!link_ready_ || !StateFresh(now_us) || !tracker.heard ||
+      !tracker.silence_from_us) {
+    return false;
+  }
   const uint64_t from_us = *tracker.silence_from_us;
   return now_us > from_us && now_us - from_us > tracker.merge.timeout_us;
 }

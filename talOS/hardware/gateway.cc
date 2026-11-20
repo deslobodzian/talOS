@@ -653,11 +653,12 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     return false;
   }
   if (fault_ || configuring_ || !healthy_ || mismatched) {
-    // During total loss every node flushes neutral (the State carries the
-    // hardware fault) and the bridge forwards the merge with the loss's own
-    // epoch: refusing that is the gate working too.
-    const bool loss_neutral =
-        !healthy_ && !mismatched && DrivesNothing(c, config_);
+    // During total loss, a latched fault, or an in-progress configure every
+    // node flushes neutral (the State carries the hardware fault or
+    // unconfigured flags) and the bridge forwards the merge with that state's
+    // own epoch: refusing that is the gate working too.
+    const bool loss_neutral = (!healthy_ || fault_ || configuring_) &&
+                              !mismatched && DrivesNothing(c, config_);
     if (!superseded_neutral && !loss_neutral) {
       ++state_.counters.rejected_command_count;
     }
