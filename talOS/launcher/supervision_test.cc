@@ -3914,7 +3914,7 @@ TEST(Supervision, CallerScheduleStartFileDisablesLauncherCoordination) {
     ::remove(path->c_str());
 }
 
-// When sim_gateway exits without a pending non-quarantined restart before
+// When sim_gateway exits without a pending restart before
 // sim_schedule_start is written, supervision abandons schedule-start
 // coordination: sim_schedule_start is not written and the loop sleeps until
 // its next real deadline instead of waking every 20 ms.
@@ -4082,6 +4082,115 @@ TEST(Supervision, NonCriticalExitOrQuarantineDoesNotBlockSimGatewaySchedule) {
     EXPECT_EQ(ManifestRuns(manifest, "alpha").size(), 2u) << manifest;
     std::filesystem::remove_all(options.output_dir);
   }
+}
+
+// When sim_gateway crashes before registering and waits in a pending restart
+// backoff (including past max_restarts; launcher-managed sim_gateway is
+// critical and therefore retries on capped backoff rather than quarantining),
+// schedule-start coordination stays armed without writing sim_schedule_start
+// while the gateway is down, and writes sim_schedule_start cleanly once the
+// retried gateway starts its loop.
+// REQ-DEV-10, REQ-DEV-24
+TEST(Supervision, SimGatewayCrashAndRestartStillStartsSchedule) {
+  const auto gw_runs = TempPath("sim_sched_gw_retry_runs");
+  ::remove(gw_runs.c_str());
+  testing::SteppedClock clock;
+  clock.Freeze();
+  auto options = BaseOptions("sim_sched_gw_retry",
+                             "sim_gateway = \"//example/sim_gateway:node\"\n");
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.start_sim_gateway = true;
+  options.max_restarts = 1;
+  options.duration_s = 3600;
+  options.heartbeat_periods = 1'000'000;
+  options.heartbeat_startup_grace_ms = 3'600'000;
+  options.construction_timeout = 1h;
+  options.supervision_clock = clock.clock();
+  UseHealthyRegisteringNodes(options, "sim_sched_gw_retry");
+  const std::string loss_binary = RunfileBinary("TALOS_DELIVERY_LOSS_NODE");
+  // Runs 1 and 2 crash before registering (run 1 restarts immediately as a
+  // critical first crash; run 2 enters a 100 ms pending backoff). Run 3 starts
+  // its loop normally.
+  options.binary_overrides["//example/sim_gateway:node"] = WriteStub(
+      "sim_sched_gw_retry_gateway",
+      "echo run >> '" + gw_runs + "'\n" + "if [ \"$(wc -l < '" + gw_runs +
+          "')\" -le 2 ]; then exit 1; fi\nexec " + loss_binary +
+          " sim_gateway //example/sim_gateway:node 0,0,0,0,run --log "
+          "/dev/null \"$@\"\n",
+      "sim_gateway");
+
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string live = session_dir + "/manifest.json";
+  const std::string start_file =
+      session_dir + "/" + std::string{kSimScheduleStartFile};
+  const uint64_t session = options.session_id;
+  testing::SupervisionPasses passes;
+  bool saw_pending_backoff = false;
+  bool wrote_while_down = false;
+  bool started_after_retry = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    int64_t retry_at = 0;
+    saw_pending_backoff = WaitFor(stop, [&] {
+      if (!Registered("hardware_node", session) ||
+          !Registered("alpha", session) || !Registered("beta", session))
+        return false;
+      const std::string manifest = ReadFile(live);
+      const auto runs = ManifestRuns(manifest, "sim_gateway");
+      if (runs.size() != 2 ||
+          runs.back().find("\"reason\": \"crash\"") == std::string::npos)
+        return false;
+      retry_at = EntryInteger(ManifestEntry(manifest, "sim_gateway"),
+                              "retry_at_monotonic_ns");
+      return retry_at > 0;
+    });
+    if (saw_pending_backoff) {
+      // Run two supervision passes while sim_gateway is down in backoff so
+      // every healthy peer's loop_started is observed and we confirm the start
+      // file is not written before sim_gateway comes back up.
+      const uint64_t after_down = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after_down;
+      });
+      wrote_while_down = std::filesystem::exists(start_file);
+      // Advance to the pending restart deadline and wake Supervise.
+      clock.HoldAt(SupervisionTime{std::chrono::nanoseconds{retry_at}});
+      SupervisionWakeup::Wake();
+      started_after_retry = WaitFor(stop, [&] {
+        return Registered("sim_gateway", session) &&
+               std::filesystem::exists(start_file);
+      });
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+
+  EXPECT_EQ(RunSession(options), 0);
+  driver.join();
+  ASSERT_TRUE(saw_pending_backoff)
+      << "sim_gateway never entered pending restart backoff";
+  EXPECT_FALSE(wrote_while_down)
+      << "sim_schedule_start was written while sim_gateway was down";
+  ASSERT_TRUE(started_after_retry)
+      << "sim_schedule_start was not written after sim_gateway retried";
+  std::string stamp = ReadFile(start_file);
+  if (stamp.ends_with('\n')) stamp.pop_back();
+  ASSERT_FALSE(stamp.empty());
+  EXPECT_GT(std::stoll(stamp), 0);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto runs = ManifestRuns(manifest, "sim_gateway");
+  ASSERT_EQ(runs.size(), 3u) << manifest;
+  EXPECT_NE(runs[0].find("\"reason\": \"crash\""), std::string::npos)
+      << runs[0];
+  EXPECT_NE(runs[1].find("\"reason\": \"crash\""), std::string::npos)
+      << runs[1];
+  EXPECT_NE(runs[2].find("\"reason\": \"stop\""), std::string::npos) << runs[2];
+  EXPECT_EQ(
+      EntryInteger(ManifestEntry(manifest, "sim_gateway"), "restart_count"), 2);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(gw_runs.c_str());
 }
 
 }  // namespace

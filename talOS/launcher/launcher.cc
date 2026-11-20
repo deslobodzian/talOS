@@ -41,7 +41,7 @@ namespace {
 
 // How often Supervise checks whether every non-observer member's loop has
 // started while waiting to write kSimScheduleStartFile. Stops once written or
-// once sim_gateway exits or is quarantined without a non-quarantined restart.
+// once sim_gateway exits with no pending restart.
 constexpr std::chrono::milliseconds kSimScheduleStartPoll{20};
 
 // The topic ends a registry row published, or nullopt while it has
@@ -1693,11 +1693,10 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       const auto& gw_proc = procs[*sim_gateway_index];
       const auto& gw_launch = launches[*sim_gateway_index];
       const bool gw_running = gw_proc.pid > 0 && !gw_proc.exited;
-      if (!gw_running &&
-          (!gw_launch.restart.pending() || gw_launch.restart.quarantined())) {
-        // sim_gateway exited or failed to spawn without a pending
-        // non-quarantined restart (or is quarantined): stop waiting and stop
-        // the 20 ms schedule-start poll for the rest of the session.
+      if (!gw_running && !gw_launch.restart.pending()) {
+        // sim_gateway exited or failed to spawn with no pending restart: stop
+        // waiting and stop the 20 ms schedule-start poll for the rest of the
+        // session.
         sim_schedule_done = true;
       } else if (gw_running) {
         bool roster_ready = gw_launch.loop_started;
