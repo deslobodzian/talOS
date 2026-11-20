@@ -3914,5 +3914,175 @@ TEST(Supervision, CallerScheduleStartFileDisablesLauncherCoordination) {
     ::remove(path->c_str());
 }
 
+// When sim_gateway exits without a pending non-quarantined restart before
+// sim_schedule_start is written, supervision abandons schedule-start
+// coordination: sim_schedule_start is not written and the loop sleeps until
+// its next real deadline instead of waking every 20 ms.
+// REQ-DEV-10, REQ-DEV-24
+TEST(Supervision, SimGatewayEarlyExitStopsScheduleStartPolling) {
+  auto options = BaseOptions("sim_sched_gw_exit",
+                             "sim_gateway = \"//example/sim_gateway:node\"\n");
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.start_sim_gateway = true;
+  options.max_restarts = 0;
+  // Nothing else falls due on its own for an hour, so any 20 ms wakes after
+  // sim_gateway exits can come only from schedule-start polling.
+  options.duration_s = 3600;
+  options.heartbeat_periods = 1'000'000;
+  options.heartbeat_startup_grace_ms = 3'600'000;
+  options.construction_timeout = 1h;
+  for (const std::string_view name : {"hardware_node", "alpha", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + std::string{name} + ":node";
+    options.binary_overrides[target] = WriteStub(
+        "sim_sched_gw_exit_" + std::string{name}, "exec sleep 60\n", name);
+  }
+  // sim_gateway exits early before registering; the remaining stubs never
+  // register, so roster_ready is never reached.
+  options.binary_overrides["//example/sim_gateway:node"] =
+      WriteStub("sim_sched_gw_exit_gateway", "exit 1\n", "sim_gateway");
+
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string live = session_dir + "/manifest.json";
+  const std::string start_file =
+      session_dir + "/" + std::string{kSimScheduleStartFile};
+  testing::SupervisionPasses passes;
+  bool gateway_exited = false;
+  uint64_t passes_after_exit = 0;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    gateway_exited = WaitFor(stop, [&] {
+      const auto runs = ManifestRuns(ReadFile(live), "sim_gateway");
+      return !runs.empty() &&
+             runs.back().find("\"reason\": \"crash\"") != std::string::npos;
+    });
+    if (gateway_exited) {
+      // 300 ms would produce ~15 passes under a 20 ms poll, and at most 1
+      // in-flight wake once schedule-start polling stops.
+      const uint64_t base = passes.Started();
+      WaitFor(stop, [&] { return passes.Started() - base >= 4; }, 300ms);
+      passes_after_exit = passes.Started() - base;
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  EXPECT_EQ(RunSession(options), 1);
+  driver.join();
+  ASSERT_TRUE(gateway_exited) << "sim_gateway did not exit as crashed";
+  EXPECT_LT(passes_after_exit, 4u)
+      << "Supervise kept waking (" << passes_after_exit
+      << " passes in 300 ms) after sim_gateway exited";
+  EXPECT_FALSE(std::filesystem::exists(start_file));
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// When a non-critical member exits cleanly or is quarantined before
+// registering, sim_schedule_start is still written once the remaining active
+// non-observer members have started their loops.
+// REQ-DEV-10, REQ-DEV-24
+TEST(Supervision, NonCriticalExitOrQuarantineDoesNotBlockSimGatewaySchedule) {
+  const std::string loss_binary = RunfileBinary("TALOS_DELIVERY_LOSS_NODE");
+
+  // Case 1: non-critical alpha exits cleanly (exit 0) before registering;
+  // restarts are enabled, but non-critical clean exits are not restarted.
+  {
+    auto options = BaseOptions(
+        "sim_sched_nc_clean", "sim_gateway = \"//example/sim_gateway:node\"\n");
+    options.simulation = true;
+    options.remote = "127.0.0.1";
+    options.start_sim_gateway = true;
+    options.max_restarts = 5;
+    options.duration_s = kHangSeconds;
+    MakeAlphaNonCritical(options);
+    UseHealthyRegisteringNodes(options, "sim_sched_nc_clean");
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStub("sim_sched_nc_clean_alpha", "exit 0\n", "alpha");
+    options.binary_overrides["//example/sim_gateway:node"] = WriteStub(
+        "sim_sched_nc_clean_gateway",
+        "exec " + loss_binary +
+            " sim_gateway //example/sim_gateway:node 0,0,0,0,run --log "
+            "/dev/null \"$@\"\n",
+        "sim_gateway");
+
+    const std::string session_dir =
+        options.output_dir + "/" + std::to_string(options.session_id);
+    const std::string start_file =
+        session_dir + "/" + std::string{kSimScheduleStartFile};
+    std::string seen;
+    EXPECT_EQ(RunSessionUntil(
+                  options,
+                  [&](const std::string& live) {
+                    const auto runs = ManifestRuns(live, "alpha");
+                    return !runs.empty() &&
+                           runs.back().find("\"reason\": \"exit\"") !=
+                               std::string::npos &&
+                           std::filesystem::exists(start_file);
+                  },
+                  seen),
+              0);
+    ASSERT_FALSE(seen.empty()) << "sim_schedule_start was not written after "
+                                  "non-critical clean exit";
+    std::string stamp = ReadFile(start_file);
+    if (stamp.ends_with('\n')) stamp.pop_back();
+    ASSERT_FALSE(stamp.empty());
+    EXPECT_GT(std::stoll(stamp), 0);
+    const std::string manifest =
+        ReadFile(options.output_dir + "/manifest.json");
+    EXPECT_EQ(ManifestRuns(manifest, "alpha").size(), 1u) << manifest;
+    std::filesystem::remove_all(options.output_dir);
+  }
+
+  // Case 2: non-critical alpha crashes before registering until quarantined;
+  // sim_schedule_start is written once alpha enters quarantine without waiting
+  // out the 60 s restart window.
+  {
+    auto options = BaseOptions(
+        "sim_sched_nc_quar", "sim_gateway = \"//example/sim_gateway:node\"\n");
+    options.simulation = true;
+    options.remote = "127.0.0.1";
+    options.start_sim_gateway = true;
+    options.max_restarts = 1;
+    options.restart_window_ms = 60000;
+    options.duration_s = kHangSeconds;
+    MakeAlphaNonCritical(options);
+    UseHealthyRegisteringNodes(options, "sim_sched_nc_quar");
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStub("sim_sched_nc_quar_alpha", "exit 1\n", "alpha");
+    options.binary_overrides["//example/sim_gateway:node"] = WriteStub(
+        "sim_sched_nc_quar_gateway",
+        "exec " + loss_binary +
+            " sim_gateway //example/sim_gateway:node 0,0,0,0,run --log "
+            "/dev/null \"$@\"\n",
+        "sim_gateway");
+
+    const std::string session_dir =
+        options.output_dir + "/" + std::to_string(options.session_id);
+    const std::string start_file =
+        session_dir + "/" + std::string{kSimScheduleStartFile};
+    std::string seen;
+    EXPECT_EQ(RunSessionUntil(
+                  options,
+                  [&](const std::string& live) {
+                    return ManifestEntry(live, "alpha")
+                                   .find("\"quarantined\": true") !=
+                               std::string::npos &&
+                           std::filesystem::exists(start_file);
+                  },
+                  seen),
+              1);
+    ASSERT_FALSE(seen.empty()) << "sim_schedule_start was not written after "
+                                  "non-critical quarantine";
+    std::string stamp = ReadFile(start_file);
+    if (stamp.ends_with('\n')) stamp.pop_back();
+    ASSERT_FALSE(stamp.empty());
+    EXPECT_GT(std::stoll(stamp), 0);
+    const std::string manifest =
+        ReadFile(options.output_dir + "/manifest.json");
+    EXPECT_EQ(ManifestRuns(manifest, "alpha").size(), 2u) << manifest;
+    std::filesystem::remove_all(options.output_dir);
+  }
+}
+
 }  // namespace
 }  // namespace talos::launcher
