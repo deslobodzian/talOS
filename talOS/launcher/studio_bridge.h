@@ -97,9 +97,11 @@ class StudioBridge {
   // Aligns the first run's liveness origin with Supervise's start time.
   void BeginSupervision(SupervisionTime started);
 
-  // One supervision pass's liveness look at the bridge's live registry row
-  // (read-only, lock-free): records its realtime outcome (without warning for
-  // an observer) and kills a hung or unregistered run with SIGKILL. Returns
+  // One supervision pass's look at the bridge: captures its bound port from
+  // `listening <port>` (updating `proc.http_port` and `args_[2]` so restarts
+  // rebind the same port), and inspects its live registry row (read-only,
+  // lock-free), recording its realtime outcome (without warning for an
+  // observer) and killing a hung or unregistered run with SIGKILL. Returns
   // whether `proc` changed.
   bool Watch(NodeProcessInfo& proc, const introspect::RegistryMapping* registry,
              const SupervisionClock& clock, bool stopping);
@@ -169,6 +171,8 @@ class StudioBridge {
   std::string_view kill_reason_;
   bool heartbeat_killed_{false};
   bool realtime_reported_{false};
+  bool port_observed_{false};
+  bool started_port_announced_{false};
   bool running_{false};  // A run was spawned and is not yet reaped.
   bool settled_{false};  // That run has been up a settle interval.
   bool came_up_{false};  // Some run has.

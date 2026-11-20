@@ -3,7 +3,6 @@
 import os
 from pathlib import Path
 import re
-import socket
 import sys
 import tomllib
 
@@ -19,12 +18,6 @@ from talOS.launcher.tlog_read import (
 def workspace():
     return Path(os.environ["TEST_SRCDIR"]) / os.environ.get(
         "TEST_WORKSPACE", "_main")
-
-
-def tcp_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
 
 
 NEUTRAL = ("neutral", 0, 0.0, 0.0)

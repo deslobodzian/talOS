@@ -197,6 +197,9 @@ struct NodeProcessInfo {
   // (introspect::RealtimeOf; process::RealtimeGrant order); empty until one
   // did.
   std::optional<process::RealtimeOutcome> realtime;
+  // The HTTP port the Studio bridge bound (from its `listening <port>` line);
+  // empty for other members and until the bridge reports it.
+  std::optional<uint16_t> http_port;
 
   // Keeps `outcome` when it is worse than the one recorded; returns whether
   // it was.

@@ -350,6 +350,16 @@ local_port = 5805
     EXPECT_THROW(ParsePortFlag("--remote-port", bad), std::invalid_argument)
         << bad;
   }
+  // Ephemeral port 0 is accepted only when the flag opts in
+  // (--studio-http-port).
+  EXPECT_EQ(ParsePortFlag("--studio-http-port", "0", /*allow_zero=*/true), 0);
+  EXPECT_EQ(ParsePortFlag("--studio-http-port", "65535", /*allow_zero=*/true),
+            65535);
+  for (const char* bad : {"65536", "70000", "-1", "0x", ""}) {
+    EXPECT_THROW(ParsePortFlag("--studio-http-port", bad, /*allow_zero=*/true),
+                 std::invalid_argument)
+        << bad;
+  }
 }
 
 // Log retention keys of the wrong type or sign are refused, not defaulted.
@@ -385,6 +395,7 @@ TEST(ConfigTest, CommissionedRefusesTargetCoverageTurnedOff) {
 }
 
 TEST(ConfigTest, RejectsInvalidStudioOptions) {
+  ExpectRejected("[studio]\nhttp_port = 0\n");
   ExpectRejected("[studio]\nhttp_port = 70000\n");
   ExpectRejected("[studio]\nmax_clients = 0\n");
   ExpectRejected("[studio]\nmax_clients = 65\n");

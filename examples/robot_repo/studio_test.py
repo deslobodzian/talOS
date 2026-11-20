@@ -28,17 +28,15 @@ STOP_WAIT_S = 10
 
 
 def free_ports():
-    """Free loopback ports for the gateway, the hardware bridge (UDP) and
-    Studio (TCP), bound at 0 and released before the launch, since the
-    launcher refuses port 0 (talOS docs/TESTING.md §6.4)."""
+    """Free loopback UDP ports for the gateway and the hardware bridge, bound
+    at 0 and released before the launch, since the launcher still refuses
+    port 0 for the gateway link (talOS docs/TESTING.md §6.4). Studio uses
+    `--studio-http-port 0` and records its bound port in `manifest.json`."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as gateway, \
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge, \
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as studio:
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge:
         gateway.bind(("127.0.0.1", 0))
         bridge.bind(("127.0.0.1", 0))
-        studio.bind(("", 0))
-        return (gateway.getsockname()[1], bridge.getsockname()[1],
-                studio.getsockname()[1])
+        return gateway.getsockname()[1], bridge.getsockname()[1]
 
 
 class StudioBridgeInSession(unittest.TestCase):
@@ -63,9 +61,9 @@ class StudioBridgeInSession(unittest.TestCase):
 
     def check_session(self, out):
         sim = runfiles.Create().Rlocation("_main/sim")
-        gateway, bridge, studio = free_ports()
+        gateway, bridge = free_ports()
         launch = subprocess.Popen(
-            [sim, "--start-studio-bridge", "--studio-http-port", str(studio),
+            [sim, "--start-studio-bridge", "--studio-http-port", "0",
              "--output-dir", out, "--remote", "127.0.0.1",
              "--remote-port", str(gateway), "--local-port", str(bridge),
              "--duration-s", str(HANG_S)],
@@ -83,6 +81,18 @@ class StudioBridgeInSession(unittest.TestCase):
                     up.set()
             up.set()  # the launch ended: nothing more will come
 
+        def read_http_port():
+            for path in glob.glob(os.path.join(out, "*", "manifest.json")):
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        nodes = {n["name"]: n for n in json.load(f)["nodes"]}
+                    port = nodes.get("studio_bridge", {}).get("http_port")
+                    if isinstance(port, int) and port > 0:
+                        return port
+                except (OSError, json.JSONDecodeError, KeyError):
+                    pass
+            return None
+
         reader = threading.Thread(target=read, daemon=True)
         reader.start()
         try:
@@ -91,6 +101,17 @@ class StudioBridgeInSession(unittest.TestCase):
                             + "".join(output[-60:]))
             log = "".join(output)
             self.assertIn("Started studio_bridge", log, log)
+            studio = read_http_port()
+            if studio is None:
+                wait = threading.Event()
+                for _ in range(HANG_S * 20):
+                    studio = read_http_port()
+                    if studio is not None or launch.poll() is not None:
+                        break
+                    wait.wait(0.05)
+            self.assertIsNotNone(
+                studio,
+                f"manifest.json did not record studio_bridge http_port:\n{log}")
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{studio}/drive",
                                             timeout=HANG_S) as answer:
@@ -141,6 +162,8 @@ class StudioBridgeInSession(unittest.TestCase):
         with open(manifests[0], encoding="utf-8") as f:
             nodes = {n["name"]: n for n in json.load(f)["nodes"]}
         self.assertIn("studio_bridge", nodes, sorted(nodes))
+        self.assertEqual(nodes["studio_bridge"].get("http_port"), studio,
+                         nodes["studio_bridge"])
         runs = [(r["exit_code"], r["exit_signal"])
                 for r in nodes["studio_bridge"].get("runs", [])]
         self.assertEqual(runs, [(0, 0)], nodes["studio_bridge"])

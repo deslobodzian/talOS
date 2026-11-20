@@ -330,6 +330,9 @@ std::string SessionManifest::ToJson() const {
     }
     ss << "      \"record_count\": " << n.record_count << ",\n";
     ss << "      \"runs_dropped\": " << n.runs_dropped << ",\n";
+    if (n.http_port) {
+      ss << "      \"http_port\": " << *n.http_port << ",\n";
+    }
     // Last: a run holds no nested object or array, and no node field
     // follows the runs.
     ss << "      \"runs\": [";

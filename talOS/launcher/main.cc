@@ -57,7 +57,8 @@ int main(int argc, char** argv) {
       } else if (arg == "--start-studio-bridge") {
         options.start_studio_bridge = true;
       } else if (arg == "--studio-http-port" && i + 1 < argc) {
-        options.studio_http_port = talos::config::ParsePortFlag(arg, argv[++i]);
+        options.studio_http_port =
+            talos::config::ParsePortFlag(arg, argv[++i], /*allow_zero=*/true);
       } else if (arg == "--allow-graph-errors") {
         options.allow_graph_errors = true;
       } else if (arg == "--describe-only") {
@@ -107,6 +108,10 @@ int main(int argc, char** argv) {
                "gateway's probe and runtime;\n"
                "                         repeat for each argument, requires "
                "--start-sim-gateway\n"
+               "  --studio-http-port PORT  Studio HTTP port; overrides "
+               "[studio] http_port (0 lets\n"
+               "                         the OS pick a free port, recorded in "
+               "manifest.json)\n"
                "  --describe-only        ask every node in the config "
                "what it is, lint the\n"
                "                         graph they describe, and exit "
