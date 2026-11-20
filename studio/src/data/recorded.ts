@@ -711,23 +711,23 @@ function buildBreakSpans(gaps: readonly ReviewGap[],
 
 function channelAffectedByBreak(channel: string, span: BreakSpan): boolean {
   if (!span.process) return true;
-  const slash = channel.indexOf('/');
-  if (slash <= 0) return true;
-  const owner = channel.slice(0, slash);
-  if (owner === span.process) return true;
+  const parts = channel.split('/');
+  if (parts.length < 2 || !parts[0]) return true;
+  const owner = parts[0];
   if (owner === 'hw') {
-    if (channel.startsWith('hw/request/')) {
-      const rest = channel.slice('hw/request/'.length);
-      const next = rest.indexOf('/');
-      const reqOwner = next === -1 ? rest : rest.slice(0, next);
-      return reqOwner === span.process;
+    if (parts[1] === 'request' && parts.length >= 3 && parts[2]) {
+      return parts[2] === span.process;
     }
     if (span.process === 'hardware_node' || span.process === 'bridge') return true;
     // A session without a bridge log may read /hw/state/driver_station from a
     // reader process; straddling the gap interval still avoids false breaks.
     return span.kind === 'gap';
   }
-  return false;
+  // Target-lane channels (`<subsystem>/target/<source>/*`) are written by
+  // `<source>`, not `<subsystem>`.
+  const writer = (parts[1] === 'target' && parts.length >= 3 && parts[2]) ?
+      parts[2] : owner;
+  return writer === span.process;
 }
 
 // Finds the break timestamp strictly between two consecutive points of `pts`

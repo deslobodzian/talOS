@@ -1,6 +1,7 @@
 #include "studio/review/review.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -2123,6 +2124,91 @@ TEST_F(ReviewTest, BoundsExposeConfiguredStudioPoseTopic) {
     EXPECT_TRUE(bounds["pose_topic"].is_null());
   }
   std::filesystem::remove_all(dir);
+}
+
+// Guards REQ-OPS-42 on manifest.json's config_path: Session::Open refuses
+// oversized (> 1 MiB) and non-regular (FIFO, symlink to FIFO) configs without
+// hanging or allocating unbounded memory, returning pose_topic == null while
+// still reading [studio] pose_topic through a single bounded include.
+// REQ-OPS-42, REQ-OPS-41
+TEST_F(ReviewTest, BoundedConfigReadRefusesOversizedAndNonRegularConfigPath) {
+  const auto write_manifest_config = [](const std::string& dir,
+                                        const std::string& cfg_path) {
+    testing::WriteFixtureSession(dir);
+    std::string manifest = ReadFile(dir + "/manifest.json");
+    manifest.insert(1, "\n  \"config_path\": \"" + cfg_path + "\",");
+    std::ofstream{dir + "/manifest.json"} << manifest;
+  };
+
+  // 1. Oversized (> 1 MiB) valid robot.toml yields pose_topic == null.
+  {
+    const std::string dir = Library() + "/pose_huge";
+    const std::string cfg = dir + "/robot.toml";
+    write_manifest_config(dir, cfg);
+    {
+      std::ofstream out{cfg, std::ios::binary};
+      out << "[studio]\npose_topic = \"/huge/state\"\n\n[subsystems]\n";
+      const std::string pad(1024, 'x');
+      for (int i = 0; i < 1025; ++i) out << "# " << pad << '\n';
+    }
+    Review review{Library(), 1u << 20};
+    const Response resp = review.Get("/review/pose_huge/bounds.json", "");
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json bounds = json::parse(resp.body);
+    ASSERT_TRUE(bounds.contains("pose_topic")) << resp.body;
+    EXPECT_TRUE(bounds["pose_topic"].is_null()) << bounds["pose_topic"];
+  }
+
+  // 2. Non-regular FIFO (no writer open), symlink to FIFO, and a valid config
+  //    whose `include` targets a FIFO all return pose_topic == null without
+  //    blocking.
+  {
+    const std::string dir = Library() + "/pose_fifo";
+    const std::string fifo = dir + "/config.fifo";
+    const std::string link = dir + "/link.toml";
+    const std::string inc_cfg = dir + "/inc.toml";
+    write_manifest_config(dir, fifo);
+    ASSERT_EQ(mkfifo(fifo.c_str(), 0600), 0);
+    std::filesystem::create_symlink(fifo, link);
+    std::ofstream{inc_cfg} << "include = \"config.fifo\"\n";
+
+    const auto check_null = [&](const std::string& path) {
+      std::string manifest = ReadFile(dir + "/manifest.json");
+      const auto pos = manifest.find("\"config_path\"");
+      ASSERT_NE(pos, std::string::npos);
+      const auto end = manifest.find('\n', pos);
+      manifest.replace(pos, end - pos, "\"config_path\": \"" + path + "\",");
+      std::ofstream{dir + "/manifest.json"} << manifest;
+      Review review{Library(), 1u << 20};
+      const Response resp = review.Get("/review/pose_fifo/bounds.json", "");
+      ASSERT_EQ(resp.status, 200) << resp.body;
+      const json bounds = json::parse(resp.body);
+      ASSERT_TRUE(bounds.contains("pose_topic")) << resp.body;
+      EXPECT_TRUE(bounds["pose_topic"].is_null()) << path << ": " << bounds;
+    };
+    check_null(fifo);
+    check_null(link);
+    check_null(inc_cfg);
+    std::filesystem::remove_all(dir);
+  }
+
+  // 3. Single bounded `include` still resolves `[studio] pose_topic` from the
+  //    base file.
+  {
+    const std::string dir = Library() + "/pose_inc";
+    const std::string cfg = dir + "/robot.toml";
+    write_manifest_config(dir, cfg);
+    std::ofstream{dir + "/base.toml"}
+        << "[studio]\npose_topic = \"/base_odom/state\"\n";
+    std::ofstream{cfg} << "include = \"base.toml\"\n";
+    Review review{Library(), 1u << 20};
+    const Response resp = review.Get("/review/pose_inc/bounds.json", "");
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json bounds = json::parse(resp.body);
+    EXPECT_EQ(bounds["pose_topic"], "/base_odom/state");
+  }
 }
 
 }  // namespace
