@@ -95,10 +95,16 @@ class HardwareLink(_OnNode):
 
     def fresh(self, max_age=None) -> bool:
         """Whether state is younger than max_age (default command timeout)."""
-        if isinstance(max_age, timedelta):
-            max_age = max_age.total_seconds()
-        ns = -1 if max_age is None else round(max_age * 1e9)
-        return _abi.boolean(lib.talos_hardware_fresh(self._node, ns))
+        node = self._node
+        if max_age is None:
+            ns = -1
+        else:
+            if isinstance(max_age, timedelta):
+                max_age = max_age.total_seconds()
+            if max_age < 0:
+                return False
+            ns = round(max_age * 1e9)
+        return _abi.boolean(lib.talos_hardware_fresh(node, ns))
 
     @property
     def age(self) -> float:

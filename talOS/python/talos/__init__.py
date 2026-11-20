@@ -124,14 +124,14 @@ class Node:
 
     @property
     def simulation(self):
-        return bool(lib.talos_node_simulation(self._handle))
+        return _abi.boolean(lib.talos_node_simulation(self._handle))
 
     @property
     def describing(self):
         """True only while the node is built to answer --describe: skip
         building heavy native backends, but validate every parameter and
         declare the same endpoints as in a run."""
-        return bool(lib.talos_node_describing(self._handle))
+        return _abi.boolean(lib.talos_node_describing(self._handle))
 
     @property
     def now(self):
@@ -278,9 +278,16 @@ class Subscription(_OnNode):
 
     def fresh(self, max_age=None):
         """has_value and age < max_age (default [robot] command_timeout)."""
-        max_age_ns = -1 if max_age is None else round(max_age * _NS)
+        node = self._node
+        if max_age is None:
+            max_age_ns = -1
+        elif max_age < 0:
+            _ = self.has_value
+            return False
+        else:
+            max_age_ns = round(max_age * _NS)
         return _abi.boolean(lib.talos_subscription_fresh(
-            self._node, self._index, max_age_ns))
+            node, self._index, max_age_ns))
 
     @property
     def age(self):  # seconds since publication; inf before the first
