@@ -24,6 +24,57 @@ has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
 ## 2026-11-20
 
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `0cebbd0d`, no
+hardware attached, idle (load 1.2). Measurements for `TODO.md` `SCALE-1`,
+`RT-7`, `STUDIO-2`, `MAC-2`, and `INC-3`:
+
+- **SCALE-1: `wake_fanout_bench` at 32 armed readers on macOS.**
+  `bazel run -c opt //talOS/rtms:wake_fanout_bench` (2000 publications after
+  200 warm-up, `MAX_READERS` 32, segment version 9): 0 armed / 32 held:
+  0.00 us median, 1.00 us p99, 3.00 us max; 1 armed / 1 held: 2.00 us median,
+  5.00 us p99, 16.00 us max; 8 armed / 8 held: 16.00 us median, 30.00 us p99,
+  62.00 us max (2.00 us/armed); 8 armed / 32 held: 15.00 us median, 26.00 us
+  p99, 29.00 us max (1.88 us/armed); 32 armed / 32 held: 71.00 us median,
+  93.00 us p99, 97.00 us max (2.22 us/armed); `walk` 32/32: 0.00 us median,
+  1.00 us p99, 4.00 us max.
+- **RT-7: descriptor count on macOS enabled in simulation (`REQ-OPS-43`).**
+  Physics simulation (`robot_physics_sim.toml`, `--sim-gateway --physics`,
+  15 s teleop with stick demand, `ulimit -n` soft 256 / hard unlimited),
+  sampled mid-run via `lsof -a -p <pid> -d 0-9999`: `launcher` 36 open FDs,
+  `hardware_node` 9 (7 ipc/sock/kqueue), `swerve_module` 8 (6), `motor` 8 (6),
+  `gyro` 7 (5), `telemetry` 7 (5), `teleop` 7 (5), `sim_gateway` 6 (5).
+  `session_report --strict` passed all verdicts (first accepted State 4.16 ms,
+  0 enabled gaps >= 100 ms, worst target age 2.20 ms <= 25 ms,
+  `alert_warning_owner_timed_out` false across all 749 samples).
+- **STUDIO-2: real bench sessions reviewed on the Mac mini (`REQ-OPS-41`).**
+  `bazel run -c opt //studio/review:studio_review` against the 2026-11-17 bench
+  logs (`~/talos-bench/logs/U`, `V`, `W`):
+  - Session `U` (`7798953721310323380`, 300.0 s, 25 files, 182.8 MiB):
+    `bounds.json` (cold `Open()`) 392.0 ms, `channels.json` 0.4 ms (243
+    channels), `timeline.json` 0.3 ms (3 modes, 3 alerts, 6 runs),
+    `declared.json` 0.3 ms, `snapshot` 4.2 ms (19.3 KB), `series` (1 ch, 400
+    pts) 54.7 ms. Headless Google Chrome rendered `index.html` (`talOS ·
+    Telemetry Studio`, HTTP 200) against `127.0.0.1` serving `U`.
+  - Session `V` (`17289576640307273572`, 1094.6 s, 66 files, 580.1 MiB,
+    `log_capped`): `bounds.json` 1302.3 ms, `channels.json` 0.4 ms (243 ch),
+    `timeline.json` 0.2 ms (23 modes, 6 alerts, 7 runs), `snapshot` 11.8 ms,
+    `series` 164.2 ms.
+  - Session `W` (`1111857340715075397`, 1178.1 s, 68 files, 720.5 MiB,
+    `log_capped`): `bounds.json` 1626.7 ms, `channels.json` 0.4 ms (231 ch),
+    `timeline.json` 0.3 ms (1 mode, 2 alerts, 7 runs), `snapshot` 14.2 ms,
+    `series` 217.4 ms.
+- **MAC-2: fresh `bench_bundle` install and first-launch timing (`REQ-OPS-47`).**
+  Fresh `tools/deploy.sh install` of `//bench/main_processor:bench_bundle` into
+  a temporary prefix took 4.05 s (including warm-up); first
+  `run.sh --sim --describe-only` took 0.13 s (against the 15 s probe deadline);
+  first `run.sh --sim --duration-s 5` took 5.22 s total (0.22 s startup
+  overhead).
+- **INC-3: `restart_latency` baseline on Mac mini (`swerve_module`, physics sim).**
+  Idle (10 kills): SIGKILL to first `/hw/request/swerve_module` median 26.2 ms
+  (range 24.8–31.2 ms; Python `gyro`/`motor` warm spawn-to-origin 84.9–123.9 ms).
+  Under `--disk-load 8` (10 kills): median 10.6 ms (range 10.1–40.5 ms; Python
+  79.3–124.2 ms).
+
 Mac mini (M4 Pro, 12 cores, macOS arm64), commit `1e3bb1c8`, no hardware
 attached, idle. Verification of `TODO.md` STUDIO-1 macOS bridge listener and
 idle-timeout tests:
