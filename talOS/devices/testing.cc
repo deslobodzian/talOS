@@ -23,6 +23,7 @@
 #include "talOS/devices/access.h"
 #include "talOS/hardware/feedback.h"
 #include "talOS/hardware/gate.h"
+#include "talOS/hardware/gateway.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/names.h"
 #include "talOS/protocol/types.h"
@@ -598,6 +599,8 @@ struct SimHardware::Impl {
            return hardware::PwmSample{c.id, true,
                                       ValueOr(applied_pwm_outputs, c.id, 0.0)};
          });
+    // Where the gateway applies it: after Backend::Read, before its masks.
+    hardware::ReplaceNonFinite(state);
     MaskUnable(state);
     JudgeTotalLoss(state);
 

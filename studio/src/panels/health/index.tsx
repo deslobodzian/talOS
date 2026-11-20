@@ -8,14 +8,11 @@ import {useMemo} from 'react';
 import {usePlayback, useSnapshot, useSystem} from '../../data/hooks';
 import {liveNodeCount} from '../../data/freshness';
 import {usePanelNavigation} from '../../layout/navigation';
-import {
-  declaredStatus,
-  endpointAttributesKnown,
-  topicHealthOf,
-} from '../../system';
+import {declaredStatus, graphVersionMismatch, topicHealthOf} from '../../system';
 import {duration, integer, staleness} from '../../ui/formatters';
 import {EmptyState, Stat, StatList} from '../../ui/primitives';
 import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
+import {GraphVersionNotice} from '../system/GraphVersionNotice';
 import type {PanelDefinition} from '../types';
 import './health.css';
 
@@ -24,7 +21,9 @@ export type HealthConfig = Record<string, never>;
 const defaultConfig: HealthConfig = {};
 const parseConfig = (_raw: unknown): HealthConfig => ({});
 
-type Problem = {severity: 'warn'|'note'; text: string; panel: string};
+// `code` names a problem that is not about one node or topic, so its kind
+// stays legible apart from its words.
+type Problem = {severity: 'warn'|'note'; text: string; panel: string; code?: string};
 
 function HealthPanel() {
   const playback = usePlayback();
@@ -62,6 +61,19 @@ function HealthPanel() {
         panel: 'system'
       });
     const linted = new Set((declared?.diagnostics ?? []).map(d => d.subject));
+
+    // The bridge is sending, but in a graph version this page cannot read:
+    // not "nothing needs attention", and not a stale graph either.
+    const versions = graph ? null : graphVersionMismatch(system.error);
+    if (versions)
+      out.push({
+        severity: 'warn',
+        text: `the bridge sends system graph version ${versions.bridge}, ` +
+            `this page reads version ${versions.page}: which nodes are alive ` +
+            'is unknown',
+        panel: 'system',
+        code: 'graph-version-mismatch'
+      });
 
     if (graph) {
       const health = topicHealthOf(graph);
@@ -111,18 +123,9 @@ function HealthPanel() {
               integer(graph.bridge.ws_drops)} messages to slow clients`,
           panel: 'system'
         });
-      if (!endpointAttributesKnown(graph))
-        out.push({
-          severity: 'note',
-          text: `the bridge sends version ${
-              graph.version} system graphs, which carry no endpoint ` +
-              'attributes: a topic whose far end is outside talOS is listed ' +
-              'here as a fault',
-          panel: 'system'
-        });
     }
     return out;
-  }, [graph, graphStale, declared, status]);
+  }, [graph, graphStale, declared, status, system.error]);
 
   const s = snapshot;
   const channels = Object.keys(s?.channels ?? {}).length;
@@ -178,7 +181,8 @@ function HealthPanel() {
         <Stat label="Frames forwarded">
           {integer(graph.bridge.frames_forwarded)}
         </Stat>
-      </StatList> : <EmptyState>
+      </StatList> : graphVersionMismatch(system.error) ? <GraphVersionNotice/> :
+      <EmptyState>
         {system.error ? system.error :
                         'No system graph yet. Connect to a robot bridge, or start demo data to explore the viewer.'}
       </EmptyState>}
@@ -193,7 +197,7 @@ function HealthPanel() {
       </div>
       {problems.length ?
            <ul className="attention">{problems.map((problem, i) =>
-             <li key={i} className={problem.severity}>
+             <li key={i} className={problem.severity} data-code={problem.code}>
                <span>{problem.text}</span>
                <button className="link"
                        onClick={() => navigation.openPanel(problem.panel)}>

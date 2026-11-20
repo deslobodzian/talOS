@@ -128,7 +128,8 @@ A socket the bridge opens while the Mini routes `10.0.0.72` over Wi-Fi
 (it opens a new one after a send fails, as one may while the Ethernet cable
 is out) would send from `10.0.0.25`, which the RIO ignores, and keep that
 source after the cable returns: the motors would stay neutral until the
-bridge restarts. Turn the
+session is restarted (the bridge is alive, so nothing restarts it; seen on
+[2026-11-17](BENCH_RESULTS.md#2026-11-17), TODO.md RT-27). Turn the
 Mini's Wi-Fi off for an enabled session; `route -n get 10.0.0.72` must name
 `interface: en0`.
 

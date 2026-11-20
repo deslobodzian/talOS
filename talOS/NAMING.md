@@ -51,8 +51,11 @@ Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 `_out`, `_pub`, `_sub`, `_tx`, `_rx`, `_topic`, `_send`, `_recv`).
 
 The graph lint also rejects two writers on one topic, more than 32 declared
-readers per topic (including observers), a read topic nobody writes (unless an
-endpoint declares it `optional` or `external`), conflicting schemas, message
+readers per topic (including observers), a read topic nobody writes (naming
+each reader that requires it: among readers that are not observers, `optional`
+exempts only the reader that declares it; an observer's read never requires a
+writer when another end is `optional`; one end declaring the topic `external`,
+written outside the graph, exempts every reader), conflicting schemas, message
 sizes or ring layouts, a target lane whose source is in no mode of that
 subsystem's target policy, and an `hw` topic written by anything but the
 hardware bridge (the launcher's `hardware_node` roster entry, whatever binary
@@ -71,7 +74,7 @@ under `/hw/request`, remapped or not, at construction. A topic nobody reads
 `state`, `status`, `event` or `telemetry`, so a topic published for display
 is no finding, while a `target`, `request` or `command` that only telemetry
 records still is), a policy lane nobody writes yet, a topic whose owner is not a node in the
-session, an `optional` read of an owner-published topic that its owner, a node
+session, an owner-published topic every reader reads `optional` that its owner, a node
 in the session, does not publish (only the owner may, so the read is
 misspelled or the owner does not publish it in this configuration; the
 finding names the readers and the owner), a node whose hardware request carries `untargeted_outputs` without

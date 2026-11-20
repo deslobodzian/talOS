@@ -360,28 +360,57 @@ def state_to_request(states, records, spans):
 def driver_station_to_lane(packets, records, spans):
     """Per producer (a process publishing a target lane), each Driver
     Station packet's /hw/state/driver_station publication to that
-    producer's next lane publication at or after it, a release included.
-    It ends where target age at the tick begins. A sample whose span meets
-    a log gap of the producer's log, which could hide an earlier send, is
-    unmeasured and counted. Returns ({node: [ms]}, count)."""
+    producer's next lane publication at or after it, a release included,
+    taken only when that publication comes before the stream's next packet
+    (the last packet's window is open): the row is the reaction of a
+    producer that is publishing. A packet the producer did not answer in
+    its window gives no sample and is counted unanswered per producer,
+    apart by the packet's own enabled bit (ds_enabled, as the enabled rows
+    read it): "enabled" (a stall, or by design an operator producer not yet
+    armed or in a mode it does not serve) and "other" (disabled), with
+    their "total"; if any unanswered packet has no enabled bit (not
+    decoded), the split is not measured and both are null, as every row
+    that needs the bit is in such a session. So a producer silent while
+    disabled (teleop releases its lanes once and then publishes nothing) is
+    no sample spanning the silence, and one that stalls while enabled shows
+    in its own count. It ends where target age at the tick begins. A
+    sample, or an unanswered window, that meets a log gap of the producer's
+    log (which could hide a send) or of the packet stream's (which could
+    hide the next packet) is unmeasured and counted.
+    Returns ({node: [ms]}, {node: {"total", "enabled", "other"}}, unmeasured)."""
     sends = {}
     for r in records:
         if r["kind"] == "SEND" and is_target_lane(r["topic"]):
             sends.setdefault(r["process"], []).append(r["publish_ms"])
-    delays, unmeasured = {}, 0
+    packets = sorted(packets, key=lambda p: p["publish_ms"])
+    windows = [(p["publish_ms"], later["publish_ms"], p.get("ds_enabled"))
+               for p, later in zip(packets, packets[1:])]
+    if packets:
+        windows.append((packets[-1]["publish_ms"], math.inf,
+                        packets[-1].get("ds_enabled")))
+    stream_logs = {p["process"] for p in packets[:1]}
+    delays, unanswered, unmeasured = {}, {}, 0
     for node, times in sorted(sends.items()):
         times.sort()
         samples = delays.setdefault(node, [])
-        for packet in packets:
-            since = packet["publish_ms"]
+        counts = {True: 0, False: 0, None: 0}
+        logs = {node} | stream_logs
+        for since, until, enabled in windows:
             index = bisect.bisect_left(times, since)
-            if index == len(times):
-                continue
-            if across_gap(spans, {node}, since, times[index]):
+            answer = times[index] if index < len(times) else math.inf
+            if across_gap(spans, logs, since, min(answer, until)):
                 unmeasured += 1
+            elif answer < until:
+                samples.append(answer - since)
             else:
-                samples.append(times[index] - since)
-    return delays, unmeasured
+                counts[None if enabled is None else bool(enabled)] += 1
+        # A packet without its enabled bit (not decoded) leaves the split
+        # not measured: null, as every row that needs the bit is.
+        split = counts[None] == 0
+        unanswered[node] = {"total": sum(counts.values()),
+                            "enabled": counts[True] if split else None,
+                            "other": counts[False] if split else None}
+    return delays, unanswered, unmeasured
 
 
 def dispatches(records):
@@ -771,7 +800,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     # REQ-RT-25's rows; informational, no verdict (REQ-RT-26 is judged at
     # the bench).
     to_request, across_to_request = state_to_request(states, records, spans)
-    to_lane, across_to_lane = driver_station_to_lane(ds_packets, records, spans)
+    to_lane, unanswered, across_to_lane = driver_station_to_lane(ds_packets, records, spans)
     to_command, across_to_command = driver_station_to_command(ds, records, spans,
                                                               enabled_at, bridge)
     # The enabled-only rows above stay required (REQ-RT-15); in a session
@@ -841,6 +870,9 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             "feedback_age_us": feedback_age(states),
             "state_to_request_ms": {k: stats(v) for k, v in sorted(to_request.items())},
             "driver_station_to_lane_ms": {k: stats(v) for k, v in sorted(to_lane.items())},
+            # Per producer, the packets it did not answer before the next,
+            # by the packet's enabled bit.
+            "driver_station_to_lane_unanswered": unanswered,
             "driver_station_to_command_ms": stats(to_command),
             "clock_drift_ppm": clock_drift_ppm(status_records, spans),
             "never_enabled": never_enabled,
@@ -923,6 +955,14 @@ def latency_lines(report):
         if across.get(key):
             lines.append(f"{name[0].upper()}{name[1:]}: {across[key]} samples across a "
                          "log gap not measured.")
+    for node, count in report["driver_station_to_lane_unanswered"].items():
+        prefix = f"Driver station to lane {node}: packets not answered before the next packet: "
+        if count["enabled"] is None:
+            lines.append(f"{prefix}{count['total']}; split by enabled NOT MEASURED "
+                         "(packets not decoded).")
+        elif count["total"]:
+            lines.append(f"{prefix}{count['enabled']} while enabled, {count['other']} "
+                         "while disabled.")
     return lines
 
 

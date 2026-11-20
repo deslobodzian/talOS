@@ -23,8 +23,11 @@
 // to push it.
 namespace talos::rio {
 
-// The persisted configuration, or nullopt when the file is missing or fails
-// its CRC, decoding, ceilings or validation.
+// The persisted configuration, or nullopt when the file is missing, was
+// written under another protocol version or before the file carried one, or
+// fails its CRC, decoding, ceilings or validation (hardware::
+// LoadPersistedConfig). Such a file is never migrated: the RoboRIO boots
+// unconfigured and waits for the bridge's push.
 std::optional<hardware::Config> LoadConfigFile(const std::string& path);
 
 // Where the configuration is persisted. Save() writes durably and
@@ -36,12 +39,13 @@ class ConfigFile {
   // Builds every path a save needs, so Save() allocates nothing.
   explicit ConfigFile(std::string path);
 
-  // Writes `persisted` (hardware::PersistedConfig: the config wire bytes and
-  // their CRC32). Blocks on storage (two fsyncs): never call it from the loop
-  // thread; ConfigPersister runs it on a thread of its own. Off Windows it
-  // makes system calls only (open, write, fsync, close, rename, unlink) and
-  // allocates and frees nothing; desktop simulation on Windows, which has no
-  // fsync, writes through the standard library.
+  // Writes `persisted` (hardware::PersistedConfig: a magic and protocol
+  // version, the config wire bytes, then a CRC32 of all three). Blocks on
+  // storage (two fsyncs): never call it from the loop thread; ConfigPersister
+  // runs it on a thread of its own. Off Windows it makes system calls only
+  // (open, write, fsync, close, rename, unlink) and allocates and frees
+  // nothing; desktop simulation on Windows, which has no fsync, writes through
+  // the standard library.
   bool Save(std::span<const uint8_t> persisted) const;
 
  private:

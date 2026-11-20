@@ -10,8 +10,8 @@ import {
   declaredStatus,
   declaredUrl,
   drivenBy,
-  endpointAttributesKnown,
   eventRates,
+  GraphVersionMismatch,
   isSubscriber,
   MAX_DECLARED_BYTES,
   MAX_SYSTEM_BYTES,
@@ -246,21 +246,6 @@ test('an observed topic is read, as the launcher\'s lint counts it', () => {
         'unread', name);
   }
 });
-
-test('a graph too old to carry endpoint attributes is read, and marked as such',
-     () => {
-       // The version is how a reader knows whether "not external" was stated or
-       // merely unavailable. Both documents parse -- refusing the older one
-       // would blank a working view -- so the difference has to be legible.
-       assert.equal(endpointAttributesKnown(parse()), false);
-       assert.equal(
-           endpointAttributesKnown(parse({version: SYSTEM_GRAPH_VERSION})), true);
-       assert.equal(endpointAttributesKnown(parse({version: 99})), true);
-       // The demo states them on every end, so it must claim the version that
-       // says so.
-       assert.equal(
-           endpointAttributesKnown(parseSystemGraph(demoSystemGraph())), true);
-     });
 
 test('a declared endpoint attribute is not a fault, and says which it is', () => {
   const row = healthRow;
@@ -769,4 +754,36 @@ test('graph updates and deferral notices keep a held graph current and fresh', (
                 /do not match/);
   assert.equal(stream.arrival, 2000);
   assert.deepEqual(stream.ingest(update, 3200), parseSystemGraph(later));
+});
+
+// REQ-OPS-23: "stale" means the graph stopped arriving. A page and a bridge of
+// different builds may disagree on the update's value list, which the page
+// walks by position, so the page cannot read either a graph or an update of a
+// version not its own. It names that (what the bridge sends against what the
+// page reads), in both directions, and holds no graph whose liveness it could
+// show; it does not accept the graph and then refuse every update until the
+// graph ages to stale (seen on the bench with a page of an older build).
+test('a graph of another version is named as a mismatch, never read', () => {
+  const golden = JSON.parse(bridgeGolden('graph.json')) as Json;
+  const update = bridgeGolden('update.json');
+  const {structure} = JSON.parse(update) as {structure: string};
+  // The bridge and this page are one build, so they speak one version.
+  assert.equal(golden.version, SYSTEM_GRAPH_VERSION);
+
+  for (const version of [SYSTEM_GRAPH_VERSION + 1, SYSTEM_GRAPH_VERSION - 1]) {
+    const stream = new SystemGraphStream();
+    const named = (e: unknown) => e instanceof GraphVersionMismatch &&
+        e.bridge === version && e.page === SYSTEM_GRAPH_VERSION;
+    assert.throws(() => stream.ingest(JSON.stringify({...golden, version}), 0),
+                  named);
+    // Its updates and deferral notices keep naming the mismatch rather than
+    // "a structure not held", and none of them is taken as the graph arriving.
+    assert.throws(() => stream.ingest(update, 500), named);
+    assert.throws(() => stream.ingest(JSON.stringify(
+        {kind: 'talos.system_graph.deferred', structure}), 1000), named);
+    assert.equal(stream.arrival, null);
+    // A graph this page reads ends it.
+    assert.ok(stream.ingest(bridgeGolden('graph.json'), 1500));
+    assert.ok(stream.ingest(update, 2000));
+  }
 });

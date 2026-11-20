@@ -736,6 +736,38 @@ TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
   expect_outputs(true);
 }
 
+// REQ-SAFE-22: as on the gateway (hardware::ReplaceNonFinite), a motor whose
+// position is not finite reads invalid, and only that motor: the State still
+// decodes, the other motor keeps its values (a non-finite temperature reads
+// 0) and the node stays enabled, where one NaN on the wire would read as a
+// lost link.
+TEST(SimHardwareNonFinite, ANonFinitePositionInvalidatesOnlyThatMotor) {
+  struct Mech {
+    explicit Mech(Node& n)
+        : node{n}, braked{n, "braked"}, coasting{n, "coasting"} {}
+    void update() { enabled = robot_enabled(node); }
+    Node& node;
+    Motor braked, coasting;
+    bool enabled = false;
+  };
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(20ms);
+  ASSERT_TRUE(mech.enabled);
+  hw.set_motor("mech", "braked", kNaN, 2.0);
+  hw.set_motor("mech", "coasting", 1.5, -0.5, 0, 0, kNaN);
+  sim.step(100ms);  // twice command_timeout_us
+  EXPECT_TRUE(mech.enabled);
+  EXPECT_FALSE(mech.braked.connected());
+  EXPECT_TRUE(mech.coasting.connected());
+  EXPECT_EQ(mech.coasting.position(), 1.5);
+  EXPECT_EQ(mech.coasting.velocity(), -0.5);
+  EXPECT_EQ(mech.coasting.temperature_c(), 0.0);
+}
+
 // A simulated robot has no CAN bus to read: SimHardware's /hw/status lists
 // every bus the config names, "rio" first, as SIMULATED, never as a failing
 // bus or an idle one, so no test under Sim raises
