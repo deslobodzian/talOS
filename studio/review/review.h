@@ -15,16 +15,18 @@
 //       channel's level, studio::AlertLevelName; stream_id "0")
 //   GET /review/<id>/bounds.json
 //       {"start_ns","end_ns","origin_wall_ns","max_series_values",
-//        "max_series_channels","hardware_not_decoded","gaps"}: the two max_
-//       ones, plain numbers, are kMaxSeriesValues and kMaxSeriesChannels,
-//       which a client splits its series requests by; hardware_not_decoded
-//       is null, or log_dump's line for a session whose hardware packets
-//       are not served (Session::hardware_not_decoded); gaps, always
-//       present, lists every GAP record (Session::gaps, in its order) as
-//       {"process","start_ns","end_ns","records","dispatches","sends",
+//        "max_series_channels","hardware_not_decoded","gaps","pose_topic"}:
+//       the two max_ ones, plain numbers, are kMaxSeriesValues and
+//       kMaxSeriesChannels, which a client splits its series requests by;
+//       hardware_not_decoded is null, or log_dump's line for a session whose
+//       hardware packets are not served (Session::hardware_not_decoded); gaps,
+//       always present, lists every GAP record (Session::gaps, in its order)
+//       as {"process","start_ns","end_ns","records","dispatches","sends",
 //       "closed_at_flush"}: records, dispatches and sends plain numbers,
 //       closed_at_flush true for a gap the writer's stop closed; the
-//       session's start_ns..end_ns covers every gap's span
+//       session's start_ns..end_ns covers every gap's span; pose_topic is
+//       `[studio] pose_topic` from the session's config or null when unset or
+//       unreadable
 //       wall time of a session time t_ns is origin_wall_ns + t_ns
 //   GET /review/<id>/timeline.json
 //       {"hardware_not_decoded","modes","modes_dropped","alerts",
@@ -33,8 +35,10 @@
 //       Driver Station mode transitions as {"start_ns","end_ns","mode","fms"}
 //       where mode is disabled, teleop, auto, test or estop; alerts lists
 //       intervals of every ChannelInfo.alert != None channel as
-//       {"channel","level","start_ns","end_ns"} (first true publish_ns to
-//       first false publish_ns or session end_ns); runs lists manifest.json's
+//       {"channel","level","start_ns","end_ns","active_at_end"} (first true
+//       publish_ns to first false publish_ns or session end_ns; active_at_end
+//       is true only when still active at session end, false when cleared even
+//       on exact end_ns); runs lists manifest.json's
 //       nodes[].runs[] mapped via origin_wall_ns as
 //       {"node","start_ns","end_ns","reason"} (end_ns is null when
 //       end_wall_ns == 0). Each list is bounded per open session

@@ -27,7 +27,7 @@ import {
   type AlertLatch,
   type LatchedAlert
 } from './alerts';
-import {discoverEstimate, type EstimateChannels} from './discovery';
+import {discoverEstimate} from './discovery';
 import {
   decodeSeries,
   errorMessage,
@@ -41,7 +41,10 @@ import {
   parseSnapshot,
   reviewUrl,
   type FetchLike,
+  type ReviewAlertInterval,
   type ReviewBounds,
+  type ReviewGap,
+  type ReviewRunInterval,
   type ReviewSnapshot,
   type ReviewTimeline,
   type SeriesBuckets,
@@ -133,6 +136,39 @@ export type RecordedOptions = {fetch?: FetchLike; clock?: ReviewClock};
 
 const defaultFetch: FetchLike = (url, init) => fetch(url, init);
 
+type PoseChannels = {x: string; y: string; yaw: string; valid: string};
+
+// Resolves chassis pose channels, preferring `[studio] pose_topic` from the
+// session's config (bounds.pose_topic) over estimator discovery so recorded
+// sessions match live telemetry's SetupPoseExtraction.
+function resolvePoseChannels(channels: ChannelInfo[],
+                             poseTopic?: string): PoseChannels|null {
+  if (poseTopic) {
+    const names = new Set(channels.map(c => c.name));
+    const base = poseTopic.replace(/^\/+/, '');
+    if (base) {
+      const prefix = `${base}/`;
+      const valid = `${prefix}valid`;
+      const preferred = `${prefix}pose/x_m`;
+      const candidates = names.has(preferred) ?
+          [preferred] :
+          channels.filter(c => c.name.startsWith(prefix) && c.name.endsWith('/x_m'))
+              .map(c => c.name);
+      for (const x of candidates) {
+        const stem = x.slice(0, -'x_m'.length);
+        const y = `${stem}y_m`, yaw = `${stem}yaw_rad`;
+        if (names.has(y) && names.has(yaw)) return {x, y, yaw, valid};
+      }
+    }
+  }
+  const est = discoverEstimate(channels);
+  if (!est) return null;
+  return {
+    x: est.x, y: est.y, yaw: est.yaw,
+    valid: est.x.replace(/pose\/x_m$/, 'valid')
+  };
+}
+
 export class RecordedSource implements DataSource {
   readonly kind = 'recorded';
   version = 0;
@@ -142,7 +178,7 @@ export class RecordedSource implements DataSource {
 
   private readonly listeners = new Set<() => void>();
   private readonly infos: Map<string, ChannelInfo>;
-  private readonly estimate: EstimateChannels|null;
+  private readonly poseChannels: PoseChannels|null;
   private readonly fetchFn: FetchLike;
   private readonly clock: ReviewClock;
   private readonly start: bigint;
@@ -191,7 +227,7 @@ export class RecordedSource implements DataSource {
               readonly timeline: ReviewTimeline = EMPTY_TIMELINE,
               readonly declared: DeclaredGraph|null = null) {
     this.infos = new Map(channels.map(c => [c.name, c]));
-    this.estimate = discoverEstimate(channels);
+    this.poseChannels = resolvePoseChannels(channels, bounds.pose_topic);
     this.fetchFn = fetchFn;
     this.clock = clock;
     this.start = BigInt(bounds.start_ns);
@@ -392,16 +428,16 @@ export class RecordedSource implements DataSource {
     this.changed();
   }
 
-  // The estimator's pose (geometry.PoseEstimate: pose, valid), with its own
-  // sample time. Invalid or non-finite is no pose, as telemetry's chassis.
+  // The configured `[studio] pose_topic` (else discovered estimator) pose,
+  // with its own sample time. Invalid or non-finite is no pose, as live.
   private readChassis(): {pose: Pose; sample_ns: string}|null {
-    const est = this.estimate;
-    if (!est) return null;
-    const x = this.samples.get(est.x), y = this.samples.get(est.y),
-          yaw = this.samples.get(est.yaw);
+    const pose = this.poseChannels;
+    if (!pose) return null;
+    const x = this.samples.get(pose.x), y = this.samples.get(pose.y),
+          yaw = this.samples.get(pose.yaw);
     if (!x || !y || !yaw) return null;
     if (![x.value, y.value, yaw.value].every(Number.isFinite)) return null;
-    const valid = this.samples.get(est.x.replace(/pose\/x_m$/, 'valid'));
+    const valid = this.samples.get(pose.valid);
     if (valid && valid.value !== 1) return null;
     const oldest = [x, y, yaw].map(s => BigInt(s.timestamp_ns))
                        .reduce((a, b) => a < b ? a : b);
@@ -546,7 +582,8 @@ export class RecordedSource implements DataSource {
     }
     const buckets = mergeParts(parts, channels.length, perRequest);
     return buckets ?
-        bucketSeries(channels, buckets, this.bounds.start_ns, plan.from, plan.to) :
+        bucketSeries(channels, buckets, this.bounds.start_ns, plan.from, plan.to,
+                     this.bounds.gaps, this.timeline.runs) :
         emptySeries(this.bounds.start_ns, channels);
   }
 
@@ -616,23 +653,154 @@ function emptySeries(t0_ns: string, channels: string[]): Series {
   return {t0_ns, times: new Float64Array(0), values};
 }
 
+type BreakSpan = {
+  process: string;
+  start: number;
+  end: number;
+  kind: 'gap' | 'run_gap' | 'run_restart' | 'run_exit';
+};
+
+function buildBreakSpans(gaps: readonly ReviewGap[],
+                         runs: readonly ReviewRunInterval[],
+                         lo: number, hi: number): BreakSpan[] {
+  const spans: BreakSpan[] = [];
+  for (const g of gaps) {
+    const start = Number(BigInt(g.start_ns));
+    const end = Number(BigInt(g.end_ns));
+    if (end >= lo && start <= hi) spans.push({process: g.process, start, end, kind: 'gap'});
+  }
+  const byNode = new Map<string, ReviewRunInterval[]>();
+  for (const run of runs) {
+    let list = byNode.get(run.node);
+    if (!list) {
+      list = [];
+      byNode.set(run.node, list);
+    }
+    list.push(run);
+  }
+  for (const [node, list] of byNode) {
+    const sorted = list.length > 1 ?
+        [...list].sort((a, b) => {
+          const dt = BigInt(a.start_ns) - BigInt(b.start_ns);
+          return dt < 0n ? -1 : dt > 0n ? 1 : 0;
+        }) :
+        list;
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1], curr = sorted[i];
+      const restart = Number(BigInt(curr.start_ns));
+      if (prev.end_ns !== null) {
+        const prevEnd = Number(BigInt(prev.end_ns));
+        if (prevEnd <= restart) {
+          if (restart >= lo && prevEnd <= hi)
+            spans.push({process: node, start: prevEnd, end: restart, kind: 'run_gap'});
+          continue;
+        }
+      }
+      if (restart >= lo && restart <= hi)
+        spans.push({process: node, start: restart, end: restart, kind: 'run_restart'});
+    }
+    const last = sorted[sorted.length - 1];
+    if (last.end_ns !== null) {
+      const exitAt = Number(BigInt(last.end_ns));
+      if (exitAt >= lo && exitAt <= hi)
+        spans.push({process: node, start: exitAt, end: exitAt, kind: 'run_exit'});
+    }
+  }
+  return spans;
+}
+
+function channelAffectedByBreak(channel: string, span: BreakSpan): boolean {
+  if (!span.process) return true;
+  const slash = channel.indexOf('/');
+  if (slash <= 0) return true;
+  const owner = channel.slice(0, slash);
+  if (owner === span.process) return true;
+  if (owner === 'hw') {
+    if (channel.startsWith('hw/request/')) {
+      const rest = channel.slice('hw/request/'.length);
+      const next = rest.indexOf('/');
+      const reqOwner = next === -1 ? rest : rest.slice(0, next);
+      return reqOwner === span.process;
+    }
+    if (span.process === 'hardware_node' || span.process === 'bridge') return true;
+    // A session without a bridge log may read /hw/state/driver_station from a
+    // reader process; straddling the gap interval still avoids false breaks.
+    return span.kind === 'gap';
+  }
+  return false;
+}
+
+// Finds the break timestamp strictly between two consecutive points of `pts`
+// separated by `span`, or null when no consecutive pair straddles `span`.
+function findBreakBetween(pts: readonly number[], span: BreakSpan): number|null {
+  if (pts.length < 2) return null;
+  // Binary search for the largest index k with pts[k] <= span.start
+  // (or pts[k] < span.start for run_restart).
+  let lo = 0, hi = pts.length - 1, k = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const ok = span.kind === 'run_restart' ? pts[mid] < span.start : pts[mid] <= span.start;
+    if (ok) {
+      k = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (k < 0 || k + 1 >= pts.length) return null;
+  const a = pts[k], b = pts[k + 1];
+  const matches =
+      span.kind === 'run_exit' ? (a <= span.end && span.end < b) :
+      span.kind === 'run_restart' ? (a < span.start && span.start <= b) :
+      (a <= span.start && span.end <= b && a < b);
+  if (!matches) return null;
+  let tBreak = (span.start + span.end) / 2;
+  if (!(tBreak > a && tBreak < b)) tBreak = (a + b) / 2;
+  return (tBreak > a && tBreak < b) ? tBreak : null;
+}
+
 // Buckets as a Series. Each channel's point for a bucket sits at its own
 // t_ns, its last sample's publication time: channels of one request share
 // bucket edges, not times. The rows are every distinct point time in
 // [from, to], ascending; a channel is NaN (count 0) in a row that is not one
-// of its points, which the plot draws through, and has no row for an empty
-// bucket.
+// of its points, which the plot draws through (plotColumn -> undefined), and
+// has no row for an empty bucket. Explicit gap-break rows (NaN with count 1,
+// which plotColumn maps to null to break the uPlot line) are inserted ONLY at
+// real `bounds.gaps` and `timeline.runs` restart/exit boundaries — never on a
+// fixed time threshold.
 export function bucketSeries(channels: string[], buckets: SeriesBuckets, t0_ns: string,
-                             from: bigint, to: bigint): Series {
+                             from: bigint, to: bigint,
+                             gaps: readonly ReviewGap[] = [],
+                             runs: readonly ReviewRunInterval[] = []): Series {
   const lo = Number(from), hi = Number(to);
   const times = new Set<number>();
-  channels.forEach((_, c) => {
+  const channelPoints: number[][] = channels.map((_, c) => {
     const column = buckets.channels[c];
+    const pts = new Set<number>();
     for (let i = 0; i < buckets.buckets; i++) {
       const t = column.t_ns[i];
-      if (column.count[i] > 0 && Number.isFinite(t) && t >= lo && t <= hi) times.add(t);
+      if (column.count[i] > 0 && Number.isFinite(t) && t >= lo && t <= hi) {
+        times.add(t);
+        pts.add(t);
+      }
     }
+    return [...pts].sort((a, b) => a - b);
   });
+  const breakSpans = (gaps.length || runs.length) ? buildBreakSpans(gaps, runs, lo, hi) : [];
+  const channelBreaks: number[][] = channels.map(() => []);
+  if (breakSpans.length) {
+    for (let c = 0; c < channels.length; c++) {
+      const pts = channelPoints[c];
+      if (pts.length < 2) continue;
+      for (const span of breakSpans) {
+        if (!channelAffectedByBreak(channels[c], span)) continue;
+        const tBreak = findBreakBetween(pts, span);
+        if (tBreak === null) continue;
+        times.add(tBreak);
+        channelBreaks[c].push(tBreak);
+      }
+    }
+  }
   const rowTimes = [...times].sort((a, b) => a - b);
   const rowOf = new Map(rowTimes.map((t, row) => [t, row]));
   const t0 = Number(t0_ns);
@@ -653,6 +821,10 @@ export function bucketSeries(channels: string[], buckets: SeriesBuckets, t0_ns: 
       min[name][row] = column.min[i];
       max[name][row] = column.max[i];
       count[name][row] = column.count[i];
+    }
+    for (const tBreak of channelBreaks[c]) {
+      const row = rowOf.get(tBreak);
+      if (row !== undefined && count[name][row] === 0) count[name][row] = 1;
     }
   });
   return {t0_ns, times: Float64Array.from(rowTimes, t => (t - t0) / 1e9),
@@ -740,6 +912,9 @@ export function timelineModeBands(timeline: ReviewTimeline): ModeBand[] {
   }));
 }
 
+const alertActiveAtEnd = (a: ReviewAlertInterval, sessionEnd: bigint): boolean =>
+    a.active_at_end !== undefined ? a.active_at_end : BigInt(a.end_ns) >= sessionEnd;
+
 export function timelineEvents(bounds: ReviewBounds, timeline: ReviewTimeline): RobotEvent[] {
   const out: RobotEvent[] = [];
   let seq = 0;
@@ -793,7 +968,7 @@ export function timelineEvents(bounds: ReviewBounds, timeline: ReviewTimeline): 
     const category = alertCategory(a.channel);
     add('alert-on', a.start_ns, ALERT_TO_SEVERITY[a.level], category, label,
         `alert raised (${a.level})`, a.channel);
-    if (BigInt(a.end_ns) < sessionEnd) {
+    if (!alertActiveAtEnd(a, sessionEnd)) {
       const seconds = (Number(BigInt(a.end_ns) - BigInt(a.start_ns)) / 1e9).toFixed(3);
       add('alert-off', a.end_ns, 'info', category, `${label} cleared`,
           `active ${seconds} s`, a.channel);
@@ -844,8 +1019,7 @@ export function timelineAlertLatch(bounds: ReviewBounds, timeline: ReviewTimelin
     const end = BigInt(a.end_ns);
     const activeAtPlayhead =
         (start <= playhead && playhead < end) ||
-        (end >= sessionEnd && start <= playhead && playhead <= end) ||
-        (start === end && playhead === start);
+        (alertActiveAtEnd(a, sessionEnd) && start <= playhead && playhead <= end);
     const level = TIMELINE_TO_ALERT_LEVEL[a.level];
     const existing = byChannel.get(a.channel);
     if (existing) {

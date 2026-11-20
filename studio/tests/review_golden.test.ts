@@ -62,6 +62,7 @@ test('sessions, channels and bounds decode to the fixture session', () => {
   // The fixture is recorded under this build's hardware protocol (REQ-OPS-51):
   // its null reason leaves no notice.
   assert.equal(bounds.hardware_not_decoded, undefined);
+  assert.equal(bounds.pose_topic, undefined);
 });
 
 test('a snapshot keeps NaN, an integer past 2^53 exactly, and each sample time', () => {
@@ -127,7 +128,8 @@ test('timeline.json and declared.json decode to the fixture session', () => {
     channel: 'observer/status/alert_error_link_lost',
     level: 'error',
     start_ns: (START_NS + 2_001_000_000n).toString(),
-    end_ns: (START_NS + 4_001_000_000n).toString()
+    end_ns: (START_NS + 4_001_000_000n).toString(),
+    active_at_end: false
   }]);
   assert.deepEqual(timeline.runs, [
     {

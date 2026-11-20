@@ -173,7 +173,26 @@ struct ChannelRef {
 struct AlertInterval {
   std::int64_t start_ns{0};
   std::int64_t end_ns{0};
-  ChannelRef channel;
+  std::uint32_t topic{0};
+  // Low 31 bits: channel index within topic; high bit: active_at_end (true
+  // when still active at session end, false when cleared by a false sample,
+  // even on exact end_ns).
+  std::uint32_t channel_and_active{0};
+
+  static constexpr std::uint32_t kActiveAtEndMask = std::uint32_t{1} << 31;
+
+  static AlertInterval Make(std::int64_t start_ns, std::int64_t end_ns,
+                            ChannelRef ref, bool active_at_end) noexcept {
+    return {start_ns, end_ns, ref.topic,
+            (ref.channel & ~kActiveAtEndMask) |
+                (active_at_end ? kActiveAtEndMask : 0u)};
+  }
+  ChannelRef channel() const noexcept {
+    return {topic, channel_and_active & ~kActiveAtEndMask};
+  }
+  bool active_at_end() const noexcept {
+    return (channel_and_active & kActiveAtEndMask) != 0;
+  }
 };
 static_assert(sizeof(AlertInterval) == 24,
               "REQ-OPS-42: 24 B per timeline alert interval");
@@ -253,6 +272,9 @@ class Session {
   const std::string& hardware_not_decoded() const {
     return hardware_not_decoded_;
   }
+  // `[studio] pose_topic` from the session's robot config (manifest.json
+  // config_path), or empty when unset or unreadable.
+  const std::string& pose_topic() const { return pose_topic_; }
 
   // Timeline summary derived during Open() (REQ-OPS-41, REQ-OPS-42):
   // Driver Station mode transitions (empty when hardware_not_decoded() is
@@ -306,6 +328,7 @@ class Session {
   std::int64_t end_ns_{0};
   std::int64_t origin_wall_ns_{0};
   std::string hardware_not_decoded_;
+  std::string pose_topic_;
   std::vector<ModeInterval> modes_;
   std::uint64_t modes_dropped_{0};
   std::vector<AlertInterval> alerts_;

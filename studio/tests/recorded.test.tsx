@@ -43,6 +43,7 @@ import type {ChannelInfo} from '../src/data/types';
 import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
 import {eventsPanel} from '../src/panels/events';
 import {healthPanel} from '../src/panels/health';
+import {plotColumn} from '../src/panels/plot';
 import {Header} from '../src/shell/Header';
 import {RecordedTransport} from '../src/shell/RecordedTransport';
 import {ReviewPicker} from '../src/shell/ReviewPicker';
@@ -874,4 +875,187 @@ test('RecordedTransport renders timeline lanes for modes, alerts, restarts and g
   assert.match(undecodedHtml, /class="scrub-mode undecoded"/);
   assert.doesNotMatch(undecodedHtml, /class="scrub-mode disabled"/);
   undecoded.close();
+});
+
+// REQ-OPS-37, REQ-OPS-41: an alert that genuinely cleared on exact
+// bounds.end_ns (active_at_end === false) emits a cleared event and reads
+// active: false at playhead === bounds.end_ns, whereas active_at_end === true
+// stays active without a false cleared event.
+test('alert clearing on exact bounds.end_ns is not active at end', () => {
+  const server = fakeServer(echoSnapshot);
+  const timeline: ReviewTimeline = parseTimeline({
+    ...EMPTY_TIMELINE,
+    alerts: [
+      {
+        channel: 'hw/status/alert_error_link_lost',
+        level: 'error',
+        start_ns: (START + 2_000_000_000n).toString(),
+        end_ns: END.toString(),
+        active_at_end: false
+      },
+      {
+        channel: 'shooter/status/alert_warning_temp_high',
+        level: 'warning',
+        start_ns: (START + 3_000_000_000n).toString(),
+        end_ns: END.toString(),
+        active_at_end: true
+      }
+    ]
+  });
+  const rec = new RecordedSource(SERVER, 's1', [], BOUNDS, server.fetchFn,
+                                 fakeClock().clock, timeline, null);
+  const titles = rec.events().map(e => e.title);
+  assert.ok(titles.includes('hw: link lost cleared'), titles.join(', '));
+  assert.ok(!titles.includes('shooter: temp high cleared'), titles.join(', '));
+
+  // Just before END both alerts are active; at exact END only the held one is.
+  rec.seek((END - 1n).toString());
+  const beforeEnd = new Map(rec.alertLatch().alerts.map(a => [a.channel, a.active]));
+  assert.equal(beforeEnd.get('hw/status/alert_error_link_lost'), true);
+  assert.equal(beforeEnd.get('shooter/status/alert_warning_temp_high'), true);
+
+  rec.seek(END.toString());
+  const atEnd = new Map(rec.alertLatch().alerts.map(a => [a.channel, a.active]));
+  assert.equal(atEnd.get('hw/status/alert_error_link_lost'), false);
+  assert.equal(atEnd.get('shooter/status/alert_warning_temp_high'), true);
+  rec.close();
+
+  assert.throws(() => parseTimeline({
+    ...EMPTY_TIMELINE,
+    alerts: [{channel: 'a', level: 'error', start_ns: '1', end_ns: '2', active_at_end: 'no'}]
+  }), ReviewError);
+});
+
+// REQ-OPS-41, REQ-OPS-23: RecordedSource honors bounds.pose_topic ([studio]
+// pose_topic) over discoverEstimate when present, including custom Pose2d field
+// names and valid gating, and falls back to discoverEstimate when absent.
+test('RecordedSource prefers bounds.pose_topic over discoverEstimate', async () => {
+  const channels = [
+    'pose_estimator/state/pose/x_m',
+    'pose_estimator/state/pose/y_m',
+    'pose_estimator/state/pose/yaw_rad',
+    'pose_estimator/state/valid',
+    'pose_estimator/state/observation_accepted_count',
+    'alt_odom/state/robot_pose/x_m',
+    'alt_odom/state/robot_pose/y_m',
+    'alt_odom/state/robot_pose/yaw_rad',
+    'alt_odom/state/valid'
+  ].map(info);
+  const at = START + 2_000_000_000n;
+  let altValid = 1;
+  const server = fakeServer(url => {
+    if (!url.pathname.endsWith('/snapshot')) return undefined;
+    const s = (value: number) => ({value, sample_ns: at.toString()});
+    return json({t_ns: at.toString(), channels: {
+      'pose_estimator/state/pose/x_m': s(1),
+      'pose_estimator/state/pose/y_m': s(2),
+      'pose_estimator/state/pose/yaw_rad': s(0.5),
+      'pose_estimator/state/valid': s(1),
+      'alt_odom/state/robot_pose/x_m': s(7),
+      'alt_odom/state/robot_pose/y_m': s(8),
+      'alt_odom/state/robot_pose/yaw_rad': s(1.5),
+      'alt_odom/state/valid': s(altValid)
+    }});
+  });
+
+  const configuredBounds = parseBounds({...BOUNDS, pose_topic: '/alt_odom/state'});
+  assert.equal(configuredBounds.pose_topic, '/alt_odom/state');
+  assert.equal(parseBounds({...BOUNDS, pose_topic: null}).pose_topic, undefined);
+  assert.throws(() => parseBounds({...BOUNDS, pose_topic: 42}), ReviewError);
+
+  const configured = new RecordedSource(SERVER, 's1', channels, configuredBounds,
+                                        server.fetchFn, fakeClock().clock);
+  configured.seek(at.toString());
+  await settle();
+  assert.equal(configured.chassis()?.pose.x, 7);
+  assert.equal(configured.chassis()?.pose.y, 8);
+  assert.equal(configured.chassis()?.pose.yaw, 1.5);
+  configured.close();
+
+  // valid === 0 on the configured pose_topic suppresses the pose.
+  altValid = 0;
+  const invalidPose = new RecordedSource(SERVER, 's1', channels, configuredBounds,
+                                         server.fetchFn, fakeClock().clock);
+  invalidPose.seek(at.toString());
+  await settle();
+  assert.equal(invalidPose.chassis(), null);
+  invalidPose.close();
+
+  // Without pose_topic (or when pose_topic names an absent topic), falls back
+  // to discoverEstimate.
+  const fallback = new RecordedSource(SERVER, 's1', channels, BOUNDS,
+                                      server.fetchFn, fakeClock().clock);
+  fallback.seek(at.toString());
+  await settle();
+  assert.equal(fallback.chassis()?.pose.x, 1);
+  assert.equal(fallback.chassis()?.pose.y, 2);
+  fallback.close();
+});
+
+// REQ-OPS-23, REQ-OPS-41: bucketSeries inserts explicit NaN (count = 1 ->
+// plotColumn maps to null) break rows ONLY at bounds.gaps and timeline.runs
+// restart/exit boundaries, never on a fixed time threshold, while normal sparse
+// multi-channel buckets keep count = 0 (undefined) and draw smoothly.
+test('bucketSeries inserts uPlot gap breaks only at real gaps and run restarts', async () => {
+  // 1. Sparse multi-channel buckets 8 s apart with NO gaps/runs: NO break rows,
+  //    alignment placeholders keep count = 0 (plotColumn -> undefined).
+  const sparse = decodeSeries(seriesBuffer([
+    {t: [1e9, 9e9], min: [10, 20], max: [10, 20], last: [10, 20], count: [1, 1]},
+    {t: [1e9, 5e9], min: [1, 2], max: [1, 2], last: [1, 2], count: [1, 1]}
+  ]), 2);
+  const noBreaks = bucketSeries(['shooter/state/position_m', 'observer/status/ready'],
+                                sparse, '0', 0n, 10_000_000_000n, [], []);
+  assert.deepEqual([...noBreaks.times], [1, 5, 9]);
+  assert.deepEqual(plotColumn(noBreaks.values['shooter/state/position_m'],
+                              noBreaks.count!['shooter/state/position_m']),
+                   [10, undefined, 20]);
+  assert.deepEqual(plotColumn(noBreaks.values['observer/status/ready'],
+                              noBreaks.count!['observer/status/ready']),
+                   [1, 2, undefined]);
+
+  // 2. Log gap in shooter [3s, 4s] + shooter crash/restart [6s, 7s]: shooter
+  //    gets explicit NaN with count = 1 (plotColumn -> null) at both boundaries,
+  //    while observer (no gap/restart) draws smoothly through both rows.
+  const gappedBuckets = decodeSeries(seriesBuffer([
+    {t: [2e9, NaN, 5e9, 8e9], min: [1, NaN, 2, 3], max: [1, NaN, 2, 3],
+     last: [1, NaN, 2, 3], count: [1, 0, 1, 1]},
+    {t: [2e9, 3.5e9, 5e9, 8e9], min: [9, 8, 7, 6], max: [9, 8, 7, 6],
+     last: [9, 8, 7, 6], count: [1, 1, 1, 1]}
+  ]), 2);
+  // Note: observer has a real sample at 3.5 s (the exact midpoint of shooter's
+  // [3s, 4s] gap) — that real sample must be preserved while shooter breaks!
+  const gaps: ReviewGap[] = [
+    gap({process: 'shooter', start_ns: '3000000000', end_ns: '4000000000'})
+  ];
+  const runs = [
+    {node: 'observer', start_ns: '0', end_ns: '10000000000', reason: 'stop'},
+    {node: 'shooter', start_ns: '0', end_ns: '6000000000', reason: 'crash'},
+    {node: 'shooter', start_ns: '7000000000', end_ns: '10000000000', reason: 'stop'}
+  ];
+  const broken = bucketSeries(['shooter/state/position_m', 'observer/status/ready'],
+                              gappedBuckets, '0', 0n, 10_000_000_000n, gaps, runs);
+  assert.deepEqual([...broken.times], [2, 3.5, 5, 6.5, 8]);
+  assert.deepEqual([...broken.count!['shooter/state/position_m']], [1, 1, 1, 1, 1]);
+  assert.deepEqual(plotColumn(broken.values['shooter/state/position_m'],
+                              broken.count!['shooter/state/position_m']),
+                   [1, null, 2, null, 3]);
+  assert.deepEqual(plotColumn(broken.values['observer/status/ready'],
+                              broken.count!['observer/status/ready']),
+                   [9, 8, 7, undefined, 6]);
+
+  // 3. RecordedSource.series() wires bounds.gaps and timeline.runs end-to-end.
+  const t = [Number(START + 2_000_000_000n), Number(START + 8_000_000_000n)];
+  const body = seriesBuffer([{t, min: [1, 2], max: [1, 2], last: [1, 2], count: [1, 1]}]);
+  const server = fakeServer(url => url.pathname.endsWith('/series') ?
+      new Response(body.slice(0)) : echoSnapshot(url));
+  const rec = new RecordedSource(
+      SERVER, 's1', [info('shooter/state/position_m')], BOUNDS,
+      server.fetchFn, fakeClock().clock, SAMPLE_TIMELINE, null);
+  rec.series(['shooter/state/position_m'], 'all', END.toString(), 256);
+  await settle();
+  const s = rec.series(['shooter/state/position_m'], 'all', END.toString(), 256);
+  const plotted = plotColumn(s.values['shooter/state/position_m'],
+                             s.count!['shooter/state/position_m']);
+  assert.deepEqual(plotted, [1, null, 2]);
+  rec.close();
 });

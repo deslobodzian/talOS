@@ -41,7 +41,8 @@ export type ReviewSession = {
 // text from the server's files, shown as text, never as markup.
 export type ReviewBounds = {start_ns: string; end_ns: string; origin_wall_ns: string;
                             max_series_values: number; max_series_channels: number;
-                            hardware_not_decoded?: string; gaps: ReviewGap[]};
+                            hardware_not_decoded?: string; gaps: ReviewGap[];
+                            pose_topic?: string};
 
 // A stretch where a process's event log dropped records (a GAP record,
 // REQ-OPS-41): its first lost event time and the time capture resumed, what
@@ -69,6 +70,9 @@ export type ReviewAlertInterval = {
   level: TimelineAlertLevel;
   start_ns: string;
   end_ns: string;
+  // True when still active at session end; false when cleared by a false
+  // sample (even on exact bounds.end_ns). Absent only from older servers.
+  active_at_end?: boolean;
 };
 export type ReviewRunInterval = {
   node: string;
@@ -200,10 +204,15 @@ export function parseBounds(raw: unknown): ReviewBounds {
   const reason = source.hardware_not_decoded ?? null;
   if (reason !== null && typeof reason !== 'string')
     fail('bounds.hardware_not_decoded must be a string or null');
+  const poseTopic = source.pose_topic ?? null;
+  if (poseTopic !== null && typeof poseTopic !== 'string')
+    fail('bounds.pose_topic must be a string or null');
   if (BigInt(bounds.end_ns) < BigInt(bounds.start_ns))
     fail('bounds.end_ns is before bounds.start_ns');
-  const out = {...bounds, gaps: parseGaps(source.gaps)};
-  return typeof reason === 'string' ? {...out, hardware_not_decoded: reason} : out;
+  const out: ReviewBounds = {...bounds, gaps: parseGaps(source.gaps)};
+  if (typeof reason === 'string') out.hardware_not_decoded = reason;
+  if (typeof poseTopic === 'string' && poseTopic.length > 0) out.pose_topic = poseTopic;
+  return out;
 }
 
 // bounds.json gaps: absent (a server from before GAP records) is none, and a
@@ -306,11 +315,15 @@ export function parseTimeline(raw: unknown): ReviewTimeline {
     const level = str(a, 'level', where);
     if (!TIMELINE_ALERT_LEVELS.has(level))
       fail(`${where}.level must be error, warning or info`);
+    const activeAtEnd = a.active_at_end;
+    if (activeAtEnd !== undefined && typeof activeAtEnd !== 'boolean')
+      fail(`${where}.active_at_end must be a boolean`);
     return {
       channel: str(a, 'channel', where),
       level: level as TimelineAlertLevel,
       start_ns,
-      end_ns
+      end_ns,
+      ...(typeof activeAtEnd === 'boolean' ? {active_at_end: activeAtEnd} : {})
     };
   });
   const runs: ReviewRunInterval[] = (source.runs as unknown[]).map((entry, i) => {
