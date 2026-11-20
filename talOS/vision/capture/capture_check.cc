@@ -76,7 +76,10 @@ int64_t ThreadCpuNanos() {
 // The calling thread's scheduling, e.g. "SCHED_OTHER nice 10".
 std::string ThreadScheduling() {
 #if defined(__linux__)
-  const int policy = sched_getscheduler(0);
+  int policy = sched_getscheduler(0);
+#ifdef SCHED_RESET_ON_FORK
+  if (policy >= 0) policy &= ~SCHED_RESET_ON_FORK;
+#endif
   sched_param param{};
   sched_getparam(0, &param);
   const auto tid = static_cast<id_t>(syscall(SYS_gettid));

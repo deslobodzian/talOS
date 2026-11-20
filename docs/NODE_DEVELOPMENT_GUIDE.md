@@ -187,9 +187,10 @@ inherit the variable from the launcher.
 
 A thread the node starts must not run at the loop's priority. On Linux
 `ConfigureRealtime` passes `SCHED_RESET_ON_FORK`, so children and threads
-created afterwards start at `SCHED_OTHER` (nice 0) rather than inheriting
-`SCHED_FIFO`, where an unbounded helper (capture, detection, encoding) still
-competes with timeshare (`--sim`) loops as an equal. A helper
+created afterwards start at `SCHED_OTHER` (with any negative nice reset to 0)
+rather than inheriting `SCHED_FIFO`; without `ConfigureBackgroundThread()`, an
+unbounded helper (capture, detection, encoding) still competes at normal
+priority with timeshare (`--sim`) loops. A helper
 thread calls `talos::process::ConfigureBackgroundThread()` first: on Linux it
 leaves any inherited realtime policy for `SCHED_OTHER` at nice
 `kBackgroundNice` (10), which threads it creates inherit; on macOS it sets
