@@ -101,7 +101,12 @@ static_assert(sizeof(Gap) == 48, "REQ-OPS-42: 48 B per GAP record");
 
 // Fixed ceilings on the timeline kept per open session (REQ-OPS-42): 96 KiB
 // each for modes and alerts (4096 x 24 B) and at most 4096 runs from
-// manifest.json, regardless of session length or flapping rate. Excess items
+// manifest.json, regardless of session length or flapping rate. While
+// Session::Open() scans logs, alerts are capped at kMaxTimelineAlerts per
+// alert channel (4096 x 16 B = 64 KiB transient per alert channel stream;
+// close order equals start order within one channel) before merging into the
+// global earliest kMaxTimelineAlerts intervals by start_ns, so a flapping
+// alert cannot drop an earlier alert on the same status topic. Excess items
 // are dropped and counted in *_dropped().
 inline constexpr std::size_t kMaxTimelineModes = 4096;
 inline constexpr std::size_t kMaxTimelineAlerts = 4096;

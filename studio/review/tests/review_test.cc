@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1618,6 +1619,127 @@ TEST_F(ReviewTest, TimelineCapsFlappingModesAndAlerts) {
   std::filesystem::remove_all(dir);
 }
 
+// A reflection schema for one status struct with three alert bools (offsets
+// 0, 1, 2), used to test multi-alert status topics without altering the
+// checked-in fixture schema.
+std::string MultiAlertSchema() {
+  flatbuffers::FlatBufferBuilder fbb;
+  const auto bool_type = reflection::CreateType(
+      fbb, reflection::BaseType::Bool, reflection::BaseType::None, -1, 0, 1);
+  // Fields sorted by name (matching flatc reflection schemas) and id 0..2.
+  std::vector<flatbuffers::Offset<reflection::Field>> fields{
+      reflection::CreateFieldDirect(fbb, "alert_error_held", bool_type,
+                                    /*id=*/0, /*offset=*/0),
+      reflection::CreateFieldDirect(fbb, "alert_error_late", bool_type,
+                                    /*id=*/1, /*offset=*/1),
+      reflection::CreateFieldDirect(fbb, "alert_warning_flap", bool_type,
+                                    /*id=*/2, /*offset=*/2),
+  };
+  std::vector<flatbuffers::Offset<reflection::Object>> objects{
+      reflection::CreateObjectDirect(fbb, "review_test.MultiAlert", &fields,
+                                     /*is_struct=*/true, /*minalign=*/1,
+                                     /*bytesize=*/3),
+  };
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+  reflection::FinishSchemaBuffer(
+      fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+  return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+}
+
+// Guards the per-channel alert cap on a multi-alert status topic: a peer
+// alert flapping past kMaxTimelineAlerts cannot starve an earlier long-lived
+// alert that closes after the flaps or stays active until session end, and
+// alerts_dropped counts every dropped interval across per-channel and global
+// truncation.
+// REQ-OPS-37, REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, TimelineAlertCapPreservesEarlyAlertDespiteFlappingPeer) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const std::string dir = Library() + "/multi_alert_flap";
+  std::filesystem::create_directories(dir);
+  constexpr std::size_t kExtraFlaps = 5;
+  constexpr std::size_t kTotalFlaps = kMaxTimelineAlerts + kExtraFlaps;
+  const std::int64_t last_ms = 2 + static_cast<std::int64_t>(kTotalFlaps) * 2;
+  {
+    talos::event::Registration status_src;
+    status_src.id = 2;
+    status_src.kind = SourceKind::SENDER;
+    status_src.name = "/multi/status";
+    status_src.message_bytes = 3;
+    status_src.schema = {"review_test.MultiAlert", 2, MultiAlertSchema()};
+    tlog::LogWriter writer{dir + "/multi.tlog", "multi",
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start({status_src}, MonotonicTime::from_nanos(kStartNs));
+
+    std::uint64_t seq = 0;
+    const auto send = [&](std::int64_t offset_ms, bool held, bool late,
+                          bool flap) {
+      const std::array<std::byte, 3> payload{
+          static_cast<std::byte>(held ? 1 : 0),
+          static_cast<std::byte>(late ? 1 : 0),
+          static_cast<std::byte>(flap ? 1 : 0),
+      };
+      Context ctx{};
+      ctx.dispatch_index = ++seq;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + offset_ms * kMs);
+      writer.send(ctx, 2, payload, 0, seq);
+    };
+
+    // alert_error_held opens at 0 ms and stays active through session end.
+    // alert_error_late opens at 1 ms and closes at last_ms after all flaps.
+    send(0, true, false, false);
+    send(1, true, true, false);
+    for (std::size_t i = 0; i < kTotalFlaps; ++i) {
+      const std::int64_t base_ms = 2 + static_cast<std::int64_t>(i) * 2;
+      send(base_ms, true, true, true);
+      send(base_ms + 1, true, true, false);
+    }
+    send(last_ms, true, false, false);
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  Review review{Library(), 1u << 20};
+  const Response resp =
+      review.Get("/review/multi_alert_flap/timeline.json", "");
+  std::filesystem::remove_all(dir);
+  ASSERT_EQ(resp.status, 200) << resp.body;
+  const json tl = json::parse(resp.body);
+  ASSERT_EQ(tl["alerts"].size(), kMaxTimelineAlerts);
+  // Total intervals = 1 (held) + 1 (late) + kTotalFlaps (flap).
+  // Kept = kMaxTimelineAlerts; dropped = kExtraFlaps + 2.
+  EXPECT_EQ(tl["alerts_dropped"], kExtraFlaps + 2);
+
+  EXPECT_EQ(tl["alerts"][0]["channel"], "multi/status/alert_error_held");
+  EXPECT_EQ(tl["alerts"][0]["level"], "error");
+  EXPECT_EQ(tl["alerts"][0]["start_ns"], std::to_string(kStartNs));
+  EXPECT_EQ(tl["alerts"][0]["end_ns"],
+            std::to_string(kStartNs + last_ms * kMs));
+
+  EXPECT_EQ(tl["alerts"][1]["channel"], "multi/status/alert_error_late");
+  EXPECT_EQ(tl["alerts"][1]["level"], "error");
+  EXPECT_EQ(tl["alerts"][1]["start_ns"], std::to_string(kStartNs + 1 * kMs));
+  EXPECT_EQ(tl["alerts"][1]["end_ns"],
+            std::to_string(kStartNs + last_ms * kMs));
+
+  EXPECT_EQ(tl["alerts"][2]["channel"], "multi/status/alert_warning_flap");
+  EXPECT_EQ(tl["alerts"][2]["level"], "warning");
+  EXPECT_EQ(tl["alerts"][2]["start_ns"], std::to_string(kStartNs + 2 * kMs));
+  EXPECT_EQ(tl["alerts"][2]["end_ns"], std::to_string(kStartNs + 3 * kMs));
+
+  const std::int64_t last_kept_flap_ms =
+      2 + static_cast<std::int64_t>(kMaxTimelineAlerts - 3) * 2;
+  EXPECT_EQ(tl["alerts"].back()["channel"], "multi/status/alert_warning_flap");
+  EXPECT_EQ(tl["alerts"].back()["start_ns"],
+            std::to_string(kStartNs + last_kept_flap_ms * kMs));
+  EXPECT_EQ(tl["alerts"].back()["end_ns"],
+            std::to_string(kStartNs + (last_kept_flap_ms + 1) * kMs));
+}
+
 // Guards GET /review/<id>/declared.json: serves graph.json verbatim when
 // present and 404 plain text when absent.
 // REQ-OPS-41, REQ-CONTRACT-29
@@ -1635,6 +1757,27 @@ TEST_F(ReviewTest, DeclaredServesGraphJsonOr404WhenAbsent) {
   EXPECT_EQ(absent.status, 404);
   EXPECT_EQ(absent.content_type, "text/plain; charset=utf-8");
   std::filesystem::remove_all(dir);
+}
+
+// Guards that GET /review/<id>/declared.json refuses a graph.json symlink
+// pointing outside the session library with 404 instead of reading it.
+// REQ-OPS-41
+TEST_F(ReviewTest, DeclaredRefusesSymlinkOutsideLibrary) {
+  const std::filesystem::path outside = Directory() + "/outside_graph.json";
+  std::ofstream{outside} << R"({"secret":true})";
+  const std::string dir = Library() + "/symlink_graph";
+  testing::WriteFixtureSession(dir);
+  std::filesystem::remove(dir + "/graph.json");
+  std::filesystem::create_symlink(outside, dir + "/graph.json");
+
+  Review review{Library(), 1u << 20};
+  const Response resp = review.Get("/review/symlink_graph/declared.json", "");
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove(outside);
+
+  EXPECT_EQ(resp.status, 404);
+  EXPECT_EQ(resp.content_type, "text/plain; charset=utf-8");
+  EXPECT_EQ(resp.body.find("secret"), std::string::npos) << resp.body;
 }
 
 }  // namespace
