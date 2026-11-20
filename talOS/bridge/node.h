@@ -361,16 +361,21 @@ class HardwareNode {
   // or enabled/fault edge), at `now_us`, which starts the silence of each
   // owner not yet silent (SubsystemTracker::silence_from_us).
   void InvalidateRequests(uint64_t now_us);
-  // Whether the link is ready for requests (a State accepted and the
-  // current gateway boot has acknowledged this configuration), after a
-  // gateway frame received at `now_us`. Becoming ready starts every owner's
-  // silence at `now_us`, as the session's start does.
+  // Whether an accepted State is still fresh at `now_us` (state_age_us <
+  // command_timeout_us).
+  bool StateFresh(uint64_t now_us) const;
+  // Whether the link is ready for requests (a fresh accepted State and the
+  // current gateway boot has acknowledged this configuration) as of `now_us`.
+  // Becoming ready (session start, gateway reboot acknowledgement, or fresh
+  // States returning after a stale link) starts every owner's silence at
+  // `now_us`.
   void UpdateLinkReady(uint64_t now_us);
   // Whether `tracker`'s owner is silent at `now_us` as /hw/status reports
-  // it: the link is ready, the owner has been heard (a request of its
+  // it: the link is ready with a fresh State (state_age_us <
+  // command_timeout_us), the owner has been heard (a request of its
   // received, accepted or not), and nothing restarted its silence
   // (silence_from_us) for longer than its owner timeout. False while the
-  // link is not ready, when alert_error_link_lost or
+  // link is not ready or State is stale, when alert_error_link_lost or
   // alert_error_not_configured says why nothing merges, and for an owner
   // never heard (SubsystemTracker::heard).
   bool OwnerSilent(const SubsystemTracker& tracker, uint64_t now_us) const;

@@ -461,7 +461,7 @@ commands, neutralized motors, apply failures, and device resets. The refused
 count omits two refusals of an all-neutral command (every motor neutral with
 zero demand and feedforward, every digital output off, every PWM output
 off): a current one while the gateway is disabled, uncommissioned,
-unconfigured or in total feedback loss (below), since the bridge keeps
+unconfigured, faulted or in total feedback loss (below), since the bridge keeps
 forwarding those while the robot cannot drive; and one that passes every other check but carries an earlier epoch
 while no command is in force, since the bridge built it from a State read
 before this epoch began (at an enable or a disable, for example). Any other

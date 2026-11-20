@@ -1357,29 +1357,38 @@ TEST(HardwareNodeTrustTest,
 
   // The drivetrain's node stops, then the gateway reboots: nothing is
   // reported until boot 12 acknowledges, though that takes longer than the
-  // owner timeout.
-  const State boot12 = TrustState(config_id, 12, 1, 500);
+  // owner timeout (boot 12 keeps publishing States every 5 ms throughout).
+  State boot12 = TrustState(config_id, 12, 1, 500);
   now_us += 1000;
   ASSERT_TRUE(rig.gateway.Deliver(boot12, now_us));
   EXPECT_TRUE(node.Status(now_us).alert_error_not_configured());
   EXPECT_EQ(TimedOutMask(node, now_us), 0u);
   const uint64_t reready_us = now_us + (2 * owner_timeout_us);
   for (now_us += 5000; now_us < reready_us; now_us += 5000) {
-    node.Tick(now_us);
+    boot12.sample_time_us += 5000;
+    ASSERT_TRUE(rig.gateway.Deliver(boot12, now_us));
     EXPECT_EQ(TimedOutMask(node, now_us), 0u) << "at " << now_us;
   }
   node.Tick(reready_us - 1);
   EXPECT_EQ(TimedOutMask(node, reready_us - 1), 0u);
   EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
   Acknowledge(rig, config_id, reready_us);
-  // Once ready again, the drivetrain (bit 0), heard before the reboot, is
-  // reported one owner timeout later; the intake still is not.
+  boot12.sample_time_us += 5000;
+  ASSERT_TRUE(rig.gateway.Deliver(boot12, reready_us));
+  // Once ready again on a live link, the drivetrain (bit 0), heard before the
+  // reboot, is reported one owner timeout later; the intake still is not.
   EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us), 0u);
   EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us + 1), 0b01u);
   node.Tick(reready_us + owner_timeout_us + 1);
   EXPECT_EQ(node.owner_timeouts("drivetrain"), 1u);
   EXPECT_EQ(node.owner_timeouts("intake"), 0u);
+  for (uint64_t t = reready_us + owner_timeout_us + 5000;
+       t <= reready_us + (10 * owner_timeout_us); t += 5000) {
+    boot12.sample_time_us += 5000;
+    ASSERT_TRUE(rig.gateway.Deliver(boot12, t));
+  }
   EXPECT_EQ(TimedOutMask(node, reready_us + (10 * owner_timeout_us)), 0b01u);
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 1u);
 }
 
 // A Python node's first request reached the bridge about 157 ms into every
@@ -1833,6 +1842,86 @@ TEST(HardwareNodeTrustTest, DropsDriverStationPacketsBeforeStateAndDuplicates) {
   EXPECT_FALSE(send_ds(0xA1, 1000, 1004000));
   EXPECT_TRUE(send_ds(0xA1, 2000, 1005000));
   EXPECT_EQ(node.driver_station_packets_received(), 3u);
+}
+
+// Guards RT-12: when the gateway link goes stale (state_age_us >=
+// command_timeout_us), timed_out_mask and alert_warning_owner_timed_out must
+// not raise (link_lost explains the outage), and when fresh States of the same
+// boot return, owner silence restarts from the return so owners get a full
+// owner-timeout window to react before raising an alert.
+// REQ-OPS-20
+TEST(HardwareNodeTrustTest,
+     OwnerTimeoutDoesNotRaiseWhileStateIsStaleOrOnLinkReturn) {
+  using Names = std::vector<std::string>;
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+  const uint64_t owner_timeout_us = OwnerTimeoutUs(5000, timeout_us);
+  ASSERT_LT(owner_timeout_us, timeout_us);
+
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  const auto publish_both = [&](uint64_t observed_us) {
+    Command cmd{};
+    cmd.config_id = config_id;
+    cmd.boot_id = 11;
+    cmd.epoch = 1;
+    cmd.observed_time_us = observed_us;
+    PublishCommand(drive_pub, cmd);
+    PublishCommand(intake_pub, cmd);
+  };
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  Acknowledge(rig, config_id, kStartUs - 500);
+  publish_both(1000);
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 1000), kStartUs));
+  EXPECT_EQ(TimedOutMask(node, kStartUs), 0u);
+
+  // Owners keep publishing while State is still fresh (within owner_timeout_us
+  // each step, ending at kStartUs + timeout_us - 10'000).
+  publish_both(1000);
+  node.Tick(kStartUs + (owner_timeout_us - 5'000));
+  const uint64_t last_req_us = kStartUs + timeout_us - 10'000;
+  publish_both(1000);
+  node.Tick(last_req_us);
+  EXPECT_EQ(TimedOutMask(node, last_req_us), 0u);
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 0u);
+
+  // No new State arrives and owners stop publishing once the link drops.
+  // At state_age_us == timeout_us and beyond (including well past
+  // last_req_us + owner_timeout_us), State is stale: timed_out_mask and
+  // alert_warning_owner_timed_out must stay clear, and Tick must not record
+  // owner-timeout episodes.
+  const uint64_t stale_edge_us = kStartUs + timeout_us;
+  const uint64_t long_outage_us = last_req_us + (3 * owner_timeout_us);
+  ASSERT_GT(long_outage_us, stale_edge_us);
+  node.Tick(stale_edge_us);
+  EXPECT_EQ(TimedOutMask(node, stale_edge_us), 0u);
+  node.Tick(long_outage_us);
+  EXPECT_EQ(TimedOutMask(node, long_outage_us), 0u);
+  EXPECT_EQ(Alerts(node.Status(long_outage_us)), Names{"link_lost"});
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 0u);
+
+  // Same-boot State returns after the outage: silence restarts from recovery,
+  // so no immediate owner_timed_out fires on the recovery tick; it fires only
+  // if owners stay silent past owner_timeout_us while States stay fresh.
+  const uint64_t recover_us = long_outage_us + 10'000;
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id, 11, 1, 500000), recover_us));
+  EXPECT_EQ(TimedOutMask(node, recover_us), 0u);
+  EXPECT_EQ(Alerts(node.Status(recover_us)), Names{});
+  EXPECT_EQ(TimedOutMask(node, recover_us + owner_timeout_us), 0u);
+  // Keep State fresh through owner_timeout_us + 1 so silence IS reported when
+  // an owner really stays quiet on a healthy link.
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 550000),
+                              recover_us + owner_timeout_us));
+  EXPECT_EQ(TimedOutMask(node, recover_us + owner_timeout_us + 1), 0b11u);
 }
 
 }  // namespace

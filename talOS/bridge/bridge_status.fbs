@@ -54,14 +54,16 @@ struct CanBusStatus {
 // payload decodes, those then dropped as reordered or of a retired boot
 // included; a State that does not decode is not counted. timed_out_mask has
 // bit i set while the i-th actuator-owning subsystem, in sorted name order,
-// is silent: the link is ready (a State accepted and the current gateway
+// is silent: the link is ready (a fresh State accepted with
+// state_age_us < command_timeout_us and the current gateway
 // boot has acknowledged this configuration), the bridge has received a
 // request from that subsystem since it started (accepted or refused), and,
 // for longer than its
 // owner timeout (ARCHITECTURE.md "The tick"), none of its requests has been
 // accepted since the latest of its last accepted request (its first
 // received request, until one is accepted), the link becoming ready (the
-// session's start, or a gateway reboot's acknowledgement) and that
+// session's start, a gateway reboot's acknowledgement, or fresh States
+// returning after a stale link) and that
 // subsystem's first controller transition (boot, configuration, epoch,
 // enable or fault edge) after either at which it was not already silent.
 // So a controller transition, a session's start (however late an owner's
