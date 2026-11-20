@@ -1753,5 +1753,137 @@ TEST(TelemetryTopic, AStoppedReaderDoesNotStopPublication) {
   stalled.release_reader(*reader);
 }
 
+// Builds a minimal verified reflection schema containing `geometry.Pose2d`
+// (at object index 0) and `pose_test.Estimate` (at object index 1, sorted by
+// name for FlatBuffers LookupByKey) with configurable pose field type and
+// optional `valid` offset.
+std::string CraftPoseSchema(reflection::BaseType pose_field_type,
+                            std::uint16_t pose_field_bytes, bool include_valid,
+                            std::uint16_t valid_offset) {
+  flatbuffers::FlatBufferBuilder fbb;
+
+  auto make_field = [&](const char* name, reflection::BaseType base,
+                        std::int32_t obj_index, std::uint16_t id,
+                        std::uint16_t offset) {
+    const auto type =
+        reflection::CreateType(fbb, base, reflection::BaseType::None, obj_index,
+                               /*fixed_length=*/0, /*base_size=*/1,
+                               /*element_size=*/1);
+    return reflection::CreateFieldDirect(fbb, name, type, id, offset);
+  };
+
+  std::vector<flatbuffers::Offset<reflection::Field>> pose_fields;
+  pose_fields.push_back(make_field("x_m", pose_field_type, -1, 0, 0));
+  pose_fields.push_back(
+      make_field("y_m", pose_field_type, -1, 1, pose_field_bytes));
+  pose_fields.push_back(
+      make_field("yaw_rad", pose_field_type, -1, 2,
+                 static_cast<std::uint16_t>(pose_field_bytes * 2)));
+  const auto pose_obj = reflection::CreateObjectDirect(
+      fbb, "geometry.Pose2d", &pose_fields, /*is_struct=*/true,
+      /*minalign=*/pose_field_bytes,
+      /*bytesize=*/pose_field_bytes * 3);
+
+  std::vector<flatbuffers::Offset<reflection::Field>> est_fields;
+  est_fields.push_back(
+      make_field("pose", reflection::BaseType::Obj, /*obj_index=*/0, 0, 0));
+  if (include_valid) {
+    est_fields.push_back(
+        make_field("valid", reflection::BaseType::Bool, -1, 1, valid_offset));
+  }
+  const std::int32_t est_bytes =
+      include_valid
+          ? std::max<std::int32_t>(pose_field_bytes * 3, valid_offset + 1)
+          : pose_field_bytes * 3;
+  const auto est_obj = reflection::CreateObjectDirect(
+      fbb, "pose_test.Estimate", &est_fields, /*is_struct=*/true,
+      /*minalign=*/pose_field_bytes, /*bytesize=*/est_bytes);
+
+  std::vector<flatbuffers::Offset<reflection::Object>> objects{pose_obj,
+                                                               est_obj};
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+  reflection::FinishSchemaBuffer(
+      fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+  return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+}
+
+class FloatPoseTopicNode {
+ public:
+  explicit FloatPoseTopicNode(talos::Node& node) {
+    using talos::detail::NodeAccess;
+    const std::string bfbs =
+        CraftPoseSchema(reflection::BaseType::Float, sizeof(float), false, 0);
+    NodeAccess::add_publisher(
+        node, "/pose_estimator/state", 24, 8,
+        talos::schema::Identity{"pose_test.Estimate", 111, bfbs});
+  }
+};
+
+class TruncatedPoseTopicNode {
+ public:
+  explicit TruncatedPoseTopicNode(talos::Node& node) {
+    using talos::detail::NodeAccess;
+    NodeAccess::add_publisher(node, "/pose_estimator/state", 16, 8,
+                              talos::schema::Of<::geometry::PoseEstimate>());
+  }
+};
+
+class OutOfBoundsValidPoseTopicNode {
+ public:
+  explicit OutOfBoundsValidPoseTopicNode(talos::Node& node) {
+    using talos::detail::NodeAccess;
+    const std::string bfbs =
+        CraftPoseSchema(reflection::BaseType::Double, sizeof(double), true, 24);
+    NodeAccess::add_publisher(
+        node, "/pose_estimator/state", 24, 8,
+        talos::schema::Identity{"pose_test.Estimate", 222, bfbs});
+  }
+};
+
+// REQ-OPS-22: SetupPoseExtraction must verify field base types (Double for
+// x_m/y_m/yaw_rad, Bool for valid) and message_bytes bounds before recording
+// offsets read by memcpy in update().
+TEST(TelemetryTest, PoseExtractionRefusesWrongTypesAndOutOfBoundsOffsets) {
+  const std::string kConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+pose_topic = "/pose_estimator/state"
+
+[subsystems.pose_estimator]
+node = "//pose_estimator:node"
+
+[subsystems.pose_estimator.motors.m]
+can_id = 1
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+
+  // 1. Float fields inside geometry.Pose2d instead of Double.
+  {
+    Sim sim = Sim::FromToml(kConfig);
+    sim.add<FloatPoseTopicNode>("pose_estimator");
+    EXPECT_THROW(sim.add<Telemetry>("telemetry"), std::invalid_argument);
+  }
+
+  // 2. Valid Double fields, but declared message_bytes truncates yaw_rad.
+  {
+    Sim sim = Sim::FromToml(kConfig);
+    sim.add<TruncatedPoseTopicNode>("pose_estimator");
+    EXPECT_THROW(sim.add<Telemetry>("telemetry"), std::invalid_argument);
+  }
+
+  // 3. Valid Double geometry.Pose2d fits in 24 bytes, but Bool `valid` sits at
+  // offset 24 (past message_bytes = 24).
+  {
+    Sim sim = Sim::FromToml(kConfig);
+    sim.add<OutOfBoundsValidPoseTopicNode>("pose_estimator");
+    EXPECT_THROW(sim.add<Telemetry>("telemetry"), std::invalid_argument);
+  }
+}
+
 }  // namespace
 }  // namespace talos::telemetry

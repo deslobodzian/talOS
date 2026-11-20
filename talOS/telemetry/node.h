@@ -576,32 +576,60 @@ class Telemetry {
     }
     const reflection::Object* object =
         schema->objects()->LookupByKey(source.schema.c_str());
-    if (!object) {
+    if (!object || !object->is_struct() || object->fields() == nullptr) {
       throw std::invalid_argument("telemetry: schema object '" + source.schema +
                                   "' for pose topic '" + source.name +
-                                  "' is missing");
+                                  "' is missing or not a struct");
     }
 
+    auto read_double_offset = [&](const reflection::Field& sub_field,
+                                  std::size_t pose_offset,
+                                  std::size_t& out) -> void {
+      if (sub_field.type() == nullptr ||
+          sub_field.type()->base_type() != reflection::BaseType::Double) {
+        throw std::invalid_argument(
+            "telemetry: pose topic '" + source.name + "' geometry.Pose2d." +
+            sub_field.name()->str() + " must be a double");
+      }
+      const std::size_t offset = pose_offset + sub_field.offset();
+      if (offset > source.message_bytes ||
+          sizeof(double) > source.message_bytes - offset) {
+        throw std::invalid_argument(
+            "telemetry: pose topic '" + source.name + "' geometry.Pose2d." +
+            sub_field.name()->str() + " exceeds message_bytes");
+      }
+      out = offset;
+    };
+
     bool found_pose = false;
+    std::size_t x_offset = 0;
+    std::size_t y_offset = 0;
+    std::size_t yaw_offset = 0;
     for (const auto* field : *object->fields()) {
+      if (field == nullptr || field->type() == nullptr) continue;
       const auto& type = *field->type();
-      if (type.base_type() == reflection::BaseType::Obj) {
-        const auto* sub_obj = schema->objects()->Get(type.index());
-        if (sub_obj != nullptr &&
+      if (type.base_type() == reflection::BaseType::Obj && type.index() >= 0 &&
+          static_cast<std::size_t>(type.index()) < schema->objects()->size()) {
+        const auto* sub_obj = schema->objects()->Get(
+            static_cast<flatbuffers::uoffset_t>(type.index()));
+        if (sub_obj != nullptr && sub_obj->is_struct() &&
+            sub_obj->fields() != nullptr &&
             sub_obj->name()->string_view() == "geometry.Pose2d") {
           const std::size_t pose_offset = field->offset();
           bool found_x = false;
           bool found_y = false;
           bool found_yaw = false;
           for (const auto* sub_field : *sub_obj->fields()) {
-            if (sub_field->name()->string_view() == "x_m") {
-              pose_x_offset_ = pose_offset + sub_field->offset();
+            if (sub_field == nullptr) continue;
+            const std::string_view sub_name = sub_field->name()->string_view();
+            if (sub_name == "x_m") {
+              read_double_offset(*sub_field, pose_offset, x_offset);
               found_x = true;
-            } else if (sub_field->name()->string_view() == "y_m") {
-              pose_y_offset_ = pose_offset + sub_field->offset();
+            } else if (sub_name == "y_m") {
+              read_double_offset(*sub_field, pose_offset, y_offset);
               found_y = true;
-            } else if (sub_field->name()->string_view() == "yaw_rad") {
-              pose_yaw_offset_ = pose_offset + sub_field->offset();
+            } else if (sub_name == "yaw_rad") {
+              read_double_offset(*sub_field, pose_offset, yaw_offset);
               found_yaw = true;
             }
           }
@@ -618,18 +646,33 @@ class Telemetry {
                                   "' has no geometry.Pose2d field");
     }
 
-    has_pose_ = true;
+    bool has_valid_field = false;
+    std::size_t valid_offset = 0;
     for (const auto* field : *object->fields()) {
+      if (field == nullptr || field->type() == nullptr) continue;
       if (field->name()->string_view() == "valid" &&
           field->type()->base_type() == reflection::BaseType::Bool) {
-        pose_has_valid_field_ = true;
-        pose_valid_offset_ = field->offset();
+        const std::size_t offset = field->offset();
+        if (offset > source.message_bytes ||
+            sizeof(bool) > source.message_bytes - offset) {
+          throw std::invalid_argument("telemetry: pose topic '" + source.name +
+                                      "' valid field exceeds message_bytes");
+        }
+        has_valid_field = true;
+        valid_offset = offset;
         break;
       }
     }
+
     pose_sub_index_ = NodeAccess::add_observer(
         node_, source.name, source.message_bytes, source.alignment,
         {source.schema, source.schema_hash, source.bfbs});
+    pose_x_offset_ = x_offset;
+    pose_y_offset_ = y_offset;
+    pose_yaw_offset_ = yaw_offset;
+    pose_has_valid_field_ = has_valid_field;
+    pose_valid_offset_ = valid_offset;
+    has_pose_ = true;
   }
 
   void ObserveDriverStation(const introspect::naming::SourceShape& source) {
