@@ -380,7 +380,13 @@ Response Review::Bounds(const Session& session) const {
     out += gap.closed_at_flush ? "true" : "false";
     out += '}';
   }
-  out += "]}";
+  out += "],\"pose_topic\":";
+  if (session.pose_topic().empty()) {
+    out += "null";
+  } else {
+    AppendEscaped(out, session.pose_topic());
+  }
+  out += '}';
   return {200, "application/json", std::move(out)};
 }
 
@@ -407,7 +413,7 @@ Response Review::Timeline(const Session& session) const {
   for (std::size_t i = 0; i < session.alerts().size(); ++i) {
     if (i != 0) out += ',';
     const AlertInterval& alert = session.alerts()[i];
-    const auto& channel = session.channel(alert.channel);
+    const auto& channel = session.channel(alert.channel());
     out += "{\"channel\":";
     AppendEscaped(out, channel.name);
     out += ",\"level\":";
@@ -416,6 +422,8 @@ Response Review::Timeline(const Session& session) const {
     AppendI64(out, alert.start_ns);
     out += ",\"end_ns\":";
     AppendI64(out, alert.end_ns);
+    out += ",\"active_at_end\":";
+    out += alert.active_at_end() ? "true" : "false";
     out += '}';
   }
   out += "],\"alerts_dropped\":";

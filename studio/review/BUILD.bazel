@@ -26,6 +26,7 @@ cc_library(
         "//studio/bridge:static_files",
         "//studio/bridge:system",
         "//studio/bridge:telemetry",
+        "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/hardware",

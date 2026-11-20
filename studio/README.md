@@ -382,10 +382,14 @@ shown in the footer with **Retry**; panels keep what they last showed.
 | Health | Recorded playback status, `bounds.json` log gaps, active and latched alerts at the playhead, node run history and restarts from `timeline.json`, and the session's declared graph (`declared.json`, when present); explicitly notes that live registry liveness is not present in recordings rather than fabricating live rows. |
 | Every other panel | "Not available for recorded sessions yet." |
 
-Values carry the channel names live telemetry uses. The chassis pose differs:
-live, it is the topic `[studio] pose_topic` names; on a recording, it is the
-estimator that the dictionary shows (the one with
-`<owner>/state/observation_accepted_count`).
+Values carry the channel names live telemetry uses. The chassis pose honors
+`[studio] pose_topic` both live and on a recording (read from the session's
+config via `bounds.json`), falling back on a recording to the estimator that
+the dictionary shows (the one with `<owner>/state/observation_accepted_count`)
+when `pose_topic` is unset or its config is unavailable. Recorded plots break
+lines only at real `bounds.json` log gaps and `timeline.json` process
+restart/exit boundaries, drawing smoothly across normal sparse multi-channel
+buckets.
 
 ## Run
 

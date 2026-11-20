@@ -2009,5 +2009,121 @@ TEST_F(ReviewTest, SnapshotStaysWithinChannelAndByteCaps) {
   }
 }
 
+// Guards the end_ns == bounds.end_ns alert ambiguity: an alert that genuinely
+// clears on the exact final timestamp reports active_at_end == false, while one
+// still active at session end reports active_at_end == true (both share the
+// same end_ns == bounds.end_ns).
+// REQ-OPS-37, REQ-OPS-41
+TEST_F(ReviewTest, TimelineAlertsDistinguishClearedAtEndFromActiveAtEnd) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const std::string dir = Library() + "/alert_end_ambiguity";
+  std::filesystem::create_directories(dir);
+  constexpr std::int64_t kEndMs = 4000;
+  {
+    talos::event::Registration status_src;
+    status_src.id = 2;
+    status_src.kind = SourceKind::SENDER;
+    status_src.name = "/multi/status";
+    status_src.message_bytes = 3;
+    status_src.schema = {"review_test.MultiAlert", 2, MultiAlertSchema()};
+    tlog::LogWriter writer{dir + "/multi.tlog", "multi",
+                           tlog::LogWriterOptions{8192, 1, false}, 1};
+    writer.start({status_src}, MonotonicTime::from_nanos(kStartNs));
+    std::uint64_t seq = 0;
+    const auto send = [&](std::int64_t offset_ms, bool held, bool late,
+                          bool flap) {
+      const std::array<std::byte, 3> payload{
+          static_cast<std::byte>(held ? 1 : 0),
+          static_cast<std::byte>(late ? 1 : 0),
+          static_cast<std::byte>(flap ? 1 : 0),
+      };
+      Context ctx{};
+      ctx.dispatch_index = ++seq;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + offset_ms * kMs);
+      writer.send(ctx, 2, payload, 0, seq);
+    };
+    send(0, true, false, false);
+    send(1000, true, true, true);
+    send(2000, true, true, false);
+    send(kEndMs, true, false, false);  // late clears on exact bounds.end_ns
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  Review review{Library(), 1u << 20};
+  const Response bounds_resp =
+      review.Get("/review/alert_end_ambiguity/bounds.json", "");
+  const Response tl_resp =
+      review.Get("/review/alert_end_ambiguity/timeline.json", "");
+  std::filesystem::remove_all(dir);
+  ASSERT_EQ(bounds_resp.status, 200) << bounds_resp.body;
+  ASSERT_EQ(tl_resp.status, 200) << tl_resp.body;
+  const std::string end_ns = json::parse(bounds_resp.body)["end_ns"];
+  ASSERT_EQ(end_ns, std::to_string(kStartNs + kEndMs * kMs));
+  const json alerts = json::parse(tl_resp.body)["alerts"];
+  ASSERT_EQ(alerts.size(), 3u) << alerts.dump();
+
+  // alert_error_held: [0, 4s], still active at session end.
+  EXPECT_EQ(alerts[0]["channel"], "multi/status/alert_error_held");
+  EXPECT_EQ(alerts[0]["end_ns"], end_ns);
+  ASSERT_TRUE(alerts[0].contains("active_at_end")) << alerts[0].dump();
+  EXPECT_EQ(alerts[0]["active_at_end"], true);
+
+  // alert_warning_flap: [1s, 2s], cleared mid-session.
+  EXPECT_EQ(alerts[1]["channel"], "multi/status/alert_warning_flap");
+  EXPECT_EQ(alerts[1]["end_ns"], std::to_string(kStartNs + 2 * kSecond));
+  ASSERT_TRUE(alerts[1].contains("active_at_end")) << alerts[1].dump();
+  EXPECT_EQ(alerts[1]["active_at_end"], false);
+
+  // alert_error_late: [1s, 4s], cleared on exact bounds.end_ns.
+  EXPECT_EQ(alerts[2]["channel"], "multi/status/alert_error_late");
+  EXPECT_EQ(alerts[2]["end_ns"], end_ns);
+  ASSERT_TRUE(alerts[2].contains("active_at_end")) << alerts[2].dump();
+  EXPECT_EQ(alerts[2]["active_at_end"], false);
+}
+
+// Guards bounds.json pose_topic: reads [studio] pose_topic from the session's
+// manifest config_path when readable, and reports null without failing open
+// when absent or unreadable (e.g. a session copied from a robot).
+// REQ-OPS-41
+TEST_F(ReviewTest, BoundsExposeConfiguredStudioPoseTopic) {
+  const std::string dir = Library() + "/pose_cfg";
+  testing::WriteFixtureSession(dir);
+  const std::string config_path = dir + "/robot.toml";
+  std::ofstream{config_path}
+      << "[studio]\npose_topic = \"/alt_odom/state\"\n\n[subsystems]\n";
+  {
+    std::string manifest = ReadFile(dir + "/manifest.json");
+    manifest.insert(1, "\n  \"config_path\": \"" + config_path + "\",");
+    std::ofstream{dir + "/manifest.json"} << manifest;
+  }
+
+  {
+    Review review{Library(), 1u << 20};
+    const Response resp = review.Get("/review/pose_cfg/bounds.json", "");
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json bounds = json::parse(resp.body);
+    ASSERT_TRUE(bounds.contains("pose_topic")) << resp.body;
+    EXPECT_EQ(bounds["pose_topic"], "/alt_odom/state");
+  }
+
+  // Removing the config file falls back to null without breaking Session::Open.
+  std::filesystem::remove(config_path);
+  {
+    Review review{Library(), 1u << 20};
+    const Response resp = review.Get("/review/pose_cfg/bounds.json", "");
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json bounds = json::parse(resp.body);
+    ASSERT_TRUE(bounds.contains("pose_topic")) << resp.body;
+    EXPECT_TRUE(bounds["pose_topic"].is_null());
+  }
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 }  // namespace studio::review

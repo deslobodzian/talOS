@@ -15,6 +15,7 @@
 
 #include "nlohmann/json.hpp"
 #include "studio/review/hardware_channels.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/launcher/log_inputs.h"
@@ -628,8 +629,8 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
               [&session](const AlertInterval& a, const AlertInterval& b) {
                 if (a.start_ns != b.start_ns) return a.start_ns < b.start_ns;
                 if (a.end_ns != b.end_ns) return a.end_ns < b.end_ns;
-                return session->channel(a.channel).name <
-                       session->channel(b.channel).name;
+                return session->channel(a.channel()).name <
+                       session->channel(b.channel()).name;
               });
   };
   for (std::uint32_t t = 0; t < session->topics_.size(); ++t) {
@@ -655,20 +656,23 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
         const auto& alert_channels = build.alert_channels;
         for (std::size_t i = 0; i < alert_channels.size(); ++i) {
           AlertChannelState& st = stream.channels[i];
+          const ChannelRef ref{t, alert_channels[i]};
+          const std::size_t closed_count = st.intervals.size();
+          for (const RawAlertInterval& iv : st.intervals) {
+            combined_alerts.push_back(AlertInterval::Make(
+                iv.start_ns, iv.end_ns, ref, /*active_at_end=*/false));
+          }
+          std::vector<RawAlertInterval>{}.swap(st.intervals);
           if (st.active) {
-            if (st.intervals.size() < kMaxTimelineAlerts) {
-              st.intervals.push_back(
-                  {st.start_ns, std::max(st.start_ns, session->end_ns_)});
+            if (closed_count < kMaxTimelineAlerts) {
+              combined_alerts.push_back(AlertInterval::Make(
+                  st.start_ns, std::max(st.start_ns, session->end_ns_), ref,
+                  /*active_at_end=*/true));
             } else {
               ++st.dropped;
             }
           }
           session->alerts_dropped_ += st.dropped;
-          for (const RawAlertInterval& iv : st.intervals) {
-            combined_alerts.push_back(
-                {iv.start_ns, iv.end_ns, ChannelRef{t, alert_channels[i]}});
-          }
-          std::vector<RawAlertInterval>{}.swap(st.intervals);
           if (combined_alerts.size() > kMaxTimelineAlerts) {
             sort_alerts();
             session->alerts_dropped_ +=
@@ -698,6 +702,17 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   }
   ReadManifestRuns(dir / "manifest.json", session->origin_wall_ns_,
                    session->runs_, session->runs_dropped_);
+  const std::string config_path =
+      talos::launcher::SessionConfigPath("", {dir.string()});
+  if (!config_path.empty()) {
+    try {
+      session->pose_topic_ =
+          talos::config::ParseRobotConfig(config_path).studio.pose_topic;
+    } catch (const std::exception&) {
+      // A missing, moved, or unreadable config leaves pose_topic unset; Studio
+      // falls back to estimator discovery.
+    }
+  }
   return session;
 }
 
