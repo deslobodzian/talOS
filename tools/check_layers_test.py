@@ -323,6 +323,8 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 '#include "talOS/hardware/config.h"\n'
                 '#include "talOS/node/node.h"\n'
                 'inline constexpr int kPeriodUs = 5\'000;\n'
+                'inline constexpr unsigned kMask = 0xdead\'beef;\n'
+                'inline constexpr double kScale = .5\'0e+1\'2;\n'
                 'inline constexpr const char* kDoc = '
                 '"detail::NodeAccess::add_hardware_request";\n'
             ),
@@ -337,6 +339,32 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 '#define CAT(a, b) a##b\n'
                 '#define CAT2(a, b) a%:%:b\n'
                 ')";\n'
+                'char quote(int k) {\n'
+                '  switch (k) {\n'
+                '    case\'"\': return\'"\';\n'
+                '    default: return \'x\';\n'
+                '  }\n'
+                '}\n'
+            ),
+            # Explicit non-C++ files under scanned roots are not scanned as C++.
+            "bench/arm/README": (
+                "Notes mentioning NodeAccess and #include \"talOS/node/access.h\"\n"
+            ),
+            "bench/arm/notes.md": (
+                "Docs mentioning NodeAccess and ##.\n"
+            ),
+            "bench/arm/helper.py": (
+                "# Python mentioning NodeAccess and talOS/node/access.h\n"
+            ),
+            "bench/arm/config.toml": (
+                '# TOML comment mentioning NodeAccess\nname = "arm"\n'
+            ),
+            "bench/arm/arm_message.fbs": (
+                "// FlatBuffers mentioning NodeAccess\n"
+            ),
+            # Legal Starlark target deps (e.g. testonly/CLI targets) pass.
+            "bench/arm/sim_test_BUILD_extra.bzl": (
+                'DEPS = ["//talOS/ipc", "//talOS/rtms:rtms", "//talOS/node:testing"]\n'
             ),
             # Repo tooling outside tools/scaffold_testdata/ is not scanned.
             "tools/BUILD": (
@@ -407,6 +435,25 @@ class CheckNodeSourcesTest(unittest.TestCase):
              'const char* s = "/*"; detail::NodeAccess::add_hardware_request();\n'),
             ("after_char_literal_quote",
              "char c = '\"'; detail::NodeAccess::add_hardware_request();\n"),
+            ("case_char_literal_quote_no_space",
+             "void f(char c, talos::Node& n) {\n"
+             "  switch (c) {\n"
+             "    case'\"': talos::detail::NodeAccess::add_hardware_request(n, 0, 0, {});\n"
+             "  }\n"
+             "}\n"),
+            ("case_char_literal_quote_spliced_lines",
+             "void f(char c, talos::Node& n) {\n"
+             "  switch (c) {\n"
+             "    case'\"':\\\n"
+             "    talos::detail::NodeAccess::add_hardware_request(n, 0, 0, {});\n"
+             "  }\n"
+             "}\n"),
+            ("return_char_literal_quote_no_space",
+             "char f() { return'\"'; } "
+             "void g() { talos::detail::NodeAccess::add_hardware_request(); }\n"),
+            ("ident_ending_in_digit_before_char_quote",
+             "int a1 = 0; char c = a1 ? '\"' : 'x';\n"
+             "void g() { case1'\"': talos::detail::HardwareAccess::note_live_target(); }\n"),
             ("after_digit_separator",
              "int n = 1'000; /* ok */ detail::NodeAccess::add_hardware_request();\n"),
             ("unterminated_block_comment_fails_closed",
@@ -620,7 +667,196 @@ class CheckNodeSourcesTest(unittest.TestCase):
         self.assertIn("talOS/hardware/packet.h", out)
 
     # REQ-SAFE-27
-    def test_unreadable_file_fails_closed(self):
+    def test_build_and_bzl_macro_and_copt_bypasses_are_refused(self):
+        cases = [
+            ("build_local_defines_token_paste", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'local_defines = ["CAT(a,b)=a##b"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_local_defines_digraph_paste", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'local_defines = ["CAT(a,b)=a%:%:b"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_defines_forbidden_symbol", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'defines = ["SEND=talos::detail::NodeAccess::add_hardware_request"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_defines_hardware_access", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'defines = ["MARK=talos::detail::HardwareAccess::note_live_target"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_defines_concat_symbol", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'defines = ["X=" + "Node" + "Access"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_copts_include_adjacent", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'copts = ["-include", "talOS/ipc/publisher.h"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_copts_include_local_header", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'copts = ["-include", "local_bypass.h"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_copts_include_equals", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'copts = ["-include=talOS/node/access.h"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_copts_include_joined", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'copts = ["-includetalOS/devices/access.h"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_copts_imacros", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'copts = ["-imacros", "macros.h"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_copts_trigraphs", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'copts = ["-trigraphs"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("build_defines_forbidden_header_path", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = ["arm.cc"], '
+                    'defines = ["H=\\"talOS/devices/../node/access.h\\""])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/BUILD:1:"),
+            ("bzl_wrapper_macro_defines_and_copts", {
+                "bench/arm/macros.bzl": (
+                    'def robot_lib(name, srcs):\n'
+                    '    native.cc_library(\n'
+                    '        name = name,\n'
+                    '        srcs = srcs,\n'
+                    '        local_defines = ["CAT(a,b)=a##b"],\n'
+                    '    )\n'
+                ),
+                "bench/arm/BUILD": (
+                    'load(":macros.bzl", "robot_lib")\n'
+                    'robot_lib(name = "arm", srcs = ["arm.cc"])\n'
+                ),
+                "bench/arm/arm.cc": "int ok = 1;\n",
+            }, "bench/arm/macros.bzl:5:"),
+            ("bzl_wrapper_macro_copts_include", {
+                "examples/custom/macros.bzl": (
+                    'COPTS = ["-include", "talOS/rtms/rtms.h"]\n'
+                ),
+                "examples/custom/BUILD": 'cc_library(name = "c", srcs = ["c.cc"])\n',
+                "examples/custom/c.cc": "int ok = 1;\n",
+            }, "examples/custom/macros.bzl:1:"),
+            ("bzl_syntax_error_fails_closed", {
+                "bench/arm/broken.bzl": "def broken(:\n",
+            }, "bench/arm/broken.bzl:"),
+        ]
+        for name, files, expected in cases:
+            with self.subTest(name=name):
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn(expected, out)
+
+    # REQ-SAFE-27
+    def test_indirect_and_non_standard_suffix_files_are_scanned(self):
+        cases = [
+            ("filegroup_txt_textual_hdrs_include", {
+                "bench/arm/BUILD": (
+                    'filegroup(name = "fg", srcs = ["wrap.txt"])\n'
+                    'cc_library(name = "arm", srcs = ["a.cc"], textual_hdrs = [":fg"])\n'
+                ),
+                "bench/arm/a.cc": "int ok = 1;\n",
+                "bench/arm/wrap.txt": '#include "talOS/node/access.h"\n',
+            }, "bench/arm/wrap.txt:1:"),
+            ("filegroup_txt_symbol", {
+                "bench/arm/BUILD": (
+                    'filegroup(name = "fg", srcs = ["wrap.txt"])\n'
+                    'cc_library(name = "arm", srcs = ["a.cc"], textual_hdrs = [":fg"])\n'
+                ),
+                "bench/arm/a.cc": "int ok = 1;\n",
+                "bench/arm/wrap.txt": (
+                    "void f() { talos::detail::NodeAccess::add_hardware_request(); }\n"
+                ),
+            }, "bench/arm/wrap.txt:1:"),
+            ("wrapper_macro_txt_private_headers", {
+                "bench/arm/BUILD": (
+                    'load(":m.bzl", "robot_lib")\n'
+                    'robot_lib(name = "arm", private_headers = ["wrap.txt"])\n'
+                ),
+                "bench/arm/m.bzl": "def robot_lib(**kwargs): pass\n",
+                "bench/arm/wrap.txt": '#include "talOS/ipc/publisher.h"\n',
+            }, "bench/arm/wrap.txt:1:"),
+            ("objc_mm_suffix", {
+                "bench/arm/BUILD": 'cc_library(name = "arm", srcs = ["bypass.mm"])\n',
+                "bench/arm/bypass.mm": (
+                    "void f() { talos::detail::NodeAccess::add_hardware_request(); }\n"
+                ),
+            }, "bench/arm/bypass.mm:1:"),
+            ("tlh_suffix", {
+                "bench/arm/BUILD": 'cc_library(name = "arm", srcs = ["bypass.tlh"])\n',
+                "bench/arm/bypass.tlh": '#include "talOS/devices/access.h"\n',
+            }, "bench/arm/bypass.tlh:1:"),
+            ("tli_suffix", {
+                "bench/arm/BUILD": 'cc_library(name = "arm", srcs = ["bypass.tli"])\n',
+                "bench/arm/bypass.tli": '#include "talOS/rtms/rtms.h"\n',
+            }, "bench/arm/bypass.tli:1:"),
+            ("unreferenced_extensionless_file", {
+                "bench/arm/BUILD": self.NODE_BUILD,
+                "bench/arm/arm.cc": "int ok = 1;\n",
+                "bench/arm/unlisted_hdr": '#include "talOS/node/access.h"\n',
+            }, "bench/arm/unlisted_hdr:1:"),
+            ("non_cpp_suffix_referenced_in_textual_hdrs", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", textual_hdrs = ["sneaky.md"])\n'
+                ),
+                "bench/arm/sneaky.md": '#include "talOS/node/access.h"\n',
+            }, "bench/arm/sneaky.md:1:"),
+            ("filegroup_non_cpp_suffix_in_textual_hdrs", {
+                "bench/arm/BUILD": (
+                    'filegroup(name = "fg", srcs = ["sneaky.md"])\n'
+                    'cc_library(name = "arm", textual_hdrs = [":fg"])\n'
+                ),
+                "bench/arm/sneaky.md": (
+                    "void f() { talos::detail::NodeAccess::add_hardware_request(); }\n"
+                ),
+            }, "bench/arm/sneaky.md:1:"),
+        ]
+        for name, files, expected in cases:
+            with self.subTest(name=name):
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn(expected, out)
+
+    # REQ-SAFE-27
+    def test_unreadable_and_non_utf8_files_fail_closed(self):
         def broken_read(path):
             if path.endswith(".cc"):
                 raise PermissionError("denied")
@@ -630,6 +866,21 @@ class CheckNodeSourcesTest(unittest.TestCase):
         failures = check_layers.run_source_checks(
             ["bench/arm/BUILD", "bench/arm/arm.cc"],
             broken_read,
+            exempt_cli_files={},
+            out=out,
+        )
+        self.assertEqual(failures, 1, out.getvalue())
+        self.assertIn("fail closed", out.getvalue())
+
+        def non_utf8_read(path):
+            if path.endswith(".txt"):
+                raise UnicodeDecodeError("utf-8", b"\xff\xfe", 0, 1, "invalid")
+            return self.NODE_BUILD
+
+        out = io.StringIO()
+        failures = check_layers.run_source_checks(
+            ["bench/arm/BUILD", "bench/arm/blob.txt"],
+            non_utf8_read,
             exempt_cli_files={},
             out=out,
         )

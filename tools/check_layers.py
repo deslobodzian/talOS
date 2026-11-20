@@ -36,12 +36,13 @@ The table below is ARCHITECTURE.md "Layers" and "Allowed dependencies"
   (anything in `//talOS/node:*` other than `//talOS/node:node`).
 
 The C++ source scan (also run standalone via `--source-only` in
-`tools/source_lints.sh`) walks every tracked C++ source/header (plus any
-extensionless or custom-suffix header referenced in BUILD `hdrs`,
-`textual_hdrs` or `srcs`) under `bench/`, `examples/`,
+`tools/source_lints.sh`) walks every tracked file under `bench/`, `examples/`,
 `tools/scaffold_testdata/`, and any other robot package outside `talOS/`,
-`third_party/`, `controller_processor/`, `studio/` and `tools/`, and refuses
-from the start (RULES.md 2):
+`third_party/`, `controller_processor/`, `studio/` and `tools/` (skipping only
+an explicit list of non-C++ basenames/suffixes, unless referenced via BUILD
+`hdrs`/`textual_hdrs`, and failing closed on unreadable or non-UTF-8 files),
+plus every `BUILD`, `BUILD.bazel`, and `.bzl` file under the same roots, and
+refuses from the start (RULES.md 2):
 
 - `#include` (or `#include_next`, quote or angle-bracket, after comment
   stripping, line-continuation splicing and path normalization) of
@@ -52,7 +53,11 @@ from the start (RULES.md 2):
   directives that cannot be verified statically;
 - non-comment, non-string references to `NodeAccess`, `add_hardware_request`,
   `HardwareAccess`, or `note_live_target`, and preprocessor token-pasting
-  operators `##` and `%:%:` (which could otherwise assemble them).
+  operators `##` and `%:%:` (which could otherwise assemble them);
+- Starlark string constants (and constant concatenations) in `BUILD`,
+  `BUILD.bazel`, and `.bzl` files that carry those forbidden symbols, token
+  pasting, forbidden header paths, or `-include`/`-imacros`/`-trigraphs`
+  compiler flags.
 
 ALLOWLIST holds today's known Bazel exceptions, each with its reason and the
 TODO.md item that removes it. NON_NODE_CLI_FILES maps non-node CLI binaries
@@ -154,14 +159,70 @@ EXCLUDED_SOURCE_PREFIXES = (
     "studio/",
     "tools/",
 )
-CPP_SUFFIXES = (
-    ".c", ".cc", ".cpp", ".cxx", ".c++", ".cppm", ".ixx",
-    ".h", ".hh", ".hpp", ".hxx", ".h++", ".ipp", ".inl", ".inc", ".tcc",
-)
+STARLARK_BASENAMES = frozenset({"BUILD", "BUILD.bazel"})
+STARLARK_SUFFIXES = frozenset({".bzl"})
+
+# Explicit non-C++ files skipped from the C++ source scan (fail closed: any
+# suffix or extensionless filename not listed here — including .txt, .mm,
+# .tlh, .tli, and arbitrary extensionless headers — IS scanned as C++).
+# Files referenced via BUILD `hdrs` or `textual_hdrs` are scanned as C++
+# even if their suffix appears here.
+NON_CPP_BASENAMES = frozenset({
+    "BUILD",
+    "BUILD.bazel",
+    "MODULE.bazel",
+    "REPO.bazel",
+    "WORKSPACE",
+    "WORKSPACE.bazel",
+    "README",
+    "LICENSE",
+    "COPYING",
+    "AUTHORS",
+    "NOTICE",
+    ".gitignore",
+    ".gitattributes",
+    ".bazelrc",
+    ".bazelignore",
+    ".bazelversion",
+    ".clang-format",
+    ".clang-tidy",
+    ".editorconfig",
+})
+NON_CPP_SUFFIXES = frozenset({
+    ".md",
+    ".py",
+    ".pyi",
+    ".toml",
+    ".fbs",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".sh",
+    ".bzl",
+    ".bazel",
+    ".bazelrc",
+    ".lock",
+    ".png",
+    ".svg",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".tlog",
+})
+
 INCLUDE_DIRECTIVE_RE = re.compile(
     r"^[ \t]*(?:#|%:)[ \t]*(include(?:_next)?)\b(.*)$")
 HEADER_NAME_RE = re.compile(r'^(?:"([^"]*)"|<([^>]*)>)')
 TOKEN_PASTE_RE = re.compile(r"##|%:%:")
+FORBIDDEN_COPT_FLAG_RE = re.compile(r"^--?(?:include|imacros|trigraphs)")
+FORBIDDEN_COPT_ADJACENT_FLAGS = frozenset({
+    "-include", "--include", "-imacros", "--imacros",
+})
+STARLARK_COPT_JOINED_RE = re.compile(r"^--?(?:include|imacros)=?(.+)$")
+STARLARK_PATH_TOKEN_RE = re.compile(r"[^\s\"'<>(),;=]+")
 
 FORBIDDEN_INCLUDE_EXACT = frozenset({
     "talOS/node/access.h",
@@ -424,22 +485,12 @@ class Bazel:
                           f"intersect ({render(to)})")
 
 
+def _is_ascii_digit(ch):
+    return "0" <= ch <= "9"
+
+
 def _is_ident_char(ch):
     return ch.isalnum() or ch == "_"
-
-
-def _has_char_or_raw_prefix(src, idx):
-    """True when `src[idx]` is not preceded by an identifier, or is preceded
-    only by a C++ string/char encoding prefix (`u8`, `u`, `U`, `L`)."""
-    if idx == 0 or not _is_ident_char(src[idx - 1]):
-        return True
-    if (idx >= 2 and src[idx - 2:idx] == "u8" and
-            (idx == 2 or not _is_ident_char(src[idx - 3]))):
-        return True
-    if (src[idx - 1] in ("u", "U", "L") and
-            (idx == 1 or not _is_ident_char(src[idx - 2]))):
-        return True
-    return False
 
 
 def _strip_cpp_comments(text):
@@ -513,27 +564,66 @@ def _strip_cpp_comments(text):
             emit(" ", " ", spliced_lines[i])
             i = end + 2
             continue
-        # Raw string literal: R"delim(...)delim" (with optional u8/u/U/L).
-        if ch == "R" and nxt == '"' and _has_char_or_raw_prefix(src, i):
-            paren = src.find("(", i + 2)
-            delim = src[i + 2:paren] if paren != -1 else ""
-            if (paren == -1 or len(delim) > 16 or
-                    any(c in (" ", "\t", "\r", "\n", "\\", ")")
-                        for c in delim)):
-                errors.append((spliced_lines[i], "unterminated-string",
-                               "malformed raw string literal"))
+        # Identifier, or raw string literal: [u8|u|U|L]R"delim(...)delim".
+        if ch == "_" or ch.isalpha():
+            j = i + 1
+            while j < n and _is_ident_char(src[j]):
+                j += 1
+            ident = src[i:j]
+            if (ident in ("R", "u8R", "uR", "UR", "LR") and
+                    j < n and src[j] == '"'):
+                paren = src.find("(", j + 1)
+                delim = src[j + 1:paren] if paren != -1 else ""
+                if (paren == -1 or len(delim) > 16 or
+                        any(c in (" ", "\t", "\r", "\n", "\\", ")")
+                            for c in delim)):
+                    errors.append((spliced_lines[i], "unterminated-string",
+                                   "malformed raw string literal"))
+                    break
+                closing = ")" + delim + '"'
+                end = src.find(closing, paren + 1)
+                if end == -1:
+                    errors.append((spliced_lines[i], "unterminated-string",
+                                   "unterminated raw string literal"))
+                    break
+                stop = end + len(closing)
+                for k in range(i, stop):
+                    c = "\n" if src[k] == "\n" else " "
+                    emit(c, c, spliced_lines[k])
+                i = stop
+                continue
+            for k in range(i, j):
+                emit(src[k], src[k], spliced_lines[k])
+            i = j
+            continue
+        # pp-number (C++14+ [lex.ppnumber]): starts with an ASCII digit or
+        # '.' followed by an ASCII digit. Only here is '\'' a digit separator,
+        # so tokens like `case'"':` or `return'"';` still lex `'"'` as a char
+        # literal rather than opening a fake string.
+        if _is_ascii_digit(ch) or (ch == "." and _is_ascii_digit(nxt)):
+            if ch == ".":
+                emit(ch, ch, spliced_lines[i])
+                i += 1
+            emit(src[i], src[i], spliced_lines[i])
+            i += 1
+            while i < n:
+                c = src[i]
+                c_next = src[i + 1] if i + 1 < n else ""
+                if c == "'" and c_next and _is_ident_char(c_next):
+                    emit(c, c, spliced_lines[i])
+                    emit(c_next, c_next, spliced_lines[i + 1])
+                    i += 2
+                    continue
+                if c in ("e", "E", "p", "P") and c_next in ("+", "-"):
+                    emit(c, c, spliced_lines[i])
+                    emit(c_next, c_next, spliced_lines[i + 1])
+                    i += 2
+                    continue
+                if _is_ident_char(c) or c == ".":
+                    emit(c, c, spliced_lines[i])
+                    i += 1
+                    continue
                 break
-            closing = ")" + delim + '"'
-            end = src.find(closing, paren + 1)
-            if end == -1:
-                errors.append((spliced_lines[i], "unterminated-string",
-                               "unterminated raw string literal"))
-                break
-            stop = end + len(closing)
-            for k in range(i, stop):
-                c = "\n" if src[k] == "\n" else " "
-                emit(c, c, spliced_lines[k])
-            i = stop
             continue
         # Normal string literal: preserve in `with_strings` (for #include),
         # blank interior in `no_strings`.
@@ -560,8 +650,8 @@ def _strip_cpp_comments(text):
                 emit(c, " ", spliced_lines[i])
                 i += 1
             continue
-        # Character literal (not a C++14 numeric digit separator like 1'000).
-        if ch == "'" and _has_char_or_raw_prefix(src, i):
+        # Character literal (pp-number digit separators were already consumed).
+        if ch == "'":
             emit("'", "'", spliced_lines[i])
             i += 1
             while i < n:
@@ -717,28 +807,155 @@ def _resolve_build_label(pkg, raw):
     return norm
 
 
-def _extract_build_referenced_files(build_path, content, tracked_set, pkg_files):
-    """Extracts tracked files referenced in BUILD `hdrs`, `textual_hdrs` or
-    extensionless `srcs` (so extensionless C++ headers cannot evade scanning).
+def _is_starlark_file(path):
+    base = os.path.basename(path)
+    if base in STARLARK_BASENAMES:
+        return True
+    return os.path.splitext(base)[1].lower() in STARLARK_SUFFIXES
 
-    Returns `(referenced_paths, error_or_none)`.
-    """
-    try:
-        tree = ast.parse(content, filename=build_path)
-    except SyntaxError as exc:
-        return set(), f"cannot parse BUILD file: {exc}"
 
-    pkg = os.path.dirname(build_path)
+def _is_non_cpp_file(path):
+    base = os.path.basename(path)
+    if base in NON_CPP_BASENAMES:
+        return True
+    return os.path.splitext(base)[1].lower() in NON_CPP_SUFFIXES
+
+
+def _collect_starlark_bindings(tree):
     bindings = {}
     for stmt in tree.body:
         if isinstance(stmt, ast.Assign):
             for target in stmt.targets:
                 if isinstance(target, ast.Name):
                     bindings[target.id] = stmt.value
+    return bindings
+
+
+def _eval_starlark_str(node, bindings, seen=frozenset()):
+    """Evaluates a Starlark string constant, constant `+` concat, or `.join`."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in bindings:
+        if node.id not in seen:
+            return _eval_starlark_str(bindings[node.id], bindings,
+                                      seen | {node.id})
+        return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _eval_starlark_str(node.left, bindings, seen)
+        right = _eval_starlark_str(node.right, bindings, seen)
+        if left is not None and right is not None:
+            return left + right
+        return None
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
+            node.func.attr == "join" and len(node.args) == 1 and
+            not node.keywords and
+            isinstance(node.args[0], (ast.List, ast.Tuple))):
+        sep = _eval_starlark_str(node.func.value, bindings, seen)
+        if sep is None:
+            return None
+        parts = []
+        for elt in node.args[0].elts:
+            val = _eval_starlark_str(elt, bindings, seen)
+            if val is None:
+                return None
+            parts.append(val)
+        return sep.join(parts)
+    return None
+
+
+def _extract_starlark_header_candidates(value):
+    """Yields header-path candidates embedded in a Starlark string."""
+    s_slash = value.replace("\\", "/")
+    for tok in STARLARK_PATH_TOKEN_RE.findall(s_slash):
+        yield tok
+        m = STARLARK_COPT_JOINED_RE.match(tok)
+        if m:
+            yield m.group(1)
+        if ":" in tok:
+            pkg, name = tok.rsplit(":", 1)
+            if "." in name or "/" in name:
+                yield f"{pkg}/{name}"
+
+
+def scan_starlark_ast(path, tree):
+    """Refuses BUILD / `.bzl` string constants carrying bypass symbols,
+    token pasting, forbidden header paths, or `-include`/`-imacros`/`-trigraphs`
+    compiler flags."""
+    bindings = _collect_starlark_bindings(tree)
+    violations = []
+    seen_keys = set()
+    reported_flag_nodes = set()
+
+    def add(lineno, kind, detail, header=""):
+        key = (lineno, kind, detail)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            violations.append(SourceViolation(path, lineno, kind, detail,
+                                              header=header))
+
+    # First detect adjacent flag+arg list/tuple pairs like `["-include", "foo"]`.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            elts = node.elts
+            for idx in range(len(elts) - 1):
+                flag = _eval_starlark_str(elts[idx], bindings)
+                if flag in FORBIDDEN_COPT_ADJACENT_FLAGS:
+                    arg = _eval_starlark_str(elts[idx + 1], bindings)
+                    if arg is not None:
+                        lineno = getattr(elts[idx], "lineno", 1)
+                        add(lineno, "starlark-forbidden-copt",
+                            f"Starlark list uses forbidden compiler flag "
+                            f"`{flag}` with `{arg}`")
+                        reported_flag_nodes.add(id(elts[idx]))
+
+    # Inspect every string constant (and constant string concatenation/join).
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Constant, ast.BinOp, ast.Call)):
+            continue
+        val = _eval_starlark_str(node, bindings)
+        if val is None:
+            continue
+        lineno = getattr(node, "lineno", 1)
+
+        for symbol, pattern in FORBIDDEN_SYMBOLS:
+            if pattern.search(val):
+                add(lineno, "starlark-forbidden-symbol",
+                    f"Starlark string references forbidden framework internal "
+                    f"`{symbol}`")
+
+        for m in TOKEN_PASTE_RE.finditer(val):
+            add(lineno, "starlark-token-paste",
+                f"Starlark string uses preprocessor token pasting "
+                f"`{m.group(0)}` (can assemble forbidden framework internals)")
+
+        if id(node) not in reported_flag_nodes:
+            for tok in re.findall(r"[^\s,]+", val):
+                if FORBIDDEN_COPT_FLAG_RE.match(tok):
+                    add(lineno, "starlark-forbidden-copt",
+                        f"Starlark string uses forbidden compiler flag `{tok}`")
+
+        for cand in _extract_starlark_header_candidates(val):
+            norm = _normalize_include(cand)
+            if _is_forbidden_include(norm):
+                add(lineno, "starlark-forbidden-include",
+                    f"Starlark string references forbidden header `{norm}`",
+                    header=norm)
+
+    violations.sort(key=lambda v: (v.line, v.kind, v.detail))
+    return violations
+
+
+def _extract_build_referenced_files(build_path, tree, tracked_set, pkg_files):
+    """Extracts tracked files referenced in BUILD `hdrs` or `textual_hdrs`
+    (expanding same-package `filegroup`s), so even a file whose suffix is on
+    `NON_CPP_SUFFIXES` is scanned as C++ if explicitly included as a header."""
+    pkg = os.path.dirname(build_path)
+    bindings = _collect_starlark_bindings(tree)
 
     def extract_strings(node, seen=frozenset()):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            yield node.value
+        val = _eval_starlark_str(node, bindings, seen)
+        if val is not None:
+            yield val
             return
         if isinstance(node, ast.Name) and node.id in bindings:
             if node.id not in seen:
@@ -765,37 +982,74 @@ def _extract_build_referenced_files(build_path, content, tracked_set, pkg_files)
         for child in ast.iter_child_nodes(node):
             yield from extract_strings(child, seen)
 
+    # Index same-package filegroups so `textual_hdrs = [":fg"]` expands `fg`.
+    filegroups = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+                node.func.id == "filegroup"):
+            fg_name = None
+            fg_srcs = []
+            for kw in node.keywords:
+                if kw.arg == "name":
+                    fg_name = _eval_starlark_str(kw.value, bindings)
+                elif kw.arg == "srcs":
+                    fg_srcs.extend(extract_strings(kw.value))
+            if fg_name:
+                filegroups[fg_name] = fg_srcs
+
+    def resolve_with_filegroups(raw, seen_fg=frozenset()):
+        candidate = _resolve_build_label(pkg, raw)
+        if not candidate:
+            return
+        if candidate in tracked_set:
+            yield candidate
+            return
+        # Check same-package filegroup target name (`:fg`, `fg`, `//pkg:fg`).
+        fg_key = None
+        if raw.startswith(":"):
+            fg_key = raw[1:]
+        elif raw.startswith("//"):
+            body = raw[2:]
+            if ":" in body:
+                target_pkg, target_name = body.split(":", 1)
+                if target_pkg == pkg:
+                    fg_key = target_name
+        elif "/" not in raw:
+            fg_key = raw
+        if fg_key and fg_key in filegroups and fg_key not in seen_fg:
+            for src in filegroups[fg_key]:
+                yield from resolve_with_filegroups(src, seen_fg | {fg_key})
+
     found = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         for kw in node.keywords:
-            if kw.arg not in ("hdrs", "textual_hdrs", "srcs"):
+            if kw.arg not in ("hdrs", "textual_hdrs"):
                 continue
             for raw in extract_strings(kw.value):
-                candidate = _resolve_build_label(pkg, raw)
-                if not candidate or candidate not in tracked_set:
-                    continue
-                if not _is_in_scanned_tree(candidate):
-                    continue
-                base = os.path.basename(candidate)
-                if base in ("BUILD", "BUILD.bazel"):
-                    continue
-                if kw.arg in ("hdrs", "textual_hdrs"):
+                for candidate in resolve_with_filegroups(raw):
+                    if not _is_in_scanned_tree(candidate):
+                        continue
+                    if _is_starlark_file(candidate):
+                        continue
                     found.add(candidate)
-                elif os.path.splitext(base)[1] == "":
-                    found.add(candidate)
-    return found, None
+    return found
 
 
-def find_node_source_files(files, read):
-    """Discovers every tracked C++ file (plus BUILD-referenced extensionless or
-    custom-suffix headers) under `bench/`, `examples/`, `tools/scaffold_testdata/`,
-    and any other robot tree outside `talOS/`.
+def discover_scanned_files(files, read):
+    """Discovers every tracked source file and Starlark (`BUILD`, `BUILD.bazel`,
+    `.bzl`) file under `bench/`, `examples/`, `tools/scaffold_testdata/`, and
+    any other robot tree outside `talOS/`.
 
-    Returns `(cpp_files, read_errors)` where `read_errors` is a list of
-    `(path, detail)` for any BUILD file that could not be read or parsed
-    (fail closed).
+    Returns `(cpp_files, starlark_trees, read_errors)` where:
+    - `cpp_files`: sorted list of files to scan as C++ (every tracked file
+      not on `NON_CPP_BASENAMES`/`NON_CPP_SUFFIXES`, plus any file referenced
+      via BUILD `hdrs`/`textual_hdrs`);
+    - `starlark_trees`: sorted list of `(path, ast_tree)` pairs for every
+      `BUILD`, `BUILD.bazel`, and `.bzl` file under the scanned roots;
+    - `read_errors`: list of `(path, detail)` for any Starlark file that could
+      not be read, decoded as UTF-8, or parsed (fail closed).
     """
     tracked_set = set(files)
     by_pkg = {}
@@ -811,28 +1065,31 @@ def find_node_source_files(files, read):
             by_pkg.setdefault(pkg, []).append(rel)
 
     cpp_files = set()
+    starlark_trees = []
     read_errors = []
     for path in sorted(files):
         if not _is_in_scanned_tree(path):
             continue
-        base = os.path.basename(path)
-        if base in ("BUILD", "BUILD.bazel"):
+        if _is_starlark_file(path):
             try:
                 content = read(path)
-            except OSError as exc:
-                read_errors.append((path, f"cannot read BUILD file: {exc}"))
+            except (OSError, UnicodeDecodeError) as exc:
+                read_errors.append((path, f"cannot read Starlark file: {exc}"))
                 continue
-            pkg = os.path.dirname(path)
-            referenced, err = _extract_build_referenced_files(
-                path, content, tracked_set, by_pkg.get(pkg, ()))
-            if err:
-                read_errors.append((path, err))
+            try:
+                tree = ast.parse(content, filename=path)
+            except SyntaxError as exc:
+                read_errors.append((path, f"cannot parse Starlark file: {exc}"))
                 continue
-            cpp_files.update(referenced)
+            starlark_trees.append((path, tree))
+            if os.path.basename(path) in STARLARK_BASENAMES:
+                pkg = os.path.dirname(path)
+                cpp_files.update(_extract_build_referenced_files(
+                    path, tree, tracked_set, by_pkg.get(pkg, ())))
             continue
-        if os.path.splitext(base)[1].lower() in CPP_SUFFIXES:
+        if not _is_non_cpp_file(path):
             cpp_files.add(path)
-    return sorted(cpp_files), read_errors
+    return sorted(cpp_files), starlark_trees, read_errors
 
 
 def _is_exempt_cli_violation(violation, exempt_cli_files):
@@ -847,15 +1104,21 @@ def _is_exempt_cli_violation(violation, exempt_cli_files):
 
 
 def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
-    """Scans C++ sources outside `talOS/` for RULES.md 2 bypasses.
-    Returns the number of failures."""
+    """Scans C++ sources and BUILD/`.bzl` files outside `talOS/` for RULES.md 2
+    bypasses. Returns the number of failures."""
     if exempt_cli_files is None:
         exempt_cli_files = NON_NODE_CLI_FILES
-    cpp_files, read_errors = find_node_source_files(files, read)
+    cpp_files, starlark_trees, read_errors = discover_scanned_files(files, read)
     failures = 0
     for path, detail in read_errors:
         failures += 1
         print(f"VIOLATION {path}: {detail} (fail closed)", file=out)
+
+    for path, tree in starlark_trees:
+        for violation in scan_starlark_ast(path, tree):
+            failures += 1
+            print(f"VIOLATION {violation.path}:{violation.line}: "
+                  f"{violation.detail} (RULES.md 2 / REQ-SAFE-27)", file=out)
 
     for path, allowed_headers in sorted(exempt_cli_files.items()):
         if not allowed_headers:
@@ -873,7 +1136,7 @@ def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
     for path in cpp_files:
         try:
             text = read(path)
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             failures += 1
             print(f"VIOLATION {path}: cannot read source file: {exc} "
                   f"(fail closed)", file=out)
@@ -901,6 +1164,7 @@ def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
     else:
         print(f"C++ devices-layer bypass check passed "
               f"({len(cpp_files)} source file(s), "
+              f"{len(starlark_trees)} Starlark file(s), "
               f"{exempt_header_count} allowlisted CLI header(s))", file=out)
     return failures
 
@@ -917,7 +1181,7 @@ def tracked_files():
 
 
 def read_source_file(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 
