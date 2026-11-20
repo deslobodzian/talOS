@@ -13,23 +13,15 @@
 namespace talos::hardware {
 // Leaves no non-finite value in `state`'s configured samples, the gateway's
 // rule for every backend (Gateway::Tick, after Backend::Read),
-// testing::SimHardware, and EncodeSanitizedState below. A motor or CAN sensor
-// whose position or velocity is not finite is invalid (MarkInvalid); a
-// motor's non-finite voltage, current or temperature is 0 and does not by
+// testing::SimHardware, and Encode(const State&, ...) (messages.h). A motor or
+// CAN sensor whose position or velocity is not finite is invalid (MarkInvalid);
+// a motor's non-finite voltage, current or temperature is 0 and does not by
 // itself change its validity; an analog input, encoder or PWM output sample
 // with one is invalid with 0; a non-finite battery voltage is 0 with the
 // health sample invalid; and a CAN bus slot with a non-finite utilization is
 // a failed read: utilization 0, a kOk or kPending read state kFailed, its
 // counters kept.
 void ReplaceNonFinite(State& state);
-
-// Applies ReplaceNonFinite to a copy of `state` and encodes it for the wire
-// (Encode, messages.h). Every State producer encodes through this so no
-// non-finite value can reach the wire or fail tenths encoding, even if a
-// caller did not sanitize beforehand. Returns 0 only for structural errors
-// (out-of-range counts or enums, or a too-small buffer), never for a
-// non-finite measurement.
-std::size_t EncodeSanitizedState(const State& state, std::span<uint8_t> data);
 
 // Platform-specific code owns device objects. Configure runs at startup or
 // disabled and may block; Read/Apply/Neutral and reset polling must not block.

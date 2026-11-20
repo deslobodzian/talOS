@@ -190,7 +190,7 @@ class Endpoint {
     }
     auto state = gateway_.snapshot();
     state.clock_probe_time_us = clock_probe_time_us;
-    const auto size = EncodeSanitizedState(state, buffer_);
+    const auto size = Encode(state, buffer_);
     if (size == 0) {
       return Worse(ack_status, protocol::UdpStatus::kInvalidArgument);
     }
