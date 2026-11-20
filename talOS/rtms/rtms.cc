@@ -175,6 +175,23 @@ bool HeldByLiveProcess(const RTMSHeader& header) {
   return false;
 }
 
+// Releases one counted attachment to a standalone segment using the CAS
+// close protocol. Returns true when this caller dropped the count to zero and
+// marked the segment closing, so it must unlink the segment after unmapping.
+bool ReleaseCountedLifetime(RTMSHeader& header) noexcept {
+  std::uint64_t word = header.lifetime.load(std::memory_order_acquire);
+  for (;;) {
+    const std::uint64_t count = word & kLifetimeCountMask;
+    const std::uint64_t next =
+        count <= 1 ? ((word & ~kLifetimeCountMask) | kLifetimeClosing)
+                   : word - 1;
+    if (header.lifetime.compare_exchange_weak(
+            word, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      return count <= 1;
+    }
+  }
+}
+
 }  // namespace
 
 RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
@@ -351,8 +368,11 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
         ClaimWriter(*header, path_);
       } catch (...) {
         if (counted_) {
-          header->lifetime.fetch_sub(1, std::memory_order_acq_rel);
+          const std::uint64_t segment_id = header->segment_id;
+          const bool unlink = ReleaseCountedLifetime(*header);
           counted_ = false;
+          ptr = SharedMemoryPtr{};
+          if (unlink) UnlinkIfSame(path_, segment_id);
         }
         throw;
       }
@@ -376,19 +396,7 @@ void RTMSQueue::close() noexcept {
   const std::uint64_t segment_id = header_->segment_id;
   bool unlink = options_.session_owner;
   if (counted_) {
-    std::uint64_t word = header_->lifetime.load(std::memory_order_acquire);
-    for (;;) {
-      const std::uint64_t count = word & kLifetimeCountMask;
-      const std::uint64_t next =
-          count <= 1 ? ((word & ~kLifetimeCountMask) | kLifetimeClosing)
-                     : word - 1;
-      if (header_->lifetime.compare_exchange_weak(word, next,
-                                                  std::memory_order_acq_rel,
-                                                  std::memory_order_acquire)) {
-        unlink = count <= 1;
-        break;
-      }
-    }
+    unlink = ReleaseCountedLifetime(*header_);
   }
   header_ = nullptr;
   counted_ = false;

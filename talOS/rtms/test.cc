@@ -1424,6 +1424,45 @@ TEST(RTMSLifetime, ASegmentLeftClosingByAKilledHolderIsReclaimed) {
   EXPECT_EQ(reopened.writer_sequence(), 0u);
 }
 
+// REQ-CONTRACT-21 / REQ-OPS-03: when ClaimWriter() fails during open() on a
+// standalone segment, a non-last opener drops its count leaving the segment
+// alive, while a last-holder opener runs the CAS close/unlink protocol so the
+// shared-memory segment is not leaked.
+TEST(RTMSLifetime, ClaimWriterFailureAsLastHolderUnlinksStandaloneSegment) {
+  const std::string path = make_test_path("claim_fail");
+  shm_unlink(ShmObjectName(path).c_str());
+  RTMSQueue owner{path,
+                  sizeof(Message::TestMessage),
+                  alignof(Message::TestMessage),
+                  kSchema,
+                  16,
+                  publisher_options()};
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_EQ(header->lifetime.load(std::memory_order_acquire), 1u);
+
+  // While another holder remains, a failed ClaimWriter keeps the segment alive
+  // and restores the holder count.
+  EXPECT_THROW((RTMSQueue{path, sizeof(Message::TestMessage),
+                          alignof(Message::TestMessage), kSchema, 16,
+                          publisher_options()}),
+               std::runtime_error);
+  EXPECT_TRUE(SegmentExists(path));
+  EXPECT_EQ(header->lifetime.load(std::memory_order_acquire), 1u);
+
+  // Simulate the concurrent close of the previous holder before the failing
+  // opener's catch block runs (count drops to 0 before the opener releases its
+  // increment, while owner_pid is still live so ClaimWriter throws).
+  header->lifetime.store(0, std::memory_order_release);
+  EXPECT_THROW((RTMSQueue{path, sizeof(Message::TestMessage),
+                          alignof(Message::TestMessage), kSchema, 16,
+                          publisher_options()}),
+               std::runtime_error);
+  EXPECT_FALSE(SegmentExists(path));
+  EXPECT_NE(header->lifetime.load(std::memory_order_acquire) & kLifetimeClosing,
+            0u);
+}
+
 // --- dead readers
 // ---------------------------------------------------------------
 
