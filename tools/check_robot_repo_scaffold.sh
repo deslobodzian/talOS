@@ -64,6 +64,8 @@ start=$SECONDS
 # shellcheck source=tools/check_copy_lock.sh
 . "$talos/tools/check_copy_lock.sh" || die "cannot read check_copy_lock.sh"
 take_copy_lock "$lock" "$copy"
+mount_flag="$(sandbox_mount_talos "$talos")"
+[ -n "$mount_flag" ] && bazel_flags+=("$mount_flag")
 
 bazel_started=0
 remove_copy() {

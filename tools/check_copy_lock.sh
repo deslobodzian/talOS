@@ -50,3 +50,17 @@ point_rc_at_talos() {
     "$rc" > "$rc.new" && mv "$rc.new" "$rc" || return 2
   return "$found"
 }
+
+# Bazel 8's Linux sandbox mounts a private tmpfs over /tmp
+# (--incompatible_sandbox_hermetic_tmp), hiding any local_path_override or
+# --override_module checkout under /tmp (such as tools/prepush.sh's worktree).
+# Prints the --sandbox_add_mount_pair flag needed to expose TALOS inside the
+# sandbox when running on Linux with TALOS under /tmp; prints nothing otherwise.
+sandbox_mount_talos() {
+  local talos_dir="$1"
+  if [ "$(uname -s)" = Linux ]; then
+    case "$talos_dir" in
+      /tmp/*) printf '%s\n' "--sandbox_add_mount_pair=$talos_dir" ;;
+    esac
+  fi
+}

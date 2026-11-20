@@ -197,6 +197,35 @@ class CheckRobotRepositoryTest(unittest.TestCase):
                 "build:release "
                 f"--workspace_status_command={talos}/tools/workspace_status.sh\n")
 
+    # REQ-DEV-32
+    def test_mounts_talos_in_linux_sandbox_when_under_tmp(self):
+        # Bazel 8's Linux sandbox mounts a private tmpfs over /tmp
+        # (--incompatible_sandbox_hermetic_tmp), hiding a prepush worktree
+        # under /tmp unless --sandbox_add_mount_pair exposes it.
+        if os.uname().sysname != "Linux":
+            self.skipTest("Linux sandbox tmpfs isolation only")
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp_talos:
+            tmp_talos = os.path.realpath(tmp_talos)
+            for name in ("check_copy_lock.sh", "check_robot_repository.sh"):
+                src = os.path.join(os.path.dirname(self.script), name)
+                with open(src, encoding="utf-8") as f:
+                    put(os.path.join(tmp_talos, "tools", name), f.read(), 0o755)
+            result = subprocess.run(
+                ["bash",
+                 os.path.join(tmp_talos, "tools", "check_robot_repository.sh"),
+                 self.robot],
+                env=self.env, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0,
+                             result.stdout + result.stderr)
+            flag = f"--sandbox_add_mount_pair={tmp_talos}"
+            build_and_test = [
+                call.split("|", 1)[1] for call in self.calls()
+                if call.split("|", 1)[1].startswith(("build ", "test "))
+            ]
+            self.assertEqual(len(build_and_test), 2, self.calls())
+            for args in build_and_test:
+                self.assertIn(flag, args)
+
 
 if __name__ == "__main__":
     unittest.main()
