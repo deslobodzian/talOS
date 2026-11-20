@@ -87,21 +87,22 @@ struct ModeStream {
   bool closed_last{false};
 };
 
-struct AlertChannelState {
-  bool active{false};
-  std::int64_t start_ns{0};
-};
-
 struct RawAlertInterval {
   std::int64_t start_ns{0};
   std::int64_t end_ns{0};
-  std::uint32_t channel{0};
+};
+static_assert(sizeof(RawAlertInterval) == 16,
+              "REQ-OPS-42: 16 B per transient alert interval");
+
+struct AlertChannelState {
+  bool active{false};
+  std::int64_t start_ns{0};
+  std::vector<RawAlertInterval> intervals;
+  std::uint64_t dropped{0};
 };
 
 struct AlertStream {
-  std::vector<AlertChannelState> state;
-  std::vector<RawAlertInterval> intervals;
-  std::uint64_t dropped{0};
+  std::vector<AlertChannelState> channels;
   std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
 };
 
@@ -447,8 +448,8 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       const std::int64_t publish_ns = r.header.publish_time_ns;
       AlertStream& stream =
           alert_streams[{topic_idx, log_file.process, is_send}];
-      if (stream.state.empty()) {
-        stream.state.resize(topic.alert_channels.size());
+      if (stream.channels.empty()) {
+        stream.channels.resize(topic.alert_channels.size());
       }
       if (publish_ns >= stream.last_publish_ns) {
         stream.last_publish_ns = publish_ns;
@@ -460,16 +461,16 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
             continue;
           }
           const bool active = raw != 0;
-          AlertChannelState& st = stream.state[i];
+          AlertChannelState& st = stream.channels[i];
           if (active && !st.active) {
             st.active = true;
             st.start_ns = publish_ns;
           } else if (!active && st.active) {
             st.active = false;
-            if (stream.intervals.size() < kMaxTimelineAlerts) {
-              stream.intervals.push_back({st.start_ns, publish_ns, c});
+            if (st.intervals.size() < kMaxTimelineAlerts) {
+              st.intervals.push_back({st.start_ns, publish_ns});
             } else {
-              ++stream.dropped;
+              ++st.dropped;
             }
           }
         }
@@ -586,6 +587,15 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
 
   // Finalize timeline modes and alerts from each topic's canonical stream.
   std::vector<AlertInterval> combined_alerts;
+  const auto sort_alerts = [&combined_alerts, &session] {
+    std::sort(combined_alerts.begin(), combined_alerts.end(),
+              [&session](const AlertInterval& a, const AlertInterval& b) {
+                if (a.start_ns != b.start_ns) return a.start_ns < b.start_ns;
+                if (a.end_ns != b.end_ns) return a.end_ns < b.end_ns;
+                return session->channel(a.channel).name <
+                       session->channel(b.channel).name;
+              });
+  };
   for (std::uint32_t t = 0; t < session->topics_.size(); ++t) {
     const Topic& topic = session->topics_[t];
     const bool is_send = topic.kind == EventKind::SEND;
@@ -607,36 +617,33 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
         AlertStream& stream = it->second;
         const auto& alert_channels = indexer.topics[build_idx].alert_channels;
         for (std::size_t i = 0; i < alert_channels.size(); ++i) {
-          if (stream.state[i].active) {
-            if (stream.intervals.size() < kMaxTimelineAlerts) {
-              stream.intervals.push_back(
-                  {stream.state[i].start_ns,
-                   std::max(stream.state[i].start_ns, session->end_ns_),
-                   alert_channels[i]});
+          AlertChannelState& st = stream.channels[i];
+          if (st.active) {
+            if (st.intervals.size() < kMaxTimelineAlerts) {
+              st.intervals.push_back(
+                  {st.start_ns, std::max(st.start_ns, session->end_ns_)});
             } else {
-              ++stream.dropped;
+              ++st.dropped;
             }
           }
-        }
-        session->alerts_dropped_ += stream.dropped;
-        for (const RawAlertInterval& iv : stream.intervals) {
-          combined_alerts.push_back(
-              {iv.start_ns, iv.end_ns, ChannelRef{t, iv.channel}});
+          session->alerts_dropped_ += st.dropped;
+          for (const RawAlertInterval& iv : st.intervals) {
+            combined_alerts.push_back(
+                {iv.start_ns, iv.end_ns, ChannelRef{t, alert_channels[i]}});
+          }
+          std::vector<RawAlertInterval>{}.swap(st.intervals);
+          if (combined_alerts.size() > kMaxTimelineAlerts) {
+            sort_alerts();
+            session->alerts_dropped_ +=
+                combined_alerts.size() - kMaxTimelineAlerts;
+            combined_alerts.resize(kMaxTimelineAlerts);
+          }
         }
       }
     }
   }
-  std::sort(combined_alerts.begin(), combined_alerts.end(),
-            [&session](const AlertInterval& a, const AlertInterval& b) {
-              if (a.start_ns != b.start_ns) return a.start_ns < b.start_ns;
-              if (a.end_ns != b.end_ns) return a.end_ns < b.end_ns;
-              return session->channel(a.channel).name <
-                     session->channel(b.channel).name;
-            });
-  if (combined_alerts.size() > kMaxTimelineAlerts) {
-    session->alerts_dropped_ += combined_alerts.size() - kMaxTimelineAlerts;
-    combined_alerts.resize(kMaxTimelineAlerts);
-  }
+  alert_streams.clear();
+  sort_alerts();
   session->alerts_ = std::move(combined_alerts);
   session->alerts_.shrink_to_fit();
 

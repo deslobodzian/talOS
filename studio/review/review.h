@@ -39,9 +39,14 @@
 //       {"node","start_ns","end_ns","reason"} (end_ns is null when
 //       end_wall_ns == 0). Each list is bounded per open session
 //       (kMaxTimelineModes = 4096, kMaxTimelineAlerts = 4096,
-//       kMaxTimelineRuns = 4096; REQ-OPS-42), with overflow counted in
-//       modes_dropped, alerts_dropped and runs_dropped (which also sums each
-//       node's manifest runs_dropped).
+//       kMaxTimelineRuns = 4096; 96 KiB retained each for modes and alerts;
+//       REQ-OPS-42). During Session::Open(), alerts buffer at most
+//       kMaxTimelineAlerts intervals per alert channel stream (64 KiB per
+//       alert channel stream) before merging to the earliest
+//       kMaxTimelineAlerts globally by start_ns, so a flapping peer cannot
+//       starve another alert on the same status topic. Overflow is counted in
+//       modes_dropped, alerts_dropped (per-channel plus global merge drops)
+//       and runs_dropped (which also sums each node's manifest runs_dropped).
 //   GET /review/<id>/declared.json
 //       the session directory's graph.json verbatim (application/json, up to
 //       kMaxDeclaredBytes), or 404 plain text when absent
