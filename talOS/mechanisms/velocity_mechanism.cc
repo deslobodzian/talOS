@@ -82,7 +82,7 @@ void VelocityMechanism::update() {
   velocity_rps_ = motor_.velocity();
   velocity_recent_ = velocity_recent();
   current_a_ = motor_.current();
-  readiness(spin ? request_rps_ : 0.0);
+  readiness(goal_rps_);
 }
 
 // The velocity's age at its State against ReadinessAgeBound; an unknown age

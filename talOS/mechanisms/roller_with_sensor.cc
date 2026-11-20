@@ -80,13 +80,12 @@ void RollerWithSensor::update() {
        phase_ == RollerPhase::kFeeding)) {
     go(RollerPhase::kIdle);
   }
-  // The roller output of the phase this tick starts in; transitions apply
-  // from the next tick.
-  std::optional<double> volts;
+  // Evaluate phase transitions before selecting the voltage so changes take
+  // effect on the same tick without a one-tick overshoot from the old phase.
   switch (phase_) {
     case RollerPhase::kIdle:
       if (command == RollerCommand::kIntake) {
-        go(RollerPhase::kIntaking);
+        go(has_piece_ ? RollerPhase::kHolding : RollerPhase::kIntaking);
       } else if (idle_runs_ && newly_asked &&
                  command == RollerCommand::kEject) {
         go(RollerPhase::kEjecting);
@@ -95,11 +94,6 @@ void RollerWithSensor::update() {
       }
       break;
     case RollerPhase::kIntaking:
-      // Intaking stops on the sensor, so it does not drive toward one it
-      // cannot read: a piece may arrive during the gap. A held piece keeps
-      // hold_v, and a timed eject or feed runs its clock, since neither
-      // needs the sensor to stop.
-      if (sensor_connected_) volts = intake_v_;
       if (has_piece_) {
         go(RollerPhase::kHolding);
       } else if (command == RollerCommand::kIdle) {
@@ -111,7 +105,6 @@ void RollerWithSensor::update() {
       }
       break;
     case RollerPhase::kHolding:
-      volts = hold_v_;
       if (command == RollerCommand::kEject) {
         go(RollerPhase::kEjecting);
       } else if (command == RollerCommand::kFeed) {
@@ -121,12 +114,31 @@ void RollerWithSensor::update() {
       }
       break;
     case RollerPhase::kEjecting:
-      volts = eject_v_;
       if (now - phase_since_ >= eject_time_) go(RollerPhase::kIdle);
       break;
     case RollerPhase::kFeeding:
-      volts = feed_v_;
       if (now - phase_since_ >= feed_time_) go(RollerPhase::kIdle);
+      break;
+  }
+  std::optional<double> volts;
+  switch (phase_) {
+    case RollerPhase::kIdle:
+      break;
+    case RollerPhase::kIntaking:
+      // Intaking stops on the sensor, so it does not drive toward one it
+      // cannot read: a piece may arrive during the gap. A held piece keeps
+      // hold_v, and a timed eject or feed runs its clock, since neither
+      // needs the sensor to stop.
+      if (sensor_connected_) volts = intake_v_;
+      break;
+    case RollerPhase::kHolding:
+      volts = hold_v_;
+      break;
+    case RollerPhase::kEjecting:
+      volts = eject_v_;
+      break;
+    case RollerPhase::kFeeding:
+      volts = feed_v_;
       break;
   }
   // Only a live request drives; anything not set this tick is neutral.

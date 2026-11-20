@@ -173,6 +173,71 @@ TEST(RollerWithSensor, DrivesAtALiveLane) {
   EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
 }
 
+// Phase transitions take effect on the same tick's voltage: no one-tick lag on
+// entry and no one-tick voltage overshoot from the previous phase on exit.
+// REQ-SAFE-38
+TEST(RollerWithSensor, TransitionsApplyVoltageOnTheSameTick) {
+  Rig intake{"intake"};
+  intake.Start();
+
+  // kIdle -> kIntaking drives intake_v on the first tick.
+  intake.Drive(Command::INTAKE, 5ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIntaking);
+  EXPECT_TRUE(intake.roller().driving());
+  EXPECT_DOUBLE_EQ(intake.roller().output_v(), 6.0);
+
+  // kIntaking -> kIdle stops driving on the transition tick.
+  intake.Drive(Command::IDLE, 5ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_FALSE(intake.roller().driving());
+  EXPECT_DOUBLE_EQ(intake.roller().output_v(), 0.0);
+
+  // kIntaking -> kHolding switches to hold_v on the tick has_piece turns true.
+  intake.Drive(Command::INTAKE, 10ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kIntaking);
+  intake.Sensor("beam", true);
+  for (int i = 0; i < 5 && !intake.roller().has_piece(); ++i) {
+    intake.Drive(Command::INTAKE, 5ms);
+  }
+  ASSERT_TRUE(intake.roller().has_piece());
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kHolding);
+  EXPECT_TRUE(intake.roller().driving());
+  EXPECT_DOUBLE_EQ(intake.roller().output_v(), 1.0);
+
+  // kHolding -> kEjecting applies eject_v on the transition tick.
+  intake.Drive(Command::EJECT, 5ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
+  EXPECT_TRUE(intake.roller().driving());
+  EXPECT_DOUBLE_EQ(intake.roller().output_v(), -8.0);
+
+  // kEjecting -> kIdle goes neutral on the exact tick eject_us expires.
+  intake.Sensor("beam", false);
+  bool finished = false;
+  for (int i = 0; i < 60; ++i) {
+    intake.Drive(Command::EJECT, 5ms);
+    if (intake.roller().phase() == RollerPhase::kIdle) {
+      EXPECT_FALSE(intake.roller().driving());
+      EXPECT_DOUBLE_EQ(intake.roller().output_v(), 0.0);
+      finished = true;
+      break;
+    }
+    EXPECT_DOUBLE_EQ(intake.roller().output_v(), -8.0);
+  }
+  EXPECT_TRUE(finished);
+
+  // kIdle with a piece already present enters kHolding without pulsing
+  // intake_v.
+  intake.Sensor("beam", true);
+  for (int i = 0; i < 5 && !intake.roller().has_piece(); ++i) {
+    intake.Drive(Command::IDLE, 5ms);
+  }
+  ASSERT_TRUE(intake.roller().has_piece());
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  intake.Drive(Command::INTAKE, 5ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kHolding);
+  EXPECT_DOUBLE_EQ(intake.roller().output_v(), 1.0);
+}
+
 // With idle_runs, an eject asked in kIdle runs once however long it is
 // held; asking again (after another command) runs it again. Without it
 // (the indexer) kIdle ignores an eject.

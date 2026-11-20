@@ -511,18 +511,32 @@ void PositionMechanism::idle(PositionPhase phase) {
 }
 
 // The equivalent of `goal` (goal + k * wrap_rot) nearest the current
-// position, moved inside [min_rot, max_rot] when one equivalent is.
+// position, moved inside [min_rot, max_rot] when one equivalent is; when the
+// travel is narrower than wrap_rot and no equivalent lies inside it, the one
+// nearest [min_rot, max_rot] so clamping goes to the nearest stop.
 double PositionMechanism::wrap(double goal) const {
   if (wrap_rot_ <= 0) return goal;
-  double best =
+  const double best =
       goal + std::round((position_rot_ - goal) / wrap_rot_) * wrap_rot_;
+  if (best >= min_rot_ && best <= max_rot_) return best;
+  double below = 0.0;
+  double above = 0.0;
   if (best > max_rot_) {
-    best -= std::ceil((best - max_rot_) / wrap_rot_) * wrap_rot_;
+    below = best - std::ceil((best - max_rot_) / wrap_rot_) * wrap_rot_;
+    if (below >= min_rot_) return below;
+    above = below + wrap_rot_;
+  } else {
+    above = best + std::ceil((min_rot_ - best) / wrap_rot_) * wrap_rot_;
+    if (above <= max_rot_) return above;
+    below = above - wrap_rot_;
   }
-  if (best < min_rot_) {
-    best += std::ceil((min_rot_ - best) / wrap_rot_) * wrap_rot_;
-  }
-  return best;
+  const double d_below = min_rot_ - below;
+  const double d_above = above - max_rot_;
+  if (d_below != d_above) return d_below < d_above ? below : above;
+  return std::abs(position_rot_ - min_rot_) <=
+                 std::abs(position_rot_ - max_rot_)
+             ? below
+             : above;
 }
 
 double PositionMechanism::gravity_at(double position_rot) const {

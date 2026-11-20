@@ -166,6 +166,20 @@ home_margin_rot = 0.2
 homing_timeout_us = 500000
 homing_stall_rps = 0.05
 homing_stall_us = 200000
+
+[subsystems.sector.motors.sector]
+can_id = 12
+feedback = "RemoteCANcoder"
+feedback_sensor = "sector_cc"
+position_frame = "absolute"
+[subsystems.sector.sensors.sector_cc]
+type = "CANcoder"
+can_id = 13
+[subsystems.sector.sector]
+tolerance_rot = 0.01
+wrap_rot = 1.0
+min_rot = 0.0
+max_rot = 0.75
 )";
 
 // A robot node around one PositionMechanism: its goal is the teleop lane's,
@@ -1138,6 +1152,37 @@ TEST(PositionMechanism, TurretWrapPicksTheNearestEquivalentInRange) {
   EXPECT_NEAR(demand_for(0.6, 0.3), 0.3, 1e-9);    // already nearest
   EXPECT_NEAR(demand_for(0.7, -0.9), 0.1, 1e-9);   // 1.1 is past max_rot
   EXPECT_NEAR(demand_for(-0.6, 0.5), -0.5, 1e-9);  // the other way
+}
+
+// When max_rot - min_rot < wrap_rot (a bounded turret with a dead zone), a
+// goal with no equivalent inside [min_rot, max_rot] clamps to the stop nearest
+// the goal instead of wrapping across the range to the far stop.
+// REQ-SAFE-36
+TEST(PositionMechanism, TurretWrapClampsUnreachableGoalToNearestStop) {
+  Rig sector{"sector"};
+  sector.Start();
+  const auto demand_for = [&](double position_rot, double goal_rot) {
+    SCOPED_TRACE(std::to_string(position_rot) + " -> " +
+                 std::to_string(goal_rot));
+    sector.SetMotor(position_rot);
+    sector.Drive(goal_rot, 20ms);
+    EXPECT_NEAR(sector.mech().goal_rot(), sector.Applied().demand, 1e-12);
+    return sector.Applied().demand;
+  };
+  // Dead zone is (0.75, 1.0), midpoint 0.875: -0.01 / 0.99 is 0.01 from min
+  // (0.0) and 0.24 from max (0.75); -0.20 / 0.80 is 0.05 from max and 0.20
+  // from min.
+  EXPECT_NEAR(demand_for(0.1, -0.01), 0.0, 1e-9);
+  EXPECT_NEAR(demand_for(0.7, 0.99), 0.0, 1e-9);
+  EXPECT_NEAR(demand_for(0.1, -0.20), 0.75, 1e-9);
+  EXPECT_NEAR(demand_for(0.7, 0.80), 0.75, 1e-9);
+  // Midpoint of the dead zone breaks ties toward the nearer stop.
+  EXPECT_NEAR(demand_for(0.1, 0.875), 0.0, 1e-9);
+  EXPECT_NEAR(demand_for(0.7, 0.875), 0.75, 1e-9);
+  // Equivalents inside [min_rot, max_rot] and far-out positions still wrap.
+  EXPECT_NEAR(demand_for(0.1, 1.5), 0.5, 1e-9);
+  EXPECT_NEAR(demand_for(-2.0, -0.01), 0.0, 1e-9);
+  EXPECT_NEAR(demand_for(3.0, -0.01), 0.0, 1e-9);
 }
 
 // at_goal needs at_goal_debounce_us of continuous tolerance, and leaves at
