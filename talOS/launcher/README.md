@@ -427,18 +427,26 @@ bundled bridge), and the bundle's webroot replaces a relative
 `[studio] webroot` (an absolute one is kept). A bundle built without them has
 no bridge: the flag adds none to the roster and the launcher says the bundle
 carries no Studio. The bridge answers `--describe`
-like any other node, and the launcher starts it with the session's `graph.json`
-as `--declared` and the session's `manifest.json` as `--manifest`; its stdout
-and stderr land in `<output_dir>/<session_id>/studio_bridge.log`
-(plaintext, not a `.tlog`) beside the manifest, like every member's
-[output](#node-output), but are not echoed to the launcher's stdout.
+like any other node, and the launcher starts it with `--session-id`, the
+session's `graph.json` as `--declared` and the session's `manifest.json` as
+`--manifest`; its stdout and stderr land in
+`<output_dir>/<session_id>/studio_bridge.log` (plaintext, not a `.tlog`) beside
+the manifest, like every member's [output](#node-output), but are not echoed to
+the launcher's stdout.
 
 The bridge is the one roster member supervised differently (`StudioBridge` in
 `studio_bridge.h`); it waits for the telemetry segment itself (see the
 [bridge README](../../studio/bridge/README.md#publisher-and-serving-constraints)).
-It is an observer: its spawns, exits, restarts and final give-up never start,
-stop, restart or delay another member, and never change the launcher's exit
-status. Its first run spawns with the nodes. Every ending of a run while the
+It is an observer: its spawns, exits, liveness kills, restarts and final
+give-up never start, stop, restart or delay another member, and never change
+the launcher's exit status. Its first run spawns with the nodes, and it claims
+a live registry row (observer tier, updating `heartbeat_monotonic_ns` and
+`dispatch_count` on every loop pass, at least every 250 ms). The launcher
+watches that row with `RunLiveness` (1 s period, `kStudioBridgePeriod`, with
+the session's `--heartbeat-periods` and `--heartbeat-startup-grace-ms`): a
+bridge whose loop stops making progress is SIGKILLed as `stalled` (or
+`heartbeat_missing` if it never registers past the grace and timeout) and
+restarted on the bridge's schedule below. Every ending of a run while the
 session is not stopping is a failure, exit 0 included (a server that ends
 before the stop has failed), and so is a spawn that fails; each is restarted
 on a non-critical member's schedule ([restarts](#restarts)): 50 ms, doubling
@@ -453,12 +461,12 @@ Where a node would be quarantined, the bridge is left for the rest of the
 session instead: one line names it and says it will not be restarted again,
 its manifest entry is marked `recorder_failed`, and the session runs on
 without Studio. The bound counts starts inside the rolling restart window,
-not over the session: a bridge that dies fewer than `max_restarts` times
-per window is restarted every time, for the whole session. A bridge that
+not over the session: a bridge that dies or hangs fewer than `max_restarts`
+times per window is restarted every time, for the whole session. A bridge that
 fails at once on every run therefore costs at
 most `max_restarts` + 1 spawns, 6 by default, all within about 1.6 s of the
 first (50 + 100 + 200 + 400 + 800 ms of backoff), then none: no busy loop
-and no fork storm, and since it takes no registry row, no registry churn.
+and no fork storm.
 `--max-restarts 0` leaves it at its first ending. A stop cancels a pending
 restart, so no bridge is spawned once the stop has begun, and the session
 ends without waiting out the backoff. A run counts as up once it has run
@@ -471,7 +479,8 @@ roster's completion. Its restarts are in its manifest entry
 (`restart_count`, which counts every restart attempt, one whose spawn
 failed included, as its restart lines number them;
 `retry_at_monotonic_ns` while one is pending; and each
-run's `runs[]` entry with the reason it ended), and so in
+run's `runs[]` entry with the reason it ended, `stalled` and
+`heartbeat_missing` included), and so in
 [`session_report`](#session-measurements)'s node and run tables and Studio's
 session panel; how it ended (a kill, a crash, its exit code) is never in
 the launcher's exit status: an operator's stop of a session whose bridge
@@ -480,13 +489,11 @@ died still exits 0.
 A restart binds the same `[studio] http_port`. The bridge holds its port
 exclusively (`SO_REUSEADDR`, never `SO_REUSEPORT`;
 [studio/bridge](../../studio/bridge/README.md)), and the launcher kills a dead
-run's process group before it schedules the restart, so the port is free again
-for the restart. A port another listener holds, such as another launcher's
-bridge on the same port (a developer's `./sim.sh` on the robot computer), is
-refused: every run prints `cannot listen on port <port>` and exits, which the
-bound above ends, with the reason in `studio_bridge.log`. The launcher sees
-the bridge only through its exits: it takes no registry row, so a bridge that
-hangs without exiting is not detected or restarted.
+or hung run's process group before it schedules the restart, so the port is
+free again for the restart. A port another listener holds, such as another
+launcher's bridge on the same port (a developer's `./sim.sh` on the robot
+computer), is refused: every run prints `cannot listen on port <port>` and
+exits, which the bound above ends, with the reason in `studio_bridge.log`.
 
 ## Node output
 
@@ -757,8 +764,8 @@ the heartbeat timeout have elapsed; registration is required even when
 `--allow-graph-errors` permits a failed description. The launcher prepared the
 registry before starting them ([one session per namespace](#one-session-per-namespace)),
 and rows of killed runs are freed by the next claim. Rows held by live
-processes outside the session are not, so a launch whose roster (every member
-but Studio's bridge, which takes no row) does not fit beside them in the 32
+processes outside the session are not, so a launch whose roster (every member,
+including `sim_gateway` and `studio_bridge`) does not fit beside them in the 32
 rows is refused before anything starts, naming the holders.
 
 Construction is visible in the registry before endpoints are available and has
@@ -818,7 +825,7 @@ hold and touches no disk. The times it sleeps until:
 
 | Deadline | Decides |
 |---|---|
-| each running member's next look at its registry row (`RunLiveness::NextLook`): one look interval (its heartbeat timeout / 4) after the last, its stall deadline (the startup grace's end or one heartbeat timeout after the progress last seen, whichever is later), and its construction deadline until a look sees it constructed | `stalled`, `heartbeat_missing`, `construction_deadline`; the row's endpoints, recording and realtime flags and delivery counts, read at each look |
+| each running member's next look at its registry row (`RunLiveness::NextLook`, the Studio bridge's included): one look interval (its heartbeat timeout / 4) after the last, its stall deadline (the startup grace's end or one heartbeat timeout after the progress last seen, whichever is later), and its construction deadline until a look sees it constructed | `stalled`, `heartbeat_missing`, `construction_deadline`; the row's endpoints, recording and realtime flags and delivery counts, read at each look |
 | each pending restart's start, the Studio bridge's included | the restart backoff, a quarantined member's retry |
 | one settle interval (1 s) after the Studio bridge's last spawn, until that run is up | whether it holds the session open ([Studio bridge](#studio-bridge)) |
 | `--duration-s`'s end, until the stop is sent | the stop |

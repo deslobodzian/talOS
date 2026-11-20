@@ -753,6 +753,19 @@ cc_binary(
     ],
 )
 
+# A Studio bridge stub that claims a registry row under --session-id and
+# freezes on command (supervision_test's hung-bridge check).
+cc_binary(
+    name = "hanging_bridge",
+    testonly = True,
+    srcs = ["testdata/hanging_bridge.cc"],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/introspection:registry",
+        "//talOS/process:realtime_outcome",
+    ],
+)
+
 cc_test(
     name = "supervision_test",
     size = "medium",
@@ -762,6 +775,7 @@ cc_test(
         ":byte_wake_loss",
         ":delivery_loss_node",
         ":endpoint_drift",
+        ":hanging_bridge",
         ":held_stop",
         ":session_report",
         "//talOS/bridge:hardware_node",
@@ -772,6 +786,7 @@ cc_test(
         "TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)",
         "TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)",
         "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
+        "TALOS_HANGING_BRIDGE": "$(rlocationpath :hanging_bridge)",
         "TALOS_HELD_STOP_NODE": "$(rlocationpath :held_stop)",
         "TALOS_SESSION_REPORT": "$(rlocationpath :session_report)",
     },

@@ -49,19 +49,39 @@ StudioBridge::StudioBridge(std::size_t index, const NodeSpec& spec,
       target_{spec.target},
       log_path_{NodeOutputPath(options.output_dir, kStudioBridgeName)},
       output_{output},
+      session_id_{options.session_id},
       http_port_{EffectiveStudioHttpPort(robot_config, options)},
       args_{spec.binary_path,
             StudioBridgeWatchTopic(described[index], robot_config),
             std::to_string(http_port_),
             EffectiveStudioWebroot(robot_config, options),
+            "--session-id",
+            std::to_string(options.session_id),
             "--config",
             options.config_path,
             "--declared",
             graph_path,
             "--manifest",
             options.output_dir + "/manifest.json"},
-      limits_{limits} {
+      limits_{limits},
+      liveness_limits_{
+          HeartbeatTimeout(
+              std::chrono::microseconds{kStudioBridgePeriod}.count(),
+              options.heartbeat_periods),
+          std::chrono::milliseconds{options.heartbeat_startup_grace_ms},
+          options.construction_timeout} {
   proc.log_path.clear();
+}
+
+void StudioBridge::NewRun(SupervisionTime spawned) {
+  liveness_.Begin(spawned);
+  kill_reason_ = {};
+  heartbeat_killed_ = false;
+  realtime_reported_ = false;
+}
+
+void StudioBridge::BeginSupervision(SupervisionTime started) {
+  if (running_) liveness_.Begin(started);
 }
 
 void StudioBridge::Start(NodeProcessInfo& proc, const SupervisionClock& clock) {
@@ -77,6 +97,7 @@ void StudioBridge::Start(NodeProcessInfo& proc, const SupervisionClock& clock) {
   ConsoleLine(std::cout) << "[launcher] Starting studio_bridge (target "
                          << target_ << ")...\n";
   std::string error;
+  spawned_monotonic_ns_ = introspect::monotonic_now_ns();
   const pid_t pid = Spawn(error);
   const SupervisionTime now = clock();
   if (pid < 0) {
@@ -89,12 +110,87 @@ void StudioBridge::Start(NodeProcessInfo& proc, const SupervisionClock& clock) {
   last_spawn_ = now;
   running_ = true;
   settled_ = false;
+  NewRun(now);
+}
+
+bool StudioBridge::Watch(NodeProcessInfo& proc,
+                         const introspect::RegistryMapping* registry,
+                         const SupervisionClock& clock, bool stopping) {
+  if (!running_ || heartbeat_killed_ || stopping || proc.pid <= 0 ||
+      proc.exited) {
+    return false;
+  }
+  uint32_t row_flags = 0;
+  const auto read_row = [&]() -> RowObservation {
+    if (registry == nullptr) return {};
+    for (const auto& record : registry->header()->nodes) {
+      if (record.state.load(std::memory_order_acquire) !=
+          static_cast<uint64_t>(introspect::SlotState::ACTIVE))
+        continue;
+      const auto generation = record.generation.load(std::memory_order_acquire);
+      if (record.pid != static_cast<uint64_t>(proc.pid) ||
+          record.session_id != session_id_)
+        continue;
+      const auto beat =
+          record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+      if (beat < spawned_monotonic_ns_) continue;
+      const auto dispatch =
+          record.dispatch_count.load(std::memory_order_relaxed);
+      const auto flags = record.flags.load(std::memory_order_acquire);
+      if (record.generation.load(std::memory_order_acquire) != generation ||
+          record.state.load(std::memory_order_acquire) !=
+              static_cast<uint64_t>(introspect::SlotState::ACTIVE))
+        continue;
+      row_flags = flags;
+      return {.found = true,
+              .constructing = (flags & introspect::kFlagConstructing) != 0,
+              .heartbeat = beat,
+              .dispatch = dispatch};
+    }
+    return {};
+  };
+  const LivenessCheck check =
+      liveness_.Watch(clock, read_row, liveness_limits_);
+  bool changed = false;
+  if (!realtime_reported_) {
+    if (const auto outcome = introspect::RealtimeOf(row_flags)) {
+      realtime_reported_ = true;
+      if (proc.RecordRealtime(*outcome)) changed = true;
+    }
+  }
+  if (!check.kill.empty()) {
+    const auto ms = [now = check.judged_at](SupervisionTime since) {
+      return std::to_string(
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - since)
+              .count());
+    };
+    const std::string detail =
+        check.kill == kRunConstructionDeadline
+            ? " construction deadline exceeded"
+        : check.kill == kRunHeartbeatMissing
+            ? " heartbeat missing"
+            : " stalled: dispatch count unchanged for " +
+                  ms(liveness_.progress_changed_at()) + " ms (heartbeat " +
+                  (check.judged_at - liveness_.heartbeat_changed_at() <
+                           liveness_limits_.heartbeat_timeout
+                       ? "still moving)"
+                       : "unchanged too, for " +
+                             ms(liveness_.heartbeat_changed_at()) + " ms)");
+    ConsoleLine(std::cerr) << "[launcher] studio_bridge" << detail
+                           << "; killing pid " << proc.pid << "\n";
+    SignalProcessGroup(proc.pid, SIGKILL);
+    heartbeat_killed_ = true;
+    kill_reason_ = check.kill;
+  }
+  return changed;
 }
 
 void StudioBridge::Exited(NodeProcessInfo& proc, int status,
                           SupervisionTime now, bool stopping) {
   running_ = false;
   settled_ = false;
+  heartbeat_killed_ = false;
+  kill_reason_ = {};
   if (stopping) {
     ConsoleLine(std::cout) << "[launcher] Process studio_bridge (pid "
                            << proc.pid << ") exited (" << ExitReason(status)
@@ -105,7 +201,7 @@ void StudioBridge::Exited(NodeProcessInfo& proc, int status,
 }
 
 void StudioBridge::Supervise(NodeProcessInfo& proc, SupervisionTime now,
-                             bool stopping) {
+                             const SupervisionClock& clock, bool stopping) {
   if (running_ && !settled_ &&
       now - last_spawn_ >= kStudioBridgeSettleInterval) {
     settled_ = true;
@@ -120,13 +216,15 @@ void StudioBridge::Supervise(NodeProcessInfo& proc, SupervisionTime now,
     restart_.Cancel();
     ShowRestart(proc, restart_);
   } else if (restart_.Due(now)) {
-    Restart(proc, now);
+    Restart(proc, now, clock);
   }
 }
 
-SupervisionTime StudioBridge::NextCheck() const {
+SupervisionTime StudioBridge::NextCheck(bool stopping) const {
   SupervisionTime next = SupervisionTime::max();
   if (running_ && !settled_) next = last_spawn_ + kStudioBridgeSettleInterval;
+  if (running_ && !stopping && !heartbeat_killed_)
+    next = std::min(next, liveness_.NextLook(liveness_limits_));
   if (restart_.pending()) next = std::min(next, restart_.due_at());
   return next;
 }
@@ -157,7 +255,8 @@ pid_t StudioBridge::Spawn(std::string& error) {
                       /*echo=*/false);
 }
 
-void StudioBridge::Restart(NodeProcessInfo& proc, SupervisionTime now) {
+void StudioBridge::Restart(NodeProcessInfo& proc, SupervisionTime now,
+                           const SupervisionClock& clock) {
   // The attempt is a restart whether or not it spawns: it counts against the
   // window and in restart_count, so the restart lines, the give-up line's
   // count and the manifest agree even when a spawn fails.
@@ -165,20 +264,23 @@ void StudioBridge::Restart(NodeProcessInfo& proc, SupervisionTime now) {
   ShowRestart(proc, restart_);
   ++proc.restart_count;
   std::string error;
+  spawned_monotonic_ns_ = introspect::monotonic_now_ns();
   const pid_t pid = Spawn(error);
   if (pid < 0) {
     proc.RecordSpawnFailure();
     Failed(proc, "cannot spawn studio_bridge (" + error + ")", now);
     return;
   }
+  const SupervisionTime spawned = clock();
   proc.pid = pid;
   proc.exited = false;
   proc.exit_code = -1;
   proc.exit_signal = 0;
   proc.BeginRun(pid);
-  last_spawn_ = now;
+  last_spawn_ = spawned;
   running_ = true;
   settled_ = false;
+  NewRun(spawned);
 }
 
 void StudioBridge::Failed(NodeProcessInfo& proc, std::string_view what,

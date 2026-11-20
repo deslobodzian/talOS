@@ -276,6 +276,27 @@ py_test(
     ],
 )
 
+cc_test(
+    name = "registration_test",
+    size = "small",
+    srcs = ["tests/registration_test.cc"],
+    data = [":studio_bridge"],
+    env = {"TALOS_STUDIO_BRIDGE": "$(rlocationpath :studio_bridge)"},
+    tags = [
+        "integration",
+        "local",
+    ],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/introspection:registry",
+        "//talOS/process:realtime_outcome",
+        "//talOS/telemetry:wire",
+        "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 # --describe answers with no ports, shm, or robot, so this stays hermetic.
 py_test(
     name = "describe_test",
