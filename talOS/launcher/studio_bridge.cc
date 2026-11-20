@@ -180,8 +180,8 @@ bool StudioBridge::Watch(NodeProcessInfo& proc,
       if (const auto port = ParseListeningPort(*line)) {
         http_port_ = *port;
         args_[2] = std::to_string(*port);
-        if (proc.http_port != *port) {
-          proc.http_port = *port;
+        if (proc.http_port != port) {
+          proc.http_port = port;
           changed = true;
         }
         if (settled_ && !started_port_announced_) {
