@@ -1560,21 +1560,14 @@ class RegistryReader {
         std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
             .count();
     for (std::size_t i = 0; i < kMaxNodes; ++i) {
-      const NodeRecord& record = header->nodes[i];
-      if (record.state.load(std::memory_order_acquire) !=
-          static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+      auto row = read_stable_row(header->nodes[i], i);
+      if (!row) continue;
+      if (now - row->node.heartbeat_monotonic_ns >= timeout ||
+          !talos::ProcessWordAlive(row->claimant)) {
         continue;
       }
-      const std::uint64_t claimant =
-          (record.pid_start << kProcessPidBits) | record.pid;
-      if (now - record.heartbeat_monotonic_ns.load(std::memory_order_relaxed) >=
-              timeout ||
-          !talos::ProcessWordAlive(claimant)) {
-        continue;
-      }
-      NodeSnapshot node = copy(record, i);
-      node.alive = (node.flags & kFlagConstructing) == 0;
-      out.push_back(std::move(node));
+      row->node.alive = (row->node.flags & kFlagConstructing) == 0;
+      out.push_back(std::move(row->node));
     }
     return out;
   }
@@ -1588,40 +1581,50 @@ class RegistryReader {
             .count();
 
     for (std::size_t i = 0; i < kMaxNodes; ++i) {
-      const NodeRecord& record = header->nodes[i];
-      if (record.state.load(std::memory_order_acquire) !=
-          static_cast<std::uint64_t>(SlotState::ACTIVE)) {
-        continue;
-      }
-
-      // Copy, then check the slot was not recycled while copying. Two attempts
-      // is enough: claiming happens once per process start, not per read.
-      for (int attempt = 0; attempt < 2; ++attempt) {
-        const std::uint64_t generation =
-            record.generation.load(std::memory_order_acquire);
-        auto node = copy_stable(record, i);
-        const std::uint64_t claimant =
-            (record.pid_start << kProcessPidBits) | record.pid;
-        if (!node ||
-            record.state.load(std::memory_order_acquire) !=
-                static_cast<std::uint64_t>(SlotState::ACTIVE) ||
-            record.generation.load(std::memory_order_acquire) != generation) {
-          continue;
-        }
-        node->generation = generation;
-        // A crashed owner's heartbeat stays fresh for kLivenessTimeout, so
-        // its process is checked too, as the claim sweep checks it.
-        node->alive = now - node->heartbeat_monotonic_ns < timeout &&
-                      (node->flags & kFlagConstructing) == 0 &&
-                      talos::ProcessWordAlive(claimant);
-        out.push_back(std::move(*node));
-        break;
-      }
+      auto row = read_stable_row(header->nodes[i], i);
+      if (!row) continue;
+      // A crashed owner's heartbeat stays fresh for kLivenessTimeout, so
+      // its process is checked too, as the claim sweep checks it.
+      row->node.alive = now - row->node.heartbeat_monotonic_ns < timeout &&
+                        (row->node.flags & kFlagConstructing) == 0 &&
+                        talos::ProcessWordAlive(row->claimant);
+      out.push_back(std::move(row->node));
     }
     return out;
   }
 
  private:
+  struct StableRow {
+    NodeSnapshot node;
+    std::uint64_t claimant{0};
+  };
+
+  // Generation-verified, seqlock-copied snapshot of one ACTIVE slot together
+  // with its claimant process word. Two attempts is enough: claiming happens
+  // once per process start, not per read.
+  static std::optional<StableRow> read_stable_row(const NodeRecord& record,
+                                                  std::size_t slot) {
+    if (record.state.load(std::memory_order_acquire) !=
+        static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+      return std::nullopt;
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const std::uint64_t generation =
+          record.generation.load(std::memory_order_acquire);
+      auto node = copy_stable(record, slot);
+      const std::uint64_t claimant =
+          (record.pid_start << kProcessPidBits) | record.pid;
+      if (!node ||
+          record.state.load(std::memory_order_acquire) !=
+              static_cast<std::uint64_t>(SlotState::ACTIVE) ||
+          record.generation.load(std::memory_order_acquire) != generation) {
+        continue;
+      }
+      node->generation = generation;
+      return StableRow{std::move(*node), claimant};
+    }
+    return std::nullopt;
+  }
   // Seqlock read of one slot: an odd sequence means a refresh is landing, and
   // a sequence that moved across the copy means one landed mid-copy. Either
   // way the copy is retried, bounded so a writer that died mid-sample -- or a
