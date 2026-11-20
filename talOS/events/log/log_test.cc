@@ -2811,10 +2811,10 @@ long VoluntarySwitches(pid_t id) {
   return -1;
 }
 
-// A node calls process::ConfigureRealtime (SCHED_FIFO) on its loop thread
-// before the loop starts the log writer, and Linux threads inherit their
-// creator's policy: the writer must put itself back under SCHED_OTHER rather
-// than compete with control loops for the CPU.
+// Even when a creator thread holds a plain SCHED_FIFO policy (without
+// SCHED_RESET_ON_FORK), Linux threads inherit their creator's policy: the log
+// writer must still put itself back under SCHED_OTHER rather than compete with
+// control loops for the CPU.
 TEST(LogBackgroundWriter, WriterLeavesTheRealtimePolicyOfItsCreator) {
   const auto path = TempPath("writer_policy");
   bool realtime = false;
