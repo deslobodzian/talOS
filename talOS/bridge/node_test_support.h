@@ -28,21 +28,27 @@ namespace talos::hardware::bridge_test {
 // is a test's proof that something did not happen.
 inline constexpr std::chrono::seconds kHangBound{10};
 
-// Binds a loopback UDP socket to a port the OS chooses and connects it to
-// itself, so it accepts no datagram from another socket: a bridge sending to
-// the port sees it closed (ECONNREFUSED), as if nothing were bound, while no
-// other socket can be given the port. Returns the socket, or -1.
+// Binds a UDP socket on every interface (0.0.0.0) to a port the OS chooses and
+// connects it to 127.0.0.1 on that port, so it accepts no datagram from another
+// socket: a bridge sending to the port sees it closed (ECONNREFUSED), as if
+// nothing were bound, while no other socket can be given the port and
+// HardwareNode's 0.0.0.0 bind does not collide with a non-loopback socket.
+// Returns the socket, or -1.
 inline int ReservePort(uint16_t& port) {
   const int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) return -1;
   sockaddr_in address{};
   address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
   socklen_t size = sizeof(address);
   if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-      getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0 ||
-      connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
-          0) {
+      getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+    close(fd);
+    return -1;
+  }
+  sockaddr_in peer = address;
+  peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) != 0) {
     close(fd);
     return -1;
   }

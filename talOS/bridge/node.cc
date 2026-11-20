@@ -1,6 +1,7 @@
 #include "node.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -171,8 +172,25 @@ void HardwareNode::IndexActuators() {
 }
 
 bool HardwareNode::Open() {
-  if (peer_.Open("0.0.0.0", local_port_, remote_ip_.c_str(), remote_port_) !=
-      protocol::UdpStatus::kOk) {
+  errno = 0;
+  const protocol::UdpStatus status =
+      peer_.Open("0.0.0.0", local_port_, remote_ip_.c_str(), remote_port_);
+  if (status != protocol::UdpStatus::kOk) {
+    const int err = errno;
+    if (err != 0) {
+      std::fprintf(stderr,
+                   "hardware_node: failed to open UDP socket 0.0.0.0:%u -> "
+                   "%s:%u (%s: %s)\n",
+                   static_cast<unsigned>(local_port_), remote_ip_.c_str(),
+                   static_cast<unsigned>(remote_port_),
+                   protocol::UdpStatusName(status), std::strerror(err));
+    } else {
+      std::fprintf(
+          stderr,
+          "hardware_node: failed to open UDP socket 0.0.0.0:%u -> %s:%u (%s)\n",
+          static_cast<unsigned>(local_port_), remote_ip_.c_str(),
+          static_cast<unsigned>(remote_port_), protocol::UdpStatusName(status));
+    }
     return false;
   }
   OpenTopics();

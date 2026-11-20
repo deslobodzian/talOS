@@ -1522,12 +1522,12 @@ TEST(Supervision, ASigintTheStopDidNotSendIsStillACrash) {
   ::remove(alpha_pid.c_str());
 }
 
-// A loopback UDP port nothing holds now.
+// A UDP port nothing holds on any interface now.
 uint16_t FreeUdpPort() {
   const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
   sockaddr_in address{};
   address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
   socklen_t length = sizeof address;
   const bool bound =
       fd >= 0 &&

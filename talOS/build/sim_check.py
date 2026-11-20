@@ -81,6 +81,7 @@ import ctypes
 import importlib.util
 import json
 import os
+import random
 import select
 import signal
 import socket
@@ -126,17 +127,36 @@ DEFAULT_TIMEOUT_S = 60
 
 
 def udp_ports():
-    """Two distinct free loopback UDP ports (docs/TESTING.md §6.4: bound at
-    0 and released before the launch, since the launcher refuses port 0).
+    """Two distinct free UDP ports on 0.0.0.0 below the OS ephemeral range
+    (20000..31999; docs/TESTING.md §6.4: probed and released before the
+    launch, since the launcher refuses port 0).
 
     Kept inline here because talos_sim_test (contract.bzl) runs sim_check.py
     directly via srcs with only @rules_python//python/runfiles in deps.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as gateway, \
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge:
-        gateway.bind(("127.0.0.1", 0))
-        bridge.bind(("127.0.0.1", 0))
-        return gateway.getsockname()[1], bridge.getsockname()[1]
+    port_base, port_span = 20000, 12000
+    start = random.randrange(port_span)
+    held = []
+    ports = []
+    try:
+        for offset in range(port_span):
+            port = port_base + (start + offset) % port_span
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.bind(("0.0.0.0", port))
+            except OSError:
+                sock.close()
+                continue
+            held.append(sock)
+            ports.append(port)
+            if len(ports) == 2:
+                return ports[0], ports[1]
+    finally:
+        for sock in held:
+            sock.close()
+    raise RuntimeError(
+        f"fewer than 2 free UDP ports in "
+        f"{port_base}-{port_base + port_span - 1}")
 
 
 def running_in_session(stat, sid):
