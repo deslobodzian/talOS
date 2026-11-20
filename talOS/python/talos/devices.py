@@ -44,7 +44,7 @@ class Mode(enum.IntEnum):
 
 def robot_enabled(node):
     """Whether this node's outputs reach the hardware."""
-    return bool(_abi.ok(lib.talos_robot_enabled(node._handle)))
+    return _abi.boolean(lib.talos_robot_enabled(node._handle))
 
 
 def allow_untargeted_outputs(node):
@@ -98,7 +98,7 @@ class HardwareLink(_OnNode):
         if isinstance(max_age, timedelta):
             max_age = max_age.total_seconds()
         ns = -1 if max_age is None else round(max_age * 1e9)
-        return bool(_abi.ok(lib.talos_hardware_fresh(self._node, ns)))
+        return _abi.boolean(lib.talos_hardware_fresh(self._node, ns))
 
     @property
     def age(self) -> float:
@@ -135,10 +135,8 @@ class _Input(_Device):
         return bool(self._sample().valid)
 
 
-class Motor(_Input):
-    _KIND = _abi.DEVICE_MOTOR
-    _SAMPLE = lib.talos_motor_sample
-    _TIME = lib.talos_motor_time
+class _TimedInput(_Input):
+    _TIME = None  # its talos_*_time entry point
 
     def _time(self, velocity):
         sampled = ctypes.c_int64()
@@ -146,6 +144,8 @@ class Motor(_Input):
             self._node, self._index, velocity, ctypes.byref(sampled)))
         return sampled.value if found else None
 
+
+class _PositionTimedInput(_TimedInput):
     @property
     def position_time(self):
         """Acquisition time, integer node-clock ns, or None if unavailable."""
@@ -155,6 +155,36 @@ class Motor(_Input):
     def velocity_time(self):
         """Acquisition time, integer node-clock ns, or None if unavailable."""
         return self._time(True)
+
+
+class _Rezeroable:
+    _REZERO = None
+    _ZEROED = None
+
+    def _rezero(self, offset_rot=0):
+        _abi.ok(self._REZERO(self._node, self._index, offset_rot))
+
+    @property
+    def zeroed(self):
+        """Whether a rezero holds: False until one takes (a restarted node
+        starts unzeroed), and again once one is dropped: on a gateway boot
+        change, a reset that masks this device in the next gateway State, or
+        any device reset across a sequence gap. A disconnect keeps it, and so
+        does every reset of a motor whose config sets
+        position_frame = "absolute". A dropped zero keeps its offset
+        (dropping does not move position or yaw). Motor set_position and
+        set_motion_magic go out neutral while no rezero holds, unless
+        position_frame = "absolute" (a remote CANcoder's frame, usable from
+        the first state)."""
+        return _abi.boolean(self._ZEROED(self._node, self._index))
+
+
+class Motor(_Rezeroable, _PositionTimedInput):
+    _KIND = _abi.DEVICE_MOTOR
+    _SAMPLE = lib.talos_motor_sample
+    _TIME = lib.talos_motor_time
+    _REZERO = lib.talos_motor_rezero
+    _ZEROED = lib.talos_motor_zeroed
 
     def _age(self, velocity):
         age = ctypes.c_int64()
@@ -184,21 +214,7 @@ class Motor(_Input):
         than two status periods at its State (C++ RezeroAgeBound), leaves the
         offset unchanged: zeroed stays as it was, so retry on a later tick.
         """
-        _abi.ok(lib.talos_motor_rezero(self._node, self._index, position_rot))
-
-    @property
-    def zeroed(self):
-        """Whether a rezero holds: False until one takes (a restarted node
-        starts unzeroed), and again once one is dropped: on a gateway boot
-        change, a reset that masks this motor in the next gateway State, or
-        any device reset across a sequence gap. A disconnect keeps it, and so
-        does every reset of a motor whose config sets
-        position_frame = "absolute". A dropped zero keeps its offset
-        (dropping does not move position). set_position and set_motion_magic
-        go out neutral while no rezero holds, unless position_frame =
-        "absolute" (a remote CANcoder's frame, usable from the first
-        state)."""
-        return bool(_abi.ok(lib.talos_motor_zeroed(self._node, self._index)))
+        self._rezero(position_rot)
 
     @property
     def clamped_count(self):
@@ -281,13 +297,10 @@ class Motor(_Input):
                                     ff_volts, slot))
 
 
-class CANcoder(_Input):
+class CANcoder(_PositionTimedInput):
     _KIND = _abi.DEVICE_CANCODER
     _SAMPLE = lib.talos_sensor_sample
     _TIME = lib.talos_sensor_time
-    _time = Motor._time
-    position_time = Motor.position_time
-    velocity_time = Motor.velocity_time
 
     @property
     def position(self):  # rotations
@@ -298,24 +311,27 @@ class CANcoder(_Input):
         return self._sample().velocity
 
 
-class Gyro(_Input):
+class Gyro(_Rezeroable, _TimedInput):
     """A Pigeon2. Rotations and rotations/s, CCW+."""
     _KIND = _abi.DEVICE_GYRO
     _SAMPLE = lib.talos_sensor_sample
     _TIME = lib.talos_sensor_time
-    _time = Motor._time
-    yaw_time = Motor.position_time
-    yaw_rate_time = Motor.velocity_time
+    _REZERO = lib.talos_gyro_rezero
+    _ZEROED = lib.talos_gyro_zeroed
+
+    @property
+    def yaw_time(self):
+        """Acquisition time, integer node-clock ns, or None if unavailable."""
+        return self._time(False)
+
+    @property
+    def yaw_rate_time(self):
+        """Acquisition time, integer node-clock ns, or None if unavailable."""
+        return self._time(True)
 
     def rezero(self, yaw_rot=0):
         """Set node-shared software yaw on connected finite feedback/input."""
-        _abi.ok(lib.talos_gyro_rezero(self._node, self._index, yaw_rot))
-
-    @property
-    def zeroed(self):
-        """Whether a rezero holds; dropped like Motor.zeroed, keeping its
-        offset, so dropping does not move yaw."""
-        return bool(_abi.ok(lib.talos_gyro_zeroed(self._node, self._index)))
+        self._rezero(yaw_rot)
 
     @property
     def yaw(self):
@@ -512,9 +528,11 @@ class Target(_OnNode):
         if not _abi.ok(lib.talos_target_get(self._node, self._index, None,
                                             self._source)):
             return ""
-        return _abi.check(lib.talos_target_source_name(
-            self._node, self._index, self._source.value),
-            lambda name: name is None).decode()
+        name = lib.talos_target_source_name(
+            self._node, self._index, self._source.value)
+        if name is None:
+            _abi.fail()
+        return name.decode()
 
 
 class OperatorArming(_OnNode):
@@ -546,15 +564,15 @@ class OperatorArming(_OnNode):
         self._index = _abi.index(lib.talos_operator_arming_open(self._node))
 
     def evaluate(self, neutral) -> bool:
-        return bool(_abi.ok(lib.talos_operator_arming_evaluate(
-            self._node, self._index, 1 if neutral else 0)))
+        return _abi.boolean(lib.talos_operator_arming_evaluate(
+            self._node, self._index, 1 if neutral else 0))
 
     @property
     def armed(self) -> bool:
         """Armed now, without evaluating: what an armed lane's send()
         checks."""
-        return bool(_abi.ok(lib.talos_operator_arming_armed(
-            self._node, self._index)))
+        return _abi.boolean(lib.talos_operator_arming_armed(
+            self._node, self._index))
 
     def disarm(self):
         _abi.ok(lib.talos_operator_arming_disarm(self._node, self._index))
@@ -591,9 +609,9 @@ class TargetLane(_OnNode):
         lane's arming held it to a release."""
         data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
-        return bool(_abi.ok(lib.talos_target_lane_send(
-            self._node, self._index, data, len(data))))
+        return _abi.boolean(lib.talos_target_lane_send(
+            self._node, self._index, data, len(data)))
 
     def release(self):
-        return bool(_abi.ok(lib.talos_target_lane_release(
-            self._node, self._index)))
+        return _abi.boolean(lib.talos_target_lane_release(
+            self._node, self._index))

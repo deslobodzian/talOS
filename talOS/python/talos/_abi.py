@@ -421,30 +421,34 @@ def fail():
     raise TalosError(lib.talos_last_error().decode())
 
 
-def check(result, failed):
-    if failed(result):
-        fail()
-    return result
-
-
 def ok(status):
     """For int32 status returns: TALOS_ERR (-1) raises."""
-    return check(status, lambda r: r < 0)
+    if status < 0:
+        fail()
+    return status
 
 
-def index(result):
-    return check(result, lambda r: r < 0)
+index = ok
+
+
+def boolean(status):
+    """For int32 boolean/status returns: TALOS_ERR (-1) raises, else bool."""
+    return bool(ok(status))
 
 
 def value(result, failure):
     """For returns whose failure value is also a valid result (0 from
     talos_state_machine_state): the call failed only when it also left a
     talos_last_error(), which a call that succeeds clears."""
-    return check(result, lambda r: r == failure and lib.talos_last_error())
+    if result == failure and lib.talos_last_error():
+        fail()
+    return result
 
 
 def handle(pointer):
-    return check(pointer, lambda p: not p)
+    if not pointer:
+        fail()
+    return pointer
 
 
 def encode(text):

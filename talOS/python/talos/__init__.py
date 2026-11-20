@@ -273,14 +273,14 @@ class Subscription(_OnNode):
 
     @property
     def has_value(self):
-        return bool(_abi.ok(
-            lib.talos_subscription_has_value(self._node, self._index)))
+        return _abi.boolean(
+            lib.talos_subscription_has_value(self._node, self._index))
 
     def fresh(self, max_age=None):
         """has_value and age < max_age (default [robot] command_timeout)."""
         max_age_ns = -1 if max_age is None else round(max_age * _NS)
-        return bool(_abi.ok(lib.talos_subscription_fresh(
-            self._node, self._index, max_age_ns)))
+        return _abi.boolean(lib.talos_subscription_fresh(
+            self._node, self._index, max_age_ns))
 
     @property
     def age(self):  # seconds since publication; inf before the first
@@ -290,8 +290,8 @@ class Subscription(_OnNode):
 
     @property
     def updated(self):  # a message arrived since the previous update() began
-        return bool(_abi.ok(
-            lib.talos_subscription_updated(self._node, self._index)))
+        return _abi.boolean(
+            lib.talos_subscription_updated(self._node, self._index))
 
 
 class Publisher(_OnNode):
@@ -304,8 +304,8 @@ class Publisher(_OnNode):
         raises TypeError), or send(message) to re-send a received one."""
         data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
-        return bool(_abi.ok(lib.talos_publisher_send(
-            self._node, self._index, data, len(data))))
+        return _abi.boolean(lib.talos_publisher_send(
+            self._node, self._index, data, len(data)))
 
 
 class BytePublisher(_OnNode):
@@ -322,8 +322,8 @@ class BytePublisher(_OnNode):
             raise TypeError(f"expected bytes-like object, got "
                             f"{type(data).__name__}")
         raw = bytes(data)
-        return bool(_abi.ok(lib.talos_byte_publisher_send(
-            self._node, self._index, raw, len(raw))))
+        return _abi.boolean(lib.talos_byte_publisher_send(
+            self._node, self._index, raw, len(raw)))
 
 
 class StateMachine(_OnNode):
@@ -398,8 +398,8 @@ class StateMachine(_OnNode):
     @property
     def just_entered(self):
         """True during the first update() tick that starts in this state."""
-        return bool(_abi.ok(lib.talos_state_machine_just_entered(
-            self._node, self._index)))
+        return _abi.boolean(lib.talos_state_machine_just_entered(
+            self._node, self._index))
 
 def _factory(cls, built, owner=None, freeze=False):
     """A C factory: builds cls on a new Node and installs its update().
