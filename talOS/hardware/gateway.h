@@ -12,8 +12,8 @@
 
 namespace talos::hardware {
 // Leaves no non-finite value in `state`'s configured samples, the gateway's
-// rule for every backend (Gateway::Tick, after Backend::Read) and
-// testing::SimHardware's for the State it publishes. A motor or CAN sensor
+// rule for every backend (Gateway::Tick, after Backend::Read),
+// testing::SimHardware, and EncodeSanitizedState below. A motor or CAN sensor
 // whose position or velocity is not finite is invalid (MarkInvalid); a
 // motor's non-finite voltage, current or temperature is 0 and does not by
 // itself change its validity; an analog input, encoder or PWM output sample
@@ -22,6 +22,14 @@ namespace talos::hardware {
 // a failed read: utilization 0, a kOk or kPending read state kFailed, its
 // counters kept.
 void ReplaceNonFinite(State& state);
+
+// Applies ReplaceNonFinite to a copy of `state` and encodes it for the wire
+// (Encode, messages.h). Every State producer encodes through this so no
+// non-finite value can reach the wire or fail tenths encoding, even if a
+// caller did not sanitize beforehand. Returns 0 only for structural errors
+// (out-of-range counts or enums, or a too-small buffer), never for a
+// non-finite measurement.
+std::size_t EncodeSanitizedState(const State& state, std::span<uint8_t> data);
 
 // Platform-specific code owns device objects. Configure runs at startup or
 // disabled and may block; Read/Apply/Neutral and reset polling must not block.
@@ -179,8 +187,9 @@ class Gateway {
   // Reconfigure clears the apply-failure latch.
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
   // The State to publish. Every invalid motor or CAN-sensor sample carries
-  // zero measurements (MarkInvalid); while unconfigured (configuring, or the
-  // last configure failed) every sample is invalid, since no Read ran.
+  // zero measurements (MarkInvalid), and no floating field is non-finite
+  // (ReplaceNonFinite); while unconfigured (configuring, or the last configure
+  // failed) every sample is invalid, since no Read ran.
   State snapshot() const;
   const Config& config() const { return config_; }
   bool configured() const { return configured_; }

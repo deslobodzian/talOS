@@ -607,7 +607,11 @@ would take for a lost link): any other non-finite reading is sent as 0, its
 sample invalid where it has a validity of its own; a motor's voltage,
 currents and temperature have none, so they read 0 with the motor still
 valid, as for stale effort. What each field becomes is stated once, at
-`hardware::ReplaceNonFinite` (`gateway.h`).
+`hardware::ReplaceNonFinite` (`gateway.h`). Every State producer encodes
+through `hardware::EncodeSanitizedState` (`gateway.h`), which applies
+`ReplaceNonFinite` before the raw wire codec `Encode` (`messages.h`), so a
+non-finite value cannot cross the wire even if a caller did not sanitize
+beforehand.
 While the gateway is unconfigured (a configure in progress, every boot
 restore included, or the last configure failed) it reads no device, so every
 State it publishes then carries no measurement: every motor and CAN-sensor

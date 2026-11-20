@@ -459,7 +459,9 @@ void Gateway::FindPositionJumps(std::vector<uint16_t>& reset_ids) {
 // long the reads failed.
 void ReplaceNonFinite(State& state) {
   const auto finite = [](double x) { return std::isfinite(x); };
-  for (std::size_t i = 0; i < state.motor_count; ++i) {
+  const std::size_t motors =
+      std::min<std::size_t>(state.motor_count, state.motors.size());
+  for (std::size_t i = 0; i < motors; ++i) {
     auto& m = state.motors[i];
     if (!finite(m.position_rot) || !finite(m.velocity_rps)) MarkInvalid(m);
     for (double* x : {&m.voltage, &m.stator_current_a, &m.temperature_c,
@@ -467,23 +469,31 @@ void ReplaceNonFinite(State& state) {
       if (!finite(*x)) *x = 0;
     }
   }
-  for (std::size_t i = 0; i < state.sensor_count; ++i) {
+  const std::size_t sensors =
+      std::min<std::size_t>(state.sensor_count, state.sensors.size());
+  for (std::size_t i = 0; i < sensors; ++i) {
     auto& sensor = state.sensors[i];
     if (!finite(sensor.position_rot) || !finite(sensor.velocity_rps)) {
       MarkInvalid(sensor);
     }
   }
-  for (std::size_t i = 0; i < state.analog_input_count; ++i) {
+  const std::size_t analog_inputs = std::min<std::size_t>(
+      state.analog_input_count, state.analog_inputs.size());
+  for (std::size_t i = 0; i < analog_inputs; ++i) {
     auto& input = state.analog_inputs[i];
     if (!finite(input.voltage)) input = {input.id, false, 0, input.age_us};
   }
-  for (std::size_t i = 0; i < state.encoder_count; ++i) {
+  const std::size_t encoders =
+      std::min<std::size_t>(state.encoder_count, state.encoders.size());
+  for (std::size_t i = 0; i < encoders; ++i) {
     auto& encoder = state.encoders[i];
     if (!finite(encoder.position_rot) || !finite(encoder.velocity_rps)) {
       encoder = {encoder.id, false, 0, 0, encoder.age_us};
     }
   }
-  for (std::size_t i = 0; i < state.pwm_output_count; ++i) {
+  const std::size_t pwm_outputs =
+      std::min<std::size_t>(state.pwm_output_count, state.pwm_outputs.size());
+  for (std::size_t i = 0; i < pwm_outputs; ++i) {
     auto& output = state.pwm_outputs[i];
     if (!finite(output.output)) output = {output.id, false, 0};
   }
@@ -499,6 +509,12 @@ void ReplaceNonFinite(State& state) {
       bus.read_state = CanBusReadState::kFailed;
     }
   }
+}
+
+std::size_t EncodeSanitizedState(const State& state, std::span<uint8_t> data) {
+  State sanitized = state;
+  ReplaceNonFinite(sanitized);
+  return Encode(sanitized, data);
 }
 
 // The backend judged each sample's status, value and isolation; the age bound
@@ -783,6 +799,7 @@ State Gateway::snapshot() const {
   for (auto& sensor : s.sensors) {
     if (!sensor.valid) MarkInvalid(sensor);
   }
+  ReplaceNonFinite(s);
   s.flags = (configured_ && config_.commissioned ? kConfigured : 0u) |
             (configured_ && enabled_ ? kEnabled : 0u) |
             (active_ ? kCommandActive : 0u) |
