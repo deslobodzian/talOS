@@ -93,6 +93,9 @@ struct CameraIntrinsics {
       const double r4 = r2 * r2;
       const double r6 = r4 * r2;
       const double radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+      if (!(radial > 1e-6)) {
+        return Eigen::Vector2d(x_dist, y_dist);
+      }
 
       const double dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
       const double dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;

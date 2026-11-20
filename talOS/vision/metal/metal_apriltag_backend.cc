@@ -115,25 +115,19 @@ struct MetalAprilTagBackend::Impl {
   MTL::Library* library{nullptr};
   MTL::CommandQueue* queue{nullptr};
   MTL::ComputePipelineState* pso_rgb_to_gray{nullptr};
-  MTL::ComputePipelineState* pso_decimate_2x{nullptr};
   MTL::ComputePipelineState* pso_rgb_to_gray_decimate_2x{nullptr};
-  MTL::ComputePipelineState* pso_grad_thresh{nullptr};
-  MTL::ComputePipelineState* pso_cand_mask{nullptr};
   MTL::ComputePipelineState* pso_tile_min_max_4x4{nullptr};
   MTL::ComputePipelineState* pso_tile_blur_and_threshold{nullptr};
 
   MTL::Buffer* cached_in_buf{nullptr};
   size_t cached_in_capacity{0};
   MTL::Buffer* cached_gray_buf{nullptr};
-  MTL::Buffer* cached_grad_mag_buf{nullptr};
-  MTL::Buffer* cached_grad_dir_buf{nullptr};
   MTL::Buffer* cached_thresh_buf{nullptr};
   size_t cached_thresh_capacity{0};
   MTL::Buffer* cached_im_min_buf{nullptr};
   size_t cached_im_min_capacity{0};
   MTL::Buffer* cached_im_max_buf{nullptr};
   size_t cached_im_max_capacity{0};
-  MTL::Buffer* cached_cand_mask_buf{nullptr};
   size_t cached_gray_capacity{0};
   MTL::Buffer* cached_dec_buf{nullptr};
   size_t cached_dec_capacity{0};
@@ -202,14 +196,6 @@ struct MetalAprilTagBackend::Impl {
       cached_gray_buf->release();
       cached_gray_buf = nullptr;
     }
-    if (cached_grad_mag_buf) {
-      cached_grad_mag_buf->release();
-      cached_grad_mag_buf = nullptr;
-    }
-    if (cached_grad_dir_buf) {
-      cached_grad_dir_buf->release();
-      cached_grad_dir_buf = nullptr;
-    }
     if (cached_thresh_buf) {
       cached_thresh_buf->release();
       cached_thresh_buf = nullptr;
@@ -221,10 +207,6 @@ struct MetalAprilTagBackend::Impl {
     if (cached_im_max_buf) {
       cached_im_max_buf->release();
       cached_im_max_buf = nullptr;
-    }
-    if (cached_cand_mask_buf) {
-      cached_cand_mask_buf->release();
-      cached_cand_mask_buf = nullptr;
     }
     if (cached_dec_buf) {
       cached_dec_buf->release();
@@ -270,21 +252,9 @@ struct MetalAprilTagBackend::Impl {
       pso_rgb_to_gray->release();
       pso_rgb_to_gray = nullptr;
     }
-    if (pso_decimate_2x) {
-      pso_decimate_2x->release();
-      pso_decimate_2x = nullptr;
-    }
     if (pso_rgb_to_gray_decimate_2x) {
       pso_rgb_to_gray_decimate_2x->release();
       pso_rgb_to_gray_decimate_2x = nullptr;
-    }
-    if (pso_grad_thresh) {
-      pso_grad_thresh->release();
-      pso_grad_thresh = nullptr;
-    }
-    if (pso_cand_mask) {
-      pso_cand_mask->release();
-      pso_cand_mask = nullptr;
     }
     if (pso_tile_min_max_4x4) {
       pso_tile_min_max_4x4->release();
@@ -325,52 +295,7 @@ struct MetalAprilTagBackend::Impl {
       compile_options->release();
 
       if (library != nullptr) {
-        NS::String* n_rgb =
-            NS::String::string("rgb_to_gray", NS::UTF8StringEncoding);
-        NS::String* n_dec =
-            NS::String::string("decimate_2x", NS::UTF8StringEncoding);
-        NS::String* n_fused = NS::String::string("rgb_to_gray_decimate_2x",
-                                                 NS::UTF8StringEncoding);
-        NS::String* n_gt = NS::String::string("gradient_and_threshold",
-                                              NS::UTF8StringEncoding);
-        NS::String* n_cm =
-            NS::String::string("candidate_mask", NS::UTF8StringEncoding);
-        NS::String* n_tmm =
-            NS::String::string("tile_min_max_4x4", NS::UTF8StringEncoding);
-        NS::String* n_tbt = NS::String::string("tile_blur_and_threshold",
-                                               NS::UTF8StringEncoding);
-
-        MTL::Function* fn_rgb = library->newFunction(n_rgb);
-        MTL::Function* fn_dec = library->newFunction(n_dec);
-        MTL::Function* fn_fused = library->newFunction(n_fused);
-        MTL::Function* fn_gt = library->newFunction(n_gt);
-        MTL::Function* fn_cm = library->newFunction(n_cm);
-        MTL::Function* fn_tmm = library->newFunction(n_tmm);
-        MTL::Function* fn_tbt = library->newFunction(n_tbt);
-
-        NS::Error* pso_err = nullptr;
-        pso_rgb_to_gray = device->newComputePipelineState(fn_rgb, &pso_err);
-        pso_decimate_2x = device->newComputePipelineState(fn_dec, &pso_err);
-        pso_rgb_to_gray_decimate_2x =
-            device->newComputePipelineState(fn_fused, &pso_err);
-        pso_grad_thresh = device->newComputePipelineState(fn_gt, &pso_err);
-        pso_cand_mask = device->newComputePipelineState(fn_cm, &pso_err);
-        pso_tile_min_max_4x4 =
-            device->newComputePipelineState(fn_tmm, &pso_err);
-        pso_tile_blur_and_threshold =
-            device->newComputePipelineState(fn_tbt, &pso_err);
-
-        fn_rgb->release();
-        fn_dec->release();
-        fn_fused->release();
-        fn_gt->release();
-        fn_cm->release();
-        fn_tmm->release();
-        fn_tbt->release();
-
-        // Stage 2: GPU CCL + edge candidates. Tolerate nullptr (missing kernel
-        // or PSO failure auto-disables Stage 2; Stage 1 remains the default).
-        auto make_stage2_pso = [&](const char* kernel_name) {
+        auto make_pso = [&](const char* kernel_name) {
           NS::String* n =
               NS::String::string(kernel_name, NS::UTF8StringEncoding);
           MTL::Function* fn = library->newFunction(n);
@@ -383,15 +308,22 @@ struct MetalAprilTagBackend::Impl {
           fn->release();
           return pso;
         };
-        pso_ccl_init = make_stage2_pso("ccl_init");
-        pso_ccl_union = make_stage2_pso("ccl_union_pass");
-        pso_ccl_flatten = make_stage2_pso("ccl_flatten");
-        pso_ccl_sizes = make_stage2_pso("ccl_compute_sizes");
-        pso_extract_cands = make_stage2_pso("extract_edge_candidates");
 
-        if (pso_rgb_to_gray && pso_decimate_2x && pso_rgb_to_gray_decimate_2x &&
-            pso_grad_thresh && pso_cand_mask && pso_tile_min_max_4x4 &&
-            pso_tile_blur_and_threshold) {
+        pso_rgb_to_gray = make_pso("rgb_to_gray");
+        pso_rgb_to_gray_decimate_2x = make_pso("rgb_to_gray_decimate_2x");
+        pso_tile_min_max_4x4 = make_pso("tile_min_max_4x4");
+        pso_tile_blur_and_threshold = make_pso("tile_blur_and_threshold");
+
+        // Stage 2: GPU CCL + edge candidates. Tolerate nullptr (missing kernel
+        // or PSO failure auto-disables Stage 2; Stage 1 remains the default).
+        pso_ccl_init = make_pso("ccl_init");
+        pso_ccl_union = make_pso("ccl_union_pass");
+        pso_ccl_flatten = make_pso("ccl_flatten");
+        pso_ccl_sizes = make_pso("ccl_compute_sizes");
+        pso_extract_cands = make_pso("extract_edge_candidates");
+
+        if (pso_rgb_to_gray && pso_rgb_to_gray_decimate_2x &&
+            pso_tile_min_max_4x4 && pso_tile_blur_and_threshold) {
           queue = device->newCommandQueue();
           device_name = device->name()->utf8String();
           is_fallback = false;
