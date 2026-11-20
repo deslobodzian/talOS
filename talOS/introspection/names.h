@@ -622,6 +622,8 @@ inline std::vector<Diagnostic> LintGraph(
     std::string name;
     std::vector<std::string> writers;
     std::vector<std::string> readers;
+    // Regular readers and observers, in declaration order.
+    std::vector<std::string> all_readers;
     // Readers whose end is neither optional nor external: `optional` is one
     // reader's tolerance of a missing writer, so it exempts only that reader.
     std::vector<std::string> required_readers;
@@ -739,7 +741,10 @@ inline std::vector<Diagnostic> LintGraph(
         if (!source.optional() && !source.external())
           topic.required_readers.push_back(node.name);
       }
-      if (IsReader(source.kind)) ++topic.reader_count;
+      if (IsReader(source.kind)) {
+        topic.all_readers.push_back(node.name);
+        ++topic.reader_count;
+      }
 
       // Two types on one topic: named by schema identity, which also catches
       // two same-size types a size check cannot tell apart. A shape without
@@ -830,7 +835,7 @@ inline std::vector<Diagnostic> LintGraph(
       // them.
       add(Severity::ERROR, topic.name,
           "is read by " +
-              join(topic.exempt ? topic.required_readers : topic.readers) +
+              join(topic.exempt ? topic.required_readers : topic.all_readers) +
               " but nothing publishes it; either the writer is missing or the "
               "two ends are spelled differently");
     } else if (topic.writers.empty() && !topic.readers.empty() &&

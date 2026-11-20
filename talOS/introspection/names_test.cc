@@ -818,6 +818,55 @@ TEST(LintGraph, AnOptionalReaderExemptsOnlyItselfFromTheUnwrittenError) {
                                         reader("panel", kSourceFlagExternal)});
     EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
   }
+  {
+    SCOPED_TRACE("observer only on unwritten topic");
+    const NodeShape bad_telemetry{
+        "telemetry",
+        "//talOS/telemetry:node",
+        {Watcher("/motor/state", 32, kSourceFlagObserver),
+         Watcher("/motor/state/wheel", 32, kSourceFlagObserver),
+         Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+    const auto diagnostics = LintGraph({motor, bad_telemetry});
+    const auto* error =
+        Find(diagnostics, Severity::ERROR, "/motor/state/wheel");
+    ASSERT_NE(error, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(error->message, "telemetry")) << error->message;
+    EXPECT_EQ(error->message.find("is read by  but"), std::string::npos)
+        << error->message;
+    EXPECT_EQ(Errors(diagnostics), 1) << Describe(diagnostics);
+  }
+  {
+    SCOPED_TRACE("regular reader and observer on unwritten topic");
+    const NodeShape bad_telemetry{
+        "telemetry",
+        "//talOS/telemetry:node",
+        {Watcher("/motor/state", 32, kSourceFlagObserver),
+         Watcher("/motor/state/wheel", 32, kSourceFlagObserver),
+         Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+    const auto diagnostics =
+        LintGraph({motor, bad_telemetry, reader("arm", 0)});
+    const auto* error =
+        Find(diagnostics, Severity::ERROR, "/motor/state/wheel");
+    ASSERT_NE(error, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(error->message, "arm")) << error->message;
+    EXPECT_TRUE(Names(error->message, "telemetry")) << error->message;
+    EXPECT_EQ(Errors(diagnostics), 1) << Describe(diagnostics);
+  }
+  {
+    SCOPED_TRACE("observer plus optional reader stays non-error");
+    const NodeShape bad_telemetry{
+        "telemetry",
+        "//talOS/telemetry:node",
+        {Watcher("/motor/state", 32, kSourceFlagObserver),
+         Watcher("/motor/state/wheel", 32, kSourceFlagObserver),
+         Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+    const auto diagnostics =
+        LintGraph({motor, bad_telemetry, reader("panel", kSourceFlagOptional)});
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+    EXPECT_NE(Find(diagnostics, Severity::WARNING, "/motor/state/wheel"),
+              nullptr)
+        << Describe(diagnostics);
+  }
 }
 
 // REQ-CONTRACT-33: from the writer's schema, an `alert_` field that is not a
