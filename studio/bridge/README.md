@@ -38,6 +38,8 @@ port <port>` and exits 1 (`//studio/bridge:listen_test`).
 
 These named options are removed before positional parsing:
 
+- `--session-id ID` or `--session-id=ID`: unsigned integer session id stamped
+  into the bridge's live registry row (default `0`, ignored in `--describe`).
 - `--config PATH`: read `[studio] max_clients` and `[studio] dashboard` (the
   driver dashboard's layout; see [Driver dashboard feed](#driver-dashboard-feed))
   from robot configuration, and each subsystem's `critical` for the drive
@@ -110,7 +112,14 @@ deferred and the next update carries the changes, so a slow or starved client
 sees fewer, never inconsistent, ticks. A page the socket refuses resynchronizes
 that client with a fresh keyframe.
 
-The system graph includes the bridge itself and refreshes every 250 ms of
+The bridge also claims a live registry row (`studio_bridge`, `LoopTier::kObserver`,
+one `WATCHER` source on its telemetry topic) under `--session-id`, advancing
+`heartbeat_monotonic_ns` and `dispatch_count` on every loop pass (continuing
+standalone if the registry is unavailable) so the launcher detects and restarts
+a hung bridge ([Studio bridge](../../talOS/launcher/README.md#studio-bridge)).
+The system graph includes the bridge itself (replacing its own live registry
+row with `self()` so `/system.json` carries a single `studio_bridge` entry with
+exact bridge counters) and refreshes every 250 ms of
 the monotonic clock (see [Waking](#waking)). `/system.json` serves the whole document,
 with a `structure` id covering everything but its fast values (wall time,
 counters, heartbeats, liveness, selected sources, held outputs, topic

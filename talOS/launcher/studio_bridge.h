@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
+#include "talOS/introspection/registry.h"
 #include "talOS/launcher/child_output.h"
 #include "talOS/launcher/describe_graph.h"
 #include "talOS/launcher/roster.h"
@@ -22,22 +23,26 @@ namespace talos::launcher {
 // Studio bridge
 //
 // The one roster member supervised differently. It takes positional args
-// rather than the node flags, logs plaintext to studio_bridge.log rather than
-// a .tlog, and takes no registry row, so the launcher sees it only through
-// its exits (a bridge that hangs without exiting is not noticed). It is an
+// rather than the node flags (plus --session-id, --config, --declared and
+// --manifest) and logs plaintext to studio_bridge.log rather than a .tlog. It
+// claims a live registry row (observer tier, advancing heartbeat_monotonic_ns
+// and dispatch_count on every loop pass), so the launcher watches it with
+// RunLiveness (period kStudioBridgePeriod) and kills and restarts a hung or
+// unregistered bridge on the same bounded schedule as an exit. It is an
 // observer: nothing it does starts, stops, restarts or delays another
 // member, and how it ended never sets the session's exit status.
 //
 // Every ending of a run while the session is not stopping -- a nonzero
-// exit, a signal, or exit 0, since a server that ends before the stop has
-// failed -- and every spawn that fails is restarted on the restart schedule
-// a non-critical member has (RestartSchedule: 50 ms, doubling to 1 s, at
-// most max_restarts starts per rolling restart window, inside the
-// supervision loop), with the restart line a node's restart prints. Where a
-// node would be quarantined, the bridge is left: one line says it will not
-// be restarted again, it is marked failed, and the session runs on without
-// Studio. --max-restarts 0 leaves it at its first ending. A stop cancels a
-// pending restart, so no bridge is spawned once the stop has begun.
+// exit, a signal, a liveness kill (stalled or heartbeat_missing), or exit 0,
+// since a server that ends before the stop has failed -- and every spawn that
+// fails is restarted on the restart schedule a non-critical member has
+// (RestartSchedule: 50 ms, doubling to 1 s, at most max_restarts starts per
+// rolling restart window, inside the supervision loop), with the restart line
+// a node's restart prints. Where a node would be quarantined, the bridge is
+// left: one line says it will not be restarted again, it is marked failed,
+// and the session runs on without Studio. --max-restarts 0 leaves it at its
+// first ending. A stop cancels a pending restart, so no bridge is spawned
+// once the stop has begun.
 //
 // A run counts as up once it has run for kStudioBridgeSettleInterval: until
 // then, and while a restart is pending, the bridge does not hold the session
@@ -45,6 +50,9 @@ namespace talos::launcher {
 // ---------------------------------------------------------------------------
 
 inline constexpr std::chrono::seconds kStudioBridgeSettleInterval{1};
+// Matches studio_bridge's <= 1 s wake cadence (250 ms graph refresh and 1 s
+// attached segment check, even with zero clients and zero telemetry).
+inline constexpr std::chrono::seconds kStudioBridgePeriod{1};
 
 // Removes Studio's bridge from `specs` and `described` (index for index)
 // when its --describe probe did not answer, missing binary included:
@@ -86,6 +94,20 @@ class StudioBridge {
   // the time `clock` reads after the spawn.
   void Start(NodeProcessInfo& proc, const SupervisionClock& clock);
 
+  // Aligns the first run's liveness origin with Supervise's start time.
+  void BeginSupervision(SupervisionTime started);
+
+  // One supervision pass's liveness look at the bridge's live registry row
+  // (read-only, lock-free): records its realtime outcome (without warning for
+  // an observer) and kills a hung or unregistered run with SIGKILL. Returns
+  // whether `proc` changed.
+  bool Watch(NodeProcessInfo& proc, const introspect::RegistryMapping* registry,
+             const SupervisionClock& clock, bool stopping);
+
+  // Why Watch killed the current run (kRunStalled, kRunHeartbeatMissing, ...),
+  // or empty when it has not.
+  std::string_view kill_reason() const { return kill_reason_; }
+
   // The supervision loop reaped the current run at `now` (waitpid `status`;
   // the run already ended in `proc`): schedules its restart, or leaves the
   // bridge, unless the session is `stopping`.
@@ -95,12 +117,14 @@ class StudioBridge {
   // One supervision pass, after the loop has reaped exits: marks a run that
   // has been up a settle interval as up, cancels a pending restart once the
   // session is `stopping`, and starts one that is due.
-  void Supervise(NodeProcessInfo& proc, SupervisionTime now, bool stopping);
+  void Supervise(NodeProcessInfo& proc, SupervisionTime now,
+                 const SupervisionClock& clock, bool stopping);
 
-  // When Supervise next has something to decide without an exit: the
-  // settle interval's end of a run still settling, and a pending restart's
-  // start; time_point::max() for neither.
-  SupervisionTime NextCheck() const;
+  // When Supervise or Watch next has something to decide without an exit: the
+  // settle interval's end of a run still settling, the liveness look deadline
+  // while running and not `stopping`, and a pending restart's start;
+  // time_point::max() for none.
+  SupervisionTime NextCheck(bool stopping = false) const;
 
   // The session ended. A pending restart is dropped; a run still settling
   // is killed and reaped, so its run ends with the session. A bridge none
@@ -112,9 +136,13 @@ class StudioBridge {
   // One run, its output drained into log_path_ only, never echoed.
   pid_t Spawn(std::string& error);
 
+  // Starts liveness tracking for a freshly spawned run.
+  void NewRun(SupervisionTime spawned);
+
   // Starts the pending restart at `now`; one that cannot be spawned fails
   // like a run.
-  void Restart(NodeProcessInfo& proc, SupervisionTime now);
+  void Restart(NodeProcessInfo& proc, SupervisionTime now,
+               const SupervisionClock& clock);
 
   // A run ended, or a spawn failed (`what`, for the line), at `now` while
   // the session runs: schedules the next start, or leaves the bridge.
@@ -128,12 +156,19 @@ class StudioBridge {
   std::string target_;
   std::string log_path_;
   ChildOutput& output_;
+  uint64_t session_id_;
   uint16_t http_port_;
   std::vector<std::string> args_;
   RestartLimits limits_;
+  LivenessLimits liveness_limits_;
+  RunLiveness liveness_;
   // Its restarts: one schedule, a non-critical member's.
   RestartSchedule restart_{/*critical=*/false};
   SupervisionTime last_spawn_{};
+  int64_t spawned_monotonic_ns_{0};
+  std::string_view kill_reason_;
+  bool heartbeat_killed_{false};
+  bool realtime_reported_{false};
   bool running_{false};  // A run was spawned and is not yet reaped.
   bool settled_{false};  // That run has been up a settle interval.
   bool came_up_{false};  // Some run has.

@@ -3110,6 +3110,17 @@ std::string BridgeRun(const std::string& record, std::string_view then) {
          std::string{then};
 }
 
+// Waits until `done()` holds, `stop` is requested, or `bound` elapses.
+bool WaitFor(const std::stop_token& stop, const std::function<bool()>& done,
+             std::chrono::steady_clock::duration bound = std::chrono::seconds{
+                 kHangSeconds}) {
+  const auto give_up = std::chrono::steady_clock::now() + bound;
+  while (!stop.stop_requested() && !done() &&
+         std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(2ms);
+  return !stop.stop_requested() && done();
+}
+
 // Studio bridge sessions for the tests below: NothingDueOptions (no member
 // ends, stalls or misses a deadline on its own) with the bridge started, a
 // restart budget of 3 and a supervision clock the test holds from before
@@ -3160,14 +3171,6 @@ TEST(Supervision, CrashedStudioBridgeRestartsAndNoNodeIsDisturbed) {
   bool restarted = false;
   std::jthread driver{[&](const std::stop_token& stop) {
     const testing::SteppedClock::ReleaseOnExit release{clock};
-    const auto wait = [&](const std::function<bool()>& done) {
-      const auto give_up =
-          std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
-      while (!stop.stop_requested() && !done() &&
-             std::chrono::steady_clock::now() < give_up)
-        std::this_thread::sleep_for(2ms);
-      return !stop.stop_requested() && done();
-    };
     const auto every_member_ran = [&] {
       if (ReadLines(runs).size() != 3 || ReadLines(bridge_runs).size() != 1)
         return false;
@@ -3176,16 +3179,16 @@ TEST(Supervision, CrashedStudioBridgeRestartsAndNoNodeIsDisturbed) {
         return EntryInteger(ManifestEntry(before, name), "pid") > 0;
       });
     };
-    if (wait(every_member_ran)) {
+    if (WaitFor(stop, every_member_ran)) {
       // Up one settle interval: a running bridge, not one still starting.
       clock.HoldAt(start + kStudioBridgeSettleInterval);
       const uint64_t settled = passes.Started() + 2;
-      if (wait([&] {
+      if (WaitFor(stop, [&] {
             SupervisionWakeup::Wake();
             return passes.Started() >= settled;
           })) {
         std::ofstream{crash}.close();
-        crashed = wait([&] {
+        crashed = WaitFor(stop, [&] {
           const auto history = ManifestRuns(ReadFile(live), "studio_bridge");
           return !history.empty() &&
                  history.front().find("\"reason\": \"crash\"") !=
@@ -3195,7 +3198,8 @@ TEST(Supervision, CrashedStudioBridgeRestartsAndNoNodeIsDisturbed) {
     }
     if (crashed) {
       clock.Release();
-      restarted = wait([&] { return ReadLines(bridge_runs).size() == 2; });
+      restarted =
+          WaitFor(stop, [&] { return ReadLines(bridge_runs).size() == 2; });
     }
     ::kill(::getpid(), SIGTERM);
   }};
@@ -3251,14 +3255,6 @@ TEST(Supervision, FailingStudioBridgeRestartsBoundedTimesThenIsLeft) {
   bool looked_later = false;
   std::jthread driver{[&](const std::stop_token& stop) {
     const testing::SteppedClock::ReleaseOnExit release{clock};
-    const auto wait = [&](const std::function<bool()>& done) {
-      const auto give_up =
-          std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
-      while (!stop.stop_requested() && !done() &&
-             std::chrono::steady_clock::now() < give_up)
-        std::this_thread::sleep_for(2ms);
-      return !stop.stop_requested() && done();
-    };
     const auto bridge_runs_ended = [&](std::size_t count, int64_t& retry_at) {
       const std::string manifest = ReadFile(live);
       retry_at = EntryInteger(ManifestEntry(manifest, "studio_bridge"),
@@ -3270,14 +3266,15 @@ TEST(Supervision, FailingStudioBridgeRestartsBoundedTimesThenIsLeft) {
     };
     for (std::size_t run = 1; run <= 3; ++run) {
       int64_t retry_at = 0;
-      if (!wait(
-              [&] { return bridge_runs_ended(run, retry_at) && retry_at > 0; }))
+      if (!WaitFor(stop, [&] {
+            return bridge_runs_ended(run, retry_at) && retry_at > 0;
+          }))
         break;
       retries.emplace_back(std::chrono::nanoseconds{retry_at});
       clock.HoldAt(retries.back());
     }
     if (retries.size() == 3) {
-      left = wait([&] {
+      left = WaitFor(stop, [&] {
         int64_t retry_at = 0;
         return bridge_runs_ended(4, retry_at) && retry_at == 0 &&
                ManifestEntry(ReadFile(live), "studio_bridge")
@@ -3289,7 +3286,7 @@ TEST(Supervision, FailingStudioBridgeRestartsBoundedTimesThenIsLeft) {
                    std::chrono::milliseconds{options.restart_window_ms} +
                    kRestartMaxBackoff);
       const uint64_t later = passes.Started() + 2;
-      looked_later = wait([&] {
+      looked_later = WaitFor(stop, [&] {
         SupervisionWakeup::Wake();
         return passes.Started() >= later;
       });
@@ -3364,27 +3361,19 @@ TEST(Supervision, StopDuringStudioBridgeBackoffStartsNoBridge) {
   bool rescued = false;
   std::jthread driver{[&](const std::stop_token& stop) {
     const testing::SteppedClock::ReleaseOnExit release_clock{clock};
-    const auto wait = [&](const std::function<bool()>& done) {
-      const auto give_up =
-          std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
-      while (!stop.stop_requested() && !done() &&
-             std::chrono::steady_clock::now() < give_up)
-        std::this_thread::sleep_for(2ms);
-      return !stop.stop_requested() && done();
-    };
     const auto stopped = [&](const std::string& manifest, const char* name) {
       const auto history = ManifestRuns(manifest, name);
       return !history.empty() &&
              history.back().find("\"reason\": \"stop\"") != std::string::npos;
     };
-    pending = wait([&] {
+    pending = WaitFor(stop, [&] {
       return ReadLines(runs).size() == 3 &&
              EntryInteger(ManifestEntry(ReadFile(live), "studio_bridge"),
                           "retry_at_monotonic_ns") > 0;
     });
     ::kill(::getpid(), SIGTERM);
     if (pending) {
-      stopping = wait([&] {
+      stopping = WaitFor(stop, [&] {
         const std::string manifest = ReadFile(live);
         return stopped(manifest, "alpha") && stopped(manifest, "beta");
       });
@@ -3393,13 +3382,13 @@ TEST(Supervision, StopDuringStudioBridgeBackoffStartsNoBridge) {
       // Past the restart's due time, short of the stop timeout.
       clock.HoldAt(start + kRestartMaxBackoff);
       const uint64_t later = passes.Started() + 2;
-      wait([&] {
+      WaitFor(stop, [&] {
         SupervisionWakeup::Wake();
         return passes.Started() >= later;
       });
     }
     std::ofstream{release}.close();
-    if (!wait([&] { return returned.load(); })) rescued = true;
+    if (!WaitFor(stop, [&] { return returned.load(); })) rescued = true;
   }};
   const int status = RunSession(options);
   returned = true;
@@ -3421,6 +3410,245 @@ TEST(Supervision, StopDuringStudioBridgeBackoffStartsNoBridge) {
   std::filesystem::remove_all(options.output_dir);
   for (const auto* path : {&runs, &bridge_runs, &release})
     ::remove(path->c_str());
+}
+
+std::string RunfileBinary(const char* env_var) {
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  if (!runfiles) throw std::runtime_error(error);
+  const char* path = std::getenv(env_var);
+  if (path == nullptr)
+    throw std::runtime_error(std::string{"missing "} + env_var);
+  return runfiles->Rlocation(path);
+}
+
+// Configures `hardware_node`, `alpha`, and `beta` as registering, heartbeating
+// stubs (`delivery_loss_node`) so real liveness timeouts apply to studio_bridge
+// without killing the other roster members.
+void UseHealthyRegisteringNodes(LauncherOptions& options,
+                                std::string_view tag) {
+  const std::string binary = RunfileBinary("TALOS_DELIVERY_LOSS_NODE");
+  for (const std::string name : {"hardware_node", "alpha", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + name + ":node";
+    options.binary_overrides[target] = WriteStub(
+        std::string{tag} + "_" + name,
+        "exec " + binary + " " + name + " " + target + " 0,0,0,0,run \"$@\"\n",
+        name);
+  }
+}
+
+// A Studio bridge that registers its row, advances dispatch_count, and then
+// hangs without exiting is detected by the launcher's liveness watch (whose
+// NextCheck wakes the loop on time), killed as `stalled`, and restarted on the
+// bridge's schedule without disturbing any other node.
+// REQ-OPS-30, REQ-OPS-45
+TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
+  const auto bridge_runs = TempPath("bridge_hang_bridge_runs");
+  const auto hang = TempPath("bridge_hang_now");
+  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+  auto options = BaseOptions("bridge_hang");
+  options.duration_s = kHangSeconds;
+  options.max_restarts = 2;
+  options.heartbeat_periods = 1;
+  options.heartbeat_startup_grace_ms = 500;
+  options.start_studio_bridge = true;
+  UseHealthyRegisteringNodes(options, "bridge_hang");
+  const std::string binary = RunfileBinary("TALOS_HANGING_BRIDGE");
+  options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStub(
+      "bridge_hang_bridge",
+      "exec " + binary + " '" + bridge_runs + "' '" + hang + "' once \"$@\"\n",
+      "studio_bridge");
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  const uint64_t session = options.session_id;
+  constexpr std::array kNodes{"hardware_node", "alpha", "beta"};
+  std::string before;
+  bool restarted = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const auto ready = [&] {
+      if (ReadLines(bridge_runs).size() != 1 ||
+          !Registered("studio_bridge", session) ||
+          !Registered("hardware_node", session) ||
+          !Registered("alpha", session) || !Registered("beta", session))
+        return false;
+      before = ReadFile(live);
+      return std::ranges::all_of(kNodes, [&](const char* name) {
+        return EntryInteger(ManifestEntry(before, name), "pid") > 0;
+      });
+    };
+    if (WaitFor(stop, ready)) {
+      std::ofstream{hang}.close();
+      restarted = WaitFor(stop, [&] {
+        return ReadLines(bridge_runs).size() == 2 &&
+               Registered("studio_bridge", session);
+      });
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  const int status = RunSession(options);
+  driver.join();
+  EXPECT_TRUE(restarted) << "hung studio_bridge was not killed and restarted";
+  EXPECT_EQ(status, 0);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string bridge = ManifestEntry(manifest, "studio_bridge");
+  EXPECT_EQ(EntryInteger(bridge, "restart_count"), 1) << bridge;
+  EXPECT_NE(bridge.find("\"loop_tier\": \"observer\""), std::string::npos)
+      << bridge;
+  EXPECT_NE(bridge.find("\"realtime\": \"not_requested\""), std::string::npos)
+      << bridge;
+  const auto history = ManifestRuns(manifest, "studio_bridge");
+  ASSERT_EQ(history.size(), 2u) << manifest;
+  EXPECT_NE(history[0].find("\"reason\": \"stalled\""), std::string::npos)
+      << history[0];
+  EXPECT_NE(history[0].find("\"exit_signal\": 9"), std::string::npos)
+      << history[0];
+  for (const char* name : kNodes) {
+    SCOPED_TRACE(name);
+    const std::string entry = ManifestEntry(manifest, name);
+    EXPECT_EQ(EntryInteger(entry, "restart_count"), 0) << entry;
+    EXPECT_EQ(EntryInteger(entry, "pid"),
+              EntryInteger(ManifestEntry(before, name), "pid"))
+        << entry;
+    EXPECT_EQ(ManifestRuns(manifest, name).size(), 1u) << manifest;
+  }
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+}
+
+// A Studio bridge that hangs on every run is killed as `stalled` and restarted
+// up to max_restarts times on the non-critical backoff, then left for the rest
+// of the session (`recorder_failed`, no retry pending) without disturbing any
+// other node or affecting the session's exit status.
+// REQ-OPS-30
+TEST(Supervision, RepeatedlyHangingStudioBridgeExhaustsRestartsAndIsLeft) {
+  const auto bridge_runs = TempPath("bridge_hang_bound_bridge_runs");
+  const auto hang = TempPath("bridge_hang_bound_now");
+  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  auto options = BaseOptions("bridge_hang_bound");
+  options.duration_s = 3600;
+  options.max_restarts = 2;
+  options.heartbeat_periods = 1;
+  options.heartbeat_startup_grace_ms = 500;
+  options.construction_timeout = 1h;
+  options.start_studio_bridge = true;
+  options.supervision_clock = clock.clock();
+  UseHealthyRegisteringNodes(options, "bridge_hang_bound");
+  const std::string binary = RunfileBinary("TALOS_HANGING_BRIDGE");
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("bridge_hang_bound_bridge",
+                "exec " + binary + " '" + bridge_runs + "' '" + hang +
+                    "' always \"$@\"\n",
+                "studio_bridge");
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  const uint64_t session = options.session_id;
+  testing::SupervisionPasses passes;
+  bool left = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    SupervisionTime now = start;
+    const auto run_stalled = [&](std::size_t count, int64_t& retry_at) {
+      const std::string manifest = ReadFile(live);
+      retry_at = EntryInteger(ManifestEntry(manifest, "studio_bridge"),
+                              "retry_at_monotonic_ns");
+      const auto history = ManifestRuns(manifest, "studio_bridge");
+      return history.size() == count &&
+             history.back().find("\"reason\": \"stalled\"") !=
+                 std::string::npos;
+    };
+    const auto node_dispatches = [session] {
+      std::array<uint64_t, 3> counts{0, 0, 0};
+      const auto reader = introspect::RegistryReader::open();
+      if (!reader) return counts;
+      constexpr std::array<std::string_view, 3> kNames{"hardware_node", "alpha",
+                                                       "beta"};
+      for (const auto& row : reader->nodes()) {
+        if (row.session_id != session) continue;
+        for (std::size_t idx = 0; idx < kNames.size(); ++idx) {
+          if (row.name == kNames[idx]) counts[idx] = row.dispatch_count;
+        }
+      }
+      return counts;
+    };
+    const bool nodes_up = WaitFor(stop, [&] {
+      return Registered("hardware_node", session) &&
+             Registered("alpha", session) && Registered("beta", session);
+    });
+    for (std::size_t run = 1; nodes_up && run <= 3; ++run) {
+      if (!WaitFor(stop, [&] { return ReadLines(bridge_runs).size() == run; }))
+        break;
+      // Let one pass observe the registered row at `now`.
+      const uint64_t seen_pass = passes.Started() + 2;
+      if (!WaitFor(stop, [&] {
+            SupervisionWakeup::Wake();
+            return passes.Started() >= seen_pass;
+          }))
+        break;
+      // Wait for each healthy node to publish a fresh dispatch count before
+      // stepping the clock ahead, so only the frozen studio_bridge stalls.
+      const auto before_step = node_dispatches();
+      if (!WaitFor(stop, [&] {
+            const auto current = node_dispatches();
+            return current[0] > before_step[0] && current[1] > before_step[1] &&
+                   current[2] > before_step[2];
+          }))
+        break;
+      now += 2s;
+      clock.HoldAt(now);
+      SupervisionWakeup::Wake();
+      int64_t retry_at = 0;
+      if (run <= 2) {
+        if (!WaitFor(stop, [&] {
+              return run_stalled(run, retry_at) && retry_at > 0;
+            }))
+          break;
+        now = SupervisionTime{std::chrono::nanoseconds{retry_at}};
+        clock.HoldAt(now);
+        SupervisionWakeup::Wake();
+      } else {
+        left = WaitFor(stop, [&] {
+          return run_stalled(run, retry_at) && retry_at == 0 &&
+                 ManifestEntry(ReadFile(live), "studio_bridge")
+                         .find("\"recorder_failed\": true") !=
+                     std::string::npos;
+        });
+      }
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  const int status = RunSession(options);
+  driver.join();
+  ASSERT_TRUE(left)
+      << "repeatedly hanging bridge was not left after exhaustion";
+  EXPECT_EQ(status, 0);
+  EXPECT_EQ(ReadLines(bridge_runs).size(), 3u);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string bridge = ManifestEntry(manifest, "studio_bridge");
+  EXPECT_EQ(EntryInteger(bridge, "restart_count"), 2) << bridge;
+  EXPECT_EQ(EntryInteger(bridge, "retry_at_monotonic_ns"), 0) << bridge;
+  EXPECT_NE(bridge.find("\"recorder_failed\": true"), std::string::npos)
+      << bridge;
+  const auto history = ManifestRuns(manifest, "studio_bridge");
+  ASSERT_EQ(history.size(), 3u) << manifest;
+  for (const auto& entry : history) {
+    EXPECT_NE(entry.find("\"reason\": \"stalled\""), std::string::npos)
+        << entry;
+  }
+  for (const char* name : {"hardware_node", "alpha", "beta"}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(EntryInteger(ManifestEntry(manifest, name), "restart_count"), 0);
+    EXPECT_EQ(ManifestRuns(manifest, name).size(), 1u) << manifest;
+  }
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
 }
 
 }  // namespace

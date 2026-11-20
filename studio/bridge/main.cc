@@ -164,6 +164,23 @@ struct Bridge {
   // Returns from the event loop's wait (every one, whatever woke it), and of
   // them the ones a telemetry publication or a deadline timer woke.
   std::uint64_t wakes = 0, publication_wakes = 0, deadline_wakes = 0;
+  // Live registry claim (optional: standalone runs continue if the registry is
+  // unavailable) and the monotonic pass counter published as dispatch_count so
+  // the launcher's liveness check detects a hung bridge (REQ-OPS-30).
+  std::uint64_t session_id = 0;
+  std::uint64_t loop_passes = 0;
+  std::optional<talos::introspect::NodeRegistration> registration;
+
+  void report_registration() {
+    if (!registration) return;
+    registration->begin_sample();
+    registration->heartbeat();
+    registration->set_dispatch_count(loop_passes);
+    registration->set_source(0, forwarded,
+                             lapped + telemetry_state.incomplete_ticks,
+                             queue ? queue->writer_sequence() : 0, 0, 0, 0);
+    registration->end_sample();
+  }
 
   Bridge() = default;
   Bridge(const Bridge&) = delete;
@@ -423,9 +440,16 @@ struct Bridge {
     if (layout && !drive_clients.clients().empty()) refresh_drive_summary();
 
     // The bridge is a participant, not a neutral observer: it holds a reader
-    // slot on the telemetry topic. Leaving itself out made that topic report
-    // "published but nobody reads it", which is exactly the fault the topic
-    // view exists to surface -- a false one is worse than none.
+    // slot on the telemetry topic. Replace its own live registry row with
+    // self(), which carries exact forwarded/lapped/sequence counters and keeps
+    // studio_bridge visible even when the registry is unavailable, without
+    // duplicating studio_bridge in /system.json.
+    const auto own_pid = static_cast<std::uint64_t>(::getpid());
+    std::erase_if(input.nodes,
+                  [own_pid](const talos::introspect::NodeSnapshot& node) {
+                    return node.pid == own_pid &&
+                           node.name == studio::kStudioBridgeNodeName;
+                  });
     input.nodes.push_back(self());
 
     system_graph = studio::BuildSystemGraph(input);
@@ -447,12 +471,13 @@ struct Bridge {
     // tells the two message families apart by frame type.
   }
 
-  // This process as the registry would have described it, had it a slot.
+  // This process as /system.json reports it, carrying exact bridge counters.
   talos::introspect::NodeSnapshot self() const {
     talos::introspect::NodeSnapshot node;
     node.name = studio::kStudioBridgeNodeName;
     node.target = "//studio/bridge:studio_bridge";
     node.pid = static_cast<std::uint64_t>(::getpid());
+    node.session_id = session_id;
     node.start_wall_ns = started_wall_ns;
     node.heartbeat_monotonic_ns = talos::introspect::monotonic_now_ns();
     node.alive = true;
@@ -549,6 +574,8 @@ struct Bridge {
     // Every pass, not only on a new tick: a pass woken by the budget's refill
     // or a client's heartbeat (next_wake_ns) sends what is due.
     pass_clients();
+    ++loop_passes;
+    report_registration();
   }
 
   // When the loop must next run with no socket event or publication
@@ -670,9 +697,9 @@ constexpr unsigned kMaxIdleTimeoutS = 960;
 int main(int argc, char** argv) try {
   // `--describe`: answer what this process is without touching shared memory,
   // sockets, or the HTTP port, so the launcher can probe this binary like any
-  // other node and carry it in the declared graph. `--config` and `--sim` are
-  // accepted and otherwise ignored, because the launcher probes every binary
-  // with the same flags.
+  // other node and carry it in the declared graph. `--config`, `--sim`, and
+  // `--session-id` are accepted and otherwise ignored, because the launcher
+  // probes every binary with the same flags.
   for (int i = 1; i < argc; ++i) {
     if (std::string_view(argv[i]) != "--describe") continue;
     const char* config_path = nullptr;
@@ -716,14 +743,32 @@ int main(int argc, char** argv) try {
   std::string declared_path;
   std::string manifest_path;
   std::string config_path;
+  std::uint64_t session_id = 0;
+  bool bad_session_id = false;
   unsigned idle_timeout_s = kIdleTimeoutS;
   bool bad_idle_timeout = false;
+  const auto parse_session_id = [&](std::string_view value) {
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), session_id);
+    bad_session_id = error != std::errc{} || end != value.data() + value.size();
+  };
   for (int i = 0; i < argc; ++i) {
     const std::string_view argument = argv[i];
     static constexpr std::string_view kDeclared = "--declared";
     static constexpr std::string_view kManifest = "--manifest";
+    static constexpr std::string_view kSessionId = "--session-id";
     if (argument == "--config" && i + 1 < argc) {
       config_path = argv[++i];
+      continue;
+    }
+    if (argument == kSessionId && i + 1 < argc) {
+      parse_session_id(argv[++i]);
+      continue;
+    }
+    if (argument.starts_with(kSessionId) &&
+        argument.size() > kSessionId.size() &&
+        argument[kSessionId.size()] == '=') {
+      parse_session_id(argument.substr(kSessionId.size() + 1));
       continue;
     }
     if (argument == "--idle-timeout-s" && i + 1 < argc) {
@@ -763,10 +808,12 @@ int main(int argc, char** argv) try {
       std::any_of(args.begin() + 1, args.end(), [](const char* argument) {
         return std::string_view(argument).starts_with("--");
       });
-  if (count > 4 || unknown_option || bad_idle_timeout) {
+  if (count > 4 || unknown_option || bad_idle_timeout || bad_session_id) {
     std::cerr
         << "Usage: studio_bridge "
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
+           "       [--session-id ID]     launcher session id for live "
+           "registry (default 0)\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
            "       [--manifest PATH]   the launcher's manifest.json, served at "
@@ -836,6 +883,7 @@ int main(int argc, char** argv) try {
   if (!missing_pages.empty()) std::cerr << MissingPage(webroot, missing_pages);
   Bridge bridge;
   bridge.topic = topic;
+  bridge.session_id = session_id;
   // Watched by segment name, not by topic. A topic like /talos/telemetry has
   // an interior slash, which POSIX does not allow in an shm name, so RTMS maps
   // it (`ShmObjectName`) before touching the OS. The bridge attaches only
@@ -1122,6 +1170,29 @@ int main(int argc, char** argv) try {
     throw std::runtime_error("cannot listen on port " +
                              std::to_string(http_port) +
                              " (another process holds it?)");
+  }
+  try {
+    bridge.registration.emplace(talos::introspect::NodeRegistration::Identity{
+        .name = std::string{studio::kStudioBridgeNodeName},
+        .target = "//studio/bridge:studio_bridge",
+        .session_id = bridge.session_id,
+        .flags = 0,
+    });
+    talos::event::Registration source;
+    source.id = 0;
+    source.kind = talos::event::SourceKind::WATCHER;
+    source.name = bridge.topic;
+    source.message_bytes =
+        static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
+    source.alignment = 8;
+    source.schema = talos::schema::Bytes();
+    bridge.registration->publish(talos::event::Manifest{source});
+    bridge.registration->set_realtime(
+        {.tier = talos::process::LoopTier::kObserver});
+    bridge.report_registration();
+  } catch (const std::exception& e) {
+    std::cerr << "studio_bridge: node registry unavailable: " << e.what()
+              << '\n';
   }
   std::cout << "listening "
             << us_socket_local_port(

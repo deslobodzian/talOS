@@ -710,13 +710,10 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     namespace_names.RegistryPrepared();
     try {
       introspect::PrepareRegistry();
-      // Every member but Studio's bridge registers a row; the sim gateway
-      // registers its own.
-      const auto registering = static_cast<std::size_t>(std::count_if(
-          node_specs.begin(), node_specs.end(),
-          [](const NodeSpec& spec) { return !spec.studio_bridge; }));
-      const std::string full =
-          RegistryCapacityError(introspect::RegistryReader{}, registering);
+      // Every member registers a row, including the sim gateway and Studio's
+      // bridge.
+      const std::string full = RegistryCapacityError(
+          introspect::RegistryReader{}, node_specs.size());
       if (!full.empty()) {
         ConsoleLine(std::cerr) << "launcher: " << full << "\n";
         return 1;
@@ -1484,6 +1481,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
   // Every first run's liveness counts from here, not its spawn.
   const auto started = options_.supervision_clock();
   for (auto& launch : launches) launch.NewRun(started);
+  if (studio) studio->BeginSupervision(started);
   ServiceNotifier notifier;
   const auto watchdog = notifier.watchdog_interval();
   // A pass starts as soon as a child exits or a stop signal arrives.
@@ -1571,10 +1569,13 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       auto& proc = procs[i];
       auto& launch = launches[i];
       if (proc.pid <= 0 || proc.exited) continue;
-      // Every member but Studio's bridge, which takes no registry row, is
-      // supervised by its row; the simulation gateway registers like a node.
-      if (!stopping && !launch.heartbeat_killed &&
-          !(studio && i == studio->index())) {
+      // Every member is supervised by its registry row; Studio's bridge runs
+      // its own observer liveness and bounded restart policy (StudioBridge).
+      if (studio && i == studio->index()) {
+        if (studio->Watch(proc, registry ? &*registry : nullptr,
+                          options_.supervision_clock, stopping))
+          manifest_changed = true;
+      } else if (!stopping && !launch.heartbeat_killed) {
         if (WatchRun(proc, launch, registry ? &*registry : nullptr))
           manifest_changed = true;
       }
@@ -1582,7 +1583,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       if (::waitpid(proc.pid, &status, WNOHANG) != proc.pid) continue;
       FinishProcessGroup(proc.pid);
       // The run's counts as it ended, before EndRun closes the run. Studio's
-      // bridge takes no row.
+      // bridge reports no delivery-loss counts.
       if (registry && !(studio && i == studio->index())) {
         uint32_t flags = 0;
         if (const auto loss =
@@ -1603,8 +1604,12 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       // from the stop flag: a stop signal from elsewhere that ended the run
       // first is not the session's (EndedByOwnStopSignal). Recorded in the
       // run, which the exit status reads too (exit_not_counted).
-      proc.EndRun(RunEndReason(launch.kill_reason, stop_arrived(), status),
-                  EndedByOwnStopSignal(launch.kill_reason, status));
+      const std::string_view kill_reason =
+          (studio && i == studio->index() && !studio->kill_reason().empty())
+              ? studio->kill_reason()
+              : launch.kill_reason;
+      proc.EndRun(RunEndReason(kill_reason, stop_arrived(), status),
+                  EndedByOwnStopSignal(kill_reason, status));
       // An observer's restarts are its own, on a non-critical schedule that
       // touches no other member (StudioBridge).
       if (studio && i == studio->index()) {
@@ -1659,7 +1664,8 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       const uint64_t began = runs();
       const int64_t retry_at = bridge.retry_at_monotonic_ns;
       const bool failed = bridge.failed;
-      studio->Supervise(procs[studio->index()], now, stop_arrived());
+      studio->Supervise(procs[studio->index()], now, options_.supervision_clock,
+                        stop_arrived());
       if (began != runs() || retry_at != bridge.retry_at_monotonic_ns ||
           failed != bridge.failed)
         manifest_changed = true;
@@ -1739,7 +1745,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     for (const auto& launch : launches) {
       if (launch.restart.pending()) due(launch.restart.due_at());
     }
-    if (studio) due(studio->NextCheck());
+    if (studio) due(studio->NextCheck(stop_sent));
     wakeup.Wait(wake == SupervisionTime::max()
                     ? std::chrono::nanoseconds::max()
                     : wake - options_.supervision_clock());
