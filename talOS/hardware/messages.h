@@ -296,12 +296,21 @@ static_assert(kMaxStateSize == 1419, "Update docs/DATA_FLOW.md");
 // Explicit little-endian codecs: no padding, native bool layout, or alignment
 // assumptions cross the RoboRIO/companion boundary.
 std::size_t Encode(const Command&, std::span<uint8_t>);
-// Raw State wire codec: writes floating fields as given (non-finite doubles or
-// floats produce bytes Decode refuses, and non-finite tenths fields return 0).
-// State producers must use EncodeSanitizedState (gateway.h), which applies
-// ReplaceNonFinite before encoding; raw Encode is only for codec tests and
-// EncodeSanitizedState itself.
+// Applies ReplaceNonFinite (gateway.h) to a copy of the State before encoding
+// for the wire so no non-finite value can reach the wire or fail tenths
+// encoding, even if a caller did not sanitize beforehand. Produces the exact
+// raw wire bytes for every finite State. Returns 0 only for structural errors
+// (out-of-range counts or enums, or a too-small buffer), never for a
+// non-finite measurement.
 std::size_t Encode(const State&, std::span<uint8_t>);
 bool Decode(std::span<const uint8_t>, Command&);
 bool Decode(std::span<const uint8_t>, State&);
+
+namespace detail {
+// Codec-test-only raw State encoder: writes floating fields as given
+// (non-finite doubles or floats produce bytes Decode refuses, and non-finite
+// tenths fields return 0). Never call from a State producer; use
+// hardware::Encode(const State&, std::span<uint8_t>) instead.
+std::size_t EncodeUnsanitizedState(const State&, std::span<uint8_t>);
+}  // namespace detail
 }  // namespace talos::hardware

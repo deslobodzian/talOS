@@ -18,7 +18,6 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/hardware/gate.h"
-#include "talOS/hardware/gateway.h"
 #include "talOS/introspection/names.h"
 #include "talOS/process/process.h"
 
@@ -786,7 +785,7 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     UpdateLinkReady(now_us);
 
     talos::hardware::Packet pkt{};
-    pkt.size = static_cast<uint32_t>(EncodeSanitizedState(state, pkt.data));
+    pkt.size = static_cast<uint32_t>(Encode(state, pkt.data));
     if (state_pub_) Publish(*state_pub_, 0, pkt, now_us);
     return;
   }

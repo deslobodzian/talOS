@@ -178,16 +178,18 @@ TEST(Messages, MotorDiagnosticsUseSaturatingSignedTenths) {
   EXPECT_DOUBLE_EQ(decoded.motors[0].supply_current_a, 3276.7);
   EXPECT_DOUBLE_EQ(decoded.motors[0].stator_current_a, 3276.7);
 
+  // The raw codec rejects non-finite signed-tenths fields; public Encode
+  // sanitizes them through ReplaceNonFinite (tested below).
   for (double invalid : {std::numeric_limits<double>::infinity(),
                          std::numeric_limits<double>::quiet_NaN()}) {
     motor.temperature_c = invalid;
-    EXPECT_EQ(Encode(state, bytes), 0u);
+    EXPECT_EQ(detail::EncodeUnsanitizedState(state, bytes), 0u);
     motor.temperature_c = 25;
     motor.supply_current_a = invalid;
-    EXPECT_EQ(Encode(state, bytes), 0u);
+    EXPECT_EQ(detail::EncodeUnsanitizedState(state, bytes), 0u);
     motor.supply_current_a = 0;
     motor.stator_current_a = invalid;
-    EXPECT_EQ(Encode(state, bytes), 0u);
+    EXPECT_EQ(detail::EncodeUnsanitizedState(state, bytes), 0u);
     motor.stator_current_a = 0;
   }
 }
@@ -1479,15 +1481,15 @@ TEST(Gateway, ANonFiniteReadingInvalidatesOnlyItsSampleAndTheStateDecodes) {
   }
 }
 
-// EncodeSanitizedState is the single encoding boundary for every State
-// producer: it leaves finite wire bytes bit-for-bit identical to raw Encode,
-// never mutates the caller's State, replaces every non-finite field per
-// ReplaceNonFinite so Decode always succeeds where raw Encode would either
-// return 0 or emit undecodable bytes, and still returns 0 cleanly on
-// structural errors (including out-of-range device counts without OOB access).
+// Public Encode(const State&, ...) is the single encoding boundary for every
+// State producer: it leaves finite wire bytes bit-for-bit identical to
+// detail::EncodeUnsanitizedState, never mutates the caller's State, replaces
+// every non-finite field per ReplaceNonFinite so Decode always succeeds where
+// raw encoding would either return 0 or emit undecodable bytes, and still
+// returns 0 cleanly on structural errors (including out-of-range device counts
+// without OOB access).
 // REQ-SAFE-22, REQ-CONTRACT-32
-TEST(Messages,
-     EncodeSanitizedStateSanitizesEveryNonFiniteFieldAndPreservesFiniteBytes) {
+TEST(Messages, EncodeStateSanitizesEveryNonFiniteFieldAndPreservesFiniteBytes) {
   State base;
   base.config_id = 0x1122334455667788ull;
   base.boot_id = 42;
@@ -1514,9 +1516,8 @@ TEST(Messages,
 
   std::array<uint8_t, kMaxStateSize> raw_bytes{};
   std::array<uint8_t, kMaxStateSize> sanitized_bytes{};
-  const std::size_t raw_size = Encode(base, raw_bytes);
-  const std::size_t sanitized_size =
-      EncodeSanitizedState(base, sanitized_bytes);
+  const std::size_t raw_size = detail::EncodeUnsanitizedState(base, raw_bytes);
+  const std::size_t sanitized_size = Encode(base, sanitized_bytes);
   ASSERT_GT(raw_size, 0u);
   EXPECT_EQ(sanitized_size, raw_size);
   EXPECT_EQ(sanitized_bytes, raw_bytes);
@@ -1688,16 +1689,17 @@ TEST(Messages,
       State dirty = base;
       c.inject(dirty, bad_value);
 
-      // Raw Encode either refuses the State (tenths) or emits bytes Decode
+      // Raw encoding either refuses the State (tenths) or emits bytes Decode
       // rejects: skipping sanitization cannot pass silently.
       std::array<uint8_t, kMaxStateSize> raw{};
-      const std::size_t raw_written = Encode(dirty, raw);
+      const std::size_t raw_written =
+          detail::EncodeUnsanitizedState(dirty, raw);
       State raw_decoded{};
       EXPECT_FALSE(raw_written > 0 &&
                    Decode(std::span{raw}.first(raw_written), raw_decoded));
 
       std::array<uint8_t, kMaxStateSize> clean{};
-      const std::size_t clean_written = EncodeSanitizedState(dirty, clean);
+      const std::size_t clean_written = Encode(dirty, clean);
       ASSERT_EQ(clean_written, raw_size);
       // Caller's State still holds its injected non-finite field.
       EXPECT_FALSE(AllFinite(dirty));
@@ -1714,6 +1716,8 @@ TEST(Messages,
   const Mutator mutators[] = {
       [](State& s) { s.motor_count = kMaxMotors + 1; },
       [](State& s) { s.sensor_count = kMaxSensors + 1; },
+      [](State& s) { s.digital_input_count = kMaxDigitalInputs + 1; },
+      [](State& s) { s.digital_output_count = kMaxDigitalOutputs + 1; },
       [](State& s) { s.analog_input_count = kMaxAnalogInputs + 1; },
       [](State& s) { s.encoder_count = kMaxEncoders + 1; },
       [](State& s) { s.pwm_output_count = kMaxPwmOutputs + 1; },
@@ -1721,24 +1725,27 @@ TEST(Messages,
         s.build.program = static_cast<GatewayProgram>(
             static_cast<uint8_t>(kLastGatewayProgram) + 1);
       },
+      [](State& s) { s.health.can_bus_count = kMaxCanBuses + 1; },
       [](State& s) { s.health.can_bus_index = 1; },
+      [](State& s) {
+        s.health.can_bus.read_state = static_cast<CanBusReadState>(
+            static_cast<uint8_t>(kLastCanBusReadState) + 1);
+      },
   };
   for (const Mutator mutate : mutators) {
     State bad = base;
     mutate(bad);
-    EXPECT_EQ(EncodeSanitizedState(bad, sanitized_bytes), 0u);
+    EXPECT_EQ(Encode(bad, sanitized_bytes), 0u);
   }
-  EXPECT_EQ(EncodeSanitizedState(
-                base, std::span{sanitized_bytes}.first(raw_size - 1)),
-            0u);
+  EXPECT_EQ(Encode(base, std::span{sanitized_bytes}.first(raw_size - 1)), 0u);
 }
 
-// Endpoint::Tick routes through EncodeSanitizedState, and Gateway::snapshot()
-// enforces ReplaceNonFinite even while unconfigured: non-finite HAL-like
-// readings (battery voltage, analog input, PWM output, motor effort, CAN bus
-// utilization) never cause Endpoint::Tick to fail with kInvalidArgument and
-// always yield a decodable State with expected validity cleared and 0
-// substituted.
+// Endpoint::Tick encodes through Encode (which applies ReplaceNonFinite), and
+// Gateway::snapshot() also enforces ReplaceNonFinite even while unconfigured:
+// non-finite HAL-like readings (battery voltage, analog input, PWM output,
+// motor effort, CAN bus utilization) never cause Endpoint::Tick to fail with
+// kInvalidArgument and always yield a decodable State with expected validity
+// cleared and 0 substituted.
 // REQ-SAFE-22, REQ-CONTRACT-32
 TEST(Gateway, EndpointEncodesNonFiniteHalReadingsAsValidDecodableState) {
   constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -1768,7 +1775,7 @@ TEST(Gateway, EndpointEncodesNonFiniteHalReadingsAsValidDecodableState) {
   const State snap = gateway.snapshot();
   EXPECT_TRUE(AllFinite(snap));
   std::array<uint8_t, kMaxStateSize> bytes{};
-  const std::size_t size = EncodeSanitizedState(snap, bytes);
+  const std::size_t size = Encode(snap, bytes);
   ASSERT_GT(size, 0u);
   State decoded{};
   ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));

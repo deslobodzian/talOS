@@ -452,7 +452,7 @@ void Gateway::FindPositionJumps(std::vector<uint16_t>& reset_ids) {
 }
 
 // The rule is stated at its declaration (gateway.h). Why it exists: Decode
-// refuses a whole State for one non-finite value (and Encode one for a
+// refuses a whole State for one non-finite value (and raw encoding one for a
 // non-finite current or temperature), so one device's NaN on the wire would
 // read at the bridge as total loss. Why a CAN bus slot becomes a failed read
 // rather than kNone: the bridge keeps a kNone slot's last report, however
@@ -509,12 +509,6 @@ void ReplaceNonFinite(State& state) {
       bus.read_state = CanBusReadState::kFailed;
     }
   }
-}
-
-std::size_t EncodeSanitizedState(const State& state, std::span<uint8_t> data) {
-  State sanitized = state;
-  ReplaceNonFinite(sanitized);
-  return Encode(sanitized, data);
 }
 
 // The backend judged each sample's status, value and isolation; the age bound
