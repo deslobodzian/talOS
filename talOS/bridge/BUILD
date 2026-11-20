@@ -63,6 +63,7 @@ cc_library(
         ":messages",
         "//talOS/configuration",
         "//talOS/driver_station",
+        "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/events:events_os",
         "//talOS/hardware",

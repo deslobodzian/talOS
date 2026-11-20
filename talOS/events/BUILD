@@ -3,7 +3,8 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
 # Types shared by every loop: time, dispatch context, callbacks, the source
-# manifest, the timer queue, the recorder policy and the delivery policy.
+# manifest, the timer queue, the wake-arm stall guard, the recorder policy and
+# the delivery policy.
 # Header only, no OS calls.
 cc_library(
     name = "events_core",
@@ -15,6 +16,7 @@ cc_library(
         "manifest.h",
         "recorder.h",
         "scheduler.h",
+        "stall_guard.h",
         "time.h",
     ],
     visibility = ["//visibility:public"],
