@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 #
 # Run clang-tidy 18, the version CI runs, on the C++ files changed against a
-# base. The selection logic is not copied: this extracts the Python step
-# "Run clang-tidy on changed sources and headers" from
-# .github/workflows/continuous-integration.yaml and runs it, so the changed
+# base. Both this script and CI invoke tools/run_clang_tidy.py, so the changed
 # sources, the includers analysed for a changed header, the test-code check
-# exemption and the OFF_GRAPH list are CI's own. It sees committed changes
+# exemption and the OFF_GRAPH list are shared. It sees committed changes
 # only (git diff BASE HEAD, as in CI): commit first. Tool setup:
 # tools/clang18.sh.
 #
@@ -44,12 +42,8 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-wf=.github/workflows/continuous-integration.yaml
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-sed -n "/python3 - \"\\\$BASE\" <<'PYEOF'/,/^ *PYEOF\$/p" "$wf" | sed '1d;$d;s/^        //' > "$tmp/tidy.py"
-grep -q 'clang-tidy-18' "$tmp/tidy.py" ||
-  clang18_die "could not extract the clang-tidy step from $wf; update tools/tidy.sh"
 
 command -v python3 >/dev/null 2>&1 || clang18_die "need python3"
 clang18_setup
@@ -140,7 +134,8 @@ if [ "$refresh" = 1 ] || [ ! -f compile_commands.json ]; then
     echo "tidy: cannot run here: no compile_commands.json and no bazel to make it" >&2
     exit 3
   fi
-  bazel run --disk_cache="$HOME/.cache/bazel-disk" --noshow_progress \
+  disk_cache="${TALOS_BAZEL_DISK_CACHE:-$HOME/.cache/talos-bazel-disk}"
+  bazel run --disk_cache="$disk_cache" --noshow_progress \
     @hedron_compile_commands//:refresh_all ||
     { echo "tidy: cannot run here: compilation database refresh failed" >&2; exit 3; }
 fi
@@ -151,4 +146,4 @@ if [ "$base_arg" = --all ]; then
 else
   clang18_base "$base_arg"
 fi
-python3 "$tmp/tidy.py" "$BASE"
+python3 tools/run_clang_tidy.py "$BASE"
