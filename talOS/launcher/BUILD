@@ -1,7 +1,7 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 # One launcher console line composed and handed to its stream in one write.
@@ -456,6 +456,13 @@ cc_binary(
     ],
 )
 
+# Binary .tlog header/record reader and node clock helper for Python tools.
+py_library(
+    name = "tlog_read",
+    srcs = ["tlog_read.py"],
+    visibility = ["//visibility:public"],
+)
+
 # bazel run //talOS/launcher:restart_latency -- --config <robot.toml> [...]
 # Per-stage SIGKILL-to-first-request restart latency; see README "Restart
 # latency". The config's nodes come from the workspace's bazel-bin.
@@ -465,6 +472,8 @@ py_binary(
     data = [":launcher"],
     visibility = ["//visibility:public"],
     deps = [
+        ":tlog_read",
+        "//talOS/build:udp_ports",
         "//talOS/memory:shm_name",
         "@rules_python//python/runfiles",
     ],
@@ -479,6 +488,8 @@ py_test(
     ],
     data = [":restart_latency_fixture"],
     deps = [
+        ":tlog_read",
+        "//talOS/build:udp_ports",
         "//talOS/memory:shm_name",
         "@rules_python//python/runfiles",
     ],

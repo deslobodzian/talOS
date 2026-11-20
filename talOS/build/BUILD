@@ -1,6 +1,6 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load(
     ":contract.bzl",
     "TALOS_TOPIC_ABBREVIATIONS",
@@ -17,6 +17,13 @@ exports_files([
     # The check talos_sim_test runs.
     "sim_check.py",
 ])
+
+# Free loopback UDP port pair selection for test and tool launches.
+py_library(
+    name = "udp_ports",
+    srcs = ["udp_ports.py"],
+    visibility = ["//visibility:public"],
+)
 
 # Unlinks the test namespace's live registry after talos_sim_test's session
 # (sim_check.py).

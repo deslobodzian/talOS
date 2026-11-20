@@ -31,7 +31,6 @@ after it."""
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import tempfile
@@ -88,15 +87,6 @@ def unlink_registry(namespace):
         shm_unlink(shm_name(REGISTRY, namespace))
     except FileNotFoundError:
         pass
-
-
-def udp_ports():
-    """Two distinct free loopback UDP ports (TESTING.md §6: bound at 0)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as gateway, \
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge:
-        gateway.bind(("127.0.0.1", 0))
-        bridge.bind(("127.0.0.1", 0))
-        return gateway.getsockname()[1], bridge.getsockname()[1]
 
 
 def scaffold(work):
@@ -188,7 +178,7 @@ class ScaffoldSimTest(unittest.TestCase):
         time zero is when the session is up; stops it `duration_s` after
         that (module docstring). Asserts the launcher stops in order and
         exits 0; returns (session directory, launcher output)."""
-        gateway_port, bridge_port = udp_ports()
+        gateway_port, bridge_port = sim_check.udp_ports()
         # Bazel's TEST_TMPDIR is the shared-memory namespace
         # (ARCHITECTURE.md "Topics and messages") and holds the lock files,
         # which Bazel removes with it; only the registry segment, which a
