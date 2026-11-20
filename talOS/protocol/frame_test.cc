@@ -102,5 +102,22 @@ TEST(FrameTest, RejectsPreviousProtocolVersion) {
             DecodeStatus::kUnsupportedVersion);
 }
 
+// REQ-CONTRACT-02
+TEST(FrameTest, RejectsTruncatedAndTrailingBytes) {
+  const std::array<uint8_t, 4> payload = {1, 2, 3, 4};
+  std::array<uint8_t, kMaxFrameSize> frame{};
+  const std::size_t size =
+      EncodeFrame(FrameType::kHardwareCommand, kFlagNone, 7, 100,
+                  payload.data(), payload.size(), frame.data(), frame.size());
+  ASSERT_EQ(size, kFrameHeaderSize + payload.size());
+
+  DecodedFrame decoded;
+  EXPECT_EQ(DecodeFrame(frame.data(), size - 1, &decoded),
+            DecodeStatus::kTruncated);
+  frame[size] = 0xAA;
+  EXPECT_EQ(DecodeFrame(frame.data(), size + 1, &decoded),
+            DecodeStatus::kTruncated);
+}
+
 }  // namespace
 }  // namespace talos::protocol

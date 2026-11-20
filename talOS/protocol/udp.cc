@@ -294,6 +294,7 @@ UdpStatus RuntimeUdpPeer::Send(std::size_t frame_size) {
   if (sent < 0) {
     const int error = LastSocketError();
     if (IsWouldBlockError(error)) {
+      ++stats_.send_would_block;
       return UdpStatus::kWouldBlock;
     }
     stats_.last_send_error = error;
@@ -329,6 +330,7 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
       ++stats_.receive_would_block;
       return UdpStatus::kWouldBlock;
     }
+    stats_.last_recv_error = error;
     return UdpStatus::kSocketError;
   }
 
@@ -345,11 +347,15 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
     return UdpStatus::kDecodeError;
   }
 
-  if (stats_.last_received_sequence != 0 &&
-      decoded.header.sequence != stats_.last_received_sequence + 1) {
-    ++stats_.sequence_gaps;
+  if (stats_.last_received_sequence == 0) {
+    stats_.last_received_sequence = decoded.header.sequence;
+  } else if (decoded.header.sequence > stats_.last_received_sequence) {
+    stats_.sequence_gaps +=
+        decoded.header.sequence - stats_.last_received_sequence - 1;
+    stats_.last_received_sequence = decoded.header.sequence;
+  } else {
+    ++stats_.out_of_order_frames;
   }
-  stats_.last_received_sequence = decoded.header.sequence;
   ++stats_.received_frames;
   stats_.received_bytes += received_size;
   *out = decoded;

@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -189,6 +190,88 @@ TEST(RuntimeUdpTest, ReopenKeepsThePortsAndTheSendSequence) {
   ASSERT_EQ(testing::ReceiveFrame(rio, &received), UdpStatus::kOk);
   EXPECT_EQ(received.header.monotonic_time_us, 3u);
   EXPECT_EQ(received.header.sequence, 2u);
+}
+
+// REQ-RT-22: sequence_gaps counts actual missed frames on in-order jumps,
+// while out-of-order and duplicate frames increment out_of_order_frames
+// without rolling last_received_sequence backwards (so the next in-order
+// frame creates no phantom gap).
+TEST(RuntimeUdpTest, CountsMissedSequenceGapsAndOutOfOrderWithoutRollback) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+
+  const auto send_seq = [&](uint64_t seq) {
+    std::array<uint8_t, kFrameHeaderSize> buf{};
+    const std::size_t n =
+        EncodeFrame(FrameType::kClockProbe, kFlagNone, seq, seq * 1000, nullptr,
+                    0, buf.data(), buf.size());
+    ASSERT_EQ(n, kFrameHeaderSize);
+    ASSERT_EQ(::sendto(raw_sender, buf.data(), n, 0,
+                       reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+              static_cast<ssize_t>(n));
+    DecodedFrame frame;
+    ASSERT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kOk);
+    EXPECT_EQ(frame.header.sequence, seq);
+  };
+
+  send_seq(1);  // first frame
+  EXPECT_EQ(receiver.stats().sequence_gaps, 0u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 1u);
+
+  send_seq(5);  // jumped 2, 3, 4 -> 3 missed frames
+  EXPECT_EQ(receiver.stats().sequence_gaps, 3u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 0u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 5u);
+
+  send_seq(3);  // delayed out-of-order -> must not roll last_received back
+  EXPECT_EQ(receiver.stats().sequence_gaps, 3u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 1u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 5u);
+
+  send_seq(5);  // duplicate -> out-of-order
+  EXPECT_EQ(receiver.stats().sequence_gaps, 3u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 2u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 5u);
+
+  send_seq(6);  // contiguous after 5 -> 0 additional missed frames
+
+  ::close(raw_sender);
+
+  EXPECT_EQ(receiver.stats().sequence_gaps, 3u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 2u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 6u);
+  EXPECT_EQ(receiver.stats().received_frames, 5u);
+  EXPECT_EQ(receiver.stats().send_would_block, 0u);
+}
+
+// REQ-RT-22: a non-EAGAIN recv() error records errno in last_recv_error.
+TEST(RuntimeUdpTest, RecordsLastRecvErrorOnSocketError) {
+  const uint16_t unbound = FreeLoopbackPort();
+  ASSERT_NE(unbound, 0);
+  RuntimeUdpPeer peer;
+  ASSERT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", unbound), UdpStatus::kOk);
+  ASSERT_EQ(peer.SendFrame(FrameType::kClockProbe, kFlagNone, 1, nullptr, 0),
+            UdpStatus::kOk);
+
+  // Wait for ICMP port unreachable to surface on the connected UDP socket.
+  pollfd pfd{peer.NativeFd(), POLLIN | POLLERR, 0};
+  ASSERT_EQ(::poll(&pfd, 1, 5000), 1);
+
+  DecodedFrame frame;
+  EXPECT_EQ(peer.TryReceive(&frame), UdpStatus::kSocketError);
+  EXPECT_EQ(peer.stats().last_recv_error, ECONNREFUSED);
 }
 
 }  // namespace
