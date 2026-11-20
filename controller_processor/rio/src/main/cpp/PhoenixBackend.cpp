@@ -1296,7 +1296,8 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
                            !feedback_valid;
       sim_neutral_[i] = neutral;
       if (neutral) {
-        result = m.SetControl(ph::controls::NeutralOut{});
+        result =
+            m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
       } else {
         result = m.SetControl(
             ph::controls::Follower{master->can_id, config.oppose_master}
@@ -1308,7 +1309,8 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
     sim_neutral_[i] = r.mode == hw::Mode::kNeutral;
     switch (r.mode) {
       case hw::Mode::kNeutral:
-        result = m.SetControl(ph::controls::NeutralOut{});
+        result =
+            m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
         break;
       case hw::Mode::kDutyCycle:
         result = m.SetControl(ph::controls::DutyCycleOut{r.demand}
@@ -1354,7 +1356,8 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
         // neutralized is this motor's neutral here too.
         if (!hw::TorqueCurrentAllowed(config, r)) {
           sim_neutral_[i] = true;
-          result = m.SetControl(ph::controls::NeutralOut{});
+          result =
+              m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
           break;
         }
         result = m.SetControl(

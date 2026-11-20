@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctre/phoenix6/controls/NeutralOut.hpp>
 #include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <filesystem>
@@ -2037,6 +2038,54 @@ TEST_F(PhoenixBackendTorque, AnOutOfContractRequestIsNeutralOut) {
     ASSERT_TRUE(ApplySent(backend, commands)) << why;
     EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut") << why;
   }
+}
+
+// Every NeutralOut that Apply sends (direct kNeutral, a neutralized follower,
+// and an out-of-contract torque-current request) must be one-shot (0 Hz),
+// matching Neutral() and WatchdogNeutral(), so Phoenix's background control
+// thread does not keep resending periodic 20 Hz frames.
+// REQ-SAFE-43
+TEST_F(PhoenixBackendTorque, EveryApplyNeutralOutIsOneShot) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto master = TestMotor(10, "master", 1);
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  auto gripper = TorqueMotor(30, "gripper", 3);
+  config.motors = {master, follower, gripper};
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  const auto expect_one_shot_neutral = [&](std::size_t i,
+                                           std::string_view why) {
+    const auto applied = Motor(backend, i).GetAppliedControl();
+    ASSERT_NE(applied, nullptr) << why;
+    const auto neutral =
+        std::dynamic_pointer_cast<const ctre::phoenix6::controls::NeutralOut>(
+            applied);
+    ASSERT_NE(neutral, nullptr) << why << ": got " << applied->GetName();
+    EXPECT_DOUBLE_EQ(neutral->UpdateFreqHz.value(), 0.0) << why;
+  };
+
+  // Drive every motor first so each NeutralOut replaces an active control.
+  const std::array<hw::MotorRequest, 3> drive{
+      Request(10, hw::Mode::kVoltage, 4.0),
+      Request(20, hw::Mode::kVoltage, 0.0),
+      Request(30, hw::Mode::kTorqueCurrent, 2.0)};
+  ASSERT_TRUE(ApplySent(backend, drive));
+
+  // Direct kNeutral on master, follower neutralized with master, and
+  // out-of-contract kTorqueCurrent (over max_torque_current_a) on gripper.
+  const std::array<hw::MotorRequest, 3> neutral_all{
+      Request(10, hw::Mode::kNeutral, 0.0),
+      Request(20, hw::Mode::kVoltage, 4.0),
+      Request(30, hw::Mode::kTorqueCurrent, 10.0)};
+  ASSERT_TRUE(ApplySent(backend, neutral_all));
+  expect_one_shot_neutral(0, "direct kNeutral");
+  expect_one_shot_neutral(1, "follower neutral");
+  expect_one_shot_neutral(2, "out-of-contract torque current");
 }
 
 class PhoenixBackendPeakVoltage : public PhoenixBackendTorque {};
