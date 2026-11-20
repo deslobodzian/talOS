@@ -11,6 +11,7 @@
 // NeutralOut for one out of contract.
 #include "PhoenixBackend.h"
 
+#include <frc/DigitalInput.h>
 #include <frc/simulation/DriverStationSim.h>
 #include <frc/simulation/DutyCycleEncoderSim.h>
 #include <frc/simulation/EncoderSim.h>
@@ -28,12 +29,14 @@
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <initializer_list>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1009,6 +1012,18 @@ class PhoenixBackendRecovery : public ::testing::Test {
   }
   static void MarkUnavailable(PhoenixBackend& backend, uint16_t id) {
     backend.unavailable_.push_back(id);
+  }
+  static void SetConfigureFuture(PhoenixBackend& backend,
+                                 std::future<bool> future) {
+    backend.configure_ = std::move(future);
+  }
+  static ::testing::AssertionResult WaitConfigureReady(
+      PhoenixBackend& backend) {
+    if (!backend.configure_.valid())
+      return ::testing::AssertionFailure() << "configure future is not valid";
+    if (backend.configure_.wait_for(kReadyTimeout) != std::future_status::ready)
+      return ::testing::AssertionFailure() << "configure stayed pending";
+    return ::testing::AssertionSuccess();
   }
   static void StopRefreshingHealth(PhoenixBackend& backend) {
     auto& motor = Motor(backend, 0);
@@ -2056,4 +2071,72 @@ TEST_F(PhoenixBackendPeakVoltage, IsMaxVoltageAfterConfigureAndRestore) {
   ASSERT_TRUE(AppliedConfig(backend, 0, applied));
   EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), 2.0);
   EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -2.0);
+}
+
+// Asynchronous configuration runs on a worker thread and is polled on the
+// SCHED_FIFO RoboRIO loop thread. Any exception thrown inside Configure()
+// (validation, WPILib HAL resource allocation) or from configure_.get() must
+// report ConfigureStatus::kFailed with a recorded error and never escape onto
+// the loop thread.
+// REQ-SAFE-21
+TEST_F(PhoenixBackendRecovery, AsyncConfigureCatchesExceptionsAsFailure) {
+  EnsureHal();
+  Console console;
+  PhoenixBackend backend(true, console.log());
+
+  // 1. hw::Validate throws std::invalid_argument inside the async worker.
+  hw::Config invalid;
+  invalid.period_us = 0;
+  ASSERT_NO_THROW(backend.BeginConfigure(invalid));
+  ASSERT_TRUE(WaitConfigureReady(backend));
+  hw::Backend::ConfigureStatus status = hw::Backend::ConfigureStatus::kPending;
+  ASSERT_NO_THROW(status = backend.PollConfigure());
+  EXPECT_EQ(status, hw::Backend::ConfigureStatus::kFailed);
+  ASSERT_TRUE(backend.last_config_error().has_value());
+  EXPECT_FALSE(backend.last_config_error()->message.empty());
+  EXPECT_FALSE(console.Lines({"[phoenix]", "config failed"}).empty());
+
+  // 2. WPILib HAL constructor throws frc::RuntimeError after Validate passes
+  // (e.g. a DIO channel already held by another resource), exercised through
+  // Gateway::BeginReconfigure/Tick as on the RoboRIO loop.
+  frc::DigitalInput occupied_dio{7};
+  hw::Config dio_conflict;
+  hw::DigitalInputConfig di;
+  di.id = 40;
+  di.name = "conflict_di";
+  di.dio = 7;
+  dio_conflict.digital_inputs.push_back(di);
+  hw::Gateway gateway{backend, 1};
+  ASSERT_TRUE(gateway.BeginReconfigure(dio_conflict));
+  ASSERT_TRUE(WaitConfigureReady(backend));
+  ASSERT_NO_THROW(gateway.Tick(5000, false));
+  EXPECT_FALSE(gateway.configuring());
+  EXPECT_FALSE(gateway.configured());
+  EXPECT_TRUE((gateway.snapshot().flags & hw::kHardwareFault) != 0);
+  ASSERT_TRUE(gateway.config_error().has_value());
+  EXPECT_FALSE(gateway.config_error()->message.empty());
+
+  // 3. PollConfigure() itself catches both std::exception and unknown
+  // exceptions stored in configure_.
+  {
+    std::promise<bool> p;
+    p.set_exception(
+        std::make_exception_ptr(std::runtime_error("injected future error")));
+    SetConfigureFuture(backend, p.get_future());
+    ASSERT_NO_THROW(status = backend.PollConfigure());
+    EXPECT_EQ(status, hw::Backend::ConfigureStatus::kFailed);
+    ASSERT_TRUE(backend.last_config_error().has_value());
+    EXPECT_NE(
+        backend.last_config_error()->message.find("injected future error"),
+        std::string::npos);
+  }
+  {
+    std::promise<bool> p;
+    p.set_exception(std::make_exception_ptr(42));
+    SetConfigureFuture(backend, p.get_future());
+    ASSERT_NO_THROW(status = backend.PollConfigure());
+    EXPECT_EQ(status, hw::Backend::ConfigureStatus::kFailed);
+    ASSERT_TRUE(backend.last_config_error().has_value());
+    EXPECT_FALSE(backend.last_config_error()->message.empty());
+  }
 }

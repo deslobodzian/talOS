@@ -15,6 +15,7 @@
 #include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
 #include <ctre/phoenix6/controls/VelocityVoltage.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
+#include <exception>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -255,6 +256,28 @@ void LogCanBusStatus(talos::rio::RioLog& log, std::string_view bus,
   }
   log.Post(event);
 }
+
+// Records an exception from Configure() or its future as a failed configure
+// without letting a secondary exception escape onto the SCHED_FIFO loop thread.
+void RecordConfigureException(std::optional<hw::ConfigError>& last_error,
+                              talos::rio::RioLog& log,
+                              const char* detail) noexcept {
+  try {
+    hw::ConfigError err;
+    err.device_name = "phoenix";
+    err.operation = "configure";
+    err.message = (detail != nullptr && detail[0] != '\0')
+                      ? detail
+                      : "unexpected exception";
+    last_error = err;
+    talos::rio::LogEvent event;
+    event.index = kConfigureFailedMessage;
+    event.SetText("[phoenix] " + hw::FormatConfigError(err));
+    log.Post(event);
+  } catch (...) {
+    // Never let a secondary exception (e.g. bad_alloc) escape.
+  }
+}
 }  // namespace
 
 PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
@@ -285,15 +308,40 @@ std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
 }
 
 void PhoenixBackend::BeginConfigure(const hw::Config& config) {
-  configure_ = std::async(std::launch::async,
-                          [this, config] { return Configure(config); });
+  try {
+    configure_ = std::async(std::launch::async, [this, config] {
+      try {
+        return Configure(config);
+      } catch (const std::exception& e) {
+        RecordConfigureException(last_error_, *log_, e.what());
+        return false;
+      } catch (...) {
+        RecordConfigureException(last_error_, *log_, "unknown exception");
+        return false;
+      }
+    });
+  } catch (const std::exception& e) {
+    configure_ = {};
+    RecordConfigureException(last_error_, *log_, e.what());
+  } catch (...) {
+    configure_ = {};
+    RecordConfigureException(last_error_, *log_, "unknown exception");
+  }
 }
 
 PhoenixBackend::ConfigureStatus PhoenixBackend::PollConfigure() {
   if (!configure_.valid()) return ConfigureStatus::kFailed;
   if (configure_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
     return ConfigureStatus::kPending;
-  return configure_.get() ? ConfigureStatus::kDone : ConfigureStatus::kFailed;
+  try {
+    return configure_.get() ? ConfigureStatus::kDone : ConfigureStatus::kFailed;
+  } catch (const std::exception& e) {
+    RecordConfigureException(last_error_, *log_, e.what());
+    return ConfigureStatus::kFailed;
+  } catch (...) {
+    RecordConfigureException(last_error_, *log_, "unknown exception");
+    return ConfigureStatus::kFailed;
+  }
 }
 
 bool PhoenixBackend::Configure(const hw::Config& c) {
