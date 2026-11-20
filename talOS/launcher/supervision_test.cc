@@ -3550,6 +3550,56 @@ void UseHealthyRegisteringNodes(LauncherOptions& options,
   }
 }
 
+// Advances `clock` from `now` to `target` in increments strictly below the
+// 500 ms `kMinHeartbeatTimeout` of `hardware_node`, `alpha`, and `beta`,
+// refreshing each healthy node's observed `dispatch_count` before every step
+// so an extra supervision pass never mistakes a clock jump for a node stall.
+bool AdvanceClockWithHealthyNodes(const std::stop_token& stop,
+                                  testing::SteppedClock& clock,
+                                  testing::SupervisionPasses& passes,
+                                  uint64_t session, SupervisionTime& now,
+                                  SupervisionTime target) {
+  const auto node_dispatches = [session] {
+    std::array<uint64_t, 3> counts{0, 0, 0};
+    const auto reader = introspect::RegistryReader::open();
+    if (!reader) return counts;
+    constexpr std::array<std::string_view, 3> kNames{"hardware_node", "alpha",
+                                                     "beta"};
+    for (const auto& row : reader->nodes()) {
+      if (row.session_id != session) continue;
+      for (std::size_t idx = 0; idx < kNames.size(); ++idx) {
+        if (row.name == kNames[idx]) counts[idx] = row.dispatch_count;
+      }
+    }
+    return counts;
+  };
+  const auto observe_pass = [&] {
+    const uint64_t next = passes.Started() + 2;
+    return WaitFor(stop, [&] {
+      SupervisionWakeup::Wake();
+      return passes.Started() >= next;
+    });
+  };
+  const auto refresh_healthy_nodes = [&] {
+    const auto before_step = node_dispatches();
+    if (!WaitFor(stop, [&] {
+          const auto current = node_dispatches();
+          return current[0] > before_step[0] && current[1] > before_step[1] &&
+                 current[2] > before_step[2];
+        }))
+      return false;
+    return observe_pass();
+  };
+  while (now < target) {
+    if (!refresh_healthy_nodes()) return false;
+    const auto remaining = target - now;
+    now += remaining < 250ms ? remaining : 250ms;
+    clock.HoldAt(now);
+    SupervisionWakeup::Wake();
+  }
+  return true;
+}
+
 // A Studio bridge that registers its row, advances dispatch_count, and then
 // hangs without exiting is detected by the launcher's liveness watch, killed
 // as `stalled`, and restarted on the bridge's schedule without disturbing any
@@ -3559,12 +3609,16 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
   const auto bridge_runs = TempPath("bridge_hang_bridge_runs");
   const auto hang = TempPath("bridge_hang_now");
   for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
   auto options = BaseOptions("bridge_hang");
-  options.duration_s = kHangSeconds;
+  options.duration_s = 3600;
   options.max_restarts = 2;
   options.heartbeat_periods = 1;
   options.heartbeat_startup_grace_ms = 500;
+  options.construction_timeout = 1h;
   options.start_studio_bridge = true;
+  options.supervision_clock = clock.clock();
   UseHealthyRegisteringNodes(options, "bridge_hang");
   const std::string binary = RunfileBinary("TALOS_HANGING_BRIDGE");
   options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStub(
@@ -3576,9 +3630,19 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
                            "/manifest.json";
   const uint64_t session = options.session_id;
   constexpr std::array kNodes{"hardware_node", "alpha", "beta"};
+  testing::SupervisionPasses passes;
   std::string before;
   bool restarted = false;
   std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    SupervisionTime now = start;
+    const auto observe_pass = [&] {
+      const uint64_t next = passes.Started() + 2;
+      return WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= next;
+      });
+    };
     const auto ready = [&] {
       if (ReadLines(bridge_runs).size() != 1 ||
           !Registered("studio_bridge", session) ||
@@ -3590,12 +3654,39 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
         return EntryInteger(ManifestEntry(before, name), "pid") > 0;
       });
     };
-    if (WaitFor(stop, ready)) {
+    if (WaitFor(stop, ready) && observe_pass()) {
       std::ofstream{hang}.close();
-      restarted = WaitFor(stop, [&] {
-        return ReadLines(bridge_runs).size() == 2 &&
-               Registered("studio_bridge", session);
-      });
+      // Step across studio_bridge's 1 s stall timeout in 250 ms increments
+      // until the launcher records the stall (an extra step absorbs any
+      // dispatch the bridge emitted just before observing `hang`), then step
+      // to its scheduled restart without depending on host wall-clock timing.
+      int64_t retry_at = 0;
+      const auto bridge_stalled = [&] {
+        const std::string manifest = ReadFile(live);
+        retry_at = EntryInteger(ManifestEntry(manifest, "studio_bridge"),
+                                "retry_at_monotonic_ns");
+        const auto history = ManifestRuns(manifest, "studio_bridge");
+        return history.size() == 1 &&
+               history.back().find("\"reason\": \"stalled\"") !=
+                   std::string::npos &&
+               retry_at > 0;
+      };
+      bool stalled = false;
+      for (int step = 0; step < 12 && !stalled; ++step) {
+        if (!AdvanceClockWithHealthyNodes(stop, clock, passes, session, now,
+                                          now + 250ms))
+          break;
+        stalled = bridge_stalled();
+      }
+      if (!stalled) stalled = WaitFor(stop, bridge_stalled);
+      if (stalled && AdvanceClockWithHealthyNodes(
+                         stop, clock, passes, session, now,
+                         SupervisionTime{std::chrono::nanoseconds{retry_at}})) {
+        restarted = WaitFor(stop, [&] {
+          return ReadLines(bridge_runs).size() == 2 &&
+                 Registered("studio_bridge", session);
+        });
+      }
     }
     ::kill(::getpid(), SIGTERM);
   }};
@@ -3673,19 +3764,12 @@ TEST(Supervision, RepeatedlyHangingStudioBridgeExhaustsRestartsAndIsLeft) {
              history.back().find("\"reason\": \"stalled\"") !=
                  std::string::npos;
     };
-    const auto node_dispatches = [session] {
-      std::array<uint64_t, 3> counts{0, 0, 0};
-      const auto reader = introspect::RegistryReader::open();
-      if (!reader) return counts;
-      constexpr std::array<std::string_view, 3> kNames{"hardware_node", "alpha",
-                                                       "beta"};
-      for (const auto& row : reader->nodes()) {
-        if (row.session_id != session) continue;
-        for (std::size_t idx = 0; idx < kNames.size(); ++idx) {
-          if (row.name == kNames[idx]) counts[idx] = row.dispatch_count;
-        }
-      }
-      return counts;
+    const auto observe_pass = [&] {
+      const uint64_t target = passes.Started() + 2;
+      return WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= target;
+      });
     };
     const bool nodes_up = WaitFor(stop, [&] {
       return Registered("hardware_node", session) &&
@@ -3695,51 +3779,20 @@ TEST(Supervision, RepeatedlyHangingStudioBridgeExhaustsRestartsAndIsLeft) {
       if (!WaitFor(stop, [&] { return ReadLines(bridge_runs).size() == run; }))
         break;
       // Let one pass observe the registered bridge row at `now`.
-      const auto observe_pass = [&] {
-        const uint64_t target = passes.Started() + 2;
-        return WaitFor(stop, [&] {
-          SupervisionWakeup::Wake();
-          return passes.Started() >= target;
-        });
-      };
-      const auto refresh_healthy_nodes = [&] {
-        const auto before_step = node_dispatches();
-        if (!WaitFor(stop, [&] {
-              const auto current = node_dispatches();
-              return current[0] > before_step[0] &&
-                     current[1] > before_step[1] && current[2] > before_step[2];
-            }))
-          return false;
-        return observe_pass();
-      };
       if (!observe_pass()) break;
-      // Advance across studio_bridge's 1 s stall timeout (kStudioBridgePeriod
-      // x heartbeat_periods) in 250 ms steps — strictly below the 500 ms
-      // kMinHeartbeatTimeout of hardware_node, alpha, and beta — refreshing
-      // every healthy node's observed dispatch count at each step so no extra
-      // supervision pass can ever make a healthy node appear stalled across a
-      // clock jump.
-      bool stepped = true;
-      for (int step = 0; step < 4; ++step) {
-        if (!refresh_healthy_nodes()) {
-          stepped = false;
-          break;
-        }
-        now += 250ms;
-        clock.HoldAt(now);
-        SupervisionWakeup::Wake();
-      }
-      if (!stepped) break;
+      if (!AdvanceClockWithHealthyNodes(stop, clock, passes, session, now,
+                                        now + 1000ms))
+        break;
       int64_t retry_at = 0;
       if (run <= 2) {
         if (!WaitFor(stop, [&] {
               return run_stalled(run, retry_at) && retry_at > 0;
             }))
           break;
-        if (!refresh_healthy_nodes()) break;
-        now = SupervisionTime{std::chrono::nanoseconds{retry_at}};
-        clock.HoldAt(now);
-        SupervisionWakeup::Wake();
+        if (!AdvanceClockWithHealthyNodes(
+                stop, clock, passes, session, now,
+                SupervisionTime{std::chrono::nanoseconds{retry_at}}))
+          break;
       } else {
         left = WaitFor(stop, [&] {
           return run_stalled(run, retry_at) && retry_at == 0 &&
