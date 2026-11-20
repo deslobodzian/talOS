@@ -3,11 +3,11 @@
 #include <sys/statvfs.h>
 
 #include <algorithm>
-#include <charconv>
 #include <cstring>
 #include <exception>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <span>
 #include <sstream>
@@ -21,6 +21,7 @@
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/manifest.h"
+#include "talOS/events/session_manifest.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/protocol/types.h"
@@ -36,14 +37,22 @@ std::string ReadSmallFile(const fs::path& path) {
   return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
 }
 
-// The value after `"key": ` in the launcher's own manifest JSON, which writes
-// one key per line (SessionManifest::ToJson); empty when absent.
-std::string_view JsonValue(std::string_view json, std::string_view key) {
-  const std::string quoted = "\"" + std::string{key} + "\": ";
-  const auto at = json.find(quoted);
-  if (at == std::string_view::npos) return {};
-  json.remove_prefix(at + quoted.size());
-  return json.substr(0, json.find_first_of(",\n}"));
+// Reads `<dir>/manifest.json`: nullopt when absent or unreadable, empty Fields
+// when present but malformed JSON.
+std::optional<event::session_manifest::Fields> ReadManifest(
+    const fs::path& dir) {
+  std::error_code error;
+  if (!fs::is_regular_file(dir / event::session_manifest::kFileName, error)) {
+    return std::nullopt;
+  }
+  const std::optional<std::string> text =
+      event::session_manifest::ReadText(dir);
+  if (!text) return std::nullopt;
+  try {
+    return event::session_manifest::Parse(*text);
+  } catch (const event::session_manifest::ManifestError&) {
+    return event::session_manifest::Fields{};
+  }
 }
 
 // What this build can read: an `other` or `unknown` verdict holds until it
@@ -112,32 +121,26 @@ Seen ScanLog(const std::string& path) {
 
 SessionFacts InspectSession(const fs::path& dir, ClassCache cache) {
   SessionFacts facts;
-  std::error_code error;
-  if (!fs::is_regular_file(dir / "manifest.json", error)) return facts;
-  const std::string manifest = ReadSmallFile(dir / "manifest.json");
-  const std::string_view start = JsonValue(manifest, "start_wall_ns");
-  std::int64_t start_ns = 0;
-  const auto [end, parsed] =
-      std::from_chars(start.data(), start.data() + start.size(), start_ns);
-  if (parsed == std::errc{} && end == start.data() + start.size() &&
-      start_ns > 0)
-    facts.start_wall_ns = start_ns;
-  // The session's own, written before its runs' (SessionManifest::ToJson).
-  const std::string_view end_ns = JsonValue(manifest, "end_wall_ns");
-  facts.finished = !end_ns.empty() && end_ns != "0";
-  if (JsonValue(manifest, "simulation") != "true")
+  const std::optional<event::session_manifest::Fields> manifest =
+      ReadManifest(dir);
+  if (!manifest) return facts;
+  if (manifest->start_wall_ns && *manifest->start_wall_ns > 0 &&
+      *manifest->start_wall_ns <=
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::int64_t>::max())) {
+    facts.start_wall_ns = static_cast<std::int64_t>(*manifest->start_wall_ns);
+  }
+  facts.finished = manifest->end_wall_ns && *manifest->end_wall_ns != 0;
+  if (!manifest->simulation.value_or(false)) {
     facts.verdict = RecordedMatch(dir, cache);
+  }
   return facts;
 }
 
 std::optional<bool> SessionSimulation(const fs::path& dir) {
-  std::error_code error;
-  if (!fs::is_regular_file(dir / "manifest.json", error)) return std::nullopt;
-  const std::string manifest = ReadSmallFile(dir / "manifest.json");
-  const std::string_view simulation = JsonValue(manifest, "simulation");
-  if (simulation == "true") return true;
-  if (simulation == "false") return false;
-  return std::nullopt;
+  const std::optional<event::session_manifest::Fields> manifest =
+      ReadManifest(dir);
+  return manifest ? manifest->simulation : std::nullopt;
 }
 
 MatchVerdict RecordedMatch(const fs::path& dir, ClassCache cache_mode) {

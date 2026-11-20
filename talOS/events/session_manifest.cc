@@ -34,6 +34,12 @@ class Scanner {
             fields.config_path.reset();
             Skip(1);
           }
+        } else if (key == kSimulation) {
+          fields.simulation = OptionalBool();
+        } else if (key == kStartWallNs) {
+          fields.start_wall_ns = Unsigned();
+        } else if (key == kEndWallNs) {
+          fields.end_wall_ns = Unsigned();
         } else if (key == kNodes) {
           fields.nodes = Nodes();
         } else {
@@ -185,6 +191,20 @@ class Scanner {
       return std::nullopt;
     }
     return value;
+  }
+
+  // A JSON boolean, or nullopt for any other value (skipped).
+  std::optional<bool> OptionalBool() {
+    if (Peek() == 't') {
+      Literal("true");
+      return true;
+    }
+    if (Peek() == 'f') {
+      Literal("false");
+      return false;
+    }
+    Skip(1);
+    return std::nullopt;
   }
 
   bool Bool(std::string_view key) {
