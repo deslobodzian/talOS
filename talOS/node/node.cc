@@ -17,6 +17,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1229,31 +1230,41 @@ class OfflinePort final : public LoopPortFor<Loop> {
 // --replay-inputs: this node, on a simulated loop on the recorded clock, fed
 // every message the session logged on a topic it watches at its recorded
 // time (talOS/events/input_replay.h). Its path must be a session directory
-// (SESSION_DIR); a non-directory is refused naming the path as given. A node
+// (SESSION_DIR); a non-directory is refused naming the path as given, and any
+// other filesystem error (such as EACCES) names the path and OS error. A node
 // the session logged runs on its own recorded timeline (origin and run start,
-// so its timers fire at the recorded deadlines, without fabricating a firing
-// past a late EXIT) and is handed what it received live, at the drains it
-// received it in. What it sends is logged to --log. A topic recorded with
-// another schema fails before anything runs; topics nobody recorded are
-// listed. The run ends before the earliest gap or damaged stretch in a log
-// it is fed from, says where, and exits 1 (event::ReplayInputs), as does a
-// run whose own output log has a gap. A log it would be fed from that may
-// have lost records nothing in it marks or bounds is refused before anything
-// runs (a ReplayError, exit 1): one with a `.capped` marker or whose member
-// the session manifest marks log_capped, a run's log without its EXIT record
-// of a member it marks log_gap or recorder_failed, one with a missing or
-// incomplete-header segment (including a first segment gone without a marker
-// or a missing segment before the unnumbered active file whose records jump
-// in dispatch index or sender sequence), and one whose damaged stretch nothing
-// bounds. So is the node's own first-run log when it arms a timer and its
-// first segment, or a segment before its first firing read, is gone or
-// unreadable: the firing its run start is read from may have been in it; and,
-// with no firing that gives the run start, when it holds no record of its run
-// or a loss that may hold its firings.
+// so its timers fire at the recorded deadlines, with loop_end() clamped before
+// an unfired armed deadline for a lossless single-run log; see input_replay.h
+// for the ARM_TIMER live-latency and backlog-drain-exit exceptions) and is
+// handed what it received live, at the drains it received it in. What it sends
+// is logged to --log. A topic recorded with another schema fails before
+// anything runs; topics nobody recorded are listed. The run ends before the
+// earliest gap or damaged stretch in a log it is fed from, says where, and
+// exits 1 (event::ReplayInputs), as does a run whose own output log has a gap.
+// A log it would be fed from that may have lost records nothing in it marks or
+// bounds is refused before anything runs (a ReplayError, exit 1): one with a
+// `.capped` marker or whose member the session manifest marks log_capped, a
+// run's log without its EXIT record of a member it marks log_gap or
+// recorder_failed, one with a missing or incomplete-header segment (including
+// a first segment gone without a marker when a later numbered segment remains
+// or the unnumbered active file's first intact record has dispatch_index > 1,
+// or a missing segment before the unnumbered active file whose boundary jumps
+// in dispatch_index (> prev + 1) or repeated-sender accepted-SEND sequence
+// (> prev + 1)), and one whose damaged stretch nothing bounds. So is the
+// node's own first-run log when it arms a timer and its first segment, or a
+// segment before its first firing read, is gone or unreadable: the firing its
+// run start is read from may have been in it; and, with no firing that gives
+// the run start, when it holds no record of its run or a loss that may hold
+// its firings.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
   std::error_code ec;
   if (!std::filesystem::is_directory(flags.replay_inputs, ec)) {
+    if (ec && ec != std::errc::no_such_file_or_directory &&
+        ec != std::errc::not_a_directory) {
+      throw std::invalid_argument("--replay-inputs " + flags.replay_inputs +
+                                  ": " + ec.message());
+    }
     throw std::invalid_argument("--replay-inputs " + flags.replay_inputs +
                                 " is not a session directory");
   }
