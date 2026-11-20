@@ -10,7 +10,7 @@ Each rule carries its status:
 | Mark | Meaning |
 |---|---|
 | **[enforced]** | the build, the graph lint or a test fails when it is broken |
-| **[review]** | a convention; the `reviewer` agent (`.claude/agents/reviewer.md`) checks it |
+| **[review]** | a convention; the `reviewer` agent (`.agents/agents/reviewer.md`, `.claude/agents/reviewer.md`) checks it |
 | **[gap]** | stated, but nothing checks it yet; names the TODO.md item that adds the check |
 
 ## 1. What the four goals mean here

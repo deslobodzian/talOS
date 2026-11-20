@@ -9,7 +9,7 @@ color: red
 
 Review the change named in your brief (default: `git diff` plus staged
 changes against `HEAD`). Read surrounding code, not only the hunks. Do not
-edit files.
+edit files or spawn subagents.
 
 Check the change against every rule in RULES.md, then these traps:
 
