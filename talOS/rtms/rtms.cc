@@ -11,11 +11,13 @@
 #include <atomic>
 #include <cerrno>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -33,6 +35,52 @@ namespace {
 std::string Remedy(const std::string& path) {
   return " (stop the processes using it, then shm_unlink " +
          ShmObjectName(path) + ", start a launcher session, or reboot)";
+}
+
+std::runtime_error VersionMismatchError(const std::string& path,
+                                        std::uint64_t version) {
+  return std::runtime_error("RTMS shared-memory version mismatch on " + path +
+                            ": segment version " + std::to_string(version) +
+                            ", expected " + std::to_string(kRtmsVersion) +
+                            Remedy(path));
+}
+
+// Minimum prefix needed to identify a talOS RTMS segment and its format
+// version, even when an older format had a smaller RTMSHeader.
+struct HeaderPrefix {
+  std::atomic<std::uint64_t> magic{0};
+  std::uint64_t version{0};
+};
+static_assert(offsetof(RTMSHeader, magic) == offsetof(HeaderPrefix, magic));
+static_assert(offsetof(RTMSHeader, version) == offsetof(HeaderPrefix, version));
+static_assert(sizeof(HeaderPrefix) ==
+              offsetof(RTMSHeader, version) + sizeof(RTMSHeader::version));
+
+// Checks an existing segment's magic/version prefix before SharedMemoryPtr
+// refuses a smaller older-version segment by size. Does not wait on a
+// segment still being created: if it is absent, too small for the prefix, or
+// has not published magic yet, open() proceeds to SharedMemoryPtr.
+void ThrowIfVersionMismatch(const std::string& path) {
+  const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0666);
+  if (fd == -1) return;
+  struct stat info {};
+  std::optional<std::uint64_t> version;
+  if (::fstat(fd, &info) == 0 && info.st_size >= 0 &&
+      static_cast<std::uint64_t>(info.st_size) >= sizeof(HeaderPrefix)) {
+    void* mapped =
+        ::mmap(nullptr, sizeof(HeaderPrefix), PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped != MAP_FAILED) {
+      const auto* prefix = static_cast<const HeaderPrefix*>(mapped);
+      if (prefix->magic.load(std::memory_order_acquire) == kRtmsMagic) {
+        version = prefix->version;
+      }
+      ::munmap(mapped, sizeof(HeaderPrefix));
+    }
+  }
+  ::close(fd);
+  if (version.has_value() && *version != kRtmsVersion) {
+    throw VersionMismatchError(path, *version);
+  }
 }
 
 // Bounded like SharedMemoryPtr's size wait: a creator initializes a header
@@ -253,7 +301,18 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
   }
 
   for (int attempt = 0; attempt <= kOpenAttempts; ++attempt) {
-    SharedMemoryPtr ptr{path_, total_bytes_};
+    if (!options_.session_owner) {
+      ThrowIfVersionMismatch(path_);
+    }
+    SharedMemoryPtr ptr;
+    try {
+      ptr = SharedMemoryPtr{path_, total_bytes_};
+    } catch (const std::runtime_error&) {
+      if (!options_.session_owner) {
+        ThrowIfVersionMismatch(path_);
+      }
+      throw;
+    }
     auto* header = static_cast<RTMSHeader*>(ptr.ptr());
 
     if (ptr.mode() == SharedMemoryMode::CREATE) {
@@ -302,10 +361,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
           "with shm_unlink, and restart");
     }
     if (header->version != kRtmsVersion) {
-      throw std::runtime_error("RTMS shared-memory version mismatch on " +
-                               path_ + ": segment version " +
-                               std::to_string(header->version) + ", expected " +
-                               std::to_string(kRtmsVersion) + Remedy(path_));
+      throw VersionMismatchError(path_, header->version);
     }
     if (!layout_matches(*header)) {
       throw std::runtime_error(

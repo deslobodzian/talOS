@@ -267,6 +267,82 @@ TEST(LayoutValidation, AVersion8SegmentIsRefusedUntilASessionReplacesIt) {
   EXPECT_TRUE(reader.register_reader().has_value());
 }
 
+// REQ-CONTRACT-36: an old version-8 segment smaller than v9's 2368 B
+// RTMSHeader must still report the version-mismatch diagnostic and shm_unlink
+// remedy rather than failing an opaque size check before reading version.
+TEST(LayoutValidation, SmallVersion8SegmentReportsVersionMismatchWithRemedy) {
+  constexpr std::size_t kSlots = 16;
+  const std::string path = make_test_path("version_8_small");
+  // Both a header-only v8 segment (832 B) and a complete small-ring v8 segment
+  // are smaller than v9's sizeof(RTMSHeader) (2368 B).
+  static_assert(sizeof(Version8Header) < sizeof(RTMSHeader));
+  const std::vector<std::byte> left = LeaveVersion8Segment(path, kSlots, 0);
+  ASSERT_FALSE(left.empty());
+  ASSERT_LT(left.size(), sizeof(RTMSHeader));
+
+  for (const RTMSOptions options :
+       {overwrite_sequence_options(), RTMSOptions{.publisher = true}}) {
+    SCOPED_TRACE(options.publisher ? "writer" : "reader");
+    try {
+      RTMSQueue queue{path,
+                      sizeof(Message::TestMessage),
+                      alignof(Message::TestMessage),
+                      kSchema,
+                      kSlots,
+                      options};
+      FAIL() << "expected version-mismatch runtime_error";
+    } catch (const std::runtime_error& err) {
+      const std::string message = err.what();
+      EXPECT_NE(message.find(path), std::string::npos) << message;
+      EXPECT_NE(message.find("version 8"), std::string::npos) << message;
+      EXPECT_NE(message.find("expected " + std::to_string(kRtmsVersion)),
+                std::string::npos)
+          << message;
+      EXPECT_NE(message.find("shm_unlink " + ShmObjectName(path)),
+                std::string::npos)
+          << message;
+    }
+    EXPECT_EQ(SegmentBytes(path, left.size()), left)
+        << "the refused attach wrote to it";
+  }
+
+  // Also check a segment truncated to just Version8Header (no ring slots).
+  const std::string trunc_path = make_test_path("version_8_header_only");
+  ::shm_unlink(ShmObjectName(trunc_path).c_str());
+  const int fd = ::shm_open(ShmObjectName(trunc_path).c_str(),
+                            O_CREAT | O_EXCL | O_RDWR, 0666);
+  ASSERT_GE(fd, 0) << std::strerror(errno);
+  ASSERT_EQ(::ftruncate(fd, static_cast<off_t>(sizeof(Version8Header))), 0);
+  void* mapped = ::mmap(nullptr, sizeof(Version8Header), PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, 0);
+  ::close(fd);
+  ASSERT_NE(mapped, MAP_FAILED);
+  Version8Header header{};
+  header.magic = kRtmsMagic;
+  header.version = 8;
+  std::memcpy(mapped, &header, sizeof(header));
+  ::munmap(mapped, sizeof(Version8Header));
+
+  try {
+    RTMSQueue queue{trunc_path,
+                    sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage),
+                    kSchema,
+                    kSlots,
+                    overwrite_sequence_options()};
+    FAIL() << "expected version-mismatch runtime_error";
+  } catch (const std::runtime_error& err) {
+    const std::string message = err.what();
+    EXPECT_NE(message.find(trunc_path), std::string::npos) << message;
+    EXPECT_NE(message.find("version 8"), std::string::npos) << message;
+    EXPECT_NE(message.find("shm_unlink " + ShmObjectName(trunc_path)),
+              std::string::npos)
+        << message;
+  }
+  ::shm_unlink(ShmObjectName(trunc_path).c_str());
+  ::shm_unlink(ShmObjectName(path).c_str());
+}
+
 TEST(ReaderOwnership, ReleaseRejectsInvalidFreeAndForeignReaders) {
   const auto path = make_test_path("release");
   RTMSQueue queue{path, 8, 8, kSchema, 2};
