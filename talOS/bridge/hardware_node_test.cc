@@ -91,7 +91,11 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
 
   ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
 
+  ASSERT_TRUE(InjectState(node, gateway_peer,
+                          TrustState(NodeConfigId(cfg), 42, 1, 1000), 1000));
+
   driver_station::DriverStationData data{};
+  data.boot_id = 42;
   data.sample_time_us = 1000;
   std::vector<uint8_t> dummy_payload(1024);
   dummy_payload.resize(driver_station::Encode(data, dummy_payload));
@@ -384,16 +388,17 @@ TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
               static_cast<ssize_t>(size));
   }
   // A current frame behind them: once the bridge has it, it read both.
-  driver_station::DriverStationData data{};
-  data.sample_time_us = 1000;
-  std::vector<uint8_t> ds(1024);
-  ds.resize(driver_station::Encode(data, ds));
-  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kDriverStation, 1, 1000,
-                                   ds.data(), ds.size()),
+  ConfigAckPayload ack{};
+  ack.config_id = NodeConfigId(cfg);
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                                   1000, ack_bytes.data(), ack_bytes.size()),
             protocol::UdpStatus::kOk);
   const bool delivered = WaitFor([&] {
     node.Tick(1'000'000);
-    return node.driver_station_packets_received() > 0;
+    return node.is_configured();
   });
   const std::string err = ::testing::internal::GetCapturedStderr();
   ASSERT_TRUE(delivered);
@@ -1947,6 +1952,97 @@ TEST(HardwareNodeTest, SteadyStateTickDoesNotAllocate) {
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_EQ(node.identity_rejected(), 0u);
   EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 15.0 + 595);
+}
+
+// REQ-OPS-21, REQ-RT-22: /hw/command is published and logged only when
+// SendToGateway succeeds, so IPC observers and the event log match what
+// actually left on the wire.
+TEST(HardwareNodeTest, FailedCommandSendIsNotPublishedOrLogged) {
+  const std::string log_path = ::testing::TempDir() + "/bridge_failed_send_" +
+                               std::to_string(getpid()) + ".tlog";
+  std::filesystem::remove(log_path);
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, true, log_path, 61));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> cmd_sub{
+      kCommandTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::SEQUENCE}};
+  ipc::Publisher<Packet> intake{RequestTopic("intake")};
+
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(NodeConfigId(cfg), 11, 1, 1000),
+                          1'000'000));
+  // Fail the first command send with a transient socket error.
+  pending_send_error = ECONNREFUSED;
+  node.set_seams({.send_error = &TakeSendError});
+  PublishCommand(intake, IntakeRequest(cfg, 4.0));
+  node.Tick(1'001'000);
+  EXPECT_EQ(node.commands_sent(), 0u);
+  EXPECT_FALSE(cmd_sub.read().has_value())
+      << "failed UDP send must not publish on /hw/command";
+
+  // Next retry succeeds: published and logged once.
+  node.Tick(1'002'000);
+  EXPECT_EQ(node.commands_sent(), 1u);
+  EXPECT_TRUE(cmd_sub.read().has_value());
+
+  link.node.reset();  // flushes the log
+  event::log::LogReader reader{log_path};
+  std::size_t logged_commands = 0;
+  event::log::LogReader::Record record;
+  while (reader.next(record)) {
+    if (record.header.kind !=
+        static_cast<std::uint16_t>(event::EventKind::SEND)) {
+      continue;
+    }
+    if (reader.manifest()[record.header.source_id].name == kCommandTopic) {
+      ++logged_commands;
+    }
+  }
+  EXPECT_EQ(logged_commands, 1u);
+  std::filesystem::remove(log_path);
+}
+
+// REQ-RT-22 (TODO.md RT-28): the exit summary prints UDP transport loss and
+// decode counters from peer_.stats().
+TEST(HardwareNodeTest, ExitSummaryReportsUdpGapsDecodeFailuresAndWouldBlock) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+
+  // Send seq 1, a corrupt frame (decode failure), then seq 5 (gap of 3) over
+  // the connected gateway socket so the bridge accepts them.
+  auto send_raw_seq = [&](uint64_t seq) {
+    std::array<uint8_t, protocol::kFrameHeaderSize> buf{};
+    const std::size_t n = protocol::EncodeFrame(
+        protocol::FrameType::kClockProbe, protocol::kFlagNone, seq, seq * 1000,
+        nullptr, 0, buf.data(), buf.size());
+    ASSERT_EQ(::send(link.gateway.NativeFd(), buf.data(), n, 0),
+              static_cast<ssize_t>(n));
+  };
+
+  send_raw_seq(1);
+  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  ASSERT_EQ(::send(link.gateway.NativeFd(), garbage, sizeof(garbage), 0),
+            static_cast<ssize_t>(sizeof(garbage)));
+  send_raw_seq(5);
+
+  // Wait until the bridge has drained all 3 datagrams.
+  ASSERT_TRUE(DatagramQueued(node));
+  node.Tick(1'000'000);
+  while (QueuedBytes(node) > 0) node.Tick(1'001'000);
+
+  process::stop_requested.store(true);
+  ::testing::internal::CaptureStdout();
+  static_cast<void>(node.Run());
+  const std::string output = ::testing::internal::GetCapturedStdout();
+  process::stop_requested.store(false);
+
+  EXPECT_NE(output.find("sequence_gaps=3"), std::string::npos) << output;
+  EXPECT_NE(output.find("decode_failures=1"), std::string::npos) << output;
+  EXPECT_NE(output.find("send_would_block=0"), std::string::npos) << output;
 }
 
 }  // namespace
