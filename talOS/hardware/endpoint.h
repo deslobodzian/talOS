@@ -58,7 +58,9 @@ class Endpoint {
   // so only the newest completed transfer's ACK ever goes out (the bridge
   // would otherwise wait for its next push). Returns the State send's
   // status, or, when that succeeded, the first failed ACK send's: either way a
-  // send that found the socket unable to send reaches the caller.
+  // send that found the socket unable to send reaches the caller. If State
+  // fails to encode, no kHardwareState frame is sent and kInvalidArgument is
+  // returned unless an ACK send already failed.
   protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
     gateway_.Tick(now_us, enabled);
     // Only echo probes received on a previous tick: now_us was sampled before
@@ -189,6 +191,9 @@ class Endpoint {
     auto state = gateway_.snapshot();
     state.clock_probe_time_us = clock_probe_time_us;
     const auto size = Encode(state, buffer_);
+    if (size == 0) {
+      return Worse(ack_status, protocol::UdpStatus::kInvalidArgument);
+    }
     return Worse(
         Send(protocol::FrameType::kHardwareState, now_us, buffer_.data(), size),
         ack_status);
