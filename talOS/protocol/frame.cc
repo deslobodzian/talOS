@@ -31,22 +31,12 @@ std::size_t EncodeFrame(FrameType type, uint16_t flags, uint64_t sequence,
                         std::size_t payload_size, uint8_t* out,
                         std::size_t out_capacity) {
   if (payload_size > kMaxPayloadSize ||
-      out_capacity < kFrameHeaderSize + payload_size) {
+      out_capacity < kFrameHeaderSize + payload_size || out == nullptr) {
     return 0;
   }
   if (payload_size > 0 && payload == nullptr) {
     return 0;
   }
-
-  WriteUInt<uint64_t>(out + 0, kFrameMagic);
-  WriteUInt<uint16_t>(out + 8, kProtocolVersion);
-  WriteUInt<uint16_t>(out + 10, static_cast<uint16_t>(kFrameHeaderSize));
-  WriteUInt<uint16_t>(out + 12, static_cast<uint16_t>(type));
-  WriteUInt<uint16_t>(out + 14, flags);
-  WriteUInt<uint64_t>(out + 16, sequence);
-  WriteUInt<uint64_t>(out + 24, monotonic_time_us);
-  WriteUInt<uint32_t>(out + 32, static_cast<uint32_t>(payload_size));
-  WriteUInt<uint32_t>(out + 36, 0);
 
   if (payload_size > 0) {
     std::memcpy(out + kFrameHeaderSize, payload, payload_size);
