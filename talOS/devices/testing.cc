@@ -416,19 +416,15 @@ struct SimHardware::Impl {
         hardware::MarkInvalid(state.sensors[i]);
       }
     }
-    for (std::size_t i = 0; i < state.motor_count; ++i) {
-      if (hardware::MasterSampleInvalid(motors, state, i)) {
-        hardware::MarkInvalid(state.motors[i]);
-      }
-    }
     unable.clear();
-    for (std::size_t i = 0; i < state.motor_count; ++i) {
-      if (hardware::MotorMayDrive(motors, state, i)) continue;
-      const std::uint16_t id = state.motors[i].id;
-      unable.insert(id);
-      motor_drives_from[id] = state.sample_time_us + 1;
-      applied_motors[id] = hardware::MotorRequest{.id = id};
-    }
+    hardware::MaskFollowersAndDriveCutoffs(
+        motors, state, [](std::size_t) {},
+        [&](std::size_t i, std::uint64_t drives_from_us) {
+          const std::uint16_t id = state.motors[i].id;
+          unable.insert(id);
+          motor_drives_from[id] = drives_from_us;
+          applied_motors[id] = hardware::MotorRequest{.id = id};
+        });
   }
 
   // The gateway's total-loss rule (Gateway::Tick), judged as the gateway

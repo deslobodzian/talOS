@@ -267,16 +267,11 @@ void Gateway::MaskUnavailable() {
       MaskMotor(i);
     }
   }
-  // After every master is masked: config refuses follower chains, so a
-  // master is never a follower.
-  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-    if (MasterSampleInvalid(config_.motors, state_, i)) MaskMotor(i);
-  }
-  // A command observed no later than a State in which a motor could not
-  // drive never drives it, whatever its feedback shows when it arrives.
-  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-    if (!MayDrive(i)) motor_drives_from_[i] = state_.sample_time_us + 1;
-  }
+  MaskFollowersAndDriveCutoffs(
+      config_.motors, state_, [&](std::size_t i) { MaskMotor(i); },
+      [&](std::size_t i, uint64_t drives_from_us) {
+        motor_drives_from_[i] = drives_from_us;
+      });
 }
 
 bool Gateway::MayDrive(std::size_t i) const {
