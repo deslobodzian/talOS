@@ -333,11 +333,13 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 '// Token paste operators in comments (## and %:%:) are ok.\n'
                 '/* Also ## and %:%: in block comments. */\n'
                 'const char* kStr = "## and %:%: in strings are ok";\n'
+                'const char* kPunct = "what??! http://example.com";\n'
                 'const char* kRaw = R"(\n'
                 '#include "talOS/node/access.h"\n'
                 'detail::NodeAccess::add_hardware_request\n'
                 '#define CAT(a, b) a##b\n'
                 '#define CAT2(a, b) a%:%:b\n'
+                'what??!\n'
                 ')";\n'
                 'char quote(int k) {\n'
                 '  switch (k) {\n'
@@ -651,7 +653,9 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 ("node_access_symbol",
                  'void f() { detail::NodeAccess::add_hardware_request(); }\n',
                  exempt),
-                ("token_paste", '#define CAT(a, b) a##b\n', exempt)):
+                ("token_paste", '#define CAT(a, b) a##b\n', exempt),
+                ("trigraph_in_cli", '#define CAT(a, b) a??=??=b\n', exempt),
+                ("non_cpp_include_in_cli", '#include "secret.md"\n', exempt)):
             with self.subTest(case=label):
                 bad_files = dict(files)
                 bad_files["bench/swerve/send_target.cc"] += bad_line
@@ -886,6 +890,157 @@ class CheckNodeSourcesTest(unittest.TestCase):
         )
         self.assertEqual(failures, 1, out.getvalue())
         self.assertIn("fail closed", out.getvalue())
+
+    # REQ-SAFE-27, REQ-CONTRACT-16
+    def test_trigraphs_are_refused_in_cpp_and_starlark(self):
+        cpp_cases = [
+            ("code_token_paste_trigraph",
+             "#define CAT(a, b) a??=??=b\n"),
+            ("code_directive_trigraph",
+             '??=include "talOS/node/access.h"\n'),
+            ("block_comment_splice_hiding_call",
+             "/* *??/\n"
+             "/ void f() { talos::detail::NodeAccess::add_hardware_request(); } /* */\n"),
+            ("line_comment_splice_hiding_call",
+             "// ??/\n"
+             "/*\n"
+             "void f() { talos::detail::NodeAccess::add_hardware_request(); }\n"
+             "// */\n"),
+            ("string_literal_backslash_trigraph_desync",
+             'const char* s = "??/"; /* "; '
+             'talos::detail::NodeAccess::add_hardware_request(); /* */\n'),
+            ("char_literal_backslash_trigraph_desync",
+             "char c = '??/'; /* '; "
+             "talos::detail::NodeAccess::add_hardware_request(); /* */\n"),
+        ]
+        for name, body in cpp_cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": body,
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/arm.cc:", out)
+
+        starlark_cases = [
+            ("copts_ftrigraphs",
+             'cc_library(name = "arm", srcs = ["arm.cc"], copts = ["-ftrigraphs"])\n'),
+            ("copts_double_dash_trigraphs",
+             'cc_library(name = "arm", srcs = ["arm.cc"], copts = ["--trigraphs"])\n'),
+            ("copts_xclang_ftrigraphs",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-Xclang", "-ftrigraphs"])\n'),
+            ("local_defines_trigraph_paste",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'local_defines = ["CAT(a,b)=a??=??=b"])\n'),
+        ]
+        for name, build in starlark_cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": build,
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/BUILD:1:", out)
+
+    # REQ-SAFE-27, REQ-CONTRACT-16
+    def test_include_path_copts_are_refused_in_starlark(self):
+        cases = [
+            ("copts_I_joined",
+             'cc_library(name = "arm", srcs = ["arm.cc"], copts = ["-ItalOS"])\n'),
+            ("copts_I_equals",
+             'cc_library(name = "arm", srcs = ["arm.cc"], copts = ["-I=talOS"])\n'),
+            ("copts_I_adjacent",
+             'cc_library(name = "arm", srcs = ["arm.cc"], copts = ["-I", "talOS"])\n'),
+            ("copts_iquote_adjacent",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-iquote", "talOS/node"])\n'),
+            ("copts_iquote_joined",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-iquotetalOS/node"])\n'),
+            ("copts_isystem_adjacent",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-isystem", "talOS/node"])\n'),
+            ("copts_isystem_equals",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-isystem=talOS/node"])\n'),
+            ("copts_idirafter_adjacent",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-idirafter", "talOS/node"])\n'),
+            ("copts_idirafter_equals",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-idirafter=talOS/node"])\n'),
+            ("copts_include_directory_equals",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["--include-directory=talOS"])\n'),
+            ("copts_include_directory_adjacent",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["--include-directory", "talOS"])\n'),
+            ("copts_include_directory_after",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["--include-directory-after=talOS"])\n'),
+            ("copts_wp_I_joined",
+             'cc_library(name = "arm", srcs = ["arm.cc"], copts = ["-Wp,-ItalOS"])\n'),
+            ("copts_wp_I_comma",
+             'cc_library(name = "arm", srcs = ["arm.cc"], copts = ["-Wp,-I,talOS"])\n'),
+            ("copts_wp_iquote",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-Wp,-iquote,talOS/node"])\n'),
+            ("cxxopts_I_adjacent",
+             'cc_library(name = "arm", srcs = ["arm.cc"], cxxopts = ["-I", "talOS"])\n'),
+            ("conlyopts_isystem",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'conlyopts = ["-isystem", "talOS"])\n'),
+        ]
+        for name, build in cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": build,
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/BUILD:1:", out)
+
+        # Even in a .bzl macro where the directory is a parameter, `-I` is refused.
+        bzl_files = {
+            "bench/arm/macros.bzl": (
+                'def robot_lib(name, srcs, inc):\n'
+                '    native.cc_library(name = name, srcs = srcs, copts = ["-I", inc])\n'
+            ),
+            "bench/arm/BUILD": (
+                'load(":macros.bzl", "robot_lib")\n'
+                'robot_lib(name = "arm", srcs = ["arm.cc"], inc = "talOS")\n'
+            ),
+            "bench/arm/arm.cc": "int ok = 1;\n",
+        }
+        failures, out = run_sources(bzl_files)
+        self.assertGreaterEqual(failures, 1, out)
+        self.assertIn("bench/arm/macros.bzl:2:", out)
+
+    # REQ-SAFE-27, REQ-CONTRACT-16
+    def test_non_cpp_suffix_and_basename_includes_are_refused(self):
+        cases = [
+            ("md_quotes", '#include "secret.md"\n'),
+            ("json_angles", "#include <pkg/bypass.json>\n"),
+            ("txt_quotes", '#include "wrap.txt"\n'),
+            ("uppercase_md", '#include "UPPER.MD"\n'),
+            ("uppercase_txt", '#include "WRAP.TXT"\n'),
+            ("readme_basename", '#include "other/README"\n'),
+            ("include_next_toml", '#include_next "bypass.toml"\n'),
+            ("digraph_json", '%:include "bypass.json"\n'),
+        ]
+        for name, body in cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": body,
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/arm.cc:1:", out)
 
 
 if __name__ == "__main__":
