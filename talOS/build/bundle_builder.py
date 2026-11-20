@@ -515,9 +515,9 @@ def main():
         f.write("\n".join(lines) + "\n")
 
     # 7. run.sh. A bundle that carries Studio starts its bridge by default,
-    # so a booted robot (deploy.sh enable-boot runs run.sh bare) and a run
-    # by hand serve the same Studio; --no-studio, which run.sh consumes,
-    # declines it. A bridge that cannot run is one warning (REQ-OPS-30).
+    # so a booted robot (deploy.sh enable-boot runs run.sh --serve-refusal)
+    # and a run by hand serve the same Studio; --no-studio, which run.sh
+    # consumes, declines it. A bridge that cannot run is one warning (REQ-OPS-30).
     start_studio = "true" if studio else "false"
     run_sh_path = os.path.join(out_dir, "run.sh")
     with open(run_sh_path, "w") as f:

@@ -198,9 +198,11 @@ A relative `--prefix` is resolved against the working directory.
   that step's processes, selects nothing, removes the copy and exits 128
   plus the signal's number, so no stray `bundles/<stamp>` is left for
   `prune` to count among the newest.
-- **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
+- **enable-boot** starts `<prefix>/current/run.sh --serve-refusal` at
   boot as `--user` (default `talos`; the account must exist), so a booted
-  robot serves the Studio its bundle carries ([above](#build-a-bundle)).
+  robot serves the Studio its bundle carries ([above](#build-a-bundle)) and
+  serves a phase-1 refusal reason on `/drive` if startup is refused
+  ([refusal visibility](../talOS/launcher/README.md#refusal-visibility---serve-refusal)).
   Linux: writes and enables
   `/etc/systemd/system/talos.service` (`Type=notify`, `Restart=always`, a
   three-second supervision watchdog, a stop through the launcher alone

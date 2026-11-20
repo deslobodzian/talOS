@@ -1155,7 +1155,9 @@ int main(int argc, char** argv) try {
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
         ->writeHeader("Cache-Control", kLiveCacheControl)
-        ->end(bridge.system_graph.json);
+        ->end(bridge.system_graph.json.empty()
+                  ? std::string_view{"{}"}
+                  : std::string_view{bridge.system_graph.json});
   });
   app.get("/declared.json", [&](auto* res, auto*) {
     // 404 rather than an empty document: "no declared graph was given" and "the
@@ -1252,10 +1254,11 @@ int main(int argc, char** argv) try {
                              " (another process holds it?)");
   }
   // Only claim a live registry row when supervised by a launcher (--session-id
-  // nonzero). Standalone runs leave the host registry untouched, and a
-  // supervised run fails fast if claiming fails instead of serving until the
-  // launcher kills it as heartbeat_missing (REQ-OPS-30).
-  if (bridge.session_id != 0) {
+  // nonzero) and not in refusal mode. Standalone and refusal runs leave the
+  // host registry untouched, and a supervised run fails fast if claiming fails
+  // instead of serving until the launcher kills it as heartbeat_missing
+  // (REQ-OPS-30).
+  if (bridge.session_id != 0 && !bridge.refusal_mode) {
     try {
       bridge.registration.emplace(talos::introspect::NodeRegistration::Identity{
           .name = std::string{studio::kStudioBridgeNodeName},
