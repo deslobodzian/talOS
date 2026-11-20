@@ -54,7 +54,7 @@ standard library. On macOS the newest SDK's libc++ may need a newer clang
 Linux x86_64, when clang 18 cannot parse the host's libstdc++ (such as
 Arch's GCC 16), it fetches pinned Debian GCC 14 `libstdc++-14-dev` and
 `libgcc-14-dev` headers (SHA-256 verified) into
-`~/.cache/talos/gcc-14-sysroot-14.2.0-19` and analyses against them with
+`${XDG_CACHE_HOME:-~/.cache}/talos/gcc-14-sysroot-14.2.0-19` and analyses against them with
 `--gcc-install-dir`. It exits 3 when it cannot run: no bazel to make the
 database, or a standard library clang 18 cannot parse when no fallback is
 available (e.g. an offline host before the GCC 14 cache is populated,

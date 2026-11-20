@@ -175,6 +175,11 @@ populate_gcc14_sysroot() {
     fallback_reason="need dpkg-deb, bsdtar, or ar+tar to extract Debian GCC 14 packages"
     return 1
   fi
+  # Clean up any stale staging directory left behind by a prior SIGKILL/SIGTERM
+  # (safe here: populate_gcc14_sysroot runs under the cache flock when available).
+  if command -v flock >/dev/null 2>&1; then
+    rm -rf "$cache_root/.gcc-14-sysroot-${GCC14_DEB_VERSION}".staging.* 2>/dev/null || true
+  fi
   staging="$(mktemp -d "$cache_root/.gcc-14-sysroot-${GCC14_DEB_VERSION}.staging.XXXXXX")" || {
     staging=""
     fallback_reason="cannot create staging directory in $cache_root"
@@ -194,9 +199,9 @@ populate_gcc14_sysroot() {
     return 1
   fi
   if ! printf '%s\n' "$gcc14_fingerprint" > "$staging/.ready"; then
+    fallback_reason="cannot write readiness marker in $staging"
     rm -rf "$staging"
     staging=""
-    fallback_reason="cannot write readiness marker in $staging"
     return 1
   fi
   if [ -e "$gcc14_root" ] && ! gcc14_ready; then
