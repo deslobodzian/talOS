@@ -72,7 +72,16 @@ TEST(SimMotorDiagnostics, AmbientAndEffortPlaceholdersAcrossNeutral) {
     uint64_t now_us = 0;
     StepBackend(*backend, state, now_us, 5000, 2);
     EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
-    EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 20.0);
+    if (backend == &ideal) {
+      EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 20.0);
+    } else {
+      EXPECT_GT(state.motors[0].supply_current_a, 0.0);
+      EXPECT_DOUBLE_EQ(
+          state.motors[0].supply_current_a,
+          std::min(40.0, std::abs(state.motors[0].voltage *
+                                  state.motors[0].stator_current_a) /
+                             kSimRestingSupplyV));
+    }
     backend->Neutral();
     StepBackend(*backend, state, now_us, 5000, 1);
     EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
@@ -128,6 +137,9 @@ TEST(SimGravity, ProfiledMotionMagicIncludesGravityAndClampsVoltage) {
     cfg.motors[0].cruise_velocity_rps = 1.0;
     cfg.motors[0].acceleration_rps2 = 2.0;
     cfg.motors[0].max_voltage = 5.0;
+    // Above stall so max_voltage, not current limiting, is the binding clamp.
+    cfg.motors[0].stator_limit_a = 400.0;
+    cfg.motors[0].supply_limit_a = 400.0;
     PhysicsSimBackend backend;
     ASSERT_TRUE(backend.Configure(cfg));
     std::array<MotorRequest, kMaxMotors> commands{};
@@ -145,9 +157,14 @@ TEST(SimFollowers, PhysicsResolvesOrderOppositionAndNeutral) {
   for (const bool follower_first : {false, true}) {
     for (const bool oppose : {false, true}) {
       auto cfg = SingleMotorConfig();
+      // Above stall so duty scaling to 0.5 * supply_v is not current-limited.
+      cfg.motors[0].stator_limit_a = 400.0;
+      cfg.motors[0].supply_limit_a = 400.0;
       auto follower = TestMotor(2, "follower", 2);
       follower.master_id = 1;
       follower.oppose_master = oppose;
+      follower.stator_limit_a = 400.0;
+      follower.supply_limit_a = 400.0;
       cfg.motors.push_back(follower);
       if (follower_first) std::swap(cfg.motors[0], cfg.motors[1]);
       const std::size_t master = follower_first ? 1 : 0;
@@ -370,6 +387,7 @@ TEST(SimMotorDiagnostics, StatorCurrentIsTheWindingModel) {
     SCOPED_TRACE(c.stall_a);
     auto cfg = SingleMotorConfig();
     cfg.motors[0].stator_limit_a = 1000.0;  // above stall: unclamped
+    cfg.motors[0].supply_limit_a = 1000.0;
     cfg.motors[0].motor_type.value = c.type;
     PhysicsSimBackend backend;
     ASSERT_TRUE(backend.Configure(cfg));
@@ -465,8 +483,14 @@ TEST(SimMotorDiagnostics, TorqueCurrentAcceleratesToTheVoltageCeiling) {
     EXPECT_LE(s.motors[0].stator_current_a, 2.0);
     command[0].demand = 0.0;
     ASSERT_TRUE(backend.Apply(command));
-    StepBackend(backend, s, now_us, 5000, 200);  // 1 s of zero torque
-    EXPECT_NEAR(s.motors[0].velocity_rps, ceiling_rps, 0.01 * ceiling_rps);
+    StepBackend(backend, s, now_us, 5000, 200);  // 1 s of zero stator current
+    // At 0 A electromagnetic torque, only the Kraken X60's 2 A no-load drag
+    // slows the rotor (rather than braking to 0 as Neutral() does).
+    const double expected_coast_rps =
+        ceiling_rps * std::pow(1.0 - (2.0 / 366.0) * 0.1, 200);
+    EXPECT_NEAR(s.motors[0].velocity_rps, expected_coast_rps,
+                0.01 * ceiling_rps);
+    EXPECT_GT(s.motors[0].velocity_rps, 0.85 * ceiling_rps);
     EXPECT_NEAR(s.motors[0].stator_current_a, 0.0, 1e-9);
   }
 }
@@ -939,7 +963,7 @@ TEST(SimBelievability, NeutralDecaysPerBrakeWhileZeroVelocityHolds) {
     PhysicsSimBackend backend;
     ASSERT_TRUE(backend.Configure(c));
     std::array<MotorRequest, kMaxMotors> cmd{};
-    cmd[0] = Duty(1, 0.3);  // Gentle spin-up so the hold-settle travel fits.
+    cmd[0] = Duty(1, 0.25);  // Gentle spin-up so the 80 A-limited stop fits.
     ASSERT_TRUE(backend.Apply(cmd));
     State s{};
     uint64_t now_us = 0;
@@ -1530,6 +1554,178 @@ TEST(SimWorld, SecondGeometryControlsLinearAndYawMotionAndSurvivesReconfigure) {
     fallback.Advance(400);
     EXPECT_NEAR(fallback.backend.truth().vx_mps, 1.0, 1e-8);
   }
+}
+
+// REQ-DEV-10: At 12 V, each motor type draws its manufacturer stall current at
+// rest and its free current at free speed, and supply current obeys power
+// conservation |applied_volts * stator_current| / supply_v.
+TEST(SimMotorDiagnostics, FreeCurrentAndSupplyCurrentMatchMotorSpecs) {
+  struct Spec {
+    MotorType type;
+    double free_rps;
+    double stall_a;
+    double free_a;
+  };
+  for (const Spec s :
+       {Spec{MotorType::kKrakenX60, 6000.0 / 60.0, 366.0, 2.0},
+        Spec{MotorType::kKrakenX44, 7530.0 / 60.0, 275.0, 2.0},
+        Spec{MotorType::kFalcon500, 6380.0 / 60.0, 257.0, 1.5}}) {
+    SCOPED_TRACE(s.stall_a);
+    auto cfg = SingleMotorConfig();
+    cfg.motors[0].motor_type.value = s.type;
+    cfg.motors[0].stator_limit_a = 1000.0;
+    cfg.motors[0].supply_limit_a = 1000.0;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+    ASSERT_TRUE(backend.Apply(cmd));
+    State st{};
+    st.motor_count = 1;
+    uint64_t now_us = 0;
+    StepBackend(backend, st, now_us, 5000, 1);  // At rest: 12 V stall.
+    EXPECT_NEAR(st.motors[0].stator_current_a, s.stall_a, 1e-9);
+    EXPECT_NEAR(st.motors[0].supply_current_a,
+                12.0 * s.stall_a / kSimRestingSupplyV, 1e-9);
+    StepBackend(backend, st, now_us, 5000, 400);  // 2 s: 12 V free speed.
+    EXPECT_NEAR(st.motors[0].velocity_rps, s.free_rps, 1e-4);
+    EXPECT_NEAR(st.motors[0].stator_current_a, s.free_a, 1e-3);
+    EXPECT_NEAR(st.motors[0].supply_current_a,
+                std::abs(st.motors[0].voltage * st.motors[0].stator_current_a) /
+                    kSimRestingSupplyV,
+                1e-9);
+  }
+}
+
+// REQ-DEV-10: stator_limit_a feeds back into rotor dynamics by clamping
+// effective winding voltage around back-EMF before StepAxis, slowing spin-up
+// and capping applied voltage and reported stator current.
+TEST(SimMotorDiagnostics, StatorLimitClampsAppliedVoltageAndSlowsSpinUp) {
+  auto make_cfg = [](double stator_limit_a) {
+    auto cfg = SingleMotorConfig();
+    cfg.motors[0].stator_limit_a = stator_limit_a;
+    cfg.motors[0].supply_limit_a = 400.0;
+    return cfg;
+  };
+  PhysicsSimBackend tight, loose;
+  ASSERT_TRUE(tight.Configure(make_cfg(20.0)));
+  ASSERT_TRUE(loose.Configure(make_cfg(200.0)));
+  std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+  ASSERT_TRUE(tight.Apply(cmd));
+  ASSERT_TRUE(loose.Apply(cmd));
+  State st{}, sl{};
+  st.motor_count = sl.motor_count = 1;
+  uint64_t now_t = 0;
+  uint64_t now_l = 0;
+  const double r_ohm = 12.0 / 366.0;
+  StepBackend(tight, st, now_t, 5000, 1);  // dt = 0, at rest.
+  StepBackend(loose, sl, now_l, 5000, 1);
+  EXPECT_NEAR(st.motors[0].voltage, 20.0 * r_ohm, 1e-9);
+  EXPECT_NEAR(st.motors[0].stator_current_a, 20.0, 1e-9);
+  EXPECT_NEAR(sl.motors[0].voltage, 200.0 * r_ohm, 1e-9);
+  StepBackend(tight, st, now_t, 5000, 10);  // 50 ms of acceleration.
+  StepBackend(loose, sl, now_l, 5000, 10);
+  EXPECT_LT(st.motors[0].velocity_rps, sl.motors[0].velocity_rps * 0.25);
+  EXPECT_LE(st.motors[0].stator_current_a, 20.0 + 1e-9);
+  EXPECT_LT(st.motors[0].voltage, 12.0);
+}
+
+// REQ-DEV-10: supply_limit_a caps power drawn from the battery consistently
+// with applied voltage and stator current, and supply current drops to 0 when
+// unpowered or when supply_v <= 0.
+TEST(SimMotorDiagnostics, SupplyLimitCapsPowerAndDropsToZeroWhenUnpowered) {
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].stator_limit_a = 1000.0;
+  cfg.motors[0].supply_limit_a = 15.0;
+  PhysicsSimBackend limited;
+  ASSERT_TRUE(limited.Configure(cfg));
+  auto unlimited_cfg = cfg;
+  unlimited_cfg.motors[0].supply_limit_a = 400.0;
+  PhysicsSimBackend unlimited;
+  ASSERT_TRUE(unlimited.Configure(unlimited_cfg));
+  std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+  ASSERT_TRUE(limited.Apply(cmd));
+  ASSERT_TRUE(unlimited.Apply(cmd));
+  State sl{}, su{};
+  sl.motor_count = su.motor_count = 1;
+  uint64_t now_l = 0;
+  uint64_t now_u = 0;
+  StepBackend(limited, sl, now_l, 5000, 1);
+  StepBackend(unlimited, su, now_u, 5000, 1);
+  EXPECT_NEAR(sl.motors[0].supply_current_a, 15.0, 1e-9);
+  EXPECT_NEAR(std::abs(sl.motors[0].voltage * sl.motors[0].stator_current_a) /
+                  kSimRestingSupplyV,
+              15.0, 1e-9);
+  EXPECT_LT(sl.motors[0].voltage, 12.0);
+  StepBackend(limited, sl, now_l, 5000, 10);
+  StepBackend(unlimited, su, now_u, 5000, 10);
+  EXPECT_LE(sl.motors[0].supply_current_a, 15.0 + 1e-9);
+  EXPECT_LT(sl.motors[0].velocity_rps, su.motors[0].velocity_rps);
+
+  limited.SetSupplyVoltage(0.0);
+  StepBackend(limited, sl, now_l, 5000, 1);
+  EXPECT_DOUBLE_EQ(sl.motors[0].supply_current_a, 0.0);
+
+  limited.SetSupplyVoltage(kSimRestingSupplyV);
+  limited.Neutral();
+  StepBackend(limited, sl, now_l, 5000, 1);
+  EXPECT_DOUBLE_EQ(sl.motors[0].supply_current_a, 0.0);
+  EXPECT_DOUBLE_EQ(sl.motors[0].stator_current_a, 0.0);
+}
+
+// REQ-DEV-10: End-of-travel hard stops clamp position, zero velocity when
+// driven into the stop (raising stator current to stall), allow motion away
+// from the stop, work even when soft_limits = false, and survive Configure().
+TEST(SimMotorDiagnostics,
+     HardStopsStallWithoutSoftLimitsAndSurviveReconfigure) {
+  for (const bool inverted : {false, true}) {
+    SCOPED_TRACE(inverted);
+    auto cfg = SingleMotorConfig();
+    cfg.motors[0].soft_limits = false;
+    cfg.motors[0].inverted = inverted;
+    cfg.motors[0].sensor_to_mechanism_ratio = 5.0;
+    PhysicsSimBackend backend;
+    backend.SetHardStops(
+        {{.motor = "roller", .min_rot = -0.3, .max_rot = 0.5}});
+    ASSERT_TRUE(backend.Configure(cfg));
+    // Reconfigure (as a config pushed by the bridge): hard stops survive.
+    cfg.motors[0].max_voltage = 11.0;
+    ASSERT_TRUE(backend.Configure(cfg));
+
+    State s{};
+    s.motor_count = 1;
+    uint64_t now_us = 0;
+    std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, -1.5, 0.0}}};
+    ASSERT_TRUE(backend.Apply(cmd));
+    StepBackend(backend, s, now_us, 5000, 200);  // 1 s into min_rot stop.
+    EXPECT_DOUBLE_EQ(s.motors[0].position_rot, -0.3);
+    EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+    EXPECT_NEAR(s.motors[0].stator_current_a, 1.5 * 366.0 / 12.0, 1e-9);
+
+    // Reversing drives freely off min_rot and stalls at max_rot.
+    cmd[0].demand = 1.5;
+    ASSERT_TRUE(backend.Apply(cmd));
+    StepBackend(backend, s, now_us, 5000, 5);
+    EXPECT_GT(s.motors[0].position_rot, -0.3);
+    EXPECT_GT(s.motors[0].velocity_rps, 0.0);
+    StepBackend(backend, s, now_us, 5000, 200);
+    EXPECT_DOUBLE_EQ(s.motors[0].position_rot, 0.5);
+    EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+    EXPECT_NEAR(s.motors[0].stator_current_a, 1.5 * 366.0 / 12.0, 1e-9);
+  }
+
+  // One-sided hard stop (min_rot only): clamps below, free above.
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].soft_limits = false;
+  PhysicsSimBackend backend;
+  backend.SetHardStops({{.motor = "roller", .min_rot = -0.2}});
+  ASSERT_TRUE(backend.Configure(cfg));
+  State s{};
+  s.motor_count = 1;
+  uint64_t now_us = 0;
+  std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 2.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(cmd));
+  StepBackend(backend, s, now_us, 5000, 100);
+  EXPECT_GT(s.motors[0].position_rot, 5.0);
 }
 
 }  // namespace

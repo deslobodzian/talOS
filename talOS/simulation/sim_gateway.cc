@@ -216,6 +216,7 @@ int main(int argc, char** argv) {
     talos::hardware::Config hw_config;
     std::vector<talos::hardware::sim::HomeSwitch> home_switches;
     std::vector<talos::hardware::sim::SwerveModuleSpec> swerve_modules;
+    std::vector<talos::hardware::sim::HardStop> hard_stops;
     {
       const auto robot_config = talos::config::ParseRobotConfig(config_path);
       ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
@@ -237,6 +238,12 @@ int main(int argc, char** argv) {
       for (const auto& m : robot_config.simulation.swerve_modules) {
         swerve_modules.push_back(
             {.drive = m.drive, .steer = m.steer, .x_m = m.x_m, .y_m = m.y_m});
+      }
+      hard_stops.reserve(robot_config.simulation.hard_stops.size());
+      for (const auto& stop : robot_config.simulation.hard_stops) {
+        hard_stops.push_back({.motor = stop.motor,
+                              .min_rot = stop.min_rot,
+                              .max_rot = stop.max_rot});
       }
     }
     talos::hardware::SimBackend ideal;
@@ -265,11 +272,12 @@ int main(int argc, char** argv) {
     // meant to exercise.
     //
     // The wire carries no motor type, home switches ([digital_inputs.*]
-    // sim_motor) or [simulation] swerve geometry: bound by name before
-    // Reconfigure, they apply on the first State and survive any config the
-    // bridge pushes later.
+    // sim_motor) or [simulation] swerve geometry / hard stops: bound by name
+    // before Reconfigure, they apply on the first State and survive any config
+    // the bridge pushes later.
     physics_backend.SetLocalMotorTypes(hw_config);
     physics_backend.SetHomeSwitches(std::move(home_switches));
+    physics_backend.SetHardStops(std::move(hard_stops));
     if (!swerve_modules.empty()) {
       physics_backend.SetSwerveModules(std::move(swerve_modules));
     }

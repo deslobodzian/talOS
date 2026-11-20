@@ -48,7 +48,8 @@
 //
 // Controlled inputs/faults. Beam breaks and RoboRIO limit-switch inputs via
 // SetDigitalInput, a home switch a motor's position closes via
-// SetHomeSwitches, switches on a TalonFX's own limit inputs via
+// SetHomeSwitches, physical end-of-travel hard stops via SetHardStops,
+// switches on a TalonFX's own limit inputs via
 // Set{Forward,Reverse}LimitPressed (enforced per MotorConfig's
 // forward_limit_switch and reverse_limit_switch), soft limits from
 // MotorConfig enforced in physics, frozen feedback, per-device disconnect,
@@ -90,6 +91,9 @@ struct MotorModel {
   // Stall current at 12 V, which sets the winding resistance,
   // R = 12 V / stall current.
   double stall_current_a_at_12v{366.0};
+  // Free (no-load) stator current at 12 V, which sets the back-EMF constant,
+  // k_e = (12 V - free current * R) / free speed.
+  double free_current_a_at_12v{2.0};
   // First-order lag at nominal_inertia_kg_m2.
   double time_constant_s{0.02};
   double nominal_inertia_kg_m2{0.002};
@@ -98,27 +102,36 @@ struct MotorModel {
   // Deadband: a standing-still rotor will not break away while |volts| is
   // below this. Kept at 0 by default so small signals stay observable.
   double static_friction_v{0.0};
+
+  double resistance_ohm() const { return 12.0 / stall_current_a_at_12v; }
+  double back_emf_v_per_rps() const {
+    return (12.0 - free_current_a_at_12v * resistance_ohm()) /
+           free_speed_rps_at_12v;
+  }
 };
 
-// The published 12 V free speed and stall current of each motor type
-// (manufacturer data, as tabulated by ReCalc, reca.lc): Kraken X60 6000 rpm
-// and 366 A, Kraken X44 7530 rpm and 275 A, Falcon 500 6380 rpm and 257 A.
-// Free current (1.5-2 A) is neglected: back-EMF at free speed is taken as
-// the full 12 V.
+// The published 12 V free speed, stall current and free current of each motor
+// type (CTRE manufacturer specifications / ReCalc, reca.lc):
+//   Kraken X60: 6000 rpm, 366 A stall, 2.0 A free
+//   Kraken X44: 7530 rpm, 275 A stall, 2.0 A free
+//   Falcon 500: 6380 rpm, 257 A stall, 1.5 A free
 inline MotorModel MotorModelFor(MotorType type) {
   MotorModel model;
   switch (type) {
     case MotorType::kKrakenX60:
       model.free_speed_rps_at_12v = 6000.0 / 60.0;
       model.stall_current_a_at_12v = 366.0;
+      model.free_current_a_at_12v = 2.0;
       break;
     case MotorType::kKrakenX44:
       model.free_speed_rps_at_12v = 7530.0 / 60.0;
       model.stall_current_a_at_12v = 275.0;
+      model.free_current_a_at_12v = 2.0;
       break;
     case MotorType::kFalcon500:
       model.free_speed_rps_at_12v = 6380.0 / 60.0;
       model.stall_current_a_at_12v = 257.0;
+      model.free_current_a_at_12v = 1.5;
       break;
   }
   return model;
@@ -303,6 +316,19 @@ struct SwerveModuleSpec {
   double y_m{};
 };
 
+// Mechanical end-of-travel hard stops for a named motor, in mechanism
+// rotations of its own hardware frame (before any node's rezero), matching
+// HomeSwitch. Enforced even when MotorConfig::soft_limits is false (as
+// required for rezero-frame mechanisms): clamps position into [min_rot,
+// max_rot] and zeroes velocity when driven into a stop, so back-EMF drops to
+// 0 and stator current rises while motion away from the stop stays free.
+// Bound by motor name so it survives every later Configure().
+struct HardStop {
+  std::string motor;
+  std::optional<double> min_rot;
+  std::optional<double> max_rot;
+};
+
 // Physics-backed Backend. See the header comment for the item-by-item map.
 class PhysicsSimBackend final : public Backend {
  public:
@@ -348,6 +374,15 @@ class PhysicsSimBackend final : public Backend {
     ConfigureSwerve();
   }
 
+  // Mechanical end-of-travel hard stops (HardStop), replacing any set before.
+  // Matched by motor name so they survive every later Configure, including a
+  // config pushed by the bridge; an entry whose motor is not configured or
+  // whose bounds are invalid is ignored.
+  void SetHardStops(std::vector<HardStop> stops) {
+    hard_stops_ = std::move(stops);
+    BindHardStops();
+  }
+
   bool Configure(const Config& config) override {
     config_ = config;
     can_bus_count_ = CanBuses(config_).count;
@@ -358,6 +393,7 @@ class PhysicsSimBackend final : public Backend {
       }
     }
     BindHomeSwitches();
+    BindHardStops();
     axes_.fill(AxisState{});
     profiles_.fill(Profile{});
     gyro_override_ = false;
@@ -450,14 +486,15 @@ class PhysicsSimBackend final : public Backend {
       out.position_rot = mech_pos;
       out.velocity_rps = mech_vel;
       out.voltage = powered_[i] ? applied_volts_[i] : 0.0;
-      // Placeholder supply current proportional to effort and constant
-      // ambient temperature; not electrical or thermal models.
-      out.supply_current_a = std::abs(out.voltage) / 12.0 * m.supply_limit_a;
       out.temperature_c = 25.0;
       out.fault_flags = HardLimitFlags(i);
-      EnforceSoftLimits(m, out, i);
-      // After the limit stops the rotor: a motor held at it is stalled.
+      if (EnforceSoftLimits(m, out, i) && powered_[i]) {
+        applied_volts_[i] = LimitWindingVoltage(i, m, applied_volts_[i]);
+        out.voltage = applied_volts_[i];
+      }
+      // After any limit stops the rotor: a motor held at it is stalled.
       out.stator_current_a = StatorCurrent(i, m);
+      out.supply_current_a = SupplyCurrent(i, m, out.stator_current_a);
       held_[i] = out;
       held_at_us_[i] = state.sample_time_us;
     }
@@ -906,12 +943,59 @@ class PhysicsSimBackend final : public Backend {
     }
   }
 
-  void EnforceSoftLimits(const MotorConfig& m, MotorSample& out,
+  // Resolves hard_stops_ by motor name against config_.
+  void BindHardStops() {
+    bound_hard_stops_.fill(BoundHardStop{});
+    for (const HardStop& s : hard_stops_) {
+      if (!s.min_rot && !s.max_rot) continue;
+      if (s.min_rot && !std::isfinite(*s.min_rot)) continue;
+      if (s.max_rot && !std::isfinite(*s.max_rot)) continue;
+      if (s.min_rot && s.max_rot && !(*s.min_rot < *s.max_rot)) continue;
+      for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+        if (config_.motors[i].name == s.motor) {
+          bound_hard_stops_[i] = {s.min_rot, s.max_rot};
+          break;
+        }
+      }
+    }
+  }
+
+  // Enforces physical end-of-travel hard stops on axis i regardless of
+  // MotorConfig::soft_limits. Returns true when a stop zeroed velocity.
+  bool EnforceHardStop(std::size_t i) {
+    const BoundHardStop& stop = bound_hard_stops_[i];
+    if (!stop.min_rot && !stop.max_rot) return false;
+    const double gear = Gear(i);
+    const double dir = FeedbackDirection(i);
+    double mech_pos = axes_[i].rotor_position_rot * dir / gear;
+    double mech_vel = axes_[i].rotor_velocity_rps * dir / gear;
+    bool stopped = false;
+    if (stop.min_rot && mech_pos <= *stop.min_rot) {
+      mech_pos = *stop.min_rot;
+      if (mech_vel < 0.0) {
+        mech_vel = 0.0;
+        stopped = true;
+      }
+    }
+    if (stop.max_rot && mech_pos >= *stop.max_rot) {
+      mech_pos = *stop.max_rot;
+      if (mech_vel > 0.0) {
+        mech_vel = 0.0;
+        stopped = true;
+      }
+    }
+    axes_[i].rotor_position_rot = mech_pos * dir * gear;
+    axes_[i].rotor_velocity_rps = mech_vel * dir * gear;
+    return stopped;
+  }
+
+  bool EnforceSoftLimits(const MotorConfig& m, MotorSample& out,
                          std::size_t i) {
-    if (!m.soft_limits) return;
+    if (!m.soft_limits) return false;
     const double lo = std::min(m.reverse_limit_rot, m.forward_limit_rot);
     const double hi = std::max(m.reverse_limit_rot, m.forward_limit_rot);
     const double gear = Gear(i);
+    bool stopped = false;
     if (out.position_rot < lo || out.position_rot > hi) {
       const double clamped = std::clamp(out.position_rot, lo, hi);
       axes_[i].rotor_position_rot = clamped * FeedbackDirection(i) * gear;
@@ -920,8 +1004,10 @@ class PhysicsSimBackend final : public Backend {
           (out.position_rot >= hi && out.velocity_rps > 0)) {
         axes_[i].rotor_velocity_rps = 0.0;
         out.velocity_rps = 0.0;
+        stopped = true;
       }
     }
+    return stopped;
   }
 
   // Output toward an asserted, enabled limit switch is held neutral; volts
@@ -969,27 +1055,76 @@ class PhysicsSimBackend final : public Backend {
     return flags;
   }
 
-  // Stator current from the winding model: the applied volts less the
-  // back-EMF of the rotor's speed (12 V at the motor type's 12 V free speed),
-  // over the winding resistance (12 V over its stall current), clamped to
-  // stator_limit_a as the TalonFX's limiter reports it. It peaks at stall and
-  // falls toward 0 at free speed, so a mechanism pushed against a stop reads
-  // loaded (a 1 V push on a Kraken X60 draws about 30 A) and one spinning
-  // freely does not. 0 while unpowered (no braking current is modelled).
-  // The limit is not fed back into the rotor dynamics.
+  // Effective winding voltage in motor i's configured direction after
+  // enforcing the voltage ceiling, stator_limit_a (|V_rotor - back_emf| / R <=
+  // stator_limit_a), and supply_limit_a (power drawn from supply_v_ capped to
+  // supply_limit_a * supply_v_). Fed into StepAxis and recorded in
+  // applied_volts_ so rotor dynamics, voltage, stator current, and supply
+  // current stay mutually consistent.
+  double LimitWindingVoltage(std::size_t i, const MotorConfig& m,
+                             double volts) const {
+    const MotorModel motor = MotorModelFor(m.motor_type.value);
+    const double dir = Direction(i);
+    const double ceiling = std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0,
+                                    supply_v_ > 0.0 ? supply_v_ : 12.0);
+    double rotor_volts = std::clamp(dir * volts, -ceiling, ceiling);
+    const double back_emf_v =
+        motor.back_emf_v_per_rps() * axes_[i].rotor_velocity_rps;
+    const double resistance_ohm = motor.resistance_ohm();
+    if (m.stator_limit_a > 0.0) {
+      const double max_drop_v = m.stator_limit_a * resistance_ohm;
+      rotor_volts = std::clamp(rotor_volts, back_emf_v - max_drop_v,
+                               back_emf_v + max_drop_v);
+      rotor_volts = std::clamp(rotor_volts, -ceiling, ceiling);
+    }
+    if (m.supply_limit_a > 0.0 && supply_v_ > 0.0) {
+      const double max_power_drop =
+          m.supply_limit_a * supply_v_ * resistance_ohm;
+      const double draw_drop = rotor_volts * (rotor_volts - back_emf_v);
+      if (draw_drop > max_power_drop) {
+        const double root =
+            std::sqrt(back_emf_v * back_emf_v + 4.0 * max_power_drop);
+        rotor_volts = rotor_volts > back_emf_v ? 0.5 * (back_emf_v + root)
+                                               : 0.5 * (back_emf_v - root);
+        rotor_volts = std::clamp(rotor_volts, -ceiling, ceiling);
+      }
+    }
+    return dir * rotor_volts;
+  }
+
+  // Stator current from the winding model: |applied volts - back-EMF| / R,
+  // with R = 12 V / stall current and k_e = (12 V - free current * R) / free
+  // speed, clamped to stator_limit_a. At 12 V stall it equals stall current;
+  // at 12 V free speed it equals free current; 0 while unpowered.
   double StatorCurrent(std::size_t i, const MotorConfig& m) const {
     if (!powered_[i]) return 0.0;
     const MotorModel motor = MotorModelFor(m.motor_type.value);
     const double back_emf_v =
-        12.0 * axes_[i].rotor_velocity_rps / motor.free_speed_rps_at_12v;
+        motor.back_emf_v_per_rps() * axes_[i].rotor_velocity_rps;
     const double net_v = Direction(i) * applied_volts_[i] - back_emf_v;
-    const double resistance_ohm = 12.0 / motor.stall_current_a_at_12v;
-    return std::min(m.stator_limit_a, std::abs(net_v) / resistance_ohm);
+    double current_a = std::abs(net_v) / motor.resistance_ohm();
+    if (commands_[i].mode == Mode::kTorqueCurrent && m.master_id == 0) {
+      const double demanded = std::abs(commands_[i].demand);
+      if (std::abs(current_a - demanded) < 1e-12) current_a = demanded;
+    }
+    return m.stator_limit_a > 0.0 ? std::min(m.stator_limit_a, current_a)
+                                  : current_a;
+  }
+
+  // Power-conservation supply current: |applied_volts * stator_current| /
+  // supply_v_, clamped to supply_limit_a; 0 when unpowered or supply_v_ <= 0.
+  double SupplyCurrent(std::size_t i, const MotorConfig& m,
+                       double stator_current_a) const {
+    if (!powered_[i] || supply_v_ <= 0.0) return 0.0;
+    const double current_a =
+        std::abs(applied_volts_[i] * stator_current_a) / supply_v_;
+    return m.supply_limit_a > 0.0 ? std::min(m.supply_limit_a, current_a)
+                                  : current_a;
   }
 
   // The volts TorqueCurrentFOC applies for a demand of `amperes`: the volts
   // that pass that stator current through the winding at the rotor's speed,
-  // V = I R + back-EMF (R = 12 V over the stall current), in the motor's
+  // V = I R + back-EMF (same k_e and R as StatorCurrent), in the motor's
   // output direction. The current is clamped to the peak torque current
   // (max_torque_current_a) and the stator limit, the volts to max_voltage
   // and the supply, as the RoboRIO's duty cap of max_voltage over the
@@ -1000,13 +1135,13 @@ class PhysicsSimBackend final : public Backend {
     const double peak_a =
         std::max(0.0, std::min(m.max_torque_current_a, m.stator_limit_a));
     const double current_a = std::clamp(amperes, -peak_a, peak_a);
-    const double resistance_ohm = 12.0 / motor.stall_current_a_at_12v;
     const double back_emf_v =
-        12.0 * axes_[i].rotor_velocity_rps / motor.free_speed_rps_at_12v;
+        motor.back_emf_v_per_rps() * axes_[i].rotor_velocity_rps;
     const double ceiling =
         std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply_v_);
-    return std::clamp(current_a * resistance_ohm + Direction(i) * back_emf_v,
-                      -ceiling, ceiling);
+    return std::clamp(
+        current_a * motor.resistance_ohm() + Direction(i) * back_emf_v,
+        -ceiling, ceiling);
   }
 
   bool FeedbackValid(std::size_t i) const {
@@ -1066,7 +1201,7 @@ class PhysicsSimBackend final : public Backend {
                      DriveVoltage(req, m, mech_pos, mech_vel, supply_v_, volts);
       }
       want_power = want_power && !LimitSwitchBlocks(i, volts);
-      applied_volts_[i] = want_power ? volts : 0.0;
+      applied_volts_[i] = want_power ? LimitWindingVoltage(i, m, volts) : 0.0;
       powered_[i] = want_power;
     }
     // Resolve follower chains before integrating any axis: configuration order
@@ -1082,9 +1217,12 @@ class PhysicsSimBackend final : public Backend {
         progress = true;
         powered_[i] = commands_[i].mode != Mode::kNeutral && FeedbackValid(i) &&
                       powered_[master];
-        applied_volts_[i] = powered_[i] ? applied_volts_[master] *
-                                              (m.oppose_master ? -1.0 : 1.0)
-                                        : 0.0;
+        applied_volts_[i] =
+            powered_[i]
+                ? LimitWindingVoltage(
+                      i, m,
+                      applied_volts_[master] * (m.oppose_master ? -1.0 : 1.0))
+                : 0.0;
       }
       if (!progress) break;
     }
@@ -1100,6 +1238,15 @@ class PhysicsSimBackend final : public Backend {
       const double rotor_volts = Direction(i) * volts;
       axes_[i] = StepAxis(motor, mech, axes_[i], rotor_volts, powered_[i],
                           supply_v_, dt_s);
+      const bool stopped = EnforceHardStop(i);
+      if (powered_[i]) {
+        if (commands_[i].mode == Mode::kTorqueCurrent && m.master_id == 0) {
+          applied_volts_[i] = LimitWindingVoltage(
+              i, m, TorqueCurrentVolts(i, m, commands_[i].demand));
+        } else if (stopped) {
+          applied_volts_[i] = LimitWindingVoltage(i, m, applied_volts_[i]);
+        }
+      }
     }
     StepChassis(dt_s);
     elapsed_s_ += dt_s;
@@ -1223,6 +1370,12 @@ class PhysicsSimBackend final : public Backend {
   };
   std::vector<HomeSwitch> home_switches_;
   std::vector<BoundHomeSwitch> bound_home_switches_;
+  struct BoundHardStop {
+    std::optional<double> min_rot;
+    std::optional<double> max_rot;
+  };
+  std::vector<HardStop> hard_stops_;
+  std::array<BoundHardStop, kMaxMotors> bound_hard_stops_{};
   std::vector<SwerveModuleSpec> configured_modules_;
   double supply_v_{kSimRestingSupplyV};
   double yaw_rot_{0.0};

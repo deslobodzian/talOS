@@ -1379,5 +1379,76 @@ y_m = -0.20
             (SimulationSwerveModule{"d1", "s1", -0.40, -0.20}));
 }
 
+// REQ-DEV-10: [[simulation.hard_stops]] configures physical end-of-travel
+// bounds per motor off the hardware wire (ConfigurationId unchanged) and
+// rejects invalid shapes, bounds, unknown keys, unknown/non-motor devices, and
+// duplicate motors.
+TEST(ConfigTest, SimulationHardStopsParseStayOffWireAndValidate) {
+  const std::string devices = R"(
+[subsystems.lift.motors]
+m_lift = { can_id = 10 }
+m_arm = { can_id = 11 }
+m_wrist = { can_id = 12 }
+[subsystems.lift.sensors.enc]
+can_id = 20
+)";
+  const auto plain = Parse(devices);
+  EXPECT_TRUE(plain.simulation.hard_stops.empty());
+
+  const auto with_stops = Parse(devices + R"(
+[simulation]
+[[simulation.hard_stops]]
+motor = "m_lift"
+min_rot = -0.3
+max_rot = 5.0
+[[simulation.hard_stops]]
+motor = "m_arm"
+min_rot = 0.0
+[[simulation.hard_stops]]
+motor = "m_wrist"
+max_rot = 1.5
+)");
+  ASSERT_EQ(with_stops.simulation.hard_stops.size(), 3u);
+  EXPECT_EQ(with_stops.simulation.hard_stops[0],
+            (SimulationHardStop{"m_lift", -0.3, 5.0}));
+  EXPECT_EQ(with_stops.simulation.hard_stops[1],
+            (SimulationHardStop{"m_arm", 0.0, std::nullopt}));
+  EXPECT_EQ(with_stops.simulation.hard_stops[2],
+            (SimulationHardStop{"m_wrist", std::nullopt, 1.5}));
+  EXPECT_EQ(hardware::ConfigurationId(with_stops.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  for (const std::string_view bad : {
+           "[simulation]\nhard_stops = {}\n",
+           "[simulation]\nhard_stops = [1]\n",
+           // Unknown key.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = 0.0\n"
+           "extra = 1\n",
+           // Missing or empty motor.
+           "[[simulation.hard_stops]]\nmin_rot = 0.0\n",
+           "[[simulation.hard_stops]]\nmotor = \"\"\nmin_rot = 0.0\n",
+           // Neither min_rot nor max_rot set.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\n",
+           // Non-finite bounds or wrong type.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = nan\n",
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmax_rot = inf\n",
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = \"0\"\n",
+           // min_rot >= max_rot.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = 1.0\n"
+           "max_rot = 1.0\n",
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = 2.0\n"
+           "max_rot = 1.0\n",
+           // Unknown motor or non-motor device.
+           "[[simulation.hard_stops]]\nmotor = \"missing\"\nmin_rot = 0.0\n",
+           "[[simulation.hard_stops]]\nmotor = \"enc\"\nmin_rot = 0.0\n",
+           // Duplicate motor.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = 0.0\n"
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmax_rot = 2.0\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(devices + std::string{bad});
+  }
+}
+
 }  // namespace
 }  // namespace talos::config
