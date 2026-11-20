@@ -54,6 +54,42 @@ def safe_copy(src, dest):
 # Where a bundle holds the Python runtimes its nodes share, by repository.
 RUNTIME_DIR = "python"
 
+# Test-only PyPI distributions pulled in transitively by gtsam's wheel metadata
+# (talOS/python/requirements.txt, REQ-OPS-48). Robot bundles never run pytest;
+# omitting their external site-packages directories saves ~7 MB per Python node
+# that depends on gtsam without touching user code (_main/) or runtime stdlib.
+TEST_ONLY_WHEELS = frozenset({
+    "pytest",
+    "pluggy",
+    "iniconfig",
+    "pygments",
+    "packaging",
+})
+TEST_ONLY_SITE_ENTRIES = TEST_ONLY_WHEELS | frozenset({"_pytest"})
+
+
+def is_test_only_wheel_file(rf_rel, runtimes):
+    """True when `rf_rel` belongs to one of TEST_ONLY_WHEELS inside an external
+    wheel repository's site-packages/ directory (never _main user code and
+    never a Python runtime's own repository)."""
+    parts = rf_rel.split(os.sep)
+    if len(parts) < 3:
+        return False
+    repo = parts[0]
+    if repo == "_main" or repo in runtimes or parts[1] != "site-packages":
+        return False
+    entry = parts[2]
+    if entry in TEST_ONLY_SITE_ENTRIES:
+        return True
+    if entry.endswith(".dist-info"):
+        dist = entry.split("-", 1)[0].lower().replace("_", "-")
+        if dist in TEST_ONLY_WHEELS:
+            return True
+    # pytest's wheel also ships top-level py.py beside pytest/ and _pytest/.
+    if entry == "py.py" and "+pip+" in repo and "_pytest_" in repo:
+        return True
+    return False
+
 
 def write_exec_script(dest, target, note):
     """Writes `dest` as a script that execs `target` (a path in the bundle)
@@ -384,11 +420,16 @@ def main():
                     stage_runtime_file(name, rf_src, rf_rel, staged_at(rf_rel),
                                        staged_runtimes)
                     continue
+                if is_test_only_wheel_file(rf_rel, runtimes):
+                    continue
                 safe_copy(rf_src, os.path.join(rf_dir, rf_rel))
                 if rf_rel.endswith(".repo_mapping") or rf_rel == "_repo_mapping":
                     repo_mapping_src = rf_src
             for rf_rel, link in links:
                 target = link_target(rf_rel, link)
+                if (is_test_only_wheel_file(rf_rel, runtimes)
+                        or is_test_only_wheel_file(target, runtimes)):
+                    continue
                 stage_link(name, os.path.join(rf_dir, rf_rel), rf_rel, link,
                            staged_at(target), bundle_root)
                 if target.split(os.sep, 1)[0] in runtimes:
