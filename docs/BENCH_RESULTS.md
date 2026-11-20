@@ -22,6 +22,35 @@ Hosts named below: the **bench** is BENCH.md's RoboRIO (image
 FRC_roboRIO_2026_v1.2, two cores) and CAN devices; the **Linux workstation**
 has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
+## 2026-11-20
+
+Mac mini (M4 Pro, 12 cores, macOS arm64), commit `6dd79706`, no hardware
+attached. Investigation of nightly `Bazel (tsan, macOS)` failures (`TODO.md`
+CI-13) and kept CI logs from Nightly runs `43877022665` (`6c701709`) and
+`44122679143` (`d702c99d`).
+
+- **CI-13: zero ThreadSanitizer race reports; mechanism is ~100x macOS TSan
+  fork/exec kernel overhead.** Neither nightly run's logs contain any
+  `WARNING: ThreadSanitizer` finding. Standalone Apple clang measurements on
+  the Mac mini: `fork()` from a 3-thread process took 120 ms under TSan vs
+  0.5 ms plain; `fork` + `exec /usr/bin/true` took 213 ms vs 3 ms; 10 empty
+  `main` starts took 1.94 s (mostly kernel CPU) vs 0.02 s; 24 concurrent empty
+  `main` starts consumed 10.7 s kernel CPU in 0.96 s wall. Starting
+  `no_state_sim` took 0.9 s plain vs 2.9 s TSan idle, and 1.9 s plain vs
+  12.6 s TSan for 3 concurrent sessions pinned to efficiency cores
+  (`taskpolicy -c background`).
+- **CI-13: 3-of-3 reproduction of Nightly `44122679143` failures.** Running
+  `bazel test --config=tsan --nocache_test_results --runs_per_test=3
+  --local_test_jobs=3 '--run_under=taskpolicy -c background'` reproduced the
+  exact CI failure messages 3 of 3 on `//talOS/build:sim_check_no_state_test`
+  (14 s ready bound exceeded after the case's 4 s sleep) and
+  `//tools:scaffold_sim_test` (15 s ready wait exceeded across 6 members), and
+  pushed `//talOS/launcher:log_dump_test` (18 subprocess spawns, 60 s small
+  limit) to 48 s. On the idle 12-core Mac mini all three passed
+  (15.6 s, 24.2 s, 16.0 s). Because the Linux sanitizer lanes still run all
+  three targets, they take `no_macos_sanitizer` alongside the other
+  session-spawning tests in `talOS/launcher/BUILD`.
+
 ## 2026-11-17
 
 Bench, RoboRIO build c6c04a67 with companion 10.0.0.37, Mac mini (12 cores,

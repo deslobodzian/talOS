@@ -136,9 +136,14 @@ py_test(
     ],
     legacy_create_init = False,
     main = "scaffold_sim_test.py",
+    # Launches six instrumented processes per session (two fork()s + exec per
+    # spawn); under macOS TSan on a 3-vCPU hosted runner start-up takes ~1 s
+    # per member and overruns the 15 s ready wait (TODO.md CI-13). The Linux
+    # sanitizer legs still run this test.
     tags = [
         "e2e",
         "exclusive",
+        "no_macos_sanitizer",
     ],
     deps = [
         ":sync_manifest_lib",
