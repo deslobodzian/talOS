@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -581,25 +582,49 @@ class ClientFeed {
 // values. `rate` is the client's share in B/s; `afford(framed_bytes)` and the
 // senders are as in ClientFeed.
 struct ClientFeeds {
+  enum class Feed { kGraph, kTelemetry, kThrottledTelemetry };
+
   static constexpr std::int64_t kHoldNs = 250'000'000;
   static constexpr double kGraphShare = 0.5;
 
   GraphFeed graph;
   ClientFeed telemetry;
 
+  // `afford` takes either `(framed_bytes)` or `(framed_bytes, Feed)`. When
+  // `telemetry_first` is true (a telemetry send such as a dictionary page or
+  // keyframe is waiting on the shared egress bucket), telemetry is offered
+  // before the system graph so a small graph update cannot preempt or drain
+  // budget ahead of it.
   template <class Afford, class SendText, class SendBinary>
   void Pump(const SystemGraphDocument& document, const TelemetryState& state,
             std::int64_t now_ns, double rate, Afford&& afford,
-            SendText&& send_text, SendBinary&& send_binary) {
-    const auto afford_text = [&afford](std::size_t bytes) {
-      return afford(EgressBudget::framed(bytes));
+            SendText&& send_text, SendBinary&& send_binary,
+            bool telemetry_first = false) {
+    const auto call_afford = [&afford](std::size_t bytes, Feed feed) {
+      if constexpr (requires { afford(bytes, feed); }) {
+        return afford(bytes, feed);
+      } else {
+        return afford(bytes);
+      }
+    };
+    const auto afford_telemetry = [&call_afford](std::size_t bytes) {
+      return call_afford(bytes, Feed::kTelemetry);
+    };
+    if (telemetry_first) {
+      telemetry.Pump(state, now_ns, afford_telemetry, send_binary);
+    }
+    const auto afford_text = [&call_afford](std::size_t bytes) {
+      return call_afford(EgressBudget::framed(bytes), Feed::kGraph);
     };
     if (!graph.Pump(document, now_ns, EgressBudget::kMaxPayloadBytes,
                     afford_text, send_text)) {
       held_since_ns_ = -1;
-      telemetry.Pump(state, now_ns, afford, send_binary);
+      if (!telemetry_first) {
+        telemetry.Pump(state, now_ns, afford_telemetry, send_binary);
+      }
       return;
     }
+    if (telemetry_first) return;
     if (held_since_ns_ < 0) held_since_ns_ = held_sent_ns_ = now_ns;
     if (now_ns - held_sent_ns_ < kHoldNs) return;
     // Every byte telemetry spends leaves at least the reserve in the bucket,
@@ -613,8 +638,8 @@ struct ClientFeeds {
     bool sent = false;
     telemetry.Pump(
         state, now_ns,
-        [&afford, reserve](std::size_t bytes) {
-          return afford(bytes + reserve);
+        [&call_afford, reserve](std::size_t bytes) {
+          return call_afford(bytes + reserve, Feed::kThrottledTelemetry);
         },
         [&](std::string_view page) {
           const bool ok = send_binary(page);
@@ -649,10 +674,10 @@ struct ClientFeeds {
 // drains is offered its turn by one), so the bucket is granted in rotation:
 // of the clients able to take a send (nothing buffered, and both buckets,
 // as they stood when the pass began, hold its whole next message), none is
-// sent to twice before every other
-// one has been sent to once. A client whose next message is larger than
-// another's can therefore be passed over while the shared bucket holds the
-// smaller but not its own.
+// sent to twice before every other one has been sent to once. A client whose
+// next message is larger than another's can be passed over while the shared
+// bucket holds the smaller but not its own, up to SharedReservation::kDelayNs
+// before SharedReservation reserves the shared bucket for it.
 template <class Client>
 class ClientRotation {
  public:
@@ -665,6 +690,15 @@ class ClientRotation {
     clients_.erase(found);
     if (index < next_) --next_;
     if (next_ >= clients_.size()) next_ = 0;
+  }
+
+  // Advances the rotation so `client` is last in the next pass, as if it had
+  // just been sent to during Pass().
+  void AdvancePast(Client client) {
+    const auto found = std::find(clients_.begin(), clients_.end(), client);
+    if (found == clients_.end()) return;
+    const auto index = static_cast<std::size_t>(found - clients_.begin());
+    next_ = (index + 1) % clients_.size();
   }
 
   // Offers every client a send, starting with the one owed the next turn;
@@ -692,6 +726,230 @@ class ClientRotation {
  private:
   std::vector<Client> clients_;
   std::size_t next_ = 0;
+};
+
+// How long a programmer client whose next message fits its own bucket and the
+// burst may wait specifically for the shared egress bucket before the bridge
+// reserves the shared bucket for it (REQ-OPS-23;
+// docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary). 500 ms matches
+// GraphFeed::kUpdateNs, sits below GraphFeed::kNoticeNs (750 ms) and Studio's
+// 1 s staleness threshold, and keeps normal small-update rotation untouched.
+inline constexpr std::int64_t kSharedReserveDelayNs = 500'000'000;
+
+// Bounds how long a programmer client's waiting large message (graph,
+// dictionary page or keyframe, up to EgressBudget::kBurstBytes) can be passed
+// over while other clients or its own smaller feed spend the shared egress
+// bucket (REQ-OPS-23).
+//
+// Whenever a client is blocked *only* by the shared bucket (its own bucket
+// holds the framed message <= kBurstBytes and its socket has no buffered
+// output), its wait start is recorded. Once the longest-waiting such client
+// reaches kDelayNs, it holds the shared reservation: Pass() offers it first
+// and denies every other programmer client — and that client's smaller feed —
+// until the shared bucket refills and it sends, or until it disconnects,
+// backs up, its own bucket can no longer afford the message, or it no longer
+// needs the send. Messages over kBurstBytes can never fit and are never
+// reserved.
+//
+// Bound for one waiting client of framed size G <= kBurstBytes at shared rate
+// R: kDelayNs + G / R (independent of client count). For k simultaneously
+// waiting clients (served FIFO by wait start, tie-broken by rotation order):
+// kDelayNs + sum(G_i) / R <= kDelayNs + k * G / R.
+template <class Client>
+class SharedReservation {
+ public:
+  static constexpr std::int64_t kDelayNs = kSharedReserveDelayNs;
+
+  // Drops tracking for a disconnected client and releases any reservation it
+  // held so other clients are never stalled.
+  void Remove(Client client) {
+    EraseWaiting(client);
+    if (reserved_.has_value() && *reserved_ == client) ClearReservation();
+  }
+
+  // Runs one pass over programmer clients. When a client holds the
+  // reservation (or has reached kDelayNs), it is offered first; while it
+  // remains blocked on the shared bucket, no other client is offered bytes
+  // from the shared bucket (and other waiting clients keep their wait start
+  // times). Once the reservation finishes or clears, the remaining clients
+  // take their pass in rotation and any client now at or past kDelayNs is
+  // promoted for the next pass.
+  template <class Pump>
+  void Pass(ClientRotation<Client>& rotation, std::int64_t now_ns,
+            Pump&& pump) {
+    if (!reserved_.has_value()) Promote(now_ns);
+    std::optional<Client> skipped;
+    if (reserved_.has_value()) {
+      const Client holder = *reserved_;
+      const bool sent = PumpOne(holder, now_ns, pump);
+      if (sent) rotation.AdvancePast(holder);
+      if (reserved_.has_value()) return;
+      skipped = holder;
+    }
+    rotation.Pass([&](Client client) {
+      if (skipped.has_value() && *skipped == client) return false;
+      return PumpOne(client, now_ns, pump);
+    });
+    if (!reserved_.has_value()) Promote(now_ns);
+  }
+
+  // Whether `client` may attempt a send of `framed_bytes` now. While another
+  // client holds the reservation, returns false; while `client` itself holds
+  // the reservation and its primary send already blocked on the shared bucket
+  // this pass, denies its smaller feed too. Before reservation, denies a
+  // smaller send of `client` that would dip `own` below the larger message
+  // `client` is already waiting on the shared bucket for (preventing a
+  // self-inflicted livelock near kBurstBytes).
+  bool MaySpend(Client client, std::size_t framed_bytes, EgressBudget& own,
+                double own_rate, std::int64_t now_ns) const {
+    if (reserved_.has_value()) {
+      if (*reserved_ != client) return false;
+      return !current_blocked_;
+    }
+    if (in_client_ && current_client_ == client && current_blocked_) {
+      const auto limit = static_cast<std::size_t>(EgressBudget::kBurstBytes);
+      if (framed_bytes > limit ||
+          current_blocked_bytes_ > limit - framed_bytes) {
+        return false;
+      }
+      return own.available(current_blocked_bytes_ + framed_bytes, own_rate,
+                           now_ns);
+    }
+    return true;
+  }
+
+  // Records that `client` was blocked specifically by the shared bucket on a
+  // send of `framed_bytes` from `feed` (own bucket holds it, socket is not
+  // backpressured). Messages over kBurstBytes can never fit and are ignored;
+  // throttled telemetry while a graph waits on `own` is ignored too.
+  void BlockedOnShared(Client client, std::size_t framed_bytes,
+                       ClientFeeds::Feed feed) {
+    if (feed == ClientFeeds::Feed::kThrottledTelemetry) return;
+    if (static_cast<double>(framed_bytes) > EgressBudget::kBurstBytes) return;
+    if (!in_client_ || current_client_ != client || current_blocked_) return;
+    current_blocked_ = true;
+    current_blocked_bytes_ = framed_bytes;
+    current_blocked_feed_ = feed;
+  }
+
+  // Called when `client` completes a send. A reserved client's send fulfills
+  // its reservation and clears its wait entry; a pre-reservation smaller send
+  // leaves its wait entry intact for PumpOne() to keep or clear.
+  void OnSend(Client client) {
+    if (reserved_.has_value() && *reserved_ == client) {
+      ClearReservation();
+      EraseWaiting(client);
+    }
+  }
+
+  // True when `client` is waiting on or reserved for a telemetry send
+  // (dictionary page or keyframe/update), so ClientFeeds pumps telemetry
+  // before a small graph update.
+  bool PreferTelemetry(Client client) const {
+    if (reserved_.has_value() && *reserved_ == client) {
+      return reserved_feed_ == ClientFeeds::Feed::kTelemetry;
+    }
+    for (const Entry& entry : waiting_) {
+      if (entry.client == client) {
+        return entry.feed == ClientFeeds::Feed::kTelemetry;
+      }
+    }
+    return false;
+  }
+
+  // Earliest instant a waiting client reaches kDelayNs and triggers a
+  // reservation (kNeverNs while a reservation is already held — whose refill
+  // WakeSchedule::retry_ns tracks — or when nobody is waiting).
+  std::int64_t NextDueNs() const {
+    if (reserved_.has_value() || waiting_.empty()) return kNeverNs;
+    std::int64_t earliest = kNeverNs;
+    for (const Entry& entry : waiting_) {
+      earliest = std::min(earliest, entry.since_ns);
+    }
+    return earliest + kDelayNs;
+  }
+
+  std::optional<Client> reserved() const { return reserved_; }
+  std::size_t reserved_bytes() const { return reserved_bytes_; }
+
+ private:
+  struct Entry {
+    Client client{};
+    std::int64_t since_ns{0};
+    std::size_t bytes{0};
+    ClientFeeds::Feed feed{ClientFeeds::Feed::kGraph};
+  };
+
+  void ClearReservation() {
+    reserved_.reset();
+    reserved_bytes_ = 0;
+    reserved_feed_ = ClientFeeds::Feed::kGraph;
+  }
+
+  void EraseWaiting(Client client) {
+    waiting_.erase(std::remove_if(waiting_.begin(), waiting_.end(),
+                                  [&client](const Entry& e) {
+                                    return e.client == client;
+                                  }),
+                   waiting_.end());
+  }
+
+  template <class Pump>
+  bool PumpOne(Client client, std::int64_t now_ns, Pump&& pump) {
+    in_client_ = true;
+    current_client_ = client;
+    current_blocked_ = false;
+    current_blocked_bytes_ = 0;
+    current_blocked_feed_ = ClientFeeds::Feed::kGraph;
+    const bool sent = pump(client);
+    in_client_ = false;
+    if (current_blocked_) {
+      RecordWait(client, now_ns, current_blocked_bytes_, current_blocked_feed_);
+      if (reserved_.has_value() && *reserved_ == client) {
+        reserved_bytes_ = current_blocked_bytes_;
+        reserved_feed_ = current_blocked_feed_;
+      }
+    } else {
+      EraseWaiting(client);
+      if (reserved_.has_value() && *reserved_ == client) ClearReservation();
+    }
+    return sent;
+  }
+
+  void RecordWait(Client client, std::int64_t now_ns, std::size_t bytes,
+                  ClientFeeds::Feed feed) {
+    for (Entry& entry : waiting_) {
+      if (entry.client == client) {
+        entry.bytes = bytes;
+        entry.feed = feed;
+        return;
+      }
+    }
+    waiting_.push_back({client, now_ns, bytes, feed});
+  }
+
+  void Promote(std::int64_t now_ns) {
+    const Entry* best = nullptr;
+    for (const Entry& entry : waiting_) {
+      if (now_ns - entry.since_ns < kDelayNs) continue;
+      if (best == nullptr || entry.since_ns < best->since_ns) best = &entry;
+    }
+    if (best == nullptr) return;
+    reserved_ = best->client;
+    reserved_bytes_ = best->bytes;
+    reserved_feed_ = best->feed;
+  }
+
+  std::vector<Entry> waiting_;
+  std::optional<Client> reserved_;
+  std::size_t reserved_bytes_{0};
+  ClientFeeds::Feed reserved_feed_{ClientFeeds::Feed::kGraph};
+
+  bool in_client_{false};
+  Client current_client_{};
+  bool current_blocked_{false};
+  std::size_t current_blocked_bytes_{0};
+  ClientFeeds::Feed current_blocked_feed_{ClientFeeds::Feed::kGraph};
 };
 
 // When the bridge must next run with no socket event or publication: the

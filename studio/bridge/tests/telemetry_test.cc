@@ -1183,5 +1183,472 @@ TEST(ClientRotation, ADisconnectDoesNotSkipTheClientOwedTheTurn) {
   EXPECT_EQ(grants.order, "abc");
 }
 
+// REQ-OPS-23
+// Under a 64-client continuous small-update flood, a client waiting on a large
+// graph message (60,000 B, and at the exact kBurstBytes boundary) is reserved
+// the shared bucket after kSharedReserveDelayNs and sends strictly within
+// kSharedReserveDelayNs + G / R_shared, driven purely by WakeSchedule; a
+// message one byte past kBurstBytes is never reserved and never stalls others.
+TEST(SharedReservation, LargeMessageSendsWithinBoundUnderSixtyFourClientFlood) {
+  constexpr std::size_t kClients = 64;
+  constexpr double kSharedRate = 112000;  // default layout programmer share
+  constexpr double kClientRate = kSharedRate / static_cast<double>(kClients);
+  constexpr std::uint32_t kChannels = 80;
+  std::vector<ChannelDef> dictionary;
+  std::vector<std::uint32_t> channels;
+  for (std::uint32_t i = 0; i < kChannels; ++i) {
+    dictionary.push_back({"test/state/ch_" + std::to_string(i),
+                          "",
+                          {},
+                          Talos::Telemetry::ChannelKind_Double});
+    channels.push_back(i);
+  }
+  const auto tick_values = [&](std::uint64_t tick) {
+    std::vector<std::uint64_t> values;
+    values.reserve(kChannels);
+    for (std::uint32_t i = 0; i < kChannels; ++i) {
+      values.push_back(RawFromDouble(static_cast<double>(tick * 1000 + i)));
+    }
+    return values;
+  };
+
+  for (const std::size_t graph_bytes :
+       {std::size_t{60000}, EgressBudget::kMaxPayloadBytes,
+        EgressBudget::kMaxPayloadBytes + 1}) {
+    SCOPED_TRACE(graph_bytes);
+    const bool fits_burst = graph_bytes <= EgressBudget::kMaxPayloadBytes;
+
+    TelemetryState state;
+    ASSERT_TRUE(IngestAll(state, DictionaryPages(dictionary)));
+    ASSERT_TRUE(
+        IngestAll(state, TickPages(kChannels, 1, channels, tick_values(1))));
+
+    const SystemGraphDocument small_graph{.json = std::string(400, 's'),
+                                          .structure = "0123456789abcdef",
+                                          .values = "[]"};
+    const SystemGraphDocument large_graph{.json = std::string(graph_bytes, 'g'),
+                                          .structure = "fedcba9876543210",
+                                          .values = "[]"};
+
+    struct Peer {
+      EgressBudget budget;
+      ClientFeeds feeds;
+      std::int64_t large_sent_ns = -1;
+      std::size_t binary_sends = 0;
+    };
+    std::vector<Peer> peers(kClients);
+    ClientRotation<std::size_t> rotation;
+    SharedReservation<std::size_t> reservation;
+    // Sync all 64 clients at t = 0 so by t0 = GraphFeed::kResendNs client 0
+    // already holds small_graph (making both large_graph and deferral notices
+    // eligible at t0) and clients 1..63 send only small delta updates.
+    constexpr std::int64_t kStartNs = GraphFeed::kResendNs;
+    for (std::size_t i = 0; i < kClients; ++i) {
+      rotation.Add(i);
+      peers[i].feeds.Pump(
+          small_graph, state, 0, kClientRate, [](std::size_t) { return true; },
+          [](std::string_view) { return true; },
+          [](std::string_view) { return true; });
+    }
+
+    EgressBudget shared;
+    ASSERT_TRUE(shared.available(0, kSharedRate, kStartNs));
+    shared.spend(static_cast<std::size_t>(EgressBudget::kBurstBytes));  // empty
+    WakeSchedule schedule;
+    schedule.refreshed_ns = kStartNs;
+    schedule.check_due_ns = kNeverNs;
+
+    std::size_t total_shared_bytes =
+        static_cast<std::size_t>(EgressBudget::kBurstBytes);
+    std::size_t passes = 0;
+    const auto run_pass = [&](std::int64_t now) {
+      ++passes;
+      schedule.BeginPass();
+      if (schedule.RefreshDue(now)) schedule.refreshed_ns = now;
+      reservation.Pass(rotation, now, [&](std::size_t idx) {
+        const SystemGraphDocument& doc = idx == 0 ? large_graph : small_graph;
+        bool sent = false;
+        peers[idx].feeds.Pump(
+            doc, state, now, kClientRate,
+            [&](std::size_t framed, ClientFeeds::Feed feed) {
+              if (!reservation.MaySpend(idx, framed, peers[idx].budget,
+                                        kClientRate, now)) {
+                return false;
+              }
+              const bool fits_own =
+                  peers[idx].budget.available(framed, kClientRate, now);
+              const bool fits_shared =
+                  shared.available(framed, kSharedRate, now);
+              if (!fits_own || !fits_shared) {
+                std::int64_t wait_ns =
+                    fits_own ? 0
+                             : peers[idx].budget.wait_ns(framed, kClientRate);
+                if (!fits_shared) {
+                  wait_ns =
+                      std::max(wait_ns, shared.wait_ns(framed, kSharedRate));
+                }
+                schedule.Deferred(now, wait_ns);
+                if (fits_own) reservation.BlockedOnShared(idx, framed, feed);
+                return false;
+              }
+              return true;
+            },
+            [&](std::string_view text) {
+              const std::size_t framed = EgressBudget::framed(text.size());
+              peers[idx].budget.spend(framed);
+              shared.spend(framed);
+              total_shared_bytes += framed;
+              reservation.OnSend(idx);
+              if (idx == 0 && text == large_graph.json) {
+                peers[idx].large_sent_ns = now;
+              }
+              sent = true;
+              return true;
+            },
+            [&](std::string_view page) {
+              const std::size_t framed = EgressBudget::framed(page.size());
+              peers[idx].budget.spend(framed);
+              shared.spend(framed);
+              total_shared_bytes += framed;
+              reservation.OnSend(idx);
+              ++peers[idx].binary_sends;
+              sent = true;
+              return true;
+            },
+            reservation.PreferTelemetry(idx));
+        return sent;
+      });
+    };
+
+    const std::int64_t bound_ns =
+        kSharedReserveDelayNs +
+        static_cast<std::int64_t>(
+            std::ceil(static_cast<double>(EgressBudget::framed(graph_bytes)) /
+                      kSharedRate * 1e9));
+    constexpr std::int64_t kTickNs = 10'000'000;
+    constexpr std::int64_t kEndNs = kStartNs + 2'000'000'000;
+    std::int64_t now = kStartNs;
+    std::uint64_t tick = 1;
+    run_pass(now);
+    while (now < kEndNs) {
+      std::int64_t next =
+          schedule.NextWakeNs(now, false, small_graph, [&](const auto& visit) {
+            visit(reservation);
+            for (const Peer& peer : peers) visit(peer.feeds);
+          });
+      const std::int64_t next_tick =
+          kStartNs + static_cast<std::int64_t>(tick) * kTickNs;
+      const bool published = next_tick <= next;
+      if (published) next = next_tick;
+      now = next;
+      if (published) {
+        ++tick;
+        ASSERT_TRUE(IngestAll(
+            state, TickPages(kChannels, tick, channels, tick_values(tick))));
+      }
+      run_pass(now);
+    }
+
+    if (fits_burst) {
+      ASSERT_GE(peers[0].large_sent_ns, kStartNs)
+          << "client 0's " << graph_bytes << " B graph was starved";
+      EXPECT_LE(peers[0].large_sent_ns - kStartNs, bound_ns);
+    } else {
+      EXPECT_EQ(peers[0].large_sent_ns, -1);
+      // Oversized graph was never reserved and never blocked client 0's own
+      // telemetry or any peer.
+      EXPECT_GT(peers[0].binary_sends, 0u);
+      EXPECT_LE(static_cast<double>(reservation.reserved_bytes()),
+                EgressBudget::kBurstBytes);
+    }
+    // Other clients kept receiving updates, and total egress stayed in budget.
+    std::size_t other_sends = 0;
+    for (std::size_t i = 1; i < kClients; ++i) {
+      other_sends += peers[i].binary_sends;
+    }
+    EXPECT_GT(other_sends, 50u);
+    EXPECT_LT(passes, 1000u) << "WakeSchedule should wake on duties, not spin";
+    EXPECT_LE(static_cast<double>(total_shared_bytes),
+              EgressBudget::kBurstBytes +
+                  kSharedRate * static_cast<double>(now - kStartNs) * 1e-9 +
+                  1.0);
+  }
+}
+
+// REQ-OPS-23
+// A client waiting on a large telemetry dictionary page is not preempted or
+// starved by its own periodic system_graph.update (500 ms) or by flooding
+// peers: it sends strictly within kSharedReserveDelayNs + G / R_shared.
+TEST(SharedReservation,
+     WaitingDictionaryPageSendsWithinBoundBesideGraphUpdates) {
+  constexpr std::size_t kClients = 8;
+  constexpr double kSharedRate = 112000;
+  constexpr double kClientRate = kSharedRate / static_cast<double>(kClients);
+  // 220 channels with long names produces a ~16 KB first dictionary page.
+  std::vector<ChannelDef> large_dict;
+  for (int i = 0; i < 220; ++i) {
+    large_dict.push_back({"subsystem_alpha/telemetry_channel_with_long_name_" +
+                              std::to_string(i),
+                          "rad/s",
+                          {},
+                          Talos::Telemetry::ChannelKind_Double});
+  }
+  const std::vector<std::string> large_pages =
+      DictionaryPages(large_dict, kStream, kDictionaryId + 1);
+  ASSERT_FALSE(large_pages.empty());
+  const std::size_t page0_framed = EgressBudget::framed(large_pages[0].size());
+  ASSERT_GT(page0_framed, 10000u);
+  ASSERT_LE(static_cast<double>(page0_framed), EgressBudget::kBurstBytes);
+
+  TelemetryState small_state = SmallState();
+  TelemetryState large_state;
+  ASSERT_TRUE(IngestAll(large_state, large_pages));
+
+  SystemGraphDocument graph = BuildSystemGraph(Registry(4, 0, 0));
+  struct Peer {
+    EgressBudget budget;
+    ClientFeeds feeds;
+    std::int64_t dict_sent_ns = -1;
+  };
+  std::vector<Peer> peers(kClients);
+  ClientRotation<std::size_t> rotation;
+  SharedReservation<std::size_t> reservation;
+  for (std::size_t i = 0; i < kClients; ++i) {
+    rotation.Add(i);
+    peers[i].feeds.Pump(
+        graph, small_state, 0, kClientRate, [](std::size_t) { return true; },
+        [](std::string_view) { return true; },
+        [](std::string_view) { return true; });
+  }
+  // Client 0's own bucket holds just enough for page 0 so any small graph
+  // update sent ahead of it would dip `own` below page 0.
+  ASSERT_TRUE(peers[0].budget.available(0, kClientRate, 0));
+  peers[0].budget.spend(static_cast<std::size_t>(EgressBudget::kBurstBytes) -
+                        page0_framed);
+
+  EgressBudget shared;
+  ASSERT_TRUE(shared.available(0, kSharedRate, 0));
+  shared.spend(static_cast<std::size_t>(EgressBudget::kBurstBytes));
+
+  const std::int64_t bound_ns =
+      kSharedReserveDelayNs +
+      static_cast<std::int64_t>(
+          std::ceil(static_cast<double>(page0_framed) / kSharedRate * 1e9));
+
+  std::uint64_t refresh = 0;
+  for (std::int64_t now = 0; now <= 1'500'000'000; now += 1'000'000) {
+    if (now > 0 && now % 250'000'000 == 0) {
+      graph = BuildSystemGraph(Registry(4, ++refresh, 0));
+    }
+    // Peers 1..7 keep receiving new small ticks to drain shared.
+    if (now % 10'000'000 == 0) {
+      ASSERT_TRUE(
+          IngestAll(small_state, SmallTick(static_cast<double>(now),
+                                           static_cast<std::uint64_t>(now))));
+    }
+    reservation.Pass(rotation, now, [&](std::size_t idx) {
+      const TelemetryState& st = idx == 0 ? large_state : small_state;
+      bool sent = false;
+      peers[idx].feeds.Pump(
+          graph, st, now, kClientRate,
+          [&](std::size_t framed, ClientFeeds::Feed feed) {
+            if (!reservation.MaySpend(idx, framed, peers[idx].budget,
+                                      kClientRate, now)) {
+              return false;
+            }
+            const bool fits_own =
+                peers[idx].budget.available(framed, kClientRate, now);
+            const bool fits_shared = shared.available(framed, kSharedRate, now);
+            if (!fits_own || !fits_shared) {
+              if (fits_own) reservation.BlockedOnShared(idx, framed, feed);
+              return false;
+            }
+            return true;
+          },
+          [&](std::string_view text) {
+            const std::size_t framed = EgressBudget::framed(text.size());
+            peers[idx].budget.spend(framed);
+            shared.spend(framed);
+            reservation.OnSend(idx);
+            sent = true;
+            return true;
+          },
+          [&](std::string_view page) {
+            const std::size_t framed = EgressBudget::framed(page.size());
+            peers[idx].budget.spend(framed);
+            shared.spend(framed);
+            reservation.OnSend(idx);
+            if (idx == 0 && page == large_pages[0] &&
+                peers[0].dict_sent_ns < 0) {
+              peers[0].dict_sent_ns = now;
+            }
+            sent = true;
+            return true;
+          },
+          reservation.PreferTelemetry(idx));
+      return sent;
+    });
+  }
+  ASSERT_GE(peers[0].dict_sent_ns, 0);
+  EXPECT_LE(peers[0].dict_sent_ns, bound_ns);
+}
+
+// REQ-OPS-23
+// Disconnecting or backpressuring the reserved client immediately releases
+// the shared-bucket reservation so other clients are never stalled.
+TEST(SharedReservation,
+     DisconnectAndBackpressureReleaseReservationImmediately) {
+  for (const bool disconnect : {true, false}) {
+    SCOPED_TRACE(disconnect ? "disconnect" : "backpressure");
+    constexpr double kSharedRate = 160000;
+    constexpr double kClientRate = 80000;
+    constexpr std::size_t kLarge = 60000;
+    constexpr std::size_t kSmall = 1000;
+
+    ClientRotation<int> rotation;
+    SharedReservation<int> reservation;
+    rotation.Add(0);
+    rotation.Add(1);
+
+    EgressBudget own[2];
+    EgressBudget shared;
+    ASSERT_TRUE(shared.available(0, kSharedRate, 0));
+    shared.spend(static_cast<std::size_t>(EgressBudget::kBurstBytes));  // empty
+
+    bool backpressured = false;
+    std::size_t client1_sends = 0;
+    const auto pass = [&](std::int64_t now) {
+      reservation.Pass(rotation, now, [&](int idx) {
+        const std::size_t want = idx == 0 ? kLarge : kSmall;
+        if (!reservation.MaySpend(idx, want, own[idx], kClientRate, now)) {
+          return false;
+        }
+        const bool fits_own = own[idx].available(want, kClientRate, now);
+        const bool fits_shared = shared.available(want, kSharedRate, now);
+        const bool buffered = idx == 0 && backpressured;
+        if (!fits_own || !fits_shared) {
+          if (fits_own && !buffered) {
+            reservation.BlockedOnShared(idx, want, ClientFeeds::Feed::kGraph);
+          }
+          return false;
+        }
+        if (buffered) return false;
+        own[idx].spend(want);
+        shared.spend(want);
+        reservation.OnSend(idx);
+        if (idx == 1) ++client1_sends;
+        return true;
+      });
+    };
+
+    // Wait past kSharedReserveDelayNs while client 1 drains shared.
+    for (std::int64_t now = 0; now < kSharedReserveDelayNs; now += 10'000'000) {
+      pass(now);
+    }
+    EXPECT_GT(client1_sends, 0u);
+    pass(kSharedReserveDelayNs);
+    ASSERT_EQ(reservation.reserved(), std::optional<int>{0});
+
+    // While client 0 holds the reservation, client 1 cannot spend shared.
+    const std::size_t sends_at_reserve = client1_sends;
+    pass(kSharedReserveDelayNs + 20'000'000);
+    EXPECT_EQ(client1_sends, sends_at_reserve);
+
+    // Client 0 disconnects or backs up: reservation clears and client 1 sends
+    // immediately on the next pass.
+    if (disconnect) {
+      reservation.Remove(0);
+      rotation.Remove(0);
+      EXPECT_FALSE(reservation.reserved().has_value());
+    } else {
+      backpressured = true;
+    }
+    pass(kSharedReserveDelayNs + 30'000'000);
+    EXPECT_FALSE(reservation.reserved().has_value());
+    EXPECT_GT(client1_sends, sends_at_reserve);
+  }
+
+  // A message over kBurstBytes can never fit and is never reserved.
+  ClientRotation<int> rotation;
+  SharedReservation<int> reservation;
+  rotation.Add(0);
+  reservation.Pass(rotation, 0, [&](int idx) {
+    reservation.BlockedOnShared(
+        idx, static_cast<std::size_t>(EgressBudget::kBurstBytes) + 1,
+        ClientFeeds::Feed::kGraph);
+    return false;
+  });
+  reservation.Pass(rotation, kSharedReserveDelayNs, [&](int idx) {
+    reservation.BlockedOnShared(
+        idx, static_cast<std::size_t>(EgressBudget::kBurstBytes) + 1,
+        ClientFeeds::Feed::kGraph);
+    return false;
+  });
+  EXPECT_FALSE(reservation.reserved().has_value());
+  EXPECT_EQ(reservation.NextDueNs(), kNeverNs);
+}
+
+// REQ-OPS-23
+// Multiple clients waiting simultaneously on large messages are served FIFO
+// (tie-broken by rotation order) within kSharedReserveDelayNs + k * G / R.
+TEST(SharedReservation, MultipleWaitingLargeClientsAreServedFifoWithinBound) {
+  constexpr std::size_t kLargeClients = 4;
+  constexpr std::size_t kTotalClients = 8;
+  constexpr double kSharedRate = 160000;
+  constexpr double kClientRate =
+      kSharedRate / static_cast<double>(kTotalClients);
+  constexpr std::size_t kLarge = 60000;
+  constexpr std::size_t kSmall = 1000;
+
+  ClientRotation<std::size_t> rotation;
+  SharedReservation<std::size_t> reservation;
+  std::vector<EgressBudget> own(kTotalClients);
+  std::vector<bool> large_done(kLargeClients, false);
+  std::vector<std::size_t> completion_order;
+  std::vector<std::int64_t> completion_ns(kLargeClients, -1);
+  for (std::size_t i = 0; i < kTotalClients; ++i) rotation.Add(i);
+
+  EgressBudget shared;
+  ASSERT_TRUE(shared.available(0, kSharedRate, 0));
+  shared.spend(static_cast<std::size_t>(EgressBudget::kBurstBytes));
+
+  for (std::int64_t now = 0; now <= 3'000'000'000; now += 1'000'000) {
+    reservation.Pass(rotation, now, [&](std::size_t idx) {
+      const bool needs_large = idx < kLargeClients && !large_done[idx];
+      const std::size_t want = needs_large ? kLarge : kSmall;
+      if (!reservation.MaySpend(idx, want, own[idx], kClientRate, now)) {
+        return false;
+      }
+      const bool fits_own = own[idx].available(want, kClientRate, now);
+      const bool fits_shared = shared.available(want, kSharedRate, now);
+      if (!fits_own || !fits_shared) {
+        if (fits_own) {
+          reservation.BlockedOnShared(idx, want, ClientFeeds::Feed::kGraph);
+        }
+        return false;
+      }
+      own[idx].spend(want);
+      shared.spend(want);
+      reservation.OnSend(idx);
+      if (needs_large) {
+        large_done[idx] = true;
+        completion_order.push_back(idx);
+        completion_ns[idx] = now;
+      }
+      return true;
+    });
+  }
+
+  ASSERT_EQ(completion_order, (std::vector<std::size_t>{0, 1, 2, 3}));
+  const std::int64_t per_client_ns = static_cast<std::int64_t>(
+      std::ceil(static_cast<double>(kLarge) / kSharedRate * 1e9));
+  for (std::size_t i = 0; i < kLargeClients; ++i) {
+    EXPECT_LE(completion_ns[i],
+              kSharedReserveDelayNs +
+                  static_cast<std::int64_t>(i + 1) * per_client_ns + 1'000'000)
+        << "large client " << i;
+  }
+}
+
 }  // namespace
 }  // namespace studio
