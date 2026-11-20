@@ -3,11 +3,11 @@
 // Robot configuration: TOML -> hardware::Config plus per-subsystem ownership.
 //
 // One layout: optional `include = "base.toml"`, [robot], optional [studio],
-// and [subsystems.<name>] tables. [[subsystems]] { name, path, node?,
-// defaults? } entries are an include over it: each file (path relative to
-// robot.toml) maps its [subsystem] header and tables to [subsystems.<name>],
-// optionally layered over a `defaults` TOML file, the entry's `node` winning;
-// then it parses as one file.
+// optional [simulation], and [subsystems.<name>] tables. [[subsystems]] { name,
+// path, node?, defaults? } entries are an include over it: each file (path
+// relative to robot.toml) maps its [subsystem] header and tables to
+// [subsystems.<name>], optionally layered over a `defaults` TOML file, the
+// entry's `node` winning; then it parses as one file.
 //
 // Device tables per subsystem: motors (type "TalonFX"), sensors (type
 // "CANcoder" or "Pigeon2"), digital_inputs, digital_outputs, analog_inputs,
@@ -100,6 +100,25 @@ struct TeleopBinding {
   bool operator==(const TeleopBinding&) const = default;
 };
 
+struct SimulationSwerveModule {
+  std::string drive;
+  std::string steer;
+  double x_m{0.0};
+  double y_m{0.0};
+
+  bool operator==(const SimulationSwerveModule&) const = default;
+};
+
+// Optional `[simulation]` table: physics simulator geometry that stays off the
+// hardware wire and never affects hardware::ConfigurationId.
+struct SimulationConfig {
+  static constexpr double kDefaultWheelRadiusM = 0.0508;
+  double wheel_radius_m{kDefaultWheelRadiusM};
+  std::vector<SimulationSwerveModule> swerve_modules;
+
+  bool operator==(const SimulationConfig&) const = default;
+};
+
 struct RobotConfig {
   hardware::Config hardware;
   std::map<std::string, hardware::Devices> subsystems;
@@ -156,6 +175,7 @@ struct RobotConfig {
     std::string dashboard;
   };
   StudioConfig studio;
+  SimulationConfig simulation;
 
   const hardware::Devices* GetDevices(const std::string& subsystem) const {
     auto it = subsystems.find(subsystem);
@@ -311,7 +331,7 @@ inline uint16_t ReadPort(const toml::table& tbl, const char* key, uint16_t def,
 inline void CheckTopLevelKeys(const toml::table& tbl) {
   for (auto&& [k, v] : tbl) {
     if (k.str() != "include" && k.str() != "robot" && k.str() != "studio" &&
-        k.str() != "subsystems") {
+        k.str() != "simulation" && k.str() != "subsystems") {
       throw std::invalid_argument("unknown top-level key '" +
                                   std::string(k.str()) + "'");
     }
@@ -1470,6 +1490,104 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
       check_ref("drive", is_motor);
       check_ref("steer", is_motor);
       check_ref("encoder", detail::IsCANcoder);
+    }
+  }
+
+  if (tbl.contains("simulation")) {
+    const auto* sim = tbl["simulation"].as_table();
+    if (sim == nullptr) {
+      throw std::invalid_argument("[simulation] must be a table");
+    }
+    for (auto&& [k, v] : *sim) {
+      if (k.str() != "wheel_radius_m" && k.str() != "swerve_modules") {
+        throw std::invalid_argument("[simulation] unknown key '" +
+                                    std::string(k.str()) + "'");
+      }
+    }
+    auto& s = result.simulation;
+    if (sim->contains("wheel_radius_m")) {
+      const double radius = Read<double>(*sim, "wheel_radius_m", 0.0);
+      if (!std::isfinite(radius) || radius <= 0.0) {
+        throw std::invalid_argument(
+            "[simulation] field 'wheel_radius_m' must be finite and positive");
+      }
+      s.wheel_radius_m = radius;
+    }
+    if (sim->contains("swerve_modules")) {
+      const auto* modules = (*sim)["swerve_modules"].as_array();
+      if (modules == nullptr) {
+        throw std::invalid_argument(
+            "[simulation] field 'swerve_modules' must be an array of tables");
+      }
+      std::vector<std::string> seen_motors;
+      s.swerve_modules.reserve(modules->size());
+      for (std::size_t i = 0; i < modules->size(); ++i) {
+        const std::string entry_where =
+            "[simulation] swerve_modules[" + std::to_string(i) + "]";
+        const auto* entry = (*modules)[i].as_table();
+        if (entry == nullptr) {
+          throw std::invalid_argument(entry_where + " must be a table");
+        }
+        for (auto&& [k, v] : *entry) {
+          const std::string_view ks = k.str();
+          if (ks != "drive" && ks != "steer" && ks != "x_m" && ks != "y_m") {
+            throw std::invalid_argument(entry_where + " unknown key '" +
+                                        std::string(ks) + "'");
+          }
+        }
+        SimulationSwerveModule mod;
+        mod.drive = ReadRequired<std::string>(*entry, "drive", entry_where);
+        if (mod.drive.empty()) {
+          throw std::invalid_argument(
+              entry_where + " field 'drive' must be a non-empty string");
+        }
+        mod.steer = ReadRequired<std::string>(*entry, "steer", entry_where);
+        if (mod.steer.empty()) {
+          throw std::invalid_argument(
+              entry_where + " field 'steer' must be a non-empty string");
+        }
+        mod.x_m = ReadRequired<double>(*entry, "x_m", entry_where);
+        if (!std::isfinite(mod.x_m)) {
+          throw std::invalid_argument(entry_where +
+                                      " field 'x_m' must be finite");
+        }
+        mod.y_m = ReadRequired<double>(*entry, "y_m", entry_where);
+        if (!std::isfinite(mod.y_m)) {
+          throw std::invalid_argument(entry_where +
+                                      " field 'y_m' must be finite");
+        }
+        if (mod.x_m == 0.0 && mod.y_m == 0.0) {
+          throw std::invalid_argument(
+              entry_where + ": module position (0, 0) must be nonzero");
+        }
+        if (mod.drive == mod.steer) {
+          throw std::invalid_argument(
+              entry_where + ": drive and steer cannot be the same motor '" +
+              mod.drive + "'");
+        }
+        auto check_motor = [&](const char* role, const std::string& name) {
+          const bool is_motor = std::any_of(
+              raw_devices.begin(), raw_devices.end(),
+              [&](const detail::RawDevice& d) {
+                return d.name == name &&
+                       std::holds_alternative<hardware::MotorConfig>(d.config);
+              });
+          if (!is_motor) {
+            throw std::invalid_argument(entry_where + ": " + role + " '" +
+                                        name + "' names no configured motor");
+          }
+          if (std::find(seen_motors.begin(), seen_motors.end(), name) !=
+              seen_motors.end()) {
+            throw std::invalid_argument(
+                entry_where + ": motor '" + name +
+                "' is already used by another swerve module");
+          }
+          seen_motors.push_back(name);
+        };
+        check_motor("drive", mod.drive);
+        check_motor("steer", mod.steer);
+        s.swerve_modules.push_back(std::move(mod));
+      }
     }
   }
 

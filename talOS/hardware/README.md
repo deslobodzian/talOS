@@ -241,6 +241,15 @@ configuration fingerprint. `sim_gateway --physics` binds them from its own
 parse of `--config` (`PhysicsSimBackend::SetHomeSwitches`; the backend table
 below gives the switch's behaviour).
 
+An optional top-level `[simulation]` table configures physics chassis geometry:
+`wheel_radius_m` (positive finite double, default `0.0508` m) and
+`[[simulation.swerve_modules]]` entries (`drive`, `steer`, `x_m`, `y_m`, where
+`drive` and `steer` name distinct configured motors, no motor appears twice,
+and `(x_m, y_m)` is finite and nonzero). Like `motor_type` and `sim_motor`,
+`[simulation]` stays off the wire and out of `ConfigurationId`;
+`sim_gateway --physics` passes `wheel_radius_m` in `PhysicsOptions` and binds
+any `swerve_modules` with `PhysicsSimBackend::SetSwerveModules`.
+
 Each `[subsystems.<sub>.motors.<motor>.slot0]` (also `slot1`, `slot2`) accepts
 `gravity_type = "ElevatorStatic"` (default; alias `"Elevator"`) or
 `gravity_type = "ArmCosine"` (alias `"Arm"`). Gain `g` supplies constant
@@ -1122,13 +1131,17 @@ and field-frame velocity (m/s, rad/s). Each step converts every registered
 swerve wheel's surface velocity and steer azimuth into ground velocity, solves
 the rigid-body least-squares chassis motion, and integrates the field pose.
 Conventional `front`/`back` (`rear`), `left`/`right` drive/steer names infer
-module coordinates at ±0.30 m; `SetSwerveModuleGeometry` registers other names
-or dimensions. No gyro is required to compute truth.
+module coordinates at ±0.30 m when no explicit modules are set;
+`SetSwerveModules` binds explicit drive/steer pairs by motor name (surviving
+every later `Configure` and replacing name inference), and
+`SetSwerveModuleGeometry` overrides or registers modules by logical id. No gyro
+is required to compute truth.
 
-`sim::PhysicsOptions` selects the start pose and three deterministic errors
+`sim::PhysicsOptions` selects the start pose, nominal wheel radius
+(`wheel_radius_m`, default `0.0508` m), and three deterministic errors
 (all errors default to zero):
 
-- `wheel_radius_error_frac = e`: true radius is `0.0508 × (1 + e)` m.
+- `wheel_radius_error_frac = e`: true radius is `wheel_radius_m × (1 + e)` m.
   Rotor/encoder readings still measure wheel rotation faithfully; only ground
   travel changes, so odometry using the nominal radius drifts.
 - `wheel_slip_gain = g`: each module's slip fraction is
