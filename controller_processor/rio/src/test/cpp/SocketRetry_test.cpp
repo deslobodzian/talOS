@@ -193,6 +193,56 @@ TEST(SocketRetry, AFailingSpellThatKeepsTheSocketReportsItsStartAndEnd) {
             SendEvent::kNone);
 }
 
+// A non-blocking send refused with EAGAIN / EWOULDBLOCK
+// (UdpStatus::kWouldBlock, send buffer full) is counted and reported to the
+// loop without marking the socket lost, triggering a reopen, or ending an open
+// kSocketError spell. REQ-RT-22
+TEST(SocketRetry, WouldBlockCountsDropsAndKeepsTheSocketOpen) {
+  using SendEvent = SocketRetry::SendEvent;
+  using UdpStatus = talos::protocol::UdpStatus;
+  SocketRetry retry;
+  // Before the socket opens, a would-block status is ignored.
+  EXPECT_EQ(retry.ObserveSend(kStartUs, UdpStatus::kWouldBlock, 0),
+            SendEvent::kNone);
+  EXPECT_EQ(retry.would_block_count(), 0u);
+
+  ASSERT_EQ(retry.Poll(kStartUs, [] { return true; }),
+            SocketRetry::Event::kOpened);
+  const uint64_t burst_us = kStartUs + SocketRetry::kPeriodUs;
+  for (uint32_t i = 1; i <= 5; ++i) {
+    EXPECT_EQ(retry.ObserveSend(burst_us + i * kLoopPeriodUs,
+                                UdpStatus::kWouldBlock, 0),
+              SendEvent::kWouldBlock);
+    EXPECT_EQ(retry.would_block_count(), i);
+    EXPECT_TRUE(retry.open());
+    EXPECT_FALSE(retry.replacing());
+    EXPECT_EQ(retry.Poll(burst_us + i * kLoopPeriodUs,
+                         [] {
+                           ADD_FAILURE()
+                               << "kWouldBlock must not trigger reopen";
+                           return true;
+                         }),
+              SocketRetry::Event::kNone);
+  }
+
+  // A kWouldBlock during an open kSocketError spell does not end the spell or
+  // inflate spell_failures; a later kOk after kSpellQuietUs still recovers it.
+  const uint64_t fail_us = burst_us + 1'000'000;
+  EXPECT_EQ(retry.ObserveSend(fail_us, UdpStatus::kSocketError, ENOBUFS),
+            SendEvent::kFailing);
+  EXPECT_EQ(retry.ObserveSend(fail_us + SocketRetry::kSpellQuietUs,
+                              UdpStatus::kWouldBlock, 0),
+            SendEvent::kWouldBlock);
+  EXPECT_EQ(retry.would_block_count(), 6u);
+  EXPECT_EQ(retry.spell_failures(), 1u);
+  EXPECT_EQ(retry.spell_error(), ENOBUFS);
+  EXPECT_TRUE(retry.open());
+  EXPECT_EQ(
+      retry.ObserveSend(fail_us + SocketRetry::kSpellQuietUs + kLoopPeriodUs,
+                        UdpStatus::kOk, 0),
+      SendEvent::kRecovered);
+}
+
 #ifndef _WIN32
 // The port a bound socket holds; 0 when it has none.
 uint16_t BoundPort(int fd) {
