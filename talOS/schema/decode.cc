@@ -65,7 +65,8 @@ bool ValueSize(const reflection::Schema& schema, reflection::BaseType base,
         static_cast<std::size_t>(index) >= objects->size())
       return false;
     const auto* object = objects->Get(index);
-    if (!object->is_struct() || object->bytesize() <= 0) return false;
+    if (object == nullptr || !object->is_struct() || object->bytesize() <= 0)
+      return false;
     size = static_cast<std::size_t>(object->bytesize());
     return true;
   }
@@ -108,6 +109,18 @@ bool AppendValue(const reflection::Schema& schema, reflection::BaseType base,
   if (base == BaseType::ULong) {
     std::uint64_t value;
     std::memcpy(&value, data, sizeof value);
+    if (index >= 0) {
+      const reflection::Enum* enum_def = schema.enums()->Get(index);
+      if (enum_def != nullptr && enum_def->values() != nullptr) {
+        for (const reflection::EnumVal* named : *enum_def->values()) {
+          if (named != nullptr && named->name() != nullptr &&
+              static_cast<std::uint64_t>(named->value()) == value) {
+            out += named->name()->str();
+            return true;
+          }
+        }
+      }
+    }
     out += std::to_string(value);
     return true;
   }
@@ -117,11 +130,14 @@ bool AppendValue(const reflection::Schema& schema, reflection::BaseType base,
     return true;
   }
   if (index >= 0) {
-    for (const reflection::EnumVal* named :
-         *schema.enums()->Get(index)->values()) {
-      if (named->value() == value) {
-        out += named->name()->str();
-        return true;
+    const reflection::Enum* enum_def = schema.enums()->Get(index);
+    if (enum_def != nullptr && enum_def->values() != nullptr) {
+      for (const reflection::EnumVal* named : *enum_def->values()) {
+        if (named != nullptr && named->name() != nullptr &&
+            named->value() == value) {
+          out += named->name()->str();
+          return true;
+        }
       }
     }
   }
@@ -138,6 +154,11 @@ bool AppendStruct(const reflection::Schema& schema,
   // reflection lists fields by name; print them as declared.
   std::vector<const reflection::Field*> fields(object.fields()->begin(),
                                                object.fields()->end());
+  for (const reflection::Field* field : fields) {
+    if (field == nullptr || field->type() == nullptr ||
+        field->name() == nullptr)
+      return false;
+  }
   std::sort(fields.begin(), fields.end(),
             [](const reflection::Field* a, const reflection::Field* b) {
               return a->id() < b->id();
@@ -206,7 +227,9 @@ void AppendMessage(const std::string& bfbs, std::string_view name,
   }
   const reflection::Schema& schema = *reflection::GetSchema(bytes);
   const reflection::Object* object =
-      schema.objects()->LookupByKey(std::string{name}.c_str());
+      schema.objects() != nullptr
+          ? schema.objects()->LookupByKey(std::string{name}.c_str())
+          : nullptr;
   if (object == nullptr || !object->is_struct()) {
     out += "<schema has no struct ";
     out += name;

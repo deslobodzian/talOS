@@ -1,5 +1,6 @@
 #include "talOS/schema/field_path.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -70,15 +71,42 @@ void EncodeInteger(std::byte* dest, BaseType type, std::int64_t val,
   }
 }
 
+constexpr int kMaxDepth = 32;
+
+std::string ObjectName(const reflection::Object& object) {
+  return object.name() != nullptr ? object.name()->str() : "(unnamed)";
+}
+
 void AppendScalarPaths(const reflection::Schema& schema,
                        const reflection::Object& object,
                        const std::string& prefix,
-                       std::vector<std::string>& paths) {
+                       std::vector<std::string>& paths, int depth) {
+  if (depth >= kMaxDepth || object.fields() == nullptr) return;
+  std::vector<const reflection::Field*> fields;
+  fields.reserve(object.fields()->size());
   for (const auto* field : *object.fields()) {
+    if (field == nullptr || field->name() == nullptr ||
+        field->type() == nullptr) {
+      continue;
+    }
+    fields.push_back(field);
+  }
+  std::sort(fields.begin(), fields.end(),
+            [](const reflection::Field* a, const reflection::Field* b) {
+              return a->id() < b->id();
+            });
+  for (const auto* field : fields) {
     const std::string path = prefix + field->name()->str();
     if (field->type()->base_type() == BaseType::Obj) {
-      AppendScalarPaths(schema, *schema.objects()->Get(field->type()->index()),
-                        path + "/", paths);
+      const auto* objects = schema.objects();
+      const std::int32_t idx = field->type()->index();
+      if (objects == nullptr || idx < 0 ||
+          static_cast<std::size_t>(idx) >= objects->size()) {
+        continue;
+      }
+      const auto* next = objects->Get(idx);
+      if (next == nullptr || !next->is_struct()) continue;
+      AppendScalarPaths(schema, *next, path + "/", paths, depth + 1);
     } else {
       paths.push_back(path);
     }
@@ -98,6 +126,13 @@ ResolvedField ResolveField(const reflection::Schema& schema,
                            const reflection::Object& root,
                            std::string_view field_path,
                            std::string_view where) {
+  if (field_path.empty()) {
+    throw std::invalid_argument(std::string{where} + ": empty field path");
+  }
+  if (field_path.front() == '/' || field_path.back() == '/') {
+    throw std::invalid_argument(std::string{where} + ": invalid field path '" +
+                                std::string{field_path} + "'");
+  }
   const reflection::Object* curr_obj = &root;
   std::size_t curr_offset = 0;
   std::vector<std::string> segments;
@@ -108,32 +143,50 @@ ResolvedField ResolveField(const reflection::Schema& schema,
       segments.emplace_back(field_path.substr(pos));
       break;
     }
-    segments.emplace_back(field_path.substr(pos, next - pos));
+    const std::string_view segment = field_path.substr(pos, next - pos);
+    if (segment.empty()) {
+      throw std::invalid_argument(std::string{where} +
+                                  ": invalid field path '" +
+                                  std::string{field_path} + "'");
+    }
+    segments.emplace_back(segment);
     pos = next + 1;
-  }
-  if (segments.empty()) {
-    throw std::invalid_argument(std::string{where} + ": empty field path");
   }
 
   for (std::size_t s = 0; s < segments.size(); ++s) {
     const std::string& seg = segments[s];
+    if (curr_obj->fields() == nullptr) {
+      throw std::invalid_argument(std::string{where} + ": no fields in " +
+                                  ObjectName(*curr_obj));
+    }
     const reflection::Field* field = nullptr;
     for (const auto* f : *curr_obj->fields()) {
-      if (f->name()->str() == seg) {
+      if (f != nullptr && f->name() != nullptr && f->name()->str() == seg) {
         field = f;
         break;
       }
     }
     if (field == nullptr) {
       throw std::invalid_argument(std::string{where} + ": no field '" + seg +
-                                  "' in " + curr_obj->name()->str());
+                                  "' in " + ObjectName(*curr_obj));
+    }
+    if (field->type() == nullptr) {
+      throw std::invalid_argument(std::string{where} + ": field '" + seg +
+                                  "' has no type");
     }
     if (s + 1 < segments.size()) {
       if (field->type()->base_type() != BaseType::Obj) {
         throw std::invalid_argument(std::string{where} + ": '" + seg +
                                     "' is not a nested struct");
       }
-      const auto* next_obj = schema.objects()->Get(field->type()->index());
+      const auto* objects = schema.objects();
+      const std::int32_t idx = field->type()->index();
+      if (objects == nullptr || idx < 0 ||
+          static_cast<std::size_t>(idx) >= objects->size()) {
+        throw std::invalid_argument(std::string{where} + ": '" + seg +
+                                    "' has invalid struct index");
+      }
+      const auto* next_obj = objects->Get(idx);
       if (next_obj == nullptr || !next_obj->is_struct()) {
         throw std::invalid_argument(std::string{where} + ": '" + seg +
                                     "' is not a struct");
@@ -149,10 +202,11 @@ ResolvedField ResolveField(const reflection::Schema& schema,
                                   "' must be a scalar");
     }
     const reflection::Enum* enum_def = nullptr;
-    if (field->type()->index() >= 0 &&
-        field->type()->index() <
-            static_cast<std::int32_t>(schema.enums()->size())) {
-      enum_def = schema.enums()->Get(field->type()->index());
+    const auto* enums = schema.enums();
+    const std::int32_t enum_idx = field->type()->index();
+    if (enums != nullptr && enum_idx >= 0 &&
+        static_cast<std::size_t>(enum_idx) < enums->size()) {
+      enum_def = enums->Get(enum_idx);
     }
     return ResolvedField{
         .offset = curr_offset + field->offset(),
@@ -160,7 +214,7 @@ ResolvedField ResolveField(const reflection::Schema& schema,
         .size = ScalarSize(base),
         .enum_def = enum_def,
         .leaf_name = seg,
-        .enclosing_name = curr_obj->name()->str(),
+        .enclosing_name = ObjectName(*curr_obj),
     };
   }
   throw std::logic_error("unreachable");
@@ -169,7 +223,7 @@ ResolvedField ResolveField(const reflection::Schema& schema,
 std::vector<std::string> ScalarPaths(const reflection::Schema& schema,
                                      const reflection::Object& root) {
   std::vector<std::string> paths;
-  AppendScalarPaths(schema, root, "", paths);
+  AppendScalarPaths(schema, root, "", paths, 0);
   return paths;
 }
 
@@ -190,17 +244,27 @@ void EncodeField(std::byte* message, const ResolvedField& field,
     }
     const std::string& label = std::get<std::string>(value);
     const reflection::EnumVal* ev = nullptr;
-    for (const auto* val : *field.enum_def->values()) {
-      if (val->name()->str() == label) {
-        ev = val;
-        break;
+    if (field.enum_def->values() != nullptr) {
+      for (const auto* val : *field.enum_def->values()) {
+        if (val != nullptr && val->name() != nullptr &&
+            val->name()->str() == label) {
+          ev = val;
+          break;
+        }
       }
     }
     if (ev == nullptr) {
+      const std::string enum_name = field.enum_def->name() != nullptr
+                                        ? field.enum_def->name()->str()
+                                        : "(unnamed)";
       throw std::invalid_argument(at + ": unknown enum label '" + label +
-                                  "' in " + field.enum_def->name()->str());
+                                  "' in " + enum_name);
     }
     EncodeInteger(dest, field.base_type, ev->value(), where);
+  } else if (field.base_type != BaseType::Float &&
+             field.base_type != BaseType::Double &&
+             std::holds_alternative<std::int64_t>(value)) {
+    EncodeInteger(dest, field.base_type, std::get<std::int64_t>(value), where);
   } else {
     double val = 0.0;
     if (std::holds_alternative<std::int64_t>(value)) {
