@@ -580,11 +580,11 @@ joining client's 64,000 B dictionary and keyframe, takes several round trips,
 during which the client is held. HTTP snapshots and static files are outside
 this budget.
 
-160,000 B/s is **1.28 Mbit/s, 32 %** of the **4 Mbit/s** per-team field
-bandwidth limit that WPILib's networking documentation and the FMS whitepaper
-state, citing 2026 manual rule R704. Both the figure and the rule number are
-unverified against the 2026 manual text itself; the event's current
-allocation is authoritative. A full keyframe every tick of the bench's
+160,000 B/s is **1.28 Mbit/s**: **18.3 %** of the **7.0 Mbit/s** per-team
+field bandwidth limit for Vivid Hosting VH-109 radios (and **32 %** of the
+**4.0 Mbit/s** limit for OpenMesh radios) in the 2026 FRC Game Manual
+(Section 8, Rule R704); the event's current allocation is authoritative. A full
+keyframe every tick of the bench's
 physics-simulation graph would be its 1952 B worst case (the telemetry
 table above), 195,200 B/s at 100 Hz, more than the whole budget; the
 change-only updates carry only what changed. The system graph goes to a
