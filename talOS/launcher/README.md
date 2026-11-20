@@ -1768,7 +1768,8 @@ launcher's `talos.log` says were dropped (a member's `<name>.log`,
 `talos.log` itself, the launcher's stdout or stderr, with the count; NOT
 RECORDED for a manifest without `launcher_log`; informational, since the
 output logs are not the measured record), an unfinished
-session, state inter-arrival median/nearest-rank p99/max,
+session, state inter-arrival min/median/nearest-rank p99/max, missed
+`/hw/state` sequence counts per boot (`state_sequence_gaps`),
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
 lateness, the bridge's request-to-command delay in enabled and disabled
 time, the [latency rows](#latency-rows), every scalar `/hw/status` field,
@@ -1945,7 +1946,7 @@ other. A RoboRIO time (`sample_time_us`, `observed_time_us`) is only matched
 or ordered against another of the same `boot_id`, never subtracted from a
 main-processor one, whose mapping to it is uncertain by milliseconds
 ([gateway clock accuracy](../../docs/DATA_FLOW.md#gateway-clock-accuracy)).
-Each row is p50 (median), nearest-rank p99
+Each row is min, p50 (median), nearest-rank p99
 and max with its count, as the timing rows are, and NOT MEASURED when it has
 no sample (never 0). The rows are informational: `--strict` judges none of
 them, since REQ-RT-26's bound is judged at the bench.
