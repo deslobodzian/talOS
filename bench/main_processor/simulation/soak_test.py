@@ -126,6 +126,11 @@ def joystick_schedule(teleop_s):
     return "0:axes=0,0,0,0,0,0;buttons=0;pov=-1|" + "|".join(entries)
 
 
+def _sigterm_to_exit(signum, _frame):
+    """Turn SIGTERM into SystemExit so finally: cleanup always runs."""
+    raise SystemExit(128 + signum)
+
+
 class Soak(unittest.TestCase):
     def read_nodes(self, manifest_path):
         return {n["name"]: n for n in json.loads(manifest_path.read_text())["nodes"]}
@@ -238,6 +243,7 @@ class Soak(unittest.TestCase):
         launcher = None
         stopped = None
         success = False
+        previous_sigterm = signal.signal(signal.SIGTERM, _sigterm_to_exit)
         try:
             (tmp / "bazel-bin").symlink_to(root, target_is_directory=True)
             duration = 2 * LEAD_S + teleop_s
@@ -566,32 +572,35 @@ class Soak(unittest.TestCase):
                 self.assertTrue(fresh, f"{DRIVE} active without fresh target at {t:.1f} ms")
             success = True
         finally:
-            if stopped is not None:
-                try:
-                    os.kill(stopped, signal.SIGCONT)
-                except ProcessLookupError:
-                    pass
-            if launcher is not None:
-                if launcher.poll() is None and not success:
+            try:
+                if stopped is not None:
                     try:
-                        os.killpg(launcher.pid, signal.SIGKILL)
+                        os.kill(stopped, signal.SIGCONT)
                     except ProcessLookupError:
                         pass
-                launcher.wait(timeout=10)
-            (tmp / "bazel-bin").unlink(missing_ok=True)
-            if success:
-                shutil.rmtree(tmp)
-            else:
-                print(f"Soak artifacts retained: {tmp}", flush=True)
-                launcher_log = tmp / "launcher.txt"
-                if launcher_log.exists():
-                    print(launcher_log.read_text(errors="replace")[-20000:], flush=True)
-                # The launcher reports only how each bridge run ended (exit
-                # code or signal); the bridge's own reason (webroot, HTTP
-                # listen, config) is in its log.
-                for bridge_log in output.glob("*/studio_bridge.log"):
-                    print(f"{bridge_log}:\n" +
-                          bridge_log.read_text(errors="replace")[-4000:], flush=True)
+                if launcher is not None:
+                    if launcher.poll() is None and not success:
+                        try:
+                            os.killpg(launcher.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    launcher.wait(timeout=10)
+                (tmp / "bazel-bin").unlink(missing_ok=True)
+                if success:
+                    shutil.rmtree(tmp)
+                else:
+                    print(f"Soak artifacts retained: {tmp}", flush=True)
+                    launcher_log = tmp / "launcher.txt"
+                    if launcher_log.exists():
+                        print(launcher_log.read_text(errors="replace")[-20000:], flush=True)
+                    # The launcher reports only how each bridge run ended (exit
+                    # code or signal); the bridge's own reason (webroot, HTTP
+                    # listen, config) is in its log.
+                    for bridge_log in output.glob("*/studio_bridge.log"):
+                        print(f"{bridge_log}:\n" +
+                              bridge_log.read_text(errors="replace")[-4000:], flush=True)
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":
