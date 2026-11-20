@@ -47,6 +47,7 @@ async function run() {
   model.clock = now;
   root.innerHTML = renderShell(layout);
   const status = root.querySelector('.status-slot')!;
+  const drawError = root.querySelector('.draw-error')!;
   const grid = root.querySelector<HTMLElement>('.grid')!;
   const body = (e: Element) => e.querySelector<HTMLElement>('.body');
   // Each list widget's body shows whole rows only: its height snapped to a
@@ -64,6 +65,9 @@ async function run() {
   const surface: Surface<Element> = {
     status: html => {
       status.innerHTML = html;
+    },
+    drawError: html => {
+      drawError.innerHTML = html;
     },
     create: html => {
       const template = document.createElement('template');
@@ -105,14 +109,16 @@ async function run() {
   grid.addEventListener('scroll', countOutOfView, {capture: true, passive: true});
   window.addEventListener('resize', countOutOfView);
   // A drawing fault must not stop the page or leave the grid looking
-  // current: Painter reports it, and the grid is marked until a good draw.
+  // current: Painter keeps the status line visible, shows DRAWING ERROR, and
+  // marks the grid until a good draw.
   const painter = new Painter(surface);
   const schedule = new DrawSchedule(model, t => {
-    painter.paint(() => {
-      model.tick(t);
-      return {status: renderStatus(model, t, layout.skipped),
-              widgets: layout.widgets.map(w => renderWidget(w, model, t))};
-    });
+    painter.paint(
+        () => {
+          model.tick(t);
+          return renderStatus(model, t, layout.skipped);
+        },
+        () => layout.widgets.map(w => renderWidget(w, model, t)));
     countOutOfView();
   }, {
     now,

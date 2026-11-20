@@ -9,7 +9,10 @@ repository's checklist, beside its `[studio] dashboard` layout.
 
 Open the driver dashboard on the Driver Station laptop:
 `http://10.56.87.11:5800/drive` (`http://<main processor>:5800/drive`; what
-it draws: [Studio README](../studio/README.md#driver-dashboard)). The boot
+it draws: [Studio README](../studio/README.md#driver-dashboard)). Full screen
+at 1366x768 (or 1280x720) every list fits without scrolling; above a docked
+Driver Station the viewport is shorter and lists scroll (the heading shows
+how many rows are out of view). The boot
 service, or `run.sh`, starts the Studio bridge that serves it
 ([DEPLOYMENT.md](DEPLOYMENT.md#build-a-bundle)). The full Studio at `/` is
 for the pit. A widget dimmed and tagged
@@ -27,7 +30,8 @@ check below.
 
 ## Driver dashboard, top to bottom
 
-- [ ] Status line reads **OK** `Connected: telemetry current`. Otherwise:
+- [ ] Status line reads **OK** `Connected: telemetry current` (a session with
+  no hardware bridge adds `(RoboRIO link not judged: no hardware bridge)`). Otherwise:
 
   | Status line | Meaning | Do |
   |---|---|---|
@@ -39,6 +43,7 @@ check below.
   | **HARDWARE BRIDGE** `Hardware bridge not publishing` | no hardware status: the hardware bridge (`hardware_node`) on the main processor is not publishing, so the RoboRIO link cannot be judged | check Subsystems below |
   | `/drive` shows `Studio's pages are missing from the installed bundle` (or `are not built`) instead of the dashboard | the bridge runs, but the installed bundle has no dashboard pages | with the robot disabled, install a bundle built from the current checkout and restart the service ([DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor)); installing the same bundle again changes nothing |
   | **REPLACED** | another `/drive` page took this page's slot (the layout's `drive_clients` are held) | close the other page, then press Reconnect, which takes the oldest page's slot |
+  | **DRAWING ERROR** `The dashboard is not updating; reload the page` | a widget threw while drawing; the top status line stays live while the grid keeps its last drawn values, dimmed and outlined in red | reload the page |
 
 - [ ] Match: `DISABLED`; the alliance and station are the assigned ones; at
   the field, the match number and `FMS`. `NO DRIVER STATION`: the main

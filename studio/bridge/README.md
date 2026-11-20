@@ -394,10 +394,10 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   | `session` | string | the launcher's session id (the manifest's `session_id`), else a live registry row's, else `""` |
   | `supervised` | bool | the manifest was read; when false, `restarts` 0 and `quarantined` false mean unknown, not none |
   | `registry` | bool | the live registry could be read at this refresh; when false, every `alive` false and `drives` null mean unknown, not dead |
-  | `nodes` | array | with a manifest, every member of its `nodes` in its order but the Studio bridge itself (`studio_bridge`), so `sim_gateway` too when the launcher supervises one; without a manifest, or while it lists no member yet, every node the config launches: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
+  | `nodes` | array | with a manifest, every member of its `nodes` in its order, `sim_gateway` and `studio_bridge` included when the launcher supervises them; without a manifest, or while it lists no member yet, every node the config launches: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
   | `nodes[].name` | string | the node name |
-  | `nodes[].alive` | bool | a live registry row of that name exists (a node that never registered, or died, is false) |
-  | `nodes[].critical` | bool | the config's `critical` for that subsystem (default true); true for a member the config does not list (`hardware_node`, `sim_gateway`) |
+  | `nodes[].alive` | bool | a live registry row of that name exists (a node that never registered, or died, is false; the launcher-added `studio_bridge`, which serves the summary, is true whenever the registry is readable) |
+  | `nodes[].critical` | bool | the config's `critical` for that subsystem (default true); false for the launcher-added `studio_bridge`, and true for other members the config does not list (`hardware_node`, `sim_gateway`) |
   | `nodes[].restarts` | number | the manifest's `restart_count` for the node |
   | `nodes[].quarantined` | bool | the manifest's `quarantined` for the node |
   | `nodes[].drives` | string or null | the target lane source (`teleop`, `auto`, ...) its first `Target` with a selection last selected; null when it is not alive, reads no target, or its `Target::get()` was last null |

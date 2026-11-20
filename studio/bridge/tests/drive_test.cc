@@ -382,10 +382,10 @@ TEST(DriveSummary, CapKeepsWholeNodesAndCountsTheRest) {
 // REQ-OPS-35
 // The summary says what the `subsystems` widget shows and channels cannot:
 // each member the launcher supervises, in its manifest's order (the sim
-// gateway the config does not list included, the Studio bridge itself
-// left out), alive from the registry (a dead node raises no alert), its
-// lane from its Target's selection, restarts and quarantine from the
-// manifest, critical from the config by name. Without a manifest the
+// gateway and the Studio bridge included, with `studio_bridge` non-critical so
+// its restarts show on /drive), alive from the registry (a dead node raises no
+// alert), its lane from its Target's selection, restarts and quarantine from
+// the manifest, critical from the config by name. Without a manifest the
 // config's roster is listed and it says so instead of reporting zero
 // restarts as a fact.
 TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
@@ -393,7 +393,7 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
                                              {"drivetrain", true},
                                              {"intake", false},
                                              {"shooter", true}};
-  std::vector<talos::introspect::NodeSnapshot> registry(3);
+  std::vector<talos::introspect::NodeSnapshot> registry(4);
   registry[0].name = "hardware_node";
   registry[0].alive = true;
   registry[0].session_id = 41;
@@ -403,6 +403,8 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   registry[2].name = "intake";  // its row outlived it
   registry[2].alive = false;
   registry[2].selections.push_back({{"teleop"}, 1, 0});
+  registry[3].name = "studio_bridge";
+  registry[3].alive = true;
   // As the launcher writes it with the simulation's gateway and Studio.
   const std::string manifest =
       R"({"session_id": 42, "nodes": [)"
@@ -411,7 +413,7 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
       R"({"name": "intake", "restart_count": 5, "quarantined": true},)"
       R"({"name": "shooter", "restart_count": 0, "quarantined": false},)"
       R"({"name": "sim_gateway", "restart_count": 2, "quarantined": false},)"
-      R"({"name": "studio_bridge", "restart_count": 0, "quarantined": false}]})";
+      R"({"name": "studio_bridge", "restart_count": 3, "quarantined": false}]})";
 
   const DriveSummary summary = BuildDriveSummary(config, &registry, manifest);
   EXPECT_EQ(summary.session, "42");
@@ -419,9 +421,9 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   std::vector<std::string> names;
   names.reserve(summary.nodes.size());
   for (const auto& node : summary.nodes) names.push_back(node.name);
-  ASSERT_EQ(names,
-            (std::vector<std::string>{"hardware_node", "drivetrain", "intake",
-                                      "shooter", "sim_gateway"}));
+  ASSERT_EQ(names, (std::vector<std::string>{"hardware_node", "drivetrain",
+                                             "intake", "shooter", "sim_gateway",
+                                             "studio_bridge"}));
   const auto& hardware = summary.nodes[0];
   EXPECT_TRUE(hardware.alive);
   EXPECT_FALSE(hardware.drives.has_value());
@@ -439,6 +441,11 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   const auto& gateway = summary.nodes[4];
   EXPECT_EQ(gateway.restarts, 2u);
   EXPECT_TRUE(gateway.critical) << "a member the config does not list";
+  const auto& bridge = summary.nodes[5];
+  EXPECT_TRUE(bridge.alive);
+  EXPECT_FALSE(bridge.critical) << "studio_bridge is non-critical";
+  EXPECT_EQ(bridge.restarts, 3u);
+  EXPECT_FALSE(bridge.quarantined);
 
   const DriveSummary unsupervised =
       BuildDriveSummary(config, &registry, "{not json");
@@ -448,6 +455,157 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   EXPECT_EQ(unsupervised.nodes[2].name, "intake");
   EXPECT_FALSE(unsupervised.nodes[2].critical);
   EXPECT_EQ(unsupervised.nodes[2].restarts, 0u);
+}
+
+// REQ-OPS-35
+// Integration of BuildDriveSummary and DriveSummaryJson against a full
+// launcher-shaped manifest.json (every key the launcher writes, including
+// hardware_node, subsystems, sim_gateway and studio_bridge): the JSON stays
+// valid and preserves restarts, quarantine, criticality and liveness, and a
+// serving studio_bridge stays alive even when the registry has no row for it.
+TEST(DriveSummary, BuildsFromLauncherManifestShape) {
+  const std::vector<DriveRosterEntry> config{{"hardware_node", true},
+                                             {"gyro", false},
+                                             {"swerve_module", true},
+                                             {"telemetry", false}};
+  std::vector<talos::introspect::NodeSnapshot> registry(3);
+  registry[0].name = "hardware_node";
+  registry[0].alive = true;
+  registry[0].session_id = 1794813782;
+  registry[1].name = "swerve_module";
+  registry[1].alive = true;
+  registry[1].selections.push_back({{"teleop", "auto"}, 2, 0});
+  registry[2].name = "telemetry";
+  registry[2].alive = true;
+  // Launcher manifest shape matching studio/tests/session_manifest.json plus
+  // studio_bridge with a restart and a quarantined gyro.
+  const std::string manifest = R"({
+    "session_id": 1794813782,
+    "config_path": "/home/robot/talos/bench/main_processor/configuration/robot_physics_sim.toml",
+    "config_sha256": "",
+    "git_revision": "",
+    "git_dirty": false,
+    "output_dir": "/tmp/talos_logs/1794813782",
+    "launcher_log": "/tmp/talos_logs/1794813782/talos.log",
+    "simulation": true,
+    "hardware_protocol_version": 8,
+    "start_wall_ns": 1794813796036418138,
+    "end_wall_ns": 0,
+    "stopped_before_start": false,
+    "nodes": [
+      {
+        "name": "hardware_node",
+        "target": "//talOS/bridge:hardware_node",
+        "binary_path": "bazel-bin/talOS/bridge/hardware_node",
+        "pid": 1205436,
+        "exit_code": 0,
+        "exit_signal": 0,
+        "restart_count": 0,
+        "quarantined": false,
+        "retry_at_monotonic_ns": 0,
+        "recorder_failed": false,
+        "log_capped": false,
+        "log_gap": false,
+        "described": true,
+        "endpoint_mismatch": false,
+        "loop_tier": "bridge",
+        "realtime": "not_requested",
+        "wake_failures": 0,
+        "stalled_arms": 0,
+        "wake_fallbacks": 0,
+        "requests_skipped": 0,
+        "requests_skipped_by_subsystem": {},
+        "record_count": 5254,
+        "runs_dropped": 0,
+        "runs": []
+      },
+      {
+        "name": "gyro",
+        "target": "//bench/main_processor/gyro:node",
+        "pid": 1205438,
+        "restart_count": 4,
+        "quarantined": true,
+        "loop_tier": "observer",
+        "runs": []
+      },
+      {
+        "name": "swerve_module",
+        "target": "//bench/main_processor/swerve_module:node",
+        "pid": 1205443,
+        "restart_count": 1,
+        "quarantined": false,
+        "loop_tier": "control",
+        "runs": []
+      },
+      {
+        "name": "telemetry",
+        "target": "//talOS/telemetry:node",
+        "pid": 1205448,
+        "restart_count": 0,
+        "quarantined": false,
+        "loop_tier": "observer",
+        "runs": []
+      },
+      {
+        "name": "sim_gateway",
+        "target": "//talOS/simulation:sim_gateway",
+        "pid": 1205452,
+        "restart_count": 0,
+        "quarantined": false,
+        "loop_tier": "bridge",
+        "runs": []
+      },
+      {
+        "name": "studio_bridge",
+        "target": "//studio/bridge:studio_bridge",
+        "pid": 1205455,
+        "restart_count": 2,
+        "quarantined": false,
+        "loop_tier": "observer",
+        "runs": []
+      }
+    ]
+  })";
+
+  const DriveSummary summary = BuildDriveSummary(config, &registry, manifest);
+  const std::string wire = DriveSummaryJson(summary);
+  ASSERT_LE(wire.size(), talos::telemetry_wire::kDriveSummaryMaxBytes);
+  const nlohmann::json parsed = nlohmann::json::parse(wire);
+  EXPECT_EQ(parsed["kind"], "talos.drive.summary");
+  EXPECT_EQ(parsed["session"], "1794813782");
+  EXPECT_EQ(parsed["supervised"], true);
+  EXPECT_EQ(parsed["registry"], true);
+  EXPECT_EQ(parsed["omitted"], 0);
+  ASSERT_EQ(parsed["nodes"].size(), 6u);
+
+  const auto& gyro = parsed["nodes"][1];
+  EXPECT_EQ(gyro["name"], "gyro");
+  EXPECT_EQ(gyro["alive"], false);
+  EXPECT_EQ(gyro["critical"], false);
+  EXPECT_EQ(gyro["restarts"], 4);
+  EXPECT_EQ(gyro["quarantined"], true);
+
+  const auto& swerve = parsed["nodes"][2];
+  EXPECT_EQ(swerve["name"], "swerve_module");
+  EXPECT_EQ(swerve["alive"], true);
+  EXPECT_EQ(swerve["critical"], true);
+  EXPECT_EQ(swerve["restarts"], 1);
+  EXPECT_EQ(swerve["drives"], "teleop");
+
+  const auto& bridge = parsed["nodes"][5];
+  EXPECT_EQ(bridge["name"], "studio_bridge");
+  EXPECT_EQ(bridge["alive"], true)
+      << "studio_bridge is serving this summary and has a readable registry";
+  EXPECT_EQ(bridge["critical"], false);
+  EXPECT_EQ(bridge["restarts"], 2);
+  EXPECT_EQ(bridge["quarantined"], false);
+
+  // Without a readable registry, studio_bridge stays alive: false with
+  // registry: false so the page still renders unknown instead of UP.
+  const DriveSummary unreadable = BuildDriveSummary(config, nullptr, manifest);
+  EXPECT_FALSE(unreadable.registry);
+  ASSERT_EQ(unreadable.nodes.size(), 6u);
+  EXPECT_FALSE(unreadable.nodes[5].alive);
 }
 
 // REQ-OPS-35

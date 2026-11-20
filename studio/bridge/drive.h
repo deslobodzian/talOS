@@ -266,8 +266,7 @@ struct DriveSummary {
 };
 
 // The name the Studio bridge goes by in the registry (Bridge::self) and in
-// the launcher's manifest (its kStudioBridgeName), so the drive summary,
-// which reports the nodes the bridge watches, leaves it out.
+// the launcher's manifest (its kStudioBridgeName).
 inline constexpr std::string_view kStudioBridgeNodeName = "studio_bridge";
 
 // A node the session's config launches: its name and whether the launcher
@@ -280,16 +279,18 @@ struct DriveRosterEntry {
 
 // The drive summary. Its nodes are the launcher's roster as its manifest
 // (`manifest_json`, empty when there is none) lists them, in that order:
-// every member it supervises (the sim gateway included) but the Studio
-// bridge, with `restarts` and `quarantined` from each entry and `critical`
-// from `config` by name (true for a member the config does not list, such
-// as the sim gateway). Without a manifest, or one listing no member yet,
-// they are `config`'s nodes in its order. `alive` and `drives` come from
-// the live registry's rows of that name (`registry`; nullptr when it could
-// not be read, and the summary then says `registry: false` rather than
-// every node dead as a fact). A manifest that does not parse is
-// treated as absent, so the summary says `supervised: false` rather than
-// zero restarts as a fact; the session then comes from the registry.
+// every member it supervises (the sim gateway and the Studio bridge
+// included), with `restarts` and `quarantined` from each entry and `critical`
+// from `config` by name (false for the launcher-added Studio bridge, true for
+// other members the config does not list, such as the sim gateway). Without a
+// manifest, or one listing no member yet, they are `config`'s nodes in its
+// order. `alive` and `drives` come from the live registry's rows of that name
+// (`registry`; nullptr when it could not be read, and the summary then says
+// `registry: false` rather than every node dead as a fact); when the registry
+// is readable, the launcher-added Studio bridge is always alive because it is
+// serving this summary. A manifest that does not parse is treated as absent,
+// so the summary says `supervised: false` rather than zero restarts as a fact;
+// the session then comes from the registry.
 inline DriveSummary BuildDriveSummary(
     const std::vector<DriveRosterEntry>& config,
     const std::vector<talos::introspect::NodeSnapshot>* registry,
@@ -330,12 +331,15 @@ inline DriveSummary BuildDriveSummary(
       }
       DriveSummaryNode node;
       node.name = row["name"].get<std::string>();
-      if (node.name == kStudioBridgeNodeName) continue;
       const auto listed = std::find_if(config.begin(), config.end(),
                                        [&node](const DriveRosterEntry& entry) {
                                          return entry.name == node.name;
                                        });
-      node.critical = listed == config.end() || listed->critical;
+      if (listed != config.end()) {
+        node.critical = listed->critical;
+      } else {
+        node.critical = node.name != kStudioBridgeNodeName;
+      }
       if (row.contains("restart_count") &&
           row["restart_count"].is_number_unsigned()) {
         node.restarts = row["restart_count"].get<std::uint64_t>();
@@ -366,6 +370,13 @@ inline DriveSummary BuildDriveSummary(
         }
       }
       break;
+    }
+    if (summary.registry && node.name == kStudioBridgeNodeName &&
+        std::none_of(config.begin(), config.end(),
+                     [&node](const DriveRosterEntry& entry) {
+                       return entry.name == node.name;
+                     })) {
+      node.alive = true;
     }
   }
   return summary;
