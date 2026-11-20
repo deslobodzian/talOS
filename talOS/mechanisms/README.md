@@ -178,10 +178,11 @@ on the next tick; a stall push keeps pushing meanwhile.
 Stall homing reads stator current. Component tests set it with
 `SimHardware::set_motor(..., stator_current_a)`. The physics simulator
 (`sim_gateway --physics`) models it as a winding, (applied volts - back-EMF)
-over the motor's resistance, clamped to `stator_limit_a`, so it peaks at
-stall and falls with speed: a 1 V homing push into a stop draws about 30 A on
-a Kraken X60, and stall homing with a realistic `homing_stall_current_a`
-homes there. Limit-switch homing homes against the physics backend's home
+over the motor's resistance, clamped to `stator_limit_a` (fed back into rotor
+dynamics), so it peaks at stall and falls with speed: a 1 V homing push into
+a `[[simulation.hard_stops]]` stop draws about 30 A on a Kraken X60, and stall
+homing with a realistic `homing_stall_current_a` homes there
+(`stall_homing_sim_test`). Limit-switch homing homes against the physics backend's home
 switch (`PhysicsSimBackend::SetHomeSwitches`, talOS/hardware/README.md
 "Simulation Backends"), which closes at a configured position of the motor.
 

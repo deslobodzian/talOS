@@ -241,14 +241,20 @@ configuration fingerprint. `sim_gateway --physics` binds them from its own
 parse of `--config` (`PhysicsSimBackend::SetHomeSwitches`; the backend table
 below gives the switch's behaviour).
 
-An optional top-level `[simulation]` table configures physics chassis geometry:
-`wheel_radius_m` (positive finite double, default `0.0508` m) and
+An optional top-level `[simulation]` table configures physics chassis geometry
+and end-of-travel hard stops:
+`wheel_radius_m` (positive finite double, default `0.0508` m),
 `[[simulation.swerve_modules]]` entries (`drive`, `steer`, `x_m`, `y_m`, where
 `drive` and `steer` name distinct configured motors, no motor appears twice,
-and `(x_m, y_m)` is finite and nonzero). Like `motor_type` and `sim_motor`,
-`[simulation]` stays off the wire and out of `ConfigurationId`;
-`sim_gateway --physics` passes `wheel_radius_m` in `PhysicsOptions` and binds
-any `swerve_modules` with `PhysicsSimBackend::SetSwerveModules`.
+and `(x_m, y_m)` is finite and nonzero), and `[[simulation.hard_stops]]`
+entries (`motor` naming a configured motor with no duplicates, optional finite
+`min_rot` and/or `max_rot` with at least one set and `min_rot < max_rot` when
+both are set, in mechanism rotations of the motor's hardware frame). Like
+`motor_type` and `sim_motor`, `[simulation]` stays off the wire and out of
+`ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` in
+`PhysicsOptions`, binds any `swerve_modules` with
+`PhysicsSimBackend::SetSwerveModules`, and binds any `hard_stops` with
+`PhysicsSimBackend::SetHardStops`.
 
 Each `[subsystems.<sub>.motors.<motor>.slot0]` (also `slot1`, `slot2`) accepts
 `gravity_type = "ElevatorStatic"` (default; alias `"Elevator"`) or
@@ -1108,11 +1114,12 @@ or without a live command. Both keep each PWM output's last request
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction; a follower drives in its master's direction (reversed if opposed), ignoring its own `inverted`; a remote-CANcoder motor reports and closes its loops on the CANcoder in the CANcoder's direction |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
+| Hard stops | Ignored | `SetHardStops` (`sim::HardStop`): physical end-of-travel bounds `[min_rot, max_rot]` per named motor (mechanism rotations in its hardware frame), enforced even when `soft_limits = false` (rezero-frame mechanisms); clamps position and zeroes velocity when driven into a stop so back-EMF drops to 0 and stator current rises to the stall/limited current while allowing motion away from the stop; bound by name, survives a pushed config. `sim_gateway --physics` binds `[[simulation.hard_stops]]` |
 | CANcoder position | Its motor's position, wrapped to [-0.5, 0.5) rotations as the RoboRIO reports it | The linked mechanism's, wrapped the same way |
 | Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
-| Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero torque, so a free rotor spins on (hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
-| Stator current | Zero | (applied volts - back-EMF) / R, clamped to `stator_limit_a`; R and free speed from the motor type's published 12 V stall current and free speed (`MotorModelFor`: Kraken X60 366 A and 6000 rpm, the default; Kraken X44 275 A and 7530 rpm; Falcon 500 257 A and 6380 rpm). A motor held at a soft limit is stalled. The type is the motor's `motor_type` key (above) |
+| Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`, using the same `R` and `k_e` as `StatorCurrent`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero stator current (slowly coasting only under the motor's no-load drag rather than braking; hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
+| Stator and supply current | Stator zero; supply placeholder `|voltage| / 12 × supply_limit_a` | Winding model with free current: `R = 12 V / stall_current`, `k_e = (12 V − free_current × R) / free_speed`, `back_emf = k_e × rotor_rps` (`MotorModelFor`: Kraken X60 6000 rpm, 366 A stall, 2.0 A free, default; Kraken X44 7530 rpm, 275 A stall, 2.0 A free; Falcon 500 6380 rpm, 257 A stall, 1.5 A free). Stator current is `|applied_volts − back_emf| / R` (equals `free_current` at 12 V free speed and `stall_current` at 12 V stall), 0 while unpowered. `stator_limit_a` and `supply_limit_a` clamp effective winding voltage before rotor integration and are reflected in `applied_volts_` and reported currents. Supply current follows power conservation `|applied_volts × stator_current| / supply_v` (clamped to `supply_limit_a`, 0 when unpowered or `supply_v <= 0`). A motor held at a hard stop or soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid) and per-device disconnect (invalid), each read as `PhoenixBackend` reads a device whose frames stopped: ages growing from its last sample, limit bits cleared once that sample is 50 ms old and temperature 0 once it is 500 ms old (`kFaultFieldMaxAgeUs`, `kTemperatureMaxAgeUs`, `feedback.h`); controller restart |
 | Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it (the gateway masks it in those States either way); completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |

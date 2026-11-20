@@ -109,12 +109,22 @@ struct SimulationSwerveModule {
   bool operator==(const SimulationSwerveModule&) const = default;
 };
 
-// Optional `[simulation]` table: physics simulator geometry that stays off the
-// hardware wire and never affects hardware::ConfigurationId.
+struct SimulationHardStop {
+  std::string motor;
+  std::optional<double> min_rot;
+  std::optional<double> max_rot;
+
+  bool operator==(const SimulationHardStop&) const = default;
+};
+
+// Optional `[simulation]` table: physics simulator geometry and end-of-travel
+// hard stops that stay off the hardware wire and never affect
+// hardware::ConfigurationId.
 struct SimulationConfig {
   static constexpr double kDefaultWheelRadiusM = 0.0508;
   double wheel_radius_m{kDefaultWheelRadiusM};
   std::vector<SimulationSwerveModule> swerve_modules;
+  std::vector<SimulationHardStop> hard_stops;
 
   bool operator==(const SimulationConfig&) const = default;
 };
@@ -1499,7 +1509,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
       throw std::invalid_argument("[simulation] must be a table");
     }
     for (auto&& [k, v] : *sim) {
-      if (k.str() != "wheel_radius_m" && k.str() != "swerve_modules") {
+      if (k.str() != "wheel_radius_m" && k.str() != "swerve_modules" &&
+          k.str() != "hard_stops") {
         throw std::invalid_argument("[simulation] unknown key '" +
                                     std::string(k.str()) + "'");
       }
@@ -1587,6 +1598,79 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
         check_motor("drive", mod.drive);
         check_motor("steer", mod.steer);
         s.swerve_modules.push_back(std::move(mod));
+      }
+    }
+    if (sim->contains("hard_stops")) {
+      const auto* stops = (*sim)["hard_stops"].as_array();
+      if (stops == nullptr) {
+        throw std::invalid_argument(
+            "[simulation] field 'hard_stops' must be an array of tables");
+      }
+      std::vector<std::string> seen_motors;
+      s.hard_stops.reserve(stops->size());
+      for (std::size_t i = 0; i < stops->size(); ++i) {
+        const std::string entry_where =
+            "[simulation] hard_stops[" + std::to_string(i) + "]";
+        const auto* entry = (*stops)[i].as_table();
+        if (entry == nullptr) {
+          throw std::invalid_argument(entry_where + " must be a table");
+        }
+        for (auto&& [k, v] : *entry) {
+          const std::string_view ks = k.str();
+          if (ks != "motor" && ks != "min_rot" && ks != "max_rot") {
+            throw std::invalid_argument(entry_where + " unknown key '" +
+                                        std::string(ks) + "'");
+          }
+        }
+        SimulationHardStop stop;
+        stop.motor = ReadRequired<std::string>(*entry, "motor", entry_where);
+        if (stop.motor.empty()) {
+          throw std::invalid_argument(
+              entry_where + " field 'motor' must be a non-empty string");
+        }
+        if (entry->contains("min_rot")) {
+          const double v = Read<double>(*entry, "min_rot", 0.0);
+          if (!std::isfinite(v)) {
+            throw std::invalid_argument(entry_where +
+                                        " field 'min_rot' must be finite");
+          }
+          stop.min_rot = v;
+        }
+        if (entry->contains("max_rot")) {
+          const double v = Read<double>(*entry, "max_rot", 0.0);
+          if (!std::isfinite(v)) {
+            throw std::invalid_argument(entry_where +
+                                        " field 'max_rot' must be finite");
+          }
+          stop.max_rot = v;
+        }
+        if (!stop.min_rot && !stop.max_rot) {
+          throw std::invalid_argument(
+              entry_where +
+              ": must specify at least one of 'min_rot' or 'max_rot'");
+        }
+        if (stop.min_rot && stop.max_rot && !(*stop.min_rot < *stop.max_rot)) {
+          throw std::invalid_argument(
+              entry_where + ": 'min_rot' must be less than 'max_rot'");
+        }
+        const bool is_motor = std::any_of(
+            raw_devices.begin(), raw_devices.end(),
+            [&](const detail::RawDevice& d) {
+              return d.name == stop.motor &&
+                     std::holds_alternative<hardware::MotorConfig>(d.config);
+            });
+        if (!is_motor) {
+          throw std::invalid_argument(entry_where + ": motor '" + stop.motor +
+                                      "' names no configured motor");
+        }
+        if (std::find(seen_motors.begin(), seen_motors.end(), stop.motor) !=
+            seen_motors.end()) {
+          throw std::invalid_argument(entry_where +
+                                      ": duplicate hard stop for motor '" +
+                                      stop.motor + "'");
+        }
+        seen_motors.push_back(stop.motor);
+        s.hard_stops.push_back(std::move(stop));
       }
     }
   }

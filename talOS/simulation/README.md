@@ -150,11 +150,16 @@ Physics-only flags (all values must be finite; supplying any without
 | `--wheel-slip-gain G` | `0` | Nonnegative acceleration-dependent traction loss |
 | `--gyro-drift-radps R` | `0` | Reported yaw bias grows by `R × elapsed_seconds`, yaw rate gains `R` |
 
-Nominal wheel radius and swerve module coordinates come from the optional
-top-level `[simulation]` table (`wheel_radius_m` and
-`[[simulation.swerve_modules]]` with `drive`, `steer`, `x_m`, `y_m`), falling
-back to `0.0508` m and ±0.30 m name inference when omitted; `[simulation]`
-never enters the hardware wire format or `ConfigurationId`
+Nominal wheel radius, swerve module coordinates, and mechanical end-of-travel
+hard stops come from the optional top-level `[simulation]` table
+(`wheel_radius_m`, `[[simulation.swerve_modules]]` with `drive`, `steer`,
+`x_m`, `y_m`, and `[[simulation.hard_stops]]` with `motor` and optional
+`min_rot` / `max_rot` in hardware mechanism rotations), falling back to
+`0.0508` m, ±0.30 m name inference, and no hard stops when omitted. Hard stops
+are enforced in `--physics` even when `soft_limits = false` (as required for
+rezero-frame mechanisms), stopping the rotor so back-EMF drops to zero and
+stator current rises for stall homing. `[simulation]` never enters the hardware
+wire format or `ConfigurationId`
 ([hardware configuration](../hardware/README.md#configuration)).
 
 Encoders truthfully measure wheel rotations; radius error changes ground
