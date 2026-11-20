@@ -112,7 +112,7 @@ def caller_stamp_overrides(args, env=None):
             i += 2
             continue
         if arg.startswith("-P") and len(arg) > 2:
-            if _is_stamp_project_prop(arg[2:]):
+            if _is_stamp_project_prop(arg[2:].removeprefix("=")):
                 found.append(arg)
         elif arg == "--project-prop" and i + 1 < len(args):
             if _is_stamp_project_prop(args[i + 1]):
@@ -128,7 +128,7 @@ def caller_stamp_overrides(args, env=None):
             i += 2
             continue
         elif arg.startswith("-D") and len(arg) > 2:
-            if _is_stamp_system_prop(arg[2:]):
+            if _is_stamp_system_prop(arg[2:].removeprefix("=")):
                 found.append(arg)
         elif arg == "--system-prop" and i + 1 < len(args):
             if _is_stamp_system_prop(args[i + 1]):
@@ -233,7 +233,15 @@ def cache_lock(cache_dir):
     os.makedirs(os.path.dirname(lock_path) or ".", mode=0o755, exist_ok=True)
     with open(lock_path, "a+", encoding="utf-8") as lock_file:
         os.set_inheritable(lock_file.fileno(), False)
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(
+                f"gradlew: waiting for cache lock {lock_path}...",
+                file=sys.stderr,
+                flush=True,
+            )
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield lock_path
         finally:
