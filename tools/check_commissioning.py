@@ -1,29 +1,32 @@
-"""Fails a commit that commissions a robot or changes a physical CAN id.
+"""Fails a commit that commissions a robot or changes a physical CAN id or bus.
 
     python3 tools/check_commissioning.py --base <rev>   # from the workspace
 
 RULES.md 4: an agent never sets `commissioned = true` or changes a physical
-CAN id in a robot config; a person does that at the robot
+CAN id (or moves a device to another CAN bus, which changes its physical CAN
+address) in a robot config; a person does that at the robot
 (docs/BRINGUP.md "Human commissioning"). This checks each commit in
 `merge-base(<rev>, HEAD)..HEAD` (a merged branch's commits included) on its
 own and reports every robot or bench config line it
 
-- adds that sets `commissioned = true`, or
-- adds or removes that holds a `can_id` key (the only key talOS/hardware
-  reads a CAN id from),
+- adds that sets `commissioned = true`,
+- adds or removes that holds a `can_id` key, or
+- adds or removes that holds a `bus` key
 
-in any spelling TOML accepts (bare, quoted or dotted key, inline table,
-trailing comment), but not in a comment or a string value. It over-reports
-rather than miss one: a config file moved, renamed or added whole, or a
-`can_id` line moved between files, also needs the trailer below. A merge
-commit's own change is its diff against git's automatic re-merge of its
-parents (`git show --remerge-diff`). A clean merge has none; a line
-written while resolving a conflict, or a stale copy of a config kept from
-one side (which can revert a person's change made on the other), shows.
-It over-reports a conflict resolved by picking one side of a `can_id`
-line: the side not picked reads as removed, and the merge then carries the
-trailer. git cannot re-merge an octopus merge, so one reports what its
-diff against any parent shows.
+(`can_id` and `bus` are the only keys `talOS/configuration` reads a device's
+physical CAN address from), in any spelling TOML accepts (bare, quoted
+including basic-string unicode escapes, or dotted key, inline table, trailing
+comment), but not in a comment, a string value, or a single-quoted literal
+key holding unescaped text. It over-reports rather than miss one: a config
+file moved, renamed or added whole, or a `can_id` or `bus` line moved between
+files, also needs the trailer below. A merge commit's own change is its diff
+against git's automatic re-merge of its parents (`git show --remerge-diff`).
+A clean merge has none; a line written while resolving a conflict, or a stale
+copy of a config kept from one side (which can revert a person's change made
+on the other), shows. It over-reports a conflict resolved by picking one side
+of a `can_id` or `bus` line: the side not picked reads as removed, and the
+merge then carries the trailer. git cannot re-merge an octopus merge, so one
+reports what its diff against any parent shows.
 
 Every diff reads attributes from the empty tree and no attributes file
 (`--attr-source`), so a committed `.gitattributes` (`-diff`, `binary`,
@@ -33,7 +36,7 @@ are off. A local `.git/info/attributes`, which git reads whatever the
 attribute source, must hold no rule. The check needs git 2.40 or later;
 otherwise it exits 2 naming why.
 
-A robot or bench config is any tracked `.toml` outside an `examples`,
+A robot or bench config is any tracked `*.toml` outside an `examples`,
 `tests` or `fixtures` directory and outside any directory whose name ends
 in `testdata`: examples carry placeholder ids (ARCHITECTURE.md
 "Configuration"), and test fixtures are not loaded onto hardware.
@@ -44,11 +47,17 @@ the trailer `Commissioned-By: <name>` (`git commit --trailer
 earlier one, so it marks exactly the commit a person checked at the robot.
 Agents never write this trailer.
 
-Accepted, since no diff tells it apart: the trailer vouches for its whole
-commit, so a squash or amend that keeps a person's `Commissioned-By` in its
-last trailer block (the only one read) exempts everything folded into it,
-whoever wrote it. A person's commissioning commit therefore holds nothing
-but what that person checked at the robot.
+Accepted bounds:
+
+- Only tracked `*.toml` files are checked (robot and bench configs are TOML).
+- Any path under `EXEMPT_DIRECTORIES` (`examples`, `tests`, `fixtures`) or a
+  `*testdata` directory is exempt per REQ-DEV-33, even if real config were
+  placed there.
+- No diff tells it apart: the trailer vouches for its whole commit, so a
+  squash or amend that keeps a person's `Commissioned-By` in its last trailer
+  block (the only one read) exempts everything folded into it, whoever wrote
+  it. A person's commissioning commit therefore holds nothing but what that
+  person checked at the robot.
 
 Prints each finding as `<commit> <file>:<line>: <what>`; exits 1 when there
 is one, 2 on a usage or git error. CI's lint job and tools/prepush.sh run it
@@ -71,7 +80,20 @@ TRAILER = "Commissioned-By"
 # `{` or `,` (inline table); keys are matched on code() of the line.
 COMMISSIONED_TRUE = re.compile(r"(?:^|[\s.{,])commissioned\s*=\s*true\b")
 CAN_ID = re.compile(r"(?:^|[\s.{,])can_id\s*=")
+CAN_BUS = re.compile(r"(?:^|[\s.{,])bus\s*=")
 STRING = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'[^']*'")
+BASIC_ESCAPE = re.compile(
+    r'\\(?:(["\\bfnrt])|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))'
+)
+BASIC_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
 EXEMPT_DIRECTORIES = {"examples", "tests", "fixtures"}
 HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
@@ -85,10 +107,25 @@ def is_robot_config(path):
                    for d in directories)
 
 
+def decode_basic_string(raw):
+    """Decode TOML 1.0 basic-string escapes; keep invalid escapes raw."""
+    def replace(match):
+        simple, u4, u8 = match.groups()
+        if simple is not None:
+            return BASIC_ESCAPES[simple]
+        cp = int(u4 or u8, 16)
+        if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+            return match.group(0)
+        return chr(cp)
+
+    return BASIC_ESCAPE.sub(replace, raw)
+
+
 def code(line):
-    """A TOML line without its comment, a quoted key unquoted and every other
-    string emptied, so a key matches however it is spelled and a comment or
-    string value that mentions one does not."""
+    """A TOML line without its comment, a quoted key unquoted (decoding TOML
+    basic-string escapes for double-quoted keys, leaving single-quoted literal
+    keys raw) and every other string emptied, so a key matches however it is
+    spelled and a comment or string value that mentions one does not."""
     out, at = [], 0
     while at < len(line):
         char = line[at]
@@ -100,7 +137,11 @@ def code(line):
                 break  # An unterminated string: the rest is its text.
             after = line[match.end():].lstrip()
             is_key = after.startswith(("=", "."))
-            out.append(match.group(0)[1:-1] if is_key else '""')
+            if is_key:
+                inner = match.group(0)[1:-1]
+                out.append(decode_basic_string(inner) if char == '"' else inner)
+            else:
+                out.append('""')
             at = match.end()
             continue
         out.append(char)
@@ -155,12 +196,17 @@ def findings_in_diff(diff):
             text = code(line[1:])
             if COMMISSIONED_TRUE.search(text):
                 yield path, new, "sets commissioned = true"
-            elif CAN_ID.search(text):
+            if CAN_ID.search(text):
                 yield path, new, f"sets a CAN id: {line[1:].strip()}"
+            if CAN_BUS.search(text):
+                yield path, new, f"sets a CAN bus: {line[1:].strip()}"
             new += 1
         elif line.startswith("-"):
-            if CAN_ID.search(code(line[1:])):
+            text = code(line[1:])
+            if CAN_ID.search(text):
                 yield path, old, f"removes a CAN id: {line[1:].strip()}"
+            if CAN_BUS.search(text):
+                yield path, old, f"removes a CAN bus: {line[1:].strip()}"
             old += 1
 
 
@@ -277,10 +323,11 @@ def main(argv):
         print(line)
     if found:
         print(f"check_commissioning: RULES.md 4: only a person commissions a "
-              f"robot or changes a CAN id, in a commit carrying the trailer "
-              f"`{TRAILER}: <name>` (docs/BRINGUP.md \"Human commissioning\"); "
-              f"a person also adds it to a commit that moves, renames or adds "
-              f"a whole config, or moves a can_id line between files")
+              f"robot or changes a CAN id or bus, in a commit carrying the "
+              f"trailer `{TRAILER}: <name>` (docs/BRINGUP.md "
+              f"\"Human commissioning\"); a person also adds it to a commit "
+              f"that moves, renames or adds a whole config, or moves a "
+              f"`can_id` or `bus` line between files")
         return 1
     return 0
 

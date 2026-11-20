@@ -1,8 +1,8 @@
 """Unit tests for tools/check_commissioning.py on a scratch git repository.
 
 REQ-DEV-33 (RULES.md 4): an agent's commit that sets
-`commissioned = true` or changes a CAN id in a robot config fails; the same
-change in an example, or by a person's commit carrying
+`commissioned = true` or changes a CAN id or bus in a robot config fails;
+the same change in an example, or by a person's commit carrying
 `Commissioned-By: <name>`, passes.
 """
 
@@ -93,19 +93,132 @@ class CheckCommissioningTest(unittest.TestCase):
                      "\"commissioned\" = true  # at the robot",
                      "drive = { type = \"TalonFX\", can_id = 3 }",
                      "'can_id' = 3",
-                     "motors.drive.can_id=3 # moved"):
+                     "motors.drive.can_id=3 # moved",
+                     "bus = \"Shooter\"",
+                     "bus=\"canivore\"",
+                     "motors.drive.bus = \"Shooter\" # moved",
+                     "drive = { type = \"TalonFX\", bus = \"Shooter\" }",
+                     "\"bus\" = \"Shooter\"",
+                     "'bus' = \"Shooter\""):
             with self.subTest(line=line):
                 before = self.git("rev-parse", "HEAD").strip()
                 self.put(config, f"{line}\n")
                 self.commit("bench: respell")
                 self.assertTrue(check_commissioning.check(before), line)
 
-    # REQ-DEV-33, RULES.md 4: a comment or string naming the key is not the key.
-    def test_comment_mentioning_the_key_passes(self):
+    # REQ-DEV-33, RULES.md 4: moving a device to another CAN bus changes its
+    # physical address without touching can_id, including adding/removing bus.
+    def test_can_bus_add_change_remove_and_merge_fail(self):
+        motor = "bench/main_processor/configuration/subsystems/motor.toml"
+        # Adding bus moves the device off the default "rio" bus.
+        self.put(motor, MOTOR + "bus = \"Shooter\"\n")
+        self.commit("bench: add bus")
+        found = check_commissioning.check(self.base)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("motor.toml:4: sets a CAN bus: bus = \"Shooter\"",
+                      found[0])
+
+        # Changing bus between two values reports both removal and addition.
+        before = self.git("rev-parse", "HEAD").strip()
+        self.put(motor, MOTOR + "bus = \"rio\"\n")
+        self.commit("bench: move bus")
+        found = check_commissioning.check(before)
+        self.assertEqual(len(found), 2, found)
+        text = "\n".join(found)
+        self.assertIn("motor.toml:4: removes a CAN bus: bus = \"Shooter\"",
+                      text)
+        self.assertIn("motor.toml:4: sets a CAN bus: bus = \"rio\"", text)
+
+        # Removing bus falls back to default "rio" and still fails.
+        before = self.git("rev-parse", "HEAD").strip()
+        self.put(motor, MOTOR)
+        self.commit("bench: remove bus")
+        found = check_commissioning.check(before)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("motor.toml:4: removes a CAN bus: bus = \"rio\"",
+                      found[0])
+
+        # A bus edit introduced during merge resolution is caught too.
+        before = self.git("rev-parse", "HEAD").strip()
+        self.branch_and_merge(
+            lambda: self.put("bench/main_processor/configuration/side.toml",
+                             "b = 2\n"),
+            lambda: self.put(motor, MOTOR + "bus = \"canivore\"\n"))
+        merge = self.git("rev-parse", "HEAD").strip()[:12]
+        found = check_commissioning.check(before)
+        self.assertEqual(found, [
+            f"{merge} {motor}:4: sets a CAN bus: bus = \"canivore\""], found)
+
+    # REQ-DEV-33, RULES.md 4: TOML basic-string unicode escapes in double-quoted
+    # keys decode before key matching, both when added and when removed.
+    def test_unicode_escaped_quoted_keys_fail(self):
+        config = "bench/main_processor/configuration/robot.toml"
+        cases = (
+            (r'"\u0063an_id" = 5', "sets a CAN id"),
+            (r'"\U00000063an_id" = 6', "sets a CAN id"),
+            (r'"\u0063an\u005Fid" = 7', "sets a CAN id"),
+            (r'motors.drive."\u0063an_id" = 8', "sets a CAN id"),
+            (r'"\u0063ommissioned" = true', "sets commissioned = true"),
+            (r'"\U00000063ommissioned" = true', "sets commissioned = true"),
+            (r'robot = { "\u0063ommissioned" = true }',
+             "sets commissioned = true"),
+            (r'"\u0062us" = "canivore"', "sets a CAN bus"),
+            (r'"\U00000062us" = "rio"', "sets a CAN bus"),
+            (r'drive = { type = "TalonFX", "\u0062us" = "Shooter" }',
+             "sets a CAN bus"),
+        )
+        for line, expected in cases:
+            with self.subTest(line=line):
+                before = self.git("rev-parse", "HEAD").strip()
+                self.put(config, f"{line}\n")
+                self.commit("bench: unicode escape key")
+                found = check_commissioning.check(before)
+                self.assertIn(expected, "\n".join(found), found)
+
+        # Removing a unicode-escaped can_id or bus line is also caught.
+        for line, expected in (
+            (r'"\u0063an_id" = 5', "removes a CAN id"),
+            (r'"\u0062us" = "canivore"', "removes a CAN bus"),
+        ):
+            with self.subTest(remove=line):
+                self.put(config, f"{line}\n")
+                self.commit("bench: seed", "Commissioned-By: A Person")
+                before = self.git("rev-parse", "HEAD").strip()
+                self.put(config, ROBOT)
+                self.commit("bench: remove escaped key")
+                found = check_commissioning.check(before)
+                self.assertIn(expected, "\n".join(found), found)
+
+    # REQ-DEV-33, RULES.md 4: single-quoted literal keys do not process TOML
+    # escapes, escaped backslashes stay literal, and invalid escapes do not
+    # crash the check.
+    def test_literal_single_quoted_and_invalid_escapes_pass(self):
+        self.put(
+            "bench/main_processor/configuration/robot.toml",
+            ROBOT
+            + r"'\u0063an_id' = 5" + "\n"
+            + r"'\u0062us' = 'canivore'" + "\n"
+            + r"'\u0063ommissioned' = true" + "\n"
+            + r'"\\u0063an_id" = 5' + "\n"
+            + r'"\uD800" = 1' + "\n"
+            + r'"\U99999999" = 1' + "\n"
+            + r'"\u123" = 1' + "\n"
+            + r'"\q" = 1' + "\n",
+        )
+        self.commit("bench: literal and invalid escapes")
+        self.assertEqual(check_commissioning.check(self.base), [])
+
+    # REQ-DEV-33, RULES.md 4: a comment, string value or unrelated key naming
+    # a guarded word is not a guarded key.
+    def test_comment_string_and_unrelated_keys_pass(self):
         self.put("bench/main_processor/configuration/robot.toml",
-                 ROBOT + "# set commissioned = true at the robot\n"
-                 "note = \"can_id = 3\"\n")
-        self.commit("bench: comment")
+                 ROBOT + "# set commissioned = true or bus = \"Shooter\"\n"
+                 "note = \"can_id = 3, bus = Shooter\"\n"
+                 "can_bus = \"rio\"\n"
+                 "bus_name = \"Shooter\"\n"
+                 "can_bus_count = 2\n"
+                 "[subsystems.bus]\n")
+        self.commit("bench: comment and unrelated keys")
         self.assertEqual(check_commissioning.check(self.base), [])
 
     # REQ-DEV-33, RULES.md 4: the developer's git configuration changes nothing.
