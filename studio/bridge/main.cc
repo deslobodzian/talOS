@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "drive.h"
+#include "static_files.h"
 #include "system.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/describe.h"
@@ -42,6 +43,8 @@ extern "C" {
 namespace fs = std::filesystem;
 namespace {
 using studio::EgressBudget;
+using studio::kLiveCacheControl;
+using studio::LinkedOut;
 struct Client {
   // A programmer client's own bucket. A drive client is charged to its
   // slot's (studio::DriveSlots::Budget), which outlives the connection.
@@ -54,12 +57,9 @@ struct Client {
   studio::ClientFeeds feeds;
   studio::DriveFeed drive_feed;
 };
-// Static files and the manifest are read synchronously on the loop thread
-// that also polls RTMS, so each is capped. The static cap is a few times the
-// built Studio bundle's largest asset; the manifest cap is Studio's own
-// MAX_MANIFEST_BYTES (studio/src/data/manifest.ts), which rejects anything
-// larger anyway.
-constexpr std::uintmax_t kMaxStaticFileBytes = std::uintmax_t{4} * 1024 * 1024;
+// The manifest is read synchronously on the loop thread that also polls RTMS,
+// so it is capped at Studio's own MAX_MANIFEST_BYTES
+// (studio/src/data/manifest.ts), which rejects anything larger anyway.
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
 // The manifest's bytes, or "" when it is absent, unreadable or over the cap.
 std::string ReadManifest(const std::string& path) {
@@ -558,55 +558,6 @@ T* WatchedUser(us_internal_callback_t* callback) {
   std::memcpy(bytes.data(), callback + 1, bytes.size());
   return static_cast<T*>(std::bit_cast<void*>(bytes));
 }
-// Cache-Control (REQ-OPS-34). Studio's Vite build names every asset it
-// emits under assets/ `<name>-<hash>.<ext>`, the hash eight characters of
-// base64url (Rollup's default; its alphabet includes '-' and '_'): such a
-// file never changes under its name, so a browser keeps it for a year.
-// Every other static file, index.html and drive.html above all, is
-// revalidated on each load (`no-cache`), so a deploy's new page and the
-// asset names it carries are seen at once. The JSON the bridge generates
-// (or re-reads, like the manifest) is a live snapshot with no validator to
-// revalidate against, so it is never stored (`no-store`).
-constexpr std::string_view kImmutableCacheControl =
-    "public, max-age=31536000, immutable";
-constexpr std::string_view kRevalidateCacheControl = "no-cache";
-constexpr std::string_view kLiveCacheControl = "no-store";
-constexpr std::size_t kAssetHashChars = 8;
-
-// Whether `relative` (a path under the webroot) is a content-hashed asset.
-bool ContentHashed(const fs::path& relative) {
-  auto part = relative.begin();
-  if (part == relative.end() || *part != "assets") return false;
-  if (++part == relative.end()) return false;
-  const fs::path& name = *part;
-  if (++part != relative.end()) return false;  // not directly under assets/
-  const std::string stem = name.stem().string();
-  if (name.extension().empty() || stem.size() < kAssetHashChars + 2 ||
-      stem[stem.size() - kAssetHashChars - 1] != '-') {
-    return false;
-  }
-  return std::all_of(stem.end() - kAssetHashChars, stem.end(), [](char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '-' || c == '_';
-  });
-}
-
-std::string_view CacheControl(const fs::path& relative) {
-  return ContentHashed(relative) ? kImmutableCacheControl
-                                 : kRevalidateCacheControl;
-}
-
-std::string mime(const fs::path& p) {
-  auto ext = p.extension().string();
-  if (ext == ".html") return "text/html; charset=utf-8";
-  if (ext == ".js") return "text/javascript";
-  if (ext == ".css") return "text/css";
-  if (ext == ".json") return "application/json";
-  if (ext == ".svg") return "image/svg+xml";
-  if (ext == ".wasm") return "application/wasm";
-  return "application/octet-stream";
-}
-
 // Where to build the pages is known only to whoever made the webroot: a
 // robot repository's `studio_webroot` (webroot.bzl) leaves NOT_BUILT.txt
 // there naming the talOS checkout its `studio_web` reads, and its first line
@@ -624,23 +575,6 @@ std::string NotBuiltCommand(const fs::path& webroot) {
   return "build them with `bazel build //studio:web_dist` in the talOS "
          "checkout this workspace uses (talOS itself, or the one a robot "
          "repository's MODULE.bazel `talos` override names)";
-}
-
-// Where `page`, a file name in the webroot, resolves when it is a regular
-// file there that links out of the webroot's real tree (empty otherwise).
-// The bridge serves only files inside that tree, so such a page is present
-// but never served: a sandboxed Bazel test's runfiles stage each file of a
-// tree artifact as a link to the execroot. `bazel run` links the webroot
-// directory itself, and an installed bundle holds no links.
-fs::path LinkedOut(const fs::path& webroot, std::string_view page) {
-  std::error_code error;
-  const fs::path root = fs::weakly_canonical(webroot, error);
-  if (error) return {};
-  fs::path file = fs::weakly_canonical(root / page, error);
-  if (error || !fs::is_regular_file(file, error)) return {};
-  const fs::path relative = file.lexically_relative(root);
-  if (!relative.empty() && *relative.begin() != "..") return {};
-  return file;
 }
 
 // What `/` and `/drive` answer, 503, while the webroot holds no such page,
@@ -1105,53 +1039,39 @@ int main(int argc, char** argv) try {
         ->end(body);
   });
   app.get("/*", [&](auto* res, auto* req) {
-    auto url = std::string(req->getUrl());
-    // Reject encoded/ambiguous paths; serve only canonical descendants.
-    if (url.find('%') != url.npos || url.find('\\') != url.npos) {
+    const std::string_view url = req->getUrl();
+    // `/` is Studio and `/drive` the driver dashboard's page (a WebSocket
+    // upgrade of /drive is the feed, above).
+    const std::string_view mapped = url == "/"        ? "/index.html"
+                                    : url == "/drive" ? "/drive.html"
+                                                      : url;
+    const studio::StaticFileResult result =
+        studio::ReadStaticFile(webroot, mapped);
+    if (result.status == 200) {
+      res->writeHeader("Content-Type", result.content_type)
+          ->writeHeader("X-Content-Type-Options", "nosniff")
+          ->writeHeader("Cache-Control", result.cache_control)
+          ->end(result.body);
+      return;
+    }
+    if (result.status == 400) {
       res->writeStatus("400 Bad Request")->end();
       return;
     }
-    std::error_code error;
-    // `/` is Studio and `/drive` the driver dashboard's page (a WebSocket
-    // upgrade of /drive is the feed, above).
-    const std::string page = url == "/"        ? "index.html"
-                             : url == "/drive" ? "drive.html"
-                                               : url.substr(1);
-    const fs::path root = fs::weakly_canonical(webroot, error);
-    const fs::path file =
-        error ? fs::path{} : fs::weakly_canonical(root / page, error);
-    if (error) {
-      res->writeStatus("404 Not Found")->end();
-      return;
-    }
-    auto relative = file.lexically_relative(root);
-    if (relative.empty() || *relative.begin() == ".." ||
-        !fs::is_regular_file(file, error)) {
-      if (page == "index.html" || page == "drive.html") {
-        res->writeStatus("503 Service Unavailable")
-            ->writeHeader("Content-Type", "text/plain; charset=utf-8")
-            ->writeHeader("Cache-Control", kLiveCacheControl)
-            ->end(MissingPage(root, page));
-        return;
-      }
-      res->writeStatus("404 Not Found")->end();
-      return;
-    }
-    // Files are bounded; uWS owns buffered response bytes after end().
-    if (fs::file_size(file, error) > kMaxStaticFileBytes) {
+    if (result.status == 413) {
       res->writeStatus("413 Content Too Large")->end();
       return;
     }
-    std::ifstream input(file, std::ios::binary);
-    if (!input) {
-      res->writeStatus("404 Not Found")->end();
+    if (mapped == "/index.html" || mapped == "/drive.html") {
+      std::error_code error;
+      const fs::path root = fs::weakly_canonical(webroot, error);
+      res->writeStatus("503 Service Unavailable")
+          ->writeHeader("Content-Type", "text/plain; charset=utf-8")
+          ->writeHeader("Cache-Control", kLiveCacheControl)
+          ->end(MissingPage(error ? webroot : root, mapped.substr(1)));
       return;
     }
-    std::string body((std::istreambuf_iterator<char>(input)), {});
-    res->writeHeader("Content-Type", mime(file))
-        ->writeHeader("X-Content-Type-Options", "nosniff")
-        ->writeHeader("Cache-Control", CacheControl(relative))
-        ->end(body);
+    res->writeStatus("404 Not Found")->end();
   });
   // Exclusive: uSockets otherwise sets SO_REUSEPORT, and a second bridge of
   // the same user on this port (a developer's ./sim.sh on the robot

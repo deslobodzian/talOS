@@ -37,6 +37,16 @@ cc_library(
     ],
 )
 
+# Static HTTP file serving shared by :studio_bridge and //studio/review:
+# MIME lookup, hashed-asset Cache-Control, path containment, symlink-escape
+# detection and bounded file reading.
+cc_library(
+    name = "static_files",
+    srcs = ["static_files.cc"],
+    hdrs = ["static_files.h"],
+    visibility = ["//studio:__subpackages__"],
+)
+
 # The driver dashboard's feed (/drive): the reserved egress budget, the
 # drive slots, the channel mask and the drive summary. Header-only, like
 # :telemetry.
@@ -156,6 +166,7 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":drive",
+        ":static_files",
         ":system",
         ":telemetry",
         "//talOS/configuration",
