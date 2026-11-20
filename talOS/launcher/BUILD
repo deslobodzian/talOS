@@ -52,6 +52,17 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "session_retention_test",
+    size = "small",
+    srcs = ["session_retention_test.cc"],
+    deps = [
+        ":session",
+        "//talOS/events:session_manifest",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # fork + exec into a process group with a guardian, and the child's reports.
 cc_library(
     name = "spawn",
