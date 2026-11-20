@@ -112,6 +112,7 @@ RuntimeUdpPeer::RuntimeUdpPeer(RuntimeUdpPeer&& other) noexcept
     : socket_(std::exchange(other.socket_, kInvalidSocket)),
       next_send_sequence_(other.next_send_sequence_),
       last_below_sequence_(other.last_below_sequence_),
+      below_ascending_count_(other.below_ascending_count_),
       stats_(other.stats_),
       tx_buffer_(other.tx_buffer_),
       rx_buffer_(other.rx_buffer_),
@@ -128,6 +129,7 @@ RuntimeUdpPeer& RuntimeUdpPeer::operator=(RuntimeUdpPeer&& other) noexcept {
     socket_ = std::exchange(other.socket_, kInvalidSocket);
     next_send_sequence_ = other.next_send_sequence_;
     last_below_sequence_ = other.last_below_sequence_;
+    below_ascending_count_ = other.below_ascending_count_;
     stats_ = other.stats_;
     tx_buffer_ = other.tx_buffer_;
     rx_buffer_ = other.rx_buffer_;
@@ -353,46 +355,36 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
 
   constexpr uint64_t kReorderWindow = 64;
   constexpr uint8_t kRestartAscendingSteps = 2;
-  if (stats_.last_received_sequence == 0) {
-    stats_.last_received_sequence = decoded.header.sequence;
+  const uint64_t seq = decoded.header.sequence;
+  const bool below_last = seq > 0 && seq < stats_.last_received_sequence;
+  const bool long_run_restart =
+      below_last && stats_.last_received_sequence - seq > kReorderWindow;
+  const bool short_run_restart =
+      below_last && last_below_sequence_ != 0 && seq > last_below_sequence_ &&
+      below_ascending_count_ + 1 >= kRestartAscendingSteps;
+  if (stats_.last_received_sequence == 0 || long_run_restart ||
+      short_run_restart) {
+    // First frame, or peer restarted and reset its send sequence (large
+    // backward jump after a long run, or three ascending frames below
+    // last_received_sequence after a short run): re-baseline so subsequent
+    // packet loss is still counted in sequence_gaps.
+    stats_.last_received_sequence = seq;
     last_below_sequence_ = 0;
     below_ascending_count_ = 0;
-  } else if (decoded.header.sequence > stats_.last_received_sequence) {
-    stats_.sequence_gaps +=
-        decoded.header.sequence - stats_.last_received_sequence - 1;
-    stats_.last_received_sequence = decoded.header.sequence;
-    last_below_sequence_ = 0;
-    below_ascending_count_ = 0;
-  } else if (decoded.header.sequence > 0 &&
-             decoded.header.sequence < stats_.last_received_sequence &&
-             stats_.last_received_sequence - decoded.header.sequence >
-                 kReorderWindow) {
-    // Peer restarted after a long run and reset its send sequence: re-baseline
-    // immediately so subsequent packet loss is still counted in sequence_gaps.
-    stats_.last_received_sequence = decoded.header.sequence;
-    last_below_sequence_ = 0;
-    below_ascending_count_ = 0;
-  } else if (decoded.header.sequence > 0 &&
-             decoded.header.sequence < stats_.last_received_sequence &&
-             last_below_sequence_ != 0 &&
-             decoded.header.sequence > last_below_sequence_ &&
-             below_ascending_count_ + 1 >= kRestartAscendingSteps) {
-    // Three ascending frames below last_received_sequence indicate a peer
-    // restart after a short run rather than a 2-frame reorder.
-    stats_.last_received_sequence = decoded.header.sequence;
+  } else if (seq > stats_.last_received_sequence) {
+    stats_.sequence_gaps += seq - stats_.last_received_sequence - 1;
+    stats_.last_received_sequence = seq;
     last_below_sequence_ = 0;
     below_ascending_count_ = 0;
   } else {
     ++stats_.out_of_order_frames;
-    if (decoded.header.sequence > 0 &&
-        decoded.header.sequence < stats_.last_received_sequence) {
-      if (last_below_sequence_ != 0 &&
-          decoded.header.sequence > last_below_sequence_) {
+    if (below_last) {
+      if (last_below_sequence_ != 0 && seq > last_below_sequence_) {
         ++below_ascending_count_;
       } else {
         below_ascending_count_ = 0;
       }
-      last_below_sequence_ = decoded.header.sequence;
+      last_below_sequence_ = seq;
     } else {
       last_below_sequence_ = 0;
       below_ascending_count_ = 0;
