@@ -1804,12 +1804,11 @@ timeout's neutral command, even when the node's next request observes the
 same State), is not counted, so no value is negative. The request's time is
 its tick's, stamped before that tick's work; the command's is its publication
 on `/hw/command`, after the bridge's merge. So the row measures request tick
-to command publication, the requesting node's work included, not delivery to
-the RoboRIO: a command is logged when published whether or not its UDP send
-succeeded (its record's status is the shared-memory write's), so after a
-failed send, and while a socket is being replaced, the row still counts a
-command the RoboRIO received later or never; the bridge's `send_failures`
-(exit line, below) says whether that happened. With several owners the
+to command publication, the requesting node's work included, not arrival at
+the RoboRIO: `/hw/command` is published and logged only after the bridge's
+UDP send succeeds (`send_failures` and `send_would_block` in the exit line,
+below, count sends that did not go out), though UDP delivery across the wire
+is still unacknowledged. With several owners the
 merged observation can be an older request's, overstating it. Each sample
 is counted in enabled or disabled time (`bridge_request_to_command`
 `enabled` and `disabled` in `--json`, each with the bridge's `process`) as
@@ -1825,8 +1824,9 @@ disabled node's requests are neutral) waits for the bridge's heartbeat
 measures its reaction. The rows are informational: REQ-RT-20's 1 ms bound is verified by
 the bridge's component test. The bridge's `wait_fallbacks` and stalled request topics reach the
 report as its row's `wake_fallbacks` and `stalled_arms` (delivery loss,
-above); its other wake counters (`passes`, `throttled`) and its socket
-counters (`send_failures`, `socket_reopens`) are only in its exit lines on
+above); its other wake counters (`passes`, `throttled`), socket counters
+(`send_failures`, `socket_reopens`), and UDP stats (`sequence_gaps`,
+`decode_failures`, `send_would_block`) are only in its exit lines on
 stdout, in its [node output](#node-output) log, not in the report.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
