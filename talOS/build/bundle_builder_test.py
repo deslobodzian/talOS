@@ -444,6 +444,61 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertIn(RUNTIME, proc.stderr)
             self.assertIn("'a'", proc.stderr)
 
+    # REQ-OPS-48
+    def test_strips_test_only_wheels_from_python_node_runfiles(self):
+        # gtsam's wheel metadata pulls in pytest and its four dependencies
+        # (pluggy, iniconfig, pygments, packaging) as test-only wheels (~7 MB).
+        # The bundler strips those external site-packages wheel directories while
+        # keeping real wheels (including numpy/_pytesttester.py), runtime files,
+        # and any user code under _main/.
+        with tempfile.TemporaryDirectory() as tmp:
+            (py,) = self.python_nodes(tmp, {"a": "#!/bin/sh\n"})
+            stripped = (
+                "rules_python++pip+pypi_311_pytest_py3_none_any_07acdcf8/site-packages/pytest/__init__.py",
+                "rules_python++pip+pypi_311_pytest_py3_none_any_07acdcf8/site-packages/_pytest/main.py",
+                "rules_python++pip+pypi_311_pytest_py3_none_any_07acdcf8/site-packages/py.py",
+                "rules_python++pip+pypi_311_pytest_py3_none_any_07acdcf8/site-packages/pytest-9.2.0.dist-info/METADATA",
+                "rules_python++pip+pypi_311_pluggy_py3_none_any_7dd7b0d8/site-packages/pluggy/__init__.py",
+                "rules_python++pip+pypi_311_pluggy_py3_none_any_7dd7b0d8/site-packages/pluggy-1.7.0.dist-info/METADATA",
+                "rules_python++pip+pypi_311_iniconfig_py3_none_any_9121e2c1/site-packages/iniconfig/__init__.py",
+                "rules_python++pip+pypi_311_iniconfig_py3_none_any_9121e2c1/site-packages/iniconfig-2.3.1.dist-info/METADATA",
+                "rules_python++pip+pypi_311_pygments_py3_none_any_2363c69b/site-packages/pygments/__init__.py",
+                "rules_python++pip+pypi_311_pygments_py3_none_any_2363c69b/site-packages/pygments-2.21.0.dist-info/METADATA",
+                "rules_python++pip+pypi_311_packaging_py3_none_any_d7193f7c/site-packages/packaging/__init__.py",
+                "rules_python++pip+pypi_311_packaging_py3_none_any_d7193f7c/site-packages/packaging-26.3.dist-info/METADATA",
+            )
+            kept_in_runfiles = (
+                "rules_python++pip+pypi_311_gtsam_cp311_manylinux/site-packages/gtsam/__init__.py",
+                "rules_python++pip+pypi_311_numpy_cp311_manylinux/site-packages/numpy/_pytesttester.py",
+                "_main/packaging/node.py",
+                "_main/site-packages/pytest/user_code.py",
+            )
+            kept_in_runtime = (
+                RUNTIME + "/lib/python3.11/site-packages/pip/_vendor/packaging/__init__.py",
+            )
+            for idx, rf_rel in enumerate(stripped + kept_in_runfiles + kept_in_runtime):
+                src = os.path.join(tmp, "src", "extra", f"f{idx}.py")
+                put(src, f"# {rf_rel}\n")
+                py["runfiles"].append({"src_path": src, "rf_rel": rf_rel})
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//a:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            built = os.path.join(tmp, "out")
+            rf_root = os.path.join(built, "bin", "a.runfiles")
+            for rf_rel in stripped:
+                self.assertFalse(
+                    os.path.exists(os.path.join(rf_root, rf_rel)),
+                    f"test-only wheel file was not stripped: {rf_rel}")
+            for rf_rel in kept_in_runfiles:
+                self.assertTrue(
+                    os.path.isfile(os.path.join(rf_root, rf_rel)),
+                    f"non-test runfile was stripped: {rf_rel}")
+            for rf_rel in kept_in_runtime:
+                self.assertTrue(
+                    os.path.isfile(os.path.join(built, RUNTIME_DIR, rf_rel)),
+                    f"runtime file was stripped: {rf_rel}")
+
     def test_run_script_through_a_link_passes_the_physical_bundle(self):
         # The boot service starts <prefix>/current/run.sh. Node binaries come
         # from --bundle, so a path through the link would restart nodes from
