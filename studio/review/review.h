@@ -54,7 +54,10 @@
 //   GET /review/<id>/snapshot?t_ns=
 //       {"t_ns","channels":{name:{"value","sample_ns"}}}
 //       value as the bridge's /telemetry.json writes a sample, or null for
-//       no reading; a channel with no sample at or before t_ns is absent
+//       no reading; a channel with no sample at or before t_ns is absent;
+//       bounded to kMaxSnapshotChannels channels and kMaxSnapshotBytes bytes
+//       (REQ-OPS-42; entries past either ceiling are omitted so the JSON stays
+//       valid within the server's heap bound)
 //   GET /review/<id>/series?c=a,b&start_ns=&end_ns=&points=N
 //       application/octet-stream, little-endian: u32 channels, u32 buckets,
 //       then per channel f64 t_ns[buckets], f64 min[], f64 max[], f64 last[],
@@ -104,6 +107,11 @@ inline constexpr std::size_t SeriesRequestBytes(std::size_t channels,
 // One request's ceiling: 20 MiB and 8 B.
 inline constexpr std::size_t kMaxSeriesRequestBytes =
     SeriesRequestBytes(1, kMaxSeriesValues);
+
+// Fixed ceiling on one snapshot response body (REQ-OPS-42): at most
+// kMaxSnapshotChannels channels (session.h) and at most 2 MiB of JSON
+// (~256 B/channel at the channel cap, well below kMaxSeriesRequestBytes).
+inline constexpr std::size_t kMaxSnapshotBytes = std::size_t{2} << 20;
 
 // The most sessions kept open (indexed) at once; opening one more closes
 // the least recently used, whose index is rebuilt if it is opened again.

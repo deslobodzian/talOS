@@ -122,6 +122,7 @@ cc_test(
         "//talOS/events:gap_testing",
         "//talOS/hardware",
         "//talOS/launcher:hardware_record",
+        "//talOS/launcher:session",
         "//talOS/protocol",
         "//talOS/telemetry:frames",
         "@flatbuffers//:runtime_cc",

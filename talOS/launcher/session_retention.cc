@@ -6,7 +6,6 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <span>
@@ -32,9 +31,15 @@ namespace {
 namespace fs = std::filesystem;
 namespace tlog = event::log;
 
+constexpr std::size_t kMaxClassFileBytes = 256;
+
 std::string ReadSmallFile(const fs::path& path) {
   std::ifstream in{path, std::ios::binary};
-  return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+  if (!in.is_open()) return {};
+  std::string line(kMaxClassFileBytes, '\0');
+  in.read(line.data(), static_cast<std::streamsize>(line.size()));
+  line.resize(static_cast<std::size_t>(in.gcount()));
+  return line;
 }
 
 // Reads `<dir>/manifest.json`: nullopt when absent or unreadable, empty Fields
@@ -117,7 +122,34 @@ Seen ScanLog(const std::string& path) {
   return seen;
 }
 
+// Reads a cached verdict from `cache` if it is current for `log_bytes` and
+// `reader`. Never throws; absent or malformed files return nullopt.
+std::optional<MatchVerdict> ReadCachedVerdict(const fs::path& cache,
+                                              std::uintmax_t log_bytes,
+                                              const std::string& reader) {
+  std::istringstream cached{ReadSmallFile(cache)};
+  std::string verdict;
+  std::string identity;
+  std::uintmax_t bytes = 0;
+  // A match holds whichever build cached it: dropping it could only
+  // let a match go first. `other` and `unknown` hold for this reader.
+  if (cached >> verdict >> bytes) {
+    if (verdict == "match") return MatchVerdict::kMatch;
+    if ((verdict == "other" || verdict == "unknown") && bytes == log_bytes &&
+        cached >> identity && identity == reader) {
+      return verdict == "other" ? MatchVerdict::kOther : MatchVerdict::kUnknown;
+    }
+  }
+  return std::nullopt;
+}
+
 }  // namespace
+
+std::optional<MatchVerdict> CachedRecordedMatch(const fs::path& dir,
+                                                std::uintmax_t log_bytes) {
+  return ReadCachedVerdict(dir / std::string{kSessionClassFile}, log_bytes,
+                           ReaderIdentity());
+}
 
 SessionFacts InspectSession(const fs::path& dir, ClassCache cache) {
   SessionFacts facts;
@@ -167,21 +199,8 @@ MatchVerdict RecordedMatch(const fs::path& dir, ClassCache cache_mode) {
 
   const fs::path cache = dir / std::string{kSessionClassFile};
   const std::string reader = ReaderIdentity();
-  {
-    std::istringstream cached{ReadSmallFile(cache)};
-    std::string verdict;
-    std::string identity;
-    std::uintmax_t bytes = 0;
-    // A match holds whichever build cached it: dropping it could only
-    // let a match go first. `other` and `unknown` hold for this reader.
-    if (cached >> verdict >> bytes) {
-      if (verdict == "match") return MatchVerdict::kMatch;
-      if ((verdict == "other" || verdict == "unknown") && bytes == log_bytes &&
-          cached >> identity && identity == reader) {
-        return verdict == "other" ? MatchVerdict::kOther
-                                  : MatchVerdict::kUnknown;
-      }
-    }
+  if (const auto verdict = ReadCachedVerdict(cache, log_bytes, reader)) {
+    return *verdict;
   }
   // Packets of another protocol are not read with this build's codec
   // (REQ-OPS-51): the version the session's bridge recorded, else its

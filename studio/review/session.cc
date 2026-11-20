@@ -325,20 +325,6 @@ class Indexer {
   std::unordered_map<std::string, std::int32_t> by_name_;
 };
 
-// The wall clock and monotonic time a log's header records for its start.
-struct HeaderTimes {
-  std::int64_t wall_ns{0};
-  std::int64_t monotonic_ns{0};
-};
-std::optional<HeaderTimes> ReadHeaderTimes(const std::string& path) {
-  std::ifstream stream{path, std::ios::binary};
-  tlog::FileHeader header{};
-  if (!stream.read(reinterpret_cast<char*>(&header), sizeof header)) {
-    return std::nullopt;
-  }
-  return HeaderTimes{header.start_wall_ns, header.start_monotonic_ns};
-}
-
 }  // namespace
 
 std::string_view ModeKindName(ModeKind mode) {
@@ -698,15 +684,17 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   session->alerts_ = std::move(combined_alerts);
   session->alerts_.shrink_to_fit();
 
-  std::optional<HeaderTimes> origin;
+  std::optional<std::pair<std::int64_t, std::int64_t>> origin;
   for (const LogFile& log_file : session->files_) {
-    const auto times = ReadHeaderTimes(log_file.path);
-    if (times && (!origin || times->monotonic_ns < origin->monotonic_ns)) {
-      origin = times;
+    const tlog::WindowedLogReader reader{log_file.path};
+    const std::int64_t monotonic_ns = reader.start_time().nanos();
+    const std::int64_t wall_ns = reader.start_wall_ns();
+    if (!origin || monotonic_ns < origin->first) {
+      origin = {monotonic_ns, wall_ns};
     }
   }
   if (origin) {
-    session->origin_wall_ns_ = origin->wall_ns - origin->monotonic_ns;
+    session->origin_wall_ns_ = origin->second - origin->first;
   }
   ReadManifestRuns(dir / "manifest.json", session->origin_wall_ns_,
                    session->runs_, session->runs_dropped_);
@@ -904,8 +892,8 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
   return out;
 }
 
-std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
-                                      ReadStats* stats) const {
+std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
+                                      std::size_t max_channels) const {
   struct Latest {
     std::int64_t publish_ns{std::numeric_limits<std::int64_t>::min()};
     std::vector<std::uint64_t> raw;
@@ -1000,6 +988,7 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
   for (std::uint32_t t = 0; t < latest.size(); ++t) {
     const Latest& value = latest[t];
     for (std::uint32_t c = 0; c < value.raw.size(); ++c) {
+      if (samples.size() >= max_channels) return samples;
       samples.push_back(
           {{t, c}, value.raw[c], value.publish_ns, value.present[c] != 0});
     }

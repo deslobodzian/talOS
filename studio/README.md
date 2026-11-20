@@ -556,8 +556,8 @@ in `modes_dropped`, `alerts_dropped` and `runs_dropped` (`runs_dropped` also
 sums each node's manifest `runs_dropped`). So the heap is the open sessions'
 indexes (24 B per log-file second,
 48 B per GAP record, plus their channel names and bounded timeline), plus that cache, plus one request's ceiling (a
-series' 20 MiB; a snapshot's answer, about 100 B per channel of its
-session), plus one read window per log being read (REQ-OPS-42). On a
+series' 20 MiB; a snapshot's 2 MiB `kMaxSnapshotBytes` and 8,192-channel
+`kMaxSnapshotChannels` cap), plus one read window per log being read (REQ-OPS-42). On a
 generated 203 MiB session (8 logs, 2.75 million records; `bazel run -c opt //studio/review:review_bench`,
 Linux x86-64, a loaded host) the index pass took 0.49 s and kept 66,240 B
 (2,760 log-file seconds), a series of 8 channels over the whole session

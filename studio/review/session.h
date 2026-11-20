@@ -113,6 +113,11 @@ inline constexpr std::size_t kMaxTimelineModes = 4096;
 inline constexpr std::size_t kMaxTimelineAlerts = 4096;
 inline constexpr std::size_t kMaxTimelineRuns = 4096;
 
+// Fixed ceiling on channels returned by one Session::Snapshot (REQ-OPS-42):
+// well above live telemetry's 2048-channel dictionary cap, while bounding
+// snapshot memory even for a crafted session with huge channel counts.
+inline constexpr std::size_t kMaxSnapshotChannels = 8192;
+
 enum class ModeKind : std::uint8_t {
   kDisabled,
   kTeleop,
@@ -272,14 +277,15 @@ class Session {
                                  ReadStats* stats = nullptr) const;
 
   // Every channel of each topic with a record published at or before
-  // `t_ns`, from its latest such record, by topic then channel; a topic with
-  // none is absent. Per log file it reads, once each, only the seconds that
-  // hold a value record of one of its topics' sources at or before
-  // floor(t_ns) + 1 s, latest first, stopping per source at the first that
-  // yields its value: normally one second per source however long ago it was
-  // last published (studio/README.md, "Reviewing a session").
-  std::vector<Sample> Snapshot(std::int64_t t_ns,
-                               ReadStats* stats = nullptr) const;
+  // `t_ns`, from its latest such record, by topic then channel, capped at
+  // `max_channels`; a topic with none is absent. Per log file it reads, once
+  // each, only the seconds that hold a value record of one of its topics'
+  // sources at or before floor(t_ns) + 1 s, latest first, stopping per source
+  // at the first that yields its value: normally one second per source however
+  // long ago it was last published (studio/README.md, "Reviewing a session").
+  std::vector<Sample> Snapshot(
+      std::int64_t t_ns, ReadStats* stats = nullptr,
+      std::size_t max_channels = kMaxSnapshotChannels) const;
 
  private:
   Session() = default;
