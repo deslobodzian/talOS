@@ -105,6 +105,14 @@ bazel test //...
 ./sim.sh --sim-gateway --no-studio
 ```
 
+talOS's `.bazelrc` enables a shared Bazel disk cache at
+`~/.cache/talos-bazel-disk` (40 GiB GC cap) so worktrees, `tools/prepush.sh`,
+and `tools/tidy.sh` reuse compiled artifacts; an explicit `--disk_cache` flag
+or `~/.bazelrc` entry overrides it. For faster local C++ rebuilds on the fast
+test lane, pass `--config=dev` (`-O1` instead of `-O3`, skipping `heavy`,
+`integration`, `e2e`, and `perf` tests); `--config=dev` uses separate cache
+keys from the default `-O3` build.
+
 CI runs the C++ suite with AddressSanitizer + UndefinedBehaviorSanitizer and
 ThreadSanitizer, one leg per sanitizer: on Linux on every push
 (`continuous-integration.yaml`), on macOS nightly (`nightly.yaml`). Run sanitizer builds in their own output
