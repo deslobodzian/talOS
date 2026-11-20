@@ -3694,31 +3694,49 @@ TEST(Supervision, RepeatedlyHangingStudioBridgeExhaustsRestartsAndIsLeft) {
     for (std::size_t run = 1; nodes_up && run <= 3; ++run) {
       if (!WaitFor(stop, [&] { return ReadLines(bridge_runs).size() == run; }))
         break;
-      // Let one pass observe the registered row at `now`.
-      const uint64_t seen_pass = passes.Started() + 2;
-      if (!WaitFor(stop, [&] {
-            SupervisionWakeup::Wake();
-            return passes.Started() >= seen_pass;
-          }))
-        break;
-      // Wait for each healthy node to publish a fresh dispatch count before
-      // stepping the clock ahead, so only the frozen studio_bridge stalls.
-      const auto before_step = node_dispatches();
-      if (!WaitFor(stop, [&] {
-            const auto current = node_dispatches();
-            return current[0] > before_step[0] && current[1] > before_step[1] &&
-                   current[2] > before_step[2];
-          }))
-        break;
-      now += 2s;
-      clock.HoldAt(now);
-      SupervisionWakeup::Wake();
+      // Let one pass observe the registered bridge row at `now`.
+      const auto observe_pass = [&] {
+        const uint64_t target = passes.Started() + 2;
+        return WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          return passes.Started() >= target;
+        });
+      };
+      const auto refresh_healthy_nodes = [&] {
+        const auto before_step = node_dispatches();
+        if (!WaitFor(stop, [&] {
+              const auto current = node_dispatches();
+              return current[0] > before_step[0] &&
+                     current[1] > before_step[1] && current[2] > before_step[2];
+            }))
+          return false;
+        return observe_pass();
+      };
+      if (!observe_pass()) break;
+      // Advance across studio_bridge's 1 s stall timeout (kStudioBridgePeriod
+      // x heartbeat_periods) in 250 ms steps — strictly below the 500 ms
+      // kMinHeartbeatTimeout of hardware_node, alpha, and beta — refreshing
+      // every healthy node's observed dispatch count at each step so no extra
+      // supervision pass can ever make a healthy node appear stalled across a
+      // clock jump.
+      bool stepped = true;
+      for (int step = 0; step < 4; ++step) {
+        if (!refresh_healthy_nodes()) {
+          stepped = false;
+          break;
+        }
+        now += 250ms;
+        clock.HoldAt(now);
+        SupervisionWakeup::Wake();
+      }
+      if (!stepped) break;
       int64_t retry_at = 0;
       if (run <= 2) {
         if (!WaitFor(stop, [&] {
               return run_stalled(run, retry_at) && retry_at > 0;
             }))
           break;
+        if (!refresh_healthy_nodes()) break;
         now = SupervisionTime{std::chrono::nanoseconds{retry_at}};
         clock.HoldAt(now);
         SupervisionWakeup::Wake();
