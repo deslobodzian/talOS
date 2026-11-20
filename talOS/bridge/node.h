@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -510,7 +511,7 @@ class HardwareNode {
 
   bool is_configured_{false};
   uint64_t last_boot_id_{0};
-  uint64_t last_ds_sample_time_us_{0};
+  std::optional<uint64_t> last_ds_sample_time_us_;
   uint64_t last_epoch_{0};
   uint64_t last_sample_time_us_{0};
   uint32_t last_state_flags_{0};
@@ -534,6 +535,13 @@ class HardwareNode {
   bool version_mismatch_logged_{false};
   // Set once an undecodable State is logged, until a State decodes.
   bool state_decode_failure_logged_{false};
+  // Last refused ConfigAck logged to stderr, so repeated retries with the
+  // same status and reason do not spam; cleared on kOk or a new gateway boot.
+  bool config_refusal_logged_{false};
+  ConfigAckStatus last_config_refusal_status_{ConfigAckStatus::kOk};
+  std::array<char, sizeof(ConfigAckPayload::reason)>
+      last_config_refusal_reason_{};
+  std::size_t last_config_refusal_reason_len_{0};
   uint64_t pending_probe_send_us_{};
   uint64_t pending_probe_sample_us_{};
   uint64_t pending_probe_boot_id_{};

@@ -22,6 +22,25 @@
 #include "talOS/process/process.h"
 
 namespace talos::hardware {
+namespace {
+
+const char* ConfigAckStatusName(ConfigAckStatus status) {
+  switch (status) {
+    case ConfigAckStatus::kOk:
+      return "ok";
+    case ConfigAckStatus::kInvalidCrc:
+      return "invalid_crc";
+    case ConfigAckStatus::kMalformed:
+      return "malformed";
+    case ConfigAckStatus::kCeilingExceeded:
+      return "ceiling_exceeded";
+    case ConfigAckStatus::kBackendFailed:
+      return "backend_failed";
+  }
+  return "unknown";
+}
+
+}  // namespace
 
 // Tests only: when set, called with the options of the bridge's --log just
 // before its writer is made, so a test can hold the writer thread
@@ -613,10 +632,10 @@ void HardwareNode::Tick(uint64_t now_us) {
       talos::hardware::Packet cmd_pkt{};
       cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
       if (cmd_pkt.size > 0) {
-        if (cmd_pub_) Publish(*cmd_pub_, 1, cmd_pkt, now_us);
         if (SendToGateway(protocol::FrameType::kHardwareCommand, now_us,
                           cmd_pkt.data.data(),
                           cmd_pkt.size) == protocol::UdpStatus::kOk) {
+          if (cmd_pub_) Publish(*cmd_pub_, 1, cmd_pkt, now_us);
           ++commands_sent_;
           last_sent_cmd_ = full_cmd_;
           last_send_us_ = now_us;
@@ -646,11 +665,36 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
         if (ack.status == ConfigAckStatus::kOk) {
           is_configured_ = true;
           config_push_backoff_us_ = 50000;
+          config_refusal_logged_ = false;
         } else {
           is_configured_ = false;
           config_push_backoff_us_ =
               std::min<uint64_t>(config_push_backoff_us_ * 2, 2000000);
           last_push_time_us_ = now_us;
+          const std::size_t reason_len =
+              ::strnlen(ack.reason, sizeof(ack.reason));
+          const std::string_view reason{ack.reason, reason_len};
+          const std::string_view prev_reason{last_config_refusal_reason_.data(),
+                                             last_config_refusal_reason_len_};
+          if (!config_refusal_logged_ ||
+              ack.status != last_config_refusal_status_ ||
+              reason != prev_reason) {
+            if (reason_len > 0) {
+              std::fprintf(stderr,
+                           "hardware_node: gateway refused config (%s): %.*s\n",
+                           ConfigAckStatusName(ack.status),
+                           static_cast<int>(reason_len), ack.reason);
+            } else {
+              std::fprintf(stderr,
+                           "hardware_node: gateway refused config (%s)\n",
+                           ConfigAckStatusName(ack.status));
+            }
+            config_refusal_logged_ = true;
+            last_config_refusal_status_ = ack.status;
+            std::memcpy(last_config_refusal_reason_.data(), ack.reason,
+                        reason_len);
+            last_config_refusal_reason_len_ = reason_len;
+          }
         }
       }
     }
@@ -696,8 +740,9 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     state_accepted_ = true;
     if (state.boot_id != last_boot_id_) {
       config_push_backoff_us_ = 50000;
+      config_refusal_logged_ = false;
       // The new boot's Driver Station clock restarted with it.
-      last_ds_sample_time_us_ = 0;
+      last_ds_sample_time_us_.reset();
       ReportGatewayBuild(state);
     }
     // Configured means the current gateway boot acknowledged our config.
@@ -747,12 +792,14 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
 
   // Driver Station packets are forwarded only from the boot the accepted
   // State is in (a retired boot's delayed packet, or one from a boot whose
-  // State has not arrived yet, is dropped), in sample order within it.
+  // State has not arrived yet, is dropped), in strictly increasing sample
+  // order within it.
   if (frame.header.type == protocol::FrameType::kDriverStation) {
     driver_station::DriverStationData data{};
     if (!driver_station::Decode({frame.payload, frame.payload_size}, data) ||
-        data.boot_id != last_boot_id_ ||
-        data.sample_time_us < last_ds_sample_time_us_) {
+        last_boot_id_ == 0 || data.boot_id != last_boot_id_ ||
+        (last_ds_sample_time_us_ &&
+         data.sample_time_us <= *last_ds_sample_time_us_)) {
       return;
     }
     last_ds_sample_time_us_ = data.sample_time_us;
@@ -1249,9 +1296,15 @@ int HardwareNode::Run(int duration_s) {
       static_cast<unsigned long long>(wakeups_.deadline),
       static_cast<unsigned long long>(wakeups_.throttled),
       static_cast<unsigned long long>(wakeups_.wait_fallbacks));
-  std::printf("hardware_node: send_failures=%llu socket_reopens=%llu\n",
-              static_cast<unsigned long long>(socket_counters_.send_failures),
-              static_cast<unsigned long long>(socket_counters_.reopens));
+  const protocol::UdpStats& udp = peer_.stats();
+  std::printf(
+      "hardware_node: send_failures=%llu socket_reopens=%llu "
+      "sequence_gaps=%llu decode_failures=%llu send_would_block=%llu\n",
+      static_cast<unsigned long long>(socket_counters_.send_failures),
+      static_cast<unsigned long long>(socket_counters_.reopens),
+      static_cast<unsigned long long>(udp.sequence_gaps),
+      static_cast<unsigned long long>(udp.decode_failures),
+      static_cast<unsigned long long>(udp.send_would_block));
   // A log that failed or has a gap exits 1, as RunMain does for event-loop
   // nodes.
   bool log_incomplete = false;

@@ -1737,5 +1737,103 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
 }
 
+// REQ-CONTRACT-04: a refused ConfigAck logs status and NUL-bounded reason to
+// stderr once per distinct (status, reason) until a kOk ack clears it, so
+// config-push retries do not spam stderr.
+TEST(HardwareNodeTrustTest, LogsRefusedConfigAckOncePerDistinctReason) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  InProcessGateway& gateway = bridge.gateway;
+
+  const auto send_ack = [&](ConfigAckStatus status, const char* reason,
+                            std::size_t reason_bytes, uint64_t now_us) {
+    ConfigAckPayload ack{};
+    ack.config_id = config_id;
+    ack.status = status;
+    std::memcpy(ack.reason, reason, std::min(reason_bytes, sizeof(ack.reason)));
+    std::array<uint8_t, sizeof(ConfigAckPayload)> bytes{};
+    ASSERT_EQ(EncodeConfigAck(ack, bytes), sizeof(ConfigAckPayload));
+    gateway.Receive(protocol::FrameType::kHardwareConfigAck, now_us, bytes);
+    node.Tick(now_us);
+  };
+
+  ::testing::internal::CaptureStderr();
+  // First refusal (also full 64 bytes without NUL terminator).
+  std::array<char, sizeof(ConfigAckPayload::reason)> full_reason{};
+  full_reason.fill('X');
+  send_ack(ConfigAckStatus::kBackendFailed, full_reason.data(),
+           full_reason.size(), 1000);
+  // Identical retry: must be deduplicated (not logged again).
+  send_ack(ConfigAckStatus::kBackendFailed, full_reason.data(),
+           full_reason.size(), 2000);
+  // Different reason: logged once.
+  const char other[] = "motor 3 offline";
+  send_ack(ConfigAckStatus::kBackendFailed, other, sizeof(other) - 1, 3000);
+  send_ack(ConfigAckStatus::kBackendFailed, other, sizeof(other) - 1, 4000);
+  // kOk clears deduplication; a subsequent refusal with the same reason logs
+  // again.
+  Acknowledge(bridge, config_id, 5000);
+  send_ack(ConfigAckStatus::kBackendFailed, other, sizeof(other) - 1, 6000);
+  const std::string err = ::testing::internal::GetCapturedStderr();
+
+  const std::string sixty_four_x(64, 'X');
+  auto count_substr = [&](const std::string& needle) {
+    std::size_t count = 0;
+    for (auto pos = err.find(needle); pos != std::string::npos;
+         pos = err.find(needle, pos + needle.size())) {
+      ++count;
+    }
+    return count;
+  };
+  EXPECT_EQ(count_substr(sixty_four_x), 1u) << err;
+  EXPECT_EQ(count_substr("motor 3 offline"), 2u) << err;
+  EXPECT_NE(err.find("backend_failed"), std::string::npos) << err;
+}
+
+// REQ-SAFE-11: Driver Station packets arriving before any State (even with
+// boot_id == 0) and duplicate timestamps within a boot are dropped; the first
+// packet of a boot is admitted even at sample_time_us == 0.
+TEST(HardwareNodeTrustTest, DropsDriverStationPacketsBeforeStateAndDuplicates) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  InProcessGateway& gateway = bridge.gateway;
+  ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
+
+  const auto send_ds = [&](uint64_t boot_id, uint64_t sample_time_us,
+                           uint64_t now_us) -> bool {
+    driver_station::DriverStationData data{};
+    data.boot_id = boot_id;
+    data.sample_time_us = sample_time_us;
+    data.mode_since_us = sample_time_us;
+    data.fms.flags = driver_station::kDsAttached;
+    std::array<uint8_t, driver_station::kMaxEncodedSize> payload{};
+    const auto size = driver_station::Encode(data, payload);
+    EXPECT_GT(size, 0u);
+    gateway.Receive(protocol::FrameType::kDriverStation, now_us,
+                    std::span<const uint8_t>{payload.data(), size});
+    node.Tick(now_us);
+    return ds_sub.read().has_value();
+  };
+
+  // Before any State arrives, boot_id == 0 must not match initial
+  // last_boot_id_ == 0.
+  EXPECT_FALSE(send_ds(0, 1000, 1000));
+  EXPECT_EQ(node.driver_station_packets_received(), 0u);
+
+  // After a State arrives, sample_time_us == 0 is admitted as first packet of
+  // the boot, then duplicate timestamps are dropped.
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 0xA1, 1, 1000), 1000000));
+  EXPECT_TRUE(send_ds(0xA1, 0, 1001000));
+  EXPECT_FALSE(send_ds(0xA1, 0, 1002000));
+  EXPECT_TRUE(send_ds(0xA1, 1000, 1003000));
+  EXPECT_FALSE(send_ds(0xA1, 1000, 1004000));
+  EXPECT_TRUE(send_ds(0xA1, 2000, 1005000));
+  EXPECT_EQ(node.driver_station_packets_received(), 3u);
+}
+
 }  // namespace
 }  // namespace talos::hardware
