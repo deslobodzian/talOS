@@ -81,7 +81,9 @@ struct TopicBuild {
   std::vector<std::uint32_t> alert_channels;
   // Single canonical alert stream tracked during Open(): SEND beats MESSAGE;
   // lowest file index wins among SENDs, lexicographically smallest path wins
-  // among MESSAGEs (matching the post-scan topic selection below).
+  // among MESSAGEs (matching the post-scan topic selection below, assuming
+  // launcher log naming where each process's files arrive in file-index order
+  // and distinct processes' log paths do not interleave lexicographically).
   std::optional<std::size_t> alert_file;
   bool alert_is_send{false};
   AlertStream alert_stream;
