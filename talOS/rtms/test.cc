@@ -272,7 +272,7 @@ TEST(LayoutValidation, AVersion8SegmentIsRefusedUntilASessionReplacesIt) {
 // remedy rather than failing an opaque size check before reading version.
 TEST(LayoutValidation, SmallVersion8SegmentReportsVersionMismatchWithRemedy) {
   constexpr std::size_t kSlots = 16;
-  const std::string path = make_test_path("version_8_small");
+  const std::string path = make_test_path("v8_small");
   // Both a header-only v8 segment (832 B) and a complete small-ring v8 segment
   // are smaller than v9's sizeof(RTMSHeader) (2368 B).
   static_assert(sizeof(Version8Header) < sizeof(RTMSHeader));
@@ -307,7 +307,7 @@ TEST(LayoutValidation, SmallVersion8SegmentReportsVersionMismatchWithRemedy) {
   }
 
   // Also check a segment truncated to just Version8Header (no ring slots).
-  const std::string trunc_path = make_test_path("version_8_header_only");
+  const std::string trunc_path = make_test_path("v8_hdr");
   ::shm_unlink(ShmObjectName(trunc_path).c_str());
   const int fd = ::shm_open(ShmObjectName(trunc_path).c_str(),
                             O_CREAT | O_EXCL | O_RDWR, 0666);
