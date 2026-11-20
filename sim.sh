@@ -104,8 +104,9 @@ Options:
   --http-port N     Studio HTTP port (default 5800)
   -h, --help        this message
 
-Each run's session logs go to /tmp/talos_logs/<session_id> (launcher and
-controller output in its sim/ subdirectory).
+Each run's session logs go to /tmp/talos_logs/<session_id> (override the root
+with TALOS_SIM_LOG_DIR; launcher and controller output go in its sim/
+subdirectory).
 USAGE
 }
 
@@ -257,7 +258,7 @@ fi
 # starts in one second; the shell's pid (below 2^22 on Linux, 99999 on macOS,
 # so seven digits) makes the key unique among concurrent runs.
 SESSION_ID="$(date +%s)$(printf '%07d' "$$")"
-OUT_DIR="/tmp/talos_logs"
+OUT_DIR="${TALOS_SIM_LOG_DIR:-/tmp/talos_logs}"
 SESSION_DIR="${OUT_DIR}/${SESSION_ID}"
 LOG_DIR="${SESSION_DIR}/sim"
 mkdir -p "$LOG_DIR"
