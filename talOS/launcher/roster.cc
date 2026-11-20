@@ -271,8 +271,7 @@ bool HasSimulatorScheduleStartArg(const std::vector<std::string>& args) {
 
 uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
                                  const LauncherOptions& options) {
-  return options.studio_http_port != 0 ? options.studio_http_port
-                                       : config.studio.http_port;
+  return options.studio_http_port.value_or(config.studio.http_port);
 }
 
 std::string EffectiveStudioWebroot(const config::RobotConfig& config,

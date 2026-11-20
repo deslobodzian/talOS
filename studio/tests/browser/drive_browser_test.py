@@ -99,16 +99,17 @@ signal.signal(signal.SIGTERM, _on_sigterm)
 
 
 def free_ports(count):
-    """`count` ports free for both TCP and UDP on every address now, below
-    the host's ephemeral range.
+    """`count` ports free for UDP on every address now, below the host's
+    ephemeral range.
 
-    The launcher refuses port 0 (`--studio-http-port`, `--remote-port`,
+    The launcher still refuses port 0 for the gateway link (`--remote-port`,
     `--local-port`; `sim_gateway --port` too), so these are reserved and
     released, and its members bind them a second or more later
-    (docs/TESTING.md §6.4). Below the ephemeral range no connect() or DNS
-    lookup on the host draws one meanwhile; a port taken anyway fails the
-    wait for the bridge, naming the port and the member's own log line
-    (Session.bind_failure)."""
+    (docs/TESTING.md §6.4). Studio uses `--studio-http-port 0` and reports
+    its OS-assigned port in `manifest.json`. Below the ephemeral range no
+    connect() or DNS lookup on the host draws one meanwhile; a port taken
+    anyway fails the wait for the bridge, naming the port and the member's
+    own log line (Session.bind_failure)."""
     ports, port = [], 20000 + os.getpid() % 10000
     for _ in range(12000):
         port = 20000 + (port - 20000 + 1) % 12000  # stays below 32768
@@ -126,25 +127,28 @@ def free_ports(count):
 
 
 class Session:
-    """The launched bench simulation with the Studio bridge on a free port,
-    or on `http_port` when given."""
+    """The launched bench simulation with the Studio bridge on an OS-assigned
+    ephemeral port (`--studio-http-port 0`), or on `http_port` when given."""
 
     def __init__(self, root, tmp, http_port=None, config=None):
         self.output = tmp / "sessions"
         self.namespace = f"drive-browser-{uuid.uuid4().hex}"
-        self.http_port, gw_port, bridge_port = free_ports(3)
-        if http_port is not None:
-            self.http_port = http_port
-        # Each member that binds a reserved port, the port, and what its log
+        gw_port, bridge_port = free_ports(2)
+        self.http_port = http_port
+        http_port_arg = "0" if http_port is None else str(http_port)
+        # Each member that binds an explicit port, the port, and what its log
         # says when the bind fails (studio/bridge/main.cc, which
         # studio/bridge/listen_test.py holds to naming the port;
         # sim_gateway.cc; talOS/bridge/main.cc). HeldHttpPortIsNamedAtOnce
         # below proves the bridge's still matches.
-        self.binds = (("studio_bridge", self.http_port,
-                       f"cannot listen on port {self.http_port}"),
-                      ("sim_gateway", gw_port, "cannot open simulation socket"),
+        binds = []
+        if http_port is not None:
+            binds.append(("studio_bridge", http_port,
+                          f"cannot listen on port {http_port}"))
+        binds.extend([("sim_gateway", gw_port, "cannot open simulation socket"),
                       ("hardware_node", bridge_port,
-                       "failed to open hardware node network/ipc resources"))
+                       "failed to open hardware node network/ipc resources")])
+        self.binds = tuple(binds)
         # The launcher resolves node labels and [studio] webroot under
         # bazel-bin/ of its working directory: the runfiles tree.
         (tmp / "bazel-bin").symlink_to(root, target_is_directory=True)
@@ -152,7 +156,7 @@ class Session:
         self.log = self.log_path.open("w")
         args = [str(root / "talOS/launcher/launcher"), "--config", str(config or root / CONFIG),
                 "--sim", "--start-sim-gateway", "--start-studio-bridge",
-                "--studio-http-port", str(self.http_port),
+                "--studio-http-port", http_port_arg,
                 "--remote", "127.0.0.1", "--remote-port", str(gw_port),
                 "--local-port", str(bridge_port), "--output-dir", str(self.output),
                 # The telemetry node is held stopped for about 400 ms below,
@@ -177,7 +181,7 @@ class Session:
                          and exited.touch(), daemon=True).start()
 
     def wait_listening(self):
-        """The session directory, once the bridge's log says it listens."""
+        """The session directory, once manifest.json records studio_bridge's http_port."""
 
         def listening():
             # A failed bind first: a critical member's can end the session,
@@ -193,16 +197,27 @@ class Session:
                 said = [line for line in lines if "error" in line] or lines[-3:]
                 raise RuntimeError("launcher exited during startup: " +
                                    (" | ".join(said) or "it printed nothing"))
-            for log in self.output.glob("*/studio_bridge.log"):
-                if f"listening {self.http_port}\n" in log.read_text(errors="replace"):
-                    return log.parent
+            for manifest in self.output.glob("*/manifest.json"):
+                try:
+                    nodes = json.loads(manifest.read_text(errors="replace"))["nodes"]
+                except (OSError, json.JSONDecodeError, KeyError):
+                    continue
+                bridge = next((n for n in nodes if n.get("name") == "studio_bridge"), None)
+                if bridge is not None:
+                    port = bridge.get("http_port")
+                    if isinstance(port, int) and port > 0 and (
+                            self.http_port is None or port == self.http_port):
+                        self.http_port = port
+                        return manifest.parent
             return None
 
         def paths():
             return [self.tmp, self.output, *self.output.glob("*/"),
+                    *self.output.glob("*/manifest.json"),
                     *self.output.glob("*/*.log")]
 
-        self.dir = watch.wait_for(listening, paths, STARTUP_S, "the Studio bridge's listening line")
+        self.dir = watch.wait_for(listening, paths, STARTUP_S,
+                                  "the Studio bridge's http_port in manifest.json")
 
     def bind_failure(self):
         """A member's failed bind of its reserved port, named, or None."""

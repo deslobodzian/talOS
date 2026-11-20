@@ -3233,6 +3233,109 @@ TEST(Supervision, CrashedStudioBridgeRestartsAndNoNodeIsDisturbed) {
     ::remove(path->c_str());
 }
 
+// Ephemeral `--studio-http-port 0`: the bridge's `listening <port>` line is
+// captured from its output pipe (even split across writes and preceded by
+// other lines), recorded on the studio_bridge entry in manifest.json as
+// `http_port`, announced in `Started studio_bridge ... on http://localhost:P`
+// (never port 0), and passed as argv[2] on restart so the restart rebinds the
+// same port.
+// REQ-OPS-30, REQ-OPS-08, REQ-OPS-34
+TEST(Supervision,
+     StudioBridgeEphemeralPortRecordedInManifestAndReusedOnRestart) {
+  const auto runs = TempPath("bridge_port_runs");
+  const auto bridge_runs = TempPath("bridge_port_bridge_runs");
+  const auto bridge_ports = TempPath("bridge_port_argv");
+  const auto crash = TempPath("bridge_port_crash");
+  for (const auto* path : {&runs, &bridge_runs, &bridge_ports, &crash})
+    ::remove(path->c_str());
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  auto options = BridgeOptions("bridge_port", runs, clock);
+  options.studio_http_port = 0;
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("bridge_port_bridge",
+                BridgeRun(bridge_runs, "echo \"$2\" >> '" + bridge_ports +
+                                           "'\n"
+                                           "if [ \"$(wc -l < '" +
+                                           bridge_runs +
+                                           "')\" -eq 1 ]; then\n"
+                                           "  echo 'bridge starting up'\n"
+                                           "  printf 'list'\n"
+                                           "  printf 'ening 43210\\n'\n"
+                                           "  while [ ! -e '" +
+                                           crash +
+                                           "' ]; do sleep 0.01; done\n"
+                                           "  kill -KILL $$\n"
+                                           "fi\n"
+                                           "printf 'listening %s\\n' \"$2\"\n"
+                                           "while :; do sleep 0.05; done\n"),
+                "studio_bridge");
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string live = session_dir + "/manifest.json";
+  const std::string talos_log =
+      session_dir + "/" + std::string{kLauncherOutputFile};
+  bool port_recorded = false;
+  bool settled = false;
+  bool crashed = false;
+  bool restarted = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    port_recorded = WaitFor(stop, [&] {
+      if (ReadLines(runs).size() != 3 || ReadLines(bridge_runs).size() != 1)
+        return false;
+      const std::string bridge = ManifestEntry(ReadFile(live), "studio_bridge");
+      return EntryInteger(bridge, "http_port") == 43210;
+    });
+    if (port_recorded) {
+      clock.HoldAt(start + kStudioBridgeSettleInterval);
+      SupervisionWakeup::Wake();
+      settled = WaitFor(stop, [&] {
+        return ReadFile(talos_log).find("Started studio_bridge (pid ") !=
+               std::string::npos;
+      });
+    }
+    if (settled) {
+      std::ofstream{crash}.close();
+      crashed = WaitFor(stop, [&] {
+        const auto history = ManifestRuns(ReadFile(live), "studio_bridge");
+        return !history.empty() &&
+               history.front().find("\"reason\": \"crash\"") !=
+                   std::string::npos;
+      });
+    }
+    if (crashed) {
+      clock.Release();
+      restarted =
+          WaitFor(stop, [&] { return ReadLines(bridge_ports).size() == 2; });
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  const int status = RunSession(options);
+  driver.join();
+  ASSERT_TRUE(port_recorded) << "manifest.json did not record http_port 43210";
+  ASSERT_TRUE(settled) << "studio_bridge did not settle";
+  ASSERT_TRUE(crashed) << "studio_bridge crash was not recorded";
+  ASSERT_TRUE(restarted) << "studio_bridge did not restart";
+  EXPECT_EQ(status, 0);
+  const auto ports = ReadLines(bridge_ports);
+  ASSERT_EQ(ports.size(), 2u);
+  EXPECT_EQ(ports[0], "0");
+  EXPECT_EQ(ports[1], "43210");
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string bridge = ManifestEntry(manifest, "studio_bridge");
+  EXPECT_EQ(EntryInteger(bridge, "http_port"), 43210) << bridge;
+  EXPECT_EQ(EntryInteger(ManifestEntry(manifest, "alpha"), "http_port"), -1);
+  const std::string log_text =
+      ReadFile(options.output_dir + "/" + std::string{kLauncherOutputFile});
+  EXPECT_NE(log_text.find("on http://localhost:43210\n"), std::string::npos)
+      << log_text;
+  EXPECT_EQ(log_text.find("http://localhost:0"), std::string::npos) << log_text;
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&runs, &bridge_runs, &bridge_ports, &crash})
+    ::remove(path->c_str());
+}
+
 // A Studio bridge that ends at once on every run, even with exit 0 (a server
 // that ends before the stop has failed), is restarted max_restarts times
 // (3) on the non-critical member's backoff, 50, 100 and 200 ms, then left

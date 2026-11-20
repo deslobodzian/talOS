@@ -69,8 +69,9 @@ struct LauncherOptions {
   uint16_t remote_port{0};
   uint16_t local_port{0};
 
-  // Studio HTTP port override. Zero means "take [studio] http_port".
-  uint16_t studio_http_port{0};
+  // Studio HTTP port override. Unset means "take [studio] http_port"; 0 asks
+  // the OS for an ephemeral port.
+  std::optional<uint16_t> studio_http_port;
 
   // Restart budget per node in restart_window_ms; unset takes
   // robot.max_restarts.

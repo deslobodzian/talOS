@@ -1123,17 +1123,20 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
 
 }  // namespace detail
 
-// A port flag's value: a decimal integer in [1, 65535], else
+// A port flag's value: a decimal integer in [1, 65535] (or [0, 65535] when
+// `allow_zero` is true, for `--studio-http-port 0`), else
 // std::invalid_argument naming `flag` (std::stoi would accept "5802x" and a
 // uint16_t cast would wrap 70000 to 4464).
-inline uint16_t ParsePortFlag(std::string_view flag, std::string_view value) {
+inline uint16_t ParsePortFlag(std::string_view flag, std::string_view value,
+                              bool allow_zero = false) {
+  const int min_port = allow_zero ? 0 : 1;
   int port = 0;
   const auto* end = value.data() + value.size();
   const auto [ptr, ec] = std::from_chars(value.data(), end, port);
-  if (value.empty() || ec != std::errc{} || ptr != end || port < 1 ||
+  if (value.empty() || ec != std::errc{} || ptr != end || port < min_port ||
       port > 65535) {
-    throw std::invalid_argument(std::string(flag) +
-                                " must be a port in [1, 65535], not '" +
+    throw std::invalid_argument(std::string(flag) + " must be a port in [" +
+                                std::to_string(min_port) + ", 65535], not '" +
                                 std::string(value) + "'");
   }
   return static_cast<uint16_t>(port);

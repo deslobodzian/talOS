@@ -414,7 +414,12 @@ layout ([talOS/telemetry](../telemetry/README.md#dashboard-layout)); config
 load refuses a missing file, and the file is in the config's
 `CONFIG_FILES` and its bundle. The watched topic comes from `[studio] topic`,
 the same setting the telemetry node reads. `--studio-http-port PORT`
-overrides `[studio] http_port` for one run. The default webroot exists only
+overrides `[studio] http_port` for one run; `--studio-http-port 0` asks the
+OS for a free port (`[studio] http_port` in the config still requires
+`[1, 65535]`). The launcher captures the bridge's `listening <port>` line
+from its output pipe, records the bound port as `http_port` on the
+`studio_bridge` entry in `manifest.json`, and prints that port in
+`Started studio_bridge ... on http://localhost:<port>` (never port 0). The default webroot exists only
 in a checkout that has run `bazel build //studio:web_dist`; elsewhere set
 `[studio] webroot` (a robot repository's: [built pages](../../studio/README.md#built-pages)).
 The bridge needs the binary (`[studio] bridge`, resolved under `bazel-bin/`
@@ -497,7 +502,9 @@ session panel; how it ended (a kill, a crash, its exit code) is never in
 the launcher's exit status: an operator's stop of a session whose bridge
 died still exits 0.
 
-A restart binds the same `[studio] http_port`. The bridge holds its port
+A restart binds the same HTTP port: the configured port, or the port learned
+from the first run's `listening <port>` line when started with
+`--studio-http-port 0`. The bridge holds its port
 exclusively (`SO_REUSEADDR`, never `SO_REUSEPORT`;
 [studio/bridge](../../studio/bridge/README.md)), and the launcher kills a dead
 or hung run's process group before it schedules the restart, so the port is
@@ -1064,6 +1071,9 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   only the increases after a count's first.
 - per node, `recorder_failed`, `log_gap` and `log_capped`: what its runs'
   event logs lost ([restarts](#restarts)).
+- on `studio_bridge`, `http_port`: the HTTP port the bridge bound (captured
+  from its `listening <port>` line); absent for other members and until the
+  bridge reports it.
 - `stopped_before_start`: a stop request arrived before every member had
   started ([two phases](#two-phases)); the members without `runs` were
   never started.
@@ -1131,7 +1141,7 @@ header:
 the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 `manifest.json` is written before nodes start, then replaced atomically
 (written beside it, then renamed over it) at each process lifecycle change,
-when a node reports a stopped event log, when a run's endpoints differ from
+when `studio_bridge` reports its bound `http_port`, when a node reports a stopped event log, when a run's endpoints differ from
 its probe and when a run's delivery-loss count first leaves 0
 ([session manifest](#session-manifest)): a reader always sees one complete
 version. `graph.json`,

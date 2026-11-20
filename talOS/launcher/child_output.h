@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <streambuf>
 #include <string>
 #include <string_view>
@@ -77,6 +78,9 @@ inline constexpr uint64_t kChildOutputLogMaxBytes = uint64_t{64} << 20;
 // line without its newline the echo holds per pipe before it forwards it
 // anyway (splitting that line).
 inline constexpr std::size_t kChildOutputReadBytes = std::size_t{64} << 10;
+// Maximum line length buffered while watching a member's output stream for a
+// prefix; longer lines are discarded until the next newline.
+inline constexpr std::size_t kChildOutputWatchLineBytes = 256;
 // The launcher's own lines in a session directory. The launcher refuses a
 // roster member whose name breaks the node-name rule, `talos` (a reserved
 // owner) and `Talos` included, so no member's `<name>.log` takes this name;
@@ -176,10 +180,18 @@ class ChildOutput {
   ChildOutput& operator=(const ChildOutput&) = delete;
 
   // Drains `reader`, an output pipe SpawnProcess returned for `name`'s run
-  // `pid`, into `path`; with `echo`, also to the launcher's stdout. Takes the
-  // descriptor.
+  // `pid`, into `path`; with `echo`, also to the launcher's stdout. With a
+  // non-empty `watch_prefix`, the reader thread assembles lines (up to
+  // kChildOutputWatchLineBytes) even when `echo` is false, captures the first
+  // complete line starting with `watch_prefix` for this run (MatchedLine), and
+  // wakes SupervisionWakeup when it arrives. Takes the descriptor.
   void Add(int reader, const std::string& path, std::string_view name,
-           pid_t pid, bool echo);
+           pid_t pid, bool echo, std::string watch_prefix = {});
+
+  // The first complete line matching `watch_prefix` read from `path`'s run
+  // `pid` (without its trailing newline), or nullopt until one arrives.
+  std::optional<std::string> MatchedLine(const std::string& path,
+                                         pid_t pid) const;
 
   // Waits up to `linger` for every pipe to end -- its run has exited, but a
   // descendant that left the process group can hold it open -- writes out
@@ -194,11 +206,17 @@ class ChildOutput {
  private:
   struct Stream {
     int fd;
+    pid_t pid{-1};
     std::string path;
     bool echo;
     std::string header;  // Written to the log when the reader picks it up.
     // The reader's only: a partial line the echo has not forwarded yet.
     std::string echo_held;
+    // The reader's only: watched-prefix line assembly for this run.
+    std::string watch_prefix;
+    std::string watch_held;
+    bool watch_discard{false};
+    bool watch_matched{false};
   };
   // Output bound for one path that the writer has not taken yet.
   struct Pending {
@@ -206,10 +224,17 @@ class ChildOutput {
     uint64_t dropped{0};  // Since the writer last took `bytes`.
     uint64_t dropped_total{0};
     int runs{0};
+    pid_t watched_pid{-1};
+    std::optional<std::string> watched_line;
   };
 
   // A full wake pipe already holds a wakeup.
   void Wake();
+
+  // Scans `bytes` for the first complete line starting with
+  // `stream.watch_prefix` (reader thread only).
+  static std::optional<std::string> ScanWatchedLine(Stream& stream,
+                                                    std::string_view bytes);
 
   // Moves `size` bytes read from `stream` into its buffers, dropping what
   // they cannot hold, and echoes the whole lines among them.
@@ -244,9 +269,11 @@ class ChildOutput {
 
 // SpawnProcess with the child's stdout and stderr drained into `path` by
 // `output` (echoed to the launcher's stdout with `echo`), the stop signals
-// held with `hold_stop`.
+// held with `hold_stop`, and optional `watch_prefix` passed to
+// ChildOutput::Add.
 pid_t SpawnDrained(std::vector<std::string> args, std::string& error,
                    ChildOutput& output, const std::string& path,
-                   std::string_view name, bool echo, bool hold_stop = false);
+                   std::string_view name, bool echo, bool hold_stop = false,
+                   std::string watch_prefix = {});
 
 }  // namespace talos::launcher

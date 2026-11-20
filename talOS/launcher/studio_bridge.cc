@@ -5,15 +5,35 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <csignal>
 #include <cstddef>
 #include <iostream>
+#include <optional>
 #include <string_view>
 
 #include "talOS/launcher/console_line.h"
 #include "talOS/launcher/spawn.h"
 
 namespace talos::launcher {
+namespace {
+
+constexpr std::string_view kStudioListeningPrefix = "listening ";
+
+std::optional<uint16_t> ParseListeningPort(std::string_view line) {
+  if (!line.starts_with(kStudioListeningPrefix)) return std::nullopt;
+  const std::string_view value = line.substr(kStudioListeningPrefix.size());
+  int port = 0;
+  const auto* end = value.data() + value.size();
+  const auto [ptr, ec] = std::from_chars(value.data(), end, port);
+  if (value.empty() || ec != std::errc{} || ptr != end || port < 1 ||
+      port > 65535) {
+    return std::nullopt;
+  }
+  return static_cast<uint16_t>(port);
+}
+
+}  // namespace
 
 bool DropUnansweredStudioBridge(std::vector<NodeSpec>& specs,
                                 std::vector<NodeDescription>& described) {
@@ -78,6 +98,8 @@ void StudioBridge::NewRun(SupervisionTime spawned) {
   kill_reason_ = {};
   heartbeat_killed_ = false;
   realtime_reported_ = false;
+  port_observed_ = false;
+  started_port_announced_ = false;
 }
 
 void StudioBridge::BeginSupervision(SupervisionTime started) {
@@ -152,6 +174,25 @@ bool StudioBridge::Watch(NodeProcessInfo& proc,
   const LivenessCheck check =
       liveness_.Watch(clock, read_row, liveness_limits_);
   bool changed = false;
+  if (!port_observed_) {
+    if (const auto line = output_.MatchedLine(log_path_, proc.pid)) {
+      port_observed_ = true;
+      if (const auto port = ParseListeningPort(*line)) {
+        http_port_ = *port;
+        args_[2] = std::to_string(*port);
+        if (proc.http_port != *port) {
+          proc.http_port = *port;
+          changed = true;
+        }
+        if (settled_ && !started_port_announced_) {
+          started_port_announced_ = true;
+          ConsoleLine(std::cout)
+              << "[launcher] Started studio_bridge (pid " << proc.pid
+              << ") on http://localhost:" << http_port_ << "\n";
+        }
+      }
+    }
+  }
   if (!realtime_reported_) {
     if (const auto outcome = introspect::RealtimeOf(row_flags)) {
       realtime_reported_ = true;
@@ -190,6 +231,8 @@ void StudioBridge::Exited(NodeProcessInfo& proc, int status,
   running_ = false;
   settled_ = false;
   heartbeat_killed_ = false;
+  port_observed_ = false;
+  started_port_announced_ = false;
   kill_reason_ = {};
   if (stopping) {
     ConsoleLine(std::cout) << "[launcher] Process studio_bridge (pid "
@@ -206,9 +249,12 @@ void StudioBridge::Supervise(NodeProcessInfo& proc, SupervisionTime now,
       now - last_spawn_ >= kStudioBridgeSettleInterval) {
     settled_ = true;
     came_up_ = true;
-    ConsoleLine(std::cout) << "[launcher] Started studio_bridge (pid "
-                           << proc.pid << ") on http://localhost:" << http_port_
-                           << "\n";
+    if (http_port_ != 0 && !started_port_announced_) {
+      started_port_announced_ = true;
+      ConsoleLine(std::cout)
+          << "[launcher] Started studio_bridge (pid " << proc.pid
+          << ") on http://localhost:" << http_port_ << "\n";
+    }
   }
   if (!restart_.pending()) return;
   // Nothing is started once the stop has begun.
@@ -252,7 +298,8 @@ void StudioBridge::Finish(NodeProcessInfo& proc, bool stop_requested) {
 
 pid_t StudioBridge::Spawn(std::string& error) {
   return SpawnDrained(args_, error, output_, log_path_, kStudioBridgeName,
-                      /*echo=*/false);
+                      /*echo=*/false, /*hold_stop=*/false,
+                      std::string{kStudioListeningPrefix});
 }
 
 void StudioBridge::Restart(NodeProcessInfo& proc, SupervisionTime now,

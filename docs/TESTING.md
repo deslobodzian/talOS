@@ -196,10 +196,12 @@ Where RULES.md 12 is read too broadly or too narrowly:
    `sleep(100ms); EXPECT(...)` is banned.
 4. **Ports are bound at 0** and read back. `exclusive` is for tests that own
    a host-wide resource (the whole-graph e2e tests), not for fixed ports.
-   The exception is a port handed to the launcher, which refuses 0 for the
-   Studio bridge and the gateway link: the test reserves one and releases it
-   before the launch, so another process can take it first, and the test
-   says so when that happens (`//studio:drive_browser_test` names the
+   Studio's bridge accepts `--studio-http-port 0` and the launcher records
+   its bound port as `http_port` in `manifest.json`. The remaining exception
+   is the gateway UDP link (`--remote-port`, `--local-port`,
+   `sim_gateway --port`), which still refuses 0: tests reserve and release
+   those UDP ports before the launch, so another process can take one first,
+   and say so when that happens (`//studio:drive_browser_test` names the
    member's failed-bind log line).
 5. **Randomness is seeded and printed**, settable from the environment
    (`TALOS_SOAK_SEED`).

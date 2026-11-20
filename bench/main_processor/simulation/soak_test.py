@@ -243,7 +243,7 @@ class Soak(unittest.TestCase):
             duration = 2 * LEAD_S + teleop_s
             args = [str(root / "talOS/launcher/launcher"), "--config", str(config),
                     "--sim", "--start-sim-gateway", "--start-studio-bridge",
-                    "--studio-http-port", str(support.tcp_port()),
+                    "--studio-http-port", "0",
                     "--remote", "127.0.0.1", "--remote-port", str(gw_port),
                     "--local-port", str(bridge_port), "--output-dir", str(output),
                     "--duration-s", f"{duration:.0f}"]
