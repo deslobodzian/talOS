@@ -10,7 +10,12 @@ that follows a hidden HTML comment `size: <name>` is checked:
 `//tools:check_data_flow_sizes_test` fails unless it equals what
 `//tools:data_flow_sizes` prints for that name from the defining headers,
 and unless every printed size is marked somewhere (a new one gets its marker
-in the same change).
+in the same change). Those markers cover the UDP frame, payload-codec,
+device-cap, shared-memory slot, live-registry, dispatch-log, and
+telemetry-page/burst constants defined in framework headers; numbers in inline
+code spans, bench and example config arithmetic and message sizes, measured
+telemetry and wake-socket tables, and Studio bridge egress budgets are
+intentionally unchecked.
 
 ## Processes and links
 
