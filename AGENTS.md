@@ -71,7 +71,8 @@ frontier model at high reasoning effort.
 Planning uses built-in plan mode (`/plan` in Antigravity, `Plan` in Claude
 Code); a security pass uses `/security-review` where available or a
 security-focused `reviewer` pass. Shared project skills live in
-`.agents/skills/<name>/SKILL.md`, which both tools discover natively.
+`.agents/skills/<name>/SKILL.md` (symlink `.claude/skills/` if needed for
+Claude Code).
 
 Rule loading: Claude Code imports this file via `CLAUDE.md` and expands its `@`
 references inline; Antigravity loads `AGENTS.md` directly, inlines `RULES.md`,
