@@ -58,6 +58,20 @@ std::pair<std::string, std::uint64_t> LogAndPlace(const std::string& file) {
   return {std::string{stem} + std::string{kExtension}, k};
 }
 
+// `deadline_ns + period_ns * max(cycles, 1)`, saturated to int64_t::max on
+// overflow.
+std::int64_t AdvanceDeadline(std::int64_t deadline_ns, std::int64_t period_ns,
+                             std::uint64_t cycles) {
+  const std::uint64_t steps = std::max<std::uint64_t>(cycles, 1);
+  if (period_ns <= 0) return deadline_ns;
+  const std::int64_t max_ns = std::numeric_limits<std::int64_t>::max();
+  const std::int64_t base = std::max<std::int64_t>(deadline_ns, 0);
+  const auto max_steps =
+      static_cast<std::uint64_t>((max_ns - base) / period_ns);
+  if (steps > max_steps) return max_ns;
+  return deadline_ns + period_ns * static_cast<std::int64_t>(steps);
+}
+
 // The log a file of it belongs to (LogAndPlace).
 std::string LogOfFile(const std::string& file) {
   return LogAndPlace(file).first;
@@ -161,6 +175,9 @@ RecordedSession::RecordedSession(const std::string& path,
   std::vector<bool> watched_by_replayed;
   // The replayed program's first recorded run: its log's origin and run start.
   std::optional<std::pair<MonotonicTime, MonotonicTime>> replayed_run;
+  // Every distinct run log of the replayed program (LogOfFile): size 1 means
+  // it ran once without restarting.
+  std::set<std::string> replayed_logs;
   // The log of that run; the first file of it read; the file the run start
   // was read from (that first file until a firing gives it); whether a
   // firing gave it; the first file of the log read that did not continue
@@ -173,6 +190,10 @@ RecordedSession::RecordedSession(const std::string& path,
   std::string replayed_run_file;
   bool replayed_run_fired = false;
   std::string replayed_run_broken;
+  // The dispatch_index of the first intact record read in that run's first
+  // file (before any loss), so an active file whose segment0 was deleted
+  // without a marker is refused when it starts past dispatch 1.
+  std::optional<std::uint64_t> replayed_run_first_dispatch_index;
   // The now_ns of that run's first record of a dispatch (a TIMER, MESSAGE
   // or EXIT record), and the earliest loss of its timeline (gap_start), read
   // while the log continued from its first segment: a dispatch, or the EXIT
@@ -180,6 +201,19 @@ RecordedSession::RecordedSession(const std::string& path,
   std::optional<MonotonicTime> replayed_run_dispatch;
   std::optional<MonotonicTime> replayed_run_loss;
   bool replayed_run_timed = false;
+  // Per-timer armed state of the replayed program's first run, updated from
+  // its manifest and every TIMER, ARM_TIMER and DISARM_TIMER record across
+  // its segments, and the latest event_time_ns of a TIMER or MESSAGE dispatch
+  // in that run: used to avoid fabricating a firing after a late EXIT or for
+  // an offset-0 timer whose only dispatch record is its EXIT.
+  struct TimerState {
+    bool armed{false};
+    std::optional<std::int64_t> deadline_ns;
+    std::int64_t offset_ns{0};
+    std::int64_t period_ns{0};
+  };
+  std::vector<TimerState> replayed_run_timers;
+  std::optional<MonotonicTime> replayed_run_last_event;
   // The latest time any of its logs recorded: its last run's exit.
   std::optional<MonotonicTime> replayed_end;
   // What one damaged stretch of a log cost one of its topic sources: the
@@ -202,21 +236,23 @@ RecordedSession::RecordedSession(const std::string& path,
   };
   // Each log read: the earliest time a GAP record of it names; what each of
   // its damaged stretches cost each topic source; whether it holds its EXIT;
-  // and the topics it recorded (with whether the replayed program watched
-  // them in it).
+  // any missing or unreadable segment detected when reading this file; and
+  // the topics it recorded (with whether the replayed program watched them in
+  // it).
   struct ReadLog {
     std::string path;
     std::optional<MonotonicTime> gap;
     std::vector<Stretch> damage;
     bool exit{false};
+    std::string segment_refusal;
     std::vector<std::pair<std::uint32_t, bool>> topics;
   };
   std::vector<ReadLog> logs;
   // Each file read, by path: its origin, then the now_ns of its last intact
   // record and by source id its watchers' last intact receipts' publication
   // times and sequences, and the earliest loss of its timeline and its
-  // timers' offsets (gap_start and timer_offset, below). A segment of the
-  // same log (LogSegmentFiles: the next one, with its origin and manifest)
+  // timers' offsets and armed states (gap_start, timer_offset, timer_state).
+  // A segment of the same log (the next one, with its origin and manifest)
   // starts from them, so damage right after its header is bounded, and a
   // run start read from its first firing is bounded and offset, as it would
   // be in one file.
@@ -227,17 +263,43 @@ RecordedSession::RecordedSession(const std::string& path,
     std::vector<std::optional<std::uint64_t>> last_sequence;
     std::optional<MonotonicTime> gap_start;
     std::vector<std::optional<std::int64_t>> timer_offset;
+    std::vector<TimerState> timer_state;
   };
   std::map<std::string, Carried> carried;
+  // Per-log segment continuity across all files of one base log (LogOfFile),
+  // which SessionFiles orders consecutively from segment 0 to the unnumbered
+  // active file. Catches incomplete-header segments in the middle or at the
+  // head, missing first segments without a marker, gaps in segment numbers,
+  // and missing segments before the unnumbered active file (via dispatch
+  // index or accepted-SEND sequence jumps).
+  struct LogContinuity {
+    std::string skipped_incomplete;
+    bool has_readable{false};
+    std::string prev_read;
+    std::uint64_t prev_place{0};
+    MonotonicTime prev_origin;
+    std::size_t prev_manifest_size{0};
+    bool prev_truncated{false};
+    std::optional<std::uint64_t> prev_last_dispatch;
+    std::vector<std::optional<std::uint64_t>> prev_last_sent_seq;
+  };
+  std::map<std::string, LogContinuity> log_continuity;
   bool first = true;
 
   for (const std::string& log_path : log_paths_) {
+    constexpr std::uint64_t kLast = std::numeric_limits<std::uint64_t>::max();
+    const auto [base_log, place] = LogAndPlace(log_path);
+    LogContinuity& cont = log_continuity[base_log];
+
     std::optional<log::LogReader> opened;
     try {
       opened.emplace(log_path);
     } catch (const log::IncompleteLogHeader& e) {
-      // A log cut while it was being created holds no records.
+      // A log cut while it was being created holds no records; if other
+      // segments of the same log are readable, note this file so any topic
+      // feed and run start across it are refused.
       std::cerr << "warning: skipping " << log_path << ": " << e.what() << "\n";
+      if (cont.skipped_incomplete.empty()) cont.skipped_incomplete = log_path;
       continue;
     }
     log::LogReader& reader = *opened;
@@ -255,6 +317,7 @@ RecordedSession::RecordedSession(const std::string& path,
     end_ = std::max(end_, reader.start_time());
     // A log of the program being replayed: what it saw, and when it ran.
     const bool own_log = !replayed.empty() && reader.process_name() == replayed;
+    if (own_log) replayed_logs.insert(base_log);
 
     // This log's topic sources, by source id: where their messages go.
     constexpr std::uint32_t kNone = 0xFFFFFFFF;
@@ -265,10 +328,13 @@ RecordedSession::RecordedSession(const std::string& path,
     // its origin (RealtimeEventLoop shifts its schedule by that).
     std::vector<std::optional<std::int64_t>> timer_offset(
         reader.manifest().size());
+    std::vector<TimerState> timer_state(reader.manifest().size());
     std::optional<MonotonicTime> run_start;
     bool timed = false;
-    // The now_ns of this file's first record of a dispatch.
+    // The now_ns of this file's first record of a dispatch, and the latest
+    // event_time_ns of a TIMER or MESSAGE dispatch in this file.
     std::optional<MonotonicTime> first_dispatch;
+    std::optional<MonotonicTime> last_event;
     // The topics this log recorded, and whether the replayed program
     // watched each in it.
     std::vector<std::pair<std::uint32_t, bool>> recorded;
@@ -286,29 +352,53 @@ RecordedSession::RecordedSession(const std::string& path,
         reader.manifest().size());
     std::vector<std::optional<std::uint64_t>> last_sequence(
         reader.manifest().size());
-    // The segment before this one of the same log, when it was read, and
-    // whether this one is the next segment after it (a numbered segment
-    // whose number is one more; the log's own file, after its last).
+    // Check structural continuity with the previously read file of `base_log`.
+    bool header_continues = false;
+    std::string segment_refusal;
+    if (!cont.has_readable) {
+      if (!cont.skipped_incomplete.empty()) {
+        segment_refusal = "its earlier segment " + cont.skipped_incomplete +
+                          " of " + base_log +
+                          " could not be read (its header is incomplete)";
+      } else if (place != 0 && place != kLast) {
+        segment_refusal = "its first segment " +
+                          log::LogSegmentPath(base_log, 0) + " of " + base_log +
+                          " is missing";
+      }
+    } else {
+      if (!cont.skipped_incomplete.empty()) {
+        segment_refusal = "segment " + cont.skipped_incomplete + " of " +
+                          base_log +
+                          " before it could not be read (its header is "
+                          "incomplete)";
+      } else if (place != kLast && place != cont.prev_place + 1) {
+        segment_refusal = "segment " +
+                          log::LogSegmentPath(base_log, cont.prev_place + 1) +
+                          " of " + base_log + " before it is missing";
+      } else if (reader.start_time() != cont.prev_origin ||
+                 reader.manifest().size() != cont.prev_manifest_size) {
+        segment_refusal = "it does not continue " + cont.prev_read + " in " +
+                          base_log + " (different origin or manifest)";
+      } else if (cont.prev_truncated) {
+        segment_refusal = "segment " + cont.prev_read + " of " + base_log +
+                          " before it ended with a damaged tail";
+      } else {
+        header_continues = true;
+      }
+    }
+    cont.skipped_incomplete.clear();
+
     const Carried* continued = nullptr;
     bool next_segment = false;
-    {
-      const std::vector<std::string> segments =
-          log::LogSegmentFiles(LogOfFile(log_path));
-      const auto at = std::find(segments.begin(), segments.end(), log_path);
-      if (at != segments.end() && at != segments.begin()) {
-        const auto previous = carried.find(*std::prev(at));
-        if (previous != carried.end() &&
-            previous->second.origin == reader.start_time() &&
-            previous->second.last_receipt.size() == last_receipt.size()) {
-          continued = &previous->second;
-          const std::uint64_t place = LogAndPlace(log_path).second;
-          next_segment = place == std::numeric_limits<std::uint64_t>::max() ||
-                         place == LogAndPlace(*std::prev(at)).second + 1;
-          last_now = continued->last_now;
-          last_receipt = continued->last_receipt;
-          last_sequence = continued->last_sequence;
-          gap_start = continued->gap_start;
-        }
+    if (header_continues) {
+      const auto previous = carried.find(cont.prev_read);
+      if (previous != carried.end()) {
+        continued = &previous->second;
+        next_segment = true;
+        last_now = continued->last_now;
+        last_receipt = continued->last_receipt;
+        last_sequence = continued->last_sequence;
+        gap_start = continued->gap_start;
       }
     }
     ReadLog read{.path = log_path};
@@ -325,10 +415,16 @@ RecordedSession::RecordedSession(const std::string& path,
     // before that lost receipts in the same range, bounded alike).
     std::vector<std::optional<std::size_t>> open(reader.manifest().size());
     for (const Registration& registration : reader.manifest()) {
-      if (registration.kind == SourceKind::TIMER && registration.armed &&
+      if (registration.kind == SourceKind::TIMER &&
           registration.id < timer_offset.size()) {
-        timer_offset[registration.id] = registration.offset_ns;
-        timed = true;
+        timer_state[registration.id] =
+            TimerState{.armed = registration.armed,
+                       .offset_ns = registration.offset_ns,
+                       .period_ns = registration.period_ns};
+        if (registration.armed) {
+          timer_offset[registration.id] = registration.offset_ns;
+          timed = true;
+        }
       }
       if (registration.kind != SourceKind::SENDER &&
           registration.kind != SourceKind::WATCHER) {
@@ -366,7 +462,26 @@ RecordedSession::RecordedSession(const std::string& path,
     }
     // Every segment repeats the log's manifest: a timer the segment before
     // re-armed or disarmed is as that one left it.
-    if (continued != nullptr) timer_offset = continued->timer_offset;
+    if (continued != nullptr) {
+      timer_offset = continued->timer_offset;
+      timer_state = continued->timer_state;
+    }
+
+    // Record-level continuity across segment boundaries (catches a deleted
+    // segment right before the unnumbered active file, or a rotated active
+    // file whose segment0 was deleted with no marker).
+    bool seen_loss_in_file = false;
+    bool seen_record_in_file = false;
+    std::optional<std::uint64_t> first_file_dispatch;
+    std::optional<std::uint64_t> last_dispatch =
+        header_continues ? cont.prev_last_dispatch : std::nullopt;
+    std::vector<std::optional<std::uint64_t>> last_sent_seq(
+        reader.manifest().size());
+    if (header_continues &&
+        cont.prev_last_sent_seq.size() == last_sent_seq.size()) {
+      last_sent_seq = cont.prev_last_sent_seq;
+    }
+    std::vector<bool> checked_first_send(reader.manifest().size(), false);
 
     log::LogReader::Record record;
     while (reader.next(record)) {
@@ -374,6 +489,9 @@ RecordedSession::RecordedSession(const std::string& path,
       // The reader skipped a damaged stretch just before this record: what
       // it lost of each topic source, by when that could be fed at.
       if (reader.damage().spans != spans) {
+        seen_loss_in_file = true;
+        last_dispatch.reset();
+        std::fill(last_sent_seq.begin(), last_sent_seq.end(), std::nullopt);
         const std::uint64_t offset =
             spans == 0 ? reader.damage().first_offset : record_end;
         spans = reader.damage().spans;
@@ -415,6 +533,31 @@ RecordedSession::RecordedSession(const std::string& path,
           read.damage.push_back(lost);
         }
       }
+      if (!seen_record_in_file) {
+        seen_record_in_file = true;
+        if (!seen_loss_in_file) {
+          first_file_dispatch = header.dispatch_index;
+          if (!cont.has_readable && place == kLast &&
+              header.dispatch_index > 1 && segment_refusal.empty()) {
+            segment_refusal = "its first dispatch is " +
+                              std::to_string(header.dispatch_index) +
+                              ", not 1: its first segment " +
+                              log::LogSegmentPath(base_log, 0) + " of " +
+                              base_log + " is missing";
+          } else if (header_continues && cont.prev_last_dispatch.has_value() &&
+                     header.dispatch_index > *cont.prev_last_dispatch + 1) {
+            next_segment = false;
+            if (segment_refusal.empty()) {
+              segment_refusal = "dispatch index jumps from " +
+                                std::to_string(*cont.prev_last_dispatch) +
+                                " in " + cont.prev_read + " to " +
+                                std::to_string(header.dispatch_index) + " in " +
+                                log_path + ": a segment of " + base_log +
+                                " between them is missing";
+            }
+          }
+        }
+      }
       record_end =
           record.offset + sizeof(log::RecordHeader) + header.stored_bytes;
       last_now = header.now_ns;
@@ -425,13 +568,27 @@ RecordedSession::RecordedSession(const std::string& path,
                                 MonotonicTime::from_nanos(header.now_ns));
       }
       if (const auto marked = log::GapOf(header, record.payload)) {
+        seen_loss_in_file = true;
+        if (marked->detailed) {
+          last_dispatch = marked->detail.last_dispatch_index;
+        } else {
+          last_dispatch.reset();
+        }
+        std::fill(last_sent_seq.begin(), last_sent_seq.end(), std::nullopt);
         const MonotonicTime start = MonotonicTime::from_nanos(marked->start_ns);
         gap = std::min(gap.value_or(start), start);
         gap_start = std::min(gap_start.value_or(start), start);
         continue;
       }
+      last_dispatch = header.dispatch_index;
       const auto kind = static_cast<EventKind>(header.kind);
       if (kind == EventKind::EXIT) read.exit = true;
+      if (kind == EventKind::TIMER || kind == EventKind::MESSAGE) {
+        const MonotonicTime event_time =
+            MonotonicTime::from_nanos(header.event_time_ns);
+        last_event =
+            last_event ? std::max(*last_event, event_time) : event_time;
+      }
       // A dispatch's own record, or the run's EXIT; not a GAP record (above),
       // which carries a dropped record's dispatch index and the resuming
       // record's now_ns, nor an operation record of a dispatch already seen.
@@ -448,6 +605,26 @@ RecordedSession::RecordedSession(const std::string& path,
         if (stretch.has_value() && read.damage[*stretch].receipts) {
           read.damage[*stretch].to = header.sequence;
           stretch.reset();
+        }
+      }
+      if (own_log && header.source_id < timer_state.size()) {
+        TimerState& timer = timer_state[header.source_id];
+        if (kind == EventKind::ARM_TIMER) {
+          timer.armed = true;
+          timer.deadline_ns = header.event_time_ns;
+          timer.period_ns = static_cast<std::int64_t>(header.sequence);
+        } else if (kind == EventKind::DISARM_TIMER) {
+          timer.armed = false;
+          timer.deadline_ns.reset();
+        } else if (kind == EventKind::TIMER) {
+          if (timer.period_ns > 0) {
+            timer.armed = true;
+            timer.deadline_ns = AdvanceDeadline(
+                header.event_time_ns, timer.period_ns, header.sequence);
+          } else {
+            timer.armed = false;
+            timer.deadline_ns.reset();
+          }
         }
       }
       // The first firing of a timer the run had not re-armed is at the run
@@ -476,6 +653,32 @@ RecordedSession::RecordedSession(const std::string& path,
       // A watcher's receipt, or a writer's accepted send.
       const bool receipt = kind == EventKind::MESSAGE;
       const bool send = kind == EventKind::SEND && header.aux == 0;
+      if (send && header.source_id < last_sent_seq.size()) {
+        if (header_continues && !seen_loss_in_file &&
+            !checked_first_send[header.source_id]) {
+          checked_first_send[header.source_id] = true;
+          if (cont.prev_last_sent_seq.size() == last_sent_seq.size() &&
+              cont.prev_last_sent_seq[header.source_id].has_value() &&
+              header.sequence >
+                  *cont.prev_last_sent_seq[header.source_id] + 1) {
+            next_segment = false;
+            if (segment_refusal.empty()) {
+              const std::string topic_name =
+                  header.source_id < topic_of.size() &&
+                          topic_of[header.source_id] != kNone
+                      ? topics_[topic_of[header.source_id]].name
+                      : std::to_string(header.source_id);
+              segment_refusal =
+                  "topic '" + topic_name + "' sequence jumps from " +
+                  std::to_string(*cont.prev_last_sent_seq[header.source_id]) +
+                  " in " + cont.prev_read + " to " +
+                  std::to_string(header.sequence) + " in " + log_path +
+                  ": a segment of " + base_log + " between them is missing";
+            }
+          }
+        }
+        last_sent_seq[header.source_id] = header.sequence;
+      }
       if ((!receipt && !send) || header.source_id >= topic_of.size() ||
           topic_of[header.source_id] == kNone) {
         continue;
@@ -545,13 +748,30 @@ RecordedSession::RecordedSession(const std::string& path,
                           "hold every message the stretch could have lost\n"
                         : "; its intact records replay\n");
     }
+    if (!cont.has_readable && place == 0 && !seen_record_in_file &&
+        !seen_loss_in_file) {
+      // An intact empty segment0 starts before dispatch 1, so a jump past 1
+      // in a following segment is still detected.
+      last_dispatch = 0;
+    }
+    cont.has_readable = true;
+    cont.prev_read = log_path;
+    cont.prev_place = place;
+    cont.prev_origin = reader.start_time();
+    cont.prev_manifest_size = reader.manifest().size();
+    cont.prev_truncated = reader.truncated();
+    cont.prev_last_dispatch = last_dispatch;
+    cont.prev_last_sent_seq = std::move(last_sent_seq);
+
     carried[log_path] = Carried{.origin = reader.start_time(),
                                 .last_now = last_now,
                                 .last_receipt = last_receipt,
                                 .last_sequence = last_sequence,
                                 .gap_start = gap_start,
-                                .timer_offset = timer_offset};
+                                .timer_offset = timer_offset,
+                                .timer_state = timer_state};
     read.gap = gap;
+    read.segment_refusal = std::move(segment_refusal);
     read.topics = std::move(recorded);
     logs.push_back(std::move(read));
     // Its first run: the earliest origin among its logs (restarts included).
@@ -567,27 +787,39 @@ RecordedSession::RecordedSession(const std::string& path,
       replayed_run.emplace(reader.start_time(),
                            std::max(reader.start_time(),
                                     run_start.value_or(reader.start_time())));
-      replayed_run_log = LogOfFile(log_path);
+      replayed_run_log = base_log;
       replayed_run_first_read = log_path;
       replayed_run_file = log_path;
       replayed_run_fired = run_start.has_value();
       replayed_run_broken.clear();
+      replayed_run_first_dispatch_index = first_file_dispatch;
       replayed_run_dispatch = first_dispatch;
       replayed_run_loss = gap_start;
       replayed_run_timed = timed;
-    } else if (own_log && !replayed_run_fired &&
+      replayed_run_timers = timer_state;
+      replayed_run_last_event = last_event;
+    } else if (own_log && replayed_run &&
                reader.start_time() == replayed_run->first &&
-               LogOfFile(log_path) == replayed_run_log) {
-      if (continued == nullptr || !next_segment) {
-        if (replayed_run_broken.empty()) replayed_run_broken = log_path;
-      } else if (replayed_run_broken.empty()) {
-        if (!replayed_run_dispatch) replayed_run_dispatch = first_dispatch;
-        // Carried from the segment before: the loss so far.
-        replayed_run_loss = gap_start;
-        if (run_start) {
-          replayed_run->second = std::max(reader.start_time(), *run_start);
-          replayed_run_file = log_path;
-          replayed_run_fired = true;
+               base_log == replayed_run_log) {
+      replayed_run_timers = timer_state;
+      if (last_event) {
+        replayed_run_last_event =
+            replayed_run_last_event
+                ? std::max(*replayed_run_last_event, *last_event)
+                : *last_event;
+      }
+      if (!replayed_run_fired) {
+        if (continued == nullptr || !next_segment) {
+          if (replayed_run_broken.empty()) replayed_run_broken = log_path;
+        } else if (replayed_run_broken.empty()) {
+          if (!replayed_run_dispatch) replayed_run_dispatch = first_dispatch;
+          // Carried from the segment before: the loss so far.
+          replayed_run_loss = gap_start;
+          if (run_start) {
+            replayed_run->second = std::max(reader.start_time(), *run_start);
+            replayed_run_file = log_path;
+            replayed_run_fired = true;
+          }
         }
       }
     }
@@ -598,17 +830,40 @@ RecordedSession::RecordedSession(const std::string& path,
   // after the live run start: every timer armed before the run, at the run
   // start plus its offset, then falls no earlier than it did live, and live
   // fired none up to that run's last record, so neither does the replay up
-  // to there; a program that ran once ends there (loop_end()), unless its
-  // loop was late when it stopped (a due deadline it never fired before its
-  // EXIT, which the replay fires); a restarted program replays as one run.
-  // A timer it re-armed in a dispatch is re-armed at that dispatch's time,
-  // as live. The origin would fire such a timer the whole construction time
-  // early, at deadlines live never reached. Its log is refused (below) when
-  // a loss in it may hold its firings, or when it holds no such record.
+  // to there; a restarted program replays as one run. A timer it re-armed in
+  // a dispatch is re-armed at that dispatch's time, as live. The origin would
+  // fire such a timer the whole construction time early, at deadlines live
+  // never reached. Its log is refused (below) when a loss in it may hold its
+  // firings, or when it holds no such record.
   if (replayed_run && replayed_run_timed && !replayed_run_fired &&
       !replayed_run_loss && replayed_run_dispatch) {
     replayed_run->second =
         std::max(replayed_run->first, *replayed_run_dispatch);
+  }
+  // A single-run live loop that was late when it stopped can record its EXIT
+  // after a due timer deadline it never fired, and an offset-0 timer whose
+  // run's only dispatch record is its EXIT sits right at
+  // run_start == replayed_end. End the replay one nanosecond before the
+  // earliest armed timer deadline that never fired live (strictly after any
+  // recorded TIMER or MESSAGE dispatch, or any deadline when none ran), so
+  // replay never fabricates a timer firing that did not run live.
+  if (replayed_run && replayed_end && replayed_logs.size() == 1) {
+    std::optional<MonotonicTime> earliest_unfired;
+    for (const TimerState& timer : replayed_run_timers) {
+      if (!timer.armed) continue;
+      const MonotonicTime deadline =
+          timer.deadline_ns.has_value()
+              ? MonotonicTime::from_nanos(*timer.deadline_ns)
+              : replayed_run->second + Duration{timer.offset_ns};
+      if (!replayed_run_last_event.has_value() ||
+          deadline > *replayed_run_last_event) {
+        earliest_unfired =
+            std::min(earliest_unfired.value_or(deadline), deadline);
+      }
+    }
+    if (earliest_unfired && *earliest_unfired <= *replayed_end) {
+      replayed_end = *earliest_unfired - Duration{1};
+    }
   }
   if (first) throw std::runtime_error("no readable .tlog files in " + path);
 
@@ -681,7 +936,8 @@ RecordedSession::RecordedSession(const std::string& path,
   // whose lost receipts' messages the session's logs all hold (the writer's
   // sends) lost nothing the feed lacks, and is no loss.
   for (const ReadLog& log : logs) {
-    const std::string sign = refusal(log.path);
+    std::string sign = refusal(log.path);
+    if (sign.empty()) sign = log.segment_refusal;
     for (const auto& [topic, watched_here] : log.topics) {
       if (watched_by_replayed[topic] && !watched_here) continue;
       RecordedTopic& fed = topics_[topic];
@@ -736,9 +992,12 @@ RecordedSession::RecordedSession(const std::string& path,
     const std::string& log = replayed_run_log;
     const std::vector<std::string> files = log::LogSegmentFiles(log);
     const std::string head = log::LogSegmentPath(log, 0);
+    const bool starts_mid_run = replayed_run_first_dispatch_index.has_value() &&
+                                *replayed_run_first_dispatch_index > 1;
     const bool from_head =
-        LogAndPlace(replayed_run_first_read).second == 0 ||
-        (files.size() == 1 && files.front() == replayed_run_first_read);
+        !starts_mid_run &&
+        (LogAndPlace(replayed_run_first_read).second == 0 ||
+         (files.size() == 1 && files.front() == replayed_run_first_read));
     if (!from_head) {
       const std::string marker = log::CappedMarkerPath(log);
       const auto marks =

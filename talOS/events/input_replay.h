@@ -64,8 +64,10 @@ struct RecordedTopic {
   // replay refuses, and why, naming the sign it found: the log's
   // `<log>.capped` marker, the session manifest's `log_capped`, its
   // `log_gap` or `recorder_failed` for a run's log without its EXIT record,
-  // or a damaged stretch
-  // (its byte offset) before which no receipt bounds the topic's lost
+  // a missing or incomplete-header segment (including a missing first segment
+  // with no marker or a segment missing before the unnumbered active file
+  // whose records jump in dispatch index or sender sequence), or a damaged
+  // stretch (its byte offset) before which no receipt bounds the topic's lost
   // records (the replayed program's own receipts, fed at their drains'
   // event times, which need not follow the log's order; a reader's topic
   // with no intact receipt before it, unless an intact receipt of it
@@ -165,12 +167,14 @@ class RecordedSession {
   // of that run's log holds it; when it armed a timer and fired none that
   // gives it, the now of its first dispatch, at or after the live run start,
   // so no timer armed before the run fires up to that run's last record, as
-  // none did live; a program that ran once ends there, unless its loop was
-  // late when it stopped, and a restarted one replays as one run; the
-  // origin when it had no timer).
+  // none did live; a restarted program replays as one run; the origin when it
+  // had no timer).
   // For a program the session did not log, start() for both.
   // Where the replay ends: the latest time the program's own logs recorded
-  // (its exit), or end().
+  // (its exit), clamped to one nanosecond before the earliest armed timer
+  // deadline of a single-run log that never fired live (so a late EXIT or an
+  // offset-0 timer whose only dispatch record is its EXIT does not fabricate
+  // a timer firing), or end().
   MonotonicTime loop_start() const { return loop_start_; }
   MonotonicTime run_start() const { return run_start_; }
   MonotonicTime loop_end() const { return loop_end_; }
@@ -338,26 +342,35 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
                                 ? report.stopped_at_gap->at - Duration{1}
                                 : session.loop_end();
 
-  std::optional<MonotonicTime> instant;
-  for (const RecordedMessage& message : session.messages()) {
-    if (message.delivered > end) break;
-    SimulatedChannel* channel = channels[message.topic];
-    if (channel == nullptr) continue;
-    // Everything due before the message's delivery happens first; then the
-    // clock stands at it, so the drain there, a timer's or a wake's, is the
-    // first to see it. Every message of one instant goes out before that
-    // drain runs.
-    if (instant != message.delivered) {
-      loop.run_until(message.delivered - Duration{1});
-      if (loop.monotonic_now() < message.delivered) {
-        loop.advance_until(message.delivered);
+  if (end >= session.run_start()) {
+    std::optional<MonotonicTime> instant;
+    for (const RecordedMessage& message : session.messages()) {
+      if (message.delivered > end) break;
+      SimulatedChannel* channel = channels[message.topic];
+      if (channel == nullptr) continue;
+      // Everything due before the message's delivery happens first; then the
+      // clock stands at it, so the drain there, a timer's or a wake's, is the
+      // first to see it. Every message of one instant goes out before that
+      // drain runs.
+      if (instant != message.delivered) {
+        if (message.delivered > session.run_start()) {
+          loop.run_until(message.delivered - Duration{1});
+          if (loop.monotonic_now() < message.delivered) {
+            loop.advance_until(message.delivered);
+          }
+        }
+        instant = message.delivered;
       }
-      instant = message.delivered;
+      channel->publish(session.payload(message), message.time);
+      ++report.fed[fed_index[message.topic]].messages;
     }
-    channel->publish(session.payload(message), message.time);
-    ++report.fed[fed_index[message.topic]].messages;
+    loop.run_until(end);
+  } else {
+    // Nothing in [run_start, end] (e.g. an offset-0 timer whose run's only
+    // dispatch record is its EXIT, or a gap before run_start): start the loop
+    // without publishing or dispatching anything, then finish.
+    loop.run_until(end);
   }
-  loop.run_until(end);
   loop.finish();
   return report;
 }

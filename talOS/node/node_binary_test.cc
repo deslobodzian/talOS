@@ -495,6 +495,45 @@ TEST(Binary, ReplayOfALogWithAGapStopsThereAndExits1) {
   std::filesystem::remove_all(dir);
 }
 
+// A node binary's --replay-inputs takes SESSION_DIR and refuses a path that
+// is not a directory (a .tlog file or a missing path), naming the path as
+// given rather than reading a single log or prefixing a bare name with "./".
+// REQ-OPS-14
+TEST(Binary, ReplayInputsRefusesANonDirectoryPath) {
+  const std::string log = TempFile("talos_node_test_replay_file.tlog");
+  const Result recorded =
+      RunBinary("--sim --duration-s 1 --log '" + log + "' " + ConfigFlag());
+  ASSERT_EQ(recorded.status, 0) << recorded.output;
+  ::shm_unlink(ShmObjectName("/test_node/frames").c_str());
+
+  const std::string out = TempFile("talos_node_test_replay_file_out.tlog");
+  std::filesystem::remove(out);
+  {
+    SCOPED_TRACE("existing .tlog file");
+    const Result replay = RunBinary("--replay-inputs '" + log + "' --log '" +
+                                    out + "' " + ConfigFlag());
+    EXPECT_NE(replay.status, 0) << replay.output;
+    EXPECT_NE(replay.output.find(log), std::string::npos) << replay.output;
+    EXPECT_NE(replay.output.find("not a session directory"), std::string::npos)
+        << replay.output;
+    EXPECT_FALSE(std::filesystem::exists(out));
+  }
+  {
+    SCOPED_TRACE("bare filename");
+    const std::string bare = "missing_session.tlog";
+    const Result replay = RunBinary("--replay-inputs '" + bare + "' --log '" +
+                                    out + "' " + ConfigFlag());
+    EXPECT_NE(replay.status, 0) << replay.output;
+    EXPECT_NE(replay.output.find(bare), std::string::npos) << replay.output;
+    EXPECT_EQ(replay.output.find("./" + bare), std::string::npos)
+        << replay.output;
+    EXPECT_NE(replay.output.find("not a session directory"), std::string::npos)
+        << replay.output;
+    EXPECT_FALSE(std::filesystem::exists(out));
+  }
+  std::filesystem::remove(log);
+}
+
 }  // namespace
 
 namespace detail {

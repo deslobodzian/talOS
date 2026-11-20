@@ -1228,9 +1228,11 @@ class OfflinePort final : public LoopPortFor<Loop> {
 
 // --replay-inputs: this node, on a simulated loop on the recorded clock, fed
 // every message the session logged on a topic it watches at its recorded
-// time (talOS/events/input_replay.h). A node the session logged runs on its
-// own recorded timeline (origin and run start, so its timers fire at the
-// recorded deadlines) and is handed what it received live, at the drains it
+// time (talOS/events/input_replay.h). Its path must be a session directory
+// (SESSION_DIR); a non-directory is refused naming the path as given. A node
+// the session logged runs on its own recorded timeline (origin and run start,
+// so its timers fire at the recorded deadlines, without fabricating a firing
+// past a late EXIT) and is handed what it received live, at the drains it
 // received it in. What it sends is logged to --log. A topic recorded with
 // another schema fails before anything runs; topics nobody recorded are
 // listed. The run ends before the earliest gap or damaged stretch in a log
@@ -1239,14 +1241,22 @@ class OfflinePort final : public LoopPortFor<Loop> {
 // have lost records nothing in it marks or bounds is refused before anything
 // runs (a ReplayError, exit 1): one with a `.capped` marker or whose member
 // the session manifest marks log_capped, a run's log without its EXIT record
-// of a member it marks log_gap or recorder_failed, and one whose damaged
-// stretch nothing bounds. So is the node's own first-run log when it arms a
-// timer and its first segment, or a segment before its first firing read,
-// is gone or unreadable: the firing its run start is read from may have been
-// in it; and, with no firing that gives the run start, when it holds no
-// record of its run or a loss that may hold its firings.
+// of a member it marks log_gap or recorder_failed, one with a missing or
+// incomplete-header segment (including a first segment gone without a marker
+// or a missing segment before the unnumbered active file whose records jump
+// in dispatch index or sender sequence), and one whose damaged stretch nothing
+// bounds. So is the node's own first-run log when it arms a timer and its
+// first segment, or a segment before its first firing read, is gone or
+// unreadable: the firing its run start is read from may have been in it; and,
+// with no firing that gives the run start, when it holds no record of its run
+// or a loss that may hold its firings.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
+  std::error_code ec;
+  if (!std::filesystem::is_directory(flags.replay_inputs, ec)) {
+    throw std::invalid_argument("--replay-inputs " + flags.replay_inputs +
+                                " is not a session directory");
+  }
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
   const event::RecordedSession session{flags.replay_inputs, node_name};
   event::SimulationEnvironment environment;

@@ -1778,5 +1778,391 @@ TEST(InputReplay, RefusesALogWhoseRecorderFailedBeforeItsExit) {
   std::filesystem::remove_all(out);
 }
 
+// A timer armed at offset 0 (immediately due at run_start).
+class ImmediateTicker {
+ public:
+  explicit ImmediateTicker(Loop& loop, bool watch_sensor = false)
+      : tick_{make_timer<&ImmediateTicker::on_tick>(loop, "tick", this)} {
+    if (watch_sensor) {
+      loop.set_prompt(
+          watch<EventsTest::SensorMessage, &ImmediateTicker::on_sensor>(
+              loop, kTopics.sensor, this));
+    }
+    tick_.setup_periodic(loop.monotonic_now(), 1ms);
+  }
+
+  int ticks{0};
+  int readings{0};
+
+ private:
+  void on_tick(const Context&) { ++ticks; }
+  void on_sensor(const Context&, const EventsTest::SensorMessage&) {
+    ++readings;
+  }
+
+  Timer<Loop> tick_;
+};
+
+// A live loop that was late when it stopped can record its EXIT after a due
+// timer deadline it never fired, and an offset-0 timer whose run's only
+// dispatch record is its EXIT sits right at run_start == loop_end: replay must
+// not fabricate a timer firing in either case.
+// REQ-OPS-14
+TEST(InputReplay, LateExitAndOffsetZeroExitOnlyDoNotFabricateTimerFirings) {
+  {
+    SCOPED_TRACE("late EXIT after a timer that fired");
+    const std::string dir = TempDir("late_exit_fired");
+    const std::string out = TempDir("late_exit_fired_out");
+    const std::string path = dir + "/ticker.tlog";
+    {
+      log::LogWriter writer{path, "ticker",
+                            log::LogWriterOptions{.background = false}};
+      writer.start(ManifestOf<Ticker>(dir + "/unused.tlog"), kOrigin);
+      for (int i = 1; i <= 10; ++i) {
+        const MonotonicTime deadline =
+            kOrigin + kLateRun + std::chrono::milliseconds{i};
+        writer.dispatch(Context{.kind = EventKind::TIMER,
+                                .source_id = 0,
+                                .dispatch_index = static_cast<std::uint64_t>(i),
+                                .event_time = deadline,
+                                .now = deadline,
+                                .sequence = 1},
+                        {});
+      }
+      // Next deadline is kLateRun + 11ms, never fired; EXIT recorded late at
+      // kLateRun + 11.5ms.
+      const MonotonicTime late_exit = kOrigin + kLateRun + 11ms + 500us;
+      writer.finish(Context{.kind = EventKind::EXIT,
+                            .dispatch_index = 11,
+                            .event_time = late_exit,
+                            .now = late_exit});
+      writer.flush();
+    }
+    const std::vector<std::int64_t> live = TimerFirings(path);
+    ASSERT_EQ(live.size(), 10u);
+    const RecordedSession session{dir, "ticker"};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/ticker.tlog", "ticker"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    const Ticker ticker{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(TimerFirings(out + "/ticker.tlog"), live);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("late EXIT after no timer fired, with a message dispatch");
+    const std::string dir = TempDir("late_exit_unfired");
+    const std::string out = TempDir("late_exit_unfired_out");
+    const std::string path = dir + "/slow.tlog";
+    {
+      log::LogWriter writer{path, "slow",
+                            log::LogWriterOptions{.background = false}};
+      writer.start(ManifestOf<SlowTicker>(dir + "/unused.tlog"), kOrigin);
+      const EventsTest::SensorMessage reading{1, 1.0F, 1.0F};
+      writer.dispatch(Context{.kind = EventKind::MESSAGE,
+                              .source_id = 1,
+                              .dispatch_index = 1,
+                              .event_time = kOrigin + 10ms,
+                              .now = kOrigin + 10ms,
+                              .publish_time = kOrigin + 10ms,
+                              .sequence = 0},
+                      std::as_bytes(std::span{&reading, 1}));
+      // Timer offset is 20ms: replay run_start is 10ms (first dispatch), so
+      // replay deadline is 30ms; EXIT recorded late at 31ms without firing it.
+      writer.finish(Context{.kind = EventKind::EXIT,
+                            .dispatch_index = 2,
+                            .event_time = kOrigin + 31ms,
+                            .now = kOrigin + 31ms});
+      writer.flush();
+    }
+    EXPECT_EQ(ReplaySlowTicker(dir, out), std::nullopt);
+    EXPECT_EQ(TimerFirings(out + "/slow.tlog"), std::vector<std::int64_t>{});
+    EXPECT_EQ(Receipts(out + "/slow.tlog"), Receipts(path));
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("offset-0 timer whose only dispatch record is its EXIT");
+    const std::string dir = TempDir("offset_zero_exit_only");
+    const std::string out = TempDir("offset_zero_exit_only_out");
+    // Also put a producer log with messages before EXIT to ensure pre-run
+    // messages on a newly-watched prompt topic cannot trigger the offset-0
+    // timer either.
+    WriterLog(dir);
+    const std::string path = dir + "/immediate.tlog";
+    {
+      log::LogWriter writer{path, "immediate",
+                            log::LogWriterOptions{.background = false}};
+      writer.start(ManifestOf<ImmediateTicker>(dir + "/unused.tlog"), kOrigin);
+      const MonotonicTime exit_at = kOrigin + kLateRun;
+      writer.finish(Context{.kind = EventKind::EXIT,
+                            .dispatch_index = 1,
+                            .event_time = exit_at,
+                            .now = exit_at});
+      writer.flush();
+    }
+    for (const bool watch_sensor : {false, true}) {
+      SCOPED_TRACE(watch_sensor ? "watching another log's topic"
+                                : "no watched topics");
+      const RecordedSession session{dir, "immediate"};
+      SimulationEnvironment environment;
+      Loop loop{environment,
+                log::LogWriter{out + "/immediate.tlog", "immediate"},
+                Loop::Options{.delivery = Delivery::ON_PUBLISH,
+                              .start = session.loop_start(),
+                              .run_start = session.run_start()}};
+      const ImmediateTicker ticker{loop, watch_sensor};
+      const InputReplayReport report = ReplayInputs(loop, environment, session);
+      EXPECT_FALSE(report.stopped_at_gap.has_value());
+      EXPECT_EQ(ticker.ticks, 0);
+      EXPECT_EQ(ticker.readings, 0);
+      // Only the terminal EXIT record advances dispatch_count.
+      EXPECT_EQ(loop.dispatch_count(), 1u);
+      EXPECT_EQ(TimerFirings(out + "/immediate.tlog"),
+                std::vector<std::int64_t>{});
+    }
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
+// A segment skipped as an incomplete header in the middle of a log lost its
+// records: input replay refuses any topic fed from that log (naming the log
+// and the unread segment), rather than silently dropping those records with
+// only a warning. A log that feeds the program nothing does not stop it.
+// REQ-OPS-14
+TEST(InputReplay, RefusesTopicFeedsAcrossAnIncompleteHeaderMiddleSegment) {
+  {
+    SCOPED_TRACE("incomplete middle segment in a log feeding a watched topic");
+    const std::string dir = TempDir("mid_incomplete");
+    const std::string out = TempDir("mid_incomplete_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string path = dir + "/observer.tlog";
+    RotateAt(path, {kOrigin + 20ms, kOrigin + 40ms});
+    const std::string mid = log::LogSegmentPath(path, 1);
+    ZeroFileHeader(mid);
+
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    try {
+      ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "fed from " << path << " across incomplete " << mid;
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(path), std::string::npos) << what;
+      EXPECT_NE(what.find(mid), std::string::npos) << what;
+    }
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("incomplete middle segment in a log that feeds nothing");
+    const std::string dir = TempDir("mid_incomplete_unfed");
+    const std::string out = TempDir("mid_incomplete_unfed_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string path = dir + "/producer.tlog";
+    RotateAt(path, {kOrigin + 20ms, kOrigin + 40ms});
+    ZeroFileHeader(log::LogSegmentPath(path, 1));
+
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/setpoints.tlog", "setpoints"},
+              Loop::Options{.start = session.start()}};
+    SetpointWatcher watcher{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    ASSERT_EQ(report.fed.size(), 1u);
+    EXPECT_EQ(report.fed[0].messages, 6u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
+// A log whose first segment is gone with no .capped marker and no manifest
+// mark (e.g. a copied session missing segment0) is refused for any topic fed
+// from it, naming the log, whether multiple segments remain or only the
+// active unnumbered file remains (whose first dispatch index is > 1).
+// REQ-OPS-14
+TEST(InputReplay, RefusesTopicFeedsFromALogMissingItsFirstSegmentWithoutMarks) {
+  {
+    SCOPED_TRACE("segment0 deleted, segment1 and active file remain");
+    const std::string dir = TempDir("head_gone_unmarked");
+    const std::string out = TempDir("head_gone_unmarked_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string path = dir + "/observer.tlog";
+    RotateAt(path, {kOrigin + 20ms, kOrigin + 40ms});
+    const std::string head = log::LogSegmentPath(path, 0);
+    std::filesystem::remove(head);
+
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    try {
+      ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "fed from " << path << " with " << head << " missing";
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(log::LogSegmentPath(path, 1)), std::string::npos)
+          << what;
+      EXPECT_NE(what.find(head), std::string::npos) << what;
+    }
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("segment0 deleted, only active unnumbered file remains");
+    const std::string dir = TempDir("head_gone_only_active");
+    const std::string out = TempDir("head_gone_only_active_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string path = dir + "/observer.tlog";
+    RotateAt(path, {kOrigin + 20ms});
+    std::filesystem::remove(log::LogSegmentPath(path, 0));
+
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    try {
+      ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "fed from " << path << " starting past dispatch 1";
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(path), std::string::npos) << what;
+    }
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("segment0 deleted, only active file remains, run_start check");
+    const std::string dir = TempDir("head_gone_only_active_run_start");
+    const std::string out = TempDir("head_gone_only_active_run_start_out");
+    RecordLateTicker(dir);
+    const std::string path = dir + "/ticker.tlog";
+    RotateAt(path, {kOrigin + 20ms});
+    std::filesystem::remove(log::LogSegmentPath(path, 0));
+
+    const RecordedSession session{dir, "ticker"};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/ticker.tlog", "ticker"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    const Ticker ticker{loop};
+    try {
+      ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "took run_start from " << path
+                    << " after segment0 was deleted";
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(path), std::string::npos) << what;
+    }
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
+// A segment deleted right before the log's unnumbered active file (segment0
+// present, segment1 deleted, active .tlog present) cannot be seen from file
+// names alone, but leaves a dispatch_index jump (event-loop logs) or an
+// accepted-SEND transport sequence jump (bridge-style dispatch_index == 0
+// logs): input replay detects the discontinuity and refuses both topic feeds
+// and run start, naming the log.
+// REQ-OPS-14
+TEST(InputReplay, RefusesALogMissingTheSegmentBeforeItsUnnumberedFile) {
+  {
+    SCOPED_TRACE("event-loop log feeding a watched topic");
+    const std::string dir = TempDir("missing_before_active_feed");
+    const std::string out = TempDir("missing_before_active_feed_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string path = dir + "/observer.tlog";
+    RotateAt(path, {kOrigin + 20ms, kOrigin + 40ms});
+    std::filesystem::remove(log::LogSegmentPath(path, 1));
+
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    try {
+      ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "fed from " << path << " with segment1 deleted";
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(path), std::string::npos) << what;
+    }
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("event-loop log run_start across missing segment1");
+    const std::string dir = TempDir("missing_before_active_run_start");
+    const std::string out = TempDir("missing_before_active_run_start_out");
+    RecordSlowTicker(dir, kOrigin + std::chrono::milliseconds{kSessionMs});
+    const std::string path = dir + "/slow.tlog";
+    RotateAt(path, {kOrigin + 15ms, kOrigin + 30ms});
+    ASSERT_TRUE(TimerFirings(log::LogSegmentPath(path, 0)).empty());
+    ASSERT_FALSE(TimerFirings(log::LogSegmentPath(path, 1)).empty());
+    std::filesystem::remove(log::LogSegmentPath(path, 1));
+
+    const std::optional<std::string> refused = ReplaySlowTicker(dir, out);
+    EXPECT_NE(refused.value_or("").find(path), std::string::npos)
+        << refused.value_or("replayed, not refused");
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("dispatch_index == 0 bridge-style log (sequence jump)");
+    const std::string dir = TempDir("missing_before_active_bridge");
+    const std::string out = TempDir("missing_before_active_bridge_out");
+    const std::string path = dir + "/bridge.tlog";
+    {
+      log::LogWriter writer{path, "hardware_node",
+                            log::LogWriterOptions{.background = false}};
+      writer.start(ManifestOf<SensorWriter>(dir + "/unused.tlog"), kOrigin);
+      for (int i = 1; i <= 12; ++i) {
+        const MonotonicTime at = kOrigin + std::chrono::milliseconds{i};
+        const EventsTest::SensorMessage reading{i, 1.0F, 1.0F};
+        writer.send(Context{.event_time = at, .now = at}, 0,
+                    std::as_bytes(std::span{&reading, 1}), 0,
+                    static_cast<std::uint64_t>(i - 1));
+      }
+      writer.finish(Context{.kind = EventKind::EXIT,
+                            .event_time = kOrigin + 13ms,
+                            .now = kOrigin + 13ms});
+      writer.flush();
+    }
+    RotateAt(path, {kOrigin + 5ms, kOrigin + 9ms});
+    std::filesystem::remove(log::LogSegmentPath(path, 1));
+
+    const RecordedSession session{dir};
+    try {
+      ReplayWatcher(session, out);
+      ADD_FAILURE() << "fed from " << path << " with segment1 deleted";
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(path), std::string::npos) << what;
+    }
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
 }  // namespace
 }  // namespace talos::event
