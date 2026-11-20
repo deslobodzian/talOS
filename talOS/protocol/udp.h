@@ -119,6 +119,8 @@ class RuntimeUdpPeer {
 
   uintptr_t socket_;
   uint64_t next_send_sequence_;
+  uint64_t last_below_sequence_{0};
+  uint8_t below_ascending_count_{0};
   UdpStats stats_;
   std::array<uint8_t, kMaxFrameSize> tx_buffer_;
   std::array<uint8_t, kMaxFrameSize> rx_buffer_;

@@ -256,6 +256,68 @@ TEST(RuntimeUdpTest, CountsMissedSequenceGapsAndOutOfOrderWithoutRollback) {
   EXPECT_EQ(receiver.stats().send_would_block, 0u);
 }
 
+// REQ-RT-22: when a peer restarts and resets its send sequence to 1,
+// RuntimeUdpPeer re-baselines last_received_sequence so later gaps are still
+// counted (both after a long run and after a short run).
+TEST(RuntimeUdpTest, PeerRestartRebaselinesSequenceGapCounting) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+
+  const auto send_seq = [&](uint64_t seq) {
+    std::array<uint8_t, kFrameHeaderSize> buf{};
+    const std::size_t n =
+        EncodeFrame(FrameType::kClockProbe, kFlagNone, seq, seq * 1000, nullptr,
+                    0, buf.data(), buf.size());
+    ASSERT_EQ(n, kFrameHeaderSize);
+    ASSERT_EQ(::sendto(raw_sender, buf.data(), n, 0,
+                       reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+              static_cast<ssize_t>(n));
+    DecodedFrame frame;
+    ASSERT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kOk);
+  };
+
+  // Long run restart: large backward jump re-baselines immediately.
+  send_seq(120000);
+  send_seq(1);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 1u);
+  EXPECT_EQ(receiver.stats().sequence_gaps, 0u);
+  send_seq(4);  // missed 2, 3 -> 2 missed frames
+  EXPECT_EQ(receiver.stats().sequence_gaps, 2u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 4u);
+
+  // A 2-frame reorder inside the window must not re-baseline or add false gaps.
+  send_seq(10);  // missed 5..9 -> +5 (total 7)
+  EXPECT_EQ(receiver.stats().sequence_gaps, 7u);
+  send_seq(8);
+  send_seq(9);
+  send_seq(11);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 11u);
+  EXPECT_EQ(receiver.stats().sequence_gaps, 7u);
+
+  // Short run restart (within reorder window): three ascending frames below
+  // last re-baseline.
+  send_seq(1);
+  send_seq(2);
+  send_seq(3);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 3u);
+  send_seq(6);  // missed 4, 5 -> +2 (total 9)
+  EXPECT_EQ(receiver.stats().sequence_gaps, 9u);
+
+  ::close(raw_sender);
+}
+
 // REQ-RT-22: a non-EAGAIN recv() error records errno in last_recv_error.
 TEST(RuntimeUdpTest, RecordsLastRecvErrorOnSocketError) {
   const uint16_t unbound = FreeLoopbackPort();

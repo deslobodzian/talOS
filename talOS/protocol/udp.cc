@@ -111,6 +111,7 @@ RuntimeUdpPeer::~RuntimeUdpPeer() { Close(); }
 RuntimeUdpPeer::RuntimeUdpPeer(RuntimeUdpPeer&& other) noexcept
     : socket_(std::exchange(other.socket_, kInvalidSocket)),
       next_send_sequence_(other.next_send_sequence_),
+      last_below_sequence_(other.last_below_sequence_),
       stats_(other.stats_),
       tx_buffer_(other.tx_buffer_),
       rx_buffer_(other.rx_buffer_),
@@ -126,6 +127,7 @@ RuntimeUdpPeer& RuntimeUdpPeer::operator=(RuntimeUdpPeer&& other) noexcept {
     Close();
     socket_ = std::exchange(other.socket_, kInvalidSocket);
     next_send_sequence_ = other.next_send_sequence_;
+    last_below_sequence_ = other.last_below_sequence_;
     stats_ = other.stats_;
     tx_buffer_ = other.tx_buffer_;
     rx_buffer_ = other.rx_buffer_;
@@ -171,6 +173,8 @@ UdpStatus RuntimeUdpPeer::Open(const char* local_address, uint16_t local_port,
   }
   opened_ = true;
   next_send_sequence_ = 1;
+  last_below_sequence_ = 0;
+  below_ascending_count_ = 0;
   stats_ = {};
   return UdpStatus::kOk;
 }
@@ -347,14 +351,52 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
     return UdpStatus::kDecodeError;
   }
 
+  constexpr uint64_t kReorderWindow = 64;
+  constexpr uint8_t kRestartAscendingSteps = 2;
   if (stats_.last_received_sequence == 0) {
     stats_.last_received_sequence = decoded.header.sequence;
+    last_below_sequence_ = 0;
+    below_ascending_count_ = 0;
   } else if (decoded.header.sequence > stats_.last_received_sequence) {
     stats_.sequence_gaps +=
         decoded.header.sequence - stats_.last_received_sequence - 1;
     stats_.last_received_sequence = decoded.header.sequence;
+    last_below_sequence_ = 0;
+    below_ascending_count_ = 0;
+  } else if (decoded.header.sequence > 0 &&
+             decoded.header.sequence < stats_.last_received_sequence &&
+             stats_.last_received_sequence - decoded.header.sequence >
+                 kReorderWindow) {
+    // Peer restarted after a long run and reset its send sequence: re-baseline
+    // immediately so subsequent packet loss is still counted in sequence_gaps.
+    stats_.last_received_sequence = decoded.header.sequence;
+    last_below_sequence_ = 0;
+    below_ascending_count_ = 0;
+  } else if (decoded.header.sequence > 0 &&
+             decoded.header.sequence < stats_.last_received_sequence &&
+             last_below_sequence_ != 0 &&
+             decoded.header.sequence > last_below_sequence_ &&
+             below_ascending_count_ + 1 >= kRestartAscendingSteps) {
+    // Three ascending frames below last_received_sequence indicate a peer
+    // restart after a short run rather than a 2-frame reorder.
+    stats_.last_received_sequence = decoded.header.sequence;
+    last_below_sequence_ = 0;
+    below_ascending_count_ = 0;
   } else {
     ++stats_.out_of_order_frames;
+    if (decoded.header.sequence > 0 &&
+        decoded.header.sequence < stats_.last_received_sequence) {
+      if (last_below_sequence_ != 0 &&
+          decoded.header.sequence > last_below_sequence_) {
+        ++below_ascending_count_;
+      } else {
+        below_ascending_count_ = 0;
+      }
+      last_below_sequence_ = decoded.header.sequence;
+    } else {
+      last_below_sequence_ = 0;
+      below_ascending_count_ = 0;
+    }
   }
   ++stats_.received_frames;
   stats_.received_bytes += received_size;
