@@ -81,6 +81,7 @@ py_test(
     },
     tags = ["integration"],
     deps = [
+        "//talOS/build:udp_ports",
         "//talOS/memory:shm_name",
         "@rules_python//python/runfiles",
     ],

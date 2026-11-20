@@ -113,7 +113,11 @@ DEFAULT_TIMEOUT_S = 60
 
 def udp_ports():
     """Two distinct free loopback UDP ports (docs/TESTING.md §6.4: bound at
-    0 and released before the launch, since the launcher refuses port 0)."""
+    0 and released before the launch, since the launcher refuses port 0).
+
+    Kept inline here because talos_sim_test (contract.bzl) runs sim_check.py
+    directly via srcs with only @rules_python//python/runfiles in deps.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as gateway, \
             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge:
         gateway.bind(("127.0.0.1", 0))

@@ -34,4 +34,8 @@ py_test(
         "no_asan",
         "no_tsan",
     ],
+    deps = [
+        "//talOS/build:udp_ports",
+        "//talOS/launcher:tlog_read",
+    ],
 )
