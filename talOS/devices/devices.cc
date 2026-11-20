@@ -788,12 +788,16 @@ hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
   return sample;
 }
 
-bool HardwareAccess::motor_hard_limit(const HardwareLink& link,
-                                      std::size_t index, bool forward) {
-  const auto sample = motor_sample(link, index);
+bool HardwareAccess::motor_hard_limit(const hardware::MotorSample& sample,
+                                      bool forward) {
   const std::uint32_t flag = forward ? hardware::kMotorForwardHardLimitFlag
                                      : hardware::kMotorReverseHardLimitFlag;
   return sample.valid && (sample.fault_flags & flag) != 0;
+}
+
+bool HardwareAccess::motor_hard_limit(const HardwareLink& link,
+                                      std::size_t index, bool forward) {
+  return motor_hard_limit(motor_sample(link, index), forward);
 }
 
 hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
