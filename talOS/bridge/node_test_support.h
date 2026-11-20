@@ -28,12 +28,11 @@ namespace talos::hardware::bridge_test {
 // is a test's proof that something did not happen.
 inline constexpr std::chrono::seconds kHangBound{10};
 
-// Binds a UDP socket on every interface (0.0.0.0) to a port the OS chooses and
-// connects it to 127.0.0.1 on that port, so it accepts no datagram from another
-// socket: a bridge sending to the port sees it closed (ECONNREFUSED), as if
-// nothing were bound, while no other socket can be given the port and
-// HardwareNode's 0.0.0.0 bind does not collide with a non-loopback socket.
-// Returns the socket, or -1.
+// Binds a UDP socket to 0.0.0.0:0 so the chosen port is not already held on a
+// non-loopback interface, then connects it to 127.0.0.1 on that port so it
+// accepts no datagram from another socket (connect narrows the local address to
+// 127.0.0.1 while still blocking later 0.0.0.0 and 127.0.0.1 binds without
+// SO_REUSEADDR). Returns the socket, or -1.
 inline int ReservePort(uint16_t& port) {
   const int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) return -1;
