@@ -36,8 +36,12 @@ The table below is ARCHITECTURE.md "Layers" and "Allowed dependencies"
   (anything in `//talOS/node:*` other than `//talOS/node:node`).
 
 The C++ source scan (also run standalone via `--source-only` in
-`tools/source_lints.sh`) walks tracked C++ sources and headers in node
-packages outside `talOS/` and refuses from the start (RULES.md 2):
+`tools/source_lints.sh`) walks every tracked C++ source/header (plus any
+extensionless or custom-suffix header referenced in BUILD `hdrs`,
+`textual_hdrs` or `srcs`) under `bench/`, `examples/`,
+`tools/scaffold_testdata/`, and any other robot package outside `talOS/`,
+`third_party/`, `controller_processor/`, `studio/` and `tools/`, and refuses
+from the start (RULES.md 2):
 
 - `#include` (or `#include_next`, quote or angle-bracket, after comment
   stripping, line-continuation splicing and path normalization) of
@@ -47,17 +51,21 @@ packages outside `talOS/` and refuses from the start (RULES.md 2):
   `talOS/hardware/request...`, as well as computed `#include MACRO`
   directives that cannot be verified statically;
 - non-comment, non-string references to `NodeAccess`, `add_hardware_request`,
-  `HardwareAccess`, or `note_live_target`.
+  `HardwareAccess`, or `note_live_target`, and preprocessor token-pasting
+  operators `##` and `%:%:` (which could otherwise assemble them).
 
 ALLOWLIST holds today's known Bazel exceptions, each with its reason and the
-TODO.md item that removes it. NON_NODE_CLI_FILES holds non-node CLI binaries
-that sit beside a node package (never exempting `NodeAccess`, `access.h` or
-`add_hardware_request`). Both may only shrink: a stale entry fails the check,
-so it is deleted with the fix. Prints each violation; exits 1 on a violation
-or a stale entry.
+TODO.md item that removes it. NON_NODE_CLI_FILES maps non-node CLI binaries
+that sit beside a node package to the exact transport/wire headers they may
+include (never exempting `NodeAccess`, `HardwareAccess`, `node/access.h`,
+`node/internal.h`, `devices/access.h`, `add_hardware_request`,
+`note_live_target`, token pasting or computed includes). Both may only shrink
+entry by entry: a stale entry fails the check, so it is deleted with the fix.
+Prints each violation; exits 1 on a violation or a stale entry.
 """
 
 import argparse
+import ast
 import dataclasses
 import os
 import posixpath
@@ -131,21 +139,29 @@ ALLOWLIST = {
 }
 
 # C++ source bypass scan (RULES.md 2, REQ-SAFE-27).
+# Every tracked C++ file under SCANNED_SOURCE_ROOTS is scanned (regardless of
+# what macros its BUILD uses), as is any file outside EXCLUDED_SOURCE_PREFIXES
+# (e.g. a standalone robot repository at the workspace root or a `<robot>/` dir).
+SCANNED_SOURCE_ROOTS = (
+    "bench/",
+    "examples/",
+    "tools/scaffold_testdata/",
+)
 EXCLUDED_SOURCE_PREFIXES = (
     "talOS/",
     "third_party/",
     "controller_processor/",
     "studio/",
+    "tools/",
 )
 CPP_SUFFIXES = (
-    ".cc", ".cpp", ".cxx", ".c",
-    ".h", ".hh", ".hpp", ".hxx", ".ipp", ".inl", ".inc",
+    ".c", ".cc", ".cpp", ".cxx", ".c++", ".cppm", ".ixx",
+    ".h", ".hh", ".hpp", ".hxx", ".h++", ".ipp", ".inl", ".inc", ".tcc",
 )
-NODE_MACRO_RE = re.compile(
-    r"\b(?:talos_cc_node|talos_py_node|talos_cc_shared_node)\b")
 INCLUDE_DIRECTIVE_RE = re.compile(
     r"^[ \t]*(?:#|%:)[ \t]*(include(?:_next)?)\b(.*)$")
 HEADER_NAME_RE = re.compile(r'^(?:"([^"]*)"|<([^>]*)>)')
+TOKEN_PASTE_RE = re.compile(r"##|%:%:")
 
 FORBIDDEN_INCLUDE_EXACT = frozenset({
     "talOS/node/access.h",
@@ -163,6 +179,7 @@ FORBIDDEN_INCLUDE_PREFIXES = (
 NEVER_EXEMPT_INCLUDES = frozenset({
     "talOS/node/access.h",
     "talOS/node/internal.h",
+    "talOS/devices/access.h",
 })
 FORBIDDEN_SYMBOLS = (
     ("NodeAccess", re.compile(r"\bNodeAccess\b")),
@@ -172,13 +189,18 @@ FORBIDDEN_SYMBOLS = (
 )
 
 # Standalone non-node CLI binaries sitting beside a node package (not linked
-# by any talos_cc_node or node library). Only transport/wire includes are
-# exempted; NodeAccess, access.h, add_hardware_request, computed includes and
-# syntax errors are never exempted. Checked for staleness so it only shrinks.
+# by any talos_cc_node or node library). Each entry names the exact normalized
+# transport/wire headers that CLI may include; every header is checked
+# individually for staleness so the allowlist only shrinks header by header.
+# NodeAccess, HardwareAccess, node/access.h, node/internal.h, devices/access.h,
+# add_hardware_request, note_live_target, token pasting, computed includes and
+# syntax errors are never exempted.
 NON_NODE_CLI_FILES = {
-    "bench/main_processor/swerve_module/send_target.cc":
-        "operator CLI beside the node (tools/test_rio_in_the_loop.py); "
-        "not node code",
+    "bench/main_processor/swerve_module/send_target.cc": frozenset({
+        "talOS/hardware/packet.h",
+        "talOS/ipc/publisher.h",
+        "talOS/ipc/subscriber.h",
+    }),
 }
 
 
@@ -400,31 +422,6 @@ class Bazel:
         source = render(frm)
         return self.query(f"(deps({source}, 1) except ({source})) "
                           f"intersect ({render(to)})")
-
-
-def _strip_starlark_comments(text):
-    """Removes Starlark `#` comments outside single- and double-quoted strings."""
-    out = []
-    for line in text.splitlines():
-        in_quote = None
-        i = 0
-        n = len(line)
-        while i < n:
-            ch = line[i]
-            if in_quote:
-                if ch == "\\" and i + 1 < n:
-                    i += 2
-                    continue
-                if ch == in_quote:
-                    in_quote = None
-            elif ch in ('"', "'"):
-                in_quote = ch
-            elif ch == "#":
-                line = line[:i]
-                break
-            i += 1
-        out.append(line)
-    return "\n".join(out)
 
 
 def _is_ident_char(ch):
@@ -652,68 +649,206 @@ def scan_cpp_text(path, text):
                 path, lineno, "forbidden-symbol",
                 f"references forbidden framework internal `{symbol}`"))
 
+    # Refuse preprocessor token pasting (## and %:%:) outside comments and
+    # strings so macros cannot assemble NodeAccess/HardwareAccess identifiers.
+    for m in TOKEN_PASTE_RE.finditer(no_strings):
+        lineno = line_map[m.start()] if line_map else 1
+        violations.append(SourceViolation(
+            path, lineno, "token-paste",
+            f"uses preprocessor token pasting `{m.group(0)}` (can assemble "
+            f"forbidden framework internals)"))
+
     violations.sort(key=lambda v: (v.line, v.kind, v.detail))
     return violations
 
 
-def _owning_package(path, build_dirs):
-    """Nearest ancestor directory (or `""` for root) holding a BUILD file."""
-    directory = os.path.dirname(path)
-    while True:
-        if directory in build_dirs:
-            return directory
-        if not directory:
-            return None
-        directory = os.path.dirname(directory)
+def _is_in_scanned_tree(path):
+    """True when `path` is under bench/, examples/, tools/scaffold_testdata/,
+    or another robot tree outside talOS/ and repo tooling."""
+    if path.startswith(SCANNED_SOURCE_ROOTS):
+        return True
+    if path.startswith(EXCLUDED_SOURCE_PREFIXES):
+        return False
+    return True
+
+
+def _glob_to_regex(pattern):
+    """Compiles a Bazel glob pattern (`*`, `**`, `?`) to a regex."""
+    parts = ["^"]
+    i = 0
+    n = len(pattern)
+    while i < n:
+        if pattern[i:i + 3] == "**/":
+            parts.append("(?:.*/)?")
+            i += 3
+        elif pattern[i:i + 2] == "**":
+            parts.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            parts.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            parts.append("[^/]")
+            i += 1
+        else:
+            parts.append(re.escape(pattern[i]))
+            i += 1
+    parts.append("$")
+    return re.compile("".join(parts))
+
+
+def _resolve_build_label(pkg, raw):
+    """Resolves a Bazel file label or package-relative path to a repo path."""
+    if not raw or raw.startswith("@"):
+        return None
+    if raw.startswith("//"):
+        body = raw[2:]
+        if ":" in body:
+            target_pkg, name = body.split(":", 1)
+            candidate = f"{target_pkg}/{name}" if target_pkg else name
+        else:
+            candidate = body
+    else:
+        rel = raw[1:] if raw.startswith(":") else raw
+        candidate = posixpath.join(pkg, rel) if pkg else rel
+    norm = posixpath.normpath(candidate)
+    if norm in ("", ".") or norm.startswith("../"):
+        return None
+    return norm
+
+
+def _extract_build_referenced_files(build_path, content, tracked_set, pkg_files):
+    """Extracts tracked files referenced in BUILD `hdrs`, `textual_hdrs` or
+    extensionless `srcs` (so extensionless C++ headers cannot evade scanning).
+
+    Returns `(referenced_paths, error_or_none)`.
+    """
+    try:
+        tree = ast.parse(content, filename=build_path)
+    except SyntaxError as exc:
+        return set(), f"cannot parse BUILD file: {exc}"
+
+    pkg = os.path.dirname(build_path)
+    bindings = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = stmt.value
+
+    def extract_strings(node, seen=frozenset()):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node.value
+            return
+        if isinstance(node, ast.Name) and node.id in bindings:
+            if node.id not in seen:
+                yield from extract_strings(bindings[node.id], seen | {node.id})
+            return
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+                node.func.id == "glob"):
+            inc_patterns = []
+            exc_patterns = []
+            if node.args:
+                inc_patterns.extend(extract_strings(node.args[0], seen))
+            for kw in node.keywords:
+                if kw.arg == "include":
+                    inc_patterns.extend(extract_strings(kw.value, seen))
+                elif kw.arg == "exclude":
+                    exc_patterns.extend(extract_strings(kw.value, seen))
+            inc_res = [_glob_to_regex(p) for p in inc_patterns]
+            exc_res = [_glob_to_regex(p) for p in exc_patterns]
+            for rel in pkg_files:
+                if (any(r.match(rel) for r in inc_res) and
+                        not any(r.match(rel) for r in exc_res)):
+                    yield rel
+            return
+        for child in ast.iter_child_nodes(node):
+            yield from extract_strings(child, seen)
+
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg not in ("hdrs", "textual_hdrs", "srcs"):
+                continue
+            for raw in extract_strings(kw.value):
+                candidate = _resolve_build_label(pkg, raw)
+                if not candidate or candidate not in tracked_set:
+                    continue
+                if not _is_in_scanned_tree(candidate):
+                    continue
+                base = os.path.basename(candidate)
+                if base in ("BUILD", "BUILD.bazel"):
+                    continue
+                if kw.arg in ("hdrs", "textual_hdrs"):
+                    found.add(candidate)
+                elif os.path.splitext(base)[1] == "":
+                    found.add(candidate)
+    return found, None
 
 
 def find_node_source_files(files, read):
-    """Discovers C++ sources/headers in node packages outside `talOS/`.
+    """Discovers every tracked C++ file (plus BUILD-referenced extensionless or
+    custom-suffix headers) under `bench/`, `examples/`, `tools/scaffold_testdata/`,
+    and any other robot tree outside `talOS/`.
 
     Returns `(cpp_files, read_errors)` where `read_errors` is a list of
-    `(path, detail)` for any BUILD file that could not be read (fail closed).
+    `(path, detail)` for any BUILD file that could not be read or parsed
+    (fail closed).
     """
-    build_dirs = set()
-    node_pkgs = set()
-    read_errors = []
+    tracked_set = set(files)
+    by_pkg = {}
     for path in files:
-        if os.path.basename(path) not in ("BUILD", "BUILD.bazel"):
+        if not _is_in_scanned_tree(path):
             continue
-        pkg = os.path.dirname(path)
-        build_dirs.add(pkg)
-        if path.startswith(EXCLUDED_SOURCE_PREFIXES):
-            continue
-        try:
-            content = read(path)
-        except OSError as exc:
-            read_errors.append((path, f"cannot read BUILD file: {exc}"))
-            continue
-        if NODE_MACRO_RE.search(_strip_starlark_comments(content)):
-            node_pkgs.add(pkg)
+        # Record every file under each ancestor directory so package globs see
+        # subdirectory files (e.g. `glob(["inc/*"])`).
+        parts = path.split("/")
+        for depth in range(len(parts)):
+            pkg = "/".join(parts[:depth])
+            rel = "/".join(parts[depth:])
+            by_pkg.setdefault(pkg, []).append(rel)
 
-    cpp_files = []
+    cpp_files = set()
+    read_errors = []
     for path in sorted(files):
-        if path.startswith(EXCLUDED_SOURCE_PREFIXES):
+        if not _is_in_scanned_tree(path):
             continue
-        if os.path.splitext(path)[1].lower() not in CPP_SUFFIXES:
+        base = os.path.basename(path)
+        if base in ("BUILD", "BUILD.bazel"):
+            try:
+                content = read(path)
+            except OSError as exc:
+                read_errors.append((path, f"cannot read BUILD file: {exc}"))
+                continue
+            pkg = os.path.dirname(path)
+            referenced, err = _extract_build_referenced_files(
+                path, content, tracked_set, by_pkg.get(pkg, ()))
+            if err:
+                read_errors.append((path, err))
+                continue
+            cpp_files.update(referenced)
             continue
-        pkg = _owning_package(path, build_dirs)
-        if pkg is not None and pkg in node_pkgs:
-            cpp_files.append(path)
-    return cpp_files, read_errors
+        if os.path.splitext(base)[1].lower() in CPP_SUFFIXES:
+            cpp_files.add(path)
+    return sorted(cpp_files), read_errors
 
 
 def _is_exempt_cli_violation(violation, exempt_cli_files):
-    if violation.path not in exempt_cli_files:
+    allowed_headers = exempt_cli_files.get(violation.path)
+    if not allowed_headers:
         return False
     if violation.kind != "forbidden-include":
         return False
-    return violation.header not in NEVER_EXEMPT_INCLUDES
+    if violation.header in NEVER_EXEMPT_INCLUDES:
+        return False
+    return violation.header in allowed_headers
 
 
 def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
-    """Scans C++ sources in node packages outside `talOS/` for RULES.md 2
-    bypasses. Returns the number of failures."""
+    """Scans C++ sources outside `talOS/` for RULES.md 2 bypasses.
+    Returns the number of failures."""
     if exempt_cli_files is None:
         exempt_cli_files = NON_NODE_CLI_FILES
     cpp_files, read_errors = find_node_source_files(files, read)
@@ -721,6 +856,18 @@ def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
     for path, detail in read_errors:
         failures += 1
         print(f"VIOLATION {path}: {detail} (fail closed)", file=out)
+
+    for path, allowed_headers in sorted(exempt_cli_files.items()):
+        if not allowed_headers:
+            failures += 1
+            print(f"STALE non-node CLI exemption {path}: empty header list; "
+                  f"delete the entry", file=out)
+            continue
+        for header in sorted(allowed_headers):
+            if header in NEVER_EXEMPT_INCLUDES:
+                failures += 1
+                print(f"VIOLATION {path}: exemption cannot allow {header} "
+                      f"(NEVER_EXEMPT_INCLUDES)", file=out)
 
     used_exemptions = set()
     for path in cpp_files:
@@ -733,23 +880,28 @@ def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
             continue
         for violation in scan_cpp_text(path, text):
             if _is_exempt_cli_violation(violation, exempt_cli_files):
-                used_exemptions.add(path)
+                used_exemptions.add((path, violation.header))
                 continue
             failures += 1
             print(f"VIOLATION {violation.path}:{violation.line}: "
                   f"{violation.detail} (RULES.md 2 / REQ-SAFE-27)", file=out)
 
-    for path in sorted(set(exempt_cli_files) - used_exemptions):
-        failures += 1
-        print(f"STALE non-node CLI exemption {path}: no exempted hit left; "
-              f"delete the entry", file=out)
+    for path, allowed_headers in sorted(exempt_cli_files.items()):
+        for header in sorted(allowed_headers):
+            if header in NEVER_EXEMPT_INCLUDES:
+                continue
+            if (path, header) not in used_exemptions:
+                failures += 1
+                print(f"STALE non-node CLI exemption {path} ({header}): "
+                      f"no exempted hit left; delete the entry", file=out)
 
+    exempt_header_count = sum(len(h) for h in exempt_cli_files.values())
     if failures:
         print(f"{failures} RULES.md 2 C++ bypass check(s) failed", file=out)
     else:
         print(f"C++ devices-layer bypass check passed "
-              f"({len(cpp_files)} node source file(s), "
-              f"{len(exempt_cli_files)} non-node CLI exemption(s))", file=out)
+              f"({len(cpp_files)} source file(s), "
+              f"{exempt_header_count} allowlisted CLI header(s))", file=out)
     return failures
 
 

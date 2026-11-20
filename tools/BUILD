@@ -482,3 +482,17 @@ py_test(
     legacy_create_init = False,
     main = "check_host_includes_test.py",
 )
+
+# python3 tools/run_clang_tidy.py BASE (CI and tools/tidy.sh)
+# Selects changed C++ sources and includer TUs for changed headers, falling
+# back to test TUs when no production TU includes a changed header.
+py_test(
+    name = "run_clang_tidy_test",
+    size = "small",
+    srcs = [
+        "run_clang_tidy.py",
+        "run_clang_tidy_test.py",
+    ],
+    legacy_create_init = False,
+    main = "run_clang_tidy_test.py",
+)
