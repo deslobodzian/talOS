@@ -19,11 +19,28 @@ exports_files([
     "sim_check.py",
 ])
 
-# Free loopback UDP port pair selection for test and tool launches.
+# Free wildcard UDP port pair selection for test and tool launches.
 py_library(
     name = "udp_ports",
     srcs = ["udp_ports.py"],
     visibility = ["//visibility:public"],
+)
+
+# unit (REQ-DEV-25, REQ-DEV-30): UDP port helpers pick two distinct free
+# 0.0.0.0 ports below the OS ephemeral range and reject ports held on
+# non-loopback addresses.
+py_test(
+    name = "udp_ports_test",
+    size = "small",
+    srcs = [
+        "sim_check.py",
+        "udp_ports_test.py",
+    ],
+    legacy_create_init = False,
+    deps = [
+        ":udp_ports",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 # Unlinks the test namespace's live registry after talos_sim_test's session
