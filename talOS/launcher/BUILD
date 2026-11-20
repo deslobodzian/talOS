@@ -352,6 +352,11 @@ cc_test(
     srcs = ["log_dump_test.cc"],
     data = [":log_dump"],
     env = {"TALOS_LOG_DUMP": "$(rlocationpath :log_dump)"},
+    # Spawns the instrumented log_dump binary across 18 cases; under macOS
+    # TSan each fork+exec costs ~213 ms of kernel CPU (vs 3 ms plain), pushing
+    # a small (60 s) test past its timeout on 3-vCPU hosted runners (TODO.md
+    # CI-13). The Linux sanitizer legs still run this test.
+    tags = ["no_macos_sanitizer"],
     deps = [
         ":alert_message",
         ":continuity_message",

@@ -83,7 +83,15 @@ py_test(
         "SIM": "$(rlocationpath :no_state_sim)",
     },
     legacy_create_init = False,
-    tags = ["e2e"],
+    # Spawns an instrumented launcher and members (each spawn is two fork()s
+    # plus exec); under macOS TSan one fork costs ~120 ms and an empty main
+    # ~194 ms of kernel CPU (vs 0.5/2 ms plain), so on a 3-vCPU hosted runner
+    # session start-up overruns the 14 s ready bound (TODO.md CI-13). The
+    # Linux sanitizer legs still run this test.
+    tags = [
+        "e2e",
+        "no_macos_sanitizer",
+    ],
     deps = ["@rules_python//python/runfiles"],
 )
 
