@@ -332,50 +332,51 @@ class SimHardware:
         """Last explicitly requested (mode, demand, ff_volts, slot), neutral
         before any request. Expiry, omitted outputs and disable do not alter
         it."""
-        out = _abi.MotorRequest()
-        _abi.ok(lib.talos_sim_hardware_motor_request(
-            self._handle, _abi.encode(node), _abi.encode(device), out))
-        return MotorRequest(talos.Mode(out.mode), out.demand, out.ff_volts,
-                            out.slot)
+        return self._motor(lib.talos_sim_hardware_motor_request, node, device)
 
     def digital_output(self, node, device):
         """Last explicitly requested digital value (False before any)."""
-        return bool(_abi.ok(lib.talos_sim_hardware_digital_output(
-            self._handle, _abi.encode(node), _abi.encode(device))))
+        return self._digital_output(
+            lib.talos_sim_hardware_digital_output, node, device)
 
     def pwm(self, node, device):
         """The pulse the last request carrying this PWM output asked for (0
         is the centre pulse), None when it asked for no pulse or none
         carried it."""
-        out = ctypes.c_double()
-        pulsing = _abi.ok(lib.talos_sim_hardware_pwm(
-            self._handle, _abi.encode(node), _abi.encode(device), out))
-        return out.value if pulsing else None
+        return self._pwm(lib.talos_sim_hardware_pwm, node, device)
 
     def applied_motor(self, node, device):
         """Applied (mode, demand, ff_volts, slot), after expiry/neutral gates."""
-        out = _abi.MotorRequest()
-        _abi.ok(lib.talos_sim_hardware_applied_motor(
-            self._handle, _abi.encode(node), _abi.encode(device), out))
-        return MotorRequest(talos.Mode(out.mode), out.demand, out.ff_volts,
-                            out.slot)
+        return self._motor(lib.talos_sim_hardware_applied_motor, node, device)
 
     def applied_digital_output(self, node, device):
         """Applied digital value, False on expiry, omission or disable."""
-        return bool(_abi.ok(lib.talos_sim_hardware_applied_digital_output(
-            self._handle, _abi.encode(node), _abi.encode(device))))
+        return self._digital_output(
+            lib.talos_sim_hardware_applied_digital_output, node, device)
 
     def applied_pwm(self, node, device):
         """Applied PWM pulse; None (no pulse) on expiry, omission, disable,
         stop() or a non-finite set."""
+        return self._pwm(lib.talos_sim_hardware_applied_pwm, node, device)
+
+    def _motor(self, function, node, device):
+        out = _abi.MotorRequest()
+        self._set(function, node, device, out)
+        return MotorRequest(talos.Mode(out.mode), out.demand, out.ff_volts,
+                            out.slot)
+
+    def _digital_output(self, function, node, device):
+        return _abi.boolean(function(
+            self._handle, _abi.encode(node), _abi.encode(device)))
+
+    def _pwm(self, function, node, device):
         out = ctypes.c_double()
-        pulsing = _abi.ok(lib.talos_sim_hardware_applied_pwm(
-            self._handle, _abi.encode(node), _abi.encode(device), out))
+        pulsing = self._set(function, node, device, out)
         return out.value if pulsing else None
 
     def _set(self, function, node, device, *values):
-        _abi.ok(function(self._handle, _abi.encode(node), _abi.encode(device),
-                         *values))
+        return _abi.ok(function(
+            self._handle, _abi.encode(node), _abi.encode(device), *values))
 
 
 def _joystick(stick):
