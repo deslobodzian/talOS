@@ -116,7 +116,7 @@ It wrote the node package `flywheel/`, its subsystem file, its
 `[[subsystems]]` entry and the regenerated manifest, and, since this is the
 repository's first mechanism, the simulation config `robot_sim.toml`
 ([section 4](#4-make-it-move-in-simulation)), its manifest, and the two
-checks of it it added to `BUILD.bazel`. `--type position` makes
+checks of it it added to `BUILD.bazel`, pointing `//:sim` at it. `--type position` makes
 an arm or elevator instead ([section 9](#9-position-mechanisms-the-library-or-your-own-code)),
 and `--lang cpp` a C++ node ([section 6](#6-the-c-track)). The package is
 yours: the scaffold is a starting point, not a framework you must keep
@@ -232,18 +232,18 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 `include = "robot.toml"` takes the whole robot, and these tables are merged
 over the flywheel's subsystem file. The binding tells the `teleop` node to
 write a target on `/flywheel/target/teleop` while joystick button 3 is held.
-The scaffold also wrote `robot_sim_manifest.bzl`, this file's manifest, and
-added `sim_manifest_sync_test` and `sim_graph_test` to `BUILD.bazel`, so
-`bazel test //...` lints this config's graph too and fails, with the
-regenerate command, when its manifest goes stale.
+The scaffold also wrote `robot_sim_manifest.bzl`, this file's manifest,
+pointed `//:sim` at `robot_sim.toml`, and added `sim_manifest_sync_test`
+and `sim_graph_test` to `BUILD.bazel`, so `bazel test //...` lints this
+config's graph too and fails, with the regenerate command, when its
+manifest goes stale.
 
-Build and test everything, then run the simulation config with the launcher,
-as `Next:` prints it (`//:sim` runs `robot.toml`, which binds no button):
+Build and test everything, then run `//:sim` with the scripted joystick,
+as `Next:` prints it:
 
 ```sh
 bazel test //...
-bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 13 \
-    --start-sim-gateway --sim-gateway-arg --physics \
+bazel run //:sim -- --duration-s 13 \
     --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
     --sim-gateway-arg --joystick-schedule --sim-gateway-arg '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|6:axes=0;buttons=0;pov=-1'
 ```
@@ -309,8 +309,9 @@ stays neutral: that is the safety path working.
 
 - `./tools/setup.sh --check` (in talOS) lists each tool and whether it is
   acceptable.
-- `bazel run //:sim -- --duration-s 5` runs `robot.toml` alone against the
-  simulator; every member should exit 0.
+- `bazel run //:sim -- --duration-s 5` runs the robot against the
+  simulator (`robot.toml` before the first mechanism, `robot_sim.toml` once
+  `new_subsystem` creates it); every member should exit 0.
 - `bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml
   --describe-only` lints the simulation config's graph without starting
   it. A warning is fine; an `error:` line names the rule the launcher would
@@ -395,8 +396,7 @@ session the launcher printed (`<session>`, its `Output Dir`); the full dump,
 sampled, shows the trajectory:
 
 ```sh
-bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 13 \
-    --start-sim-gateway --sim-gateway-arg --physics \
+bazel run //:sim -- --duration-s 13 \
     --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
     --sim-gateway-arg --joystick-schedule --sim-gateway-arg '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=8;pov=-1|6:axes=0;buttons=0;pov=-1'
 bazel run @talos//talOS/launcher:log_dump -- --node claw --topic /claw/state <session> \
@@ -570,15 +570,12 @@ and the state `Latest().at_speed()`.
 at `/drive`. Its bridge is built in your repository from `@talos`; its pages
 are built by talOS's own workspace, in your talOS checkout, once and again
 after each talOS update. `new_robot`'s `Next:` printed the command with your
-checkout's path (here `../talos`). Then build `//:sim`, which gathers the
-bridge and the pages into `//:studio_webroot`, and run the simulation config
-with the bridge:
+checkout's path (here `../talos`). Then run `//:sim` with the bridge (it gathers the bridge and the pages into
+`//:studio_webroot` and runs `robot_sim.toml`):
 
 ```sh
 (cd ../talos && bazel build //studio:web_dist)
-bazel build //:sim
-bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duration-s 15 --start-studio-bridge \
-    --start-sim-gateway --sim-gateway-arg --physics \
+bazel run //:sim -- --duration-s 15 --start-studio-bridge \
     --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
     --sim-gateway-arg --joystick-schedule --sim-gateway-arg '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|6:axes=0;buttons=0;pov=-1'
 ```

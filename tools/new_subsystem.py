@@ -3468,19 +3468,25 @@ def sim_programs(root, config, talos):
             else talos + label for key, label in DEFAULT_PROGRAMS.items()]
 
 
-def sim_target_config(root):
+def sim_target_config(root, overrides=None):
     """The config the root package's talos_sim (`//:sim`, else the only
     one) runs, workspace-relative, or None if the BUILD file has none or
-    names it by anything but a string literal."""
+    names it by anything but a string literal. `overrides`, when given, maps
+    absolute paths to pending file contents (for --dry-run)."""
+    overrides = overrides or {}
     for build in ("BUILD.bazel", "BUILD"):
         path = os.path.join(root, build)
+        if path in overrides:
+            text = overrides[path]
+            break
         if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
             break
     else:
         return None
     try:
-        with open(path, encoding="utf-8") as f:
-            module = ast.parse(f.read())
+        module = ast.parse(text)
     except SyntaxError:
         return None
     # Every talos_sim, its config None when it is no string literal: a
@@ -4043,15 +4049,131 @@ def sim_test_loads(build, talos, manifest):
                       ("SIM_NODES", "NODES")])
 
 
+def ast_span(text, node):
+    """Character (start, end) of `node` in `text` (AST columns are UTF-8
+    byte offsets)."""
+    lines = text.splitlines(keepends=True)
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line))
+
+    def offset(lineno, col_offset):
+        prefix = lines[lineno - 1].encode("utf-8")[:col_offset].decode("utf-8")
+        return starts[lineno - 1] + len(prefix)
+
+    return (offset(node.lineno, node.col_offset),
+            offset(node.end_lineno, node.end_col_offset))
+
+
+def list_name_refs(expr, name):
+    """Every `ast.Name(id=name)` operand in a `+`-concatenation."""
+    if isinstance(expr, ast.Name):
+        return [expr] if expr.id == name else []
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        return (list_name_refs(expr.left, name)
+                + list_name_refs(expr.right, name))
+    return []
+
+
+def retarget_talos_sim(build, old_config, new_config, old_manifest):
+    """Point a root BUILD's `talos_sim(name = "sim", ...)` from `old_config`
+    (with `CONFIG_FILES` and `NODES` loaded from `old_manifest`) to
+    `new_config`, `SIM_CONFIG_FILES` and `SIM_NODES`, preserving any extra
+    entries and formatting. Returns `build` unchanged when `talos_sim` is
+    absent, non-literal, ambiguous, or has a custom layout."""
+    loads = load_statements(build)
+    if loads is None:
+        return build
+    bound = {local: (load.module, name)
+             for load in loads for local, name in load.items}
+    manifest_modules = {f":{old_manifest}", f"//:{old_manifest}"}
+    if (bound.get("CONFIG_FILES") not in {(m, "CONFIG_FILES")
+                                          for m in manifest_modules}
+            or bound.get("NODES") not in {(m, "NODES")
+                                          for m in manifest_modules}
+            or "SIM_CONFIG_FILES" not in bound
+            or "SIM_NODES" not in bound):
+        return build
+    try:
+        module = ast.parse(build)
+    except SyntaxError:
+        return build
+    sims = []
+    for node in ast.walk(module):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "talos_sim"):
+            keywords = {k.arg: k.value for k in node.keywords
+                        if k.arg is not None}
+            name = keywords.get("name")
+            if isinstance(name, ast.Constant) and name.value == "sim":
+                sims.append(node)
+    if len(sims) != 1:
+        return build
+    call = sims[0]
+    if not any(isinstance(stmt, ast.Expr) and stmt.value is call
+               for stmt in module.body):
+        return build
+    if call.args or any(k.arg is None for k in call.keywords):
+        return build
+    keywords = {k.arg: k.value for k in call.keywords}
+    config_node = keywords.get("config")
+    data_node = keywords.get("data")
+    nodes_node = keywords.get("nodes")
+    if not (isinstance(config_node, ast.Constant)
+            and isinstance(config_node.value, str)
+            and data_node is not None and nodes_node is not None):
+        return build
+    label = config_node.value
+    for prefix in ("//:", ":", ""):
+        if label == prefix + old_config:
+            break
+    else:
+        return build
+    cfg_start, cfg_end = ast_span(build, config_node)
+    cfg_raw = build[cfg_start:cfg_end]
+    if cfg_raw not in (f'"{label}"', f"'{label}'"):
+        return build
+    quote = cfg_raw[0]
+    data_refs = list_name_refs(data_node, "CONFIG_FILES")
+    nodes_refs = list_name_refs(nodes_node, "NODES")
+    if (len(data_refs) != 1 or len(nodes_refs) != 1
+            or sum(1 for n in ast.walk(data_node)
+                   if isinstance(n, ast.Name) and n.id == "CONFIG_FILES") != 1
+            or sum(1 for n in ast.walk(nodes_node)
+                   if isinstance(n, ast.Name) and n.id == "NODES") != 1
+            or any(isinstance(n, ast.Name) and n.id == "SIM_CONFIG_FILES"
+                   for n in ast.walk(data_node))
+            or any(isinstance(n, ast.Name) and n.id == "SIM_NODES"
+                   for n in ast.walk(nodes_node))):
+        return build
+    data_start, data_end = ast_span(build, data_refs[0])
+    nodes_start, nodes_end = ast_span(build, nodes_refs[0])
+    if (build[data_start:data_end] != "CONFIG_FILES"
+            or build[nodes_start:nodes_end] != "NODES"):
+        return build
+    edits = [
+        (cfg_start, cfg_end, f"{quote}{prefix}{new_config}{quote}"),
+        (data_start, data_end, "SIM_CONFIG_FILES"),
+        (nodes_start, nodes_end, "SIM_NODES"),
+    ]
+    edits.sort(key=lambda edit: edit[0], reverse=True)
+    for start, end, replacement in edits:
+        build = build[:start] + replacement + build[end:]
+    return build
+
+
 def robot_sim_files(root, layout, overrides):
     """[(path, old, new)] that give the robot repository of `layout` its
     simulation config: robot_sim.toml (sim_config_header), its manifest from
     `overrides` (the pending files), and its manifest_sync_test and
     talos_graph_test in the BUILD of its package, so that a mistake in it
-    fails `bazel test //...`. [] when the scaffold cannot place the tests
-    (no BUILD there, one that already declares their names, or one whose
-    loads sim_test_loads cannot extend without risking it); next_steps
-    then says nothing checks it."""
+    fails `bazel test //...`. When that BUILD is the root package's and has a
+    `talos_sim(name = "sim", ...)` pointed at the robot config with its
+    manifest's `CONFIG_FILES` and `NODES`, it also retargets `//:sim` to the
+    simulation config, `SIM_CONFIG_FILES` and `SIM_NODES`. [] when the
+    scaffold cannot place the tests (no BUILD there, one that already
+    declares their names, or one whose loads sim_test_loads cannot extend
+    without risking it); next_steps then says nothing checks it."""
     sim_path, exists = sim_config(root, layout)
     if exists:
         return []
@@ -4079,6 +4201,10 @@ def robot_sim_files(root, layout, overrides):
     build = sim_test_loads(old_build, layout.talos, manifest_in_package)
     if build is None:
         return []
+    if not package:
+        old_manifest = sync_manifest.manifest_path(layout.config)
+        build = retarget_talos_sim(build, layout.config, in_package,
+                                   old_manifest)
     build = build.rstrip("\n") + "\n" + fill(
         SIM_TESTS, SIM=in_package, CONFIG=posixpath.basename(layout.config),
         MANIFEST=manifest_in_package)
@@ -4471,7 +4597,8 @@ def main(argv):
         layout = layout_of(robot)
         sim_target = programs = None
         if layout.talos:
-            sim_target = sim_target_config(root)
+            sim_target = sim_target_config(
+                root, {path: content for path, _, content in writes})
             programs = sim_programs(root, layout.config, layout.talos)
         print(next_steps(robot, args.name, can_id, args.kind, args.lang,
                          golden_test, sim, button,
