@@ -257,8 +257,10 @@ py_test(
     deps = [":sync_manifest_lib"],
 )
 
-# python3 tools/check_layers.py (CI: the Linux job, after the build)
-# Checks the Bazel graph against ARCHITECTURE.md's layers with bazel query.
+# python3 tools/check_layers.py (CI: the Linux job, after the build) and
+# python3 tools/check_layers.py --source-only (tools/source_lints.sh)
+# Checks the Bazel graph against ARCHITECTURE.md's layers with bazel query,
+# and scans C++ node sources outside talOS/ for RULES.md 2 bypasses.
 py_test(
     name = "check_layers_test",
     size = "small",
