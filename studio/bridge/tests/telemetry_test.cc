@@ -1386,6 +1386,7 @@ TEST(SharedReservation,
   constexpr double kClientRate = kSharedRate / static_cast<double>(kClients);
   // 220 channels with long names produces a ~16 KB first dictionary page.
   std::vector<ChannelDef> large_dict;
+  large_dict.reserve(220);
   for (int i = 0; i < 220; ++i) {
     large_dict.push_back({"subsystem_alpha/telemetry_channel_with_long_name_" +
                               std::to_string(i),

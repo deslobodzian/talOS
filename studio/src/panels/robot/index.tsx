@@ -376,12 +376,17 @@ function RobotPanel() {
                  <Stat label="Brownout" channel="hw/status/brownout" tone={status.power.brownout ? 'warn' : undefined}>
                    {status.power.brownout === null ? '—' : status.power.brownout ? 'yes' : 'no'}
                  </Stat>
-                 {status.power.canBuses.map(bus =>
-                   <Stat key={bus.index}
-                         label={bus.label.startsWith('CAN ') ? bus.label : `CAN ${bus.label}`}
-                         channel={bus.channel} tone={canBusUnread(bus) ? 'warn' : undefined}>
+                 {status.power.canBuses.map(bus => {
+                   const configured = system.declared?.can_buses?.[bus.index];
+                   const label = configured
+                       ? `CAN ${configured}`
+                       : bus.index === 0 ? 'CAN rio' : `CAN bus ${bus.index}`;
+                   return <Stat key={bus.index} label={label}
+                                channel={bus.channel}
+                                tone={canBusUnread(bus) ? 'warn' : undefined}>
                      {canBusReading(bus)}
-                   </Stat>)}
+                   </Stat>;
+                 })}
                </StatList>
              </div>}
       </Card>

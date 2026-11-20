@@ -540,12 +540,21 @@ One waiting client's shared-bucket wait is therefore bounded independently of
 layout, **1.07 s** at R = 112,000 B/s with the default layout, **1.30 s** at
 the 80,000 B/s minimum programmer share; **0.75 s** / **0.86 s** for a
 40,000 B whole graph; **0.60 s** / **0.65 s** for a 16,394 B framed
-dictionary page). When k programmer clients wait simultaneously on messages
-of framed sizes G₁, …, Gₖ ≤ G, they are served FIFO by wait start
+dictionary page), per individual message or dictionary page (a multi-page
+dictionary queues each page on its own wait), plus up to 1 ms of
+whole-millisecond timer rounding per wake (`us_timer_set` in
+`studio/bridge/main.cc`). When k programmer clients wait simultaneously on
+messages of framed sizes G₁, …, Gₖ ≤ G, they are served FIFO by wait start
 (tie-broken by rotation order), so every one of them sends within
 `0.5 s + (G₁ + … + Gₖ) / R ≤ 0.5 s + k × G / R` (**2.10 s** / **2.79 s** for
 all 4 default clients waiting on 64,000 B; **26.1 s** / **37.1 s** for all
-64). A client that still has
+64), plus up to 1 ms wake rounding per hop. While a programmer client holds the
+shared reservation (up to `G / R`, or `k × G / R` across k queued waiters),
+other programmer clients' sends — including `talos.system_graph.deferred`
+notices (and the holder's own notices once its message blocks on the shared
+bucket) — pause while the shared bucket refills, so a programmer client can
+transiently observe graph staleness (`GRAPH_STALE_AFTER_MS` = 1 s) whenever
+that pause pushes silence past 1 s. A client that still has
 output buffered is held: it skips passes, and its telemetry resumes from the
 latest values once it drains. Being held never disconnects a client: the
 bridge sends nothing while output is buffered, so at most one graph message
@@ -621,7 +630,8 @@ The cost falls on structure changes. A 40 KB whole graph is a second of a
 or restarts, that client's telemetry runs at four updates a second for about
 that long (at most the bound above) while the graph goes. A whole graph goes at most every 2 s: in
 a crash loop, a client's graph shows restarts up to 2 s late (marked
-deferred, not stale), and its telemetry is thinned for about a second of
+deferred, not stale, except when a shared-bucket reservation pauses notices
+past 1 s), and its telemetry is thinned for about a second of
 every two.
 
 The value-page cap leaves room under a normal MTU, but TCP is a byte stream:

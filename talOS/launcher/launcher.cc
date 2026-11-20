@@ -710,14 +710,6 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     namespace_names.RegistryPrepared();
     try {
       introspect::PrepareRegistry();
-      // Every member registers a row, including the sim gateway and Studio's
-      // bridge.
-      const std::string full = RegistryCapacityError(
-          introspect::RegistryReader{}, node_specs.size());
-      if (!full.empty()) {
-        ConsoleLine(std::cerr) << "launcher: " << full << "\n";
-        return 1;
-      }
     } catch (const std::exception& e) {
       ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
       return 1;
@@ -769,6 +761,24 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   PrintDeclaredGraph(described, diagnostics, declared_topics, graph_path);
   // Its warning is in the graph above; an observer's absence stops nothing.
   DropUnansweredStudioBridge(node_specs, described);
+
+  // Checked after dropping an unanswered Studio bridge so an absent observer
+  // never causes an off-by-one capacity refusal.
+  if (starts_roster) {
+    try {
+      // Every remaining member registers a row, including the sim gateway and
+      // Studio's bridge when present.
+      const std::string full = RegistryCapacityError(
+          introspect::RegistryReader{}, node_specs.size());
+      if (!full.empty()) {
+        ConsoleLine(std::cerr) << "launcher: " << full << "\n";
+        return 1;
+      }
+    } catch (const std::exception& e) {
+      ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
+      return 1;
+    }
+  }
 
   if (naming::HasError(diagnostics) && !options_.allow_graph_errors) {
     ConsoleLine(std::cerr)
