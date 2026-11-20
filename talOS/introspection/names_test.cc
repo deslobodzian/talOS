@@ -6,6 +6,7 @@
 #include "talOS/introspection/names.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -219,6 +220,22 @@ const Diagnostic* Find(const std::vector<Diagnostic>& diagnostics,
                                         diagnostic.subject == subject;
                                });
   return it == diagnostics.end() ? nullptr : &*it;
+}
+
+// Whether `message` names `identifier` as a whole word (a node or topic
+// segment), so a test checks who a finding names, not its sentence.
+bool Names(std::string_view message, std::string_view identifier) {
+  const auto word = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+  };
+  for (auto at = message.find(identifier); at != std::string_view::npos;
+       at = message.find(identifier, at + 1)) {
+    const auto end = at + identifier.size();
+    if ((at == 0 || !word(message[at - 1])) &&
+        (end == message.size() || !word(message[end])))
+      return true;
+  }
+  return false;
 }
 
 long Errors(const std::vector<Diagnostic>& diagnostics) {
@@ -736,13 +753,8 @@ TEST(LintGraph, AnOptionalReadOfAFeedItsOwnerDoesNotPublishWarns) {
     const auto* warning =
         Find(diagnostics, Severity::WARNING, "/motor/state/wheel");
     ASSERT_NE(warning, nullptr) << Describe(diagnostics);
-    EXPECT_NE(warning->message.find("is read by arm, at least one declaring "
-                                    "it optional"),
-              std::string::npos)
-        << warning->message;
-    EXPECT_NE(warning->message.find("'motor' publishes no such topic"),
-              std::string::npos)
-        << warning->message;
+    EXPECT_TRUE(Names(warning->message, "arm")) << warning->message;
+    EXPECT_TRUE(Names(warning->message, "motor")) << warning->message;
     EXPECT_EQ(diagnostics.size(), 1u) << Describe(diagnostics);
   }
   {
@@ -755,6 +767,56 @@ TEST(LintGraph, AnOptionalReadOfAFeedItsOwnerDoesNotPublishWarns) {
               std::string::npos)
         << warning->message;
     EXPECT_EQ(diagnostics.size(), 1u) << Describe(diagnostics);
+  }
+}
+
+// REQ-CONTRACT-09: `optional` is one reader's tolerance, so it exempts only
+// that reader: a required read of a topic nothing writes is an error naming
+// the required reader even when another reader of it declared it optional.
+// (Among readers that are not observers; telemetry's observer read here
+// requires nothing.) With every reader optional the owner warning above is
+// unchanged. `external`
+// is a fact about the topic (written outside the graph), so one end
+// declaring it exempts every reader.
+TEST(LintGraph, AnOptionalReaderExemptsOnlyItselfFromTheUnwrittenError) {
+  const NodeShape motor{
+      "motor", "//robot/motor:node", {Sender("/motor/state")}};
+  const NodeShape telemetry{
+      "telemetry",
+      "//talOS/telemetry:node",
+      {Watcher("/motor/state", 32, kSourceFlagObserver),
+       Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+  const auto reader = [](const char* name, std::uint32_t flags) {
+    return NodeShape{name,
+                     std::string("//robot/") + name + ":node",
+                     {Watcher("/motor/state/wheel", 32, flags)}};
+  };
+  {
+    SCOPED_TRACE("one required, one optional");
+    const auto diagnostics = LintGraph({motor, telemetry, reader("arm", 0),
+                                        reader("panel", kSourceFlagOptional)});
+    const auto* error =
+        Find(diagnostics, Severity::ERROR, "/motor/state/wheel");
+    ASSERT_NE(error, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(error->message, "arm")) << error->message;
+    EXPECT_FALSE(Names(error->message, "panel")) << error->message;
+    EXPECT_EQ(Errors(diagnostics), 1) << Describe(diagnostics);
+  }
+  {
+    SCOPED_TRACE("every reader optional");
+    const auto diagnostics =
+        LintGraph({motor, telemetry, reader("arm", kSourceFlagOptional),
+                   reader("panel", kSourceFlagOptional)});
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+    EXPECT_NE(Find(diagnostics, Severity::WARNING, "/motor/state/wheel"),
+              nullptr)
+        << Describe(diagnostics);
+  }
+  {
+    SCOPED_TRACE("one required, one external");
+    const auto diagnostics = LintGraph({motor, telemetry, reader("arm", 0),
+                                        reader("panel", kSourceFlagExternal)});
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
   }
 }
 

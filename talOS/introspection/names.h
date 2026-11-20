@@ -622,6 +622,9 @@ inline std::vector<Diagnostic> LintGraph(
     std::string name;
     std::vector<std::string> writers;
     std::vector<std::string> readers;
+    // Readers whose end is neither optional nor external: `optional` is one
+    // reader's tolerance of a missing writer, so it exempts only that reader.
+    std::vector<std::string> required_readers;
     std::size_t reader_count{0};  // Observers also consume transport slots.
     bool exempt{false};           // Any end declared external or optional.
     bool external{false};         // Any end declared external.
@@ -733,6 +736,8 @@ inline std::vector<Diagnostic> LintGraph(
         }
       } else if (!source.observer()) {
         topic.readers.push_back(node.name);
+        if (!source.optional() && !source.external())
+          topic.required_readers.push_back(node.name);
       }
       if (IsReader(source.kind)) ++topic.reader_count;
 
@@ -816,9 +821,16 @@ inline std::vector<Diagnostic> LintGraph(
               join(topic.writers) +
               "); one writer per topic is what keeps the dispatch log "
               "replayable");
-    } else if (topic.writers.empty() && !topic.exempt) {
+    } else if (topic.writers.empty() && !topic.external &&
+               (!topic.exempt || !topic.required_readers.empty())) {
+      // `external` is the topic's: one end declaring it written outside the
+      // graph exempts every reader. With no end optional, every end requires a
+      // writer (an observer's included). With one optional, only the readers
+      // that are not observers and declared neither flag do; the error names
+      // them.
       add(Severity::ERROR, topic.name,
-          "is read by " + join(topic.readers) +
+          "is read by " +
+              join(topic.exempt ? topic.required_readers : topic.readers) +
               " but nothing publishes it; either the writer is missing or the "
               "two ends are spelled differently");
     } else if (topic.writers.empty() && !topic.readers.empty() &&
@@ -836,12 +848,11 @@ inline std::vector<Diagnostic> LintGraph(
       // (above), so an optional read of one the owner, a node here, does not
       // write is misspelled or not published in this configuration. Its owner's
       // real topic has no finding when telemetry records it (ObserverReads).
-      // One end declared external is written outside the graph. `exempt` is the
-      // whole topic's: which reader declared it optional is not kept, so the
-      // message does not say.
+      // One end declared external is written outside the graph. Every reader
+      // here declared it optional (a required one is an error, above).
       add(Severity::WARNING, topic.name,
           "is read by " + join(topic.readers) +
-              ", at least one declaring it optional, but '" + owner +
+              ", each declaring it optional, but '" + owner +
               "' publishes no such topic; the reader misspelled it or '" +
               owner + "' does not publish it in this configuration");
     }

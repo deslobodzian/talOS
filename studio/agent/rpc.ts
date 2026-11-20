@@ -9,8 +9,8 @@ import {type Snapshot, Timeline} from '../src/core';
 import {
   type DeclaredGraph,
   declaredStatus,
-  endpointAttributesKnown,
   eventRates,
+  type GraphVersionMismatch,
   RateWindow,
   rateKey,
   type SystemGraph,
@@ -20,7 +20,9 @@ import {
 import {graphStale} from '../src/data/freshness';
 
 export class RpcFault extends Error {
-  constructor(public code: number, message: string) {
+  // `data` is the JSON-RPC error's structured detail, sent when present.
+  constructor(public code: number, message: string,
+              public data?: Record<string, unknown>) {
     super(message);
   }
 }
@@ -56,6 +58,10 @@ export type RpcContext = {
   // Absent `connected` judges by age alone.
   systemArrivalMs?: number|null;
   connected?: boolean;
+
+  // Set while the bridge sends a system graph of another version than this
+  // reader's (`system` is then null).
+  systemMismatch?: GraphVersionMismatch|null;
 };
 
 // Rates come from the window when the caller keeps one, and from the single
@@ -184,7 +190,16 @@ function topicList(value: unknown): string[] {
 // A system graph is only present once the bridge has sent one. Saying so is
 // better than returning an empty graph, which an agent would read as "nothing
 // is running" rather than "nobody has told me yet".
+//
+// A bridge sending a graph version this reader cannot read is connected and
+// talking, so it is neither: -32003, with both versions as data.
 function requireSystem(context: RpcContext): SystemGraph {
+  const mismatch = context.systemMismatch;
+  if (!context.system && mismatch)
+    throw new RpcFault(-32003, mismatch.message, {
+      bridge_version: mismatch.bridge,
+      reader_version: mismatch.page
+    });
   if (!context.system)
     throw new RpcFault(
         -32002,
@@ -387,11 +402,8 @@ export function dispatch(
     for (const state of TOPIC_HEALTH) tally[state] = 0;
     for (const topic of system.topics) tally[health(topic)]++;
     return {
-      // Which document this is. Below version 2 a source could not state
-      // whether its far end is outside talOS, so `bridged` and `unconnected`
-      // are unreachable and the topics they describe are reported as faults --
-      // the older bridge's answer, and worth being able to tell apart from a
-      // graph that says so.
+      // Which document this is: always this reader's version, since the live
+      // stream refuses any other (-32003).
       version: system.version,
       wall_ns: system.wall_ns,
       // Whether this graph still says what is running now; when it is stale,
@@ -422,8 +434,7 @@ export function dispatch(
         lossy_topics: tally.lossy,
         bridged_topics: tally.bridged,
         unconnected_topics: tally.unconnected,
-        topics_by_health: tally,
-        endpoint_attributes: endpointAttributesKnown(system)
+        topics_by_health: tally
       }
     };
   }
@@ -531,7 +542,8 @@ export function handleRpc(context: RpcContext, input: unknown): unknown|
       id,
       error: {
         code: e instanceof RpcFault ? e.code : -32603,
-        message: e instanceof RpcFault ? e.message : 'Internal error'
+        message: e instanceof RpcFault ? e.message : 'Internal error',
+        ...(e instanceof RpcFault && e.data ? {data: e.data} : {})
       }
     };
   }

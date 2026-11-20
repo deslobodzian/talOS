@@ -11,6 +11,7 @@ import {GRAPH_STALE_AFTER_MS, readingClock, sampleStale} from '../src/data/fresh
 import type {SessionManifest} from '../src/data/manifest';
 import {TelemetryStore} from '../src/data/store';
 import type {PlaybackState, Snapshot, SystemState} from '../src/data/types';
+import {graphVersionMismatch, SYSTEM_GRAPH_VERSION} from '../src/system';
 
 let now = 1000;
 type Listener = ((event: {data: unknown}) => void)|null;
@@ -44,11 +45,13 @@ function apply(m: Record<string, unknown>) {
   }
 }
 let exported: ArrayBuffer|null = null;
+let rpcResponse: unknown = null;
 const ctx = {
   onmessage: null as Listener,
   postMessage(message: {type: string; messages?: Record<string, unknown>[];
-                        buffer?: ArrayBuffer}) {
+                        buffer?: ArrayBuffer; response?: unknown}) {
     if (message.type === 'export') exported = message.buffer!;
+    if (message.type === 'rpc') rpcResponse = message.response;
     if (message.type !== 'updates') return;
     for (const m of message.messages!) apply(m);
     send({type: 'ack'});
@@ -198,6 +201,48 @@ test('a graph goes stale the moment the socket drops', () => {
   advance(8);
   assert.equal(system!.stale, true);
   assert.ok(system!.graph, 'last-known graph stays inspectable');
+});
+
+// REQ-OPS-23: a bridge of another build whose graph version is not the
+// page's is named, and the page shows no graph, so no node reads as live,
+// stopped or stale on evidence it cannot read (system.test.ts holds the
+// stream to both directions).
+test('a graph of another version is named, not shown', () => {
+  const socket = connect();
+  text(socket, demoSystemGraph(0n));
+  advance(8);
+  assert.ok(system!.graph);
+  const newer = {...JSON.parse(demoSystemGraph(1n)), version: SYSTEM_GRAPH_VERSION + 1};
+  text(socket, JSON.stringify(newer));
+  advance(8);
+  assert.equal(system!.graph, null, 'no liveness from a graph the page cannot read');
+  assert.deepEqual(graphVersionMismatch(system!.error),
+                   {bridge: SYSTEM_GRAPH_VERSION + 1, page: SYSTEM_GRAPH_VERSION});
+  // The Agent tab answers as the headless agent does.
+  send({type: 'rpc', id: 1,
+        request: {jsonrpc: '2.0', id: 1, method: 'get_system_graph'}});
+  const answer = rpcResponse as {error: {code: number; data: unknown}};
+  assert.equal(answer.error.code, -32003);
+  assert.deepEqual(answer.error.data, {bridge_version: SYSTEM_GRAPH_VERSION + 1,
+                                       reader_version: SYSTEM_GRAPH_VERSION});
+  text(socket, demoSystemGraph(2n));
+  advance(8);
+  assert.ok(system!.graph);
+  assert.equal(system!.error, '');
+});
+
+// REQ-OPS-23: the mismatch is a statement about the bridge on this socket.
+// Once it closes the page is disconnected, not still hearing that bridge.
+test('a closed socket no longer names the last bridge\'s graph version', () => {
+  const socket = connect();
+  text(socket, JSON.stringify(
+      {...JSON.parse(demoSystemGraph(0n)), version: SYSTEM_GRAPH_VERSION + 1}));
+  advance(8);
+  assert.ok(graphVersionMismatch(system!.error));
+  captureTimeout(() => socket.onclose!());
+  advance(8);
+  assert.equal(playback!.connection, 'connecting');
+  assert.equal(graphVersionMismatch(system!.error), null);
 });
 
 // An export from an older telemetry format is refused by name, not decoded

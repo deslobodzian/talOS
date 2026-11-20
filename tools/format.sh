@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # Run clang-format 18, the version CI runs, on the C/C++ files changed against
-# a base. Same selection as CI's clang-format job: files changed since the
-# base (deletions excluded), *.c *.cc *.cpp *.h *.hpp, third_party/ excluded.
-# Uncommitted edits are included too, since this runs before committing.
+# a base: CI's clang-format selection for committed changes (files changed
+# since the base, deletions excluded, *.c *.cc *.cpp *.h *.hpp, third_party/
+# excluded), plus uncommitted edits and untracked files git does not ignore,
+# so a file fails here before it is committed rather than in CI after.
 # Tool setup: tools/clang18.sh.
 #
 #   tools/format.sh [--check | --fix] [--base <ref> | --all]
@@ -43,6 +44,9 @@ else
   while IFS= read -r -d '' f; do
     [ -f "$f" ] && files+=("$f")
   done < <(git diff --name-only --diff-filter=d -z "$BASE" -- "${pat[@]}")
+  while IFS= read -r -d '' f; do
+    [ -f "$f" ] && files+=("$f")
+  done < <(git ls-files --others --exclude-standard -z -- "${pat[@]}")
 fi
 [ ${#files[@]} -gt 0 ] || { echo "format: no C/C++ files to check"; exit 0; }
 

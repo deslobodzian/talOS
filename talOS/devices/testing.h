@@ -37,7 +37,10 @@
 // request observed after the last such State drives it again; a follower's
 // sample reads invalid while its master's does. An invalid motor or CAN
 // sensor sample carries zero position, velocity, voltage and stator and
-// supply current (hardware::MarkInvalid). As on the gateway, a State in which
+// supply current (hardware::MarkInvalid). A non-finite value given to a
+// setter reaches the State as the gateway publishes one, by the gateway's own
+// function (hardware::ReplaceNonFinite, talOS/hardware/gateway.h). As on the
+// gateway, a State in which
 // every motor and CAN sensor sample is invalid as published (disconnected, too
 // old, masked by reset_device(), or a follower of an invalid master) carries
 // kHardwareFault (so robot_enabled() is false) and, the first time, starts a

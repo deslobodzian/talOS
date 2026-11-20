@@ -11,6 +11,18 @@
 #include "messages.h"
 
 namespace talos::hardware {
+// Leaves no non-finite value in `state`'s configured samples, the gateway's
+// rule for every backend (Gateway::Tick, after Backend::Read) and
+// testing::SimHardware's for the State it publishes. A motor or CAN sensor
+// whose position or velocity is not finite is invalid (MarkInvalid); a
+// motor's non-finite voltage, current or temperature is 0 and does not by
+// itself change its validity; an analog input, encoder or PWM output sample
+// with one is invalid with 0; a non-finite battery voltage is 0 with the
+// health sample invalid; and a CAN bus slot with a non-finite utilization is
+// a failed read: utilization 0, a kOk or kPending read state kFailed, its
+// counters kept.
+void ReplaceNonFinite(State& state);
+
 // Platform-specific code owns device objects. Configure runs at startup or
 // disabled and may block; Read/Apply/Neutral and reset polling must not block.
 class Backend {
@@ -32,12 +44,13 @@ class Backend {
   // value or an isolated device, and reports each sample's ages. The gateway
   // invalidates a motor or CAN-sensor sample whose position or velocity age is
   // at least `command_timeout_us` (UINT32_MAX: unknown; FeedbackFresh in
-  // gate.h). Return false for a failed read pass or total motor/CAN-sensor
-  // feedback loss, not an individual dropout. With no such devices configured,
-  // return true. An invalid sample gates only the affected motor and its
-  // followers and dependents: neutral from the Tick that finds it, and driven
-  // again only by a command observing a later State.
-  // Read also fills `state.health.can_bus`, the health of CAN bus
+  // gate.h), and replaces any non-finite value Read leaves, whatever the
+  // backend (ReplaceNonFinite, above). Return false for a failed read pass or
+  // total motor/CAN-sensor feedback loss, not an individual dropout. With no
+  // such devices configured, return true. An invalid sample gates only the
+  // affected motor and its followers and dependents: neutral from the Tick that
+  // finds it, and driven again only by a command observing a later State. Read
+  // also fills `state.health.can_bus`, the health of CAN bus
   // `state.health.can_bus_index` (CanBuses order), or leaves it kNone; the
   // gateway sets the index and count and clears the slot before each Read.
   // Total loss is judged on the State as published (AnyFeedbackValid,

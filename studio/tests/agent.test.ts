@@ -22,6 +22,7 @@ import {
   type DeclaredGraph,
   parseDeclaredGraph,
   parseSystemGraph,
+  SYSTEM_GRAPH_VERSION,
   type SystemGraph,
 } from '../src/system';
 
@@ -301,10 +302,6 @@ test('the system graph reports every node, both ends of every topic, and health'
                .health,
            'unconnected');
        assert.equal(result.summary.bridged_topics, 1);
-       // Which document the classification came from: below version 2 those two
-       // states are unreachable and their topics read as faults.
-       assert.equal(result.version, 2);
-       assert.equal(result.summary.endpoint_attributes, true);
        assert.ok(result.summary.unconnected_topics >= 1);
        assert.equal(
            Object.values(result.summary.topics_by_health)
@@ -653,6 +650,33 @@ test('losing the bridge drops the live graph instead of reporting it alive',
          assert.throws(
              () => dispatch(agent.context(), 'get_system_graph', {}),
              (e: unknown) => e instanceof RpcFault && e.code === -32002);
+       } finally {
+         agent.close();
+         bridge.close();
+       }
+     });
+
+// REQ-OPS-23: a bridge sending a graph of another version is connected and
+// talking, so "no system graph received yet" would be false. The agent
+// answers with its own code and both versions, until a readable graph.
+test('a graph of another version is answered by both versions, not as absent',
+     async () => {
+       const bridge = await fakeBridge(null);
+       const agent = startAgent(0, bridge.url);
+       try {
+         const newer = {...JSON.parse(demoSystemGraph(500n)),
+                        version: SYSTEM_GRAPH_VERSION + 1};
+         agent.ingestSystemGraph(JSON.stringify(newer));
+         const response = handleRpc(
+             agent.context(),
+             {jsonrpc: '2.0', id: 1, method: 'get_system_graph'}) as any;
+         assert.equal(response.error.code, -32003);
+         assert.deepEqual(response.error.data, {
+           bridge_version: SYSTEM_GRAPH_VERSION + 1,
+           reader_version: SYSTEM_GRAPH_VERSION
+         });
+         agent.ingestSystemGraph(demoSystemGraph(501n));
+         assert.ok(dispatch(agent.context(), 'get_system_graph', {}));
        } finally {
          agent.close();
          bridge.close();

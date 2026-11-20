@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <span>
@@ -565,35 +566,42 @@ TEST(Config, TorqueCurrentLimitTravelsOnTheWireAndFingerprint) {
   EXPECT_EQ(decoded, c);
 }
 
-// A RoboRIO's saved configuration written before foc existed (each motor
-// record one byte shorter) is refused at startup rather than misread, so the
-// RoboRIO boots unconfigured, as with a corrupt file, until the bridge
-// pushes its configuration.
-// REQ-CONTRACT-39
-TEST(ConfigWire, APersistedConfigWithoutTheFocByteIsRefused) {
+// The RoboRIO's saved configuration file is tagged with the protocol version
+// that wrote it, which every config codec change bumps. A file of another
+// version is refused by that tag, though its body decodes and its CRC holds;
+// so is a file written before the tag (the config bytes and their CRC32,
+// through protocol 11). Either way the RoboRIO boots unconfigured, as with a
+// corrupt file, until the bridge pushes its configuration.
+// REQ-CONTRACT-06
+TEST(ConfigWire, APersistedConfigOfAnotherFormatIsRefusedByItsTag) {
   const auto c = SwerveConfig(true);
-  ASSERT_GT(c.motors.size(), 1u);
-  auto bytes = SerializeConfig(c);
-  // Each motor's foc byte is the one that differs when only its foc does.
-  std::vector<std::ptrdiff_t> foc_offsets;
-  for (std::size_t i = 0; i < c.motors.size(); ++i) {
-    auto on = c;
-    on.motors[i].foc = true;
-    const auto on_bytes = SerializeConfig(on);
-    ASSERT_EQ(on_bytes.size(), bytes.size());
-    const auto at = std::mismatch(bytes.begin(), bytes.end(), on_bytes.begin());
-    ASSERT_NE(at.first, bytes.end());
-    foc_offsets.push_back(at.first - bytes.begin());
-  }
-  for (auto it = foc_offsets.rbegin(); it != foc_offsets.rend(); ++it)
-    bytes.erase(bytes.begin() + *it);
-  const uint32_t crc = ComputeCrc32(bytes);
-  for (int i = 0; i < 4; ++i)
-    bytes.push_back(static_cast<uint8_t>(crc >> (8 * i)));
+  const auto body = SerializeConfig(c);
+  const auto with_crc = [](std::vector<uint8_t> bytes) {
+    const uint32_t crc = ComputeCrc32(bytes);
+    for (int i = 0; i < 4; ++i)
+      bytes.push_back(static_cast<uint8_t>(crc >> (8 * i)));
+    return bytes;
+  };
+  const auto tagged = [&](uint16_t version) {
+    std::vector<uint8_t> bytes{'T', 'A', 'L', 'O', 'S', 'C', 'F', 'G'};
+    bytes.push_back(static_cast<uint8_t>(version & 0xFFu));
+    bytes.push_back(static_cast<uint8_t>(version >> 8));
+    bytes.insert(bytes.end(), body.begin(), body.end());
+    return with_crc(std::move(bytes));
+  };
   Config loaded;
-  EXPECT_FALSE(LoadPersistedConfig(bytes, loaded));
-  ASSERT_TRUE(LoadPersistedConfig(PersistedConfig(c), loaded));
+  EXPECT_FALSE(LoadPersistedConfig(with_crc(body), loaded));
+  const auto current = tagged(protocol::kProtocolVersion);
+  EXPECT_EQ(PersistedConfig(c), current);
+  ASSERT_TRUE(LoadPersistedConfig(current, loaded));
   EXPECT_EQ(loaded, c);
+  // The same body and a valid CRC; only the version differs.
+  constexpr uint16_t kVersion = protocol::kProtocolVersion;
+  for (const uint16_t other :
+       std::array<uint16_t, 3>{0, kVersion - 1, kVersion + 1}) {
+    SCOPED_TRACE(other);
+    EXPECT_FALSE(LoadPersistedConfig(tagged(other), loaded));
+  }
 }
 
 TEST(SimBackend, PigeonMountCalibrationReachesIdealBackend) {
@@ -1275,6 +1283,201 @@ TEST(Gateway, InvalidRemoteFeedbackIsolatesOnlyItsMotor) {
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
 }
 
+// FakeBackend's samples with `overwrite` applied after each Read: a backend
+// that copied a device's raw, non-finite value into the State.
+class NonFiniteBackend : public FakeBackend {
+ public:
+  bool Read(State& s) override {
+    const bool ok = FakeBackend::Read(s);
+    if (overwrite) overwrite(s);
+    return ok;
+  }
+  std::function<void(State&)> overwrite;
+};
+
+// Whether every floating field the State's encoding carries is finite.
+bool AllFinite(const State& s) {
+  const auto finite = [](std::initializer_list<double> values) {
+    return std::all_of(values.begin(), values.end(),
+                       [](double x) { return std::isfinite(x); });
+  };
+  for (std::size_t i = 0; i < s.motor_count; ++i) {
+    const auto& m = s.motors[i];
+    if (!finite({m.position_rot, m.velocity_rps, m.voltage, m.stator_current_a,
+                 m.temperature_c, m.supply_current_a})) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < s.sensor_count; ++i) {
+    if (!finite({s.sensors[i].position_rot, s.sensors[i].velocity_rps})) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < s.analog_input_count; ++i) {
+    if (!finite({s.analog_inputs[i].voltage})) return false;
+  }
+  for (std::size_t i = 0; i < s.encoder_count; ++i) {
+    if (!finite({s.encoders[i].position_rot, s.encoders[i].velocity_rps})) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < s.pwm_output_count; ++i) {
+    if (!finite({s.pwm_outputs[i].output})) return false;
+  }
+  return finite({s.health.battery_v, s.health.can_bus.utilization_frac});
+}
+
+// Decode refuses a whole State for one non-finite value, and Encode one for
+// a non-finite current or temperature, so one device's NaN reaching the
+// gateway would read at the bridge as total feedback loss. The gateway judges
+// a non-finite reading for every backend: a motor's or CAN sensor's
+// non-finite position or velocity invalidates only that sample, so only that
+// motor, or the motor using that CANcoder as remote feedback, goes neutral
+// while the others drive; any other non-finite reading is 0, its sample (or
+// the health sample) invalid where it has a validity, and a CAN bus slot with
+// one a failed read. Every motor and CAN sensor non-finite is total loss, as
+// any other invalid feedback is.
+// REQ-SAFE-22, REQ-CONTRACT-32
+TEST(Gateway, ANonFiniteReadingInvalidatesOnlyItsSampleAndTheStateDecodes) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  auto config = SwerveConfig(true);
+  config.analog_inputs = {{22, "pressure", 2}};
+  config.encoders = {{23, "wheel", EncoderKind::kQuadrature, 2, 3, 2048, 0}};
+  config.pwm_outputs = {{25, "servo", 5}};
+  const auto motor_index = [&config](uint16_t id) {
+    std::size_t i = 0;
+    while (config.motors[i].id != id) ++i;
+    return i;
+  };
+  // Three rotor-feedback drive motors on none of which another motor
+  // depends, and a steer motor whose remote feedback is CANcoder 5.
+  const std::size_t bad = motor_index(1);
+  const std::size_t effort = motor_index(4);
+  const std::size_t good = motor_index(8);
+  const std::size_t steer = motor_index(6);
+  ASSERT_EQ(config.motors[steer].feedback, Feedback::kRemoteCANcoder);
+  std::size_t cancoder = 0;
+  while (config.sensors[cancoder].id != config.motors[steer].feedback_sensor_id)
+    ++cancoder;
+  // kPosition and kVelocity: a motor's, a CAN sensor's and an encoder's
+  // position, then their velocity. kRioReadings: the values PhoenixBackend
+  // copies from the HAL unchecked (battery, analog input, PWM output) and the
+  // CAN bus slot. kEffort: a motor's values with no validity on the wire.
+  enum Row { kPosition, kVelocity, kRioReadings, kEffort, kEveryMotion };
+  for (const Row row :
+       {kPosition, kVelocity, kRioReadings, kEffort, kEveryMotion}) {
+    SCOPED_TRACE(row == kPosition      ? "positions"
+                 : row == kVelocity    ? "velocities"
+                 : row == kRioReadings ? "battery, analog, PWM, CAN bus"
+                 : row == kEffort      ? "motor voltage, currents, temperature"
+                                       : "every motor and CAN sensor");
+    NonFiniteBackend backend;
+    backend.positions = {{config.motors[bad].id, 0.75},
+                         {config.motors[effort].id, 2.5},
+                         {config.motors[good].id, 1.25}};
+    backend.measurement = row == kEveryMotion ? kNaN : 0.5;
+    backend.overwrite = [&](State& s) {
+      if (row == kPosition) {
+        s.motors[bad].position_rot = kNaN;
+        s.sensors[cancoder].position_rot = -kInf;
+        s.encoders[0] = {23, true, kNaN, 0.5, 0};
+      }
+      if (row == kVelocity) {
+        s.motors[bad].velocity_rps = kInf;
+        s.sensors[cancoder].velocity_rps = kNaN;
+        s.encoders[0] = {23, true, 0.5, kInf, 0};
+      }
+      if (row == kEffort) {
+        s.motors[effort].voltage = kNaN;
+        s.motors[effort].stator_current_a = kInf;
+        s.motors[effort].supply_current_a = -kInf;
+        s.motors[effort].temperature_c = kNaN;
+      }
+      if (row != kRioReadings) return;
+      s.health.battery_v = kNaN;
+      s.analog_inputs[0] = {22, true, kNaN, 0};
+      s.pwm_outputs[0] = {25, true, kNaN};
+      s.health.can_bus = {
+          .read_state = CanBusReadState::kOk,
+          .utilization_frac = std::numeric_limits<float>::quiet_NaN(),
+          .bus_off_count = 3};
+    };
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    const State published = g.snapshot();
+    EXPECT_TRUE(AllFinite(published));
+    std::array<uint8_t, kMaxStateSize> bytes{};
+    const std::size_t size = Encode(published, bytes);
+    State s{};
+    const bool decoded = Decode(std::span{bytes}.first(size), s);
+    EXPECT_GT(size, 0u);
+    EXPECT_TRUE(decoded);
+    if (size == 0 || !decoded) continue;
+    if (row == kEveryMotion) {
+      for (std::size_t i = 0; i < s.motor_count; ++i) {
+        EXPECT_FALSE(s.motors[i].valid) << config.motors[i].name;
+      }
+      EXPECT_TRUE(s.flags & kHardwareFault);
+      EXPECT_FALSE(g.Accept(Request(g), 1, 1000));
+      EXPECT_EQ(backend.applied, 0);
+      continue;
+    }
+    const bool motion = row == kPosition || row == kVelocity;
+    EXPECT_EQ(s.motors[bad].valid, !motion);
+    EXPECT_EQ(s.motors[bad].position_rot, motion ? 0 : 0.75);
+    EXPECT_EQ(s.motors[bad].velocity_rps, motion ? 0 : 0.5);
+    // An invalidated sample carries zero in every measured field.
+    EXPECT_EQ(s.motors[bad].voltage, motion ? 0 : 0.5);
+    EXPECT_EQ(s.motors[bad].stator_current_a, motion ? 0 : 0.5);
+    EXPECT_EQ(s.motors[bad].supply_current_a, motion ? 0 : 0.5);
+    EXPECT_EQ(s.sensors[cancoder].valid, !motion);
+    EXPECT_EQ(s.sensors[cancoder].position_rot, motion ? 0 : 0.5);
+    EXPECT_EQ(s.sensors[cancoder].velocity_rps, motion ? 0 : 0.5);
+    if (motion) {  // FakeBackend leaves the encoder unread otherwise.
+      EXPECT_FALSE(s.encoders[0].valid);
+      EXPECT_EQ(s.encoders[0].position_rot, 0);
+      EXPECT_EQ(s.encoders[0].velocity_rps, 0);
+    }
+    EXPECT_TRUE(s.motors[good].valid);
+    EXPECT_EQ(s.motors[good].position_rot, 1.25);
+    EXPECT_EQ(s.motors[good].velocity_rps, 0.5);
+    EXPECT_EQ(s.motors[good].voltage, 0.5);
+    // Non-finite effort and temperature leave the motion feedback valid.
+    EXPECT_TRUE(s.motors[effort].valid);
+    EXPECT_EQ(s.motors[effort].position_rot, 2.5);
+    EXPECT_EQ(s.motors[effort].velocity_rps, 0.5);
+    if (row == kEffort) {
+      EXPECT_EQ(s.motors[effort].voltage, 0);
+      EXPECT_EQ(s.motors[effort].stator_current_a, 0);
+      EXPECT_EQ(s.motors[effort].supply_current_a, 0);
+      EXPECT_EQ(s.motors[effort].temperature_c, 0);
+    }
+    if (row == kRioReadings) {
+      EXPECT_FALSE(s.health.valid);
+      EXPECT_EQ(s.health.battery_v, 0);
+      EXPECT_FALSE(s.analog_inputs[0].valid);
+      EXPECT_EQ(s.analog_inputs[0].voltage, 0);
+      EXPECT_FALSE(s.pwm_outputs[0].valid);
+      EXPECT_EQ(s.pwm_outputs[0].output, 0);
+      EXPECT_EQ(s.health.can_bus.read_state, CanBusReadState::kFailed);
+      EXPECT_EQ(s.health.can_bus.utilization_frac, 0);
+      EXPECT_EQ(s.health.can_bus.bus_off_count, 3u);
+    }
+    EXPECT_FALSE(s.flags & kHardwareFault);
+    auto command = Request(g);
+    command.pwm_output_count = 1;
+    command.pwm_outputs[0] = {.id = 25};
+    ASSERT_TRUE(g.Accept(command, 1, 1000));
+    for (std::size_t i = 0; i < config.motors.size(); ++i) {
+      EXPECT_EQ(
+          backend.last_requests[i].mode,
+          motion && (i == bad || i == steer) ? Mode::kNeutral : Mode::kVelocity)
+          << config.motors[i].name;
+    }
+  }
+}
+
 // The bench's CAN silences froze the feedback of its one Talon FX for
 // 64-66 ms (TODO.md RESET-3). Feedback younger than command_timeout_us still
 // counts: through the gap the command in force keeps driving, with no
@@ -1796,28 +1999,37 @@ TEST(Gateway, ReconfigurationRequiresDisabledOperation) {
   EXPECT_TRUE(g.Reconfigure(changed));
   EXPECT_EQ(backend.configure_calls, configures + 1);
 }
-// REQ-SAFE-23: repeated global apply failures latch a fault that re-enable
-// clears
+// REQ-SAFE-23: only consecutive global apply failures latch a fault (a
+// successful apply restarts the count), and re-enable clears it
 TEST(Gateway, ApplyFailureRetriesThenLatchesAndReenableClears) {
+  constexpr uint32_t kLimit = Gateway::kConsecutiveApplyFailureLimit;
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
   g.Tick(1000, true);
+  uint32_t sequence = 0;
+  // One short of the limit, a success, then one short again: never latched.
+  for (int run = 0; run < 2; ++run) {
+    backend.apply_ok = false;
+    for (uint32_t i = 0; i + 1 < kLimit; ++i) {
+      EXPECT_FALSE(g.Accept(Request(g), ++sequence, 1000));
+    }
+    EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+    backend.apply_ok = true;
+    EXPECT_TRUE(g.Accept(Request(g), ++sequence, 1000));
+  }
+  // The limit reached consecutively latches.
   backend.apply_ok = false;
-  EXPECT_FALSE(g.Accept(Request(g), 1, 1000));
-  EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
-  backend.apply_ok = true;
-  EXPECT_TRUE(g.Accept(Request(g), 2, 1000));
-  backend.apply_ok = false;
-  for (uint32_t i = 0; i < Gateway::kConsecutiveApplyFailureLimit; ++i) {
-    EXPECT_FALSE(g.Accept(Request(g), i + 3, 1000));
+  for (uint32_t i = 0; i < kLimit; ++i) {
+    EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+    EXPECT_FALSE(g.Accept(Request(g), ++sequence, 1000));
   }
   EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
-  EXPECT_EQ(g.snapshot().counters.apply_failure_count, 4u);
+  EXPECT_EQ(g.snapshot().counters.apply_failure_count, 3 * kLimit - 2);
   backend.apply_ok = true;
-  EXPECT_FALSE(g.Accept(Request(g), 7, 1000));
+  EXPECT_FALSE(g.Accept(Request(g), ++sequence, 1000));
   g.Tick(2000, false);
   g.Tick(3000, true);
-  EXPECT_TRUE(g.Accept(Request(g), 8, 3000));
+  EXPECT_TRUE(g.Accept(Request(g), ++sequence, 3000));
 }
 // REQ-SAFE-18: a backend stop (a global apply failure) advances the epoch, so
 // a command built before it never actuates once the backend applies again;
@@ -3693,7 +3905,8 @@ TEST(ConfigWire, PersistenceValidatesCrcAndAssemblerResetsAfterCompletion) {
   Config loaded;
   ASSERT_TRUE(LoadPersistedConfig(bytes, loaded));
   EXPECT_EQ(loaded, config);
-  bytes[0] ^= 1;
+  // period_us's low bit: a body that still decodes and validates.
+  bytes[kPersistedConfigHeaderBytes] ^= 1;
   EXPECT_FALSE(LoadPersistedConfig(bytes, loaded));
   EXPECT_FALSE(LoadPersistedConfig({}, loaded));
   auto invalid = config;
