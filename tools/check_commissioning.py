@@ -1,4 +1,4 @@
-"""Fails a commit that commissions a robot or changes a physical CAN id or bus.
+"""Fails a commit that commissions a robot or changes a physical CAN address.
 
     python3 tools/check_commissioning.py --base <rev>   # from the workspace
 
@@ -7,34 +7,43 @@ CAN id (or moves a device to another CAN bus, which changes its physical CAN
 address) in a robot config; a person does that at the robot
 (docs/BRINGUP.md "Human commissioning"). This checks each commit in
 `merge-base(<rev>, HEAD)..HEAD` (a merged branch's commits included) on its
-own and reports every robot or bench config line it
+own. For every non-exempt tracked `*.toml` file that commit changes, it reads
+the parent and commit blobs directly from git (`git cat-file blob`), parses
+both as TOML 1.0 with `tomllib` (failing closed on invalid UTF-8, TOML parse
+errors, or non-regular file modes such as symlinks), and reports any addition,
+change or removal of:
 
-- adds that sets `commissioned = true`,
-- adds or removes that holds a `can_id` key, or
-- adds or removes that holds a `bus` key
+- `commissioned` at any table path (non-table values),
+- `can_id` or `bus` at any table path (non-table values), including table
+  header swaps (`[...motors.lead]` <-> `[...motors.follower]`), inline tables,
+  multiline or triple-quoted strings, dotted keys and quoted/unicode-escaped
+  keys,
+- `include` at any table path (non-table values), or
+- `[[subsystems]]` `path` or `defaults` entries (and `[subsystem]` `defaults`),
+  which re-point device configs.
 
-(`can_id` and `bus` are the only keys `talOS/configuration` reads a device's
-physical CAN address from), in any spelling TOML accepts (bare, quoted
-including basic-string unicode escapes, or dotted key, inline table, trailing
-comment), but not in a comment, a string value, or a single-quoted literal
-key holding unescaped text. It over-reports rather than miss one: a config
-file moved, renamed or added whole, or a `can_id` or `bus` line moved between
-files, also needs the trailer below. A merge commit's own change is its diff
-against git's automatic re-merge of its parents (`git show --remerge-diff`).
-A clean merge has none; a line written while resolving a conflict, or a stale
-copy of a config kept from one side (which can revert a person's change made
-on the other), shows. It over-reports a conflict resolved by picking one side
-of a `can_id` or `bus` line: the side not picked reads as removed, and the
-merge then carries the trailer. git cannot re-merge an octopus merge, so one
-reports what its diff against any parent shows.
+Because each file is parsed as TOML rather than scanned line by line, comments,
+string values, unrelated keys, and tables named like a guarded key (such as
+`[subsystems.bus]`) do not trigger findings, while any valid TOML 1.0 spelling
+of a guarded key is seen. A config file moved, renamed, deleted, or added
+whole with guarded keys is also reported.
 
-Every diff reads attributes from the empty tree and no attributes file
-(`--attr-source`), so a committed `.gitattributes` (`-diff`, `binary`,
-`-merge`, `merge=<driver>`) neither hides a line nor makes the re-merge
-keep the side the merge kept; external diff, textconv and renormalization
-are off. A local `.git/info/attributes`, which git reads whatever the
-attribute source, must hold no rule. The check needs git 2.40 or later;
-otherwise it exits 2 naming why.
+For a two-parent merge commit with a single merge base, the check compares the
+merged commit's guarded keys against the 3-way merge of its parents relative
+to their merge base: a clean merge reports nothing (each parent branch's own
+commits are checked on their own), while a resolution that writes or edits a
+guarded key, keeps a stale copy that reverts the other side's change, or
+resolves a conflict on a guarded key is reported. For a criss-cross merge
+(multiple merge bases), an unrelated-history merge (no merge base), or an
+octopus merge (more than two parents), the check compares the merge commit
+against every parent and reports any guarded key differing from any parent.
+
+Every git tree diff reads attributes from the empty tree and no attributes
+file (`--attr-source`), so a committed `.gitattributes` (`-diff`, `binary`,
+`-merge`, `merge=<driver>`) has no effect. A local `.git/info/attributes`,
+which git reads whatever the attribute source, must hold no rule. The check
+needs git 2.40 or later and Python 3.11 or later (`tomllib`); otherwise it
+exits 2 naming why.
 
 A robot or bench config is any tracked `*.toml` outside an `examples`,
 `tests` or `fixtures` directory and outside any directory whose name ends
@@ -58,10 +67,13 @@ Accepted bounds:
   block (the only one read) exempts everything folded into it, whoever wrote
   it. A person's commissioning commit therefore holds nothing but what that
   person checked at the robot.
+- Each changed file is compared on its own parsed TOML rather than resolving
+  cross-file targets; re-pointing `include`, `[[subsystems]]` `path`/`defaults`
+  or `[subsystem]` `defaults` is guarded directly instead.
 
-Prints each finding as `<commit> <file>:<line>: <what>`; exits 1 when there
-is one, 2 on a usage or git error. CI's lint job and tools/prepush.sh run it
-through tools/source_lints.sh --base. CI's base covers every commit the
+Prints each finding as `<commit> <file>: <what>`; exits 1 when there is one,
+2 on a usage, environment or git error. CI's lint job and tools/prepush.sh run
+it through tools/source_lints.sh --base. CI's base covers every commit the
 event adds (a pull request's or topic branch's merge base with main; on
 main, the previous tip, or after a force push its merge base with HEAD),
 and the job fails, naming why, when no such base exists
@@ -69,33 +81,38 @@ and the job fails, naming why, when no such base exists
 """
 
 import argparse
-import codecs
+import json
+import math
 import os
 import re
 import subprocess
 import sys
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fails closed
+    tomllib = None
+
 TRAILER = "Commissioned-By"
-# A key can stand at the line's start, after a dot (dotted key) or after
-# `{` or `,` (inline table); keys are matched on code() of the line.
-COMMISSIONED_TRUE = re.compile(r"(?:^|[\s.{,])commissioned\s*=\s*true\b")
-CAN_ID = re.compile(r"(?:^|[\s.{,])can_id\s*=")
-CAN_BUS = re.compile(r"(?:^|[\s.{,])bus\s*=")
-STRING = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'[^']*'")
-BASIC_ESCAPE = re.compile(
-    r'\\(?:(["\\bfnrt])|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))'
-)
-BASIC_ESCAPES = {
-    '"': '"',
-    "\\": "\\",
-    "b": "\b",
-    "f": "\f",
-    "n": "\n",
-    "r": "\r",
-    "t": "\t",
-}
 EXEMPT_DIRECTORIES = {"examples", "tests", "fixtures"}
-HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+GUARDED_KEYS = frozenset({"commissioned", "can_id", "bus", "include"})
+REGULAR_MODES = frozenset({"100644", "100755"})
+BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+KIND_LABEL = {
+    "commissioned": "commissioned",
+    "can_id": "a CAN id",
+    "bus": "a CAN bus",
+    "include": "include",
+    "subsystem_pointer": "a subsystem config pointer",
+}
+
+# `--attr-source` (2.40) reads attributes from a tree instead of the work
+# tree, which is HEAD, the commit being checked.
+NEEDED_GIT = (2, 40)
+
+
+class CannotCheck(Exception):
+    pass
 
 
 def is_robot_config(path):
@@ -107,144 +124,30 @@ def is_robot_config(path):
                    for d in directories)
 
 
-def decode_basic_string(raw):
-    """Decode TOML 1.0 basic-string escapes; keep invalid escapes raw."""
-    def replace(match):
-        simple, u4, u8 = match.groups()
-        if simple is not None:
-            return BASIC_ESCAPES[simple]
-        cp = int(u4 or u8, 16)
-        if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
-            return match.group(0)
-        return chr(cp)
-
-    return BASIC_ESCAPE.sub(replace, raw)
-
-
-def code(line):
-    """A TOML line without its comment, a quoted key unquoted (decoding TOML
-    basic-string escapes for double-quoted keys, leaving single-quoted literal
-    keys raw) and every other string emptied, so a key matches however it is
-    spelled and a comment or string value that mentions one does not."""
-    out, at = [], 0
-    while at < len(line):
-        char = line[at]
-        if char == "#":
-            break
-        if char in "\"'":
-            match = STRING.match(line, at)
-            if not match:
-                break  # An unterminated string: the rest is its text.
-            after = line[match.end():].lstrip()
-            is_key = after.startswith(("=", "."))
-            if is_key:
-                inner = match.group(0)[1:-1]
-                out.append(decode_basic_string(inner) if char == '"' else inner)
-            else:
-                out.append('""')
-            at = match.end()
-            continue
-        out.append(char)
-        at += 1
-    return "".join(out)
-
-
 def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True,
                           check=True).stdout
 
 
-def diff_name(name):
-    """A `--- `/`+++ ` line's file name as a path: git ends a name holding
-    a space with a tab and C-quotes one holding a non-ASCII or control byte
-    (core.quotePath), so a config named either way is still checked."""
-    name = name.removesuffix("\t")
-    if name.startswith('"') and name.endswith('"'):
-        raw = codecs.escape_decode(name[1:-1].encode("utf-8"))[0]
-        name = raw.decode("utf-8", "surrogateescape")
-    return name
-
-
-def findings_in_diff(diff):
-    """(file, line, what) for each guarded line a unified -U0 diff changes."""
-    path, old, new = None, 0, 0
-    for line in diff.splitlines():
-        if line.startswith(("--- ", "+++ ")):
-            # `--- a/<path>` then `+++ b/<path>`; a created or deleted
-            # file has /dev/null on one side and keeps the other's path.
-            name = diff_name(line[4:])
-            if name.startswith(("a/", "b/")):
-                path = name[2:]
-            continue
-        if line.startswith("diff --git "):
-            path = None
-            continue
-        match = HUNK.match(line)
-        if match:
-            old, new = int(match.group(1)), int(match.group(2))
-            continue
-        if path is None or not is_robot_config(path):
-            continue
-        if CONFLICT_MARKER.match(line):
-            # A re-merge's conflict marker: not config, but a line.
-            if line.startswith("+"):
-                new += 1
-            else:
-                old += 1
-            continue
-        if line.startswith("+"):
-            text = code(line[1:])
-            if COMMISSIONED_TRUE.search(text):
-                yield path, new, "sets commissioned = true"
-            if CAN_ID.search(text):
-                yield path, new, f"sets a CAN id: {line[1:].strip()}"
-            if CAN_BUS.search(text):
-                yield path, new, f"sets a CAN bus: {line[1:].strip()}"
-            new += 1
-        elif line.startswith("-"):
-            text = code(line[1:])
-            if CAN_ID.search(text):
-                yield path, old, f"removes a CAN id: {line[1:].strip()}"
-            if CAN_BUS.search(text):
-                yield path, old, f"removes a CAN bus: {line[1:].strip()}"
-            old += 1
-
-
-# Fixed prefixes, no external diff or text conversion, and every file read
-# as text: the output must not depend on the user's git configuration
-# (diff.noprefix, diff.external, a textconv driver) or on a gitattributes
-# `-diff`/`binary` mark, which the checked commit itself can add.
-DIFF_FLAGS = ("-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
-              "--no-renames", "--src-prefix=a/", "--dst-prefix=b/")
-
-
-# `git show --remerge-diff` (2.36) re-merges a merge's parents and diffs
-# the merge against that: exactly what the merge itself changed.
-# `--attr-source` (2.40) reads attributes from a tree instead of the work
-# tree, which is HEAD, the commit being checked.
-NEEDED_GIT = (2, 40)
-# A conflict marker in the re-merge, never a TOML line; the plain style,
-# whatever merge.conflictStyle says, so no base section is shown.
-CONFLICT_MARKER = re.compile(r"^[-+](?:<{7}|>{7}|\|{7})(?: |$)|^[-+]={7}$")
-
-
-class CannotCheck(Exception):
-    pass
+def git_bytes(*args):
+    return subprocess.run(["git", *args], capture_output=True,
+                          check=True).stdout
 
 
 def pinned_git():
-    """The git options every diff here runs with: attributes from the empty
-    tree (git knows its id without storing it, so nothing is written) and
-    from no user file, so neither a committed `.gitattributes` (`-merge`,
-    `merge=<driver>`, `binary`) nor core.attributesFile changes a diff or
-    makes the re-merge keep the side a merge kept; no renormalization and
-    the plain conflict style in the re-merge."""
+    """The git options every tree diff here runs with: attributes from the
+    empty tree (git knows its id without storing it, so nothing is written)
+    and from no user file, so neither a committed `.gitattributes` nor
+    core.attributesFile affects git's behavior; also checks git >= 2.40 and
+    Python tomllib availability."""
+    if tomllib is None:
+        raise CannotCheck("needs Python 3.11 or later (tomllib)")
     version = git("version")
     match = re.search(r"(\d+)\.(\d+)", version)
     if not match or tuple(map(int, match.groups())) < NEEDED_GIT:
         raise CannotCheck(
             f"needs git {'.'.join(map(str, NEEDED_GIT))} or later "
-            f"(--attr-source, --remerge-diff); this is {version.strip()}")
+            f"(--attr-source); this is {version.strip()}")
     info = git("rev-parse", "--git-path", "info/attributes").strip()
     try:
         with open(info, encoding="utf-8", errors="replace") as f:
@@ -254,7 +157,7 @@ def pinned_git():
         rules = []
     if rules:
         raise CannotCheck(f"{info} sets attributes, which git applies to every "
-                        f"diff whatever the attribute source; empty it")
+                          f"diff whatever the attribute source; empty it")
     empty_tree = git("hash-object", "-t", "tree", os.devnull).strip()
     return (f"--attr-source={empty_tree}",
             "-c", f"core.attributesFile={os.devnull}",
@@ -262,23 +165,347 @@ def pinned_git():
             "-c", "merge.conflictStyle=merge")
 
 
+def canonical(value):
+    """Type-preserving canonical key for comparing parsed TOML values
+    (prevents Python's True == 1, False == 0, 1 == 1.0, and NaN != NaN)."""
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ("float", "nan")
+        return ("float", value, math.copysign(1.0, value))
+    if isinstance(value, str):
+        return ("str", value)
+    if isinstance(value, dict):
+        return ("table", tuple(sorted((k, canonical(v))
+                                      for k, v in value.items())))
+    if isinstance(value, list):
+        return ("array", tuple(canonical(v) for v in value))
+    return (type(value).__name__, repr(value))
+
+
+def format_path(path):
+    """Human-readable TOML path from tagged path segments."""
+    parts = []
+    for tag, val in path:
+        if tag == "key":
+            seg = val if BARE_KEY.match(val) else json.dumps(val)
+            parts.append(f".{seg}" if parts else seg)
+        elif tag == "item":
+            seg = val if BARE_KEY.match(val) else json.dumps(val)
+            parts.append(f"[{seg}]")
+        else:
+            parts.append(f"[{val}]")
+    return "".join(parts)
+
+
+def format_value(val):
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, str):
+        return json.dumps(val)
+    return repr(val)
+
+
+def extract_guarded(doc):
+    """Map tagged key path -> (kind, canonical_value, raw_value) for every
+    guarded setting in a parsed TOML document."""
+    out = {}
+
+    def record(path, kind, val):
+        out[path] = (kind, canonical(val), val)
+
+    def walk_subsystems_manifest(items, base_path):
+        names = [
+            item.get("name")
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and item.get("name")
+        ]
+        unique_names = (len(names) == len(items)
+                        and len(set(names)) == len(names))
+        for idx, item in enumerate(items):
+            selector = (("item", item["name"]) if unique_names
+                        else ("index", idx))
+            entry_path = base_path + (selector,)
+            if isinstance(item, dict):
+                pointer_keys = (("path", "defaults") if unique_names
+                                else ("name", "path", "defaults"))
+                for pkey in pointer_keys:
+                    if pkey in item:
+                        record(entry_path + (("key", pkey),),
+                               "subsystem_pointer", item[pkey])
+                walk(item, entry_path)
+            else:
+                record(entry_path, "subsystem_pointer", item)
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, val in node.items():
+                child_path = path + (("key", key),)
+                # Tables named like a guarded key (e.g. [subsystems.bus]) are
+                # containers, not guarded scalar values; still recurse into
+                # them so any guarded keys inside are checked.
+                if key in GUARDED_KEYS and not isinstance(val, dict):
+                    record(child_path, key, val)
+                if path == () and key == "subsystem" and isinstance(val, dict):
+                    if "defaults" in val:
+                        record(child_path + (("key", "defaults"),),
+                               "subsystem_pointer", val["defaults"])
+                if path == () and key == "subsystems" and isinstance(val, list):
+                    walk_subsystems_manifest(val, child_path)
+                    continue
+                if isinstance(val, (dict, list)):
+                    walk(val, child_path)
+        elif isinstance(node, list):
+            for idx, item in enumerate(node):
+                if isinstance(item, (dict, list)):
+                    walk(item, path + (("index", idx),))
+
+    walk(doc, ())
+    return out
+
+
+def rec_equal(a, b):
+    if a is None or b is None:
+        return a is b
+    return a[0] == b[0] and a[1] == b[1]
+
+
+def describe_change(key_path, old_rec, new_rec):
+    where = format_path(key_path)
+    if old_rec is None:
+        kind, _, new_val = new_rec
+        if kind == "commissioned":
+            return f"sets commissioned = {format_value(new_val)} at {where}"
+        return f"sets {KIND_LABEL[kind]}: {where} = {format_value(new_val)}"
+    if new_rec is None:
+        kind, _, old_val = old_rec
+        if kind == "commissioned":
+            return f"removes commissioned = {format_value(old_val)} at {where}"
+        return f"removes {KIND_LABEL[kind]}: {where} = {format_value(old_val)}"
+    kind, _, new_val = new_rec
+    _, _, old_val = old_rec
+    if kind == "commissioned":
+        return (f"changes commissioned at {where} from "
+                f"{format_value(old_val)} to {format_value(new_val)}")
+    return (f"changes {KIND_LABEL[kind]}: {where} from "
+            f"{format_value(old_val)} to {format_value(new_val)}")
+
+
+def compare_guarded(before, after):
+    findings = []
+    for key_path in sorted(set(before) | set(after), key=format_path):
+        old_rec = before.get(key_path)
+        new_rec = after.get(key_path)
+        if not rec_equal(old_rec, new_rec):
+            findings.append(describe_change(key_path, old_rec, new_rec))
+    return findings
+
+
+def compare_merge_guarded(base_map, p1_map, p2_map, merged_map):
+    findings = []
+    keys = set(base_map) | set(p1_map) | set(p2_map) | set(merged_map)
+    for key_path in sorted(keys, key=format_path):
+        vb = base_map.get(key_path)
+        v1 = p1_map.get(key_path)
+        v2 = p2_map.get(key_path)
+        vm = merged_map.get(key_path)
+        if rec_equal(v1, v2):
+            if not rec_equal(vm, v1):
+                findings.append(describe_change(key_path, v1, vm))
+        elif not rec_equal(v1, vb) and rec_equal(v2, vb):
+            if not rec_equal(vm, v1):
+                findings.append(describe_change(key_path, v1, vm))
+        elif not rec_equal(v2, vb) and rec_equal(v1, vb):
+            if not rec_equal(vm, v2):
+                findings.append(describe_change(key_path, v2, vm))
+        else:
+            kind = (vm or v1 or v2 or vb)[0]
+            where = format_path(key_path)
+            s1 = "<absent>" if v1 is None else format_value(v1[2])
+            s2 = "<absent>" if v2 is None else format_value(v2[2])
+            sm = "<absent>" if vm is None else format_value(vm[2])
+            findings.append(
+                f"resolves a merge conflict on {KIND_LABEL[kind]}: {where} "
+                f"(parents: {s1} vs {s2}, merged: {sm})")
+    return findings
+
+
+def parse_raw_diff_tree(raw):
+    """Parse `git diff-tree --no-commit-id -r --no-renames --raw -z
+    --no-abbrev` output into {path: (old_entry, new_entry)} for robot configs."""
+    tokens = raw.split(b"\0")
+    entries = {}
+    i = 0
+    while i < len(tokens):
+        meta = tokens[i]
+        i += 1
+        if not meta:
+            continue
+        if not meta.startswith(b":"):
+            raise CannotCheck(
+                f"unexpected diff-tree record: {meta.decode('utf-8', 'replace')!r}")
+        fields = meta[1:].decode("ascii").split(" ")
+        if len(fields) != 5:
+            raise CannotCheck(f"unexpected diff-tree fields: {fields!r}")
+        old_mode, new_mode, old_oid, new_oid, status = fields
+        if status.startswith(("R", "C")):
+            raise CannotCheck(f"unexpected rename/copy status {status!r}")
+        if i >= len(tokens):
+            raise CannotCheck("truncated diff-tree output")
+        path = tokens[i].decode("utf-8", "surrogateescape")
+        i += 1
+        if not is_robot_config(path):
+            continue
+        old_entry = (None if old_mode == "000000" or set(old_oid) == {"0"}
+                     else (old_mode, old_oid))
+        new_entry = (None if new_mode == "000000" or set(new_oid) == {"0"}
+                     else (new_mode, new_oid))
+        entries[path] = (old_entry, new_entry)
+    return entries
+
+
+def changed_toml_entries(pinned, rev_a, rev_b):
+    """Map changed non-exempt *.toml path -> (old_entry, new_entry).
+    When rev_a is None, diffs root commit rev_b against the empty tree."""
+    args = [*pinned, "diff-tree", "--no-commit-id", "-r", "--no-renames",
+            "--raw", "-z", "--no-abbrev"]
+    if rev_a is None:
+        args.extend(["--root", rev_b])
+    else:
+        args.extend([rev_a, rev_b])
+    args.extend(["--", "*.toml"])
+    return parse_raw_diff_tree(git_bytes(*args))
+
+
+def tree_entry(pinned, rev, path):
+    """Return (mode, oid) for `path` at `rev`, or None if absent or a tree."""
+    raw = git_bytes(*pinned, "--literal-pathspecs", "ls-tree", "-z",
+                    rev, "--", path)
+    if not raw:
+        return None
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        meta, entry_path = record.split(b"\t", 1)
+        if entry_path.decode("utf-8", "surrogateescape") != path:
+            continue
+        mode, obj_type, oid = meta.decode("ascii").split(" ")
+        if obj_type == "tree":
+            return None
+        return mode, oid
+    return None
+
+
+def load_guarded(entry, side_label=None):
+    """Load and parse a git tree entry (mode, oid) into (guarded_map, error).
+    Fails closed on non-regular file modes, invalid UTF-8, or invalid TOML."""
+    if entry is None:
+        return {}, None
+    mode, oid = entry
+    suffix = f" ({side_label})" if side_label else ""
+    if mode not in REGULAR_MODES:
+        return None, f"non-regular file mode {mode}{suffix}"
+    raw = git_bytes("cat-file", "blob", oid)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        return None, f"invalid TOML{suffix}: invalid UTF-8: {err}"
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as err:
+        return None, f"invalid TOML{suffix}: {err}"
+    return extract_guarded(doc), None
+
+
+def pair_findings(path, old_entry, new_entry):
+    """Findings for one changed config between `old_entry` and `new_entry`."""
+    if old_entry == new_entry:
+        return []
+    new_map, new_err = load_guarded(new_entry)
+    old_map, old_err = load_guarded(old_entry, side_label="parent")
+    errors = [err for err in (new_err, old_err) if err is not None]
+    if errors:
+        return [(path, err) for err in errors]
+    return [(path, what) for what in compare_guarded(old_map, new_map)]
+
+
+def merge_bases(p1, p2):
+    proc = subprocess.run(["git", "merge-base", "--all", p1, p2],
+                          capture_output=True, text=True, check=False)
+    if proc.returncode == 0:
+        return proc.stdout.splitlines()
+    if proc.returncode == 1:
+        return []
+    raise subprocess.CalledProcessError(proc.returncode, proc.args,
+                                        proc.stdout, proc.stderr)
+
+
 def merge_findings(pinned, commit, parents):
-    """The merge's own changes: its diff against git's automatic re-merge
-    of its parents. A clean merge's is empty; a resolution that writes a
-    new line, or keeps one side's stale copy of a file the other side
-    changed, shows. git cannot re-merge more than two parents, so an
-    octopus merge reports what its diff against any parent shows."""
-    if len(parents) > 2:
-        found = {}
-        for parent in parents:
-            diff = git(*pinned, "diff", *DIFF_FLAGS, parent, commit, "--",
-                       "*.toml")
-            for path, line, what in findings_in_diff(diff):
-                found.setdefault((path, what), line)
-        return [(path, line, what) for (path, what), line in found.items()]
-    diff = git(*pinned, "show", "--remerge-diff", "--format=", *DIFF_FLAGS,
-               commit, "--", "*.toml")
-    return findings_in_diff(diff)
+    """The merge's own changes to guarded TOML keys."""
+    per_parent = [changed_toml_entries(pinned, parent, commit)
+                  for parent in parents]
+    paths = sorted({path for entries in per_parent for path in entries})
+    if not paths:
+        return []
+
+    if len(parents) == 2:
+        bases = merge_bases(parents[0], parents[1])
+        if len(bases) == 1:
+            base_rev = bases[0]
+            out = []
+            for path in paths:
+                if path in per_parent[0]:
+                    e1, em = per_parent[0][path]
+                    e2 = (per_parent[1][path][0] if path in per_parent[1]
+                          else em)
+                else:
+                    e2, em = per_parent[1][path]
+                    e1 = em
+                eb = tree_entry(pinned, base_rev, path)
+                if (em == e1 and e2 == eb) or (em == e2 and e1 == eb):
+                    continue
+                m_map, m_err = load_guarded(em)
+                p1_map, p1_err = load_guarded(e1, side_label="first parent")
+                p2_map, p2_err = load_guarded(e2, side_label="second parent")
+                b_map, b_err = load_guarded(eb, side_label="merge base")
+                errors = [e for e in (m_err, p1_err, p2_err, b_err)
+                          if e is not None]
+                if errors:
+                    for err in dict.fromkeys(errors):
+                        out.append((path, err))
+                    continue
+                for what in compare_merge_guarded(b_map, p1_map, p2_map, m_map):
+                    out.append((path, what))
+            return out
+
+    # Octopus merge (>2 parents), criss-cross merge (>1 merge base), or
+    # unrelated-history merge (0 merge bases): compare against every parent.
+    seen = set()
+    out = []
+    for entries in per_parent:
+        for path, (old_entry, new_entry) in sorted(entries.items()):
+            for finding in pair_findings(path, old_entry, new_entry):
+                if finding not in seen:
+                    seen.add(finding)
+                    out.append(finding)
+    return out
+
+
+def commit_findings(pinned, commit, parents):
+    if len(parents) > 1:
+        return merge_findings(pinned, commit, parents)
+    parent = parents[0] if parents else None
+    entries = changed_toml_entries(pinned, parent, commit)
+    out = []
+    for path in sorted(entries):
+        old_entry, new_entry = entries[path]
+        out.extend(pair_findings(path, old_entry, new_entry))
+    return out
 
 
 def check(base):
@@ -294,14 +521,8 @@ def check(base):
                       commit).strip()
         if trailer:
             continue
-        if len(parents) > 1:
-            findings = merge_findings(pinned, commit, parents)
-        else:
-            findings = findings_in_diff(git(*pinned, "show", "--format=",
-                                            *DIFF_FLAGS, commit, "--",
-                                            "*.toml"))
-        for path, line, what in findings:
-            found.append(f"{commit[:12]} {path}:{line}: {what}")
+        for path, what in commit_findings(pinned, commit, parents):
+            found.append(f"{commit[:12]} {path}: {what}")
     return found
 
 
@@ -316,8 +537,10 @@ def main(argv):
         print(f"check_commissioning: {error}", file=sys.stderr)
         return 2
     except subprocess.CalledProcessError as error:
+        stderr = (error.stderr.decode("utf-8", "replace")
+                  if isinstance(error.stderr, bytes) else error.stderr)
         print(f"check_commissioning: git {' '.join(error.cmd[1:])}: "
-              f"{error.stderr.strip()}", file=sys.stderr)
+              f"{stderr.strip()}", file=sys.stderr)
         return 2
     for line in found:
         print(line)
@@ -326,8 +549,8 @@ def main(argv):
               f"robot or changes a CAN id or bus, in a commit carrying the "
               f"trailer `{TRAILER}: <name>` (docs/BRINGUP.md "
               f"\"Human commissioning\"); a person also adds it to a commit "
-              f"that moves, renames or adds a whole config, or moves a "
-              f"`can_id` or `bus` line between files")
+              f"that moves, renames or adds a whole config, or re-points an "
+              f"`include` or subsystem config path/defaults")
         return 1
     return 0
 
