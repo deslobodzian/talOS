@@ -25,9 +25,9 @@ class SessionReportTest(unittest.TestCase):
             report = json.loads(result.stdout)
             self.assertEqual(report["config_sha256"], "fixture-sha256")
             self.assertEqual(report["state_overall"],
-                             {"count": 7, "median_ms": 5, "p99_ms": 200, "max_ms": 200})
+                             {"count": 7, "min_ms": 5, "median_ms": 5, "p99_ms": 200, "max_ms": 200})
             self.assertEqual(report["state_enabled"],
-                             {"count": 5, "median_ms": 5, "p99_ms": 120, "max_ms": 120})
+                             {"count": 5, "min_ms": 5, "median_ms": 5, "p99_ms": 120, "max_ms": 120})
             self.assertEqual(report["enabled_gaps_ge_100_ms"], 1)
             self.assertEqual(report["timer_lateness"]["fixture:update"]["max_ms"], 1)
             self.assertEqual(report["target_receipt_age"]["fixture:/fixture/target/test"]["median_ms"], 3)
@@ -36,7 +36,7 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual(verdicts["enabled state gaps"], "FAIL")
             self.assertEqual(report["target_age_at_tick"],
                              {"fixture:/fixture/target/test":
-                                  {"count": 1, "median_ms": 4, "p99_ms": 4, "max_ms": 4}})
+                                  {"count": 1, "min_ms": 4, "median_ms": 4, "p99_ms": 4, "max_ms": 4}})
             # The manifest's signal death reaches the node summary.
             self.assertEqual(report["nodes"][0]["exit_signal"], 9)
             self.assertEqual(verdicts["target age at tick"], "PASS")
@@ -190,14 +190,14 @@ class SessionReportTest(unittest.TestCase):
                    hardware("hardware_node", "/hw/command", 26, 2)]
         for label, gaps, latency in (
                 ("requester's log", [gap("lift", 20, 20, 1), gap("camera", 0, 30, 9)],
-                 {"count": 1, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25}),
+                 {"count": 1, "min_ms": 0.25, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25}),
                 ("both logs", [gap("lift", 20, 20, 1), gap("hardware_node", 10, 10, 1)],
                  None)):
             with self.subTest(label):
                 report = session_report.analyze({"nodes": []}, traffic + gaps)
                 self.assertEqual(report["bridge_request_to_command"]["disabled"], latency)
         self.assertIn("| bridge request to command hardware_node disabled | NOT MEASURED "
-                      "| — | — | — |", session_report.markdown(report).splitlines())
+                      "| — | — | — | — |", session_report.markdown(report).splitlines())
 
         # A gap at the head of lift's log, before its first kept request:
         # a request carrying observation 1 could be lost there, so the
@@ -303,9 +303,9 @@ class SessionReportTest(unittest.TestCase):
                    state("lift", "MESSAGE", 1, (99999, 99999))]
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["feedback_age_us"], {
-            "motor 3": {"count": 3, "median_us": 2600, "p99_us": 4000, "max_us": 4000,
+            "motor 3": {"count": 3, "min_us": 1200, "median_us": 2600, "p99_us": 4000, "max_us": 4000,
                         "sentinel": 1},
-            "sensor 9": {"count": 3, "median_us": 900, "p99_us": 900, "max_us": 900,
+            "sensor 9": {"count": 3, "min_us": 900, "median_us": 900, "p99_us": 900, "max_us": 900,
                          "sentinel": 0}})
 
     # REQ-RT-25: State to request joins a State's (boot_id, sample_time_us),
@@ -328,8 +328,8 @@ class SessionReportTest(unittest.TestCase):
                    send("arm", "/hw/request/arm", 14, boot_id="7", observed_time_us=sample_us)]
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["state_to_request_ms"], {
-            "arm": {"count": 1, "median_ms": 4, "p99_ms": 4, "max_ms": 4},
-            "lift": {"count": 1, "median_ms": 2, "p99_ms": 2, "max_ms": 2}})
+            "arm": {"count": 1, "min_ms": 4, "median_ms": 4, "p99_ms": 4, "max_ms": 4},
+            "lift": {"count": 1, "min_ms": 2, "median_ms": 2, "p99_ms": 2, "max_ms": 2}})
 
     # REQ-RT-25, REQ-OPS-16: a sample whose span meets a gap of the owner's
     # log is NOT MEASURED, not a pass and not a shorter figure: lift's log
@@ -364,7 +364,7 @@ class SessionReportTest(unittest.TestCase):
                    record("SEND", "/lift/target/teleop", 26, 26)]
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["driver_station_to_lane_ms"],
-                         {"teleop": {"count": 2, "median_ms": 5.5, "p99_ms": 6, "max_ms": 6}})
+                         {"teleop": {"count": 2, "min_ms": 5, "median_ms": 5.5, "p99_ms": 6, "max_ms": 6}})
 
     # REQ-RT-25: Driver Station to lane is the reaction of
     # a producer that is publishing. teleop released its lane once, 3 ms
@@ -387,7 +387,7 @@ class SessionReportTest(unittest.TestCase):
                  for t in [3] + list(range(82, 98, 5)) + list(range(182, 200, 5))]
         report = session_report.analyze({"nodes": []}, packets + sends)
         self.assertEqual(report["driver_station_to_lane_ms"],
-                         {"teleop": {"count": 3, "median_ms": 2, "p99_ms": 3, "max_ms": 3}})
+                         {"teleop": {"count": 3, "min_ms": 2, "median_ms": 2, "p99_ms": 3, "max_ms": 3}})
         self.assertEqual(report["driver_station_to_lane_unanswered"],
                          {"teleop": {"total": 7, "enabled": 4, "other": 3}})
         line = next(line for line in session_report.markdown(report).splitlines()
@@ -455,7 +455,7 @@ class SessionReportTest(unittest.TestCase):
                    command(81.2, 8000)]
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["driver_station_to_command_ms"],
-                         {"count": 1, "median_ms": 6.3, "p99_ms": 6.3, "max_ms": 6.3})
+                         {"count": 1, "min_ms": 6.3, "median_ms": 6.3, "p99_ms": 6.3, "max_ms": 6.3})
 
     # REQ-RT-25: a tick is built from a packet only if its lane was
     # published before the next packet. Enabled with the sticks neutral the
@@ -468,7 +468,7 @@ class SessionReportTest(unittest.TestCase):
                     self.merged_command(1005.25, 5000)]
         self.assertEqual(session_report.analyze({"nodes": []}, records)
                          ["driver_station_to_command_ms"],
-                         {"count": 1, "median_ms": 5.25, "p99_ms": 5.25, "max_ms": 5.25})
+                         {"count": 1, "min_ms": 5.25, "median_ms": 5.25, "p99_ms": 5.25, "max_ms": 5.25})
 
     # REQ-RT-25: a restarted node logs under its name again from dispatch 0,
     # so a READ joins a request only within one run. lift's first run
@@ -513,8 +513,8 @@ class SessionReportTest(unittest.TestCase):
         bridge = session_report.analyze({"nodes": []}, records)["bridge_request_to_command"]
         self.assertEqual(bridge, {
             "process": "hardware_node",
-            "enabled": {"count": 1, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25},
-            "disabled": {"count": 1, "median_ms": 20, "p99_ms": 20, "max_ms": 20}})
+            "enabled": {"count": 1, "min_ms": 0.25, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25},
+            "disabled": {"count": 1, "min_ms": 20, "median_ms": 20, "p99_ms": 20, "max_ms": 20}})
 
     # REQ-RT-25: the clocks' relative drift is the slope of the bridge's
     # valid clock_offset_us over its /hw/status publication times, fitted
@@ -869,6 +869,90 @@ class SessionReportTest(unittest.TestCase):
             with open(directory + "/manifest.json", "w") as manifest:
                 manifest.write('{"nodes": []}')
             self.assertEqual(session_report.main(), 1)
+
+    # REQ-RT-25 (TODO.md TIME-4): stats() carries min alongside median/p99/max
+    # so state-to-request and other latency rows show whether samples swept a
+    # full period.
+    def test_stats_includes_min_and_markdown_table_shows_it(self):
+        self.assertEqual(session_report.stats([10, 2, 6, 4]),
+                         {"count": 4, "min_ms": 2, "median_ms": 5.0,
+                          "p99_ms": 10, "max_ms": 10})
+        self.assertEqual(session_report.stats([300, 100, 200], "us"),
+                         {"count": 3, "min_us": 100, "median_us": 200,
+                          "p99_us": 300, "max_us": 300})
+        self.assertIsNone(session_report.stats([]))
+        self.assertEqual(
+            session_report.stats_row("row", session_report.stats([10, 2, 6, 4])),
+            "| row | 4 | 2 | 5 | 10 | 10 |")
+        self.assertEqual(
+            session_report.stats_row("row", None),
+            "| row | NOT MEASURED | — | — | — | — |")
+
+    # TODO.md RT-28: count missed /hw/state sequences within each gateway boot,
+    # reporting total missed states, gap count, and the longest consecutive gap
+    # (ignoring boot transitions and intervals across a /hw/state log gap).
+    def test_state_sequence_gaps_within_boot_and_excluding_log_gaps(self):
+        def state(now_ms, boot_id, sequence, process="hardware_node"):
+            return dict(process=process, kind="SEND", topic="/hw/state",
+                        now_ms=now_ms, event_ms=now_ms, publish_ms=now_ms,
+                        decoded="", hardware={"type": "state",
+                                              "boot_id": str(boot_id),
+                                              "sequence": sequence})
+        def gap(first, last, records):
+            return dict(process="hardware_node", kind="GAP", topic="?",
+                        now_ms=last + 1, event_ms=first, publish_ms=0,
+                        decoded="", gap={
+                            "start_ms": first, "end_ms": last + 1,
+                            "first_lost_ms": first, "last_lost_ms": last,
+                            "records": records, "cause": "pool_full",
+                            "closed_at_flush": False})
+        # Boot 1: seq 10->11 (0 missed), 11->14 (2 missed at 5 ms),
+        # 14->15 (0 missed). Boot 2 restarts at seq 1: boot jump is NOT a gap!
+        # Boot 2: seq 1->6 (4 missed at 30 ms), then a log gap hides 6->100
+        # (excluded, disk drop not link loss), then 100->101 (0 missed).
+        records = [
+            state(0, 1, 10),
+            state(5, 1, 11),
+            state(20, 1, 14),
+            state(25, 1, 15),
+            state(30, 2, 1),
+            state(55, 2, 6),
+            gap(60, 100, 8),
+            state(110, 2, 100),
+            state(115, 2, 101),
+        ]
+        report = session_report.analyze({"nodes": []}, records)
+        self.assertEqual(report["state_sequence_gaps"], {
+            "intervals": 5,
+            "missed": 6,
+            "gaps": 2,
+            "longest_run": 4,
+            "longest_at_ms": 30,
+        })
+        self.assertEqual(report["intervals_across_gaps"]["state_sequence"], 1)
+        md = session_report.markdown(report)
+        self.assertIn(
+            "State sequence gaps: 6 missed states across 2 gaps "
+            "(longest consecutive gap: 4 states at 30 ms).",
+            md.splitlines())
+
+        # Contiguous sequences report 0 missed states.
+        clean = [state(0, 1, 1), state(5, 1, 2), state(10, 1, 3)]
+        clean_report = session_report.analyze({"nodes": []}, clean)
+        self.assertEqual(clean_report["state_sequence_gaps"], {
+            "intervals": 2,
+            "missed": 0,
+            "gaps": 0,
+            "longest_run": 0,
+            "longest_at_ms": None,
+        })
+
+        # Unsequenced/undecoded states report None (NOT MEASURED).
+        undecoded = [dict(process="hardware_node", kind="SEND", topic="/hw/state",
+                          now_ms=t, event_ms=t, publish_ms=t, decoded="")
+                     for t in (0, 5, 10)]
+        self.assertIsNone(
+            session_report.analyze({"nodes": []}, undecoded)["state_sequence_gaps"])
 
 
 if __name__ == "__main__":
