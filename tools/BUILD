@@ -496,3 +496,18 @@ py_test(
     legacy_create_init = False,
     main = "run_clang_tidy_test.py",
 )
+
+# tools/tidy.sh (CI's clang-tidy selection locally, with Linux x86_64 GCC 14
+# libstdc++ fallback when clang 18 cannot parse the host standard library).
+py_test(
+    name = "tidy_test",
+    size = "small",
+    srcs = ["tidy_test.py"],
+    data = [
+        "clang18.sh",
+        "run_clang_tidy.py",
+        "tidy.sh",
+    ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)

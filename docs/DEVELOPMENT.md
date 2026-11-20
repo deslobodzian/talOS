@@ -103,7 +103,8 @@ compile read a header from the host's include tree but the C library's,
 the kernel's or the C++ standard library's), then `bazel test //...` with no
 cached test result (build results come from the disk cache
 `~/.cache/talos-bazel-disk`), then `tools/tidy.sh` on the same diff (on a
-host whose standard library clang 18 cannot parse, it prints `tidy NOT RUN`
+host where clang 18 cannot parse the standard library and no fallback is
+available, it prints `tidy NOT RUN`
 with the reason and does not fail the run: CI is then the first to run
 clang-tidy), runs the gradle checks when the commits to
 push (since the checked branch's upstream, else since the merge base with
