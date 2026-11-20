@@ -39,3 +39,19 @@ py_test(
         "//talOS/launcher:tlog_read",
     ],
 )
+
+py_test(
+    name = "soak_sigterm_test",
+    size = "small",
+    srcs = [
+        "soak_sigterm_test.py",
+        "soak_test.py",
+        "support.py",
+    ],
+    imports = ["."],
+    main = "soak_sigterm_test.py",
+    deps = [
+        "//talOS/build:udp_ports",
+        "//talOS/launcher:tlog_read",
+    ],
+)
