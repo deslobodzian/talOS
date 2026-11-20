@@ -62,16 +62,18 @@ refuses from the start (RULES.md 2):
 - Starlark string constants (and constant concatenations) in `BUILD`,
   `BUILD.bazel`, and `.bzl` files that carry those forbidden symbols, token
   pasting, C++ trigraphs, forbidden header paths, or `-include`/`-imacros`/
-  `-trigraphs`/`-ftrigraphs`/`-fms-extensions`/`-I`/`-iquote`/`-isystem`/
-  `-cxx-isystem`/`-idirafter`/`--include-directory`/`-iwithprefix`/
-  `-iwithsysroot` compiler flags (joined, separate, or via `-Wp,`/`-Xclang`).
+  `-trigraphs`/`-ftrigraphs`/`-fms-extensions`/`-fms-compatibility`/`-I`/
+  `-iquote`/`-isystem`/`-cxx-isystem`/`-idirafter`/`--include-directory`/
+  `-iwithprefix`/`-iwithsysroot` compiler flags (joined, separate, or via
+  `-Wp,`/`-Xclang`).
 
 Residual static-scan limits (tracked under TODO ARCH-2): Bazel
 `includes = [...]` rule attributes, compiler `@file` response files in `copts`,
-`.bazelrc`/`talos.bazelrc` flags, Starlark strings built at runtime (e.g.
-`%`, `.format()`, slices, `load()`ed constants, macro parameters, `.scl`
-files), and generated headers (`genrule`). Closing those requires evaluating
-Bazel `aquery` compile actions.
+`.bazelrc`/`talos.bazelrc` flags, `--target=*-windows-msvc` (which also enables
+MSVC extensions, though a COFF object will not link into a Linux node),
+Starlark strings built at runtime (e.g. `%`, `.format()`, slices, `load()`ed
+constants, macro parameters, `.scl` files), and generated headers (`genrule`).
+Closing those requires evaluating Bazel `aquery` compile actions.
 
 ALLOWLIST holds today's known Bazel exceptions, each with its reason and the
 TODO.md item that removes it. NON_NODE_CLI_FILES maps non-node CLI binaries
@@ -239,8 +241,8 @@ HEADER_NAME_RE = re.compile(r'^(?:"([^"]*)"|<([^>]*)>)')
 TOKEN_PASTE_RE = re.compile(r"##|%:%:")
 TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>-]")
 FORBIDDEN_COPT_FLAG_RE = re.compile(
-    r"^(?:--?(?:include|imacros|f?trigraphs|fms-extensions|iquote|"
-    r"(?:cxx-)?isystem|idirafter|iwithprefix|iwithsysroot)|-I)"
+    r"^(?:--?(?:include|imacros|f?trigraphs|fms-(?:extensions|compatibility)|"
+    r"iquote|(?:cxx-)?isystem|idirafter|iwithprefix|iwithsysroot)|-I)"
 )
 FORBIDDEN_COPT_ADJACENT_FLAGS = frozenset({
     "-include", "--include",
