@@ -86,6 +86,8 @@ html, body {
 .top h1 { font-size: 22px; margin: 0; white-space: nowrap; }
 
 .status-slot { flex: 1; min-width: 0; }
+.draw-error { flex: none; }
+.draw-error:empty { display: none; }
 
 .status {
   font-size: 20px;

@@ -207,29 +207,6 @@ test('a widget the page cannot draw is shown, never a silent blank', () => {
   assert.match(status, /1 layout widget not drawn/, 'a widget with no readable cell vanished silently');
 });
 
-// REQ-OPS-36: a value is shown stale within 500 ms of its last update. The
-// bridge's empty update re-sends the held tick; only a sequence_id that
-// advances keeps the values current.
-test('values go stale within 500 ms of the last new tick, whatever else arrives', () => {
-  const h = harness();
-  h.connect(0);
-  // Heartbeat updates of the same tick every 100 ms: the producer stopped.
-  for (let t = 100; t <= STALE_MS; t += 100) {
-    h.at(t);
-    h.socket().send(...update(1, {}, false));
-  }
-  assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'), 'stale while current');
-  h.at(STALE_MS + 1);
-  const stale = widgetHtml(render(h), 'Flywheel');
-  assert.match(stale, /class="w w-number stale"/);
-  assert.match(stale, /tag-stale">STALE/);
-  assert.match(stale, /52\.3/, 'a stale value is still shown, marked');
-  // A heartbeat of a newer tick makes it current again.
-  h.at(600);
-  h.socket().send(...update(2, {}, false));
-  assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'));
-});
-
 // Timers on a test clock: `run(t)` fires, in order, every timeout due by t.
 function fakeTimers(clock: {now: number; wall: number}) {
   let pending: {at: number; fn: () => void; handle: number}[] = [];
@@ -257,13 +234,14 @@ function fakeTimers(clock: {now: number; wall: number}) {
   return {timers, run};
 }
 
-// REQ-OPS-36: a value is shown stale within 500 ms of its last update. The
-// bridge may deliver the producer's last tick up to its 100 ms heartbeat
-// after the tick, so the page's own share must be STALE_MS and not STALE_MS
-// plus a render period. The page draws every RENDER_MS at a phase unrelated
-// to the ticks while the bridge restamps the last tick every 100 ms;
-// whatever the phase, the first stale draw comes STALE_MS (+ STALE_DRAW_LAG_MS)
-// after the last new tick's receipt.
+// REQ-OPS-36: a value is shown stale within 500 ms of its last update,
+// whatever else arrives (the bridge's empty update re-sends the held tick;
+// only a sequence_id that advances keeps values current). The bridge may
+// deliver the producer's last tick up to its 100 ms heartbeat after the
+// tick, so the page's own share must be STALE_MS and not STALE_MS plus a
+// render period. Whatever the periodic draw phase, the first stale draw
+// comes STALE_MS (+ STALE_DRAW_LAG_MS) after the last new tick's receipt,
+// keeping the last value shown and marked, and a newer tick clears STALE.
 test('the page draws a stopped value stale at its deadline at any draw phase', () => {
   for (let phase = 0; phase < RENDER_MS; phase += 7) {
     const h = harness();
@@ -271,14 +249,19 @@ test('the page draws a stopped value stale at its deadline at any draw phase', (
     h.model.clock = () => clock.now;
     const {timers, run} = fakeTimers(clock);
     let shownStale = Infinity;
+    let staleHtml = '';
     const schedule = new DrawSchedule(h.model, now => {
       h.model.tick(now);
       h.clock.now = now;
-      if (shownStale === Infinity && widgetHtml(render(h), 'Flywheel').includes('STALE'))
+      const html = widgetHtml(render(h), 'Flywheel');
+      if (shownStale === Infinity && html.includes('STALE')) {
         shownStale = now;
+        staleHtml = html;
+      }
     }, timers);
     h.connect(0);  // the last new tick, received at 0
     schedule.frame();
+    assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'), 'stale while current');
     for (let t = 1; t <= 1000 && shownStale === Infinity; t++) {
       run(t);
       clock.now = clock.wall = t;
@@ -289,6 +272,15 @@ test('the page draws a stopped value stale at its deadline at any draw phase', (
     assert.ok(shownStale >= STALE_MS && shownStale <= STALE_MS + STALE_DRAW_LAG_MS,
               `draw phase ${phase} ms: first stale draw at ${shownStale} ms, deadline ` +
               `${STALE_MS} ms + ${STALE_DRAW_LAG_MS} ms (REQ-OPS-36: 500 ms with the bridge's 100 ms heartbeat)`);
+    if (phase === 0) {
+      assert.match(staleHtml, /class="w w-number stale"/);
+      assert.match(staleHtml, /tag-stale">STALE/);
+      assert.match(staleHtml, /52\.3/, 'a stale value is not shown');
+      h.at(600);
+      h.socket().send(...update(2, {}, false));
+      assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'),
+                'a newer tick did not clear STALE');
+    }
   }
 });
 
@@ -321,7 +313,7 @@ test('a connect-time keyframe shows its values stale until a newer tick arrives'
   h.join(0, NOMINAL, 100);
   const flywheel = () => widgetHtml(render(h), 'Flywheel');
   assert.match(flywheel(), /tag-stale">STALE/, 'the connect-time keyframe is shown current');
-  assert.match(flywheel(), /52\.3/, 'the keyframe values are shown, marked');
+  assert.match(flywheel(), /52\.3/, 'the keyframe values are not shown');
   assert.equal(h.model.status(h.clock.now).link, 'connecting');
   // The producer is dead: the bridge restamps tick 100 every 100 ms.
   for (let t = 100; t <= 1000; t += 100) {
@@ -353,7 +345,7 @@ test('a reconnect does not show the connect-time keyframe as current', () => {
   h.socket().send(...encodeDictionaryPages(header(60), CHANNELS),
                   ...update(60, {...NOMINAL, 'shooter/state/flywheel_velocity_rps': 70}, true));
   const held = widgetHtml(render(h), 'Flywheel');
-  assert.match(held, /70\.0/, 'the keyframe does not replace the held values');
+  assert.match(held, /70\.0/, 'the keyframe did not replace the held values');
   assert.match(held, /STALE/, 'the connect-time keyframe after a reconnect is shown current');
   h.at(reconnectedAt + 100);
   h.socket().send(...update(61, {}, false));
@@ -378,7 +370,8 @@ test('a channel never received is shown as no data, not zero', () => {
 // and the bucket refill after connecting reads as connecting.
 test('the status line names the failed link', () => {
   const cases: {name: string; arrange: (h: ReturnType<typeof harness>) => void; link: Link;
-                carried?: {channels: readonly string[]; alerts: boolean}}[] = [
+                carried?: {channels: readonly string[]; alerts: boolean};
+                textMatch?: RegExp}[] = [
     {name: 'all links up', link: 'ok', arrange: h => h.connect(0)},
     {name: 'socket closed', link: 'bridge', arrange: h => {
       h.connect(0);
@@ -426,9 +419,11 @@ test('the status line names the failed link', () => {
       h.connect(0, WITHOUT_HW_STATUS_ALERTS);
     }},
     // The feed never carries the channel for this layout, so its absence
-    // says nothing about the RoboRIO link.
-    {name: 'layout without an alerts widget', link: 'ok',
+    // says nothing about the RoboRIO link — and the OK line says it is not
+    // judged rather than claiming a verified link.
+    {name: 'layout without the link channel', link: 'ok',
      carried: {channels: LAYOUT.channels.filter(n => n !== LINK_LOST), alerts: false},
+     textMatch: /RoboRIO link not judged\)$/,
      arrange: h => {
       h.connect(0, WITHOUT_HW_STATUS_ALERTS);
     }},
@@ -438,8 +433,55 @@ test('the status line names the failed link', () => {
     c.arrange(h);
     const status = h.model.status(h.clock.now);
     assert.equal(status.link, c.link, `${c.name}: ${status.text}`);
+    if (c.textMatch) assert.match(status.text, c.textMatch, `${c.name}: ${status.text}`);
     assert.match(renderStatus(h.model, h.clock.now), new RegExp(`link-${c.link}`), c.name);
   }
+});
+
+// REQ-OPS-36: a session with no hardware bridge has no /hw/status in its
+// dictionary, so the OK line states that the RoboRIO link is not judged
+// without a hardware bridge. When a layout does carry hw/status/state_age_us,
+// renderStatus surfaces the State age alongside the status line.
+test('OK line names an absent hardware bridge, and surfaces state age when carried', () => {
+  const noHwChannels: ChannelSpec[] = [
+    {name: 'shooter/state/flywheel_velocity_rps', unit: 'rps', kind: ChannelKind.Double},
+  ];
+  const noHwHead = (seq: number) => ({
+    streamId: 11n, sequenceId: BigInt(seq), timestampNs: BigInt(seq) * 50_000_000n,
+    dictionaryId: dictionaryId(noHwChannels), channelCount: noHwChannels.length
+  });
+  const h = harness();
+  h.model.start(0);
+  h.socket().onopen!();
+  h.socket().send(
+      ...encodeDictionaryPages(noHwHead(0), noHwChannels),
+      ...encodeValuePages(noHwHead(0), POSE, true, [[0, rawFromDouble(10)]]),
+      ...encodeValuePages(noHwHead(1), POSE, false, []));
+  const status = h.model.status(0);
+  assert.equal(status.link, 'ok');
+  assert.match(status.text, /RoboRIO link not judged: no hardware bridge/);
+  assert.match(renderStatus(h.model, 0), /RoboRIO link not judged: no hardware bridge/);
+
+  const ageChannels: ChannelSpec[] = [
+    {name: LINK_LOST, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
+    {name: 'hw/status/state_age_us', unit: 'us', kind: ChannelKind.UInt},
+  ];
+  const ageHead = (seq: number) => ({
+    streamId: 12n, sequenceId: BigInt(seq), timestampNs: BigInt(seq) * 50_000_000n,
+    dictionaryId: dictionaryId(ageChannels), channelCount: ageChannels.length
+  });
+  const withAge = harness({channels: [LINK_LOST, 'hw/status/state_age_us'], alerts: true});
+  withAge.model.start(0);
+  withAge.socket().onopen!();
+  withAge.socket().send(
+      ...encodeDictionaryPages(ageHead(0), ageChannels),
+      ...encodeValuePages(ageHead(0), POSE, true, [[0, 0n], [1, 4200n]]),
+      ...encodeValuePages(ageHead(1), POSE, false, []));
+  assert.match(renderStatus(withAge.model, 0), /state age 4 ms/);
+  withAge.socket().send(...encodeValuePages(ageHead(2), POSE, false, [[0, 1n], [1, 0n]]));
+  assert.match(renderStatus(withAge.model, 0), /link-roborio.*no state received/);
+  withAge.socket().send(...encodeValuePages(ageHead(3), POSE, false, [[0, 1n], [1, 350_000n]]));
+  assert.match(renderStatus(withAge.model, 0), /link-roborio.*state age 350 ms/);
 });
 
 // REQ-OPS-36: on a close or an error the page reconnects every 1 s, one
@@ -455,7 +497,7 @@ test('reconnects every second after a close or an error, one socket at a time', 
   assert.equal(h.sockets.length, 2, 'no reconnect 1 s after the last attempt');
   // The attempt fails at once (the bridge is down): the next goes 1 s later.
   h.sockets[1].onerror!();
-  assert.ok(h.sockets[1].closed, 'an errored socket is closed');
+  assert.ok(h.sockets[1].closed, 'an errored socket is not closed');
   h.at(2 * RECONNECT_MS - 1);
   assert.equal(h.sockets.length, 2, 'reconnected within 1 s of the last attempt');
   h.at(2 * RECONNECT_MS);
@@ -524,10 +566,12 @@ test('the subsystems widget lists the summary, one state word per row', () => {
   h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
     registry: true, omitted: 3, nodes: [
       node('hardware_node', {}), node('drivetrain', {restarts: 2, drives: 'teleop'}),
-      node('shooter', {alive: false, quarantined: true})]}));
+      node('shooter', {alive: false, quarantined: true}),
+      node('studio_bridge', {critical: false, restarts: 3})]}));
   const html = widgetHtml(render(h), 'Subsystems');
   assert.match(html, /drivetrain<\/span><span class="tag tag-good">UP<\/span><span class="meta">restarts 2 · drives teleop/);
   assert.match(html, /shooter<\/span><span class="tag tag-bad">FAILING<\/span>/);
+  assert.match(html, /studio_bridge<\/span><span class="tag tag-good">UP<\/span><span class="meta">restarts 3/);
   for (const row of html.match(/<li>.*?<\/li>/g) ?? [])
     assert.ok((row.match(/class="tag /g) ?? []).length <= 1, `two state words in ${row}`);
   assert.match(html, /\+3 more/);
@@ -973,6 +1017,52 @@ test('subsystems rows put failed and driving nodes first', () => {
   assert.deepEqual(order, ['shooter', 'vision', 'drivetrain', 'telemetry', 'camera']);
 });
 
+// REQ-OPS-49: listRowsFit's box model assumes drive.css keeps zero margin and
+// padding on lists and their items, uses --drive-list-gap only between columns
+// (no row-gap), and sets each list item's height to --drive-row and item gap
+// to --drive-item-gap. Any extra spacing on these selectors would silently
+// overflow the calculated row count.
+test('list selectors keep the margin, padding, gap and height listRowsFit models', () => {
+  const css = readFileSync(new URL('../src/drive/drive.css', import.meta.url), 'utf8')
+                  .replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...css.matchAll(/([^{}@]+)\{([^}]*)\}/g)].map(([, sel, body]) => ({
+    selectors: sel.split(',').map(s => s.trim().replace(/\s+/g, ' ')),
+    body
+  }));
+  const declsFor = (selector: string) => {
+    const out = new Map<string, string>();
+    for (const r of rules) {
+      if (!r.selectors.includes(selector)) continue;
+      for (const part of r.body.split(';')) {
+        const colon = part.indexOf(':');
+        if (colon < 0) continue;
+        out.set(part.slice(0, colon).trim(), part.slice(colon + 1).trim());
+      }
+    }
+    return out;
+  };
+  const ul = declsFor('ul');
+  assert.equal(ul.get('margin'), '0', 'ul must have margin: 0');
+  assert.equal(ul.get('padding'), '0', 'ul must have padding: 0');
+
+  for (const list of ['.nodes', '.checks']) {
+    const d = declsFor(list);
+    assert.equal(d.get('column-gap'), 'var(--drive-list-gap)', `${list} column-gap`);
+    assert.equal(d.get('row-gap'), undefined, `${list} must not set row-gap`);
+    assert.equal(d.get('gap'), undefined, `${list} must not set gap (adds row-gap)`);
+    assert.equal(d.get('margin'), undefined, `${list} must not add margin`);
+    assert.equal(d.get('padding'), undefined, `${list} must not add padding`);
+  }
+
+  for (const item of ['.alerts li', '.nodes li', '.checks li']) {
+    const d = declsFor(item);
+    assert.equal(d.get('height'), 'var(--drive-row)', `${item} height`);
+    assert.equal(d.get('gap'), 'var(--drive-item-gap)', `${item} gap`);
+    assert.equal(d.get('margin'), undefined, `${item} must not add margin`);
+    assert.equal(d.get('padding'), undefined, `${item} must not add padding`);
+  }
+});
+
 // A Surface of plain objects that lays out like a browser: `grid` holds the
 // element at each index, so a test can tell a kept element from a replaced
 // one by identity. Each element's list body holds its `<li>` rows, ROW px
@@ -983,10 +1073,13 @@ test('subsystems rows put failed and driving nodes first', () => {
 const ROW = METRICS.row, ROOM = 100;
 type FakeElement = {html: string; top: number; attached: boolean; height: number; content: number};
 function fakeSurface() {
-  const page = {status: '', errored: false, grid: [] as FakeElement[], puts: 0};
+  const page = {status: '', drawError: '', errored: false, grid: [] as FakeElement[], puts: 0};
   const surface: Surface<FakeElement> = {
     status: html => {
       page.status = html;
+    },
+    drawError: html => {
+      page.drawError = html;
     },
     create: html => ({html, top: 0, attached: false, height: ROOM,
                       content: (html.match(/<li>/g)?.length ?? 0) * ROW}),
@@ -1024,12 +1117,12 @@ test('the painter replaces only a changed widget and keeps a list scrolled', () 
   const painter = new Painter(surface);
   // As the page does: each paint, then every list snapped to whole rows.
   const paint = (graph: string, nodes: string) => {
-    painter.paint(() => ({status: '<div>OK</div>', widgets: [graph, nodes]}));
+    painter.paint(() => '<div>OK</div>', () => [graph, nodes]);
     page.grid.forEach(e => surface.fit(e));
   };
   paint('<section>graph 1</section>', rows(10));
   const [graph, list] = page.grid;
-  assert.ok(graph && list, 'the first paint draws every widget');
+  assert.ok(graph && list, 'the first paint did not draw every widget');
   surface.setScrollTop(list, 2 * ROW);  // the driver scrolled the list
   paint('<section>graph 2</section>', rows(10));
   assert.notEqual(page.grid[0], graph, 'a changed widget is not repainted');
@@ -1059,25 +1152,52 @@ test('the out-of-view count of a scrolled list', () => {
   assert.equal(outOfViewText({above: 0, below: 0}), '');
 });
 
-// REQ-OPS-49, REQ-OPS-36: a drawing fault is named on the status line and
-// must not leave the last grid looking current: the frame says so there and
-// marks the grid, which keeps its elements. The next good draw clears the
-// mark and repaints the status line, even when it draws the same text as
-// before the fault.
-test('a drawing error marks the grid and the next good draw clears it', () => {
+// REQ-OPS-49, REQ-OPS-36: a widget drawing fault keeps the top status line
+// visible (and live as link status changes), shows a DRAWING ERROR row
+// telling the operator to reload, and marks the grid while keeping its last
+// elements. If drawing the status line itself throws, the status slot shows
+// DRAWING ERROR; the next good draw clears the mark and repaints cleanly.
+test('a drawing error keeps the status line, says to reload, and clears on recovery', () => {
   const {page, surface} = fakeSurface();
   const painter = new Painter(surface);
-  const good = () => ({status: '<div>status</div>', widgets: ['<section>grid</section>']});
-  painter.paint(good);
+  const okStatus = '<div class="status link-ok"><b>OK</b> Connected</div>';
+  const lostStatus = '<div class="status link-roborio"><b>ROBORIO LINK</b> RoboRIO link lost</div>';
+  const goodWidgets = () => ['<section>grid</section>'];
+
+  painter.paint(() => okStatus, goodWidgets);
   const shown = page.grid[0];
-  painter.paint(() => {
+  // A widget throws while the RoboRIO link also drops: the status line
+  // updates and stays visible, while the DRAWING ERROR row tells the driver
+  // to reload.
+  painter.paint(() => lostStatus, () => {
     throw new Error('<x-fault>');
   });
   assert.equal(page.errored, true, 'a drawing error leaves the grid unmarked');
   assert.equal(page.grid[0], shown);
-  assert.match(page.status, /link-error/);
-  assert.ok(page.status.includes(esc('<x-fault>')), page.status);
-  painter.paint(good);
+  assert.equal(page.status, lostStatus, 'a widget drawing error overwrote the top status line');
+  assert.match(page.drawError, /link-error/);
+  assert.match(page.drawError, /DRAWING ERROR/);
+  assert.match(page.drawError, /reload the page/i);
+  assert.ok(page.drawError.includes(esc('<x-fault>')), page.drawError);
+
+  // Recovery clears the DRAWING ERROR row and grid mark.
+  painter.paint(() => okStatus, goodWidgets);
   assert.equal(page.errored, false);
-  assert.equal(page.status, '<div>status</div>', 'the status line is not repainted after a drawing error');
+  assert.equal(page.drawError, '', 'the DRAWING ERROR row was not cleared on recovery');
+  assert.equal(page.status, okStatus);
+
+  // If drawing the status line itself throws, the status slot falls back to
+  // DRAWING ERROR telling the operator to reload, and recovers on the next
+  // good draw even when the status text matches the pre-fault status.
+  painter.paint(() => {
+    throw new Error('<x-status-fault>');
+  }, goodWidgets);
+  assert.equal(page.errored, true);
+  assert.equal(page.drawError, '');
+  const fallbackStatus: string = page.status;
+  assert.match(fallbackStatus, /link-error.*DRAWING ERROR.*reload the page/i);
+  assert.ok(fallbackStatus.includes(esc('<x-status-fault>')), fallbackStatus);
+  painter.paint(() => okStatus, goodWidgets);
+  assert.equal(page.errored, false);
+  assert.equal(page.status, okStatus, 'the status line was not repainted after a status drawing error');
 });

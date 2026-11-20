@@ -36,8 +36,9 @@
 //     nothing) and the RoboRIO link (`hw/status/alert_error_link_lost`).
 //     Those two only when the feed carries that channel, which the bridge's
 //     mask does when /drive/layout.json lists it in `channels` or has
-//     `alerts` true (an `alerts` widget); otherwise the channel's absence
-//     says nothing, and the status line says nothing of either. Right after
+//     `alerts` true (an `alerts` widget); otherwise the OK line states that
+//     the RoboRIO link is not judged (and names "no hardware bridge" when the
+//     dictionary lacks `/hw/status`). Right after
 //     a socket opens the bridge may still be refilling the slot's bucket
 //     before the dictionary (README: at most about 0.8 s on the 2026 config):
 //     for CONNECTING_GRACE_MS that is `connecting`, not a lost link. After
@@ -82,6 +83,7 @@ export const DECODE_RETRY_MS = 5000;
 export const DECODE_STREAK_MS = 10_000;
 export const REPLACED_CODE = 4000;
 export const LINK_LOST_CHANNEL = 'hw/status/alert_error_link_lost';
+export const STATE_AGE_CHANNEL = 'hw/status/state_age_us';
 // The longest history a graph or a field trail can ask for (README: 30 s),
 // and a cap on points per channel whatever the update rate.
 const HISTORY_S = 30;
@@ -340,8 +342,15 @@ export class DriveModel {
       if (lost === undefined)
         return {link: 'hardware', text: 'Hardware bridge not publishing: no hardware status'};
       if (lost !== 0) return {link: 'roborio', text: 'RoboRIO link lost'};
+      return {link: 'ok', text: 'Connected: telemetry current'};
     }
-    return {link: 'ok', text: 'Connected: telemetry current'};
+    const noHardwareBridge = !s || s.units[LINK_LOST_CHANNEL] === undefined;
+    return {
+      link: 'ok',
+      text: noHardwareBridge ?
+          'Connected: telemetry current (RoboRIO link not judged: no hardware bridge)' :
+          'Connected: telemetry current (RoboRIO link not judged)'
+    };
   }
 
   private connect(now: number) {

@@ -7,7 +7,7 @@
 import {channelDisplay, type Snapshot} from '../core';
 import {alertLevelName, type ActiveAlert, type LatchedAlert} from '../data/alerts';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../panels/field/geometry';
-import {type DriveModel, type DriveSummary, type Link, STALE_MS, type SummaryNode} from './feed';
+import {type DriveModel, type DriveSummary, type Link, STALE_MS, STATE_AGE_CHANNEL, type SummaryNode} from './feed';
 import type {Cell, CheckItem, Layout, Widget} from './layout';
 
 export function esc(text: string): string {
@@ -368,10 +368,20 @@ export function renderStatus(model: DriveModel, now: number, skipped = 0): strin
   const status = model.status(now);
   const c = model.counters;
   const malformed = c.malformed_binary + c.malformed_text;
+  let stateAge = '';
+  if ((status.link === 'ok' || status.link === 'roborio') && model.latest) {
+    const ageUs = model.latest.channels[STATE_AGE_CHANNEL];
+    if (ageUs !== undefined && Number.isFinite(ageUs) && ageUs >= 0) {
+      stateAge = status.link === 'roborio' && ageUs === 0 ?
+          ' <span class="meta">no state received</span>' :
+          ` <span class="meta">state age ${Math.round(ageUs / 1000)} ms</span>`;
+    }
+  }
   return `<div class="status link-${status.link}" role="status">` +
       `<b>${LINK_WORD[status.link]}</b> ${esc(status.text)}` +
       (status.link === 'replaced' ?
            ' <button type="button" data-action="reconnect">Reconnect</button>' : '') +
+      stateAge +
       (malformed ? ` <span class="meta">${plural(malformed, 'malformed message')} counted</span>` : '') +
       (skipped > 0 ?
            ` <span class="meta bad">${plural(skipped, 'layout widget')} not drawn: no cell this page can read</span>` :
@@ -393,6 +403,9 @@ export function gridStyle(layout: Layout): string {
 // plain objects. `E` is one widget's element.
 export interface Surface<E> {
   status(html: string): void;
+  // A dedicated DRAWING ERROR row beneath the top status bar (empty when
+  // clear), so a widget drawing fault never hides the link status line.
+  drawError(html: string): void;
   create(html: string): E;
   // Puts `next` at `index` of the grid, in place of `previous` if any.
   put(index: number, next: E, previous: E|undefined): void;
@@ -407,8 +420,10 @@ export interface Surface<E> {
   errored(on: boolean): void;
 }
 
-// One frame: the status line, and each widget's markup in layout order.
-export type Frame = {status: string; widgets: string[]};
+function drawErrorHtml(error: unknown): string {
+  return '<div class="status link-error" role="alert"><b>DRAWING ERROR</b> ' +
+      `The dashboard is not updating; reload the page (${esc(String(error))})</div>`;
+}
 
 // Paints frames widget by widget. The page redraws every RENDER_MS, and with
 // a live producer some widget (a graph, the battery, the match clock)
@@ -418,40 +433,52 @@ export type Frame = {status: string; widgets: string[]};
 // one's list scroll position: read before the old element leaves the grid
 // (off it, it reads 0) and set once the new body is sized to whole rows (set
 // before, it is clamped to a taller body's range, so a list scrolled to its
-// bottom would lose part of a row). A drawing error leaves the grid as it
-// is, marks it (it shows values no longer updated) and says so on the
-// status line.
+// bottom would lose part of a row). A widget drawing error keeps the top
+// status line visible and live, shows a DRAWING ERROR row telling the
+// operator to reload, and marks the grid until a good draw; if drawing the
+// status line itself throws, the status slot carries DRAWING ERROR instead.
 export class Painter<E> {
   private status = '';
+  private drawError = '';
   private markup: string[] = [];
   private elements: E[] = [];
 
   constructor(private readonly surface: Surface<E>) {}
 
-  paint(draw: () => Frame) {
-    let next: Frame;
+  paint(drawStatus: () => string, drawWidgets: () => string[]) {
+    let nextStatus: string;
     try {
-      next = draw();
+      nextStatus = drawStatus();
     } catch (error) {
       // Forget the status shown, so the first good draw repaints it.
       this.status = '';
-      this.surface.status('<div class="status link-error" role="status"><b>DRAWING ERROR</b> ' +
-                          `The dashboard is not updating: ${esc(String(error))}</div>`);
+      if (this.drawError !== '') this.surface.drawError(this.drawError = '');
+      this.surface.status(drawErrorHtml(error));
       this.surface.errored(true);
       return;
     }
-    if (next.status !== this.status) this.surface.status(this.status = next.status);
-    next.widgets.forEach((html, i) => {
-      if (html === this.markup[i]) return;
-      this.markup[i] = html;
-      const previous = this.elements[i];
-      const top = previous === undefined ? 0 : this.surface.scrollTop(previous);
-      const element = this.surface.create(html);
-      this.surface.put(i, element, previous);
-      this.elements[i] = element;
-      this.surface.fit(element);
-      if (top > 0) this.surface.setScrollTop(element, top);
-    });
+    if (nextStatus !== this.status) this.surface.status(this.status = nextStatus);
+
+    try {
+      const nextWidgets = drawWidgets();
+      nextWidgets.forEach((html, i) => {
+        if (html === this.markup[i]) return;
+        const previous = this.elements[i];
+        const top = previous === undefined ? 0 : this.surface.scrollTop(previous);
+        const element = this.surface.create(html);
+        this.surface.put(i, element, previous);
+        this.elements[i] = element;
+        this.markup[i] = html;
+        this.surface.fit(element);
+        if (top > 0) this.surface.setScrollTop(element, top);
+      });
+    } catch (error) {
+      const html = drawErrorHtml(error);
+      if (html !== this.drawError) this.surface.drawError(this.drawError = html);
+      this.surface.errored(true);
+      return;
+    }
+    if (this.drawError !== '') this.surface.drawError(this.drawError = '');
     this.surface.errored(false);
   }
 }
@@ -614,6 +641,7 @@ export function renderShell(layout: Layout, status = '', grid = ''): string {
   return `<div class="page" style="${pageStyle()}">` +
       `<header class="top"><h1>${esc(layout.title)}</h1>` +
       `<div class="status-slot">${status}</div></header>` +
+      '<div class="draw-error"></div>' +
       `<main class="grid" style="${gridStyle(layout)}">${grid}</main>` +
       '</div>';
 }
