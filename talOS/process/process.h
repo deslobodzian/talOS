@@ -140,8 +140,9 @@ bool RealtimeRequested(bool simulation) noexcept;
 // writing and mlocked (memory::KeepMappingsResident), and the calling
 // thread's stack is prefaulted 256 KiB below this call (less on a smaller
 // stack) and mlocked up to its top. Scheduling: PolicyFor(options), SCHED_FIFO
-// on Linux, the time-constraint policy or QOS_CLASS_USER_INTERACTIVE on macOS.
-// Threads created afterwards inherit the policy on Linux, so call it last,
+// with SCHED_RESET_ON_FORK on Linux (so child processes and threads created
+// afterwards start at SCHED_OTHER instead of inheriting SCHED_FIFO), the
+// time-constraint policy or QOS_CLASS_USER_INTERACTIVE on macOS. Call it last,
 // from the thread that runs the loop.
 //
 // Returns what it asked for and what it got (realtime_outcome.h): `tier`
@@ -163,10 +164,10 @@ inline constexpr int kBackgroundNice = 10;
 
 // Best effort, for the calling thread: puts it below every node loop thread,
 // for a helper thread doing unbounded work (camera capture and detection,
-// image encoding). On Linux it leaves any realtime policy it inherited (a
-// thread created after ConfigureRealtime inherits SCHED_FIFO) for SCHED_OTHER
-// and raises its nice value to at least kBackgroundNice; threads it creates
-// afterwards inherit both. On macOS it sets QOS_CLASS_UTILITY, below the
+// image encoding). On Linux it leaves any realtime policy it may have
+// inherited for SCHED_OTHER and raises its nice value to at least
+// kBackgroundNice; threads it creates afterwards inherit both. On macOS it
+// sets QOS_CLASS_UTILITY, below the
 // default QoS a loop thread runs at under timeshare; a thread created with
 // pthread_create starts at the default QoS again (macOS does not inherit
 // QoS or the time-constraint policy), so every thread calls this itself.

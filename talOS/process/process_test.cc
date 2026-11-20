@@ -175,6 +175,9 @@ bool HasTimeConstraint() {
 bool ThreadIsRealtime() {
 #if defined(__APPLE__)
   return HasTimeConstraint();
+#elif defined(__linux__)
+  const int policy = ::sched_getscheduler(0);
+  return policy >= 0 && (policy & ~SCHED_RESET_ON_FORK) == SCHED_FIFO;
 #else
   int policy = 0;
   sched_param param{};
@@ -191,6 +194,12 @@ bool ThreadHasTierPolicy(LoopTier tier) {
   if (expected.time_constraint) return HasTimeConstraint();
   return !HasTimeConstraint() &&
          ::qos_class_self() == QOS_CLASS_USER_INTERACTIVE;
+#elif defined(__linux__)
+  const int policy = ::sched_getscheduler(0);
+  sched_param param{};
+  if (policy < 0 || ::sched_getparam(0, &param) != 0) return false;
+  return policy == (SCHED_FIFO | SCHED_RESET_ON_FORK) &&
+         param.sched_priority == expected.fifo_priority;
 #else
   int policy = 0;
   sched_param param{};
@@ -294,10 +303,10 @@ TEST(ProcessTest, BackgroundThreadRunsBelowTheDefaultPriority) {
   EXPECT_TRUE(after);
 }
 
-// A thread created by a realtime loop thread inherits SCHED_FIFO on Linux.
-// The helper must take it out of realtime, and so must keep any thread it
-// creates afterwards (a detector's worker pool) out of realtime too; on Linux
-// that thread also inherits the background nice value.
+// A thread created by a realtime thread that did not set SCHED_RESET_ON_FORK
+// inherits SCHED_FIFO on Linux. The helper must take it out of realtime, and so
+// must keep any thread it creates afterwards (a detector's worker pool) out of
+// realtime too; on Linux that thread also inherits the background nice value.
 TEST(ProcessTest, BackgroundThreadLeavesAnInheritedRealtimePolicy) {
   ::unsetenv("TALOS_REALTIME");
   bool parent_realtime = false;
@@ -306,7 +315,13 @@ TEST(ProcessTest, BackgroundThreadLeavesAnInheritedRealtimePolicy) {
   bool grandchild_realtime = true;
   bool grandchild_background = false;
   std::thread parent{[&] {
+#if defined(__linux__)
+    sched_param param{};
+    param.sched_priority = kControlFifoPriority;
+    (void)::sched_setscheduler(0, SCHED_FIFO, &param);
+#else
     (void)ConfigureRealtime({.period = 10ms, .tier = LoopTier::kControl});
+#endif
     parent_realtime = ThreadIsRealtime();
     if (!parent_realtime) return;
     std::thread child{[&] {
@@ -330,6 +345,49 @@ TEST(ProcessTest, BackgroundThreadLeavesAnInheritedRealtimePolicy) {
   EXPECT_TRUE(grandchild_background);
 #endif
 }
+
+#if defined(__linux__)
+// ConfigureRealtime passes SCHED_RESET_ON_FORK on Linux, so neither a forked
+// child process nor a newly created thread inherits SCHED_FIFO from the loop
+// thread. Runs in a forked child so fork() stays single-threaded and the test
+// process keeps its own scheduling.
+// REQ-RT-08
+TEST(ProcessTest, RealtimeResetsPolicyOnForkAndThreadCreation) {
+  ::unsetenv("TALOS_REALTIME");
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    const RealtimeOutcome outcome =
+        ConfigureRealtime({.period = 10ms, .tier = LoopTier::kControl});
+    if (outcome.grant() == RealtimeGrant::kRefused) ::_exit(2);
+    if (!ThreadHasTierPolicy(LoopTier::kControl)) ::_exit(3);
+
+    const pid_t grandchild = ::fork();
+    if (grandchild < 0) ::_exit(4);
+    if (grandchild == 0) {
+      ::_exit(::sched_getscheduler(0) == SCHED_OTHER ? 0 : 1);
+    }
+    int gc_status = 0;
+    if (::waitpid(grandchild, &gc_status, 0) != grandchild ||
+        !WIFEXITED(gc_status) || WEXITSTATUS(gc_status) != 0) {
+      ::_exit(5);
+    }
+
+    int thread_policy = -1;
+    std::thread worker{[&] { thread_policy = ::sched_getscheduler(0); }};
+    worker.join();
+    ::_exit(thread_policy == SCHED_OTHER ? 0 : 6);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  if (WEXITSTATUS(status) == 2) {
+    GTEST_SKIP() << "realtime refused; cannot verify SCHED_RESET_ON_FORK";
+  }
+  EXPECT_EQ(WEXITSTATUS(status), 0)
+      << "child failed at step " << WEXITSTATUS(status);
+}
+#endif
 
 }  // namespace
 }  // namespace talos::process

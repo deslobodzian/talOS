@@ -120,7 +120,9 @@ subsystem owns a motor, digital output or PWM output or which writes a target
 lane (`teleop`, a driver or autonomous node), is a control node; every other node
 (telemetry, cameras, a pose estimator, Python observers) is an observer.
 
-- Linux: `SCHED_FIFO` priority 49 for the bridge, 45 for control nodes and 40
+- Linux: `SCHED_FIFO` (with `SCHED_RESET_ON_FORK`, so forked child processes
+  and threads created later start at `SCHED_OTHER` instead of inheriting
+  `SCHED_FIFO`) priority 49 for the bridge, 45 for control nodes and 40
   for observers, so a runnable loop preempts every loop of a lower tier. All
   are below the `SCHED_FIFO` 50 PREEMPT_RT gives threaded interrupt handlers
   (among them the NIC's, which carries the RoboRIO's packets), so no loop
@@ -183,12 +185,13 @@ production policy, against a simulated gateway (which itself never runs
 realtime) (`talOS/process` `RealtimeRequested`). Nodes and the bridge
 inherit the variable from the launcher.
 
-A thread the node starts must not run at the loop's priority. On Linux a
-thread created after the loop thread went realtime inherits `SCHED_FIFO`, so
-an unbounded helper (capture, detection, encoding) would preempt every control
-loop; under timeshare (`--sim`) it competes with them as an equal. A helper
+A thread the node starts must not run at the loop's priority. On Linux
+`ConfigureRealtime` passes `SCHED_RESET_ON_FORK`, so children and threads
+created afterwards start at `SCHED_OTHER` (nice 0) rather than inheriting
+`SCHED_FIFO`, where an unbounded helper (capture, detection, encoding) still
+competes with timeshare (`--sim`) loops as an equal. A helper
 thread calls `talos::process::ConfigureBackgroundThread()` first: on Linux it
-leaves an inherited realtime policy for `SCHED_OTHER` at nice
+leaves any inherited realtime policy for `SCHED_OTHER` at nice
 `kBackgroundNice` (10), which threads it creates inherit; on macOS it sets
 `QOS_CLASS_UTILITY`, which new threads do not inherit, so each thread calls it
 itself (a dispatch queue takes the QoS in its attributes). In the vision
