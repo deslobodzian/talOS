@@ -186,6 +186,30 @@ TEST_F(VelocityMechanismTest, ChangedGoalRestartsReadiness) {
   EXPECT_TRUE(flywheel().at_speed());
 }
 
+// Changing an out-of-range request that still clamps to the same goal_rps_
+// does not spuriously reset readiness; moving back inside range does.
+// REQ-SAFE-37
+TEST_F(VelocityMechanismTest, UnchangedClampedGoalKeepsReadiness) {
+  SetVelocity(80.0);
+  Drive(100.0, 20ms);
+  ASSERT_DOUBLE_EQ(flywheel().goal_rps(), 80.0);
+  ASSERT_TRUE(flywheel().at_speed());
+  Drive(120.0, 5ms);
+  EXPECT_DOUBLE_EQ(flywheel().goal_rps(), 80.0);
+  EXPECT_TRUE(flywheel().at_speed());
+  Drive(79.0, 5ms);
+  EXPECT_DOUBLE_EQ(flywheel().goal_rps(), 79.0);
+  EXPECT_FALSE(flywheel().at_speed());
+
+  SetVelocity(-80.0);
+  Drive(-100.0, 20ms);
+  ASSERT_DOUBLE_EQ(flywheel().goal_rps(), -80.0);
+  ASSERT_TRUE(flywheel().at_speed());
+  Drive(-120.0, 5ms);
+  EXPECT_DOUBLE_EQ(flywheel().goal_rps(), -80.0);
+  EXPECT_TRUE(flywheel().at_speed());
+}
+
 // A CAN gap freezes the flywheel's velocity: the gateway keeps reporting the
 // last value, in band, with a growing age, and keeps it valid until that age
 // reaches command_timeout_us (100 ms). at_speed must not ride on it: a
