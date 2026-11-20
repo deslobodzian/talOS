@@ -121,6 +121,9 @@ struct Bridge {
   std::string attach_error;
   // Every send to a client leaves in one of its passes (pass_clients).
   studio::ClientRotation<Socket*> clients;
+  // Reserves the shared programmer bucket for a client waiting past
+  // kSharedReserveDelayNs for a large message (studio::SharedReservation).
+  studio::SharedReservation<Socket*> shared_reservation;
   us_listen_socket_t* listener = nullptr;
   // ws_drops counts messages the socket refused; that client is then
   // resynchronized (the whole graph, a telemetry keyframe). A graph or
@@ -246,14 +249,36 @@ struct Bridge {
   // sees the buckets at one level, so a refill landing between two clients
   // cannot hand the turn of one that could not yet afford a message to a
   // later one with a message of the same size.
-  bool affordable(Socket* client, std::size_t framed_bytes, std::int64_t now) {
+  bool affordable(
+      Socket* client, std::size_t framed_bytes, std::int64_t now,
+      studio::ClientFeeds::Feed feed = studio::ClientFeeds::Feed::kGraph) {
     Client* data = client->getUserData();
     EgressBudget* budget = budget_of(client);
     // An evicted drive client holds no slot and is sent nothing more.
     if (budget == nullptr) return false;
+    if (data->drive) {
+      std::int64_t wait_ns = 0;
+      if (!egress.Affordable(*budget, true, framed_bytes, now, wait_ns)) {
+        schedule.Deferred(now, wait_ns);
+        return false;
+      }
+      if (client->getBufferedAmount() != 0) {
+        ++held;
+        return false;
+      }
+      return true;
+    }
+    if (!shared_reservation.MaySpend(client, framed_bytes, *budget,
+                                     client_rate(), now)) {
+      return false;
+    }
+    const bool fits_own = budget->available(framed_bytes, client_rate(), now);
     std::int64_t wait_ns = 0;
-    if (!egress.Affordable(*budget, data->drive, framed_bytes, now, wait_ns)) {
+    if (!egress.Affordable(*budget, false, framed_bytes, now, wait_ns)) {
       schedule.Deferred(now, wait_ns);
+      if (fits_own && client->getBufferedAmount() == 0) {
+        shared_reservation.BlockedOnShared(client, framed_bytes, feed);
+      }
       return false;
     }
     if (client->getBufferedAmount() != 0) {
@@ -279,7 +304,9 @@ struct Bridge {
       return false;
     }
     const auto size = EgressBudget::framed(bytes.size());
-    egress.Spend(*budget, client->getUserData()->drive, size);
+    const bool is_drive = client->getUserData()->drive;
+    egress.Spend(*budget, is_drive, size);
+    if (!is_drive) shared_reservation.OnSend(client);
     egress_bytes += size;
     return true;
   }
@@ -309,38 +336,41 @@ struct Bridge {
     }
     data->feeds.Pump(
         system_graph, telemetry_state, now_ns, client_rate(),
-        [this, client, now_ns](std::size_t framed_bytes) {
-          return affordable(client, framed_bytes, now_ns);
+        [this, client, now_ns](std::size_t framed_bytes,
+                               studio::ClientFeeds::Feed feed) {
+          return affordable(client, framed_bytes, now_ns, feed);
         },
         [this, client](std::string_view text) {
           return send_now(client, text, uWS::OpCode::TEXT);
         },
         [this, client](std::string_view page) {
           return send_now(client, page, uWS::OpCode::BINARY);
-        });
+        },
+        shared_reservation.PreferTelemetry(client));
     return egress_bytes != charged;
   }
 
   // Offers every client what is due: each drive client, whose own bucket
-  // nobody else spends, then the programmer clients in rotation
-  // (studio::ClientRotation).
+  // nobody else spends, then the programmer clients in rotation with shared
+  // bucket reservation (studio::ClientRotation, studio::SharedReservation).
   void pass_clients() {
     const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
     for (Socket* client : drive_clients.clients()) pump(client, now_ns);
-    clients.Pass(
-        [this, now_ns](Socket* client) { return pump(client, now_ns); });
+    shared_reservation.Pass(clients, now_ns, [this, now_ns](Socket* client) {
+      return pump(client, now_ns);
+    });
   }
 
   // A client's output drained: a drive client is offered what is due at
-  // once; a programmer client gets a pass, which offers it its turn
-  // (studio::ClientRotation::Drained).
+  // once; a programmer client gets a pass, which offers it its turn behind
+  // any reserved or earlier client.
   void drained(Socket* client) {
     const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
     if (client->getUserData()->drive) {
       pump(client, now_ns);
       return;
     }
-    clients.Drained(client, [this, now_ns](Socket* offered) {
+    shared_reservation.Pass(clients, now_ns, [this, now_ns](Socket* offered) {
       return pump(offered, now_ns);
     });
   }
@@ -526,6 +556,7 @@ struct Bridge {
   std::int64_t next_wake_ns(std::int64_t now_ns) const {
     return schedule.NextWakeNs(now_ns, !wake || backlog, system_graph,
                                [this](const auto& visit) {
+                                 visit(shared_reservation);
                                  for (Socket* client : clients.clients())
                                    visit(client->getUserData()->feeds);
                                  for (Socket* client : drive_clients.clients())
@@ -905,6 +936,7 @@ int main(int argc, char** argv) try {
   // so a client whose writes keep draining is not sent to twice in a turn.
   behavior.drain = [&](auto* ws) { bridge.drained(ws); };
   behavior.close = [&](auto* ws, int, std::string_view) {
+    bridge.shared_reservation.Remove(ws);
     bridge.clients.Remove(ws);
   };
   // The driver dashboard's feed (README.md "Driver dashboard feed"): outside

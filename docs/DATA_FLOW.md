@@ -521,7 +521,31 @@ message), none is sent to twice before
 every other one has been sent to once (`ClientRotation` in
 `studio/bridge/telemetry.h`). Messages differ in size, so a client whose
 next update is larger than another's can be passed over while the shared
-bucket holds the smaller one but not its own. A client that still has
+bucket holds the smaller one but not its own, up to **500 ms**
+(`kSharedReserveDelayNs`, `SharedReservation` in `studio/bridge/telemetry.h`):
+once a programmer client whose own bucket holds its pending message of framed
+size G ≤ 64,000 B (and whose socket has nothing buffered) has waited 500 ms
+specifically for the shared bucket, the bridge reserves the shared bucket for
+it — granting no bytes from the shared bucket to other programmer clients or
+to that client's own smaller feed — until the shared bucket refills to G and
+it sends (or until it disconnects, backs up, its own bucket can no longer
+afford G, or it no longer needs the send; messages above 64,000 B are never
+reserved, and drive clients use their own buckets and are never deferred).
+One waiting client's shared-bucket wait is therefore bounded independently of
+`max_clients` by
+
+0.5 s + G / R
+
+(**0.90 s** for a 64,000 B message at R = 160,000 B/s without a dashboard
+layout, **1.07 s** at R = 112,000 B/s with the default layout, **1.30 s** at
+the 80,000 B/s minimum programmer share; **0.75 s** / **0.86 s** for a
+40,000 B whole graph; **0.60 s** / **0.65 s** for a 16,394 B framed
+dictionary page). When k programmer clients wait simultaneously on messages
+of framed sizes G₁, …, Gₖ ≤ G, they are served FIFO by wait start
+(tie-broken by rotation order), so every one of them sends within
+`0.5 s + (G₁ + … + Gₖ) / R ≤ 0.5 s + k × G / R` (**2.10 s** / **2.79 s** for
+all 4 default clients waiting on 64,000 B; **26.1 s** / **37.1 s** for all
+64). A client that still has
 output buffered is held: it skips passes, and its telemetry resumes from the
 latest values once it drains. Being held never disconnects a client: the
 bridge sends nothing while output is buffered, so at most one graph message
@@ -583,8 +607,9 @@ the 40,000 B/s share of 4 clients without a dashboard layout (**2.9 s** at
 the 28,000 B/s share with the default one), and **55.5 s** for a graph at the
 64,000 B burst at the 2,500 B/s share of `max_clients = 64` (**82.1 s** at
 its 1,750 B/s share with the default layout). The bound is on the client's own
-bucket: the shared bucket refills at the sum of every share, so it adds delay
-only while other clients spend bursts they saved, and a client whose socket
+bucket: once that bucket holds G, the shared bucket adds at most the
+reservation bound above (`0.5 s + G / R` for one waiting client, or
+`0.5 s + k × G / R` when k wait simultaneously), and a client whose socket
 still has output buffered is sent nothing until it drains. Telemetry keeps
 flowing beside the waiting graph, change-only, so the thinning skips samples,
 never values; while a graph waits, a reading goes stale only when one update costs more than
