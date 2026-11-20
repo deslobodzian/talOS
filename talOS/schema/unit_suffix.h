@@ -7,7 +7,9 @@
 // Bazel's exec configuration, which does not get the repo's -std=c++23.
 
 #include <array>
+#include <cstddef>
 #include <string_view>
+#include <utility>
 
 namespace talos::schema {
 
@@ -29,12 +31,19 @@ inline constexpr std::array<SuffixUnit, 26> kUnitSuffixTable = {{
     {"_mask", ""},       {"_px", "px"},
 }};
 
-inline constexpr std::array<std::string_view, 26> kUnitSuffixes = {
-    "_ns",     "_us",    "_m",   "_mps",  "_mps2", "_rad",  "_radps",
-    "_radps2", "_rot",   "_rps", "_rps2", "_v",    "_a",    "_w",
-    "_degc",   "_kg",    "_n",   "_nm",   "_frac", "_duty", "_ratio",
-    "_count",  "_index", "_id",  "_mask", "_px",
-};
+namespace detail {
+
+template <std::size_t... Is>
+constexpr std::array<std::string_view, sizeof...(Is)> MakeUnitSuffixes(
+    std::index_sequence<Is...>) {
+  return {kUnitSuffixTable[Is].suffix...};
+}
+
+}  // namespace detail
+
+inline constexpr std::array<std::string_view, kUnitSuffixTable.size()>
+    kUnitSuffixes = detail::MakeUnitSuffixes(
+        std::make_index_sequence<kUnitSuffixTable.size()>{});
 
 // `name` is something followed by one of kUnitSuffixes.
 constexpr bool has_unit_suffix(std::string_view name) {
