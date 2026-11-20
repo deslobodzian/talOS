@@ -4,8 +4,9 @@
 Used by both .github/workflows/continuous-integration.yaml and tools/tidy.sh.
 Analyzes TUs in compile_commands.json: each changed source (tests included),
 plus up to TUS_PER_HEADER includers of each changed header (direct or
-transitive; production includers for a production header). Exits 1 if any
-file has findings or a changed in-graph source is missing from the database.
+transitive; production includers for a production header, falling back to test
+includers when no production TU includes it). Exits 1 if any file has findings
+or a changed in-graph source is missing from the database.
 """
 
 import concurrent.futures
@@ -67,6 +68,43 @@ def production(rel):
         or path.stem.endswith(('_test', '_testing'))
         or 'fuzz' in path.stem
     )
+
+
+def select_includers(header, includers, tus, limit=TUS_PER_HEADER):
+    """Selects up to `limit` TUs in `tus` that include `header` (direct or
+    transitive, nearest and same-directory first).
+
+    For a production header, prefers production TUs; when no production TU
+    includes it (e.g. a test-only support header without `test` in its name),
+    falls back to test TUs so the header is still analyzed.
+
+    Returns `(selected_tus, used_test_fallback)`.
+    """
+    is_prod_header = production(header)
+    found, fallback, seen, frontier = [], [], {header}, [header]
+    while frontier and len(found) < limit:
+        level = sorted(
+            {i for h in frontier for i in includers.get(h, ())} - seen,
+            key=lambda p: (
+                os.path.dirname(p) != os.path.dirname(header),
+                p,
+            ),
+        )
+        seen.update(level)
+        for p in level:
+            if p not in tus:
+                continue
+            if not is_prod_header or production(p):
+                if len(found) < limit:
+                    found.append(p)
+            elif len(fallback) < limit:
+                fallback.append(p)
+        frontier = [p for p in level if p.endswith(HEADERS)]
+    if found:
+        return found, False
+    if fallback:
+        return fallback, True
+    return [], False
 
 
 def main():
@@ -148,29 +186,16 @@ def main():
                     for header in resolved:
                         includers.setdefault(header, set()).add(rel)
         for header in headers:
-            found, seen, frontier = [], {header}, [header]
-            while frontier and len(found) < TUS_PER_HEADER:
-                level = sorted(
-                    {i for h in frontier for i in includers.get(h, ())} - seen,
-                    key=lambda p: (
-                        os.path.dirname(p) != os.path.dirname(header),
-                        p,
-                    ),
+            found, used_test_fallback = select_includers(header, includers, tus)
+            if found and used_test_fallback:
+                print(
+                    f'{header}: via {", ".join(found)} '
+                    '(test fallback: no production TU includes it)'
                 )
-                seen.update(level)
-                found += [
-                    p
-                    for p in level
-                    if p in tus and (production(p) or not production(header))
-                ][: TUS_PER_HEADER - len(found)]
-                frontier = [p for p in level if p.endswith(HEADERS)]
-            if found:
+                targets += found
+            elif found:
                 print(f'{header}: via {", ".join(found)}')
                 targets += found
-            elif production(header):
-                print(
-                    f'{header}: no production translation unit includes it; not analyzed'
-                )
             else:
                 print(f'{header}: no translation unit includes it; not analyzed')
     targets = list(dict.fromkeys(targets))

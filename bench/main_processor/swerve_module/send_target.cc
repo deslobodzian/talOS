@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "swerve_module/module_message_generated.h"
-#include "talOS/devices/access.h"
 #include "talOS/devices/target.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
@@ -38,9 +37,14 @@ constexpr const char* kUsage =
 std::uint64_t Generation(const talos::hardware::Packet& packet) {
   talos::driver_station::DriverStationData ds{};
   if (!talos::driver_station::Decode(packet.bytes(), ds)) return 0;
-  return talos::detail::DsModeOf(ds.fms.flags) != talos::detail::DsMode::kNone
-             ? ds.mode_since_us
-             : 0;
+  const std::uint32_t key = talos::driver_station::ModeKey(ds.fms.flags);
+  const bool active = (key & talos::driver_station::kDsAttached) != 0 &&
+                      (key & talos::driver_station::kEnabled) != 0 &&
+                      (key & talos::driver_station::kEStop) == 0 &&
+                      (key & (talos::driver_station::kAutonomous |
+                              talos::driver_station::kTeleop |
+                              talos::driver_station::kTest)) != 0;
+  return active ? ds.mode_since_us : 0;
 }
 
 }  // namespace

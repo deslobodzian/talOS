@@ -183,12 +183,12 @@ def with_edge(frm, to, generator=None):
     return graph
 
 
-def run_sources(file_map, exempt_cli_files=()):
+def run_sources(file_map, exempt_cli_files=None):
     out = io.StringIO()
     failures = check_layers.run_source_checks(
         sorted(file_map.keys()),
         lambda p: file_map[p],
-        exempt_cli_files=exempt_cli_files,
+        exempt_cli_files={} if exempt_cli_files is None else exempt_cli_files,
         out=out,
     )
     return failures, out.getvalue()
@@ -328,16 +328,21 @@ class CheckNodeSourcesTest(unittest.TestCase):
             ),
             "bench/arm/arm.cc": (
                 '#include "arm/arm.h"\n'
+                '// Token paste operators in comments (## and %:%:) are ok.\n'
+                '/* Also ## and %:%: in block comments. */\n'
+                'const char* kStr = "## and %:%: in strings are ok";\n'
                 'const char* kRaw = R"(\n'
                 '#include "talOS/node/access.h"\n'
                 'detail::NodeAccess::add_hardware_request\n'
+                '#define CAT(a, b) a##b\n'
+                '#define CAT2(a, b) a%:%:b\n'
                 ')";\n'
             ),
-            # Non-node integration harness outside talOS/ is not scanned.
-            "bench/integration/BUILD": (
-                'cc_test(name = "it", srcs = ["it_test.cc"])\n'
+            # Repo tooling outside tools/scaffold_testdata/ is not scanned.
+            "tools/BUILD": (
+                'cc_binary(name = "data_flow_sizes", srcs = ["data_flow_sizes.cc"])\n'
             ),
-            "bench/integration/it_test.cc": (
+            "tools/data_flow_sizes.cc": (
                 '#include "talOS/rtms/rtms.h"\n'
                 '#include "talOS/hardware/messages.h"\n'
             ),
@@ -420,32 +425,150 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 self.assertIn("bench/arm/arm.cc:", out)
 
     # REQ-SAFE-27
-    def test_subdirectory_and_aliased_load_and_root_package_are_scanned(self):
-        # Subdirectory without its own BUILD belongs to the parent node package.
-        files = {
-            "bench/arm/BUILD": (
-                'load("//talOS/build:contract.bzl", my_node = "talos_cc_node")\n'
-                'my_node(name = "node", srcs = ["arm.cc"], node_name = "arm")\n'
-            ),
-            "bench/arm/detail/helper.inl": '#include "talOS/node/access.h"\n',
-        }
-        failures, out = run_sources(files)
-        self.assertEqual(failures, 1, out)
-        self.assertIn("bench/arm/detail/helper.inl:1:", out)
+    def test_token_pasting_is_refused_outside_comments_and_strings(self):
+        cases = [
+            ("hash_hash",
+             "#define CAT(a, b) a##b\n"
+             "void f() { talos::detail::CAT(Node, Access)::CAT(add_hardware, _request)(); }\n"),
+            ("hash_hash_spaced",
+             "#define CAT(a, b) a ## b\n"),
+            ("digraph_paste",
+             "#define CAT(a, b) a%:%:b\n"),
+            ("digraph_paste_spaced",
+             "#define CAT(a, b) a %:%: b\n"),
+            ("spliced_hash_hash",
+             "#define CAT(a, b) a#\\\n#b\n"),
+            ("spliced_digraph_paste",
+             "#define CAT(a, b) a%:\\\n%:b\n"),
+        ]
+        for name, body in cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": body,
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/arm.cc:", out)
 
-        # Standalone node package at the workspace root (empty package dir).
-        root_files = {
-            "BUILD": self.NODE_BUILD,
-            "wrist.h": '#include <talOS/rtms/rtms.h>\n',
-        }
-        failures, out = run_sources(root_files)
-        self.assertEqual(failures, 1, out)
-        self.assertIn("wrist.h:1:", out)
+    # REQ-SAFE-27
+    def test_helper_packages_subpackages_and_wrapper_macros_are_scanned(self):
+        cases = [
+            ("helper_cc_library_no_node_macro", {
+                "bench/main_processor/BUILD": (
+                    'cc_library(name = "helper", hdrs = ["helper.h"])\n'
+                ),
+                "bench/main_processor/helper.h": (
+                    'void bypass() { talos::detail::NodeAccess::add_hardware_request(); }\n'
+                ),
+            }, "bench/main_processor/helper.h:1:"),
+            ("helper_cc_library_forbidden_include", {
+                "bench/main_processor/BUILD": (
+                    'cc_library(name = "helper", hdrs = ["helper.h"])\n'
+                ),
+                "bench/main_processor/helper.h": '#include "talOS/rtms/rtms.h"\n',
+            }, "bench/main_processor/helper.h:1:"),
+            ("subpackage_with_own_build", {
+                "bench/arm/BUILD": self.NODE_BUILD,
+                "bench/arm/subpkg/BUILD": (
+                    'cc_library(name = "sub", hdrs = ["sub.h"])\n'
+                ),
+                "bench/arm/subpkg/sub.h": '#include "talOS/node/access.h"\n',
+            }, "bench/arm/subpkg/sub.h:1:"),
+            ("custom_wrapper_macro_package", {
+                "examples/custom/BUILD": (
+                    'load("//my:macros.bzl", "robot_node")\n'
+                    'robot_node(name = "node", srcs = ["custom.cc"])\n'
+                ),
+                "examples/custom/custom.cc": (
+                    'void f() { talos::detail::HardwareAccess::note_live_target(); }\n'
+                ),
+            }, "examples/custom/custom.cc:1:"),
+            ("scaffold_testdata_helper_package", {
+                "tools/scaffold_testdata/helper/BUILD": (
+                    'cc_library(name = "h", hdrs = ["h.h"])\n'
+                ),
+                "tools/scaffold_testdata/helper/h.h": '#include "talOS/ipc/publisher.h"\n',
+            }, "tools/scaffold_testdata/helper/h.h:1:"),
+            ("root_package_standalone_robot", {
+                "BUILD": self.NODE_BUILD,
+                "wrist.h": '#include <talOS/rtms/rtms.h>\n',
+            }, "wrist.h:1:"),
+            ("subdirectory_without_build", {
+                "bench/arm/BUILD": (
+                    'load("//talOS/build:contract.bzl", my_node = "talos_cc_node")\n'
+                    'my_node(name = "node", srcs = ["arm.cc"], node_name = "arm")\n'
+                ),
+                "bench/arm/detail/helper.inl": '#include "talOS/node/access.h"\n',
+            }, "bench/arm/detail/helper.inl:1:"),
+        ]
+        for name, files, expected in cases:
+            with self.subTest(name=name):
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn(expected, out)
+
+    # REQ-SAFE-27
+    def test_cpp_suffixes_and_extensionless_build_headers_are_scanned(self):
+        for suffix in (
+                ".tcc", ".h++", ".c++", ".cppm", ".ixx",
+                ".hpp", ".hh", ".hxx", ".inl", ".inc", ".ipp",
+                ".cc", ".cpp", ".cxx", ".h", ".c", ".TCC"):
+            with self.subTest(suffix=suffix):
+                path = f"bench/arm/bypass{suffix}"
+                files = {
+                    "bench/arm/BUILD": (
+                        'cc_library(name = "arm", srcs = ["bypass' + suffix + '"])\n'
+                    ),
+                    path: '#include "talOS/node/access.h"\n',
+                }
+                failures, out = run_sources(files)
+                self.assertEqual(failures, 1, f"{suffix}: {out}")
+                self.assertIn(f"{path}:1:", out)
+
+        extless_cases = [
+            ("textual_hdrs", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", textual_hdrs = ["bypass_hdr"])\n'
+                ),
+                "bench/arm/bypass_hdr": '#include "talOS/node/access.h"\n',
+            }, "bench/arm/bypass_hdr:1:"),
+            ("hdrs_subdir", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", hdrs = ["detail/bypass_hdr"])\n'
+                ),
+                "bench/arm/detail/bypass_hdr": (
+                    'void f() { talos::detail::NodeAccess::add_hardware_request(); }\n'
+                ),
+            }, "bench/arm/detail/bypass_hdr:1:"),
+            ("srcs_extensionless", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", srcs = [":raw_hdr"])\n'
+                ),
+                "bench/arm/raw_hdr": '#include "talOS/rtms/rtms.h"\n',
+            }, "bench/arm/raw_hdr:1:"),
+            ("textual_hdrs_glob", {
+                "bench/arm/BUILD": (
+                    'cc_library(name = "arm", textual_hdrs = glob(["inc/*"]))\n'
+                ),
+                "bench/arm/inc/secret": '#include "talOS/devices/access.h"\n',
+            }, "bench/arm/inc/secret:1:"),
+        ]
+        for name, files, expected in extless_cases:
+            with self.subTest(name=name):
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn(expected, out)
 
     # REQ-SAFE-27
     def test_non_node_cli_exemption_scope_and_staleness(self):
-        exempt = {"bench/swerve/send_target.cc": "operator CLI"}
-        # Transport includes in the exempted CLI pass.
+        exempt = {
+            "bench/swerve/send_target.cc": frozenset({
+                "talOS/ipc/publisher.h",
+                "talOS/hardware/packet.h",
+            }),
+        }
+        # Only the exact allowlisted transport/wire includes pass.
         files = {
             "bench/swerve/BUILD": self.NODE_BUILD,
             "bench/swerve/send_target.cc": (
@@ -456,21 +579,45 @@ class CheckNodeSourcesTest(unittest.TestCase):
         failures, out = run_sources(files, exempt_cli_files=exempt)
         self.assertEqual(failures, 0, out)
 
-        # Even in an exempted CLI, NodeAccess / node/access.h is refused.
-        files["bench/swerve/send_target.cc"] += (
-            '#include "talOS/node/access.h"\n'
-            'void f() { detail::NodeAccess::add_hardware_request(); }\n'
+        # An unallowlisted transport include in the same CLI is refused.
+        extra_transport = dict(files)
+        extra_transport["bench/swerve/send_target.cc"] += (
+            '#include "talOS/rtms/rtms.h"\n'
         )
-        failures, out = run_sources(files, exempt_cli_files=exempt)
-        self.assertGreaterEqual(failures, 2, out)
-        self.assertIn("talOS/node/access.h", out)
-        self.assertIn("NodeAccess", out)
+        failures, out = run_sources(extra_transport, exempt_cli_files=exempt)
+        self.assertEqual(failures, 1, out)
+        self.assertIn("talOS/rtms/rtms.h", out)
 
-        # Removing the exempted includes makes the exemption stale and fails.
-        files["bench/swerve/send_target.cc"] = '#include <cstdio>\n'
-        failures, out = run_sources(files, exempt_cli_files=exempt)
+        # talOS/devices/access.h, talOS/node/access.h, NodeAccess, and token
+        # pasting are refused even inside send_target.cc (and even if someone
+        # tries to list access.h in the exemption map).
+        for label, bad_line, custom_exempt in (
+                ("devices_access", '#include "talOS/devices/access.h"\n', exempt),
+                ("devices_access_even_if_listed",
+                 '#include "talOS/devices/access.h"\n',
+                 {"bench/swerve/send_target.cc": frozenset({
+                     "talOS/ipc/publisher.h",
+                     "talOS/hardware/packet.h",
+                     "talOS/devices/access.h",
+                 })}),
+                ("node_access_header", '#include "talOS/node/access.h"\n', exempt),
+                ("node_access_symbol",
+                 'void f() { detail::NodeAccess::add_hardware_request(); }\n',
+                 exempt),
+                ("token_paste", '#define CAT(a, b) a##b\n', exempt)):
+            with self.subTest(case=label):
+                bad_files = dict(files)
+                bad_files["bench/swerve/send_target.cc"] += bad_line
+                failures, out = run_sources(bad_files, exempt_cli_files=custom_exempt)
+                self.assertGreaterEqual(failures, 1, f"{label}: {out}")
+
+        # Dropping one exempted header makes that header stale and fails.
+        shrunk = dict(files)
+        shrunk["bench/swerve/send_target.cc"] = '#include "talOS/ipc/publisher.h"\n'
+        failures, out = run_sources(shrunk, exempt_cli_files=exempt)
         self.assertEqual(failures, 1, out)
         self.assertIn("STALE non-node CLI exemption", out)
+        self.assertIn("talOS/hardware/packet.h", out)
 
     # REQ-SAFE-27
     def test_unreadable_file_fails_closed(self):
@@ -483,7 +630,7 @@ class CheckNodeSourcesTest(unittest.TestCase):
         failures = check_layers.run_source_checks(
             ["bench/arm/BUILD", "bench/arm/arm.cc"],
             broken_read,
-            exempt_cli_files=(),
+            exempt_cli_files={},
             out=out,
         )
         self.assertEqual(failures, 1, out.getvalue())
