@@ -575,25 +575,54 @@ inline hardware::MotorType ReadMotorType(const toml::table& t,
   throw std::invalid_argument(message);
 }
 
-inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
+inline void CheckDeviceKeys(const toml::table& t, const std::string& name,
+                            std::string_view kind,
+                            std::initializer_list<std::string_view> allowed) {
   for (auto&& [key, value] : t) {
-    const auto k = key.str();
-    if (k != "type" && k != "bus" && k != "can_id" && k != "inverted" &&
-        k != "brake" && k != "supply_limit_a" && k != "stator_limit_a" &&
-        k != "max_voltage" && k != "rotor_to_sensor_ratio" &&
-        k != "sensor_to_mechanism_ratio" && k != "continuous_wrap" &&
-        k != "soft_limits" && k != "reverse_limit_rot" &&
-        k != "forward_limit_rot" && k != "max_velocity_rps" &&
-        k != "cruise_velocity_rps" && k != "acceleration_rps2" &&
-        k != "jerk_rps3" && k != "follow" && k != "oppose_master" &&
-        k != "feedback" && k != "feedback_sensor" && k != "slot0" &&
-        k != "slot1" && k != "slot2" && k != "position_frame" &&
-        k != "forward_limit_switch" && k != "reverse_limit_switch" &&
-        k != "motor_type" && k != "foc" && k != "max_torque_current_a") {
-      throw std::invalid_argument("unknown motor key '" + std::string(k) +
-                                  "' for " + name);
+    if (std::find(allowed.begin(), allowed.end(), key.str()) == allowed.end()) {
+      std::string message = "unknown " + std::string(kind) + " key '" +
+                            std::string(key.str()) + "' for " + name;
+      if (key.source().path) {
+        message += " in " + *key.source().path;
+      }
+      throw std::invalid_argument(message);
     }
   }
+}
+
+inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
+  CheckDeviceKeys(t, name, "motor",
+                  {"type",
+                   "bus",
+                   "can_id",
+                   "inverted",
+                   "brake",
+                   "supply_limit_a",
+                   "stator_limit_a",
+                   "max_voltage",
+                   "rotor_to_sensor_ratio",
+                   "sensor_to_mechanism_ratio",
+                   "continuous_wrap",
+                   "soft_limits",
+                   "reverse_limit_rot",
+                   "forward_limit_rot",
+                   "max_velocity_rps",
+                   "cruise_velocity_rps",
+                   "acceleration_rps2",
+                   "jerk_rps3",
+                   "follow",
+                   "oppose_master",
+                   "feedback",
+                   "feedback_sensor",
+                   "slot0",
+                   "slot1",
+                   "slot2",
+                   "position_frame",
+                   "forward_limit_switch",
+                   "reverse_limit_switch",
+                   "motor_type",
+                   "foc",
+                   "max_torque_current_a"});
   if (Read<std::string>(t, "type", "TalonFX") != "TalonFX") {
     throw std::invalid_argument("unknown motor type for " + name);
   }
@@ -626,15 +655,9 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
     if (t.contains(slot_name) && !t[slot_name].is_table()) {
       throw std::invalid_argument(slot_name + " must be a table for " + name);
     }
-    if (auto* slot = t["slot" + std::to_string(s)].as_table()) {
-      for (auto&& [key, value] : *slot) {
-        const auto k = key.str();
-        if (k != "p" && k != "i" && k != "d" && k != "s" && k != "v" &&
-            k != "a" && k != "g" && k != "gravity_type") {
-          throw std::invalid_argument("unknown motor slot key '" +
-                                      std::string(k) + "' for " + name);
-        }
-      }
+    if (auto* slot = t[slot_name].as_table()) {
+      CheckDeviceKeys(*slot, name, "motor slot",
+                      {"p", "i", "d", "s", "v", "a", "g", "gravity_type"});
       auto& g = m.slots[s];
       g.p = Read(*slot, "p", g.p);
       g.i = Read(*slot, "i", g.i);
@@ -650,7 +673,7 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
         g.gravity_type = hardware::GravityType::kArmCosine;
       } else {
         throw std::invalid_argument("unknown gravity_type for motor " + name +
-                                    " slot" + std::to_string(s));
+                                    " " + slot_name);
       }
     }
   }
@@ -722,21 +745,6 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   }
   raw.config = std::move(m);
   return raw;
-}
-
-inline void CheckDeviceKeys(const toml::table& t, const std::string& name,
-                            std::string_view kind,
-                            std::initializer_list<std::string_view> allowed) {
-  for (auto&& [key, value] : t) {
-    if (std::find(allowed.begin(), allowed.end(), key.str()) == allowed.end()) {
-      std::string message = "unknown " + std::string(kind) + " key '" +
-                            std::string(key.str()) + "' for " + name;
-      if (key.source().path) {
-        message += " in " + *key.source().path;
-      }
-      throw std::invalid_argument(message);
-    }
-  }
 }
 
 // A digital input, with its simulated home switch (DigitalInputConfig::

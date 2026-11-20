@@ -701,6 +701,23 @@ TEST_F(ManifestTest, MotorTypeSetsThePhysicsModelAndRefusesUnknownTypes) {
   }
 }
 
+TEST_F(ManifestTest, UnknownMotorKeyReportsSubsystemFilePath) {
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"lift\"\npath = \"subsystems/lift.toml\"\n");
+  Write("subsystems/lift.toml",
+        "[subsystem]\nname = \"lift\"\n[motors.winch]\ncan_id = 1\n"
+        "unknown_key = 1\n");
+  try {
+    ParseRobotConfig(Robot());
+    ADD_FAILURE() << "an unknown motor key was accepted";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    for (const char* part : {"unknown_key", "winch", "subsystems/lift.toml"}) {
+      EXPECT_NE(what.find(part), std::string::npos) << what;
+    }
+  }
+}
+
 // A simulated home switch is bound in configuration, but only sim_gateway
 // --physics reads it: the RoboRIO's config, and so its ConfigurationId, is
 // the same with and without it, and a key that could not bind is refused
