@@ -1059,3 +1059,32 @@ test('bucketSeries inserts uPlot gap breaks only at real gaps and run restarts',
   assert.deepEqual(plotted, [1, null, 2]);
   rec.close();
 });
+
+// REQ-OPS-41: for target-lane channels (<subsystem>/target/<source>/*), the
+// writer process is <source>, not <subsystem>: a <source> gap or restart breaks
+// its target lane, while a <subsystem> crash/restart does not spuriously break it.
+test('bucketSeries attributes target-lane breaks to the source writer, not the subsystem', () => {
+  const buckets = decodeSeries(seriesBuffer([
+    {t: [2e9, 5e9, 8e9], min: [1, 2, 3], max: [1, 2, 3], last: [1, 2, 3], count: [1, 1, 1]},
+    {t: [2e9, 5e9, 8e9], min: [10, 20, 30], max: [10, 20, 30], last: [10, 20, 30], count: [1, 1, 1]}
+  ]), 2);
+  const gaps: ReviewGap[] = [
+    gap({process: 'teleop', start_ns: '3000000000', end_ns: '4000000000'})
+  ];
+  const runs = [
+    // Zero-width run_restart (prev.end_ns === null) on drivetrain at 6.5 s
+    // must NOT spuriously break drivetrain/target/teleop/vx_mps.
+    {node: 'drivetrain', start_ns: '0', end_ns: null, reason: 'crash'},
+    {node: 'drivetrain', start_ns: '6500000000', end_ns: '10000000000', reason: 'stop'}
+  ];
+  const series = bucketSeries(
+      ['drivetrain/target/teleop/vx_mps', 'drivetrain/state/vx_mps'],
+      buckets, '0', 0n, 10_000_000_000n, gaps, runs);
+  assert.deepEqual([...series.times], [2, 3.5, 5, 6.5, 8]);
+  assert.deepEqual(plotColumn(series.values['drivetrain/target/teleop/vx_mps'],
+                              series.count!['drivetrain/target/teleop/vx_mps']),
+                   [1, null, 2, undefined, 3]);
+  assert.deepEqual(plotColumn(series.values['drivetrain/state/vx_mps'],
+                              series.count!['drivetrain/state/vx_mps']),
+                   [10, undefined, 20, null, 30]);
+});

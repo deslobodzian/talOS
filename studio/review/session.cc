@@ -1,6 +1,7 @@
 #include "studio/review/session.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -140,6 +141,82 @@ bool SelectCanonicalAlertStream(TopicBuild& topic,
 }
 
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
+constexpr std::uintmax_t kMaxConfigBytes = std::uintmax_t{1} << 20;
+
+// Reads a regular TOML file up to kMaxConfigBytes without hanging on FIFOs or
+// device nodes or allocating unbounded memory (REQ-OPS-42).
+std::optional<toml::table> ReadBoundedToml(const fs::path& path) {
+  std::error_code ec;
+  const fs::file_status st = fs::status(path, ec);
+  if (ec || !fs::is_regular_file(st)) return std::nullopt;
+  const std::uintmax_t bytes = fs::file_size(path, ec);
+  if (ec || bytes == 0 || bytes > kMaxConfigBytes) return std::nullopt;
+  std::ifstream stream{path, std::ios::binary};
+  if (!stream.is_open()) return std::nullopt;
+  std::string content;
+  content.reserve(static_cast<std::size_t>(bytes));
+  std::array<char, 8192> chunk{};
+  while (stream) {
+    stream.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    const std::streamsize got = stream.gcount();
+    if (got <= 0) break;
+    if (content.size() + static_cast<std::size_t>(got) > kMaxConfigBytes) {
+      return std::nullopt;
+    }
+    content.append(chunk.data(), static_cast<std::size_t>(got));
+  }
+  if (stream.bad() || content.empty()) return std::nullopt;
+  try {
+    return toml::parse(content, path.string());
+  } catch (const toml::parse_error&) {
+    return std::nullopt;
+  }
+}
+
+// Extracts `[studio] pose_topic` from `config_path` (following at most one
+// direct top-level `include`, matching ResolveRobotConfig without expanding
+// subsystem manifests or unbounded includes). Returns std::nullopt on any
+// missing, non-regular, oversized, or unparseable file.
+std::optional<std::string> ReadPoseTopicFromConfig(
+    const fs::path& config_path) {
+  const auto extract =
+      [](const toml::table& tbl,
+         bool& explicit_invalid) -> std::optional<std::string> {
+    if (!tbl.contains("studio")) return std::nullopt;
+    const auto* studio = tbl["studio"].as_table();
+    if (studio == nullptr) {
+      explicit_invalid = true;
+      return std::nullopt;
+    }
+    if (!studio->contains("pose_topic")) return std::nullopt;
+    const auto val = (*studio)["pose_topic"].value_exact<std::string>();
+    if (!val || val->empty()) {
+      explicit_invalid = true;
+      return std::nullopt;
+    }
+    return *val;
+  };
+
+  const auto root = ReadBoundedToml(config_path);
+  if (!root) return std::nullopt;
+  bool explicit_invalid = false;
+  if (auto pose = extract(*root, explicit_invalid)) return pose;
+  if (explicit_invalid) return std::nullopt;
+
+  if (root->contains("include")) {
+    const auto inc = (*root)["include"].value_exact<std::string>();
+    if (!inc || inc->empty()) return std::nullopt;
+    const fs::path base_dir = config_path.parent_path();
+    const fs::path inc_rel{*inc};
+    const fs::path inc_path = inc_rel.is_absolute() || base_dir.empty()
+                                  ? inc_rel
+                                  : base_dir / inc_rel;
+    const auto base = ReadBoundedToml(inc_path);
+    if (!base) return std::nullopt;
+    return extract(*base, explicit_invalid);
+  }
+  return std::nullopt;
+}
 
 ModeKind ModeFromDriverStation(
     const std::array<std::uint64_t,
@@ -705,12 +782,8 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   const std::string config_path =
       talos::launcher::SessionConfigPath("", {dir.string()});
   if (!config_path.empty()) {
-    try {
-      session->pose_topic_ =
-          talos::config::ParseRobotConfig(config_path).studio.pose_topic;
-    } catch (const std::exception&) {
-      // A missing, moved, or unreadable config leaves pose_topic unset; Studio
-      // falls back to estimator discovery.
+    if (auto pose = ReadPoseTopicFromConfig(config_path)) {
+      session->pose_topic_ = std::move(*pose);
     }
   }
   return session;
