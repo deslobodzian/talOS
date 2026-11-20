@@ -3,9 +3,12 @@ from the session it records.
 
     sim_check.py --sim RLOCATION --settle-s N --log-dump RLOCATION
         --session-report RLOCATION --registry-unlink RLOCATION
+        [--studio-bridge]
 
 It runs `<sim> --output-dir <tmp> --remote 127.0.0.1 --remote-port P
---local-port Q --duration-s <backstop>` on free loopback ports (the duration
+--local-port Q --duration-s <backstop>` (plus `--start-studio-bridge
+--studio-http-port 0` when `--studio-bridge` is given) on free loopback
+ports (the duration
 lies past every bound below and only ends a launch whose check was killed
 outright; the check stops the launch itself), and waits for
 two events: the bridge has accepted a State (its `hardware_node: gateway
@@ -13,13 +16,18 @@ boot ` line in `<session>/hardware_node.log`, printed on the first State it
 accepts from each gateway boot), and every member of the session's manifest
 has a run whose loop has started (the manifest's per-node `realtime`, which
 the launcher records from the run's registry row once the node reports it,
-right before its loop runs, and posts as a manifest version). It wakes on
+right before its loop runs, and posts as a manifest version). With
+`--studio-bridge`, when `studio_bridge` is in the manifest, it also waits
+for `studio_bridge` to record a bound `http_port` and for the launcher's
+`Started studio_bridge` line in `<session>/talos.log` (printed only once
+the bridge has run past `kStudioBridgeSettleInterval`, so stopping it sends
+SIGINT rather than SIGKILL). It wakes on
 file events (inotify on Linux, kqueue on macOS) and on the launch's exit,
-never on a timer. Once both hold, the session runs `settle_s` more and then
+never on a timer. Once ready, the session runs `settle_s` more and then
 gets SIGINT, so the launcher stops it in order. A member whose run ends
-before then ends the wait at once. So a slow-starting member (a Python node
-importing a large library, a loaded host) delays the stop, and only the
-hang bound below can fail a session for being slow.
+or restarts before then ends the wait at once. So a slow-starting member (a
+Python node importing a large library, a loaded host) delays the stop, and
+only the hang bound below can fail a session for being slow.
 
 A caller of check() that expects no State (a test of this check) can bound
 the wait for the State alone by `state_s`, counted from the moment every
@@ -83,13 +91,19 @@ import time
 
 from python.runfiles import runfiles
 
-# talOS/launcher/roster.h kHardwareNodeName and kSimGatewayName: the names
-# the launcher gives the bridge and the simulator in every session.
+# talOS/launcher/roster.h kHardwareNodeName, kSimGatewayName and
+# kStudioBridgeName: the names the launcher gives the bridge, the simulator
+# and Studio's bridge in every session.
 BRIDGE = "hardware_node"
 SIMULATOR = "sim_gateway"
+STUDIO_BRIDGE = "studio_bridge"
 # What the bridge prints on the first State it accepts from a gateway boot
 # (HardwareNode::ReportGatewayBuild), which the launcher writes to its log.
 FIRST_STATE_LINE = "hardware_node: gateway boot "
+# What the launcher writes to talos.log once studio_bridge has both bound its
+# HTTP port and run past kStudioBridgeSettleInterval (StudioBridge::Supervise /
+# Watch). Stopping before this line SIGKILLs the settling bridge.
+STUDIO_STARTED_LINE = "[launcher] Started studio_bridge (pid "
 # What readiness() waits for until FIRST_STATE_LINE is in the bridge's log.
 WAITING_FOR_STATE = "a State accepted by the bridge"
 
@@ -308,10 +322,22 @@ class Watch:
             self._queue.close()
 
 
-def readiness(session):
-    """(done, waiting for): done once the bridge has accepted a State and
-    every member's loop has started, or as soon as any member's run has
-    ended, which no wait can mend."""
+def valid_http_port(value):
+    """Whether `value` is a bound TCP port number in [1, 65535]."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= 65535)
+
+
+def readiness(session, studio=False):
+    """(done, waiting for): done once the bridge has accepted a State, every
+    member's loop has started, and (with `studio`, when studio_bridge is in
+    the manifest) studio_bridge has recorded a bound http_port and settled
+    past kStudioBridgeSettleInterval; or as soon as any member's run has
+    ended or restarted, which no wait can mend. When `studio` is True and
+    studio_bridge is absent from a populated manifest (dropped because it was
+    not configured or did not answer --describe), readiness does not wait on
+    it so judge() fails it after the stop rather than hanging until the
+    timeout."""
     waiting = []
     try:
         with open(os.path.join(session, f"{BRIDGE}.log"), "rb") as f:
@@ -323,21 +349,36 @@ def readiness(session):
         with open(os.path.join(session, "manifest.json"),
                   encoding="utf-8") as f:
             nodes = json.load(f)["nodes"]
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, TypeError):
         return False, waiting + ["the session manifest"]
+    if not nodes:
+        return False, waiting + ["the session roster"]
     starting = []
+    studio_node = None
     for node in nodes:
+        if node.get("name") == STUDIO_BRIDGE:
+            studio_node = node
         runs = node.get("runs") or []
-        if runs and runs[-1].get("end_wall_ns"):
+        if (len(runs) > 1 or node.get("runs_dropped", 0) > 0
+                or (runs and runs[-1].get("end_wall_ns"))):
             return True, []
         if not runs or not node.get("realtime"):
             starting.append(node["name"])
     if starting:
         waiting.append(f"the loops of {', '.join(starting)} to start")
+    if studio and studio_node is not None:
+        if not valid_http_port(studio_node.get("http_port")):
+            waiting.append(f"{STUDIO_BRIDGE} to bind its HTTP port")
+        try:
+            with open(os.path.join(session, "talos.log"), "rb") as f:
+                if STUDIO_STARTED_LINE.encode() not in f.read():
+                    waiting.append(f"{STUDIO_BRIDGE} to settle")
+        except OSError:
+            waiting.append(f"{STUDIO_BRIDGE} to settle")
     return not waiting, waiting
 
 
-def wait_ready(launch, out, timeout_s, state_s=None):
+def wait_ready(launch, out, timeout_s, state_s=None, studio=False):
     """Waits for readiness() of the session the launch writes under `out`,
     for the launch's exit, or `timeout_s`: returns the problem, empty when
     ready or the launch exited. With `state_s`, once every member's loop has
@@ -350,6 +391,7 @@ def wait_ready(launch, out, timeout_s, state_s=None):
         watch.add(out, directory=True)
         session = None
         log_watched = False
+        talos_log_watched = False
         waiting = ["the session directory"]
         while launch.process.poll() is None:
             # Watches are added before the files are read, so a change
@@ -365,7 +407,12 @@ def wait_ready(launch, out, timeout_s, state_s=None):
                 if not log_watched and os.path.exists(log):
                     watch.add(log, directory=False)
                     log_watched = True
-                done, waiting = readiness(session)
+                if studio and not talos_log_watched:
+                    talos_log = os.path.join(session, "talos.log")
+                    if os.path.exists(talos_log):
+                        watch.add(talos_log, directory=False)
+                        talos_log_watched = True
+                done, waiting = readiness(session, studio=studio)
                 if done:
                     return ""
                 if (state_s is not None and state_deadline is None
@@ -473,7 +520,7 @@ def controller_link(session, log_dump, report):
     return passes, f"{verdict}: {detail}"
 
 
-def judge(session, log_dump, report):
+def judge(session, log_dump, report, studio=False):
     """The session's problems (module docstring), empty if it passes."""
     try:
         with open(os.path.join(session, "manifest.json"),
@@ -492,9 +539,11 @@ def judge(session, log_dump, report):
     if manifest.get("stopped_before_start"):
         problems.append("the session stopped before every member started")
     names = []
+    by_name = {}
     for node in nodes:
         name = node["name"]
         names.append(name)
+        by_name[name] = node
         runs = node.get("runs", [])
         count = len(runs) + node.get("runs_dropped", 0)
         if count != 1:
@@ -509,9 +558,37 @@ def judge(session, log_dump, report):
     if SIMULATOR not in names:
         problems.append(f"no {SIMULATOR} in the session: it ran without a "
                         "simulator")
-    if not set(names) - {BRIDGE, SIMULATOR}:
+    if not set(names) - {BRIDGE, SIMULATOR, STUDIO_BRIDGE}:
         problems.append(f"no node besides {BRIDGE} and {SIMULATOR} ran: "
                         f"{names}")
+    if studio:
+        bridge = by_name.get(STUDIO_BRIDGE)
+        if bridge is None:
+            problems.append(
+                f"no {STUDIO_BRIDGE} in the session manifest: it was not "
+                "configured, missing from runfiles, or did not answer "
+                "--describe")
+        else:
+            port = bridge.get("http_port")
+            if not valid_http_port(port):
+                problems.append(
+                    f"{STUDIO_BRIDGE} did not record a valid http_port "
+                    f"(got {port!r})")
+            if ((bridge.get("exit_code", 0), bridge.get("exit_signal", 0))
+                    != (0, 0) and not bridge.get("runs")):
+                problems.append(
+                    f"{STUDIO_BRIDGE} ended with exit code "
+                    f"{bridge.get('exit_code')}, signal "
+                    f"{bridge.get('exit_signal')}")
+            restarts = bridge.get("restart_count", 0)
+            if restarts != 0:
+                problems.append(
+                    f"{STUDIO_BRIDGE} restarted {restarts} times "
+                    "(restart_count must be 0)")
+            if bridge.get("recorder_failed", False):
+                problems.append(
+                    f"{STUDIO_BRIDGE} is marked recorder_failed in the "
+                    "session manifest")
     passes, verdict = controller_link(session, log_dump, report)
     if not passes:
         problems.append(f"controller link {verdict}")
@@ -534,11 +611,13 @@ def ready_bound(settle_s):
 
 
 def check(sim, settle_s, log_dump, session_report, registry_unlink,
-          ready_s, state_s=None):
+          ready_s, state_s=None, studio=False):
     """Runs `sim`, waits up to `ready_s` for it to be ready (with `state_s`,
-    for the State only `state_s` past every member's loop starting; module
-    docstring), lets it run `settle_s` more, stops it and judges it:
-    (problems, diagnostics); no problems is a pass."""
+    for the State only `state_s` past every member's loop starting; with
+    `studio`, also starts Studio's bridge on an ephemeral HTTP port and
+    judges it in the manifest; module docstring), lets it run `settle_s`
+    more, stops it and judges it: (problems, diagnostics); no problems is a
+    pass."""
     report = load_session_report(session_report)
     gateway_port, bridge_port = udp_ports()
     with tempfile.TemporaryDirectory(
@@ -555,11 +634,14 @@ def check(sim, settle_s, log_dump, session_report, registry_unlink,
                 "--remote-port", str(gateway_port),
                 "--local-port", str(bridge_port),
                 "--duration-s", str(backstop_s)]
+        if studio:
+            args += ["--start-studio-bridge", "--studio-http-port", "0"]
         problems = []
         try:
             with open(output_path, "wb") as output, \
                     Launch(args, output) as launch:
-                unready = wait_ready(launch, out, ready_s, state_s)
+                unready = wait_ready(launch, out, ready_s, state_s,
+                                     studio=studio)
                 if unready:
                     problems.append(unready)
                 elif launch.process.poll() is None:
@@ -595,7 +677,8 @@ def check(sim, settle_s, log_dump, session_report, registry_unlink,
                 problems.append(f"expected one session directory, found "
                                 f"{sessions}")
             else:
-                problems += judge(sessions[0], log_dump, report)
+                problems += judge(sessions[0], log_dump, report,
+                                  studio=studio)
     return problems, diagnostics
 
 
@@ -612,6 +695,10 @@ def main(argv):
                  "--registry-unlink"):
         parser.add_argument(flag, required=True)
     parser.add_argument("--settle-s", type=int, required=True)
+    parser.add_argument(
+        "--studio-bridge", action="store_true",
+        help="start Studio's bridge on an ephemeral HTTP port and require "
+             "it to run cleanly in the manifest")
     args = parser.parse_args(argv)
     # Bazel ends a test at its timeout with SIGTERM: leave through the
     # finally blocks, which stop the launch, as Ctrl-C does.
@@ -623,7 +710,7 @@ def main(argv):
     problems, diagnostics = check(
         rlocation(args.sim), args.settle_s, rlocation(args.log_dump),
         rlocation(args.session_report), rlocation(args.registry_unlink),
-        ready_s)
+        ready_s, studio=args.studio_bridge)
     if problems:
         print(diagnostics, file=sys.stderr)
         print("sim_check: FAILED\n" + "\n".join(f"  {p}" for p in problems),

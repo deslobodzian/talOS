@@ -90,11 +90,12 @@ unless ARGS include `--start-studio-bridge`. The simulator is the one
 `data`. The launcher gives it the bridge's ports (`[robot] controller_port`
 and `local_port`, or ARGS' `--remote-port` and `--local-port`).
 
-`sim_smoke_test` is `talos_sim_test(sim = ":sim")`: it runs `//:sim` with
-those two flags on free ports until the bridge has accepted a State and
-every member's loop has started, then 1 s more, stops it, and fails unless
-every member the session records ran once and exited 0 and the bridge
-received State from the simulator. A robot repository adds the same few lines; what the check
+`sim_smoke_test` is `talos_sim_test(sim = ":sim", studio = True)`: it runs `//:sim` with
+those two flags and `--start-studio-bridge --studio-http-port 0` until the bridge has
+accepted a State, `studio_bridge` has settled on its ephemeral port, and every member's
+loop has started, then 1 s more, stops it, and fails unless every member the session
+records (including `studio_bridge`) ran once and exited 0 and the bridge received State
+from the simulator. A robot repository adds the same few lines; what the check
 judges is in `talos_sim_test`'s docstring (`talOS/build/contract.bzl`).
 
 ## Studio
@@ -127,15 +128,16 @@ next `bazel run //:sim` serves them. This robot has no `[studio] dashboard`
 layout, so `/drive` shows no widgets
 ([talOS/telemetry](../../talOS/telemetry/README.md#dashboard-layout)).
 
-`studio_test` runs `//:sim --start-studio-bridge` on free ports until the
-launcher reports the bridge up. It requires `/drive` to answer with the page
+`studio_test` runs `//:sim --start-studio-bridge --studio-http-port 0` until the
+manifest records the bridge's bound `http_port`. It requires `/drive` to answer with the page
 when `//:studio_webroot` holds no `NOT_BUILT.txt`, else with that command
 naming `//:studio_webroot`'s folder and a talOS checkout that exists (so a
 webroot the config or `//:sim`'s `data` miswires fails it). It then stops
 the session and requires the bridge to have run once and exited 0. It runs
 outside Bazel's sandbox, which would stage each page as a link out of the
-webroot, a file the bridge does not serve. It is not a `talos_sim_test`, which waits for every
-member's registry row; the bridge takes none.
+webroot, a file the bridge does not serve. Unlike `sim_smoke_test` (which
+checks process lifecycle and registration via `talos_sim_test(..., studio = True)`),
+`studio_test` verifies the served HTTP `/drive` and webroot responses.
 
 `robot_bundle` carries no Studio: `talos_bundle` refuses a webroot without
 `index.html`, and this fixture's checks run where the pages are not built.

@@ -7,6 +7,7 @@ load(
     "TALOS_TOPIC_DIRECTION_SUFFIXES",
     "TALOS_TOPIC_ROLES",
     "talos_sim",
+    "talos_sim_test",
     "talos_topic_problem",
 )
 
@@ -88,6 +89,73 @@ py_test(
     # ~194 ms of kernel CPU (vs 0.5/2 ms plain), so on a 3-vCPU hosted runner
     # session start-up overruns the 14 s ready bound (TODO.md CI-13). The
     # Linux sanitizer legs still run this test.
+    tags = [
+        "e2e",
+        "no_macos_sanitizer",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+# The session sim_check_studio_pass_test judges: telemetry, the hardware
+# bridge, sim_gateway, and the testdata studio_bridge stub.
+talos_sim(
+    name = "studio_sim",
+    testonly = True,
+    config = "//talOS/build/testdata/sim_check:studio_robot.toml",
+    data = [
+        "//talOS/build/testdata/sim_check:studio_bridge",
+        "//talOS/simulation:sim_gateway",
+    ],
+    nodes = ["//talOS/telemetry:node"],
+)
+
+# e2e (REQ-DEV-30, REQ-OPS-30, REQ-OPS-34): talos_sim_test(studio = True)
+# passes when studio_bridge is present, binds an ephemeral HTTP port, settles,
+# and exits cleanly on SIGINT.
+talos_sim_test(
+    name = "sim_check_studio_pass_test",
+    sim = ":studio_sim",
+    studio = True,
+    # Same macOS TSan fork/exec overhead as sim_check_no_state_test (CI-13).
+    tags = ["no_macos_sanitizer"],
+)
+
+# Same config without studio_bridge in runfiles: the launcher drops the
+# unanswered bridge from the roster and manifest (DropUnansweredStudioBridge),
+# which sim_check_studio_test proves sim_check(studio=True) catches.
+talos_sim(
+    name = "missing_studio_sim",
+    testonly = True,
+    config = "//talOS/build/testdata/sim_check:studio_robot.toml",
+    data = ["//talOS/simulation:sim_gateway"],
+    nodes = ["//talOS/telemetry:node"],
+)
+
+# e2e (REQ-DEV-30, REQ-OPS-30, REQ-OPS-34): sim_check(studio=True) fails
+# cleanly without hanging when studio_bridge is missing from the session
+# manifest, and judge(studio=True) rejects missing/bad http_port, restarts,
+# recorder_failed, and nonzero exit/signal.
+py_test(
+    name = "sim_check_studio_test",
+    size = "medium",
+    timeout = "short",
+    srcs = [
+        "sim_check.py",
+        "sim_check_studio_test.py",
+    ],
+    data = [
+        ":missing_studio_sim",
+        ":registry_unlink",
+        "//talOS/launcher:log_dump",
+        "//talOS/launcher:session_report",
+    ],
+    env = {
+        "LOG_DUMP": "$(rlocationpath //talOS/launcher:log_dump)",
+        "MISSING_STUDIO_SIM": "$(rlocationpath :missing_studio_sim)",
+        "REGISTRY_UNLINK": "$(rlocationpath :registry_unlink)",
+    },
+    legacy_create_init = False,
+    # Same macOS TSan fork/exec overhead as sim_check_no_state_test (CI-13).
     tags = [
         "e2e",
         "no_macos_sanitizer",

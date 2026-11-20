@@ -1,0 +1,23 @@
+# sim_check_studio_pass_test and sim_check_studio_test's session: talOS's
+# telemetry node beside the hardware bridge, the real sim_gateway, and the
+# testdata studio_bridge stub (kept inside talOS/ to respect RULES.md 5).
+[robot]
+name = "sim_check_studio_test"
+period_us = 5000
+command_timeout_us = 100000
+commissioned = false
+sim_gateway = "//talOS/simulation:sim_gateway"
+controller_address = "127.0.0.1"
+
+[robot.targets]
+teleop = []
+autonomous = []
+test = []
+
+[studio]
+bridge = "//talOS/build/testdata/sim_check:studio_bridge"
+topic = "/talos/telemetry"
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+period_us = 10000

@@ -1242,7 +1242,7 @@ _LOG_DUMP = Label("//talOS/launcher:log_dump")
 _SESSION_REPORT = Label("//talOS/launcher:session_report")
 _REGISTRY_UNLINK = Label("//talOS/build:registry_unlink")
 
-def talos_sim_test(name, sim, settle_s = 1, **kwargs):
+def talos_sim_test(name, sim, settle_s = 1, studio = False, **kwargs):
     """Runs the talos_sim target `sim` until it is up, stops it and judges its session.
 
     The session runs until the bridge has accepted a State from the
@@ -1254,7 +1254,13 @@ def talos_sim_test(name, sim, settle_s = 1, **kwargs):
     every member of the session's manifest ran exactly once and exited with
     code 0 and no signal; the session holds the simulator and a node besides
     it and the hardware bridge; and the bridge received State (session_report's
-    "controller link" verdict). The check is talOS/build/sim_check.py.
+    "controller link" verdict). When `studio` is True, the session also starts
+    Studio's bridge on an ephemeral HTTP port (`--start-studio-bridge
+    --studio-http-port 0`), waits for it to bind its port and settle past the
+    launcher's settle interval, and fails unless `studio_bridge` appears in the
+    manifest with a valid `http_port`, 1 clean run (`exit_code == 0`,
+    `exit_signal == 0`), `restart_count == 0`, and `recorder_failed == False`.
+    The check is talOS/build/sim_check.py.
 
     Tagged `e2e` (it runs the whole config) and `exclusive` (it does, on as
     many cores as the robot uses), as Bazel's `medium` size (its `moderate`
@@ -1267,27 +1273,32 @@ def talos_sim_test(name, sim, settle_s = 1, **kwargs):
         member that fails soon after starting fails the test. It does not
         bound startup. A value leaving less than 10 s of the timeout for
         startup, after 45 s for the stop, fails the test before it starts.
+      studio: whether to start and verify the supervised Studio bridge
+        (`--studio-bridge`).
       **kwargs: passed to py_test.
     """
     sim_label = native.package_relative_label(sim)
     tags = kwargs.pop("tags", [])
+    args = [
+        "--sim",
+        "$(rlocationpath %s)" % sim_label,
+        "--settle-s",
+        str(settle_s),
+        "--log-dump",
+        "$(rlocationpath %s)" % _LOG_DUMP,
+        "--session-report",
+        _rlocation(_SESSION_REPORT.same_package_label("session_report.py")),
+        "--registry-unlink",
+        "$(rlocationpath %s)" % _REGISTRY_UNLINK,
+    ]
+    if studio:
+        args.append("--studio-bridge")
     py_test(
         name = name,
         size = kwargs.pop("size", "medium"),
         srcs = [_SIM_CHECK],
         main = _SIM_CHECK,
-        args = [
-            "--sim",
-            "$(rlocationpath %s)" % sim_label,
-            "--settle-s",
-            str(settle_s),
-            "--log-dump",
-            "$(rlocationpath %s)" % _LOG_DUMP,
-            "--session-report",
-            _rlocation(_SESSION_REPORT.same_package_label("session_report.py")),
-            "--registry-unlink",
-            "$(rlocationpath %s)" % _REGISTRY_UNLINK,
-        ],
+        args = args,
         data = [sim_label, _LOG_DUMP, _SESSION_REPORT, _REGISTRY_UNLINK],
         legacy_create_init = False,
         tags = tags + [tag for tag in ["e2e", "exclusive"] if tag not in tags],
