@@ -35,6 +35,7 @@ cc_library(
 # bridge, a command-line tool) does not pull in an event loop.
 cc_library(
     name = "registry",
+    srcs = ["registry.cc"],
     hdrs = ["registry.h"],
     deps = [
         ":lock_file",
