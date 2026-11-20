@@ -133,8 +133,8 @@ LogWriter::LogWriter(std::string_view path, std::string_view process_name,
   // A background writer's file is created by its thread (open_file): the
   // constructor runs on the thread that will run the loop.
   if (options.background) return;
-  state_->fd =
-      ::open(std::string{path}.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  state_->fd = ::open(std::string{path}.c_str(),
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 
   if (state_->fd < 0) {
     throw std::system_error(errno, std::generic_category(),
@@ -344,7 +344,10 @@ void LogWriter::State::mark_capped() noexcept {
               std::strerror(errno));
     return;
   }
-  ::fsync(marker_fd);
+  if (process::DurableSync(marker_fd) != 0) {
+    set_error(std::string{"LogWriter: cannot sync "} + marker + ": " +
+              std::strerror(errno));
+  }
   ::close(marker_fd);
 }
 
@@ -667,7 +670,7 @@ void LogWriter::State::open_file() noexcept {
     mark_capped();
     return;
   }
-  fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) {
     // Sticky: append() accepts nothing more, and write_chunk() drops what
     // was already handed over, so drain() and destruction still return.
