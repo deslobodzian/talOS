@@ -11,6 +11,7 @@ exports_files(
 
 cc_library(
     name = "configuration",
+    srcs = ["config_parser.cc"],
     hdrs = ["config_parser.h"],
     visibility = ["//visibility:public"],
     deps = [
