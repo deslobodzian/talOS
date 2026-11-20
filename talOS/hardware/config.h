@@ -33,8 +33,14 @@ template <std::size_t Capacity>
 class FixedString {
  public:
   constexpr FixedString() noexcept = default;
+  // Implicit conversions match std::string so designated initializers
+  // (e.g. `.name = "drive"`) and std::string_view callers stay
+  // source-compatible.
+  // NOLINTNEXTLINE(google-explicit-constructor)
   FixedString(const char* s) noexcept { assign(s); }
+  // NOLINTNEXTLINE(google-explicit-constructor)
   FixedString(std::string_view s) noexcept { assign(s); }
+  // NOLINTNEXTLINE(google-explicit-constructor)
   FixedString(const std::string& s) noexcept {
     assign(std::string_view{s.data(), s.size()});
   }
@@ -91,6 +97,7 @@ class FixedString {
   constexpr std::string_view view() const noexcept {
     return {data_.data(), size_};
   }
+  // NOLINTNEXTLINE(google-explicit-constructor)
   constexpr operator std::string_view() const noexcept { return view(); }
   std::string str() const { return std::string(data_.data(), size_); }
   constexpr const char* c_str() const noexcept { return data_.data(); }

@@ -517,9 +517,9 @@ class BundleBuilderTest(unittest.TestCase):
 
     # REQ-OPS-34
     def test_run_script_starts_a_carried_studio_unless_declined(self):
-        # The boot service runs run.sh bare, so the default is what a booted
-        # robot gets. --no-studio is run.sh's own and must not reach the
-        # launcher, which would refuse it.
+        # The boot service runs run.sh --serve-refusal without --no-studio, so
+        # the default is what a booted robot gets. --no-studio is run.sh's own
+        # and must not reach the launcher, which would refuse it.
         for carried, given, starts in ((True, [], True),
                                        (True, ["--no-studio"], False),
                                        (False, [], False)):

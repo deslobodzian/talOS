@@ -1158,7 +1158,7 @@ Record each step, dated, in [BENCH_RESULTS.md](BENCH_RESULTS.md).
 
 ## Boot operation
 
-The boot service runs `run.sh` with no arguments, so it uses
+The boot service runs `run.sh --serve-refusal` (passing no `--remote` override), so it uses
 `robot_bench.toml`'s robot-network address (`10.56.87.2`) and cannot reach
 this bench's RoboRIO ([bench network](#bench-network)); on the Mini it also
 needs FileVault off (TODO.md DEPLOY-8). These checks run on the robot
