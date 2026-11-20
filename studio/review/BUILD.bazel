@@ -1,4 +1,4 @@
-load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -90,7 +90,11 @@ cc_library(
 # decodes them with studio/src/data/review.ts, so a shape change on either
 # side fails the other side's test (studio/README.md, "Reviewing a
 # session", says how to update them).
-js_library(
+# copy_to_bin, not rules_js's js_library: this package stays free of
+# aspect_rules_js, a development dependency of talOS that a dependent module
+# does not get. The copies sit in the output tree, where //studio's js_test
+# reads data.
+copy_to_bin(
     name = "golden",
     srcs = glob(["testdata/golden/*"]),
     visibility = ["//studio:__pkg__"],
