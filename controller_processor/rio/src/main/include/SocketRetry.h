@@ -32,8 +32,9 @@
 // observation age). Only a tick with no socket open (an attempt failed, or
 // none is due yet) ticks the gateway disabled and sends nothing. Any other
 // send error (ENOBUFS, ECONNREFUSED, ...) clears on the same socket and
-// keeps it; EAGAIN is reported as kWouldBlock, counted and logged via
-// SendWouldBlock while keeping the socket open without triggering a reopen.
+// keeps it; EAGAIN is reported as kWouldBlock via SendWouldBlock while keeping
+// the socket open without triggering a reopen (the cumulative count lives on
+// RuntimeUdpPeer::stats().send_would_block).
 // Every other failed send is counted in its spell (SendEvent), which the loop
 // reports when it starts and when sends succeed again, so a failure that keeps
 // the socket shows on the console too.
@@ -131,11 +132,9 @@ class SocketRetry {
 
   // A non-blocking send on the open socket returned UdpStatus::kWouldBlock
   // (EAGAIN/EWOULDBLOCK, send buffer full). Keeps the socket open without
-  // triggering a reopen, leaves any open failing spell untouched, and counts
-  // the drop.
-  SendEvent SendWouldBlock() {
+  // triggering a reopen and leaves any open failing spell untouched.
+  SendEvent SendWouldBlock() const {
     if (!open_) return SendEvent::kNone;
-    ++would_block_count_;
     return SendEvent::kWouldBlock;
   }
 
@@ -155,8 +154,6 @@ class SocketRetry {
     }
     return SendEvent::kNone;
   }
-
-  uint64_t would_block_count() const { return would_block_count_; }
 
   // The current or last spell: its failed sends, the times of the first and
   // the last, the error its kFailing named, and the last send error.
@@ -192,7 +189,6 @@ class SocketRetry {
   uint64_t spell_last_failure_us_{0};
   int spell_error_{0};
   int last_send_error_{0};
-  uint64_t would_block_count_{0};
 };
 
 }  // namespace talos::rio

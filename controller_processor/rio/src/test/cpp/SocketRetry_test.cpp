@@ -194,17 +194,16 @@ TEST(SocketRetry, AFailingSpellThatKeepsTheSocketReportsItsStartAndEnd) {
 }
 
 // A non-blocking send refused with EAGAIN / EWOULDBLOCK
-// (UdpStatus::kWouldBlock, send buffer full) is counted and reported to the
-// loop without marking the socket lost, triggering a reopen, or ending an open
+// (UdpStatus::kWouldBlock, send buffer full) is reported to the loop without
+// marking the socket lost, triggering a reopen, or ending an open
 // kSocketError spell. REQ-RT-22
-TEST(SocketRetry, WouldBlockCountsDropsAndKeepsTheSocketOpen) {
+TEST(SocketRetry, WouldBlockReportsDropAndKeepsTheSocketOpen) {
   using SendEvent = SocketRetry::SendEvent;
   using UdpStatus = talos::protocol::UdpStatus;
   SocketRetry retry;
   // Before the socket opens, a would-block status is ignored.
   EXPECT_EQ(retry.ObserveSend(kStartUs, UdpStatus::kWouldBlock, 0),
             SendEvent::kNone);
-  EXPECT_EQ(retry.would_block_count(), 0u);
 
   ASSERT_EQ(retry.Poll(kStartUs, [] { return true; }),
             SocketRetry::Event::kOpened);
@@ -213,7 +212,6 @@ TEST(SocketRetry, WouldBlockCountsDropsAndKeepsTheSocketOpen) {
     EXPECT_EQ(retry.ObserveSend(burst_us + i * kLoopPeriodUs,
                                 UdpStatus::kWouldBlock, 0),
               SendEvent::kWouldBlock);
-    EXPECT_EQ(retry.would_block_count(), i);
     EXPECT_TRUE(retry.open());
     EXPECT_FALSE(retry.replacing());
     EXPECT_EQ(retry.Poll(burst_us + i * kLoopPeriodUs,
@@ -233,7 +231,6 @@ TEST(SocketRetry, WouldBlockCountsDropsAndKeepsTheSocketOpen) {
   EXPECT_EQ(retry.ObserveSend(fail_us + SocketRetry::kSpellQuietUs,
                               UdpStatus::kWouldBlock, 0),
             SendEvent::kWouldBlock);
-  EXPECT_EQ(retry.would_block_count(), 6u);
   EXPECT_EQ(retry.spell_failures(), 1u);
   EXPECT_EQ(retry.spell_error(), ENOBUFS);
   EXPECT_TRUE(retry.open());
