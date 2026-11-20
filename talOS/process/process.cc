@@ -273,6 +273,20 @@ void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
   }
 }
 
+#elif defined(__linux__)
+
+void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
+  const int low = ::sched_get_priority_min(SCHED_FIFO);
+  const int high = ::sched_get_priority_max(SCHED_FIFO);
+  sched_param param{};
+  param.sched_priority = std::clamp(loop.fifo_priority, low, high);
+  // SCHED_RESET_ON_FORK: a child process forked from, or a thread created by,
+  // this loop thread starts at SCHED_OTHER instead of inheriting SCHED_FIFO.
+  if (::sched_setscheduler(0, SCHED_FIFO | SCHED_RESET_ON_FORK, &param) != 0) {
+    problems.add(kStepPolicy, "SCHED_FIFO", std::strerror(errno));
+  }
+}
+
 #else
 
 void SetThreadPolicy(const LoopPolicy& loop, Problems& problems) {
@@ -321,10 +335,25 @@ void SetBackground(Problems& problems) {
 #else
 
 bool IsRealtimePolicy(int policy) {
+#if defined(__linux__)
+  policy &= ~SCHED_RESET_ON_FORK;
+#endif
   return policy == SCHED_FIFO || policy == SCHED_RR;
 }
 
 void SetBackground(Problems& problems) {
+#if defined(__linux__)
+  // Query and update the kernel directly: glibc's pthread_getschedparam caches
+  // the policy in the thread descriptor across pthread_create even after
+  // SCHED_RESET_ON_FORK resets the child in the kernel.
+  const int policy = ::sched_getscheduler(0);
+  if (policy >= 0 && IsRealtimePolicy(policy)) {
+    sched_param param{};
+    if (::sched_setscheduler(0, SCHED_OTHER, &param) != 0) {
+      problems.add(kStepPolicy, "SCHED_OTHER", std::strerror(errno));
+    }
+  }
+#else
   int policy = SCHED_OTHER;
   sched_param param{};
   if (::pthread_getschedparam(::pthread_self(), &policy, &param) == 0 &&
@@ -335,6 +364,7 @@ void SetBackground(Problems& problems) {
     if (result != 0)
       problems.add(kStepPolicy, "SCHED_OTHER", std::strerror(result));
   }
+#endif
   // Linux keeps a nice value per thread; PRIO_PROCESS with a thread id sets
   // only that thread's. Never lowered: that would need privilege.
   const auto tid = static_cast<id_t>(::syscall(SYS_gettid));
@@ -456,6 +486,15 @@ bool ThreadIsBackground() noexcept {
   const qos_class_t qos = ::qos_class_self();
   return !HasTimeConstraint() && qos != QOS_CLASS_UNSPECIFIED &&
          qos <= QOS_CLASS_UTILITY;
+#elif defined(__linux__)
+  const int policy = ::sched_getscheduler(0);
+  if (policy < 0 || IsRealtimePolicy(policy)) {
+    return false;
+  }
+  errno = 0;
+  const int nice =
+      ::getpriority(PRIO_PROCESS, static_cast<id_t>(::syscall(SYS_gettid)));
+  return errno == 0 && nice >= kBackgroundNice;
 #else
   int policy = SCHED_OTHER;
   sched_param param{};
