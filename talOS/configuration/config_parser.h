@@ -876,7 +876,11 @@ inline std::vector<std::pair<std::string, TeleopValue>> ParseTeleopAssignments(
     } else if (const auto* integer = value.as_integer()) {
       assignments.emplace_back(key, integer->get());
     } else if (const auto* real = value.as_floating_point()) {
-      assignments.emplace_back(key, real->get());
+      const double v = real->get();
+      if (!std::isfinite(v)) {
+        throw std::invalid_argument(where + "." + key + " must be finite");
+      }
+      assignments.emplace_back(key, v);
     } else if (const auto* text = value.as_string()) {
       assignments.emplace_back(key, text->get());
     } else {
@@ -1050,6 +1054,9 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
       b.scale = sc.is_floating_point()
                     ? sc.as_floating_point()->get()
                     : static_cast<double>(sc.as_integer()->get());
+      if (!std::isfinite(b.scale)) {
+        throw std::invalid_argument(entry_where + ".scale must be finite");
+      }
       if (entry->contains("deadband_frac")) {
         const auto& df = (*entry)["deadband_frac"];
         if (!df.is_floating_point() && !df.is_integer()) {
@@ -1144,6 +1151,30 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     throw std::invalid_argument("[robot] must be a table");
   }
   if (auto* robot = tbl["robot"].as_table()) {
+    static constexpr std::array<std::string_view, 16> kRobotKeys = {
+        "name",
+        "period_us",
+        "command_timeout_us",
+        "status_hz",
+        "commissioned",
+        "require_target_coverage",
+        "simulation_only",
+        "controller_address",
+        "controller_port",
+        "local_port",
+        "log_keep_sessions",
+        "log_max_bytes",
+        "max_restarts",
+        "hardware_node",
+        "sim_gateway",
+        "targets",
+    };
+    for (auto&& [k, v] : *robot) {
+      if (std::ranges::find(kRobotKeys, k.str()) == kRobotKeys.end()) {
+        throw std::invalid_argument("[robot] unknown key '" +
+                                    std::string(k.str()) + "'");
+      }
+    }
     hw.period_us = Read(*robot, "period_us", hw.period_us);
     hw.command_timeout_us =
         Read(*robot, "command_timeout_us", hw.command_timeout_us);
