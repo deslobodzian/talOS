@@ -667,16 +667,20 @@ DIO/analog/PWM and RIO encoder validity never sink the backend.
 
 `controller_processor/rio/src/main/cpp/Robot.cpp` is the thin WPILib
 adapter. Its companion (main processor) address is fixed when it is built:
-`./gradlew deploy -Pcompanion=<ipv4>` (or `buildRio`), `10.56.87.11` without
-the property. `build.gradle` takes it only from the command line: a
+`./gradlew deploy -PteamNumber=<team> -Pcompanion=<ipv4>` (or `buildRio -Pcompanion=<ipv4>`,
+or from a robot repository `bazel run @talos//controller_processor/rio:gradlew -- ...`).
+There is no built-in team number or companion default: `buildRio` and `deploy`
+fail without `-Pcompanion=<ipv4>`, and `deploy` also requires a team number
+(`-PteamNumber=<team>` or `.wpilib/wpilib_preferences.json`). `build.gradle`
+takes `-Pcompanion` only from the command line: a
 `companion` set in a `gradle.properties` or `ORG_GRADLE_PROJECT_companion`
 fails the build, so a bench address cannot carry into a later deploy from the
 same laptop. It also fails the build on an empty value (a bare `-Pcompanion`
 or an unset shell variable) and on anything but a dotted IPv4 literal without
 leading zeros outside `0.0.0.0/8`, loopback `127.0.0.0/8` and `224.0.0.0/3`
 (multicast, reserved, broadcast), addresses the RoboRIO's socket could not
-open or send to. Every Gradle run prints the address it builds in and whether
-it is the default (`RoboRIO companion address built in: ...`). It is
+open or send to. Every RoboRIO build prints the address it builds in
+(`RoboRIO companion address built in: ...`). It is
 never learned from an incoming datagram: the gateway's socket is connected to
 that one peer, which is what keeps any other host on the network from
 commanding the robot ([protocol](../protocol/README.md)). Runtime ports are
@@ -1013,9 +1017,11 @@ build from a copy with no git history passes
 `-PtalosRevision=<16 lowercase hex digits> -PtalosDirty=true|false` on the
 command line instead, which replaces git: the commit is those digits and the
 dirty flag is `-PtalosDirty` (true when the copy differs from that commit).
-The two are required together, and the pair is refused while git sees a work
-tree in the project directory, where git stamps the build itself and an
-override could only hide uncommitted changes. Like `-Pcompanion` both are
+The two are required together, and the pair is refused while git's work-tree
+root matches the talOS root being built from, where git stamps the build itself
+and an override could only hide uncommitted changes (a staged copy inside an
+unrelated git repository is not stamped with that repository's commit and
+accepts the override). Like `-Pcompanion` both are
 refused from a `gradle.properties` or the environment, and a revision that is
 not exactly 16 lowercase hex digits, or is all zeros (revision 0 means
 unknown), or a `-PtalosDirty` that is not exactly `true` or `false`, fails
@@ -1031,7 +1037,7 @@ Build without deploying:
 
 ```sh
 cd controller_processor/rio
-./gradlew buildRio
+./gradlew buildRio -Pcompanion=<ipv4>
 ./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, LoopConsole, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader; and rioBuildStampTest
 ```
 

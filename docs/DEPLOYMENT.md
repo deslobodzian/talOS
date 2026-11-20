@@ -597,15 +597,42 @@ reader's time namespace, so a node in another would judge live claims dead.
 
 ## RoboRIO
 
-`controller_processor/rio` is deployed with GradleRIO
-(`./gradlew deploy` in that directory). It sends to the companion address it
-was built with, port 5803: `10.56.87.11` unless the main processor's address
-differs, then `./gradlew deploy -Pcompanion=<ipv4>`
-([RoboRIO](../talOS/hardware/README.md#roborio)). Deployed from a copy with no
-git history, add `-PtalosRevision=<first 16 hex digits of its commit>
+`controller_processor/rio` is built and deployed with GradleRIO. talOS has no
+built-in team number or companion address:
+
+- Every RoboRIO target build (`buildRio` or `deploy`) requires
+  `-Pcompanion=<ipv4>` on the command line — the main processor's IPv4 address
+  (port 5803; refused from `gradle.properties` or the environment,
+  [RoboRIO](../talOS/hardware/README.md#roborio)). Desktop `phoenixTest` and
+  `simulateNative` use `127.0.0.1` and need neither `-Pcompanion` nor a team
+  number.
+- `deploy` also requires a team number: pass `-PteamNumber=<team>` on the
+  command line, or provide `.wpilib/wpilib_preferences.json` with
+  `"teamNumber"` in the robot repository.
+
+From a robot repository, build and deploy through Bazel without touching the
+pinned talOS checkout:
+
+```sh
+bazel run @talos//controller_processor/rio:gradlew -- buildRio -Pcompanion=<ipv4>
+bazel run @talos//controller_processor/rio:gradlew -- deploy -Pcompanion=<ipv4>                 # uses .wpilib/wpilib_preferences.json
+bazel run @talos//controller_processor/rio:gradlew -- deploy -PteamNumber=<team> -Pcompanion=<ipv4>
+```
+
+`@talos//controller_processor/rio:gradlew` stages the Gradle project and the
+`talOS/` sources it compiles into a cache directory (`$XDG_CACHE_HOME/talos/rio`
+or `~/.cache/talos/rio`), computes `-PtalosRevision` and `-PtalosDirty` from the
+pinned talOS checkout before copying, and forwards the robot repository's
+`.wpilib/wpilib_preferences.json` (if present). From a talOS checkout directly,
+run `(cd controller_processor/rio && ./gradlew deploy -PteamNumber=<team> -Pcompanion=<ipv4>)`
+(or `bazel run //controller_processor/rio:gradlew -- ...`).
+
+Deployed from a copy with no talOS git history (including a copy placed inside
+an unrelated git repository, whose work-tree root does not match the talOS
+root), add `-PtalosRevision=<first 16 hex digits of its commit>
 -PtalosDirty=true|false` (whether the copy differs from that commit) so its
-State still names the build; from a git checkout the build refuses them
-([build stamp](../talOS/hardware/README.md#roborio)).
+State still names the build; inside a talOS git checkout itself the build
+refuses them ([build stamp](../talOS/hardware/README.md#roborio)).
 Deploy it from the talOS checkout the main-processor bundle was built
 against (the one a robot repository's `MODULE.bazel` names): each side
 rejects frames of another protocol version (currently 11; see

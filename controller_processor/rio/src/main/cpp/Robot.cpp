@@ -253,6 +253,10 @@ void Robot::StartCompetition() {
   // The main processor this program sends State to and, its socket being
   // connected, the only host it accepts frames from: fixed at build time
   // (-Pcompanion, build.gradle), never learned from a datagram.
+#if defined(__FRC_ROBORIO__) && !defined(RUNNING_FRC_TESTS)
+  static_assert(talos::rio::kCompanionAddress[0] != '\0',
+                "RoboRIO build requires -Pcompanion=<ipv4>");
+#endif
   const char* const companion_address =
       IsSimulation() ? "127.0.0.1" : talos::rio::kCompanionAddress;
   // Prefixed, like every RioLog line, with the gateway's clock: on the

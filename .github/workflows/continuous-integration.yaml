@@ -450,7 +450,9 @@ jobs:
     - name: RoboRIO target build
       # Cross-compile the deployed frcUserProgram for linuxathena. This is
       # the artifact `deploy` ships; it never runs in CI, it must compile.
-      run: ./gradlew buildRio
+      # talOS has no built-in companion address, so -Pcompanion=<ipv4> is
+      # required for every RoboRIO target build.
+      run: ./gradlew buildRio -Pcompanion=10.0.0.2
 
   rio-in-the-loop:
     name: RoboRIO program in the loop (WPILib sim)
