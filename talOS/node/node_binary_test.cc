@@ -531,6 +531,27 @@ TEST(Binary, ReplayInputsRefusesANonDirectoryPath) {
         << replay.output;
     EXPECT_FALSE(std::filesystem::exists(out));
   }
+  if (::geteuid() != 0) {
+    SCOPED_TRACE("unsearchable parent directory (EACCES)");
+    const std::string locked = TempFile("talos_node_test_locked_parent");
+    std::filesystem::remove_all(locked);
+    std::filesystem::create_directories(locked + "/session");
+    std::filesystem::permissions(locked, std::filesystem::perms::none);
+    const std::string path = locked + "/session";
+    const Result replay = RunBinary("--replay-inputs '" + path + "' --log '" +
+                                    out + "' " + ConfigFlag());
+    std::filesystem::permissions(locked, std::filesystem::perms::owner_all);
+    std::filesystem::remove_all(locked);
+    EXPECT_NE(replay.status, 0) << replay.output;
+    EXPECT_NE(replay.output.find(path), std::string::npos) << replay.output;
+    EXPECT_EQ(replay.output.find("not a session directory"), std::string::npos)
+        << replay.output;
+    EXPECT_NE(replay.output.find(
+                  std::make_error_code(std::errc::permission_denied).message()),
+              std::string::npos)
+        << replay.output;
+    EXPECT_FALSE(std::filesystem::exists(out));
+  }
   std::filesystem::remove(log);
 }
 

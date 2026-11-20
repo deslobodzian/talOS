@@ -58,6 +58,24 @@ std::pair<std::string, std::uint64_t> LogAndPlace(const std::string& file) {
   return {std::string{stem} + std::string{kExtension}, k};
 }
 
+// `a + b`, saturated to [int64_t::min, int64_t::max] on signed overflow.
+std::int64_t SaturatingAdd(std::int64_t a, std::int64_t b) {
+  constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+  constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+  if (b > 0 && a > kMax - b) return kMax;
+  if (b < 0 && a < kMin - b) return kMin;
+  return a + b;
+}
+
+// `a - b`, saturated to [int64_t::min, int64_t::max] on signed overflow.
+std::int64_t SaturatingSub(std::int64_t a, std::int64_t b) {
+  constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+  constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+  if (b < 0 && a > kMax + b) return kMax;
+  if (b > 0 && a < kMin + b) return kMin;
+  return a - b;
+}
+
 // `deadline_ns + period_ns * max(cycles, 1)`, saturated to int64_t::max on
 // overflow.
 std::int64_t AdvanceDeadline(std::int64_t deadline_ns, std::int64_t period_ns,
@@ -213,6 +231,7 @@ RecordedSession::RecordedSession(const std::string& path,
     std::int64_t period_ns{0};
   };
   std::vector<TimerState> replayed_run_timers;
+  bool replayed_run_timers_uncertain = false;
   std::optional<MonotonicTime> replayed_run_last_event;
   // The latest time any of its logs recorded: its last run's exit.
   std::optional<MonotonicTime> replayed_end;
@@ -264,6 +283,7 @@ RecordedSession::RecordedSession(const std::string& path,
     std::optional<MonotonicTime> gap_start;
     std::vector<std::optional<std::int64_t>> timer_offset;
     std::vector<TimerState> timer_state;
+    bool timer_state_uncertain{false};
   };
   std::map<std::string, Carried> carried;
   // Per-log segment continuity across all files of one base log (LogOfFile),
@@ -329,6 +349,7 @@ RecordedSession::RecordedSession(const std::string& path,
     std::vector<std::optional<std::int64_t>> timer_offset(
         reader.manifest().size());
     std::vector<TimerState> timer_state(reader.manifest().size());
+    bool timer_state_uncertain = false;
     std::optional<MonotonicTime> run_start;
     bool timed = false;
     // The now_ns of this file's first record of a dispatch, and the latest
@@ -465,6 +486,7 @@ RecordedSession::RecordedSession(const std::string& path,
     if (continued != nullptr) {
       timer_offset = continued->timer_offset;
       timer_state = continued->timer_state;
+      timer_state_uncertain = continued->timer_state_uncertain;
     }
 
     // Record-level continuity across segment boundaries (catches a deleted
@@ -490,6 +512,13 @@ RecordedSession::RecordedSession(const std::string& path,
       // it lost of each topic source, by when that could be fed at.
       if (reader.damage().spans != spans) {
         seen_loss_in_file = true;
+        if (own_log) {
+          timer_state_uncertain = true;
+          for (TimerState& timer : timer_state) {
+            timer.armed = false;
+            timer.deadline_ns.reset();
+          }
+        }
         last_dispatch.reset();
         std::fill(last_sent_seq.begin(), last_sent_seq.end(), std::nullopt);
         const std::uint64_t offset =
@@ -569,6 +598,16 @@ RecordedSession::RecordedSession(const std::string& path,
       }
       if (const auto marked = log::GapOf(header, record.payload)) {
         seen_loss_in_file = true;
+        if (own_log) {
+          // Records dropped in the gap may hold TIMER firings or
+          // ARM_TIMER/DISARM_TIMER calls; invalidate tracked timer state so a
+          // stale pre-gap deadline never clamps loop_end() below real firings.
+          timer_state_uncertain = true;
+          for (TimerState& timer : timer_state) {
+            timer.armed = false;
+            timer.deadline_ns.reset();
+          }
+        }
         if (marked->detailed) {
           last_dispatch = marked->detail.last_dispatch_index;
         } else {
@@ -643,9 +682,10 @@ RecordedSession::RecordedSession(const std::string& path,
         if (kind == EventKind::ARM_TIMER || kind == EventKind::DISARM_TIMER) {
           timer_offset[header.source_id].reset();
         } else if (kind == EventKind::TIMER && offset.has_value()) {
-          std::int64_t start_ns = header.event_time_ns - *offset;
+          std::int64_t start_ns = SaturatingSub(header.event_time_ns, *offset);
           if (gap_start.has_value()) {
-            start_ns = std::max(start_ns, gap_start->nanos() - *offset);
+            start_ns =
+                std::max(start_ns, SaturatingSub(gap_start->nanos(), *offset));
           }
           run_start = MonotonicTime::from_nanos(start_ns);
         }
@@ -769,7 +809,8 @@ RecordedSession::RecordedSession(const std::string& path,
                                 .last_sequence = last_sequence,
                                 .gap_start = gap_start,
                                 .timer_offset = timer_offset,
-                                .timer_state = timer_state};
+                                .timer_state = timer_state,
+                                .timer_state_uncertain = timer_state_uncertain};
     read.gap = gap;
     read.segment_refusal = std::move(segment_refusal);
     read.topics = std::move(recorded);
@@ -797,11 +838,15 @@ RecordedSession::RecordedSession(const std::string& path,
       replayed_run_loss = gap_start;
       replayed_run_timed = timed;
       replayed_run_timers = timer_state;
+      replayed_run_timers_uncertain = timer_state_uncertain;
       replayed_run_last_event = last_event;
     } else if (own_log && replayed_run &&
                reader.start_time() == replayed_run->first &&
                base_log == replayed_run_log) {
       replayed_run_timers = timer_state;
+      replayed_run_timers_uncertain = replayed_run_timers_uncertain ||
+                                      timer_state_uncertain ||
+                                      continued == nullptr || !next_segment;
       if (last_event) {
         replayed_run_last_event =
             replayed_run_last_event
@@ -843,18 +888,21 @@ RecordedSession::RecordedSession(const std::string& path,
   // A single-run live loop that was late when it stopped can record its EXIT
   // after a due timer deadline it never fired, and an offset-0 timer whose
   // run's only dispatch record is its EXIT sits right at
-  // run_start == replayed_end. End the replay one nanosecond before the
-  // earliest armed timer deadline that never fired live (strictly after any
-  // recorded TIMER or MESSAGE dispatch, or any deadline when none ran), so
-  // replay never fabricates a timer firing that did not run live.
-  if (replayed_run && replayed_end && replayed_logs.size() == 1) {
+  // run_start == replayed_end. When the run's own records have no GAP, damaged
+  // stretch, or broken segment carry (so tracked timer state is complete),
+  // end the replay one nanosecond before the earliest armed timer deadline
+  // strictly after any recorded TIMER or MESSAGE dispatch (or any deadline
+  // when none ran), avoiding fabricated firings in those cases.
+  if (replayed_run && replayed_end && replayed_logs.size() == 1 &&
+      !replayed_run_timers_uncertain) {
     std::optional<MonotonicTime> earliest_unfired;
     for (const TimerState& timer : replayed_run_timers) {
       if (!timer.armed) continue;
       const MonotonicTime deadline =
           timer.deadline_ns.has_value()
               ? MonotonicTime::from_nanos(*timer.deadline_ns)
-              : replayed_run->second + Duration{timer.offset_ns};
+              : MonotonicTime::from_nanos(SaturatingAdd(
+                    replayed_run->second.nanos(), timer.offset_ns));
       if (!replayed_run_last_event.has_value() ||
           deadline > *replayed_run_last_event) {
         earliest_unfired =
@@ -862,7 +910,8 @@ RecordedSession::RecordedSession(const std::string& path,
       }
     }
     if (earliest_unfired && *earliest_unfired <= *replayed_end) {
-      replayed_end = *earliest_unfired - Duration{1};
+      replayed_end = MonotonicTime::from_nanos(
+          SaturatingSub(earliest_unfired->nanos(), 1));
     }
   }
   if (first) throw std::runtime_error("no readable .tlog files in " + path);

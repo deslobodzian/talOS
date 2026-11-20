@@ -914,7 +914,12 @@ every log that recorded it, the writer's `SEND`s (the hardware bridge's
 sequence and publication time live readers saw. A node the session ran replays on its own recorded timeline: its
 timers fire at the deadlines they fired at live (a node that fired none
 starts its run at its first dispatch and fires none up to that run's last
-record, and a single-run log never fabricates a firing after a late `EXIT`;
+record; for a single-run log with no own-log gap, damaged stretch or broken
+segment carry, `loop_end()` is clamped before the earliest armed timer deadline
+strictly after the last recorded `TIMER` or `MESSAGE` dispatch so a late `EXIT`
+or an offset-0 exit-only run does not fabricate a firing, except for the
+`ARM_TIMER` live-latency and backlog-drain-exit cases in
+[input replay](../events/README.md#replaying-another-sessions-inputs);
 a restarted node replays as one run), and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and
@@ -929,8 +934,12 @@ naming the log and the sign, and the launcher exits 1: one with a
 `log_capped`, a run's log without its EXIT record of a member it marks
 `log_gap` or `recorder_failed` ([session manifest](#session-manifest)), one
 with a missing or incomplete-header segment (including a missing first segment
-without a marker or a segment missing before the active file detected by a
-dispatch-index or sender-sequence jump), and one whose damaged
+without a marker when a later numbered segment remains or the unnumbered active
+file's first intact record has `dispatch_index > 1`, or a segment missing
+before the active file detected by a `dispatch_index > prev + 1` or
+repeated-sender accepted-`SEND` sequence `> prev + 1` jump; see
+[input replay](../events/README.md#replaying-another-sessions-inputs) for the
+unnumbered-file limits), and one whose damaged
 records nothing bounds the time of. The node's own first run's log is
 refused the same way, whatever it feeds, when the node had a timer and
 that log's first segment, or a segment before its first firing read, is

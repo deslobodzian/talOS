@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -2161,6 +2162,242 @@ TEST(InputReplay, RefusesALogMissingTheSegmentBeforeItsUnnumberedFile) {
     }
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(out);
+  }
+}
+
+// A program with a periodic timer that disarms itself on its first firing,
+// and optionally watches /input/sensor during replay.
+class DisarmingTicker {
+ public:
+  explicit DisarmingTicker(Loop& loop, bool watch_sensor = false)
+      : tick_{make_timer<&DisarmingTicker::on_tick>(loop, "tick", this)} {
+    if (watch_sensor) {
+      watch<EventsTest::SensorMessage, &DisarmingTicker::on_sensor>(
+          loop, kTopics.sensor, this);
+    }
+    tick_.setup_periodic(loop.monotonic_now() + 5ms, 5ms);
+  }
+
+  int ticks{0};
+  int readings{0};
+
+ private:
+  void on_tick(const Context&) {
+    ++ticks;
+    tick_.disable();
+  }
+  void on_sensor(const Context&, const EventsTest::SensorMessage&) {
+    ++readings;
+  }
+
+  Timer<Loop> tick_;
+};
+
+// A program whose initial one-shot timer arms a second, initially disarmed
+// one-shot timer 5 ms later.
+class ArmingTicker {
+ public:
+  explicit ArmingTicker(Loop& loop)
+      : first_{make_timer<&ArmingTicker::on_first>(loop, "first", this)},
+        second_{make_timer<&ArmingTicker::on_second>(loop, "second", this)} {
+    first_.setup(loop.monotonic_now() + 5ms);
+  }
+
+  int first_ticks{0};
+  int second_ticks{0};
+
+ private:
+  void on_first(const Context& context) {
+    ++first_ticks;
+    second_.setup(context.now + 5ms);
+  }
+  void on_second(const Context&) { ++second_ticks; }
+
+  Timer<Loop> first_;
+  Timer<Loop> second_;
+};
+
+// An own-log GAP record before EXIT drops records (which may include TIMER
+// firings or DISARM_TIMER operations), invalidating tracked timer state so a
+// stale pre-gap deadline never clamps loop_end() and drops firings that ran
+// live.
+// REQ-OPS-14
+TEST(InputReplay, OwnLogGapBeforeExitDoesNotClampAwayRealFirings) {
+  const std::string dir = TempDir("own_gap_before_exit");
+  const std::string out = TempDir("own_gap_before_exit_out");
+  const std::string path = dir + "/ticker.tlog";
+  const MonotonicTime exit_at = kOrigin + kLateRun + 10ms;
+  {
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{path, "ticker"},
+              Loop::Options{.start = kOrigin, .run_start = kOrigin + kLateRun}};
+    const Ticker ticker{loop};
+    loop.run_until(exit_at);
+    loop.finish();
+  }
+  const std::vector<std::int64_t> live = TimerFirings(path);
+  ASSERT_EQ(live.size(), 10u);
+  // Replace firings 6..10 with a GAP closed at flush, leaving EXIT held at
+  // exit_at after the GAP.
+  const std::string gapped = path + ".gap";
+  log::CopyWithGap(path, gapped, 5, RecordOffsets(path).size());
+  std::filesystem::rename(gapped, path);
+  ASSERT_EQ(TimerFirings(path).size(), 5u);
+
+  const RecordedSession session{dir, "ticker"};
+  EXPECT_EQ(session.loop_end(), exit_at);
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/ticker.tlog", "ticker"},
+            Loop::Options{.start = session.loop_start(),
+                          .run_start = session.run_start()}};
+  const Ticker ticker{loop};
+  const InputReplayReport report = ReplayInputs(loop, environment, session);
+  EXPECT_FALSE(report.stopped_at_gap.has_value());
+  EXPECT_EQ(TimerFirings(out + "/ticker.tlog"), live);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
+}
+
+// Late-EXIT clamping tracks ARM_TIMER and DISARM_TIMER: disarming a periodic
+// timer prevents its old next deadline from clamping away later time/inputs,
+// and arming a previously disarmed one-shot timer clamps a late EXIT before
+// that new deadline so no firing is fabricated. Crafted extreme offsets and
+// deadlines saturate without signed-overflow UB.
+// REQ-OPS-14
+TEST(InputReplay, ArmAndDisarmTimerTrackingBeforeLateExit) {
+  {
+    SCOPED_TRACE("DISARM_TIMER clears the timer so later inputs are not cut");
+    const std::string dir = TempDir("disarm_before_exit");
+    const std::string out = TempDir("disarm_before_exit_out");
+    const MonotonicTime exit_at = kOrigin + 20ms;
+    {
+      SimulationEnvironment environment;
+      Loop producer_loop{environment,
+                         log::LogWriter{dir + "/producer.tlog", "producer"},
+                         Loop::Options{.start = kOrigin}};
+      Loop ticker_loop{environment,
+                       log::LogWriter{dir + "/ticker.tlog", "ticker"},
+                       Loop::Options{.start = kOrigin}};
+      const Producer producer{producer_loop};
+      DisarmingTicker ticker{ticker_loop};
+      for (int ms = 1; ms <= 20; ++ms) {
+        const MonotonicTime now = kOrigin + std::chrono::milliseconds{ms};
+        producer_loop.run_until(now);
+        ticker_loop.run_until(now);
+      }
+      producer_loop.finish();
+      ticker_loop.finish();
+      ASSERT_EQ(ticker.ticks, 1);
+    }
+    const RecordedSession session{dir, "ticker"};
+    // Without DISARM_TIMER tracking, loop_end would be clamped to 10ms - 1ns.
+    EXPECT_EQ(session.loop_end(), exit_at);
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/ticker.tlog", "ticker"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    DisarmingTicker ticker{loop, /*watch_sensor=*/true};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(ticker.ticks, 1);
+    // Producer sends every 2 ms from 2 ms to 20 ms -> 10 readings.
+    EXPECT_EQ(ticker.readings, 10);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("ARM_TIMER clamps a late EXIT before the armed one-shot");
+    const std::string dir = TempDir("arm_before_late_exit");
+    const std::string out = TempDir("arm_before_late_exit_out");
+    const std::string path = dir + "/armer.tlog";
+    {
+      log::LogWriter writer{path, "armer",
+                            log::LogWriterOptions{.background = false}};
+      writer.start(ManifestOf<ArmingTicker>(dir + "/unused.tlog"), kOrigin);
+      const MonotonicTime first_at = kOrigin + 5ms;
+      const MonotonicTime second_at = kOrigin + 10ms;
+      const Context first_tick{.kind = EventKind::TIMER,
+                               .source_id = 0,
+                               .dispatch_index = 1,
+                               .event_time = first_at,
+                               .now = first_at,
+                               .sequence = 1};
+      writer.dispatch(first_tick, {});
+      // Handler armed timer 1 as a one-shot for second_at (period = 0).
+      writer.dispatch(Context{.kind = EventKind::ARM_TIMER,
+                              .source_id = 1,
+                              .dispatch_index = 1,
+                              .event_time = second_at,
+                              .now = first_at,
+                              .sequence = 0},
+                      {});
+      // Late EXIT after second_at without timer 1 ever firing.
+      const MonotonicTime late_exit = kOrigin + 12ms;
+      writer.finish(Context{.kind = EventKind::EXIT,
+                            .dispatch_index = 2,
+                            .event_time = late_exit,
+                            .now = late_exit});
+      writer.flush();
+    }
+    const RecordedSession session{dir, "armer"};
+    // Without ARM_TIMER tracking, loop_end would remain 12ms and timer 1 would
+    // fabricate a firing at 10ms.
+    EXPECT_EQ(session.loop_end(), kOrigin + 10ms - 1ns);
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/armer.tlog", "armer"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    ArmingTicker armer{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(armer.first_ticks, 1);
+    EXPECT_EQ(armer.second_ticks, 0);
+    EXPECT_EQ(TimerFirings(out + "/armer.tlog"),
+              (std::vector<std::int64_t>{(kOrigin + 5ms).nanos()}));
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("extreme crafted offset and deadline saturate cleanly");
+    const std::string dir = TempDir("extreme_timer_bounds");
+    const std::string path = dir + "/crafted.tlog";
+    {
+      Manifest manifest;
+      manifest.push_back(
+          Registration{.id = 0,
+                       .kind = SourceKind::TIMER,
+                       .name = "huge_offset",
+                       .period_ns = 0,
+                       .offset_ns = std::numeric_limits<std::int64_t>::max(),
+                       .armed = true});
+      manifest.push_back(Registration{.id = 1,
+                                      .kind = SourceKind::TIMER,
+                                      .name = "min_deadline",
+                                      .period_ns = 0,
+                                      .offset_ns = 0,
+                                      .armed = false});
+      log::LogWriter writer{path, "crafted",
+                            log::LogWriterOptions{.background = false}};
+      writer.start(manifest, kOrigin);
+      writer.dispatch(Context{.kind = EventKind::ARM_TIMER,
+                              .source_id = 1,
+                              .dispatch_index = 1,
+                              .event_time = MonotonicTime::from_nanos(
+                                  std::numeric_limits<std::int64_t>::min()),
+                              .now = kOrigin + 1ms,
+                              .sequence = 0},
+                      {});
+      writer.finish(Context{.kind = EventKind::EXIT,
+                            .dispatch_index = 2,
+                            .event_time = kOrigin + 2ms,
+                            .now = kOrigin + 2ms});
+      writer.flush();
+    }
+    const RecordedSession session{dir, "crafted"};
+    EXPECT_EQ(
+        session.loop_end(),
+        MonotonicTime::from_nanos(std::numeric_limits<std::int64_t>::min()));
+    std::filesystem::remove_all(dir);
   }
 }
 

@@ -65,8 +65,13 @@ struct RecordedTopic {
   // `<log>.capped` marker, the session manifest's `log_capped`, its
   // `log_gap` or `recorder_failed` for a run's log without its EXIT record,
   // a missing or incomplete-header segment (including a missing first segment
-  // with no marker or a segment missing before the unnumbered active file
-  // whose records jump in dispatch index or sender sequence), or a damaged
+  // without a marker when a later numbered segment remains or the unnumbered
+  // active file's first intact record has dispatch_index > 1, not an
+  // unnumbered-only file starting at dispatch_index <= 1 or a
+  // dispatch_index == 0 bridge log; and a segment missing before the
+  // unnumbered active file whose boundary jumps in dispatch_index (> prev + 1)
+  // or accepted-SEND sequence (> prev + 1) for a sender present on both
+  // sides), or a damaged
   // stretch (its byte offset) before which no receipt bounds the topic's lost
   // records (the replayed program's own receipts, fed at their drains'
   // event times, which need not follow the log's order; a reader's topic
@@ -138,7 +143,8 @@ struct RecordedMessage {
 // (`nodes[].log_paths`), matched here by file name, so a session read from
 // another directory still matches. Logs with no such
 // manifest beside them (a directory outside a launcher session, another
-// session's manifest) are judged by their `.capped` markers alone.
+// session's manifest) are judged by their `.capped` markers and segment
+// continuity alone.
 class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)
@@ -171,28 +177,41 @@ class RecordedSession {
   // had no timer).
   // For a program the session did not log, start() for both.
   // Where the replay ends: the latest time the program's own logs recorded
-  // (its exit), clamped to one nanosecond before the earliest armed timer
-  // deadline of a single-run log that never fired live (so a late EXIT or an
-  // offset-0 timer whose only dispatch record is its EXIT does not fabricate
-  // a timer firing), or end().
+  // (its exit), or end(). For a single-run log whose own records have no GAP,
+  // damaged stretch, or broken segment carry, this is clamped to one
+  // nanosecond before the earliest armed timer deadline strictly after the
+  // last recorded TIMER or MESSAGE dispatch's event_time (or any armed
+  // deadline when none ran), avoiding a fabricated firing on a late EXIT or an
+  // offset-0 timer whose only dispatch record is its EXIT. Two cases remain
+  // unclamped: (1) a timer armed via ARM_TIMER relative to live now()
+  // (E + latency) whose replay deadline (E + P) falls before a live EXIT in
+  // [E + P, E + latency + P), and (2) a timer that came due between the
+  // realtime loop's timer pass and a following backlog drain whose handler
+  // called exit() (its deadline precedes that drain's event_time).
   MonotonicTime loop_start() const { return loop_start_; }
   MonotonicTime run_start() const { return run_start_; }
   MonotonicTime loop_end() const { return loop_end_; }
 
   // When the replayed program's first run's log arms a timer: the first
   // file of it read, when that is not its first segment
-  // (log::LogSegmentPath(log, 0); a rotated log keeps its later ones) nor
-  // the log of a run never rotated, and why, naming the sign: that segment's
-  // incomplete header, the log's `<log>.capped` marker, the session
-  // manifest's `log_capped`, or else only that the segment is gone; or the
-  // first file read that does not continue the segment before it (one
-  // between them missing or unread) while no firing was read before it. The
-  // run start's firing may have been in the segment not read; a later one's
-  // first firing may be whole periods later, so ReplayInputs refuses the
-  // log, whatever it feeds. With no firing that gives the run start, also
-  // the first file read when the log holds no record of its run (nothing
-  // gives its start or its end) or a GAP record or damaged stretch (which
-  // may hold its firings). Empty when none.
+  // (log::LogSegmentPath(log, 0); a rotated log keeps its later ones) nor an
+  // unrotated single file whose first intact record before any loss has
+  // dispatch_index <= 1 (a lone unnumbered file starting at
+  // dispatch_index > 1 is refused as missing segment 0, whereas one starting
+  // at dispatch_index <= 1 cannot be told from an unrotated log without a
+  // format change), and why, naming the sign: that segment's incomplete
+  // header, the log's `<log>.capped` marker, the session manifest's
+  // `log_capped`, or else only that the segment is gone; or the first file
+  // read that does not continue the segment before it (one between them
+  // missing or unread, including a missing segment before the unnumbered
+  // active file detected by a dispatch_index > prev + 1 or repeated-sender
+  // accepted-SEND sequence > prev + 1 jump) while no firing was read before
+  // it. The run start's firing may have been in the segment not read; a later
+  // one's first firing may be whole periods later, so ReplayInputs refuses the
+  // log, whatever it feeds. With no firing that gives the run start, also the
+  // first file read when the log holds no record of its run (nothing gives its
+  // start or its end) or a GAP record or damaged stretch (which may hold its
+  // firings). Empty when none.
   const std::string& run_start_refused_log() const {
     return run_start_refused_log_;
   }

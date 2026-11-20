@@ -371,13 +371,21 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   is stamped with the deadline. A message one live drain missed, and the next
   took, is taken by that next drain again. A watcher that took only the
   newest message sees no skipped message, so its dropped count is zero. The
-  replay ends at the program's last record (`loop_end()`), clamped for a
-  single-run log to one nanosecond before the earliest armed timer deadline
-  that never fired live (strictly after any recorded `TIMER` or `MESSAGE`
-  dispatch, or any deadline when none ran), so neither a live loop that was
-  late when it stopped (recording `EXIT` after a due deadline it never fired)
-  nor an offset-0 timer whose run's only dispatch record is its `EXIT`
-  fabricates a timer firing.
+  replay ends at the program's last record (`loop_end()`). For a single-run log
+  whose own records have no `GAP`, damaged stretch, or broken segment carry
+  (after any own-log loss, tracked timer state is invalidated so a stale
+  pre-loss deadline does not clamp away firings that ran live), `loop_end()` is
+  clamped to one nanosecond before the earliest armed timer deadline strictly
+  after the last recorded `TIMER` or `MESSAGE` dispatch's `event_time` (or any
+  armed deadline when none ran), avoiding a fabricated timer firing on a late
+  `EXIT` or an offset-0 timer whose run's only dispatch record is its `EXIT`.
+  Two edge cases remain unclamped: (1) a timer armed in a handler via
+  `ARM_TIMER` relative to `now()` had live deadline `E + latency + P`, whereas
+  replay runs the handler at `E` and arms for `E + P`, so a live `EXIT` in
+  `[E + P, E + latency + P)` is not clamped below `E + P`; and (2) a timer that
+  came due between the realtime loop's timer pass and a following backlog drain
+  (`drain_messages(at, at)`) whose handler called `exit()` has its deadline
+  before that drain's `event_time`, so it escapes the `> last_event` filter.
 - `ReplayInputs` runs the loop on its virtual clock to `loop_end()`, the end
   of the session for a program it did not run (or to a gap, below). Each
   recorded message on a
@@ -447,26 +455,37 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   ([session manifest](../launcher/README.md#session-manifest)), a run's log
   without its `EXIT` record is suspect and one with it is judged by its GAP
   records. A rotated log that lost a segment without a marker is suspect too:
-  a missing first segment (including an active file whose first dispatch is
-  past 1), an incomplete-header segment skipped before a readable segment, a
-  gap in numbered segments, a non-final segment ending with a damaged tail,
-  or a segment missing just before the log's unnumbered active file detected
-  from a `dispatch_index` jump (> 1) or an accepted-`SEND` transport sequence
-  jump (> 1) across the boundary (since `FileHeader` carries no segment
-  index, a deleted final numbered segment holding only operation records of
-  the previous segment's final dispatch, or in a `dispatch_index == 0` log
-  only topics not sent on both sides, cannot be distinguished without a format
-  change). Each recorded topic names the first such log it is fed from, or
+  a missing first segment (caught when a later numbered segment remains, or
+  when only the unnumbered active file remains and its first intact record
+  before any loss has `dispatch_index > 1`; without a segment index in
+  `FileHeader`, an unnumbered-only file starting at `dispatch_index <= 1`, such
+  as constructor sends or a split dispatch 1, or a `dispatch_index == 0` bridge
+  log cannot be distinguished from an unrotated log), an incomplete-header
+  segment skipped before a readable segment, a gap in numbered segments, a
+  non-final segment ending with a damaged tail, or a segment missing just
+  before the log's unnumbered active file detected from a `dispatch_index` jump
+  (`> prev + 1`) or an accepted-`SEND` transport sequence jump (`> prev + 1`)
+  for a sender present in both the preceding segment and the active file (since
+  `FileHeader` carries no segment index, a deleted final numbered segment
+  escapes detection if the active file's first dispatch index is at most
+  `prev + 1` — e.g. only operation records of dispatch `prev`, or dispatch
+  `prev + 1`'s dispatch record lost while its operation records begin the
+  active file — and no sender present on both sides has a sequence jump,
+  including a `dispatch_index == 0` bridge log whose deleted segment only sent
+  topics not sent on both sides). Each recorded topic names the first such log
+  it is fed from, or
   one with a damaged stretch nothing bounds (`RecordedTopic::refused_log`,
   `refused_reason`), by the same rule as gaps, and `ReplayInputs` throws a
   `ReplayError` before anything runs, naming the log, the sign and the topic;
   a node binary prints it and exits 1. The replayed program's own first
   run's log is refused the same way, fed topic or not, when its manifest
   arms a timer and its first segment (`<stem>.segment0.tlog`) was not read
-  (the byte cap deleted it, its header is incomplete, or the active file
-  starts past dispatch 1), or a segment before the first firing read is
-  missing or unreadable (including one detected by a dispatch-index or
-  sender-sequence jump into the active file): the firing `run_start()` is read
+  (the byte cap deleted it, its header is incomplete, a later numbered segment
+  remains without it, or a lone unnumbered active file's first intact record
+  before any loss has `dispatch_index > 1` — not `<= 1`), or a segment before
+  the first firing read is missing or unreadable (including one detected by a
+  `dispatch_index > prev + 1` or repeated-sender accepted-`SEND` sequence
+  `> prev + 1` jump into the active file): the firing `run_start()` is read
   from may have been there, and a later segment's first firing may be whole
   periods later (`RecordedSession::run_start_refused_log`, naming the first
   file read, or the one that does not continue the segment before it, and the
@@ -497,7 +516,8 @@ wall-clock start timestamp remains informational.
 Node binaries expose this as
 `--replay-inputs <session dir>` (`talOS/node/node.cc`, Python nodes included
 through the C ABI; a path that is not a directory is refused naming it as
-given); the launcher as `--replay-inputs <dir> --only <node>`
+given, and any other filesystem error such as `EACCES` reports the OS error);
+the launcher as `--replay-inputs <dir> --only <node>`
 (`talOS/launcher/README.md`). Byte topics (`Node::publish_bytes`) are
 discarded there, as under `--replay`: the loop never logs them, and an offline
 run must not write into a live robot's shared memory.
