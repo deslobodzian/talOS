@@ -249,8 +249,8 @@ test('an observed topic is read, as the launcher\'s lint counts it', () => {
 
 test('a declared endpoint attribute is not a fault, and says which it is', () => {
   const row = healthRow;
-  const external = {external: true, optional: false};
-  const optional = {external: false, optional: true};
+  const external = {external: true, optional: false, requiredReader: false};
+  const optional = {external: false, optional: true, requiredReader: false};
 
   // /hw/command: the consumer is the RoboRIO across UDP, so a shared-memory
   // subscriber will never exist. Reporting that as unread is what makes an
@@ -273,7 +273,8 @@ test('a declared endpoint attribute is not a fault, and says which it is', () =>
   // sends and what a topic with nothing special about it means.
   assert.equal(topicHealth(row({publishers: []}), undefined), 'orphaned');
   assert.equal(
-      topicHealth(row({publishers: []}), {external: false, optional: false}),
+      topicHealth(row({publishers: []}),
+                  {external: false, optional: false, requiredReader: false}),
       'orphaned');
 });
 
@@ -300,12 +301,104 @@ test('endpoint attributes are read off the ends, not the topic row', () => {
   assert.equal(graph.nodes[0].sources[0].external, true);
   assert.equal(graph.nodes[0].sources[0].optional, false);
   const ends = topicEnds(graph.nodes);
-  assert.deepEqual(ends.get('/hw/command'), {external: true, optional: false});
+  assert.deepEqual(ends.get('/hw/command'),
+                   {external: true, optional: false, requiredReader: false});
   assert.equal(ends.get('/hw/state')?.external, false);
+  assert.equal(ends.get('/hw/state')?.requiredReader, true);
 
   const health = healthByName(graph);
   assert.equal(health.get('/hw/command'), 'bridged');
   assert.equal(health.get('/hw/state'), 'orphaned');
+});
+
+// REQ-OPS-23, REQ-CONTRACT-09
+test('optional exempts per reader, matching LintGraph', () => {
+  const graph = parse({
+    nodes: [
+      node({
+        name: 'auto_pilot',
+        sources: [
+          source({id: 0, kind: 'FETCHER', name: '/vision/state', optional: true}),
+          source({id: 1, kind: 'FETCHER', name: '/drivetrain/target/auto', optional: true}),
+          source({id: 2, kind: 'FETCHER', name: '/odometry/state', optional: true})
+        ]
+      }),
+      node({
+        name: 'pose_estimator',
+        sources: [
+          source({id: 0, kind: 'WATCHER', name: '/vision/state'}),
+          source({id: 1, kind: 'WATCHER', name: '/hw/state'})
+        ]
+      }),
+      node({
+        name: 'bridge_peer',
+        sources: [
+          source({id: 0, kind: 'WATCHER', name: '/hw/state', external: true})
+        ]
+      }),
+      node({
+        name: 'telemetry',
+        sources: [
+          source({id: 0, kind: 'WATCHER', name: '/odometry/state', observer: true}),
+          source({id: 1, kind: 'WATCHER', name: '/gyro/state', observer: true})
+        ]
+      }),
+      node({
+        name: 'vision',
+        sources: [
+          source({id: 0, kind: 'SENDER', name: '/vision/telemetry', optional: true})
+        ]
+      })
+    ],
+    topics: [
+      topic({
+        name: '/vision/state',
+        publishers: [],
+        subscribers: ['auto_pilot', 'pose_estimator']
+      }),
+      topic({
+        name: '/drivetrain/target/auto',
+        publishers: [],
+        subscribers: ['auto_pilot']
+      }),
+      topic({
+        name: '/odometry/state',
+        publishers: [],
+        subscribers: ['auto_pilot'],
+        observers: ['telemetry']
+      }),
+      topic({
+        name: '/gyro/state',
+        publishers: [],
+        subscribers: [],
+        observers: ['telemetry']
+      }),
+      topic({
+        name: '/hw/state',
+        publishers: [],
+        subscribers: ['pose_estimator', 'bridge_peer']
+      }),
+      topic({
+        name: '/vision/telemetry',
+        publishers: ['vision'],
+        subscribers: []
+      })
+    ]
+  });
+
+  const health = healthByName(graph);
+  // One optional + one required subscriber with no publisher -> orphaned.
+  assert.equal(health.get('/vision/state'), 'orphaned');
+  // Only optional subscriber(s) with no publisher -> unconnected.
+  assert.equal(health.get('/drivetrain/target/auto'), 'unconnected');
+  // Optional subscriber + observer with no publisher -> unconnected.
+  assert.equal(health.get('/odometry/state'), 'unconnected');
+  // Observer-only with no publisher and no optional end -> orphaned.
+  assert.equal(health.get('/gyro/state'), 'orphaned');
+  // External on any end still marks a half-wired topic bridged.
+  assert.equal(health.get('/hw/state'), 'bridged');
+  // Optional publisher with no reader -> unconnected.
+  assert.equal(health.get('/vision/telemetry'), 'unconnected');
 });
 
 test('an endpoint attribute may be absent but must not be the wrong type', () => {
@@ -597,7 +690,7 @@ test('a declared graph parses into nodes, ends and the launcher\'s lint', () => 
   // The declared ends classify topics the same way the live ones do, which is
   // what lets a launcher's warning and a viewer's badge agree.
   assert.deepEqual(topicEnds(declared.nodes).get('/hw/command'),
-                   {external: true, optional: false});
+                   {external: true, optional: false, requiredReader: false});
 });
 
 test('a declared graph is refused as strictly as a live one, and says which', () => {
