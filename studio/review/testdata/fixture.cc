@@ -1,9 +1,11 @@
 #include "studio/review/testdata/fixture.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -12,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "review_test/review_alert_descriptor.h"
+#include "review_test/review_alert_generated.h"
 #include "review_test/review_message_descriptor.h"
 #include "review_test/review_message_generated.h"
 #include "talOS/driver_station/driver_station.h"
@@ -41,6 +45,7 @@ constexpr std::uint16_t kShot = 2;
 constexpr std::uint16_t kRequest = 3;
 constexpr std::uint16_t kStatus = 4;
 constexpr std::uint16_t kDriverStation = 3;
+constexpr std::uint16_t kHealth = 4;
 
 talos::schema::Identity ShotSchema() {
   using D = talos::Descriptor<review_test::Shot>;
@@ -54,6 +59,19 @@ talos::schema::Identity StatusSchema() {
   return {std::string{D::kName}, D::kHash,
           std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
                       D::kBfbs.size()}};
+}
+
+talos::schema::Identity HealthSchema() {
+  using D = talos::Descriptor<review_test::Health>;
+  return {std::string{D::kName}, D::kHash,
+          std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                      D::kBfbs.size()}};
+}
+
+std::string HexHash(std::uint64_t hash) {
+  char buf[19] = {};
+  std::snprintf(buf, sizeof buf, "0x%016" PRIx64, hash);
+  return buf;
 }
 
 talos::schema::Identity PacketSchema() {
@@ -173,6 +191,8 @@ void WriteObserver(const std::string& path) {
     events.push_back(
         {kStartNs + std::int64_t{k} * 100 * kMs + 2 * kMs, kDriverStation, k});
   }
+  events.push_back({kStartNs + 2'001 * kMs, kHealth, 1});
+  events.push_back({kStartNs + 4'001 * kMs, kHealth, 0});
   std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
     return a.event_ns < b.event_ns;
   });
@@ -183,9 +203,12 @@ void WriteObserver(const std::string& path) {
        Source(kShot, SourceKind::WATCHER, "/shooter/state",
               sizeof(review_test::Shot), ShotSchema()),
        Source(kDriverStation, SourceKind::WATCHER, "/hw/state/driver_station",
-              sizeof(talos::hardware::Packet), PacketSchema())},
+              sizeof(talos::hardware::Packet), PacketSchema()),
+       Source(kHealth, SourceKind::SENDER, "/observer/status",
+              sizeof(review_test::Health), HealthSchema())},
       MonotonicTime::from_nanos(kStartNs + kObserverOriginNs));
   std::uint64_t index = 0;
+  std::uint64_t health_seq = 0;
   for (const Event& e : events) {
     Context message{};
     message.kind = EventKind::MESSAGE;
@@ -199,6 +222,9 @@ void WriteObserver(const std::string& path) {
           kStartNs + std::int64_t{e.k} * 20 * kMs + kMs / 2);
       const review_test::Shot shot = ShotOf(e.k);
       writer.dispatch(message, Bytes(shot));
+    } else if (e.source == kHealth) {
+      const review_test::Health health{e.k != 0, e.k == 0};
+      writer.send(message, kHealth, Bytes(health), 0, ++health_seq);
     } else {
       message.source_id = kDriverStation;
       message.publish_time =
@@ -279,7 +305,99 @@ void WriteFixtureSession(const std::string& dir) {
       << "{\n  \"session_id\": " << kSessionId
       << ",\n  \"simulation\": true,\n  \"start_wall_ns\": " << kStartWallNs
       << ",\n  \"end_wall_ns\": " << kStartWallNs + 10'000'000'000
-      << ",\n  \"nodes\": []\n}\n";
+      << ",\n  \"nodes\": [\n"
+      << "    {\n"
+      << "      \"name\": \"observer\",\n"
+      << "      \"restart_count\": 0,\n"
+      << "      \"runs_dropped\": 0,\n"
+      << "      \"runs\": [\n"
+      << "        {\"pid\": 1000, \"start_wall_ns\": "
+      << (kStartWallNs + kObserverOriginNs)
+      << ", \"end_wall_ns\": " << (kStartWallNs + 10'002'000'000)
+      << ", \"exit_code\": 0, \"exit_signal\": 0, \"reason\": \"stop\", "
+         "\"stopped_by_session\": false}\n"
+      << "      ]\n"
+      << "    },\n"
+      << "    {\n"
+      << "      \"name\": \"shooter\",\n"
+      << "      \"restart_count\": 1,\n"
+      << "      \"runs_dropped\": 0,\n"
+      << "      \"runs\": [\n"
+      << "        {\"pid\": 1001, \"start_wall_ns\": " << kStartWallNs
+      << ", \"end_wall_ns\": " << (kStartWallNs + 6'000'000'000)
+      << ", \"exit_code\": 1, \"exit_signal\": 0, \"reason\": \"crash\", "
+         "\"stopped_by_session\": false},\n"
+      << "        {\"pid\": 1002, \"start_wall_ns\": "
+      << (kStartWallNs + 7'000'000'000)
+      << ", \"end_wall_ns\": " << (kStartWallNs + 10'000'000'000)
+      << ", \"exit_code\": 0, \"exit_signal\": 0, \"reason\": \"stop\", "
+         "\"stopped_by_session\": false}\n"
+      << "      ]\n"
+      << "    }\n"
+      << "  ]\n}\n";
+  const auto shot_hash = HexHash(talos::Descriptor<review_test::Shot>::kHash);
+  const auto status_hash =
+      HexHash(talos::Descriptor<review_test::Status>::kHash);
+  const auto health_hash =
+      HexHash(talos::Descriptor<review_test::Health>::kHash);
+  const auto packet_hash =
+      HexHash(talos::Descriptor<talos::hardware::Packet>::kHash);
+  std::ofstream{dir + "/graph.json"}
+      << "{\n"
+      << "  \"describe_version\": 1,\n"
+      << "  \"session_id\": \"" << kSessionId << "\",\n"
+      << "  \"can_buses\": [\"rio\"],\n"
+      << "  \"nodes\": [\n"
+      << "    {\n"
+      << "      \"name\": \"observer\",\n"
+      << "      \"target\": \"//studio/review:observer\",\n"
+      << "      \"sources\": [\n"
+      << "        {\"kind\": \"TIMER\", \"name\": \"update\", "
+         "\"message_bytes\": 0},\n"
+      << "        {\"kind\": \"WATCHER\", \"name\": \"/shooter/state\", "
+         "\"message_bytes\": "
+      << sizeof(review_test::Shot)
+      << ", \"schema\": \"review_test.Shot\", \"schema_hash\": \"" << shot_hash
+      << "\"},\n"
+      << "        {\"kind\": \"WATCHER\", \"name\": "
+         "\"/hw/state/driver_station\", \"message_bytes\": "
+      << sizeof(talos::hardware::Packet)
+      << ", \"schema\": \"talos.hardware.Packet\", \"schema_hash\": \""
+      << packet_hash << "\"},\n"
+      << "        {\"kind\": \"SENDER\", \"name\": \"/observer/status\", "
+         "\"message_bytes\": "
+      << sizeof(review_test::Health)
+      << ", \"schema\": \"review_test.Health\", \"schema_hash\": \""
+      << health_hash << "\"}\n"
+      << "      ]\n"
+      << "    },\n"
+      << "    {\n"
+      << "      \"name\": \"shooter\",\n"
+      << "      \"target\": \"//studio/review:shooter\",\n"
+      << "      \"sources\": [\n"
+      << "        {\"kind\": \"TIMER\", \"name\": \"update\", "
+         "\"message_bytes\": 0},\n"
+      << "        {\"kind\": \"SENDER\", \"name\": \"/shooter/state\", "
+         "\"message_bytes\": "
+      << sizeof(review_test::Shot)
+      << ", \"schema\": \"review_test.Shot\", \"schema_hash\": \"" << shot_hash
+      << "\"},\n"
+      << "        {\"kind\": \"SENDER\", \"name\": \"/hw/request/shooter\", "
+         "\"message_bytes\": "
+      << sizeof(talos::hardware::Packet)
+      << ", \"external\": true, \"schema\": \"talos.hardware.Packet\", "
+         "\"schema_hash\": \""
+      << packet_hash << "\"},\n"
+      << "        {\"kind\": \"SENDER\", \"name\": \"/shooter/status\", "
+         "\"message_bytes\": "
+      << sizeof(review_test::Status)
+      << ", \"schema\": \"review_test.Status\", \"schema_hash\": \""
+      << status_hash << "\"}\n"
+      << "      ]\n"
+      << "    }\n"
+      << "  ],\n"
+      << "  \"diagnostics\": []\n"
+      << "}\n";
   if (!std::filesystem::exists(
           talos::event::log::LogSegmentPath(dir + "/shooter.tlog", 0))) {
     throw std::runtime_error("the shooter's first run did not rotate");

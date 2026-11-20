@@ -116,6 +116,7 @@ cc_test(
         ":fixture",
         ":review",
         ":review_test_message",
+        "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/events:gap_testing",

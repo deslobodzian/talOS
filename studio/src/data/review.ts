@@ -9,6 +9,7 @@
 // (data/types.ts), with an integer JSON number also accepted.
 
 import {AlertLevel} from '../generated/talos/telemetry/alert-level';
+import {parseDeclaredGraph, type DeclaredGraph} from '../system';
 import type {ChannelInfo} from './types';
 
 export const DEFAULT_REVIEW_URL = 'http://127.0.0.1:5805';
@@ -51,6 +52,39 @@ export type ReviewGap = {process: string; start_ns: string; end_ns: string;
 
 export type ReviewSample = {value: number; exact?: string; sample_ns: string};
 export type ReviewSnapshot = {t_ns: string; channels: Map<string, ReviewSample>};
+
+// GET /review/<id>/timeline.json (studio/review/review.h): Driver Station
+// mode transitions (empty when hardware_not_decoded is true), alert intervals
+// across every alert channel, and node runs mapped from manifest.json.
+export type TimelineMode = 'disabled'|'teleop'|'auto'|'test'|'estop';
+export type ReviewModeInterval = {
+  start_ns: string;
+  end_ns: string;
+  mode: TimelineMode;
+  fms: boolean;
+};
+export type TimelineAlertLevel = 'error'|'warning'|'info';
+export type ReviewAlertInterval = {
+  channel: string;
+  level: TimelineAlertLevel;
+  start_ns: string;
+  end_ns: string;
+};
+export type ReviewRunInterval = {
+  node: string;
+  start_ns: string;
+  end_ns: string|null;
+  reason: string;
+};
+export type ReviewTimeline = {
+  hardware_not_decoded: boolean;
+  modes: ReviewModeInterval[];
+  modes_dropped: number;
+  alerts: ReviewAlertInterval[];
+  alerts_dropped: number;
+  runs: ReviewRunInterval[];
+  runs_dropped: number;
+};
 
 // One channel's decimated columns, index-aligned: `count[i]` samples fell in
 // bucket i, which spans min[i]..max[i] and ends at last[i], published at
@@ -233,6 +267,77 @@ export function parseSnapshot(raw: unknown): ReviewSnapshot {
   return {t_ns: u64(source.t_ns, 'snapshot.t_ns'), channels: out};
 }
 
+const TIMELINE_MODES: ReadonlySet<string> =
+    new Set(['disabled', 'teleop', 'auto', 'test', 'estop']);
+const TIMELINE_ALERT_LEVELS: ReadonlySet<string> =
+    new Set(['error', 'warning', 'info']);
+
+function nonNegInt(value: unknown, where: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
+    fail(`${where} must be a non-negative integer`);
+  return value as number;
+}
+
+export function parseTimeline(raw: unknown): ReviewTimeline {
+  const source = record(raw, 'timeline.json');
+  if (typeof source.hardware_not_decoded !== 'boolean')
+    fail('timeline.hardware_not_decoded must be a boolean');
+  if (!Array.isArray(source.modes)) fail('timeline.modes must be an array');
+  if (!Array.isArray(source.alerts)) fail('timeline.alerts must be an array');
+  if (!Array.isArray(source.runs)) fail('timeline.runs must be an array');
+  const modes: ReviewModeInterval[] = (source.modes as unknown[]).map((entry, i) => {
+    const where = `timeline.modes[${i}]`;
+    const m = record(entry, where);
+    const start_ns = u64(m.start_ns, `${where}.start_ns`);
+    const end_ns = u64(m.end_ns, `${where}.end_ns`);
+    if (BigInt(end_ns) < BigInt(start_ns)) fail(`${where}.end_ns is before start_ns`);
+    const mode = str(m, 'mode', where);
+    if (!TIMELINE_MODES.has(mode))
+      fail(`${where}.mode must be disabled, teleop, auto, test or estop`);
+    if (typeof m.fms !== 'boolean') fail(`${where}.fms must be a boolean`);
+    return {start_ns, end_ns, mode: mode as TimelineMode, fms: m.fms as boolean};
+  });
+  const alerts: ReviewAlertInterval[] = (source.alerts as unknown[]).map((entry, i) => {
+    const where = `timeline.alerts[${i}]`;
+    const a = record(entry, where);
+    const start_ns = u64(a.start_ns, `${where}.start_ns`);
+    const end_ns = u64(a.end_ns, `${where}.end_ns`);
+    if (BigInt(end_ns) < BigInt(start_ns)) fail(`${where}.end_ns is before start_ns`);
+    const level = str(a, 'level', where);
+    if (!TIMELINE_ALERT_LEVELS.has(level))
+      fail(`${where}.level must be error, warning or info`);
+    return {
+      channel: str(a, 'channel', where),
+      level: level as TimelineAlertLevel,
+      start_ns,
+      end_ns
+    };
+  });
+  const runs: ReviewRunInterval[] = (source.runs as unknown[]).map((entry, i) => {
+    const where = `timeline.runs[${i}]`;
+    const r = record(entry, where);
+    const start_ns = u64(r.start_ns, `${where}.start_ns`);
+    const end_ns = r.end_ns === null ? null : u64(r.end_ns, `${where}.end_ns`);
+    if (end_ns !== null && BigInt(end_ns) < BigInt(start_ns))
+      fail(`${where}.end_ns is before start_ns`);
+    return {
+      node: str(r, 'node', where),
+      start_ns,
+      end_ns,
+      reason: str(r, 'reason', where)
+    };
+  });
+  return {
+    hardware_not_decoded: source.hardware_not_decoded as boolean,
+    modes,
+    modes_dropped: nonNegInt(source.modes_dropped, 'timeline.modes_dropped'),
+    alerts,
+    alerts_dropped: nonNegInt(source.alerts_dropped, 'timeline.alerts_dropped'),
+    runs,
+    runs_dropped: nonNegInt(source.runs_dropped, 'timeline.runs_dropped')
+  };
+}
+
 // GET /review/<id>/series: little-endian u32 channels, u32 buckets, then per
 // channel f64 t_ns[buckets], f64 min[], f64 max[], f64 last[], u32 count[].
 // `expected` is the number of channels requested; the response must carry
@@ -307,6 +412,33 @@ export function errorMessage(e: unknown): string {
 
 export async function listSessions(server: string, fetchFn: FetchLike): Promise<ReviewSession[]> {
   return parseSessions(await getJson(fetchFn, reviewUrl(server, 'sessions.json')));
+}
+
+export async function fetchTimeline(server: string, id: string, fetchFn: FetchLike,
+                                    signal?: AbortSignal): Promise<ReviewTimeline> {
+  return parseTimeline(await getJson(fetchFn, reviewUrl(server, id, 'timeline.json'), signal));
+}
+
+// Fetches /review/<id>/declared.json (the session's graph.json verbatim).
+// Returns null when absent (HTTP 404); throws ReviewError on transport,
+// non-404 HTTP, or parse failures.
+export async function fetchDeclared(server: string, id: string, fetchFn: FetchLike,
+                                    signal?: AbortSignal): Promise<DeclaredGraph|null> {
+  const url = reviewUrl(server, id, 'declared.json');
+  let response: Response;
+  try {
+    response = await fetchFn(url, signal ? {signal} : undefined);
+  } catch (e) {
+    if (isAbort(e)) throw e;
+    return fail(`${url}: ${errorMessage(e)}`);
+  }
+  if (response.status === 404) return null;
+  if (!response.ok) fail(`${url}: HTTP ${response.status}`);
+  try {
+    return parseDeclaredGraph(await response.text());
+  } catch (e) {
+    return fail(`${url}: ${errorMessage(e)}`);
+  }
 }
 
 // `origin` when the page was served by a review server (studio_review serves

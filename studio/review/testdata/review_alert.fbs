@@ -1,6 +1,5 @@
-// A status message with an alert field (talOS/NAMING.md), in a file of its
-// own so the fixture session's schema bytes, and so the golden responses,
-// do not depend on it.
+// A status message with an alert field (talOS/NAMING.md), used by the fixture
+// session and alert tests.
 namespace review_test;
 
 struct Health {

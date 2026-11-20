@@ -1,15 +1,19 @@
 #include "studio/review/session.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
+#include "nlohmann/json.hpp"
 #include "studio/review/hardware_channels.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
@@ -54,10 +58,138 @@ struct TopicBuild {
   HardwareRecord hardware{HardwareRecord::kNone};
   std::uint64_t schema_hash{0};
   std::vector<Channel> channels;  // struct topics
+  // Indices into `channels` whose alert level is not None.
+  std::vector<std::uint32_t> alert_channels;
   // Hardware topics: every channel name seen, with its kind.
   std::map<std::string, ChannelKind> hardware_channels;
   std::int64_t decoded_second{std::numeric_limits<std::int64_t>::min()};
 };
+
+constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
+
+ModeKind ModeFromDriverStation(
+    const std::array<std::uint64_t,
+                     talos::telemetry::kDriverStationChannelCount>& raw) {
+  if (raw[5] != 0) return ModeKind::kEstop;
+  if (raw[0] == 0 || raw[1] == 0) return ModeKind::kDisabled;
+  if (raw[2] != 0) return ModeKind::kAuto;
+  if (raw[3] != 0) return ModeKind::kTeleop;
+  if (raw[4] != 0) return ModeKind::kTest;
+  return ModeKind::kDisabled;
+}
+
+struct ModeStream {
+  std::vector<ModeInterval> intervals;
+  std::uint64_t dropped{0};
+  std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
+  ModeKind last_mode{ModeKind::kDisabled};
+  bool last_fms{false};
+  bool closed_last{false};
+};
+
+struct AlertChannelState {
+  bool active{false};
+  std::int64_t start_ns{0};
+};
+
+struct RawAlertInterval {
+  std::int64_t start_ns{0};
+  std::int64_t end_ns{0};
+  std::uint32_t channel{0};
+};
+
+struct AlertStream {
+  std::vector<AlertChannelState> state;
+  std::vector<RawAlertInterval> intervals;
+  std::uint64_t dropped{0};
+  std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
+};
+
+bool ReadManifestInt(const nlohmann::json& object, std::string_view key,
+                     std::int64_t& out) {
+  const auto it = object.find(key);
+  if (it == object.end()) return false;
+  if (it->is_number_integer()) {
+    out = it->get<std::int64_t>();
+    return true;
+  }
+  if (it->is_string()) {
+    const std::string& text = it->get_ref<const std::string&>();
+    const auto [end, ec] =
+        std::from_chars(text.data(), text.data() + text.size(), out);
+    return ec == std::errc{} && end == text.data() + text.size() &&
+           !text.empty();
+  }
+  return false;
+}
+
+void ReadManifestRuns(const fs::path& manifest_path,
+                      std::int64_t origin_wall_ns,
+                      std::vector<RunInterval>& runs,
+                      std::uint64_t& runs_dropped) {
+  std::error_code error;
+  if (fs::is_symlink(manifest_path, error) ||
+      !fs::is_regular_file(manifest_path, error)) {
+    return;
+  }
+  const auto bytes = fs::file_size(manifest_path, error);
+  if (error || bytes == 0 || bytes > kMaxManifestBytes) return;
+  std::ifstream stream{manifest_path};
+  if (!stream.is_open()) return;
+  const auto manifest = nlohmann::json::parse(
+      std::string{std::istreambuf_iterator<char>{stream}, {}}, nullptr,
+      /*allow_exceptions=*/false);
+  if (!manifest.is_object()) return;
+  const auto nodes = manifest.find("nodes");
+  if (nodes == manifest.end() || !nodes->is_array()) return;
+  for (const auto& node : *nodes) {
+    if (!node.is_object()) continue;
+    const auto name_it = node.find("name");
+    if (name_it == node.end() || !name_it->is_string()) continue;
+    const std::string& node_name = name_it->get_ref<const std::string&>();
+    std::int64_t node_dropped = 0;
+    if (ReadManifestInt(node, "runs_dropped", node_dropped) &&
+        node_dropped > 0) {
+      runs_dropped += static_cast<std::uint64_t>(node_dropped);
+    }
+    const auto node_runs = node.find("runs");
+    if (node_runs == node.end() || !node_runs->is_array()) continue;
+    for (const auto& run : *node_runs) {
+      if (!run.is_object()) continue;
+      std::int64_t start_wall_ns = 0;
+      if (!ReadManifestInt(run, "start_wall_ns", start_wall_ns) ||
+          start_wall_ns <= 0) {
+        continue;
+      }
+      const auto reason_it = run.find("reason");
+      if (reason_it == run.end() || !reason_it->is_string()) continue;
+      std::int64_t end_wall_ns = 0;
+      (void)ReadManifestInt(run, "end_wall_ns", end_wall_ns);
+      std::int64_t start_ns = start_wall_ns - origin_wall_ns;
+      if (start_ns < 0) start_ns = 0;
+      std::optional<std::int64_t> end_ns;
+      if (end_wall_ns > 0) {
+        end_ns = std::max(start_ns, end_wall_ns - origin_wall_ns);
+      }
+      runs.push_back({node_name, start_ns, end_ns,
+                      reason_it->get_ref<const std::string&>()});
+    }
+  }
+  std::sort(runs.begin(), runs.end(),
+            [](const RunInterval& a, const RunInterval& b) {
+              const std::int64_t a_end =
+                  a.end_ns.value_or(std::numeric_limits<std::int64_t>::max());
+              const std::int64_t b_end =
+                  b.end_ns.value_or(std::numeric_limits<std::int64_t>::max());
+              return std::tie(a.start_ns, a.node, a_end, a.reason) <
+                     std::tie(b.start_ns, b.node, b_end, b.reason);
+            });
+  if (runs.size() > kMaxTimelineRuns) {
+    runs_dropped += runs.size() - kMaxTimelineRuns;
+    runs.resize(kMaxTimelineRuns);
+  }
+  runs.shrink_to_fit();
+}
 
 // A log file as the index pass learns it: per source id, its topic (-1 for
 // none, kUnresolved before its first value record) and which value record
@@ -118,6 +250,11 @@ class Indexer {
             source.name, schema.name, schema.bfbs);
       }
       if (topic.decoder == Decoder::kHardware || !topic.channels.empty()) {
+        for (std::uint32_t c = 0; c < topic.channels.size(); ++c) {
+          if (topic.channels[c].alert != Talos::Telemetry::AlertLevel_None) {
+            topic.alert_channels.push_back(c);
+          }
+        }
         index = static_cast<std::int32_t>(topics.size());
         topics.push_back(std::move(topic));
       }
@@ -149,6 +286,22 @@ std::optional<HeaderTimes> ReadHeaderTimes(const std::string& path) {
 
 }  // namespace
 
+std::string_view ModeKindName(ModeKind mode) {
+  switch (mode) {
+    case ModeKind::kDisabled:
+      return "disabled";
+    case ModeKind::kTeleop:
+      return "teleop";
+    case ModeKind::kAuto:
+      return "auto";
+    case ModeKind::kTest:
+      return "test";
+    case ModeKind::kEstop:
+      return "estop";
+  }
+  return "disabled";
+}
+
 double ValueOf(ChannelKind kind, std::uint64_t raw) {
   switch (kind) {
     case Talos::Telemetry::ChannelKind_Bool:
@@ -176,6 +329,9 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   std::size_t file = 0;
   bool any = false;
   std::vector<HardwareSample> samples;
+  std::map<std::pair<std::string, bool>, ModeStream> mode_streams;
+  std::map<std::tuple<std::size_t, std::string, bool>, AlertStream>
+      alert_streams;
   auto recorded = talos::launcher::RecordedProtocolVersion({dir.string()});
   if (const std::string line = recorded.Disagreement(); !line.empty()) {
     std::cerr << "studio_review: " << dir.string() << ": " << line << '\n';
@@ -241,10 +397,11 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
                    r.payload);
     }
     if (build.topic[id] < 0) return true;
-    build.kinds[id] |=
-        r.header.kind == static_cast<std::uint16_t>(EventKind::SEND) ? 1 : 2;
-    TopicBuild& topic =
-        indexer.topics[static_cast<std::size_t>(build.topic[id])];
+    const bool is_send =
+        r.header.kind == static_cast<std::uint16_t>(EventKind::SEND);
+    build.kinds[id] |= is_send ? 1 : 2;
+    const auto topic_idx = static_cast<std::size_t>(build.topic[id]);
+    TopicBuild& topic = indexer.topics[topic_idx];
     // A hardware topic's channels are what its packets hold: learned from
     // its first packet in each second.
     if (topic.decoder == Decoder::kHardware && topic.decoded_second != second) {
@@ -253,6 +410,69 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       for (const HardwareSample& sample : samples) {
         if (!sample.null)
           topic.hardware_channels.emplace(sample.name, sample.kind);
+      }
+    } else if (topic.decoder == Decoder::kDriverStation) {
+      std::array<std::uint64_t, talos::telemetry::kDriverStationChannelCount>
+          values{};
+      if (talos::telemetry::ReadDriverStation(r.payload, values)) {
+        const std::int64_t publish_ns = r.header.publish_time_ns;
+        ModeStream& stream = mode_streams[{log_file.process, is_send}];
+        if (publish_ns >= stream.last_publish_ns) {
+          stream.last_publish_ns = publish_ns;
+          const ModeKind mode = ModeFromDriverStation(values);
+          const bool fms = values[6] != 0;
+          if (stream.intervals.empty()) {
+            stream.intervals.push_back({publish_ns, publish_ns, mode, fms});
+            stream.last_mode = mode;
+            stream.last_fms = fms;
+          } else if (mode != stream.last_mode || fms != stream.last_fms) {
+            if (!stream.closed_last) {
+              stream.intervals.back().end_ns = publish_ns;
+              if (stream.intervals.size() < kMaxTimelineModes) {
+                stream.intervals.push_back({publish_ns, publish_ns, mode, fms});
+              } else {
+                stream.closed_last = true;
+                ++stream.dropped;
+              }
+            } else {
+              ++stream.dropped;
+            }
+            stream.last_mode = mode;
+            stream.last_fms = fms;
+          }
+        }
+      }
+    } else if (topic.decoder == Decoder::kStruct &&
+               !topic.alert_channels.empty()) {
+      const std::int64_t publish_ns = r.header.publish_time_ns;
+      AlertStream& stream =
+          alert_streams[{topic_idx, log_file.process, is_send}];
+      if (stream.state.empty()) {
+        stream.state.resize(topic.alert_channels.size());
+      }
+      if (publish_ns >= stream.last_publish_ns) {
+        stream.last_publish_ns = publish_ns;
+        for (std::size_t i = 0; i < topic.alert_channels.size(); ++i) {
+          const std::uint32_t c = topic.alert_channels[i];
+          std::uint64_t raw = 0;
+          if (!talos::telemetry::ReadChannel(topic.channels[c], r.payload,
+                                             raw)) {
+            continue;
+          }
+          const bool active = raw != 0;
+          AlertChannelState& st = stream.state[i];
+          if (active && !st.active) {
+            st.active = true;
+            st.start_ns = publish_ns;
+          } else if (!active && st.active) {
+            st.active = false;
+            if (stream.intervals.size() < kMaxTimelineAlerts) {
+              stream.intervals.push_back({st.start_ns, publish_ns, c});
+            } else {
+              ++stream.dropped;
+            }
+          }
+        }
       }
     }
     return true;
@@ -279,6 +499,7 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
 
   // Each topic's process: the one that sent it, else the one whose log
   // path sorts first among those that received it.
+  std::vector<std::size_t> topic_build_index;
   for (std::size_t t = 0; t < indexer.topics.size(); ++t) {
     TopicBuild& build = indexer.topics[t];
     std::optional<std::size_t> sender;
@@ -338,6 +559,7 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     if (topic.channels.empty()) continue;
     session->topics_.push_back(std::move(topic));
     session->hardware_index_.push_back(std::move(hardware_index));
+    topic_build_index.push_back(t);
   }
   // Topics by name, so channels.json lists them in a stable order.
   std::vector<std::size_t> order(session->topics_.size());
@@ -347,9 +569,11 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   });
   std::vector<Topic> topics;
   std::vector<std::unordered_map<std::string, std::uint32_t>> hardware_index;
+  std::vector<std::size_t> sorted_build_index;
   for (const std::size_t i : order) {
     topics.push_back(std::move(session->topics_[i]));
     hardware_index.push_back(std::move(session->hardware_index_[i]));
+    sorted_build_index.push_back(topic_build_index[i]);
   }
   session->topics_ = std::move(topics);
   session->hardware_index_ = std::move(hardware_index);
@@ -359,6 +583,62 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       session->by_name_.emplace(channels[c].name, ChannelRef{t, c});
     }
   }
+
+  // Finalize timeline modes and alerts from each topic's canonical stream.
+  std::vector<AlertInterval> combined_alerts;
+  for (std::uint32_t t = 0; t < session->topics_.size(); ++t) {
+    const Topic& topic = session->topics_[t];
+    const bool is_send = topic.kind == EventKind::SEND;
+    if (!protocol.foreign() && topic.decoder == Decoder::kDriverStation) {
+      const auto it = mode_streams.find({topic.process, is_send});
+      if (it != mode_streams.end()) {
+        session->modes_ = std::move(it->second.intervals);
+        session->modes_dropped_ = it->second.dropped;
+        if (!session->modes_.empty() && !it->second.closed_last) {
+          session->modes_.back().end_ns =
+              std::max(session->modes_.back().start_ns, session->end_ns_);
+        }
+        session->modes_.shrink_to_fit();
+      }
+    } else if (topic.decoder == Decoder::kStruct) {
+      const std::size_t build_idx = sorted_build_index[t];
+      const auto it = alert_streams.find({build_idx, topic.process, is_send});
+      if (it != alert_streams.end()) {
+        AlertStream& stream = it->second;
+        const auto& alert_channels = indexer.topics[build_idx].alert_channels;
+        for (std::size_t i = 0; i < alert_channels.size(); ++i) {
+          if (stream.state[i].active) {
+            if (stream.intervals.size() < kMaxTimelineAlerts) {
+              stream.intervals.push_back(
+                  {stream.state[i].start_ns,
+                   std::max(stream.state[i].start_ns, session->end_ns_),
+                   alert_channels[i]});
+            } else {
+              ++stream.dropped;
+            }
+          }
+        }
+        session->alerts_dropped_ += stream.dropped;
+        for (const RawAlertInterval& iv : stream.intervals) {
+          combined_alerts.push_back(
+              {iv.start_ns, iv.end_ns, ChannelRef{t, iv.channel}});
+        }
+      }
+    }
+  }
+  std::sort(combined_alerts.begin(), combined_alerts.end(),
+            [&session](const AlertInterval& a, const AlertInterval& b) {
+              if (a.start_ns != b.start_ns) return a.start_ns < b.start_ns;
+              if (a.end_ns != b.end_ns) return a.end_ns < b.end_ns;
+              return session->channel(a.channel).name <
+                     session->channel(b.channel).name;
+            });
+  if (combined_alerts.size() > kMaxTimelineAlerts) {
+    session->alerts_dropped_ += combined_alerts.size() - kMaxTimelineAlerts;
+    combined_alerts.resize(kMaxTimelineAlerts);
+  }
+  session->alerts_ = std::move(combined_alerts);
+  session->alerts_.shrink_to_fit();
 
   std::optional<HeaderTimes> origin;
   for (const LogFile& log_file : session->files_) {
@@ -370,6 +650,8 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   if (origin) {
     session->origin_wall_ns_ = origin->wall_ns - origin->monotonic_ns;
   }
+  ReadManifestRuns(dir / "manifest.json", session->origin_wall_ns_,
+                   session->runs_, session->runs_dropped_);
   return session;
 }
 

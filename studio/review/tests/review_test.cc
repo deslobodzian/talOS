@@ -35,6 +35,7 @@
 #include "studio/review/http.h"
 #include "studio/review/series_cache.h"
 #include "studio/review/testdata/fixture.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/gap_testing.h"
@@ -934,6 +935,8 @@ GoldenRequests() {
       {"sessions.json", {"/review/sessions.json", ""}},
       {"channels.json", {"/review/s1/channels.json", ""}},
       {"bounds.json", {"/review/s1/bounds.json", ""}},
+      {"timeline.json", {"/review/s1/timeline.json", ""}},
+      {"declared.json", {"/review/s1/declared.json", ""}},
       {"snapshot.json", {"/review/s1/snapshot", "t_ns=" + end}},
       {"series.bin",
        {"/review/s1/series",
@@ -1324,6 +1327,314 @@ TEST(HardwareChannelsTest, MotorModeReadsNeutralApartFromZeroVolts) {
     ASSERT_TRUE(values.contains(name)) << name;
     EXPECT_EQ(values[name], value) << name;
   }
+}
+
+// Guards timeline.json mode transitions (all 5 modes + FMS flag) and
+// REQ-OPS-51: when hardware_not_decoded is true, modes is empty so consumers
+// never misread undecoded hardware packets as "disabled".
+// REQ-OPS-41, REQ-OPS-51
+TEST_F(ReviewTest, TimelineModesAndHardwareNotDecoded) {
+  namespace ds = talos::driver_station;
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  // All 5 modes + FMS transition in a small synthetic session.
+  const std::string dir = Library() + "/modes";
+  std::filesystem::create_directories(dir);
+  {
+    using P = talos::Descriptor<talos::hardware::Packet>;
+    talos::event::Registration source;
+    source.id = 2;
+    source.kind = SourceKind::SENDER;
+    source.name = "/hw/state/driver_station";
+    source.message_bytes = sizeof(talos::hardware::Packet);
+    source.schema = {std::string{P::kName}, P::kHash, {}};
+    tlog::LogWriter writer{dir + "/bridge.tlog", "bridge",
+                           tlog::LogWriterOptions{8192, 1, false}, 1};
+    writer.start({source}, MonotonicTime::from_nanos(kStartNs));
+    const struct {
+      std::int64_t offset_ms;
+      std::uint32_t flags;
+    } packets[] = {
+        {0, ds::kDsAttached},
+        {1000, ds::kDsAttached | ds::kFmsAttached},
+        {2000,
+         ds::kDsAttached | ds::kFmsAttached | ds::kEnabled | ds::kAutonomous},
+        {3000, ds::kDsAttached | ds::kFmsAttached | ds::kEnabled | ds::kTeleop},
+        {4000, ds::kDsAttached | ds::kEnabled | ds::kTest},
+        {5000, ds::kDsAttached | ds::kEStop},
+    };
+    std::uint64_t seq = 0;
+    for (const auto& p : packets) {
+      ds::DriverStationData data;
+      data.fms.flags = p.flags;
+      talos::hardware::Packet packet{};
+      packet.size = static_cast<std::uint32_t>(ds::Encode(data, packet.data));
+      Context ctx{};
+      ctx.dispatch_index = ++seq;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + p.offset_ms * kMs);
+      writer.send(ctx, 2, std::as_bytes(std::span{&packet, 1}), 0, seq);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  Review review{Library(), 1u << 20};
+  const Response modes_resp = review.Get("/review/modes/timeline.json", "");
+  ASSERT_EQ(modes_resp.status, 200) << modes_resp.body;
+  const json tl = json::parse(modes_resp.body);
+  EXPECT_EQ(tl["hardware_not_decoded"], false);
+  EXPECT_EQ(tl["modes_dropped"], 0);
+  ASSERT_EQ(tl["modes"].size(), 6u);
+  EXPECT_EQ(tl["modes"][0]["mode"], "disabled");
+  EXPECT_EQ(tl["modes"][0]["fms"], false);
+  EXPECT_EQ(tl["modes"][1]["mode"], "disabled");
+  EXPECT_EQ(tl["modes"][1]["fms"], true);
+  EXPECT_EQ(tl["modes"][2]["mode"], "auto");
+  EXPECT_EQ(tl["modes"][2]["fms"], true);
+  EXPECT_EQ(tl["modes"][3]["mode"], "teleop");
+  EXPECT_EQ(tl["modes"][3]["fms"], true);
+  EXPECT_EQ(tl["modes"][4]["mode"], "test");
+  EXPECT_EQ(tl["modes"][4]["fms"], false);
+  EXPECT_EQ(tl["modes"][5]["mode"], "estop");
+  EXPECT_EQ(tl["modes"][5]["start_ns"], std::to_string(kStartNs + 5 * kSecond));
+  EXPECT_EQ(tl["modes"][5]["end_ns"], std::to_string(kStartNs + 5 * kSecond));
+  std::filesystem::remove_all(dir);
+
+  // Hardware protocol mismatch: hardware_not_decoded is true and modes is [].
+  const std::string foreign = Library() + "/foreign_tl";
+  testing::WriteFixtureSession(foreign);
+  const std::uint16_t other = talos::protocol::kProtocolVersion - 1;
+  {
+    std::ifstream in{foreign + "/manifest.json"};
+    std::string text{std::istreambuf_iterator<char>{in}, {}};
+    text.insert(
+        1, "\n  \"hardware_protocol_version\": " + std::to_string(other) + ",");
+    std::ofstream{foreign + "/manifest.json"} << text;
+  }
+  const Response foreign_resp =
+      review.Get("/review/foreign_tl/timeline.json", "");
+  ASSERT_EQ(foreign_resp.status, 200) << foreign_resp.body;
+  const json foreign_tl = json::parse(foreign_resp.body);
+  EXPECT_EQ(foreign_tl["hardware_not_decoded"], true);
+  EXPECT_TRUE(foreign_tl["modes"].empty());
+  EXPECT_EQ(foreign_tl["modes_dropped"], 0);
+  // Non-hardware alerts and manifest runs are still served.
+  EXPECT_EQ(foreign_tl["alerts"].size(), 1u);
+  EXPECT_EQ(foreign_tl["runs"].size(), 3u);
+  std::filesystem::remove_all(foreign);
+}
+
+// Guards alert intervals in timeline.json: an alert raised and cleared closes
+// at the clearing record's publish_ns; one still active at session end closes
+// at session end_ns.
+// REQ-OPS-37, REQ-OPS-41
+TEST_F(ReviewTest, TimelineAlertsCoverClearedAndActiveToEnd) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const std::string dir = Library() + "/alert_tl";
+  std::filesystem::create_directories(dir);
+  {
+    using D = talos::Descriptor<review_test::Health>;
+    talos::event::Registration health;
+    health.id = 2;
+    health.kind = SourceKind::SENDER;
+    health.name = "/thing/status";
+    health.message_bytes = sizeof(review_test::Health);
+    health.schema = {std::string{D::kName}, D::kHash,
+                     std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                                 D::kBfbs.size()}};
+    tlog::LogWriter writer{dir + "/thing.tlog", "thing",
+                           tlog::LogWriterOptions{8192, 1, false}, 1};
+    writer.start({health}, MonotonicTime::from_nanos(kStartNs));
+    const struct {
+      std::int64_t offset_ms;
+      bool active;
+    } samples[] = {
+        {0, false},    {1000, true}, {2000, true},
+        {3000, false}, {5000, true}, {8000, true},
+    };
+    std::uint64_t seq = 0;
+    for (const auto& s : samples) {
+      const review_test::Health msg{s.active, !s.active};
+      Context ctx{};
+      ctx.dispatch_index = ++seq;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + s.offset_ms * kMs);
+      writer.send(ctx, 2, std::as_bytes(std::span{&msg, 1}), 0, seq);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  Review review{Library(), 1u << 20};
+  const Response resp = review.Get("/review/alert_tl/timeline.json", "");
+  ASSERT_EQ(resp.status, 200) << resp.body;
+  const json tl = json::parse(resp.body);
+  ASSERT_EQ(tl["alerts"].size(), 2u);
+  EXPECT_EQ(tl["alerts"][0]["channel"], "thing/status/alert_error_link_lost");
+  EXPECT_EQ(tl["alerts"][0]["level"], "error");
+  EXPECT_EQ(tl["alerts"][0]["start_ns"],
+            std::to_string(kStartNs + 1 * kSecond));
+  EXPECT_EQ(tl["alerts"][0]["end_ns"], std::to_string(kStartNs + 3 * kSecond));
+  EXPECT_EQ(tl["alerts"][1]["start_ns"],
+            std::to_string(kStartNs + 5 * kSecond));
+  EXPECT_EQ(tl["alerts"][1]["end_ns"], std::to_string(kStartNs + 8 * kSecond));
+  std::filesystem::remove_all(dir);
+}
+
+// Guards manifest runs[] mapping via origin_wall_ns, end_wall_ns == 0 -> null,
+// runs_dropped preservation, and never guessing runs from .restart<N>.tlog
+// filenames when manifest.json has no runs.
+// REQ-OPS-41
+TEST_F(ReviewTest, TimelineRunsMapFromManifestAndHandleUnfinishedRuns) {
+  const std::string dir = Library() + "/runs_tl";
+  testing::WriteFixtureSession(dir);
+  // Overwrite manifest with an unfinished run (end_wall_ns == 0) and
+  // runs_dropped > 0.
+  std::ofstream{dir + "/manifest.json"}
+      << "{\n  \"session_id\": " << testing::kSessionId
+      << ",\n  \"simulation\": true,\n  \"start_wall_ns\": "
+      << testing::kStartWallNs << ",\n  \"end_wall_ns\": 0,\n  \"nodes\": [\n"
+      << "    {\"name\": \"shooter\", \"runs_dropped\": 3, \"runs\": [\n"
+      << "      {\"pid\": 1, \"start_wall_ns\": " << testing::kStartWallNs
+      << ", \"end_wall_ns\": " << (testing::kStartWallNs + 2 * kSecond)
+      << ", \"reason\": \"stalled\"},\n"
+      << "      {\"pid\": 2, \"start_wall_ns\": "
+      << (testing::kStartWallNs + 4 * kSecond)
+      << ", \"end_wall_ns\": 0, \"reason\": \"running\"}\n"
+      << "    ]}\n  ]\n}\n";
+  Review review{Library(), 1u << 20};
+  const Response resp = review.Get("/review/runs_tl/timeline.json", "");
+  ASSERT_EQ(resp.status, 200) << resp.body;
+  const json tl = json::parse(resp.body);
+  EXPECT_EQ(tl["runs_dropped"], 3);
+  ASSERT_EQ(tl["runs"].size(), 2u);
+  EXPECT_EQ(tl["runs"][0]["node"], "shooter");
+  EXPECT_EQ(tl["runs"][0]["start_ns"], std::to_string(kStartNs));
+  EXPECT_EQ(tl["runs"][0]["end_ns"], std::to_string(kStartNs + 2 * kSecond));
+  EXPECT_EQ(tl["runs"][0]["reason"], "stalled");
+  EXPECT_EQ(tl["runs"][1]["start_ns"], std::to_string(kStartNs + 4 * kSecond));
+  EXPECT_TRUE(tl["runs"][1]["end_ns"].is_null());
+  EXPECT_EQ(tl["runs"][1]["reason"], "running");
+  std::filesystem::remove_all(dir);
+
+  // Removing manifest.json leaves runs empty even though shooter.restart1.tlog
+  // is present: never guess restart reasons from filenames.
+  const std::string no_manifest = Library() + "/no_manifest_tl";
+  testing::WriteFixtureSession(no_manifest);
+  std::filesystem::remove(no_manifest + "/manifest.json");
+  const Response no_m = review.Get("/review/no_manifest_tl/timeline.json", "");
+  ASSERT_EQ(no_m.status, 200) << no_m.body;
+  const json no_m_tl = json::parse(no_m.body);
+  EXPECT_TRUE(no_m_tl["runs"].empty());
+  EXPECT_EQ(no_m_tl["runs_dropped"], 0);
+  std::filesystem::remove_all(no_manifest);
+}
+
+// Guards REQ-OPS-42 timeline heap caps: pathological flapping past
+// kMaxTimelineModes and kMaxTimelineAlerts stays capped at the exact ceiling
+// and reports the dropped counts, closing the last kept mode at its actual
+// transition rather than falsely extending it to session end.
+// REQ-OPS-42
+TEST_F(ReviewTest, TimelineCapsFlappingModesAndAlerts) {
+  namespace ds = talos::driver_station;
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const std::string dir = Library() + "/flap";
+  std::filesystem::create_directories(dir);
+  constexpr std::size_t kExtraModes = 5;
+  constexpr std::size_t kExtraAlerts = 7;
+  {
+    using P = talos::Descriptor<talos::hardware::Packet>;
+    using H = talos::Descriptor<review_test::Health>;
+    talos::event::Registration ds_src;
+    ds_src.id = 2;
+    ds_src.kind = SourceKind::SENDER;
+    ds_src.name = "/hw/state/driver_station";
+    ds_src.message_bytes = sizeof(talos::hardware::Packet);
+    ds_src.schema = {std::string{P::kName}, P::kHash, {}};
+    talos::event::Registration health_src;
+    health_src.id = 3;
+    health_src.kind = SourceKind::SENDER;
+    health_src.name = "/thing/status";
+    health_src.message_bytes = sizeof(review_test::Health);
+    health_src.schema = {
+        std::string{H::kName}, H::kHash,
+        std::string{reinterpret_cast<const char*>(H::kBfbs.data()),
+                    H::kBfbs.size()}};
+    tlog::LogWriter writer{dir + "/flap.tlog", "flap",
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start({ds_src, health_src}, MonotonicTime::from_nanos(kStartNs));
+
+    std::uint64_t seq = 0;
+    const std::size_t total_modes = kMaxTimelineModes + kExtraModes;
+    const std::size_t total_alert_edges =
+        (kMaxTimelineAlerts + kExtraAlerts) * 2;
+    const std::size_t steps = std::max(total_modes, total_alert_edges);
+    for (std::size_t i = 0; i < steps; ++i) {
+      Context ctx{};
+      ctx.dispatch_index = ++seq;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(
+          kStartNs + static_cast<std::int64_t>(i) * kMs);
+      if (i < total_modes) {
+        ds::DriverStationData data;
+        data.fms.flags =
+            ds::kDsAttached | ((i % 2 == 1) ? (ds::kEnabled | ds::kTeleop) : 0);
+        talos::hardware::Packet packet{};
+        packet.size = static_cast<std::uint32_t>(ds::Encode(data, packet.data));
+        writer.send(ctx, 2, std::as_bytes(std::span{&packet, 1}), 0, seq);
+      }
+      if (i < total_alert_edges) {
+        const review_test::Health msg{i % 2 == 0, i % 2 == 1};
+        writer.send(ctx, 3, std::as_bytes(std::span{&msg, 1}), 0, seq);
+      }
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  Review review{Library(), 1u << 20};
+  const Response resp = review.Get("/review/flap/timeline.json", "");
+  ASSERT_EQ(resp.status, 200) << resp.body;
+  const json tl = json::parse(resp.body);
+  EXPECT_EQ(tl["modes"].size(), kMaxTimelineModes);
+  EXPECT_EQ(tl["modes_dropped"], kExtraModes);
+  // Last kept mode closed when the first dropped mode began (index
+  // kMaxTimelineModes), not stretched to the end of the session.
+  EXPECT_EQ(tl["modes"].back()["end_ns"],
+            std::to_string(kStartNs +
+                           static_cast<std::int64_t>(kMaxTimelineModes) * kMs));
+  EXPECT_EQ(tl["alerts"].size(), kMaxTimelineAlerts);
+  EXPECT_EQ(tl["alerts_dropped"], kExtraAlerts);
+  std::filesystem::remove_all(dir);
+}
+
+// Guards GET /review/<id>/declared.json: serves graph.json verbatim when
+// present and 404 plain text when absent.
+// REQ-OPS-41, REQ-CONTRACT-29
+TEST_F(ReviewTest, DeclaredServesGraphJsonOr404WhenAbsent) {
+  Review review{Library(), 1u << 20};
+  const Response present = review.Get("/review/s1/declared.json", "");
+  ASSERT_EQ(present.status, 200) << present.body;
+  EXPECT_EQ(present.content_type, "application/json");
+  EXPECT_EQ(present.body, ReadFile(Library() + "/s1/graph.json"));
+
+  const std::string dir = Library() + "/no_graph";
+  testing::WriteFixtureSession(dir);
+  std::filesystem::remove(dir + "/graph.json");
+  const Response absent = review.Get("/review/no_graph/declared.json", "");
+  EXPECT_EQ(absent.status, 404);
+  EXPECT_EQ(absent.content_type, "text/plain; charset=utf-8");
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace
