@@ -737,9 +737,7 @@ int32_t talos_pwm_stop(TalosNode* node, int64_t index) {
 int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
-    const auto& link = Link(node);
-    const auto i = Index(index);
-    const auto s = HardwareAccess::motor_sample(link, i);
+    const auto s = HardwareAccess::motor_sample(Link(node), Index(index));
     o.valid = s.valid;
     o.position = s.position_rot;
     o.velocity = s.velocity_rps;
@@ -747,8 +745,12 @@ int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
     o.current = s.stator_current_a;
     o.temperature_c = s.temperature_c;
     o.supply_current_a = s.supply_current_a;
-    o.forward_limit = HardwareAccess::motor_hard_limit(link, i, true);
-    o.reverse_limit = HardwareAccess::motor_hard_limit(link, i, false);
+    o.forward_limit =
+        s.valid &&
+        (s.fault_flags & talos::hardware::kMotorForwardHardLimitFlag) != 0;
+    o.reverse_limit =
+        s.valid &&
+        (s.fault_flags & talos::hardware::kMotorReverseHardLimitFlag) != 0;
     return TALOS_OK;
   });
 }
