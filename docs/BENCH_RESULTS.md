@@ -24,6 +24,28 @@ has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
 ## 2026-11-20
 
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `1218376d`, no
+hardware attached. Three consecutive uncached full suites
+(`bazel test --nocache_test_results --test_output=errors //...`, 251 tests)
+each started immediately after driving 1-minute `vm.loadavg` to >= 9.0
+(`TODO.md` `MAC-2`, `TEST-10`):
+
+- **MAC-2: `//bench/main_processor:bundle_test` passes 3 of 3 full suites
+  started at load >= 9.**
+  - Run 1 (start load `9.01 5.18 3.54`, elapsed 166 s):
+    `//bench/main_processor:bundle_test` PASSED in 33.8 s (`install_check_test`
+    27.1 s, `warm_up_test` 18.1 s). Two unrelated tests failed under the initial
+    load spike: `//talOS/launcher:supervision_test`
+    (`Supervision.HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes`,
+    6430 ms; real wall-clock deadlines, `TEST-10`) and `//tools:prepush_test`
+    (TIMEOUT in 60.0 s).
+  - Run 2 (start load `9.16 6.88 4.63`, elapsed 128 s):
+    `//bench/main_processor:bundle_test` PASSED in 50.8 s (`install_check_test`
+    42.3 s, `warm_up_test` 14.6 s); 251/251 tests passed.
+  - Run 3 (start load `9.12 6.91 4.99`, elapsed 139 s):
+    `//bench/main_processor:bundle_test` PASSED in 55.6 s (`install_check_test`
+    26.8 s, `warm_up_test` 15.4 s); 251/251 tests passed.
+
 Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `0cebbd0d`, no
 hardware attached, idle (load 1.2). Measurements for `TODO.md` `SCALE-1`,
 `RT-7`, `STUDIO-2`, `MAC-2`, and `INC-3`:
