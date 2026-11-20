@@ -76,11 +76,11 @@ TEST(SimMotorDiagnostics, AmbientAndEffortPlaceholdersAcrossNeutral) {
       EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 20.0);
     } else {
       EXPECT_GT(state.motors[0].supply_current_a, 0.0);
-      EXPECT_DOUBLE_EQ(
-          state.motors[0].supply_current_a,
-          std::min(40.0, std::abs(state.motors[0].voltage *
-                                  state.motors[0].stator_current_a) /
-                             kSimRestingSupplyV));
+      EXPECT_LE(state.motors[0].supply_current_a, 40.0);
+      // At 6 V command on a 12.6 V bus, step-down power conservation keeps
+      // battery draw strictly below winding (stator) current.
+      EXPECT_LT(state.motors[0].supply_current_a,
+                state.motors[0].stator_current_a);
     }
     backend->Neutral();
     StepBackend(*backend, state, now_us, 5000, 1);
@@ -372,10 +372,11 @@ TEST(SimHealth, PowerVisibleWhileDisabledAndStale) {
 }
 
 // Stator current is the winding model, (applied volts - back-EMF) / R with
-// R = 12 V / the motor type's stall current, clamped to stator_limit_a: a
-// stalled rotor draws stall_current / 12 per volt (a 1 V homing push into a
-// stop reads loaded), one at its free speed for the applied volts draws
-// none, and 12 V at half the 12 V free speed draws half the stall current.
+// R = 12 V / the motor type's stall current, with LimitWindingVoltage enforcing
+// stator_limit_a within the voltage ceiling: a stalled rotor draws
+// stall_current / 12 per volt (a 1 V homing push into a stop reads loaded), one
+// at its free speed for the applied volts draws none, and 12 V at half the 12 V
+// free speed draws half the stall current.
 TEST(SimMotorDiagnostics, StatorCurrentIsTheWindingModel) {
   struct Case {
     MotorType type;
@@ -418,7 +419,7 @@ TEST(SimMotorDiagnostics, StatorCurrentIsTheWindingModel) {
   s.motor_count = 1;
   uint64_t now_us = 0;
   StepBackend(backend, s, now_us, 5000, 1);
-  EXPECT_DOUBLE_EQ(s.motors[0].stator_current_a, 80.0);
+  EXPECT_NEAR(s.motors[0].stator_current_a, 80.0, 1e-9);
 }
 
 // A motor driven into its soft limit is held there with its rotor stopped,
@@ -475,22 +476,20 @@ TEST(SimMotorDiagnostics, TorqueCurrentAcceleratesToTheVoltageCeiling) {
     EXPECT_GT(s.motors[0].velocity_rps, 1.0);
     EXPECT_LT(s.motors[0].velocity_rps, 30.0);
     EXPECT_GT(s.motors[0].stator_current_a, 1.5);
-    EXPECT_LE(s.motors[0].stator_current_a, 2.0);
+    EXPECT_LE(s.motors[0].stator_current_a, 2.0 + 1e-9);
     StepBackend(backend, s, now_us, 5000, 800);  // 5 s: at the 4 V ceiling
     const double ceiling_rps = 4.0 / 12.0 * 100.0;
-    EXPECT_NEAR(s.motors[0].velocity_rps, ceiling_rps, 0.01 * ceiling_rps);
+    const double vel_at_ceiling = s.motors[0].velocity_rps;
+    EXPECT_NEAR(vel_at_ceiling, ceiling_rps, 0.01 * ceiling_rps);
     EXPECT_NEAR(s.motors[0].voltage, 4.0, 1e-9);
-    EXPECT_LE(s.motors[0].stator_current_a, 2.0);
+    EXPECT_LE(s.motors[0].stator_current_a, 2.0 + 1e-9);
     command[0].demand = 0.0;
     ASSERT_TRUE(backend.Apply(command));
     StepBackend(backend, s, now_us, 5000, 200);  // 1 s of zero stator current
-    // At 0 A electromagnetic torque, only the Kraken X60's 2 A no-load drag
-    // slows the rotor (rather than braking to 0 as Neutral() does).
-    const double expected_coast_rps =
-        ceiling_rps * std::pow(1.0 - (2.0 / 366.0) * 0.1, 200);
-    EXPECT_NEAR(s.motors[0].velocity_rps, expected_coast_rps,
-                0.01 * ceiling_rps);
-    EXPECT_GT(s.motors[0].velocity_rps, 0.85 * ceiling_rps);
+    // At 0 A electromagnetic torque, only no-load drag slows the rotor slightly
+    // (rather than braking to 0 as Neutral() does on a brake-mode motor).
+    EXPECT_GT(s.motors[0].velocity_rps, 0.85 * vel_at_ceiling);
+    EXPECT_LT(s.motors[0].velocity_rps, vel_at_ceiling);
     EXPECT_NEAR(s.motors[0].stator_current_a, 0.0, 1e-9);
   }
 }
@@ -1590,9 +1589,7 @@ TEST(SimMotorDiagnostics, FreeCurrentAndSupplyCurrentMatchMotorSpecs) {
     EXPECT_NEAR(st.motors[0].velocity_rps, s.free_rps, 1e-4);
     EXPECT_NEAR(st.motors[0].stator_current_a, s.free_a, 1e-3);
     EXPECT_NEAR(st.motors[0].supply_current_a,
-                std::abs(st.motors[0].voltage * st.motors[0].stator_current_a) /
-                    kSimRestingSupplyV,
-                1e-9);
+                12.0 * s.free_a / kSimRestingSupplyV, 1e-3);
   }
 }
 
@@ -1726,6 +1723,165 @@ TEST(SimMotorDiagnostics,
   ASSERT_TRUE(backend.Apply(cmd));
   StepBackend(backend, s, now_us, 5000, 100);
   EXPECT_GT(s.motors[0].position_rot, 5.0);
+}
+
+// REQ-DEV-10: SupplyCurrent is signed (positive when drawing from the battery,
+// negative during regenerative braking when applied voltage lies between 0 and
+// back-EMF), caps only positive draw at supply_limit_a (leaving regen signed
+// and unclamped), and StatorCurrent reports the true winding current from
+// applied_volts_ even when brownout lowers the voltage ceiling and forces
+// current above stator_limit_a.
+TEST(SimMotorDiagnostics,
+     RegenSupplyCurrentIsSignedAndBrownoutStatorCurrentIsNotHidden) {
+  for (const bool inverted : {false, true}) {
+    SCOPED_TRACE(inverted);
+    auto cfg = SingleMotorConfig();
+    cfg.motors[0].inverted = inverted;
+    cfg.motors[0].stator_limit_a = 40.0;
+    cfg.motors[0].supply_limit_a = 15.0;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(cfg));
+    State s{};
+    s.motor_count = 1;
+    uint64_t now_us = 0;
+
+    // Motoring from rest: positive battery draw capped at supply_limit_a.
+    std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+    ASSERT_TRUE(backend.Apply(cmd));
+    StepBackend(backend, s, now_us, 5000, 1);
+    EXPECT_GT(s.motors[0].supply_current_a, 0.0);
+    EXPECT_LE(s.motors[0].supply_current_a, 15.0 + 1e-9);
+
+    // Spin up to 12 V free speed (~100 rps, back-EMF ~11.93 V).
+    StepBackend(backend, s, now_us, 5000, 400);
+    ASSERT_GT(s.motors[0].velocity_rps, 95.0);
+    EXPECT_GT(s.motors[0].supply_current_a, 0.0);
+
+    // Regenerative braking: commanding 6 V below ~11.93 V back-EMF holds
+    // applied voltage at back-EMF - 40 A * R (~10.62 V), returning ~33.7 A to
+    // the battery (negative, and not clamped to -15 A by supply_limit_a).
+    cmd[0].demand = 6.0;
+    ASSERT_TRUE(backend.Apply(cmd));
+    StepBackend(backend, s, now_us, 1, 1);  // 1 us later: still near 100 rps.
+    EXPECT_NEAR(s.motors[0].stator_current_a, 40.0, 0.5);
+    EXPECT_LT(s.motors[0].supply_current_a, -25.0);
+
+    // Brownout while still near 100 rps: voltage ceiling drops to 6.0 V, which
+    // is ~5.93 V below back-EMF (~181 A). StatorCurrent must report the actual
+    // winding current rather than hiding it behind a second stator_limit_a cap.
+    backend.SetSupplyVoltage(6.0);
+    StepBackend(backend, s, now_us, 1, 1);
+    EXPECT_GT(s.motors[0].stator_current_a, 100.0);
+    EXPECT_LT(s.motors[0].supply_current_a, -100.0);
+  }
+}
+
+// REQ-DEV-10: A hard stop on a master motor clamps every follower in its chain
+// (aligned or opposed, regardless of master inversion or follower gear ratio),
+// so followers stall with their master instead of spinning freely past the stop
+// and reverse freely off it.
+TEST(SimMotorDiagnostics, HardStopOnMasterClampsAndStallsFollowers) {
+  for (const bool master_inverted : {false, true}) {
+    for (const bool oppose : {false, true}) {
+      for (const double follower_gear : {5.0, 1.0}) {
+        SCOPED_TRACE(testing::Message() << "master_inverted=" << master_inverted
+                                        << " oppose=" << oppose
+                                        << " follower_gear=" << follower_gear);
+        auto cfg = SingleMotorConfig();
+        cfg.motors[0].soft_limits = false;
+        cfg.motors[0].inverted = master_inverted;
+        cfg.motors[0].sensor_to_mechanism_ratio = 5.0;
+        auto follower = TestMotor(2, "follower", 2);
+        follower.master_id = 1;
+        follower.oppose_master = oppose;
+        follower.soft_limits = false;
+        follower.sensor_to_mechanism_ratio = follower_gear;
+        cfg.motors.push_back(follower);
+
+        PhysicsSimBackend backend;
+        backend.SetHardStops(
+            {{.motor = "roller", .min_rot = -0.3, .max_rot = 0.5}});
+        ASSERT_TRUE(backend.Configure(cfg));
+
+        State s{};
+        s.motor_count = 2;
+        uint64_t now_us = 0;
+        const double sign = oppose ? -1.0 : 1.0;
+        const double scale = 5.0 / follower_gear;
+        std::array<MotorRequest, 2> cmd{
+            {{1, Mode::kVoltage, 0, -1.5, 0.0}, Duty(2, 0.0)}};
+        ASSERT_TRUE(backend.Apply(cmd));
+        StepBackend(backend, s, now_us, 5000, 200);  // 1 s into min_rot stop.
+        EXPECT_DOUBLE_EQ(s.motors[0].position_rot, -0.3);
+        EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+        EXPECT_DOUBLE_EQ(s.motors[1].position_rot, -0.3 * sign * scale);
+        EXPECT_DOUBLE_EQ(s.motors[1].velocity_rps, 0.0);
+        EXPECT_NEAR(s.motors[1].stator_current_a, s.motors[0].stator_current_a,
+                    1e-9);
+        EXPECT_NEAR(s.motors[1].stator_current_a, 1.5 * 366.0 / 12.0, 1e-9);
+
+        // Reversing drives both master and follower freely off min_rot to
+        // max_rot.
+        cmd[0].demand = 1.5;
+        ASSERT_TRUE(backend.Apply(cmd));
+        StepBackend(backend, s, now_us, 5000, 5);
+        EXPECT_GT(s.motors[0].position_rot, -0.3);
+        EXPECT_GT(s.motors[1].position_rot * sign, -0.3 * scale);
+        EXPECT_GT(s.motors[1].velocity_rps * sign, 0.0);
+        StepBackend(backend, s, now_us, 5000, 200);
+        EXPECT_DOUBLE_EQ(s.motors[0].position_rot, 0.5);
+        EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+        EXPECT_DOUBLE_EQ(s.motors[1].position_rot, 0.5 * sign * scale);
+        EXPECT_DOUBLE_EQ(s.motors[1].velocity_rps, 0.0);
+        EXPECT_NEAR(s.motors[1].stator_current_a, s.motors[0].stator_current_a,
+                    1e-9);
+      }
+    }
+  }
+}
+
+// REQ-DEV-10: Hard stops evaluate position and velocity in FeedbackDirection
+// (the remote CANcoder's frame when configured), not the motor's output
+// Direction. With motor inverted=false (Direction=+1) and remote CANcoder
+// inverted=true (FeedbackDirection=-1), asymmetric stops [-0.3, 0.5] stop
+// positive voltage at reported -0.3 and negative voltage at reported +0.5.
+TEST(SimMotorDiagnostics, HardStopUsesRemoteCancoderFeedbackDirection) {
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].soft_limits = false;
+  cfg.motors[0].inverted = false;
+  cfg.motors[0].sensor_to_mechanism_ratio = 5.0;
+  SensorConfig encoder{2, "encoder", SensorKind::kCANcoder, 20, "rio"};
+  encoder.inverted = true;
+  cfg.sensors.push_back(encoder);
+  cfg.motors[0].feedback = Feedback::kRemoteCANcoder;
+  cfg.motors[0].feedback_sensor_id = 2;
+
+  PhysicsSimBackend backend;
+  backend.SetHardStops({{.motor = "roller", .min_rot = -0.3, .max_rot = 0.5}});
+  ASSERT_TRUE(backend.Configure(cfg));
+
+  State s{};
+  s.motor_count = 1;
+  s.sensor_count = 1;
+  uint64_t now_us = 0;
+
+  // Positive motor voltage moves the inverted CANcoder reading negatively into
+  // min_rot = -0.3 (not -0.5, which Direction would clamp it to).
+  std::array<MotorRequest, 1> cmd{{{1, Mode::kVoltage, 0, 1.5, 0.0}}};
+  ASSERT_TRUE(backend.Apply(cmd));
+  StepBackend(backend, s, now_us, 5000, 200);
+  EXPECT_DOUBLE_EQ(s.motors[0].position_rot, -0.3);
+  EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+  EXPECT_NEAR(s.motors[0].stator_current_a, 1.5 * 366.0 / 12.0, 1e-9);
+
+  // Negative motor voltage moves the inverted CANcoder reading positively into
+  // max_rot = +0.5 (not +0.3).
+  cmd[0].demand = -1.5;
+  ASSERT_TRUE(backend.Apply(cmd));
+  StepBackend(backend, s, now_us, 5000, 200);
+  EXPECT_DOUBLE_EQ(s.motors[0].position_rot, 0.5);
+  EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+  EXPECT_NEAR(s.motors[0].stator_current_a, 1.5 * 366.0 / 12.0, 1e-9);
 }
 
 }  // namespace

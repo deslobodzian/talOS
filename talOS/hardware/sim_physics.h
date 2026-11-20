@@ -316,13 +316,14 @@ struct SwerveModuleSpec {
   double y_m{};
 };
 
-// Mechanical end-of-travel hard stops for a named motor, in mechanism
+// Mechanical end-of-travel hard stops for a named master motor, in mechanism
 // rotations of its own hardware frame (before any node's rezero), matching
 // HomeSwitch. Enforced even when MotorConfig::soft_limits is false (as
 // required for rezero-frame mechanisms): clamps position into [min_rot,
-// max_rot] and zeroes velocity when driven into a stop, so back-EMF drops to
-// 0 and stator current rises while motion away from the stop stays free.
-// Bound by motor name so it survives every later Configure().
+// max_rot] and zeroes velocity when driven into a stop (for the master and
+// every follower in its chain), so back-EMF drops to 0 and stator current rises
+// while motion away from the stop stays free. Bound by motor name so it
+// survives every later Configure().
 struct HardStop {
   std::string motor;
   std::optional<double> min_rot;
@@ -494,7 +495,7 @@ class PhysicsSimBackend final : public Backend {
       }
       // After any limit stops the rotor: a motor held at it is stalled.
       out.stator_current_a = StatorCurrent(i, m);
-      out.supply_current_a = SupplyCurrent(i, m, out.stator_current_a);
+      out.supply_current_a = SupplyCurrent(i, m);
       held_[i] = out;
       held_at_us_[i] = state.sample_time_us;
     }
@@ -796,17 +797,20 @@ class PhysicsSimBackend final : public Backend {
           if (config_.motors[i].name == spec.drive) drive = i;
           if (config_.motors[i].name == spec.steer) steer = i;
         }
-        if (!drive || !steer || *drive == *steer) continue;
+        if (!drive || !steer) continue;
+        const std::size_t drive_idx = *drive;
+        const std::size_t steer_idx = *steer;
+        if (drive_idx == steer_idx) continue;
         bool duplicate = false;
         for (const auto& existing : modules_) {
-          if (existing.drive == *drive || existing.steer == *steer ||
-              existing.drive == *steer || existing.steer == *drive) {
+          if (existing.drive == drive_idx || existing.steer == steer_idx ||
+              existing.drive == steer_idx || existing.steer == drive_idx) {
             duplicate = true;
             break;
           }
         }
         if (!duplicate) {
-          modules_.push_back({*drive, *steer, spec.x_m, spec.y_m});
+          modules_.push_back({drive_idx, steer_idx, spec.x_m, spec.y_m});
         }
       }
       return;
@@ -943,7 +947,26 @@ class PhysicsSimBackend final : public Backend {
     }
   }
 
-  // Resolves hard_stops_ by motor name against config_.
+  // Resolves motor i to its root master along any follower chain, returning
+  // the root index and cumulative oppose_master sign (+1 aligned, -1 opposed).
+  // Returns {i, +1.0} for an independent motor or on a missing master / cycle.
+  std::pair<std::size_t, double> ResolveRootMaster(std::size_t i) const {
+    std::size_t cur = i;
+    double oppose_sign = 1.0;
+    for (std::size_t hop = 0; hop < config_.motors.size(); ++hop) {
+      const auto& m = config_.motors[cur];
+      if (m.master_id == 0) return {cur, oppose_sign};
+      const int master = MotorIndex(m.master_id);
+      if (master < 0) return {i, 1.0};
+      if (m.oppose_master) oppose_sign = -oppose_sign;
+      cur = static_cast<std::size_t>(master);
+    }
+    return {i, 1.0};
+  }
+
+  // Resolves hard_stops_ by motor name against config_. Follower motors are
+  // ignored here (config load refuses them; EnforceHardStop applies the root
+  // master's stop to every follower in its chain).
   void BindHardStops() {
     bound_hard_stops_.fill(BoundHardStop{});
     for (const HardStop& s : hard_stops_) {
@@ -953,7 +976,9 @@ class PhysicsSimBackend final : public Backend {
       if (s.min_rot && s.max_rot && !(*s.min_rot < *s.max_rot)) continue;
       for (std::size_t i = 0; i < config_.motors.size(); ++i) {
         if (config_.motors[i].name == s.motor) {
-          bound_hard_stops_[i] = {s.min_rot, s.max_rot};
+          if (config_.motors[i].master_id == 0) {
+            bound_hard_stops_[i] = {s.min_rot, s.max_rot};
+          }
           break;
         }
       }
@@ -961,12 +986,15 @@ class PhysicsSimBackend final : public Backend {
   }
 
   // Enforces physical end-of-travel hard stops on axis i regardless of
-  // MotorConfig::soft_limits. Returns true when a stop zeroed velocity.
+  // MotorConfig::soft_limits. A follower shares its root master's stop in the
+  // master's mechanism frame (flipped by cumulative oppose_master). Returns
+  // true when a stop zeroed velocity.
   bool EnforceHardStop(std::size_t i) {
-    const BoundHardStop& stop = bound_hard_stops_[i];
+    const auto [root, oppose_sign] = ResolveRootMaster(i);
+    const BoundHardStop& stop = bound_hard_stops_[root];
     if (!stop.min_rot && !stop.max_rot) return false;
-    const double gear = Gear(i);
-    const double dir = FeedbackDirection(i);
+    const double gear = Gear(root);
+    const double dir = FeedbackDirection(root) * oppose_sign;
     double mech_pos = axes_[i].rotor_position_rot * dir / gear;
     double mech_vel = axes_[i].rotor_velocity_rps * dir / gear;
     bool stopped = false;
@@ -1092,32 +1120,40 @@ class PhysicsSimBackend final : public Backend {
     return dir * rotor_volts;
   }
 
-  // Stator current from the winding model: |applied volts - back-EMF| / R,
-  // with R = 12 V / stall current and k_e = (12 V - free current * R) / free
-  // speed, clamped to stator_limit_a. At 12 V stall it equals stall current;
-  // at 12 V free speed it equals free current; 0 while unpowered.
-  double StatorCurrent(std::size_t i, const MotorConfig& m) const {
+  // Signed stator current in motor i's physical rotor frame:
+  // (rotor_volts - back_emf) / R, with R = 12 V / stall current and
+  // k_e = (12 V - free current * R) / free speed; 0 while unpowered.
+  double SignedStatorCurrent(std::size_t i, const MotorConfig& m) const {
     if (!powered_[i]) return 0.0;
     const MotorModel motor = MotorModelFor(m.motor_type.value);
     const double back_emf_v =
         motor.back_emf_v_per_rps() * axes_[i].rotor_velocity_rps;
-    const double net_v = Direction(i) * applied_volts_[i] - back_emf_v;
-    double current_a = std::abs(net_v) / motor.resistance_ohm();
-    if (commands_[i].mode == Mode::kTorqueCurrent && m.master_id == 0) {
-      const double demanded = std::abs(commands_[i].demand);
-      if (std::abs(current_a - demanded) < 1e-12) current_a = demanded;
-    }
-    return m.stator_limit_a > 0.0 ? std::min(m.stator_limit_a, current_a)
-                                  : current_a;
+    const double rotor_volts = Direction(i) * applied_volts_[i];
+    return (rotor_volts - back_emf_v) / motor.resistance_ohm();
   }
 
-  // Power-conservation supply current: |applied_volts * stator_current| /
-  // supply_v_, clamped to supply_limit_a; 0 when unpowered or supply_v_ <= 0.
-  double SupplyCurrent(std::size_t i, const MotorConfig& m,
-                       double stator_current_a) const {
+  // Stator current magnitude from the actual applied_volts_ and back-EMF:
+  // |rotor_volts - back_emf| / R. LimitWindingVoltage already enforces
+  // stator_limit_a in dynamics when the voltage ceiling allows; no second
+  // clamp is applied here, so overspeed or brownout current exceeding
+  // stator_limit_a stays visible rather than hidden. At 12 V stall it equals
+  // stall current; at 12 V free speed it equals free current; 0 while
+  // unpowered.
+  double StatorCurrent(std::size_t i, const MotorConfig& m) const {
+    return std::abs(SignedStatorCurrent(i, m));
+  }
+
+  // Signed power-conservation supply current:
+  // (rotor_volts * signed_stator_current) / supply_v_ (positive = battery
+  // draw, negative = regenerative braking). Positive draw is clamped to
+  // supply_limit_a (matching LimitWindingVoltage, which limits draw and not
+  // regen), while negative regen stays signed, matching Phoenix 6. 0 when
+  // unpowered or supply_v_ <= 0.
+  double SupplyCurrent(std::size_t i, const MotorConfig& m) const {
     if (!powered_[i] || supply_v_ <= 0.0) return 0.0;
+    const double rotor_volts = Direction(i) * applied_volts_[i];
     const double current_a =
-        std::abs(applied_volts_[i] * stator_current_a) / supply_v_;
+        rotor_volts * SignedStatorCurrent(i, m) / supply_v_;
     return m.supply_limit_a > 0.0 ? std::min(m.supply_limit_a, current_a)
                                   : current_a;
   }

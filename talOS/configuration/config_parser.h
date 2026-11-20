@@ -1653,15 +1653,23 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
           throw std::invalid_argument(
               entry_where + ": 'min_rot' must be less than 'max_rot'");
         }
-        const bool is_motor = std::any_of(
+        const auto motor_it = std::find_if(
             raw_devices.begin(), raw_devices.end(),
             [&](const detail::RawDevice& d) {
               return d.name == stop.motor &&
                      std::holds_alternative<hardware::MotorConfig>(d.config);
             });
-        if (!is_motor) {
+        if (motor_it == raw_devices.end()) {
           throw std::invalid_argument(entry_where + ": motor '" + stop.motor +
                                       "' names no configured motor");
+        }
+        const auto& motor_cfg =
+            std::get<hardware::MotorConfig>(motor_it->config);
+        if (motor_cfg.master_id != 0) {
+          throw std::invalid_argument(
+              entry_where + ": motor '" + stop.motor + "' follows '" +
+              motor_it->follow_motor +
+              "'; configure the hard stop on its master instead");
         }
         if (std::find(seen_motors.begin(), seen_motors.end(), stop.motor) !=
             seen_motors.end()) {
