@@ -41,8 +41,9 @@
 //       (kMaxTimelineModes = 4096, kMaxTimelineAlerts = 4096,
 //       kMaxTimelineRuns = 4096; 96 KiB retained each for modes and alerts;
 //       REQ-OPS-42). During Session::Open(), alerts buffer at most
-//       kMaxTimelineAlerts intervals per alert channel stream (64 KiB per
-//       alert channel stream) before merging to the earliest
+//       kMaxTimelineAlerts intervals per alert channel on each topic's single
+//       canonical stream (64 KiB per alert channel; non-canonical streams are
+//       skipped or evicted immediately) before merging to the earliest
 //       kMaxTimelineAlerts globally by start_ns, so a flapping peer cannot
 //       starve another alert on the same status topic. Overflow is counted in
 //       modes_dropped, alerts_dropped (per-channel plus global merge drops)

@@ -51,6 +51,25 @@ bool IsValueRecord(const tlog::RecordHeader& header) {
          tlog::IsAcceptedSend(header);
 }
 
+struct RawAlertInterval {
+  std::int64_t start_ns{0};
+  std::int64_t end_ns{0};
+};
+static_assert(sizeof(RawAlertInterval) == 16,
+              "REQ-OPS-42: 16 B per transient alert interval");
+
+struct AlertChannelState {
+  bool active{false};
+  std::int64_t start_ns{0};
+  std::vector<RawAlertInterval> intervals;
+  std::uint64_t dropped{0};
+};
+
+struct AlertStream {
+  std::vector<AlertChannelState> channels;
+  std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
+};
+
 // A topic as the index pass learns it.
 struct TopicBuild {
   std::string name;
@@ -60,10 +79,62 @@ struct TopicBuild {
   std::vector<Channel> channels;  // struct topics
   // Indices into `channels` whose alert level is not None.
   std::vector<std::uint32_t> alert_channels;
+  // Single canonical alert stream tracked during Open(): SEND beats MESSAGE;
+  // lowest file index wins among SENDs, lexicographically smallest path wins
+  // among MESSAGEs (matching the post-scan topic selection below).
+  std::optional<std::size_t> alert_file;
+  bool alert_is_send{false};
+  AlertStream alert_stream;
   // Hardware topics: every channel name seen, with its kind.
   std::map<std::string, ChannelKind> hardware_channels;
   std::int64_t decoded_second{std::numeric_limits<std::int64_t>::min()};
 };
+
+bool SelectCanonicalAlertStream(TopicBuild& topic,
+                                const std::vector<LogFile>& files,
+                                std::size_t file, bool is_send) {
+  const LogFile& log_file = files[file];
+  if (!topic.alert_file.has_value()) {
+    topic.alert_file = file;
+    topic.alert_is_send = is_send;
+    topic.alert_stream.channels.resize(topic.alert_channels.size());
+    return true;
+  }
+  const std::size_t cur_file = *topic.alert_file;
+  const LogFile& cur = files[cur_file];
+  if (topic.alert_is_send) {
+    if (!is_send) return false;
+    if (log_file.process == cur.process) {
+      if (file < cur_file) topic.alert_file = file;
+      return true;
+    }
+    if (file < cur_file) {
+      topic.alert_file = file;
+      topic.alert_stream = AlertStream{};
+      topic.alert_stream.channels.resize(topic.alert_channels.size());
+      return true;
+    }
+    return false;
+  }
+  if (is_send) {
+    topic.alert_file = file;
+    topic.alert_is_send = true;
+    topic.alert_stream = AlertStream{};
+    topic.alert_stream.channels.resize(topic.alert_channels.size());
+    return true;
+  }
+  if (log_file.process == cur.process) {
+    if (log_file.path < cur.path) topic.alert_file = file;
+    return true;
+  }
+  if (log_file.path < cur.path) {
+    topic.alert_file = file;
+    topic.alert_stream = AlertStream{};
+    topic.alert_stream.channels.resize(topic.alert_channels.size());
+    return true;
+  }
+  return false;
+}
 
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
 
@@ -85,25 +156,6 @@ struct ModeStream {
   ModeKind last_mode{ModeKind::kDisabled};
   bool last_fms{false};
   bool closed_last{false};
-};
-
-struct RawAlertInterval {
-  std::int64_t start_ns{0};
-  std::int64_t end_ns{0};
-};
-static_assert(sizeof(RawAlertInterval) == 16,
-              "REQ-OPS-42: 16 B per transient alert interval");
-
-struct AlertChannelState {
-  bool active{false};
-  std::int64_t start_ns{0};
-  std::vector<RawAlertInterval> intervals;
-  std::uint64_t dropped{0};
-};
-
-struct AlertStream {
-  std::vector<AlertChannelState> channels;
-  std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
 };
 
 bool ReadManifestInt(const nlohmann::json& object, std::string_view key,
@@ -331,8 +383,6 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   bool any = false;
   std::vector<HardwareSample> samples;
   std::map<std::pair<std::string, bool>, ModeStream> mode_streams;
-  std::map<std::tuple<std::size_t, std::string, bool>, AlertStream>
-      alert_streams;
   auto recorded = talos::launcher::RecordedProtocolVersion({dir.string()});
   if (const std::string line = recorded.Disagreement(); !line.empty()) {
     std::cerr << "studio_review: " << dir.string() << ": " << line << '\n';
@@ -445,32 +495,30 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       }
     } else if (topic.decoder == Decoder::kStruct &&
                !topic.alert_channels.empty()) {
-      const std::int64_t publish_ns = r.header.publish_time_ns;
-      AlertStream& stream =
-          alert_streams[{topic_idx, log_file.process, is_send}];
-      if (stream.channels.empty()) {
-        stream.channels.resize(topic.alert_channels.size());
-      }
-      if (publish_ns >= stream.last_publish_ns) {
-        stream.last_publish_ns = publish_ns;
-        for (std::size_t i = 0; i < topic.alert_channels.size(); ++i) {
-          const std::uint32_t c = topic.alert_channels[i];
-          std::uint64_t raw = 0;
-          if (!talos::telemetry::ReadChannel(topic.channels[c], r.payload,
-                                             raw)) {
-            continue;
-          }
-          const bool active = raw != 0;
-          AlertChannelState& st = stream.channels[i];
-          if (active && !st.active) {
-            st.active = true;
-            st.start_ns = publish_ns;
-          } else if (!active && st.active) {
-            st.active = false;
-            if (st.intervals.size() < kMaxTimelineAlerts) {
-              st.intervals.push_back({st.start_ns, publish_ns});
-            } else {
-              ++st.dropped;
+      if (SelectCanonicalAlertStream(topic, session->files_, file, is_send)) {
+        const std::int64_t publish_ns = r.header.publish_time_ns;
+        AlertStream& stream = topic.alert_stream;
+        if (publish_ns >= stream.last_publish_ns) {
+          stream.last_publish_ns = publish_ns;
+          for (std::size_t i = 0; i < topic.alert_channels.size(); ++i) {
+            const std::uint32_t c = topic.alert_channels[i];
+            std::uint64_t raw = 0;
+            if (!talos::telemetry::ReadChannel(topic.channels[c], r.payload,
+                                               raw)) {
+              continue;
+            }
+            const bool active = raw != 0;
+            AlertChannelState& st = stream.channels[i];
+            if (active && !st.active) {
+              st.active = true;
+              st.start_ns = publish_ns;
+            } else if (!active && st.active) {
+              st.active = false;
+              if (st.intervals.size() < kMaxTimelineAlerts) {
+                st.intervals.push_back({st.start_ns, publish_ns});
+              } else {
+                ++st.dropped;
+              }
             }
           }
         }
@@ -612,10 +660,11 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       }
     } else if (topic.decoder == Decoder::kStruct) {
       const std::size_t build_idx = sorted_build_index[t];
-      const auto it = alert_streams.find({build_idx, topic.process, is_send});
-      if (it != alert_streams.end()) {
-        AlertStream& stream = it->second;
-        const auto& alert_channels = indexer.topics[build_idx].alert_channels;
+      TopicBuild& build = indexer.topics[build_idx];
+      if (build.alert_file.has_value() && build.alert_is_send == is_send &&
+          session->files_[*build.alert_file].process == topic.process) {
+        AlertStream& stream = build.alert_stream;
+        const auto& alert_channels = build.alert_channels;
         for (std::size_t i = 0; i < alert_channels.size(); ++i) {
           AlertChannelState& st = stream.channels[i];
           if (st.active) {
@@ -639,10 +688,10 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
             combined_alerts.resize(kMaxTimelineAlerts);
           }
         }
+        stream = AlertStream{};
       }
     }
   }
-  alert_streams.clear();
   sort_alerts();
   session->alerts_ = std::move(combined_alerts);
   session->alerts_.shrink_to_fit();

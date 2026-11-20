@@ -1780,5 +1780,124 @@ TEST_F(ReviewTest, DeclaredRefusesSymlinkOutsideLibrary) {
   EXPECT_EQ(resp.body.find("secret"), std::string::npos) << resp.body;
 }
 
+// Guards canonical alert stream selection during Session::Open(): a sender's
+// SEND stream beats receive-side MESSAGE streams even when a receiver logs
+// earlier or its path sorts first, and when only receivers exist the
+// lexicographically smallest log path wins while keeping intervals across that
+// process's restarted log files.
+// REQ-OPS-37, REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, TimelineAlertsFollowCanonicalStreamAndSkipNonCanonical) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  using D = talos::Descriptor<review_test::Health>;
+  const auto make_reg = [](SourceKind kind) {
+    talos::event::Registration reg;
+    reg.id = 2;
+    reg.kind = kind;
+    reg.name = "/thing/status";
+    reg.message_bytes = sizeof(review_test::Health);
+    reg.schema = {std::string{D::kName}, D::kHash,
+                  std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                              D::kBfbs.size()}};
+    return reg;
+  };
+  const auto write_messages =
+      [&](const std::string& path, const std::string& process,
+          const std::vector<std::pair<std::int64_t, bool>>& samples) {
+        tlog::LogWriter writer{path, process,
+                               tlog::LogWriterOptions{8192, 1, false}, 1};
+        writer.start({make_reg(SourceKind::WATCHER)},
+                     MonotonicTime::from_nanos(kStartNs));
+        std::uint64_t seq = 0;
+        for (const auto& [offset_ms, active] : samples) {
+          const review_test::Health msg{active, !active};
+          Context ctx{};
+          ctx.kind = EventKind::MESSAGE;
+          ctx.source_id = 2;
+          ctx.dispatch_index = ++seq;
+          ctx.sequence = seq;
+          ctx.event_time = ctx.now = ctx.publish_time =
+              MonotonicTime::from_nanos(kStartNs + offset_ms * kMs);
+          writer.dispatch(ctx, std::as_bytes(std::span{&msg, 1}));
+        }
+        writer.flush();
+        ASSERT_FALSE(writer.failed()) << writer.error();
+      };
+
+  // Subcase 1: SEND beats MESSAGE even when receiver path sorts earlier and
+  // receives a record before the sender's first SEND.
+  {
+    const std::string dir = Library() + "/canon_sender";
+    std::filesystem::create_directories(dir);
+    write_messages(dir + "/alpha.tlog", "alpha",
+                   {{0, true}, {500, false}, {1500, true}, {2500, false}});
+    {
+      tlog::LogWriter writer{dir + "/thing.tlog", "thing",
+                             tlog::LogWriterOptions{8192, 1, false}, 1};
+      writer.start({make_reg(SourceKind::SENDER)},
+                   MonotonicTime::from_nanos(kStartNs));
+      std::uint64_t seq = 0;
+      for (const auto& [offset_ms, active] :
+           std::vector<std::pair<std::int64_t, bool>>{{1000, true},
+                                                      {3000, false}}) {
+        const review_test::Health msg{active, !active};
+        Context ctx{};
+        ctx.dispatch_index = ++seq;
+        ctx.event_time = ctx.now =
+            MonotonicTime::from_nanos(kStartNs + offset_ms * kMs);
+        writer.send(ctx, 2, std::as_bytes(std::span{&msg, 1}), 0, seq);
+      }
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    Review review{Library(), 1u << 20};
+    const Response resp = review.Get("/review/canon_sender/timeline.json", "");
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json tl = json::parse(resp.body);
+    EXPECT_EQ(tl["alerts_dropped"], 0);
+    ASSERT_EQ(tl["alerts"].size(), 1u);
+    EXPECT_EQ(tl["alerts"][0]["start_ns"],
+              std::to_string(kStartNs + 1 * kSecond));
+    EXPECT_EQ(tl["alerts"][0]["end_ns"],
+              std::to_string(kStartNs + 3 * kSecond));
+  }
+
+  // Subcase 2: Receiver-only topic picks lexicographically smallest log path
+  // (alpha) even when beta and gamma log earlier, and preserves alpha's prior
+  // intervals when alpha.restart1.tlog (even smaller path, same process) logs.
+  {
+    const std::string dir = Library() + "/canon_receiver";
+    std::filesystem::create_directories(dir);
+    write_messages(dir + "/beta.tlog", "beta",
+                   {{0, true}, {1000, false}, {4000, true}, {4500, false}});
+    write_messages(dir + "/gamma.tlog", "gamma",
+                   {{500, true}, {1500, false}, {6500, true}, {7000, false}});
+    write_messages(dir + "/alpha.tlog", "alpha", {{2000, true}, {3000, false}});
+    write_messages(dir + "/alpha.restart1.tlog", "alpha",
+                   {{5000, true}, {6000, false}});
+    Review review{Library(), 1u << 20};
+    const Response resp =
+        review.Get("/review/canon_receiver/timeline.json", "");
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    const json tl = json::parse(resp.body);
+    EXPECT_EQ(tl["alerts_dropped"], 0);
+    ASSERT_EQ(tl["alerts"].size(), 2u);
+    EXPECT_EQ(tl["alerts"][0]["start_ns"],
+              std::to_string(kStartNs + 2 * kSecond));
+    EXPECT_EQ(tl["alerts"][0]["end_ns"],
+              std::to_string(kStartNs + 3 * kSecond));
+    EXPECT_EQ(tl["alerts"][1]["start_ns"],
+              std::to_string(kStartNs + 5 * kSecond));
+    EXPECT_EQ(tl["alerts"][1]["end_ns"],
+              std::to_string(kStartNs + 6 * kSecond));
+  }
+}
+
 }  // namespace
 }  // namespace studio::review
