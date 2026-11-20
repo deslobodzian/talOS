@@ -946,5 +946,41 @@ TEST(Endpoint, ReportsTheNewestDrainedCommandAndWhetherItWasAccepted) {
     return HasFailure();
   }));
 }
+
+// Encode(state, buffer_) returns 0 when a State cannot be encoded (e.g. an
+// unknown GatewayProgram). Endpoint::Tick must not transmit a 0-byte
+// kHardwareState frame on the wire, and must keep sending normally once the
+// State is encodable again.
+// REQ-CONTRACT-02, REQ-CONTRACT-30
+TEST(Endpoint, DoesNotSendZeroByteStateFrameWhenEncodeReturnsZero) {
+  SimBackend backend;
+  Gateway gateway{backend, 3014};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto invalid_program = static_cast<GatewayProgram>(
+      static_cast<uint8_t>(kLastGatewayProgram) + 1);
+  gateway.SetBuild({0, invalid_program, false});
+  std::array<uint8_t, kMaxStateSize> scratch{};
+  ASSERT_EQ(Encode(gateway.snapshot(), scratch), 0u);
+
+  const uint64_t sent_before = endpoint.udp_stats().sent_frames;
+  EXPECT_EQ(endpoint.Tick(1000, false), protocol::UdpStatus::kInvalidArgument);
+  EXPECT_EQ(endpoint.udp_stats().sent_frames, sent_before);
+
+  gateway.SetBuild({0, GatewayProgram::kSimGateway, false});
+  ASSERT_EQ(endpoint.Tick(2000, false), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.udp_stats().sent_frames, sent_before + 1);
+
+  protocol::DecodedFrame frame;
+  ASSERT_EQ(companion.Receive(&frame), protocol::UdpStatus::kOk);
+  EXPECT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
+  EXPECT_GT(frame.payload_size, 0u);
+  State state;
+  ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
+  EXPECT_EQ(state.sample_time_us, 2000u);
+}
 }  // namespace
 }  // namespace talos::hardware
