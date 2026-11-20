@@ -150,6 +150,7 @@ class TwoNodesTest(unittest.TestCase):
                          [0, 1, 2, 3, 4])
         self.assertTrue(follower.goal.fresh())
         self.assertFalse(follower.goal.fresh(max_age=0.001))
+        self.assertFalse(follower.goal.fresh(max_age=-0.01))
         self.assertLess(follower.goal.age, 0.01)
         self.assertEqual(sim.node("follower").period, 0.01)
         self.assertAlmostEqual(sim.now, 0.055)
@@ -390,10 +391,13 @@ class AbiErrorsTest(unittest.TestCase):
                 with self.assertRaises(talos.TalosError):
                     getattr(stepper.sm, name)
         subscription = follower.goal
+        node = sim.node("follower")
         self.assertIsNone(subscription.value)
         with mock.patch.object(talos.lib, "talos_last_error",
-                               return_value=b"subscription failed"):
+                               return_value=b"abi call failed"):
             for symbol, read in (
+                ("talos_node_simulation", lambda: node.simulation),
+                ("talos_node_describing", lambda: node.describing),
                 ("talos_subscription_has_value",
                  lambda: subscription.has_value),
                 ("talos_subscription_fresh", lambda: subscription.fresh()),
@@ -409,6 +413,17 @@ class AbiErrorsTest(unittest.TestCase):
                                        return_value=None):
                     with self.assertRaises(talos.TalosError):
                         _ = subscription.value
+        # Negative max_age still validates handle/index before returning False.
+        subscription._index = 99
+        with self.assertRaises(talos.TalosError):
+            subscription.fresh(-0.01)
+        node._native = None
+        with self.assertRaises(talos.TalosError):
+            subscription.fresh(-0.01)
+        link = talos.HardwareLink(sim.node("planner"))
+        sim.node("planner")._native = None
+        with self.assertRaises(talos.TalosError):
+            link.fresh(-0.01)
 
 
 class CallbackErrorTest(unittest.TestCase):
@@ -687,6 +702,8 @@ dio = 1
         self.assertGreaterEqual(link.age, 0)
         self.assertLess(link.age, 0.1)
         self.assertFalse(link.fresh(0))
+        self.assertFalse(link.fresh(-0.01))
+        self.assertFalse(link.fresh(timedelta(seconds=-0.01)))
         self.assertFalse(link.fresh(link.age))
         self.assertTrue(link.fresh(link.age + 1e-9))
         self.assertTrue(link.fresh(timedelta(seconds=1)))
