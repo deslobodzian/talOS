@@ -151,12 +151,16 @@ not mark a late graph stale. A whole graph larger than the egress burst
 can never be sent: the bridge logs that once when the graph crosses the
 burst, sends no notice (the client's graph goes stale, which is the truth),
 and still serves it at `/system.json`. It opens the registry lazily. Topic health is
-computed in [`system.h`](system.h): missing ends are `bridged` when external,
-otherwise `unconnected` when optional, otherwise `orphaned` or `unread`
+computed in [`system.h`](system.h): missing ends are `bridged` when any end is
+`external`; with no publisher, `unconnected` when an end is `optional` and no
+non-observer subscriber requires it (neither `optional` nor `external`),
+otherwise `orphaned` (matching the launcher's
+[graph lint](../../talOS/NAMING.md#topics), where `optional` exempts only the
+reader that declared it and observers beside an optional end); with a publisher
+and no reader, `unconnected` when an end is `optional`, otherwise `unread`
 (an observer counts as a reader for `unread` only of a `state`, `status`,
-`event` or `telemetry` topic, as in the launcher's
-[graph lint](../../talOS/NAMING.md#topics), so Studio and the launcher name the
-same unread topics);
+`event` or `telemetry` topic, as in the graph lint, so Studio and the launcher
+name the same orphaned and unread topics);
 connected topics are `lossy` when an end lost messages, `idle` before
 publication, and `ok` otherwise. A topic's `dropped` sums every end except
 latest-only watchers (source `latest_only: true`): the registry records one
