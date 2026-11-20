@@ -745,12 +745,8 @@ int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
     o.current = s.stator_current_a;
     o.temperature_c = s.temperature_c;
     o.supply_current_a = s.supply_current_a;
-    o.forward_limit =
-        s.valid &&
-        (s.fault_flags & talos::hardware::kMotorForwardHardLimitFlag) != 0;
-    o.reverse_limit =
-        s.valid &&
-        (s.fault_flags & talos::hardware::kMotorReverseHardLimitFlag) != 0;
+    o.forward_limit = HardwareAccess::motor_hard_limit(s, /*forward=*/true);
+    o.reverse_limit = HardwareAccess::motor_hard_limit(s, /*forward=*/false);
     return TALOS_OK;
   });
 }
