@@ -1061,6 +1061,54 @@ TEST(ConfigTest, RejectsInvalidTeleopDefaultTypes) {
   }
 }
 
+// REQ-CONTRACT-17: unknown keys in [robot] (such as a misspelled safety or
+// timing key) are refused naming the key instead of silently using defaults.
+TEST(ConfigTest, RejectsUnknownRobotKeys) {
+  try {
+    Parse("[robot]\ncommand_timout_us = 100000\n");
+    ADD_FAILURE() << "unknown [robot] key was accepted";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("[robot]"), std::string::npos) << what;
+    EXPECT_NE(what.find("command_timout_us"), std::string::npos) << what;
+  }
+  // Every known [robot] key still loads.
+  EXPECT_NO_THROW(Parse(R"(
+[robot]
+name = "bench"
+period_us = 5000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+require_target_coverage = false
+simulation_only = false
+controller_address = "10.56.87.2"
+controller_port = 5802
+local_port = 5803
+log_keep_sessions = 5
+log_max_bytes = 1048576
+max_restarts = 3
+hardware_node = "//talOS/bridge:hardware_node"
+sim_gateway = "//talOS/simulation:sim_gateway"
+[robot.targets]
+teleop = ["teleop"]
+)"));
+}
+
+// REQ-CONTRACT-17: non-finite floats in teleop scale or defaults are refused
+// at config load instead of propagating NaN/Inf into teleop targets.
+TEST(ConfigTest, RejectsNonFiniteTeleopScaleAndDefaults) {
+  for (const std::string_view bad : {"nan", "inf", "-inf"}) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(
+        "[[subsystems.test.teleop.bindings]]\naxis = 0\n"
+        "field = \"velocity_rps\"\nscale = " +
+        std::string{bad} + "\n");
+    ExpectRejected("[subsystems.test.teleop.defaults]\nvelocity_rps = " +
+                   std::string{bad} + "\n");
+  }
+}
+
 // Other binding shapes are cases in testdata/.
 TEST(ConfigTest, RejectsNegativePovAndFractionalPovIndex) {
   for (const std::string binding : {"pov = -45\nwhile_held = { x = 1 }",

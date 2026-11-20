@@ -898,9 +898,13 @@ TEST(TeleopNode, DefaultsShareAssignmentSchemaValidation) {
     SCOPED_TRACE(replacement);
     std::string config{kPartialToml};
     config.replace(config.find(assignment), assignment.size(), replacement);
-    Sim sim = MakeSim(config);
-    sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
-    EXPECT_THROW(sim.add<Teleop>("teleop"), std::invalid_argument);
+    EXPECT_THROW(
+        {
+          Sim sim = MakeSim(config);
+          sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+          sim.add<Teleop>("teleop");
+        },
+        std::invalid_argument);
   }
 }
 
@@ -919,9 +923,13 @@ TEST(TeleopNode, ConstructionRejectsInvalidFloatingPointButtonAssignments) {
             "[[subsystems.mechanism.teleop.bindings]]\nbutton = 1\n" +
             action + " = { \"" + field + "\" = " + value +
             " }\n[subsystems.teleop]\n";
-        Sim sim = MakeSim(config);
-        sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
-        EXPECT_THROW(sim.add<Teleop>("teleop"), std::invalid_argument);
+        EXPECT_THROW(
+            {
+              Sim sim = MakeSim(config);
+              sim.add<ConsumerNode<schema_test::Mixed>>("mechanism");
+              sim.add<Teleop>("teleop");
+            },
+            std::invalid_argument);
       }
     }
   }
@@ -947,9 +955,8 @@ TEST(TeleopNode, FloatingPointEncodingAcceptsFiniteLimitsWithoutOverflow) {
                                        std::numeric_limits<double>::max()));
 }
 
-// REQ-CONTRACT-24: config load accepts any number as an axis scale, so the
-// node's construction refuses a non-finite one. (A non-finite deadband_frac
-// is config load's: ConfigTest.RejectsTeleopAxisDeadbandBelowTheFloor.)
+// REQ-CONTRACT-24: non-finite axis scales are refused during config load (and
+// by Teleop construction if passed programmatically).
 TEST(TeleopNode, ConstructionRejectsNonFiniteAxisScale) {
   for (const std::string value : {"nan", "inf", "-inf"}) {
     SCOPED_TRACE("scale = " + value);
