@@ -1448,6 +1448,20 @@ max_rot = 1.5
     SCOPED_TRACE(bad);
     ExpectRejected(devices + std::string{bad});
   }
+
+  // A hard stop targeting a follower motor is refused, naming both follower and
+  // master so the user configures the stop on the master instead.
+  try {
+    Parse(devices +
+          "[subsystems.lift.motors.m_follower]\ncan_id = 13\n"
+          "follow = \"m_lift\"\n"
+          "[[simulation.hard_stops]]\nmotor = \"m_follower\"\nmin_rot = 0.0\n");
+    ADD_FAILURE() << "accepted hard stop on follower motor";
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find("m_follower"), std::string::npos) << what;
+    EXPECT_NE(what.find("m_lift"), std::string::npos) << what;
+  }
 }
 
 }  // namespace
