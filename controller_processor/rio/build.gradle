@@ -223,7 +223,8 @@ if (companionAddress != null) {
 def needsCompanion = { org.gradle.api.Task task ->
     task.name == 'buildRio' ||
     task.name == 'deploy' ||
-    task.name.toLowerCase().contains('frcuserprogramlinuxathena') ||
+    (task.name.toLowerCase().contains('frcuserprogramlinuxathena') &&
+            !task.name.endsWith('CompileCommands')) ||
     task.name.endsWith('RoborioDeploy') ||
     task.name == 'deployRoborio'
 }
@@ -635,7 +636,8 @@ tasks.register("setupCompileCommands") {
     description = 'Generate and copy compile_commands.json to project root'
     group = 'ide'
 
-    dependsOn 'generateCompileCommands'
+    dependsOn 'generateCompileCommands', 'generateRioBuild'
+    def desktopPlatform = wpi.platforms.desktop
 
     doLast {
         def filePath = ""
@@ -644,11 +646,18 @@ tasks.register("setupCompileCommands") {
         } else if (OperatingSystem.current().isMacOsX()) {
             filePath = "build/TargetedCompileCommands/osxuniversalrelease"
         } else if (OperatingSystem.current().isLinux()) {
-            // Todo:
+            filePath = "build/TargetedCompileCommands/${desktopPlatform}release"
+        }
+
+        def sourceFile = filePath ? file("${filePath}/compile_commands.json") : null
+        if (sourceFile == null || !sourceFile.isFile()) {
+            throw new GradleException(
+                    "setupCompileCommands: expected compile_commands.json at " +
+                    "${sourceFile ?: '(unsupported OS)'}")
         }
 
         copy {
-            from fileTree(filePath).include('compile_commands.json')
+            from sourceFile
             into projectDir
         }
     }
