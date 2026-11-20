@@ -483,6 +483,20 @@ TEST(PhoenixBackendEncoders,
       << "non-finite reading poisoned last_position_rot on the next valid tick";
   EXPECT_NEAR(state.encoders[0].position_rot, 0.275, 1e-9);
   EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+
+  // Same for +Inf.
+  sim.Set(std::numeric_limits<double>::infinity());
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_FALSE(state.encoders[0].valid);
+  EXPECT_DOUBLE_EQ(state.encoders[0].position_rot, 0.0);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+
+  sim.Set(0.5);
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_TRUE(state.encoders[0].valid)
+      << "+Inf reading poisoned last_position_rot on the next valid tick";
+  EXPECT_NEAR(state.encoders[0].position_rot, 0.375, 1e-9);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
 }
 
 // The HAL's default PWM centre pulse, which frc::PWM::SetSpeed(0) gives: the
