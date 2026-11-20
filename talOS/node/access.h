@@ -57,6 +57,10 @@ struct NodeSetup {
   std::shared_ptr<const config::RobotConfig> config;  // parsed config_path
   bool simulation = false;
   bool describing = false;  // --describe: Node::describing()
+  // --targeted-outputs: set by the launcher when --describe declared a
+  // hardware_request endpoint without untargeted_outputs (REQ-SAFE-42), so
+  // mark_untargeted_outputs is refused at construction.
+  bool require_targeted_outputs = false;
   LoopPort* loop = nullptr;
   GraphSource graph;  // unset: no graph (null)
   // The session output directory the launcher started this node under (the
@@ -244,8 +248,10 @@ struct NodeAccess {
   // talos::AllowUntargetedOutputs (talOS/devices/devices.h): the devices
   // flush gates this node's outputs on robot_enabled alone, and describe and
   // the registry mark its hardware request with
-  // naming::kSourceFlagUntargetedOutputs. Constructor only: afterwards it
-  // throws std::logic_error naming the node.
+  // naming::kSourceFlagUntargetedOutputs. Constructor only, and refused when
+  // the node was started with --targeted-outputs (its --describe probe
+  // declared a hardware request without untargeted_outputs): throws
+  // std::logic_error naming the node.
   static void mark_untargeted_outputs(Node& node);
   static bool untargeted_outputs(const Node& node);
   // Whether the devices flush is holding back outputs this node set: its

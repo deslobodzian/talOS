@@ -94,6 +94,7 @@ struct Node::Impl {
   std::shared_ptr<const config::RobotConfig> config;
   bool simulation = false;
   bool describing = false;
+  bool require_targeted_outputs = false;
   detail::LoopPort* loop = nullptr;
   detail::GraphSource graph;
   std::optional<std::filesystem::path> session_dir;
@@ -301,6 +302,7 @@ Node::Node(detail::NodeSetup setup) : impl_{std::make_unique<Impl>()} {
   impl.config = std::move(setup.config);
   impl.simulation = setup.simulation;
   impl.describing = setup.describing;
+  impl.require_targeted_outputs = setup.require_targeted_outputs;
   impl.loop = setup.loop;
   impl.graph = std::move(setup.graph);
   impl.session_dir = std::move(setup.session_dir);
@@ -852,6 +854,14 @@ std::string_view NodeAccess::hardware_request(const Node& node) {
 
 void NodeAccess::mark_untargeted_outputs(Node& node) {
   node.impl_->CheckOpen("AllowUntargetedOutputs");
+  if (node.impl_->require_targeted_outputs) {
+    throw std::logic_error(
+        node.impl_->name +
+        ": AllowUntargetedOutputs refused under --targeted-outputs: "
+        "its --describe probe declared a hardware request without "
+        "untargeted_outputs; call AllowUntargetedOutputs unconditionally in "
+        "the constructor so the graph lint sees it");
+  }
   node.impl_->untargeted_outputs = true;
 }
 
@@ -1061,6 +1071,7 @@ struct Flags {
   std::chrono::nanoseconds log_window{0};
   bool simulation = false;
   bool describe = false;
+  bool targeted_outputs = false;
   bool log_set = false;  // --log was passed (vs. the /tmp default)
 };
 
@@ -1073,6 +1084,8 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.simulation = true;
     } else if (arg == "--describe") {
       flags.describe = true;
+    } else if (arg == "--targeted-outputs") {
+      flags.targeted_outputs = true;
     } else if (arg == "--log" && i + 1 < argc) {
       flags.log_path = argv[++i];
       flags.log_set = true;
@@ -1094,7 +1107,8 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.duration_s = std::stoi(argv[++i]);
     } else {
       throw std::invalid_argument(
-          "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
+          "usage: node [--sim] [--describe] [--targeted-outputs] "
+          "[--duration-s N] [--log PATH] "
           "[--log-max-bytes N] [--log-window-us N] [--session-id ID] "
           "[--config PATH] "
           "[--graph PATH] [--replay PATH] [--replay-inputs SESSION_DIR]");
@@ -1189,6 +1203,9 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
       config::ParseRobotConfig(flags.config_path));
   setup.simulation = flags.simulation;
   setup.describing = flags.describe;
+  // Ignored under --describe so a probe always reports the opt-out it declares
+  // for the graph lint to judge; enforced on every run started with the flag.
+  setup.require_targeted_outputs = flags.targeted_outputs && !flags.describe;
   setup.loop = hosted.port.get();
   setup.graph = GraphFromFlags(flags, node_name);
   setup.session_dir = std::move(session_dir);

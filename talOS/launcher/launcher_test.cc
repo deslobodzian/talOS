@@ -1626,6 +1626,317 @@ TEST(LauncherGraphTest, AnOptOutTheProbeDidNotDescribeIsAnEndpointMismatch) {
   EXPECT_EQ(EndpointMismatch({opted_out}, {opted_out}), "");
 }
 
+// SPEC-10 / REQ-SAFE-42, REQ-CONTRACT-11: the launcher passes
+// --targeted-outputs ONLY when the member's --describe probe answered,
+// --allow-graph-errors is not set, and the probe declared a hardware_request
+// endpoint without untargeted_outputs. Non-actuator nodes, nodes declaring
+// untargeted_outputs, hardware_node, unanswered probes, and
+// --allow-graph-errors launches do not receive it.
+TEST(LauncherGraphTest, PassesTargetedOutputsOnlyToTargetedActuatorMembers) {
+  const std::string config_path = TempPath("targeted_outputs_cfg") + ".toml";
+  {
+    std::ofstream out{config_path};
+    out << R"(
+[robot]
+name = "targeted_outputs_fixture"
+period_us = 5000
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+
+[subsystems.beta]
+node = "//example/beta:node"
+
+[subsystems.beta.motors.m2]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+
+[subsystems.gamma]
+node = "//example/gamma:node"
+critical = false
+)";
+  }
+
+  auto alpha_req = Sender("/hw/request/alpha", 64);
+  alpha_req.flags = introspect::naming::kSourceFlagHardwareRequest;
+  auto beta_req = Sender("/hw/request/beta", 64);
+  beta_req.flags = introspect::naming::kSourceFlagHardwareRequest |
+                   introspect::naming::kSourceFlagUntargetedOutputs;
+  const auto hw_sources = std::vector<introspect::naming::SourceShape>{
+      Endpoint(event::SourceKind::FETCHER, "/hw/request/alpha", 64),
+      Endpoint(event::SourceKind::FETCHER, "/hw/request/beta", 64)};
+
+  const auto live_lines_of = [](const std::string& invoked,
+                                std::string_view member) {
+    std::vector<std::string> lines;
+    std::istringstream in{invoked};
+    const std::string prefix = std::string{member} + " ";
+    for (std::string line; std::getline(in, line);) {
+      if (line.starts_with(prefix) &&
+          line.find("--describe") == std::string::npos) {
+        lines.push_back(std::move(line));
+      }
+    }
+    return lines;
+  };
+  const auto describe_lines_of = [](const std::string& invoked) {
+    std::vector<std::string> lines;
+    std::istringstream in{invoked};
+    for (std::string line; std::getline(in, line);) {
+      if (line.find("--describe") != std::string::npos) {
+        lines.push_back(std::move(line));
+      }
+    }
+    return lines;
+  };
+
+  {
+    SCOPED_TRACE("normal launch gates only targeted actuator member");
+    const std::string invoked = TempPath("targeted_outputs_normal_invoked");
+    ::remove(invoked.c_str());
+    const std::string out_dir = TempPath("targeted_outputs_normal_out");
+    std::filesystem::remove_all(out_dir);
+    std::filesystem::create_directories(out_dir);
+    LauncherOptions options;
+    options.output_dir = out_dir;
+    options.session_id = GenerateSessionId();
+    options.config_path = config_path;
+    options.describe_timeout_ms = 4000;
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        "to_norm_hw",
+        RecordingStub("hardware_node", "//talOS/bridge:hardware_node", invoked,
+                      hw_sources));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        "to_norm_alpha",
+        RecordingStub("alpha", "//example/alpha:node", invoked, {alpha_req}));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        "to_norm_beta",
+        RecordingStub("beta", "//example/beta:node", invoked, {beta_req}));
+    options.binary_overrides["//example/gamma:node"] = WriteStubNode(
+        "to_norm_gamma", RecordingStub("gamma", "//example/gamma:node", invoked,
+                                       {Sender("/gamma/state")}));
+
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(invoked);
+    for (const auto& line : describe_lines_of(recorded)) {
+      EXPECT_EQ(line.find("--targeted-outputs"), std::string::npos) << line;
+    }
+    const auto alpha_live = live_lines_of(recorded, "alpha");
+    ASSERT_EQ(alpha_live.size(), 1u) << recorded;
+    EXPECT_NE(alpha_live[0].find("--targeted-outputs"), std::string::npos)
+        << alpha_live[0];
+    for (const std::string_view other : {"beta", "gamma", "hardware_node"}) {
+      const auto lines = live_lines_of(recorded, other);
+      ASSERT_EQ(lines.size(), 1u) << other << "\n" << recorded;
+      EXPECT_EQ(lines[0].find("--targeted-outputs"), std::string::npos)
+          << other << ": " << lines[0];
+    }
+    ::remove(invoked.c_str());
+    std::filesystem::remove_all(out_dir);
+  }
+
+  {
+    SCOPED_TRACE("--allow-graph-errors omits --targeted-outputs");
+    const std::string invoked = TempPath("targeted_outputs_allow_invoked");
+    ::remove(invoked.c_str());
+    const std::string out_dir = TempPath("targeted_outputs_allow_out");
+    std::filesystem::remove_all(out_dir);
+    std::filesystem::create_directories(out_dir);
+    LauncherOptions options;
+    options.output_dir = out_dir;
+    options.session_id = GenerateSessionId();
+    options.config_path = config_path;
+    options.describe_timeout_ms = 4000;
+    options.simulation = true;
+    options.allow_graph_errors = true;
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        "to_allow_hw",
+        RecordingStub("hardware_node", "//talOS/bridge:hardware_node", invoked,
+                      hw_sources));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        "to_allow_alpha",
+        RecordingStub("alpha", "//example/alpha:node", invoked, {alpha_req}));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        "to_allow_beta",
+        RecordingStub("beta", "//example/beta:node", invoked, {beta_req}));
+    options.binary_overrides["//example/gamma:node"] = WriteStubNode(
+        "to_allow_gamma", RecordingStub("gamma", "//example/gamma:node",
+                                        invoked, {Sender("/gamma/state")}));
+
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(invoked);
+    const auto alpha_live = live_lines_of(recorded, "alpha");
+    ASSERT_EQ(alpha_live.size(), 1u) << recorded;
+    EXPECT_EQ(alpha_live[0].find("--targeted-outputs"), std::string::npos)
+        << alpha_live[0];
+    ::remove(invoked.c_str());
+    std::filesystem::remove_all(out_dir);
+  }
+
+  {
+    SCOPED_TRACE("unanswered non-critical probe omits --targeted-outputs");
+    const std::string invoked = TempPath("targeted_outputs_unanswered_invoked");
+    ::remove(invoked.c_str());
+    const std::string out_dir = TempPath("targeted_outputs_unanswered_out");
+    std::filesystem::remove_all(out_dir);
+    std::filesystem::create_directories(out_dir);
+    const std::string silent_gamma =
+        std::string{"#!/bin/sh\necho \"gamma $*\" >> '"} + invoked + "'\n" +
+        std::string{kStubWithoutDescribe}.substr(
+            std::string{"#!/bin/sh\n"}.size());
+    LauncherOptions options;
+    options.output_dir = out_dir;
+    options.session_id = GenerateSessionId();
+    options.config_path = config_path;
+    options.describe_timeout_ms = 4000;
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        "to_unans_hw",
+        RecordingStub("hardware_node", "//talOS/bridge:hardware_node", invoked,
+                      hw_sources));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        "to_unans_alpha",
+        RecordingStub("alpha", "//example/alpha:node", invoked, {alpha_req}));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        "to_unans_beta",
+        RecordingStub("beta", "//example/beta:node", invoked, {beta_req}));
+    options.binary_overrides["//example/gamma:node"] =
+        WriteStubNode("to_unans_gamma", silent_gamma);
+
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(invoked);
+    const auto gamma_live = live_lines_of(recorded, "gamma");
+    ASSERT_EQ(gamma_live.size(), 1u) << recorded;
+    EXPECT_EQ(gamma_live[0].find("--targeted-outputs"), std::string::npos)
+        << gamma_live[0];
+    ::remove(invoked.c_str());
+    std::filesystem::remove_all(out_dir);
+  }
+
+  ::remove(config_path.c_str());
+}
+
+// SPEC-10 / REQ-SAFE-42, REQ-CONTRACT-11: a critical actuator member whose
+// --describe probe declared hardware_request without untargeted_outputs
+// receives --targeted-outputs on BOTH run 0 and every restart (Restart reuses
+// launch.args), so a member hiding AllowUntargetedOutputs behind
+// !Node::describing() fails construction on both run 0 and restart instead of
+// ticking untargeted.
+TEST(LauncherGraphTest, HiddenOptOutRefusesBothFirstRunAndRestart) {
+  const std::string out_dir = TempPath("targeted_restart_out");
+  const std::string runs_file = TempPath("targeted_restart_runs");
+  const std::string ticked_file = TempPath("targeted_restart_ticked");
+  const std::string done_fifo = TempPath("targeted_restart_fifo");
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::create_directories(out_dir);
+  ::remove(runs_file.c_str());
+  ::remove(ticked_file.c_str());
+  ::unlink(done_fifo.c_str());
+  ASSERT_EQ(::mkfifo(done_fifo.c_str(), 0600), 0) << std::strerror(errno);
+  const int fifo_fd = ::open(done_fifo.c_str(), O_RDWR | O_CLOEXEC);
+  ASSERT_GE(fifo_fd, 0) << std::strerror(errno);
+
+  auto alpha_req = Sender("/hw/request/alpha", 64);
+  alpha_req.flags = introspect::naming::kSourceFlagHardwareRequest;
+  const std::string alpha_script =
+      std::string{"#!/bin/sh\n"} +
+      "for arg in \"$@\"; do\n"
+      "  if [ \"$arg\" = \"--describe\" ]; then\n"
+      "    cat <<'TALOS_DESCRIBE'\n" +
+      DescribeJson("alpha", "//example/alpha:node", {alpha_req}) +
+      "TALOS_DESCRIBE\n"
+      "    exit 0\n"
+      "  fi\n"
+      "done\n"
+      "echo \"$*\" >> '" +
+      runs_file +
+      "'\n"
+      "has_flag=0\n"
+      "for arg in \"$@\"; do\n"
+      "  if [ \"$arg\" = \"--targeted-outputs\" ]; then\n"
+      "    has_flag=1\n"
+      "  fi\n"
+      "done\n"
+      "if [ \"$has_flag\" -eq 0 ]; then\n"
+      "  echo untargeted >> '" +
+      ticked_file +
+      "'\n"
+      "  exit 0\n"
+      "fi\n"
+      "count=$(wc -l < '" +
+      runs_file +
+      "')\n"
+      "if [ \"$count\" -ge 2 ]; then\n"
+      "  printf 'd' > '" +
+      done_fifo +
+      "'\n"
+      "fi\n"
+      "echo 'alpha: AllowUntargetedOutputs refused under --targeted-outputs' "
+      ">&2\n"
+      "exit 1\n";
+
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = GenerateSessionId();
+  options.config_path = WriteFixtureToml();
+  options.describe_timeout_ms = 4000;
+  options.duration_s = static_cast<int>(kHang.count());
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      "to_restart_hw",
+      NodeDescribeThenSleep(
+          "hardware_node", "//talOS/bridge:hardware_node",
+          {Endpoint(event::SourceKind::FETCHER, "/hw/request/alpha", 64)}, 30));
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode("to_restart_alpha", alpha_script);
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      "to_restart_beta",
+      NodeDescribeThenSleep("beta", "//example/beta:node", {}, 30));
+
+  std::jthread stopper{[fifo_fd](const std::stop_token& stop) {
+    char byte = 0;
+    if (::read(fifo_fd, &byte, 1) == 1 && byte == 'd' &&
+        !stop.stop_requested()) {
+      ::kill(::getpid(), SIGTERM);
+    }
+  }};
+
+  Launcher{options}.Run();
+  stopper.request_stop();
+  const char wake = 'x';
+  (void)::write(fifo_fd, &wake, 1);
+  stopper.join();
+  ::close(fifo_fd);
+  ::unlink(done_fifo.c_str());
+
+  EXPECT_FALSE(std::filesystem::exists(ticked_file))
+      << "member ticked untargeted: " << ReadFile(ticked_file);
+  std::vector<std::string> run_lines;
+  {
+    std::istringstream in{ReadFile(runs_file)};
+    for (std::string line; std::getline(in, line);) {
+      if (!line.empty()) run_lines.push_back(std::move(line));
+    }
+  }
+  ASSERT_GE(run_lines.size(), 2u) << "expected both run 0 and restart 1; got:\n"
+                                  << ReadFile(runs_file);
+  EXPECT_NE(run_lines[0].find("alpha.tlog"), std::string::npos) << run_lines[0];
+  EXPECT_NE(run_lines[1].find("alpha.restart1.tlog"), std::string::npos)
+      << run_lines[1];
+  for (std::size_t i = 0; i < run_lines.size(); ++i) {
+    EXPECT_NE(run_lines[i].find("--targeted-outputs"), std::string::npos)
+        << "run " << i << ": " << run_lines[i];
+  }
+
+  ::remove(runs_file.c_str());
+  ::remove(ticked_file.c_str());
+  std::filesystem::remove_all(out_dir);
+}
+
 // TOOLS-3: a launch before the build finds no binaries. That is one refusal
 // carrying the build command for every missing node, not one "did not
 // answer" per node; a binary that exists but does not answer keeps its own.

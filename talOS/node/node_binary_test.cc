@@ -804,5 +804,152 @@ TEST(Binary, StopEndsARunningNodeThatWaitsOnNothing) {
   EXPECT_LT(stopped_after, 30s) << "the stop waited for --duration-s";
 }
 
+struct CapturedRun {
+  int status;
+  std::string out;
+  std::string err;
+};
+
+CapturedRun RunInProcess(const std::string& args,
+                         const detail::InstanceFactory& make) {
+  std::vector<std::string> words{"test_node"};
+  {
+    std::istringstream split{args};
+    for (std::string word; split >> std::quoted(word, '\'');) {
+      words.push_back(word);
+    }
+  }
+  std::vector<char*> argv;
+  argv.reserve(words.size());
+  for (std::string& word : words) argv.push_back(word.data());
+  ::testing::internal::CaptureStdout();
+  ::testing::internal::CaptureStderr();
+  const int status = detail::RunMain(static_cast<int>(argv.size()), argv.data(),
+                                     "test_node", "//test", make);
+  CapturedRun result{status, ::testing::internal::GetCapturedStdout(),
+                     ::testing::internal::GetCapturedStderr()};
+  process::stop_requested.store(false);
+  return result;
+}
+
+// A node binary started with --targeted-outputs (passed by the launcher when
+// --describe declared a hardware_request endpoint without untargeted_outputs)
+// refuses AllowUntargetedOutputs at construction and never ticks. Without the
+// flag (standalone run) it constructs and ticks; under --describe the flag is
+// ignored so the probe still reports untargeted_outputs for the graph lint; a
+// targeted actuator node runs cleanly with --targeted-outputs.
+// REQ-SAFE-42, REQ-CONTRACT-11
+TEST(Binary, TargetedOutputsRefusesAllowUntargetedOutputsAtConstruction) {
+  const std::string log = TempFile("targeted_outputs.tlog");
+  std::atomic<int> ticks{0};
+
+  const auto make_actuator = [&ticks](bool opt_out, bool hide_in_describe) {
+    return [&ticks, opt_out, hide_in_describe](Node& node) -> detail::Instance {
+      detail::NodeAccess::add_hardware_request(
+          node, sizeof(Count), alignof(Count), schema::Of<Count>());
+      if (opt_out && (!hide_in_describe || !node.describing())) {
+        detail::NodeAccess::mark_untargeted_outputs(node);
+      }
+      detail::NodeAccess::set_update(node, [&ticks] {
+        ticks.fetch_add(1);
+        process::stop_requested.store(true);
+      });
+      return std::make_shared<int>(0);
+    };
+  };
+
+  {
+    SCOPED_TRACE("opt-out refused under --targeted-outputs");
+    ticks.store(0);
+    const CapturedRun run = RunInProcess(
+        "--sim --targeted-outputs --duration-s 5 --log '" + log + "' " +
+            ConfigFlag(),
+        make_actuator(/*opt_out=*/true, /*hide_in_describe=*/false));
+    EXPECT_EQ(run.status, 1) << run.out << "\n" << run.err;
+    EXPECT_EQ(ticks.load(), 0) << "refused node must never tick";
+    EXPECT_NE(run.err.find("test_node"), std::string::npos) << run.err;
+    EXPECT_NE(run.err.find("AllowUntargetedOutputs"), std::string::npos)
+        << run.err;
+    EXPECT_NE(run.err.find("--targeted-outputs"), std::string::npos) << run.err;
+  }
+
+  {
+    SCOPED_TRACE("hidden opt-out refused under --targeted-outputs");
+    ticks.store(0);
+    const CapturedRun probe = RunInProcess(
+        "--describe " + ConfigFlag(),
+        make_actuator(/*opt_out=*/true, /*hide_in_describe=*/true));
+    ASSERT_EQ(probe.status, 0) << probe.err;
+    introspect::Description described;
+    std::string error;
+    ASSERT_TRUE(introspect::DescribeReader::Parse(probe.out, described, error))
+        << error;
+    const auto req = std::find_if(
+        described.sources.begin(), described.sources.end(),
+        [](const auto& s) { return s.name == "/hw/request/test_node"; });
+    ASSERT_NE(req, described.sources.end()) << probe.out;
+    EXPECT_NE(req->flags & introspect::naming::kSourceFlagHardwareRequest, 0u);
+    EXPECT_EQ(req->flags & introspect::naming::kSourceFlagUntargetedOutputs,
+              0u);
+
+    const CapturedRun run = RunInProcess(
+        "--sim --targeted-outputs --duration-s 5 --log '" + log + "' " +
+            ConfigFlag(),
+        make_actuator(/*opt_out=*/true, /*hide_in_describe=*/true));
+    EXPECT_EQ(run.status, 1) << run.out << "\n" << run.err;
+    EXPECT_EQ(ticks.load(), 0) << "hidden opt-out must never tick";
+    EXPECT_NE(run.err.find("AllowUntargetedOutputs"), std::string::npos)
+        << run.err;
+    EXPECT_NE(run.err.find("--targeted-outputs"), std::string::npos) << run.err;
+  }
+
+  {
+    SCOPED_TRACE("standalone opt-out without --targeted-outputs succeeds");
+    ticks.store(0);
+    const CapturedRun run = RunInProcess(
+        "--sim --duration-s 5 --log '" + log + "' " + ConfigFlag(),
+        make_actuator(/*opt_out=*/true, /*hide_in_describe=*/false));
+    EXPECT_EQ(run.status, 0) << run.out << "\n" << run.err;
+    EXPECT_GE(ticks.load(), 1);
+    ::shm_unlink(ShmObjectName("/hw/request/test_node").c_str());
+  }
+
+  {
+    SCOPED_TRACE("--describe ignores --targeted-outputs");
+    ticks.store(0);
+    const CapturedRun probe = RunInProcess(
+        "--describe --targeted-outputs " + ConfigFlag(),
+        make_actuator(/*opt_out=*/true, /*hide_in_describe=*/false));
+    ASSERT_EQ(probe.status, 0) << probe.err;
+    EXPECT_EQ(ticks.load(), 0);
+    introspect::Description described;
+    std::string error;
+    ASSERT_TRUE(introspect::DescribeReader::Parse(probe.out, described, error))
+        << error << "\n"
+        << probe.out;
+    const auto req = std::find_if(
+        described.sources.begin(), described.sources.end(),
+        [](const auto& s) { return s.name == "/hw/request/test_node"; });
+    ASSERT_NE(req, described.sources.end()) << probe.out;
+    EXPECT_NE(req->flags & introspect::naming::kSourceFlagHardwareRequest, 0u);
+    EXPECT_NE(req->flags & introspect::naming::kSourceFlagUntargetedOutputs,
+              0u);
+  }
+
+  {
+    SCOPED_TRACE("normal targeted actuator runs cleanly with flag");
+    ticks.store(0);
+    const CapturedRun run = RunInProcess(
+        "--sim --targeted-outputs --duration-s 5 --log '" + log + "' " +
+            ConfigFlag(),
+        make_actuator(/*opt_out=*/false, /*hide_in_describe=*/false));
+    EXPECT_EQ(run.status, 0) << run.out << "\n" << run.err;
+    EXPECT_GE(ticks.load(), 1);
+    ::shm_unlink(ShmObjectName("/hw/request/test_node").c_str());
+  }
+
+  std::filesystem::remove(log);
+}
+
 }  // namespace
 }  // namespace talos
