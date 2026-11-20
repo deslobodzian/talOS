@@ -301,6 +301,81 @@ TEST_F(NodeApi, RegistrationFailureFailsTheAdd) {
   EXPECT_EQ(talos_sim_add(sim_, "relay", build, &relay), nullptr);
 }
 
+TEST_F(NodeApi, RemoveAndMidRunAddRestartNodeAtCurrentSimTime) {
+  Relay first;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &first);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  const Value in1{4.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/relay/in", &in1, sizeof in1),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 25 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_node_tick(node), 2u);
+  ASSERT_EQ(first.callbacks, 1);
+
+  EXPECT_EQ(talos_sim_remove(nullptr, "relay"), TALOS_ERR);
+  EXPECT_EQ(talos_sim_remove(sim_, nullptr), TALOS_ERR);
+  EXPECT_EQ(talos_sim_remove(sim_, "missing"), TALOS_ERR);
+  ASSERT_EQ(talos_sim_remove(sim_, "relay"), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_sim_remove(sim_, "relay"), TALOS_ERR);
+  EXPECT_EQ(talos_sim_node(sim_, "relay"), nullptr);
+
+  // Messages published while removed must not reach the old or new instance.
+  const Value while_stopped{6.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/relay/in", &while_stopped,
+                                  sizeof while_stopped),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(first.callbacks, 1);
+  ASSERT_EQ(talos_sim_now_ns(sim_), 35 * kMs);
+
+  // Re-adding mid-run starts at sim now (35 ms) with no catch-up ticks and no
+  // pre-attach messages.
+  Relay second;
+  TalosNode* restarted = talos_sim_add(sim_, "relay", &BuildRelay, &second);
+  ASSERT_NE(restarted, nullptr) << talos_last_error();
+  EXPECT_EQ(talos_node_now_ns(restarted), 35 * kMs);
+  EXPECT_EQ(talos_node_tick(restarted), 0u);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_node_tick(restarted), 1u);
+  EXPECT_EQ(second.callbacks, 0);
+  EXPECT_EQ(talos_subscription_has_value(restarted, second.in), 0);
+
+  // A new message published after attach drives the restarted node normally.
+  const Value in2{8.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/relay/in", &in2, sizeof in2),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(second.callbacks, 1);
+  Value out{};
+  ASSERT_EQ(talos_sim_latest_raw(sim_, "/relay/out", &out, sizeof out), 1);
+  EXPECT_DOUBLE_EQ(out.x, 20.0);
+  EXPECT_EQ(out.stamp, 55 * kMs);
+
+  // Re-entrant remove/add from inside talos_sim_step returns TALOS_ERR.
+  struct Reenter {
+    TalosSim* sim = nullptr;
+    int32_t remove_result = TALOS_OK;
+    TalosNode* add_result = nullptr;
+  } reenter{sim_};
+  auto build_reenter = [](TalosNode* n, void* u) -> int32_t {
+    return talos_node_set_update(
+        n,
+        [](void* ctx) -> int32_t {
+          auto& r = *static_cast<Reenter*>(ctx);
+          r.remove_result = talos_sim_remove(r.sim, "relay");
+          r.add_result = talos_sim_add(
+              r.sim, "extra", [](TalosNode*, void*) { return 0; }, nullptr);
+          return 0;
+        },
+        u);
+  };
+  ASSERT_NE(talos_sim_add(sim_, "reenter", build_reenter, &reenter), nullptr)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(reenter.remove_result, TALOS_ERR);
+  EXPECT_EQ(reenter.add_result, nullptr);
+}
+
 struct ByteSender {
   TalosNode* node = nullptr;
   int64_t out = -1;

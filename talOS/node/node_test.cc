@@ -319,6 +319,138 @@ TEST(Node, TimedPauseResumesExactlyAtItsDeadlineAndRejectsInvalidNodes) {
   EXPECT_THROW(sim.pause("listener", -1ms), std::invalid_argument);
 }
 
+struct Restartable {
+  enum class Mode { kIdle, kActive };
+  static inline int alive = 0;
+  explicit Restartable(Node& n)
+      : node{n},
+        sm{n, Mode::kIdle},
+        plain{n.subscribe<Count>("/watch/target")},
+        waking{n.subscribe<Count>("/watch/wake", [this](const Count& c) {
+          woken.emplace_back(c.tick_count(), Duration{node.now().nanos()});
+        })} {
+    ++alive;
+    n.every(3ms, [this] { beats.push_back(Duration{node.now().nanos()}); });
+  }
+  ~Restartable() { --alive; }
+  void update() {
+    ticks.push_back(Duration{node.now().nanos()});
+    time_in_state.push_back(sm.time_in_state());
+    just_entered.push_back(sm.just_entered());
+  }
+  Node& node;
+  StateMachine<Mode> sm;
+  Subscription<Count> plain;
+  Subscription<Count> waking;
+  std::vector<Duration> ticks;
+  std::vector<Duration> beats;
+  std::vector<Duration> time_in_state;
+  std::vector<bool> just_entered;
+  std::vector<std::pair<std::int64_t, Duration>> woken;
+};
+
+// REQ-SAFE-31: removing a node destroys it and stops its timers and callbacks;
+// re-adding it mid-run starts its clock at sim.now() without catch-up timers
+// from t = 0 and delivers only messages published after it attached.
+TEST(Sim, RemoveDestroysNodeAndMidRunAddStartsAtNowWithoutCatchUp) {
+  Restartable::alive = 0;
+
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& first = sim.add<Restartable>("listener");  // 5 ms period
+  ASSERT_EQ(Restartable::alive, 1);
+  sim.publish("/watch/target", Count{1, 0});
+  sim.step(20ms);
+  ASSERT_EQ(first.ticks.size(), 4u);
+  ASSERT_TRUE(first.plain.has_value());
+
+  sim.remove("listener");
+  EXPECT_EQ(Restartable::alive, 0);
+  EXPECT_THROW((void)sim.node("listener"), std::invalid_argument);
+
+  // Publications while removed and at the exact restart instant (before add)
+  // must not be delivered to the restarted instance.
+  sim.publish("/watch/target", Count{2, 0});
+  sim.publish("/watch/wake", Count{20, 0});
+  sim.step(5ms);  // now = 25 ms
+  sim.publish("/watch/target", Count{3, 0});
+  sim.publish("/watch/wake", Count{30, 0});
+
+  auto& restarted = sim.add<Restartable>("listener");
+  ASSERT_EQ(Restartable::alive, 1);
+  EXPECT_EQ(sim.now(), Time{} + 25ms);
+  EXPECT_EQ(sim.node("listener").now(), sim.now());
+  EXPECT_EQ(sim.node("listener").tick(), 0u);
+
+  // Stepping 0 ms starts the loop at 25 ms with no catch-up firings from 0.
+  sim.step(0ms);
+  EXPECT_TRUE(restarted.ticks.empty());
+  EXPECT_TRUE(restarted.beats.empty());
+  EXPECT_TRUE(restarted.woken.empty());
+  EXPECT_FALSE(restarted.plain.has_value());
+
+  // First every(3ms) fires at 28 ms and first update(5ms) at 30 ms.
+  sim.step(5ms);
+  EXPECT_EQ(restarted.beats, (std::vector<Duration>{28ms}));
+  EXPECT_EQ(restarted.ticks, (std::vector<Duration>{30ms}));
+  EXPECT_EQ(restarted.time_in_state, (std::vector<Duration>{5ms}));
+  EXPECT_EQ(restarted.just_entered, (std::vector<bool>{true}));
+  EXPECT_FALSE(restarted.plain.has_value());
+  EXPECT_TRUE(restarted.woken.empty());
+
+  // Messages published after attach reach both subscriptions normally.
+  sim.publish("/watch/target", Count{4, 0});
+  sim.publish("/watch/wake", Count{40, 0});
+  sim.step(5ms);  // now = 35 ms
+  EXPECT_EQ(restarted.woken,
+            (std::vector<std::pair<std::int64_t, Duration>>{{40, 30ms}}));
+  ASSERT_TRUE(restarted.plain.has_value());
+  EXPECT_EQ(restarted.plain->tick_count(), 4);
+  EXPECT_EQ(restarted.plain.age(), 5ms);
+}
+
+TEST(Sim, RemoveAndMidRunAddRejectMissingDuplicateAndReentrantCalls) {
+  struct Reentrant {
+    explicit Reentrant(Node& n)
+        : in{n.subscribe<Count>("/reenter/wake", [this](const Count&) {
+            if (on_wake) on_wake();
+          })} {}
+    void update() {
+      if (on_update) on_update();
+    }
+    Subscription<Count> in;
+    std::function<void()> on_update;
+    std::function<void()> on_wake;
+  };
+
+  auto sim = Sim::FromToml(kRobotToml);
+  EXPECT_THROW(sim.remove("missing"), std::invalid_argument);
+  auto& node = sim.add<Reentrant>("listener");
+  EXPECT_THROW(sim.add<Empty>("listener"), std::invalid_argument);
+
+  // Calling remove() or add() inside step() throws std::logic_error and leaves
+  // the Sim usable once step() unwinds.
+  node.on_update = [&] { sim.remove("listener"); };
+  EXPECT_THROW(sim.step(5ms), std::logic_error);
+  // Throwing inside Round(5ms) left sim.now() at 0 while the node's periodic
+  // timer already advanced to 10 ms, so step 10 ms to reach the next tick.
+  node.on_update = [&] { sim.add<Empty>("talker"); };
+  EXPECT_THROW(sim.step(10ms), std::logic_error);
+  node.on_update = nullptr;
+
+  node.on_wake = [&] { sim.remove("listener"); };
+  sim.publish("/reenter/wake", Count{1, 0});
+  EXPECT_THROW(sim.step(1ms), std::logic_error);
+  node.on_wake = nullptr;
+
+  // After stepping, duplicate name is still refused while hosted; remove works
+  // once and refuses a second remove.
+  EXPECT_THROW(sim.add<Empty>("listener"), std::invalid_argument);
+  sim.remove("listener");
+  EXPECT_THROW(sim.remove("listener"), std::invalid_argument);
+  sim.add<Empty>("talker");
+  sim.step(5ms);
+}
+
 // A node of type T named "listener" on a simulated loop the test holds, so
 // that it can read what testing::Sim keeps inside its loops.
 template <class T>

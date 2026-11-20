@@ -171,6 +171,82 @@ class TwoNodesTest(unittest.TestCase):
         sim.step(0.007)
         self.assertEqual(collector.heard, [(7, 10), (8, 10)])
 
+    # REQ-SAFE-31: Sim.remove destroys the hosted node and invalidates its
+    # Python wrappers; mid-run Sim.add starts at now_ns with no catch-up ticks
+    # and delivers only messages published after attach.
+    def test_remove_and_mid_run_add_restart_node_cleanly(self):
+        import gc
+        import weakref
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        first = sim.add(Follower, "follower")
+        first_node = sim.node("follower")
+        first_sub = first.goal
+        first_ref = weakref.ref(first)
+
+        sim.publish(Goal, "/planner/goal", height_rot=1.0, enabled=True,
+                    tick_count=1)
+        sim.step(0.025)
+        self.assertEqual(len(first.received), 1)
+        self.assertEqual(first_node.tick, 2)
+
+        sim.remove("follower")
+        # Stale handles raise TalosError rather than touching freed memory.
+        with self.assertRaises(talos.TalosError):
+            _ = first_node.name
+        with self.assertRaises(talos.TalosError):
+            _ = first_sub.has_value
+        with self.assertRaises(talos.TalosError):
+            sim.remove("follower")
+        with self.assertRaises(talos.TalosError):
+            sim.node("follower")
+
+        # Callback tables were cleared so the removed node object is collectible.
+        del first, first_node, first_sub
+        gc.collect()
+        self.assertIsNone(first_ref())
+
+        # Publications before re-add must not reach the restarted node.
+        sim.publish(Goal, "/planner/goal", height_rot=2.0, enabled=True,
+                    tick_count=2)
+        sim.step(0.01)
+        self.assertEqual(sim.now_ns, 35_000_000)
+
+        restarted = sim.add(Follower, "follower")
+        restarted_node = sim.node("follower")
+        self.assertEqual(restarted_node.now_ns, 35_000_000)
+        self.assertEqual(restarted_node.tick, 0)
+        sim.step(0.01)
+        self.assertEqual(restarted_node.tick, 1)
+        self.assertEqual(restarted.received, [])
+        self.assertFalse(restarted.goal.has_value)
+
+        sim.publish(Goal, "/planner/goal", height_rot=3.0, enabled=True,
+                    tick_count=3)
+        sim.step(0.01)
+        self.assertEqual([g.tick_count for g in restarted.received], [3])
+        status = sim.latest(Status, "/follower/status")
+        self.assertEqual(status.height_rot, 6.0)
+
+        # Calling remove() or add() from inside step() raises TalosError.
+        class Reenter:
+            def __init__(self, node):
+                self.action = None
+
+            def update(self):
+                if self.action is not None:
+                    self.action()
+
+        reenter = sim.add(Reenter, "planner")
+        reenter.action = lambda: sim.remove("follower")
+        with self.assertRaises(talos.TalosError):
+            sim.step(0.01)
+        reenter.action = lambda: sim.add(Clock, "vision")
+        with self.assertRaises(talos.TalosError):
+            sim.step(0.02)
+        reenter.action = None
+        sim.step(0.02)
+
 
 class AtDrainCollector:
     """Hears every /planner/goal at the node's drains, never woken by one:

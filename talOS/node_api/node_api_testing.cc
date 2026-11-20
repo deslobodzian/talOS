@@ -99,6 +99,13 @@ TalosNode* talos_sim_add(TalosSim* sim, const char* node_name,
   });
 }
 
+int32_t talos_sim_remove(TalosSim* sim, const char* node_name) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsSim(sim).remove(NonNull(node_name, "node_name"));
+    return TALOS_OK;
+  });
+}
+
 TalosNode* talos_sim_node(TalosSim* sim, const char* node_name) {
   return Guard<TalosNode*>(nullptr, [&] {
     return talos::node_api::AsHandle(

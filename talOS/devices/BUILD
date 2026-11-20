@@ -58,6 +58,7 @@ cc_test(
     srcs = ["testing_test.cc"],
     deps = [
         ":devices",
+        ":target_test_message",
         ":testing",
         "//talOS/bridge:messages",
         "//talOS/configuration",
