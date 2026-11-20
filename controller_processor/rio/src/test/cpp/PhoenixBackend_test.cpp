@@ -1305,43 +1305,30 @@ TEST_F(PhoenixBackendRecovery, LateFeedbackStaysValidAndIsReportedLate) {
 // bit, since an old switch or limiter state is a wrong display (a motor
 // driven into its pressed forward switch, or stalled at its stator limit),
 // but keeps the fault bits it last had: losing the signal never un-faults a
-// motor (BootDuringEnable here, raised by a TalonFX that boots while enabled).
-// Each row first waits until a read shows its bit: the reads that PumpReads
-// gates on fresh motion feedback say nothing of the separate 50 Hz
-// FaultField, and one that finds it 50 ms old reports no limit by this same
-// rule. A simulated TalonFX raises BootDuringEnable only on its first boot in
-// the process, and clears it about 0.5 s after that boot, driven or not; so
-// the boot row takes a CAN id no device here has used, and waits for the bit
-// straight after AwaitReady, without the limit rows' 30-read pump, which
-// takes about as long as the bit lasts.
+// motor (OverSupplyV here, raised deterministically through the simulator's
+// supply-voltage input with no wall-clock window). Each row first waits until
+// a read shows its bit: the reads that PumpReads gates on fresh motion
+// feedback say nothing of the separate 50 Hz FaultField, and one that finds it
+// 50 ms old reports no limit by this same rule.
 // REQ-CONTRACT-32
 TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
-  enum class Row { kForwardHardLimit, kStatorLimiter, kBootFault };
-  // FaultField bit 4, BootDuringEnable: a fault (hw::MotorFaulted).
-  constexpr uint32_t kBootDuringEnableFlag = uint32_t{1} << 4;
-  // CAN ids no other test here uses: one boot row per run of this test
-  // (--gtest_repeat), up to the last TalonFX id.
-  constexpr int kFirstBootCanId = 45;
-  constexpr int kLastCanId = 62;
-  static int next_boot_can_id = kFirstBootCanId;
+  enum class Row { kForwardHardLimit, kStatorLimiter, kOverSupplyFault };
+  // FaultField bit 18, OverSupplyV: a fault (hw::MotorFaulted).
+  constexpr uint32_t kOverSupplyVFlag = uint32_t{1} << 18;
+  static_assert(hw::MotorFaulted(kOverSupplyVFlag));
   for (const Row row :
-       {Row::kForwardHardLimit, Row::kStatorLimiter, Row::kBootFault}) {
+       {Row::kForwardHardLimit, Row::kStatorLimiter, Row::kOverSupplyFault}) {
     const uint32_t bit =
         row == Row::kForwardHardLimit ? hw::kMotorForwardHardLimitFlag
         : row == Row::kStatorLimiter  ? hw::kMotorCurrentLimitFlags
-                                      : kBootDuringEnableFlag;
+                                      : kOverSupplyVFlag;
     SCOPED_TRACE(row == Row::kForwardHardLimit ? "forward hard limit"
                  : row == Row::kStatorLimiter  ? "stator current limit"
-                                               : "boot fault");
+                                               : "over-supply voltage fault");
     EnsureHal();
     EnabledDs ds;
     hw::Config config;
-    if (row == Row::kBootFault) {
-      ASSERT_LE(next_boot_can_id, kLastCanId)
-          << "every CAN id the boot row may take has booted in this process";
-    }
-    auto motor =
-        TestMotor(1, "motor", row == Row::kBootFault ? next_boot_can_id++ : 1);
+    auto motor = TestMotor(1, "motor", 1);
     motor.stator_limit_a = 10;
     config.motors.push_back(motor);
     PhoenixBackend backend(true);
@@ -1351,9 +1338,17 @@ TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
         Request(1, hw::Mode::kVoltage, row == Row::kStatorLimiter ? 6.0 : 2.0)};
     hw::State state;
     auto& sim = Motor(backend, 0).GetSimState();
+    struct SimReset {
+      ctre::phoenix6::sim::TalonFXSimState& sim;
+      ~SimReset() {
+        sim.SetForwardLimit(false);
+        sim.SetSupplyVoltage(units::volt_t{12.0});
+      }
+    } reset{sim};
     if (row == Row::kStatorLimiter) StallRotor(backend);
     if (row == Row::kForwardHardLimit) sim.SetForwardLimit(true);
-    if (row != Row::kBootFault) PumpReads(backend, state, commands, 30);
+    if (row == Row::kOverSupplyFault) sim.SetSupplyVoltage(units::volt_t{30.0});
+    if (row != Row::kOverSupplyFault) PumpReads(backend, state, commands, 30);
     auto& faults = Motor(backend, 0).GetFaultField(false);
     ASSERT_TRUE(ReadUntil(backend, state,
                           [&] {
@@ -1367,14 +1362,22 @@ TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
     PumpReads(backend, state, commands, 30);
     ASSERT_GE(faults.GetTimestamp().GetLatency().value(), 0.05);
     EXPECT_TRUE(state.motors[0].valid);
-    if (row == Row::kBootFault) {
+    if (row == Row::kOverSupplyFault) {
       EXPECT_NE(state.motors[0].fault_flags & bit, 0u)
           << "fault_flags " << state.motors[0].fault_flags;
+      EXPECT_TRUE(hw::MotorFaulted(state.motors[0].fault_flags))
+          << "fault_flags " << state.motors[0].fault_flags;
+      // Restore nominal supply voltage and wait for the simulated TalonFX to
+      // clear OverSupplyV so later rows and tests on CAN id 1 start clean.
+      sim.SetSupplyVoltage(units::volt_t{12.0});
+      ResumeRefreshing(backend, faults);
+      ASSERT_TRUE(ReadUntil(backend, state, [&] {
+        return (state.motors[0].fault_flags & kOverSupplyVFlag) == 0;
+      })) << "OverSupplyV did not clear after restoring 12 V";
     } else {
       EXPECT_EQ(state.motors[0].fault_flags & hw::kMotorNotFaultFlags, 0u)
           << "fault_flags " << state.motors[0].fault_flags;
     }
-    sim.SetForwardLimit(false);
   }
 }
 
