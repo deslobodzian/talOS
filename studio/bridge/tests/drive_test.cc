@@ -772,5 +772,64 @@ TEST(DriveSlots, ReconnectingNeverMintsBytes) {
   EXPECT_TRUE(first_update->keyframe());
 }
 
+// REQ-OPS-34, REQ-OPS-35, REQ-OPS-36, TODO.md DEPLOY-12:
+// BuildRefusalDriveSummary and DriveSummaryJson carry launch_refused and
+// refusal_reason within kDriveSummaryMaxBytes (truncating cleanly at a UTF-8
+// boundary), leave normal summaries backwards-compatible (no refusal fields),
+// and kRefusalDriveLayoutJson parses as a valid minimal layout.
+TEST(DriveSummary,
+     RefusalSummaryEncodesReasonWithinCapAndPreservesNormalShape) {
+  // Normal summary stays backwards-compatible (no launch_refused key).
+  const nlohmann::json normal =
+      nlohmann::json::parse(DriveSummaryJson(DriveSummary{}));
+  EXPECT_FALSE(normal.contains("launch_refused"));
+  EXPECT_FALSE(normal.contains("refusal_reason"));
+
+  // Valid last_refusal.json carries exact reason.
+  const DriveSummary refused = BuildRefusalDriveSummary(
+      R"({"refused":true,"reason":"error: alpha: duplicate writer on /alpha/state","config_path":"/opt/talos/current/robot.toml","wall_ns":42})");
+  EXPECT_TRUE(refused.launch_refused);
+  EXPECT_EQ(refused.refusal_reason,
+            "error: alpha: duplicate writer on /alpha/state");
+  const std::string wire = DriveSummaryJson(refused);
+  EXPECT_LE(wire.size(), talos::telemetry_wire::kDriveSummaryMaxBytes);
+  const nlohmann::json parsed = nlohmann::json::parse(wire);
+  EXPECT_EQ(parsed["kind"], "talos.drive.summary");
+  EXPECT_EQ(parsed["launch_refused"], true);
+  EXPECT_EQ(parsed["refusal_reason"],
+            "error: alpha: duplicate writer on /alpha/state");
+  EXPECT_EQ(parsed["nodes"].size(), 0u);
+  EXPECT_EQ(parsed["omitted"], 0);
+
+  // Fallback when file is empty or corrupt still produces a clear refusal.
+  const DriveSummary fallback =
+      BuildRefusalDriveSummary("{not json", "config parse error");
+  EXPECT_TRUE(fallback.launch_refused);
+  EXPECT_EQ(fallback.refusal_reason, "config parse error");
+
+  const DriveSummary empty_fallback = BuildRefusalDriveSummary("");
+  EXPECT_TRUE(empty_fallback.launch_refused);
+  EXPECT_FALSE(empty_fallback.refusal_reason.empty());
+
+  // Oversized UTF-8 reason is truncated within kDriveSummaryMaxBytes as valid
+  // JSON without splitting a multi-byte character.
+  DriveSummary huge;
+  huge.launch_refused = true;
+  for (int i = 0; i < 2000; ++i) huge.refusal_reason += "—refusal ";
+  const std::string capped = DriveSummaryJson(huge);
+  EXPECT_LE(capped.size(), talos::telemetry_wire::kDriveSummaryMaxBytes);
+  const nlohmann::json capped_parsed = nlohmann::json::parse(capped);
+  EXPECT_EQ(capped_parsed["launch_refused"], true);
+  EXPECT_TRUE(
+      capped_parsed["refusal_reason"].get<std::string>().ends_with("..."));
+
+  // Minimal layout JSON is valid and has a 1x1 grid with zero widgets.
+  const nlohmann::json layout = nlohmann::json::parse(kRefusalDriveLayoutJson);
+  EXPECT_EQ(layout["columns"], 1);
+  EXPECT_EQ(layout["rows"], 1);
+  EXPECT_TRUE(layout["widgets"].is_array());
+  EXPECT_TRUE(layout["widgets"].empty());
+}
+
 }  // namespace
 }  // namespace studio

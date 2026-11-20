@@ -1255,3 +1255,67 @@ test('a drawing error keeps the status line, says to reload, and clears on recov
   assert.equal(page.errored, false);
   assert.equal(page.status, okStatus, 'the status line was not repainted after a status drawing error');
 });
+
+// REQ-OPS-34, REQ-OPS-36, TODO.md DEPLOY-12: when the bridge runs in refusal
+// mode (`--refusal-file`) and sends a `talos.drive.summary` with
+// `launch_refused: true` and `refusal_reason`, `/drive` renders a clear
+// `LAUNCH REFUSED` banner with the exact escaped refusal reason instead of
+// blaming `BRIDGE LINK` or `TELEMETRY`, even with no telemetry ticks.
+test('a refused launch renders LAUNCH REFUSED with its reason instead of BRIDGE LINK', () => {
+  const minimalLayout = parseLayout({
+    title: 'Drive',
+    columns: 1,
+    rows: 1,
+    update_hz: 5,
+    alerts: false,
+    channels: [],
+    widgets: []
+  });
+  const h = harness(minimalLayout);
+  h.model.start(0);
+  h.socket().onopen!();
+  const reason = 'error: motor_py: unread parameter key <unread.value_m>';
+  h.socket().send(JSON.stringify({
+    kind: 'talos.drive.summary',
+    session: '',
+    supervised: false,
+    registry: false,
+    launch_refused: true,
+    refusal_reason: reason,
+    nodes: [],
+    omitted: 0
+  }));
+
+  // Immediate status and past CONNECTING_GRACE_MS with only heartbeats: stays
+  // LAUNCH REFUSED, never BRIDGE LINK or TELEMETRY.
+  for (let t = 0; t <= CONNECTING_GRACE_MS + 500; t += 100) {
+    h.at(t);
+    if (t > 0) h.socket().send('{"kind":"talos.drive.heartbeat"}');
+    const status = h.model.status(t);
+    assert.equal(status.link, 'refused', `${t} ms: got ${status.link} (${status.text})`);
+    assert.equal(status.text, reason);
+  }
+
+  const statusHtml = renderStatus(h.model, h.clock.now);
+  assert.match(statusHtml, /class="status link-refused"/);
+  assert.match(statusHtml, /<b>LAUNCH REFUSED<\/b>/);
+  assert.ok(statusHtml.includes(esc(reason)), statusHtml);
+  assert.doesNotMatch(statusHtml, /BRIDGE LINK/);
+  assert.doesNotMatch(statusHtml, /TELEMETRY/);
+
+  const pageHtml = renderDashboard(minimalLayout, h.model, h.clock.now);
+  assert.match(pageHtml, /class="w refusal-banner"/);
+  assert.match(pageHtml, /LAUNCH REFUSED/);
+  assert.ok(pageHtml.includes(esc(reason)), pageHtml);
+  assert.doesNotMatch(pageHtml, /BRIDGE LINK/);
+
+  // After a reconnect to a healthy session, LAUNCH REFUSED clears.
+  h.socket().onclose!({code: 1006, reason: ''});
+  h.at(h.clock.now + RECONNECT_MS);
+  h.socket().onopen!();
+  h.socket().send(
+      ...encodeDictionaryPages(header(1), CHANNELS),
+      ...update(1, NOMINAL, true),
+      ...update(2, {}, false));
+  assert.equal(h.model.status(h.clock.now).link, 'ok');
+});

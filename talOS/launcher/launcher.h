@@ -81,6 +81,11 @@ inline constexpr int kStopSignal = SIGINT;
 // kills the member's group (SIGKILL; run reason stop_timeout).
 inline constexpr std::chrono::seconds kStopTimeout{2};
 
+// Refusal record written atomically under the log root on a phase-1 refusal
+// (not --describe-only or --replay-inputs), served on /drive when
+// --serve-refusal and --start-studio-bridge are set.
+inline constexpr std::string_view kLastRefusalFile = "last_refusal.json";
+
 // Whether a run ended by the stop signal the launcher sent it: the session's
 // stop signaled it (`kill_reason` kRunStop, or kRunStopTimeout when the
 // SIGKILL found it already ended) before the launcher reaped it, and
@@ -142,6 +147,17 @@ class Launcher {
   // Run's body, with the launcher's output taken. A launch that starts the
   // roster installs `stop_signals` before it creates anything.
   int RunSession(StopSignals& stop_signals);
+
+  // Records a phase-1 refusal atomically to `<log_root_>/last_refusal.json`
+  // (when not --describe-only and not --replay-inputs). When
+  // `options_.serve_refusal && options_.start_studio_bridge` (and the bundle
+  // carries Studio), runs the Studio bridge in refusal mode until a stop
+  // signal, `--duration-s` (if > 0), or the bridge's own exit (e.g.
+  // EADDRINUSE when another session holds the port), stops it cleanly, and
+  // still returns 1.
+  int RefuseLaunch(std::string_view reason,
+                   const config::RobotConfig* robot_config,
+                   StopSignals& stop_signals);
 
   // Replaces manifest.json with the session's state and `procs`. Before the
   // first node starts, and for the final manifest, it is written here and in
@@ -428,6 +444,8 @@ class Launcher {
                      NodeLaunch& launch) const;
 
   LauncherOptions options_;
+  // Log root directory (--output-dir before /<session_id> is appended).
+  std::string log_root_;
   SessionManifest session_manifest_;
   std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
   // Set by Run from --max-restarts or the config, and the window.

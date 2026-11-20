@@ -56,6 +56,8 @@ int main(int argc, char** argv) {
         options.sim_gateway_args.emplace_back(argv[++i]);
       } else if (arg == "--start-studio-bridge") {
         options.start_studio_bridge = true;
+      } else if (arg == "--serve-refusal") {
+        options.serve_refusal = true;
       } else if (arg == "--studio-http-port" && i + 1 < argc) {
         options.studio_http_port =
             talos::config::ParsePortFlag(arg, argv[++i], /*allow_zero=*/true);
@@ -88,7 +90,7 @@ int main(int argc, char** argv) {
                "[--output-dir PATH] "
                "[--duration-s N] [--session-id ID] [--sim] "
                "[--start-sim-gateway [--sim-gateway-arg ARG]...] "
-               "[--start-studio-bridge] "
+               "[--start-studio-bridge] [--serve-refusal] "
                "[--studio-http-port PORT] "
                "[--describe-only [--describe-as-launch]] "
                "[--allow-graph-errors] [--describe-timeout-ms MS] "
@@ -112,6 +114,12 @@ int main(int argc, char** argv) {
                "[studio] http_port (0 lets\n"
                "                         the OS pick a free port, recorded in "
                "manifest.json)\n"
+               "  --serve-refusal        with --start-studio-bridge, keep the "
+               "Studio bridge running\n"
+               "                         on a phase-1 refusal so /drive shows "
+               "LAUNCH REFUSED instead\n"
+               "                         of BRIDGE LINK until stopped (still "
+               "exits 1)\n"
                "  --describe-only        ask every node in the config "
                "what it is, lint the\n"
                "                         graph they describe, and exit "

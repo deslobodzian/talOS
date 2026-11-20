@@ -262,8 +262,58 @@ struct DriveSummary {
   bool supervised{false};  // restarts and quarantine come from a manifest
   // The live registry was read; when false, `alive` means unknown.
   bool registry{false};
+  // Set when the launcher refused the launch in phase 1 and started the bridge
+  // in refusal mode (`--refusal-file`): /drive renders LAUNCH REFUSED with
+  // `refusal_reason` instead of BRIDGE LINK or stale telemetry.
+  bool launch_refused{false};
+  std::string refusal_reason;
   std::vector<DriveSummaryNode> nodes;
 };
+
+// Minimal valid /drive/layout.json served in refusal mode when no robot
+// dashboard layout is available (e.g., a TOML parse error or early refusal),
+// so /drive loads immediately with zero 404/stuck state and opens its feed.
+inline constexpr std::string_view kRefusalDriveLayoutJson =
+    R"({"title":"Drive","columns":1,"rows":1,"update_hz":5,"alerts":false,"channels":[],"widgets":[]})";
+
+// Builds a refusal DriveSummary from the launcher's `last_refusal.json`
+// (`{"refused":true,"reason":"...","config_path":"...","wall_ns":...}`).
+// Falls back to `fallback_reason`, trimmed raw bytes, or a generic message if
+// the file is unreadable or malformed so /drive always surfaces LAUNCH REFUSED.
+inline DriveSummary BuildRefusalDriveSummary(
+    std::string_view refusal_json, std::string_view fallback_reason = {}) {
+  DriveSummary summary;
+  summary.launch_refused = true;
+  if (!refusal_json.empty()) {
+    const nlohmann::json parsed =
+        nlohmann::json::parse(refusal_json, nullptr, false);
+    if (parsed.is_object() && parsed.contains("reason") &&
+        parsed["reason"].is_string()) {
+      summary.refusal_reason = parsed["reason"].get<std::string>();
+    }
+  }
+  if (summary.refusal_reason.empty() && !fallback_reason.empty()) {
+    summary.refusal_reason.assign(fallback_reason);
+  }
+  if (summary.refusal_reason.empty() && !refusal_json.empty()) {
+    std::string_view trimmed = refusal_json;
+    while (!trimmed.empty() &&
+           (trimmed.front() == ' ' || trimmed.front() == '\t' ||
+            trimmed.front() == '\r' || trimmed.front() == '\n')) {
+      trimmed.remove_prefix(1);
+    }
+    while (!trimmed.empty() &&
+           (trimmed.back() == ' ' || trimmed.back() == '\t' ||
+            trimmed.back() == '\r' || trimmed.back() == '\n')) {
+      trimmed.remove_suffix(1);
+    }
+    if (!trimmed.empty()) summary.refusal_reason.assign(trimmed);
+  }
+  if (summary.refusal_reason.empty()) {
+    summary.refusal_reason = "launch refused; see launcher logs on the robot";
+  }
+  return summary;
+}
 
 // The name the Studio bridge goes by in the registry (Bridge::self) and in
 // the launcher's manifest (its kStudioBridgeName).
@@ -405,7 +455,9 @@ inline void AppendDriveNode(std::string& out, const DriveSummaryNode& node) {
 
 // The drive summary message (README.md "Driver dashboard feed"), at most
 // `max_bytes`: when every node does not fit, the nodes at the end that do
-// not are left out and counted in "omitted".
+// not are left out and counted in "omitted". When `summary.launch_refused` is
+// true, carries `"launch_refused":true,"refusal_reason":...` (truncating the
+// reason cleanly at a UTF-8 code-point boundary if needed to fit `max_bytes`).
 inline std::string DriveSummaryJson(
     const DriveSummary& summary,
     std::size_t max_bytes = talos::telemetry_wire::kDriveSummaryMaxBytes) {
@@ -413,6 +465,37 @@ inline std::string DriveSummaryJson(
   AppendEscaped(head, summary.session);
   head += summary.supervised ? ",\"supervised\":true" : ",\"supervised\":false";
   head += summary.registry ? ",\"registry\":true" : ",\"registry\":false";
+  if (summary.launch_refused) {
+    head += ",\"launch_refused\":true,\"refusal_reason\":";
+    const std::string suffix = ",\"nodes\":[],\"omitted\":0}";
+    std::string escaped;
+    AppendEscaped(escaped, summary.refusal_reason);
+    if (head.size() + escaped.size() + suffix.size() <= max_bytes) {
+      head += escaped;
+      head += suffix;
+      return head;
+    }
+    std::size_t len = summary.refusal_reason.size();
+    while (len > 0) {
+      --len;
+      while (len > 0 &&
+             (static_cast<unsigned char>(summary.refusal_reason[len]) & 0xC0) ==
+                 0x80) {
+        --len;
+      }
+      escaped.clear();
+      AppendEscaped(escaped,
+                    std::string(summary.refusal_reason.substr(0, len)) + "...");
+      if (head.size() + escaped.size() + suffix.size() <= max_bytes) {
+        head += escaped;
+        head += suffix;
+        return head;
+      }
+    }
+    head += "\"\"";
+    head += suffix;
+    return head;
+  }
   head += ",\"nodes\":[";
   std::vector<std::string> nodes;
   nodes.reserve(summary.nodes.size());

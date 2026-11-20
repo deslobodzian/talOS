@@ -1,8 +1,11 @@
 #include "talOS/launcher/launcher.h"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -4489,6 +4492,261 @@ TEST(LauncherRemoteTest, BridgeProbeGetsTheEffectiveRemote) {
                "/graph.json");
   EXPECT_EQ(graph.find("\"described\": false"), std::string::npos) << graph;
   std::filesystem::remove_all(options.output_dir);
+}
+
+// Fetches one HTTP GET path on 127.0.0.1:`port` and returns the raw response.
+std::string HttpGetLoopback(uint16_t port, std::string_view path) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return {};
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) !=
+      0) {
+    ::close(fd);
+    return {};
+  }
+  const std::string request = "GET " + std::string{path} +
+                              " HTTP/1.1\r\nHost: localhost\r\n"
+                              "Connection: close\r\n\r\n";
+  (void)::send(fd, request.data(), request.size(), 0);
+  std::string response;
+  char buf[1024];
+  for (;;) {
+    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    if (n <= 0) break;
+    response.append(buf, static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  return response;
+}
+
+// Stub studio_bridge that answers --describe and, when given --refusal-file,
+// binds port 0, prints `listening <port>`, notifies `ready_fifo` with the port,
+// serves GET /drive/summary.json from --refusal-file, and exits cleanly on
+// SIGINT/SIGTERM. Starts with `#!/bin/sh` because WriteStubNode prepends a
+// shell --talos-first-exec guard on line 2.
+std::string RefusalBridgeStub(const std::string& ready_fifo) {
+  return R"(#!/bin/sh
+exec python3 - "$@" <<'PYEOF'
+import http.server, json, os, signal, sys
+
+if "--describe" in sys.argv:
+    print(json.dumps({
+        "describe_version": 1,
+        "name": "studio_bridge",
+        "target": "//studio/bridge:studio_bridge",
+        "sources": [{"kind": "WATCHER", "name": "/talos/telemetry",
+                     "message_bytes": 1200, "alignment": 8,
+                     "schema": "bytes", "schema_hash": 0, "slots": 64}]
+    }))
+    sys.exit(0)
+
+refusal_file = ""
+for i, arg in enumerate(sys.argv):
+    if arg == "--refusal-file" and i + 1 < len(sys.argv):
+        refusal_file = sys.argv[i + 1]
+
+with open(refusal_file, encoding="utf-8") as f:
+    rec = json.load(f)
+body = json.dumps({
+    "kind": "talos.drive.summary",
+    "session": "",
+    "supervised": False,
+    "registry": False,
+    "launch_refused": True,
+    "refusal_reason": rec.get("reason", ""),
+    "nodes": [],
+    "omitted": 0,
+}).encode("utf-8")
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/drive/summary.json":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+port = server.server_address[1]
+print(f"listening {port}", flush=True)
+
+def on_stop(signum, frame):
+    os._exit(0)
+
+signal.signal(signal.SIGINT, on_stop)
+signal.signal(signal.SIGTERM, on_stop)
+
+with open(")" +
+         ready_fifo + R"(", "w", encoding="utf-8") as fifo:
+    fifo.write(f"{port}\n")
+    fifo.flush()
+
+server.serve_forever()
+PYEOF
+)";
+}
+
+// REQ-OPS-34, REQ-OPS-36, TODO.md DEPLOY-12: with --serve-refusal and
+// --start-studio-bridge, a phase-1 graph refusal writes last_refusal.json in
+// the log root, starts the Studio bridge with --refusal-file serving
+// /drive/summary.json with launch_refused: true and the refusal reason, stops
+// the bridge cleanly on SIGINT, and still returns 1.
+TEST(LauncherGraphTest, ServeRefusalStartsBridgeAndServesSummaryUntilStopped) {
+  const std::string ready_fifo = TempPath("serve_refusal_ready.fifo");
+  ::unlink(ready_fifo.c_str());
+  ASSERT_EQ(::mkfifo(ready_fifo.c_str(), 0600), 0);
+
+  // Two writers on /alpha/state triggers a phase-1 graph refusal.
+  const std::string writer_alpha =
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")});
+  const std::string writer_beta =
+      DescribingStub("beta", "//example/beta:node", {Sender("/alpha/state")});
+  GraphFixture fixture{"serve_refusal", writer_alpha, writer_beta};
+  const std::string log_root = fixture.options.output_dir;
+  fixture.options.start_studio_bridge = true;
+  fixture.options.serve_refusal = true;
+  fixture.options.studio_http_port = 0;
+  fixture.options.duration_s = static_cast<int>(kHang.count());
+  fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStubNode("serve_refusal_bridge", RefusalBridgeStub(ready_fifo));
+
+  int exit_code = -1;
+  std::thread runner([&] { exit_code = Launcher{fixture.options}.Run(); });
+
+  // Blocks until the refusal bridge binds and announces its port.
+  uint16_t bound_port = 0;
+  {
+    std::ifstream in{ready_fifo};
+    int parsed = 0;
+    ASSERT_TRUE(in >> parsed) << "refusal bridge did not report a port";
+    bound_port = static_cast<uint16_t>(parsed);
+  }
+  ASSERT_GT(bound_port, 0u);
+
+  const std::string response =
+      HttpGetLoopback(bound_port, "/drive/summary.json");
+  EXPECT_NE(response.find("200 OK"), std::string::npos) << response;
+  EXPECT_NE(response.find("\"launch_refused\": true"), std::string::npos)
+      << response;
+  EXPECT_NE(response.find("/alpha/state"), std::string::npos) << response;
+
+  const std::string refusal_json =
+      ReadFile(log_root + "/" + std::string{kLastRefusalFile});
+  EXPECT_NE(refusal_json.find("\"refused\": true"), std::string::npos)
+      << refusal_json;
+  EXPECT_NE(refusal_json.find("/alpha/state"), std::string::npos)
+      << refusal_json;
+
+  ASSERT_EQ(::kill(::getpid(), SIGINT), 0);
+  runner.join();
+
+  EXPECT_EQ(exit_code, 1);
+  EXPECT_FALSE(fixture.has_manifest());
+  ::unlink(ready_fifo.c_str());
+  std::filesystem::remove_all(log_root);
+}
+
+// REQ-OPS-34, REQ-OPS-50, TODO.md DEPLOY-12:
+// 1. Without --serve-refusal, a phase-1 refusal still writes last_refusal.json
+//    and returns 1 immediately without spawning the Studio bridge in refusal
+//    mode (preserving CLI tests like RefusedGraphIsNamedAtOnce).
+// 2. With --describe-only --serve-refusal, neither last_refusal.json nor the
+//    refusal bridge runs.
+// 3. When the refusal bridge exits immediately on its own (e.g. EADDRINUSE
+//    because a live session holds port 5800), --serve-refusal returns 1
+//    immediately without waiting for duration_s.
+TEST(LauncherGraphTest,
+     RefusalWithoutServeFlagOrWithExitingBridgeReturnsOneImmediately) {
+  const std::string writer_alpha =
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")});
+  const std::string writer_beta =
+      DescribingStub("beta", "//example/beta:node", {Sender("/alpha/state")});
+
+  // Case 1: serve_refusal = false -> refusal bridge is never spawned.
+  {
+    const std::string spawned = TempPath("no_serve_refusal_spawned");
+    ::unlink(spawned.c_str());
+    GraphFixture fixture{"no_serve_refusal", writer_alpha, writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = false;
+    fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+        WriteStubNode(
+            "no_serve_refusal_bridge",
+            "#!/bin/sh\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$a\" = \"--describe\" ]; then\n"
+            "    printf '{\"name\":\"studio_bridge\","
+            "\"target\":\"//studio/bridge:studio_bridge\",\"sources\":[]}\\n'\n"
+            "    exit 0\n"
+            "  fi\n"
+            "done\n"
+            "echo spawned > \"" +
+                spawned + "\"\nexit 0\n");
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(spawned))
+        << "refusal bridge ran without --serve-refusal";
+    const std::string refusal_json =
+        ReadFile(log_root + "/" + std::string{kLastRefusalFile});
+    EXPECT_NE(refusal_json.find("/alpha/state"), std::string::npos)
+        << refusal_json;
+    ::unlink(spawned.c_str());
+    std::filesystem::remove_all(log_root);
+  }
+
+  // Case 2: --describe-only with --serve-refusal writes no last_refusal.json.
+  {
+    GraphFixture fixture{"describe_only_serve_refusal", writer_alpha,
+                         writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    fixture.options.describe_only = true;
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = true;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(
+        std::filesystem::exists(log_root + "/" + std::string{kLastRefusalFile}))
+        << "--describe-only must not write last_refusal.json";
+    std::filesystem::remove_all(log_root);
+  }
+
+  // Case 3: refusal bridge exits immediately (e.g. EADDRINUSE) -> returns 1
+  // without waiting for duration_s (frozen supervision clock never reaches
+  // deadline, so returning proves it ended on the bridge's exit).
+  {
+    GraphFixture fixture{"eaddrinuse_serve_refusal", writer_alpha, writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    testing::SteppedClock clock;
+    fixture.options.supervision_clock = clock.clock();
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = true;
+    fixture.options.duration_s = static_cast<int>(kHang.count());
+    fixture.options
+        .binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
+        "eaddrinuse_refusal_bridge",
+        "#!/bin/sh\n"
+        "for a in \"$@\"; do\n"
+        "  if [ \"$a\" = \"--describe\" ]; then\n"
+        "    printf '{\"name\":\"studio_bridge\","
+        "\"target\":\"//studio/bridge:studio_bridge\",\"sources\":[]}\\n'\n"
+        "    exit 0\n"
+        "  fi\n"
+        "done\n"
+        "echo 'cannot listen on port 5800 (another process holds it?)' >&2\n"
+        "exit 1\n");
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    std::filesystem::remove_all(log_root);
+  }
 }
 
 }  // namespace

@@ -1,11 +1,13 @@
 #include "talOS/launcher/launcher.h"
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -407,7 +409,202 @@ Launcher::Launcher(LauncherOptions options) : options_{std::move(options)} {
   if (options_.session_id == 0) options_.session_id = GenerateSessionId();
   const std::filesystem::path root =
       options_.output_dir.empty() ? "/tmp/talos_logs" : options_.output_dir;
+  log_root_ = root.string();
   options_.output_dir = (root / std::to_string(options_.session_id)).string();
+}
+
+int Launcher::RefuseLaunch(std::string_view reason,
+                           const config::RobotConfig* robot_config,
+                           StopSignals& stop_signals) {
+  if (options_.describe_only || !options_.replay_inputs.empty()) return 1;
+
+  const std::string refusal_path =
+      (std::filesystem::path{log_root_} / kLastRefusalFile).string();
+  std::string json = "{\n  \"refused\": true,\n  \"reason\": ";
+  json += Quoted(reason);
+  json += ",\n  \"config_path\": ";
+  json += Quoted(options_.config_path);
+  json += ",\n  \"wall_ns\": ";
+  json += std::to_string(WallClockNanos());
+  json += "\n}\n";
+
+  std::error_code dir_error;
+  std::filesystem::create_directories(log_root_, dir_error);
+  std::string write_error;
+  const bool refusal_written =
+      !dir_error &&
+      WriteFileAtomically(refusal_path, json, options_.sync_file, write_error);
+  if (!refusal_written) {
+    ConsoleLine(std::cerr) << "[launcher] cannot write " << refusal_path << " ("
+                           << (dir_error ? dir_error.message() : write_error)
+                           << ")\n";
+  }
+
+  if (!options_.serve_refusal || !options_.start_studio_bridge ||
+      BundleWithoutStudio(options_)) {
+    return 1;
+  }
+
+  const std::string target = robot_config != nullptr
+                                 ? robot_config->studio.bridge
+                                 : std::string{"//studio/bridge:studio_bridge"};
+  const NodeSpec spec =
+      MakeNodeSpec(kStudioBridgeName, target, options_, /*studio_bridge=*/true);
+  if (spec.binary_path.empty() ||
+      ::access(spec.binary_path.c_str(), X_OK) != 0) {
+    ConsoleLine(std::cerr)
+        << "[launcher] cannot serve refusal: studio_bridge not executable at '"
+        << (spec.binary_path.empty() ? target : spec.binary_path) << "'\n";
+    return 1;
+  }
+
+  const decltype(config::RobotConfig::studio) defaults{};
+  const uint16_t http_port = options_.studio_http_port.value_or(
+      robot_config != nullptr ? robot_config->studio.http_port
+                              : defaults.http_port);
+  const std::string webroot =
+      robot_config != nullptr ? EffectiveStudioWebroot(*robot_config, options_)
+                              : (options_.bundle_has_studio &&
+                                         !options_.bundle_studio_webroot.empty()
+                                     ? options_.bundle_studio_webroot
+                                     : defaults.webroot);
+  const std::string topic =
+      robot_config != nullptr ? robot_config->studio.topic : defaults.topic;
+
+  std::vector<std::string> args{spec.binary_path,          topic,
+                                std::to_string(http_port), webroot,
+                                "--refusal-file",          refusal_path};
+  if (!refusal_written) {
+    args.emplace_back("--refusal-reason");
+    args.emplace_back(reason);
+  }
+
+  stop_signals.Install();
+  if (process::stop_requested.load()) return 1;
+
+  SupervisionWakeup wakeup;
+  int stdout_fd = -1;
+  std::string spawn_error;
+  const pid_t pid = SpawnProcess(std::move(args), spawn_error,
+                                 SpawnOutput::kStdoutPipe, &stdout_fd);
+  if (pid < 0) {
+    ConsoleLine(std::cerr) << "[launcher] cannot spawn refusal studio_bridge ("
+                           << spawn_error << ")\n";
+    return 1;
+  }
+  if (stdout_fd >= 0) {
+    const int flags = ::fcntl(stdout_fd, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(stdout_fd, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  ServiceNotifier notifier;
+  notifier.Send("READY=1");
+  const auto watchdog = notifier.watchdog_interval();
+  const auto start_time = options_.supervision_clock();
+  SupervisionTime next_watchdog =
+      watchdog ? start_time + *watchdog : SupervisionTime::max();
+  const SupervisionTime deadline =
+      options_.duration_s > 0
+          ? start_time + std::chrono::seconds(options_.duration_s)
+          : SupervisionTime::max();
+
+  bool stop_sent = false;
+  SupervisionTime shutdown_deadline = SupervisionTime::max();
+  bool port_announced = false;
+  std::string stdout_buf;
+
+  const auto drain_stdout = [&] {
+    if (stdout_fd < 0) return;
+    char chunk[256];
+    for (;;) {
+      const ssize_t n = ::read(stdout_fd, chunk, sizeof(chunk));
+      if (n > 0) {
+        if (!port_announced && stdout_buf.size() < 4096) {
+          stdout_buf.append(chunk, static_cast<std::size_t>(n));
+        }
+        continue;
+      }
+      if (n == 0) {
+        ::close(stdout_fd);
+        stdout_fd = -1;
+      }
+      break;
+    }
+    if (!port_announced) {
+      std::size_t pos = 0;
+      for (std::size_t nl = stdout_buf.find('\n', pos); nl != std::string::npos;
+           nl = stdout_buf.find('\n', pos)) {
+        std::string_view line(stdout_buf.data() + pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        constexpr std::string_view kPrefix = "listening ";
+        if (line.starts_with(kPrefix)) {
+          const std::string_view value = line.substr(kPrefix.size());
+          int bound = 0;
+          const auto* end = value.data() + value.size();
+          const auto [ptr, ec] = std::from_chars(value.data(), end, bound);
+          if (!value.empty() && ec == std::errc{} && ptr == end && bound >= 1 &&
+              bound <= 65535) {
+            port_announced = true;
+            ConsoleLine(std::cout)
+                << "[launcher] Launch refused; serving refusal on "
+                   "http://localhost:"
+                << bound << "/drive\n";
+            pos = nl + 1;
+            break;
+          }
+        }
+        pos = nl + 1;
+      }
+      if (pos > 0) stdout_buf.erase(0, pos);
+    }
+  };
+
+  for (;;) {
+    drain_stdout();
+    int status = 0;
+    const pid_t reaped = ::waitpid(pid, &status, WNOHANG);
+    if (reaped == pid) {
+      FinishProcessGroup(pid);
+      drain_stdout();
+      if (stdout_fd >= 0) {
+        ::close(stdout_fd);
+        stdout_fd = -1;
+      }
+      if (!stop_sent) {
+        ConsoleLine(std::cerr) << "[launcher] refusal studio_bridge exited ("
+                               << ExitReason(status) << ")\n";
+      }
+      break;
+    }
+    const SupervisionTime now = options_.supervision_clock();
+    if (watchdog && now >= next_watchdog) {
+      notifier.Send("WATCHDOG=1");
+      next_watchdog = now + *watchdog;
+    }
+    if (!stop_sent && (process::stop_requested.load() || now >= deadline)) {
+      stop_sent = true;
+      shutdown_deadline = now + kStopTimeout;
+      SignalProcessGroup(pid, kStopSignal);
+    }
+    if (stop_sent && now >= shutdown_deadline) {
+      SignalProcessGroup(pid, SIGKILL);
+    }
+    auto wake = SupervisionTime::max();
+    const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
+    if (watchdog) due(next_watchdog);
+    if (stop_sent) {
+      if (now < shutdown_deadline) due(shutdown_deadline);
+    } else {
+      due(deadline);
+      if (!port_announced && stdout_fd >= 0) {
+        due(now + std::chrono::milliseconds{10});
+      }
+    }
+    wakeup.Wait(wake == SupervisionTime::max()
+                    ? std::chrono::nanoseconds::max()
+                    : wake - options_.supervision_clock());
+  }
+  return 1;
 }
 
 int Launcher::Run() {
@@ -459,45 +656,50 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // real controller: --sim requires the loopback remote (below). Refused
   // before the config is read, so nothing is probed, written or spawned.
   if (options_.allow_graph_errors && !options_.simulation) {
-    ConsoleLine(std::cerr)
-        << "launcher: --allow-graph-errors is accepted only with --sim; "
-           "nothing was described or started\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "--allow-graph-errors is accepted only with --sim; nothing was "
+        "described or started";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   // Alone it would start the roster, which whoever passed it meant to check.
   if (options_.describe_as_launch && !options_.describe_only) {
-    ConsoleLine(std::cerr)
-        << "launcher: --describe-as-launch requires --describe-only; "
-           "nothing was described or started\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "--describe-as-launch requires --describe-only; nothing was described "
+        "or started";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
-    ConsoleLine(std::cerr)
-        << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "--sim-gateway-arg requires --start-sim-gateway";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   // The launcher gives the simulator the bridge's ports (SimulatorArgs); a
   // port written by hand as well could only disagree with the bridge's.
   for (const std::string& arg : options_.sim_gateway_args) {
     if (IsSimulatorPortArg(arg)) {
-      ConsoleLine(std::cerr)
-          << "launcher: --sim-gateway-arg " << arg
-          << " is refused: the launcher passes the simulator --port "
-             "and --remote-port from [robot] controller_port and "
-             "local_port, or from its --remote-port and --local-port; "
-             "set those instead\n";
-      return 1;
+      const std::string message =
+          "--sim-gateway-arg " + arg +
+          " is refused: the launcher passes the simulator --port "
+          "and --remote-port from [robot] controller_port and "
+          "local_port, or from its --remote-port and --local-port; "
+          "set those instead";
+      ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+      return RefuseLaunch(message, nullptr, stop_signals);
     }
   }
   std::string bundle_error;
   if (!LoadBundle(options_, bundle_error)) {
     ConsoleLine(std::cerr) << "launcher: " << bundle_error << "\n";
-    return 1;
+    return RefuseLaunch(bundle_error, nullptr, stop_signals);
   }
   if (options_.config_path.empty()) {
-    ConsoleLine(std::cerr)
-        << "launcher: --config PATH or --bundle PATH is required\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "--config PATH or --bundle PATH is required";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   // Recorded absolute (manifest.json, graph.json, every member's --config):
   // a relative path names nothing once the launcher's working directory is
@@ -559,7 +761,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   if (starts_roster) {
     if (!take_lock()) {
       ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
-      return 1;
+      return RefuseLaunch(lock_error, nullptr, stop_signals);
     }
     if (lock_needs_room) {
       ConsoleLine(std::cerr)
@@ -574,8 +776,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   try {
     robot_config = config::ParseRobotConfig(options_.config_path);
   } catch (const std::exception& e) {
-    ConsoleLine(std::cerr) << "launcher: failed to load config from "
-                           << options_.config_path << ": " << e.what() << "\n";
+    const std::string message =
+        "failed to load config from " + options_.config_path + ": " + e.what();
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
     if (config_was_relative) {
       ConsoleLine(std::cerr)
           << "launcher: working directory is "
@@ -583,7 +786,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
           << "; run from the repository root or pass an absolute "
              "--config path\n";
     }
-    return 1;
+    return RefuseLaunch(message, nullptr, stop_signals);
   }
   // A simulation config (its gains, bindings and travel) never drives real
   // hardware. --describe-only and --replay-inputs touch none, but
@@ -594,43 +797,42 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // preparation and capacity stay the launch's alone.
   if (robot_config.simulation_only && !options_.simulation &&
       (starts_roster || options_.describe_as_launch)) {
-    ConsoleLine(std::cerr)
-        << "launcher: " << options_.config_path
-        << " sets [robot] simulation_only = true; "
-        << (options_.describe_as_launch
-                ? "a launch of it without --sim is refused, so it "
-                  "cannot be installed as the robot's; nothing was "
-                  "started\n"
-                : "run it with --sim (or --describe-only); nothing "
-                  "was started\n");
-    return 1;
+    const std::string message =
+        options_.config_path + " sets [robot] simulation_only = true; " +
+        (options_.describe_as_launch
+             ? "a launch of it without --sim is refused, so it cannot be "
+               "installed as the robot's; nothing was started"
+             : "run it with --sim (or --describe-only); nothing was started");
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
   }
   std::string effective_remote;
   try {
     effective_remote = EffectiveRemoteAddress(robot_config, options_);
   } catch (const std::exception& e) {
     ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-    return 1;
+    return RefuseLaunch(e.what(), &robot_config, stop_signals);
   }
   if (options_.simulation && effective_remote != "127.0.0.1") {
-    ConsoleLine(std::cerr)
-        << "launcher: --sim requires remote 127.0.0.1; effective remote "
-        << effective_remote << "\n";
-    return 1;
+    const std::string message =
+        "--sim requires remote 127.0.0.1; effective remote " + effective_remote;
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
   }
   std::string restart_error;
   int max_restarts = kDefaultMaxRestarts;
   if (!ResolveMaxRestarts(robot_config, options_, max_restarts,
                           restart_error)) {
     ConsoleLine(std::cerr) << "launcher: " << restart_error << "\n";
-    return 1;
+    return RefuseLaunch(restart_error, &robot_config, stop_signals);
   }
   if (options_.restart_window_ms <= 0 || options_.heartbeat_periods <= 0 ||
       options_.heartbeat_startup_grace_ms < 0) {
-    std::cerr
-        << "launcher: restart window and heartbeat periods must be positive; "
-           "startup grace must be nonnegative\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "restart window and heartbeat periods must be positive; startup grace "
+        "must be nonnegative";
+    std::cerr << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, &robot_config, stop_signals);
   }
   restart_limits_ = {max_restarts,
                      std::chrono::milliseconds{options_.restart_window_ms}};
@@ -643,8 +845,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
            "without Studio\n";
   }
   if (node_specs.empty()) {
-    ConsoleLine(std::cerr) << "launcher: no nodes declared in config\n";
-    return 1;
+    constexpr std::string_view kMessage = "no nodes declared in config";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, &robot_config, stop_signals);
   }
   // A member's name is its file names (<name>.log, <name>.tlog) and its
   // registry row. Subsystem keys are unique, so two members of one name are
@@ -657,14 +860,15 @@ int Launcher::RunSession(StopSignals& stop_signals) {
       if (node_specs[i].name != node_specs[j].name) continue;
       const NodeSpec& added =
           node_specs[i].studio_bridge ? node_specs[i] : node_specs[j];
-      ConsoleLine(std::cerr)
-          << "launcher: [subsystems." << node_specs[i].name
-          << "] has the name of the launcher's own "
-          << (added.studio_bridge
-                  ? "Studio bridge, which --start-studio-bridge adds"
-                  : "roster member of that name")
-          << "; rename the subsystem\n";
-      return 1;
+      const std::string message =
+          "[subsystems." + node_specs[i].name +
+          "] has the name of the launcher's own " +
+          (added.studio_bridge
+               ? "Studio bridge, which --start-studio-bridge adds"
+               : "roster member of that name") +
+          "; rename the subsystem";
+      ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+      return RefuseLaunch(message, &robot_config, stop_signals);
     }
   }
   // A member's name is its file names (<name>.log, <name>.tlog). One that
@@ -676,19 +880,19 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   for (const NodeSpec& spec : node_specs) {
     const auto problem = naming::CheckNodeName(spec.name);
     if (!problem) continue;
-    ConsoleLine(std::cerr)
-        << "launcher: roster member '" << spec.name << "': " << *problem
-        << "; refused even with --allow-graph-errors, since the name "
-           "is its output and event log file names (the launcher's own "
-           "is "
-        << kLauncherOutputFile << ")\n";
-    return 1;
+    const std::string message =
+        "roster member '" + spec.name + "': " + *problem +
+        "; refused even with --allow-graph-errors, since the name is its "
+        "output and event log file names (the launcher's own is " +
+        std::string{kLauncherOutputFile} + ")";
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
   }
   // Checked again right before retention lists the log root: another
   // launch may have taken the lock meanwhile.
   if (lock_needs_room && !take_lock()) {
     ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
-    return 1;
+    return RefuseLaunch(lock_error, &robot_config, stop_signals);
   }
   const Pruning pruning = session_lock      ? Pruning::kLocked
                           : lock_needs_room ? Pruning::kUnlocked
@@ -699,11 +903,13 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   if (lock_needs_room && (!take_lock() || !session_lock)) {
     ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
     ReportUnwrittenRetention(retention_record);
-    return 1;
+    return RefuseLaunch(lock_error, &robot_config, stop_signals);
   }
   if (!CreateSessionDirectory(robot_config, node_specs.size(),
                               pruning != Pruning::kNone, retention_record)) {
-    return 1;
+    return RefuseLaunch(
+        "cannot create or lock session directory " + options_.output_dir,
+        &robot_config, stop_signals);
   }
   launcher_output_->Record(options_.output_dir + "/" +
                            std::string{kLauncherOutputFile});
@@ -718,7 +924,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
       introspect::PrepareRegistry();
     } catch (const std::exception& e) {
       ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-      return 1;
+      return RefuseLaunch(e.what(), &robot_config, stop_signals);
     }
   }
 
@@ -732,7 +938,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
         starts_roster ? process::StopFd() : -1);
   } catch (const std::exception& e) {
     ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-    return 1;
+    return RefuseLaunch(e.what(), &robot_config, stop_signals);
   }
   // A stop kills the probes it finds running (ProbeDescribe), so their
   // descriptions are not the roster's: nothing is linted or recorded.
@@ -760,9 +966,10 @@ int Launcher::RunSession(StopSignals& stop_signals) {
                       diagnostics, options_.bundle_config_sha256,
                       CanBusNamesOf(robot_config)),
           options_.sync_file, graph_error)) {
-    ConsoleLine(std::cerr) << "launcher: cannot write " << graph_path << " ("
-                           << graph_error << "); nothing was started\n";
-    return 1;
+    const std::string message = "cannot write " + graph_path + " (" +
+                                graph_error + "); nothing was started";
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
   }
   PrintDeclaredGraph(described, diagnostics, declared_topics, graph_path);
   // Its warning is in the graph above; an observer's absence stops nothing.
@@ -778,11 +985,11 @@ int Launcher::RunSession(StopSignals& stop_signals) {
           introspect::RegistryReader{}, node_specs.size());
       if (!full.empty()) {
         ConsoleLine(std::cerr) << "launcher: " << full << "\n";
-        return 1;
+        return RefuseLaunch(full, &robot_config, stop_signals);
       }
     } catch (const std::exception& e) {
       ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-      return 1;
+      return RefuseLaunch(e.what(), &robot_config, stop_signals);
     }
   }
 
@@ -791,7 +998,22 @@ int Launcher::RunSession(StopSignals& stop_signals) {
         << "launcher: the declared graph has errors; refusing to "
            "start. Fix the errors above, or, in simulation, pass "
            "--allow-graph-errors with --sim to launch anyway.\n";
-    return 1;
+    std::string details;
+    int error_count = 0;
+    for (const auto& diagnostic : diagnostics) {
+      if (diagnostic.severity != naming::Severity::ERROR) continue;
+      if (error_count < 5) {
+        if (!details.empty()) details += "; ";
+        details += diagnostic.ToString();
+      }
+      ++error_count;
+    }
+    if (details.empty()) {
+      details = "the declared graph has errors";
+    } else if (error_count > 5) {
+      details += " (+" + std::to_string(error_count - 5) + " more)";
+    }
+    return RefuseLaunch(details, &robot_config, stop_signals);
   }
   if (options_.describe_only) {
     ConsoleLine(std::cout) << "[launcher] describe-only: nothing was started\n";
@@ -806,7 +1028,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     segments = CreateSessionSegments(described);
   } catch (const std::exception& e) {
     ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-    return 1;
+    return RefuseLaunch(e.what(), &robot_config, stop_signals);
   }
   ConsoleLine(std::cout) << "[launcher] Created " << segments.size()
                          << " session-owned topic segments\n";

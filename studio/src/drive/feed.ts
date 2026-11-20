@@ -117,11 +117,13 @@ export type DriveSummary = {
   registry: boolean;
   nodes: SummaryNode[];
   omitted: number;
+  launch_refused?: boolean;
+  refusal_reason?: string;
 };
 
 export type Connection = 'connecting'|'open'|'waiting'|'replaced';
 export type Link =
-    'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'roborio'|'replaced';
+    'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'roborio'|'replaced'|'refused';
 // `undecodable`: the line names a feed the page could not decode.
 export type LinkStatus = {link: Link; text: string; undecodable?: true};
 
@@ -161,13 +163,18 @@ export function parseSummary(v: unknown): DriveSummary|null {
       drives: typeof node.drives === 'string' ? node.drives : null
     });
   }
-  return {
+  const summary: DriveSummary = {
     session: typeof s.session === 'string' ? s.session : '',
     supervised: s.supervised,
     registry: s.registry,
     nodes,
     omitted: typeof s.omitted === 'number' && s.omitted > 0 ? s.omitted : 0
   };
+  if (s.launch_refused === true) {
+    summary.launch_refused = true;
+    if (typeof s.refusal_reason === 'string') summary.refusal_reason = s.refusal_reason;
+  }
+  return summary;
 }
 
 function bytesOf(data: unknown): Uint8Array|null {
@@ -317,6 +324,13 @@ export class DriveModel {
     if (now - this.lastMessageAt > SILENCE_MS)
       return {link: 'bridge', text: 'Dashboard to bridge link: nothing heard for ' +
                                     seconds(now - this.lastMessageAt)};
+    if (this.summaryThisSocket && this.summary?.launch_refused) {
+      const reason = this.summary.refusal_reason?.trim();
+      return {
+        link: 'refused',
+        text: reason || 'Robot launch refused; check launcher logs and redeploy'
+      };
+    }
     if (this.suspended)
       return {link: 'telemetry', text: 'Telemetry stale: the page missed time (laptop asleep), ' +
                                        'waiting for a new tick'};

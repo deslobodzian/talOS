@@ -358,7 +358,7 @@ export function renderWidget(w: Widget, model: DriveModel, now: number): string 
 const LINK_WORD: Record<Link, string> = {
   ok: 'OK', connecting: 'CONNECTING', bridge: 'BRIDGE LINK',
   telemetry: 'TELEMETRY', hardware: 'HARDWARE BRIDGE', roborio: 'ROBORIO LINK',
-  replaced: 'REPLACED'
+  replaced: 'REPLACED', refused: 'LAUNCH REFUSED'
 };
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -377,8 +377,11 @@ export function renderStatus(model: DriveModel, now: number, skipped = 0): strin
           ` <span class="meta">state age ${Math.round(ageUs / 1000)} ms</span>`;
     }
   }
-  return `<div class="status link-${status.link}" role="status">` +
-      `<b>${LINK_WORD[status.link]}</b> ${esc(status.text)}` +
+  const summaryText = status.link === 'refused' ?
+      status.text.replace(/\s+/g, ' ').trim() : status.text;
+  const titleAttr = status.link === 'refused' ? ` title="${esc(status.text)}"` : '';
+  return `<div class="status link-${status.link}" role="status"${titleAttr}>` +
+      `<b>${LINK_WORD[status.link]}</b> ${esc(summaryText)}` +
       (status.link === 'replaced' ?
            ' <button type="button" data-action="reconnect">Reconnect</button>' : '') +
       stateAge +
@@ -389,9 +392,33 @@ export function renderStatus(model: DriveModel, now: number, skipped = 0): strin
       '</div>';
 }
 
+function renderRefusalBanner(reason: string): string {
+  return '<section class="w refusal-banner" role="alert" style="grid-column:1 / -1;grid-row:1 / -1">' +
+      '<header><h2>LAUNCH REFUSED</h2></header>' +
+      '<div class="body">' +
+      '<div class="big bad">LAUNCH REFUSED</div>' +
+      `<pre class="refusal-reason">${esc(reason)}</pre>` +
+      '<p class="small refusal-hint">The robot did not start because the launcher refused this configuration or bundle. ' +
+      'Fix the error above, install a passing bundle, and restart the robot service (see Pre-match checklist).</p>' +
+      '</div></section>';
+}
+
+// Each grid cell's markup, in order, for Painter (main.ts) and renderWidgets.
+// When the layout has no widgets (the minimal layout served in refusal mode),
+// draws a full-grid LAUNCH REFUSED banner while refused.
+export function renderGridWidgets(layout: Layout, model: DriveModel, now: number): string[] {
+  if (layout.widgets.length > 0)
+    return layout.widgets.map(w => renderWidget(w, model, now));
+  const status = model.status(now);
+  if (status.link === 'refused') return [renderRefusalBanner(status.text)];
+  return ['<section class="w" style="grid-column:1 / -1;grid-row:1 / -1">' +
+      '<header><h2>Robot status</h2></header>' +
+      `<div class="body"><p class="none">${esc(status.text)}</p></div></section>`];
+}
+
 // The widgets, for the grid element (gridStyle sizes it).
 export function renderWidgets(layout: Layout, model: DriveModel, now: number): string {
-  return layout.widgets.map(w => renderWidget(w, model, now)).join('');
+  return renderGridWidgets(layout, model, now).join('');
 }
 
 export function gridStyle(layout: Layout): string {
