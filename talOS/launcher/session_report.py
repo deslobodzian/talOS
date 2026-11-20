@@ -14,13 +14,15 @@ from python.runfiles import runfiles
 
 
 def stats(values, unit="ms"):
-    """Count, median, nearest-rank p99 and max, each named with its unit;
+    """Count, min, median, nearest-rank p99 and max, each named with its unit;
     None for no values (a row with no sample is not measured, not 0)."""
     values = sorted(values)
     if not values:
         return None
-    return {"count": len(values), f"median_{unit}": statistics.median(values),
-            f"p99_{unit}": values[math.ceil(.99 * len(values)) - 1], f"max_{unit}": values[-1]}
+    return {"count": len(values), f"min_{unit}": values[0],
+            f"median_{unit}": statistics.median(values),
+            f"p99_{unit}": values[math.ceil(.99 * len(values)) - 1],
+            f"max_{unit}": values[-1]}
 
 
 def scalars(decoded):
@@ -609,6 +611,41 @@ def controller_link(states, state_source, status_records, status_source):
     return False, False, None, "no /hw/state or /hw/status record"
 
 
+def state_sequence_gaps(states, spans):
+    """Count missed /hw/state sequences within each gateway boot from decoded
+    State records (hardware.boot_id and hardware.sequence, TODO.md RT-28).
+    Consecutive pairs across a boot change are not counted; pairs meeting a
+    log gap of the state stream's log are skipped and counted in `unmeasured`.
+    Returns (summary_or_None, unmeasured)."""
+    state_logs = {r["process"] for r in states[:1]}
+    sequenced = [r for r in states
+                 if isinstance(r.get("hardware"), dict) and "sequence" in r["hardware"]]
+    intervals = missed = gap_count = longest_run = unmeasured = 0
+    longest_at_ms = None
+    for previous, current in zip(sequenced, sequenced[1:]):
+        prev_hw, curr_hw = previous["hardware"], current["hardware"]
+        if prev_hw.get("boot_id") != curr_hw.get("boot_id"):
+            continue
+        if across_gap(spans, state_logs, previous["now_ms"], current["now_ms"]):
+            unmeasured += 1
+            continue
+        prev_seq, curr_seq = prev_hw["sequence"], curr_hw["sequence"]
+        if curr_seq <= prev_seq:
+            continue
+        intervals += 1
+        skipped = curr_seq - prev_seq - 1
+        if skipped > 0:
+            missed += skipped
+            gap_count += 1
+            if skipped > longest_run:
+                longest_run = skipped
+                longest_at_ms = previous["publish_ms"]
+    if intervals == 0:
+        return None, unmeasured
+    return {"intervals": intervals, "missed": missed, "gaps": gap_count,
+            "longest_run": longest_run, "longest_at_ms": longest_at_ms}, unmeasured
+
+
 def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_decoded=None):
     # hardware_not_decoded: log_dump's line for a session recorded under
     # another hardware protocol. Its Driver Station packets were not decoded,
@@ -803,6 +840,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     to_lane, unanswered, across_to_lane = driver_station_to_lane(ds_packets, records, spans)
     to_command, across_to_command = driver_station_to_command(ds, records, spans,
                                                               enabled_at, bridge)
+    seq_gaps, across_seq = state_sequence_gaps(states, spans)
     # The enabled-only rows above stay required (REQ-RT-15); in a session
     # that never enabled they cannot be measured, which is no tool fault.
     never_enabled = None
@@ -862,6 +900,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             "first_state_ms": first_state_ms,
             "state_stream": source, "state_overall": stats(overall),
             "state_enabled": stats(enabled), "enabled_gaps_ge_100_ms": gaps,
+            "state_sequence_gaps": seq_gaps,
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
             "target_age_at_tick": {k: stats(v) for k, v in sorted(tick_ages.items())},
             "timer_lateness": {k: stats(v) for k, v in sorted(timers.items())},
@@ -885,7 +924,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             "alerts": alert_summary(records, spans), "verdicts": verdicts,
             "limitations": ["State timing is bridge IPC publication or one consumer dispatch stream, not raw UDP arrival; never pooled duplicate readers.",
                             "Enabled uses the logged DS enabled bit, held until its next observation; DS silence is not proof of continued physical enablement.",
-                            "Bridge request to command runs from the requesting tick's start to the command's publication on /hw/command, not its delivery to the RoboRIO: a command whose UDP send failed is still counted (the bridge's send_failures, on its exit line, says whether any did); with several owners the merged observation can be another owner's older request, overstating it.",
+                            "Bridge request to command runs from the requesting tick's start to the command's publication on /hw/command (after the bridge's UDP send succeeds), not its delivery across the network to the RoboRIO; with several owners the merged observation can be another owner's older request, overstating it.",
                             "Alert times are publication times of their status topic: an alert is timed from the first record showing it active to the first showing it clear (or that topic's last record), so a topic published every P ms resolves them to P, and a publisher that stops (a crash) holds its last state until its next record.",
                             "Counter deltas exclude unknown increments before the first sample and during resets; clock mapping is not absolute synchronization.",
                             "Capped, truncated or unfinished sessions cannot establish whole-session acceptance; retain raw logs."],
@@ -896,6 +935,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             **({"log_gaps": gap_list, "records_lost": records_lost,
                 "intervals_across_gaps": {"state_overall": across_state,
                                           "state_enabled": across_state + across_ds,
+                                          "state_sequence": across_seq,
                                           "bridge_request_to_command": across_bridge,
                                           "state_to_request": across_to_request,
                                           "driver_station_to_lane": across_to_lane,
@@ -913,9 +953,9 @@ def strict_failures(report):
 def stats_row(name, s, unit="ms"):
     """One table row of stats(); NOT MEASURED for a row with no sample."""
     if s is None or not s["count"]:
-        return f"| {name} | NOT MEASURED | — | — | — |"
-    return (f"| {name} | {s['count']} | {s[f'median_{unit}']:.6g} | {s[f'p99_{unit}']:.6g} "
-            f"| {s[f'max_{unit}']:.6g} |")
+        return f"| {name} | NOT MEASURED | — | — | — | — |"
+    return (f"| {name} | {s['count']} | {s[f'min_{unit}']:.6g} | {s[f'median_{unit}']:.6g} "
+            f"| {s[f'p99_{unit}']:.6g} | {s[f'max_{unit}']:.6g} |")
 
 
 # The REQ-RT-25 rows, each named as the report states it and keyed as in
@@ -929,8 +969,8 @@ def latency_lines(report):
     """The Latency section: REQ-RT-25's rows, informational (no verdict)."""
     lines = ["", "## Latency (REQ-RT-25)",
              "Informational, not judged by --strict. Each value is the difference of two "
-             "readings of one clock.", "| Measurement | Count | Median | p99 | Max |",
-             "|---|---:|---:|---:|---:|"]
+             "readings of one clock.", "| Measurement | Count | Min | Median | p99 | Max |",
+             "|---|---:|---:|---:|---:|---:|"]
     devices = report["feedback_age_us"]
     # A sentinel (unknown) age is named in the row, never in its figures.
     lines += [stats_row(f"feedback age {name} (µs"
@@ -1005,7 +1045,8 @@ def markdown(report):
         ["- NOT RECORDED (the manifest names no launcher log)"] if drops is None else
         ["- " + s for s in drops] or ["- talos.log notes no dropped output"])
     lines += ["", "## Timing (ms)", f"State stream: {report['state_stream'] or 'NOT MEASURED'}",
-              "| Measurement | Count | Median | p99 | Max |", "|---|---:|---:|---:|---:|"]
+              "| Measurement | Count | Min | Median | p99 | Max |",
+              "|---|---:|---:|---:|---:|---:|"]
     entries = {"/hw/state overall": report["state_overall"],
                "/hw/state enabled": report["state_enabled"],
                **{"receipt " + k: v for k, v in report["target_receipt_age"].items()},
@@ -1016,6 +1057,16 @@ def markdown(report):
         for split in ("enabled", "disabled"):
             entries[f"bridge request to command {bridge['process']} {split}"] = bridge[split]
     lines += [stats_row(name, s) for name, s in entries.items()]
+    seq = report["state_sequence_gaps"]
+    if seq is None:
+        lines.append("State sequence gaps: NOT MEASURED (no decoded /hw/state sequence pairs).")
+    elif seq["missed"]:
+        lines.append(
+            f"State sequence gaps: {seq['missed']} missed states across {seq['gaps']} gaps "
+            f"(longest consecutive gap: {seq['longest_run']} states at "
+            f"{seq['longest_at_ms']:.6g} ms).")
+    else:
+        lines.append(f"State sequence gaps: 0 missed states across {seq['intervals']} intervals.")
     if not report["target_receipt_age"]:
         lines.append("Target receipt age: NOT MEASURED (no target MESSAGE dispatches).")
     if not report["target_age_at_tick"]:
