@@ -246,23 +246,37 @@ with a Python actuator owner needs a `command_timeout_us` of at least 80000.
 
 The lint checks the graph the probes declared, so a node must declare the same
 endpoints whether or not `Node::describing()`
-([node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md)). The launcher
-checks that each run did. Once per run of every member that answered
-`--describe`, in the first supervision pass that finds the run's registry row
-active with its sources published, it compares the row's topic ends with the
-probe's: kind, topic, message size, alignment and the `external`, `optional`,
-`observer` and `untargeted_outputs` attributes, as multisets, so a node that
-lifts its flush's target gate only when it is not describing
-(REQ-SAFE-42) is refused as below. Timers are not endpoints, and the
-loop's latest-only flag, which a probe reports, is a delivery detail, not an
-endpoint attribute. The schema hash is not in
-the registry; it needs no comparison, because every declared topic's
-session-owned segment was created with its declared schema and an end with
-another one fails at attach, while an undeclared topic differs by name. A row
-publishes its sources once per claim, before it clears `kFlagConstructing`
-(or, for the hardware bridge and the simulation gateway, which never set it,
-before any source shows), so the comparison never sees a half-written table;
-a run that registers no source at all is not compared.
+([node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md)). Two checks
+enforce that:
+
+- **Targeted-outputs construction gate (REQ-SAFE-42).** When a member's
+  `--describe` probe answered and declared a `hardware_request` endpoint without
+  `untargeted_outputs`, and `--allow-graph-errors` is not set, the launcher
+  passes `--targeted-outputs` to that member on its first run and on every
+  restart (`Restart` reuses `launch.args`). A node started with
+  `--targeted-outputs` refuses `talos::AllowUntargetedOutputs`
+  (`talos.allow_untargeted_outputs` in Python) at construction with
+  `std::logic_error` (`TalosError`) and exits non-zero before its loop starts,
+  so an opt-out hidden behind `!Node::describing()` can never tick untargeted
+  on a first run or after a critical restart. Non-actuator nodes,
+  `hardware_node`, `sim_gateway`, `studio_bridge`, nodes whose probe declared
+  `untargeted_outputs`, unanswered probes and `--allow-graph-errors` launches do
+  not receive `--targeted-outputs`.
+- **Live endpoint comparison.** Once per run of every member that answered
+  `--describe`, in the first supervision pass that finds the run's registry row
+  active with its sources published, the launcher compares the row's topic ends
+  with the probe's: kind, topic, message size, alignment and the `external`,
+  `optional`, `observer` and `untargeted_outputs` attributes, as multisets.
+  Timers are not endpoints, and the
+  loop's latest-only flag, which a probe reports, is a delivery detail, not an
+  endpoint attribute. The schema hash is not in
+  the registry; it needs no comparison, because every declared topic's
+  session-owned segment was created with its declared schema and an end with
+  another one fails at attach, while an undeclared topic differs by name. A row
+  publishes its sources once per claim, before it clears `kFlagConstructing`
+  (or, for the hardware bridge and the simulation gateway, which never set it,
+  before any source shows), so the comparison never sees a half-written table;
+  a run that registers no source at all is not compared.
 
 A difference is one error line naming the member, its pid and each end only
 the live run or only the probe holds:

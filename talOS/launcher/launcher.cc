@@ -1013,6 +1013,22 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
     if (described.answered && described.declared.reads_graph) {
       args.insert(args.end(), {"--graph", DeclaredGraphPath(options_)});
     }
+    // REQ-SAFE-42: when the probe declared a hardware_request endpoint without
+    // untargeted_outputs, pass --targeted-outputs so neither the first run nor
+    // any restart (which reuses launch.args) can hide AllowUntargetedOutputs
+    // behind !Node::describing(). Only real talos::Run / talos.run actuator
+    // nodes declare kSourceFlagHardwareRequest; hardware_node, sim_gateway,
+    // studio_bridge and non-actuator nodes never do.
+    if (described.answered && !options_.allow_graph_errors) {
+      const bool targeted_actuator = std::any_of(
+          described.declared.sources.begin(), described.declared.sources.end(),
+          [](const naming::SourceShape& source) {
+            return naming::IsSender(source.kind) &&
+                   (source.flags & naming::kSourceFlagHardwareRequest) != 0 &&
+                   (source.flags & naming::kSourceFlagUntargetedOutputs) == 0;
+          });
+      if (targeted_actuator) args.push_back("--targeted-outputs");
+    }
   }
   // The hardware bridge's controller addresses are among them
   // (ControllerArgs), as they were in its probe.
