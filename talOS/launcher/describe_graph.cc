@@ -314,6 +314,17 @@ naming::TargetModeSources TargetModeSourcesOf(
   return sources;
 }
 
+std::vector<std::string> CanBusNamesOf(
+    const config::RobotConfig& robot_config) {
+  const hardware::CanBusList buses = hardware::CanBuses(robot_config.hardware);
+  std::vector<std::string> names;
+  names.reserve(buses.count);
+  for (std::size_t i = 0; i < buses.count; ++i) {
+    names.emplace_back(buses.names[i]);
+  }
+  return names;
+}
+
 std::vector<naming::Diagnostic> LintParameterUnits(
     const config::RobotConfig& robot_config) {
   std::vector<naming::Diagnostic> findings;
@@ -781,13 +792,22 @@ std::vector<RTMSQueue> CreateSessionSegments(
 std::string GraphToJson(uint64_t session_id, const std::string& config_path,
                         const std::vector<NodeDescription>& described,
                         const std::vector<naming::Diagnostic>& diagnostics,
-                        const std::string& config_sha256) {
+                        const std::string& config_sha256,
+                        const std::vector<std::string>& can_buses) {
   std::ostringstream ss;
   ss << "{\n";
   ss << "  \"describe_version\": " << introspect::kDescribeVersion << ",\n";
   ss << "  \"session_id\": \"" << session_id << "\",\n";
   ss << "  \"config_path\": " << Quoted(config_path) << ",\n";
   ss << "  \"config_sha256\": " << Quoted(config_sha256) << ",\n";
+  if (!can_buses.empty()) {
+    ss << "  \"can_buses\": [";
+    for (std::size_t i = 0; i < can_buses.size(); ++i) {
+      if (i > 0) ss << ", ";
+      ss << Quoted(can_buses[i]);
+    }
+    ss << "],\n";
+  }
   ss << "  \"nodes\": [\n";
   for (std::size_t i = 0; i < described.size(); ++i) {
     const auto& node = described[i];

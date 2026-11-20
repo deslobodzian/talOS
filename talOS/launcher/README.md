@@ -951,11 +951,13 @@ neither read nor written.
 ## graph.json
 
 Phase one writes `<output_dir>/<session_id>/graph.json` beside the session's
-`manifest.json`: the session id, the config it came from, every node with its
+`manifest.json`: the session id, the config it came from, the configuration's
+CAN bus slot names (`can_buses`, `hardware::CanBuses`, slot 0 `"rio"` then each
+extra bus in byte order), every node with its
 name, target, whether it answered, and each source's kind, name, message size
 and endpoint attributes, followed by every diagnostic. Studio's bridge serves it
-so a viewer can show the declared graph next to the live one and mark the
-difference.
+so a viewer can show the declared graph next to the live one, mark the
+difference, and label `/hw/status` CAN bus slots by bus name.
 It is written to a temporary file and renamed into place, as is the
 `declared_graph.json` beside it that graph-reading nodes are described and
 started with as `--graph`. A launch that cannot write either exits 1 before

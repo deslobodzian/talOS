@@ -218,3 +218,36 @@ test('the alerts card lists active alerts by level and the latch with counts', (
   assert.match(quiet, /no active alerts/);
   assert.match(quiet, /no alerts raised/);
 });
+
+// REQ-OPS-23: the Power card labels each CAN bus by its declared bus name when
+// present, and falls back to "CAN rio" / "CAN bus N" when declared is absent.
+test('the power card labels CAN buses from the declared graph and falls back when absent', () => {
+  const B = 'hw/status/can_buses/';
+  const frame = {
+    stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+    chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+    channels: {
+      'hw/status/battery_v': 12.4, 'hw/status/can_bus_count': 2,
+      [B + '0/read_state']: 1, [B + '0/utilization_frac']: 0.10,
+      [B + '1/read_state']: 1, [B + '1/utilization_frac']: 0.35
+    },
+    units: {}, labels: {}
+  };
+  const named = renderPanel(createStaticStudio({
+    frames: [frame],
+    playback: {mode: 'PAUSED', cursor_ns: '1000000000'},
+    system: {
+      declared: {version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'Shooter']}
+    }
+  })).replace(/<[^>]*>/g, '|');
+  assert.match(named, /CAN rio\|+10%/);
+  assert.match(named, /CAN Shooter\|+35%/);
+  assert.doesNotMatch(named, /CAN bus 1/);
+
+  const fallback = renderPanel(createStaticStudio({
+    frames: [frame],
+    playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+  })).replace(/<[^>]*>/g, '|');
+  assert.match(fallback, /CAN rio\|+10%/);
+  assert.match(fallback, /CAN bus 1\|+35%/);
+});

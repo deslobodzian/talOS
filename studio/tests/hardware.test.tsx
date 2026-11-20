@@ -193,3 +193,45 @@ test('the hardware panel shows a failed CAN bus as failed, not as 0%', () => {
   assert.ok(html.includes('can-unread">failed<'), 'the failed bus is not marked');
   assert.ok(!html.includes('>0%<'), 'the failed bus reads as an idle one');
 });
+
+// REQ-OPS-23: when the declared graph carries can_buses, the hardware panel's
+// table and CAN utilization chart series label slots by configured bus name
+// rather than "CAN bus N".
+test('the hardware panel and chart label CAN buses from the declared graph', () => {
+  const series = canBusSeries([
+    {state: [1, 1, 1], frac: [0.1, 0.2, 0.3]},
+    {state: [1, 1, 1], frac: [0.4, 0.5, 0.6]}
+  ]);
+  assert.deepEqual(
+      canBusLines(2, series, ['rio', 'Shooter']).map(l => l.name),
+      ['rio', 'Shooter']);
+  assert.deepEqual(
+      canBusLines(2, series).map(l => l.name),
+      ['rio', 'CAN bus 1']);
+
+  const B = 'hw/status/can_buses/';
+  const studio = createStaticStudio({
+    frames: [{
+      stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+      chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+      channels: {
+        'hw/status/battery_v': 12.0, 'hw/status/can_bus_count': 2,
+        [B + '0/read_state']: 1, [B + '0/utilization_frac']: 0.15,
+        [B + '1/read_state']: 1, [B + '1/utilization_frac']: 0.42
+      },
+      units: {}, labels: {}
+    }],
+    playback: {mode: 'PAUSED', cursor_ns: '1000000000'},
+    system: {
+      declared: {version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'Shooter']}
+    }
+  });
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  assert.ok(html.includes('>rio<'), html);
+  assert.ok(html.includes('>Shooter<'), html);
+  assert.ok(!html.includes('CAN bus 1'), html);
+});

@@ -69,11 +69,17 @@ export type CanBus = {
 };
 
 // Slot 0 is the RoboRIO's own bus; the others are the configuration's
-// further buses in byte order, which /hw/status does not name.
-export const canBusLabel = (index: number): string =>
-    index === 0 ? 'rio' : `CAN bus ${index}`;
+// further buses in byte order. When the declared graph carries the slot names
+// (hardware::CanBuses), use them; otherwise fall back to "rio" and "CAN bus N".
+export const canBusLabel = (
+    index: number, busNames?: readonly string[]): string => {
+  const configured = busNames?.[index];
+  return configured ? configured : index === 0 ? 'rio' : `CAN bus ${index}`;
+};
 
-export function canBuses(channels: Record<string, number>): CanBus[] {
+export function canBuses(
+    channels: Record<string, number>,
+    busNames?: readonly string[]): CanBus[] {
   const count = channels['hw/status/can_bus_count'];
   if (count === undefined || !Number.isFinite(count)) return [];
   const out: CanBus[] = [];
@@ -86,7 +92,7 @@ export function canBuses(channels: Record<string, number>): CanBus[] {
     const state = canBusReadState(channels[prefix + 'read_state']);
     out.push({
       index,
-      label: canBusLabel(index),
+      label: canBusLabel(index, busNames),
       state,
       frac: state === 'ok' ? read('utilization_frac') : null,
       busOff: read('bus_off_count'),
@@ -200,7 +206,7 @@ export function robotStatus(snapshot: Snapshot|null, system: SystemState): Robot
     power: {
       battery_v: num('hw/status/battery_v'),
       brownout: flag('hw/status/brownout'),
-      canBuses: canBuses(ch),
+      canBuses: canBuses(ch, system.declared?.can_buses),
       healthValid: flag('hw/status/health_valid')
     },
     link: {

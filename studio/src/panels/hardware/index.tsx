@@ -13,7 +13,7 @@
 
 import {useMemo} from 'react';
 
-import {useDictionary, useSeries, useSnapshot} from '../../data/hooks';
+import {useDictionary, useSeries, useSnapshot, useSystem} from '../../data/hooks';
 import {canBuses, canBusReading, canBusUnread, type CanBus} from '../../data/robot';
 import {durationUs, integer} from '../../ui/formatters';
 import {DataTable, type Column} from '../../ui/DataTable';
@@ -183,6 +183,8 @@ function CanBusTable({buses}: {buses: CanBus[]}) {
 function HardwarePanel() {
   const snapshot = useSnapshot();
   const dictionary = useDictionary();
+  const system = useSystem();
+  const busNames = system.declared?.can_buses;
 
   const ch = snapshot?.channels ?? {};
   const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
@@ -192,7 +194,7 @@ function HardwarePanel() {
     return v === undefined ? undefined : v !== 0;
   };
 
-  const buses = canBuses(ch);
+  const buses = canBuses(ch, busNames);
   const busCount = num('can_bus_count');
   const busChannels = useMemo(() => canBusSeriesChannels(busCount), [busCount]);
   const power = useSeries(
@@ -254,7 +256,7 @@ function HardwarePanel() {
   }
 
   const brownoutBands = flagBands(power.times, power.values[`${HW}brownout`]);
-  const busLines = canBusLines(busCount, power);
+  const busLines = canBusLines(busCount, power, busNames);
   const timedOutBits = bitHistory(
       masks.times, masks.values[`${HW}timed_out_mask`], subsystemCount ?? 32);
   const faultBits = bitHistory(masks.times, masks.values[`${HW}motor_fault_mask`]);

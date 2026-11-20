@@ -377,7 +377,8 @@ function RobotPanel() {
                    {status.power.brownout === null ? '—' : status.power.brownout ? 'yes' : 'no'}
                  </Stat>
                  {status.power.canBuses.map(bus =>
-                   <Stat key={bus.index} label={bus.index === 0 ? 'CAN rio' : bus.label}
+                   <Stat key={bus.index}
+                         label={bus.label.startsWith('CAN ') ? bus.label : `CAN ${bus.label}`}
                          channel={bus.channel} tone={canBusUnread(bus) ? 'warn' : undefined}>
                      {canBusReading(bus)}
                    </Stat>)}

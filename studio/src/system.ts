@@ -172,6 +172,9 @@ const MAX_SELECTIONS = 64;
 const MAX_DIAGNOSTICS = 1024;
 const MAX_MESSAGE = 2048;
 
+// /hw/status carries at most hardware::kMaxCanBuses (4) CAN bus slots.
+const MAX_CAN_BUSES = 4;
+
 const fail = (what: string): never => {
   throw Error(what);
 };
@@ -554,6 +557,10 @@ export type DeclaredDiagnostic = {
 
 export type DeclaredGraph = {
   version: number; nodes: DeclaredNode[]; diagnostics: DeclaredDiagnostic[];
+  // The robot configuration's CAN bus names in `/hw/status` `can_buses` slot
+  // order (`hardware::CanBuses`: slot 0 "rio", then extra buses in byte order).
+  // Absent or empty in declared graphs written before this field was added.
+  can_buses?: string[];
 };
 
 function parseDeclaredSource(value: unknown, where: string): DeclaredSource {
@@ -627,6 +634,15 @@ export function declaredUrl(socketUrl: string): string|null {
   }
 }
 
+function parseCanBuses(root: Record<string, unknown>): string[] {
+  if (root.can_buses === undefined) return [];
+  return list(root, 'can_buses', MAX_CAN_BUSES).map((entry, i) => {
+    if (typeof entry !== 'string' || entry.length > MAX_STRING)
+      fail(`can_buses[${i}] must be a string`);
+    return entry as string;
+  });
+}
+
 export function parseDeclaredGraph(text: string): DeclaredGraph {
   return parsing('declared graph', () => {
     if (text.length > MAX_DECLARED_BYTES) fail('document too large');
@@ -650,7 +666,8 @@ export function parseDeclaredGraph(text: string): DeclaredGraph {
       diagnostics: root.diagnostics === undefined ?
           [] :
           list(root, 'diagnostics', MAX_DIAGNOSTICS)
-              .map((entry, i) => parseDiagnostic(entry, `diagnostics[${i}]`))
+              .map((entry, i) => parseDiagnostic(entry, `diagnostics[${i}]`)),
+      can_buses: parseCanBuses(root)
     };
   });
 }

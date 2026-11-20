@@ -1350,6 +1350,7 @@ TEST(LauncherGraphTest, ProbesEveryBinaryAndPutsWhatItSaysInTheGraph) {
   EXPECT_NE(graph.find("\"session_id\": \"81985529216486895\""),
             std::string::npos)
       << graph;
+  EXPECT_NE(graph.find("\"can_buses\": [\"rio\"]"), std::string::npos) << graph;
   EXPECT_NE(graph.find("\"name\": \"alpha\""), std::string::npos) << graph;
   EXPECT_NE(graph.find("\"kind\": \"SENDER\", \"name\": \"/alpha/state\""),
             std::string::npos)
@@ -1364,6 +1365,55 @@ TEST(LauncherGraphTest, ProbesEveryBinaryAndPutsWhatItSaysInTheGraph) {
   const std::string manifest = ReadFile(fixture.out_dir + "/manifest.json");
   EXPECT_NE(manifest.find("\"described\": true"), std::string::npos)
       << manifest;
+}
+
+// REQ-OPS-23: graph.json records the robot configuration's CAN bus slot table
+// (hardware::CanBuses: slot 0 "rio", then each extra bus in byte order) so
+// Studio labels /hw/status can_buses slots by bus name rather than slot index.
+TEST(LauncherGraphTest, WritesConfiguredCanBusesInSlotOrderToGraphJson) {
+  GraphFixture fixture{
+      "can_buses",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")})};
+  const std::string config_path = TempPath("can_buses_fixture") + ".toml";
+  {
+    std::ofstream out{config_path};
+    out << R"(
+[robot]
+name = "can_buses_fixture"
+period_us = 5000
+sim_gateway = "//example/sim:gateway"
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+period_us = 5000
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "Shooter"
+can_id = 1
+
+[subsystems.beta]
+node = "//example/beta:node"
+period_us = 10000
+
+[subsystems.beta.motors.m2]
+type = "TalonFX"
+bus = "Drive"
+can_id = 2
+)";
+  }
+  fixture.options.config_path = config_path;
+  fixture.options.describe_only = true;
+
+  Launcher launcher{fixture.options};
+  EXPECT_EQ(launcher.Run(), 0);
+
+  const std::string graph = fixture.graph_json();
+  EXPECT_NE(graph.find("\"can_buses\": [\"rio\", \"Drive\", \"Shooter\"]"),
+            std::string::npos)
+      << graph;
+  std::filesystem::remove(config_path);
 }
 
 TEST(LauncherGraphTest, RefusesToSpawnWhenTheTwoEndsAreSpelledDifferently) {
