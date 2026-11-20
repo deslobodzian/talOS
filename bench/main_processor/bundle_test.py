@@ -63,7 +63,7 @@ BUNDLES = (
 # that must load from the installed files: each package, and the extension
 # module that links the libraries the wheel bundles (gtsam.libs/) or its
 # robotpy-native wheel holds (native/wpimath/, native/wpiutil/). On Linux
-# each module's first name must also name a mapped file.
+# and macOS each module's first name must also name a mapped file.
 NATIVE_IMPORTS = {
     "native_wheel": ("numpy", "numpy._core._multiarray_umath",
                      "gtsam", "gtsam.gtsam",
@@ -80,23 +80,37 @@ CLEAN_ENV = {k: v for k, v in os.environ.items()
 
 # Run by a node's venv interpreter: adds the site-packages directory it is
 # given, imports each module named after it and prints, as JSON, the real
-# path of each module's file and (where /proc exists) of every mapped file
-# whose path names one of their packages.
+# path of each module's file and (on Linux from /proc/self/maps, on macOS
+# from _dyld_get_image_name) of every mapped file whose path names one of
+# their packages.
 IMPORT_PROBE = """
-import importlib, json, os, site, sys
+import ctypes, importlib, json, os, site, sys
 site.addsitedir(sys.argv[1])
 modules = sys.argv[2:]
 files = [os.path.realpath(importlib.import_module(m).__file__)
          for m in modules]
+roots = {m.split(".")[0] for m in modules}
 mapped = set()
 if os.path.exists("/proc/self/maps"):
-    roots = {m.split(".")[0] for m in modules}
     with open("/proc/self/maps") as maps:
         for line in maps:
             fields = line.split(maxsplit=5)
             path = fields[5].strip() if len(fields) == 6 else ""
             if path.startswith("/") and any(r in path for r in roots):
                 mapped.add(os.path.realpath(path))
+elif sys.platform == "darwin":
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    lib._dyld_image_count.argtypes = []
+    lib._dyld_image_count.restype = ctypes.c_uint32
+    lib._dyld_get_image_name.argtypes = [ctypes.c_uint32]
+    lib._dyld_get_image_name.restype = ctypes.c_char_p
+    for i in range(lib._dyld_image_count()):
+        raw = lib._dyld_get_image_name(i)
+        if not raw:
+            continue
+        path = os.fsdecode(raw)
+        if path.startswith("/") and any(r in path for r in roots):
+            mapped.add(os.path.realpath(path))
 print(json.dumps({"files": files, "mapped": sorted(mapped)}))
 """
 
@@ -325,7 +339,7 @@ class BundleTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0,
                              f"{node['name']}: {proc.stderr}")
             loaded = json.loads(proc.stdout)
-            if sys.platform == "linux":
+            if sys.platform in ("linux", "darwin"):
                 for root in {module.split(".")[0] for module in modules}:
                     self.assertTrue(
                         [path for path in loaded["mapped"] if root in path],
