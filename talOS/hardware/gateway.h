@@ -225,7 +225,9 @@ class Gateway {
   }
   // Precise failure behind the last rejected configuration, if the
   // backend could say more than "it failed".
-  std::optional<ConfigError> config_error() const { return config_error_; }
+  const std::optional<ConfigError>& config_error() const {
+    return config_error_;
+  }
   uint32_t restore_attempt_count() const { return restore_attempt_count_; }
 
  private:
@@ -267,8 +269,8 @@ class Gateway {
   uint64_t restore_retry_at_{};
   bool configuring_{false};
   Config pending_config_;
-  std::vector<uint16_t> unavailable_;
-  std::vector<uint16_t> restoring_ids_;
+  FixedVector<uint16_t, kMaxMotors + kMaxSensors> unavailable_;
+  FixedVector<uint16_t, kMaxMotors + kMaxSensors> restoring_ids_;
   std::array<MotorRequest, kMaxMotors> last_requests_{};
   // Per motor, the earliest observation time a command may drive it on: one
   // past the last State in which it could not drive (MayDrive false), the

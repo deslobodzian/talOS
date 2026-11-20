@@ -4241,5 +4241,42 @@ TEST(ConfigWire, PersistenceValidatesCrcAndAssemblerResetsAfterCompletion) {
             ConfigAssembler::Status::kIncomplete);
 }
 
+// Allocation-free config codec helpers match their vector-returning
+// counterparts byte for byte, reject undersized output spans, and agree with
+// Validate()/ConfigurationId() on valid and invalid configs.
+// REQ-RT-01, REQ-RT-06, REQ-SAFE-24
+TEST(ConfigWire, AllocationFreeHelpersMatchWireBytesAndValidation) {
+  const auto config = SwerveConfig(true);
+  const auto expected_ser = SerializeConfig(config);
+  const auto expected_persisted = PersistedConfig(config);
+
+  std::array<uint8_t, kMaxSerializedConfigSize> ser_buf{};
+  const std::size_t ser_len = SerializeConfigInto(config, ser_buf);
+  ASSERT_EQ(ser_len, expected_ser.size());
+  EXPECT_TRUE(
+      std::equal(expected_ser.begin(), expected_ser.end(), ser_buf.begin()));
+  EXPECT_EQ(SerializeConfigInto(config, std::span{ser_buf}.first(ser_len - 1)),
+            0u);
+
+  std::array<uint8_t, kMaxPersistedConfigSize> persist_buf{};
+  const std::size_t persist_len = PersistedConfigInto(config, persist_buf);
+  ASSERT_EQ(persist_len, expected_persisted.size());
+  EXPECT_TRUE(std::equal(expected_persisted.begin(), expected_persisted.end(),
+                         persist_buf.begin()));
+  EXPECT_EQ(PersistedConfigInto(config,
+                                std::span{persist_buf}.first(persist_len - 1)),
+            0u);
+
+  EXPECT_TRUE(IsValid(config));
+  EXPECT_EQ(TryConfigurationId(config), ConfigurationId(config));
+
+  Config bad_name = config;
+  bad_name.motors[0].name = std::string(kMaxConfigNameLength + 1, 'a');
+  EXPECT_TRUE(bad_name.motors[0].name.overflowed());
+  EXPECT_FALSE(IsValid(bad_name));
+  EXPECT_EQ(TryConfigurationId(bad_name), 0u);
+  EXPECT_THROW(Validate(bad_name), std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace talos::hardware

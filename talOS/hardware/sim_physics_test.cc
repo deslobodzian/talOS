@@ -1487,7 +1487,7 @@ TEST(SimWorld, SecondGeometryControlsLinearAndYawMotionAndSurvivesReconfigure) {
     steer.slots[0].p = 1.0;
     config.motors.push_back(drive);
     config.motors.push_back(steer);
-    specs.push_back({drive.name, steer.name, xs[i], ys[i]});
+    specs.push_back({drive.name.str(), steer.name.str(), xs[i], ys[i]});
   }
   config.sensors.push_back({20, "imu", SensorKind::kPigeon2, 30, "rio"});
 

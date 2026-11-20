@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "RioLog.h"
 #include "hardware/config_wire.h"
 #include "hardware/gateway.h"
 
@@ -53,13 +55,12 @@ namespace hw = talos::hardware;
 #define TALOS_TEST_COUNTS_MALLOC 1
 #endif
 namespace {
-std::array<std::atomic<const void*>, 8> watched{};
-std::atomic<int> freed_by_loop{0};
-std::atomic<int> freed_elsewhere{0};
 thread_local bool on_loop_thread = false;
 std::atomic<bool> counting{false};
 std::atomic<int> saver_allocations{0};
 std::atomic<int> saver_frees{0};
+std::atomic<int> loop_allocations{0};
+std::atomic<int> loop_frees{0};
 
 // The saver thread names itself (ConfigPersister::Run); other threads of this
 // binary (the Phoenix simulation's) allocate as they please.
@@ -73,34 +74,29 @@ bool OnSaverThread() {
 #endif
 }
 
-void CountOnSaver(std::atomic<int>& count) {
-  if (counting.load(std::memory_order_relaxed) && OnSaverThread())
-    count.fetch_add(1, std::memory_order_relaxed);
-}
-
-void Watch(const void* block) {
-  for (auto& slot : watched) {
-    const void* empty = nullptr;
-    if (slot.compare_exchange_strong(empty, block)) return;
+void CountAllocation() {
+  if (!counting.load(std::memory_order_relaxed)) return;
+  if (OnSaverThread()) {
+    saver_allocations.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (on_loop_thread) {
+    loop_allocations.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
-void Freed(void* block) {
-  if (block == nullptr) return;
-  for (auto& slot : watched) {
-    const void* expected = block;
-    if (slot.load(std::memory_order_relaxed) == block &&
-        slot.compare_exchange_strong(expected, nullptr)) {
-      (on_loop_thread ? freed_by_loop : freed_elsewhere)
-          .fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
+void CountFree() {
+  if (!counting.load(std::memory_order_relaxed)) return;
+  if (OnSaverThread()) {
+    saver_frees.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (on_loop_thread) {
+    loop_frees.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
 void* MaybeAllocate(std::size_t size) {
 #ifndef TALOS_TEST_COUNTS_MALLOC
-  CountOnSaver(saver_allocations);  // Otherwise malloc counts it.
+  CountAllocation();  // Otherwise malloc counts it.
 #endif
   return std::malloc(size == 0 ? 1 : size);
 }
@@ -112,9 +108,8 @@ void* Allocate(std::size_t size) {
 
 // The free side of the replaced deletes, counted once.
 void Release(void* block) {
-  Freed(block);
 #ifndef TALOS_TEST_COUNTS_MALLOC
-  if (block != nullptr) CountOnSaver(saver_frees);
+  if (block != nullptr) CountFree();
 #endif
   std::free(block);
 }
@@ -133,28 +128,28 @@ void __libc_free(void* block);
 // NOLINTEND(bugprone-reserved-identifier)
 
 void* malloc(std::size_t size) noexcept {
-  CountOnSaver(saver_allocations);
+  CountAllocation();
   return __libc_malloc(size);
 }
 void* calloc(std::size_t count, std::size_t size) noexcept {
-  CountOnSaver(saver_allocations);
+  CountAllocation();
   return __libc_calloc(count, size);
 }
 void* realloc(void* block, std::size_t size) noexcept {
-  CountOnSaver(saver_allocations);
+  CountAllocation();
   return __libc_realloc(block, size);
 }
 void* memalign(std::size_t alignment, std::size_t size) noexcept {
-  CountOnSaver(saver_allocations);
+  CountAllocation();
   return __libc_memalign(alignment, size);
 }
 void* aligned_alloc(std::size_t alignment, std::size_t size) noexcept {
-  CountOnSaver(saver_allocations);
+  CountAllocation();
   return __libc_memalign(alignment, size);
 }
 int posix_memalign(void** block, std::size_t alignment,
                    std::size_t size) noexcept {
-  CountOnSaver(saver_allocations);
+  CountAllocation();
   if (alignment == 0 || alignment % sizeof(void*) != 0 ||
       (alignment & (alignment - 1)) != 0)
     return EINVAL;
@@ -164,7 +159,7 @@ int posix_memalign(void** block, std::size_t alignment,
   return 0;
 }
 void free(void* block) noexcept {
-  if (block != nullptr) CountOnSaver(saver_frees);
+  if (block != nullptr) CountFree();
   __libc_free(block);
 }
 }  // extern "C"
@@ -470,26 +465,22 @@ uint32_t Trailer(std::span<const uint8_t> persisted) {
   return crc;
 }
 
-// The saver thread runs at nice 19 without priority inheritance. Were it to
-// allocate or free, glibc could take the lock of an arena the loop thread
-// shares (on the RoboRIO, 32-bit with two cores, glibc caps arenas at four,
-// and the saver starts after HAL, WPILib and Phoenix threads exist), and the
-// saver
-// preempted holding it would stall the loop's next allocation. So once
-// started it does neither (with glibc, malloc and free included), across
-// saves that succeed, one that fails after writing and syncing its temporary
-// file (the rename over a directory fails, so the save unlinks the temporary
-// and leaves none behind) and the save Stop() runs while the last saved
-// configuration is still uncollected; each handed-over configuration's bytes
-// are freed on the loop thread (watched from the save until freed), and the
-// file holds the newest one handed over.
-// REQ-CONTRACT-06
+// The saver thread runs at nice 19 without priority inheritance. Were either
+// thread to allocate or free during persistence, glibc could contend on a
+// shared arena lock on the RoboRIO (two cores, four arenas). With preallocated
+// fixed-size slots swapped by index under mutex_, neither the saver thread nor
+// the loop thread (Acknowledged, Tick, Stop) allocates or frees (with glibc,
+// malloc and free included), across saves that succeed, one that fails after
+// writing and syncing its temporary file (the rename over a directory fails,
+// so the save unlinks the temporary and leaves none behind) and a save
+// queued while another is in flight; the file holds the newest one handed
+// over.
+// REQ-CONTRACT-06, REQ-RT-01, REQ-RT-06
 TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
-  on_loop_thread = true;
-  freed_by_loop = 0;
-  freed_elsewhere = 0;
   saver_allocations = 0;
   saver_frees = 0;
+  loop_allocations = 0;
+  loop_frees = 0;
   const auto directory = std::filesystem::temp_directory_path();
   const auto path = (directory / "talos_config_saver_test.bin").string();
   // A directory where the file should be: the rename over it fails.
@@ -519,7 +510,6 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
   {
     talos::rio::ConfigPersister persister{
         [&](std::span<const uint8_t> persisted) {
-          Watch(persisted.data());
           std::unique_lock lock{mutex};
           named = named && OnSaverThread();
           ++started;
@@ -537,6 +527,7 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
         },
         0};
     persister.Start();
+    on_loop_thread = true;
     counting = true;
 
     uint32_t failures = 0;
@@ -554,38 +545,41 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
       }
     };
 
-    // A save, collected: its configuration comes back to be freed here.
+    // A save, collected with zero loop or saver allocations/frees.
     persister.Acknowledged(configs[0]);
-    ASSERT_TRUE(
-        tick_until([&] { return finished == 1 && freed_by_loop == 1; }));
+    const bool first_done = tick_until([&] { return finished == 1; });
     // A save that fails.
     {
       std::lock_guard lock{mutex};
       fail_next = true;
     }
     persister.Acknowledged(configs[1]);
-    ASSERT_TRUE(
-        tick_until([&] { return failures == 1 && freed_by_loop == 2; }));
-    // A save held while the next configuration is handed over, then Stop()
-    // with that one pending and the held one finished but not collected.
+    const bool second_done = tick_until([&] { return failures == 1; });
+    // A save held while the next configuration is handed over, then Stop().
     {
       std::lock_guard lock{mutex};
       gate_open = false;
     }
     persister.Acknowledged(configs[2]);
-    ASSERT_TRUE(tick_until([&] { return started == 3; }));
+    const bool third_started = tick_until([&] { return started == 3; });
     persister.Acknowledged(configs[3]);
     for (int tick = 0; tick < 10; ++tick) failures += persister.Tick(true);
+    bool third_done = false;
     {
       std::unique_lock lock{mutex};
       gate_open = true;
       changed.notify_all();
-      ASSERT_TRUE(changed.wait_for(lock, kHang, [&] { return finished == 3; }));
+      third_done = changed.wait_for(lock, kHang, [&] { return finished >= 3; });
     }
     persister.Stop();
-    counting = false;
     failures += persister.Tick(false);
+    counting = false;
+    on_loop_thread = false;
 
+    ASSERT_TRUE(first_done);
+    ASSERT_TRUE(second_done);
+    ASSERT_TRUE(third_started);
+    ASSERT_TRUE(third_done);
     EXPECT_EQ(failures, 1u);
     std::lock_guard lock{mutex};
     EXPECT_TRUE(named) << "the saver thread was not identified by its name";
@@ -596,14 +590,221 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
       << "allocations on the saver thread after it started";
   EXPECT_EQ(saver_frees.load(), 0)
       << "frees on the saver thread after it started";
-  EXPECT_EQ(freed_elsewhere.load(), 0)
-      << "handed-over configurations the saver thread freed";
-  EXPECT_EQ(freed_by_loop.load(), 4);
+  EXPECT_EQ(loop_allocations.load(), 0)
+      << "allocations on the loop thread during Acknowledged/Tick/Stop";
+  EXPECT_EQ(loop_frees.load(), 0)
+      << "frees on the loop thread during Acknowledged/Tick/Stop";
   EXPECT_EQ(talos::rio::LoadConfigFile(path), configs[3]);
   EXPECT_FALSE(std::filesystem::exists(unrenamable.string() + ".tmp"))
       << "the failed save left its temporary file";
   std::filesystem::remove(path);
   std::filesystem::remove_all(unrenamable);
+}
+
+// Guards TEST-20: configuration transfer, validation, enabled refusal,
+// reconfiguration commit, persistence handover, and RioLog's default console
+// sink all execute with zero heap allocations and zero frees, even when every
+// device and bus name exceeds std::string's SSO threshold.
+// REQ-RT-01, REQ-RT-06, REQ-SAFE-24
+TEST(ConfigStore, ConfigTransferReconfigurePersistAndRioLogSinkZeroHeapAlloc) {
+  auto make_long_config = [](int base_can, bool second_motor) {
+    hw::Config c;
+    c.commissioned = true;
+    hw::MotorConfig m1;
+    m1.id = 1;
+    m1.name = "drivetrain_front_left_drive_motor_with_long_name_for_no_sso";
+    m1.can_id = base_can;
+    m1.bus = "canivore_swerve_drivetrain_bus_name_exceeding_sso";
+    c.motors.push_back(m1);
+    if (second_motor) {
+      hw::MotorConfig m2;
+      m2.id = 2;
+      m2.name = "drivetrain_front_left_steer_motor_with_long_name_for_no_sso";
+      m2.can_id = base_can + 1;
+      m2.bus = "canivore_swerve_drivetrain_bus_name_exceeding_sso";
+      c.motors.push_back(m2);
+    }
+    hw::SensorConfig s;
+    s.id = 10;
+    s.name = "drivetrain_front_left_cancoder_long_name_exceeding_sso";
+    s.kind = hw::SensorKind::kCANcoder;
+    s.can_id = base_can + 10;
+    s.bus = "canivore_swerve_drivetrain_bus_name_exceeding_sso";
+    c.sensors.push_back(s);
+    c.digital_inputs.push_back(
+        {20, "superstructure_elevator_home_limit_switch_long_name", 0});
+    c.digital_outputs.push_back(
+        {21, "superstructure_intake_solenoid_output_long_name", 1});
+    c.analog_inputs.push_back(
+        {22, "superstructure_pressure_transducer_input_long_name", 0});
+    c.encoders.push_back({23, "superstructure_arm_quadrature_encoder_long_name",
+                          hw::EncoderKind::kQuadrature, 2, 3, 2048.0, 0.0});
+    c.pwm_outputs.push_back(
+        {24, "superstructure_climber_servo_pwm_output_long_name", 0});
+    return c;
+  };
+
+  const hw::Config config_a = make_long_config(1, false);
+  const hw::Config config_b = make_long_config(5, true);
+  hw::Config invalid_config = config_b;
+  invalid_config.period_us = 0;  // fails IsValid()
+  hw::Config ceiling_config = config_b;
+  ceiling_config.motors[0].supply_limit_a = hw::kCeilingMaxSupplyCurrentA + 1.0;
+
+  const uint64_t id_a = hw::ConfigurationId(config_a);
+  const uint64_t id_b = hw::ConfigurationId(config_b);
+  const auto chunks_a = hw::CreateConfigChunks(config_a, 200);
+  const auto chunks_b = hw::CreateConfigChunks(config_b, 200);
+  auto bad_crc_chunks = hw::CreateConfigChunks(config_a, 200);
+  bad_crc_chunks.back().back() ^= 0xFF;
+  const auto ceiling_chunks = hw::CreateConfigChunks(ceiling_config, 200);
+
+  // Pre-open a temporary FILE* and make it unbuffered (like stderr in
+  // production) before counting so glibc's lazy stdio buffer allocation is
+  // not triggered on the first fwrite().
+  std::FILE* log_stream = std::tmpfile();
+  ASSERT_NE(log_stream, nullptr);
+  ASSERT_EQ(std::setvbuf(log_stream, nullptr, _IONBF, 0), 0);
+  std::string long_line(2500, 'x');
+  long_line.push_back('\n');
+
+  hw::ConfigAssembler assembler;
+  PendingBackend backend;
+  hw::Gateway gateway{backend, 42};
+  std::atomic<uint64_t> saved_count{0};
+  talos::rio::ConfigPersister persister{[&](std::span<const uint8_t>) {
+                                          saved_count.fetch_add(
+                                              1, std::memory_order_relaxed);
+                                          return true;
+                                        },
+                                        0};
+  persister.Start();
+
+  std::array<char, 160> err_buf{};
+  std::array<uint8_t, hw::kMaxSerializedConfigSize> ser_buf{};
+  std::array<uint8_t, hw::kMaxPersistedConfigSize> persist_buf{};
+
+  saver_allocations = 0;
+  saver_frees = 0;
+  loop_allocations = 0;
+  loop_frees = 0;
+  on_loop_thread = true;
+  counting = true;
+
+  // 1. SerializeConfigInto, PersistedConfigInto, TryConfigurationId, IsValid.
+  const std::size_t ser_a = hw::SerializeConfigInto(config_a, ser_buf);
+  const std::size_t per_a = hw::PersistedConfigInto(config_a, persist_buf);
+  const uint64_t try_id_a = hw::TryConfigurationId(config_a);
+  const uint64_t try_id_invalid = hw::TryConfigurationId(invalid_config);
+  const int allocs_after_wire = loop_allocations.load();
+  const int frees_after_wire = loop_frees.load();
+
+  // 2. ConfigAssembler::AddChunk: success, CRC error, ceiling error, second
+  //    config with different device counts.
+  hw::ConfigAssembler::Status status_a =
+      hw::ConfigAssembler::Status::kIncomplete;
+  for (const auto& ch : chunks_a) {
+    status_a = assembler.AddChunk(ch, std::span<char>{err_buf});
+  }
+  hw::ConfigAssembler::Status status_crc =
+      hw::ConfigAssembler::Status::kIncomplete;
+  for (const auto& ch : bad_crc_chunks) {
+    status_crc = assembler.AddChunk(ch, std::span<char>{err_buf});
+  }
+  hw::ConfigAssembler::Status status_ceil =
+      hw::ConfigAssembler::Status::kIncomplete;
+  for (const auto& ch : ceiling_chunks) {
+    status_ceil = assembler.AddChunk(ch, std::span<char>{err_buf});
+  }
+  hw::ConfigAssembler::Status status_b =
+      hw::ConfigAssembler::Status::kIncomplete;
+  for (const auto& ch : chunks_b) {
+    status_b = assembler.AddChunk(ch, std::span<char>{err_buf});
+  }
+  const int allocs_after_assembler = loop_allocations.load();
+  const int frees_after_assembler = loop_frees.load();
+
+  // 3. Gateway::BeginReconfigure, CommitConfiguration, RecordEnabledRefusal.
+  const bool begin_a = gateway.BeginReconfigure(config_a);
+  backend.done = true;
+  gateway.Tick(5000, false);  // CommitConfiguration(config_a)
+  gateway.Tick(10000, true);  // enable
+  const bool refused_b = gateway.BeginReconfigure(config_b);
+  const bool refused_invalid = gateway.BeginReconfigure(invalid_config);
+  const bool idempotent_a = gateway.BeginReconfigure(config_a);
+  gateway.Tick(15000, false);  // disable
+  const bool invalid_disabled = gateway.BeginReconfigure(invalid_config);
+  backend.done = false;
+  const bool begin_b = gateway.BeginReconfigure(config_b);
+  backend.done = true;
+  gateway.Tick(20000, false);  // CommitConfiguration(config_b)
+  const int allocs_after_gateway = loop_allocations.load();
+  const int frees_after_gateway = loop_frees.load();
+
+  // 4. ConfigPersister::Acknowledged and Tick.
+  persister.Acknowledged(config_a);
+  const uint32_t fail_1 = persister.Tick(true);
+  persister.Acknowledged(config_b);
+  const uint32_t fail_2 = persister.Tick(true);
+  persister.Stop();
+  const int allocs_after_persister = loop_allocations.load();
+  const int frees_after_persister = loop_frees.load();
+
+  // 5. RioLog default sink formatting (normal line and > 2048 B fallback).
+  talos::rio::RioLog::WriteConsoleLine(12'345'000, "[rio] hello\n", log_stream);
+  talos::rio::RioLog::WriteConsoleLine(12'346'000, long_line, log_stream);
+
+  counting = false;
   on_loop_thread = false;
+
+  EXPECT_EQ(allocs_after_wire, 0);
+  EXPECT_EQ(frees_after_wire, 0);
+  EXPECT_EQ(allocs_after_assembler, 0);
+  EXPECT_EQ(frees_after_assembler, 0);
+  EXPECT_EQ(allocs_after_gateway, 0);
+  EXPECT_EQ(frees_after_gateway, 0);
+  EXPECT_EQ(allocs_after_persister, 0);
+  EXPECT_EQ(frees_after_persister, 0);
+  EXPECT_EQ(loop_allocations.load(), 0)
+      << "loop thread allocated during config transfer / reconfigure / persist "
+         "/ "
+         "RioLog sink";
+  EXPECT_EQ(loop_frees.load(), 0)
+      << "loop thread freed during config transfer / reconfigure / persist / "
+         "RioLog sink";
+  EXPECT_EQ(saver_allocations.load(), 0)
+      << "saver thread allocated during persistence";
+  EXPECT_EQ(saver_frees.load(), 0) << "saver thread freed during persistence";
+
+  EXPECT_GT(ser_a, 0u);
+  EXPECT_GT(per_a, 0u);
+  EXPECT_EQ(try_id_a, id_a);
+  EXPECT_EQ(try_id_invalid, 0u);
+  EXPECT_EQ(status_a, hw::ConfigAssembler::Status::kComplete);
+  EXPECT_EQ(status_crc, hw::ConfigAssembler::Status::kCrcMismatch);
+  EXPECT_EQ(status_ceil, hw::ConfigAssembler::Status::kCeilingExceeded);
+  EXPECT_EQ(status_b, hw::ConfigAssembler::Status::kComplete);
+  EXPECT_EQ(assembler.config(), config_b);
+  EXPECT_TRUE(begin_a);
+  EXPECT_FALSE(refused_b);
+  EXPECT_FALSE(refused_invalid);
+  EXPECT_TRUE(idempotent_a);
+  EXPECT_FALSE(invalid_disabled);
+  EXPECT_TRUE(begin_b);
+  EXPECT_EQ(gateway.last_enabled_refusal().count, 2u);
+  EXPECT_EQ(gateway.last_enabled_refusal().refused_id, 0u);
+  EXPECT_EQ(gateway.last_enabled_refusal().active_id, id_a);
+  EXPECT_TRUE(gateway.configured());
+  EXPECT_EQ(gateway.snapshot().config_id, id_b);
+  EXPECT_EQ(fail_1, 0u);
+  EXPECT_EQ(fail_2, 0u);
+  EXPECT_GE(saved_count.load(), 1u);
+
+  std::rewind(log_stream);
+  std::string logged(3000, '\0');
+  const std::size_t n = std::fread(logged.data(), 1, logged.size(), log_stream);
+  logged.resize(n);
+  std::fclose(log_stream);
+  EXPECT_EQ(logged, "[12.345] [rio] hello\n[12.346] " + long_line);
 }
 }  // namespace

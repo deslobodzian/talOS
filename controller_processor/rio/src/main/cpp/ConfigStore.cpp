@@ -107,7 +107,10 @@ std::optional<hardware::Config> BeginRestore(hardware::Gateway& gateway,
 }
 
 ConfigPersister::ConfigPersister(Save save, uint64_t on_disk_id)
-    : save_{std::move(save)}, on_disk_id_{on_disk_id}, saved_id_{on_disk_id} {}
+    : save_{std::move(save)},
+      slots_{std::make_unique<std::array<Persisted, 3>>()},
+      on_disk_id_{on_disk_id},
+      saved_id_{on_disk_id} {}
 
 ConfigPersister::~ConfigPersister() { Stop(); }
 
@@ -132,10 +135,11 @@ void ConfigPersister::Stop() {
     // since, an enabled one, or a lost try-lock): the loop no longer ticks,
     // so it is handed over here, superseding one not yet started, as Tick()
     // would. Saving it now after an enable is harmless: the loop has stopped.
-    if (unsaved_) {
-      if (!pending_) ++outstanding_;
-      pending_ = std::move(unsaved_);
-      unsaved_.reset();
+    if (has_unsaved_) {
+      if (!has_pending_) ++outstanding_;
+      std::swap(pending_slot_, unsaved_slot_);
+      has_pending_ = true;
+      has_unsaved_ = false;
     }
     stop_ = true;
   }
@@ -145,25 +149,28 @@ void ConfigPersister::Stop() {
 #else
   pthread_join(thread_, nullptr);
 #endif
-  // A save run while stopping behind an uncollected one stays in saving_;
-  // freed here, on this thread, so a saver started again finds it empty.
-  saving_.reset();
   started_ = false;
 }
 
 void ConfigPersister::Acknowledged(const hardware::Config& config) {
-  const uint64_t id = hardware::ConfigurationId(config);
+  const uint64_t id = hardware::TryConfigurationId(config);
+  if (id == 0) return;
   // Already on disk, with nothing handed over since that could be written
   // after it: nothing to save. Otherwise this is the newest, even when the
   // file holds it (A on disk, B in flight, A acknowledged: A must follow B).
-  if (outstanding_ == 0 && !unsaved_ && id == on_disk_id_) return;
-  // Encoded here, on the loop thread, which owns the bytes from here to the
-  // Tick() that frees them: the saver neither allocates nor frees.
-  unsaved_ = Persisted{id, hardware::PersistedConfig(config)};
+  if (outstanding_ == 0 && !has_unsaved_ && id == on_disk_id_) return;
+  // Encoded directly into the preallocated unsaved slot on the loop thread:
+  // neither thread allocates or frees.
+  Persisted& slot = (*slots_)[unsaved_slot_];
+  const std::size_t size = hardware::PersistedConfigInto(config, slot.bytes);
+  if (size == 0) return;
+  slot.id = id;
+  slot.size = size;
+  has_unsaved_ = true;
 }
 
 uint32_t ConfigPersister::Tick(bool disabled) {
-  if (!unsaved_ && outstanding_ == 0) return 0;
+  if (!has_unsaved_ && outstanding_ == 0) return 0;
   std::unique_lock lock{mutex_, std::try_to_lock};
   if (!lock.owns_lock()) return 0;  // the saver is moving one; next tick
   outstanding_ -= finished_ - collected_finished_;
@@ -171,16 +178,14 @@ uint32_t ConfigPersister::Tick(bool disabled) {
   const auto failed = static_cast<uint32_t>(failed_ - collected_failed_);
   collected_failed_ = failed_;
   on_disk_id_ = saved_id_;
-  // A saved configuration comes back to be freed here, after the unlock.
-  std::optional<Persisted> saved = std::move(done_);
-  done_.reset();
-  bool wake = saved.has_value() && pending_.has_value();
-  if (unsaved_ && disabled) {
+  bool wake = false;
+  if (has_unsaved_ && disabled) {
     // A configuration handed over but not yet started is superseded: its
     // save never runs, so it was never outstanding twice.
-    if (!pending_) ++outstanding_;
-    pending_ = std::move(unsaved_);
-    unsaved_.reset();
+    if (!has_pending_) ++outstanding_;
+    std::swap(pending_slot_, unsaved_slot_);
+    has_pending_ = true;
+    has_unsaved_ = false;
     wake = true;
   }
   lock.unlock();
@@ -195,9 +200,8 @@ void* ConfigPersister::RunThread(void* persister) {
 }
 #endif
 
-// Allocates and frees nothing: every Persisted moves between slots that are
-// empty (moving a vector out leaves nothing to free), and save_ is required
-// not to.
+// Allocates and frees nothing: every Persisted stays in its preallocated slot
+// (swapped by index under mutex_), and save_ is required not to allocate.
 void ConfigPersister::Run() {
 #ifdef __linux__
   // Below the loop thread, like the logger: a save is not urgent.
@@ -208,33 +212,20 @@ void ConfigPersister::Run() {
 #endif
   std::unique_lock lock{mutex_};
   for (;;) {
-    // The next save waits for the loop to take the last one back (done_),
-    // except when stopping.
-    wake_.wait(lock, [this] {
-      return (pending_.has_value() && !done_.has_value()) || stop_;
-    });
-    // Stop saves what was handed over first. saving_ is always empty here:
-    // it stays occupied only after a save while stopping, after which
-    // nothing is handed over until Stop() has joined this thread and freed
-    // it.
-    if (!pending_ || saving_) return;
-    saving_.emplace(std::move(*pending_));
-    pending_.reset();
+    wake_.wait(lock, [this] { return has_pending_ || stop_; });
+    // Stop saves what was handed over before returning.
+    if (!has_pending_) return;
+    std::swap(saving_slot_, pending_slot_);
+    has_pending_ = false;
     lock.unlock();
-    const bool ok = save_(saving_->bytes);
+    const Persisted& saving = (*slots_)[saving_slot_];
+    const bool ok = save_(saving.span());
     lock.lock();
     ++finished_;
     if (ok) {
-      saved_id_ = saving_->id;
+      saved_id_ = saving.id;
     } else {
       ++failed_;
-    }
-    // Back to the loop thread, which allocated it, to free. Only while
-    // stopping can done_ still hold the last one; this one then stays in
-    // saving_ (see there).
-    if (!done_) {
-      done_.emplace(std::move(*saving_));
-      saving_.reset();
     }
   }
 }

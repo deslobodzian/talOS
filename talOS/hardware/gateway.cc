@@ -103,7 +103,12 @@ Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
   fault_ = !configured_;
   if (!configured_) config_error_ = backend_.last_config_error();
   backend_.Neutral();
-  unavailable_ = backend_.UnavailableDevices();
+  unavailable_.clear();
+  for (const uint16_t id : backend_.UnavailableDevices()) {
+    if (unavailable_.size() < unavailable_.capacity()) {
+      unavailable_.push_back(id);
+    }
+  }
   restore_waiting_ = !unavailable_.empty();
   restore_retry_at_ = kRestoreInitialBackoffUs;
 }
@@ -131,14 +136,7 @@ bool Gateway::Reconfigure(const Config& config) {
     RecordEnabledRefusal(config);
     return false;
   }
-  try {
-    Validate(config);
-  } catch (...) {
-    fault_ = true;
-    return false;
-  }
-  const auto ceiling = CheckCeilings(config);
-  if (!ceiling.ok) {
+  if (!IsValid(config) || !CheckCeilingsInto(config, {})) {
     fault_ = true;
     return false;
   }
@@ -163,12 +161,7 @@ bool Gateway::BeginReconfigure(const Config& config) {
     RecordEnabledRefusal(config);
     return false;
   }
-  try {
-    Validate(config);
-  } catch (...) {
-    return false;
-  }
-  if (!CheckCeilings(config).ok) return false;
+  if (!IsValid(config) || !CheckCeilingsInto(config, {})) return false;
   Invalidate();
   configured_ = false;
   healthy_ = false;
@@ -180,7 +173,7 @@ bool Gateway::BeginReconfigure(const Config& config) {
 
 void Gateway::CommitConfiguration(const Config& config) {
   config_ = config;
-  state_.config_id = ConfigurationId(config_);
+  state_.config_id = TryConfigurationId(config_);
   state_.motor_count = config_.motors.size();
   state_.sensor_count = config_.sensors.size();
   state_.digital_input_count = config_.digital_inputs.size();
@@ -214,7 +207,12 @@ void Gateway::CommitConfiguration(const Config& config) {
   fault_ = false;
   consecutive_apply_failures_ = 0;
   config_error_.reset();
-  unavailable_ = backend_.UnavailableDevices();
+  unavailable_.clear();
+  for (const uint16_t id : backend_.UnavailableDevices()) {
+    if (unavailable_.size() < unavailable_.capacity()) {
+      unavailable_.push_back(id);
+    }
+  }
   restore_waiting_ = !unavailable_.empty();
   restore_retry_at_ = state_.sample_time_us + kRestoreInitialBackoffUs;
   restore_backoff_us_ = kRestoreInitialBackoffUs;
@@ -227,12 +225,7 @@ void Gateway::CommitConfiguration(const Config& config) {
   Invalidate();
 }
 void Gateway::RecordEnabledRefusal(const Config& refused) {
-  uint64_t refused_id = 0;
-  try {
-    refused_id = ConfigurationId(refused);  // validates it first
-  } catch (...) {
-    refused_id = 0;  // one that would not validate has no id
-  }
+  const uint64_t refused_id = TryConfigurationId(refused);
   last_enabled_refusal_ = {last_enabled_refusal_.count + 1, refused_id,
                            configured_ ? state_.config_id : 0};
 }
@@ -318,8 +311,10 @@ bool Gateway::IsolateFailedMotors() {
     if (!motor || DeviceUnavailable(id)) continue;
     // Same quarantine as a device reset: masked, dependents neutral, restored
     // with backoff, and only a post-isolation observation re-authorizes it.
-    std::erase(restoring_ids_, id);
-    unavailable_.push_back(id);
+    restoring_ids_.erase_value(id);
+    if (unavailable_.size() < unavailable_.capacity()) {
+      unavailable_.push_back(id);
+    }
     isolated = true;
   }
   if (isolated) {
@@ -350,14 +345,18 @@ void Gateway::PollResets() {
       }
       if (result == Backend::RestoreStatus::kDone) {
         const auto remaining = backend_.UnavailableDevices();
-        std::erase_if(unavailable_, [&](uint16_t id) {
+        unavailable_.erase_if([&](uint16_t id) {
           return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
                      restoring_ids_.end() &&
                  std::find(remaining.begin(), remaining.end(), id) ==
                      remaining.end();
         });
-        for (auto id : remaining)
-          if (!DeviceUnavailable(id)) unavailable_.push_back(id);
+        for (auto id : remaining) {
+          if (!DeviceUnavailable(id) &&
+              unavailable_.size() < unavailable_.capacity()) {
+            unavailable_.push_back(id);
+          }
+        }
       }
       restore_waiting_ = !unavailable_.empty();
       restore_retry_at_ = state_.sample_time_us + restore_backoff_us_;
@@ -373,8 +372,11 @@ void Gateway::PollResets() {
     state_.counters.device_reset_count += reset_ids.size();
     if (unavailable_.empty()) restore_backoff_us_ = kRestoreInitialBackoffUs;
     for (auto id : reset_ids) {
-      std::erase(restoring_ids_, id);
-      if (!DeviceUnavailable(id)) unavailable_.push_back(id);
+      restoring_ids_.erase_value(id);
+      if (!DeviceUnavailable(id) &&
+          unavailable_.size() < unavailable_.capacity()) {
+        unavailable_.push_back(id);
+      }
     }
     restore_waiting_ = true;
     restore_retry_at_ = state_.sample_time_us;

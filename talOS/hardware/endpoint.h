@@ -74,7 +74,7 @@ class Endpoint {
                        ? ConfigAckStatus::kOk
                        : ConfigAckStatus::kBackendFailed;
       if (ack.status != ConfigAckStatus::kOk) {
-        const auto error = gateway_.config_error();
+        const auto& error = gateway_.config_error();
         if (error)
           std::snprintf(ack.reason, sizeof(ack.reason), "%s: %s",
                         error->device_name.c_str(), error->message.c_str());
@@ -112,9 +112,9 @@ class Endpoint {
         continue;
       }
       if (frame.header.type == protocol::FrameType::kHardwareConfig) {
-        std::string err;
-        auto status =
-            assembler_.AddChunk({frame.payload, frame.payload_size}, err);
+        std::array<char, sizeof(ConfigAckPayload::reason)> err{};
+        auto status = assembler_.AddChunk({frame.payload, frame.payload_size},
+                                          std::span<char>{err});
         if (status == ConfigAssembler::Status::kComplete) {
           if (gateway_.configuring()) continue;
           bool ok = gateway_.BeginReconfigure(assembler_.config());
@@ -143,7 +143,7 @@ class Endpoint {
             // generic string. Compact "device: cause" summary so both survive
             // truncation to the 64-byte reason; snprintf always
             // NUL-terminates.
-            const auto config_error = gateway_.config_error();
+            const auto& config_error = gateway_.config_error();
             if (config_error.has_value()) {
               std::snprintf(ack.reason, sizeof(ack.reason), "%s: %s",
                             config_error->device_name.c_str(),
@@ -165,7 +165,7 @@ class Endpoint {
           } else {
             ack.status = ConfigAckStatus::kMalformed;
           }
-          std::snprintf(ack.reason, sizeof(ack.reason), "%s", err.c_str());
+          std::snprintf(ack.reason, sizeof(ack.reason), "%s", err.data());
           QueueAck(ack);
           ack_status = Worse(ack_status, SendAck(now_us));
         }

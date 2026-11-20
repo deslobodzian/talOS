@@ -58,6 +58,27 @@ void LogEvent::SetName(std::string_view value) { CopyBounded(name, value); }
 void LogEvent::SetBus(std::string_view value) { CopyBounded(bus, value); }
 void LogEvent::SetText(std::string_view value) { CopyBounded(text, value); }
 
+void RioLog::WriteConsoleLine(uint64_t steady_us, std::string_view line,
+                              std::FILE* stream) noexcept {
+  // One write, so another thread's console line cannot split it, formatted on
+  // the stack so the low-priority logger thread does not allocate here.
+  char prefix[kConsoleTimeSize];
+  FormatConsoleTime(steady_us, prefix);
+  const std::size_t prefix_len = std::strlen(prefix);
+  char buffer[2048];
+  if (prefix_len + line.size() <= sizeof(buffer)) {
+    std::memcpy(buffer, prefix, prefix_len);
+    if (!line.empty()) {
+      std::memcpy(buffer + prefix_len, line.data(), line.size());
+    }
+    std::fwrite(buffer, 1, prefix_len + line.size(), stream);
+  } else {
+    std::fwrite(prefix, 1, prefix_len, stream);
+    std::fwrite(line.data(), 1, line.size(), stream);
+  }
+  std::fflush(stream);
+}
+
 RioLog::RioLog(Sink sink)
     : sink_{std::move(sink)},
       cells_{std::make_unique<std::array<Cell, kCapacity>>()},
@@ -70,11 +91,7 @@ RioLog::RioLog(Sink sink)
     (*cells_)[i].sequence.store(i, std::memory_order_relaxed);
   if (!sink_) {
     sink_ = [](std::string_view line) {
-      // One write, so another thread's console line cannot split it.
-      std::string timed = ConsoleTime(SteadyNowUs());
-      timed.append(line);
-      std::fwrite(timed.data(), 1, timed.size(), stderr);
-      std::fflush(stderr);
+      WriteConsoleLine(SteadyNowUs(), line, stderr);
     };
   }
 }

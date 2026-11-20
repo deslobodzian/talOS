@@ -106,8 +106,8 @@ double TorqueDutyCap(double max_voltage, double battery_v) {
 
 // Posts a feedback validity change: the loop thread only copies it.
 void LogFeedbackChange(talos::rio::RioLog& log, talos::rio::LogKind kind,
-                       std::size_t index, const std::string& name, uint16_t id,
-                       const std::string& bus, int can_id, bool valid,
+                       std::size_t index, std::string_view name, uint16_t id,
+                       std::string_view bus, int can_id, bool valid,
                        const ph::BaseStatusSignal& p,
                        const ph::BaseStatusSignal& v) {
   talos::rio::LogEvent event;
@@ -131,8 +131,8 @@ void LogFeedbackChange(talos::rio::RioLog& log, talos::rio::LogKind kind,
 // gateway's bound changes no validity, so this line is what shows it.
 // Loop thread: a copy into the queue, never a write.
 void NoteLateness(talos::rio::RioLog& log, talos::rio::LogKind kind,
-                  std::size_t index, const std::string& name, uint16_t id,
-                  const std::string& bus, int can_id, uint32_t late_us,
+                  std::size_t index, std::string_view name, uint16_t id,
+                  std::string_view bus, int can_id, uint32_t late_us,
                   const ph::BaseStatusSignal& p, const ph::BaseStatusSignal& v,
                   bool& late, uint32_t& peak_age_us) {
   const uint32_t age_us = std::max(Age(p), Age(v));
@@ -372,9 +372,8 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   last_brownout_ = false;
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
-  const auto note_failure = [this](const std::string& name,
-                                   const std::string& bus, int can_id,
-                                   const std::string& operation,
+  const auto note_failure = [this](std::string_view name, std::string_view bus,
+                                   int can_id, const std::string& operation,
                                    const ctre::phoenix::StatusCode& code) {
     if (code.IsOK()) return true;
     uint16_t id = 0;

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -225,6 +226,10 @@ class RioLog {
   // Decode a TalonFX FaultField (SPN 0x34c, frame 0xad).
   static std::string DecodeTalonFaultBits(uint32_t fault_flags);
   static std::string Format(const LogEvent& event);
+  // Writes ConsoleTime(steady_us) + line to `stream` using a stack buffer so
+  // the default sink allocates nothing.
+  static void WriteConsoleLine(uint64_t steady_us, std::string_view line,
+                               std::FILE* stream) noexcept;
 
  private:
   // Bounded multi-producer queue (Vyukov): one sequence number per cell, so
