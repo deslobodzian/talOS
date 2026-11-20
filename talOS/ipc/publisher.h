@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <span>
 #include <string>
+#include <type_traits>
 
 #include "concepts.h"
 #include "talOS/rtms/rtms.h"
@@ -48,6 +49,9 @@ class RawPublisher {
 template <NotDerivedFromFlatbufferTable Message>
   requires talos::Described<Message>
 class Publisher {
+  static_assert(std::is_trivially_copyable_v<Message>,
+                "RTMS messages must be flatbuffer structs, not tables");
+
  public:
   // Defaults to the policy that keeps the publisher running: a subscriber
   // that stops reading gets lapped instead of stalling this process.
