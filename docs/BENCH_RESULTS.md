@@ -24,6 +24,16 @@ has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
 ## 2026-11-20
 
+Mac mini (M4 Pro, 12 cores, macOS arm64), commit `1e3bb1c8`, no hardware
+attached, idle. Verification of `TODO.md` STUDIO-1 macOS bridge listener and
+idle-timeout tests:
+
+- **STUDIO-1: exclusive port bind and client idle-timeout tests pass on macOS.**
+  `bazel test --nocache_test_results --test_output=errors //studio/bridge:listen_test //studio/bridge:client_timeout_test`
+  passed with 0 skips (`listen_test` 0.2 s, confirming a second listener on an
+  in-use port fails on macOS; `client_timeout_test` 8.9 s, confirming an
+  unresponsive client frees its slot within the 12–16 s idle-timeout window).
+
 Mac mini (M4 Pro, 12 cores, macOS arm64), commit `6dd79706`, no hardware
 attached. Investigation of nightly `Bazel (tsan, macOS)` failures (`TODO.md`
 CI-13) and kept CI logs from Nightly runs `43877022665` (`6c701709`) and
