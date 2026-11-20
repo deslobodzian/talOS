@@ -253,6 +253,10 @@ class Launcher {
     uint32_t recording_reported{0};
     // This run's realtime outcome was seen in its row (NoteRealtime).
     bool realtime_reported{false};
+    // This run's loop has started: its registry row was seen active without
+    // kFlagConstructing and with either a realtime outcome or a dispatch.
+    // Cleared by NewRun.
+    bool loop_started{false};
     // The member answered --describe: its runs' live endpoints are compared
     // with `declared` (CheckEndpoints), once per run, after the run's row
     // has published them; `endpoints_checked` says this run's was.
@@ -399,6 +403,7 @@ class Launcher {
   void Supervise(std::vector<NodeProcessInfo>& procs,
                  std::vector<NodeLaunch>& launches,
                  std::optional<StudioBridge>& studio,
+                 std::optional<std::size_t> sim_gateway_index,
                  std::chrono::steady_clock::time_point deadline);
 
   // One supervision pass over a running member other than Studio's bridge:

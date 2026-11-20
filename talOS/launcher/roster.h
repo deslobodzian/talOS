@@ -189,6 +189,10 @@ inline constexpr std::string_view kHardwareNodeName =
     naming::kHardwareBridgeNode;
 inline constexpr std::string_view kSimGatewayName = "sim_gateway";
 inline constexpr std::string_view kStudioBridgeName = "studio_bridge";
+// File in the session directory where the launcher writes the node-clock
+// timestamp (decimal nanoseconds) that starts sim_gateway's schedules once
+// every non-observer member's loop has started (PrepareLaunch, Supervise).
+inline constexpr std::string_view kSimScheduleStartFile = "sim_schedule_start";
 
 // Resolves a node target to an executable path: an override (bundle manifest
 // or test) wins, then the target's bazel-bin output relative to the
@@ -238,6 +242,12 @@ std::vector<std::string> SimulatorArgs(const config::RobotConfig& config,
 // A --sim-gateway-arg value Launcher::Run refuses: a port flag of the
 // simulator's, which SimulatorArgs already passes.
 bool IsSimulatorPortArg(std::string_view arg);
+
+// Whether `args` (--sim-gateway-arg values) already passes
+// --schedule-start-file: when a caller supplies its own, the launcher leaves
+// schedule coordination to that caller instead of passing and writing
+// kSimScheduleStartFile.
+bool HasSimulatorScheduleStartArg(const std::vector<std::string>& args);
 
 // The roster: the hardware bridge (with ControllerArgs), the subsystems, the
 // sim gateway under --sim-gateway (with SimulatorArgs), and the Studio bridge

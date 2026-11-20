@@ -340,7 +340,18 @@ is refused naming its `[subsystems.sim_gateway]` key. The launcher passes the ga
 ports (`SimulatorArgs`): `--port` is the effective controller port the bridge
 sends to (`[robot] controller_port`, or `--remote-port`) and `--remote-port` the
 effective local port the bridge listens on (`[robot] local_port`, or
-`--local-port`), so the two always agree. Repeat `--sim-gateway-arg ARG` to
+`--local-port`), so the two always agree. Unless `--sim-gateway-arg` already
+supplies `--schedule-start-file`, the launcher also passes
+`--schedule-start-file <output_dir>/<session_id>/sim_schedule_start` at runtime
+and writes the node-clock timestamp there atomically once every non-observer
+member's loop has started (its live registry row is active without
+`kFlagConstructing` and has reported its realtime outcome or a dispatch; the
+Studio bridge, an observer, never delays it, nor does a member that has exited
+without a pending non-quarantined restart). Until then `sim_gateway` holds its
+schedules' time-zero state, so a slow-starting node never misses its opening
+mode or joystick window, and a restarted gateway rejoins the same schedule
+partway; passing `--sim-gateway-arg --schedule-start-file` leaves coordination
+to the caller. Repeat `--sim-gateway-arg ARG` to
 forward further arguments verbatim, in order, after those, to **both** its
 `--describe` probe and runtime. The forwarding flag requires
 `--start-sim-gateway`, and a `--port` or `--remote-port` among its values is

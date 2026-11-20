@@ -53,11 +53,16 @@ The schedules and `--duration-s` count from one time zero on the
 main-processor node clock (`talos::event::Poller::now()`: `CLOCK_MONOTONIC` on
 Linux, `CLOCK_MONOTONIC_RAW` on macOS, which counts host sleep). By default it
 is the gateway's loop start. `--schedule-start-file PATH` instead takes it from
-`PATH`, which a harness writes (atomically, by rename) with the time in
-decimal nanoseconds, so it can start the match once the stack is up and time
-its own actions from the same instant. Until the file exists and its time
-arrives, the gateway holds the schedules' time-zero state (first mode phase,
-time-0 joystick and fault events). Content that is not a non-negative integer
+`PATH`, which the launcher or a harness writes (atomically, by rename) with
+the time in decimal nanoseconds, so it can start the match once the stack is
+up and time its own actions from the same instant. Under `--sim
+--start-sim-gateway`, the launcher passes
+`--schedule-start-file <session_dir>/sim_schedule_start` automatically (unless
+`--sim-gateway-arg` already supplies `--schedule-start-file`) and writes it
+once every non-observer member's loop has started
+([launcher](../launcher/README.md#lightweight-simulation-gateway)). Until the
+file exists and its time arrives, the gateway holds the schedules' time-zero
+state (first mode phase, time-0 joystick and fault events). Content that is not a non-negative integer
 stops the gateway with an error naming the file. A start already past (logged
 to stderr) joins the schedule partway, as does a restarted gateway: fault
 intervals that already ended are skipped, not replayed.
