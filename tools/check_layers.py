@@ -49,22 +49,36 @@ refuses from the start (RULES.md 2):
   `talOS/node/access.h`, `talOS/node/internal.h`, `talOS/devices/access.h`,
   `talOS/rtms/...`, `talOS/ipc/...`, `talOS/memory/...`,
   `talOS/hardware/messages.h`, `talOS/hardware/packet.h`, or
-  `talOS/hardware/request...`, as well as computed `#include MACRO`
-  directives that cannot be verified statically;
+  `talOS/hardware/request...`, non-C++ filenames (`NON_CPP_BASENAMES`,
+  `NON_CPP_SUFFIXES`, and `.txt`, case-insensitive) that could hide headers
+  from source discovery, and computed `#include MACRO` directives that cannot
+  be verified statically;
 - non-comment, non-string references to `NodeAccess`, `add_hardware_request`,
-  `HardwareAccess`, or `note_live_target`, and preprocessor token-pasting
-  operators `##` and `%:%:` (which could otherwise assemble them);
+  `HardwareAccess`, or `note_live_target`, preprocessor token-pasting
+  operators `##` and `%:%:` (which could otherwise assemble them), and C++
+  trigraphs (`??[=/'()!<>-]` in code and comments, plus `??/` in string/char
+  literals where it can escape quotes or splice lines under trigraph-enabling
+  flags);
 - Starlark string constants (and constant concatenations) in `BUILD`,
   `BUILD.bazel`, and `.bzl` files that carry those forbidden symbols, token
-  pasting, forbidden header paths, or `-include`/`-imacros`/`-trigraphs`
-  compiler flags.
+  pasting, C++ trigraphs, forbidden header paths, or `-include`/`-imacros`/
+  `-trigraphs`/`-ftrigraphs`/`-I`/`-iquote`/`-isystem`/`-idirafter`/
+  `--include-directory`/`-iwithprefix`/`-iwithsysroot` compiler flags (joined,
+  separate, or via `-Wp,`/`-Xclang`).
+
+Residual static-scan limits (tracked under TODO ARCH-2): Bazel
+`includes = [...]` rule attributes, Starlark strings built at runtime (e.g.
+`%`, `.format()`, slices, `load()`ed constants, macro parameters, `.scl`
+files), and generated headers (`genrule`). Closing those requires evaluating
+Bazel `aquery` compile actions.
 
 ALLOWLIST holds today's known Bazel exceptions, each with its reason and the
 TODO.md item that removes it. NON_NODE_CLI_FILES maps non-node CLI binaries
 that sit beside a node package to the exact transport/wire headers they may
 include (never exempting `NodeAccess`, `HardwareAccess`, `node/access.h`,
 `node/internal.h`, `devices/access.h`, `add_hardware_request`,
-`note_live_target`, token pasting or computed includes). Both may only shrink
+`note_live_target`, token pasting, trigraphs, non-C++ includes or computed
+includes). Both may only shrink
 entry by entry: a stale entry fails the check, so it is deleted with the fix.
 Prints each violation; exits 1 on a violation or a stale entry.
 """
@@ -212,14 +226,30 @@ NON_CPP_SUFFIXES = frozenset({
     ".pdf",
     ".tlog",
 })
+NON_CPP_BASENAMES_LOWER = frozenset(b.lower() for b in NON_CPP_BASENAMES)
+# Refused as `#include` targets even though `.txt` files under scanned roots
+# are still scanned as C++ (prevents smuggling via cross-package/generated
+# non-C++ files that discovery skips or does not reach).
+FORBIDDEN_INCLUDE_SUFFIXES = NON_CPP_SUFFIXES | frozenset({".txt"})
 
 INCLUDE_DIRECTIVE_RE = re.compile(
     r"^[ \t]*(?:#|%:)[ \t]*(include(?:_next)?)\b(.*)$")
 HEADER_NAME_RE = re.compile(r'^(?:"([^"]*)"|<([^>]*)>)')
 TOKEN_PASTE_RE = re.compile(r"##|%:%:")
-FORBIDDEN_COPT_FLAG_RE = re.compile(r"^--?(?:include|imacros|trigraphs)")
+TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>-]")
+FORBIDDEN_COPT_FLAG_RE = re.compile(
+    r"^(?:--?(?:include|imacros|f?trigraphs|iquote|isystem|idirafter|"
+    r"iwithprefix|iwithsysroot)|-I)"
+)
 FORBIDDEN_COPT_ADJACENT_FLAGS = frozenset({
-    "-include", "--include", "-imacros", "--imacros",
+    "-include", "--include",
+    "-imacros", "--imacros",
+    "-I",
+    "-iquote", "--iquote",
+    "-isystem", "--isystem",
+    "-idirafter", "--idirafter",
+    "--include-directory", "--include-directory-after",
+    "-iwithprefix", "-iwithprefixbefore", "-iwithsysroot",
 })
 STARLARK_COPT_JOINED_RE = re.compile(r"^--?(?:include|imacros)=?(.+)$")
 STARLARK_PATH_TOKEN_RE = re.compile(r"[^\s\"'<>(),;=]+")
@@ -254,8 +284,8 @@ FORBIDDEN_SYMBOLS = (
 # transport/wire headers that CLI may include; every header is checked
 # individually for staleness so the allowlist only shrinks header by header.
 # NodeAccess, HardwareAccess, node/access.h, node/internal.h, devices/access.h,
-# add_hardware_request, note_live_target, token pasting, computed includes and
-# syntax errors are never exempted.
+# add_hardware_request, note_live_target, token pasting, trigraphs, non-C++
+# includes, computed includes and syntax errors are never exempted.
 NON_NODE_CLI_FILES = {
     "bench/main_processor/swerve_module/send_target.cc": frozenset({
         "talOS/hardware/packet.h",
@@ -549,9 +579,17 @@ def _strip_cpp_comments(text):
         # Line comment: replace with space, leave '\n' intact.
         if ch == "/" and nxt == "/":
             emit(" ", " ", spliced_lines[i])
+            comment_start = i + 2
             i += 2
             while i < n and src[i] != "\n":
                 i += 1
+            for tm in TRIGRAPH_RE.finditer(src[comment_start:i]):
+                errors.append((
+                    spliced_lines[comment_start + tm.start()],
+                    "trigraph",
+                    f"uses C++ trigraph `{tm.group(0)}` in comment "
+                    f"(can splice lines or close comments under -trigraphs)",
+                ))
             continue
         # Block comment: C++ translation phase 3 replaces the entire comment
         # (including newlines inside it) with a single space.
@@ -561,6 +599,13 @@ def _strip_cpp_comments(text):
                 errors.append((spliced_lines[i], "unterminated-comment",
                                "unterminated block comment"))
                 break
+            for tm in TRIGRAPH_RE.finditer(src[i + 2:end]):
+                errors.append((
+                    spliced_lines[i + 2 + tm.start()],
+                    "trigraph",
+                    f"uses C++ trigraph `{tm.group(0)}` in comment "
+                    f"(can splice lines or close comments under -trigraphs)",
+                ))
             emit(" ", " ", spliced_lines[i])
             i = end + 2
             continue
@@ -580,6 +625,13 @@ def _strip_cpp_comments(text):
                     errors.append((spliced_lines[i], "unterminated-string",
                                    "malformed raw string literal"))
                     break
+                for tm in TRIGRAPH_RE.finditer(delim):
+                    errors.append((
+                        spliced_lines[j + 1 + tm.start()],
+                        "trigraph",
+                        f"uses C++ trigraph `{tm.group(0)}` in raw string "
+                        f"delimiter",
+                    ))
                 closing = ")" + delim + '"'
                 end = src.find(closing, paren + 1)
                 if end == -1:
@@ -626,8 +678,11 @@ def _strip_cpp_comments(text):
                 break
             continue
         # Normal string literal: preserve in `with_strings` (for #include),
-        # blank interior in `no_strings`.
+        # blank interior in `no_strings`. Refuse `??/` inside literals because
+        # phase-1 `??/` -> `\` can escape the closing quote or splice lines
+        # under trigraph-enabling flags and desync the lexer.
         if ch == '"':
+            lit_start = i
             emit('"', '"', spliced_lines[i])
             i += 1
             while i < n:
@@ -649,9 +704,19 @@ def _strip_cpp_comments(text):
                     break
                 emit(c, " ", spliced_lines[i])
                 i += 1
+            pos = src.find("??/", lit_start, i)
+            while pos != -1:
+                errors.append((
+                    spliced_lines[pos],
+                    "trigraph",
+                    "uses C++ trigraph `??/` in string literal "
+                    "(can escape quotes or splice lines under -trigraphs)",
+                ))
+                pos = src.find("??/", pos + 3, i)
             continue
         # Character literal (pp-number digit separators were already consumed).
         if ch == "'":
+            lit_start = i
             emit("'", "'", spliced_lines[i])
             i += 1
             while i < n:
@@ -673,6 +738,15 @@ def _strip_cpp_comments(text):
                     break
                 emit(c, " ", spliced_lines[i])
                 i += 1
+            pos = src.find("??/", lit_start, i)
+            while pos != -1:
+                errors.append((
+                    spliced_lines[pos],
+                    "trigraph",
+                    "uses C++ trigraph `??/` in character literal "
+                    "(can escape quotes or splice lines under -trigraphs)",
+                ))
+                pos = src.find("??/", pos + 3, i)
             continue
         emit(ch, ch, spliced_lines[i])
         i += 1
@@ -697,6 +771,14 @@ def _is_forbidden_include(norm):
     if norm in FORBIDDEN_INCLUDE_EXACT:
         return True
     return norm.startswith(FORBIDDEN_INCLUDE_PREFIXES)
+
+
+def _is_non_cpp_include(norm):
+    """True when an `#include` target has a non-C++ basename or suffix."""
+    base = posixpath.basename(norm)
+    if base.lower() in NON_CPP_BASENAMES_LOWER:
+        return True
+    return posixpath.splitext(base)[1].lower() in FORBIDDEN_INCLUDE_SUFFIXES
 
 
 def scan_cpp_text(path, text):
@@ -729,6 +811,11 @@ def scan_cpp_text(path, text):
                         path, lineno, "forbidden-include",
                         f"#{directive} \"{raw_header}\" (normalized: {norm})",
                         header=norm))
+                elif _is_non_cpp_include(norm):
+                    violations.append(SourceViolation(
+                        path, lineno, "non-cpp-include",
+                        f"#{directive} \"{raw_header}\" (non-C++ filename "
+                        f"cannot be included; bypasses source discovery)"))
         offset += len(segment)
 
     # Check non-comment, non-string code for forbidden internal symbols.
@@ -747,6 +834,15 @@ def scan_cpp_text(path, text):
             path, lineno, "token-paste",
             f"uses preprocessor token pasting `{m.group(0)}` (can assemble "
             f"forbidden framework internals)"))
+
+    # Refuse C++ trigraphs in code (comments and `??/` in literals were
+    # checked in `_strip_cpp_comments`).
+    for m in TRIGRAPH_RE.finditer(no_strings):
+        lineno = line_map[m.start()] if line_map else 1
+        violations.append(SourceViolation(
+            path, lineno, "trigraph",
+            f"uses C++ trigraph `{m.group(0)}` (can assemble directives, "
+            f"token pasting, or line splices under -trigraphs)"))
 
     violations.sort(key=lambda v: (v.line, v.kind, v.detail))
     return violations
@@ -879,8 +975,9 @@ def _extract_starlark_header_candidates(value):
 
 def scan_starlark_ast(path, tree):
     """Refuses BUILD / `.bzl` string constants carrying bypass symbols,
-    token pasting, forbidden header paths, or `-include`/`-imacros`/`-trigraphs`
-    compiler flags."""
+    token pasting, C++ trigraphs, forbidden header paths, or forbidden
+    `-include`/`-imacros`/`-trigraphs`/`-ftrigraphs`/include-path compiler
+    flags."""
     bindings = _collect_starlark_bindings(tree)
     violations = []
     seen_keys = set()
@@ -927,6 +1024,11 @@ def scan_starlark_ast(path, tree):
             add(lineno, "starlark-token-paste",
                 f"Starlark string uses preprocessor token pasting "
                 f"`{m.group(0)}` (can assemble forbidden framework internals)")
+
+        for m in TRIGRAPH_RE.finditer(val):
+            add(lineno, "starlark-trigraph",
+                f"Starlark string uses C++ trigraph `{m.group(0)}` (can "
+                f"assemble token pasting or directives in compiler defines)")
 
         if id(node) not in reported_flag_nodes:
             for tok in re.findall(r"[^\s,]+", val):
