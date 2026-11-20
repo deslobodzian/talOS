@@ -19,14 +19,24 @@ import time
 
 SOURCES = ('.c', '.cc', '.cpp')
 HEADERS = ('.h', '.hpp')
-# Sources the Linux build graph never compiles, so they have no compilation
-# database entry: the GradleRIO program and its tests (rio-adapter job) and
-# sources selected only for other platforms. Paths in .bazelignore are outside
-# the graph too and are read from there.
+# Sources the active host's Bazel build graph never compiles, so they have no
+# compilation database entry: the GradleRIO program and its tests (rio-adapter
+# job) and platform-specific sources for other OSes. Paths in .bazelignore are
+# outside the graph too and are read from there.
 OFF_GRAPH = (
     'controller_processor/rio/',
-    'talOS/events/os/kqueue_poller.cc',
     'talOS/vision/capture/unsupported_source.cc',
+) + (
+    (
+        'talOS/events/os/epoll_poller.cc',
+        'talOS/vision/capture/v4l2_source.cc',
+        'talOS/vision/capture/v4l2_source_test.cc',
+    )
+    if sys.platform == 'darwin'
+    else (
+        'talOS/events/os/kqueue_poller.cc',
+        'talOS/vision/capture/avfoundation_source.mm',
+    )
 )
 # A changed header is analyzed through at most this many translation units
 # that include it, nearest includers first.
