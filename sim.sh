@@ -391,26 +391,25 @@ fi
 
 # --- 2. the node graph ------------------------------------------------------
 say "starting node graph (log: $LOG_DIR/launcher.log)"
-LAUNCH_ARGS="--config $CONFIG --sim --session-id $SESSION_ID --output-dir $OUT_DIR"
-[ -n "$DURATION" ] && LAUNCH_ARGS="$LAUNCH_ARGS --duration-s $DURATION"
+LAUNCH_ARGS=(--config "$CONFIG" --sim --session-id "$SESSION_ID" --output-dir "$OUT_DIR")
+[ -n "$DURATION" ] && LAUNCH_ARGS+=(--duration-s "$DURATION")
 # Studio's bridge is a declared node in the launcher's graph ([studio] in the
 # robot config): the launcher starts and supervises it, so sim.sh only asks
 # for it and forwards the HTTP port override.
 if [ "$WANT_STUDIO" = "1" ]; then
-  LAUNCH_ARGS="$LAUNCH_ARGS --start-studio-bridge"
-  [ "$HTTP_PORT" != "5800" ] && LAUNCH_ARGS="$LAUNCH_ARGS --studio-http-port $HTTP_PORT"
+  LAUNCH_ARGS+=(--start-studio-bridge)
+  [ "$HTTP_PORT" != "5800" ] && LAUNCH_ARGS+=(--studio-http-port "$HTTP_PORT")
 fi
 # The lightweight sim gateway stands in for the controller processor only
 # in mode 3 (--sim-gateway). In mode 1 WPILib publishes /hw/state; in mode 2
 # an existing controller does. Starting the gateway alongside either would
 # create two publishers on /hw/state.
 if [ "$WANT_GATEWAY" = "1" ]; then
-  LAUNCH_ARGS="$LAUNCH_ARGS --start-sim-gateway --sim-gateway-arg --physics"
+  LAUNCH_ARGS+=(--start-sim-gateway --sim-gateway-arg --physics)
 fi
 # Bash 3.2 treats an empty array as unset under nounset; the + expansion
 # preserves each forwarded argument without expanding an unset array.
-# shellcheck disable=SC2086
-./bazel-bin/talOS/launcher/launcher $LAUNCH_ARGS ${GATEWAY_ARGS[@]+"${GATEWAY_ARGS[@]}"} > "$LOG_DIR/launcher.log" 2>&1 &
+./bazel-bin/talOS/launcher/launcher "${LAUNCH_ARGS[@]}" ${GATEWAY_ARGS[@]+"${GATEWAY_ARGS[@]}"} > "$LOG_DIR/launcher.log" 2>&1 &
 LAUNCHER_PID=$!
 track "$LAUNCHER_PID" "launcher"
 
