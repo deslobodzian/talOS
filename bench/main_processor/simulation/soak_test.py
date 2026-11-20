@@ -128,6 +128,9 @@ def joystick_schedule(teleop_s):
 
 def _sigterm_to_exit(signum, _frame):
     """Turn SIGTERM into SystemExit so finally: cleanup always runs."""
+    # Ignore a second SIGTERM while unwinding into finally: so cleanup cannot
+    # be aborted mid-way; the inner finally: restores the previous handler.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 
@@ -572,6 +575,7 @@ class Soak(unittest.TestCase):
                 self.assertTrue(fresh, f"{DRIVE} active without fresh target at {t:.1f} ms")
             success = True
         finally:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
             try:
                 if stopped is not None:
                     try:
