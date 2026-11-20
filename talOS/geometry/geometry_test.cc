@@ -224,6 +224,27 @@ TEST(SE3, ExpLogRoundTrip) {
     const SE3<double> x = SE3<double>::Exp(tau);
     EXPECT_TRUE(SE3<double>::Exp(x.Log()).matrix().isApprox(x.matrix(), 1e-6));
   }
+  // Near-pi and exact-pi rotations: LeftVInverse stays finite and accurate
+  // without 0/0 cancellation in (1 + cos theta) / (2 theta sin theta).
+  for (const double angle : {kPi - 1e-7, kPi - 1e-8, kPi - 1e-12, kPi}) {
+    SCOPED_TRACE(angle);
+    for (int i = 0; i < 20; ++i) {
+      const Eigen::Vector3d axis = RandomAxis(rng);
+      const Eigen::Vector3d w = angle * axis;
+      const Eigen::Matrix3d v_inv = SE3<double>::LeftVInverse(w);
+      ASSERT_TRUE(v_inv.allFinite());
+      EXPECT_TRUE((SE3<double>::LeftV(w) * v_inv)
+                      .isApprox(Eigen::Matrix3d::Identity(), 1e-11));
+
+      const SE3<double> x(SO3<double>::Exp(w), Eigen::Vector3d(1.0, -2.0, 3.0));
+      const Eigen::Matrix<double, 6, 1> log_x = x.Log();
+      ASSERT_TRUE(log_x.allFinite());
+      const SE3<double> recovered = SE3<double>::Exp(log_x);
+      EXPECT_TRUE(recovered.matrix().isApprox(x.matrix(), 1e-10))
+          << "diff:\n"
+          << (recovered.matrix() - x.matrix());
+    }
+  }
   // boxplus/boxminus round-trip.
   for (int i = 0; i < 200; ++i) {
     const SE3<double> a = RandomSE3(rng);
