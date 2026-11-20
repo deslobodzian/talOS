@@ -42,6 +42,24 @@ void LoopConsole::ObserveWatchdog(const LoopWatchdog& watchdog) {
   log_.Post(event);
 }
 
+void LoopConsole::ObserveSendWouldBlock(uint64_t send_would_block) {
+  if (send_would_block == reported_send_would_block_) return;
+  if (send_would_block < reported_send_would_block_) {
+    reported_send_would_block_ = send_would_block;
+    return;
+  }
+  reported_send_would_block_ = send_would_block;
+  char text[160];
+  std::snprintf(text, sizeof(text),
+                "hardware gateway socket send would block (EAGAIN, send buffer "
+                "full): %llu dropped since start; keeping the socket",
+                static_cast<unsigned long long>(send_would_block));
+  LogEvent event;
+  event.index = kSocketWouldBlockMessage;
+  event.SetText(text);
+  log_.Post(event);
+}
+
 void LoopConsole::ReportRefusal(
     const hardware::Gateway::EnabledRefusal& refusal) {
   if (refusal.count == reported_refusals_) return;

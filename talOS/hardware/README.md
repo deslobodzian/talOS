@@ -702,8 +702,13 @@ every other send fails with `ECONNREFUSED`); a spell prints `hardware
 gateway socket send failed (errno <n>); keeping the socket` at its first
 failure that keeps the socket and, once such a spell ends, `hardware gateway
 socket sending again: <n> sends failed over <s> s (errno <n>[, last errno <m>])`,
-`<s>` from its first failure to its last (at most one line a second). A send
-raises no `SIGPIPE` on either end
+`<s>` from its first failure to its last (at most one line a second). A
+non-blocking send refused with `EAGAIN` / `EWOULDBLOCK` (`UdpStatus::kWouldBlock`,
+send buffer full) keeps the socket open without triggering a reopen and prints
+`hardware gateway socket send would block (EAGAIN, send buffer full): <n>
+dropped since start; keeping the socket` (rate-limited by `RioLog` to at most
+one line a second, bursts coalesced with the cumulative `send_would_block`
+count). A send raises no `SIGPIPE` on either end
 ([protocol](../protocol/README.md)).
 
 A tick that invalidates the command in force because it reached its expiry

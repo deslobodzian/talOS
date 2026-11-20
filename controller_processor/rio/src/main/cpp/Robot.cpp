@@ -60,7 +60,7 @@ constexpr const char* kConfigPath = "talos_config.bin";
 
 // RioLog kMessage indices (rate-limit keys) of this file's reports; 0, 7, 8
 // and 16 to 31 are PhoenixBackend's (configure failure, CAN bus status, CAN
-// bus reader, licence refusals), 9 and up LoopConsole's.
+// bus reader, licence refusals), 9 to 12 LoopConsole's.
 constexpr uint16_t kSocketMessage = 1;
 constexpr uint16_t kPersistMessage = 2;
 constexpr uint16_t kSocketOpenMessage = 3;
@@ -466,16 +466,15 @@ void Robot::StartCompetition() {
     // a second).
     const auto sent = [&](talos::protocol::UdpStatus status) {
       using SendEvent = talos::rio::SocketRetry::SendEvent;
-      SendEvent event = SendEvent::kNone;
-      if (status == talos::protocol::UdpStatus::kOk) {
-        event = socket_retry.SendSucceeded(now_us);
-      } else if (status == talos::protocol::UdpStatus::kSocketError) {
-        event = socket_retry.SendFailed(now_us,
-                                        endpoint_->udp_stats().last_send_error);
-      }
+      const SendEvent event = socket_retry.ObserveSend(
+          now_us, status, endpoint_->udp_stats().last_send_error);
       char text[160];
       switch (event) {
         case SendEvent::kNone:
+          return;
+        case SendEvent::kWouldBlock:
+          loop_console.ObserveSendWouldBlock(
+              endpoint_->udp_stats().send_would_block);
           return;
         case SendEvent::kLost:
           std::snprintf(text, sizeof(text),
@@ -580,9 +579,11 @@ void Robot::StartCompetition() {
     }
 
     // A console line for each command expiry this tick found (no State
-    // reaches the main processor when its loss caused the expiry) and each
-    // changed configuration it refused while enabled.
+    // reaches the main processor when its loss caused the expiry), each
+    // changed configuration it refused while enabled, and any EAGAIN send drop
+    // (including one on an ACK send masked by a State kSocketError).
     loop_console.ObserveGateway(*gateway_);
+    loop_console.ObserveSendWouldBlock(endpoint_->udp_stats().send_would_block);
 
     // Arms the watchdog only while a command is in force (a tick without one
     // neutralized every output itself), with the time by which this loop's

@@ -185,7 +185,7 @@ constexpr double kSimNeutralStandstillRps = 0.01;
 // Follower ("no slower than 20 Hz", controls/Follower.hpp).
 constexpr double kFollowerSignalMinHz = 20.0;
 // RioLog kMessage indices (rate-limit keys) of this file's lines; Robot.cpp
-// uses 1 to 6, LoopConsole 9 to 11. A licence refusal's line is keyed by its
+// uses 1 to 6, LoopConsole 9 to 12. A licence refusal's line is keyed by its
 // motor (16 to 31),
 // so the logger coalesces no motor's line into another's.
 constexpr uint16_t kConfigureFailedMessage = 0;
