@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "config_wire.h"
+#include "endpoint.h"
 #include "gateway_test_support.h"
 #include "sim_backend.h"
 #include "sim_physics.h"
@@ -1476,6 +1477,314 @@ TEST(Gateway, ANonFiniteReadingInvalidatesOnlyItsSampleAndTheStateDecodes) {
           << config.motors[i].name;
     }
   }
+}
+
+// EncodeSanitizedState is the single encoding boundary for every State
+// producer: it leaves finite wire bytes bit-for-bit identical to raw Encode,
+// never mutates the caller's State, replaces every non-finite field per
+// ReplaceNonFinite so Decode always succeeds where raw Encode would either
+// return 0 or emit undecodable bytes, and still returns 0 cleanly on
+// structural errors (including out-of-range device counts without OOB access).
+// REQ-SAFE-22, REQ-CONTRACT-32
+TEST(Messages,
+     EncodeSanitizedStateSanitizesEveryNonFiniteFieldAndPreservesFiniteBytes) {
+  State base;
+  base.config_id = 0x1122334455667788ull;
+  base.boot_id = 42;
+  base.epoch = 3;
+  base.sample_time_us = 123456;
+  base.motor_count = 2;
+  base.motors[0] = {1, true, 1.5, -2.5, 6.0, 12.5, 100, 200, 7, 35.5, 4.5};
+  base.motors[1] = {2, true, 3.0, 4.0, 5.0, 8.0, 50, 60, 0, 28.0, 3.0};
+  base.sensor_count = 2;
+  base.sensors[0] = {10, true, 0.25, -0.75, 150, 250};
+  base.sensors[1] = {11, true, -0.125, 1.25, 10, 20};
+  base.analog_input_count = 1;
+  base.analog_inputs[0] = {20, true, 3.3, 300};
+  base.encoder_count = 1;
+  base.encoders[0] = {30, true, 2.25, -1.5, 400};
+  base.pwm_output_count = 1;
+  base.pwm_outputs[0] = {40, true, 0.5};
+  base.health = {.valid = true,
+                 .battery_v = 12.4,
+                 .brownout = true,
+                 .can_bus_count = 1,
+                 .can_bus_index = 0,
+                 .can_bus = {CanBusReadState::kOk, 0.25F, 5, 6, 7, 8, 9}};
+
+  std::array<uint8_t, kMaxStateSize> raw_bytes{};
+  std::array<uint8_t, kMaxStateSize> sanitized_bytes{};
+  const std::size_t raw_size = Encode(base, raw_bytes);
+  const std::size_t sanitized_size =
+      EncodeSanitizedState(base, sanitized_bytes);
+  ASSERT_GT(raw_size, 0u);
+  EXPECT_EQ(sanitized_size, raw_size);
+  EXPECT_EQ(sanitized_bytes, raw_bytes);
+
+  const double kNonFinite[] = {
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+  };
+
+  struct Case {
+    const char* name;
+    void (*inject)(State&, double);
+    void (*verify)(const State&);
+  };
+  const Case cases[] = {
+      {"motor.position_rot",
+       [](State& s, double v) { s.motors[0].position_rot = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].position_rot, 0.0);
+         EXPECT_EQ(d.motors[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.motors[0].voltage, 0.0);
+         EXPECT_EQ(d.motors[0].stator_current_a, 0.0);
+         EXPECT_EQ(d.motors[0].supply_current_a, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].temperature_c, 35.5);
+         EXPECT_EQ(d.motors[0].fault_flags, 7u);
+         EXPECT_TRUE(d.motors[1].valid);
+         EXPECT_DOUBLE_EQ(d.motors[1].position_rot, 3.0);
+       }},
+      {"motor.velocity_rps",
+       [](State& s, double v) { s.motors[0].velocity_rps = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].position_rot, 0.0);
+         EXPECT_EQ(d.motors[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.motors[0].voltage, 0.0);
+         EXPECT_TRUE(d.motors[1].valid);
+       }},
+      {"motor.voltage", [](State& s, double v) { s.motors[0].voltage = v; },
+       [](const State& d) {
+         EXPECT_TRUE(d.motors[0].valid);
+         EXPECT_DOUBLE_EQ(d.motors[0].position_rot, 1.5);
+         EXPECT_DOUBLE_EQ(d.motors[0].velocity_rps, -2.5);
+         EXPECT_EQ(d.motors[0].voltage, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].stator_current_a, 12.5);
+       }},
+      {"motor.stator_current_a",
+       [](State& s, double v) { s.motors[0].stator_current_a = v; },
+       [](const State& d) {
+         EXPECT_TRUE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].stator_current_a, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].supply_current_a, 4.5);
+       }},
+      {"motor.supply_current_a",
+       [](State& s, double v) { s.motors[0].supply_current_a = v; },
+       [](const State& d) {
+         EXPECT_TRUE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].supply_current_a, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].stator_current_a, 12.5);
+       }},
+      {"motor.temperature_c",
+       [](State& s, double v) { s.motors[0].temperature_c = v; },
+       [](const State& d) {
+         EXPECT_TRUE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].temperature_c, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].position_rot, 1.5);
+       }},
+      {"motor.position_rot+temperature_c",
+       [](State& s, double v) {
+         s.motors[0].position_rot = v;
+         s.motors[0].temperature_c = v;
+       },
+       [](const State& d) {
+         EXPECT_FALSE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].position_rot, 0.0);
+         EXPECT_EQ(d.motors[0].temperature_c, 0.0);
+       }},
+      {"sensor.position_rot",
+       [](State& s, double v) { s.sensors[0].position_rot = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.sensors[0].valid);
+         EXPECT_EQ(d.sensors[0].position_rot, 0.0);
+         EXPECT_EQ(d.sensors[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.sensors[0].position_age_us, 150u);
+         EXPECT_TRUE(d.sensors[1].valid);
+       }},
+      {"sensor.velocity_rps",
+       [](State& s, double v) { s.sensors[0].velocity_rps = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.sensors[0].valid);
+         EXPECT_EQ(d.sensors[0].position_rot, 0.0);
+         EXPECT_EQ(d.sensors[0].velocity_rps, 0.0);
+         EXPECT_TRUE(d.sensors[1].valid);
+       }},
+      {"analog_input.voltage",
+       [](State& s, double v) { s.analog_inputs[0].voltage = v; },
+       [](const State& d) {
+         EXPECT_EQ(d.analog_inputs[0].id, 20u);
+         EXPECT_FALSE(d.analog_inputs[0].valid);
+         EXPECT_EQ(d.analog_inputs[0].voltage, 0.0);
+         EXPECT_EQ(d.analog_inputs[0].age_us, 300u);
+       }},
+      {"encoder.position_rot",
+       [](State& s, double v) { s.encoders[0].position_rot = v; },
+       [](const State& d) {
+         EXPECT_EQ(d.encoders[0].id, 30u);
+         EXPECT_FALSE(d.encoders[0].valid);
+         EXPECT_EQ(d.encoders[0].position_rot, 0.0);
+         EXPECT_EQ(d.encoders[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.encoders[0].age_us, 400u);
+       }},
+      {"encoder.velocity_rps",
+       [](State& s, double v) { s.encoders[0].velocity_rps = v; },
+       [](const State& d) {
+         EXPECT_EQ(d.encoders[0].id, 30u);
+         EXPECT_FALSE(d.encoders[0].valid);
+         EXPECT_EQ(d.encoders[0].position_rot, 0.0);
+         EXPECT_EQ(d.encoders[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.encoders[0].age_us, 400u);
+       }},
+      {"pwm_output.output",
+       [](State& s, double v) { s.pwm_outputs[0].output = v; },
+       [](const State& d) {
+         EXPECT_EQ(d.pwm_outputs[0].id, 40u);
+         EXPECT_FALSE(d.pwm_outputs[0].valid);
+         EXPECT_EQ(d.pwm_outputs[0].output, 0.0);
+       }},
+      {"health.battery_v", [](State& s, double v) { s.health.battery_v = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.health.valid);
+         EXPECT_EQ(d.health.battery_v, 0.0);
+         EXPECT_TRUE(d.health.brownout);
+         EXPECT_EQ(d.health.can_bus.read_state, CanBusReadState::kOk);
+       }},
+      {"health.can_bus.utilization_frac (kOk)",
+       [](State& s, double v) {
+         s.health.can_bus.read_state = CanBusReadState::kOk;
+         s.health.can_bus.utilization_frac = static_cast<float>(v);
+       },
+       [](const State& d) {
+         EXPECT_EQ(d.health.can_bus.utilization_frac, 0.0F);
+         EXPECT_EQ(d.health.can_bus.read_state, CanBusReadState::kFailed);
+         EXPECT_EQ(d.health.can_bus.bus_off_count, 5u);
+       }},
+      {"health.can_bus.utilization_frac (kPending)",
+       [](State& s, double v) {
+         s.health.can_bus.read_state = CanBusReadState::kPending;
+         s.health.can_bus.utilization_frac = static_cast<float>(v);
+       },
+       [](const State& d) {
+         EXPECT_EQ(d.health.can_bus.utilization_frac, 0.0F);
+         EXPECT_EQ(d.health.can_bus.read_state, CanBusReadState::kFailed);
+       }},
+      {"health.can_bus.utilization_frac (kStale preserved)",
+       [](State& s, double v) {
+         s.health.can_bus.read_state = CanBusReadState::kStale;
+         s.health.can_bus.utilization_frac = static_cast<float>(v);
+       },
+       [](const State& d) {
+         EXPECT_EQ(d.health.can_bus.utilization_frac, 0.0F);
+         EXPECT_EQ(d.health.can_bus.read_state, CanBusReadState::kStale);
+       }},
+  };
+
+  for (const auto& c : cases) {
+    for (const double bad_value : kNonFinite) {
+      SCOPED_TRACE(c.name);
+      State dirty = base;
+      c.inject(dirty, bad_value);
+
+      // Raw Encode either refuses the State (tenths) or emits bytes Decode
+      // rejects: skipping sanitization cannot pass silently.
+      std::array<uint8_t, kMaxStateSize> raw{};
+      const std::size_t raw_written = Encode(dirty, raw);
+      State raw_decoded{};
+      EXPECT_FALSE(raw_written > 0 &&
+                   Decode(std::span{raw}.first(raw_written), raw_decoded));
+
+      std::array<uint8_t, kMaxStateSize> clean{};
+      const std::size_t clean_written = EncodeSanitizedState(dirty, clean);
+      ASSERT_EQ(clean_written, raw_size);
+      // Caller's State still holds its injected non-finite field.
+      EXPECT_FALSE(AllFinite(dirty));
+
+      State decoded{};
+      ASSERT_TRUE(Decode(std::span{clean}.first(clean_written), decoded));
+      EXPECT_TRUE(AllFinite(decoded));
+      c.verify(decoded);
+    }
+  }
+
+  // Structural errors still return 0 cleanly without out-of-bounds access.
+  using Mutator = void (*)(State&);
+  const Mutator mutators[] = {
+      [](State& s) { s.motor_count = kMaxMotors + 1; },
+      [](State& s) { s.sensor_count = kMaxSensors + 1; },
+      [](State& s) { s.analog_input_count = kMaxAnalogInputs + 1; },
+      [](State& s) { s.encoder_count = kMaxEncoders + 1; },
+      [](State& s) { s.pwm_output_count = kMaxPwmOutputs + 1; },
+      [](State& s) {
+        s.build.program = static_cast<GatewayProgram>(
+            static_cast<uint8_t>(kLastGatewayProgram) + 1);
+      },
+      [](State& s) { s.health.can_bus_index = 1; },
+  };
+  for (const Mutator mutate : mutators) {
+    State bad = base;
+    mutate(bad);
+    EXPECT_EQ(EncodeSanitizedState(bad, sanitized_bytes), 0u);
+  }
+  EXPECT_EQ(EncodeSanitizedState(
+                base, std::span{sanitized_bytes}.first(raw_size - 1)),
+            0u);
+}
+
+// Endpoint::Tick routes through EncodeSanitizedState, and Gateway::snapshot()
+// enforces ReplaceNonFinite even while unconfigured: non-finite HAL-like
+// readings (battery voltage, analog input, PWM output, motor effort, CAN bus
+// utilization) never cause Endpoint::Tick to fail with kInvalidArgument and
+// always yield a decodable State with expected validity cleared and 0
+// substituted.
+// REQ-SAFE-22, REQ-CONTRACT-32
+TEST(Gateway, EndpointEncodesNonFiniteHalReadingsAsValidDecodableState) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  auto config = SwerveConfig(true);
+  config.analog_inputs = {{22, "pressure", 2}};
+  config.pwm_outputs = {{25, "servo", 5}};
+  NonFiniteBackend backend;
+  backend.measurement = 0.5;
+  backend.overwrite = [&](State& s) {
+    s.health.valid = true;
+    s.health.battery_v = kNaN;
+    s.health.can_bus = {
+        .read_state = CanBusReadState::kOk,
+        .utilization_frac = std::numeric_limits<float>::quiet_NaN(),
+        .bus_off_count = 2};
+    s.analog_inputs[0] = {22, true, kInf, 77};
+    s.pwm_outputs[0] = {25, true, -kInf};
+    s.motors[0].stator_current_a = kNaN;
+    s.motors[0].temperature_c = kInf;
+  };
+  Gateway gateway{config, backend, 7};
+  Endpoint endpoint{gateway};
+  endpoint.SetSendEnabled(false);
+
+  EXPECT_EQ(endpoint.Tick(1000, true), protocol::UdpStatus::kOk);
+  const State snap = gateway.snapshot();
+  EXPECT_TRUE(AllFinite(snap));
+  std::array<uint8_t, kMaxStateSize> bytes{};
+  const std::size_t size = EncodeSanitizedState(snap, bytes);
+  ASSERT_GT(size, 0u);
+  State decoded{};
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_FALSE(decoded.health.valid);
+  EXPECT_EQ(decoded.health.battery_v, 0.0);
+  EXPECT_EQ(decoded.health.can_bus.read_state, CanBusReadState::kFailed);
+  EXPECT_EQ(decoded.health.can_bus.utilization_frac, 0.0F);
+  EXPECT_EQ(decoded.health.can_bus.bus_off_count, 2u);
+  EXPECT_FALSE(decoded.analog_inputs[0].valid);
+  EXPECT_EQ(decoded.analog_inputs[0].voltage, 0.0);
+  EXPECT_EQ(decoded.analog_inputs[0].age_us, 77u);
+  EXPECT_FALSE(decoded.pwm_outputs[0].valid);
+  EXPECT_EQ(decoded.pwm_outputs[0].output, 0.0);
+  EXPECT_TRUE(decoded.motors[0].valid);
+  EXPECT_EQ(decoded.motors[0].stator_current_a, 0.0);
+  EXPECT_EQ(decoded.motors[0].temperature_c, 0.0);
 }
 
 // The bench's CAN silences froze the feedback of its one Talon FX for

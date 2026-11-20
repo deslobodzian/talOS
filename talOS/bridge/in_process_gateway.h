@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "talOS/bridge/node.h"
+#include "talOS/hardware/gateway.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/protocol/frame.h"
@@ -62,7 +63,8 @@ class InProcessGateway {
   // decode).
   bool Deliver(const State& state, uint64_t now_us) {
     Packet packet{};
-    packet.size = static_cast<uint32_t>(Encode(state, packet.data));
+    packet.size =
+        static_cast<uint32_t>(EncodeSanitizedState(state, packet.data));
     const uint64_t before = node_.states_received();
     Receive(protocol::FrameType::kHardwareState, now_us,
             std::span<const uint8_t>{packet.data.data(), packet.size});

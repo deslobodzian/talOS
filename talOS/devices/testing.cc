@@ -609,8 +609,8 @@ struct SimHardware::Impl {
       return;
     }
     Packet packet{};
-    packet.size =
-        static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
+    packet.size = static_cast<std::uint32_t>(
+        hardware::EncodeSanitizedState(state, packet.data));
     sim.publish(hardware::kStateTopic, packet);
     ++states_sent;
     if (ds_packet) PublishDriverStation(*ds_packet);
