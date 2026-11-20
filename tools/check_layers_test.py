@@ -993,6 +993,15 @@ class CheckNodeSourcesTest(unittest.TestCase):
             ("conlyopts_isystem",
              'cc_library(name = "arm", srcs = ["arm.cc"], '
              'conlyopts = ["-isystem", "talOS"])\n'),
+            ("copts_cxx_isystem_adjacent",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-cxx-isystem", "talOS"])\n'),
+            ("copts_cxx_isystem_equals",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-cxx-isystem=talOS"])\n'),
+            ("copts_fms_extensions",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-fms-extensions"])\n'),
         ]
         for name, build in cases:
             with self.subTest(name=name):
@@ -1031,6 +1040,10 @@ class CheckNodeSourcesTest(unittest.TestCase):
             ("readme_basename", '#include "other/README"\n'),
             ("include_next_toml", '#include_next "bypass.toml"\n'),
             ("digraph_json", '%:include "bypass.json"\n'),
+            ("import_forbidden_publisher", '#import "talOS/ipc/publisher.h"\n'),
+            ("import_forbidden_access", '#import <talOS/node/access.h>\n'),
+            ("digraph_import_access", '%:import "talOS/node/access.h"\n'),
+            ("import_non_cpp_md", '#import "secret.md"\n'),
         ]
         for name, body in cases:
             with self.subTest(name=name):
