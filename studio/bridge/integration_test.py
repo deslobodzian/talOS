@@ -618,6 +618,80 @@ class BridgeIntegration(unittest.TestCase):
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
 
+    # REQ-OPS-34, REQ-OPS-35, REQ-OPS-36, TODO.md DEPLOY-12
+    def test_refusal_file_serves_drive_summary_layout_and_ws_without_config(self):
+        """With --refusal-file, the bridge binds port 0, serves /drive,
+        a minimal /drive/layout.json, /drive/summary.json, and ws /drive with
+        launch_refused + refusal_reason (plus heartbeats), and fails fast if
+        the requested port is already held."""
+        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
+        bridge_bin = str(workspace / "studio/bridge/studio_bridge")
+        with tempfile.TemporaryDirectory() as tmp:
+            webroot = Path(tmp, "webroot")
+            webroot.mkdir()
+            (webroot / "drive.html").write_text("<html>drive</html>")
+            refusal_path = Path(tmp, "last_refusal.json")
+            refusal_path.write_text(json.dumps({
+                "refused": True,
+                "reason": "error: motor_py: unread parameter key unread.value_m",
+                "config_path": "/opt/talos/current/robot.toml",
+                "wall_ns": 123456789,
+            }))
+            bridge = subprocess.Popen(
+                [bridge_bin, "/talos/telemetry", "0", str(webroot),
+                 "--refusal-file", str(refusal_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            processes = [bridge]
+            try:
+                port = bound_port(bridge)
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/drive", timeout=3) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertIn(b"drive", resp.read())
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/drive/layout.json", timeout=3) as resp:
+                    layout = json.loads(resp.read())
+                    self.assertEqual(layout["columns"], 1)
+                    self.assertEqual(layout["rows"], 1)
+                    self.assertEqual(layout["widgets"], [])
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/drive/summary.json", timeout=3) as resp:
+                    summary = json.loads(resp.read())
+                    self.assertEqual(summary["kind"], "talos.drive.summary")
+                    self.assertTrue(summary["launch_refused"])
+                    self.assertIn("unread.value_m", summary["refusal_reason"])
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as ws:
+                    self.assertIn(b"101 Switching Protocols", upgrade(ws, "/drive"))
+                    ws.settimeout(3)
+                    got_summary = None
+                    got_heartbeat = False
+                    for _ in range(10):
+                        opcode, payload = any_frame(ws)
+                        self.assertEqual(opcode, TEXT)
+                        doc = json.loads(payload)
+                        if doc["kind"] == "talos.drive.summary":
+                            got_summary = doc
+                        elif doc["kind"] == "talos.drive.heartbeat":
+                            got_heartbeat = True
+                        if got_summary and got_heartbeat:
+                            break
+                    self.assertIsNotNone(got_summary)
+                    self.assertTrue(got_summary["launch_refused"])
+                    self.assertIn("unread.value_m", got_summary["refusal_reason"])
+                    self.assertTrue(got_heartbeat)
+
+                # A second refusal bridge on the same port fails immediately.
+                conflict = subprocess.run(
+                    [bridge_bin, "/talos/telemetry", str(port), str(webroot),
+                     "--refusal-file", str(refusal_path)],
+                    capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(conflict.returncode, 0)
+                self.assertNotIn("listening", conflict.stdout)
+            finally:
+                stop(processes)
+                for process in processes:
+                    self.assertEqual(process.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

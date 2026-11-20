@@ -891,7 +891,7 @@ StartLimitIntervalSec=0
 Type=notify
 User=$user
 Environment=\"TALOS_LOG_DIR=$PREFIX/logs\"
-ExecStart=$PREFIX/current/run.sh
+ExecStart=$PREFIX/current/run.sh --serve-refusal
 TimeoutStartSec=1200
 KillMode=mixed
 TimeoutStopSec=90
@@ -925,6 +925,7 @@ WantedBy=multi-user.target
   <key>ProgramArguments</key>
   <array>
     <string>$PREFIX/current/run.sh</string>
+    <string>--serve-refusal</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

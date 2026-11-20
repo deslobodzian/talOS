@@ -159,6 +159,7 @@ struct Bridge {
   std::string manifest_path;
   std::vector<talos::introspect::NodeSnapshot> registry_nodes;
   bool registry_read = false;  // the last refresh could open the registry
+  bool refusal_mode = false;   // --refusal-file: serving a phase-1 refusal
   std::string drive_summary;
   std::uint64_t evicted = 0;
   // Returns from the event loop's wait (every one, whatever woke it), and of
@@ -552,6 +553,13 @@ struct Bridge {
   // reservation pauses notices past Studio's staleness threshold
   // (docs/DATA_FLOW.md).
   void service(std::int64_t now_ns) {
+    if (refusal_mode) {
+      schedule.BeginPass();
+      pass_clients();
+      ++loop_passes;
+      report_registration();
+      return;
+    }
     if (wake) wake->drain();
     watch(now_ns);
     schedule.BeginPass();
@@ -584,6 +592,14 @@ struct Bridge {
   // When the loop must next run with no socket event or publication
   // (studio::WakeSchedule::NextWakeNs).
   std::int64_t next_wake_ns(std::int64_t now_ns) const {
+    if (refusal_mode) {
+      std::int64_t due = now_ns + 1'000'000'000;
+      for (Socket* client : drive_clients.clients()) {
+        const std::int64_t next = client->getUserData()->drive_feed.NextDueNs();
+        if (next < due) due = next;
+      }
+      return std::max(due, now_ns + 1'000'000);
+    }
     return schedule.NextWakeNs(now_ns, !wake || backlog, system_graph,
                                [this](const auto& visit) {
                                  visit(shared_reservation);
@@ -746,6 +762,8 @@ int main(int argc, char** argv) try {
   std::string declared_path;
   std::string manifest_path;
   std::string config_path;
+  std::string refusal_file;
+  std::string refusal_reason;
   std::uint64_t session_id = 0;
   bool bad_session_id = false;
   unsigned idle_timeout_s = kIdleTimeoutS;
@@ -762,8 +780,30 @@ int main(int argc, char** argv) try {
     static constexpr std::string_view kDeclared = "--declared";
     static constexpr std::string_view kManifest = "--manifest";
     static constexpr std::string_view kSessionId = "--session-id";
+    static constexpr std::string_view kRefusalFile = "--refusal-file";
+    static constexpr std::string_view kRefusalReason = "--refusal-reason";
     if (argument == "--config" && i + 1 < argc) {
       config_path = argv[++i];
+      continue;
+    }
+    if (argument == kRefusalFile && i + 1 < argc) {
+      refusal_file = argv[++i];
+      continue;
+    }
+    if (argument.starts_with(kRefusalFile) &&
+        argument.size() > kRefusalFile.size() &&
+        argument[kRefusalFile.size()] == '=') {
+      refusal_file = argument.substr(kRefusalFile.size() + 1);
+      continue;
+    }
+    if (argument == kRefusalReason && i + 1 < argc) {
+      refusal_reason = argv[++i];
+      continue;
+    }
+    if (argument.starts_with(kRefusalReason) &&
+        argument.size() > kRefusalReason.size() &&
+        argument[kRefusalReason.size()] == '=') {
+      refusal_reason = argument.substr(kRefusalReason.size() + 1);
       continue;
     }
     if (argument == kSessionId && i + 1 < argc) {
@@ -825,6 +865,8 @@ int main(int argc, char** argv) try {
            "/manifest.json\n"
            "       [--config PATH]     reads [studio] max_clients and "
            "dashboard\n"
+           "       [--refusal-file PATH]  serve a launcher phase-1 refusal on "
+           "/drive\n"
            "       [--idle-timeout-s S]  client idle timeout, 8 to 960 "
            "(default 16)\n"
            "       [--describe]          print the --describe envelope and "
@@ -889,58 +931,79 @@ int main(int argc, char** argv) try {
   Bridge bridge;
   bridge.topic = topic;
   bridge.session_id = session_id;
-  // Watched by segment name, not by topic. A topic like /talos/telemetry has
-  // an interior slash, which POSIX does not allow in an shm name, so RTMS maps
-  // it (`ShmObjectName`) before touching the OS. The bridge attaches only
-  // once the segment exists: an empty ring of its own would wait for a
-  // publisher that might disagree with its layout.
-  bridge.segment = ShmObjectName(topic);
-  try {
-    bridge.wake.emplace();
-  } catch (const std::exception& e) {
-    std::cerr << "no wake channel (" << e.what()
-              << "); reading the topic every 1 ms\n";
+  bridge.refusal_mode = !refusal_file.empty() || !refusal_reason.empty();
+  if (!bridge.refusal_mode) {
+    // Watched by segment name, not by topic. A topic like /talos/telemetry has
+    // an interior slash, which POSIX does not allow in an shm name, so RTMS
+    // maps it (`ShmObjectName`) before touching the OS. The bridge attaches
+    // only once the segment exists: an empty ring of its own would wait for a
+    // publisher that might disagree with its layout.
+    bridge.segment = ShmObjectName(topic);
+    try {
+      bridge.wake.emplace();
+    } catch (const std::exception& e) {
+      std::cerr << "no wake channel (" << e.what()
+                << "); reading the topic every 1 ms\n";
+    }
   }
   if (!config_path.empty()) {
-    const auto robot = talos::config::ParseRobotConfig(config_path);
-    bridge.max_clients = robot.studio.max_clients;
-    // A layout that does not parse disables only the driver dashboard
-    // (/drive answers 404, nothing is reserved): Studio stays up, and the
-    // telemetry node refuses the same layout by name.
-    if (!robot.studio.dashboard.empty()) {
-      try {
-        bridge.layout =
-            talos::telemetry::ParseDashboardLayout(robot.studio.dashboard);
-      } catch (const std::exception& e) {
-        std::cerr << "driver dashboard disabled: " << e.what() << '\n';
+    try {
+      const auto robot = talos::config::ParseRobotConfig(config_path);
+      bridge.max_clients = robot.studio.max_clients;
+      // A layout that does not parse disables only the driver dashboard
+      // (/drive answers 404, nothing is reserved): Studio stays up, and the
+      // telemetry node refuses the same layout by name.
+      if (!robot.studio.dashboard.empty()) {
+        try {
+          bridge.layout =
+              talos::telemetry::ParseDashboardLayout(robot.studio.dashboard);
+        } catch (const std::exception& e) {
+          std::cerr << "driver dashboard disabled: " << e.what() << '\n';
+        }
       }
-    }
-    // The nodes the config launches: the hardware bridge, then each
-    // subsystem with a `node`, critical unless it says otherwise. The drive
-    // summary lists them only when there is no manifest, whose roster is
-    // the launcher's own; otherwise it takes only `critical` from here.
-    bridge.config_roster.push_back(
-        {std::string{talos::introspect::naming::kHardwareBridgeNode}, true});
-    if (const auto* subsystems = robot.toml_data["subsystems"].as_table()) {
-      bridge.config_roster.reserve(subsystems->size() + 1);
-      for (auto&& [key, value] : *subsystems) {
-        const auto* table = value.as_table();
-        if (table == nullptr || !table->contains("node")) continue;
-        bridge.config_roster.push_back(
-            {std::string{key.str()}, (*table)["critical"].value_or(true)});
+      // The nodes the config launches: the hardware bridge, then each
+      // subsystem with a `node`, critical unless it says otherwise. The drive
+      // summary lists them only when there is no manifest, whose roster is
+      // the launcher's own; otherwise it takes only `critical` from here.
+      bridge.config_roster.push_back(
+          {std::string{talos::introspect::naming::kHardwareBridgeNode}, true});
+      if (const auto* subsystems = robot.toml_data["subsystems"].as_table()) {
+        bridge.config_roster.reserve(subsystems->size() + 1);
+        for (auto&& [key, value] : *subsystems) {
+          const auto* table = value.as_table();
+          if (table == nullptr || !table->contains("node")) continue;
+          bridge.config_roster.push_back(
+              {std::string{key.str()}, (*table)["critical"].value_or(true)});
+        }
       }
+    } catch (const std::exception& e) {
+      if (!bridge.refusal_mode) throw;
+      std::cerr << "refusal mode: ignoring unparseable config " << config_path
+                << " (" << e.what() << ")\n";
     }
   }
   bridge.manifest_path = manifest_path;
+  if (bridge.refusal_mode) {
+    bridge.drive_summary =
+        studio::DriveSummaryJson(studio::BuildRefusalDriveSummary(
+            ReadManifest(refusal_file), refusal_reason));
+  }
+  const std::uint32_t drive_slot_count = bridge.layout
+                                             ? bridge.layout->drive_clients
+                                             : (bridge.refusal_mode ? 4u : 0u);
+  const std::uint32_t drive_budget = bridge.layout
+                                         ? bridge.layout->budget_bytes_per_s
+                                         : (bridge.refusal_mode ? 24000u : 0u);
   bridge.egress = studio::BridgeEgress(studio::EgressPlan::Of(
-      bridge.max_clients, bridge.layout ? bridge.layout->drive_clients : 0,
-      bridge.layout ? bridge.layout->budget_bytes_per_s : 0));
+      bridge.max_clients, drive_slot_count, drive_budget));
   if (bridge.layout) {
     bridge.layout_json = talos::telemetry::DashboardLayoutJson(*bridge.layout);
     bridge.drive_mask =
         studio::DriveMask(talos::telemetry::DriveFeedChannels(*bridge.layout));
-    bridge.drive_clients =
-        studio::DriveSlots<Socket*>(bridge.layout->drive_clients);
+    bridge.drive_clients = studio::DriveSlots<Socket*>(drive_slot_count);
+  } else if (bridge.refusal_mode) {
+    bridge.layout_json = std::string{studio::kRefusalDriveLayoutJson};
+    bridge.drive_clients = studio::DriveSlots<Socket*>(drive_slot_count);
   }
   uWS::App app;
   uWS::App::WebSocketBehavior<Client> behavior{};
@@ -1001,7 +1064,7 @@ int main(int argc, char** argv) try {
   drive_behavior.idleTimeout = behavior.idleTimeout;
   drive_behavior.sendPingsAutomatically = true;
   drive_behavior.upgrade = [&](auto* response, auto* request, auto* context) {
-    if (!bridge.layout) {
+    if (!bridge.layout && !bridge.refusal_mode) {
       response->writeStatus("404 Not Found")->end();
       return;
     }
@@ -1011,8 +1074,9 @@ int main(int argc, char** argv) try {
         request->getHeader("sec-websocket-extensions"), context);
   };
   drive_behavior.open = [&](auto* ws) {
-    if (!bridge.layout) return;  // the upgrade refuses /drive without one
-    ws->getUserData()->drive_feed.Configure(bridge.layout->update_hz);
+    if (!bridge.layout && !bridge.refusal_mode) return;
+    ws->getUserData()->drive_feed.Configure(
+        bridge.layout ? bridge.layout->update_hz : 5);
     // It takes the bucket of the slot it fills, so a reconnect never
     // starts from a fresh burst (studio::DriveSlots).
     if (const auto oldest = bridge.drive_clients.Admit(ws).evicted) {
@@ -1032,7 +1096,7 @@ int main(int argc, char** argv) try {
     // The dictionary, a keyframe of the layout's channels and the summary
     // at once, the summary from the registry as it is now (the refresh
     // rebuilds it while a drive client is held).
-    bridge.refresh_system();
+    if (!bridge.refusal_mode) bridge.refresh_system();
     bridge.pass_clients();
   };
   drive_behavior.drain = [&](auto* ws) { bridge.drained(ws); };
@@ -1042,7 +1106,7 @@ int main(int argc, char** argv) try {
   app.ws<Client>("/telemetry", std::move(behavior));
   app.ws<Client>("/drive", std::move(drive_behavior));
   app.get("/drive/layout.json", [&](auto* res, auto*) {
-    if (!bridge.layout) {
+    if (!bridge.layout && !bridge.refusal_mode) {
       res->writeStatus("404 Not Found")->end();
       return;
     }
@@ -1050,6 +1114,17 @@ int main(int argc, char** argv) try {
         ->writeHeader("X-Content-Type-Options", "nosniff")
         ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(bridge.layout_json);
+  });
+  app.get("/drive/summary.json", [&](auto* res, auto*) {
+    if (!bridge.layout && !bridge.refusal_mode) {
+      res->writeStatus("404 Not Found")->end();
+      return;
+    }
+    if (!bridge.refusal_mode) bridge.refresh_drive_summary();
+    res->writeHeader("Content-Type", "application/json")
+        ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
+        ->end(bridge.drive_summary);
   });
   app.get("/telemetry.json", [&](auto* res, auto*) {
     // 503 until a dictionary and an aligned frame have both arrived: an

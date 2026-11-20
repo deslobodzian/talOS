@@ -104,11 +104,12 @@ html, body {
 .status.link-ok b { color: var(--good); }
 .status.link-connecting b { color: var(--info); }
 .status.link-bridge, .status.link-telemetry, .status.link-hardware, .status.link-roborio,
-.status.link-replaced, .status.link-error {
+.status.link-replaced, .status.link-error, .status.link-refused {
   border-color: var(--bad);
 }
 .status.link-bridge b, .status.link-telemetry b, .status.link-hardware b,
-.status.link-roborio b, .status.link-replaced b, .status.link-error b { color: var(--bad); }
+.status.link-roborio b, .status.link-replaced b, .status.link-error b,
+.status.link-refused b { color: var(--bad); }
 .status .meta.bad { color: var(--bad); }
 
 .status button {
@@ -307,4 +308,29 @@ ul { list-style: none; margin: 0; padding: 0; }
   border: 2px dashed var(--bad);
   padding: 6px;
   margin: 4px 0 0;
+}
+
+.refusal-banner {
+  border: 3px solid var(--bad);
+  padding: 16px 20px;
+}
+.refusal-banner .body {
+  gap: 12px;
+  overflow-y: auto;
+  padding-top: 8px;
+}
+.refusal-reason {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: 600 18px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.refusal-hint {
+  margin: 0;
+  color: var(--muted);
 }

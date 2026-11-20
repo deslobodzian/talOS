@@ -8,7 +8,7 @@ import './drive.css';
 
 import {DriveModel, type DriveSocket, RECONNECT_MS, RENDER_MS} from './feed';
 import {type Layout, parseLayout} from './layout';
-import {DrawSchedule, esc, METRICS, outOfView, outOfViewText, Painter, renderShell, renderStatus, renderWidget, type Surface} from './view';
+import {DrawSchedule, esc, METRICS, outOfView, outOfViewText, Painter, renderGridWidgets, renderShell, renderStatus, type Surface} from './view';
 
 const root = document.getElementById('drive')!;
 const now = () => performance.now();
@@ -118,7 +118,7 @@ async function run() {
           model.tick(t);
           return renderStatus(model, t, layout.skipped);
         },
-        () => layout.widgets.map(w => renderWidget(w, model, t)));
+        () => renderGridWidgets(layout, model, t));
     countOutOfView();
   }, {
     now,

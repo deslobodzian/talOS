@@ -64,6 +64,12 @@ struct LauncherOptions {
   // the robot config).
   bool start_studio_bridge{false};
 
+  // On a phase-1 refusal (when not --describe-only), if start_studio_bridge is
+  // also set, keep the Studio bridge running in refusal mode so /drive shows
+  // LAUNCH REFUSED with the reason instead of BRIDGE LINK, until a stop signal
+  // (or duration_s > 0) arrives or the bridge exits, then still return 1.
+  bool serve_refusal{false};
+
   // Controller addressing. Empty/zero means "take it from [robot]".
   std::string remote;
   uint16_t remote_port{0};

@@ -269,12 +269,28 @@ the bridge runs on without it. The code is [`drive.h`](drive.h).
 **Endpoints**, on the same port as Studio:
 
 - `GET /drive` without a WebSocket upgrade: `drive.html` from the web
-  directory (404 when it has none).
+  directory (503 with build/install instructions when it has none).
 - `GET /drive/layout.json`: the layout as `DashboardLayoutJson` writes it
   (shape in the telemetry README's `/drive/layout.json`). 404 without a
-  layout.
+  layout; in refusal mode (`--refusal-file`), serves a minimal valid layout
+  so `/drive` renders immediately without a robot config.
+- `GET /drive/summary.json`: the latest `talos.drive.summary` JSON (404
+  without a layout or refusal mode).
 - `ws://<host>:<port>/drive`: the feed. The upgrade answers 404 without a
-  layout and is otherwise always accepted: never 503.
+  layout (unless `--refusal-file` is set) and is otherwise always accepted:
+  never 503.
+
+**Refusal mode (`--refusal-file PATH`).** Started by the launcher under
+`--serve-refusal --start-studio-bridge` when phase 1 refuses a launch
+([launcher README](../../talOS/launcher/README.md#refusal-visibility---serve-refusal)).
+The bridge reads `PATH` (`last_refusal.json`), opens no shared memory or
+registry, serves `drive.html`, a minimal `/drive/layout.json`,
+`/drive/summary.json`, and `ws://<host>:<port>/drive` with a
+`talos.drive.summary` carrying `"launch_refused": true` and `"refusal_reason"`,
+plus the 100 ms `talos.drive.heartbeat` so `/drive` renders **LAUNCH REFUSED**
+rather than **BRIDGE LINK**. Port bind remains exclusive
+(`LIBUS_LISTEN_EXCLUSIVE_PORT`), so an already-running session holding port
+5800 causes the refusal bridge to exit nonzero immediately.
 
 **Slots.** At most the layout's `drive_clients` feed connections are held.
 They are not counted against `[studio] max_clients`, so programmer clients
@@ -402,6 +418,8 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   | `nodes[].quarantined` | bool | the manifest's `quarantined` for the node |
   | `nodes[].drives` | string or null | the target lane source (`teleop`, `auto`, ...) its first `Target` with a selection last selected; null when it is not alive, reads no target, or its `Target::get()` was last null |
   | `omitted` | number | nodes left off the end of `nodes` to keep the message within 4,096 bytes; normally 0 |
+  | `launch_refused` | bool (optional) | present and `true` only in refusal mode (`--refusal-file`), when the launcher refused phase 1 |
+  | `refusal_reason` | string (optional) | present with `launch_refused: true`: the launcher's refusal reason, truncated if needed to keep the message within 4,096 bytes |
 
 So a feed client hears something at least every 100 ms (plus the moments
 its bucket needs for a 36 B heartbeat) while the bridge runs and its socket
