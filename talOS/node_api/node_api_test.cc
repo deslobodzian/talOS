@@ -417,6 +417,35 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   EXPECT_EQ(wheel.valid, 1);
   EXPECT_DOUBLE_EQ(wheel.position, 3.0);
   EXPECT_DOUBLE_EQ(wheel.velocity, 1.5);
+  EXPECT_EQ(wheel.forward_limit, 0);
+  EXPECT_EQ(wheel.reverse_limit, 0);
+
+  ASSERT_EQ(talos_sim_hardware_set_limit_switches(hw, "roller", "wheel", 1, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &wheel), TALOS_OK);
+  EXPECT_EQ(wheel.forward_limit, 1);
+  EXPECT_EQ(wheel.reverse_limit, 0);
+
+  ASSERT_EQ(talos_sim_hardware_set_limit_switches(hw, "roller", "wheel", 0, 1),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &wheel), TALOS_OK);
+  EXPECT_EQ(wheel.forward_limit, 0);
+  EXPECT_EQ(wheel.reverse_limit, 1);
+
+  ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &wheel), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 0);
+  EXPECT_EQ(wheel.forward_limit, 0);
+  EXPECT_EQ(wheel.reverse_limit, 0);
+
+  ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 1),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_limit_switches(hw, "roller", "wheel", 0, 0),
+            TALOS_OK);
 
   ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
   ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
