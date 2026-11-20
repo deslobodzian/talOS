@@ -10,15 +10,20 @@ import {test} from 'node:test';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
+import {AlertLevel} from '../src/data/alerts';
 import {readingClock, sampleStale} from '../src/data/freshness';
 import {useChannelStale, useChassis, usePlayback} from '../src/data/hooks';
 import {
+  alertMarks,
   bucketSeries,
-  POINT_SIZES,
-  quantizePoints,
-  RecordedSource,
+  EMPTY_TIMELINE,
   GAP_MIN_WIDTH,
   gapBands,
+  POINT_SIZES,
+  quantizePoints,
+  recordedModeLanes,
+  RecordedSource,
+  restartMarks,
   SERIES_SLOTS,
   type ReviewClock
 } from '../src/data/recorded';
@@ -26,16 +31,22 @@ import {
   decodeSeries,
   detectReviewServer,
   parseBounds,
+  parseTimeline,
   ReviewError,
-  type ReviewGap,
   type FetchLike,
-  type ReviewBounds
+  type ReviewBounds,
+  type ReviewGap,
+  type ReviewTimeline
 } from '../src/data/review';
 import {createStaticStudio, StudioProvider} from '../src/data/studio';
 import type {ChannelInfo} from '../src/data/types';
+import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
+import {eventsPanel} from '../src/panels/events';
+import {healthPanel} from '../src/panels/health';
 import {Header} from '../src/shell/Header';
 import {RecordedTransport} from '../src/shell/RecordedTransport';
 import {ReviewPicker} from '../src/shell/ReviewPicker';
+import {parseDeclaredGraph, parseSystemGraph} from '../src/system';
 
 const SERVER = 'http://review.test';
 const START = 1_000_000_000n;
@@ -442,6 +453,8 @@ test('an HTTP error or malformed payload is an error state, never a throw', asyn
   // Opening: a malformed bounds document rejects with what is wrong.
   const broken = fakeServer(url => url.pathname.endsWith('/bounds.json') ?
       json({start_ns: '5', end_ns: '1', origin_wall_ns: '0'}) :
+      url.pathname.endsWith('/timeline.json') ? json(EMPTY_TIMELINE) :
+      url.pathname.endsWith('/declared.json') ? new Response('', {status: 404}) :
       json({channels: []}));
   await assert.rejects(RecordedSource.open(SERVER, 's1', {fetch: broken.fetchFn}),
                        ReviewError);
@@ -525,7 +538,10 @@ test('a session whose hardware packets were not decoded says why in its status',
 
   const server = fakeServer(url => url.pathname.endsWith('/bounds.json') ?
       json(document) : url.pathname.endsWith('/channels.json') ?
-      json({channels: []}) : echoSnapshot(url));
+      json({channels: []}) : url.pathname.endsWith('/timeline.json') ?
+      json({...EMPTY_TIMELINE, hardware_not_decoded: true}) :
+      url.pathname.endsWith('/declared.json') ?
+      new Response('', {status: 404}) : echoSnapshot(url));
   const refused = await RecordedSource.open(SERVER, 's1', {fetch: server.fetchFn,
                                                            clock: fakeClock().clock});
   assert.equal(refused.playback.status, `Recorded session s1 · ${reason}`);
@@ -605,4 +621,257 @@ test('the recorded transport counts and draws log gaps', () => {
   assert.doesNotMatch(html(plain), /scrub-gap/);
   plain.close();
   gapped.close();
+});
+
+const SAMPLE_TIMELINE: ReviewTimeline = {
+  hardware_not_decoded: false,
+  modes: [
+    {start_ns: (START + 0n).toString(), end_ns: (START + 2_000_000_000n).toString(),
+     mode: 'disabled', fms: false},
+    {start_ns: (START + 2_000_000_000n).toString(), end_ns: (START + 5_000_000_000n).toString(),
+     mode: 'auto', fms: true},
+    {start_ns: (START + 5_000_000_000n).toString(), end_ns: (START + 8_000_000_000n).toString(),
+     mode: 'teleop', fms: true},
+    {start_ns: (START + 8_000_000_000n).toString(), end_ns: END.toString(),
+     mode: 'estop', fms: false}
+  ],
+  modes_dropped: 0,
+  alerts: [
+    {channel: 'hw/status/alert_error_link_lost', level: 'error',
+     start_ns: (START + 1_000_000_000n).toString(),
+     end_ns: (START + 3_000_000_000n).toString()},
+    {channel: 'hw/status/alert_error_link_lost', level: 'error',
+     start_ns: (START + 6_000_000_000n).toString(),
+     end_ns: END.toString()},
+    {channel: 'shooter/status/alert_warning_temp_high', level: 'warning',
+     start_ns: (START + 4_000_000_000n).toString(),
+     end_ns: (START + 5_000_000_000n).toString()}
+  ],
+  alerts_dropped: 0,
+  runs: [
+    {node: 'shooter', start_ns: START.toString(),
+     end_ns: (START + 6_000_000_000n).toString(), reason: 'crash'},
+    {node: 'shooter', start_ns: (START + 7_000_000_000n).toString(),
+     end_ns: null, reason: 'running'}
+  ],
+  runs_dropped: 0
+};
+
+// REQ-OPS-41, REQ-OPS-37, REQ-CONTRACT-29: RecordedSource.open fetches
+// timeline.json and declared.json (treating 404 on declared.json as null),
+// and parseTimeline rejects malformed payloads.
+test('RecordedSource.open loads timeline and optional declared graph', async () => {
+  const declaredJson = demoDeclaredGraph();
+  const makeServer = (declaredStatus: number) => fakeServer(url => {
+    if (url.pathname.endsWith('/channels.json')) return json({channels: []});
+    if (url.pathname.endsWith('/bounds.json')) return json(BOUNDS);
+    if (url.pathname.endsWith('/timeline.json')) return json(SAMPLE_TIMELINE);
+    if (url.pathname.endsWith('/declared.json')) {
+      return declaredStatus === 200 ?
+          new Response(declaredJson, {status: 200, headers: {'content-type': 'application/json'}}) :
+          new Response('no declared graph\n', {status: declaredStatus});
+    }
+    return echoSnapshot(url);
+  });
+
+  const withDeclared = await RecordedSource.open(SERVER, 's1', {
+    fetch: makeServer(200).fetchFn, clock: fakeClock().clock
+  });
+  assert.ok(withDeclared.declared);
+  assert.equal(withDeclared.declared.nodes.length, parseDeclaredGraph(declaredJson).nodes.length);
+  assert.equal(withDeclared.timeline.modes.length, 4);
+  withDeclared.close();
+
+  const withoutDeclared = await RecordedSource.open(SERVER, 's1', {
+    fetch: makeServer(404).fetchFn, clock: fakeClock().clock
+  });
+  assert.equal(withoutDeclared.declared, null);
+  withoutDeclared.close();
+
+  assert.throws(() => parseTimeline({...EMPTY_TIMELINE, hardware_not_decoded: 'no'}), ReviewError);
+  assert.throws(() => parseTimeline({
+    ...EMPTY_TIMELINE,
+    modes: [{start_ns: '10', end_ns: '5', mode: 'teleop', fms: false}]
+  }), ReviewError);
+  assert.throws(() => parseTimeline({
+    ...EMPTY_TIMELINE,
+    modes: [{start_ns: '1', end_ns: '5', mode: 'bogus', fms: false}]
+  }), ReviewError);
+  assert.throws(() => parseTimeline({
+    ...EMPTY_TIMELINE,
+    alerts: [{channel: 'a', level: 'fatal', start_ns: '1', end_ns: '2'}]
+  }), ReviewError);
+});
+
+// REQ-OPS-41, REQ-OPS-37, REQ-OPS-51: RecordedSource derives events, modeBands,
+// and playhead-aware alertLatch from timeline.json + bounds.gaps, and never
+// misreports hardware_not_decoded as disabled.
+test('RecordedSource derives events, modeBands, alertLatch and respects hardware_not_decoded', () => {
+  const server = fakeServer(echoSnapshot);
+  const gappedBounds = {...BOUNDS, gaps: [gap({start_ns: (START + 2_500_000_000n).toString(),
+                                               end_ns: (START + 2_800_000_000n).toString()})]};
+  const rec = new RecordedSource(SERVER, 's1', [], gappedBounds, server.fetchFn,
+                                 fakeClock().clock, SAMPLE_TIMELINE, null);
+
+  // Mode bands map 'auto' -> 'autonomous'.
+  assert.deepEqual(rec.modeBands().map(b => b.mode),
+                   ['disabled', 'autonomous', 'teleop', 'estop']);
+
+  // Events are chronologically sorted and cover modes, alerts (raise+clear,
+  // no false clear on active-to-end), crash+restart, and log gaps.
+  const events = rec.events();
+  for (let i = 1; i < events.length; i++) {
+    assert.ok(BigInt(events[i].t_ns) >= BigInt(events[i - 1].t_ns), 'not sorted');
+  }
+  const titles = events.map(e => e.title);
+  assert.ok(titles.includes('Disabled'), titles.join(', '));
+  assert.ok(titles.includes('Enabled · autonomous'), titles.join(', '));
+  assert.ok(titles.includes('FMS attached'), titles.join(', '));
+  assert.ok(titles.includes('Enabled · teleop'), titles.join(', '));
+  assert.ok(titles.includes('E-stop'), titles.join(', '));
+  assert.ok(titles.includes('hw: link lost'), titles.join(', '));
+  assert.ok(titles.includes('hw: link lost cleared'), titles.join(', '));
+  assert.equal(titles.filter(t => t === 'hw: link lost cleared').length, 1);
+  assert.ok(titles.includes('shooter crash'), titles.join(', '));
+  assert.ok(titles.includes('shooter restarted (run 2)'), titles.join(', '));
+  assert.ok(titles.includes('Log gap in bridge'), titles.join(', '));
+
+  // alertLatch tracks active vs latched across playhead positions and returns
+  // a stable reference until the playhead moves.
+  const atStart = rec.alertLatch();
+  assert.equal(atStart.alerts.length, 0);
+  assert.equal(rec.alertLatch(), atStart);
+
+  rec.seek((START + 2_000_000_000n).toString());
+  const duringFirst = rec.alertLatch();
+  assert.equal(duringFirst.alerts.length, 1);
+  assert.equal(duringFirst.alerts[0].channel, 'hw/status/alert_error_link_lost');
+  assert.equal(duringFirst.alerts[0].level, AlertLevel.Error);
+  assert.equal(duringFirst.alerts[0].active, true);
+  assert.equal(duringFirst.alerts[0].count, 1);
+
+  rec.seek((START + 4_500_000_000n).toString());
+  const afterClear = rec.alertLatch();
+  assert.equal(afterClear.alerts.length, 2);
+  assert.equal(afterClear.alerts[0].active, false);  // link lost cleared at 3s
+  assert.equal(afterClear.alerts[1].channel, 'shooter/status/alert_warning_temp_high');
+  assert.equal(afterClear.alerts[1].active, true);
+
+  rec.seek(END.toString());
+  const atEnd = rec.alertLatch();
+  assert.equal(atEnd.alerts[0].active, true);  // second activation lasts to END
+  assert.equal(atEnd.alerts[0].count, 2);
+  assert.equal(atEnd.alerts[1].active, false);
+  rec.close();
+
+  // hardware_not_decoded: modeBands is empty and events emit a single notice,
+  // never pretending the robot was disabled.
+  const undecoded = new RecordedSource(
+      SERVER, 's1', [], {...BOUNDS, hardware_not_decoded: 'protocol mismatch'},
+      server.fetchFn, fakeClock().clock,
+      {...EMPTY_TIMELINE, hardware_not_decoded: true}, null);
+  assert.deepEqual(undecoded.modeBands(), []);
+  assert.equal(undecoded.events().length, 1);
+  assert.equal(undecoded.events()[0].title, 'Hardware packets not decoded');
+  assert.doesNotMatch(undecoded.events()[0].title, /Disabled/);
+  undecoded.close();
+});
+
+// REQ-OPS-41, REQ-OPS-37: Events panel works on recordings and Health panel
+// renders an honest recorded view without fabricating live registry liveness.
+test('Events and Health panels render recorded sessions honestly', () => {
+  assert.equal(eventsPanel.recorded, true);
+  assert.equal(healthPanel.recorded, true);
+
+  const server = fakeServer(echoSnapshot);
+  const declared = parseDeclaredGraph(demoDeclaredGraph());
+  const gappedBounds = {...BOUNDS, gaps: [gap()]};
+  const rec = new RecordedSource(SERVER, 's1', [info('shooter/state/position_m')],
+                                 gappedBounds, server.fetchFn, fakeClock().clock,
+                                 SAMPLE_TIMELINE, declared);
+  rec.seek((START + 7_000_000_000n).toString());
+
+  // Even if studio.system holds a live graph from earlier, Health on a
+  // recorded session must never show live registry counts or fabricate rows.
+  const studio = createStaticStudio({
+    system: {graph: parseSystemGraph(demoSystemGraph(50n)), stale: false}
+  });
+  studio.openRecorded(rec);
+
+  const eventsHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <eventsPanel.component config={eventsPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="ev"/>
+      </StudioProvider>);
+  assert.match(eventsHtml, /Recorded timeline/);
+  assert.match(eventsHtml, /shooter crash/);
+  assert.match(eventsHtml, /hw: link lost/);
+  assert.match(eventsHtml, /Log gap in bridge/);
+
+  const healthHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <healthPanel.component config={healthPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="hl"/>
+      </StudioProvider>);
+  assert.match(healthHtml, /Live registry liveness is not present in recorded sessions/);
+  assert.doesNotMatch(healthHtml, /Nodes live/);
+  assert.doesNotMatch(healthHtml, /Frames forwarded/);
+  assert.match(healthHtml, /Declared nodes/);
+  assert.match(healthHtml, /shooter/);
+  assert.match(healthHtml, /crash/);
+  assert.match(healthHtml, /running/);  // end_ns === null handled honestly
+  assert.match(healthHtml, /link lost/);
+  assert.match(healthHtml, /log gap in bridge/);
+
+  // Without declared.json, Health says so honestly.
+  const noDecl = new RecordedSource(SERVER, 's1', [], BOUNDS, server.fetchFn,
+                                    fakeClock().clock, EMPTY_TIMELINE, null);
+  studio.openRecorded(noDecl);
+  const noDeclHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <healthPanel.component config={healthPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="hl"/>
+      </StudioProvider>);
+  assert.match(noDeclHtml, /No declared graph \(graph\.json\) in this session/);
+  assert.match(noDeclHtml, /No faults, restarts, alerts, or log gaps recorded/);
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41, REQ-OPS-51: RecordedTransport renders mode bands (or an undecoded
+// bar), alert marks, restart/unclean-exit marks, and gap bands.
+test('RecordedTransport renders timeline lanes for modes, alerts, restarts and gaps', () => {
+  const server = fakeServer(echoSnapshot);
+  const rec = new RecordedSource(SERVER, 's1', [], {...BOUNDS, gaps: [gap()]},
+                                 server.fetchFn, fakeClock().clock, SAMPLE_TIMELINE, null);
+  assert.equal(recordedModeLanes(rec.bounds, rec.timeline).length, 4);
+  assert.equal(alertMarks(rec.bounds, rec.timeline).length, 3);
+  assert.equal(restartMarks(rec.bounds, rec.timeline).length, 2);  // crash + restart
+
+  const noop = () => {};
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={createStaticStudio({playback: rec.playback})}>
+        <RecordedTransport source={rec} stepNs="1000000" onStepNs={noop} onClose={noop}/>
+      </StudioProvider>);
+  assert.match(html, /class="scrub-mode disabled"/);
+  assert.match(html, /class="scrub-mode autonomous"/);
+  assert.match(html, /class="scrub-mode teleop"/);
+  assert.match(html, /class="scrub-mode estop"/);
+  assert.match(html, /class="scrub-alert error"/);
+  assert.match(html, /class="scrub-alert warning"/);
+  assert.match(html, /class="scrub-restart exit"/);
+  assert.match(html, /class="scrub-restart restart"/);
+  assert.match(html, /class="scrub-gap"/);
+  rec.close();
+
+  const undecoded = new RecordedSource(
+      SERVER, 's1', [], {...BOUNDS, hardware_not_decoded: 'protocol mismatch'},
+      server.fetchFn, fakeClock().clock,
+      {...EMPTY_TIMELINE, hardware_not_decoded: true}, null);
+  const undecodedHtml = renderToStaticMarkup(
+      <StudioProvider studio={createStaticStudio({playback: undecoded.playback})}>
+        <RecordedTransport source={undecoded} stepNs="1000000" onStepNs={noop} onClose={noop}/>
+      </StudioProvider>);
+  assert.match(undecodedHtml, /class="scrub-mode undecoded"/);
+  assert.doesNotMatch(undecodedHtml, /class="scrub-mode disabled"/);
+  undecoded.close();
 });
