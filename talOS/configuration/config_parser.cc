@@ -1669,7 +1669,11 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
     for (const auto& [name, owned] : result.subsystems) {
       if (!owned.owns_actuators()) continue;
       const auto* sub_tbl = result.GetSubsystemTable(name);
-      if (sub_tbl == nullptr) continue;
+      if (sub_tbl == nullptr) {
+        throw std::logic_error(
+            "[subsystems." + name +
+            "] owns actuators but has no subsystem table in toml_data");
+      }
       const auto period_us = Read(*sub_tbl, "period_us", int64_t{hw.period_us});
       if (period_us > int64_t{hw.command_timeout_us / 4}) {
         throw std::invalid_argument(
