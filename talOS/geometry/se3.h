@@ -39,7 +39,7 @@ class SE3 {
   }
 
   // Logarithmic map, exact. v = V^-1 t with
-  // V^-1 = I - W/2 + c W^2, c = 1/t^2 - (1+cos t)/(2 t sin t).
+  // V^-1 = I - W/2 + c W^2, c = (1 - (t/2) / tan(t/2)) / t^2.
   Vector6 Log() const {
     const Vector3 w = r_.Log();
     Vector6 tau;
@@ -121,19 +121,22 @@ class SE3 {
     return Matrix3::Identity() + a * w_hat + b * w_hat_sq;
   }
 
-  // Inverse of V, closed form. Series c -> 1/12 + theta^2/720.
+  // Inverse of V, closed form. Series c -> 1/12 + theta^2/720 + theta^4/30240.
   static Matrix3 LeftVInverse(const Vector3& w) {
     const Scalar theta_sq = w.squaredNorm();
     const Scalar theta = std::sqrt(theta_sq);
     const Matrix3 w_hat = SO3<Scalar>::Hat(w);
     const Matrix3 w_hat_sq = w_hat * w_hat;
     Scalar c;
-    if (theta < TaylorThreshold()) {
-      c = Scalar(1) / Scalar(12) + theta_sq / Scalar(720);
+    if (theta_sq < TaylorThreshold()) {
+      c = Scalar(1) / Scalar(12) + theta_sq / Scalar(720) +
+          theta_sq * theta_sq / Scalar(30240);
     } else {
-      const Scalar sin_theta = std::sin(theta);
-      c = Scalar(1) / theta_sq -
-          (Scalar(1) + std::cos(theta)) / (Scalar(2) * theta * sin_theta);
+      const Scalar half = theta / Scalar(2);
+      const Scalar tan_half = std::tan(half);
+      const Scalar cot_term =
+          std::isinf(tan_half) ? Scalar(0) : half / tan_half;
+      c = (Scalar(1) - cot_term) / theta_sq;
     }
     return Matrix3::Identity() - w_hat / Scalar(2) + c * w_hat_sq;
   }
