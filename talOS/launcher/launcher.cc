@@ -416,7 +416,14 @@ Launcher::Launcher(LauncherOptions options) : options_{std::move(options)} {
 int Launcher::RefuseLaunch(std::string_view reason,
                            const config::RobotConfig* robot_config,
                            StopSignals& stop_signals) {
-  if (options_.describe_only || !options_.replay_inputs.empty()) return 1;
+  // Without owning `session_lock_`, another session may already be live
+  // (possibly with --no-studio or a custom HTTP port) or already serving a
+  // real refusal: never overwrite <log_root>/last_refusal.json or bind the
+  // Studio HTTP port unless this launcher holds the session lock.
+  if (options_.describe_only || !options_.replay_inputs.empty() ||
+      session_lock_ == nullptr) {
+    return 1;
+  }
 
   const std::string refusal_path =
       (std::filesystem::path{log_root_} / kLastRefusalFile).string();
@@ -498,17 +505,16 @@ int Launcher::RefuseLaunch(std::string_view reason,
   }
 
   ServiceNotifier notifier;
-  notifier.Send("READY=1");
   const auto watchdog = notifier.watchdog_interval();
   const auto start_time = options_.supervision_clock();
-  SupervisionTime next_watchdog =
-      watchdog ? start_time + *watchdog : SupervisionTime::max();
+  SupervisionTime next_watchdog = SupervisionTime::max();
   const SupervisionTime deadline =
       options_.duration_s > 0
           ? start_time + std::chrono::seconds(options_.duration_s)
           : SupervisionTime::max();
 
   bool stop_sent = false;
+  bool ready_sent = false;
   SupervisionTime shutdown_deadline = SupervisionTime::max();
   bool port_announced = false;
   std::string stdout_buf;
@@ -577,7 +583,15 @@ int Launcher::RefuseLaunch(std::string_view reason,
       break;
     }
     const SupervisionTime now = options_.supervision_clock();
-    if (watchdog && now >= next_watchdog) {
+    // Notify systemd READY=1 only once the bridge is alive and has announced
+    // its listening port, so an immediate EADDRINUSE exit never falsely
+    // reports READY=1 before returning 1.
+    if (port_announced && !ready_sent) {
+      notifier.Send("READY=1");
+      ready_sent = true;
+      if (watchdog) next_watchdog = now + *watchdog;
+    }
+    if (ready_sent && watchdog && now >= next_watchdog) {
       notifier.Send("WATCHDOG=1");
       next_watchdog = now + *watchdog;
     }
@@ -591,7 +605,7 @@ int Launcher::RefuseLaunch(std::string_view reason,
     }
     auto wake = SupervisionTime::max();
     const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
-    if (watchdog) due(next_watchdog);
+    if (ready_sent && watchdog) due(next_watchdog);
     if (stop_sent) {
       if (now < shutdown_deadline) due(shutdown_deadline);
     } else {
@@ -651,6 +665,7 @@ int Launcher::Run() {
 }
 
 int Launcher::RunSession(StopSignals& stop_signals) {
+  session_lock_ = nullptr;
   // The flag overrides every graph refusal, the safety ones included
   // (REQ-SAFE-27/28) and the live-endpoint refusal, so it never reaches a
   // real controller: --sim requires the loopback remote (below). Refused
@@ -754,7 +769,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   const auto take_lock = [&] {
     bool no_room = false;
     session_lock = options_.acquire_session_lock(lock_error, &no_room);
-    if (session_lock) session_lock_ = &*session_lock;
+    session_lock_ = session_lock ? &*session_lock : nullptr;
     lock_needs_room = !session_lock && no_room && LockSharesLogFilesystem();
     return session_lock.has_value() || lock_needs_room;
   };
@@ -1395,11 +1410,10 @@ std::string Launcher::StallReport(const NodeLaunch& launch, bool constructing,
 }
 
 void Launcher::StopSignals::Install() {
-  if (!installed_) {
-    for (std::size_t i = 0; i < kSignals.size(); ++i)
-      ::sigaction(kSignals[i], nullptr, &saved_[i]);
-    installed_ = true;
-  }
+  if (installed_) return;
+  for (std::size_t i = 0; i < kSignals.size(); ++i)
+    ::sigaction(kSignals[i], nullptr, &saved_[i]);
+  installed_ = true;
   InstallSignals();
 }
 

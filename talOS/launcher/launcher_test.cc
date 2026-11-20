@@ -4,9 +4,11 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -4595,12 +4597,74 @@ PYEOF
 )";
 }
 
+// Captures sd_notify datagrams sent to NOTIFY_SOCKET while in scope.
+class NotifyCapture {
+ public:
+  NotifyCapture() {
+    static int serial = 0;
+    path_ = "/tmp/talos_notify_cap_" + std::to_string(::getpid()) + "_" +
+            std::to_string(serial++);
+    ::unlink(path_.c_str());
+    fd_ = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path_.c_str(), path_.size() + 1);
+    const auto len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                            path_.size() + 1);
+    if (fd_ >= 0 &&
+        ::bind(fd_, reinterpret_cast<const sockaddr*>(&addr), len) == 0) {
+      ::fcntl(fd_, F_SETFL, O_NONBLOCK);
+      ::setenv("NOTIFY_SOCKET", path_.c_str(), 1);
+    }
+  }
+  ~NotifyCapture() {
+    ::unsetenv("NOTIFY_SOCKET");
+    if (fd_ >= 0) ::close(fd_);
+    ::unlink(path_.c_str());
+  }
+  NotifyCapture(const NotifyCapture&) = delete;
+  NotifyCapture& operator=(const NotifyCapture&) = delete;
+
+  std::vector<std::string> Drain() const {
+    std::vector<std::string> out;
+    if (fd_ < 0) return out;
+    char buf[128];
+    for (;;) {
+      const ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+      if (n <= 0) break;
+      out.emplace_back(buf, static_cast<std::size_t>(n));
+    }
+    return out;
+  }
+
+  bool WaitFor(std::string_view expected, std::chrono::seconds timeout) const {
+    if (fd_ < 0) return false;
+    const int timeout_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      for (const auto& msg : Drain()) {
+        if (msg == expected) return true;
+      }
+      pollfd pfd{.fd = fd_, .events = POLLIN, .revents = 0};
+      const int ready = ::poll(&pfd, 1, timeout_ms);
+      if (ready <= 0) return false;
+    }
+    return false;
+  }
+
+ private:
+  std::string path_;
+  int fd_{-1};
+};
+
 // REQ-OPS-34, REQ-OPS-36, TODO.md DEPLOY-12: with --serve-refusal and
 // --start-studio-bridge, a phase-1 graph refusal writes last_refusal.json in
 // the log root, starts the Studio bridge with --refusal-file serving
-// /drive/summary.json with launch_refused: true and the refusal reason, stops
+// /drive/summary.json with launch_refused: true and the refusal reason,
+// sends READY=1 once the bridge announces its listening port, stops
 // the bridge cleanly on SIGINT, and still returns 1.
 TEST(LauncherGraphTest, ServeRefusalStartsBridgeAndServesSummaryUntilStopped) {
+  NotifyCapture notify;
   const std::string ready_fifo = TempPath("serve_refusal_ready.fifo");
   ::unlink(ready_fifo.c_str());
   ASSERT_EQ(::mkfifo(ready_fifo.c_str(), 0600), 0);
@@ -4631,6 +4695,8 @@ TEST(LauncherGraphTest, ServeRefusalStartsBridgeAndServesSummaryUntilStopped) {
     bound_port = static_cast<uint16_t>(parsed);
   }
   ASSERT_GT(bound_port, 0u);
+  EXPECT_TRUE(notify.WaitFor("READY=1", kHang))
+      << "launcher did not send READY=1 after refusal bridge announced port";
 
   const std::string response =
       HttpGetLoopback(bound_port, "/drive/summary.json");
@@ -4663,7 +4729,7 @@ TEST(LauncherGraphTest, ServeRefusalStartsBridgeAndServesSummaryUntilStopped) {
 //    refusal bridge runs.
 // 3. When the refusal bridge exits immediately on its own (e.g. EADDRINUSE
 //    because a live session holds port 5800), --serve-refusal returns 1
-//    immediately without waiting for duration_s.
+//    immediately without waiting for duration_s and without sending READY=1.
 TEST(LauncherGraphTest,
      RefusalWithoutServeFlagOrWithExitingBridgeReturnsOneImmediately) {
   const std::string writer_alpha =
@@ -4720,9 +4786,9 @@ TEST(LauncherGraphTest,
   }
 
   // Case 3: refusal bridge exits immediately (e.g. EADDRINUSE) -> returns 1
-  // without waiting for duration_s (frozen supervision clock never reaches
-  // deadline, so returning proves it ended on the bridge's exit).
+  // without waiting for duration_s and without reporting READY=1 to systemd.
   {
+    NotifyCapture notify;
     GraphFixture fixture{"eaddrinuse_serve_refusal", writer_alpha, writer_beta};
     const std::string log_root = fixture.options.output_dir;
     testing::SteppedClock clock;
@@ -4745,8 +4811,135 @@ TEST(LauncherGraphTest,
         "exit 1\n");
 
     EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    const auto notifications = notify.Drain();
+    EXPECT_EQ(std::find(notifications.begin(), notifications.end(), "READY=1"),
+              notifications.end())
+        << "READY=1 must not be sent when refusal bridge exits before "
+           "listening";
     std::filesystem::remove_all(log_root);
   }
+}
+
+// REQ-OPS-34, REQ-OPS-50, TODO.md DEPLOY-12: a launcher that does not own the
+// session lock (refused because another launcher holds it, or refused on a
+// pre-lock CLI error) must exit 1 immediately without overwriting an existing
+// <log_root>/last_refusal.json or spawning a refusal studio_bridge (which
+// would collide with a live session running --no-studio or a custom port).
+TEST(LauncherGraphTest,
+     RefusalWithoutSessionLockPreservesLastRefusalAndSkipsBridge) {
+  const std::string sentinel =
+      "{\"refused\":true,\"reason\":\"existing live refusal\"}\n";
+  const std::string writer_alpha =
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")});
+  const std::string writer_beta =
+      DescribingStub("beta", "//example/beta:node", {Sender("/alpha/state")});
+
+  // Case 1: held session lock (!take_lock()).
+  {
+    const std::string spawned = TempPath("held_lock_refusal_spawned");
+    ::unlink(spawned.c_str());
+    GraphFixture fixture{"held_lock_refusal", writer_alpha, writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    std::filesystem::create_directories(log_root);
+    const std::string refusal_path =
+        log_root + "/" + std::string{kLastRefusalFile};
+    {
+      std::ofstream out{refusal_path, std::ios::binary};
+      out << sentinel;
+    }
+    testing::SteppedClock clock;
+    fixture.options.supervision_clock = clock.clock();
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = true;
+    fixture.options.duration_s = static_cast<int>(kHang.count());
+    fixture.options.acquire_session_lock = [](std::string& error,
+                                              bool* no_room) {
+      error = "another launcher (pid 99999) is running a session";
+      if (no_room != nullptr) *no_room = false;
+      return std::optional<SessionLock>{};
+    };
+    fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+        WriteStubNode(
+            "held_lock_refusal_bridge",
+            "#!/bin/sh\necho spawned > \"" + spawned + "\"\nexit 0\n");
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(spawned))
+        << "refusal bridge must not spawn when session_lock is held";
+    EXPECT_EQ(ReadFile(refusal_path), sentinel)
+        << "existing last_refusal.json must not be clobbered on held lock";
+    ::unlink(spawned.c_str());
+    std::filesystem::remove_all(log_root);
+  }
+
+  // Case 2: pre-lock refusal (--allow-graph-errors without --sim).
+  {
+    const std::string spawned = TempPath("pre_lock_refusal_spawned");
+    ::unlink(spawned.c_str());
+    GraphFixture fixture{"pre_lock_refusal", writer_alpha, writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    std::filesystem::create_directories(log_root);
+    const std::string refusal_path =
+        log_root + "/" + std::string{kLastRefusalFile};
+    {
+      std::ofstream out{refusal_path, std::ios::binary};
+      out << sentinel;
+    }
+    testing::SteppedClock clock;
+    fixture.options.supervision_clock = clock.clock();
+    fixture.options.allow_graph_errors = true;
+    fixture.options.simulation = false;
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = true;
+    fixture.options.duration_s = static_cast<int>(kHang.count());
+    fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+        WriteStubNode(
+            "pre_lock_refusal_bridge",
+            "#!/bin/sh\necho spawned > \"" + spawned + "\"\nexit 0\n");
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(spawned))
+        << "refusal bridge must not spawn on pre-lock refusal";
+    EXPECT_EQ(ReadFile(refusal_path), sentinel)
+        << "existing last_refusal.json must not be clobbered on pre-lock "
+           "refusal";
+    ::unlink(spawned.c_str());
+    std::filesystem::remove_all(log_root);
+  }
+}
+
+// REQ-OPS-34, TODO.md DEPLOY-12: StopSignals::Install() must be idempotent so
+// RefuseLaunch() never clears a stop signal that arrived after RunSession()
+// installed stop handlers; a pending stop must return 1 immediately without
+// spawning the refusal studio_bridge.
+TEST(LauncherGraphTest,
+     RefuseLaunchHonorsPendingStopSignalWithoutSpawningBridge) {
+  const std::string spawned = TempPath("pending_stop_refusal_spawned");
+  ::unlink(spawned.c_str());
+  auto options = SessionFixture("pending_stop_refusal");
+  const std::string log_root = options.output_dir;
+  // Invalid TOML forces ParseRobotConfig to fail and enter RefuseLaunch right
+  // after RunSession installed stop_signals and acquired session_lock.
+  std::ofstream{options.config_path} << "[robot\n";
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
+  options.start_studio_bridge = true;
+  options.serve_refusal = true;
+  options.duration_s = static_cast<int>(kHang.count());
+  options.acquire_session_lock = [](std::string& error, bool* no_room) {
+    auto lock = SessionLock::Acquire(error, no_room);
+    if (lock) ::raise(SIGINT);
+    return lock;
+  };
+  options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
+      "pending_stop_refusal_bridge",
+      "#!/bin/sh\necho spawned > \"" + spawned + "\"\nsleep 60\n");
+
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  EXPECT_FALSE(std::filesystem::exists(spawned))
+      << "refusal bridge must not spawn when a stop signal is already pending";
+  ::unlink(spawned.c_str());
+  std::filesystem::remove_all(log_root);
 }
 
 }  // namespace
