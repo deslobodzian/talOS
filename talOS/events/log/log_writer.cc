@@ -1,14 +1,12 @@
 #include "talOS/events/log/log_writer.h"
 
 #include <fcntl.h>
-#include <pthread.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <limits>
@@ -16,14 +14,8 @@
 #include <system_error>
 #include <utility>
 
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#include <mach/thread_policy.h>
-#else
-#include <sched.h>
-#endif
-
 #include "talOS/process/durable_sync.h"
+#include "talOS/process/process.h"
 
 namespace talos::event::log {
 
@@ -31,41 +23,6 @@ namespace {
 
 std::span<const std::byte> as_bytes(const void* data, std::size_t size) {
   return {reinterpret_cast<const std::byte*>(data), size};
-}
-
-// Puts the calling thread (the writer) under the normal time-sharing policy.
-// A thread created by one running under process::ConfigureRealtime inherits
-// SCHED_FIFO on Linux; the writer must not preempt control loops to write a
-// log. Best effort: leaving realtime needs no privilege, and a refusal is
-// reported to stderr, not as a log fault.
-void UseNormalScheduling() noexcept {
-#if defined(__APPLE__)
-  // Whether or not a time-constraint policy reached this thread, the
-  // standard policy replaces it.
-  thread_standard_policy_data_t policy{};
-  const kern_return_t result = ::thread_policy_set(
-      ::pthread_mach_thread_np(::pthread_self()), THREAD_STANDARD_POLICY,
-      reinterpret_cast<thread_policy_t>(&policy), THREAD_STANDARD_POLICY_COUNT);
-  if (result != KERN_SUCCESS) {
-    std::fprintf(stderr, "talos: log writer kept its scheduling policy (%d)\n",
-                 static_cast<int>(result));
-  }
-#else
-  int current = SCHED_OTHER;
-  sched_param param{};
-  if (::pthread_getschedparam(::pthread_self(), &current, &param) == 0 &&
-      current == SCHED_OTHER) {
-    return;
-  }
-  param = sched_param{};
-  param.sched_priority = 0;
-  const int result =
-      ::pthread_setschedparam(::pthread_self(), SCHED_OTHER, &param);
-  if (result != 0) {
-    std::fprintf(stderr, "talos: log writer kept its scheduling policy (%s)\n",
-                 std::strerror(result));
-  }
-#endif
 }
 
 }  // namespace
@@ -730,7 +687,7 @@ void LogWriter::State::start_writer() {
 
   State* raw = this;
   writer = std::thread{[raw] {
-    UseNormalScheduling();
+    process::ConfigureBackgroundThread();
     // Before any chunk, so the prefix leads the file. Records handed over
     // meanwhile wait in the pool; the producer never waits for this.
     raw->open_file();

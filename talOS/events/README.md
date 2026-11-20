@@ -578,9 +578,10 @@ atomic store and load, plus, when the writer is idle, one semaphore post (`sem_p
 macOS): it may enter the kernel to wake the writer, but never blocks or takes
 a lock, and a post made before the writer waits is kept. A node logging
 more often than every 10 ms posts a record only when its stream starts.
-The writer runs under the normal scheduling
-policy (`SCHED_OTHER` on Linux, the standard policy on macOS) even when the
-thread that started it runs realtime.
+The writer runs below every loop thread via
+`talos::process::ConfigureBackgroundThread()` (`SCHED_OTHER` with raised nice
+on Linux, `QOS_CLASS_UTILITY` on macOS) even when the thread that started it
+runs realtime.
 
 `start()` sizes every chunk for the manifest's largest payload and a GAP
 record. A record the writer cannot take, because every chunk is handed over

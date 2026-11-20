@@ -48,6 +48,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":events_core",
+        "//talOS/process",
         "//talOS/process:durable_sync",
     ],
 )

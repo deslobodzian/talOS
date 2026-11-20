@@ -38,9 +38,9 @@ namespace talos::event::log {
 // semaphore until a chunk is handed over or a sync is due; the producer posts
 // it on every hand-off, asleep or not, and a post neither blocks nor takes a
 // lock (sem_post on Linux, dispatch_semaphore_signal on macOS). The writer
-// runs under the normal scheduling policy whatever the thread that
-// started it runs under, so it never competes with a realtime loop thread
-// for the CPU.
+// runs as a background thread (process::ConfigureBackgroundThread) whatever
+// the thread that started it runs under, so it never competes with a
+// realtime loop thread for the CPU.
 //
 // Two losses are bounded separately. A process killed by a signal (the
 // launcher's stall kill, a segfault, an abort) runs no flush, so its log
