@@ -189,12 +189,12 @@ std::optional<std::string> ReadPoseTopicFromConfig(
       return std::nullopt;
     }
     if (!studio->contains("pose_topic")) return std::nullopt;
-    const auto val = (*studio)["pose_topic"].value_exact<std::string>();
+    auto val = (*studio)["pose_topic"].value_exact<std::string>();
     if (!val || val->empty()) {
       explicit_invalid = true;
       return std::nullopt;
     }
-    return *val;
+    return val;
   };
 
   const auto root = ReadBoundedToml(config_path);

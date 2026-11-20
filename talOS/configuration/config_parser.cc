@@ -521,7 +521,7 @@ RawDevice ParseMotor(const toml::table& t, const std::string& name) {
         "false, or use a remote CANcoder's absolute position frame "
         "(feedback = \"RemoteCANcoder\", position_frame = \"absolute\")");
   }
-  raw.config = std::move(m);
+  raw.config = m;
   return raw;
 }
 
@@ -543,7 +543,7 @@ RawDevice ParseDigitalInput(const toml::table& t, const std::string& name) {
                                     name + " needs sim_motor");
       }
     }
-    return RawDevice{.config = std::move(input)};
+    return RawDevice{.config = input};
   }
   sim.motor = ReadNonEmpty(t, "sim_motor", "", "digital input");
   sim.closed_at_rot = ReadRequired<double>(t, "sim_closed_at_rot", name);
@@ -553,7 +553,7 @@ RawDevice ParseDigitalInput(const toml::table& t, const std::string& name) {
   }
   sim.closed_above = Read(t, "sim_closed_above", sim.closed_above);
   sim.closed_reads = Read(t, "sim_closed_reads", sim.closed_reads);
-  return RawDevice{.config = std::move(input)};
+  return RawDevice{.config = input};
 }
 
 RawDevice ParseSensor(const toml::table& t, const std::string& name) {
@@ -573,7 +573,7 @@ RawDevice ParseSensor(const toml::table& t, const std::string& name) {
   s.can_id = ReadRequired<int>(t, "can_id", name);
   s.inverted = Read(t, "inverted", s.inverted);
   s.offset_rot = Read(t, "offset_rot", s.offset_rot);
-  return {.name = name, .config = std::move(s)};
+  return {.name = name, .config = s};
 }
 
 RawDevice ParseEncoder(const toml::table& t, const std::string& name) {
@@ -595,7 +595,7 @@ RawDevice ParseEncoder(const toml::table& t, const std::string& name) {
     throw std::invalid_argument("unknown encoder type '" + type + "' for " +
                                 name);
   }
-  return {.name = name, .config = std::move(e)};
+  return {.name = name, .config = e};
 }
 
 // Applies a [targets] table over `policy`: each listed mode is replaced. Keys

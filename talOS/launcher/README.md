@@ -529,12 +529,14 @@ exits, which the bound above ends, with the reason in `studio_bridge.log`.
 
 ### Refusal visibility (`--serve-refusal`)
 
-On any phase-1 refusal (a bad config, a graph or naming error, `simulation_only`
-without `--sim`, a held session lock, a full node registry, or a failed probe;
-never on `--describe-only` or `--replay-inputs`), the launcher atomically
-writes `<output_dir>/last_refusal.json` (`{"refused": true, "reason": "...",
-"config_path": "...", "wall_ns": ...}`) in the log root (when writable or
-creatable).
+On any phase-1 refusal after the launcher acquires `session.lock` (a bad
+config, a graph or naming error, `simulation_only` without `--sim`, a full node
+registry, or a failed probe; never on `--describe-only`, `--replay-inputs`, a
+held session lock, or a pre-lock CLI/bundle argument refusal so another live
+session's log root and `/drive` port are never disturbed), the launcher
+atomically writes `<output_dir>/last_refusal.json` (`{"refused": true,
+"reason": "...", "config_path": "...", "wall_ns": ...}`) in the log root (when
+writable or creatable).
 
 Without `--serve-refusal`, the launcher still exits 1 immediately. With both
 `--serve-refusal` and `--start-studio-bridge` (which `tools/deploy.sh
@@ -542,11 +544,12 @@ enable-boot` passes to the boot service's `run.sh`), the launcher starts the
 Studio bridge in refusal mode (`--refusal-file <output_dir>/last_refusal.json`,
 using `--studio-http-port`, `[studio] http_port`, or default `5800` and the
 bundle's or configured webroot so even a TOML parse error still serves
-`/drive`), notifies systemd (`READY=1` and `WATCHDOG=1`), and waits until a
-stop signal, `--duration-s` (if > 0), or the bridge's own exit (e.g.
-`EADDRINUSE` when a live session already holds port 5800), then stops the
-bridge cleanly and still exits 1. While it runs, `/drive` renders
-**LAUNCH REFUSED** with the exact refusal reason instead of **BRIDGE LINK**
+`/drive`), notifies systemd (`READY=1` and `WATCHDOG=1`) once the bridge
+announces its listening port, and waits until a stop signal, `--duration-s` (if
+> 0), or the bridge's own exit (e.g. `EADDRINUSE` when another process outside
+the lock already holds port 5800), then stops the bridge cleanly and still
+exits 1. While it runs, `/drive` renders **LAUNCH REFUSED** with the exact
+refusal reason instead of **BRIDGE LINK**
 ([PRE_MATCH.md](../../docs/PRE_MATCH.md#driver-dashboard-top-to-bottom)).
 
 ## Node output
