@@ -11,12 +11,13 @@ local_path_override(
     path = "examples/wrist_repo",
 )
 
+# Pinned for the macOS C++ toolchain under Bazel 8.6 / Xcode (supplies the
+# macOS C++ toolchain targets; without it Bazel resolves transitive 1.24.2).
 bazel_dep(name = "apple_support", version = "2.0.0", repo_name = "build_bazel_apple_support")
 bazel_dep(name = "rules_cc", version = "0.2.18")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "flatbuffers", version = "25.12.19")
-bazel_dep(name = "rules_foreign_cc", version = "0.14.0")
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
 
 # No aspect_rules_esbuild: nothing loads it, and 0.27.0 requires
@@ -24,8 +25,6 @@ bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
 # root_package attribute flatbuffers@25.12.19 still passes. Keeping it
 # elevated rules_js past the root 2.8.2 pin and broke evaluation of the npm
 # extension for any build needing npm repos (e.g. //... via studio/).
-bazel_dep(name = "rules_go", version = "0.63.0")
-bazel_dep(name = "rules_java", version = "9.6.1")
 bazel_dep(name = "rules_python", version = "2.0.1")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")

@@ -359,15 +359,12 @@ asks for; only an override, such as `single_version_override`, fixes one).
 
 | Bazel module | For |
 |---|---|
-| `apple_support` | the Apple C++ toolchain on macOS (`repo_name` `build_bazel_apple_support`); root pin |
+| `apple_support` | the Apple C++ toolchain on macOS under Bazel 8.6 / Xcode (`repo_name` `build_bazel_apple_support`; supplies the configured macOS C++ toolchain targets instead of transitive 1.24.2); root pin |
 | `rules_cc` | C++ rules |
 | `googletest` | C++ tests |
 | `platforms` | OS constraints (`@platforms//os:*`) in `select`s |
 | `flatbuffers` | message schemas, `flatc`, the C++ and Python runtimes |
-| `rules_foreign_cc` | root pin |
 | `aspect_bazel_lib` | `copy_to_bin` and build stamping |
-| `rules_go` | root pin |
-| `rules_java` | root pin |
 | `rules_python` | Python rules, the 3.11 toolchain and the pinned pip lock |
 | `nlohmann_json` | Choreo `.traj` and session manifest reading |
 | `opencv` | `talOS/vision` image conversion and IO (patched, root only) |
