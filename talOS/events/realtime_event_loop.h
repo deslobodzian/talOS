@@ -19,6 +19,7 @@
 #include "talOS/events/os/poller.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/scheduler.h"
+#include "talOS/events/stall_guard.h"
 #include "talOS/events/time.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/rtms/wake.h"
@@ -302,9 +303,7 @@ class RealtimeEventLoop
           next_sequence{other.next_sequence},
           lost{other.lost},
           prompt{other.prompt},
-          progress{other.progress},
-          stall_progress{other.stall_progress},
-          stalls{other.stalls} {}
+          stall_guard{other.stall_guard} {}
     Transport& operator=(Transport&& other) noexcept {
       if (this != &other) {
         release();
@@ -313,9 +312,7 @@ class RealtimeEventLoop
         next_sequence = other.next_sequence;
         lost = other.lost;
         prompt = other.prompt;
-        progress = other.progress;
-        stall_progress = other.stall_progress;
-        stalls = other.stalls;
+        stall_guard = other.stall_guard;
       }
       return *this;
     }
@@ -332,17 +329,15 @@ class RealtimeEventLoop
     std::uint64_t lost{0};
     // Its reader slot names the loop's WakeReceiver (ON_PUBLISH only).
     bool prompt{false};
-    // Drains that delivered from it or found its slot freed, and, for the
-    // stall guard in wait_for_publication: the progress at its last failed
-    // arm, and how many failed arms in a row have drained since it moved.
-    std::uint64_t progress{0};
-    std::uint64_t stall_progress{0};
-    std::uint32_t stalls{0};
+    // Stall guard for wait_for_publication: reset on a clean arm, a delivery
+    // or a freed slot.
+    StallGuard stall_guard{kMaxStalledArms};
   };
 
   // Failed arms of one prompt watcher that may each drain in place of a
   // wait while nothing is delivered from it (see wait_for_publication).
-  static constexpr std::uint32_t kMaxStalledArms = 3;
+  static constexpr std::uint32_t kMaxStalledArms =
+      StallGuard::kDefaultMaxStalled;
 
   // Delivery::ON_PUBLISH, at the start of the run: one receiver for the
   // loop, named by every prompt watcher's reader slot. Without a prompt
@@ -416,20 +411,17 @@ class RealtimeEventLoop
               ? options_.arm_wake(*transport.queue, *transport.reader_id)
               : transport.queue->arm_wake(*transport.reader_id);
       if (armed) {
-        transport.stalls = 0;
+        transport.stall_guard.reset();
         continue;
       }
-      if (transport.progress != transport.stall_progress) {
-        transport.stall_progress = transport.progress;
-        transport.stalls = 0;
-      }
-      if (transport.stalls < kMaxStalledArms) {
-        ++transport.stalls;
-        return Poller::now();
-      }
-      if (transport.stalls == kMaxStalledArms) {
-        ++transport.stalls;
-        stalled_arms_.fetch_add(1, std::memory_order_relaxed);
+      switch (transport.stall_guard.on_failed_arm()) {
+        case StallAction::kRetry:
+          return Poller::now();
+        case StallAction::kTripped:
+          stalled_arms_.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case StallAction::kStalled:
+          break;
       }
     }
     const MonotonicTime now = Poller::now();
@@ -587,7 +579,7 @@ class RealtimeEventLoop
             this->count_dropped(id, 1);
           }
           if (result == ReadResult::INACTIVE) {
-            ++transport.progress;
+            transport.stall_guard.reset();
             transport.reader_id.reset();
             rejoin(queue, transport);
           }
@@ -595,7 +587,7 @@ class RealtimeEventLoop
         }
 
         transport.next_sequence = info.sequence + 1;
-        ++transport.progress;
+        transport.stall_guard.reset();
         now = Poller::now();
         const MonotonicTime published =
             MonotonicTime::from_nanos(info.publish_time_ns);

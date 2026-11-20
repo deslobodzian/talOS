@@ -488,7 +488,7 @@ void HardwareNode::Tick(uint64_t now_us) {
     if (received) {
       ++tracker.requests;
       ++tick_requests_;
-      tracker.arm_stalled = false;
+      tracker.stall_guard.reset();
       tracker.requests_skipped += received->dropped;
       // Heard from its first request, accepted, refused or undecodable
       // alike: the topic is this subsystem's alone, written only by its
@@ -1041,7 +1041,7 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
                                ? seams_.arm_request(*tracker.subscriber)
                                : tracker.subscriber->arm_wake();
     if (caught_up) {
-      tracker.arm_stalled = false;
+      tracker.stall_guard.reset();
     } else {
       tracker.arm_failed = true;
       input_waiting = true;
@@ -1064,30 +1064,29 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
       cpu_window_datagrams_ >= kDatagramBudget) {
     // Spent: input waits for the window's end, a duty does not.
     ++wakeups_.throttled;
-    idle_passes_ = 0;
+    idle_guard_.reset();
     return {std::min(cpu_window_start_us_ + kCpuWindowUs, timed_us), true};
   }
 
   if (input_waiting) {
     if (tick_datagrams_ > 0 || tick_requests_ > 0) {
-      idle_passes_ = 0;
+      idle_guard_.reset();
       return {now_us, false};
     }
-    if (idle_passes_ < kMaxIdlePasses) {
-      ++idle_passes_;
+    if (idle_guard_.on_failed_arm() == event::StallAction::kRetry) {
       return {now_us, false};
     }
     // The guard: each topic whose failed arm it now stops holding the loop
     // awake is a stalled arm, counted once until it arms or delivers again,
     // as an event loop counts its watchers' (Activity::stalled_arms).
     for (auto& [name, tracker] : subsystems_) {
-      if (tracker.arm_failed && !tracker.arm_stalled) {
-        tracker.arm_stalled = true;
+      if (tracker.arm_failed &&
+          tracker.stall_guard.on_failed_arm() == event::StallAction::kTripped) {
         ++wakeups_.stalled_arms;
       }
     }
   }
-  idle_passes_ = 0;
+  idle_guard_.reset();
   return {timed_us, false};
 }
 
