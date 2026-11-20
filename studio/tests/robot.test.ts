@@ -133,3 +133,23 @@ test('CAN buses read their utilization only while their last read is current', (
   assert.deepEqual(buses.map(canBusUnread), [false, true, true]);
   assert.equal(buses[1].readFailures, 12);
 });
+
+// REQ-OPS-23: when the declared graph carries the configuration's CAN bus slot
+// names (hardware::CanBuses), robotStatus labels each slot by its bus name and
+// falls back to "rio" / "CAN bus N" for any slot not named.
+test('CAN buses use declared slot names when present and fall back when absent', () => {
+  const B = 'hw/status/can_buses/';
+  const snapshot = snap({
+    'hw/status/can_bus_count': 2,
+    [B + '0/read_state']: 1, [B + '0/utilization_frac']: 0.12,
+    [B + '1/read_state']: 1, [B + '1/utilization_frac']: 0.34
+  });
+  const named = robotStatus(snapshot, {
+    ...noSystem,
+    declared: {version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'Shooter']}
+  });
+  assert.deepEqual(named.power.canBuses.map(b => b.label), ['rio', 'Shooter']);
+
+  const fallback = robotStatus(snapshot, noSystem);
+  assert.deepEqual(fallback.power.canBuses.map(b => b.label), ['rio', 'CAN bus 1']);
+});

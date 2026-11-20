@@ -762,7 +762,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   if (!WriteFileAtomically(
           graph_path,
           GraphToJson(options_.session_id, options_.config_path, described,
-                      diagnostics, options_.bundle_config_sha256),
+                      diagnostics, options_.bundle_config_sha256,
+                      CanBusNamesOf(robot_config)),
           options_.sync_file, graph_error)) {
     ConsoleLine(std::cerr) << "launcher: cannot write " << graph_path << " ("
                            << graph_error << "); nothing was started\n";

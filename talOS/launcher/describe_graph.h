@@ -67,6 +67,10 @@ naming::TargetSources TargetSourcesOf(const config::RobotConfig& robot_config);
 naming::TargetModeSources TargetModeSourcesOf(
     const config::RobotConfig& robot_config);
 
+// The robot configuration's CAN bus names in `/hw/status` `can_buses` slot
+// order (hardware::CanBuses: slot 0 "rio", then each extra bus in byte order).
+std::vector<std::string> CanBusNamesOf(const config::RobotConfig& robot_config);
+
 // METHODOLOGY §6: every numeric parameter key ends in a unit suffix. One
 // warning per subsystem whose [subsystems.<name>] table has numeric keys (a
 // number, or an array of numbers) without one, listing them. Nested tables
@@ -205,9 +209,13 @@ std::vector<RTMSQueue> CreateSessionSegments(
 
 // The declared graph on disk, beside the session's manifest. uint64 values are
 // decimal strings: a JSON number is a double, and an id past 2^53 would change.
+// When `can_buses` is non-empty, it is written as `"can_buses": [...]` in
+// `/hw/status` slot order (CanBusNamesOf) so Studio can label each slot by bus
+// name.
 std::string GraphToJson(uint64_t session_id, const std::string& config_path,
                         const std::vector<NodeDescription>& described,
                         const std::vector<naming::Diagnostic>& diagnostics,
-                        const std::string& config_sha256 = "");
+                        const std::string& config_sha256 = "",
+                        const std::vector<std::string>& can_buses = {});
 
 }  // namespace talos::launcher

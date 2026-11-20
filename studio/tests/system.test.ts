@@ -708,6 +708,9 @@ test('a declared graph is refused as strictly as a live one, and says which', ()
   refuses({diagnostics: [{severity: 'fatal', subject: '/x', message: 'no'}]});
   refuses({diagnostics: [{severity: 'error', subject: '/x'}]});
   refuses({diagnostics: new Array(1025).fill(null)});
+  refuses({can_buses: 'rio'});
+  refuses({can_buses: ['rio', 1]});
+  refuses({can_buses: ['rio', 'a', 'b', 'c', 'd']});
 
   // A live system graph handed to this reader is a mistake, not a graph.
   assert.throws(() => parseDeclaredGraph(demoSystemGraph()), Error);
@@ -725,7 +728,11 @@ test('a declared graph the launcher wrote plainly is still read', () => {
   const bare = parseDeclaredGraph(JSON.stringify({nodes: [declaredNode()]}));
   assert.equal(bare.nodes.length, 1);
   assert.deepEqual(bare.diagnostics, []);
+  assert.deepEqual(bare.can_buses, []);
   assert.equal(bare.version, DECLARED_VERSION);
+
+  const withBuses = parseDeclared({can_buses: ['rio', 'Shooter']});
+  assert.deepEqual(withBuses.can_buses, ['rio', 'Shooter']);
 
   // ERROR is how the enumerator is spelled in C++; error is how it prints.
   const shouted = parseDeclared(
