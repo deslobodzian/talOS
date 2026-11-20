@@ -62,12 +62,13 @@ refuses from the start (RULES.md 2):
 - Starlark string constants (and constant concatenations) in `BUILD`,
   `BUILD.bazel`, and `.bzl` files that carry those forbidden symbols, token
   pasting, C++ trigraphs, forbidden header paths, or `-include`/`-imacros`/
-  `-trigraphs`/`-ftrigraphs`/`-I`/`-iquote`/`-isystem`/`-idirafter`/
-  `--include-directory`/`-iwithprefix`/`-iwithsysroot` compiler flags (joined,
-  separate, or via `-Wp,`/`-Xclang`).
+  `-trigraphs`/`-ftrigraphs`/`-fms-extensions`/`-I`/`-iquote`/`-isystem`/
+  `-cxx-isystem`/`-idirafter`/`--include-directory`/`-iwithprefix`/
+  `-iwithsysroot` compiler flags (joined, separate, or via `-Wp,`/`-Xclang`).
 
 Residual static-scan limits (tracked under TODO ARCH-2): Bazel
-`includes = [...]` rule attributes, Starlark strings built at runtime (e.g.
+`includes = [...]` rule attributes, compiler `@file` response files in `copts`,
+`.bazelrc`/`talos.bazelrc` flags, Starlark strings built at runtime (e.g.
 `%`, `.format()`, slices, `load()`ed constants, macro parameters, `.scl`
 files), and generated headers (`genrule`). Closing those requires evaluating
 Bazel `aquery` compile actions.
@@ -233,13 +234,13 @@ NON_CPP_BASENAMES_LOWER = frozenset(b.lower() for b in NON_CPP_BASENAMES)
 FORBIDDEN_INCLUDE_SUFFIXES = NON_CPP_SUFFIXES | frozenset({".txt"})
 
 INCLUDE_DIRECTIVE_RE = re.compile(
-    r"^[ \t]*(?:#|%:)[ \t]*(include(?:_next)?)\b(.*)$")
+    r"^[ \t]*(?:#|%:)[ \t]*(include(?:_next)?|import)\b(.*)$")
 HEADER_NAME_RE = re.compile(r'^(?:"([^"]*)"|<([^>]*)>)')
 TOKEN_PASTE_RE = re.compile(r"##|%:%:")
 TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>-]")
 FORBIDDEN_COPT_FLAG_RE = re.compile(
-    r"^(?:--?(?:include|imacros|f?trigraphs|iquote|isystem|idirafter|"
-    r"iwithprefix|iwithsysroot)|-I)"
+    r"^(?:--?(?:include|imacros|f?trigraphs|fms-extensions|iquote|"
+    r"(?:cxx-)?isystem|idirafter|iwithprefix|iwithsysroot)|-I)"
 )
 FORBIDDEN_COPT_ADJACENT_FLAGS = frozenset({
     "-include", "--include",
@@ -247,6 +248,7 @@ FORBIDDEN_COPT_ADJACENT_FLAGS = frozenset({
     "-I",
     "-iquote", "--iquote",
     "-isystem", "--isystem",
+    "-cxx-isystem", "--cxx-isystem",
     "-idirafter", "--idirafter",
     "--include-directory", "--include-directory-after",
     "-iwithprefix", "-iwithprefixbefore", "-iwithsysroot",
