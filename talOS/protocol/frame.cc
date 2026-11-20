@@ -102,7 +102,7 @@ DecodeStatus DecodeFrame(const uint8_t* data, std::size_t size,
     return DecodeStatus::kPayloadTooLarge;
   }
   const std::size_t frame_size = kFrameHeaderSize + header.payload_size;
-  if (size < frame_size) {
+  if (size != frame_size) {
     return DecodeStatus::kTruncated;
   }
   out->header = header;

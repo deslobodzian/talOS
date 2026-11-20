@@ -32,11 +32,13 @@ struct UdpSocketOptions {
 struct UdpStats {
   uint64_t sent_frames = 0;
   uint64_t sent_bytes = 0;
+  uint64_t send_would_block = 0;
   uint64_t received_frames = 0;
   uint64_t received_bytes = 0;
   uint64_t receive_would_block = 0;
   uint64_t decode_failures = 0;
   uint64_t sequence_gaps = 0;
+  uint64_t out_of_order_frames = 0;
   uint64_t last_received_sequence = 0;
   DecodeStatus last_decode_status = DecodeStatus::kOk;
   // The header version of the last kUnsupportedVersion frame; 0 before one.
@@ -45,6 +47,9 @@ struct UdpStats {
   // returned kSocketError from an open socket; 0 before one, or when that
   // send was short with no error.
   int last_send_error = 0;
+  // The OS error (errno; WSAGetLastError() on Windows) of the last receive
+  // that returned kSocketError from an open socket; 0 before one.
+  int last_recv_error = 0;
 };
 
 // Connected UDP runtime peer for the Mac<->Rio hot path.
