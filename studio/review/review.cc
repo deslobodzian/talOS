@@ -7,7 +7,6 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -89,33 +88,22 @@ struct SessionEntry {
 };
 
 // The largest manifest.json the listing parses; a larger one (no launcher
-// writes one) lists the session without its times. The launcher's
-// session_class file is one short line.
+// writes one) lists the session without its times.
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
-constexpr std::size_t kMaxClassFileBytes = 256;
 
 // A session's class from what the launcher already decided, never from its
 // logs: a simulation, or a session without a manifest, is "other", as
-// retention classifies it; else the launcher's session_class
-// file when it is current (written by RecordedMatch: "match" for good,
-// "other" while the event logs hold the bytes it counted), else "unknown".
+// retention classifies it; else the launcher's cached session_class verdict
+// when current (CachedRecordedMatch), else "unknown".
 std::string_view ClassOf(const fs::path& dir, const SessionEntry& entry) {
   if (!entry.classified) return "other";
   std::uintmax_t log_bytes = 0;
   for (const auto& [name, bytes] : entry.files) {
     if (name.ends_with(".tlog")) log_bytes += bytes;
   }
-  std::ifstream stream{dir / std::string{talos::launcher::kSessionClassFile}};
-  std::string line(kMaxClassFileBytes, '\0');
-  stream.read(line.data(), static_cast<std::streamsize>(line.size()));
-  line.resize(static_cast<std::size_t>(stream.gcount()));
-  std::istringstream cached{line};
-  std::string verdict;
-  std::uintmax_t bytes = 0;
-  if (cached >> verdict >> bytes) {
-    if (verdict == "match") return "match";
-    if (verdict == "other" && bytes == log_bytes) return "other";
-  }
+  const auto verdict = talos::launcher::CachedRecordedMatch(dir, log_bytes);
+  if (verdict == talos::launcher::MatchVerdict::kMatch) return "match";
+  if (verdict == talos::launcher::MatchVerdict::kOther) return "other";
   return "unknown";
 }
 
@@ -485,21 +473,26 @@ Response Review::Snapshot(const Session& session, std::string_view query) {
   std::string out{"{\"t_ns\":"};
   AppendI64(out, t_ns);
   out += ",\"channels\":{";
+  constexpr std::size_t kClosingBytes = 2;  // "}}"
+  std::string entry;
   bool first = true;
   for (const Sample& sample : samples) {
     const auto& channel = session.channel(sample.channel);
-    if (!first) out += ',';
-    first = false;
-    AppendEscaped(out, channel.name);
-    out += ":{\"value\":";
+    entry.clear();
+    if (!first) entry += ',';
+    AppendEscaped(entry, channel.name);
+    entry += ":{\"value\":";
     if (sample.reading) {
-      AppendSample(out, channel.kind, sample.raw);
+      AppendSample(entry, channel.kind, sample.raw);
     } else {
-      out += "null";
+      entry += "null";
     }
-    out += ",\"sample_ns\":";
-    AppendI64(out, sample.sample_ns);
-    out += '}';
+    entry += ",\"sample_ns\":";
+    AppendI64(entry, sample.sample_ns);
+    entry += '}';
+    if (out.size() + entry.size() + kClosingBytes > kMaxSnapshotBytes) break;
+    out += entry;
+    first = false;
   }
   out += "}}";
   return {200, "application/json", std::move(out)};

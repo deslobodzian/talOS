@@ -612,6 +612,7 @@ struct WindowedLogReader::State {
   std::vector<ManifestEntry> entries;
   Manifest manifest;
   MonotonicTime start_time;
+  std::int64_t start_wall_ns{0};
   std::uint64_t session_id{0};
   std::string process_name;
   std::uint64_t records_offset{0};  // where the first record would start
@@ -685,6 +686,7 @@ WindowedLogReader::WindowedLogReader(std::string_view path)
   }
 
   state.start_time = MonotonicTime::from_nanos(header.start_monotonic_ns);
+  state.start_wall_ns = header.start_wall_ns;
   state.session_id = header.session_id;
   state.process_name = read_name(header.process_name);
   // The records, through a fixed window that a resynchronising scan can
@@ -711,6 +713,9 @@ std::span<const ManifestEntry> WindowedLogReader::manifest_entries()
 }
 MonotonicTime WindowedLogReader::start_time() const noexcept {
   return state_->start_time;
+}
+std::int64_t WindowedLogReader::start_wall_ns() const noexcept {
+  return state_->start_wall_ns;
 }
 const std::string& WindowedLogReader::process_name() const noexcept {
   return state_->process_name;

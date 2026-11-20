@@ -45,6 +45,7 @@
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/launcher/hardware_record.h"
+#include "talOS/launcher/session_retention.h"
 #include "talOS/protocol/types.h"
 #include "talOS/telemetry/frames.h"
 
@@ -1079,10 +1080,8 @@ TEST_F(ReviewTest, ListingClassifiesFromTheLauncherCacheOnly) {
     const char* cache;  // session_class's content, or null for none
     const char* expected;
   } cases[] = {
-      {nullptr, "unknown"},
-      {"match 0\n", "match"},
-      {"stale", "unknown"},
-      {"current", "other"},
+      {nullptr, "unknown"},        {"match 0\n", "match"}, {"stale", "unknown"},
+      {"stale_reader", "unknown"}, {"current", "other"},
   };
   for (const auto& c : cases) {
     SCOPED_TRACE(c.cache == nullptr ? "no cache" : c.cache);
@@ -1091,8 +1090,13 @@ TEST_F(ReviewTest, ListingClassifiesFromTheLauncherCacheOnly) {
       std::filesystem::remove(file);
     } else if (std::string_view{c.cache} == "stale") {
       std::ofstream{file} << "other " << log_bytes + 1 << '\n';
+    } else if (std::string_view{c.cache} == "stale_reader") {
+      std::ofstream{file} << "other " << log_bytes << " old.reader\n";
     } else if (std::string_view{c.cache} == "current") {
-      std::ofstream{file} << "other " << log_bytes << '\n';
+      std::filesystem::remove(file);
+      ASSERT_EQ(talos::launcher::RecordedMatch(
+                    library / "s1", talos::launcher::ClassCache::kReadWrite),
+                talos::launcher::MatchVerdict::kOther);
     } else {
       std::ofstream{file} << c.cache;
     }
@@ -1896,6 +1900,112 @@ TEST_F(ReviewTest, TimelineAlertsFollowCanonicalStreamAndSkipNonCanonical) {
               std::to_string(kStartNs + 5 * kSecond));
     EXPECT_EQ(tl["alerts"][1]["end_ns"],
               std::to_string(kStartNs + 6 * kSecond));
+  }
+}
+
+// A reflection schema for one struct of `count` bool fields, each named
+// `<prefix><0..count-1>`, used to exercise snapshot channel and byte caps.
+std::string ManyBoolsSchema(const std::string& struct_name,
+                            const std::string& prefix, std::uint16_t count) {
+  flatbuffers::FlatBufferBuilder fbb;
+  const auto bool_type = reflection::CreateType(
+      fbb, reflection::BaseType::Bool, reflection::BaseType::None, -1, 0, 1);
+  std::vector<std::pair<std::string, std::uint16_t>> names;
+  names.reserve(count);
+  for (std::uint16_t i = 0; i < count; ++i) {
+    names.emplace_back(prefix + std::to_string(i), i);
+  }
+  std::sort(names.begin(), names.end());
+  std::vector<flatbuffers::Offset<reflection::Field>> fields;
+  fields.reserve(count);
+  for (const auto& [name, id] : names) {
+    fields.push_back(
+        reflection::CreateFieldDirect(fbb, name.c_str(), bool_type, id, id));
+  }
+  std::vector<flatbuffers::Offset<reflection::Object>> objects{
+      reflection::CreateObjectDirect(fbb, struct_name.c_str(), &fields,
+                                     /*is_struct=*/true, /*minalign=*/1,
+                                     /*bytesize=*/count),
+  };
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+  reflection::FinishSchemaBuffer(
+      fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+  return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+}
+
+// Guards REQ-OPS-42's snapshot ceiling: a session with more than
+// kMaxSnapshotChannels channels returns valid JSON capped at
+// kMaxSnapshotChannels, and one whose channel names would exceed
+// kMaxSnapshotBytes stops before exceeding kMaxSnapshotBytes while keeping
+// valid JSON.
+// REQ-OPS-42
+TEST_F(ReviewTest, SnapshotStaysWithinChannelAndByteCaps) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const auto write_many = [&](const std::string& dir, const std::string& name,
+                              const std::string& prefix, std::size_t topics,
+                              std::uint16_t fields_per_topic) {
+    std::filesystem::create_directories(dir);
+    const std::string schema_name = "review_test." + name;
+    const std::string bfbs =
+        ManyBoolsSchema(schema_name, prefix, fields_per_topic);
+    std::vector<talos::event::Registration> sources;
+    sources.reserve(topics);
+    for (std::size_t t = 0; t < topics; ++t) {
+      talos::event::Registration reg;
+      reg.id = static_cast<std::uint16_t>(t + 1);
+      reg.kind = SourceKind::SENDER;
+      reg.name = "/t" + std::to_string(t) + "/state";
+      reg.message_bytes = fields_per_topic;
+      reg.schema = {schema_name, 100 + t, bfbs};
+      sources.push_back(std::move(reg));
+    }
+    tlog::LogWriter writer{dir + "/many.tlog", "many",
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start(sources, MonotonicTime::from_nanos(kStartNs));
+    const std::vector<std::byte> payload(fields_per_topic, std::byte{1});
+    std::uint64_t seq = 0;
+    for (std::size_t t = 0; t < topics; ++t) {
+      Context ctx{};
+      ctx.dispatch_index = ++seq;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(ctx, static_cast<std::uint16_t>(t + 1), payload, 0, seq);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  };
+
+  // Subcase 1: 9,000 short-named channels hit kMaxSnapshotChannels (8,192).
+  {
+    const std::string dir = Library() + "/snap_channels";
+    write_many(dir, "snap_channels", "f", 9, 1000);
+    Review review{Library(), 1u << 20};
+    const Response resp = review.Get("/review/snap_channels/snapshot",
+                                     "t_ns=" + std::to_string(kStartNs));
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    EXPECT_LE(resp.body.size(), kMaxSnapshotBytes);
+    const json parsed = json::parse(resp.body);
+    EXPECT_EQ(parsed["channels"].size(), kMaxSnapshotChannels);
+  }
+
+  // Subcase 2: 9,000 long-named channels (~300 B JSON each) hit
+  // kMaxSnapshotBytes (2 MiB) before kMaxSnapshotChannels and stay valid JSON.
+  {
+    const std::string dir = Library() + "/snap_bytes";
+    write_many(dir, "snap_bytes", std::string(240, 'x') + "_", 9, 1000);
+    Review review{Library(), 1u << 20};
+    const Response resp = review.Get("/review/snap_bytes/snapshot",
+                                     "t_ns=" + std::to_string(kStartNs));
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(resp.status, 200) << resp.body;
+    EXPECT_LE(resp.body.size(), kMaxSnapshotBytes);
+    const json parsed = json::parse(resp.body);
+    EXPECT_GT(parsed["channels"].size(), 0u);
+    EXPECT_LT(parsed["channels"].size(), kMaxSnapshotChannels);
   }
 }
 

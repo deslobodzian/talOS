@@ -146,5 +146,30 @@ TEST(SessionRetentionTest, HandlesMissingCorruptPartialAndCompactManifests) {
   fs::remove_all(root);
 }
 
+// Guards CachedRecordedMatch: reads only session_class without scanning logs
+// or writing into the directory, accepts match regardless of log_bytes, and
+// requires exact log_bytes and current reader identity for other/unknown.
+// REQ-OPS-42
+TEST(SessionRetentionTest, CachedRecordedMatchReadsCacheOnly) {
+  const fs::path dir = TempDir("cached_only");
+  EXPECT_EQ(CachedRecordedMatch(dir, 0), std::nullopt);
+  EXPECT_FALSE(fs::exists(dir / std::string{kSessionClassFile}));
+
+  // Populates session_class with this build's ReaderIdentity for an empty dir.
+  EXPECT_EQ(RecordedMatch(dir, ClassCache::kReadWrite), MatchVerdict::kOther);
+  EXPECT_EQ(CachedRecordedMatch(dir, 0), MatchVerdict::kOther);
+  EXPECT_EQ(CachedRecordedMatch(dir, 1), std::nullopt);
+
+  // Stale reader identity misses cache.
+  std::ofstream{dir / std::string{kSessionClassFile}} << "other 0 old.reader\n";
+  EXPECT_EQ(CachedRecordedMatch(dir, 0), std::nullopt);
+
+  // Match holds regardless of log_bytes or reader identity.
+  std::ofstream{dir / std::string{kSessionClassFile}} << "match 999\n";
+  EXPECT_EQ(CachedRecordedMatch(dir, 0), MatchVerdict::kMatch);
+
+  fs::remove_all(dir);
+}
+
 }  // namespace
 }  // namespace talos::launcher

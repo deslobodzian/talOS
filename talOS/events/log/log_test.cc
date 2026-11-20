@@ -787,6 +787,30 @@ TEST(WindowedLogReaderLimits, MoreReadersThanTheDescriptorLimit) {
   ::unlink(source.c_str());
 }
 
+// Guards WindowedLogReader::start_wall_ns() and start_time() against LogReader:
+// callers mapping monotonic log times to wall clock (studio_review) read both
+// from WindowedLogReader without re-opening raw FileHeaders.
+// REQ-OPS-41
+TEST(WindowedLogReaderLimits, StartWallNsMatchesLogReader) {
+  const std::string path = TempPath("start_wall_ns");
+  WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  constexpr std::int64_t kPinnedWallNs = 1'767'225'600'123'456'789LL;
+  {
+    std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
+    ASSERT_TRUE(file.is_open());
+    file.seekp(offsetof(FileHeader, start_wall_ns));
+    file.write(reinterpret_cast<const char*>(&kPinnedWallNs),
+               sizeof kPinnedWallNs);
+    ASSERT_TRUE(file);
+  }
+  const LogReader full{path};
+  const WindowedLogReader windowed{path};
+  EXPECT_EQ(windowed.start_wall_ns(), kPinnedWallNs);
+  EXPECT_EQ(windowed.start_wall_ns(), full.start_wall_ns());
+  EXPECT_EQ(windowed.start_time().nanos(), full.start_time().nanos());
+  ::unlink(path.c_str());
+}
+
 // Where the fixture's record of `kind` in dispatch `dispatch` is.
 std::size_t FixtureIndex(const std::vector<ExpectedRecord>& expected,
                          std::uint64_t dispatch, EventKind kind) {
