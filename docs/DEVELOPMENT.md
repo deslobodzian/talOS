@@ -106,7 +106,9 @@ cached test result (build results come from the disk cache
 host whose standard library clang 18 cannot parse, it prints `tidy NOT RUN`
 with the reason and does not fail the run: CI is then the first to run
 clang-tidy), runs the gradle checks when the commits to
-push touch the RoboRIO program or anything under `talOS/` (its
+push (since the checked branch's upstream, else since the merge base with
+`origin/main`; every file when neither exists) touch the RoboRIO program or
+anything under `talOS/` (its
 `build.gradle` takes headers from all of it), runs CI's RoboRIO-in-the-loop
 check (`tools/test_rio_in_the_loop.py --wpilib`, about 30 s) when they touch
 that tool, `bench/`, the RoboRIO program, anything under `talOS/`, or what
@@ -131,9 +133,10 @@ leaves `TALOS_REQUIRE_NETNS=1` unset, so
 where it finds no browser
 ([the test's search](../studio/README.md#driver-dashboard-in-a-browser))
 it leaves `TALOS_REQUIRE_BROWSER=1` unset, so `//studio:drive_browser_test`
-skips where CI fails it; and Studio's checks use the checkout's installed `studio/node_modules`
-(an offline `pnpm install` when there is none or the commits change
-`studio/pnpm-lock.yaml`, and studio SKIPPED if that fails). It prints one
+skips where CI fails it; and Studio's checks reuse the checkout's installed `studio/node_modules`
+when its `studio/node_modules/.pnpm/lock.yaml` matches the worktree's
+`studio/pnpm-lock.yaml` (otherwise running an offline `pnpm install`, and
+reporting studio SKIPPED if that fails). It prints one
 line per step and exits nonzero if any failed; the script's header lists
 its flags and steps. With `TALOS_ROBOT_REPOSITORY` set to the checkout of
 a robot repository that consumes talOS, it also runs

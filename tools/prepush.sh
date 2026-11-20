@@ -35,9 +35,9 @@
 # (tools/tidy.sh with format's base, CI's clang-tidy selection; where it
 # exits 3, cannot run on this host, the line `prepush: tidy NOT RUN
 # (<its reason>)`, which does not fail the run), then, when the commits to push
-# (<ref>@{upstream}..<ref>; every file when <ref> is not a branch with an
-# upstream) touch MODULE.bazel, REPO.bazel, third_party/, talOS/, tools/ or
-# the fixtures,
+# (<ref>@{upstream}...<ref>, else since the merge base with origin/main,
+# else every file when neither exists) touch MODULE.bazel, REPO.bazel,
+# third_party/, talOS/, tools/ or the fixtures,
 # dependent-robot_repo and dependent-wrist_repo (`bazel test //...
 # @talos//talOS/configuration:config_fuzz_test` inside examples/robot_repo
 # and examples/wrist_repo, the repositories that depend on talOS) and
@@ -86,9 +86,9 @@
 # where it finds the browser //studio:drive_browser_test would use, it sets
 # TALOS_REQUIRE_BROWSER=1 (and passes TALOS_BROWSER when set); with none,
 # that test skips and the run says so. JAVA_HOME, when unset, defaults to
-# ~/wpilib/2026/jdk if that directory exists. Studio trusts the checkout's installed
-# studio/node_modules when present, unless the commits to push change
-# studio/pnpm-lock.yaml: then, as when none is installed, it runs `pnpm
+# ~/wpilib/2026/jdk if that directory exists. Studio reuses the checkout's
+# installed studio/node_modules when its studio/node_modules/.pnpm/lock.yaml
+# matches the worktree's studio/pnpm-lock.yaml; otherwise it runs `pnpm
 # install --frozen-lockfile --offline` and reports studio SKIPPED if that
 # fails.
 #
@@ -229,13 +229,22 @@ skip() {  # skip NAME REASON: a step that should have run and did not.
 
 # Which optional steps the commits to push need.
 # The range is from the checked branch's upstream (--ref's own when it
-# names a branch); for any other commit there is none, and every optional
-# step runs.
+# names a branch), else from the merge base with origin/main; when neither
+# exists (or shares no history with the commit), every optional step runs.
 upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name "$ref@{upstream}" 2>/dev/null || true)"
+touches_base=""
+touches_from=""
+if [ -n "$upstream" ]; then
+  touches_base="$upstream"
+  touches_from="$upstream"
+elif git -C "$repo" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+  touches_base="$(git -C "$repo" merge-base refs/remotes/origin/main "$commit" 2>/dev/null || true)"
+  touches_from="origin/main"
+fi
 touches() {  # touches PATH...: the pushed range changes something under PATH.
-  [ -z "$upstream" ] && return 0
+  [ -z "$touches_base" ] && return 0
   local changed
-  changed="$(git -C "$repo" diff --name-only "$upstream...$commit" -- "$@")" || return 0
+  changed="$(git -C "$repo" diff --name-only "$touches_base...$commit" -- "$@")" || return 0
   [ -n "$changed" ]
 }
 
@@ -408,7 +417,7 @@ fi
 # read there.
 dependent_paths=(MODULE.bazel REPO.bazel talos.bazelrc .bazelversion third_party/ talOS/ tools/ examples/robot_repo/ examples/wrist_repo/)
 if ! touches "${dependent_paths[@]}"; then
-  report "dependents not needed (nothing under ${dependent_paths[*]} since $upstream)"
+  report "dependents not needed (nothing under ${dependent_paths[*]} since $touches_from)"
 elif [ ! -d "$wt/examples/robot_repo" ]; then
   report "dependents not needed (this commit has no examples/robot_repo)"
 else
@@ -459,7 +468,7 @@ rio_paths=(controller_processor/ talOS/)
 if [ "$skip_gradle" = 1 ]; then
   report "gradle skipped (--skip-gradle)"
 elif ! touches "${rio_paths[@]}"; then
-  report "gradle not needed (nothing under ${rio_paths[*]} since $upstream)"
+  report "gradle not needed (nothing under ${rio_paths[*]} since $touches_from)"
 else
   run_step gradle sh -c \
     'cd controller_processor/rio && ./gradlew phoenixTest buildRio -Pcompanion=10.0.0.2 -Pheadless --offline' ||
@@ -479,7 +488,7 @@ rio_loop_paths=(tools/test_rio_in_the_loop.py bench/ controller_processor/
 if [ "$skip_gradle" = 1 ]; then
   report "rio-in-the-loop skipped (--skip-gradle)"
 elif [ "$full" = 0 ] && ! touches "${rio_loop_paths[@]}"; then
-  report "rio-in-the-loop not needed (nothing under ${rio_loop_paths[*]} since $upstream)"
+  report "rio-in-the-loop not needed (nothing under ${rio_loop_paths[*]} since $touches_from)"
 elif [ ! -f "$wt/tools/test_rio_in_the_loop.py" ]; then
   no_tool rio-in-the-loop tools/test_rio_in_the_loop.py
 elif [ "$built" = 0 ]; then
@@ -520,10 +529,12 @@ run_step checkout-unchanged sh -c \
 if [ "$skip_studio" = 1 ]; then
   report "studio skipped (--skip-studio)"
 elif ! touches studio/; then
-  report "studio not needed (nothing under studio/ since $upstream)"
+  report "studio not needed (nothing under studio/ since $touches_from)"
 else
   studio_ready=1
-  if [ -d "$repo/studio/node_modules" ] && ! touches studio/pnpm-lock.yaml; then
+  if [ -d "$repo/studio/node_modules" ] &&
+      [ -f "$repo/studio/node_modules/.pnpm/lock.yaml" ] &&
+      cmp -s "$repo/studio/node_modules/.pnpm/lock.yaml" "$wt/studio/pnpm-lock.yaml"; then
     ln -s "$repo/studio/node_modules" "$wt/studio/node_modules"
   elif ! run_step studio-install sh -c \
       'cd studio && pnpm install --frozen-lockfile --offline'; then

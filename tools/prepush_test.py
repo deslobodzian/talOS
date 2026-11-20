@@ -359,6 +359,92 @@ class PrepushTest(unittest.TestCase):
         with open(self.pnpm_log, encoding="utf-8") as f:
             self.assertEqual([line.split()[0] for line in f], ["install"])
 
+    # REQ-DEV-25: on a branch without an upstream, studio reuses the checkout's
+    # node_modules when its recorded .pnpm/lock.yaml matches the committed
+    # pnpm-lock.yaml, and refuses stale node_modules whose recorded lockfile
+    # differs.
+    def test_studio_reuses_modules_only_when_recorded_lockfile_matches(self):
+        self.commit("studio/pnpm-lock.yaml", "lockfile-v1")
+        put(os.path.join(self.repo, "studio", "node_modules", ".pnpm",
+                         "lock.yaml"), "lockfile-v1\n")
+        status, out, _ = self.prepush("--skip-gradle",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: studio-test ok", out)
+        self.assertIn("prepush: studio-build ok", out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f],
+                             ["test", "build"])
+
+        # Stale node_modules recorded an older lockfile: must not symlink.
+        os.remove(self.pnpm_log)
+        put(os.path.join(self.repo, "studio", "node_modules", ".pnpm",
+                         "lock.yaml"), "lockfile-old\n")
+        status, out, _ = self.prepush("--skip-gradle",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: studio SKIPPED", out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f], ["install"])
+
+    # REQ-DEV-25: an unpushed branch with no upstream falls back to the merge
+    # base with origin/main for optional steps, and still runs everything when
+    # origin/main is absent.
+    def test_optional_steps_fall_back_to_origin_main_without_upstream(self):
+        self.add_gradlew()
+        self.commit("studio/pnpm-lock.yaml", "lockfile-v1")
+        put(os.path.join(self.repo, "studio", "node_modules", ".pnpm",
+                         "lock.yaml"), "lockfile-v1\n")
+
+        # Neither upstream nor origin/main: every optional step runs.
+        self.commit("docs/before_remote.md", "docs before remote")
+        status, out, _ = self.prepush("--ref", "HEAD",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(self.gradle_ran(), out)
+        self.assertEqual([c[1] for c in self.full_calls()], ["rio"], out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f],
+                             ["test", "build"])
+        os.remove(self.pnpm_log)
+
+        # With origin/main present and no upstream, a doc-only change skips
+        # gradle, rio-in-the-loop and studio.
+        remote = os.path.join(self.tmp, "remote.git")
+        self.git("init", "-q", "--bare", remote)
+        self.git("remote", "add", "origin", remote)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/main")
+        self.git("fetch", "-q", "origin")
+        self.commit("docs/only_docs.md", "docs only")
+        status, out, _ = self.prepush("--ref", "HEAD")
+        self.assertEqual(status, 0, out)
+        self.assertFalse(self.gradle_ran(), out)
+        self.assertEqual(self.full_calls(), [], out)
+        self.assertFalse(os.path.exists(self.pnpm_log), out)
+        self.assertIn("gradle not needed (nothing under controller_processor/ "
+                      "talOS/ since origin/main)", out)
+        self.assertIn("studio not needed (nothing under studio/ since "
+                      "origin/main)", out)
+
+        # Touching talOS/ runs gradle and rio-in-the-loop, still skips studio.
+        self.commit("talOS/x.h", "talos header")
+        status, out, _ = self.prepush("--ref", "HEAD")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(self.gradle_ran(), out)
+        self.assertEqual([c[1] for c in self.full_calls()], ["rio"], out)
+        self.assertFalse(os.path.exists(self.pnpm_log), out)
+
+        # Touching studio/ runs studio too.
+        self.commit("studio/x.ts", "studio source")
+        status, out, _ = self.prepush("--ref", "HEAD",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(self.gradle_ran(), out)
+        self.assertEqual([c[1] for c in self.full_calls()], ["rio"], out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f],
+                             ["test", "build"])
+
     # REQ-DEV-25
     def test_gradle_runs_for_any_source_the_roborio_program_compiles(self):
         # build.gradle compiles talOS/driver_station/driver_station.cc and
