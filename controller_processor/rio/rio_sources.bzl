@@ -11,10 +11,16 @@ def _rio_sources_aspect_impl(_target, ctx):
         collected.extend(ctx.rule.files.srcs)
     if hasattr(ctx.rule.files, "hdrs"):
         collected.extend(ctx.rule.files.hdrs)
-    return [RioSourcesInfo(files = depset(collected))]
+    transitive = [
+        dep[RioSourcesInfo].files
+        for dep in getattr(ctx.rule.attr, "deps", [])
+        if RioSourcesInfo in dep
+    ]
+    return [RioSourcesInfo(files = depset(collected, transitive = transitive))]
 
 _rio_sources_aspect = aspect(
     implementation = _rio_sources_aspect_impl,
+    attr_aspects = ["deps"],
 )
 
 def _rlocation_and_relpath(f):
@@ -26,14 +32,25 @@ def _rlocation_and_relpath(f):
         rlocation = "_main/" + relpath
     return relpath, rlocation
 
+def _in_talos_repo(f, module_short_path):
+    if module_short_path.startswith("../"):
+        prefix = module_short_path.rpartition("/")[0] + "/"
+        return f.short_path.startswith(prefix)
+    return not f.short_path.startswith("../")
+
 def _rio_stage_manifest_impl(ctx):
     files = depset(
         ctx.files.srcs,
         transitive = [dep[RioSourcesInfo].files for dep in ctx.attr.talos_deps],
     )
+    module_short_path = ctx.file.module_file.short_path
     _, module_rlocation = _rlocation_and_relpath(ctx.file.module_file)
     entries = {}
+    talos_files = []
     for f in files.to_list():
+        if not _in_talos_repo(f, module_short_path):
+            continue
+        talos_files.append(f)
         relpath, rlocation = _rlocation_and_relpath(f)
         entries[relpath] = rlocation
     payload = {
@@ -43,8 +60,7 @@ def _rio_stage_manifest_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".json")
     ctx.actions.write(output = out, content = json.encode_indent(payload) + "\n")
     runfiles = ctx.runfiles(
-        files = [out, ctx.file.module_file],
-        transitive_files = files,
+        files = [out, ctx.file.module_file] + talos_files,
     )
     return [
         DefaultInfo(

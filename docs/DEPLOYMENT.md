@@ -621,18 +621,27 @@ bazel run @talos//controller_processor/rio:gradlew -- deploy -PteamNumber=<team>
 
 `@talos//controller_processor/rio:gradlew` stages the Gradle project and the
 `talOS/` sources it compiles into a cache directory (`$XDG_CACHE_HOME/talos/rio`
-or `~/.cache/talos/rio`), computes `-PtalosRevision` and `-PtalosDirty` from the
-pinned talOS checkout before copying, and forwards the robot repository's
-`.wpilib/wpilib_preferences.json` (if present). From a talOS checkout directly,
-run `(cd controller_processor/rio && ./gradlew deploy -PteamNumber=<team> -Pcompanion=<ipv4>)`
-(or `bazel run //controller_processor/rio:gradlew -- ...`).
+or `~/.cache/talos/rio`, keyed by both the talOS root and the calling workspace
+and preferences so concurrent robot repositories sharing one talOS checkout do
+not collide, and serialized with an exclusive lock across staging and Gradle),
+computes `-PtalosRevision` and `-PtalosDirty` from the pinned talOS git work
+tree before copying (refusing caller-supplied `talosRevision` or `talosDirty`
+overrides when a git checkout stamp exists), and forwards the robot
+repository's `.wpilib/wpilib_preferences.json` (if present). From a talOS
+checkout directly, run `(cd controller_processor/rio && ./gradlew deploy
+-PteamNumber=<team> -Pcompanion=<ipv4>)` (or `bazel run
+//controller_processor/rio:gradlew -- ...`).
 
-Deployed from a copy with no talOS git history (including a copy placed inside
-an unrelated git repository, whose work-tree root does not match the talOS
-root), add `-PtalosRevision=<first 16 hex digits of its commit>
--PtalosDirty=true|false` (whether the copy differs from that commit) so its
-State still names the build; inside a talOS git checkout itself the build
-refuses them ([build stamp](../talOS/hardware/README.md#roborio)).
+Deployed from a copy with no talOS git history — including when a robot
+repository fetches talOS via `git_override` or an archive (so Bazel's external
+`@talos` repository contains no `.git` directory), or a copy placed inside an
+unrelated git repository whose work-tree root does not match the talOS root —
+`@talos//controller_processor/rio:gradlew` builds with revision `0`
+(`"unknown"`) unless `-PtalosRevision=<first 16 hex digits of its commit>
+-PtalosDirty=true|false` (whether the copy differs from that commit) is passed
+on the command line; inside a talOS git checkout itself (including
+`local_path_override` or a git submodule), both the runner and `build.gradle`
+refuse those overrides ([build stamp](../talOS/hardware/README.md#roborio)).
 Deploy it from the talOS checkout the main-processor bundle was built
 against (the one a robot repository's `MODULE.bazel` names): each side
 rejects frames of another protocol version (currently 11; see
