@@ -10,6 +10,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -37,6 +38,22 @@
 
 namespace talos::launcher {
 namespace {
+
+// The main-processor node clock (talos::event::Poller::now()):
+// CLOCK_MONOTONIC on Linux, CLOCK_MONOTONIC_RAW on macOS.
+int64_t NodeClockNanos() {
+  struct timespec ts {};
+#if defined(__APPLE__)
+  ::clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+  ::clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+  return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
+}
+
+// How often Supervise checks whether every non-observer member's loop has
+// started while waiting to write kSimScheduleStartFile. Stops once written.
+constexpr std::chrono::milliseconds kSimScheduleStartPoll{20};
 
 // The topic ends a registry row published, or nullopt while it has
 // published none: a row is visible from its claim, and a writer that never
@@ -834,6 +851,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   std::vector<NodeProcessInfo> procs;
   procs.reserve(node_specs.size());
   std::optional<StudioBridge> studio;
+  std::optional<std::size_t> sim_gateway_index;
   for (std::size_t i = 0; i < node_specs.size(); ++i) {
     const auto& spec = node_specs[i];
     NodeProcessInfo& proc = procs.emplace_back();
@@ -845,6 +863,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     // event log.
     if (!spec.sim_gateway) {
       proc.log_path = NodeLogPath(options_.output_dir, spec.name, 0);
+    } else if (!HasSimulatorScheduleStartArg(options_.sim_gateway_args)) {
+      sim_gateway_index = i;
     }
     proc.described = described[i].answered;
     if (spec.studio_bridge) {
@@ -918,7 +938,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     studio->Start(procs[studio->index()], options_.supervision_clock);
   PersistManifest(procs);
 
-  Supervise(procs, launches, studio, deadline);
+  Supervise(procs, launches, studio, sim_gateway_index, deadline);
   manifest.end_wall_ns = WallClockNanos();
   // Every run has been reaped and its group killed, so the pipes end.
   output_->Stop();
@@ -980,6 +1000,11 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
     // 0, which every mechanism rejects.
     args.insert(args.end(), {"--config", options_.config_path, "--session-id",
                              std::to_string(options_.session_id)});
+    if (!HasSimulatorScheduleStartArg(options_.sim_gateway_args)) {
+      args.insert(args.end(), {"--schedule-start-file",
+                               options_.output_dir + "/" +
+                                   std::string{kSimScheduleStartFile}});
+    }
   } else {
     args.insert(args.end(),
                 {"--session-id", std::to_string(options_.session_id), "--log"});
@@ -1216,6 +1241,7 @@ void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
   heartbeat_killed = false;
   endpoints_checked = false;
   realtime_reported = false;
+  loop_started = false;
 }
 
 void Launcher::SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -1404,6 +1430,7 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
                         const introspect::RegistryMapping* registry) {
   bool changed = false;
   uint32_t recording = 0;
+  bool row_loop_started = false;
   std::optional<std::vector<naming::SourceShape>> live;
   bool live_complete = true;
   std::optional<DeliveryCounts> delivery;
@@ -1433,6 +1460,9 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
           (flags & introspect::kFlagConstructing) == 0) {
         published = PublishedEndpoints(record, live_complete);
       }
+      const bool loop_ready =
+          (flags & introspect::kFlagConstructing) == 0 &&
+          (introspect::RealtimeOf(flags).has_value() || dispatch > 0);
       DeliveryCounts loss = DeliveryCountsOf(record);
       if (record.generation.load(std::memory_order_acquire) != generation ||
           record.state.load(std::memory_order_acquire) !=
@@ -1441,6 +1471,7 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
       live = std::move(published);
       delivery = std::move(loss);
       recording = flags;
+      row_loop_started = loop_ready;
       return {.found = true,
               .constructing = (flags & introspect::kFlagConstructing) != 0,
               .heartbeat = beat,
@@ -1453,6 +1484,7 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   // against this run (RunLiveness).
   const LivenessCheck check = launch.liveness.Watch(options_.supervision_clock,
                                                     read_row, launch.limits);
+  if (row_loop_started) launch.loop_started = true;
   if (NoteRecording(proc, launch, recording)) changed = true;
   if (NoteRealtime(proc, launch, recording)) changed = true;
   // Kept every pass, posted only when a count first leaves 0: a later
@@ -1484,8 +1516,10 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
 void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                          std::vector<NodeLaunch>& launches,
                          std::optional<StudioBridge>& studio,
+                         std::optional<std::size_t> sim_gateway_index,
                          std::chrono::steady_clock::time_point deadline) {
   bool stop_sent = false;
+  bool sim_schedule_started = !sim_gateway_index.has_value();
   auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
   std::optional<introspect::RegistryMapping> registry;
   // Every first run's liveness counts from here, not its spawn.
@@ -1665,6 +1699,42 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
         manifest_changed = true;
       }
     }
+    if (!sim_schedule_started && sim_gateway_index && !stop_arrived()) {
+      const auto& gw_proc = procs[*sim_gateway_index];
+      const auto& gw_launch = launches[*sim_gateway_index];
+      bool roster_ready =
+          gw_proc.pid > 0 && !gw_proc.exited && gw_launch.loop_started;
+      for (std::size_t i = 0; roster_ready && i < procs.size(); ++i) {
+        if (studio && i == studio->index()) continue;
+        if (i == *sim_gateway_index) continue;
+        const auto& proc = procs[i];
+        const auto& launch = launches[i];
+        if (proc.pid > 0 && !proc.exited) {
+          roster_ready = launch.loop_started;
+        } else {
+          // Exited or unspawned: wait only while a non-quarantined restart is
+          // pending, so a finished, unrestartable or quarantined member cannot
+          // hold the simulator's schedules forever.
+          roster_ready =
+              !launch.restart.pending() || launch.restart.quarantined();
+        }
+      }
+      if (roster_ready) {
+        const std::string path =
+            options_.output_dir + "/" + std::string{kSimScheduleStartFile};
+        const std::string stamp = std::to_string(NodeClockNanos()) + "\n";
+        std::string write_error;
+        if (WriteFileAtomically(path, stamp, SyncFunction{}, write_error)) {
+          ConsoleLine(std::cout)
+              << "[launcher] Started sim_gateway schedule (" << path << ")\n";
+        } else {
+          ConsoleLine(std::cerr)
+              << "[launcher] cannot write " << path << " (" << write_error
+              << "); sim_gateway schedule not started\n";
+        }
+        sim_schedule_started = true;
+      }
+    }
     if (studio) {
       const auto& bridge = procs[studio->index()];
       // Every run it begins, spawned or not, dropped from the history or not.
@@ -1744,6 +1814,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       if (now < shutdown_deadline) due(shutdown_deadline);
     } else {
       due(deadline);
+      if (!sim_schedule_started) due(now + kSimScheduleStartPoll);
       // Each run the next pass watches (WatchRun): its row's next look.
       for (std::size_t i = 0; i < procs.size(); ++i) {
         if (procs[i].pid <= 0 || procs[i].exited ||

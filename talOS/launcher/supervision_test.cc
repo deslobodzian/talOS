@@ -3761,5 +3761,158 @@ TEST(Supervision, StudioBridgeLivenessAloneWakesTheLoop) {
   for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
 }
 
+// The launcher passes --schedule-start-file <session>/sim_schedule_start to a
+// launcher-managed sim_gateway and holds off writing that file until every
+// non-observer member's loop has started (not constructing), ignoring an
+// observer (studio_bridge) that has not registered.
+// REQ-DEV-05, REQ-DEV-10
+TEST(Supervision, SimGatewayScheduleWaitsForEveryNonObserverLoop) {
+  const auto gateway_args = TempPath("sim_sched_gw_args");
+  ::remove(gateway_args.c_str());
+  auto options = BaseOptions("sim_sched",
+                             "sim_gateway = \"//example/sim_gateway:node\"\n");
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.start_sim_gateway = true;
+  options.start_studio_bridge = true;
+  options.max_restarts = 0;
+  options.duration_s = kHangSeconds;
+  // alpha is a real talos node whose constructor sleeps 1.2 s while
+  // heartbeating kFlagConstructing.
+  {
+    auto config = toml::parse_file(options.config_path);
+    config["subsystems"]["alpha"].as_table()->insert_or_assign(
+        "construction_ms", 1200);
+    std::ofstream{options.config_path} << config;
+  }
+  const std::string loss_binary = RunfileBinary("TALOS_DELIVERY_LOSS_NODE");
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStub(
+      "sim_sched_hardware",
+      "exec " + loss_binary +
+          " hardware_node //talOS/bridge:hardware_node 0,0,0,0,run \"$@\"\n",
+      "hardware_node");
+  options.binary_overrides["//example/alpha:node"] =
+      RunfileBinary("TALOS_CONSTRUCTION_NODE");
+  options.binary_overrides["//example/beta:node"] = WriteStub(
+      "sim_sched_beta",
+      "exec " + loss_binary + " beta //example/beta:node 0,0,0,0,run \"$@\"\n",
+      "beta");
+  options.binary_overrides["//example/sim_gateway:node"] = WriteStub(
+      "sim_sched_gateway",
+      "printf '%s\\n' \"$*\" > '" + gateway_args + "'\nexec " + loss_binary +
+          " sim_gateway //example/sim_gateway:node 0,0,0,0,run --log "
+          "/dev/null \"$@\"\n",
+      "sim_gateway");
+  // An observer that never registers must not hold sim_gateway's schedule.
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("sim_sched_studio", "trap 'exit 0' INT TERM\nexec sleep 30\n",
+                "studio_bridge");
+
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string start_file =
+      session_dir + "/" + std::string{kSimScheduleStartFile};
+  const uint64_t session = options.session_id;
+  bool saw_constructing_without_file = false;
+  bool wrote_early = false;
+  std::string seen;
+  EXPECT_EQ(RunSessionUntil(
+                options,
+                [&](const std::string&) {
+                  const bool file_exists = std::filesystem::exists(start_file);
+                  if (!Registered("alpha", session)) {
+                    if (Registered("sim_gateway", session) &&
+                        Registered("hardware_node", session) &&
+                        Registered("beta", session)) {
+                      if (file_exists) wrote_early = true;
+                      saw_constructing_without_file = true;
+                    }
+                    return false;
+                  }
+                  return file_exists;
+                },
+                seen),
+            0);
+  ASSERT_FALSE(seen.empty()) << "sim_schedule_start was never written";
+  EXPECT_TRUE(saw_constructing_without_file)
+      << "never observed peers running while alpha was constructing";
+  EXPECT_FALSE(wrote_early)
+      << "sim_schedule_start appeared before alpha finished constructing";
+  EXPECT_FALSE(Registered("studio_bridge", session));
+
+  const std::string passed = ReadFile(gateway_args);
+  EXPECT_NE(passed.find("--schedule-start-file " + start_file),
+            std::string::npos)
+      << passed;
+  std::string stamp = ReadFile(start_file);
+  ASSERT_FALSE(stamp.empty());
+  if (stamp.ends_with('\n')) stamp.pop_back();
+  ASSERT_FALSE(stamp.empty());
+  EXPECT_TRUE(std::all_of(stamp.begin(), stamp.end(), [](char c) {
+    return c >= '0' && c <= '9';
+  })) << stamp;
+  EXPECT_GT(std::stoll(stamp), 0);
+
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(gateway_args.c_str());
+}
+
+// When the caller passes --schedule-start-file through --sim-gateway-arg, the
+// launcher forwards it untouched and neither passes nor writes its own
+// sim_schedule_start file.
+// REQ-DEV-05
+TEST(Supervision, CallerScheduleStartFileDisablesLauncherCoordination) {
+  const auto gateway_args = TempPath("custom_sched_gw_args");
+  const auto custom_file = TempPath("custom_sched_start");
+  for (const auto* path : {&gateway_args, &custom_file})
+    ::remove(path->c_str());
+  auto options = BaseOptions("custom_sched",
+                             "sim_gateway = \"//example/sim_gateway:node\"\n");
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.start_sim_gateway = true;
+  options.sim_gateway_args = {"--schedule-start-file", custom_file};
+  options.max_restarts = 0;
+  options.duration_s = kHangSeconds;
+  UseHealthyRegisteringNodes(options, "custom_sched");
+  const std::string loss_binary = RunfileBinary("TALOS_DELIVERY_LOSS_NODE");
+  options.binary_overrides["//example/sim_gateway:node"] = WriteStub(
+      "custom_sched_gateway",
+      "printf '%s\\n' \"$*\" > '" + gateway_args + "'\nexec " + loss_binary +
+          " sim_gateway //example/sim_gateway:node 0,0,0,0,run --log "
+          "/dev/null \"$@\"\n",
+      "sim_gateway");
+
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string launcher_file =
+      session_dir + "/" + std::string{kSimScheduleStartFile};
+  const uint64_t session = options.session_id;
+  std::string seen;
+  EXPECT_EQ(RunSessionUntil(
+                options,
+                [session](const std::string&) {
+                  return Registered("sim_gateway", session) &&
+                         Registered("hardware_node", session) &&
+                         Registered("alpha", session) &&
+                         Registered("beta", session);
+                },
+                seen),
+            0);
+  ASSERT_FALSE(seen.empty());
+  const std::string passed = ReadFile(gateway_args);
+  EXPECT_NE(passed.find("--schedule-start-file " + custom_file),
+            std::string::npos)
+      << passed;
+  EXPECT_EQ(passed.find(std::string{kSimScheduleStartFile}), std::string::npos)
+      << passed;
+  EXPECT_FALSE(std::filesystem::exists(launcher_file));
+  EXPECT_FALSE(std::filesystem::exists(custom_file));
+
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&gateway_args, &custom_file})
+    ::remove(path->c_str());
+}
+
 }  // namespace
 }  // namespace talos::launcher

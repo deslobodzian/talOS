@@ -3697,17 +3697,20 @@ def show(root, writes):
 # What ./sim.sh drives a scaffold with: teleop after a second disabled, and
 # joystick 0's button (button 3: bit 2) pressed from second 3 to second 6,
 # after a neutral sample that arms the teleop lane (talos::OperatorArming).
-# The schedules last SIM_SCHEDULE_S from sim_gateway's loop start: the
-# release at second 6 and 2 s to see the mechanism go neutral after it.
+# The schedules last SIM_SCHEDULE_S from the schedule start the launcher
+# writes to sim_gateway's --schedule-start-file once every non-observer
+# member's loop has started: the release at second 6 and 2 s to see the
+# mechanism go neutral after it.
 SIM_SCHEDULE_S = 8
-# The launcher counts --duration-s from its first spawn, sim_gateway (spawned
-# last) its schedules from its own loop start, which follows its registry
-# claim at once. The launcher kills a member that has not claimed its row by
-# the startup grace (talOS/launcher/roster.h heartbeat_startup_grace_ms, 5 s
-# by default; the printed command keeps it), so a run whose gateway was not
-# restarted starts the schedules at most that long after the duration began.
-# The printed duration adds that grace to the schedules' length, so how long
-# start-up takes, within the grace, cuts no second off the button's window.
+# The launcher counts --duration-s from its first spawn, while sim_gateway's
+# schedules count from the schedule start written once every non-observer
+# member's loop has started. The launcher kills a member that has not claimed
+# its row by the startup grace (talOS/launcher/roster.h
+# heartbeat_startup_grace_ms, 5 s by default; the printed command keeps it),
+# so a session whose roster comes up within that grace starts the schedules at
+# most that long after the duration began. The printed duration adds that
+# grace to the schedules' length, so start-up within the grace cuts no second
+# off the button's window.
 LAUNCHER_STARTUP_GRACE_S = 5
 SIM_DURATION_S = LAUNCHER_STARTUP_GRACE_S + SIM_SCHEDULE_S
 MODE_SCHEDULE = "disabled:1,teleop:10"

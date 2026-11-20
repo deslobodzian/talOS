@@ -262,6 +262,13 @@ bool IsSimulatorPortArg(std::string_view arg) {
   return arg == "--port" || arg == "--remote-port";
 }
 
+bool HasSimulatorScheduleStartArg(const std::vector<std::string>& args) {
+  return std::any_of(args.begin(), args.end(), [](const std::string& arg) {
+    return arg == "--schedule-start-file" ||
+           arg.starts_with("--schedule-start-file=");
+  });
+}
+
 uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
                                  const LauncherOptions& options) {
   return options.studio_http_port != 0 ? options.studio_http_port

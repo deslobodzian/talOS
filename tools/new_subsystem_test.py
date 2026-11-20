@@ -1020,13 +1020,14 @@ class NewSubsystemTest(unittest.TestCase):
     # REQ-DEV-05
     def test_sim_run_outlasts_its_schedule_however_late_the_gateway_starts(
             self):
-        # The launcher counts --duration-s from its first spawn, but
-        # sim_gateway counts its schedules from its own loop start, which
-        # the launcher bounds only by killing a member that has not
-        # registered by its startup grace (talOS/launcher/roster.h
-        # heartbeat_startup_grace_ms, 5000 ms). Each printed run must
-        # outlast that grace plus the joystick schedule's last event, or a
-        # slow start ends the session before the button is held (TOOLS-18).
+        # The launcher counts --duration-s from its first spawn, while
+        # sim_gateway's schedules count from the schedule start the launcher
+        # writes once every non-observer member's loop has started, which the
+        # launcher bounds for unregistered members by its startup grace
+        # (talOS/launcher/roster.h heartbeat_startup_grace_ms, 5000 ms). Each
+        # printed run must outlast that grace plus the joystick schedule's
+        # last event, or a slow start ends the session before the button is
+        # held.
         startup_grace_s = 5
         for run in (new_subsystem.sim_run(3),
                     new_subsystem.launcher_sim_run("@talos", "robot_sim.toml",
