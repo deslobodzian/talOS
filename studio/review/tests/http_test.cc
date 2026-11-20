@@ -171,8 +171,22 @@ TEST_F(HttpTest, ServesTheReviewShapes) {
   EXPECT_EQ(header[0], 2u);
   EXPECT_EQ(header[1], 5u);
 
+  const Reply timeline = Get(port_, "/review/s1/timeline.json");
+  ASSERT_EQ(timeline.status, 200) << timeline.body;
+  EXPECT_NE(timeline.headers.find("application/json"), std::string::npos);
+  const json tl = json::parse(timeline.body);
+  EXPECT_EQ(tl["hardware_not_decoded"], false);
+  EXPECT_FALSE(tl["modes"].empty());
+  EXPECT_FALSE(tl["alerts"].empty());
+  EXPECT_FALSE(tl["runs"].empty());
+
+  const Reply declared = Get(port_, "/review/s1/declared.json");
+  ASSERT_EQ(declared.status, 200) << declared.body;
+  EXPECT_NE(declared.headers.find("application/json"), std::string::npos);
+  EXPECT_FALSE(json::parse(declared.body)["nodes"].empty());
+
   for (const std::string path :
-       {"/review/s1/timeline.json", "/review/robot/fetch", "/missing.js"}) {
+       {"/review/s1/unknown.json", "/review/robot/fetch", "/missing.js"}) {
     EXPECT_EQ(Get(port_, path).status, 404) << path;
   }
   const Reply studio = Get(port_, "/");

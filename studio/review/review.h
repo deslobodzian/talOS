@@ -26,6 +26,25 @@
 //       closed_at_flush true for a gap the writer's stop closed; the
 //       session's start_ns..end_ns covers every gap's span
 //       wall time of a session time t_ns is origin_wall_ns + t_ns
+//   GET /review/<id>/timeline.json
+//       {"hardware_not_decoded","modes","modes_dropped","alerts",
+//        "alerts_dropped","runs","runs_dropped"}: hardware_not_decoded is a
+//       boolean matching bounds.json (when true, modes is empty); modes lists
+//       Driver Station mode transitions as {"start_ns","end_ns","mode","fms"}
+//       where mode is disabled, teleop, auto, test or estop; alerts lists
+//       intervals of every ChannelInfo.alert != None channel as
+//       {"channel","level","start_ns","end_ns"} (first true publish_ns to
+//       first false publish_ns or session end_ns); runs lists manifest.json's
+//       nodes[].runs[] mapped via origin_wall_ns as
+//       {"node","start_ns","end_ns","reason"} (end_ns is null when
+//       end_wall_ns == 0). Each list is bounded per open session
+//       (kMaxTimelineModes = 4096, kMaxTimelineAlerts = 4096,
+//       kMaxTimelineRuns = 4096; REQ-OPS-42), with overflow counted in
+//       modes_dropped, alerts_dropped and runs_dropped (which also sums each
+//       node's manifest runs_dropped).
+//   GET /review/<id>/declared.json
+//       the session directory's graph.json verbatim (application/json, up to
+//       kMaxDeclaredBytes), or 404 plain text when absent
 //   GET /review/<id>/snapshot?t_ns=
 //       {"t_ns","channels":{name:{"value","sample_ns"}}}
 //       value as the bridge's /telemetry.json writes a sample, or null for
@@ -84,6 +103,10 @@ inline constexpr std::size_t kMaxSeriesRequestBytes =
 // the least recently used, whose index is rebuilt if it is opened again.
 inline constexpr std::size_t kMaxOpenSessions = 4;
 
+// The largest graph.json served at /review/<id>/declared.json, matching
+// Studio's MAX_DECLARED_BYTES (studio/src/system.ts).
+inline constexpr std::uintmax_t kMaxDeclaredBytes = std::uintmax_t{1} << 20;
+
 struct Response {
   int status{200};
   std::string content_type{"application/json"};
@@ -120,6 +143,8 @@ class Review {
   Response Sessions();
   Response Channels(const Session& session) const;
   Response Bounds(const Session& session) const;
+  Response Timeline(const Session& session) const;
+  Response Declared(std::string_view id) const;
   Response Snapshot(const Session& session, std::string_view query);
   Response Series(std::string_view id, const Session& session,
                   std::string_view query);

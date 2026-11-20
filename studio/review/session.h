@@ -99,6 +99,32 @@ struct Gap {
 };
 static_assert(sizeof(Gap) == 48, "REQ-OPS-42: 48 B per GAP record");
 
+// Fixed ceilings on the timeline kept per open session (REQ-OPS-42): 96 KiB
+// each for modes and alerts (4096 x 24 B) and at most 4096 runs from
+// manifest.json, regardless of session length or flapping rate. Excess items
+// are dropped and counted in *_dropped().
+inline constexpr std::size_t kMaxTimelineModes = 4096;
+inline constexpr std::size_t kMaxTimelineAlerts = 4096;
+inline constexpr std::size_t kMaxTimelineRuns = 4096;
+
+enum class ModeKind : std::uint8_t {
+  kDisabled,
+  kTeleop,
+  kAuto,
+  kTest,
+  kEstop,
+};
+std::string_view ModeKindName(ModeKind mode);
+
+struct ModeInterval {
+  std::int64_t start_ns{0};
+  std::int64_t end_ns{0};
+  ModeKind mode{ModeKind::kDisabled};
+  bool fms{false};
+};
+static_assert(sizeof(ModeInterval) == 24,
+              "REQ-OPS-42: 24 B per timeline mode interval");
+
 struct LogFile {
   std::string path;
   std::string process;
@@ -131,6 +157,21 @@ struct Topic {
 struct ChannelRef {
   std::uint32_t topic{0};
   std::uint32_t channel{0};
+};
+
+struct AlertInterval {
+  std::int64_t start_ns{0};
+  std::int64_t end_ns{0};
+  ChannelRef channel;
+};
+static_assert(sizeof(AlertInterval) == 24,
+              "REQ-OPS-42: 24 B per timeline alert interval");
+
+struct RunInterval {
+  std::string node;
+  std::int64_t start_ns{0};
+  std::optional<std::int64_t> end_ns;  // empty when end_wall_ns == 0
+  std::string reason;
 };
 
 // A channel's samples over [start_ns, end_ns), cut into equal buckets (the
@@ -202,6 +243,17 @@ class Session {
     return hardware_not_decoded_;
   }
 
+  // Timeline summary derived during Open() (REQ-OPS-41, REQ-OPS-42):
+  // Driver Station mode transitions (empty when hardware_not_decoded() is
+  // non-empty), active alert intervals across all alert channels, and node
+  // runs from manifest.json mapped via origin_wall_ns().
+  const std::vector<ModeInterval>& modes() const { return modes_; }
+  std::uint64_t modes_dropped() const { return modes_dropped_; }
+  const std::vector<AlertInterval>& alerts() const { return alerts_; }
+  std::uint64_t alerts_dropped() const { return alerts_dropped_; }
+  const std::vector<RunInterval>& runs() const { return runs_; }
+  std::uint64_t runs_dropped() const { return runs_dropped_; }
+
   // The index's checkpoints and gaps: what grows with the session's length.
   std::size_t index_bytes() const;
   std::size_t log_seconds() const;
@@ -242,6 +294,12 @@ class Session {
   std::int64_t end_ns_{0};
   std::int64_t origin_wall_ns_{0};
   std::string hardware_not_decoded_;
+  std::vector<ModeInterval> modes_;
+  std::uint64_t modes_dropped_{0};
+  std::vector<AlertInterval> alerts_;
+  std::uint64_t alerts_dropped_{0};
+  std::vector<RunInterval> runs_;
+  std::uint64_t runs_dropped_{0};
 };
 
 // The value of a raw telemetry sample of `kind` as a double (a bucket's).

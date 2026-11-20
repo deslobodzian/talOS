@@ -222,6 +222,7 @@ Response Review::Get(std::string_view path, std::string_view query) {
   const std::string_view id = path.substr(0, slash);
   const std::string_view route = path.substr(slash + 1);
   if (route != "channels.json" && route != "bounds.json" &&
+      route != "timeline.json" && route != "declared.json" &&
       route != "snapshot" && route != "series") {
     return Error(404, "not found");
   }
@@ -231,6 +232,8 @@ Response Review::Get(std::string_view path, std::string_view query) {
   try {
     if (route == "channels.json") return Channels(*session);
     if (route == "bounds.json") return Bounds(*session);
+    if (route == "timeline.json") return Timeline(*session);
+    if (route == "declared.json") return Declared(id);
     if (route == "snapshot") return Snapshot(*session, query);
     return Series(id, *session, query);
   } catch (const std::exception& e) {
@@ -391,6 +394,83 @@ Response Review::Bounds(const Session& session) const {
   }
   out += "]}";
   return {200, "application/json", std::move(out)};
+}
+
+Response Review::Timeline(const Session& session) const {
+  std::string out{"{\"hardware_not_decoded\":"};
+  out += session.hardware_not_decoded().empty() ? "false" : "true";
+  out += ",\"modes\":[";
+  for (std::size_t i = 0; i < session.modes().size(); ++i) {
+    if (i != 0) out += ',';
+    const ModeInterval& mode = session.modes()[i];
+    out += "{\"start_ns\":";
+    AppendI64(out, mode.start_ns);
+    out += ",\"end_ns\":";
+    AppendI64(out, mode.end_ns);
+    out += ",\"mode\":";
+    AppendEscaped(out, ModeKindName(mode.mode));
+    out += ",\"fms\":";
+    out += mode.fms ? "true" : "false";
+    out += '}';
+  }
+  out += "],\"modes_dropped\":";
+  out += std::to_string(session.modes_dropped());
+  out += ",\"alerts\":[";
+  for (std::size_t i = 0; i < session.alerts().size(); ++i) {
+    if (i != 0) out += ',';
+    const AlertInterval& alert = session.alerts()[i];
+    const auto& channel = session.channel(alert.channel);
+    out += "{\"channel\":";
+    AppendEscaped(out, channel.name);
+    out += ",\"level\":";
+    AppendEscaped(out, AlertLevelName(channel.alert));
+    out += ",\"start_ns\":";
+    AppendI64(out, alert.start_ns);
+    out += ",\"end_ns\":";
+    AppendI64(out, alert.end_ns);
+    out += '}';
+  }
+  out += "],\"alerts_dropped\":";
+  out += std::to_string(session.alerts_dropped());
+  out += ",\"runs\":[";
+  for (std::size_t i = 0; i < session.runs().size(); ++i) {
+    if (i != 0) out += ',';
+    const RunInterval& run = session.runs()[i];
+    out += "{\"node\":";
+    AppendEscaped(out, run.node);
+    out += ",\"start_ns\":";
+    AppendI64(out, run.start_ns);
+    out += ",\"end_ns\":";
+    if (run.end_ns) {
+      AppendI64(out, *run.end_ns);
+    } else {
+      out += "null";
+    }
+    out += ",\"reason\":";
+    AppendEscaped(out, run.reason);
+    out += '}';
+  }
+  out += "],\"runs_dropped\":";
+  out += std::to_string(session.runs_dropped());
+  out += '}';
+  return {200, "application/json", std::move(out)};
+}
+
+Response Review::Declared(std::string_view id) const {
+  const fs::path path = library_ / std::string{id} / "graph.json";
+  std::error_code error;
+  if (fs::is_symlink(path, error) || !fs::is_regular_file(path, error)) {
+    return Error(404, "no declared graph");
+  }
+  const auto bytes = fs::file_size(path, error);
+  if (error || bytes == 0 || bytes > kMaxDeclaredBytes) {
+    return Error(404, "no declared graph");
+  }
+  std::ifstream stream{path, std::ios::binary};
+  if (!stream.is_open()) return Error(404, "no declared graph");
+  std::string body{std::istreambuf_iterator<char>{stream}, {}};
+  if (body.empty()) return Error(404, "no declared graph");
+  return {200, "application/json", std::move(body)};
 }
 
 Response Review::Snapshot(const Session& session, std::string_view query) {
