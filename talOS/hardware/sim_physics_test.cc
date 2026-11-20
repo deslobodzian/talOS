@@ -1442,5 +1442,95 @@ TEST(SimWorld, ExplicitGyroOverridesDoNotTeleportTruth) {
   EXPECT_DOUBLE_EQ(world.state.sensors[0].velocity_rps, -0.25);
 }
 
+// REQ-DEV-05, REQ-DEV-23: physics uses configured wheel_radius_m and explicit
+// swerve module coordinates instead of hard-coded 0.0508 m / ±0.30 m, overrides
+// inferred conventional-name placement without duplicating modules, and keeps
+// the explicit geometry across a later Configure() (pushed config).
+TEST(SimWorld, SecondGeometryControlsLinearAndYawMotionAndSurvivesReconfigure) {
+  static constexpr double kTau = WorldFixture::kTau;
+  static constexpr double kWheelRadius = 0.06;
+  const std::array<const char*, 4> names{"front_left", "front_right",
+                                         "back_left", "back_right"};
+  const std::array<double, 4> xs{0.40, 0.40, -0.40, -0.40};
+  const std::array<double, 4> ys{0.25, -0.25, 0.25, -0.25};
+
+  Config config;
+  std::vector<sim::SwerveModuleSpec> specs;
+  for (std::size_t i = 0; i < 4; ++i) {
+    auto drive = TestMotor(2 * i + 1, "drive", static_cast<int>(2 * i + 1));
+    drive.name = std::string(names[i]) + "_drive";
+    auto steer = TestMotor(2 * i + 2, "steer", static_cast<int>(2 * i + 2));
+    steer.name = std::string(names[i]) + "_steer";
+    steer.slots[0].p = 1.0;
+    config.motors.push_back(drive);
+    config.motors.push_back(steer);
+    specs.push_back({drive.name, steer.name, xs[i], ys[i]});
+  }
+  config.sensors.push_back({20, "imu", SensorKind::kPigeon2, 30, "rio"});
+
+  PhysicsSimBackend backend{{.wheel_radius_m = kWheelRadius}};
+  backend.SetSwerveModules(specs);
+  ASSERT_TRUE(backend.Configure(config));
+  // Simulate a later config pushed over the wire: explicit module geometry
+  // must survive without falling back to ±0.30 m inference.
+  ASSERT_TRUE(backend.Configure(config));
+
+  State state{};
+  uint64_t now_us = 0;
+  std::array<MotorRequest, kMaxMotors> commands{};
+  auto drive_chassis = [&](double vx, double vy, double omega) {
+    for (std::size_t i = 0; i < 4; ++i) {
+      const double wheel_vx = vx - omega * ys[i];
+      const double wheel_vy = vy + omega * xs[i];
+      commands[2 * i] = MotorRequest{static_cast<uint16_t>(2 * i + 1),
+                                     Mode::kNeutral, 0, 0.0, 0.0};
+      commands[2 * i + 1] = {static_cast<uint16_t>(2 * i + 2), Mode::kPosition,
+                             0, std::atan2(wheel_vy, wheel_vx) / kTau, 0.0};
+    }
+    ASSERT_TRUE(backend.Apply(commands));
+    StepBackend(backend, state, now_us, 5000, 2000);
+    for (std::size_t i = 0; i < 4; ++i) {
+      const double speed = std::hypot(vx - omega * ys[i], vy + omega * xs[i]);
+      commands[2 * i] = Duty(2 * i + 1, speed / (100.0 * kTau * kWheelRadius) *
+                                            12.0 / kSimRestingSupplyV);
+    }
+    ASSERT_TRUE(backend.Apply(commands));
+    StepBackend(backend, state, now_us, 5000, 400);
+  };
+
+  // Pure linear translation: ground speed scales with 0.06 m, not 0.0508 m.
+  drive_chassis(1.2, 0.0, 0.0);
+  const auto before_linear = backend.truth();
+  StepBackend(backend, state, now_us, 5000, 200);
+  const auto after_linear = backend.truth();
+  EXPECT_NEAR(after_linear.x_m - before_linear.x_m, 1.2, 1e-8);
+  EXPECT_NEAR(after_linear.y_m - before_linear.y_m, 0.0, 1e-8);
+  EXPECT_NEAR(after_linear.vx_mps, 1.2, 1e-8);
+  EXPECT_NEAR(after_linear.omega_radps, 0.0, 1e-8);
+  EXPECT_NEAR(state.motors[0].velocity_rps * kTau * kWheelRadius, 1.2, 1e-8);
+
+  // Pure yaw rotation: angular velocity matches (±0.40, ±0.25) and 0.06 m,
+  // not inferred ±0.30 m or duplicated modules.
+  drive_chassis(0.0, 0.0, 0.9);
+  const auto before_rot = backend.truth();
+  StepBackend(backend, state, now_us, 5000, 200);
+  const auto after_rot = backend.truth();
+  EXPECT_NEAR(after_rot.yaw_rad - before_rot.yaw_rad, 0.9, 1e-8);
+  EXPECT_NEAR(after_rot.omega_radps, 0.9, 1e-8);
+  EXPECT_NEAR(state.sensors[0].velocity_rps, 0.9 / kTau, 1e-8);
+  EXPECT_NEAR(after_rot.x_m - before_rot.x_m, 0.0, 1e-8);
+  EXPECT_NEAR(after_rot.y_m - before_rot.y_m, 0.0, 1e-8);
+
+  // Non-positive or non-finite wheel_radius_m falls back to 0.0508 m.
+  for (const double bad_radius :
+       {0.0, -0.06, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity()}) {
+    WorldFixture fallback{{.wheel_radius_m = bad_radius}};
+    fallback.Drive(1.0, 0.0, 0.0);
+    fallback.Advance(400);
+    EXPECT_NEAR(fallback.backend.truth().vx_mps, 1.0, 1e-8);
+  }
+}
+
 }  // namespace
 }  // namespace talos::hardware

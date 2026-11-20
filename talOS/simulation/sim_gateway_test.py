@@ -217,6 +217,130 @@ class SimGatewayStartup(unittest.TestCase):
                 self.assertEqual(inputs, [(1, True, True), (2, True, False),
                                           (3, True, True), (4, True, False)])
 
+    # REQ-DEV-05, REQ-DEV-23
+    def test_physics_reads_simulation_geometry_from_config(self):
+        """[simulation] wheel_radius_m and [[simulation.swerve_modules]] in an
+        overlay config drive sim_gateway --physics chassis motion, overriding
+        both the 0.0508 m default radius and ±0.30 m name inference."""
+        wheel_radius_m = 0.08
+        x_m = 0.40
+        y_m = 0.25
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM) as peer:
+            base = Path(tmp) / "robot.toml"
+            base.write_text(
+                '[robot]\nname = "sim_geometry_test"\nperiod_us = 5000\n'
+                'command_timeout_us = 100000\n'
+                'controller_address = "127.0.0.1"\n'
+                '[subsystems.drive.motors]\n'
+                'back_left_drive = { can_id = 1 }\n'
+                'back_left_steer = { can_id = 2 }\n'
+                'back_right_drive = { can_id = 3 }\n'
+                'back_right_steer = { can_id = 4 }\n'
+                'front_left_drive = { can_id = 5 }\n'
+                'front_left_steer = { can_id = 6 }\n'
+                'front_right_drive = { can_id = 7 }\n'
+                'front_right_steer = { can_id = 8 }\n'
+                '[subsystems.drive.sensors.imu]\n'
+                'type = "Pigeon2"\ncan_id = 9\n',
+                encoding="utf-8")
+            overlay = Path(tmp) / "robot_sim.toml"
+            overlay.write_text(
+                'include = "robot.toml"\n'
+                '[simulation]\n'
+                f'wheel_radius_m = {wheel_radius_m}\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "front_left_drive"\nsteer = "front_left_steer"\n'
+                f'x_m = {x_m}\ny_m = {y_m}\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "front_right_drive"\nsteer = "front_right_steer"\n'
+                f'x_m = {x_m}\ny_m = {-y_m}\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "back_left_drive"\nsteer = "back_left_steer"\n'
+                f'x_m = {-x_m}\ny_m = {y_m}\n'
+                '[[simulation.swerve_modules]]\n'
+                'drive = "back_right_drive"\nsteer = "back_right_steer"\n'
+                f'x_m = {-x_m}\ny_m = {-y_m}\n',
+                encoding="utf-8")
+            peer.bind(("127.0.0.1", 0))
+            peer.settimeout(0.1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                reserve.bind(("127.0.0.1", 0))
+                gateway_port = reserve.getsockname()[1]
+            # Sorted device names assign logical ids:
+            # 1: back_left_drive, 2: back_left_steer, 3: back_right_drive,
+            # 4: back_right_steer, 5: front_left_drive, 6: front_left_steer,
+            # 7: front_right_drive, 8: front_right_steer, 9: imu.
+            # With all steer angles at 0, driving right wheels (+y = -0.25)
+            # forward and left wheels (+y = +0.25) backward produces pure CCW
+            # rotation whose ratio yaw_rate_rps / drive_rps equals
+            # (y_m / (x_m^2 + y_m^2)) * wheel_radius_m.
+            motor_demands = [
+                (1, 1, -0.15), (2, 0, 0.0),
+                (3, 1, 0.15), (4, 0, 0.0),
+                (5, 1, -0.15), (6, 0, 0.0),
+                (7, 1, 0.15), (8, 0, 0.0),
+            ]
+            with subprocess.Popen(
+                    [str(binary()), "--config", str(overlay), "--physics",
+                     "--port", str(gateway_port),
+                     "--remote-port", str(peer.getsockname()[1]),
+                     "--duration-s", "0.4"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True) as proc:
+                cmd_seq = 0
+                observed = None
+                try:
+                    for _ in range(100):
+                        try:
+                            packet = peer.recv(4096)
+                        except socket.timeout:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        if struct.unpack_from("<H", packet, 12)[0] != 20:
+                            continue
+                        config_id, boot_id, epoch, sample_time_us = (
+                            struct.unpack_from("<QQQQ", packet, 40))
+                        motors, sensors = struct.unpack_from(
+                            "<HH", packet, 40 + 70)
+                        self.assertEqual((motors, sensors), (8, 1))
+                        # Motor index 2 is back_right_drive (id 3, +0.15 duty).
+                        m_off = 40 + 84 + 45 * 2
+                        _, _, _, drive_vel_rps = struct.unpack_from(
+                            "<HBdd", packet, m_off)
+                        s_off = 40 + 84 + 45 * motors
+                        _, _, _, pigeon_vel_rps = struct.unpack_from(
+                            "<HBdd", packet, s_off)
+                        if drive_vel_rps > 1.0:
+                            observed = (drive_vel_rps, pigeon_vel_rps)
+                        cmd_seq += 1
+                        payload = bytearray(struct.pack(
+                            "<QQQQHHH", config_id, boot_id, epoch,
+                            sample_time_us, len(motor_demands), 0, 0))
+                        for motor_id, mode, demand in motor_demands:
+                            payload += struct.pack(
+                                "<HBBdd", motor_id, mode, 0, demand, 0.0)
+                        frame = (
+                            packet[:12]
+                            + struct.pack("<HHQQII", 21, 0, cmd_seq,
+                                          sample_time_us, len(payload), 0)
+                            + payload
+                        )
+                        peer.sendto(frame, ("127.0.0.1", gateway_port))
+                    stdout, stderr = proc.communicate(timeout=5)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                self.assertEqual(proc.returncode, 0, stdout + stderr)
+                self.assertIsNotNone(
+                    observed, "drive motor never accelerated under commands")
+                drive_vel_rps, pigeon_vel_rps = observed
+                expected_ratio = (y_m / (x_m * x_m + y_m * y_m)) * wheel_radius_m
+                self.assertAlmostEqual(
+                    pigeon_vel_rps / drive_vel_rps, expected_ratio, places=5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -147,9 +147,13 @@ struct AxisState {
 };
 
 struct PhysicsOptions {
+  static constexpr double kDefaultWheelRadiusM = 0.0508;
   double start_x_m{0.0};
   double start_y_m{0.0};
   double start_yaw_rad{0.0};
+  // Nominal wheel radius in meters. Non-positive or non-finite values fall
+  // back to kDefaultWheelRadiusM.
+  double wheel_radius_m{kDefaultWheelRadiusM};
   double wheel_radius_error_frac{0.0};
   // Deterministic traction simplification: both acceleration and braking
   // only reduce ground travel; wheel odometry over-reports either way.
@@ -289,10 +293,25 @@ struct HomeSwitch {
   bool closed_reads{false};
 };
 
+// One swerve module's drive/steer motor names and robot-frame coordinates
+// (+x forward, +y left, meters). Bound by motor name so it survives every
+// later Configure(), including a config pushed by the bridge.
+struct SwerveModuleSpec {
+  std::string drive;
+  std::string steer;
+  double x_m{};
+  double y_m{};
+};
+
 // Physics-backed Backend. See the header comment for the item-by-item map.
 class PhysicsSimBackend final : public Backend {
  public:
-  explicit PhysicsSimBackend(PhysicsOptions options = {}) : options_{options} {}
+  explicit PhysicsSimBackend(PhysicsOptions options = {}) : options_{options} {
+    if (!std::isfinite(options_.wheel_radius_m) ||
+        options_.wheel_radius_m <= 0.0) {
+      options_.wheel_radius_m = PhysicsOptions::kDefaultWheelRadiusM;
+    }
+  }
 
   const WorldState& truth() const { return truth_; }
 
@@ -317,6 +336,16 @@ class PhysicsSimBackend final : public Backend {
   void SetHomeSwitches(std::vector<HomeSwitch> switches) {
     home_switches_ = std::move(switches);
     BindHomeSwitches();
+  }
+
+  // Configured swerve modules (SwerveModuleSpec), replacing any set before.
+  // When non-empty, Configure() binds only these modules by motor name instead
+  // of inferring ±0.30 m coordinates from motor names, and they survive every
+  // later Configure, a config the bridge pushes included. Passing an empty
+  // vector restores name inference.
+  void SetSwerveModules(std::vector<SwerveModuleSpec> modules) {
+    configured_modules_ = std::move(modules);
+    ConfigureSwerve();
   }
 
   bool Configure(const Config& config) override {
@@ -666,13 +695,14 @@ class PhysicsSimBackend final : public Backend {
     yaw_rot_ = yaw_rot;
   }
   // Override inferred placement, or register arbitrarily named module pairs.
-  // Wheel travel uses nominal radius 0.0508 m plus the configured error.
+  // Wheel travel uses options_.wheel_radius_m (default 0.0508 m) plus the
+  // configured error.
   void SetSwerveModuleGeometry(uint16_t drive_id, uint16_t steer_id, double x_m,
                                double y_m) {
     const int drive = MotorIndex(drive_id);
     const int steer = MotorIndex(steer_id);
-    if (drive < 0 || steer < 0 || !std::isfinite(x_m) || !std::isfinite(y_m) ||
-        (x_m == 0.0 && y_m == 0.0))
+    if (drive < 0 || steer < 0 || drive == steer || !std::isfinite(x_m) ||
+        !std::isfinite(y_m) || (x_m == 0.0 && y_m == 0.0))
       return;
     for (auto& module : modules_) {
       if (module.drive == static_cast<std::size_t>(drive)) {
@@ -716,6 +746,34 @@ class PhysicsSimBackend final : public Backend {
   };
 
   void ConfigureSwerve() {
+    modules_.clear();
+    if (!configured_modules_.empty()) {
+      for (const auto& spec : configured_modules_) {
+        if (!std::isfinite(spec.x_m) || !std::isfinite(spec.y_m) ||
+            (spec.x_m == 0.0 && spec.y_m == 0.0)) {
+          continue;
+        }
+        std::optional<std::size_t> drive;
+        std::optional<std::size_t> steer;
+        for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+          if (config_.motors[i].name == spec.drive) drive = i;
+          if (config_.motors[i].name == spec.steer) steer = i;
+        }
+        if (!drive || !steer || *drive == *steer) continue;
+        bool duplicate = false;
+        for (const auto& existing : modules_) {
+          if (existing.drive == *drive || existing.steer == *steer ||
+              existing.drive == *steer || existing.steer == *drive) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (!duplicate) {
+          modules_.push_back({*drive, *steer, spec.x_m, spec.y_m});
+        }
+      }
+      return;
+    }
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& name = config_.motors[i].name;
       if (!name.ends_with("_drive")) continue;
@@ -1064,9 +1122,9 @@ class PhysicsSimBackend final : public Backend {
     double moment = 0.0;
     double lever_squared = 0.0;
     for (auto& module : modules_) {
-      const double surface_speed = axes_[module.drive].rotor_velocity_rps /
-                                   Gear(module.drive) * kTau * 0.0508 *
-                                   (1.0 + options_.wheel_radius_error_frac);
+      const double surface_speed =
+          axes_[module.drive].rotor_velocity_rps / Gear(module.drive) * kTau *
+          options_.wheel_radius_m * (1.0 + options_.wheel_radius_error_frac);
       const double acceleration =
           (surface_speed - module.previous_surface_speed_mps) / dt_s;
       module.previous_surface_speed_mps = surface_speed;
@@ -1165,6 +1223,7 @@ class PhysicsSimBackend final : public Backend {
   };
   std::vector<HomeSwitch> home_switches_;
   std::vector<BoundHomeSwitch> bound_home_switches_;
+  std::vector<SwerveModuleSpec> configured_modules_;
   double supply_v_{kSimRestingSupplyV};
   double yaw_rot_{0.0};
   double yaw_rate_rps_{0.0};

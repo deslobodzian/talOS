@@ -146,9 +146,16 @@ Physics-only flags (all values must be finite; supplying any without
 | Flag | Default | Meaning |
 |---|---|---|
 | `--start-pose X_M,Y_M,YAW_RAD` | `2,2,0` | Physical field start pose, independent of estimator parameters |
-| `--wheel-radius-error FRAC` | `0` | True radius `0.0508 × (1 + FRAC)` m; strictly `-0.5 < FRAC < 0.5` |
+| `--wheel-radius-error FRAC` | `0` | True radius `wheel_radius_m × (1 + FRAC)` m (`wheel_radius_m` defaults to `0.0508`); strictly `-0.5 < FRAC < 0.5` |
 | `--wheel-slip-gain G` | `0` | Nonnegative acceleration-dependent traction loss |
 | `--gyro-drift-radps R` | `0` | Reported yaw bias grows by `R × elapsed_seconds`, yaw rate gains `R` |
+
+Nominal wheel radius and swerve module coordinates come from the optional
+top-level `[simulation]` table (`wheel_radius_m` and
+`[[simulation.swerve_modules]]` with `drive`, `steer`, `x_m`, `y_m`), falling
+back to `0.0508` m and ±0.30 m name inference when omitted; `[simulation]`
+never enters the hardware wire format or `ConfigurationId`
+([hardware configuration](../hardware/README.md#configuration)).
 
 Encoders truthfully measure wheel rotations; radius error changes ground
 travel only. Each wheel's slip fraction is
@@ -184,7 +191,8 @@ start the bridge and the simulator on a config's non-default ports, with no
 port argument written by hand, and checks that the bridge publishes the
 simulator's State. `sim_gateway_test` (integration, about 1 s) runs the
 simulator alone: `--describe` and its flag checks, a run without a config,
-the Driver Station packets of a mode and joystick schedule, and the home
-switches `--physics` reads from a config. A robot's full-graph tests against the simulator live
+the Driver Station packets of a mode and joystick schedule, the home
+switches `--physics` reads from a config, and `[simulation]` wheel radius and
+swerve module geometry. A robot's full-graph tests against the simulator live
 with the robot (the bench's:
 [bench simulation tests](../../bench/main_processor/simulation/README.md)).

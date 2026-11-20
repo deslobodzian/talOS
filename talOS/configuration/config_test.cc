@@ -1220,5 +1220,164 @@ TEST(ConfigTest, SharedResolutionCases) {
   }
 }
 
+// REQ-DEV-05, REQ-DEV-23: [simulation] configures physics wheel radius and
+// swerve module placement, defaults when omitted, stays off the hardware wire
+// (ConfigurationId unchanged), and rejects invalid keys, values or motor refs.
+TEST(ConfigTest, SimulationTableParsesDefaultsStaysOffWireAndValidates) {
+  const std::string devices = R"(
+[subsystems.drive.motors]
+m_d0 = { can_id = 10 }
+m_s0 = { can_id = 11 }
+m_d1 = { can_id = 12 }
+m_s1 = { can_id = 13 }
+[subsystems.drive.sensors.imu]
+type = "Pigeon2"
+can_id = 20
+)";
+  const auto plain = Parse(devices);
+  EXPECT_DOUBLE_EQ(plain.simulation.wheel_radius_m, 0.0508);
+  EXPECT_TRUE(plain.simulation.swerve_modules.empty());
+
+  const auto with_sim = Parse(devices + R"(
+[simulation]
+wheel_radius_m = 0.06
+[[simulation.swerve_modules]]
+drive = "m_d0"
+steer = "m_s0"
+x_m = 0.40
+y_m = 0.25
+[[simulation.swerve_modules]]
+drive = "m_d1"
+steer = "m_s1"
+x_m = -0.40
+y_m = -0.25
+)");
+  EXPECT_DOUBLE_EQ(with_sim.simulation.wheel_radius_m, 0.06);
+  ASSERT_EQ(with_sim.simulation.swerve_modules.size(), 2u);
+  EXPECT_EQ(with_sim.simulation.swerve_modules[0],
+            (SimulationSwerveModule{"m_d0", "m_s0", 0.40, 0.25}));
+  EXPECT_EQ(with_sim.simulation.swerve_modules[1],
+            (SimulationSwerveModule{"m_d1", "m_s1", -0.40, -0.25}));
+  EXPECT_EQ(hardware::ConfigurationId(with_sim.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  // Invalid [simulation] table shapes, keys and wheel_radius_m values.
+  for (const std::string_view bad : {
+           "simulation = 1\n",
+           "[simulation]\nunknown = 1\n",
+           "[simulation]\nwheel_radius_m = 0.0\n",
+           "[simulation]\nwheel_radius_m = -0.05\n",
+           "[simulation]\nwheel_radius_m = nan\n",
+           "[simulation]\nwheel_radius_m = inf\n",
+           "[simulation]\nwheel_radius_m = -inf\n",
+           "[simulation]\nwheel_radius_m = \"0.05\"\n",
+           "[simulation]\nswerve_modules = {}\n",
+           "[simulation]\nswerve_modules = [1]\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(devices + std::string{bad});
+  }
+
+  // Invalid [[simulation.swerve_modules]] entries.
+  for (const std::string_view bad : {
+           // Unknown key.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\nz_m = "
+           "0\n",
+           // Missing required keys.
+           "[[simulation.swerve_modules]]\n"
+           "steer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\n",
+           // Empty motor names.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"\"\nx_m = 0.3\ny_m = 0.3\n",
+           // Non-finite or zero coordinates.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = nan\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = inf\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.0\ny_m = 0.0\n",
+           // Unknown motor or non-motor device.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"missing\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"imu\"\nx_m = 0.3\ny_m = 0.3\n",
+           // Same motor as drive and steer, or reused across modules.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_d0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n"
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s1\"\nx_m = -0.3\ny_m = -0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n"
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_s0\"\nsteer = \"m_s1\"\nx_m = -0.3\ny_m = -0.3\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(devices + std::string{bad});
+  }
+}
+
+TEST_F(ManifestTest, SimulationTableMergesAcrossIncludeOverlays) {
+  Write("robot.toml", R"(
+[robot]
+period_us = 5000
+
+[simulation]
+wheel_radius_m = 0.055
+
+[[simulation.swerve_modules]]
+drive = "d0"
+steer = "s0"
+x_m = 0.35
+y_m = 0.25
+
+[subsystems.drive.motors]
+d0 = { can_id = 1 }
+s0 = { can_id = 2 }
+d1 = { can_id = 3 }
+s1 = { can_id = 4 }
+)");
+  // Overlay overrides only wheel_radius_m and inherits swerve_modules.
+  Write("override_radius.toml", R"(
+include = "robot.toml"
+
+[simulation]
+wheel_radius_m = 0.065
+)");
+  const auto radius_only =
+      ParseRobotConfig((dir_ / "override_radius.toml").string());
+  EXPECT_DOUBLE_EQ(radius_only.simulation.wheel_radius_m, 0.065);
+  ASSERT_EQ(radius_only.simulation.swerve_modules.size(), 1u);
+  EXPECT_EQ(radius_only.simulation.swerve_modules[0],
+            (SimulationSwerveModule{"d0", "s0", 0.35, 0.25}));
+
+  // Overlay replaces swerve_modules while inheriting wheel_radius_m.
+  Write("override_modules.toml", R"(
+include = "robot.toml"
+
+[[simulation.swerve_modules]]
+drive = "d1"
+steer = "s1"
+x_m = -0.40
+y_m = -0.20
+)");
+  const auto modules_only =
+      ParseRobotConfig((dir_ / "override_modules.toml").string());
+  EXPECT_DOUBLE_EQ(modules_only.simulation.wheel_radius_m, 0.055);
+  ASSERT_EQ(modules_only.simulation.swerve_modules.size(), 1u);
+  EXPECT_EQ(modules_only.simulation.swerve_modules[0],
+            (SimulationSwerveModule{"d1", "s1", -0.40, -0.20}));
+}
+
 }  // namespace
 }  // namespace talos::config

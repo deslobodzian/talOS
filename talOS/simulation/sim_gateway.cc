@@ -212,6 +212,33 @@ int main(int argc, char** argv) {
           "nothing downstream would ever move");
     }
     talos::process::InstallStopHandlers();
+    talos::simulation::GatewayPorts ports{};
+    talos::hardware::Config hw_config;
+    std::vector<talos::hardware::sim::HomeSwitch> home_switches;
+    std::vector<talos::hardware::sim::SwerveModuleSpec> swerve_modules;
+    {
+      const auto robot_config = talos::config::ParseRobotConfig(config_path);
+      ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
+                                                     remote_port_flag);
+      options.wheel_radius_m = robot_config.simulation.wheel_radius_m;
+      hw_config = robot_config.hardware;
+      hw_config.commissioned = true;
+      home_switches.reserve(hw_config.digital_inputs.size());
+      for (const auto& input : hw_config.digital_inputs) {
+        const auto& sim = input.sim_home_switch;
+        if (sim.motor.empty()) continue;
+        home_switches.push_back({.input = input.name,
+                                 .motor = sim.motor,
+                                 .closed_at_rot = sim.closed_at_rot,
+                                 .closed_above = sim.closed_above,
+                                 .closed_reads = sim.closed_reads});
+      }
+      swerve_modules.reserve(robot_config.simulation.swerve_modules.size());
+      for (const auto& m : robot_config.simulation.swerve_modules) {
+        swerve_modules.push_back(
+            {.drive = m.drive, .steer = m.steer, .x_m = m.x_m, .y_m = m.y_m});
+      }
+    }
     talos::hardware::SimBackend ideal;
     talos::hardware::sim::PhysicsSimBackend physics_backend{options};
     talos::hardware::Backend& backend =
@@ -236,37 +263,21 @@ int main(int argc, char** argv) {
     // commissioned hardware, and a simulator that coasts every demand to
     // zero for lack of a commissioning bit would conceal the control it is
     // meant to exercise.
-    talos::simulation::GatewayPorts ports{};
-    {
-      auto robot_config = talos::config::ParseRobotConfig(config_path);
-      ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
-                                                     remote_port_flag);
-      auto hw_config = robot_config.hardware;
-      hw_config.commissioned = true;
-      // The wire carries no motor type: a config the bridge pushes later
-      // keeps each motor's type from this parse, matched by name.
-      physics_backend.SetLocalMotorTypes(hw_config);
-      // Nor home switches ([digital_inputs.*] sim_motor): bound by name,
-      // they survive a pushed config too. Set before Reconfigure, which
-      // binds them, so the first State already reads them.
-      std::vector<talos::hardware::sim::HomeSwitch> home_switches;
-      home_switches.reserve(hw_config.digital_inputs.size());
-      for (const auto& input : hw_config.digital_inputs) {
-        const auto& sim = input.sim_home_switch;
-        if (sim.motor.empty()) continue;
-        home_switches.push_back({.input = input.name,
-                                 .motor = sim.motor,
-                                 .closed_at_rot = sim.closed_at_rot,
-                                 .closed_above = sim.closed_above,
-                                 .closed_reads = sim.closed_reads});
-      }
-      physics_backend.SetHomeSwitches(std::move(home_switches));
-      if (!gateway.Reconfigure(hw_config)) {
-        throw std::runtime_error(
-            "sim_gateway: Reconfigure failed for the robot config");
-      }
-      talos::simulation::ResolveFaults(faults, hw_config);
+    //
+    // The wire carries no motor type, home switches ([digital_inputs.*]
+    // sim_motor) or [simulation] swerve geometry: bound by name before
+    // Reconfigure, they apply on the first State and survive any config the
+    // bridge pushes later.
+    physics_backend.SetLocalMotorTypes(hw_config);
+    physics_backend.SetHomeSwitches(std::move(home_switches));
+    if (!swerve_modules.empty()) {
+      physics_backend.SetSwerveModules(std::move(swerve_modules));
     }
+    if (!gateway.Reconfigure(hw_config)) {
+      throw std::runtime_error(
+          "sim_gateway: Reconfigure failed for the robot config");
+    }
+    talos::simulation::ResolveFaults(faults, hw_config);
     talos::hardware::Endpoint endpoint{gateway};
     if (endpoint.Open("127.0.0.1", ports.listen, "127.0.0.1", ports.send) !=
         talos::protocol::UdpStatus::kOk) {
