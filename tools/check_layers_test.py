@@ -1002,6 +1002,12 @@ class CheckNodeSourcesTest(unittest.TestCase):
             ("copts_fms_extensions",
              'cc_library(name = "arm", srcs = ["arm.cc"], '
              'copts = ["-fms-extensions"])\n'),
+            ("copts_fms_compatibility",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-fms-compatibility"])\n'),
+            ("copts_xclang_fms_compatibility",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-Xclang", "-fms-compatibility"])\n'),
         ]
         for name, build in cases:
             with self.subTest(name=name):
