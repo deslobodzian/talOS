@@ -12,7 +12,7 @@ build --experimental_disk_cache_gc_max_size=40G
 # Fast local iteration: lower C++ optimization and run only the fast test lane.
 # Uses separate action cache keys from the default -O3 build.
 build:dev --cxxopt=-O1
-test:dev --test_tag_filters=-heavy,-integration,-e2e,-perf
+test:dev --config=fast
 
 # --config=release records this checkout's revision (talos.bazelrc).
 build:release --workspace_status_command=tools/workspace_status.sh
