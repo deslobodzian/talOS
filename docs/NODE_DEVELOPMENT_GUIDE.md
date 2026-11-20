@@ -592,7 +592,11 @@ Which cases every node tests, and how: [TESTING.md](TESTING.md#7-the-node-test-m
 
 `talos::testing::Sim` (`//talOS/node:testing`) runs nodes on one simulated clock
 with in-memory topics; `talos::testing::SimHardware` (`//talOS/devices:testing`)
-stands in for the bridge.
+stands in for the bridge. `sim.remove(name)` stops and destroys a hosted node,
+and `sim.add` may be called after `step()` (including to re-add a removed name)
+to model a node restart: a node added mid-run starts its clock at `sim.now()`,
+fires its first periodic timer at `sim.now() + period`, and receives only
+messages published after it attached.
 
 ```cpp
 Sim sim{config_path};                 // or Sim::FromToml(inline_toml)
@@ -653,8 +657,8 @@ velocity below `0.01 rps` snaps to zero. Position continues integrating during
 decay. Python exposes the same accessors.
 
 Python: `from talos.testing import Sim, SimHardware` (`//talOS/python:testing`),
-the same methods (`Sim.from_toml`, `sim.step(seconds)`,
-`sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`,
+the same methods (`Sim.from_toml`, `sim.add(Cls, name)`, `sim.remove(name)`,
+`sim.step(seconds)`, `sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`,
 `sim.publish_target(M, sub, source, **fields)`, `sim.release_target(M, sub,
 source)`, `sim.latest_target(M, sub, source)`, `hw.set_driver_station(enabled=True,
 teleop=True)`, `hw.stop_driver_station()`, `sim.latest_bytes(topic)`). The

@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 35u
+#define TALOS_NODE_ABI_VERSION 36u
 
 enum {
   TALOS_OK = 0,
@@ -520,9 +520,13 @@ void talos_sim_destroy(TalosSim* sim);
 // talos_node_session_dir. `path` NULL or "" clears it. Call before
 // talos_sim_add.
 int32_t talos_sim_set_session_dir(TalosSim* sim, const char* path);
-// Builds a node named `node_name` with `factory`. NULL on error.
+// Builds a node named `node_name` with `factory`, before or after stepping.
+// NULL on error.
 TalosNode* talos_sim_add(TalosSim* sim, const char* node_name,
                          TalosFactory factory, void* user);
+// Stops and removes the hosted node named `node_name`, destroying it so the
+// name may be added again later. Fails if absent or called inside step.
+int32_t talos_sim_remove(TalosSim* sim, const char* node_name);
 TalosNode* talos_sim_node(TalosSim* sim, const char* node_name);
 int32_t talos_sim_step(TalosSim* sim, int64_t duration_ns);
 // Pauses only this node for duration_ns; resume ends a pause early.

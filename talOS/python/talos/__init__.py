@@ -115,7 +115,8 @@ class Node:
     @property
     def _handle(self):
         if self._native is None:
-            raise TalosError("this node's Sim has been destroyed")
+            raise TalosError(
+                "this node has been removed or its Sim has been destroyed")
         return self._native
 
     @property

@@ -132,7 +132,7 @@ struct Sim::Impl {
   std::vector<std::unique_ptr<Hosted>> nodes;
   std::vector<Periodic> periodic;
   Duration now{0};
-  bool started = false;
+  bool stepping = false;
 
   // Rounds at one instant before step() gives up on nodes that keep
   // publishing to each other's prompt subscriptions without time passing.
@@ -265,6 +265,21 @@ Node& Sim::node(std::string_view node_name) {
                               "'");
 }
 
+void Sim::remove(std::string_view node_name) {
+  Impl& impl = *impl_;
+  if (impl.stepping) {
+    throw std::logic_error("Sim: remove() cannot be called inside step()");
+  }
+  const auto it = std::find_if(
+      impl.nodes.begin(), impl.nodes.end(),
+      [&](const auto& hosted) { return hosted->name == node_name; });
+  if (it == impl.nodes.end()) {
+    throw std::invalid_argument("Sim: no node named '" +
+                                std::string{node_name} + "'");
+  }
+  impl.nodes.erase(it);
+}
+
 void Sim::pause(std::string_view node_name, Duration duration) {
   if (duration < Duration::zero()) {
     throw std::invalid_argument("Sim: negative pause");
@@ -311,7 +326,14 @@ std::optional<std::vector<std::byte>> Sim::latest_bytes(
 void Sim::step(Duration d) {
   if (d < Duration::zero()) throw std::invalid_argument("Sim: negative step");
   Impl& impl = *impl_;
-  impl.started = true;
+  if (impl.stepping) {
+    throw std::logic_error("Sim: step() cannot be called inside step()");
+  }
+  struct Stepping {
+    bool& flag;
+    explicit Stepping(bool& f) : flag{f} { flag = true; }
+    ~Stepping() { flag = false; }
+  } stepping{impl.stepping};
   const Duration end = impl.now + d;
   impl.RunPeriodic();
   impl.StartLoops();
@@ -340,8 +362,8 @@ using testing::Sim;
 void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
                               const InstanceFactory& make) {
   Sim::Impl& impl = *sim.impl_;
-  if (impl.started) {
-    throw std::logic_error("Sim: add every node before the first step");
+  if (impl.stepping) {
+    throw std::logic_error("Sim: add() cannot be called inside step()");
   }
   for (const auto& hosted : impl.nodes) {
     if (hosted->name == node_name) {
@@ -351,8 +373,10 @@ void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
   }
   auto hosted = std::make_unique<Sim::Impl::Hosted>();
   hosted->name = std::string{node_name};
-  hosted->loop =
-      std::make_unique<event::SimulatedEventLoop<>>(impl.environment);
+  hosted->loop = std::make_unique<event::SimulatedEventLoop<>>(
+      impl.environment, event::SimulatedEventLoop<>::Options{
+                            .start = Time::from_nanos(impl.now.count()),
+                        });
   hosted->port =
       std::make_unique<testing::SimPort>(*hosted->loop, impl.byte_topics);
   // The declared graph, as the launcher builds it: every node added before

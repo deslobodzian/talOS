@@ -21,6 +21,7 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/node/sim_access.h"
+#include "target_test/target_test_message_generated.h"
 
 namespace talos::testing {
 namespace {
@@ -1032,6 +1033,103 @@ TEST_F(SimHardwareTest, ModeChangeOnALostTickStartsANewGeneration) {
   hw.set_driver_station(teleop);
   sim.step(5ms);
   EXPECT_GT(mode_since_us(), before);
+}
+
+// REQ-SAFE-31: an actuator node stopped and re-added mid-run inside
+// command_timeout_us (and inside the bridge's owner timeout) never drives on a
+// pre-restart target even though that target is still younger than
+// command_timeout_us and in the same mode generation: its subscriptions deliver
+// only what is published after attach, so its first flush neutralizes the motor
+// until a new target arrives. Kept stopped past the owner timeout, the bridge
+// neutralizes the motor before the node is re-added, and SimHardware cleanly
+// reads the restarted node's /hw/request/<node> once it returns.
+TEST(SimHardwareRestart,
+     RestartedActuatorNodeStaysNeutralOnPreRestartTargetAndResumesOnNewTarget) {
+  struct Lift {
+    explicit Lift(Node& n) : node{n}, target{n}, motor{n, "m"} {}
+    void update() {
+      if (const auto* goal = target.get()) {
+        motor.set_duty_cycle(goal->position_rot());
+      }
+      ++updates;
+    }
+    Node& node;
+    Target<target_test::Goal> target;
+    Motor motor;
+    int updates = 0;
+  };
+  constexpr std::string_view kToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.lift.motors.m]
+can_id = 1
+)";
+  constexpr std::uint32_t kTeleop =
+      driver_station::kEnabled | driver_station::kTeleop;
+
+  auto sim = Sim::FromToml(kToml);
+  sim.add<Lift>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+
+  // Part 1: restart inside the 50 ms owner timeout and 100 ms command_timeout.
+  const Time published = sim.now();
+  const std::uint64_t generation = DriverStationGeneration(sim);
+  ASSERT_NE(generation, 0u);
+  PublishTarget(sim, "lift", "teleop", target_test::Goal{0.5});
+  sim.step(10ms);  // now = 20 ms
+  ASSERT_EQ(hw.applied_motor("lift", "m").mode, Mode::kDutyCycle);
+  ASSERT_DOUBLE_EQ(hw.applied_motor("lift", "m").demand, 0.5);
+
+  sim.remove("lift");
+  sim.step(10ms);  // now = 30 ms: still inside the 50 ms owner timeout
+  ASSERT_EQ(hw.applied_motor("lift", "m").mode, Mode::kDutyCycle);
+
+  auto& restarted = sim.add<Lift>("lift");
+  EXPECT_EQ(sim.now(), Time{} + 30ms);
+  EXPECT_EQ(sim.node("lift").now(), sim.now());
+  // At 35 ms restarted ticks before SimHardware publishes (no State yet);
+  // at 40 ms it drains the 35 ms State & DS packet (robot_enabled == true)
+  // and flushes neutral, neutralizing the motor inside the owner timeout.
+  sim.step(10ms);  // now = 40 ms
+  EXPECT_EQ(DriverStationGeneration(sim), generation);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(restarted.updates, 2);
+  EXPECT_EQ(restarted.target.get(), nullptr);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kNeutral);
+
+  // Stay neutral for the entire remaining lifetime of the pre-restart target.
+  for (; sim.now() - published < 95ms; sim.step(5ms)) {
+    EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kNeutral)
+        << "target age " << (sim.now() - published).count() / 1'000'000
+        << " ms";
+  }
+
+  // A new target published after attach drives the restarted node immediately.
+  PublishTarget(sim, "lift", "teleop", target_test::Goal{0.75});
+  sim.step(10ms);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kDutyCycle);
+  EXPECT_DOUBLE_EQ(hw.applied_motor("lift", "m").demand, 0.75);
+
+  // Part 2: stopped past command_timeout_us (and owner timeout), the motor
+  // goes neutral before re-add; re-adding resumes cleanly on a new target.
+  sim.remove("lift");
+  sim.step(105ms);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kNeutral);
+
+  sim.add<Lift>("lift");
+  sim.step(10ms);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kNeutral);
+
+  PublishTarget(sim, "lift", "teleop", target_test::Goal{0.25});
+  sim.step(10ms);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kDutyCycle);
+  EXPECT_DOUBLE_EQ(hw.applied_motor("lift", "m").demand, 0.25);
 }
 
 }  // namespace

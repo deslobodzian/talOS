@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 35
+_EXPECTED_ABI_VERSION = 36
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -286,6 +286,7 @@ _TESTING_SIGNATURES = {
     "talos_sim_destroy": (None, [c_void_p]),
     "talos_sim_set_session_dir": (c_int32, [c_void_p, c_char_p]),
     "talos_sim_add": (c_void_p, [c_void_p, c_char_p, FACTORY, c_void_p]),
+    "talos_sim_remove": (c_int32, [c_void_p, c_char_p]),
     "talos_sim_node": (c_void_p, [c_void_p, c_char_p]),
     "talos_sim_step": (c_int32, [c_void_p, c_int64]),
     "talos_sim_pause": (c_int32, [c_void_p, c_char_p, c_int64]),

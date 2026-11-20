@@ -56,7 +56,7 @@ class Sim:
     def __init__(self, config_path=None, *, _handle=None):
         self._handle = _handle or _abi.handle(
             lib.talos_sim_create(_abi.encode(config_path)))
-        self._nodes = []  # (Node, object) per node, alive with the sim
+        self._nodes = {}  # node_name -> (Node, object), alive while hosted
 
     @classmethod
     def from_toml(cls, robot_toml):
@@ -77,22 +77,53 @@ class Sim:
             # Garbage collection may finalize this Sim while other objects
             # of the same unreachable cycle still hold its nodes: their
             # handles now raise instead of reaching freed memory.
-            for node, _ in self._nodes:
+            for node, _ in self._nodes.values():
                 node._native = None
+                node._callbacks.clear()
+            self._nodes.clear()
             lib.talos_sim_destroy(handle)
 
     def add(self, cls, node_name):
-        """Builds cls on a node named node_name; returns the object."""
-        factory = talos._factory(cls, self._nodes, self)
-        _abi.handle(lib.talos_sim_add(self._handle, _abi.encode(node_name),
-                                      factory, None))
-        return self._nodes[-1][1]
+        """Builds cls on a node named node_name; returns the object.
+
+        May be called before or after step(): a node added mid-run starts at
+        now_ns and receives only messages published after it attached."""
+        key = node_name.decode() if isinstance(node_name, bytes) else node_name
+        built = []
+        factory = talos._factory(cls, built, self)
+        try:
+            _abi.handle(lib.talos_sim_add(self._handle, _abi.encode(node_name),
+                                          factory, None))
+        except BaseException:
+            for node, _ in built:
+                node._native = None
+                node._callbacks.clear()
+                node._owner = None
+            raise
+        node, obj = built[0]
+        self._nodes[key] = (node, obj)
+        return obj
+
+    def remove(self, node_name):
+        """Stops and removes node_name, destroying its native node.
+
+        The name may be added again later; any existing wrapper for the
+        removed node raises TalosError."""
+        _abi.ok(lib.talos_sim_remove(self._handle, _abi.encode(node_name)))
+        key = node_name.decode() if isinstance(node_name, bytes) else node_name
+        entry = self._nodes.pop(key, None)
+        if entry is not None:
+            node, _ = entry
+            node._native = None
+            node._callbacks.clear()
+            node._owner = None
 
     def node(self, node_name):
         """The talos.Node add() built for node_name."""
         handle = _abi.handle(
             lib.talos_sim_node(self._handle, _abi.encode(node_name)))
-        return next(node for node, _ in self._nodes if node._native == handle)
+        return next(node for node, _ in self._nodes.values()
+                    if node._native == handle)
 
     def step(self, seconds):
         """Advances virtual time, running every node's timers and messages."""
