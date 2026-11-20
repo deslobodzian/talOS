@@ -447,54 +447,52 @@ struct Bridge {
   }
 
   // Reads what the topic holds, up to a page budget (`backlog` when it stops
-  // there), and brings every client toward it.
-  void poll() {
+  // there).
+  void read_queue() {
     backlog = false;
-    if (queue) {
-      // Bound work so HTTP and client socket processing cannot starve.
-      for (unsigned count = 0;; ++count) {
-        if (count == 256) {
-          backlog = true;
-          break;
-        }
-        MessageInfo info;
-        const auto result = queue->read_next(reader, frame, info);
-        if (result == ReadResult::TORN) {
-          ++invalid;
-          continue;
-        }
-        if (result != ReadResult::OK) break;
-        lapped += info.dropped;
-        auto bytes = talos::telemetry_wire::payload(frame);
-        if (bytes.empty()) {
-          ++invalid;
-          continue;
-        }
-        const bool had_frame = telemetry_state.has_frame;
-        const std::uint64_t sequence = telemetry_state.sequence_id;
-        if (!studio::IngestTelemetry(telemetry_state, bytes,
-                                     talos::introspect::monotonic_now_ns())) {
-          ++invalid;
-          continue;
-        }
-        if (telemetry_state.has_frame &&
-            (!had_frame || telemetry_state.sequence_id != sequence)) {
-          ++forwarded;
-        }
+    if (!queue) return;
+    // Bound work so HTTP and client socket processing cannot starve.
+    for (unsigned count = 0;; ++count) {
+      if (count == 256) {
+        backlog = true;
+        break;
+      }
+      MessageInfo info;
+      const auto result = queue->read_next(reader, frame, info);
+      if (result == ReadResult::TORN) {
+        ++invalid;
+        continue;
+      }
+      if (result != ReadResult::OK) break;
+      lapped += info.dropped;
+      auto bytes = talos::telemetry_wire::payload(frame);
+      if (bytes.empty()) {
+        ++invalid;
+        continue;
+      }
+      const bool had_frame = telemetry_state.has_frame;
+      const std::uint64_t sequence = telemetry_state.sequence_id;
+      if (!studio::IngestTelemetry(telemetry_state, bytes,
+                                   talos::introspect::monotonic_now_ns())) {
+        ++invalid;
+        continue;
+      }
+      if (telemetry_state.has_frame &&
+          (!had_frame || telemetry_state.sequence_id != sequence)) {
+        ++forwarded;
       }
     }
-    // Every pass, not only on a new tick: a pass woken by the budget's refill
-    // or a client's heartbeat (next_wake_ns) sends what is due.
-    pass_clients();
   }
 
   // One pass of the loop, whatever woke it: the wake channel's protocol
   // (drain, read until empty, arm, and read again while an arm finds a
   // page), the segment check, the graph refresh, and every client's due
-  // sends. Each client is sent its changed counters at most every
-  // GraphFeed::kUpdateNs (or a deferral notice), so Studio keeps measuring
-  // node rates from successive graphs' counters and never marks a merely
-  // deferred graph stale.
+  // sends. Arming before pass_clients() writes to client sockets ensures a
+  // publication arriving while clients are pumped wakes the next wait rather
+  // than racing an unarmed reader. Each client is sent its changed counters
+  // at most every GraphFeed::kUpdateNs (or a deferral notice), so Studio
+  // keeps measuring node rates from successive graphs' counters and never
+  // marks a merely deferred graph stale.
   void service(std::int64_t now_ns) {
     if (wake) wake->drain();
     watch(now_ns);
@@ -505,18 +503,22 @@ struct Bridge {
       schedule.refreshed_ns = now_ns;
       refresh_system();
     }
-    poll();
-    if (!queue || !wake) return;
-    // Three tries: a slot this queue no longer holds never arms, and must
-    // not make the loop spin; it falls back to reading every kFallbackNs.
-    for (int attempt = 0; !backlog; ++attempt) {
-      if (queue->arm_wake(reader)) return;
-      if (attempt == 2) {
-        backlog = true;
-        return;
+    read_queue();
+    if (queue && wake) {
+      // Three tries: a slot this queue no longer holds never arms, and must
+      // not make the loop spin; it falls back to reading every kFallbackNs.
+      for (int attempt = 0; !backlog; ++attempt) {
+        if (queue->arm_wake(reader)) break;
+        if (attempt == 2) {
+          backlog = true;
+          break;
+        }
+        read_queue();
       }
-      poll();
     }
+    // Every pass, not only on a new tick: a pass woken by the budget's refill
+    // or a client's heartbeat (next_wake_ns) sends what is due.
+    pass_clients();
   }
 
   // When the loop must next run with no socket event or publication
