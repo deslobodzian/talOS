@@ -1,6 +1,7 @@
 # talos hard rules
 
-Every session and subagent loads this file (AGENTS.md imports it). A rule here
+Every session and subagent loads this file (imported by AGENTS.md and
+`.agents/rules/rules.md`). A rule here
 is not traded for convenience: if a task seems to need breaking one, stop and
 ask. ARCHITECTURE.md and talOS/NAMING.md hold the contracts these rules point
 at; they are not restated here.
