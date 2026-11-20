@@ -904,12 +904,11 @@ with `--replay-inputs` takes `--sim` only as given. A topic the node did not
 watch live (all of them, for a node the session did not run) is fed from
 every log that recorded it, the writer's `SEND`s (the hardware bridge's
 `--log` included) and readers' receipts, each publication once, with the
-sequence and publication time live readers saw. A node the session ran
-replays on its own recorded timeline: its
+sequence and publication time live readers saw. A node the session ran replays on its own recorded timeline: its
 timers fire at the deadlines they fired at live (a node that fired none
 starts its run at its first dispatch and fires none up to that run's last
-record; a node that ran once ends there, unless its loop was late when it
-stopped; a restarted node replays as one run), and it is handed what it
+record, and a single-run log never fabricates a firing after a late `EXIT`;
+a restarted node replays as one run), and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and
 ages measured from it). The node is never fed across a log gap: the run ends
@@ -921,8 +920,10 @@ may have lost records no GAP record marks is refused before the node runs,
 naming the log and the sign, and the launcher exits 1: one with a
 `<log>.capped` marker or of a member the session manifest marks
 `log_capped`, a run's log without its EXIT record of a member it marks
-`log_gap` or `recorder_failed` ([session manifest](#session-manifest)), and
-one whose damaged
+`log_gap` or `recorder_failed` ([session manifest](#session-manifest)), one
+with a missing or incomplete-header segment (including a missing first segment
+without a marker or a segment missing before the active file detected by a
+dispatch-index or sender-sequence jump), and one whose damaged
 records nothing bounds the time of. The node's own first run's log is
 refused the same way, whatever it feeds, when the node had a timer and
 that log's first segment, or a segment before its first firing read, is

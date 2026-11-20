@@ -361,20 +361,23 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   first) starts at its first dispatch, which live made inside `run()`, so
   at or after its run start: a timer armed before the run fires no earlier
   than live, so the replay fires none up to that run's last record; a
-  program that ran once ends there, unless its loop was late when it
-  stopped (a due deadline it never fired before its `EXIT`, which the
-  replay fires); a restarted program replays as one run, through the time
-  it was down. Such a run's log is refused (below) when it holds no record
-  of its run, or a loss that may hold its firings. A run with no timer
-  starts at its origin. A topic it watched live is fed from
-  its own receipts alone, each at the drain that delivered it live (its
-  `MESSAGE` record's event time), with its recorded publication time; the
-  replayed drain runs at its deadline, without the live loop's wake-up
-  latency, so a message published during that latency is stamped with the
-  deadline. A message one live drain missed, and the next took, is taken by
-  that next drain again. A watcher that took only the newest message sees no
-  skipped message, so its dropped count is zero. The replay ends at the program's
-  last record (`loop_end()`).
+  restarted program replays as one run, through the time it was down. Such a
+  run's log is refused (below) when it holds no record of its run, or a loss
+  that may hold its firings. A run with no timer starts at its origin. A
+  topic it watched live is fed from its own receipts alone, each at the drain
+  that delivered it live (its `MESSAGE` record's event time), with its
+  recorded publication time; the replayed drain runs at its deadline, without
+  the live loop's wake-up latency, so a message published during that latency
+  is stamped with the deadline. A message one live drain missed, and the next
+  took, is taken by that next drain again. A watcher that took only the
+  newest message sees no skipped message, so its dropped count is zero. The
+  replay ends at the program's last record (`loop_end()`), clamped for a
+  single-run log to one nanosecond before the earliest armed timer deadline
+  that never fired live (strictly after any recorded `TIMER` or `MESSAGE`
+  dispatch, or any deadline when none ran), so neither a live loop that was
+  late when it stopped (recording `EXIT` after a due deadline it never fired)
+  nor an offset-0 timer whose run's only dispatch record is its `EXIT`
+  fabricates a timer firing.
 - `ReplayInputs` runs the loop on its virtual clock to `loop_end()`, the end
   of the session for a program it did not run (or to a gap, below). Each
   recorded message on a
@@ -443,28 +446,40 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   `recorder_failed`
   ([session manifest](../launcher/README.md#session-manifest)), a run's log
   without its `EXIT` record is suspect and one with it is judged by its GAP
-  records. Each recorded topic names the first such log it is fed from, or
+  records. A rotated log that lost a segment without a marker is suspect too:
+  a missing first segment (including an active file whose first dispatch is
+  past 1), an incomplete-header segment skipped before a readable segment, a
+  gap in numbered segments, a non-final segment ending with a damaged tail,
+  or a segment missing just before the log's unnumbered active file detected
+  from a `dispatch_index` jump (> 1) or an accepted-`SEND` transport sequence
+  jump (> 1) across the boundary (since `FileHeader` carries no segment
+  index, a deleted final numbered segment holding only operation records of
+  the previous segment's final dispatch, or in a `dispatch_index == 0` log
+  only topics not sent on both sides, cannot be distinguished without a format
+  change). Each recorded topic names the first such log it is fed from, or
   one with a damaged stretch nothing bounds (`RecordedTopic::refused_log`,
   `refused_reason`), by the same rule as gaps, and `ReplayInputs` throws a
   `ReplayError` before anything runs, naming the log, the sign and the topic;
   a node binary prints it and exits 1. The replayed program's own first
   run's log is refused the same way, fed topic or not, when its manifest
   arms a timer and its first segment (`<stem>.segment0.tlog`) was not read
-  (the byte cap deleted it, or its header is incomplete), or a segment
-  before the first firing read is missing or unreadable: the firing
-  `run_start()` is read from may have been there, and a later segment's
-  first firing may be whole periods later
-  (`RecordedSession::run_start_refused_log`, naming the first file read, or
-  the one that does not continue the segment before it, and the sign). So
-  is such a log with no firing that gives the run start when it holds no
-  record of its run (no dispatch nor `EXIT`: nothing gives its start or its
-  end), or a GAP record or damaged stretch, which may hold its firings. A
-  capped log that kept its first segment (capture stopped at the cap) still
+  (the byte cap deleted it, its header is incomplete, or the active file
+  starts past dispatch 1), or a segment before the first firing read is
+  missing or unreadable (including one detected by a dispatch-index or
+  sender-sequence jump into the active file): the firing `run_start()` is read
+  from may have been there, and a later segment's first firing may be whole
+  periods later (`RecordedSession::run_start_refused_log`, naming the first
+  file read, or the one that does not continue the segment before it, and the
+  sign). So is such a log with no firing that gives the run start when it
+  holds no record of its run (no dispatch nor `EXIT`: nothing gives its start
+  or its end), or a GAP record or damaged stretch, which may hold its firings.
+  A capped log that kept its first segment (capture stopped at the cap) still
   gives the run start. `RecordedSession` reads the
   `manifest.json` in the directory holding the logs when its `session_id` is
   the logs', and matches a member's `log_paths` to the logs by file name, so
   a session copied elsewhere still matches; logs without one (outside a
-  launcher session) are judged by their `.capped` markers alone. A manifest
+  launcher session) are judged by their `.capped` markers and segment
+  continuity alone. A manifest
   that is not JSON is refused, naming it. It is read with
   `session_manifest.h`, the reader `log_dump` and Studio's review also use
   (`talOS/launcher/hardware_record.h`) and whose key names the launcher's
@@ -481,7 +496,8 @@ wall-clock start timestamp remains informational.
 
 Node binaries expose this as
 `--replay-inputs <session dir>` (`talOS/node/node.cc`, Python nodes included
-through the C ABI); the launcher as `--replay-inputs <dir> --only <node>`
+through the C ABI; a path that is not a directory is refused naming it as
+given); the launcher as `--replay-inputs <dir> --only <node>`
 (`talOS/launcher/README.md`). Byte topics (`Node::publish_bytes`) are
 discarded there, as under `--replay`: the loop never logs them, and an offline
 run must not write into a live robot's shared memory.
