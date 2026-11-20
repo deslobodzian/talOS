@@ -382,6 +382,76 @@ class RunTest(unittest.TestCase):
                   if source.get("untargeted_outputs")}
         self.assertEqual(marked, {"/hw/request/lift"})
 
+    # REQ-SAFE-42: under --targeted-outputs (passed by the launcher when
+    # --describe declared a hardware request without untargeted_outputs),
+    # talos.allow_untargeted_outputs raises TalosError at construction so the
+    # Python node exits non-zero before update() runs; without the flag, the
+    # same node constructs and ticks.
+    def test_targeted_outputs_refuses_allow_untargeted_outputs_at_construction(
+        self,
+    ):
+        probe = textwrap.dedent("""
+            import os, signal, sys, tempfile
+            import talos
+
+            mode = sys.argv[1]
+            robot_toml = sys.argv[2]
+            ticks = []
+
+            class Probe:
+                def __init__(self, node):
+                    self.lift = talos.Motor(node, "lift")
+                    talos.allow_untargeted_outputs(node)
+
+                def update(self):
+                    ticks.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                config = os.path.join(tmp, "robot.toml")
+                log = os.path.join(tmp, "lift.tlog")
+                with open(config, "w") as f:
+                    f.write(robot_toml)
+                argv = ["probe", "--sim", "--duration-s", "5",
+                        "--log", log, "--config", config]
+                if mode == "targeted":
+                    argv.insert(2, "--targeted-outputs")
+                    try:
+                        code = talos.run(Probe, "lift", "//talOS/python:probe",
+                                         argv)
+                    except talos.TalosError as err:
+                        assert not ticks, f"refused node ticked: {len(ticks)}"
+                        print(f"TALOS_ERROR:{err}", flush=True)
+                        raise
+                    raise AssertionError(
+                        f"expected TalosError, got exit code {code} "
+                        f"(ticks={len(ticks)})"
+                    )
+                code = talos.run(Probe, "lift", "//talOS/python:probe", argv)
+                assert code == 0, f"expected exit 0, got {code}"
+                assert ticks, "expected update() to run"
+        """)
+
+        refused = subprocess.run(
+            [sys.executable, "-c", probe, "targeted", ROBOT_TOML],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(refused.returncode, 0,
+                            refused.stdout + refused.stderr)
+        self.assertIn("TALOS_ERROR:", refused.stdout,
+                      refused.stdout + refused.stderr)
+        self.assertIn("lift", refused.stdout)
+        self.assertIn("AllowUntargetedOutputs", refused.stdout)
+        self.assertIn("--targeted-outputs", refused.stdout)
+        self.assertIn("TalosError", refused.stderr)
+
+        allowed = subprocess.run(
+            [sys.executable, "-c", probe, "standalone", ROBOT_TOML],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(allowed.returncode, 0,
+                         allowed.stdout + allowed.stderr)
+
 
 class BorrowedLifetimeTest(unittest.TestCase):
     def test_wrappers_keep_sim_alive_until_native_teardown(self):
