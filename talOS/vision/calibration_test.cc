@@ -101,5 +101,39 @@ TEST(CalibrationTest, CameraMounting) {
                   .isApprox(Eigen::Vector3d::UnitY()));
 }
 
+TEST(CalibrationTest, UndistortGuardsNonPositiveRadial) {
+  CameraIntrinsics intr;
+  intr.fx = 600.0;
+  intr.fy = 600.0;
+  intr.cx = 320.0;
+  intr.cy = 240.0;
+  intr.k1 = -0.5;
+
+  // radial == 0.0 on first iteration (r2 = 2.0): must not divide by zero.
+  const double x_zero = std::sqrt(2.0);
+  const Eigen::Vector2d p_zero =
+      intr.UndistortNormalizedPoint({intr.cx + intr.fx * x_zero, intr.cy});
+  EXPECT_TRUE(std::isfinite(p_zero.x()));
+  EXPECT_TRUE(std::isfinite(p_zero.y()));
+  EXPECT_DOUBLE_EQ(p_zero.x(), x_zero);
+  EXPECT_DOUBLE_EQ(p_zero.y(), 0.0);
+
+  // radial < 0.0 on first iteration (r2 = 4.0): must not flip sign or diverge.
+  const Eigen::Vector2d p_neg =
+      intr.UndistortNormalizedPoint({intr.cx + intr.fx * 2.0, intr.cy});
+  EXPECT_TRUE(std::isfinite(p_neg.x()));
+  EXPECT_TRUE(std::isfinite(p_neg.y()));
+  EXPECT_DOUBLE_EQ(p_neg.x(), 2.0);
+  EXPECT_DOUBLE_EQ(p_neg.y(), 0.0);
+
+  // Diverges into radial < 0.0 on second iteration (r2 = 1.96 -> x1 = 70.0).
+  const Eigen::Vector2d p_div =
+      intr.UndistortNormalizedPoint({intr.cx + intr.fx * 1.4, intr.cy});
+  EXPECT_TRUE(std::isfinite(p_div.x()));
+  EXPECT_TRUE(std::isfinite(p_div.y()));
+  EXPECT_DOUBLE_EQ(p_div.x(), 1.4);
+  EXPECT_DOUBLE_EQ(p_div.y(), 0.0);
+}
+
 }  // namespace
 }  // namespace talos::vision
