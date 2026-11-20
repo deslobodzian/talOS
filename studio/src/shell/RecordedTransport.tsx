@@ -1,11 +1,21 @@
 // The footer while a recorded session is open, in place of the live Timeline:
 // step, play/pause at 1x/2x/4x, a scrub slider over the session, the playhead
-// as session time and wall time, a band over each log gap (REQ-OPS-41), the review error if any, and Close.
+// as session time and wall time, timeline lanes for Driver Station modes,
+// alerts, node restarts/unclean exits and log gaps (REQ-OPS-41), the review
+// error if any, and Close.
 
 import {useSyncExternalStore} from 'react';
 
 import {usePlayback} from '../data/hooks';
-import {gapBands, PLAY_RATES, type PlayRate, type RecordedSource} from '../data/recorded';
+import {
+  alertMarks,
+  gapBands,
+  PLAY_RATES,
+  recordedModeLanes,
+  restartMarks,
+  type PlayRate,
+  type RecordedSource
+} from '../data/recorded';
 import {wallTimeNs} from '../data/review';
 import {sessionTime, timestamp, wallDateTime} from '../ui/formatters';
 
@@ -24,6 +34,10 @@ export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
   const stepOk = /^[1-9]\d{0,17}$/.test(stepNs);
   const playing = playback.mode === 'REPLAY_PLAYING';
   const spanMs = Number((end - start) / 1000000n);
+  const modes = recordedModeLanes(source.bounds, source.timeline);
+  const alerts = alertMarks(source.bounds, source.timeline);
+  const restarts = restartMarks(source.bounds, source.timeline);
+  const gaps = gapBands(source.bounds);
 
   return <footer className="timeline recorded">
     <div className="playback">
@@ -46,6 +60,28 @@ export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
         <code>{sessionTime(cursor - start)} · {wallDateTime(
             wallTimeNs(source.bounds, cursor.toString()))}</code>
       </div>
+      <div className="scrub-lanes" aria-label="Recorded session timeline lanes">
+        <div className="scrub-lane scrub-lane-modes">
+          {source.timeline.hardware_not_decoded ?
+            <span className="scrub-mode undecoded"
+                  title="Hardware packets not decoded: Driver Station mode lane unavailable"
+                  aria-label="Hardware packets not decoded: Driver Station mode lane unavailable"/> :
+            modes.map((band, i) =>
+              <span key={i} className={'scrub-mode ' + band.mode}
+                    title={band.title} aria-label={band.title}
+                    style={{left: `${band.left * 100}%`, width: `${band.width * 100}%`}}/>)}
+        </div>
+        <div className="scrub-lane scrub-lane-marks">
+          {alerts.map((mark, i) =>
+            <span key={`a-${i}`} className={'scrub-alert ' + mark.level}
+                  title={mark.title} aria-label={mark.title}
+                  style={{left: `${mark.left * 100}%`, width: `${mark.width * 100}%`}}/>)}
+          {restarts.map((mark, i) =>
+            <span key={`r-${i}`} className={'scrub-restart ' + mark.kind}
+                  title={mark.title} aria-label={mark.title}
+                  style={{left: `${mark.left * 100}%`}}/>)}
+        </div>
+      </div>
       <div className="scrub-track">
         <input type="range" className="scrub-range" aria-label="Recorded session time"
                min={0} max={Math.max(1, spanMs)} step={1}
@@ -53,7 +89,7 @@ export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
                onChange={e => source.seek(
                    (start + BigInt(Math.round(Number(e.target.value))) * 1000000n)
                        .toString())}/>
-        {gapBands(source.bounds).map((band, i) =>
+        {gaps.map((band, i) =>
           <span key={i} className="scrub-gap" title={band.title} aria-label={band.title}
                 style={{left: `${band.left * 100}%`, width: `${band.width * 100}%`}}/>)}
       </div>

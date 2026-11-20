@@ -19,11 +19,20 @@
 // merged.
 
 import type {Pose, Snapshot} from '../core';
-import type {AlertLevel} from '../generated/talos/telemetry/alert-level';
+import {AlertLevel} from '../generated/talos/telemetry/alert-level';
+import type {DeclaredGraph} from '../system';
+import {
+  alertText,
+  compareAlerts,
+  type AlertLatch,
+  type LatchedAlert
+} from './alerts';
 import {discoverEstimate, type EstimateChannels} from './discovery';
 import {
   decodeSeries,
   errorMessage,
+  fetchDeclared,
+  fetchTimeline,
   getBytes,
   getJson,
   isAbort,
@@ -34,18 +43,24 @@ import {
   type FetchLike,
   type ReviewBounds,
   type ReviewSnapshot,
+  type ReviewTimeline,
   type SeriesBuckets,
-  type SeriesColumns
+  type SeriesColumns,
+  type TimelineAlertLevel,
+  type TimelineMode
 } from './review';
 import type {ChannelSample, DataSource} from './source';
 import type {
   ChannelInfo,
+  DriverStationMode,
+  EventCategory,
   Mode,
   ModeBand,
   PlaybackState,
   RobotEvent,
   Series,
-  SeriesWindow
+  SeriesWindow,
+  Severity
 } from './types';
 
 // Milliseconds, and a periodic callback (an animation frame in the browser).
@@ -92,9 +107,18 @@ const GRID_DIVISIONS = 16n;
 const ALL_GRID_DIVISIONS = 64n;
 const MIN_GRID_NS = 1000000n;
 
-const NO_EVENTS: RobotEvent[] = [];
 const NO_BANDS: ModeBand[] = [];
 const ZERO_POSE: Pose = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+
+export const EMPTY_TIMELINE: ReviewTimeline = {
+  hardware_not_decoded: false,
+  modes: [],
+  modes_dropped: 0,
+  alerts: [],
+  alerts_dropped: 0,
+  runs: [],
+  runs_dropped: 0
+};
 
 type Request = {controller: AbortController; promise: Promise<SeriesBuckets|null>;
                 slots: Set<string>};
@@ -144,21 +168,28 @@ export class RecordedSource implements DataSource {
   // The consumers one render pass (series() calls at one `version`) asked
   // for, and those of the latest pass that asked for any: what is on screen.
   private pass = {version: -1, slots: new Set<string>()};
+  private readonly recordedEvents: RobotEvent[];
+  private readonly recordedModeBands: ModeBand[];
+  private cachedLatch: {cursor: bigint; latch: AlertLatch}|null = null;
 
   static async open(server: string, id: string,
                     options: RecordedOptions = {}): Promise<RecordedSource> {
     const fetchFn = options.fetch ?? defaultFetch;
-    const [channels, bounds] = await Promise.all([
+    const [channels, bounds, timeline, declared] = await Promise.all([
       getJson(fetchFn, reviewUrl(server, id, 'channels.json')).then(parseChannels),
-      getJson(fetchFn, reviewUrl(server, id, 'bounds.json')).then(parseBounds)
+      getJson(fetchFn, reviewUrl(server, id, 'bounds.json')).then(parseBounds),
+      fetchTimeline(server, id, fetchFn),
+      fetchDeclared(server, id, fetchFn)
     ]);
     return new RecordedSource(server, id, channels, bounds, fetchFn,
-                              options.clock ?? browserClock);
+                              options.clock ?? browserClock, timeline, declared);
   }
 
   constructor(readonly server: string, readonly id: string,
               private readonly channels: ChannelInfo[], readonly bounds: ReviewBounds,
-              fetchFn: FetchLike, clock: ReviewClock) {
+              fetchFn: FetchLike, clock: ReviewClock,
+              readonly timeline: ReviewTimeline = EMPTY_TIMELINE,
+              readonly declared: DeclaredGraph|null = null) {
     this.infos = new Map(channels.map(c => [c.name, c]));
     this.estimate = discoverEstimate(channels);
     this.fetchFn = fetchFn;
@@ -167,6 +198,8 @@ export class RecordedSource implements DataSource {
     this.end = BigInt(bounds.end_ns);
     this.playhead = this.start;
     this.snapshotWanted = bounds.start_ns;
+    this.recordedEvents = timelineEvents(bounds, timeline);
+    this.recordedModeBands = timelineModeBands(timeline);
     this.playback = this.makePlayback('PAUSED');
     this.requestSnapshot(bounds.start_ns, true);
   }
@@ -537,17 +570,20 @@ export class RecordedSource implements DataSource {
   chassis() {
     return this.chassisReading;
   }
-  // Timeline lanes (modes, alerts) are not served yet.
   events() {
-    return NO_EVENTS;
+    return this.recordedEvents;
   }
   modeBands() {
-    return NO_BANDS;
+    return this.recordedModeBands;
   }
-  // The review server's alert intervals are not served yet; a snapshot still
-  // carries the alerts active at the playhead.
-  alertLatch() {
-    return null;
+  // Active and latched alerts up to the current playhead from timeline.json
+  // (REQ-OPS-37), cached per playhead position for useSyncExternalStore.
+  alertLatch(): AlertLatch {
+    if (this.cachedLatch && this.cachedLatch.cursor === this.playhead)
+      return this.cachedLatch.latch;
+    const latch = timelineAlertLatch(this.bounds, this.timeline, this.playhead);
+    this.cachedLatch = {cursor: this.playhead, latch};
+    return latch;
   }
 }
 
@@ -651,4 +687,299 @@ export function gapBands(bounds: ReviewBounds): GapBand[] {
           (g.closed_at_flush ? '; closed at the stop' : '')
     };
   });
+}
+
+const TIMELINE_TO_DS_MODE: Record<TimelineMode, DriverStationMode> = {
+  disabled: 'disabled',
+  teleop: 'teleop',
+  auto: 'autonomous',
+  test: 'test',
+  estop: 'estop'
+};
+
+const TIMELINE_TO_ALERT_LEVEL: Record<TimelineAlertLevel, AlertLevel> = {
+  error: AlertLevel.Error,
+  warning: AlertLevel.Warning,
+  info: AlertLevel.Info
+};
+
+const ALERT_TO_SEVERITY: Record<TimelineAlertLevel, Severity> = {
+  error: 'error',
+  warning: 'warn',
+  info: 'info'
+};
+
+const CLEAN_RUN_REASONS: ReadonlySet<string> = new Set(['stop', 'exit', 'running']);
+
+export const isUncleanRunExit = (reason: string, end_ns: string|null): boolean =>
+    end_ns !== null && !CLEAN_RUN_REASONS.has(reason);
+
+function alertCategory(channel: string): EventCategory {
+  if (channel.startsWith('hw/status/')) {
+    const rest = channel.slice('hw/status/'.length);
+    if (rest.startsWith('battery') || rest.startsWith('brownout') || rest.startsWith('can_'))
+      return 'power';
+    return 'hardware';
+  }
+  if (channel.startsWith('hw/')) return 'hardware';
+  return 'system';
+}
+
+function modeEventTitle(mode: DriverStationMode): string {
+  if (mode === 'estop') return 'E-stop';
+  if (mode === 'disabled') return 'Disabled';
+  return `Enabled · ${mode}`;
+}
+
+export function timelineModeBands(timeline: ReviewTimeline): ModeBand[] {
+  if (timeline.hardware_not_decoded) return NO_BANDS;
+  return timeline.modes.map(m => ({
+    start_ns: m.start_ns,
+    end_ns: m.end_ns,
+    mode: TIMELINE_TO_DS_MODE[m.mode]
+  }));
+}
+
+export function timelineEvents(bounds: ReviewBounds, timeline: ReviewTimeline): RobotEvent[] {
+  const out: RobotEvent[] = [];
+  let seq = 0;
+  const add = (tag: string, t_ns: string, severity: Severity,
+               category: EventCategory, title: string, detail?: string,
+               channel?: string) => {
+    const event: RobotEvent = {
+      id: `recorded-${tag}:${t_ns}:${++seq}`,
+      t_ns,
+      severity,
+      category,
+      title
+    };
+    if (detail !== undefined) event.detail = detail;
+    if (channel !== undefined) event.channel = channel;
+    out.push(event);
+  };
+
+  // Mode transitions (or one explicit notice when hardware was not decoded,
+  // never misreporting undecoded hardware as disabled; REQ-OPS-51).
+  if (timeline.hardware_not_decoded) {
+    add('hw-not-decoded', bounds.start_ns, 'warn', 'hardware',
+        'Hardware packets not decoded',
+        bounds.hardware_not_decoded ?? 'Driver Station modes unavailable');
+  } else {
+    for (let i = 0; i < timeline.modes.length; i++) {
+      const m = timeline.modes[i];
+      const dsMode = TIMELINE_TO_DS_MODE[m.mode];
+      const prev = i > 0 ? timeline.modes[i - 1] : null;
+      if (!prev || prev.mode !== m.mode) {
+        const severity: Severity = dsMode === 'estop' ? 'error' : 'info';
+        const detail = prev?.mode === 'estop' ? 'from estop' :
+            m.fms ? 'FMS attached' : undefined;
+        add('mode', m.start_ns, severity, 'driver_station',
+            modeEventTitle(dsMode), detail);
+      }
+      if (prev && prev.fms !== m.fms) {
+        add('fms', m.start_ns, 'info', 'driver_station',
+            m.fms ? 'FMS attached' : 'FMS detached');
+      }
+    }
+  }
+
+  // Alert activations and clears from timeline.alerts (REQ-OPS-37).
+  const sessionEnd = BigInt(bounds.end_ns);
+  for (const a of timeline.alerts) {
+    const levelEnum = TIMELINE_TO_ALERT_LEVEL[a.level];
+    const owner = a.channel.slice(0, Math.max(0, a.channel.indexOf('/')));
+    const text = alertText(a.channel, levelEnum);
+    const label = owner ? `${owner}: ${text}` : text;
+    const category = alertCategory(a.channel);
+    add('alert-on', a.start_ns, ALERT_TO_SEVERITY[a.level], category, label,
+        `alert raised (${a.level})`, a.channel);
+    if (BigInt(a.end_ns) < sessionEnd) {
+      const seconds = (Number(BigInt(a.end_ns) - BigInt(a.start_ns)) / 1e9).toFixed(3);
+      add('alert-off', a.end_ns, 'info', category, `${label} cleared`,
+          `active ${seconds} s`, a.channel);
+    }
+  }
+
+  // Node restarts (non-initial runs) and unclean run exits from manifest runs[].
+  const priorRun = new Map<string, {count: number; reason: string}>();
+  for (const run of timeline.runs) {
+    const seen = priorRun.get(run.node);
+    const runNumber = (seen?.count ?? 0) + 1;
+    if (seen) {
+      add('run-restart', run.start_ns, 'warn', 'system',
+          `${run.node} restarted (run ${runNumber})`,
+          seen.reason ? `after ${seen.reason.replace(/_/g, ' ')}` : undefined);
+    }
+    if (isUncleanRunExit(run.reason, run.end_ns)) {
+      add('run-exit', run.end_ns!, 'error', 'system',
+          `${run.node} ${run.reason.replace(/_/g, ' ')}`,
+          `run ${runNumber}`);
+    }
+    priorRun.set(run.node, {count: runNumber, reason: run.reason});
+  }
+
+  // Log gaps from bounds.gaps (REQ-OPS-41).
+  for (const g of bounds.gaps) {
+    const seconds = (Number(BigInt(g.end_ns) - BigInt(g.start_ns)) / 1e9).toFixed(3);
+    add('gap', g.start_ns, 'warn', 'stream', `Log gap in ${g.process}`,
+        `${seconds} s, lost ${g.records} records (${g.dispatches} dispatches, ${g.sends} sends)` +
+            (g.closed_at_flush ? '; closed at stop' : ''));
+  }
+
+  // Sort chronologically, keeping emission order for equal timestamps.
+  out.sort((a, b) => {
+    const dt = BigInt(a.t_ns) - BigInt(b.t_ns);
+    return dt < 0n ? -1 : dt > 0n ? 1 : 0;
+  });
+  return out;
+}
+
+export function timelineAlertLatch(bounds: ReviewBounds, timeline: ReviewTimeline,
+                                   playhead: bigint): AlertLatch {
+  const sessionEnd = BigInt(bounds.end_ns);
+  const byChannel = new Map<string, LatchedAlert>();
+  for (const a of timeline.alerts) {
+    const start = BigInt(a.start_ns);
+    if (start > playhead) continue;
+    const end = BigInt(a.end_ns);
+    const activeAtPlayhead =
+        (start <= playhead && playhead < end) ||
+        (end >= sessionEnd && start <= playhead && playhead <= end) ||
+        (start === end && playhead === start);
+    const level = TIMELINE_TO_ALERT_LEVEL[a.level];
+    const existing = byChannel.get(a.channel);
+    if (existing) {
+      existing.count++;
+      if (start < BigInt(existing.first_ns)) existing.first_ns = a.start_ns;
+      if (start > BigInt(existing.last_ns)) existing.last_ns = a.start_ns;
+      existing.active = existing.active || activeAtPlayhead;
+    } else {
+      byChannel.set(a.channel, {
+        channel: a.channel,
+        level,
+        owner: a.channel.slice(0, Math.max(0, a.channel.indexOf('/'))),
+        text: alertText(a.channel, level),
+        first_ns: a.start_ns,
+        last_ns: a.start_ns,
+        count: 1,
+        active: activeAtPlayhead
+      });
+    }
+  }
+  return {
+    matchStart_ns: bounds.start_ns,
+    matchKey: null,
+    alerts: [...byChannel.values()].sort(compareAlerts)
+  };
+}
+
+export type ModeLane = {
+  left: number;
+  width: number;
+  mode: DriverStationMode;
+  fms: boolean;
+  title: string;
+};
+
+export type AlertMark = {
+  left: number;
+  width: number;
+  level: TimelineAlertLevel;
+  channel: string;
+  title: string;
+  start_ns: string;
+};
+
+export type RestartMark = {
+  left: number;
+  node: string;
+  kind: 'restart'|'exit';
+  reason: string;
+  title: string;
+  t_ns: string;
+};
+
+function fraction(bounds: ReviewBounds) {
+  const start = BigInt(bounds.start_ns);
+  const span = Number(BigInt(bounds.end_ns) - start);
+  return {
+    start,
+    at: (t: string) => span <= 0 ? 0 :
+        Math.min(1, Math.max(0, Number(BigInt(t) - start) / span)),
+    offsetS: (t: string) => (Number(BigInt(t) - start) / 1e9).toFixed(3)
+  };
+}
+
+export function recordedModeLanes(bounds: ReviewBounds,
+                                  timeline: ReviewTimeline): ModeLane[] {
+  if (timeline.hardware_not_decoded) return [];
+  const f = fraction(bounds);
+  return timeline.modes.map(m => {
+    const left = f.at(m.start_ns);
+    const right = f.at(m.end_ns);
+    const width = Math.max(GAP_MIN_WIDTH, right - left);
+    const clampedLeft = Math.min(left, 1 - width);
+    const mode = TIMELINE_TO_DS_MODE[m.mode];
+    const fmsLabel = m.fms ? ' (FMS)' : '';
+    return {
+      left: clampedLeft,
+      width,
+      mode,
+      fms: m.fms,
+      title: `${mode}${fmsLabel}: ${f.offsetS(m.start_ns)} s – ${f.offsetS(m.end_ns)} s`
+    };
+  });
+}
+
+export function alertMarks(bounds: ReviewBounds,
+                           timeline: ReviewTimeline): AlertMark[] {
+  const f = fraction(bounds);
+  return timeline.alerts.map(a => {
+    const left = f.at(a.start_ns);
+    const width = Math.max(GAP_MIN_WIDTH, f.at(a.end_ns) - left);
+    const clampedLeft = Math.min(left, 1 - width);
+    const owner = a.channel.slice(0, Math.max(0, a.channel.indexOf('/')));
+    const text = alertText(a.channel, TIMELINE_TO_ALERT_LEVEL[a.level]);
+    const label = owner ? `${owner}: ${text}` : text;
+    return {
+      left: clampedLeft,
+      width,
+      level: a.level,
+      channel: a.channel,
+      start_ns: a.start_ns,
+      title: `${a.level} · ${label} (${f.offsetS(a.start_ns)} s – ${f.offsetS(a.end_ns)} s)`
+    };
+  });
+}
+
+export function restartMarks(bounds: ReviewBounds,
+                             timeline: ReviewTimeline): RestartMark[] {
+  const f = fraction(bounds);
+  const marks: RestartMark[] = [];
+  const seenNodes = new Map<string, number>();
+  for (const run of timeline.runs) {
+    const count = (seenNodes.get(run.node) ?? 0) + 1;
+    seenNodes.set(run.node, count);
+    if (count > 1) {
+      marks.push({
+        left: f.at(run.start_ns),
+        node: run.node,
+        kind: 'restart',
+        reason: run.reason,
+        t_ns: run.start_ns,
+        title: `${run.node} restarted (run ${count}) at ${f.offsetS(run.start_ns)} s`
+      });
+    }
+    if (isUncleanRunExit(run.reason, run.end_ns)) {
+      marks.push({
+        left: f.at(run.end_ns!),
+        node: run.node,
+        kind: 'exit',
+        reason: run.reason,
+        t_ns: run.end_ns!,
+        title: `${run.node} ${run.reason.replace(/_/g, ' ')} at ${f.offsetS(run.end_ns!)} s`
+      });
+    }
+  }
+  return marks;
 }

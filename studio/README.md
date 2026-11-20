@@ -348,8 +348,11 @@ remembers, are not there (the browser keeps them per origin).
 
 While a recording is open it replaces the live view on every page, and the
 footer becomes its transport: step back and forward by the step size, play
-and pause at 1x, 2x or 4x, a slider over the whole session, and the playhead
-as session time (from the session's start) and wall time. Each stretch where
+and pause at 1x, 2x or 4x, a slider over the whole session, timeline lanes
+for Driver Station modes (or a striped bar when hardware packets were not
+decoded), alert intervals, and node restarts/unclean exits from
+`timeline.json`, and the playhead as session time (from the session's start)
+and wall time. Each stretch where
 a process's event log dropped records (a log gap in `bounds.json`'s `gaps`)
 is a warning-coloured band over the slider, at least a sliver wide, whose
 tooltip names the process, the duration, the records, dispatches and sends
@@ -371,7 +374,9 @@ shown in the footer with **Retry**; panels keep what they last showed.
 |---|---|
 | Plot | Each channel decimated to the plot's pixel width rounded up to 256, 512, 1024, 2048 or 4096 buckets (so a plot wider than 4096 px gets fewer buckets than pixels), so resizing a plot requests again only where it crosses one, and fetched in as many requests as the server's limit on channels × buckets (its `bounds.json`) needs: the line is each bucket's last sample, at that sample's own publication time, and a bucket of more than one sample also draws its min-to-max range. The window ends at the playhead; "All history" is the session from its start to the playhead. |
 | Field | The pose estimator's pose at the playhead (no pose while its `valid` is false), the trail and camera observations over the window. |
-| Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the snapshot it came from (the snapshot's own time, as live measures against its frame's: a snapshot still trailing a playing playhead does not age its readings), and the alerts active there; the system graph, events, node selections and the alert latch are live-only and show as absent. |
+| Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the snapshot it came from (the snapshot's own time, as live measures against its frame's: a snapshot still trailing a playing playhead does not age its readings), and the alerts active and latched up to the playhead from `timeline.json`; the live system graph and node selections are live-only and show as absent. |
+| Events | Chronological events from `timeline.json` and `bounds.json` (`gaps`): Driver Station mode transitions (or a notice when hardware packets were not decoded), alert activations and clears, node restarts and unclean exits from `manifest.json`, and log gaps; clicking an event seeks the recording to its timestamp. |
+| Health | Recorded playback status, `bounds.json` log gaps, active and latched alerts at the playhead, node run history and restarts from `timeline.json`, and the session's declared graph (`declared.json`, when present); explicitly notes that live registry liveness is not present in recordings rather than fabricating live rows. |
 | Every other panel | "Not available for recorded sessions yet." |
 
 Values carry the channel names live telemetry uses. The chassis pose differs:
@@ -443,9 +448,15 @@ listens on 127.0.0.1 only (there is no flag to change that), and refuses a
 port another listener holds, exiting with `cannot listen on 127.0.0.1:<port>`
 (it never shares a port, as uSockets' `SO_REUSEPORT` default would). It serves the
 review API under `/review/`: `sessions.json`, and per session
-`channels.json`, `bounds.json`, `snapshot?t_ns=` and
-`series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes are in
-[`review/review.h`](review/review.h). Every other path is a file of the built
+`channels.json`, `bounds.json`, `timeline.json`, `declared.json`,
+`snapshot?t_ns=` and `series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes
+are in [`review/review.h`](review/review.h). `timeline.json` summarises
+Driver Station mode transitions (empty when `hardware_not_decoded` is true),
+alert active intervals across every `ChannelInfo.alert != None` channel, and
+`manifest.json`'s `nodes[].runs[]` mapped via `origin_wall_ns` (with
+`end_wall_ns == 0` as `null`). `declared.json` serves the session's
+`graph.json` verbatim (up to 1 MiB, `kMaxDeclaredBytes`), or 404 when absent.
+Every other path is a file of the built
 Studio (`//studio:web_dist`, from the binary's runfiles, or `--webroot`), so a
 Studio opened there reads the API from its own origin; a path that leaves
 the webroot is refused. A session id is one directory name of the library; a
@@ -535,8 +546,13 @@ most 80 B per value while it is answered (its buckets, each bucket's last
 time and the response), so at most 20 MiB (`kMaxSeriesRequestBytes`). At
 most 4 sessions are open at once (`kMaxOpenSessions`); opening another
 closes the least recently used, whose index is rebuilt when it is opened
-again. So the heap is the open sessions' indexes (24 B per log-file second,
-48 B per GAP record, plus their channel names), plus that cache, plus one request's ceiling (a
+again. Each open session's timeline is also bounded by fixed ceilings
+(`kMaxTimelineModes = 4096` and `kMaxTimelineAlerts = 4096`, 24 B each =
+96 KiB per lane, plus `kMaxTimelineRuns = 4096`), with any overflow reported
+in `modes_dropped`, `alerts_dropped` and `runs_dropped` (`runs_dropped` also
+sums each node's manifest `runs_dropped`). So the heap is the open sessions'
+indexes (24 B per log-file second,
+48 B per GAP record, plus their channel names and bounded timeline), plus that cache, plus one request's ceiling (a
 series' 20 MiB; a snapshot's answer, about 100 B per channel of its
 session), plus one read window per log being read (REQ-OPS-42). On a
 generated 203 MiB session (8 logs, 2.75 million records; `bazel run -c opt //studio/review:review_bench`,

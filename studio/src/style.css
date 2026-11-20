@@ -1123,7 +1123,57 @@ th.sortable i {
   background: var(--warn);
   opacity: .45;
   border-radius: 2px;
+  pointer-events: none;
 }
+/* Recorded session timeline lanes (modes, alerts, restarts) above the slider. */
+.scrub-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.scrub-lane {
+  position: relative;
+  height: 6px;
+  background: #0b131e;
+  border-radius: 2px;
+  overflow: hidden;
+}
+.scrub-mode {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  opacity: .75;
+}
+.scrub-mode.disabled { background: var(--ds-disabled); }
+.scrub-mode.autonomous { background: var(--ds-autonomous); }
+.scrub-mode.teleop { background: var(--ds-teleop); }
+.scrub-mode.test { background: var(--ds-test); }
+.scrub-mode.estop { background: var(--ds-estop); }
+.scrub-mode.undecoded {
+  left: 0;
+  right: 0;
+  background: repeating-linear-gradient(
+      -45deg, #273647, #273647 4px, #141f2d 4px, #141f2d 8px);
+}
+.scrub-alert {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 1px;
+  opacity: .85;
+}
+.scrub-alert.error { background: var(--error); }
+.scrub-alert.warning { background: var(--warn); }
+.scrub-alert.info { background: var(--info); }
+.scrub-restart {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-1px);
+}
+.scrub-restart.restart { background: var(--ds-test); }
+.scrub-restart.exit { background: var(--error); }
 
 .timeline {
   flex-shrink: 0;
