@@ -200,20 +200,23 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 - A widget kind it does not draw is an "Unsupported widget" cell, and one
   with no cell the page can read is counted on the status line. A message
   that does not decode is counted on the status line (`N malformed messages
-  counted`). A text message, or a binary one before any value page of the
-  connection decoded and within 1.5 s of its opening (before the
-  dictionary), is then ignored. A binary one after that grace with no value
-  page decoded closes the connection and reconnects: the dictionary and a
-  keyframe come within it, so the feed is one the page cannot read (a page
-  from another bridge version fails every page, the dictionary included) or
-  they were lost. So does a binary one after a value page decoded, since the
-  updates carry only changes and a keyframe's first page clears every
+  counted`). A text message is then ignored. A binary message that fails to
+  decode before any value page of the connection decoded and within 1.5 s of
+  its opening (before the dictionary) waits out that 1.5 s grace; if a valid
+  dictionary and value page arrive within the grace the connection recovers,
+  otherwise the connection closes and reconnects once the 1.5 s grace passes
+  (even if no further binary message arrives). A binary one after that grace
+  with no value page decoded closes the connection and reconnects at once: the
+  dictionary and a keyframe come within it, so the feed is one the page cannot
+  read (a page from another bridge version fails every page, the dictionary
+  included) or they were lost. So does a binary one after a value page decoded,
+  since the updates carry only changes and a keyframe's first page clears every
   channel, so a lost page would leave a value wrong or absent. That close is
   the feed's fault, not the link's: the status line reads TELEMETRY
   `Telemetry feed could not be decoded: reload the page` until a later
   connection decodes a value page or stays open past 1.5 s without a binary
-  message that fails to decode (one that fails within the 1.5 s keeps the
-  line until the next one closes the connection), and after 3 such closes
+  message that fails to decode (one that fails within the 1.5 s keeps the line
+  until the grace expires and closes the connection), and after 3 such closes
   in a row (each within
   10 s of its connection opening) attempts start 5 s apart instead of 1 s,
   so a feed that never decodes does not spend the slot's byte budget on a

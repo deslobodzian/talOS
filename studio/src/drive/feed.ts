@@ -50,11 +50,12 @@
 //     value page of the socket decoded and within CONNECTING_GRACE_MS of its
 //     opening (a corrupt message before the dictionary), is then ignored. A
 //     binary one after the grace with no value page decoded closes the socket
-//     as an error: the bridge sends the dictionary and a keyframe within the
-//     grace, so the feed is one this page cannot read (a page from another
-//     bridge version fails every page, the dictionary included) or its
-//     dictionary or keyframe was lost. A binary one after a value page
-//     decoded closes it too: the updates carry only changes,
+//     as an error (and so does passing the grace with no value page decoded
+//     after a binary one failed inside it): the bridge sends the dictionary and
+//     a keyframe within the grace, so the feed is one this page cannot read (a
+//     page from another bridge version fails every page, the dictionary
+//     included) or its dictionary or keyframe was lost. A binary one after a
+//     value page decoded closes it too: the updates carry only changes,
 //     and a keyframe's first page clears every channel, so a lost page (or
 //     a later page of a keyframe or an update whose earlier pages the
 //     decoder applied) would leave a value wrong or absent while later
@@ -62,8 +63,8 @@
 //     keyframe. Such a close is the feed's fault, not the link's: the status
 //     names the telemetry feed until a later socket decodes a value page or
 //     stays open past CONNECTING_GRACE_MS with no binary message that fails
-//     to decode (one that fails inside the grace holds the name until the
-//     close the next one makes), and after
+//     to decode (one that fails inside the grace closes the socket once the
+//     grace ends with no value page decoded), and after
 //     DECODE_RETRIES of them in a row (each within DECODE_STREAK_MS of its
 //     socket opening) attempts start DECODE_RETRY_MS apart, so a feed that
 //     never decodes does not spend the slot's byte budget on a dictionary
@@ -209,9 +210,10 @@ export class DriveModel {
   // the current socket while no value page has decoded on it and either it
   // has been open at most CONNECTING_GRACE_MS (the dictionary and keyframe's
   // bound) or a binary message on it failed to decode (undecodableThisSocket:
-  // one inside the grace carries the line across it to the decode close the
-  // next one makes). Otherwise the line judges that socket like any other,
-  // while the streak itself carries on to the next decode close.
+  // one inside the grace carries the line across it until tick() or the next
+  // undecodable message closes the socket). Otherwise the line judges that
+  // socket like any other, while the streak itself carries on to the next
+  // decode close.
   private decodeFailures = 0;
   private undecodableThisSocket = false;  // a binary message of this socket failed to decode
   private readonly tracked: Set<string>;
@@ -251,6 +253,9 @@ export class DriveModel {
     } else if (this.connection === 'open' &&
                now - this.lastMessageAt >= DEAD_AFTER_MS) {
       this.fail();
+    } else if (this.connection === 'open' && this.undecodableThisSocket &&
+               !this.valuesThisSocket && now - this.openedAt > CONNECTING_GRACE_MS) {
+      this.fail(now, true);
     }
     if (this.connection === 'waiting' && now >= this.nextAttemptAt) this.connect(now);
   }

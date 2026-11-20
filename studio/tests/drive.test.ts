@@ -736,7 +736,7 @@ test('a feed none of whose pages decode is named and backed off', () => {
   }
   assert.equal(named, CONNECTING_GRACE_MS + 100,
                `an undecodable feed is named at ${named} ms, ${h.model.status(h.clock.now).text}`);
-  assert.deepEqual(starts, [0, 1700, 3400, 3400 + DECODE_RETRY_MS, 3400 + 2 * DECODE_RETRY_MS]);
+  assert.deepEqual(starts, [0, 1600, 3200, 3200 + DECODE_RETRY_MS, 3200 + 2 * DECODE_RETRY_MS]);
 });
 
 // REQ-OPS-36: once named, a feed that stays undecodable stays named on every
@@ -774,6 +774,60 @@ test('an undecodable feed stays named across the grace of each reconnect', () =>
     else if (named) assert.fail(`${t} ms (${t - opened} ms after open): the named feed reads as ${status.text}`);
   }
   assert.ok(reconnects >= 3, `${reconnects} reconnects after the feed was named`);
+});
+
+// REQ-OPS-36: a corrupt binary page within CONNECTING_GRACE_MS followed only by
+// heartbeats (no valid value page ever decodes on the socket) fails once the
+// grace expires, reports the undecodable feed, and backs off reconnects after
+// DECODE_RETRIES consecutive failures. If a valid dictionary and value page
+// arrive before grace expires, the socket recovers and stays open past grace.
+test('a corrupt binary page within grace followed only by heartbeats fails after grace', () => {
+  const dictPage = encodeDictionaryPages(header(0), CHANNELS)[0];
+  const corruptDict = dictPage.slice(0, dictPage.length - 5);
+  const heartbeat = '{"kind":"talos.drive.heartbeat"}';
+
+  const h = harness();
+  const starts: number[] = [];
+  for (let t = 0; t <= 9000; t += 100) {
+    const before = h.sockets.length;
+    h.at(t);
+    if (t === 0) h.model.start(0);
+    if (h.sockets.length !== before) {
+      starts.push(t);
+      h.socket().onopen!();
+      h.socket().send(corruptDict);
+    } else if (h.model.connection === 'open') {
+      h.socket().send(heartbeat);
+    }
+    if (t <= CONNECTING_GRACE_MS) {
+      assert.equal(h.sockets.length, 1, `closed early at ${t} ms within grace`);
+      assert.equal(h.sockets[0].closed, false, `socket closed early at ${t} ms`);
+    } else {
+      const status = h.model.status(t);
+      assert.ok(status.undecodable, `${t} ms: expected undecodable status, got "${status.text}"`);
+      assert.match(status.text, /Telemetry feed could not be decoded/);
+    }
+  }
+  assert.ok(h.sockets[0].closed, 'first socket stayed open past grace after corrupt dictionary');
+  assert.deepEqual(starts, [0, 1600, 3200, 3200 + DECODE_RETRY_MS]);
+
+  // Recovery within grace: a corrupt page followed by a valid dictionary and
+  // value page before grace ends keeps the socket open past CONNECTING_GRACE_MS.
+  const recovered = harness();
+  recovered.at(0);
+  recovered.model.start(0);
+  recovered.socket().onopen!();
+  recovered.socket().send(corruptDict);
+  recovered.at(100);
+  recovered.socket().send(...encodeDictionaryPages(header(0), CHANNELS),
+                          ...update(0, NOMINAL, true), ...update(1, {}, false));
+  for (let t = 200; t <= CONNECTING_GRACE_MS + 500; t += 100) {
+    recovered.at(t);
+    recovered.socket().send(...update(t / 100, {}, false));
+  }
+  assert.equal(recovered.sockets.length, 1, 'recovered socket reconnected after grace');
+  assert.equal(recovered.sockets[0].closed, false, 'recovered socket closed after grace');
+  assert.equal(recovered.model.status(recovered.clock.now).link, 'ok');
 });
 
 // REQ-OPS-36: a keyframe of several pages applies each as it arrives, the
