@@ -351,7 +351,7 @@ class PhysicsSimBackend final : public Backend {
   void SetLocalMotorTypes(const Config& local) {
     local_motor_types_.clear();
     for (const auto& m : local.motors) {
-      local_motor_types_[m.name] = m.motor_type.value;
+      local_motor_types_[m.name.str()] = m.motor_type.value;
     }
   }
 
@@ -388,7 +388,7 @@ class PhysicsSimBackend final : public Backend {
     config_ = config;
     can_bus_count_ = CanBuses(config_).count;
     for (auto& m : config_.motors) {
-      if (const auto it = local_motor_types_.find(m.name);
+      if (const auto it = local_motor_types_.find(m.name.str());
           it != local_motor_types_.end()) {
         m.motor_type.value = it->second;
       }

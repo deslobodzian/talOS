@@ -405,7 +405,7 @@ RawDevice ParseMotor(const toml::table& t, const std::string& name) {
     throw std::invalid_argument("unknown motor type for " + name);
   }
   hardware::MotorConfig m;
-  m.bus = Read(t, "bus", m.bus);
+  m.bus = Read(t, "bus", m.bus.str());
   m.can_id = ReadRequired<int>(t, "can_id", name);
   m.inverted = Read(t, "inverted", m.inverted);
   m.brake = Read(t, "brake", m.brake);
@@ -569,7 +569,7 @@ RawDevice ParseSensor(const toml::table& t, const std::string& name) {
     throw std::invalid_argument("unknown sensor type '" + type + "' for " +
                                 name);
   }
-  s.bus = Read(t, "bus", s.bus);
+  s.bus = Read(t, "bus", s.bus.str());
   s.can_id = ReadRequired<int>(t, "can_id", name);
   s.inverted = Read(t, "inverted", s.inverted);
   s.offset_rot = Read(t, "offset_rot", s.offset_rot);

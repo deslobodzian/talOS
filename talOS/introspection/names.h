@@ -418,10 +418,13 @@ struct CanBusLoad {
 inline std::vector<CanBusLoad> EstimateCanBusLoads(
     const hardware::Config& config) {
   std::map<std::string, CanBusLoad, std::less<>> buses;
-  const auto at = [&](const std::string& bus) -> CanBusLoad& {
-    CanBusLoad& load = buses[bus];
-    load.bus = bus;
-    return load;
+  const auto at = [&](std::string_view bus) -> CanBusLoad& {
+    auto it = buses.find(bus);
+    if (it == buses.end()) {
+      it = buses.emplace(std::string{bus}, CanBusLoad{}).first;
+      it->second.bus = it->first;
+    }
+    return it->second;
   };
   for (const auto& motor : config.motors) ++at(motor.bus).motors;
   for (const auto& sensor : config.sensors) {
@@ -452,7 +455,7 @@ inline std::vector<Diagnostic> CheckHardwareConfig(
         motor.max_velocity_rps * motor.sensor_to_mechanism_ratio;
     if (sensor_velocity > 105.0) {
       out.push_back(
-          {Severity::WARNING, motor.name,
+          {Severity::WARNING, motor.name.str(),
            "max_velocity_rps * sensor_to_mechanism_ratio is " +
                std::to_string(sensor_velocity) +
                " rps, exceeding the recommended 105 rps; check gearing and "

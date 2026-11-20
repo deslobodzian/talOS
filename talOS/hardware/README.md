@@ -47,10 +47,10 @@ and the protocol version that wrote them and followed by a CRC32
 configuration over on its first disabled tick after the acknowledgement, or
 at a clean exit (`ConfigPersister::Stop`), and a saver thread (`talos-config`, nice 19) syncs storage while the loop ticks
 on: the loop only try-locks the handover, never waits on the save, and polls
-its outcome on later ticks. The loop encodes the configuration it hands over
-and frees those bytes itself once they are saved; once started, the saver
-thread allocates and frees nothing (system calls only, on paths built at
-startup), so it never holds an allocator lock the loop could wait on. A
+its outcome on later ticks. The loop encodes the configuration into a preallocated slot and swaps it by
+index under the lock; once constructed, neither the loop thread nor the saver
+thread allocates or frees during configuration persistence (system calls only,
+on paths built at startup). A
 configuration acknowledged while a save runs is
 saved after it, newest last; a failed save prints `cannot persist hardware
 configuration`, keeps the previous file, and an identical push saves it

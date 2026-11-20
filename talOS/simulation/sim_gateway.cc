@@ -228,7 +228,7 @@ int main(int argc, char** argv) {
       for (const auto& input : hw_config.digital_inputs) {
         const auto& sim = input.sim_home_switch;
         if (sim.motor.empty()) continue;
-        home_switches.push_back({.input = input.name,
+        home_switches.push_back({.input = input.name.str(),
                                  .motor = sim.motor,
                                  .closed_at_rot = sim.closed_at_rot,
                                  .closed_above = sim.closed_above,

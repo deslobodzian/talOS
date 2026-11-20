@@ -1,10 +1,17 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#include <ostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace talos::hardware {
@@ -16,6 +23,330 @@ inline constexpr std::size_t kMaxDigitalOutputs = 4;
 inline constexpr std::size_t kMaxAnalogInputs = 4;
 inline constexpr std::size_t kMaxEncoders = 4;
 inline constexpr std::size_t kMaxPwmOutputs = 4;
+inline constexpr std::size_t kMaxConfigNameLength = 63;
+
+// Inline NUL-terminated string bounded to `Capacity` bytes so hardware::Config
+// copies, deserialization, and reconfiguration on the RoboRIO loop never
+// allocate. Assigning more than `Capacity` bytes sets `overflowed()`, which
+// Validate() rejects.
+template <std::size_t Capacity>
+class FixedString {
+ public:
+  constexpr FixedString() noexcept = default;
+  FixedString(const char* s) noexcept { assign(s); }
+  FixedString(std::string_view s) noexcept { assign(s); }
+  FixedString(const std::string& s) noexcept {
+    assign(std::string_view{s.data(), s.size()});
+  }
+
+  FixedString& operator=(const char* s) noexcept {
+    assign(s);
+    return *this;
+  }
+  FixedString& operator=(std::string_view s) noexcept {
+    assign(s);
+    return *this;
+  }
+  FixedString& operator=(const std::string& s) noexcept {
+    assign(std::string_view{s.data(), s.size()});
+    return *this;
+  }
+  FixedString& operator+=(std::string_view s) noexcept {
+    append(s);
+    return *this;
+  }
+  void append(std::string_view s) noexcept {
+    if (s.size() > Capacity - size_) overflow_ = true;
+    const std::size_t add = std::min(s.size(), Capacity - size_);
+    if (add > 0) std::memcpy(data_.data() + size_, s.data(), add);
+    size_ += add;
+    data_[size_] = '\0';
+  }
+
+  void assign(const char* s) noexcept {
+    assign(s == nullptr ? std::string_view{} : std::string_view{s});
+  }
+  void assign(const char* s, std::size_t len) noexcept {
+    assign(s == nullptr ? std::string_view{} : std::string_view{s, len});
+  }
+  void assign(std::string_view s) noexcept {
+    overflow_ = s.size() > Capacity;
+    size_ = std::min(s.size(), Capacity);
+    if (size_ > 0) std::memcpy(data_.data(), s.data(), size_);
+    data_[size_] = '\0';
+  }
+  void assign(std::size_t count, char ch) noexcept {
+    overflow_ = count > Capacity;
+    size_ = std::min(count, Capacity);
+    if (size_ > 0)
+      std::memset(data_.data(), static_cast<unsigned char>(ch), size_);
+    data_[size_] = '\0';
+  }
+  void clear() noexcept {
+    size_ = 0;
+    overflow_ = false;
+    data_[0] = '\0';
+  }
+
+  constexpr std::string_view view() const noexcept {
+    return {data_.data(), size_};
+  }
+  constexpr operator std::string_view() const noexcept { return view(); }
+  std::string str() const { return std::string(data_.data(), size_); }
+  constexpr const char* c_str() const noexcept { return data_.data(); }
+  constexpr const char* data() const noexcept { return data_.data(); }
+  constexpr std::size_t size() const noexcept { return size_; }
+  constexpr std::size_t length() const noexcept { return size_; }
+  constexpr bool empty() const noexcept { return size_ == 0 && !overflow_; }
+  constexpr bool overflowed() const noexcept { return overflow_; }
+  constexpr char operator[](std::size_t i) const noexcept { return data_[i]; }
+  constexpr const char* begin() const noexcept { return data_.data(); }
+  constexpr const char* end() const noexcept { return data_.data() + size_; }
+
+  bool ends_with(std::string_view suffix) const noexcept {
+    return view().ends_with(suffix);
+  }
+  std::size_t find(std::string_view s, std::size_t pos = 0) const noexcept {
+    return view().find(s, pos);
+  }
+  std::string substr(std::size_t pos = 0,
+                     std::size_t count = std::string_view::npos) const {
+    return std::string(view().substr(pos, count));
+  }
+
+  bool operator==(const FixedString& other) const noexcept {
+    return overflow_ == other.overflow_ && view() == other.view();
+  }
+  friend bool operator==(const FixedString& a, std::string_view b) noexcept {
+    return !a.overflow_ && a.view() == b;
+  }
+  friend bool operator==(const FixedString& a, const char* b) noexcept {
+    return !a.overflow_ && b != nullptr && a.view() == b;
+  }
+  friend bool operator==(const FixedString& a, const std::string& b) noexcept {
+    return !a.overflow_ && a.view() == b;
+  }
+  friend auto operator<=>(const FixedString& a, const FixedString& b) noexcept {
+    return a.view() <=> b.view();
+  }
+  friend std::string operator+(const std::string& a, const FixedString& b) {
+    std::string out;
+    out.reserve(a.size() + b.size_);
+    out.append(a);
+    out.append(b.data(), b.size_);
+    return out;
+  }
+  friend std::string operator+(const FixedString& a, const std::string& b) {
+    std::string out;
+    out.reserve(a.size_ + b.size());
+    out.append(a.data(), a.size_);
+    out.append(b);
+    return out;
+  }
+  friend std::string operator+(const char* a, const FixedString& b) {
+    const std::string_view av = a == nullptr ? std::string_view{} : a;
+    std::string out;
+    out.reserve(av.size() + b.size_);
+    out.append(av);
+    out.append(b.data(), b.size_);
+    return out;
+  }
+  friend std::string operator+(const FixedString& a, const char* b) {
+    const std::string_view bv = b == nullptr ? std::string_view{} : b;
+    std::string out;
+    out.reserve(a.size_ + bv.size());
+    out.append(a.data(), a.size_);
+    out.append(bv);
+    return out;
+  }
+  friend std::string operator+(std::string_view a, const FixedString& b) {
+    std::string out;
+    out.reserve(a.size() + b.size_);
+    out.append(a);
+    out.append(b.data(), b.size_);
+    return out;
+  }
+  friend std::string operator+(const FixedString& a, std::string_view b) {
+    std::string out;
+    out.reserve(a.size_ + b.size());
+    out.append(a.data(), a.size_);
+    out.append(b);
+    return out;
+  }
+  friend std::ostream& operator<<(std::ostream& os, const FixedString& s) {
+    return os << s.view();
+  }
+
+ private:
+  std::array<char, Capacity + 1> data_{};
+  std::size_t size_{0};
+  bool overflow_{false};
+};
+
+using ConfigString = FixedString<kMaxConfigNameLength>;
+
+// Inline bounded vector with std::vector-compatible interface so Config and
+// Gateway hold device lists without heap allocations on the RoboRIO loop.
+template <typename T, std::size_t Capacity>
+class FixedVector {
+ public:
+  static constexpr std::size_t kCapacity = Capacity;
+  using value_type = T;
+  using size_type = std::size_t;
+  using difference_type = std::ptrdiff_t;
+  using reference = T&;
+  using const_reference = const T&;
+  using iterator = T*;
+  using const_iterator = const T*;
+
+  constexpr FixedVector() noexcept = default;
+  FixedVector(std::initializer_list<T> init) {
+    if (init.size() > Capacity) {
+      throw std::invalid_argument("invalid hardware device count");
+    }
+    for (const auto& item : init) data_[size_++] = item;
+  }
+  FixedVector& operator=(std::initializer_list<T> init) {
+    if (init.size() > Capacity) {
+      throw std::invalid_argument("invalid hardware device count");
+    }
+    std::size_t i = 0;
+    for (const auto& item : init) data_[i++] = item;
+    for (; i < size_; ++i) data_[i] = T{};
+    size_ = init.size();
+    return *this;
+  }
+  FixedVector(const FixedVector& other) : size_{other.size_} {
+    for (std::size_t i = 0; i < size_; ++i) data_[i] = other.data_[i];
+  }
+  FixedVector& operator=(const FixedVector& other) {
+    if (this == &other) return *this;
+    for (std::size_t i = 0; i < other.size_; ++i) data_[i] = other.data_[i];
+    for (std::size_t i = other.size_; i < size_; ++i) data_[i] = T{};
+    size_ = other.size_;
+    return *this;
+  }
+  FixedVector(FixedVector&& other) noexcept(
+      std::is_nothrow_move_assignable_v<T>)
+      : size_{other.size_} {
+    for (std::size_t i = 0; i < size_; ++i)
+      data_[i] = std::move(other.data_[i]);
+  }
+  FixedVector& operator=(FixedVector&& other) noexcept(
+      std::is_nothrow_move_assignable_v<T>) {
+    if (this == &other) return *this;
+    for (std::size_t i = 0; i < other.size_; ++i) {
+      data_[i] = std::move(other.data_[i]);
+    }
+    for (std::size_t i = other.size_; i < size_; ++i) data_[i] = T{};
+    size_ = other.size_;
+    return *this;
+  }
+
+  constexpr std::size_t size() const noexcept { return size_; }
+  constexpr bool empty() const noexcept { return size_ == 0; }
+  constexpr std::size_t capacity() const noexcept { return Capacity; }
+  constexpr std::size_t max_size() const noexcept { return Capacity; }
+  constexpr T* data() noexcept { return data_.data(); }
+  constexpr const T* data() const noexcept { return data_.data(); }
+  constexpr iterator begin() noexcept { return data_.data(); }
+  constexpr iterator end() noexcept { return data_.data() + size_; }
+  constexpr const_iterator begin() const noexcept { return data_.data(); }
+  constexpr const_iterator end() const noexcept { return data_.data() + size_; }
+  constexpr const_iterator cbegin() const noexcept { return data_.data(); }
+  constexpr const_iterator cend() const noexcept {
+    return data_.data() + size_;
+  }
+  constexpr T& front() noexcept { return data_[0]; }
+  constexpr const T& front() const noexcept { return data_[0]; }
+  constexpr T& back() noexcept { return data_[size_ - 1]; }
+  constexpr const T& back() const noexcept { return data_[size_ - 1]; }
+  constexpr T& operator[](std::size_t i) noexcept { return data_[i]; }
+  constexpr const T& operator[](std::size_t i) const noexcept {
+    return data_[i];
+  }
+  T& at(std::size_t i) {
+    if (i >= size_) throw std::out_of_range("FixedVector::at");
+    return data_[i];
+  }
+  const T& at(std::size_t i) const {
+    if (i >= size_) throw std::out_of_range("FixedVector::at");
+    return data_[i];
+  }
+
+  void clear() noexcept {
+    for (std::size_t i = 0; i < size_; ++i) data_[i] = T{};
+    size_ = 0;
+  }
+  void reserve(std::size_t n) {
+    if (n > Capacity) {
+      throw std::invalid_argument("invalid hardware device count");
+    }
+  }
+  void resize(std::size_t n) {
+    if (n > Capacity) {
+      throw std::invalid_argument("invalid hardware device count");
+    }
+    for (std::size_t i = size_; i < n; ++i) data_[i] = T{};
+    for (std::size_t i = n; i < size_; ++i) data_[i] = T{};
+    size_ = n;
+  }
+  void push_back(const T& value) {
+    if (size_ >= Capacity) {
+      throw std::invalid_argument("invalid hardware device count");
+    }
+    data_[size_++] = value;
+  }
+  void push_back(T&& value) {
+    if (size_ >= Capacity) {
+      throw std::invalid_argument("invalid hardware device count");
+    }
+    data_[size_++] = std::move(value);
+  }
+  template <typename... Args>
+  T& emplace_back(Args&&... args) {
+    if (size_ >= Capacity) {
+      throw std::invalid_argument("invalid hardware device count");
+    }
+    data_[size_] = T{std::forward<Args>(args)...};
+    return data_[size_++];
+  }
+  void pop_back() noexcept {
+    if (size_ == 0) return;
+    data_[--size_] = T{};
+  }
+  void erase_value(const T& value) noexcept {
+    std::size_t out = 0;
+    for (std::size_t i = 0; i < size_; ++i) {
+      if (!(data_[i] == value)) {
+        if (out != i) data_[out] = std::move(data_[i]);
+        ++out;
+      }
+    }
+    for (std::size_t i = out; i < size_; ++i) data_[i] = T{};
+    size_ = out;
+  }
+  template <typename Pred>
+  void erase_if(Pred pred) {
+    std::size_t out = 0;
+    for (std::size_t i = 0; i < size_; ++i) {
+      if (!pred(data_[i])) {
+        if (out != i) data_[out] = std::move(data_[i]);
+        ++out;
+      }
+    }
+    for (std::size_t i = out; i < size_; ++i) data_[i] = T{};
+    size_ = out;
+  }
+
+  bool operator==(const FixedVector& other) const {
+    return size_ == other.size_ && std::equal(begin(), end(), other.begin());
+  }
+
+ private:
+  std::array<T, Capacity> data_{};
+  std::size_t size_{0};
+};
 enum class SensorKind : uint8_t { kCANcoder = 1, kPigeon2 = 2 };
 enum class Feedback : uint8_t { kRotor = 0, kRemoteCANcoder = 1 };
 enum class GravityType : uint8_t { kElevatorStatic = 0, kArmCosine = 1 };
@@ -57,9 +388,9 @@ struct LocalMotorType {
 
 struct MotorConfig {
   uint16_t id{};  // Logical ID, independent of CAN address and array index.
-  std::string name;
+  ConfigString name;
   int can_id{};
-  std::string bus{"rio"};
+  ConfigString bus{"rio"};
   bool inverted{false};
   bool brake{true};
   double supply_limit_a{40};
@@ -113,10 +444,10 @@ struct MotorConfig {
 
 struct SensorConfig {
   uint16_t id{};
-  std::string name;
+  ConfigString name;
   SensorKind kind{SensorKind::kCANcoder};
   int can_id{};
-  std::string bus{"rio"};
+  ConfigString bus{"rio"};
   bool inverted{false};
   // CANcoder magnet offset, or Pigeon mount yaw added before inversion.
   double offset_rot{0};  // rotations, [-0.5, 0.5)
@@ -138,7 +469,7 @@ struct LocalHomeSwitch {
 
 struct DigitalInputConfig {
   uint16_t id{};
-  std::string name;
+  ConfigString name;
   int dio{};
   // [digital_inputs.*] sim_motor, sim_closed_at_rot, sim_closed_above and
   // sim_closed_reads. Not sent to the controller and not part of
@@ -151,14 +482,14 @@ struct DigitalInputConfig {
 
 struct DigitalOutputConfig {
   uint16_t id{};
-  std::string name;
+  ConfigString name;
   int dio{};
   bool operator==(const DigitalOutputConfig&) const = default;
 };
 
 struct AnalogInputConfig {
   uint16_t id{};
-  std::string name;
+  ConfigString name;
   int channel{};
   bool operator==(const AnalogInputConfig&) const = default;
 };
@@ -167,7 +498,7 @@ enum class EncoderKind : uint8_t { kQuadrature = 1, kDutyCycle = 2 };
 
 struct EncoderConfig {
   uint16_t id{};
-  std::string name;
+  ConfigString name;
   EncoderKind kind{EncoderKind::kQuadrature};
   int dio_a{};
   int dio_b{-1};
@@ -178,7 +509,7 @@ struct EncoderConfig {
 
 struct PwmConfig {
   uint16_t id{};
-  std::string name;
+  ConfigString name;
   int channel{};
   bool operator==(const PwmConfig&) const = default;
 };
@@ -203,13 +534,16 @@ struct Devices {
 };
 
 struct Config {
-  std::vector<MotorConfig> motors;
-  std::vector<SensorConfig> sensors;
-  std::vector<DigitalInputConfig> digital_inputs;
-  std::vector<DigitalOutputConfig> digital_outputs;
-  std::vector<AnalogInputConfig> analog_inputs;
-  std::vector<EncoderConfig> encoders;
-  std::vector<PwmConfig> pwm_outputs;
+  // Capacity exceeds kMaxMotors so callers that inspect unvalidated configs
+  // (e.g. CAN bus load estimation tests) can hold > kMaxMotors entries before
+  // Validate() / DeserializeConfig() enforces the kMaxMotors wire limit.
+  FixedVector<MotorConfig, kMaxMotors * 2> motors;
+  FixedVector<SensorConfig, kMaxSensors> sensors;
+  FixedVector<DigitalInputConfig, kMaxDigitalInputs> digital_inputs;
+  FixedVector<DigitalOutputConfig, kMaxDigitalOutputs> digital_outputs;
+  FixedVector<AnalogInputConfig, kMaxAnalogInputs> analog_inputs;
+  FixedVector<EncoderConfig, kMaxEncoders> encoders;
+  FixedVector<PwmConfig, kMaxPwmOutputs> pwm_outputs;
   uint32_t period_us{
       5000};  // 200 Hz setpoints/telemetry, PID stays on TalonFX.
   uint32_t command_timeout_us{100000};
@@ -221,9 +555,14 @@ struct Config {
 // Throws before any device is opened. Unknown references and duplicate names,
 // logical IDs, or CAN addresses on a bus are rejected, and so is a config
 // naming more than kMaxCanBuses - 1 CAN buses besides "rio" or two that
-// differ only by case (CanBuses).
+// differ only by case (CanBuses). Allocates nothing on a valid config.
 void Validate(const Config& config);
+// Non-throwing, allocation-free form of Validate() for the RoboRIO loop.
+bool IsValid(const Config& config) noexcept;
 uint64_t ConfigurationId(const Config& config);
+// Non-throwing, allocation-free form of ConfigurationId(): returns 0 when
+// IsValid(config) is false.
+uint64_t TryConfigurationId(const Config& config) noexcept;
 
 // The CAN buses whose health State carries (HealthSample::can_bus) and
 // /hw/status reports, one slot each.
