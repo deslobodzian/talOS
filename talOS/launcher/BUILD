@@ -254,6 +254,7 @@ cc_library(
         "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:events_os",
         "//talOS/introspection:describe",
         "//talOS/introspection:lock_file",
         "//talOS/introspection:names",

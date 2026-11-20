@@ -10,7 +10,6 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
-#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +24,7 @@
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/events/os/poller.h"
 #include "talOS/introspection/lock_file.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/launcher/console_line.h"
@@ -39,20 +39,9 @@
 namespace talos::launcher {
 namespace {
 
-// The main-processor node clock (talos::event::Poller::now()):
-// CLOCK_MONOTONIC on Linux, CLOCK_MONOTONIC_RAW on macOS.
-int64_t NodeClockNanos() {
-  struct timespec ts {};
-#if defined(__APPLE__)
-  ::clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-#else
-  ::clock_gettime(CLOCK_MONOTONIC, &ts);
-#endif
-  return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
-}
-
 // How often Supervise checks whether every non-observer member's loop has
-// started while waiting to write kSimScheduleStartFile. Stops once written.
+// started while waiting to write kSimScheduleStartFile. Stops once written or
+// once sim_gateway exits or is quarantined without a non-quarantined restart.
 constexpr std::chrono::milliseconds kSimScheduleStartPoll{20};
 
 // The topic ends a registry row published, or nullopt while it has
@@ -1519,7 +1508,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                          std::optional<std::size_t> sim_gateway_index,
                          std::chrono::steady_clock::time_point deadline) {
   bool stop_sent = false;
-  bool sim_schedule_started = !sim_gateway_index.has_value();
+  bool sim_schedule_done = !sim_gateway_index.has_value();
   auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
   std::optional<introspect::RegistryMapping> registry;
   // Every first run's liveness counts from here, not its spawn.
@@ -1699,40 +1688,56 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
         manifest_changed = true;
       }
     }
-    if (!sim_schedule_started && sim_gateway_index && !stop_arrived()) {
+    bool sim_schedule_polling = false;
+    if (!sim_schedule_done && sim_gateway_index && !stop_arrived()) {
       const auto& gw_proc = procs[*sim_gateway_index];
       const auto& gw_launch = launches[*sim_gateway_index];
-      bool roster_ready =
-          gw_proc.pid > 0 && !gw_proc.exited && gw_launch.loop_started;
-      for (std::size_t i = 0; roster_ready && i < procs.size(); ++i) {
-        if (studio && i == studio->index()) continue;
-        if (i == *sim_gateway_index) continue;
-        const auto& proc = procs[i];
-        const auto& launch = launches[i];
-        if (proc.pid > 0 && !proc.exited) {
-          roster_ready = launch.loop_started;
-        } else {
-          // Exited or unspawned: wait only while a non-quarantined restart is
-          // pending, so a finished, unrestartable or quarantined member cannot
-          // hold the simulator's schedules forever.
-          roster_ready =
-              !launch.restart.pending() || launch.restart.quarantined();
+      const bool gw_running = gw_proc.pid > 0 && !gw_proc.exited;
+      if (!gw_running &&
+          (!gw_launch.restart.pending() || gw_launch.restart.quarantined())) {
+        // sim_gateway exited or failed to spawn without a pending
+        // non-quarantined restart (or is quarantined): stop waiting and stop
+        // the 20 ms schedule-start poll for the rest of the session.
+        sim_schedule_done = true;
+      } else if (gw_running) {
+        bool roster_ready = gw_launch.loop_started;
+        bool waiting_for_running_loop = !gw_launch.loop_started;
+        for (std::size_t i = 0; i < procs.size(); ++i) {
+          if (studio && i == studio->index()) continue;
+          if (i == *sim_gateway_index) continue;
+          const auto& proc = procs[i];
+          const auto& launch = launches[i];
+          if (proc.pid > 0 && !proc.exited) {
+            if (!launch.loop_started) {
+              roster_ready = false;
+              waiting_for_running_loop = true;
+            }
+          } else if (launch.restart.pending() &&
+                     !launch.restart.quarantined()) {
+            // Exited or unspawned: wait only while a non-quarantined restart is
+            // pending, so a finished, unrestartable or quarantined member
+            // cannot hold the simulator's schedules forever.
+            roster_ready = false;
+          }
         }
-      }
-      if (roster_ready) {
-        const std::string path =
-            options_.output_dir + "/" + std::string{kSimScheduleStartFile};
-        const std::string stamp = std::to_string(NodeClockNanos()) + "\n";
-        std::string write_error;
-        if (WriteFileAtomically(path, stamp, SyncFunction{}, write_error)) {
-          ConsoleLine(std::cout)
-              << "[launcher] Started sim_gateway schedule (" << path << ")\n";
+        if (roster_ready) {
+          const std::string path =
+              options_.output_dir + "/" + std::string{kSimScheduleStartFile};
+          const std::string stamp =
+              std::to_string(event::Poller::now().nanos()) + "\n";
+          std::string write_error;
+          if (WriteFileAtomically(path, stamp, SyncFunction{}, write_error)) {
+            ConsoleLine(std::cout)
+                << "[launcher] Started sim_gateway schedule (" << path << ")\n";
+          } else {
+            ConsoleLine(std::cerr)
+                << "[launcher] cannot write " << path << " (" << write_error
+                << "); sim_gateway schedule not started\n";
+          }
+          sim_schedule_done = true;
         } else {
-          ConsoleLine(std::cerr)
-              << "[launcher] cannot write " << path << " (" << write_error
-              << "); sim_gateway schedule not started\n";
+          sim_schedule_polling = waiting_for_running_loop;
         }
-        sim_schedule_started = true;
       }
     }
     if (studio) {
@@ -1814,7 +1819,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       if (now < shutdown_deadline) due(shutdown_deadline);
     } else {
       due(deadline);
-      if (!sim_schedule_started) due(now + kSimScheduleStartPoll);
+      if (sim_schedule_polling) due(now + kSimScheduleStartPoll);
       // Each run the next pass watches (WatchRun): its row's next look.
       for (std::size_t i = 0; i < procs.size(); ++i) {
         if (procs[i].pid <= 0 || procs[i].exited ||
