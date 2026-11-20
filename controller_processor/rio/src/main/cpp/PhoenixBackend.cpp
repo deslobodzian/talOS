@@ -1156,7 +1156,7 @@ bool PhoenixBackend::Read(hw::State& s) {
       const bool connected = dev.duty_cycle->IsConnected();
       const double pos = dev.duty_cycle->Get() - dev.config.offset_rot;
       double vel = 0.0;
-      if (connected) {
+      if (connected && std::isfinite(pos)) {
         const auto now = std::chrono::steady_clock::now();
         if (dev.last_time && now > *dev.last_time) {
           const double dt =

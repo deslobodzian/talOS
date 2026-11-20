@@ -33,6 +33,7 @@
 #include <future>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -440,6 +441,46 @@ TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
   sim.Set(0.4);
   ASSERT_TRUE(backend.Read(state));
   EXPECT_TRUE(state.encoders[0].valid);
+  EXPECT_NEAR(state.encoders[0].position_rot, 0.275, 1e-9);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+}
+
+// A non-finite duty-cycle reading while connected invalidates only that tick
+// and must not poison last_position_rot so the next valid reading is also
+// invalidated by a NaN velocity finite difference (a backend-internal gap
+// Gateway's ReplaceNonFinite cannot repair).
+// REQ-SAFE-22, REQ-CONTRACT-32
+TEST(PhoenixBackendEncoders,
+     NonFiniteDutyCycleReadingDoesNotPoisonNextValidTick) {
+  EnsureHal();
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "m1", 1));
+  config.encoders.push_back(DutyEncoder(11, "duty", 2, 0.125));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  frc::sim::DutyCycleEncoderSim sim(2);
+  sim.SetConnected(true);
+  sim.Set(0.25);
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  hw::State state{};
+  ASSERT_TRUE(backend.Read(state));
+  ASSERT_TRUE(state.encoders[0].valid);
+
+  // Inject NaN while connected: this tick's encoder sample is invalid and
+  // zeroed, while the backend stays healthy.
+  sim.Set(std::numeric_limits<double>::quiet_NaN());
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_FALSE(state.encoders[0].valid);
+  EXPECT_DOUBLE_EQ(state.encoders[0].position_rot, 0.0);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+
+  // Next tick returns a valid finite reading: must recover immediately at rest
+  // rather than computing remainder(pos - NaN, 1.0).
+  sim.Set(0.4);
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_TRUE(state.encoders[0].valid)
+      << "non-finite reading poisoned last_position_rot on the next valid tick";
   EXPECT_NEAR(state.encoders[0].position_rot, 0.275, 1e-9);
   EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
 }
