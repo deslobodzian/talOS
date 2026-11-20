@@ -1682,6 +1682,12 @@ TEST(Supervision, RosterThatDoesNotFitTheRegistryIsRefused) {
   EXPECT_EQ(RunSession(options), 1);
   EXPECT_TRUE(ReadLines(runs).empty());
   held.pop_back();
+  // An unanswered Studio bridge is dropped before checking capacity, so 29
+  // held rows + 3 active nodes still fit even with --start-studio-bridge.
+  options.start_studio_bridge = true;
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("registry_full_bridge", "exit 1\n", "studio_bridge",
+                /*answers_describe=*/false);
   options.output_dir = TempPath("registry_full");
   options.session_id = GenerateSessionId();
   options.duration_s = 2;
@@ -3442,10 +3448,10 @@ void UseHealthyRegisteringNodes(LauncherOptions& options,
 }
 
 // A Studio bridge that registers its row, advances dispatch_count, and then
-// hangs without exiting is detected by the launcher's liveness watch (whose
-// NextCheck wakes the loop on time), killed as `stalled`, and restarted on the
-// bridge's schedule without disturbing any other node.
-// REQ-OPS-30, REQ-OPS-45
+// hangs without exiting is detected by the launcher's liveness watch, killed
+// as `stalled`, and restarted on the bridge's schedule without disturbing any
+// other node.
+// REQ-OPS-30
 TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
   const auto bridge_runs = TempPath("bridge_hang_bridge_runs");
   const auto hang = TempPath("bridge_hang_now");
@@ -3647,6 +3653,110 @@ TEST(Supervision, RepeatedlyHangingStudioBridgeExhaustsRestartsAndIsLeft) {
     EXPECT_EQ(EntryInteger(ManifestEntry(manifest, name), "restart_count"), 0);
     EXPECT_EQ(ManifestRuns(manifest, name).size(), 1u) << manifest;
   }
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+}
+
+// The Studio bridge's liveness look is a wake deadline of its own (REQ-OPS-45):
+// once the bridge has settled and every other roster member has exited cleanly
+// (with max_restarts = 0 and duration_s = 3600, so no other member's liveness,
+// restart, settle deadline, or session deadline is due, and no external
+// SupervisionWakeup::Wake() is ever sent), hanging studio_bridge causes
+// StudioBridge::NextCheck alone to wake the supervision loop, kill it as
+// `stalled`, and end the session cleanly. Deleting the liveness term in
+// StudioBridge::NextCheck leaves the loop asleep for an hour and fails this
+// test.
+// REQ-OPS-30, REQ-OPS-45
+TEST(Supervision, StudioBridgeLivenessAloneWakesTheLoop) {
+  const auto bridge_runs = TempPath("bridge_liveness_wake_runs");
+  const auto hang = TempPath("bridge_liveness_wake_hang");
+  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+  auto options = BaseOptions("bridge_liveness_wake");
+  options.duration_s = 3600;
+  options.max_restarts = 0;
+  options.heartbeat_periods = 1;
+  options.heartbeat_startup_grace_ms = 500;
+  options.construction_timeout = 1h;
+  options.start_studio_bridge = true;
+  UseHealthyRegisteringNodes(options, "bridge_liveness_wake");
+  const std::string binary = RunfileBinary("TALOS_HANGING_BRIDGE");
+  options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStub(
+      "bridge_liveness_wake_bridge",
+      "exec " + binary + " '" + bridge_runs + "' '" + hang + "' once \"$@\"\n",
+      "studio_bridge");
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string live = session_dir + "/manifest.json";
+  const std::string talos_log = session_dir + "/talos.log";
+  const uint64_t session = options.session_id;
+  constexpr std::array kNodes{"hardware_node", "alpha", "beta"};
+  std::atomic<bool> returned{false};
+  bool settled = false;
+  bool nodes_exited = false;
+  bool rescued = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    // Wait until studio_bridge has settled (so Starting() is false and its
+    // settle deadline is past) and every other member has registered and
+    // recorded its pid.
+    std::array<pid_t, 3> pids{0, 0, 0};
+    settled = WaitFor(stop, [&] {
+      if (ReadLines(bridge_runs).size() != 1 ||
+          !Registered("studio_bridge", session) ||
+          !Registered("hardware_node", session) ||
+          !Registered("alpha", session) || !Registered("beta", session))
+        return false;
+      if (ReadFile(talos_log).find("Started studio_bridge (pid ") ==
+          std::string::npos)
+        return false;
+      const std::string manifest = ReadFile(live);
+      for (std::size_t i = 0; i < kNodes.size(); ++i) {
+        const int64_t pid =
+            EntryInteger(ManifestEntry(manifest, kNodes[i]), "pid");
+        if (pid <= 0) return false;
+        pids[i] = static_cast<pid_t>(pid);
+      }
+      return true;
+    });
+    if (settled) {
+      // Stop every other member cleanly so none of them has a liveness look
+      // or restart pending; only the settled studio_bridge remains running.
+      for (const pid_t pid : pids) ::kill(pid, SIGTERM);
+      nodes_exited = WaitFor(stop, [&] {
+        const std::string manifest = ReadFile(live);
+        return std::ranges::all_of(kNodes, [&](const char* name) {
+          const auto runs = ManifestRuns(manifest, name);
+          return !runs.empty() && runs.back().find("\"reason\": \"running\"") ==
+                                      std::string::npos;
+        });
+      });
+    }
+    if (nodes_exited) {
+      // Now hang studio_bridge; nothing except StudioBridge::NextCheck can
+      // wake the supervision loop for the next hour.
+      std::ofstream{hang}.close();
+      if (!WaitFor(stop, [&] { return returned.load(); }, 10s)) {
+        rescued = true;
+        ::kill(::getpid(), SIGTERM);
+      }
+    } else {
+      ::kill(::getpid(), SIGTERM);
+    }
+  }};
+  const int status = RunSession(options);
+  returned = true;
+  driver.join();
+  ASSERT_TRUE(settled) << "studio_bridge did not settle";
+  ASSERT_TRUE(nodes_exited) << "other roster members did not exit cleanly";
+  EXPECT_FALSE(rescued) << "hung studio_bridge waited for an unrelated wake "
+                           "(StudioBridge::NextCheck)";
+  EXPECT_EQ(status, 0);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto history = ManifestRuns(manifest, "studio_bridge");
+  ASSERT_EQ(history.size(), 1u) << manifest;
+  EXPECT_NE(history[0].find("\"reason\": \"stalled\""), std::string::npos)
+      << history[0];
+  EXPECT_NE(history[0].find("\"exit_signal\": 9"), std::string::npos)
+      << history[0];
   std::filesystem::remove_all(options.output_dir);
   for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
 }

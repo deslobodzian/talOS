@@ -164,9 +164,10 @@ struct Bridge {
   // Returns from the event loop's wait (every one, whatever woke it), and of
   // them the ones a telemetry publication or a deadline timer woke.
   std::uint64_t wakes = 0, publication_wakes = 0, deadline_wakes = 0;
-  // Live registry claim (optional: standalone runs continue if the registry is
-  // unavailable) and the monotonic pass counter published as dispatch_count so
-  // the launcher's liveness check detects a hung bridge (REQ-OPS-30).
+  // Live registry claim (claimed only when --session-id is nonzero, as the
+  // launcher passes; standalone runs leave the registry untouched) and the
+  // monotonic pass counter published as dispatch_count so the launcher's
+  // liveness check detects a hung bridge (REQ-OPS-30).
   std::uint64_t session_id = 0;
   std::uint64_t loop_passes = 0;
   std::optional<talos::introspect::NodeRegistration> registration;
@@ -546,8 +547,10 @@ struct Bridge {
   // publication arriving while clients are pumped wakes the next wait rather
   // than racing an unarmed reader. Each client is sent its changed counters
   // at most every GraphFeed::kUpdateNs (or a deferral notice), so Studio
-  // keeps measuring node rates from successive graphs' counters and never
-  // marks a merely deferred graph stale.
+  // keeps measuring node rates from successive graphs' counters and does not
+  // mark a merely rate-deferred graph stale unless a shared-bucket
+  // reservation pauses notices past Studio's staleness threshold
+  // (docs/DATA_FLOW.md).
   void service(std::int64_t now_ns) {
     if (wake) wake->drain();
     watch(now_ns);
@@ -750,7 +753,9 @@ int main(int argc, char** argv) try {
   const auto parse_session_id = [&](std::string_view value) {
     const auto [end, error] =
         std::from_chars(value.data(), value.data() + value.size(), session_id);
-    bad_session_id = error != std::errc{} || end != value.data() + value.size();
+    if (error != std::errc{} || end != value.data() + value.size()) {
+      bad_session_id = true;
+    }
   };
   for (int i = 0; i < argc; ++i) {
     const std::string_view argument = argv[i];
@@ -813,7 +818,7 @@ int main(int argc, char** argv) try {
         << "Usage: studio_bridge "
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
            "       [--session-id ID]     launcher session id for live "
-           "registry (default 0)\n"
+           "registry (nonzero registers; default 0)\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
            "       [--manifest PATH]   the launcher's manifest.json, served at "
@@ -1171,28 +1176,35 @@ int main(int argc, char** argv) try {
                              std::to_string(http_port) +
                              " (another process holds it?)");
   }
-  try {
-    bridge.registration.emplace(talos::introspect::NodeRegistration::Identity{
-        .name = std::string{studio::kStudioBridgeNodeName},
-        .target = "//studio/bridge:studio_bridge",
-        .session_id = bridge.session_id,
-        .flags = 0,
-    });
-    talos::event::Registration source;
-    source.id = 0;
-    source.kind = talos::event::SourceKind::WATCHER;
-    source.name = bridge.topic;
-    source.message_bytes =
-        static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
-    source.alignment = 8;
-    source.schema = talos::schema::Bytes();
-    bridge.registration->publish(talos::event::Manifest{source});
-    bridge.registration->set_realtime(
-        {.tier = talos::process::LoopTier::kObserver});
-    bridge.report_registration();
-  } catch (const std::exception& e) {
-    std::cerr << "studio_bridge: node registry unavailable: " << e.what()
-              << '\n';
+  // Only claim a live registry row when supervised by a launcher (--session-id
+  // nonzero). Standalone runs leave the host registry untouched, and a
+  // supervised run fails fast if claiming fails instead of serving until the
+  // launcher kills it as heartbeat_missing (REQ-OPS-30).
+  if (bridge.session_id != 0) {
+    try {
+      bridge.registration.emplace(talos::introspect::NodeRegistration::Identity{
+          .name = std::string{studio::kStudioBridgeNodeName},
+          .target = "//studio/bridge:studio_bridge",
+          .session_id = bridge.session_id,
+          .flags = 0,
+      });
+      talos::event::Registration source;
+      source.id = 0;
+      source.kind = talos::event::SourceKind::WATCHER;
+      source.name = bridge.topic;
+      source.message_bytes =
+          static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
+      source.alignment = 8;
+      source.schema = talos::schema::Bytes();
+      bridge.registration->publish(talos::event::Manifest{source});
+      bridge.registration->set_realtime(
+          {.tier = talos::process::LoopTier::kObserver});
+      bridge.report_registration();
+    } catch (const std::exception& e) {
+      throw std::runtime_error(
+          std::string{"studio_bridge: cannot claim node registry row: "} +
+          e.what());
+    }
   }
   std::cout << "listening "
             << us_socket_local_port(

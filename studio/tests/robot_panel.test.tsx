@@ -250,4 +250,15 @@ test('the power card labels CAN buses from the declared graph and falls back whe
   })).replace(/<[^>]*>/g, '|');
   assert.match(fallback, /CAN rio\|+10%/);
   assert.match(fallback, /CAN bus 1\|+35%/);
+
+  // A configured bus literally starting with "CAN " keeps its "CAN " card
+  // prefix rather than being misread as the unnamed fallback.
+  const canPrefixed = renderPanel(createStaticStudio({
+    frames: [frame],
+    playback: {mode: 'PAUSED', cursor_ns: '1000000000'},
+    system: {
+      declared: {version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'CAN x']}
+    }
+  })).replace(/<[^>]*>/g, '|');
+  assert.match(canPrefixed, /CAN CAN x\|+35%/);
 });

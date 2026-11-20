@@ -119,9 +119,10 @@ class RegistryCleanup : public ::testing::Environment {
 [[maybe_unused]] ::testing::Environment* const kRegistryCleanup =
     ::testing::AddGlobalTestEnvironment(new RegistryCleanup);
 
-// REQ-OPS-30: studio_bridge registers a live registry row, advances
-// dispatch_count and heartbeat_monotonic_ns on each loop pass, and replaces
-// its own row with self() in /system.json so no duplicate entry appears.
+// REQ-OPS-30: studio_bridge registers a live registry row when --session-id is
+// nonzero, advances dispatch_count and heartbeat_monotonic_ns on each loop
+// pass, and replaces its own row with self() in /system.json so exactly one
+// studio_bridge entry appears carrying self()'s counters and shape.
 TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
   const std::string binary = BridgeBinary();
   const std::string topic = "/test/telemetry/reg" + std::to_string(::getpid());
@@ -132,6 +133,8 @@ TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
   // Invalid --session-id is rejected; --describe ignores --session-id.
   EXPECT_EQ(RunToExit({binary, topic, "0", webroot, "--session-id", "-1"}), 2);
   EXPECT_EQ(RunToExit({binary, topic, "0", webroot, "--session-id", "abc"}), 2);
+  EXPECT_EQ(RunToExit({binary, topic, "0", webroot, "--session-id=abc"}), 2);
+  EXPECT_EQ(RunToExit({binary, topic, "0", webroot, "--session-id"}), 2);
   EXPECT_EQ(RunToExit({binary, "--describe", "--session-id", "12345"}), 0);
 
   int stdout_pipe[2]{-1, -1};
@@ -170,6 +173,7 @@ TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
   EXPECT_EQ(first->target, "//studio/bridge:studio_bridge");
   EXPECT_EQ(first->session_id, 12345u);
   EXPECT_TRUE(first->alive);
+  EXPECT_GE(first->generation, 1u);
   ASSERT_TRUE(first->realtime().has_value());
   EXPECT_EQ(first->realtime()->tier, talos::process::LoopTier::kObserver);
   EXPECT_FALSE(first->realtime()->requested);
@@ -181,30 +185,51 @@ TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
 
   // Two HTTP requests ensure at least one post-handler service() pass completes
   // between the first row read and the second.
+  ASSERT_FALSE(HttpGet(port, "/system.json").empty());
   const std::string body = HttpGet(port, "/system.json");
   ASSERT_FALSE(body.empty());
+  const auto second = FindRow(pid);
+  ASSERT_TRUE(second.has_value());
+  EXPECT_GT(second->dispatch_count, first->dispatch_count);
+  EXPECT_GT(second->heartbeat_monotonic_ns, first->heartbeat_monotonic_ns);
+
   const auto doc = nlohmann::json::parse(body);
   ASSERT_TRUE(doc.contains("registry"));
   EXPECT_TRUE(doc["registry"]["available"].get<bool>());
   ASSERT_TRUE(doc.contains("nodes"));
   std::size_t bridge_entries = 0;
-  std::string reported_pid;
+  nlohmann::json reported;
   for (const auto& node : doc["nodes"]) {
     if (node["name"] == "studio_bridge") {
       ++bridge_entries;
-      reported_pid = node["pid"].get<std::string>();
+      reported = node;
     }
   }
-  EXPECT_EQ(bridge_entries, 1u) << body;
-  EXPECT_EQ(reported_pid, std::to_string(pid)) << body;
-
-  // A second request runs in a later loop iteration, after the first's pass()
-  // updated the registry row.
-  ASSERT_FALSE(HttpGet(port, "/system.json").empty());
-  const auto second = FindRow(pid);
-  ASSERT_TRUE(second.has_value());
-  EXPECT_GT(second->dispatch_count, first->dispatch_count);
-  EXPECT_GT(second->heartbeat_monotonic_ns, first->heartbeat_monotonic_ns);
+  ASSERT_EQ(bridge_entries, 1u) << body;
+  // The entry must come from self() rather than the raw live registry row:
+  // self() reports generation 0 and dispatch_count == forwarded (0 here, while
+  // the live registry row has generation >= 1 and dispatch_count == loop_passes
+  // >= 1), so dropping self() or skipping deduplication both fail here.
+  EXPECT_EQ(reported["pid"].get<std::string>(), std::to_string(pid)) << body;
+  EXPECT_EQ(reported["target"].get<std::string>(),
+            "//studio/bridge:studio_bridge")
+      << body;
+  EXPECT_EQ(reported["session_id"].get<std::string>(), "12345") << body;
+  EXPECT_TRUE(reported["alive"].get<bool>()) << body;
+  EXPECT_EQ(reported["generation"].get<std::string>(), "0") << body;
+  EXPECT_EQ(reported["dispatch_count"].get<std::string>(), "0") << body;
+  EXPECT_EQ(reported["declared_sources"].get<int>(), 1) << body;
+  ASSERT_TRUE(reported.contains("sources") && reported["sources"].size() == 1u)
+      << body;
+  const auto& source = reported["sources"][0];
+  EXPECT_EQ(source["kind"].get<std::string>(), "WATCHER") << body;
+  EXPECT_EQ(source["name"].get<std::string>(), topic) << body;
+  EXPECT_EQ(source["message_bytes"].get<std::uint32_t>(),
+            static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes))
+      << body;
+  EXPECT_EQ(source["events"].get<std::string>(), "0") << body;
+  EXPECT_EQ(source["dropped"].get<std::string>(), "0") << body;
+  EXPECT_EQ(source["sequence"].get<std::string>(), "0") << body;
 
   ::kill(pid, SIGTERM);
   int status = 0;
@@ -212,6 +237,98 @@ TEST(BridgeRegistration, RegistersAdvancesProgressAndDeduplicatesSystemJson) {
   }
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   EXPECT_FALSE(FindRow(pid).has_value());
+  std::filesystem::remove_all(webroot);
+}
+
+// REQ-OPS-30: a standalone bridge (no --session-id, or --session-id 0) does
+// not claim a /talos_registry row, yet still reports itself via self() in
+// /system.json.
+TEST(BridgeRegistration, StandaloneDoesNotRegisterARow) {
+  const std::string binary = BridgeBinary();
+  const std::string topic =
+      "/test/telemetry/standalone" + std::to_string(::getpid());
+  const std::string webroot =
+      ::testing::TempDir() + "/bridge_standalone_" + std::to_string(::getpid());
+  std::filesystem::create_directories(webroot);
+
+  int stdout_pipe[2]{-1, -1};
+  ASSERT_EQ(::pipe(stdout_pipe), 0);
+  const std::vector<std::string> args = {binary, topic, "0", webroot};
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+  argv.push_back(nullptr);
+
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    ::close(stdout_pipe[0]);
+    ::dup2(stdout_pipe[1], STDOUT_FILENO);
+    ::close(stdout_pipe[1]);
+    ::execv(argv[0], argv.data());
+    ::_exit(127);
+  }
+  ::close(stdout_pipe[1]);
+
+  std::string line;
+  char ch = '\0';
+  while (::read(stdout_pipe[0], &ch, 1) == 1) {
+    if (ch == '\n') break;
+    line.push_back(ch);
+  }
+  ::close(stdout_pipe[0]);
+  ASSERT_TRUE(line.starts_with("listening ")) << line;
+  const auto port = static_cast<uint16_t>(std::stoul(line.substr(10)));
+
+  EXPECT_FALSE(FindRow(pid).has_value())
+      << "standalone studio_bridge must not claim a registry row";
+  const std::string body = HttpGet(port, "/system.json");
+  ASSERT_FALSE(body.empty());
+  const auto doc = nlohmann::json::parse(body);
+  ASSERT_TRUE(doc.contains("nodes"));
+  std::size_t bridge_entries = 0;
+  nlohmann::json reported;
+  for (const auto& node : doc["nodes"]) {
+    if (node["name"] == "studio_bridge" &&
+        node["pid"].get<std::string>() == std::to_string(pid)) {
+      ++bridge_entries;
+      reported = node;
+    }
+  }
+  ASSERT_EQ(bridge_entries, 1u) << body;
+  EXPECT_EQ(reported["session_id"].get<std::string>(), "0") << body;
+  EXPECT_FALSE(FindRow(pid).has_value());
+
+  ::kill(pid, SIGTERM);
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  std::filesystem::remove_all(webroot);
+}
+
+// REQ-OPS-30: when supervised (--session-id nonzero), failing to claim a
+// registry row exits nonzero immediately rather than serving until the
+// launcher SIGKILLs the bridge as heartbeat_missing.
+TEST(BridgeRegistration, SupervisedFailsFastWhenRegistryIsFull) {
+  const std::string binary = BridgeBinary();
+  const std::string topic = "/test/telemetry/full" + std::to_string(::getpid());
+  const std::string webroot =
+      ::testing::TempDir() + "/bridge_full_" + std::to_string(::getpid());
+  std::filesystem::create_directories(webroot);
+
+  std::vector<std::unique_ptr<talos::introspect::NodeRegistration>> held;
+  held.reserve(talos::introspect::kMaxNodes);
+  for (std::size_t i = 0; i < talos::introspect::kMaxNodes; ++i) {
+    held.push_back(std::make_unique<talos::introspect::NodeRegistration>(
+        talos::introspect::NodeRegistration::Identity{
+            .name = "held" + std::to_string(i), .session_id = 99999}));
+  }
+
+  EXPECT_EQ(RunToExit({binary, topic, "0", webroot, "--session-id", "12345"}),
+            1);
+
+  held.clear();
   std::filesystem::remove_all(webroot);
 }
 

@@ -576,7 +576,8 @@ class GraphFeed {
   static constexpr std::int64_t kResendNs = 2'000'000'000;
   // Past the update interval, so an update only briefly held (the usual case
   // beside telemetry) arrives without a notice; under Studio's one-second
-  // GRAPH_STALE_AFTER_MS, so a held graph never reads as stale.
+  // GRAPH_STALE_AFTER_MS, so a rate-deferred graph does not read as stale
+  // while notices can spend from the shared bucket (docs/DATA_FLOW.md).
   static constexpr std::int64_t kNoticeNs = 750'000'000;
 
   // `afford(bytes)` says whether a message of that many payload bytes may be

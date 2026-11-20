@@ -38,8 +38,10 @@ port <port>` and exits 1 (`//studio/bridge:listen_test`).
 
 These named options are removed before positional parsing:
 
-- `--session-id ID` or `--session-id=ID`: unsigned integer session id stamped
-  into the bridge's live registry row (default `0`, ignored in `--describe`).
+- `--session-id ID` or `--session-id=ID`: unsigned integer session id; when
+  nonzero (as the launcher passes), the bridge claims a live registry row under
+  that session id and exits nonzero if claiming fails; default `0` (standalone:
+  claims no registry row). Ignored in `--describe`.
 - `--config PATH`: read `[studio] max_clients` and `[studio] dashboard` (the
   driver dashboard's layout; see [Driver dashboard feed](#driver-dashboard-feed))
   from robot configuration, and each subsystem's `critical` for the drive
@@ -112,11 +114,13 @@ deferred and the next update carries the changes, so a slow or starved client
 sees fewer, never inconsistent, ticks. A page the socket refuses resynchronizes
 that client with a fresh keyframe.
 
-The bridge also claims a live registry row (`studio_bridge`, `LoopTier::kObserver`,
-one `WATCHER` source on its telemetry topic) under `--session-id`, advancing
-`heartbeat_monotonic_ns` and `dispatch_count` on every loop pass (continuing
-standalone if the registry is unavailable) so the launcher detects and restarts
-a hung bridge ([Studio bridge](../../talOS/launcher/README.md#studio-bridge)).
+When started with a nonzero `--session-id` (as the launcher passes), the bridge
+claims a live registry row (`studio_bridge`, `LoopTier::kObserver`, one
+`WATCHER` source on its telemetry topic), advancing `heartbeat_monotonic_ns`
+and `dispatch_count` on every loop pass, and exits nonzero if claiming fails so
+the launcher detects and restarts a hung or failed bridge
+([Studio bridge](../../talOS/launcher/README.md#studio-bridge)). Standalone
+runs (`--session-id 0` or omitted) claim no registry row.
 The system graph includes the bridge itself (replacing its own live registry
 row with `self()` so `/system.json` carries a single `studio_bridge` entry with
 exact bridge counters) and refreshes every 250 ms of
@@ -155,7 +159,9 @@ sent
 `{"kind":"talos.system_graph.deferred","structure":...}`, so Studio, which
 marks the graph stale after `GRAPH_STALE_AFTER_MS`
 ([`freshness.ts`](../src/data/freshness.ts)) without a graph message, does
-not mark a late graph stale. A whole graph larger than the egress burst
+not mark a merely rate-deferred graph stale unless a shared-bucket reservation
+pauses notices past 1 s
+([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)). A whole graph larger than the egress burst
 ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary))
 can never be sent: the bridge logs that once when the graph crosses the
 burst, sends no notice (the client's graph goes stale, which is the truth),
