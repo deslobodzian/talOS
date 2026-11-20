@@ -23,6 +23,7 @@ cc_library(
         "session.h",
     ],
     deps = [
+        "//studio/bridge:static_files",
         "//studio/bridge:system",
         "//studio/bridge:telemetry",
         "//talOS/events:events_core",
