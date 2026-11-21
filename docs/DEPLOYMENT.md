@@ -24,7 +24,10 @@ bazel build --config=release //bench/main_processor:bench_bundle
 ```
 
 `--config=release` stamps the build: the bundle records the git revision of
-the workspace Bazel runs in and whether that tree had uncommitted changes.
+the workspace Bazel runs in and whether that tree had uncommitted changes
+(`git_revision` and `git_dirty`), and when a separate robot repository builds
+against a talOS git checkout, talOS's revision and dirty state as well
+(`talos_git_revision` and `talos_git_dirty`).
 The config (`build:release --stamp`) is in [`talos.bazelrc`](../talos.bazelrc),
 which talOS's `.bazelrc` and every robot repository's import; the revision
 comes from the `--workspace_status_command` each workspace's own `.bazelrc`
@@ -65,7 +68,7 @@ It writes the bundle directory `bazel-bin/<package>/<name>/`
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `studio/` | with `studio_bridge` and `studio_webroot` only: the bridge binary (`studio/studio_bridge`) and the site it serves (`studio/webroot/`) |
 | `config/` | the robot config and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
-| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; from a `testonly` `talos_bundle`, `testonly = true` ([install](#on-the-main-processor) refuses it); with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
+| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty` (and, when a separate robot repository is built against a talOS git checkout, `talos_git_revision` and `talos_git_dirty`); from a `testonly` `talos_bundle`, `testonly = true` ([install](#on-the-main-processor) refuses it); with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
 
 The bundle holds no symlinks. Bazel may restore a tree artifact from its
 disk or remote cache with each symlink in it replaced by a copy of its
@@ -80,7 +83,8 @@ which Bazel's runfiles hold as copies of it) are such scripts too, so the
 bundle holds the interpreter once, however many Python nodes it carries. The
 build fails when two nodes carry different files under one runtime's name.
 
-The launcher copies `config_sha256`, `git_revision` and `git_dirty` into every
+The launcher copies `config_sha256`, `git_revision` and `git_dirty` (plus
+`talos_git_revision` and `talos_git_dirty` when present) into every
 session manifest, and records each member's binary SHA-256 again when the
 session starts ([session manifest](../talOS/launcher/README.md#session-manifest)).
 A digest covers only the file under `bin/`: not a C++ node's shared libraries
@@ -279,7 +283,8 @@ A relative `--prefix` is resolved against the working directory.
 - **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`),
   oldest first by the `start_wall_ns` their manifest records (the directory's
   modification time without one; session ids are not ordered in time), each
-  with its start, `git_revision` (and `dirty`), the launcher's match
+  with its start, `git_revision` (and `dirty`, plus `talos_git_revision` /
+  `talos_git_dirty` when present), the launcher's match
   classification from its `session_class` file (`match`, `other`, `unknown`,
   or `unclassified` before retention has read it; a `--sim` session is never
   classified, so it stays `unclassified`) and its runs counted by

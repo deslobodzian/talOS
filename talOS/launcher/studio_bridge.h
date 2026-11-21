@@ -170,7 +170,6 @@ class StudioBridge {
   int64_t spawned_monotonic_ns_{0};
   std::string_view kill_reason_;
   bool heartbeat_killed_{false};
-  bool realtime_reported_{false};
   bool port_observed_{false};
   bool started_port_announced_{false};
   bool running_{false};  // A run was spawned and is not yet reaped.

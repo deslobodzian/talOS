@@ -17,14 +17,6 @@ alias(
     visibility = ["//visibility:public"],
 )
 
-# Private forwarding header for talOS/bridge's internal tests; the merge rules
-# live in //talOS/hardware:merge.
-cc_library(
-    name = "merge",
-    hdrs = ["merge.h"],
-    deps = ["//talOS/hardware:merge"],
-)
-
 cc_library(
     name = "node_lib",
     srcs = ["node.cc"],
@@ -45,6 +37,7 @@ cc_library(
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
         "//talOS/ipc",
+        "//talOS/memory:residency",
         "//talOS/process",
         "//talOS/protocol",
         "//talOS/rtms:wake",
@@ -100,13 +93,13 @@ cc_test(
     srcs = ["trust_test.cc"],
     deps = [
         ":in_process_gateway",
-        ":merge",
         ":messages",
         ":node_lib",
         ":node_test_support",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:merge",
         "//talOS/ipc",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
@@ -123,7 +116,6 @@ cc_test(
     env = {"HARDWARE_NODE": "$(rlocationpath :hardware_node)"},
     tags = ["integration"],
     deps = [
-        ":merge",
         ":messages",
         ":node_lib",
         ":node_test_support",
@@ -133,6 +125,7 @@ cc_test(
         "//talOS/events:events_os",
         "//talOS/events:input_replay",
         "//talOS/hardware",
+        "//talOS/hardware:merge",
         "//talOS/introspection:registry",
         "//talOS/ipc",
         "//talOS/node:allocation_probe",
@@ -179,9 +172,9 @@ cc_test(
         "integration",
     ],
     deps = [
-        ":merge",
         ":node_lib",
         ":node_test_support",
+        "//talOS/hardware:merge",
         "//talOS/ipc",
         "//talOS/process",
         "@googletest//:gtest",

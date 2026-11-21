@@ -622,13 +622,13 @@ std::optional<ProtocolVersionField> ResolveProtocolVersionField(
 
 std::optional<std::uint16_t> ReadProtocolVersion(
     const ProtocolVersionField& field, std::span<const std::byte> payload) {
-  if (field.size == 0 || payload.size() != field.message_bytes ||
-      field.offset > payload.size() ||
+  const auto base_type = static_cast<reflection::BaseType>(field.base_type);
+  if (!IsIntegerScalar(base_type) || field.size == 0 ||
+      field.size != schema::ScalarSize(base_type) ||
+      payload.size() != field.message_bytes || field.offset > payload.size() ||
       field.size > payload.size() - field.offset) {
     return std::nullopt;
   }
-  const auto base_type = static_cast<reflection::BaseType>(field.base_type);
-  if (!IsIntegerScalar(base_type)) return std::nullopt;
   const std::int64_t raw =
       schema::ReadInt64(base_type, payload.data() + field.offset);
   if (base_type == reflection::BaseType::ULong &&

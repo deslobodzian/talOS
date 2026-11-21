@@ -97,7 +97,6 @@ void StudioBridge::NewRun(SupervisionTime spawned) {
   liveness_.Begin(spawned);
   kill_reason_ = {};
   heartbeat_killed_ = false;
-  realtime_reported_ = false;
   port_observed_ = false;
   started_port_announced_ = false;
 }
@@ -194,7 +193,6 @@ bool StudioBridge::Watch(NodeProcessInfo& proc,
     }
   }
   if (const auto outcome = introspect::RealtimeOf(row_flags)) {
-    realtime_reported_ = true;
     if (proc.RecordRealtime(*outcome)) changed = true;
   }
   if (!check.kill.empty()) {

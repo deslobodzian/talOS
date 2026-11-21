@@ -9,7 +9,18 @@ canon_dir() {
   (cd "$1" 2>/dev/null && pwd -P) || return 1
 }
 
-TALOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+script_path="${BASH_SOURCE[0]}"
+hops=0
+while [ -L "$script_path" ] && [ "$hops" -lt 40 ]; do
+  hops=$((hops + 1))
+  link_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)" || break
+  target="$(readlink "$script_path")" || break
+  case "$target" in
+    /*) script_path="$target" ;;
+    *) script_path="$link_dir/$target" ;;
+  esac
+done
+TALOS_DIR="$(cd "$(dirname "$script_path")/.." && pwd -P)"
 
 pwd_top=""
 if revision="$(git rev-parse HEAD 2>/dev/null)"; then
