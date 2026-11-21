@@ -329,33 +329,50 @@ TEST(PositionMechanism, NonFiniteDemandGoesNeutral) {
 }
 
 // A request outside update() (here a message callback, which would act on
-// a goal no Target selected) is refused, naming the mechanism.
+// a goal no Target selected) is refused for set_goal(), hold() and
+// clear_fault(), naming the mechanism.
 // REQ-SAFE-36
 TEST(PositionMechanism, RequestOutsideUpdateThrows) {
-  struct CallbackNode {
-    explicit CallbackNode(Node& node)
-        : mech{node, "arm"},
-          goal{node.subscribe<control::PositionTarget>(
-              "/test/goal", [this](const control::PositionTarget& t) {
-                mech.set_goal(t.position_rot());
-              })} {}
-    void update() { mech.update(); }
-    PositionMechanism mech;
-    Subscription<control::PositionTarget> goal;
-  };
-  auto sim = Sim::FromToml(kRobotToml);
-  sim.add<CallbackNode>("arm");
-  SimHardware hw{sim};
-  hw.enable();
-  sim.step(10ms);
-  sim.publish("/test/goal", control::PositionTarget{0.2, 0.0});
-  try {
+  enum class Action { kSetGoal, kHold, kClearFault };
+  for (const Action action :
+       {Action::kSetGoal, Action::kHold, Action::kClearFault}) {
+    SCOPED_TRACE(static_cast<int>(action));
+    struct CallbackNode {
+      explicit CallbackNode(Node& node)
+          : mech{node, "arm"},
+            goal{node.subscribe<control::PositionTarget>(
+                "/test/goal", [this](const control::PositionTarget& t) {
+                  switch (action) {
+                    case Action::kSetGoal:
+                      mech.set_goal(t.position_rot());
+                      break;
+                    case Action::kHold:
+                      mech.hold(t.feedforward_v());
+                      break;
+                    case Action::kClearFault:
+                      mech.clear_fault();
+                      break;
+                  }
+                })} {}
+      void update() { mech.update(); }
+      PositionMechanism mech;
+      Action action = Action::kSetGoal;
+      Subscription<control::PositionTarget> goal;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<CallbackNode>("arm").action = action;
+    SimHardware hw{sim};
+    hw.enable();
     sim.step(10ms);
-    ADD_FAILURE() << "set_goal() from a callback was accepted";
-  } catch (const std::logic_error& e) {
-    EXPECT_NE(std::string{e.what()}.find("PositionMechanism 'arm'"),
-              std::string::npos)
-        << e.what();
+    sim.publish("/test/goal", control::PositionTarget{0.2, 0.0});
+    try {
+      sim.step(10ms);
+      ADD_FAILURE() << "request from a callback was accepted";
+    } catch (const std::logic_error& e) {
+      EXPECT_NE(std::string{e.what()}.find("PositionMechanism 'arm'"),
+                std::string::npos)
+          << e.what();
+    }
   }
 }
 
@@ -433,7 +450,8 @@ can_id = 2
       sim.add<PositionNode>("m");
       ADD_FAILURE() << "constructed";
     } catch (const std::invalid_argument& e) {
-      EXPECT_NE(std::string{e.what()}.find(key), std::string::npos) << e.what();
+      EXPECT_NE(std::string{e.what()}.find("m." + key), std::string::npos)
+          << e.what();
     }
   };
   const std::vector<std::pair<std::string, std::string>> bad{
@@ -491,7 +509,7 @@ can_id = 2
                                   "absolute_rot_per_sensor_rot = -1.0\n"},
       // On the window's edge (offset 0.4 maps (-0.1, 0.9)): a hood resting
       // on its stop just below min_rot would read across the discontinuity.
-      {"absolute_margin_rot", absolute + "absolute_offset_rot = 0.4\n"
+      {"absolute_offset_rot", absolute + "absolute_offset_rot = 0.4\n"
                                          "min_rot = -0.1\nmax_rot = 0.8\n"},
       {"absolute_margin_rot",
        "tolerance_rot = 0.1\nhoming = \"absolute\"\nabsolute_sensor = \"cc\"\n"
@@ -1125,6 +1143,45 @@ TEST(PositionMechanism, StallFaultLatchesUntilTheDriverStationDisables) {
   EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
   lift.Drive(1.0, 20ms);
   EXPECT_EQ(lift.Applied().mode, Mode::kMotionMagic);
+}
+
+// clear_fault() called inside update() clears a latched fault without
+// disabling the Driver Station, returning the mechanism to driving.
+// REQ-SAFE-36
+TEST(PositionMechanism, ClearFaultInsideUpdateResumesDrivingWhileEnabled) {
+  struct ClearableNode {
+    explicit ClearableNode(Node& node)
+        : mech{node, node.name()}, target{node} {}
+    void update() {
+      if (clear_next) {
+        mech.clear_fault();
+        clear_next = false;
+      }
+      if (const control::PositionTarget* t = target.get()) {
+        mech.set_goal(t->position_rot(), t->feedforward_v());
+      } else {
+        mech.stop();
+      }
+      mech.update();
+    }
+    PositionMechanism mech;
+    Target<control::PositionTarget> target;
+    bool clear_next = false;
+  };
+  Rig<ClearableNode> lift{"lift"};
+  lift.Start();
+  lift.Drive(1.0, 250ms);  // stalls (velocity 0) past stall_time_us (200 ms)
+  ASSERT_EQ(lift.mech().phase(), PositionPhase::kFaulted);
+  ASSERT_EQ(lift.mech().fault(), PositionFault::kStall);
+  lift.ExpectNeutral();
+
+  lift.node.clear_next = true;
+  lift.Drive(1.0, 20ms);  // stays enabled throughout
+  EXPECT_FALSE(lift.node.clear_next);
+  EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+  EXPECT_EQ(lift.mech().phase(), PositionPhase::kMoving);
+  EXPECT_EQ(lift.Applied().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(lift.Applied().demand, 1.0);
 }
 
 // A goal not reached within move_timeout_us faults, even while the motor

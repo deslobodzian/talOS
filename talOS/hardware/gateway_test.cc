@@ -3761,6 +3761,7 @@ TEST(PhysicsSimBackend, AMotorResetBesideAValidSensorIsLocal) {
 // so a command observed before it never drives the restarted frame. The
 // restored motor's first sample starts a new reference rather than reading
 // as another jump; the late latch is counted as one more reset.
+// REQ-SAFE-24
 TEST(Gateway, RotorPositionJumpIsAResetBeforeItsLatchArrives) {
   const auto config = SwerveConfig(true);
   const auto index = MotorIndex(config, Feedback::kRotor);

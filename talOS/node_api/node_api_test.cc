@@ -304,6 +304,60 @@ TEST_F(NodeApi, RegistrationFailureFailsTheAdd) {
   EXPECT_EQ(talos_sim_add(sim_, "relay", build, &relay), nullptr);
 }
 
+// REQ-SAFE-27: talos_node_publish and talos_node_publish_bytes refuse any
+// /hw/request topic at construction, direct or remapped.
+TEST(NodeApiHardwareRequest, PublishAndPublishBytesRefuseHardwareRequestTopic) {
+  TalosSim* sim = talos_sim_from_toml(R"(
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+
+[subsystems.plain]
+[subsystems.bytes]
+[subsystems.remapped.remap]
+state = "/hw/request/remapped"
+[subsystems.remapped_bytes.remap]
+frames = "/hw/request/remapped_bytes"
+
+[subsystems.roller.motors.wheel]
+can_id = 1
+)");
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+
+  auto build_plain = [](TalosNode* node, void*) -> int32_t {
+    return talos_node_publish(node, "/hw/request/plain", sizeof(Value),
+                              &kValueSchema) < 0
+               ? 1
+               : 0;
+  };
+  auto build_bytes = [](TalosNode* node, void*) -> int32_t {
+    return talos_node_publish_bytes(node, "/hw/request/bytes", 64, 16, 1, 0) < 0
+               ? 1
+               : 0;
+  };
+  auto build_remapped = [](TalosNode* node, void*) -> int32_t {
+    return talos_node_publish(node, "state", sizeof(Value), &kValueSchema) < 0
+               ? 1
+               : 0;
+  };
+  auto build_remapped_bytes = [](TalosNode* node, void*) -> int32_t {
+    return talos_node_publish_bytes(node, "frames", 64, 16, 1, 0) < 0 ? 1 : 0;
+  };
+
+  for (const auto& [name, factory] :
+       {std::pair<const char*, TalosFactory>{"plain", build_plain},
+        std::pair<const char*, TalosFactory>{"bytes", build_bytes},
+        std::pair<const char*, TalosFactory>{"remapped", build_remapped},
+        std::pair<const char*, TalosFactory>{"remapped_bytes",
+                                             build_remapped_bytes}}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(talos_sim_add(sim, name, factory, nullptr), nullptr);
+    const std::string err = talos_last_error();
+    EXPECT_NE(err.find("/hw/request"), std::string::npos) << err;
+  }
+  talos_sim_destroy(sim);
+}
+
 TEST_F(NodeApi, RemoveAndMidRunAddRestartNodeAtCurrentSimTime) {
   Relay first;
   TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &first);

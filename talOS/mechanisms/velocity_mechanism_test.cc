@@ -413,9 +413,12 @@ can_id = 1
   const std::vector<std::pair<std::string, std::string>> bad{
       {"at_speed_entry_rps", "at_speed_entry_rps = 0.0\n"},
       {"at_speed_entry_rps", "at_speed_entry_rps = nan\n"},
+      {"at_speed_exit_frac", "at_speed_exit_frac = -0.1\n"},
       {"at_speed_exit_frac", "at_speed_exit_frac = 1.5\n"},
       {"at_speed_entry_tick_count", "at_speed_entry_tick_count = 0\n"},
       {"spin_down_rps2", "spin_down_rps2 = -1.0\n"},
+      {"slot", "slot = -1\n"},
+      {"slot", "slot = 3\n"},
   };
   for (const auto& [key, table] : bad) {
     SCOPED_TRACE(table);
@@ -423,7 +426,9 @@ can_id = 1
       add(table);
       ADD_FAILURE() << "constructed";
     } catch (const std::invalid_argument& e) {
-      EXPECT_NE(std::string{e.what()}.find(key), std::string::npos) << e.what();
+      EXPECT_NE(std::string{e.what()}.find("flywheel." + key),
+                std::string::npos)
+          << e.what();
     }
   }
 }

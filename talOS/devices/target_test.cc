@@ -1262,6 +1262,101 @@ TEST(TargetGate, OnlyAGetInsideThisUpdateCounts) {
   }
 }
 
+// REQ-SAFE-41: source() alone (without get()) inside update() counts as a live
+// target when a lane is selected, and holds outputs neutral when none is.
+TEST(TargetGate, SourceAloneInsideUpdateCountsAsALiveTarget) {
+  struct SourceOnly {
+    explicit SourceOnly(Node& n) : node{n}, target{n}, devices{n} {}
+    void update() {
+      last_source = std::string{target.source()};
+      devices.Drive(0.5);
+    }
+    Node& node;
+    Target<Goal> target;
+    GateDevices devices;
+    std::string last_source;
+  };
+  auto sim = Sim::FromToml(kGateToml);
+  auto& gate = sim.add<SourceOnly>("gate");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+  ASSERT_EQ(gate.last_source, "");
+  ExpectNeutral(hw);
+  EXPECT_TRUE(detail::NodeAccess::outputs_held(gate.node));
+
+  PublishTarget(sim, "gate", "teleop", Goal{0.5});
+  sim.step(5ms);
+  EXPECT_EQ(gate.last_source, "teleop");
+  ExpectDriving(hw, 0.5);
+  EXPECT_FALSE(detail::NodeAccess::outputs_held(gate.node));
+
+  ReleaseTarget<Goal>(sim, "gate", "teleop");
+  sim.step(5ms);
+  EXPECT_EQ(gate.last_source, "");
+  ExpectNeutral(hw);
+  EXPECT_TRUE(detail::NodeAccess::outputs_held(gate.node));
+}
+
+// REQ-SAFE-41: a Target::get() made in the constructor or in a message
+// callback does not count as a live target for update()'s flush, even when the
+// callback's get() returns a live target.
+TEST(TargetGate, GetInConstructorOrCallbackDoesNotCountForUpdate) {
+  struct NonUpdateAsker {
+    explicit NonUpdateAsker(Node& n)
+        : node{n},
+          target{n},
+          devices{n},
+          ping{n.subscribe<Small>("/test/ping", [this](const Small&) {
+            if (target.get() != nullptr) seen_in_callback = true;
+          })} {
+      static_cast<void>(target.get());
+      asked_in_ctor = true;
+    }
+    void update() {
+      if (ask_in_update) static_cast<void>(target.get());
+      devices.Drive(0.5);
+    }
+    Node& node;
+    Target<Goal> target;
+    GateDevices devices;
+    Subscription<Small> ping;
+    bool asked_in_ctor = false;
+    bool seen_in_callback = false;
+    bool ask_in_update = false;
+  };
+  auto sim = Sim::FromToml(kGateToml);
+  auto& gate = sim.add<NonUpdateAsker>("gate");
+  ASSERT_TRUE(gate.asked_in_ctor);
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+  // Publish a fresh target so the next tick drains it into the Target's
+  // subscription; update() itself does not ask.
+  PublishTarget(sim, "gate", "teleop", Goal{0.5});
+  sim.step(5ms);
+  ExpectNeutral(hw);
+  EXPECT_TRUE(detail::NodeAccess::outputs_held(gate.node));
+
+  // Between ticks, wake the message callback while the drained target is live:
+  // target.get() returns non-null in the callback, yet the next update() still
+  // has no live target of its own and its outputs are held neutral.
+  sim.step(1ms);
+  sim.publish("/test/ping", Small{1.0f});
+  sim.step(4ms);
+  ASSERT_TRUE(gate.seen_in_callback);
+  ExpectNeutral(hw);
+  EXPECT_TRUE(detail::NodeAccess::outputs_held(gate.node));
+
+  // Once update() itself asks, the same live target drives the tick.
+  gate.ask_in_update = true;
+  sim.step(5ms);
+  ExpectDriving(hw, 0.5);
+  EXPECT_FALSE(detail::NodeAccess::outputs_held(gate.node));
+}
+
 // Drives from a live target each tick until told to throw: that update()
 // asks its Target, sets every output from the target, then throws. The
 // next update() asks and sets only as `ask` and `set` say.
