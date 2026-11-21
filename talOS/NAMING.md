@@ -43,8 +43,8 @@ doubled or trailing `_`.
   `naming::ParseAlertField` is the only reader of this grammar: the
   telemetry dictionary carries each alert's level (`ChannelInfo.alert`), so
   no viewer parses names. The graph lint refuses an `alert_` field that is
-  not a `bool` or not of these levels (nested structs included), and warns
-  on an alert outside a `status` topic.
+  not a `bool` or not of these levels (nested structs included), and refuses
+  an alert outside a `status` topic.
 
 Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 `pos`, `vel`, …; use the full word), and so are direction suffixes (`_in`,
