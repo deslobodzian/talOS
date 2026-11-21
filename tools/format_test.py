@@ -1,6 +1,6 @@
 """Tests for tools/format.sh against a throwaway git repository.
 
-REQ-DEV-25: the local pre-push checks find what CI finds. CI formats every
+REQ-DEV-36, REQ-DEV-25: the local pre-push checks find what CI finds. CI formats every
 C/C++ file the pushed commits add, so a new file not yet `git add`-ed must
 not pass the local `format.sh --check` and then fail CI's.
 

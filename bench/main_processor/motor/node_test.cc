@@ -179,7 +179,7 @@ TEST_F(MotorTest, DriverStationLossGoesNeutral) {
   Neutral();
 }
 
-// REQ-CONTRACT-25
+// REQ-SAFE-45, REQ-CONTRACT-25
 TEST_F(MotorTest, DisconnectedFeedbackGoesNeutral) {
   Enable();
   Send(Velocity());

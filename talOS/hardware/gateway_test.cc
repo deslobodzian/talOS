@@ -1340,7 +1340,7 @@ bool AllFinite(const State& s) {
 // the health sample) invalid where it has a validity, and a CAN bus slot with
 // one a failed read. Every motor and CAN sensor non-finite is total loss, as
 // any other invalid feedback is.
-// REQ-SAFE-22, REQ-CONTRACT-32
+// REQ-SAFE-22, REQ-CONTRACT-32, REQ-CONTRACT-43
 TEST(Gateway, ANonFiniteReadingInvalidatesOnlyItsSampleAndTheStateDecodes) {
   constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
   constexpr double kInf = std::numeric_limits<double>::infinity();
@@ -1488,7 +1488,7 @@ TEST(Gateway, ANonFiniteReadingInvalidatesOnlyItsSampleAndTheStateDecodes) {
 // raw encoding would either return 0 or emit undecodable bytes, and still
 // returns 0 cleanly on structural errors (including out-of-range device counts
 // without OOB access).
-// REQ-SAFE-22, REQ-CONTRACT-32
+// REQ-SAFE-22, REQ-CONTRACT-32, REQ-CONTRACT-43
 TEST(Messages, EncodeStateSanitizesEveryNonFiniteFieldAndPreservesFiniteBytes) {
   State base;
   base.config_id = 0x1122334455667788ull;

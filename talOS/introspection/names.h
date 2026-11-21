@@ -588,6 +588,10 @@ inline std::optional<std::string> HardwareWriterProblem(
 }
 }  // namespace detail
 
+// Maximum node hops from an operator producer to an actuator owner before
+// LintGraph warns (REQ-CONTRACT-09).
+inline constexpr std::size_t kMaxOperatorToActuatorHops = 2;
+
 // Everything checkable about a whole graph, errors first.
 //
 // Errors cannot be correct in any configuration (two writers, a reader with no
@@ -599,7 +603,9 @@ inline std::optional<std::string> HardwareWriterProblem(
 // partial launch (an unread topic, an owner not in this session, a policy
 // lane nobody writes yet, an alert outside a `status` topic, a node that
 // writes its hardware request but reads no target lane of its own, a node
-// whose hardware request is marked untargeted_outputs). Required coverage
+// whose hardware request is marked untargeted_outputs, or an operator producer
+// whose shortest path to an actuator owner exceeds kMaxOperatorToActuatorHops
+// node hops). Required coverage
 // additionally rejects a target-consuming subsystem with no producer for a
 // nonempty mode policy, and makes untargeted_outputs an error. Timers are
 // skipped: their names are labels, not topics.
@@ -953,6 +959,118 @@ inline std::vector<Diagnostic> LintGraph(
                   "', but none of its policy lanes has a writer: " +
                   join(lanes));
         }
+      }
+    }
+  }
+
+  // REQ-CONTRACT-09: warn when an operator producer's shortest path to an
+  // actuator owner exceeds kMaxOperatorToActuatorHops node hops over non-/hw,
+  // non-observer topic edges.
+  {
+    const std::size_t n = nodes.size();
+    std::vector<bool> is_operator_producer(n, false);
+    std::vector<bool> is_actuator_owner(n, false);
+    std::map<std::string_view,
+             std::pair<std::vector<std::size_t>, std::vector<std::size_t>>>
+        topic_edges;
+
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto& node = nodes[i];
+      if (node.hardware_bridge) continue;
+      bool reads_driver_station = false;
+      bool writes_teleop_lane = false;
+      for (const auto& source : node.sources) {
+        if (IsSender(source.kind) &&
+            (source.flags & kSourceFlagHardwareRequest) != 0) {
+          is_actuator_owner[i] = true;
+        }
+        if (IsReader(source.kind) && !source.observer() &&
+            source.name == "/hw/state/driver_station") {
+          reads_driver_station = true;
+        }
+        if (IsSender(source.kind) && IsTargetLane(source.name)) {
+          const auto segments = detail::Segments(source.name);
+          if (segments[0] != node.name) {
+            const auto sub = target_mode_sources.find(segments[0]);
+            if (sub != target_mode_sources.end()) {
+              const auto teleop = sub->second.find("teleop");
+              if (teleop != sub->second.end() &&
+                  std::find(teleop->second.begin(), teleop->second.end(),
+                            segments[2]) != teleop->second.end()) {
+                writes_teleop_lane = true;
+              }
+            }
+          }
+        }
+        if (!IsSender(source.kind) && !IsReader(source.kind)) continue;
+        if (CheckTopicName(source.name)) continue;
+        const auto segments = detail::Segments(source.name);
+        if (segments[0] == "hw") continue;
+        if (IsSender(source.kind)) {
+          topic_edges[source.name].first.push_back(i);
+        } else if (!source.observer()) {
+          topic_edges[source.name].second.push_back(i);
+        }
+      }
+      if (reads_driver_station && writes_teleop_lane) {
+        is_operator_producer[i] = true;
+      }
+    }
+
+    std::vector<std::vector<std::size_t>> adj(n);
+    for (const auto& entry : topic_edges) {
+      const auto& [writers, readers] = entry.second;
+      for (const std::size_t u : writers) {
+        for (const std::size_t v : readers) {
+          if (u == v) continue;
+          if (std::find(adj[u].begin(), adj[u].end(), v) == adj[u].end()) {
+            adj[u].push_back(v);
+          }
+        }
+      }
+    }
+    for (auto& neighbors : adj) {
+      std::sort(neighbors.begin(), neighbors.end());
+    }
+
+    const std::size_t kUnvisited = n;
+    for (std::size_t p = 0; p < n; ++p) {
+      if (!is_operator_producer[p]) continue;
+      std::vector<std::size_t> dist(n, kUnvisited);
+      std::vector<std::size_t> parent(n, kUnvisited);
+      std::vector<std::size_t> queue;
+      queue.reserve(n);
+      dist[p] = 0;
+      queue.push_back(p);
+      for (std::size_t head = 0; head < queue.size(); ++head) {
+        const std::size_t u = queue[head];
+        for (const std::size_t v : adj[u]) {
+          if (dist[v] != kUnvisited) continue;
+          dist[v] = dist[u] + 1;
+          parent[v] = u;
+          queue.push_back(v);
+        }
+      }
+      for (std::size_t a = 0; a < n; ++a) {
+        if (!is_actuator_owner[a] || dist[a] == kUnvisited ||
+            dist[a] <= kMaxOperatorToActuatorHops) {
+          continue;
+        }
+        std::vector<std::size_t> path;
+        for (std::size_t cur = a; cur != kUnvisited; cur = parent[cur]) {
+          path.push_back(cur);
+        }
+        std::reverse(path.begin(), path.end());
+        std::string chain;
+        for (std::size_t k = 0; k < path.size(); ++k) {
+          if (k > 0) chain += " -> ";
+          chain += nodes[path[k]].name;
+        }
+        add(Severity::WARNING, nodes[p].name,
+            "operator producer '" + nodes[p].name +
+                "' reaches actuator owner '" + nodes[a].name + "' in " +
+                std::to_string(dist[a]) + " node hops (limit " +
+                std::to_string(kMaxOperatorToActuatorHops) + "): " + chain);
       }
     }
   }
