@@ -49,6 +49,12 @@ inline constexpr std::size_t rtms_slot_stride(std::size_t message_size,
 }
 
 static_assert(sizeof(std::int64_t) == 8);
+static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free);
+static_assert(std::atomic_ref<std::uint64_t>::required_alignment <=
+              alignof(std::int64_t));
+static_assert(std::atomic_ref<std::int64_t>::is_always_lock_free);
+static_assert(std::atomic_ref<std::int64_t>::required_alignment <=
+              alignof(std::int64_t));
 static_assert(rtms_slot_stride(1, 1) == 16);
 static_assert(rtms_slot_stride(8, 4) == 16);
 static_assert(rtms_slot_stride(16, 8) == 24);
@@ -349,7 +355,7 @@ class RTMSQueue {
   // `message_sequence`, i.e. the bytes just read were not overwritten.
   bool slot_still_valid(std::uint64_t message_sequence) const;
 
-  const std::byte* slot_address(std::uint64_t message_sequence) const;
+  std::byte* slot_address(std::uint64_t message_sequence);
 
   // Notifies the wake receiver of each reader slot in `mask` that has one.
   void notify_readers(std::uint64_t mask);
