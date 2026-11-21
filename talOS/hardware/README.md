@@ -188,12 +188,15 @@ configuration, so after a reset at 30 rotations limits of [0, 50] would allow
 
 `motor_type` names the motor the TalonFX drives: `"kraken_x60"` (the
 default), `"kraken_x44"` or `"falcon_500"`; config load refuses any other
-value, naming the key, the motor and its file. Only the physics simulator
-reads it, for its winding model (stator current, free speed; see the backend
-table below). It is not in the wire format or the configuration fingerprint,
-so a config the bridge pushes to `sim_gateway` carries none: the physics
-backend gives each pushed motor the type of the motor of the same name in
-`sim_gateway`'s own parse of `--config` (`PhysicsSimBackend::SetLocalMotorTypes`).
+value, naming the key, the motor and its file. It is not in the wire format or
+the configuration fingerprint, so a config the bridge pushes over UDP carries
+none: `sim_gateway --physics` reads it locally from its own parse of `--config`
+(`PhysicsSimBackend::SetLocalMotorTypes`) for its winding model (stator
+current, free speed; see the backend table below), while the WPILib desktop
+simulator (`PhoenixBackend` under `./sim.sh`) receives only pushed configs and
+therefore defaults to `KrakenX60` (or `KrakenX60FOC` when `foc = true`),
+selecting `KrakenX44` or `Falcon500` only when `MotorConfig::motor_type` is
+populated in-process (e.g., unit tests).
 
 `forward_limit_switch` and `reverse_limit_switch` set the switches wired to
 the TalonFX's own forward and reverse limit inputs: `"NormallyOpen"` (the
@@ -1168,13 +1171,16 @@ Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see
 [`talOS/simulation/README.md`](../simulation/README.md)). The RoboRIO desktop
 simulation (`PhoenixBackend`, compiled off-RoboRIO only) uses WPILib's
-`LinearSystemId::DCMotorSystem` with `DCMotor` ratings (`KrakenX60`,
-`KrakenX44`, `Falcon500`, choosing the FOC variant when `foc = true`) at
+`LinearSystemId::DCMotorSystem` with `DCMotor` ratings (choosing the FOC
+variant when `foc = true`; over UDP under `./sim.sh`, `motor_type` stays
+off-wire so pushed configs default to `KrakenX60` / `KrakenX60FOC`, while
+`KrakenX44` and `Falcon500` are selected when `MotorConfig::motor_type` is
+populated in-process, e.g., unit tests) at
 `J_rotor = 0.0005 kg·m²` reflected across each motor's gear ratio
 (`J_mech = J_rotor × gear_ratio²`, ~44.5 ms electrical time constant for a
 Kraken X60), writing rotor position, velocity, and acceleration plus remote
-CANcoder state and forwarding the RoboRIO's simulated battery voltage
-(`>= 4 V`) to each simulated device. Brake neutral drives `0 V` into the plant
+CANcoder state and forwarding any positive simulated RoboRIO battery voltage
+(clamped to Phoenix 6's `4 V` floor) to each simulated device on change. Brake neutral drives `0 V` into the plant
 (shorted-winding back-EMF braking), while coast neutral decays exponentially
 (`tau = 1.0 s`) with the `0.01 rps` standstill snap. When swerve drive/steer
 pairs (`front`/`back`/`rear`, `left`/`right`, ±0.30 m) or differential
@@ -1189,7 +1195,7 @@ untouched.
 |---|---|---|---|---|---|
 | Ideal (`SimBackend`) | `sim_gateway` (default, no `--physics`), or `SimHardware` in unit tests | Instant velocity/position; zero gains still move; zero Pigeon2 raw yaw | Scripted `--mode-schedule` / `--joystick-schedule` | None (resets & I/O setters in C++ tests only) | Fast logic, wiring, sequencing, mode/timeout unit tests |
 | Lightweight physics (`sim_gateway --physics`) | `./sim.sh --sim-gateway` (or `sim_gateway --physics`) | `sim::PhysicsSimBackend`: winding/current-limit model, gearing, hard stops, home switches, swerve ground pose & Pigeon2 yaw | Scripted `--mode-schedule` / `--joystick-schedule` (no USB gamepad) | Publishes `/sim/state` for cameras; odometry error (`--wheel-radius-error`, `--wheel-slip-gain`, `--gyro-drift-radps`) & `--fault-schedule` | Headless CI/soak runs, vision/odometry error tests, fault injection, PID/limit/homing verification |
-| WPILib desktop sim (`PhoenixBackend`) | `./sim.sh` (or `./gradlew simulateNative` in `controller_processor/rio`) | Real Phoenix 6 simulator + WPILib `LinearSystemId::DCMotorSystem` plant (`KrakenX60`/`X44`/`Falcon500`, FOC-aware) + inferred swerve/differential Pigeon2 yaw | WPILib Sim GUI with live USB gamepad (or `--headless` scripted schedules) | None (cameras emit invalid observations) | Interactive driving with a USB gamepad, testing real Phoenix 6 closed-loop/FOC/status-signal behaviour, RoboRIO-in-the-loop verification |
+| WPILib desktop sim (`PhoenixBackend`) | `./sim.sh` (or `./gradlew simulateNative` in `controller_processor/rio`) | Real Phoenix 6 simulator + WPILib `LinearSystemId::DCMotorSystem` plant (`KrakenX60`/`KrakenX60FOC` over UDP since `motor_type` is off-wire; `KrakenX44`/`Falcon500` when populated in-process) + inferred swerve/differential Pigeon2 yaw | WPILib Sim GUI with live USB gamepad (or `--headless` scripted schedules) | None (cameras emit invalid observations) | Interactive driving with a USB gamepad, testing real Phoenix 6 closed-loop/FOC/status-signal behaviour, RoboRIO-in-the-loop verification |
 
 ### Ground truth and odometry error
 
