@@ -204,10 +204,10 @@ TEST_F(SwerveModuleTest, DriverStationLossGoesNeutral) {
   Neutral();
 }
 
-// REQ-CONTRACT-25: losing any one of the three devices stops both motors,
-// the CANcoder alone included (the steer motor's own feedback stays valid,
-// so only the node's gate stops the drive). The other two keep the robot
-// enabled.
+// REQ-SAFE-45, REQ-CONTRACT-25: losing any one of the three devices stops both
+// motors, the CANcoder alone included (the steer motor's own feedback stays
+// valid, so only the node's gate stops the drive). The other two keep the
+// robot enabled.
 TEST_F(SwerveModuleTest, DisconnectedFeedbackGoesNeutral) {
   struct Device {
     const char* name;
