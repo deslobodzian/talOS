@@ -8,8 +8,14 @@
 
 import {useMemo, useState} from 'react';
 
-import {useDictionary, usePlayback, useSeries, useSnapshot} from '../../data/hooks';
-import {useStudio} from '../../data/studio';
+import {
+  useDictionary,
+  usePlayback,
+  useSeries,
+  useSnapshot,
+  useSource,
+  useSourceVersion
+} from '../../data/hooks';
 import type {ChannelInfo} from '../../data/types';
 import {channelDisplayName} from '../../ui/channel';
 import {FreshnessNotice} from '../../ui/FreshnessNotice';
@@ -63,20 +69,21 @@ function groupKey(name: string): string {
 }
 
 const EMPTY = new Float64Array(0);
+// Cap per-render sparkline series fan-out on large recorded dictionaries so
+// opening the Inspector never floods the review server; collapsing groups or
+// filtering brings any group's sparklines into this budget.
+export const MAX_RECORDED_SPARKLINE_CHANNELS = 64;
+const SPARKLINE_WIDTH = 90;
 
 function InspectorPanel() {
-  const studio = useStudio();
+  const source = useSource();
+  useSourceVersion();
   const snapshot = useSnapshot();
   const dictionary = useDictionary();
   const playback = usePlayback();
   const [filter, setFilter] = useState('');
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const needle = filter.trim().toLowerCase();
-
-  const allNames = useMemo(() => dictionary.map(c => c.name), [dictionary]);
-  // A 30 s window for the sparklines; it also re-renders on every store change
-  // so each row's age reads the current newest sample.
-  const series30 = useSeries(allNames, {seconds: 30});
 
   const groups = useMemo(() => {
     const visible = needle ?
@@ -102,6 +109,22 @@ function InspectorPanel() {
           channels: channels.slice().sort((a, b) => a.name.localeCompare(b.name))
         }));
   }, [dictionary, needle]);
+
+  const sparklineNames = useMemo(() => {
+    const names: string[] = [];
+    const cap = source.kind === 'recorded' ? MAX_RECORDED_SPARKLINE_CHANNELS : Infinity;
+    for (const g of groups) {
+      if (collapsed.has(g.key)) continue;
+      for (const c of g.channels) {
+        if (c.labels.length > 0) continue;
+        if (names.length >= cap) return names;
+        names.push(c.name);
+      }
+    }
+    return names;
+  }, [groups, collapsed, source.kind]);
+
+  const series30 = useSeries(sparklineNames, {seconds: 30}, SPARKLINE_WIDTH);
 
   const toggleGroup = (key: string) => {
     setCollapsed(prev => {
@@ -153,7 +176,7 @@ function InspectorPanel() {
               {g.channels.map(c => {
                 const value = snapshot?.channels[c.name];
                 const kind = kindOf(c, value);
-                const age = channelAge(studio.store, c.name, playback);
+                const age = channelAge(source, c.name, playback);
                 const values = series30.values[c.name] ?? EMPTY;
                 return <tr key={c.name}>
                   <td><code>{channelDisplayName(c.name)}</code></td>
@@ -205,5 +228,6 @@ export const inspectorPanel: PanelDefinition<InspectorConfig> = {
   description: 'Every channel, its value, unit, staleness and recent shape.',
   defaultConfig,
   parseConfig,
-  component: InspectorPanel
+  component: InspectorPanel,
+  recorded: true
 };

@@ -12,7 +12,7 @@ import {useMemo} from 'react';
 
 import {discoverSubsystems, type Subsystem} from '../../data/discovery';
 import {nodeLiveness} from '../../data/freshness';
-import {useChannelStale, useDictionary, useSeries, useSnapshot, useSystem} from '../../data/hooks';
+import {useChannelStale, useDictionary, useRecorded, useSeries, useSnapshot, useSystem} from '../../data/hooks';
 import type {ChannelInfo} from '../../data/types';
 import type {SystemNode} from '../../system';
 import {rateKey} from '../../system';
@@ -233,10 +233,12 @@ function SubsystemCard(
 function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
   const dictionary = useDictionary();
   const system = useSystem();
+  const recorded = useRecorded();
   const snapshot = useSnapshot();
+  const graph = recorded ? null : system.graph;
 
   const subsystems = useMemo(
-      () => discoverSubsystems(dictionary, system.graph), [dictionary, system.graph]);
+      () => discoverSubsystems(dictionary, graph), [dictionary, graph]);
 
   const infoBy = useMemo(() => {
     const map = new Map<string, ChannelInfo>();
@@ -304,9 +306,9 @@ function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
            {visible.map(sub =>
              <SubsystemCard key={sub.name} sub={sub} infoBy={infoBy}
                             snapshot={snapshot}
-                            node={system.graph?.nodes.find(n => n.name === sub.name)}
-                            graphStale={system.stale}
-                            rates={system.rates} series={series}/>)}
+                            node={graph?.nodes.find(n => n.name === sub.name)}
+                            graphStale={recorded ? false : system.stale}
+                            rates={recorded ? {} : system.rates} series={series}/>)}
          </div>}
   </div>;
 }
@@ -318,5 +320,6 @@ export const subsystemsPanel: PanelDefinition<SubsystemsConfig> = {
   description: 'One card per subsystem: state, status and demand-vs-measured.',
   defaultConfig,
   parseConfig,
-  component: SubsystemsPanel
+  component: SubsystemsPanel,
+  recorded: true
 };

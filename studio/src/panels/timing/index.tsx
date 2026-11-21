@@ -170,5 +170,7 @@ export const timingPanel: PanelDefinition<TimingConfig> = {
   description: 'Dispatch timing and latency per source.',
   defaultConfig,
   parseConfig,
-  component: TimingPanel
+  component: TimingPanel,
+  recorded: false,
+  liveOnlyReason: 'Live-only: Timing reads per-source dispatch cadence and latency from the live shared-memory registry, which is not stored in .tlog recordings.'
 };

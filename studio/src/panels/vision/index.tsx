@@ -202,7 +202,7 @@ function VisionPanel() {
       const points = observationErrors(
           d.times, col(channel(c.name, 'state/pose/x_m'))(d),
           col(channel(c.name, 'state/pose/y_m'))(d),
-          col(channel(c.name, 'state/valid'))(d), rX, rY);
+          col(channel(c.name, 'state/valid'))(d), rX, rY, ref30.times);
       const times: number[] = [], xs: number[] = [], ys: number[] = [];
       for (const p of points) {
         times.push(p.t);
@@ -387,5 +387,6 @@ export const visionPanel: PanelDefinition<VisionConfig> = {
   description: 'Camera health, frame stats and estimator agreement.',
   defaultConfig,
   parseConfig,
-  component: VisionPanel
+  component: VisionPanel,
+  recorded: true
 };

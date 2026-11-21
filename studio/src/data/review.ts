@@ -10,6 +10,7 @@
 
 import {AlertLevel} from '../generated/talos/telemetry/alert-level';
 import {parseDeclaredGraph, type DeclaredGraph} from '../system';
+import {parseManifest, type SessionManifest} from './manifest';
 import type {ChannelInfo} from './types';
 
 export const DEFAULT_REVIEW_URL = 'http://127.0.0.1:5805';
@@ -451,6 +452,31 @@ export async function fetchDeclared(server: string, id: string, fetchFn: FetchLi
     return parseDeclaredGraph(await response.text());
   } catch (e) {
     return fail(`${url}: ${errorMessage(e)}`);
+  }
+}
+
+// Fetches /review/<id>/manifest.json (the session's manifest.json verbatim).
+// Returns {manifest: null, error: ''} when absent (HTTP 404); on non-404 HTTP
+// or parse failure returns {manifest: null, error} so opening a session does
+// not fail and the Session panel can report the reason (matching live
+// /manifest.json).
+export async function fetchManifest(
+    server: string, id: string, fetchFn: FetchLike,
+    signal?: AbortSignal): Promise<{manifest: SessionManifest|null; error: string}> {
+  const url = reviewUrl(server, id, 'manifest.json');
+  let response: Response;
+  try {
+    response = await fetchFn(url, signal ? {signal} : undefined);
+  } catch (e) {
+    if (isAbort(e)) throw e;
+    return {manifest: null, error: `${url}: ${errorMessage(e)}`};
+  }
+  if (response.status === 404) return {manifest: null, error: ''};
+  if (!response.ok) return {manifest: null, error: `${url}: HTTP ${response.status}`};
+  try {
+    return {manifest: parseManifest(await response.text()), error: ''};
+  } catch (e) {
+    return {manifest: null, error: errorMessage(e)};
   }
 }
 

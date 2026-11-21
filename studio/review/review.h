@@ -55,6 +55,9 @@
 //   GET /review/<id>/declared.json
 //       the session directory's graph.json verbatim (application/json, up to
 //       kMaxDeclaredBytes), or 404 plain text when absent
+//   GET /review/<id>/manifest.json
+//       the session directory's manifest.json verbatim (application/json, up
+//       to kMaxManifestBytes), or 404 plain text when absent
 //   GET /review/<id>/snapshot?t_ns=
 //       {"t_ns","channels":{name:{"value","sample_ns"}}}
 //       value as the bridge's /telemetry.json writes a sample, or null for
@@ -125,6 +128,10 @@ inline constexpr std::size_t kMaxOpenSessions = 4;
 // Studio's MAX_DECLARED_BYTES (studio/src/system.ts).
 inline constexpr std::uintmax_t kMaxDeclaredBytes = std::uintmax_t{1} << 20;
 
+// The largest manifest.json read for session listing or served at
+// /review/<id>/manifest.json.
+inline constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
+
 struct Response {
   int status{200};
   std::string content_type{"application/json"};
@@ -163,6 +170,7 @@ class Review {
   Response Bounds(const Session& session) const;
   Response Timeline(const Session& session) const;
   Response Declared(std::string_view id) const;
+  Response Manifest(std::string_view id) const;
   Response Snapshot(const Session& session, std::string_view query);
   Response Series(std::string_view id, const Session& session,
                   std::string_view query);

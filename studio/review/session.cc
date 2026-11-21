@@ -331,7 +331,45 @@ constexpr std::int32_t kUnresolved = -2;
 struct FileBuild {
   std::vector<std::int32_t> topic;
   std::vector<std::uint8_t> kinds;  // bit 0 SEND, bit 1 MESSAGE
+  // Transient map from source_id (>= 63) to dense bit index in
+  // LogFile::overflow_source_ids.
+  std::unordered_map<std::uint16_t, std::size_t> overflow_bit;
 };
+
+void RecordOverflowSource(LogFile& log_file, FileBuild& build,
+                          std::size_t cp_idx, std::uint16_t source_id) {
+  const auto [it, inserted] = build.overflow_bit.emplace(
+      source_id, log_file.overflow_source_ids.size());
+  if (inserted) {
+    log_file.overflow_source_ids.push_back(source_id);
+    const std::size_t needed_words =
+        (log_file.overflow_source_ids.size() + 63) / 64;
+    if (needed_words > log_file.overflow_words_per_cp) {
+      const std::size_t old_words = log_file.overflow_words_per_cp;
+      const std::size_t old_cps =
+          old_words == 0 ? 0 : log_file.overflow_bits.size() / old_words;
+      std::vector<std::uint64_t> grown(
+          std::max(old_cps, cp_idx + 1) * needed_words, 0);
+      for (std::size_t c = 0; c < old_cps; ++c) {
+        for (std::size_t w = 0; w < old_words; ++w) {
+          grown[c * needed_words + w] =
+              log_file.overflow_bits[c * old_words + w];
+        }
+      }
+      log_file.overflow_bits = std::move(grown);
+      log_file.overflow_words_per_cp = needed_words;
+    }
+  }
+  const std::size_t bit_idx = it->second;
+  const std::size_t required_size =
+      (cp_idx + 1) * log_file.overflow_words_per_cp;
+  if (log_file.overflow_bits.size() < required_size) {
+    log_file.overflow_bits.resize(required_size, 0);
+  }
+  log_file.overflow_bits[cp_idx * log_file.overflow_words_per_cp +
+                         (bit_idx / 64)] |=
+      (std::uint64_t{1} << (bit_idx % 64));
+}
 
 class Indexer {
  public:
@@ -404,6 +442,29 @@ class Indexer {
 };
 
 }  // namespace
+
+std::optional<std::size_t> LogFile::OverflowBit(std::uint16_t source_id) const {
+  if (source_id < 63 || overflow_source_ids.empty()) return std::nullopt;
+  const auto it = std::find(overflow_source_ids.begin(),
+                            overflow_source_ids.end(), source_id);
+  if (it == overflow_source_ids.end()) return std::nullopt;
+  return static_cast<std::size_t>(it - overflow_source_ids.begin());
+}
+
+bool LogFile::HasSource(std::size_t cp_idx, std::uint16_t source_id,
+                        std::optional<std::size_t> overflow_bit) const {
+  const std::uint64_t mask = checkpoints[cp_idx].sources;
+  if (source_id < 63) return (mask & (std::uint64_t{1} << source_id)) != 0;
+  if ((mask & (std::uint64_t{1} << 63)) == 0 || !overflow_bit ||
+      overflow_words_per_cp == 0) {
+    return false;
+  }
+  const std::size_t word_idx =
+      cp_idx * overflow_words_per_cp + (*overflow_bit / 64);
+  if (word_idx >= overflow_bits.size()) return false;
+  return (overflow_bits[word_idx] &
+          (std::uint64_t{1} << (*overflow_bit % 64))) != 0;
+}
 
 std::string_view ModeKindName(ModeKind mode) {
   switch (mode) {
@@ -495,7 +556,20 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       return true;
     }
     if (!IsValueRecord(r.header)) return true;
-    log_file.checkpoints.back().sources |= SourceBit(r.header.source_id);
+    const std::size_t cp_idx = log_file.checkpoints.size() - 1;
+    const std::int64_t cp_second = log_file.checkpoints[cp_idx].second;
+    const std::int64_t publish_second = FloorSecond(r.header.publish_time_ns);
+    if (cp_second > publish_second) {
+      log_file.max_lead_s =
+          std::max(log_file.max_lead_s, cp_second - publish_second);
+    } else if (publish_second > cp_second) {
+      log_file.max_lag_s =
+          std::max(log_file.max_lag_s, publish_second - cp_second);
+    }
+    log_file.checkpoints[cp_idx].sources |= SourceBit(r.header.source_id);
+    if (r.header.source_id >= 63) {
+      RecordOverflowSource(log_file, builds[file], cp_idx, r.header.source_id);
+    }
     if (r.source == nullptr || r.payload.empty()) return true;
     FileBuild& build = builds[file];
     const std::uint16_t id = r.header.source_id;
@@ -802,7 +876,12 @@ std::size_t Session::log_seconds() const {
 }
 
 std::size_t Session::index_bytes() const {
-  return log_seconds() * sizeof(Checkpoint) + gaps_.size() * sizeof(Gap);
+  std::size_t bytes =
+      log_seconds() * sizeof(Checkpoint) + gaps_.size() * sizeof(Gap);
+  for (const LogFile& file : files_) {
+    bytes += file.overflow_bits.size() * sizeof(std::uint64_t);
+  }
+  return bytes;
 }
 
 bool Session::Decode(const Topic& topic, std::span<const std::byte> payload,
@@ -907,8 +986,8 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
   wanted_topics.reserve(wants.size());
   for (const auto& [topic, unused] : wants) wanted_topics.push_back(topic);
 
-  const std::int64_t first_second = FloorSecond(start_ns) - 1;
-  const std::int64_t last_second = FloorSecond(end_ns) + 1;
+  const std::int64_t start_second = FloorSecond(start_ns);
+  const std::int64_t end_second = FloorSecond(end_ns);
   const auto span_ns = static_cast<__int128>(end_ns) - start_ns;
   std::vector<std::uint64_t> raw;
   std::vector<std::uint8_t> present;
@@ -916,25 +995,64 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
        SourcesByFile(topics_, wanted_topics)) {
     const LogFile& file = files_[file_index];
     const auto& checkpoints = file.checkpoints;
+    const std::int64_t first_second = start_second - file.max_lag_s;
+    const std::int64_t last_second = end_second + file.max_lead_s;
     const auto first = std::lower_bound(
         checkpoints.begin(), checkpoints.end(), first_second,
         [](const Checkpoint& c, std::int64_t s) { return c.second < s; });
-    std::uint64_t mask = 0;
-    for (const auto& [id, topic] : sources) mask |= SourceBit(id);
-    bool holds = false;
-    for (auto it = first; it != checkpoints.end() && it->second <= last_second;
-         ++it) {
-      holds = holds || (it->sources & mask) != 0;
+    const auto end_it = std::upper_bound(
+        first, checkpoints.end(), last_second,
+        [](std::int64_t s, const Checkpoint& c) { return s < c.second; });
+    std::uint64_t low_mask = 0;
+    std::vector<std::pair<std::size_t, std::uint64_t>> overflow_checks;
+    for (const auto& [id, topic] : sources) {
+      if (id < 63) {
+        low_mask |= (std::uint64_t{1} << id);
+      } else if (const auto bit = file.OverflowBit(id)) {
+        overflow_checks.emplace_back(*bit / 64,
+                                     std::uint64_t{1} << (*bit % 64));
+      }
     }
-    if (!holds) continue;
+    const auto cp_holds = [&](std::size_t cp_idx) {
+      const std::uint64_t mask = checkpoints[cp_idx].sources;
+      if ((mask & low_mask) != 0) return true;
+      if (overflow_checks.empty() || (mask & (std::uint64_t{1} << 63)) == 0 ||
+          file.overflow_words_per_cp == 0) {
+        return false;
+      }
+      const std::size_t base = cp_idx * file.overflow_words_per_cp;
+      for (const auto& [word_off, bit_mask] : overflow_checks) {
+        const std::size_t idx = base + word_off;
+        if (idx < file.overflow_bits.size() &&
+            (file.overflow_bits[idx] & bit_mask) != 0) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const auto first_idx =
+        static_cast<std::size_t>(first - checkpoints.begin());
+    const auto end_idx = static_cast<std::size_t>(end_it - checkpoints.begin());
+    std::optional<std::size_t> first_match;
+    std::size_t last_match = 0;
+    for (std::size_t cp = first_idx; cp < end_idx; ++cp) {
+      if (!cp_holds(cp)) continue;
+      if (!first_match) first_match = cp;
+      last_match = cp;
+    }
+    if (!first_match) continue;
+    const std::uint64_t stop_offset =
+        last_match + 1 < checkpoints.size()
+            ? checkpoints[last_match + 1].offset
+            : std::numeric_limits<std::uint64_t>::max();
     if (stats != nullptr) ++stats->seeks;
     tlog::LogVisitor visitor;
     visitor.manifest = [](std::span<const tlog::ManifestEntry>) {
       return true;
     };
     visitor.record = [&](const tlog::LogReader::Record& record) {
+      if (record.offset >= stop_offset) return false;
       const auto& header = record.header;
-      if (FloorSecond(header.event_time_ns) > last_second) return false;
       Count(record, stats);
       const auto source = std::find_if(
           sources.begin(), sources.end(),
@@ -966,7 +1084,8 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
       }
       return true;
     };
-    tlog::VisitLog(file.path, visitor, tlog::VisitOptions{first->offset});
+    tlog::VisitLog(file.path, visitor,
+                   tlog::VisitOptions{checkpoints[*first_match].offset});
   }
   for (Series& series : out) {
     for (std::size_t b = 0; b < points; ++b) {
@@ -990,40 +1109,44 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
   std::vector<Latest> latest(topics_.size());
   std::vector<std::uint32_t> all(topics_.size());
   for (std::uint32_t t = 0; t < all.size(); ++t) all[t] = t;
-  const std::int64_t last_second = FloorSecond(t_ns) + 1;
+  const std::int64_t target_second = FloorSecond(t_ns);
   std::vector<std::uint64_t> raw;
   std::vector<std::uint8_t> present;
 
   for (const auto& [file_index, sources] : SourcesByFile(topics_, all)) {
     const LogFile& file = files_[file_index];
     const auto& checkpoints = file.checkpoints;
-    // The latest second at or before `from` holding source `id`, or -1.
-    const auto previous = [&](std::uint16_t id, std::ptrdiff_t from) {
+    const std::int64_t last_second = target_second + file.max_lead_s;
+    struct Item {
+      std::uint16_t id;
+      std::uint32_t topic;
+      std::optional<std::size_t> overflow_bit;
+      std::ptrdiff_t candidate;
+      std::ptrdiff_t found_checkpoint{-1};
+      Latest found;
+    };
+    // The latest second at or before `from` holding `item`'s source, or -1.
+    const auto previous = [&](const Item& item, std::ptrdiff_t from) {
       for (std::ptrdiff_t c = from; c >= 0; --c) {
-        const Checkpoint& checkpoint = checkpoints[static_cast<std::size_t>(c)];
-        if (checkpoint.second <= last_second &&
-            (checkpoint.sources & SourceBit(id)) != 0) {
+        const auto cp_idx = static_cast<std::size_t>(c);
+        if (checkpoints[cp_idx].second <= last_second &&
+            file.HasSource(cp_idx, item.id, item.overflow_bit)) {
           return c;
         }
       }
       return std::ptrdiff_t{-1};
     };
-    struct Item {
-      std::uint16_t id;
-      std::uint32_t topic;
-      std::ptrdiff_t candidate;
-      Latest found;
-    };
     std::vector<Item> items;
+    items.reserve(sources.size());
     for (const auto& [id, topic] : sources) {
-      items.push_back(
-          {id,
-           topic,
-           previous(id, static_cast<std::ptrdiff_t>(checkpoints.size()) - 1),
-           {}});
+      Item item{id, topic, file.OverflowBit(id), -1, -1, {}};
+      item.candidate =
+          previous(item, static_cast<std::ptrdiff_t>(checkpoints.size()) - 1);
+      items.push_back(std::move(item));
     }
     // Seconds latest first, each read once, for every item whose candidate
-    // it is; an item that finds nothing there moves to its previous second.
+    // it is; an item keeps checking earlier checkpoints until none can hold a
+    // newer publication (accounting for publish/receipt skew).
     while (true) {
       std::ptrdiff_t second = -1;
       for (const Item& item : items) second = std::max(second, item.candidate);
@@ -1047,13 +1170,16 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
           const Topic& topic = topics_[item.topic];
           if (header.kind != static_cast<std::uint16_t>(topic.kind) ||
               !IsValueRecord(header) || header.publish_time_ns > t_ns ||
-              header.publish_time_ns < item.found.publish_ns) {
+              header.publish_time_ns < item.found.publish_ns ||
+              (header.publish_time_ns == item.found.publish_ns &&
+               item.found_checkpoint > second)) {
             continue;
           }
           if (!Decode(topic, record.payload, raw, present)) continue;
           item.found.publish_ns = header.publish_time_ns;
           item.found.raw = raw;
           item.found.present = present;
+          item.found_checkpoint = second;
         }
         return true;
       };
@@ -1061,8 +1187,18 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
                      tlog::VisitOptions{checkpoints[at].offset});
       for (Item& item : items) {
         if (item.candidate != second) continue;
-        item.candidate =
-            item.found.raw.empty() ? previous(item.id, second - 1) : -1;
+        if (item.found.raw.empty()) {
+          item.candidate = previous(item, second - 1);
+        } else {
+          const std::int64_t min_second =
+              FloorSecond(item.found.publish_ns) - file.max_lag_s;
+          const std::ptrdiff_t prev = previous(item, second - 1);
+          item.candidate =
+              (prev >= 0 &&
+               checkpoints[static_cast<std::size_t>(prev)].second >= min_second)
+                  ? prev
+                  : -1;
+        }
       }
     }
     for (Item& item : items) {

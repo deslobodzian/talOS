@@ -91,9 +91,12 @@ function SplitHandle({path, index, direction, sizes, onResize}: {
               onPointerCancel={end} onKeyDown={key}/>;
 }
 
-function NotForRecorded({children}: {children: React.ReactNode}) {
+function NotForRecorded({reason, children}: {
+  reason?: string;
+  children: React.ReactNode;
+}) {
   return useSourceKind() === 'recorded' ?
-      <EmptyState>Not available for recorded sessions yet.</EmptyState> :
+      <EmptyState>{reason ?? 'Live-only panel; not available for recorded sessions.'}</EmptyState> :
       <>{children}</>;
 }
 
@@ -109,7 +112,8 @@ function renderPanel(node: PanelNode, callbacks: WorkspaceCallbacks,
                  setConfig={c => callbacks.onConfig(node.instanceId, c)}/> :
       <UnknownPanel panelId={node.panelId} config={node.config}/>;
   const content = def?.recorded ? panel :
-      <NotForRecorded key={`${node.instanceId}:${node.panelId}`}>{panel}</NotForRecorded>;
+      <NotForRecorded key={`${node.instanceId}:${node.panelId}`}
+                      reason={def?.liveOnlyReason}>{panel}</NotForRecorded>;
 
   return <PanelChrome key={node.instanceId}
       panelId={node.panelId}

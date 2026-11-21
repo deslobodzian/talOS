@@ -5,6 +5,7 @@
 // review server is a fake `fetch`.
 
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 
 import React from 'react';
@@ -13,6 +14,7 @@ import {renderToStaticMarkup} from 'react-dom/server';
 import {AlertLevel} from '../src/data/alerts';
 import {readingClock, sampleStale} from '../src/data/freshness';
 import {useChannelStale, useChassis, usePlayback} from '../src/data/hooks';
+import {parseManifest} from '../src/data/manifest';
 import {
   alertMarks,
   bucketSeries,
@@ -41,12 +43,22 @@ import {
 import {createStaticStudio, StudioProvider} from '../src/data/studio';
 import type {ChannelInfo} from '../src/data/types';
 import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
+import {panelNode} from '../src/layout/tree';
 import {eventsPanel} from '../src/panels/events';
+import {framesPanel} from '../src/panels/frames';
+import {hardwarePanel} from '../src/panels/hardware';
 import {healthPanel} from '../src/panels/health';
+import {inspectorPanel, MAX_RECORDED_SPARKLINE_CHANNELS} from '../src/panels/inspector';
 import {plotColumn} from '../src/panels/plot';
+import {pose3dPanel} from '../src/panels/pose3d';
+import {PANELS} from '../src/panels/registry';
+import {sessionPanel} from '../src/panels/session';
+import {subsystemsPanel} from '../src/panels/subsystems';
+import {visionPanel} from '../src/panels/vision';
 import {Header} from '../src/shell/Header';
 import {RecordedTransport} from '../src/shell/RecordedTransport';
 import {ReviewPicker} from '../src/shell/ReviewPicker';
+import {WorkspaceArea, type WorkspaceCallbacks} from '../src/shell/WorkspaceArea';
 import {parseDeclaredGraph, parseSystemGraph} from '../src/system';
 
 const SERVER = 'http://review.test';
@@ -541,7 +553,7 @@ test('a session whose hardware packets were not decoded says why in its status',
       json(document) : url.pathname.endsWith('/channels.json') ?
       json({channels: []}) : url.pathname.endsWith('/timeline.json') ?
       json({...EMPTY_TIMELINE, hardware_not_decoded: true}) :
-      url.pathname.endsWith('/declared.json') ?
+      url.pathname.endsWith('/declared.json') || url.pathname.endsWith('/manifest.json') ?
       new Response('', {status: 404}) : echoSnapshot(url));
   const refused = await RecordedSource.open(SERVER, 's1', {fetch: server.fetchFn,
                                                            clock: fakeClock().clock});
@@ -663,7 +675,7 @@ const SAMPLE_TIMELINE: ReviewTimeline = {
 // and parseTimeline rejects malformed payloads.
 test('RecordedSource.open loads timeline and optional declared graph', async () => {
   const declaredJson = demoDeclaredGraph();
-  const makeServer = (declaredStatus: number) => fakeServer(url => {
+  const makeServer = (declaredStatus: number, manifestResponse?: Response) => fakeServer(url => {
     if (url.pathname.endsWith('/channels.json')) return json({channels: []});
     if (url.pathname.endsWith('/bounds.json')) return json(BOUNDS);
     if (url.pathname.endsWith('/timeline.json')) return json(SAMPLE_TIMELINE);
@@ -671,6 +683,9 @@ test('RecordedSource.open loads timeline and optional declared graph', async () 
       return declaredStatus === 200 ?
           new Response(declaredJson, {status: 200, headers: {'content-type': 'application/json'}}) :
           new Response('no declared graph\n', {status: declaredStatus});
+    }
+    if (url.pathname.endsWith('/manifest.json')) {
+      return manifestResponse ?? new Response('no manifest\n', {status: 404});
     }
     return echoSnapshot(url);
   });
@@ -1087,4 +1102,277 @@ test('bucketSeries attributes target-lane breaks to the source writer, not the s
   assert.deepEqual(plotColumn(series.values['drivetrain/state/vx_mps'],
                               series.count!['drivetrain/state/vx_mps']),
                    [10, undefined, 20, null, 30]);
+});
+
+// REQ-OPS-41: the panel registry exposes 12 recorded-capable panels and 3
+// live-only panels (system, timing, agent), and WorkspaceArea explains why
+// each live-only panel is unavailable for recordings.
+test('panel registry splits into 12 recorded panels and 3 live-only panels with reasons', () => {
+  const recordedIds = PANELS.filter(p => p.recorded === true).map(p => p.id).sort();
+  const liveOnlyIds = PANELS.filter(p => !p.recorded).map(p => p.id).sort();
+  assert.deepEqual(recordedIds, [
+    'events', 'field', 'frames', 'hardware', 'health', 'inspector',
+    'plot', 'pose3d', 'robot', 'session', 'subsystems', 'vision'
+  ]);
+  assert.deepEqual(liveOnlyIds, ['agent', 'system', 'timing']);
+
+  const server = fakeServer(echoSnapshot);
+  const rec = source(server);
+  const studio = createStaticStudio();
+  studio.openRecorded(rec);
+  const callbacks: WorkspaceCallbacks = {
+    onSplit() {}, onClose() {}, onSwitch() {}, onConfig() {},
+    onResize() {}, onMaximize() {}, onFocusPanel() {}
+  };
+  for (const id of liveOnlyIds) {
+    const html = renderToStaticMarkup(
+        <StudioProvider studio={studio}>
+          <WorkspaceArea root={panelNode(id, 'p1', undefined)} maximized={null}
+                         callbacks={callbacks}/>
+        </StudioProvider>);
+    assert.match(html, /Live-only:/, id);
+    assert.doesNotMatch(html, /Not available for recorded sessions yet/, id);
+  }
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41: RecordedSource.open loads /review/<id>/manifest.json, and the
+// Session panel renders manifest header + process table (restarts, exit codes,
+// delivery loss, records, log paths) with live registry columns (Alive, Loop,
+// Latency) shown as '—'.
+test('Session panel renders recorded manifest without fabricating live registry state', async () => {
+  const rawManifest = readFileSync(new URL('./session_manifest.json', import.meta.url), 'utf8');
+  const declaredJson = demoDeclaredGraph();
+  const server = fakeServer(url => {
+    if (url.pathname.endsWith('/channels.json')) return json({channels: []});
+    if (url.pathname.endsWith('/bounds.json')) return json(BOUNDS);
+    if (url.pathname.endsWith('/timeline.json')) return json(EMPTY_TIMELINE);
+    if (url.pathname.endsWith('/declared.json')) {
+      return new Response(declaredJson, {status: 200, headers: {'content-type': 'application/json'}});
+    }
+    if (url.pathname.endsWith('/manifest.json')) {
+      return new Response(rawManifest, {status: 200, headers: {'content-type': 'application/json'}});
+    }
+    return echoSnapshot(url);
+  });
+  const rec = await RecordedSource.open(SERVER, 's1', {
+    fetch: server.fetchFn, clock: fakeClock().clock
+  });
+  assert.equal(rec.manifest?.session_id, '1794813782');
+  assert.equal(rec.manifestError, '');
+
+  // Even when studio.system holds a live graph from earlier, Session in
+  // recorded mode must ignore it and render '—' for Alive/Loop/Latency.
+  const studio = createStaticStudio({
+    system: {
+      graph: parseSystemGraph(demoSystemGraph(50n)),
+      stale: false,
+      rates: {'telemetry 0': 50}
+    }
+  });
+  studio.openRecorded(rec);
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <sessionPanel.component config={sessionPanel.defaultConfig}
+                                setConfig={() => {}} instanceId="sess"/>
+      </StudioProvider>);
+  const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+  assert.match(text, /1794813782/);
+  assert.match(text, /MANIFEST ∪ DECLARED/);
+  assert.match(text, /telemetry delivery loss .*wake failures 1 · stalled arms 2/);
+  assert.match(text, /hardware_node delivery loss .*skipped requests 3 \(swerve_module 3\)/);
+  assert.match(text, /hardware_node\.tlog/);
+  assert.doesNotMatch(text, /\blive\b/);
+  assert.doesNotMatch(text, /50\.0 Hz/);
+  studio.closeRecorded();
+
+  // Malformed manifest.json does not fail RecordedSource.open; Session reports
+  // the parse error cleanly.
+  const badServer = fakeServer(url => {
+    if (url.pathname.endsWith('/channels.json')) return json({channels: []});
+    if (url.pathname.endsWith('/bounds.json')) return json(BOUNDS);
+    if (url.pathname.endsWith('/timeline.json')) return json(EMPTY_TIMELINE);
+    if (url.pathname.endsWith('/declared.json')) return new Response('', {status: 404});
+    if (url.pathname.endsWith('/manifest.json')) return new Response('{bad', {status: 200});
+    return echoSnapshot(url);
+  });
+  const badRec = await RecordedSource.open(SERVER, 's1', {
+    fetch: badServer.fetchFn, clock: fakeClock().clock
+  });
+  assert.equal(badRec.manifest, null);
+  assert.match(badRec.manifestError, /Invalid manifest/);
+  badRec.close();
+});
+
+// REQ-OPS-41: Inspector reads channel age from RecordedSource (DataSource)
+// and caps series fan-out on large recorded dictionaries.
+test('Inspector uses DataSource.channelSample and caps series fan-out in recorded mode', async () => {
+  const at = START + 5_000_000_000n;
+  const channels: ChannelInfo[] = [];
+  const snapChannels: Record<string, {value: number; sample_ns: string}> = {};
+  for (let i = 0; i < MAX_RECORDED_SPARKLINE_CHANNELS + 30; i++) {
+    const name = `sub/state/ch_${String(i).padStart(3, '0')}`;
+    channels.push({name, unit: 'm', labels: []});
+    snapChannels[name] = {
+      value: i,
+      // ch_000 is fresh (0.2s old), ch_001 is stale (2.0s old).
+      sample_ns: (i === 1 ? at - 2_000_000_000n : at - 200_000_000n).toString()
+    };
+  }
+  const server = fakeServer(url => {
+    if (url.pathname.endsWith('/snapshot')) {
+      return json({t_ns: at.toString(), channels: snapChannels});
+    }
+    return undefined;
+  });
+  const rec = new RecordedSource(SERVER, 's1', channels, BOUNDS, server.fetchFn, fakeClock().clock);
+  rec.seek(at.toString());
+  await settle();
+
+  const studio = createStaticStudio();
+  studio.openRecorded(rec);
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <inspectorPanel.component config={inspectorPanel.defaultConfig}
+                                  setConfig={() => {}} instanceId="insp"/>
+      </StudioProvider>);
+  assert.match(html, /ch_000/);
+  assert.match(html, /ch_001/);
+  assert.match(html, /STALE/);
+  // Series request must be capped at MAX_RECORDED_SPARKLINE_CHANNELS (64),
+  // not all 94 dictionary channels!
+  const seriesCalls = server.of('/series');
+  assert.equal(seriesCalls.length, 1);
+  const requested = seriesCalls[0].url.searchParams.get('c')!.split(',');
+  assert.equal(requested.length, MAX_RECORDED_SPARKLINE_CHANNELS);
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41: Hardware, Subsystems, Pose3d, Vision and Frames all render
+// cleanly on recorded sessions without leaking stale live system state.
+test('Hardware, Subsystems, Pose3d, Vision and Frames render recorded sessions honestly', async () => {
+  const at = START + 5_000_000_000n;
+  const channels: ChannelInfo[] = [
+    'hw/status/battery_v',
+    'hw/status/can_bus_count',
+    'hw/status/can_buses/0/read_state',
+    'hw/status/can_buses/0/utilization_frac',
+    'hw/status/can_buses/1/read_state',
+    'hw/status/can_buses/1/utilization_frac',
+    'shooter/state/enabled',
+    'shooter/state/target_velocity_rps',
+    'shooter/state/flywheel_velocity_rps',
+    'pose_estimator/state/pose/x_m',
+    'pose_estimator/state/pose/y_m',
+    'pose_estimator/state/pose/yaw_rad',
+    'pose_estimator/state/valid',
+    'pose_estimator/state/observation_accepted_count',
+    'pose_estimator/state/observation_rejected_count',
+    'front_cam/state/pose/x_m',
+    'front_cam/state/pose/y_m',
+    'front_cam/state/x_std_m',
+    'front_cam/state/y_std_m',
+    'front_cam/state/yaw_std_rad',
+    'front_cam/state/tag_count',
+    'front_cam/state/valid',
+    'front_cam/state/sample_time_ns',
+    'front_cam/status/healthy',
+    'front_cam/status/frame_period_us',
+    'front_cam/status/last_latency_us',
+    'front_cam/status/visible_tag_count',
+    'front_cam/status/frames_dropped_count'
+  ].map(name => ({name, unit: name.endsWith('_rps') ? 'rps' : '', labels: []}));
+
+  const s = (value: number, age = 0n) => ({value, sample_ns: (at - age).toString()});
+  const server = fakeServer(url => {
+    if (url.pathname.endsWith('/snapshot')) {
+      return json({
+        t_ns: at.toString(),
+        channels: {
+          'hw/status/battery_v': s(12.34),
+          'hw/status/can_bus_count': s(2),
+          'hw/status/can_buses/0/read_state': s(1),
+          'hw/status/can_buses/0/utilization_frac': s(0.2),
+          'hw/status/can_buses/1/read_state': s(1),
+          'hw/status/can_buses/1/utilization_frac': s(0.45),
+          'shooter/state/enabled': s(1),
+          'shooter/state/target_velocity_rps': s(60),
+          'shooter/state/flywheel_velocity_rps': s(57),
+          'pose_estimator/state/pose/x_m': s(3.0),
+          'pose_estimator/state/pose/y_m': s(2.0),
+          'pose_estimator/state/pose/yaw_rad': s(0.5),
+          'pose_estimator/state/valid': s(1),
+          'front_cam/status/healthy': s(1),
+          'front_cam/status/frame_period_us': s(20000),
+          'front_cam/status/last_latency_us': s(15000),
+          'front_cam/status/visible_tag_count': s(3)
+        }
+      });
+    }
+    return undefined;
+  });
+
+  const recDeclared = {
+    version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'RecordedCanivore']
+  };
+  const rec = new RecordedSource(SERVER, 's1', channels, BOUNDS, server.fetchFn,
+                                 fakeClock().clock, EMPTY_TIMELINE, recDeclared,
+                                 parseManifest(readFileSync(
+                                     new URL('./session_manifest.json', import.meta.url), 'utf8')));
+  rec.seek(at.toString());
+  await settle();
+
+  // Seed stale live system state to verify recorded panels ignore it.
+  const studio = createStaticStudio({
+    system: {
+      graph: parseSystemGraph(demoSystemGraph(50n)),
+      stale: false,
+      declared: {version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'StaleLiveBus']}
+    }
+  });
+  studio.openRecorded(rec);
+
+  const hwHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="hw"/>
+      </StudioProvider>);
+  assert.match(hwHtml, /12\.34 V/);
+  assert.match(hwHtml, /RecordedCanivore/);
+  assert.doesNotMatch(hwHtml, /StaleLiveBus/);
+
+  const subHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <subsystemsPanel.component config={subsystemsPanel.defaultConfig}
+                                   setConfig={() => {}} instanceId="sub"/>
+      </StudioProvider>);
+  assert.match(subHtml, /shooter/);
+  assert.match(subHtml, /no target node/);
+  assert.match(subHtml, /Δ -3\.000 rps/);
+
+  const poseHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <pose3dPanel.component config={pose3dPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="p3d"/>
+      </StudioProvider>);
+  assert.doesNotMatch(poseHtml, /Pose unavailable/);
+  assert.doesNotMatch(poseHtml, /Pose STALE/);
+
+  const visHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <visionPanel.component config={visionPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="vis"/>
+      </StudioProvider>);
+  assert.match(visHtml, /front_cam/);
+  assert.match(visHtml, /HEALTHY/);
+  assert.match(visHtml, /50\.0/);
+
+  const framesHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <framesPanel.component config={framesPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="fr"/>
+      </StudioProvider>);
+  assert.match(framesHtml, /Choose a recorded frames directory/);
+
+  studio.closeRecorded();
 });

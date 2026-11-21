@@ -84,6 +84,19 @@ test('observationErrors compares only accepted observations', () => {
     {t: 2, x: 1, y: 5},
     {t: 3, x: -1, y: 0}
   ]);
+
+  // Separate decimated recorded time axes: matches each valid observation to
+  // the nearest finite reference pose within 0.5 s and skips stale gaps.
+  const camTimes = [1.02, 2.04, 5.0];
+  const refTimes = [1.0, 2.0, 2.05, 8.0];
+  assert.deepEqual(
+      observationErrors(camTimes, [1.1, 2.2, 5.0], [10.3, 20.4, 50.0], [1, 1, 1],
+                        [1.0, 2.0, 2.1, 8.0], [10.0, 20.0, 20.1, 80.0], refTimes)
+          .map(p => ({t: p.t, x: Math.round(p.x * 100) / 100, y: Math.round(p.y * 100) / 100})),
+      [
+        {t: 1.02, x: 0.1, y: 0.3},
+        {t: 2.04, x: 0.1, y: 0.3}
+      ]);
 });
 
 // --- rendering --------------------------------------------------------------
