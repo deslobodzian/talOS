@@ -3200,7 +3200,12 @@ def _talos_repo_name_from_module(workspace_root):
                         and isinstance(kw.value, ast.Constant)
                         and isinstance(kw.value.value, str)):
                     kwargs[kw.arg] = kw.value.value
-            if kwargs.get("name") == "talos":
+            name = kwargs.get("name")
+            if (name is None and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)):
+                name = node.args[0].value
+            if name == "talos":
                 return kwargs.get("repo_name") or None
     return None
 

@@ -1250,11 +1250,11 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
   for (auto& [name, tracker] : subsystems_) {
     // One without a slot cannot be armed; each Tick's read retries the
     // claim, and the longest wait bounds the time to the next Tick.
-    if (!tracker.subscriber || !tracker.subscriber->registered()) continue;
-    if (wake_wait_.arm_reader(tracker.stall_guard, [&] {
-          return seams_.arm_request != nullptr
-                     ? seams_.arm_request(*tracker.subscriber)
-                     : tracker.subscriber->arm_wake();
+    auto* subscriber = tracker.subscriber.get();
+    if (!subscriber || !subscriber->registered()) continue;
+    if (wake_wait_.arm_reader(tracker.stall_guard, [this, subscriber] {
+          return seams_.arm_request != nullptr ? seams_.arm_request(*subscriber)
+                                               : subscriber->arm_wake();
         })) {
       retry_immediately = true;
     }

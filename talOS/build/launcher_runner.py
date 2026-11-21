@@ -56,14 +56,18 @@ def split_config(config, root=None):
     repo, rel = config.split("/", 1)
     if not repo or not rel:
         sys.exit(f"launcher_runner: invalid config rlocationpath: {config}")
-    if root:
+    if "+" in repo or "~" in repo:
+        sys.exit(f"launcher_runner: {config} is not in the main "
+                 "repository; the launcher reads a config by its "
+                 "workspace path")
+    if root and repo != "_main":
         mapping = parse_repo_mapping(os.path.join(root, "_repo_mapping"))
         if mapping:
             sources = {source for source, _, _ in mapping if source}
-            external_repos = {
+            external_repos = set(sources) | {
                 canonical for source, _, canonical in mapping
-                if source == "" and canonical and (
-                    "+" in canonical or "~" in canonical
+                if canonical and canonical != "_main" and (
+                    source != "" or "+" in canonical or "~" in canonical
                     or canonical in sources)
             }
             if repo in external_repos:
@@ -106,7 +110,7 @@ def workspace(tmp, launcher, config_rlocation):
         os.symlink(src, os.path.join(bazel_bin, entry))
     if not os.path.exists(os.path.join(bazel_bin, "external")):
         os.symlink(root, os.path.join(bazel_bin, "external"))
-    env = dict(os.environ, **r.EnvVars())
+    env = dict(os.environ, **(r.EnvVars() if r else {}))
     env["RUNFILES_DIR"] = root
     env.pop("PYTHONPATH", None)
     env.pop("BUILD_WORKSPACE_DIRECTORY", None)
