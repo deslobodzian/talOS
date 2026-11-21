@@ -454,6 +454,22 @@ jobs:
       # required for every RoboRIO target build.
       run: ./gradlew buildRio -Pcompanion=10.0.0.2
 
+    - name: Generate RoboRIO compilation database
+      # Export desktop compile_commands.json for clang-tidy-18 (CI-12).
+      run: ./gradlew setupCompileCommands
+
+    - name: Install clang-tidy
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-tidy-18
+
+    - name: Run clang-tidy on RoboRIO sources (observe)
+      # New lint gate starts in observe mode (AGENTS.md verification practice
+      # #9): reports lint findings without failing until its CI output is read,
+      # while still failing closed on missing DB/sources or compiler errors.
+      working-directory: .
+      run: python3 tools/run_rio_clang_tidy.py --observe
+
   rio-in-the-loop:
     name: RoboRIO program in the loop (WPILib sim)
     # The deployed RoboRIO program (Robot.cpp: its Driver Station loop,
