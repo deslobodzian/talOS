@@ -22,6 +22,33 @@ Hosts named below: the **bench** is BENCH.md's RoboRIO (image
 FRC_roboRIO_2026_v1.2, two cores) and CAN devices; the **Linux workstation**
 has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
+## 2026-11-21
+
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commits `d942b0b8` and
+`6037f7ff`, no hardware attached, idle. Measurements for `TODO.md` `LOG-8`,
+`TRACE-1`, `TEST-10`, and `TEST-22`:
+
+- **LOG-8: enabled simulation time-cut log window stays within 8/7 of the
+  printed window (`REQ-OPS-32`).** At `d942b0b8`, 60 s enabled teleop physics
+  simulation (`robot_physics_sim.toml` with `[robot] log_max_bytes = 33554432`,
+  `--mode-schedule teleop:60`, active stick demand from t=2 s): printed
+  `Event-log window 20331671 us` (`20.332 s`); all 6 logging members exited 0
+  with `log_capped = true`, `log_gap = false`, `recorder_failed = false` and
+  kept spans `hardware_node` `19.307 s` (`W/span = 1.0531`), `swerve_module`
+  `19.273 s` (`1.0549`), `teleop` `19.268 s` (`1.0552`), `telemetry` `19.185 s`
+  (`1.0597`), `gyro` `19.103 s` (`1.0643`), `motor` `18.938 s` (`1.0736`); worst
+  ratio `1.0736 <= 8/7 (1.1429)`.
+- **TRACE-1: macOS death and idle-timeout checks pass on the Mac mini.** At
+  `d942b0b8`, `bazel test --test_output=errors //talOS/launcher:launcher_death_test //studio/bridge:client_timeout_test`
+  passed (`launcher_death_test` 1.3 s, `client_timeout_test` 9.1 s). In Linux
+  CI run `44855147331` (`d942b0b8`), `//talOS/protocol:udp_address_change_test`
+  ran under `TALOS_REQUIRE_NETNS=1` and passed in 0.2 s (0 skips).
+- **TEST-10 & TEST-22: repeated macOS runs pass with 0 failures.** At
+  `6037f7ff`, `bazel test --nocache_test_results --runs_per_test=5` passed
+  `//talOS/launcher:launcher_test` (20/20 shard runs, max 51.2 s),
+  `//talOS/launcher:supervision_test` (15/15 shard runs, max 71.9 s), and
+  `//talOS/bridge:run_timing_test` (5/5 runs, max 0.1 s).
+
 ## 2026-11-20
 
 Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `1218376d`, no
