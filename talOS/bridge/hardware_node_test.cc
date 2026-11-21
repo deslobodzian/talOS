@@ -1471,7 +1471,8 @@ bool NeverCaughtUp(ipc::Subscriber<Packet>& /*subscriber*/) { return false; }
 // the loop waits for its next duty anyway: it cannot spin. Each request
 // topic whose failed arm the guard stops holding the loop awake counts once
 // in stalled_arms, which reaches the bridge's registry row (TODO.md RT-7),
-// until a read returns a request from that topic.
+// stays stalled across subsequent passes without re-spinning, and arms fresh
+// again once a read returns a request from that topic.
 // REQ-RT-20, REQ-OPS-43
 TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -1482,10 +1483,10 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   ASSERT_TRUE(reader.has_value());
   node.set_seams({.arm_request = &NeverCaughtUp});
   uint64_t now_us = 1'000'000;
-  // kMaxIdlePasses immediate passes, then one that waits (the guard) until
-  // the time it returns, where the next pass runs.
-  const auto stall = [&node, &now_us] {
-    for (uint64_t i = 0; i < HardwareNode::kMaxIdlePasses; ++i, ++now_us) {
+  // `retries` immediate passes, then one that waits (the guard) until the time
+  // it returns, where the next pass runs.
+  const auto stall = [&node, &now_us](uint64_t retries) {
+    for (uint64_t i = 0; i < retries; ++i, ++now_us) {
       EXPECT_EQ(node.Pass(now_us).until_us, now_us) << i;
     }
     const HardwareNode::Wait wait = node.Pass(now_us);
@@ -1495,19 +1496,23 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
     now_us = wait.until_us;
     return waited_us;
   };
-  EXPECT_EQ(stall(), 10'000u);  // the longest wait
+  EXPECT_EQ(stall(HardwareNode::kMaxIdlePasses), 10'000u);  // the longest wait
   // Both subsystems' arms (drivetrain, intake) stalled.
   EXPECT_EQ(node.wakeups().stalled_arms, 2u);
-  stall();
+  // Once stalled, subsequent passes wait immediately (here until the next
+  // 20 ms /hw/status duty) without re-spinning or recounting stalled_arms.
+  EXPECT_EQ(stall(0), 10'000u - HardwareNode::kMaxIdlePasses);
   EXPECT_EQ(node.wakeups().stalled_arms, 2u) << "once per stall, not per pass";
 
   ipc::Publisher<Packet> intake{RequestTopic("intake")};
   Command request{};
   request.config_id = NodeConfigId(cfg);
   PublishCommand(intake, request);
+  // Reading intake's request resets intake's StallGuard; its failed arm in the
+  // same pass uses the first of its kMaxIdlePasses retries.
   EXPECT_EQ(node.Pass(now_us).until_us, now_us) << "read the request";
   ++now_us;
-  stall();
+  EXPECT_GT(stall(HardwareNode::kMaxIdlePasses - 1), 0u);
   EXPECT_EQ(node.wakeups().stalled_arms, 3u) << "intake stalled again";
 
   node.PublishIntrospection();
@@ -1520,6 +1525,67 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   }
   ASSERT_TRUE(bridge.has_value());
   EXPECT_EQ(bridge->delivery_loss().stalled_arms, 3u);
+}
+
+// Guards ARCH-5 / RT-7: each request subscriber tracks its own StallGuard via
+// WakeChannelWait::arm_reader, so steady UDP State datagrams arriving on every
+// tick must NOT reset a stalled request subscriber's guard or hide it from
+// stalled_arms.
+// REQ-RT-20, REQ-OPS-43
+TEST(HardwareNodeTest, StalledRequestArmTripsUnderSteadyUdpTraffic) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
+  node.set_seams({.arm_request = &NeverCaughtUp});
+
+  uint64_t now_us = 1'000'000;
+  uint64_t sample_us = 1'000;
+  const uint64_t config_id = NodeConfigId(cfg);
+  const auto pass_with_udp_state = [&]() {
+    sample_us += 1'000;
+    const uint64_t states_before = node.states_received();
+    EXPECT_TRUE(
+        SendState(link.gateway, TrustState(config_id, 11, 1, sample_us)));
+    EXPECT_TRUE(DatagramQueued(node));
+    const HardwareNode::Wait wait = node.Pass(now_us);
+    EXPECT_EQ(node.states_received(), states_before + 1)
+        << "each pass must consume a UDP datagram";
+    return wait;
+  };
+
+  // kMaxIdlePasses retries, each consuming a real UDP datagram, then the next
+  // pass trips both request subscribers' guards and waits instead of spinning.
+  for (uint64_t i = 0; i < HardwareNode::kMaxIdlePasses; ++i, now_us += 2'000) {
+    const HardwareNode::Wait wait = pass_with_udp_state();
+    EXPECT_FALSE(wait.ignore_input) << i;
+    EXPECT_EQ(wait.until_us, now_us) << i;
+  }
+  const HardwareNode::Wait tripped = pass_with_udp_state();
+  EXPECT_FALSE(tripped.ignore_input);
+  EXPECT_GT(tripped.until_us, now_us)
+      << "stalled request arms must stop spinning even with UDP traffic";
+  EXPECT_EQ(node.wakeups().stalled_arms, 2u);
+
+  // Another pass with another UDP datagram stays stalled without recounting.
+  now_us += 2'000;
+  const HardwareNode::Wait still_stalled = pass_with_udp_state();
+  EXPECT_FALSE(still_stalled.ignore_input);
+  EXPECT_GT(still_stalled.until_us, now_us);
+  EXPECT_EQ(node.wakeups().stalled_arms, 2u);
+
+  node.PublishIntrospection();
+  std::optional<introspect::NodeSnapshot> bridge;
+  for (auto& row : reader->nodes()) {
+    if (row.name == kNodeName &&
+        row.pid == static_cast<std::uint64_t>(getpid()) &&
+        (!bridge || row.generation > bridge->generation))
+      bridge = std::move(row);
+  }
+  ASSERT_TRUE(bridge.has_value());
+  EXPECT_EQ(bridge->delivery_loss().stalled_arms, 2u);
 }
 
 // A UDP socket bound to `port` on every address, so binding the port again

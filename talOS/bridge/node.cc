@@ -384,18 +384,18 @@ void HardwareNode::PublishIntrospection() {
     set(tracker.source_index, tracker.requests, tracker.requests_skipped);
   }
 
-  // The bridge's loop is its own, so its wake loss is too: the wake
-  // notifications its publishers failed to send, the request topics whose
-  // failed arms its idle-pass guard (kMaxIdlePasses) stopped holding it
-  // awake, and the runs that could not wait on their inputs (OpenWaits).
+  // The bridge's loop composes WakeChannelWait for its request-subscriber
+  // wake channel: report the wake notifications its publishers failed to send
+  // alongside WakeChannelWait's stalled_arms and wake_fallbacks.
   std::uint64_t wake_failures = 0;
   for (auto* publisher : {state_pub_.get(), cmd_pub_.get(), ds_pub_.get()}) {
     if (publisher != nullptr)
       wake_failures += publisher->queue().wake_failures();
   }
   if (status_pub_) wake_failures += status_pub_->queue().wake_failures();
-  registration_->set_wake_loss(wake_failures, wakeups_.stalled_arms,
-                               wakeups_.wait_fallbacks);
+  const event::WakeLoss wake_loss = wake_wait_.loss();
+  registration_->set_wake_loss(wake_failures, wake_loss.stalled_arms,
+                               wake_loss.wake_fallbacks);
   registration_->end_sample();
 }
 
@@ -1206,24 +1206,24 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
   next_liveness_us_ = now_us + kLivenessBackstopUs;
 
   // Every request subscriber is armed before the loop may sleep: a request
-  // published after its arm notifies request_wake_, and one published
-  // before it fails the arm (talOS/rtms README.md "Wake channel").
-  bool input_waiting = tick_receive_capped_;
+  // published after its arm notifies wake_wait_, and one published before it
+  // fails the arm (talOS/rtms README.md "Wake channel"). Each subscriber runs
+  // its own StallGuard through WakeChannelWait::arm_reader so steady UDP
+  // traffic or another active subsystem cannot mask a stalled request arm.
+  bool retry_immediately = tick_receive_capped_;
   for (auto& [name, tracker] : subsystems_) {
-    tracker.arm_failed = false;
     // One without a slot cannot be armed; each Tick's read retries the
     // claim, and the longest wait bounds the time to the next Tick.
     if (!tracker.subscriber || !tracker.subscriber->registered()) continue;
-    const bool caught_up = seams_.arm_request != nullptr
-                               ? seams_.arm_request(*tracker.subscriber)
-                               : tracker.subscriber->arm_wake();
-    if (caught_up) {
-      tracker.stall_guard.reset();
-    } else {
-      tracker.arm_failed = true;
-      input_waiting = true;
+    if (wake_wait_.arm_reader(tracker.stall_guard, [&] {
+          return seams_.arm_request != nullptr
+                     ? seams_.arm_request(*tracker.subscriber)
+                     : tracker.subscriber->arm_wake();
+        })) {
+      retry_immediately = true;
     }
   }
+  wakeups_.stalled_arms = wake_wait_.loss().stalled_arms;
 
   const uint64_t timed_us =
       std::min({NextDutyUs(now_us), next_liveness_us_, next_introspection_us_,
@@ -1241,36 +1241,19 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
       cpu_window_datagrams_ >= kDatagramBudget) {
     // Spent: input waits for the window's end, a duty does not.
     ++wakeups_.throttled;
-    idle_guard_.reset();
     return {std::min(cpu_window_start_us_ + kCpuWindowUs, timed_us), true};
   }
 
-  if (input_waiting) {
-    if (tick_datagrams_ > 0 || tick_requests_ > 0) {
-      idle_guard_.reset();
-      return {now_us, false};
-    }
-    if (idle_guard_.on_failed_arm() == event::StallAction::kRetry) {
-      return {now_us, false};
-    }
-    // The guard: each topic whose failed arm it now stops holding the loop
-    // awake is a stalled arm, counted once until it arms or delivers again,
-    // as an event loop counts its watchers' (Activity::stalled_arms).
-    for (auto& [name, tracker] : subsystems_) {
-      if (tracker.arm_failed &&
-          tracker.stall_guard.on_failed_arm() == event::StallAction::kTripped) {
-        ++wakeups_.stalled_arms;
-      }
-    }
+  if (retry_immediately) {
+    return {now_us, false};
   }
-  idle_guard_.reset();
   return {timed_us, false};
 }
 
 bool HardwareNode::OpenWaits() {
   // The loop sleeps until there is something to do: a datagram from the
   // gateway, a request on any /hw/request topic (each subscriber's slot
-  // names request_wake_), a stop, or the next time-driven duty.
+  // names wake_wait_), a stop, or the next time-driven duty.
   try {
     poller_.emplace();
     if (peer_.NativeFd() >= 0) {
@@ -1278,12 +1261,14 @@ bool HardwareNode::OpenWaits() {
     } else if (!socket_lost_) {
       throw std::runtime_error("the UDP socket has no fd");
     }
-    if (seams_.make_wake_receiver != nullptr) {
-      request_wake_.emplace(seams_.make_wake_receiver());
-    } else {
-      request_wake_.emplace();
+    if (!wake_wait_.open(*poller_, "hardware_node: cannot wait for input",
+                         static_cast<std::int64_t>(kRetryUs),
+                         seams_.make_wake_receiver)) {
+      CloseWaits();
+      max_wait_us_ = kRetryUs;
+      wakeups_.wait_fallbacks = wake_wait_.loss().wake_fallbacks;
+      return false;
     }
-    poller_->add_fd(request_wake_->fd());
     // A stop (SIGINT, SIGTERM, process::RequestStop) makes the stop pipe
     // readable, which ends the wait at once.
     if (const int stop_fd = talos::process::StopFd(); stop_fd >= 0) {
@@ -1291,7 +1276,7 @@ bool HardwareNode::OpenWaits() {
     }
     for (auto& [name, tracker] : subsystems_) {
       if (tracker.subscriber) {
-        tracker.subscriber->set_wake_receiver(request_wake_->id());
+        tracker.subscriber->set_wake_receiver(wake_wait_.id());
       }
     }
     max_wait_us_ = kMaxWaitUs;
@@ -1307,18 +1292,16 @@ void HardwareNode::FallBackToPolling(const char* reason) {
   // pass every kRetryUs, as a node's loop falls back to polling.
   CloseWaits();
   max_wait_us_ = kRetryUs;
-  ++wakeups_.wait_fallbacks;
-  std::fprintf(stderr,
-               "hardware_node: cannot wait for input (%s); polling it "
-               "every %llu us\n",
-               reason, static_cast<unsigned long long>(kRetryUs));
+  wake_wait_.record_fallback("hardware_node: cannot wait for input", reason,
+                             static_cast<std::int64_t>(kRetryUs));
+  wakeups_.wait_fallbacks = wake_wait_.loss().wake_fallbacks;
 }
 
 void HardwareNode::CloseWaits() {
   for (auto& [name, tracker] : subsystems_) {
     if (tracker.subscriber) tracker.subscriber->set_wake_receiver(0);
   }
-  request_wake_.reset();
+  wake_wait_.close();
   poller_.reset();
 }
 
@@ -1362,7 +1345,7 @@ int HardwareNode::Run(int duration_s) {
   // that break still counts as a run that reached its duration.
   bool reached_duration = false;
   while (!talos::process::stop_requested.load()) {
-    if (request_wake_) request_wake_->drain();
+    wake_wait_.drain();
     const uint64_t now_us = clock_us();
     if (now_us >= end_us) {
       reached_duration = true;

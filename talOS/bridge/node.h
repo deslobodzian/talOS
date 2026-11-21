@@ -20,6 +20,7 @@
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/events/stall_guard.h"
+#include "talOS/events/wake_channel_wait.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/config_wire.h"
 #include "talOS/hardware/messages.h"
@@ -95,12 +96,11 @@ struct SubsystemTracker {
   // node's wakes to the bridge fail or the bridge falls behind, and this
   // subsystem merges at a fraction of its rate (TODO.md RT-7).
   uint64_t requests_skipped{0};
-  // HardwareNode::Pass()'s idle-pass guard (kMaxIdlePasses): whether this
-  // topic's arm failed in the last pass, and the per-topic stall latch so the
-  // guard counts it once in Wakeups::stalled_arms until its arm succeeds or a
-  // read returns a request from it.
-  bool arm_failed{false};
-  event::StallGuard stall_guard{0};
+  // Per-topic wake-arm stall guard (WakeChannelWait::arm_reader): reset on a
+  // clean arm or when Tick() reads a request from this topic; trips once in
+  // Wakeups::stalled_arms after kMaxIdlePasses consecutive failed arms without
+  // read progress, independent of UDP datagrams or other topics.
+  event::StallGuard stall_guard{event::StallGuard::kDefaultMaxStalled};
 
   // Positions in the merged command of the actuators this subsystem owns,
   // resolved from `devices` by HardwareNode::IndexActuators so a timeout
@@ -465,10 +465,11 @@ class HardwareNode {
     void* context{nullptr};
   };
   FrameSink frame_sink_{};
-  // What every request subscriber's reader slot names while Run() waits.
-  // Declared before subsystems_, so their slots are released first and no
-  // publisher notifies a closed receiver.
-  std::optional<WakeReceiver> request_wake_;
+  // Shared wake-channel wait helper owning the WakeReceiver every request
+  // subscriber's reader slot names while Run() waits, plus atomic wake-loss
+  // counters. Declared before subsystems_, so their slots are released first
+  // and no publisher notifies a closed receiver.
+  event::WakeChannelWait wake_wait_;
   // Run()'s waits (OpenWaits); empty while it cannot build one.
   std::optional<event::Poller> poller_;
   Seams seams_{};
@@ -505,8 +506,6 @@ class HardwareNode {
   uint32_t tick_datagrams_{0};
   uint32_t tick_requests_{0};
   bool tick_receive_capped_{false};
-  // Consecutive passes that found input waiting but consumed none.
-  event::StallGuard idle_guard_{kMaxIdlePasses};
   // The current CPU budget window: its start, and its passes and datagrams.
   uint64_t cpu_window_start_us_{0};
   uint64_t cpu_window_passes_{0};
