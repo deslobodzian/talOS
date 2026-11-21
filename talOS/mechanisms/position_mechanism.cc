@@ -37,8 +37,9 @@ bool ParseMotionMagic(const Params& params) {
   params.fail("control", "must be \"motion_magic\" or \"position\"");
 }
 
-// Both acquisition times known and at most `bound` apart.
-bool Aligned(std::optional<Time> a, std::optional<Time> b, Duration bound) {
+// Both sample ages at the same latched State known and at most `bound` apart.
+bool Aligned(std::optional<Duration> a, std::optional<Duration> b,
+             Duration bound) {
   return a.has_value() && b.has_value() &&
          (*a > *b ? *a - *b : *b - *a) <= bound;
 }
@@ -304,8 +305,7 @@ void PositionMechanism::update() {
   if (!motor_.zeroed()) settling_ = false;  // a dropped zero homes again
   if (absolute_.has_value() && !motor_.zeroed() && connected_ &&
       absolute_->connected() &&
-      Aligned(motor_.position_time(), absolute_->position_time(),
-              rezero_skew_)) {
+      Aligned(motor_.position_age(), absolute_->position_age(), rezero_skew_)) {
     motor_.rezero(absolute_->position() * absolute_rot_per_sensor_rot_ +
                   absolute_offset_rot_);
   }

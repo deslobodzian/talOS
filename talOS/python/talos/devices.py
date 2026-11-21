@@ -152,6 +152,14 @@ class _TimedInput(_Input):
 
 
 class _PositionTimedInput(_TimedInput):
+    _AGE = None  # its talos_*_age entry point
+
+    def _age(self, velocity):
+        age = ctypes.c_int64()
+        found = _abi.ok(self._AGE(
+            self._node, self._index, velocity, ctypes.byref(age)))
+        return age.value if found else None
+
     @property
     def position_time(self):
         """Acquisition time, integer node-clock ns, or None if unavailable."""
@@ -161,6 +169,19 @@ class _PositionTimedInput(_TimedInput):
     def velocity_time(self):
         """Acquisition time, integer node-clock ns, or None if unavailable."""
         return self._time(True)
+
+    @property
+    def position_age(self):
+        """The position sample's age at the State it arrived in, integer ns:
+        read from the State, so known without the clock mapping position_time
+        needs. None unless connected, or when the age is unknown."""
+        return self._age(False)
+
+    @property
+    def velocity_age(self):
+        """The velocity sample's age at its State, integer ns, or None, as
+        position_age."""
+        return self._age(True)
 
 
 class _Rezeroable:
@@ -189,28 +210,9 @@ class Motor(_Rezeroable, _PositionTimedInput):
     _KIND = _abi.DEVICE_MOTOR
     _SAMPLE = lib.talos_motor_sample
     _TIME = lib.talos_motor_time
+    _AGE = lib.talos_motor_age
     _REZERO = lib.talos_motor_rezero
     _ZEROED = lib.talos_motor_zeroed
-
-    def _age(self, velocity):
-        age = ctypes.c_int64()
-        found = _abi.ok(lib.talos_motor_age(
-            self._node, self._index, velocity, ctypes.byref(age)))
-        return age.value if found else None
-
-    @property
-    def position_age(self):
-        """The position sample's age at the State it arrived in, integer ns
-        (Motor::position_age): read from the State, so known without the
-        clock mapping position_time needs. None unless connected, or when
-        the age is unknown."""
-        return self._age(False)
-
-    @property
-    def velocity_age(self):
-        """The velocity sample's age at its State, integer ns, or None, as
-        position_age."""
-        return self._age(True)
 
     def rezero(self, position_rot=0):
         """Set the node-shared software position on connected finite feedback.
@@ -307,6 +309,7 @@ class CANcoder(_PositionTimedInput):
     _KIND = _abi.DEVICE_CANCODER
     _SAMPLE = lib.talos_sensor_sample
     _TIME = lib.talos_sensor_time
+    _AGE = lib.talos_sensor_age
 
     @property
     def position(self):  # rotations

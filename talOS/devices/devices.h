@@ -253,6 +253,11 @@ class CANcoder {
   bool connected() const;   // sample valid and hardware state fresh
   std::optional<Time> position_time() const;
   std::optional<Time> velocity_time() const;
+  // How old each signal's sample was at the State it arrived in, like
+  // Motor::position_age / velocity_age: known from the first accepted State,
+  // nullopt unless connected() or when the age is unknown (UINT32_MAX).
+  std::optional<Duration> position_age() const;
+  std::optional<Duration> velocity_age() const;
 
  private:
   HardwareLink* link_{nullptr};

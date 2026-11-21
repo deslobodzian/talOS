@@ -605,9 +605,12 @@ TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
   EXPECT_EQ(mech.a.position_time(), std::nullopt);
   EXPECT_EQ(mech.cc.velocity_time(), std::nullopt);
   EXPECT_EQ(mech.gyro.yaw_time(), std::nullopt);
-  // A motor's ages come from the State itself: known before the mapping.
+  // A motor's and CANcoder's ages come from the State itself: known before the
+  // mapping.
   EXPECT_EQ(mech.a.position_age(), 1ms);
   EXPECT_EQ(mech.a.velocity_age(), 3ms);
+  EXPECT_EQ(mech.cc.position_age(), 2ms);
+  EXPECT_EQ(mech.cc.velocity_age(), 4ms);
   sim.step(40ms);
   ASSERT_TRUE(link.sample_time());
   const Time sampled = *link.sample_time();
@@ -626,21 +629,33 @@ TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
   EXPECT_FALSE(mech.a.connected());
   EXPECT_EQ(mech.a.velocity_time(), std::nullopt);
   EXPECT_EQ(mech.a.velocity_age(), std::nullopt);
+  EXPECT_FALSE(mech.cc.connected());
   EXPECT_EQ(mech.cc.position_time(), std::nullopt);
+  EXPECT_EQ(mech.cc.position_age(), std::nullopt);
+  EXPECT_EQ(mech.cc.velocity_age(), std::nullopt);
   EXPECT_EQ(mech.gyro.yaw_rate_time(), std::nullopt);
   hw->set_motor("mech", "a", 1.5, -2.0, 1000, 3000);
+  hw->set_cancoder("mech", "cc", 0.2, 0.3, 2000, 4000);
   hw->set_connected("mech", "a", false);
+  hw->set_connected("mech", "cc", false);
   sim.step(10ms);
   EXPECT_EQ(mech.a.velocity_time(), std::nullopt);
   EXPECT_EQ(mech.a.position_age(), std::nullopt);
+  EXPECT_EQ(mech.cc.position_age(), std::nullopt);
+  EXPECT_EQ(mech.cc.velocity_age(), std::nullopt);
   hw->set_connected("mech", "a", true);
+  hw->set_connected("mech", "cc", true);
   sim.step(10ms);
   ASSERT_EQ(mech.a.velocity_age(), 3ms);
+  ASSERT_EQ(mech.cc.position_age(), 2ms);
+  ASSERT_EQ(mech.cc.velocity_age(), 4ms);
   hw.reset();
   sim.step(150ms);
   EXPECT_EQ(mech.a.position_time(), std::nullopt);
   EXPECT_EQ(mech.a.velocity_age(), std::nullopt) << "stale State";
   EXPECT_EQ(mech.cc.position_time(), std::nullopt);
+  EXPECT_EQ(mech.cc.position_age(), std::nullopt) << "stale State";
+  EXPECT_EQ(mech.cc.velocity_age(), std::nullopt) << "stale State";
   EXPECT_EQ(mech.gyro.yaw_rate_time(), std::nullopt);
 }
 

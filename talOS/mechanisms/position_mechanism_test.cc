@@ -1062,6 +1062,43 @@ TEST(PositionMechanism, AbsoluteHomingWaitsForAlignedSamples) {
   EXPECT_EQ(wrist.Applied().mode, Mode::kMotionMagic);
 }
 
+// REQ-SAFE-05: absolute homing compares sample ages from the same latched
+// State (position_age()), so it homes before the bridge's clock mapping
+// converges, and refuses an unknown age (UINT32_MAX).
+// REQ-SAFE-36
+TEST(PositionMechanism,
+     AbsoluteHomingBeforeClockMappingConvergesAndRefusesUnknownAge) {
+  {
+    Rig wrist{"wrist"};
+    const auto& link = wrist.sim.node("wrist").extension<HardwareLink>();
+    wrist.SetMotor(5.0, 1.0);
+    wrist.hw.set_cancoder("wrist", "angle", 0.1, 1.0, 2'000, 0);
+    wrist.Start();  // 10 ms: short of the 8 states the mapping needs
+    ASSERT_FALSE(link.sample_time()) << "the mapping has converged already";
+    EXPECT_TRUE(wrist.mech().homed());
+    EXPECT_NEAR(wrist.mech().position_rot(), 0.35, 1e-9);
+    wrist.Drive(0.35, 10ms);
+    ASSERT_FALSE(link.sample_time()) << "the mapping has converged already";
+    EXPECT_EQ(wrist.Applied().mode, Mode::kMotionMagic);
+    EXPECT_NEAR(wrist.Applied().demand, 5.0, 1e-9);
+  }
+  {
+    Rig wrist{"wrist"};
+    wrist.SetMotor(5.0, 1.0);
+    wrist.hw.set_cancoder("wrist", "angle", 0.1, 1.0, UINT32_MAX, 0);
+    wrist.Start();
+    wrist.Drive(0.35, 80ms);
+    EXPECT_FALSE(wrist.mech().homed());
+    EXPECT_EQ(wrist.mech().phase(), PositionPhase::kUnhomed);
+    wrist.ExpectNeutral();
+
+    wrist.hw.set_cancoder("wrist", "angle", 0.1, 1.0, 4'000, 0);
+    wrist.Drive(0.35, 20ms);
+    EXPECT_TRUE(wrist.mech().homed());
+    EXPECT_NEAR(wrist.mech().position_rot(), 0.35, 1e-9);
+  }
+}
+
 // A goal short of the target that stops moving faults (stall), latched
 // neutral; a stale link does not clear it, a Driver Station disable does.
 // REQ-SAFE-36

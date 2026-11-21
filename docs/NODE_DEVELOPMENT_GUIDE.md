@@ -279,7 +279,7 @@ Handles are named by their device key in the subsystem config
 | `node.extension<talos::HardwareLink>().sample_time()`: node-clock `Time` the latest hardware state was sampled at, `nullopt` while stale or before the bridge's clock mapping converges (8 states) | `talos.hardware_sample_time_ns(node)` (int ns, or `None`) |
 | `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
 | `Motor` / `CANcoder`: `position_time()`, `velocity_time()`; `Gyro`: `yaw_time()`, `yaw_rate_time()` | same names as properties: integer node-clock nanoseconds, or `None` |
-| `Motor`: `position_age()`, `velocity_age()`: the sample's age at the State it arrived in, `std::optional<Duration>`, read from that State (no clock mapping needed); `nullopt` unless `connected()` or when the age is unknown | same names as properties: integer nanoseconds, or `None` |
+| `Motor` / `CANcoder`: `position_age()`, `velocity_age()`: the sample's age at the State it arrived in, `std::optional<Duration>`, read from that State (no clock mapping needed); `nullopt` unless `connected()` or when the age is unknown | same names as properties: integer nanoseconds, or `None` |
 
 Actuator flush and disable semantics are in
 [Architecture: The tick](../ARCHITECTURE.md#the-tick).
@@ -356,9 +356,9 @@ one status period old when the RoboRIO reads it; the second period absorbs
 jitter. A refused rezero changes nothing (`zeroed()` stays as it was), so a
 homing node calls it again on a later tick, as `PositionMechanism` does.
 `PositionMechanism`'s absolute homing also requires the CANcoder and motor
-positions it combines to have been acquired within the same bound of each
-other (`position_time()`, so not before the bridge's clock mapping
-converges).
+positions it combines to have sample ages (`position_age()`, read from the
+same State) within the same bound of each other, so it does not wait for
+the bridge's clock mapping either.
 Motor position and gyro yaw subtract the offset; velocity/rate are unchanged.
 Motor position and motion-magic goals translate back to hardware coordinates
 before clamping. Configured soft limits remain in the **hardware frame**,
