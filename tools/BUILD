@@ -512,9 +512,9 @@ py_test(
     deps = ["@rules_python//python/runfiles"],
 )
 
-# python3 tools/run_rio_clang_tidy.py (CI's roborio job)
+# python3 tools/run_rio_clang_tidy.py (CI's rio-adapter job)
 # Sanitizes GradleRIO's compile_commands.json and runs clang-tidy-18 over
-# controller_processor/rio/src/main/cpp/*.cpp (CI-12).
+# controller_processor/rio/src/main/cpp and src/main/include (CI-12).
 py_test(
     name = "run_rio_clang_tidy_test",
     size = "small",

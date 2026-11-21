@@ -3656,32 +3656,43 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
     };
     if (WaitFor(stop, ready) && observe_pass()) {
       std::ofstream{hang}.close();
-      // Step across studio_bridge's 1 s stall timeout in 250 ms increments
-      // until the launcher records the stall (an extra step absorbs any
-      // dispatch the bridge emitted just before observing `hang`), then step
-      // to its scheduled restart without depending on host wall-clock timing.
+      // Step across studio_bridge's 1 s stall timeout in 250 ms increments,
+      // letting supervision observe each step before advancing again so a
+      // step cannot overshoot the 50 ms restart backoff and race
+      // ManifestWriter on history.size() == 1 vs 2.
       int64_t retry_at = 0;
+      bool already_restarted = false;
       const auto bridge_stalled = [&] {
         const std::string manifest = ReadFile(live);
         retry_at = EntryInteger(ManifestEntry(manifest, "studio_bridge"),
                                 "retry_at_monotonic_ns");
         const auto history = ManifestRuns(manifest, "studio_bridge");
-        return history.size() == 1 &&
-               history.back().find("\"reason\": \"stalled\"") !=
-                   std::string::npos &&
-               retry_at > 0;
+        if (history.empty() ||
+            history[0].find("\"reason\": \"stalled\"") == std::string::npos) {
+          return false;
+        }
+        if (history.size() >= 2) {
+          already_restarted = true;
+          return true;
+        }
+        return retry_at > 0;
       };
       bool stalled = false;
       for (int step = 0; step < 12 && !stalled; ++step) {
         if (!AdvanceClockWithHealthyNodes(stop, clock, passes, session, now,
-                                          now + 250ms))
+                                          now + 250ms) ||
+            !observe_pass()) {
           break;
+        }
         stalled = bridge_stalled();
       }
       if (!stalled) stalled = WaitFor(stop, bridge_stalled);
-      if (stalled && AdvanceClockWithHealthyNodes(
-                         stop, clock, passes, session, now,
-                         SupervisionTime{std::chrono::nanoseconds{retry_at}})) {
+      const bool reached_restart_time =
+          stalled && (already_restarted ||
+                      AdvanceClockWithHealthyNodes(
+                          stop, clock, passes, session, now,
+                          SupervisionTime{std::chrono::nanoseconds{retry_at}}));
+      if (reached_restart_time) {
         restarted = WaitFor(stop, [&] {
           return ReadLines(bridge_runs).size() == 2 &&
                  Registered("studio_bridge", session);
