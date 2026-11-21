@@ -2,16 +2,18 @@
 """Run clang-tidy-18 on controller_processor/rio's GradleRIO compile_commands.json.
 
 GradleRIO emits -nostdinc plus host GCC -isystem directories (including GCC's
-private intrinsics directory, which breaks Clang on xmmintrin.h). This script
-writes a sanitized copy of the compilation database to a temporary directory
-with -nostdinc and host GCC/system -isystem entries removed so clang-tidy-18
-uses Clang's own builtin headers and compatible C++ standard library, while
-keeping every WPILib, Phoenix 6, and talOS include flag intact.
+private intrinsics directory, which breaks Clang on xmmintrin.h, and Debian/
+Ubuntu multiarch C++ header directories that can mismatch clang-18's selected
+libstdc++). This script writes a sanitized copy of the compilation database to
+a temporary directory with -nostdinc and host GCC/system -isystem entries
+removed so clang-tidy-18 uses Clang's own builtin headers and compatible C++
+standard library, while keeping every WPILib, Phoenix 6, and talOS include flag
+intact.
 
-Setup errors (missing database, missing source in the database, missing
-clang-tidy binary, or compiler parse errors) always fail closed (exit 2),
-even under --observe. Lint findings exit 1 by default or 0 under --observe
-(AGENTS.md verification practice #9: a new gate starts by observing).
+Setup errors, tool crashes/config errors, missing sources, and compiler parse
+errors always fail closed (exit 2), even under --observe. Only genuine
+clang-tidy lint findings exit 0 under --observe (1 without --observe), per
+AGENTS.md verification practice #9.
 """
 
 import argparse
@@ -19,6 +21,7 @@ import concurrent.futures
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -32,18 +35,34 @@ DEFAULT_DB = pathlib.Path(
     'linuxx86-64release/compile_commands.json'
 )
 DEFAULT_SRC_DIR = pathlib.Path('controller_processor/rio/src/main/cpp')
+DEFAULT_HEADER_FILTER = r'^.*(controller_processor/rio/src/main/include|talOS)/.*'
 
 # Host GCC and system header directories stripped from GradleRIO's command
 # lines so Clang resolves its own resource intrinsics (xmmintrin.h) and
-# standard headers cleanly.
+# standard headers cleanly across Arch and Ubuntu (GCC 13/14/16).
 STRIP_ISYSTEM_MARKERS = (
     '/lib/gcc/',
-    '/include/c++/',
+    '/c++/',
 )
 STRIP_ISYSTEM_EXACT = frozenset({
     '/usr/include',
     '/usr/local/include',
 })
+
+TOOL_ERROR_MARKERS = (
+    '[clang-diagnostic-error]',
+    'Found compiler error(s).',
+    'LLVM ERROR:',
+    'Error parsing ',
+    'YAML:',
+    'Compile command not found',
+    'Unknown command line argument',
+    'error: unable to handle compilation',
+    'Error while trying to load a compilation database',
+)
+TIDY_DIAGNOSTIC_RE = re.compile(
+    r':\d+:\d+: (?:warning|error): .+ \[([^\]\s]+)\]'
+)
 
 
 def _is_host_gcc_isystem(path_str):
@@ -84,6 +103,13 @@ def sanitize_arguments(args, gcc_install_dir=''):
     return out
 
 
+def _resolve_entry_file(entry):
+    raw_file = pathlib.Path(entry['file'])
+    if not raw_file.is_absolute() and 'directory' in entry:
+        raw_file = pathlib.Path(entry['directory']) / raw_file
+    return raw_file.resolve()
+
+
 def sanitize_database(entries, gcc_install_dir=''):
     """Return a sanitized copy of a compile_commands.json entry list."""
     cleaned = []
@@ -98,6 +124,9 @@ def sanitize_database(entries, gcc_install_dir=''):
             copy.pop('command', None)
         else:
             continue
+        # Resolve symlinks (e.g. macOS /tmp -> /private/tmp) so entry['file']
+        # matches the resolved source path passed on clang-tidy's command line.
+        copy['file'] = str(_resolve_entry_file(copy))
         copy['arguments'] = sanitize_arguments(
             raw_args, gcc_install_dir=gcc_install_dir
         )
@@ -107,27 +136,37 @@ def sanitize_database(entries, gcc_install_dir=''):
 
 def collect_sources(src_dir, entries):
     """Return sorted absolute source paths and any sources missing from the DB."""
-    sources = sorted(p.resolve() for p in src_dir.glob('*.cpp'))
-    db_files = set()
-    for entry in entries:
-        raw_file = pathlib.Path(entry['file'])
-        if not raw_file.is_absolute() and 'directory' in entry:
-            raw_file = pathlib.Path(entry['directory']) / raw_file
-        db_files.add(raw_file.resolve())
+    sources = sorted(p.resolve() for p in src_dir.rglob('*.cpp'))
+    db_files = {_resolve_entry_file(entry) for entry in entries}
     missing = [p for p in sources if p not in db_files]
     return sources, missing
 
 
-def has_compiler_error(output):
-    return (
-        '[clang-diagnostic-error]' in output
-        or 'Found compiler error(s).' in output
+def is_lint_finding_only(returncode, output):
+    """True only when clang-tidy exited 1 solely due to non-compiler lint hits.
+
+    Any signal kill (returncode < 0), setup/CLI error (returncode > 1),
+    compiler parse error, YAML config error, or output without a tidy
+    diagnostic returns False so the caller fails closed (exit 2) even under
+    --observe.
+    """
+    if returncode != 1:
+        return False
+    if any(marker in output for marker in TOOL_ERROR_MARKERS):
+        return False
+    checks = TIDY_DIAGNOSTIC_RE.findall(output)
+    return bool(checks) and all(
+        'clang-diagnostic-error' not in check for check in checks
     )
 
 
-def run_one(tidy_bin, db_dir, source):
+def run_one(tidy_bin, db_dir, source, header_filter=DEFAULT_HEADER_FILTER):
+    cmd = [tidy_bin, '-p', str(db_dir)]
+    if header_filter:
+        cmd.append(f'--header-filter={header_filter}')
+    cmd.append(str(source))
     proc = subprocess.run(
-        [tidy_bin, '-p', str(db_dir), str(source)],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -150,6 +189,11 @@ def main(argv=None):
         help='Directory containing RoboRIO C++ sources to analyze.',
     )
     parser.add_argument(
+        '--header-filter',
+        default=DEFAULT_HEADER_FILTER,
+        help='Regex passed to clang-tidy --header-filter.',
+    )
+    parser.add_argument(
         '--tidy-bin',
         default='clang-tidy-18',
         help='clang-tidy executable name or path.',
@@ -162,7 +206,7 @@ def main(argv=None):
     parser.add_argument(
         '--observe',
         action='store_true',
-        help='Report lint findings without failing (setup/parse errors still fail).',
+        help='Report lint findings without failing (setup/tool/parse errors still fail).',
     )
     parser.add_argument(
         '--jobs',
@@ -219,7 +263,7 @@ def main(argv=None):
         )
         return 2
     if missing:
-        names = ', '.join(p.name for p in missing)
+        names = ', '.join(str(p.relative_to(args.src_dir.resolve())) for p in missing)
         print(
             f'rio-clang-tidy: sources missing from {args.db}: {names}',
             file=sys.stderr,
@@ -228,7 +272,7 @@ def main(argv=None):
 
     t0 = time.monotonic()
     findings = 0
-    parse_errors = 0
+    tool_errors = 0
     repo_root = pathlib.Path.cwd().resolve()
 
     with tempfile.TemporaryDirectory(prefix='rio-tidy-') as tmp:
@@ -240,7 +284,13 @@ def main(argv=None):
             max_workers=max(1, args.jobs)
         ) as pool:
             futures = [
-                pool.submit(run_one, args.tidy_bin, db_dir, src)
+                pool.submit(
+                    run_one,
+                    args.tidy_bin,
+                    db_dir,
+                    src,
+                    args.header_filter,
+                )
                 for src in sources
             ]
             for fut in futures:
@@ -250,22 +300,24 @@ def main(argv=None):
                 except ValueError:
                     label = str(src)
                 if rc != 0:
-                    if has_compiler_error(out):
-                        parse_errors += 1
-                    else:
+                    if is_lint_finding_only(rc, out):
                         findings += 1
+                    else:
+                        tool_errors += 1
                     print(f'::group::{label}')
                     if out:
                         print(out.rstrip())
+                    else:
+                        print(f'clang-tidy exited with code {rc} (no output)')
                     print('::endgroup::')
 
     elapsed = time.monotonic() - t0
     mode = ' (observe mode)' if args.observe else ''
     print(
         f'rio-clang-tidy: {len(sources)} files, {findings} with findings, '
-        f'{parse_errors} with parse errors, {elapsed:.1f}s{mode}'
+        f'{tool_errors} with tool/parse errors, {elapsed:.1f}s{mode}'
     )
-    if parse_errors > 0:
+    if tool_errors > 0:
         return 2
     if findings > 0 and not args.observe:
         return 1
