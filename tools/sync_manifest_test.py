@@ -253,6 +253,45 @@ class SyncManifestTest(unittest.TestCase):
         with self.assertRaises(sync_manifest.ManifestError):
             sync_manifest.resolve(self.root, "bot/abs.toml")
 
+    # REQ-DEV-30
+    def test_talos_repo_prefix_reads_custom_apparent_name_from_repo_mapping(self):
+        with mock.patch.object(sync_manifest, "current_repository",
+                               return_value=""):
+            self.assertEqual(sync_manifest.talos_repo_prefix(), "//")
+            self.assertEqual(sync_manifest.command(),
+                             "bazel run //tools:sync_manifest --")
+
+        for canonical, apparent in (("talos+", "my_talos"),
+                                    ("talos~", "my_talos7")):
+            with self.subTest(source="RUNFILES_DIR", canonical=canonical), \
+                    tempfile.TemporaryDirectory() as rf_dir:
+                put(rf_dir, "_repo_mapping",
+                    f"other+,talos,{canonical}\n"
+                    f",{apparent},{canonical}\n")
+                with mock.patch.dict(os.environ, {"RUNFILES_DIR": rf_dir},
+                                     clear=False), \
+                        mock.patch.object(sync_manifest, "current_repository",
+                                          return_value=canonical):
+                    self.assertEqual(sync_manifest.talos_repo_prefix(),
+                                     f"@{apparent}//")
+                    self.assertEqual(
+                        sync_manifest.command(),
+                        f"bazel run @{apparent}//tools:sync_manifest --")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping = os.path.join(tmp, "repo_mapping_file")
+            put(tmp, "repo_mapping_file", ",manifest_talos,talos+\n")
+            manifest = os.path.join(tmp, "MANIFEST")
+            put(tmp, "MANIFEST", f"_repo_mapping {mapping}\n")
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("RUNFILES_DIR", "RUNFILES_MANIFEST_FILE")}
+            env["RUNFILES_MANIFEST_FILE"] = manifest
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sync_manifest, "current_repository",
+                                      return_value="talos+"):
+                self.assertEqual(sync_manifest.talos_repo_prefix(),
+                                 "@manifest_talos//")
+
 
 CASES = "talOS/configuration/testdata"
 

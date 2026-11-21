@@ -206,7 +206,28 @@ def alias_interpreter_copies(interpreter):
                               f"{os.path.basename(interpreter)}.")
 
 
-def node_targets(node):
+def parse_repo_mappings(paths):
+    """Reads Bazel 3-column CSV `_repo_mapping` files into
+    `{target_canonical: [target_apparent, ...]}` for mappings visible from the
+    main repository (`source_canonical == ""`), preserving order."""
+    by_canonical = {}
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\r\n").split(",")
+                if len(parts) != 3:
+                    continue
+                source, apparent, canonical = parts
+                if source == "" and apparent and canonical:
+                    names = by_canonical.setdefault(canonical, [])
+                    if apparent not in names:
+                        names.append(apparent)
+    return by_canonical
+
+
+def node_targets(node, canonical_to_apparent=None):
     """Every label the robot config may name `node` by."""
     targets = []
     for label in (node["target"], node.get("label")):
@@ -215,13 +236,20 @@ def node_targets(node):
         targets.append(label)
         if label.startswith("@"):
             repo, package = label.lstrip("@").split("//", 1)
-            # The config uses an apparent module name; node metadata uses
+            # The config uses an apparent repository name; node metadata uses
             # Bazel's canonical repository name. Preserve both spellings.
-            targets.append("@" + repo.split("+", 1)[0] + "//" + package)
+            if canonical_to_apparent and repo in canonical_to_apparent:
+                for apparent in canonical_to_apparent[repo]:
+                    targets.append(f"@{apparent}//{package}")
+            elif repo == "_main":
+                targets.append(f"//{package}")
+            else:
+                targets.append("@" + repo.split("+", 1)[0].split("~", 1)[0]
+                               + "//" + package)
     return list(dict.fromkeys(targets))
 
 
-def check_nodes(spec, resolved):
+def check_nodes(spec, resolved, canonical_to_apparent=None):
     """Exits unless the bundle's nodes are exactly the ones its config
     launches. `resolved` is the configuration resolver's JSON for the config:
     `nodes` holds every subsystem's node (the generated manifest's NODES), and
@@ -235,7 +263,8 @@ def check_nodes(spec, resolved):
     if not isinstance(hardware, str):  # as the launcher reads it
         hardware = spec["default_hardware_node"]
     launched = set(resolved["nodes"]) | {hardware}
-    bundled = [(node.get("label") or node["target"], node_targets(node))
+    bundled = [(node.get("label") or node["target"],
+                node_targets(node, canonical_to_apparent))
                for node in spec["nodes"]]
     missing = sorted(label for label in launched
                      if not any(label in targets for _, targets in bundled))
@@ -250,7 +279,7 @@ def check_nodes(spec, resolved):
             [f"  in nodes but not launched: {label}" for label in extra]))
 
 
-def check_studio(spec, resolved):
+def check_studio(spec, resolved, canonical_to_apparent=None):
     """Exits when the bundle carries a Studio bridge other than the one its
     config's `[studio] bridge` names, or a webroot without Studio's pages
     (index.html, and drive.html for the driver dashboard). Unset,
@@ -260,7 +289,8 @@ def check_studio(spec, resolved):
     if not studio:
         return
     configured = resolved["effective"].get("studio", {}).get("bridge")
-    targets = node_targets({"target": studio["bridge_label"]})
+    targets = node_targets({"target": studio["bridge_label"]},
+                           canonical_to_apparent)
     if isinstance(configured, str) and configured not in targets:
         sys.exit(f"bundle: studio_bridge {studio['bridge_label']} is not the "
                  f"[studio] bridge {configured} that "
@@ -299,14 +329,17 @@ def main():
     parser.add_argument("--out", required=True, help="Output bundle directory")
     parser.add_argument("--stable-status",
                         help="Bazel's stable status file, in a --stamp build")
+    parser.add_argument("--repo-mapping", action="append", default=[],
+                        help="Bazel `_repo_mapping` manifest (may repeat)")
     args = parser.parse_args()
 
     with open(args.spec, "r") as f:
         spec = json.load(f)
     with open(args.resolved, "r") as f:
         resolved = json.load(f)
-    check_nodes(spec, resolved)
-    check_studio(spec, resolved)
+    canonical_to_apparent = parse_repo_mappings(args.repo_mapping)
+    check_nodes(spec, resolved, canonical_to_apparent)
+    check_studio(spec, resolved, canonical_to_apparent)
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -453,7 +486,7 @@ def main():
             binary_sha256 = hashlib.sha256(f.read()).hexdigest()
         manifest_nodes.append({
             "name": name,
-            "targets": node_targets(node),
+            "targets": node_targets(node, canonical_to_apparent),
             "binary": bin_rel,
             "binary_sha256": binary_sha256,
             "language": lang,
@@ -482,7 +515,8 @@ def main():
             f"bridge_sha256 = {json.dumps(bridge_sha256)}",
             "targets = [" + ", ".join(
                 json.dumps(t) for t in
-                node_targets({"target": studio["bridge_label"]})) + "]",
+                node_targets({"target": studio["bridge_label"]},
+                             canonical_to_apparent)) + "]",
             f"webroot = {json.dumps(webroot_rel)}",
         ]
 

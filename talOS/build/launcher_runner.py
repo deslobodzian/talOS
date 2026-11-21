@@ -2,12 +2,12 @@
 
 The runner behind talos_graph_test and talos_sim (contract.bzl). The
 launcher resolves node labels as a workspace's `bazel-bin` paths
-(`//p:t` as bazel-bin/p/t, `@repo//p:t` as bazel-bin/external/repo+/p/t),
-so the runner builds that layout over the runfiles tree: a work directory
-mirroring the main repository's runfiles, with a bazel-bin holding the same
-entries and `external` naming the runfiles root, where every other
-repository's runfiles live. It works the same whether talOS is the main
-repository or a dependency.
+(`//p:t` as bazel-bin/p/t, `@repo//p:t` via `_repo_mapping` as
+bazel-bin/external/<canonical>/p/t), so the runner builds that layout over the
+runfiles tree: a work directory mirroring the main repository's runfiles, with
+a bazel-bin holding the same entries and `external` naming the runfiles root,
+where every other repository's runfiles live. It works the same whether talOS
+is the main repository or a dependency.
 
     launcher_runner.py --launcher RLOCATION --config RLOCATION
         (--graph-nodes N | --sim) [-- LAUNCHER_ARGS...]
@@ -28,22 +28,75 @@ import tempfile
 
 from python.runfiles import runfiles
 
-MAIN = "_main"
+
+def parse_repo_mapping(path):
+    """Reads Bazel's 3-column CSV `_repo_mapping` into
+    [(source_canonical, target_apparent, target_canonical)]."""
+    entries = []
+    if not path or not os.path.isfile(path):
+        return entries
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\r\n").split(",")
+            if len(parts) == 3:
+                entries.append(tuple(parts))
+    return entries
 
 
-def workspace(tmp, launcher):
-    """Builds the work directory in `tmp`; returns (work_dir, environment)."""
-    r = runfiles.Create()
+def split_config(config, root=None):
+    """Splits a config's `$(rlocationpath ...)` into `(main_repo, rel_path)`.
+
+    Derives the main repository's runfiles directory from the rlocationpath's
+    leading segment rather than hardcoding `_main`. When `root/_repo_mapping`
+    exists, rejects a config belonging to an external repository.
+    """
+    if "/" not in config:
+        sys.exit(f"launcher_runner: {config} has no repository prefix; "
+                 "pass $(rlocationpath <config>)")
+    repo, rel = config.split("/", 1)
+    if not repo or not rel:
+        sys.exit(f"launcher_runner: invalid config rlocationpath: {config}")
+    if root:
+        mapping = parse_repo_mapping(os.path.join(root, "_repo_mapping"))
+        if mapping:
+            sources = {source for source, _, _ in mapping if source}
+            external_repos = {
+                canonical for source, _, canonical in mapping
+                if source == "" and canonical and (
+                    "+" in canonical or "~" in canonical
+                    or canonical in sources)
+            }
+            if repo in external_repos:
+                sys.exit(f"launcher_runner: {config} is not in the main "
+                         "repository; the launcher reads a config by its "
+                         "workspace path")
+    return repo, rel
+
+
+def find_runfiles_root(launcher, main_repo, r=None):
+    """Locates the Bazel runfiles root containing `main_repo`."""
+    if r is None:
+        r = runfiles.Create()
     candidates = [os.environ.get("RUNFILES_DIR"),
-                  r.EnvVars().get("RUNFILES_DIR"),
+                  r.EnvVars().get("RUNFILES_DIR") if r else None,
                   # <root>/<repo>/talOS/launcher/launcher
                   os.path.dirname(os.path.dirname(os.path.dirname(
                       os.path.dirname(launcher))))]
     root = next((c for c in candidates
-                 if c and os.path.isdir(os.path.join(c, MAIN))), None)
+                 if c and os.path.isdir(os.path.join(c, main_repo))), None)
     if root is None:
-        sys.exit(f"launcher_runner: no runfiles tree among {candidates}")
-    main_dir = os.path.join(root, MAIN)
+        sys.exit(f"launcher_runner: no runfiles tree for '{main_repo}' "
+                 f"among {candidates}")
+    return root
+
+
+def workspace(tmp, launcher, config_rlocation):
+    """Builds the work directory in `tmp`; returns (work_dir, config, env)."""
+    r = runfiles.Create()
+    main_repo, _ = split_config(config_rlocation)
+    root = find_runfiles_root(launcher, main_repo, r)
+    main_repo, config = split_config(config_rlocation, root)
+    main_dir = os.path.join(root, main_repo)
     work_dir = os.path.join(tmp, "ws")
     bazel_bin = os.path.join(work_dir, "bazel-bin")
     os.makedirs(bazel_bin)
@@ -57,7 +110,7 @@ def workspace(tmp, launcher):
     env["RUNFILES_DIR"] = root
     env.pop("PYTHONPATH", None)
     env.pop("BUILD_WORKSPACE_DIRECTORY", None)
-    return work_dir, env
+    return work_dir, config, env
 
 
 def rlocation(path, what):
@@ -69,18 +122,9 @@ def rlocation(path, what):
     return found
 
 
-def config_path(config):
-    """The config's path inside the work directory, which mirrors the main
-    repository: a config in another repository has no such path."""
-    if not config.startswith(MAIN + "/"):
-        sys.exit(f"launcher_runner: {config} is not in the main repository; "
-                 "the launcher reads a config by its workspace path")
-    return config[len(MAIN) + 1:]
-
-
-def graph_test(launcher, config, expected_nodes):
+def graph_test(launcher, config_rlocation, expected_nodes):
     with tempfile.TemporaryDirectory() as tmp:
-        work_dir, env = workspace(tmp, launcher)
+        work_dir, config, env = workspace(tmp, launcher, config_rlocation)
         out_dir = os.path.join(tmp, "out")
         os.makedirs(out_dir)
         proc = subprocess.run(
@@ -121,9 +165,9 @@ def from_invocation(args):
     return out
 
 
-def sim(launcher, config, launcher_args):
+def sim(launcher, config_rlocation, launcher_args):
     with tempfile.TemporaryDirectory() as tmp:
-        work_dir, env = workspace(tmp, launcher)
+        work_dir, config, env = workspace(tmp, launcher, config_rlocation)
         command = [launcher, "--config", config, "--sim",
                    "--start-sim-gateway", "--sim-gateway-arg", "--physics"]
         child = subprocess.Popen(command + from_invocation(launcher_args),
@@ -155,14 +199,13 @@ def main(argv):
     mode.add_argument("--sim", action="store_true")
     args = parser.parse_args(argv)
     launcher = rlocation(args.launcher, "launcher")
-    config = config_path(args.config)
     if args.sim:
         # talos_sim's own arguments end in `--`, so `bazel run //:sim --
         # ARGS` hands every one of ARGS to the launcher.
-        return sim(launcher, config, launcher_args)
+        return sim(launcher, args.config, launcher_args)
     if launcher_args:
         parser.error(f"unexpected launcher arguments: {launcher_args}")
-    graph_test(launcher, config, args.graph_nodes)
+    graph_test(launcher, args.config, args.graph_nodes)
     return 0
 
 

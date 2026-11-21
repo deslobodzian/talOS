@@ -5,6 +5,7 @@ runtime once, in python/) and of C++ nodes' shared libraries in lib/, its check 
 against the config, and its run.sh (including the Studio it starts), and
 tools/deploy.sh's bundle selection, pruning and session commands."""
 
+import importlib.util
 import json
 import os
 import plistlib
@@ -550,6 +551,96 @@ class BundleBuilderTest(unittest.TestCase):
                 self.assertEqual("--start-studio-bridge" in args, starts, args)
                 self.assertNotIn("--no-studio", args)
                 self.assertEqual(args[-2:], ["--duration-s", "1"])
+
+    # REQ-DEV-30
+    def test_repo_mapping_maps_custom_apparent_names_for_nodes_and_studio(self):
+        # A robot repository with `bazel_dep(name = "talos", repo_name =
+        # "my_talos")` names talOS nodes as `@my_talos//...` in its config while
+        # Bazel's canonical labels are `@@talos+//...` (Bazel 8) or
+        # `@@talos~//...` (Bazel 7). `_repo_mapping` supplies the real apparent
+        # name to check_nodes, check_studio, and bundle_manifest.toml.
+        for canonical, apparent in (("talos+", "my_talos"),
+                                    ("talos~", "my_talos7")):
+            with self.subTest(canonical=canonical, apparent=apparent), \
+                    tempfile.TemporaryDirectory() as tmp:
+                repo_mapping = os.path.join(tmp, "_repo_mapping")
+                put(repo_mapping,
+                    f",{apparent},{canonical}\n"
+                    f"{canonical},rules_cc,rules_cc+\n")
+                bridge = os.path.join(tmp, "src", "studio_bridge")
+                put(bridge, "")
+                webroot = os.path.join(tmp, "src", "dist")
+                put(os.path.join(webroot, "index.html"), "<html>")
+                put(os.path.join(webroot, "drive.html"), "<html>")
+                hw_canon = f"@@{canonical}//talOS/bridge:hardware_node"
+                teleop_canon = f"@@{canonical}//talOS/teleop:node"
+                studio_canon = f"@@{canonical}//studio/bridge:studio_bridge"
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"},
+                    [node(tmp, "hardware_node", hw_canon),
+                     node(tmp, "teleop", teleop_canon)],
+                    [f"@{apparent}//talOS/teleop:node"],
+                    robot={"hardware_node":
+                           f"@{apparent}//talOS/bridge:hardware_node"},
+                    extra=("--repo-mapping", repo_mapping),
+                    studio={"bridge_path": bridge,
+                            "bridge_label": studio_canon,
+                            "webroot_path": webroot},
+                    effective={"studio": {
+                        "bridge":
+                        f"@{apparent}//studio/bridge:studio_bridge"}})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                with open(os.path.join(tmp, "out", "bundle_manifest.toml"),
+                          "rb") as f:
+                    manifest = tomllib.load(f)
+                by_name = {n["name"]: n["targets"] for n in manifest["nodes"]}
+                self.assertEqual(
+                    by_name["teleop"],
+                    [teleop_canon, f"@{apparent}//talOS/teleop:node"])
+                self.assertEqual(
+                    manifest["studio"]["targets"],
+                    [studio_canon, f"@{apparent}//studio/bridge:studio_bridge"])
+
+    # REQ-DEV-30
+    def test_launcher_runner_derives_main_repo_without_hardcoding_main(self):
+        runner_path = runfiles.Create().Rlocation(
+            "_main/talOS/build/launcher_runner.py")
+        spec = importlib.util.spec_from_file_location(
+            "launcher_runner", runner_path)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "runfiles")
+            put(os.path.join(root, "_repo_mapping"),
+                ",my_robot,custom_main\n"
+                ",my_talos,talos+\n"
+                "talos+,rules_cc,rules_cc+\n")
+            put(os.path.join(root, "custom_main", "robot.toml"), "[robot]\n")
+            launcher = os.path.join(
+                root, "talos+", "talOS", "launcher", "launcher")
+            put(launcher, "")
+            self.assertEqual(
+                runner.split_config("custom_main/robot.toml", root),
+                ("custom_main", "robot.toml"))
+            with self.assertRaises(SystemExit) as caught:
+                runner.split_config("talos+/bench/robot.toml", root)
+            self.assertIn("not in the main repository", str(caught.exception))
+            old_rf = os.environ.get("RUNFILES_DIR")
+            os.environ["RUNFILES_DIR"] = root
+            try:
+                work_dir, config, env = runner.workspace(
+                    os.path.join(tmp, "work"), launcher,
+                    "custom_main/robot.toml")
+            finally:
+                if old_rf is None:
+                    os.environ.pop("RUNFILES_DIR", None)
+                else:
+                    os.environ["RUNFILES_DIR"] = old_rf
+            self.assertEqual(config, "robot.toml")
+            self.assertEqual(env["RUNFILES_DIR"], root)
+            self.assertTrue(os.path.isfile(os.path.join(work_dir, "robot.toml")))
+            self.assertTrue(os.path.isdir(
+                os.path.join(work_dir, "bazel-bin", "external", "talos+")))
 
 
 class DeployTest(unittest.TestCase):
