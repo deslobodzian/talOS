@@ -1,6 +1,8 @@
 """Exercise real IPC -> WebSocket bytes with bridge_client's stdlib WebSocket client."""
 import base64
+import ctypes
 import json
+import mmap
 import os
 from pathlib import Path
 import signal
@@ -17,6 +19,7 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridge_client import (BINARY, CLOSE, TEXT, any_frame, bound_port, fast_slots,
                            frame_of, receive, stop, upgrade)
+from talOS.memory.shm_name import shm_name
 
 
 # An RTMS segment's header (talOS/rtms/rtms.h RTMSHeader, version 9, 2368 B):
@@ -35,6 +38,17 @@ RTMS_READERS, RTMS_MAX_READERS = 320, 32
 PID_MASK = (1 << 22) - 1
 
 
+def parse_rtms_header(header):
+    """(writer_pid_or_None, reader_pids) from an RTMS v9 header, or None."""
+    if (len(header) < RTMS_HEADER_BYTES
+            or struct.unpack_from("<QQ", header) != (RTMS_MAGIC, RTMS_VERSION)):
+        return None
+    owner = struct.unpack_from("<Q", header, RTMS_WRITER_OWNER)[0]
+    readers = {(struct.unpack_from("<Q", header, RTMS_READERS + 64 * i + 8)[0] >> 2) & PID_MASK
+               for i in range(RTMS_MAX_READERS)}
+    return (owner & PID_MASK if owner else None, readers - {0})
+
+
 def rtms_segments():
     """(name, writer pid, reader pids) of every RTMS segment this user can read."""
     segments = []
@@ -44,14 +58,51 @@ def rtms_segments():
                 header = handle.read(RTMS_HEADER_BYTES)
         except OSError:
             continue
-        if (len(header) < RTMS_HEADER_BYTES
-                or struct.unpack_from("<QQ", header) != (RTMS_MAGIC, RTMS_VERSION)):
+        parsed = parse_rtms_header(header)
+        if parsed is None:
             continue
-        owner = struct.unpack_from("<Q", header, RTMS_WRITER_OWNER)[0]
-        readers = {(struct.unpack_from("<Q", header, RTMS_READERS + 64 * i + 8)[0] >> 2) & PID_MASK
-                   for i in range(RTMS_MAX_READERS)}
-        segments.append((entry.name, owner & PID_MASK if owner else None, readers - {0}))
+        segments.append((entry.name, parsed[0], parsed[1]))
     return segments
+
+
+def darwin_rtms_segment(topic):
+    """(writer pid, reader pids) of `topic`'s POSIX shm segment on macOS."""
+    ns = os.environ.get("TALOS_SHM_NAMESPACE") or os.environ.get("TEST_TMPDIR") or ""
+    segment = shm_name(topic, ns) if ns else "/" + topic.lstrip("/").replace("/", ".")
+    libc = ctypes.CDLL(None, use_errno=True)
+    # Declare only the two fixed parameters: O_RDONLY never reads the variadic
+    # mode_t argument, keeping arm64 macOS ABI exact.
+    libc.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    libc.shm_open.restype = ctypes.c_int
+    fd = libc.shm_open(segment.encode(), os.O_RDONLY)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), segment)
+    try:
+        with mmap.mmap(fd, RTMS_HEADER_BYTES, access=mmap.ACCESS_READ) as mapping:
+            header = mapping[:RTMS_HEADER_BYTES]
+    finally:
+        os.close(fd)
+    parsed = parse_rtms_header(header)
+    if parsed is None:
+        raise AssertionError(f"segment {segment} for {topic} is not an RTMS v{RTMS_VERSION} header")
+    return parsed
+
+
+def parse_lsof_fields(text):
+    """Parses `lsof -F ftPan` output into a list of per-fd dicts."""
+    records = []
+    current = None
+    for line in text.splitlines():
+        if not line:
+            continue
+        tag, value = line[0], line[1:]
+        if tag == "f":
+            current = {"fd": value}
+            records.append(current)
+        elif current is not None:
+            current[tag] = value
+    return records
 
 
 def socket_inodes(pid):
@@ -83,8 +134,10 @@ def table_inodes(*tables):
 
 class BridgeIntegration(unittest.TestCase):
     # REQ-SAFE-35
-    @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "reads /dev/shm and /proc, which only Linux has")
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") or sys.platform == "darwin",
+        "inspects open sockets and shared memory via /proc+/dev/shm (Linux) or lsof+shm_open (macOS)",
+    )
     def test_running_bridge_opens_no_writer_and_no_datagram_socket(self):
         """A bridge serving a client holds no RTMS writer and no UDP or raw socket.
 
@@ -117,23 +170,74 @@ class BridgeIntegration(unittest.TestCase):
                     # attached, read the topic and sent on the socket.
                     self.assertEqual(frame_of(ws, BINARY)[8:12], b"TLM3")
 
-                    segments = rtms_segments()
-                    written = [name for name, writer, _ in segments if writer == bridge.pid]
-                    self.assertEqual(written, [], f"bridge pid {bridge.pid} writes {written}")
-                    telemetry = [(writer, readers) for _, writer, readers in segments
-                                 if bridge.pid in readers]
-                    self.assertIn((mock.pid, {bridge.pid}), telemetry,
-                                  f"no segment written by the mock ({mock.pid}) and read by "
-                                  f"the bridge ({bridge.pid}): {segments}")
+                    if sys.platform.startswith("linux"):
+                        segments = rtms_segments()
+                        written = [name for name, writer, _ in segments if writer == bridge.pid]
+                        self.assertEqual(written, [], f"bridge pid {bridge.pid} writes {written}")
+                        telemetry = [(writer, readers) for _, writer, readers in segments
+                                     if bridge.pid in readers]
+                        self.assertIn((mock.pid, {bridge.pid}), telemetry,
+                                      f"no segment written by the mock ({mock.pid}) and read by "
+                                      f"the bridge ({bridge.pid}): {segments}")
 
-                    held = socket_inodes(bridge.pid)
-                    datagram = held & table_inodes("udp", "udp6", "udplite", "udplite6",
-                                                   "raw", "raw6")
-                    self.assertEqual(datagram, set(), f"bridge holds UDP or raw sockets {datagram}")
-                    tcp, unix = table_inodes("tcp", "tcp6"), table_inodes("unix")
-                    self.assertTrue(held & tcp, f"none of {held} is TCP: the listener is missing")
-                    self.assertEqual(held - tcp - unix, set(),
-                                     f"bridge sockets neither TCP nor Unix: {held - tcp - unix}")
+                        held = socket_inodes(bridge.pid)
+                        datagram = held & table_inodes("udp", "udp6", "udplite", "udplite6",
+                                                       "raw", "raw6")
+                        self.assertEqual(datagram, set(),
+                                         f"bridge holds UDP or raw sockets {datagram}")
+                        tcp, unix = table_inodes("tcp", "tcp6"), table_inodes("unix")
+                        self.assertTrue(held & tcp,
+                                        f"none of {held} is TCP: the listener is missing")
+                        self.assertEqual(held - tcp - unix, set(),
+                                         f"bridge sockets neither TCP nor Unix: {held - tcp - unix}")
+                    else:
+                        # macOS: verify the RTMS header directly via shm_open(O_RDONLY)
+                        # and inspect every open descriptor of the bridge with lsof.
+                        writer, readers = darwin_rtms_segment(topic)
+                        self.assertNotEqual(writer, bridge.pid,
+                                            f"bridge pid {bridge.pid} owns writer on {topic}")
+                        self.assertEqual(writer, mock.pid,
+                                         f"expected mock pid {mock.pid} as writer, got {writer}")
+                        self.assertIn(bridge.pid, readers,
+                                      f"bridge pid {bridge.pid} not listed in readers {readers}")
+
+                        udp = subprocess.run(
+                            ["lsof", "-n", "-P", "-a", "-p", str(bridge.pid), "-i", "UDP"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertIn(udp.returncode, (0, 1), udp.stderr)
+                        self.assertEqual(udp.stdout.strip(), "",
+                                         f"bridge holds UDP sockets:\n{udp.stdout}")
+
+                        all_fds = subprocess.run(
+                            ["lsof", "-n", "-P", "-a", "-p", str(bridge.pid), "-F", "ftPan"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertEqual(all_fds.returncode, 0, all_fds.stderr)
+                        records = parse_lsof_fields(all_fds.stdout)
+                        self.assertTrue(records, "lsof returned no descriptors for bridge")
+
+                        tcp_listeners = []
+                        for rec in records:
+                            fd_type = rec.get("t", "")
+                            proto = rec.get("P", "")
+                            access = rec.get("a", "")
+                            name = rec.get("n", "")
+                            # No raw / link-layer / non-TCP inet sockets.
+                            self.assertNotIn("RAW", fd_type.upper(),
+                                             f"bridge holds raw socket: {rec}")
+                            self.assertNotIn("NDRV", fd_type.upper(),
+                                             f"bridge holds NDRV socket: {rec}")
+                            if fd_type in ("IPv4", "IPv6") or proto:
+                                self.assertEqual(proto, "TCP",
+                                                 f"bridge holds non-TCP inet socket: {rec}")
+                                if f":{port}" in name:
+                                    tcp_listeners.append(rec)
+                            if fd_type == "PSXSHM":
+                                self.assertNotIn(access, ("w", "u"),
+                                                 f"bridge holds writable shm descriptor: {rec}")
+                        self.assertTrue(tcp_listeners,
+                                        f"no TCP socket on port {port} found in {records}")
             finally:
                 stop(processes)
                 for process in processes:

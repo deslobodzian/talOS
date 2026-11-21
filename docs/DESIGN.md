@@ -172,7 +172,7 @@ Automated checks that keep the architecture honest.
 | config load refusals (timeouts, periods, singular sections, soft limits) | "The tick" numbers |
 | `wpilib_lockstep_test` | GradleRIO and RobotPy wheel versions agree |
 | `new_subsystem_test` golden packages | the scaffold's output builds and passes |
-| `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies"; its allowlist only shrinks |
+| `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies" and `studio/review` viewer isolation (`REQ-SAFE-35`); its allowlist only shrinks |
 | `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
 | `tools/check_links.py` (CI lint job) | every relative markdown link and `#anchor` resolves |
 | `tools/trace.py --check` (CI lint job) | every `REQ-` tag names a catalogue requirement; every SAFE, CONTRACT and P0 requirement has a tagged test at or below its cheapest runnable tier (from Bazel lane tags, GradleRIO `phoenixTest`, and Studio Vitest) or cites a bench section or open TODO.md item; quarantines are dated and unexpired; every Bazel package is in the package scope table; its waiver list only shrinks |

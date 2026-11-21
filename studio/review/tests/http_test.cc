@@ -16,7 +16,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
+#include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -281,6 +285,216 @@ TEST_F(HttpTest, ListensOnLoopbackOnly) {
     EXPECT_EQ(error, ECONNREFUSED) << text;
   }
   freeifaddrs(interfaces);
+}
+
+namespace {
+
+std::map<std::string, std::string> SnapshotDirectory(
+    const std::filesystem::path& root) {
+  std::map<std::string, std::string> snapshot;
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator(root)) {
+    const std::string rel =
+        std::filesystem::relative(entry.path(), root).generic_string();
+    if (entry.is_directory()) {
+      snapshot.emplace(rel + "/", "");
+      continue;
+    }
+    std::ifstream in(entry.path(), std::ios::binary);
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    snapshot.emplace(rel, buf.str());
+  }
+  return snapshot;
+}
+
+#if defined(__linux__)
+std::set<std::uint64_t> ProcNetInodes(
+    const std::vector<std::string>& tables,
+    std::map<std::uint64_t, std::pair<std::string, std::string>>*
+        tcp_local_and_state = nullptr) {
+  std::set<std::uint64_t> inodes;
+  for (const auto& table : tables) {
+    std::ifstream in("/proc/net/" + table);
+    if (!in.is_open()) continue;
+    std::string line;
+    std::getline(in, line);  // header
+    const std::size_t col = (table == "unix") ? 6 : 9;
+    while (std::getline(in, line)) {
+      std::istringstream ss(line);
+      std::vector<std::string> fields;
+      std::string tok;
+      while (ss >> tok) fields.push_back(std::move(tok));
+      if (fields.size() <= col) continue;
+      const std::uint64_t inode = std::stoull(fields[col]);
+      inodes.insert(inode);
+      if (tcp_local_and_state != nullptr && fields.size() > 3) {
+        (*tcp_local_and_state)[inode] = {fields[1], fields[3]};
+      }
+    }
+  }
+  return inodes;
+}
+#endif
+
+}  // namespace
+
+// Guards that studio_review is strictly a read-only loopback viewer: after
+// serving every review endpoint it holds only loopback TCP (no UDP or raw
+// sockets), opens or maps zero shared memory, and writes nothing to its
+// session library directory.
+// REQ-SAFE-35
+TEST_F(HttpTest, OpensNoDatagramSocketNoSharedMemoryAndWritesNothing) {
+  const auto before = SnapshotDirectory(directory_);
+  ASSERT_FALSE(before.empty());
+
+  ASSERT_EQ(Get(port_, "/review/sessions.json").status, 200);
+  ASSERT_EQ(Get(port_, "/review/s1/channels.json").status, 200);
+  ASSERT_EQ(Get(port_, "/review/s1/timeline.json").status, 200);
+  ASSERT_EQ(Get(port_, "/review/s1/declared.json").status, 200);
+  ASSERT_EQ(Get(port_, "/review/s1/manifest.json").status, 200);
+  ASSERT_EQ(
+      Get(port_, "/review/s1/series?c=shooter%2Fstate%2Fposition_m&start_ns=" +
+                     std::to_string(studio::review::testing::kStartNs) +
+                     "&end_ns=" +
+                     std::to_string(studio::review::testing::kStartNs +
+                                    2'000'000'000) +
+                     "&points=5")
+          .status,
+      200);
+  ASSERT_EQ(Get(port_, "/").status, 200);
+
+  // Zero writes to the log directory.
+  const auto after = SnapshotDirectory(directory_);
+  EXPECT_EQ(before, after);
+
+#if defined(__linux__)
+  const std::string proc_root = "/proc/" + std::to_string(child_);
+  std::set<std::uint64_t> held_sockets;
+  for (const auto& entry :
+       std::filesystem::directory_iterator(proc_root + "/fd")) {
+    std::error_code ec;
+    const auto target = std::filesystem::read_symlink(entry.path(), ec);
+    if (ec) continue;
+    const std::string s = target.string();
+    EXPECT_EQ(s.rfind("/dev/shm/", 0), std::string::npos)
+        << "studio_review opened shared memory: " << s;
+    constexpr std::string_view kPrefix = "socket:[";
+    if (s.starts_with(kPrefix) && s.back() == ']') {
+      held_sockets.insert(
+          std::stoull(s.substr(kPrefix.size(), s.size() - kPrefix.size() - 1)));
+    }
+  }
+  {
+    std::ifstream maps(proc_root + "/maps");
+    ASSERT_TRUE(maps.is_open());
+    std::string line;
+    while (std::getline(maps, line)) {
+      EXPECT_EQ(line.find("/dev/shm/"), std::string::npos)
+          << "studio_review mapped shared memory: " << line;
+    }
+  }
+  const auto datagram =
+      ProcNetInodes({"udp", "udp6", "udplite", "udplite6", "raw", "raw6"});
+  for (const std::uint64_t inode : held_sockets) {
+    EXPECT_EQ(datagram.count(inode), 0u)
+        << "studio_review holds UDP or raw socket inode " << inode;
+  }
+  std::map<std::uint64_t, std::pair<std::string, std::string>> tcp_info;
+  const auto tcp = ProcNetInodes({"tcp", "tcp6"}, &tcp_info);
+  const auto unix_socks = ProcNetInodes({"unix"});
+  bool saw_loopback_listener = false;
+  for (const std::uint64_t inode : held_sockets) {
+    EXPECT_TRUE(tcp.count(inode) > 0 || unix_socks.count(inode) > 0)
+        << "studio_review holds non-TCP/non-Unix socket inode " << inode;
+    if (const auto it = tcp_info.find(inode); it != tcp_info.end()) {
+      const auto& [local_addr, state] = it->second;
+      // 0A = TCP_LISTEN; every listener must be bound to loopback.
+      if (state == "0A") {
+        const bool is_loopback =
+            local_addr.starts_with("0100007F:") ||
+            local_addr.starts_with("00000000000000000000000001000000:");
+        EXPECT_TRUE(is_loopback)
+            << "studio_review listener is not loopback: " << local_addr;
+        saw_loopback_listener = saw_loopback_listener || is_loopback;
+      }
+    }
+  }
+  EXPECT_TRUE(saw_loopback_listener)
+      << "studio_review TCP listener not observed in /proc/net/tcp";
+#elif defined(__APPLE__)
+  int pipefd[2];
+  ASSERT_EQ(pipe(pipefd), 0);
+  const std::string pid_arg = std::to_string(child_);
+  const pid_t lsof_pid = fork();
+  ASSERT_GE(lsof_pid, 0);
+  if (lsof_pid == 0) {
+    dup2(pipefd[1], STDOUT_FILENO);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    execlp("lsof", "lsof", "-n", "-P", "-a", "-p", pid_arg.c_str(), "-F",
+           "ftPan", static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  close(pipefd[1]);
+  std::string output;
+  char buf[4096];
+  for (ssize_t n; (n = read(pipefd[0], buf, sizeof buf)) > 0;) {
+    output.append(buf, static_cast<std::size_t>(n));
+  }
+  close(pipefd[0]);
+  int status = 0;
+  ASSERT_EQ(waitpid(lsof_pid, &status, 0), lsof_pid);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+
+  struct FdRec {
+    std::string type;
+    std::string proto;
+    std::string access;
+    std::string name;
+  };
+  std::vector<FdRec> recs;
+  std::istringstream lines(output);
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (line.empty()) continue;
+    const char tag = line[0];
+    const std::string val = line.substr(1);
+    if (tag == 'f') {
+      recs.emplace_back();
+    } else if (!recs.empty()) {
+      if (tag == 't') recs.back().type = val;
+      if (tag == 'P') recs.back().proto = val;
+      if (tag == 'a') recs.back().access = val;
+      if (tag == 'n') recs.back().name = val;
+    }
+  }
+  ASSERT_FALSE(recs.empty()) << "lsof returned no descriptors";
+  bool saw_loopback_listener = false;
+  const std::string want_listen = "127.0.0.1:" + std::to_string(port_);
+  for (const auto& r : recs) {
+    EXPECT_NE(r.type, "PSXSHM") << "studio_review holds shm fd: " << r.name;
+    EXPECT_EQ(r.type.find("RAW"), std::string::npos) << r.type << " " << r.name;
+    EXPECT_EQ(r.type.find("NDRV"), std::string::npos)
+        << r.type << " " << r.name;
+    if (r.type == "IPv4" || r.type == "IPv6" || !r.proto.empty()) {
+      EXPECT_EQ(r.proto, "TCP") << "non-TCP inet socket: " << r.name;
+      const bool is_loopback =
+          r.name.starts_with("127.0.0.1:") || r.name.starts_with("[::1]:");
+      EXPECT_TRUE(is_loopback) << "non-loopback inet socket: " << r.name;
+      if (r.name.find(want_listen) != std::string::npos) {
+        saw_loopback_listener = true;
+      }
+    }
+    if (r.type == "REG" && r.name.find(directory_) != std::string::npos) {
+      EXPECT_NE(r.access, "w") << "writable library fd: " << r.name;
+      EXPECT_NE(r.access, "u") << "read-write library fd: " << r.name;
+    }
+  }
+  EXPECT_TRUE(saw_loopback_listener)
+      << "loopback TCP listener " << want_listen << " not found in:\n"
+      << output;
+#endif
 }
 
 // Guards that a second server cannot share a port: uSockets sets SO_REUSEPORT

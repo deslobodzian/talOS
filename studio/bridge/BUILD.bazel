@@ -198,7 +198,10 @@ py_test(
         "integration",
         "local",
     ],
-    deps = [":bridge_client"],
+    deps = [
+        ":bridge_client",
+        "//talOS/memory:shm_name",
+    ],
 )
 
 py_test(

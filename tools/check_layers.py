@@ -221,6 +221,25 @@ WIRE_CLI_PACKAGES = frozenset({
 PYTHON_GATEWAYS = ("talOS/node_api", "talOS/schema", "talOS/build",
                    "talOS/msgs")
 
+# REQ-SAFE-35: studio/review is an offline log viewer and must never depend
+# directly on talOS/rtms, talOS/ipc, talOS/protocol or talOS/bridge, nor
+# transitively on RTMS segment/wake, IPC, bridge runtime or node/devices.
+REVIEW_FORBIDDEN_DIRECT_DEPS = (
+    "talOS/rtms/...",
+    "talOS/ipc/...",
+    "talOS/protocol/...",
+    "talOS/bridge/...",
+)
+REVIEW_FORBIDDEN_TRANSITIVE_DEPS = (
+    "talOS/rtms:rtms",
+    "talOS/rtms:wake",
+    "talOS/ipc/...",
+    "talOS/bridge:node_lib",
+    "talOS/bridge:hardware_node",
+    "talOS/node/...",
+    "talOS/devices/...",
+)
+
 # Generated targets another package may depend on: messages, and C++ nodes
 # exported for talos.cpp_node (ARCHITECTURE.md "Allowed dependencies").
 SHARED_GENERATORS = ("talos_messages", "talos_cc_shared_node")
@@ -507,6 +526,25 @@ def checks(node_packages):
             only_generators=CC_NODE_GENERATORS,
             except_testonly=True,
         ),
+    ))
+    # REQ-SAFE-35: studio/review is an offline log viewer.
+    result.append(Check(
+        "studio/review has no direct dependency on talOS/rtms, talOS/ipc, "
+        "talOS/protocol or talOS/bridge (REQ-SAFE-35)",
+        "studio/review/...",
+        REVIEW_FORBIDDEN_DIRECT_DEPS,
+        kind="direct",
+        source=Set(("studio/review/...",), rules_only=True,
+                   except_testonly=True),
+    ))
+    result.append(Check(
+        "studio/review has no transitive dependency on RTMS, IPC, bridge "
+        "runtime or node/devices (REQ-SAFE-35)",
+        "studio/review/...",
+        REVIEW_FORBIDDEN_TRANSITIVE_DEPS,
+        kind="path",
+        source=Set(("studio/review/...",), rules_only=True,
+                   except_testonly=True),
     ))
     return result
 
