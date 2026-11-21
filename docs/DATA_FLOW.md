@@ -687,3 +687,38 @@ immediate timeout. The maximum frame fits the IPv4 MTU without fragmentation.
 
 The device caps are a hard one-datagram budget: State has <!-- size: state.headroom_bytes -->**13 B**
 worst-case payload headroom.
+
+### State frame growth
+
+**Supported device scope (owner decision 2026-11-21):** talOS supports CTRE
+Phoenix 6 CAN devices (`TalonFX`, `CANcoder`, `Pigeon2`) plus RoboRIO onboard
+I/O (`DIO`, `AnalogInput`, `Encoder`, `PWM`). REV devices, pneumatics,
+addressable LEDs, and CANrange are explicitly out of scope.
+
+**Current single-frame budget:** A fully populated State payload is
+`84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 47` =
+<!-- size: state.max_payload_bytes -->**1,419 B** at the current caps
+(<!-- size: caps.motors -->16 motors, <!-- size: caps.sensors -->12 CAN
+sensors, <!-- size: caps.digital_inputs -->8 DI,
+<!-- size: caps.digital_outputs -->4 DO,
+<!-- size: caps.analog_inputs -->4 AI, <!-- size: caps.encoders -->4 encoders,
+<!-- size: caps.pwm_outputs -->4 PWM) out of `kMaxPayloadSize` =
+<!-- size: frame.max_payload_bytes -->1,432 B
+(<!-- size: state.headroom_bytes -->**13 B** headroom;
+<!-- size: state.max_frame_bytes -->1,459 B ≤
+<!-- size: frame.max_bytes -->1,472 B Ethernet IPv4/UDP MTU). A 17th motor
+(+<!-- size: state.motor_bytes -->45 B) or any new device kind therefore cannot
+fit in one State datagram.
+
+**Growth design (if a robot needs >16 motors or a new device kind; no wire
+change today):** Carry State as multi-frame, tick-coherent chunks carrying
+`frame_index` / `frame_count` keyed by `(boot_id, sequence)` — following the
+same payload-level chunking and reassembly pattern as `ConfigChunkHeader` /
+`ConfigAssembler` (`talOS/hardware/config_wire.h`, `talOS/hardware/endpoint.h`).
+Changing the wire layout bumps `protocol::kProtocolVersion`
+([protocol version](#protocol-version), [RULES.md 9](../RULES.md)). On the
+main processor, `HardwareNode` assembles all chunks for a `(boot_id, sequence)`
+tick before publishing `/hw/state` (sizing `hardware::Packet` for the
+reassembled payload) and drops any incomplete older tick as soon as a newer
+`(boot_id, sequence)` arrives or expires, bounding partial-tick drop so halves
+from different ticks never mix.
