@@ -67,9 +67,9 @@ void RioLog::WriteConsoleLine(uint64_t steady_us, std::string_view line,
   const std::size_t prefix_len = std::strlen(prefix);
   char buffer[2048];
   if (prefix_len + line.size() <= sizeof(buffer)) {
-    std::memcpy(buffer, prefix, prefix_len);
+    std::copy_n(prefix, prefix_len, buffer);
     if (!line.empty()) {
-      std::memcpy(buffer + prefix_len, line.data(), line.size());
+      std::copy_n(line.data(), line.size(), buffer + prefix_len);
     }
     std::fwrite(buffer, 1, prefix_len + line.size(), stream);
   } else {
