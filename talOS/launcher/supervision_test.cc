@@ -5124,11 +5124,23 @@ TEST(Supervision, ShutdownStopsHardwareNodeBeforeActuatorOwners) {
     bool held_before_timeout = false;
     std::jthread driver{[&](const std::stop_token& stop) {
       const testing::SteppedClock::ReleaseOnExit release_clock{clock};
-      if (!WaitFor(stop, [&] { return ReadLines(ready).size() == 3; })) {
+      if (!WaitFor(stop, [&] {
+            if (ReadLines(ready).size() != 3) return false;
+            const std::string init = ReadFile(live);
+            return !ManifestRuns(init, "hardware_node").empty() &&
+                   !ManifestRuns(init, "alpha").empty();
+          })) {
         ::kill(::getpid(), SIGTERM);
         return;
       }
+      // Keep clock frozen at `start` while Supervise() handles SIGTERM so
+      // bridge_stop_deadline is deterministically `start + kBridgeStopTimeout`.
       ::kill(::getpid(), SIGTERM);
+      const uint64_t after_sigterm = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after_sigterm;
+      });
       clock.HoldAt(start + kBridgeStopTimeout - 50ms);
       const uint64_t after = passes.Started() + 2;
       WaitFor(stop, [&] {
@@ -5136,11 +5148,13 @@ TEST(Supervision, ShutdownStopsHardwareNodeBeforeActuatorOwners) {
         return passes.Started() >= after;
       });
       const std::string mid = ReadFile(live);
+      const auto mid_hw = ManifestRuns(mid, "hardware_node");
+      const auto mid_alpha = ManifestRuns(mid, "alpha");
       held_before_timeout =
-          ManifestRuns(mid, "hardware_node").back().find("\"running\"") !=
-              std::string::npos &&
-          ManifestRuns(mid, "alpha").back().find("\"running\"") !=
-              std::string::npos;
+          !mid_hw.empty() &&
+          mid_hw.back().find("\"running\"") != std::string::npos &&
+          !mid_alpha.empty() &&
+          mid_alpha.back().find("\"running\"") != std::string::npos;
       clock.HoldAt(start + kBridgeStopTimeout);
       SupervisionWakeup::Wake();
     }};
