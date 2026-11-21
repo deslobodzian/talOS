@@ -648,6 +648,10 @@ and the node takes it as a stop during construction and exits 0, provided
 it reaches its stop handlers within the stop timeout (`kStopTimeout`, 2 s)
 of the launcher's stop. One still starting then is SIGKILLed and recorded
 `stop_timeout`, as a stuck constructor is, and the session ends nonzero.
+On shutdown, the launcher stops `hardware_node` first (`kStopSignal`, up to
+`kBridgeStopTimeout`, 500 ms, before SIGKILLing a hung bridge) and signals the
+remaining members only after `hardware_node` has been reaped, so the bridge
+quiesces and stops forwarding before actuator owners exit.
 Probes, group guardians, `--replay-inputs` runs, members that do not say so
 (`hardware_node`, `sim_gateway`, the Studio bridge, foreign binaries) and
 members whose `--describe` probe did not answer (a non-critical member the

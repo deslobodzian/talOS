@@ -1923,8 +1923,11 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                          std::optional<std::size_t> sim_gateway_index,
                          BridgeStatusObserver* status_observer,
                          std::chrono::steady_clock::time_point deadline) {
-  bool stop_sent = false;
+  enum class StopPhase { kNone, kBridge, kAllSignaled };
+  StopPhase stop_phase = StopPhase::kNone;
+  bool bridge_killed = false;
   bool sim_schedule_done = !sim_gateway_index.has_value();
+  auto bridge_stop_deadline = std::chrono::steady_clock::time_point::max();
   auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
   std::optional<introspect::RegistryMapping> registry;
   // Every first run's liveness counts from here, not its spawn.
@@ -1946,8 +1949,8 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     notifier.Send("WATCHDOG=1");
     const auto now = options_.supervision_clock();
     const bool past_deadline = now >= deadline;
-    const bool stopping =
-        process::stop_requested.load() || stop_sent || past_deadline;
+    const bool stopping = process::stop_requested.load() ||
+                          stop_phase != StopPhase::kNone || past_deadline;
     // A stop signal can land after `stopping` was sampled: systemctl stop
     // signals the launcher and then every node, so a node killed by it can
     // be reaped in this pass. Restart decisions read the flag again, so
@@ -2199,11 +2202,22 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       return;
     }
 
-    if (!stop_sent && (process::stop_requested.load() || past_deadline ||
-                       endpoints_refused_)) {
-      stop_sent = true;
+    // Two-phase shutdown (REQ-OPS-20): stop `hardware_node` first so the
+    // bridge stops forwarding commands (and sends its neutral) before actuator
+    // owners exit; bound the wait at kBridgeStopTimeout (SIGKILL if hung), and
+    // only after `hardware_node` has been reaped signal the remaining children.
+    const auto running_bridge = [&]() -> std::optional<std::size_t> {
+      for (std::size_t i = 0; i < procs.size(); ++i) {
+        if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
+            !procs[i].exited) {
+          return i;
+        }
+      }
+      return std::nullopt;
+    };
+    const auto signal_remaining = [&] {
+      stop_phase = StopPhase::kAllSignaled;
       shutdown_deadline = now + kStopTimeout;
-      ConsoleLine(std::cout) << "[launcher] Stopping children...\n";
       for (std::size_t i = 0; i < procs.size(); ++i) {
         const auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
@@ -2212,8 +2226,34 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
         SignalProcessGroup(proc.pid, kStopSignal);
         if (launches[i].kill_reason.empty()) launches[i].kill_reason = kRunStop;
       }
+    };
+    if (stop_phase == StopPhase::kNone &&
+        (process::stop_requested.load() || past_deadline ||
+         endpoints_refused_)) {
+      ConsoleLine(std::cout) << "[launcher] Stopping children...\n";
+      if (const auto bridge_idx = running_bridge()) {
+        stop_phase = StopPhase::kBridge;
+        bridge_stop_deadline = now + kBridgeStopTimeout;
+        SignalProcessGroup(procs[*bridge_idx].pid, kStopSignal);
+        if (launches[*bridge_idx].kill_reason.empty()) {
+          launches[*bridge_idx].kill_reason = kRunStop;
+        }
+      } else {
+        signal_remaining();
+      }
+    } else if (stop_phase == StopPhase::kBridge) {
+      const auto bridge_idx = running_bridge();
+      if (!bridge_idx) {
+        signal_remaining();
+      } else if (!bridge_killed && now >= bridge_stop_deadline) {
+        bridge_killed = true;
+        SignalProcessGroup(procs[*bridge_idx].pid, SIGKILL);
+        if (launches[*bridge_idx].kill_reason == kRunStop) {
+          launches[*bridge_idx].kill_reason = kRunStopTimeout;
+        }
+      }
     }
-    if (stop_sent && now >= shutdown_deadline) {
+    if (stop_phase == StopPhase::kAllSignaled && now >= shutdown_deadline) {
       for (std::size_t i = 0; i < procs.size(); ++i) {
         const auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
@@ -2231,7 +2271,11 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     // The pass's WATCHDOG=1 went out at about `now`.
     if (watchdog) due(now + *watchdog);
     if (refreshes_locks) due(next_lock_refresh);
-    if (stop_sent) {
+    if (stop_phase == StopPhase::kBridge) {
+      if (!bridge_killed && now < bridge_stop_deadline) {
+        due(bridge_stop_deadline);
+      }
+    } else if (stop_phase == StopPhase::kAllSignaled) {
       // Once passed, its SIGKILLs are sent; the exits they cause wake it.
       if (now < shutdown_deadline) due(shutdown_deadline);
     } else {
@@ -2257,7 +2301,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     for (const auto& launch : launches) {
       if (launch.restart.pending()) due(launch.restart.due_at());
     }
-    if (studio) due(studio->NextCheck(stop_sent));
+    if (studio) due(studio->NextCheck(stop_phase != StopPhase::kNone));
     wakeup.Wait(wake == SupervisionTime::max()
                     ? std::chrono::nanoseconds::max()
                     : wake - options_.supervision_clock());
