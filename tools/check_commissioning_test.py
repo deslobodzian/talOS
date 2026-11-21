@@ -658,11 +658,14 @@ class CheckCommissioningTest(unittest.TestCase):
     # REQ-DEV-33, RULES.md 4: uppercase/mixed-case .toml extensions are checked,
     # while EXEMPT_DIRECTORIES stay exact-case so exemptions are not widened.
     def test_case_insensitive_toml_extensions_fail(self):
+        # Use filenames that do not case-collide with setUp()'s robot.toml or
+        # examples/ directory so the test exercises genuine uppercase/mixed
+        # paths on case-insensitive filesystems (macOS APFS) as well as Linux.
         for rel in (
-            "bench/main_processor/configuration/ROBOT.TOML",
+            "bench/main_processor/configuration/EXTRA.TOML",
             "bench/main_processor/configuration/Motor.Toml",
-            "EXAMPLES/robot/robot.toml",
-            "Tests/robot/Config.TOML",
+            "TESTS/robot/Config.TOML",
+            "FIXTURES/robot/Config.TOML",
         ):
             with self.subTest(path=rel):
                 self.git("reset", "--hard", self.base)
@@ -671,6 +674,19 @@ class CheckCommissioningTest(unittest.TestCase):
                 found = check_commissioning.check(self.base)
                 self.assertEqual(len(found), 1, found)
                 self.assertIn(f" {rel}: sets commissioned = true", found[0])
+
+        # Verify uppercase EXAMPLES/ is not exempted (remove lowercase
+        # examples/ first so macOS APFS creates a real uppercase directory).
+        self.git("reset", "--hard", self.base)
+        self.git("rm", "-rq", "examples")
+        self.commit("remove lowercase examples fixture")
+        no_examples_base = self.git("rev-parse", "HEAD").strip()
+        upper_ex = "EXAMPLES/robot/extra.toml"
+        self.put(upper_ex, "[robot]\ncommissioned = true\n")
+        self.commit(f"bench: add {upper_ex}")
+        found = check_commissioning.check(no_examples_base)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn(f" {upper_ex}: sets commissioned = true", found[0])
 
         # Editing a CAN id in a mixed-case .Toml file fails too.
         self.git("reset", "--hard", self.base)
@@ -688,7 +704,7 @@ class CheckCommissioningTest(unittest.TestCase):
 
         # Exact-case exempt directory with uppercase .TOML still passes.
         self.git("reset", "--hard", self.base)
-        self.put("examples/robot/ROBOT.TOML", "[robot]\ncommissioned = true\n")
+        self.put("examples/robot/EXTRA.TOML", "[robot]\ncommissioned = true\n")
         self.commit("examples: uppercase config")
         self.assertEqual(check_commissioning.check(self.base), [])
 
