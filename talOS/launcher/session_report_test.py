@@ -954,6 +954,60 @@ class SessionReportTest(unittest.TestCase):
         self.assertIsNone(
             session_report.analyze({"nodes": []}, undecoded)["state_sequence_gaps"])
 
+    # REQ-OPS-20 (TODO.md RT-17, RT-28): BridgeStatus socket/State loss counters
+    # are surfaced in both JSON (`bridge_socket_counters`) and markdown output.
+    def test_bridge_socket_and_state_loss_counters(self):
+        def status(t, send_fail, reopens, seq_gaps, decode_fail, would_block):
+            decoded = (
+                f"{{states_received_count: 10, "
+                f"socket_send_failures_count: {send_fail}, "
+                f"socket_reopens_count: {reopens}, "
+                f"state_sequence_gaps_count: {seq_gaps}, "
+                f"state_decode_failures_count: {decode_fail}, "
+                f"socket_send_would_block_count: {would_block}}}"
+            )
+            return dict(process="hardware_node", kind="SEND", topic="/hw/status",
+                        now_ms=t, event_ms=t, publish_ms=t, decoded=decoded)
+
+        # Include a bridge restart mid-session so reset/delta accounting is exercised.
+        records = [
+            status(0, 1, 0, 2, 0, 0),
+            status(20, 4, 1, 5, 1, 2),
+            status(40, 0, 0, 1, 0, 0),
+            status(60, 2, 1, 3, 2, 1),
+        ]
+        report = session_report.analyze({"nodes": []}, records)
+        counters = report["bridge_socket_counters"]
+        self.assertIsNotNone(counters)
+        self.assertEqual(set(counters.keys()), set(session_report.BRIDGE_SOCKET_COUNTERS))
+        self.assertEqual(counters["socket_send_failures_count"]["delta"], 5)
+        self.assertEqual(counters["socket_send_failures_count"]["last"], 2)
+        self.assertEqual(counters["socket_send_failures_count"]["resets"], 1)
+        self.assertEqual(counters["socket_reopens_count"]["delta"], 2)
+        self.assertEqual(counters["state_sequence_gaps_count"]["delta"], 5)
+        self.assertEqual(counters["state_decode_failures_count"]["delta"], 3)
+        self.assertEqual(counters["socket_send_would_block_count"]["delta"], 3)
+
+        md = session_report.markdown(report)
+        self.assertIn(
+            "Bridge UDP/State loss counters: "
+            "socket_send_failures_count=delta:5/last:2 (resets=1), "
+            "socket_reopens_count=delta:2/last:1 (resets=1), "
+            "state_sequence_gaps_count=delta:5/last:3 (resets=1), "
+            "state_decode_failures_count=delta:3/last:2 (resets=1), "
+            "socket_send_would_block_count=delta:3/last:1 (resets=1)",
+            md.splitlines(),
+        )
+
+        # Older logs without these fields report None and omit the summary line.
+        legacy = [dict(process="hardware_node", kind="SEND", topic="/hw/status",
+                       now_ms=0, event_ms=0, publish_ms=0,
+                       decoded="{states_received_count: 5}")]
+        legacy_report = session_report.analyze({"nodes": []}, legacy)
+        self.assertIsNone(legacy_report["bridge_socket_counters"])
+        self.assertNotIn("Bridge UDP/State loss counters:",
+                         session_report.markdown(legacy_report))
+
 
 if __name__ == "__main__":
     unittest.main()

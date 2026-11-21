@@ -117,6 +117,8 @@ class Endpoint {
                                           std::span<char>{err});
         if (status == ConfigAssembler::Status::kComplete) {
           if (gateway_.configuring()) continue;
+          const uint64_t enabled_refusals_before =
+              gateway_.last_enabled_refusal().count;
           bool ok = gateway_.BeginReconfigure(assembler_.config());
           // Bounded backends can complete immediately; Phoenix only polls its
           // worker here and returns without waiting for CAN transactions.
@@ -143,8 +145,13 @@ class Endpoint {
             // generic string. Compact "device: cause" summary so both survive
             // truncation to the 64-byte reason; snprintf always
             // NUL-terminates.
+            const auto& refusal = gateway_.last_enabled_refusal();
             const auto& config_error = gateway_.config_error();
-            if (config_error.has_value()) {
+            if (refusal.count != enabled_refusals_before &&
+                refusal.refused_id == assembler_.config_id()) {
+              std::snprintf(ack.reason, sizeof(ack.reason),
+                            "disable to accept the new configuration");
+            } else if (config_error.has_value()) {
               std::snprintf(ack.reason, sizeof(ack.reason), "%s: %s",
                             config_error->device_name.c_str(),
                             config_error->message.c_str());

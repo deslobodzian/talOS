@@ -88,10 +88,22 @@ export function alertLevelName(level: AlertLevel): string {
   return LEVEL_NAME[level] ?? 'none';
 }
 
-// The alert's display name: the field after `alert_<level>_`, with spaces for
-// underscores. The level comes from the dictionary, so this strips a known
-// prefix and never classifies a name.
+// Human-readable descriptions for known /hw/status alerts whose field name
+// alone does not explain what failed or what the drive team should do.
+const ALERT_TEXT: Readonly<Record<string, string>> = {
+  'hw/status/alert_error_hardware_fault':
+      'hardware fault (total feedback loss or gateway fault)',
+  'hw/status/alert_error_config_refused_enabled':
+      'config refused while enabled: disable to accept the new configuration',
+};
+
+// The alert's display name: a known human-readable hint when registered, else
+// the field after `alert_<level>_`, with spaces for underscores. The level
+// comes from the dictionary, so this strips a known prefix and never
+// classifies a name.
 export function alertText(channel: string, level: AlertLevel): string {
+  const known = ALERT_TEXT[channel];
+  if (known !== undefined) return known;
   const leaf = channel.slice(channel.lastIndexOf('/') + 1);
   const prefix = `alert_${alertLevelName(level)}_`;
   return (leaf.startsWith(prefix) ? leaf.slice(prefix.length) : leaf)

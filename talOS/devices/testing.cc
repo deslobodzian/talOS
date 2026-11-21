@@ -646,6 +646,8 @@ struct SimHardware::Impl {
         static_cast<std::uint32_t>(clock.window_count()),
         clock.converged(),
         state.health.valid,
+        (state.flags & hardware::kHardwareFault) != 0,
+        false,  // alert_error_config_refused_enabled
         state.health.battery_v,
         state.health.brownout,
         false,  // alert_warning_can_bus_unread: can_buses.Fill
@@ -662,6 +664,11 @@ struct SimHardware::Impl {
         protocol::kProtocolVersion,
         state.build.revision,
         0,
+        0,
+        0,  // socket_send_failures_count
+        0,  // socket_reopens_count
+        0,  // state_sequence_gaps_count
+        0,  // state_decode_failures_count
         0};
     can_buses.Fill(status);
     sim.publish(::bridge::topics::kStatus, status);

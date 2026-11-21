@@ -99,6 +99,36 @@ const COUNTERS: CounterSpec[] = [
     label: 'Device resets',
     note: 'Device resets detected since the bridge started; the gateway ' +
         'neutralizes and re-configures after each.'
+  },
+  {
+    name: 'socket_send_failures_count',
+    label: 'Socket send failures',
+    note: 'Failed UDP sends on the bridge→RoboRIO socket since the bridge ' +
+        'started.'
+  },
+  {
+    name: 'socket_reopens_count',
+    label: 'Socket reopens',
+    note: 'Times the bridge closed and reopened its UDP socket after a ' +
+        'permanent send error.'
+  },
+  {
+    name: 'state_sequence_gaps_count',
+    label: 'State sequence gaps',
+    note: 'Missed UDP frame sequence numbers detected on incoming gateway ' +
+        'datagrams.'
+  },
+  {
+    name: 'state_decode_failures_count',
+    label: 'State decode failures',
+    note: 'Incoming UDP frames that failed frame decoding (corrupt or ' +
+        'mismatched protocol).'
+  },
+  {
+    name: 'socket_send_would_block_count',
+    label: 'Socket send would-block',
+    note: 'Outbound UDP sends dropped because the nonblocking socket send ' +
+        'buffer was full.'
   }
 ];
 

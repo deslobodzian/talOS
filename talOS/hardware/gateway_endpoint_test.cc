@@ -773,6 +773,39 @@ TEST(Endpoint, PartialOrRejectedTransferKeepsTheActiveConfig) {
   EXPECT_TRUE(gateway.Accept(Request(gateway), 1, now_us));
 }
 
+// REQ-SAFE-21, REQ-OPS-20 (TODO.md RESET-4): pushing a changed configuration
+// while the robot is enabled returns kBackendFailed with the reason telling the
+// drive team to disable to accept the new configuration, without changing the
+// wire protocol version or ConfigAckPayload layout.
+TEST(Endpoint, EnabledReconfigurationRefusalExplainsToDisable) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3014};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  const auto active = SwerveConfig(true);
+  const auto accepted = PushConfig(endpoint, gateway, companion, active, false);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_EQ(accepted->status, ConfigAckStatus::kOk);
+
+  // Transition gateway to enabled, then push a changed configuration.
+  ASSERT_TRUE(TickForState(endpoint, companion, 3000, true).has_value());
+  auto changed = active;
+  changed.motors[0].slots[0].p = 4.25;
+  const auto refused = PushConfig(endpoint, gateway, companion, changed, true);
+  ASSERT_TRUE(refused.has_value());
+  EXPECT_EQ(refused->config_id, ConfigurationId(changed));
+  EXPECT_EQ(refused->status, ConfigAckStatus::kBackendFailed);
+  EXPECT_STREQ(refused->reason, "disable to accept the new configuration");
+
+  // Disabling lets the same configuration apply cleanly.
+  const auto applied = PushConfig(endpoint, gateway, companion, changed, false);
+  ASSERT_TRUE(applied.has_value());
+  EXPECT_EQ(applied->config_id, ConfigurationId(changed));
+  EXPECT_EQ(applied->status, ConfigAckStatus::kOk);
+}
+
 TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
   class PendingBackend : public FakeBackend {
    public:
