@@ -3422,6 +3422,147 @@ TEST(Supervision, SessionDirectoryLockIsRefreshedAndRetakenWhileHeld) {
   ::remove(runs.c_str());
 }
 
+// LOG-10 / REQ-OPS-11, REQ-OPS-30: lock-loss and retake events during
+// supervision persist immediately into the live manifest and survive into the
+// final manifest, and per-member `critical` and `studio_bridge` flags reflect
+// each member's role (including non-critical subsystems and the launcher-added
+// Studio bridge).
+TEST(Supervision, ManifestRecordsLockLossRetakeCriticalAndStudioBridge) {
+  auto options = BaseOptions("lock_manifest");
+  MakeAlphaNonCritical(options);
+  options.max_restarts = 0;
+  options.duration_s = 1'000'000;
+  options.heartbeat_periods = 1'000'000;
+  options.heartbeat_startup_grace_ms = 1'000'000'000;
+  options.construction_timeout = 1000h;
+  options.start_studio_bridge = true;
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
+  std::atomic<bool> block_dir_lock{false};
+  options.lock_session_directory = [&block_dir_lock](int fd, int op) {
+    if (block_dir_lock.load()) {
+      errno = EWOULDBLOCK;
+      return -1;
+    }
+    return ::flock(fd, op);
+  };
+  const auto runs = TempPath("lock_manifest_runs");
+  ::remove(runs.c_str());
+  for (const std::string name : {"hardware_node", "alpha", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + name + ":node";
+    options.binary_overrides[target] = WriteStub(
+        "lock_manifest_" + name, TrappedRun(runs, kLoopUntilStopped), name);
+  }
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("lock_manifest_bridge",
+                "trap 'exit 0' INT TERM\n" + std::string{kLoopUntilStopped},
+                "studio_bridge");
+
+  const std::string dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string dir_lock =
+      dir + "/" + std::string{kSessionDirectoryLockFile};
+  const std::string session_lock =
+      introspect::LockFilePath(ShmObjectName(kSessionLockName));
+  const std::string live = dir + "/manifest.json";
+
+  testing::SupervisionPasses passes;
+  bool started = false;
+  bool initial_false = false;
+  bool live_retaken = false;
+  bool live_dir_lost = false;
+  bool live_session_lost = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const auto pass = [&] {
+      const uint64_t after = passes.Started() + 2;
+      return WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after;
+      });
+    };
+    started =
+        WaitFor(stop, [&] { return ReadLines(runs).size() == 3; }) && pass();
+    if (started) {
+      const std::string before = ReadFile(live);
+      initial_false =
+          before.find("\"session_lock_lost\": false") != std::string::npos &&
+          before.find("\"directory_lock_lost\": false") != std::string::npos &&
+          before.find("\"directory_lock_retaken\": false") != std::string::npos;
+
+      ::unlink(dir_lock.c_str());
+      clock.Advance(kLockFileRefresh);
+      SupervisionWakeup::Wake();
+      live_retaken = WaitFor(stop, [&] {
+        return ReadFile(live).find("\"directory_lock_retaken\": true") !=
+               std::string::npos;
+      });
+
+      block_dir_lock.store(true);
+      ::unlink(dir_lock.c_str());
+      clock.Advance(kLockFileRefresh);
+      SupervisionWakeup::Wake();
+      live_dir_lost = WaitFor(stop, [&] {
+        return ReadFile(live).find("\"directory_lock_lost\": true") !=
+               std::string::npos;
+      });
+
+      ::unlink(session_lock.c_str());
+      clock.Advance(kLockFileRefresh);
+      SupervisionWakeup::Wake();
+      live_session_lost = WaitFor(stop, [&] {
+        return ReadFile(live).find("\"session_lock_lost\": true") !=
+               std::string::npos;
+      });
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  RunSession(options);
+  driver.join();
+
+  ASSERT_TRUE(started) << "not every member started";
+  EXPECT_TRUE(initial_false);
+  EXPECT_TRUE(live_retaken)
+      << "directory_lock_retaken did not reach live manifest";
+  EXPECT_TRUE(live_dir_lost)
+      << "directory_lock_lost did not reach live manifest";
+  EXPECT_TRUE(live_session_lost)
+      << "session_lock_lost did not reach live manifest";
+
+  const std::string final_manifest =
+      ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_NE(final_manifest.find("\"session_lock_lost\": true"),
+            std::string::npos)
+      << final_manifest;
+  EXPECT_NE(final_manifest.find("\"directory_lock_lost\": true"),
+            std::string::npos)
+      << final_manifest;
+  EXPECT_NE(final_manifest.find("\"directory_lock_retaken\": true"),
+            std::string::npos)
+      << final_manifest;
+
+  const std::string hw = ManifestEntry(final_manifest, "hardware_node");
+  EXPECT_NE(hw.find("\"critical\": true"), std::string::npos) << hw;
+  EXPECT_NE(hw.find("\"studio_bridge\": false"), std::string::npos) << hw;
+
+  const std::string alpha = ManifestEntry(final_manifest, "alpha");
+  EXPECT_NE(alpha.find("\"critical\": false"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"studio_bridge\": false"), std::string::npos) << alpha;
+
+  const std::string beta = ManifestEntry(final_manifest, "beta");
+  EXPECT_NE(beta.find("\"critical\": true"), std::string::npos) << beta;
+  EXPECT_NE(beta.find("\"studio_bridge\": false"), std::string::npos) << beta;
+
+  const std::string bridge = ManifestEntry(final_manifest, "studio_bridge");
+  EXPECT_NE(bridge.find("\"critical\": false"), std::string::npos) << bridge;
+  EXPECT_NE(bridge.find("\"studio_bridge\": true"), std::string::npos)
+      << bridge;
+
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
 // Options for a session in which nothing falls due on its own for an hour
 // (the session lock's refresh): no member is looked at, stalls, misses its
 // grace or construction deadline, or ends, and the duration is an hour. A

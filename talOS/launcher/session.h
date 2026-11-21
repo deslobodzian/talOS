@@ -154,6 +154,12 @@ int64_t WallClockNanos();
 struct NodeProcessInfo {
   std::string name;
   std::string target;
+  // Whether the launcher supervises this member as critical (false for
+  // non-critical subsystems and for the launcher-added Studio bridge).
+  bool critical{true};
+  // Whether this member is the launcher-added Studio bridge (true only for
+  // NodeSpec::studio_bridge, never for a robot subsystem named studio_bridge).
+  bool studio_bridge{false};
   std::string binary_path;
   // SHA-256 of binary_path when the session started (FileSha256); empty when
   // it could not be read.
@@ -287,6 +293,17 @@ struct SessionManifest {
   // A stop request arrived before every member was started: the members
   // with no run were never started.
   bool stopped_before_start{false};
+  // The namespace session lock file (`SessionLock`) was removed while this
+  // session held it, so a second launcher in this namespace would no longer be
+  // refused.
+  bool session_lock_lost{false};
+  // The session directory's `session.lock` was removed while this session held
+  // it and could not be locked again (retention holds it or moved the
+  // directory away).
+  bool directory_lock_lost{false};
+  // The session directory's `session.lock` was removed while this session held
+  // it and locked again on a new file.
+  bool directory_lock_retaken{false};
   std::size_t declared_topics{0};
   std::vector<NodeProcessInfo> nodes;
 

@@ -298,12 +298,21 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"end_wall_ns\": " << end_wall_ns << ",\n";
   ss << "  \"stopped_before_start\": "
      << (stopped_before_start ? "true" : "false") << ",\n";
+  ss << "  \"session_lock_lost\": " << (session_lock_lost ? "true" : "false")
+     << ",\n";
+  ss << "  \"directory_lock_lost\": "
+     << (directory_lock_lost ? "true" : "false") << ",\n";
+  ss << "  \"directory_lock_retaken\": "
+     << (directory_lock_retaken ? "true" : "false") << ",\n";
   ss << "  " << Key(keys::kNodes) << "[\n";
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& n = nodes[i];
     ss << "    {\n";
     ss << "      \"name\": " << Quoted(n.name) << ",\n";
     ss << "      \"target\": " << Quoted(n.target) << ",\n";
+    ss << "      \"critical\": " << (n.critical ? "true" : "false") << ",\n";
+    ss << "      \"studio_bridge\": " << (n.studio_bridge ? "true" : "false")
+       << ",\n";
     ss << "      \"binary_path\": " << Quoted(n.binary_path) << ",\n";
     ss << "      \"binary_sha256\": " << Quoted(n.binary_sha256) << ",\n";
     ss << "      \"log_path\": " << Quoted(n.log_path) << ",\n";

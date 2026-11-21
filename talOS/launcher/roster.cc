@@ -315,6 +315,7 @@ NodeSpec MakeNodeSpecWithMapping(std::string_view name,
   NodeSpec spec{std::string{name}, target,
                 ResolveBinary(target, options.binary_overrides, repo_mapping)};
   spec.studio_bridge = studio_bridge;
+  if (studio_bridge) spec.critical = false;
   if (::access(spec.binary_path.c_str(), X_OK) != 0 &&
       (studio_bridge || name != kStudioBridgeName)) {
     auto it = options.binary_overrides.find(spec.name);

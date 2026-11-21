@@ -1104,6 +1104,12 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   RoboRIO program's build is not here: every `/hw/state` record of the bridge's
   log carries it (`log_dump`'s `hardware` field,
   [filtering and exporting logs](#filtering-and-exporting-logs)).
+- per node, `critical` and `studio_bridge`: `critical` is `true` for the
+  hardware bridge, the simulation gateway and critical subsystems, and `false`
+  for non-critical subsystems (`[subsystems.<name>] critical = false`) and the
+  launcher-added Studio bridge; `studio_bridge` is `true` only for the
+  launcher-added Studio bridge (`--start-studio-bridge`), never for a robot
+  subsystem named `studio_bridge`.
 - per node, `binary_sha256`: the SHA-256 of `binary_path` as the session
   starts, empty if it cannot be read. It covers that file only: not the
   shared libraries a C++ node loads, nor a Python node's runfiles.
@@ -1165,6 +1171,13 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 - `stopped_before_start`: a stop request arrived before every member had
   started ([two phases](#two-phases)); the members without `runs` were
   never started.
+- `session_lock_lost`, `directory_lock_lost`, `directory_lock_retaken`:
+  whether the hourly lock refresh found the namespace session lock file removed
+  (`session_lock_lost`), found `session.lock` removed and could not lock it
+  again (`directory_lock_lost`), or found `session.lock` removed and locked it
+  again on a new file (`directory_lock_retaken`); each defaults to `false` and
+  persists into the live manifest as soon as observed
+  ([session segments and logs](#session-segments-and-logs)).
 - `launcher_log`: the launcher's own `talos.log` ([node output](#node-output)).
   A member's output log is not listed: it is always
   `<output_dir>/<session_id>/<name>.log`, and the launcher's end-of-session
@@ -1229,8 +1242,10 @@ header:
 the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 `manifest.json` is written before nodes start, then replaced atomically
 (written beside it, then renamed over it) at each process lifecycle change,
-when `studio_bridge` reports its bound `http_port`, when a node reports a stopped event log, when a run's endpoints differ from
-its probe and when a run's delivery-loss count first leaves 0
+when `studio_bridge` reports its bound `http_port`, when a node reports a
+stopped event log, when a run's endpoints differ from its probe, when a run's
+delivery-loss count first leaves 0, and when an hourly lock refresh observes a
+lost or retaken session or directory lock
 ([session manifest](#session-manifest)): a reader always sees one complete
 version. `graph.json`,
 `declared_graph.json` and every manifest version from the roster about to
@@ -1376,10 +1391,14 @@ server blocks for as long as the mount retries it (without end on a hard
 mount), and with it supervision and the watchdog's ping. If the path stops naming the
 locked file (removed by hand, or by a cleaner before a refresh), retention
 could take the directory from then on; the next refresh locks the file the
-path names (creating it, never the directory) and says so once on stderr. That adds
+path names (creating it, never the directory), says so once on stderr, and
+records `directory_lock_retaken: true` in `manifest.json`. That adds
 no window: it and a retention lock the same file, so either the launch
 holds it first and every later retention passes the session over, or a
-retention holds it and is removing the directory, which is reported too. A
+retention holds it and is removing the directory, which is reported on stderr
+and recorded as `directory_lock_lost: true` in `manifest.json` (similarly, a
+removed namespace session lock is reported on stderr and recorded as
+`session_lock_lost: true`). A
 running launcher that holds no `session.lock` (one built before it existed)
 is protected only from launches in its own namespace. So is one whose log
 root's filesystem takes no advisory locks (`EOPNOTSUPP`, `ENOTSUP`, `EINVAL`,

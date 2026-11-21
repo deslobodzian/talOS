@@ -99,6 +99,57 @@ test('parseManifest accepts string uint64 and missing optional flags', () => {
                    .nodes[0].log_gap, true);
   // A manifest from before exit_signal existed reads as no signal death.
   assert.equal(m.nodes[0].exit_signal, 0);
+  // REQ-OPS-11, REQ-OPS-30: legacy manifests leave lock-anomaly and
+  // critical/studio_bridge fields undefined so critical is never misreported
+  // as false.
+  assert.equal(m.session_lock_lost, undefined);
+  assert.equal(m.directory_lock_lost, undefined);
+  assert.equal(m.directory_lock_retaken, undefined);
+  assert.equal(m.nodes[0].critical, undefined);
+  assert.equal(m.nodes[0].studio_bridge, undefined);
+});
+
+// REQ-OPS-11, REQ-OPS-30: parseManifest parses lock-loss/retake and
+// per-member critical/studio_bridge booleans when present and rejects
+// non-boolean values for them.
+test('parseManifest reads lock flags and member critical/studio_bridge flags', () => {
+  const doc = {
+    session_id: '7',
+    config_path: '/robot.toml',
+    config_sha256: 'abc',
+    output_dir: '/tmp/session',
+    simulation: false,
+    start_wall_ns: '1',
+    end_wall_ns: '2',
+    session_lock_lost: true,
+    directory_lock_lost: false,
+    directory_lock_retaken: true,
+    nodes: [
+      {
+        name: 'drivetrain', target: '//2026:drivetrain', critical: true,
+        studio_bridge: false, binary_path: 'b', log_path: 'l', log_paths: ['l'],
+        pid: 1, exit_code: 0, restart_count: 0, record_count: 0
+      },
+      {
+        name: 'studio_bridge', target: '//studio/bridge:studio_bridge',
+        critical: false, studio_bridge: true, binary_path: 's', log_path: '',
+        log_paths: [], pid: 2, exit_code: 0, restart_count: 0, record_count: 0
+      }
+    ]
+  };
+  const m = parseManifest(JSON.stringify(doc));
+  assert.equal(m.session_lock_lost, true);
+  assert.equal(m.directory_lock_lost, false);
+  assert.equal(m.directory_lock_retaken, true);
+  assert.equal(m.nodes[0].critical, true);
+  assert.equal(m.nodes[0].studio_bridge, false);
+  assert.equal(m.nodes[1].critical, false);
+  assert.equal(m.nodes[1].studio_bridge, true);
+
+  assert.throws(() => parseManifest(JSON.stringify({...doc, session_lock_lost: 1})));
+  assert.throws(() => parseManifest(JSON.stringify({
+    ...doc, nodes: [{...doc.nodes[0], critical: 'yes'}]
+  })));
 });
 
 test('parseManifest reads run history and code identity; older manifests lack them', () => {

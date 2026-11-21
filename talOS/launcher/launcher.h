@@ -446,7 +446,7 @@ class Launcher {
   // restart do not hold the session open. Between passes it sleeps until
   // the earliest deadline a pass decides on, woken at once by a child's exit
   // or a stop signal (SupervisionWakeup; README "Supervision passes").
-  void Supervise(std::vector<NodeProcessInfo>& procs,
+  void Supervise(SessionManifest& manifest, std::vector<NodeProcessInfo>& procs,
                  std::vector<NodeLaunch>& launches,
                  std::optional<StudioBridge>& studio,
                  std::optional<std::size_t> sim_gateway_index,
