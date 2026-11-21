@@ -464,6 +464,14 @@ class RobotRepositoryTest(unittest.TestCase):
             for gone in ("roller", "gate"):
                 self.assertNotIn(gone, files["robot.toml"])
                 self.assertNotIn(gone, files["robot_manifest.bzl"])
+            # REPO-7 / TOOLS-7: README documents the CI Studio build step and
+            # stale-pin failure behavior.
+            readme = files["README.md"]
+            self.assertIn("bazel build //studio:web_dist", readme)
+            self.assertIn(
+                "bazel test --test_env=TALOS_REQUIRE_STUDIO_PAGES=1 //...",
+                readme)
+            self.assertIn("STUDIO_STAMP.txt", readme)
             # What the repository's manifest_sync_test checks.
             for path, content in files.items():
                 write(os.path.join(target, path), content)

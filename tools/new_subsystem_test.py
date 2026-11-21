@@ -1384,6 +1384,65 @@ class NewSubsystemTest(unittest.TestCase):
             self.assertIn('name = "localizer"', by_rel[
                 "bot/main_processor/configuration/robot.toml"])
 
+    # REQ-DEV-01, REQ-DEV-30
+    def test_talos_module_and_build_templates_support_custom_repo_name(self):
+        # talos_module() reads sync_manifest.talos_repo_prefix() (backed by
+        # _repo_mapping) and inspects BUILD_WORKSPACE_DIRECTORY/MODULE.bazel's
+        # bazel_dep(name = "talos", repo_name = ...) via ast.
+        with mock.patch.object(new_subsystem.sync_manifest,
+                               "current_repository", return_value=""):
+            self.assertEqual(new_subsystem.talos_module(), "")
+
+        for canonical, apparent in (("talos+", "my_talos"),
+                                    ("talos~", "my_talos7")):
+            with self.subTest(source="repo_mapping", canonical=canonical), \
+                    tempfile.TemporaryDirectory() as rf_dir:
+                with open(os.path.join(rf_dir, "_repo_mapping"), "w",
+                          encoding="utf-8") as f:
+                    f.write(f",{apparent},{canonical}\n")
+                with mock.patch.dict(os.environ, {"RUNFILES_DIR": rf_dir},
+                                     clear=False), \
+                        mock.patch.object(new_subsystem.sync_manifest,
+                                          "current_repository",
+                                          return_value=canonical):
+                    self.assertEqual(new_subsystem.talos_module(""),
+                                     f"@{apparent}")
+
+        with tempfile.TemporaryDirectory() as ws:
+            with open(os.path.join(ws, "MODULE.bazel"), "w",
+                      encoding="utf-8") as f:
+                f.write('module(name = "bot")\n'
+                        'bazel_dep(name = "talos", version = "0.1.0", '
+                        'repo_name = "custom_talos")\n')
+            with mock.patch.object(new_subsystem.sync_manifest,
+                                   "current_repository",
+                                   return_value="talos+"), \
+                    mock.patch.dict(os.environ,
+                                    {"BUILD_WORKSPACE_DIRECTORY": ws}):
+                self.assertEqual(new_subsystem.talos_module(), "@custom_talos")
+
+        # BUILD templates substitute @TALOS@ directly and sort deps with
+        # string_list() (no TALOS_LABEL regex post-rewrite).
+        self.assertFalse(hasattr(new_subsystem, "TALOS_LABEL"))
+        bare_talos = re.compile(r"(?<![@\w])//talOS/")
+        for lang in ("cpp", "py"):
+            for kind in ("velocity", "position", "estimator"):
+                with self.subTest(lang=lang, kind=kind):
+                    build = new_subsystem.package_files(
+                        "intake", lang, kind=kind,
+                        talos="@my_talos")["BUILD"]
+                    self.assertIsNone(bare_talos.search(build), build)
+                    self.assertIn(
+                        'load("@my_talos//talOS/build:contract.bzl"', build)
+                    if lang == "cpp":
+                        # @googletest < @my_talos < @rules_cc in buildifier order
+                        self.assertLess(
+                            build.index('"@googletest//:gtest_main"'),
+                            build.index('"@my_talos//talOS/devices:testing"'))
+                        self.assertLess(
+                            build.index('"@my_talos//talOS/node:testing"'),
+                            build.index('"@rules_cc//cc/runfiles"'))
+
 
 if __name__ == "__main__":
     unittest.main()
