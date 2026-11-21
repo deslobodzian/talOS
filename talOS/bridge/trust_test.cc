@@ -1273,14 +1273,18 @@ TEST(HardwareNodeTrustTest, TransitionAtTwoPeriodsOfSilenceRaisesNoTimeout) {
   ASSERT_FALSE(node.is_subsystem_timed_out("drivetrain"));
   ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
 
-  // The new epoch, 1 us before both owners' next flush, which it refuses.
+  // The new epoch, 1 us before both owners' next flush, which it refuses
+  // without merging (superseded all-neutral requests do not count in
+  // identity_rejected).
   constexpr uint64_t kTransitionUs = kAcceptedUs + kPeriodUs - 1;
   const State second = TrustState(config_id, 11, 2, 1000 + kPeriodUs);
   ASSERT_TRUE(rig.gateway.Deliver(second, kTransitionUs));
   PublishCommand(drive_pub, NeutralCommand(first, drive));
   PublishCommand(intake_pub, NeutralCommand(first, roller));
   node.Tick(kAcceptedUs + kPeriodUs);
-  ASSERT_EQ(node.identity_rejected(), 2u);
+  ASSERT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.identity_rejected(), 0u);
 
   // Two periods and one microsecond since each owner's last accepted
   // request: no timeout.
@@ -2028,6 +2032,123 @@ TEST(HardwareNodeTrustTest,
   ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 12, 2, 8000), now_us));
   EXPECT_FALSE(node.Status(now_us).alert_error_hardware_fault());
   EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
+}
+
+// Guards RT-12 item (a) (REQ-OPS-20): at a fresh enable edge (epoch bump,
+// before any request is accepted from a subsystem in the new epoch), an
+// in-flight all-neutral request carrying the earlier nonzero epoch is still
+// refused (never merges or refreshes silence), but does not increment
+// identity_rejected_count. Any driving output, wrong device ownership, or
+// stale-epoch neutral arriving after a new-epoch request was already accepted
+// still increments identity_rejected_count.
+TEST(
+    HardwareNodeTrustTest,
+    SupersededNeutralAtEnableEdgeIsRefusedWithoutIncrementingIdentityRejected) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint16_t beacon = cfg.hardware.digital_outputs[0].id;
+  const uint16_t strip = cfg.hardware.pwm_outputs[0].id;
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  Acknowledge(rig, config_id, kStartUs - 500);
+  State disabled = TrustState(config_id, 11, 1, 1'000);
+  disabled.flags = kConfigured;
+  ASSERT_TRUE(gateway.Deliver(disabled, kStartUs));
+
+  auto make_stale_neutral = [&]() {
+    Command cmd{};
+    cmd.config_id = config_id;
+    cmd.boot_id = 11;
+    cmd.epoch = 1;
+    cmd.observed_time_us = 1'000;
+    cmd.count = 1;
+    cmd.motors[0] = {roller, Mode::kNeutral, 0, 0.0, 0.0};
+    cmd.digital_output_count = 1;
+    cmd.digital_outputs[0] = {beacon, false};
+    cmd.pwm_output_count = 1;
+    cmd.pwm_outputs[0] = {strip, PwmMode::kOff, 0.0};
+    return cmd;
+  };
+
+  // Accept one neutral request while disabled in epoch 1 so intake is heard.
+  PublishCommand(intake_pub, make_stale_neutral());
+  node.Tick(kStartUs + 1'000);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.identity_rejected(), 0u);
+
+  // Enable edge: gateway bumps epoch 1 -> 2.
+  const uint64_t enable_us = kStartUs + 5'000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 2, 6'000), enable_us));
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+  const uint64_t commands_before = node.commands_sent();
+
+  // (i) All-neutral stale-epoch request racing the enable edge: refused
+  // (never merges, no command sent, silence_from_us not refreshed), yet
+  // identity_rejected_count stays 0.
+  PublishCommand(intake_pub, make_stale_neutral());
+  node.Tick(enable_us + 2'000);
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.commands_sent(), commands_before);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_EQ(node.Status(enable_us + 2'000).identity_rejected_count(), 0u);
+  // Silence was NOT refreshed at enable_us + 2'000: it still expires at
+  // enable_us + owner_timeout_us + 1.
+  EXPECT_EQ(TimedOutMask(node, enable_us + owner_timeout_us), 0u);
+  EXPECT_EQ(TimedOutMask(node, enable_us + owner_timeout_us + 1), 0b10u);
+
+  // (ii) Driving stale-epoch requests (motor, DIO, PWM pulse) STILL increment
+  // identity_rejected_count.
+  Command driving_motor = make_stale_neutral();
+  driving_motor.motors[0] = {roller, Mode::kVoltage, 0, 3.0, 0.0};
+  PublishCommand(intake_pub, driving_motor);
+  node.Tick(enable_us + 3'000);
+  EXPECT_EQ(node.identity_rejected(), 1u);
+
+  Command driving_dio = make_stale_neutral();
+  driving_dio.digital_outputs[0] = {beacon, true};
+  PublishCommand(intake_pub, driving_dio);
+  node.Tick(enable_us + 4'000);
+  EXPECT_EQ(node.identity_rejected(), 2u);
+
+  Command driving_pwm = make_stale_neutral();
+  driving_pwm.pwm_outputs[0] = {strip, PwmMode::kPulse, 0.0};
+  PublishCommand(intake_pub, driving_pwm);
+  node.Tick(enable_us + 5'000);
+  EXPECT_EQ(node.identity_rejected(), 3u);
+
+  // (iii) Stale-epoch neutral request addressing another subsystem's device
+  // STILL increments identity_rejected_count.
+  Command wrong_owner = make_stale_neutral();
+  wrong_owner.motors[0] = {drive, Mode::kNeutral, 0, 0.0, 0.0};
+  PublishCommand(intake_pub, wrong_owner);
+  node.Tick(enable_us + 6'000);
+  EXPECT_EQ(node.identity_rejected(), 4u);
+  EXPECT_EQ(node.ownership_rejected(), 0u);
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+
+  // (iv) Once a new-epoch request is accepted, a subsequent stale-epoch
+  // all-neutral request STILL increments identity_rejected_count.
+  Command epoch2_ok = make_stale_neutral();
+  epoch2_ok.epoch = 2;
+  epoch2_ok.observed_time_us = 6'000;
+  PublishCommand(intake_pub, epoch2_ok);
+  node.Tick(enable_us + 7'000);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.identity_rejected(), 4u);
+
+  PublishCommand(intake_pub, make_stale_neutral());
+  node.Tick(enable_us + 8'000);
+  EXPECT_EQ(node.identity_rejected(), 5u);
+  EXPECT_EQ(node.Status(enable_us + 8'000).identity_rejected_count(), 5u);
 }
 
 }  // namespace

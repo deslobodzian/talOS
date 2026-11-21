@@ -154,6 +154,13 @@ struct CanBusStatus {
 struct BridgeStatus {
   states_received_count:uint64;
   commands_sent_count:uint64;
+  // Subsystem requests refused by the bridge's identity or freshness gate
+  // (wrong config_id, boot_id, epoch, or inadmissible observed_time_us). Omits
+  // a superseded all-neutral request from an earlier nonzero epoch of the same
+  // boot and configuration (valid device ownership, admissible observation
+  // age, before any request has been accepted from that subsystem in the new
+  // epoch), which is still dropped without merging or refreshing silence,
+  // mirroring gateway_rejected_command_count's superseded-neutral rule.
   identity_rejected_count:uint64;
   ownership_rejected_count:uint64;
   driver_station_packet_count:uint64;
