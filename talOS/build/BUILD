@@ -187,6 +187,8 @@ py_binary(
     srcs = ["bundle_builder.py"],
 )
 
+# Over 5 s on 4-vCPU CI (6.5 s), integration lane: executes bundle_builder.py,
+# workspace_status.sh, and real git subprocesses across temporary repositories.
 py_test(
     name = "bundle_builder_test",
     size = "small",
@@ -198,6 +200,7 @@ py_test(
         "//tools:workspace_status.sh",
     ],
     legacy_create_init = False,
+    tags = ["integration"],
     deps = ["@rules_python//python/runfiles"],
 )
 
