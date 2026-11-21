@@ -19,6 +19,10 @@
 #include "talOS/rtms/wake.h"
 #include "talOS/schema/identity.h"
 
+namespace talos::rtms_test {
+class RegistrationPeer;  // ring_lap_test.cc
+}  // namespace talos::rtms_test
+
 inline constexpr size_t CACHE_LINE = 64;  // C++ I think as a function for this.
 inline constexpr size_t MAX_SLOTS = 1u << 10;  // 1024 slots maximum
 inline constexpr size_t MASK = MAX_SLOTS - 1;  // Mask for fixed size
@@ -316,6 +320,10 @@ class RTMSQueue {
   }
 
  private:
+  // Runs register_reader()'s claim and activate steps with writes between
+  // them, which no thread schedule can be made to do on demand.
+  friend class talos::rtms_test::RegistrationPeer;
+
   // Number of times a read retries when the writer laps it mid-read.
   static constexpr int MAX_READ_ATTEMPTS = 8;
 
@@ -345,6 +353,17 @@ class RTMSQueue {
   // Leaves the segment's lifetime: the last queue of a segment that is not
   // session-owned, or the session owner, unlinks it.
   void close() noexcept;
+
+  // register_reader()'s two steps for reader slot `reader_id`. The claim
+  // marks a free slot CLAIMING and starts its cursor at the writer's
+  // position, which it returns; nullopt when the slot is not free.
+  std::optional<std::uint64_t> claim_reader_slot(std::size_t reader_id);
+  // Marks a slot claimed at writer position `current` ACTIVE, false when the
+  // claim was lost meanwhile. When a writer that saw no active reader has
+  // published `slots` or more messages since the claim, the cursor's slot
+  // was overwritten or may be being overwritten: the cursor then moves to
+  // the writer.
+  bool activate_reader_slot(std::size_t reader_id, std::uint64_t current);
 
   // Chooses the sequence this reader should observe next and fills in how
   // many messages were skipped to reach it. Returns false when the reader is

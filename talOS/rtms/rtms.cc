@@ -780,47 +780,59 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
   return ReadResult::TORN;
 }
 
-std::optional<std::size_t> RTMSQueue::register_reader() {
-  const std::uint64_t claiming = ReaderWord(ReaderState::CLAIMING);
+std::optional<std::uint64_t> RTMSQueue::claim_reader_slot(
+    std::size_t reader_id) {
+  auto& reader = header_->readers[reader_id];
+  std::uint64_t expected = 0;
+
+  // The claim carries this process's pid, so a claimant that dies at any
+  // point after it -- even before it marks the slot active -- leaves a
+  // slot reclaim_dead_readers() can free.
+  if (!reader.state.compare_exchange_strong(
+          expected, ReaderWord(ReaderState::CLAIMING),
+          std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    return std::nullopt;
+  }
+
+  // A previous holder's receiver and arm do not carry over to this one.
+  header_->writer.waiters.fetch_and(~(std::uint64_t{1} << reader_id),
+                                    std::memory_order_acq_rel);
+  reader.wake_id.store(0, std::memory_order_release);
+
+  const auto current = header_->writer.sequence.load(std::memory_order_acquire);
+
+  reader.sequence.store(current, std::memory_order_relaxed);
+  return current;
+}
+
+bool RTMSQueue::activate_reader_slot(std::size_t reader_id,
+                                     std::uint64_t current) {
+  auto& reader = header_->readers[reader_id];
   const std::uint64_t active = ReaderWord(ReaderState::ACTIVE);
+
+  // Only while the claim is still this one: a process that judged this
+  // one dead may have freed it meanwhile, and another claimed the slot.
+  std::uint64_t expected = ReaderWord(ReaderState::CLAIMING);
+  if (!reader.state.compare_exchange_strong(expected, active,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+    return false;
+  }
+  registered_[reader_id] = active;
+  const auto writer_after =
+      header_->writer.sequence.load(std::memory_order_acquire);
+  if (writer_after > current && writer_after - current >= header_->slots) {
+    reader.sequence.store(writer_after, std::memory_order_release);
+  }
+  return true;
+}
+
+std::optional<std::size_t> RTMSQueue::register_reader() {
   for (int pass = 0; pass < 2; ++pass) {
     for (std::size_t i = 0; i < MAX_READERS; ++i) {
-      auto& reader = header_->readers[i];
-      std::uint64_t expected = 0;
-
-      // The claim carries this process's pid, so a claimant that dies at any
-      // point after it -- even before it marks the slot active -- leaves a
-      // slot reclaim_dead_readers() can free.
-      if (!reader.state.compare_exchange_strong(expected, claiming,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_relaxed)) {
-        continue;
-      }
-
-      // A previous holder's receiver and arm do not carry over to this one.
-      header_->writer.waiters.fetch_and(~(std::uint64_t{1} << i),
-                                        std::memory_order_acq_rel);
-      reader.wake_id.store(0, std::memory_order_release);
-
-      const auto current =
-          header_->writer.sequence.load(std::memory_order_acquire);
-
-      reader.sequence.store(current, std::memory_order_relaxed);
-
-      // Only while the claim is still this one: a process that judged this
-      // one dead may have freed it meanwhile, and another claimed the slot.
-      expected = claiming;
-      if (!reader.state.compare_exchange_strong(expected, active,
-                                                std::memory_order_release,
-                                                std::memory_order_relaxed)) {
-        continue;
-      }
-      registered_[i] = active;
-      const auto writer_after =
-          header_->writer.sequence.load(std::memory_order_acquire);
-      if (writer_after > current && writer_after - current > header_->slots) {
-        reader.sequence.store(writer_after, std::memory_order_release);
-      }
+      const std::optional<std::uint64_t> current = claim_reader_slot(i);
+      if (!current.has_value()) continue;
+      if (!activate_reader_slot(i, *current)) continue;
       return i;
     }
     if (reclaim_dead_readers() == 0) break;
