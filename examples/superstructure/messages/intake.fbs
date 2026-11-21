@@ -10,8 +10,10 @@ struct IntakeGoal {
   command:IntakeCommand;
 }
 
-// What the intake is doing, on /intake/state. has_piece is the beam break.
+// What the intake is doing, on /intake/state. has_piece is the beam break
+// reading; sensor_connected is whether that digital input sample is valid.
 struct IntakeStatus {
   state:IntakeState;
   has_piece:bool;
+  sensor_connected:bool;
 }

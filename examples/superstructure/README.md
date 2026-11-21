@@ -39,8 +39,10 @@ maps the block's phase to its own status enum.
   never sent) it behaves as asked for IDLE with the roller neutral; the state
   machine still tracks the beam break and finishes a timed eject. Losing
   enable cancels an eject or intake in progress (back to IDLE); a held piece
-  stays HOLDING. While the beam break's sample is invalid, `has_piece` keeps
-  its last valid value and INTAKING leaves the roller neutral
+  stays HOLDING. `/intake/state` (`demo.IntakeStatus`) carries `sensor_connected`
+  from the beam break's `connected()` validity: while the sample is invalid,
+  `sensor_connected` is false, `has_piece` keeps its last valid value, and
+  INTAKING leaves the roller neutral rather than blocking indefinitely
   ([RollerWithSensor](../../talOS/mechanisms/README.md#rollerwithsensor)).
 - **elevator**: motion magic to the goal height (clamped to
   `min_rot`..`max_rot`, 0..12, in the `[lift]` table) while it has a target. It reports STOWED at 0, MOVING,
@@ -209,12 +211,14 @@ stale, released or never-sent lane, and latch HOMING_FAILED on the timeout
 (kept through a stale-link glitch, cleared by a Driver Station disable), on a
 stall and on a switch stuck closed. Another test refuses unsafe homing
 parameters, naming the key. The other tests start the lift on its closed
-switch, which reads false. The intake alone drives at a live lane and goes
+switch, which reads false. The intake alone drives at a live lane, goes
 neutral while disabled, on a goal of an earlier generation, and on a stale
-lane while keeping its state.
-`py/superstructure_test.py` covers Python host integration, disabled operation
-and target loss with `talos.testing.Sim` and `config/robot_py.toml`; the shared
-C++ suite owns the detailed mechanism scenarios.
+lane while keeping its state, and clears `sensor_connected` with a neutral
+roller when the beam break disconnects until it reconnects.
+`py/superstructure_test.py` covers Python host integration, disabled operation,
+target loss and beam-break disconnect with `talos.testing.Sim` and
+`config/robot_py.toml`; the shared C++ suite owns the detailed mechanism
+scenarios.
 
 ## Run it in simulation
 

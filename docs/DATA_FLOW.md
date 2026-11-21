@@ -325,7 +325,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/swerve_module/state` (bench only): swerve_module → telemetry/logs | 128 | 120 B ModuleState: drive, steer and CANcoder feedback, the commanded setpoint and flags; pinned in `swerve_module.h` |
 | `/gyro/state` (bench only): gyro → telemetry/logs | 56 | 48 B GyroState: yaw, yaw rate, their ages and two flags, including padding; Python node, size pinned at import by `bench/main_processor/gyro/node_py_test.py` |
 | `/elevator/state` (examples/superstructure): elevator → superstructure/telemetry | 40 | 32 B demo.ElevatorStatus |
-| `/intake/state` (examples/superstructure): intake → superstructure/telemetry | 16 | 2 B demo.IntakeStatus |
+| `/intake/state` (examples/superstructure): intake → superstructure/telemetry | 16 | 3 B demo.IntakeStatus |
 | `/superstructure/state` (examples/superstructure): superstructure → telemetry | 16 | 1 B demo.SuperstructureStatus |
 | `/wrist/state` (examples/external_subsystem): wrist → logs | 32 | 24 B wrist.WristState |
 | `/<camera>/state`: a robot's camera node → a `new_subsystem --type estimator` node/telemetry | <!-- size: pose_observation.slot_bytes -->72 | <!-- size: pose_observation.bytes -->64 B geometry.PoseObservation, including padding |
