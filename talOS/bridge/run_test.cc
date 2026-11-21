@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -409,6 +410,89 @@ TEST(HardwareNodeTest, RunSendsHeartbeatsAndTheTimeoutNeutralOnItsOwn) {
       commands.back().sent_us - commands.front().sent_us;
   EXPECT_GT(neutral_after_us, timeout_us);
   EXPECT_LT(neutral_after_us, command_timeout_us);
+}
+
+std::atomic<int> run_pending_recv_error{0};
+int TakeRunRecvError() { return run_pending_recv_error.exchange(0); }
+
+// Under Run() with its poller active, a transient receive error (ECONNREFUSED)
+// keeps the socket open, while a permanent receive error (ENETUNREACH) closes
+// the socket, removes its fd from the poller, reopens it, registers the new fd
+// so subsequent States still arrive, and reports the reopen on /hw/status.
+// REQ-RT-22
+TEST(HardwareNodeTest, RunReopensSocketOnPermanentReceiveErrorAndKeepsRunning) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  run_pending_recv_error.store(0);
+  node.set_seams({.recv_error = &TakeRunRecvError});
+  ipc::Subscriber<Packet> states{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  ipc::Subscriber<bridge::BridgeStatus> statuses{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  {
+    RunningBridge run{node};
+    ASSERT_TRUE(
+        SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 1000)));
+    ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 1000); }));
+
+    // Transient ECONNREFUSED keeps the socket open and frames keep arriving.
+    run_pending_recv_error.store(ECONNREFUSED);
+    ASSERT_TRUE(
+        SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 2000)));
+    ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 2000); }));
+
+    // Permanent ENETUNREACH triggers a reopen and re-adds the fd to poller_.
+    run_pending_recv_error.store(ENETUNREACH);
+    ASSERT_TRUE(WaitFor([&] {
+      const auto status = statuses.read();
+      return status && status->socket_reopens_count() >= 1u;
+    }));
+    ASSERT_TRUE(
+        SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 3000)));
+    ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 3000); }));
+  }
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+  EXPECT_EQ(node.wakeups().wait_fallbacks, 0u);
+}
+
+// Under Run(), a HardwareNode pinned to an absent local_address starts cleanly,
+// keeps its poller active without falling back to 1 ms polling, and retries
+// opening on the 100 ms cadence rather than falling back to 0.0.0.0.
+// REQ-RT-22, REQ-OPS-25
+TEST(HardwareNodeTest,
+     RunRetriesAbsentLocalAddressWithoutCrashingOrPollingFallback) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  uint16_t gateway_port = 0;
+  uint16_t node_port = 0;
+  int gw_res = ReservePort(gateway_port);
+  int node_res = ReservePort(node_port);
+  ASSERT_GE(gw_res, 0);
+  ASSERT_GE(node_res, 0);
+  Release(node_res);
+
+  HardwareNode node{cfg, "127.0.0.1", gateway_port, node_port,  true, 0,
+                    {},  0,           {},           "192.0.2.1"};
+  ASSERT_TRUE(node.Open());
+  ipc::Subscriber<bridge::BridgeStatus> statuses{bridge::topics::kStatus};
+  uint64_t status_count = 0;
+  {
+    RunningBridge run{node};
+    // 10 status publications at 20 ms each (~180 ms) guarantees at least two
+    // 100 ms reopen attempts on the bridge clock.
+    ASSERT_TRUE(WaitFor([&] {
+      while (statuses.read()) ++status_count;
+      return status_count >= 10;
+    }));
+  }
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.wakeups().wait_fallbacks, 0u);
+  EXPECT_GE(node.socket_counters().reopen_attempts, 2u);
+  EXPECT_EQ(node.socket_counters().reopens, 0u);
+  Release(gw_res);
 }
 
 }  // namespace

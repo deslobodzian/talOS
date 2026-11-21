@@ -687,7 +687,12 @@ commanding the robot ([protocol](../protocol/README.md)). Runtime ports are
 5802 on the gateway and 5803 on the companion.
 The other direction -- the companion finding the gateway -- is
 `[robot] controller_address` in the robot config (see [launcher addressing](../launcher/README.md#controller-addressing)),
-overridden per launch by `launcher --remote`. Real hardware uses Driver Station
+overridden per launch by `launcher --remote`. `[robot] local_address` (or
+`hardware_node --local-address IP`) optionally pins the bridge's UDP bind
+address to a specific IPv4 interface instead of `0.0.0.0`; when pinned and
+absent at startup (`EADDRNOTAVAIL` / `ENETUNREACH`), `hardware_node` logs one
+stderr line naming the address and errno and retries every 100 ms until the
+interface comes up rather than falling back to `0.0.0.0` or exiting. Real hardware uses Driver Station
 enable and e-stop.
 The socket is opened from the adapter's main loop. After a RoboRIO boot the
 program can start before the network has a route to the companion, and the
@@ -698,15 +703,16 @@ until the socket opens. The console reports the failures
 (`hardware gateway socket failed: <status> (errno <n>)`, coalesced to one line
 a second) and, once it opens, `hardware gateway socket open after <n> failed
 attempts, <s> s after the first`.
-A send that fails with an error the socket may never recover from
-(`protocol::SendErrorNeedsNewSocket`, whose errors are in
-[talOS/protocol](../protocol/README.md): among them `ENETUNREACH`, Linux's
-error once the RoboRIO's address changes under the connected socket; the
-bridge's rule in
+A send or receive that fails with an error the socket may never recover from
+(`protocol::SendErrorNeedsNewSocket` / `protocol::ReceiveErrorNeedsNewSocket`,
+whose errors are in [talOS/protocol](../protocol/README.md): among them
+`ENETUNREACH`, Linux's error once the RoboRIO's address changes under the
+connected socket, and `EBADF`; the bridge's rule in
 [data flow](../../docs/DATA_FLOW.md#link-rates-and-endpoints)) loses the
-socket: nothing more is sent that tick, and the loop opens a new socket on
-the same ports (`Endpoint::Reopen`, keeping the frame sequence) on the same
-100 ms cadence, at once when no attempt was made in the last 100 ms, so a
+socket: on a permanent receive error the adapter closes it immediately
+(`Endpoint::Close()`), nothing more is sent that tick, and the loop opens a new
+socket on the same ports (`Endpoint::Reopen`, keeping the frame sequence) on the
+same 100 ms cadence, at once when no attempt was made in the last 100 ms, so a
 condition that breaks every new socket costs at most ten sockets a second.
 Usually the next tick replaces it and runs as any other: the replacement is
 a link gap of one tick, and the command in force keeps its usual expiry
@@ -716,10 +722,11 @@ sequence, boot, epoch and age checks. A tick with no socket open (the
 attempt failed, or is not due yet) ticks the gateway disabled, all outputs
 neutral, and sends nothing, as before the first open. The console prints
 `hardware gateway socket cannot send (errno <n>); replacing it, nothing is
-sent until then` and, once replaced, `hardware gateway socket replaced after
-<n> failed attempts, <s> s after it could not send` (each coalesced to one
-line a second). Any other send error (`ENOBUFS`, `ECONNREFUSED`, ...) keeps
-the socket. Every failed send is counted in a spell, which ends at a good
+sent until then` (or `hardware gateway socket cannot receive (errno <n>);
+replacing it, nothing is sent until then`) and, once replaced, `hardware
+gateway socket replaced after <n> failed attempts, <s> s after it was lost`
+(each coalesced to one line a second). Any other send or receive error
+(`ENOBUFS`, `ECONNREFUSED`, ...) keeps the socket. Every failed send is counted in a spell, which ends at a good
 send one second after its last failure (with the companion's port closed
 every other send fails with `ECONNREFUSED`); a spell prints `hardware
 gateway socket send failed (errno <n>); keeping the socket` at its first

@@ -43,11 +43,28 @@ class Endpoint {
     return peer_.Open(local, local_port, remote, remote_port);
   }
   // A new socket on the ports of the last successful Open(), keeping the
-  // frame sequence (RuntimeUdpPeer::Reopen): for a caller whose sends found
-  // the socket unable to send again (protocol::SendErrorNeedsNewSocket on
-  // udp_stats().last_send_error).
+  // frame sequence (RuntimeUdpPeer::Reopen): for a caller whose sends or
+  // receives found the socket broken (protocol::SendErrorNeedsNewSocket /
+  // protocol::ReceiveErrorNeedsNewSocket).
   protocol::UdpStatus Reopen() { return peer_.Reopen(); }
+  void Close() { peer_.Close(); }
   const protocol::UdpStats& udp_stats() const { return peer_.stats(); }
+  // The last receive-side socket error observed during the most recent Tick()
+  // (kOk and 0 when no kSocketError occurred). Callers pass these to
+  // SocketRetry::ObserveReceive() so permanent receive errors reopen the
+  // socket while transient ones (ECONNREFUSED) keep it open (REQ-RT-22).
+  protocol::UdpStatus last_receive_status() const {
+    return last_receive_status_;
+  }
+  int last_receive_error() const { return last_receive_error_; }
+  bool receive_needs_reopen() const {
+    return last_receive_status_ == protocol::UdpStatus::kSocketError &&
+           protocol::ReceiveErrorNeedsNewSocket(last_receive_error_);
+  }
+  // Test seam (null in production): when set, asked before each TryReceive()
+  // in Tick(); a nonzero errno fails that receive with kSocketError and that
+  // error, so tests can reach OS receive errors loopback never produces.
+  void SetReceiveErrorSeam(int (*seam)()) { receive_error_seam_ = seam; }
   // Link fault injection drops outbound traffic, never inbound commands or
   // gateway safety ticks. Suppressed datagrams are not queued for recovery.
   void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
@@ -92,10 +109,22 @@ class Endpoint {
     bool have_command = false;
     uint64_t command_sequence = 0;
     Command newest;
+    last_receive_status_ = protocol::UdpStatus::kOk;
+    last_receive_error_ = 0;
     for (int i = 0; i < kReceiveBudget; ++i) {
       protocol::DecodedFrame frame;
-      const auto result = peer_.TryReceive(&frame);
+      int recv_error =
+          receive_error_seam_ != nullptr ? receive_error_seam_() : 0;
+      const auto result = recv_error != 0 ? protocol::UdpStatus::kSocketError
+                                          : peer_.TryReceive(&frame);
       if (result == protocol::UdpStatus::kWouldBlock) break;
+      if (result == protocol::UdpStatus::kSocketError) {
+        if (recv_error == 0) recv_error = peer_.stats().last_recv_error;
+        last_receive_status_ = result;
+        last_receive_error_ = recv_error;
+        if (protocol::ReceiveErrorNeedsNewSocket(recv_error)) break;
+        continue;
+      }
       if (result == protocol::UdpStatus::kDecodeError &&
           peer_.stats().last_decode_status ==
               protocol::DecodeStatus::kUnsupportedVersion) {
@@ -248,6 +277,9 @@ class Endpoint {
   // with one CAN write pass each.
   static constexpr int kReceiveBudget = 64;
   bool send_enabled_{true};
+  int (*receive_error_seam_)(){nullptr};
+  protocol::UdpStatus last_receive_status_{protocol::UdpStatus::kOk};
+  int last_receive_error_{0};
   PeerContact contact_;
   DrainedCommand drained_;
   uint64_t pending_probe_time_us_{};

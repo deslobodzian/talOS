@@ -20,6 +20,7 @@
 #include <iterator>
 #include <optional>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "config_wire.h"
@@ -1014,6 +1015,75 @@ TEST(Endpoint, DoesNotSendZeroByteStateFrameWhenEncodeReturnsZero) {
   State state;
   ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
   EXPECT_EQ(state.sample_time_us, 2000u);
+}
+
+int pending_endpoint_recv_error = 0;
+int TakeEndpointRecvError() {
+  return std::exchange(pending_endpoint_recv_error, 0);
+}
+
+// Endpoint::Tick() surfaces permanent receive errors (ENETUNREACH, EBADF) via
+// last_receive_status()/last_receive_error()/receive_needs_reopen() while
+// ignoring transient ECONNREFUSED and continuing to drain frames.
+// REQ-RT-22
+TEST(Endpoint, SurfacesPermanentReceiveErrorsWhileIgnoringTransientErrors) {
+  SimBackend backend;
+  Gateway gateway{backend, 3015};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  // 1. Transient ECONNREFUSED: Tick records it with receive_needs_reopen()
+  // false and continues draining subsequent queued frames.
+  endpoint.SetReceiveErrorSeam(&TakeEndpointRecvError);
+  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kClockProbe, 0, 5000,
+                                nullptr, 0),
+            protocol::UdpStatus::kOk);
+  pending_endpoint_recv_error = ECONNREFUSED;
+  ASSERT_EQ(endpoint.Tick(1000, false), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.last_receive_status(), protocol::UdpStatus::kSocketError);
+  EXPECT_EQ(endpoint.last_receive_error(), ECONNREFUSED);
+  EXPECT_FALSE(endpoint.receive_needs_reopen());
+  // Ensure the queued probe was still received (on this tick or the next once
+  // loopback delivers it).
+  uint64_t now_us = 2000;
+  ASSERT_TRUE(Eventually([&] {
+    EXPECT_EQ(endpoint.Tick(now_us, false), protocol::UdpStatus::kOk);
+    now_us += 1000;
+    return endpoint.peer_contact().frame_us != 0;
+  }));
+  EXPECT_EQ(endpoint.last_receive_status(), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.last_receive_error(), 0);
+  EXPECT_FALSE(endpoint.receive_needs_reopen());
+
+  // 2. Permanent ENETUNREACH: Tick breaks out of the receive loop and surfaces
+  // receive_needs_reopen() == true.
+  pending_endpoint_recv_error = ENETUNREACH;
+  ASSERT_EQ(endpoint.Tick(now_us, false), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.last_receive_status(), protocol::UdpStatus::kSocketError);
+  EXPECT_EQ(endpoint.last_receive_error(), ENETUNREACH);
+  EXPECT_TRUE(endpoint.receive_needs_reopen());
+  now_us += 1000;
+
+  // 3. Real EBADF from the OS socket (no seam): closing the underlying fd
+  // causes TryReceive() to fail with EBADF; Close() + Reopen() restores it.
+  endpoint.SetReceiveErrorSeam(nullptr);
+  const int endpoint_fd = companion.EndpointFd();
+  ASSERT_GE(endpoint_fd, 0);
+  ASSERT_EQ(::close(endpoint_fd), 0);
+  EXPECT_EQ(endpoint.Tick(now_us, false), protocol::UdpStatus::kSocketError);
+  EXPECT_EQ(endpoint.last_receive_status(), protocol::UdpStatus::kSocketError);
+  EXPECT_EQ(endpoint.last_receive_error(), EBADF);
+  EXPECT_TRUE(endpoint.receive_needs_reopen());
+
+  endpoint.Close();
+  ASSERT_EQ(endpoint.Reopen(), protocol::UdpStatus::kOk);
+  ASSERT_TRUE(companion.Reconnect());
+  now_us += 1000;
+  ASSERT_EQ(endpoint.Tick(now_us, false), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.last_receive_status(), protocol::UdpStatus::kOk);
+  EXPECT_EQ(endpoint.last_receive_error(), 0);
+  EXPECT_FALSE(endpoint.receive_needs_reopen());
 }
 }  // namespace
 }  // namespace talos::hardware

@@ -2110,5 +2110,171 @@ TEST(HardwareNodeTest, BridgeStatusReportsUdpSocketAndStateLossCounters) {
   EXPECT_TRUE(status == node.Status(now_us));
 }
 
+int pending_recv_error = 0;
+int TakeRecvError() { return std::exchange(pending_recv_error, 0); }
+
+// Permanent receive errors close and reopen the socket on the 100 ms cadence
+// (incrementing /hw/status socket_reopens_count), while transient errors such
+// as ECONNREFUSED keep the socket open.
+// REQ-RT-22
+TEST(HardwareNodeTest,
+     PermanentReceiveErrorReopensSocketWhileTransientKeepsIt) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<bridge::BridgeStatus> status_sub{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+
+  // 1. Real OS EBADF on TryReceive(): tick with no send due so TryReceive()
+  // hits the closed fd directly.
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  ASSERT_EQ(NextProbeUs(link.gateway), kStartUs);
+  const int fd = node.udp_fd();
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const uint64_t lost_us = kStartUs + 5'000;
+  node.Tick(lost_us);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().recv_failures, 1u);
+  EXPECT_EQ(node.socket_counters().last_recv_error, EBADF);
+  EXPECT_EQ(node.socket_counters().reopens, 0u);
+  // First reopen is scheduled on the next Tick (1 ms later at the latest).
+  const uint64_t reopen_us = lost_us + 1'000;
+  EXPECT_EQ(node.NextDutyUs(lost_us), reopen_us);
+  node.Tick(reopen_us);
+  EXPECT_GE(node.udp_fd(), 0);
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(NodeConfigId(cfg), 11, 1, 1000),
+                          reopen_us + 1'000));
+
+  // Publish /hw/status and verify socket_reopens_count reflects the reopen.
+  uint64_t now_us = reopen_us + 25'000;
+  node.Tick(now_us);
+  auto published = status_sub.read();
+  ASSERT_TRUE(published.has_value());
+  EXPECT_EQ(published->socket_reopens_count(), 1u);
+
+  // 2. Transient ECONNREFUSED keeps the socket open without reopening.
+  node.set_seams({.recv_error = &TakeRecvError});
+  pending_recv_error = ECONNREFUSED;
+  now_us += 20'000;
+  const int fd_before = node.udp_fd();
+  node.Tick(now_us);
+  EXPECT_EQ(node.udp_fd(), fd_before);
+  EXPECT_EQ(node.socket_counters().last_recv_error, ECONNREFUSED);
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+
+  // 3. Permanent ENETUNREACH closes and reopens once kReopenRetryUs has passed
+  // since the previous reopen, incrementing socket_reopens_count on /hw/status.
+  now_us = reopen_us + HardwareNode::kReopenRetryUs;
+  pending_recv_error = ENETUNREACH;
+  node.Tick(now_us);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().last_recv_error, ENETUNREACH);
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+
+  now_us += 1'000;
+  node.Tick(now_us);
+  EXPECT_GE(node.udp_fd(), 0);
+  EXPECT_EQ(node.socket_counters().reopens, 2u);
+
+  // 4. Another permanent receive error inside kReopenRetryUs is throttled.
+  const uint64_t second_reopen_us = now_us;
+  pending_recv_error = EADDRNOTAVAIL;
+  node.Tick(second_reopen_us + 5'000);
+  EXPECT_EQ(node.udp_fd(), -1);
+  node.Tick(second_reopen_us + HardwareNode::kReopenRetryUs - 1);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().reopens, 2u);
+
+  now_us = second_reopen_us + HardwareNode::kReopenRetryUs;
+  node.Tick(now_us);
+  EXPECT_GE(node.udp_fd(), 0);
+  EXPECT_EQ(node.socket_counters().reopens, 3u);
+
+  now_us += 25'000;
+  node.Tick(now_us);
+  published = status_sub.read();
+  ASSERT_TRUE(published.has_value());
+  EXPECT_EQ(published->socket_reopens_count(), 3u);
+}
+
+// A HardwareNode pinned to an absent local_address (EADDRNOTAVAIL) does not
+// crash or fall back to 0.0.0.0: Open() logs one stderr line naming the
+// address and errno, enters deferred open, keeps OpenWaits() out of polling
+// fallback, and retries every 100 ms until the interface appears. An address
+// conflict (EADDRINUSE) still fails hard.
+// REQ-RT-22, REQ-OPS-25
+TEST(HardwareNodeTest, AbsentLocalAddressRetriesEvery100MsWithoutFallback) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  // RFC 5737 TEST-NET-1: never assigned to a local interface -> EADDRNOTAVAIL.
+  constexpr const char* kAbsentIp = "192.0.2.1";
+  uint16_t gateway_port = 0;
+  uint16_t node_port = 0;
+  int gw_res = ReservePort(gateway_port);
+  int node_res = ReservePort(node_port);
+  ASSERT_GE(gw_res, 0);
+  ASSERT_GE(node_res, 0);
+  Release(node_res);
+
+  HardwareNode node{cfg, "127.0.0.1", gateway_port, node_port, true, 0,
+                    {},  0,           {},           kAbsentIp};
+  ::testing::internal::CaptureStderr();
+  const bool opened = node.Open();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  EXPECT_TRUE(opened) << stderr_text;
+  EXPECT_NE(stderr_text.find(kAbsentIp), std::string::npos) << stderr_text;
+  EXPECT_NE(stderr_text.find(std::to_string(EADDRNOTAVAIL)), std::string::npos)
+      << stderr_text;
+  EXPECT_EQ(node.udp_fd(), -1)
+      << "must not fall back to 0.0.0.0 when local_address is absent";
+
+  // OpenWaits() must succeed without falling back to polling.
+  EXPECT_TRUE(node.OpenWaits());
+  EXPECT_EQ(node.wakeups().wait_fallbacks, 0u);
+  node.CloseWaits();
+
+  // First Tick makes the initial retry attempt; subsequent retries happen on
+  // the 100 ms kReopenRetryUs cadence and never before.
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 1u);
+  EXPECT_EQ(node.socket_counters().reopens, 0u);
+
+  node.Tick(kStartUs + 20'000);
+  node.Tick(kStartUs + 50'000);
+  node.Tick(kStartUs + HardwareNode::kReopenRetryUs - 1);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 1u);
+
+  node.Tick(kStartUs + HardwareNode::kReopenRetryUs);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 2u);
+
+  node.Tick(kStartUs + 2 * HardwareNode::kReopenRetryUs - 1);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 2u);
+  node.Tick(kStartUs + 2 * HardwareNode::kReopenRetryUs);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 3u);
+  EXPECT_TRUE(node.Status(kStartUs + 2 * HardwareNode::kReopenRetryUs)
+                  .alert_error_link_lost());
+
+  // EADDRINUSE on a pinned local address still fails Open() hard.
+  int holder = HoldPort(node_port);
+  ASSERT_GE(holder, 0);
+  HardwareNode conflicting{cfg, "127.0.0.1", gateway_port, node_port,  true, 0,
+                           {},  0,           {},           "127.0.0.1"};
+  ::testing::internal::CaptureStderr();
+  EXPECT_FALSE(conflicting.Open());
+  const std::string conflict_err = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(conflict_err.find("127.0.0.1"), std::string::npos) << conflict_err;
+  Release(holder);
+  Release(gw_res);
+}
+
 }  // namespace
 }  // namespace talos::hardware
