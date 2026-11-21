@@ -203,9 +203,12 @@ RecordedSession::RecordedSession(const std::string& path,
   std::map<std::string, std::uint32_t, std::less<>> topic_index;
   // (topic, sequence) -> index in messages_, every log's.
   std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> seen;
-  // The same for the replayed program's own receipts, kept apart in `own`.
+  // The same for the replayed program's own receipts, kept apart in `own`,
+  // along with each receipt's raw transport publish_time_ns (before clamping
+  // to its drain's delivered time) for duplicate-sequence conflict checks.
   std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> own_seen;
   std::vector<RecordedMessage> own;
+  std::vector<std::int64_t> own_publish_ns;
   // Whether a topic's recorded_by is its writer, which a reader never
   // replaces.
   std::vector<bool> by_writer;
@@ -258,53 +261,66 @@ RecordedSession::RecordedSession(const std::string& path,
   std::optional<MonotonicTime> replayed_end;
   // What one damaged stretch of a log cost one of its topic sources: the
   // earliest time a record lost there could be fed at (none where nothing
-  // bounds it) and the stretch's byte offset. For a watcher in a log other
-  // than the replayed program's, whose receipts are fed only as its topic's
-  // messages, also the sequences its lost receipts lie in: a watcher
-  // receives in sequence order, so after its last intact receipt before the
-  // stretch (from the topic's first, 0, when none precedes it) and before
-  // its first intact receipt after it in the same file (`to`, unknown until
-  // read). The session's logs holding every message there, it lost nothing
-  // the feed lacks.
+  // bounds it) and the stretch's byte offset. For a writer's accepted sends
+  // or a non-replayed watcher's receipts, also the sequences its lost records
+  // lie in: both advance in transport sequence order, so after the last intact
+  // record before the stretch (from 0 when none precedes it) and before the
+  // next intact record after it in the same file or a contiguous later segment
+  // (`to`, unknown until read). The session's logs holding every message in
+  // `[from, *to)`, the stretch lost nothing the feed lacks.
   struct Stretch {
     std::uint32_t topic{0};
     std::optional<MonotonicTime> bound;
     std::uint64_t offset{0};
-    bool receipts{false};
+    bool recoverable{false};
+    bool is_sender{false};
     std::uint64_t from{0};
     std::optional<std::uint64_t> to;
   };
+  struct OpenStretch {
+    std::size_t log_idx{0};
+    std::size_t stretch_idx{0};
+  };
+  struct LogTopic {
+    std::uint32_t topic{0};
+    bool writer{false};
+    bool watched_by_replayed{false};
+  };
   // Each log read: the earliest time a GAP record of it names; what each of
   // its damaged stretches cost each topic source; whether it holds its EXIT;
-  // any missing or unreadable segment detected when reading this file; and
-  // the topics it recorded (with whether the replayed program watched them in
-  // it).
+  // whether it ended with a truncated/damaged tail; any missing or unreadable
+  // segment detected when reading this file; and the topics it recorded (with
+  // whether it wrote each and whether the replayed program watched it there).
   struct ReadLog {
     std::string path;
     std::optional<MonotonicTime> gap;
     std::vector<Stretch> damage;
     bool exit{false};
+    bool truncated{false};
     std::string segment_refusal;
     // True when `segment_refusal` is solely a missing first segment (no
     // incomplete header, no middle-segment gap, no dispatch/sequence jump),
     // which a byte-capped log explains when allow_capped is set.
     bool head_missing_only{false};
-    std::vector<std::pair<std::uint32_t, bool>> topics;
+    std::vector<LogTopic> topics;
   };
   std::vector<ReadLog> logs;
   // Each file read, by path: its origin, then the now_ns of its last intact
   // record and by source id its watchers' last intact receipts' publication
-  // times and sequences, and the earliest loss of its timeline and its
-  // timers' offsets and armed states (gap_start, timer_offset, timer_state).
-  // A segment of the same log (the next one, with its origin and manifest)
-  // starts from them, so damage right after its header is bounded, and a
-  // run start read from its first firing is bounded and offset, as it would
-  // be in one file.
+  // times and sequences, per-source monotonic sequence watermarks, open
+  // damaged stretches, the earliest loss of its timeline and its timers'
+  // offsets and armed states (gap_start, timer_offset, timer_state). A
+  // contiguous segment of the same log starts from them, so damage right
+  // after its header is bounded, open stretches close on the next intact
+  // record in a later segment, and a run start read from its first firing is
+  // bounded and offset, as it would be in one file.
   struct Carried {
     MonotonicTime origin;
     std::optional<std::int64_t> last_now;
     std::vector<std::optional<std::int64_t>> last_receipt;
     std::vector<std::optional<std::uint64_t>> last_sequence;
+    std::vector<std::optional<std::uint64_t>> last_monotonic_seq;
+    std::vector<std::optional<OpenStretch>> open_stretches;
     std::optional<MonotonicTime> gap_start;
     std::vector<std::optional<std::int64_t>> timer_offset;
     std::vector<TimerState> timer_state;
@@ -381,9 +397,9 @@ RecordedSession::RecordedSession(const std::string& path,
     // event_time_ns of a TIMER or MESSAGE dispatch in this file.
     std::optional<MonotonicTime> first_dispatch;
     std::optional<MonotonicTime> last_event;
-    // The topics this log recorded, and whether the replayed program
-    // watched each in it.
-    std::vector<std::pair<std::uint32_t, bool>> recorded;
+    // The topics this log recorded, whether it wrote each, and whether the
+    // replayed program watched each in it.
+    std::vector<LogTopic> recorded;
     // The earliest time a GAP record of this log names (gap), and the
     // earliest loss of its timeline (gap_start: that, or the now_ns of the
     // last intact record before a damaged stretch), which a run start taken
@@ -398,6 +414,15 @@ RecordedSession::RecordedSession(const std::string& path,
         reader.manifest().size());
     std::vector<std::optional<std::uint64_t>> last_sequence(
         reader.manifest().size());
+    // Per source_id monotonic sequence watermark (carried across contiguous
+    // segments, never cleared by gap or damage) to fail closed if a topic
+    // segment was re-created outside a launcher session and restarted at 0.
+    std::vector<std::optional<std::uint64_t>> last_monotonic_seq(
+        reader.manifest().size());
+    // By source id, its open stretch (`{log_idx, stretch_idx}` into `logs` or
+    // the current `read.damage`), carried across contiguous segments so an
+    // intact receipt or accepted send in a later segment closes `to`.
+    std::vector<std::optional<OpenStretch>> open(reader.manifest().size());
     // Check structural continuity with the previously read file of `base_log`.
     bool header_continues = false;
     std::string segment_refusal;
@@ -439,7 +464,7 @@ RecordedSession::RecordedSession(const std::string& path,
 
     const Carried* continued = nullptr;
     bool next_segment = false;
-    if (header_continues) {
+    if (header_continues && segment_refusal.empty()) {
       const auto previous = carried.find(cont.prev_read);
       if (previous != carried.end()) {
         continued = &previous->second;
@@ -447,22 +472,36 @@ RecordedSession::RecordedSession(const std::string& path,
         last_now = continued->last_now;
         last_receipt = continued->last_receipt;
         last_sequence = continued->last_sequence;
+        last_monotonic_seq = continued->last_monotonic_seq;
+        open = continued->open_stretches;
         gap_start = continued->gap_start;
       }
     }
     ReadLog read{.path = log_path};
+    const auto drop_carried_open = [&] {
+      for (auto& slot : open) {
+        if (slot.has_value() && slot->log_idx != logs.size()) slot.reset();
+      }
+    };
+    const auto close_open_stretch = [&](std::uint32_t source_id, bool is_sender,
+                                        std::uint64_t seq) {
+      if (source_id >= open.size() || !open[source_id].has_value()) return;
+      const OpenStretch ref = *open[source_id];
+      if (ref.log_idx != logs.size() && !segment_refusal.empty()) return;
+      Stretch& s = ref.log_idx == logs.size()
+                       ? read.damage[ref.stretch_idx]
+                       : logs[ref.log_idx].damage[ref.stretch_idx];
+      if (s.recoverable && s.is_sender == is_sender) {
+        s.to = seq;
+        open[source_id].reset();
+      }
+    };
     // Whether a record of a dispatch has been read from this file.
     bool dispatched = false;
     // The damaged stretches counted so far, and where the last intact
     // record ends: where a stretch found after it starts.
     std::size_t spans = 0;
     std::uint64_t record_end = 0;
-    // By source id, its open stretch (an index into read.damage), which a
-    // later one adds nothing to: a writer's or the replayed program's
-    // watcher's first (a later one is bounded no earlier, or unbounded
-    // alike); another watcher's until its next receipt closes it (a stretch
-    // before that lost receipts in the same range, bounded alike).
-    std::vector<std::optional<std::size_t>> open(reader.manifest().size());
     for (const Registration& registration : reader.manifest()) {
       if (registration.kind == SourceKind::TIMER &&
           registration.id < timer_offset.size()) {
@@ -507,7 +546,9 @@ RecordedSession::RecordedSession(const std::string& path,
       if (registration.id < topic_of.size()) {
         topic_of[registration.id] = it->second;
       }
-      recorded.emplace_back(it->second, own_log && !writer);
+      recorded.push_back(LogTopic{.topic = it->second,
+                                  .writer = writer,
+                                  .watched_by_replayed = own_log && !writer});
     }
     // Every segment repeats the log's manifest: a timer the segment before
     // re-armed or disarmed is as that one left it.
@@ -547,6 +588,8 @@ RecordedSession::RecordedSession(const std::string& path,
             timer.deadline_ns.reset();
           }
         }
+        const std::vector<std::optional<std::uint64_t>> prev_sent_seq =
+            last_sent_seq;
         last_dispatch.reset();
         std::fill(last_sent_seq.begin(), last_sent_seq.end(), std::nullopt);
         const std::uint64_t offset =
@@ -566,27 +609,36 @@ RecordedSession::RecordedSession(const std::string& path,
             continue;
           }
           // A writer's send is fed at its publication time, which is its
-          // record's now_ns (LogWriter::send). A reader's receipt is fed at
-          // its publication time, and a watcher receives its topic in
-          // sequence order, whose publication times never decrease (one
-          // writer per topic, stamped from the monotonic clock); before its
-          // first receipt nothing bounds it. The replayed program's own
-          // receipt is fed at its drain's event time (a tick's deadline, or
-          // a prompt watcher's publication time), which need not follow the
-          // log's order: nothing bounds it.
+          // record's now_ns (LogWriter::send), and accepted sends advance in
+          // transport sequence order (refused sends carry aux != 0 and are
+          // ignored). A reader's receipt is fed at its publication time, and
+          // a watcher receives its topic in sequence order, whose publication
+          // times never decrease (one writer per topic, stamped from the
+          // monotonic clock); before its first receipt nothing bounds it. The
+          // replayed program's own receipt is fed at its drain's event time
+          // (a tick's deadline, or a prompt watcher's publication time),
+          // which need not follow the log's order: nothing bounds it.
           Stretch lost{.topic = topic_of[source.id], .offset = offset};
           if (source.kind == SourceKind::SENDER) {
             lost.bound = since_last;
+            lost.recoverable = true;
+            lost.is_sender = true;
+            lost.from = (source.id < prev_sent_seq.size() &&
+                         prev_sent_seq[source.id].has_value())
+                            ? *prev_sent_seq[source.id] + 1
+                            : 0;
           } else if (!own_log) {
             if (last_receipt[source.id].has_value()) {
               lost.bound = MonotonicTime::from_nanos(*last_receipt[source.id]);
             }
-            lost.receipts = true;
+            lost.recoverable = true;
+            lost.is_sender = false;
             lost.from = last_sequence[source.id].has_value()
                             ? *last_sequence[source.id] + 1
                             : 0;
           }
-          open[source.id] = read.damage.size();
+          open[source.id] = OpenStretch{.log_idx = logs.size(),
+                                        .stretch_idx = read.damage.size()};
           read.damage.push_back(lost);
         }
       }
@@ -613,6 +665,7 @@ RecordedSession::RecordedSession(const std::string& path,
                                 log_path + ": a segment of " + base_log +
                                 " between them is missing";
             }
+            drop_carried_open();
           }
         }
       }
@@ -669,11 +722,8 @@ RecordedSession::RecordedSession(const std::string& path,
           header.source_id < last_receipt.size()) {
         last_receipt[header.source_id] = header.publish_time_ns;
         last_sequence[header.source_id] = header.sequence;
-        std::optional<std::size_t>& stretch = open[header.source_id];
-        if (stretch.has_value() && read.damage[*stretch].receipts) {
-          read.damage[*stretch].to = header.sequence;
-          stretch.reset();
-        }
+        close_open_stretch(header.source_id, /*is_sender=*/false,
+                           header.sequence);
       }
       if (own_log && header.source_id < timer_state.size()) {
         TimerState& timer = timer_state[header.source_id];
@@ -744,9 +794,12 @@ RecordedSession::RecordedSession(const std::string& path,
                   std::to_string(header.sequence) + " in " + log_path +
                   ": a segment of " + base_log + " between them is missing";
             }
+            drop_carried_open();
           }
         }
         last_sent_seq[header.source_id] = header.sequence;
+        close_open_stretch(header.source_id, /*is_sender=*/true,
+                           header.sequence);
       }
       if ((!receipt && !send) || header.source_id >= topic_of.size() ||
           topic_of[header.source_id] == kNone) {
@@ -754,6 +807,19 @@ RecordedSession::RecordedSession(const std::string& path,
       }
       const std::uint32_t topic = topic_of[header.source_id];
       if (record.payload.size() != topics_[topic].message_bytes) continue;
+      if (header.source_id < last_monotonic_seq.size()) {
+        if (last_monotonic_seq[header.source_id].has_value() &&
+            header.sequence <= *last_monotonic_seq[header.source_id]) {
+          throw ReplayError(
+              "non-monotonic sequence on topic '" + topics_[topic].name +
+              "' in " + log_path + ": sequence " +
+              std::to_string(header.sequence) + " after " +
+              std::to_string(*last_monotonic_seq[header.source_id]) +
+              " (a segment may have been re-created outside a launcher "
+              "session)");
+        }
+        last_monotonic_seq[header.source_id] = header.sequence;
+      }
       if (own_log && receipt) {
         // Delivered by the drain at its event time; published no later, as
         // the replayed drain runs at its deadline.
@@ -767,6 +833,18 @@ RecordedSession::RecordedSession(const std::string& path,
             own_seen.try_emplace({topic, header.sequence}, own.size());
         if (!inserted) {
           RecordedMessage& known = own[it->second];
+          const std::span<const std::byte> known_payload{
+              bytes_.data() + known.offset, topics_[topic].message_bytes};
+          if (header.publish_time_ns != own_publish_ns[it->second] ||
+              !std::equal(record.payload.begin(), record.payload.end(),
+                          known_payload.begin())) {
+            throw ReplayError(
+                "conflicting records for topic '" + topics_[topic].name +
+                "' sequence " + std::to_string(header.sequence) + " in " +
+                log_path +
+                " (different publish time or payload; a segment may have been "
+                "re-created outside a launcher session)");
+          }
           if (delivered < known.delivered) {
             known.delivered = delivered;
             known.time = time;
@@ -774,6 +852,7 @@ RecordedSession::RecordedSession(const std::string& path,
           continue;
         }
         own.push_back({time, delivered, topic, header.sequence, bytes_.size()});
+        own_publish_ns.push_back(header.publish_time_ns);
         bytes_.insert(bytes_.end(), record.payload.begin(),
                       record.payload.end());
         continue;
@@ -794,12 +873,18 @@ RecordedSession::RecordedSession(const std::string& path,
       const auto [it, inserted] =
           seen.try_emplace({topic, header.sequence}, messages_.size());
       if (!inserted) {
-        RecordedMessage& known = messages_[it->second];
-        if (time < known.time) {
-          known.time = time;
-          known.delivered = time;
-          std::copy(record.payload.begin(), record.payload.end(),
-                    bytes_.begin() + static_cast<std::ptrdiff_t>(known.offset));
+        const RecordedMessage& known = messages_[it->second];
+        const std::span<const std::byte> known_payload{
+            bytes_.data() + known.offset, topics_[topic].message_bytes};
+        if (time != known.time ||
+            !std::equal(record.payload.begin(), record.payload.end(),
+                        known_payload.begin())) {
+          throw ReplayError(
+              "conflicting records for topic '" + topics_[topic].name +
+              "' sequence " + std::to_string(header.sequence) + " in " +
+              log_path +
+              " (different publish time or payload; a segment may have been "
+              "re-created outside a launcher session)");
         }
         continue;
       }
@@ -836,11 +921,14 @@ RecordedSession::RecordedSession(const std::string& path,
                                 .last_now = last_now,
                                 .last_receipt = last_receipt,
                                 .last_sequence = last_sequence,
+                                .last_monotonic_seq = last_monotonic_seq,
+                                .open_stretches = open,
                                 .gap_start = gap_start,
                                 .timer_offset = timer_offset,
                                 .timer_state = timer_state,
                                 .timer_state_uncertain = timer_state_uncertain};
     read.gap = gap;
+    read.truncated = reader.truncated();
     read.segment_refusal = std::move(segment_refusal);
     read.head_missing_only = head_missing_only;
     read.topics = std::move(recorded);
@@ -969,6 +1057,25 @@ RecordedSession::RecordedSession(const std::string& path,
   }
   if (first) throw std::runtime_error("no readable .tlog files in " + path);
 
+  // Cross-check the replayed program's own receipts against other logs sharing
+  // (topic, sequence) before replacing those topics' messages with `own`.
+  for (const auto& [key, own_idx] : own_seen) {
+    const auto other = seen.find(key);
+    if (other == seen.end()) continue;
+    const RecordedMessage& a = own[own_idx];
+    const RecordedMessage& b = messages_[other->second];
+    const std::size_t n = topics_[a.topic].message_bytes;
+    if (own_publish_ns[own_idx] != b.time.nanos() ||
+        !std::equal(bytes_.begin() + static_cast<std::ptrdiff_t>(a.offset),
+                    bytes_.begin() + static_cast<std::ptrdiff_t>(a.offset + n),
+                    bytes_.begin() + static_cast<std::ptrdiff_t>(b.offset))) {
+      throw ReplayError(
+          "conflicting records for topic '" + topics_[a.topic].name +
+          "' sequence " + std::to_string(a.sequence) +
+          " across session logs (different publish time or payload; a segment "
+          "may have been re-created outside a launcher session)");
+    }
+  }
   // A topic the replayed program watched is what it received, and nothing
   // another log adds.
   std::erase_if(messages_, [&](const RecordedMessage& message) {
@@ -1037,12 +1144,15 @@ RecordedSession::RecordedSession(const std::string& path,
     const auto last = seen.lower_bound({topic, to});
     return static_cast<std::uint64_t>(std::distance(first, last)) == to - from;
   };
-  // Where each topic's feed ends, and whether it is refused: the earliest
-  // loss, and the first refused log, among the logs it is fed from, which
-  // for a topic the program watched live are its own logs that watched it,
-  // and otherwise every log that recorded it. A reader's damaged stretch
-  // whose lost receipts' messages the session's logs all hold (the writer's
-  // sends) lost nothing the feed lacks, and is no loss.
+  // Precompute per-log cap/hard/segment refusals once so writer-completeness
+  // and the topic-feed loop judge every log identically.
+  struct LogVerdict {
+    std::string base_log;
+    std::string cap_sign;
+    std::string hard_sign;
+  };
+  std::vector<LogVerdict> verdicts;
+  verdicts.reserve(logs.size());
   for (const ReadLog& log : logs) {
     const std::string base_log = LogOfFile(log.path);
     const std::string cap_sign = cap_refusal(log.path);
@@ -1051,8 +1161,80 @@ RecordedSession::RecordedSession(const std::string& path,
         !(log.head_missing_only && !cap_sign.empty())) {
       hard_sign = log.segment_refusal;
     }
-    for (const auto& [topic, watched_here] : log.topics) {
+    verdicts.push_back({base_log, cap_sign, hard_sign});
+  }
+  // For any topic the replayed program did not watch live: if at least one
+  // writer log exists for the topic, every writer log of that topic is
+  // complete (no cap/hard/segment refusal, no GAP, no unrecovered damage on
+  // that topic, not truncated, and its run reached EXIT), and the session
+  // holds every sequence in [0, max_seq], then the writer holds the topic in
+  // full and reader-only caps, marks, gaps and damage cost the feed nothing.
+  std::vector<bool> writer_complete(topics_.size(), false);
+  for (std::size_t topic = 0; topic < topics_.size(); ++topic) {
+    if (watched_by_replayed[topic]) continue;
+    bool has_writer = false;
+    bool all_writers_complete = true;
+    for (std::size_t i = 0; i < logs.size(); ++i) {
+      const ReadLog& log = logs[i];
+      const bool is_writer = std::any_of(
+          log.topics.begin(), log.topics.end(), [&](const LogTopic& entry) {
+            return entry.topic == topic && entry.writer;
+          });
+      if (!is_writer) continue;
+      has_writer = true;
+      const LogVerdict& v = verdicts[i];
+      if (!v.cap_sign.empty() || !v.hard_sign.empty() ||
+          !log.segment_refusal.empty() || log.gap.has_value() ||
+          log.truncated || !exited.contains(v.base_log)) {
+        all_writers_complete = false;
+        break;
+      }
+      for (const Stretch& stretch : log.damage) {
+        if (stretch.topic != topic) continue;
+        if (!(stretch.recoverable && stretch.to.has_value() &&
+              held(static_cast<std::uint32_t>(topic), stretch.from,
+                   *stretch.to))) {
+          all_writers_complete = false;
+          break;
+        }
+      }
+      if (!all_writers_complete) break;
+    }
+    if (!has_writer || !all_writers_complete) continue;
+    const auto t = static_cast<std::uint32_t>(topic);
+    const auto first_msg = seen.lower_bound({t, 0});
+    const auto last_msg =
+        seen.upper_bound({t, std::numeric_limits<std::uint64_t>::max()});
+    if (first_msg == last_msg) {
+      writer_complete[topic] = true;
+    } else {
+      const std::uint64_t max_seq = std::prev(last_msg)->first.second;
+      writer_complete[topic] =
+          max_seq < std::numeric_limits<std::uint64_t>::max() &&
+          held(t, 0, max_seq + 1);
+    }
+  }
+  // Where each topic's feed ends, and whether it is refused: the earliest
+  // loss, and the first refused log, among the logs it is fed from, which
+  // for a topic the program watched live are its own logs that watched it,
+  // and otherwise every log that recorded it (excluding reader-only logs of a
+  // topic proven writer-complete above). A writer's or reader's damaged
+  // stretch whose lost sequences `[from, *to)` the session's logs all hold
+  // lost nothing the feed lacks, and is no loss.
+  for (std::size_t i = 0; i < logs.size(); ++i) {
+    const ReadLog& log = logs[i];
+    const std::string& base_log = verdicts[i].base_log;
+    const std::string& cap_sign = verdicts[i].cap_sign;
+    const std::string& hard_sign = verdicts[i].hard_sign;
+    for (const LogTopic& entry : log.topics) {
+      const std::uint32_t topic = entry.topic;
+      const bool watched_here = entry.watched_by_replayed;
       if (watched_by_replayed[topic] && !watched_here) continue;
+      const bool log_writes_topic = std::any_of(
+          log.topics.begin(), log.topics.end(), [&](const LogTopic& other) {
+            return other.topic == topic && other.writer;
+          });
+      if (!log_writes_topic && writer_complete[topic]) continue;
       RecordedTopic& fed = topics_[topic];
       const auto loss = [&](MonotonicTime at,
                             std::optional<std::uint64_t> damage_offset) {
@@ -1066,7 +1248,7 @@ RecordedSession::RecordedSession(const std::string& path,
       std::string reason = hard_sign;
       for (const Stretch& stretch : log.damage) {
         if (stretch.topic != topic ||
-            (stretch.receipts && stretch.to.has_value() &&
+            (stretch.recoverable && stretch.to.has_value() &&
              held(topic, stretch.from, *stretch.to))) {
           continue;
         }

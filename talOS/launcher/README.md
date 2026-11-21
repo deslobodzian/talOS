@@ -1031,13 +1031,16 @@ it may have held the firing its recorded timeline starts from (with
 starts the timed node at the kept window's earliest recorded firing or
 dispatch). So is a
 timed node's log with no such firing that holds no record of its run, or
-a gap or damaged stretch that may hold its firings. A damaged stretch in another reader's
-log of a topic is no loss only where an intact receipt of the topic follows
-it in that file and the session's other logs (the writer's sends) hold
-every message that reader could have lost there
+a gap or damaged stretch that may hold its firings. A writer's or another
+reader's damaged stretch is no loss when an intact accepted send or receipt
+follows it in the same file or a contiguous later segment and the session's
+other logs hold every message in that sequence range, and reader-only caps,
+marks, gaps or damage on a topic the replayed node did not watch live are
+ignored when every writer log of that topic is intact and exited and the
+session holds every sequence from `0` through the maximum recorded sequence
 ([the rule](../events/README.md#replaying-another-sessions-inputs)). See
 [input replay](../events/README.md#replaying-another-sessions-inputs) for
-timing and schema checks.
+timing, duplicate-sequence and schema checks.
 
 A node that reads the declared graph (`telemetry`, `teleop`) replays on the
 one the session was launched with, the session's `declared_graph.json` (a
