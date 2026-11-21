@@ -23,16 +23,29 @@ GRAPH = {
     "//talOS/events:input_replay": (None, ["//talOS/events:events"]),
     "//talOS/hardware:config": (None, []),
     "//talOS/hardware:merge": (None, []),
-    "//talOS/protocol:protocol": (None, []),
-    "//talOS/hardware:hardware": (None, ["//talOS/hardware:config",
+    "//talOS/protocol:frame": (None, []),
+    "//talOS/protocol:protocol": (None, ["//talOS/protocol:frame"]),
+    "//talOS/hardware:codecs": (None, ["//talOS/hardware:config",
+                                       "//talOS/protocol:frame"]),
+    "//talOS/hardware:hardware": (None, ["//talOS/hardware:codecs",
+                                         "//talOS/hardware:config",
                                          "//talOS/protocol:protocol"]),
     "//talOS/bridge:messages": (None, []),
     "//talOS/launcher:hardware_record": (None, ["//talOS/bridge:messages",
-                                                "//talOS/hardware:hardware"]),
-    "//studio/bridge:system": (None, ["//talOS/introspection:registry"]),
-    "//studio/review:review": (None, ["//studio/bridge:system",
-                                      "//talOS/hardware:hardware",
-                                      "//talOS/launcher:hardware_record"]),
+                                                "//talOS/hardware:codecs",
+                                                "//talOS/protocol:frame"]),
+    "//talOS/launcher:session_retention": (
+        None, ["//talOS/launcher:hardware_record",
+               "//talOS/hardware:codecs",
+               "//talOS/protocol:frame"]),
+    "//studio/bridge:json_format": (None, []),
+    "//studio/bridge:system": (None, ["//studio/bridge:json_format",
+                                      "//talOS/introspection:registry"]),
+    "//studio/review:review": (None, ["//studio/bridge:json_format",
+                                      "//talOS/hardware:codecs",
+                                      "//talOS/launcher:hardware_record",
+                                      "//talOS/launcher:session_retention",
+                                      "//talOS/telemetry:channels"]),
     "//studio/review:studio_review": (None, ["//studio/review:review"]),
     "//talOS/introspection:names": (None, []),
     "//talOS/introspection:registry": (None, ["//talOS/memory:shared_memory",
@@ -63,7 +76,7 @@ GRAPH = {
     "//talOS/devices:testing": (None, ["//talOS/devices:devices",
                                        "//talOS/devices:access",
                                        "//talOS/hardware:merge"]),
-    "//talOS/telemetry:channels": (None, ["//talOS/hardware:hardware"]),
+    "//talOS/telemetry:channels": (None, ["//talOS/hardware:codecs"]),
     "//talOS/telemetry:telemetry": (None, ["//talOS/telemetry:channels",
                                            "//talOS/node:access"]),
     "//talOS/telemetry:node": ("talos_cc_node", ["//talOS/telemetry:telemetry"]),
@@ -535,19 +548,30 @@ class CheckLayersTest(unittest.TestCase):
                 ("//studio/review:review", "//talOS/bridge:messages"),
                 ("//studio/review:studio_review", "//talOS/rtms:wake"),
                 ("//studio/review:studio_review", "//talOS/bridge:node_lib"),
-                # Transitive paths from studio/review into RTMS/IPC/bridge
-                # writers or node/devices also fail.
-                ("//studio/bridge:system", "//talOS/rtms:rtms"),
-                ("//studio/bridge:system", "//talOS/rtms:wake"),
-                ("//studio/bridge:system", "//talOS/ipc:ipc"),
-                ("//studio/bridge:system", "//talOS/bridge:node_lib"),
-                ("//studio/bridge:system", "//talOS/node:node"),
-                ("//studio/bridge:system", "//talOS/devices:devices"),
+                # Transitive paths from studio/review into RTMS/IPC/UDP/
+                # hardware gateway/shared_memory/bridge runtime or
+                # node/devices also fail.
+                ("//studio/bridge:json_format", "//talOS/rtms:rtms"),
+                ("//studio/bridge:json_format", "//talOS/rtms:wake"),
+                ("//studio/bridge:json_format", "//talOS/ipc:ipc"),
+                ("//studio/bridge:json_format", "//talOS/protocol:protocol"),
+                ("//studio/bridge:json_format", "//talOS/hardware:hardware"),
+                ("//studio/bridge:json_format", "//talOS/memory:shared_memory"),
+                ("//studio/bridge:json_format", "//talOS/bridge:node_lib"),
+                ("//studio/bridge:json_format", "//talOS/node:node"),
+                ("//studio/bridge:json_format", "//talOS/devices:devices"),
+                # Linking live :system or :hardware back into review fails via
+                # transitive shared_memory / hardware:hardware / protocol:protocol.
+                ("//studio/review:review", "//studio/bridge:system"),
+                ("//studio/review:review", "//talOS/hardware:hardware"),
+                ("//talOS/launcher:session_retention",
+                 "//talOS/memory:shared_memory"),
         ):
             with self.subTest(frm=frm, to=to):
                 failures, out = run(with_edge(frm, to))
                 self.assertGreaterEqual(failures, 1, out)
-                self.assertIn(f"  {to}\n", out)
+                if to not in ("//studio/bridge:system",):
+                    self.assertIn(f"  {to}\n", out)
 
 
 class CheckNodeSourcesTest(unittest.TestCase):

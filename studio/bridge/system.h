@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "studio/bridge/json_format.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
 
@@ -64,54 +65,6 @@ struct BridgeStats {
   std::uint64_t refused{0};
   std::uint64_t egress_bytes{0};
 };
-
-inline void AppendEscaped(std::string& out, std::string_view value) {
-  out += '"';
-  for (const char c : value) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        // Control characters have no literal form in JSON, and a topic name
-        // should never contain one; emit the escape rather than invalid JSON.
-        if (static_cast<unsigned char>(c) < 0x20) {
-          static constexpr char kHex[] = "0123456789abcdef";
-          out += "\\u00";
-          out += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
-          out += kHex[static_cast<unsigned char>(c) & 0xF];
-        } else {
-          out += c;
-        }
-    }
-  }
-  out += '"';
-}
-
-// uint64 and int64 leave as quoted decimals; see the note at the top.
-inline void AppendU64(std::string& out, std::uint64_t value) {
-  out += '"';
-  out += std::to_string(value);
-  out += '"';
-}
-
-inline void AppendI64(std::string& out, std::int64_t value) {
-  out += '"';
-  out += std::to_string(value);
-  out += '"';
-}
 
 // Where the document's fast values sit: the counters, heartbeats and verdicts
 // that change from one refresh to the next. Everything else is the graph's

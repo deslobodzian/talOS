@@ -12,8 +12,7 @@
 #include <system_error>
 
 #include "nlohmann/json.hpp"
-#include "studio/bridge/system.h"
-#include "studio/bridge/telemetry.h"
+#include "studio/bridge/json_format.h"
 #include "talOS/launcher/session_retention.h"
 #include "talOS/telemetry/frames.h"
 

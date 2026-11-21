@@ -20,24 +20,40 @@ cc_test(
     ],
 )
 
+# Session classification and retention facts (session_retention.h): reads
+# manifests, .tlog files and the cached verdict without shared memory, locks
+# or UDP (REQ-SAFE-35).
+cc_library(
+    name = "session_retention",
+    srcs = ["session_retention.cc"],
+    hdrs = ["session_retention.h"],
+    visibility = ["//studio/review:__pkg__"],
+    deps = [
+        ":hardware_record",
+        "//talOS/driver_station",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/events:session_manifest",
+        "//talOS/hardware:codecs",
+        "//talOS/protocol:frame",
+    ],
+)
+
 # A session's records: its manifest, run history, lock, retention facts and
 # the atomic writes that keep them.
 cc_library(
     name = "session",
-    srcs = [
-        "session.cc",
-        "session_retention.cc",
-    ],
+    srcs = ["session.cc"],
     hdrs = [
         "file_digest.h",
         "session.h",
         "session_lock.h",
-        "session_retention.h",
     ],
     visibility = ["//studio/review:__pkg__"],
     deps = [
         ":console_line",
         ":hardware_record",
+        ":session_retention",
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
@@ -335,9 +351,9 @@ cc_library(
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/events:session_manifest",
-        "//talOS/hardware",
+        "//talOS/hardware:codecs",
         "//talOS/hardware:config",
-        "//talOS/protocol",
+        "//talOS/protocol:frame",
         "//talOS/schema:field_path",
         "//talOS/schema:identity",
     ],

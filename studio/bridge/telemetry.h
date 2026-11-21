@@ -29,16 +29,12 @@
 #include <utility>
 #include <vector>
 
+#include "studio/bridge/json_format.h"
 #include "studio/bridge/system.h"
 #include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/telemetry_generated.h"
 
 namespace studio {
-
-inline constexpr int kTelemetryVersion = 3;
-
-using talos::telemetry::AlertLevel;
-using talos::telemetry::ChannelKind;
 
 struct TelemetryChannelInfo {
   std::string name;
@@ -1016,76 +1012,6 @@ static_assert(EgressBudget::framed(EgressBudget::kMaxPayloadBytes) <=
                   EgressBudget::framed(EgressBudget::kMaxPayloadBytes + 1) >
                       talos::telemetry_wire::kClientBurstBytes,
               "kMaxPayloadBytes is the largest payload the burst affords");
-
-// A finite double in round-trip form; NaN and the infinities, which JSON
-// numbers cannot spell, as the strings "NaN", "Infinity" and "-Infinity".
-inline void AppendTelemetryDouble(std::string& out, double value) {
-  if (std::isnan(value)) {
-    out += "\"NaN\"";
-    return;
-  }
-  if (std::isinf(value)) {
-    out += value > 0 ? "\"Infinity\"" : "\"-Infinity\"";
-    return;
-  }
-  char buffer[32];
-  std::snprintf(buffer, sizeof buffer, "%.17g", value);
-  out += buffer;
-}
-
-// One channel sample as JSON: a number, or for an integer past 2^53 (which a
-// JSON number, read as a double, would round) its exact decimal string.
-inline void AppendSample(std::string& out, ChannelKind kind,
-                         std::uint64_t raw) {
-  constexpr std::uint64_t kExact = std::uint64_t{1} << 53;
-  switch (kind) {
-    case Talos::Telemetry::ChannelKind_Int: {
-      const auto value = static_cast<std::int64_t>(raw);
-      const bool exact = value >= -static_cast<std::int64_t>(kExact) &&
-                         value <= static_cast<std::int64_t>(kExact);
-      if (!exact) out += '"';
-      out += std::to_string(value);
-      if (!exact) out += '"';
-      return;
-    }
-    case Talos::Telemetry::ChannelKind_UInt:
-    case Talos::Telemetry::ChannelKind_Bool:
-      if (raw > kExact) out += '"';
-      out += std::to_string(raw);
-      if (raw > kExact) out += '"';
-      return;
-    default:
-      AppendTelemetryDouble(out, talos::telemetry::DoubleFromRaw(raw));
-  }
-}
-
-inline std::string_view ChannelKindName(ChannelKind kind) {
-  switch (kind) {
-    case Talos::Telemetry::ChannelKind_Int:
-      return "int";
-    case Talos::Telemetry::ChannelKind_UInt:
-      return "uint";
-    case Talos::Telemetry::ChannelKind_Bool:
-      return "bool";
-    default:
-      return "double";
-  }
-}
-
-// The level as the alert grammar spells it (`alert_<level>_<name>`), "none"
-// for a channel that is not an alert.
-inline std::string_view AlertLevelName(AlertLevel level) {
-  switch (level) {
-    case Talos::Telemetry::AlertLevel_Info:
-      return "info";
-    case Talos::Telemetry::AlertLevel_Warning:
-      return "warning";
-    case Talos::Telemetry::AlertLevel_Error:
-      return "error";
-    default:
-      return "none";
-  }
-}
 
 inline void AppendPose(std::string& out, const TelemetryPose& pose) {
   out += "{\"x\":";
