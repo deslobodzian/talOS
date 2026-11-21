@@ -462,6 +462,22 @@ carries no Studio, so a deployed robot has no driver dashboard until its
 bundle refuses a webroot without them; talOS's
 `examples/robot_repo/README.md`, "Studio").
 
+In CI (and before building a Studio-bearing `robot_bundle`), build Studio's
+pages in the talOS checkout first and require them in tests:
+
+```sh
+(cd @TALOS@ && bazel build //studio:web_dist)
+bazel test --test_env=TALOS_REQUIRE_STUDIO_PAGES=1 //...
+```
+
+`//studio:web_dist` writes `STUDIO_STAMP.txt` with a hash of Studio's web
+inputs (`studio/src/**` and `talOS/telemetry/telemetry.fbs`). If the `@talos`
+pin moves without rebuilding `//studio:web_dist`, building `//:studio_webroot`,
+`//:sim`, or a Studio-bearing `talos_bundle` fails closed naming the expected
+and actual stamps and the rebuild command above. On a fresh clone before the
+pages are built, `bazel test //...` (without `TALOS_REQUIRE_STUDIO_PAGES=1`)
+still passes while `studio_test` checks the 503 response.
+
 ## Where talOS comes from
 
 `MODULE.bazel` points `@talos` at the talOS checkout this repository was

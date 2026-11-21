@@ -294,7 +294,7 @@ talos_messages(
 CC_BUILD = """\
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
+load("@TALOS@//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 @MESSAGES@
 cc_library(
@@ -303,11 +303,7 @@ cc_library(
     include_prefix = "@NAME@",
     strip_include_prefix = ".",
     visibility = ["//visibility:private"],
-    deps = [
-        ":messages",
-        "//talOS/devices",
-        "//talOS/node",
-    ],
+    deps = @LIB_DEPS@,
 )
 
 talos_cc_node(
@@ -325,14 +321,7 @@ cc_test(
     env = {
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
     },
-    deps = [
-        ":@NAME@",
-        "//talOS/devices:testing",
-        "//talOS/node:allocation_probe",
-        "//talOS/node:testing",
-        "@googletest//:gtest_main",
-        "@rules_cc//cc/runfiles",
-    ],
+    deps = @TEST_DEPS@,
 )
 """
 
@@ -1111,7 +1100,7 @@ dio = 0
 
 PY_BUILD = """\
 load("@rules_python//python:defs.bzl", "py_test")
-load("//talOS/build:contract.bzl", "talos_messages", "talos_py_node")
+load("@TALOS@//talOS/build:contract.bzl", "talos_messages", "talos_py_node")
 
 @MESSAGES@
 talos_py_node(
@@ -1119,7 +1108,7 @@ talos_py_node(
     class_name = "@PASCAL@",
     main = "@NAME@.py",
     node_name = "@NAME@",
-    deps = [":messages_py"],
+    deps = @NODE_DEPS@,
 )
 
 py_test(
@@ -1133,10 +1122,7 @@ py_test(
         "no_asan",
         "no_tsan",
     ],
-    deps = [
-        ":messages_py",
-        "//talOS/python:testing",
-    ],
+    deps = @TEST_DEPS@,
 )
 """
 
@@ -2176,7 +2162,7 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 ESTIMATOR_MESSAGES_BUILD = """\
 # The @NAME@'s topic. Its state is the shared geometry.PoseEstimate and its
-# camera inputs are geometry.PoseObservation (//talOS/msgs:geometry), so the
+# camera inputs are geometry.PoseObservation (@TALOS@//talOS/msgs:geometry), so the
 # package declares no schema of its own. Consumers find the pose through
 # config (telemetry's pose_topic), not through this package.
 talos_messages(
@@ -2186,7 +2172,7 @@ talos_messages(
     topics = {
         "state": "/@NAME@/state",
     },
-    deps = ["//talOS/msgs:geometry"],
+    deps = ["@TALOS@//talOS/msgs:geometry"],
 )
 """
 
@@ -2758,9 +2744,10 @@ observation_timeout_us = 500000
 """
 
 
-def estimator_files(name, lang):
+def estimator_files(name, lang, talos=""):
     """{relative path: content} of an estimator package."""
-    values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
+    values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US,
+                  TALOS=talos)
     doc = fill(ESTIMATOR_DOC, **values)
     messages = fill(ESTIMATOR_MESSAGES_BUILD, **values)
     files = {"testdata/robot.toml": fill(ESTIMATOR_TESTDATA_ROBOT, **values)}
@@ -2771,10 +2758,20 @@ def estimator_files(name, lang):
                          f"{name}/{name}.h", "talOS/devices/testing.h",
                          "talOS/node/allocation_probe.h",
                          "talOS/node/testing.h"]
-        build = fill(CC_BUILD, MESSAGES=messages,
-                     DATA="[\n" + string_list(["testdata/robot.toml"], 4), **values)
         # The node reads no devices; only its test drives SimHardware.
-        build = build.replace('        "//talOS/devices",\n', "", 1)
+        lib_deps = [":messages", f"{talos}//talOS/node"]
+        test_deps = [
+            f":{name}",
+            f"{talos}//talOS/devices:testing",
+            f"{talos}//talOS/node:allocation_probe",
+            f"{talos}//talOS/node:testing",
+            "@googletest//:gtest_main",
+            "@rules_cc//cc/runfiles",
+        ]
+        build = fill(CC_BUILD, MESSAGES=messages,
+                     DATA="[\n" + string_list(["testdata/robot.toml"], 4),
+                     LIB_DEPS="[\n" + string_list(lib_deps, 4),
+                     TEST_DEPS="[\n" + string_list(test_deps, 4), **values)
         files.update({
             "BUILD": build,
             f"{name}.h": fill(CC_ESTIMATOR_HEADER,
@@ -2795,11 +2792,14 @@ def estimator_files(name, lang):
         from_imports = "\n".join(
             f"from {module} import {imports[module]}"
             for module in sorted(imports, key=str.lower))
+        test_deps = [":messages_py", f"{talos}//talOS/python:testing"]
         files.update({
             "BUILD": fill(PY_BUILD, MESSAGES=messages,
                           DATA="[\n" + string_list(
-                              [f"{name}.py", "testdata/robot.toml"],
-                              4), **values),
+                              [f"{name}.py", "testdata/robot.toml"], 4),
+                          NODE_DEPS='[":messages_py"]',
+                          TEST_DEPS="[\n" + string_list(test_deps, 4),
+                          **values),
             f"{name}.py": fill(PY_ESTIMATOR_NODE, DOC=doc, **values),
             "node_test.py": fill(PY_ESTIMATOR_TEST, FROM_IMPORTS=from_imports,
                                  **values),
@@ -2809,26 +2809,6 @@ def estimator_files(name, lang):
 
 # ---------------------------------------------------------------- generation
 
-TALOS_LABEL = re.compile(r"(?<![@\w])//talOS/")
-LIST_ITEMS = re.compile(r'(?:^[ \t]+"[^"\n]*",\n)+', re.M)
-
-
-def talos_labels(build, talos):
-    """`build` with every talOS label (`//talOS/...`) naming the module
-    `talos` (`@talos//talOS/...`), as a repository that depends on talOS
-    names it, each list kept in buildifier's order. `talos` empty: in talOS
-    itself, unchanged."""
-    if not talos:
-        return build
-    build = TALOS_LABEL.sub(f"{talos}//talOS/", build)
-
-    def resort(match):
-        lines = match.group(0).splitlines(keepends=True)
-        return "".join(sorted(
-            lines, key=lambda line: label_order(line.strip()[1:-2])))
-
-    return LIST_ITEMS.sub(resort, build)
-
 
 def package_files(name, lang, standalone=False, kind="velocity", raw=False,
                   talos=""):
@@ -2836,11 +2816,11 @@ def package_files(name, lang, standalone=False, kind="velocity", raw=False,
     that writes out its own homing and limits instead of using
     talOS/mechanisms. `talos`: the label prefix of the talOS module, `@talos`
     in a repository that depends on it (standalone always), empty in talOS."""
+    effective_talos = "@talos" if standalone else talos
     values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
-    files = (estimator_files(name, lang) if kind == "estimator"
-             else mechanism_files(name, lang, kind, raw))
-    files["BUILD"] = talos_labels(files["BUILD"],
-                                  "@talos" if standalone else talos)
+    files = (estimator_files(name, lang, effective_talos)
+             if kind == "estimator"
+             else mechanism_files(name, lang, kind, raw, effective_talos))
     if standalone:
         # The repo root is the package, so defaults.toml is exported after
         # the loads.
@@ -2869,11 +2849,11 @@ def neighbor_of(name):
     return "bystander" if name == "neighbor" else "neighbor"
 
 
-def mechanism_files(name, lang, kind, raw=False):
+def mechanism_files(name, lang, kind, raw=False, talos=""):
     """{relative path: content} of a one-motor velocity/position package;
     `raw`: package_files'."""
     values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US,
-                  NEIGHBOR=neighbor_of(name))
+                  NEIGHBOR=neighbor_of(name), TALOS=talos)
     messages = fill(MESSAGES_BUILD, **values)
     fbs_template = (POSITION_RAW_FBS if raw else
                     POSITION_FBS if kind == "position" else FBS)
@@ -2890,8 +2870,22 @@ def mechanism_files(name, lang, kind, raw=False):
         neighbor = values["NEIGHBOR"]
         data = ["testdata/robot.toml", f"testdata/{name}.toml",
                 f"testdata/{neighbor}.toml"]
+        lib_deps = [":messages", f"{talos}//talOS/devices",
+                    f"{talos}//talOS/node"]
+        if kind == "position" and not raw:
+            lib_deps.append(f"{talos}//talOS/mechanisms")
+        test_deps = [
+            f":{name}",
+            f"{talos}//talOS/devices:testing",
+            f"{talos}//talOS/node:allocation_probe",
+            f"{talos}//talOS/node:testing",
+            "@googletest//:gtest_main",
+            "@rules_cc//cc/runfiles",
+        ]
         build = fill(CC_BUILD, MESSAGES=messages,
-                     DATA="[\n" + string_list(data, 4), **values)
+                     DATA="[\n" + string_list(data, 4),
+                     LIB_DEPS="[\n" + string_list(lib_deps, 4),
+                     TEST_DEPS="[\n" + string_list(test_deps, 4), **values)
         hdr_template = CC_POSITION_HEADER if kind == "position" else CC_HEADER
         cc_test = fill(CC_TEST, INCLUDES=includes(test_includes), **values)
         testdata_subsystem = CC_TESTDATA_SUBSYSTEM
@@ -2949,11 +2943,6 @@ def mechanism_files(name, lang, kind, raw=False):
             # A thin node over talos::mechanisms::PositionMechanism, whose
             # name is both its motor and its parameter table.
             node_includes.append("talOS/mechanisms/position_mechanism.h")
-            build = edited(build, [
-                ('        "//talOS/devices",\n        "//talOS/node",\n',
-                 '        "//talOS/devices",\n        "//talOS/mechanisms",\n'
-                 '        "//talOS/node",\n'),
-            ])
             cc_test = edited(cc_test, [
                 # A motor on its home switch zeroes after home_samples ticks.
                 ("    sim.step(10ms);  // the mode is current before any lane "
@@ -2994,8 +2983,17 @@ def mechanism_files(name, lang, kind, raw=False):
         from_imports = "\n".join(
             f"from {module} import {imports[module]}"
             for module in sorted(imports, key=str.lower))
+        py_test_deps = [":messages_py", f"{talos}//talOS/python:testing"]
+        if kind == "position" and not raw:
+            py_node_deps = "[\n" + string_list(
+                [":messages_py", f"{talos}//talOS/python:mechanisms"], 4)
+            py_test_deps.append(f"{talos}//talOS/python:mechanisms")
+        else:
+            py_node_deps = '[":messages_py"]'
         build = fill(PY_BUILD, MESSAGES=messages,
-                     DATA="[\n" + string_list(data, 4), **values)
+                     DATA="[\n" + string_list(data, 4),
+                     NODE_DEPS=py_node_deps,
+                     TEST_DEPS="[\n" + string_list(py_test_deps, 4), **values)
         node = fill(PY_NODE, **values)
         py_test = fill(PY_TEST, FROM_IMPORTS=from_imports, **values)
         testdata_robot = PY_TESTDATA_ROBOT
@@ -3061,14 +3059,6 @@ def mechanism_files(name, lang, kind, raw=False):
             node = fill(PY_POSITION_NODE, FROM_IMPORTS="\n".join(
                 f"from {module} import {node_imports[module]}"
                 for module in sorted(node_imports, key=str.lower)), **values)
-            build = edited(build, [
-                ('    deps = [":messages_py"],\n',
-                 '    deps = [\n        ":messages_py",\n'
-                 '        "//talOS/python:mechanisms",\n    ],\n'),
-                ('        ":messages_py",\n        "//talOS/python:testing",\n',
-                 '        ":messages_py",\n        "//talOS/python:mechanisms",\n'
-                 '        "//talOS/python:testing",\n'),
-            ])
             py_test = edited(py_test, [
                 (f"    # matrix: n/a 9 (the {name} reads no parameters)\n",
                  fill(PY_POSITION_PARAMETERS, **values)),
@@ -3186,11 +3176,48 @@ def layout_of(robot):
                   robot)
 
 
-def talos_module():
+def _talos_repo_name_from_module(workspace_root):
+    """Apparent repository name for `talos` declared by
+    `bazel_dep(name = "talos", repo_name = ...)` in `<workspace_root>/MODULE.bazel`
+    via Python `ast`, or None if absent or unreadable."""
+    if not workspace_root:
+        return None
+    module_path = os.path.join(workspace_root, "MODULE.bazel")
+    if not os.path.isfile(module_path):
+        return None
+    try:
+        with open(module_path, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=module_path)
+    except (OSError, SyntaxError):
+        return None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "bazel_dep"):
+            kwargs = {}
+            for kw in node.keywords:
+                if (kw.arg in ("name", "repo_name")
+                        and isinstance(kw.value, ast.Constant)
+                        and isinstance(kw.value.value, str)):
+                    kwargs[kw.arg] = kw.value.value
+            if kwargs.get("name") == "talos":
+                return kwargs.get("repo_name") or None
+    return None
+
+
+def talos_module(workspace_root=None):
     """The label prefix of talOS as the workspace being worked in names it:
-    "" when talOS is the main repository, else `@<module>` (`@talos`), from
-    the regenerate command sync_manifest gives the same workspace."""
-    return sync_manifest.command().split()[2].partition("//")[0]
+    "" when talOS is the main repository, else `@<apparent>` from
+    `sync_manifest.talos_repo_prefix()` (and `<workspace>/MODULE.bazel`'s
+    `bazel_dep(name = "talos", repo_name = ...)` when present)."""
+    prefix = sync_manifest.talos_repo_prefix().removesuffix("//")
+    if not prefix:
+        return ""
+    root = (workspace_root if workspace_root is not None
+            else os.environ.get("BUILD_WORKSPACE_DIRECTORY"))
+    if repo_name := _talos_repo_name_from_module(root):
+        return f"@{repo_name}"
+    return prefix
 
 
 # A robot repository's config when --config is not given: the layout of
