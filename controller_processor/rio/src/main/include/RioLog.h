@@ -31,15 +31,16 @@
 // longer than the period) and late ticks (one starting more than 1.5 periods
 // after the previous, as when the loop is starved of the CPU, which delays
 // command-timeout enforcement however short the work), with that window's
-// longest work and longest interval. None has a field in State, so all stay
-// RIO-local.
+// longest work, that single worst-work tick's 8-phase split (published
+// lock-free through an atomic seqlock), and longest interval. None has a field
+// in State, so all stay RIO-local.
 //
-// Every 10 s it also prints where the ticks' work went (TickPhase), when that
-// window had ticks: per phase the mean and longest time per tick, and the
-// device counts. The loop thread adds a tick's phases with plain arithmetic
-// and hands a finished window over on the first tick after the logger asks
-// for it: relaxed stores between an acquire load of the request and a
-// release store, once per window.
+// Every 10 s (and on Flush()/Stop() for the final partial window) it also
+// prints where the ticks' work went (TickPhase), when that window had ticks:
+// per phase the mean and longest time per tick, and the device counts. The
+// loop thread adds a tick's phases with plain arithmetic and hands a finished
+// window over on the first tick after the logger asks for it: relaxed stores
+// between an acquire load of the request and a release store, once per window.
 //
 // Beside that line, the same window's latency line (REQ-RT-25): the p50, p99
 // and max of each drained command's observation age (accepted and refused
@@ -294,6 +295,26 @@ class RioLog {
   std::array<std::atomic<uint64_t>, kPhaseCount> published_max_ns_{};
   std::atomic<uint32_t> published_motors_{0};
   std::atomic<uint32_t> published_sensors_{0};
+  // Worst-work tick of the current 1 s timing summary window. The logger
+  // advances timing_epoch_ (release) on each 1 s summary; the loop thread
+  // resets local_worst_work_us_ when the epoch changes and publishes the new
+  // worst tick's phases via an atomic seqlock (worst_seq_ odd acq_rel ->
+  // release atomic stores -> worst_seq_ even release) so Drain() reads a
+  // consistent snapshot without waiting for a handover tick.
+  struct WorstSnapshot {
+    bool valid{false};
+    uint64_t epoch{0};
+    uint64_t work_us{0};
+    std::array<uint64_t, kPhaseCount> phase_ns{};
+  };
+  WorstSnapshot ReadWorstTick() const;
+  std::atomic<uint64_t> timing_epoch_{1};
+  uint64_t local_timing_epoch_{0};
+  uint64_t local_worst_work_us_{0};
+  std::atomic<uint64_t> worst_seq_{0};
+  std::atomic<uint64_t> worst_published_epoch_{0};
+  std::atomic<uint64_t> worst_published_us_{0};
+  std::array<std::atomic<uint64_t>, kPhaseCount> worst_phase_ns_{};
   void WritePhases(uint64_t now_us, bool force);
 
   // Latency: per figure, counts per kLatencyBucketUs bucket and one
@@ -312,6 +333,8 @@ class RioLog {
     LatencyHistogram refused;
     LatencyHistogram driver_station;
   };
+  void EmitPhasesAndLatency(const PhaseWindow& window,
+                            const LatencyWindow& latency);
   struct PendingAge {
     bool present{false};
     bool accepted{false};

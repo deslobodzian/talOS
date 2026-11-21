@@ -775,11 +775,15 @@ for the bits that are not faults (`kMotorNotFaultFlags`), `limit
 raised`/`limit cleared`, then the active `faults=[...]` and `limits=[...]`;
 the `motor_fault_mask changed` line counts faults only. Once
 in any second that saw them, it also prints the dropped-event count and the
-loop's timing faults: overruns (a tick's work, from wake to sleep, longer than
-the period) and late ticks (a tick starting more than 1.5 periods after the
-previous, a starved loop however short its work), with that second's longest
-work and interval. Every 10 s, when the loop ticked in that window, it
-prints where those ticks' work went:
+loop's timing faults (`[rio] loop timing:`): overruns (a tick's work, from wake
+to sleep, longer than the period) and late ticks (a tick starting more than 1.5
+periods after the previous, a starved loop however short its work), with that
+second's longest work, longest interval, period, and that single worst-work
+tick's 8-phase split (`; worst tick phases: refresh <r> us, devices <d> us,
+control <c> us, health <h> us, other <o> us, link <l> us, driver station <ds>
+us, loop <lp> us`). Every 10 s — and on clean exit (`RioLog::Flush` / `Stop`)
+for the final partial window — when the loop ticked in that window, it prints
+where those ticks' work went:
 
 ```
 [rio] tick phases: refresh mean/max <a>/<b> us, devices <a>/<b> us, control <a>/<b> us, health <a>/<b> us, other <a>/<b> us, link <a>/<b> us, driver station <a>/<b> us, loop <a>/<b> us over <n> ticks (motors=<m> sensors=<s>)
@@ -1108,8 +1112,11 @@ must be free. Both modes fail a run during which the host slept (more than
 50 ms of sleep), since a frozen host reads as a stalled robot; on macOS the
 harness holds `caffeinate -s` for the run, which also holds off a headless
 Mac's DarkWake maintenance sleep. `--wpilib` also fails when the RoboRIO
-loop's watchdog reports a stall or its timing report shows more than 250 ms
-between ticks, naming whether the tick overran or only started late.
+loop's watchdog reports a stall, when its timing report shows more than 250 ms
+between ticks (naming whether the tick overran or only started late), or when a
+scenario prints no `[rio] tick phases` (with positive tick count) or `[rio]
+latency` line (and in the driving scenario, when accepted command or Driver
+Station latency sample counts are zero).
 
 ## Simulation Backends: Ideal vs Physics-Backed
 
