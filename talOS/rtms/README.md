@@ -78,7 +78,10 @@ Each topic has 32 reader slots (`MAX_READERS`), including observer
 subscriptions. Dead readers are reclaimed before registration fails. The graph
 lint rejects declared reader counts above this limit before launch; standalone
 `ipc::Subscriber` construction and a realtime loop's watcher registration
-throw with the topic and limit if exhausted.
+throw with the topic and limit if exhausted. Every reader—prompt (woken) or
+polled/observer—holds one of those 32 slots; RTMS does not implement a
+separate process-local cursor-only path for never-woken readers while 32 slots
+per topic hold real robot graphs comfortably.
 
 A queue keeps the state word it claimed each reader slot with. Once the slot
 holds another word -- another process judged this one dead and freed the slot,

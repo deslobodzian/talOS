@@ -3669,7 +3669,11 @@ def talos_checkout(script):
 def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
                     raw=False):
     """[(path, None, content)] for a standalone Bzlmod subsystem repository
-    that builds against the talOS checkout at `talos_root` as it stands."""
+    that builds against the talOS checkout at `talos_root` as it stands.
+
+    Writes `local_path_override` (and `.bazelrc`'s import) using a relative
+    path from `target_dir` to `talos_root` when both share a common ancestor,
+    matching `new_robot`'s accepted relative-path policy."""
     if problem := check_name(name) or check_kind(name, lang, kind, raw):
         raise Refused(problem)
     if os.path.exists(target_dir) and os.listdir(target_dir):

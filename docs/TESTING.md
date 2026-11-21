@@ -197,12 +197,13 @@ Where RULES.md 12 is read too broadly or too narrowly:
 4. **Ports are bound at 0** and read back. `exclusive` is for tests that own
    a host-wide resource (the whole-graph e2e tests), not for fixed ports.
    Studio's bridge accepts `--studio-http-port 0` and the launcher records
-   its bound port as `http_port` in `manifest.json`. The remaining exception
+   its bound port as `http_port` in `manifest.json`. The accepted exception
    is the gateway UDP link (`--remote-port`, `--local-port`,
-   `sim_gateway --port`), which still refuses 0: tests reserve and release
-   those UDP ports before the launch, so another process can take one first,
-   and say so when that happens (`//studio:drive_browser_test` names the
-   member's failed-bind log line).
+   `sim_gateway --port`), where both ends open mutually `connect()`ed UDP
+   sockets and refuse port 0: tests reserve and release UDP ports below the
+   OS ephemeral range (`20000..31999`) before the launch and report bind
+   failures directly (`HardwareNode::Open()` names failed binds, and
+   `//studio:drive_browser_test` names the member's failed-bind log line).
 5. **Randomness is seeded and printed**, settable from the environment
    (`TALOS_SOAK_SEED`).
 6. **A wall-clock bound comes from a requirement.** A perf test or timed e2e
@@ -294,7 +295,10 @@ step exercises its case the lint cannot check: that is a review item
 stamped under each earlier generation. Cases 9 and 12 cannot be claimed (a
 parity run compares no construction and no allocation), so construction
 and anything only the Python node does keep their own Python tests.
-`bench/main_processor/motor/node_py_test.py` is the example; the
+`bench/main_processor/motor/node_py_test.py` is the repository's sole
+dual-language parity pair and is sufficient to exercise `talos.parity`
+(other Python nodes wrap their C++ implementations via `talos.cpp_node`
+under RULES.md 7); the
 [node development guide](NODE_DEVELOPMENT_GUIDE.md#testing) gives the API.
 
 A case that does not apply is a comment in the test file naming why:
@@ -404,6 +408,12 @@ everyday loop; `--config=heavy`, `--config=integration`, `--config=e2e` and
 `--config=perf` run one lane, and `--config=no_e2e` every lane but e2e.
 `bazel test //...` runs every lane but the soak; it is what runs before a
 push ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)).
+End-to-end simulation tests run on the real clock (`sim_gateway`, the launcher
+and each node process use host time; talOS does not maintain a discrete-event
+lockstep multi-process simulator), so scripted e2e runs take their wall-clock
+duration; `--config=fast` excludes `e2e` (along with `heavy`, `integration` and
+`perf`) so everyday iteration stays fast while deterministic node and mechanism
+logic runs on `Sim`'s virtual clock.
 Bazel keeps only the last `--test_tag_filters`, so a lane is combined with a
 sanitizer in one filter, not two configs:
 `bazel test --config=asan --test_tag_filters=-no_asan,-heavy,-integration,-e2e,-perf //...`.
