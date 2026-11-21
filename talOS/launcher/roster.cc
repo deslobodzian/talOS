@@ -142,6 +142,10 @@ bool LoadBundle(LauncherOptions& options, std::string& error) {
     options.bundle_git_revision =
         manifest["git_revision"].value_or(std::string{});
     options.bundle_git_dirty = manifest["git_dirty"].value_or(false);
+    options.bundle_talos_git_revision =
+        manifest["talos_git_revision"].value_or(std::string{});
+    options.bundle_talos_git_dirty =
+        manifest["talos_git_dirty"].value_or(false);
 
     if (const auto* nodes = manifest["nodes"].as_array()) {
       for (const auto& entry : *nodes) {

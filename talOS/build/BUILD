@@ -195,6 +195,7 @@ py_test(
         "bundle_builder.py",
         "launcher_runner.py",
         "//tools:deploy.sh",
+        "//tools:workspace_status.sh",
     ],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],

@@ -265,6 +265,12 @@ struct SessionManifest {
   // uncommitted changes. Empty and false otherwise.
   std::string git_revision;
   bool git_dirty{false};
+  // The talOS checkout revision a --stamp build in a separate robot repository
+  // recorded (bundle_manifest.toml talos_git_revision), and whether its tree
+  // had uncommitted changes. Empty and false otherwise; omitted from
+  // manifest.json when empty.
+  std::string talos_git_revision;
+  bool talos_git_dirty{false};
   std::string output_dir;
   // The launcher's own output log, talos.log (README "Node output"); empty
   // for none.

@@ -1094,12 +1094,15 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   bridge recorded on `/hw/status`, and under this one only when no bridge
   recorded one
   ([which logs a build can read](#which-logs-a-build-can-read)).
-- `config_sha256`, `git_revision`, `git_dirty`: the bundle's config identity
-  and the source revision of a `--config=release` build
+- `config_sha256`, `git_revision`, `git_dirty` (and, when a separate robot
+  repository was stamped against a talOS git checkout, `talos_git_revision`,
+  `talos_git_dirty`, omitted when empty): the bundle's config identity
+  and the source revision(s) of a `--config=release` build
   ([deployment](../../docs/DEPLOYMENT.md#build-a-bundle)); empty (and
-  `false`) outside a bundle or for an unstamped one. The RoboRIO program's
-  build is not here: every `/hw/state` record of the bridge's log carries it
-  (`log_dump`'s `hardware` field,
+  `false`) outside a bundle or for an unstamped one. `session_report` prints
+  `talOS revision: <rev>[ (dirty)]` after `Source revision:` when present. The
+  RoboRIO program's build is not here: every `/hw/state` record of the bridge's
+  log carries it (`log_dump`'s `hardware` field,
   [filtering and exporting logs](#filtering-and-exporting-logs)).
 - per node, `binary_sha256`: the SHA-256 of `binary_path` as the session
   starts, empty if it cannot be read. It covers that file only: not the
