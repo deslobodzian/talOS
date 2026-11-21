@@ -254,6 +254,20 @@ if [ "$WANT_GATEWAY" = "1" ] && [ -z "$(target sim_gateway)" ]; then
   die "$CONFIG sets no [robot] sim_gateway for --sim-gateway to start"
 fi
 
+# In WPILib mode, fail fast if another session already holds this namespace's
+# session lock so we never spend time building or booting Gradle/WPILib only
+# to have the launcher refuse startup afterwards.
+check_session_lock() {
+  local err
+  err="$(./bazel-bin/talOS/launcher/launcher --check-session-lock 2>&1)" || {
+    printf '%s\n' "$err" >&2
+    die "another session holds the session lock; stop it before starting WPILib simulation"
+  }
+}
+if [ "$WANT_RIO" = "1" ] && [ -x ./bazel-bin/talOS/launcher/launcher ]; then
+  check_session_lock
+fi
+
 # The launcher takes a number (uint64). The second alone collides for two
 # starts in one second; the shell's pid (below 2^22 on Linux, 99999 on macOS,
 # so seven digits) makes the key unique among concurrent runs.
@@ -325,6 +339,7 @@ tail -5 "$BUILD_LOG"
 
 # --- 1. the controller processor (WPILib sim) -------------------------------
 if [ "$WANT_RIO" = "1" ]; then
+  check_session_lock
   # The robot's own RoboRIO program when it has one beside its
   # main_processor/, else talOS's; the bridge sends either its hardware
   # config.

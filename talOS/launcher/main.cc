@@ -67,6 +67,8 @@ int main(int argc, char** argv) {
         options.allow_graph_errors = true;
       } else if (arg == "--describe-only") {
         options.describe_only = true;
+      } else if (arg == "--check-session-lock") {
+        options.check_session_lock = true;
       } else if (arg == "--describe-as-launch") {
         options.describe_as_launch = true;
       } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
@@ -97,6 +99,7 @@ int main(int argc, char** argv) {
                "[--start-studio-bridge] [--serve-refusal] "
                "[--studio-http-port PORT] "
                "[--describe-only [--describe-as-launch]] "
+               "[--check-session-lock] "
                "[--allow-graph-errors] [--describe-timeout-ms MS] "
                "[--max-restarts N] "
                "[--remote IP] [--local-address IP] [--remote-port PORT] "
@@ -132,6 +135,10 @@ int main(int argc, char** argv) {
                "what it is, lint the\n"
                "                         graph they describe, and exit "
                "without starting a robot\n"
+               "  --check-session-lock   test whether this namespace's "
+               "session lock is free\n"
+               "                         (exits 0 if free, 1 naming the "
+               "holder if held)\n"
                "  --describe-as-launch   with --describe-only, also refuse "
                "what the same\n"
                "                         launch would refuse before its "
