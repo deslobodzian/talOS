@@ -8,6 +8,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -1056,6 +1057,18 @@ TEST(OperatorArmingBlocker, RecordsBlockingInputWhileDisarmedAndClearsOnArm) {
   EXPECT_FALSE(op.arming.evaluate(true, {}));
   EXPECT_FALSE(op.arming.armed());
   EXPECT_EQ(op.arming.blocker(), kNone);
+
+  // Off-thread access throws std::logic_error, matching armed().
+  bool off_thread_refused = false;
+  std::thread worker{[&] {
+    try {
+      (void)op.arming.blocker();
+    } catch (const std::logic_error&) {
+      off_thread_refused = true;
+    }
+  }};
+  worker.join();
+  EXPECT_TRUE(off_thread_refused);
 }
 
 // The live-target gate at the devices flush (RULES.md 1): a tick drives only

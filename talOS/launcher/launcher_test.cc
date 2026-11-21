@@ -2748,6 +2748,114 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   std::remove(gamma.binary_path.c_str());
 }
 
+// REQ-OPS-55: a graph-reading node's Pass-1 static non-telemetry SENDER (such
+// as teleop's /teleop/status) is exported to declared_graph.json so another
+// graph reader (telemetry) can observe it, while telemetry's own
+// telemetry-role SENDER (/talos/telemetry) and Pass-1 watchers are omitted so
+// telemetry never sees itself.
+TEST(LauncherGraphTest,
+     TelemetrySeesOtherGraphReadersPass1StaticSenderAndNotItsOwn) {
+  const std::string record = TempPath("graph_pass1_static_record");
+  std::filesystem::create_directories(record);
+
+  auto two_pass_stub = [&](const introspect::Description& pass1,
+                           const introspect::Description& pass2,
+                           const std::string& save_as) {
+    return std::string{"#!/bin/sh\n"} +
+           "describe=0\n"
+           "graph=''\n"
+           "while [ $# -gt 0 ]; do\n"
+           "  case \"$1\" in\n"
+           "    --describe) describe=1 ;;\n"
+           "    --graph) shift; graph=\"$1\" ;;\n"
+           "  esac\n"
+           "  shift\n"
+           "done\n"
+           "[ $describe = 1 ] || exit 0\n"
+           "if [ -z \"$graph\" ]; then\n"
+           "  cat <<'TALOS_DESCRIBE'\n" +
+           introspect::DescribeToJson(pass1) +
+           "TALOS_DESCRIBE\n"
+           "  exit 0\n"
+           "fi\n" +
+           (save_as.empty()
+                ? std::string{}
+                : "cp \"$graph\" '" + record + "/" + save_as + "'\n") +
+           "cat <<'TALOS_DESCRIBE'\n" + introspect::DescribeToJson(pass2) +
+           "TALOS_DESCRIBE\n";
+  };
+
+  introspect::Description teleop_p1;
+  teleop_p1.name = "teleop";
+  teleop_p1.target = "//example/teleop:node";
+  teleop_p1.reads_graph = true;
+  teleop_p1.sources = {Sender("/teleop/status"),
+                       Watcher("/hw/state/driver_station")};
+  introspect::Description teleop_p2 = teleop_p1;
+  teleop_p2.sources.push_back(Sender("/alpha/target/teleop"));
+
+  introspect::Description telemetry_p1;
+  telemetry_p1.name = "telemetry";
+  telemetry_p1.target = "//example/telemetry:node";
+  telemetry_p1.reads_graph = true;
+  telemetry_p1.sources = {Sender("/talos/telemetry")};
+  introspect::Description telemetry_p2 = telemetry_p1;
+  auto obs_alpha = Watcher("/alpha/state");
+  obs_alpha.flags = introspect::naming::kSourceFlagObserver;
+  auto obs_teleop = Watcher("/teleop/status");
+  obs_teleop.flags = introspect::naming::kSourceFlagObserver;
+  telemetry_p2.sources.push_back(obs_alpha);
+  telemetry_p2.sources.push_back(obs_teleop);
+
+  NodeSpec alpha{"alpha", "//example/alpha:node",
+                 WriteStubNode("graph_pass1_alpha",
+                               DescribingStub("alpha", "//example/alpha:node",
+                                              {Sender("/alpha/state")}))};
+  NodeSpec teleop{"teleop", "//example/teleop:node",
+                  WriteStubNode("graph_pass1_teleop",
+                                two_pass_stub(teleop_p1, teleop_p2, ""))};
+  NodeSpec telemetry{
+      "telemetry", "//example/telemetry:node",
+      WriteStubNode("graph_pass1_telemetry",
+                    two_pass_stub(telemetry_p1, telemetry_p2, "graph"))};
+
+  LauncherOptions options;
+  options.output_dir = TempPath("graph_pass1_static_out");
+  std::vector<NodeDescription> described;
+  DescribeGraph({telemetry, teleop, alpha}, options, described);
+
+  ASSERT_EQ(described.size(), 3u);
+  EXPECT_TRUE(described[0].answered) << described[0].error;
+  EXPECT_TRUE(described[1].answered) << described[1].error;
+  EXPECT_TRUE(described[2].answered) << described[2].error;
+
+  introspect::DeclaredGraph graph;
+  std::string error;
+  ASSERT_TRUE(introspect::DescribeReader::ParseGraph(
+      ReadFile(record + "/graph"), graph, error))
+      << error;
+  ASSERT_EQ(graph.size(), 2u);
+
+  const auto find_node = [&](std::string_view name) {
+    return std::find_if(
+        graph.begin(), graph.end(),
+        [&](const introspect::Description& d) { return d.name == name; });
+  };
+  EXPECT_NE(find_node("alpha"), graph.end());
+  EXPECT_EQ(find_node("telemetry"), graph.end());
+  const auto teleop_it = find_node("teleop");
+  ASSERT_NE(teleop_it, graph.end());
+  ASSERT_EQ(teleop_it->sources.size(), 1u);
+  EXPECT_EQ(teleop_it->sources[0].kind, event::SourceKind::SENDER);
+  EXPECT_EQ(teleop_it->sources[0].name, "/teleop/status");
+
+  std::filesystem::remove_all(record);
+  std::filesystem::remove_all(options.output_dir);
+  std::remove(alpha.binary_path.c_str());
+  std::remove(teleop.binary_path.c_str());
+  std::remove(telemetry.binary_path.c_str());
+}
+
 // A graph file the launch cannot write -- the declared graph its graph
 // readers are described and started with, or graph.json -- refuses the launch
 // before anything starts.

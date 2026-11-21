@@ -297,7 +297,7 @@ parity run compares no construction and no allocation), so construction
 and anything only the Python node does keep their own Python tests.
 `bench/main_processor/motor/node_py_test.py` is the repository's sole
 dual-language parity pair and is sufficient to exercise `talos.parity`
-(other Python nodes wrap their C++ implementations via `talos.cpp_node`
+(other dual-language Python nodes wrap their C++ implementations via `talos.cpp_node`
 under RULES.md 7); the
 [node development guide](NODE_DEVELOPMENT_GUIDE.md#testing) gives the API.
 

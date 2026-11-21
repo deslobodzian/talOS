@@ -102,7 +102,7 @@ numbered section, a number in RULES a rule:
 | REQ-SAFE-43 | A torque-current demand (`Motor::set_torque_current`, `TALOS_MODE_TORQUE_CURRENT`, Python `Motor.set_torque_current`) is stator amperes. Config load refuses `max_torque_current_a` negative, non-finite, above `stator_limit_a`, set without `foc = true`, set on a follower, or set on a motor another motor follows (a follower copies its master's torque current but not its duty cap, so the mode drives a single motor). The setter throws naming the motor and the key unless `foc = true` and `max_torque_current_a > 0`, clamps to ±`max_torque_current_a` (counted by `clamped_count`) and neutralizes a non-finite demand; the gateway neutralizes a torque-current request whose motor lacks either key, whose demand exceeds the limit or whose feedforward is not 0; the RoboRIO applies it as TorqueCurrentFOC with peak torque current ±`max_torque_current_a` and a maximum duty cycle of `max_voltage` over its last battery reading (no output before the first), sends NeutralOut for such a request that reaches it out of contract, and every neutral is NeutralOut. | P0 | ARCH "The tick"; HR "Supported Hardware Requests" | request bytes; `clamped_count`; exception; gateway applied request; applied control fields | component |
 | REQ-SAFE-44 | The RoboRIO configures each TalonFX with peak forward and reverse voltage ±`max_voltage`, in the configuration it applies at configure and applies again when it restores the device after a reset, so no voltage-based request (voltage, velocity, position and motion magic, sent as Phoenix's voltage controls) applies more than `max_voltage`; the torque-current mode's duty cap is REQ-SAFE-43's. | P0 | code `controller_processor/rio/src/main/cpp/PhoenixBackend.cpp`; BENCH.md "Human commissioning and first spin" | applied TalonFX configuration (`PeakForwardVoltage`, `PeakReverseVoltage`) | component |
 | REQ-SAFE-45 | A node closing a control loop on a hardware device whose feedback is not `connected()` neutralizes the affected actuator outputs in that `update()`. | P0 | ARCH "The tick" | motor request mode and demand on disconnected feedback | component |
-| REQ-SAFE-46 | A mechanism node reading a digital input (such as a piece or limit sensor) carries that sensor's `connected()` validity in its state message (e.g. `IntakeStatus.sensor_connected`) and never blocks indefinitely waiting for a disconnected input. | P1 | ARCH "The tick"; `examples/superstructure/README.md` | state `sensor_connected` field and neutral output on disconnected DI | component |
+| REQ-SAFE-46 | A mechanism node reading a digital input (such as a piece sensor; limit-switch homing is governed by REQ-SAFE-36) carries that sensor's `connected()` validity in its state message (e.g. `IntakeStatus.sensor_connected`) and never blocks indefinitely waiting for a disconnected input. | P1 | ARCH "The tick"; `examples/superstructure/README.md` | state `sensor_connected` field and neutral output on disconnected DI | component |
 
 ### CONTRACT: wire format, schema identity, C ABI/Python parity, naming/graph rules, config validation
 
@@ -286,7 +286,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/rtms`, `talOS/memory`, `talOS/ipc` | REQ-SAFE-08, REQ-SAFE-31, REQ-CONTRACT-07, REQ-CONTRACT-21, REQ-CONTRACT-36, REQ-CONTRACT-22, REQ-RT-12, REQ-RT-19, REQ-OPS-03 |
 | `talOS/events` | REQ-RT-01 to REQ-RT-05, REQ-RT-11, REQ-RT-19, REQ-RT-21, REQ-CONTRACT-20, REQ-CONTRACT-36, REQ-OPS-12 to REQ-OPS-14, REQ-OPS-31, REQ-OPS-52 |
 | `talOS/node` | REQ-SAFE-06, REQ-SAFE-27, REQ-SAFE-42, REQ-CONTRACT-18, REQ-RT-01, REQ-RT-05, REQ-RT-06, REQ-RT-19, REQ-RT-21, REQ-DEV-08, REQ-CONTRACT-31, REQ-OPS-52 |
-| `talOS/devices` | REQ-SAFE-01 to REQ-SAFE-09, REQ-SAFE-12, REQ-SAFE-13, REQ-SAFE-31, REQ-SAFE-41, REQ-SAFE-42, REQ-CONTRACT-23, REQ-DEV-07, REQ-SAFE-43 |
+| `talOS/devices` | REQ-SAFE-01 to REQ-SAFE-09, REQ-SAFE-12, REQ-SAFE-13, REQ-SAFE-31, REQ-SAFE-41, REQ-SAFE-42, REQ-CONTRACT-23, REQ-DEV-07, REQ-SAFE-43, REQ-OPS-55 |
 | `talOS/bridge` | REQ-SAFE-11, REQ-SAFE-15, REQ-SAFE-16, REQ-SAFE-19, REQ-SAFE-40, REQ-CONTRACT-04, REQ-RT-13, REQ-RT-20, REQ-RT-22, REQ-OPS-20, REQ-OPS-21, REQ-OPS-37, REQ-OPS-52 |
 | `talOS/hardware` | REQ-SAFE-17 to REQ-SAFE-24, REQ-SAFE-26, REQ-CONTRACT-02, REQ-CONTRACT-05, REQ-CONTRACT-06, REQ-CONTRACT-30, REQ-DEV-10, REQ-DEV-24, REQ-CONTRACT-32, REQ-CONTRACT-35, REQ-CONTRACT-39, REQ-SAFE-43, REQ-RT-25 |
 | `talOS/protocol` | REQ-CONTRACT-01, REQ-CONTRACT-03, REQ-RT-22 |
@@ -296,7 +296,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/simulation` | REQ-DEV-05 (the simulator and its schedules), REQ-DEV-31 |
 | `talOS/introspection` | REQ-SAFE-41, REQ-SAFE-42, REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-CONTRACT-33, REQ-CONTRACT-36, REQ-CONTRACT-37, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32, REQ-OPS-52 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
-| `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-SAFE-42, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09, REQ-RT-23, REQ-SAFE-43 |
+| `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-SAFE-42, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09, REQ-RT-23, REQ-SAFE-43, REQ-OPS-55 |
 | `talOS/schema`, `talOS/build` | REQ-CONTRACT-07, REQ-CONTRACT-08, REQ-CONTRACT-19, REQ-DEV-09, REQ-DEV-30, REQ-OPS-48, REQ-OPS-53 |
 | `talOS/msgs`, `talOS/geometry` | REQ-CONTRACT-25, REQ-DEV-26 |
 | `talOS/telemetry` | REQ-CONTRACT-28, REQ-OPS-22, REQ-OPS-35, REQ-OPS-37, REQ-OPS-38, REQ-OPS-39 |
@@ -308,7 +308,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/aiming` | REQ-DEV-16 to REQ-DEV-19 |
 | `bench` | REQ-CONTRACT-19, REQ-CONTRACT-41; bench procedures for REQ-RT-14, REQ-RT-15; composition evidence for REQ-SAFE-31 (the soak, `bench/main_processor/simulation`); the bench nodes: the node test matrix proves the node drives through its `Target` (REQ-SAFE-07, case 1) and reports its state (REQ-CONTRACT-25); the neutral half of REQ-SAFE-02, REQ-SAFE-07 and REQ-SAFE-09 is the flush's (REQ-SAFE-41); REQ-SAFE-04, REQ-CONTRACT-14 (motor), REQ-CONTRACT-18, REQ-RT-06, REQ-DEV-26 (swerve module) |
 | `controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29, REQ-RT-24, REQ-CONTRACT-39, REQ-CONTRACT-40, REQ-SAFE-43, REQ-SAFE-44, REQ-RT-25 |
-| `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-36, REQ-OPS-41, REQ-OPS-42, REQ-OPS-49, REQ-OPS-51 |
+| `studio` | REQ-SAFE-35, REQ-SAFE-41, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-36, REQ-OPS-41, REQ-OPS-42, REQ-OPS-49, REQ-OPS-51, REQ-OPS-55 |
 | `studio/agent` | none in the catalogue: kept, with no further work until a requirement names it |
 | `tools`, `examples` | REQ-SAFE-46, REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-06, REQ-DEV-12, REQ-DEV-23, REQ-DEV-25, REQ-DEV-30, REQ-DEV-32 to REQ-DEV-35, REQ-OPS-47, REQ-OPS-50, REQ-OPS-53, REQ-OPS-54 |
 

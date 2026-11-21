@@ -196,7 +196,8 @@ function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): st
         !n.alive          ? tag(NODE_STATE.down, n.critical ? 'bad' : 'warn') :
         n.outputs_held    ? tag(NODE_STATE.held, 'warn') :
                             tag(NODE_STATE.up, 'good');
-    const held = summary.registry && n.outputs_held ? 'outputs held: no live target' : '';
+    const held = !(summary.supervised && n.quarantined) && summary.registry &&
+        n.alive && n.outputs_held ? 'outputs held: no live target' : '';
     const restarts = summary.supervised && n.restarts > 0 ? `restarts ${n.restarts}` : '';
     const drives = summary.registry && n.drives !== null ? `drives ${n.drives}` : '';
     // The name's tooltip repeats what a narrow row may cut off.
@@ -655,7 +656,7 @@ export function listRowsFit(layout: {columns: number; rows: number}, at: Cell,
 }
 
 // How many characters of a row's name show beside `word` and `notes` notes
-// (a subsystems row has at most one, restarts and drives: shrunk to nothing
+// (a subsystems row has at most one, held, restarts and drives: shrunk to nothing
 // first, still a gap) in a list
 // column `width` px wide, by the GLYPH_PX model: what the row leaves after
 // its gaps and the word's box, less one character for the ellipsis of a cut

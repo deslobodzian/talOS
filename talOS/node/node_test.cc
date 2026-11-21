@@ -1321,12 +1321,25 @@ bool ShmSegmentExists(const std::string& topic) {
   return true;
 }
 
-// In a Sim a graph reader sees every node added before it, schemas
-// included, except other graph readers.
+// In a Sim a graph reader sees every node added before it, schemas included,
+// plus Pass-1 static non-telemetry senders of earlier graph readers (never
+// itself).
 struct GraphReader {
   explicit GraphReader(Node& node)
       : graph{*detail::NodeAccess::declared_graph(node)} {}
   detail::DeclaredGraph graph;
+};
+
+struct GraphReaderWithStaticSender {
+  explicit GraphReaderWithStaticSender(Node& node)
+      : status{node.publish<Count>("status")},
+        telemetry{node.publish<Count>("telemetry")},
+        graph{*detail::NodeAccess::declared_graph(node)},
+        dynamic{node.publish<Count>("/talker/target/teleop")} {}
+  Publisher<Count> status;
+  Publisher<Count> telemetry;
+  detail::DeclaredGraph graph;
+  Publisher<Count> dynamic;
 };
 
 struct CountPublisher {
@@ -1345,11 +1358,33 @@ TEST(Node, SimHandsAGraphReaderTheNodesAddedBeforeIt) {
   EXPECT_EQ(state.name, "/talker/state");
   EXPECT_EQ(state.schema, "node_test.Count");
   EXPECT_EQ(state.bfbs, schema::Of<Count>().bfbs);
-  // The first reader is not in the second's graph.
+  // The first reader declared no static senders, so it is not in the second's
+  // graph.
   ASSERT_EQ(second.graph.size(), 1u);
   EXPECT_EQ(second.graph[0].name, "talker");
   EXPECT_TRUE(detail::NodeAccess::reads_graph(sim.node("listener")));
   EXPECT_FALSE(detail::NodeAccess::reads_graph(sim.node("talker")));
+}
+
+TEST(Node, SimExportsEarlierGraphReadersPass1StaticSendersExcludingSelf) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<CountPublisher>("talker");
+  const auto& first = sim.add<GraphReaderWithStaticSender>("listener");
+  const auto& second = sim.add<GraphReader>("mechanism");
+
+  // The first graph reader sees only talker, never itself.
+  ASSERT_EQ(first.graph.size(), 1u);
+  EXPECT_EQ(first.graph[0].name, "talker");
+
+  // The second graph reader sees talker and the first reader's Pass-1 static
+  // non-telemetry sender (/listener/status), not its telemetry-role sender
+  // (/listener/telemetry) and not its post-graph dynamic sender.
+  ASSERT_EQ(second.graph.size(), 2u);
+  EXPECT_EQ(second.graph[0].name, "talker");
+  EXPECT_EQ(second.graph[1].name, "listener");
+  ASSERT_EQ(second.graph[1].sources.size(), 1u);
+  EXPECT_EQ(second.graph[1].sources[0].kind, event::SourceKind::SENDER);
+  EXPECT_EQ(second.graph[1].sources[0].name, "/listener/status");
 }
 
 // A node's sends belong to the thread that runs its loop: the loop's dispatch

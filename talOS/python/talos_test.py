@@ -1215,6 +1215,21 @@ class TargetTest(unittest.TestCase):
         self.assertTrue(op.last_armed)
         self.assertEqual(op.last_blocker, talos.ArmingBlocker())
 
+        # ArmingBlocker validates int8 port (-128..127) and int16 index
+        # (-32768..32767) instead of silently wrapping in ctypes.
+        self.assertEqual(
+            talos.ArmingBlocker(talos.ArmingInputKind.AXIS, -128, -32768).port,
+            -128)
+        self.assertEqual(
+            talos.ArmingBlocker(talos.ArmingInputKind.AXIS, 127, 32767).index,
+            32767)
+        for bad_port in (-129, 128, 256, True):
+            with self.assertRaises(ValueError):
+                talos.ArmingBlocker(talos.ArmingInputKind.AXIS, bad_port, 0)
+        for bad_index in (-32769, 32768, 65536, False):
+            with self.assertRaises(ValueError):
+                talos.ArmingBlocker(talos.ArmingInputKind.AXIS, 0, bad_index)
+
 
 class StateMachineTest(unittest.TestCase):
     """Transitions are StateMachine's (node_test.cc); these prove each

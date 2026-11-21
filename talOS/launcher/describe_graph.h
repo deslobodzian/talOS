@@ -124,15 +124,19 @@ std::string DeclaredGraphPath(const LauncherOptions& options);
 // source: a second declaration of the topology is a thing to forget to update.
 //
 // Two passes. A framework node whose topics follow from the other nodes'
-// (telemetry observes every state topic, teleop writes each bound lane with
-// its consumer's schema) asks for the declared graph in its constructor and
-// says so in its description (reads_graph). Every node is described once
-// without a graph; then the descriptions of the nodes that do not read it
-// are written to DeclaredGraphPath, and each graph reader is described
-// again with `--graph` that file, which it is also started with. A graph
-// reader therefore sees every node but the graph readers. Each pass probes
-// its binaries in parallel (ForEachInParallel), so a pass takes about as long
-// as its slowest probe rather than the sum of them.
+// (telemetry observes every state and status topic, teleop writes each bound
+// lane with its consumer's schema) asks for the declared graph in its
+// constructor and says so in its description (reads_graph). Every node is
+// described once without a graph; then the descriptions of the nodes that do
+// not read it, plus the Pass-1 static non-`telemetry`-role `SENDER` endpoints
+// of graph-reading nodes (such as teleop's `/teleop/status`, omitting readers
+// with none), are written to DeclaredGraphPath, and each graph reader is
+// described again with `--graph` that file, which it is also started with.
+// Each graph reader strips its own entry when loading `--graph`, so it sees
+// every non-reader node and every other graph reader's Pass-1 static
+// non-`telemetry` senders, and never itself. Each pass probes its binaries in
+// parallel (ForEachInParallel), so a pass takes about as long as its slowest
+// probe rather than the sum of them.
 // Throws when that file cannot be written: a graph reader is never described,
 // or started, without the graph.
 //

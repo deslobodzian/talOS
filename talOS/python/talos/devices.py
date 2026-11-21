@@ -561,6 +561,18 @@ class ArmingBlocker:
     port: int = -1
     index: int = -1
 
+    def __post_init__(self):
+        if (isinstance(self.port, bool) or not isinstance(self.port, int) or
+                not -128 <= self.port <= 127):
+            raise ValueError(
+                f"ArmingBlocker.port must be an int8 (-128..127), "
+                f"got {self.port!r}")
+        if (isinstance(self.index, bool) or not isinstance(self.index, int) or
+                not -32768 <= self.index <= 32767):
+            raise ValueError(
+                f"ArmingBlocker.index must be an int16 (-32768..32767), "
+                f"got {self.index!r}")
+
 
 class OperatorArming(_OnNode):
     """Whether an operator-input producer may publish active targets
@@ -600,10 +612,12 @@ class OperatorArming(_OnNode):
         if blocker is None:
             return _abi.boolean(lib.talos_operator_arming_evaluate(
                 self._node, self._index, 1 if neutral else 0))
+        if not isinstance(blocker, ArmingBlocker):
+            blocker = ArmingBlocker(blocker.kind, blocker.port, blocker.index)
         _abi.ok(lib.talos_operator_arming_evaluate_blocker(
             self._node, self._index, 1 if neutral else 0,
-            int(ArmingInputKind(blocker.kind)), int(blocker.port),
-            int(blocker.index), ctypes.byref(self._armed_out)))
+            int(ArmingInputKind(blocker.kind)), blocker.port,
+            blocker.index, ctypes.byref(self._armed_out)))
         return bool(self._armed_out.value)
 
     @property

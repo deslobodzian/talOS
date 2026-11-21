@@ -371,18 +371,6 @@ ArmingBlocker TargetAccess::arming_blocker(Node& node, std::size_t arming) {
   return Armed(node, state) ? ArmingBlocker{} : state.blocker;
 }
 
-ArmingBlocker TargetAccess::arming_blocker_noexcept(
-    Node& node, std::size_t arming) noexcept {
-  try {
-    const auto& armings = node.extension<Targets>().armings;
-    if (arming >= armings.size()) return {};
-    const ArmingState& state = armings[arming];
-    return Armed(node, state) ? ArmingBlocker{} : state.blocker;
-  } catch (...) {
-    return {};
-  }
-}
-
 void TargetAccess::arming_disarm(Node& node, std::size_t arming) {
   NodeAccess::require_loop_thread(node, "OperatorArming::disarm");
   ArmingState& state = ArmingAt(node, arming);

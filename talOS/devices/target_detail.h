@@ -83,8 +83,6 @@ struct TargetAccess {
                               ArmingBlocker blocker);
   static bool arming_armed(Node& node, std::size_t arming);
   static ArmingBlocker arming_blocker(Node& node, std::size_t arming);
-  static ArmingBlocker arming_blocker_noexcept(Node& node,
-                                               std::size_t arming) noexcept;
   static void arming_disarm(Node& node, std::size_t arming);
 };
 

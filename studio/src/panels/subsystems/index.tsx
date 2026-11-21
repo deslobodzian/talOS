@@ -186,6 +186,11 @@ function formatDisarmedStatus(
   if (kindLabel === 'OTHER') {
     return 'Disarmed — release held input to arm';
   }
+  const alertChannel =
+      sub.statusChannels.find(c => channelLeaf(c) === 'alert_warning_disarmed');
+  if (alertChannel !== undefined && snapshot.channels[alertChannel] === 0) {
+    return null;
+  }
   return 'Disarmed — release inputs to arm';
 }
 
