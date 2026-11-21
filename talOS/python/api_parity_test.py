@@ -15,6 +15,7 @@ from python.runfiles import runfiles
 
 # C type (after normalization) -> the ctypes expression _abi.py must use.
 _SCALARS = {
+    "int8_t": "c_int8", "uint8_t": "c_uint8", "int16_t": "c_int16",
     "int32_t": "c_int32", "int64_t": "c_int64", "uint32_t": "c_uint32",
     "uint64_t": "c_uint64", "double": "c_double", "float": "c_float",
     "char*": "c_char_p", "void": "None", "void*": "c_void_p",

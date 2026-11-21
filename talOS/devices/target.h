@@ -198,10 +198,22 @@ class OperatorArming {
   bool evaluate(bool neutral) {
     return detail::TargetAccess::arming_evaluate(*node_, index_, neutral);
   }
+  // Same as evaluate(neutral), recording `blocker` while disarmed and clearing
+  // it to {ArmingInputKind::kNone, -1, -1} once armed or when `inputs_neutral`
+  // is true (REQ-OPS-55).
+  bool evaluate(bool inputs_neutral, ArmingBlocker blocker) {
+    return detail::TargetAccess::arming_evaluate(*node_, index_, inputs_neutral,
+                                                 blocker);
+  }
   // Whether it is armed now, without evaluating: what a lane opened with it
   // checks on every send().
   bool armed() const {
     return detail::TargetAccess::arming_armed(*node_, index_);
+  }
+  // The blocking input recorded while disarmed, or {kNone, -1, -1} when armed
+  // or when no non-neutral input was reported.
+  ArmingBlocker blocker() const noexcept {
+    return detail::TargetAccess::arming_blocker_noexcept(*node_, index_);
   }
   void disarm() { detail::TargetAccess::arming_disarm(*node_, index_); }
 

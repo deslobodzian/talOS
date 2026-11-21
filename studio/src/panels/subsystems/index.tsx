@@ -139,6 +139,56 @@ function PairRow(
   </li>;
 }
 
+const BLOCKING_KIND_FALLBACK = ['NONE', 'AXIS', 'BUTTON', 'POV', 'OTHER'] as const;
+
+// Human-readable arming status for any operator node publishing
+// `<owner>/status/armed` and `<owner>/status/blocking_kind` (REQ-OPS-55).
+function formatDisarmedStatus(
+    sub: Subsystem,
+    infoBy: Map<string, ChannelInfo>,
+    snapshot: {channels: Record<string, number>} | null): string | null {
+  const armedChannel = sub.statusChannels.find(c => channelLeaf(c) === 'armed');
+  const kindChannel = sub.statusChannels.find(c => channelLeaf(c) === 'blocking_kind');
+  if (!armedChannel || !kindChannel || !snapshot) return null;
+  const armed = snapshot.channels[armedChannel];
+  if (armed === undefined || armed !== 0) return null;
+
+  const kindVal = snapshot.channels[kindChannel];
+  const labels = infoBy.get(kindChannel)?.labels ?? [];
+  let kindLabel = 'NONE';
+  if (kindVal !== undefined && Number.isInteger(kindVal) && kindVal >= 0) {
+    if (kindVal < labels.length) {
+      kindLabel = labels[kindVal].toUpperCase();
+    } else if (kindVal < BLOCKING_KIND_FALLBACK.length) {
+      kindLabel = BLOCKING_KIND_FALLBACK[kindVal];
+    }
+  }
+
+  const joyChannel = sub.statusChannels.find(c => channelLeaf(c) === 'blocking_joystick_index');
+  const inputChannel = sub.statusChannels.find(c => channelLeaf(c) === 'blocking_input_index');
+  const joy = joyChannel !== undefined ? snapshot.channels[joyChannel] : undefined;
+  const input = inputChannel !== undefined ? snapshot.channels[inputChannel] : undefined;
+  const hasIds = joy !== undefined && input !== undefined &&
+      Number.isInteger(joy) && Number.isInteger(input) && joy >= 0 && input >= 0;
+
+  if (kindLabel === 'AXIS') {
+    return hasIds ? `Disarmed — joystick ${joy} axis ${input} held` :
+                    'Disarmed — joystick axis held';
+  }
+  if (kindLabel === 'BUTTON') {
+    return hasIds ? `Disarmed — joystick ${joy} button ${input} held` :
+                    'Disarmed — joystick button held';
+  }
+  if (kindLabel === 'POV') {
+    return hasIds ? `Disarmed — joystick ${joy} POV ${input} held` :
+                    'Disarmed — joystick POV held';
+  }
+  if (kindLabel === 'OTHER') {
+    return 'Disarmed — release held input to arm';
+  }
+  return 'Disarmed — release inputs to arm';
+}
+
 function SubsystemCard(
     {sub, infoBy, snapshot, node, graphStale, rates, series}: {
       sub: Subsystem;
@@ -168,6 +218,7 @@ function SubsystemCard(
   }, [channels, infoBy]);
 
   const selection = sub.selection;
+  const disarmedStatus = formatDisarmedStatus(sub, infoBy, snapshot);
   const liveness = node ? nodeLiveness(node, {stale: graphStale}) : null;
   const loop = node ? loopRate(node, rates) : undefined;
   const latency = node ? worstLatency(node) : undefined;
@@ -187,6 +238,10 @@ function SubsystemCard(
         {enabledValue === undefined ? '—' : enabledValue === 1 ? 'enabled' : 'disabled'}
       </span>
     </header>
+
+    {disarmedStatus && <div className="subsystem-meta">
+      <em className="text-warn">{disarmedStatus}</em>
+    </div>}
 
     <div className="subsystem-meta">
       <div className="subsystem-lanes">

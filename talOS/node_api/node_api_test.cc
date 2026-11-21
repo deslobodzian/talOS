@@ -1061,4 +1061,84 @@ TEST_F(NodeApi, TargetSelectsTheTeleopLaneAndLanesRelease) {
   talos_sim_hardware_destroy(hw);
 }
 
+// REQ-OPS-55: OperatorArming blocker C ABI round-trips kind/port/index, clears
+// on arm, preserves 1-arg evaluate, and refuses unknown kind or bad handle.
+TEST_F(NodeApi, OperatorArmingBlockerRoundTripsAndValidatesKind) {
+  int64_t arming = -1;
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    *static_cast<int64_t*>(user) = talos_operator_arming_open(node);
+    return *static_cast<int64_t*>(user) < 0 ? 1 : 0;
+  };
+  TalosNode* node = talos_sim_add(sim_, "roller", build, &arming);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  TalosDriverStationPacket packet{};
+  packet.flags = TALOS_DS_ATTACHED | TALOS_DS_ENABLED | TALOS_DS_TELEOP;
+  ASSERT_EQ(talos_sim_hardware_set_driver_station(hw, &packet), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+
+  uint8_t kind = 99;
+  int8_t port = 99;
+  int16_t index = 99;
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_NONE);
+  EXPECT_EQ(port, -1);
+  EXPECT_EQ(index, -1);
+
+  // Legacy 1-arg evaluate(0) records OTHER/-1/-1.
+  EXPECT_EQ(talos_operator_arming_evaluate(node, arming, 0), 0);
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_OTHER);
+  EXPECT_EQ(port, -1);
+  EXPECT_EQ(index, -1);
+
+  // Blocker overload records exact kind/port/index while disarmed.
+  int32_t may_publish = -1;
+  ASSERT_EQ(talos_operator_arming_evaluate_blocker(
+                node, arming, 0, TALOS_ARMING_INPUT_AXIS, 1, 2, &may_publish),
+            TALOS_OK);
+  EXPECT_EQ(may_publish, 0);
+  EXPECT_EQ(talos_operator_arming_armed(node, arming), 0);
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_AXIS);
+  EXPECT_EQ(port, 1);
+  EXPECT_EQ(index, 2);
+
+  // Neutral evaluation arms and clears blocker.
+  ASSERT_EQ(talos_operator_arming_evaluate_blocker(
+                node, arming, 1, TALOS_ARMING_INPUT_NONE, -1, -1, &may_publish),
+            TALOS_OK);
+  EXPECT_EQ(may_publish, 0);
+  EXPECT_EQ(talos_operator_arming_armed(node, arming), 1);
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_NONE);
+  EXPECT_EQ(port, -1);
+  EXPECT_EQ(index, -1);
+
+  // While armed, non-neutral returns 1 and keeps blocker cleared.
+  ASSERT_EQ(talos_operator_arming_evaluate_blocker(
+                node, arming, 0, TALOS_ARMING_INPUT_BUTTON, 0, 4, &may_publish),
+            TALOS_OK);
+  EXPECT_EQ(may_publish, 1);
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_NONE);
+  EXPECT_EQ(port, -1);
+  EXPECT_EQ(index, -1);
+
+  // Invalid kind and invalid handle are refused.
+  EXPECT_EQ(talos_operator_arming_evaluate_blocker(node, arming, 0, 99, 0, 0,
+                                                   &may_publish),
+            TALOS_ERR);
+  EXPECT_EQ(talos_operator_arming_blocker(node, -1, &kind, &port, &index),
+            TALOS_ERR);
+  talos_sim_hardware_destroy(hw);
+}
+
 }  // namespace

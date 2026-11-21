@@ -11,9 +11,10 @@
 # row.
 #
 # The feed's worst case: 32 named channels (the match widget's 12 included)
-# plus the nine /hw/status alerts the alerts widget carries, 41 channels at
-# 20 Hz, is 24,352 B/s of the 25,000 budget, which covers 41 channels (and up
-# to 43 before needing a larger budget).
+# plus the ten alerts the alerts widget carries (nine /hw/status plus
+# /teleop/status/alert_warning_disarmed), 42 channels at 20 Hz, is
+# 24,592 B/s of the 25,000 budget, which covers 42 channels (and up to 43
+# before needing a larger budget).
 
 [dashboard]
 title = "Drive"

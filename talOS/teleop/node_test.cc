@@ -24,6 +24,8 @@
 #include "talOS/node/testing.h"
 #include "talOS/schema/field_path.h"
 #include "talOS/teleop/node.h"
+#include "teleop/status_generated.h"
+#include "teleop/topics.h"
 
 namespace talos::teleop {
 namespace {
@@ -1067,6 +1069,156 @@ TEST(TeleopNode, BadParameterFailsConstruction) {
           << error.what();
     }
   }
+}
+
+// REQ-OPS-55: /teleop/status reports armed state, alert_warning_disarmed
+// (only while enabled in teleop and disarmed; never while disabled or in
+// autonomous), and the exact blocking axis/button/POV until inputs return to
+// neutral.
+TEST(TeleopNode, PublishesStatusAndDisarmedAlertForHeldAxisButtonAndPov) {
+  constexpr const char* kMultiInputToml = R"(
+[robot]
+period_us = 20000
+command_timeout_us = 100000
+
+[subsystems.roller]
+period_us = 20000
+
+[subsystems.roller.teleop]
+defaults = { velocity_rps = 0.0, feedforward_v = 0.0 }
+
+[[subsystems.roller.teleop.bindings]]
+port = 0
+axis = 1
+field = "velocity_rps"
+scale = 10.0
+deadband_frac = 0.1
+
+[[subsystems.roller.teleop.bindings]]
+port = 1
+button = 3
+while_held = { velocity_rps = 20.0 }
+
+[[subsystems.roller.teleop.bindings]]
+port = 0
+pov = 90
+pov_index = 1
+while_held = { velocity_rps = 30.0 }
+
+[subsystems.teleop]
+period_us = 20000
+)";
+  Sim sim = MakeSim(kMultiInputToml);
+  sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+
+  const auto latest_status = [&sim] {
+    return sim.latest<::teleop::TeleopStatus>(::teleop::topics::kStatus);
+  };
+  const auto push_sticks = [&](std::uint32_t flags,
+                               const ds::JoystickData& stick0,
+                               const ds::JoystickData& stick1) {
+    ds::DriverStationData data{};
+    data.fms.flags = flags;
+    data.joysticks[0] = stick0;
+    data.joysticks[1] = stick1;
+    Push(hw, sim, data);
+  };
+  const auto neutral_stick = [] {
+    auto s = MakeStick();
+    s.pov_count = 2;
+    s.povs[0] = -1;
+    s.povs[1] = -1;
+    return s;
+  };
+
+  // Disabled with an axis held: disarmed, but alert_warning_disarmed is FALSE.
+  constexpr std::uint32_t kTeleopDisabled = ds::kTeleop | ds::kDsAttached;
+  auto held_axis = neutral_stick();
+  held_axis.axes[1] = 0.8f;
+  push_sticks(kTeleopDisabled, held_axis, neutral_stick());
+  auto st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->armed());
+  EXPECT_FALSE(st->alert_warning_disarmed());
+
+  // Autonomous enabled: teleop is inactive, alert_warning_disarmed is FALSE.
+  constexpr std::uint32_t kAutoEnabled =
+      ds::kEnabled | ds::kAutonomous | ds::kDsAttached;
+  push_sticks(kAutoEnabled, neutral_stick(), neutral_stick());
+  st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->armed());
+  EXPECT_FALSE(st->alert_warning_disarmed());
+
+  // Enable teleop with axis 1 on port 0 held -> disarmed alert + exact axis.
+  push_sticks(kTeleopEnabled, held_axis, neutral_stick());
+  st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->armed());
+  EXPECT_TRUE(st->alert_warning_disarmed());
+  EXPECT_EQ(st->blocking_kind(), ::teleop::BlockingInputKind::AXIS);
+  EXPECT_EQ(st->blocking_joystick_index(), 0);
+  EXPECT_EQ(st->blocking_input_index(), 1);
+
+  // Release -> armed, alert clears, blocker resets to NONE/-1/-1.
+  push_sticks(kTeleopEnabled, neutral_stick(), neutral_stick());
+  st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_TRUE(st->armed());
+  EXPECT_FALSE(st->alert_warning_disarmed());
+  EXPECT_EQ(st->blocking_kind(), ::teleop::BlockingInputKind::NONE);
+  EXPECT_EQ(st->blocking_joystick_index(), -1);
+  EXPECT_EQ(st->blocking_input_index(), -1);
+
+  // Disable then re-enable with button 3 on port 1 held -> BUTTON / 1 / 3.
+  auto held_btn = neutral_stick();
+  held_btn.buttons = 1u << 2;  // 1-based button 3
+  push_sticks(kTeleopDisabled, neutral_stick(), held_btn);
+  EXPECT_FALSE(latest_status()->alert_warning_disarmed());
+  push_sticks(kTeleopEnabled, neutral_stick(), held_btn);
+  st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->armed());
+  EXPECT_TRUE(st->alert_warning_disarmed());
+  EXPECT_EQ(st->blocking_kind(), ::teleop::BlockingInputKind::BUTTON);
+  EXPECT_EQ(st->blocking_joystick_index(), 1);
+  EXPECT_EQ(st->blocking_input_index(), 3);
+
+  // Release -> armed again.
+  push_sticks(kTeleopEnabled, neutral_stick(), neutral_stick());
+  st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_TRUE(st->armed());
+  EXPECT_FALSE(st->alert_warning_disarmed());
+  EXPECT_EQ(st->blocking_kind(), ::teleop::BlockingInputKind::NONE);
+  EXPECT_EQ(st->blocking_joystick_index(), -1);
+  EXPECT_EQ(st->blocking_input_index(), -1);
+
+  // Disable then re-enable with POV 1 on port 0 deflected in another direction.
+  auto held_pov = neutral_stick();
+  held_pov.povs[1] = 180;
+  push_sticks(kTeleopDisabled, held_pov, neutral_stick());
+  push_sticks(kTeleopEnabled, held_pov, neutral_stick());
+  st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->armed());
+  EXPECT_TRUE(st->alert_warning_disarmed());
+  EXPECT_EQ(st->blocking_kind(), ::teleop::BlockingInputKind::POV);
+  EXPECT_EQ(st->blocking_joystick_index(), 0);
+  EXPECT_EQ(st->blocking_input_index(), 1);
+
+  // Release POV -> armed, alert clears, blocker resets.
+  push_sticks(kTeleopEnabled, neutral_stick(), neutral_stick());
+  st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_TRUE(st->armed());
+  EXPECT_FALSE(st->alert_warning_disarmed());
+  EXPECT_EQ(st->blocking_kind(), ::teleop::BlockingInputKind::NONE);
+  EXPECT_EQ(st->blocking_joystick_index(), -1);
+  EXPECT_EQ(st->blocking_input_index(), -1);
 }
 
 }  // namespace

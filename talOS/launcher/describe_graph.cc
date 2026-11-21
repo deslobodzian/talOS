@@ -559,8 +559,25 @@ std::vector<naming::Diagnostic> DescribeGraph(
   if (any_reader && !StopWithin(stop_fd, std::chrono::milliseconds{0})) {
     introspect::DeclaredGraph graph;
     for (const auto& described : out) {
-      if (described.answered && !described.declared.reads_graph) {
+      if (!described.answered) continue;
+      if (!described.declared.reads_graph) {
         graph.push_back(described.declared);
+        continue;
+      }
+      // Include Pass-1 static senders declared by graph-reading nodes (such as
+      // teleop's /teleop/status) so other graph readers (such as telemetry) can
+      // observe them without cycles; omit telemetry-role outputs and readers
+      // that declare no static senders.
+      introspect::Description static_pub = described.declared;
+      static_pub.sources.clear();
+      for (const auto& source : described.declared.sources) {
+        if (source.kind == event::SourceKind::SENDER &&
+            naming::Role(source.name) != "telemetry") {
+          static_pub.sources.push_back(source);
+        }
+      }
+      if (!static_pub.sources.empty()) {
+        graph.push_back(std::move(static_pub));
       }
     }
     const std::string graph_path = DeclaredGraphPath(options);

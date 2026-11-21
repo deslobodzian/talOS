@@ -1001,6 +1001,63 @@ TEST_F(OperatorArmingTest, InputHeldThroughADisarmWaitsForNeutral) {
   ExpectReleasedUntilNeutralThenDriving();
 }
 
+// REQ-OPS-55: OperatorArming records the blocking input while disarmed and
+// clears it to {kNone, -1, -1} once armed, neutral, or disarmed.
+TEST(OperatorArmingBlocker, RecordsBlockingInputWhileDisarmedAndClearsOnArm) {
+  struct BlockerOp {
+    explicit BlockerOp(Node& node) : arming{node} {}
+    OperatorArming arming;
+  };
+  auto sim = Sim::FromToml(std::string{kRobotToml} +
+                           "[subsystems.operator]\nperiod_us = 20000\n");
+  auto& op = sim.add<BlockerOp>("operator");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+
+  const ArmingBlocker kNone{};
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_EQ(op.arming.blocker(), kNone);
+
+  // One-arg evaluate(false) records kOther/-1/-1 while disarmed.
+  EXPECT_FALSE(op.arming.evaluate(false));
+  EXPECT_EQ(op.arming.blocker(),
+            (ArmingBlocker{ArmingInputKind::kOther, -1, -1}));
+
+  // Two-arg overload records the exact kind, port, and index while disarmed.
+  const ArmingBlocker axis{ArmingInputKind::kAxis, 0, 1};
+  EXPECT_FALSE(op.arming.evaluate(false, axis));
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_EQ(op.arming.blocker(), axis);
+
+  // Neutral evaluation arms immediately and clears the blocker.
+  EXPECT_FALSE(op.arming.evaluate(true, {}));
+  EXPECT_TRUE(op.arming.armed());
+  EXPECT_EQ(op.arming.blocker(), kNone);
+
+  // Once armed, non-neutral inputs may publish and never set a blocker.
+  const ArmingBlocker btn{ArmingInputKind::kButton, 1, 3};
+  EXPECT_TRUE(op.arming.evaluate(false, btn));
+  EXPECT_TRUE(op.arming.armed());
+  EXPECT_EQ(op.arming.blocker(), kNone);
+
+  // Disarm clears the blocker until the next non-neutral evaluation.
+  op.arming.disarm();
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_EQ(op.arming.blocker(), kNone);
+
+  EXPECT_FALSE(op.arming.evaluate(false, btn));
+  EXPECT_EQ(op.arming.blocker(), btn);
+
+  // Neutral while disabled still clears blocker (even though it cannot arm).
+  hw.set_driver_station(DsPacket(0));
+  sim.step(20ms);
+  EXPECT_FALSE(op.arming.evaluate(true, {}));
+  EXPECT_FALSE(op.arming.armed());
+  EXPECT_EQ(op.arming.blocker(), kNone);
+}
+
 // The live-target gate at the devices flush (RULES.md 1): a tick drives only
 // when one of the node's Targets returned a target from a get() made during
 // that update(). Every node here owns a motor, a digital output and a PWM

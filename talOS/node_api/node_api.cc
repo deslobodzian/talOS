@@ -101,6 +101,24 @@ static_assert(hardware::kLastMode == hardware::Mode::kTorqueCurrent,
 static_assert(TALOS_WAKE_ON_PUBLISH == static_cast<int>(Wake::kOnPublish) &&
               TALOS_WAKE_AT_DRAIN == static_cast<int>(Wake::kAtDrain));
 
+talos::ArmingInputKind ArmingInputKindOf(std::uint8_t kind) {
+  if (kind > TALOS_ARMING_INPUT_OTHER) {
+    throw std::invalid_argument("unknown arming input kind " +
+                                std::to_string(kind));
+  }
+  return static_cast<talos::ArmingInputKind>(kind);
+}
+constexpr bool SameArmingKind(std::uint8_t abi, talos::ArmingInputKind kind) {
+  return abi == static_cast<std::uint8_t>(kind);
+}
+static_assert(
+    SameArmingKind(TALOS_ARMING_INPUT_NONE, talos::ArmingInputKind::kNone) &&
+    SameArmingKind(TALOS_ARMING_INPUT_AXIS, talos::ArmingInputKind::kAxis) &&
+    SameArmingKind(TALOS_ARMING_INPUT_BUTTON,
+                   talos::ArmingInputKind::kButton) &&
+    SameArmingKind(TALOS_ARMING_INPUT_POV, talos::ArmingInputKind::kPov) &&
+    SameArmingKind(TALOS_ARMING_INPUT_OTHER, talos::ArmingInputKind::kOther));
+
 TalosSample* Out(TalosSample* out) {
   if (out == nullptr) throw std::invalid_argument("null TalosSample");
   *out = TalosSample{};
@@ -966,9 +984,36 @@ int32_t talos_operator_arming_evaluate(TalosNode* node, int64_t arming,
   });
 }
 
+int32_t talos_operator_arming_evaluate_blocker(TalosNode* node, int64_t handle,
+                                               int32_t inputs_neutral,
+                                               uint8_t kind, int8_t port,
+                                               int16_t index,
+                                               int32_t* out_armed) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    const talos::ArmingBlocker blocker{ArmingInputKindOf(kind), port, index};
+    const bool armed = TargetAccess::arming_evaluate(
+        AsNode(node), Index(handle), inputs_neutral != 0, blocker);
+    if (out_armed != nullptr) *out_armed = armed ? 1 : 0;
+    return TALOS_OK;
+  });
+}
+
 int32_t talos_operator_arming_armed(TalosNode* node, int64_t arming) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     return TargetAccess::arming_armed(AsNode(node), Index(arming)) ? 1 : 0;
+  });
+}
+
+int32_t talos_operator_arming_blocker(TalosNode* node, int64_t handle,
+                                      uint8_t* out_kind, int8_t* out_port,
+                                      int16_t* out_index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    const talos::ArmingBlocker blocker =
+        TargetAccess::arming_blocker(AsNode(node), Index(handle));
+    if (out_kind != nullptr) *out_kind = static_cast<uint8_t>(blocker.kind);
+    if (out_port != nullptr) *out_port = blocker.port;
+    if (out_index != nullptr) *out_index = blocker.index;
+    return TALOS_OK;
   });
 }
 

@@ -22,6 +22,7 @@ units and reads 0 (connected False) until the first state.
 """
 
 import ctypes
+import dataclasses
 import enum
 import math
 from datetime import timedelta
@@ -544,6 +545,23 @@ class Target(_OnNode):
         return name.decode()
 
 
+class ArmingInputKind(enum.IntEnum):
+    """Which kind of operator input blocks OperatorArming (REQ-OPS-55)."""
+    NONE = _abi.ARMING_INPUT_NONE
+    AXIS = _abi.ARMING_INPUT_AXIS
+    BUTTON = _abi.ARMING_INPUT_BUTTON
+    POV = _abi.ARMING_INPUT_POV
+    OTHER = _abi.ARMING_INPUT_OTHER
+
+
+@dataclasses.dataclass(frozen=True)
+class ArmingBlocker:
+    """Fixed-size description of the input blocking OperatorArming."""
+    kind: ArmingInputKind = ArmingInputKind.NONE
+    port: int = -1
+    index: int = -1
+
+
 class OperatorArming(_OnNode):
     """Whether an operator-input producer may publish active targets
     (talos::OperatorArming): armed by a reading that found every input it
@@ -554,7 +572,9 @@ class OperatorArming(_OnNode):
                                       "operator", arming=self.arming)
         ...
         held = self.ds.joystick(1).button(3)
-        if self.arming.evaluate(neutral=not held) and held:
+        blocker = (talos.ArmingBlocker(talos.ArmingInputKind.BUTTON, 1, 3)
+                   if held else talos.ArmingBlocker())
+        if self.arming.evaluate(neutral=not held, blocker=blocker) and held:
             self.climb.send(...)
         else:
             self.climb.release()
@@ -571,10 +591,20 @@ class OperatorArming(_OnNode):
     def __init__(self, node):
         super().__init__(node)
         self._index = _abi.index(lib.talos_operator_arming_open(self._node))
+        self._armed_out = ctypes.c_int32(0)
+        self._kind_out = ctypes.c_uint8(0)
+        self._port_out = ctypes.c_int8(-1)
+        self._index_out = ctypes.c_int16(-1)
 
-    def evaluate(self, neutral) -> bool:
-        return _abi.boolean(lib.talos_operator_arming_evaluate(
-            self._node, self._index, 1 if neutral else 0))
+    def evaluate(self, neutral, blocker=None) -> bool:
+        if blocker is None:
+            return _abi.boolean(lib.talos_operator_arming_evaluate(
+                self._node, self._index, 1 if neutral else 0))
+        _abi.ok(lib.talos_operator_arming_evaluate_blocker(
+            self._node, self._index, 1 if neutral else 0,
+            int(ArmingInputKind(blocker.kind)), int(blocker.port),
+            int(blocker.index), ctypes.byref(self._armed_out)))
+        return bool(self._armed_out.value)
 
     @property
     def armed(self) -> bool:
@@ -582,6 +612,18 @@ class OperatorArming(_OnNode):
         checks."""
         return _abi.boolean(lib.talos_operator_arming_armed(
             self._node, self._index))
+
+    @property
+    def blocker(self) -> ArmingBlocker:
+        """The blocking input recorded while disarmed, or NONE/-1/-1 when
+        armed or neutral."""
+        _abi.ok(lib.talos_operator_arming_blocker(
+            self._node, self._index, ctypes.byref(self._kind_out),
+            ctypes.byref(self._port_out), ctypes.byref(self._index_out)))
+        return ArmingBlocker(
+            ArmingInputKind(self._kind_out.value),
+            self._port_out.value,
+            self._index_out.value)
 
     def disarm(self):
         _abi.ok(lib.talos_operator_arming_disarm(self._node, self._index))

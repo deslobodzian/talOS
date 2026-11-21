@@ -6,6 +6,8 @@ import talos
 from control.VelocityTarget import VelocityTarget
 from talos.teleop import Teleop
 from talos.testing import Sim, SimHardware, Stick
+from teleop.BlockingInputKind import BlockingInputKind
+from teleop.TeleopStatus import TeleopStatus
 
 
 ROBOT_TOML = """
@@ -139,6 +141,45 @@ class TeleopTest(unittest.TestCase):
         hw.stop_driver_station()
         sim.step(0.3)
         assert_released()
+
+    # REQ-OPS-55
+    def test_teleop_status_reports_disarmed_alert_and_blocker(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.add(Roller, "roller")
+        sim.add(Teleop, "teleop")
+        hw = SimHardware(sim)
+        hw.enable()
+
+        # Disabled with button 1 held: disarmed, but alert stays false.
+        hw.set_driver_station(
+            enabled=False, teleop=True, joysticks=[Stick(buttons=(1,))])
+        sim.step(0.06)
+        status = sim.latest(TeleopStatus, "/teleop/status")
+        self.assertIsNotNone(status)
+        self.assertFalse(status.armed)
+        self.assertFalse(status.alert_warning_disarmed)
+
+        # Enabled in teleop with button 1 held: alert true, exact blocker.
+        hw.set_driver_station(
+            enabled=True, teleop=True, joysticks=[Stick(buttons=(1,))])
+        sim.step(0.06)
+        status = sim.latest(TeleopStatus, "/teleop/status")
+        self.assertFalse(status.armed)
+        self.assertTrue(status.alert_warning_disarmed)
+        self.assertEqual(status.blocking_kind, BlockingInputKind.BUTTON)
+        self.assertEqual(status.blocking_joystick_index, 0)
+        self.assertEqual(status.blocking_input_index, 1)
+
+        # Release: armed, alert clears, blocker resets to NONE/-1/-1.
+        hw.set_driver_station(
+            enabled=True, teleop=True, joysticks=[Stick(buttons=())])
+        sim.step(0.06)
+        status = sim.latest(TeleopStatus, "/teleop/status")
+        self.assertTrue(status.armed)
+        self.assertFalse(status.alert_warning_disarmed)
+        self.assertEqual(status.blocking_kind, BlockingInputKind.NONE)
+        self.assertEqual(status.blocking_joystick_index, -1)
+        self.assertEqual(status.blocking_input_index, -1)
 
 
 if __name__ == "__main__":
