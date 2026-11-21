@@ -78,6 +78,11 @@ bool CappedLogStopped(const std::string& log_path);
 // The signal a stopping session sends every running member's group, once.
 inline constexpr int kStopSignal = SIGINT;
 
+// How long a stopping session gives `hardware_node` after its kStopSignal to
+// exit before SIGKILLing it and proceeding to stop the remaining members
+// (two-phase shutdown, REQ-OPS-20).
+inline constexpr std::chrono::milliseconds kBridgeStopTimeout{500};
+
 // How long a stopping session gives a member after its kStopSignal before it
 // kills the member's group (SIGKILL; run reason stop_timeout).
 inline constexpr std::chrono::seconds kStopTimeout{2};

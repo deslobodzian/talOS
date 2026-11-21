@@ -3798,7 +3798,7 @@ TEST(Supervision, FailingStudioBridgeRestartsBoundedTimesThenIsLeft) {
 // the restart: no bridge is spawned once the stop has begun, and the session
 // ends as soon as its members have, waiting neither for the backoff nor for
 // the stop timeout. The supervision clock is held at the bridge's exit until
-// the stop is under way (hardware_node ignores the stop's SIGINT and holds
+// the stop is under way (alpha ignores the stop's SIGINT and holds
 // the session open until the test releases it), then moved past the
 // restart's due time but short of the stop timeout, so a pass that still
 // started the restart would start a bridge during the stop.
@@ -3812,12 +3812,12 @@ TEST(Supervision, StopDuringStudioBridgeBackoffStartsNoBridge) {
   testing::SteppedClock clock;
   const SupervisionTime start = clock.Freeze();
   auto options = BridgeOptions("bridge_stop", runs, clock);
-  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStub(
-      "bridge_stop_hardware",
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "bridge_stop_alpha",
       "trap '' INT\n" +
           RecordLogArgThen(runs, "while [ ! -e '" + release +
                                      "' ]; do sleep 0.01; done\nexit 0\n"),
-      "hardware_node");
+      "alpha");
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStub("bridge_stop_bridge", BridgeRun(bridge_runs, "exit 1\n"),
                 "studio_bridge");
@@ -3845,7 +3845,7 @@ TEST(Supervision, StopDuringStudioBridgeBackoffStartsNoBridge) {
     if (pending) {
       stopping = WaitFor(stop, [&] {
         const std::string manifest = ReadFile(live);
-        return stopped(manifest, "alpha") && stopped(manifest, "beta");
+        return stopped(manifest, "hardware_node") && stopped(manifest, "beta");
       });
     }
     if (stopping) {
@@ -3864,7 +3864,7 @@ TEST(Supervision, StopDuringStudioBridgeBackoffStartsNoBridge) {
   returned = true;
   driver.join();
   ASSERT_TRUE(pending) << "the bridge's restart was never scheduled";
-  ASSERT_TRUE(stopping) << "the stop did not end alpha and beta";
+  ASSERT_TRUE(stopping) << "the stop did not end hardware_node and beta";
   EXPECT_FALSE(rescued);
   EXPECT_EQ(ReadLines(bridge_runs).size(), 1u)
       << "a bridge was started after the stop began";
@@ -3873,10 +3873,10 @@ TEST(Supervision, StopDuringStudioBridgeBackoffStartsNoBridge) {
   const std::string bridge = ManifestEntry(manifest, "studio_bridge");
   EXPECT_EQ(EntryInteger(bridge, "retry_at_monotonic_ns"), 0) << bridge;
   EXPECT_EQ(EntryInteger(bridge, "restart_count"), 0) << bridge;
-  const auto hardware = ManifestRuns(manifest, "hardware_node");
-  ASSERT_EQ(hardware.size(), 1u) << manifest;
-  EXPECT_NE(hardware.back().find("\"reason\": \"stop\""), std::string::npos)
-      << hardware.back();
+  const auto alpha = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha.size(), 1u) << manifest;
+  EXPECT_NE(alpha.back().find("\"reason\": \"stop\""), std::string::npos)
+      << alpha.back();
   std::filesystem::remove_all(options.output_dir);
   for (const auto* path : {&runs, &bridge_runs, &release})
     ::remove(path->c_str());
@@ -4940,6 +4940,178 @@ TEST(Supervision, BridgeProtocolMismatchWarnsOncePerRunAndRewarnsOnRestart) {
   std::filesystem::remove_all(options.output_dir);
   ::remove(hw_runs.c_str());
   ::remove(crash_run1.c_str());
+}
+
+// RT-12(b) / REQ-OPS-20: two-phase shutdown stops `hardware_node` first and
+// waits for it to exit (up to kBridgeStopTimeout before SIGKILLing a hung
+// bridge) before signaling the remaining actuator-owning nodes.
+// REQ-OPS-20
+TEST(Supervision, ShutdownStopsHardwareNodeBeforeActuatorOwners) {
+  // Case 1: hardware_node exits cleanly on kStopSignal; actuator owners
+  // (alpha, beta) receive kStopSignal only after hardware_node has exited.
+  {
+    const auto ready = TempPath("twophase_ready");
+    const auto events = TempPath("twophase_events");
+    const auto release_hw = TempPath("twophase_release_hw");
+    for (const auto* p : {&ready, &events, &release_hw}) ::remove(p->c_str());
+
+    testing::SteppedClock clock;
+    clock.Freeze();
+    auto options = BaseOptions("twophase_clean");
+    options.duration_s = 3600;
+    options.max_restarts = 0;
+    options.heartbeat_periods = 1'000'000;
+    options.heartbeat_startup_grace_ms = 3'600'000;
+    options.construction_timeout = 1h;
+    options.supervision_clock = clock.clock();
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStub("twophase_clean_hw",
+                  "got_int=0\n"
+                  "trap 'got_int=1' INT\n"
+                  "echo hw >> '" +
+                      ready +
+                      "'\n"
+                      "while [ \"$got_int\" -eq 0 ]; do sleep 0.01; done\n"
+                      "echo hw_int >> '" +
+                      events +
+                      "'\n"
+                      "while [ ! -e '" +
+                      release_hw +
+                      "' ]; do sleep 0.01; done\n"
+                      "echo hw_exit >> '" +
+                      events +
+                      "'\n"
+                      "exit 0\n",
+                  "hardware_node");
+    const auto owner_body = [&](std::string_view name) {
+      return "got_int=0\n"
+             "trap 'got_int=1' INT\n"
+             "echo " +
+             std::string{name} + " >> '" + ready +
+             "'\n"
+             "while [ \"$got_int\" -eq 0 ]; do sleep 0.01; done\n"
+             "echo " +
+             std::string{name} + "_int >> '" + events +
+             "'\n"
+             "exit 0\n";
+    };
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStub("twophase_clean_alpha", owner_body("alpha"), "alpha");
+    options.binary_overrides["//example/beta:node"] =
+        WriteStub("twophase_clean_beta", owner_body("beta"), "beta");
+
+    testing::SupervisionPasses passes;
+    std::vector<std::string> events_while_hw_alive;
+    std::jthread driver{[&](const std::stop_token& stop) {
+      const testing::SteppedClock::ReleaseOnExit release_clock{clock};
+      if (!WaitFor(stop, [&] { return ReadLines(ready).size() == 3; })) {
+        ::kill(::getpid(), SIGTERM);
+        return;
+      }
+      ::kill(::getpid(), SIGTERM);
+      if (WaitFor(stop, [&] {
+            const auto lines = ReadLines(events);
+            return !lines.empty() && lines[0] == "hw_int";
+          })) {
+        const uint64_t after = passes.Started() + 2;
+        WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          return passes.Started() >= after;
+        });
+        events_while_hw_alive = ReadLines(events);
+      }
+      std::ofstream{release_hw}.close();
+    }};
+
+    EXPECT_EQ(RunSession(options), 0);
+    driver.join();
+    EXPECT_EQ(events_while_hw_alive, (std::vector<std::string>{"hw_int"}))
+        << "actuator owners were signaled before hardware_node exited";
+    const auto all_events = ReadLines(events);
+    ASSERT_EQ(all_events.size(), 4u);
+    EXPECT_EQ(all_events[0], "hw_int");
+    EXPECT_EQ(all_events[1], "hw_exit");
+    std::vector<std::string> owners(all_events.begin() + 2, all_events.end());
+    std::sort(owners.begin(), owners.end());
+    EXPECT_EQ(owners, (std::vector<std::string>{"alpha_int", "beta_int"}));
+
+    std::filesystem::remove_all(options.output_dir);
+    for (const auto* p : {&ready, &events, &release_hw}) ::remove(p->c_str());
+  }
+
+  // Case 2: a hung hardware_node ignoring kStopSignal is SIGKILLed at
+  // kBridgeStopTimeout (500 ms), after which alpha and beta are signaled and
+  // exit cleanly with reason "stop".
+  {
+    const auto ready = TempPath("twophase_hung_ready");
+    ::remove(ready.c_str());
+    testing::SteppedClock clock;
+    const SupervisionTime start = clock.Freeze();
+    auto options = BaseOptions("twophase_hung");
+    options.duration_s = 3600;
+    options.max_restarts = 0;
+    options.heartbeat_periods = 1'000'000;
+    options.heartbeat_startup_grace_ms = 3'600'000;
+    options.construction_timeout = 1h;
+    options.supervision_clock = clock.clock();
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStub("twophase_hung_hw",
+                  "trap '' INT\necho hw >> '" + ready + "'\nexec sleep 60\n",
+                  "hardware_node");
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStub("twophase_hung_alpha",
+                  "echo alpha >> '" + ready + "'\nexec sleep 60\n", "alpha");
+    options.binary_overrides["//example/beta:node"] =
+        WriteStub("twophase_hung_beta",
+                  "echo beta >> '" + ready + "'\nexec sleep 60\n", "beta");
+
+    const std::string live = options.output_dir + "/" +
+                             std::to_string(options.session_id) +
+                             "/manifest.json";
+    testing::SupervisionPasses passes;
+    bool held_before_timeout = false;
+    std::jthread driver{[&](const std::stop_token& stop) {
+      const testing::SteppedClock::ReleaseOnExit release_clock{clock};
+      if (!WaitFor(stop, [&] { return ReadLines(ready).size() == 3; })) {
+        ::kill(::getpid(), SIGTERM);
+        return;
+      }
+      ::kill(::getpid(), SIGTERM);
+      clock.HoldAt(start + kBridgeStopTimeout - 50ms);
+      const uint64_t after = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after;
+      });
+      const std::string mid = ReadFile(live);
+      held_before_timeout =
+          ManifestRuns(mid, "hardware_node").back().find("\"running\"") !=
+              std::string::npos &&
+          ManifestRuns(mid, "alpha").back().find("\"running\"") !=
+              std::string::npos;
+      clock.HoldAt(start + kBridgeStopTimeout);
+      SupervisionWakeup::Wake();
+    }};
+
+    EXPECT_EQ(RunSession(options), -1);
+    driver.join();
+    EXPECT_TRUE(held_before_timeout)
+        << "hardware_node or alpha ended before kBridgeStopTimeout";
+    const std::string manifest =
+        ReadFile(options.output_dir + "/manifest.json");
+    const auto hw = ManifestRuns(manifest, "hardware_node");
+    ASSERT_EQ(hw.size(), 1u);
+    EXPECT_NE(hw.back().find("\"reason\": \"stop_timeout\""), std::string::npos)
+        << hw.back();
+    for (const char* name : {"alpha", "beta"}) {
+      const auto runs = ManifestRuns(manifest, name);
+      ASSERT_EQ(runs.size(), 1u);
+      EXPECT_NE(runs.back().find("\"reason\": \"stop\""), std::string::npos)
+          << name << ": " << runs.back();
+    }
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(ready.c_str());
+  }
 }
 
 }  // namespace
