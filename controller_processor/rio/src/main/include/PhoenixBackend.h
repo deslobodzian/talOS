@@ -28,6 +28,12 @@
 #include "RioLog.h"
 #include "hardware/gateway.h"
 
+#ifndef __FRC_ROBORIO__
+#include <frc/system/LinearSystem.h>
+#include <frc/system/plant/DCMotor.h>
+#include <frc/system/plant/LinearSystemId.h>
+#endif
+
 class PhoenixBackend final : public talos::hardware::Backend {
  public:
   // Reports go to `log`, which must outlive the backend; without one the
@@ -86,7 +92,10 @@ class PhoenixBackend final : public talos::hardware::Backend {
   friend class PhoenixBackendFollowerFeedback;
   friend class PhoenixBackendRecovery;
   friend class PhoenixBackendWatchdog;
+#ifndef __FRC_ROBORIO__
+  void ConfigureSimulation(const talos::hardware::Config& c);
   void UpdateSimulation(double dt);
+#endif
   // Builds refresh_signals_ and refresh_groups_ from signals_ (Configure).
   void GroupSignalsByNetwork(const talos::hardware::Config& c);
   // The licence check of the motor at `index` (MotorConfig::foc), on the
@@ -204,15 +213,34 @@ class PhoenixBackend final : public talos::hardware::Backend {
   double last_battery_v_{0};
 
   bool is_simulation_{false};
-  std::optional<std::chrono::steady_clock::time_point> last_sim_time_;
-  std::array<double, talos::hardware::kMaxMotors> sim_rotor_velocity_{};
-  std::array<double, talos::hardware::kMaxMotors> sim_rotor_position_{};
-  std::array<int, talos::hardware::kMaxMotors> motor_to_sensor_map_{};
   // Desktop sim only: true while the motor is commanded neutral (NeutralOut),
   // so UpdateSimulation decays the rotor per brake/coast instead of tracking
   // voltage.
   std::array<bool, talos::hardware::kMaxMotors> sim_neutral_{};
+#ifndef __FRC_ROBORIO__
+  struct SimMotorPlant {
+    frc::LinearSystem<2, 1, 2> system{frc::LinearSystemId::DCMotorSystem(
+        frc::DCMotor::KrakenX60(1), units::kilogram_square_meter_t{0.0005},
+        1.0)};
+    frc::Vectord<2> state{frc::Vectord<2>::Zero()};
+    double gear_ratio{1.0};
+  };
+  struct SimChassisModule {
+    std::size_t drive_index{0};
+    // -1 for differential-drive wheels (fixed 0 rad azimuth).
+    int steer_index{-1};
+    double x_m{0.0};
+    double y_m{0.0};
+  };
+  std::optional<std::chrono::steady_clock::time_point> last_sim_time_;
+  std::array<SimMotorPlant, talos::hardware::kMaxMotors> sim_plants_{};
+  std::array<int, talos::hardware::kMaxMotors> motor_to_sensor_map_{};
+  std::array<SimChassisModule, talos::hardware::kMaxMotors>
+      sim_chassis_modules_{};
+  std::size_t sim_chassis_module_count_{0};
   double sim_yaw_deg_{0.0};
+  double last_sim_supply_v_{0.0};
+#endif
   // Held by Configure while it rebuilds the device lists, and by
   // WatchdogNeutral, which only tries it: it never waits on a configure.
   // Declared before configure_, whose destruction waits for a Configure

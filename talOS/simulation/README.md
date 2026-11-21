@@ -180,8 +180,11 @@ The ideal backend and WPILib/RoboRIO simulation publish **no** `/sim/state`.
 Their simulated camera nodes emit invalid observations rather than inventing
 truth from odometry.
 
-For ideal/physics backend behavior and model hooks, see
-[hardware simulation backends](../hardware/README.md).
+For ideal/physics backend behavior, model hooks, and choosing between
+`SimBackend`, `sim_gateway --physics` (scripted schedules, `/sim/state` truth,
+and fault injection — no USB gamepad), and WPILib desktop simulation (`./sim.sh`
+with a live USB gamepad), see
+[which simulator to use for what](../hardware/README.md#which-simulator-to-use-for-what).
 
 ## Realtime scheduling
 
