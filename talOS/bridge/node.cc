@@ -76,10 +76,13 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
                            uint16_t local_port, bool simulation,
                            uint64_t session_id, std::string log_path,
                            uint64_t log_max_bytes,
-                           std::chrono::nanoseconds log_window)
+                           std::chrono::nanoseconds log_window,
+                           std::string local_ip)
     : robot_config_{std::move(robot_config)},
       config_{robot_config_.hardware},
       remote_ip_{std::move(remote_ip)},
+      local_ip_{local_ip.empty() ? std::string{"0.0.0.0"}
+                                 : std::move(local_ip)},
       remote_port_{remote_port},
       local_port_{local_port},
       simulation_{simulation},
@@ -175,27 +178,45 @@ void HardwareNode::IndexActuators() {
 }
 
 bool HardwareNode::Open() {
+  const char* const bind_ip = local_ip_.empty() ? "0.0.0.0" : local_ip_.c_str();
   errno = 0;
   const protocol::UdpStatus status =
-      peer_.Open("0.0.0.0", local_port_, remote_ip_.c_str(), remote_port_);
+      peer_.Open(bind_ip, local_port_, remote_ip_.c_str(), remote_port_);
   if (status != protocol::UdpStatus::kOk) {
     const int err = errno;
+    const bool local_pinned = std::string_view{bind_ip} != "0.0.0.0";
+    const bool address_absent = status == protocol::UdpStatus::kSocketError &&
+                                (err == EADDRNOTAVAIL || err == ENETUNREACH);
+    if (local_pinned && address_absent) {
+      socket_lost_ = true;
+      socket_never_opened_ = true;
+      reopen_attempted_ = false;
+      std::fprintf(
+          stderr,
+          "hardware_node: local address %s:%u unavailable (%s, errno %d); "
+          "retrying every %llu us until the interface comes up\n",
+          bind_ip, static_cast<unsigned>(local_port_), std::strerror(err), err,
+          static_cast<unsigned long long>(kReopenRetryUs));
+      OpenTopics();
+      return true;
+    }
     if (err != 0) {
       std::fprintf(stderr,
-                   "hardware_node: failed to open UDP socket 0.0.0.0:%u -> "
+                   "hardware_node: failed to open UDP socket %s:%u -> "
                    "%s:%u (%s: %s)\n",
-                   static_cast<unsigned>(local_port_), remote_ip_.c_str(),
-                   static_cast<unsigned>(remote_port_),
+                   bind_ip, static_cast<unsigned>(local_port_),
+                   remote_ip_.c_str(), static_cast<unsigned>(remote_port_),
                    protocol::UdpStatusName(status), std::strerror(err));
     } else {
       std::fprintf(
           stderr,
-          "hardware_node: failed to open UDP socket 0.0.0.0:%u -> %s:%u (%s)\n",
-          static_cast<unsigned>(local_port_), remote_ip_.c_str(),
+          "hardware_node: failed to open UDP socket %s:%u -> %s:%u (%s)\n",
+          bind_ip, static_cast<unsigned>(local_port_), remote_ip_.c_str(),
           static_cast<unsigned>(remote_port_), protocol::UdpStatusName(status));
     }
     return false;
   }
+  socket_never_opened_ = false;
   OpenTopics();
   return true;
 }
@@ -434,12 +455,29 @@ void HardwareNode::ReopenSocket(uint64_t now_us) {
   if (reopen_attempted_ && now_us - last_reopen_us_ < kReopenRetryUs) return;
   reopen_attempted_ = true;
   last_reopen_us_ = now_us;
-  // A failure (the port taken meanwhile, out of descriptors) is retried
-  // kReopenRetryUs later.
-  if (peer_.Reopen() != protocol::UdpStatus::kOk) return;
-  ++socket_counters_.reopens;
+  ++socket_counters_.reopen_attempts;
+  const char* const bind_ip = local_ip_.empty() ? "0.0.0.0" : local_ip_.c_str();
+  // A failure (address still absent, port taken meanwhile, out of descriptors)
+  // is retried kReopenRetryUs later.
+  const protocol::UdpStatus status =
+      socket_never_opened_
+          ? peer_.Open(bind_ip, local_port_, remote_ip_.c_str(), remote_port_)
+          : peer_.Reopen();
+  if (status != protocol::UdpStatus::kOk) return;
+  if (socket_never_opened_) {
+    socket_never_opened_ = false;
+    socket_lost_ = false;
+    std::fprintf(stderr, "hardware_node: UDP socket %s:%u -> %s:%u open\n",
+                 bind_ip, static_cast<unsigned>(local_port_),
+                 remote_ip_.c_str(), static_cast<unsigned>(remote_port_));
+  } else {
+    ++socket_counters_.reopens;
+  }
   if (!poller_) return;
   try {
+    if (peer_.NativeFd() < 0) {
+      throw std::runtime_error("the UDP socket has no fd");
+    }
     poller_->add_fd(peer_.NativeFd());
   } catch (const std::exception& e) {
     FallBackToPolling(e.what());
@@ -480,7 +518,9 @@ void HardwareNode::Tick(uint64_t now_us) {
       break;
     }
     protocol::DecodedFrame frame;
-    const auto status = peer_.TryReceive(&frame);
+    int recv_error = seams_.recv_error != nullptr ? seams_.recv_error() : 0;
+    const auto status = recv_error != 0 ? protocol::UdpStatus::kSocketError
+                                        : peer_.TryReceive(&frame);
     if (status == protocol::UdpStatus::kWouldBlock) {
       tick_receive_capped_ = false;
       break;
@@ -490,6 +530,28 @@ void HardwareNode::Tick(uint64_t now_us) {
     if (status == protocol::UdpStatus::kOk ||
         status == protocol::UdpStatus::kDecodeError) {
       ++tick_datagrams_;
+    }
+    if (status == protocol::UdpStatus::kSocketError) {
+      if (recv_error == 0) recv_error = peer_.stats().last_recv_error;
+      ++socket_counters_.recv_failures;
+      socket_counters_.last_recv_error = recv_error;
+      if (protocol::ReceiveErrorNeedsNewSocket(recv_error)) {
+        if (poller_ && peer_.NativeFd() >= 0) {
+          poller_->remove_fd(peer_.NativeFd());
+        }
+        peer_.Close();
+        if (!socket_lost_) {
+          socket_lost_ = true;
+          std::fprintf(stderr,
+                       "hardware_node: the UDP socket to the gateway cannot "
+                       "receive (%s); replacing it, nothing is sent until "
+                       "then\n",
+                       std::strerror(recv_error));
+        }
+        tick_receive_capped_ = false;
+        break;
+      }
+      continue;
     }
     if (status == protocol::UdpStatus::kDecodeError &&
         peer_.stats().last_decode_status ==
@@ -1211,10 +1273,11 @@ bool HardwareNode::OpenWaits() {
   // names request_wake_), a stop, or the next time-driven duty.
   try {
     poller_.emplace();
-    if (peer_.NativeFd() < 0) {
+    if (peer_.NativeFd() >= 0) {
+      poller_->add_fd(peer_.NativeFd());
+    } else if (!socket_lost_) {
       throw std::runtime_error("the UDP socket has no fd");
     }
-    poller_->add_fd(peer_.NativeFd());
     if (seams_.make_wake_receiver != nullptr) {
       request_wake_.emplace(seams_.make_wake_receiver());
     } else {

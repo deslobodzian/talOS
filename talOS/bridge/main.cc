@@ -12,9 +12,10 @@ int main(int argc, char** argv) {
     // No default: the framework names no robot (ARCHITECTURE.md Rule 1), so
     // --config is required. Empty means missing. Controller addressing is
     // config-driven: an explicit CLI flag wins, otherwise [robot]
-    // controller_address / controller_port / local_port apply.
+    // controller_address / local_address / controller_port / local_port apply.
     std::string config_path;
     std::string remote_cli;
+    std::string local_address_cli;
     uint16_t remote_port_cli = 0;
     uint16_t local_port_cli = 0;
     int duration_s = 0;
@@ -31,6 +32,8 @@ int main(int argc, char** argv) {
         config_path = argv[++i];
       } else if (arg == "--remote" && i + 1 < argc) {
         remote_cli = argv[++i];
+      } else if (arg == "--local-address" && i + 1 < argc) {
+        local_address_cli = argv[++i];
       } else if (arg == "--remote-port" && i + 1 < argc) {
         remote_port_cli = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--local-port" && i + 1 < argc) {
@@ -52,18 +55,18 @@ int main(int argc, char** argv) {
       } else {
         throw std::invalid_argument(
             "usage: hardware_node --config PATH [--remote IP] "
-            "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
-            "[--sim] [--log PATH] [--log-max-bytes N] [--log-window-us N] "
-            "[--session-id ID] [--describe]");
+            "[--local-address IP] [--remote-port PORT] [--local-port PORT] "
+            "[--duration-s N] [--sim] [--log PATH] [--log-max-bytes N] "
+            "[--log-window-us N] [--session-id ID] [--describe]");
       }
     }
 
     if (config_path.empty()) {
       throw std::invalid_argument(
           "usage: hardware_node --config PATH [--remote IP] "
-          "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
-          "[--sim] [--log PATH] [--log-max-bytes N] [--log-window-us N] "
-          "[--session-id ID] [--describe]");
+          "[--local-address IP] [--remote-port PORT] [--local-port PORT] "
+          "[--duration-s N] [--sim] [--log PATH] [--log-max-bytes N] "
+          "[--log-window-us N] [--session-id ID] [--describe]");
     }
 
     auto robot_config = talos::config::ParseRobotConfig(config_path);
@@ -79,6 +82,10 @@ int main(int argc, char** argv) {
     }
     const std::string remote_ip =
         talos::config::ResolveControllerAddress(robot_config, remote_cli);
+    const std::string resolved_local =
+        talos::config::ResolveLocalAddress(robot_config, local_address_cli);
+    const std::string local_ip =
+        resolved_local.empty() ? std::string{"0.0.0.0"} : resolved_local;
     const uint16_t remote_port =
         talos::config::ResolveControllerPort(robot_config, remote_port_cli);
     const uint16_t local_port =
@@ -91,7 +98,8 @@ int main(int argc, char** argv) {
                                        session_id,
                                        std::move(log_path),
                                        log_max_bytes,
-                                       log_window};
+                                       log_window,
+                                       local_ip};
 
     // --describe answers out of the constructor alone: no socket, no shared
     // memory, no registry slot, nothing the real node holds. That is what lets

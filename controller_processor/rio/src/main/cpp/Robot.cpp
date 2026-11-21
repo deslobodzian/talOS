@@ -455,7 +455,7 @@ void Robot::StartCompetition() {
       std::snprintf(
           text, sizeof(text),
           "hardware gateway socket replaced after %u failed attempts, %.3f s "
-          "after it could not send",
+          "after it was lost",
           static_cast<unsigned>(socket_retry.failures()),
           static_cast<double>(now_us - socket_retry.lost_us()) / 1e6);
       Report(*log_, kSocketReplacedMessage, text);
@@ -520,9 +520,23 @@ void Robot::StartCompetition() {
     if (socket_retry.open()) {
       // Endpoint handles clock probes even disabled/uncommissioned, echoing
       // only on a subsequent tick so its sample stamp follows probe receipt.
-      sent(endpoint_->Tick(
+      const auto tick_status = endpoint_->Tick(
           now_us, (mode_flags & talos::driver_station::kEnabled) != 0 &&
-                      (mode_flags & talos::driver_station::kEStop) == 0));
+                      (mode_flags & talos::driver_station::kEStop) == 0);
+      // Permanent receive errors close the socket and schedule a 100 ms
+      // SocketRetry reopen; transient errors (ECONNREFUSED) keep it open.
+      socket_retry.ObserveReceive(now_us, endpoint_->last_receive_status(),
+                                  endpoint_->last_receive_error());
+      if (!socket_retry.open()) {
+        endpoint_->Close();
+        char text[160];
+        std::snprintf(text, sizeof(text),
+                      "hardware gateway socket cannot receive (errno %d); "
+                      "replacing it, nothing is sent until then",
+                      socket_retry.last_recv_error());
+        Report(*log_, kSocketLostMessage, text);
+      }
+      sent(tick_status);
       // The socket retry and the endpoint's tick.
       const uint64_t ticked_ns = NowNs();
       log_->ClosePhase(TickPhase::kLink, ticked_ns);

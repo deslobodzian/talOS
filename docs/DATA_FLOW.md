@@ -64,24 +64,30 @@ shared-memory topics only; its repository documents their rates.
 | studio_bridge → driver dashboard (`/drive`) | WebSocket, the same port | Per drive client (at most the layout's `drive_clients`, outside `max_clients`): dictionary pages and a keyframe of the feed's channels (the layout's, `hw/status/alert_error_link_lost`, and with an `alerts` widget every alert channel) on connection, then change-only updates of those channels at most `update_hz` (default 20) a second, an empty update after 100 ms without one, and the drive summary (at most <!-- size: telemetry.drive_summary_bytes -->4,096 B) on change at most every 500 ms; within the layout's `budget_bytes_per_s` (default 24,000 B/s), reserved out of the bridge's 160,000 B/s ([bridge README](../studio/bridge/README.md#driver-dashboard-feed)). |
 
 A failed send never kills the bridge (`RuntimeUdpPeer` raises no
-`SIGPIPE`). When a send to the gateway fails with an error its socket never
-recovers from (`protocol::SendErrorNeedsNewSocket`, whose errors per OS are
-in [talOS/protocol](../talOS/protocol/README.md): a socket shut down or
-marked defunct, or one whose source address left the host), the bridge
-closes the socket and opens a new one on the same ports (`Reopen()`, which
-keeps the frame sequence the gateway's replay gate checks): on its next pass,
-at most 1000 µs later, then at most every 100000 µs
-(`HardwareNode::kReopenRetryUs`). While it is closed nothing is sent or
+`SIGPIPE`). When a send or receive on the gateway socket fails with an error its
+socket never recovers from (`protocol::SendErrorNeedsNewSocket` /
+`protocol::ReceiveErrorNeedsNewSocket`, whose errors per OS are in
+[talOS/protocol](../talOS/protocol/README.md): a socket shut down or marked
+defunct, an invalid descriptor, or one whose source address left the host), the
+bridge removes the descriptor from its poller, closes the socket and opens a new
+one on the same addresses and ports (`Reopen()`, which keeps the frame sequence
+the gateway's replay gate checks): on its next pass, at most 1000 µs later, then
+at most every 100000 µs (`HardwareNode::kReopenRetryUs`). When `[robot]
+local_address` (or `--local-address IP`) pins a specific local IPv4 address that
+is not yet on the host at startup (`EADDRNOTAVAIL` / `ENETUNREACH`), the bridge
+starts with the socket closed and retries opening it on that same 100000 µs
+cadence without falling back to `0.0.0.0`. While it is closed nothing is sent or
 received, so the RoboRIO neutralizes at its command timeout and `/hw/status`
 `state_age_us` grows, as for an unplugged cable; with no route to the
 RoboRIO at all, each new socket's open fails and is retried on that
-cadence. Any other send error (`ECONNREFUSED` while the RoboRIO program is
-down, for one) keeps the socket, and the failed send's duty is retried
+cadence. Any other send or receive error (`ECONNREFUSED` while the RoboRIO
+program is down, for one) keeps the socket, and a failed send's duty is retried
 1000 µs later. The bridge prints the errno once per
 outage and one line when a send succeeds again; its exit line counts
 `send_failures` and `socket_reopens`. The RoboRIO program replaces its own
-socket by the same rule (`protocol::SendErrorNeedsNewSocket`), on its 100 ms
-open-retry cadence ([talOS/hardware](../talOS/hardware/README.md#roborio)).
+socket by the same rules (`protocol::SendErrorNeedsNewSocket` and
+`protocol::ReceiveErrorNeedsNewSocket`), on its 100 ms open-retry cadence
+([talOS/hardware](../talOS/hardware/README.md#roborio)).
 
 Camera observation timestamps describe exposure, not publication. Measure
 timestamp bias during [camera bring-up](BRINGUP.md#camera-intrinsics-calibration).

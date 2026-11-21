@@ -117,7 +117,8 @@ class HardwareNode {
                         uint16_t remote_port = 5802, uint16_t local_port = 5803,
                         bool simulation = false, uint64_t session_id = 0,
                         std::string log_path = {}, uint64_t log_max_bytes = 0,
-                        std::chrono::nanoseconds log_window = {});
+                        std::chrono::nanoseconds log_window = {},
+                        std::string local_ip = "0.0.0.0");
 
   ~HardwareNode() = default;
 
@@ -182,6 +183,9 @@ class HardwareNode {
   // `send_error`, when set, is asked before each send to the gateway: a
   // nonzero errno fails that send with it, unsent, as if the OS had
   // returned it (a test reaches the errors a loopback socket never gives).
+  // `recv_error`, when set, is asked before each TryReceive() in Tick(): a
+  // nonzero errno fails that receive with it, unread, as if the OS had
+  // returned it.
   // `before_wait`, when set, is called on Run()'s thread right before each
   // wait that input can end, after every request subscriber is armed (a
   // test publishes there what the bridge must then wake for).
@@ -189,6 +193,7 @@ class HardwareNode {
     WakeReceiver (*make_wake_receiver)(){nullptr};
     bool (*arm_request)(ipc::Subscriber<Packet>& subscriber){nullptr};
     int (*send_error)(){nullptr};
+    int (*recv_error)(){nullptr};
     void (*before_wait)(){nullptr};
   };
   void set_seams(Seams seams) { seams_ = seams; }
@@ -235,25 +240,29 @@ class HardwareNode {
   };
   const Wakeups& wakeups() const { return wakeups_; }
 
-  // The UDP socket to the gateway. A send that fails with an error the
-  // socket may never recover from (protocol::SendErrorNeedsNewSocket: a
-  // socket shut down or defunct, or its source address gone from the host)
-  // closes it; Tick() then opens a new one on the same ports
-  // (RuntimeUdpPeer::Reopen): the first attempt on the next Tick
-  // (NextDutyUs: kRetryUs later at the latest), then at most once per
-  // kReopenRetryUs, which is also the cadence while the network has no
-  // route to the gateway and each attempt fails.
+  // The UDP socket to the gateway. A send or receive that fails with an error
+  // the socket may never recover from (protocol::SendErrorNeedsNewSocket /
+  // protocol::ReceiveErrorNeedsNewSocket: a socket shut down or defunct, or
+  // its source address gone from the host) closes it; Tick() then opens a new
+  // one on the same addresses and ports (RuntimeUdpPeer::Reopen): the first
+  // attempt on the next Tick (NextDutyUs: kRetryUs later at the latest), then
+  // at most once per kReopenRetryUs, which is also the cadence while the
+  // network has no route to the gateway or a pinned local_address is not yet
+  // on the host and each attempt fails.
   // While it is closed nothing is sent or received, so the gateway times
   // the command out and /hw/status's state_age_us grows, as for any lost
-  // link. Any other send error (ECONNREFUSED while the gateway is down,
-  // ENOBUFS, ...) keeps the socket: it clears by itself, and the failed duty
-  // is retried kRetryUs later.
+  // link. Any other send or receive error (ECONNREFUSED while the gateway is
+  // down, ENOBUFS, ...) keeps the socket: it clears by itself, and a failed
+  // send duty is retried kRetryUs later.
   // stderr gets one line when an outage starts, with its errno, and one when
   // a send succeeds again. Read only while Run() is not running.
   struct SocketCounters {
-    uint64_t send_failures{0};  // sends that failed, of either kind
-    int last_send_error{0};     // the errno of the last; 0 before one
-    uint64_t reopens{0};        // sockets opened to replace a lost one
+    uint64_t send_failures{0};    // sends that failed, of either kind
+    int last_send_error{0};       // the errno of the last send error; 0 before
+    uint64_t recv_failures{0};    // receives that failed with kSocketError
+    int last_recv_error{0};       // the errno of the last recv error; 0 before
+    uint64_t reopens{0};          // sockets opened to replace a lost one
+    uint64_t reopen_attempts{0};  // ReopenSocket() open/reopen attempts made
   };
   const SocketCounters& socket_counters() const { return socket_counters_; }
   // The socket's fd, -1 while it is closed (a test breaks it through this).
@@ -441,6 +450,7 @@ class HardwareNode {
   Config config_;
   uint64_t config_id_{0};
   std::string remote_ip_;
+  std::string local_ip_;
   uint16_t remote_port_;
   uint16_t local_port_;
   bool simulation_;
@@ -506,9 +516,13 @@ class HardwareNode {
   uint64_t max_wait_us_{kMaxWaitUs};
   Wakeups wakeups_{};
   SocketCounters socket_counters_{};
-  // An outage: from a send that closed the socket to the first send that
-  // succeeds after it.
+  // An outage: from a send/receive that closed the socket (or a pinned
+  // local_address unavailable at Open()) until recovery.
   bool socket_lost_{false};
+  // True when Open() deferred socket creation because a pinned local_address
+  // was not yet on the host (EADDRNOTAVAIL/ENETUNREACH); cleared once the
+  // initial peer_.Open() succeeds.
+  bool socket_never_opened_{false};
   // The last reopen attempt, on the bridge clock; none yet while
   // !reopen_attempted_.
   bool reopen_attempted_{false};
