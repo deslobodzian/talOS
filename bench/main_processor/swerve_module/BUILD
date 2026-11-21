@@ -39,7 +39,6 @@ cc_binary(
         ":messages",
         "//talOS/devices",
         "//talOS/driver_station",
-        "//talOS/events:events_os",
         "//talOS/hardware",
         "//talOS/introspection:names",
         "//talOS/ipc",
@@ -61,7 +60,7 @@ cc_test(
         "//talOS/devices:testing",
         "//talOS/node:allocation_probe",
         "//talOS/node:testing",
-        "//talOS/teleop",
+        "//talOS/teleop:testing",
         "@googletest//:gtest_main",
     ],
 )

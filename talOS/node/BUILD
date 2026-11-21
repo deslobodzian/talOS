@@ -14,21 +14,36 @@ cc_library(
     ],
 )
 
+# Safe, non-privileged thunks behind node.h's templates.
+cc_library(
+    name = "node_detail",
+    hdrs = ["node_detail.h"],
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/schema:identity"],
+)
+
+# Private header target for node.cc's implementation_deps so talOS/node/access.h
+# never enters downstream robot-node compile sandboxes (ARCH-2 / RULES.md 2).
+cc_library(
+    name = "access_hdr",
+    hdrs = ["access.h"],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":node_detail",
+        "//talOS/schema:identity",
+    ],
+)
+
 # The node authoring API: talos::Node, Subscription, Publisher, StateMachine,
 # talos::Run and TALOS_NODE. Generic: no hardware (see //talOS/devices).
 # Internal framework deps stay in implementation_deps so their headers are
 # excluded from downstream robot-node compile sandboxes (ARCH-2 / RULES.md 2).
 cc_library(
     name = "node",
-    srcs = [
-        "access.h",
-        "node.cc",
-    ],
-    hdrs = [
-        "node.h",
-        "node_detail.h",
-    ],
+    srcs = ["node.cc"],
+    hdrs = ["node.h"],
     implementation_deps = [
+        ":access_hdr",
         ":loop_port",
         "//talOS/configuration",
         "//talOS/events",
@@ -41,6 +56,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":node_detail",
         "//talOS/events:events_core",
         "//talOS/ipc:concepts",
         "//talOS/schema:identity",

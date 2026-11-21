@@ -22,6 +22,7 @@
 #include "schema_test/shapes_generated.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/hardware_lint.h"
+#include "talOS/rtms/rtms.h"
 #include "talOS/schema/identity.h"
 
 namespace talos::introspect::naming {
@@ -31,6 +32,8 @@ static_assert(std::string_view{hardware::kRequestTopicPrefix} ==
                   kRequestTopicPrefix,
               "naming::kRequestTopicPrefix must match "
               "hardware::kRequestTopicPrefix");
+static_assert(kMaxTopicReaders == MAX_READERS,
+              "naming::kMaxTopicReaders must match rtms MAX_READERS");
 
 using event::SourceKind;
 
@@ -350,6 +353,40 @@ TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
   EXPECT_NE(Find(diagnostics, Severity::ERROR, "/hw/request/drivetrain"),
             nullptr)
       << Describe(diagnostics);
+}
+
+// REQ-SAFE-27: ShmObjectName strips all leading '/' and maps interior '/' to
+// '.', so IsHardwareRequest must recognise multiple-leading-slash and
+// dot-colliding spellings so Node::publish / publish_bytes refuse them all.
+TEST(TopicName, IsHardwareRequestRecognisesLeadingSlashesAndDotCollisions) {
+  for (const std::string_view topic : {
+           "/hw/request",
+           "/hw/request/foo",
+           "//hw/request",
+           "//hw/request/foo",
+           "///hw/request/foo",
+           "////hw/request/foo/bar",
+           "/hw.request",
+           "/hw.request.foo",
+           "//hw.request.foo",
+           "/hw.request/foo",
+           "/hw/request.foo",
+       }) {
+    EXPECT_TRUE(IsHardwareRequest(topic)) << topic;
+  }
+  for (const std::string_view topic : {
+           "",
+           "/",
+           "//",
+           "///",
+           "hw/request/foo",
+           "/hw/state",
+           "/hw/requests/foo",
+           "/other/request/foo",
+           "/hw/request_other/foo",
+       }) {
+    EXPECT_FALSE(IsHardwareRequest(topic)) << topic;
+  }
 }
 
 // RULES.md 2: the roster's bridge writes the hw namespace, and

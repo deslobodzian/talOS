@@ -3,9 +3,18 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_cc_node")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
 
-exports_files(["telemetry.fbs"])
+_FRAMEWORK_VISIBILITY = [
+    "//studio:__subpackages__",
+    "//talOS:__subpackages__",
+    "//tools:__pkg__",
+]
+
+exports_files(
+    ["telemetry.fbs"],
+    visibility = ["//visibility:public"],
+)
 
 # The Studio feed contract: the telemetry frame FlatBuffers schema plus the
 # slot-geometry wire header. Its only dependency is flatbuffers, so robot
@@ -14,6 +23,7 @@ exports_files(["telemetry.fbs"])
 flatbuffer_cc_library(
     name = "schema",
     srcs = ["telemetry.fbs"],
+    visibility = ["//visibility:public"],
 )
 
 # The slot geometry is a contract between the bridge and whatever produces
@@ -21,6 +31,7 @@ flatbuffer_cc_library(
 cc_library(
     name = "wire",
     hdrs = ["wire.h"],
+    visibility = ["//visibility:public"],
 )
 
 # Page encoding: the producer, the Studio bridge and the mock build every
@@ -28,6 +39,7 @@ cc_library(
 cc_library(
     name = "frames",
     hdrs = ["frames.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":schema",
         ":wire",
@@ -63,6 +75,7 @@ cc_library(
     name = "channels",
     srcs = ["channels.cc"],
     hdrs = ["channels.h"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":frames",
         ":schema",
@@ -96,6 +109,7 @@ cc_test(
 cc_library(
     name = "telemetry",
     hdrs = ["node.h"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":channels",
         ":dashboard_layout",
@@ -117,6 +131,7 @@ talos_cc_node(
     name = "node",
     srcs = ["node.cc"],
     node_name = "telemetry",
+    visibility = ["//visibility:public"],
     deps = [":telemetry"],
 )
 
@@ -148,6 +163,7 @@ cc_library(
     name = "dashboard_layout",
     srcs = ["dashboard_layout.cc"],
     hdrs = ["dashboard_layout.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":wire",
         "//talOS/introspection:names",

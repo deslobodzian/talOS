@@ -185,7 +185,7 @@ Automated checks that keep the architecture honest.
 ### To add
 
 The checks the **[gap]** marks name are TODO.md's "Method enforcement and
-test corrections" items, plus ARCH-2 and ARCH-3.
+test corrections" items, plus ARCH-3.
 
 A new **[review]** rule is accepted only with a sentence saying why it
 cannot be enforced.

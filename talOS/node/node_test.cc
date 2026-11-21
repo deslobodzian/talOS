@@ -880,6 +880,26 @@ struct RemappedRequest {
   explicit RemappedRequest(Node& n) : request{n.publish<Count>("state")} {}
   Publisher<Count> request;
 };
+struct DoubleSlashRequest {
+  explicit DoubleSlashRequest(Node& n)
+      : request{n.publish<Count>("//hw/request/double")} {}
+  Publisher<Count> request;
+};
+struct TripleSlashRequest {
+  explicit TripleSlashRequest(Node& n)
+      : request{n.publish<Count>("///hw/request/triple")} {}
+  Publisher<Count> request;
+};
+struct DoubleSlashByteRequest {
+  explicit DoubleSlashByteRequest(Node& n)
+      : request{n.publish_bytes("//hw/request/bytes_double", 8)} {}
+  BytePublisher request;
+};
+struct DotCollisionRequest {
+  explicit DotCollisionRequest(Node& n)
+      : request{n.publish<Count>("/hw.request.dot")} {}
+  Publisher<Count> request;
+};
 
 // REQ-SAFE-27
 TEST(Node, APlainPublisherOnAHardwareRequestIsRefused) {
@@ -890,15 +910,30 @@ command_timeout_us = 100000
 
 [subsystems.plain]
 [subsystems.bytes]
+[subsystems.double_slash]
+[subsystems.triple_slash]
+[subsystems.bytes_double]
+[subsystems.dot]
 [subsystems.remapped.remap]
 state = "/hw/request/remapped"
+[subsystems.remapped_double.remap]
+state = "//hw/request/remapped"
 
 [subsystems.mechanism.motors.unused]
 can_id = 1
 )");
   EXPECT_THROW(sim.add<PlainRequest>("plain"), std::invalid_argument);
   EXPECT_THROW(sim.add<ByteRequest>("bytes"), std::invalid_argument);
+  EXPECT_THROW(sim.add<DoubleSlashRequest>("double_slash"),
+               std::invalid_argument);
+  EXPECT_THROW(sim.add<TripleSlashRequest>("triple_slash"),
+               std::invalid_argument);
+  EXPECT_THROW(sim.add<DoubleSlashByteRequest>("bytes_double"),
+               std::invalid_argument);
+  EXPECT_THROW(sim.add<DotCollisionRequest>("dot"), std::invalid_argument);
   EXPECT_THROW(sim.add<RemappedRequest>("remapped"), std::invalid_argument);
+  EXPECT_THROW(sim.add<RemappedRequest>("remapped_double"),
+               std::invalid_argument);
 }
 
 // --- state machines --------------------------------------------------------

@@ -2,6 +2,29 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
+# Safe, non-privileged thunks behind target.h's templates.
+cc_library(
+    name = "target_detail",
+    hdrs = ["target_detail.h"],
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/schema:identity"],
+)
+
+# Private header target for devices.cc/target.cc's implementation_deps so
+# talOS/devices/access.h never enters downstream robot-node compile sandboxes
+# (ARCH-2 / RULES.md 2).
+cc_library(
+    name = "access_hdr",
+    hdrs = ["access.h"],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":target_detail",
+        "//talOS/events:events_core",
+        "//talOS/hardware",
+        "//talOS/schema:identity",
+    ],
+)
+
 # Robot hardware for talos::Node: Motor, CANcoder, Gyro, digital/analog I/O,
 # encoders and PWM through the bridge, attached as a Node extension, the
 # Driver Station the bridge forwards, and target lanes (Target, TargetLane)
@@ -12,16 +35,15 @@ load("//talOS/build:contract.bzl", "talos_messages")
 cc_library(
     name = "devices",
     srcs = [
-        "access.h",
         "devices.cc",
         "target.cc",
     ],
     hdrs = [
         "devices.h",
         "target.h",
-        "target_detail.h",
     ],
     implementation_deps = [
+        ":access_hdr",
         "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/hardware",
@@ -32,6 +54,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":target_detail",
         "//talOS/driver_station",
         "//talOS/node",
         "//talOS/schema:identity",

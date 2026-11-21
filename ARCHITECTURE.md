@@ -93,12 +93,18 @@ Allowed dependencies:
   `talOS/devices` is built on `Node`'s public API (`extension<T>()`,
   `after_update()`) and the framework hooks in `detail::NodeAccess`
   (`//talOS/node:access`). Privileged framework targets (`//talOS/node:access`,
-  `//talOS/node:loop_port`, `//talOS/devices:access`,
-  `//talOS/hardware:hardware`, `//talOS/ipc:ipc`, `//talOS/rtms:{rtms,wake}`,
-  `//talOS/memory:shared_memory`) are non-public in Bazel, and internal
-  transport/wire deps of `//talOS/node:node` and `//talOS/devices:devices` live
-  in `implementation_deps`, so robot node code cannot include or link them
-  (RULES.md 2).
+  `//talOS/node:access_hdr`, `//talOS/node:loop_port`, `//talOS/devices:access`,
+  `//talOS/devices:access_hdr`, `//talOS/hardware:hardware`, `//talOS/ipc:ipc`,
+  `//talOS/rtms:{rtms,wake,process_liveness}`,
+  `//talOS/memory:{shared_memory,residency}`,
+  `//talOS/events:{events,events_os,input_replay}`,
+  `//talOS/telemetry:{telemetry,channels}`, `//talOS/teleop:teleop`,
+  `//talOS/node_api:node_api`, `//talOS/bridge:node_lib`,
+  `//talOS/introspection:{registry,reporter}`,
+  `//talOS/launcher:launcher_lib`) are non-public in Bazel, and internal
+  transport/wire/access deps of `//talOS/node:node` and
+  `//talOS/devices:devices` live in `implementation_deps`, so robot node code
+  cannot include or link them (RULES.md 2).
 - `talOS/` never depends on a robot, an example or `studio/`.
 - Python reaches talOS only through the C ABI in `talOS/node_api`; it does not
   reimplement a wire format, a memory layout, a state machine, or a C++ node

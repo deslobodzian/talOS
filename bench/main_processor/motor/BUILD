@@ -48,7 +48,7 @@ cc_test(
         "//talOS/devices:testing",
         "//talOS/node:allocation_probe",
         "//talOS/node:testing",
-        "//talOS/teleop",
+        "//talOS/teleop:testing",
         "@googletest//:gtest_main",
     ],
 )
