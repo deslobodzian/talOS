@@ -417,6 +417,7 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   | `nodes[].restarts` | number | the manifest's `restart_count` for the node |
   | `nodes[].quarantined` | bool | the manifest's `quarantined` for the node |
   | `nodes[].drives` | string or null | the target lane source (`teleop`, `auto`, ...) its first `Target` with a selection last selected; null when it is not alive, reads no target, or its `Target::get()` was last null |
+  | `nodes[].outputs_held` | bool (optional) | present and `true` only while the node is alive and its devices flush is holding back outputs set with no live target (`kFlagOutputsHeld`; REQ-SAFE-41); omitted when false |
   | `omitted` | number | nodes left off the end of `nodes` to keep the message within 4,096 bytes; normally 0 |
   | `launch_refused` | bool (optional) | present and `true` only in refusal mode (`--refusal-file`), when the launcher refused phase 1 |
   | `refusal_reason` | string (optional) | present with `launch_refused: true`: the launcher's refusal reason, truncated if needed to keep the message within 4,096 bytes |

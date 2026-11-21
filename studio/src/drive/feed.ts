@@ -108,6 +108,7 @@ export type SummaryNode = {
   restarts: number;
   quarantined: boolean;
   drives: string|null;
+  outputs_held: boolean;
 };
 // talos.drive.summary (README): `registry` false means `alive` and `drives`
 // are unknown, `supervised` false that `restarts` and `quarantined` are.
@@ -160,7 +161,8 @@ export function parseSummary(v: unknown): DriveSummary|null {
       restarts: typeof node.restarts === 'number' && Number.isFinite(node.restarts) ?
           node.restarts : 0,
       quarantined: node.quarantined === true,
-      drives: typeof node.drives === 'string' ? node.drives : null
+      drives: typeof node.drives === 'string' ? node.drives : null,
+      outputs_held: node.outputs_held === true
     });
   }
   const summary: DriveSummary = {

@@ -895,5 +895,44 @@ TEST(DriveSummary,
   EXPECT_TRUE(layout["widgets"].empty());
 }
 
+// REQ-SAFE-41: BuildDriveSummary propagates `kFlagOutputsHeld` for alive rows
+// only, and DriveSummaryJson emits `"outputs_held":true` only when true
+// (omitting the key when false so the 4,096 B cap budget stays unchanged).
+TEST(DriveSummary, OutputsHeldPropagatesForAliveRowsAndIsOmittedWhenFalse) {
+  const std::vector<DriveRosterEntry> config{
+      {"drivetrain", true}, {"shooter", true}, {"intake", false}};
+  std::vector<talos::introspect::NodeSnapshot> registry(3);
+  registry[0].name = "drivetrain";
+  registry[0].alive = true;
+  registry[0].flags = talos::introspect::kFlagOutputsHeld;
+  registry[1].name = "shooter";
+  registry[1].alive = true;
+  registry[1].flags = 0;
+  registry[2].name = "intake";
+  registry[2].alive = false;
+  registry[2].flags = talos::introspect::kFlagOutputsHeld;
+
+  const DriveSummary summary = BuildDriveSummary(config, &registry, "");
+  ASSERT_EQ(summary.nodes.size(), 3u);
+  EXPECT_TRUE(summary.nodes[0].outputs_held);
+  EXPECT_FALSE(summary.nodes[1].outputs_held);
+  EXPECT_FALSE(summary.nodes[2].outputs_held)
+      << "dead rows never report outputs_held";
+
+  const std::string wire = DriveSummaryJson(summary);
+  const nlohmann::json parsed = nlohmann::json::parse(wire);
+  ASSERT_EQ(parsed["nodes"].size(), 3u);
+  EXPECT_EQ(parsed["nodes"][0]["outputs_held"], true);
+  EXPECT_FALSE(parsed["nodes"][1].contains("outputs_held"))
+      << "outputs_held:false must be omitted from JSON: " << wire;
+  EXPECT_FALSE(parsed["nodes"][2].contains("outputs_held"))
+      << "dead node must omit outputs_held: " << wire;
+
+  const DriveSummary unreadable = BuildDriveSummary(config, nullptr, "");
+  for (const auto& node : unreadable.nodes) {
+    EXPECT_FALSE(node.outputs_held);
+  }
+}
+
 }  // namespace
 }  // namespace studio
