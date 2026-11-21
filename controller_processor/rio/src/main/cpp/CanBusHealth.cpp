@@ -88,7 +88,7 @@ void CanBusSampler::Reconfigure(const hardware::Config& config,
         [board, read = read_, clock = clock_, period_us = period_us_,
          stuck = stuck_] { Run(board, read, clock, period_us, stuck); }};
     board_ = std::move(board);
-  } catch (const std::system_error&) {
+  } catch (const std::system_error&) {  // NOLINT(bugprone-empty-catch)
     // No reads: Poll reports every bus stale (see the header).
   }
 }

@@ -274,7 +274,7 @@ void RecordConfigureException(std::optional<hw::ConfigError>& last_error,
     event.index = kConfigureFailedMessage;
     event.SetText("[phoenix] " + hw::FormatConfigError(err));
     log.Post(event);
-  } catch (...) {
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
     // Never let a secondary exception (e.g. bad_alloc) escape.
   }
 }
