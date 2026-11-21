@@ -101,6 +101,7 @@ genrule(
         ["src/**"],
         exclude = ["src/generated/**"],
     ) + [
+        "agent/rpc.ts",
         "drive.html",
         "index.html",
         "package.json",

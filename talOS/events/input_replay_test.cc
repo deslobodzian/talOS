@@ -3541,5 +3541,195 @@ TEST(InputReplay, AllowCappedClampsLateExitWhenSegmentZeroRotatedOut) {
   std::filesystem::remove_all(out);
 }
 
+// LOG-29(c): an unconsumed IncompleteLogHeader file or a manifest-listed
+// missing/unexited/capped/failed writer run must prevent writer_complete from
+// falsely rescuing a capped or gapped reader. REQ-OPS-14
+TEST(InputReplay, MissingOrIncompleteRestartedWriterDoesNotRescueReader) {
+  {
+    SCOPED_TRACE(
+        "unconsumed IncompleteLogHeader prevents writer rescue (capped & "
+        "gapped)");
+    for (const bool gapped_reader : {false, true}) {
+      SCOPED_TRACE(gapped_reader ? "gapped reader" : "capped reader");
+      const std::string dir = TempDir("incomplete_restart_no_rescue");
+      const std::string out = TempDir("incomplete_restart_no_rescue_out");
+      WriterLog(dir);
+      ReaderLog(dir);
+      if (gapped_reader) {
+        MarkGap(dir + "/reader.tlog", kDrain + 5us);
+      } else {
+        CreateEmptyFile(log::CappedMarkerPath(dir + "/reader.tlog"));
+      }
+      // Truncated-header restarted writer log: skipped on IncompleteLogHeader
+      // with no later readable segment to consume it.
+      CreateEmptyFile(dir + "/writer.restart1.tlog");
+
+      ::testing::internal::CaptureStderr();
+      const RecordedSession session{dir};
+      static_cast<void>(::testing::internal::GetCapturedStderr());
+      if (gapped_reader) {
+        const WatcherRun run = ReplayWatcher(session, out);
+        EXPECT_TRUE(run.report.stopped_at_gap.has_value());
+      } else {
+        EXPECT_THROW(ReplayWatcher(session, out), ReplayError);
+      }
+      std::filesystem::remove_all(dir);
+      std::filesystem::remove_all(out);
+    }
+  }
+  {
+    SCOPED_TRACE(
+        "manifest listing missing restarted writer log, log_capped, or "
+        "recorder_failed/log_gap on missing log prevents writer rescue");
+    enum class WriterManifestFault {
+      kMissingRestartLog,
+      kWriterLogCapped,
+      kWriterRecorderFailedMissing,
+      kWriterLogGapMissing,
+    };
+    for (const WriterManifestFault fault :
+         {WriterManifestFault::kMissingRestartLog,
+          WriterManifestFault::kWriterLogCapped,
+          WriterManifestFault::kWriterRecorderFailedMissing,
+          WriterManifestFault::kWriterLogGapMissing}) {
+      const std::string dir = TempDir("manifest_writer_no_rescue");
+      const std::string out = TempDir("manifest_writer_no_rescue_out");
+      WriterLog(dir);
+      ReaderLog(dir);
+      const std::uint64_t id =
+          log::LogReader{dir + "/writer.tlog"}.session_id();
+      CreateEmptyFile(log::CappedMarkerPath(dir + "/reader.tlog"));
+      std::ofstream manifest{dir + "/manifest.json"};
+      switch (fault) {
+        case WriterManifestFault::kMissingRestartLog:
+          manifest << "{\"session_id\": " << id
+                   << ", \"nodes\": [{\"name\": \"writer\", \"log_paths\": "
+                      "[\"/s/writer.tlog\", \"/s/writer.restart1.tlog\"], "
+                      "\"log_capped\": false, \"log_gap\": false, "
+                      "\"gap_logs\": [], \"recorder_failed\": false, "
+                      "\"recorder_failed_logs\": []}]}\n";
+          break;
+        case WriterManifestFault::kWriterLogCapped:
+          manifest << "{\"session_id\": " << id
+                   << ", \"nodes\": [{\"name\": \"writer\", \"log_paths\": "
+                      "[\"/s/writer.tlog\"], \"log_capped\": true, "
+                      "\"log_gap\": false, \"gap_logs\": [], "
+                      "\"recorder_failed\": false, "
+                      "\"recorder_failed_logs\": []}]}\n";
+          break;
+        case WriterManifestFault::kWriterRecorderFailedMissing:
+          manifest << "{\"session_id\": " << id
+                   << ", \"nodes\": [{\"name\": \"writer\", \"log_paths\": "
+                      "[\"/s/writer.tlog\"], \"log_capped\": false, "
+                      "\"log_gap\": false, \"gap_logs\": [], "
+                      "\"recorder_failed\": true, \"recorder_failed_logs\": "
+                      "[\"/s/writer.restart1.tlog\"]}]}\n";
+          break;
+        case WriterManifestFault::kWriterLogGapMissing:
+          manifest << "{\"session_id\": " << id
+                   << ", \"nodes\": [{\"name\": \"writer\", \"log_paths\": "
+                      "[\"/s/writer.tlog\"], \"log_capped\": false, "
+                      "\"log_gap\": true, \"gap_logs\": "
+                      "[\"/s/writer.restart1.tlog\"], \"recorder_failed\": "
+                      "false, \"recorder_failed_logs\": []}]}\n";
+          break;
+      }
+      manifest.close();
+
+      const RecordedSession session{dir};
+      EXPECT_THROW(ReplayWatcher(session, out), ReplayError);
+      std::filesystem::remove_all(dir);
+      std::filesystem::remove_all(out);
+    }
+  }
+}
+
+// LOG-28: an inconsistent manifest with log_gap: true and gap_logs: [] still
+// fails closed as a member-wide log_gap mark on an unexited log. REQ-OPS-14
+TEST(InputReplay, InconsistentLogGapTrueWithEmptyGapLogsFailsClosed) {
+  const std::string dir = TempDir("inconsistent_empty_gap_logs");
+  const std::string out = TempDir("inconsistent_empty_gap_logs_out");
+  const std::vector<std::uint64_t> woff = WriterLog(dir);
+  const std::string wpath = dir + "/writer.tlog";
+  const std::uint64_t id = log::LogReader{wpath}.session_id();
+  // Drop EXIT so manifest log_gap refuses the log.
+  std::filesystem::resize_file(wpath, woff.back());
+  std::ofstream{dir + "/manifest.json"}
+      << "{\"session_id\": " << id
+      << ", \"nodes\": [{\"name\": \"writer\", \"log_paths\": "
+         "[\"/s/writer.tlog\"], \"log_capped\": false, \"log_gap\": true, "
+         "\"gap_logs\": [], \"recorder_failed\": false, "
+         "\"recorder_failed_logs\": []}]}\n";
+
+  const RecordedSession session{dir};
+  try {
+    ReplayWatcher(session, out);
+    ADD_FAILURE() << "accepted unexited log with log_gap:true and gap_logs:[]";
+  } catch (const ReplayError& e) {
+    EXPECT_NE(std::string{e.what()}.find("log_gap"), std::string::npos)
+        << e.what();
+  }
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
+}
+
+// LOG-29(a)/(b): a MESSAGE/SEND record with a mismatched payload size must not
+// close an open damaged stretch. REQ-OPS-14
+TEST(InputReplay, WrongPayloadSizeRecordDoesNotCloseOpenStretch) {
+  const std::string dir = TempDir("wrong_payload_stretch");
+  const std::string out = TempDir("wrong_payload_stretch_out");
+  const std::vector<std::uint64_t> woff = WriterLog(dir);
+  // Drop writer EXIT so reader's damaged stretch is judged directly (not
+  // bypassed by writer_complete).
+  std::filesystem::resize_file(dir + "/writer.tlog", woff.back());
+  const std::string rpath = dir + "/reader.tlog";
+  {
+    log::LogWriter writer{rpath, "reader",
+                          log::LogWriterOptions{.background = false}};
+    writer.start(ManifestOf<SensorWatcher>(dir + "/unused.tlog"), kOrigin);
+    for (int i = 1; i <= 2; ++i) {
+      const EventsTest::SensorMessage reading{i, 1.0F, 1.0F};
+      writer.dispatch(
+          Context{.kind = EventKind::MESSAGE,
+                  .source_id = 0,
+                  .dispatch_index = static_cast<std::uint64_t>(i),
+                  .event_time = kDrain,
+                  .now = kDrain + std::chrono::microseconds{5 * i},
+                  .publish_time = kOrigin + std::chrono::milliseconds{i},
+                  .sequence = static_cast<std::uint64_t>(i - 1)},
+          std::as_bytes(std::span{&reading, 1}));
+    }
+    // Receipt for sequence 2 with a 1-byte payload (wrong size for
+    // SensorMessage): must be ignored and must NOT close the damaged stretch
+    // on sequence 1.
+    const std::byte bogus{0x42};
+    writer.dispatch(Context{.kind = EventKind::MESSAGE,
+                            .source_id = 0,
+                            .dispatch_index = 3,
+                            .event_time = kDrain,
+                            .now = kDrain + 15us,
+                            .publish_time = kOrigin + 3ms,
+                            .sequence = 2},
+                    std::span{&bogus, 1});
+    writer.finish(Context{.kind = EventKind::EXIT,
+                          .dispatch_index = 4,
+                          .event_time = kDrain + 20us,
+                          .now = kDrain + 20us});
+    writer.flush();
+  }
+  const std::vector<std::uint64_t> roff = RecordOffsets(rpath);
+  ASSERT_EQ(roff.size(), 4u);  // seq 0, seq 1, bogus seq 2, EXIT
+  DamageRecord(rpath, roff[1]);
+
+  ::testing::internal::CaptureStderr();
+  const RecordedSession session{dir};
+  static_cast<void>(::testing::internal::GetCapturedStderr());
+  const WatcherRun run = ReplayWatcher(session, out);
+  ASSERT_TRUE(run.report.stopped_at_gap.has_value());
+  EXPECT_EQ(run.report.stopped_at_gap->damage_offset, roff[1]);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
+}
+
 }  // namespace
 }  // namespace talos::event

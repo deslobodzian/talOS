@@ -129,19 +129,29 @@ struct ManifestMarks {
   bool recorder_failed{false};
 };
 
+// What the session manifest says about every member: per-log-filename marks
+// plus the parsed member entries (used to check whether a writer member has
+// missing, unexited, capped or failed runs when judging writer completeness).
+struct SessionManifestInfo {
+  std::map<std::string, ManifestMarks> marks;
+  std::vector<session_manifest::Member> nodes;
+};
+
 // By file name, the logs of every member the session manifest beside the
 // logs (`<directory>/manifest.json`, talOS/launcher/session.cc, read by
 // session_manifest::Parse) marks `log_gap`, `log_capped` or
-// `recorder_failed`, with those marks; empty when there is no manifest, or
-// it is another session's or has no session_id. When a member carries per-run
-// `gap_logs` or `recorder_failed_logs` arrays, only the basenames listed in
-// each array receive that mark (legacy manifests without those arrays fall
-// back to marking every basename in `log_paths` when the member's boolean is
-// true). Throws std::runtime_error naming a manifest that is not JSON, or
-// whose `log_gap`, `log_capped`, `recorder_failed` or required `log_paths` is
-// not what the launcher writes.
-std::map<std::string, ManifestMarks> MarkedLogNames(
-    const std::filesystem::path& directory, std::uint64_t session_id) {
+// `recorder_failed`, with those marks, plus the manifest's `nodes`; empty when
+// there is no manifest, or it is another session's or has no session_id. When
+// a member carries non-empty per-run `gap_logs` or per-run
+// `recorder_failed_logs` arrays, only the basenames listed in each array
+// receive that mark (legacy manifests without those arrays, or an inconsistent
+// `log_gap: true` with an empty `gap_logs` array, fall back to marking every
+// basename in `log_paths` when the member's boolean is true). Throws
+// std::runtime_error naming a manifest that is not JSON, or whose `log_gap`,
+// `log_capped`, `recorder_failed` or required `log_paths` is not what the
+// launcher writes.
+SessionManifestInfo LoadManifestInfo(const std::filesystem::path& directory,
+                                     std::uint64_t session_id) {
   const std::optional<std::string> text = session_manifest::ReadText(directory);
   if (!text) return {};
   const auto error = [&](std::string_view what) {
@@ -159,7 +169,8 @@ std::map<std::string, ManifestMarks> MarkedLogNames(
   if (manifest.session_id != session_id) return {};
   std::map<std::string, ManifestMarks> names;
   for (const session_manifest::Member& node : manifest.nodes) {
-    const bool legacy_gap = node.log_gap && !node.gap_logs.has_value();
+    const bool legacy_gap =
+        node.log_gap && (!node.gap_logs.has_value() || node.gap_logs->empty());
     const bool legacy_failed =
         node.recorder_failed && !node.recorder_failed_logs.has_value();
     const bool needs_log_paths = node.log_capped || legacy_gap || legacy_failed;
@@ -187,7 +198,8 @@ std::map<std::string, ManifestMarks> MarkedLogNames(
       }
     }
   }
-  return names;
+  return SessionManifestInfo{.marks = std::move(names),
+                             .nodes = std::move(manifest.nodes)};
 }
 
 }  // namespace
@@ -722,8 +734,6 @@ RecordedSession::RecordedSession(const std::string& path,
           header.source_id < last_receipt.size()) {
         last_receipt[header.source_id] = header.publish_time_ns;
         last_sequence[header.source_id] = header.sequence;
-        close_open_stretch(header.source_id, /*is_sender=*/false,
-                           header.sequence);
       }
       if (own_log && header.source_id < timer_state.size()) {
         TimerState& timer = timer_state[header.source_id];
@@ -798,8 +808,6 @@ RecordedSession::RecordedSession(const std::string& path,
           }
         }
         last_sent_seq[header.source_id] = header.sequence;
-        close_open_stretch(header.source_id, /*is_sender=*/true,
-                           header.sequence);
       }
       if ((!receipt && !send) || header.source_id >= topic_of.size() ||
           topic_of[header.source_id] == kNone) {
@@ -820,6 +828,7 @@ RecordedSession::RecordedSession(const std::string& path,
         }
         last_monotonic_seq[header.source_id] = header.sequence;
       }
+      close_open_stretch(header.source_id, /*is_sender=*/send, header.sequence);
       if (own_log && receipt) {
         // Delivered by the drain at its event time; published no later, as
         // the replayed drain runs at its deadline.
@@ -1096,8 +1105,9 @@ RecordedSession::RecordedSession(const std::string& path,
   // file, the log's path.
   const std::filesystem::path directory =
       std::filesystem::path{log_paths_.front()}.parent_path();
-  const std::map<std::string, ManifestMarks> marked = MarkedLogNames(
+  const SessionManifestInfo manifest_info = LoadManifestInfo(
       directory.empty() ? std::filesystem::path{"."} : directory, session_id_);
+  const std::map<std::string, ManifestMarks>& marked = manifest_info.marks;
   std::set<std::string> exited;
   for (const ReadLog& log : logs) {
     if (log.exit) exited.insert(log.path);
@@ -1164,14 +1174,90 @@ RecordedSession::RecordedSession(const std::string& path,
     verdicts.push_back({base_log, cap_sign, hard_sign});
   }
   // For any topic the replayed program did not watch live: if at least one
-  // writer log exists for the topic, every writer log of that topic is
-  // complete (no cap/hard/segment refusal, no GAP, no unrecovered damage on
-  // that topic, not truncated, and its run reached EXIT), and the session
-  // holds every sequence in [0, max_seq], then the writer holds the topic in
-  // full and reader-only caps, marks, gaps and damage cost the feed nothing.
+  // writer log exists for the topic, no IncompleteLogHeader file in the session
+  // was left unconsumed (an unreadable log could belong to a restarted writer),
+  // every writer log of that topic is complete (no cap/hard/segment refusal, no
+  // GAP, no unrecovered damage on that topic, not truncated, and its run
+  // reached EXIT), every run the session manifest lists for the writer member
+  // is present, clean and exited (and the writer member is neither log_capped
+  // nor recorder_failed), and the session holds every sequence in [0, max_seq],
+  // then the writer holds the topic in full and reader-only caps, marks, gaps
+  // and damage cost the feed nothing.
+  const bool has_unconsumed_incomplete = std::any_of(
+      log_continuity.begin(), log_continuity.end(), [](const auto& entry) {
+        return !entry.second.skipped_incomplete.empty();
+      });
+  std::set<std::string> read_base_names;
+  std::set<std::string> dirty_base_names;
+  for (std::size_t i = 0; i < logs.size(); ++i) {
+    const ReadLog& log = logs[i];
+    const LogVerdict& v = verdicts[i];
+    const std::string base_name =
+        std::filesystem::path{v.base_log}.filename().string();
+    read_base_names.insert(base_name);
+    if (!v.cap_sign.empty() || !v.hard_sign.empty() ||
+        !log.segment_refusal.empty() || log.gap.has_value() || log.truncated ||
+        !exited.contains(v.base_log)) {
+      dirty_base_names.insert(base_name);
+    }
+  }
+  const auto is_clean_exited_base = [&](const std::string& log_path) {
+    const std::string name =
+        std::filesystem::path{log_path}.filename().string();
+    return read_base_names.contains(name) && !dirty_base_names.contains(name);
+  };
+  std::map<std::string, std::vector<std::size_t>> manifest_members_by_log;
+  for (std::size_t idx = 0; idx < manifest_info.nodes.size(); ++idx) {
+    const session_manifest::Member& member = manifest_info.nodes[idx];
+    const auto index_paths =
+        [&](const std::optional<std::vector<std::string>>& paths) {
+          if (!paths) return;
+          for (const std::string& p : *paths) {
+            auto& list = manifest_members_by_log
+                [std::filesystem::path{p}.filename().string()];
+            if (std::find(list.begin(), list.end(), idx) == list.end()) {
+              list.push_back(idx);
+            }
+          }
+        };
+    index_paths(member.log_paths);
+    index_paths(member.gap_logs);
+    index_paths(member.recorder_failed_logs);
+  }
+  const auto writer_member_complete = [&](const std::string& base_log) {
+    const std::string name =
+        std::filesystem::path{base_log}.filename().string();
+    const auto it = manifest_members_by_log.find(name);
+    if (it == manifest_members_by_log.end()) return true;
+    for (const std::size_t idx : it->second) {
+      const session_manifest::Member& member = manifest_info.nodes[idx];
+      if (member.log_capped || member.recorder_failed) return false;
+      if (member.log_gap &&
+          (!member.gap_logs.has_value() || member.gap_logs->empty()) &&
+          !member.log_paths.has_value()) {
+        return false;
+      }
+      if (member.log_paths) {
+        for (const std::string& p : *member.log_paths) {
+          if (!is_clean_exited_base(p)) return false;
+        }
+      }
+      if (member.gap_logs) {
+        for (const std::string& p : *member.gap_logs) {
+          if (!is_clean_exited_base(p)) return false;
+        }
+      }
+      if (member.recorder_failed_logs) {
+        for (const std::string& p : *member.recorder_failed_logs) {
+          if (!is_clean_exited_base(p)) return false;
+        }
+      }
+    }
+    return true;
+  };
   std::vector<bool> writer_complete(topics_.size(), false);
   for (std::size_t topic = 0; topic < topics_.size(); ++topic) {
-    if (watched_by_replayed[topic]) continue;
+    if (watched_by_replayed[topic] || has_unconsumed_incomplete) continue;
     bool has_writer = false;
     bool all_writers_complete = true;
     for (std::size_t i = 0; i < logs.size(); ++i) {
@@ -1185,7 +1271,8 @@ RecordedSession::RecordedSession(const std::string& path,
       const LogVerdict& v = verdicts[i];
       if (!v.cap_sign.empty() || !v.hard_sign.empty() ||
           !log.segment_refusal.empty() || log.gap.has_value() ||
-          log.truncated || !exited.contains(v.base_log)) {
+          log.truncated || !exited.contains(v.base_log) ||
+          !writer_member_complete(v.base_log)) {
         all_writers_complete = false;
         break;
       }

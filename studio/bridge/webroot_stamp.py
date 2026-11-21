@@ -25,6 +25,7 @@ import subprocess
 import sys
 
 FIXED_INPUTS = (
+    "studio/agent/rpc.ts",
     "studio/drive.html",
     "studio/index.html",
     "studio/package.json",
