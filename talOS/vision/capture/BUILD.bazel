@@ -21,6 +21,7 @@ objc_library(
         "Foundation",
     ],
     target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//talOS/vision/capture:__pkg__"],
     deps = [
         "//talOS/events:events_core",
         "//talOS/events:events_os",
@@ -44,15 +45,7 @@ cc_library(
         "@platforms//os:macos": ["Info.plist"],
         "//conditions:default": [],
     }),
-    linkopts = select({
-        "@platforms//os:macos": ["-Wl,-sectcreate,__TEXT,__info_plist,$(location Info.plist)"],
-        "//conditions:default": [],
-    }),
-    deps = [
-        "//talOS/events:events_core",
-        "//talOS/vision:camera_source",
-        "//talOS/vision:frame",
-    ] + select({
+    implementation_deps = select({
         "@platforms//os:macos": [":avfoundation"],
         "@platforms//os:linux": [
             "//talOS/events:events_os",
@@ -61,6 +54,15 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
+    linkopts = select({
+        "@platforms//os:macos": ["-Wl,-sectcreate,__TEXT,__info_plist,$(location Info.plist)"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/vision:camera_source",
+        "//talOS/vision:frame",
+    ],
 )
 
 cc_test(

@@ -176,6 +176,7 @@ FORBIDDEN_NODE_DEPS = (
     "talOS/introspection:registry",
     "talOS/introspection:reporter",
     "talOS/launcher:launcher_lib",
+    "talOS/simulation:schedules",
 )
 FORBIDDEN_NODE_DEPS_EXCLUDE = ("talOS/node:node",)
 
@@ -203,6 +204,8 @@ RESTRICTED_INTERNAL_TARGETS = (
     "talOS/introspection:registry",
     "talOS/introspection:reporter",
     "talOS/launcher:launcher_lib",
+    "talOS/simulation:schedules",
+    "talOS/vision/capture:avfoundation",
 )
 # Hardware wire and raw IPC targets: never //visibility:public, and not visible
 # to any node package except WIRE_CLI_PACKAGES (which host standalone dev CLIs).
@@ -327,14 +330,21 @@ FORBIDDEN_INCLUDE_EXACT = frozenset({
     "talOS/node/access.h",
     "talOS/node/internal.h",
     "talOS/devices/access.h",
+    "talOS/hardware/config_wire.h",
+    "talOS/hardware/endpoint.h",
+    "talOS/hardware/gateway.h",
     "talOS/hardware/messages.h",
     "talOS/hardware/packet.h",
+    "talOS/hardware/sim_backend.h",
+    "talOS/hardware/sim_physics.h",
     "talOS/events/event_loop_base.h",
+    "talOS/events/handles.h",
     "talOS/events/input_replay.h",
     "talOS/events/realtime_event_loop.h",
     "talOS/events/replay_event_loop.h",
     "talOS/events/simulated_event_loop.h",
     "talOS/events/wake_channel_wait.h",
+    "talOS/simulation/schedules.h",
     "talOS/telemetry/channels.h",
     "talOS/telemetry/node.h",
     "talOS/teleop/node.h",

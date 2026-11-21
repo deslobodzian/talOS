@@ -914,6 +914,8 @@ command_timeout_us = 100000
 [subsystems.triple_slash]
 [subsystems.bytes_double]
 [subsystems.dot]
+[subsystems.hashed_shm.remap]
+state = "/~deadbeef12345678"
 [subsystems.remapped.remap]
 state = "/hw/request/remapped"
 [subsystems.remapped_double.remap]
@@ -931,6 +933,7 @@ can_id = 1
   EXPECT_THROW(sim.add<DoubleSlashByteRequest>("bytes_double"),
                std::invalid_argument);
   EXPECT_THROW(sim.add<DotCollisionRequest>("dot"), std::invalid_argument);
+  EXPECT_THROW(sim.add<RemappedRequest>("hashed_shm"), std::invalid_argument);
   EXPECT_THROW(sim.add<RemappedRequest>("remapped"), std::invalid_argument);
   EXPECT_THROW(sim.add<RemappedRequest>("remapped_double"),
                std::invalid_argument);

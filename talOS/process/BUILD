@@ -5,11 +5,9 @@ cc_library(
     name = "process",
     srcs = ["process.cc"],
     hdrs = ["process.h"],
+    implementation_deps = ["//talOS/memory:residency"],
     visibility = ["//visibility:public"],
-    deps = [
-        ":realtime_outcome",
-        "//talOS/memory:residency",
-    ],
+    deps = [":realtime_outcome"],
 )
 
 # The loop tier and ConfigureRealtime's outcome, without the code that applies
