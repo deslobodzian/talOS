@@ -143,10 +143,11 @@ struct RecordedMessage {
 // `<stem>.segment<k>.tlog` belongs to, or the session manifest's
 // `log_capped` for its member: its oldest segment deleted, which may have
 // held a GAP record, or capture stopped at the cap), and a run's log without
-// its EXIT record of a member the manifest marks `log_gap` or
-// `recorder_failed`, whose gap that run's end may have cut short before its
-// GAP record was written, or whose recorder failed (a disk error ends
-// capture with no GAP record). A run's
+// its EXIT record that the manifest marks in `gap_logs` or
+// `recorder_failed_logs` (or, for legacy manifests without those arrays, any
+// run of a member marked `log_gap` or `recorder_failed`), whose gap that run's
+// end may have cut short before its GAP record was written, or whose recorder
+// failed (a disk error ends capture with no GAP record). A run's
 // log with its EXIT holds a GAP record for every gap (LogWriter::gaps) and
 // is judged by them. Each topic notes the first such log it is fed from
 // (refused_log), which ReplayInputs refuses, as it does a damaged stretch
@@ -159,8 +160,9 @@ struct RecordedMessage {
 // `manifest.json` in the directory holding the logs
 // (talOS/launcher/README.md, "Session manifest"), used when its session_id
 // is the logs'; it names a member's logs by the paths they were recorded at
-// (`nodes[].log_paths`), matched here by file name, so a session read from
-// another directory still matches. Logs with no such
+// (`nodes[].log_paths`, `nodes[].gap_logs`, `nodes[].recorder_failed_logs`),
+// matched here by file name, so a session read from another directory still
+// matches. Logs with no such
 // manifest beside them (a directory outside a launcher session, another
 // session's manifest) are judged by their `.capped` markers and segment
 // continuity alone.

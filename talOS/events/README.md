@@ -450,11 +450,14 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   its member, shows it. Neither has a gap that its run's end cut short, nor
   the tail a failed recorder lost (a disk error ends capture with no GAP
   record): a writer that reached its `EXIT` wrote a GAP record for every gap
-  (`LogWriter::gaps`), so of a member the manifest marks `log_gap` or
-  `recorder_failed`
-  ([session manifest](../launcher/README.md#session-manifest)), a run's log
-  without its `EXIT` record is suspect and one with it is judged by its GAP
-  records. A rotated log that lost a segment without a marker is suspect too:
+  (`LogWriter::gaps`), so a run's log without its `EXIT` record that the
+  manifest names in `gap_logs` or `recorder_failed_logs` (or, for legacy
+  manifests without those arrays, any run of a member marked `log_gap` or
+  `recorder_failed`;
+  [session manifest](../launcher/README.md#session-manifest)) is suspect and
+  one with its `EXIT` is judged by its GAP records. A clean run without `EXIT`
+  is not refused merely because another run of the same member had a gap or
+  recorder failure (or a failed spawn, which has no log). A rotated log that lost a segment without a marker is suspect too:
   a missing first segment (caught when a later numbered segment remains, or
   when only the unnumbered active file remains and its first intact record
   before any loss has `dispatch_index > 1`; without a segment index in
@@ -510,7 +513,8 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   A capped log that kept its first segment (capture stopped at the cap) still
   gives the run start. `RecordedSession` reads the
   `manifest.json` in the directory holding the logs when its `session_id` is
-  the logs', and matches a member's `log_paths` to the logs by file name, so
+  the logs', and matches a member's `log_paths`, `gap_logs` and
+  `recorder_failed_logs` to the logs by file name, so
   a session copied elsewhere still matches; logs without one (outside a
   launcher session) are judged by their `.capped` markers and segment
   continuity alone. A manifest

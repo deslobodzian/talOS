@@ -265,8 +265,13 @@ class Launcher {
     RunLiveness liveness;
     LivenessLimits limits{};
     bool heartbeat_killed{false};
-    // Event log flags of its registry rows already reported (NoteRecording).
+    // Event log flags of its registry rows already reported on stderr
+    // (NoteRecording, once per member and kind).
     uint32_t recording_reported{0};
+    // Whether this run already recorded kFlagRecorderFailed into
+    // proc.recorder_failed_logs (cleared by NewRun so a later run's failure is
+    // still recorded per run even after recording_reported suppressed stderr).
+    bool run_recorder_failed{false};
     // This run's realtime outcome was seen in its row (NoteRealtime).
     bool realtime_reported{false};
     // This run's loop has started: its registry row was seen active without

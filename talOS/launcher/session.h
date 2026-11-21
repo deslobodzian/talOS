@@ -209,8 +209,17 @@ struct NodeProcessInfo {
   // gapped log is incomplete evidence). Returns whether `log` was not named
   // before, so each gapped run's log gets its one line.
   bool RecordLogGap(const std::string& log);
-  // The logs RecordLogGap has named. Not in the manifest.
+  // The logs RecordLogGap has named, serialized as `gap_logs`.
   std::vector<std::string> gap_logs;
+
+  // Marks the run whose event log is `log` as having failed recording
+  // (live kFlagRecorderFailed, or damaged/unreadable at shutdown; not
+  // SpawnFailed which has no log). Sets `failed` and adds non-empty `log`
+  // once. Returns whether `failed` or `recorder_failed_logs` changed.
+  bool RecordRecorderFailure(const std::string& log);
+  // The logs RecordRecorderFailure has named, serialized as
+  // `recorder_failed_logs`.
+  std::vector<std::string> recorder_failed_logs;
 
   // Every run, first first, capped at kMaxRecordedRuns: the first run and
   // the newest; `runs_dropped` counts the ones between that were dropped.

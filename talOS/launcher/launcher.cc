@@ -314,14 +314,14 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
         try {
           const auto summary = event::log::SummarizeLog(file);
           proc.record_count += summary.record_count;
-          if (!summary.damage.clean()) proc.failed = true;
+          if (!summary.damage.clean()) proc.RecordRecorderFailure(path);
           if (summary.gaps > 0) gapped = true;
         } catch (const event::log::IncompleteLogHeader& e) {
           // Cut while it was being created: no records to count.
           ConsoleLine(std::cerr)
               << "[launcher] skipping " << file << ": " << e.what() << "\n";
         } catch (...) {
-          proc.failed = true;
+          proc.RecordRecorderFailure(path);
         }
       }
       // A gap the live row did not show (a reporter that never sampled it)
@@ -1520,6 +1520,7 @@ void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
   endpoints_checked = false;
   realtime_reported = false;
   loop_started = false;
+  run_recorder_failed = false;
 }
 
 void Launcher::SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -1636,10 +1637,18 @@ bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
   const bool gap =
       (flags & introspect::kFlagLogGap) != 0 && proc.RecordLogGap(log);
   if (gap) PrintLogGap(proc.name, log);
+  // Once per run: record this run's log in recorder_failed_logs independently
+  // of the per-member stderr-once flags in recording_reported.
+  bool changed = gap;
+  if ((flags & introspect::kFlagRecorderFailed) != 0 &&
+      !launch.run_recorder_failed) {
+    launch.run_recorder_failed = true;
+    if (proc.RecordRecorderFailure(log)) changed = true;
+  }
   const uint32_t fresh =
       flags & ~launch.recording_reported &
       (introspect::kFlagRecorderFailed | introspect::kFlagLogCapped);
-  if (fresh == 0) return gap;
+  if (fresh == 0) return changed;
   launch.recording_reported |= fresh;
   if ((fresh & introspect::kFlagRecorderFailed) != 0) {
     proc.failed = true;

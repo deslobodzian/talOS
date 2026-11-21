@@ -1005,8 +1005,10 @@ the time, and the launcher exits 1 with it. A log it would be fed from that
 may have lost records no GAP record marks is refused before the node runs,
 naming the log and the sign, and the launcher exits 1: one with a
 `<log>.capped` marker or of a member the session manifest marks
-`log_capped`, a run's log without its EXIT record of a member it marks
-`log_gap` or `recorder_failed` ([session manifest](#session-manifest)), one
+`log_capped`, a run's log without its EXIT record named in the manifest's
+`gap_logs` or `recorder_failed_logs` (or, for legacy manifests without those
+arrays, any run of a member marked `log_gap` or `recorder_failed`;
+[session manifest](#session-manifest)), one
 with a missing or incomplete-header segment (including a missing first segment
 without a marker when a later numbered segment remains or the unnumbered active
 file's first intact record has `dispatch_index > 1`, or a segment missing
@@ -1134,8 +1136,14 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   version the launcher posts anyway, at the latest the one the run's end
   posts, so a healthy session adds no version, and a killed launcher loses
   only the increases after a count's first.
-- per node, `recorder_failed`, `log_gap` and `log_capped`: what its runs'
-  event logs lost ([restarts](#restarts)).
+- per node, `recorder_failed`, `recorder_failed_logs`, `log_gap`, `gap_logs`
+  and `log_capped`: what its runs' event logs lost ([restarts](#restarts)).
+  `gap_logs` and `recorder_failed_logs` list the per-run event log paths that
+  suffered a gap or a recording failure (live `kFlagRecorderFailed`, or
+  damaged/unreadable at shutdown; a failed spawn sets `recorder_failed` without
+  adding a log path), so input replay scopes missing-`EXIT` refusals to the
+  affected run(s) while falling back to member-wide marks on legacy manifests
+  without those arrays.
 - on `studio_bridge`, `http_port`: the HTTP port the bridge bound (captured
   from its `listening <port>` line); absent for other members and until the
   bridge reports it.
