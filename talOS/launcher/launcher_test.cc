@@ -1563,11 +1563,12 @@ TEST(LauncherGraphTest, ASimulatorPortWrittenByHandIsRefusedBeforeAnyProbe) {
 // A config whose `[robot] simulation_only = true` (here set by
 // a simulation config that includes the deployable fixture) runs only with
 // --sim. Without it the launch is refused before any member is probed or
-// spawned and before any session directory exists; with --sim it runs, and
-// --describe-only, which touches no hardware, lints it. --describe-as-launch
-// makes --describe-only refuse it as the launch would (deploy.sh's install
-// check, which judges what the boot service will start), and is refused
-// without --describe-only, where it would start the roster.
+// spawned and before any session directory exists, naming both
+// `simulation_only` and the config path; with --sim it runs, and
+// --describe-only and --replay-inputs, which touch no hardware, are allowed.
+// --describe-as-launch makes --describe-only refuse it as the launch would
+// (deploy.sh's install check, which judges what the boot service will start),
+// and is refused without --describe-only, where it would start the roster.
 // REQ-SAFE-40, REQ-OPS-50
 TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
   struct Row {
@@ -1575,19 +1576,26 @@ TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
     bool simulation;
     bool describe_only;
     bool as_launch;
+    bool replay_inputs;
     bool refused;
+    bool names_simulation_only;
   };
   for (const Row row :
-       {Row{"launch", false, false, false, true},
-        Row{"--sim", true, false, false, false},
-        Row{"--describe-only", false, true, false, false},
-        Row{"--describe-only --describe-as-launch", false, true, true, true},
+       {Row{"launch", false, false, false, false, true, true},
+        Row{"--sim", true, false, false, false, false, false},
+        Row{"--describe-only", false, true, false, false, false, false},
+        Row{"--replay-inputs", false, false, false, true, false, false},
+        Row{"--describe-only --describe-as-launch", false, true, true, false,
+            true, true},
         Row{"--sim --describe-only --describe-as-launch", true, true, true,
-            false},
-        Row{"--sim --describe-as-launch", true, false, true, true}}) {
+            false, false, false},
+        Row{"--sim --describe-as-launch", true, false, true, false, true,
+            false}}) {
     SCOPED_TRACE(row.name);
     const std::string invoked = TempPath("simulation_only_invoked");
     ::remove(invoked.c_str());
+    const std::string recorded = TempPath("simulation_only_recorded");
+    std::filesystem::remove_all(recorded);
     GraphFixture fixture{
         "simulation_only",
         RecordingStub("alpha", "//example/alpha:node", invoked),
@@ -1603,14 +1611,31 @@ TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
     fixture.options.simulation = row.simulation;
     fixture.options.describe_only = row.describe_only;
     fixture.options.describe_as_launch = row.as_launch;
+    if (row.replay_inputs) {
+      std::filesystem::create_directories(recorded);
+      std::ofstream{recorded + "/manifest.json"} << "{}\n";
+      fixture.options.replay_inputs = recorded;
+      fixture.options.only = "alpha";
+    }
 
-    EXPECT_EQ(Launcher{fixture.options}.Run(), row.refused ? 1 : 0);
+    ::testing::internal::CaptureStderr();
+    const int status = Launcher{fixture.options}.Run();
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(status, row.refused ? 1 : 0) << err;
     EXPECT_EQ(std::filesystem::exists(invoked), !row.refused)
         << ReadFile(invoked);
     EXPECT_EQ(std::filesystem::exists(fixture.out_dir), !row.refused)
         << fixture.out_dir;
+    if (row.names_simulation_only) {
+      EXPECT_NE(err.find("simulation_only"), std::string::npos) << err;
+      EXPECT_NE(
+          err.find(std::filesystem::weakly_canonical(sim_config).string()),
+          std::string::npos)
+          << err;
+    }
     ::remove(invoked.c_str());
     ::remove(sim_config.c_str());
+    std::filesystem::remove_all(recorded);
   }
 }
 
@@ -1678,6 +1703,92 @@ TEST(LauncherGraphTest, AnOptOutTheProbeDidNotDescribeIsAnEndpointMismatch) {
   EXPECT_NE(hidden.find("/hw/request/alpha"), std::string::npos) << hidden;
   EXPECT_NE(hidden.find("untargeted_outputs"), std::string::npos) << hidden;
   EXPECT_EQ(EndpointMismatch({opted_out}, {opted_out}), "");
+}
+
+// REQ-SAFE-42: a node calling AllowUntargetedOutputs marks its hardware request
+// endpoint with kSourceFlagUntargetedOutputs in its live registry row, which
+// RegistryReader surfaces on `/hw/request/<node>` (while a targeted actuator
+// node's row carries only kSourceFlagHardwareRequest).
+TEST(LauncherGraphTest, LiveRegistryRowCarriesUntargetedOutputsOnHardwareReq) {
+  const std::string path = "/talos_reg_uout_" + std::to_string(::getpid());
+  introspect::RegistryMapping::unlink(path);
+
+  const auto make_manifest = [](std::string topic) {
+    event::Manifest manifest;
+    event::Registration reg;
+    reg.id = 1;
+    reg.kind = event::SourceKind::SENDER;
+    reg.name = std::move(topic);
+    reg.message_bytes = 64;
+    reg.alignment = 8;
+    manifest.push_back(std::move(reg));
+    return manifest;
+  };
+
+  introspect::NodeRegistration opted_out_reg{
+      {.name = "alpha", .target = "//example/alpha:node", .session_id = 42},
+      path};
+  opted_out_reg.publish(
+      make_manifest("/hw/request/alpha"),
+      std::vector<introspect::EndpointAttribute>{
+          {"/hw/request/alpha",
+           introspect::naming::kSourceFlagHardwareRequest |
+               introspect::naming::kSourceFlagUntargetedOutputs}});
+
+  introspect::NodeRegistration targeted_reg{
+      {.name = "beta", .target = "//example/beta:node", .session_id = 42},
+      path};
+  targeted_reg.publish(make_manifest("/hw/request/beta"),
+                       std::vector<introspect::EndpointAttribute>{
+                           {"/hw/request/beta",
+                            introspect::naming::kSourceFlagHardwareRequest}});
+
+  const auto reader = introspect::RegistryReader::open(path);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  const auto find_source =
+      [&](std::string_view node_name,
+          std::string_view topic) -> const introspect::SourceSnapshot* {
+    for (const auto& node : nodes) {
+      if (node.name != node_name) continue;
+      for (const auto& src : node.sources) {
+        if (src.name == topic) return &src;
+      }
+    }
+    return nullptr;
+  };
+
+  const auto* alpha_req = find_source("alpha", "/hw/request/alpha");
+  ASSERT_NE(alpha_req, nullptr);
+  EXPECT_NE(alpha_req->flags & introspect::naming::kSourceFlagHardwareRequest,
+            0u);
+  EXPECT_NE(alpha_req->flags & introspect::naming::kSourceFlagUntargetedOutputs,
+            0u);
+
+  const auto* beta_req = find_source("beta", "/hw/request/beta");
+  ASSERT_NE(beta_req, nullptr);
+  EXPECT_NE(beta_req->flags & introspect::naming::kSourceFlagHardwareRequest,
+            0u);
+  EXPECT_EQ(beta_req->flags & introspect::naming::kSourceFlagUntargetedOutputs,
+            0u);
+
+  // Confirm the live row's flags participate in endpoint comparison as
+  // Launcher::CheckEndpoints converts them.
+  introspect::naming::SourceShape live_alpha{alpha_req->kind, alpha_req->name,
+                                             alpha_req->message_bytes,
+                                             alpha_req->flags};
+  live_alpha.alignment = alpha_req->alignment;
+  auto described_targeted = Sender("/hw/request/alpha", 64);
+  described_targeted.flags = introspect::naming::kSourceFlagHardwareRequest;
+  auto described_opted_out = described_targeted;
+  described_opted_out.flags |= introspect::naming::kSourceFlagUntargetedOutputs;
+  EXPECT_EQ(EndpointMismatch({described_opted_out}, {live_alpha}), "");
+  const std::string mismatch =
+      EndpointMismatch({described_targeted}, {live_alpha});
+  EXPECT_NE(mismatch.find("/hw/request/alpha"), std::string::npos) << mismatch;
+  EXPECT_NE(mismatch.find("untargeted_outputs"), std::string::npos) << mismatch;
+
+  introspect::RegistryMapping::unlink(path);
 }
 
 // SPEC-10 / REQ-SAFE-42, REQ-CONTRACT-11: the launcher passes
@@ -2219,6 +2330,60 @@ TEST(LauncherGraphTest,
         DiscoverNodes(parsed, fixture.options), fixture.options, described)))
         << section;
     ASSERT_TRUE(described.at(1).answered);
+  }
+}
+
+// REQ-SAFE-28: full Launcher::Run() refuses to launch (exits non-zero, writes
+// no manifest, spawns nothing) when a critical = false subsystem owns a motor,
+// digital output, or PWM output, or describes a target-lane sender.
+TEST(LauncherGraphTest, NonCriticalActuatorOrTargetProducerRefusesLaunch) {
+  for (const auto* section : {"motors", "digital_outputs", "pwm_outputs"}) {
+    SCOPED_TRACE(section);
+    GraphFixture fixture{"optional_actuator_run",
+                         DescribingStub("alpha", "//example/alpha:node", {}),
+                         DescribingStub("beta", "//example/beta:node", {})};
+    auto config = toml::parse_file(fixture.options.config_path);
+    auto* alpha = config["subsystems"]["alpha"].as_table();
+    alpha->erase("motors");
+    alpha->insert_or_assign("critical", false);
+    toml::table device;
+    device.insert(section == std::string_view{"motors"}            ? "can_id"
+                  : section == std::string_view{"digital_outputs"} ? "dio"
+                                                                   : "channel",
+                  1);
+    alpha->insert_or_assign(section,
+                            toml::table{{"output", std::move(device)}});
+    std::ofstream{fixture.options.config_path} << config;
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1) << section;
+    EXPECT_FALSE(fixture.has_manifest()) << section;
+    EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),
+              std::string::npos)
+        << fixture.graph_json();
+  }
+
+  {
+    SCOPED_TRACE("non_critical_target_producer");
+    GraphFixture fixture{"optional_target_run",
+                         DescribingStub("alpha", "//example/alpha:node",
+                                        {Sender("/beta/target/teleop")}),
+                         DescribingStub("beta", "//example/beta:node",
+                                        {Watcher("/beta/target/teleop")})};
+    auto config = toml::parse_file(fixture.options.config_path);
+    auto* alpha = config["subsystems"]["alpha"].as_table();
+    alpha->erase("motors");
+    alpha->insert_or_assign("critical", false);
+    auto* beta = config["subsystems"]["beta"].as_table();
+    toml::table targets;
+    targets.insert("teleop", toml::array{"teleop"});
+    beta->insert_or_assign("targets", std::move(targets));
+    std::ofstream{fixture.options.config_path} << config;
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(fixture.has_manifest());
+    EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),
+              std::string::npos)
+        << fixture.graph_json();
   }
 }
 

@@ -353,7 +353,7 @@ TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
 // one error on that topic. The bridge is its roster slot, not its name: a
 // replacement bridge binary may call itself anything, and a node calling
 // itself hardware_node gains nothing.
-// REQ-CONTRACT-09
+// REQ-CONTRACT-09, REQ-SAFE-27
 TEST(LintGraph, OnlyTheBridgeAndEachNodesFlushWriteTheHwNamespace) {
   struct Case {
     const char* writer;

@@ -209,6 +209,14 @@ std::vector<std::string> ManifestRuns(const std::string& manifest,
   return out;
 }
 
+// The integer `key` of a member's manifest object (ManifestEntry), or -1.
+int64_t EntryInteger(const std::string& entry, std::string_view key) {
+  const std::string name = "\"" + std::string{key} + "\": ";
+  const std::size_t at = entry.find(name);
+  if (at == std::string::npos) return -1;
+  return std::strtoll(entry.c_str() + at + name.size(), nullptr, 10);
+}
+
 LauncherOptions ConstructionOptions(std::string_view tag, int delay_ms) {
   auto options = BaseOptions(tag);
   options.max_restarts = 0;
@@ -1258,6 +1266,7 @@ constexpr std::string_view kRunUntilStopped =
 // RequestedStopDoesNotRestartCleanExits's; the session deadline takes the
 // same path: its pass sends the stop (stop_sent) before any member can
 // react, so every later exit is reaped with the session stopping.
+// REQ-SAFE-29
 TEST(Supervision, CriticalCleanExitRestarts) {
   auto options = BaseOptions("clean_exit");
   options.duration_s = kHangSeconds;
@@ -2009,7 +2018,99 @@ TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   ::remove(beta_runs.c_str());
 }
 
+// A critical member (here alpha, an actuator owner) that crashes repeatedly
+// past max_restarts is never quarantined: it keeps restarting on the capped
+// backoff, its manifest entry stays quarantined: false with restart_count past
+// max_restarts, and each crashed run records reason "crash".
+// REQ-SAFE-29
+TEST(Supervision, CriticalMemberCrashesPastMaxRestartsWithoutQuarantine) {
+  LauncherOptions options =
+      BaseOptions("critical_restart_loop", "max_restarts = 2\n");
+  options.duration_s = kHangSeconds;
+  options.heartbeat_startup_grace_ms = 60'000;
+  testing::SteppedClock clock;
+  clock.Freeze();
+  options.supervision_clock = clock.clock();
+  const std::string alpha_runs = TempPath("critical_loop_alpha_runs");
+  ::remove(alpha_runs.c_str());
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("critical_loop_hardware", kRunUntilStopped, "hardware_node");
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "critical_loop_alpha", RecordLogArgThen(alpha_runs, "exit 3\n"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("critical_loop_beta", kRunUntilStopped);
+
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  constexpr std::size_t kTargetRuns = 5;  // 4 restarts, past max_restarts = 2.
+  bool reached_past_limit = false;
+  bool ever_quarantined = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    for (std::size_t run = 1; run <= kTargetRuns; ++run) {
+      int64_t retry_at = 0;
+      const bool crashed = WaitFor(stop, [&] {
+        const std::string manifest = ReadFile(live);
+        const std::string entry = ManifestEntry(manifest, "alpha");
+        if (entry.find("\"quarantined\": true") != std::string::npos) {
+          ever_quarantined = true;
+        }
+        const auto history = ManifestRuns(manifest, "alpha");
+        if (history.size() < run ||
+            history[run - 1].find("\"reason\": \"crash\"") ==
+                std::string::npos) {
+          return false;
+        }
+        if (history.size() > run) return true;
+        retry_at = EntryInteger(entry, "retry_at_monotonic_ns");
+        return retry_at > 0;
+      });
+      if (!crashed) break;
+      if (run == kTargetRuns) {
+        reached_past_limit = true;
+        break;
+      }
+      if (retry_at > 0) {
+        clock.HoldAt(SupervisionTime{std::chrono::nanoseconds{retry_at}});
+      }
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  EXPECT_NE(RunSession(options), 0);
+  driver.request_stop();
+  driver.join();
+
+  ASSERT_TRUE(reached_past_limit)
+      << "critical alpha did not keep restarting past max_restarts = 2";
+  EXPECT_FALSE(ever_quarantined) << "critical alpha must never be quarantined";
+  const std::string dir = options.output_dir;
+  const auto recorded = ReadLines(alpha_runs);
+  ASSERT_GE(recorded.size(), kTargetRuns);
+  EXPECT_EQ(recorded[0], dir + "/alpha.tlog");
+  for (std::size_t i = 1; i < kTargetRuns; ++i) {
+    EXPECT_EQ(recorded[i],
+              dir + "/alpha.restart" + std::to_string(i) + ".tlog");
+  }
+  const std::string manifest = ReadFile(dir + "/manifest.json");
+  const std::string alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_GE(EntryInteger(alpha, "restart_count"),
+            static_cast<int64_t>(kTargetRuns - 1))
+      << alpha;
+  EXPECT_NE(alpha.find("\"quarantined\": false"), std::string::npos) << alpha;
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_GE(history.size(), kTargetRuns) << manifest;
+  for (std::size_t i = 0; i < kTargetRuns; ++i) {
+    EXPECT_NE(history[i].find("\"reason\": \"crash\""), std::string::npos)
+        << "run " << i << ": " << history[i];
+  }
+
+  std::filesystem::remove_all(dir);
+  ::remove(alpha_runs.c_str());
+}
+
 // --max-restarts 0 wins over the config and disables restarts.
+// REQ-SAFE-29
 TEST(Supervision, MaxRestartsZeroDisablesRestarts) {
   LauncherOptions options = BaseOptions("norestart_out", "max_restarts = 4\n");
   options.max_restarts = 0;
@@ -2899,6 +3000,7 @@ std::jthread PublishStubRow(const LauncherOptions& options,
 // A loop blocked inside the node while its reporting thread still heartbeats:
 // the dispatch count, which only the loop moves, stops, and the launcher kills
 // the run as stalled and restarts it.
+// REQ-SAFE-29, REQ-OPS-05
 TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
   auto options = BaseOptions("stalled_out", "max_restarts = 1\n");
   options.heartbeat_startup_grace_ms = 0;
@@ -3372,14 +3474,6 @@ TEST(Supervision, StudioBridgeRestartAloneWakesTheLoop) {
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
   ::remove(attempts.c_str());
-}
-
-// The integer `key` of a member's manifest object (ManifestEntry), or -1.
-int64_t EntryInteger(const std::string& entry, std::string_view key) {
-  const std::string name = "\"" + std::string{key} + "\": ";
-  const std::size_t at = entry.find(name);
-  if (at == std::string::npos) return -1;
-  return std::strtoll(entry.c_str() + at + name.size(), nullptr, 10);
 }
 
 // A Studio bridge stub's body: once its stop trap is set, appends its pid
