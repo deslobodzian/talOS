@@ -330,17 +330,19 @@ struct DriveRosterEntry {
 // The drive summary. Its nodes are the launcher's roster as its manifest
 // (`manifest_json`, empty when there is none) lists them, in that order:
 // every member it supervises (the sim gateway and the Studio bridge
-// included), with `restarts` and `quarantined` from each entry and `critical`
-// from `config` by name (false for the launcher-added Studio bridge, true for
-// other members the config does not list, such as the sim gateway). Without a
-// manifest, or one listing no member yet, they are `config`'s nodes in its
-// order. `alive` and `drives` come from the live registry's rows of that name
-// (`registry`; nullptr when it could not be read, and the summary then says
-// `registry: false` rather than every node dead as a fact); when the registry
-// is readable, the launcher-added Studio bridge is always alive because it is
-// serving this summary. A manifest that does not parse is treated as absent,
-// so the summary says `supervised: false` rather than zero restarts as a fact;
-// the session then comes from the registry.
+// included), with `restarts`, `quarantined`, `critical` and `studio_bridge`
+// from each entry. On legacy manifests lacking `studio_bridge` or `critical`,
+// `studio_bridge` falls back to `name == kStudioBridgeNodeName` not listed in
+// `config`, and `critical` falls back to `config` by name (else
+// `!is_studio_bridge`). Without a manifest, or one listing no member yet, they
+// are `config`'s nodes in its order. `alive` and `drives` come from the live
+// registry's rows of that name (`registry`; nullptr when it could not be read,
+// and the summary then says `registry: false` rather than every node dead as a
+// fact); when the registry is readable, the launcher-added Studio bridge
+// (`is_studio_bridge`) is always alive because it is serving this summary. A
+// manifest that does not parse is treated as absent, so the summary says
+// `supervised: false` rather than zero restarts as a fact; the session then
+// comes from the registry.
 inline DriveSummary BuildDriveSummary(
     const std::vector<DriveRosterEntry>& config,
     const std::vector<talos::introspect::NodeSnapshot>* registry,
@@ -370,10 +372,12 @@ inline DriveSummary BuildDriveSummary(
       }
     }
   }
+  std::vector<bool> studio_bridge_flags;
   if (summary.supervised && manifest.contains("nodes") &&
       manifest["nodes"].is_array()) {
     const auto& members = manifest["nodes"];
     summary.nodes.reserve(members.size());
+    studio_bridge_flags.reserve(members.size());
     for (const auto& row : members) {
       if (!row.is_object() || !row.contains("name") ||
           !row["name"].is_string()) {
@@ -385,10 +389,16 @@ inline DriveSummary BuildDriveSummary(
                                        [&node](const DriveRosterEntry& entry) {
                                          return entry.name == node.name;
                                        });
-      if (listed != config.end()) {
+      const bool is_studio_bridge =
+          row.contains("studio_bridge") && row["studio_bridge"].is_boolean()
+              ? row["studio_bridge"].get<bool>()
+              : (node.name == kStudioBridgeNodeName && listed == config.end());
+      if (row.contains("critical") && row["critical"].is_boolean()) {
+        node.critical = row["critical"].get<bool>();
+      } else if (listed != config.end()) {
         node.critical = listed->critical;
       } else {
-        node.critical = node.name != kStudioBridgeNodeName;
+        node.critical = !is_studio_bridge;
       }
       if (row.contains("restart_count") &&
           row["restart_count"].is_number_unsigned()) {
@@ -398,10 +408,12 @@ inline DriveSummary BuildDriveSummary(
         node.quarantined = row["quarantined"].get<bool>();
       }
       summary.nodes.push_back(std::move(node));
+      studio_bridge_flags.push_back(is_studio_bridge);
     }
   }
   if (summary.nodes.empty()) {
     summary.nodes.reserve(config.size());
+    studio_bridge_flags.assign(config.size(), false);
     for (const DriveRosterEntry& entry : config) {
       DriveSummaryNode node;
       node.name = entry.name;
@@ -409,7 +421,8 @@ inline DriveSummary BuildDriveSummary(
       summary.nodes.push_back(std::move(node));
     }
   }
-  for (DriveSummaryNode& node : summary.nodes) {
+  for (std::size_t i = 0; i < summary.nodes.size(); ++i) {
+    DriveSummaryNode& node = summary.nodes[i];
     for (const auto& row : rows) {
       if (row.name != node.name || !row.alive) continue;
       node.alive = true;
@@ -421,11 +434,7 @@ inline DriveSummary BuildDriveSummary(
       }
       break;
     }
-    if (summary.registry && node.name == kStudioBridgeNodeName &&
-        std::none_of(config.begin(), config.end(),
-                     [&node](const DriveRosterEntry& entry) {
-                       return entry.name == node.name;
-                     })) {
+    if (summary.registry && studio_bridge_flags[i]) {
       node.alive = true;
     }
   }

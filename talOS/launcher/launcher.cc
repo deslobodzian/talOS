@@ -1211,6 +1211,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     NodeProcessInfo& proc = procs.emplace_back();
     proc.name = spec.name;
     proc.target = spec.target;
+    proc.critical = !spec.studio_bridge && spec.critical;
+    proc.studio_bridge = spec.studio_bridge;
     proc.binary_path = spec.binary_path;
     proc.binary_sha256 = FileSha256(spec.binary_path);
     // The launcher's gateway is started without --log, so it writes no
@@ -1298,8 +1300,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     studio->Start(procs[studio->index()], options_.supervision_clock);
   PersistManifest(procs);
 
-  Supervise(procs, launches, studio, sim_gateway_index, status_observer.get(),
-            deadline);
+  Supervise(manifest, procs, launches, studio, sim_gateway_index,
+            status_observer.get(), deadline);
   manifest.end_wall_ns = WallClockNanos();
   // Every run has been reaped and its group killed, so the pipes end.
   output_->Stop();
@@ -1935,7 +1937,8 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   return changed;
 }
 
-void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
+void Launcher::Supervise(SessionManifest& manifest,
+                         std::vector<NodeProcessInfo>& procs,
                          std::vector<NodeLaunch>& launches,
                          std::optional<StudioBridge>& studio,
                          std::optional<std::size_t> sim_gateway_index,
@@ -1984,6 +1987,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       if (session_lock_ != nullptr && !session_lock_->Refresh() &&
           !lock_lost_reported) {
         lock_lost_reported = true;
+        manifest.session_lock_lost = true;
+        session_manifest_.session_lock_lost = true;
+        manifest_changed = true;
         ConsoleLine(std::cerr)
             << "[launcher] the session lock " << session_lock_->path()
             << " was removed; a second launcher in this namespace "
@@ -1994,7 +2000,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       // and then hourly: between two tries a retention whose probe locks
       // again may remove this session, and on a network log root this flock
       // can block supervision and the watchdog ping (README "Session
-      // segments and logs"; TODO.md LOG-10).
+      // segments and logs").
       const Refreshed directory =
           session_directory_
               ? session_directory_->Refresh(options_.lock_session_directory)
@@ -2008,6 +2014,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       } else if (directory == Refreshed::kRetaken &&
                  !directory_lock_retaken_reported) {
         directory_lock_retaken_reported = true;
+        manifest.directory_lock_retaken = true;
+        session_manifest_.directory_lock_retaken = true;
+        manifest_changed = true;
         ConsoleLine(std::cerr)
             << "[launcher] " << session_directory_->path()
             << " was removed while this session held it; locked it "
@@ -2016,6 +2025,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       } else if (directory == Refreshed::kLost &&
                  !directory_lock_lost_reported) {
         directory_lock_lost_reported = true;
+        manifest.directory_lock_lost = true;
+        session_manifest_.directory_lock_lost = true;
+        manifest_changed = true;
         ConsoleLine(std::cerr)
             << "[launcher] " << session_directory_->path()
             << " was removed and cannot be locked again (retention "

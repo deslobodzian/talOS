@@ -40,6 +40,12 @@ export type ManifestDelivery = {
 export type ManifestNode = {
   name: string;
   target: string;
+  // Whether the launcher supervises this member as critical (absent in legacy
+  // manifests, so consumers do not mistake an absent key for non-critical).
+  critical?: boolean;
+  // Whether this member is the launcher-added Studio bridge (absent in legacy
+  // manifests).
+  studio_bridge?: boolean;
   binary_path: string;
   // Absent in manifests written before the launcher recorded them.
   binary_sha256?: string;
@@ -79,6 +85,10 @@ export type SessionManifest = {
   simulation: boolean;
   start_wall_ns: string;
   end_wall_ns: string;
+  // Lock anomalies recorded during supervision (absent in legacy manifests).
+  session_lock_lost?: boolean;
+  directory_lock_lost?: boolean;
+  directory_lock_retaken?: boolean;
   nodes: ManifestNode[];
 };
 
@@ -259,6 +269,9 @@ function parseNode(value: unknown, where: string): ManifestNode {
   return {
     name: str(source, 'name'),
     target: str(source, 'target'),
+    ...('critical' in source ? {critical: bool(source, 'critical')} : {}),
+    ...('studio_bridge' in source ?
+            {studio_bridge: bool(source, 'studio_bridge')} : {}),
     binary_path: path(source, 'binary_path'),
     ...('binary_sha256' in source ?
             {binary_sha256: str(source, 'binary_sha256')} : {}),
@@ -298,6 +311,12 @@ export function parseManifest(raw: string): SessionManifest {
       simulation: bool(source, 'simulation'),
       start_wall_ns: u64Field(raw, source, 'start_wall_ns'),
       end_wall_ns: u64Field(raw, source, 'end_wall_ns'),
+      ...('session_lock_lost' in source ?
+              {session_lock_lost: bool(source, 'session_lock_lost')} : {}),
+      ...('directory_lock_lost' in source ?
+              {directory_lock_lost: bool(source, 'directory_lock_lost')} : {}),
+      ...('directory_lock_retaken' in source ?
+              {directory_lock_retaken: bool(source, 'directory_lock_retaken')} : {}),
       nodes: list(source, 'nodes', MAX_NODES).map(
           (entry, i) => parseNode(entry, `nodes[${i}]`))
     };

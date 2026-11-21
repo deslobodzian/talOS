@@ -1189,6 +1189,71 @@ TEST(LauncherTest, ARefusedRealtimeGrantIsWarnedAndOutlivesALaterFullRun) {
       << json;
 }
 
+// REQ-OPS-11, REQ-OPS-30: SessionManifest::ToJson carries lock-loss/retake
+// flags and per-member `critical` and `studio_bridge`, and DiscoverNodes marks
+// the launcher-added Studio bridge `studio_bridge = true, critical = false`.
+TEST(LauncherTest, ManifestSerializesLockFlagsCriticalAndStudioBridge) {
+  SessionManifest defaults;
+  NodeProcessInfo critical_node;
+  critical_node.name = "drivetrain";
+  NodeProcessInfo bridge;
+  bridge.name = "studio_bridge";
+  bridge.critical = false;
+  bridge.studio_bridge = true;
+  defaults.nodes = {critical_node, bridge};
+
+  const std::string default_json = defaults.ToJson();
+  EXPECT_NE(default_json.find("\"session_lock_lost\": false"),
+            std::string::npos)
+      << default_json;
+  EXPECT_NE(default_json.find("\"directory_lock_lost\": false"),
+            std::string::npos)
+      << default_json;
+  EXPECT_NE(default_json.find("\"directory_lock_retaken\": false"),
+            std::string::npos)
+      << default_json;
+  const std::size_t dt_pos = default_json.find("\"name\": \"drivetrain\"");
+  const std::size_t br_pos = default_json.find("\"name\": \"studio_bridge\"");
+  ASSERT_NE(dt_pos, std::string::npos);
+  ASSERT_NE(br_pos, std::string::npos);
+  const std::string dt_slice = default_json.substr(dt_pos, br_pos - dt_pos);
+  const std::string br_slice = default_json.substr(br_pos);
+  EXPECT_NE(dt_slice.find("\"critical\": true"), std::string::npos) << dt_slice;
+  EXPECT_NE(dt_slice.find("\"studio_bridge\": false"), std::string::npos)
+      << dt_slice;
+  EXPECT_NE(br_slice.find("\"critical\": false"), std::string::npos)
+      << br_slice;
+  EXPECT_NE(br_slice.find("\"studio_bridge\": true"), std::string::npos)
+      << br_slice;
+
+  SessionManifest anomalous;
+  anomalous.session_lock_lost = true;
+  anomalous.directory_lock_lost = true;
+  anomalous.directory_lock_retaken = true;
+  const std::string anomalous_json = anomalous.ToJson();
+  EXPECT_NE(anomalous_json.find("\"session_lock_lost\": true"),
+            std::string::npos)
+      << anomalous_json;
+  EXPECT_NE(anomalous_json.find("\"directory_lock_lost\": true"),
+            std::string::npos)
+      << anomalous_json;
+  EXPECT_NE(anomalous_json.find("\"directory_lock_retaken\": true"),
+            std::string::npos)
+      << anomalous_json;
+
+  // DiscoverNodes marks the launcher-added Studio bridge non-critical.
+  LauncherOptions options;
+  options.start_studio_bridge = true;
+  const auto specs =
+      DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), options);
+  const auto it = std::find_if(specs.begin(), specs.end(), [](const auto& s) {
+    return s.name == kStudioBridgeName;
+  });
+  ASSERT_NE(it, specs.end());
+  EXPECT_TRUE(it->studio_bridge);
+  EXPECT_FALSE(it->critical);
+}
+
 TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
   const auto with_robot_keys = [](std::string_view keys) {
     std::string toml{kFixtureToml};

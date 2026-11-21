@@ -608,6 +608,70 @@ TEST(DriveSummary, BuildsFromLauncherManifestShape) {
   EXPECT_FALSE(unreadable.nodes[5].alive);
 }
 
+// REQ-OPS-30, REQ-OPS-35: BuildDriveSummary reads `studio_bridge` and
+// `critical` directly from the launcher manifest (avoiding name-matching when
+// present), and falls back to config / name-matching on legacy manifests.
+TEST(DriveSummary,
+     ReadsManifestCriticalAndStudioBridgeFlagsWithLegacyFallback) {
+  const std::vector<talos::introspect::NodeSnapshot> empty_registry;
+
+  // New manifest with explicit flags and an empty config:
+  // - launcher-added bridge (`studio_bridge: true`) is alive when registry is
+  //   readable and non-critical, even under a non-default name;
+  // - a robot subsystem named `studio_bridge` (`studio_bridge: false,
+  //   critical: true`) is NOT forced alive and stays critical;
+  // - an explicit `critical: false` subsystem is respected without config.
+  const std::string modern_manifest = R"({
+    "session_id": 99,
+    "nodes": [
+      {"name": "drivetrain", "critical": true, "studio_bridge": false,
+       "restart_count": 0, "quarantined": false},
+      {"name": "telemetry", "critical": false, "studio_bridge": false,
+       "restart_count": 0, "quarantined": false},
+      {"name": "studio_bridge", "critical": true, "studio_bridge": false,
+       "restart_count": 0, "quarantined": false},
+      {"name": "viewer_bridge", "critical": false, "studio_bridge": true,
+       "restart_count": 1, "quarantined": false}
+    ]
+  })";
+  const DriveSummary modern =
+      BuildDriveSummary(/*config=*/{}, &empty_registry, modern_manifest);
+  ASSERT_EQ(modern.nodes.size(), 4u);
+  EXPECT_TRUE(modern.nodes[0].critical);
+  EXPECT_FALSE(modern.nodes[0].alive);
+  EXPECT_FALSE(modern.nodes[1].critical);
+  EXPECT_FALSE(modern.nodes[1].alive);
+  EXPECT_EQ(modern.nodes[2].name, "studio_bridge");
+  EXPECT_TRUE(modern.nodes[2].critical)
+      << "a subsystem named studio_bridge with studio_bridge:false stays "
+         "critical";
+  EXPECT_FALSE(modern.nodes[2].alive)
+      << "a subsystem named studio_bridge with studio_bridge:false is not "
+         "forced alive";
+  EXPECT_EQ(modern.nodes[3].name, "viewer_bridge");
+  EXPECT_FALSE(modern.nodes[3].critical);
+  EXPECT_TRUE(modern.nodes[3].alive)
+      << "studio_bridge:true is alive when the registry is readable";
+
+  // Legacy manifest lacking `studio_bridge` and `critical` falls back to
+  // config lookup and the `studio_bridge` name heuristic.
+  const std::vector<DriveRosterEntry> config{{"intake", false}};
+  const std::string legacy_manifest = R"({
+    "session_id": 100,
+    "nodes": [
+      {"name": "intake", "restart_count": 0, "quarantined": false},
+      {"name": "studio_bridge", "restart_count": 0, "quarantined": false}
+    ]
+  })";
+  const DriveSummary legacy =
+      BuildDriveSummary(config, &empty_registry, legacy_manifest);
+  ASSERT_EQ(legacy.nodes.size(), 2u);
+  EXPECT_FALSE(legacy.nodes[0].critical);
+  EXPECT_FALSE(legacy.nodes[0].alive);
+  EXPECT_FALSE(legacy.nodes[1].critical);
+  EXPECT_TRUE(legacy.nodes[1].alive);
+}
+
 // REQ-OPS-35
 // A registry the bridge cannot open is said, `"registry":false` right
 // after `supervised`, so the page reads every `alive: false` as unknown
