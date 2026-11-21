@@ -46,11 +46,16 @@
 #include <thread>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
+#include "talOS/protocol/types.h"
 #include "talOS/rtms/process_liveness.h"
+#include "talOS/rtms/rtms.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::launcher {
 namespace {
@@ -4732,6 +4737,209 @@ TEST(Supervision, SimGatewayCrashAndRestartStillStartsSchedule) {
       EntryInteger(ManifestEntry(manifest, "sim_gateway"), "restart_count"), 2);
   std::filesystem::remove_all(options.output_dir);
   ::remove(gw_runs.c_str());
+}
+
+// Helper: writes a shell stub whose --describe output is `description`.
+std::string WriteDescribedStub(std::string_view tag,
+                               const introspect::Description& description,
+                               std::string_view body) {
+  const std::string path = TempPath(tag) + ".sh";
+  std::ostringstream out;
+  out << "#!/bin/sh\n"
+      << "for arg in \"$@\"; do\n"
+      << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+      << "    cat <<'TALOS_DESCRIBE'\n"
+      << introspect::DescribeToJson(description) << "TALOS_DESCRIBE\n"
+      << "    exit 0\n"
+      << "  fi\n"
+      << "done\n"
+      << body;
+  return testing::WriteWarmStub(path, out.str());
+}
+
+// LOG-16: DescribeGraph counts the launcher as +1 observer reader on /hw/status
+// when the bridge declares it, and Supervise opens /hw/status as an observer
+// reader using the bridge's declared shape, warning once per bridge run to
+// stderr + talos.log when protocol_version_id != protocol::kProtocolVersion
+// and re-warning after a bridge restart.
+// REQ-OPS-51
+TEST(Supervision, BridgeProtocolMismatchWarnsOncePerRunAndRewarnsOnRestart) {
+  const auto status_schema = talos::schema::Of<bridge::BridgeStatus>();
+  introspect::naming::SourceShape status_sender;
+  status_sender.kind = event::SourceKind::SENDER;
+  status_sender.name = std::string{bridge::topics::kStatus};
+  status_sender.message_bytes = sizeof(bridge::BridgeStatus);
+  status_sender.alignment = alignof(bridge::BridgeStatus);
+  status_sender.slots = MAX_SLOTS;
+  status_sender.schema = status_schema.name;
+  status_sender.schema_hash = status_schema.hash;
+  status_sender.bfbs = status_schema.bfbs;
+
+  introspect::Description bridge_desc;
+  bridge_desc.name = "hardware_node";
+  bridge_desc.target = "//talOS/bridge:hardware_node";
+  bridge_desc.sources.push_back(status_sender);
+
+  // Part 1: DescribeGraph counts the launcher's observer reader on /hw/status
+  // against MAX_READERS (32 other readers + 1 launcher = 33 -> error;
+  // 31 other readers + 1 launcher = 32 -> ok).
+  {
+    const auto has_reader_limit_error =
+        [](const std::vector<introspect::naming::Diagnostic>& diags) {
+          return std::any_of(diags.begin(), diags.end(), [](const auto& d) {
+            return d.severity == introspect::naming::Severity::ERROR &&
+                   d.subject == bridge::topics::kStatus &&
+                   d.message.find("reader limit") != std::string::npos;
+          });
+        };
+    const std::string bridge_bin =
+        WriteDescribedStub("proto_limit_hw", bridge_desc, "exit 0\n");
+    for (const std::size_t readers : {MAX_READERS - 1, MAX_READERS}) {
+      introspect::Description reader_desc;
+      reader_desc.name = "alpha";
+      reader_desc.target = "//example/alpha:node";
+      introspect::naming::SourceShape reader_shape = status_sender;
+      reader_shape.kind = event::SourceKind::FETCHER;
+      for (std::size_t i = 0; i < readers; ++i) {
+        reader_desc.sources.push_back(reader_shape);
+      }
+      const std::string alpha_bin =
+          WriteDescribedStub("proto_limit_alpha_" + std::to_string(readers),
+                             reader_desc, "exit 0\n");
+      auto opts = BaseOptions("proto_limit_" + std::to_string(readers));
+      const std::vector<NodeSpec> specs{
+          {.name = "hardware_node",
+           .target = "//talOS/bridge:hardware_node",
+           .binary_path = bridge_bin,
+           .critical = true},
+          {.name = "alpha",
+           .target = "//example/alpha:node",
+           .binary_path = alpha_bin,
+           .critical = true},
+      };
+      std::vector<NodeDescription> described;
+      const auto diags = DescribeGraph(specs, opts, described);
+      EXPECT_EQ(has_reader_limit_error(diags), readers == MAX_READERS)
+          << "readers=" << readers;
+    }
+  }
+
+  // Part 2: Live mismatch warns once per bridge run and re-warns after restart.
+  const auto hw_runs = TempPath("proto_warn_hw_runs");
+  const auto crash_run1 = TempPath("proto_warn_crash1");
+  ::remove(hw_runs.c_str());
+  ::remove(crash_run1.c_str());
+
+  auto options = BaseOptions("proto_warn");
+  options.duration_s = kHangSeconds;
+  options.max_restarts = 2;
+  // Run 1 records its pid and waits for `crash_run1`, then exits 1 (triggers
+  // immediate restart for critical hardware_node). Run 2 records its pid and
+  // sleeps until stopped.
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteDescribedStub("proto_warn_hw", bridge_desc,
+                         "echo $$ >> '" + hw_runs +
+                             "'\n"
+                             "if [ \"$(wc -l < '" +
+                             hw_runs +
+                             "')\" -eq 1 ]; then\n"
+                             "  while [ ! -e '" +
+                             crash_run1 +
+                             "' ]; do sleep 0.01; done\n"
+                             "  exit 1\n"
+                             "fi\n"
+                             "while :; do sleep 0.05; done\n");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("proto_warn_alpha", "while :; do sleep 0.05; done\n", "alpha");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("proto_warn_beta", "while :; do sleep 0.05; done\n", "beta");
+
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string talos_log = session_dir + "/talos.log";
+  const std::uint16_t wrong_version =
+      static_cast<std::uint16_t>(talos::protocol::kProtocolVersion - 1);
+  const std::string needle = "reports hardware protocol " +
+                             std::to_string(wrong_version) + " on /hw/status";
+  const auto count_warnings = [&] {
+    const std::string text = ReadFile(talos_log);
+    std::size_t count = 0;
+    for (std::size_t at = text.find(needle); at != std::string::npos;
+         at = text.find(needle, at + needle.size())) {
+      ++count;
+    }
+    return count;
+  };
+
+  testing::SupervisionPasses passes;
+  bool warned_run1 = false;
+  std::size_t count_after_extra_publishes = 0;
+  bool warned_run2 = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    if (!WaitFor(stop, [&] { return ReadLines(hw_runs).size() == 1; })) {
+      ::kill(::getpid(), SIGTERM);
+      return;
+    }
+    RTMSQueue status_pub{bridge::topics::kStatus,
+                         sizeof(bridge::BridgeStatus),
+                         alignof(bridge::BridgeStatus),
+                         status_schema,
+                         MAX_SLOTS,
+                         RTMSOptions{.publisher = true}};
+    bridge::BridgeStatus msg{};
+    msg.mutate_protocol_version_id(wrong_version);
+    const auto payload = std::as_bytes(std::span{&msg, 1});
+    status_pub.write(payload);
+    SupervisionWakeup::Wake();
+    warned_run1 = WaitFor(stop, [&] { return count_warnings() == 1; });
+    if (warned_run1) {
+      // Publish additional mismatched statuses during the same bridge run:
+      // must not warn a second time.
+      status_pub.write(payload);
+      status_pub.write(payload);
+      const uint64_t target_pass = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= target_pass;
+      });
+      count_after_extra_publishes = count_warnings();
+
+      // Crash run 1 and wait for run 2 to start, then publish again.
+      std::ofstream{crash_run1}.close();
+      if (WaitFor(stop, [&] { return ReadLines(hw_runs).size() == 2; })) {
+        // Wait for Supervise to have spawned run 2 and updated manifest.
+        WaitFor(stop, [&] {
+          return ManifestRuns(ReadFile(session_dir + "/manifest.json"),
+                              "hardware_node")
+                     .size() == 2;
+        });
+        status_pub.write(payload);
+        SupervisionWakeup::Wake();
+        warned_run2 = WaitFor(stop, [&] { return count_warnings() == 2; });
+      }
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+
+  EXPECT_EQ(RunSession(options), 0);
+  driver.join();
+  EXPECT_TRUE(warned_run1) << ReadFile(talos_log);
+  EXPECT_EQ(count_after_extra_publishes, 1u) << ReadFile(talos_log);
+  EXPECT_TRUE(warned_run2) << ReadFile(talos_log);
+  EXPECT_EQ(count_warnings(), 2u) << ReadFile(talos_log);
+  const auto pids = ReadLines(hw_runs);
+  ASSERT_EQ(pids.size(), 2u);
+  const std::string log_text = ReadFile(talos_log);
+  EXPECT_NE(log_text.find("hardware_node (pid " + pids[0] + ") " + needle),
+            std::string::npos)
+      << log_text;
+  EXPECT_NE(log_text.find("hardware_node (pid " + pids[1] + ") " + needle),
+            std::string::npos)
+      << log_text;
+
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(hw_runs.c_str());
+  ::remove(crash_run1.c_str());
 }
 
 }  // namespace

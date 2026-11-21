@@ -148,6 +148,11 @@ std::string DeclaredGraphPath(const LauncherOptions& options);
 // `stop_fd` is ProbeDescribe's: once it reads ready, every running probe is
 // killed and none is started, so the result describes no roster and the
 // caller must not act on it.
+//
+// When a hardware bridge declares `/hw/status` as a sender, the lint counts
+// the launcher itself as one additional observer reader on `/hw/status` (the
+// live protocol-version check opens an RTMS reader slot on it), without
+// modifying `out`.
 std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
     std::vector<NodeDescription>& out,

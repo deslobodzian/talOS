@@ -23,6 +23,7 @@
 #include <system_error>
 #include <utility>
 
+#include "bridge/topics.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
@@ -35,11 +36,92 @@
 #include "talOS/launcher/session_lock.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/process/process.h"
+#include "talOS/protocol/types.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
 namespace talos::launcher {
+
+struct Launcher::BridgeStatusObserver {
+  struct Sample {
+    bool received{false};
+    std::optional<std::uint16_t> version;
+  };
+
+  RTMSQueue queue;
+  std::size_t reader_id{0};
+  ProtocolVersionField version_field;
+  std::vector<std::byte> scratch;
+
+  BridgeStatusObserver(RTMSQueue q, std::size_t id, ProtocolVersionField field,
+                       std::size_t bytes)
+      : queue{std::move(q)},
+        reader_id{id},
+        version_field{field},
+        scratch(bytes) {}
+  ~BridgeStatusObserver() { queue.release_reader(reader_id); }
+  BridgeStatusObserver(const BridgeStatusObserver&) = delete;
+  BridgeStatusObserver& operator=(const BridgeStatusObserver&) = delete;
+
+  void Drain() {
+    MessageInfo info{};
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      const ReadResult result = queue.read_next(reader_id, scratch, info);
+      if (result != ReadResult::TORN) return;
+    }
+  }
+
+  Sample ReadLatest() {
+    MessageInfo info{};
+    const ReadResult result = queue.read_next(reader_id, scratch, info);
+    if (result != ReadResult::OK) return {};
+    return {true, ReadProtocolVersion(version_field, scratch)};
+  }
+
+  static std::unique_ptr<BridgeStatusObserver> Open(
+      const std::vector<NodeDescription>& described) {
+    for (const auto& node : described) {
+      if (node.roster_name != kHardwareNodeName || !node.answered) continue;
+      for (const auto& source : node.declared.sources) {
+        if (source.kind != event::SourceKind::SENDER ||
+            source.name != ::bridge::topics::kStatus) {
+          continue;
+        }
+        const auto field = ResolveProtocolVersionField(
+            source.bfbs, source.schema, source.message_bytes);
+        if (!field) return nullptr;
+        try {
+          RTMSQueue queue{
+              source.name,
+              source.message_bytes,
+              source.alignment,
+              schema::Identity{source.schema, source.schema_hash, {}},
+              source.slots,
+              RTMSOptions{.read_mode = ReadMode::LATEST,
+                          .publisher = false,
+                          .session_owner = false}};
+          const auto reader_id = queue.register_reader();
+          if (!reader_id) return nullptr;
+          return std::make_unique<BridgeStatusObserver>(
+              std::move(queue), *reader_id, *field, source.message_bytes);
+        } catch (const std::exception& e) {
+          ConsoleLine(std::cerr)
+              << "[launcher] cannot observe " << source.name
+              << " for hardware protocol check: " << e.what() << "\n";
+          return nullptr;
+        }
+      }
+    }
+    return nullptr;
+  }
+};
+
 namespace {
+
+// How often Supervise polls `/hw/status` while waiting for the current bridge
+// run's first status message to check `protocol_version_id`. Stops once that
+// run's version has been checked.
+constexpr std::chrono::milliseconds kBridgeProtocolPoll{20};
 
 // How often Supervise checks whether every non-observer member's loop has
 // started while waiting to write kSimScheduleStartFile. Stops once written or
@@ -1077,6 +1159,10 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   }
   ConsoleLine(std::cout) << "[launcher] Created " << segments.size()
                          << " session-owned topic segments\n";
+  // Declared after `segments` so the observer reader detaches before the
+  // session unlinks `/hw/status`.
+  std::unique_ptr<BridgeStatusObserver> status_observer =
+      BridgeStatusObserver::Open(described);
   if (options_.session_segments_created) options_.session_segments_created();
 
   SessionManifest manifest;
@@ -1200,7 +1286,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     studio->Start(procs[studio->index()], options_.supervision_clock);
   PersistManifest(procs);
 
-  Supervise(procs, launches, studio, sim_gateway_index, deadline);
+  Supervise(procs, launches, studio, sim_gateway_index, status_observer.get(),
+            deadline);
   manifest.end_wall_ns = WallClockNanos();
   // Every run has been reaped and its group killed, so the pipes end.
   output_->Stop();
@@ -1520,6 +1607,7 @@ void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
   endpoints_checked = false;
   realtime_reported = false;
   loop_started = false;
+  protocol_checked = false;
   run_recorder_failed = false;
 }
 
@@ -1575,7 +1663,8 @@ uint64_t Launcher::RestartLogBudget(NodeProcessInfo& proc, uint64_t budget) {
 }
 
 void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
-                       SupervisionTime now) {
+                       SupervisionTime now,
+                       BridgeStatusObserver* status_observer) {
   if (launch.restart.quarantined())
     ConsoleLine(std::cout) << "[launcher] " << proc.name
                            << " retrying after quarantine\n";
@@ -1589,6 +1678,11 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
         NodeLogPath(options_.output_dir, proc.name, restart);
     launch.args[launch.log_arg + 2] =
         std::to_string(RestartLogBudget(proc, launch.log_budget));
+  }
+  if (proc.name == kHardwareNodeName && status_observer != nullptr) {
+    // Discard any unread status written by the prior bridge run before the new
+    // run starts so the next read observes only the new run's status.
+    status_observer->Drain();
   }
   std::string error;
   launch.spawned_monotonic_ns = introspect::monotonic_now_ns();
@@ -1614,6 +1708,27 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
        << proc.name << " (pid " << pid << ", target " << proc.target;
   if (restart > 0) line << ", restart " << restart;
   line << ")\n";
+}
+
+void Launcher::CheckBridgeProtocol(
+    const NodeProcessInfo& proc, NodeLaunch& launch,
+    BridgeStatusObserver* status_observer) const {
+  if (status_observer == nullptr || proc.name != kHardwareNodeName ||
+      launch.protocol_checked) {
+    return;
+  }
+  const BridgeStatusObserver::Sample sample = status_observer->ReadLatest();
+  if (!sample.received) return;
+  launch.protocol_checked = true;
+  if (sample.version && *sample.version != protocol::kProtocolVersion) {
+    ConsoleLine(std::cerr)
+        << "[launcher] warning: " << proc.name << " (pid " << proc.pid
+        << ") reports hardware protocol " << *sample.version << " on "
+        << ::bridge::topics::kStatus
+        << ", but this launcher was built for hardware protocol "
+        << protocol::kProtocolVersion
+        << "; hardware packets in this session may not match this build\n";
+  }
 }
 
 bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -1714,7 +1829,9 @@ bool Launcher::RosterContinues(const std::vector<NodeProcessInfo>& procs,
 }
 
 bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
-                        const introspect::RegistryMapping* registry) {
+                        const introspect::RegistryMapping* registry,
+                        BridgeStatusObserver* status_observer) {
+  CheckBridgeProtocol(proc, launch, status_observer);
   bool changed = false;
   uint32_t recording = 0;
   bool row_loop_started = false;
@@ -1804,6 +1921,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                          std::vector<NodeLaunch>& launches,
                          std::optional<StudioBridge>& studio,
                          std::optional<std::size_t> sim_gateway_index,
+                         BridgeStatusObserver* status_observer,
                          std::chrono::steady_clock::time_point deadline) {
   bool stop_sent = false;
   bool sim_schedule_done = !sim_gateway_index.has_value();
@@ -1907,12 +2025,14 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                           options_.supervision_clock, stopping))
           manifest_changed = true;
       } else if (!stopping && !launch.heartbeat_killed) {
-        if (WatchRun(proc, launch, registry ? &*registry : nullptr))
+        if (WatchRun(proc, launch, registry ? &*registry : nullptr,
+                     status_observer))
           manifest_changed = true;
       }
       int status = 0;
       if (::waitpid(proc.pid, &status, WNOHANG) != proc.pid) continue;
       FinishProcessGroup(proc.pid);
+      CheckBridgeProtocol(proc, launch, status_observer);
       // The run's counts as it ended, before EndRun closes the run. Studio's
       // bridge reports no delivery-loss counts.
       if (registry && !(studio && i == studio->index())) {
@@ -1981,7 +2101,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
               << " finished with the rest of the roster; not "
                  "restarted\n";
         } else {
-          Restart(procs[i], launch, now);
+          Restart(procs[i], launch, now, status_observer);
         }
         manifest_changed = true;
       }
@@ -2117,6 +2237,15 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     } else {
       due(deadline);
       if (sim_schedule_polling) due(now + kSimScheduleStartPoll);
+      if (status_observer != nullptr) {
+        for (std::size_t i = 0; i < procs.size(); ++i) {
+          if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
+              !procs[i].exited && !launches[i].protocol_checked) {
+            due(now + kBridgeProtocolPoll);
+            break;
+          }
+        }
+      }
       // Each run the next pass watches (WatchRun): its row's next look.
       for (std::size_t i = 0; i < procs.size(); ++i) {
         if (procs[i].pid <= 0 || procs[i].exited ||

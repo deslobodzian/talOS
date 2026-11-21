@@ -1746,11 +1746,18 @@ version on every `/hw/status` (`bridge.BridgeStatus` `protocol_version_id`),
 and the launcher puts its build's in `manifest.json`, as
 `hardware_protocol_version` ([session manifest](#session-manifest)). The
 tools read a session under the bridge's: the first `/hw/status` the bridge
-sent in each of its logs (each run and segment), when its log records the
-topic with this build's `BridgeStatus` schema. They use the manifest's only
-when no log does: a session from before the field, one with no bridge, or
-a bridge from before the field, whose `/hw/status` has another schema
-(`RecordedProtocolVersion`, `hardware_record.h`). Finding the bridge's
+sent in each of its logs (each run and segment), resolving `protocol_version_id`
+by field name from the recorded `.bfbs` schema so a `BridgeStatus` layout change
+does not hide it. They use the manifest's only when no log records a `/hw/status`
+whose schema carries an integer `protocol_version_id`: a session from before
+the field, one with no bridge, or a bridge whose schema lacks the field
+(`RecordedProtocolVersion`, `hardware_record.h`). While a session runs, the
+launcher also opens `/hw/status` as an observer reader (using the bridge's
+declared shape and resolving `protocol_version_id` from its `.bfbs`, counted as
+one observer reader slot on `/hw/status` during phase-one graph lint) and warns
+once per bridge run (to stderr and `talos.log`, re-warning if the bridge
+restarts) when the live `protocol_version_id` differs from the launcher build's
+`protocol::kProtocolVersion`. Finding the bridge's
 costs a read of each log's header, and of the bridge's logs up to their
 first status, never past their first second of records: the bridge's
 `--log` records every status it publishes, on its first pass and every

@@ -28,6 +28,7 @@
 #include "talOS/launcher/child_output.h"
 #include "talOS/launcher/describe_graph.h"
 #include "talOS/launcher/file_digest.h"
+#include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/roster.h"
 #include "talOS/launcher/service_notifier.h"
 #include "talOS/launcher/session.h"
@@ -278,6 +279,11 @@ class Launcher {
     // kFlagConstructing and with either a realtime outcome or a dispatch.
     // Cleared by NewRun.
     bool loop_started{false};
+    // For the hardware bridge: whether this run's `/hw/status`
+    // `protocol_version_id` was already observed and checked against
+    // `protocol::kProtocolVersion`. Reset by NewRun so a restarted bridge is
+    // checked again.
+    bool protocol_checked{false};
     // The member answered --describe: its runs' live endpoints are compared
     // with `declared` (CheckEndpoints), once per run, after the run's row
     // has published them; `endpoints_checked` says this run's was.
@@ -358,10 +364,22 @@ class Launcher {
   // run it shortened capped (`<log>.capped`, `log_capped`).
   static uint64_t RestartLogBudget(NodeProcessInfo& proc, uint64_t budget);
 
+  // Observer reader on the bridge's declared `/hw/status` topic, opened after
+  // session segments are created and destroyed before they are unlinked so
+  // Supervise checks `protocol_version_id` once per bridge run (LOG-16).
+  struct BridgeStatusObserver;
+
   // Starts `proc`'s pending run: restart `restart_count + 1` into a fresh
   // event log or, when no run has spawned yet, the first. The attempt counts
   // against the rolling budget whether or not it spawns.
-  void Restart(NodeProcessInfo& proc, NodeLaunch& launch, SupervisionTime now);
+  void Restart(NodeProcessInfo& proc, NodeLaunch& launch, SupervisionTime now,
+               BridgeStatusObserver* status_observer);
+
+  // Checks the bridge's live `/hw/status` `protocol_version_id` once per
+  // bridge run, warning once to stderr + talos.log when it differs from
+  // `protocol::kProtocolVersion`.
+  void CheckBridgeProtocol(const NodeProcessInfo& proc, NodeLaunch& launch,
+                           BridgeStatusObserver* status_observer) const;
 
   // A run's registry row reports its loop's realtime outcome once the node
   // asked for it, or decided not to (introspect::RealtimeOf; introspection
@@ -425,6 +443,7 @@ class Launcher {
                  std::vector<NodeLaunch>& launches,
                  std::optional<StudioBridge>& studio,
                  std::optional<std::size_t> sim_gateway_index,
+                 BridgeStatusObserver* status_observer,
                  std::chrono::steady_clock::time_point deadline);
 
   // One supervision pass over a running member other than Studio's bridge:
@@ -435,7 +454,8 @@ class Launcher {
   // clock reads around that row read (RunLiveness::Watch). Returns whether
   // `proc` changed.
   bool WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
-                const introspect::RegistryMapping* registry);
+                const introspect::RegistryMapping* registry,
+                BridgeStatusObserver* status_observer);
 
   // Fills `launch` for a member's first run: its supervision settings and
   // the command line it is spawned with, its event log capped at

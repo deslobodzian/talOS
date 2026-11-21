@@ -30,11 +30,13 @@
 // bridge's own build's version in every /hw/status it publishes
 // (bridge.BridgeStatus protocol_version_id), and the launcher's build's in
 // manifest.json (hardware_protocol_version). The bridge's, when recorded, is
-// the session's version; the manifest's only when no log of the session
-// records a /hw/status of this build's BridgeStatus schema (a session from
-// before the field, one with no bridge, or a .tlog read without its
-// session's). HardwareProtocolCheck runs once over a session before any
-// packet is decoded:
+// the session's version (resolved by field name `protocol_version_id` from
+// the recorded `/hw/status` `.bfbs` schema, so a layout change to
+// BridgeStatus does not hide it); the manifest's only when no log of the
+// session records a `/hw/status` whose schema carries an integer
+// `protocol_version_id` (a session from before the field, one with no
+// bridge, or a .tlog read without its session's). HardwareProtocolCheck runs
+// once over a session before any packet is decoded:
 //   - a recorded version other than this build's, or a bridge that recorded
 //     two, refuses every packet, none tried;
 //   - otherwise every packet is tried with this build's codecs. Every
@@ -131,14 +133,14 @@ struct RecordedProtocol {
   std::optional<std::uint16_t> manifest;
   // The bridge's: the protocol_version_id of the first /hw/status SEND in
   // each of the session's logs whose manifest registers /hw/status as a
-  // sender of this build's BridgeStatus schema (the bridge's --log, which
-  // records every status it publishes), the distinct values in log path
-  // order. One bridge build writes one value, so two mean bridge runs of
-  // different builds in one session (which one bundle cannot launch). A
-  // /hw/status of another schema (a bridge from before the field), one
-  // whose field is 0 (no version: one a test wrote), or none in a log's
-  // first second of records (a bridge that did not log its statuses) adds
-  // none.
+  // sender with a verified .bfbs schema containing an integer scalar
+  // `protocol_version_id` field (the bridge's --log, which records every
+  // status it publishes), the distinct values in log path order. One bridge
+  // build writes one value, so two mean bridge runs of different builds in
+  // one session (which one bundle cannot launch). A /hw/status whose schema
+  // lacks `protocol_version_id` (a bridge from before the field), one whose
+  // field is 0 (no version: one a test wrote), or none in a log's first
+  // second of records (a bridge that did not log its statuses) adds none.
   std::vector<std::uint16_t> bridge;
 
   // The version the session's packets are read under: the bridge's when it
@@ -225,6 +227,29 @@ class HardwareProtocolCheck {
   std::set<std::string, std::less<>> sent_;
   HardwarePacket scratch_;
 };
+
+// Location and scalar type of `protocol_version_id` resolved by field name
+// from a `/hw/status` schema's `.bfbs` (talOS/schema/field_path.h).
+struct ProtocolVersionField {
+  std::size_t offset{0};
+  std::size_t size{0};
+  std::size_t message_bytes{0};
+  std::uint8_t base_type{0};
+};
+
+// Resolves `protocol_version_id` by field name in struct `schema_name` of
+// `bfbs`, verifying it is an integer scalar within `message_bytes` (and
+// matching the struct's bytesize when `message_bytes` is nonzero). Returns
+// nullopt if `bfbs` does not verify, lacks `schema_name` or
+// `protocol_version_id`, is not an integer scalar, or fails bounds checks.
+std::optional<ProtocolVersionField> ResolveProtocolVersionField(
+    std::string_view bfbs, std::string_view schema_name,
+    std::size_t message_bytes);
+
+// Reads `protocol_version_id` from one `/hw/status` payload using `field`,
+// verifying exact payload size, bounds, and `[1, 0xFFFF]`.
+std::optional<std::uint16_t> ReadProtocolVersion(
+    const ProtocolVersionField& field, std::span<const std::byte> payload);
 
 // The JSON object for one recorded Packet payload (sizeof(hardware::Packet)
 // bytes). Never throws: a payload of the wrong size or one the codec rejects
