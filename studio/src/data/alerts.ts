@@ -88,13 +88,22 @@ export function alertLevelName(level: AlertLevel): string {
   return LEVEL_NAME[level] ?? 'none';
 }
 
-// Human-readable descriptions for known /hw/status alerts whose field name
-// alone does not explain what failed or what the drive team should do.
+// Human-readable descriptions for known status alerts whose field name alone
+// does not explain what failed or what the drive team should do.
 const ALERT_TEXT: Readonly<Record<string, string>> = {
   'hw/status/alert_error_hardware_fault':
       'hardware fault (total feedback loss or gateway fault)',
   'hw/status/alert_error_config_refused_enabled':
       'config refused while enabled: disable to accept the new configuration',
+  'teleop/status/alert_warning_disarmed':
+      'Operator arming disarmed — release held joystick input to arm',
+};
+
+// Fallback descriptions matched by alert leaf name so custom operator nodes
+// publishing the standard alert_warning_disarmed field get the same guidance.
+const ALERT_LEAF_TEXT: Readonly<Record<string, string>> = {
+  'alert_warning_disarmed':
+      'Operator arming disarmed — release held joystick input to arm',
 };
 
 // The alert's display name: a known human-readable hint when registered, else
@@ -105,6 +114,8 @@ export function alertText(channel: string, level: AlertLevel): string {
   const known = ALERT_TEXT[channel];
   if (known !== undefined) return known;
   const leaf = channel.slice(channel.lastIndexOf('/') + 1);
+  const byLeaf = ALERT_LEAF_TEXT[leaf];
+  if (byLeaf !== undefined) return byLeaf;
   const prefix = `alert_${alertLevelName(level)}_`;
   return (leaf.startsWith(prefix) ? leaf.slice(prefix.length) : leaf)
       .replace(/_/g, ' ');

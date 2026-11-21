@@ -437,7 +437,7 @@ mode generations and policy defaults. API:
 | `target_.source()`: `"teleop"`, `"auto"`, ... or `""` | `target.source` |
 | `talos::TargetLane<M> lane_{node, "wrist", "auto"}`: `send(M{...})` (stamped with this node's mode generation), `release()` | `talos.TargetLane(node, M, "wrist", "auto")`: `send(field=...)` or `send(message)`, `release()` |
 | `talos::OperatorArming arming_{node}`; `talos::TargetLane<M> lane_{node, "climber", "operator", arming_}`: `send()` goes out as a release (and returns false) while `arming_.armed()` is false | `talos.OperatorArming(node)`; `talos.TargetLane(node, M, "climber", "operator", arming=arming)` |
-| `arming_.evaluate(neutral)` on every reading of the inputs: true when this reading may publish; otherwise a neutral reading arms it at once (a send on that neutral reading is active). `disarm()` for producer-specific reasons (a joystick reconnecting) | `arming.evaluate(neutral)`, `arming.armed`, `arming.disarm()` |
+| `arming_.evaluate(neutral)` (or `arming_.evaluate(neutral, ArmingBlocker{kind, port, index})`) on every reading of the inputs: true when this reading may publish; otherwise a neutral reading arms it at once (a send on that neutral reading is active). `arming_.blocker()` returns the recorded `ArmingBlocker` while disarmed and `{kNone, -1, -1}` once armed or neutral (zero allocation). `disarm()` for producer-specific reasons (a joystick reconnecting) | `arming.evaluate(neutral, blocker=None)`, `arming.armed`, `arming.blocker`, `arming.disarm()` (`talos.ArmingBlocker`, `talos.ArmingInputKind`) |
 
 A producer that maps operator input (joysticks, a button board) opens its
 lanes with an `OperatorArming`, so a control held through a disable, reboot,

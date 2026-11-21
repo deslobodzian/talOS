@@ -82,3 +82,22 @@ those later evaluations either, and the floor lets a stick resting a few
 counts off zero arm. A bound POV must centre even if held in a different
 direction than its binding. Edge history is seeded from that snapshot, so a button held through
 a restart neither commands nor flips a toggle.
+
+## Status topic (`/teleop/status`)
+
+Every tick `teleop` publishes `teleop::TeleopStatus`
+(`talOS/teleop/messages/status.fbs`) on `/teleop/status`:
+
+- `armed` (`bool`): current `OperatorArming::armed()` state.
+- `alert_warning_disarmed` (`bool`): active warning alert while enabled in
+  teleop (not e-stopped) and disarmed; never active while disabled or outside
+  teleop.
+- `blocking_kind` (`BlockingInputKind`: `NONE`, `AXIS`, `BUTTON`, `POV`,
+  `OTHER`), `blocking_joystick_index` (`byte`, `-1` when none), and
+  `blocking_input_index` (`short`, `-1` when none): the first non-neutral
+  connected bound input preventing rearming, reset to `NONE / -1 / -1` once
+  armed or neutral.
+
+`/teleop/status` is registered before `teleop` reads the declared graph, so
+`telemetry` discovers and forwards it to Studio and `/drive` automatically.
+

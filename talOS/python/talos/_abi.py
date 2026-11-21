@@ -8,9 +8,10 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 37
+_EXPECTED_ABI_VERSION = 38
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
+c_int8, c_uint8, c_int16 = (ctypes.c_int8, ctypes.c_uint8, ctypes.c_int16)
 c_int32, c_int64, c_uint32, c_uint64 = (
     ctypes.c_int32, ctypes.c_int64, ctypes.c_uint32, ctypes.c_uint64)
 c_double, c_float, c_char_p, c_void_p = (
@@ -85,6 +86,11 @@ ROLLER_PHASE_INTAKING = 1
 ROLLER_PHASE_HOLDING = 2
 ROLLER_PHASE_EJECTING = 3
 ROLLER_PHASE_FEEDING = 4
+ARMING_INPUT_NONE = 0
+ARMING_INPUT_AXIS = 1
+ARMING_INPUT_BUTTON = 2
+ARMING_INPUT_POV = 3
+ARMING_INPUT_OTHER = 4
 
 
 class TalosError(RuntimeError):
@@ -252,7 +258,11 @@ _SIGNATURES = {
     "talos_target_lane_release": (c_int32, [c_void_p, c_int64]),
     "talos_operator_arming_open": (c_int64, [c_void_p]),
     "talos_operator_arming_evaluate": (c_int32, [c_void_p, c_int64, c_int32]),
+    "talos_operator_arming_evaluate_blocker": (c_int32, [
+        c_void_p, c_int64, c_int32, c_uint8, c_int8, c_int16, _P(c_int32)]),
     "talos_operator_arming_armed": (c_int32, [c_void_p, c_int64]),
+    "talos_operator_arming_blocker": (c_int32, [
+        c_void_p, c_int64, _P(c_uint8), _P(c_int8), _P(c_int16)]),
     "talos_operator_arming_disarm": (c_int32, [c_void_p, c_int64]),
     "talos_position_mechanism_open": (c_int64, [c_void_p, c_char_p]),
     "talos_position_mechanism_set_goal": (c_int32, [c_void_p, c_int64,

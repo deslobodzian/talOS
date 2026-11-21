@@ -1156,6 +1156,65 @@ class TargetTest(unittest.TestCase):
         driver_station(held=True)
         self.assertEqual(lift.seen.height_rot, 0.5)
 
+    # REQ-OPS-55
+    def test_operator_arming_blocker_tracks_held_input_and_clears_on_arm(self):
+        class BlockerOperator:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.arming = talos.OperatorArming(node)
+                self.last_blocker = talos.ArmingBlocker()
+                self.last_armed = False
+
+            def update(self):
+                stick = self.ds.joystick(0)
+                if stick.connected and stick.button(1):
+                    blocker = talos.ArmingBlocker(
+                        talos.ArmingInputKind.BUTTON, 0, 1)
+                    self.arming.evaluate(False, blocker)
+                elif stick.connected and abs(stick.axis(1)) > 0.1:
+                    blocker = talos.ArmingBlocker(
+                        talos.ArmingInputKind.AXIS, 0, 1)
+                    self.arming.evaluate(False, blocker)
+                else:
+                    self.arming.evaluate(True, talos.ArmingBlocker())
+                self.last_armed = self.arming.armed
+                self.last_blocker = self.arming.blocker
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        op = sim.add(BlockerOperator, "planner")
+        hw = SimHardware(sim)
+        hw.enable()
+
+        hw.set_driver_station(
+            enabled=True, teleop=True,
+            joysticks=[Stick(axes=(0.0, 0.75))])
+        sim.step(0.04)
+        self.assertFalse(op.last_armed)
+        self.assertEqual(
+            op.last_blocker,
+            talos.ArmingBlocker(talos.ArmingInputKind.AXIS, 0, 1))
+
+        hw.set_driver_station(
+            enabled=True, teleop=True,
+            joysticks=[Stick(buttons=(1,))])
+        sim.step(0.04)
+        self.assertFalse(op.last_armed)
+        self.assertEqual(
+            op.last_blocker,
+            talos.ArmingBlocker(talos.ArmingInputKind.BUTTON, 0, 1))
+
+        hw.set_driver_station(enabled=True, teleop=True, joysticks=[Stick()])
+        sim.step(0.04)
+        self.assertTrue(op.last_armed)
+        self.assertEqual(op.last_blocker, talos.ArmingBlocker())
+
+        # Once armed, holding a button leaves blocker cleared.
+        hw.set_driver_station(
+            enabled=True, teleop=True, joysticks=[Stick(buttons=(1,))])
+        sim.step(0.04)
+        self.assertTrue(op.last_armed)
+        self.assertEqual(op.last_blocker, talos.ArmingBlocker())
+
 
 class StateMachineTest(unittest.TestCase):
     """Transitions are StateMachine's (node_test.cc); these prove each

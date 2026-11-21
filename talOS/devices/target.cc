@@ -52,6 +52,7 @@ struct ArmingState {
   std::uint64_t generation = 0;
   std::uint64_t recoveries = 0;
   std::optional<Time> last_evaluation;
+  ArmingBlocker blocker{};
 };
 
 // This node's targets, lanes and armings, attached as a Node extension.
@@ -334,17 +335,28 @@ std::size_t TargetAccess::open_arming(Node& node) {
 
 bool TargetAccess::arming_evaluate(Node& node, std::size_t arming,
                                    bool neutral) {
+  return arming_evaluate(
+      node, arming, neutral,
+      neutral ? ArmingBlocker{} : ArmingBlocker{ArmingInputKind::kOther});
+}
+
+bool TargetAccess::arming_evaluate(Node& node, std::size_t arming, bool neutral,
+                                   ArmingBlocker blocker) {
   NodeAccess::require_loop_thread(node, "OperatorArming::evaluate");
   ArmingState& state = ArmingAt(node, arming);
   const bool armed = Armed(node, state);
   state.last_evaluation = node.now();
-  if (armed) return true;
+  if (armed) {
+    state.blocker = {};
+    return true;
+  }
   // Arms for the evaluations after this one, under the view seen now.
   const std::uint64_t generation = DriverStationAccess::generation(state.ds);
   state.armed = neutral && generation != 0;
   state.generation = generation;
   state.boot_id = state.ds.data().boot_id;
   state.recoveries = DriverStationAccess::recoveries(state.ds);
+  state.blocker = neutral ? ArmingBlocker{} : blocker;
   return false;
 }
 
@@ -353,9 +365,29 @@ bool TargetAccess::arming_armed(Node& node, std::size_t arming) {
   return Armed(node, ArmingAt(node, arming));
 }
 
+ArmingBlocker TargetAccess::arming_blocker(Node& node, std::size_t arming) {
+  NodeAccess::require_loop_thread(node, "OperatorArming::blocker");
+  const ArmingState& state = ArmingAt(node, arming);
+  return Armed(node, state) ? ArmingBlocker{} : state.blocker;
+}
+
+ArmingBlocker TargetAccess::arming_blocker_noexcept(
+    Node& node, std::size_t arming) noexcept {
+  try {
+    const auto& armings = node.extension<Targets>().armings;
+    if (arming >= armings.size()) return {};
+    const ArmingState& state = armings[arming];
+    return Armed(node, state) ? ArmingBlocker{} : state.blocker;
+  } catch (...) {
+    return {};
+  }
+}
+
 void TargetAccess::arming_disarm(Node& node, std::size_t arming) {
   NodeAccess::require_loop_thread(node, "OperatorArming::disarm");
-  ArmingAt(node, arming).armed = false;
+  ArmingState& state = ArmingAt(node, arming);
+  state.armed = false;
+  state.blocker = {};
 }
 
 }  // namespace talos::detail

@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 37u
+#define TALOS_NODE_ABI_VERSION 38u
 
 enum {
   TALOS_OK = 0,
@@ -387,15 +387,33 @@ int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
 int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
                                const void* message, uint32_t size);
 int32_t talos_target_lane_release(TalosNode* node, int64_t lane);
+enum {  // talos::ArmingInputKind
+  TALOS_ARMING_INPUT_NONE = 0,
+  TALOS_ARMING_INPUT_AXIS = 1,
+  TALOS_ARMING_INPUT_BUTTON = 2,
+  TALOS_ARMING_INPUT_POV = 3,
+  TALOS_ARMING_INPUT_OTHER = 4,
+};
 // talos::OperatorArming: opens one (call while the factory runs) and returns
 // its index. evaluate returns 1 when the producer may publish active targets
 // on this reading of its inputs (`neutral` nonzero: every input at rest), 0
-// otherwise; armed returns 1 or 0 without evaluating. All return TALOS_ERR on
-// error.
+// otherwise; evaluate_blocker also records the blocking input (`kind`,
+// `port`, `index`) while disarmed and writes 1 or 0 to `*out_armed` (when
+// non-NULL), returning TALOS_OK; blocker writes the recorded blocker into any
+// non-NULL out pointers and returns TALOS_OK; armed returns 1 or 0 without
+// evaluating. All return TALOS_ERR on error.
 int64_t talos_operator_arming_open(TalosNode* node);
 int32_t talos_operator_arming_evaluate(TalosNode* node, int64_t arming,
                                        int32_t neutral);
+int32_t talos_operator_arming_evaluate_blocker(TalosNode* node, int64_t handle,
+                                               int32_t inputs_neutral,
+                                               uint8_t kind, int8_t port,
+                                               int16_t index,
+                                               int32_t* out_armed);
 int32_t talos_operator_arming_armed(TalosNode* node, int64_t arming);
+int32_t talos_operator_arming_blocker(TalosNode* node, int64_t handle,
+                                      uint8_t* out_kind, int8_t* out_port,
+                                      int16_t* out_index);
 int32_t talos_operator_arming_disarm(TalosNode* node, int64_t arming);
 
 // --- mechanisms (talOS/mechanisms) -----------------------------------------

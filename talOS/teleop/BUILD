@@ -31,6 +31,7 @@ cc_library(
         "//talOS/schema:field_path",
         "//talOS/schema:identity",
         "//talOS/schema:schema_hash",
+        "//talOS/teleop/messages",
         "@flatbuffers//:runtime_cc",
     ],
 )
@@ -79,6 +80,7 @@ py_test(
         "//talOS/msgs:control_py",
         "//talOS/python:teleop",
         "//talOS/python:testing",
+        "//talOS/teleop/messages:messages_py",
     ],
 )
 
@@ -97,6 +99,7 @@ cc_test(
         "//talOS/node:testing",
         "//talOS/schema:field_path",
         "//talOS/schema:test_messages",
+        "//talOS/teleop/messages",
         "@googletest//:gtest_main",
     ],
 )

@@ -133,3 +133,23 @@ test('hardware fault and enabled config refusal alerts render actionable text', 
       byChannel[REFUSED_ENABLED].text.includes('disable to accept the new configuration'),
       byChannel[REFUSED_ENABLED].text);
 });
+
+// REQ-OPS-55: disarmed operator arming alert carries actionable guidance for
+// both /teleop/status and any custom robot operator node.
+test('operator arming disarmed alert renders actionable text', () => {
+  const TELEOP_DISARMED = 'teleop/status/alert_warning_disarmed';
+  const CUSTOM_DISARMED = 'operator/status/alert_warning_disarmed';
+  const active = activeAlerts({
+    timestamp_ns: '1000000',
+    channels: {[TELEOP_DISARMED]: 1, [CUSTOM_DISARMED]: 1},
+    alerts: {
+      [TELEOP_DISARMED]: AlertLevel.Warning,
+      [CUSTOM_DISARMED]: AlertLevel.Warning,
+    },
+  });
+  const byChannel = Object.fromEntries(active.map(a => [a.channel, a]));
+  assert.equal(byChannel[TELEOP_DISARMED].owner, 'teleop');
+  assert.match(byChannel[TELEOP_DISARMED].text, /release held joystick input to arm/i);
+  assert.equal(byChannel[CUSTOM_DISARMED].owner, 'operator');
+  assert.match(byChannel[CUSTOM_DISARMED].text, /release held joystick input to arm/i);
+});

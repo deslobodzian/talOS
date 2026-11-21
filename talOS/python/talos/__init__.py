@@ -34,15 +34,17 @@ import sys
 from talos import _abi
 from talos._abi import TalosError, lib
 from talos._messages import Message, enum_names, message_type
-from talos.devices import (Alliance, AnalogInput, CANcoder, DigitalInput,
-                           DigitalOutput, DriverStation, Encoder, Gyro, HardwareLink,
-                           Joystick, Mode, Motor, OperatorArming, PwmOutput,
-                           Target, TargetLane, _OnNode,
+from talos.devices import (Alliance, AnalogInput, ArmingBlocker,
+                           ArmingInputKind, CANcoder, DigitalInput,
+                           DigitalOutput, DriverStation, Encoder, Gyro,
+                           HardwareLink, Joystick, Mode, Motor, OperatorArming,
+                           PwmOutput, Target, TargetLane, _OnNode,
                            allow_untargeted_outputs, hardware_sample_time_ns,
                            robot_enabled)
 
 __all__ = [
-    "Alliance", "AnalogInput", "BytePublisher", "CANcoder", "DigitalInput",
+    "Alliance", "AnalogInput", "ArmingBlocker", "ArmingInputKind",
+    "BytePublisher", "CANcoder", "DigitalInput",
     "DigitalOutput", "DriverStation", "Encoder", "Gyro", "HardwareLink", "Joystick", "Message",
     "Mode", "Motor", "Node", "OperatorArming", "Publisher", "PwmOutput",
     "StateMachine",

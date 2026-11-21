@@ -250,3 +250,86 @@ test('a demand/measured pair shows measured minus demand at the cursor', () => {
   // Shooter at the cursor: flywheel 58 rps against a 60 rps target.
   assert.ok(renderPanel(populatedStudio()).includes('Δ -2.000 rps'));
 });
+
+// REQ-OPS-55: subsystem cards with status/armed + status/blocking_kind display
+// the held joystick input while disarmed, for both teleop and custom operator
+// nodes, and hide the notice once armed.
+test('subsystem cards render operator arming blocker when disarmed and clear when armed', () => {
+  const armingUnits: Record<string, string> = {
+    'teleop/status/armed': '',
+    'teleop/status/blocking_kind': '',
+    'teleop/status/blocking_joystick_index': '',
+    'teleop/status/blocking_input_index': '',
+    'operator/status/armed': '',
+    'operator/status/blocking_kind': '',
+    'operator/status/blocking_joystick_index': '',
+    'operator/status/blocking_input_index': '',
+  };
+  const armingLabels: Record<string, string[]> = {
+    'teleop/status/blocking_kind': ['NONE', 'AXIS', 'BUTTON', 'POV', 'OTHER'],
+    'operator/status/blocking_kind': ['NONE', 'AXIS', 'BUTTON', 'POV', 'OTHER'],
+  };
+  const renderWith = (channels: Record<string, number>): string => {
+    const snap: Snapshot = {
+      stream_id: 'stream0',
+      sequence_id: '1',
+      timestamp_ns: '1000000000',
+      dictionary_id: 0,
+      chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+      channels,
+      units: armingUnits,
+      labels: armingLabels,
+    };
+    const studio = createStaticStudio({
+      frames: [snap],
+      playback: {
+        mode: 'PAUSED', cursor_ns: snap.timestamp_ns,
+        bounds: {start: snap.timestamp_ns, end: snap.timestamp_ns},
+        stats: {skipped: 0, late: 0, invalid: 0}, status: 'Demo',
+        connection: 'demo',
+      },
+    });
+    return renderPanel(studio);
+  };
+
+  // Disarmed: teleop blocked on joystick 0 axis 1, custom operator on joystick 1 button 3.
+  const disarmedHtml = renderWith({
+    'teleop/status/armed': 0,
+    'teleop/status/blocking_kind': 1,
+    'teleop/status/blocking_joystick_index': 0,
+    'teleop/status/blocking_input_index': 1,
+    'operator/status/armed': 0,
+    'operator/status/blocking_kind': 2,
+    'operator/status/blocking_joystick_index': 1,
+    'operator/status/blocking_input_index': 3,
+  });
+  assert.ok(disarmedHtml.includes('Disarmed — joystick 0 axis 1 held'), disarmedHtml);
+  assert.ok(disarmedHtml.includes('Disarmed — joystick 1 button 3 held'), disarmedHtml);
+
+  // Disarmed on POV and with NONE blocker.
+  const povHtml = renderWith({
+    'teleop/status/armed': 0,
+    'teleop/status/blocking_kind': 3,
+    'teleop/status/blocking_joystick_index': 0,
+    'teleop/status/blocking_input_index': 1,
+    'operator/status/armed': 0,
+    'operator/status/blocking_kind': 0,
+    'operator/status/blocking_joystick_index': -1,
+    'operator/status/blocking_input_index': -1,
+  });
+  assert.ok(povHtml.includes('Disarmed — joystick 0 POV 1 held'), povHtml);
+  assert.ok(povHtml.includes('Disarmed — release inputs to arm'), povHtml);
+
+  // Armed: no disarmed banner shown.
+  const armedHtml = renderWith({
+    'teleop/status/armed': 1,
+    'teleop/status/blocking_kind': 0,
+    'teleop/status/blocking_joystick_index': -1,
+    'teleop/status/blocking_input_index': -1,
+    'operator/status/armed': 1,
+    'operator/status/blocking_kind': 0,
+    'operator/status/blocking_joystick_index': -1,
+    'operator/status/blocking_input_index': -1,
+  });
+  assert.ok(!armedHtml.includes('Disarmed'), armedHtml);
+});

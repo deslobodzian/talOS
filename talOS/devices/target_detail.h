@@ -17,6 +17,27 @@
 
 namespace talos {
 class Node;
+
+// Which kind of operator input is preventing OperatorArming from arming
+// (REQ-OPS-55). Values match teleop::BlockingInputKind and
+// TALOS_ARMING_INPUT_*.
+enum class ArmingInputKind : std::uint8_t {
+  kNone = 0,
+  kAxis = 1,
+  kButton = 2,
+  kPov = 3,
+  kOther = 4,
+};
+
+// Fixed-size, zero-allocation description of the input blocking OperatorArming
+// while disarmed: {kNone, -1, -1} when armed or when inputs are neutral.
+struct ArmingBlocker {
+  ArmingInputKind kind{ArmingInputKind::kNone};
+  std::int8_t port{-1};
+  std::int16_t index{-1};
+
+  bool operator==(const ArmingBlocker&) const = default;
+};
 }  // namespace talos
 
 namespace talos::detail {
@@ -56,9 +77,14 @@ struct TargetAccess {
 
   // OperatorArming (target.h): subscribes to the Driver Station.
   static std::size_t open_arming(Node& node);
-  // OperatorArming::evaluate, armed and disarm.
+  // OperatorArming::evaluate, armed, blocker and disarm.
   static bool arming_evaluate(Node& node, std::size_t arming, bool neutral);
+  static bool arming_evaluate(Node& node, std::size_t arming, bool neutral,
+                              ArmingBlocker blocker);
   static bool arming_armed(Node& node, std::size_t arming);
+  static ArmingBlocker arming_blocker(Node& node, std::size_t arming);
+  static ArmingBlocker arming_blocker_noexcept(Node& node,
+                                               std::size_t arming) noexcept;
   static void arming_disarm(Node& node, std::size_t arming);
 };
 
