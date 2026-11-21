@@ -934,6 +934,19 @@ TEST(PhoenixBackendSim, WpilibPlantReflectsMotorTypeFocGearingAndSupply) {
   PumpReads(backend, state, full_duty, 30);
   EXPECT_DOUBLE_EQ(state.health.battery_v, 8.0);
   EXPECT_NEAR(state.motors[0].voltage, 8.0, 0.5);
+
+  // Dropping the simulated battery below Phoenix's 4 V floor (12.8 V -> 3.0 V)
+  // updates simulated device supply to 4.0 V rather than leaving it stuck at
+  // 12.8 V, while keeping the raw 3.0 V RoboRIO battery reading untouched.
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{hw::kSimRestingSupplyV});
+  PumpReads(backend, state, full_duty, 20);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, hw::kSimRestingSupplyV);
+  EXPECT_GT(state.motors[0].voltage, 11.5);
+
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{3.0});
+  PumpReads(backend, state, full_duty, 30);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, 3.0);
+  EXPECT_NEAR(state.motors[0].voltage, 4.0, 0.5);
   backend.Neutral();
 }
 
@@ -1041,6 +1054,79 @@ TEST(PhoenixBackendPigeon,
     ASSERT_TRUE(state.sensors[0].valid);
     EXPECT_NEAR(state.sensors[0].position_rot, 0.25, 1e-3);
   }
+}
+
+// Remote-CANcoder swerve modules with nonzero magnet offset and inverted
+// sensor/steer direction close their steer loops on the CANcoder's reported
+// angle (wrap(steer_sign * raw + offset_rot)), so chassis kinematics must apply
+// both steer_sign and offset_rot to integrate Pigeon2 yaw CCW+ rather than
+// cancelling or reversing it.
+// REQ-DEV-05
+TEST(PhoenixBackendPigeon,
+     SwerveRemoteCancoderWithMagnetOffsetAndInversionDrivesYawCcw) {
+  EnsureHal();
+  EnabledDs ds;
+
+  hw::Config config;
+  const std::array<const char*, 4> corners{"front_left", "front_right",
+                                           "back_left", "back_right"};
+  const std::array<double, 4> spin_angles{0.375, 0.125, -0.375, -0.125};
+  for (std::size_t i = 0; i < corners.size(); ++i) {
+    const auto enc_id = static_cast<uint16_t>(10 + i);
+    const int enc_can_id = static_cast<int>(10 + i);
+    hw::SensorConfig enc{enc_id, std::string(corners[i]) + "_enc",
+                         hw::SensorKind::kCANcoder, enc_can_id, "rio"};
+    enc.inverted = true;
+    enc.offset_rot = 0.25;
+    config.sensors.push_back(enc);
+
+    auto drive = TestMotor(static_cast<uint16_t>(2 * i + 1),
+                           std::string(corners[i]) + "_drive",
+                           static_cast<int>(2 * i + 1));
+    drive.sensor_to_mechanism_ratio = 6.75;
+
+    auto steer = TestMotor(static_cast<uint16_t>(2 * i + 2),
+                           std::string(corners[i]) + "_steer",
+                           static_cast<int>(2 * i + 2));
+    steer.inverted = true;
+    steer.feedback = hw::Feedback::kRemoteCANcoder;
+    steer.feedback_sensor_id = enc_id;
+    steer.rotor_to_sensor_ratio = 12.8;
+    steer.sensor_to_mechanism_ratio = 1.0;
+    steer.continuous_wrap = true;
+    steer.slots[0].p = 12.0;
+
+    config.motors.push_back(drive);
+    config.motors.push_back(steer);
+  }
+  config.sensors.push_back(
+      hw::SensorConfig{20, "imu", hw::SensorKind::kPigeon2, 30, "rio"});
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  std::array<hw::MotorRequest, 8> cmd{};
+  for (std::size_t i = 0; i < 4; ++i) {
+    cmd[2 * i] =
+        Request(static_cast<uint16_t>(2 * i + 1), hw::Mode::kVoltage, 6.0);
+    cmd[2 * i + 1] = Request(static_cast<uint16_t>(2 * i + 2),
+                             hw::Mode::kPosition, spin_angles[i]);
+  }
+  hw::State state;
+  PumpReads(backend, state, cmd, 50);
+
+  // Steer CANcoders should have converged to the requested spin azimuths.
+  for (std::size_t i = 0; i < 4; ++i) {
+    ASSERT_TRUE(state.sensors[i].valid) << i;
+    const double err =
+        std::remainder(state.sensors[i].position_rot - spin_angles[i], 1.0);
+    EXPECT_NEAR(err, 0.0, 0.05) << "corner " << i;
+  }
+  ASSERT_TRUE(state.sensors[4].valid);
+  EXPECT_GT(state.sensors[4].velocity_rps, 0.1);
+  EXPECT_GT(state.sensors[4].position_rot, 0.05);
+  backend.Neutral();
 }
 
 class PhoenixBackendFollower : public ::testing::TestWithParam<bool> {};

@@ -1449,10 +1449,9 @@ void PhoenixBackend::ConfigureSimulation(const hw::Config& c) {
   last_sim_time_ = std::nullopt;
 
   const double battery_v = frc::RobotController::GetBatteryVoltage().value();
-  const double supply_v =
-      (std::isfinite(battery_v) && battery_v >= kSimMinSupplyV)
-          ? battery_v
-          : hw::kSimRestingSupplyV;
+  const double supply_v = (std::isfinite(battery_v) && battery_v > 0.0)
+                              ? std::max(battery_v, kSimMinSupplyV)
+                              : hw::kSimRestingSupplyV;
   last_sim_supply_v_ = supply_v;
 
   for (std::size_t i = 0; i < motors_.size() && i < sim_plants_.size(); ++i) {
@@ -1576,18 +1575,20 @@ void PhoenixBackend::UpdateSimulation(double dt) {
   // it changes. Never call RoboRioSim::SetVInVoltage here so battery injections
   // from tests or the Sim GUI read back untouched.
   const double battery_v = frc::RobotController::GetBatteryVoltage().value();
-  if (std::isfinite(battery_v) && battery_v >= kSimMinSupplyV &&
-      battery_v != last_sim_supply_v_) {
-    last_sim_supply_v_ = battery_v;
-    const units::volt_t supply{battery_v};
-    for (auto& motor : motors_) {
-      motor->GetSimState().SetSupplyVoltage(supply);
-    }
-    for (auto& device : sensors_) {
-      if (device.encoder) {
-        device.encoder->GetSimState().SetSupplyVoltage(supply);
-      } else if (device.imu) {
-        device.imu->GetSimState().SetSupplyVoltage(supply);
+  if (std::isfinite(battery_v) && battery_v > 0.0) {
+    const double supply_v = std::max(battery_v, kSimMinSupplyV);
+    if (supply_v != last_sim_supply_v_) {
+      last_sim_supply_v_ = supply_v;
+      const units::volt_t supply{supply_v};
+      for (auto& motor : motors_) {
+        motor->GetSimState().SetSupplyVoltage(supply);
+      }
+      for (auto& device : sensors_) {
+        if (device.encoder) {
+          device.encoder->GetSimState().SetSupplyVoltage(supply);
+        } else if (device.imu) {
+          device.imu->GetSimState().SetSupplyVoltage(supply);
+        }
       }
     }
   }
@@ -1607,9 +1608,10 @@ void PhoenixBackend::UpdateSimulation(double dt) {
     // (talOS/hardware/README.md says what is known of 0 A). Coast neutral opens
     // the windings, decaying exponentially with tau = 1.0 s.
     if (!sim_neutral_[i] || m_cfg.brake) {
-      const double input_v =
+      const double raw_v =
           sim_neutral_[i] ? 0.0 : sim.GetMotorVoltage().value();
-      const frc::Vectord<1> u{input_v};
+      const double applied_v = std::isfinite(raw_v) ? raw_v : 0.0;
+      const frc::Vectord<1> u{applied_v};
       plant.state =
           plant.system.CalculateX(plant.state, u, units::second_t{dt});
     } else {
@@ -1667,12 +1669,17 @@ void PhoenixBackend::UpdateSimulation(double dt) {
       if (mod.steer_index >= 0) {
         const auto s_idx = static_cast<std::size_t>(mod.steer_index);
         const int enc_idx = motor_to_sensor_map_[s_idx];
+        const bool has_remote_encoder =
+            enc_idx >= 0 &&
+            static_cast<std::size_t>(enc_idx) < config_.sensors.size();
         const double steer_sign =
-            (enc_idx >= 0 &&
-             static_cast<std::size_t>(enc_idx) < config_.sensors.size())
+            has_remote_encoder
                 ? (config_.sensors[enc_idx].inverted ? -1.0 : 1.0)
                 : (config_.motors[s_idx].inverted ? -1.0 : 1.0);
         angle = steer_sign * sim_plants_[s_idx].state(0);
+        if (has_remote_encoder) {
+          angle += config_.sensors[enc_idx].offset_rot * kTau;
+        }
       }
       const double vx = speed * std::cos(angle);
       const double vy = speed * std::sin(angle);
