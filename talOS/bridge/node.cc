@@ -44,6 +44,32 @@ const char* ConfigAckStatusName(ConfigAckStatus status) {
   return "unknown";
 }
 
+// Whether a subsystem's partial request drives no actuator: every addressed
+// motor is kNeutral with valid slot and zero demand and feedforward, every
+// digital output is false, and every PWM output is kOff (a pulse of 0 is the
+// centre pulse, which drives). Mirrors Gateway's DrivesNothing for a single
+// subsystem's partial request.
+bool RequestDrivesNothing(const Command& partial) {
+  for (std::size_t i = 0; i < partial.count; ++i) {
+    const auto& r = partial.motors[i];
+    if (r.mode != Mode::kNeutral || r.slot > 2 || r.demand != 0.0 ||
+        r.feedforward_v != 0.0) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < partial.digital_output_count; ++i) {
+    if (partial.digital_outputs[i].value) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < partial.pwm_output_count; ++i) {
+    if (partial.pwm_outputs[i].mode != PwmMode::kOff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 // Tests only: when set, called with the options of the bridge's --log just
@@ -613,7 +639,13 @@ void HardwareNode::Tick(uint64_t now_us) {
         // stream of bad requests still times the subsystem out, in the merge
         // and on /hw/status alike.
         if (!HasRequestIdentity(tracker, partial)) {
-          ++identity_rejected_;
+          // A superseded all-neutral request racing a controller transition
+          // (e.g. an enable edge) before any request is accepted in the new
+          // epoch is still dropped without merging or refreshing silence, but
+          // does not increment identity_rejected_ (REQ-OPS-20).
+          if (!IsSupersededNeutral(tracker, partial)) {
+            ++identity_rejected_;
+          }
         } else if (!OwnsRequestDevices(tracker, partial)) {
           ++ownership_rejected_;
         } else {
@@ -1467,6 +1499,16 @@ bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,
   }
   return tracker.merge.Admits(partial.observed_time_us, last_sample_time_us_,
                               config_.command_timeout_us);
+}
+
+bool HardwareNode::IsSupersededNeutral(const SubsystemTracker& tracker,
+                                       const Command& partial) const {
+  return partial.config_id == config_id_ && partial.boot_id == last_boot_id_ &&
+         partial.epoch != 0 && partial.epoch < last_epoch_ &&
+         !tracker.merge.seen &&
+         tracker.merge.Admits(partial.observed_time_us, last_sample_time_us_,
+                              config_.command_timeout_us) &&
+         OwnsRequestDevices(tracker, partial) && RequestDrivesNothing(partial);
 }
 
 bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,

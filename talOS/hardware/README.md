@@ -466,7 +466,13 @@ forwarding those while the robot cannot drive; and one that passes every other c
 while no command is in force, since the bridge built it from a State read
 before this epoch began (at an enable or a disable, for example). Any other
 refused command counts, an earlier-epoch command that drives an output
-included. Each command supplies every configured motor in manifest
+included. The bridge applies the same superseded-neutral omission to
+`/hw/status` `identity_rejected_count`: an earlier-nonzero-epoch all-neutral
+request of the same configuration, boot, and device ownership with an
+admissible observation age, arriving before that subsystem has had a request
+accepted in the new epoch, is still dropped without merging or refreshing
+silence, while any driving demand, ownership violation, or stale-epoch request
+after a new-epoch acceptance still increments `identity_rejected_count`. Each command supplies every configured motor in manifest
 order.
 The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
 latest accepted health sample, motor fault mask, gateway counters and gateway

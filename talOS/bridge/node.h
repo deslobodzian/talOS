@@ -358,6 +358,16 @@ class HardwareNode {
   // latest State's sample, so it remains the safety backstop.
   bool HasRequestIdentity(const SubsystemTracker& tracker,
                           const Command& partial) const;
+  // Whether a request refused by HasRequestIdentity is an all-neutral request
+  // built from a State just before the current epoch began (for example, at an
+  // enable or disable edge): same configuration and boot, earlier nonzero
+  // epoch, no request accepted from this subsystem in the new epoch yet,
+  // admissible observation age, valid device ownership, and driving nothing.
+  // Such a request is still refused (never merges or refreshes silence), but
+  // is omitted from identity_rejected_, mirroring Gateway::Accept's
+  // superseded_neutral (REQ-OPS-20).
+  bool IsSupersededNeutral(const SubsystemTracker& tracker,
+                           const Command& partial) const;
   // Whether every actuator a request addresses belongs to the subsystem that
   // published it. One stray id rejects the whole request: a partial merge
   // would let a buggy subsystem drive hardware it does not own.
