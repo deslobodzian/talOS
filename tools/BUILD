@@ -544,3 +544,16 @@ py_test(
     legacy_create_init = False,
     main = "run_rio_clang_tidy_test.py",
 )
+
+# python3 tools/retry_unacquired.py (.github/workflows/retry-unacquired.yaml)
+# Fail-closed retry decider for unacquired hosted macOS runners (CI-11).
+py_test(
+    name = "retry_unacquired_test",
+    size = "small",
+    srcs = [
+        "retry_unacquired.py",
+        "retry_unacquired_test.py",
+    ],
+    legacy_create_init = False,
+    main = "retry_unacquired_test.py",
+)
