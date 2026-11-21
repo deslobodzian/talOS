@@ -262,7 +262,12 @@ cc_library(
         "service_notifier.h",
         "studio_bridge.h",
     ],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//bench/main_processor:__pkg__",
+        "//studio:__subpackages__",
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = [
         ":child_output",
         ":console_line",

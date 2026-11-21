@@ -21,13 +21,17 @@
 #include <vector>
 
 #include "talOS/events/manifest.h"
-#include "talOS/rtms/rtms.h"
 
 namespace talos::introspect::naming {
 
 // A topic name is `/owner/role[/qualifier[/qualifier]]`.
 inline constexpr std::size_t kMinSegments = 2;
 inline constexpr std::size_t kMaxSegments = 4;
+
+// The transport's reader-slot limit per topic, observers included: matches
+// RTMS's MAX_READERS (checked by static_assert in names_test.cc so names.h
+// never pulls talOS/rtms/rtms.h into downstream compile sandboxes).
+inline constexpr std::size_t kMaxTopicReaders = 32;
 
 // The transport's limit: macOS caps a shm name at PSHMNAMLEN, which
 // `rtms::ValidatePath` enforces as 30 characters after the slash. When a name
@@ -434,13 +438,29 @@ inline bool ObserverReads(std::string_view topic) {
 }
 
 // Whether `topic` is in the hardware request namespace: `/hw/request` or any
-// topic below it, well formed or not. Only a node's devices-layer flush
-// writes there (detail::NodeAccess::add_hardware_request); the generic
-// publishers refuse every such topic, however it was spelled or remapped.
+// topic below it, well formed or not (including multiple leading slashes or
+// dot-separated spellings that ShmObjectName maps to the same POSIX shm name).
+// Only a node's devices-layer flush writes there
+// (detail::NodeAccess::add_hardware_request); the generic publishers refuse
+// every such topic, however it was spelled or remapped.
 inline bool IsHardwareRequest(std::string_view topic) {
+  while (topic.size() > 1 && topic[0] == '/' && topic[1] == '/') {
+    topic.remove_prefix(1);
+  }
   const auto segments = detail::Segments(topic);
-  return segments.size() >= 2 && segments[0] == "hw" &&
-         segments[1] == "request";
+  if (segments.size() >= 2 && segments[0] == "hw" && segments[1] == "request") {
+    return true;
+  }
+  // ShmObjectName maps interior '/' to '.', so '/hw.request...' collides with
+  // '/hw/request/...' in POSIX shared memory.
+  if (topic.starts_with('/')) {
+    const std::string_view rest = topic.substr(1);
+    if (rest == "hw.request" || rest.starts_with("hw.request.") ||
+        rest.starts_with("hw.request/") || rest.starts_with("hw/request.")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The hardware request topic prefix (`/hw/request/<node>`): matches
@@ -738,11 +758,11 @@ inline std::vector<Diagnostic> LintGraph(
           "the 'test' namespace is for tests; a node in a session must not "
           "use it");
 
-    if (topic.reader_count > MAX_READERS) {
+    if (topic.reader_count > kMaxTopicReaders) {
       add(Severity::ERROR, topic.name,
           "has " + std::to_string(topic.reader_count) +
-              " readers; RTMS reader limit is " + std::to_string(MAX_READERS) +
-              " (including observers)");
+              " readers; RTMS reader limit is " +
+              std::to_string(kMaxTopicReaders) + " (including observers)");
     }
     if (topic.writers.size() > 1) {
       add(Severity::ERROR, topic.name,

@@ -2,6 +2,12 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
+_FRAMEWORK_VISIBILITY = [
+    "//studio:__subpackages__",
+    "//talOS:__subpackages__",
+    "//tools:__pkg__",
+]
+
 # Types shared by every loop: time, dispatch context, callbacks, the source
 # manifest, the timer queue, the wake-arm stall guard, the recorder policy and
 # the delivery policy.
@@ -109,7 +115,7 @@ cc_library(
         "os/poller.h",
         "wake_channel_wait.h",
     ],
-    visibility = ["//visibility:public"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":events_core",
         "//talOS/rtms:wake",
@@ -146,7 +152,7 @@ cc_library(
         "replay_event_loop.h",
         "simulated_event_loop.h",
     ],
-    visibility = ["//visibility:public"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":events_core",
         ":events_log",
@@ -164,7 +170,7 @@ cc_library(
     name = "input_replay",
     srcs = ["input_replay.cc"],
     hdrs = ["input_replay.h"],
-    visibility = ["//visibility:public"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":events",
         ":events_core",

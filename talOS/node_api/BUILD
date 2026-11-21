@@ -4,7 +4,15 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_shared_node")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
+
+exports_files(
+    [
+        "node_api.cc",
+        "node_api.h",
+    ],
+    visibility = ["//talOS/python:__pkg__"],
+)
 
 cc_library(
     name = "internal",
@@ -31,6 +39,7 @@ cc_library(
         "node_api.cc",
     ],
     hdrs = ["node_api.h"],
+    visibility = ["//talOS:__subpackages__"],
     deps = [
         ":internal",
         "//talOS/devices",
@@ -52,6 +61,7 @@ cc_library(
     name = "node_api_testing",
     testonly = True,
     srcs = ["node_api_testing.cc"],
+    visibility = ["//talOS:__subpackages__"],
     deps = [
         ":internal",
         ":node_api",
@@ -91,6 +101,7 @@ cc_shared_library(
     ],
     features = ["set_soname"],
     shared_lib_name = "libtalos_node.so",
+    visibility = ["//visibility:public"],
     deps = [
         ":node_api",
         "//talOS/devices",
@@ -117,6 +128,7 @@ cc_shared_library(
     dynamic_deps = [":libtalos_node.so"],
     features = ["set_soname"],
     shared_lib_name = "libtalos_node_testing.so",
+    visibility = ["//talOS:__subpackages__"],
     deps = [":node_api_testing"],
 )
 

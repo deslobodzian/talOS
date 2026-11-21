@@ -3,16 +3,21 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_cc_shared_node")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
 
 cc_library(
     name = "deadband",
     hdrs = ["deadband.h"],
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
     name = "teleop",
     hdrs = ["node.h"],
+    visibility = [
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = [
         ":deadband",
         "//talOS/configuration",
@@ -30,16 +35,30 @@ cc_library(
     ],
 )
 
+# Test helper for robot/bench Sim tests to add the declarative teleop node
+# without exposing talOS/teleop/node.h or talOS/node/access.h.
+cc_library(
+    name = "testing",
+    testonly = True,
+    srcs = ["testing.cc"],
+    hdrs = ["testing.h"],
+    implementation_deps = [":teleop"],
+    visibility = ["//visibility:public"],
+    deps = ["//talOS/node:testing"],
+)
+
 talos_cc_node(
     name = "node",
     srcs = ["node.cc"],
     node_name = "teleop",
+    visibility = ["//visibility:public"],
     deps = [":teleop"],
 )
 
 talos_cc_shared_node(
     name = "libteleop.so",
     srcs = ["teleop_abi.cc"],
+    visibility = ["//talOS:__subpackages__"],
     deps = [":teleop"],
 )
 

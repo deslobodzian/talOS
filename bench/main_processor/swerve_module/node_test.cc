@@ -1,5 +1,3 @@
-#include "talOS/teleop/node.h"
-
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -15,6 +13,7 @@
 #include "talOS/devices/testing.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
+#include "talOS/teleop/testing.h"
 
 namespace swerve_module {
 namespace {
@@ -374,7 +373,7 @@ TEST(SwerveModuleTeleop, ConfiguredHoldToRunAxesReleaseAndDisable) {
   talos::testing::Sim sim{kConfig};
   sim.add<BenchSwerveModule>(kNode);
   sim.add<MotorLaneReader>("motor");
-  sim.add<talos::teleop::Teleop>("teleop");
+  talos::teleop::AddTeleop(sim);
   talos::testing::SimHardware hw{sim};
   hw.enable();
   auto packet = DsPacket(ds::kEnabled | ds::kTeleop);

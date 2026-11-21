@@ -21,7 +21,10 @@ cc_library(
     name = "node_lib",
     srcs = ["node.cc"],
     hdrs = ["node.h"],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = [
         "//talOS/configuration",
         "//talOS/driver_station",

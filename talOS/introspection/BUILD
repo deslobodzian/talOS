@@ -1,19 +1,30 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
+
+exports_files(
+    ["names.h"],
+    visibility = ["//tools:__pkg__"],
+)
+
+_FRAMEWORK_VISIBILITY = [
+    "//studio:__subpackages__",
+    "//talOS:__subpackages__",
+    "//tools:__pkg__",
+]
 
 # The naming protocol, as code: the topic grammar, the closed role vocabulary
-# and the graph-level checks. Uses the transport's reader-slot limit so launch
-# validation stays consistent with runtime registration, and reads each
+# and the graph-level checks. Pins kMaxTopicReaders to RTMS's MAX_READERS in
+# names_test.cc so :names stays independent of //talOS/rtms, and reads each
 # writer's message schema for the alert-field grammar (names.cc).
 cc_library(
     name = "names",
     srcs = ["names.cc"],
     hdrs = ["names.h"],
+    visibility = ["//visibility:public"],
     deps = [
         "//talOS/events:events_core",
-        "//talOS/rtms",
         "@flatbuffers//:runtime_cc",
     ],
 )
@@ -24,6 +35,7 @@ cc_library(
 cc_library(
     name = "hardware_lint",
     hdrs = ["hardware_lint.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":names",
         "//talOS/hardware:config",
@@ -35,6 +47,7 @@ cc_library(
 cc_library(
     name = "describe",
     hdrs = ["describe.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":names",
         "//talOS/events:events_core",
@@ -48,6 +61,7 @@ cc_library(
     name = "registry",
     srcs = ["registry.cc"],
     hdrs = ["registry.h"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":lock_file",
         ":names",
@@ -63,6 +77,7 @@ cc_library(
 cc_library(
     name = "lock_file",
     hdrs = ["lock_file.h"],
+    visibility = ["//visibility:public"],
 )
 
 # Publishes a running loop into the registry. Separate target because a reader
@@ -70,6 +85,7 @@ cc_library(
 cc_library(
     name = "reporter",
     hdrs = ["reporter.h"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":describe",
         ":registry",
@@ -85,6 +101,7 @@ cc_test(
         ":hardware_lint",
         ":names",
         "//talOS/hardware",
+        "//talOS/rtms",
         "//talOS/schema:identity",
         "//talOS/schema:test_messages",
         "@googletest//:gtest_main",

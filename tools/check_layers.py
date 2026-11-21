@@ -34,17 +34,27 @@ The table below is ARCHITECTURE.md "Layers" and "Allowed dependencies"
 - non-testonly C++ nodes (`talos_cc_node`, `talos_cc_shared_node`) and
   `cc_library` targets outside `talOS/` never depend directly on
   `//talOS/rtms/...`, `//talOS/ipc/...`, `//talOS/memory/...`,
-  `//talOS/hardware:hardware`, `//talOS/devices:access`, or internal
-  `//talOS/node:*` targets (anything in `//talOS/node:*` other than
+  `//talOS/hardware:hardware`, `//talOS/devices:{access,access_hdr}`,
+  `//talOS/events:{events,events_os,input_replay}`,
+  `//talOS/telemetry:{telemetry,channels}`, `//talOS/teleop:teleop`,
+  `//talOS/node_api:node_api`, `//talOS/bridge:node_lib`,
+  `//talOS/introspection:{registry,reporter}`, `//talOS/launcher:launcher_lib`,
+  or internal `//talOS/node:*` targets (anything in `//talOS/node:*` other than
   `//talOS/node:node`);
 - structural Bazel visibility enforcement (RULES.md 2 / ARCH-2): privileged
-  internal targets (`//talOS/node:access`, `//talOS/node:loop_port`,
-  `//talOS/devices:access`, `//talOS/rtms:rtms`, `//talOS/rtms:wake`,
-  `//talOS/memory:shared_memory`, `//talOS/hardware:hardware`,
-  `//talOS/ipc:ipc`) are never `//visibility:public`, and are not visible to
-  robot/example/bench node packages (except `//talOS/hardware:hardware` and
-  `//talOS/ipc:ipc` for `//bench/main_processor/swerve_module` which hosts
-  the standalone `:send_target` CLI).
+  internal targets (`//talOS/node:{access,access_hdr,loop_port}`,
+  `//talOS/devices:{access,access_hdr}`,
+  `//talOS/rtms:{rtms,wake,process_liveness}`,
+  `//talOS/memory:{shared_memory,residency}`,
+  `//talOS/events:{events,events_os,input_replay}`,
+  `//talOS/telemetry:{telemetry,channels}`, `//talOS/teleop:teleop`,
+  `//talOS/node_api:node_api`, `//talOS/bridge:node_lib`,
+  `//talOS/introspection:{registry,reporter}`, `//talOS/launcher:launcher_lib`,
+  `//talOS/hardware:hardware`, `//talOS/ipc:ipc`) are never
+  `//visibility:public`, and are not visible to robot/example/bench node
+  packages (except `//talOS/hardware:hardware` and `//talOS/ipc:ipc` for
+  `//bench/main_processor/swerve_module` which hosts the standalone
+  `:send_target` CLI).
 
 The C++ source scan (also run standalone via `--source-only` in
 `tools/source_lints.sh`) walks every tracked file under `bench/`, `examples/`,
@@ -59,11 +69,14 @@ refuses from the start (RULES.md 2):
   stripping, line-continuation splicing and path normalization) of
   `talOS/node/access.h`, `talOS/node/internal.h`, `talOS/devices/access.h`,
   `talOS/rtms/...`, `talOS/ipc/...`, `talOS/memory/...`,
-  `talOS/hardware/messages.h`, `talOS/hardware/packet.h`, or
-  `talOS/hardware/request...`, non-C++ filenames (`NON_CPP_BASENAMES`,
-  `NON_CPP_SUFFIXES`, and `.txt`, case-insensitive) that could hide headers
-  from source discovery, and computed `#include MACRO` directives that cannot
-  be verified statically;
+  `talOS/hardware/messages.h`, `talOS/hardware/packet.h`,
+  `talOS/hardware/request...`, `talOS/events/{event_loop_base,input_replay,realtime_event_loop,replay_event_loop,simulated_event_loop,wake_channel_wait}.h`,
+  `talOS/events/os/...`, `talOS/telemetry/{channels,node}.h`,
+  `talOS/teleop/node.h`, `talOS/node_api/...`, `talOS/bridge/node.h`,
+  `talOS/introspection/{registry,reporter}.h`, non-C++ filenames
+  (`NON_CPP_BASENAMES`, `NON_CPP_SUFFIXES`, and `.txt`, case-insensitive) that
+  could hide headers from source discovery, and computed `#include MACRO`
+  directives that cannot be verified statically;
 - non-comment, non-string references to `NodeAccess`, `add_hardware_request`,
   `HardwareAccess`, or `note_live_target`, preprocessor token-pasting
   operators `##` and `%:%:` (which could otherwise assemble them), and C++
@@ -151,6 +164,18 @@ FORBIDDEN_NODE_DEPS = (
     "talOS/hardware:hardware",
     "talOS/node:*",
     "talOS/devices:access",
+    "talOS/devices:access_hdr",
+    "talOS/events:events",
+    "talOS/events:events_os",
+    "talOS/events:input_replay",
+    "talOS/telemetry:telemetry",
+    "talOS/telemetry:channels",
+    "talOS/teleop:teleop",
+    "talOS/node_api:node_api",
+    "talOS/bridge:node_lib",
+    "talOS/introspection:registry",
+    "talOS/introspection:reporter",
+    "talOS/launcher:launcher_lib",
 )
 FORBIDDEN_NODE_DEPS_EXCLUDE = ("talOS/node:node",)
 
@@ -158,11 +183,26 @@ FORBIDDEN_NODE_DEPS_EXCLUDE = ("talOS/node:node",)
 # robot/example/bench node packages (structural RULES.md 2 enforcement).
 RESTRICTED_INTERNAL_TARGETS = (
     "talOS/node:access",
+    "talOS/node:access_hdr",
     "talOS/node:loop_port",
     "talOS/devices:access",
+    "talOS/devices:access_hdr",
     "talOS/rtms:rtms",
     "talOS/rtms:wake",
+    "talOS/rtms:process_liveness",
     "talOS/memory:shared_memory",
+    "talOS/memory:residency",
+    "talOS/events:events",
+    "talOS/events:events_os",
+    "talOS/events:input_replay",
+    "talOS/telemetry:telemetry",
+    "talOS/telemetry:channels",
+    "talOS/teleop:teleop",
+    "talOS/node_api:node_api",
+    "talOS/bridge:node_lib",
+    "talOS/introspection:registry",
+    "talOS/introspection:reporter",
+    "talOS/launcher:launcher_lib",
 )
 # Hardware wire and raw IPC targets: never //visibility:public, and not visible
 # to any node package except WIRE_CLI_PACKAGES (which host standalone dev CLIs).
@@ -289,12 +329,26 @@ FORBIDDEN_INCLUDE_EXACT = frozenset({
     "talOS/devices/access.h",
     "talOS/hardware/messages.h",
     "talOS/hardware/packet.h",
+    "talOS/events/event_loop_base.h",
+    "talOS/events/input_replay.h",
+    "talOS/events/realtime_event_loop.h",
+    "talOS/events/replay_event_loop.h",
+    "talOS/events/simulated_event_loop.h",
+    "talOS/events/wake_channel_wait.h",
+    "talOS/telemetry/channels.h",
+    "talOS/telemetry/node.h",
+    "talOS/teleop/node.h",
+    "talOS/bridge/node.h",
+    "talOS/introspection/registry.h",
+    "talOS/introspection/reporter.h",
 })
 FORBIDDEN_INCLUDE_PREFIXES = (
     "talOS/rtms/",
     "talOS/ipc/",
     "talOS/memory/",
     "talOS/hardware/request",
+    "talOS/events/os/",
+    "talOS/node_api/",
 )
 NEVER_EXEMPT_INCLUDES = frozenset({
     "talOS/node/access.h",
