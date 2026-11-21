@@ -914,9 +914,9 @@ TEST(LintGraph, AnOptionalReaderExemptsOnlyItselfFromTheUnwrittenError) {
 }
 
 // REQ-CONTRACT-33: from the writer's schema, an `alert_` field that is not a
-// bool or not of a known level is an error naming the field (nested structs
-// included), and a well-formed alert outside a `status` topic is a warning.
-// A reader's end, which carries the same schema, adds nothing.
+// bool, not of a known level, or outside a `status` topic is an error naming
+// the field (nested structs included). A reader's end, which carries the same
+// schema, adds nothing.
 TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
   const auto with = [](SourceShape shape, const schema::Identity& identity) {
     shape.schema = identity.name;
@@ -973,7 +973,7 @@ TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
     const auto findings = alert_findings(LintGraph(nodes), "/shooter/state");
     ASSERT_EQ(findings.size(), 3u) << Describe(findings);
     for (const auto& finding : findings) {
-      EXPECT_EQ(finding.severity, Severity::WARNING) << finding.ToString();
+      EXPECT_EQ(finding.severity, Severity::ERROR) << finding.ToString();
     }
   }
   {

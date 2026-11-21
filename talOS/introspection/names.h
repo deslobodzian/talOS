@@ -533,10 +533,10 @@ inline constexpr std::size_t kMaxOperatorToActuatorHops = 2;
 // writer, two schemas or message sizes or ring layouts on one topic, a
 // malformed name, a lane its subsystem never reads, an `hw` topic written by
 // anything but the roster's bridge or, for `/hw/request/<node>`, <node>'s
-// devices-layer flush, an `alert_` field that is not a bool or not
-// ParseAlertField's grammar). Warnings are normal during development or in a
-// partial launch (an unread topic, an owner not in this session, a policy
-// lane nobody writes yet, an alert outside a `status` topic, a node that
+// devices-layer flush, an `alert_` field that is not a bool, not
+// ParseAlertField's grammar, or outside a `status` topic). Warnings are normal
+// during development or in a partial launch (an unread topic, an owner not in
+// this session, a policy lane nobody writes yet, a node that
 // writes its hardware request but reads no target lane of its own, a node
 // whose hardware request is marked untargeted_outputs, or an operator producer
 // whose shortest path to an actuator owner exceeds kMaxOperatorToActuatorHops
@@ -646,7 +646,7 @@ inline std::vector<Diagnostic> LintGraph(
                       ") is not a bool; an alert is active "
                       "while true");
             } else if (role != "status") {
-              add(Severity::WARNING, source.name,
+              add(Severity::ERROR, source.name,
                   "alert field '" + field.path + "' (written by " + node.name +
                       ") is in a '" + role +
                       "' topic; an alert belongs to its node's 'status' "
