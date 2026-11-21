@@ -519,11 +519,16 @@ TEST_F(HttpTest, OpensNoDatagramSocketNoSharedMemoryAndWritesNothing) {
   const std::string pid_arg = std::to_string(child_);
 
   // Catch closed-fd SharedMemoryPtr mappings via vmmap: studio_review must
-  // hold zero writable SM=SHM regions.
+  // hold zero writable SM=SHM regions. Bazel's macOS test PATH may omit
+  // /usr/sbin, so prefer the standard system paths when executable.
+  const char* vmmap_bin =
+      access("/usr/bin/vmmap", X_OK) == 0 ? "/usr/bin/vmmap" : "vmmap";
+  const char* lsof_bin =
+      access("/usr/sbin/lsof", X_OK) == 0 ? "/usr/sbin/lsof" : "lsof";
   std::string vmmap_out;
   int vmmap_exit = -1;
-  ASSERT_TRUE(RunToolCapture("vmmap",
-                             {"vmmap", "-wide", pid_arg.c_str(), nullptr},
+  ASSERT_TRUE(RunToolCapture(vmmap_bin,
+                             {vmmap_bin, "-wide", pid_arg.c_str(), nullptr},
                              vmmap_out, vmmap_exit));
   ASSERT_EQ(vmmap_exit, 0) << vmmap_out;
   ASSERT_FALSE(vmmap_out.empty());
@@ -536,12 +541,13 @@ TEST_F(HttpTest, OpensNoDatagramSocketNoSharedMemoryAndWritesNothing) {
     }
   }
 
-  // Strict lsof socket allowlist: reject every socket fd except unix sockets
-  // and the single loopback TCP LISTEN socket on exact :{port_}.
+  // Strict lsof socket allowlist: reject every socket fd except unix sockets,
+  // the single loopback TCP LISTEN socket on exact :{port_}, and any loopback
+  // accepted TCP socket on exact local :{port_} still tearing down after Get().
   std::string output;
   int lsof_exit = -1;
-  ASSERT_TRUE(RunToolCapture("lsof",
-                             {"lsof", "-n", "-P", "-a", "-p", pid_arg.c_str(),
+  ASSERT_TRUE(RunToolCapture(lsof_bin,
+                             {lsof_bin, "-n", "-P", "-a", "-p", pid_arg.c_str(),
                               "-F", "ftPTan", nullptr},
                              output, lsof_exit));
   ASSERT_EQ(lsof_exit, 0) << output;
@@ -586,16 +592,36 @@ TEST_F(HttpTest, OpensNoDatagramSocketNoSharedMemoryAndWritesNothing) {
     }
     if (IsDarwinNonSocketType(r.type) && r.proto.empty()) continue;
     if (r.type == "unix") continue;
-    // Strict allowlist: the only allowed non-unix socket is the single
-    // loopback TCP LISTEN socket on exact :{port_}.
+    // macOS libnetwork/getaddrinfo opens an internal com.apple.netsrc
+    // kernel-control socket for address-selection queries (cannot transmit).
+    if (r.type == "systm" && r.name.starts_with("[ctl com.apple.netsrc ")) {
+      continue;
+    }
+    // Strict allowlist: the only allowed non-unix sockets are the single
+    // loopback TCP LISTEN socket on exact :{port_} and any lingering loopback
+    // accepted connection on exact local :{port_} tearing down after Get().
+    const auto is_loopback_endpoint = [](std::string_view ep) {
+      return ep.starts_with("127.0.0.1:") || ep.starts_with("[::1]:");
+    };
     const bool is_inet = (r.type == "IPv4" || r.type == "IPv6");
-    const bool is_loopback =
-        r.name.starts_with("127.0.0.1:") || r.name.starts_with("[::1]:");
+    const std::size_t arrow = r.name.find("->");
     const bool is_expected_listener =
         is_inet && r.proto == "TCP" && r.state == "LISTEN" &&
-        r.name.find("->") == std::string::npos && is_loopback &&
+        arrow == std::string::npos && is_loopback_endpoint(r.name) &&
         MatchesExactPort(r.name, port_);
-    EXPECT_TRUE(is_expected_listener)
+    bool is_loopback_accepted = false;
+    if (is_inet && r.proto == "TCP" && arrow != std::string::npos &&
+        (r.state == "ESTABLISHED" || r.state == "CLOSE_WAIT" ||
+         r.state == "FIN_WAIT_1" || r.state == "FIN_WAIT_2" ||
+         r.state == "LAST_ACK")) {
+      const std::string_view local = std::string_view{r.name}.substr(0, arrow);
+      const std::string_view remote =
+          std::string_view{r.name}.substr(arrow + 2);
+      is_loopback_accepted = is_loopback_endpoint(local) &&
+                             MatchesExactPort(local, port_) &&
+                             is_loopback_endpoint(remote);
+    }
+    EXPECT_TRUE(is_expected_listener || is_loopback_accepted)
         << "studio_review holds disallowed socket: type=" << r.type
         << " proto=" << r.proto << " state=" << r.state << " name=" << r.name;
     if (is_expected_listener) ++loopback_listeners;

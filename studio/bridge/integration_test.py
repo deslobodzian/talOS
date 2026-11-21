@@ -6,6 +6,7 @@ import mmap
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -101,13 +102,18 @@ def darwin_rtms_segment(topic):
     return parsed
 
 
+def darwin_tool(name, fallback):
+    """Locates a macOS inspection tool even when Bazel's PATH omits /usr/sbin."""
+    return shutil.which(name) or fallback
+
+
 def darwin_writable_shm_regions(pid):
     """Writable `SM=SHM` region lines from `vmmap -wide <pid>` on macOS.
 
     Catches closed-fd `SharedMemoryPtr` mappings that `lsof` cannot see.
     """
     proc = subprocess.run(
-        ["vmmap", "-wide", str(pid)],
+        [darwin_tool("vmmap", "/usr/bin/vmmap"), "-wide", str(pid)],
         capture_output=True, text=True, timeout=15,
     )
     if proc.returncode != 0:
@@ -248,8 +254,9 @@ class BridgeIntegration(unittest.TestCase):
                             f"got {len(writable_shm)}: {writable_shm}",
                         )
 
+                        lsof_bin = darwin_tool("lsof", "/usr/sbin/lsof")
                         udp = subprocess.run(
-                            ["lsof", "-n", "-P", "-a", "-p", str(bridge.pid), "-i", "UDP"],
+                            [lsof_bin, "-n", "-P", "-a", "-p", str(bridge.pid), "-i", "UDP"],
                             capture_output=True, text=True, timeout=10,
                         )
                         self.assertIn(udp.returncode, (0, 1), udp.stderr)
@@ -260,7 +267,7 @@ class BridgeIntegration(unittest.TestCase):
                                          f"bridge holds UDP sockets:\n{udp.stdout}")
 
                         all_fds = subprocess.run(
-                            ["lsof", "-n", "-P", "-a", "-p", str(bridge.pid), "-F", "ftPTan"],
+                            [lsof_bin, "-n", "-P", "-a", "-p", str(bridge.pid), "-F", "ftPTan"],
                             capture_output=True, text=True, timeout=10,
                         )
                         self.assertEqual(all_fds.returncode, 0, all_fds.stderr)
@@ -284,6 +291,12 @@ class BridgeIntegration(unittest.TestCase):
                             if fd_type in DARWIN_NON_SOCKET_TYPES and not proto:
                                 continue
                             if fd_type == "unix":
+                                continue
+                            # macOS libnetwork/getaddrinfo opens an internal
+                            # com.apple.netsrc kernel-control socket for
+                            # address-selection queries (cannot transmit).
+                            if (fd_type == "systm"
+                                    and name.startswith("[ctl com.apple.netsrc ")):
                                 continue
                             # Strict socket allowlist: reject every non-unix
                             # socket (IPv4/IPv6 non-TCP, systm, KCTL, ROUTE,
