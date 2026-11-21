@@ -121,19 +121,23 @@ The RIO program has no built-in team number or companion address, and
 `robot_bench.toml`'s `controller_address` (`10.56.87.2`) is the robot
 network's. So every RIO deploy for this bench passes
 `-PteamNumber=5687 -Pcompanion=10.0.0.37`, and every launch on the Mini
-passes `--remote 10.0.0.72`.
+passes `--remote 10.0.0.72 --local-address 10.0.0.37` (or sets both in an
+untracked overlay config below).
 
-The Mini's Wi-Fi is on the same subnet. The bridge's socket takes its source
-address when it connects, and the RIO's socket accepts frames only from the
-address it was built with ([RoboRIO](../talOS/hardware/README.md#roborio)).
-A socket the bridge opens while the Mini routes `10.0.0.72` over Wi-Fi
-(it opens a new one after a send fails, as one may while the Ethernet cable
-is out) would send from `10.0.0.25`, which the RIO ignores, and keep that
-source after the cable returns: the motors would stay neutral until the
-session is restarted (the bridge is alive, so nothing restarts it; seen on
-[2026-11-17](BENCH_RESULTS.md#2026-11-17), TODO.md RT-27). Turn the
-Mini's Wi-Fi off for an enabled session; `route -n get 10.0.0.72` must name
-`interface: en0`.
+The Mini's Wi-Fi is on the same subnet, and the RIO's socket accepts frames
+only from the companion address it was built with
+([RoboRIO](../talOS/hardware/README.md#roborio)). Setting
+`[robot] local_address = "10.0.0.37"` or passing `--local-address 10.0.0.37`
+pins `hardware_node`'s gateway UDP socket to `en0` (`10.0.0.37`) on initial
+open and on every reopen (retrying every 100 ms while `en0` is absent rather
+than falling back to `0.0.0.0`). Without `local_address`, `hardware_node`
+binds `0.0.0.0` (the launcher emits a `--describe-only` warning on non-loopback
+targets), so a socket reopened while the Ethernet cable is out would send from
+Wi-Fi (`10.0.0.25`), which the RIO ignores, and keep that source after the
+cable returns until the session is restarted (seen on
+[2026-11-17](BENCH_RESULTS.md#2026-11-17), TODO.md RT-27). Still turn the
+Mini's Wi-Fi off for an enabled session so no route flap interferes, and check
+that `route -n get 10.0.0.72` names `interface: en0`.
 
 On any other LAN, build the RIO program for the main processor's address,
 from `controller_processor/rio` (or via `bazel run //controller_processor/rio:gradlew --`):
@@ -160,6 +164,7 @@ include = "robot.toml"
 
 [robot]
 controller_address = "<roborio-ipv4>"
+local_address = "<main-processor-ipv4>"  # optional; pins the companion interface
 commissioned = false
 ```
 

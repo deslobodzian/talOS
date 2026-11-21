@@ -40,6 +40,8 @@ int main(int argc, char** argv) {
         options.output_dir = argv[++i];
       } else if (arg == "--remote" && i + 1 < argc) {
         options.remote = argv[++i];
+      } else if (arg == "--local-address" && i + 1 < argc) {
+        options.local_address = argv[++i];
       } else if (arg == "--remote-port" && i + 1 < argc) {
         options.remote_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--local-port" && i + 1 < argc) {
@@ -97,7 +99,8 @@ int main(int argc, char** argv) {
                "[--describe-only [--describe-as-launch]] "
                "[--allow-graph-errors] [--describe-timeout-ms MS] "
                "[--max-restarts N] "
-               "[--remote IP] [--remote-port PORT] [--local-port PORT] "
+               "[--remote IP] [--local-address IP] [--remote-port PORT] "
+               "[--local-port PORT] "
                "[--replay-inputs SESSION_DIR --only NODE "
                "[--allow-capped-replay]]\n"
                "\n"
@@ -105,6 +108,8 @@ int main(int argc, char** argv) {
                "(assembled by talos_bundle)\n"
                "  --remote IP            controller address; overrides "
                "[robot] controller_address\n"
+               "  --local-address IP     local bind IPv4 address; overrides "
+               "[robot] local_address (default: wildcard 0.0.0.0)\n"
                "  --remote-port PORT     controller port; overrides "
                "[robot] controller_port (default 5802)\n"
                "  --local-port PORT      local bind port; overrides "

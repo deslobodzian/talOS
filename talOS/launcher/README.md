@@ -87,7 +87,7 @@ passes it. Of a launch's refusals before its probes:
 
 | Refusal | `--describe-only` | with `--describe-as-launch` |
 |---|---|---|
-| `--allow-graph-errors` without `--sim`; `--sim-gateway-arg` without `--start-sim-gateway` or naming a port; an unloadable bundle or config; `--sim` with a remote other than `127.0.0.1`; a bad restart setting; a duplicate or misnamed member | refused | refused |
+| `--allow-graph-errors` without `--sim`; `--sim-gateway-arg` without `--start-sim-gateway` or naming a port; an unloadable bundle or config; an invalid `--remote` or `--local-address`; `--sim` with a remote other than `127.0.0.1` or a `local_address` other than unset/`127.0.0.1`; a bad restart setting; a duplicate or misnamed member | refused | refused |
 | [`[robot] simulation_only`](#lightweight-simulation-gateway) without `--sim` | accepted | refused |
 | the [session lock](#one-session-per-namespace) held by another launch | not checked | not checked: it is held by the session a check runs beside |
 | the [live registry](../introspection/README.md#prepared-by-the-launcher) cannot be prepared or has no room | not checked | not checked: it is shared memory, and its rows are the running session's |
@@ -313,6 +313,7 @@ configuration, with a CLI override for one-off runs:
 ```toml
 [robot]
 controller_address = "10.56.87.2"  # RoboRIO as seen from this companion
+local_address = "10.56.87.5"       # optional companion interface IPv4; unset binds 0.0.0.0
 controller_port = 5802             # gateway port on the controller
 local_port = 5803                  # bind port on the companion
 ```
@@ -320,24 +321,40 @@ local_port = 5803                  # bind port on the companion
 
 ```sh
 bazel run //talOS/launcher:launcher -- --config bench/main_processor/configuration/robot.toml
-bazel run //talOS/launcher:launcher -- --config bench/main_processor/configuration/robot.toml --remote 10.56.87.2
+bazel run //talOS/launcher:launcher -- --config bench/main_processor/configuration/robot.toml --remote 10.56.87.2 --local-address 10.56.87.5
 ```
 
-`--remote` overrides `[robot] controller_address`; `--remote-port` and
-`--local-port` override their config counterparts the same way. The address
-must be an IPv4 literal (the bridge's socket resolves no hostname), and a port,
-in the config or a flag, is an integer in [1, 65535]; config load or flag
-parsing refuses anything else. The launcher
-resolves the effective endpoint once per launch, prints it
-(`[launcher] Controller <addr>:<port> ...`), and always starts
-`hardware_node` with an explicit `--remote/--remote-port/--local-port` triple,
-which its `--describe` probe gets too (`ControllerArgs`): the bridge refuses
-`--sim` without the loopback remote, so a probe left to the config's
-address would refuse `--sim --remote 127.0.0.1` on a config naming the
-RoboRIO.
-Running the bridge standalone resolves identically: its own `--remote` wins,
-otherwise its `--config` supplies the address. Simulation requires the loopback
-remote. On hardware, commissioning gates commands; see
+`--remote` overrides `[robot] controller_address`, `--local-address` overrides
+`[robot] local_address`, and `--remote-port` and `--local-port` override their
+config counterparts the same way. Every address must be an IPv4 literal without
+leading zeros (the bridge's socket resolves no hostname), and a port, in the
+config or a flag, is an integer in [1, 65535]; config load or flag validation
+refuses anything else before probing or spawning. The launcher resolves the
+effective endpoint once per launch, prints it (`[launcher] Controller
+<addr>:<port> (local <ip>:<port>)` when `local_address` is set, or `(local port
+<port>)` when unset), and always starts `hardware_node` with an explicit
+`--remote/--remote-port/--local-port` triple plus `--local-address <ip>` when
+`local_address` is non-empty, which its `--describe` probe gets too
+(`ControllerArgs`): the bridge refuses `--sim` without the loopback remote, so
+a probe left to the config's address would refuse `--sim --remote 127.0.0.1` on
+a config naming the RoboRIO.
+
+When `[robot] local_address` (or `--local-address`) is set, `hardware_node`
+binds that IPv4 interface address on its first open and on every socket reopen,
+preventing a multi-homed companion (such as a Mac mini with Ethernet and Wi-Fi
+on the same subnet) from drifting onto another source IP after a cable pull or
+route change (`REQ-RT-22`). When unset on a non-`--sim`, non-loopback
+(`!= 127.0.0.1`) controller target, phase one (and `--describe-only`) emits a
+non-fatal warning (`warning: hardware_node: [robot] local_address is unset;
+...`) so field configs catch an unpinned bind before deployment (`REQ-OPS-25`);
+loopback (`127.0.0.1`) and `--sim` launches emit no warning.
+
+Running the bridge standalone resolves identically: its own `--remote` and
+`--local-address` win, otherwise its `--config` supplies them. Simulation
+requires the loopback remote (`127.0.0.1`) and either an unset or `127.0.0.1`
+local address (a field config that sets `[robot] local_address` can be run
+under `--sim` by also passing `--local-address 127.0.0.1`). On hardware,
+commissioning gates commands; see
 [hardware configuration](../hardware/README.md#configuration).
 
 ## Lightweight simulation gateway

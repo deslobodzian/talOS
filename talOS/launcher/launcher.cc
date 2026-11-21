@@ -840,6 +840,22 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     ConsoleLine(std::cerr) << "launcher: " << message << "\n";
     return RefuseLaunch(message, &robot_config, stop_signals);
   }
+  std::string effective_local_address;
+  try {
+    effective_local_address = EffectiveLocalAddress(robot_config, options_);
+  } catch (const std::exception& e) {
+    ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
+    return RefuseLaunch(e.what(), &robot_config, stop_signals);
+  }
+  if (options_.simulation && !effective_local_address.empty() &&
+      effective_local_address != "127.0.0.1") {
+    const std::string message =
+        "--sim requires local_address unset or 127.0.0.1; effective local "
+        "address " +
+        effective_local_address;
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
+  }
   std::string restart_error;
   int max_restarts = kDefaultMaxRestarts;
   if (!ResolveMaxRestarts(robot_config, options_, max_restarts,
@@ -976,6 +992,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   }
   for (auto& finding : naming::CheckHardwareConfig(robot_config.hardware)) {
     diagnostics.push_back(std::move(finding));
+  }
+  if (effective_local_address.empty() && !options_.simulation &&
+      effective_remote != "127.0.0.1") {
+    diagnostics.push_back(
+        {naming::Severity::WARNING, std::string{kHardwareNodeName},
+         "[robot] local_address is unset; hardware_node binds 0.0.0.0 and may "
+         "pick another interface on route changes (set [robot] local_address "
+         "or --local-address)"});
   }
   const std::size_t declared_topics = CountDeclaredTopics(described);
 
@@ -1125,15 +1149,21 @@ int Launcher::RunSession(StopSignals& stop_signals) {
                                   std::chrono::seconds(options_.duration_s)
                             : std::chrono::steady_clock::time_point::max();
 
-  const std::string remote = EffectiveRemoteAddress(robot_config, options_);
   const uint16_t remote_port = EffectiveRemotePort(robot_config, options_);
   const uint16_t local_port = EffectiveLocalPort(robot_config, options_);
   ConsoleLine(std::cout) << "[launcher] Starting session "
                          << options_.session_id << " with " << procs.size()
                          << " nodes...\n";
-  ConsoleLine(std::cout) << "[launcher] Controller " << remote << ":"
-                         << remote_port << " (local port " << local_port
-                         << ")\n";
+  if (effective_local_address.empty()) {
+    ConsoleLine(std::cout) << "[launcher] Controller " << effective_remote
+                           << ":" << remote_port << " (local port "
+                           << local_port << ")\n";
+  } else {
+    ConsoleLine(std::cout) << "[launcher] Controller " << effective_remote
+                           << ":" << remote_port << " (local "
+                           << effective_local_address << ":" << local_port
+                           << ")\n";
+  }
 
   // From the segments on, a stop ends the session through supervision and
   // the final manifest, as any stop does: a member it finds not yet started

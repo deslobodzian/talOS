@@ -231,6 +231,11 @@ std::string EffectiveRemoteAddress(const config::RobotConfig& config,
   return config::ResolveControllerAddress(config, options.remote);
 }
 
+std::string EffectiveLocalAddress(const config::RobotConfig& config,
+                                  const LauncherOptions& options) {
+  return config::ResolveLocalAddress(config, options.local_address);
+}
+
 uint16_t EffectiveRemotePort(const config::RobotConfig& config,
                              const LauncherOptions& options) {
   return config::ResolveControllerPort(config, options.remote_port);
@@ -243,9 +248,16 @@ uint16_t EffectiveLocalPort(const config::RobotConfig& config,
 
 std::vector<std::string> ControllerArgs(const config::RobotConfig& config,
                                         const LauncherOptions& options) {
-  return {"--remote",      EffectiveRemoteAddress(config, options),
-          "--remote-port", std::to_string(EffectiveRemotePort(config, options)),
-          "--local-port",  std::to_string(EffectiveLocalPort(config, options))};
+  std::vector<std::string> args{
+      "--remote",      EffectiveRemoteAddress(config, options),
+      "--remote-port", std::to_string(EffectiveRemotePort(config, options)),
+      "--local-port",  std::to_string(EffectiveLocalPort(config, options))};
+  if (const std::string local_address = EffectiveLocalAddress(config, options);
+      !local_address.empty()) {
+    args.emplace_back("--local-address");
+    args.push_back(local_address);
+  }
+  return args;
 }
 
 std::vector<std::string> SimulatorArgs(const config::RobotConfig& config,
