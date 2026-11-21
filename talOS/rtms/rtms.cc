@@ -7,6 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -608,8 +609,10 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
 
   // Revoke a former reliable publisher's full-capacity guarantee before any
   // overwrite, including one interrupted by writer death. The release fence
-  // keeps this invalidation before slot writes; readers fence their slot reads
-  // before checking the marker, as with a seqlock's write-in-progress marker.
+  // keeps this invalidation (and the prior sequence publication) before the
+  // relaxed atomic slot word stores below; a reader that observes any word of
+  // this overwrite synchronizes-with this fence at slot_still_valid()'s
+  // acquire fence ([atomics.fences]/2) and must reject the candidate.
   if (options_.overflow_policy != OverflowPolicy::DROP_NEWEST) {
     header_->writer.reliable_sequence.store(0, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
@@ -620,13 +623,25 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
   auto* next_segment =
       base + header_->data_offset + (slot_index * header_->slot_stride);
 
-  std::memcpy(next_segment, message.data(), message.size());
-  if (message.size() < header_->message_bytes) {
-    std::memset(next_segment + message.size(), 0,
-                header_->message_bytes - message.size());
+  // Copy payload and timestamp as uniform 8-byte relaxed atomic words so a
+  // concurrent read_next() on a lapped slot is well-defined (no C++ data
+  // race). Short writes and sub-8-byte tails are zero-padded in the word
+  // before storing, avoiding mixed-width atomic accesses.
+  for (std::size_t off = 0; off < publish_time_offset_;
+       off += sizeof(std::uint64_t)) {
+    std::uint64_t word = 0;
+    if (off < message.size()) {
+      const std::size_t chunk =
+          std::min<std::size_t>(sizeof(std::uint64_t), message.size() - off);
+      std::memcpy(&word, message.data() + off, chunk);
+    }
+    std::atomic_ref<std::uint64_t>(
+        *reinterpret_cast<std::uint64_t*>(next_segment + off))
+        .store(word, std::memory_order_relaxed);
   }
-  std::memcpy(next_segment + publish_time_offset_, &publish_time_ns,
-              sizeof(publish_time_ns));
+  std::atomic_ref<std::int64_t>(
+      *reinterpret_cast<std::int64_t*>(next_segment + publish_time_offset_))
+      .store(publish_time_ns, std::memory_order_relaxed);
   if (options_.overflow_policy == OverflowPolicy::DROP_NEWEST) {
     header_->writer.reliable_sequence.store(next_position,
                                             std::memory_order_release);
@@ -645,10 +660,10 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
   return {WriteResult::SUCCESS, writer_position};
 }
 
-const std::byte* RTMSQueue::slot_address(std::uint64_t message_sequence) const {
+std::byte* RTMSQueue::slot_address(std::uint64_t message_sequence) {
   const std::uint64_t slot_index = message_sequence & (header_->slots - 1);
 
-  return static_cast<const std::byte*>(ptr_.ptr()) + header_->data_offset +
+  return static_cast<std::byte*>(ptr_.ptr()) + header_->data_offset +
          (slot_index * header_->slot_stride);
 }
 
@@ -735,10 +750,21 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
       return ReadResult::EMPTY;
     }
 
-    const std::byte* slot = slot_address(candidate.sequence);
-    std::memcpy(destination.data(), slot, header_->message_bytes);
-    std::memcpy(&candidate.publish_time_ns, slot + publish_time_offset_,
-                sizeof(candidate.publish_time_ns));
+    std::byte* slot = slot_address(candidate.sequence);
+    for (std::size_t off = 0; off < publish_time_offset_;
+         off += sizeof(std::uint64_t)) {
+      const std::uint64_t word =
+          std::atomic_ref<std::uint64_t>(
+              *reinterpret_cast<std::uint64_t*>(slot + off))
+              .load(std::memory_order_relaxed);
+      const std::size_t chunk =
+          std::min<std::size_t>(sizeof(std::uint64_t), message_size_ - off);
+      std::memcpy(destination.data() + off, &word, chunk);
+    }
+    candidate.publish_time_ns =
+        std::atomic_ref<std::int64_t>(
+            *reinterpret_cast<std::int64_t*>(slot + publish_time_offset_))
+            .load(std::memory_order_relaxed);
 
     if (!slot_still_valid(candidate.sequence)) {
       continue;

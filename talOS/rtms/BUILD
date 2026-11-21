@@ -118,7 +118,6 @@ cc_test(
     name = "ring_lap_test",
     size = "small",
     srcs = ["ring_lap_test.cc"],
-    tags = ["no_tsan"],  # the lapped copy is a data race by design; tsan reports it
     deps = [
         ":ring_test_payload",
         ":rtms",
