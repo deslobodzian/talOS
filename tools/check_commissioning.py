@@ -7,11 +7,11 @@ CAN id (or moves a device to another CAN bus, which changes its physical CAN
 address) in a robot config; a person does that at the robot
 (docs/BRINGUP.md "Human commissioning"). This checks each commit in
 `merge-base(<rev>, HEAD)..HEAD` (a merged branch's commits included) on its
-own. For every non-exempt tracked `*.toml` file that commit changes, it reads
-the parent and commit blobs directly from git (`git cat-file blob`), parses
-both as TOML 1.0 with `tomllib` (failing closed on invalid UTF-8, TOML parse
-errors, or non-regular file modes such as symlinks), and reports any addition,
-change or removal of:
+own. For every non-exempt tracked `*.toml` file (matched case-insensitively)
+that commit changes, it reads the parent and commit blobs directly from git
+(`git cat-file blob`), parses both as TOML 1.0 with `tomllib` (failing closed
+on invalid UTF-8, TOML parse errors, or non-regular file modes), and reports
+any addition, change or removal of:
 
 - `commissioned` at any table path (non-table values),
 - `can_id` or `bus` at any table path (non-table values), including table
@@ -45,10 +45,13 @@ which git reads whatever the attribute source, must hold no rule. The check
 needs git 2.40 or later and Python 3.11 or later (`tomllib`); otherwise it
 exits 2 naming why.
 
-A robot or bench config is any tracked `*.toml` outside an `examples`,
-`tests` or `fixtures` directory and outside any directory whose name ends
-in `testdata`: examples carry placeholder ids (ARCHITECTURE.md
-"Configuration"), and test fixtures are not loaded onto hardware.
+A robot or bench config is any tracked `*.toml` (matched case-insensitively)
+outside an exact-case `examples`, `tests` or `fixtures` directory and outside
+any directory whose name ends in `testdata`: examples carry placeholder ids
+(ARCHITECTURE.md "Configuration"), and test fixtures are not loaded onto
+hardware. Any non-exempt tracked symlink (file or directory symlink, with or
+without a `.toml` suffix) also fails closed with `non-regular file mode 120000`,
+since a directory symlink could redirect a config tree into an exempt path.
 
 The override is the person's own: the commit that makes the change carries
 the trailer `Commissioned-By: <name>` (`git commit --trailer
@@ -58,10 +61,13 @@ Agents never write this trailer.
 
 Accepted bounds:
 
-- Only tracked `*.toml` files are checked (robot and bench configs are TOML).
-- Any path under `EXEMPT_DIRECTORIES` (`examples`, `tests`, `fixtures`) or a
-  `*testdata` directory is exempt per REQ-DEV-33, even if real config were
-  placed there.
+- Non-exempt `*.toml` files are matched case-insensitively (e.g. `.TOML`,
+  `.Toml`), and any non-exempt symlink (file or directory symlink, regardless
+  of extension) fails closed; regular non-TOML files are not inspected (robot
+  and bench configs are TOML).
+- Any path under exact-case `EXEMPT_DIRECTORIES` (`examples`, `tests`,
+  `fixtures`) or a `*testdata` directory is exempt per REQ-DEV-33, even if real
+  config were placed there.
 - No diff tells it apart: the trailer vouches for its whole commit, so a
   squash or amend that keeps a person's `Commissioned-By` in its last trailer
   block (the only one read) exempts everything folded into it, whoever wrote
@@ -97,6 +103,7 @@ TRAILER = "Commissioned-By"
 EXEMPT_DIRECTORIES = {"examples", "tests", "fixtures"}
 GUARDED_KEYS = frozenset({"commissioned", "can_id", "bus", "include"})
 REGULAR_MODES = frozenset({"100644", "100755"})
+SYMLINK_MODE = "120000"
 BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 KIND_LABEL = {
     "commissioned": "commissioned",
@@ -115,13 +122,18 @@ class CannotCheck(Exception):
     pass
 
 
+def is_exempt_path(path):
+    """Whether a tracked path lies under an exempt directory (exact case)."""
+    directories = path.split("/")[:-1]
+    return any(d in EXEMPT_DIRECTORIES or d.endswith("testdata")
+               for d in directories)
+
+
 def is_robot_config(path):
     """Whether a tracked path is a robot or bench config this rule guards."""
-    if not path.endswith(".toml"):
+    if not path.lower().endswith(".toml"):
         return False
-    directories = path.split("/")[:-1]
-    return not any(d in EXEMPT_DIRECTORIES or d.endswith("testdata")
-                   for d in directories)
+    return not is_exempt_path(path)
 
 
 def git(*args):
@@ -337,7 +349,8 @@ def compare_merge_guarded(base_map, p1_map, p2_map, merged_map):
 
 def parse_raw_diff_tree(raw):
     """Parse `git diff-tree --no-commit-id -r --no-renames --raw -z
-    --no-abbrev` output into {path: (old_entry, new_entry)} for robot configs."""
+    --no-abbrev` output into {path: (old_entry, new_entry)} for robot configs
+    and non-exempt symlinks."""
     tokens = raw.split(b"\0")
     entries = {}
     i = 0
@@ -359,7 +372,9 @@ def parse_raw_diff_tree(raw):
             raise CannotCheck("truncated diff-tree output")
         path = tokens[i].decode("utf-8", "surrogateescape")
         i += 1
-        if not is_robot_config(path):
+        is_symlink = old_mode == SYMLINK_MODE or new_mode == SYMLINK_MODE
+        if not (is_robot_config(path)
+                or (is_symlink and not is_exempt_path(path))):
             continue
         old_entry = (None if old_mode == "000000" or set(old_oid) == {"0"}
                      else (old_mode, old_oid))
@@ -370,15 +385,15 @@ def parse_raw_diff_tree(raw):
 
 
 def changed_toml_entries(pinned, rev_a, rev_b):
-    """Map changed non-exempt *.toml path -> (old_entry, new_entry).
-    When rev_a is None, diffs root commit rev_b against the empty tree."""
+    """Map changed non-exempt *.toml (case-insensitive) or symlink path ->
+    (old_entry, new_entry). When rev_a is None, diffs root commit rev_b
+    against the empty tree."""
     args = [*pinned, "diff-tree", "--no-commit-id", "-r", "--no-renames",
             "--raw", "-z", "--no-abbrev"]
     if rev_a is None:
         args.extend(["--root", rev_b])
     else:
         args.extend([rev_a, rev_b])
-    args.extend(["--", "*.toml"])
     return parse_raw_diff_tree(git_bytes(*args))
 
 
@@ -401,7 +416,7 @@ def tree_entry(pinned, rev, path):
     return None
 
 
-def load_guarded(entry, side_label=None):
+def load_guarded(entry, side_label=None, parse_toml=True):
     """Load and parse a git tree entry (mode, oid) into (guarded_map, error).
     Fails closed on non-regular file modes, invalid UTF-8, or invalid TOML."""
     if entry is None:
@@ -410,6 +425,8 @@ def load_guarded(entry, side_label=None):
     suffix = f" ({side_label})" if side_label else ""
     if mode not in REGULAR_MODES:
         return None, f"non-regular file mode {mode}{suffix}"
+    if not parse_toml:
+        return {}, None
     raw = git_bytes("cat-file", "blob", oid)
     try:
         text = raw.decode("utf-8")
@@ -426,8 +443,10 @@ def pair_findings(path, old_entry, new_entry):
     """Findings for one changed config between `old_entry` and `new_entry`."""
     if old_entry == new_entry:
         return []
-    new_map, new_err = load_guarded(new_entry)
-    old_map, old_err = load_guarded(old_entry, side_label="parent")
+    parse_toml = is_robot_config(path)
+    new_map, new_err = load_guarded(new_entry, parse_toml=parse_toml)
+    old_map, old_err = load_guarded(old_entry, side_label="parent",
+                                    parse_toml=parse_toml)
     errors = [err for err in (new_err, old_err) if err is not None]
     if errors:
         return [(path, err) for err in errors]
@@ -469,10 +488,14 @@ def merge_findings(pinned, commit, parents):
                 eb = tree_entry(pinned, base_rev, path)
                 if (em == e1 and e2 == eb) or (em == e2 and e1 == eb):
                     continue
-                m_map, m_err = load_guarded(em)
-                p1_map, p1_err = load_guarded(e1, side_label="first parent")
-                p2_map, p2_err = load_guarded(e2, side_label="second parent")
-                b_map, b_err = load_guarded(eb, side_label="merge base")
+                parse_toml = is_robot_config(path)
+                m_map, m_err = load_guarded(em, parse_toml=parse_toml)
+                p1_map, p1_err = load_guarded(e1, side_label="first parent",
+                                              parse_toml=parse_toml)
+                p2_map, p2_err = load_guarded(e2, side_label="second parent",
+                                              parse_toml=parse_toml)
+                b_map, b_err = load_guarded(eb, side_label="merge base",
+                                            parse_toml=parse_toml)
                 errors = [e for e in (m_err, p1_err, p2_err, b_err)
                           if e is not None]
                 if errors:
