@@ -11,10 +11,10 @@
 //     and nothing teleports.
 //
 // The motor/mechanism model below is the one reusable model: motor
-// type, gear ratio, inertia, friction, and load (roller/flywheel first). The
-// RoboRIO PhoenixBackend keeps its own first-order Kraken model (same 100 rps
-// at 12 V family); the GradleRIO build excludes sim_* headers (see
-// build.gradle).
+// type, gear ratio, inertia, friction, and load (roller/flywheel first).
+// RoboRIO desktop simulation (PhoenixBackend) instead uses WPILib's
+// LinearSystemId::DCMotorSystem plant and chassis kinematics for Pigeon2 yaw;
+// the GradleRIO build excludes sim_* headers (see build.gradle).
 //
 // Physics is driven by controller voltage output. Closed-loop modes
 // emulate a TalonFX-style P+FF loop producing volts from the configured gain

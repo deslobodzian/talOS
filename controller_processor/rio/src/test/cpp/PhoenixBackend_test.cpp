@@ -879,6 +879,170 @@ TEST(PhoenixBackendSim, NeutralPreservesMomentumAndBrakeDecaysFasterThanCoast) {
   EXPECT_GT(coast.after_300ms_rps, 10.0 * std::max(brake.after_300ms_rps, 0.1));
 }
 
+// Desktop simulation drives each motor through WPILib's DCMotorSystem plant
+// (motor type, FOC variant, and gear-reflected inertia) and forwards the
+// simulated RoboRIO battery voltage to each device rather than assuming a
+// fixed 100 rps / 12 V lag.
+// REQ-DEV-05, REQ-DEV-06
+TEST(PhoenixBackendSim, WpilibPlantReflectsMotorTypeFocGearingAndSupply) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto x60 = TestMotor(1, "x60", 1);
+  auto x60_foc = TestMotor(2, "x60_foc", 2);
+  x60_foc.foc = true;
+  auto x44 = TestMotor(3, "x44", 3);
+  x44.motor_type.value = hw::MotorType::kKrakenX44;
+  auto geared_x60 = TestMotor(4, "geared_x60", 4);
+  geared_x60.sensor_to_mechanism_ratio = 5.0;
+  config.motors = {x60, x60_foc, x44, geared_x60};
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  const std::array<hw::MotorRequest, 4> drive_6v{
+      Request(1, hw::Mode::kVoltage, 6.0), Request(2, hw::Mode::kVoltage, 6.0),
+      Request(3, hw::Mode::kVoltage, 6.0), Request(4, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, drive_6v, 35);
+  for (std::size_t i = 0; i < 4; ++i) ASSERT_TRUE(state.motors[i].valid) << i;
+
+  // Kraken X44 (7758 rpm) spins noticeably faster than Kraken X60 (6000 rpm),
+  // which spins slightly faster unloaded than Kraken X60 FOC (5800 rpm);
+  // gearing divides reported mechanism speed while preserving rotor dynamics.
+  EXPECT_GT(state.motors[0].velocity_rps, 45.0);
+  EXPECT_GT(state.motors[2].velocity_rps, state.motors[0].velocity_rps * 1.20);
+  EXPECT_GT(state.motors[0].velocity_rps, state.motors[1].velocity_rps + 1.0);
+  EXPECT_NEAR(state.motors[3].velocity_rps, state.motors[0].velocity_rps / 5.0,
+              0.5);
+
+  // Forwarding RoboRIO battery voltage: duty cycle 1.0 at an injected 8 V
+  // battery applies ~8 V instead of hardcoded 12 V, without overwriting the
+  // injected RoboRioSim battery reading.
+  const auto prev_v = frc::sim::RoboRioSim::GetVInVoltage();
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{8.0});
+  struct RestoreBattery {
+    units::volt_t volts;
+    ~RestoreBattery() { frc::sim::RoboRioSim::SetVInVoltage(volts); }
+  } restore{prev_v};
+
+  const std::array<hw::MotorRequest, 4> full_duty{
+      Request(1, hw::Mode::kDutyCycle, 1.0),
+      Request(2, hw::Mode::kNeutral, 0.0), Request(3, hw::Mode::kNeutral, 0.0),
+      Request(4, hw::Mode::kNeutral, 0.0)};
+  PumpReads(backend, state, full_duty, 30);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, 8.0);
+  EXPECT_NEAR(state.motors[0].voltage, 8.0, 0.5);
+  backend.Neutral();
+}
+
+// Under desktop simulation, inferred swerve or differential chassis kinematics
+// integrate wheel motion into Pigeon2 yaw and yaw rate, while a non-chassis
+// configuration leaves manually injected SetRawYaw untouched.
+// REQ-DEV-05
+TEST(PhoenixBackendPigeon,
+     ChassisKinematicsDrivesYawAndNonChassisPreservesManualYaw) {
+  EnsureHal();
+  EnabledDs ds;
+
+  // 1. Swerve chassis spinning in place CCW+, then reversing CW-.
+  {
+    hw::Config config;
+    const std::array<const char*, 4> corners{"front_left", "front_right",
+                                             "back_left", "back_right"};
+    const std::array<double, 4> spin_angles{0.375, 0.125, -0.375, -0.125};
+    for (std::size_t i = 0; i < corners.size(); ++i) {
+      auto drive = TestMotor(static_cast<uint16_t>(2 * i + 1),
+                             std::string(corners[i]) + "_drive",
+                             static_cast<int>(2 * i + 1));
+      drive.sensor_to_mechanism_ratio = 6.75;
+      auto steer = TestMotor(static_cast<uint16_t>(2 * i + 2),
+                             std::string(corners[i]) + "_steer",
+                             static_cast<int>(2 * i + 2));
+      steer.sensor_to_mechanism_ratio = 12.8;
+      steer.slots[0].p = 6.0;
+      config.motors.push_back(drive);
+      config.motors.push_back(steer);
+    }
+    config.sensors.push_back(
+        hw::SensorConfig{20, "imu", hw::SensorKind::kPigeon2, 30, "rio"});
+
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+
+    std::array<hw::MotorRequest, 8> cmd{};
+    for (std::size_t i = 0; i < 4; ++i) {
+      cmd[2 * i] =
+          Request(static_cast<uint16_t>(2 * i + 1), hw::Mode::kVoltage, 6.0);
+      cmd[2 * i + 1] = Request(static_cast<uint16_t>(2 * i + 2),
+                               hw::Mode::kPosition, spin_angles[i]);
+    }
+    hw::State state;
+    PumpReads(backend, state, cmd, 35);
+    ASSERT_TRUE(state.sensors[0].valid);
+    EXPECT_GT(state.sensors[0].velocity_rps, 0.1);
+    EXPECT_GT(state.sensors[0].position_rot, 0.05);
+
+    for (std::size_t i = 0; i < 4; ++i) {
+      cmd[2 * i] =
+          Request(static_cast<uint16_t>(2 * i + 1), hw::Mode::kVoltage, -6.0);
+    }
+    PumpReads(backend, state, cmd, 35);
+    EXPECT_LT(state.sensors[0].velocity_rps, -0.1);
+    backend.Neutral();
+  }
+
+  // 2. Differential chassis fallback (left/right drive pairs, 0.60 m track).
+  {
+    hw::Config config;
+    auto left = TestMotor(1, "left_drive", 1);
+    left.sensor_to_mechanism_ratio = 6.75;
+    auto right = TestMotor(2, "right_drive", 2);
+    right.sensor_to_mechanism_ratio = 6.75;
+    config.motors = {left, right};
+    config.sensors.push_back(
+        hw::SensorConfig{20, "imu", hw::SensorKind::kPigeon2, 30, "rio"});
+
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+
+    const std::array<hw::MotorRequest, 2> spin_ccw{
+        Request(1, hw::Mode::kVoltage, -6.0),
+        Request(2, hw::Mode::kVoltage, 6.0)};
+    hw::State state;
+    PumpReads(backend, state, spin_ccw, 30);
+    ASSERT_TRUE(state.sensors[0].valid);
+    EXPECT_GT(state.sensors[0].velocity_rps, 0.1);
+    EXPECT_GT(state.sensors[0].position_rot, 0.05);
+    backend.Neutral();
+  }
+
+  // 3. Non-chassis config under desktop simulation keeps manual SetRawYaw.
+  {
+    hw::Config config;
+    config.motors.push_back(TestMotor(1, "roller", 1));
+    config.sensors.push_back(
+        hw::SensorConfig{20, "imu", hw::SensorKind::kPigeon2, 30, "rio"});
+
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+
+    ctre::phoenix6::hardware::Pigeon2 observer(30,
+                                               ctre::phoenix6::CANBus{"rio"});
+    observer.GetSimState().SetRawYaw(units::degree_t{90.0});
+    const std::array<hw::MotorRequest, 1> neutral{
+        Request(1, hw::Mode::kNeutral, 0.0)};
+    hw::State state;
+    PumpReads(backend, state, neutral, 15);
+    ASSERT_TRUE(state.sensors[0].valid);
+    EXPECT_NEAR(state.sensors[0].position_rot, 0.25, 1e-3);
+  }
+}
+
 class PhoenixBackendFollower : public ::testing::TestWithParam<bool> {};
 
 TEST_P(PhoenixBackendFollower, FollowsMasterAndNeutralizesWithMaster) {

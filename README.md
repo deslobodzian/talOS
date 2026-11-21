@@ -63,7 +63,11 @@ change is made and verified: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 ```
 
 A team's robot lives in its own repository and runs there with
-`bazel run //:sim` ([docs/FIRST_MECHANISM.md](docs/FIRST_MECHANISM.md)).
+`bazel run //:sim` ([docs/FIRST_MECHANISM.md](docs/FIRST_MECHANISM.md)). For
+when to use ideal `SimBackend`, `sim_gateway --physics` (headless physics,
+`/sim/state` vision truth, fault injection), or WPILib desktop simulation
+(`./sim.sh` with a USB gamepad), see
+[which simulator to use for what](talOS/hardware/README.md#which-simulator-to-use-for-what).
 
 Check a robot's graph without starting it:
 

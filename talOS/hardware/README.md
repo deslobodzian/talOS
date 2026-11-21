@@ -316,6 +316,16 @@ Besides motors and CAN sensors, the manifest accepts RIO digital inputs and
 outputs, analog inputs, quadrature and duty-cycle encoders, and PWM outputs.
 Phoenix and both sims implement all of them.
 
+### Device scope
+
+The supported hardware scope is CTRE Phoenix 6 CAN devices (`TalonFX`,
+`CANcoder`, `Pigeon2`) plus RoboRIO onboard I/O (DIO inputs and outputs, analog
+inputs, quadrature and duty-cycle encoders, and PWM outputs). REV motor
+controllers, pneumatics, addressable LEDs, and CANrange are out of scope. Adding
+another device kind or exceeding the per-frame device caps requires growing the
+hardware `State` transport beyond a single UDP payload; see
+[state frame growth](../../docs/DATA_FLOW.md#state-frame-growth).
+
 A PWM output's request is off or a pulse (`PwmMode`, `messages.h`). Off sends
 no pulse (`PWM::SetDisabled`): a servo goes limp and a PWM motor controller
 sees no signal. A pulse is `output` on `PWM::SetSpeed`'s scale, -1 to +1,
@@ -1156,10 +1166,30 @@ or without a live command. Both keep each PWM output's last request
 
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see
-[`talOS/simulation/README.md`](../simulation/README.md)). The RoboRIO desktop model
-keeps its own first-order Kraken model (same 100 rps at 12 V family) and the
-same neutral rule: neutral removes drive and the rotor decays per `brake`
-(about 0.05 s braked, 1.0 s coasting) instead of stopping instantly.
+[`talOS/simulation/README.md`](../simulation/README.md)). The RoboRIO desktop
+simulation (`PhoenixBackend`, compiled off-RoboRIO only) uses WPILib's
+`LinearSystemId::DCMotorSystem` with `DCMotor` ratings (`KrakenX60`,
+`KrakenX44`, `Falcon500`, choosing the FOC variant when `foc = true`) at
+`J_rotor = 0.0005 kg·m²` reflected across each motor's gear ratio
+(`J_mech = J_rotor × gear_ratio²`, ~44.5 ms electrical time constant for a
+Kraken X60), writing rotor position, velocity, and acceleration plus remote
+CANcoder state and forwarding the RoboRIO's simulated battery voltage
+(`>= 4 V`) to each simulated device. Brake neutral drives `0 V` into the plant
+(shorted-winding back-EMF braking), while coast neutral decays exponentially
+(`tau = 1.0 s`) with the `0.01 rps` standstill snap. When swerve drive/steer
+pairs (`front`/`back`/`rear`, `left`/`right`, ±0.30 m) or differential
+left/right drive pairs (0.60 m trackwidth) are inferred from motor names,
+centered rigid-body kinematics integrate yaw and yaw rate into every configured
+`Pigeon2`; non-chassis configurations leave manually injected `Pigeon2` raw yaw
+untouched.
+
+### Which simulator to use for what
+
+| Path | How to run | Motor / chassis model | Driver Station & gamepad | Truth (`/sim/state`) & faults | Use for |
+|---|---|---|---|---|---|
+| Ideal (`SimBackend`) | `sim_gateway` (default, no `--physics`), or `SimHardware` in unit tests | Instant velocity/position; zero gains still move; zero Pigeon2 raw yaw | Scripted `--mode-schedule` / `--joystick-schedule` | None (resets & I/O setters in C++ tests only) | Fast logic, wiring, sequencing, mode/timeout unit tests |
+| Lightweight physics (`sim_gateway --physics`) | `./sim.sh --sim-gateway` (or `sim_gateway --physics`) | `sim::PhysicsSimBackend`: winding/current-limit model, gearing, hard stops, home switches, swerve ground pose & Pigeon2 yaw | Scripted `--mode-schedule` / `--joystick-schedule` (no USB gamepad) | Publishes `/sim/state` for cameras; odometry error (`--wheel-radius-error`, `--wheel-slip-gain`, `--gyro-drift-radps`) & `--fault-schedule` | Headless CI/soak runs, vision/odometry error tests, fault injection, PID/limit/homing verification |
+| WPILib desktop sim (`PhoenixBackend`) | `./sim.sh` (or `./gradlew simulateNative` in `controller_processor/rio`) | Real Phoenix 6 simulator + WPILib `LinearSystemId::DCMotorSystem` plant (`KrakenX60`/`X44`/`Falcon500`, FOC-aware) + inferred swerve/differential Pigeon2 yaw | WPILib Sim GUI with live USB gamepad (or `--headless` scripted schedules) | None (cameras emit invalid observations) | Interactive driving with a USB gamepad, testing real Phoenix 6 closed-loop/FOC/status-signal behaviour, RoboRIO-in-the-loop verification |
 
 ### Ground truth and odometry error
 
