@@ -193,6 +193,7 @@ py_test(
     srcs = ["bundle_builder_test.py"],
     data = [
         "bundle_builder.py",
+        "launcher_runner.py",
         "//tools:deploy.sh",
     ],
     legacy_create_init = False,

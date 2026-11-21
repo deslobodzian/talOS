@@ -187,7 +187,31 @@ struct LauncherOptions {
   // Target or node name -> binary path. Filled from the bundle manifest, or
   // directly by tests.
   std::map<std::string, std::string> binary_overrides;
+
+  // Main-repository apparent -> canonical repo name map, parsed from Bazel's
+  // `_repo_mapping`. When unset, MakeNodeSpec loads it from runfiles.
+  std::optional<std::map<std::string, std::string>> repo_mapping;
 };
+
+// ---------------------------------------------------------------------------
+// Repository mapping
+// ---------------------------------------------------------------------------
+
+// Main-repository apparent repo name -> canonical repo name (from entries of
+// Bazel's `_repo_mapping` whose source canonical name is empty).
+using RepoMapping = std::map<std::string, std::string>;
+
+// Parses Bazel's 3-column CSV `_repo_mapping` content
+// (`source_canonical,target_apparent,target_canonical`), returning the
+// `target_apparent -> target_canonical` map for `source_canonical == ""`.
+RepoMapping ParseRepoMapping(std::string_view content);
+
+// Reads Bazel's `_repo_mapping` from `<argv0>.runfiles/_repo_mapping` (or
+// `<argv0>.repo_mapping`) when `argv0` is non-empty, else from
+// `RUNFILES_DIR/_repo_mapping` when `RUNFILES_DIR` is set, else beside the
+// running executable (`<exe>.runfiles/_repo_mapping` / `<exe>.repo_mapping`).
+// Returns an empty map when no mapping file exists.
+RepoMapping LoadRepoMapping(std::string_view argv0 = {});
 
 // ---------------------------------------------------------------------------
 // Bundles
@@ -220,16 +244,24 @@ inline constexpr std::string_view kSimScheduleStartFile = "sim_schedule_start";
 // label is taken as a path.
 //
 // One node has two label spellings: apparent `@repo//pkg:rule` (as a robot
-// config spells it) and canonical `@@repo+//pkg:rule` (as a baked
-// TALOS_NODE_TARGET and the bundle manifest spell it). Module names never
-// contain '+', so for an override lookup both spellings normalize the repo
-// to the part before the first '+': `@wrist`, `@@wrist+` and `@@wrist`
-// compare equal, while `//pkg:rule`, paths and node names compare literally.
+// config spells it) and canonical `@@canon//pkg:rule` (as a baked
+// TALOS_NODE_TARGET and the bundle manifest spell it). When Bazel's
+// `_repo_mapping` covers the repo, `@apparent` resolves through
+// `apparent -> canonical` so custom `repo_name != module_name` and both
+// Bazel 8 (`+`) and Bazel 7 (`~`) canonical names compare equal. When no
+// mapping covers the repo, fallback strips a `+`/`~` canonical suffix so
+// `@wrist`, `@@wrist+`, `@@wrist~` and `@@wrist` still compare equal, while
+// `//pkg:rule`, paths and node names compare literally.
 std::string NormalizeTargetKey(std::string_view target);
+std::string NormalizeTargetKey(std::string_view target,
+                               const RepoMapping& repo_mapping);
 
 std::string ResolveBinary(
     const std::string& target_or_path,
     const std::map<std::string, std::string>& overrides = {});
+std::string ResolveBinary(const std::string& target_or_path,
+                          const std::map<std::string, std::string>& overrides,
+                          const RepoMapping& repo_mapping);
 
 // ResolveBinary, falling back to an override keyed by the node's name when
 // the target does not resolve to an executable. `studio_bridge` marks the

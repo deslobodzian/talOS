@@ -943,6 +943,21 @@ def _talos_bundle_impl(ctx):
         bundle_dir.path,
     ]
 
+    # Pass Bazel's `_repo_mapping` manifests (from the launcher, nodes, and
+    # Studio bridge) so bundle_builder maps canonical repo names to the main
+    # repository's real apparent names instead of guessing from `+` suffixes.
+    repo_mapping_targets = [ctx.attr.launcher] + list(ctx.attr.nodes)
+    if ctx.attr.studio_bridge:
+        repo_mapping_targets.append(ctx.attr.studio_bridge)
+    seen_repo_mappings = {}
+    for target in repo_mapping_targets:
+        ftr = target[DefaultInfo].files_to_run
+        rm = ftr.repo_mapping_manifest if ftr else None
+        if rm and rm not in seen_repo_mappings:
+            seen_repo_mappings[rm] = True
+            direct_inputs.append(rm)
+            arguments += ["--repo-mapping", rm.path]
+
     # The source revision only under --stamp (--config=release): the status
     # file changes with every commit, so an unstamped bundle never reads it
     # and stays cached.

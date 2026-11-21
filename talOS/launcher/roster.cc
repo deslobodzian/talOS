@@ -2,12 +2,112 @@
 
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <utility>
 
 #include "toml.hpp"
 
 namespace talos::launcher {
+
+namespace {
+
+std::optional<std::string> ReadFileContents(const std::filesystem::path& path) {
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(path, ec)) return std::nullopt;
+  std::ifstream input(path);
+  if (!input.is_open()) return std::nullopt;
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+  return buffer.str();
+}
+
+std::optional<std::string> ReadMappingBesideExecutable(
+    const std::filesystem::path& exe_path) {
+  if (exe_path.empty()) return std::nullopt;
+  const std::string base = exe_path.string();
+  if (auto content = ReadFileContents(
+          std::filesystem::path{base + ".runfiles"} / "_repo_mapping")) {
+    return content;
+  }
+  return ReadFileContents(std::filesystem::path{base + ".repo_mapping"});
+}
+
+std::filesystem::path CurrentExecutablePath() {
+#ifdef __APPLE__
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  if (size == 0) return {};
+  std::string buffer(size, '\0');
+  if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+  return std::filesystem::path{buffer.c_str()};
+#elif defined(__linux__)
+  std::error_code ec;
+  auto path = std::filesystem::read_symlink("/proc/self/exe", ec);
+  if (ec) return {};
+  return path;
+#else
+  return {};
+#endif
+}
+
+}  // namespace
+
+RepoMapping ParseRepoMapping(std::string_view content) {
+  RepoMapping mapping;
+  std::size_t pos = 0;
+  while (pos < content.size()) {
+    const std::size_t nl = content.find('\n', pos);
+    std::string_view line = nl == std::string_view::npos
+                                ? content.substr(pos)
+                                : content.substr(pos, nl - pos);
+    pos = nl == std::string_view::npos ? content.size() : nl + 1;
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    const std::size_t first_comma = line.find(',');
+    if (first_comma == std::string_view::npos) continue;
+    const std::size_t second_comma = line.find(',', first_comma + 1);
+    if (second_comma == std::string_view::npos) continue;
+    // Only 3-column rows for the main repository (empty source_canonical).
+    if (line.find(',', second_comma + 1) != std::string_view::npos) continue;
+    const std::string_view source = line.substr(0, first_comma);
+    const std::string_view apparent =
+        line.substr(first_comma + 1, second_comma - first_comma - 1);
+    const std::string_view canonical = line.substr(second_comma + 1);
+    if (source.empty() && !apparent.empty() && !canonical.empty()) {
+      mapping.emplace(std::string{apparent}, std::string{canonical});
+    }
+  }
+  return mapping;
+}
+
+RepoMapping LoadRepoMapping(std::string_view argv0) {
+  if (!argv0.empty()) {
+    if (auto content =
+            ReadMappingBesideExecutable(std::filesystem::path{argv0})) {
+      return ParseRepoMapping(*content);
+    }
+    return {};
+  }
+  if (const char* runfiles_dir = std::getenv("RUNFILES_DIR");
+      runfiles_dir != nullptr && *runfiles_dir != '\0') {
+    if (auto content = ReadFileContents(std::filesystem::path{runfiles_dir} /
+                                        "_repo_mapping")) {
+      return ParseRepoMapping(*content);
+    }
+    return {};
+  }
+  if (auto content = ReadMappingBesideExecutable(CurrentExecutablePath())) {
+    return ParseRepoMapping(*content);
+  }
+  return {};
+}
 
 bool LoadBundle(LauncherOptions& options, std::string& error) {
   if (options.bundle_dir.empty()) {
@@ -99,9 +199,12 @@ bool LoadBundle(LauncherOptions& options, std::string& error) {
   return true;
 }
 
-std::string NormalizeTargetKey(std::string_view target) {
+std::string NormalizeTargetKey(std::string_view target,
+                               const RepoMapping& repo_mapping) {
   std::string_view rest = target;
+  bool canonical = false;
   if (rest.starts_with("@@")) {
+    canonical = true;
     rest.remove_prefix(2);
   } else if (rest.starts_with("@")) {
     rest.remove_prefix(1);
@@ -110,19 +213,47 @@ std::string NormalizeTargetKey(std::string_view target) {
   }
   const std::size_t slashes = rest.find("//");
   if (slashes == std::string_view::npos) return std::string{target};
-  std::string_view repo = rest.substr(0, slashes);
-  if (const std::size_t plus = repo.find('+'); plus != std::string_view::npos)
-    repo = repo.substr(0, plus);
-  if (repo.empty() || repo.find_first_of("@/:") != std::string_view::npos)
+  const std::string_view repo = rest.substr(0, slashes);
+  const std::string_view path = rest.substr(slashes + 2);
+  if (repo.empty() || repo.find_first_of("@/:") != std::string_view::npos) {
     return std::string{target};
-  return std::string{repo} + "//" + std::string{rest.substr(slashes + 2)};
+  }
+  if (!canonical) {
+    if (const auto it = repo_mapping.find(std::string{repo});
+        it != repo_mapping.end()) {
+      if (it->second == "_main") return "//" + std::string{path};
+      return it->second + "//" + std::string{path};
+    }
+  } else {
+    if (repo == "_main") return "//" + std::string{path};
+    for (const auto& [apparent, mapped] : repo_mapping) {
+      if (mapped == repo) {
+        return std::string{repo} + "//" + std::string{path};
+      }
+    }
+  }
+  // Fallback when `_repo_mapping` does not cover this repository: strip
+  // Bazel 8 (`+`) or Bazel 7 (`~`) canonical suffixes so `@wrist` and
+  // `@@wrist+` / `@@wrist~` compare equal.
+  std::string_view base = repo;
+  if (const std::size_t sep = base.find_first_of("+~");
+      sep != std::string_view::npos) {
+    base = base.substr(0, sep);
+  }
+  if (base.empty()) return std::string{target};
+  return std::string{base} + "//" + std::string{path};
+}
+
+std::string NormalizeTargetKey(std::string_view target) {
+  return NormalizeTargetKey(target, LoadRepoMapping());
 }
 
 std::string ResolveBinary(const std::string& target_or_path,
-                          const std::map<std::string, std::string>& overrides) {
-  const std::string want = NormalizeTargetKey(target_or_path);
+                          const std::map<std::string, std::string>& overrides,
+                          const RepoMapping& repo_mapping) {
+  const std::string want = NormalizeTargetKey(target_or_path, repo_mapping);
   for (const auto& [key, path] : overrides) {
-    if (NormalizeTargetKey(key) == want) return path;
+    if (NormalizeTargetKey(key, repo_mapping) == want) return path;
   }
   if (target_or_path.starts_with("@")) {
     const bool canonical = target_or_path.starts_with("@@");
@@ -136,15 +267,22 @@ std::string ResolveBinary(const std::string& target_or_path,
       return target_or_path;
     }
     std::string repo = target_or_path.substr(repo_start, slashes - repo_start);
-    // Bazel 8 Bzlmod places apparent @repo under bazel-bin/external/<repo>+/,
-    // while canonical @@wrist+ already carries the trailing '+'.
-    if (!canonical && !repo.ends_with('+')) repo += '+';
+    if (!canonical) {
+      if (const auto it = repo_mapping.find(repo); it != repo_mapping.end()) {
+        repo = it->second;
+      } else if (!repo.ends_with('+') && !repo.ends_with('~')) {
+        // Fallback when no `_repo_mapping` covers this repo: Bazel 8 Bzlmod
+        // places apparent `@repo` under `bazel-bin/external/<repo>+/`.
+        repo += '+';
+      }
+    }
     std::string subpath = target_or_path.substr(slashes + 2);
     if (subpath.starts_with(':')) {
       subpath.erase(0, 1);
     } else {
       std::replace(subpath.begin(), subpath.end(), ':', '/');
     }
+    if (repo == "_main") return "bazel-bin/" + subpath;
     return "bazel-bin/external/" + repo + "/" + subpath;
   }
   if (!target_or_path.starts_with("//")) return target_or_path;
@@ -157,10 +295,17 @@ std::string ResolveBinary(const std::string& target_or_path,
   return "bazel-bin/" + subpath;
 }
 
+std::string ResolveBinary(const std::string& target_or_path,
+                          const std::map<std::string, std::string>& overrides) {
+  return ResolveBinary(target_or_path, overrides, LoadRepoMapping());
+}
+
 NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
                       const LauncherOptions& options, bool studio_bridge) {
+  const RepoMapping repo_mapping =
+      options.repo_mapping ? *options.repo_mapping : LoadRepoMapping();
   NodeSpec spec{std::string{name}, target,
-                ResolveBinary(target, options.binary_overrides)};
+                ResolveBinary(target, options.binary_overrides, repo_mapping)};
   spec.studio_bridge = studio_bridge;
   if (::access(spec.binary_path.c_str(), X_OK) != 0 &&
       (studio_bridge || name != kStudioBridgeName)) {

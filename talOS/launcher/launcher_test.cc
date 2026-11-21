@@ -2783,6 +2783,69 @@ TEST(LauncherBundleTest, ResolveBinaryPrefersOverrideThenBazelBin) {
             "/opt/talos/bundles/current/bin/wrist");
 }
 
+// REQ-DEV-30
+TEST(LauncherBundleTest, RepoMappingResolvesCustomApparentAndCanonicalNames) {
+  const RepoMapping mapping = ParseRepoMapping(
+      ",my_talos,talos+\n"
+      ",legacy_talos,talos~\n"
+      ",robot,_main\n"
+      "talos+,rules_cc,rules_cc+\n"
+      "malformed_line\n");
+  ASSERT_EQ(mapping.size(), 3U);
+  EXPECT_EQ(mapping.at("my_talos"), "talos+");
+  EXPECT_EQ(mapping.at("legacy_talos"), "talos~");
+  EXPECT_EQ(mapping.at("robot"), "_main");
+
+  // Apparent names resolve through `_repo_mapping` for both Bazel 8 (+) and
+  // Bazel 7 (~), and canonical names are used directly without appending `+`.
+  const std::map<std::string, std::string> empty_overrides;
+  EXPECT_EQ(
+      ResolveBinary("@my_talos//talOS/teleop:node", empty_overrides, mapping),
+      "bazel-bin/external/talos+/talOS/teleop/node");
+  EXPECT_EQ(ResolveBinary("@legacy_talos//talOS/teleop:node", empty_overrides,
+                          mapping),
+            "bazel-bin/external/talos~/talOS/teleop/node");
+  EXPECT_EQ(
+      ResolveBinary("@@talos~//talOS/teleop:node", empty_overrides, mapping),
+      "bazel-bin/external/talos~/talOS/teleop/node");
+  EXPECT_EQ(ResolveBinary("@@plain_canon//pkg:node", empty_overrides, mapping),
+            "bazel-bin/external/plain_canon/pkg/node");
+  EXPECT_EQ(ResolveBinary("@robot//gate:node", empty_overrides, mapping),
+            "bazel-bin/gate/node");
+
+  // NormalizeTargetKey aligns apparent and canonical spellings via the mapping
+  // even when repo_name != module_name, without colliding unrelated repos.
+  EXPECT_EQ(NormalizeTargetKey("@my_talos//talOS/teleop:node", mapping),
+            NormalizeTargetKey("@@talos+//talOS/teleop:node", mapping));
+  EXPECT_EQ(NormalizeTargetKey("@legacy_talos//talOS/teleop:node", mapping),
+            NormalizeTargetKey("@@talos~//talOS/teleop:node", mapping));
+  EXPECT_NE(NormalizeTargetKey("@talos//talOS/teleop:node", mapping),
+            NormalizeTargetKey("@@talos+//talOS/teleop:node", mapping));
+  EXPECT_EQ(NormalizeTargetKey("@robot//gate:node", mapping), "//gate:node");
+
+  std::map<std::string, std::string> overrides;
+  overrides["@@talos+//talOS/teleop:node"] = "/bundle/bin/teleop";
+  overrides["@@talos~//talOS/telemetry:node"] = "/bundle/bin/telemetry";
+  EXPECT_EQ(ResolveBinary("@my_talos//talOS/teleop:node", overrides, mapping),
+            "/bundle/bin/teleop");
+  EXPECT_EQ(
+      ResolveBinary("@legacy_talos//talOS/telemetry:node", overrides, mapping),
+      "/bundle/bin/telemetry");
+
+  // LoadRepoMapping reads `<argv0>.runfiles/_repo_mapping`.
+  const std::string fake_root = TempPath("repo_mapping_test");
+  const std::string fake_bin = fake_root + "/launcher";
+  std::filesystem::create_directories(fake_bin + ".runfiles");
+  {
+    std::ofstream f(fake_bin + ".runfiles/_repo_mapping");
+    f << ",custom_talos,talos+\n";
+  }
+  const RepoMapping loaded = LoadRepoMapping(fake_bin);
+  ASSERT_EQ(loaded.size(), 1U);
+  EXPECT_EQ(loaded.at("custom_talos"), "talos+");
+  std::filesystem::remove_all(fake_root);
+}
+
 TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   const std::string bundle_dir = TempPath("test_bundle_dir");
   std::filesystem::create_directories(bundle_dir + "/config");
