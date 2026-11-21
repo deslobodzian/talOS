@@ -206,7 +206,9 @@ when:
   module version.
 
 Each of these needs the network: do it, then run `bazel fetch //...` again,
-before leaving.
+before leaving. This documented preparation in the target checkout and output
+base is the supported offline workflow; talOS does not patch `rules_python` or
+`grpc` to suppress those PyPI index queries.
 
 ## Realtime grant for deploy.sh run
 

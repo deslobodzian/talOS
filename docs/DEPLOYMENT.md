@@ -144,11 +144,12 @@ local_address` to a physical interface):
 and the hardware bridge's `--describe` probe and its runs both get the
 effective values
 ([controller addressing](../talOS/launcher/README.md#controller-addressing)).
-A bundle carries no simulator (`--start-sim-gateway` reports the
-`[robot] sim_gateway` binary missing from the bundle), so something else must stand in for the
-RoboRIO on that host: a `sim_gateway` run from a checkout with `--config`
-naming the bundle's config, which then uses that config's `[robot]
-controller_port` and `local_port`, or the RoboRIO program under WPILib
+A bundle intentionally carries no simulator (`--start-sim-gateway` reports the
+`[robot] sim_gateway` binary missing from the bundle): deployed bundles carry
+only robot code and its config, so running a bundle simulated uses an external
+simulator standing in for the RoboRIO on that host—a `sim_gateway` run from a
+checkout with `--config` naming the bundle's config (which uses that config's
+`[robot] controller_port` and `local_port`), or the RoboRIO program under WPILib
 simulation. A launch that changes the ports with `--remote-port` and
 `--local-port` needs the same values given to a hand-run `sim_gateway` as
 `--port` and `--remote-port`.

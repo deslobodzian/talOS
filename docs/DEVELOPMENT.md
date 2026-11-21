@@ -173,6 +173,10 @@ commit, or the work reported as "pushed, CI pending".
 Every 25 commits or weekly, record as TODO.md entries and fixes: targets
 that failed twice in the last 20 CI runs without a product change; expired
 `quarantine` tags; new tests against
-[TESTING.md §4](TESTING.md#4-what-makes-a-test-meaningful); doc numbers,
-flags and names against code (a `scout` per doc); `[review]` marks that
-could be `[enforced]`; TODO.md items now passing or 60 days without evidence.
+[TESTING.md §4](TESTING.md#4-what-makes-a-test-meaningful); a sample of 10
+requirements in [REQUIREMENTS.md](REQUIREMENTS.md) audited against their
+tagged tests to confirm each test proves the requirement's sentence (not
+merely that a tag exists); doc numbers, flags and names against code (a
+`scout` per doc); `[review]` marks that could be `[enforced]` (the global
+whole-codebase clauses of `REQ-SAFE-14` and `REQ-SAFE-45` are accepted as
+review-only); TODO.md items now passing or 60 days without evidence.
