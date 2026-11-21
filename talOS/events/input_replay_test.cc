@@ -2401,5 +2401,295 @@ TEST(InputReplay, ArmAndDisarmTimerTrackingBeforeLateExit) {
   }
 }
 
+// With InputReplayOptions::allow_capped, a byte-capped session (`<log>.capped`
+// or manifest `log_capped`) replays deterministically from the start of the
+// kept window and warns on stderr naming the capped log(s) and pre-window
+// loss; default behavior (allow_capped = false) remains refusal.
+// REQ-OPS-14
+TEST(InputReplay, AllowCappedReplaysFromKeptWindowAndWarns) {
+  {
+    SCOPED_TRACE("rotated capped feed log (.capped marker)");
+    const std::string dir = TempDir("allow_capped_feed");
+    const std::string out = TempDir("allow_capped_feed_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string observer = dir + "/observer.tlog";
+    RotateAt(observer, {kOrigin + 20ms, kOrigin + 40ms});
+    std::filesystem::remove(log::LogSegmentPath(observer, 0));
+    CreateEmptyFile(log::CappedMarkerPath(observer));
+
+    // Default refuses.
+    {
+      const RecordedSession session{dir};
+      SimulationEnvironment env;
+      Loop loop{env, log::LogWriter{out + "/refused.tlog", "consumer"},
+                Loop::Options{.start = session.start()}};
+      TestRobot<Loop> consumer{loop, kTopics, kGain};
+      consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+      EXPECT_THROW(ReplayInputs(loop, env, session), ReplayError);
+      EXPECT_EQ(loop.dispatch_count(), 0u);
+    }
+
+    // allow_capped replays deterministically and warns.
+    const InputReplayOptions opts{.allow_capped = true};
+    const RecordedSession session{dir, {}, opts};
+    auto run_once = [&](const std::string& log_path, std::string& stderr_out) {
+      SimulationEnvironment env;
+      Loop loop{env, log::LogWriter{log_path, "consumer"},
+                Loop::Options{.start = session.loop_start(),
+                              .run_start = session.run_start()}};
+      TestRobot<Loop> consumer{loop, kTopics, kGain};
+      consumer.control_timer().setup_periodic(session.loop_start() + 1ms, 1ms);
+      ::testing::internal::CaptureStderr();
+      const InputReplayReport report = ReplayInputs(loop, env, session, opts);
+      stderr_out = ::testing::internal::GetCapturedStderr();
+      return std::pair{consumer.efforts(), report};
+    };
+    std::string err1;
+    std::string err2;
+    const auto [efforts1, report1] = run_once(out + "/first.tlog", err1);
+    const auto [efforts2, report2] = run_once(out + "/second.tlog", err2);
+    EXPECT_FALSE(report1.stopped_at_gap.has_value());
+    EXPECT_EQ(report1.capped_logs, std::vector<std::string>{observer});
+    EXPECT_NE(err1.find(observer), std::string::npos) << err1;
+    EXPECT_NE(err1.find("kept window"), std::string::npos) << err1;
+    EXPECT_EQ(efforts1, efforts2);
+    EXPECT_EQ(Sends(out + "/first.tlog"), Sends(out + "/second.tlog"));
+    // Observer kept setpoints from 20..60 ms (25, 35, 45, 55 -> 4 of 6).
+    ASSERT_EQ(report1.fed.size(), 2u);
+    EXPECT_EQ(report1.fed[1].topic, kTopics.setpoint);
+    EXPECT_EQ(report1.fed[1].messages, 4u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("manifest log_capped without .capped file");
+    const std::string dir = TempDir("allow_capped_manifest");
+    const std::string out = TempDir("allow_capped_manifest_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string observer = dir + "/observer.tlog";
+    RotateAt(observer, {kOrigin + 20ms});
+    std::filesystem::remove(log::LogSegmentPath(observer, 0));
+    WriteManifest(dir, "\"log_gap\": false, \"log_capped\": true");
+
+    const RecordedSession session{dir};
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    ::testing::internal::CaptureStderr();
+    const InputReplayReport report = ReplayInputs(
+        loop, env, session, InputReplayOptions{.allow_capped = true});
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.capped_logs, std::vector<std::string>{observer});
+    EXPECT_NE(err.find(observer), std::string::npos) << err;
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("timed node whose segment0 was rotated out by byte cap");
+    const std::string dir = TempDir("allow_capped_timed");
+    const std::string out = TempDir("allow_capped_timed_out");
+    RecordLateTicker(dir);
+    const std::string path = dir + "/ticker.tlog";
+    RotateAt(path, {kOrigin + 20ms, kOrigin + 40ms});
+    std::filesystem::remove(log::LogSegmentPath(path, 0));
+    CreateEmptyFile(log::CappedMarkerPath(path));
+    const std::vector<std::int64_t> kept_firings = LogTimerFirings(path);
+    ASSERT_FALSE(kept_firings.empty());
+
+    const InputReplayOptions opts{.allow_capped = true};
+    const RecordedSession session{dir, "ticker", opts};
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/ticker.tlog", "ticker"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    const Ticker ticker{loop};
+    ::testing::internal::CaptureStderr();
+    const InputReplayReport report = ReplayInputs(loop, env, session, opts);
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.capped_logs, std::vector<std::string>{path});
+    EXPECT_NE(err.find(path), std::string::npos) << err;
+    EXPECT_NE(err.find("kept window"), std::string::npos) << err;
+    EXPECT_EQ(TimerFirings(out + "/ticker.tlog"), kept_firings);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE(
+        "timed node with no firing in kept window starts at earliest dispatch");
+    const std::string dir = TempDir("allow_capped_dispatch_only");
+    const std::string out = TempDir("allow_capped_dispatch_only_out");
+    RecordSlowTicker(dir, kOrigin + 21ms);
+    const std::string path = dir + "/slow.tlog";
+    ASSERT_TRUE(TimerFirings(path).empty());
+    RotateAt(path, {kOrigin + 10ms});
+    std::filesystem::remove(log::LogSegmentPath(path, 0));
+    CreateEmptyFile(log::CappedMarkerPath(path));
+    const std::vector<Receipt> kept_receipts = Receipts(path);
+    ASSERT_FALSE(kept_receipts.empty());
+
+    const InputReplayOptions opts{.allow_capped = true};
+    const RecordedSession session{dir, "slow", opts};
+    EXPECT_EQ(session.run_start(), kOrigin + 10ms);
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/slow.tlog", "slow"},
+              Loop::Options{.delivery = Delivery::ON_PUBLISH,
+                            .start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    SlowTicker slow{loop};
+    ::testing::internal::CaptureStderr();
+    const InputReplayReport report = ReplayInputs(loop, env, session, opts);
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.capped_logs, std::vector<std::string>{path});
+    EXPECT_NE(err.find(path), std::string::npos) << err;
+    EXPECT_EQ(TimerFirings(out + "/slow.tlog"), std::vector<std::int64_t>{});
+    // The replayed SimulationEnvironment numbers messages from 0, while the
+    // kept window's timestamps (now, event_time, publish_time) match live.
+    const std::vector<Receipt> replayed = Receipts(out + "/slow.tlog");
+    ASSERT_EQ(replayed.size(), kept_receipts.size());
+    for (std::size_t i = 0; i < kept_receipts.size(); ++i) {
+      EXPECT_EQ(std::get<0>(replayed[i]), std::get<0>(kept_receipts[i]));
+      EXPECT_EQ(std::get<1>(replayed[i]), std::get<1>(kept_receipts[i]));
+      EXPECT_EQ(std::get<2>(replayed[i]), std::get<2>(kept_receipts[i]));
+    }
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
+// Even with allow_capped = true, uncapped log_gap, recorder_failed, incomplete
+// headers, unmarked missing segment0, and unbounded damage are still refused,
+// and GAP records in the kept window still stop the replay.
+// REQ-OPS-14
+TEST(InputReplay, AllowCappedStillRefusesUncappedGapsDamageAndBrokenSegments) {
+  const InputReplayOptions allow{.allow_capped = true};
+  {
+    SCOPED_TRACE("capped AND log_gap without EXIT");
+    const std::string dir = TempDir("allow_capped_log_gap");
+    const std::string out = TempDir("allow_capped_log_gap_out");
+    RecordSession(dir, out + "/live.tlog");
+    CreateEmptyFile(dir + "/observer.tlog.capped");
+    WriteManifest(dir, "\"log_gap\": true, \"log_capped\": true");
+    std::filesystem::resize_file(dir + "/observer.tlog",
+                                 RecordOffsets(dir + "/observer.tlog").back());
+    const RecordedSession session{dir, {}, allow};
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    EXPECT_THROW(ReplayInputs(loop, env, session, allow), ReplayError);
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("capped AND recorder_failed without EXIT");
+    const std::string dir = TempDir("allow_capped_rec_failed");
+    const std::string out = TempDir("allow_capped_rec_failed_out");
+    RecordSession(dir, out + "/live.tlog");
+    CreateEmptyFile(dir + "/observer.tlog.capped");
+    WriteManifest(
+        dir,
+        "\"log_gap\": false, \"log_capped\": true, \"recorder_failed\": true");
+    std::filesystem::resize_file(dir + "/observer.tlog",
+                                 RecordOffsets(dir + "/observer.tlog").back());
+    const RecordedSession session{dir, {}, allow};
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    EXPECT_THROW(ReplayInputs(loop, env, session, allow), ReplayError);
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("capped with incomplete header on segment0");
+    const std::string dir = TempDir("allow_capped_incomplete_head");
+    const std::string out = TempDir("allow_capped_incomplete_head_out");
+    RecordLateTicker(dir);
+    const std::string path = dir + "/ticker.tlog";
+    RotateAt(path, {kOrigin + 20ms, kOrigin + 40ms});
+    ZeroFileHeader(log::LogSegmentPath(path, 0));
+    CreateEmptyFile(log::CappedMarkerPath(path));
+    const RecordedSession session{dir, "ticker", allow};
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/ticker.tlog", "ticker"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    const Ticker ticker{loop};
+    EXPECT_THROW(ReplayInputs(loop, env, session, allow), ReplayError);
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("capped with unbounded damage");
+    const std::string dir = TempDir("allow_capped_damage");
+    const std::string out = TempDir("allow_capped_damage_out");
+    const std::vector<std::uint64_t> offsets = ReaderLog(dir);
+    DamageRecord(dir + "/reader.tlog", offsets[0]);
+    CreateEmptyFile(dir + "/reader.tlog.capped");
+    const RecordedSession session{dir, {}, allow};
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/watcher.tlog", "watcher"},
+              Loop::Options{.start = session.start()}};
+    SensorWatcher watcher{loop};
+    EXPECT_THROW(ReplayInputs(loop, env, session, allow), ReplayError);
+    EXPECT_EQ(watcher.readings, 0);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("missing segment0 without .capped or manifest log_capped");
+    const std::string dir = TempDir("allow_capped_unmarked_missing");
+    const std::string out = TempDir("allow_capped_unmarked_missing_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string observer = dir + "/observer.tlog";
+    RotateAt(observer, {kOrigin + 20ms, kOrigin + 40ms});
+    std::filesystem::remove(log::LogSegmentPath(observer, 0));
+    const RecordedSession session{dir, {}, allow};
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    EXPECT_THROW(ReplayInputs(loop, env, session, allow), ReplayError);
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE(
+        "capped log with a GAP record in the kept window still stops at gap");
+    const std::string dir = TempDir("allow_capped_gap_in_window");
+    const std::string out = TempDir("allow_capped_gap_in_window_out");
+    RecordSession(dir, out + "/live.tlog");
+    const std::string observer = dir + "/observer.tlog";
+    const log::LogGap gap = MarkGap(observer, kOrigin + 45ms);
+    RotateAt(observer, {kOrigin + 20ms});
+    std::filesystem::remove(log::LogSegmentPath(observer, 0));
+    CreateEmptyFile(log::CappedMarkerPath(observer));
+    const RecordedSession session{dir, {}, allow};
+    SimulationEnvironment env;
+    Loop loop{env, log::LogWriter{out + "/consumer.tlog", "consumer"},
+              Loop::Options{.start = session.start()}};
+    TestRobot<Loop> consumer{loop, kTopics, kGain};
+    consumer.control_timer().setup_periodic(session.start() + 1ms, 1ms);
+    const InputReplayReport report = ReplayInputs(loop, env, session, allow);
+    ASSERT_TRUE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.stopped_at_gap->log, observer);
+    EXPECT_EQ(report.stopped_at_gap->at.nanos(), gap.start_ns);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
 }  // namespace
 }  // namespace talos::event

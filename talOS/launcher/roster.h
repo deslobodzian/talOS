@@ -123,6 +123,13 @@ struct LauncherOptions {
           [](const std::filesystem::path& path, std::error_code& error) {
             std::filesystem::create_directories(path, error);
           }};
+  // Internal retention seam: removes a moved session or leftover directory
+  // tree, setting the error when it cannot; std::filesystem::remove_all in
+  // production.
+  std::function<std::uintmax_t(const std::filesystem::path&, std::error_code&)>
+      remove_all{[](const std::filesystem::path& path, std::error_code& error) {
+        return std::filesystem::remove_all(path, error);
+      }};
   // Internal start-up seam: called on the launcher's thread once the
   // session's topic segments exist, before the first manifest and any spawn.
   // Empty in production.
@@ -149,6 +156,11 @@ struct LauncherOptions {
   // directory logged (talOS/events/input_replay.h), and nothing else.
   std::string replay_inputs;
   std::string only;
+  // With `replay_inputs`: allow replaying logs capped by [robot]
+  // log_max_bytes (`<log>.capped` or manifest `log_capped`) from the start of
+  // their kept window instead of refusing them (REQ-OPS-14). Refused without
+  // `replay_inputs`.
+  bool allow_capped_replay{false};
 
   // How long one binary gets to answer --describe. A Python node importing
   // native wheels (robotpy-wpimath) needs several seconds on its first run

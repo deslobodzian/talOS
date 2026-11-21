@@ -73,6 +73,8 @@ int main(int argc, char** argv) {
         options.replay_inputs = argv[++i];
       } else if (arg == "--only" && i + 1 < argc) {
         options.only = argv[++i];
+      } else if (arg == "--allow-capped-replay") {
+        options.allow_capped_replay = true;
       } else if (arg == "--max-restarts" && i + 1 < argc) {
         options.max_restarts = std::stoi(argv[++i]);
         if (*options.max_restarts < 0) {
@@ -96,7 +98,8 @@ int main(int argc, char** argv) {
                "[--allow-graph-errors] [--describe-timeout-ms MS] "
                "[--max-restarts N] "
                "[--remote IP] [--remote-port PORT] [--local-port PORT] "
-               "[--replay-inputs SESSION_DIR --only NODE]\n"
+               "[--replay-inputs SESSION_DIR --only NODE "
+               "[--allow-capped-replay]]\n"
                "\n"
                "  --bundle PATH          launch from a bundle directory "
                "(assembled by talos_bundle)\n"
@@ -145,7 +148,12 @@ int main(int argc, char** argv) {
                "the topics the session\n"
                "                         in DIR logged at their "
                "recorded times; its log goes\n"
-               "                         to --output-dir\n";
+               "                         to --output-dir\n"
+               "  --allow-capped-replay  with --replay-inputs, replay "
+               "byte-capped logs from\n"
+               "                         the start of their kept window "
+               "(warns of pre-window\n"
+               "                         loss; still refuses uncapped gaps)\n";
         return 0;
       } else {
         throw std::invalid_argument("unknown argument: " + arg);

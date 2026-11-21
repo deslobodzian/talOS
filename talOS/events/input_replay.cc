@@ -174,8 +174,9 @@ std::map<std::string, ManifestMarks> MarkedLogNames(
 }  // namespace
 
 RecordedSession::RecordedSession(const std::string& path,
-                                 std::string_view replayed)
-    : log_paths_{SessionFiles(path)} {
+                                 std::string_view replayed,
+                                 InputReplayOptions options)
+    : allow_capped_{options.allow_capped}, log_paths_{SessionFiles(path)} {
   if (log_paths_.empty()) {
     throw std::runtime_error("no .tlog files in " + path);
   }
@@ -205,6 +206,7 @@ RecordedSession::RecordedSession(const std::string& path,
   // from a firing).
   std::string replayed_run_log;
   std::string replayed_run_first_read;
+  std::string replayed_run_skipped_incomplete;
   std::string replayed_run_file;
   bool replayed_run_fired = false;
   std::string replayed_run_broken;
@@ -264,6 +266,10 @@ RecordedSession::RecordedSession(const std::string& path,
     std::vector<Stretch> damage;
     bool exit{false};
     std::string segment_refusal;
+    // True when `segment_refusal` is solely a missing first segment (no
+    // incomplete header, no middle-segment gap, no dispatch/sequence jump),
+    // which a byte-capped log explains when allow_capped is set.
+    bool head_missing_only{false};
     std::vector<std::pair<std::uint32_t, bool>> topics;
   };
   std::vector<ReadLog> logs;
@@ -376,6 +382,8 @@ RecordedSession::RecordedSession(const std::string& path,
     // Check structural continuity with the previously read file of `base_log`.
     bool header_continues = false;
     std::string segment_refusal;
+    bool head_missing_only = false;
+    const std::string skipped_incomplete_before = cont.skipped_incomplete;
     if (!cont.has_readable) {
       if (!cont.skipped_incomplete.empty()) {
         segment_refusal = "its earlier segment " + cont.skipped_incomplete +
@@ -385,6 +393,7 @@ RecordedSession::RecordedSession(const std::string& path,
         segment_refusal = "its first segment " +
                           log::LogSegmentPath(base_log, 0) + " of " + base_log +
                           " is missing";
+        head_missing_only = true;
       }
     } else {
       if (!cont.skipped_incomplete.empty()) {
@@ -573,6 +582,7 @@ RecordedSession::RecordedSession(const std::string& path,
                               ", not 1: its first segment " +
                               log::LogSegmentPath(base_log, 0) + " of " +
                               base_log + " is missing";
+            head_missing_only = true;
           } else if (header_continues && cont.prev_last_dispatch.has_value() &&
                      header.dispatch_index > *cont.prev_last_dispatch + 1) {
             next_segment = false;
@@ -813,6 +823,7 @@ RecordedSession::RecordedSession(const std::string& path,
                                 .timer_state_uncertain = timer_state_uncertain};
     read.gap = gap;
     read.segment_refusal = std::move(segment_refusal);
+    read.head_missing_only = head_missing_only;
     read.topics = std::move(recorded);
     logs.push_back(std::move(read));
     // Its first run: the earliest origin among its logs (restarts included).
@@ -830,6 +841,7 @@ RecordedSession::RecordedSession(const std::string& path,
                                     run_start.value_or(reader.start_time())));
       replayed_run_log = base_log;
       replayed_run_first_read = log_path;
+      replayed_run_skipped_incomplete = skipped_incomplete_before;
       replayed_run_file = log_path;
       replayed_run_fired = run_start.has_value();
       replayed_run_broken.clear();
@@ -884,6 +896,22 @@ RecordedSession::RecordedSession(const std::string& path,
       !replayed_run_loss && replayed_run_dispatch) {
     replayed_run->second =
         std::max(replayed_run->first, *replayed_run_dispatch);
+  }
+  // Whether the replayed program's first run was read from its first segment.
+  // When segment 0 was rotated out (e.g. by the byte cap), any ARM_TIMER or
+  // DISARM_TIMER in segment 0 is unseen, so tracked timer state is uncertain
+  // and must not clamp loop_end().
+  bool replayed_run_from_head = true;
+  if (replayed_run) {
+    const std::vector<std::string> files =
+        log::LogSegmentFiles(replayed_run_log);
+    const bool starts_mid_run = replayed_run_first_dispatch_index.has_value() &&
+                                *replayed_run_first_dispatch_index > 1;
+    replayed_run_from_head =
+        !starts_mid_run &&
+        (LogAndPlace(replayed_run_first_read).second == 0 ||
+         (files.size() == 1 && files.front() == replayed_run_first_read));
+    if (!replayed_run_from_head) replayed_run_timers_uncertain = true;
   }
   // A single-run live loop that was late when it stopped can record its EXIT
   // after a due timer deadline it never fired, and an offset-0 timer whose
@@ -942,7 +970,7 @@ RecordedSession::RecordedSession(const std::string& path,
   for (const ReadLog& log : logs) {
     if (log.exit) exited.insert(log.path);
   }
-  const auto refusal = [&](const std::string& file) -> std::string {
+  const auto cap_refusal = [&](const std::string& file) -> std::string {
     const std::string log = LogOfFile(file);
     if (std::string marker = log::CappedMarkerPath(log);
         std::filesystem::exists(marker)) {
@@ -950,11 +978,17 @@ RecordedSession::RecordedSession(const std::string& path,
     }
     const auto marks =
         marked.find(std::filesystem::path{log}.filename().string());
-    if (marks == marked.end()) return {};
-    if (marks->second.log_capped) {
+    if (marks != marked.end() && marks->second.log_capped) {
       return "the session manifest marks its member log_capped: no GAP "
              "record marks what the byte cap cost it";
     }
+    return {};
+  };
+  const auto hard_refusal = [&](const std::string& file) -> std::string {
+    const std::string log = LogOfFile(file);
+    const auto marks =
+        marked.find(std::filesystem::path{log}.filename().string());
+    if (marks == marked.end()) return {};
     if (marks->second.log_gap && !exited.contains(log)) {
       return "the session manifest marks its member log_gap, and its run's "
              "log has no EXIT record: a gap its process's end cut short has "
@@ -985,8 +1019,13 @@ RecordedSession::RecordedSession(const std::string& path,
   // whose lost receipts' messages the session's logs all hold (the writer's
   // sends) lost nothing the feed lacks, and is no loss.
   for (const ReadLog& log : logs) {
-    std::string sign = refusal(log.path);
-    if (sign.empty()) sign = log.segment_refusal;
+    const std::string base_log = LogOfFile(log.path);
+    const std::string cap_sign = cap_refusal(log.path);
+    std::string hard_sign = hard_refusal(log.path);
+    if (hard_sign.empty() && !log.segment_refusal.empty() &&
+        !(log.head_missing_only && !cap_sign.empty())) {
+      hard_sign = log.segment_refusal;
+    }
     for (const auto& [topic, watched_here] : log.topics) {
       if (watched_by_replayed[topic] && !watched_here) continue;
       RecordedTopic& fed = topics_[topic];
@@ -999,7 +1038,7 @@ RecordedSession::RecordedSession(const std::string& path,
         }
       };
       if (log.gap.has_value()) loss(*log.gap, std::nullopt);
-      std::string reason = sign;
+      std::string reason = hard_sign;
       for (const Stretch& stretch : log.damage) {
         if (stretch.topic != topic ||
             (stretch.receipts && stretch.to.has_value() &&
@@ -1024,6 +1063,16 @@ RecordedSession::RecordedSession(const std::string& path,
         fed.refused_log = log.path;
         fed.refused_reason = reason;
       }
+      if (!cap_sign.empty()) {
+        if (fed.capped_log.empty()) {
+          fed.capped_log = log.path;
+          fed.capped_reason = cap_sign;
+        }
+        if (std::find(fed.capped_logs.begin(), fed.capped_logs.end(),
+                      base_log) == fed.capped_logs.end()) {
+          fed.capped_logs.push_back(base_log);
+        }
+      }
     }
   }
   // The replayed program's run start is its first timer firing less that
@@ -1033,66 +1082,84 @@ RecordedSession::RecordedSession(const std::string& path,
   // LogSegmentPath(log, 0) nor the log of a run never rotated), the first
   // firing read may be whole periods after the run's, and every timer would
   // replay that late: the log is refused, as a fed topic's capped log is,
-  // whether or not a topic is fed from it. So is a log in which a file read
+  // whether or not a topic is fed from it, unless it is byte-capped and
+  // InputReplayOptions::allow_capped is set. So is a log in which a file read
   // before any firing did not continue the one before it (a segment between
   // them missing or unread). With no armed timer the run start is the log's
   // origin, which every segment holds.
   if (replayed_run_timed) {
     const std::string& log = replayed_run_log;
-    const std::vector<std::string> files = log::LogSegmentFiles(log);
     const std::string head = log::LogSegmentPath(log, 0);
-    const bool starts_mid_run = replayed_run_first_dispatch_index.has_value() &&
-                                *replayed_run_first_dispatch_index > 1;
-    const bool from_head =
-        !starts_mid_run &&
-        (LogAndPlace(replayed_run_first_read).second == 0 ||
-         (files.size() == 1 && files.front() == replayed_run_first_read));
-    if (!from_head) {
+    if (!replayed_run_from_head) {
       const std::string marker = log::CappedMarkerPath(log);
       const auto marks =
           marked.find(std::filesystem::path{log}.filename().string());
-      std::string sign;
-      if (std::filesystem::exists(head)) {
-        sign =
+      const bool capped = std::filesystem::exists(marker) ||
+                          (marks != marked.end() && marks->second.log_capped);
+      if (!replayed_run_skipped_incomplete.empty()) {
+        run_start_refused_log_ = replayed_run_first_read;
+        run_start_refused_reason_ =
+            "its earlier segment could not be read (its header is "
+            "incomplete): " +
+            replayed_run_skipped_incomplete +
+            ", which may have held the first timer firing the run start is "
+            "read from, and a later segment's first firing may be whole "
+            "periods after it";
+      } else if (std::filesystem::exists(head)) {
+        run_start_refused_log_ = replayed_run_first_read;
+        run_start_refused_reason_ =
             "its first segment could not be read (its header is "
-            "incomplete): ";
-      } else if (std::filesystem::exists(marker)) {
-        sign = marker + " exists: the byte cap deleted its first segment ";
-      } else if (marks != marked.end() && marks->second.log_capped) {
-        sign =
-            "the session manifest marks its member log_capped: the byte cap "
-            "deleted its first segment ";
+            "incomplete): " +
+            head +
+            ", which may have held the first timer firing the run start is "
+            "read from, and a later segment's first firing may be whole "
+            "periods after it";
+      } else if (capped) {
+        const std::string sign =
+            std::filesystem::exists(marker)
+                ? marker + " exists: the byte cap deleted its first segment "
+                : "the session manifest marks its member log_capped: the byte "
+                  "cap deleted its first segment ";
+        run_start_capped_log_ = replayed_run_first_read;
+        run_start_capped_base_log_ = log;
+        run_start_capped_reason_ =
+            sign + head +
+            ", which may have held the first timer firing the run start is "
+            "read from, and a later segment's first firing may be whole "
+            "periods after it";
       } else {
-        sign = "its first segment is gone: ";
+        run_start_refused_log_ = replayed_run_first_read;
+        run_start_refused_reason_ =
+            "its first segment is gone: " + head +
+            ", which may have held the first timer firing the run start is "
+            "read from, and a later segment's first firing may be whole "
+            "periods after it";
       }
-      run_start_refused_log_ = replayed_run_first_read;
-      run_start_refused_reason_ =
-          sign + head +
-          ", which may have held the first timer firing the run start is "
-          "read from, and a later segment's first firing may be whole periods "
-          "after it";
-    } else if (!replayed_run_fired && !replayed_run_broken.empty()) {
-      run_start_refused_log_ = replayed_run_broken;
-      run_start_refused_reason_ =
-          "it does not continue the segment of " + log +
-          " read before it (a segment between them is missing or could not "
-          "be read), which may have held the first timer firing the run "
-          "start is read from, and none was read before it";
-    } else if (!replayed_run_fired && !replayed_run_dispatch) {
-      // Its run began (its writer starts with run()) and left no record: a
-      // replay would run its timers from the origin to the session's end.
-      run_start_refused_log_ = replayed_run_first_read;
-      run_start_refused_reason_ =
-          "it holds no record of its run: nothing gives its start or its end";
-    } else if (!replayed_run_fired && replayed_run_loss) {
-      // The firings that give the run start may be in the loss; its first
-      // dispatch would then replay none of them.
-      run_start_refused_log_ = replayed_run_first_read;
-      run_start_refused_reason_ =
-          "it holds no timer firing that gives its run start, and a loss in "
-          "it (a GAP record or damaged stretch, from " +
-          std::to_string(replayed_run_loss->nanos()) +
-          " ns) may hold the run's firings";
+    }
+    if (run_start_refused_log_.empty()) {
+      if (!replayed_run_fired && !replayed_run_broken.empty()) {
+        run_start_refused_log_ = replayed_run_broken;
+        run_start_refused_reason_ =
+            "it does not continue the segment of " + log +
+            " read before it (a segment between them is missing or could not "
+            "be read), which may have held the first timer firing the run "
+            "start is read from, and none was read before it";
+      } else if (!replayed_run_fired && !replayed_run_dispatch) {
+        // Its run began (its writer starts with run()) and left no record: a
+        // replay would run its timers from the origin to the session's end.
+        run_start_refused_log_ = replayed_run_first_read;
+        run_start_refused_reason_ =
+            "it holds no record of its run: nothing gives its start or its end";
+      } else if (!replayed_run_fired && replayed_run_loss) {
+        // The firings that give the run start may be in the loss; its first
+        // dispatch would then replay none of them.
+        run_start_refused_log_ = replayed_run_first_read;
+        run_start_refused_reason_ =
+            "it holds no timer firing that gives its run start, and a loss in "
+            "it (a GAP record or damaged stretch, from " +
+            std::to_string(replayed_run_loss->nanos()) +
+            " ns) may hold the run's firings";
+      }
     }
   }
   for (const RecordedMessage& message : messages_) {
@@ -1130,6 +1197,18 @@ const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
                       Shape(registration.schema, registration.message_bytes));
   }
   return topic;
+}
+
+void WarnCappedReplay(const std::vector<std::string>& capped_logs) {
+  if (capped_logs.empty()) return;
+  std::cerr << "warning: --allow-capped-replay: replaying capped log"
+            << (capped_logs.size() == 1 ? "" : "s") << " ";
+  for (std::size_t i = 0; i < capped_logs.size(); ++i) {
+    if (i > 0) std::cerr << ", ";
+    std::cerr << capped_logs[i];
+  }
+  std::cerr << " from the start of the kept window; pre-window history was "
+               "lost to the byte cap\n";
 }
 
 }  // namespace talos::event
