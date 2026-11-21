@@ -160,6 +160,30 @@ void RioLog::RecordTick(uint64_t interval_us, uint64_t duration_us,
   raise(max_tick_us_, duration_us);
   raise(max_interval_us_, interval_us);
 
+  // Snapshot the single worst-work tick's phases for the current 1 s summary
+  // window via a lock-free atomic seqlock, before tick_phase_ns_ is zeroed.
+  const uint64_t epoch = timing_epoch_.load(std::memory_order_acquire);
+  const bool new_epoch = epoch != local_timing_epoch_;
+  if (new_epoch) {
+    local_timing_epoch_ = epoch;
+    local_worst_work_us_ = 0;
+  }
+  if (new_epoch || duration_us > local_worst_work_us_) {
+    local_worst_work_us_ = duration_us;
+    const uint64_t seq = worst_seq_.load(std::memory_order_relaxed);
+    // Lock-free seqlock without standalone fences (-Werror=tsan rejects
+    // atomic_thread_fence): odd acq_rel + release payload stores pair with
+    // acquire payload loads in ReadWorstTick() so any torn read from a newer
+    // write synchronizes-with the odd sequence write before seq2 is read.
+    worst_seq_.exchange(seq + 1, std::memory_order_acq_rel);
+    worst_published_epoch_.store(epoch, std::memory_order_release);
+    worst_published_us_.store(duration_us, std::memory_order_release);
+    for (std::size_t i = 0; i < kPhaseCount; ++i) {
+      worst_phase_ns_[i].store(tick_phase_ns_[i], std::memory_order_release);
+    }
+    worst_seq_.store(seq + 2, std::memory_order_release);
+  }
+
   // Hand the logger the window it asked for, without this tick, which opens
   // the next one. The acquire re-load runs only on a new request, once per
   // window: it reads the value the logger stored with release (it is the only
@@ -282,58 +306,98 @@ void RioLog::SetTickDevices(std::size_t motors, std::size_t sensors) {
   tick_sensors_ = static_cast<uint32_t>(sensors);
 }
 
+RioLog::WorstSnapshot RioLog::ReadWorstTick() const {
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    const uint64_t seq1 = worst_seq_.load(std::memory_order_acquire);
+    if ((seq1 & 1u) != 0) {
+      std::this_thread::yield();
+      continue;
+    }
+    WorstSnapshot snapshot{};
+    snapshot.epoch = worst_published_epoch_.load(std::memory_order_acquire);
+    snapshot.work_us = worst_published_us_.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < kPhaseCount; ++i) {
+      snapshot.phase_ns[i] = worst_phase_ns_[i].load(std::memory_order_acquire);
+    }
+    const uint64_t seq2 = worst_seq_.load(std::memory_order_acquire);
+    if (seq1 == seq2) {
+      snapshot.valid = true;
+      return snapshot;
+    }
+    std::this_thread::yield();
+  }
+  return {};
+}
+
+void RioLog::EmitPhasesAndLatency(const PhaseWindow& window,
+                                  const LatencyWindow& latency) {
+  std::array<double, kPhaseCount> mean_us{};
+  std::array<double, kPhaseCount> max_us{};
+  for (std::size_t i = 0; i < kPhaseCount; ++i) {
+    mean_us[i] = static_cast<double>(window.sum_ns[i]) /
+                 static_cast<double>(window.ticks) / 1e3;
+    max_us[i] = static_cast<double>(window.max_ns[i]) / 1e3;
+  }
+  const auto at = [](TickPhase phase) {
+    return static_cast<std::size_t>(phase);
+  };
+  char text[512];
+  std::snprintf(
+      text, sizeof(text),
+      "[rio] tick phases: refresh mean/max %.1f/%.1f us, devices "
+      "%.1f/%.1f us, control %.1f/%.1f us, health %.1f/%.1f us, other "
+      "%.1f/%.1f us, link %.1f/%.1f us, driver station %.1f/%.1f us, "
+      "loop %.1f/%.1f us over %llu ticks (motors=%u sensors=%u)\n",
+      mean_us[at(TickPhase::kRefresh)], max_us[at(TickPhase::kRefresh)],
+      mean_us[at(TickPhase::kDevices)], max_us[at(TickPhase::kDevices)],
+      mean_us[at(TickPhase::kControl)], max_us[at(TickPhase::kControl)],
+      mean_us[at(TickPhase::kHealth)], max_us[at(TickPhase::kHealth)],
+      mean_us[at(TickPhase::kOther)], max_us[at(TickPhase::kOther)],
+      mean_us[at(TickPhase::kLink)], max_us[at(TickPhase::kLink)],
+      mean_us[at(TickPhase::kDriverStation)],
+      max_us[at(TickPhase::kDriverStation)], mean_us[at(TickPhase::kLoop)],
+      max_us[at(TickPhase::kLoop)],
+      static_cast<unsigned long long>(window.ticks),
+      static_cast<unsigned>(window.motors),
+      static_cast<unsigned>(window.sensors));
+  sink_(text);
+  sink_("[rio] latency: command age accepted p50/p99/max " +
+        latency.accepted.Summary() + ", refused " + latency.refused.Summary() +
+        "; driver station refresh to send " + latency.driver_station.Summary() +
+        "\n");
+}
+
 void RioLog::WritePhases(uint64_t now_us, bool force) {
   if (phase_awaiting_ &&
       phase_served_.load(std::memory_order_acquire) == phase_requested_) {
     phase_awaiting_ = false;
     const uint64_t ticks = published_ticks_.load(std::memory_order_relaxed);
     if (ticks > 0) {
-      std::array<double, kPhaseCount> mean_us{};
-      std::array<double, kPhaseCount> max_us{};
+      PhaseWindow window{};
+      window.ticks = ticks;
       for (std::size_t i = 0; i < kPhaseCount; ++i) {
-        mean_us[i] = static_cast<double>(
-                         published_sum_ns_[i].load(std::memory_order_relaxed)) /
-                     static_cast<double>(ticks) / 1e3;
-        max_us[i] = static_cast<double>(
-                        published_max_ns_[i].load(std::memory_order_relaxed)) /
-                    1e3;
+        window.sum_ns[i] = published_sum_ns_[i].load(std::memory_order_relaxed);
+        window.max_ns[i] = published_max_ns_[i].load(std::memory_order_relaxed);
       }
-      const auto at = [](TickPhase phase) {
-        return static_cast<std::size_t>(phase);
-      };
-      char text[512];
-      std::snprintf(
-          text, sizeof(text),
-          "[rio] tick phases: refresh mean/max %.1f/%.1f us, devices "
-          "%.1f/%.1f us, control %.1f/%.1f us, health %.1f/%.1f us, other "
-          "%.1f/%.1f us, link %.1f/%.1f us, driver station %.1f/%.1f us, "
-          "loop %.1f/%.1f us over %llu ticks (motors=%u sensors=%u)\n",
-          mean_us[at(TickPhase::kRefresh)], max_us[at(TickPhase::kRefresh)],
-          mean_us[at(TickPhase::kDevices)], max_us[at(TickPhase::kDevices)],
-          mean_us[at(TickPhase::kControl)], max_us[at(TickPhase::kControl)],
-          mean_us[at(TickPhase::kHealth)], max_us[at(TickPhase::kHealth)],
-          mean_us[at(TickPhase::kOther)], max_us[at(TickPhase::kOther)],
-          mean_us[at(TickPhase::kLink)], max_us[at(TickPhase::kLink)],
-          mean_us[at(TickPhase::kDriverStation)],
-          max_us[at(TickPhase::kDriverStation)], mean_us[at(TickPhase::kLoop)],
-          max_us[at(TickPhase::kLoop)], static_cast<unsigned long long>(ticks),
-          static_cast<unsigned>(
-              published_motors_.load(std::memory_order_relaxed)),
-          static_cast<unsigned>(
-              published_sensors_.load(std::memory_order_relaxed)));
-      sink_(text);
-      LatencyWindow& latency = latency_[latency_published_];
-      sink_("[rio] latency: command age accepted p50/p99/max " +
-            latency.accepted.Summary() + ", refused " +
-            latency.refused.Summary() + "; driver station refresh to send " +
-            latency.driver_station.Summary() + "\n");
+      window.motors = published_motors_.load(std::memory_order_relaxed);
+      window.sensors = published_sensors_.load(std::memory_order_relaxed);
+      EmitPhasesAndLatency(window, latency_[latency_published_]);
     }
     // Empty for the loop's next switch to it, before the next request's
     // release store.
     latency_[latency_published_] = {};
   }
-  // A flush asks for nothing: the stopped loop would never answer.
-  if (force) return;
+  if (force) {
+    // On Stop(), the loop thread's release store to stop_ happens-before
+    // Run()'s acquire load and this Flush(), so draining the open partial
+    // window here is race-free; a flush asks for nothing further.
+    if (phase_window_.ticks > 0) {
+      EmitPhasesAndLatency(phase_window_, latency_[latency_front_]);
+      phase_window_ = {};
+      latency_[latency_front_] = {};
+    }
+    return;
+  }
   if (!phase_clock_started_) {
     phase_clock_started_ = true;
     next_phase_us_ = now_us + kPhaseWindowUs;
@@ -355,7 +419,7 @@ void RioLog::Start() {
 
 void RioLog::Stop() {
   if (!thread_.joinable()) return;
-  stop_.store(true, std::memory_order_relaxed);
+  stop_.store(true, std::memory_order_release);
   thread_.join();
 }
 
@@ -365,7 +429,7 @@ void RioLog::Run() {
   pthread_setname_np(pthread_self(), "talos-log");
   setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
 #endif
-  while (!stop_.load(std::memory_order_relaxed)) {
+  while (!stop_.load(std::memory_order_acquire)) {
     Drain(SteadyNowUs());
     std::this_thread::sleep_for(std::chrono::milliseconds{20});
   }
@@ -446,13 +510,47 @@ void RioLog::WriteDue(uint64_t now_us, bool force) {
         " events dropped (total " + std::to_string(dropped) + ")\n");
     reported_dropped_ = dropped;
   }
-  // The maxima cover this window only.
+  // The maxima and worst-tick phase split cover this window only.
+  const uint64_t current_epoch = timing_epoch_.load(std::memory_order_relaxed);
+  const WorstSnapshot worst = ReadWorstTick();
+  const bool has_worst = worst.valid && worst.epoch == current_epoch;
+  timing_epoch_.store(current_epoch + 1, std::memory_order_release);
   const uint64_t max_tick = max_tick_us_.exchange(0, std::memory_order_relaxed);
   const uint64_t max_interval =
       max_interval_us_.exchange(0, std::memory_order_relaxed);
   const uint64_t overruns = overruns_.load(std::memory_order_relaxed);
   const uint64_t late = late_ticks_.load(std::memory_order_relaxed);
   if (overruns != reported_overruns_ || late != reported_late_ticks_) {
+    uint64_t reported_max_tick = max_tick;
+    std::array<uint64_t, kPhaseCount> worst_ns{};
+    if (has_worst) {
+      reported_max_tick = std::max(reported_max_tick, worst.work_us);
+      worst_ns = worst.phase_ns;
+    } else {
+      const WorstSnapshot retry = ReadWorstTick();
+      if (retry.valid &&
+          (retry.epoch == current_epoch || retry.epoch == current_epoch + 1)) {
+        reported_max_tick = std::max(reported_max_tick, retry.work_us);
+        worst_ns = retry.phase_ns;
+      }
+    }
+    const auto at = [](TickPhase phase) {
+      return static_cast<std::size_t>(phase);
+    };
+    char phases[320];
+    std::snprintf(
+        phases, sizeof(phases),
+        "; worst tick phases: refresh %.1f us, devices %.1f us, control %.1f "
+        "us, health %.1f us, other %.1f us, link %.1f us, driver station %.1f "
+        "us, loop %.1f us\n",
+        static_cast<double>(worst_ns[at(TickPhase::kRefresh)]) / 1e3,
+        static_cast<double>(worst_ns[at(TickPhase::kDevices)]) / 1e3,
+        static_cast<double>(worst_ns[at(TickPhase::kControl)]) / 1e3,
+        static_cast<double>(worst_ns[at(TickPhase::kHealth)]) / 1e3,
+        static_cast<double>(worst_ns[at(TickPhase::kOther)]) / 1e3,
+        static_cast<double>(worst_ns[at(TickPhase::kLink)]) / 1e3,
+        static_cast<double>(worst_ns[at(TickPhase::kDriverStation)]) / 1e3,
+        static_cast<double>(worst_ns[at(TickPhase::kLoop)]) / 1e3);
     sink_(
         "[rio] loop timing: " + std::to_string(overruns - reported_overruns_) +
         " overruns (work longer than the period), " +
@@ -460,9 +558,10 @@ void RioLog::WriteDue(uint64_t now_us, bool force) {
         " late ticks (started over 1.5 periods after the previous) since "
         "the last report; totals " +
         std::to_string(overruns) + " and " + std::to_string(late) +
-        "; max work " + std::to_string(max_tick) + " us, max interval " +
-        std::to_string(max_interval) + " us, period " +
-        std::to_string(period_us_.load(std::memory_order_relaxed)) + " us\n");
+        "; max work " + std::to_string(reported_max_tick) +
+        " us, max interval " + std::to_string(max_interval) + " us, period " +
+        std::to_string(period_us_.load(std::memory_order_relaxed)) + " us" +
+        phases);
     reported_overruns_ = overruns;
     reported_late_ticks_ = late;
   }
