@@ -888,11 +888,19 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     realtime_exempt = [n.get("name") for n in manifest["nodes"] if simulation
                        and n.get("loop_tier") in ACTUATION_TIERS
                        and n.get("realtime") == "not_requested"]
+    talos_rev = manifest.get("talos_git_revision") or ""
+    talos_revision = (
+        talos_rev + (" (dirty)" if manifest.get("talos_git_dirty") else "")
+        if talos_rev else ""
+    )
     return {"session_id": manifest.get("session_id"),
             "config_sha256": manifest.get("config_sha256") or "NOT RECORDED (non-bundle launch)",
             # A --config=release bundle's source revision; older manifests lack it.
             "git_revision": (manifest.get("git_revision") or "NOT RECORDED (unstamped or non-bundle)")
                             + (" (dirty)" if manifest.get("git_dirty") else ""),
+            # Present only when a separate robot repo was stamped against a
+            # talOS git checkout (REPO-4).
+            **({"talos_git_revision": talos_revision} if talos_revision else {}),
             # exit_signal is 0 unless a signal killed the node; older manifests lack it.
             "nodes": [{**{k: n.get(k) for k in ("name", "restart_count", "exit_code")},
                        "exit_signal": n.get("exit_signal", 0),
@@ -1029,10 +1037,13 @@ def latency_lines(report):
 def markdown(report):
     lines = ["# Session report", f"Session: {report['session_id']}",
              f"Config SHA-256: {report['config_sha256']}",
-             f"Source revision: {report['git_revision']}", "", "## Nodes",
-             "| Node | Restarts | Exit code | Exit signal | quarantined | recorder_failed | log_capped "
-             "| Loop tier | Realtime | Delivery loss |",
-             "|---|---:|---:|---:|---|---|---|---|---|---|"]
+             f"Source revision: {report['git_revision']}"]
+    if report.get("talos_git_revision"):
+        lines.append(f"talOS revision: {report['talos_git_revision']}")
+    lines += ["", "## Nodes",
+              "| Node | Restarts | Exit code | Exit signal | quarantined | recorder_failed | log_capped "
+              "| Loop tier | Realtime | Delivery loss |",
+              "|---|---:|---:|---:|---|---|---|---|---|---|"]
     for n in report["nodes"]:
         lines.append("| " + " | ".join(str(n[k]) for k in n) + " |")
     lines += ["", "## Runs", "| Node | Binary SHA-256 | Run | PID | Seconds | Exit code | Exit signal | Reason |",

@@ -282,6 +282,11 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"config_sha256\": " << Quoted(config_sha256) << ",\n";
   ss << "  \"git_revision\": " << Quoted(git_revision) << ",\n";
   ss << "  \"git_dirty\": " << (git_dirty ? "true" : "false") << ",\n";
+  if (!talos_git_revision.empty()) {
+    ss << "  \"talos_git_revision\": " << Quoted(talos_git_revision) << ",\n";
+    ss << "  \"talos_git_dirty\": " << (talos_git_dirty ? "true" : "false")
+       << ",\n";
+  }
   ss << "  \"output_dir\": " << Quoted(output_dir) << ",\n";
   ss << "  \"launcher_log\": " << Quoted(launcher_log) << ",\n";
   ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";

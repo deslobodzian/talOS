@@ -181,6 +181,11 @@ struct LauncherOptions {
   // git_revision, git_dirty), present when it was built with --stamp.
   std::string bundle_git_revision;
   bool bundle_git_dirty{false};
+  // The bundle's talOS revision and dirty flag (bundle_manifest.toml
+  // talos_git_revision, talos_git_dirty), present when a separate robot
+  // repository was stamped against a talOS git checkout.
+  std::string bundle_talos_git_revision;
+  bool bundle_talos_git_dirty{false};
   // The bundle's Studio (bundle_manifest.toml [studio], written when its
   // talos_bundle sets studio_bridge and studio_webroot): whether it carries
   // one, and the absolute path of its webroot.

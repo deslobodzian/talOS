@@ -10,6 +10,7 @@ exports_files([
     "deploy.sh",
     "sync_manifest.py",
     "trace.py",
+    "workspace_status.sh",
 ])
 
 # bazel run //tools:new_subsystem -- <name> --lang cpp|py [--type T [--raw]] (--robot R | --standalone DIR) [--dry-run]

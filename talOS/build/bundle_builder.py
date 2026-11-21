@@ -305,20 +305,27 @@ def check_studio(spec, resolved, canonical_to_apparent=None):
 
 
 def source_revision(path):
-    """The bundle_manifest.toml lines naming the source revision, from a --stamp
-    build's stable status file (tools/workspace_status.sh); none when it has
-    no STABLE_GIT_COMMIT (no git checkout, or no --workspace_status_command)."""
+    """The bundle_manifest.toml lines naming the source revision (and, when a
+    separate robot repository builds against a talOS git checkout, talOS's
+    revision), from a --stamp build's stable status file
+    (tools/workspace_status.sh); none when neither commit key is present."""
     status = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
             key, _, value = line.rstrip("\n").partition(" ")
             status[key] = value
+    lines = []
     revision = status.get("STABLE_GIT_COMMIT", "")
-    if not revision:
-        return []
-    dirty = status.get("STABLE_GIT_DIRTY", "0") != "0"
-    return [f"git_revision = {json.dumps(revision)}",
-            f"git_dirty = {'true' if dirty else 'false'}"]
+    if revision:
+        dirty = status.get("STABLE_GIT_DIRTY", "0") != "0"
+        lines += [f"git_revision = {json.dumps(revision)}",
+                  f"git_dirty = {'true' if dirty else 'false'}"]
+    talos_revision = status.get("STABLE_TALOS_GIT_COMMIT", "")
+    if talos_revision:
+        talos_dirty = status.get("STABLE_TALOS_GIT_DIRTY", "0") != "0"
+        lines += [f"talos_git_revision = {json.dumps(talos_revision)}",
+                  f"talos_git_dirty = {'true' if talos_dirty else 'false'}"]
+    return lines
 
 
 def main():

@@ -1180,6 +1180,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   manifest.config_sha256 = options_.bundle_config_sha256;
   manifest.git_revision = options_.bundle_git_revision;
   manifest.git_dirty = options_.bundle_git_dirty;
+  manifest.talos_git_revision = options_.bundle_talos_git_revision;
+  manifest.talos_git_dirty = options_.bundle_talos_git_dirty;
   manifest.output_dir = options_.output_dir;
   // Recorded since the session directory's creation (above).
   manifest.launcher_log =

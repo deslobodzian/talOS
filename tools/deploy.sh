@@ -1119,7 +1119,12 @@ def when(ns):
 
 def revision(m):
     rev = str(m.get("git_revision") or "")[:12] or "unstamped"
-    return rev + (" dirty" if m.get("git_dirty") else "")
+    text = rev + (" dirty" if m.get("git_dirty") else "")
+    talos = str(m.get("talos_git_revision") or "")[:12]
+    if talos:
+        text += (" talos " + talos
+                 + (" dirty" if m.get("talos_git_dirty") else ""))
+    return text
 
 
 def outcomes(m):

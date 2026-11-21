@@ -2893,6 +2893,53 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   std::filesystem::remove_all(bundle_dir);
 }
 
+// REQ-OPS-10 (REPO-4): LoadBundle reads dual-revision stamps from
+// bundle_manifest.toml, and SessionManifest::ToJson emits talos_git_revision /
+// talos_git_dirty only when talos_git_revision is non-empty.
+TEST(LauncherBundleTest, LoadBundleAndManifestCarryTalosRevisionWhenPresent) {
+  const std::string bundle_dir = TempPath("test_bundle_talos_rev");
+  std::filesystem::create_directories(bundle_dir + "/config");
+  { std::ofstream{bundle_dir + "/config/robot.toml"} << "[robot]\n"; }
+
+  {
+    std::ofstream mf(bundle_dir + "/bundle_manifest.toml");
+    mf << "bundle_version = 1\n"
+       << "config_path = \"config/robot.toml\"\n"
+       << "git_revision = \"1111aaaa\"\n"
+       << "git_dirty = false\n"
+       << "talos_git_revision = \"2222bbbb\"\n"
+       << "talos_git_dirty = true\n";
+  }
+
+  LauncherOptions options;
+  options.bundle_dir = bundle_dir;
+  std::string error;
+  ASSERT_TRUE(LoadBundle(options, error)) << error;
+  EXPECT_EQ(options.bundle_git_revision, "1111aaaa");
+  EXPECT_FALSE(options.bundle_git_dirty);
+  EXPECT_EQ(options.bundle_talos_git_revision, "2222bbbb");
+  EXPECT_TRUE(options.bundle_talos_git_dirty);
+
+  SessionManifest dual;
+  dual.git_revision = options.bundle_git_revision;
+  dual.git_dirty = options.bundle_git_dirty;
+  dual.talos_git_revision = options.bundle_talos_git_revision;
+  dual.talos_git_dirty = options.bundle_talos_git_dirty;
+  const std::string dual_json = dual.ToJson();
+  EXPECT_NE(dual_json.find("\"talos_git_revision\": \"2222bbbb\""),
+            std::string::npos);
+  EXPECT_NE(dual_json.find("\"talos_git_dirty\": true"), std::string::npos);
+
+  // Single-repo or unstamped manifests omit the talos_git_* keys completely.
+  SessionManifest single;
+  single.git_revision = "1111aaaa";
+  const std::string single_json = single.ToJson();
+  EXPECT_EQ(single_json.find("talos_git_revision"), std::string::npos);
+  EXPECT_EQ(single_json.find("talos_git_dirty"), std::string::npos);
+
+  std::filesystem::remove_all(bundle_dir);
+}
+
 // REQ-OPS-30: a deployed bundle that carries Studio starts its own bridge and
 // serves its own webroot, through the [studio] keys a checkout uses; one that
 // carries none runs its session without a bridge rather than failing the

@@ -179,8 +179,11 @@ repository name nothing.
 
 `bazel build --config=release //:robot_bundle` builds what the robot's main
 processor installs, stamped with this repository's git revision
-(`.bazelrc`'s `--workspace_status_command`, talOS's
-`tools/workspace_status.sh` run here), and `@talos//tools:deploy.sh install`
+(`git_revision`, `git_dirty`) and, when talOS is a separate git checkout,
+talOS's git revision (`talos_git_revision`, `talos_git_dirty`, both emitted by
+`.bazelrc`'s `--workspace_status_command`, talOS's `tools/workspace_status.sh`
+run here, and reported by `manifest.json`, `session_report`, and `deploy.sh
+logs`), and `@talos//tools:deploy.sh install`
 installs it ([docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)).
 `bundle_install_test` (e2e, about 2 s) does that into a scratch prefix: the
 install exits 0 with no warm-up warning (its graph check ran the bundle's

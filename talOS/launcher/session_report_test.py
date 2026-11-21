@@ -1008,6 +1008,32 @@ class SessionReportTest(unittest.TestCase):
         self.assertNotIn("Bridge UDP/State loss counters:",
                          session_report.markdown(legacy_report))
 
+    # REQ-OPS-10 (REPO-4): session_report prints `talOS revision:` right after
+    # `Source revision:` when manifest.json carries `talos_git_revision`, and
+    # omits both JSON key and markdown line when absent.
+    def test_reports_talos_revision_after_source_revision_when_present(self):
+        plain = session_report.analyze(
+            {"session_id": 1, "git_revision": "aaaa1111", "nodes": []}, [])
+        self.assertNotIn("talos_git_revision", plain)
+        self.assertNotIn("talOS revision:", session_report.markdown(plain))
+
+        for dirty, suffix in ((False, ""), (True, " (dirty)")):
+            with self.subTest(dirty=dirty):
+                report = session_report.analyze({
+                    "session_id": 2,
+                    "git_revision": "aaaa1111",
+                    "git_dirty": False,
+                    "talos_git_revision": "bbbb2222",
+                    "talos_git_dirty": dirty,
+                    "nodes": [],
+                }, [])
+                self.assertEqual(report["talos_git_revision"],
+                                 "bbbb2222" + suffix)
+                lines = session_report.markdown(report).splitlines()
+                src_idx = lines.index("Source revision: aaaa1111")
+                self.assertEqual(lines[src_idx + 1],
+                                 "talOS revision: bbbb2222" + suffix)
+
 
 if __name__ == "__main__":
     unittest.main()

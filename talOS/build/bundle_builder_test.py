@@ -166,6 +166,7 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertIn(f'binary_sha256 = "{empty_sha256}"', manifest)
             # Unstamped: no revision rather than a stale or made-up one.
             self.assertNotIn("git_revision", manifest)
+            self.assertNotIn("talos_git_revision", manifest)
         with tempfile.TemporaryDirectory() as tmp:
             status = os.path.join(tmp, "stable-status.txt")
             put(status, "BUILD_HOST h\nSTABLE_GIT_COMMIT 0123abcd\n"
@@ -174,6 +175,128 @@ class BundleBuilderTest(unittest.TestCase):
                                      extra=("--stable-status", status))
             self.assertIn('git_revision = "0123abcd"', manifest)
             self.assertIn("git_dirty = true", manifest)
+            self.assertNotIn("talos_git_revision", manifest)
+        # Dual-revision stamp from a separate robot repository (REPO-4).
+        with tempfile.TemporaryDirectory() as tmp:
+            status = os.path.join(tmp, "stable-status.txt")
+            put(status,
+                "STABLE_GIT_COMMIT 1111aaaa\nSTABLE_GIT_DIRTY 0\n"
+                "STABLE_TALOS_GIT_COMMIT 2222bbbb\nSTABLE_TALOS_GIT_DIRTY 1\n")
+            _, manifest = self.build(tmp, {"c/robot.toml": "[robot]\n"},
+                                     extra=("--stable-status", status))
+            self.assertIn('git_revision = "1111aaaa"', manifest)
+            self.assertIn("git_dirty = false", manifest)
+            self.assertIn('talos_git_revision = "2222bbbb"', manifest)
+            self.assertIn("talos_git_dirty = true", manifest)
+        # talOS checkout stamped even when the robot directory is not a git repo.
+        with tempfile.TemporaryDirectory() as tmp:
+            status = os.path.join(tmp, "stable-status.txt")
+            put(status,
+                "STABLE_TALOS_GIT_COMMIT 3333cccc\nSTABLE_TALOS_GIT_DIRTY 0\n")
+            _, manifest = self.build(tmp, {"c/robot.toml": "[robot]\n"},
+                                     extra=("--stable-status", status))
+            self.assertNotIn("\ngit_revision =", "\n" + manifest)
+            self.assertIn('talos_git_revision = "3333cccc"', manifest)
+            self.assertIn("talos_git_dirty = false", manifest)
+
+    # REQ-OPS-10, REQ-DEV-30 (REPO-4): workspace_status.sh stamps both the
+    # robot repo and talOS when invoked from a separate robot repository,
+    # omits STABLE_TALOS_GIT_* in a single repo or vendored tree, and still
+    # stamps talOS when the robot directory is outside git.
+    def test_workspace_status_stamps_separate_robot_and_talos_repos(self):
+        status_src = os.path.abspath(
+            runfiles.Create().Rlocation("_main/tools/workspace_status.sh"))
+
+        def git(repo, *args):
+            env = dict(os.environ,
+                       GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="t@example.com",
+                       GIT_COMMITTER_NAME="Test",
+                       GIT_COMMITTER_EMAIL="t@example.com")
+            for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+                env.pop(k, None)
+            proc = subprocess.run(
+                ["git", "-C", repo, *args],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+
+        def init_repo(path, files, executable=()):
+            os.makedirs(path, exist_ok=True)
+            git(path, "init", "-q")
+            for rel, content in files.items():
+                full = os.path.join(path, rel)
+                put(full, content)
+                if rel in executable:
+                    os.chmod(full, 0o755)
+            git(path, "add", ".")
+            git(path, "commit", "-q", "-m", "init")
+            return git(path, "rev-parse", "HEAD")
+
+        def run_status(script, cwd):
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+            proc = subprocess.run(["bash", script], cwd=cwd,
+                                  capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            parsed = {}
+            for line in proc.stdout.splitlines():
+                k, _, v = line.partition(" ")
+                parsed[k] = v
+            return parsed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(status_src, encoding="utf-8") as f:
+                script_body = f.read()
+            talos_dir = os.path.join(tmp, "talos")
+            talos_rev = init_repo(
+                talos_dir, {"tools/workspace_status.sh": script_body},
+                executable=("tools/workspace_status.sh",))
+            talos_script = os.path.join(talos_dir, "tools", "workspace_status.sh")
+
+            # 1. Single repo (inside talOS): emits only STABLE_GIT_*.
+            self.assertEqual(run_status(talos_script, talos_dir), {
+                "STABLE_GIT_COMMIT": talos_rev,
+                "STABLE_GIT_DIRTY": "0",
+            })
+
+            # 2. Separate clean robot repo: emits both revisions, both clean.
+            robot_dir = os.path.join(tmp, "robot")
+            robot_rev = init_repo(robot_dir, {"robot.toml": "[robot]\n"})
+            self.assertEqual(run_status(talos_script, robot_dir), {
+                "STABLE_GIT_COMMIT": robot_rev,
+                "STABLE_GIT_DIRTY": "0",
+                "STABLE_TALOS_GIT_COMMIT": talos_rev,
+                "STABLE_TALOS_GIT_DIRTY": "0",
+            })
+
+            # 3. Dirty robot + dirty talOS: both dirty bits flip to 1.
+            put(os.path.join(robot_dir, "untracked.txt"), "dirty\n")
+            put(os.path.join(talos_dir, "untracked.txt"), "dirty\n")
+            self.assertEqual(run_status(talos_script, robot_dir), {
+                "STABLE_GIT_COMMIT": robot_rev,
+                "STABLE_GIT_DIRTY": "1",
+                "STABLE_TALOS_GIT_COMMIT": talos_rev,
+                "STABLE_TALOS_GIT_DIRTY": "1",
+            })
+
+            # 4. Non-git robot directory: does not exit early; stamps talOS.
+            nongit_dir = os.path.join(tmp, "nongit")
+            os.makedirs(nongit_dir)
+            self.assertEqual(run_status(talos_script, nongit_dir), {
+                "STABLE_TALOS_GIT_COMMIT": talos_rev,
+                "STABLE_TALOS_GIT_DIRTY": "1",
+            })
+
+            # 5. Vendored copy inside robot repo (no separate talOS .git):
+            # toplevel != TALOS_DIR, so STABLE_TALOS_GIT_* is not emitted.
+            vendored = os.path.join(
+                robot_dir, "vendor", "talos", "tools", "workspace_status.sh")
+            put(vendored, script_body)
+            os.chmod(vendored, 0o755)
+            self.assertEqual(run_status(vendored, robot_dir), {
+                "STABLE_GIT_COMMIT": robot_rev,
+                "STABLE_GIT_DIRTY": "1",
+            })
 
     def test_cpp_nodes_shared_libraries_land_once_in_lib(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -736,6 +859,23 @@ class DeployTest(unittest.TestCase):
             self.assertIn("last=stop", fields("arm:"))
             self.assertIn("restarts=1", fields("arm:"))
             self.assertNotIn("left no manifest", out)
+            self.assertNotIn("talos", summary)
+
+    # REQ-OPS-10 (REPO-4): deploy.sh logs surfaces talos_git_revision when
+    # present in a session's manifest.json and omits it otherwise.
+    def test_logs_reports_talos_revision_when_present(self):
+        second = 1_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            self.session(
+                tmp, "dual", 1 * second, start_ns=1_700_000_100 * second,
+                git_revision="1111222233334444", git_dirty=False,
+                talos_git_revision="abcdef0123456789", talos_git_dirty=True)
+            proc = self.deploy(tmp, "logs")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            header = next(line for line in proc.stdout.splitlines()
+                          if line.startswith("session dual"))
+            self.assertIn("revision 111122223333 talos abcdef012345 dirty",
+                          header)
 
     def test_logs_shows_launcher_stderr_a_failed_launch_left(self):
         second = 1_000_000_000
