@@ -1263,10 +1263,12 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
   return flags;
 }
 
-// The declared graph from --graph, read on first use. Without the flag:
-// under --replay-inputs, the one the replayed session was launched with
-// (<session dir>/declared_graph.json, which the launcher writes into a
-// session that runs a graph reader); none yet under --describe (the
+// The declared graph from --graph, read on first use, with this node's own
+// entry stripped (declared_graph.json carries Pass-1 static senders of
+// graph-reading nodes for other graph readers, so a reader never sees itself).
+// Without the flag: under --replay-inputs, the one the replayed session was
+// launched with (<session dir>/declared_graph.json, which the launcher writes
+// into a session that runs a graph reader); none yet under --describe (the
 // launcher's first pass); and an error otherwise, since a node that reads the
 // graph cannot be built without one.
 GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
@@ -1291,8 +1293,8 @@ GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
     };
   }
   auto graph = std::make_shared<std::optional<DeclaredGraph>>();
-  return [graph, path = std::move(path),
-          unreadable = std::move(unreadable)]() -> const DeclaredGraph* {
+  return [graph, path = std::move(path), unreadable = std::move(unreadable),
+          self_name = std::string{node_name}]() -> const DeclaredGraph* {
     if (!graph->has_value()) {
       std::ifstream file{path};
       if (!file) throw std::runtime_error(unreadable);
@@ -1302,6 +1304,9 @@ GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
       if (!introspect::DescribeReader::ParseGraph(text, parsed, error)) {
         throw std::runtime_error("--graph " + path + ": " + error);
       }
+      std::erase_if(parsed, [&](const introspect::Description& described) {
+        return described.name == self_name;
+      });
       graph->emplace(std::move(parsed));
     }
     return &**graph;

@@ -1095,8 +1095,13 @@ test('subsystems widget renders outputs_held as HELD, ranked right after failed 
   assert.match(html, /shooter<\/span><span class="tag tag-bad">FAILING<\/span>/);
   assert.match(html, /elevator<\/span><span class="tag tag-bad">DOWN<\/span>/);
   assert.match(html, /drivetrain<\/span><span class="tag tag-good">UP<\/span>/);
-  for (const row of html.match(/<li>.*?<\/li>/g) ?? [])
+  const rows = html.match(/<li>.*?<\/li>/g) ?? [];
+  for (const row of rows)
     assert.ok((row.match(/class="tag /g) ?? []).length <= 1, `two state words in ${row}`);
+  const shooterRow = rows.find(r => r.includes('>shooter<'));
+  const elevatorRow = rows.find(r => r.includes('>elevator<'));
+  assert.ok(shooterRow && !shooterRow.includes('outputs held'), shooterRow);
+  assert.ok(elevatorRow && !elevatorRow.includes('outputs held'), elevatorRow);
   const order = [...html.matchAll(/<span class="name"[^>]*>([^<]*)</g)].map(m => m[1]);
   assert.deepEqual(order, ['shooter', 'elevator', 'vision', 'intake', 'drivetrain', 'camera']);
 

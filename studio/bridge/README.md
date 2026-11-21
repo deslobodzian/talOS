@@ -413,7 +413,7 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   | `nodes` | array | with a manifest, every member of its `nodes` in its order, `sim_gateway` and `studio_bridge` included when the launcher supervises them; without a manifest, or while it lists no member yet, every node the config launches: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
   | `nodes[].name` | string | the node name |
   | `nodes[].alive` | bool | a live registry row of that name exists (a node that never registered, or died, is false; the launcher-added `studio_bridge`, which serves the summary, is true whenever the registry is readable) |
-  | `nodes[].critical` | bool | the config's `critical` for that subsystem (default true); false for the launcher-added `studio_bridge`, and true for other members the config does not list (`hardware_node`, `sim_gateway`) |
+  | `nodes[].critical` | bool | the launcher manifest's `critical` for the member; on legacy manifests lacking it (or without a manifest), falls back to the config's `critical` for that subsystem (default true), else `!studio_bridge` (false for the launcher-added `studio_bridge`, true for other members such as `hardware_node` and `sim_gateway`) |
   | `nodes[].restarts` | number | the manifest's `restart_count` for the node |
   | `nodes[].quarantined` | bool | the manifest's `quarantined` for the node |
   | `nodes[].drives` | string or null | the target lane source (`teleop`, `auto`, ...) its first `Target` with a selection last selected; null when it is not alive, reads no target, or its `Target::get()` was last null |

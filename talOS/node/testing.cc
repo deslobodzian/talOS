@@ -18,6 +18,7 @@
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/simulated_event_loop.h"
+#include "talOS/introspection/names.h"
 #include "talOS/node/internal.h"
 
 namespace talos::testing {
@@ -109,6 +110,10 @@ struct Sim::Impl {
     detail::Instance user;
     // What this node got from NodeAccess::declared_graph, if it asked.
     detail::DeclaredGraph graph;
+    // Pass-1 static non-telemetry-role senders registered before this node
+    // first asked for the declared graph, matching DescribeGraph's Pass-1
+    // export to other graph readers.
+    std::optional<introspect::Description> pass1_static_senders;
     std::optional<Time> paused_until;
     ~Hosted() {
       user.reset();
@@ -380,8 +385,10 @@ void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
   hosted->port =
       std::make_unique<testing::SimPort>(*hosted->loop, impl.byte_topics);
   // The declared graph, as the launcher builds it: every node added before
-  // this one that does not read the graph itself. Add a graph-reading node
-  // (telemetry, teleop) after the nodes it should see.
+  // this one that does not read the graph itself, plus the Pass-1 static
+  // non-telemetry-role senders of earlier graph-reading nodes (excluding
+  // self). Add a graph-reading node (telemetry, teleop) after the nodes it
+  // should see.
   Sim::Impl::Hosted* self = hosted.get();
   hosted->node = NodeAccess::create(NodeSetup{
       .name = hosted->name,
@@ -390,12 +397,31 @@ void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
       .simulation = true,
       .loop = hosted->port.get(),
       .graph = [&impl, self]() -> const detail::DeclaredGraph* {
+        if (!self->pass1_static_senders.has_value()) {
+          introspect::Description static_pub =
+              detail::DescribeNode(*self->node, "", self->loop->manifest(),
+                                   introspect::LoopSourceFlags(*self->loop));
+          std::erase_if(static_pub.sources,
+                        [](const introspect::naming::SourceShape& source) {
+                          return source.kind != event::SourceKind::SENDER ||
+                                 introspect::naming::Role(source.name) ==
+                                     "telemetry";
+                        });
+          self->pass1_static_senders.emplace(std::move(static_pub));
+        }
         self->graph.clear();
         for (const auto& other : impl.nodes) {
-          if (NodeAccess::reads_graph(*other->node)) continue;
-          self->graph.push_back(
-              detail::DescribeNode(*other->node, "", other->loop->manifest(),
-                                   introspect::LoopSourceFlags(*other->loop)));
+          if (other.get() == self || other->name == self->name) continue;
+          if (!NodeAccess::reads_graph(*other->node)) {
+            self->graph.push_back(detail::DescribeNode(
+                *other->node, "", other->loop->manifest(),
+                introspect::LoopSourceFlags(*other->loop)));
+            continue;
+          }
+          if (other->pass1_static_senders &&
+              !other->pass1_static_senders->sources.empty()) {
+            self->graph.push_back(*other->pass1_static_senders);
+          }
         }
         return &self->graph;
       },

@@ -212,8 +212,8 @@ class OperatorArming {
   }
   // The blocking input recorded while disarmed, or {kNone, -1, -1} when armed
   // or when no non-neutral input was reported.
-  ArmingBlocker blocker() const noexcept {
-    return detail::TargetAccess::arming_blocker_noexcept(*node_, index_);
+  ArmingBlocker blocker() const {
+    return detail::TargetAccess::arming_blocker(*node_, index_);
   }
   void disarm() { detail::TargetAccess::arming_disarm(*node_, index_); }
 

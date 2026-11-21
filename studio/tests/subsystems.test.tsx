@@ -257,6 +257,7 @@ test('a demand/measured pair shows measured minus demand at the cursor', () => {
 test('subsystem cards render operator arming blocker when disarmed and clear when armed', () => {
   const armingUnits: Record<string, string> = {
     'teleop/status/armed': '',
+    'teleop/status/alert_warning_disarmed': '',
     'teleop/status/blocking_kind': '',
     'teleop/status/blocking_joystick_index': '',
     'teleop/status/blocking_input_index': '',
@@ -292,9 +293,11 @@ test('subsystem cards render operator arming blocker when disarmed and clear whe
     return renderPanel(studio);
   };
 
-  // Disarmed: teleop blocked on joystick 0 axis 1, custom operator on joystick 1 button 3.
+  // Disarmed: teleop blocked on joystick 0 axis 1 (even when disabled/auto
+  // with alert_warning_disarmed === 0), custom operator on joystick 1 button 3.
   const disarmedHtml = renderWith({
     'teleop/status/armed': 0,
+    'teleop/status/alert_warning_disarmed': 0,
     'teleop/status/blocking_kind': 1,
     'teleop/status/blocking_joystick_index': 0,
     'teleop/status/blocking_input_index': 1,
@@ -306,9 +309,41 @@ test('subsystem cards render operator arming blocker when disarmed and clear whe
   assert.ok(disarmedHtml.includes('Disarmed — joystick 0 axis 1 held'), disarmedHtml);
   assert.ok(disarmedHtml.includes('Disarmed — joystick 1 button 3 held'), disarmedHtml);
 
-  // Disarmed on POV and with NONE blocker.
+  // Disabled/auto with neutral inputs (alert_warning_disarmed === 0 and
+  // blocking_kind === NONE): suppress the yellow "Disarmed — release inputs to
+  // arm" banner.
+  const disabledNeutralHtml = renderWith({
+    'teleop/status/armed': 0,
+    'teleop/status/alert_warning_disarmed': 0,
+    'teleop/status/blocking_kind': 0,
+    'teleop/status/blocking_joystick_index': -1,
+    'teleop/status/blocking_input_index': -1,
+    'operator/status/armed': 1,
+    'operator/status/blocking_kind': 0,
+    'operator/status/blocking_joystick_index': -1,
+    'operator/status/blocking_input_index': -1,
+  });
+  assert.ok(!disabledNeutralHtml.includes('Disarmed'), disabledNeutralHtml);
+
+  // Enabled in teleop and disarmed with NONE (alert_warning_disarmed === 1)
+  // still shows the fallback banner.
+  const teleopNoneHtml = renderWith({
+    'teleop/status/armed': 0,
+    'teleop/status/alert_warning_disarmed': 1,
+    'teleop/status/blocking_kind': 0,
+    'teleop/status/blocking_joystick_index': -1,
+    'teleop/status/blocking_input_index': -1,
+    'operator/status/armed': 1,
+    'operator/status/blocking_kind': 0,
+    'operator/status/blocking_joystick_index': -1,
+    'operator/status/blocking_input_index': -1,
+  });
+  assert.ok(teleopNoneHtml.includes('Disarmed — release inputs to arm'), teleopNoneHtml);
+
+  // Disarmed on POV and with NONE blocker (node without alert_warning_disarmed).
   const povHtml = renderWith({
     'teleop/status/armed': 0,
+    'teleop/status/alert_warning_disarmed': 1,
     'teleop/status/blocking_kind': 3,
     'teleop/status/blocking_joystick_index': 0,
     'teleop/status/blocking_input_index': 1,
@@ -323,6 +358,7 @@ test('subsystem cards render operator arming blocker when disarmed and clear whe
   // Armed: no disarmed banner shown.
   const armedHtml = renderWith({
     'teleop/status/armed': 1,
+    'teleop/status/alert_warning_disarmed': 0,
     'teleop/status/blocking_kind': 0,
     'teleop/status/blocking_joystick_index': -1,
     'teleop/status/blocking_input_index': -1,
