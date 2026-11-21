@@ -105,9 +105,15 @@ cc_library(
     hdrs = select({
         "@platforms//os:macos": ["os/kqueue_poller.h"],
         "@platforms//os:linux": ["os/epoll_poller.h"],
-    }) + ["os/poller.h"],
+    }) + [
+        "os/poller.h",
+        "wake_channel_wait.h",
+    ],
     visibility = ["//visibility:public"],
-    deps = [":events_core"],
+    deps = [
+        ":events_core",
+        "//talOS/rtms:wake",
+    ],
 )
 
 cc_test(

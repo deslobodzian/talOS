@@ -4,8 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <cstdio>
-#include <exception>
 #include <functional>
 #include <optional>
 #include <span>
@@ -21,6 +19,7 @@
 #include "talOS/events/scheduler.h"
 #include "talOS/events/stall_guard.h"
 #include "talOS/events/time.h"
+#include "talOS/events/wake_channel_wait.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/rtms/wake.h"
 
@@ -143,17 +142,18 @@ class RealtimeEventLoop
   Delivery delivery() const { return options_.delivery; }
   Activity activity() const {
     Activity counts = activity_;
-    counts.stalled_arms = stalled_arms_.load(std::memory_order_relaxed);
-    counts.wake_fallbacks = wake_fallbacks_.load(std::memory_order_relaxed);
+    const talos::event::WakeLoss channel = wake_wait_.loss();
+    counts.stalled_arms = channel.stalled_arms;
+    counts.wake_fallbacks = channel.wake_fallbacks;
     return counts;
   }
   // Reads only atomics and the transports registration fixed, so another
   // thread may call it while the loop runs; before the run, call it from the
   // loop's thread.
   WakeLoss wake_loss() const {
-    WakeLoss loss{
-        .stalled_arms = stalled_arms_.load(std::memory_order_relaxed),
-        .wake_fallbacks = wake_fallbacks_.load(std::memory_order_relaxed)};
+    const talos::event::WakeLoss channel = wake_wait_.loss();
+    WakeLoss loss{.stalled_arms = channel.stalled_arms,
+                  .wake_fallbacks = channel.wake_fallbacks};
     for (const Transport& transport : transports_) {
       if (transport.queue) {
         loss.wake_failures += transport.queue->wake_failures();
@@ -276,7 +276,7 @@ class RealtimeEventLoop
 
       const MonotonicTime deadline = std::min(scheduler_.next_deadline(), end);
 
-      if (!wake_) {
+      if (!wake_wait_.is_open()) {
         if (poller_.wait_until(deadline) == Poller::WakeReason::READABLE) {
           serve_watched_fds();
         }
@@ -349,37 +349,25 @@ class RealtimeEventLoop
       if (transports_[id].prompt) prompt_watchers_.push_back(id);
     }
     if (prompt_watchers_.empty()) return;
-    try {
-      if (options_.make_wake_receiver != nullptr) {
-        wake_.emplace(options_.make_wake_receiver());
-      } else {
-        wake_.emplace();
-      }
-      poller_.add_fd(wake_->fd());
-    } catch (const std::exception& error) {
+    const auto poll_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             options_.tick_period)
+                             .count();
+    if (!wake_wait_.open(poller_,
+                         "talos: event loop cannot be woken on publish",
+                         poll_us, options_.make_wake_receiver)) {
       // Out of descriptors, say: a node that cannot be woken still runs,
       // at the cost of POLL's wakeups.
-      wake_.reset();
       for (const std::uint16_t id : prompt_watchers_) {
         transports_[id].prompt = false;
       }
       prompt_watchers_.clear();
       options_.delivery = Delivery::POLL;
-      wake_fallbacks_.fetch_add(1, std::memory_order_relaxed);
-      std::fprintf(stderr,
-                   "talos: event loop cannot be woken on publish (%s); it "
-                   "drains every %lld us instead\n",
-                   error.what(),
-                   static_cast<long long>(
-                       std::chrono::duration_cast<std::chrono::microseconds>(
-                           options_.tick_period)
-                           .count()));
       return;
     }
     for (const std::uint16_t id : prompt_watchers_) {
       Transport& transport = transports_[id];
       if (transport.queue && transport.reader_id) {
-        transport.queue->set_reader_wake(*transport.reader_id, wake_->id());
+        transport.queue->set_reader_wake(*transport.reader_id, wake_wait_.id());
       }
     }
   }
@@ -406,22 +394,13 @@ class RealtimeEventLoop
       // A watcher without a slot cannot be armed; each drain retries its
       // rejoin, and the backstop bounds the wait for the next one.
       if (!transport.queue || !transport.reader_id) continue;
-      const bool armed =
-          options_.arm_wake != nullptr
-              ? options_.arm_wake(*transport.queue, *transport.reader_id)
-              : transport.queue->arm_wake(*transport.reader_id);
-      if (armed) {
-        transport.stall_guard.reset();
-        continue;
-      }
-      switch (transport.stall_guard.on_failed_arm()) {
-        case StallAction::kRetry:
-          return Poller::now();
-        case StallAction::kTripped:
-          stalled_arms_.fetch_add(1, std::memory_order_relaxed);
-          break;
-        case StallAction::kStalled:
-          break;
+      if (wake_wait_.arm_reader(transport.stall_guard, [&] {
+            return options_.arm_wake != nullptr
+                       ? options_.arm_wake(*transport.queue,
+                                           *transport.reader_id)
+                       : transport.queue->arm_wake(*transport.reader_id);
+          })) {
+        return Poller::now();
       }
     }
     const MonotonicTime now = Poller::now();
@@ -434,11 +413,10 @@ class RealtimeEventLoop
     if (reason == Poller::WakeReason::READABLE) {
       serve_watched_fds();
       // A watched fd alone is no publication: nothing to drain.
-      if (!this->running() || !wake_ ||
-          !poller_.reported_readable(wake_->fd())) {
+      if (!this->running() || !wake_wait_.reported_readable(poller_)) {
         return std::nullopt;
       }
-      wake_->drain();
+      wake_wait_.drain();
       return Poller::now();
     }
     if (reason == Poller::WakeReason::DEADLINE && backstop < deadline) {
@@ -620,8 +598,8 @@ class RealtimeEventLoop
     if (!transport.reader_id) {
       return;
     }
-    if (transport.prompt && wake_) {
-      queue.set_reader_wake(*transport.reader_id, wake_->id());
+    if (transport.prompt && wake_wait_.is_open()) {
+      queue.set_reader_wake(*transport.reader_id, wake_wait_.id());
     }
     const std::uint64_t start = queue.reader_sequence(*transport.reader_id);
     if (start > transport.next_sequence) {
@@ -633,10 +611,11 @@ class RealtimeEventLoop
   Options options_;
   Poller poller_;
   Scheduler scheduler_;
-  // Delivery::ON_PUBLISH with a prompt watcher: the receiver their
-  // publications wake. Declared before the transports so that their reader
-  // slots, which name it, are released first.
-  std::optional<WakeReceiver> wake_;
+  // Delivery::ON_PUBLISH with a prompt watcher: the wake channel wait helper
+  // owning the receiver their publications wake and its atomic wake-loss
+  // counters. Declared before the transports so that their reader slots, which
+  // name the receiver, are released first.
+  WakeChannelWait wake_wait_;
   std::vector<Transport> transports_;
   std::vector<std::uint16_t> watchers_;
   // The prompt watchers, in registration order (ON_PUBLISH only).
@@ -646,11 +625,9 @@ class RealtimeEventLoop
     std::function<void()> on_readable;
   };
   std::vector<FdWatch> fd_watches_;
-  // Activity's wakeups and drains; its stalled_arms and wake_fallbacks are
-  // the atomics below, which wake_loss() reads from another thread.
+  // Activity's wakeups and drains; its stalled_arms and wake_fallbacks live in
+  // wake_wait_, which wake_loss() reads atomically from another thread.
   Activity activity_;
-  std::atomic<std::uint64_t> stalled_arms_{0};
-  std::atomic<std::uint64_t> wake_fallbacks_{0};
   // The last drain left a backlog the run drains again at once (see
   // drain_messages).
   bool backlog_{false};
