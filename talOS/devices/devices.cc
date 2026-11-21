@@ -812,13 +812,20 @@ hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
 
 namespace {
 template <class Sample>
-std::optional<Time> AcquisitionTime(const HardwareLink& link,
-                                    const Sample& sample, bool velocity) {
+std::optional<Duration> SignalAge(const Sample& sample, bool velocity) {
   const auto age = velocity ? sample.velocity_age_us : sample.position_age_us;
   if (!sample.valid || age == UINT32_MAX) return std::nullopt;
+  return std::chrono::microseconds{age};
+}
+
+template <class Sample>
+std::optional<Time> AcquisitionTime(const HardwareLink& link,
+                                    const Sample& sample, bool velocity) {
+  const auto age = SignalAge(sample, velocity);
+  if (!age) return std::nullopt;
   const auto time = link.sample_time();
   if (!time) return std::nullopt;
-  return *time - std::chrono::microseconds{age};
+  return *time - *age;
 }
 }  // namespace
 
@@ -837,10 +844,13 @@ std::optional<Time> HardwareAccess::sensor_time(const HardwareLink& link,
 std::optional<Duration> HardwareAccess::motor_age(const HardwareLink& link,
                                                   std::size_t index,
                                                   bool velocity) {
-  const auto sample = motor_sample(link, index);
-  const auto age = velocity ? sample.velocity_age_us : sample.position_age_us;
-  if (!sample.valid || age == UINT32_MAX) return std::nullopt;
-  return std::chrono::microseconds{age};
+  return SignalAge(motor_sample(link, index), velocity);
+}
+
+std::optional<Duration> HardwareAccess::sensor_age(const HardwareLink& link,
+                                                   std::size_t index,
+                                                   bool velocity) {
+  return SignalAge(sensor_sample(link, index), velocity);
 }
 
 hardware::DigitalInputSample HardwareAccess::digital_input_sample(
@@ -1011,6 +1021,12 @@ std::optional<Time> CANcoder::position_time() const {
 }
 std::optional<Time> CANcoder::velocity_time() const {
   return HardwareAccess::sensor_time(*link_, index_, true);
+}
+std::optional<Duration> CANcoder::position_age() const {
+  return HardwareAccess::sensor_age(*link_, index_, false);
+}
+std::optional<Duration> CANcoder::velocity_age() const {
+  return HardwareAccess::sensor_age(*link_, index_, true);
 }
 
 Gyro::Gyro(Node& node, std::string_view name)

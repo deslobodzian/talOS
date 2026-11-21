@@ -693,9 +693,13 @@ can_id = 3
         hw.set_gyro("lift", "gyro", 0.75, -0.5, 5000, 6000)
         sim.step(0.02)
         self.assertIsNone(signals.motor.position_time)
-        # Motor ages come from the State: known before the clock mapping.
+        self.assertIsNone(signals.encoder.position_time)
+        # Motor and CANcoder ages come from the State: known before the clock
+        # mapping.
         self.assertEqual((signals.motor.position_age,
                           signals.motor.velocity_age), (1_000_000, 3_000_000))
+        self.assertEqual((signals.encoder.position_age,
+                          signals.encoder.velocity_age), (2_000_000, 4_000_000))
         sim.step(0.08)
         sampled = talos.hardware_sample_time_ns(node)
         self.assertIsInstance(sampled, int)
@@ -716,15 +720,28 @@ can_id = 3
         self.assertFalse(signals.motor.connected)
         self.assertIsNone(signals.motor.velocity_time)
         self.assertIsNone(signals.motor.velocity_age)
+        self.assertFalse(signals.encoder.connected)
         self.assertIsNone(signals.encoder.position_time)
+        self.assertIsNone(signals.encoder.position_age)
+        self.assertIsNone(signals.encoder.velocity_age)
         self.assertIsNone(signals.gyro.yaw_rate_time)
         hw.set_motor("lift", "lift", 3, 2, 1000, 3000)
+        hw.set_cancoder("lift", "cc", 0.2, 0.3, 2000, 4000)
         hw.set_connected("lift", "lift", False)
+        hw.set_connected("lift", "cc", False)
         sim.step(0.02)
         self.assertIsNone(signals.motor.velocity_time)
+        self.assertIsNone(signals.encoder.position_age)
+        self.assertIsNone(signals.encoder.velocity_age)
+        hw.set_connected("lift", "cc", True)
+        sim.step(0.02)
+        self.assertEqual((signals.encoder.position_age,
+                          signals.encoder.velocity_age), (2_000_000, 4_000_000))
         del hw
         sim.step(0.15)
         self.assertIsNone(signals.encoder.position_time)
+        self.assertIsNone(signals.encoder.position_age)
+        self.assertIsNone(signals.encoder.velocity_age)
         self.assertIsNone(signals.gyro.yaw_rate_time)
 
     def test_limit_switches_read_only_from_a_connected_sample(self):

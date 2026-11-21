@@ -66,10 +66,13 @@ struct HardwareAccess {
       const HardwareLink& link, std::size_t index, bool velocity);
   static std::optional<event::MonotonicTime> sensor_time(
       const HardwareLink& link, std::size_t index, bool velocity);
-  // Motor::position_age / velocity_age.
+  // Motor::position_age / velocity_age, CANcoder::position_age / velocity_age.
   static std::optional<event::Duration> motor_age(const HardwareLink& link,
                                                   std::size_t index,
                                                   bool velocity);
+  static std::optional<event::Duration> sensor_age(const HardwareLink& link,
+                                                   std::size_t index,
+                                                   bool velocity);
   // The latched sample for a device; all zeros (valid == false) until an
   // accepted hardware state carries it. A motor's, CAN sensor's or encoder's
   // invalid sample carries the last valid position instead of its own

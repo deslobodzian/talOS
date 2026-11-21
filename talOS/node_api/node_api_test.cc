@@ -38,6 +38,9 @@ channel = 0
 [subsystems.roller.sensors.gyro]
 type = "Pigeon2"
 can_id = 2
+[subsystems.roller.sensors.cc]
+type = "CANcoder"
+can_id = 3
 )";
 
 struct Value {
@@ -738,9 +741,14 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   ASSERT_NE(hw, nullptr) << talos_last_error();
   const auto gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
   ASSERT_GE(gyro, 0);
+  const auto cc = talos_device(node, TALOS_DEVICE_CANCODER, "cc");
+  ASSERT_GE(cc, 0);
   ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 1000,
                                          3000, 0, 0, 0),
             TALOS_OK);
+  ASSERT_EQ(
+      talos_sim_hardware_set_cancoder(hw, "roller", "cc", 0.2, 0.3, 2000, 4000),
+      TALOS_OK);
   ASSERT_EQ(
       talos_sim_hardware_set_gyro(hw, "roller", "gyro", 0.75, -0.5, 5000, 6000),
       TALOS_OK);
@@ -757,6 +765,18 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   int64_t acquired = -1;
   EXPECT_EQ(talos_motor_time(node, roller.wheel, 0, &acquired), 0);
   EXPECT_EQ(acquired, -1);
+  EXPECT_EQ(talos_sensor_time(node, cc, 0, &acquired), 0);
+  EXPECT_EQ(acquired, -1);
+  // Signal ages come from the State itself: known before the mapping.
+  int64_t age = -1;
+  ASSERT_EQ(talos_motor_age(node, roller.wheel, 0, &age), 1);
+  EXPECT_EQ(age, 1 * kMs);
+  ASSERT_EQ(talos_motor_age(node, roller.wheel, 1, &age), 1);
+  EXPECT_EQ(age, 3 * kMs);
+  ASSERT_EQ(talos_sensor_age(node, cc, 0, &age), 1);
+  EXPECT_EQ(age, 2 * kMs);
+  ASSERT_EQ(talos_sensor_age(node, cc, 1, &age), 1);
+  EXPECT_EQ(age, 4 * kMs);
 
   ASSERT_EQ(talos_sim_step(sim_, 50 * kMs), TALOS_OK) << talos_last_error();
   ASSERT_EQ(talos_hardware_sample_time(node, &sampled), 1);
@@ -770,6 +790,10 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   EXPECT_EQ(acquired, sampled - kMs);
   ASSERT_EQ(talos_motor_time(node, roller.wheel, 1, &acquired), 1);
   EXPECT_EQ(acquired, sampled - 3 * kMs);
+  ASSERT_EQ(talos_sensor_time(node, cc, 0, &acquired), 1);
+  EXPECT_EQ(acquired, sampled - 2 * kMs);
+  ASSERT_EQ(talos_sensor_time(node, cc, 1, &acquired), 1);
+  EXPECT_EQ(acquired, sampled - 4 * kMs);
   ASSERT_EQ(talos_sensor_time(node, gyro, 0, &acquired), 1);
   EXPECT_EQ(acquired, sampled - 5 * kMs);
   ASSERT_EQ(talos_sensor_time(node, gyro, 1, &acquired), 1);
@@ -777,12 +801,30 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   EXPECT_EQ(talos_motor_time(node, roller.wheel, 0, nullptr), TALOS_ERR);
   EXPECT_EQ(talos_sensor_time(node, gyro, 0, nullptr), TALOS_ERR);
   EXPECT_EQ(talos_motor_time(node, -1, 0, &acquired), TALOS_ERR);
+  EXPECT_EQ(talos_sensor_age(node, cc, 0, nullptr), TALOS_ERR);
+  EXPECT_EQ(talos_sensor_age(node, -1, 0, &age), TALOS_ERR);
+  EXPECT_EQ(talos_sensor_age(node, roller.wheel, 0, &age), TALOS_ERR);
+
+  // An unknown age invalidates the sample and returns 0.
+  ASSERT_EQ(talos_sim_hardware_set_cancoder(hw, "roller", "cc", 0.2, 0.3,
+                                            UINT32_MAX, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_sensor_age(node, cc, 0, &age), 0);
+  EXPECT_EQ(talos_sensor_age(node, cc, 1, &age), 0);
+  ASSERT_EQ(
+      talos_sim_hardware_set_cancoder(hw, "roller", "cc", 0.2, 0.3, 2000, 4000),
+      TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_sensor_age(node, cc, 0, &age), 1);
+  EXPECT_EQ(age, 2 * kMs);
 
   talos_sim_hardware_destroy(hw);  // the bridge goes silent
   ASSERT_EQ(talos_sim_step(sim_, 150 * kMs), TALOS_OK) << talos_last_error();
   EXPECT_EQ(talos_hardware_sample_time(node, &sampled), 0);
   EXPECT_EQ(talos_motor_time(node, roller.wheel, 0, &acquired), 0);
   EXPECT_EQ(talos_sensor_time(node, gyro, 0, &acquired), 0);
+  EXPECT_EQ(talos_sensor_age(node, cc, 0, &age), 0);
 }
 
 TEST_F(NodeApi, HardwareFreshnessAndAge) {
