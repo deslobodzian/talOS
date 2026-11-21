@@ -201,17 +201,12 @@ jobs:
     - name: Lane budgets (docs/TESTING.md §9)
       # Each test action's time against its lane's budget, from this
       # invocation's build events (a cached result keeps the time of the
-      # run that produced it). The fast lane's 5 s is printed, not
-      # enforced: the budgets were measured on an idle 8-core workstation,
-      # where every fast target ran under 5 s, and this runner ran three
-      # over it (run 43357369179: the 2026 robot's bundle_test 6.8 s and
-      # pose_estimator node_test 5.6 s, when talOS held that robot, and
-      # //studio:typecheck 5.6 s). TODO.md LANE-1.
+      # run that produced it). Enforces every lane (fast, heavy, integration,
+      # e2e, perf) against docs/TESTING.md §9's budgets.
       if: ${{ !cancelled() && (steps.test.outcome == 'success' || steps.test.outcome == 'failure') }}
       run: >-
         python3 tools/slow_tests.py --check
         --bep "$RUNNER_TEMP/test-events.json"
-        --enforce heavy,integration,e2e,perf
 
     - &checkout-unchanged
       name: Checkout unchanged by the build and tests

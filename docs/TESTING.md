@@ -215,8 +215,11 @@ Where RULES.md 12 is read too broadly or too narrowly:
    verifies its preconditions: realtime granted (`talos: realtime scheduling
    incomplete` fails the macOS sim tests), the host did not sleep, and the
    graph's CPU demand fits the cores. A test that cannot hold its bound on a
-   host fails as unqualified, distinctly from a product failure. **[gap:
-   LANE-1]**
+   host fails as unqualified, distinctly from a product failure
+   (`//talOS/bridge:run_timing_test` records the gtest property
+   `host_unqualified="true"` and `[HOST_UNQUALIFIED]` in its failure message;
+   uniform reporting across the remaining perf and timed e2e tests is still
+   open). **[gap: LANE-1]**
 8. **Statistics over single samples.** A lateness or gap assertion uses the
    quantity the requirement names (the maximum inside a window, or a
    percentile over at least 50 samples), as
@@ -414,10 +417,8 @@ millisecond) over the threshold; `--bep FILE` reads one invocation's
 With `--check` it exits 1 when an action exceeds its lane's budget above
 (lane tags from `--lanes FILE`, the `--bep` file, or `bazel query`, where a
 failed query or one finding no lane-tagged test is an error).
-**[enforced: the Linux job, after the suite, for the heavy, integration,
-e2e and perf lanes; gap: LANE-1 for the fast lane, which a hosted runner
-does not hold (the workflow step names the targets) and which is checked
-locally only]**
+**[enforced: the Linux job, after the suite, for every lane (fast, heavy,
+integration, e2e and perf)]**
 
 CI policy:
 
