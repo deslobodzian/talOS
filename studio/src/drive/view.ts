@@ -158,18 +158,20 @@ function alertsWidget(model: DriveModel): string {
 
 // The rows that matter come first, so a list that overflows its cell (the
 // body then scrolls) hides the least: a node down or quarantined (critical
-// ones first), a named node the summary lacks, one driving from a target
-// lane, a critical one, then the rest; summary order within each.
+// ones first), a node whose devices flush is holding outputs with no live
+// target (REQ-SAFE-41), a named node the summary lacks, one driving from a
+// target lane, a critical one, then the rest; summary order within each.
 function nodeRank(n: SummaryNode|string, summary: DriveSummary): number {
-  if (typeof n === 'string') return 2;
+  if (typeof n === 'string') return 3;
   const failed = (summary.registry && !n.alive) || (summary.supervised && n.quarantined);
   if (failed) return n.critical ? 0 : 1;
-  if (summary.registry && n.drives !== null) return 3;
-  return n.critical ? 4 : 5;
+  if (summary.registry && n.outputs_held) return 2;
+  if (summary.registry && n.drives !== null) return 4;
+  return n.critical ? 5 : 6;
 }
 
 // A subsystems row's state words (the row width model sizes for the widest).
-export const NODE_STATE = {failing: 'FAILING', down: 'DOWN', up: 'UP', unknown: 'unknown'} as const;
+export const NODE_STATE = {failing: 'FAILING', down: 'DOWN', held: 'HELD', up: 'UP', unknown: 'unknown'} as const;
 
 function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): string {
   const summary = model.summary;
@@ -187,16 +189,19 @@ function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): st
       return `<li><span class="name" title="${esc(n)}">${esc(n)}</span>${tag(NODE_STATE.unknown, 'neutral')}` +
           '<span class="meta">not in the summary</span></li>';
     // One state word, the most severe: a quarantined node is not running
-    // (the launcher paused its restarts), so FAILING says all DOWN would.
+    // (the launcher paused its restarts), so FAILING says all DOWN would; an
+    // alive node whose flush is holding outputs with no live target shows HELD.
     const state = summary.supervised && n.quarantined ? tag(NODE_STATE.failing, 'bad') :
         !summary.registry ? tag(NODE_STATE.unknown, 'neutral') :
-        n.alive           ? tag(NODE_STATE.up, 'good') :
-                            tag(NODE_STATE.down, n.critical ? 'bad' : 'warn');
+        !n.alive          ? tag(NODE_STATE.down, n.critical ? 'bad' : 'warn') :
+        n.outputs_held    ? tag(NODE_STATE.held, 'warn') :
+                            tag(NODE_STATE.up, 'good');
+    const held = summary.registry && n.outputs_held ? 'outputs held: no live target' : '';
     const restarts = summary.supervised && n.restarts > 0 ? `restarts ${n.restarts}` : '';
     const drives = summary.registry && n.drives !== null ? `drives ${n.drives}` : '';
     // The name's tooltip repeats what a narrow row may cut off.
-    // One note for both, so a narrow row loses one gap to it, not two.
-    const note = [restarts, drives].filter(Boolean).join(' · ');
+    // One note for all, so a narrow row loses one gap to it.
+    const note = [held, restarts, drives].filter(Boolean).join(' · ');
     const title = [n.name, note].filter(Boolean).join(' · ');
     return `<li><span class="name" title="${esc(title)}">${esc(n.name)}</span>${state}` +
         (note ? `<span class="meta">${esc(note)}</span>` : '') + '</li>';

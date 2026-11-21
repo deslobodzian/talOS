@@ -1071,6 +1071,43 @@ test('subsystems rows put failed and driving nodes first', () => {
   assert.deepEqual(order, ['shooter', 'vision', 'drivetrain', 'telemetry', 'camera']);
 });
 
+// REQ-SAFE-41: a live subsystem whose devices flush is holding outputs with no
+// live target (`outputs_held: true`) shows HELD (`tag-warn`) with one state
+// word per row, names "outputs held: no live target" in its note and title,
+// yields to FAILING / unknown / DOWN when those apply, and ranks right after
+// failed nodes ahead of driving and idle subsystems.
+test('subsystems widget renders outputs_held as HELD, ranked right after failed nodes', () => {
+  const node = (name: string, extra: object) => ({name, alive: true, critical: true, restarts: 0,
+                                                  quarantined: false, drives: null, ...extra});
+  const h = harness();
+  h.connect(0);
+  h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
+    registry: true, omitted: 0, nodes: [
+      node('camera', {critical: false}),
+      node('drivetrain', {drives: 'teleop'}),
+      node('intake', {outputs_held: true, restarts: 1}),
+      node('vision', {critical: false, alive: false}),
+      node('shooter', {alive: false, quarantined: true, outputs_held: true}),
+      node('elevator', {alive: false, outputs_held: true})]}));
+  const html = widgetHtml(render(h), 'Subsystems');
+  assert.match(html,
+               /title="intake · outputs held: no live target · restarts 1">intake<\/span><span class="tag tag-warn">HELD<\/span><span class="meta">outputs held: no live target · restarts 1<\/span>/);
+  assert.match(html, /shooter<\/span><span class="tag tag-bad">FAILING<\/span>/);
+  assert.match(html, /elevator<\/span><span class="tag tag-bad">DOWN<\/span>/);
+  assert.match(html, /drivetrain<\/span><span class="tag tag-good">UP<\/span>/);
+  for (const row of html.match(/<li>.*?<\/li>/g) ?? [])
+    assert.ok((row.match(/class="tag /g) ?? []).length <= 1, `two state words in ${row}`);
+  const order = [...html.matchAll(/<span class="name"[^>]*>([^<]*)</g)].map(m => m[1]);
+  assert.deepEqual(order, ['shooter', 'elevator', 'vision', 'intake', 'drivetrain', 'camera']);
+
+  // Without a readable registry, unknown wins over outputs_held and no held note shows.
+  h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
+    registry: false, omitted: 0, nodes: [node('intake', {outputs_held: true})]}));
+  const unread = widgetHtml(render(h), 'Subsystems');
+  assert.match(unread, /intake<\/span><span class="tag tag-neutral">unknown<\/span>/);
+  assert.doesNotMatch(unread, /HELD|outputs held/);
+});
+
 // REQ-OPS-49: listRowsFit's box model assumes drive.css keeps zero margin and
 // padding on lists and their items, uses --drive-list-gap only between columns
 // (no row-gap), and sets each list item's height to --drive-row and item gap

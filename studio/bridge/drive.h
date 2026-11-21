@@ -255,6 +255,9 @@ struct DriveSummaryNode {
   // The target lane source its Target last selected, while it is alive;
   // nullopt when it selected none or reads no target.
   std::optional<std::string> drives;
+  // True while the node is alive and its devices flush is holding back outputs
+  // set with no live target (introspect::kFlagOutputsHeld; REQ-SAFE-41).
+  bool outputs_held{false};
 };
 
 struct DriveSummary {
@@ -335,14 +338,14 @@ struct DriveRosterEntry {
 // `studio_bridge` falls back to `name == kStudioBridgeNodeName` not listed in
 // `config`, and `critical` falls back to `config` by name (else
 // `!is_studio_bridge`). Without a manifest, or one listing no member yet, they
-// are `config`'s nodes in its order. `alive` and `drives` come from the live
-// registry's rows of that name (`registry`; nullptr when it could not be read,
-// and the summary then says `registry: false` rather than every node dead as a
-// fact); when the registry is readable, the launcher-added Studio bridge
-// (`is_studio_bridge`) is always alive because it is serving this summary. A
-// manifest that does not parse is treated as absent, so the summary says
-// `supervised: false` rather than zero restarts as a fact; the session then
-// comes from the registry.
+// are `config`'s nodes in its order. `alive`, `drives` and `outputs_held` come
+// from the live registry's rows of that name (`registry`; nullptr when it could
+// not be read, and the summary then says `registry: false` rather than every
+// node dead as a fact); when the registry is readable, the launcher-added
+// Studio bridge (`is_studio_bridge`) is always alive because it is serving this
+// summary. A manifest that does not parse is treated as absent, so the summary
+// says `supervised: false` rather than zero restarts as a fact; the session
+// then comes from the registry.
 inline DriveSummary BuildDriveSummary(
     const std::vector<DriveRosterEntry>& config,
     const std::vector<talos::introspect::NodeSnapshot>* registry,
@@ -426,6 +429,7 @@ inline DriveSummary BuildDriveSummary(
     for (const auto& row : rows) {
       if (row.name != node.name || !row.alive) continue;
       node.alive = true;
+      node.outputs_held = row.outputs_held();
       for (const auto& selection : row.selections) {
         if (auto source = selection.selected_source()) {
           node.drives = std::move(*source);
@@ -456,6 +460,9 @@ inline void AppendDriveNode(std::string& out, const DriveSummaryNode& node) {
     AppendEscaped(out, *node.drives);
   } else {
     out += "null";
+  }
+  if (node.outputs_held) {
+    out += ",\"outputs_held\":true";
   }
   out += '}';
 }
