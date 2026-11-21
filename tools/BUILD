@@ -511,3 +511,17 @@ py_test(
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
 )
+
+# python3 tools/run_rio_clang_tidy.py (CI's roborio job)
+# Sanitizes GradleRIO's compile_commands.json and runs clang-tidy-18 over
+# controller_processor/rio/src/main/cpp/*.cpp (CI-12).
+py_test(
+    name = "run_rio_clang_tidy_test",
+    size = "small",
+    srcs = [
+        "run_rio_clang_tidy.py",
+        "run_rio_clang_tidy_test.py",
+    ],
+    legacy_create_init = False,
+    main = "run_rio_clang_tidy_test.py",
+)
