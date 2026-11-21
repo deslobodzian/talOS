@@ -331,10 +331,16 @@ jobs:
         disk-cache: robot-repo
         repository-cache: true
         cache-save: ${{ github.ref == 'refs/heads/main' }}
+    - name: Build Studio pages for dependent repositories
+      # Writes bazel-bin/studio/dist (with STUDIO_STAMP.txt) so examples/robot_repo
+      # exercises real HTTP 200 /drive serving (TALOS_REQUIRE_STUDIO_PAGES=1).
+      run: bazel build --noshow_progress //studio:web_dist
     - name: Robot repository (graph, node and sim tests, bundle)
       working-directory: examples/robot_repo
       run: |
-        bazel test --test_output=errors //... \
+        bazel test --test_output=errors \
+          --test_env=TALOS_REQUIRE_STUDIO_PAGES=1 \
+          //... \
           @talos//talOS/configuration:config_fuzz_test
     - name: Scaffolded subsystems in a copy of the robot repository
       # new_subsystem's C++ and Python output, built and tested in a copy

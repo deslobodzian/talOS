@@ -129,21 +129,44 @@ layout, so `/drive` shows no widgets
 ([talOS/telemetry](../../talOS/telemetry/README.md#dashboard-layout)).
 
 `studio_test` runs `//:sim --start-studio-bridge --studio-http-port 0` until the
-manifest records the bridge's bound `http_port`. It requires `/drive` to answer with the page
-when `//:studio_webroot` holds no `NOT_BUILT.txt`, else with that command
-naming `//:studio_webroot`'s folder and a talOS checkout that exists (so a
-webroot the config or `//:sim`'s `data` miswires fails it). It then stops
-the session and requires the bridge to have run once and exited 0. It runs
-outside Bazel's sandbox, which would stage each page as a link out of the
-webroot, a file the bridge does not serve. Unlike `sim_smoke_test` (which
-checks process lifecycle and registration via `talos_sim_test(..., studio = True)`),
-`studio_test` verifies the served HTTP `/drive` and webroot responses.
+manifest records the bridge's bound `http_port`. It requires `/drive` to answer
+HTTP 200 with the HTML page when `//:studio_webroot` holds no `NOT_BUILT.txt`,
+else 503 with the build command naming `//:studio_webroot`'s folder and a talOS
+checkout that exists (so a webroot the config or `//:sim`'s `data` miswires
+fails it); setting `--test_env=TALOS_REQUIRE_STUDIO_PAGES=1` fails the test if
+the pages are not built. It then stops the session and requires the bridge to
+have run once and exited 0. It runs outside Bazel's sandbox, which would stage
+each page as a link out of the webroot, a file the bridge does not serve.
+Unlike `sim_smoke_test` (which checks process lifecycle and registration via
+`talos_sim_test(..., studio = True)`), `studio_test` verifies the served HTTP
+`/drive` and webroot responses.
 
-`robot_bundle` carries no Studio: `talos_bundle` refuses a webroot without
-`index.html`, and this fixture's checks run where the pages are not built.
-A robot repository that builds them adds
+**Stale-pin detection:** `//studio:web_dist` writes `STUDIO_STAMP.txt` into
+`bazel-bin/studio/dist` holding a deterministic SHA-256 over Studio's web
+inputs (`studio/src/**`, its HTML/config/lock files, and
+`talOS/telemetry/telemetry.fbs`). `studio_web` checks that stamp against the
+pinned `@talos` checkout whenever built pages exist. If the talOS pin moves (or
+Studio's inputs change) without rebuilding `//studio:web_dist`, `studio_web`
+writes `STALE.txt` instead of symlinking the old pages, and building
+`//:studio_webroot`, `//:sim`, or a Studio-bearing `talos_bundle` fails closed
+printing the expected and actual stamps and the exact rebuild command
+(`(cd <talOS checkout> && bazel build //studio:web_dist)`), while `bazel query`
+and targets that do not use `//:studio_webroot` still load and build.
+
+**Fresh clones, bundles, and CI:** On a fresh clone before `//studio:web_dist`
+has been built, `bazel test //...` (with `TALOS_REQUIRE_STUDIO_PAGES` unset)
+still passes because `//:studio_webroot` carries `NOT_BUILT.txt`. `robot_bundle`
+carries no Studio here because `talos_bundle` refuses a `studio_webroot`
+without `index.html` and `drive.html`; a robot repository that adds
 `studio_bridge = "@talos//studio/bridge:studio_bridge"` and
-`studio_webroot = ":studio_webroot"` to its `talos_bundle`.
+`studio_webroot = ":studio_webroot"` to its `talos_bundle` (and any CI job that
+exercises Studio pages end to end) must build `//studio:web_dist` in the talOS
+checkout first:
+
+```sh
+(cd <talOS checkout> && bazel build //studio:web_dist)
+bazel test --test_env=TALOS_REQUIRE_STUDIO_PAGES=1 //...
+```
 
 ## What a robot repository names by `@talos//`
 
