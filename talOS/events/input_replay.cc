@@ -898,9 +898,10 @@ RecordedSession::RecordedSession(const std::string& path,
         std::max(replayed_run->first, *replayed_run_dispatch);
   }
   // Whether the replayed program's first run was read from its first segment.
-  // When segment 0 was rotated out (e.g. by the byte cap), any ARM_TIMER or
-  // DISARM_TIMER in segment 0 is unseen, so tracked timer state is uncertain
-  // and must not clamp loop_end().
+  // When segment 0 was rotated out (e.g. by the byte cap under
+  // --allow-capped-replay), an ARM_TIMER or DISARM_TIMER in segment 0 is
+  // unseen, so clamping below only uses timers whose deadline was observed in
+  // the kept window (or offset-0 timers when no firing was kept at all).
   bool replayed_run_from_head = true;
   if (replayed_run) {
     const std::vector<std::string> files =
@@ -911,21 +912,26 @@ RecordedSession::RecordedSession(const std::string& path,
         !starts_mid_run &&
         (LogAndPlace(replayed_run_first_read).second == 0 ||
          (files.size() == 1 && files.front() == replayed_run_first_read));
-    if (!replayed_run_from_head) replayed_run_timers_uncertain = true;
   }
   // A single-run live loop that was late when it stopped can record its EXIT
   // after a due timer deadline it never fired, and an offset-0 timer whose
   // run's only dispatch record is its EXIT sits right at
-  // run_start == replayed_end. When the run's own records have no GAP, damaged
-  // stretch, or broken segment carry (so tracked timer state is complete),
-  // end the replay one nanosecond before the earliest armed timer deadline
-  // strictly after any recorded TIMER or MESSAGE dispatch (or any deadline
-  // when none ran), avoiding fabricated firings in those cases.
+  // run_start == replayed_end. When the run's kept records have no GAP,
+  // damaged stretch, or broken segment carry, end the replay one nanosecond
+  // before the earliest armed timer deadline strictly after any recorded TIMER
+  // or MESSAGE dispatch (or any deadline when none ran), avoiding fabricated
+  // firings in those cases. When segment 0 was rotated out, only timers with a
+  // deadline observed in the kept window (or any armed timer when no firing
+  // was kept) participate, so a timer disarmed in segment 0 cannot clamp early.
   if (replayed_run && replayed_end && replayed_logs.size() == 1 &&
       !replayed_run_timers_uncertain) {
     std::optional<MonotonicTime> earliest_unfired;
     for (const TimerState& timer : replayed_run_timers) {
       if (!timer.armed) continue;
+      if (!replayed_run_from_head && !timer.deadline_ns.has_value() &&
+          replayed_run_fired) {
+        continue;
+      }
       const MonotonicTime deadline =
           timer.deadline_ns.has_value()
               ? MonotonicTime::from_nanos(*timer.deadline_ns)

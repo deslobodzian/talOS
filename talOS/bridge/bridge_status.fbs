@@ -124,7 +124,7 @@ struct CanBusStatus {
 // matching the bridge's exit summary):
 // - socket_send_failures_count: failed UDP sends on the gateway socket.
 // - socket_reopens_count: times the bridge closed and reopened its UDP socket
-//   after a permanent send error.
+//   after a permanent send or receive error.
 // - state_sequence_gaps_count: missed UDP frame sequence numbers detected on
 //   incoming gateway datagrams.
 // - state_decode_failures_count: incoming UDP frames that failed frame

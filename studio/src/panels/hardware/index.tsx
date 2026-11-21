@@ -110,7 +110,7 @@ const COUNTERS: CounterSpec[] = [
     name: 'socket_reopens_count',
     label: 'Socket reopens',
     note: 'Times the bridge closed and reopened its UDP socket after a ' +
-        'permanent send error.'
+        'permanent send or receive error.'
   },
   {
     name: 'state_sequence_gaps_count',

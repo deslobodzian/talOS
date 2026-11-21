@@ -501,8 +501,9 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   first file read, or the one that does not continue the segment before it, and
   the sign). With `InputReplayOptions::allow_capped`, a byte-capped log whose
   first segment was rotated out instead starts the timed node at the kept
-  window's earliest recorded timer firing (less its offset) or dispatch, with
-  late-`EXIT` clamping disabled since pre-window timer state is unknown. So is
+  window's earliest recorded timer firing (less its offset) or dispatch, still
+  clamping late `EXIT` against timers observed in the kept window (or offset-0
+  timers when no firing was kept). So is
   such a log with no firing that gives the run start when it
   holds no record of its run (no dispatch nor `EXIT`: nothing gives its start
   or its end), or a GAP record or damaged stretch, which may hold its firings.

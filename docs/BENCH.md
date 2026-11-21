@@ -381,7 +381,7 @@ workstation is one. They change the motor config locally, and a person
 step below: launch it from the Mini's checkout as
 [bench network](#bench-network) gives (never edit an installed bundle), with
 the robot disabled, since an enabled RoboRIO refuses a changed
-configuration (TODO.md RESET-4). Such a session's revision is dirty: it is
+configuration (Studio shows `alert_error_config_refused_enabled`). Such a session's revision is dirty: it is
 evidence for these checks, not for the
 [supervised enabled session](#one-supervised-enabled-session).
 
