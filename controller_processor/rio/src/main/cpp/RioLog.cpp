@@ -145,43 +145,67 @@ bool RioLog::Pop(LogEvent& event) {
 
 void RioLog::RecordTick(uint64_t interval_us, uint64_t duration_us,
                         uint64_t period_us) {
-  period_us_.store(period_us, std::memory_order_relaxed);
-  if (duration_us > period_us)
-    overruns_.fetch_add(1, std::memory_order_relaxed);
-  if (interval_us > period_us + period_us / 2)
-    late_ticks_.fetch_add(1, std::memory_order_relaxed);
-  // The logger thread resets both maxima each summary window.
-  const auto raise = [](std::atomic<uint64_t>& max, uint64_t value) {
-    uint64_t current = max.load(std::memory_order_relaxed);
-    while (value > current && !max.compare_exchange_weak(
-                                  current, value, std::memory_order_relaxed)) {
-    }
-  };
-  raise(max_tick_us_, duration_us);
-  raise(max_interval_us_, interval_us);
-
-  // Snapshot the single worst-work tick's phases for the current 1 s summary
-  // window via a lock-free atomic seqlock, before tick_phase_ns_ is zeroed.
+  // Update the current 1 s timing window and publish counters, maxima, and
+  // the single worst-work tick's phases atomically into timing_[epoch & 1]
+  // via a lock-free atomic seqlock, before tick_phase_ns_ is zeroed.
   const uint64_t epoch = timing_epoch_.load(std::memory_order_acquire);
   const bool new_epoch = epoch != local_timing_epoch_;
   if (new_epoch) {
     local_timing_epoch_ = epoch;
-    local_worst_work_us_ = 0;
+    local_window_overruns_ = 0;
+    local_window_late_ticks_ = 0;
+    local_max_tick_us_ = 0;
+    local_max_interval_us_ = 0;
+    local_period_us_ = 0;
+    local_worst_phase_ns_ = {};
   }
-  if (new_epoch || duration_us > local_worst_work_us_) {
-    local_worst_work_us_ = duration_us;
-    const uint64_t seq = worst_seq_.load(std::memory_order_relaxed);
+  const bool is_overrun = duration_us > period_us;
+  const bool is_late = interval_us > period_us + period_us / 2;
+  if (is_overrun) {
+    ++local_window_overruns_;
+    ++local_total_overruns_;
+    overruns_.store(local_total_overruns_, std::memory_order_relaxed);
+  }
+  if (is_late) {
+    ++local_window_late_ticks_;
+    ++local_total_late_ticks_;
+    late_ticks_.store(local_total_late_ticks_, std::memory_order_relaxed);
+  }
+  const bool new_worst = new_epoch || duration_us > local_max_tick_us_;
+  if (new_worst) {
+    local_max_tick_us_ = duration_us;
+    local_worst_phase_ns_ = tick_phase_ns_;
+  }
+  const bool new_max_interval =
+      new_epoch || interval_us > local_max_interval_us_;
+  if (new_max_interval) {
+    local_max_interval_us_ = interval_us;
+  }
+  const bool new_period = new_epoch || period_us != local_period_us_;
+  if (new_period) {
+    local_period_us_ = period_us;
+  }
+  if (new_epoch || is_overrun || is_late || new_worst || new_max_interval ||
+      new_period) {
+    TimingSlot& slot = timing_[epoch & 1u];
+    const uint64_t seq = slot.seq.load(std::memory_order_relaxed);
     // Lock-free seqlock without standalone fences (-Werror=tsan rejects
     // atomic_thread_fence): odd acq_rel + release payload stores pair with
-    // acquire payload loads in ReadWorstTick() so any torn read from a newer
+    // acquire payload loads in ReadTimingSlot() so any torn read from a newer
     // write synchronizes-with the odd sequence write before seq2 is read.
-    worst_seq_.exchange(seq + 1, std::memory_order_acq_rel);
-    worst_published_epoch_.store(epoch, std::memory_order_release);
-    worst_published_us_.store(duration_us, std::memory_order_release);
+    slot.seq.exchange(seq + 1, std::memory_order_acq_rel);
+    slot.epoch.store(epoch, std::memory_order_release);
+    slot.overruns.store(local_window_overruns_, std::memory_order_release);
+    slot.late_ticks.store(local_window_late_ticks_, std::memory_order_release);
+    slot.max_tick_us.store(local_max_tick_us_, std::memory_order_release);
+    slot.max_interval_us.store(local_max_interval_us_,
+                               std::memory_order_release);
+    slot.period_us.store(local_period_us_, std::memory_order_release);
     for (std::size_t i = 0; i < kPhaseCount; ++i) {
-      worst_phase_ns_[i].store(tick_phase_ns_[i], std::memory_order_release);
+      slot.worst_phase_ns[i].store(local_worst_phase_ns_[i],
+                                   std::memory_order_release);
     }
-    worst_seq_.store(seq + 2, std::memory_order_release);
+    slot.seq.store(seq + 2, std::memory_order_release);
   }
 
   // Hand the logger the window it asked for, without this tick, which opens
@@ -306,20 +330,43 @@ void RioLog::SetTickDevices(std::size_t motors, std::size_t sensors) {
   tick_sensors_ = static_cast<uint32_t>(sensors);
 }
 
-RioLog::WorstSnapshot RioLog::ReadWorstTick() const {
+uint64_t RioLog::max_tick_us() const {
+  const uint64_t epoch = timing_epoch_.load(std::memory_order_relaxed);
+  const TimingSlot& slot = timing_[epoch & 1u];
+  return slot.epoch.load(std::memory_order_relaxed) == epoch
+             ? slot.max_tick_us.load(std::memory_order_relaxed)
+             : 0;
+}
+
+uint64_t RioLog::max_interval_us() const {
+  const uint64_t epoch = timing_epoch_.load(std::memory_order_relaxed);
+  const TimingSlot& slot = timing_[epoch & 1u];
+  return slot.epoch.load(std::memory_order_relaxed) == epoch
+             ? slot.max_interval_us.load(std::memory_order_relaxed)
+             : 0;
+}
+
+RioLog::TimingSnapshot RioLog::ReadTimingSlot(uint64_t expected_epoch) const {
+  const TimingSlot& slot = timing_[expected_epoch & 1u];
   for (int attempt = 0; attempt < 64; ++attempt) {
-    const uint64_t seq1 = worst_seq_.load(std::memory_order_acquire);
+    const uint64_t seq1 = slot.seq.load(std::memory_order_acquire);
     if ((seq1 & 1u) != 0) {
       std::this_thread::yield();
       continue;
     }
-    WorstSnapshot snapshot{};
-    snapshot.epoch = worst_published_epoch_.load(std::memory_order_acquire);
-    snapshot.work_us = worst_published_us_.load(std::memory_order_acquire);
+    TimingSnapshot snapshot{};
+    snapshot.epoch = slot.epoch.load(std::memory_order_acquire);
+    snapshot.overruns = slot.overruns.load(std::memory_order_acquire);
+    snapshot.late_ticks = slot.late_ticks.load(std::memory_order_acquire);
+    snapshot.max_tick_us = slot.max_tick_us.load(std::memory_order_acquire);
+    snapshot.max_interval_us =
+        slot.max_interval_us.load(std::memory_order_acquire);
+    snapshot.period_us = slot.period_us.load(std::memory_order_acquire);
     for (std::size_t i = 0; i < kPhaseCount; ++i) {
-      snapshot.phase_ns[i] = worst_phase_ns_[i].load(std::memory_order_acquire);
+      snapshot.worst_phase_ns[i] =
+          slot.worst_phase_ns[i].load(std::memory_order_acquire);
     }
-    const uint64_t seq2 = worst_seq_.load(std::memory_order_acquire);
+    const uint64_t seq2 = slot.seq.load(std::memory_order_acquire);
     if (seq1 == seq2) {
       snapshot.valid = true;
       return snapshot;
@@ -510,30 +557,88 @@ void RioLog::WriteDue(uint64_t now_us, bool force) {
         " events dropped (total " + std::to_string(dropped) + ")\n");
     reported_dropped_ = dropped;
   }
-  // The maxima and worst-tick phase split cover this window only.
-  const uint64_t current_epoch = timing_epoch_.load(std::memory_order_relaxed);
-  const WorstSnapshot worst = ReadWorstTick();
-  const bool has_worst = worst.valid && worst.epoch == current_epoch;
-  timing_epoch_.store(current_epoch + 1, std::memory_order_release);
-  const uint64_t max_tick = max_tick_us_.exchange(0, std::memory_order_relaxed);
-  const uint64_t max_interval =
-      max_interval_us_.exchange(0, std::memory_order_relaxed);
-  const uint64_t overruns = overruns_.load(std::memory_order_relaxed);
-  const uint64_t late = late_ticks_.load(std::memory_order_relaxed);
-  if (overruns != reported_overruns_ || late != reported_late_ticks_) {
-    uint64_t reported_max_tick = max_tick;
-    std::array<uint64_t, kPhaseCount> worst_ns{};
-    if (has_worst) {
-      reported_max_tick = std::max(reported_max_tick, worst.work_us);
-      worst_ns = worst.phase_ns;
-    } else {
-      const WorstSnapshot retry = ReadWorstTick();
-      if (retry.valid &&
-          (retry.epoch == current_epoch || retry.epoch == current_epoch + 1)) {
-        reported_max_tick = std::max(reported_max_tick, retry.work_us);
-        worst_ns = retry.phase_ns;
-      }
+  // The maxima, counts and worst-tick phase split cover this window only.
+  // Read the current slot first: if the loop thread has already published into
+  // `timing_current_epoch_`, its single-writer happens-before guarantees the
+  // previous slot (`timing_current_epoch_ - 1`) is quiescent and can be drained
+  // of any stragglers before `timing_epoch_` advances and recycles that slot.
+  const uint64_t current_epoch = timing_current_epoch_;
+  const TimingSnapshot curr_check = ReadTimingSlot(current_epoch);
+  const bool curr_active =
+      curr_check.valid && curr_check.epoch == current_epoch;
+
+  TimingSnapshot prev{};
+  bool prev_present = false;
+  if (current_epoch > 1) {
+    prev = ReadTimingSlot(current_epoch - 1);
+    if (!prev.valid) {
+      // Loop thread is mid-seqlock in the previous slot (only possible when
+      // !curr_active): retry on the next drain without advancing the epoch.
+      if (!force) next_summary_us_ = now_us;
+      return;
     }
+    prev_present = prev.epoch == current_epoch - 1;
+  }
+
+  const uint64_t straggler_overruns =
+      prev_present && prev.overruns > prev_reported_overruns_
+          ? prev.overruns - prev_reported_overruns_
+          : 0;
+  const uint64_t straggler_late =
+      prev_present && prev.late_ticks > prev_reported_late_ticks_
+          ? prev.late_ticks - prev_reported_late_ticks_
+          : 0;
+
+  TimingSnapshot curr{};
+  bool curr_present = false;
+  if (curr_active) {
+    // Previous slot is now drained and quiescent; advance timing_epoch_ so
+    // subsequent ticks write to the other slot while we take the final read of
+    // `current_epoch`.
+    timing_epoch_.store(current_epoch + 1, std::memory_order_release);
+    curr = ReadTimingSlot(current_epoch);
+    if (!curr.valid || curr.epoch != current_epoch) {
+      // A straggler was mid-seqlock for all 64 yields; report `curr_check` now
+      // and catch the straggler's delta from `prev` on the next window.
+      curr = curr_check;
+    }
+    curr_present = true;
+    prev_reported_overruns_ = curr.overruns;
+    prev_reported_late_ticks_ = curr.late_ticks;
+    timing_current_epoch_ = current_epoch + 1;
+  } else {
+    // No tick has finished writing to `current_epoch` yet; keep the epoch open
+    // so `current_epoch - 1` stays reserved for any in-flight straggler.
+    if (prev_present) {
+      prev_reported_overruns_ += straggler_overruns;
+      prev_reported_late_ticks_ += straggler_late;
+    }
+    if (!curr_check.valid && !force) {
+      next_summary_us_ = now_us;
+    }
+  }
+
+  const uint64_t curr_overruns = curr_present ? curr.overruns : 0;
+  const uint64_t curr_late = curr_present ? curr.late_ticks : 0;
+  const uint64_t delta_overruns = straggler_overruns + curr_overruns;
+  const uint64_t delta_late = straggler_late + curr_late;
+  if (delta_overruns > 0 || delta_late > 0) {
+    reported_overruns_ += delta_overruns;
+    reported_late_ticks_ += delta_late;
+    const bool use_prev = straggler_overruns > 0 || straggler_late > 0;
+    const bool use_curr = curr_overruns > 0 || curr_late > 0;
+    // Pick the worst work (and its own phase split) from the window(s) that
+    // actually contributed a fault, never pairing a fault with a clean window.
+    const bool pick_prev_work =
+        use_prev && (!use_curr || prev.max_tick_us > curr.max_tick_us);
+    const uint64_t reported_max_tick =
+        pick_prev_work ? prev.max_tick_us : curr.max_tick_us;
+    const std::array<uint64_t, kPhaseCount> worst_ns =
+        pick_prev_work ? prev.worst_phase_ns : curr.worst_phase_ns;
+    const uint64_t reported_max_interval =
+        std::max(use_prev ? prev.max_interval_us : uint64_t{0},
+                 use_curr ? curr.max_interval_us : uint64_t{0});
+    const uint64_t reported_period = use_curr ? curr.period_us : prev.period_us;
     const auto at = [](TickPhase phase) {
       return static_cast<std::size_t>(phase);
     };
@@ -551,19 +656,16 @@ void RioLog::WriteDue(uint64_t now_us, bool force) {
         static_cast<double>(worst_ns[at(TickPhase::kLink)]) / 1e3,
         static_cast<double>(worst_ns[at(TickPhase::kDriverStation)]) / 1e3,
         static_cast<double>(worst_ns[at(TickPhase::kLoop)]) / 1e3);
-    sink_(
-        "[rio] loop timing: " + std::to_string(overruns - reported_overruns_) +
-        " overruns (work longer than the period), " +
-        std::to_string(late - reported_late_ticks_) +
-        " late ticks (started over 1.5 periods after the previous) since "
-        "the last report; totals " +
-        std::to_string(overruns) + " and " + std::to_string(late) +
-        "; max work " + std::to_string(reported_max_tick) +
-        " us, max interval " + std::to_string(max_interval) + " us, period " +
-        std::to_string(period_us_.load(std::memory_order_relaxed)) + " us" +
-        phases);
-    reported_overruns_ = overruns;
-    reported_late_ticks_ = late;
+    sink_("[rio] loop timing: " + std::to_string(delta_overruns) +
+          " overruns (work longer than the period), " +
+          std::to_string(delta_late) +
+          " late ticks (started over 1.5 periods after the previous) since "
+          "the last report; totals " +
+          std::to_string(reported_overruns_) + " and " +
+          std::to_string(reported_late_ticks_) + "; max work " +
+          std::to_string(reported_max_tick) + " us, max interval " +
+          std::to_string(reported_max_interval) + " us, period " +
+          std::to_string(reported_period) + " us" + phases);
   }
 }
 

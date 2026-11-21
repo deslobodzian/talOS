@@ -6,10 +6,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -474,8 +477,18 @@ TEST(RioLog, FlushAndStopEmitFinalPartialPhaseAndLatencyWindow) {
     log.Start();
     log.SetTickDevices(2, 1);
     for (int i = 0; i < 4; ++i) {
-      log.AddPhase(TickPhase::kRefresh, 250'000);
-      log.AddPhase(TickPhase::kControl, 150'000);
+      if (i == 2) {
+        // Distinct phases for the overrun tick so the test proves the summary
+        // reports the overrun's own phase split, not another tick's.
+        log.AddPhase(TickPhase::kRefresh, 400'000);
+        log.AddPhase(TickPhase::kDevices, 300'000);
+        log.AddPhase(TickPhase::kControl, 500'000);
+        log.AddPhase(TickPhase::kLink, 4'800'000);
+      } else {
+        log.AddPhase(TickPhase::kRefresh, 200'000);
+        log.AddPhase(TickPhase::kControl, 100'000);
+        log.AddPhase(TickPhase::kLink, 700'000);
+      }
       log.RecordCommandAge(2'000, true);
       log.RecordDriverStationAge(3'000);
       log.RecordTick(5'000, i == 2 ? 6'000 : 1'000, 5'000);
@@ -498,8 +511,11 @@ TEST(RioLog, FlushAndStopEmitFinalPartialPhaseAndLatencyWindow) {
         has_latency = true;
       }
       if (line.find("[rio] loop timing:") != std::string::npos &&
-          line.find("; worst tick phases: refresh 250.0 us, devices 0.0 us, "
-                    "control 150.0 us,") != std::string::npos) {
+          line.find("max work 6000 us") != std::string::npos &&
+          line.find("; worst tick phases: refresh 400.0 us, devices 300.0 us, "
+                    "control 500.0 us, health 0.0 us, other 0.0 us, link "
+                    "4800.0 us, driver station 0.0 us, loop 0.0 us\n") !=
+              std::string::npos) {
         has_worst = true;
       }
     }
@@ -507,6 +523,67 @@ TEST(RioLog, FlushAndStopEmitFinalPartialPhaseAndLatencyWindow) {
     EXPECT_TRUE(has_latency) << "Stop() did not emit final partial latency";
     EXPECT_TRUE(has_worst) << "Stop() did not emit loop timing worst phases";
   }
+}
+
+// Concurrent RecordTick() and Drain() never pair an overrun's max work with an
+// earlier normal tick's phases or all zeros, and never lose overruns across
+// 1 s window boundaries.
+// REQ-OPS-29
+TEST(RioLog, LoopTimingConcurrentOverrunAlwaysMatchesItsOwnPhases) {
+  using talos::rio::TickPhase;
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(0);
+
+  constexpr int kTotalTicks = 20'000;
+  constexpr int kOverrunStride = 20;
+  constexpr uint64_t kExpectedOverruns = kTotalTicks / kOverrunStride;
+  std::atomic<bool> writer_done{false};
+  std::thread writer{[&] {
+    for (int i = 0; i < kTotalTicks; ++i) {
+      if (i % kOverrunStride == kOverrunStride / 2) {
+        log.AddPhase(TickPhase::kRefresh, 1'000'000);
+        log.AddPhase(TickPhase::kDevices, 2'000'000);
+        log.AddPhase(TickPhase::kLink, 9'000'000);
+        log.RecordTick(5'000, 12'000, 5'000);
+      } else {
+        log.AddPhase(TickPhase::kRefresh, 400'000);
+        log.AddPhase(TickPhase::kLink, 100'000);
+        log.RecordTick(5'000, 500, 5'000);
+      }
+    }
+    writer_done.store(true, std::memory_order_release);
+  }};
+
+  uint64_t now_us = RioLog::kWindowUs;
+  while (!writer_done.load(std::memory_order_acquire)) {
+    log.Drain(now_us);
+    now_us += RioLog::kWindowUs;
+  }
+  writer.join();
+  log.Flush(now_us);
+
+  uint64_t sum_overruns = 0;
+  uint64_t timing_lines = 0;
+  for (const auto& line : lines) {
+    if (line.find("[rio] loop timing: ") == std::string::npos) continue;
+    ++timing_lines;
+    unsigned long long delta = 0;
+    ASSERT_EQ(
+        std::sscanf(line.c_str(), "[rio] loop timing: %llu overruns", &delta),
+        1)
+        << line;
+    sum_overruns += delta;
+    EXPECT_NE(line.find("max work 12000 us"), std::string::npos) << line;
+    EXPECT_NE(line.find("; worst tick phases: refresh 1000.0 us, devices "
+                        "2000.0 us, control 0.0 us, health 0.0 us, other "
+                        "0.0 us, link 9000.0 us, driver station 0.0 us, "
+                        "loop 0.0 us\n"),
+              std::string::npos)
+        << line;
+  }
+  EXPECT_GT(timing_lines, 0u);
+  EXPECT_EQ(sum_overruns, kExpectedOverruns);
 }
 
 }  // namespace
