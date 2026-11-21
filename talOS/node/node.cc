@@ -740,7 +740,7 @@ void CheckLayout(const std::string& node, std::string_view topic,
 // publisher there would skip all of that, so none is opened, however the
 // topic was spelled or remapped, whatever --allow-graph-errors says.
 void RefuseHardwareRequest(const std::string& node, std::string_view topic) {
-  if (introspect::naming::IsHardwareRequest(topic)) {
+  if (introspect::naming::IsHardwareRequest(topic) || topic.starts_with("/~")) {
     throw std::invalid_argument(
         node + ": cannot publish '" + std::string{topic} +
         "': hardware requests are sent only by the devices layer's flush "

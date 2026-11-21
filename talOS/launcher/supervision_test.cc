@@ -5067,6 +5067,12 @@ TEST(Supervision, ShutdownStopsHardwareNodeBeforeActuatorOwners) {
         events_while_hw_alive = ReadLines(events);
       }
       std::ofstream{release_hw}.close();
+      // Keep the stepped clock frozen while hardware_node sees release_hw,
+      // writes hw_exit, and exits, and alpha/beta receive kStopSignal; without
+      // this wait, ReleaseOnExit unfreezes clock to wall time (which on a slow
+      // host can already be >= start + kBridgeStopTimeout) and SIGKILLs
+      // hardware_node before it finishes writing hw_exit.
+      WaitFor(stop, [&] { return ReadLines(events).size() >= 4; });
     }};
 
     EXPECT_EQ(RunSession(options), 0);

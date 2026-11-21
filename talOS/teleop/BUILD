@@ -42,9 +42,11 @@ cc_library(
     testonly = True,
     srcs = ["testing.cc"],
     hdrs = ["testing.h"],
-    implementation_deps = [":teleop"],
+    implementation_deps = [
+        ":teleop",
+        "//talOS/node:testing",
+    ],
     visibility = ["//visibility:public"],
-    deps = ["//talOS/node:testing"],
 )
 
 talos_cc_node(

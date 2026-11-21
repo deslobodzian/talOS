@@ -45,12 +45,16 @@ cc_test(
 )
 
 # The simulator's fault schedule: parsed from --fault-schedule, resolved
-# against a config's devices and applied to the physics backend. Public for
-# a robot's tests of its own checks against the simulated robot.
+# against a config's devices and applied to the physics backend. Restricted
+# because schedules.h includes hardware/sim_physics.h and depends on
+# //talOS/hardware (RULES.md 2 / ARCH-2).
 cc_library(
     name = "schedules",
     hdrs = ["schedules.h"],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = ["//talOS/hardware"],
 )
 
