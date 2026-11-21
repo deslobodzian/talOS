@@ -97,6 +97,16 @@ struct CanBusStatus {
 //   boot's acknowledgement.
 // - alert_error_uncommissioned: commissioned is false. Never in simulation.
 // - alert_error_motor_fault: motor_fault_mask is nonzero.
+// - alert_error_hardware_fault: the link is fresh (StateFresh), configured is
+//   true, and the latest accepted State carries kHardwareFault (total feedback
+//   loss or latched gateway apply-failure fault). Clears as soon as the fault
+//   clears, the link goes stale, or configured becomes false.
+// - alert_error_config_refused_enabled: the link is fresh (StateFresh),
+//   configured is false, and the gateway's last config refusal was
+//   kBackendFailed with reason "disable to accept the new configuration" (a
+//   changed configuration pushed while the robot is enabled). Clears on a kOk
+//   acknowledgement, a new gateway boot, a different refusal reason, or a
+//   stale/lost link.
 // - alert_warning_owner_timed_out: timed_out_mask is nonzero, so it raises
 //   neither at a controller transition, which times every owner out in the
 //   merge until its next request, nor at the session's start, nor for an
@@ -109,6 +119,18 @@ struct CanBusStatus {
 // motor_fault, brownout and can_bus_unread describe the last accepted
 // States, as the fields they read do: while link_lost holds they are those
 // States'.
+//
+// UDP socket and State loss counters (cumulative since the bridge started,
+// matching the bridge's exit summary):
+// - socket_send_failures_count: failed UDP sends on the gateway socket.
+// - socket_reopens_count: times the bridge closed and reopened its UDP socket
+//   after a permanent send error.
+// - state_sequence_gaps_count: missed UDP frame sequence numbers detected on
+//   incoming gateway datagrams.
+// - state_decode_failures_count: incoming UDP frames that failed frame
+//   decoding.
+// - socket_send_would_block_count: outbound UDP sends dropped with
+//   EAGAIN/EWOULDBLOCK.
 //
 // can_buses holds one slot per CAN bus the configuration names, slot 0 the
 // RoboRIO's own bus ("rio"), then the others in byte order
@@ -155,6 +177,9 @@ struct BridgeStatus {
   clock_window_count:uint32;
   clock_offset_valid:bool;
   health_valid:bool;
+  // These two fill the padding after health_valid before battery_v.
+  alert_error_hardware_fault:bool;
+  alert_error_config_refused_enabled:bool;
   battery_v:double;
   brownout:bool;
   // These two fill the padding after brownout.
@@ -191,5 +216,10 @@ struct BridgeStatus {
   // relative oscillator drift. Local logs only (excluded from robot radio).
   clock_offset_uncertainty_us:uint64;
   clock_min_round_trip_us:uint64;
+  socket_send_failures_count:uint64;
+  socket_reopens_count:uint64;
+  state_sequence_gaps_count:uint64;
+  state_decode_failures_count:uint64;
+  socket_send_would_block_count:uint64;
   can_buses:[CanBusStatus:4];
 }

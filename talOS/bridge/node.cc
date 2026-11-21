@@ -25,6 +25,9 @@
 namespace talos::hardware {
 namespace {
 
+constexpr std::string_view kConfigRefusedEnabledReason =
+    "disable to accept the new configuration";
+
 const char* ConfigAckStatusName(ConfigAckStatus status) {
   switch (status) {
     case ConfigAckStatus::kOk:
@@ -62,7 +65,7 @@ static_assert(std::string_view{kNodeName} ==
 // 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out
 // at alignof(Message), so the two agree only while this holds.
 static_assert(alignof(bridge::BridgeStatus) == 8);
-static_assert(sizeof(bridge::BridgeStatus) == 264,
+static_assert(sizeof(bridge::BridgeStatus) == 304,
               "BridgeStatus size changed; update docs/DATA_FLOW.md");
 // Each actuator-owning subsystem owns at least one such device.
 static_assert(kMaxMotors + kMaxDigitalOutputs + kMaxPwmOutputs <= 32,
@@ -688,6 +691,8 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
           is_configured_ = true;
           config_push_backoff_us_ = 50000;
           config_refusal_logged_ = false;
+          last_config_refusal_status_ = ConfigAckStatus::kOk;
+          last_config_refusal_reason_len_ = 0;
         } else {
           is_configured_ = false;
           config_push_backoff_us_ =
@@ -760,15 +765,23 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     }
     // If the previous State had gone stale before this one arrived, drop
     // link_ready_ first so the UpdateLinkReady() below treats this as a link
-    // recovery and restarts each owner's silence window.
-    if (link_ready_ && !StateFresh(now_us)) {
-      UpdateLinkReady(now_us);
+    // recovery and restarts each owner's silence window; also clear any prior
+    // config refusal from before the outage until the fresh push is answered.
+    if (state_accepted_ && !StateFresh(now_us)) {
+      if (link_ready_) UpdateLinkReady(now_us);
+      config_refusal_logged_ = false;
+      last_config_refusal_status_ = ConfigAckStatus::kOk;
+      last_config_refusal_reason_len_ = 0;
     }
     last_state_receipt_us_ = now_us;
     state_accepted_ = true;
     if (state.boot_id != last_boot_id_) {
       config_push_backoff_us_ = 50000;
       config_refusal_logged_ = false;
+      if (last_boot_id_ != 0) {
+        last_config_refusal_status_ = ConfigAckStatus::kOk;
+        last_config_refusal_reason_len_ = 0;
+      }
       // The new boot's Driver Station clock restarted with it.
       last_ds_sample_time_us_.reset();
       ReportGatewayBuild(state);
@@ -894,7 +907,17 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       states_received_ > 0 && now_us > last_state_receipt_us_
           ? now_us - last_state_receipt_us_
           : 0;
+  const bool state_fresh = StateFresh(now_us);
+  const bool hardware_fault = state_fresh && is_configured_ &&
+                              (last_state_flags_ & kHardwareFault) != 0;
+  const bool config_refused_enabled =
+      state_fresh && !is_configured_ &&
+      last_config_refusal_status_ == ConfigAckStatus::kBackendFailed &&
+      std::string_view{last_config_refusal_reason_.data(),
+                       last_config_refusal_reason_len_} ==
+          kConfigRefusedEnabledReason;
   const HealthSample& health = latest_state_.health;
+  const protocol::UdpStats& udp = peer_.stats();
   bridge::BridgeStatus status{
       states_received_,
       commands_sent_,
@@ -921,6 +944,8 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       static_cast<uint32_t>(clock_.window_count()),
       clock_.converged() && clock_.accuracy_valid(),
       health.valid,
+      /*alert_error_hardware_fault=*/hardware_fault,
+      /*alert_error_config_refused_enabled=*/config_refused_enabled,
       health.battery_v,
       health.brownout,
       /*alert_warning_can_bus_unread=*/false,  // can_buses_.Fill
@@ -938,6 +963,11 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       latest_state_.build.revision,
       clock_.uncertainty_us(),
       clock_.round_trip_us(),
+      socket_counters_.send_failures,
+      socket_counters_.reopens,
+      udp.sequence_gaps,
+      udp.decode_failures,
+      udp.send_would_block,
   };
   can_buses_.Fill(status);
   return status;

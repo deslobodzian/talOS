@@ -235,3 +235,38 @@ test('the hardware panel and chart label CAN buses from the declared graph', () 
   assert.ok(html.includes('>Shooter<'), html);
   assert.ok(!html.includes('CAN bus 1'), html);
 });
+
+// REQ-OPS-20 (RT-17, RT-28): the five UDP socket and incoming State loss
+// counters on /hw/status appear in the Hardware panel's Counters table when
+// declared by the bridge.
+test('the hardware panel displays UDP socket and State loss counters', () => {
+  const studio = createStaticStudio({
+    frames: [{
+      stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+      chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+      channels: {
+        'hw/status/socket_send_failures_count': 3,
+        'hw/status/socket_reopens_count': 1,
+        'hw/status/state_sequence_gaps_count': 7,
+        'hw/status/state_decode_failures_count': 2,
+        'hw/status/socket_send_would_block_count': 4,
+      },
+      units: {}, labels: {}
+    }],
+    playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+  });
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  for (const label of [
+    'Socket send failures',
+    'Socket reopens',
+    'State sequence gaps',
+    'State decode failures',
+    'Socket send would-block',
+  ]) {
+    assert.ok(html.includes(label), `missing counter ${label}`);
+  }
+});

@@ -611,6 +611,25 @@ def controller_link(states, state_source, status_records, status_source):
     return False, False, None, "no /hw/state or /hw/status record"
 
 
+# BridgeStatus UDP socket and incoming State loss counters (REQ-OPS-20,
+# TODO.md RT-17, RT-28), surfaced directly in the report alongside /hw/status.
+BRIDGE_SOCKET_COUNTERS = (
+    "socket_send_failures_count",
+    "socket_reopens_count",
+    "state_sequence_gaps_count",
+    "state_decode_failures_count",
+    "socket_send_would_block_count",
+)
+
+
+def bridge_socket_counters(status_summary):
+    """Per-counter summary for the BridgeStatus UDP socket / State loss
+    counters present in status_summary, or None when none were recorded."""
+    found = {key: status_summary[key]
+             for key in BRIDGE_SOCKET_COUNTERS if key in status_summary}
+    return found or None
+
+
 def state_sequence_gaps(states, spans):
     """Count missed /hw/state sequences within each gateway boot from decoded
     State records (hardware.boot_id and hardware.sequence, TODO.md RT-28).
@@ -919,6 +938,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             # recorded under another protocol and not decoded.
             "hardware_not_decoded": hardware_not_decoded,
             "status_stream": status_source, "status": status_summary,
+            "bridge_socket_counters": bridge_socket_counters(status_summary),
             # alert_summary(); informational, as the operator-visibility
             # design has it: --strict does not judge alerts.
             "alerts": alert_summary(records, spans), "verdicts": verdicts,
@@ -1095,6 +1115,15 @@ def markdown(report):
                      "not measured.")
     lines += latency_lines(report)
     lines += ["", "## /hw/status", f"Stream: {report['status_stream'] or 'NOT MEASURED'}"]
+    if report["bridge_socket_counters"] is not None:
+        lines.append(
+            "Bridge UDP/State loss counters: "
+            + ", ".join(
+                f"{field}=delta:{values['delta']}/last:{values['last']}"
+                + (f" (resets={values['resets']})" if values["resets"] else "")
+                for field, values in report["bridge_socket_counters"].items()
+            )
+        )
     for field, values in report["status"].items():
         lines.append(f"- {field}: " + ", ".join(f"{k}={v}" for k, v in values.items()))
     lines += ["", "## Alerts",

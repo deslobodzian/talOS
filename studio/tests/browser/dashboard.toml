@@ -11,16 +11,16 @@
 # row.
 #
 # The feed's worst case: 32 named channels (the match widget's 12 included)
-# plus the seven /hw/status alerts the alerts widget carries, 39 channels at
-# 20 Hz, is 23,872 B/s of the 24,000 budget, which covers 39 channels: one
-# more channel or alert needs a larger budget.
+# plus the nine /hw/status alerts the alerts widget carries, 41 channels at
+# 20 Hz, is 24,352 B/s of the 25,000 budget, which covers 41 channels (and up
+# to 43 before needing a larger budget).
 
 [dashboard]
 title = "Drive"
 columns = 12
 rows = 8
 update_hz = 20
-budget_bytes_per_s = 24000
+budget_bytes_per_s = 25000
 drive_clients = 2
 
 [[widgets]]

@@ -114,3 +114,22 @@ test('without a match number, auto then teleop is one match and the next enable 
   assert.equal(tracker.latch().matchStart_ns, '500000000');
   assert.deepEqual(latched(tracker), []);
 });
+
+// REQ-OPS-20 (OBS-6, RESET-4): hardware_fault and config_refused_enabled carry
+// actionable human-readable labels in Studio and on /drive.
+test('hardware fault and enabled config refusal alerts render actionable text', () => {
+  const HW_FAULT = 'hw/status/alert_error_hardware_fault';
+  const REFUSED_ENABLED = 'hw/status/alert_error_config_refused_enabled';
+  const active = activeAlerts({
+    timestamp_ns: '1000000',
+    channels: {[HW_FAULT]: 1, [REFUSED_ENABLED]: 1},
+    alerts: {[HW_FAULT]: AlertLevel.Error, [REFUSED_ENABLED]: AlertLevel.Error},
+  });
+  const byChannel = Object.fromEntries(active.map(a => [a.channel, a]));
+  assert.equal(byChannel[HW_FAULT].owner, 'hw');
+  assert.match(byChannel[HW_FAULT].text, /hardware fault/i);
+  assert.equal(byChannel[REFUSED_ENABLED].owner, 'hw');
+  assert.ok(
+      byChannel[REFUSED_ENABLED].text.includes('disable to accept the new configuration'),
+      byChannel[REFUSED_ENABLED].text);
+});

@@ -57,14 +57,19 @@ check below.
   ([automatic channels](../talOS/telemetry/README.md#automatic-channels-and-units)).
 - [ ] Alerts: Active reads `none`. Each alert names its owner and its
   condition (`hw link lost`, `hw not configured`, `hw uncommissioned`,
-  `hw motor fault`, `hw owner timed out`, `hw brownout`, `hw can bus
-  unread`; what each means:
-  [bridge_status.fbs](../talOS/bridge/bridge_status.fbs)). `owner timed out`: an actuator node is
-  not commanding (down or crash-looping; see Subsystems). `can bus unread`:
-  a CAN bus's status read is failing or stopped, so its health is unknown
-  (Studio's Hardware panel shows which bus by its slot, `rio` first; the
-  RoboRIO console names it). The Raised list
-  keeps every alert seen this match with its count: read it after the match.
+  `hw motor fault`, `hw hardware fault (total feedback loss or gateway fault)`,
+  `hw config refused while enabled: disable to accept the new configuration`,
+  `hw owner timed out`, `hw brownout`, `hw can bus unread`; what each means:
+  [bridge_status.fbs](../talOS/bridge/bridge_status.fbs)). `hardware fault`:
+  the gateway reports `kHardwareFault` (total feedback loss across configured
+  motors/sensors or three consecutive backend apply failures). `config refused
+  while enabled`: a changed hardware configuration was pushed while the robot
+  was enabled — disable the robot so the RoboRIO can accept it. `owner timed
+  out`: an actuator node is not commanding (down or crash-looping; see
+  Subsystems). `can bus unread`: a CAN bus's status read is failing or stopped,
+  so its health is unknown (Studio's Hardware panel shows which bus by its
+  slot, `rio` first; the RoboRIO console names it). The Raised list keeps every
+  alert seen this match with its count: read it after the match.
 - [ ] Field: the robot drawn at its starting position, with no `POSE NOT
   VALID` (the layout's `valid` channel false) or `NOT LOCALIZED` (its
   `localized` channel false) tag.

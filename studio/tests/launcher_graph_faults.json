@@ -48,12 +48,12 @@
         {
           "kind": "SENDER",
           "name": "/hw/status",
-          "message_bytes": 264,
+          "message_bytes": 304,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xb97101f222aa96a4",
+          "schema_hash": "0xac2efa019ff2e2b4",
           "alignment": 8,
           "slots": 1024
         },
@@ -277,24 +277,24 @@
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 264,
+          "message_bytes": 304,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xb97101f222aa96a4",
+          "schema_hash": "0xac2efa019ff2e2b4",
           "alignment": 8,
           "slots": 1024
         },
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 264,
+          "message_bytes": 304,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xb97101f222aa96a4",
+          "schema_hash": "0xac2efa019ff2e2b4",
           "alignment": 8,
           "slots": 1024
         },
@@ -466,12 +466,12 @@
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 264,
+          "message_bytes": 304,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xb97101f222aa96a4",
+          "schema_hash": "0xac2efa019ff2e2b4",
           "alignment": 8,
           "slots": 1024
         },
@@ -754,12 +754,12 @@
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 264,
+          "message_bytes": 304,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xb97101f222aa96a4",
+          "schema_hash": "0xac2efa019ff2e2b4",
           "alignment": 8,
           "slots": 1024
         },
@@ -865,12 +865,12 @@
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 264,
+          "message_bytes": 304,
           "external": false,
           "optional": false,
           "observer": true,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xb97101f222aa96a4",
+          "schema_hash": "0xac2efa019ff2e2b4",
           "alignment": 8,
           "slots": 1024
         },

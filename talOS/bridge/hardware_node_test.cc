@@ -2045,5 +2045,70 @@ TEST(HardwareNodeTest, ExitSummaryReportsUdpGapsDecodeFailuresAndWouldBlock) {
   EXPECT_NE(output.find("send_would_block=0"), std::string::npos) << output;
 }
 
+// REQ-OPS-20 (TODO.md RT-17, RT-28): /hw/status carries the bridge's UDP
+// socket and incoming State loss counters (socket_send_failures_count,
+// socket_reopens_count, state_sequence_gaps_count, state_decode_failures_count,
+// socket_send_would_block_count).
+TEST(HardwareNodeTest, BridgeStatusReportsUdpSocketAndStateLossCounters) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<bridge::BridgeStatus> status_sub{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+
+  // 1. Trigger a permanent send error (reopens the socket) and a transient
+  // send error (counts a send failure without reopening).
+  node.set_seams({.send_error = &TakeSendError});
+  pending_send_error = EPIPE;
+  node.Tick(1'000'000);  // clock probe fails -> send_failures=1, socket closed
+  ASSERT_EQ(node.socket_counters().send_failures, 1u);
+  ASSERT_EQ(node.socket_counters().reopens, 0u);
+  node.Tick(1'001'000);  // reopens socket -> reopens=1, probe succeeds
+  ASSERT_EQ(node.socket_counters().reopens, 1u);
+
+  pending_send_error = ECONNREFUSED;
+  node.Tick(1'200'000);  // next probe fails transiently -> send_failures=2
+  ASSERT_EQ(node.socket_counters().send_failures, 2u);
+  ASSERT_EQ(node.socket_counters().reopens, 1u);
+
+  // 2. Send seq 1, a corrupt frame (decode failure), then seq 6 (gap of 4).
+  auto send_raw_seq = [&](uint64_t seq) {
+    std::array<uint8_t, protocol::kFrameHeaderSize> buf{};
+    const std::size_t n = protocol::EncodeFrame(
+        protocol::FrameType::kClockProbe, protocol::kFlagNone, seq, seq * 1000,
+        nullptr, 0, buf.data(), buf.size());
+    ASSERT_EQ(::send(link.gateway.NativeFd(), buf.data(), n, 0),
+              static_cast<ssize_t>(n));
+  };
+  send_raw_seq(1);
+  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  ASSERT_EQ(::send(link.gateway.NativeFd(), garbage, sizeof(garbage), 0),
+            static_cast<ssize_t>(sizeof(garbage)));
+  send_raw_seq(6);
+
+  ASSERT_TRUE(DatagramQueued(node));
+  uint64_t now_us = 1'220'000;
+  node.Tick(now_us);
+  while (QueuedBytes(node) > 0) {
+    now_us += 20'000;
+    node.Tick(now_us);
+  }
+  // Ensure a fresh /hw/status publication after draining.
+  now_us += 20'000;
+  node.Tick(now_us);
+
+  const auto published = status_sub.read();
+  ASSERT_TRUE(published.has_value());
+  const bridge::BridgeStatus status = *published;
+  EXPECT_EQ(status.socket_send_failures_count(), 2u);
+  EXPECT_EQ(status.socket_reopens_count(), 1u);
+  EXPECT_EQ(status.state_sequence_gaps_count(), 4u);
+  EXPECT_EQ(status.state_decode_failures_count(), 1u);
+  EXPECT_EQ(status.socket_send_would_block_count(), 0u);
+  EXPECT_TRUE(status == node.Status(now_us));
+}
+
 }  // namespace
 }  // namespace talos::hardware

@@ -1587,6 +1587,12 @@ std::vector<std::string> Alerts(const bridge::BridgeStatus& status) {
     active.emplace_back("owner_timed_out");
   }
   if (status.alert_warning_brownout()) active.emplace_back("brownout");
+  if (status.alert_error_hardware_fault()) {
+    active.emplace_back("hardware_fault");
+  }
+  if (status.alert_error_config_refused_enabled()) {
+    active.emplace_back("config_refused_enabled");
+  }
   if (status.alert_warning_can_bus_unread()) {
     active.emplace_back("can_bus_unread");
   }
@@ -1922,6 +1928,106 @@ TEST(HardwareNodeTrustTest,
   ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 550000),
                               recover_us + owner_timeout_us));
   EXPECT_EQ(TimedOutMask(node, recover_us + owner_timeout_us + 1), 0b11u);
+}
+
+// REQ-OPS-20 (OBS-6, RESET-4): alert_error_hardware_fault is active only while
+// State is fresh, configured is true, and kHardwareFault is set;
+// alert_error_config_refused_enabled is active only while State is fresh,
+// configured is false, and the gateway refused configuration because the robot
+// is enabled, clearing on kOk, a new boot, another refusal reason, or a stale
+// link.
+TEST(HardwareNodeTrustTest,
+     HardwareFaultAndConfigRefusedEnabledAlertsActivateAndClear) {
+  using Names = std::vector<std::string>;
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+
+  const auto send_ack = [&](ConfigAckStatus status, std::string_view reason,
+                            uint64_t now_us) {
+    ConfigAckPayload ack{};
+    ack.config_id = config_id;
+    ack.status = status;
+    std::memcpy(ack.reason, reason.data(),
+                std::min(reason.size(), sizeof(ack.reason)));
+    std::array<uint8_t, sizeof(ConfigAckPayload)> bytes{};
+    ASSERT_EQ(EncodeConfigAck(ack, bytes), sizeof(ConfigAckPayload));
+    gateway.Receive(protocol::FrameType::kHardwareConfigAck, now_us, bytes);
+    node.Tick(now_us);
+  };
+
+  uint64_t now_us = 1'000'000;
+  // 1. Fresh State, unconfigured: a generic backend failure does NOT raise
+  // config_refused_enabled.
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id + 1, 11, 1, 1000), now_us));
+  send_ack(ConfigAckStatus::kBackendFailed, "motor 1 offline", now_us + 1000);
+  now_us += 1000;
+  EXPECT_FALSE(node.Status(now_us).alert_error_config_refused_enabled());
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{"not_configured"});
+
+  // 2. Enabled refusal raises alert_error_config_refused_enabled alongside
+  // not_configured.
+  now_us += 1000;
+  send_ack(ConfigAckStatus::kBackendFailed,
+           "disable to accept the new configuration", now_us);
+  EXPECT_TRUE(node.Status(now_us).alert_error_config_refused_enabled());
+  EXPECT_EQ(Alerts(node.Status(now_us)),
+            (Names{"not_configured", "config_refused_enabled"}));
+
+  // 3. Stale link clears alert_error_config_refused_enabled (and link return
+  // does not resurrect the pre-outage refusal).
+  const uint64_t stale_us = 1'000'000 + timeout_us;
+  EXPECT_FALSE(node.Status(stale_us).alert_error_config_refused_enabled());
+  now_us = stale_us + 5000;
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id + 1, 11, 1, 200000), now_us));
+  EXPECT_FALSE(node.Status(now_us).alert_error_config_refused_enabled());
+
+  // 4. Re-raise on same boot, then a new boot clears it.
+  now_us += 1000;
+  send_ack(ConfigAckStatus::kBackendFailed,
+           "disable to accept the new configuration", now_us);
+  ASSERT_TRUE(node.Status(now_us).alert_error_config_refused_enabled());
+  now_us += 1000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id + 1, 12, 1, 1000), now_us));
+  EXPECT_FALSE(node.Status(now_us).alert_error_config_refused_enabled());
+
+  // 5. Re-raise on boot 12, then kOk clears it; hardware_fault does not raise
+  // while unconfigured even if State carries kHardwareFault.
+  now_us += 1000;
+  State faulted = TrustState(config_id + 1, 12, 1, 2000);
+  faulted.flags |= kHardwareFault;
+  ASSERT_TRUE(gateway.Deliver(faulted, now_us));
+  send_ack(ConfigAckStatus::kBackendFailed,
+           "disable to accept the new configuration", now_us + 1000);
+  now_us += 1000;
+  EXPECT_TRUE(node.Status(now_us).alert_error_config_refused_enabled());
+  EXPECT_FALSE(node.Status(now_us).alert_error_hardware_fault());
+
+  // 6. Configure and deliver fresh configured State with kHardwareFault:
+  // config_refused_enabled clears, hardware_fault activates.
+  now_us += 1000;
+  Acknowledge(rig, config_id, now_us);
+  State configured_fault = TrustState(config_id, 12, 2, 3000);
+  configured_fault.flags |= kHardwareFault;
+  ASSERT_TRUE(gateway.Deliver(configured_fault, now_us + 1000));
+  now_us += 1000;
+  EXPECT_FALSE(node.Status(now_us).alert_error_config_refused_enabled());
+  EXPECT_TRUE(node.Status(now_us).alert_error_hardware_fault());
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{"hardware_fault"});
+
+  // 7. Stale link clears alert_error_hardware_fault.
+  EXPECT_FALSE(node.Status(now_us + timeout_us).alert_error_hardware_fault());
+
+  // 8. Fresh healthy State clears alert_error_hardware_fault cleanly.
+  now_us += 5000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 12, 2, 8000), now_us));
+  EXPECT_FALSE(node.Status(now_us).alert_error_hardware_fault());
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
 }
 
 }  // namespace
