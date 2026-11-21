@@ -50,6 +50,30 @@ def _unacquired(job_id, name="macOS (build, test)", conclusion="cancelled"):
     }
 
 
+def _run_meta(
+    run_id=99,
+    workflow_id=7,
+    attempt=1,
+    event="push",
+    head_branch="feature/dry-and-hardening",
+    status="completed",
+    conclusion="failure",
+    pull_requests=None,
+    head_repo="owner/repo",
+):
+    return {
+        "id": run_id,
+        "workflow_id": workflow_id,
+        "run_attempt": attempt,
+        "event": event,
+        "head_branch": head_branch,
+        "status": status,
+        "conclusion": conclusion,
+        "pull_requests": pull_requests if pull_requests is not None else [],
+        "head_repository": {"full_name": head_repo},
+    }
+
+
 class RetryUnacquiredTest(unittest.TestCase):
     def test_retries_ci_unacquired_macos_with_failed_gate(self):
         jobs = [
@@ -140,11 +164,77 @@ class RetryUnacquiredTest(unittest.TestCase):
             retry_unacquired.should_retry_unacquired([_job(1, "Linux")], {}, attempt=1)[0]
         )
 
-    def test_evaluate_run_fetches_annotations_only_for_candidates(self):
+    def test_refuses_when_newer_run_exists_for_branch(self):
+        meta = _run_meta(run_id=99, attempt=1)
+        fresh, reason = retry_unacquired.check_run_freshness(
+            99, 1, meta, [_run_meta(run_id=100, attempt=1)]
+        )
+        self.assertFalse(fresh)
+        self.assertIn("newer run 100", reason)
+
+    def test_refuses_when_run_attempt_already_advanced(self):
+        meta = _run_meta(run_id=99, attempt=3)
+        fresh, reason = retry_unacquired.check_run_freshness(
+            99, 1, meta, [meta]
+        )
+        self.assertFalse(fresh)
+        self.assertIn("attempt 3, not 1", reason)
+
+    def test_refuses_newer_pull_request_run_for_same_pr_only(self):
+        pr42_old = _run_meta(
+            run_id=99, event="pull_request", head_branch="topic", pull_requests=[{"number": 42}]
+        )
+        pr43_other = _run_meta(
+            run_id=101, event="pull_request", head_branch="other", pull_requests=[{"number": 43}]
+        )
+        pr42_new = _run_meta(
+            run_id=102, event="pull_request", head_branch="topic", pull_requests=[{"number": 42}]
+        )
+        # Another PR's newer run does not block PR #42.
+        ok, _ = retry_unacquired.check_run_freshness(99, 1, pr42_old, [pr43_other, pr42_old])
+        self.assertTrue(ok)
+        # A newer run on PR #42 itself refuses.
+        stale, reason = retry_unacquired.check_run_freshness(
+            99, 1, pr42_old, [pr42_new, pr43_other, pr42_old]
+        )
+        self.assertFalse(stale)
+        self.assertIn("newer run 102", reason)
+
+    def test_push_run_not_blocked_by_sibling_pr_or_fork_run_on_same_branch(self):
+        push_100 = _run_meta(
+            run_id=100, event="push", head_branch="feature/x", head_repo="owner/repo"
+        )
+        pr_101 = _run_meta(
+            run_id=101, event="pull_request", head_branch="feature/x", head_repo="owner/repo"
+        )
+        fork_102 = _run_meta(
+            run_id=102, event="push", head_branch="feature/x", head_repo="fork/repo"
+        )
+        push_103 = _run_meta(
+            run_id=103, event="push", head_branch="feature/x", head_repo="owner/repo"
+        )
+        ok, reason = retry_unacquired.check_run_freshness(
+            100, 1, push_100, [fork_102, pr_101, push_100], repo="owner/repo"
+        )
+        self.assertTrue(ok, reason)
+        stale, reason2 = retry_unacquired.check_run_freshness(
+            100, 1, push_100, [push_103, pr_101, push_100], repo="owner/repo"
+        )
+        self.assertFalse(stale)
+        self.assertIn("newer run 103", reason2)
+
+    def test_evaluate_run_checks_freshness_then_fetches_candidate_annotations(self):
         calls = []
 
-        def fake_api(endpoint):
-            calls.append(endpoint)
+        def fake_api(endpoint, *, paginate=True):
+            calls.append((endpoint, paginate))
+            if endpoint == "/repos/owner/repo/actions/runs/99":
+                return json.dumps(_run_meta(run_id=99, workflow_id=7, attempt=1))
+            if endpoint == (
+                "/repos/owner/repo/actions/workflows/7/runs"
+                "?branch=feature%2Fdry-and-hardening&event=push&per_page=10"
+            ):
+                return json.dumps({"workflow_runs": [_run_meta(run_id=99, workflow_id=7)]})
             if "/jobs" in endpoint:
                 return (
                     json.dumps({"jobs": [_job(1, "Linux")]})
@@ -159,7 +249,9 @@ class RetryUnacquiredTest(unittest.TestCase):
             "owner/repo", run_id=99, attempt=1, api_get=fake_api
         )
         self.assertTrue(retry, reason)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)
+        self.assertFalse(calls[0][1])
+        self.assertFalse(calls[1][1])
 
 
 if __name__ == "__main__":

@@ -651,6 +651,9 @@ jobs:
         exit "$status"
 
   gate:
+    # Name matched by tools/retry_unacquired.py (AGGREGATOR_JOB_NAMES) so an
+    # unacquired-runner retry allows `CI gate`'s dependent failure; update both
+    # together if renamed.
     name: CI gate
     # The one check to require: it fails unless every job above succeeded.
     # Only the soak may be skipped (it runs on pushes, not pull requests).

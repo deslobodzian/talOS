@@ -444,6 +444,16 @@ CI policy:
 - The Linux suite sets `TALOS_REQUIRE_NETNS=1` and
   `TALOS_REQUIRE_BROWSER=1`, so a test that would skip for want of a
   network namespace or a browser fails there instead.
+- A companion `workflow_run` workflow
+  ([`.github/workflows/retry-unacquired.yaml`](../.github/workflows/retry-unacquired.yaml),
+  `tools/retry_unacquired.py`) automatically runs `gh run rerun --failed` on
+  `Continuous Integration` and `Nightly` only for the host-failure case
+  [DEVELOPMENT.md §6](DEVELOPMENT.md#6-push-and-done) permits: `run_attempt < 3`,
+  the run is still the newest for its workflow and branch/PR at that attempt,
+  every non-passing job (besides `CI gate`) never acquired a hosted runner
+  (0 steps, no runner, and the `"not acquired by Runner"` check-run annotation),
+  and real failures or cancellations are refused. Automatic reruns appear as
+  attempt 2 or 3 in the run's GitHub Actions attempt list.
 
 What each job runs, and on which trigger, is in
 [`.github/workflows/`](../.github/workflows/); this file does not restate it.
