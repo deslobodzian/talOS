@@ -28,10 +28,12 @@ import {
   type LatchedAlert
 } from './alerts';
 import {discoverEstimate} from './discovery';
+import type {SessionManifest} from './manifest';
 import {
   decodeSeries,
   errorMessage,
   fetchDeclared,
+  fetchManifest,
   fetchTimeline,
   getBytes,
   getJson,
@@ -211,21 +213,25 @@ export class RecordedSource implements DataSource {
   static async open(server: string, id: string,
                     options: RecordedOptions = {}): Promise<RecordedSource> {
     const fetchFn = options.fetch ?? defaultFetch;
-    const [channels, bounds, timeline, declared] = await Promise.all([
+    const [channels, bounds, timeline, declared, manifestResult] = await Promise.all([
       getJson(fetchFn, reviewUrl(server, id, 'channels.json')).then(parseChannels),
       getJson(fetchFn, reviewUrl(server, id, 'bounds.json')).then(parseBounds),
       fetchTimeline(server, id, fetchFn),
-      fetchDeclared(server, id, fetchFn)
+      fetchDeclared(server, id, fetchFn),
+      fetchManifest(server, id, fetchFn)
     ]);
     return new RecordedSource(server, id, channels, bounds, fetchFn,
-                              options.clock ?? browserClock, timeline, declared);
+                              options.clock ?? browserClock, timeline, declared,
+                              manifestResult.manifest, manifestResult.error);
   }
 
   constructor(readonly server: string, readonly id: string,
               private readonly channels: ChannelInfo[], readonly bounds: ReviewBounds,
               fetchFn: FetchLike, clock: ReviewClock,
               readonly timeline: ReviewTimeline = EMPTY_TIMELINE,
-              readonly declared: DeclaredGraph|null = null) {
+              readonly declared: DeclaredGraph|null = null,
+              readonly manifest: SessionManifest|null = null,
+              readonly manifestError: string = '') {
     this.infos = new Map(channels.map(c => [c.name, c]));
     this.poseChannels = resolvePoseChannels(channels, bounds.pose_topic);
     this.fetchFn = fetchFn;

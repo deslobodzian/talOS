@@ -2211,5 +2211,349 @@ TEST_F(ReviewTest, BoundedConfigReadRefusesOversizedAndNonRegularConfigPath) {
   }
 }
 
+// Guards REQ-OPS-41/REQ-OPS-42 publish/receipt skew > 1 s: a message published
+// 5 s before or after its event/receipt time is returned by both ReadSeries
+// and Snapshot, and Snapshot checks overlapping seconds instead of stopping at
+// the first (older-published) record it sees.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, PublishReceiptSkewOverOneSecond) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  using D = talos::Descriptor<review_test::Shot>;
+  const auto make_reg = [](std::uint16_t id, const char* name) {
+    talos::event::Registration reg;
+    reg.id = id;
+    reg.kind = SourceKind::WATCHER;
+    reg.name = name;
+    reg.message_bytes = sizeof(review_test::Shot);
+    reg.schema = {std::string{D::kName}, D::kHash,
+                  std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                              D::kBfbs.size()}};
+    return reg;
+  };
+  const auto write_msg = [](tlog::LogWriter& writer, std::uint16_t id,
+                            std::uint64_t& seq, std::int64_t event_ns,
+                            std::int64_t publish_ns, double pos) {
+    review_test::Shot shot{pos, static_cast<std::uint32_t>(seq),
+                           review_test::Mode::IDLE, true, seq};
+    Context ctx{};
+    ctx.kind = EventKind::MESSAGE;
+    ctx.source_id = id;
+    ctx.dispatch_index = ++seq;
+    ctx.sequence = seq;
+    ctx.event_time = ctx.now = MonotonicTime::from_nanos(event_ns);
+    ctx.publish_time = MonotonicTime::from_nanos(publish_ns);
+    writer.dispatch(ctx, std::as_bytes(std::span{&shot, 1}));
+  };
+
+  // Subcase 1: Lead skew (received 5 s AFTER publication) + overlapping
+  // earlier-received record with a newer publication time.
+  {
+    const std::string dir = Library() + "/skew_lead";
+    std::filesystem::create_directories(dir);
+    {
+      tlog::LogWriter writer{dir + "/obs.tlog", "obs",
+                             tlog::LogWriterOptions{8192, 1, false}, 1};
+      writer.start({make_reg(2, "/lead/state")},
+                   MonotonicTime::from_nanos(kStartNs));
+      std::uint64_t seq = 0;
+      // Received at 4 s, published at 4 s (pos = 40.0).
+      write_msg(writer, 2, seq, kStartNs + 4 * kSecond, kStartNs + 4 * kSecond,
+                40.0);
+      // Received at 7 s, published at 2 s (5 s lead skew, pos = 20.0).
+      write_msg(writer, 2, seq, kStartNs + 7 * kSecond, kStartNs + 2 * kSecond,
+                20.0);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    const auto session = Session::Open(dir);
+    ASSERT_EQ(session->files().size(), 1u);
+    EXPECT_EQ(session->files()[0].max_lead_s, 5);
+    EXPECT_EQ(session->files()[0].max_lag_s, 0);
+    const auto ref = session->Find("lead/state/position_m");
+    ASSERT_TRUE(ref.has_value());
+
+    // ReadSeries over [1s, 3s) finds the record published at 2s (event at 7s).
+    const auto series = session->ReadSeries(
+        std::span{&*ref, 1}, kStartNs + 1 * kSecond, kStartNs + 3 * kSecond, 2);
+    ASSERT_EQ(series.size(), 1u);
+    EXPECT_EQ(series[0].count[1], 1u);
+    EXPECT_EQ(series[0].last[1], 20.0);
+
+    // Snapshot at 3s finds the record published at 2s (event at 7s).
+    const auto snap3 = session->Snapshot(kStartNs + 3 * kSecond);
+    const auto it3 =
+        std::find_if(snap3.begin(), snap3.end(), [&](const Sample& s) {
+          return s.channel.topic == ref->topic &&
+                 s.channel.channel == ref->channel;
+        });
+    ASSERT_NE(it3, snap3.end());
+    EXPECT_EQ(ValueOf(session->channel(*ref).kind, it3->raw), 20.0);
+    EXPECT_EQ(it3->sample_ns, kStartNs + 2 * kSecond);
+
+    // Snapshot at 7s must NOT stop at event second 7 (publish 2s): it checks
+    // earlier overlapping seconds and returns the newer publish at 4s (40.0).
+    const auto snap7 = session->Snapshot(kStartNs + 7 * kSecond);
+    const auto it7 =
+        std::find_if(snap7.begin(), snap7.end(), [&](const Sample& s) {
+          return s.channel.topic == ref->topic &&
+                 s.channel.channel == ref->channel;
+        });
+    ASSERT_NE(it7, snap7.end());
+    EXPECT_EQ(ValueOf(session->channel(*ref).kind, it7->raw), 40.0);
+    EXPECT_EQ(it7->sample_ns, kStartNs + 4 * kSecond);
+    std::filesystem::remove_all(dir);
+  }
+
+  // Subcase 2: Lag skew (published 5 s AFTER event time) + later event with
+  // an older publication time.
+  {
+    const std::string dir = Library() + "/skew_lag";
+    std::filesystem::create_directories(dir);
+    {
+      tlog::LogWriter writer{dir + "/obs.tlog", "obs",
+                             tlog::LogWriterOptions{8192, 1, false}, 1};
+      writer.start({make_reg(2, "/lag/state")},
+                   MonotonicTime::from_nanos(kStartNs));
+      std::uint64_t seq = 0;
+      // Event at 7 s, published at 12 s (5 s lag skew, pos = 120.0).
+      write_msg(writer, 2, seq, kStartNs + 7 * kSecond, kStartNs + 12 * kSecond,
+                120.0);
+      // Event at 9 s, published at 9 s (pos = 90.0).
+      write_msg(writer, 2, seq, kStartNs + 9 * kSecond, kStartNs + 9 * kSecond,
+                90.0);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+    const auto session = Session::Open(dir);
+    ASSERT_EQ(session->files().size(), 1u);
+    EXPECT_EQ(session->files()[0].max_lead_s, 0);
+    EXPECT_EQ(session->files()[0].max_lag_s, 5);
+    const auto ref = session->Find("lag/state/position_m");
+    ASSERT_TRUE(ref.has_value());
+
+    // ReadSeries over [11s, 13s) widens first_second by max_lag_s to find it.
+    const auto series =
+        session->ReadSeries(std::span{&*ref, 1}, kStartNs + 11 * kSecond,
+                            kStartNs + 13 * kSecond, 2);
+    ASSERT_EQ(series.size(), 1u);
+    EXPECT_EQ(series[0].count[1], 1u);
+    EXPECT_EQ(series[0].last[1], 120.0);
+
+    // Snapshot at 13s must NOT stop at event second 9 (publish 9s): it checks
+    // event second 7 (7 + max_lag_s >= 9) and returns publish 12s (120.0).
+    const auto snap13 = session->Snapshot(kStartNs + 13 * kSecond);
+    const auto it13 =
+        std::find_if(snap13.begin(), snap13.end(), [&](const Sample& s) {
+          return s.channel.topic == ref->topic &&
+                 s.channel.channel == ref->channel;
+        });
+    ASSERT_NE(it13, snap13.end());
+    EXPECT_EQ(ValueOf(session->channel(*ref).kind, it13->raw), 120.0);
+    EXPECT_EQ(it13->sample_ns, kStartNs + 12 * kSecond);
+    std::filesystem::remove_all(dir);
+  }
+}
+
+// Guards REQ-OPS-42 lazy overflow bitset for source ids >= 63: Checkpoint stays
+// 24 B, logs with <= 63 sources allocate zero overflow memory, and source ids
+// >= 63 (including across multiple 64-bit overflow words) are indexed
+// independently without aliasing on bit 63.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, SourceIdsAtOrAbove63DoNotAlias) {
+  static_assert(sizeof(Checkpoint) == 24);
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using D = talos::Descriptor<review_test::Shot>;
+
+  // Fixture session uses only source ids < 63 -> zero overflow allocation.
+  {
+    const auto fixture_session = Session::Open(Library() + "/s1");
+    for (const LogFile& file : fixture_session->files()) {
+      EXPECT_TRUE(file.overflow_source_ids.empty());
+      EXPECT_TRUE(file.overflow_bits.empty());
+      EXPECT_EQ(file.overflow_words_per_cp, 0u);
+    }
+  }
+
+  const std::string dir = Library() + "/high_sources";
+  std::filesystem::create_directories(dir);
+  const auto make_reg = [](std::uint16_t id, const std::string& name) {
+    talos::event::Registration reg;
+    reg.id = id;
+    reg.kind = SourceKind::SENDER;
+    reg.name = name;
+    reg.message_bytes = sizeof(review_test::Shot);
+    reg.schema = {std::string{D::kName}, D::kHash,
+                  std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                              D::kBfbs.size()}};
+    return reg;
+  };
+  {
+    std::vector<talos::event::Registration> regs;
+    regs.push_back(make_reg(64, "/src64/state"));
+    regs.push_back(make_reg(70, "/src70/state"));
+    // Add 65 extra overflow sources (ids 80..144) to cross a 64-bit overflow
+    // word boundary, verifying multi-word bitset growth too.
+    for (std::uint16_t id = 80; id <= 144; ++id) {
+      regs.push_back(make_reg(id, "/pad" + std::to_string(id) + "/state"));
+    }
+    tlog::LogWriter writer{dir + "/high.tlog", "high",
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start(regs, MonotonicTime::from_nanos(kStartNs));
+    std::uint64_t seq = 0;
+    const auto send = [&](std::uint16_t id, std::int64_t offset_s, double pos) {
+      review_test::Shot shot{pos, static_cast<std::uint32_t>(seq),
+                             review_test::Mode::IDLE, true, seq};
+      Context ctx{};
+      ctx.dispatch_index = ++seq;
+      ctx.event_time = ctx.now =
+          MonotonicTime::from_nanos(kStartNs + offset_s * kSecond);
+      writer.send(ctx, id, std::as_bytes(std::span{&shot, 1}), 0, seq);
+    };
+    // Source 64 publishes ONLY at second 1.
+    send(64, 1, 64.5);
+    // Source 70 publishes at every second 2..10; pad sources (ids 80..144,
+    // crossing a 64-bit overflow word boundary) publish at second 3 in order.
+    for (std::int64_t s = 2; s <= 10; ++s) {
+      send(70, s, 70.0 + static_cast<double>(s));
+      if (s == 3) {
+        for (std::uint16_t id = 80; id <= 144; ++id) {
+          send(id, 3, static_cast<double>(id));
+        }
+      }
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  const auto session = Session::Open(dir);
+  ASSERT_EQ(session->files().size(), 1u);
+  EXPECT_GE(session->files()[0].overflow_words_per_cp, 2u);
+
+  const auto ref64 = session->Find("src64/state/position_m");
+  const auto ref70 = session->Find("src70/state/position_m");
+  const auto ref144 = session->Find("pad144/state/position_m");
+  ASSERT_TRUE(ref64.has_value());
+  ASSERT_TRUE(ref70.has_value());
+  ASSERT_TRUE(ref144.has_value());
+
+  // ReadSeries for source 64 over [5s, 10s) must skip completely (0 seeks)
+  // even though source 70 (>= 63) is present in every second 5..10.
+  {
+    ReadStats stats{};
+    const auto series =
+        session->ReadSeries(std::span{&*ref64, 1}, kStartNs + 5 * kSecond,
+                            kStartNs + 10 * kSecond, 5, &stats);
+    EXPECT_EQ(stats.seeks, 0u);
+    EXPECT_EQ(stats.records, 0u);
+    for (const auto c : series[0].count) EXPECT_EQ(c, 0u);
+  }
+
+  // ReadSeries for source 144 (in second overflow word) over [5s, 10s) skips
+  // too, and over [3s, 4s) finds its exact value.
+  {
+    ReadStats skip_stats{};
+    (void)session->ReadSeries(std::span{&*ref144, 1}, kStartNs + 5 * kSecond,
+                              kStartNs + 10 * kSecond, 2, &skip_stats);
+    EXPECT_EQ(skip_stats.seeks, 0u);
+
+    const auto hit =
+        session->ReadSeries(std::span{&*ref144, 1}, kStartNs + 3 * kSecond,
+                            kStartNs + 4 * kSecond, 1);
+    EXPECT_EQ(hit[0].count[0], 1u);
+    EXPECT_EQ(hit[0].last[0], 144.0);
+  }
+
+  // Snapshot at 10s jumps directly to each source's latest checkpoint:
+  // second 10 (src70), second 3 (pad80..144), second 1 (src64) = 3 seeks total
+  // instead of walking seconds 9, 8, 7, 6, 5, 4, 2!
+  {
+    ReadStats stats{};
+    const auto snap = session->Snapshot(kStartNs + 10 * kSecond, &stats);
+    EXPECT_EQ(stats.seeks, 3u);
+    const auto get_val = [&](ChannelRef ref) -> std::optional<double> {
+      const auto it =
+          std::find_if(snap.begin(), snap.end(), [&](const Sample& s) {
+            return s.channel.topic == ref.topic &&
+                   s.channel.channel == ref.channel;
+          });
+      if (it == snap.end()) return std::nullopt;
+      return ValueOf(session->channel(ref).kind, it->raw);
+    };
+    EXPECT_EQ(get_val(*ref64), 64.5);
+    EXPECT_EQ(get_val(*ref70), 80.0);
+    EXPECT_EQ(get_val(*ref144), 144.0);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// Guards GET /review/<id>/manifest.json: serves manifest.json verbatim when
+// present, 404 when absent, symlinked, or oversized (> kMaxManifestBytes), and
+// 400 on path traversal.
+// REQ-OPS-41, REQ-OPS-42
+TEST_F(ReviewTest, ManifestServesManifestJsonOr404WhenAbsentOrUnsafe) {
+  Review review{Library(), 1u << 20};
+  const Response present = review.Get("/review/s1/manifest.json", "");
+  ASSERT_EQ(present.status, 200) << present.body;
+  EXPECT_EQ(present.content_type, "application/json");
+  EXPECT_EQ(present.body, ReadFile(Library() + "/s1/manifest.json"));
+
+  // Missing manifest.json -> 404 plain text.
+  {
+    const std::string dir = Library() + "/no_manifest";
+    testing::WriteFixtureSession(dir);
+    std::filesystem::remove(dir + "/manifest.json");
+    const Response absent = review.Get("/review/no_manifest/manifest.json", "");
+    std::filesystem::remove_all(dir);
+    EXPECT_EQ(absent.status, 404);
+    EXPECT_EQ(absent.content_type, "text/plain; charset=utf-8");
+  }
+
+  // Symlink pointing outside library -> 404 without leaking target contents.
+  {
+    const std::filesystem::path outside =
+        Directory() + "/outside_manifest.json";
+    std::ofstream{outside} << R"({"secret":true})";
+    const std::string dir = Library() + "/symlink_manifest";
+    testing::WriteFixtureSession(dir);
+    std::filesystem::remove(dir + "/manifest.json");
+    std::filesystem::create_symlink(outside, dir + "/manifest.json");
+    const Response sym =
+        review.Get("/review/symlink_manifest/manifest.json", "");
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove(outside);
+    EXPECT_EQ(sym.status, 404);
+    EXPECT_EQ(sym.content_type, "text/plain; charset=utf-8");
+    EXPECT_EQ(sym.body.find("secret"), std::string::npos) << sym.body;
+  }
+
+  // Oversized manifest.json (> kMaxManifestBytes) -> 404.
+  {
+    const std::string dir = Library() + "/huge_manifest";
+    testing::WriteFixtureSession(dir);
+    {
+      std::ofstream out{dir + "/manifest.json", std::ios::binary};
+      out << "{\"pad\":\"";
+      const std::string chunk(65536, 'a');
+      for (std::size_t i = 0; i < 65; ++i) out << chunk;
+      out << "\"}";
+    }
+    const Response huge = review.Get("/review/huge_manifest/manifest.json", "");
+    std::filesystem::remove_all(dir);
+    EXPECT_EQ(huge.status, 404);
+    EXPECT_EQ(huge.content_type, "text/plain; charset=utf-8");
+  }
+
+  // Path traversal session id -> 400.
+  EXPECT_EQ(review.Get("/review/../manifest.json", "").status, 400);
+}
+
 }  // namespace
 }  // namespace studio::review

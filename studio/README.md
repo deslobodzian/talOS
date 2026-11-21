@@ -377,10 +377,17 @@ shown in the footer with **Retry**; panels keep what they last showed.
 |---|---|
 | Plot | Each channel decimated to the plot's pixel width rounded up to 256, 512, 1024, 2048 or 4096 buckets (so a plot wider than 4096 px gets fewer buckets than pixels), so resizing a plot requests again only where it crosses one, and fetched in as many requests as the server's limit on channels × buckets (its `bounds.json`) needs: the line is each bucket's last sample, at that sample's own publication time, and a bucket of more than one sample also draws its min-to-max range. The window ends at the playhead; "All history" is the session from its start to the playhead. |
 | Field | The pose estimator's pose at the playhead (no pose while its `valid` is false), the trail and camera observations over the window. |
+| 3D Viewport | The chassis pose at the playhead through `useChassis()` (with the same staleness and `pose_topic` rules as Field) and optional local GLB field model. |
 | Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the snapshot it came from (the snapshot's own time, as live measures against its frame's: a snapshot still trailing a playing playhead does not age its readings), and the alerts active and latched up to the playhead from `timeline.json`; the live system graph and node selections are live-only and show as absent. |
+| Subsystems | Discovered subsystem state/status channels, sparklines and demand-vs-measured pairs at the playhead; live registry target selections, liveness, loop rate and latency are absent (`—`) rather than showing stale live state. |
+| Vision | Discovered camera health, FPS, latency, tag count, valid rate, dropped-frame delta, std devs, disagreement and time-aligned observation x/y error against the estimator or sim truth over decimated recorded series. |
 | Events | Chronological events from `timeline.json` and `bounds.json` (`gaps`): Driver Station mode transitions (or a notice when hardware packets were not decoded), alert activations and clears, node restarts and unclean exits from `manifest.json`, and log gaps; clicking an event seeks the recording to its timestamp. |
 | Health | Recorded playback status, `bounds.json` log gaps, active and latched alerts at the playhead, node run history and restarts from `timeline.json`, and the session's declared graph (`declared.json`, when present); explicitly notes that live registry liveness is not present in recordings rather than fabricating live rows. |
-| Every other panel | "Not available for recorded sessions yet." |
+| Inspector | Every channel's value, unit and sample age at the playhead via `DataSource.channelSample`, with 30 s sparklines fetched only for visible expanded numeric channels (capped to 64 channels per render on large recorded dictionaries). |
+| Hardware link | `/hw/status` power, CAN bus utilization (labeled from `declared.json`'s `can_buses`), link age, clock offset, counters and fault/limit bitmasks at the playhead (or the `hardware_not_decoded` notice when hardware packets were not decoded). |
+| Session | The recording's `manifest.json` header and process table (restarts, exit codes/signals/reasons, recorder status, delivery loss, record counts, log paths) merged with `declared.json`; live registry columns (`Alive`, `Loop`, `Latency`) show `—`. |
+| Frames | Offline local-disk camera frame browser (works identically with or without a recording open). |
+| System, Timing, Agent (live-only) | Live-only (`recorded: false`): System and Timing read the live shared-memory registry, and Agent queries the live telemetry worker/headless agent, none of which are stored in `.tlog` recordings. |
 
 Values carry the channel names live telemetry uses. The chassis pose honors
 `[studio] pose_topic` both live and on a recording (read from the session's
@@ -456,13 +463,15 @@ port another listener holds, exiting with `cannot listen on 127.0.0.1:<port>`
 (it never shares a port, as uSockets' `SO_REUSEPORT` default would). It serves the
 review API under `/review/`: `sessions.json`, and per session
 `channels.json`, `bounds.json`, `timeline.json`, `declared.json`,
-`snapshot?t_ns=` and `series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes
+`manifest.json`, `snapshot?t_ns=` and `series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes
 are in [`review/review.h`](review/review.h). `timeline.json` summarises
 Driver Station mode transitions (empty when `hardware_not_decoded` is true),
 alert active intervals across every `ChannelInfo.alert != None` channel, and
 `manifest.json`'s `nodes[].runs[]` mapped via `origin_wall_ns` (with
 `end_wall_ns == 0` as `null`). `declared.json` serves the session's
-`graph.json` verbatim (up to 1 MiB, `kMaxDeclaredBytes`), or 404 when absent.
+`graph.json` verbatim (up to 1 MiB, `kMaxDeclaredBytes`), and `manifest.json`
+serves the session's `manifest.json` verbatim (up to 4 MiB,
+`kMaxManifestBytes`), each returning 404 when absent.
 Every other path is a file of the built
 Studio (`//studio:web_dist`, from the binary's runfiles, or `--webroot`), so a
 Studio opened there reads the API from its own origin; a path that leaves
@@ -536,16 +545,18 @@ Opening a session streams it once, merged, and keeps per log file one
 24-byte checkpoint per second of event time that holds records other than
 GAP records (where that
 second starts, and which sources recorded a value in it, a SEND or MESSAGE
-record). A series seeks to the checkpoints it needs and reads those seconds
-only, one second either side of its range by event time: a message received
-or sent more than a second from its publication time is not found. A
+record), plus each file's observed maximum second-level lead/lag between
+checkpoint event time and publication time (`max_lead_s` / `max_lag_s`), and a
+lazy out-of-line presence bitset allocated only when a file records source ids
+>= 63 (0 bytes for <= 63 sources). A series seeks to the checkpoints it needs
+and reads only those seconds widened by `max_lag_s` / `max_lead_s`, so messages
+published more than a second before or after receipt are still found. A
 snapshot at `t` reads, per log file and per topic source in it, the latest
-second (up to the one after `t`'s) that holds a value of that source, each
-such second once, and the source's next earlier such second only when that
-one yields none (every value in it published after `t`): normally one second
-per source, however long ago the topic was last published. Source ids from 63 on
-share one bit of the checkpoint, so such a source may also read seconds that
-hold only another's values. No log file is read whole.
+seconds (up to `floor(t) + max_lead_s`) that hold a value of that source, each
+such second once, stopping once no earlier checkpoint can hold a newer
+publication (`checkpoint.second < floor(found.publish_ns) - max_lag_s`):
+normally one second per source, however long ago the topic was last published.
+No log file is read whole.
 Series buckets (min, max, last, count) are kept for repeated requests in an
 LRU of at most `--cache-mb`. One series request asks for at most 262,144
 values (channels × points, `kMaxSeriesValues`; 400 past it) and holds at

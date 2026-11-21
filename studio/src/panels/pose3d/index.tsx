@@ -1,6 +1,6 @@
 // The 3D spatial viewport: the chassis pose in three dimensions, with an
 // optional user-loaded field model. The old Spatial view, reading its pose
-// from useSnapshot(); a pose whose frame is no longer current is drawn
+// from useChassis(); a pose whose frame is no longer current is drawn
 // translucent and marked STALE. The WebGL canvas only renders in a browser;
 // under react-dom/server it renders a placeholder, so the registry test can
 // render every panel without a WebGL context.
@@ -11,8 +11,7 @@ import * as THREE from 'three';
 import {OrbitControls} from 'three/examples/jsm/controls/OrbitControls.js';
 import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-import {chassisReading} from '../../data/freshness';
-import {usePlayback, useSnapshot} from '../../data/hooks';
+import {useChassis} from '../../data/hooks';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../field/geometry';
 import type {PanelDefinition} from '../types';
 import './pose3d.css';
@@ -63,8 +62,7 @@ function disposeModel(model: THREE.Group) {
 }
 
 function Pose3dPanel() {
-  const s = useSnapshot();
-  const reading = chassisReading(s, usePlayback());
+  const reading = useChassis();
   const [model, setModel] = useState<THREE.Group|null>(null);
   const [error, setError] = useState('');
   const isBrowser = typeof window !== 'undefined';
@@ -153,5 +151,6 @@ export const pose3dPanel: PanelDefinition<Pose3dConfig> = {
   description: 'The chassis pose in three dimensions, with an optional field model.',
   defaultConfig,
   parseConfig,
-  component: Pose3dPanel
+  component: Pose3dPanel,
+  recorded: true
 };

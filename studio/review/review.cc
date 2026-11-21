@@ -1,6 +1,7 @@
 #include "studio/review/review.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <cstring>
@@ -87,9 +88,39 @@ struct SessionEntry {
   std::vector<std::pair<std::string, std::uintmax_t>> files;
 };
 
-// The largest manifest.json the listing parses; a larger one (no launcher
-// writes one) lists the session without its times.
-constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
+// Reads one regular non-symlink JSON file from a session directory up to
+// `max_bytes`, returning 404 when absent, symlinked, non-regular, empty or
+// oversized.
+Response ReadSessionJsonFile(const fs::path& path, std::uintmax_t max_bytes,
+                             std::string_view missing_message) {
+  std::error_code error;
+  const fs::file_status st = fs::symlink_status(path, error);
+  if (error || fs::is_symlink(st) || !fs::is_regular_file(st)) {
+    return Error(404, std::string{missing_message});
+  }
+  const auto bytes = fs::file_size(path, error);
+  if (error || bytes == 0 || bytes > max_bytes) {
+    return Error(404, std::string{missing_message});
+  }
+  std::ifstream stream{path, std::ios::binary};
+  if (!stream.is_open()) return Error(404, std::string{missing_message});
+  std::string body;
+  body.reserve(static_cast<std::size_t>(bytes));
+  std::array<char, 8192> chunk{};
+  while (stream) {
+    stream.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    const std::streamsize got = stream.gcount();
+    if (got <= 0) break;
+    if (body.size() + static_cast<std::size_t>(got) > max_bytes) {
+      return Error(404, std::string{missing_message});
+    }
+    body.append(chunk.data(), static_cast<std::size_t>(got));
+  }
+  if (stream.bad() || body.empty()) {
+    return Error(404, std::string{missing_message});
+  }
+  return {200, "application/json", std::move(body)};
+}
 
 // A session's class from what the launcher already decided, never from its
 // logs: a simulation, or a session without a manifest, is "other", as
@@ -211,7 +242,7 @@ Response Review::Get(std::string_view path, std::string_view query) {
   const std::string_view route = path.substr(slash + 1);
   if (route != "channels.json" && route != "bounds.json" &&
       route != "timeline.json" && route != "declared.json" &&
-      route != "snapshot" && route != "series") {
+      route != "manifest.json" && route != "snapshot" && route != "series") {
     return Error(404, "not found");
   }
   Response error;
@@ -222,6 +253,7 @@ Response Review::Get(std::string_view path, std::string_view query) {
     if (route == "bounds.json") return Bounds(*session);
     if (route == "timeline.json") return Timeline(*session);
     if (route == "declared.json") return Declared(id);
+    if (route == "manifest.json") return Manifest(id);
     if (route == "snapshot") return Snapshot(*session, query);
     return Series(id, *session, query);
   } catch (const std::exception& e) {
@@ -453,20 +485,13 @@ Response Review::Timeline(const Session& session) const {
 }
 
 Response Review::Declared(std::string_view id) const {
-  const fs::path path = library_ / std::string{id} / "graph.json";
-  std::error_code error;
-  if (fs::is_symlink(path, error) || !fs::is_regular_file(path, error)) {
-    return Error(404, "no declared graph");
-  }
-  const auto bytes = fs::file_size(path, error);
-  if (error || bytes == 0 || bytes > kMaxDeclaredBytes) {
-    return Error(404, "no declared graph");
-  }
-  std::ifstream stream{path, std::ios::binary};
-  if (!stream.is_open()) return Error(404, "no declared graph");
-  std::string body{std::istreambuf_iterator<char>{stream}, {}};
-  if (body.empty()) return Error(404, "no declared graph");
-  return {200, "application/json", std::move(body)};
+  return ReadSessionJsonFile(library_ / std::string{id} / "graph.json",
+                             kMaxDeclaredBytes, "no declared graph");
+}
+
+Response Review::Manifest(std::string_view id) const {
+  return ReadSessionJsonFile(library_ / std::string{id} / "manifest.json",
+                             kMaxManifestBytes, "no manifest");
 }
 
 Response Review::Snapshot(const Session& session, std::string_view query) {

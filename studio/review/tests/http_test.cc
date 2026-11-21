@@ -86,6 +86,8 @@ class HttpTest : public testing::Test {
         testing::TempDir() + "/review_http_" + std::to_string(getpid());
     std::filesystem::remove_all(directory_);
     studio::review::testing::WriteFixtureSession(directory_ + "/s1");
+    studio::review::testing::WriteFixtureSession(directory_ + "/s2");
+    std::filesystem::remove(directory_ + "/s2/manifest.json");
     std::string error;
     std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
         rules_cc::cc::runfiles::Runfiles::CreateForTest(
@@ -147,7 +149,7 @@ TEST_F(HttpTest, ServesTheReviewShapes) {
   EXPECT_NE(sessions.headers.find("application/json"), std::string::npos);
   const json list = json::parse(sessions.body);
   ASSERT_TRUE(list.is_array());
-  ASSERT_EQ(list.size(), 1u);
+  ASSERT_EQ(list.size(), 2u);
   EXPECT_EQ(list[0]["id"], "s1");
   EXPECT_EQ(list[0]["class"], "other");
 
@@ -184,6 +186,17 @@ TEST_F(HttpTest, ServesTheReviewShapes) {
   ASSERT_EQ(declared.status, 200) << declared.body;
   EXPECT_NE(declared.headers.find("application/json"), std::string::npos);
   EXPECT_FALSE(json::parse(declared.body)["nodes"].empty());
+
+  const Reply manifest = Get(port_, "/review/s1/manifest.json");
+  ASSERT_EQ(manifest.status, 200) << manifest.body;
+  EXPECT_NE(manifest.headers.find("application/json"), std::string::npos);
+  EXPECT_NE(manifest.headers.find("Cache-Control: no-store"),
+            std::string::npos);
+  const json mf = json::parse(manifest.body);
+  EXPECT_EQ(mf["session_id"], studio::review::testing::kSessionId);
+  EXPECT_FALSE(mf["nodes"].empty());
+  EXPECT_EQ(Get(port_, "/review/s2/manifest.json").status, 404);
+  EXPECT_EQ(Get(port_, "/review/../manifest.json").status, 400);
 
   for (const std::string path :
        {"/review/s1/unknown.json", "/review/robot/fetch", "/missing.js"}) {

@@ -46,9 +46,12 @@
 // served, the Driver Station's included, and hardware_not_decoded() holds
 // log_dump's line, also printed on stderr.
 //
-// A read selects records by publication time but walks a file by event
-// time, so it reads one second either side of the range: a message received
-// or sent more than a second from its publication time is not found.
+// A read selects records by publication time while walking a file by event
+// time: each LogFile tracks its observed maximum second-level lead and lag
+// between checkpoint event time and publication time so reads widen their
+// event-time scan window to cover any skew, and keeps a lazy out-of-line
+// presence bitset for source ids >= 63 (0 bytes when all source ids are < 63)
+// so Checkpoint stays 24 B (REQ-OPS-42).
 
 #include <array>
 #include <cstddef>
@@ -140,6 +143,20 @@ struct LogFile {
   std::string path;
   std::string process;
   std::vector<Checkpoint> checkpoints;
+  // Maximum second-level skew observed across value records in this file:
+  // max_lead_s = max(0, checkpoint.second - FloorSecond(publish_ns)),
+  // max_lag_s  = max(0, FloorSecond(publish_ns) - checkpoint.second).
+  std::int64_t max_lead_s{0};
+  std::int64_t max_lag_s{0};
+  // Lazy out-of-line presence bitset for source ids >= 63, allocated only when
+  // a value record with source_id >= 63 is indexed (0 bytes for <= 63 sources).
+  std::vector<std::uint16_t> overflow_source_ids;
+  std::vector<std::uint64_t> overflow_bits;
+  std::size_t overflow_words_per_cp{0};
+
+  std::optional<std::size_t> OverflowBit(std::uint16_t source_id) const;
+  bool HasSource(std::size_t cp_idx, std::uint16_t source_id,
+                 std::optional<std::size_t> overflow_bit) const;
 };
 
 enum class Decoder : std::uint8_t {
@@ -302,9 +319,11 @@ class Session {
   // `t_ns`, from its latest such record, by topic then channel, capped at
   // `max_channels`; a topic with none is absent. Per log file it reads, once
   // each, only the seconds that hold a value record of one of its topics'
-  // sources at or before floor(t_ns) + 1 s, latest first, stopping per source
-  // at the first that yields its value: normally one second per source however
-  // long ago it was last published (studio/README.md, "Reviewing a session").
+  // sources at or before floor(t_ns) + file.max_lead_s, latest first, stopping
+  // per source once no earlier checkpoint can hold a newer publication
+  // (checkpoint.second < floor(found.publish_ns) - file.max_lag_s): normally
+  // one second per source however long ago it was last published
+  // (studio/README.md, "Reviewing a session").
   std::vector<Sample> Snapshot(
       std::int64_t t_ns, ReadStats* stats = nullptr,
       std::size_t max_channels = kMaxSnapshotChannels) const;

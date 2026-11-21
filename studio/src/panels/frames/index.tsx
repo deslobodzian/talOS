@@ -443,5 +443,6 @@ export const framesPanel: PanelDefinition = {
   description: 'Browse recorded camera frames and their detection context.',
   defaultConfig: {},
   parseConfig: () => ({}),
-  component: FramesPanel
+  component: FramesPanel,
+  recorded: true
 };

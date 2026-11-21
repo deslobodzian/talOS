@@ -13,7 +13,7 @@
 
 import {useMemo} from 'react';
 
-import {useDictionary, useSeries, useSnapshot, useSystem} from '../../data/hooks';
+import {useDictionary, useRecorded, useSeries, useSnapshot, useSystem} from '../../data/hooks';
 import {canBuses, canBusReading, canBusUnread, type CanBus} from '../../data/robot';
 import {durationUs, integer} from '../../ui/formatters';
 import {DataTable, type Column} from '../../ui/DataTable';
@@ -214,7 +214,8 @@ function HardwarePanel() {
   const snapshot = useSnapshot();
   const dictionary = useDictionary();
   const system = useSystem();
-  const busNames = system.declared?.can_buses;
+  const recorded = useRecorded();
+  const busNames = recorded ? recorded.declared?.can_buses : system.declared?.can_buses;
 
   const ch = snapshot?.channels ?? {};
   const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
@@ -279,8 +280,11 @@ function HardwarePanel() {
   if (!anyHardware) {
     return <div className="hardware">
       <EmptyState>
-        No /hw/status telemetry. Connect to a robot bridge, or start demo data
-        to explore the link and power views.
+        {recorded?.bounds.hardware_not_decoded ?
+            recorded.bounds.hardware_not_decoded :
+         recorded ?
+            'No /hw/status telemetry in this recorded session.' :
+            'No /hw/status telemetry. Connect to a robot bridge, or start demo data to explore the link and power views.'}
       </EmptyState>
     </div>;
   }
@@ -424,5 +428,6 @@ export const hardwarePanel: PanelDefinition<HardwareConfig> = {
   description: 'Main-processor ↔ RoboRIO link, power, clock and counters.',
   defaultConfig,
   parseConfig,
-  component: HardwarePanel
+  component: HardwarePanel,
+  recorded: true
 };

@@ -25,8 +25,10 @@ export type PanelDefinition<C = unknown> = {
   parseConfig: (raw: unknown) => C;
   component: ComponentType<PanelProps<C>>;
   // Renders from a recorded session (data/recorded.ts). Without it the panel
-  // shows that it is not available while a recording is open.
+  // shows its liveOnlyReason (or a default live-only notice) while a recording
+  // is open.
   recorded?: boolean;
+  liveOnlyReason?: string;
 };
 
 // Registry entries erase the config type; the layout calls parseConfig before
