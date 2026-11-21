@@ -26,7 +26,7 @@ that bus's Talon FX, CANcoder and Pigeon 2 counts at the config's
 `status_hz`, with CTR Electronics' per-device figures (classic CAN on
 `"rio"`, CAN FD on a CANivore) plus 5 % for the vendor's diagnostic server,
 calibrated to the bench's measured CANivore utilization
-(`EstimateCanBusLoads` in `talOS/introspection/names.h`); the warning names
+(`EstimateCanBusLoads` in `talOS/introspection/hardware_lint.h`); the warning names
 the bus, its estimate and its device counts.
 
 Subsystems default to `critical = true`. A failed probe (timeout, crash or

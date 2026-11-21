@@ -20,10 +20,17 @@
 
 #include "gtest/gtest.h"
 #include "schema_test/shapes_generated.h"
+#include "talOS/hardware/packet.h"
+#include "talOS/introspection/hardware_lint.h"
 #include "talOS/schema/identity.h"
 
 namespace talos::introspect::naming {
 namespace {
+
+static_assert(std::string_view{hardware::kRequestTopicPrefix} ==
+                  kRequestTopicPrefix,
+              "naming::kRequestTopicPrefix must match "
+              "hardware::kRequestTopicPrefix");
 
 using event::SourceKind;
 

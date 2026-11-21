@@ -78,7 +78,7 @@
 #include <string>
 #include <string_view>
 
-#include "talOS/devices/access.h"
+#include "talOS/devices/target_detail.h"
 #include "talOS/node/node.h"
 
 namespace talos {

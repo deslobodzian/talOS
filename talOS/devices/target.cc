@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
+#include "talOS/devices/access.h"
 #include "talOS/devices/devices.h"
 #include "talOS/introspection/names.h"
 #include "talOS/node/access.h"

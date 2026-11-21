@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "talOS/introspection/describe.h"
+#include "talOS/node/access.h"
 #include "talOS/node/node.h"
 
 class Observer {

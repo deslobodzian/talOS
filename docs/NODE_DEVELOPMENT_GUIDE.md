@@ -632,7 +632,7 @@ explicitly requested value; `pwm` and `applied_pwm` return the pulse
 (`std::optional<double>`, Python `float`), 0 being the centre pulse, or
 `std::nullopt` (`None`) for no pulse. Use `applied_motor`, `applied_digital_output`, and
 `applied_pwm` to inspect effective outputs: requests merge by the bridge's
-rules (`//talOS/bridge:merge`), so a node's outputs go neutral at its
+rules (`//talOS/hardware:merge`), so a node's outputs go neutral at its
 [owner timeout](../ARCHITECTURE.md#the-tick) and every output stops, as the
 gateway's do, once the oldest observation of any node still merged is
 `command_timeout_us` old; omitted outputs are neutral, and disabled hardware

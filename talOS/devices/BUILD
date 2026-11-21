@@ -6,27 +6,54 @@ load("//talOS/build:contract.bzl", "talos_messages")
 # encoders and PWM through the bridge, attached as a Node extension, the
 # Driver Station the bridge forwards, and target lanes (Target, TargetLane)
 # resolved by that Driver Station's mode.
+# Hardware wire/packet/access deps stay in implementation_deps so their
+# headers are excluded from downstream robot-node compile sandboxes
+# (ARCH-2 / RULES.md 2).
 cc_library(
     name = "devices",
     srcs = [
+        "access.h",
         "devices.cc",
         "target.cc",
     ],
     hdrs = [
-        "access.h",
         "devices.h",
         "target.h",
+        "target_detail.h",
+    ],
+    implementation_deps = [
+        "//talOS/configuration",
+        "//talOS/events:events_core",
+        "//talOS/hardware",
+        "//talOS/hardware:boot_history",
+        "//talOS/hardware:bridge_messages",
+        "//talOS/introspection:names",
+        "//talOS/node:access",
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//talOS/bridge:boot_history",
-        "//talOS/bridge:messages",
-        "//talOS/configuration",
         "//talOS/driver_station",
+        "//talOS/node",
+        "//talOS/schema:identity",
+    ],
+)
+
+# Privileged hardware-link plumbing (HardwareAccess, including note_live_target
+# and device_id, and DriverStationAccess). Restricted to framework layers only
+# so robot node code cannot include or link it.
+cc_library(
+    name = "access",
+    hdrs = ["access.h"],
+    visibility = [
+        "//talOS/devices:__pkg__",
+        "//talOS/mechanisms:__pkg__",
+        "//talOS/node_api:__pkg__",
+    ],
+    deps = [
+        ":devices",
         "//talOS/events:events_core",
         "//talOS/hardware",
-        "//talOS/introspection:names",
-        "//talOS/node",
+        "//talOS/schema:identity",
     ],
 )
 
@@ -38,14 +65,15 @@ cc_library(
     hdrs = ["testing.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":access",
         ":devices",
-        "//talOS/bridge:can_buses",
-        "//talOS/bridge:clock_offset",
-        "//talOS/bridge:merge",
-        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:bridge_messages",
+        "//talOS/hardware:can_buses",
+        "//talOS/hardware:clock_offset",
+        "//talOS/hardware:merge",
         "//talOS/introspection:names",
         "//talOS/node:testing",
         "//talOS/protocol",
@@ -57,13 +85,14 @@ cc_test(
     size = "small",
     srcs = ["testing_test.cc"],
     deps = [
+        ":access",
         ":devices",
         ":target_test_message",
         ":testing",
-        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:bridge_messages",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],
@@ -76,9 +105,11 @@ cc_test(
     deps = [
         ":devices",
         ":testing",
-        "//talOS/bridge:messages",
+        "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:bridge_messages",
+        "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],
 )
@@ -100,6 +131,7 @@ cc_test(
         ":testing",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/node:access",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],

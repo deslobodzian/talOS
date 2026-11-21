@@ -13,8 +13,10 @@ The table below is ARCHITECTURE.md "Layers" and "Allowed dependencies"
 - the stack: rtms (with memory and ipc) < events < node < devices; a layer
   never depends on a layer above it, nor on the talOS packages built on the
   stack (the bridge, launcher, simulator, framework nodes, node_api,
-  python), and talOS/node drives no hardware (it never depends on
-  talOS/hardware);
+  python); layers below node never depend on talOS/hardware, and talOS/node
+  depends only on //talOS/hardware:config (timeouts and actuator ownership
+  via talOS/configuration), never on //talOS/hardware:hardware or any other
+  target in talOS/hardware/...;
 - nothing under talOS/ depends on a robot, an example, the bench, a
   controller processor's program or studio/;
 - talOS/geometry never depends on talOS/vision;
@@ -32,8 +34,17 @@ The table below is ARCHITECTURE.md "Layers" and "Allowed dependencies"
 - non-testonly C++ nodes (`talos_cc_node`, `talos_cc_shared_node`) and
   `cc_library` targets outside `talOS/` never depend directly on
   `//talOS/rtms/...`, `//talOS/ipc/...`, `//talOS/memory/...`,
-  `//talOS/hardware:hardware`, or internal `//talOS/node:*` targets
-  (anything in `//talOS/node:*` other than `//talOS/node:node`).
+  `//talOS/hardware:hardware`, `//talOS/devices:access`, or internal
+  `//talOS/node:*` targets (anything in `//talOS/node:*` other than
+  `//talOS/node:node`);
+- structural Bazel visibility enforcement (RULES.md 2 / ARCH-2): privileged
+  internal targets (`//talOS/node:access`, `//talOS/node:loop_port`,
+  `//talOS/devices:access`, `//talOS/rtms:rtms`, `//talOS/rtms:wake`,
+  `//talOS/memory:shared_memory`, `//talOS/hardware:hardware`,
+  `//talOS/ipc:ipc`) are never `//visibility:public`, and are not visible to
+  robot/example/bench node packages (except `//talOS/hardware:hardware` and
+  `//talOS/ipc:ipc` for `//bench/main_processor/swerve_module` which hosts
+  the standalone `:send_target` CLI).
 
 The C++ source scan (also run standalone via `--source-only` in
 `tools/source_lints.sh`) walks every tracked file under `bench/`, `examples/`,
@@ -67,16 +78,15 @@ refuses from the start (RULES.md 2):
   `-iwithprefix`/`-iwithsysroot` compiler flags (joined, separate, or via
   `-Wp,`/`-Xclang`).
 
-Residual static-scan limits (tracked under TODO ARCH-2): Bazel
-`includes = [...]` rule attributes, compiler `@file` response files in `copts`,
-`.bazelrc`/`talos.bazelrc` flags, `--target=*-windows-msvc` (which also enables
-MSVC extensions, though a COFF object will not link into a Linux node),
-Starlark strings built at runtime (e.g. `%`, `.format()`, slices, `load()`ed
-constants, macro parameters, `.scl` files), and generated headers (`genrule`).
-Closing those requires evaluating Bazel `aquery` compile actions.
+Structural enforcement (ARCH-2 / RULES.md 2): Bazel visibility (checked above
+for every restricted target) prevents robot node code from depending on
+privileged internal or transport targets, and `implementation_deps` on
+`//talOS/node:node` and `//talOS/devices:devices` excludes their headers from
+downstream robot-node compile sandboxes. The static source scan provides fast
+defense-in-depth in `tools/source_lints.sh` without requiring Bazel.
 
-ALLOWLIST holds today's known Bazel exceptions, each with its reason and the
-TODO.md item that removes it. NON_NODE_CLI_FILES maps non-node CLI binaries
+ALLOWLIST holds any Bazel exceptions (empty since ARCH-2). NON_NODE_CLI_FILES
+maps non-node CLI binaries
 that sit beside a node package to the exact transport/wire headers they may
 include (never exempting `NodeAccess`, `HardwareAccess`, `node/access.h`,
 `node/internal.h`, `devices/access.h`, `add_hardware_request`,
@@ -116,9 +126,12 @@ ON_THE_STACK = (
     "talOS/teleop",
 )
 
-# "talOS/node drives no hardware": the layers up to node never depend on the
-# hardware config and wire package.
+# "talOS/node drives no hardware": layers below node never depend on
+# talOS/hardware; talOS/node reads only //talOS/hardware:config (timeouts and
+# actuator ownership for loop tier) through talOS/configuration
+# (ARCHITECTURE.md "Allowed dependencies").
 HARDWARE = "talOS/hardware"
+HARDWARE_CONFIG = "talOS/hardware:config"
 
 # Robot code and what sits beside talOS; talOS never depends on them.
 OUTSIDE_TALOS = ("bench", "controller_processor", "examples", "studio")
@@ -137,8 +150,29 @@ FORBIDDEN_NODE_DEPS = (
     "talOS/memory/...",
     "talOS/hardware:hardware",
     "talOS/node:*",
+    "talOS/devices:access",
 )
 FORBIDDEN_NODE_DEPS_EXCLUDE = ("talOS/node:node",)
+
+# Targets that must never be //visibility:public and must not be visible to
+# robot/example/bench node packages (structural RULES.md 2 enforcement).
+RESTRICTED_INTERNAL_TARGETS = (
+    "talOS/node:access",
+    "talOS/node:loop_port",
+    "talOS/devices:access",
+    "talOS/rtms:rtms",
+    "talOS/rtms:wake",
+    "talOS/memory:shared_memory",
+)
+# Hardware wire and raw IPC targets: never //visibility:public, and not visible
+# to any node package except WIRE_CLI_PACKAGES (which host standalone dev CLIs).
+RESTRICTED_WIRE_TARGETS = (
+    "talOS/hardware:hardware",
+    "talOS/ipc:ipc",
+)
+WIRE_CLI_PACKAGES = frozenset({
+    "bench/main_processor/swerve_module",
+})
 
 # What talOS/python may depend on directly outside itself.
 PYTHON_GATEWAYS = ("talOS/node_api", "talOS/schema", "talOS/build",
@@ -148,17 +182,8 @@ PYTHON_GATEWAYS = ("talOS/node_api", "talOS/schema", "talOS/build",
 # exported for talos.cpp_node (ARCHITECTURE.md "Allowed dependencies").
 SHARED_GENERATORS = ("talos_messages", "talos_cc_shared_node")
 
-# (from, to) -> reason. Remove an entry with the change that removes its
-# dependency; the check fails while a stale entry remains.
-ALLOWLIST = {
-    ("talOS/node", "talOS/hardware"):
-        "talOS/node reads hardware::Config timeouts and actuator ownership "
-        "through talOS/configuration, and names.h's /hw topic names through "
-        "talOS/introspection (TODO ARCH-2)",
-    ("talOS/devices", "talOS/bridge"):
-        "talOS/devices:testing (SimHardware) runs the bridge's merge rules, "
-        "//talOS/bridge:merge (TODO ARCH-2)",
-}
+# (from, to) -> reason. Must remain empty; any stale entry fails the check.
+ALLOWLIST = {}
 
 # C++ source bypass scan (RULES.md 2, REQ-SAFE-27).
 # Every tracked C++ file under SCANNED_SOURCE_ROOTS is scanned (regardless of
@@ -364,12 +389,17 @@ def checks(node_packages):
     for i, (layer, packages) in enumerate(STACK):
         above = [p for _, higher in STACK[i + 1:] for p in higher]
         above += ON_THE_STACK
-        if layer != "devices":
+        exclude = ()
+        if layer == "node":
+            above.append(HARDWARE)
+            exclude = (HARDWARE_CONFIG,)
+        elif layer != "devices":
             above.append(HARDWARE)
         for package in packages:
             result.append(Check(f"{layer} layer below {', '.join(above)}",
                                 recursive(package),
-                                tuple(recursive(p) for p in above)))
+                                tuple(recursive(p) for p in above),
+                                exclude=exclude))
     result.append(Check("talOS/ below robots, examples, bench and studio",
                         "talOS/...",
                         tuple(recursive(p) for p in OUTSIDE_TALOS)))
@@ -426,7 +456,8 @@ def run(backend, out=sys.stdout):
     """Runs every Bazel check against `backend`; returns the failure count."""
     failures = 0
     used = set()
-    all_checks = checks(backend.node_packages())
+    node_pkgs = backend.node_packages()
+    all_checks = checks(node_pkgs)
     for check in all_checks:
         frm = strip_pattern(check.frm)
         allowed = [t for t in check.to if (frm, strip_pattern(t)) in ALLOWLIST]
@@ -449,11 +480,34 @@ def run(backend, out=sys.stdout):
         failures += 1
         print(f"STALE allowlist entry {frm} -> {to}: no check covers it",
               file=out)
+    # Structural Bazel visibility checks (RULES.md 2 / ARCH-2): none of the
+    # restricted targets may be //visibility:public, and node packages may not
+    # see targets restricted to framework/CLI packages.
+    all_restricted = RESTRICTED_INTERNAL_TARGETS + RESTRICTED_WIRE_TARGETS
+    public = backend.public_targets(all_restricted)
+    if public:
+        failures += 1
+        print("VIOLATION restricted internal/transport targets must not be "
+              "//visibility:public (RULES.md 2):", file=out)
+        for label in public:
+            print(f"  {label}", file=out)
+    for pkg, target in sorted(backend.node_sample_targets().items()):
+        forbidden = list(RESTRICTED_INTERNAL_TARGETS)
+        if pkg not in WIRE_CLI_PACKAGES:
+            forbidden.extend(RESTRICTED_WIRE_TARGETS)
+        visible = backend.visible_to(target, forbidden)
+        if visible:
+            failures += 1
+            print(f"VIOLATION restricted targets visible to node package "
+                  f"//{pkg} ({target}) (RULES.md 2):", file=out)
+            for label in visible:
+                print(f"  {label}", file=out)
+    visibility_checks = 1 + len(node_pkgs)
     if failures:
         print(f"{failures} layer check(s) failed (docs/DESIGN.md §3)",
               file=out)
     else:
-        print(f"{len(all_checks)} layer checks passed, "
+        print(f"{len(all_checks) + visibility_checks} layer checks passed, "
               f"{len(ALLOWLIST)} allowlisted dependencies remain", file=out)
     return failures
 
@@ -503,12 +557,30 @@ class Bazel:
                                f"{expr}")
         return [line for line in proc.stdout.splitlines() if line]
 
-    def node_packages(self):
+    def node_sample_targets(self):
+        """One generated node rule label per node package under NODE_ROOTS."""
         roots = " + ".join(f"//{r}/..." for r in NODE_ROOTS)
         generators = "|".join(NODE_GENERATORS)
-        return sorted(set(self.query(
+        labels = sorted(self.query(
             f"attr(generator_function, \"^({generators})$\", {roots})",
-            output="package")))
+            output="label"))
+        samples = {}
+        for label in labels:
+            pkg = label.removeprefix("//").split(":", 1)[0]
+            samples.setdefault(pkg, label)
+        return samples
+
+    def node_packages(self):
+        return sorted(self.node_sample_targets().keys())
+
+    def public_targets(self, targets):
+        expr = " + ".join(f"//{t}" for t in targets)
+        return sorted(self.query(
+            f'attr(visibility, "//visibility:public", {expr})'))
+
+    def visible_to(self, target_label, targets):
+        expr = " + ".join(f"//{t}" for t in targets)
+        return sorted(self.query(f"visible({target_label}, {expr})"))
 
     def somepath(self, frm, to):
         return self.query(f"somepath({render(frm)}, {render(to)})")

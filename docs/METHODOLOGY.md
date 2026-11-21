@@ -153,7 +153,7 @@ There are exactly two kinds of input, and they are treated differently.
    controller at neutral but drives a servo to centre; leave it unset (or
    `stop()` it) for no pulse. **[enforced; hardware qualification]**
 4. Never write `/hw/request/<node>` and never send hardware requests outside
-   `update()`. **[enforced: `publish` refuses `/hw/request`, graph lint; gap: ARCH-2, node code can still reach `detail::NodeAccess` and raw RTMS publishers]**
+   `update()`. **[enforced: `publish`/`publish_bytes` and `NodeDetail::publisher_send` refuse `/hw/request`, graph lint, Bazel visibility + `implementation_deps`, and `tools/check_layers.py`]**
 5. Closed loops run on the Talon (`set_velocity`, `set_position`,
    `set_motion_magic`). Run a loop in the node only when it needs data the Talon
    does not have, such as pose or vision. **[review]**

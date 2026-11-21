@@ -19,6 +19,7 @@
 #include <variant>
 #include <vector>
 
+#include "talOS/node/node_detail.h"
 #include "talOS/schema/identity.h"
 
 namespace talos {
@@ -69,20 +70,6 @@ struct NodeSetup {
   std::optional<std::filesystem::path> session_dir;
 };
 
-// The user's object, type-erased so the runner and the harness need not be
-// templates. The factory builds it against a Node and installs its update().
-using Instance = std::shared_ptr<void>;
-using InstanceFactory = std::function<Instance(Node&)>;
-
-template <class T>
-InstanceFactory MakeInstance();  // node.h
-
-// The binary's main: flags, describe/replay/realtime, logging, the live
-// registry.
-int RunMain(int argc, char** argv, const char* node_name,
-            const char* node_target, const InstanceFactory& make);
-
-using MessageCallback = std::function<void(const void*)>;
 using ParamValue = std::variant<bool, std::int64_t, double, std::string,
                                 std::vector<std::string>, std::vector<double>>;
 

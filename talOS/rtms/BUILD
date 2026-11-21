@@ -8,6 +8,12 @@ flatbuffer_cc_library(
     srcs = ["test_message.fbs"],
 )
 
+_TRANSPORT_VISIBILITY = [
+    "//studio:__subpackages__",
+    "//talOS:__subpackages__",
+    "//tools:__pkg__",
+]
+
 # Whether a process recorded in shared memory (pid, start time and pid
 # namespace) still runs: RTMS claims and the live registry's rows share this
 # one check.
@@ -15,7 +21,7 @@ cc_library(
     name = "process_liveness",
     srcs = ["process_liveness.cc"],
     hdrs = ["process_liveness.h"],
-    visibility = ["//visibility:public"],
+    visibility = _TRANSPORT_VISIBILITY,
 )
 
 # The cross-process wake channel a publisher uses to wake a reader asleep on
@@ -24,14 +30,14 @@ cc_library(
     name = "wake",
     srcs = ["wake.cc"],
     hdrs = ["wake.h"],
-    visibility = ["//visibility:public"],
+    visibility = _TRANSPORT_VISIBILITY,
 )
 
 cc_library(
     name = "rtms",
     srcs = ["rtms.cc"],
     hdrs = ["rtms.h"],
-    visibility = ["//visibility:public"],
+    visibility = _TRANSPORT_VISIBILITY,
     deps = [
         ":process_liveness",
         ":wake",

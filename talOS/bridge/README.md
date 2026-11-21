@@ -4,10 +4,10 @@
 nodes (shared-memory topics) and the controller processor (RoboRIO or
 `sim_gateway`, over UDP). It merges each actuator-owning subsystem's
 `/hw/request/<node>` into one `hardware::Command`, enforces identity, ownership,
-and per-owner timeout neutralization (`merge.h`), forwards `/hw/state` and
+and per-owner timeout neutralization (`talOS/hardware/merge.h`), forwards `/hw/state` and
 `/hw/state/driver_station`, maintains the gateway-to-node clock mapping
-(`clock_offset.h`), and publishes link and controller health on `/hw/status`
-(`bridge_status.fbs`).
+(`talOS/hardware/clock_offset.h`), and publishes link and controller health on `/hw/status`
+(`talOS/hardware/status/bridge_status.fbs`).
 
 ## Why `HardwareNode` Composes `WakeChannelWait` Instead of `RealtimeEventLoop`
 

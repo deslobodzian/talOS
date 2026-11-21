@@ -21,7 +21,7 @@
 // it before the first step to have a state at time 0; later, the first state
 // goes out at that moment. Devices are keyed by (node, device) exactly as the
 // node names them.
-// Requests merge by the bridge's rules (talOS/bridge/merge.h): a node's
+// Requests merge by the bridge's rules (talOS/hardware/merge.h): a node's
 // outputs go neutral once its last admitted request is older than the
 // bridge's owner timeout (ARCHITECTURE.md, "The tick"), and, as on the
 // gateway, every output goes neutral (a new epoch) at a gateway tick that

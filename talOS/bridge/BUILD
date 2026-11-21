@@ -1,54 +1,28 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("//talOS/build:contract.bzl", "talos_messages")
 
-# BridgeStatus (namespace bridge) and its topic: hardware_node's health,
-# published every 20 ms on /hw/status.
-talos_messages(
+# Compatibility aliases for BridgeStatus (//talOS/hardware/status:messages) so
+# existing C++ and Python consumers of //talOS/bridge:messages[_py] keep their
+# labels and `bridge/bridge_status_generated.h` / `bridge.BridgeStatus` paths.
+alias(
     name = "messages",
-    srcs = ["bridge_status.fbs"],
-    include_prefix = "bridge",
-    topics = {"status": "/hw/status"},
-)
-
-# The gateway boots a stream has been in, current and recently retired: the
-# State ordering gate (via clock_offset) and every Driver Station consumer.
-cc_library(
-    name = "boot_history",
-    hdrs = ["boot_history.h"],
+    actual = "//talOS/hardware/status:messages",
     visibility = ["//visibility:public"],
 )
 
-# The gateway-to-node clock mapping the bridge publishes on /hw/status, also
-# run by talos::testing::SimHardware when it plays the bridge.
-cc_library(
-    name = "clock_offset",
-    srcs = ["clock_offset.cc"],
-    hdrs = ["clock_offset.h"],
+alias(
+    name = "messages_py",
+    actual = "//talOS/hardware/status:messages_py",
     visibility = ["//visibility:public"],
-    deps = [":boot_history"],
 )
 
-# The /hw/status CAN bus table, assembled from the one bus slot each State
-# reports, also run by talos::testing::SimHardware when it plays the bridge.
-cc_library(
-    name = "can_buses",
-    hdrs = ["can_buses.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":messages",
-        "//talOS/hardware",
-    ],
-)
-
-# The request merge rules (owner timeout, admission, merged observation),
-# also run by talos::testing::SimHardware when it plays the bridge.
+# Private forwarding header for talOS/bridge's internal tests; the merge rules
+# live in //talOS/hardware:merge.
 cc_library(
     name = "merge",
-    srcs = ["merge.cc"],
     hdrs = ["merge.h"],
-    visibility = ["//visibility:public"],
+    deps = ["//talOS/hardware:merge"],
 )
 
 cc_library(
@@ -57,16 +31,16 @@ cc_library(
     hdrs = ["node.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":can_buses",
-        ":clock_offset",
-        ":merge",
-        ":messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/events:events_os",
         "//talOS/hardware",
+        "//talOS/hardware:bridge_messages",
+        "//talOS/hardware:can_buses",
+        "//talOS/hardware:clock_offset",
+        "//talOS/hardware:merge",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
@@ -211,38 +185,6 @@ cc_test(
         "//talOS/ipc",
         "//talOS/process",
         "@googletest//:gtest",
-        "@googletest//:gtest_main",
-    ],
-)
-
-cc_test(
-    name = "clock_offset_test",
-    size = "small",
-    srcs = ["clock_offset_test.cc"],
-    deps = [
-        ":clock_offset",
-        "@googletest//:gtest_main",
-    ],
-)
-
-cc_test(
-    name = "can_buses_test",
-    size = "small",
-    srcs = ["can_buses_test.cc"],
-    deps = [
-        ":can_buses",
-        ":messages",
-        "//talOS/hardware",
-        "@googletest//:gtest_main",
-    ],
-)
-
-cc_test(
-    name = "merge_test",
-    size = "small",
-    srcs = ["merge_test.cc"],
-    deps = [
-        ":merge",
         "@googletest//:gtest_main",
     ],
 )

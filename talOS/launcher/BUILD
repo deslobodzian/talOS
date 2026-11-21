@@ -279,6 +279,7 @@ cc_library(
         "//talOS/events:events_log",
         "//talOS/events:events_os",
         "//talOS/introspection:describe",
+        "//talOS/introspection:hardware_lint",
         "//talOS/introspection:lock_file",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
@@ -1034,6 +1035,7 @@ talos_cc_node(
     deps = [
         ":replay_message",
         "//talOS/introspection:describe",
+        "//talOS/node:access",
     ],
 )
 

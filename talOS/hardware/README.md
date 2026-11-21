@@ -509,7 +509,7 @@ normal traffic stays far below the budget.
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
 `talos.hardware_sample_time_ns(node)`). The bridge keeps the mapping
-(`talOS/bridge/clock_offset.h`) and publishes it on `/hw/status`. Empty clock
+(`talOS/hardware/clock_offset.h`) and publishes it on `/hw/status`. Empty clock
 probes run at most 50 Hz even while disabled/uncommissioned, with one probe
 outstanding at a time and an unanswered probe replaced after 100 ms, so one
 lost probe or echo never outlasts the exchange already held.

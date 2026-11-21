@@ -39,6 +39,7 @@
 #include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/endpoint.h"
 #include "talOS/hardware/gateway.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/hardware/sim_backend.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/protocol/frame.h"

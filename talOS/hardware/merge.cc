@@ -1,4 +1,4 @@
-#include "talOS/bridge/merge.h"
+#include "talOS/hardware/merge.h"
 
 #include <algorithm>
 

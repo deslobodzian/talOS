@@ -34,11 +34,13 @@ cc_library(
     deps = [
         ":internal",
         "//talOS/devices",
+        "//talOS/devices:access",
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/mechanisms",
         "//talOS/msgs:control",
         "//talOS/node",
+        "//talOS/node:access",
     ],
     # Every exported symbol must reach the shared objects below, even though
     # nothing in them references them.
@@ -136,6 +138,7 @@ talos_cc_shared_node(
     deps = [
         "//talOS/devices",
         "//talOS/hardware",
+        "//talOS/node:access",
     ],
 )
 
