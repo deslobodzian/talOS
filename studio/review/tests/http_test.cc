@@ -65,6 +65,7 @@ Reply Get(std::uint16_t port, const std::string& target,
   std::size_t length = 0;
   while (true) {
     const ssize_t n = read(fd, buffer, sizeof buffer);
+    if (n < 0 && errno == EINTR) continue;
     if (n <= 0) break;
     data.append(buffer, static_cast<std::size_t>(n));
     if (header_end == std::string::npos) {
@@ -86,9 +87,12 @@ Reply Get(std::uint16_t port, const std::string& target,
 class HttpTest : public testing::Test {
  protected:
   void SetUp() override {
-    directory_ =
-        testing::TempDir() + "/review_http_" + std::to_string(getpid());
-    std::filesystem::remove_all(directory_);
+    const std::filesystem::path raw_dir =
+        std::filesystem::path(testing::TempDir()) /
+        ("review_http_" + std::to_string(getpid()));
+    std::filesystem::remove_all(raw_dir);
+    std::filesystem::create_directories(raw_dir);
+    directory_ = std::filesystem::weakly_canonical(raw_dir).string();
     studio::review::testing::WriteFixtureSession(directory_ + "/s1");
     studio::review::testing::WriteFixtureSession(directory_ + "/s2");
     std::filesystem::remove(directory_ + "/s2/manifest.json");
@@ -131,7 +135,8 @@ class HttpTest : public testing::Test {
   void TearDown() override {
     if (child_ > 0) {
       kill(child_, SIGTERM);
-      waitpid(child_, nullptr, 0);
+      while (waitpid(child_, nullptr, 0) < 0 && errno == EINTR) {
+      }
     }
     std::filesystem::remove_all(directory_);
   }
@@ -335,6 +340,87 @@ std::set<std::uint64_t> ProcNetInodes(
   }
   return inodes;
 }
+#elif defined(__APPLE__)
+bool RunToolCapture(const char* file, const std::vector<const char*>& argv,
+                    std::string& stdout_out, int& exit_code) {
+  int pipefd[2];
+  if (pipe(pipefd) != 0) return false;
+  const pid_t pid = fork();
+  if (pid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return false;
+  }
+  if (pid == 0) {
+    dup2(pipefd[1], STDOUT_FILENO);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    execvp(file, const_cast<char* const*>(argv.data()));
+    _exit(127);
+  }
+  close(pipefd[1]);
+  stdout_out.clear();
+  char buf[4096];
+  for (;;) {
+    const ssize_t n = read(pipefd[0], buf, sizeof buf);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (n == 0) break;
+    stdout_out.append(buf, static_cast<std::size_t>(n));
+  }
+  close(pipefd[0]);
+  int status = 0;
+  pid_t waited = -1;
+  do {
+    waited = waitpid(pid, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  if (waited != pid || !WIFEXITED(status)) {
+    exit_code = -1;
+    return false;
+  }
+  exit_code = WEXITSTATUS(status);
+  return true;
+}
+
+bool MatchesExactPort(std::string_view text, std::uint16_t port) {
+  const std::string needle = ":" + std::to_string(port);
+  std::size_t pos = 0;
+  while ((pos = text.find(needle, pos)) != std::string_view::npos) {
+    const std::size_t end = pos + needle.size();
+    if (end == text.size() || text[end] < '0' || text[end] > '9') {
+      return true;
+    }
+    pos = end;
+  }
+  return false;
+}
+
+bool IsWritableShmVmmapLine(std::string_view line) {
+  const std::size_t bracket = line.find(']');
+  if (bracket == std::string_view::npos) return false;
+  std::size_t i = bracket + 1;
+  while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+  if (i + 7 > line.size() || line[i + 3] != '/') return false;
+  const std::string_view cur_prot = line.substr(i, 3);
+  if (cur_prot.find('w') == std::string_view::npos) return false;
+  i += 7;
+  while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+  constexpr std::string_view kSmShm = "SM=SHM";
+  if (!line.substr(i).starts_with(kSmShm)) return false;
+  const std::size_t after = i + kSmShm.size();
+  return after == line.size() || line[after] == ' ' || line[after] == '\t';
+}
+
+bool IsDarwinNonSocketType(std::string_view fd_type) {
+  return fd_type == "REG" || fd_type == "VREG" || fd_type == "DIR" ||
+         fd_type == "VDIR" || fd_type == "CHR" || fd_type == "VCHR" ||
+         fd_type == "BLK" || fd_type == "VBLK" || fd_type == "FIFO" ||
+         fd_type == "VFIFO" || fd_type == "PIPE" || fd_type == "KQUEUE" ||
+         fd_type == "VNODE" || fd_type == "NPOLICY" || fd_type == "GUARD" ||
+         fd_type == "FSEVENTS" || fd_type == "NEXUS" || fd_type == "CHANNEL";
+}
 #endif
 
 }  // namespace
@@ -403,53 +489,67 @@ TEST_F(HttpTest, OpensNoDatagramSocketNoSharedMemoryAndWritesNothing) {
   std::map<std::uint64_t, std::pair<std::string, std::string>> tcp_info;
   const auto tcp = ProcNetInodes({"tcp", "tcp6"}, &tcp_info);
   const auto unix_socks = ProcNetInodes({"unix"});
-  bool saw_loopback_listener = false;
+  int loopback_listeners = 0;
+  char port_hex[8] = {};
+  std::snprintf(port_hex, sizeof port_hex, ":%04X",
+                static_cast<unsigned>(port_));
+  const std::string want_v4 = std::string{"0100007F"} + port_hex;
+  const std::string want_v6 =
+      std::string{"00000000000000000000000001000000"} + port_hex;
   for (const std::uint64_t inode : held_sockets) {
     EXPECT_TRUE(tcp.count(inode) > 0 || unix_socks.count(inode) > 0)
         << "studio_review holds non-TCP/non-Unix socket inode " << inode;
     if (const auto it = tcp_info.find(inode); it != tcp_info.end()) {
       const auto& [local_addr, state] = it->second;
-      // 0A = TCP_LISTEN; every listener must be bound to loopback.
+      // 0A = TCP_LISTEN; every listener must be bound to loopback on port_.
       if (state == "0A") {
-        const bool is_loopback =
-            local_addr.starts_with("0100007F:") ||
-            local_addr.starts_with("00000000000000000000000001000000:");
-        EXPECT_TRUE(is_loopback)
-            << "studio_review listener is not loopback: " << local_addr;
-        saw_loopback_listener = saw_loopback_listener || is_loopback;
+        const bool is_expected =
+            (local_addr == want_v4 || local_addr == want_v6);
+        EXPECT_TRUE(is_expected)
+            << "studio_review listener is not loopback on expected port: "
+            << local_addr << " (want " << want_v4 << " or " << want_v6 << ")";
+        if (is_expected) ++loopback_listeners;
       }
     }
   }
-  EXPECT_TRUE(saw_loopback_listener)
-      << "studio_review TCP listener not observed in /proc/net/tcp";
+  EXPECT_EQ(loopback_listeners, 1)
+      << "expected exactly 1 loopback TCP listener on port " << port_
+      << " in /proc/net/tcp";
 #elif defined(__APPLE__)
-  int pipefd[2];
-  ASSERT_EQ(pipe(pipefd), 0);
   const std::string pid_arg = std::to_string(child_);
-  const pid_t lsof_pid = fork();
-  ASSERT_GE(lsof_pid, 0);
-  if (lsof_pid == 0) {
-    dup2(pipefd[1], STDOUT_FILENO);
-    close(pipefd[0]);
-    close(pipefd[1]);
-    execlp("lsof", "lsof", "-n", "-P", "-a", "-p", pid_arg.c_str(), "-F",
-           "ftPan", static_cast<char*>(nullptr));
-    _exit(127);
+
+  // Catch closed-fd SharedMemoryPtr mappings via vmmap: studio_review must
+  // hold zero writable SM=SHM regions.
+  std::string vmmap_out;
+  int vmmap_exit = -1;
+  ASSERT_TRUE(RunToolCapture("vmmap",
+                             {"vmmap", "-wide", pid_arg.c_str(), nullptr},
+                             vmmap_out, vmmap_exit));
+  ASSERT_EQ(vmmap_exit, 0) << vmmap_out;
+  ASSERT_FALSE(vmmap_out.empty());
+  {
+    std::istringstream vlines(vmmap_out);
+    std::string vline;
+    while (std::getline(vlines, vline)) {
+      EXPECT_FALSE(IsWritableShmVmmapLine(vline))
+          << "studio_review mapped writable shared memory: " << vline;
+    }
   }
-  close(pipefd[1]);
+
+  // Strict lsof socket allowlist: reject every socket fd except unix sockets
+  // and the single loopback TCP LISTEN socket on exact :{port_}.
   std::string output;
-  char buf[4096];
-  for (ssize_t n; (n = read(pipefd[0], buf, sizeof buf)) > 0;) {
-    output.append(buf, static_cast<std::size_t>(n));
-  }
-  close(pipefd[0]);
-  int status = 0;
-  ASSERT_EQ(waitpid(lsof_pid, &status, 0), lsof_pid);
-  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+  int lsof_exit = -1;
+  ASSERT_TRUE(RunToolCapture("lsof",
+                             {"lsof", "-n", "-P", "-a", "-p", pid_arg.c_str(),
+                              "-F", "ftPTan", nullptr},
+                             output, lsof_exit));
+  ASSERT_EQ(lsof_exit, 0) << output;
 
   struct FdRec {
     std::string type;
     std::string proto;
+    std::string state;
     std::string access;
     std::string name;
   };
@@ -465,34 +565,44 @@ TEST_F(HttpTest, OpensNoDatagramSocketNoSharedMemoryAndWritesNothing) {
     } else if (!recs.empty()) {
       if (tag == 't') recs.back().type = val;
       if (tag == 'P') recs.back().proto = val;
+      if (tag == 'T' && val.starts_with("ST=")) {
+        recs.back().state = val.substr(3);
+      }
       if (tag == 'a') recs.back().access = val;
       if (tag == 'n') recs.back().name = val;
     }
   }
   ASSERT_FALSE(recs.empty()) << "lsof returned no descriptors";
-  bool saw_loopback_listener = false;
-  const std::string want_listen = "127.0.0.1:" + std::to_string(port_);
+  int loopback_listeners = 0;
   for (const auto& r : recs) {
-    EXPECT_NE(r.type, "PSXSHM") << "studio_review holds shm fd: " << r.name;
-    EXPECT_EQ(r.type.find("RAW"), std::string::npos) << r.type << " " << r.name;
-    EXPECT_EQ(r.type.find("NDRV"), std::string::npos)
-        << r.type << " " << r.name;
-    if (r.type == "IPv4" || r.type == "IPv6" || !r.proto.empty()) {
-      EXPECT_EQ(r.proto, "TCP") << "non-TCP inet socket: " << r.name;
-      const bool is_loopback =
-          r.name.starts_with("127.0.0.1:") || r.name.starts_with("[::1]:");
-      EXPECT_TRUE(is_loopback) << "non-loopback inet socket: " << r.name;
-      if (r.name.find(want_listen) != std::string::npos) {
-        saw_loopback_listener = true;
-      }
+    if (r.type == "PSXSHM") {
+      ADD_FAILURE() << "studio_review holds shm fd: " << r.name;
+      continue;
     }
-    if (r.type == "REG" && r.name.find(directory_) != std::string::npos) {
+    if ((r.type == "REG" || r.type == "VREG") &&
+        r.name.find(directory_) != std::string::npos) {
       EXPECT_NE(r.access, "w") << "writable library fd: " << r.name;
       EXPECT_NE(r.access, "u") << "read-write library fd: " << r.name;
     }
+    if (IsDarwinNonSocketType(r.type) && r.proto.empty()) continue;
+    if (r.type == "unix") continue;
+    // Strict allowlist: the only allowed non-unix socket is the single
+    // loopback TCP LISTEN socket on exact :{port_}.
+    const bool is_inet = (r.type == "IPv4" || r.type == "IPv6");
+    const bool is_loopback =
+        r.name.starts_with("127.0.0.1:") || r.name.starts_with("[::1]:");
+    const bool is_expected_listener =
+        is_inet && r.proto == "TCP" && r.state == "LISTEN" &&
+        r.name.find("->") == std::string::npos && is_loopback &&
+        MatchesExactPort(r.name, port_);
+    EXPECT_TRUE(is_expected_listener)
+        << "studio_review holds disallowed socket: type=" << r.type
+        << " proto=" << r.proto << " state=" << r.state << " name=" << r.name;
+    if (is_expected_listener) ++loopback_listeners;
   }
-  EXPECT_TRUE(saw_loopback_listener)
-      << "loopback TCP listener " << want_listen << " not found in:\n"
+  EXPECT_EQ(loopback_listeners, 1)
+      << "expected exactly 1 loopback TCP LISTEN socket on port " << port_
+      << " in:\n"
       << output;
 #endif
 }
@@ -559,10 +669,17 @@ TEST(HttpListen, RefusesAPortAnotherListenerHolds) {
   fclose(stream);
   if (listened) kill(child, SIGTERM);
   int status = 0;
-  waitpid(child, &status, 0);
+  while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+  }
   std::string messages;
   char buffer[4096];
-  for (ssize_t n; (n = read(err[0], buffer, sizeof buffer)) > 0;) {
+  for (;;) {
+    const ssize_t n = read(err[0], buffer, sizeof buffer);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (n == 0) break;
     messages.append(buffer, static_cast<std::size_t>(n));
   }
   close(err[0]);
