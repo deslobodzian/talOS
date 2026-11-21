@@ -17,33 +17,10 @@
 #include "talOS/bridge/merge.h"
 #include "talOS/bridge/node.h"
 #include "talOS/bridge/node_test_support.h"
-#include "talOS/process/process.h"
 
 namespace talos::hardware {
 namespace {
 using namespace bridge_test;  // NOLINT(google-build-using-namespace)
-
-// Runs the bridge's Run() on its own thread until Stop() or destruction,
-// which stop it as SIGTERM does (process::RequestStop) and join it. The
-// node's counters are read only once it has stopped.
-class RunningBridge {
- public:
-  explicit RunningBridge(HardwareNode& node)
-      : thread_{[&node] { node.Run(); }} {}
-  RunningBridge(const RunningBridge&) = delete;
-  RunningBridge& operator=(const RunningBridge&) = delete;
-  ~RunningBridge() { Stop(); }
-
-  void Stop() {
-    if (!thread_.joinable()) return;
-    process::RequestStop(0);
-    thread_.join();
-    process::stop_requested.store(false);
-  }
-
- private:
-  std::thread thread_;
-};
 
 // The host's scheduling noise over a test: the longest a 1 ms sleep of an
 // ordinary thread overran, for a timed test to read before it judges

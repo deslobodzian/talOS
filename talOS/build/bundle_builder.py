@@ -227,6 +227,21 @@ def parse_repo_mappings(paths):
     return by_canonical
 
 
+def parse_apparent_repos(entries, canonical_to_apparent=None):
+    """Merges `apparent=canonical` pairs (from `--apparent-repo`) into
+    `{canonical: [apparent, ...]}`."""
+    by_canonical = {} if canonical_to_apparent is None else canonical_to_apparent
+    for entry in entries:
+        apparent, sep, canonical = entry.partition("=")
+        if not sep or not apparent or not canonical:
+            sys.exit(f"bundle: invalid --apparent-repo value {entry!r}; "
+                     "expected apparent=canonical")
+        names = by_canonical.setdefault(canonical, [])
+        if apparent not in names:
+            names.append(apparent)
+    return by_canonical
+
+
 def node_targets(node, canonical_to_apparent=None):
     """Every label the robot config may name `node` by."""
     targets = []
@@ -238,14 +253,21 @@ def node_targets(node, canonical_to_apparent=None):
             repo, package = label.lstrip("@").split("//", 1)
             # The config uses an apparent repository name; node metadata uses
             # Bazel's canonical repository name. Preserve both spellings.
-            if canonical_to_apparent and repo in canonical_to_apparent:
+            if repo == "" or repo == "_main":
+                targets.append(f"//{package}")
+                if canonical_to_apparent and "_main" in canonical_to_apparent:
+                    for apparent in canonical_to_apparent["_main"]:
+                        targets.append(f"@{apparent}//{package}")
+            elif canonical_to_apparent and repo in canonical_to_apparent:
                 for apparent in canonical_to_apparent[repo]:
                     targets.append(f"@{apparent}//{package}")
-            elif repo == "_main":
-                targets.append(f"//{package}")
             else:
                 targets.append("@" + repo.split("+", 1)[0].split("~", 1)[0]
                                + "//" + package)
+        elif label.startswith("//") and canonical_to_apparent and "_main" in canonical_to_apparent:
+            package = label[2:]
+            for apparent in canonical_to_apparent["_main"]:
+                targets.append(f"@{apparent}//{package}")
     return list(dict.fromkeys(targets))
 
 
@@ -338,6 +360,8 @@ def main():
                         help="Bazel's stable status file, in a --stamp build")
     parser.add_argument("--repo-mapping", action="append", default=[],
                         help="Bazel `_repo_mapping` manifest (may repeat)")
+    parser.add_argument("--apparent-repo", action="append", default=[],
+                        help="Caller apparent=canonical repo mapping (may repeat)")
     args = parser.parse_args()
 
     with open(args.spec, "r") as f:
@@ -345,6 +369,7 @@ def main():
     with open(args.resolved, "r") as f:
         resolved = json.load(f)
     canonical_to_apparent = parse_repo_mappings(args.repo_mapping)
+    parse_apparent_repos(args.apparent_repo, canonical_to_apparent)
     check_nodes(spec, resolved, canonical_to_apparent)
     check_studio(spec, resolved, canonical_to_apparent)
 

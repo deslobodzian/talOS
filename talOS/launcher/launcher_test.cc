@@ -1705,92 +1705,6 @@ TEST(LauncherGraphTest, AnOptOutTheProbeDidNotDescribeIsAnEndpointMismatch) {
   EXPECT_EQ(EndpointMismatch({opted_out}, {opted_out}), "");
 }
 
-// REQ-SAFE-42: a node calling AllowUntargetedOutputs marks its hardware request
-// endpoint with kSourceFlagUntargetedOutputs in its live registry row, which
-// RegistryReader surfaces on `/hw/request/<node>` (while a targeted actuator
-// node's row carries only kSourceFlagHardwareRequest).
-TEST(LauncherGraphTest, LiveRegistryRowCarriesUntargetedOutputsOnHardwareReq) {
-  const std::string path = "/talos_reg_uout_" + std::to_string(::getpid());
-  introspect::RegistryMapping::unlink(path);
-
-  const auto make_manifest = [](std::string topic) {
-    event::Manifest manifest;
-    event::Registration reg;
-    reg.id = 1;
-    reg.kind = event::SourceKind::SENDER;
-    reg.name = std::move(topic);
-    reg.message_bytes = 64;
-    reg.alignment = 8;
-    manifest.push_back(std::move(reg));
-    return manifest;
-  };
-
-  introspect::NodeRegistration opted_out_reg{
-      {.name = "alpha", .target = "//example/alpha:node", .session_id = 42},
-      path};
-  opted_out_reg.publish(
-      make_manifest("/hw/request/alpha"),
-      std::vector<introspect::EndpointAttribute>{
-          {"/hw/request/alpha",
-           introspect::naming::kSourceFlagHardwareRequest |
-               introspect::naming::kSourceFlagUntargetedOutputs}});
-
-  introspect::NodeRegistration targeted_reg{
-      {.name = "beta", .target = "//example/beta:node", .session_id = 42},
-      path};
-  targeted_reg.publish(make_manifest("/hw/request/beta"),
-                       std::vector<introspect::EndpointAttribute>{
-                           {"/hw/request/beta",
-                            introspect::naming::kSourceFlagHardwareRequest}});
-
-  const auto reader = introspect::RegistryReader::open(path);
-  ASSERT_TRUE(reader.has_value());
-  const auto nodes = reader->nodes();
-  const auto find_source =
-      [&](std::string_view node_name,
-          std::string_view topic) -> const introspect::SourceSnapshot* {
-    for (const auto& node : nodes) {
-      if (node.name != node_name) continue;
-      for (const auto& src : node.sources) {
-        if (src.name == topic) return &src;
-      }
-    }
-    return nullptr;
-  };
-
-  const auto* alpha_req = find_source("alpha", "/hw/request/alpha");
-  ASSERT_NE(alpha_req, nullptr);
-  EXPECT_NE(alpha_req->flags & introspect::naming::kSourceFlagHardwareRequest,
-            0u);
-  EXPECT_NE(alpha_req->flags & introspect::naming::kSourceFlagUntargetedOutputs,
-            0u);
-
-  const auto* beta_req = find_source("beta", "/hw/request/beta");
-  ASSERT_NE(beta_req, nullptr);
-  EXPECT_NE(beta_req->flags & introspect::naming::kSourceFlagHardwareRequest,
-            0u);
-  EXPECT_EQ(beta_req->flags & introspect::naming::kSourceFlagUntargetedOutputs,
-            0u);
-
-  // Confirm the live row's flags participate in endpoint comparison as
-  // Launcher::CheckEndpoints converts them.
-  introspect::naming::SourceShape live_alpha{alpha_req->kind, alpha_req->name,
-                                             alpha_req->message_bytes,
-                                             alpha_req->flags};
-  live_alpha.alignment = alpha_req->alignment;
-  auto described_targeted = Sender("/hw/request/alpha", 64);
-  described_targeted.flags = introspect::naming::kSourceFlagHardwareRequest;
-  auto described_opted_out = described_targeted;
-  described_opted_out.flags |= introspect::naming::kSourceFlagUntargetedOutputs;
-  EXPECT_EQ(EndpointMismatch({described_opted_out}, {live_alpha}), "");
-  const std::string mismatch =
-      EndpointMismatch({described_targeted}, {live_alpha});
-  EXPECT_NE(mismatch.find("/hw/request/alpha"), std::string::npos) << mismatch;
-  EXPECT_NE(mismatch.find("untargeted_outputs"), std::string::npos) << mismatch;
-
-  introspect::RegistryMapping::unlink(path);
-}
-
 // SPEC-10 / REQ-SAFE-42, REQ-CONTRACT-11: the launcher passes
 // --targeted-outputs ONLY when the member's --describe probe answered,
 // --allow-graph-errors is not set, and the probe declared a hardware_request
@@ -2334,14 +2248,35 @@ TEST(LauncherGraphTest,
 }
 
 // REQ-SAFE-28: full Launcher::Run() refuses to launch (exits non-zero, writes
-// no manifest, spawns nothing) when a critical = false subsystem owns a motor,
-// digital output, or PWM output, or describes a target-lane sender.
+// no manifest, spawns nothing after --describe) when a critical = false
+// subsystem owns a motor, digital output, or PWM output, or describes a
+// target-lane sender.
 TEST(LauncherGraphTest, NonCriticalActuatorOrTargetProducerRefusesLaunch) {
+  const auto check_only_described = [](const std::string& record) {
+    std::istringstream in{ReadFile(record)};
+    std::string line;
+    bool saw_any = false;
+    while (std::getline(in, line)) {
+      if (line.empty()) continue;
+      saw_any = true;
+      EXPECT_NE(line.find("--describe"), std::string::npos)
+          << "node was spawned after --describe: " << line;
+    }
+    EXPECT_TRUE(saw_any) << "expected --describe invocations";
+  };
+
   for (const auto* section : {"motors", "digital_outputs", "pwm_outputs"}) {
     SCOPED_TRACE(section);
+    const std::string record =
+        TempPath(std::string{"optional_actuator_"} + section + "_runs");
+    ::remove(record.c_str());
     GraphFixture fixture{"optional_actuator_run",
-                         DescribingStub("alpha", "//example/alpha:node", {}),
-                         DescribingStub("beta", "//example/beta:node", {})};
+                         RecordingStub("alpha", "//example/alpha:node", record),
+                         RecordingStub("beta", "//example/beta:node", record)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode(std::string{"optional_actuator_"} + section + "_hw",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", record));
     auto config = toml::parse_file(fixture.options.config_path);
     auto* alpha = config["subsystems"]["alpha"].as_table();
     alpha->erase("motors");
@@ -2357,18 +2292,29 @@ TEST(LauncherGraphTest, NonCriticalActuatorOrTargetProducerRefusesLaunch) {
 
     EXPECT_EQ(Launcher{fixture.options}.Run(), 1) << section;
     EXPECT_FALSE(fixture.has_manifest()) << section;
-    EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),
-              std::string::npos)
-        << fixture.graph_json();
+    const std::string graph = fixture.graph_json();
+    const std::size_t err_pos = graph.find("\"severity\": \"error\"");
+    ASSERT_NE(err_pos, std::string::npos) << graph;
+    const std::string diag = graph.substr(err_pos);
+    EXPECT_NE(diag.find("alpha"), std::string::npos) << diag;
+    EXPECT_NE(diag.find("critical"), std::string::npos) << diag;
+    check_only_described(record);
+    ::remove(record.c_str());
   }
 
   {
     SCOPED_TRACE("non_critical_target_producer");
+    const std::string record = TempPath("optional_target_runs");
+    ::remove(record.c_str());
     GraphFixture fixture{"optional_target_run",
-                         DescribingStub("alpha", "//example/alpha:node",
-                                        {Sender("/beta/target/teleop")}),
-                         DescribingStub("beta", "//example/beta:node",
-                                        {Watcher("/beta/target/teleop")})};
+                         RecordingStub("alpha", "//example/alpha:node", record,
+                                       {Sender("/beta/target/teleop")}),
+                         RecordingStub("beta", "//example/beta:node", record,
+                                       {Watcher("/beta/target/teleop")})};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("optional_target_hw",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", record));
     auto config = toml::parse_file(fixture.options.config_path);
     auto* alpha = config["subsystems"]["alpha"].as_table();
     alpha->erase("motors");
@@ -2381,9 +2327,14 @@ TEST(LauncherGraphTest, NonCriticalActuatorOrTargetProducerRefusesLaunch) {
 
     EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
     EXPECT_FALSE(fixture.has_manifest());
-    EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),
-              std::string::npos)
-        << fixture.graph_json();
+    const std::string graph = fixture.graph_json();
+    const std::size_t err_pos = graph.find("\"severity\": \"error\"");
+    ASSERT_NE(err_pos, std::string::npos) << graph;
+    const std::string diag = graph.substr(err_pos);
+    EXPECT_NE(diag.find("alpha"), std::string::npos) << diag;
+    EXPECT_NE(diag.find("critical"), std::string::npos) << diag;
+    check_only_described(record);
+    ::remove(record.c_str());
   }
 }
 
@@ -2812,6 +2763,10 @@ TEST(LauncherBundleTest, RepoMappingResolvesCustomApparentAndCanonicalNames) {
             "bazel-bin/external/plain_canon/pkg/node");
   EXPECT_EQ(ResolveBinary("@robot//gate:node", empty_overrides, mapping),
             "bazel-bin/gate/node");
+  EXPECT_EQ(ResolveBinary("@@//gate:node", empty_overrides, mapping),
+            "bazel-bin/gate/node");
+  EXPECT_EQ(ResolveBinary("@@_main//gate:node", empty_overrides, mapping),
+            "bazel-bin/gate/node");
 
   // NormalizeTargetKey aligns apparent and canonical spellings via the mapping
   // even when repo_name != module_name, without colliding unrelated repos.
@@ -2822,6 +2777,8 @@ TEST(LauncherBundleTest, RepoMappingResolvesCustomApparentAndCanonicalNames) {
   EXPECT_NE(NormalizeTargetKey("@talos//talOS/teleop:node", mapping),
             NormalizeTargetKey("@@talos+//talOS/teleop:node", mapping));
   EXPECT_EQ(NormalizeTargetKey("@robot//gate:node", mapping), "//gate:node");
+  EXPECT_EQ(NormalizeTargetKey("@@//gate:node", mapping), "//gate:node");
+  EXPECT_EQ(NormalizeTargetKey("@@_main//gate:node", mapping), "//gate:node");
 
   std::map<std::string, std::string> overrides;
   overrides["@@talos+//talOS/teleop:node"] = "/bundle/bin/teleop";

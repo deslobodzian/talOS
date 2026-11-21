@@ -219,17 +219,18 @@ std::string NormalizeTargetKey(std::string_view target,
   if (slashes == std::string_view::npos) return std::string{target};
   const std::string_view repo = rest.substr(0, slashes);
   const std::string_view path = rest.substr(slashes + 2);
-  if (repo.empty() || repo.find_first_of("@/:") != std::string_view::npos) {
+  if (repo.find_first_of("@/:") != std::string_view::npos) {
     return std::string{target};
   }
   if (!canonical) {
+    if (repo.empty()) return std::string{target};
     if (const auto it = repo_mapping.find(std::string{repo});
         it != repo_mapping.end()) {
       if (it->second == "_main") return "//" + std::string{path};
       return it->second + "//" + std::string{path};
     }
   } else {
-    if (repo == "_main") return "//" + std::string{path};
+    if (repo.empty() || repo == "_main") return "//" + std::string{path};
     for (const auto& [apparent, mapped] : repo_mapping) {
       if (mapped == repo) {
         return std::string{repo} + "//" + std::string{path};
@@ -267,7 +268,7 @@ std::string ResolveBinary(const std::string& target_or_path,
                                   ? std::string::npos
                                   : target_or_path.find(':', slashes + 2);
     if (slashes == std::string::npos || colon == std::string::npos ||
-        slashes == repo_start) {
+        (!canonical && slashes == repo_start)) {
       return target_or_path;
     }
     std::string repo = target_or_path.substr(repo_start, slashes - repo_start);
@@ -286,7 +287,7 @@ std::string ResolveBinary(const std::string& target_or_path,
     } else {
       std::replace(subpath.begin(), subpath.end(), ':', '/');
     }
-    if (repo == "_main") return "bazel-bin/" + subpath;
+    if (repo.empty() || repo == "_main") return "bazel-bin/" + subpath;
     return "bazel-bin/external/" + repo + "/" + subpath;
   }
   if (!target_or_path.starts_with("//")) return target_or_path;
@@ -304,10 +305,13 @@ std::string ResolveBinary(const std::string& target_or_path,
   return ResolveBinary(target_or_path, overrides, LoadRepoMapping());
 }
 
-NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
-                      const LauncherOptions& options, bool studio_bridge) {
-  const RepoMapping repo_mapping =
-      options.repo_mapping ? *options.repo_mapping : LoadRepoMapping();
+namespace {
+
+NodeSpec MakeNodeSpecWithMapping(std::string_view name,
+                                 const std::string& target,
+                                 const LauncherOptions& options,
+                                 const RepoMapping& repo_mapping,
+                                 bool studio_bridge = false) {
   NodeSpec spec{std::string{name}, target,
                 ResolveBinary(target, options.binary_overrides, repo_mapping)};
   spec.studio_bridge = studio_bridge;
@@ -319,18 +323,30 @@ NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
   return spec;
 }
 
+}  // namespace
+
+NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
+                      const LauncherOptions& options, bool studio_bridge) {
+  const RepoMapping repo_mapping =
+      options.repo_mapping ? *options.repo_mapping : LoadRepoMapping();
+  return MakeNodeSpecWithMapping(name, target, options, repo_mapping,
+                                 studio_bridge);
+}
+
 std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
                                     const LauncherOptions& options) {
+  const RepoMapping repo_mapping =
+      options.repo_mapping ? *options.repo_mapping : LoadRepoMapping();
   std::vector<NodeSpec> specs;
   const auto robot_string = [&](std::string_view key) {
     return robot_config.toml_data["robot"][key].value<std::string>();
   };
 
   // 1. The hardware bridge.
-  specs.push_back(MakeNodeSpec(
+  specs.push_back(MakeNodeSpecWithMapping(
       kHardwareNodeName,
       robot_string("hardware_node").value_or("//talOS/bridge:hardware_node"),
-      options));
+      options, repo_mapping));
   specs.back().extra_args = ControllerArgs(robot_config, options);
 
   // 2. Subsystems.
@@ -339,7 +355,8 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
     for (auto&& [key, value] : *subsystems) {
       if (const auto* table = value.as_table()) {
         if (auto node = (*table)["node"].value<std::string>()) {
-          auto spec = MakeNodeSpec(key.str(), *node, options);
+          auto spec =
+              MakeNodeSpecWithMapping(key.str(), *node, options, repo_mapping);
           spec.critical = (*table)["critical"].value_or(true);
           if (const auto* devices =
                   robot_config.GetDevices(std::string{key.str()})) {
@@ -355,7 +372,8 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
   // that is belongs to the robot config, not to the framework.
   if (options.start_sim_gateway && options.simulation) {
     if (auto gateway = robot_string("sim_gateway")) {
-      specs.push_back(MakeNodeSpec(kSimGatewayName, *gateway, options));
+      specs.push_back(MakeNodeSpecWithMapping(kSimGatewayName, *gateway,
+                                              options, repo_mapping));
       specs.back().sim_gateway = true;
       specs.back().extra_args = SimulatorArgs(robot_config, options);
     }
@@ -365,8 +383,9 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
   // deployed robot is viewable too (an observer: see StudioBridge). A bundle
   // without Studio has none; probing a binary it lacks would fail the graph.
   if (options.start_studio_bridge && !BundleWithoutStudio(options)) {
-    specs.push_back(MakeNodeSpec(kStudioBridgeName, robot_config.studio.bridge,
-                                 options, /*studio_bridge=*/true));
+    specs.push_back(MakeNodeSpecWithMapping(
+        kStudioBridgeName, robot_config.studio.bridge, options, repo_mapping,
+        /*studio_bridge=*/true));
   }
   return specs;
 }

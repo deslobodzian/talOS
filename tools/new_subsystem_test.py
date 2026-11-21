@@ -1408,18 +1408,24 @@ class NewSubsystemTest(unittest.TestCase):
                     self.assertEqual(new_subsystem.talos_module(""),
                                      f"@{apparent}")
 
-        with tempfile.TemporaryDirectory() as ws:
-            with open(os.path.join(ws, "MODULE.bazel"), "w",
-                      encoding="utf-8") as f:
-                f.write('module(name = "bot")\n'
-                        'bazel_dep(name = "talos", version = "0.1.0", '
-                        'repo_name = "custom_talos")\n')
-            with mock.patch.object(new_subsystem.sync_manifest,
-                                   "current_repository",
-                                   return_value="talos+"), \
-                    mock.patch.dict(os.environ,
-                                    {"BUILD_WORKSPACE_DIRECTORY": ws}):
-                self.assertEqual(new_subsystem.talos_module(), "@custom_talos")
+        for module_text, expected in (
+                ('module(name = "bot")\n'
+                 'bazel_dep(name = "talos", version = "0.1.0", '
+                 'repo_name = "custom_talos")\n', "@custom_talos"),
+                ('module(name = "bot")\n'
+                 'bazel_dep("talos", repo_name = "pos_talos")\n',
+                 "@pos_talos")):
+            with self.subTest(expected=expected), \
+                    tempfile.TemporaryDirectory() as ws:
+                with open(os.path.join(ws, "MODULE.bazel"), "w",
+                          encoding="utf-8") as f:
+                    f.write(module_text)
+                with mock.patch.object(new_subsystem.sync_manifest,
+                                       "current_repository",
+                                       return_value="talos+"), \
+                        mock.patch.dict(os.environ,
+                                        {"BUILD_WORKSPACE_DIRECTORY": ws}):
+                    self.assertEqual(new_subsystem.talos_module(), expected)
 
         # BUILD templates substitute @TALOS@ directly and sort deps with
         # string_list() (no TALOS_LABEL regex post-rewrite).

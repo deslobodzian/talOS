@@ -951,5 +951,68 @@ TEST(Binary, TargetedOutputsRefusesAllowUntargetedOutputsAtConstruction) {
   std::filesystem::remove(log);
 }
 
+// A real running Node's live registry row carries kSourceFlagUntargetedOutputs
+// on `/hw/request/<node>` iff AllowUntargetedOutputs (mark_untargeted_outputs)
+// was called during construction, so the launcher's live endpoint check catches
+// an opt-out hidden from --describe.
+// REQ-SAFE-42
+TEST(Binary, LiveRegistryRowCarriesUntargetedOutputsIffAllowed) {
+  const std::string log = TempFile("live_untargeted_outputs.tlog");
+
+  const auto read_live_request_flags = []() -> std::optional<std::uint32_t> {
+    const auto reader = introspect::RegistryReader::open();
+    if (!reader) return std::nullopt;
+    std::uint64_t best_gen = 0;
+    std::optional<std::uint32_t> flags;
+    for (const auto& row : reader->nodes()) {
+      if (row.name != "test_node" ||
+          row.pid != static_cast<std::uint64_t>(::getpid()) || !row.alive ||
+          row.generation < best_gen) {
+        continue;
+      }
+      best_gen = row.generation;
+      flags.reset();
+      for (const auto& src : row.sources) {
+        if (src.name == "/hw/request/test_node") {
+          flags = src.flags;
+          break;
+        }
+      }
+    }
+    return flags;
+  };
+
+  for (const bool opt_out : {true, false}) {
+    SCOPED_TRACE(opt_out ? "with AllowUntargetedOutputs"
+                         : "without AllowUntargetedOutputs");
+    std::optional<std::uint32_t> observed_flags;
+    const CapturedRun run = RunInProcess(
+        "--sim --duration-s 5 --log '" + log + "' " + ConfigFlag(),
+        [opt_out, &observed_flags,
+         &read_live_request_flags](Node& node) -> detail::Instance {
+          detail::NodeAccess::add_hardware_request(
+              node, sizeof(Count), alignof(Count), schema::Of<Count>());
+          if (opt_out) detail::NodeAccess::mark_untargeted_outputs(node);
+          detail::NodeAccess::set_update(
+              node, [&observed_flags, &read_live_request_flags] {
+                observed_flags = read_live_request_flags();
+                process::stop_requested.store(true);
+              });
+          return std::make_shared<int>(0);
+        });
+    ASSERT_EQ(run.status, 0) << run.out << "\n" << run.err;
+    ASSERT_TRUE(observed_flags.has_value())
+        << "live registry row missing /hw/request/test_node";
+    EXPECT_NE(*observed_flags & introspect::naming::kSourceFlagHardwareRequest,
+              0u);
+    EXPECT_EQ((*observed_flags &
+               introspect::naming::kSourceFlagUntargetedOutputs) != 0u,
+              opt_out);
+    ::shm_unlink(ShmObjectName("/hw/request/test_node").c_str());
+  }
+
+  std::filesystem::remove(log);
+}
+
 }  // namespace
 }  // namespace talos

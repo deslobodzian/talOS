@@ -495,6 +495,7 @@ TEST(Supervision, HeartbeatingConstructorStillHasAFiniteDeadline) {
   const uint64_t session = options.session_id;
   testing::SupervisionPasses passes;
   bool observed_constructing = false;
+  bool alive_past_grace = false;
   std::jthread driver{[&](const std::stop_token& stop) {
     const testing::SteppedClock::ReleaseOnExit release{clock};
     const auto constructing_heartbeat = [&]() -> std::optional<int64_t> {
@@ -502,7 +503,8 @@ TEST(Supervision, HeartbeatingConstructorStillHasAFiniteDeadline) {
       if (!registry) return std::nullopt;
       for (const auto& node : registry->nodes()) {
         if (node.name == "alpha" && node.session_id == session &&
-            (node.flags & introspect::kFlagConstructing) != 0) {
+            (node.flags & introspect::kFlagConstructing) != 0 &&
+            ::kill(static_cast<pid_t>(node.pid), 0) == 0) {
           return node.heartbeat_monotonic_ns;
         }
       }
@@ -515,36 +517,51 @@ TEST(Supervision, HeartbeatingConstructorStillHasAFiniteDeadline) {
         return passes.Started() >= next;
       });
     };
-    int64_t first_beat = 0;
+    // Wait for alpha's constructing row AND a supervision pass at `start` so
+    // Supervise() has recorded `started_at_ == start` before advancing the
+    // clock.
+    if (!WaitFor(stop, [&] { return constructing_heartbeat().has_value(); }) ||
+        !observe_pass()) {
+      return;
+    }
+    // Hold inside the 2 s startup grace (1800 ms), then wait for the
+    // reporting thread's construction heartbeat to advance and observe a pass
+    // at 1800 ms so progress_changed_at_ == start + 1800 ms.
+    clock.HoldAt(start + 1800ms);
+    if (!observe_pass()) return;
+    const auto beat_at_1800 = constructing_heartbeat();
+    if (!beat_at_1800) return;
     if (!WaitFor(stop,
                  [&] {
                    const auto beat = constructing_heartbeat();
-                   if (!beat) return false;
-                   first_beat = *beat;
-                   return true;
+                   return beat && *beat > *beat_at_1800;
                  }) ||
         !observe_pass()) {
       return;
     }
-    // Wait for the reporting thread's construction heartbeat to advance, then
-    // step past the 2 s startup grace (still inside the 3 s construction
-    // deadline) so the constructing heartbeat keeps alpha alive past grace.
-    if (!WaitFor(stop, [&] {
-          const auto beat = constructing_heartbeat();
-          return beat && *beat > first_beat;
-        })) {
-      return;
-    }
     observed_constructing = true;
-    clock.HoldAt(start + 2500ms);
+    // Step across the 2 s grace in a < kMinHeartbeatTimeout (500 ms) increment
+    // (2200 ms - 1800 ms = 400 ms < 500 ms): the constructing heartbeat keeps
+    // alpha alive past grace without tripping stalled.
+    clock.HoldAt(start + 2200ms);
     if (!observe_pass()) return;
+    alive_past_grace = constructing_heartbeat().has_value();
+    // Step to the 3 s construction deadline: alpha is killed for
+    // construction_deadline, never stalled. Keep the clock held until the
+    // session exits so ReleaseOnExit cannot snap time back before the pass.
     clock.HoldAt(start + options.construction_timeout);
+    WaitFor(stop, [&] {
+      SupervisionWakeup::Wake();
+      return false;
+    });
   }};
   EXPECT_NE(RunSession(options), 0);
   driver.request_stop();
   driver.join();
   EXPECT_TRUE(observed_constructing)
       << "alpha never published a moving construction heartbeat";
+  EXPECT_TRUE(alive_past_grace)
+      << "alpha did not stay alive past startup grace";
   const auto manifest = ReadFile(options.output_dir + "/manifest.json");
   const auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
@@ -3009,7 +3026,8 @@ std::jthread PublishStubRow(const LauncherOptions& options,
 // REQ-SAFE-29, REQ-OPS-05
 TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
   auto options = BaseOptions("stalled_out", "max_restarts = 1\n");
-  options.heartbeat_startup_grace_ms = 0;
+  constexpr auto kGrace = 1000ms;
+  options.heartbeat_startup_grace_ms = static_cast<int>(kGrace.count());
   options.duration_s = kHangSeconds;
   testing::SteppedClock clock;
   const SupervisionTime start = clock.Freeze();
@@ -3032,6 +3050,8 @@ TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
         row.heartbeat_monotonic_ns.store(introspect::monotonic_now_ns());
       });
   const uint64_t session = options.session_id;
+  const std::string live =
+      options.output_dir + "/" + std::to_string(session) + "/manifest.json";
   testing::SupervisionPasses passes;
   bool stepped = false;
   std::jthread driver{[&](const std::stop_token& stop) {
@@ -3044,11 +3064,36 @@ TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
         })) {
       return;
     }
-    clock.HoldAt(start + kMinHeartbeatTimeout);
-    if (!WaitFor(stop, [&] { return ReadLines(runs).size() >= 2; })) return;
+    // Step run 0 past both startup grace and kMinHeartbeatTimeout so run 0 is
+    // killed as stalled and restarted cleanly; while the clock stays frozen at
+    // start + kGrace, run 1 and its peers exit cleanly without hitting any
+    // heartbeat timeout or starting a second restart.
+    clock.HoldAt(start + kGrace);
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          const std::string manifest = ReadFile(live);
+          const auto alpha_runs = ManifestRuns(manifest, "alpha");
+          if (alpha_runs.size() < 2) return false;
+          for (const char* name : {"hardware_node", "alpha", "beta"}) {
+            const auto member_runs = ManifestRuns(manifest, name);
+            if (member_runs.empty() ||
+                member_runs.back().find("\"reason\": \"running\"") !=
+                    std::string::npos) {
+              return false;
+            }
+          }
+          return true;
+        })) {
+      return;
+    }
     stepped = true;
-    // Past the 50 ms clean-exit backoff so RosterContinues ends the session.
-    clock.HoldAt(start + kMinHeartbeatTimeout + 100ms);
+    // Past every clean-exit backoff (100 ms for restart 2) so RosterContinues
+    // cancels every pending restart and ends the session at once.
+    clock.HoldAt(start + kGrace + 200ms);
+    WaitFor(stop, [&] {
+      SupervisionWakeup::Wake();
+      return false;
+    });
   }};
   EXPECT_EQ(RunSession(options), 0);
   driver.request_stop();
@@ -4222,7 +4267,7 @@ TEST(Supervision, StudioBridgeLivenessAloneWakesTheLoop) {
   options.duration_s = 3600;
   options.max_restarts = 0;
   options.heartbeat_periods = 1;
-  options.heartbeat_startup_grace_ms = 15000;
+  options.heartbeat_startup_grace_ms = 2000;
   options.construction_timeout = 1h;
   options.start_studio_bridge = true;
   UseHealthyRegisteringNodes(options, "bridge_liveness_wake");

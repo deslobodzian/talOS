@@ -725,6 +725,74 @@ class BundleBuilderTest(unittest.TestCase):
                     [studio_canon, f"@{apparent}//studio/bridge:studio_bridge"])
 
     # REQ-DEV-30
+    def test_apparent_repo_maps_external_targets_without_main_repo_mapping_rows(self):
+        # When 100% of a bundle's targets live in an external repo (`@my_talos`),
+        # their `repo_mapping_manifest` files carry no `source == ""` main-repo
+        # rows. The `talos_bundle` macro extracts `apparent=canonical` pairs in
+        # the caller's repo context and passes `--apparent-repo`, so `check_nodes`,
+        # `check_studio`, and `bundle_manifest.toml` still resolve `@my_talos`.
+        for canonical, apparent in (("talos+", "my_talos"),
+                                    ("talos~", "my_talos7")):
+            with self.subTest(canonical=canonical, apparent=apparent), \
+                    tempfile.TemporaryDirectory() as tmp:
+                # External-repo manifest only: zero `source == ""` rows.
+                repo_mapping = os.path.join(tmp, "_repo_mapping")
+                put(repo_mapping,
+                    f"{canonical},rules_cc,rules_cc+\n"
+                    f"{canonical},rules_python,rules_python+\n")
+                bridge = os.path.join(tmp, "src", "studio_bridge")
+                put(bridge, "")
+                webroot = os.path.join(tmp, "src", "dist")
+                put(os.path.join(webroot, "index.html"), "<html>")
+                put(os.path.join(webroot, "drive.html"), "<html>")
+                hw_canon = f"@@{canonical}//talOS/bridge:hardware_node"
+                teleop_canon = f"@@{canonical}//talOS/teleop:node"
+                studio_canon = f"@@{canonical}//studio/bridge:studio_bridge"
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"},
+                    [node(tmp, "hardware_node", hw_canon),
+                     node(tmp, "teleop", teleop_canon)],
+                    [f"@{apparent}//talOS/teleop:node"],
+                    robot={"hardware_node":
+                           f"@{apparent}//talOS/bridge:hardware_node"},
+                    extra=("--repo-mapping", repo_mapping,
+                           "--apparent-repo", f"{apparent}={canonical}"),
+                    studio={"bridge_path": bridge,
+                            "bridge_label": studio_canon,
+                            "webroot_path": webroot},
+                    effective={"studio": {
+                        "bridge":
+                        f"@{apparent}//studio/bridge:studio_bridge"}})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                with open(os.path.join(tmp, "out", "bundle_manifest.toml"),
+                          "rb") as f:
+                    manifest = tomllib.load(f)
+                by_name = {n["name"]: n["targets"] for n in manifest["nodes"]}
+                self.assertEqual(
+                    by_name["hardware_node"],
+                    [hw_canon, f"@{apparent}//talOS/bridge:hardware_node"])
+                self.assertEqual(
+                    by_name["teleop"],
+                    [teleop_canon, f"@{apparent}//talOS/teleop:node"])
+                self.assertEqual(
+                    manifest["studio"]["targets"],
+                    [studio_canon, f"@{apparent}//studio/bridge:studio_bridge"])
+
+        # Canonical main-repo `@@//pkg:node` normalizes to `//pkg:node` cleanly.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE),
+                 node(tmp, "arm", "@@//arm:node")],
+                ["//arm:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(os.path.join(tmp, "out", "bundle_manifest.toml"),
+                      "rb") as f:
+                manifest = tomllib.load(f)
+            by_name = {n["name"]: n["targets"] for n in manifest["nodes"]}
+            self.assertEqual(by_name["arm"], ["@@//arm:node", "//arm:node"])
+
+    # REQ-DEV-30
     def test_launcher_runner_derives_main_repo_without_hardcoding_main(self):
         runner_path = runfiles.Create().Rlocation(
             "_main/talOS/build/launcher_runner.py")
@@ -737,23 +805,43 @@ class BundleBuilderTest(unittest.TestCase):
             put(os.path.join(root, "_repo_mapping"),
                 ",my_robot,custom_main\n"
                 ",my_talos,talos+\n"
-                "talos+,rules_cc,rules_cc+\n")
+                "+_repo_rules+toml,talos,_main\n"
+                "talos+,rules_cc,rules_cc+\n"
+                "talos+,transitive_plain,transitive_plain\n")
             put(os.path.join(root, "custom_main", "robot.toml"), "[robot]\n")
             launcher = os.path.join(
                 root, "talos+", "talOS", "launcher", "launcher")
             put(launcher, "")
             self.assertEqual(
+                runner.split_config("_main/robot.toml", root),
+                ("_main", "robot.toml"))
+            self.assertEqual(
                 runner.split_config("custom_main/robot.toml", root),
                 ("custom_main", "robot.toml"))
-            with self.assertRaises(SystemExit) as caught:
-                runner.split_config("talos+/bench/robot.toml", root)
-            self.assertIn("not in the main repository", str(caught.exception))
+            for bad in ("talos+/bench/robot.toml",
+                        "rules_cc+/bench/robot.toml",
+                        "legacy~dep/bench/robot.toml",
+                        "transitive_plain/bench/robot.toml"):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(SystemExit) as caught:
+                        runner.split_config(bad, root)
+                    self.assertIn("not in the main repository",
+                                  str(caught.exception))
             old_rf = os.environ.get("RUNFILES_DIR")
             os.environ["RUNFILES_DIR"] = root
             try:
                 work_dir, config, env = runner.workspace(
                     os.path.join(tmp, "work"), launcher,
                     "custom_main/robot.toml")
+                # Guard against runfiles.Create() returning None.
+                orig_create = runner.runfiles.Create
+                runner.runfiles.Create = lambda: None
+                try:
+                    work_dir2, config2, env2 = runner.workspace(
+                        os.path.join(tmp, "work2"), launcher,
+                        "custom_main/robot.toml")
+                finally:
+                    runner.runfiles.Create = orig_create
             finally:
                 if old_rf is None:
                     os.environ.pop("RUNFILES_DIR", None)
@@ -764,6 +852,9 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(work_dir, "robot.toml")))
             self.assertTrue(os.path.isdir(
                 os.path.join(work_dir, "bazel-bin", "external", "talos+")))
+            self.assertEqual(config2, "robot.toml")
+            self.assertEqual(env2["RUNFILES_DIR"], root)
+            self.assertTrue(os.path.isfile(os.path.join(work_dir2, "robot.toml")))
 
 
 class DeployTest(unittest.TestCase):

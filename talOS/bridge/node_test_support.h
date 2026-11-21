@@ -19,6 +19,7 @@
 
 #include "talOS/bridge/node.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/process/process.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware::bridge_test {
@@ -317,5 +318,27 @@ inline Command IntakeRequest(const config::RobotConfig& cfg, double demand) {
                        demand, 0.0};
   return request;
 }
+
+// Runs the bridge's Run() on its own thread until Stop() or destruction,
+// which stop it as SIGTERM does (process::RequestStop) and join it. The
+// node's counters are read only once it has stopped.
+class RunningBridge {
+ public:
+  explicit RunningBridge(HardwareNode& node)
+      : thread_{[&node] { node.Run(); }} {}
+  RunningBridge(const RunningBridge&) = delete;
+  RunningBridge& operator=(const RunningBridge&) = delete;
+  ~RunningBridge() { Stop(); }
+
+  void Stop() {
+    if (!thread_.joinable()) return;
+    process::RequestStop(0);
+    thread_.join();
+    process::stop_requested.store(false);
+  }
+
+ private:
+  std::thread thread_;
+};
 
 }  // namespace talos::hardware::bridge_test

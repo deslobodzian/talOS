@@ -958,6 +958,13 @@ def _talos_bundle_impl(ctx):
             direct_inputs.append(rm)
             arguments += ["--repo-mapping", rm.path]
 
+    # Also pass apparent -> canonical repo pairs extracted in the caller's
+    # repository context by the talos_bundle macro: when every target in the
+    # bundle lives in an external repo (e.g. @my_talos), none of their
+    # repo_mapping_manifests carry `source == ""` rows.
+    for apparent, canonical in sorted(ctx.attr.apparent_repos.items()):
+        arguments += ["--apparent-repo", "%s=%s" % (apparent, canonical)]
+
     # The source revision only under --stamp (--config=release): the status
     # file changes with every commit, so an unstamped bundle never reads it
     # and stays cached.
@@ -1078,6 +1085,10 @@ _talos_bundle = rule(
             doc = "The built Studio site, one directory holding index.html, that " +
                   "the bundled bridge serves. Set with studio_bridge.",
         ),
+        "apparent_repos": attr.string_dict(
+            default = {},
+            doc = "Apparent-to-canonical repo names extracted in the caller's repository context.",
+        ),
         "_builder": attr.label(
             default = Label("//talOS/build:bundle_builder"),
             executable = True,
@@ -1095,6 +1106,26 @@ _talos_bundle = rule(
         ),
     }, **STAMP_ATTRS),
 )
+
+def _extract_apparent_repos(targets):
+    """Maps apparent repo names seen in caller target strings to canonical names."""
+    mapping = {}
+    for item in targets:
+        if not item or type(item) != "string":
+            continue
+        if not item.startswith("@") or item.startswith("@@"):
+            continue
+        if "//" in item:
+            apparent = item[1:].split("//", 1)[0]
+        elif ":" not in item:
+            apparent = item[1:]
+        else:
+            continue
+        if not apparent or apparent in mapping:
+            continue
+        canonical = native.package_relative_label(item).repo_name
+        mapping[apparent] = canonical if canonical else "_main"
+    return mapping
 
 def talos_bundle(name, config, **kwargs):
     """Assembles a deployable bundle of exactly the nodes `config` launches.
@@ -1122,7 +1153,20 @@ def talos_bundle(name, config, **kwargs):
     manifest = config_label.same_package_label(
         config_label.name.removesuffix(".toml") + "_manifest.bzl",
     )
-    _talos_bundle(name = name, config = config, manifest = manifest, **kwargs)
+    caller_targets = list(kwargs.get("nodes", []))
+    for key in ("hardware_node", "studio_bridge", "launcher"):
+        if kwargs.get(key):
+            caller_targets.append(kwargs[key])
+    apparent_repos = _extract_apparent_repos(caller_targets)
+    if "apparent_repos" in kwargs:
+        apparent_repos.update(kwargs.pop("apparent_repos"))
+    _talos_bundle(
+        name = name,
+        config = config,
+        manifest = manifest,
+        apparent_repos = apparent_repos,
+        **kwargs
+    )
 
 # The launcher and the runner that starts it from a runfiles tree
 # (launcher_runner.py), shared by talos_graph_test and talos_sim.
