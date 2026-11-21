@@ -220,6 +220,23 @@ class SuperstructureTest(unittest.TestCase):
         self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
         self.assertEqual(self.roller().mode, NEUTRAL)
 
+    # REQ-SAFE-46
+    def test_disconnected_beam_break_clears_sensor_connected(self):
+        enable_teleop(self.sim, self.hw)
+        self.hold(Command.INTAKE, 0.1)
+        self.assertTrue(self.intake_status().sensor_connected)
+        self.assertEqual(self.roller()[:2], (VOLTAGE, INTAKE_VOLTS))
+
+        self.hw.set_connected("intake", "beam_break", False)
+        self.hold(Command.INTAKE, 0.1)
+        self.assertFalse(self.intake_status().sensor_connected)
+        self.assertEqual(self.roller().mode, NEUTRAL)
+
+        self.hw.set_connected("intake", "beam_break", True)
+        self.hold(Command.INTAKE, 0.1)
+        self.assertTrue(self.intake_status().sensor_connected)
+        self.assertEqual(self.roller()[:2], (VOLTAGE, INTAKE_VOLTS))
+
 
 if __name__ == "__main__":
     unittest.main()
