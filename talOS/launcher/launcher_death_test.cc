@@ -104,10 +104,25 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
+// Reads a file (including /proc/<pid>/stat) without throwing if the file or
+// process disappears mid-read (ENOENT or ESRCH on Linux).
 std::string ReadFile(const std::string& path) {
-  std::ifstream in{path};
-  return std::string((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return {};
+  std::string out;
+  char buf[512];
+  for (;;) {
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    if (n > 0) {
+      out.append(buf, static_cast<std::size_t>(n));
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0) out.clear();
+    break;
+  }
+  ::close(fd);
+  return out;
 }
 
 // Whether the registry's shared-memory name is namespaced, decided by the
@@ -156,14 +171,16 @@ std::string WriteStub(const std::string& member, bool ignore_termination) {
 std::vector<pid_t> GroupMembers(pid_t group) {
   std::vector<pid_t> members;
 #ifdef __linux__
-  for (const auto& entry : std::filesystem::directory_iterator{"/proc"}) {
-    const std::string name = entry.path().filename().string();
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it{"/proc", ec}, end;
+       !ec && it != end; it.increment(ec)) {
+    const std::string name = it->path().filename().string();
     if (name.empty() || !std::all_of(name.begin(), name.end(), [](char c) {
           return c >= '0' && c <= '9';
         }))
       continue;
     // "pid (comm) state ppid pgrp ...": comm may hold spaces and parentheses.
-    const std::string stat = ReadFile(entry.path().string() + "/stat");
+    const std::string stat = ReadFile(it->path().string() + "/stat");
     const std::size_t close = stat.rfind(')');
     if (close == std::string::npos) continue;
     std::istringstream fields{stat.substr(close + 1)};
