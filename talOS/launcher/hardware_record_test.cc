@@ -3,9 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -17,6 +19,8 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
+#include "flatbuffers/reflection.h"
+#include "flatbuffers/reflection_generated.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
@@ -107,12 +111,66 @@ void WriteNodeLog(const std::string& path, std::uint64_t session_id) {
   ASSERT_FALSE(writer.failed()) << writer.error();
 }
 
+// Builds a synthetic verified reflection.Schema `.bfbs` for a struct named
+// `bridge.BridgeStatus` of `bytesize` bytes: either carrying an integer
+// `protocol_version_id` at `version_offset` (modified layout) or lacking the
+// field altogether (pre-field layout).
+std::string SyntheticBridgeStatusBfbs(bool with_protocol_version,
+                                      std::uint16_t version_offset,
+                                      std::int32_t bytesize) {
+  flatbuffers::FlatBufferBuilder builder;
+  const auto obj_name = builder.CreateString("bridge.BridgeStatus");
+  std::vector<flatbuffers::Offset<reflection::Field>> fields_vec;
+  {
+    const auto name = builder.CreateString("states_received_count");
+    reflection::TypeBuilder tb(builder);
+    tb.add_base_type(reflection::BaseType::ULong);
+    const auto type = tb.Finish();
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(name);
+    fb.add_type(type);
+    fb.add_id(0);
+    fb.add_offset(0);
+    fields_vec.push_back(fb.Finish());
+  }
+  if (with_protocol_version) {
+    const auto name = builder.CreateString("protocol_version_id");
+    reflection::TypeBuilder tb(builder);
+    tb.add_base_type(reflection::BaseType::UShort);
+    const auto type = tb.Finish();
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(name);
+    fb.add_type(type);
+    fb.add_id(1);
+    fb.add_offset(version_offset);
+    fields_vec.push_back(fb.Finish());
+  }
+  const auto fields = builder.CreateVectorOfSortedTables(&fields_vec);
+  reflection::ObjectBuilder ob(builder);
+  ob.add_name(obj_name);
+  ob.add_fields(fields);
+  ob.add_is_struct(true);
+  ob.add_bytesize(bytesize);
+  const auto obj = ob.Finish();
+  std::vector<flatbuffers::Offset<reflection::Object>> objects_vec{obj};
+  const auto objects = builder.CreateVectorOfSortedTables(&objects_vec);
+  const auto enums = builder.CreateVector(
+      std::vector<flatbuffers::Offset<reflection::Enum>>{});
+  reflection::SchemaBuilder sb(builder);
+  sb.add_objects(objects);
+  sb.add_enums(enums);
+  reflection::FinishSchemaBuffer(builder, sb.Finish());
+  return std::string{reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                     builder.GetSize()};
+}
+
 // The bridge's log at `path` of session `session_id`: a State, then, `late`
-// after it, two /hw/status SENDs whose protocol_version_id is `version`, the
-// topic registered as a BridgeStatus layout of `schema_hash`.
-void WriteBridgeLog(const std::string& path, std::uint64_t session_id,
-                    std::uint16_t version, std::uint64_t schema_hash,
-                    std::chrono::nanoseconds late) {
+// after it, two /hw/status SENDs carrying `status_payload` under
+// `status_source`.
+void WriteBridgeLogWithStatus(const std::string& path, std::uint64_t session_id,
+                              const talos::event::Registration& status_source,
+                              std::span<const std::byte> status_payload,
+                              std::chrono::nanoseconds late) {
   using Packet = talos::Descriptor<talos::hardware::Packet>;
   talos::event::Registration state;
   state.id = 0;
@@ -120,9 +178,6 @@ void WriteBridgeLog(const std::string& path, std::uint64_t session_id,
   state.name = std::string{talos::hardware::kStateTopic};
   state.message_bytes = sizeof(talos::hardware::Packet);
   state.schema = {std::string{Packet::kName}, Packet::kHash, {}};
-  talos::event::Registration status_source =
-      StatusSource(1, talos::event::SourceKind::SENDER);
-  status_source.schema.hash = schema_hash;
   talos::event::log::LogWriter writer{
       path, "hardware_node",
       talos::event::log::LogWriterOptions{1 << 14, 1, false}, session_id};
@@ -138,13 +193,26 @@ void WriteBridgeLog(const std::string& path, std::uint64_t session_id,
       ctx.event_time.nanos() + late.count());
   ctx.now = ctx.event_time;
   ctx.publish_time = ctx.event_time;
-  bridge::BridgeStatus status{};
-  status.mutate_protocol_version_id(version);
   for (const std::uint64_t sequence : {1, 2}) {
-    writer.send(ctx, 1, std::as_bytes(std::span{&status, 1}), 0, sequence);
+    writer.send(ctx, 1, status_payload, 0, sequence);
   }
   writer.flush();
   ASSERT_FALSE(writer.failed()) << writer.error();
+}
+
+// The bridge's log at `path` of session `session_id`: a State, then, `late`
+// after it, two /hw/status SENDs whose protocol_version_id is `version`, the
+// topic registered as a BridgeStatus layout of `schema_hash`.
+void WriteBridgeLog(const std::string& path, std::uint64_t session_id,
+                    std::uint16_t version, std::uint64_t schema_hash,
+                    std::chrono::nanoseconds late) {
+  talos::event::Registration status_source =
+      StatusSource(1, talos::event::SourceKind::SENDER);
+  status_source.schema.hash = schema_hash;
+  bridge::BridgeStatus status{};
+  status.mutate_protocol_version_id(version);
+  WriteBridgeLogWithStatus(path, session_id, status_source,
+                           std::as_bytes(std::span{&status, 1}), late);
 }
 
 // The members of one JSON object, raw value text by key, at its top level
@@ -555,13 +623,14 @@ TEST(HardwareProtocolCheck, ALogNamedAloneTakesItsSessionsManifest) {
 }
 
 // Guards: the manifest's version is used only when no log records a
-// /hw/status SEND of this build's BridgeStatus schema within its first
-// second: none at all, a node's copy, one from before protocol_version_id
-// (here another layout's schema hash, its bytes this build's version), or
-// one past the first second (the search is bounded); a bridge version other
-// than this build's refuses the session though the manifest's is this
-// build's; bridge runs of two versions in one session refuse it. A log named
-// alone is read with its session's bridge log. (A real bridge's log read
+// /hw/status SEND whose .bfbs schema carries an integer `protocol_version_id`
+// within its first second: none at all, a node's copy, one whose .bfbs lacks
+// `protocol_version_id`, or one past the first second (the search is bounded);
+// a modified-layout BridgeStatus .bfbs carrying `protocol_version_id` at a
+// different offset/size and schema hash IS read by field name; a bridge
+// version other than this build's refuses the session though the manifest's is
+// this build's; bridge runs of two versions in one session refuse it. A log
+// named alone is read with its session's bridge log. (A real bridge's log read
 // under its version over the manifest's: //talOS/bridge:node_test
 // ASessionIsReadUnderTheProtocolItsBridgeLogged.)
 // REQ-OPS-51
@@ -571,12 +640,14 @@ TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
   constexpr std::uint64_t kHash =
       talos::Descriptor<bridge::BridgeStatus>::kHash;
   using std::chrono::milliseconds;
+  enum class SchemaKind { kCurrent, kModifiedWithField, kWithoutField };
   struct Bridge {
     const char* file;
     std::uint16_t version;
     std::uint64_t schema_hash;
     // The status SENDs' time after the log's first record.
     milliseconds late{20};
+    SchemaKind schema_kind{SchemaKind::kCurrent};
   };
   struct Case {
     const char* label;
@@ -596,10 +667,19 @@ TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
        true,
        {kOther},
        true},
-      {"no /hw/status", kOther, {}, kOther, true, {}, false},
-      {"an old-schema /hw/status",
+      {"modified-layout BridgeStatus bfbs carrying protocol_version_id",
+       kBuild,
+       {{"hardware_node.tlog", kOther, kHash ^ 1, milliseconds{20},
+         SchemaKind::kModifiedWithField}},
        kOther,
-       {{"hardware_node.tlog", kBuild, kHash ^ 1}},
+       true,
+       {kOther},
+       true},
+      {"no /hw/status", kOther, {}, kOther, true, {}, false},
+      {"a BridgeStatus bfbs lacking protocol_version_id",
+       kOther,
+       {{"hardware_node.tlog", kBuild, kHash ^ 2, milliseconds{20},
+         SchemaKind::kWithoutField}},
        kOther,
        true,
        {},
@@ -631,8 +711,42 @@ TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
     std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
     WriteNodeLog(dir + "/drivetrain.tlog", 42);
     for (const auto& bridge : c.bridge) {
-      WriteBridgeLog(dir + "/" + bridge.file, 42, bridge.version,
-                     bridge.schema_hash, bridge.late);
+      const std::string log_path = dir + "/" + bridge.file;
+      if (bridge.schema_kind == SchemaKind::kCurrent) {
+        WriteBridgeLog(log_path, 42, bridge.version, bridge.schema_hash,
+                       bridge.late);
+      } else if (bridge.schema_kind == SchemaKind::kModifiedWithField) {
+        constexpr std::size_t kModifiedBytes = 16;
+        constexpr std::uint16_t kVersionOffset = 10;
+        talos::event::Registration status_source;
+        status_source.id = 1;
+        status_source.kind = talos::event::SourceKind::SENDER;
+        status_source.name = std::string{bridge::topics::kStatus};
+        status_source.message_bytes = kModifiedBytes;
+        status_source.schema = {
+            "bridge.BridgeStatus", bridge.schema_hash,
+            SyntheticBridgeStatusBfbs(/*with_protocol_version=*/true,
+                                      kVersionOffset, kModifiedBytes)};
+        std::array<std::byte, kModifiedBytes> payload{};
+        std::memcpy(payload.data() + kVersionOffset, &bridge.version,
+                    sizeof(bridge.version));
+        WriteBridgeLogWithStatus(log_path, 42, status_source, payload,
+                                 bridge.late);
+      } else {
+        constexpr std::size_t kOldBytes = 8;
+        talos::event::Registration status_source;
+        status_source.id = 1;
+        status_source.kind = talos::event::SourceKind::SENDER;
+        status_source.name = std::string{bridge::topics::kStatus};
+        status_source.message_bytes = kOldBytes;
+        status_source.schema = {
+            "bridge.BridgeStatus", bridge.schema_hash,
+            SyntheticBridgeStatusBfbs(/*with_protocol_version=*/false, 0,
+                                      kOldBytes)};
+        std::array<std::byte, kOldBytes> payload{};
+        WriteBridgeLogWithStatus(log_path, 42, status_source, payload,
+                                 bridge.late);
+      }
     }
     for (const auto& input : {dir, dir + "/drivetrain.tlog"}) {
       SCOPED_TRACE(input);

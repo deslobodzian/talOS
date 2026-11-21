@@ -25,6 +25,7 @@
 #include <tuple>
 #include <utility>
 
+#include "bridge/topics.h"
 #include "talOS/hardware/config.h"
 #include "talOS/launcher/console_line.h"
 #include "talOS/launcher/session.h"
@@ -602,9 +603,25 @@ std::vector<naming::Diagnostic> DescribeGraph(
       // subsystem can take (Launcher::Run refuses two members of one name),
       // so a replacement bridge binary that describes itself by another
       // name still owns `hw`.
+      auto sources = described.declared.sources;
+      if (spec.name == kHardwareNodeName) {
+        // The launcher opens `/hw/status` as an observer reader at runtime to
+        // check `protocol_version_id` against its own build, consuming one
+        // RTMS reader slot; account for it in LintGraph's MAX_READERS check
+        // without altering `out` (graph.json / EndpointMismatch).
+        for (const auto& source : described.declared.sources) {
+          if (source.kind == event::SourceKind::SENDER &&
+              source.name == ::bridge::topics::kStatus) {
+            naming::SourceShape observer = source;
+            observer.kind = event::SourceKind::FETCHER;
+            observer.flags = naming::kSourceFlagObserver;
+            sources.push_back(std::move(observer));
+            break;
+          }
+        }
+      }
       shapes.push_back({described.declared.name, described.declared.target,
-                        described.declared.sources,
-                        spec.name == kHardwareNodeName});
+                        std::move(sources), spec.name == kHardwareNodeName});
       if (described.declared.name != described.roster_name) {
         probe_findings.push_back(
             {naming::Severity::WARNING, described.roster_name,
