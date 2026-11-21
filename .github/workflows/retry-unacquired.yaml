@@ -1,0 +1,47 @@
+# Automatically reruns failed/cancelled jobs of Continuous Integration or
+# Nightly when every non-passing job (other than the `CI gate` aggregator)
+# failed before acquiring a hosted runner (0 steps, no runner, and the
+# check-run annotation reports "not acquired by Runner"; CI-11). Never retries
+# real build/test failures or user/concurrency cancellations, and caps retries
+# at run_attempt < 3.
+#
+# Checks out the default branch (never untrusted PR head code) because this
+# workflow holds actions: write to call `gh run rerun --failed`.
+name: Retry Unacquired Runner
+
+on:
+  workflow_run:
+    workflows:
+      - Continuous Integration
+      - Nightly
+    types:
+      - completed
+
+permissions:
+  contents: read
+  checks: read
+  actions: write
+
+jobs:
+  retry-unacquired:
+    name: Retry unacquired jobs
+    if: >-
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'cancelled') &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v7
+      - name: Inspect failed jobs and rerun if all were unacquired
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          python3 tools/retry_unacquired.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --run-id "$RUN_ID" \
+            --attempt "$RUN_ATTEMPT" \
+            --apply
