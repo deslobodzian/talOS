@@ -1605,7 +1605,7 @@ void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
   kill_reason = {};
   heartbeat_killed = false;
   endpoints_checked = false;
-  realtime_reported = false;
+  realtime_seen.reset();
   loop_started = false;
   protocol_checked = false;
   run_recorder_failed = false;
@@ -1733,15 +1733,21 @@ void Launcher::CheckBridgeProtocol(
 
 bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
                             uint32_t flags) const {
-  if (launch.realtime_reported) return false;
   const std::optional<process::RealtimeOutcome> outcome =
       introspect::RealtimeOf(flags);
   if (!outcome) return false;
-  launch.realtime_reported = true;
-  const std::string warning =
-      RealtimeWarning(proc.name, proc.pid, *outcome, options_.simulation);
+  if (launch.realtime_seen) {
+    const auto added = static_cast<std::uint8_t>(
+        outcome->refused & ~launch.realtime_seen->refused);
+    if (added == 0) return false;
+    launch.realtime_seen->refused |= added;
+  } else {
+    launch.realtime_seen = *outcome;
+  }
+  const std::string warning = RealtimeWarning(
+      proc.name, proc.pid, *launch.realtime_seen, options_.simulation);
   if (!warning.empty()) ConsoleLine(std::cerr) << warning;
-  return proc.RecordRealtime(*outcome);
+  return proc.RecordRealtime(*launch.realtime_seen);
 }
 
 bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -2045,8 +2051,10 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                                     launch.spawned_monotonic_ns, flags)) {
           proc.RecordDeliveryLoss(*loss);
           // A run that ended before a supervision pass saw its row's event
-          // log flags (one killed during a gap) is marked from them here.
+          // log flags (one killed during a gap) or late realtime refusal is
+          // marked from them here.
           NoteRecording(proc, launch, flags);
+          NoteRealtime(proc, launch, flags);
         }
       }
       proc.exited = true;

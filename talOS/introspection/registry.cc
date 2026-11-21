@@ -379,6 +379,20 @@ void NodeRegistration::set_realtime(const process::RealtimeOutcome& outcome) {
   record_->flags.fetch_or(RealtimeFlags(outcome), std::memory_order_release);
 }
 
+void NodeRegistration::note_realtime_refused(std::uint8_t steps) {
+  if (!owns_slot()) return;
+  const std::uint32_t masked =
+      static_cast<std::uint32_t>(steps & process::kAllSteps);
+  if (masked == 0) return;
+  const std::uint32_t current = record_->flags.load(std::memory_order_acquire);
+  const std::uint32_t rt_bits =
+      (current & kFlagRealtimeMask) >> kFlagRealtimeShift;
+  if ((rt_bits & 3u) == 0 || (rt_bits & 4u) == 0) return;
+  const std::uint32_t add = masked << (kFlagRealtimeShift + 3);
+  if ((current & add) == add) return;
+  record_->flags.fetch_or(add, std::memory_order_release);
+}
+
 void NodeRegistration::activate() {
   if (owns_slot()) {
     record_->flags.fetch_and(~kFlagConstructing, std::memory_order_release);

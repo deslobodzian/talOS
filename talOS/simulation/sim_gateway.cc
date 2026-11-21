@@ -27,6 +27,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/ipc/publisher.h"
+#include "talOS/memory/residency.h"
 #include "talOS/process/process.h"
 #include "talOS/simulation/ports.h"
 #include "talOS/simulation/schedules.h"
@@ -427,6 +428,9 @@ int main(int argc, char** argv) {
         if (physics) {
           registration->set_source(0, truth_samples, truth_dropped,
                                    truth_sequence, last_truth_ns, 0, 0);
+        }
+        if (talos::memory::LateLockRefused()) {
+          registration->note_realtime_refused(talos::process::kStepRingLock);
         }
         registration->end_sample();
       }

@@ -52,6 +52,7 @@
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
+#include "talOS/memory/residency.h"
 #include "talOS/protocol/types.h"
 #include "talOS/rtms/process_liveness.h"
 #include "talOS/rtms/rtms.h"
@@ -5112,6 +5113,180 @@ TEST(Supervision, ShutdownStopsHardwareNodeBeforeActuatorOwners) {
     std::filesystem::remove_all(options.output_dir);
     ::remove(ready.c_str());
   }
+}
+
+// RT-2 (software part): late ring mlock refusal exposed via
+// memory::LateLockRefused, recorded into a live registry row via
+// NodeRegistration::note_realtime_refused, and warned/merged by
+// Launcher::NoteRealtime (both after initial full and partial grants, and at
+// reap time via FinalDeliveryCounts) and NodeProcessInfo::RecordRealtime.
+// REQ-RT-01, REQ-OPS-18
+TEST(Supervision, LateRingLockRefusalWarnsAndMergesIntoManifest) {
+  // Part 1: residency seam + NodeRegistration::note_realtime_refused guards.
+  {
+    EXPECT_FALSE(talos::memory::LateLockRefused());
+    talos::memory::SetLateLockRefusedForTest(true);
+    EXPECT_TRUE(talos::memory::LateLockRefused());
+    talos::memory::SetLateLockRefusedForTest(false);
+    EXPECT_FALSE(talos::memory::LateLockRefused());
+
+    const std::string reg_path =
+        "/late_rt_test_" + std::to_string(::getpid()) + ".reg";
+    introspect::RegistryMapping::unlink(reg_path);
+    {
+      introspect::NodeRegistration reg{{.name = "alpha", .session_id = 1},
+                                       reg_path};
+      auto reader = introspect::RegistryReader::open(reg_path);
+      ASSERT_TRUE(reader.has_value());
+      // Before set_realtime: note_realtime_refused must be a no-op.
+      reg.note_realtime_refused(process::kStepRingLock);
+      EXPECT_EQ(reader->nodes().front().realtime(), std::nullopt);
+      // Requested=false: note_realtime_refused must be a no-op.
+      reg.set_realtime({.tier = process::LoopTier::kControl,
+                        .requested = false,
+                        .refused = 0});
+      reg.note_realtime_refused(process::kStepRingLock);
+      ASSERT_TRUE(reader->nodes().front().realtime().has_value());
+      EXPECT_EQ(reader->nodes().front().realtime()->refused, 0u);
+    }
+    introspect::RegistryMapping::unlink(reg_path);
+    {
+      introspect::NodeRegistration reg{{.name = "alpha", .session_id = 2},
+                                       reg_path};
+      auto reader = introspect::RegistryReader::open(reg_path);
+      ASSERT_TRUE(reader.has_value());
+      reg.set_realtime({.tier = process::LoopTier::kControl,
+                        .requested = true,
+                        .refused = process::kStepStackLock});
+      reg.note_realtime_refused(process::kStepRingLock);
+      const auto rt = reader->nodes().front().realtime();
+      ASSERT_TRUE(rt.has_value());
+      EXPECT_EQ(rt->grant(), process::RealtimeGrant::kPartial);
+      EXPECT_EQ(rt->refused, process::kStepStackLock | process::kStepRingLock);
+    }
+    introspect::RegistryMapping::unlink(reg_path);
+  }
+
+  // Part 2: live supervision + reap-time merge into manifest.json & talos.log.
+  auto options = BaseOptions("late_ring_mlock");
+  options.duration_s = kHangSeconds;
+  options.max_restarts = 0;
+  UseHealthyRegisteringNodes(options, "late_ring_mlock");
+
+  const std::string session_dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string live = session_dir + "/manifest.json";
+  const std::string talos_log = session_dir + "/talos.log";
+  const uint64_t session = options.session_id;
+
+  const auto set_member_flags = [&](std::string_view name, uint32_t bits) {
+    introspect::RegistryMapping mapping{introspect::kRegistryPath,
+                                        /*read_only=*/false};
+    for (auto& row : mapping.header()->nodes) {
+      if (row.state.load(std::memory_order_acquire) !=
+          static_cast<uint64_t>(introspect::SlotState::ACTIVE)) {
+        continue;
+      }
+      if (row.session_id == session &&
+          introspect::read_name(row.name, introspect::kMaxNameBytes) == name) {
+        row.flags.fetch_or(bits, std::memory_order_release);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  bool initial_seen = false;
+  bool late_seen = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    if (!WaitFor(stop, [&] {
+          return Registered("hardware_node", session) &&
+                 Registered("alpha", session) && Registered("beta", session);
+        })) {
+      ::kill(::getpid(), SIGTERM);
+      return;
+    }
+    // Initial grants: hardware_node = full, alpha = full, beta = partial
+    // (stack mlock).
+    set_member_flags("hardware_node", introspect::RealtimeFlags(
+                                          {.tier = process::LoopTier::kBridge,
+                                           .requested = true,
+                                           .refused = 0}));
+    set_member_flags(
+        "alpha", introspect::RealtimeFlags({.tier = process::LoopTier::kControl,
+                                            .requested = true,
+                                            .refused = 0}));
+    set_member_flags("beta", introspect::RealtimeFlags(
+                                 {.tier = process::LoopTier::kControl,
+                                  .requested = true,
+                                  .refused = process::kStepStackLock}));
+    SupervisionWakeup::Wake();
+    initial_seen = WaitFor(stop, [&] {
+      const std::string m = ReadFile(live);
+      return ManifestEntry(m, "hardware_node").find("\"realtime\": \"full\"") !=
+                 std::string::npos &&
+             ManifestEntry(m, "alpha").find("\"realtime\": \"full\"") !=
+                 std::string::npos &&
+             ManifestEntry(m, "beta").find(
+                 "\"realtime_refused\": \"stack mlock\"") != std::string::npos;
+    });
+    if (initial_seen) {
+      // Late kStepRingLock refusal on alpha (after full) and beta (after
+      // partial stack mlock) observed during supervision.
+      const uint32_t late_ring = static_cast<uint32_t>(process::kStepRingLock)
+                                 << (introspect::kFlagRealtimeShift + 3);
+      set_member_flags("alpha", late_ring);
+      set_member_flags("beta", late_ring);
+      SupervisionWakeup::Wake();
+      late_seen = WaitFor(stop, [&] {
+        const std::string m = ReadFile(live);
+        return ManifestEntry(m, "alpha")
+                       .find("\"realtime_refused\": \"ring mlock\"") !=
+                   std::string::npos &&
+               ManifestEntry(m, "beta").find(
+                   "\"realtime_refused\": \"ring mlock, stack mlock\"") !=
+                   std::string::npos;
+      });
+      // Late kStepRingLock refusal on hardware_node right at shutdown so
+      // reap-time FinalDeliveryCounts -> NoteRealtime merges it.
+      set_member_flags("hardware_node", late_ring);
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+
+  EXPECT_EQ(RunSession(options), 0);
+  driver.join();
+  ASSERT_TRUE(initial_seen);
+  ASSERT_TRUE(late_seen);
+
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string log_text = ReadFile(talos_log);
+
+  const std::string alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"realtime\": \"partial\""), std::string::npos)
+      << alpha;
+  EXPECT_NE(alpha.find("\"realtime_refused\": \"ring mlock\""),
+            std::string::npos)
+      << alpha;
+  EXPECT_NE(log_text.find("alpha (pid "), std::string::npos) << log_text;
+  EXPECT_NE(log_text.find("partial (ring mlock)"), std::string::npos)
+      << log_text;
+
+  const std::string beta = ManifestEntry(manifest, "beta");
+  EXPECT_NE(beta.find("\"realtime\": \"partial\""), std::string::npos) << beta;
+  EXPECT_NE(beta.find("\"realtime_refused\": \"ring mlock, stack mlock\""),
+            std::string::npos)
+      << beta;
+  EXPECT_NE(log_text.find("partial (ring mlock, stack mlock)"),
+            std::string::npos)
+      << log_text;
+
+  const std::string hw = ManifestEntry(manifest, "hardware_node");
+  EXPECT_NE(hw.find("\"realtime\": \"partial\""), std::string::npos) << hw;
+  EXPECT_NE(hw.find("\"realtime_refused\": \"ring mlock\""), std::string::npos)
+      << hw;
+
+  std::filesystem::remove_all(options.output_dir);
 }
 
 }  // namespace
