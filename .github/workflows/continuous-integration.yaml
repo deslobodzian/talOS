@@ -463,12 +463,12 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y clang-tidy-18
 
-    - name: Run clang-tidy on RoboRIO sources (observe)
-      # New lint gate starts in observe mode (AGENTS.md verification practice
-      # #9): reports lint findings without failing until its CI output is read,
-      # while still failing closed on missing DB/sources or compiler errors.
+    - name: Run clang-tidy on RoboRIO sources
+      # Runs clang-tidy-18 over controller_processor/rio/src/main/cpp and
+      # src/main/include against GradleRIO's desktop compilation database,
+      # failing on any lint finding, missing DB/source, or compiler error.
       working-directory: .
-      run: python3 tools/run_rio_clang_tidy.py --observe
+      run: python3 tools/run_rio_clang_tidy.py
 
   rio-in-the-loop:
     name: RoboRIO program in the loop (WPILib sim)

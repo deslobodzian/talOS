@@ -465,11 +465,10 @@ sources under `controller_processor/rio/src` are built by Gradle with compiler
 warnings (`-Wall -Wextra -pedantic -Werror -Wno-unused-parameter` for the
 RoboRIO and the Linux and macOS desktop builds, macOS adding
 `-Wno-unknown-warning-option -Wno-character-conversion`; `/W3 /WX` on Windows),
-and the CI `rio-adapter` job also runs `tools/run_rio_clang_tidy.py --observe`
+and the CI `rio-adapter` job also runs `tools/run_rio_clang_tidy.py`
 against GradleRIO's `setupCompileCommands` desktop database over
-`controller_processor/rio/src/main/cpp` and `src/main/include` (reporting
-findings in observe mode while failing closed on setup, tool, or parse
-errors). When each runs,
+`controller_processor/rio/src/main/cpp` and `src/main/include`, failing on
+any clang-tidy finding or setup, tool, or parse error. When each runs,
 and the more-than-20-commits rule for
 `--full`, are in [DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder).
 
