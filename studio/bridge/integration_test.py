@@ -5,6 +5,7 @@ import json
 import mmap
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import struct
@@ -65,9 +66,20 @@ def rtms_segments():
     return segments
 
 
+VMMAP_REGION_RE = re.compile(r"\]\s+([r-][w-][x-])/([r-][w-][x-])\s+SM=(\S+)")
+DARWIN_NON_SOCKET_TYPES = frozenset({
+    "REG", "VREG", "DIR", "VDIR", "CHR", "VCHR", "BLK", "VBLK",
+    "FIFO", "VFIFO", "PIPE", "KQUEUE", "VNODE", "NPOLICY", "GUARD",
+    "PSXSHM", "PSXSEM", "FSEVENTS", "NEXUS", "CHANNEL",
+})
+
+
 def darwin_rtms_segment(topic):
     """(writer pid, reader pids) of `topic`'s POSIX shm segment on macOS."""
-    ns = os.environ.get("TALOS_SHM_NAMESPACE") or os.environ.get("TEST_TMPDIR") or ""
+    if "TALOS_SHM_NAMESPACE" in os.environ:
+        ns = os.environ["TALOS_SHM_NAMESPACE"]
+    else:
+        ns = os.environ.get("TEST_TMPDIR", "")
     segment = shm_name(topic, ns) if ns else "/" + topic.lstrip("/").replace("/", ".")
     libc = ctypes.CDLL(None, use_errno=True)
     # Declare only the two fixed parameters: O_RDONLY never reads the variadic
@@ -89,8 +101,27 @@ def darwin_rtms_segment(topic):
     return parsed
 
 
+def darwin_writable_shm_regions(pid):
+    """Writable `SM=SHM` region lines from `vmmap -wide <pid>` on macOS.
+
+    Catches closed-fd `SharedMemoryPtr` mappings that `lsof` cannot see.
+    """
+    proc = subprocess.run(
+        ["vmmap", "-wide", str(pid)],
+        capture_output=True, text=True, timeout=15,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"vmmap failed ({proc.returncode}): {proc.stderr}")
+    writable = []
+    for line in proc.stdout.splitlines():
+        match = VMMAP_REGION_RE.search(line)
+        if match and "w" in match.group(1) and match.group(3) == "SHM":
+            writable.append(line.strip())
+    return writable
+
+
 def parse_lsof_fields(text):
-    """Parses `lsof -F ftPan` output into a list of per-fd dicts."""
+    """Parses `lsof -F ftPTan` output into a list of per-fd dicts."""
     records = []
     current = None
     for line in text.splitlines():
@@ -101,7 +132,11 @@ def parse_lsof_fields(text):
             current = {"fd": value}
             records.append(current)
         elif current is not None:
-            current[tag] = value
+            if tag == "T":
+                if value.startswith("ST="):
+                    current["state"] = value[3:]
+            else:
+                current[tag] = value
     return records
 
 
@@ -191,8 +226,10 @@ class BridgeIntegration(unittest.TestCase):
                         self.assertEqual(held - tcp - unix, set(),
                                          f"bridge sockets neither TCP nor Unix: {held - tcp - unix}")
                     else:
-                        # macOS: verify the RTMS header directly via shm_open(O_RDONLY)
-                        # and inspect every open descriptor of the bridge with lsof.
+                        # macOS: verify the RTMS header directly via
+                        # shm_open(O_RDONLY), check writable SM=SHM VM regions
+                        # via vmmap (catches closed-fd SharedMemoryPtr maps),
+                        # and enforce a strict socket allowlist via lsof.
                         writer, readers = darwin_rtms_segment(topic)
                         self.assertNotEqual(writer, bridge.pid,
                                             f"bridge pid {bridge.pid} owns writer on {topic}")
@@ -201,43 +238,80 @@ class BridgeIntegration(unittest.TestCase):
                         self.assertIn(bridge.pid, readers,
                                       f"bridge pid {bridge.pid} not listed in readers {readers}")
 
+                        # RegistryReader maps O_RDONLY (r--/r--) and --session-id
+                        # is unset, so only the subscribed telemetry topic is
+                        # mapped rw- SM=SHM.
+                        writable_shm = darwin_writable_shm_regions(bridge.pid)
+                        self.assertEqual(
+                            len(writable_shm), 1,
+                            f"expected exactly 1 writable SM=SHM region (telemetry topic), "
+                            f"got {len(writable_shm)}: {writable_shm}",
+                        )
+
                         udp = subprocess.run(
                             ["lsof", "-n", "-P", "-a", "-p", str(bridge.pid), "-i", "UDP"],
                             capture_output=True, text=True, timeout=10,
                         )
                         self.assertIn(udp.returncode, (0, 1), udp.stderr)
+                        if udp.returncode == 1:
+                            self.assertEqual(udp.stderr, "",
+                                             f"lsof -i UDP failed: {udp.stderr}")
                         self.assertEqual(udp.stdout.strip(), "",
                                          f"bridge holds UDP sockets:\n{udp.stdout}")
 
                         all_fds = subprocess.run(
-                            ["lsof", "-n", "-P", "-a", "-p", str(bridge.pid), "-F", "ftPan"],
+                            ["lsof", "-n", "-P", "-a", "-p", str(bridge.pid), "-F", "ftPTan"],
                             capture_output=True, text=True, timeout=10,
                         )
                         self.assertEqual(all_fds.returncode, 0, all_fds.stderr)
                         records = parse_lsof_fields(all_fds.stdout)
                         self.assertTrue(records, "lsof returned no descriptors for bridge")
 
+                        port_re = re.compile(rf":{port}(?:$|[^0-9])")
+                        ws_port_re = re.compile(rf":{ws.getsockname()[1]}(?:$|[^0-9])")
                         tcp_listeners = []
+                        tcp_clients = []
                         for rec in records:
                             fd_type = rec.get("t", "")
                             proto = rec.get("P", "")
+                            state = rec.get("state", "")
                             access = rec.get("a", "")
                             name = rec.get("n", "")
-                            # No raw / link-layer / non-TCP inet sockets.
-                            self.assertNotIn("RAW", fd_type.upper(),
-                                             f"bridge holds raw socket: {rec}")
-                            self.assertNotIn("NDRV", fd_type.upper(),
-                                             f"bridge holds NDRV socket: {rec}")
-                            if fd_type in ("IPv4", "IPv6") or proto:
-                                self.assertEqual(proto, "TCP",
-                                                 f"bridge holds non-TCP inet socket: {rec}")
-                                if f":{port}" in name:
-                                    tcp_listeners.append(rec)
                             if fd_type == "PSXSHM":
                                 self.assertNotIn(access, ("w", "u"),
                                                  f"bridge holds writable shm descriptor: {rec}")
-                        self.assertTrue(tcp_listeners,
-                                        f"no TCP socket on port {port} found in {records}")
+                                continue
+                            if fd_type in DARWIN_NON_SOCKET_TYPES and not proto:
+                                continue
+                            if fd_type == "unix":
+                                continue
+                            # Strict socket allowlist: reject every non-unix
+                            # socket (IPv4/IPv6 non-TCP, systm, KCTL, ROUTE,
+                            # RAW, NDRV, etc.) except the single TCP LISTEN
+                            # socket on :{port} and this test's ESTABLISHED ws.
+                            self.assertIn(fd_type, ("IPv4", "IPv6"),
+                                          f"bridge holds disallowed socket type: {rec}")
+                            self.assertEqual(proto, "TCP",
+                                             f"bridge holds non-TCP socket: {rec}")
+                            local, sep, remote = name.partition("->")
+                            if not sep and state == "LISTEN" and port_re.search(local):
+                                tcp_listeners.append(rec)
+                            elif (sep and state == "ESTABLISHED"
+                                  and port_re.search(local)
+                                  and ws_port_re.search(remote)):
+                                tcp_clients.append(rec)
+                            else:
+                                self.fail(f"bridge holds unexpected TCP socket: {rec}")
+                        self.assertEqual(
+                            len(tcp_listeners), 1,
+                            f"expected exactly 1 TCP LISTEN socket on port {port}, "
+                            f"got {tcp_listeners} in {records}",
+                        )
+                        self.assertEqual(
+                            len(tcp_clients), 1,
+                            f"expected 1 ESTABLISHED ws client socket, "
+                            f"got {tcp_clients} in {records}",
+                        )
             finally:
                 stop(processes)
                 for process in processes:
