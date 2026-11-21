@@ -141,7 +141,6 @@ LauncherOptions BaseOptions(std::string_view tag,
   LauncherOptions options;
   options.session_id = GenerateSessionId();
   options.output_dir = TempPath(tag);
-  options.describe_timeout_ms = 4000;
   options.config_path = WriteFixtureToml(tag, robot_keys);
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       WriteStub(std::string{tag} + "_hardware", "exit 0\n", "hardware_node");
@@ -341,6 +340,17 @@ bool Registered(std::string_view name, uint64_t session) {
   });
 }
 
+// Waits until `done()` holds, `stop` is requested, or `bound` elapses.
+bool WaitFor(const std::stop_token& stop, const std::function<bool()>& done,
+             std::chrono::steady_clock::duration bound = std::chrono::seconds{
+                 kHangSeconds}) {
+  const auto give_up = std::chrono::steady_clock::now() + bound;
+  while (!stop.stop_requested() && !done() &&
+         std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(2ms);
+  return !stop.stop_requested() && done();
+}
+
 // A stub body that sets its stop trap (exit 0 on SIGINT or SIGTERM), then
 // appends its --log argument to `record`, then runs `then`: a recorded run
 // can be stopped without dying of the signal.
@@ -456,15 +466,71 @@ TEST(Supervision, LiveEndpointsThatMatchTheProbeAreNotReported) {
 // deadline, not as stalled: its reporting thread's construction heartbeat
 // keeps it alive past the 2 s grace, and the launcher reads that heartbeat
 // and the constructing flag from its registry row until the 3 s deadline.
-// The deadline's arithmetic is SupervisionPolicy's; this is the real kill.
+// The deadline's arithmetic is SupervisionPolicy's; this is the real kill,
+// stepped on the supervision clock so host load cannot race registration or
+// the grace window.
 // REQ-OPS-05
 TEST(Supervision, HeartbeatingConstructorStillHasAFiniteDeadline) {
   auto options = ConstructionOptions("hung_construction", 60000);
-  // Registration under the Linux sanitizer legs fits in the grace.
   options.heartbeat_startup_grace_ms = 2000;
   options.construction_timeout = 3000ms;
-  options.duration_s = 10;
+  options.duration_s = kHangSeconds;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  options.supervision_clock = clock.clock();
+  const uint64_t session = options.session_id;
+  testing::SupervisionPasses passes;
+  bool observed_constructing = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    const auto constructing_heartbeat = [&]() -> std::optional<int64_t> {
+      const auto registry = introspect::RegistryReader::open();
+      if (!registry) return std::nullopt;
+      for (const auto& node : registry->nodes()) {
+        if (node.name == "alpha" && node.session_id == session &&
+            (node.flags & introspect::kFlagConstructing) != 0) {
+          return node.heartbeat_monotonic_ns;
+        }
+      }
+      return std::nullopt;
+    };
+    const auto observe_pass = [&] {
+      const uint64_t next = passes.Started() + 2;
+      return WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= next;
+      });
+    };
+    int64_t first_beat = 0;
+    if (!WaitFor(stop,
+                 [&] {
+                   const auto beat = constructing_heartbeat();
+                   if (!beat) return false;
+                   first_beat = *beat;
+                   return true;
+                 }) ||
+        !observe_pass()) {
+      return;
+    }
+    // Wait for the reporting thread's construction heartbeat to advance, then
+    // step past the 2 s startup grace (still inside the 3 s construction
+    // deadline) so the constructing heartbeat keeps alpha alive past grace.
+    if (!WaitFor(stop, [&] {
+          const auto beat = constructing_heartbeat();
+          return beat && *beat > first_beat;
+        })) {
+      return;
+    }
+    observed_constructing = true;
+    clock.HoldAt(start + 2500ms);
+    if (!observe_pass()) return;
+    clock.HoldAt(start + options.construction_timeout);
+  }};
   EXPECT_NE(RunSession(options), 0);
+  driver.request_stop();
+  driver.join();
+  EXPECT_TRUE(observed_constructing)
+      << "alpha never published a moving construction heartbeat";
   const auto manifest = ReadFile(options.output_dir + "/manifest.json");
   const auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
@@ -478,7 +544,7 @@ TEST(Supervision, HeartbeatingConstructorStillHasAFiniteDeadline) {
 
 TEST(Supervision, ConstructorFailureExitsNonzeroAndIsReported) {
   auto options = ConstructionOptions("failed_construction", -1);
-  options.duration_s = 3;
+  options.duration_s = kHangSeconds;
   EXPECT_NE(RunSession(options), 0);
   const auto entry =
       ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
@@ -1362,7 +1428,8 @@ TEST(Supervision, RequestedStopDoesNotRestartCleanExits) {
   const pid_t launcher = ::fork();
   ASSERT_GE(launcher, 0);
   if (launcher == 0) ::_exit(Launcher{options}.Run());
-  const auto give_up = std::chrono::steady_clock::now() + 10s;
+  const auto give_up =
+      std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
   // A recorded log argument acknowledges an installed stop handler, not just
   // a fork. Wait for all members rather than guessing with a fixed sleep.
   while (ReadLines(runs).size() < 3 &&
@@ -1470,7 +1537,8 @@ TEST(Supervision, AStopDuringAMembersRuntimeStartUpIsHeldUntilItHandlesIt) {
   bool marked = false;
   options.member_spawned = [&](const std::string& member) {
     if (member != "alpha") return;
-    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    const auto give_up =
+        std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
     while (!(marked = std::filesystem::exists(started)) &&
            std::chrono::steady_clock::now() < give_up)
       std::this_thread::sleep_for(1ms);
@@ -1532,7 +1600,8 @@ TEST(Supervision, AStopSignalFromElsewhereIsNotTheSessionsStop) {
   std::jthread interrupter{[&](const std::stop_token& stop) {
     // A give-up lets the clock run on, so the stop timeout ends alpha.
     const testing::SteppedClock::ReleaseOnExit release{clock};
-    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    const auto give_up =
+        std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
     while (!stop.stop_requested() &&
            std::chrono::steady_clock::now() < give_up) {
       const std::string manifest = ReadFile(live);
@@ -1810,7 +1879,7 @@ TEST(Supervision, RosterThatDoesNotFitTheRegistryIsRefused) {
                 /*answers_describe=*/false);
   options.output_dir = TempPath("registry_full");
   options.session_id = GenerateSessionId();
-  options.duration_s = 2;
+  options.duration_s = kHangSeconds;
   EXPECT_EQ(RunSession(options), 0);
   EXPECT_GE(ReadLines(runs).size(), 2u);
   std::filesystem::remove_all(TempPath("registry_full"));
@@ -2121,20 +2190,47 @@ TEST(Supervision, StalledNodeGroupKillStopsItsHelper) {
   auto options = BaseOptions("helper_out");
   options.max_restarts = 0;
   options.heartbeat_startup_grace_ms = 0;
-  options.duration_s = 3;
+  options.duration_s = kHangSeconds;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  options.supervision_clock = clock.clock();
   const auto helper_pid = TempPath("helper_pid");
+  ::remove(helper_pid.c_str());
   int lifetime[2];
   ASSERT_EQ(::pipe(lifetime), 0);
   // The helper inherits this writer across exec. EOF proves it stopped, even
   // on hosts where an orphaned helper briefly remains as a zombie.
   options.binary_overrides["//example/alpha:node"] = WriteStub(
-      "helper_alpha", "sleep 30 &\necho $! > " + helper_pid + "\nwait\n");
+      "helper_alpha", "sleep 30 &\necho $! > " + helper_pid + ".tmp && mv " +
+                          helper_pid + ".tmp " + helper_pid + "\nwait\n");
   options.binary_overrides["//example/beta:node"] =
       WriteStub("helper_beta", "exit 0\n");
+  testing::SupervisionPasses passes;
+  bool helper_started = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    helper_started = WaitFor(stop, [&] {
+      pid_t pid = 0;
+      std::ifstream in{helper_pid};
+      return (in >> pid) && pid > 0;
+    });
+    if (!helper_started) return;
+    const uint64_t next = passes.Started() + 2;
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          return passes.Started() >= next;
+        })) {
+      return;
+    }
+    clock.HoldAt(start + kMinHeartbeatTimeout);
+  }};
   EXPECT_NE(RunSession(options), 0);
+  driver.request_stop();
+  driver.join();
+  EXPECT_TRUE(helper_started) << "alpha's helper never wrote its pid";
   ::close(lifetime[1]);
   pollfd ready{lifetime[0], POLLIN, 0};
-  const int result = ::poll(&ready, 1, 1000);
+  const int result = ::poll(&ready, 1, kHangSeconds * 1000);
   char byte = 0;
   EXPECT_GT(result, 0);
   if (result > 0) {
@@ -2167,7 +2263,7 @@ TEST(Supervision, KillingLauncherKillsNodeAndItsHelper) {
   }
   ::close(output[1]);
   pollfd ready{output[0], POLLIN, 0};
-  const int started = ::poll(&ready, 1, 3000);
+  const int started = ::poll(&ready, 1, kHangSeconds * 1000);
   char text[64]{};
   ssize_t size = 0;
   if (started > 0) size = ::read(output[0], text, sizeof(text) - 1);
@@ -2175,7 +2271,7 @@ TEST(Supervision, KillingLauncherKillsNodeAndItsHelper) {
   int status = 0;
   while (::waitpid(launcher, &status, 0) < 0 && errno == EINTR) {
   }
-  const int stopped = ::poll(&ready, 1, 3000);
+  const int stopped = ::poll(&ready, 1, kHangSeconds * 1000);
   char byte = 0;
   EXPECT_GT(started, 0);
   EXPECT_GT(size, 0);
@@ -2253,7 +2349,7 @@ TEST(Supervision, SendsReadyThenWatchdogDatagrams) {
   std::vector<std::string> messages;
   for (int i = 0; i < 2; ++i) {
     pollfd ready{socket, POLLIN, 0};
-    if (::poll(&ready, 1, 10000) <= 0) break;
+    if (::poll(&ready, 1, kHangSeconds * 1000) <= 0) break;
     char buffer[64];
     const auto size = ::recv(socket, buffer, sizeof(buffer), 0);
     if (size > 0) messages.emplace_back(buffer, static_cast<std::size_t>(size));
@@ -2291,8 +2387,8 @@ TEST(Supervision, AStalledLoopStopsFeedingTheServiceWatchdog) {
   constexpr auto kInterval = 100ms;
   auto options = BaseOptions("watchdog_stall");
   // Only bounds a hang: the test stops the session once it has judged it,
-  // and its own waits add up to at most about 30 s.
-  options.duration_s = 3 * kHangSeconds;
+  // and its own waits add up to at most about 60 s.
+  options.duration_s = 4 * kHangSeconds;
   // The stubs never register; no heartbeat kill may end them meanwhile.
   options.heartbeat_startup_grace_ms = 60'000;
   options.binary_overrides["//talOS/bridge:hardware_node"] =
@@ -2329,8 +2425,9 @@ TEST(Supervision, AStalledLoopStopsFeedingTheServiceWatchdog) {
   std::string while_stalled;
   bool resumed = false;
   std::jthread driver{[&] {
+    const auto hang = std::chrono::seconds{kHangSeconds};
     for (int i = 0; i < 2 && !pinged; ++i)
-      pinged = receive(10s) == "WATCHDOG=1";
+      pinged = receive(hang) == "WATCHDOG=1";
     if (pinged) {
       {
         std::unique_lock lock{mutex};
@@ -2338,7 +2435,7 @@ TEST(Supervision, AStalledLoopStopsFeedingTheServiceWatchdog) {
       }
       SupervisionWakeup::Wake();
       std::unique_lock lock{mutex};
-      held = changed.wait_for(lock, 10s, [&] { return stalled; });
+      held = changed.wait_for(lock, hang, [&] { return stalled; });
     }
     if (held) {
       // Sent before the loop stopped: queued already, drained here.
@@ -2351,7 +2448,7 @@ TEST(Supervision, AStalledLoopStopsFeedingTheServiceWatchdog) {
       stall = false;
     }
     changed.notify_all();
-    if (held) resumed = receive(10s) == "WATCHDOG=1";
+    if (held) resumed = receive(hang) == "WATCHDOG=1";
     // Unpinged, the session is stuck before its loop; its deadline ends it.
     if (pinged) ::kill(::getpid(), SIGTERM);
   }};
@@ -2398,7 +2495,7 @@ TEST(Supervision, NotifierSupportsAbstractSocketNames) {
     ::_exit(0);
   }
   pollfd ready{socket, POLLIN, 0};
-  const int received = ::poll(&ready, 1, 1000);
+  const int received = ::poll(&ready, 1, kHangSeconds * 1000);
   char buffer[64]{};
   ssize_t size = 0;
   if (received > 0) size = ::recv(socket, buffer, sizeof(buffer), 0);
@@ -2445,7 +2542,8 @@ TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
   int status = 0;
   pid_t reaped = 0;
   while ((reaped = ::waitpid(launcher, &status, WNOHANG)) == 0 &&
-         std::chrono::steady_clock::now() < give_up + 10s)
+         std::chrono::steady_clock::now() <
+             give_up + std::chrono::seconds{kHangSeconds})
     std::this_thread::sleep_for(10ms);
   if (reaped != launcher) {
     ::kill(launcher, SIGKILL);
@@ -2804,7 +2902,10 @@ std::jthread PublishStubRow(const LauncherOptions& options,
 TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
   auto options = BaseOptions("stalled_out", "max_restarts = 1\n");
   options.heartbeat_startup_grace_ms = 0;
-  options.duration_s = 3;
+  options.duration_s = kHangSeconds;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  options.supervision_clock = clock.clock();
   const auto pid_file = TempPath("stalled_pid");
   const auto runs = TempPath("stalled_runs");
   ::remove(pid_file.c_str());
@@ -2814,16 +2915,39 @@ TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
       RecordLogArgThen(runs,
                        "case \"$log\" in *restart1.tlog) exit 0;; esac\n"
                        "echo $$ > " +
-                           pid_file + "\nexec sleep 10\n"));
+                           pid_file + ".tmp && mv " + pid_file + ".tmp " +
+                           pid_file + "\nexec sleep 60\n"));
   options.binary_overrides["//example/beta:node"] =
       WriteStub("stalled_beta", "exit 0\n");
   auto publisher =
       PublishStubRow(options, pid_file, [](introspect::NodeRecord& row) {
         row.heartbeat_monotonic_ns.store(introspect::monotonic_now_ns());
       });
+  const uint64_t session = options.session_id;
+  testing::SupervisionPasses passes;
+  bool stepped = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    if (!WaitFor(stop, [&] { return Registered("alpha", session); })) return;
+    const uint64_t next = passes.Started() + 2;
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          return passes.Started() >= next;
+        })) {
+      return;
+    }
+    clock.HoldAt(start + kMinHeartbeatTimeout);
+    if (!WaitFor(stop, [&] { return ReadLines(runs).size() >= 2; })) return;
+    stepped = true;
+    // Past the 50 ms clean-exit backoff so RosterContinues ends the session.
+    clock.HoldAt(start + kMinHeartbeatTimeout + 100ms);
+  }};
   EXPECT_EQ(RunSession(options), 0);
+  driver.request_stop();
+  driver.join();
   publisher.request_stop();
   publisher.join();
+  EXPECT_TRUE(stepped) << "stalled alpha was not killed and restarted";
   EXPECT_EQ(ReadLines(runs).size(), 2u);
   const auto manifest = ReadFile(options.output_dir + "/manifest.json");
   const auto alpha = ManifestEntry(manifest, "alpha");
@@ -2851,18 +2975,42 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
   options.allow_graph_errors = true;
   options.simulation = true;  // The flag requires --sim.
   options.heartbeat_startup_grace_ms = 0;
-  options.duration_s = 3;
+  options.duration_s = kHangSeconds;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  options.supervision_clock = clock.clock();
   const auto runs = TempPath("undescribed_runs");
   ::remove(runs.c_str());
   options.binary_overrides["//example/alpha:node"] = WriteStub(
       "undescribed_alpha",
       RecordLogArgThen(runs,
                        "case \"$log\" in *restart1.tlog) exit 0;; esac\n"
-                       "exec sleep 10\n"),
+                       "exec sleep 60\n"),
       "alpha", false);
   options.binary_overrides["//example/beta:node"] =
       WriteStub("undescribed_beta", "exit 0\n");
+  testing::SupervisionPasses passes;
+  bool stepped = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    if (!WaitFor(stop, [&] { return !ReadLines(runs).empty(); })) return;
+    const uint64_t next = passes.Started() + 2;
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          return passes.Started() >= next;
+        })) {
+      return;
+    }
+    clock.HoldAt(start + kMinHeartbeatTimeout);
+    if (!WaitFor(stop, [&] { return ReadLines(runs).size() >= 2; })) return;
+    stepped = true;
+    // Past the 50 ms clean-exit backoff so RosterContinues ends the session.
+    clock.HoldAt(start + kMinHeartbeatTimeout + 100ms);
+  }};
   EXPECT_EQ(RunSession(options), 0);
+  driver.request_stop();
+  driver.join();
+  EXPECT_TRUE(stepped) << "unregistered alpha was not killed and restarted";
   EXPECT_EQ(ReadLines(runs).size(), 2u);
   const auto manifest = ReadFile(options.output_dir + "/manifest.json");
   const auto alpha = ManifestEntry(manifest, "alpha");
@@ -2907,7 +3055,8 @@ TEST(Supervision, IdleSessionPassesOncePerLookIntervalNotOnAPoll) {
   uint64_t counted = 0;
   std::chrono::nanoseconds window{};
   std::jthread stopper{[&](const std::stop_token& stop) {
-    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    const auto give_up =
+        std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
     const auto wait = [&](const std::function<bool()>& done) {
       while (!stop.stop_requested() && !done() &&
              std::chrono::steady_clock::now() < give_up)
@@ -2985,7 +3134,8 @@ TEST(Supervision, ChildExitAndStopSignalWakeTheSleepingLoop) {
     returned = true;
   }};
   const auto wait = [](const std::function<bool()>& done) {
-    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    const auto give_up =
+        std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
     while (!done() && std::chrono::steady_clock::now() < give_up)
       std::this_thread::sleep_for(2ms);
     return done();
@@ -3165,9 +3315,11 @@ TEST(Supervision, StopTimeoutAloneWakesTheLoop) {
         std::this_thread::sleep_for(2ms);
       return done();
     };
-    wait([&] { return ReadLines(runs).size() == 3; }, 10s);
+    wait([&] { return ReadLines(runs).size() == 3; },
+         std::chrono::seconds{kHangSeconds});
     ::kill(::getpid(), SIGTERM);
-    if (!wait([&] { return returned.load(); }, kStopTimeout + 10s)) {
+    if (!wait([&] { return returned.load(); },
+              kStopTimeout + std::chrono::seconds{kHangSeconds})) {
       rescued = true;
       SupervisionWakeup::Wake();
     }
@@ -3206,7 +3358,8 @@ TEST(Supervision, StudioBridgeRestartAloneWakesTheLoop) {
                 "studio_bridge");
   bool retried = false;
   std::jthread driver{[&](const std::stop_token& stop) {
-    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    const auto give_up =
+        std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
     while (!stop.stop_requested() && ReadLines(attempts).size() < 2 &&
            std::chrono::steady_clock::now() < give_up)
       std::this_thread::sleep_for(2ms);
@@ -3234,17 +3387,6 @@ int64_t EntryInteger(const std::string& entry, std::string_view key) {
 std::string BridgeRun(const std::string& record, std::string_view then) {
   return "trap 'exit 0' INT TERM\necho $$ >> " + record + "\n" +
          std::string{then};
-}
-
-// Waits until `done()` holds, `stop` is requested, or `bound` elapses.
-bool WaitFor(const std::stop_token& stop, const std::function<bool()>& done,
-             std::chrono::steady_clock::duration bound = std::chrono::seconds{
-                 kHangSeconds}) {
-  const auto give_up = std::chrono::steady_clock::now() + bound;
-  while (!stop.stop_requested() && !done() &&
-         std::chrono::steady_clock::now() < give_up)
-    std::this_thread::sleep_for(2ms);
-  return !stop.stop_requested() && done();
 }
 
 // Studio bridge sessions for the tests below: NothingDueOptions (no member
@@ -3980,7 +4122,7 @@ TEST(Supervision, StudioBridgeLivenessAloneWakesTheLoop) {
   options.duration_s = 3600;
   options.max_restarts = 0;
   options.heartbeat_periods = 1;
-  options.heartbeat_startup_grace_ms = 500;
+  options.heartbeat_startup_grace_ms = 15000;
   options.construction_timeout = 1h;
   options.start_studio_bridge = true;
   UseHealthyRegisteringNodes(options, "bridge_liveness_wake");
@@ -4039,7 +4181,7 @@ TEST(Supervision, StudioBridgeLivenessAloneWakesTheLoop) {
       // Now hang studio_bridge; nothing except StudioBridge::NextCheck can
       // wake the supervision loop for the next hour.
       std::ofstream{hang}.close();
-      if (!WaitFor(stop, [&] { return returned.load(); }, 10s)) {
+      if (!WaitFor(stop, [&] { return returned.load(); })) {
         rescued = true;
         ::kill(::getpid(), SIGTERM);
       }

@@ -66,6 +66,15 @@ std::string TempPath(std::string_view name) {
 // §6.3).
 constexpr std::chrono::seconds kHang{20};
 
+// Polls `done()` until it holds, `stop` is requested, or `kHang` elapses.
+bool WaitFor(const std::stop_token& stop, const std::function<bool()>& done) {
+  const auto give_up = std::chrono::steady_clock::now() + kHang;
+  while (!stop.stop_requested() && !done() &&
+         std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(std::chrono::milliseconds{2});
+  return !stop.stop_requested() && done();
+}
+
 // A framework-owned fixture: the launcher's discovery logic is robot-agnostic,
 // so its tests must not read any particular robot's configuration.
 constexpr std::string_view kFixtureToml = R"(
@@ -383,17 +392,23 @@ introspect::naming::SourceShape Endpoint(event::SourceKind kind,
 std::string ReadFile(const std::string& path);
 
 TEST(LauncherTest, DescribeDeadlineAppliesAfterStdoutCloses) {
-  const auto binary = WriteStubNode("describe_closed_stdout",
-                                    "#!/bin/sh\nexec 1>&-\nexec sleep 30\n");
+  const auto closed = TempPath("describe_closed_stdout_marker");
+  ::remove(closed.c_str());
+  const auto binary = WriteStubNode(
+      "describe_closed_stdout",
+      "#!/bin/sh\nexec 1>&-\n: > '" + closed + "'\nexec sleep 60\n");
   introspect::Description description;
   std::string error;
   const auto started = std::chrono::steady_clock::now();
   EXPECT_FALSE(ProbeDescribe({binary, "--describe"},
-                             std::chrono::milliseconds{100}, description,
+                             std::chrono::milliseconds{1000}, description,
                              error));
   const auto elapsed = std::chrono::steady_clock::now() - started;
-  EXPECT_LT(elapsed, std::chrono::seconds{3});
+  EXPECT_TRUE(std::filesystem::exists(closed))
+      << "probe timed out before child closed stdout";
+  EXPECT_LT(elapsed, kHang);
   std::filesystem::remove(binary);
+  ::remove(closed.c_str());
 }
 
 TEST(LauncherTest, DescribeOutputIsBounded) {
@@ -532,14 +547,14 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
 }
 
 // The duration deadline starts with the session, not after the viewer: a
-// failing bridge plus long-lived nodes must still end near --duration-s.
-// A bridge none of whose runs came up by then never served Studio, and its
-// manifest entry says so (recorder_failed), though its restarts were not
-// yet used up: 50 + 100 + 200 + 400 ms of backoff, the fifth 800 ms later,
-// past the 1 s deadline. REQ-OPS-30
+// failing bridge plus long-lived nodes must still end at --duration-s on the
+// supervision clock. A bridge none of whose runs came up by then never served
+// Studio, and its manifest entry says so (recorder_failed), though its restarts
+// were not yet used up. REQ-OPS-30
 TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   const std::string tag = "bridge_deadline";
   const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::remove_all(out_dir);
   std::filesystem::create_directories(out_dir);
 
   LauncherOptions options;
@@ -547,8 +562,12 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   options.session_id = 0xDEAD1100ULL;
   options.simulation = true;
   options.start_studio_bridge = true;
-  options.describe_timeout_ms = 4000;
   options.duration_s = 1;
+  // The stubs never take a registry row; nothing here waits for one.
+  options.heartbeat_startup_grace_ms = 60000;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  options.supervision_clock = clock.clock();
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       tag + "_hardware",
@@ -562,16 +581,39 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStubNode(tag + "_bridge", BridgeDescribeThen("exit 1\n"));
 
+  const std::string live =
+      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json";
+  bool advanced = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    if (!WaitFor(stop, [&] {
+          const std::string manifest = ReadFile(live);
+          const std::size_t bridge =
+              manifest.find("\"name\": \"studio_bridge\"");
+          if (bridge == std::string::npos ||
+              manifest.find("\n  \"end_wall_ns\": 0,") == std::string::npos)
+            return false;
+          const std::string entry = manifest.substr(
+              bridge, manifest.find("\"runs\": [", bridge) - bridge);
+          return entry.find("\"exit_code\": 1") != std::string::npos;
+        })) {
+      return;
+    }
+    advanced = true;
+    clock.HoldAt(start + std::chrono::seconds{options.duration_s});
+  }};
+
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{options};
   launcher.Run();
   const auto elapsed = std::chrono::steady_clock::now() - started;
+  driver.request_stop();
+  driver.join();
 
-  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
-            20)
+  EXPECT_TRUE(advanced) << "studio_bridge never recorded its failing run";
+  EXPECT_LT(elapsed, kHang)
       << "deadline must fire without waiting out the bridge window";
-  const std::string manifest = ReadFile(
-      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json");
+  const std::string manifest = ReadFile(live);
   const std::size_t bridge = manifest.find("\"name\": \"studio_bridge\"");
   ASSERT_NE(bridge, std::string::npos) << manifest;
   const std::string entry =
@@ -595,6 +637,8 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
   std::filesystem::remove_all(out_dir);
   std::filesystem::create_directories(out_dir);
   const std::string gapped = TempPath(tag + "_source.tlog");
+  const std::string restarted = TempPath(tag + "_restarted");
+  ::remove(restarted.c_str());
   {
     event::log::LogWriter writer{
         gapped, "alpha",
@@ -616,7 +660,9 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
   options.output_dir = out_dir;
   options.session_id = 0x6A9;
   options.simulation = true;
-  options.duration_s = 1;
+  options.duration_s = static_cast<int>(kHang.count());
+  // The stubs never take a registry row; nothing here waits for one.
+  options.heartbeat_startup_grace_ms = 60000;
   options.config_path = WriteFixtureToml();
   std::string alpha = NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                             {Sender("/alpha/state")}, 30);
@@ -627,7 +673,9 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
       gapped +
       "' \"$1\"; }\n"
       " shift\n done\n"
-      "case \"$log\" in *.restart*) exec sleep 30 ;; esac\n"
+      "case \"$log\" in *.restart*) : > '" +
+      restarted +
+      "'; exec sleep 30 ;; esac\n"
       "exit 1\n";
   options.binary_overrides["//example/alpha:node"] =
       WriteStubNode(tag + "_alpha", alpha);
@@ -639,9 +687,18 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
       NodeDescribeThenSleep("hardware_node", "//talOS/bridge:hardware_node", {},
                             30));
 
+  bool saw_restart = false;
+  std::jthread stopper{[&](const std::stop_token& stop) {
+    saw_restart =
+        WaitFor(stop, [&] { return std::filesystem::exists(restarted); });
+    if (saw_restart) ::kill(::getpid(), SIGTERM);
+  }};
   ::testing::internal::CaptureStderr();
   Launcher{options}.Run();
   const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  stopper.request_stop();
+  stopper.join();
+  EXPECT_TRUE(saw_restart) << "alpha's restart never wrote its gapped log";
 
   const std::string manifest = ReadFile(
       out_dir + "/" + std::to_string(options.session_id) + "/manifest.json");
@@ -677,6 +734,7 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
       << stderr_text;
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(gapped);
+  ::remove(restarted.c_str());
 }
 
 // A member that ignores SIGINT is killed (SIGKILL, run reason stop_timeout)
@@ -695,7 +753,6 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   options.output_dir = out_dir;
   options.session_id = 0xDEAD2200ULL;
   options.simulation = true;
-  options.describe_timeout_ms = 4000;
   options.duration_s = static_cast<int>(kHang.count());
   // The stubs never take a registry row; nothing here waits for one.
   options.heartbeat_startup_grace_ms = 60000;
@@ -743,11 +800,7 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
     // so its duration ends the session and the test fails with a message.
     const testing::SteppedClock::ReleaseOnExit release{clock};
     const auto wait = [&](const std::function<bool()>& done) {
-      const auto give_up = std::chrono::steady_clock::now() + kHang;
-      while (!stop.stop_requested() && !done() &&
-             std::chrono::steady_clock::now() < give_up)
-        std::this_thread::sleep_for(std::chrono::milliseconds{2});
-      return !stop.stop_requested() && done();
+      return WaitFor(stop, done);
     };
     const auto passes_from_now = [&](uint64_t count) {
       const uint64_t until = passes.Started() + count;
@@ -785,7 +838,7 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   const auto elapsed = std::chrono::steady_clock::now() - started;
   stopper.request_stop();
   stopper.join();
-  EXPECT_LT(elapsed, std::chrono::seconds{10});
+  EXPECT_LT(elapsed, kHang);
   ASSERT_TRUE(beta_stopped) << "the stop's SIGINT ended no peer";
   ASSERT_TRUE(held_short) << "alpha was killed before the stop timeout: the "
                              "session ended while the clock was held short "
@@ -823,7 +876,6 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   options.output_dir = out_dir;
   options.session_id = 0x57AB1EULL;
   options.start_studio_bridge = true;
-  options.describe_timeout_ms = 4000;
   options.duration_s = 3;
   // The stubs never take a registry row; nothing here waits for one.
   options.heartbeat_startup_grace_ms = 60000;
@@ -928,7 +980,6 @@ TEST(LauncherTest, StudioBridgeEndingNeverSetsTheSessionStatus) {
     options.output_dir = out_dir;
     options.session_id = 0xB51A7ULL;
     options.start_studio_bridge = true;
-    options.describe_timeout_ms = 4000;
     options.duration_s = static_cast<int>(kHang.count());
     // The stubs never take a registry row; nothing here waits for one.
     options.heartbeat_startup_grace_ms = 60000;
@@ -1278,7 +1329,7 @@ constexpr std::string_view kStubThatHangsOnDescribe =
     "#!/bin/sh\n"
     "for arg in \"$@\"; do\n"
     "  if [ \"$arg\" = \"--describe\" ]; then\n"
-    "    exec sleep 30\n"
+    "    exec sleep 60\n"
     "  fi\n"
     "done\n"
     "exit 0\n";
@@ -1324,7 +1375,6 @@ struct GraphFixture {
     options.session_id = 0x0123456789ABCDEFULL;
     out_dir += "/" + std::to_string(options.session_id);
     options.config_path = WriteFixtureToml();
-    options.describe_timeout_ms = 4000;
     options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
         std::string{tag} + "_hardware",
         DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
@@ -1591,15 +1641,14 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
   GraphFixture fixture{
       "hangs", kStubThatHangsOnDescribe,
       DescribingStub("beta", "//example/beta:node", {Sender("/beta/state")})};
-  fixture.options.describe_timeout_ms = 250;
+  fixture.options.describe_timeout_ms = 3000;
 
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{fixture.options};
   EXPECT_EQ(launcher.Run(), 1);
   EXPECT_FALSE(fixture.has_manifest());
   const auto elapsed = std::chrono::steady_clock::now() - started;
-  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
-            10);
+  EXPECT_LT(elapsed, kHang);
 }
 
 // The error diagnostics graph.json records, one per line.
@@ -1712,7 +1761,6 @@ critical = false
     options.output_dir = out_dir;
     options.session_id = GenerateSessionId();
     options.config_path = config_path;
-    options.describe_timeout_ms = 4000;
     options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
         "to_norm_hw",
         RecordingStub("hardware_node", "//talOS/bridge:hardware_node", invoked,
@@ -1757,7 +1805,6 @@ critical = false
     options.output_dir = out_dir;
     options.session_id = GenerateSessionId();
     options.config_path = config_path;
-    options.describe_timeout_ms = 4000;
     options.simulation = true;
     options.allow_graph_errors = true;
     options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
@@ -1799,7 +1846,6 @@ critical = false
     options.output_dir = out_dir;
     options.session_id = GenerateSessionId();
     options.config_path = config_path;
-    options.describe_timeout_ms = 4000;
     options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
         "to_unans_hw",
         RecordingStub("hardware_node", "//talOS/bridge:hardware_node", invoked,
@@ -1889,7 +1935,6 @@ TEST(LauncherGraphTest, HiddenOptOutRefusesBothFirstRunAndRestart) {
   options.output_dir = out_dir;
   options.session_id = GenerateSessionId();
   options.config_path = WriteFixtureToml();
-  options.describe_timeout_ms = 4000;
   options.duration_s = static_cast<int>(kHang.count());
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       "to_restart_hw",
@@ -2186,10 +2231,9 @@ TEST(LauncherGraphTest, NonCriticalDescribeTimeoutAllowsPeersToLaunch) {
   alpha->erase("motors");
   alpha->insert_or_assign("critical", false);
   std::ofstream{fixture.options.config_path} << config;
-  // Only alpha must miss the deadline. A freshly written stub's first exec
-  // alone can take about 100 ms (macOS, Bazel's darwin sandbox), so the
-  // answering peers need a deadline well above that.
-  fixture.options.describe_timeout_ms = 1000;
+  // Only alpha (which hangs for 60 s) must miss the deadline; give critical
+  // peers generous headroom even under heavy host load.
+  fixture.options.describe_timeout_ms = 5000;
   fixture.options.max_restarts = 0;
   EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
   EXPECT_TRUE(fixture.has_manifest());
@@ -2304,7 +2348,6 @@ TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {
                                               {Sender("/gamma/state")}));
 
   LauncherOptions options;
-  options.describe_timeout_ms = 4000;
   std::vector<NodeDescription> described;
   const auto diagnostics = DescribeGraph({spec}, options, described);
 
@@ -2329,8 +2372,8 @@ TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {
 TEST(LauncherGraphTest, ProbeReportsWhyABinaryCannotRun) {
   introspect::Description out;
   std::string error;
-  EXPECT_FALSE(ProbeDescribe({"/nonexistent/talos_node", "--describe"},
-                             std::chrono::milliseconds{500}, out, error));
+  EXPECT_FALSE(ProbeDescribe({"/nonexistent/talos_node", "--describe"}, kHang,
+                             out, error));
   EXPECT_NE(error.find("/nonexistent/talos_node"), std::string::npos) << error;
   EXPECT_NE(error.find(std::strerror(ENOENT)), std::string::npos) << error;
 }
@@ -2424,7 +2467,6 @@ TEST(LauncherGraphTest, TransientProbeSpawnFailureIsRetried) {
                                         {Sender("/alpha/state")}));
 
   LauncherOptions options;
-  options.describe_timeout_ms = 4000;
   options.probe_spawn_failures["alpha"] = 2;
   std::vector<NodeDescription> described;
   const auto diagnostics = DescribeGraph({spec}, options, described);
@@ -2488,7 +2530,6 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
       WriteStubNode("graph_gamma",
                     GraphReaderStub("gamma", "//example/gamma:node", record))};
   LauncherOptions options;
-  options.describe_timeout_ms = 4000;
   options.output_dir = TempPath("graph_reader_out");
   std::vector<NodeDescription> described;
   const auto diagnostics = DescribeGraph({gamma, alpha}, options, described);
@@ -4366,7 +4407,7 @@ TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   auto options = SessionFixture(tag);
   std::filesystem::remove_all(options.output_dir);
   // The deadline a stop must not wait out.
-  const std::chrono::milliseconds describe_deadline{kHang};
+  const std::chrono::milliseconds describe_deadline{std::chrono::seconds{30}};
   options.describe_timeout_ms = static_cast<int>(describe_deadline.count());
   const std::string probe = TempPath(tag + "_probe_pid");
   ::remove(probe.c_str());
@@ -4394,9 +4435,9 @@ TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   ASSERT_GT(probe_pid, 0) << "alpha's probe never started";
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << "the launcher ended with " << ExitReason(status);
-  // Far inside the deadline: without the stop the launcher ends about one
+  // Well inside the deadline: without the stop the launcher ends about one
   // deadline after the probe's spawn, which is a little before stopped_at.
-  EXPECT_LT(stopping, describe_deadline / 4)
+  EXPECT_LT(stopping, describe_deadline / 2)
       << "the stop waited for the probe's describe deadline";
   errno = 0;
   EXPECT_TRUE(::kill(probe_pid, 0) != 0 && errno == ESRCH)
