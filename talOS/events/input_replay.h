@@ -63,11 +63,18 @@ struct RecordedTopic {
   // (a watcher receives in sequence order); both counted along the log
   // across its segments (a later segment starts from the one before it,
   // when read). Where nothing bounds it, the log is refused instead (below).
-  // A reader's stretch, in a log other than the replayed program's, costs
-  // nothing where the session's logs hold every message of the topic whose
-  // sequence lies between its intact receipts around the stretch (from 0
-  // when none precedes it; never when none follows it in its file): the
-  // writer's sends restore all it could have lost.
+  // A writer's or non-replayed reader's damaged stretch costs nothing where
+  // the session's logs hold every message of the topic whose sequence lies
+  // between its intact records around the stretch (from 0 when none precedes
+  // it; closing on the next intact accepted send or receipt in the same file
+  // or a contiguous later segment). For any topic the replayed program did not
+  // watch live, when at least one writer log exists, every writer log of that
+  // topic is intact and exited (no cap/hard/segment refusal, no GAP, no
+  // unrecovered damage on that topic, not truncated, and its run reached EXIT),
+  // and the session holds every sequence from 0 through the maximum recorded
+  // sequence, reader-only caps, marks, gaps and damage are ignored for that
+  // topic (still applied to run_start and topics the replayed program watched
+  // live).
   std::optional<MonotonicTime> first_gap;
   std::string first_gap_log;
   // Where that loss is a damaged stretch: its byte offset in first_gap_log.
@@ -174,9 +181,13 @@ class RecordedSession {
   // process name of the program to be replayed, or empty for none. Throws
   // std::runtime_error on an unreadable log, on logs from two sessions, on a
   // topic the logs record with two schemas, and on a manifest.json beside them
-  // that is not JSON. A log's damaged records are skipped (log::LogReader) and
-  // mark a loss or a refusal (above); what was skipped is printed to stderr as
-  // a warning naming the file and byte offsets.
+  // that is not JSON; throws ReplayError if two records share `(topic,
+  // sequence)` with differing publish times or payloads or if a single log
+  // observes a non-monotonic sequence on a topic (e.g. a segment re-created
+  // outside a launcher session restarting at 0). A log's damaged records are
+  // skipped (log::LogReader) and mark a loss or a refusal (above); what was
+  // skipped is printed to stderr as a warning naming the file and byte
+  // offsets.
   explicit RecordedSession(const std::string& path,
                            std::string_view replayed = {},
                            InputReplayOptions options = {});

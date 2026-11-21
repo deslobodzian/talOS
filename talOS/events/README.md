@@ -346,9 +346,14 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   clock (`now_ns` and `publish_time_ns` 0); the transport stamped it with
   the loop's origin, which its readers recorded, so it is fed at its log's
   origin: a restarted writer's initial message at its restart. One message
-  seen in several logs is kept once, by topic and transport sequence, at
-  the earliest time recorded. Logs from two sessions, or a topic recorded with
-  two schemas, are refused.
+  seen in several logs is kept once, by topic and transport sequence. To fail
+  closed on sessions recorded outside the launcher where a re-created topic
+  segment restarts its sequence at 0, `RecordedSession` throws `ReplayError`
+  naming the topic and sequence whenever two records share `(topic, sequence)`
+  with differing `publish_time_ns` or differing payload bytes, or whenever a
+  single log (including across contiguous segments) observes a non-monotonic
+  sequence on a source. Logs from two sessions, or a topic recorded with two
+  schemas, are refused.
 - A program the session ran (logs carrying its process name) replays on its
   own recorded timeline. Each process's log has its own origin, and its
   loop's schedule counts from when its `run()` began, after construction
@@ -436,13 +441,23 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   own receipts, fed at their drains' event times (a tick's deadline, or a
   prompt watcher's publication time, which need not follow the log's
   order), nor a reader's topic with no intact receipt before the stretch:
-  such a log is refused (below), naming it and the offset. A reader's
-  stretch in another program's log is no loss when the session's logs (the
-  writer's sends) hold every message of the topic between that reader's
-  intact receipts around it, from sequence 0 when none precedes it (a
-  watcher receives in sequence order, and a session numbers a topic's
-  messages from 0, no two alike); it still is when no receipt of the topic
-  follows it in that file. A damaged tail only shortens its log.
+  such a log is refused (below), naming it and the offset. A writer's damaged
+  stretch (for accepted sends, ignoring refused sends with `aux != 0`) or
+  another program's reader's damaged stretch is no loss when an intact
+  accepted send or receipt follows it in the same file or in a contiguous
+  later segment (`header_continues` with no segment refusal) and the session's
+  logs hold every message of the topic between the intact records around it
+  (from sequence 0 when none precedes it: a session numbers a topic's messages
+  from 0, no two alike). Furthermore, for any topic the replayed program did
+  not watch live, if at least one writer log exists for that topic, every
+  writer log of it is complete (no cap/hard/segment refusal, no `GAP`, no
+  unrecovered damage on that topic, not truncated, and its run reached `EXIT`),
+  and the session holds every sequence from `0` through the maximum recorded
+  sequence across all logs, then reader-only caps, marks (`log_gap` /
+  `recorder_failed` without `EXIT`), `GAP` records, and damaged stretches
+  (including an unclosed trailing stretch with no following receipt) are
+  ignored for that topic; they still apply to `run_start()` and to topics the
+  replayed program watched live. A damaged tail only shortens its log.
 - Some losses leave no mark in the log. What the byte cap cost a log (its
   oldest segment, which may have held a GAP record, or the records after
   capture stopped) has no GAP record: `<log>.capped` beside the log, whichever
