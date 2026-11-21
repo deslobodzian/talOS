@@ -73,6 +73,7 @@ cc_library(
     deps = [
         ":describe",
         ":registry",
+        "//talOS/memory:residency",
     ],
 )
 

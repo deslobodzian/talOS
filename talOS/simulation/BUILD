@@ -21,6 +21,7 @@ cc_binary(
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
         "//talOS/ipc",
+        "//talOS/memory:residency",
         "//talOS/msgs:geometry",
         "//talOS/process",
     ],

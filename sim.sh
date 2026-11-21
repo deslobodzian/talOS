@@ -256,16 +256,30 @@ fi
 
 # In WPILib mode, fail fast if another session already holds this namespace's
 # session lock so we never spend time building or booting Gradle/WPILib only
-# to have the launcher refuse startup afterwards.
+# to have the launcher refuse startup afterwards. Before the build, a stale
+# pre-build binary may lack --check-session-lock or fail to load; only an
+# active-holder message aborts early, while other failures fall through to
+# `bazel build` and the strict post-build check below.
 check_session_lock() {
-  local err
-  err="$(./bazel-bin/talOS/launcher/launcher --check-session-lock 2>&1)" || {
+  local strict="${1:-strict}"
+  local err status
+  err="$(./bazel-bin/talOS/launcher/launcher --check-session-lock 2>&1)"
+  status=$?
+  [ "$status" = 0 ] && return 0
+  case "$err" in
+    *"another launcher"*|*"session lock held"*)
+      printf '%s\n' "$err" >&2
+      die "another session holds the session lock; stop it before starting WPILib simulation"
+      ;;
+  esac
+  if [ "$strict" = "strict" ]; then
     printf '%s\n' "$err" >&2
-    die "another session holds the session lock; stop it before starting WPILib simulation"
-  }
+    die "session lock check failed (exit $status); refusing to start WPILib simulation"
+  fi
+  return 0
 }
 if [ "$WANT_RIO" = "1" ] && [ -x ./bazel-bin/talOS/launcher/launcher ]; then
-  check_session_lock
+  check_session_lock prebuild
 fi
 
 # The launcher takes a number (uint64). The second alone collides for two

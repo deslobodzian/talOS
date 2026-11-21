@@ -14,9 +14,9 @@
 #include <thread>
 #include <vector>
 
-#include "talOS/bridge/merge.h"
 #include "talOS/bridge/node.h"
 #include "talOS/bridge/node_test_support.h"
+#include "talOS/hardware/merge.h"
 
 namespace talos::hardware {
 namespace {
