@@ -16,25 +16,27 @@
 // nothing it would notice, and State goes out within one period of the route
 // appearing.
 //
-// A send that fails with an error the socket may never recover from
-// (protocol::SendErrorNeedsNewSocket: a socket shut down, or its source
-// address gone from the host, which Linux reports as ENETUNREACH) loses the
-// socket: nothing more is sent on that tick, and the next attempt opens a new
-// socket on the same ports (Endpoint::Reopen, keeping the frame sequence),
-// on the same cadence: at once if no attempt was made in the last kPeriodUs,
-// otherwise kPeriodUs after the last, so a condition that also breaks every
-// new socket costs at most ten sockets a second, and a network with no route
-// at all costs one failed open per kPeriodUs, as at boot. Usually that is
-// the next tick, which then runs as any other: a replaced socket is a link
-// gap of one tick, and the command in force keeps its usual expiry. Closing
-// the old socket drops the datagrams queued on it, and a command that
-// arrives later passes the gateway's usual checks (sequence, boot, epoch,
-// observation age). Only a tick with no socket open (an attempt failed, or
-// none is due yet) ticks the gateway disabled and sends nothing. Any other
-// send error (ENOBUFS, ECONNREFUSED, ...) clears on the same socket and
-// keeps it; EAGAIN is reported as kWouldBlock via SendWouldBlock while keeping
-// the socket open without triggering a reopen (the cumulative count lives on
-// RuntimeUdpPeer::stats().send_would_block).
+// A send or receive that fails with an error the socket may never recover from
+// (protocol::SendErrorNeedsNewSocket / protocol::ReceiveErrorNeedsNewSocket: a
+// socket shut down, invalid fd, or its source address gone from the host,
+// which Linux reports as ENETUNREACH) loses the socket: nothing more is sent
+// on that tick, and the next attempt opens a new socket on the same ports
+// (Endpoint::Reopen, keeping the frame sequence), on the same cadence: at once
+// if no attempt was made in the last kPeriodUs, otherwise kPeriodUs after the
+// last, so a condition that also breaks every new socket costs at most ten
+// sockets a second, and a network with no route at all costs one failed open
+// per kPeriodUs, as at boot. Usually that is the next tick, which then runs as
+// any other: a replaced socket is a link gap of one tick, and the command in
+// force keeps its usual expiry. Closing the old socket drops the datagrams
+// queued on it, and a command that arrives later passes the gateway's usual
+// checks (sequence, boot, epoch, observation age). Only a tick with no socket
+// open (an attempt failed, or none is due yet) ticks the gateway disabled and
+// sends nothing. Any other send error (ENOBUFS, ECONNREFUSED, ...) clears on
+// the same socket and keeps it; EAGAIN is reported as kWouldBlock via
+// SendWouldBlock while keeping the socket open without triggering a reopen
+// (the cumulative count lives on RuntimeUdpPeer::stats().send_would_block).
+// Transient receive errors (such as ECONNREFUSED) and non-socket outcomes
+// (kOk, kWouldBlock, kDecodeError) keep the socket open.
 // Every other failed send is counted in its spell (SendEvent), which the loop
 // reports when it starts and when sends succeed again, so a failure that keeps
 // the socket shows on the console too.
@@ -155,6 +157,36 @@ class SocketRetry {
     return SendEvent::kNone;
   }
 
+  // A receive on the open socket failed at `now_us` with OS error `error`
+  // (UdpStats::last_recv_error). Permanent socket errors
+  // (protocol::ReceiveErrorNeedsNewSocket) lose the socket so the next due
+  // Poll replaces it on the same kPeriodUs cadence as SendFailed; transient
+  // errors (such as ECONNREFUSED) keep it open. Returns true when this call
+  // lost the socket.
+  bool ReceiveFailed(uint64_t now_us, int error) {
+    if (!open_) return false;
+    if (!protocol::ReceiveErrorNeedsNewSocket(error)) return false;
+    last_recv_error_ = error;
+    open_ = false;
+    replacing_ = true;
+    lost_us_ = now_us;
+    failures_ = 0;
+    first_failure_us_ = 0;
+    return true;
+  }
+
+  // Dispatches one receive outcome on the open socket: permanent receive
+  // socket errors transition into replacing state on the same kPeriodUs
+  // cadence as ObserveSend, while kOk, kWouldBlock, kDecodeError,
+  // kInvalidArgument, and transient errors such as ECONNREFUSED keep the
+  // socket open.
+  void ObserveReceive(uint64_t now_us, protocol::UdpStatus status,
+                      int last_recv_error) {
+    if (status == protocol::UdpStatus::kSocketError) {
+      ReceiveFailed(now_us, last_recv_error);
+    }
+  }
+
   // The current or last spell: its failed sends, the times of the first and
   // the last, the error its kFailing named, and the last send error.
   uint32_t spell_failures() const { return spell_failures_; }
@@ -162,6 +194,7 @@ class SocketRetry {
   uint64_t spell_last_failure_us() const { return spell_last_failure_us_; }
   int spell_error() const { return spell_error_; }
   int last_send_error() const { return last_send_error_; }
+  int last_recv_error() const { return last_recv_error_; }
 
   bool open() const { return open_; }
   // Lost and not yet replaced: `open` must open the same ports again
@@ -189,6 +222,7 @@ class SocketRetry {
   uint64_t spell_last_failure_us_{0};
   int spell_error_{0};
   int last_send_error_{0};
+  int last_recv_error_{0};
 };
 
 }  // namespace talos::rio

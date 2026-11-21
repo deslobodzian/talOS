@@ -240,6 +240,94 @@ TEST(SocketRetry, WouldBlockReportsDropAndKeepsTheSocketOpen) {
       SendEvent::kRecovered);
 }
 
+// Permanent receive errors lose the socket and schedule replacement on the
+// same kPeriodUs cadence as ObserveSend, while non-socket outcomes (kOk,
+// kWouldBlock, kDecodeError) and transient errors (ECONNREFUSED) keep it open.
+// REQ-RT-22
+TEST(SocketRetry, PermanentReceiveErrorReopensWhileTransientKeepsSocket) {
+  using UdpStatus = talos::protocol::UdpStatus;
+
+  // Before open, receive errors are ignored.
+  {
+    SocketRetry retry;
+    retry.ObserveReceive(kStartUs, UdpStatus::kSocketError, EBADF);
+    EXPECT_FALSE(retry.open());
+    EXPECT_FALSE(retry.replacing());
+  }
+
+  // Non-socket statuses and transient errors keep the socket open.
+  {
+    SocketRetry retry;
+    ASSERT_EQ(retry.Poll(kStartUs, [] { return true; }),
+              SocketRetry::Event::kOpened);
+    const uint64_t t = kStartUs + SocketRetry::kPeriodUs;
+    for (const auto status :
+         {UdpStatus::kOk, UdpStatus::kWouldBlock, UdpStatus::kDecodeError,
+          UdpStatus::kInvalidArgument}) {
+      retry.ObserveReceive(t, status, EBADF);
+      EXPECT_TRUE(retry.open());
+      EXPECT_FALSE(retry.replacing());
+    }
+    for (const int transient : {0, ECONNREFUSED, EAGAIN, EWOULDBLOCK, EINTR}) {
+      SCOPED_TRACE(std::strerror(transient));
+      retry.ObserveReceive(t, UdpStatus::kSocketError, transient);
+      EXPECT_TRUE(retry.open());
+      EXPECT_FALSE(retry.replacing());
+      EXPECT_EQ(retry.Poll(t + kLoopPeriodUs,
+                           [] {
+                             ADD_FAILURE()
+                                 << "transient receive error triggered reopen";
+                             return true;
+                           }),
+                SocketRetry::Event::kNone);
+    }
+  }
+
+  // Every permanent receive error transitions into replacing state and the
+  // next due Poll replaces the socket on the kPeriodUs cadence.
+  uint64_t now = kStartUs;
+  for (const int permanent :
+       {EBADF, ENOTCONN, ENOTSOCK, EPIPE, ENETUNREACH, EADDRNOTAVAIL}) {
+    SCOPED_TRACE(std::strerror(permanent));
+    SocketRetry retry;
+    ASSERT_EQ(retry.Poll(now, [] { return true; }),
+              SocketRetry::Event::kOpened);
+    const uint64_t lost_us = now + SocketRetry::kPeriodUs;
+    retry.ObserveReceive(lost_us, UdpStatus::kSocketError, permanent);
+    EXPECT_FALSE(retry.open());
+    EXPECT_TRUE(retry.replacing());
+    EXPECT_EQ(retry.lost_us(), lost_us);
+    EXPECT_EQ(retry.last_recv_error(), permanent);
+
+    const uint64_t replaced_us = lost_us + kLoopPeriodUs;
+    ASSERT_EQ(retry.Poll(replaced_us, [] { return true; }),
+              SocketRetry::Event::kReplaced);
+    EXPECT_TRUE(retry.open());
+    EXPECT_FALSE(retry.replacing());
+
+    // A permanent receive error immediately after replacement respects the
+    // kPeriodUs throttle.
+    retry.ObserveReceive(replaced_us + kLoopPeriodUs, UdpStatus::kSocketError,
+                         permanent);
+    EXPECT_FALSE(retry.open());
+    EXPECT_TRUE(retry.replacing());
+    for (uint64_t tick = replaced_us + 2 * kLoopPeriodUs;
+         tick < replaced_us + SocketRetry::kPeriodUs; tick += kLoopPeriodUs) {
+      EXPECT_EQ(retry.Poll(tick,
+                           [] {
+                             ADD_FAILURE() << "reopened before kPeriodUs";
+                             return true;
+                           }),
+                SocketRetry::Event::kNone)
+          << tick;
+    }
+    EXPECT_EQ(
+        retry.Poll(replaced_us + SocketRetry::kPeriodUs, [] { return true; }),
+        SocketRetry::Event::kReplaced);
+    now += 1'000'000;
+  }
+}
+
 #ifndef _WIN32
 // The port a bound socket holds; 0 when it has none.
 uint16_t BoundPort(int fd) {

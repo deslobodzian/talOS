@@ -35,6 +35,8 @@ bool EnsureSocketRuntime() {
 
 int LastSocketError() { return WSAGetLastError(); }
 
+void SetLastSocketError(int error) { WSASetLastError(error); }
+
 bool IsWouldBlockError(int error) {
   return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
 }
@@ -55,6 +57,8 @@ using NativeSocket = int;
 bool EnsureSocketRuntime() { return true; }
 
 int LastSocketError() { return errno; }
+
+void SetLastSocketError(int error) { errno = error; }
 
 bool IsWouldBlockError(int error) {
   return error == EAGAIN || error == EWOULDBLOCK || error == EINPROGRESS;
@@ -199,7 +203,9 @@ UdpStatus RuntimeUdpPeer::OpenSocket() {
 
   const UdpStatus status = ConfigureSocket(options_);
   if (status != UdpStatus::kOk) {
+    const int error = LastSocketError();
     Close();
+    SetLastSocketError(error);
     return status;
   }
 
@@ -209,7 +215,9 @@ UdpStatus RuntimeUdpPeer::OpenSocket() {
   local.sin_port = local_port_;
   if (bind(ToNativeSocket(socket_), reinterpret_cast<const sockaddr*>(&local),
            sizeof(local)) != 0) {
+    const int error = LastSocketError();
     Close();
+    SetLastSocketError(error);
     return UdpStatus::kSocketError;
   }
 
@@ -224,6 +232,7 @@ UdpStatus RuntimeUdpPeer::OpenSocket() {
       const int error = LastSocketError();
       if (!options_.non_blocking || !IsWouldBlockError(error)) {
         Close();
+        SetLastSocketError(error);
         return UdpStatus::kSocketError;
       }
     }
@@ -472,6 +481,17 @@ bool SendErrorNeedsNewSocket(int error) {
 #else
   return error == EPIPE || error == ENOTCONN || error == EDESTADDRREQ ||
          error == EADDRNOTAVAIL || error == ENETUNREACH || error == EBADF;
+#endif
+}
+
+bool ReceiveErrorNeedsNewSocket(int error) noexcept {
+#if defined(_WIN32)
+  return error == WSAEBADF || error == WSAENOTCONN || error == WSAENOTSOCK ||
+         error == WSAESHUTDOWN || error == WSAENETUNREACH ||
+         error == WSAEADDRNOTAVAIL;
+#else
+  return error == EBADF || error == ENOTCONN || error == ENOTSOCK ||
+         error == EPIPE || error == ENETUNREACH || error == EADDRNOTAVAIL;
 #endif
 }
 

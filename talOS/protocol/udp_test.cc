@@ -336,5 +336,40 @@ TEST(RuntimeUdpTest, RecordsLastRecvErrorOnSocketError) {
   EXPECT_EQ(peer.stats().last_recv_error, ECONNREFUSED);
 }
 
+// REQ-RT-22: permanent receive errors trigger socket replacement, while
+// transient errors such as ICMP port unreachable (ECONNREFUSED) keep it.
+TEST(RuntimeUdpTest,
+     ReceiveErrorNeedsNewSocketClassifiesPermanentAndTransient) {
+  for (const int permanent :
+       {EBADF, ENOTCONN, ENOTSOCK, EPIPE, ENETUNREACH, EADDRNOTAVAIL}) {
+    EXPECT_TRUE(ReceiveErrorNeedsNewSocket(permanent))
+        << std::strerror(permanent);
+  }
+  for (const int transient : {0, ECONNREFUSED, EAGAIN, EWOULDBLOCK, EINTR,
+                              ENOBUFS, ENETDOWN, EHOSTUNREACH}) {
+    EXPECT_FALSE(ReceiveErrorNeedsNewSocket(transient))
+        << std::strerror(transient);
+  }
+}
+
+// REQ-RT-22: binding an IPv4 local_address that is not assigned to the host
+// fails with EADDRNOTAVAIL rather than falling back to 0.0.0.0.
+TEST(RuntimeUdpTest, OpenFailsCleanlyWhenLocalAddressIsAbsent) {
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(remote, 0);
+  RuntimeUdpPeer peer;
+  errno = 0;
+  EXPECT_EQ(peer.Open("192.0.2.254", 0, "127.0.0.1", remote),
+            UdpStatus::kSocketError);
+  EXPECT_EQ(errno, EADDRNOTAVAIL);
+  EXPECT_FALSE(peer.IsOpen());
+  EXPECT_EQ(peer.NativeFd(), -1);
+  EXPECT_EQ(peer.Reopen(), UdpStatus::kInvalidArgument);
+
+  // A subsequent Open with an assigned address still succeeds cleanly.
+  EXPECT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", remote), UdpStatus::kOk);
+  EXPECT_TRUE(peer.IsOpen());
+}
+
 }  // namespace
 }  // namespace talos::protocol

@@ -145,6 +145,16 @@ class RuntimeUdpPeer {
 // the RoboRIO program) decide with this one function.
 bool SendErrorNeedsNewSocket(int error);
 
+// Whether a receive that failed with OS error `error`
+// (UdpStats::last_recv_error) indicates a broken socket that will never
+// receive again, so only a new one can (Reopen): EBADF, ENOTCONN, ENOTSOCK,
+// EPIPE, ENETUNREACH, EADDRNOTAVAIL (on Windows the WSA equivalents:
+// WSAEBADF, WSAENOTSOCK, WSAENOTCONN, WSAESHUTDOWN, WSAENETUNREACH,
+// WSAEADDRNOTAVAIL). Transient errors such as ECONNREFUSED, EAGAIN,
+// EWOULDBLOCK, EINTR and 0 keep the socket. Both ends' callers (the bridge's
+// HardwareNode, the RoboRIO program) decide with this one function.
+bool ReceiveErrorNeedsNewSocket(int error) noexcept;
+
 const char* UdpStatusName(UdpStatus status);
 
 }  // namespace talos::protocol
