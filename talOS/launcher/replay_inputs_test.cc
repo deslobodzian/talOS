@@ -386,12 +386,13 @@ node = "//talOS/launcher:replay_graph_reader"
     return Replay(node, out_dir, session_dir_);
   }
   int Replay(const std::string& node, const std::string& out_dir,
-             const std::string& session) {
+             const std::string& session, bool allow_capped_replay = false) {
     LauncherOptions options = Options();
     options.config_path = config_;
     options.output_dir = out_dir;
     options.replay_inputs = session;
     options.only = node;
+    options.allow_capped_replay = allow_capped_replay;
     return Launcher{options}.Run();
   }
 
@@ -745,6 +746,135 @@ TEST_F(ReplayInputsTest, RefusesToWriteIntoTheSessionItReads) {
   EXPECT_NE(Replay("replay_consumer", session, session), 0);
   EXPECT_FALSE(std::filesystem::exists(session + "/replay_consumer.tlog"));
   std::filesystem::remove_all(TempPath("refused_session"));
+}
+
+// REQ-OPS-14: --allow-capped-replay requires --replay-inputs on both the
+// launcher and node binaries; with --replay-inputs, it forwards to the node so
+// a byte-capped session replays deterministically from the kept window with a
+// warning on stderr, while default replay still refuses it and uncapped
+// log_gap sessions without EXIT are still refused.
+TEST_F(ReplayInputsTest, AllowCappedReplayFlagEndToEnd) {
+  // 1. Launcher refuses --allow-capped-replay without --replay-inputs.
+  {
+    LauncherOptions options = Options();
+    options.config_path = config_;
+    options.output_dir = TempPath("allow_capped_no_replay");
+    options.allow_capped_replay = true;
+    ::testing::internal::CaptureStderr();
+    const int status = Launcher{options}.Run();
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(status, 1) << err;
+    EXPECT_NE(err.find("--allow-capped-replay"), std::string::npos) << err;
+    EXPECT_NE(err.find("--replay-inputs"), std::string::npos) << err;
+    std::filesystem::remove_all(options.output_dir);
+  }
+
+  // 2. Node binary refuses --allow-capped-replay without --replay-inputs.
+  EXPECT_NE(RunNode(Runfile("TALOS_CONSUMER_NODE"),
+                    {"--allow-capped-replay", "--config", config_}),
+            0);
+
+  // 3. Capped session: default refuses, --allow-capped-replay replays
+  // deterministically and warns on stderr.
+  Record();
+  const std::string session = CopyOfSession("capped_session");
+  const std::string source_log = session + "/replay_source.tlog";
+  std::ofstream{event::log::CappedMarkerPath(source_log)}.close();
+
+  const std::string refused_out = TempPath("capped_refused");
+  std::filesystem::remove_all(refused_out);
+  EXPECT_NE(Replay("replay_consumer", refused_out, session,
+                   /*allow_capped_replay=*/false),
+            0);
+  std::filesystem::remove_all(refused_out);
+
+  const std::string out1 = TempPath("capped_out1");
+  const std::string out2 = TempPath("capped_out2");
+  std::filesystem::remove_all(out1);
+  std::filesystem::remove_all(out2);
+  ASSERT_EQ(
+      Replay("replay_consumer", out1, session, /*allow_capped_replay=*/true),
+      0);
+  ASSERT_EQ(
+      Replay("replay_consumer", out2, session, /*allow_capped_replay=*/true),
+      0);
+  const std::vector<Sent> sends1 =
+      Sends(out1 + "/1/replay_consumer.tlog", "/replay_consumer/state");
+  ASSERT_FALSE(sends1.empty());
+  EXPECT_EQ(Sends(out2 + "/1/replay_consumer.tlog", "/replay_consumer/state"),
+            sends1);
+
+  // Verify the node itself prints the capped-replay warning to stderr.
+  {
+    int pipefd[2];
+    ASSERT_EQ(::pipe(pipefd), 0);
+    const std::string direct_log = TempPath("capped_direct_out.tlog");
+    std::filesystem::remove(direct_log);
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      ::close(pipefd[0]);
+      ::dup2(pipefd[1], STDERR_FILENO);
+      ::close(pipefd[1]);
+      const std::string bin = Runfile("TALOS_CONSUMER_NODE");
+      ::execl(bin.c_str(), bin.c_str(), "--replay-inputs", session.c_str(),
+              "--allow-capped-replay", "--session-id", "1", "--log",
+              direct_log.c_str(), "--config", config_.c_str(), nullptr);
+      ::_exit(127);
+    }
+    ::close(pipefd[1]);
+    std::string node_stderr;
+    char buf[256];
+    for (ssize_t n = 0; (n = ::read(pipefd[0], buf, sizeof(buf))) > 0;) {
+      node_stderr.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(pipefd[0]);
+    int status = 0;
+    ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << node_stderr;
+    EXPECT_NE(node_stderr.find(source_log), std::string::npos) << node_stderr;
+    EXPECT_NE(node_stderr.find("kept window"), std::string::npos)
+        << node_stderr;
+    std::filesystem::remove(direct_log);
+  }
+
+  // 4. Uncapped log_gap without EXIT is still refused under
+  // --allow-capped-replay.
+  {
+    const std::string gap_session = CopyOfSession("capped_with_log_gap");
+    const std::string gap_source = gap_session + "/replay_source.tlog";
+    std::uint64_t exit_offset = 0;
+    {
+      event::log::LogReader reader{gap_source};
+      event::log::LogReader::Record rec;
+      while (reader.next(rec)) {
+        if (rec.header.kind ==
+            static_cast<std::uint16_t>(event::EventKind::EXIT)) {
+          exit_offset = rec.offset;
+        }
+      }
+    }
+    ASSERT_GT(exit_offset, 0u);
+    std::filesystem::resize_file(gap_source, exit_offset);
+    std::ofstream{event::log::CappedMarkerPath(gap_source)}.close();
+    std::ofstream{gap_session + "/manifest.json"}
+        << "{\n  \"session_id\": 1,\n  \"simulation\": true,\n  \"nodes\": "
+           "[{\"name\": \"replay_source\", \"log_paths\": [\""
+        << gap_source
+        << "\"], \"log_gap\": true, \"log_capped\": true, "
+           "\"recorder_failed\": false}]\n}\n";
+    const std::string gap_out = TempPath("capped_gap_out");
+    std::filesystem::remove_all(gap_out);
+    EXPECT_NE(Replay("replay_consumer", gap_out, gap_session,
+                     /*allow_capped_replay=*/true),
+              0);
+    std::filesystem::remove_all(gap_out);
+    std::filesystem::remove_all(TempPath("capped_with_log_gap"));
+  }
+
+  std::filesystem::remove_all(out1);
+  std::filesystem::remove_all(out2);
+  std::filesystem::remove_all(TempPath("capped_session"));
 }
 
 }  // namespace

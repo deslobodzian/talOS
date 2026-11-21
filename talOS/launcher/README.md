@@ -997,11 +997,20 @@ before the active file detected by a `dispatch_index > prev + 1` or
 repeated-sender accepted-`SEND` sequence `> prev + 1` jump; see
 [input replay](../events/README.md#replaying-another-sessions-inputs) for the
 unnumbered-file limits), and one whose damaged
-records nothing bounds the time of. The node's own first run's log is
+records nothing bounds the time of. Passing `--allow-capped-replay` (accepted
+only with `--replay-inputs`; forwarded to the replayed node) overrides the
+`<log>.capped` / `log_capped` refusal and replays from the start of the kept
+window, printing a warning to stderr naming the capped log(s) and noting that
+pre-window history was lost; uncapped `log_gap`, `recorder_failed`, incomplete
+headers, missing non-head segments, and unbounded damage are still refused. The
+node's own first run's log is
 refused the same way, whatever it feeds, when the node had a timer and
 that log's first segment, or a segment before its first firing read, is
 gone or unreadable (the byte cap deleted it, or its header is incomplete):
-it may have held the firing its recorded timeline starts from. So is a
+it may have held the firing its recorded timeline starts from (with
+`--allow-capped-replay`, a byte-capped log whose first segment was rotated out
+starts the timed node at the kept window's earliest recorded firing or
+dispatch). So is a
 timed node's log with no such firing that holds no record of its run, or
 a gap or damaged stretch that may hold its firings. A damaged stretch in another reader's
 log of a topic is no loss only where an intact receipt of the topic follows
@@ -1308,7 +1317,9 @@ holding the lock, and removes it there; a launch creating that path
 meanwhile finds the lock held or the directory gone and creates it again,
 so no launch writes into a directory being removed. A
 `.talos-removing-<session_id>` directory a removal cut short goes at the
-next launch's retention. The supervision loop touches its `session.lock`
+next launch's retention; if a concurrent sweep removes the tree first
+(`ENOENT`), both `remove_idle` and the leftover sweep treat it cleanly as
+removed without reporting an error (`launcher_retention_test.cc`). The supervision loop touches its `session.lock`
 hourly, with the session lock (one `futimens` on the held descriptor, which
 writes and syncs nothing itself), and with it the session's files a launch
 writes once and may leave for days (`manifest.json` in a quiet session,
@@ -1331,27 +1342,29 @@ holds it first and every later retention passes the session over, or a
 retention holds it and is removing the directory, which is reported too. A
 running launcher that holds no `session.lock` (one built before it existed)
 is protected only from launches in its own namespace. So is one whose log
-root's filesystem takes no advisory locks (NFS without a lock daemon,
-macOS's msdos and exFAT volumes): its launch warns once and runs without
-the lock rather than being refused, and retention there removes sessions as
-it did before launches locked them. Such a launch tries the lock again at
-each hourly refresh, and once it takes it (the lock and the probe failed in
-one lock-daemon hiccup, and the daemon answers again) says so once on stderr
-and is passed over by retention from then on. Until that refresh it is not:
-once the daemon answers again, a retention from another namespace whose
-probe now locks can take the unheld lock and remove the running session, a
-window of up to one refresh period (an hour). The retry is a `flock` on the
+root's filesystem takes no advisory locks (`EOPNOTSUPP`, `ENOTSUP`, `EINVAL`,
+`ENOSYS`, such as macOS's msdos and exFAT volumes): its launch warns once and
+runs without the lock rather than being refused, and retention there removes
+sessions as it did before launches locked them. `ENOLCK` is separated from
+`FlockUnsupported`: when probing `.talos-lock-probe` on the log root returns
+`ENOLCK` (such as a network lock daemon being down), retention prints a warning
+naming `ENOLCK` and refuses/skips all deletions, leaving every existing session
+untouched so a running session in another namespace can never be deleted
+(`REQ-OPS-11`, `launcher_retention_test.cc`). Such a launch (started unlocked
+while the lock daemon was down) tries the lock again at each hourly refresh,
+and once it takes it says so once on stderr and is passed over by retention
+from then on. Until that refresh it is not: once the daemon answers again, a
+retention from another namespace whose probe now locks can take the unheld lock
+and remove the running session, a window of up to one refresh period (an hour).
+The retry is a `flock` on the
 supervision thread, against a lock service that has just failed: on a
 network filesystem (a hard-mounted NFS root) that call can block through its
 RPC retries, and with it supervision and the service watchdog's ping, so the
-log root should be on a local disk. Whether a log root takes no locks is
-decided once by retention, and once by the session directory's creation,
-by a shared lock of the root's `.talos-lock-probe` file, never by one
-failing call. A lock daemon already down at that probe therefore makes a
-root whose locks work read as one that takes none for that whole retention
-(`LogRootTakesNoLocks`): while the daemon stays down, a running session's
-`session.lock` fails the same way, reads as unheld, and that retention may
-remove the session. On a root whose probe locked, a session whose `session.lock`
+log root should be on a local disk. Whether a log root supports advisory locks,
+takes none, or has an unavailable lock service (`ENOLCK`) is decided once by
+retention, and once by the session directory's creation, by a shared lock of
+the root's `.talos-lock-probe` file (`ProbeLogRootLocks`), never by one failing
+call. On a root whose probe locked, a session whose `session.lock`
 cannot be locked for such a reason (an NFS lock daemon that stops
 answering) is passed over, with a warning, and a launch whose own lock
 fails so tries again rather than running without it: up to 100 attempts

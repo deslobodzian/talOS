@@ -1072,6 +1072,7 @@ struct Flags {
   bool simulation = false;
   bool describe = false;
   bool targeted_outputs = false;
+  bool allow_capped_replay = false;
   bool log_set = false;  // --log was passed (vs. the /tmp default)
 };
 
@@ -1086,6 +1087,8 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.describe = true;
     } else if (arg == "--targeted-outputs") {
       flags.targeted_outputs = true;
+    } else if (arg == "--allow-capped-replay") {
+      flags.allow_capped_replay = true;
     } else if (arg == "--log" && i + 1 < argc) {
       flags.log_path = argv[++i];
       flags.log_set = true;
@@ -1111,12 +1114,17 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
           "[--duration-s N] [--log PATH] "
           "[--log-max-bytes N] [--log-window-us N] [--session-id ID] "
           "[--config PATH] "
-          "[--graph PATH] [--replay PATH] [--replay-inputs SESSION_DIR]");
+          "[--graph PATH] [--replay PATH] [--replay-inputs SESSION_DIR "
+          "[--allow-capped-replay]]");
     }
   }
   if (!flags.replay_path.empty() && !flags.replay_inputs.empty()) {
     throw std::invalid_argument(
         "--replay and --replay-inputs exclude each other");
+  }
+  if (flags.allow_capped_replay && flags.replay_inputs.empty()) {
+    throw std::invalid_argument(
+        "--allow-capped-replay requires --replay-inputs SESSION_DIR");
   }
   if (flags.duration_s < 0) {
     throw std::invalid_argument("duration must be nonnegative");
@@ -1286,7 +1294,10 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                                 " is not a session directory");
   }
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
-  const event::RecordedSession session{flags.replay_inputs, node_name};
+  const event::InputReplayOptions replay_options{.allow_capped =
+                                                     flags.allow_capped_replay};
+  const event::RecordedSession session{flags.replay_inputs, node_name,
+                                       replay_options};
   event::SimulationEnvironment environment;
   event::log::LogWriterOptions log_options;
   if (log_options_for_test) log_options_for_test(log_options);
@@ -1298,7 +1309,7 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   const Hosted hosted =
       Host(std::make_unique<OfflinePort<Loop>>(loop), node_name, flags, make);
   const event::InputReplayReport report =
-      event::ReplayInputs(loop, environment, session);
+      event::ReplayInputs(loop, environment, session, replay_options);
 
   std::printf(
       "replay-inputs: %zu logs of session %llu, %.3f s\n",

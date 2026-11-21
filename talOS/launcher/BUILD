@@ -63,6 +63,27 @@ cc_test(
     ],
 )
 
+# Retention lock safety (ENOLCK refusal-to-delete vs lockless roots) and
+# racing ENOENT removal sweep (REQ-OPS-11).
+cc_test(
+    name = "launcher_retention_test",
+    size = "small",
+    srcs = ["launcher_retention_test.cc"],
+    tags = [
+        "integration",
+        "no_macos_sanitizer",
+    ],
+    deps = [
+        ":first_exec",
+        ":launcher_lib",
+        ":registry_cleanup",
+        ":session",
+        ":stop_signal_guard",
+        "//talOS/introspection:describe",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # fork + exec into a process group with a guardian, and the child's reports.
 cc_library(
     name = "spawn",

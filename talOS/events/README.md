@@ -475,9 +475,18 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   topics not sent on both sides). Each recorded topic names the first such log
   it is fed from, or
   one with a damaged stretch nothing bounds (`RecordedTopic::refused_log`,
-  `refused_reason`), by the same rule as gaps, and `ReplayInputs` throws a
+  `refused_reason`; byte-capped logs in `capped_log`, `capped_reason`), by the
+  same rule as gaps, and `ReplayInputs` throws a
   `ReplayError` before anything runs, naming the log, the sign and the topic;
-  a node binary prints it and exits 1. The replayed program's own first
+  a node binary prints it and exits 1. With `InputReplayOptions::allow_capped`
+  (CLI `--allow-capped-replay`), byte-capped logs (`<log>.capped` or manifest
+  `log_capped`, including a first segment rotated out by the byte cap) are
+  replayed from the start of the kept window instead of refused, printing a
+  warning to stderr listing the capped logs and noting that pre-window history
+  was lost; uncapped `log_gap` or `recorder_failed` runs without `EXIT`,
+  incomplete-header segments, unmarked missing segments, and unbounded damaged
+  stretches are still refused, and any `GAP` record inside the kept window
+  still stops the run. The replayed program's own first
   run's log is refused the same way, fed topic or not, when its manifest
   arms a timer and its first segment (`<stem>.segment0.tlog`) was not read
   (the byte cap deleted it, its header is incomplete, a later numbered segment
@@ -487,9 +496,14 @@ replay with their own delivery (`ON_PUBLISH` or `BEFORE_TIMERS`).
   `dispatch_index > prev + 1` or repeated-sender accepted-`SEND` sequence
   `> prev + 1` jump into the active file): the firing `run_start()` is read
   from may have been there, and a later segment's first firing may be whole
-  periods later (`RecordedSession::run_start_refused_log`, naming the first
-  file read, or the one that does not continue the segment before it, and the
-  sign). So is such a log with no firing that gives the run start when it
+  periods later (`RecordedSession::run_start_refused_log`, or
+  `run_start_capped_log` when the byte cap rotated segment 0 out, naming the
+  first file read, or the one that does not continue the segment before it, and
+  the sign). With `InputReplayOptions::allow_capped`, a byte-capped log whose
+  first segment was rotated out instead starts the timed node at the kept
+  window's earliest recorded timer firing (less its offset) or dispatch, with
+  late-`EXIT` clamping disabled since pre-window timer state is unknown. So is
+  such a log with no firing that gives the run start when it
   holds no record of its run (no dispatch nor `EXIT`: nothing gives its start
   or its end), or a GAP record or damaged stretch, which may hold its firings.
   A capped log that kept its first segment (capture stopped at the cap) still
@@ -514,10 +528,12 @@ Pass an explicit `--session-id` to keep that header field stable. The log's
 wall-clock start timestamp remains informational.
 
 Node binaries expose this as
-`--replay-inputs <session dir>` (`talOS/node/node.cc`, Python nodes included
+`--replay-inputs <session dir> [--allow-capped-replay]` (`talOS/node/node.cc`,
+Python nodes included
 through the C ABI; a path that is not a directory is refused naming it as
-given, and any other filesystem error such as `EACCES` reports the OS error);
-the launcher as `--replay-inputs <dir> --only <node>`
+given, any other filesystem error such as `EACCES` reports the OS error, and
+`--allow-capped-replay` without `--replay-inputs` is refused);
+the launcher as `--replay-inputs <dir> --only <node> [--allow-capped-replay]`
 (`talOS/launcher/README.md`). Byte topics (`Node::publish_bytes`) are
 discarded there, as under `--replay`: the loop never logs them, and an offline
 run must not write into a live robot's shared memory.

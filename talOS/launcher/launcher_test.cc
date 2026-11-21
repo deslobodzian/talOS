@@ -3604,12 +3604,12 @@ TEST(LauncherSessions, ACrashLoopBesideARunningSessionLeavesOneDirectory) {
   std::filesystem::remove_all(root);
 }
 
-// A log root on a filesystem without advisory locks (NFS without a lock
-// daemon: ENOLCK; macOS msdos and exFAT volumes: ENOTSUP) cannot hold a
-// session directory's lock. The robot still starts: one warning, and the
-// session runs without it, protected as before launches locked their
-// directories (by the namespace's session lock only); retention removes
-// as it did then.
+// A log root on a filesystem without advisory locks (macOS msdos and exFAT
+// volumes: ENOTSUP/EOPNOTSUPP; ENOSYS) cannot hold a session directory's lock.
+// The robot still starts: one warning, and the session runs without it,
+// protected as before launches locked their directories (by the namespace's
+// session lock only); retention removes as it did then. (ENOLCK is tested
+// separately in launcher_retention_test.cc: retention refuses all deletions.)
 // REQ-OPS-11
 TEST(LauncherSessions, ALogRootWithoutLocksStillLaunches) {
   auto options = SessionFixture("no_locks");
@@ -3621,7 +3621,7 @@ TEST(LauncherSessions, ALogRootWithoutLocksStillLaunches) {
   std::ofstream{options.config_path} << configuration;
   WriteSessionManifest(root + "/1", 1, 1001, 1101);
   options.lock_session_directory = [](int, int) {
-    errno = ENOLCK;
+    errno = EOPNOTSUPP;
     return -1;
   };
   options.session_id = 2;

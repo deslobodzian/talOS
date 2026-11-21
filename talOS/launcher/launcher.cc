@@ -691,6 +691,12 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
     return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
+  if (options_.allow_capped_replay && options_.replay_inputs.empty()) {
+    constexpr std::string_view kMessage =
+        "--allow-capped-replay requires --replay-inputs SESSION_DIR";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
+  }
   // The launcher gives the simulator the bridge's ports (SimulatorArgs); a
   // port written by hand as well could only disagree with the bridge's.
   for (const std::string& arg : options_.sim_gateway_args) {
@@ -1371,6 +1377,7 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
                                 "--config",
                                 options_.config_path};
   if (simulation) args.push_back("--sim");
+  if (options_.allow_capped_replay) args.push_back("--allow-capped-replay");
   std::string error;
   const pid_t pid = SpawnProcess(std::move(args), error);
   if (pid < 0) {
