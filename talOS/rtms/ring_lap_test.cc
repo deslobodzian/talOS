@@ -308,6 +308,7 @@ TEST(RingLap, DropNewestDeliversEveryMessageOnOneMapping) {
   }
 
   std::latch start{static_cast<std::ptrdiff_t>(kReaders) + 1};
+  std::atomic<bool> failed{false};
   std::array<std::uint64_t, kReaders> received{};
   std::array<std::string, kReaders> failure{};
 
@@ -316,7 +317,8 @@ TEST(RingLap, DropNewestDeliversEveryMessageOnOneMapping) {
     readers[r] = std::thread{[&, r] {
       start.arrive_and_wait();
       DropNewestPayload copy{};
-      while (received[r] < kMessages) {
+      while (received[r] < kMessages &&
+             !failed.load(std::memory_order_acquire)) {
         MessageInfo info{};
         const ReadResult read = queue.read_next(
             reader_ids[r], std::as_writable_bytes(std::span{copy}), info);
@@ -334,9 +336,14 @@ TEST(RingLap, DropNewestDeliversEveryMessageOnOneMapping) {
               "{}, first foreign word {}",
               expected, static_cast<int>(read), info.sequence, info.dropped,
               info.publish_time_ns, FirstForeignWord(copy, expected));
+          failed.store(true, std::memory_order_release);
+          queue.release_reader(reader_ids[r]);
           return;
         }
         ++received[r];
+      }
+      if (failed.load(std::memory_order_acquire)) {
+        queue.release_reader(reader_ids[r]);
       }
     }};
   }
@@ -344,7 +351,7 @@ TEST(RingLap, DropNewestDeliversEveryMessageOnOneMapping) {
   start.arrive_and_wait();
   DropNewestPayload message{};
   std::uint64_t written = 0;
-  while (written < kMessages) {
+  while (written < kMessages && !failed.load(std::memory_order_acquire)) {
     FillRingPayload(message, written);
     const WriteStatus status = queue.write(std::as_bytes(std::span{message}),
                                            RingPublishTime(written));
@@ -353,6 +360,7 @@ TEST(RingLap, DropNewestDeliversEveryMessageOnOneMapping) {
       continue;
     }
     if (status.result != WriteResult::SUCCESS) {
+      failed.store(true, std::memory_order_release);
       break;
     }
     ++written;
