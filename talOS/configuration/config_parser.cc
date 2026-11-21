@@ -1,7 +1,5 @@
 #include "talOS/configuration/config_parser.h"
 
-#include <arpa/inet.h>
-
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -81,9 +79,27 @@ std::string ReadNonEmpty(const toml::table& tbl, const char* key,
   return v;
 }
 
-bool IsIpv4Address(const std::string& address) {
-  in_addr parsed{};
-  return inet_pton(AF_INET, address.c_str(), &parsed) == 1;
+// Strict dotted-quad IPv4 literal (four decimal octets in [0, 255] with no
+// leading zeros, whitespace, signs, IPv6 syntax, or trailing bytes).
+bool IsIpv4Address(std::string_view address) {
+  if (address.empty()) return false;
+  std::size_t pos = 0;
+  for (int octet = 0; octet < 4; ++octet) {
+    if (octet > 0) {
+      if (pos >= address.size() || address[pos] != '.') return false;
+      ++pos;
+    }
+    const std::size_t start = pos;
+    int value = 0;
+    while (pos < address.size() && address[pos] >= '0' && address[pos] <= '9') {
+      value = value * 10 + (address[pos] - '0');
+      if (value > 255) return false;
+      ++pos;
+    }
+    const std::size_t digits = pos - start;
+    if (digits == 0 || (digits > 1 && address[start] == '0')) return false;
+  }
+  return pos == address.size();
 }
 
 int64_t ReadPositive(const toml::table& tbl, const char* key, int64_t def,
@@ -1108,6 +1124,25 @@ std::string ResolveControllerAddress(const RobotConfig& config,
   return cli_override;
 }
 
+std::string ResolveLocalAddress(const RobotConfig& config,
+                                std::string_view cli_override) {
+  if (!cli_override.empty()) {
+    if (!IsIpv4Address(cli_override)) {
+      throw std::invalid_argument(
+          "--local-address must be an IPv4 address, not '" +
+          std::string(cli_override) + "'");
+    }
+    return std::string(cli_override);
+  }
+  if (config.local_address.empty()) return {};
+  if (!IsIpv4Address(config.local_address)) {
+    throw std::invalid_argument(
+        "[robot] field 'local_address' must be an IPv4 address, not '" +
+        config.local_address + "'");
+  }
+  return config.local_address;
+}
+
 uint16_t ResolveControllerPort(const RobotConfig& config,
                                uint16_t cli_override) {
   if (cli_override != 0) return cli_override;
@@ -1130,7 +1165,7 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
     throw std::invalid_argument("[robot] must be a table");
   }
   if (const auto* robot = root["robot"].as_table()) {
-    static constexpr std::array<std::string_view, 16> kRobotKeys = {
+    static constexpr std::array<std::string_view, 17> kRobotKeys = {
         "name",
         "period_us",
         "command_timeout_us",
@@ -1139,6 +1174,7 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
         "require_target_coverage",
         "simulation_only",
         "controller_address",
+        "local_address",
         "controller_port",
         "local_port",
         "log_keep_sessions",
@@ -1181,6 +1217,16 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
           "[robot] field 'controller_address' must be an IPv4 address such "
           "as \"10.56.87.2\", not '" +
           result.controller_address + "': the bridge resolves no hostname");
+    }
+    if (robot->contains("local_address")) {
+      result.local_address =
+          ReadNonEmpty(*robot, "local_address", "", "[robot]");
+      if (!IsIpv4Address(result.local_address)) {
+        throw std::invalid_argument(
+            "[robot] field 'local_address' must be an IPv4 address such as "
+            "\"10.56.87.5\", not '" +
+            result.local_address + "'");
+      }
     }
     result.controller_port =
         ReadPort(*robot, "controller_port", result.controller_port, "[robot]");

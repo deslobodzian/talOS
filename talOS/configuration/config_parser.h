@@ -131,6 +131,11 @@ struct RobotConfig {
   // An IPv4 literal: the bridge's socket (talOS/protocol/udp.h) takes one
   // and never resolves a hostname, so config load refuses anything else.
   std::string controller_address{"127.0.0.1"};
+  // Optional IPv4 local interface address for the bridge's gateway UDP socket
+  // (`[robot] local_address`). Empty when unset, keeping wildcard `0.0.0.0`.
+  // When set, config load requires an IPv4 literal without leading zeros
+  // (REQ-RT-22, REQ-OPS-25).
+  std::string local_address;
   uint16_t controller_port{5802};
   uint16_t local_port{5803};
 
@@ -280,6 +285,13 @@ uint16_t ParsePortFlag(std::string_view flag, std::string_view value,
 // does for controller_address.
 std::string ResolveControllerAddress(const RobotConfig& config,
                                      const std::string& cli_override);
+
+// Effective local bind address: an explicit CLI value wins, otherwise `[robot]
+// local_address`, or "" when neither is set (wildcard `0.0.0.0`). A non-empty
+// value that is not an IPv4 literal throws std::invalid_argument naming
+// `--local-address` or `local_address`.
+std::string ResolveLocalAddress(const RobotConfig& config,
+                                std::string_view cli_override);
 
 uint16_t ResolveControllerPort(const RobotConfig& config,
                                uint16_t cli_override);

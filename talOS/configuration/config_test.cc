@@ -362,6 +362,59 @@ local_port = 5805
   }
 }
 
+// REQ-OPS-25, REQ-CONTRACT-17: [robot] local_address defaults to empty
+// (wildcard), validates IPv4 literals strictly when set, and yields to a
+// non-empty CLI --local-address override.
+TEST(ConfigTest, LocalAddressDefaultsEmptyValidatesIpv4AndPrefersCliOverride) {
+  const auto omitted = Parse("");
+  EXPECT_TRUE(omitted.local_address.empty());
+  EXPECT_EQ(ResolveLocalAddress(omitted, ""), "");
+  EXPECT_EQ(ResolveLocalAddress(omitted, "10.56.87.6"), "10.56.87.6");
+
+  const auto configured = Parse("[robot]\nlocal_address = \"10.56.87.5\"\n");
+  EXPECT_EQ(configured.local_address, "10.56.87.5");
+  EXPECT_EQ(ResolveLocalAddress(configured, ""), "10.56.87.5");
+  EXPECT_EQ(ResolveLocalAddress(configured, "10.0.0.9"), "10.0.0.9");
+
+  for (const char* bad : {"\"\"", "123", "\"roborio.local\"", "\"10.0.0\"",
+                          "\"256.0.0.1\"", "\"10.0.0.1.2\"", "\"::1\"",
+                          "\"fe80::1\"", "\"010.56.87.5\"", "\"10.00.87.5\""}) {
+    SCOPED_TRACE(bad);
+    try {
+      Parse(std::string("[robot]\nlocal_address = ") + bad + "\n");
+      ADD_FAILURE() << "accepted invalid local_address " << bad;
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find("local_address"),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+
+  for (const char* bad_cli :
+       {"roborio.local", "10.0.0", "256.0.0.1", "::1", "010.56.87.5"}) {
+    SCOPED_TRACE(bad_cli);
+    try {
+      (void)ResolveLocalAddress(configured, bad_cli);
+      ADD_FAILURE() << "accepted invalid --local-address " << bad_cli;
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find("--local-address"),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+
+  RobotConfig invalid_config = omitted;
+  invalid_config.local_address = "010.0.0.1";
+  try {
+    (void)ResolveLocalAddress(invalid_config, "");
+    ADD_FAILURE() << "accepted invalid config.local_address";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string_view{error.what()}.find("local_address"),
+              std::string_view::npos)
+        << error.what();
+  }
+}
+
 // Log retention keys of the wrong type or sign are refused, not defaulted.
 TEST(ConfigTest, RejectsInvalidLogRetention) {
   EXPECT_EQ(Parse("[robot]\nlog_keep_sessions = 3\n").log_keep_sessions, 3);
