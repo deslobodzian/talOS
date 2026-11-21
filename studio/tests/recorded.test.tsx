@@ -1374,5 +1374,67 @@ test('Hardware, Subsystems, Pose3d, Vision and Frames render recorded sessions h
       </StudioProvider>);
   assert.match(framesHtml, /Choose a recorded frames directory/);
 
+  // Every channel requested from /series must be present in channels.json.
+  const declaredNames = new Set(channels.map(c => c.name));
+  for (const call of server.of('/series')) {
+    for (const chName of call.url.searchParams.get('c')!.split(',')) {
+      assert.ok(declaredNames.has(chName), `requested absent channel ${chName}`);
+    }
+  }
+
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41, REQ-OPS-51: studio_review returns HTTP 404 on unknown channel
+// names (which pauses playback), so HardwarePanel on hardware_not_decoded (or
+// partial /hw/status) and VisionPanel on minimal camera/estimator recordings
+// must never request channels absent from the dictionary.
+test('HardwarePanel and VisionPanel never request absent channels on recorded sessions', async () => {
+  // 1. HardwarePanel on hardware_not_decoded: zero /series requests.
+  const undecodedServer = fakeServer(echoSnapshot);
+  const undecoded = new RecordedSource(
+      SERVER, 's1', [],
+      {...BOUNDS, hardware_not_decoded: 'protocol mismatch'},
+      undecodedServer.fetchFn, fakeClock().clock,
+      {...EMPTY_TIMELINE, hardware_not_decoded: true}, null);
+  const studio = createStaticStudio();
+  studio.openRecorded(undecoded);
+  const undecodedHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="hw"/>
+      </StudioProvider>);
+  assert.match(undecodedHtml, /protocol mismatch/);
+  assert.equal(undecodedServer.of('/series').length, 0);
+  studio.closeRecorded();
+
+  // 2. VisionPanel on minimal camera (pose/x_m + x_std_m + tag_count only)
+  //    and minimal estimator (observation_accepted_count only): never requests
+  //    absent camera/estimator fields.
+  const minimalChannels = [
+    'front_cam/state/pose/x_m',
+    'front_cam/state/x_std_m',
+    'front_cam/state/tag_count',
+    'pose_estimator/state/observation_accepted_count'
+  ].map(info);
+  const present = new Set(minimalChannels.map(c => c.name));
+  const visServer = fakeServer(echoSnapshot);
+  const minimalRec = new RecordedSource(
+      SERVER, 's1', minimalChannels, BOUNDS, visServer.fetchFn,
+      fakeClock().clock, EMPTY_TIMELINE, null);
+  studio.openRecorded(minimalRec);
+  const visHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <visionPanel.component config={visionPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="vis"/>
+      </StudioProvider>);
+  assert.match(visHtml, /front_cam/);
+  assert.match(visHtml, /POSE_ESTIMATOR/);
+  const visRequested = visServer.of('/series').flatMap(
+      call => call.url.searchParams.get('c')!.split(','));
+  assert.ok(visRequested.length > 0);
+  for (const chName of visRequested) {
+    assert.ok(present.has(chName), `VisionPanel requested absent channel ${chName}`);
+  }
   studio.closeRecorded();
 });

@@ -29,6 +29,8 @@ import './subsystems.css';
 export type SubsystemsConfig = {selected: string[] | null};
 
 const defaultConfig: SubsystemsConfig = {selected: null};
+const EMPTY_RATES: Record<string, number> = {};
+const SPARKLINE_WIDTH = 150;
 
 function parseConfig(raw: unknown): SubsystemsConfig {
   const obj = raw && typeof raw === 'object' && !Array.isArray(raw) ?
@@ -262,7 +264,7 @@ function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
     return [...names].sort();
   }, [visible, infoBy]);
 
-  const series = useSeries(seriesChannels, {seconds: 30});
+  const series = useSeries(seriesChannels, {seconds: 30}, SPARKLINE_WIDTH);
 
   const toggle = (name: string) => {
     const selected = config.selected;
@@ -308,7 +310,7 @@ function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
                             snapshot={snapshot}
                             node={graph?.nodes.find(n => n.name === sub.name)}
                             graphStale={recorded ? false : system.stale}
-                            rates={recorded ? {} : system.rates} series={series}/>)}
+                            rates={recorded ? EMPTY_RATES : system.rates} series={series}/>)}
          </div>}
   </div>;
 }

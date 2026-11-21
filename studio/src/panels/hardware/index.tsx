@@ -37,6 +37,7 @@ const defaultConfig: HardwareConfig = {};
 const parseConfig = (_raw: unknown): HardwareConfig => ({});
 
 const HW = 'hw/status/';
+const EMPTY = new Float64Array(0);
 
 // The counter tallies the bridge and gateway publish on /hw/status, in the
 // order a person cares about them. Explanations come from the bridge_status
@@ -228,13 +229,21 @@ function HardwarePanel() {
   const buses = canBuses(ch, busNames);
   const busCount = num('can_bus_count');
   const busChannels = useMemo(() => canBusSeriesChannels(busCount), [busCount]);
-  const power = useSeries(
-      [`${HW}battery_v`, `${HW}brownout`, ...busChannels], {seconds: 120});
-  const age = useSeries([`${HW}state_age_us`], {seconds: 120});
-  const masks = useSeries(
-      [`${HW}timed_out_mask`, `${HW}motor_fault_mask`,
-       `${HW}motor_forward_limit_mask`, `${HW}motor_reverse_limit_mask`],
-      'all');
+  const powerChannels = useMemo(
+      () => [`${HW}battery_v`, `${HW}brownout`, ...busChannels]
+          .filter(name => present.has(name)),
+      [busChannels, present]);
+  const power = useSeries(powerChannels, {seconds: 120});
+  const ageChannels = useMemo(
+      () => [`${HW}state_age_us`].filter(name => present.has(name)),
+      [present]);
+  const age = useSeries(ageChannels, {seconds: 120});
+  const maskChannels = useMemo(
+      () => [`${HW}timed_out_mask`, `${HW}motor_fault_mask`,
+             `${HW}motor_forward_limit_mask`, `${HW}motor_reverse_limit_mask`]
+          .filter(name => present.has(name)),
+      [present]);
+  const masks = useSeries(maskChannels, 'all');
 
   const counterNames = useMemo(
       () => COUNTERS.filter(c => present.has(`${HW}${c.name}`))
@@ -260,7 +269,8 @@ function HardwarePanel() {
         ...spec,
         total: count(ch[`${HW}${spec.name}`]),
         rate: rateString(counterRate(
-            counterSeries.times, counterSeries.values[`${HW}${spec.name}`]))
+            counterSeries.times,
+            counterSeries.values[`${HW}${spec.name}`] ?? EMPTY))
       });
     }
     return out;
@@ -289,15 +299,18 @@ function HardwarePanel() {
     </div>;
   }
 
-  const brownoutBands = flagBands(power.times, power.values[`${HW}brownout`]);
+  const brownoutBands =
+      flagBands(power.times, power.values[`${HW}brownout`] ?? EMPTY);
   const busLines = canBusLines(busCount, power, busNames);
   const timedOutBits = bitHistory(
-      masks.times, masks.values[`${HW}timed_out_mask`], subsystemCount ?? 32);
-  const faultBits = bitHistory(masks.times, masks.values[`${HW}motor_fault_mask`]);
+      masks.times, masks.values[`${HW}timed_out_mask`] ?? EMPTY,
+      subsystemCount ?? 32);
+  const faultBits = bitHistory(
+      masks.times, masks.values[`${HW}motor_fault_mask`] ?? EMPTY);
   const forwardLimitBits = bitHistory(
-      masks.times, masks.values[`${HW}motor_forward_limit_mask`]);
+      masks.times, masks.values[`${HW}motor_forward_limit_mask`] ?? EMPTY);
   const reverseLimitBits = bitHistory(
-      masks.times, masks.values[`${HW}motor_reverse_limit_mask`]);
+      masks.times, masks.values[`${HW}motor_reverse_limit_mask`] ?? EMPTY);
 
   return <div className="hardware">
     <FreshnessNotice prefix={HW}/>
@@ -316,7 +329,8 @@ function HardwarePanel() {
         <h3>Battery voltage · 2 min</h3>
         <TimeSeriesChart
             lines={[{name: 'battery_v', color: 'var(--accent)',
-                     times: power.times, values: power.values[`${HW}battery_v`]}]}
+                     times: power.times,
+                     values: power.values[`${HW}battery_v`] ?? EMPTY}]}
             bands={brownoutBands} height={96} legend={false}/>
         <p className="chart-note">Shaded spans are brownout ({
             brownout === undefined ? 'unknown' : brownout ? 'active' : 'clear'
@@ -354,7 +368,8 @@ function HardwarePanel() {
         <h3>State age · 2 min</h3>
         <TimeSeriesChart
             lines={[{name: 'state_age_us', color: 'var(--accent)',
-                     times: age.times, values: age.values[`${HW}state_age_us`]}]}
+                     times: age.times,
+                     values: age.values[`${HW}state_age_us`] ?? EMPTY}]}
             height={96} threshold={timeoutUs} legend={false}/>
         <p className="chart-note">
           {timeoutUs === undefined ?

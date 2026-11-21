@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -343,6 +344,119 @@ TEST(ManifestReplay, PerRunGapAndRecorderFailedArraysScopeRefusals) {
       std::filesystem::remove_all(dir);
     }
   }
+  {
+    SCOPED_TRACE(
+        "inconsistent log_gap:true with gap_logs:[] fails closed as "
+        "member-wide");
+    const std::string dir = TempDir("inconsistent_empty_gap_logs");
+    const std::string run0 = RecordSource(dir, true);
+    const std::uint64_t id = event::log::LogReader{run0}.session_id();
+    const std::string json = "{\n  \"session_id\": " + std::to_string(id) +
+                             ",\n  \"nodes\": [{\n"
+                             "    \"name\": \"source\",\n"
+                             "    \"log_paths\": [\"/robot/source.tlog\"],\n"
+                             "    \"log_gap\": true,\n"
+                             "    \"gap_logs\": [],\n"
+                             "    \"recorder_failed\": false,\n"
+                             "    \"recorder_failed_logs\": [],\n"
+                             "    \"log_capped\": false\n"
+                             "  }]\n}\n";
+    std::string error;
+    ASSERT_TRUE(WriteFileAtomically(dir + "/manifest.json", json, {}, error))
+        << error;
+
+    const event::RecordedSession session{dir};
+    event::SimulationEnvironment environment;
+    event::SimulatedEventLoop<> loop{
+        environment,
+        event::SimulatedEventLoop<>::Options{.start = session.start()}};
+    Reader reader{loop};
+    try {
+      event::ReplayInputs(loop, environment, session);
+      ADD_FAILURE() << "accepted log_gap:true with empty gap_logs";
+    } catch (const event::ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(run0), std::string::npos) << what;
+      EXPECT_NE(what.find("log_gap"), std::string::npos) << what;
+    }
+    EXPECT_EQ(reader.readings, 0);
+    std::filesystem::remove_all(dir);
+  }
+}
+
+// LOG-29(c): when the launcher's manifest lists a restarted writer run in
+// `log_paths` whose file is missing from the session directory, the remaining
+// exited writer run must NOT rescue a capped reader log. REQ-OPS-14
+TEST(ManifestReplay, MissingRestartedWriterLogPreventsRescuingCappedReader) {
+  const std::string dir = TempDir("missing_restarted_writer");
+  event::SimulationEnvironment record_env;
+  const std::string run0 =
+      RecordSourceRun(dir, "source.tlog", record_env, kOrigin, false);
+  const std::string run1 = RecordSourceRun(dir, "source.restart1.tlog",
+                                           record_env, kOrigin + 50ms, false);
+  // Record a reader that watched kTopic during run0 and mark it capped.
+  const std::string reader_log = dir + "/watcher.tlog";
+  {
+    struct LoggedWatcher {
+      explicit LoggedWatcher(Loop& loop) {
+        event::watch<Reading, &LoggedWatcher::on_reading>(loop, kTopic, this);
+      }
+      void on_reading(const event::Context&, const Reading&) {}
+    };
+    Loop wloop{record_env, event::log::LogWriter{reader_log, "watcher"},
+               Loop::Options{.start = kOrigin}};
+    const LoggedWatcher watcher{wloop};
+    wloop.run_until(kOrigin + std::chrono::milliseconds{kReadings});
+    wloop.finish();
+  }
+  {
+    std::ofstream marker{event::log::CappedMarkerPath(reader_log)};
+    ASSERT_TRUE(marker.good());
+  }
+
+  SessionManifest manifest;
+  manifest.session_id = event::log::LogReader{run0}.session_id();
+  NodeProcessInfo writer_member;
+  writer_member.name = "source";
+  writer_member.log_path = run0;
+  writer_member.log_paths = {run0, run1};
+  manifest.nodes.push_back(writer_member);
+  NodeProcessInfo reader_member;
+  reader_member.name = "watcher";
+  reader_member.log_path = reader_log;
+  reader_member.log_paths = {reader_log};
+  manifest.nodes.push_back(reader_member);
+  std::string error;
+  ASSERT_TRUE(
+      WriteFileAtomically(dir + "/manifest.json", manifest.ToJson(), {}, error))
+      << error;
+
+  // With both exited writer runs present, the writer rescues the capped reader.
+  {
+    const event::RecordedSession session{dir};
+    event::SimulationEnvironment env;
+    event::SimulatedEventLoop<> loop{
+        env, event::SimulatedEventLoop<>::Options{.start = session.start()}};
+    Reader reader{loop};
+    const event::InputReplayReport report =
+        event::ReplayInputs(loop, env, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(reader.readings, 2 * kReadings);
+  }
+
+  // Delete the restarted writer run listed in manifest.json: writer is no
+  // longer complete, so the capped reader is refused instead of rescued.
+  std::filesystem::remove(run1);
+  {
+    const event::RecordedSession session{dir};
+    event::SimulationEnvironment env;
+    event::SimulatedEventLoop<> loop{
+        env, event::SimulatedEventLoop<>::Options{.start = session.start()}};
+    Reader reader{loop};
+    EXPECT_THROW(event::ReplayInputs(loop, env, session), event::ReplayError);
+    EXPECT_EQ(reader.readings, 0);
+  }
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace

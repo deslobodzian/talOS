@@ -63,8 +63,10 @@ Accepted bounds:
 
 - Non-exempt `*.toml` files are matched case-insensitively (e.g. `.TOML`,
   `.Toml`), and any non-exempt symlink (file or directory symlink, regardless
-  of extension) fails closed; regular non-TOML files are not inspected (robot
-  and bench configs are TOML).
+  of extension) fails closed; regular non-TOML files and non-TOML gitlinks
+  (mode `160000`, git submodules; a gitlink at a non-exempt `*.toml` path
+  still fails closed as a non-regular file mode) are not inspected (robot and
+  bench configs are TOML).
 - Any path under exact-case `EXEMPT_DIRECTORIES` (`examples`, `tests`,
   `fixtures`) or a `*testdata` directory is exempt per REQ-DEV-33, even if real
   config were placed there.

@@ -46,6 +46,7 @@ class WebrootStampTest(unittest.TestCase):
     def test_changes_when_any_input_changes_or_is_added(self):
         base = webroot_stamp.compute_stamp(self.root)
         for rel in (
+            "studio/agent/rpc.ts",
             "studio/drive.html",
             "studio/pnpm-lock.yaml",
             "talOS/telemetry/telemetry.fbs",
@@ -71,6 +72,7 @@ class WebrootStampTest(unittest.TestCase):
         self.assertEqual(lines, sorted(lines))
         for rel in webroot_stamp.FIXED_INPUTS:
             self.assertIn(rel, lines)
+        self.assertIn("studio/agent/rpc.ts", lines)
         self.assertIn("studio/src/main.tsx", lines)
         self.assertIn("studio/src/drive/main.ts", lines)
         self.assertFalse(
