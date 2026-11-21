@@ -21,6 +21,14 @@ reading the existing tags follow (`// REQ-SAFE-09`, `# REQ-A, REQ-B: why`).
   a quoted BRINGUP.md heading after `BR`, or a BENCH.md heading after
   `BENCH.md`. Tags in the sources of a quarantined target do not count
   (TESTING.md §8.3);
+- a SAFE, CONTRACT or P0 requirement without a cited verification whose
+  `Cheapest tier` names a Bazel-runnable tier (`unit`, `component`, `contract`,
+  `fuzz`/`property`, `integration`, `e2e`) and that has no tagged test at or
+  below that tier. Bazel test targets map to lanes from their `BUILD` /
+  `BUILD.bazel` `tags` (`fast` untagged, `heavy`, `integration`, `e2e`, `perf`,
+  or `soak` when `manual`); GradleRIO `controller_processor/rio/src/test/cpp/*`
+  and Studio Vitest `studio/tests/*.test.ts*` map to `fast`. Higher-tier
+  composition tags remain allowed as additional evidence;
 - a target tagged `quarantine` in a BUILD file without an open TODO.md item
   naming its label (`//pkg:name`), or whose latest date (YYYY-MM-DD) is past
   or more than 14 days out;
@@ -29,12 +37,6 @@ reading the existing tags follow (`// REQ-SAFE-09`, `# REQ-A, REQ-B: why`).
   scope" table names or contains, and an entry naming no tracked directory.
   An entry is a backticked path from the repository root;
   `a/{b,c}` expands.
-
-Not enforced: the tier clause ("at its Cheapest tier or below"). A test's tier
-is not derivable from the tree today: tiers are defined by the resources a
-test touches (TESTING.md §2) and the lanes are not yet Bazel tags (LANE-1),
-so `--report` prints each requirement's Cheapest tier beside its tests for a
-reviewer to judge, and the check asks only for a tagged test.
 
 Framework catalogues. A robot repository keeps its own rows in its
 docs/REQUIREMENTS.md and tags its tests with talOS's rows too. Each
@@ -81,6 +83,35 @@ TODO_ITEM = re.compile(r"^- \[ \] \*\*([A-Z][A-Z0-9]*-\d+)\b")
 TODO_ID = re.compile(r"(?<![\w-])([A-Z][A-Z0-9]*-\d+)\b")
 DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 QUARANTINE_DAYS = 14
+
+# Bazel lane -> numeric rank (docs/TESTING.md §9). Lower rank is cheaper.
+# `fast` covers unit, component, contract and bounded fuzz; `heavy` covers
+# CPU-bound deterministic component/contract tests; `soak`/`manual` and
+# `unknown` (a test source wired to no test rule) never satisfy a runnable
+# cheapest tier.
+LANE_RANK = {
+    "fast": 0,
+    "heavy": 1,
+    "integration": 2,
+    "e2e": 3,
+    "perf": 4,
+    "soak": 5,
+}
+UNKNOWN_LANE_RANK = 99
+
+# Cheapest-tier token (from docs/REQUIREMENTS.md's "Cheapest tier" column)
+# -> (canonical tier name, maximum allowed lane rank, max lane display name).
+# Bench / hardware-only / perf / manual tiers are not Bazel-runnable here
+# and are skipped by the tier check.
+RUNNABLE_TIERS = {
+    "unit": ("unit", 0, "fast"),
+    "component": ("component", 1, "heavy"),
+    "contract": ("contract", 1, "heavy"),
+    "fuzz": ("fuzz/property", 1, "heavy"),
+    "property": ("fuzz/property", 1, "heavy"),
+    "integration": ("integration", 2, "integration"),
+    "e2e": ("e2e", 3, "e2e"),
+}
 
 
 class Requirement:
@@ -215,6 +246,71 @@ def quarantined_targets(files, read):
     return targets
 
 
+def rule_lane(rule_tags):
+    """The Bazel lane of a test rule from its tags (docs/TESTING.md §9)."""
+    if "manual" in rule_tags:
+        return "soak"
+    # Fail closed: if multiple lane tags appear on one rule, take the
+    # costliest (highest rank) lane.
+    for lane in ("perf", "e2e", "integration", "heavy"):
+        if lane in rule_tags:
+            return lane
+    return "fast"
+
+
+def test_source_lanes(files, read):
+    """{source_path: {lane, ...}} for every non-quarantined test source."""
+    lanes = {}
+    for path in files:
+        if os.path.basename(path) in ("BUILD", "BUILD.bazel"):
+            package = os.path.dirname(path)
+            for rule in build_rules(read(path)):
+                kind_match = re.match(r"^([A-Za-z_]\w*)\(", rule)
+                name_match = re.search(r'\bname\s*=\s*"([^"]+)"', rule)
+                if not (kind_match and name_match):
+                    continue
+                if not kind_match.group(1).endswith("_test"):
+                    continue
+                tags_match = re.search(r"\btags\s*=\s*\[([^\]]*)\]", rule)
+                rule_tags = (set(re.findall(r'"([^"]+)"',
+                                            tags_match.group(1)))
+                             if tags_match else set())
+                if "quarantine" in rule_tags:
+                    continue
+                lane = rule_lane(rule_tags)
+                srcs_match = re.search(r"\bsrcs\s*=\s*\[([^\]]*)\]", rule)
+                rel_srcs = (re.findall(r'"([^"]+)"', srcs_match.group(1))
+                            if srcs_match else [])
+                main_match = re.search(r'\bmain\s*=\s*"([^"]+)"', rule)
+                if main_match:
+                    rel_srcs.append(main_match.group(1))
+                for src in rel_srcs:
+                    if src.startswith(("//", "@", ":")):
+                        continue
+                    joined = os.path.normpath(os.path.join(package, src))
+                    joined = joined.replace(os.sep, "/")
+                    lanes.setdefault(joined, set()).add(lane)
+        elif path.startswith("controller_processor/rio/src/test/cpp/"):
+            lanes.setdefault(path, set()).add("fast")
+        elif (path.startswith("studio/tests/") and
+              re.search(r"\.test\.tsx?$", path)):
+            lanes.setdefault(path, set()).add("fast")
+    return lanes
+
+
+def cheapest_runnable_tier(tier_text):
+    """(tier_name, max_lane_rank, max_lane_name) for the cheapest
+    Bazel-runnable tier named in `tier_text`, or None if it names only
+    non-runnable tiers (e.g. bench, perf, manual)."""
+    stripped = re.sub(r"\([^)]*\)", "", tier_text).lower()
+    found = [RUNNABLE_TIERS[token]
+             for token in re.findall(r"[a-z0-9]+", stripped)
+             if token in RUNNABLE_TIERS]
+    if not found:
+        return None
+    return min(found, key=lambda item: item[1])
+
+
 def bazel_packages(files):
     packages = set()
     for path in files:
@@ -307,6 +403,7 @@ def trace(files, read, today, frameworks=()):
 
     quarantined = quarantined_targets(files, read)
     quarantined_sources = {s for _, _, sources in quarantined for s in sources}
+    source_lanes = test_source_lanes(files, read)
     tests = {}
     for path, number, req_id in find_tags(files, read):
         if req_id not in catalogue and req_id not in framework:
@@ -338,16 +435,40 @@ def trace(files, read, today, frameworks=()):
                                       bringup_headings)
         if citation:
             citations[req.id] = citation
-        gap = req.must_verify() and req.id not in tests and not citation
+        missing_test = req.must_verify() and req.id not in tests and not citation
+        tier_gap_msg = None
+        if req.must_verify() and not citation and req.id in tests:
+            required = cheapest_runnable_tier(req.tier)
+            if required is not None:
+                tier_name, max_rank, max_lane = required
+                found_lanes = set()
+                for path, _ in tests[req.id]:
+                    found_lanes.update(source_lanes.get(path, {"unknown"}))
+                min_rank = min(LANE_RANK.get(lane, UNKNOWN_LANE_RANK)
+                               for lane in found_lanes)
+                if min_rank > max_rank:
+                    lanes_text = ", ".join(sorted(found_lanes))
+                    files_text = ", ".join(sorted({p for p, _ in tests[req.id]}))
+                    tier_gap_msg = (
+                        f"{REQUIREMENTS}: {req.id} ({req.priority}, {req.area}) "
+                        f"requires cheapest tier `{tier_name}` (lane <= `{max_lane}`), "
+                        f"but only has tagged tests in: {lanes_text} ({files_text}); "
+                        f"add a test at or below `{tier_name}` "
+                        f"(docs/TESTING.md §2, §3)")
+        gap = missing_test or (tier_gap_msg is not None)
         waiver = waivers.pop(req.id, None)
         if gap and not waiver:
-            failures.append(
-                f"{REQUIREMENTS}: {req.id} ({req.priority}, {req.area}) has "
-                f"no tagged test and cites no open TODO.md item or bench "
-                f"section; tag the test that proves it (docs/TESTING.md §3)")
+            if missing_test:
+                failures.append(
+                    f"{REQUIREMENTS}: {req.id} ({req.priority}, {req.area}) has "
+                    f"no tagged test and cites no open TODO.md item or bench "
+                    f"section; tag the test that proves it (docs/TESTING.md §3)")
+            else:
+                failures.append(tier_gap_msg)
         elif waiver and not gap:
             why = ("needs no test by this check" if not req.must_verify() else
-                   "now has a tagged test or a cited verification")
+                   "now has a tagged test at or below its cheapest tier "
+                   "or a cited verification")
             failures.append(f"{WAIVERS}:{waiver[2]}: stale waiver: {req.id} "
                             f"{why}; delete the line")
 
@@ -387,7 +508,7 @@ def check(files, read, today, out=sys.stdout, frameworks=()):
     if not failures:
         waived = len(parse_waivers(read(WAIVERS), today)[0])
         print(f"trace: {len(catalogue)} requirements, {len(tests)} with "
-              f"tagged tests, {waived} waived; tier not checked (LANE-1)" +
+              f"tagged tests, {waived} waived; cheapest tier enforced" +
               "".join(f"; tags of {path} accepted" for path in frameworks),
               file=out)
     return len(failures)

@@ -114,6 +114,13 @@ std::vector<naming::Diagnostic> LintPythonActuatorPeriods(
     const config::RobotConfig& robot_config,
     const std::vector<NodeDescription>& described);
 
+// REQ-SAFE-28: one error per roster member marked critical = false that owns
+// a motor, digital output or PWM output (`spec.owns_actuators`) or describes a
+// target-lane sender (`naming::IsTargetLane`).
+std::vector<naming::Diagnostic> LintCriticalNodes(
+    const std::vector<NodeSpec>& specs,
+    const std::vector<NodeDescription>& described);
+
 // Where the launcher writes the declared graph that graph-reading nodes get
 // as `--graph` (introspect::DeclaredGraph): beside graph.json in the session
 // directory.

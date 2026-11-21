@@ -160,6 +160,22 @@ cc_test(
     ],
 )
 
+# Unit tests for phase-1 graph and roster criticality rules (REQ-SAFE-28),
+# calling DiscoverNodes and LintCriticalNodes directly without spawning.
+cc_test(
+    name = "describe_graph_test",
+    size = "small",
+    srcs = ["describe_graph_test.cc"],
+    deps = [
+        ":describe_graph",
+        ":roster",
+        "//talOS/configuration",
+        "//talOS/events:events_core",
+        "//talOS/introspection:names",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # Each member's share of the session's event-log budget.
 cc_library(
     name = "log_budget",

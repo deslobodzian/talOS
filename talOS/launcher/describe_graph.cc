@@ -492,6 +492,31 @@ std::vector<naming::Diagnostic> LintPythonActuatorPeriods(
   return findings;
 }
 
+std::vector<naming::Diagnostic> LintCriticalNodes(
+    const std::vector<NodeSpec>& specs,
+    const std::vector<NodeDescription>& described) {
+  std::vector<naming::Diagnostic> findings;
+  const std::size_t count = std::min(specs.size(), described.size());
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto& spec = specs[i];
+    const auto& node = described[i];
+    const bool writes_targets =
+        std::any_of(node.declared.sources.begin(), node.declared.sources.end(),
+                    [](const auto& source) {
+                      return source.kind == event::SourceKind::SENDER &&
+                             naming::IsTargetLane(source.name);
+                    });
+    if (!spec.critical && (spec.owns_actuators || writes_targets)) {
+      findings.push_back(
+          {naming::Severity::ERROR,
+           node.roster_name.empty() ? spec.name : node.roster_name,
+           "critical=false is forbidden for an actuator owner or target-lane "
+           "producer"});
+    }
+  }
+  return findings;
+}
+
 std::string DeclaredGraphPath(const LauncherOptions& options) {
   const std::filesystem::path dir =
       options.output_dir.empty()
@@ -600,21 +625,13 @@ std::vector<naming::Diagnostic> DescribeGraph(
 
   std::vector<naming::NodeShape> shapes;
   std::vector<NodeSpec> missing;
+  auto critical_findings = LintCriticalNodes(specs, out);
+  probe_findings.insert(probe_findings.end(),
+                        std::make_move_iterator(critical_findings.begin()),
+                        std::make_move_iterator(critical_findings.end()));
   for (std::size_t i = 0; i < out.size(); ++i) {
     const auto& described = out[i];
     const auto& spec = specs[i];
-    const bool writes_targets =
-        std::any_of(described.declared.sources.begin(),
-                    described.declared.sources.end(), [](const auto& source) {
-                      return source.kind == event::SourceKind::SENDER &&
-                             naming::IsTargetLane(source.name);
-                    });
-    if (!spec.critical && (spec.owns_actuators || writes_targets)) {
-      probe_findings.push_back(
-          {naming::Severity::ERROR, described.roster_name,
-           "critical=false is forbidden for an actuator owner or target-lane "
-           "producer"});
-    }
     if (described.answered) {
       // The bridge is known by its roster name, `hardware_node`, which no
       // subsystem can take (Launcher::Run refuses two members of one name),

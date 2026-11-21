@@ -78,10 +78,12 @@ counts too); an ID later in a sentence is prose, not a tag.
 - Every SAFE and CONTRACT requirement has a tagged test at its cheapest tier
   or below, or names the bench procedure ([BENCH.md](BENCH.md)) or open
   TODO.md item that verifies it. **[enforced: `tools/trace.py --check`
-  (CI lint job) for a tagged test or a cited bench section or open TODO.md
-  item; known gaps are listed with their TODO item in
-  `tools/trace_waivers.txt`, which only shrinks; gap: LANE-1 for the tier,
-  which the lane tags (§9) record but nothing checks]** `python3 tools/trace.py --report`
+  (CI lint job) checks for a tagged test at or below the requirement's
+  cheapest runnable tier (from Bazel lane tags in §9, plus GradleRIO
+  `phoenixTest` and Studio Vitest as `fast`; higher-tier composition tags
+  remain allowed alongside), or a cited bench section or open TODO.md item;
+  known gaps are listed with their TODO item in `tools/trace_waivers.txt`,
+  which only shrinks]** `python3 tools/trace.py --report`
   prints each requirement's tests.
 - A robot repository's catalogue, its own `docs/REQUIREMENTS.md`, holds only
   its own rows, in talOS's one numbering; its tests also tag talOS's rows.

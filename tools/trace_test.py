@@ -40,7 +40,10 @@ def tree(**overrides):
         "docs/BENCH.md": "# Bench\n## Loop stall check\n",
         "docs/BRINGUP.md": "# Bring-up\n## Link timing\n",
         "tools/trace_waivers.txt": "",
-        "talOS/node/BUILD": 'cc_test(\n    name = "node_test",\n)\n',
+        "talOS/node/BUILD": (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["node_test.cc"],\n)\n'
+        ),
         "talOS/node/node_test.cc": "// REQ-SAFE-01\nTEST(Node, Neutral) {}\n",
     }
     files.update(overrides)
@@ -194,6 +197,149 @@ class TraceTest(unittest.TestCase):
             "talOS/vision/testdata/BUILD": ""}))
         self.assertEqual(failures, 1, out)
         self.assertIn("package talOS/vision is missing", out)
+
+    def test_cheapest_tier_is_enforced_against_bazel_lanes(self):
+        # Clean tree reports cheapest tier enforced (no stale LANE-1 note).
+        failures, out = check(tree())
+        self.assertEqual(failures, 0, out)
+        self.assertIn("cheapest tier enforced", out)
+        self.assertNotIn("LANE-1", out)
+
+        # A unit requirement tagged only in an integration test fails, naming
+        # the requirement ID, required cheapest tier, and found lane.
+        integ_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["node_test.cc"],\n'
+            '    tags = ["integration"],\n)\n'
+        )
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="unit")),
+            "talOS/node/BUILD": integ_build,
+        }))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("REQ-SAFE-01", out)
+        self.assertIn("`unit`", out)
+        self.assertIn("integration", out)
+
+        # A heavy test satisfies component/contract, but NOT unit.
+        heavy_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["node_test.cc"],\n'
+            '    tags = ["heavy"],\n)\n'
+        )
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="component")),
+            "talOS/node/BUILD": heavy_build,
+        }))
+        self.assertEqual(failures, 0, out)
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="unit")),
+            "talOS/node/BUILD": heavy_build,
+        }))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("heavy", out)
+
+        # Higher-tier composition tags remain allowed when a test at or below
+        # the cheapest tier is also present.
+        both_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["node_test.cc"],\n)\n'
+            'cc_test(\n    name = "e2e_test",\n'
+            '    srcs = ["e2e_test.cc"],\n'
+            '    tags = ["e2e"],\n)\n'
+        )
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="unit")),
+            "talOS/node/BUILD": both_build,
+            "talOS/node/e2e_test.cc": "// REQ-SAFE-01\nTEST(Node, E2e) {}\n",
+        }))
+        self.assertEqual(failures, 0, out)
+
+        # An integration requirement is satisfied by either fast or integration,
+        # but not e2e or manual/soak.
+        for lane_tag, expected in (
+                (None, 0),
+                ("integration", 0),
+                ("e2e", 1),
+                ("manual", 1),
+                ("perf", 1),
+        ):
+            with self.subTest(lane_tag=lane_tag):
+                tags_line = (f'    tags = ["{lane_tag}"],\n'
+                             if lane_tag else "")
+                build = (
+                    'cc_test(\n    name = "node_test",\n'
+                    '    srcs = ["node_test.cc"],\n' + tags_line + ')\n'
+                )
+                failures, out = check(tree(**{
+                    "docs/REQUIREMENTS.md": catalogue(
+                        row("REQ-SAFE-01", "P0", tier="integration")),
+                    "talOS/node/BUILD": build,
+                }))
+                self.assertEqual(failures, expected, out)
+
+    def test_unwired_test_source_fails_closed_for_tier(self):
+        # A test file not wired into any BUILD test rule has unknown lane and
+        # cannot satisfy a runnable cheapest tier.
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="unit")),
+            "talOS/node/BUILD": 'cc_test(\n    name = "other",\n)\n',
+        }))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("REQ-SAFE-01", out)
+        self.assertIn("unknown", out)
+
+    def test_gradlerio_studio_vitest_and_bench_tiers(self):
+        # GradleRIO phoenixTest and Studio Vitest test files count as fast
+        # (unit/component), and bench-only tiers skip Bazel tier enforcement.
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="unit"),
+                row("REQ-SAFE-02", "P0", tier="unit"),
+                row("REQ-SAFE-03", "P0",
+                    tier="bench (RoboRIO build and console)"),
+                scope=("`talOS/node`",)),
+            "talOS/node/BUILD": (
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = ["e2e"],\n)\n'
+            ),
+            "talOS/node/node_test.cc": "// REQ-SAFE-03\nTEST(Bench, X) {}\n",
+            "controller_processor/rio/src/test/cpp/Foo_test.cpp":
+                "// REQ-SAFE-01\nTEST(Rio, Fast) {}\n",
+            "studio/tests/view.test.tsx":
+                "// REQ-SAFE-02\ntest('fast', () => {});\n",
+        }))
+        self.assertEqual(failures, 0, out)
+
+    def test_tier_gap_waiver_holds_then_turns_stale(self):
+        waiver = "REQ-SAFE-01 2026-11-01 ARCH-2 move to unit\n"
+        integ_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["node_test.cc"],\n'
+            '    tags = ["integration"],\n)\n'
+        )
+        # Waived tier gap passes.
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="unit")),
+            "talOS/node/BUILD": integ_build,
+            "tools/trace_waivers.txt": waiver,
+        }))
+        self.assertEqual(failures, 0, out)
+        # Once moved to fast lane, the waiver is stale and fails.
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="unit")),
+            "tools/trace_waivers.txt": waiver,
+        }))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("stale waiver", out)
 
 
 if __name__ == "__main__":
