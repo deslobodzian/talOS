@@ -455,11 +455,12 @@ is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
 `log_dump` and `--replay-inputs` read every segment in a
 session directory, and given one log's file each
-reads that log's kept segments with it; `--replay-inputs` refuses to feed a
-node from a log whose `<log>.capped` marker exists (or whose member the
-session manifest marks `log_capped`), since no GAP record
-marks what the cap cost it (its oldest segment, or the records after
-capture stopped). Exact `--replay` refuses a log whose first
+reads that log's kept segments with it; by default `--replay-inputs` refuses to
+feed a node from a log whose `<log>.capped` marker exists (or whose member the
+session manifest marks `log_capped`), since no GAP record marks what the cap
+cost it (its oldest segment, or the records after capture stopped), while
+`--allow-capped-replay` replays from the start of the kept window with a
+warning stating the pre-window loss. Exact `--replay` refuses a log whose first
 dispatch is not 1, since a later segment starts mid-session. Rotation syncs each finished segment and the next one's header
 before renaming it into place, and the cap marker before deleting the oldest,
 so a power loss leaves whole segments; a session reader skips (with a

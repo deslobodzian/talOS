@@ -963,16 +963,39 @@ inline std::vector<Diagnostic> LintGraph(
     }
   }
 
-  // REQ-CONTRACT-09: warn when an operator producer's shortest path to an
-  // actuator owner exceeds kMaxOperatorToActuatorHops node hops over non-/hw,
-  // non-observer topic edges.
+  // REQ-CONTRACT-09, REQ-RT-16: warn when an operator producer's shortest
+  // command-flow path to an actuator owner exceeds kMaxOperatorToActuatorHops
+  // node hops. Only non-/hw, non-observer command roles (`target`, `request`,
+  // `command`) are traversed — never `state`/`status`/`event`/`telemetry`
+  // feedback — outgoing target lanes from an operator producer must belong to
+  // a subsystem's `teleop` policy, and BFS does not expand past an actuator
+  // owner.
   {
     const std::size_t n = nodes.size();
     std::vector<bool> is_operator_producer(n, false);
     std::vector<bool> is_actuator_owner(n, false);
-    std::map<std::string_view,
-             std::pair<std::vector<std::size_t>, std::vector<std::size_t>>>
-        topic_edges;
+    const auto is_teleop_target_lane = [&](std::string_view topic,
+                                           std::string_view writer_name) {
+      if (!IsTargetLane(topic)) return false;
+      const auto segments = detail::Segments(topic);
+      if (segments[0] == writer_name) return false;
+      const auto sub = target_mode_sources.find(segments[0]);
+      if (sub == target_mode_sources.end()) return false;
+      const auto teleop = sub->second.find("teleop");
+      return teleop != sub->second.end() &&
+             std::find(teleop->second.begin(), teleop->second.end(),
+                       segments[2]) != teleop->second.end();
+    };
+    const auto is_command_role = [](std::string_view role) {
+      return role == "target" || role == "request" || role == "command";
+    };
+    struct TopicCommandEdges {
+      bool is_target_lane{false};
+      std::vector<std::size_t> writers;
+      std::vector<std::size_t> teleop_writers;
+      std::vector<std::size_t> readers;
+    };
+    std::map<std::string_view, TopicCommandEdges> topic_edges;
 
     for (std::size_t i = 0; i < n; ++i) {
       const auto& node = nodes[i];
@@ -988,28 +1011,20 @@ inline std::vector<Diagnostic> LintGraph(
             source.name == "/hw/state/driver_station") {
           reads_driver_station = true;
         }
-        if (IsSender(source.kind) && IsTargetLane(source.name)) {
-          const auto segments = detail::Segments(source.name);
-          if (segments[0] != node.name) {
-            const auto sub = target_mode_sources.find(segments[0]);
-            if (sub != target_mode_sources.end()) {
-              const auto teleop = sub->second.find("teleop");
-              if (teleop != sub->second.end() &&
-                  std::find(teleop->second.begin(), teleop->second.end(),
-                            segments[2]) != teleop->second.end()) {
-                writes_teleop_lane = true;
-              }
-            }
-          }
-        }
+        const bool teleop_lane = IsSender(source.kind) &&
+                                 is_teleop_target_lane(source.name, node.name);
+        if (teleop_lane) writes_teleop_lane = true;
         if (!IsSender(source.kind) && !IsReader(source.kind)) continue;
         if (CheckTopicName(source.name)) continue;
         const auto segments = detail::Segments(source.name);
-        if (segments[0] == "hw") continue;
+        if (segments[0] == "hw" || !is_command_role(segments[1])) continue;
+        auto& entry = topic_edges[source.name];
+        if (IsTargetLane(source.name)) entry.is_target_lane = true;
         if (IsSender(source.kind)) {
-          topic_edges[source.name].first.push_back(i);
+          entry.writers.push_back(i);
+          if (teleop_lane) entry.teleop_writers.push_back(i);
         } else if (!source.observer()) {
-          topic_edges[source.name].second.push_back(i);
+          entry.readers.push_back(i);
         }
       }
       if (reads_driver_station && writes_teleop_lane) {
@@ -1018,18 +1033,28 @@ inline std::vector<Diagnostic> LintGraph(
     }
 
     std::vector<std::vector<std::size_t>> adj(n);
-    for (const auto& entry : topic_edges) {
-      const auto& [writers, readers] = entry.second;
-      for (const std::size_t u : writers) {
-        for (const std::size_t v : readers) {
-          if (u == v) continue;
-          if (std::find(adj[u].begin(), adj[u].end(), v) == adj[u].end()) {
-            adj[u].push_back(v);
-          }
+    std::vector<std::vector<std::size_t>> producer_adj(n);
+    const auto add_edge = [](std::vector<std::vector<std::size_t>>& graph,
+                             std::size_t u, std::size_t v) {
+      if (u == v) return;
+      if (std::find(graph[u].begin(), graph[u].end(), v) == graph[u].end()) {
+        graph[u].push_back(v);
+      }
+    };
+    for (const auto& [topic, entry] : topic_edges) {
+      for (const std::size_t u : entry.writers) {
+        const bool allowed_from_producer =
+            !entry.is_target_lane ||
+            std::find(entry.teleop_writers.begin(), entry.teleop_writers.end(),
+                      u) != entry.teleop_writers.end();
+        for (const std::size_t v : entry.readers) {
+          add_edge(adj, u, v);
+          if (allowed_from_producer) add_edge(producer_adj, u, v);
         }
       }
     }
-    for (auto& neighbors : adj) {
+    for (auto& neighbors : adj) std::sort(neighbors.begin(), neighbors.end());
+    for (auto& neighbors : producer_adj) {
       std::sort(neighbors.begin(), neighbors.end());
     }
 
@@ -1044,7 +1069,9 @@ inline std::vector<Diagnostic> LintGraph(
       queue.push_back(p);
       for (std::size_t head = 0; head < queue.size(); ++head) {
         const std::size_t u = queue[head];
-        for (const std::size_t v : adj[u]) {
+        if (u != p && is_actuator_owner[u]) continue;
+        const auto& neighbors = (u == p) ? producer_adj[u] : adj[u];
+        for (const std::size_t v : neighbors) {
           if (dist[v] != kUnvisited) continue;
           dist[v] = dist[u] + 1;
           parent[v] = u;

@@ -109,13 +109,13 @@ the check in the same commit (RULES.md 9).
 
 | Budget | Stated in | Check |
 |---|---|---|
-| UDP frame and payload bytes, device caps, shared-memory slot sizes | [DATA_FLOW.md](DATA_FLOW.md) | **[enforced]** `static_assert`s in `talOS/hardware`, `talOS/protocol`, `talOS/rtms`; **[gap: LINT-2]** the doc's tables are hand-kept |
+| UDP frame and payload bytes, device caps, shared-memory slot sizes | [DATA_FLOW.md](DATA_FLOW.md) | **[enforced]** `static_assert`s in `talOS/hardware`, `talOS/protocol`, `talOS/rtms`, and `//tools:check_data_flow_sizes_test` on the marked numbers in `DATA_FLOW.md` |
 | Topic name length, readers per topic | NAMING.md | **[enforced]** `names.h`, `LintGraph` |
 | `command_timeout_us` range; actuator `period_us` limit | ARCHITECTURE.md "The tick" | **[enforced]** config load refuses |
 | Owner timeout | ARCHITECTURE.md "The tick" | **[enforced]** bridge and `SimHardware` share `//talOS/bridge:merge` |
 | `update()` allocates nothing | METHODOLOGY.md §10 | **[enforced]** C++ (`AllocationProbe`); **[review]** Python |
 | `update()` p99 duration | METHODOLOGY.md §10 | **[gap: SPEC-4]** no benchmark |
-| Node hops from driver input to actuator | METHODOLOGY.md §10 | **[gap: LINT-2]** computable from `graph.json` |
+| Node hops from driver input to actuator | METHODOLOGY.md §10 | **[enforced]** `LintGraph` warning (`names.h`, `REQ-RT-16`) |
 | `/hw/request` gap in simulation | the [bench simulation README](../bench/main_processor/simulation/README.md) | asserted in simulation by the bench `soak_test` (`manual`); no requirement states it (**[gap: SPEC-4]**) |
 | Target age at the selecting tick | launcher README "Session measurements" | `session_report --strict` on a recorded session; bench run open (TIME-3) |
 | Fast-lane time per target | [TESTING.md §9](TESTING.md#9-lanes-and-ci) | **[gap: LANE-1]** |
