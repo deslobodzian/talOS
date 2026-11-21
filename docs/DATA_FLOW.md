@@ -707,8 +707,8 @@ sensors, <!-- size: caps.digital_inputs -->8 DI,
 (<!-- size: state.headroom_bytes -->**13 B** headroom;
 <!-- size: state.max_frame_bytes -->1,459 B ≤
 <!-- size: frame.max_bytes -->1,472 B Ethernet IPv4/UDP MTU). A 17th motor
-(+<!-- size: state.motor_bytes -->45 B) or any new device kind therefore cannot
-fit in one State datagram.
+(+<!-- size: state.motor_bytes -->45 B) or any new device kind exceeding the
+13 B headroom therefore cannot fit in one State datagram.
 
 **Growth design (if a robot needs >16 motors or a new device kind; no wire
 change today):** Carry State as multi-frame, tick-coherent chunks carrying
