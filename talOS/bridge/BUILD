@@ -174,18 +174,40 @@ cc_test(
 
 # Run() on real time and loopback UDP: the integration tier
 # (docs/TESTING.md §2), kept out of node_test's synthetic-time logic tests.
-# Its bounds are ratios of counts, or a requirement's margin judged only on a
-# host whose measured stalls are inside it (§6).
+# Its bounds are ratios of counts and event-driven waits; the wall-clock
+# StallMeter timing test lives in run_timing_test with `exclusive`.
 cc_test(
     name = "run_test",
     size = "medium",
     srcs = ["run_test.cc"],
+    tags = ["integration"],
     deps = [
-        ":merge",
         ":messages",
         ":node_lib",
         ":node_test_support",
         "//talOS/introspection:registry",
+        "//talOS/ipc",
+        "//talOS/process",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Run() wall-clock timing on real time and loopback UDP: isolated from
+# run_test with `exclusive` so parallel Bazel jobs on 3-vCPU macOS CI do not
+# starve its 1 ms StallMeter host-qualification probe (docs/TESTING.md §6.7).
+cc_test(
+    name = "run_timing_test",
+    size = "medium",
+    srcs = ["run_timing_test.cc"],
+    tags = [
+        "exclusive",
+        "integration",
+    ],
+    deps = [
+        ":merge",
+        ":node_lib",
+        ":node_test_support",
         "//talOS/ipc",
         "//talOS/process",
         "@googletest//:gtest",

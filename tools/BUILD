@@ -415,6 +415,8 @@ py_test(
 # read-only worktree of the commit; tools/make_sources_read_only.py is CI's
 # read-only step, and tools/check_host_includes.py runs after the build. The
 # test runs it with a stub bazel against a throwaway repository.
+# Over 5 s: spawns temporary git repositories and full prepush.sh worktree
+# checks (9.7 s on Linux CI); integration lane.
 py_test(
     name = "prepush_test",
     size = "small",
@@ -426,6 +428,7 @@ py_test(
         "prepush_robot_repository.sh",
     ],
     legacy_create_init = False,
+    tags = ["integration"],
     deps = ["@rules_python//python/runfiles"],
 )
 

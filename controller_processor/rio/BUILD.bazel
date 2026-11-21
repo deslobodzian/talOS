@@ -47,6 +47,8 @@ py_binary(
     deps = ["@rules_python//python/runfiles"],
 )
 
+# Over 5 s: stages controller_processor/rio and invokes the GradleRIO
+# daemon/wrapper (6.5 s on Linux CI); integration lane.
 py_test(
     name = "gradlew_test",
     size = "small",
@@ -55,6 +57,7 @@ py_test(
     env = {
         "RIO_GRADLEW": "$(rlocationpath :gradlew)",
     },
+    tags = ["integration"],
     deps = ["@rules_python//python/runfiles"],
 )
 

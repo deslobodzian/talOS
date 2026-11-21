@@ -62,6 +62,8 @@ vite_bin.vite_binary(
     chdir = "studio",
 )
 
+# Over 5 s: cold `tsc --noEmit` across the TypeScript and `@types/three` graph
+# (8.6 s on Linux CI); heavy lane.
 tsc_bin.tsc_test(
     name = "typecheck",
     args = [
@@ -71,6 +73,7 @@ tsc_bin.tsc_test(
     ],
     chdir = "studio",
     data = [":sources"],
+    tags = ["heavy"],
 )
 
 # The webroot a bundle carries (talos_bundle studio_webroot): index.html
