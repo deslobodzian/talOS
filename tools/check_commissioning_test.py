@@ -655,6 +655,95 @@ class CheckCommissioningTest(unittest.TestCase):
         self.commit("examples: broken")
         self.assertEqual(check_commissioning.check(self.base), [])
 
+    # REQ-DEV-33, RULES.md 4: uppercase/mixed-case .toml extensions are checked,
+    # while EXEMPT_DIRECTORIES stay exact-case so exemptions are not widened.
+    def test_case_insensitive_toml_extensions_fail(self):
+        for rel in (
+            "bench/main_processor/configuration/ROBOT.TOML",
+            "bench/main_processor/configuration/Motor.Toml",
+            "EXAMPLES/robot/robot.toml",
+            "Tests/robot/Config.TOML",
+        ):
+            with self.subTest(path=rel):
+                self.git("reset", "--hard", self.base)
+                self.put(rel, "[robot]\ncommissioned = true\n")
+                self.commit(f"bench: add {rel}")
+                found = check_commissioning.check(self.base)
+                self.assertEqual(len(found), 1, found)
+                self.assertIn(f" {rel}: sets commissioned = true", found[0])
+
+        # Editing a CAN id in a mixed-case .Toml file fails too.
+        self.git("reset", "--hard", self.base)
+        mixed = "bench/main_processor/configuration/subsystems/Drive.Toml"
+        self.put(mixed, MOTOR)
+        self.commit("bench: seed mixed-case config",
+                    "Commissioned-By: A Person")
+        seeded = self.git("rev-parse", "HEAD").strip()
+        self.put(mixed, MOTOR.replace("= 1", "= 9"))
+        self.commit("bench: edit mixed-case can_id")
+        found = check_commissioning.check(seeded)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn(f" {mixed}: changes a CAN id: motors.drive.can_id "
+                      "from 1 to 9", found[0])
+
+        # Exact-case exempt directory with uppercase .TOML still passes.
+        self.git("reset", "--hard", self.base)
+        self.put("examples/robot/ROBOT.TOML", "[robot]\ncommissioned = true\n")
+        self.commit("examples: uppercase config")
+        self.assertEqual(check_commissioning.check(self.base), [])
+
+    # REQ-DEV-33, RULES.md 4: any non-exempt symlink (including a directory
+    # symlink with no .toml suffix) fails closed; exempt symlinks pass.
+    def test_non_exempt_directory_symlink_fails_closed(self):
+        # Adding a non-exempt directory symlink without a .toml suffix fails.
+        link_rel = "robot/subsystems"
+        link_full = os.path.join(self.repo, link_rel)
+        os.makedirs(os.path.dirname(link_full), exist_ok=True)
+        os.symlink("../examples/robot/subsystems", link_full)
+        self.commit("robot: symlink subsystems directory")
+        found = check_commissioning.check(self.base)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn(f" {link_rel}: non-regular file mode 120000", found[0])
+
+        # Replacing a non-exempt symlink with a regular non-TOML file fails
+        # closed on the parent symlink without parsing the regular file as TOML.
+        self.git("reset", "--hard", self.base)
+        os.makedirs(os.path.dirname(link_full), exist_ok=True)
+        os.symlink("../examples/robot/subsystems", link_full)
+        self.commit("robot: seed symlink", "Commissioned-By: A Person")
+        seeded = self.git("rev-parse", "HEAD").strip()
+        os.unlink(link_full)
+        self.put(link_rel, "not valid toml = = =\n")
+        self.commit("robot: replace symlink with regular file")
+        found = check_commissioning.check(seeded)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn(f" {link_rel}: non-regular file mode 120000 (parent)",
+                      found[0])
+
+        # Introducing a non-exempt directory symlink in a merge fails closed.
+        self.git("reset", "--hard", self.base)
+
+        def add_merge_symlink():
+            target = os.path.join(self.repo, "robot/subsystems")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            os.symlink("../examples/robot/subsystems", target)
+
+        self.branch_and_merge(
+            lambda: self.put("bench/main_processor/configuration/side.toml",
+                             "b = 2\n"),
+            add_merge_symlink)
+        merge = self.git("rev-parse", "HEAD").strip()[:12]
+        found = check_commissioning.check(self.base)
+        self.assertEqual(found, [
+            f"{merge} robot/subsystems: non-regular file mode 120000"], found)
+
+        # A directory symlink under an exempt directory still passes.
+        self.git("reset", "--hard", self.base)
+        exempt_link = os.path.join(self.repo, "examples/robot/subsystems_link")
+        os.symlink("subsystems", exempt_link)
+        self.commit("examples: symlink inside exempt dir")
+        self.assertEqual(check_commissioning.check(self.base), [])
+
 
 if __name__ == "__main__":
     unittest.main()
