@@ -27,6 +27,7 @@
 #include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/events/session_manifest.h"
 #include "talOS/events/simulated_event_loop.h"
 #include "talOS/events/test_robot.h"
 
@@ -2689,6 +2690,73 @@ TEST(InputReplay, AllowCappedStillRefusesUncappedGapsDamageAndBrokenSegments) {
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(out);
   }
+}
+
+// session_manifest::Parse reads optional per-run gap_logs and
+// recorder_failed_logs arrays, leaving them absent in legacy manifests and on
+// malformed non-string arrays.
+// REQ-OPS-14
+TEST(InputReplay, SessionManifestParsesPerRunLogArrays) {
+  const std::string json = R"({
+    "session_id": 42,
+    "nodes": [
+      {
+        "name": "modern",
+        "log_paths": ["/s/modern.tlog", "/s/modern.restart1.tlog"],
+        "log_gap": true,
+        "gap_logs": ["/s/modern.tlog"],
+        "recorder_failed": true,
+        "recorder_failed_logs": ["/s/modern.restart1.tlog"],
+        "log_capped": false
+      },
+      {
+        "name": "empty_arrays",
+        "log_paths": ["/s/empty.tlog"],
+        "log_gap": false,
+        "gap_logs": [],
+        "recorder_failed": true,
+        "recorder_failed_logs": [],
+        "log_capped": false
+      },
+      {
+        "name": "legacy",
+        "log_paths": ["/s/legacy.tlog"],
+        "log_gap": true,
+        "recorder_failed": true,
+        "log_capped": false
+      },
+      {
+        "name": "malformed",
+        "log_paths": ["/s/malformed.tlog"],
+        "log_gap": true,
+        "gap_logs": [123],
+        "recorder_failed": true,
+        "recorder_failed_logs": "not_an_array",
+        "log_capped": false
+      }
+    ]
+  })";
+  const session_manifest::Fields fields = session_manifest::Parse(json);
+  ASSERT_EQ(fields.session_id, 42u);
+  ASSERT_EQ(fields.nodes.size(), 4u);
+
+  ASSERT_TRUE(fields.nodes[0].gap_logs.has_value());
+  EXPECT_EQ(*fields.nodes[0].gap_logs,
+            std::vector<std::string>{"/s/modern.tlog"});
+  ASSERT_TRUE(fields.nodes[0].recorder_failed_logs.has_value());
+  EXPECT_EQ(*fields.nodes[0].recorder_failed_logs,
+            std::vector<std::string>{"/s/modern.restart1.tlog"});
+
+  ASSERT_TRUE(fields.nodes[1].gap_logs.has_value());
+  EXPECT_TRUE(fields.nodes[1].gap_logs->empty());
+  ASSERT_TRUE(fields.nodes[1].recorder_failed_logs.has_value());
+  EXPECT_TRUE(fields.nodes[1].recorder_failed_logs->empty());
+
+  EXPECT_FALSE(fields.nodes[2].gap_logs.has_value());
+  EXPECT_FALSE(fields.nodes[2].recorder_failed_logs.has_value());
+
+  EXPECT_FALSE(fields.nodes[3].gap_logs.has_value());
+  EXPECT_FALSE(fields.nodes[3].recorder_failed_logs.has_value());
 }
 
 }  // namespace

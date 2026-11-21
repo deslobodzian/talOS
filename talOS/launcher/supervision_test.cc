@@ -741,6 +741,11 @@ TEST(Supervision, ALogGapInTheRowMarksTheMemberThoughItsLogHasNoGapRecord) {
     EXPECT_NE(entry.find("\"log_gap\": true"), std::string::npos) << entry;
     EXPECT_NE(entry.find("\"recorder_failed\": true"), std::string::npos)
         << entry;
+    EXPECT_NE(entry.find("\"recorder_failed_logs\": []"), std::string::npos)
+        << entry;
+    const std::string expected_gap =
+        "\"gap_logs\": [\"" + options.output_dir + "/" + name + ".tlog\"]";
+    EXPECT_NE(entry.find(expected_gap), std::string::npos) << entry;
   }
   std::vector<std::string> named;
   std::istringstream text{stderr_text};
@@ -758,6 +763,119 @@ TEST(Supervision, ALogGapInTheRowMarksTheMemberThoughItsLogHasNoGapRecord) {
     EXPECT_FALSE(std::filesystem::exists(options.output_dir + log)) << log;
   }
   std::filesystem::remove_all(options.output_dir);
+}
+
+// Run 0 and run 1 of a restarted node both suffer live kFlagRecorderFailed
+// (their --log paths are directories so LogWriter fails with EISDIR). Both
+// logs reach recorder_failed_logs in the live manifest (NewRun clears the
+// per-run recorder failure tracker independently of recording_reported),
+// while the stderr warning is still emitted once per member.
+// REQ-OPS-14
+TEST(Supervision, RecorderFailedLogsTrackEveryRunAcrossRestarts) {
+  auto options = ConstructionOptions("rec_failed_runs", 0);
+  options.simulation = true;
+  options.max_restarts = 2;
+  options.duration_s = kHangSeconds;
+  std::string rf_error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &rf_error)};
+  ASSERT_NE(runfiles, nullptr) << rf_error;
+  const char* stub = std::getenv("TALOS_DELIVERY_LOSS_NODE");
+  ASSERT_NE(stub, nullptr);
+  const std::string dl_binary = runfiles->Rlocation(stub);
+  const auto keeper = [&](std::string_view name, std::string_view target) {
+    return WriteStub("rec_failed_" + std::string{name},
+                     "exec " + dl_binary + " " + std::string{name} + " " +
+                         std::string{target} + " 0,0,0,0,run \"$@\"\n",
+                     name);
+  };
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      keeper("hardware_node", "//talOS/bridge:hardware_node");
+  options.binary_overrides["//example/beta:node"] =
+      keeper("beta", "//example/beta:node");
+  const std::string real_node =
+      options.binary_overrides["//example/alpha:node"];
+  const std::string wrapper = TempPath("rec_failed_alpha") + ".sh";
+  {
+    std::ofstream out{wrapper};
+    out << "#!/bin/sh\n"
+        << "for arg in \"$@\"; do\n"
+        << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+        << "    exec \"" << real_node << "\" \"$@\"\n"
+        << "  fi\n"
+        << "done\n"
+        << "log=\"\"\n"
+        << "prev=\"\"\n"
+        << "for arg in \"$@\"; do\n"
+        << "  if [ \"$prev\" = \"--log\" ]; then log=\"$arg\"; break; fi\n"
+        << "  prev=\"$arg\"\n"
+        << "done\n"
+        << "mkdir -p \"$log\"\n"
+        << "case \"$log\" in\n"
+        << "  *.restart*)\n"
+        << "    exec \"" << real_node << "\" \"$@\"\n"
+        << "    ;;\n"
+        << "  *)\n"
+        << "    parent=$$\n"
+        << "    manifest=\"$(dirname \"$log\")/manifest.json\"\n"
+        << "    (\n"
+        << "      i=0\n"
+        << "      while [ $i -lt 200 ]; do\n"
+        << "        if grep -q '\"recorder_failed_logs\": \\[\"' "
+           "\"$manifest\" 2>/dev/null; then\n"
+        << "          kill -9 $parent 2>/dev/null\n"
+        << "          exit 0\n"
+        << "        fi\n"
+        << "        sleep 0.02\n"
+        << "        i=$((i + 1))\n"
+        << "      done\n"
+        << "    ) &\n"
+        << "    exec \"" << real_node << "\" \"$@\"\n"
+        << "    ;;\n"
+        << "esac\n";
+  }
+  ::chmod(wrapper.c_str(), 0755);
+  options.binary_overrides["//example/alpha:node"] = wrapper;
+
+  std::string seen;
+  ::testing::internal::CaptureStderr();
+  const int status = RunSessionUntil(
+      options,
+      [](const std::string& live) {
+        const std::string alpha = ManifestEntry(live, "alpha");
+        const std::size_t key = alpha.find("\"recorder_failed_logs\": [");
+        if (key == std::string::npos) return false;
+        const std::size_t end = alpha.find(']', key);
+        if (end == std::string::npos) return false;
+        const std::string arr = alpha.substr(key, end - key + 1);
+        return arr.find("alpha.tlog") != std::string::npos &&
+               arr.find("alpha.restart1.tlog") != std::string::npos;
+      },
+      seen);
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  // alpha's run 1 exits 1 because its event log failed (incomplete()).
+  EXPECT_EQ(status, 1);
+  ASSERT_FALSE(seen.empty())
+      << "live manifest never recorded both runs in recorder_failed_logs";
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestEntry(manifest, "alpha");
+  const std::string expected = "\"recorder_failed_logs\": [\"" +
+                               options.output_dir + "/alpha.tlog\", \"" +
+                               options.output_dir + "/alpha.restart1.tlog\"]";
+  EXPECT_NE(alpha.find(expected), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"recorder_failed\": true"), std::string::npos)
+      << alpha;
+  // Per-member stderr-once preserved across runs.
+  std::size_t warnings = 0;
+  for (std::size_t pos = 0;
+       (pos = stderr_text.find("failed; the rest of this run is not recorded",
+                               pos)) != std::string::npos;
+       ++warnings, ++pos) {
+  }
+  EXPECT_EQ(warnings, 1u) << stderr_text;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(wrapper.c_str());
 }
 
 // A run that ends before it claims a registry row has no counts of its own,
@@ -1205,6 +1323,8 @@ TEST(Supervision, ExecFailureIsASpawnFailureThatNamesItsCause) {
   const auto entry = ManifestEntry(manifest, "alpha");
   EXPECT_NE(entry.find("\"restart_count\": 0,"), std::string::npos) << entry;
   EXPECT_NE(entry.find("\"recorder_failed\": true"), std::string::npos)
+      << entry;
+  EXPECT_NE(entry.find("\"recorder_failed_logs\": []"), std::string::npos)
       << entry;
   // The failed spawn is a run of its own, with no exit of its own: not the
   // previous run's exit code 3.

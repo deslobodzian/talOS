@@ -332,7 +332,11 @@ class Scanner {
         } else if (key == kRecorderFailed) {
           member.recorder_failed = Bool(key);
         } else if (key == kLogPaths) {
-          member.log_paths = LogPaths();
+          member.log_paths = StringArray();
+        } else if (key == kGapLogs) {
+          member.gap_logs = StringArray();
+        } else if (key == kRecorderFailedLogs) {
+          member.recorder_failed_logs = StringArray();
         } else {
           Skip(3);
         }
@@ -343,7 +347,7 @@ class Scanner {
   }
 
   // An array of strings, or nullopt for any other value (skipped).
-  std::optional<std::vector<std::string>> LogPaths() {
+  std::optional<std::vector<std::string>> StringArray() {
     if (Peek() != '[') {
       Skip(3);
       return std::nullopt;

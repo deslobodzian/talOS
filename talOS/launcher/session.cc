@@ -153,6 +153,18 @@ bool NodeProcessInfo::RecordLogGap(const std::string& log) {
   return true;
 }
 
+bool NodeProcessInfo::RecordRecorderFailure(const std::string& log) {
+  const bool was_failed = failed;
+  failed = true;
+  if (log.empty()) return !was_failed;
+  if (std::find(recorder_failed_logs.begin(), recorder_failed_logs.end(),
+                log) != recorder_failed_logs.end()) {
+    return !was_failed;
+  }
+  recorder_failed_logs.push_back(log);
+  return true;
+}
+
 bool NodeProcessInfo::RecordRealtime(const process::RealtimeOutcome& outcome) {
   if (realtime && realtime->grant() >= outcome.grant()) return false;
   realtime = outcome;
@@ -295,10 +307,20 @@ std::string SessionManifest::ToJson() const {
        << ",\n";
     ss << "      " << Key(keys::kRecorderFailed)
        << (n.failed ? "true" : "false") << ",\n";
+    ss << "      " << Key(keys::kRecorderFailedLogs) << "[";
+    for (std::size_t j = 0; j < n.recorder_failed_logs.size(); ++j) {
+      ss << (j ? ", " : "") << Quoted(n.recorder_failed_logs[j]);
+    }
+    ss << "],\n";
     ss << "      " << Key(keys::kLogCapped) << (n.log_capped ? "true" : "false")
        << ",\n";
     ss << "      " << Key(keys::kLogGap) << (n.log_gap ? "true" : "false")
        << ",\n";
+    ss << "      " << Key(keys::kGapLogs) << "[";
+    for (std::size_t j = 0; j < n.gap_logs.size(); ++j) {
+      ss << (j ? ", " : "") << Quoted(n.gap_logs[j]);
+    }
+    ss << "],\n";
     ss << "      \"described\": " << (n.described ? "true" : "false") << ",\n";
     ss << "      \"endpoint_mismatch\": "
        << (n.endpoint_mismatch ? "true" : "false") << ",\n";

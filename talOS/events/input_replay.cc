@@ -133,9 +133,13 @@ struct ManifestMarks {
 // logs (`<directory>/manifest.json`, talOS/launcher/session.cc, read by
 // session_manifest::Parse) marks `log_gap`, `log_capped` or
 // `recorder_failed`, with those marks; empty when there is no manifest, or
-// it is another session's or has no session_id. Throws std::runtime_error
-// naming a manifest that is not JSON, or whose `log_gap`, `log_capped`,
-// `recorder_failed` or `log_paths` is not what the launcher writes.
+// it is another session's or has no session_id. When a member carries per-run
+// `gap_logs` or `recorder_failed_logs` arrays, only the basenames listed in
+// each array receive that mark (legacy manifests without those arrays fall
+// back to marking every basename in `log_paths` when the member's boolean is
+// true). Throws std::runtime_error naming a manifest that is not JSON, or
+// whose `log_gap`, `log_capped`, `recorder_failed` or required `log_paths` is
+// not what the launcher writes.
 std::map<std::string, ManifestMarks> MarkedLogNames(
     const std::filesystem::path& directory, std::uint64_t session_id) {
   const std::optional<std::string> text = session_manifest::ReadText(directory);
@@ -155,17 +159,32 @@ std::map<std::string, ManifestMarks> MarkedLogNames(
   if (manifest.session_id != session_id) return {};
   std::map<std::string, ManifestMarks> names;
   for (const session_manifest::Member& node : manifest.nodes) {
-    const ManifestMarks marks{.log_gap = node.log_gap,
-                              .log_capped = node.log_capped,
-                              .recorder_failed = node.recorder_failed};
-    if (!marks.log_gap && !marks.log_capped && !marks.recorder_failed) {
-      continue;
+    const bool legacy_gap = node.log_gap && !node.gap_logs.has_value();
+    const bool legacy_failed =
+        node.recorder_failed && !node.recorder_failed_logs.has_value();
+    const bool needs_log_paths = node.log_capped || legacy_gap || legacy_failed;
+    if (needs_log_paths) {
+      if (!node.log_paths) {
+        throw error("a marked member's log_paths is not an array of strings");
+      }
+      for (const std::string& log : *node.log_paths) {
+        ManifestMarks& marks =
+            names[std::filesystem::path{log}.filename().string()];
+        if (legacy_gap) marks.log_gap = true;
+        if (node.log_capped) marks.log_capped = true;
+        if (legacy_failed) marks.recorder_failed = true;
+      }
     }
-    if (!node.log_paths) {
-      throw error("a marked member's log_paths is not an array of strings");
+    if (node.gap_logs) {
+      for (const std::string& log : *node.gap_logs) {
+        names[std::filesystem::path{log}.filename().string()].log_gap = true;
+      }
     }
-    for (const std::string& log : *node.log_paths) {
-      names[std::filesystem::path{log}.filename().string()] = marks;
+    if (node.recorder_failed_logs) {
+      for (const std::string& log : *node.recorder_failed_logs) {
+        names[std::filesystem::path{log}.filename().string()].recorder_failed =
+            true;
+      }
     }
   }
   return names;
