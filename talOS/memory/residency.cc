@@ -71,6 +71,14 @@ bool MappingsKeptResident() noexcept {
   return keep_resident.load(std::memory_order_relaxed);
 }
 
+bool LateLockRefused() noexcept {
+  return reported_late_failure.load(std::memory_order_relaxed);
+}
+
+void SetLateLockRefusedForTest(bool refused) noexcept {
+  reported_late_failure.store(refused, std::memory_order_relaxed);
+}
+
 void TrackMapping(void* address, std::size_t size) {
   const std::scoped_lock lock{mappings_mutex};
   mappings.emplace_back(address, size);

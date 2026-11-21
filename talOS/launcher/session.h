@@ -201,8 +201,9 @@ struct NodeProcessInfo {
   // empty for other members and until the bridge reports it.
   std::optional<uint16_t> http_port;
 
-  // Keeps `outcome` when it is worse than the one recorded; returns whether
-  // it was.
+  // Keeps `outcome` when its grant is worse than the one recorded, or merges
+  // newly refused step bits at the same grant (e.g. a late ring mlock refusal
+  // after an initial partial grant); returns whether `realtime` changed.
   bool RecordRealtime(const process::RealtimeOutcome& outcome);
 
   // Marks the run whose event log is `log` gapped: log_gap and failed (a

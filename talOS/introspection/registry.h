@@ -756,6 +756,12 @@ class NodeRegistration {
   // until then: a claim starts without them.
   void set_realtime(const process::RealtimeOutcome& outcome);
 
+  // Records additional refused realtime steps (process::kStep*) after
+  // set_realtime() has already published a requested outcome (tier != 0 and
+  // requested bit set), e.g. a late shared-memory mapping whose mlock was
+  // refused. No-op until then.
+  void note_realtime_refused(std::uint8_t steps);
+
   void activate();
 
   // The row's `flags` word, for a writer that ORs an event log flag in the

@@ -20,6 +20,7 @@
 #include "talOS/events/os/poller.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/introspection/names.h"
+#include "talOS/memory/residency.h"
 #include "talOS/process/process.h"
 
 namespace talos::hardware {
@@ -422,6 +423,9 @@ void HardwareNode::PublishIntrospection() {
   const event::WakeLoss wake_loss = wake_wait_.loss();
   registration_->set_wake_loss(wake_failures, wake_loss.stalled_arms,
                                wake_loss.wake_fallbacks);
+  if (memory::LateLockRefused()) {
+    registration_->note_realtime_refused(process::kStepRingLock);
+  }
   registration_->end_sample();
 }
 

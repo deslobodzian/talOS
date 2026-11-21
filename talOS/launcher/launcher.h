@@ -278,8 +278,10 @@ class Launcher {
     // proc.recorder_failed_logs (cleared by NewRun so a later run's failure is
     // still recorded per run even after recording_reported suppressed stderr).
     bool run_recorder_failed{false};
-    // This run's realtime outcome was seen in its row (NoteRealtime).
-    bool realtime_reported{false};
+    // This run's realtime outcome last seen in its row (NoteRealtime), so
+    // late refused bits (e.g. kStepRingLock) added after an initial full or
+    // partial grant are still warned about and merged into the manifest.
+    std::optional<process::RealtimeOutcome> realtime_seen;
     // This run's loop has started: its registry row was seen active without
     // kFlagConstructing and with either a realtime outcome or a dispatch.
     // Cleared by NewRun.

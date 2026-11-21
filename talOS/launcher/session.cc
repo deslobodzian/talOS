@@ -166,9 +166,19 @@ bool NodeProcessInfo::RecordRecorderFailure(const std::string& log) {
 }
 
 bool NodeProcessInfo::RecordRealtime(const process::RealtimeOutcome& outcome) {
-  if (realtime && realtime->grant() >= outcome.grant()) return false;
-  realtime = outcome;
-  return true;
+  if (!realtime || outcome.grant() > realtime->grant()) {
+    realtime = outcome;
+    return true;
+  }
+  if (outcome.grant() == realtime->grant()) {
+    const auto merged =
+        static_cast<std::uint8_t>(realtime->refused | outcome.refused);
+    if (merged != realtime->refused) {
+      realtime->refused = merged;
+      return true;
+    }
+  }
+  return false;
 }
 
 uint64_t DeliveryCounts::requests_skipped_total() const {

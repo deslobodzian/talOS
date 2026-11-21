@@ -193,11 +193,9 @@ bool StudioBridge::Watch(NodeProcessInfo& proc,
       }
     }
   }
-  if (!realtime_reported_) {
-    if (const auto outcome = introspect::RealtimeOf(row_flags)) {
-      realtime_reported_ = true;
-      if (proc.RecordRealtime(*outcome)) changed = true;
-    }
+  if (const auto outcome = introspect::RealtimeOf(row_flags)) {
+    realtime_reported_ = true;
+    if (proc.RecordRealtime(*outcome)) changed = true;
   }
   if (!check.kill.empty()) {
     const auto ms = [now = check.judged_at](SupervisionTime since) {
