@@ -28,6 +28,16 @@ void ExpectRejected(std::string_view body) {
   EXPECT_THROW(Parse(body), std::invalid_argument) << body;
 }
 
+void ExpectRejectedNaming(std::string_view body, std::string_view key) {
+  try {
+    static_cast<void>(Parse(body));
+    ADD_FAILURE() << "accepted:\n" << body;
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string{error.what()}.find(key), std::string::npos)
+        << error.what();
+  }
+}
+
 TEST(ConfigTest, RejectsNonBooleanCriticalFlag) {
   for (const auto value : {"0", "\"false\"", "[]", "{}"}) {
     EXPECT_THROW(
@@ -207,12 +217,15 @@ can_id = 3
 feedback_sensor = "enc"
 )");  // Rotor feedback naming a sensor.
   // A rotor frame restarts with the TalonFX, so it is never absolute.
-  ExpectRejected(
+  // REQ-SAFE-26
+  ExpectRejectedNaming(
       "[subsystems.test.motors.m2]\ncan_id = 2\nposition_frame = "
-      "\"absolute\"\n");
-  ExpectRejected(
+      "\"absolute\"\n",
+      "position_frame");
+  ExpectRejectedNaming(
       "[subsystems.test.motors.m2]\ncan_id = 2\nposition_frame = "
-      "\"power_on\"\n");
+      "\"power_on\"\n",
+      "position_frame");
   ExpectRejected(R"(
 [subsystems.test.motors.steer]
 can_id = 2
@@ -281,21 +294,23 @@ feedback_sensor = "imu"
 // Every node's Driver Station view expires at command_timeout_us, and a packet
 // can follow the previous one by 20000 us plus a gateway period: the timeout
 // spans two such gaps, 2 * (20000 + period_us).
+// REQ-SAFE-26
 TEST(ConfigTest, CommandTimeoutSpansTwoDriverStationPacketGaps) {
-  const auto robot = [](int period_us, int timeout_us) {
-    return Parse("[robot]\nperiod_us = " + std::to_string(period_us) +
-                 "\ncommand_timeout_us = " + std::to_string(timeout_us) + "\n");
+  const auto robot_toml = [](int period_us, int timeout_us) {
+    return "[robot]\nperiod_us = " + std::to_string(period_us) +
+           "\ncommand_timeout_us = " + std::to_string(timeout_us) + "\n";
   };
-  EXPECT_THROW(robot(5000, 49999), std::invalid_argument);
-  EXPECT_NO_THROW(robot(5000, 50000));
-  EXPECT_THROW(robot(20000, 79999), std::invalid_argument);
-  EXPECT_NO_THROW(robot(20000, 80000));
+  ExpectRejectedNaming(robot_toml(5000, 49999), "command_timeout_us");
+  EXPECT_NO_THROW(Parse(robot_toml(5000, 50000)));
+  ExpectRejectedNaming(robot_toml(20000, 79999), "command_timeout_us");
+  EXPECT_NO_THROW(Parse(robot_toml(20000, 80000)));
 }
 
 // The bridge holds an actuator owner's last request for at least two of its
 // periods and at least half the command timeout, and the gateway refuses a
 // merged command whose oldest observation is command_timeout_us old, so every
 // owner's period is at most a quarter of it.
+// REQ-SAFE-26
 TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostAQuarterOfTheCommandTimeout) {
   const auto parse = [](const std::string& subsystems) {
     return ParseRobotConfigString("[robot]\ncommand_timeout_us = 100000\n" +
@@ -312,7 +327,14 @@ TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostAQuarterOfTheCommandTimeout) {
           "\n[subsystems.arm." + device + std::string{kMotor});
     };
     EXPECT_NO_THROW(owner(25000)) << device;
-    EXPECT_THROW(owner(25001), std::invalid_argument) << device;
+    try {
+      static_cast<void>(owner(25001));
+      ADD_FAILURE() << "accepted period_us = 25001 for " << device;
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("period_us"), std::string::npos) << what;
+      EXPECT_NE(what.find("command_timeout_us"), std::string::npos) << what;
+    }
   }
   // A node that only reads may be slow.
   EXPECT_NO_THROW(
@@ -697,6 +719,7 @@ TEST_F(ManifestTest, StudioDashboardResolvesAgainstTheFileThatSetsIt) {
 
 // The TalonFX applies soft limits in its own position frame, which a reset
 // restarts unless it is a remote CANcoder's absolute frame.
+// REQ-SAFE-26
 TEST_F(ManifestTest, RefusesSoftLimitsOutsideAnAbsolutePositionFrame) {
   Write("robot.toml",
         "[[subsystems]]\nname = \"lift\"\npath = \"subsystems/lift.toml\"\n");
@@ -708,11 +731,12 @@ TEST_F(ManifestTest, RefusesSoftLimitsOutsideAnAbsolutePositionFrame) {
     ADD_FAILURE() << "soft limits on a rezero-frame motor were accepted";
   } catch (const std::invalid_argument& error) {
     const std::string what = error.what();
+    EXPECT_NE(what.find("soft_limits"), std::string::npos) << what;
     EXPECT_NE(what.find("winch"), std::string::npos) << what;
     EXPECT_NE(what.find("position_frame = \"absolute\""), std::string::npos)
         << what;
   }
-  ExpectRejected("soft_limits = true\n");
+  ExpectRejectedNaming("soft_limits = true\n", "soft_limits");
   const auto absolute = Parse(R"(
 [subsystems.test.sensors.encoder]
 can_id = 2

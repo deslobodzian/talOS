@@ -780,6 +780,27 @@ can_id = 3
         self.assertEqual(hw.motor_request("lift", "lift"),
                          (talos.Mode.MOTION_MAGIC, 1.5, 0.25, 2))
 
+    # REQ-SAFE-42: talos.allow_untargeted_outputs raises TalosError once the
+    # node's event loop has started (after __init__ or inside update()).
+    def test_allow_untargeted_outputs_after_loop_start_raises(self):
+        class LateOptOut:
+            def __init__(self, node):
+                self.node = node
+                self.lift = talos.Motor(node, "lift")
+                self.opt_out_in_update = False
+
+            def update(self):
+                if self.opt_out_in_update:
+                    talos.allow_untargeted_outputs(self.node)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        late = sim.add(LateOptOut, "lift")
+        with self.assertRaises(talos.TalosError):
+            talos.allow_untargeted_outputs(sim.node("lift"))
+        late.opt_out_in_update = True
+        with self.assertRaises(talos.TalosError):
+            sim.step(0.02)
+
     # REQ-SAFE-06: a motor setter outside update() raises, naming the motor
     def test_motor_command_outside_update_raises(self):
         # The flush after each update() sends neutral for every motor that
@@ -1362,6 +1383,31 @@ class MessageTest(unittest.TestCase):
         self.assertEqual(sim.latest_bytes("/planner/frames"), b"")
         with self.assertRaises(TypeError):
             telemeter.frames.send("not bytes")
+
+    # REQ-SAFE-27: publish and publish_bytes refuse any /hw/request topic at
+    # construction, direct or remapped.
+    def test_publish_and_publish_bytes_refuse_hardware_request_topics(self):
+        toml = ROBOT_TOML + """
+[subsystems.remapped.remap]
+state = "/hw/request/remapped"
+[subsystems.remapped_bytes.remap]
+frames = "/hw/request/remapped_bytes"
+"""
+        cases = (
+            ("planner", lambda n: n.publish(Goal, "/hw/request/planner")),
+            ("planner", lambda n: n.publish_bytes("/hw/request/planner", 64)),
+            ("remapped", lambda n: n.publish(Goal, "state")),
+            ("remapped_bytes", lambda n: n.publish_bytes("frames", 64)),
+        )
+        for subsystem, register in cases:
+            with self.subTest(subsystem=subsystem):
+                class BadWriter:
+                    def __init__(self, node):
+                        register(node)
+
+                sim = Sim.from_toml(toml)
+                with self.assertRaisesRegex(talos.TalosError, r"/hw/request"):
+                    sim.add(BadWriter, subsystem)
 
 
 if __name__ == "__main__":

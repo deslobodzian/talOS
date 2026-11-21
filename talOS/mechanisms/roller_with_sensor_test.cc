@@ -260,6 +260,27 @@ TEST(RollerWithSensor, IdleRunsAnEjectOncePerAsk) {
   indexer.Drive(Command::EJECT, 50ms);
   EXPECT_EQ(indexer.roller().phase(), RollerPhase::kIdle);
   EXPECT_EQ(indexer.Applied().mode, Mode::kNeutral);
+  indexer.Drive(Command::FEED, 50ms);
+  EXPECT_EQ(indexer.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(indexer.Applied().mode, Mode::kNeutral);
+}
+
+// With idle_runs, a feed newly asked in kIdle runs feed_v for feed_us once
+// per ask; asking again after another command runs it again.
+// REQ-SAFE-38
+TEST(RollerWithSensor, IdleRunsAFeedOncePerAsk) {
+  Rig intake{"intake"};
+  intake.Start();
+  intake.Drive(Command::FEED, 20ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kFeeding);
+  EXPECT_DOUBLE_EQ(intake.Applied().demand, 10.0);
+  intake.Drive(Command::FEED, 120ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+  intake.Drive(Command::IDLE, 10ms);
+  intake.Drive(Command::FEED, 20ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kFeeding);
+  EXPECT_DOUBLE_EQ(intake.Applied().demand, 10.0);
 }
 
 // Feeding a held piece runs feed_v for feed_us, then idles.
@@ -403,6 +424,47 @@ TEST(RollerWithSensor, InvalidSensorSampleRestartsTheDebounce) {
   EXPECT_EQ(indexer.roller().phase(), RollerPhase::kIntaking);
 }
 
+// Disconnecting the piece sensor during a timed kEjecting or kFeeding run
+// leaves the run on its clock until it expires: neither timed phase needs the
+// sensor to stop.
+// REQ-SAFE-38
+TEST(RollerWithSensor, DisconnectedSensorDuringTimedRunsCompletesTheirClock) {
+  Rig intake{"intake"};
+  intake.Sensor("beam", true);
+  intake.Start();
+  intake.Drive(Command::INTAKE, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kHolding);
+
+  intake.Drive(Command::EJECT, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
+  intake.hw.set_connected("intake", "beam", false);
+  intake.Drive(Command::EJECT, 140ms);  // still inside eject_us (200 ms)
+  EXPECT_FALSE(intake.roller().sensor_connected());
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
+  EXPECT_EQ(intake.Applied().mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(intake.Applied().demand, -8.0);
+  intake.Drive(Command::EJECT, 80ms);  // past eject_us
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+
+  intake.Sensor("beam", true);
+  intake.hw.set_connected("intake", "beam", true);
+  intake.Drive(Command::INTAKE, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kHolding);
+
+  intake.Drive(Command::FEED, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kFeeding);
+  intake.hw.set_connected("intake", "beam", false);
+  intake.Drive(Command::FEED, 50ms);  // still inside feed_us (100 ms)
+  EXPECT_FALSE(intake.roller().sensor_connected());
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kFeeding);
+  EXPECT_EQ(intake.Applied().mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(intake.Applied().demand, 10.0);
+  intake.Drive(Command::FEED, 60ms);  // past feed_us
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+}
+
 // Matrix case 2: losing enable keeps the held piece. The neutral output is
 // the devices flush's (REQ-SAFE-02, proved in talOS/devices).
 // REQ-SAFE-38
@@ -460,6 +522,34 @@ TEST(RollerWithSensor, DisableCancelsATimedRun) {
   EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
   intake.hw.enable();
   intake.Drive(Command::IDLE, 50ms);  // well inside eject_us
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+
+  // Losing enable during kIntaking returns to kIdle.
+  intake.Drive(Command::INTAKE, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kIntaking);
+  ASSERT_DOUBLE_EQ(intake.Applied().demand, 6.0);
+  intake.hw.enable(false);
+  intake.Drive(Command::INTAKE, 20ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+  intake.hw.enable();
+  intake.Drive(Command::IDLE, 20ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+
+  // Losing enable during kFeeding cancels the feed.
+  intake.Sensor("beam", true);
+  intake.Drive(Command::INTAKE, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kHolding);
+  intake.Drive(Command::FEED, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kFeeding);
+  intake.Sensor("beam", false);
+  intake.hw.enable(false);
+  intake.Drive(Command::FEED, 20ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  intake.hw.enable();
+  intake.Drive(Command::IDLE, 50ms);  // well inside feed_us
   EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
   EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
 }
@@ -571,11 +661,12 @@ eject_v = -6.0
   };
   EXPECT_NO_THROW(add("sensor = \"beam\"\neject_us = 100000\n"));
   const std::vector<std::pair<std::string, std::string>> bad{
-      {"sensor", "eject_us = 100000\n"},
+      {"roller.sensor", "eject_us = 100000\n"},
       {"beam_typo", "sensor = \"beam_typo\"\neject_us = 100000\n"},
-      {"eject_us", "sensor = \"beam\"\neject_us = 0\n"},
-      {"eject_us", "sensor = \"beam\"\n"},
-      {"hold_v", "sensor = \"beam\"\neject_us = 100000\nhold_v = inf\n"},
+      {"roller.eject_us", "sensor = \"beam\"\neject_us = 0\n"},
+      {"roller.eject_us", "sensor = \"beam\"\n"},
+      {"roller.feed_us", "sensor = \"beam\"\neject_us = 100000\nfeed_us = 0\n"},
+      {"roller.hold_v", "sensor = \"beam\"\neject_us = 100000\nhold_v = inf\n"},
   };
   for (const auto& [key, table] : bad) {
     SCOPED_TRACE(table);
