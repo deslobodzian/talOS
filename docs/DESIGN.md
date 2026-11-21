@@ -175,7 +175,7 @@ Automated checks that keep the architecture honest.
 | `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies"; its allowlist only shrinks |
 | `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
 | `tools/check_links.py` (CI lint job) | every relative markdown link and `#anchor` resolves |
-| `tools/trace.py --check` (CI lint job) | every `REQ-` tag names a catalogue requirement; every SAFE, CONTRACT and P0 requirement has a tagged test or cites a bench section or open TODO.md item; quarantines are dated and unexpired; every Bazel package is in the package scope table; its waiver list only shrinks |
+| `tools/trace.py --check` (CI lint job) | every `REQ-` tag names a catalogue requirement; every SAFE, CONTRACT and P0 requirement has a tagged test at or below its cheapest runnable tier (from Bazel lane tags, GradleRIO `phoenixTest`, and Studio Vitest) or cites a bench section or open TODO.md item; quarantines are dated and unexpired; every Bazel package is in the package scope table; its waiver list only shrinks |
 | `tools/slow_tests.py --check --bep` (CI Linux job) | per-target lane time budgets (fast, heavy, integration, e2e, perf; [TESTING.md §9](TESTING.md#9-lanes-and-ci)) |
 | `check_runfiles_collisions.py`, read-only sources and "checkout unchanged" in CI | the build never writes the source tree |
 | `tools/prepush.sh` (read-only sources, uncached tests, `check_host_includes.py`) | a push meets CI's conditions before CI runs: no test writes a source file or its mode-preserving copy, no compile reads a host package header (REQ-DEV-25) |
