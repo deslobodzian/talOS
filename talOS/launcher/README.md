@@ -119,6 +119,11 @@ segments its other nodes no longer share. The second launch is refused instead:
 
     launcher: another launcher (pid 4242) is running a session in this shared-memory namespace (...)
 
+`--check-session-lock` runs that lock check on its own without a config,
+exiting 0 if the namespace's session lock is free and 1 naming the holder on
+stderr if it is held (`sim.sh` calls it before starting WPILib simulation, and
+before `bazel build` when the launcher binary is already built).
+
 The namespace is `ShmObjectName`'s ([ARCHITECTURE.md](../../ARCHITECTURE.md#topics-and-messages)):
 sessions and test runs under their own `TALOS_SHM_NAMESPACE` or Bazel
 `TEST_TMPDIR` do not exclude one another. The lock is a POSIX record lock on

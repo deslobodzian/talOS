@@ -147,6 +147,9 @@ struct LauncherOptions {
 
   // Probe and lint without spawning anything, as a pre-flight check.
   bool describe_only{false};
+  // Acquire and immediately release the namespace's SessionLock, then exit 0
+  // if free or 1 naming the holder on stderr (TOOLS-7). Needs no config.
+  bool check_session_lock{false};
   // With `describe_only`: also make the refusals a launch with the same
   // options makes before it probes, those that need no lock, shared memory,
   // socket or process. Launcher::RunSession makes them, and refuses this

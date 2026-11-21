@@ -5439,5 +5439,67 @@ TEST(LauncherGraphTest,
   std::filesystem::remove_all(log_root);
 }
 
+// TOOLS-7 / REQ-OPS-20: --check-session-lock checks the namespace SessionLock
+// without requiring --config or --bundle, exits 0 (and releases the lock) when
+// free, and exits 1 naming the holding process on stderr when held.
+TEST(LauncherTest, CheckSessionLockReportsFreeAndHeldWithoutConfig) {
+  const std::string log_root = TempPath("check_session_lock_out");
+  std::filesystem::remove_all(log_root);
+
+  LauncherOptions options;
+  options.check_session_lock = true;
+  options.output_dir = log_root;
+
+  // Free: exits 0 without creating any session directory or leaving the lock
+  // held.
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(log_root));
+  {
+    std::string lock_error;
+    EXPECT_TRUE(SessionLock::Acquire(lock_error).has_value()) << lock_error;
+  }
+
+  // Held by another process: exits 1 and names the holder's pid on stderr.
+  int ready_pipe[2]{-1, -1};
+  int hold_pipe[2]{-1, -1};
+  ASSERT_EQ(::pipe(ready_pipe), 0);
+  ASSERT_EQ(::pipe(hold_pipe), 0);
+  const pid_t holder = ::fork();
+  ASSERT_GE(holder, 0);
+  if (holder == 0) {
+    ::close(ready_pipe[0]);
+    ::close(hold_pipe[1]);
+    std::string err;
+    auto lock = SessionLock::Acquire(err);
+    const char ok = lock ? '1' : '0';
+    static_cast<void>(::write(ready_pipe[1], &ok, 1));
+    ::close(ready_pipe[1]);
+    char sink = 0;
+    static_cast<void>(::read(hold_pipe[0], &sink, 1));
+    ::close(hold_pipe[0]);
+    _exit(lock ? 0 : 2);
+  }
+  ::close(ready_pipe[1]);
+  ::close(hold_pipe[0]);
+  char ok = 0;
+  ASSERT_EQ(::read(ready_pipe[0], &ok, 1), 1);
+  ::close(ready_pipe[0]);
+  ASSERT_EQ(ok, '1');
+
+  ::testing::internal::CaptureStderr();
+  const int held_status = Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(held_status, 1) << stderr_text;
+  EXPECT_NE(stderr_text.find("pid " + std::to_string(holder)),
+            std::string::npos)
+      << stderr_text;
+  EXPECT_FALSE(std::filesystem::exists(log_root));
+
+  ::close(hold_pipe[1]);
+  int wait_status = 0;
+  ASSERT_EQ(::waitpid(holder, &wait_status, 0), holder);
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+}
+
 }  // namespace
 }  // namespace talos::launcher

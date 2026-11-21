@@ -748,6 +748,15 @@ int Launcher::Run() {
 
 int Launcher::RunSession(StopSignals& stop_signals) {
   session_lock_ = nullptr;
+  if (options_.check_session_lock) {
+    std::string error;
+    const auto lock = options_.acquire_session_lock(error, nullptr);
+    if (!lock) {
+      ConsoleLine(std::cerr) << "launcher: " << error << "\n";
+      return 1;
+    }
+    return 0;
+  }
   // The flag overrides every graph refusal, the safety ones included
   // (REQ-SAFE-27/28) and the live-endpoint refusal, so it never reaches a
   // real controller: --sim requires the loopback remote (below). Refused
