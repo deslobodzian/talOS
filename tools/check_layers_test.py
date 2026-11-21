@@ -23,7 +23,17 @@ GRAPH = {
     "//talOS/events:input_replay": (None, ["//talOS/events:events"]),
     "//talOS/hardware:config": (None, []),
     "//talOS/hardware:merge": (None, []),
-    "//talOS/hardware:hardware": (None, ["//talOS/hardware:config"]),
+    "//talOS/protocol:protocol": (None, []),
+    "//talOS/hardware:hardware": (None, ["//talOS/hardware:config",
+                                         "//talOS/protocol:protocol"]),
+    "//talOS/bridge:messages": (None, []),
+    "//talOS/launcher:hardware_record": (None, ["//talOS/bridge:messages",
+                                                "//talOS/hardware:hardware"]),
+    "//studio/bridge:system": (None, ["//talOS/introspection:registry"]),
+    "//studio/review:review": (None, ["//studio/bridge:system",
+                                      "//talOS/hardware:hardware",
+                                      "//talOS/launcher:hardware_record"]),
+    "//studio/review:studio_review": (None, ["//studio/review:review"]),
     "//talOS/introspection:names": (None, []),
     "//talOS/introspection:registry": (None, ["//talOS/memory:shared_memory",
                                               "//talOS/rtms:process_liveness"]),
@@ -118,6 +128,7 @@ GRAPH = {
 # Rule kinds that are NOT cc_library (defaults to cc_library when omitted).
 KINDS = {
     "//bench/main_processor/swerve_module:send_target": "cc_binary",
+    "//studio/review:studio_review": "cc_binary",
     "//bench/main_processor/swerve_module:node": "talos_node",
     "//bench/main_processor/motor:node": "talos_node",
     "//bench/main_processor/motor:node_test": "cc_test",
@@ -512,6 +523,31 @@ class CheckLayersTest(unittest.TestCase):
                 failures, out = run(GRAPH, visibility=vis)
                 self.assertGreaterEqual(failures, 1, out)
                 self.assertIn(f"  {label}\n", out)
+
+    # REQ-SAFE-35
+    def test_studio_review_cannot_depend_on_rtms_ipc_protocol_or_bridge(self):
+        # Direct deps from studio/review on rtms, ipc, protocol or bridge fail.
+        for frm, to in (
+                ("//studio/review:review", "//talOS/rtms:rtms"),
+                ("//studio/review:review", "//talOS/rtms:process_liveness"),
+                ("//studio/review:review", "//talOS/ipc:ipc"),
+                ("//studio/review:review", "//talOS/protocol:protocol"),
+                ("//studio/review:review", "//talOS/bridge:messages"),
+                ("//studio/review:studio_review", "//talOS/rtms:wake"),
+                ("//studio/review:studio_review", "//talOS/bridge:node_lib"),
+                # Transitive paths from studio/review into RTMS/IPC/bridge
+                # writers or node/devices also fail.
+                ("//studio/bridge:system", "//talOS/rtms:rtms"),
+                ("//studio/bridge:system", "//talOS/rtms:wake"),
+                ("//studio/bridge:system", "//talOS/ipc:ipc"),
+                ("//studio/bridge:system", "//talOS/bridge:node_lib"),
+                ("//studio/bridge:system", "//talOS/node:node"),
+                ("//studio/bridge:system", "//talOS/devices:devices"),
+        ):
+            with self.subTest(frm=frm, to=to):
+                failures, out = run(with_edge(frm, to))
+                self.assertGreaterEqual(failures, 1, out)
+                self.assertIn(f"  {to}\n", out)
 
 
 class CheckNodeSourcesTest(unittest.TestCase):
