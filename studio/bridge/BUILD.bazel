@@ -2,11 +2,12 @@ load("@aspect_bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 exports_files([
     "uws.BUILD.bazel",
     "usockets.BUILD.bazel",
+    "webroot_stamp.py",
 ])
 
 # The system graph: what the live registry holds, as the JSON document Studio
@@ -305,4 +306,23 @@ py_test(
         "testdata/robot.toml",
         ":studio_bridge",
     ],
+)
+
+# Deterministic SHA-256 stamp over Studio's web inputs and telemetry.fbs,
+# run by //studio:web_dist (writing STUDIO_STAMP.txt) and by studio_web in
+# webroot.bzl (rejecting stale builds from another talOS revision).
+py_binary(
+    name = "webroot_stamp",
+    srcs = ["webroot_stamp.py"],
+    visibility = ["//studio:__pkg__"],
+)
+
+py_test(
+    name = "webroot_stamp_test",
+    size = "small",
+    srcs = [
+        "webroot_stamp.py",
+        "webroot_stamp_test.py",
+    ],
+    main = "webroot_stamp_test.py",
 )

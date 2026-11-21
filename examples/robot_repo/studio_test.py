@@ -144,12 +144,24 @@ class StudioBridgeInSession(unittest.TestCase):
             # page. Not built: 503 with the command that builds them, naming
             # the folder the bridge was given (//:studio_webroot, an existing
             # directory, so a webroot the config or //:sim's data miswires
-            # fails here too) and the talOS checkout to build in.
+            # fails here too) and the talOS checkout to build in; when
+            # TALOS_REQUIRE_STUDIO_PAGES=1 is set (as in CI), unbuilt pages
+            # fail the test instead.
             webroot = runfiles.Create().Rlocation("_main/studio_webroot")
             built = not os.path.exists(os.path.join(webroot, "NOT_BUILT.txt"))
+            require_pages = os.environ.get(
+                "TALOS_REQUIRE_STUDIO_PAGES", "").strip() not in ("", "0")
+            if require_pages and not built:
+                self.fail(
+                    f"TALOS_REQUIRE_STUDIO_PAGES is set, but Studio's pages "
+                    f"are not built ({webroot}/NOT_BUILT.txt exists; HTTP "
+                    f"{status}): {body}")
             if built:
                 self.assertEqual(status, 200, body)
                 self.assertIn("<html", body.lower())
+                self.assertTrue(
+                    os.path.isfile(os.path.join(webroot, "STUDIO_STAMP.txt")),
+                    f"built webroot {webroot} is missing STUDIO_STAMP.txt")
             else:
                 self.assertEqual(status, 503, body)
                 self.assertIn("//studio:web_dist", body)
