@@ -99,8 +99,15 @@ changes it.
 A robot's bundle config is a field overlay of its simulation config: the
 bench's `robot_bench.toml` includes the base
 [robot config](../bench/main_processor/configuration/robot.toml) and changes
-only `[robot] controller_address`, to the RoboRIO's `10.56.87.2` (and restates
-`commissioned = false`). Simulation and its tests keep using the base config
+`[robot] controller_address` to the RoboRIO's `10.56.87.2` (and restates
+`commissioned = false`). A field overlay for a multi-homed companion can also
+set `[robot] local_address` to the companion's Ethernet IPv4 address (matching
+the RoboRIO build's `-Pcompanion=<ipv4>`) so `hardware_node` binds that
+interface on every socket open and reopen rather than `0.0.0.0`; leaving it
+unset on a non-loopback target emits a non-fatal warning during
+`--describe-only` and `deploy.sh install`'s graph check
+([controller addressing](../talOS/launcher/README.md#controller-addressing)).
+Simulation and its tests keep using the base config
 with loopback (`127.0.0.1`), so no source edits are needed when switching
 between simulation and the field bundle. Such an overlay does not change CAN
 ids or commissioning: hardware must still be checked and commissioned through
@@ -120,14 +127,18 @@ warning, when the bundled bridge cannot run on the robot (it does not answer
 `--describe`), and from a checkout whose bridge is not built (the warning
 gives the `bazel build` command).
 
-To bring up the bundle against a different controller address without editing
-the config, run `./run.sh --remote <ip>` (for example,
-`./run.sh --remote 10.56.87.3`). This overrides the effective address for that
-launch; use `--remote-port` and `--local-port` if the ports also differ.
+To bring up the bundle against a different controller or companion interface
+address without editing the config, run `./run.sh --remote <ip>` (for example,
+`./run.sh --remote 10.56.87.3 --local-address 10.56.87.5`). These override
+`[robot] controller_address` and `[robot] local_address` for that launch; use
+`--remote-port` and `--local-port` if the ports also differ.
 
-An installed bundle runs simulated with `./run.sh --sim --remote 127.0.0.1`:
-`--sim` requires the loopback remote, and the hardware bridge's `--describe`
-probe and its runs both get the effective one
+An installed bundle runs simulated with `./run.sh --sim --remote 127.0.0.1`
+(plus `--local-address 127.0.0.1` if the bundle's config sets `[robot]
+local_address` to a physical interface):
+`--sim` requires the loopback remote and an unset or loopback local address,
+and the hardware bridge's `--describe` probe and its runs both get the
+effective values
 ([controller addressing](../talOS/launcher/README.md#controller-addressing)).
 A bundle carries no simulator (`--start-sim-gateway` reports the
 `[robot] sim_gateway` binary missing from the bundle), so something else must stand in for the

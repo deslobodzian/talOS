@@ -4496,6 +4496,234 @@ TEST(LauncherRemoteTest, BridgeProbeGetsTheEffectiveRemote) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// REQ-OPS-25, REQ-RT-22: `--local-address` resolves over `[robot]
+// local_address` (empty keeps wildcard `0.0.0.0`), malformed IPv4 and
+// non-loopback `--sim` local addresses are refused before probing or spawning,
+// and the effective address is forwarded to `hardware_node` as
+// `--local-address <ip>` and logged on startup.
+TEST(LauncherRemoteTest, LocalAddressResolvesAndForwardsToBridge) {
+  {
+    const auto unset = config::ParseRobotConfigString(kFixtureToml);
+    LauncherOptions options;
+    EXPECT_EQ(EffectiveLocalAddress(unset, options), "");
+    const auto unset_args = ControllerArgs(unset, options);
+    EXPECT_EQ(
+        std::find(unset_args.begin(), unset_args.end(), "--local-address"),
+        unset_args.end());
+
+    std::string with_local_toml{kFixtureToml};
+    const std::string header = "[robot]\n";
+    with_local_toml.insert(with_local_toml.find(header) + header.size(),
+                           "local_address = \"10.56.87.5\"\n");
+    const auto configured = config::ParseRobotConfigString(with_local_toml);
+    EXPECT_EQ(EffectiveLocalAddress(configured, options), "10.56.87.5");
+    const auto config_args = ControllerArgs(configured, options);
+    const auto config_flag =
+        std::find(config_args.begin(), config_args.end(), "--local-address");
+    ASSERT_NE(config_flag, config_args.end());
+    ASSERT_NE(std::next(config_flag), config_args.end());
+    EXPECT_EQ(*std::next(config_flag), "10.56.87.5");
+
+    options.local_address = "10.0.0.37";
+    EXPECT_EQ(EffectiveLocalAddress(configured, options), "10.0.0.37");
+    const auto cli_args = ControllerArgs(configured, options);
+    const auto cli_flag =
+        std::find(cli_args.begin(), cli_args.end(), "--local-address");
+    ASSERT_NE(cli_flag, cli_args.end());
+    ASSERT_NE(std::next(cli_flag), cli_args.end());
+    EXPECT_EQ(*std::next(cli_flag), "10.0.0.37");
+  }
+
+  // Invalid `--local-address` values are refused before any probe or spawn.
+  for (const char* bad : {"not-an-ip", "10.0.0.999", "010.0.0.1"}) {
+    SCOPED_TRACE(bad);
+    const std::string invoked = TempPath("bad_local_addr_invoked");
+    ::remove(invoked.c_str());
+    GraphFixture fixture{
+        "bad_local_addr",
+        RecordingStub("alpha", "//example/alpha:node", invoked),
+        RecordingStub("beta", "//example/beta:node", invoked)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("bad_local_addr_hardware",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", invoked));
+    fixture.options.local_address = bad;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(invoked)) << ReadFile(invoked);
+    EXPECT_FALSE(std::filesystem::exists(fixture.out_dir)) << fixture.out_dir;
+    ::remove(invoked.c_str());
+  }
+
+  // `--sim` refuses a non-loopback local address (from CLI or config) before
+  // any probe or spawn.
+  struct SimLocalRow {
+    const char* name;
+    const char* cli_local;
+    const char* config_local;
+  };
+  for (const SimLocalRow row :
+       {SimLocalRow{"--local-address", "10.56.87.5", nullptr},
+        SimLocalRow{"config local_address", "", "10.56.87.5"}}) {
+    SCOPED_TRACE(row.name);
+    const std::string invoked = TempPath("sim_local_guard_invoked");
+    ::remove(invoked.c_str());
+    GraphFixture fixture{
+        "sim_local_guard",
+        RecordingStub("alpha", "//example/alpha:node", invoked),
+        RecordingStub("beta", "//example/beta:node", invoked)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("sim_local_guard_hardware",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", invoked));
+    if (row.config_local != nullptr) {
+      std::string toml{kFixtureToml};
+      const std::string header = "[robot]\n";
+      toml.insert(
+          toml.find(header) + header.size(),
+          std::string{"local_address = \""} + row.config_local + "\"\n");
+      fixture.options.config_path =
+          TempPath("sim_local_guard_config") + ".toml";
+      std::ofstream{fixture.options.config_path} << toml;
+    }
+    fixture.options.simulation = true;
+    fixture.options.local_address = row.cli_local;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(invoked)) << ReadFile(invoked);
+    EXPECT_FALSE(std::filesystem::exists(fixture.out_dir)) << fixture.out_dir;
+    ::remove(invoked.c_str());
+    if (row.config_local != nullptr) {
+      ::remove(fixture.options.config_path.c_str());
+    }
+  }
+
+  // End-to-end launch: verify both probe and runtime receive the effective
+  // `--local-address` (CLI overriding `[robot] local_address`, including
+  // allowing `--sim` with `--local-address 127.0.0.1`) and that `talos.log`
+  // prints `(local <ip>:<port>)` when bound vs `(local port <port>)` when
+  // unset.
+  const std::string args_file = TempPath("local_addr_bridge_args");
+  const auto make_recording_bridge = [&](const std::string& stub_name) {
+    const std::string base =
+        DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {});
+    const std::string shebang = "#!/bin/sh\n";
+    return WriteStubNode(stub_name, shebang + "printf '%s\\n' \"$*\" >> '" +
+                                        args_file + "'\n" +
+                                        base.substr(shebang.size()));
+  };
+
+  {
+    ::remove(args_file.c_str());
+    auto options = SessionFixture("local_addr_bound");
+    std::filesystem::remove_all(options.output_dir);
+    {
+      std::string toml{kFixtureToml};
+      const std::string header = "[robot]\n";
+      toml.insert(toml.find(header) + header.size(),
+                  "local_address = \"10.56.87.5\"\n");
+      options.config_path = TempPath("local_addr_bound_config") + ".toml";
+      std::ofstream{options.config_path} << toml;
+    }
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        make_recording_bridge("local_addr_bound_hw");
+    options.simulation = true;
+    options.local_address = "127.0.0.1";
+    ASSERT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(args_file);
+    EXPECT_NE(recorded.find("--describe"), std::string::npos) << recorded;
+    EXPECT_NE(recorded.find("--local-address 127.0.0.1"), std::string::npos)
+        << recorded;
+    EXPECT_EQ(recorded.find("10.56.87.5"), std::string::npos) << recorded;
+    const std::string talos_log = ReadFile(options.output_dir + "/1/talos.log");
+    EXPECT_NE(
+        talos_log.find(
+            "[launcher] Controller 127.0.0.1:5802 (local 127.0.0.1:5803)"),
+        std::string::npos)
+        << talos_log;
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(options.config_path.c_str());
+    ::remove(args_file.c_str());
+  }
+
+  {
+    ::remove(args_file.c_str());
+    auto options = SessionFixture("local_addr_unset");
+    std::filesystem::remove_all(options.output_dir);
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        make_recording_bridge("local_addr_unset_hw");
+    ASSERT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(args_file);
+    EXPECT_EQ(recorded.find("--local-address"), std::string::npos) << recorded;
+    const std::string talos_log = ReadFile(options.output_dir + "/1/talos.log");
+    EXPECT_NE(talos_log.find(
+                  "[launcher] Controller 127.0.0.1:5802 (local port 5803)"),
+              std::string::npos)
+        << talos_log;
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(args_file.c_str());
+  }
+}
+
+// REQ-OPS-25: `--describe-only` emits a non-fatal warning when `local_address`
+// is unset on a non-loopback, non-`--sim` target, and emits none when
+// `local_address` is set (config or CLI), on `127.0.0.1`, or under `--sim`.
+TEST(LauncherRemoteTest, DescribeOnlyWarnsWhenLocalAddressUnsetOnNonLoopback) {
+  struct Row {
+    const char* name;
+    const char* controller_address;
+    const char* config_local_address;
+    const char* cli_remote;
+    const char* cli_local_address;
+    bool simulation;
+    bool expect_warning;
+  };
+  for (const Row row : {
+           Row{"non_loopback_config_unset", "10.56.87.2", nullptr, "", "",
+               false, true},
+           Row{"non_loopback_cli_unset", "127.0.0.1", nullptr, "10.56.87.2", "",
+               false, true},
+           Row{"non_loopback_config_local_set", "10.56.87.2", "10.56.87.5", "",
+               "", false, false},
+           Row{"non_loopback_cli_local_set", "10.56.87.2", nullptr, "",
+               "10.56.87.5", false, false},
+           Row{"loopback_unset", "127.0.0.1", nullptr, "", "", false, false},
+           Row{"sim_override_unset", "10.56.87.2", nullptr, "127.0.0.1", "",
+               true, false},
+       }) {
+    SCOPED_TRACE(row.name);
+    auto options = SessionFixture(std::string{"local_warn_"} + row.name);
+    std::filesystem::remove_all(options.output_dir);
+    std::string toml{kFixtureToml};
+    const std::string header = "[robot]\n";
+    std::string extra = std::string{"controller_address = \""} +
+                        row.controller_address + "\"\n";
+    if (row.config_local_address != nullptr) {
+      extra +=
+          std::string{"local_address = \""} + row.config_local_address + "\"\n";
+    }
+    toml.insert(toml.find(header) + header.size(), extra);
+    options.config_path =
+        TempPath(std::string{"local_warn_cfg_"} + row.name) + ".toml";
+    std::ofstream{options.config_path} << toml;
+    options.remote = row.cli_remote;
+    options.local_address = row.cli_local_address;
+    options.simulation = row.simulation;
+    options.describe_only = true;
+
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const std::string graph =
+        ReadFile(options.output_dir + "/" + std::to_string(options.session_id) +
+                 "/graph.json");
+    const bool has_warning =
+        graph.find(
+            "\"severity\": \"warning\", \"subject\": \"hardware_node\", "
+            "\"message\": \"[robot] local_address is unset") !=
+        std::string::npos;
+    EXPECT_EQ(has_warning, row.expect_warning) << graph;
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(options.config_path.c_str());
+  }
+}
+
 // Fetches one HTTP GET path on 127.0.0.1:`port` and returns the raw response.
 std::string HttpGetLoopback(uint16_t port, std::string_view path) {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);

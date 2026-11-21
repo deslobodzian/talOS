@@ -72,6 +72,7 @@ struct LauncherOptions {
 
   // Controller addressing. Empty/zero means "take it from [robot]".
   std::string remote;
+  std::string local_address;
   uint16_t remote_port{0};
   uint16_t local_port{0};
 
@@ -240,13 +241,14 @@ NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
                       bool studio_bridge = false);
 
 // The controller addressing the hardware bridge is described and started
-// with: `--remote`, `--remote-port` and `--local-port`, each the effective
-// value (a flag wins over the config). DiscoverNodes puts them in the
-// bridge's NodeSpec::extra_args, so its --describe probe and every run get
-// the same ones: hardware_node refuses --sim without the loopback remote,
-// and a probe that fell back to the config's address would refuse
-// `--sim --remote 127.0.0.1` on a config naming the RoboRIO. Throws as
-// config::ResolveControllerAddress does on an invalid --remote.
+// with: `--remote`, `--remote-port`, `--local-port` and, when non-empty,
+// `--local-address`, each the effective value (a flag wins over the config).
+// DiscoverNodes puts them in the bridge's NodeSpec::extra_args, so its
+// --describe probe and every run get the same ones: hardware_node refuses
+// --sim without the loopback remote, and a probe that fell back to the
+// config's address would refuse `--sim --remote 127.0.0.1` on a config naming
+// the RoboRIO. Throws as config::ResolveControllerAddress /
+// config::ResolveLocalAddress do on an invalid --remote or --local-address.
 std::vector<std::string> ControllerArgs(const config::RobotConfig& config,
                                         const LauncherOptions& options);
 
@@ -283,6 +285,11 @@ bool BundleWithoutStudio(const LauncherOptions& options);
 // Effective endpoints for a launch: a CLI flag wins, otherwise the config.
 std::string EffectiveRemoteAddress(const config::RobotConfig& config,
                                    const LauncherOptions& options);
+
+// Effective local interface bind address: CLI `--local-address` over `[robot]
+// local_address`, or empty when neither is set (wildcard `0.0.0.0`).
+std::string EffectiveLocalAddress(const config::RobotConfig& config,
+                                  const LauncherOptions& options);
 
 uint16_t EffectiveRemotePort(const config::RobotConfig& config,
                              const LauncherOptions& options);
