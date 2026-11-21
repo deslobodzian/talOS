@@ -182,7 +182,7 @@ Pass `--max-range-m` to match a non-default `camera.max_range_m`.
 ## Uncommissioned, then disabled
 
 - [ ] With the uncommissioned bundle running and DS disabled, watch the RoboRIO console and Studio. Expected: RIO logs `commissioned=0`, `/hw/status` `commissioned` reads false, and every actuator stays neutral. This deliberate refusal is not a CAN fault to bypass.
-- [ ] Inspect `/hw/status` (Studio channels use `hw/status/*`; field definitions are in `talOS/bridge/bridge_status.fbs`). Expected: `states_received_count` advances, `state_age_us` stays low, and `identity_rejected_count` / `ownership_rejected_count` do not grow. Before the first frame, `state_age_us = 0` alone does not prove connectivity.
+- [ ] Inspect `/hw/status` (Studio channels use `hw/status/*`; field definitions are in `talOS/hardware/status/bridge_status.fbs`). Expected: `states_received_count` advances, `state_age_us` stays low, and `identity_rejected_count` / `ownership_rejected_count` do not grow. Before the first frame, `state_age_us = 0` alone does not prove connectivity.
 
 ## Human commissioning
 

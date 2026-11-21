@@ -58,7 +58,7 @@
 
 #include "talOS/events/time.h"
 #include "talOS/ipc/concepts.h"
-#include "talOS/node/access.h"
+#include "talOS/node/node_detail.h"
 #include "talOS/schema/identity.h"
 
 namespace talos {
@@ -246,6 +246,7 @@ class Node {
 
  private:
   friend struct detail::NodeAccess;  // the framework's side: access.h
+  friend struct detail::NodeDetail;  // safe public-API thunks: node_detail.h
   explicit Node(detail::NodeSetup setup);
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -312,20 +313,20 @@ class StateMachine {
 
   S state() const {
     return static_cast<S>(
-        detail::NodeAccess::state_machine_state(*node_, index_));
+        detail::NodeDetail::state_machine_state(*node_, index_));
   }
   bool is(S s) const { return state() == s; }
   S previous() const {
     return static_cast<S>(
-        detail::NodeAccess::state_machine_previous(*node_, index_));
+        detail::NodeDetail::state_machine_previous(*node_, index_));
   }
   void go(S next);  // no-op when next == state()
   Duration time_in_state() const {
-    return detail::NodeAccess::state_machine_time_in_state(*node_, index_);
+    return detail::NodeDetail::state_machine_time_in_state(*node_, index_);
   }
   // True during the first update() tick that starts in this state.
   bool just_entered() const {
-    return detail::NodeAccess::state_machine_just_entered(*node_, index_);
+    return detail::NodeDetail::state_machine_just_entered(*node_, index_);
   }
 
  private:
@@ -343,28 +344,28 @@ namespace detail {
 
 template <class T>
 std::optional<T> FindParam(const Node& node, std::string_view key,
-                           NodeAccess::ParamTable subsystem = {}) {
+                           ParamTable subsystem = {}) {
   if constexpr (std::is_same_v<T, bool>) {
-    return NodeAccess::find_bool(node, key, subsystem);
+    return NodeDetail::find_bool(node, key, subsystem);
   } else if constexpr (std::is_integral_v<T>) {
     const std::optional<std::int64_t> value =
-        NodeAccess::find_int(node, key, subsystem);
+        NodeDetail::find_int(node, key, subsystem);
     if (!value) return std::nullopt;
     if (!std::in_range<T>(*value)) {
-      NodeAccess::param_error(node, key, "is out of range", subsystem);
+      NodeDetail::param_error(node, key, "is out of range", subsystem);
     }
     return static_cast<T>(*value);
   } else if constexpr (std::is_floating_point_v<T>) {
     const std::optional<double> value =
-        NodeAccess::find_double(node, key, subsystem);
+        NodeDetail::find_double(node, key, subsystem);
     if (!value) return std::nullopt;
     return static_cast<T>(*value);
   } else if constexpr (std::is_same_v<T, std::string>) {
-    return NodeAccess::find_string(node, key, subsystem);
+    return NodeDetail::find_string(node, key, subsystem);
   } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
-    return NodeAccess::find_string_list(node, key, subsystem);
+    return NodeDetail::find_string_list(node, key, subsystem);
   } else if constexpr (std::is_same_v<T, std::vector<double>>) {
-    return NodeAccess::find_double_list(node, key, subsystem);
+    return NodeDetail::find_double_list(node, key, subsystem);
   } else {
     static_assert(sizeof(T) == 0,
                   "param<T>: T must be bool, an integer, double, std::string, "
@@ -379,7 +380,7 @@ InstanceFactory MakeInstance() {
   return [](Node& node) -> Instance {
     auto object = std::make_shared<T>(node);
     if constexpr (requires(T& t) { t.update(); }) {
-      NodeAccess::set_update(node, [raw = object.get()] { raw->update(); });
+      NodeDetail::set_update(node, [raw = object.get()] { raw->update(); });
     }
     return object;
   };
@@ -391,7 +392,7 @@ std::int32_t HostCppNode(void* raw_node) noexcept {
     if (raw_node == nullptr) return -1;
     auto& node = *static_cast<Node*>(raw_node);
     auto instance = MakeInstance<T>()(node);
-    NodeAccess::add_extension(node, typeid(T), std::move(instance));
+    NodeDetail::add_extension(node, typeid(T), std::move(instance));
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "HostCppNode: %s\n", e.what());
@@ -412,7 +413,7 @@ T Node::param(std::string_view key, T fallback) const {
 template <class T>
 T Node::param(std::string_view key) const {
   std::optional<T> value = detail::FindParam<T>(*this, key);
-  if (!value) detail::NodeAccess::param_error(*this, key, "is missing");
+  if (!value) detail::NodeDetail::param_error(*this, key, "is missing");
   return *std::move(value);
 }
 
@@ -427,7 +428,7 @@ template <class T>
 T Node::param_of(std::string_view subsystem, std::string_view key) const {
   std::optional<T> value = detail::FindParam<T>(*this, key, subsystem);
   if (!value) {
-    detail::NodeAccess::param_error(*this, key, "is missing", subsystem);
+    detail::NodeDetail::param_error(*this, key, "is missing", subsystem);
   }
   return *std::move(value);
 }
@@ -435,7 +436,7 @@ T Node::param_of(std::string_view subsystem, std::string_view key) const {
 template <Message M>
 Subscription<M> Node::subscribe(std::string_view topic,
                                 SubscribeOptions options) {
-  return Subscription<M>{this, detail::NodeAccess::add_subscription(
+  return Subscription<M>{this, detail::NodeDetail::add_subscription(
                                    *this, topic, sizeof(M), kMessageAlignment,
                                    schema::Of<M>(), options.optional, {})};
 }
@@ -453,11 +454,11 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message, Wake wake,
       [fn = std::move(on_message)](const void* data) {
         fn(*static_cast<const M*>(data));
       };
-  const std::size_t index = detail::NodeAccess::add_subscription(
+  const std::size_t index = detail::NodeDetail::add_subscription(
       *this, topic, sizeof(M), kMessageAlignment, schema::Of<M>(),
       options.optional, std::move(callback));
   if (wake != Wake::kAtDrain) {
-    detail::NodeAccess::require_immediate_delivery(*this, index);
+    detail::NodeDetail::require_immediate_delivery(*this, index);
   }
   return Subscription<M>{this, index};
 }
@@ -465,69 +466,69 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message, Wake wake,
 template <Message M>
 Publisher<M> Node::publish(std::string_view topic) {
   return Publisher<M>{
-      this, detail::NodeAccess::add_publisher(
+      this, detail::NodeDetail::add_publisher(
                 *this, topic, sizeof(M), kMessageAlignment, schema::Of<M>())};
 }
 
 template <class T>
 T& Node::extension() {
   const std::type_index type{typeid(T)};
-  if (void* existing = detail::NodeAccess::find_extension(*this, type)) {
+  if (void* existing = detail::NodeDetail::find_extension(*this, type)) {
     return *static_cast<T*>(existing);
   }
   auto object = std::make_shared<T>(*this);
   T& result = *object;
-  detail::NodeAccess::add_extension(*this, type, std::move(object));
+  detail::NodeDetail::add_extension(*this, type, std::move(object));
   return result;
 }
 
 template <Message M>
 bool Subscription<M>::has_value() const {
-  return detail::NodeAccess::subscription_has_value(*node_, index_);
+  return detail::NodeDetail::subscription_has_value(*node_, index_);
 }
 template <Message M>
 const M& Subscription<M>::value() const {
   return *static_cast<const M*>(
-      detail::NodeAccess::subscription_value(*node_, index_));
+      detail::NodeDetail::subscription_value(*node_, index_));
 }
 template <Message M>
 bool Subscription<M>::fresh() const {
-  return fresh(detail::NodeAccess::freshness_timeout(*node_));
+  return fresh(detail::NodeDetail::freshness_timeout(*node_));
 }
 template <Message M>
 bool Subscription<M>::fresh(Duration max_age) const {
-  return detail::NodeAccess::subscription_fresh(*node_, index_, max_age);
+  return detail::NodeDetail::subscription_fresh(*node_, index_, max_age);
 }
 template <Message M>
 Duration Subscription<M>::age() const {
-  return detail::NodeAccess::subscription_age(*node_, index_);
+  return detail::NodeDetail::subscription_age(*node_, index_);
 }
 template <Message M>
 bool Subscription<M>::updated() const {
-  return detail::NodeAccess::subscription_updated(*node_, index_);
+  return detail::NodeDetail::subscription_updated(*node_, index_);
 }
 
 template <Message M>
 bool Publisher<M>::send(const M& message) {
-  return detail::NodeAccess::publisher_send(*node_, index_, &message,
+  return detail::NodeDetail::publisher_send(*node_, index_, &message,
                                             sizeof(M));
 }
 
 inline bool BytePublisher::send(std::span<const std::byte> message) {
-  return detail::NodeAccess::byte_publisher_send(*node_, index_, message);
+  return detail::NodeDetail::byte_publisher_send(*node_, index_, message);
 }
 
 template <class S>
   requires std::is_enum_v<S>
 StateMachine<S>::StateMachine(Node& node, S initial)
     : node_{&node},
-      index_{detail::NodeAccess::add_state_machine(
+      index_{detail::NodeDetail::add_state_machine(
           node, static_cast<std::int64_t>(initial))} {}
 
 template <class S>
   requires std::is_enum_v<S>
 void StateMachine<S>::go(S next) {
-  detail::NodeAccess::state_machine_go(*node_, index_,
+  detail::NodeDetail::state_machine_go(*node_, index_,
                                        static_cast<std::int64_t>(next));
 }
 

@@ -17,14 +17,22 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
-#include "talOS/bridge/boot_history.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/devices/access.h"
+#include "talOS/hardware/boot_history.h"
 #include "talOS/hardware/feedback.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/names.h"
+#include "talOS/node/access.h"
 
 namespace talos {
 namespace {
+
+static_assert(std::string_view{hardware::kRequestTopicPrefix} ==
+                  introspect::naming::kRequestTopicPrefix,
+              "hardware::kRequestTopicPrefix must match "
+              "introspect::naming::kRequestTopicPrefix");
 
 using detail::HardwareAccess;
 using hardware::Packet;

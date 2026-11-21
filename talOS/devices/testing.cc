@@ -16,14 +16,14 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
-#include "talOS/bridge/can_buses.h"
-#include "talOS/bridge/clock_offset.h"
-#include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
+#include "talOS/hardware/can_buses.h"
+#include "talOS/hardware/clock_offset.h"
 #include "talOS/hardware/feedback.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/gateway.h"
+#include "talOS/hardware/merge.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/names.h"
 #include "talOS/protocol/types.h"
@@ -97,7 +97,7 @@ struct SimHardware::Impl {
   std::map<std::uint16_t, bool> applied_digital_outputs;
   std::map<std::uint16_t, double> applied_pwm_outputs;
   // One per actuator-owning subsystem, merged by the bridge's rules
-  // (talOS/bridge/merge.h) on sim-time microseconds.
+  // (talOS/hardware/merge.h) on sim-time microseconds.
   struct RequestTracker {
     std::string topic;
     std::uint64_t cursor = 0;

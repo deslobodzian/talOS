@@ -28,6 +28,7 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/os/poller.h"
+#include "talOS/introspection/hardware_lint.h"
 #include "talOS/introspection/lock_file.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/launcher/console_line.h"
@@ -178,7 +179,7 @@ DeliveryCounts DeliveryCountsOf(const introspect::NodeRecord& record) {
                             static_cast<event::SourceKind>(source.kind), name))
       continue;
     // `/hw/request/<subsystem>`, as the bridge reads it.
-    const std::string_view prefix{hardware::kRequestTopicPrefix};
+    const std::string_view prefix{introspect::naming::kRequestTopicPrefix};
     if (name.starts_with(prefix)) name.erase(0, prefix.size());
     counts.requests_skipped.emplace_back(std::move(name), dropped);
   }

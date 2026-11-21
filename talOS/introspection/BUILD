@@ -13,9 +13,20 @@ cc_library(
     hdrs = ["names.h"],
     deps = [
         "//talOS/events:events_core",
-        "//talOS/hardware",
         "//talOS/rtms",
         "@flatbuffers//:runtime_cc",
+    ],
+)
+
+# Advisory hardware-config lint (CAN bus load, sensor velocity limits), run by
+# the launcher beside LintGraph. Separate from :names so talOS/node never
+# reaches talOS/hardware through talOS/introspection.
+cc_library(
+    name = "hardware_lint",
+    hdrs = ["hardware_lint.h"],
+    deps = [
+        ":names",
+        "//talOS/hardware:config",
     ],
 )
 
@@ -70,7 +81,9 @@ cc_test(
     size = "small",
     srcs = ["names_test.cc"],
     deps = [
+        ":hardware_lint",
         ":names",
+        "//talOS/hardware",
         "//talOS/schema:identity",
         "//talOS/schema:test_messages",
         "@googletest//:gtest_main",

@@ -6,7 +6,11 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 cc_library(
     name = "shared_memory",
     hdrs = ["shared_memory_ptr.h"],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//studio:__subpackages__",
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = [":residency"],
 )
 
@@ -16,7 +20,7 @@ cc_library(
     name = "residency",
     srcs = ["residency.cc"],
     hdrs = ["residency.h"],
-    visibility = ["//visibility:public"],
+    visibility = ["//talOS:__subpackages__"],
 )
 
 cc_test(

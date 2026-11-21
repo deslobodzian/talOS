@@ -66,12 +66,12 @@ The rules are ARCHITECTURE.md
 
 | Rule | Status |
 |---|---|
-| Layers depend only downward (rtms → events → node → devices → robot code) | **[enforced]**: `tools/check_layers.py` in CI, whose allowlist holds today's exceptions (`talOS/devices:testing` on `talOS/bridge:merge`; `talOS/node` on `talOS/hardware` through `talOS/configuration` and `talOS/introspection`); **[gap: ARCH-2]** to remove them and make core libraries non-public |
+| Layers depend only downward (rtms → events → node → devices → robot code) | **[enforced]**: `tools/check_layers.py` in CI with an empty allowlist (`talOS/node` reads only `//talOS/hardware:config` via `talOS/configuration`; bridge/sim helpers live in `talOS/hardware`); privileged internal/transport targets are non-public in Bazel |
 | `talOS/` never depends on a robot, an example or `studio/` | **[enforced]**: `tools/check_layers.py` |
-| Nodes share only messages and topic names | **[enforced]** for Bazel dependencies: `tools/check_layers.py` (a node package's targets, its tests included, depend on another node package only through its `talos_messages` targets or its `talos_cc_shared_node`; outside node packages only a testonly target, such as a robot's cross-node integration test, links a node's library); **[gap: ARCH-2]** for making node libraries package-private |
+| Nodes share only messages and topic names | **[enforced]** for Bazel dependencies: `tools/check_layers.py` (a node package's targets, its tests included, depend on another node package only through its `talos_messages` targets or its `talos_cc_shared_node`; outside node packages only a testonly target, such as a robot's cross-node integration test, links a node's library) |
 | `talOS/vision` → `talOS/geometry`, never the reverse | **[enforced]**: `tools/check_layers.py` |
 | Python reaches talOS only through `talOS/node_api` | **[enforced]** for the ABI: `//talOS/python:api_parity_test`, `node_api.cc` `static_assert`s; for Bazel dependencies: `tools/check_layers.py`; **[review]** for "reimplements no wire format" |
-| Only the devices-layer flush writes `/hw/request/<node>` | **[enforced]** for `publish`/`publish_bytes` and `LintGraph`; **[gap: ARCH-2]** for `detail::NodeAccess` and raw RTMS publishers, which node code can still reach |
+| Only the devices-layer flush writes `/hw/request/<node>` | **[enforced]**: `publish`/`publish_bytes` and `NodeDetail::publisher_send` refuse `/hw/request`, `LintGraph` checks the `hardware_request` flag, Bazel visibility and `implementation_deps` keep `//talOS/node:access`, `//talOS/devices:access`, `//talOS/hardware:hardware`, `//talOS/ipc:ipc`, `//talOS/rtms:{rtms,wake}` and `//talOS/memory:shared_memory` out of robot node compile/link graphs, and `tools/check_layers.py` checks visibility, direct deps and C++/Starlark sources |
 | Output setters only inside `update()` | **[enforced]**: they throw elsewhere |
 | Actuation needs `robot_enabled` and a live `Target` | **[enforced]** for "a live target exists this tick": the devices flush (REQ-SAFE-41); its opt-out, `AllowUntargetedOutputs`, is marked on the node's hardware request in `--describe` and the registry (REQ-SAFE-42); **[review]** for "the outputs derive from that target": the flush cannot tell a demand taken from the target from one taken from a joystick or a value kept from an earlier tick |
 | One writer per topic; naming; schema identity; reader cap | **[enforced]**: `LintGraph` at launch and `--describe-only`, `talos_graph_test`, `talos_messages` at BUILD load, `//talOS/build:topic_grammar_test` |
@@ -112,7 +112,7 @@ the check in the same commit (RULES.md 9).
 | UDP frame and payload bytes, device caps, shared-memory slot sizes | [DATA_FLOW.md](DATA_FLOW.md) | **[enforced]** `static_assert`s in `talOS/hardware`, `talOS/protocol`, `talOS/rtms`, and `//tools:check_data_flow_sizes_test` on the marked numbers in `DATA_FLOW.md` |
 | Topic name length, readers per topic | NAMING.md | **[enforced]** `names.h`, `LintGraph` |
 | `command_timeout_us` range; actuator `period_us` limit | ARCHITECTURE.md "The tick" | **[enforced]** config load refuses |
-| Owner timeout | ARCHITECTURE.md "The tick" | **[enforced]** bridge and `SimHardware` share `//talOS/bridge:merge` |
+| Owner timeout | ARCHITECTURE.md "The tick" | **[enforced]** bridge and `SimHardware` share `//talOS/hardware:merge` |
 | `update()` allocates nothing | METHODOLOGY.md §10 | **[enforced]** C++ (`AllocationProbe`); **[review]** Python |
 | `update()` p99 duration | METHODOLOGY.md §10 | **[gap: SPEC-4]** no benchmark |
 | Node hops from driver input to actuator | METHODOLOGY.md §10 | **[enforced]** `LintGraph` warning (`names.h`, `REQ-RT-16`) |

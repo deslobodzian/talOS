@@ -1401,5 +1401,38 @@ TEST(BytePublisher, ClaimsItsRtmsTopicWhenRegisteredAndDropsNewestWhenFull) {
   ::shm_unlink(ShmObjectName(topic).c_str());
 }
 
+// REQ-SAFE-27: NodeDetail::publisher_send (the public-API thunk backing
+// Publisher<M>::send) refuses to write into a hardware request slot registered
+// via NodeAccess::add_hardware_request; only NodeAccess::publisher_send may.
+TEST(NodeDetail, RefusesPublisherSendOnHardwareRequestSlot) {
+  const std::string config_path = Runfile("TALOS_TEST_CONFIG");
+  const auto robot_config = std::make_shared<const config::RobotConfig>(
+      config::ParseRobotConfig(config_path));
+  event::SimulationEnvironment env;
+  event::SimulatedEventLoop<> loop{env};
+  detail::LoopPortFor<event::SimulatedEventLoop<>> port{loop};
+  auto node = detail::NodeAccess::create(detail::NodeSetup{
+      .name = "test_node",
+      .config_path = config_path,
+      .config = robot_config,
+      .loop = &port,
+  });
+  const std::size_t hw_slot = detail::NodeAccess::add_hardware_request(
+      *node, sizeof(Count), kMessageAlignment, schema::Of<Count>());
+  const std::size_t normal_slot = detail::NodeDetail::add_publisher(
+      *node, "/test_node/state", sizeof(Count), kMessageAlignment,
+      schema::Of<Count>());
+  detail::NodeAccess::start(*node);
+
+  const Count msg{42, 0};
+  EXPECT_THROW(
+      detail::NodeDetail::publisher_send(*node, hw_slot, &msg, sizeof(msg)),
+      std::logic_error);
+  EXPECT_TRUE(
+      detail::NodeAccess::publisher_send(*node, hw_slot, &msg, sizeof(msg)));
+  EXPECT_TRUE(detail::NodeDetail::publisher_send(*node, normal_slot, &msg,
+                                                 sizeof(msg)));
+}
+
 }  // namespace
 }  // namespace talos

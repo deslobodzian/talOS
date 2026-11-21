@@ -171,7 +171,7 @@ at 255), failed reads u32 (<!-- size: state.can_bus_bytes -->19 B). All of a rob
 (`hardware::kMaxCanBuses`: "rio" and three more), would not fit the
 headroom, so each State carries one, slot `sequence % count`, and the bridge
 assembles `/hw/status` `can_buses` from consecutive States
-(`CanBusTable`, `talOS/bridge/can_buses.h`); a bus's slot is refreshed every `count` States. A
+(`CanBusTable`, `talOS/hardware/can_buses.h`); a bus's slot is refreshed every `count` States. A
 decoder rejects a count above <!-- size: caps.can_buses -->4, an index at or past the count (or past 0
 when the count is 0), an unknown read state and a utilization that is not
 finite. Command prefix is four u64 + three u16 counts = <!-- size: command.prefix_bytes -->38.
@@ -246,7 +246,7 @@ At caps (<!-- size: ds.axes -->12 axes, <!-- size: ds.povs -->4 POVs, <!-- size:
 `40 + 31 + 31 + 6×96` = <!-- size: ds.max_payload_bytes -->**678 B**; empty strings/all disconnected is <!-- size: ds.empty_bytes -->**46 B**.
 The boot id is the one the same gateway stamps on its State; consumers order
 packets by sample/mode time only within one boot, start over on a new one, and
-ignore the last four retired boots (`talOS/bridge/boot_history.h`); the bridge
+ignore the last four retired boots (`talOS/hardware/boot_history.h`); the bridge
 forwards only packets of the boot its accepted State is in.
 Source: `talOS/driver_station/driver_station.h` and `.cc` (`Encode`).
 
@@ -333,7 +333,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/sim/state`: physics sim_gateway → telemetry and a robot's simulated sensors | <!-- size: odometry_sample.slot_bytes -->64 | <!-- size: odometry_sample.bytes -->56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
 | `/talos/telemetry`: telemetry → studio_bridge | <!-- size: telemetry.slot_stride_bytes -->16392 × <!-- size: telemetry.slot_count -->64 slots | <!-- size: telemetry.dictionary_page_bytes -->16384 B byte payload capacity; ring = <!-- size: telemetry.ring_bytes -->1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.3 s at 100 Hz with the bench's two value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
 
-Sources: `talOS/hardware/packet.h`, `talOS/bridge/bridge_status.fbs`,
+Sources: `talOS/hardware/packet.h`, `talOS/hardware/status/bridge_status.fbs`,
 `talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, the bench's
 `*_message.fbs` and the examples' `.fbs` files, and `talOS/telemetry/wire.h`;
 each size is the `message_bytes` the `--describe-only` graph (`graph.json`)

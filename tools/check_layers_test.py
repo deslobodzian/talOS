@@ -6,24 +6,34 @@ import unittest
 
 from tools import check_layers
 
-# label -> (generator macro or None, [deps]). Every label is a rule. Today's
-# allowlisted dependencies are present, so the graph passes as it stands.
+# label -> (generator macro or None, [deps]). Every label is a rule. With
+# ARCH-2 resolved, ALLOWLIST is empty and this graph passes with no exceptions.
 GRAPH = {
     "//talOS/memory:shared_memory": (None, []),
     "//talOS/rtms:rtms": (None, ["//talOS/memory:shared_memory"]),
-    "//talOS/ipc:ipc": (None, ["//talOS/rtms:rtms"]),
+    "//talOS/rtms:wake": (None, []),
+    "//talOS/ipc:concepts": (None, []),
+    "//talOS/ipc:ipc": (None, ["//talOS/ipc:concepts", "//talOS/rtms:rtms"]),
     "//talOS/events:events": (None, ["//talOS/rtms:rtms"]),
     "//talOS/hardware:config": (None, []),
+    "//talOS/hardware:merge": (None, []),
     "//talOS/hardware:hardware": (None, ["//talOS/hardware:config"]),
     "//talOS/configuration:configuration": (None, ["//talOS/hardware:config"]),
     "//talOS/node:loop_port": (None, []),
-    "//talOS/node:access": (None, []),
+    "//talOS/node:access": (None, ["//talOS/node:node"]),
     "//talOS/node:node": (None, ["//talOS/events:events",
+                                 "//talOS/ipc:concepts",
                                  "//talOS/configuration:configuration"]),
-    "//talOS/bridge:merge": (None, ["//talOS/hardware:config"]),
-    "//talOS/devices:devices": (None, ["//talOS/node:node"]),
+    "//talOS/bridge:hardware_node": (None, ["//talOS/hardware:merge",
+                                            "//talOS/hardware:hardware"]),
+    "//talOS/devices:devices": (None, ["//talOS/node:node",
+                                       "//talOS/node:access",
+                                       "//talOS/hardware:hardware"]),
+    "//talOS/devices:access": (None, ["//talOS/devices:devices",
+                                      "//talOS/hardware:hardware"]),
     "//talOS/devices:testing": (None, ["//talOS/devices:devices",
-                                       "//talOS/bridge:merge"]),
+                                       "//talOS/devices:access",
+                                       "//talOS/hardware:merge"]),
     "//talOS/node_api:libtalos_node.so": (None, ["//talOS/devices:devices"]),
     "//talOS/teleop:libteleop.so": ("talos_cc_shared_node",
                                     ["//talOS/devices:devices"]),
@@ -113,13 +123,72 @@ def matches(label, pattern):
     return package(label) == root or package(label).startswith(root + "/")
 
 
+# Default restricted visibility table matching the real BUILD files (ARCH-2).
+VISIBILITY = {
+    "//talOS/node:access": (
+        "//talOS/devices:__pkg__", "//talOS/launcher:__pkg__",
+        "//talOS/node:__pkg__", "//talOS/node_api:__pkg__",
+        "//talOS/telemetry:__pkg__", "//talOS/teleop:__pkg__",
+    ),
+    "//talOS/node:loop_port": ("//visibility:private",),
+    "//talOS/devices:access": (
+        "//talOS/devices:__pkg__", "//talOS/mechanisms:__pkg__",
+        "//talOS/node_api:__pkg__",
+    ),
+    "//talOS/rtms:rtms": (
+        "//studio:__subpackages__", "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ),
+    "//talOS/rtms:wake": (
+        "//studio:__subpackages__", "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ),
+    "//talOS/memory:shared_memory": (
+        "//studio:__subpackages__", "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ),
+    "//talOS/hardware:hardware": (
+        "//bench/main_processor/swerve_module:__pkg__",
+        "//controller_processor/rio:__pkg__",
+        "//studio:__subpackages__", "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ),
+    "//talOS/ipc:ipc": (
+        "//bench/main_processor/swerve_module:__pkg__",
+        "//studio:__subpackages__", "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ),
+}
+
+
+def visibility_allows(vis_list, target_label, viewer_label):
+    viewer_pkg = package(viewer_label)
+    target_pkg = package(target_label)
+    if viewer_pkg == target_pkg:
+        return True
+    for entry in vis_list:
+        if entry == "//visibility:public":
+            return True
+        if entry == "//visibility:private":
+            continue
+        if entry.endswith(":__pkg__"):
+            if viewer_pkg == entry[2:-len(":__pkg__")]:
+                return True
+        elif entry.endswith(":__subpackages__"):
+            root = entry[2:-len(":__subpackages__")]
+            if viewer_pkg == root or viewer_pkg.startswith(root + "/"):
+                return True
+    return False
+
+
 class FakeBazel:
     """Evaluates the checks' sets over GRAPH, as `bazel query` would."""
 
-    def __init__(self, graph, kinds=None, testonly=None):
+    def __init__(self, graph, kinds=None, testonly=None, visibility=None):
         self.graph = graph
         self.kinds = kinds if kinds is not None else KINDS
         self.testonly = testonly if testonly is not None else TESTONLY
+        self.visibility = visibility if visibility is not None else VISIBILITY
 
     def members(self, target_set):
         result = set()
@@ -140,12 +209,35 @@ class FakeBazel:
             result.add(label)
         return result
 
+    def node_sample_targets(self):
+        samples = {}
+        for label in sorted(self.graph):
+            generator, _ = self.graph[label]
+            pkg = package(label)
+            if (generator in check_layers.NODE_GENERATORS and
+                    pkg.split("/")[0] in check_layers.NODE_ROOTS):
+                samples.setdefault(pkg, label)
+        return samples
+
     def node_packages(self):
-        return sorted({package(label)
-                       for label, (generator, _) in self.graph.items()
-                       if generator in check_layers.NODE_GENERATORS
-                       and package(label).split("/")[0]
-                       in check_layers.NODE_ROOTS})
+        return sorted(self.node_sample_targets().keys())
+
+    def public_targets(self, targets):
+        out = []
+        for t in targets:
+            label = "//" + t
+            if "//visibility:public" in self.visibility.get(label, ()):
+                out.append(label)
+        return sorted(out)
+
+    def visible_to(self, target_label, targets):
+        out = []
+        for t in targets:
+            label = "//" + t
+            if visibility_allows(self.visibility.get(label, ()),
+                                 label, target_label):
+                out.append(label)
+        return sorted(out)
 
     def somepath(self, frm, to):
         targets = self.members(to)
@@ -171,9 +263,10 @@ class FakeBazel:
         return sorted(deps & self.members(to))
 
 
-def run(graph, kinds=None, testonly=None):
+def run(graph, kinds=None, testonly=None, visibility=None):
     out = io.StringIO()
-    return check_layers.run(FakeBazel(graph, kinds, testonly), out), out.getvalue()
+    return (check_layers.run(
+        FakeBazel(graph, kinds, testonly, visibility), out), out.getvalue())
 
 
 def with_edge(frm, to, generator=None):
@@ -201,7 +294,9 @@ class CheckLayersTest(unittest.TestCase):
                 ("//talOS/rtms:rtms", "//talOS/events:events"),
                 ("//talOS/events:events", "//talOS/devices:devices"),
                 ("//talOS/node:node", "//talOS/devices:devices"),
-                ("//talOS/node:node", "//talOS/bridge:merge"),
+                ("//talOS/node:node", "//talOS/bridge:hardware_node"),
+                ("//talOS/node:node", "//talOS/hardware:hardware"),
+                ("//talOS/devices:devices", "//talOS/bridge:hardware_node"),
                 ("//talOS/events:events", "//talOS/hardware:config"),
                 ("//talOS/devices:devices", "//talOS/teleop:libteleop.so"),
                 ("//talOS/launcher:launcher",
@@ -241,6 +336,8 @@ class CheckLayersTest(unittest.TestCase):
                  "//talOS/memory:shared_memory"),
                 ("//bench/main_processor/motor:node",
                  "//talOS/node:access"),
+                ("//bench/main_processor/motor:motor",
+                 "//talOS/devices:access"),
                 ("//bench/main_processor/motor:motor",
                  "//talOS/node:loop_port"),
                 ("//examples/superstructure/cpp:mechanisms",
@@ -288,15 +385,33 @@ class CheckLayersTest(unittest.TestCase):
                 failures, out = run(with_edge(frm, to, generator))
                 self.assertEqual(failures, 0, out)
 
-    def test_allowlist_only_shrinks(self):
-        # An allowlisted dependency that is gone fails until its entry is
-        # deleted, so the list cannot hold stale exceptions.
-        graph = dict(GRAPH)
-        graph["//talOS/devices:testing"] = (None, ["//talOS/devices:devices"])
-        failures, out = run(graph)
-        self.assertEqual(failures, 1, out)
-        self.assertIn("STALE allowlist entry talOS/devices -> talOS/bridge",
-                      out)
+    # REQ-CONTRACT-15, REQ-CONTRACT-16, REQ-SAFE-27
+    def test_allowlist_is_empty_and_visibility_restrictions_hold(self):
+        self.assertEqual(check_layers.ALLOWLIST, {})
+        # Making any restricted target //visibility:public fails.
+        for target in (check_layers.RESTRICTED_INTERNAL_TARGETS +
+                       check_layers.RESTRICTED_WIRE_TARGETS):
+            label = "//" + target
+            with self.subTest(public=label):
+                vis = dict(VISIBILITY)
+                vis[label] = ("//visibility:public",)
+                failures, out = run(GRAPH, visibility=vis)
+                self.assertGreaterEqual(failures, 1, out)
+                self.assertIn(f"  {label}\n", out)
+        # Granting a robot node package visibility to a restricted target fails,
+        # including internal targets for swerve_module.
+        for label, pkg in (
+                ("//talOS/node:access", "//bench/main_processor/motor:__pkg__"),
+                ("//talOS/devices:access", "//examples/superstructure/cpp:__pkg__"),
+                ("//talOS/rtms:rtms", "//bench/main_processor/swerve_module:__pkg__"),
+                ("//talOS/hardware:hardware", "//bench/main_processor/motor:__pkg__"),
+                ("//talOS/ipc:ipc", "//examples/superstructure/cpp:__pkg__")):
+            with self.subTest(label=label, pkg=pkg):
+                vis = dict(VISIBILITY)
+                vis[label] = tuple(vis[label]) + (pkg,)
+                failures, out = run(GRAPH, visibility=vis)
+                self.assertGreaterEqual(failures, 1, out)
+                self.assertIn(f"  {label}\n", out)
 
 
 class CheckNodeSourcesTest(unittest.TestCase):

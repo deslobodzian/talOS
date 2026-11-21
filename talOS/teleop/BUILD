@@ -22,6 +22,7 @@ cc_library(
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/node",
+        "//talOS/node:access",
         "//talOS/schema:field_path",
         "//talOS/schema:identity",
         "//talOS/schema:schema_hash",

@@ -1,4 +1,4 @@
-#include "talOS/bridge/clock_offset.h"
+#include "talOS/hardware/clock_offset.h"
 
 #include <gtest/gtest.h>
 

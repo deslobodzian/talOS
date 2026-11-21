@@ -87,10 +87,18 @@ Allowed dependencies:
   hardware: it knows the hardware request topic, `/hw/request/<node>`, only to
   open it for the devices layer's flush, carry that layer's
   `untargeted_outputs` attribute on it, and refuse it to every other publisher
-  ([NAMING.md](talOS/NAMING.md#topics)), and reads the hardware config only
-  for timeouts and actuator ownership (its loop tier). `talOS/devices` is
-  built on `Node`'s public API (`extension<T>()`, `after_update()`) and the
-  framework hooks in `detail::NodeAccess`.
+  ([NAMING.md](talOS/NAMING.md#topics)), and reads only
+  `//talOS/hardware:config` (through `talOS/configuration`) for timeouts and
+  actuator ownership (its loop tier), never `//talOS/hardware:hardware`.
+  `talOS/devices` is built on `Node`'s public API (`extension<T>()`,
+  `after_update()`) and the framework hooks in `detail::NodeAccess`
+  (`//talOS/node:access`). Privileged framework targets (`//talOS/node:access`,
+  `//talOS/node:loop_port`, `//talOS/devices:access`,
+  `//talOS/hardware:hardware`, `//talOS/ipc:ipc`, `//talOS/rtms:{rtms,wake}`,
+  `//talOS/memory:shared_memory`) are non-public in Bazel, and internal
+  transport/wire deps of `//talOS/node:node` and `//talOS/devices:devices` live
+  in `implementation_deps`, so robot node code cannot include or link them
+  (RULES.md 2).
 - `talOS/` never depends on a robot, an example or `studio/`.
 - Python reaches talOS only through the C ABI in `talOS/node_api`; it does not
   reimplement a wire format, a memory layout, a state machine, or a C++ node
@@ -110,9 +118,9 @@ Beside the stack:
 | Package | Role |
 |---|---|
 | `talOS/configuration` | parses `robot.toml` and the subsystem files |
-| `talOS/hardware` | hardware config, request/state messages, the gateway the RoboRIO and sim run |
+| `talOS/hardware` | hardware config (`:config`), request/state messages, the gateway the RoboRIO and sim run, `/hw/status` (`//talOS/hardware/status:messages`, aliased as `//talOS/hardware:bridge_messages` and `//talOS/bridge:messages`), and the bridge/sim-shared link helpers (`:boot_history`, `:clock_offset`, `:can_buses`, `:merge`) |
 | `talOS/protocol` | frame and UDP wire format |
-| `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power and each CAN bus's health (assembled by `:can_buses`, which `testing::SimHardware` also runs), gateway counters and build, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `:merge` holds the request merge rules (owner timeout, merged observation) that `testing::SimHardware` also runs; `--log` records every command, State and status it publishes, with the sequence and stamp its readers see |
+| `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power and each CAN bus's health (assembled by `//talOS/hardware:can_buses`, which `testing::SimHardware` also runs), gateway counters and build, and the gateway-to-node clock mapping (`//talOS/hardware:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); runs `//talOS/hardware:merge` for the request merge rules (owner timeout, merged observation) that `testing::SimHardware` also runs; `--log` records every command, State and status it publishes, with the sequence and stamp its readers see |
 | `talOS/driver_station` | Driver Station codec |
 | `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph; `:log_dump` prints its `.tlog`s |
 | `talOS/simulation` | `:sim_gateway`, the lightweight simulator that stands in for the RoboRIO for any robot config: devices from the config's hardware, ideal or `--physics` backend, scripted mode, joystick and fault schedules, `/sim/state` truth; the launcher starts it under `--start-sim-gateway` on the bridge's ports |

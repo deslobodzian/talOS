@@ -67,15 +67,19 @@
 #include <optional>
 #include <string_view>
 
-#include "talOS/devices/access.h"
 #include "talOS/devices/target.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/node/node.h"
 
 namespace talos {
 
+namespace config {
+struct RobotConfig;  // talOS/configuration/config_parser.h
+}  // namespace config
 namespace detail {
 class DriverStationLink;  // devices.cc
+struct DriverStationAccess;
+struct HardwareAccess;
 }  // namespace detail
 namespace hardware {
 struct Config;  // talOS/hardware/config.h
@@ -101,7 +105,7 @@ class HardwareLink {
   Duration age() const;
   // Node-clock time at which the gateway sampled the latest accepted
   // hardware state: its sample_time_us mapped through the bridge's clock
-  // offset on /hw/status (talOS/bridge/clock_offset.h). nullopt before any
+  // offset on /hw/status (talOS/hardware/clock_offset.h). nullopt before any
   // state, while that state is not fresh(), and until the bridge's mapping
   // for the state's gateway boot has converged. Independent of enabled().
   // Absolute mapping error is bounded by /hw/status

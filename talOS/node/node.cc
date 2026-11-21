@@ -33,6 +33,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/reporter.h"
+#include "talOS/node/access.h"
 #include "talOS/node/internal.h"
 #include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
@@ -62,6 +63,7 @@ struct Node::Impl {
   struct PublisherSlot {
     std::uint16_t id;
     std::size_t bytes;
+    bool is_hardware_request = false;
   };
   struct BytePublisherSlot {
     std::string topic;
@@ -843,7 +845,7 @@ std::size_t NodeAccess::add_hardware_request(Node& node, std::size_t bytes,
   const std::uint16_t id =
       impl.loop->register_sender(topic, static_cast<std::uint32_t>(bytes),
                                  static_cast<std::uint32_t>(alignment), schema);
-  impl.publishers.push_back({id, bytes});
+  impl.publishers.push_back({id, bytes, /*is_hardware_request=*/true});
   impl.hardware_request = std::move(topic);
   return impl.publishers.size() - 1;
 }
@@ -899,6 +901,132 @@ bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
   return impl.loop->send(
       publisher.id,
       std::span<const std::byte>{static_cast<const std::byte*>(data), bytes});
+}
+
+// --- NodeDetail (non-privileged public-API thunks) ---------------------------
+
+void NodeDetail::set_update(Node& node, std::function<void()> update) {
+  NodeAccess::set_update(node, std::move(update));
+}
+void NodeDetail::require_immediate_delivery(Node& node,
+                                            std::size_t subscription) {
+  NodeAccess::require_immediate_delivery(node, subscription);
+}
+Duration NodeDetail::freshness_timeout(const Node& node) {
+  return NodeAccess::freshness_timeout(node);
+}
+std::optional<bool> NodeDetail::find_bool(const Node& node,
+                                          std::string_view key,
+                                          ParamTable subsystem) {
+  return NodeAccess::find_bool(node, key, subsystem);
+}
+std::optional<std::int64_t> NodeDetail::find_int(const Node& node,
+                                                 std::string_view key,
+                                                 ParamTable subsystem) {
+  return NodeAccess::find_int(node, key, subsystem);
+}
+std::optional<double> NodeDetail::find_double(const Node& node,
+                                              std::string_view key,
+                                              ParamTable subsystem) {
+  return NodeAccess::find_double(node, key, subsystem);
+}
+std::optional<std::string> NodeDetail::find_string(const Node& node,
+                                                   std::string_view key,
+                                                   ParamTable subsystem) {
+  return NodeAccess::find_string(node, key, subsystem);
+}
+std::optional<std::vector<std::string>> NodeDetail::find_string_list(
+    const Node& node, std::string_view key, ParamTable subsystem) {
+  return NodeAccess::find_string_list(node, key, subsystem);
+}
+std::optional<std::vector<double>> NodeDetail::find_double_list(
+    const Node& node, std::string_view key, ParamTable subsystem) {
+  return NodeAccess::find_double_list(node, key, subsystem);
+}
+void NodeDetail::param_error(const Node& node, std::string_view key,
+                             std::string_view problem, ParamTable subsystem) {
+  NodeAccess::param_error(node, key, problem, subsystem);
+}
+std::size_t NodeDetail::add_subscription(Node& node, std::string_view topic,
+                                         std::size_t bytes,
+                                         std::size_t alignment,
+                                         const schema::Identity& schema,
+                                         bool optional,
+                                         MessageCallback on_message) {
+  return NodeAccess::add_subscription(node, topic, bytes, alignment, schema,
+                                      optional, std::move(on_message));
+}
+const void* NodeDetail::subscription_value(const Node& node,
+                                           std::size_t index) {
+  return NodeAccess::subscription_value(node, index);
+}
+bool NodeDetail::subscription_has_value(const Node& node, std::size_t index) {
+  return NodeAccess::subscription_has_value(node, index);
+}
+Duration NodeDetail::subscription_age(const Node& node, std::size_t index) {
+  return NodeAccess::subscription_age(node, index);
+}
+bool NodeDetail::subscription_fresh(const Node& node, std::size_t index,
+                                    Duration max_age) {
+  return NodeAccess::subscription_fresh(node, index, max_age);
+}
+bool NodeDetail::subscription_updated(const Node& node, std::size_t index) {
+  return NodeAccess::subscription_updated(node, index);
+}
+std::size_t NodeDetail::add_publisher(Node& node, std::string_view topic,
+                                      std::size_t bytes, std::size_t alignment,
+                                      const schema::Identity& schema) {
+  return NodeAccess::add_publisher(node, topic, bytes, alignment, schema);
+}
+bool NodeDetail::publisher_send(Node& node, std::size_t index, const void* data,
+                                std::size_t bytes) {
+  NodeAccess::require_loop_thread(node, "Publisher::send");
+  const Node::Impl& impl = *node.impl_;
+  if (index >= impl.publishers.size()) {
+    throw std::out_of_range(impl.name + ": no publisher at index " +
+                            std::to_string(index));
+  }
+  if (impl.publishers[index].is_hardware_request) {
+    throw std::logic_error(
+        impl.name +
+        ": Publisher::send refused on hardware request slot; hardware requests "
+        "leave only through the devices-layer flush (RULES.md 2)");
+  }
+  return NodeAccess::publisher_send(node, index, data, bytes);
+}
+bool NodeDetail::byte_publisher_send(Node& node, std::size_t index,
+                                     std::span<const std::byte> message) {
+  return NodeAccess::byte_publisher_send(node, index, message);
+}
+std::size_t NodeDetail::add_state_machine(Node& node, std::int64_t initial) {
+  return NodeAccess::add_state_machine(node, initial);
+}
+std::int64_t NodeDetail::state_machine_state(const Node& node,
+                                             std::size_t index) {
+  return NodeAccess::state_machine_state(node, index);
+}
+std::int64_t NodeDetail::state_machine_previous(const Node& node,
+                                                std::size_t index) {
+  return NodeAccess::state_machine_previous(node, index);
+}
+void NodeDetail::state_machine_go(Node& node, std::size_t index,
+                                  std::int64_t next) {
+  NodeAccess::state_machine_go(node, index, next);
+}
+Duration NodeDetail::state_machine_time_in_state(const Node& node,
+                                                 std::size_t index) {
+  return NodeAccess::state_machine_time_in_state(node, index);
+}
+bool NodeDetail::state_machine_just_entered(const Node& node,
+                                            std::size_t index) {
+  return NodeAccess::state_machine_just_entered(node, index);
+}
+void* NodeDetail::find_extension(const Node& node, std::type_index type) {
+  return NodeAccess::find_extension(node, type);
+}
+void NodeDetail::add_extension(Node& node, std::type_index type,
+                               std::shared_ptr<void> object) {
+  NodeAccess::add_extension(node, type, std::move(object));
 }
 
 // --- byte topics -------------------------------------------------------------

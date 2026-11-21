@@ -60,7 +60,7 @@ check below.
   `hw motor fault`, `hw hardware fault (total feedback loss or gateway fault)`,
   `hw config refused while enabled: disable to accept the new configuration`,
   `hw owner timed out`, `hw brownout`, `hw can bus unread`; what each means:
-  [bridge_status.fbs](../talOS/bridge/bridge_status.fbs)). `hardware fault`:
+  [bridge_status.fbs](../talOS/hardware/status/bridge_status.fbs)). `hardware fault`:
   the gateway reports `kHardwareFault` (total feedback loss across configured
   motors/sensors or three consecutive backend apply failures). `config refused
   while enabled`: a changed hardware configuration was pushed while the robot
