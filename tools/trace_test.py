@@ -341,6 +341,216 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(failures, 1, out)
         self.assertIn("stale waiver", out)
 
+    def test_ast_build_parsing_fails_closed_on_evasions_and_non_literals(self):
+        req = catalogue(row("REQ-SAFE-01", "P0", tier="unit"))
+        cases = (
+            (
+                "single-quoted integration tag",
+                "cc_test(\n    name = 'node_test',\n"
+                "    srcs = ['node_test.cc'],\n"
+                "    tags = ['integration'],\n)\n",
+                ("REQ-SAFE-01", "integration"),
+            ),
+            (
+                "variable tags expression",
+                'T = ["integration"]\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = T,\n)\n',
+                ("REQ-SAFE-01", "unknown"),
+            ),
+            (
+                "select() tags expression",
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = select({"//conditions:default": ["integration"]}),\n)\n',
+                ("REQ-SAFE-01", "unknown"),
+            ),
+            (
+                "concatenated tags expression",
+                'BASE = ["small"]\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = BASE + ["integration"],\n)\n',
+                ("REQ-SAFE-01", "unknown"),
+            ),
+            (
+                "kwargs splat without explicit tags",
+                'OPTS = {"tags": ["integration"]}\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    **OPTS\n)\n',
+                ("REQ-SAFE-01", "unknown"),
+            ),
+            (
+                "closing bracket inside comment in tags",
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = [\n'
+                '        # note: ]\n'
+                '        "integration",\n'
+                '    ],\n)\n',
+                ("REQ-SAFE-01", "integration"),
+            ),
+            (
+                "commented-out empty tags before real integration tags",
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    # tags = []\n'
+                '    tags = ["integration"],\n)\n',
+                ("REQ-SAFE-01", "integration"),
+            ),
+            (
+                "commented-out srcs leaves source unwired",
+                'cc_test(\n    name = "node_test",\n'
+                '    # srcs = ["node_test.cc"],\n)\n',
+                ("REQ-SAFE-01", "unknown"),
+            ),
+            (
+                "non-literal srcs expression fails closed",
+                'SRCS = ["node_test.cc"]\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = SRCS,\n)\n',
+                ("REQ-SAFE-01", "unknown"),
+            ),
+            (
+                "BUILD syntax error fails closed",
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc",\n',
+                ("cannot parse BUILD file", "REQ-SAFE-01", "unknown"),
+            ),
+        )
+        for name, build, needles in cases:
+            with self.subTest(name):
+                failures, out = check(tree(**{
+                    "docs/REQUIREMENTS.md": req,
+                    "talOS/node/BUILD": build,
+                }))
+                self.assertGreaterEqual(failures, 1, out)
+                for needle in needles:
+                    self.assertIn(needle, out)
+
+        # Single-quoted / comment-bracketed / concatenated quarantine tags are
+        # caught by AST parsing; commented-out quarantine tags are ignored.
+        for name, build in (
+            (
+                "single-quoted quarantine",
+                "cc_test(\n    name = 'node_test',\n"
+                "    srcs = ['node_test.cc'],\n"
+                "    tags = ['quarantine'],\n)\n",
+            ),
+            (
+                "comment bracket in quarantine tags",
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = [\n        # ]\n        "quarantine",\n    ],\n)\n',
+            ),
+            (
+                "concatenated quarantine tags",
+                'BASE = ["manual"]\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = BASE + ["quarantine"],\n)\n',
+            ),
+        ):
+            with self.subTest(quarantine=name):
+                failures, out = check(tree(**{"talOS/node/BUILD": build}))
+                self.assertEqual(failures, 2, out)
+                self.assertIn("tagged quarantine without an open, dated", out)
+                self.assertIn("REQ-SAFE-01 (P0, SAFE) has no tagged test", out)
+
+        # A commented-out quarantine line does not quarantine the target.
+        failures, out = check(tree(**{
+            "talOS/node/BUILD": (
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    # tags = ["quarantine"],\n)\n'
+            ),
+        }))
+        self.assertEqual(failures, 0, out)
+
+    def test_unknown_or_misspelled_cheapest_tier_fails_closed(self):
+        for name, tier, needle in (
+            ("misspelled unit", "unt", "`unt`"),
+            ("misspelled integration", "integraton", "`integraton`"),
+            ("mixed valid and misspelled", "unit + integraton",
+             "`integraton`"),
+            ("non-runnable plus typo", "bench + unt", "`unt`"),
+            ("empty tier cell", "", "no recognized Cheapest tier"),
+            ("parenthetical only", "(see docs)",
+             "no recognized Cheapest tier"),
+        ):
+            with self.subTest(name):
+                failures, out = check(tree(**{
+                    "docs/REQUIREMENTS.md": catalogue(
+                        row("REQ-SAFE-01", "P0", tier=tier)),
+                }))
+                self.assertGreaterEqual(failures, 1, out)
+                self.assertIn("REQ-SAFE-01", out)
+                self.assertIn(needle, out)
+
+        # Nested parenthetical links (e.g. `bench ([BENCH.md](BENCH.md))`) are
+        # stripped cleanly and pass.
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0",
+                    tier="unit + integration (phoenixTest); "
+                         "bench ([BENCH.md](BENCH.md))")),
+        }))
+        self.assertEqual(failures, 0, out)
+
+    def test_bringup_citation_does_not_skip_cheapest_tier_for_tagged_tests(
+            self):
+        # REQ-DEV-33's form: a P0 requirement citing BR "..." with runnable
+        # Cheapest tier `unit` and only an `integration` tagged test MUST fail.
+        integ_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["node_test.cc"],\n'
+            '    tags = ["integration"],\n)\n'
+        )
+        req = catalogue(
+            row("REQ-SAFE-01", "P0", source='BR "Link timing"', tier="unit"))
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": req,
+            "talOS/node/BUILD": integ_build,
+        }))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("REQ-SAFE-01", out)
+        self.assertIn("`unit`", out)
+        self.assertIn("integration", out)
+
+        # Adding a fast-lane test satisfies it while keeping the integration
+        # test.
+        both_build = (
+            integ_build +
+            'cc_test(\n    name = "unit_test",\n'
+            '    srcs = ["unit_test.cc"],\n)\n'
+        )
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": req,
+            "talOS/node/BUILD": both_build,
+            "talOS/node/unit_test.cc": "// REQ-SAFE-01\nTEST(N, Fast) {}\n",
+        }))
+        self.assertEqual(failures, 0, out)
+
+        # An open TODO.md citation still waives the tier gap while tracked,
+        # and fails once the TODO item closes.
+        todo_req = catalogue(
+            row("REQ-SAFE-01", "P0", source="ARCH",
+                tier="unit (gap: TODO ARCH-2)"))
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": todo_req,
+            "talOS/node/BUILD": integ_build,
+        }))
+        self.assertEqual(failures, 0, out)
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": todo_req,
+            "talOS/node/BUILD": integ_build,
+            "TODO.md": "## Open\n",
+        }))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("REQ-SAFE-01", out)
+
 
 if __name__ == "__main__":
     unittest.main()

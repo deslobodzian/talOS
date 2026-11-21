@@ -386,6 +386,18 @@ py_test(
 # RULES.md 4: no commit since the merge base sets `commissioned = true` or
 # changes a CAN id in a robot or bench config without the person's
 # `Commissioned-By: <name>` trailer.
+# Fast-lane unit tests (no git subprocesses) for REQ-DEV-33.
+py_test(
+    name = "check_commissioning_unit_test",
+    size = "small",
+    srcs = [
+        "check_commissioning.py",
+        "check_commissioning_unit_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_commissioning_unit_test.py",
+)
+
 # Over 5 s on 4-vCPU CI (6.8 s), integration lane: spawns dozens of real git
 # subprocesses (init, add, commit, diff-tree, merge) on scratch repositories.
 py_test(
