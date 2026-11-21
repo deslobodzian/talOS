@@ -78,8 +78,11 @@ cc_library(
     deps = ["//talOS/driver_station"],
 )
 
+# Pure wire codecs, packets, gating predicates and state machine (no UDP
+# Endpoint or sockets), so log readers and studio/review decode recorded
+# hardware packets without linking transport code (REQ-SAFE-35).
 cc_library(
-    name = "hardware",
+    name = "codecs",
     srcs = [
         "gateway.cc",
         "messages.cc",
@@ -88,7 +91,6 @@ cc_library(
         "config.h",
         "config_error.h",
         "config_wire.h",
-        "endpoint.h",
         # Invalid samples and total feedback loss, shared with
         # testing::SimHardware.
         "feedback.h",
@@ -99,6 +101,23 @@ cc_library(
         "gateway.h",
         "messages.h",
         "packet.h",
+    ],
+    visibility = [
+        "//studio:__subpackages__",
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
+    deps = [
+        ":config",
+        "//talOS/protocol:frame",
+        "//talOS/schema:identity",
+    ],
+)
+
+cc_library(
+    name = "hardware",
+    hdrs = [
+        "endpoint.h",
         "sim_backend.h",
         "sim_physics.h",
     ],
@@ -110,6 +129,7 @@ cc_library(
         "//tools:__pkg__",
     ],
     deps = [
+        ":codecs",
         ":config",
         "//talOS/protocol",
         "//talOS/schema:identity",

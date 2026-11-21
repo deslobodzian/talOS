@@ -81,7 +81,7 @@ cc_library(
         ":schema",
         ":wire",
         "//talOS/driver_station",
-        "//talOS/hardware",
+        "//talOS/hardware:codecs",
         "//talOS/introspection:names",
         "//talOS/schema:field_path",
         "//talOS/schema:identity",

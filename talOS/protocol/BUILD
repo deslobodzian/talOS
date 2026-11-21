@@ -1,22 +1,29 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
+# Wire framing and protocol version constants: no sockets, so log readers and
+# studio/review decode recorded packets without linking UDP transport
+# (REQ-SAFE-35).
 cc_library(
-    name = "protocol",
-    srcs = [
-        "frame.cc",
-        "udp.cc",
-    ],
+    name = "frame",
+    srcs = ["frame.cc"],
     hdrs = [
         "frame.h",
         "types.h",
-        "udp.h",
     ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "protocol",
+    srcs = ["udp.cc"],
+    hdrs = ["udp.h"],
     linkopts = select({
         "@platforms//os:windows": ["ws2_32.lib"],
         "//conditions:default": [],
     }),
     visibility = ["//visibility:public"],
+    deps = [":frame"],
 )
 
 cc_test(
@@ -24,7 +31,7 @@ cc_test(
     size = "small",
     srcs = ["frame_test.cc"],
     deps = [
-        ":protocol",
+        ":frame",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
@@ -77,8 +84,8 @@ cc_test(
     size = "small",
     srcs = ["frame_fuzz_test.cc"],
     deps = [
+        ":frame",
         ":fuzz_corpus",
-        ":protocol",
         "@googletest//:gtest_main",
     ],
 )

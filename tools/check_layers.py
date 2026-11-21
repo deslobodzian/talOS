@@ -223,7 +223,9 @@ PYTHON_GATEWAYS = ("talOS/node_api", "talOS/schema", "talOS/build",
 
 # REQ-SAFE-35: studio/review is an offline log viewer and must never depend
 # directly on talOS/rtms, talOS/ipc, talOS/protocol or talOS/bridge, nor
-# transitively on RTMS segment/wake, IPC, bridge runtime or node/devices.
+# transitively on RTMS segment/wake, IPC, UDP protocol, hardware UDP endpoint,
+# shared_memory, bridge runtime or node/devices. Pure wire codecs
+# (talOS/protocol:frame, talOS/hardware:codecs) stay allowed.
 REVIEW_FORBIDDEN_DIRECT_DEPS = (
     "talOS/rtms/...",
     "talOS/ipc/...",
@@ -234,6 +236,9 @@ REVIEW_FORBIDDEN_TRANSITIVE_DEPS = (
     "talOS/rtms:rtms",
     "talOS/rtms:wake",
     "talOS/ipc/...",
+    "talOS/protocol:protocol",
+    "talOS/hardware:hardware",
+    "talOS/memory:shared_memory",
     "talOS/bridge:node_lib",
     "talOS/bridge:hardware_node",
     "talOS/node/...",
@@ -538,8 +543,9 @@ def checks(node_packages):
                    except_testonly=True),
     ))
     result.append(Check(
-        "studio/review has no transitive dependency on RTMS, IPC, bridge "
-        "runtime or node/devices (REQ-SAFE-35)",
+        "studio/review has no transitive dependency on RTMS, IPC, UDP "
+        "protocol, hardware UDP endpoint, shared_memory, bridge runtime or "
+        "node/devices (REQ-SAFE-35)",
         "studio/review/...",
         REVIEW_FORBIDDEN_TRANSITIVE_DEPS,
         kind="path",
