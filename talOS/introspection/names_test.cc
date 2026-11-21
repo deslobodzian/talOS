@@ -977,6 +977,30 @@ TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
     }
   }
   {
+    SCOPED_TRACE("nested alerts outside a status topic");
+    const std::vector<NodeShape> nodes = {
+        {"shooter",
+         "//robot/shooter:node",
+         {with(Sender("/shooter/state"), bad)}},
+        {"odometry",
+         "//robot/odometry:node",
+         {with(Watcher("/shooter/state"), bad)}},
+    };
+    const auto findings = alert_findings(LintGraph(nodes), "/shooter/state");
+    ASSERT_EQ(findings.size(), 5u) << Describe(findings);
+    for (const auto* field :
+         {"alert_error_fault_count", "alert_fatal_overheat",
+          "nested.alert_error_link_lost", "nested.alert_warning_hot",
+          "nested.alert_info_homed"}) {
+      const auto it = std::find_if(
+          findings.begin(), findings.end(), [field](const Diagnostic& d) {
+            return d.message.find(field) != std::string::npos;
+          });
+      ASSERT_NE(it, findings.end()) << field << Describe(findings);
+      EXPECT_EQ(it->severity, Severity::ERROR) << field;
+    }
+  }
+  {
     SCOPED_TRACE("well-formed alerts in a status topic");
     const std::vector<NodeShape> nodes = {
         {"shooter",
