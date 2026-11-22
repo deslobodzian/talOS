@@ -220,12 +220,21 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   state.motors[0].fault_flags = 5;
   state.motors[1].id = cfg.hardware.motors[0].id;
   state.motors[1].valid = true;
+  // REQ-OPS-20: the gateway's counters, each its own value so a swap shows.
+  state.counters = {.rejected_command_count = 7,
+                    .neutralized_motor_count = 5,
+                    .apply_failure_count = 3,
+                    .device_reset_count = 2};
   ASSERT_TRUE(InjectState(node, gateway, state, 1000000));
   const auto status = node.Status(1001000);
   EXPECT_TRUE(status.health_valid());
   EXPECT_DOUBLE_EQ(status.battery_v(), 9.5);
   EXPECT_TRUE(status.brownout());
   EXPECT_EQ(status.motor_fault_mask(), 2u);
+  EXPECT_EQ(status.gateway_rejected_command_count(), 7u);
+  EXPECT_EQ(status.gateway_neutralized_motor_count(), 5u);
+  EXPECT_EQ(status.gateway_apply_failure_count(), 3u);
+  EXPECT_EQ(status.gateway_device_reset_count(), 2u);
   state.health = {};
   EXPECT_EQ(status.motor_forward_limit_mask(), 0u);
   EXPECT_EQ(status.motor_reverse_limit_mask(), 0u);
@@ -499,8 +508,9 @@ TEST(HardwareNodeTest, ReportsAndClearsProtocolMismatchOnStatus) {
 
 // /hw/status names the build of the gateway boot the bridge accepted, and a
 // new boot's build replaces it: after a RoboRIO rollback the record shows the
-// build that drove the robot, not the first one the bridge heard.
-// REQ-CONTRACT-30
+// build that drove the robot, not the first one the bridge heard. Its stderr
+// names each boot's build once, however many States the boot sends.
+// REQ-CONTRACT-30, REQ-OPS-21
 TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -510,6 +520,7 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
             bridge::GatewayProgram::UNKNOWN);
   EXPECT_EQ(node.Status(999000).gateway_build_id(), 0u);
 
+  ::testing::internal::CaptureStderr();
   State state = TrustState(NodeConfigId(cfg), 42, 1, 1000);
   state.build = {0x0123456789abcdefull, GatewayProgram::kRoboRio, true};
   ASSERT_TRUE(InjectState(node, link.gateway, state, 1000000));
@@ -517,6 +528,8 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   EXPECT_EQ(status.gateway_program(), bridge::GatewayProgram::ROBORIO);
   EXPECT_TRUE(status.gateway_build_dirty());
   EXPECT_EQ(status.gateway_build_id(), 0x0123456789abcdefull);
+  state.sample_time_us = 6000;
+  ASSERT_TRUE(InjectState(node, link.gateway, state, 1000500));
 
   State rollback = TrustState(NodeConfigId(cfg), 43, 1, 50);
   rollback.build = {0x00fedcba98765432ull, GatewayProgram::kRoboRio, false};
@@ -525,6 +538,19 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   EXPECT_EQ(status.gateway_program(), bridge::GatewayProgram::ROBORIO);
   EXPECT_FALSE(status.gateway_build_dirty());
   EXPECT_EQ(status.gateway_build_id(), 0x00fedcba98765432ull);
+  rollback.sample_time_us = 5050;
+  ASSERT_TRUE(InjectState(node, link.gateway, rollback, 1006000));
+  const std::string err = ::testing::internal::GetCapturedStderr();
+  const auto count = [&err](const std::string& revision) {
+    std::size_t lines = 0;
+    for (auto at = err.find(revision); at != std::string::npos;
+         at = err.find(revision, at + 1)) {
+      ++lines;
+    }
+    return lines;
+  };
+  EXPECT_EQ(count("0123456789abcdef"), 1u) << err;
+  EXPECT_EQ(count("00fedcba98765432"), 1u) << err;
 }
 
 // Guards: hardware_node --log records the merged /hw/command, the decoded
@@ -773,14 +799,17 @@ TEST(HardwareNodeTest, ASimulationOnlyConfigRunsOnlyWithSim) {
   };
 
   // The controller's end: a bound loopback socket the bridge would send its
-  // probes and configuration to.
+  // probes and configuration to. The bridge's own port stays reserved
+  // through its run: a bridge that refuses before it opens a socket never
+  // needs it, and one that opened it first would fail to bind and say so
+  // instead of naming the key, so the refusal is proved to come first.
   uint16_t gateway_port = 0;
   uint16_t node_port = 0;
   int gateway_reservation = ReservePort(gateway_port);
   int node_reservation = ReservePort(node_port);
   const bool reserved = gateway_reservation >= 0 && node_reservation >= 0;
   Release(gateway_reservation);
-  Release(node_reservation);
+  if (!reserved) Release(node_reservation);
   ASSERT_TRUE(reserved);
   protocol::RuntimeUdpPeer gateway;
   ASSERT_EQ(gateway.Open("127.0.0.1", gateway_port, "127.0.0.1", node_port),
@@ -794,6 +823,7 @@ TEST(HardwareNodeTest, ASimulationOnlyConfigRunsOnlyWithSim) {
                  std::to_string(node_port), "--duration-s", "1"},
                 run_output),
             1);
+  Release(node_reservation);
   const std::string message = read(run_output);
   EXPECT_NE(message.find(config_path + " sets [robot] simulation_only = true; "
                                        "hardware_node runs it only with --sim"),
@@ -1436,7 +1466,8 @@ TEST(HardwareNodeTest, NextDutyUsIsWhenTickNextHasWork) {
 // without sleeping in between, until the window's datagram budget is spent:
 // then the loop sleeps through input to the end of the window, and drains
 // the rest after it. The old 1 ms poll took 32 datagrams a millisecond;
-// this takes at most kDatagramBudget plus the one pass that crosses it.
+// this takes at most the 64 a 1000 us window allows, the requirement's
+// numbers, asserted as such rather than as the constants that set them.
 // REQ-RT-20
 TEST(HardwareNodeTest, PassDrainsABacklogWithinItsCpuBudget) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -1471,12 +1502,11 @@ TEST(HardwareNodeTest, PassDrainsABacklogWithinItsCpuBudget) {
     const HardwareNode::Wait wait = node.Pass(now_us);
     const uint64_t received = node.driver_station_packets_received() - before;
     in_window += received;
-    EXPECT_LE(in_window, HardwareNode::kDatagramBudget + kReceiveBudget)
-        << "at " << now_us;
+    EXPECT_LE(in_window, 64u) << "at " << now_us;
     if (wait.ignore_input) {
       saw_spent = true;
       EXPECT_GT(wait.until_us, now_us);
-      EXPECT_LE(wait.until_us, now_us + HardwareNode::kCpuWindowUs);
+      EXPECT_LE(wait.until_us, now_us + 1000);
       now_us = wait.until_us;
       in_window = 0;
     } else if (received == kReceiveBudget) {
@@ -1541,12 +1571,13 @@ TEST(HardwareNodeTest, AFloodOfRequestsIsHeldToThePassBudget) {
   const uint64_t passes = node.wakeups().passes - passes_before;
   EXPECT_EQ(node.identity_rejected() - rejected_before, passes)
       << "a pass that did not read the flood";
-  // kPassBudget a window, plus one pass per duty that ends a sleep early
-  // (100 ms: 5 statuses, 3 heartbeats or the neutral, a probe retry; the
-  // registry's liveness rides the passes); unbudgeted, the flood makes
+  // 8 passes a 1000 us window (the requirement's numbers, not the constants
+  // that set them), plus one pass per duty that ends a sleep early (100 ms:
+  // 5 statuses, 3 heartbeats or the neutral, a probe retry; the registry's
+  // liveness rides the passes); unbudgeted, the flood makes
   // kFloodUs / kPassCostUs.
-  const uint64_t windows = kFloodUs / HardwareNode::kCpuWindowUs + 1;
-  EXPECT_LE(passes, (windows * HardwareNode::kPassBudget) + 10)
+  const uint64_t windows = (kFloodUs / 1000) + 1;
+  EXPECT_LE(passes, (windows * 8) + 10)
       << passes << " passes, " << node.wakeups().throttled << " throttled";
 
   std::vector<SentCommand> commands;
@@ -1827,6 +1858,8 @@ TEST(HardwareNodeTest, OnlyASendErrorTheSocketKeepsRepeatingReplacesIt) {
     node.Tick(now_us);  // the probe is due, and fails
     EXPECT_EQ(node.socket_counters().last_send_error, row.error);
     EXPECT_EQ(node.udp_fd() < 0, row.replaced);
+    // The loop wakes for it 1 ms later, not at the probe's next period.
+    EXPECT_EQ(node.NextDutyUs(now_us), now_us + 1'000);
     node.Tick(now_us + 1'000);
     reopens += row.replaced ? 1 : 0;
     EXPECT_EQ(node.socket_counters().reopens, reopens);
@@ -2417,6 +2450,34 @@ TEST(HardwareNodeTest, BridgeStatusReportsUdpSocketAndStateLossCounters) {
   EXPECT_EQ(status.state_decode_failures_count(), 1u);
   EXPECT_EQ(status.socket_send_would_block_count(), 0u);
   EXPECT_TRUE(status == node.Status(now_us));
+
+  // 3. A send the socket cannot take now (EAGAIN), from a socket whose send
+  // buffer is full: a stream pair, filled to the last byte, put in place of
+  // the bridge's socket on its descriptor. A datagram socket's sends on
+  // loopback do not block, and a full Unix datagram socket says ENOBUFS on
+  // macOS.
+  std::array<int, 2> pair{-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair.data()), 0);
+  ASSERT_EQ(::fcntl(pair[0], F_SETFL, O_NONBLOCK), 0);
+  std::array<uint8_t, 4096> fill{};
+  while (::send(pair[0], fill.data(), fill.size(), 0) > 0) {
+  }
+  while (::send(pair[0], fill.data(), 1, 0) > 0) {
+  }
+  ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << std::strerror(errno);
+  ASSERT_GE(::dup2(pair[0], node.udp_fd()), 0);
+  ::close(pair[0]);
+  uint64_t would_block = 0;
+  // Each Tick to the next unanswered probe's retry, which finds it full.
+  for (int i = 0; i < 10 && would_block == 0; ++i) {
+    now_us += 20'000;
+    node.Tick(now_us);
+    const auto latest = status_sub.read();
+    if (latest) would_block = latest->socket_send_would_block_count();
+  }
+  EXPECT_GE(would_block, 1u);
+  link.node.reset();  // closes the full end before its peer
+  ::close(pair[1]);
 }
 
 int pending_recv_error = 0;

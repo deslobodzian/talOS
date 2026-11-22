@@ -294,6 +294,8 @@ TEST(HardwareNodeTrustTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {
   node.Tick(1004000);
 
   EXPECT_EQ(node.ownership_rejected(), 3u);
+  // /hw/status reports the three refused requests, and not the two merged.
+  EXPECT_EQ(node.Status(1004000).ownership_rejected_count(), 3u);
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
   const Command& cmd2 = node.current_command();
@@ -615,6 +617,7 @@ TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {
 // datagram delayed from a boot the gateway has since left are dropped before
 // they reach identity, freshness, the cached requests, /hw/state or the config
 // push. A genuine new boot still recovers.
+// REQ-SAFE-11
 TEST(HardwareNodeTrustTest, ReorderedAndRetiredBootStatesChangeNothing) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint16_t drive = cfg.hardware.motors[0].id;
@@ -970,14 +973,8 @@ TEST(HardwareNodeTrustTest, NotReadyCommandRateIsOnePerHeartbeat) {
   }
 }
 
-// NextDutyUsIsWhenTickNextHasWork (hardware_node_test.cc) on a disabled
-// robot: a request that changes only the merged observation does not send,
-// and NextDutyUs() names the heartbeat that carries it rather than now.
-// Ticking just before each duty does nothing, and each duty it names has
-// work (a frame to the gateway or a /hw/status), so the loop neither sends
-// early nor wakes every millisecond for a send Tick will not make.
-// REQ-RT-13
-TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
+// NotReadyNextDutyUsIsTheHeartbeat's case for States carrying `flags`.
+void NotReadyObservationWaitsForTheHeartbeat(uint32_t flags) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
   Bridge rig{cfg};
@@ -993,7 +990,7 @@ TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
   ASSERT_EQ(heartbeat_us, 20'000u);
 
   State state = TrustState(NodeConfigId(cfg), 11, 1, 1000);
-  state.flags = kConfigured;  // disabled
+  state.flags = flags;
   ASSERT_TRUE(gateway.Deliver(state, kStartUs));
   PublishCommand(pub, NeutralCommand(state, roller));
   node.Tick(kRequestUs);
@@ -1037,71 +1034,130 @@ TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
   }
 }
 
-// While the gateway cannot take a command, a change of a demand still sends
-// at once; only a change of the observation alone waits for the heartbeat.
-// The devices layer flushes neutral then, so the change comes from a request
-// published as is, as a node outside the devices layer could: the bridge
-// forwards a demand whatever the State says and the gateway refuses it while
-// disabled, but the neutral that replaces it must not wait a heartbeat. The
-// duties NextDutyUs() names afterwards count the heartbeat from that send.
+// NextDutyUsIsWhenTickNextHasWork (hardware_node_test.cc) while the gateway
+// cannot take a command, for each State that says so (disabled; unconfigured,
+// which an uncommissioned gateway also reports; faulted): a request that
+// changes only the merged observation does not send, and NextDutyUs() names
+// the heartbeat that carries it rather than now. Ticking just before each
+// duty does nothing, and each duty it names has work (a frame to the gateway
+// or a /hw/status), so the loop neither sends early nor wakes every
+// millisecond for a send Tick will not make.
 // REQ-RT-13
-TEST(HardwareNodeTrustTest, NotReadyDemandChangeSendsAtOnce) {
+TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
+  struct Row {
+    const char* name;
+    uint32_t flags;
+  };
+  for (const Row row :
+       {Row{"disabled", kConfigured}, Row{"unconfigured", kEnabled},
+        Row{"faulted", kConfigured | kEnabled | kHardwareFault}}) {
+    SCOPED_TRACE(row.name);
+    NotReadyObservationWaitsForTheHeartbeat(row.flags);
+  }
+}
+
+// While the gateway cannot take a command, a change of a motor demand, a
+// digital output or a PWM output still sends at once; only a change of the
+// observation alone waits for the heartbeat. The devices layer flushes
+// neutral then, so the change comes from a request published as is, as a
+// node outside the devices layer could: the bridge forwards an output
+// whatever the State says and the gateway refuses it while disabled, but the
+// neutral that replaces it must not wait a heartbeat. The duties NextDutyUs()
+// names afterwards count the heartbeat from that send.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, NotReadyOutputChangeSendsAtOnce) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
-  Bridge rig{cfg};
-  HardwareNode& node = rig.node;
-  InProcessGateway& gateway = rig.gateway;
-  ipc::Publisher<Packet> pub{RequestTopic("intake")};
-  constexpr uint64_t kStartUs = 1'000'000;
-  const uint64_t heartbeat_us = node.heartbeat_us();
-  ASSERT_EQ(heartbeat_us, 20'000u);
-
-  State disabled = TrustState(NodeConfigId(cfg), 11, 1, 1000);
-  disabled.flags = kConfigured;
-  ASSERT_TRUE(gateway.Deliver(disabled, kStartUs));
-  const Command neutral = NeutralCommand(disabled, roller);
-  PublishCommand(pub, neutral);
-  node.Tick(kStartUs + 7'000);
-  ASSERT_EQ(node.commands_sent(), 1u);
-  gateway.TakeSent();
-
-  // The same observation, each time: only the demand changes.
-  Command driven = neutral;
-  driven.motors[0].mode = Mode::kVoltage;
-  driven.motors[0].demand = 4.0;
-  std::vector<SentCommand> commands;
-  const auto tick = [&](uint64_t now_us) {
-    node.Tick(now_us);
-    for (const auto& command : Commands(gateway.TakeSent())) {
-      commands.push_back({now_us, command});
-    }
+  const uint16_t beacon = cfg.hardware.digital_outputs[0].id;
+  const uint16_t strip = cfg.hardware.pwm_outputs[0].id;
+  struct Row {
+    const char* name;
+    // Makes `request` drive the row's output.
+    void (*drive)(Command& request, uint16_t beacon, uint16_t strip);
+    // Whether `command` drives it.
+    bool (*driven)(const Command& command, uint16_t roller);
   };
-  constexpr uint64_t kDrivenUs = kStartUs + 9'000;
-  constexpr uint64_t kNeutralUs = kStartUs + 10'000;
-  PublishCommand(pub, driven);
-  tick(kDrivenUs);
-  PublishCommand(pub, neutral);
-  tick(kNeutralUs);
+  const Row rows[] = {
+      {"motor demand",
+       [](Command& request, uint16_t, uint16_t) {
+         request.motors[0].mode = Mode::kVoltage;
+         request.motors[0].demand = 4.0;
+       },
+       [](const Command& command, uint16_t roller) {
+         return MotorOf(command, roller).mode == Mode::kVoltage;
+       }},
+      {"digital output",
+       [](Command& request, uint16_t beacon, uint16_t) {
+         request.digital_output_count = 1;
+         request.digital_outputs[0] = {beacon, true};
+       },
+       [](const Command& command, uint16_t) {
+         return command.digital_outputs[0].value;
+       }},
+      {"PWM output",
+       [](Command& request, uint16_t, uint16_t strip) {
+         request.pwm_output_count = 1;
+         request.pwm_outputs[0] = {strip, PwmMode::kPulse, 0.5};
+       },
+       [](const Command& command, uint16_t) {
+         return command.pwm_outputs[0].mode == PwmMode::kPulse;
+       }},
+  };
+  for (const Row& row : rows) {
+    SCOPED_TRACE(row.name);
+    Bridge rig{cfg};
+    HardwareNode& node = rig.node;
+    InProcessGateway& gateway = rig.gateway;
+    ipc::Publisher<Packet> pub{RequestTopic("intake")};
+    constexpr uint64_t kStartUs = 1'000'000;
+    const uint64_t heartbeat_us = node.heartbeat_us();
+    ASSERT_EQ(heartbeat_us, 20'000u);
 
-  // Up to just before the intake's owner timeout at kNeutralUs + 50'001.
-  uint64_t now_us = kNeutralUs;
-  for (uint64_t due_us = node.NextDutyUs(now_us); due_us < kStartUs + 55'000;
-       due_us = node.NextDutyUs(now_us)) {
-    ASSERT_GT(due_us, now_us) << "nothing is pending at " << now_us;
-    now_us = due_us;
-    tick(now_us);
-  }
+    State disabled = TrustState(NodeConfigId(cfg), 11, 1, 1000);
+    disabled.flags = kConfigured;
+    ASSERT_TRUE(gateway.Deliver(disabled, kStartUs));
+    const Command neutral = NeutralCommand(disabled, roller);
+    PublishCommand(pub, neutral);
+    node.Tick(kStartUs + 7'000);
+    ASSERT_EQ(node.commands_sent(), 1u);
+    gateway.TakeSent();
 
-  const std::array<uint64_t, 4> expected_us = {kDrivenUs, kNeutralUs,
-                                               kNeutralUs + heartbeat_us,
-                                               kNeutralUs + (2 * heartbeat_us)};
-  ASSERT_EQ(commands.size(), expected_us.size());
-  for (std::size_t i = 0; i < commands.size(); ++i) {
-    SCOPED_TRACE(i);
-    EXPECT_EQ(commands[i].sent_us, expected_us[i]);
-    EXPECT_EQ(MotorOf(commands[i].command, roller[0]).mode,
-              i == 0 ? Mode::kVoltage : Mode::kNeutral);
-    EXPECT_EQ(commands[i].command.observed_time_us, 1000u);
+    // The same observation, each time: only the output changes.
+    Command driven = neutral;
+    row.drive(driven, beacon, strip);
+    std::vector<SentCommand> commands;
+    const auto tick = [&](uint64_t now_us) {
+      node.Tick(now_us);
+      for (const auto& command : Commands(gateway.TakeSent())) {
+        commands.push_back({now_us, command});
+      }
+    };
+    constexpr uint64_t kDrivenUs = kStartUs + 9'000;
+    constexpr uint64_t kNeutralUs = kStartUs + 10'000;
+    PublishCommand(pub, driven);
+    tick(kDrivenUs);
+    PublishCommand(pub, neutral);
+    tick(kNeutralUs);
+
+    // Up to just before the intake's owner timeout at kNeutralUs + 50'001.
+    uint64_t now_us = kNeutralUs;
+    for (uint64_t due_us = node.NextDutyUs(now_us); due_us < kStartUs + 55'000;
+         due_us = node.NextDutyUs(now_us)) {
+      ASSERT_GT(due_us, now_us) << "nothing is pending at " << now_us;
+      now_us = due_us;
+      tick(now_us);
+    }
+
+    const std::array<uint64_t, 4> expected_us = {
+        kDrivenUs, kNeutralUs, kNeutralUs + heartbeat_us,
+        kNeutralUs + (2 * heartbeat_us)};
+    ASSERT_EQ(commands.size(), expected_us.size());
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(commands[i].sent_us, expected_us[i]);
+      EXPECT_EQ(row.driven(commands[i].command, roller[0]), i == 0);
+      EXPECT_EQ(commands[i].command.observed_time_us, 1000u);
+    }
   }
 }
 
@@ -1132,6 +1188,61 @@ TEST(HardwareNodeTrustTest, ReadyObservationChangeSendsAtOnce) {
   const auto commands = Commands(gateway.TakeSent());
   ASSERT_EQ(commands.size(), 1u);
   EXPECT_EQ(commands[0].observed_time_us, 2000u);
+}
+
+// Until a State has been observed nothing is commanded, even while a
+// request is merged and active (one stamped with the identity of no State,
+// which the merge admits): there is no boot, epoch or observation a command
+// could carry that the gateway would accept.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, NoCommandBeforeTheFirstState) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  Command request = IntakeRequest(cfg, 4.0);
+  request.boot_id = 0;
+  request.epoch = 0;
+  request.observed_time_us = 0;
+  PublishCommand(pub, request);
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  ASSERT_EQ(MotorOf(node.current_command(), request.motors[0].id).mode,
+            Mode::kVoltage)
+      << "the request did not merge, so nothing could have been sent";
+  // Every millisecond up to the intake's 50 ms owner timeout.
+  for (uint64_t now_us = kStartUs; now_us < kStartUs + 50'000;
+       now_us += 1'000) {
+    node.Tick(now_us);
+    EXPECT_TRUE(Commands(bridge.gateway.TakeSent()).empty()) << "at " << now_us;
+  }
+  EXPECT_EQ(node.commands_sent(), 0u);
+}
+
+// The unchanged-merge heartbeat is a fifth of command_timeout_us, at most
+// 20 ms (DATA_FLOW.md "Link rates and endpoints"): the gateway hears a live
+// merge at least five times per timeout whatever the config chose. Rows span
+// the timeouts config load accepts at a 5 ms [robot] period, 50 ms to 500 ms.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, TheHeartbeatIsAFifthOfTheTimeoutAtMost20Ms) {
+  struct Row {
+    uint32_t command_timeout_us;
+    uint64_t heartbeat_us;
+  };
+  for (const Row row : {Row{50'000, 10'000}, Row{60'000, 12'000},
+                        Row{100'000, 20'000}, Row{500'000, 20'000}}) {
+    SCOPED_TRACE(::testing::Message()
+                 << "command_timeout_us " << row.command_timeout_us);
+    std::string toml{kTrustToml};
+    const std::string period = "period_us = 5000\n";
+    toml.insert(toml.find(period) + period.size(),
+                "command_timeout_us = " +
+                    std::to_string(row.command_timeout_us) + "\n");
+    const auto cfg = config::ParseRobotConfigString(toml);
+    ASSERT_EQ(cfg.hardware.command_timeout_us, row.command_timeout_us);
+    const HardwareNode node{cfg, "127.0.0.1", 5802, 5803, true};
+    EXPECT_EQ(node.heartbeat_us(), row.heartbeat_us);
+  }
 }
 
 // A controller transition resets every owner in the merge until its next
@@ -1812,6 +1923,37 @@ TEST(HardwareNodeTrustTest, LogsRefusedConfigAckOncePerDistinctReason) {
   EXPECT_EQ(count_substr(sixty_four_x), 1u) << err;
   EXPECT_EQ(count_substr("motor 3 offline"), 2u) << err;
   EXPECT_NE(err.find("backend_failed"), std::string::npos) << err;
+}
+
+// A gateway sending States that do not decode sends them every tick: the
+// bridge reports the first of a stretch with one stderr line, and none for
+// the rest, until a State decodes; the next undecodable one is reported
+// again.
+// REQ-OPS-21
+TEST(HardwareNodeTrustTest, ReportsAnUndecodableStateOncePerStretch) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Bridge bridge{cfg};
+  InProcessGateway& gateway = bridge.gateway;
+  const std::array<uint8_t, 3> truncated{1, 2, 3};
+  const auto lines = [](const std::string& text) {
+    return std::count(text.begin(), text.end(), '\n');
+  };
+
+  ::testing::internal::CaptureStderr();
+  for (uint64_t now_us = 1000; now_us <= 3000; now_us += 1000) {
+    gateway.Receive(protocol::FrameType::kHardwareState, now_us, truncated);
+  }
+  const std::string stretch = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(lines(stretch), 1) << stretch;
+
+  ASSERT_TRUE(gateway.Deliver(TrustState(NodeConfigId(cfg), 11, 1, 1000),
+                              4000));  // its stderr is the gateway build's
+
+  ::testing::internal::CaptureStderr();
+  gateway.Receive(protocol::FrameType::kHardwareState, 5000, truncated);
+  gateway.Receive(protocol::FrameType::kHardwareState, 6000, truncated);
+  const std::string after = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(lines(after), 1) << after;
 }
 
 // REQ-SAFE-11: Driver Station packets arriving before any State (even with

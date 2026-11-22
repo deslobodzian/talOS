@@ -74,6 +74,7 @@ TEST(ClockOffset, AGatewayRebootRestartsTheWindow) {
 // A datagram delayed from a boot the gateway has left must not restart the
 // window back onto it: it is ignored, however high its sample time. Only the
 // last BootHistory::kRetiredBoots boots are remembered.
+// REQ-SAFE-11
 TEST(ClockOffset, ARetiredBootIsIgnored) {
   Estimator clock;
   ASSERT_TRUE(clock.Observe(3, 900'000'000, kBridgeStartUs));
