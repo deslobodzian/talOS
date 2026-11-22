@@ -12,6 +12,10 @@ import zlib
 from python.runfiles import runfiles
 from talOS.launcher import session_report
 
+# What the launcher records from the bench config's [robot]: the bounds the
+# /hw/state cadence rows are judged against.
+BENCH_BOUNDS = {"period_us": 5000, "command_timeout_us": 100000}
+
 
 class SessionReportTest(unittest.TestCase):
     def test_recorded_session(self):
@@ -29,7 +33,8 @@ class SessionReportTest(unittest.TestCase):
                              {"count": 7, "min_ms": 5, "median_ms": 5, "p99_ms": 200, "max_ms": 200})
             self.assertEqual(report["state_enabled"],
                              {"count": 5, "min_ms": 5, "median_ms": 5, "p99_ms": 120, "max_ms": 120})
-            self.assertEqual(report["enabled_gaps_ge_100_ms"], 1)
+            self.assertEqual((report["enabled_gaps"], report["enabled_gap_bound_ms"]), (1, 100))
+            self.assertEqual(report["state_p99_bound_ms"], 10)
             self.assertEqual(report["timer_lateness"]["fixture:update"]["max_ms"], 1)
             self.assertEqual(report["target_receipt_age"]["fixture:/fixture/target/test"]["median_ms"], 3)
             verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
@@ -41,6 +46,61 @@ class SessionReportTest(unittest.TestCase):
             # The manifest's signal death reaches the node summary.
             self.assertEqual(report["nodes"][0]["exit_signal"], 9)
             self.assertEqual(verdicts["target age at tick"], "PASS")
+
+    # REQ-RT-15, REQ-OPS-16 (TODO.md SPEC-4): the /hw/state cadence is judged
+    # against the recorded config, not the bench's. A robot with period_us
+    # 10000 and command_timeout_us 250000 publishes a State every 10 ms with
+    # one 150 ms enabled hole: p99 10 ms is under 2 x 10 ms, and 150 ms is
+    # under its 250 ms timeout, so both pass where the bench's 10 ms and
+    # 100 ms would fail them.
+    def test_cadence_is_judged_against_the_manifests_period_and_timeout(self):
+        files = runfiles.Create()
+        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
+        binary = files.Rlocation("_main/talOS/launcher/session_report")
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([fixture, directory, "slow-gateway"], check=True)
+            report = json.loads(subprocess.run(
+                [binary, "--json", directory], capture_output=True, text=True,
+                check=True).stdout)
+        self.assertEqual(report["state_enabled"],
+                         {"count": 116, "min_ms": 10, "median_ms": 10, "p99_ms": 10,
+                          "max_ms": 150})
+        verdicts = {v["measurement"]: v for v in report["verdicts"]}
+        for name in ("overall state p99", "enabled state p99", "enabled state gaps"):
+            with self.subTest(verdict=name):
+                self.assertEqual(verdicts[name]["verdict"], "PASS", verdicts[name])
+        # 2 x period_us (20 ms), not a tenth of the timeout (25 ms) or a literal.
+        self.assertEqual(report["state_p99_bound_ms"], 20)
+        self.assertEqual((report["enabled_gaps"], report["enabled_gap_bound_ms"]), (0, 250))
+
+    # REQ-OPS-16: a manifest from before the launcher recorded its config's
+    # period_us and command_timeout_us has no bound to judge the cadence
+    # against: the rows are NOT MEASURED, never judged against a bench
+    # constant, and --strict names each.
+    def test_a_manifest_without_the_bounds_does_not_judge_the_cadence(self):
+        files = runfiles.Create()
+        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
+        binary = files.Rlocation("_main/talOS/launcher/session_report")
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([fixture, directory, "unrecorded-bounds"], check=True)
+            result = subprocess.run([binary, "--json", "--strict", directory],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = json.loads(result.stdout)
+        verdicts = {v["measurement"]: v for v in report["verdicts"]}
+        for name, field in (("overall state p99", "period_us"),
+                            ("enabled state p99", "period_us"),
+                            ("enabled state gaps", "command_timeout_us")):
+            with self.subTest(verdict=name):
+                self.assertEqual(verdicts[name]["verdict"], "NOT MEASURED")
+                self.assertIn(f"manifest records no {field}", verdicts[name]["detail"])
+                self.assertIn(f"session_report: strict: {name}: NOT MEASURED",
+                              result.stderr.splitlines())
+        # The samples are still reported; only the judgement needs the bound.
+        self.assertEqual(report["state_enabled"]["p99_ms"], 120)
+        self.assertIsNone(report["state_p99_bound_ms"])
+        self.assertEqual((report["enabled_gaps"], report["enabled_gap_bound_ms"]),
+                         (None, None))
 
     # REQ-RT-20 (the bridge acts on a request when it arrives), REQ-OPS-16.
     def test_disabled_session_of_an_event_driven_bridge(self):
@@ -262,7 +322,8 @@ class SessionReportTest(unittest.TestCase):
                 "closed_at_flush": False})
         def strict(records):
             return session_report.strict_failures(
-                session_report.analyze({"end_wall_ns": 1, "nodes": []}, records))
+                session_report.analyze({"end_wall_ns": 1, "nodes": [], **BENCH_BOUNDS},
+                                       records))
         lane = record("lift", "MESSAGE", "/lift/target/teleop", 50)
         lane["decoded"] = "{mode_since_us: 1200, active: true, message: {position_rot: 0.5}}"
         passing = [record("hardware_node", "SEND", "/hw/state/driver_station", 0,
@@ -887,11 +948,12 @@ class SessionReportTest(unittest.TestCase):
         cases = (
             # No target lane was dispatched: only that required row is
             # NOT MEASURED; timer lateness is informational.
-            ({"end_wall_ns": 1, "nodes": [bridge, studio]}, records, 1),
+            ({"end_wall_ns": 1, "nodes": [bridge, studio], **BENCH_BOUNDS}, records, 1),
             # The hardware node recorded no /hw/state: seven required
             # verdicts, the controller link among them.
-            ({"end_wall_ns": 1, "nodes": [bridge]}, [], 7),
-            ({"end_wall_ns": 0, "nodes": [{**bridge, **flags}, studio]}, records, 5),
+            ({"end_wall_ns": 1, "nodes": [bridge], **BENCH_BOUNDS}, [], 7),
+            ({"end_wall_ns": 0, "nodes": [{**bridge, **flags}, studio], **BENCH_BOUNDS},
+             records, 5),
         )
         for manifest, session, failures in cases:
             self.assertEqual(len(session_report.strict_failures(
@@ -1171,18 +1233,21 @@ class SessionReportTest(unittest.TestCase):
                 self.assertEqual(lines[src_idx + 1],
                                  "talOS revision: bbbb2222" + suffix)
 
-    # REQ-RT-15: exact verdict boundaries for overall/enabled /hw/state median
-    # ([4.0, 6.0] ms), p99 (< 10.0 ms), and enabled state gaps (< 100.0 ms).
+    # REQ-RT-15, REQ-OPS-16 (TODO.md SPEC-4): exact verdict boundaries for
+    # overall/enabled /hw/state median ([4.0, 6.0] ms), p99 (< 2 x period_us),
+    # and enabled state gaps (< command_timeout_us), across bench bounds,
+    # tighter-than-bench bounds, and a non-1:10 period/timeout ratio.
     def test_state_cadence_and_gap_verdict_boundaries(self):
         def record(topic, now, **extra):
             return dict(process="hardware_node", kind="SEND", topic=topic,
                         now_ms=now, event_ms=now, publish_ms=now, decoded="",
                         **extra)
 
-        def verdicts_for(times):
+        def verdicts_for(times, bounds=BENCH_BOUNDS):
             records = [record("/hw/state/driver_station", 0, ds_enabled=True)]
             records += [record("/hw/state", t) for t in times]
-            report = session_report.analyze({"end_wall_ns": 1, "nodes": []}, records)
+            report = session_report.analyze(
+                {"end_wall_ns": 1, "nodes": [], **bounds}, records)
             return report, {v["measurement"]: v["verdict"] for v in report["verdicts"]}
 
         # Overall and enabled state median: 3.99 FAIL, 4.0/6.0 PASS, 6.01 FAIL.
@@ -1193,13 +1258,14 @@ class SessionReportTest(unittest.TestCase):
                 self.assertEqual(verdicts["overall state median"], expected)
                 self.assertEqual(verdicts["enabled state median"], expected)
 
-        # Overall and enabled state p99: 9.99 PASS, 10.0 FAIL.
+        # Overall and enabled state p99: 9.99 PASS, 10.0 FAIL at bench bounds.
         # Put the peak interval first so peak - 0.0 is exact in IEEE 754; nine
         # 5 ms intervals follow (10 total: median = 5 ms, nearest-rank p99 = peak).
         for peak, expected in ((9.99, "PASS"), (10.0, "FAIL")):
             with self.subTest(p99_ms=peak):
                 times = [0.0] + [peak + 5.0 * i for i in range(10)]
-                _, verdicts = verdicts_for(times)
+                report, verdicts = verdicts_for(times)
+                self.assertEqual(report["state_p99_bound_ms"], 10.0)
                 self.assertEqual(verdicts["overall state median"], "PASS")
                 self.assertEqual(verdicts["enabled state median"], "PASS")
                 self.assertEqual(verdicts["overall state p99"], expected)
@@ -1210,8 +1276,112 @@ class SessionReportTest(unittest.TestCase):
             with self.subTest(gap_ms=gap_ms):
                 times = [0.0, gap_ms, gap_ms + 5.0, gap_ms + 10.0]
                 report, verdicts = verdicts_for(times)
-                self.assertEqual(report["enabled_gaps_ge_100_ms"], count)
+                self.assertEqual(report["enabled_gaps"], count)
+                self.assertEqual(report["enabled_gap_bound_ms"], 100.0)
                 self.assertEqual(verdicts["enabled state gaps"], expected)
+
+        # Tighter-than-bench config (3000 / 60000 -> p99 < 6 ms, gaps < 60 ms):
+        # 7 ms p99 and 70 ms gap both FAIL where bench literals 10 / 100 pass.
+        tight = {"period_us": 3000, "command_timeout_us": 60000}
+        for peak, expected in ((5.99, "PASS"), (6.0, "FAIL"), (7.0, "FAIL")):
+            with self.subTest(tight_p99_ms=peak):
+                times = [0.0] + [peak + 3.0 * i for i in range(10)]
+                report, verdicts = verdicts_for(times, bounds=tight)
+                self.assertEqual(report["state_p99_bound_ms"], 6.0)
+                self.assertEqual(verdicts["overall state p99"], expected)
+                self.assertEqual(verdicts["enabled state p99"], expected)
+        for gap_ms, expected, count in ((59.9, "PASS", 0), (60.0, "FAIL", 1),
+                                        (70.0, "FAIL", 1)):
+            with self.subTest(tight_gap_ms=gap_ms):
+                times = [0.0, gap_ms, gap_ms + 3.0, gap_ms + 6.0]
+                report, verdicts = verdicts_for(times, bounds=tight)
+                self.assertEqual(report["enabled_gaps"], count)
+                self.assertEqual(report["enabled_gap_bound_ms"], 60.0)
+                self.assertEqual(verdicts["enabled state gaps"], expected)
+
+        # Non-1:10 ratio (10000 / 250000 -> p99 < 20 ms != 250000 / 10000 = 25 ms):
+        # 20 ms and 22 ms p99 both FAIL, catching timeout-derived p99 mutants.
+        wide = {"period_us": 10000, "command_timeout_us": 250000}
+        for peak, expected in ((19.99, "PASS"), (20.0, "FAIL"), (22.0, "FAIL")):
+            with self.subTest(wide_p99_ms=peak):
+                times = [0.0] + [peak + 10.0 * i for i in range(10)]
+                report, verdicts = verdicts_for(times, bounds=wide)
+                self.assertEqual(report["state_p99_bound_ms"], 20.0)
+                self.assertEqual(verdicts["overall state p99"], expected)
+                self.assertEqual(verdicts["enabled state p99"], expected)
+        for gap_ms, expected, count in ((249.9, "PASS", 0), (250.0, "FAIL", 1)):
+            with self.subTest(wide_gap_ms=gap_ms):
+                times = [0.0, gap_ms, gap_ms + 10.0, gap_ms + 20.0]
+                report, verdicts = verdicts_for(times, bounds=wide)
+                self.assertEqual(report["enabled_gaps"], count)
+                self.assertEqual(report["enabled_gap_bound_ms"], 250.0)
+                self.assertEqual(verdicts["enabled state gaps"], expected)
+
+    # REQ-OPS-16 (TODO.md SPEC-4): invalid, out-of-uint32-range, or partially
+    # absent manifest bounds fail closed per field as NOT MEASURED without
+    # raising (e.g. OverflowError on huge ints) or conflating the two keys.
+    def test_recorded_bound_validation_and_partial_manifests(self):
+        records = [
+            dict(process="hardware_node", kind="SEND",
+                 topic="/hw/state/driver_station",
+                 now_ms=0.0, event_ms=0.0, publish_ms=0.0, decoded="",
+                 ds_enabled=True),
+            *[dict(process="hardware_node", kind="SEND", topic="/hw/state",
+                   now_ms=t, event_ms=t, publish_ms=t, decoded="")
+              for t in (0.0, 5.0, 10.0, 15.0)],
+        ]
+
+        for bad in (0, -5000, True, False, 5000.0, "5000", None, 2**32, 10**400):
+            with self.subTest(bad_value=repr(bad)):
+                report = session_report.analyze(
+                    {"end_wall_ns": 1, "nodes": [],
+                     "period_us": bad, "command_timeout_us": bad}, records)
+                verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+                self.assertEqual(verdicts["overall state p99"], "NOT MEASURED")
+                self.assertEqual(verdicts["enabled state p99"], "NOT MEASURED")
+                self.assertEqual(verdicts["enabled state gaps"], "NOT MEASURED")
+                self.assertIsNone(report["state_p99_bound_ms"])
+                self.assertIsNone(report["enabled_gaps"])
+                self.assertIsNone(report["enabled_gap_bound_ms"])
+
+        # Largest valid uint32_t is accepted without overflow.
+        max_u32 = 0xFFFFFFFF
+        report = session_report.analyze(
+            {"end_wall_ns": 1, "nodes": [],
+             "period_us": max_u32, "command_timeout_us": max_u32}, records)
+        verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+        self.assertEqual(verdicts["overall state p99"], "PASS")
+        self.assertEqual(verdicts["enabled state p99"], "PASS")
+        self.assertEqual(verdicts["enabled state gaps"], "PASS")
+        self.assertAlmostEqual(report["state_p99_bound_ms"], 2 * max_u32 / 1000)
+        self.assertEqual(report["enabled_gaps"], 0)
+        self.assertAlmostEqual(report["enabled_gap_bound_ms"], max_u32 / 1000)
+
+        # Partial manifest: only period_us present.
+        only_period = session_report.analyze(
+            {"end_wall_ns": 1, "nodes": [], "period_us": 5000}, records)
+        v_period = {v["measurement"]: v for v in only_period["verdicts"]}
+        self.assertEqual(v_period["overall state p99"]["verdict"], "PASS")
+        self.assertEqual(v_period["enabled state p99"]["verdict"], "PASS")
+        self.assertEqual(only_period["state_p99_bound_ms"], 10.0)
+        self.assertEqual(v_period["enabled state gaps"]["verdict"], "NOT MEASURED")
+        self.assertIn("manifest records no command_timeout_us",
+                      v_period["enabled state gaps"]["detail"])
+        self.assertIsNone(only_period["enabled_gaps"])
+        self.assertIsNone(only_period["enabled_gap_bound_ms"])
+
+        # Partial manifest: only command_timeout_us present.
+        only_timeout = session_report.analyze(
+            {"end_wall_ns": 1, "nodes": [], "command_timeout_us": 100000}, records)
+        v_timeout = {v["measurement"]: v for v in only_timeout["verdicts"]}
+        self.assertEqual(v_timeout["overall state p99"]["verdict"], "NOT MEASURED")
+        self.assertEqual(v_timeout["enabled state p99"]["verdict"], "NOT MEASURED")
+        self.assertIn("manifest records no period_us",
+                      v_timeout["overall state p99"]["detail"])
+        self.assertIsNone(only_timeout["state_p99_bound_ms"])
+        self.assertEqual(v_timeout["enabled state gaps"]["verdict"], "PASS")
+        self.assertEqual(only_timeout["enabled_gaps"], 0)
+        self.assertEqual(only_timeout["enabled_gap_bound_ms"], 100.0)
 
 
 if __name__ == "__main__":

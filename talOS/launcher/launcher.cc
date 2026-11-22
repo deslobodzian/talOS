@@ -1193,6 +1193,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   manifest.launcher_log =
       options_.output_dir + "/" + std::string{kLauncherOutputFile};
   manifest.simulation = options_.simulation;
+  // What session_report judges the /hw/state cadence and gaps against.
+  manifest.period_us = robot_config.hardware.period_us;
+  manifest.command_timeout_us = robot_config.hardware.command_timeout_us;
   manifest.declared_topics = declared_topics;
   manifest.start_wall_ns = WallClockNanos();
   session_manifest_ = manifest;
