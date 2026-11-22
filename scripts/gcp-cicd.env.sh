@@ -31,9 +31,9 @@
 : "${CACHE_DISK_GB:=60}"
 # bazel-remote's local LRU size in GiB; keep it below CACHE_DISK_GB.
 : "${CACHE_MAX_SIZE_GIB:=40}"
-# Pin this to a release tag or a digest before --apply: "latest" changes
-# under a persistent VM whenever it restarts.
-: "${BAZEL_REMOTE_IMAGE:=buchgr/bazel-remote-cache:latest}"
+# A pinned release: "latest" would change under a persistent VM whenever it
+# restarts.
+: "${BAZEL_REMOTE_IMAGE:=buchgr/bazel-remote-cache:v2.6.4}"
 
 # Network tags the firewall rules are written against.
 : "${CACHE_TAG:=bazel-cache}"
