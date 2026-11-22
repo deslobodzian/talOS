@@ -290,6 +290,10 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"output_dir\": " << Quoted(output_dir) << ",\n";
   ss << "  \"launcher_log\": " << Quoted(launcher_log) << ",\n";
   ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";
+  if (period_us) ss << "  \"period_us\": " << *period_us << ",\n";
+  if (command_timeout_us) {
+    ss << "  \"command_timeout_us\": " << *command_timeout_us << ",\n";
+  }
   if (hardware_protocol_version) {
     ss << "  " << Key(keys::kHardwareProtocolVersion)
        << *hardware_protocol_version << ",\n";

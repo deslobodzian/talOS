@@ -665,6 +665,16 @@ def state_sequence_gaps(states, spans):
             "longest_run": longest_run, "longest_at_ms": longest_at_ms}, unmeasured
 
 
+def recorded_bound(manifest, key):
+    """The manifest's positive uint32 `key` (a [robot] value the launcher
+    records), or None when it records none."""
+    value = manifest.get(key)
+    if (isinstance(value, int) and not isinstance(value, bool)
+            and 0 < value <= 0xFFFFFFFF):
+        return value
+    return None
+
+
 def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_decoded=None):
     # hardware_not_decoded: log_dump's line for a session recorded under
     # another hardware protocol. Its Driver Station packets were not decoded,
@@ -804,6 +814,15 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
               "enabled": "" if not across_state + across_ds else
               f"; {across_state + across_ds} intervals across a /hw/state or "
               "Driver Station log gap not measured"}
+    # The bounds come from the config the session ran (the launcher records
+    # its [robot] period_us and command_timeout_us); a manifest from before
+    # it did has none, and the rows they judge are not measured.
+    period_us = recorded_bound(manifest, "period_us")
+    timeout_us = recorded_bound(manifest, "command_timeout_us")
+    p99_bound_ms = None if period_us is None else 2 * period_us / 1000
+    p99_rule = ("p99 < 2 x period_us; NOT MEASURED: the manifest records no period_us"
+                if p99_bound_ms is None else
+                f"p99 < {p99_bound_ms:g} ms (2 x period_us {period_us}); nearest rank")
     for name, values in (("overall", overall), ("enabled", enabled)):
         s = stats(values)
         verdict(name + " state median", s is not None,
@@ -811,14 +830,21 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
                 "about 5 ms interpreted as 4–6 ms (analysis tolerance, not an additional "
                 "bring-up requirement)" + across[name],
                 needs_hardware=name == "enabled")
-        verdict(name + " state p99", s is not None,
-                s is not None and s["p99_ms"] < 10, "p99 < 10 ms; nearest rank" + across[name],
-                needs_hardware=name == "enabled")
-    gaps = sum(v >= 100 for v in enabled)
-    # No count for a row that is not measured: 0 would read as a result.
-    verdict("enabled state gaps", bool(enabled), gaps == 0,
-            (f"{gaps} gaps >= 100 ms" if enabled and not hardware_not_decoded
-             else "gaps >= 100 ms") + across["enabled"], needs_hardware=True)
+        verdict(name + " state p99", s is not None and p99_bound_ms is not None,
+                s is not None and p99_bound_ms is not None and s["p99_ms"] < p99_bound_ms,
+                p99_rule + across[name], needs_hardware=name == "enabled")
+    gap_bound_ms = None if timeout_us is None else timeout_us / 1000
+    gaps = None if gap_bound_ms is None else sum(v >= gap_bound_ms for v in enabled)
+    if gap_bound_ms is None:
+        gap_rule = ("gaps >= command_timeout_us; NOT MEASURED: the manifest records no "
+                    "command_timeout_us")
+    else:
+        gap_rule = f"gaps >= {gap_bound_ms:g} ms (the manifest's command_timeout_us {timeout_us})"
+        # No count for a row that is not measured: 0 would read as a result.
+        if enabled and not hardware_not_decoded:
+            gap_rule = f"{gaps} {gap_rule}"
+    verdict("enabled state gaps", bool(enabled) and gaps is not None, gaps == 0,
+            gap_rule + across["enabled"], needs_hardware=True)
     worst = max(((max(v), k) for k, v in tick_ages.items()), default=None)
     unselected = sorted(enabled_lane_processes - {k.split(":", 1)[0] for k in tick_ages})
     bound = (f"selected target age at the tick <= {TARGET_AGE_LIMIT_MS} ms per process:lane "
@@ -926,7 +952,14 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             # controller_link(); null unless the bridge accepted a State.
             "first_state_ms": first_state_ms,
             "state_stream": source, "state_overall": stats(overall),
-            "state_enabled": stats(enabled), "enabled_gaps_ge_100_ms": gaps,
+            "state_enabled": stats(enabled),
+            # Enabled /hw/state intervals at or past the manifest's
+            # command_timeout_us, and that bound; both null when the
+            # manifest records none.
+            "enabled_gaps": gaps, "enabled_gap_bound_ms": gap_bound_ms,
+            # The p99 rows' bound, 2 x the manifest's period_us; null when
+            # the manifest records none.
+            "state_p99_bound_ms": p99_bound_ms,
             "state_sequence_gaps": seq_gaps,
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
             "target_age_at_tick": {k: stats(v) for k, v in sorted(tick_ages.items())},
