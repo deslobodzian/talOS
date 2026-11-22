@@ -914,6 +914,18 @@ lock a node can hold: its registry attach is read-only, which
 See [deployment](../../docs/DEPLOYMENT.md) for the generated systemd watchdog
 policy and macOS's launchd limitations.
 
+### Sleep prevention
+
+While a session runs (phase two, from starting the roster until the session
+ends; not `--describe-only`, `--replay-inputs`, or `--check-session-lock`), the
+launcher holds a macOS IOKit `kIOPMAssertionTypePreventSystemSleep` assertion
+(`SleepGuard` in `sleep_guard.h`, equivalent to `caffeinate -s`) and releases it
+cleanly via RAII when the session exits. This is defense-in-depth independent of
+`pmset sleep 0` ([deployment](../../docs/DEPLOYMENT.md#on-the-main-processor))
+against idle or DarkWake maintenance sleep on a Mac mini. If IOKit refuses the
+assertion, the launcher logs a non-fatal warning to stderr (and `talos.log`) and
+continues the session. On Linux, `SleepGuard` is a silent no-op.
+
 ### Supervision passes
 
 The supervision loop does not poll. After each pass it sleeps until the
@@ -1251,6 +1263,7 @@ header:
 | `:hardware_record` | `hardware_record.h` | the hardware packets decoded with the wire codecs (`HardwareRecordOf`, `HardwareRecordJson`), the check that a session's packets are of this build's protocol (`RecordedProtocolVersion`, `HardwareProtocolCheck`) and the run config's device names (`SessionConfigPath`, `LoadDeviceNames`), for `log_dump` and Studio's review |
 | `:log_merge` | `log_merge.h` | `MergeLogs`, a session's records streamed to a visitor in time order; `log_dump` and Studio's review link it, not the supervisor |
 | `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read, and when to look at the row next ([supervision passes](#supervision-passes)) |
+| `:sleep_guard` | `sleep_guard.h` | `SleepGuard`: macOS IOKit `PreventSystemSleep` RAII assertion held for a running session (silent no-op on Linux; [sleep prevention](#sleep-prevention)) |
 | `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
 
 

@@ -233,7 +233,10 @@ A relative `--prefix` is resolved against the working directory.
   nodes request). macOS: refuses while FileVault is on (`fdesetup status`
   is anything but `FileVault is Off.`), since the daemon then cannot start
   until someone logs in; sets `pmset -a autorestart 1 sleep 0` (power back on
-  after a power loss, never sleep while idle); writes the
+  after a power loss, never sleep while idle; as defense-in-depth independent of
+  `pmset`, the launcher also holds a macOS IOKit `PreventSystemSleep` assertion
+  for every running session,
+  [sleep prevention](../talOS/launcher/README.md#sleep-prevention)); writes the
   LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`,
   `ProcessType` `Interactive`, stderr to `/Library/Logs/talos/launchd.stderr.log`,
   [below](#boot-service-output)) and the rotation rule
