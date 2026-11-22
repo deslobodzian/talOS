@@ -2265,16 +2265,28 @@ TEST(HardwareNodeTest, ExitSummaryReportsUdpGapsDecodeFailuresAndWouldBlock) {
               static_cast<ssize_t>(n));
   };
 
-  send_raw_seq(1);
-  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
-  ASSERT_EQ(::send(link.gateway.NativeFd(), garbage, sizeof(garbage), 0),
-            static_cast<ssize_t>(sizeof(garbage)));
-  send_raw_seq(5);
+  // Deliver each datagram and drain it before sending the next so macOS
+  // loopback delivery of later datagrams cannot lag behind the first
+  // DatagramQueued() wake.
+  uint64_t now_us = 1'000'000;
+  auto deliver = [&](auto&& send_one) {
+    send_one();
+    for (;;) {
+      ASSERT_TRUE(DatagramQueued(node));
+      const bool had_bytes = QueuedBytes(node) > 0;
+      now_us += 1'000;
+      node.Tick(now_us);
+      if (had_bytes && QueuedBytes(node) == 0) break;
+    }
+  };
 
-  // Wait until the bridge has drained all 3 datagrams.
-  ASSERT_TRUE(DatagramQueued(node));
-  node.Tick(1'000'000);
-  while (QueuedBytes(node) > 0) node.Tick(1'001'000);
+  deliver([&] { send_raw_seq(1); });
+  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  deliver([&] {
+    ASSERT_EQ(::send(link.gateway.NativeFd(), garbage, sizeof(garbage), 0),
+              static_cast<ssize_t>(sizeof(garbage)));
+  });
+  deliver([&] { send_raw_seq(5); });
 
   process::stop_requested.store(true);
   ::testing::internal::CaptureStdout();
@@ -2424,19 +2436,28 @@ TEST(HardwareNodeTest, BridgeStatusReportsUdpSocketAndStateLossCounters) {
     ASSERT_EQ(::send(link.gateway.NativeFd(), buf.data(), n, 0),
               static_cast<ssize_t>(n));
   };
-  send_raw_seq(1);
-  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
-  ASSERT_EQ(::send(link.gateway.NativeFd(), garbage, sizeof(garbage), 0),
-            static_cast<ssize_t>(sizeof(garbage)));
-  send_raw_seq(6);
-
-  ASSERT_TRUE(DatagramQueued(node));
+  // Deliver each datagram and drain it before sending the next so macOS
+  // loopback delivery of later datagrams cannot lag behind the first
+  // DatagramQueued() wake.
   uint64_t now_us = 1'220'000;
-  node.Tick(now_us);
-  while (QueuedBytes(node) > 0) {
-    now_us += 20'000;
-    node.Tick(now_us);
-  }
+  auto deliver = [&](auto&& send_one) {
+    send_one();
+    for (;;) {
+      ASSERT_TRUE(DatagramQueued(node));
+      const bool had_bytes = QueuedBytes(node) > 0;
+      now_us += 5'000;
+      node.Tick(now_us);
+      if (had_bytes && QueuedBytes(node) == 0) break;
+    }
+  };
+  deliver([&] { send_raw_seq(1); });
+  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  deliver([&] {
+    ASSERT_EQ(::send(link.gateway.NativeFd(), garbage, sizeof(garbage), 0),
+              static_cast<ssize_t>(sizeof(garbage)));
+  });
+  deliver([&] { send_raw_seq(6); });
+
   // Ensure a fresh /hw/status publication after draining.
   now_us += 20'000;
   node.Tick(now_us);
