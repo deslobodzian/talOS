@@ -452,8 +452,8 @@ UdpStatus RuntimeUdpPeer::ConfigureSocket(const UdpSocketOptions& options) {
 
 // Shut down for writing, or marked defunct by macOS (EPIPE; seen after sleep
 // and wake); no longer connected (ENOTCONN, EDESTADDRREQ); no socket at all
-// (EBADF); or its source address gone from the host. connect() fixed that
-// source, and every later send on the socket uses it, so the socket stays
+// (EBADF, ENOTSOCK); or its source address gone from the host. connect() fixed
+// that source, and every later send on the socket uses it, so the socket stays
 // broken even once the host has a new address on the same network; a new
 // socket's connect picks the current one. Linux reports a gone source as
 // ENETUNREACH (its route lookup for a source that is not local fails so),
@@ -480,7 +480,8 @@ bool SendErrorNeedsNewSocket(int error) {
          error == WSAENETUNREACH || error == WSAENOTSOCK;
 #else
   return error == EPIPE || error == ENOTCONN || error == EDESTADDRREQ ||
-         error == EADDRNOTAVAIL || error == ENETUNREACH || error == EBADF;
+         error == EADDRNOTAVAIL || error == ENETUNREACH || error == EBADF ||
+         error == ENOTSOCK;
 #endif
 }
 
