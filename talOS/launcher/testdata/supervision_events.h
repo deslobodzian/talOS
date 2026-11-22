@@ -108,12 +108,12 @@ class SteppedClock {
   }
   // The clock runs on from where it is held.
   void Release() {
-    const int64_t held = state_->held.load();
+    const int64_t held = state_->held.load(std::memory_order_acquire);
     if (held == kFree) return;
     const int64_t real =
         std::chrono::steady_clock::now().time_since_epoch().count();
-    state_->ahead.store(std::max(state_->ahead.load(), held - real));
-    state_->held.store(kFree);
+    state_->ahead.store(held - real, std::memory_order_release);
+    state_->held.store(kFree, std::memory_order_release);
     SupervisionWakeup::Wake();
   }
 
@@ -137,10 +137,10 @@ class SteppedClock {
     std::atomic<int64_t> ahead{0};
     std::atomic<int64_t> held{kFree};
     SupervisionTime Now() const {
-      const int64_t at = held.load();
+      const int64_t at = held.load(std::memory_order_acquire);
       if (at != kFree) return SupervisionTime{std::chrono::nanoseconds{at}};
       return std::chrono::steady_clock::now() +
-             std::chrono::nanoseconds{ahead.load()};
+             std::chrono::nanoseconds{ahead.load(std::memory_order_acquire)};
     }
   };
   std::shared_ptr<State> state_{std::make_shared<State>()};
