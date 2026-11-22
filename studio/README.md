@@ -104,9 +104,10 @@ bridge at `/drive` (REQ-OPS-34). It draws the layout `[studio] dashboard` names
 [telemetry README](../talOS/telemetry/README.md#dashboard-layout)) from the
 `/drive` feed ([bridge README](bridge/README.md#driver-dashboard-feed)). It is
 plain TypeScript with no React, a second entry of the same Vite build
-([`vite.config.mjs`](vite.config.mjs)), so it loads about 51 kB
+([`vite.config.mjs`](vite.config.mjs)), so it loads about 55 kB
 (`assets/drive-*.js`, `assets/drive-*.css` and the chunk it shares with
-Studio: the telemetry decoder and the alert model) and makes no request beyond
+Studio, `assets/geometry-*.js`: field geometry, the telemetry decoder and the
+alert model) and makes no request beyond
 the bridge. Light and dark follow the browser's colour scheme.
 
 - [`src/drive/feed.ts`](src/drive/feed.ts) (`DriveModel`) holds the one socket,
@@ -172,11 +173,13 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   from the channel's labels, or `routine #N` out of range. Subsystems lists
   the drive summary's nodes, each with one state word, the most severe:
   `FAILING` (quarantined: the launcher paused its restarts, so it is not
-  running), `unknown` when the registry could not be read, `DOWN`, `UP`.
+  running), `unknown` when the registry could not be read, `DOWN`, `HELD`
+  (alive, `outputs_held`: the devices flush is holding outputs with no live
+  target), `UP`.
   A widget whose `nodes` names them lists exactly those, one the summary
   does not list reading `unknown`. Failed nodes come first (critical ones
-  before others), then one missing from the summary, one driving from a
-  target lane, critical ones, and the rest.
+  before others), then one holding outputs (`HELD`), one missing from the
+  summary, one driving from a target lane, critical ones, and the rest.
 - Lists (subsystems, checks, alerts) never hide a row: rows are 22 px, in as
   many columns as the cell's width holds (subsystems at least 140 px wide,
   checks 220 px), and a list that still overflows scrolls. A list's body is
@@ -190,7 +193,7 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   reads; `listRowsFit` computes from them that the 2026 layout's subsystems
   cell holds 20 rows at 1366x768 (two columns of 10) and 18 at 1280x720
   (two of 9), and its pre-match cell 12 and 10. The
-  [browser check](#driver-dashboard-in-a-browser) sees the 7 subsystem rows
+  [browser check](#driver-dashboard-in-a-browser) sees the 8 subsystem rows
   and 6 checks of a simulated bench session whole at both sizes, in a
   layout of its own. A row too narrow gives up its note (restarts, drives) first, then
   its name down to 64 px (ellipsized; the tooltip has the whole name and the
@@ -232,8 +235,9 @@ out, which the unit tests' fake surface cannot. Its subject is the bench
 robot's physics simulation with the Studio bridge and a dashboard of its own
 ([`tests/browser/robot.toml`](tests/browser/robot.toml), the bench's graph as
 `robot_physics_sim.toml` runs it plus `[studio]`, and
-[`tests/browser/dashboard.toml`](tests/browser/dashboard.toml), a full 12x8
-grid whose subsystems list holds the session's seven rows; the config's
+[`tests/browser/dashboard.toml`](tests/browser/dashboard.toml), a 12x8 grid
+filled except for its bottom-right 2x2 corner whose subsystems list holds the
+session's eight rows; the config's
 `//studio:browser_graph_test` and `//studio:browser_manifest_sync_test` keep
 it launchable). It launches that on ports and a shared-memory namespace of its
 own, opens `/drive` in the host's headless Chromium or Chrome and drives it
