@@ -35,10 +35,15 @@ case "$(basename "$0")" in
   dies) kill -KILL $$ ;;
   hangs)
     # STUB_PREWARM: run once to pay a first exec, then exit. STUB_FIFO: say
-    # it is running.
+    # it is running (after spawning a child process so process-group kill is
+    # exercised).
     [ -z "${STUB_PREWARM:-}" ] || exit 0
-    [ -z "${STUB_FIFO:-}" ] || echo up > "$STUB_FIFO"
-    exec tail -f /dev/null ;;
+    bash -c '
+      printf "child %s %s\n" "$1" "$$" >> "$STUB_LOG"
+      [ -z "${STUB_FIFO:-}" ] || echo up > "$STUB_FIFO"
+      exec tail -f /dev/null
+    ' _ "$me" &
+    wait "$!" ;;
   run.sh)
     # The graph check's run: STUB_CHECK_FIFO says it is running and never
     # exits; STUB_CHECK_EXIT is its exit status (the launcher refusing).
@@ -81,21 +86,24 @@ def stub_bundle(root, nodes):
 
 
 NATIVE_MARK = "bin/alpha.runfiles/site/mark.cpython-311-darwin.so"
+NATIVE_DYLIB = "bin/alpha.runfiles/site/mark_two.dylib"
 
 
 def native_bundle(src):
-    """A stub bundle with two native libraries: one that fails to load
-    (`broken.so`, sorted first) and the marking library, at NATIVE_MARK,
-    which it returns."""
+    """A stub bundle with three native libraries in sorted name order: one that
+    fails to load (`broken.so`, sorted first), the marking library as a `.so`
+    (`NATIVE_MARK`), and a second marking library copy as a `.dylib`
+    (`NATIVE_DYLIB`). Returns `(NATIVE_MARK, NATIVE_DYLIB)`."""
     stub_bundle(src, ("alpha",))
     site = os.path.dirname(os.path.join(src, NATIVE_MARK))
     os.makedirs(site)
-    shutil.copy(runfiles.Create().Rlocation(
-        "_main/bench/main_processor/bundle_test_native_mark.so"),
-        os.path.join(src, NATIVE_MARK))
+    mark_src = runfiles.Create().Rlocation(
+        "_main/bench/main_processor/bundle_test_native_mark.so")
+    shutil.copy(mark_src, os.path.join(src, NATIVE_MARK))
+    shutil.copy(mark_src, os.path.join(src, NATIVE_DYLIB))
     with open(os.path.join(site, "broken.so"), "wb") as f:
         f.write(b"not a Mach-O file")
-    return NATIVE_MARK
+    return NATIVE_MARK, NATIVE_DYLIB
 
 
 class WarmUpTest(unittest.TestCase):
@@ -144,6 +152,27 @@ class WarmUpTest(unittest.TestCase):
             last = f.read().splitlines()[-1]
         self.assertEqual(last, f"end {os.path.join(bundle, 'run.sh')}")
 
+    def assert_dead(self, pid, msg):
+        """Asserts `pid` is gone (or a SIGKILLed zombie awaiting init reap)."""
+        def _cleanup_kill(p=pid):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(_cleanup_kill)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+                state = f.read().rsplit(")", 1)[1].split()[0]
+            if state == "Z":
+                return
+        except OSError:
+            return
+        self.fail(f"{msg} (pid {pid} still alive)")
+
     def assert_warmed_in_turn(self, bundle, nodes, selected, proc):
         """Every member of the installed `bundle` ran exactly once, one at a
         time, while `current` still selected `selected`, and nothing else
@@ -161,6 +190,7 @@ class WarmUpTest(unittest.TestCase):
                (os.path.join(bundle, "launcher"), "--help")])
         self.assertEqual(started, want, out)
         hung_pids = []
+        child_pids = [int(r[2]) for r in records if r[0] == "child"]
         for i, r in enumerate(records):
             if r[0] != "start":
                 continue
@@ -172,9 +202,12 @@ class WarmUpTest(unittest.TestCase):
                 continue
             self.assertEqual(records[i + 1][:2], ["end", r[1]], records)
         self.assertEqual(len(hung_pids), "hangs" in nodes, records)
+        self.assertEqual(len(child_pids), "hangs" in nodes, records)
         for pid in hung_pids:
-            with self.assertRaises(ProcessLookupError, msg="hung member alive"):
-                os.kill(pid, 0)
+            self.assert_dead(pid, "hung member alive")
+        for pid in child_pids:
+            self.assertNotIn(pid, hung_pids, records)
+            self.assert_dead(pid, "hung member's child alive")
         for name in ("fails", "hangs"):
             self.assertEqual(name in proc.stderr, name in nodes, out)
 
@@ -193,6 +226,19 @@ class WarmUpTest(unittest.TestCase):
         # The graph check is no part of the warm-up.
         self.assert_checked_after_warm_up(
             os.path.realpath(os.path.join(self.prefix, "current")))
+
+    # REQ-OPS-47
+    def test_rollback_no_warm_up_runs_nothing(self):
+        self.install("old", ("alpha",), "--no-warm-up")
+        old = os.readlink(os.path.join(self.prefix, "current"))
+        self.install("new", ("alpha",), "--no-warm-up")
+        os.remove(self.log)
+        self.deploy("rollback", "--no-warm-up")
+        self.assertEqual(os.readlink(os.path.join(self.prefix, "current")),
+                         old)
+        self.assertEqual(self.records(), [])
+        self.assertEqual([r[0] for r in self.records(check=True)],
+                         ["start", "end"])
 
     # REQ-OPS-47
     def test_rollback_warms_the_previous_bundle_before_selecting_it(self):
@@ -226,18 +272,19 @@ class WarmUpTest(unittest.TestCase):
                          "only macOS charges a native library's first load")
     def test_install_loads_each_native_library_once_before_selecting(self):
         src = os.path.join(self.tmp, "bundle")
-        rel = native_bundle(src)
+        so_rel, dylib_rel = native_bundle(src)
         proc = self.deploy("install", src)
         bundle = os.path.realpath(os.path.join(self.prefix, "current"))
-        # The installed copy (the charge is per file), loaded once, while
-        # nothing was selected yet.
+        # Both the installed .so and .dylib copies (the charge is per file),
+        # loaded once each, while nothing was selected yet.
         marks = [(os.path.realpath(r[1]), r[2])
                  for r in self.records() if r[0] == "native"]
-        self.assertEqual(marks, [(os.path.join(bundle, rel), "-")],
+        self.assertEqual(marks, [(os.path.join(bundle, so_rel), "-"),
+                                 (os.path.join(bundle, dylib_rel), "-")],
                          proc.stdout + proc.stderr)
         # Counted as loaded, not by what a library prints when loaded
-        # (the marking one prints two lines).
-        self.assertIn(" and 2 native libraries in ", proc.stdout)
+        # (each marking one prints two lines).
+        self.assertIn(" and 3 native libraries in ", proc.stdout)
 
     # REQ-OPS-47: a native-library pass that dies counts only the libraries
     # it loaded and is named as not warmed.
@@ -246,15 +293,15 @@ class WarmUpTest(unittest.TestCase):
     def test_summary_counts_only_native_libraries_loaded(self):
         src = os.path.join(self.tmp, "bundle")
         native_bundle(src)
-        # The marking library's load kills its process.
+        # The first marking library's load kills its process before the .dylib.
         self.env["STUB_NATIVE_KILL"] = "1"
         proc = self.deploy("install", src)
         summary = [line for line in proc.stdout.splitlines()
                    if line.startswith("deploy: warmed ")]
         self.assertEqual(len(summary), 1, proc.stdout + proc.stderr)
         counted, _, missed = summary[0].partition("; not warmed: ")
-        # broken.so's load returned (failing); the marking one never did.
-        self.assertIn(" 3 members and 1 of 2 native libraries ", counted,
+        # broken.so's load returned (failing); the marking .so never did.
+        self.assertIn(" 3 members and 1 of 3 native libraries ", counted,
                       summary)
         self.assertTrue(missed.startswith("native libraries ("), summary)
 
@@ -306,15 +353,22 @@ class WarmUpTest(unittest.TestCase):
         self.assertEqual(deploy.returncode, 128 + number, out + err)
 
     # REQ-OPS-47, REQ-OPS-48: a stop during the warm-up kills the running
-    # member, selects nothing and removes the copy.
+    # member and its process group, selects nothing and removes the copy.
     def test_a_stopped_warm_up_kills_its_member_and_removes_the_copy(self):
         self.stop_install(("alpha", "hangs", "omega"), "STUB_FIFO",
                           signal.SIGTERM)
         records = self.records()
         started = [os.path.basename(r[1]) for r in records if r[0] == "start"]
         self.assertEqual(started, ["studio_bridge", "alpha", "hangs"], records)
-        with self.assertRaises(ProcessLookupError, msg="hung member alive"):
-            os.kill(int(records[-1][2]), 0)
+        hangs_start = [int(r[2]) for r in records
+                       if r[0] == "start" and os.path.basename(r[1]) == "hangs"]
+        hangs_child = [int(r[2]) for r in records
+                       if r[0] == "child" and os.path.basename(r[1]) == "hangs"]
+        self.assertEqual(len(hangs_start), 1, records)
+        self.assertEqual(len(hangs_child), 1, records)
+        self.assertNotEqual(hangs_start[0], hangs_child[0], records)
+        self.assert_dead(hangs_start[0], "hung member alive")
+        self.assert_dead(hangs_child[0], "hung member's child alive")
 
     # REQ-OPS-50, REQ-OPS-48: a stop during install's graph check (SIGINT,
     # which bash leaves ignored in a background job) stops the launcher,

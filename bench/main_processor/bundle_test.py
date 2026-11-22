@@ -288,11 +288,21 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue(manifest["config_sha256"])
                 self.assertEqual(graph["config_sha256"],
                                  manifest["config_sha256"])
-                # REQ-OPS-48
-                self.assert_native_wheels_load_from(
-                    os.path.realpath(where), manifest)
+                # REQ-OPS-48: an installed bundle holds zero symlinks anywhere
+                # (deploy.sh preserves any in-bundle symlink, so an internal
+                # link left by bundle_builder would survive here).
+                installed_root = os.path.realpath(where)
+                installed_links = [
+                    os.path.relpath(os.path.join(parent, entry), installed_root)
+                    for parent, dirs, files in os.walk(installed_root)
+                    for entry in dirs + files
+                    if os.path.islink(os.path.join(parent, entry))
+                ]
+                self.assertEqual(installed_links, [],
+                                 (name, installed_links[:10]))
+                self.assert_native_wheels_load_from(installed_root, manifest)
                 self.assert_linked_libraries_load_from(
-                    os.path.realpath(where), manifest, tmp)
+                    installed_root, manifest, tmp)
 
     def assert_linked_libraries_load_from(self, installed, manifest, tmp):
         """Each LINKED_LIBRARIES node, started from `installed` with the
@@ -370,14 +380,19 @@ class BundleTest(unittest.TestCase):
                     venvs = python_venvs(src, node)
                     self.assertTrue(venvs, node["name"])
                     for venv in venvs:
-                        proc = subprocess.run(
+                        proc = subprocess.Popen(
                             [venv, "-I", "-S", "-c",
                              "import os, sys; "
-                             "print(os.path.normpath(sys.executable))"],
-                            capture_output=True, text=True, env=env,
-                            timeout=60)
-                        self.assertEqual(proc.returncode, 0, proc.stderr)
-                        ran.add(proc.stdout.strip())
+                             "print(os.getpid(), os.path.normpath(sys.executable))"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env)
+                        out, err = proc.communicate(timeout=60)
+                        self.assertEqual(proc.returncode, 0, err)
+                        pid_str, executable = out.strip().split(" ", 1)
+                        # The venv wrapper execs the interpreter in place.
+                        self.assertEqual(int(pid_str), proc.pid,
+                                         f"{venv} did not exec its interpreter")
+                        ran.add(executable)
                 # Each runtime repository the nodes run is held once, under
                 # python/<repo>/, and all its nodes run that one file.
                 by_repo = {}
@@ -407,6 +422,29 @@ class BundleTest(unittest.TestCase):
                                 f for f in os.listdir(rt_lib)
                                 if f.startswith("libpython3") and ".so" in f]
                             self.assertEqual(leftovers, [], (name, repo))
+
+    # REQ-OPS-48: every real talos_bundle tree artifact holds zero symlinks.
+    # Bazel's sandbox mounts each file of a tree artifact as an individual
+    # symlink into bazel-out; resolving one known file locates the real tree
+    # artifact directory (or, when run unsandboxed, `src` itself) so we walk
+    # the actual bundle bytes produced by bundle_builder.py.
+    def test_bundles_hold_no_symlinks(self):
+        r = runfiles.Create()
+        for name in BUNDLES:
+            with self.subTest(name):
+                src = r.Rlocation(f"_main/{name}")
+                self.assertTrue(src and os.path.isdir(src), src)
+                manifest = os.path.join(src, "bundle_manifest.toml")
+                root = (os.path.dirname(os.path.realpath(manifest))
+                        if os.path.islink(manifest) else src)
+                self.assertTrue(os.path.isdir(root), root)
+                links = [
+                    os.path.relpath(os.path.join(parent, entry), root)
+                    for parent, dirs, files in os.walk(root)
+                    for entry in dirs + files
+                    if os.path.islink(os.path.join(parent, entry))
+                ]
+                self.assertEqual(links, [], (name, links[:10]))
 
 
 def launcher_stop_timeout_s():

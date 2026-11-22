@@ -2555,5 +2555,371 @@ TEST_F(ReviewTest, ManifestServesManifestJsonOr404WhenAbsentOrUnsafe) {
   EXPECT_EQ(review.Get("/review/../manifest.json", "").status, 400);
 }
 
+// Guards REQ-OPS-41 version-7 compatibility: a session whose `.tlog` files
+// carry FileHeader::version == 7 opens with no conversion and serves HTTP 200
+// with identical decoded bounds, channels, timeline, snapshot and series as
+// the version-8 session.
+// REQ-OPS-41
+TEST_F(ReviewTest, Version7LogsOpenAndDecodeIdenticallyToVersion8) {
+  const std::string dir = Library() + "/v7";
+  testing::WriteFixtureSession(dir);
+  std::size_t rewritten = 0;
+  for (const auto& entry : std::filesystem::directory_iterator{dir}) {
+    if (entry.path().extension() != ".tlog") continue;
+    std::fstream file{entry.path(),
+                      std::ios::in | std::ios::out | std::ios::binary};
+    const std::uint32_t version = 7;
+    static_assert(talos::event::log::OLDEST_READABLE_VERSION == 7);
+    file.seekp(offsetof(talos::event::log::FileHeader, version));
+    file.write(reinterpret_cast<const char*>(&version), sizeof version);
+    ASSERT_TRUE(file) << entry.path();
+    ++rewritten;
+  }
+  ASSERT_GT(rewritten, 0u);
+
+  Review review{Library(), 1u << 20};
+  const std::string end = std::to_string(kStartNs + 10 * kSecond + 2 * kMs);
+  const std::vector<std::pair<std::string, std::string>> endpoints{
+      {"bounds.json", ""},
+      {"channels.json", ""},
+      {"timeline.json", ""},
+      {"snapshot", "t_ns=" + end},
+      {"series",
+       "c=shooter/state/position_m,hw/state/driver_station/"
+       "match_time_s,hw/request/shooter/motors/1/demand&start_ns=" +
+           std::to_string(kStartNs) + "&end_ns=" + end + "&points=16"},
+  };
+  for (const auto& [endpoint, query] : endpoints) {
+    SCOPED_TRACE(endpoint);
+    const Response v8 = review.Get("/review/s1/" + endpoint, query);
+    const Response v7 = review.Get("/review/v7/" + endpoint, query);
+    ASSERT_EQ(v8.status, 200) << v8.body;
+    ASSERT_EQ(v7.status, 200) << v7.body;
+    EXPECT_EQ(v7.body, v8.body);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// Reflection schema with `depth` levels of nested structs: t.D00 (root, depth
+// 0) -> t.D01 (depth 1) -> ... -> t.D<depth> (depth `depth`, holding one bool
+// field `leaf`). Object names are zero-padded so they stay sorted for
+// FlatBuffers LookupByKey.
+std::string NestedStructSchema(std::size_t depth) {
+  flatbuffers::FlatBufferBuilder fbb;
+  std::vector<flatbuffers::Offset<reflection::Object>> objects;
+  objects.reserve(depth + 1);
+  const auto obj_name = [](std::size_t i) {
+    return std::string{"t.D"} + (i < 10 ? "0" : "") + std::to_string(i);
+  };
+  for (std::size_t i = 0; i <= depth; ++i) {
+    std::vector<flatbuffers::Offset<reflection::Field>> fields;
+    if (i < depth) {
+      const auto child_type = reflection::CreateType(
+          fbb, reflection::BaseType::Obj, reflection::BaseType::None,
+          static_cast<std::int32_t>(i + 1), 0, 1);
+      fields.push_back(
+          reflection::CreateFieldDirect(fbb, "inner", child_type, 0, 0));
+    } else {
+      const auto bool_type =
+          reflection::CreateType(fbb, reflection::BaseType::Bool,
+                                 reflection::BaseType::None, -1, 0, 1);
+      fields.push_back(
+          reflection::CreateFieldDirect(fbb, "leaf", bool_type, 0, 0));
+    }
+    objects.push_back(reflection::CreateObjectDirect(
+        fbb, obj_name(i).c_str(), &fields, /*is_struct=*/true, /*minalign=*/1,
+        /*bytesize=*/1));
+  }
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+  reflection::FinishSchemaBuffer(
+      fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+  return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+}
+
+// Guards REQ-OPS-42 schema and record payload caps through Review:
+//   - nesting depth 17 is refused (no channels) while depth 16 is accepted;
+//   - 2049 topic channels are refused (no channels) while 2048 are accepted;
+//   - a record whose payload_bytes is message_bytes + 1 (even with a valid
+//     CRC32) is rejected, failing that session (422).
+// Throughout, the healthy sibling session `s1` still returns 200.
+// REQ-OPS-42
+TEST_F(ReviewTest, SchemaDepthChannelAndRecordPayloadCapsFailOnlyTheirSession) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const auto write_single = [](const std::string& dir,
+                               talos::event::Registration source,
+                               std::span<const std::byte> payload) {
+    std::filesystem::create_directories(dir);
+    source.id = 2;
+    source.kind = SourceKind::SENDER;
+    tlog::LogWriter writer{dir + "/node.tlog", "node",
+                           tlog::LogWriterOptions{65536, 1, false}, 1};
+    writer.start({source}, MonotonicTime::from_nanos(kStartNs));
+    if (!payload.empty()) {
+      Context tick{};
+      tick.dispatch_index = 1;
+      tick.event_time = tick.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(tick, 2, payload, 0, 1);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  };
+
+  // 1. Nesting depth 16 (accepted) vs depth 17 (refused).
+  {
+    const std::byte one{1};
+    talos::event::Registration d16;
+    d16.name = "/depth16/state";
+    d16.message_bytes = 1;
+    d16.schema = {"t.D00", 2016, NestedStructSchema(16)};
+    write_single(Library() + "/depth16", d16, std::span{&one, 1});
+
+    talos::event::Registration d17;
+    d17.name = "/depth17/state";
+    d17.message_bytes = 1;
+    d17.schema = {"t.D00", 2017, NestedStructSchema(17)};
+    write_single(Library() + "/depth17", d17, std::span{&one, 1});
+  }
+
+  // 2. Topic channels: 2048 (kMaxTopicChannels, accepted) vs 2049 (refused).
+  {
+    constexpr std::uint16_t kCap =
+        static_cast<std::uint16_t>(talos::telemetry::kMaxTopicChannels);
+    static_assert(kCap == 2048);
+
+    talos::event::Registration at_cap;
+    at_cap.name = "/cap2048/state";
+    at_cap.message_bytes = kCap;
+    at_cap.schema = {"review_test.Cap2048", 2048,
+                     ManyBoolsSchema("review_test.Cap2048", "f", kCap)};
+    const std::vector<std::byte> payload2048(kCap, std::byte{1});
+    write_single(Library() + "/cap2048", at_cap, payload2048);
+
+    talos::event::Registration over_cap;
+    over_cap.name = "/cap2049/state";
+    over_cap.message_bytes = kCap + 1;
+    over_cap.schema = {"review_test.Cap2049", 2049,
+                       ManyBoolsSchema("review_test.Cap2049", "f", kCap + 1)};
+    const std::vector<std::byte> payload2049(kCap + 1, std::byte{1});
+    write_single(Library() + "/cap2049", over_cap, payload2049);
+  }
+
+  // 3. Record claiming message_bytes + 1 with a valid CRC32.
+  {
+    using D = talos::Descriptor<review_test::Shot>;
+    talos::event::Registration shot;
+    shot.name = "/over/state";
+    shot.message_bytes = sizeof(review_test::Shot);
+    shot.schema = {std::string{D::kName}, D::kHash,
+                   std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                               D::kBfbs.size()}};
+    write_single(Library() + "/over_msg", shot, {});
+
+    std::vector<std::byte> oversized(sizeof(review_test::Shot) + 1,
+                                     std::byte{0x2A});
+    tlog::RecordHeader hdr{};
+    hdr.kind = static_cast<std::uint16_t>(EventKind::SEND);
+    hdr.source_id = 2;
+    hdr.dispatch_index = 1;
+    hdr.event_time_ns = hdr.now_ns = hdr.publish_time_ns = kStartNs;
+    hdr.sequence = 1;
+    const auto stored = tlog::SealRecord(hdr, oversized);
+    ASSERT_EQ(hdr.payload_bytes, sizeof(review_test::Shot) + 1);
+    std::ofstream out{Library() + "/over_msg/node.tlog",
+                      std::ios::binary | std::ios::app};
+    out.write(reinterpret_cast<const char*>(&hdr), sizeof hdr);
+    out.write(reinterpret_cast<const char*>(stored.data()),
+              static_cast<std::streamsize>(stored.size()));
+    ASSERT_TRUE(out);
+  }
+
+  Review review{Library(), 1u << 20};
+
+  const Response ok_d16 = review.Get("/review/depth16/channels.json", "");
+  ASSERT_EQ(ok_d16.status, 200) << ok_d16.body;
+  const json d16_channels = json::parse(ok_d16.body)["channels"];
+  ASSERT_EQ(d16_channels.size(), 1u) << ok_d16.body;
+  const std::string d16_name = d16_channels[0]["name"];
+  EXPECT_TRUE(d16_name.starts_with("depth16/state/")) << d16_name;
+  EXPECT_TRUE(d16_name.ends_with("/leaf")) << d16_name;
+
+  ::testing::internal::CaptureStderr();
+  const Response bad_d17 = review.Get("/review/depth17/channels.json", "");
+  const std::string d17_err = ::testing::internal::GetCapturedStderr();
+  ASSERT_EQ(bad_d17.status, 200) << bad_d17.body;
+  EXPECT_TRUE(json::parse(bad_d17.body)["channels"].empty()) << bad_d17.body;
+  EXPECT_NE(d17_err.find("is not reviewed"), std::string::npos) << d17_err;
+
+  const Response ok_2048 = review.Get("/review/cap2048/channels.json", "");
+  ASSERT_EQ(ok_2048.status, 200) << ok_2048.body;
+  EXPECT_EQ(json::parse(ok_2048.body)["channels"].size(), 2048u);
+
+  ::testing::internal::CaptureStderr();
+  const Response bad_2049 = review.Get("/review/cap2049/channels.json", "");
+  const std::string cap_err = ::testing::internal::GetCapturedStderr();
+  ASSERT_EQ(bad_2049.status, 200) << bad_2049.body;
+  EXPECT_TRUE(json::parse(bad_2049.body)["channels"].empty()) << bad_2049.body;
+  EXPECT_NE(cap_err.find("is not reviewed"), std::string::npos) << cap_err;
+
+  EXPECT_EQ(review.Get("/review/over_msg/bounds.json", "").status, 422);
+
+  // Healthy sibling session stays 200 throughout.
+  EXPECT_EQ(review.Get("/review/s1/bounds.json", "").status, 200);
+  EXPECT_EQ(review.Get("/review/s1/channels.json", "").status, 200);
+
+  for (const char* name :
+       {"depth16", "depth17", "cap2048", "cap2049", "over_msg"}) {
+    std::filesystem::remove_all(Library() + "/" + name);
+  }
+}
+
+// Guards REQ-OPS-51 codec-rejection refusal when a session has no recorded
+// protocol version or records this build's kProtocolVersion: a single
+// codec-rejected `/hw/state` packet beside a decodable Driver Station packet
+// refuses every hardware channel (no `hw/` channels in channels.json,
+// `hardware_not_decoded` naming kProtocolVersion in bounds.json,
+// `hardware_not_decoded: true` and `modes: []` in timeline.json, and one
+// refusal line on stderr), while still serving non-hardware channels.
+// REQ-OPS-51
+TEST_F(ReviewTest, CodecRejectedHardwarePacketRefusesAllHardwareChannels) {
+  namespace ds = talos::driver_station;
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using P = talos::Descriptor<talos::hardware::Packet>;
+  using S = talos::Descriptor<review_test::Shot>;
+
+  const std::string build_ver =
+      std::to_string(talos::protocol::kProtocolVersion);
+
+  for (const bool with_matching_manifest : {false, true}) {
+    const std::string id =
+        with_matching_manifest ? "hw_reject_match" : "hw_reject_noversion";
+    SCOPED_TRACE(id);
+    const std::string dir = Library() + "/" + id;
+    std::filesystem::create_directories(dir);
+    if (with_matching_manifest) {
+      std::ofstream{dir + "/manifest.json"}
+          << "{\n  \"session_id\": 1,\n  \"hardware_protocol_version\": "
+          << build_ver << ",\n  \"nodes\": []\n}\n";
+    }
+    {
+      talos::event::Registration ds_src;
+      ds_src.id = 2;
+      ds_src.kind = SourceKind::SENDER;
+      ds_src.name = "/hw/state/driver_station";
+      ds_src.message_bytes = sizeof(talos::hardware::Packet);
+      ds_src.schema = {std::string{P::kName}, P::kHash, {}};
+
+      talos::event::Registration hw_src;
+      hw_src.id = 3;
+      hw_src.kind = SourceKind::SENDER;
+      hw_src.name = "/hw/state";
+      hw_src.message_bytes = sizeof(talos::hardware::Packet);
+      hw_src.schema = {std::string{P::kName}, P::kHash, {}};
+
+      talos::event::Registration shot_src;
+      shot_src.id = 4;
+      shot_src.kind = SourceKind::SENDER;
+      shot_src.name = "/shooter/state";
+      shot_src.message_bytes = sizeof(review_test::Shot);
+      shot_src.schema = {
+          std::string{S::kName}, S::kHash,
+          std::string{reinterpret_cast<const char*>(S::kBfbs.data()),
+                      S::kBfbs.size()}};
+
+      tlog::LogWriter writer{dir + "/bridge.tlog", "bridge",
+                             tlog::LogWriterOptions{8192, 1, false}, 1};
+      writer.start({ds_src, hw_src, shot_src},
+                   MonotonicTime::from_nanos(kStartNs));
+
+      // Decodable Driver Station packet (enabled in teleop).
+      ds::DriverStationData ds_data{};
+      ds_data.fms.flags = ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+      talos::hardware::Packet ds_pkt{};
+      ds_pkt.size =
+          static_cast<std::uint32_t>(ds::Encode(ds_data, ds_pkt.data));
+      ASSERT_GT(ds_pkt.size, 0u);
+
+      // Codec-rejected /hw/state packet (truncated / invalid payload).
+      talos::hardware::Packet bad_state{};
+      bad_state.size = 4;
+      bad_state.data[0] = bad_state.data[1] = bad_state.data[2] =
+          bad_state.data[3] = 0xFF;
+
+      // Healthy non-hardware topic.
+      const review_test::Shot shot{2.5, 1, review_test::Mode::IDLE, true, 1};
+
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(ctx, 2, std::as_bytes(std::span{&ds_pkt, 1}), 0, 1);
+      ctx.dispatch_index = 2;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs + kMs);
+      writer.send(ctx, 3, std::as_bytes(std::span{&bad_state, 1}), 0, 1);
+      ctx.dispatch_index = 3;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs + 2 * kMs);
+      writer.send(ctx, 4, std::as_bytes(std::span{&shot, 1}), 0, 1);
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+
+    Review review{Library(), 1u << 20};
+    ::testing::internal::CaptureStderr();
+    const Response channels =
+        review.Get("/review/" + id + "/channels.json", "");
+    const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+    ASSERT_EQ(channels.status, 200) << channels.body;
+
+    // Exactly one refusal line on stderr naming kProtocolVersion and /hw/state.
+    EXPECT_EQ(std::count(stderr_text.begin(), stderr_text.end(), '\n'), 1)
+        << stderr_text;
+    EXPECT_NE(stderr_text.find("hardware packets not decoded:"),
+              std::string::npos)
+        << stderr_text;
+    EXPECT_NE(stderr_text.find(build_ver), std::string::npos) << stderr_text;
+    EXPECT_NE(stderr_text.find("/hw/state"), std::string::npos) << stderr_text;
+
+    const json listed = json::parse(channels.body);
+    bool has_shooter = false;
+    for (const auto& ch : listed["channels"]) {
+      const std::string name = ch["name"];
+      EXPECT_FALSE(name.starts_with("hw/")) << name;
+      if (name == "shooter/state/position_m") has_shooter = true;
+    }
+    EXPECT_TRUE(has_shooter) << channels.body;
+
+    const Response bounds_resp =
+        review.Get("/review/" + id + "/bounds.json", "");
+    ASSERT_EQ(bounds_resp.status, 200) << bounds_resp.body;
+    const json bounds = json::parse(bounds_resp.body);
+    ASSERT_TRUE(bounds["hardware_not_decoded"].is_string()) << bounds;
+    const std::string reason = bounds["hardware_not_decoded"];
+    EXPECT_NE(reason.find(build_ver), std::string::npos) << reason;
+    EXPECT_NE(reason.find("/hw/state"), std::string::npos) << reason;
+    if (with_matching_manifest) {
+      EXPECT_NE(reason.find("recorded under this build's hardware protocol"),
+                std::string::npos)
+          << reason;
+    } else {
+      EXPECT_NE(reason.find("records no protocol version"), std::string::npos)
+          << reason;
+    }
+
+    const Response tl_resp = review.Get("/review/" + id + "/timeline.json", "");
+    ASSERT_EQ(tl_resp.status, 200) << tl_resp.body;
+    const json tl = json::parse(tl_resp.body);
+    EXPECT_EQ(tl["hardware_not_decoded"], true);
+    EXPECT_TRUE(tl["modes"].empty()) << tl.dump();
+
+    std::filesystem::remove_all(dir);
+  }
+}
+
 }  // namespace
 }  // namespace studio::review
