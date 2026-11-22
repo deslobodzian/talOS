@@ -301,7 +301,10 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     ::shm_unlink(ShmObjectName(path_).c_str());
   }
 
-  for (int attempt = 0; attempt <= kOpenAttempts; ++attempt) {
+  int closing_waits = 0;
+  int reclaim_waits = 0;
+  bool reclaimed = false;
+  for (;;) {
     if (!options_.session_owner) {
       ThrowIfVersionMismatch(path_);
     }
@@ -402,21 +405,34 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     if (closing) {
       // Its last holder is unlinking it; the next shm_open creates a fresh
       // segment once the name is gone.
-      if (attempt + 1 < kOpenAttempts) {
+      if (!reclaimed && closing_waits + 1 < kOpenAttempts) {
+        ++closing_waits;
         ::usleep(kInitRetryUs);
         continue;
       }
       // A holder killed after marking it closing never will. Its count
       // reached zero, so no queue is attached; once the wait is spent this
-      // segment -- never a newer one under the name -- is unlinked here,
-      // unless a live process still holds its writer claim or a reader slot.
-      if (attempt + 1 == kOpenAttempts && !HeldByLiveProcess(*header)) {
-        std::fprintf(stderr,
-                     "rtms: reclaiming shared memory %s, whose last holder "
-                     "died before unlinking it\n",
-                     path_.c_str());
-        UnlinkIfSame(path_, header->segment_id);
-        continue;
+      // segment -- never a newer one under the name -- is unlinked here by
+      // whichever opener claims kLifetimeReclaiming, unless a live process
+      // still holds its writer claim or a reader slot. Concurrent openers
+      // that lose the claim wait briefly for the winner's unlink and retry.
+      if (!reclaimed && !HeldByLiveProcess(*header)) {
+        if ((header->lifetime.fetch_or(kLifetimeReclaiming,
+                                       std::memory_order_acq_rel) &
+             kLifetimeReclaiming) == 0) {
+          std::fprintf(stderr,
+                       "rtms: reclaiming shared memory %s, whose last holder "
+                       "died before unlinking it\n",
+                       path_.c_str());
+          UnlinkIfSame(path_, header->segment_id);
+          reclaimed = true;
+          continue;
+        }
+        if (reclaim_waits < kOpenAttempts) {
+          ++reclaim_waits;
+          ::usleep(kInitRetryUs);
+          continue;
+        }
       }
       break;
     }
@@ -445,6 +461,9 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
 
 void RTMSQueue::close() noexcept {
   if (header_ == nullptr) return;
+  for (std::size_t id = 0; id < MAX_READERS; ++id) {
+    if (registered_[id] != 0) release_reader(id);
+  }
   if (options_.publisher) {
     std::uint64_t expected = OwnProcess();
     header_->writer.owner_pid.compare_exchange_strong(
@@ -858,7 +877,7 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
   return std::nullopt;
 }
 
-void RTMSQueue::release_reader(std::size_t id) {
+void RTMSQueue::release_reader(std::size_t id) noexcept {
   if (header_ == nullptr || id >= MAX_READERS) return;
   // Only a slot this queue claimed in this process -- a forked child
   // inherits its parent's registrations -- and only while it still holds it.
