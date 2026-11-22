@@ -689,9 +689,11 @@ a run killed at any point after that is marked.
 log file could not be created. **Treat it as a robot fault**, next to a
 brownout or a lost CAN device: the rest of the match is not recorded.
 `error()` says why. `capture_stopped()` is the byte cap ending a log that
-cannot rotate. Header writing at startup, explicit `flush()`, shutdown, and
-the opt-in synchronous writer can still block on disk; do not call `flush()`
-from a control callback.
+cannot rotate. With the default background writer, opening the file and
+writing its header run asynchronously on the background thread; only explicit
+`flush()`, shutdown, and the opt-in synchronous writer (including its startup
+header write) block the caller on disk. Do not call `flush()` from a control
+callback.
 
 ## Lateness
 

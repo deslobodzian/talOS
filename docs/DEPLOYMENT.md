@@ -49,7 +49,7 @@ subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
 `studio_bridge` (`//studio/bridge:studio_bridge`) and `studio_webroot`
 (`//studio:web_dist`, the built site), both or neither; the build fails when
 `studio_bridge` is not the config's `[studio] bridge` (when it sets one) or
-the site has no `index.html`. The bench robot and `tools/new_robot`'s robots
+the site has no `index.html` or `drive.html`. The bench robot and `tools/new_robot`'s robots
 inside talOS set both, which add about 2.5 MB; a robot repository made by
 `new_robot --standalone` sets neither, so its deployed robot has no driver
 dashboard until someone builds the pages and adds
@@ -577,11 +577,12 @@ stops the service deliberately. Notifications use `NOTIFY_SOCKET` directly,
 including Linux abstract (`@...`) Unix datagram sockets, without libsystemd.
 
 A stop goes through the launcher alone. `KillMode=mixed` sends systemd's
-SIGTERM only to the launcher, which stops the session in order: SIGINT to
-each member, SIGKILL to any still alive 2 s later (`stop_timeout` in the
-[session manifest](../talOS/launcher/README.md#session-manifest)), then
-the final manifest. systemd SIGKILLs whatever remains once the launcher
-exits, or at `TimeoutStopSec=90`: 90 s against the launcher's 2 s, so the
+SIGTERM only to the launcher, which stops the session in two phases: first
+SIGINT to `hardware_node` (SIGKILL if still alive 500 ms later), then SIGINT to
+the remaining members (SIGKILL to any still alive 2 s later; `stop_timeout` in
+the [session manifest](../talOS/launcher/README.md#session-manifest)), then the
+final manifest. systemd SIGKILLs whatever remains once the launcher exits, or
+at `TimeoutStopSec=90`: 90 s against the launcher's up to 2.5 s, so the
 launcher's own escalation and its final write always come first. systemd's
 default, `KillMode=control-group`, would SIGTERM every member as well, and
 a member that does not hold a stop while starting (`hardware_node`, the

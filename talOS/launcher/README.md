@@ -90,7 +90,7 @@ passes it. Of a launch's refusals before its probes:
 | `--allow-graph-errors` without `--sim`; `--sim-gateway-arg` without `--start-sim-gateway` or naming a port; an unloadable bundle or config; an invalid `--remote` or `--local-address`; `--sim` with a remote other than `127.0.0.1` or a `local_address` other than unset/`127.0.0.1`; a bad restart setting; a duplicate or misnamed member | refused | refused |
 | [`[robot] simulation_only`](#lightweight-simulation-gateway) without `--sim` | accepted | refused |
 | the [session lock](#one-session-per-namespace) held by another launch | not checked | not checked: it is held by the session a check runs beside |
-| the [live registry](../introspection/README.md#prepared-by-the-launcher) cannot be prepared or has no room | not checked | not checked: it is shared memory, and its rows are the running session's |
+| the [live registry](../introspection/README.md#prepared-by-the-launcher) cannot be prepared (registry capacity is checked after probes, once any unanswered Studio bridge is dropped, and is skipped by both modes too) | not checked | not checked: it is shared memory, and its rows are the running session's |
 
 A port the bridges bind is not checked either way: it is bound only by a
 member that has started (the hardware bridge's link, the Studio bridge's
@@ -570,7 +570,7 @@ exits, which the bound above ends, with the reason in `studio_bridge.log`.
 
 ### Refusal visibility (`--serve-refusal`)
 
-On any phase-1 refusal after the launcher acquires `session.lock` (a bad
+On any phase-1 refusal after the launcher acquires the namespace `SessionLock` (a bad
 config, a graph or naming error, `simulation_only` without `--sim`, a full node
 registry, or a failed probe; never on `--describe-only`, `--replay-inputs`, a
 held session lock, or a pre-lock CLI/bundle argument refusal so another live
@@ -580,8 +580,9 @@ atomically writes `<output_dir>/last_refusal.json` (`{"refused": true,
 writable or creatable).
 
 Without `--serve-refusal`, the launcher still exits 1 immediately. With both
-`--serve-refusal` and `--start-studio-bridge` (which `tools/deploy.sh
-enable-boot` passes to the boot service's `run.sh`), the launcher starts the
+`--serve-refusal` and `--start-studio-bridge` (`tools/deploy.sh enable-boot`
+passes `--serve-refusal` to the boot service's `run.sh`, which adds
+`--start-studio-bridge` for bundles carrying Studio), the launcher starts the
 Studio bridge in refusal mode (`--refusal-file <output_dir>/last_refusal.json`,
 using `--studio-http-port`, `[studio] http_port`, or default `5800` and the
 bundle's or configured webroot so even a TOML parse error still serves
@@ -942,8 +943,9 @@ hold and touches no disk. The times it sleeps until:
 | each running member's next look at its registry row (`RunLiveness::NextLook`, the Studio bridge's included): one look interval (its heartbeat timeout / 4) after the last, its stall deadline (the startup grace's end or one heartbeat timeout after the progress last seen, whichever is later), and its construction deadline until a look sees it constructed | `stalled`, `heartbeat_missing`, `construction_deadline`; the row's endpoints, recording and realtime flags and delivery counts, read at each look |
 | each pending restart's start, the Studio bridge's included | the restart backoff, a quarantined member's retry |
 | one settle interval (1 s) after the Studio bridge's last spawn, until that run is up | whether it holds the session open ([Studio bridge](#studio-bridge)) |
+| 20 ms startup polls while waiting to write `sim_schedule_start` (`kSimScheduleStartPoll`, until written or `sim_gateway` exits with no pending restart) or for the bridge run's first `/hw/status` (`kBridgeProtocolPoll`, until its protocol version is checked) | starting `sim_gateway`'s schedule; bridge protocol check |
 | `--duration-s`'s end, until the stop is sent | the stop |
-| the stop timeout (2 s after the stop), until its SIGKILLs are sent | `stop_timeout` |
+| two-phase stop timeouts: first `hardware_node` (500 ms, `kBridgeStopTimeout`), then the remaining members (2 s, `kStopTimeout`), until their SIGKILLs are sent | `stop_timeout` |
 | half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |
 | the hourly refresh of the session lock and of the session directory's `session.lock` and quiet files | [one session per namespace](#one-session-per-namespace), [retention](#session-segments-and-logs) |
 
@@ -1183,7 +1185,8 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   `requests_skipped_by_subsystem` splits the bridge's `requests_skipped` by
   the subsystem whose `/hw/request/<subsystem>` it passed over (only
   nonzero ones). A run, or a node, whose row was never seen (a spawn that
-  failed, Studio's bridge) has none of these fields. A count leaving 0
+  failed) or that reports no delivery-loss counts (Studio's bridge) has none of
+  these fields. A count leaving 0
   posts a manifest version of its own; a later increase waits for the next
   version the launcher posts anyway, at the latest the one the run's end
   posts, so a healthy session adds no version, and a killed launcher loses
@@ -1224,7 +1227,7 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 | `construction_deadline` | was killed for constructing longer than the deadline |
 | `endpoint_mismatch` | was killed, or its session stopped, for [live endpoints](#live-endpoints) that differ from its probe |
 | `stop` | ended as the session's stop (signal, `--duration-s`) asks: exit 0, SIGINT or SIGTERM (which of these leave the launcher's exit status 0: [restarts](#restarts)) |
-| `stop_timeout` | outlived the 2 s after the stop's SIGINT and was killed (SIGKILL) |
+| `stop_timeout` | outlived the stop timeout after its SIGINT (500 ms for `hardware_node`, 2 s for other members) and was killed (SIGKILL) |
 | `spawn_failed` | could not be spawned (`exit_code` -1, `exit_signal` 0) |
 
 A kill of the launcher's own (`stalled`, `heartbeat_missing`,
@@ -1254,7 +1257,9 @@ header:
 
 | Library | Files | Holds |
 |---|---|---|
-| `:session` | `session.h`, `session_lock.h`, `session_retention.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock and session directory lock, what retention reads of a recorded session, the log budget split |
+| `:session` | `session.h`, `session_lock.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock and session directory lock |
+| `:session_retention` | `session_retention.h` | session classification and what retention reads of a recorded session |
+| `:log_budget` | `log_budget.h` | each member's share of the session's event-log budget |
 | `:spawn` | `spawn.h` | `SpawnProcess` (process group, guardian, child reports), `SupervisionWakeup` |
 | `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output), and `LauncherOutput`, the launcher's own stdout, stderr and `talos.log` |
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
@@ -1997,8 +2002,10 @@ its tick's, stamped before that tick's work; the command's is its publication
 on `/hw/command`, after the bridge's merge. So the row measures request tick
 to command publication, the requesting node's work included, not arrival at
 the RoboRIO: `/hw/command` is published and logged only after the bridge's
-UDP send succeeds (`send_failures` and `send_would_block` in the exit line,
-below, count sends that did not go out), though UDP delivery across the wire
+UDP send succeeds (`socket_send_failures_count` and
+`socket_send_would_block_count` on `/hw/status`, and `send_failures` /
+`send_would_block` in the exit line, count sends that did not go out), though
+UDP delivery across the wire
 is still unacknowledged. With several owners the
 merged observation can be an older request's, overstating it. Each sample
 is counted in enabled or disabled time (`bridge_request_to_command`
@@ -2015,10 +2022,13 @@ disabled node's requests are neutral) waits for the bridge's heartbeat
 measures its reaction. The rows are informational: REQ-RT-20's 1 ms bound is verified by
 the bridge's component test. The bridge's `wait_fallbacks` and stalled request topics reach the
 report as its row's `wake_fallbacks` and `stalled_arms` (delivery loss,
-above); its other wake counters (`passes`, `throttled`), socket counters
-(`send_failures`, `socket_reopens`), and UDP stats (`sequence_gaps`,
-`decode_failures`, `send_would_block`) are only in its exit lines on
-stdout, in its [node output](#node-output) log, not in the report.
+above). Its five socket and UDP counters (`send_failures`, `socket_reopens`,
+`sequence_gaps`, `decode_failures`, `send_would_block`) are published on
+`/hw/status` and surfaced in `session_report` (`bridge_socket_counters` in
+`--json`, `Bridge UDP/State loss counters:` in Markdown) as well as its exit
+lines; only its other wake counters (`passes`, `udp`, `request`, `deadline`,
+`throttled`) are only in its exit lines on stdout, in its
+[node output](#node-output) log, not in the report.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
 exports also carry `ds_enabled`, the Driver Station `hardware.enabled` bit,
@@ -2067,7 +2077,8 @@ missed ticks or overruns. A row whose intervals all meet a gap is NOT
 MEASURED, never a pass, and its detail (or, for request to command and the
 latency rows, a line under their table) names how many intervals were left
 out; `--json` gives the counts in `intervals_across_gaps`
-(`bridge_request_to_command`, `state_to_request`, `driver_station_to_lane`,
+(`state_overall`, `state_enabled`, `state_sequence`,
+`bridge_request_to_command`, `state_to_request`, `driver_station_to_lane`,
 `driver_station_to_command`). A session without a gap reports
 exactly as before, with none of these keys.
 

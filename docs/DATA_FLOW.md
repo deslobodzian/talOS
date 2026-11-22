@@ -492,8 +492,8 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
-| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 129 | 2, 1864 B (largest 1168 / 1200 B) | 1 page, 8424 B |
-| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 136 | 2, 1952 B (largest 1168 / 1200 B) | 1 page, 8808 B |
+| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 143 | 2, 2032 B (largest 1168 / 1200 B) | 1 page, 9312 B |
+| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 150 | 2, 2120 B (largest 1168 / 1200 B) | 1 page, 9696 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):
@@ -607,8 +607,8 @@ field bandwidth limit for Vivid Hosting VH-109 radios (and **32 %** of the
 **4.0 Mbit/s** limit for OpenMesh radios) in the 2026 FRC Game Manual
 (Section 8, Rule R704); the event's current allocation is authoritative. A full
 keyframe every tick of the bench's
-physics-simulation graph would be its 1952 B worst case (the telemetry
-table above), 195,200 B/s at 100 Hz, more than the whole budget; the
+physics-simulation graph would be its 2120 B worst case (the telemetry
+table above), 212,000 B/s at 100 Hz, more than the whole budget; the
 change-only updates carry only what changed. The system graph goes to a
 client whole only on connect and when its structure changes; otherwise its
 fast values go at most every 500 ms when they changed

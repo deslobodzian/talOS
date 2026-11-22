@@ -622,8 +622,8 @@ sleep precision. Releasing a lane is not a mechanical brake.
   `wake_failures`, `stalled_arms`, `requests_skipped` or `wake_fallbacks`
   above 0 (NOT
   RECORDED there means a manifest written before the launcher recorded
-  them, or a member whose registry row the launcher never saw: Studio's
-  bridge, which takes none, or a run that failed to spawn). Its "Launcher output" section names any output whose bytes
+  them, a member that reports no delivery-loss counts (Studio's bridge), or a
+  run whose row was never seen (failed to spawn)). Its "Launcher output" section names any output whose bytes
   `talos.log` says were dropped. Keep the
   report with the session. Target age at the tick (from `Target::get` READ
   records) is required to be at most 25 ms on every lane; see
@@ -794,9 +794,9 @@ Mini between sessions.
    and all three `max_voltage` lines read `2.0`.
 5. **The RoboRIO program** of the same revision, from a clean checkout of
    it on either host: from the workstation
-   `(cd controller_processor/rio && ./gradlew deploy -Pcompanion=10.0.0.37)`,
+   `(cd controller_processor/rio && ./gradlew deploy -PteamNumber=5687 -Pcompanion=10.0.0.37)`,
    from the Mini
-   `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -Pcompanion=10.0.0.37)`.
+   `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -PteamNumber=5687 -Pcompanion=10.0.0.37)`.
    Pass: Gradle prints `RoboRIO companion address built in: 10.0.0.37 (from
    -Pcompanion)`, and the RoboRIO console prints `hardware gateway build
    <HEAD> companion 10.0.0.37:5803` without `(dirty)`, `hardware gateway
