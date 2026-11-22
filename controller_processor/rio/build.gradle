@@ -8,8 +8,9 @@ import org.gradle.language.cpp.tasks.CppCompile
 // tests (src/test/cpp) cover only this program's own sources: desktop
 // simulation regressions for the Phoenix backend, the config store, the
 // simulated Driver Station, the Driver Station reader, the logger, the
-// companion link reporter, the loop watchdog, the loop's wake schedule and
-// the loop's console lines;
+// companion link reporter, the loop watchdog, the loop's wake schedule, the
+// loop's Driver Station generations and packet cadence and the loop's console
+// lines;
 // there is no command-based framework.
 plugins {
     id "cpp"
@@ -519,7 +520,10 @@ tasks.register("rioBuildStampTest") {
         // Companion address validation (no built-in default).
         check(companionRefusal('10.0.0.2') == null && companionRefusal('192.168.1.50') == null,
                 'a valid companion IPv4 address was refused')
-        ['', '0.0.0.1', '127.0.0.1', '224.0.0.1', '255.255.255.255', '10.01.0.2', 'robot.local'].each {
+        // REQ-OPS-27: an octet above 255, and 224.0.0.0/3 across its
+        // multicast, reserved (240.0.0.0/4) and broadcast addresses.
+        ['', '0.0.0.1', '127.0.0.1', '224.0.0.1', '240.0.0.1', '255.255.255.255',
+         '10.01.0.2', '10.0.0.256', 'robot.local'].each {
             check(companionRefusal(it) != null, "invalid companion ${it} was accepted")
         }
 

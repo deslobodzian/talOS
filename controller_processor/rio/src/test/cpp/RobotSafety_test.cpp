@@ -5,14 +5,11 @@
 //   2. LoopWatchdog is pre-armed before an enabled Endpoint::Tick() when no
 //      command is active, so a stall inside the first Apply()/ApplyOutputs()
 //      is neutralized (REQ-SAFE-25).
-//   3. ModeTracker observes raw Driver Station flags, so a closed-socket
-//      outage and reopen while DS stays enabled in the same mode does not
-//      bump the mode generation (REQ-SAFE-10).
+// The loop's Driver Station generations are DriverStationSampler_test.cpp's.
 #include "RobotSafety.h"
 
 #include <gtest/gtest.h>
 
-#include <cerrno>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -20,15 +17,11 @@
 #include <vector>
 
 #include "LoopWatchdog.h"
-#include "SocketRetry.h"
-#include "driver_station/driver_station.h"
 
 namespace {
 
-namespace ds = talos::driver_station;
 using talos::rio::LoopWatchdog;
 using talos::rio::ShutdownRioLoop;
-using talos::rio::SocketRetry;
 using talos::rio::WatchdogDeadlineUs;
 using talos::rio::WatchdogPreArmDeadlineUs;
 
@@ -48,8 +41,6 @@ class RecordingWatchdogOutputs final : public talos::rio::WatchdogOutputs {
 
 constexpr uint64_t kPeriodUs = 5'000;
 constexpr uint32_t kTimeoutUs = 100'000;
-constexpr uint32_t kTeleopEnabled =
-    ds::kDsAttached | ds::kEnabled | ds::kTeleop;
 
 // Defect 1: when EndCompetition() exits the loop while outputs are energized
 // and no configure is running, outputs must be neutralized BEFORE
@@ -214,55 +205,6 @@ TEST(RobotSafety, WatchdogPreArmRefinementDisarmAndOverflowSafety) {
   // Degenerate zero-clock, zero-timeout, zero-period still never returns 0
   // (which would disarm LoopWatchdog).
   EXPECT_EQ(WatchdogPreArmDeadlineUs(0, /*enabled=*/true, 0, 0, 0), 1u);
-}
-
-// Same-mode link-drop contract (REQ-SAFE-10, ARCHITECTURE.md "Targets"):
-// Robot.cpp calls ds_mode.Observe(mode_flags, now_us) on the raw Driver Station
-// flags regardless of whether the companion UDP socket is currently open. A
-// closed-socket tick and 100 ms SocketRetry reopen while DS stays enabled in
-// the same mode must NOT bump ModeTracker's mode generation.
-// REQ-SAFE-10
-TEST(RobotSafety, ClosedSocketOutageDoesNotAdvanceModeGenerationInSameMode) {
-  SocketRetry retry;
-  ds::ModeTracker tracker;
-
-  auto stamp = [&](uint64_t now_us, uint32_t raw_flags) {
-    ds::DriverStationData packet{};
-    packet.sample_time_us = now_us;
-    packet.fms.flags = raw_flags;
-    tracker.Stamp(packet);
-    return packet.mode_since_us;
-  };
-
-  // Tick 1: socket opens and teleop is enabled.
-  const uint64_t t1 = 1'000'000;
-  ASSERT_EQ(retry.Poll(t1, [] { return true; }), SocketRetry::Event::kOpened);
-  ASSERT_TRUE(retry.open());
-  tracker.Observe(kTeleopEnabled, t1);
-  const uint64_t gen_before = stamp(t1, kTeleopEnabled);
-  ASSERT_NE(gen_before, 0u);
-
-  // Permanent UDP send error closes the socket on tick 1.
-  ASSERT_EQ(retry.SendFailed(t1, ENETUNREACH), SocketRetry::SendEvent::kLost);
-  ASSERT_FALSE(retry.open());
-
-  // Tick 2 (5 ms later, < SocketRetry::kPeriodUs): socket stays closed while
-  // raw DS flags remain kTeleopEnabled; ModeTracker still observes raw flags.
-  const uint64_t t2 = t1 + kPeriodUs;
-  ASSERT_EQ(retry.Poll(t2, [] { return true; }), SocketRetry::Event::kNone);
-  ASSERT_FALSE(retry.open());
-  tracker.Observe(kTeleopEnabled, t2);
-
-  // Tick 3 (100 ms after t1): socket reopens while DS stayed enabled in teleop.
-  const uint64_t t3 = t1 + SocketRetry::kPeriodUs;
-  ASSERT_EQ(retry.Poll(t3, [] { return true; }), SocketRetry::Event::kReplaced);
-  ASSERT_TRUE(retry.open());
-  tracker.Observe(kTeleopEnabled, t3);
-  const uint64_t gen_after = stamp(t3, kTeleopEnabled);
-
-  EXPECT_EQ(gen_after, gen_before)
-      << "same-mode closed-socket link drop bumped mode generation from "
-      << gen_before << " to " << gen_after;
 }
 
 }  // namespace

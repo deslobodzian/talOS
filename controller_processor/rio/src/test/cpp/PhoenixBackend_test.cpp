@@ -2444,7 +2444,10 @@ TEST_F(PhoenixBackendTorque, AnOutOfContractRequestIsNeutralOut) {
 // Every NeutralOut that Apply sends (direct kNeutral, a neutralized follower,
 // and an out-of-contract torque-current request) must be one-shot (0 Hz),
 // matching Neutral() and WatchdogNeutral(), so Phoenix's background control
-// thread does not keep resending periodic 20 Hz frames.
+// thread does not keep resending periodic 20 Hz frames. And the gateway's
+// neutral, Neutral(), is that one-shot NeutralOut on every configured motor,
+// whatever each was driving: a master, its follower and a torque-current
+// motor.
 // REQ-SAFE-43
 TEST_F(PhoenixBackendTorque, EveryApplyNeutralOutIsOneShot) {
   EnsureHal();
@@ -2487,6 +2490,12 @@ TEST_F(PhoenixBackendTorque, EveryApplyNeutralOutIsOneShot) {
   expect_one_shot_neutral(0, "direct kNeutral");
   expect_one_shot_neutral(1, "follower neutral");
   expect_one_shot_neutral(2, "out-of-contract torque current");
+
+  ASSERT_TRUE(ApplySent(backend, drive));
+  ASSERT_EQ(AppliedControl(backend, 2), "TorqueCurrentFOC");
+  backend.Neutral();
+  for (std::size_t i = 0; i < config.motors.size(); ++i)
+    expect_one_shot_neutral(i, "Neutral() on " + config.motors[i].name);
 }
 
 class PhoenixBackendPeakVoltage : public PhoenixBackendTorque {};

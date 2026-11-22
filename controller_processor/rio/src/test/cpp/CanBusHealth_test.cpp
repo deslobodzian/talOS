@@ -391,7 +391,7 @@ TEST(CanBusSampler, RunsForEveryConfigWithADeviceAndStopsReadingDroppedBuses) {
 // The loop's copy never waits on a read in flight: with the reader blocked
 // in one bus's vendor call, a Poll returns at once with what the other bus's
 // finished read published.
-// REQ-OPS-20, REQ-RT-13
+// REQ-OPS-20
 TEST(CanBusSampler, TheLoopCopiesWithoutWaitingOnAReadInFlight) {
   CanBusHealth health;
   auto gate = std::make_shared<Gate>();
