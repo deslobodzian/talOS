@@ -1173,5 +1173,114 @@ TEST(RealtimeEventLoop, DeliveryIsFixedOnceTheRunStarts) {
   EXPECT_EQ(loop.delivery(), Delivery::BEFORE_TIMERS);
 }
 
+// A sequence watcher (such as HardwareLink on /hw/state) with more than
+// max_messages_per_tick (64) messages queued before a timer fires must be
+// drained completely before the timer callback runs, so update() + Flush()
+// never actuate on stale state from message #64 when newer frames are already
+// in shared memory.
+// REQ-SAFE-01
+// REQ-RT-04
+TEST(RealtimeEventLoop, TimerDrainsFullSequenceBacklogBeforeDispatching) {
+  constexpr int kQueued = 80;  // over max_messages_per_tick (64), under ring
+  const std::string pid = std::to_string(::getpid());
+  int index = 0;
+  for (const auto delivery :
+       {Delivery::POLL, Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
+    const std::string topic = "/tbkl_" + pid + "_" + std::to_string(index++);
+    RealtimeEventLoop<> loop{on_publish()};
+    loop.set_delivery(delivery);
+    if (delivery == Delivery::ON_PUBLISH) {
+      loop.set_prompt(register_sensor_watcher(
+          loop, "/tbkp_" + pid + "_" + std::to_string(index)));
+    }
+    int received = 0;
+    std::int32_t last_value = 0;
+    auto on_message = [&](const Context&, std::span<const std::byte> bytes) {
+      ASSERT_EQ(bytes.size(), sizeof(EventsTest::SensorMessage));
+      EventsTest::SensorMessage message{};
+      std::memcpy(&message, bytes.data(), sizeof(message));
+      last_value = message.sensor_id();
+      ++received;
+    };
+    register_sensor_watcher(loop, topic, make_thunk(&on_message));
+
+    int observed_count = 0;
+    std::int32_t observed_value = 0;
+    auto on_timer = [&](const Context&) {
+      observed_count = received;
+      observed_value = last_value;
+      loop.exit();
+    };
+    const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+    loop.arm_timer(timer_id, loop.monotonic_now(), Duration::zero());
+
+    SensorWriter writer{topic};
+    for (int i = 1; i <= kQueued; ++i) {
+      ASSERT_TRUE(writer.publish(i));
+    }
+
+    loop.run_for(kHangBound);  // Bound only; on_timer exits.
+    EXPECT_EQ(observed_count, kQueued);
+    EXPECT_EQ(observed_value, kQueued);
+  }
+}
+
+// Pre-timer backlog draining must stay bounded so a continuously flooded
+// sequence topic cannot spin forever and starve timers (RULES.md 3).
+// REQ-RT-04
+TEST(RealtimeEventLoop, PreTimerBacklogDrainIsBoundedUnderFlood) {
+  constexpr std::size_t kSlots = 128;
+  constexpr std::size_t kCap = 16;
+  constexpr std::size_t kMaxPasses = (kSlots + kCap - 1) / kCap + 1;
+  constexpr std::size_t kExpectedMaxDrained = kMaxPasses * kCap;
+  constexpr std::size_t kSafetyCap = kSlots * 4;
+
+  const std::string topic = "/tfl_" + std::to_string(::getpid());
+  RealtimeEventLoop<>::Options options;
+  options.slots = kSlots;
+  options.max_messages_per_tick = kCap;
+  options.delivery = Delivery::BEFORE_TIMERS;
+
+  RealtimeEventLoop<> loop{options};
+  std::optional<RTMSQueue> publisher;
+  std::size_t delivered = 0;
+  auto on_message = [&](const Context&) {
+    ++delivered;
+    if (delivered < kSafetyCap) {
+      const EventsTest::SensorMessage next{static_cast<std::int32_t>(delivered),
+                                           0.0F, 0.0F};
+      ASSERT_EQ(publisher->write(std::as_bytes(
+                    std::span<const EventsTest::SensorMessage, 1>{&next, 1})),
+                WriteResult::SUCCESS);
+    }
+  };
+  register_sensor_watcher(loop, topic, make_thunk(&on_message));
+
+  bool timer_fired = false;
+  std::size_t delivered_before_timer = 0;
+  auto on_timer = [&](const Context&) {
+    timer_fired = true;
+    delivered_before_timer = delivered;
+    loop.exit();
+  };
+  const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+  loop.arm_timer(timer_id, loop.monotonic_now(), Duration::zero());
+
+  publisher.emplace(topic, sizeof(EventsTest::SensorMessage),
+                    alignof(EventsTest::SensorMessage),
+                    talos::schema::Of<EventsTest::SensorMessage>(), kSlots,
+                    RTMSOptions{.publisher = true});
+  const EventsTest::SensorMessage seed{0, 0.0F, 0.0F};
+  ASSERT_EQ(publisher->write(std::as_bytes(
+                std::span<const EventsTest::SensorMessage, 1>{&seed, 1})),
+            WriteResult::SUCCESS);
+
+  loop.run_for(kHangBound);  // Bound only; on_timer exits.
+  EXPECT_TRUE(timer_fired);
+  EXPECT_GE(delivered_before_timer, kSlots);
+  EXPECT_LE(delivered_before_timer, kExpectedMaxDrained);
+}
+
 }  // namespace
 }  // namespace talos::event
