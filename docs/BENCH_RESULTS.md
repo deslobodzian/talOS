@@ -22,6 +22,44 @@ Hosts named below: the **bench** is BENCH.md's RoboRIO (image
 FRC_roboRIO_2026_v1.2, two cores) and CAN devices; the **Linux workstation**
 has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
+## 2026-11-22
+
+Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
+`820a06d5`, no hardware attached (`TODO.md` `MAC-1`, `INC-3`, `DEPLOY-10`):
+
+- **MAC-1: `tools/mac_qualify.sh` full build, suite, configs, and warm spawns.**
+  - `bazel build //...`: PASS (41 s); `bazel test --test_output=errors //...`:
+    PASS (118 s, 100% green); all 6 `--describe-only` configs (`robot.toml`,
+    `robot_py.toml`, `robot_bench.toml`, `robot_physics_sim.toml`,
+    `examples/superstructure/config/{robot,robot_py}.toml`): PASS.
+  - `tools/deploy.sh boot-check`: FAIL as expected under `DEPLOY-8` (`FileVault
+    is On`, `pmset autorestart 0`, `pmset sleep 0`, automatic macOS updates
+    enabled).
+  - Warm Python node spawn → event-loop origin (no `sudo purge`, so warm page
+    cache; startup grace 5000 ms): `gyro` 106.0 ms first launch / 131.2–133.7 ms
+    restarts; `motor` 107.3 ms first launch / 120.0–121.0 ms restarts.
+- **INC-3: `//talOS/launcher:restart_latency` on `swerve_module` (10/10 SIGKILLs).**
+  - Idle: total **26.4 ms** median (range **25.2–31.1 ms**; `SIGKILL → origin`
+    18.8 ms median, 18.0–19.9 ms).
+  - Under `--disk-load 8` (8 writers rewriting and syncing 256 MiB files): total
+    **11.1 ms** median (range **10.4–357.7 ms**; per kill: 15.8, **357.7**,
+    10.6, 10.8, 10.4, 10.6, 36.9, 77.4, 11.3, 10.8 ms). The single **357.7 ms**
+    outlier (`SIGKILL → origin` 351.0 ms) exceeds the 300 ms frozen-driver
+    window even on M4 Pro, keeping `INC-3` open.
+- **DEPLOY-10: `//bench/main_processor:bench_bundle` (with Studio) `SIGTERM` stop.**
+  - Five consecutive runs of `bench_bundle/run.sh --sim --remote 127.0.0.1
+    --studio-http-port 0` stopped with `SIGTERM`: 5/5 exited 0 in **79.7–88.9 ms**
+    (median **84.2 ms**), against explicit launchd `ExitTimeOut = 90` s.
+
+Linux workstation (8 cores), commit `820a06d5`, loaded (concurrent worker Bazel
+builds running in sibling worktrees; `TODO.md` `TEST-24`):
+
+- **TEST-24: `//studio:drive_browser_test` 200/200 PASS on loaded Linux.**
+  - `bazel test --runs_per_test=200 --test_output=errors
+    --test_env=TALOS_REQUIRE_BROWSER=1 //studio:drive_browser_test`: **200/200
+    PASSED** (min 2.3 s, avg 2.5 s, max 3.3 s, dev 0.2 s; elapsed 506.4 s),
+    zero timeouts waiting for the Studio bridge's `listening` line.
+
 ## 2026-11-21
 
 Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commits `d942b0b8` and
