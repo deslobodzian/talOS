@@ -243,6 +243,8 @@ bool ReleaseCountedLifetime(RTMSHeader& header) noexcept {
 
 }  // namespace
 
+void (*RTMSQueue::on_reclaim_wait_)(std::uint64_t, int) = nullptr;
+
 RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
                      std::size_t message_alignment,
                      const talos::schema::Identity& schema, std::size_t slots,
@@ -301,6 +303,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     ::shm_unlink(ShmObjectName(path_).c_str());
   }
 
+  std::optional<std::uint64_t> closing_segment_id;
   int closing_waits = 0;
   int reclaim_waits = 0;
   bool reclaimed = false;
@@ -403,6 +406,14 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       }
     }
     if (closing) {
+      const std::uint64_t segment_id = header->segment_id;
+      if (!closing_segment_id.has_value() ||
+          *closing_segment_id != segment_id) {
+        closing_segment_id = segment_id;
+        closing_waits = 0;
+        reclaim_waits = 0;
+        reclaimed = false;
+      }
       // Its last holder is unlinking it; the next shm_open creates a fresh
       // segment once the name is gone.
       if (!reclaimed && closing_waits + 1 < kOpenAttempts) {
@@ -415,24 +426,27 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       // segment -- never a newer one under the name -- is unlinked here by
       // whichever opener claims kLifetimeReclaiming, unless a live process
       // still holds its writer claim or a reader slot. Concurrent openers
-      // that lose the claim wait briefly for the winner's unlink and retry.
+      // that lose the claim wait up to kOpenAttempts retries for the winner's
+      // unlink before superseding a winner that died before UnlinkIfSame().
       if (!reclaimed && !HeldByLiveProcess(*header)) {
-        if ((header->lifetime.fetch_or(kLifetimeReclaiming,
-                                       std::memory_order_acq_rel) &
-             kLifetimeReclaiming) == 0) {
+        const std::uint64_t prior = header->lifetime.fetch_or(
+            kLifetimeReclaiming, std::memory_order_acq_rel);
+        const bool won_claim = (prior & kLifetimeReclaiming) == 0;
+        if (won_claim || reclaim_waits >= kOpenAttempts) {
           std::fprintf(stderr,
-                       "rtms: reclaiming shared memory %s, whose last holder "
-                       "died before unlinking it\n",
-                       path_.c_str());
-          UnlinkIfSame(path_, header->segment_id);
+                       "rtms: reclaiming shared memory %s, whose %s died "
+                       "before unlinking it\n",
+                       path_.c_str(), won_claim ? "last holder" : "reclaimer");
+          UnlinkIfSame(path_, segment_id);
           reclaimed = true;
           continue;
         }
-        if (reclaim_waits < kOpenAttempts) {
-          ++reclaim_waits;
-          ::usleep(kInitRetryUs);
-          continue;
+        ++reclaim_waits;
+        if (on_reclaim_wait_ != nullptr) {
+          on_reclaim_wait_(segment_id, reclaim_waits);
         }
+        ::usleep(kInitRetryUs);
+        continue;
       }
       break;
     }
