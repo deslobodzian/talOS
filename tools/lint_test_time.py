@@ -1,4 +1,4 @@
-"""Lints tests and node code for wall-clock time and test retries.
+"""Lints tests and node code for wall-clock time, randomness, and test retries.
 
     python3 tools/lint_test_time.py   # from the workspace root
 
@@ -10,7 +10,17 @@ tracked files it finds:
 - `clock`: a wall-clock read (`steady_clock::now`, `system_clock::now`,
   `high_resolution_clock::now`, the same through an alias the file declares,
   `using Clock = std::chrono::steady_clock;` then `Clock::now()`,
-  `time.time(`, `time.monotonic(`) in the same files;
+  `time.time(`, `time.monotonic(`) in test sources and node code, and in node
+  code additionally `clock_gettime(`, `gettimeofday(`, `Poller::now(` (and
+  aliases of `Poller`), `std::time(`, `utc_clock`/`tai_clock`/`gps_clock`/
+  `file_clock::now(`, and Python `time.monotonic_ns(`, `time.time_ns(`,
+  `time.perf_counter[_ns](`, `time.process_time[_ns](`, `datetime.now(`,
+  `datetime.utcnow(`, `datetime.today(`, `import time`, `from time import`;
+- `random`: a randomness API in node code (`std::rand`/`rand`/`srand`,
+  `drand48`/`lrand48`/`mrand48`, `arc4random*`, C++ `<random>` engines
+  `mt19937[_64]`, `default_random_engine`, `minstd_rand[0]`, `ranlux*`,
+  `knuth_b`, and in Python `random.*`, `import random`, `from random import`,
+  `os.urandom(`, `secrets.*`);
 - `retry`: `flaky = True` or `--flaky_test_attempts` in a BUILD or `.bzl`
   file, `.bazelrc`, a workflow or a shell script.
 
@@ -34,7 +44,7 @@ sources too: there `sleep` is a `setTimeout(` call and `clock` a
 
 An integration, e2e, soak or perf test may use the real clock (§2); it is
 listed in tools/lint_test_time_allowlist.txt, one `<path> <kind> [<count>]
-<reason>` per line, where kind is sleep, clock or retry and count, a
+<reason>` per line, where kind is sleep, clock, random or retry and count, a
 positive number, is how many lines of that file hit that kind (a reason
 therefore does not start with a digit). A hit not listed fails, and so does
 a listed (path, kind) with no hit left; with a count, so do more hits than
@@ -60,8 +70,46 @@ TIME_PATTERNS = {
     "sleep": re.compile(r"\b(sleep_for|sleep_until|usleep|nanosleep|sleep)"
                         r"\s*\("),
     "clock": re.compile(r"\b(steady_clock|system_clock|high_resolution_clock)"
-                        r"::now\s*\(|\btime\.(time|monotonic)\s*\("),
+                        r"\s*::\s*now\s*\(|\btime\.(time|monotonic)\s*\("),
 }
+# Node code (non-test sources in node packages) is additionally barred from
+# POSIX/Poller/Python wall-clock APIs and randomness (REQ-RT-17; METHODOLOGY §9).
+NODE_TIME_PATTERNS = {
+    "sleep": TIME_PATTERNS["sleep"],
+    "clock": re.compile(
+        TIME_PATTERNS["clock"].pattern +
+        r"|\b(?:utc_clock|tai_clock|gps_clock|file_clock)\s*::\s*now\s*\(" +
+        r"|\b(?:clock_gettime|gettimeofday)\s*\(" +
+        r"|\bPoller\s*::\s*now\s*\(" +
+        r"|\bstd\s*::\s*time\s*\(" +
+        r"|\btime\.(?:time_ns|monotonic_ns|perf_counter(?:_ns)?|"
+        r"process_time(?:_ns)?)\s*\(" +
+        r"|\bdatetime\.(?:now|utcnow|today)\s*\("
+    ),
+    "random": re.compile(
+        r"(?<![.>])\b(?:std\s*::\s*)?(?:s?rand|drand48|lrand48|mrand48|"
+        r"arc4random(?:_uniform|_buf)?)\s*\(" +
+        r"|\b(?:std\s*::\s*)?(?:mt19937(?:_64)?|default_random_engine|"
+        r"minstd_rand0?|ranlux24_base|ranlux48_base|ranlux24|ranlux48|"
+        r"knuth_b)\b"
+    ),
+}
+# Python-only node patterns (scoped to `.py` files so C++ struct members such
+# as `random.value` never false-positive).
+PY_NODE_CLOCK_EXTRA = re.compile(
+    r"(?:^|;)\s*from\s+time\s+import\b"
+    r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*time\b"
+)
+PY_NODE_RANDOM_PATTERN = re.compile(
+    r"\brandom\.\w+"
+    r"|(?:^|;)\s*from\s+random\s+import\b"
+    r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*random\b"
+    r"|\bos\.urandom\s*\("
+    r"|(?:^|;)\s*from\s+os\s+import\b[^\n;#]*\burandom\b"
+    r"|\bsecrets\.\w+"
+    r"|(?:^|;)\s*from\s+secrets\s+import\b"
+    r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*secrets\b"
+)
 # `using Clock = std::chrono::steady_clock;` or a typedef of one: the alias's
 # `::now(` is a clock read too.
 CLOCK_ALIAS = re.compile(r"\busing\s+(\w+)\s*=\s*(?:std\s*::\s*)?"
@@ -71,6 +119,16 @@ CLOCK_ALIAS = re.compile(r"\busing\s+(\w+)\s*=\s*(?:std\s*::\s*)?"
                          r"(?:chrono\s*::\s*)?"
                          r"(?:steady_clock|system_clock|high_resolution_clock)"
                          r"\s+(\w+)\s*;")
+# `using P = talos::event::Poller;` (or C++20 clocks) in node code: `P::now()`
+# reads the clock.
+NODE_CLOCK_ALIAS = re.compile(
+    r"\busing\s+(\w+)\s*=\s*(?:(?:talos|event)\s*::\s*)*Poller\s*;"
+    r"|\btypedef\s+(?:(?:talos|event)\s*::\s*)*Poller\s+(\w+)\s*;"
+    r"|\busing\s+(\w+)\s*=\s*(?:std\s*::\s*)?(?:chrono\s*::\s*)?"
+    r"(?:utc_clock|tai_clock|gps_clock|file_clock)\s*;"
+    r"|\btypedef\s+(?:std\s*::\s*)?(?:chrono\s*::\s*)?"
+    r"(?:utc_clock|tai_clock|gps_clock|file_clock)\s+(\w+)\s*;"
+)
 TS_TIME_PATTERNS = {
     "sleep": re.compile(r"\bsetTimeout\s*\("),
     "clock": re.compile(r"\b(Date|performance)\.now\s*\("),
@@ -285,16 +343,31 @@ def scan(files, read):
     for path in files:
         patterns = {}
         stripped = None
-        if (is_test_source(path) or is_test_helper(path) or
-                (path.endswith(SOURCE_SUFFIXES) and
-                 in_package(path, packages))):
+        is_test = is_test_source(path) or is_test_helper(path)
+        is_node = (not is_test and path.endswith(SOURCE_SUFFIXES) and
+                   in_package(path, packages))
+        if is_test:
             patterns.update(TIME_PATTERNS)
+        elif is_node:
+            patterns.update(NODE_TIME_PATTERNS)
+            if path.endswith(".py"):
+                patterns["clock"] = re.compile(
+                    patterns["clock"].pattern + "|" +
+                    PY_NODE_CLOCK_EXTRA.pattern)
+                patterns["random"] = PY_NODE_RANDOM_PATTERN
+        if is_test or is_node:
             stripped = strip_comments(read(path), path)
             aliases = {a or b for a, b in CLOCK_ALIAS.findall(stripped)}
+            if is_node:
+                aliases |= {
+                    name
+                    for groups in NODE_CLOCK_ALIAS.findall(stripped)
+                    for name in groups if name
+                }
             if aliases:
                 patterns["clock"] = re.compile(
-                    TIME_PATTERNS["clock"].pattern + r"|\b(" +
-                    "|".join(sorted(aliases)) + r")::now\s*\(")
+                    patterns["clock"].pattern + r"|\b(" +
+                    "|".join(sorted(aliases)) + r")\s*::\s*now\s*\(")
         if is_studio_test(path):
             patterns.update(TS_TIME_PATTERNS)
         if is_retry_config(path):
@@ -324,9 +397,9 @@ def parse_allowlist(text):
             count = int(first) if first.isdigit() and int(first) > 0 else 0
             fields[2] = reason.strip()
         if (len(fields) < 3 or not fields[2] or count == 0 or
-                fields[1] not in ("sleep", "clock", "retry")):
+                fields[1] not in ("sleep", "clock", "random", "retry")):
             errors.append(f"{ALLOWLIST}:{number}: want `<path> sleep|clock|"
-                          f"retry [<count>] <reason>`: {line}")
+                          f"random|retry [<count>] <reason>`: {line}")
             continue
         entries[(fields[0], fields[1])] = count
     return entries, errors
@@ -343,10 +416,16 @@ def lint(files, read, allowlist_text, out=sys.stdout):
         where = ", ".join(str(n) for n in lines)
         if (path, kind) not in allowed:
             failures += 1
-            print(f"{path}:{where}: {kind} (docs/TESTING.md §6.1, §8.1; "
-                  f"METHODOLOGY.md §9). Wait on an event, take the clock as "
-                  f"a parameter, or list it in {ALLOWLIST} with its reason.",
-                  file=out)
+            if kind == "random":
+                print(f"{path}:{where}: {kind} (METHODOLOGY.md §9; REQ-RT-17)."
+                      f" Node code must be deterministic; remove randomness "
+                      f"or list it in {ALLOWLIST} with its reason.",
+                      file=out)
+            else:
+                print(f"{path}:{where}: {kind} (docs/TESTING.md §6.1, §8.1; "
+                      f"METHODOLOGY.md §9). Wait on an event, take the clock "
+                      f"as a parameter, or list it in {ALLOWLIST} with its "
+                      f"reason.", file=out)
             continue
         count = allowed[(path, kind)]
         if count is not None and len(lines) > count:
