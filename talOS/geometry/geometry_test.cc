@@ -8,6 +8,7 @@
 
 #include <Eigen/Dense>
 #include <cmath>
+#include <limits>
 #include <random>
 
 #include "talOS/geometry/lie.h"
@@ -315,9 +316,15 @@ TEST(SE2, DiscretizeMatchesIndependentLogOracle) {
                             1e-13));
   EXPECT_TRUE(SE2<double>::Discretize(1.0, -0.5, 0.0, 0.02)
                   .isApprox(Eigen::Vector3d(0.0, 1.0, -0.5), 1e-15));
-  for (const double period : {0.0, -0.1}) {
-    EXPECT_TRUE(SE2<double>::Discretize(1.0, -0.5, 2.0, period)
-                    .isApprox(Eigen::Vector3d(2.0, 1.0, -0.5), 1e-15));
+  for (const double period :
+       {0.0, -0.1, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity()}) {
+    const Eigen::Vector3d twist =
+        SE2<double>::Discretize(1.0, -0.5, 2.0, period);
+    EXPECT_TRUE(twist.allFinite()) << period;
+    EXPECT_TRUE(twist.isApprox(Eigen::Vector3d(2.0, 1.0, -0.5), 1e-15))
+        << period;
   }
 }
 
