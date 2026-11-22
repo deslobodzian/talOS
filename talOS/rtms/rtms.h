@@ -153,6 +153,8 @@ inline constexpr std::uint64_t kRtmsVersion = 9;
 // RTMSHeader::lifetime: a session-owned flag, a closing flag, an exclusive
 // reclamation flag for an abandoned closing segment, and the count of queues
 // attached to a segment that is not session-owned.
+// kLifetimeReclaiming assumes single-bundle builds (same kRtmsVersion): all
+// peers sharing a standalone segment are built together and observe it.
 inline constexpr std::uint64_t kLifetimeSessionOwned = 1ULL << 63;
 inline constexpr std::uint64_t kLifetimeClosing = 1ULL << 62;
 inline constexpr std::uint64_t kLifetimeReclaiming = 1ULL << 61;
@@ -328,6 +330,10 @@ class RTMSQueue {
 
   // Number of times a read retries when the writer laps it mid-read.
   static constexpr int MAX_READ_ATTEMPTS = 8;
+
+  // Test seam, null in production: invoked by open() each time a loser yields
+  // while waiting for an existing kLifetimeReclaiming claim on `segment_id`.
+  static void (*on_reclaim_wait_)(std::uint64_t segment_id, int wait_count);
 
   // Whether reader slot `reader_id` still holds the word this queue claimed
   // it with. Another process that judged this one dead may have freed the

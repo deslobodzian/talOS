@@ -72,6 +72,10 @@ class RegistrationPeer {
   static const RTMSHeader* Header(const RTMSQueue& queue) {
     return queue.header_;
   }
+
+  static void SetOnReclaimWait(void (*callback)(std::uint64_t, int)) {
+    RTMSQueue::on_reclaim_wait_ = callback;
+  }
 };
 
 }  // namespace talos::rtms_test
@@ -528,22 +532,162 @@ TEST(RingRegistration, ConcurrentOpenersReclaimingClosingSegmentShareOne) {
 }
 
 // REQ-OPS-03: an opener encountering a closing segment whose reclamation is
-// already claimed (kLifetimeReclaiming) must not unlink it and must fail closed
-// once its wait expires if the reclaimer never finishes.
+// already claimed (kLifetimeReclaiming):
+// (a) yields to a live/recent claim rather than racing into UnlinkIfSame()
+//     immediately, attaching to the winner's replacement segment once ready;
+// (b) eventually supersedes and reclaims an abandoned/stalled claim whose
+//     winner died before UnlinkIfSame() instead of wedging permanently; and
+// (c) resets its wait budget if a different closing segment_id appears
+// mid-loop.
 TEST(RingRegistration, OpenerDoesNotUnlinkAlreadyClaimedClosingSegment) {
   constexpr std::size_t kSlots = 4;
-  const std::string path = MakeUniquePath("/ring_reclaim_claimed");
-  auto [old_mapping, old_segment_id] = MakeAbandonedClosingSegment(
-      path, kSlots, kLifetimeClosing | kLifetimeReclaiming);
 
-  EXPECT_THROW((void)OpenSubscriber(path, kSlots), std::runtime_error);
+  struct HookGuard {
+    ~HookGuard() { RegistrationPeer::SetOnReclaimWait(nullptr); }
+  } guard;
 
-  // The closing segment must still exist untouched under `path`.
-  SharedMemoryPtr probe{path, sizeof(RTMSHeader)};
-  EXPECT_EQ(probe.mode(), SharedMemoryMode::ATTACH);
-  const auto* probe_header = static_cast<const RTMSHeader*>(probe.ptr());
-  EXPECT_EQ(probe_header->segment_id, old_segment_id);
-  ::shm_unlink(ShmObjectName(path).c_str());
+  // (a) Live/recent claim: loser yields while winner finishes UnlinkIfSame()
+  // and creates a fresh segment; loser then attaches to that winner segment.
+  {
+    const std::string path = MakeUniquePath("/ring_reclaim_live");
+    auto [old_mapping, old_segment_id] = MakeAbandonedClosingSegment(
+        path, kSlots, kLifetimeClosing | kLifetimeReclaiming);
+
+    struct LiveState {
+      std::string path;
+      std::size_t slots{0};
+      std::uint64_t old_segment_id{0};
+      int wait_calls{0};
+      bool untouched_on_first_wait{false};
+      std::optional<RTMSQueue> winner;
+      std::uint64_t winner_segment_id{0};
+    };
+    static LiveState* live = nullptr;
+    LiveState state{path, kSlots, old_segment_id};
+    live = &state;
+    RegistrationPeer::SetOnReclaimWait(
+        [](std::uint64_t segment_id, int wait_count) {
+          ++live->wait_calls;
+          if (wait_count == 1) {
+            SharedMemoryPtr probe{live->path, sizeof(RTMSHeader)};
+            const auto* hdr = static_cast<const RTMSHeader*>(probe.ptr());
+            live->untouched_on_first_wait =
+                probe.mode() == SharedMemoryMode::ATTACH &&
+                segment_id == live->old_segment_id &&
+                hdr->segment_id == live->old_segment_id;
+          } else if (wait_count == 2) {
+            ::shm_unlink(ShmObjectName(live->path).c_str());
+            live->winner.emplace(OpenSubscriber(live->path, live->slots));
+            live->winner_segment_id =
+                RegistrationPeer::Header(*live->winner)->segment_id;
+          }
+        });
+
+    RTMSQueue loser = OpenSubscriber(path, kSlots);
+    RegistrationPeer::SetOnReclaimWait(nullptr);
+    live = nullptr;
+
+    EXPECT_EQ(state.wait_calls, 2);
+    EXPECT_TRUE(state.untouched_on_first_wait)
+        << "loser must yield on kLifetimeReclaiming rather than unlink "
+           "immediately";
+    ASSERT_TRUE(state.winner.has_value());
+    ASSERT_NE(state.winner_segment_id, old_segment_id);
+    EXPECT_EQ(RegistrationPeer::Header(loser)->segment_id,
+              state.winner_segment_id);
+    EXPECT_EQ(RegistrationPeer::Header(loser)->lifetime.load(
+                  std::memory_order_acquire) &
+                  kLifetimeCountMask,
+              2U);
+  }
+
+  // (b) Abandoned/stalled claim: winner died before UnlinkIfSame(). After
+  // exhausting its reclaim wait budget, the opener supersedes and reclaims the
+  // segment rather than failing permanently.
+  {
+    const std::string path = MakeUniquePath("/ring_reclaim_stalled");
+    auto [old_mapping, old_segment_id] = MakeAbandonedClosingSegment(
+        path, kSlots, kLifetimeClosing | kLifetimeReclaiming);
+
+    struct StalledState {
+      std::uint64_t expected_segment_id{0};
+      int max_wait_count{0};
+      bool segment_matched_every_wait{true};
+    };
+    static StalledState* stalled = nullptr;
+    StalledState state{old_segment_id};
+    stalled = &state;
+    RegistrationPeer::SetOnReclaimWait(
+        [](std::uint64_t segment_id, int wait_count) {
+          stalled->max_wait_count = wait_count;
+          if (segment_id != stalled->expected_segment_id) {
+            stalled->segment_matched_every_wait = false;
+          }
+        });
+
+    RTMSQueue reopened = OpenSubscriber(path, kSlots);
+    RegistrationPeer::SetOnReclaimWait(nullptr);
+    stalled = nullptr;
+
+    EXPECT_GT(state.max_wait_count, 1)
+        << "opener must exhaust reclaim wait budget before superseding";
+    EXPECT_TRUE(state.segment_matched_every_wait);
+    EXPECT_NE(RegistrationPeer::Header(reopened)->segment_id, old_segment_id);
+    EXPECT_EQ(RegistrationPeer::Header(reopened)->lifetime.load(
+                  std::memory_order_acquire) &
+                  kLifetimeCountMask,
+              1U);
+    EXPECT_EQ(reopened.writer_sequence(), 0U);
+  }
+
+  // (c) Segment rotation mid-retry: if a second closing segment replaces the
+  // first right as reclaim_waits reaches its budget, per-segment wait counters
+  // reset so the new segment receives its full reclaim wait budget too.
+  {
+    const std::string path = MakeUniquePath("/ring_reclaim_rotated");
+    auto [seg1_mapping, seg1_id] = MakeAbandonedClosingSegment(
+        path, kSlots, kLifetimeClosing | kLifetimeReclaiming);
+
+    struct RotatedState {
+      std::string path;
+      std::size_t slots{0};
+      std::uint64_t seg1_id{0};
+      std::uint64_t seg2_id{0};
+      std::optional<SharedMemoryPtr> seg2_mapping;
+      int seg1_waits{0};
+      int seg2_waits{0};
+    };
+    static RotatedState* rotated = nullptr;
+    RotatedState state{path, kSlots, seg1_id};
+    rotated = &state;
+    RegistrationPeer::SetOnReclaimWait(
+        [](std::uint64_t segment_id, int wait_count) {
+          if (segment_id == rotated->seg1_id) {
+            rotated->seg1_waits = wait_count;
+            if (wait_count == 1) {
+              auto [mapping, id] = MakeAbandonedClosingSegment(
+                  rotated->path, rotated->slots,
+                  kLifetimeClosing | kLifetimeReclaiming);
+              rotated->seg2_mapping.emplace(std::move(mapping));
+              rotated->seg2_id = id;
+            }
+          } else if (segment_id == rotated->seg2_id) {
+            rotated->seg2_waits = wait_count;
+          }
+        });
+
+    RTMSQueue reopened = OpenSubscriber(path, kSlots);
+    RegistrationPeer::SetOnReclaimWait(nullptr);
+    rotated = nullptr;
+
+    ASSERT_NE(state.seg2_id, 0U);
+    ASSERT_NE(state.seg2_id, seg1_id);
+    EXPECT_EQ(state.seg1_waits, 1);
+    EXPECT_EQ(state.seg2_waits, 200)
+        << "rotated closing segment must get a full reset reclaim wait budget";
+    EXPECT_NE(RegistrationPeer::Header(reopened)->segment_id, seg1_id);
+    EXPECT_NE(RegistrationPeer::Header(reopened)->segment_id, state.seg2_id);
+  }
 }
 
 }  // namespace
