@@ -32,6 +32,8 @@
 #include "talOS/launcher/spawn.h"
 #include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
+#include "talOS/telemetry/config_validation.h"
+#include "talOS/telemetry/dashboard_layout.h"
 #include "toml.hpp"
 
 namespace talos::launcher {
@@ -514,6 +516,185 @@ std::vector<naming::Diagnostic> LintCriticalNodes(
            "producer"});
     }
   }
+  return findings;
+}
+
+namespace {
+
+bool IsTelemetryNodeTarget(std::string_view target) {
+  return target == "//talOS/telemetry:node" ||
+         target.ends_with("//talOS/telemetry:node");
+}
+
+std::string StripTelemetryPrefix(std::string_view message) {
+  constexpr std::string_view kPrefix = "telemetry: ";
+  if (message.starts_with(kPrefix)) message.remove_prefix(kPrefix.size());
+  return std::string{message};
+}
+
+// Builds the DeclaredGraph that a telemetry node observes (matching
+// DescribeGraph Pass 2): every answered non-reader node (excluding
+// `exclude_roster_name`) plus the static non-`telemetry`-role SENDER endpoints
+// of other answered graph readers (such as teleop's `/teleop/status`).
+// Sets `have_graph` to false only when no non-telemetry, non-Studio-bridge
+// roster member answered while at least one such member exists (e.g. before
+// binaries are built).
+introspect::DeclaredGraph DeclaredGraphForTelemetry(
+    const std::vector<NodeDescription>& described,
+    const std::vector<std::string>& telemetry_names, bool& have_graph) {
+  auto is_telemetry = [&](std::string_view name) {
+    return std::ranges::find(telemetry_names, name) != telemetry_names.end();
+  };
+  introspect::DeclaredGraph graph;
+  std::size_t answered_other = 0;
+  std::size_t unanswered_other = 0;
+  for (const auto& node : described) {
+    if (is_telemetry(node.roster_name)) continue;
+    const bool is_studio_bridge =
+        node.roster_name == kStudioBridgeName &&
+        (node.target.ends_with("//studio/bridge:studio_bridge") ||
+         node.declared.target.ends_with("//studio/bridge:studio_bridge"));
+    if (!node.answered) {
+      if (!is_studio_bridge) ++unanswered_other;
+      continue;
+    }
+    if (!is_studio_bridge) ++answered_other;
+    if (!node.declared.reads_graph) {
+      graph.push_back(node.declared);
+      continue;
+    }
+    introspect::Description static_pub = node.declared;
+    static_pub.sources.clear();
+    for (const auto& source : node.declared.sources) {
+      if (source.kind == event::SourceKind::SENDER &&
+          naming::Role(source.name) != "telemetry") {
+        static_pub.sources.push_back(source);
+      }
+    }
+    if (!static_pub.sources.empty()) {
+      graph.push_back(std::move(static_pub));
+    }
+  }
+  have_graph = (answered_other > 0) || (unanswered_other == 0);
+  return graph;
+}
+
+}  // namespace
+
+std::vector<naming::Diagnostic> LintTelemetryConfig(
+    const config::RobotConfig& robot_config,
+    const std::vector<NodeDescription>& described) {
+  std::vector<naming::Diagnostic> findings;
+  std::vector<std::string> telemetry_subsystems;
+  if (const toml::table* subsystems =
+          robot_config.toml_data["subsystems"].as_table()) {
+    for (const auto& [key, value] : *subsystems) {
+      const auto* table = value.as_table();
+      if (table == nullptr) continue;
+      const std::string name{key.str()};
+      const std::string target = (*table)["node"].value_or(std::string{});
+      bool is_telemetry = IsTelemetryNodeTarget(target) ||
+                          (name == "telemetry" && table->contains("labels"));
+      if (!is_telemetry) {
+        for (const auto& node : described) {
+          if (node.roster_name == name &&
+              (IsTelemetryNodeTarget(node.target) ||
+               IsTelemetryNodeTarget(node.declared.target))) {
+            is_telemetry = true;
+            break;
+          }
+        }
+      }
+      if (is_telemetry) telemetry_subsystems.push_back(name);
+    }
+  }
+
+  bool have_graph = false;
+  const introspect::DeclaredGraph graph =
+      DeclaredGraphForTelemetry(described, telemetry_subsystems, have_graph);
+
+  std::vector<std::vector<telemetry::ChannelDef>> dictionaries;
+  for (const std::string& name : telemetry_subsystems) {
+    std::vector<std::string> include_globs{"*"};
+    std::vector<std::string> exclude_globs;
+    bool globs_ok = true;
+    try {
+      include_globs = telemetry::ReadTelemetryGlobParam(
+          robot_config, name, "include", std::vector<std::string>{"*"});
+    } catch (const std::invalid_argument& error) {
+      findings.push_back(
+          {naming::Severity::ERROR, name, StripTelemetryPrefix(error.what())});
+      globs_ok = false;
+    }
+    try {
+      exclude_globs = telemetry::ReadTelemetryGlobParam(
+          robot_config, name, "exclude", std::vector<std::string>{});
+    } catch (const std::invalid_argument& error) {
+      findings.push_back(
+          {naming::Severity::ERROR, name, StripTelemetryPrefix(error.what())});
+      globs_ok = false;
+    }
+
+    std::vector<telemetry::LabelSpec> label_specs;
+    bool labels_parsed = false;
+    try {
+      label_specs = telemetry::ParseLabelSpecs(robot_config, name);
+      labels_parsed = true;
+    } catch (const std::invalid_argument& error) {
+      findings.push_back(
+          {naming::Severity::ERROR, name, StripTelemetryPrefix(error.what())});
+    }
+
+    if (!have_graph || !globs_ok) continue;
+    try {
+      std::vector<telemetry::ChannelDef> dict =
+          telemetry::BuildTelemetryDictionary(graph, include_globs,
+                                              exclude_globs);
+      if (labels_parsed) {
+        try {
+          telemetry::ApplyLabelSpecs(label_specs, dict);
+        } catch (const std::invalid_argument& error) {
+          findings.push_back({naming::Severity::ERROR, name,
+                              StripTelemetryPrefix(error.what())});
+        }
+      }
+      dictionaries.push_back(std::move(dict));
+    } catch (const std::exception& error) {
+      findings.push_back(
+          {naming::Severity::ERROR, name, StripTelemetryPrefix(error.what())});
+    }
+  }
+
+  if (!robot_config.studio.dashboard.empty()) {
+    try {
+      const telemetry::DashboardLayout layout =
+          telemetry::ParseDashboardLayout(robot_config.studio.dashboard);
+      if (have_graph) {
+        if (!dictionaries.empty()) {
+          for (const auto& dict : dictionaries) {
+            try {
+              telemetry::CheckDashboardAgainstDictionary(layout, dict);
+            } catch (const telemetry::DashboardLayoutError& error) {
+              findings.push_back(
+                  {naming::Severity::ERROR, "studio", error.what()});
+            }
+          }
+        } else if (telemetry_subsystems.empty()) {
+          try {
+            const std::vector<telemetry::ChannelDef> dict =
+                telemetry::BuildTelemetryDictionary(graph, {"*"}, {});
+            telemetry::CheckDashboardAgainstDictionary(layout, dict);
+          } catch (const std::exception& error) {
+            findings.push_back(
+                {naming::Severity::ERROR, "studio", error.what()});
+          }
+        }
+      }
+    } catch (const telemetry::DashboardLayoutError& error) {
+      findings.push_back({naming::Severity::ERROR, "studio", error.what()});
+    }
+  }
+
   return findings;
 }
 
