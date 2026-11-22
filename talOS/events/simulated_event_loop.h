@@ -288,8 +288,9 @@ class SimulatedEventLoop
   // publication still unread, as the realtime loop's wake after its timer
   // pass. So a publication at a timer's deadline costs one drain, not two,
   // and one a handler makes on a prompt watcher of this loop is delivered at
-  // that same instant. Throws std::runtime_error naming the prompt topics
-  // still due after kMaxWokenDrainsPerInstant woken drains at one instant.
+  // that same instant. Throws std::logic_error if called re-entrantly while
+  // already running, and std::runtime_error naming the prompt topics still due
+  // after kMaxWokenDrainsPerInstant woken drains at one instant.
   void run_until(MonotonicTime end) {
     typename Base::RunScope in_run{*this};
 

@@ -1125,6 +1125,41 @@ TEST(RealtimeEventLoop, PollDeliveryDrainsBeforeATimerDueWithTheTick) {
   EXPECT_GT(robot.efforts().front(), 4.0F);
 }
 
+// Re-entering run / run_for / run_until from inside a dispatch throws
+// std::logic_error and leaves the outer run's in_run_ flag intact so a timer
+// change from another thread is still rejected.
+// REQ-RT-04
+TEST(RealtimeEventLoop, ReentrantRunThrowsAndKeepsOuterRunActive) {
+  RealtimeEventLoop<> loop;
+  int calls = 0;
+  bool other_thread_rejected = false;
+  std::uint16_t timer_id = 0;
+  auto handler = [&](const Context&) {
+    ++calls;
+    EXPECT_THROW(loop.run(), std::logic_error);
+    EXPECT_THROW(loop.run_for(1ms), std::logic_error);
+    EXPECT_THROW(loop.run_until(Poller::now() + 1ms), std::logic_error);
+    EXPECT_EQ(calls, 1) << "re-entrant run dispatched a nested callback";
+
+    std::thread other{[&] {
+      try {
+        loop.arm_timer(timer_id, Poller::now() + 1ms, 1ms);
+      } catch (const std::logic_error&) {
+        other_thread_rejected = true;
+      }
+    }};
+    other.join();
+    loop.exit();
+  };
+
+  timer_id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(timer_id, loop.monotonic_now() + 1ms, Duration::zero());
+  loop.run_for(kHangBound);  // Bound only; the handler exits.
+  EXPECT_EQ(calls, 1);
+  EXPECT_TRUE(other_thread_rejected)
+      << "rejected re-entrant run cleared outer in_run_";
+}
+
 TEST(RealtimeEventLoop, DeliveryIsFixedOnceTheRunStarts) {
   RealtimeEventLoop<> loop;
   auto handler = [&loop](const Context&) {
