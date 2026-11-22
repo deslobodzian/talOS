@@ -1,7 +1,11 @@
 """talos.cpp_node hosts an exported C++ node on the one framework in the
 process: the library's node and devices calls run in the libtalos_node image
-Python drives, not in a private copy of their own."""
+Python drives, not in a private copy of their own.
 
+REQ-DEV-09
+"""
+
+import ast
 import ctypes
 import ctypes.util
 import json
@@ -157,6 +161,67 @@ class CppNodeTest(unittest.TestCase):
         # The probe's update() is installed: its tick timer is declared.
         self.assertIn("TIMER", [s["kind"] for s in described["sources"]])
         self.assertFalse(described["abi_update"])
+
+    # REQ-DEV-09: talos_cc_shared_node links libtalos_node.so dynamically with
+    # soname matching and Linux -z defs, and libtalos_node.so claims the whole
+    # //talOS framework closure in exports_filter while linking its packages
+    # whole — so Bazel's cc_shared_library analysis fails closed if a hosted
+    # library depends on an unexported target that libtalos_node.so already
+    # links statically (no duplicate static framework copy).
+    def test_shared_node_rule_contract_enforces_single_framework_exports(self):
+        files = runfiles.Create()
+        contract_path = files.Rlocation(os.environ["TALOS_CONTRACT_BZL"])
+        build_path = files.Rlocation(os.environ["TALOS_NODE_API_BUILD"])
+
+        with open(contract_path, encoding="utf-8") as handle:
+            contract_tree = ast.parse(handle.read(), filename=contract_path)
+        with open(build_path, encoding="utf-8") as handle:
+            build_tree = ast.parse(handle.read(), filename=build_path)
+
+        shared_fn = next(
+            (n for n in contract_tree.body
+             if isinstance(n, ast.FunctionDef)
+             and n.name == "talos_cc_shared_node"),
+            None)
+        self.assertIsNotNone(shared_fn)
+        shared_call = next(
+            (n for n in ast.walk(shared_fn)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name)
+             and n.func.id == "cc_shared_library"),
+            None)
+        self.assertIsNotNone(shared_call)
+        shared_kw = {kw.arg: kw.value for kw in shared_call.keywords}
+        self.assertIn("dynamic_deps", shared_kw)
+        dynamic_deps_src = ast.dump(shared_kw["dynamic_deps"])
+        self.assertIn("//talOS/node_api:libtalos_node.so", dynamic_deps_src)
+        self.assertIn("set_soname", ast.dump(shared_kw["features"]))
+        self.assertIn("-Wl,-z,defs", ast.dump(shared_kw["user_link_flags"]))
+        self.assertNotIn("exports_filter", shared_kw)
+
+        lib_call = None
+        for node in build_tree.body:
+            if not (isinstance(node, ast.Expr)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "cc_shared_library"):
+                continue
+            kw = {k.arg: k.value for k in node.value.keywords}
+            if (isinstance(kw.get("name"), ast.Constant)
+                    and kw["name"].value == "libtalos_node.so"):
+                lib_call = kw
+                break
+        self.assertIsNotNone(lib_call)
+        exports_filter = ast.literal_eval(lib_call["exports_filter"])
+        self.assertIn("//talOS:__subpackages__", exports_filter)
+        self.assertEqual(ast.literal_eval(lib_call["shared_lib_name"]),
+                         "libtalos_node.so")
+        self.assertIn("set_soname", ast.literal_eval(lib_call["features"]))
+        deps = set(ast.literal_eval(lib_call["deps"]))
+        for required in (":node_api", "//talOS/node", "//talOS/devices",
+                         "//talOS/hardware", "//talOS/mechanisms",
+                         "//talOS/driver_station"):
+            self.assertIn(required, deps)
 
 
 if __name__ == "__main__":

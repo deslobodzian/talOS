@@ -174,11 +174,15 @@ py_test(
     size = "small",
     srcs = ["cpp_node_test.py"],
     data = [
+        "BUILD",
         ":libframework_probe.so",
         ":libtalos_node.so",
+        "//talOS/build:contract.bzl",
     ],
     env = {
+        "TALOS_CONTRACT_BZL": "$(rlocationpath //talOS/build:contract.bzl)",
         "TALOS_FRAMEWORK_LIB": "$(rlocationpath :libtalos_node.so)",
+        "TALOS_NODE_API_BUILD": "$(rlocationpath BUILD)",
         "TALOS_PROBE_LIB": "$(rlocationpath :libframework_probe.so)",
     },
     legacy_create_init = False,
