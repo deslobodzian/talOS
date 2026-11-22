@@ -894,16 +894,26 @@ CANcoder's feedback is `command_timeout_us` old.
 If the loop stops ticking right after it applied a command, nothing else
 stops the outputs: its TalonFX controls are one-shot (their device-side
 expiry is unmeasured), and DIO and PWM outputs hold their last value. So
-each tick ends with a beat to a loop watchdog
-(`src/main/include/LoopWatchdog.h`) carrying, while a command is still in
-force, the time by which the loop's next tick would have invalidated it: the
-gateway's `command_expiry_us()` (the older of the command's acceptance and
-the State it was built from, plus `command_timeout_us`) plus two loop
-periods (one for the tick that sees the expiry, one for that tick's work
-before its beat); with no command in force it carries nothing (that tick neutralized
-every output itself). The watchdog's own thread, at `SCHED_FIFO` 30 on the
-RoboRIO (above the loop's `SCHED_FIFO` 10 and the kernel's interrupt
-threads), checks every 5 ms. Once that
+the loop beats a loop watchdog (`src/main/include/LoopWatchdog.h`) before
+`Endpoint::Tick()` on an enabled tick with no active command
+(`command_expiry_us() == 0`) — pre-arming it at
+`now + command_timeout_us + 2 * period_us` (`WatchdogPreArmDeadlineUs` in
+`src/main/include/RobotSafety.h`) so a stall inside that tick's first
+`Apply()` or `ApplyOutputs()` is still neutralized — and again at the end
+of every tick. That post-tick beat refines the deadline, while a command is
+still in force, to the time by which the loop's next tick would have
+invalidated it: the gateway's `command_expiry_us()` (the older of the
+command's acceptance and the State it was built from, plus
+`command_timeout_us`) plus two loop periods (one for the tick that sees the
+expiry, one for that tick's work before its beat); with no command in force
+it disarms back to `0` (that tick neutralized every output itself). If the
+loop stalls after `Endpoint::Tick()` returns with no command (for example
+in Driver Station send or console logging) before that post-tick beat runs,
+the pre-arm deadline stays armed and the watchdog will fire about
+`command_timeout_us + 2 * period_us` later on already-neutral outputs and
+report a `talos loop watchdog` stall to the Driver Station. The watchdog's
+own thread, at `SCHED_FIFO` 30 on the RoboRIO (above the loop's
+`SCHED_FIFO` 10 and the kernel's interrupt threads), checks every 5 ms. Once that
 time has passed it disables PWM outputs, sets DIO outputs false and sends
 `NeutralOut` to every motor, on every check until a beat moves the time (so
 outputs a resumed loop re-applies on a stale clock reading before stalling
