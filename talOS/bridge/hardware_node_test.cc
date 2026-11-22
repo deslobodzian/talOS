@@ -2229,24 +2229,61 @@ TEST(HardwareNodeTest, ExitSummaryReportsOwnerTimeoutEpisodes) {
   ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
   ASSERT_EQ(node.owner_timeouts("intake"), 0u);
 
-  // Keep the link fresh while intake goes silent past its owner timeout.
-  const uint64_t timeout_us = kRequestUs + owner_timeout_us + 1;
+  // Keep the link fresh while intake goes silent past its owner timeout, then
+  // recovers, times out a second time, and recovers again so requests (3),
+  // cumulative timeouts (2), and final timed_out (0) are pairwise distinct.
+  const uint64_t timeout1_us = kRequestUs + owner_timeout_us + 1;
   ASSERT_TRUE(InjectState(node, link.gateway,
                           TrustState(config_id, 11, 1, 2000),
                           kRequestUs + owner_timeout_us));
-  node.Tick(timeout_us);
+  node.Tick(timeout1_us);
   ASSERT_EQ(node.owner_timeouts("intake"), 1u);
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
 
+  const uint64_t request2_us = timeout1_us + 1'000;
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(request2_us);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+
+  const uint64_t timeout2_us = request2_us + owner_timeout_us + 1;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 3000),
+                          request2_us + owner_timeout_us));
+  node.Tick(timeout2_us);
+  ASSERT_EQ(node.owner_timeouts("intake"), 2u);
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+
+  const uint64_t request3_us = timeout2_us + 1'000;
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(request3_us);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.owner_timeouts("intake"), 2u);
+
+  struct RunStopGuard {
+    bool capturing{false};
+    ~RunStopGuard() {
+      if (capturing) (void)::testing::internal::GetCapturedStdout();
+      process::stop_requested.store(false);
+      static_cast<void>(process::ConsumeStopWake());
+    }
+    RunStopGuard() = default;
+    RunStopGuard(const RunStopGuard&) = delete;
+    RunStopGuard& operator=(const RunStopGuard&) = delete;
+  };
+  RunStopGuard guard;
   process::stop_requested.store(true);
   ::testing::internal::CaptureStdout();
+  guard.capturing = true;
   const int exit_code = node.Run();
+  guard.capturing = false;
   const std::string output = ::testing::internal::GetCapturedStdout();
   process::stop_requested.store(false);
+  static_cast<void>(process::ConsumeStopWake());
 
   EXPECT_EQ(exit_code, 0) << output;
   EXPECT_NE(
       output.find(
-          "hardware_node: sub=intake requests=1 timeouts=1 timed_out=1\n"),
+          "hardware_node: sub=intake requests=3 timeouts=2 timed_out=0\n"),
       std::string::npos)
       << output;
   EXPECT_NE(

@@ -132,11 +132,11 @@ touch `MODULE.bazel`, `REPO.bazel`, `talos.bazelrc`, `.bazelversion`,
 `third_party/`, `talOS/`, `tools/`, `examples/robot_repo/`, or
 `examples/wrist_repo/`, prepush also runs `dependent-robot_repo` and
 `dependent-wrist_repo` (`bazel test //... @talos//talOS/configuration:config_fuzz_test`
-in each) and `scaffold-robot_repo` (`tools/check_robot_repo_scaffold.sh`).
+in each; CI's `robot-repo` job also sets `--test_env=TALOS_REQUIRE_STUDIO_PAGES=1`) and `scaffold-robot_repo` (`tools/check_robot_repo_scaffold.sh`).
 CI additionally runs `buildifier`, the full `tools/check_layers.py` Bazel
 query, `tools/check_runfiles_collisions.py`, the generated-TS diff,
 `tools/slow_tests.py --check`, and `tools/run_rio_clang_tidy.py`; among the
-steps prepush runs, it differs from CI in three places
+steps prepush runs (besides `tidy`), it differs from CI in three places
 where the host decides, and says which applies: where the host refuses an unprivileged network namespace it
 leaves `TALOS_REQUIRE_NETNS=1` unset, so
 `//talOS/protocol:udp_address_change_test` may skip where CI fails it;
