@@ -5,10 +5,10 @@
 # and a routine an autonomous node, which the bench has not), and every
 # channel is in the bench graph's telemetry dictionary. The subsystems
 # cell is one list column
-# wide, so the session's 7 rows (5 nodes, hardware_node, sim_gateway) show
-# whole at 1366x768 (10 fit) and 1280x720 (9), and at 1366x500 (5 fit) two
-# rows are out of view, so the test can scroll to the bottom and to a middle
-# row.
+# wide, so the session's 8 rows (5 nodes, hardware_node, sim_gateway,
+# studio_bridge) show whole at 1366x768 (10 fit) and 1280x720 (9), and at
+# 1366x500 (5 fit) three rows are out of view, so the test can scroll to the
+# bottom and to a middle row.
 #
 # The feed's worst case: 32 named channels (the match widget's 12 included)
 # plus the eleven alerts the alerts widget carries (ten /hw/status plus

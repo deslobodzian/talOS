@@ -33,7 +33,7 @@ bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/r
 - Graph/naming changes (topics, nodes, configs): run `--describe-only` on every
   affected config; the launcher refuses a graph that breaks a rule.
 - RoboRIO program (`controller_processor/rio`) builds with GradleRIO,
-  not Bazel: `./gradlew phoenixTest` and `./gradlew buildRio` from that directory.
+  not Bazel: `./gradlew phoenixTest` and `./gradlew buildRio -Pcompanion=10.0.0.2` from that directory.
 - Studio (`studio/`): `pnpm test`, `pnpm build` (runs `tsc --noEmit`);
   regenerate TS bindings with `pnpm generate` after editing `talOS/telemetry/telemetry.fbs`.
 - CI also checks changed files with `clang-format-18 --dry-run --Werror`,

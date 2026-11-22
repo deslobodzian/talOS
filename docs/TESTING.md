@@ -75,15 +75,16 @@ test names; the tags are the link. A tag line starts with its first ID
 (`// REQ-SAFE-01, REQ-SAFE-02: why` tags both; a line of a Python docstring
 counts too); an ID later in a sentence is prose, not a tag.
 
-- Every SAFE and CONTRACT requirement has a tagged test at its cheapest tier
-  or below, or names the bench procedure ([BENCH.md](BENCH.md)) or open
+- Every SAFE, CONTRACT, and P0 requirement has a tagged test at its cheapest
+  tier or below, or names the bench procedure ([BENCH.md](BENCH.md)) or open
   TODO.md item that verifies it. **[enforced: `tools/trace.py --check`
-  (CI lint job) checks for a tagged test at or below the requirement's
-  cheapest runnable tier (from Bazel lane tags in §9, plus GradleRIO
-  `phoenixTest` and Studio Vitest as `fast`; higher-tier composition tags
-  remain allowed alongside), or a cited bench section or open TODO.md item;
-  known gaps are listed with their TODO item in `tools/trace_waivers.txt`,
-  which only shrinks]** `python3 tools/trace.py --report`
+  (CI lint job) enforces SAFE, CONTRACT, and P0 requirements, checking for a
+  tagged test at or below the requirement's cheapest runnable tier (from
+  Bazel lane tags in §9, plus GradleRIO `phoenixTest` and Studio node:test
+  (`tsx --test`) as `fast`; higher-tier composition tags remain allowed
+  alongside), or a cited bench section or open TODO.md item; known gaps are
+  listed with their TODO item in `tools/trace_waivers.txt`, which only
+  shrinks]** `python3 tools/trace.py --report`
   prints each requirement's tests.
 - A robot repository's catalogue, its own `docs/REQUIREMENTS.md`, holds only
   its own rows, in talOS's one numbering; its tests also tag talOS's rows.
@@ -260,8 +261,8 @@ Required cases by role:
 | producer (`TargetLane` writer: `teleop`, a robot's driver or autonomous node) | 1 as `SendsAtALiveInput`; 2 and 6 as `DisabledRobotReleasesItsLanes` and `DriverStationLossReleasesItsLanes`; 9; 11 as `NewGenerationDisarms`; 12 |
 | observer (the bench `gyro`, a camera node, an estimator) | 1 as `PublishesFromALiveInput`; 3 as `StaleInputClearsValidity` (`state` still published, validity cleared, when its input is stale); 9; 12 |
 
-The lint checks the node packages under the robot, example, bench and
-scaffold directories and every package their configs' manifests launch. It
+The lint checks the node packages under `examples`, `bench`, and
+`tools/scaffold_testdata` and every package their configs' manifests launch. It
 takes the role from the package's sources (a `Motor`, `DigitalOutput`,
 `PwmOutput` or a `talos::mechanisms` block owning a motor: actuator; else a
 `TargetLane`, `OperatorArming` or `detail::TargetAccess`: producer; else
@@ -475,7 +476,8 @@ build, reads the build's `.d` files for it).
 `tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them. CI's source lints (test time, links, requirement trace, node test
-matrix, METHODOLOGY.md §13's `bazel_dep` table, and the RULES.md 4
+matrix, METHODOLOGY.md §13's `bazel_dep` table, `layers-src`
+(`tools/check_layers.py --source-only`), and the RULES.md 4
 commissioning check against the diff base) are
 one script, `tools/source_lints.sh`, which CI's lint job and
 prepush's `source-lints` step both run. One doc check needs the compiler

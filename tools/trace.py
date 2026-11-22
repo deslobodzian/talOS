@@ -30,8 +30,8 @@ reading the existing tags follow (`// REQ-SAFE-09`, `# REQ-A, REQ-B: why`).
   and mapped to lanes from their literal `tags` (`fast` untagged, `heavy`,
   `integration`, `e2e`, `perf`, or `soak` when `manual`; non-literal `tags`
   or `srcs`, unwired files, and BUILD syntax errors fail closed as `unknown`).
-  GradleRIO `controller_processor/rio/src/test/cpp/*` and Studio Vitest
-  `studio/tests/*.test.ts*` map to `fast`. Higher-tier composition tags remain
+  GradleRIO `controller_processor/rio/src/test/cpp/*` and Studio node:test
+  (`tsx --test`) `studio/tests/*.test.ts*` map to `fast`. Higher-tier composition tags remain
   allowed as additional evidence;
 - a target tagged `quarantine` in a BUILD file without an open TODO.md item
   naming its label (`//pkg:name`), or whose latest date (YYYY-MM-DD) is past

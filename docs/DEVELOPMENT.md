@@ -95,6 +95,7 @@ Rung 3 is `tools/prepush.sh [--ref <commit>] [--full]`. It checks the commit out
 new worktree under `${TMPDIR:-/tmp}`, makes its tracked files read-only with
 CI's own step, runs CI's source lints (`tools/source_lints.sh`: test time,
 links, requirement trace, node test matrix, `bazel_dep` listing,
+`layers-src` (`tools/check_layers.py --source-only`),
 commissioning) and `tools/format.sh --check`
 on the branch's diff against its merge base with `origin/main`, as CI's
 clang-format job, then `bazel build //...`, then `tools/check_host_includes.py`
@@ -126,8 +127,16 @@ than 20 commits runs `tools/prepush.sh --full`**: without it, such a range
 branch) is reported first as the step `full` SKIPPED, the other steps still
 run, and the run exits nonzero. Every robot and example config's
 `--describe-only` runs as its `talos_graph_test`, the bundle test's fixture
-`bench/main_processor/bundle_testdata` included. Beyond those, it differs
-from CI in three places
+`bench/main_processor/bundle_testdata` included. When the commits to push
+touch `MODULE.bazel`, `REPO.bazel`, `talos.bazelrc`, `.bazelversion`,
+`third_party/`, `talOS/`, `tools/`, `examples/robot_repo/`, or
+`examples/wrist_repo/`, prepush also runs `dependent-robot_repo` and
+`dependent-wrist_repo` (`bazel test //... @talos//talOS/configuration:config_fuzz_test`
+in each) and `scaffold-robot_repo` (`tools/check_robot_repo_scaffold.sh`).
+CI additionally runs `buildifier`, the full `tools/check_layers.py` Bazel
+query, `tools/check_runfiles_collisions.py`, the generated-TS diff,
+`tools/slow_tests.py --check`, and `tools/run_rio_clang_tidy.py`; among the
+steps prepush runs, it differs from CI in three places
 where the host decides, and says which applies: where the host refuses an unprivileged network namespace it
 leaves `TALOS_REQUIRE_NETNS=1` unset, so
 `//talOS/protocol:udp_address_change_test` may skip where CI fails it;
