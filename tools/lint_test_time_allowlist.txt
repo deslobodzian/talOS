@@ -49,7 +49,7 @@ talOS/launcher/outputs_held_test.cc clock 4 integration: a gateway in the test p
 talOS/launcher/outputs_held_test.cc sleep 2 integration: paces the in-process gateway's 5 ms tick and the registry poll
 talOS/launcher/supervision_test.cc clock 42 integration: one real spawn or kill per mechanism; deadlines (10-20 s) bound polls of the manifest, registry and pid files, and a measured supervision-pass window
 talOS/launcher/supervision_test.cc sleep 26 integration: paces polls of files the spawned processes write (no notification exists) and stub registry heartbeats every 5 ms for the launcher's real-time stall check
-talOS/launcher/testdata/supervision_events.h clock 2 integration helper: SteppedClock runs on the real clock when a test is not holding it (Release, Now), as the launcher under test does
+talOS/launcher/testdata/supervision_events.h clock 1 integration helper: SteppedClock runs on the real clock when a test is not holding it (Release, Now), as the launcher under test does
 talOS/node/node_binary_test.cc clock 4 integration: a 20 s deadline bounds the wait for a spawned node's registry row, and the stop latency shows SIGTERM did not wait out --duration-s
 talOS/node/node_binary_test.cc sleep 1 integration: paces the poll for a spawned node's registry row (no notification exists)
 talOS/protocol/udp_test_helpers.h clock 2 integration helper: ReceiveFrame's deadline (kReceiveHangBound, 10 s, by default) only bounds a hang
