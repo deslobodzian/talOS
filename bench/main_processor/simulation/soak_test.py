@@ -235,7 +235,7 @@ def fault_order(teleop1_cycles, auto_cycles, teleop2_cycles, rng):
     teleop1_order.extend(pool[idx:idx + need_t1])
     idx += need_t1
     need_auto_extra = auto_cycles - len(auto_faults)
-    # Keep auto_faults within the first batch so long soaks (>= 210 s) preserve
+    # Keep auto_faults within the first batch so long soaks (>= 234 s) preserve
     # per-batch stratification (one fault kind per len(FAULTS) cycles).
     first_auto_extra = min(need_auto_extra, len(FAULTS) - len(auto_faults))
     auto_first = list(auto_faults) + pool[idx:idx + first_auto_extra]
@@ -562,11 +562,17 @@ class Soak(unittest.TestCase):
                     for action, target, s_ms, _ in events:
                         if not (span[0] <= s_ms <= span[1]):
                             continue
-                        if target in affected:
+                        if leg_producer == PRODUCER and (
+                                action == "frozen_kill"
+                                or target in (PRODUCER, "hardware_node")):
+                            # A 300 ms SIGSTOP (> 100 ms command_timeout_us) or
+                            # SIGKILL of teleop or hardware_node disarms
+                            # OperatorArming while deflected at FAULT_AT_S (1.8 s),
+                            # leaving actuation off until next cycle's CENTER_S
+                            # (CYCLE_S - FAULT_AT_S = 1200 ms).
+                            fault_ms += 1500.0
+                        elif target in affected:
                             fault_ms += 1500.0 if action in ("kill", "frozen_kill") else 500.0
-                        elif action == "frozen_kill" and leg_producer == PRODUCER:
-                            # frozen_kill also SIGSTOPs teleop for STALL_S.
-                            fault_ms += 500.0
                     driving_ms = (span[1] - span[0]) * driving_fraction
                     expected = max(0.0, driving_ms - fault_ms) / period_ms[owner]
                     return max(20, int(0.5 * expected))
