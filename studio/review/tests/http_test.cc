@@ -742,4 +742,115 @@ TEST(HttpListen, RefusesAPortAnotherListenerHolds) {
       << messages;
 }
 
+// Guards --cache-mb CLI handling: the usage default is 256, valid overrides
+// (including 0 and 16) start and serve the review API, and invalid or missing
+// values are refused with exit 2 naming --cache-mb without listening.
+// REQ-OPS-42
+TEST(HttpCli, CacheMbDefaultValidOverrideAndInvalidRefusals) {
+  const std::string library =
+      testing::TempDir() + "/review_cache_cli_" + std::to_string(getpid());
+  std::filesystem::remove_all(library);
+  std::filesystem::create_directories(library);
+  studio::review::testing::WriteFixtureSession(library + "/s1");
+
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  ASSERT_NE(runfiles, nullptr) << error;
+  const char* server = std::getenv("TALOS_STUDIO_REVIEW");
+  ASSERT_NE(server, nullptr) << "TALOS_STUDIO_REVIEW is not set";
+  const std::string binary = runfiles->Rlocation(server);
+
+  const auto run_server = [&](const std::vector<std::string>& extra_args,
+                              bool expect_start, std::string* stderr_out) {
+    int out[2];
+    int err[2];
+    ASSERT_EQ(pipe(out), 0);
+    ASSERT_EQ(pipe(err), 0);
+    const pid_t child = fork();
+    if (child == 0) {
+      for (const auto& [name, value] : runfiles->EnvVars()) {
+        setenv(name.c_str(), value.c_str(), 1);
+      }
+      dup2(out[1], STDOUT_FILENO);
+      dup2(err[1], STDERR_FILENO);
+      close(out[0]);
+      close(out[1]);
+      close(err[0]);
+      close(err[1]);
+      std::vector<const char*> argv{binary.c_str(), "--library",
+                                    library.c_str(), "--port", "0"};
+      for (const std::string& arg : extra_args) argv.push_back(arg.c_str());
+      argv.push_back(nullptr);
+      execv(binary.c_str(), const_cast<char* const*>(argv.data()));
+      _exit(127);
+    }
+    close(out[1]);
+    close(err[1]);
+    FILE* stream = fdopen(out[0], "r");
+    char line[256] = {};
+    const bool listened = fgets(line, sizeof line, stream) != nullptr;
+    fclose(stream);
+    if (expect_start) {
+      ASSERT_TRUE(listened) << "server exited before listening";
+      const std::string listening = line;
+      const auto colon = listening.rfind(':');
+      ASSERT_NE(colon, std::string::npos) << listening;
+      const auto port =
+          static_cast<std::uint16_t>(std::stoul(listening.substr(colon + 1)));
+      const Reply reply = Get(port, "/review/sessions.json");
+      EXPECT_EQ(reply.status, 200) << reply.headers;
+      kill(child, SIGTERM);
+    } else if (listened) {
+      kill(child, SIGTERM);
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+    std::string stderr_text;
+    char buffer[4096];
+    for (;;) {
+      const ssize_t n = read(err[0], buffer, sizeof buffer);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+      if (n == 0) break;
+      stderr_text.append(buffer, static_cast<std::size_t>(n));
+    }
+    close(err[0]);
+    if (!expect_start) {
+      EXPECT_FALSE(listened) << "listened on invalid args: " << line;
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 2)
+          << "status=" << status << " stderr=" << stderr_text;
+    }
+    if (stderr_out != nullptr) *stderr_out = std::move(stderr_text);
+  };
+
+  // Default (flag omitted) and valid overrides (0 and 16 MiB) start and serve.
+  run_server({}, /*expect_start=*/true, nullptr);
+  run_server({"--cache-mb", "16"}, /*expect_start=*/true, nullptr);
+  run_server({"--cache-mb", "0"}, /*expect_start=*/true, nullptr);
+
+  // Invalid values and missing value exit 2, naming --cache-mb and showing the
+  // default 256 in usage.
+  for (const std::string bad : {"abc", "-1", "1048577"}) {
+    SCOPED_TRACE("--cache-mb " + bad);
+    std::string msg;
+    run_server({"--cache-mb", bad}, /*expect_start=*/false, &msg);
+    EXPECT_NE(msg.find("invalid --cache-mb " + bad), std::string::npos) << msg;
+    EXPECT_NE(msg.find("[--cache-mb 256]"), std::string::npos) << msg;
+  }
+  {
+    std::string msg;
+    run_server({"--cache-mb"}, /*expect_start=*/false, &msg);
+    EXPECT_NE(msg.find("missing value for --cache-mb"), std::string::npos)
+        << msg;
+    EXPECT_NE(msg.find("[--cache-mb 256]"), std::string::npos) << msg;
+  }
+
+  std::filesystem::remove_all(library);
+}
+
 }  // namespace
