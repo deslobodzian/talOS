@@ -199,7 +199,10 @@ to 8 are the node's own.
    missing parameter, a value that is not a non-empty array of strings,
    more than 1024 labels or a label over the dictionary string limit, and,
    once the graph is known, a channel absent from the dictionary (excluded,
-   or in no state or status topic), not an integer, or already labelled.
+   or in no state or status topic), not an integer, or already labelled. The
+   lint reports those last three as warnings naming the nodes that did not
+   answer `--describe` when the declared graph is incomplete
+   ([launcher](../launcher/README.md#telemetry-labels-and-dashboard-layout)).
    The labels cost dictionary bytes only, nothing per tick.
 
 ## Dashboard layout
@@ -278,7 +281,10 @@ launcher's phase-1 lint (`LintTelemetryConfig`, run by `--describe-only`,
 `config_validation` and `dashboard_layout` checks, so an invalid layout is a
 hard error naming the file and key (unless overridden in simulation with
 `--sim --allow-graph-errors`). Once the declared graph has built its
-dictionary, they also refuse, naming the file and the key, a channel the
+dictionary, they also refuse (the lint only warns, naming the nodes that did
+not answer `--describe`, while that graph is incomplete;
+[launcher](../launcher/README.md#telemetry-labels-and-dashboard-layout)),
+naming the file and the key, a channel the
 layout names that the dictionary lacks (excluded, or no state or status
 topic holds it), whether the key is required or optional:
 `widgets[<i>].<key>`, `widgets[<i>].channels[<k>]` for a graph,

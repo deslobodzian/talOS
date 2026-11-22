@@ -440,6 +440,89 @@ from = "autonomous.routines"
         << findings[0].message;
   }
 
+  // A non-critical node (gyro) that did not answer --describe leaves the
+  // dictionary incomplete: a label or widget naming its channels is a warning
+  // naming gyro, not an error refusing the launch. With every node answered,
+  // the same absent channel is an error (the "channel absent from dictionary"
+  // label case and the dictionary-level channel-absent dashboard case above).
+  // Malformed label entries and an unparsable layout stay errors.
+  {
+    NodeDescription gyro_unanswered{.roster_name = "gyro",
+                                    .target = "//example/gyro:node",
+                                    .answered = false};
+    const std::vector<NodeDescription> partial{shooter, gyro_unanswered,
+                                               telemetry_unanswered};
+    const std::string gyro_sec =
+        "[subsystems.gyro]\nnode = \"//example/gyro:node\"\n"
+        "critical = false\n"
+        "[subsystems.autonomous]\nnode = \"//example/autonomous:node\"\n"
+        "routines = [\"preload\", \"none\"]\n";
+    const std::string gyro_label =
+        "[[subsystems.telemetry.labels]]\nchannel = \"gyro/state/mode_index\"\n"
+        "from = \"autonomous.routines\"\n";
+    const std::string gyro_widget =
+        "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+        "channel = \"gyro/state/hardware_fresh\"\n";
+    const std::string overlapping =
+        gyro_widget + "[[widgets]]\nkind = \"number\"\nat = [1, 0, 2, 1]\n" +
+        "channel = \"shooter/status/supply_v\"\n";
+    struct PartialCase {
+      const char* name;
+      std::string layout;
+      std::string telemetry_extra;
+      naming::Severity severity;
+      std::size_t count;
+      const char* expect_substr;
+    };
+    const std::vector<PartialCase> partial_cases{
+        {"label and widget on an unanswered node's channels", gyro_widget,
+         gyro_label, naming::Severity::WARNING, 2, "gyro did not answer"},
+        {"malformed label entry",
+         "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+         "channel = \"shooter/status/supply_v\"\n",
+         "[[subsystems.telemetry.labels]]\n", naming::Severity::ERROR, 1,
+         "labels[0].channel"},
+        {"unparsable layout", overlapping, "", naming::Severity::ERROR, 1,
+         "widgets[1].at"},
+    };
+    for (const auto& c : partial_cases) {
+      SCOPED_TRACE(c.name);
+      const auto findings = run_dashboard(
+          c.layout, telemetry_sec + c.telemetry_extra + gyro_sec, partial);
+      ASSERT_EQ(findings.size(), c.count);
+      for (const auto& finding : findings) {
+        EXPECT_EQ(finding.severity, c.severity) << finding.message;
+        EXPECT_NE(finding.message.find(c.expect_substr), std::string::npos)
+            << finding.message;
+      }
+    }
+  }
+
+  // A telemetry subsystem named in a robot repository's form,
+  // `@talos//talOS/telemetry:node`, is linted whatever its subsystem name.
+  {
+    const auto cfg = config::ParseRobotConfigString(R"(
+[robot]
+period_us = 10000
+[subsystems.shooter]
+node = "//example/shooter:node"
+[subsystems.autonomous]
+node = "//example/autonomous:node"
+routines = ["preload", "none"]
+[subsystems.recorder]
+node = "@talos//talOS/telemetry:node"
+[[subsystems.recorder.labels]]
+channel = "shooter/status/nope"
+from = "autonomous.routines"
+)");
+    const auto findings = LintTelemetryConfig(cfg, {shooter});
+    ASSERT_EQ(findings.size(), 1u);
+    EXPECT_EQ(findings[0].severity, naming::Severity::ERROR);
+    EXPECT_EQ(findings[0].subject, "recorder");
+    EXPECT_NE(findings[0].message.find("labels[0].channel"), std::string::npos)
+        << findings[0].message;
+  }
+
   std::filesystem::remove_all(dir);
 }
 
