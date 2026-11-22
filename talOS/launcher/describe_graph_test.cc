@@ -5,14 +5,19 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "schema_test/shapes_generated.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/manifest.h"
 #include "talOS/introspection/names.h"
 #include "talOS/launcher/roster.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::launcher {
 namespace {
@@ -165,6 +170,246 @@ critical = false
     }
   }
   EXPECT_TRUE(LintCriticalNodes(specs, described).empty());
+}
+
+// VIS-1 (REQ-OPS-34, REQ-OPS-35, REQ-OPS-38, REQ-OPS-39, REQ-CONTRACT-33):
+// LintTelemetryConfig promotes invalid [[subsystem.labels]] entries and
+// invalid [studio] dashboard layouts to hard phase-1 ERROR diagnostics even
+// when telemetry is non-critical or did not answer --describe.
+TEST(DescribeGraphUnitTest, LintTelemetryConfigRefusesBadLabelsAndDashboard) {
+  const auto make_alerts_sender = [](std::string topic) {
+    const schema::Identity id = schema::Of<schema_test::Alerts>();
+    naming::SourceShape source;
+    source.kind = event::SourceKind::SENDER;
+    source.name = std::move(topic);
+    source.message_bytes = sizeof(schema_test::Alerts);
+    source.alignment = alignof(schema_test::Alerts);
+    source.schema = id.name;
+    source.schema_hash = id.hash;
+    source.bfbs.assign(id.bfbs.begin(), id.bfbs.end());
+    return source;
+  };
+  const auto make_mixed_sender = [](std::string topic) {
+    const schema::Identity id = schema::Of<schema_test::Mixed>();
+    naming::SourceShape source;
+    source.kind = event::SourceKind::SENDER;
+    source.name = std::move(topic);
+    source.message_bytes = sizeof(schema_test::Mixed);
+    source.alignment = alignof(schema_test::Mixed);
+    source.schema = id.name;
+    source.schema_hash = id.hash;
+    source.bfbs.assign(id.bfbs.begin(), id.bfbs.end());
+    return source;
+  };
+
+  NodeDescription shooter{.roster_name = "shooter",
+                          .target = "//example/shooter:node",
+                          .answered = true};
+  shooter.declared.name = "shooter";
+  shooter.declared.target = "//example/shooter:node";
+  shooter.declared.sources = {make_alerts_sender("/shooter/status"),
+                              make_mixed_sender("/shooter/state")};
+
+  NodeDescription telemetry_unanswered{.roster_name = "telemetry",
+                                       .target = "//talOS/telemetry:node",
+                                       .answered = false};
+  const std::vector<NodeDescription> described{shooter, telemetry_unanswered};
+
+  // Valid [[subsystem.labels]] produces no diagnostics.
+  {
+    const auto cfg = config::ParseRobotConfigString(R"(
+[robot]
+period_us = 10000
+[subsystems.shooter]
+node = "//example/shooter:node"
+[subsystems.autonomous]
+node = "//example/autonomous:node"
+routines = ["preload", "none"]
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+critical = false
+[[subsystems.telemetry.labels]]
+channel = "shooter/status/routine_index"
+from = "autonomous.routines"
+)");
+    EXPECT_TRUE(LintTelemetryConfig(cfg, described).empty());
+  }
+
+  // Invalid [[subsystem.labels]] cases (config-only and dictionary-level).
+  struct LabelCase {
+    const char* name;
+    const char* telemetry_toml;
+    const char* expect_substr;
+  };
+  const std::vector<LabelCase> label_cases{
+      {"non-array labels", "labels = \"bad\"\n", "labels"},
+      {"empty table entry", "[[subsystems.telemetry.labels]]\n",
+       "labels[0].channel"},
+      {"unknown key in label entry",
+       "[[subsystems.telemetry.labels]]\nchannel = "
+       "\"shooter/status/routine_index\"\nfrom = \"autonomous.routines\"\n"
+       "extra = \"oops\"\n",
+       "labels[0].extra"},
+      {"missing from subsystem",
+       "[[subsystems.telemetry.labels]]\nchannel = "
+       "\"shooter/status/routine_index\"\nfrom = \"ghost.routines\"\n",
+       "labels[0].from"},
+      {"channel absent from dictionary",
+       "[[subsystems.telemetry.labels]]\nchannel = \"shooter/status/nope\"\n"
+       "from = \"autonomous.routines\"\n",
+       "labels[0].channel"},
+      {"excluded channel",
+       "exclude = [\"shooter/status/routine_index\"]\n"
+       "[[subsystems.telemetry.labels]]\nchannel = "
+       "\"shooter/status/routine_index\"\nfrom = \"autonomous.routines\"\n",
+       "labels[0].channel"},
+      {"non-integer channel",
+       "[[subsystems.telemetry.labels]]\nchannel = "
+       "\"shooter/status/supply_v\"\nfrom = \"autonomous.routines\"\n",
+       "labels[0].channel"},
+      {"already labelled enum channel",
+       "[[subsystems.telemetry.labels]]\nchannel = \"shooter/state/mode\"\n"
+       "from = \"autonomous.routines\"\n",
+       "labels[0].channel"},
+      {"duplicate label entry for same channel",
+       "[[subsystems.telemetry.labels]]\nchannel = "
+       "\"shooter/status/routine_index\"\nfrom = \"autonomous.routines\"\n"
+       "[[subsystems.telemetry.labels]]\nchannel = "
+       "\"shooter/status/routine_index\"\nfrom = \"autonomous.routines\"\n",
+       "labels[1].channel"},
+  };
+  for (const auto& c : label_cases) {
+    SCOPED_TRACE(c.name);
+    const std::string toml =
+        "[robot]\nperiod_us = 10000\n"
+        "[subsystems.shooter]\nnode = \"//example/shooter:node\"\n"
+        "[subsystems.autonomous]\nnode = \"//example/autonomous:node\"\n"
+        "routines = [\"preload\", \"none\"]\n"
+        "[subsystems.telemetry]\nnode = \"//talOS/telemetry:node\"\n"
+        "critical = false\n" +
+        std::string{c.telemetry_toml};
+    const auto cfg = config::ParseRobotConfigString(toml);
+    const auto findings = LintTelemetryConfig(cfg, described);
+    ASSERT_EQ(findings.size(), 1u);
+    EXPECT_EQ(findings[0].severity, naming::Severity::ERROR);
+    EXPECT_EQ(findings[0].subject, "telemetry");
+    EXPECT_NE(findings[0].message.find(c.expect_substr), std::string::npos)
+        << findings[0].message;
+  }
+
+  // Dashboard layout checks (file-level, dictionary channel presence, budget
+  // with alerts, excluded channel, and no-telemetry config).
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(tmp, nullptr);
+  const std::filesystem::path dir =
+      std::filesystem::path{tmp} / "lint_telemetry_dashboard";
+  std::filesystem::create_directories(dir);
+  const std::filesystem::path layout_file = dir / "dashboard.toml";
+
+  const auto run_dashboard = [&](const std::string& layout_text,
+                                 const std::string& telemetry_section,
+                                 const std::vector<NodeDescription>& nodes) {
+    std::ofstream(layout_file) << layout_text;
+    const std::string toml =
+        "[robot]\nperiod_us = 10000\n"
+        "[studio]\ndashboard = \"" +
+        layout_file.string() +
+        "\"\n"
+        "[subsystems.shooter]\nnode = \"//example/shooter:node\"\n" +
+        telemetry_section;
+    const auto cfg = config::ParseRobotConfigString(toml);
+    return LintTelemetryConfig(cfg, nodes);
+  };
+
+  const std::string telemetry_sec =
+      "[subsystems.telemetry]\nnode = \"//talOS/telemetry:node\"\n"
+      "critical = false\n";
+
+  // Valid layout passes.
+  {
+    const auto findings = run_dashboard(
+        "[dashboard]\ntitle = \"Drive\"\n"
+        "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+        "channel = \"shooter/status/supply_v\"\n",
+        telemetry_sec, described);
+    EXPECT_TRUE(findings.empty());
+  }
+
+  // File-level error (overlapping widgets) fails even with no telemetry node
+  // and even when no producer answered --describe.
+  {
+    NodeDescription unanswered_shooter{.roster_name = "shooter",
+                                       .target = "//example/shooter:node",
+                                       .answered = false};
+    const auto findings = run_dashboard(
+        "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+        "channel = \"shooter/status/supply_v\"\n"
+        "[[widgets]]\nkind = \"number\"\nat = [1, 0, 2, 1]\n"
+        "channel = \"shooter/status/supply_v\"\n",
+        "", {unanswered_shooter});
+    ASSERT_EQ(findings.size(), 1u);
+    EXPECT_EQ(findings[0].severity, naming::Severity::ERROR);
+    EXPECT_EQ(findings[0].subject, "studio");
+    EXPECT_NE(findings[0].message.find("widgets[1].at"), std::string::npos)
+        << findings[0].message;
+  }
+
+  // Dictionary-level channel absent fails.
+  {
+    const auto findings = run_dashboard(
+        "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+        "channel = \"shooter/status/missing\"\n",
+        telemetry_sec, described);
+    ASSERT_EQ(findings.size(), 1u);
+    EXPECT_EQ(findings[0].severity, naming::Severity::ERROR);
+    EXPECT_EQ(findings[0].subject, "studio");
+    EXPECT_NE(findings[0].message.find("widgets[0].channel"), std::string::npos)
+        << findings[0].message;
+  }
+
+  // Dictionary-level channel excluded by telemetry.exclude fails.
+  {
+    const auto findings = run_dashboard(
+        "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+        "channel = \"shooter/status/supply_v\"\n",
+        telemetry_sec + "exclude = [\"shooter/status/supply_v\"]\n", described);
+    ASSERT_EQ(findings.size(), 1u);
+    EXPECT_EQ(findings[0].severity, naming::Severity::ERROR);
+    EXPECT_EQ(findings[0].subject, "studio");
+    EXPECT_NE(findings[0].message.find("widgets[0].channel"), std::string::npos)
+        << findings[0].message;
+  }
+
+  // Dictionary-level budget overflow once alerts widget adds alert channels.
+  {
+    const auto findings = run_dashboard(
+        "[dashboard]\nupdate_hz = 10\nbudget_bytes_per_s = 12532\n"
+        "[[widgets]]\nkind = \"number\"\nat = [0, 0, 1, 1]\n"
+        "channel = \"shooter/status/supply_v\"\n"
+        "[[widgets]]\nkind = \"alerts\"\nat = [1, 0, 1, 1]\n",
+        telemetry_sec, described);
+    ASSERT_EQ(findings.size(), 1u);
+    EXPECT_EQ(findings[0].severity, naming::Severity::ERROR);
+    EXPECT_EQ(findings[0].subject, "studio");
+    EXPECT_NE(findings[0].message.find("[dashboard].budget_bytes_per_s"),
+              std::string::npos)
+        << findings[0].message;
+  }
+
+  // When no producer answered (e.g. binaries not built yet), a file-valid
+  // dashboard layout does not emit spurious dictionary-channel errors.
+  {
+    NodeDescription unanswered_shooter{.roster_name = "shooter",
+                                       .target = "//example/shooter:node",
+                                       .answered = false};
+    const auto findings = run_dashboard(
+        "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+        "channel = \"shooter/status/supply_v\"\n",
+        telemetry_sec, {unanswered_shooter, telemetry_unanswered});
+    EXPECT_TRUE(findings.empty());
+  }
+
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace

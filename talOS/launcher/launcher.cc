@@ -1082,6 +1082,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   for (auto& finding : LintPythonActuatorPeriods(robot_config, described)) {
     diagnostics.push_back(std::move(finding));
   }
+  for (auto& finding : LintTelemetryConfig(robot_config, described)) {
+    diagnostics.push_back(std::move(finding));
+  }
   for (auto& finding : naming::CheckHardwareConfig(robot_config.hardware)) {
     diagnostics.push_back(std::move(finding));
   }

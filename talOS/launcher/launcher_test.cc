@@ -37,6 +37,8 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
+#include "rules_cc/cc/runfiles/runfiles.h"
+#include "schema_test/shapes_generated.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/input_replay.h"
 #include "talOS/events/log/log_writer.h"
@@ -52,6 +54,7 @@
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
 #include "talOS/protocol/types.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::launcher {
 namespace {
@@ -5676,6 +5679,193 @@ TEST(LauncherTest, CheckSessionLockReportsFreeAndHeldWithoutConfig) {
   int wait_status = 0;
   ASSERT_EQ(::waitpid(holder, &wait_status, 0), holder);
   EXPECT_EQ(Launcher{options}.Run(), 0);
+}
+
+// VIS-1 (REQ-OPS-34, REQ-OPS-38, REQ-OPS-39, REQ-CONTRACT-33): even when
+// telemetry is non-critical (`critical = false`), an invalid
+// `[[subsystem.labels]]` entry or invalid `[studio] dashboard` layout is a
+// hard error in `--describe-only` and normal launch rather than a warning,
+// while valid configs pass and `--sim --allow-graph-errors` overrides refusal.
+TEST(LauncherGraphTest,
+     DescribeOnlyRefusesInvalidTelemetryLabelsAndDashboardLayout) {
+  std::string rf_error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &rf_error));
+  const char* telemetry_loc = std::getenv("TALOS_TELEMETRY");
+  ASSERT_NE(runfiles, nullptr) << rf_error;
+  ASSERT_NE(telemetry_loc, nullptr);
+  const std::string telemetry_bin = runfiles->Rlocation(telemetry_loc);
+  ASSERT_FALSE(telemetry_bin.empty());
+
+  const schema::Identity alerts_id = schema::Of<schema_test::Alerts>();
+  introspect::naming::SourceShape shooter_status;
+  shooter_status.kind = event::SourceKind::SENDER;
+  shooter_status.name = "/shooter/status";
+  shooter_status.message_bytes = sizeof(schema_test::Alerts);
+  shooter_status.alignment = alignof(schema_test::Alerts);
+  shooter_status.schema = alerts_id.name;
+  shooter_status.schema_hash = alerts_id.hash;
+  shooter_status.bfbs.assign(alerts_id.bfbs.begin(), alerts_id.bfbs.end());
+
+  const std::string hw_stub = WriteStubNode(
+      "vis1_hw",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+  const std::string shooter_stub = WriteStubNode(
+      "vis1_shooter",
+      DescribingStub("shooter", "//example/shooter:node", {shooter_status}));
+  const std::string auto_stub = WriteStubNode(
+      "vis1_auto",
+      DescribingStub("autonomous", "//example/autonomous:node", {}));
+
+  const std::string dir = TempPath("vis1_telemetry_lint");
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+
+  const auto run_case =
+      [&](const std::string& tag, const std::string& studio_extra,
+          const std::string& telemetry_extra, const std::string& dashboard_toml,
+          bool describe_only, bool allow_graph_errors,
+          std::string& out_graph) -> int {
+    const std::string case_dir = dir + "/" + tag;
+    std::filesystem::create_directories(case_dir);
+    if (!dashboard_toml.empty()) {
+      std::ofstream(case_dir + "/dashboard.toml") << dashboard_toml;
+    }
+    const std::string config_path = case_dir + "/robot.toml";
+    std::ofstream(config_path)
+        << "[robot]\nperiod_us = 10000\n"
+        << "[studio]\ntopic = \"/talos/telemetry\"\n"
+        << studio_extra
+        << "[subsystems.shooter]\nnode = \"//example/shooter:node\"\n"
+        << "[subsystems.autonomous]\nnode = \"//example/autonomous:node\"\n"
+        << "routines = [\"preload\", \"none\", \"taxi\"]\n"
+        << "[subsystems.telemetry]\nnode = \"//talOS/telemetry:node\"\n"
+        << "critical = false\n"
+        << telemetry_extra;
+
+    LauncherOptions opts;
+    opts.config_path = config_path;
+    opts.output_dir = case_dir + "/out";
+    opts.session_id = 7001;
+    opts.describe_only = describe_only;
+    opts.simulation = allow_graph_errors;
+    opts.allow_graph_errors = allow_graph_errors;
+    opts.binary_overrides["//talOS/bridge:hardware_node"] = hw_stub;
+    opts.binary_overrides["//example/shooter:node"] = shooter_stub;
+    opts.binary_overrides["//example/autonomous:node"] = auto_stub;
+    opts.binary_overrides["//talOS/telemetry:node"] = telemetry_bin;
+    const int rc = Launcher{opts}.Run();
+    out_graph = ReadFile(opts.output_dir + "/7001/graph.json");
+    return rc;
+  };
+
+  const std::string valid_dashboard = R"([dashboard]
+title = "Drive"
+[[widgets]]
+kind = "number"
+at = [0, 0, 2, 1]
+channel = "shooter/status/supply_v"
+)";
+  const std::string valid_labels = R"([[subsystems.telemetry.labels]]
+channel = "shooter/status/routine_index"
+from = "autonomous.routines"
+)";
+
+  // 1. Valid labels + valid dashboard with critical = false telemetry passes.
+  {
+    std::string graph;
+    EXPECT_EQ(run_case("valid", "dashboard = \"dashboard.toml\"\n",
+                       valid_labels, valid_dashboard, /*describe_only=*/true,
+                       /*allow_graph_errors=*/false, graph),
+              0)
+        << graph;
+    EXPECT_TRUE(GraphErrors(graph).empty()) << graph;
+  }
+
+  // 2. Invalid [[subsystem.labels]] (unknown dictionary channel) is an error
+  // in --describe-only and normal launch.
+  for (const bool describe_only : {true, false}) {
+    SCOPED_TRACE(describe_only ? "bad_label_describe" : "bad_label_launch");
+    std::string graph;
+    const std::string bad_labels = R"([[subsystems.telemetry.labels]]
+channel = "shooter/status/nonexistent"
+from = "autonomous.routines"
+)";
+    EXPECT_EQ(run_case(describe_only ? "bad_label_d" : "bad_label_l", "",
+                       bad_labels, "", describe_only,
+                       /*allow_graph_errors=*/false, graph),
+              1)
+        << graph;
+    const auto errors = GraphFindings(graph, "error", "telemetry");
+    ASSERT_FALSE(errors.empty()) << graph;
+    EXPECT_NE(errors[0].find("labels[0].channel"), std::string::npos)
+        << errors[0];
+  }
+
+  // 3. Invalid dashboard layout (file-level syntax/schema error) is an error.
+  {
+    std::string graph;
+    const std::string bad_layout = R"([dashboard]
+title = "Drive"
+[[widgets]]
+kind = "not_a_widget"
+at = [0, 0, 2, 1]
+)";
+    EXPECT_EQ(run_case("bad_layout_kind", "dashboard = \"dashboard.toml\"\n",
+                       "", bad_layout, /*describe_only=*/true,
+                       /*allow_graph_errors=*/false, graph),
+              1)
+        << graph;
+    const auto errors = GraphFindings(graph, "error", "studio");
+    ASSERT_FALSE(errors.empty()) << graph;
+    EXPECT_NE(errors[0].find("widgets[0].kind"), std::string::npos)
+        << errors[0];
+  }
+
+  // 4. Invalid dashboard layout (channel absent from dictionary) is an error.
+  {
+    std::string graph;
+    const std::string missing_ch_layout = R"([dashboard]
+title = "Drive"
+[[widgets]]
+kind = "number"
+at = [0, 0, 2, 1]
+channel = "shooter/status/nope"
+)";
+    EXPECT_EQ(run_case("bad_layout_channel", "dashboard = \"dashboard.toml\"\n",
+                       "", missing_ch_layout, /*describe_only=*/true,
+                       /*allow_graph_errors=*/false, graph),
+              1)
+        << graph;
+    const auto errors = GraphFindings(graph, "error", "studio");
+    ASSERT_FALSE(errors.empty()) << graph;
+    EXPECT_NE(errors[0].find("widgets[0].channel"), std::string::npos)
+        << errors[0];
+  }
+
+  // 5. --sim --allow-graph-errors overrides the refusal while keeping the
+  // error recorded in graph.json.
+  {
+    std::string graph;
+    const std::string bad_layout = R"([dashboard]
+[[widgets]]
+kind = "number"
+at = [0, 0, 2, 1]
+channel = "shooter/status/nope"
+)";
+    EXPECT_EQ(run_case("allow_errors", "dashboard = \"dashboard.toml\"\n", "",
+                       bad_layout, /*describe_only=*/true,
+                       /*allow_graph_errors=*/true, graph),
+              0)
+        << graph;
+    EXPECT_FALSE(GraphFindings(graph, "error", "studio").empty()) << graph;
+  }
+
+  std::filesystem::remove_all(dir);
+  std::remove(hw_stub.c_str());
+  std::remove(shooter_stub.c_str());
+  std::remove(auto_stub.c_str());
 }
 
 }  // namespace

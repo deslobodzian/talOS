@@ -247,6 +247,23 @@ Since an actuator owner's `period_us` is also at most a quarter of
 `command_timeout_us` ([the tick](../../ARCHITECTURE.md#the-tick)), a config
 with a Python actuator owner needs a `command_timeout_us` of at least 80000.
 
+## Telemetry labels and dashboard layout
+
+After phase one the launcher runs `LintTelemetryConfig` over every telemetry
+subsystem's `[[subsystem.labels]]` entries and any `[studio] dashboard` layout
+using the same validator the telemetry node runs at construction
+([talOS/telemetry](../telemetry/README.md#dashboard-layout)). An invalid
+`[[subsystem.labels]]` entry (bad structure, unknown key, missing/non-string
+field, bad `from`, missing/non-string-array source, over 1024 labels or a
+label past the string limit, or a channel absent from the declared graph's
+dictionary, not an integer, or already labelled) or an invalid `[studio]
+dashboard` layout (file syntax/schema/grid/budget errors, a channel absent
+from or excluded from the dictionary, or a drive feed over budget once alerts
+are counted) is a phase-1 error naming the subsystem or layout file and key.
+It refuses `--describe-only`, `deploy.sh install`, and launch even when
+`telemetry` is marked `critical = false` (overridden in simulation only with
+`--sim --allow-graph-errors`).
+
 ## Live endpoints
 
 The lint checks the graph the probes declared, so a node must declare the same
@@ -447,8 +464,10 @@ dashboard = "dashboard.toml"              # driver dashboard layout, relative to
 
 Every key shown is optional. `dashboard` names the driver dashboard's
 layout ([talOS/telemetry](../telemetry/README.md#dashboard-layout)); config
-load refuses a missing file, and the file is in the config's
-`CONFIG_FILES` and its bundle. The watched topic comes from `[studio] topic`,
+load refuses a missing file, phase one (`LintTelemetryConfig`) refuses an
+invalid layout as an error even when `telemetry` is `critical = false`, and
+the file is in the config's `CONFIG_FILES` and its bundle. The watched topic
+comes from `[studio] topic`,
 the same setting the telemetry node reads. `--studio-http-port PORT`
 overrides `[studio] http_port` for one run; `--studio-http-port 0` asks the
 OS for a free port (`[studio] http_port` in the config still requires
@@ -1227,7 +1246,7 @@ header:
 | `:spawn` | `spawn.h` | `SpawnProcess` (process group, guardian, child reports), `SupervisionWakeup` |
 | `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output), and `LauncherOutput`, the launcher's own stdout, stderr and `talos.log` |
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
-| `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
+| `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter, Python-period and telemetry/dashboard lints, `EndpointMismatch`, session segments, `graph.json` |
 | `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and Studio's review's inputs name, each once |
 | `:hardware_record` | `hardware_record.h` | the hardware packets decoded with the wire codecs (`HardwareRecordOf`, `HardwareRecordJson`), the check that a session's packets are of this build's protocol (`RecordedProtocolVersion`, `HardwareProtocolCheck`) and the run config's device names (`SessionConfigPath`, `LoadDeviceNames`), for `log_dump` and Studio's review |
 | `:log_merge` | `log_merge.h` | `MergeLogs`, a session's records streamed to a visitor in time order; `log_dump` and Studio's review link it, not the supervisor |

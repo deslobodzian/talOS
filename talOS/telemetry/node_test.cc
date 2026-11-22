@@ -1363,6 +1363,13 @@ TEST(TelemetryMatrix, BadParameterFailsConstruction) {
            {"missing from", "channel = \"" + kIndex + "\"\n", "labels[0].from"},
            {"missing channel", "from = \"autonomous.routines\"\n",
             "labels[0].channel"},
+           {"empty entry", "", "labels[0].channel"},
+           {"unknown key",
+            entry(kIndex, "autonomous.routines") + "typo = \"x\"\n",
+            "labels[0].typo"},
+           {"non-string channel",
+            "channel = 7\nfrom = \"autonomous.routines\"\n",
+            "labels[0].channel"},
        }) {
     SCOPED_TRACE(what);
     const std::string config = R"(

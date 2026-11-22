@@ -121,6 +121,18 @@ std::vector<naming::Diagnostic> LintCriticalNodes(
     const std::vector<NodeSpec>& specs,
     const std::vector<NodeDescription>& described);
 
+// REQ-OPS-34, REQ-OPS-35, REQ-OPS-38, REQ-OPS-39, REQ-CONTRACT-33: validates
+// every telemetry subsystem's `[[subsystem.labels]]` entries and any
+// `[studio] dashboard` layout as phase-1 `ERROR` diagnostics so an invalid
+// label entry or dashboard layout refuses `--describe-only` and launch even
+// when `telemetry` is marked `critical = false`. Checks config/file-level
+// rules unconditionally, and checks dictionary-level rules (channel presence,
+// integer/unlabelled channel, drive-feed budget) whenever the declared graph
+// has described producer nodes (or no other nodes to describe).
+std::vector<naming::Diagnostic> LintTelemetryConfig(
+    const config::RobotConfig& robot_config,
+    const std::vector<NodeDescription>& described);
+
 // Where the launcher writes the declared graph that graph-reading nodes get
 // as `--graph` (introspect::DeclaredGraph): beside graph.json in the session
 // directory.

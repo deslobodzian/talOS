@@ -158,6 +158,8 @@ cc_library(
         "//talOS/rtms",
         "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
+        "//talOS/telemetry:config_validation",
+        "//talOS/telemetry:dashboard_layout",
         "@tomlplusplus//:toml++",
     ],
 )
@@ -188,6 +190,8 @@ cc_test(
         "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/introspection:names",
+        "//talOS/schema:identity",
+        "//talOS/schema:test_messages",
         "@googletest//:gtest_main",
     ],
 )
@@ -640,6 +644,12 @@ cc_test(
     name = "launcher_test",
     size = "small",
     srcs = ["launcher_test.cc"],
+    data = [
+        "//talOS/telemetry:node",
+    ],
+    env = {
+        "TALOS_TELEMETRY": "$(rlocationpath //talOS/telemetry:node)",
+    },
     # Independent cases (each writes its own files; a stub is written once
     # per process). Unsharded, the Mac mini took up to 58.9 s of the 60 s
     # small limit at ten parallel runs (TODO.md MAC-2); four shards hold
@@ -670,7 +680,10 @@ cc_test(
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/protocol",
+        "//talOS/schema:identity",
+        "//talOS/schema:test_messages",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 

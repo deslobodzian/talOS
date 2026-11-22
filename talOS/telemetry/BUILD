@@ -107,11 +107,30 @@ cc_test(
 )
 
 cc_library(
+    name = "config_validation",
+    srcs = ["config_validation.cc"],
+    hdrs = ["config_validation.h"],
+    visibility = _FRAMEWORK_VISIBILITY,
+    deps = [
+        ":channels",
+        ":dashboard_layout",
+        ":frames",
+        ":schema",
+        ":wire",
+        "//talOS/configuration",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
+        "@tomlplusplus//:toml++",
+    ],
+)
+
+cc_library(
     name = "telemetry",
     hdrs = ["node.h"],
     visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":channels",
+        ":config_validation",
         ":dashboard_layout",
         ":frames",
         ":schema",

@@ -1,7 +1,5 @@
 #pragma once
 
-#include <fnmatch.h>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -32,36 +30,13 @@
 #include "talOS/schema/field_path.h"
 #include "talOS/schema/identity.h"
 #include "talOS/telemetry/channels.h"
+#include "talOS/telemetry/config_validation.h"
 #include "talOS/telemetry/dashboard_layout.h"
 #include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/telemetry_generated.h"
 #include "talOS/telemetry/wire.h"
 
 namespace talos::telemetry {
-
-namespace detail {
-
-inline bool MatchesAnyGlob(std::string_view name,
-                           const std::vector<std::string>& patterns) {
-  const std::string unslashed{
-      !name.empty() && name.front() == '/' ? name.substr(1) : name};
-  const std::string full_str = "/" + unslashed;
-  for (const auto& pattern : patterns) {
-    if (::fnmatch(pattern.c_str(), full_str.c_str(), 0) == 0 ||
-        ::fnmatch(pattern.c_str(), unslashed.c_str(), 0) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-inline bool MatchesGlobs(std::string_view topic,
-                         const std::vector<std::string>& includes,
-                         const std::vector<std::string>& excludes) {
-  return !MatchesAnyGlob(topic, excludes) && MatchesAnyGlob(topic, includes);
-}
-
-}  // namespace detail
 
 // How the telemetry node opens its byte topic. The stream is for viewers,
 // not a record (each node's event log is), so it overwrites: a stalled or
@@ -231,15 +206,6 @@ class Telemetry {
     Channel channel;
   };
 
-  // One [[subsystem.labels]] entry (keys labels[<i>].channel and
-  // labels[<i>].from): `channel` is named by `from`, another subsystem's
-  // string-array parameter, read at construction.
-  struct LabelSpec {
-    std::string key;  // "labels[<i>]", what an error names
-    std::string channel;
-    std::vector<std::string> labels;
-  };
-
   struct ObservedTopic {
     std::string name;
     std::size_t sub_index;
@@ -250,142 +216,30 @@ class Telemetry {
     std::array<std::size_t, kDriverStationChannelCount> ds_channels{};
   };
 
-  // Every [[subsystem.labels]] entry, its `from` read with param_of. Throws
-  // std::invalid_argument naming the key for a missing `channel` or `from`,
-  // a `from` that is not <subsystem>.<key>, a subsystem the config lacks, a
-  // missing key, a value that is not a non-empty array of strings, more
-  // than kMaxEnumLabels labels, or a label past the dictionary string limit.
+  // Every [[subsystem.labels]] entry, its `from` read with param_of via
+  // ParseLabelSpecs (config_validation.h), recording parameter reads for
+  // --describe / LintParameterKeys.
   static std::vector<LabelSpec> ReadLabels(Node& node) {
-    std::vector<LabelSpec> specs;
-    for (std::size_t i = 0;; ++i) {
-      const std::string key = "labels[" + std::to_string(i) + "]";
-      std::string channel = node.param<std::string>(key + ".channel", "");
-      const std::string from = node.param<std::string>(key + ".from", "");
-      if (channel.empty() && from.empty()) break;
-      const auto refuse = [&key](const std::string& field,
-                                 const std::string& why) {
-        throw std::invalid_argument("telemetry: " + key + "." + field + " " +
-                                    why + " (see talOS/telemetry/README.md)");
-      };
-      if (channel.empty()) refuse("channel", "is missing");
-      if (from.empty()) refuse("from", "is missing");
-      const std::size_t dot = from.find('.');
-      if (dot == 0 || dot == std::string::npos || dot + 1 == from.size()) {
-        refuse("from", "'" + from + "' is not <subsystem>.<key>");
-      }
-      std::vector<std::string> labels;
-      try {
-        labels = node.param_of<std::vector<std::string>>(from.substr(0, dot),
-                                                         from.substr(dot + 1));
-      } catch (const std::invalid_argument& error) {
-        refuse("from", "'" + from + "': " + error.what());
-      }
-      if (labels.empty()) refuse("from", "'" + from + "' holds no labels");
-      if (labels.size() > telemetry_wire::kMaxEnumLabels) {
-        refuse("from", "'" + from + "' holds " + std::to_string(labels.size()) +
-                           " labels, over the " +
-                           std::to_string(telemetry_wire::kMaxEnumLabels) +
-                           "-label limit");
-      }
-      for (const std::string& label : labels) {
-        if (label.size() > telemetry_wire::kMaxDictionaryStringBytes) {
-          refuse("from",
-                 "'" + from + "' holds a label of " +
-                     std::to_string(label.size()) + " bytes, over the " +
-                     std::to_string(telemetry_wire::kMaxDictionaryStringBytes) +
-                     "-byte dictionary string limit");
-        }
-      }
-      specs.push_back(LabelSpec{key, std::move(channel), std::move(labels)});
-    }
-    return specs;
+    using talos::detail::NodeAccess;
+    return ParseLabelSpecs(
+        NodeAccess::robot_config(node), node.name(),
+        LabelParamHooks{
+            .on_own_string =
+                [&node](std::string_view key) {
+                  static_cast<void>(node.param<std::string>(key, ""));
+                },
+            .on_from_string_list =
+                [&node](std::string_view subsystem, std::string_view key) {
+                  static_cast<void>(
+                      node.param_of<std::vector<std::string>>(subsystem, key));
+                },
+        });
   }
 
-  // Attaches each LabelSpec's labels to its channel. Throws
-  // std::invalid_argument naming the key for a channel absent from the
-  // dictionary (excluded, or no state or status topic holds it), one that is
-  // not an integer, or one that already has labels (an enum, or an earlier
-  // entry).
-  void ApplyLabels() {
-    for (LabelSpec& spec : labels_) {
-      const auto refuse = [&spec](const std::string& why) {
-        throw std::invalid_argument("telemetry: " + spec.key + ".channel '" +
-                                    spec.channel + "' " + why +
-                                    " (see talOS/telemetry/README.md)");
-      };
-      const auto it = std::find_if(
-          dictionary_.begin(), dictionary_.end(),
-          [&spec](const ChannelDef& def) { return def.name == spec.channel; });
-      if (it == dictionary_.end()) {
-        refuse("is not a channel of this dictionary");
-      }
-      if (it->kind != Talos::Telemetry::ChannelKind_Int &&
-          it->kind != Talos::Telemetry::ChannelKind_UInt) {
-        refuse("is not an integer channel");
-      }
-      if (!it->labels.empty()) refuse("already has labels");
-      it->labels = std::move(spec.labels);
-    }
-    labels_.clear();
-  }
+  void ApplyLabels() { ApplyLabelSpecs(labels_, dictionary_); }
 
-  // The layout against this dictionary (README "Dashboard layout"). Throws
-  // DashboardLayoutError naming the file and the key that named a channel
-  // the dictionary lacks (excluded, or no state or status topic holds it):
-  // `widgets[<i>].<key>`, `widgets[<i>].channels[<k>]` for a graph series,
-  // `widgets[<i>].items[<j>].channel` for a check, `widgets[<i>].pose` for a
-  // field's pose fields and `widgets[<i>].kind` for a match or power
-  // widget's fixed channels. Then holds the feed (the named channels, plus
-  // every alert channel for an `alerts` widget) to the layout's budget.
   void CheckDashboard(const DashboardLayout& layout) const {
-    std::set<std::string_view> present;
-    for (const ChannelDef& def : dictionary_) present.insert(def.name);
-    const std::string file = layout.file.string();
-    const auto require = [&](std::size_t index, const std::string& key,
-                             const std::string& name, const std::string& what) {
-      if (present.contains(name)) return;
-      throw DashboardLayoutError(
-          file + ": widgets[" + std::to_string(index) + "]." + key + ": '" +
-          name + "'" + what +
-          " is not a channel of this dictionary (excluded, or no state or "
-          "status topic holds it; see talOS/telemetry/README.md)");
-    };
-    for (std::size_t i = 0; i < layout.widgets.size(); ++i) {
-      const DashboardWidget& widget = layout.widgets[i];
-      const bool fixed = widget.kind == DashboardWidgetKind::kMatch ||
-                         widget.kind == DashboardWidgetKind::kPower;
-      for (const DashboardChannel& channel : widget.channels) {
-        if (fixed) {
-          require(i, "kind", channel.name,
-                  ", which a " +
-                      std::string(DashboardWidgetKindName(widget.kind)) +
-                      " widget reads,");
-        } else if (widget.kind == DashboardWidgetKind::kField &&
-                   (channel.role == "x" || channel.role == "y" ||
-                    channel.role == "yaw")) {
-          require(i, "pose", channel.name, "");
-        } else {
-          require(i, channel.role, channel.name, "");
-        }
-      }
-      for (std::size_t k = 0; k < widget.series.size(); ++k) {
-        require(i, "channels[" + std::to_string(k) + "]", widget.series[k], "");
-      }
-      for (std::size_t j = 0; j < widget.items.size(); ++j) {
-        require(i, "items[" + std::to_string(j) + "].channel",
-                widget.items[j].channel, "");
-      }
-    }
-    // The drive feed's channels in this dictionary (DriveFeedChannels: the
-    // layout's, the RoboRIO link's alert, and every alert channel with an
-    // `alerts` widget; dictionary names are distinct).
-    const DriveChannels feed = DriveFeedChannels(layout);
-    const auto carried = static_cast<std::size_t>(
-        std::ranges::count_if(dictionary_, [&feed](const ChannelDef& def) {
-          return feed.Carries(def.name,
-                              def.alert != Talos::Telemetry::AlertLevel_None);
-        }));
-    CheckDashboardBudget(layout, carried);
+    CheckDashboardAgainstDictionary(layout, dictionary_);
   }
 
   static std::string ResolveTopic(Node& node) {
@@ -418,7 +272,7 @@ class Telemetry {
                          std::string unit = "",
                          std::vector<std::string> labels = {},
                          AlertLevel alert = Talos::Telemetry::AlertLevel_None) {
-    if (detail::MatchesAnyGlob(name, exclude_globs_)) {
+    if (MatchesAnyGlob(name, exclude_globs_)) {
       return std::numeric_limits<std::size_t>::max();
     }
     for (const ChannelDef& existing : dictionary_) {
@@ -542,8 +396,7 @@ class Telemetry {
         const std::string_view role = introspect::naming::Role(source.name);
         if (role != "state" && role != "status") continue;
 
-        if (!detail::MatchesGlobs(source.name, include_globs_,
-                                  exclude_globs_)) {
+        if (!MatchesGlobs(source.name, include_globs_, exclude_globs_)) {
           continue;
         }
 
@@ -706,7 +559,7 @@ class Telemetry {
     // as for any source too large to serve whole.
     FlattenOptions options;
     options.keep = [this](std::string_view name) {
-      return !detail::MatchesAnyGlob(std::string{name}, exclude_globs_);
+      return !MatchesAnyGlob(name, exclude_globs_);
     };
     options.max_channels = telemetry_wire::kMaxChannels + 1;
     options.truncate = true;
