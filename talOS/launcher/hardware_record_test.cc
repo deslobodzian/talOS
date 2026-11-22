@@ -757,7 +757,14 @@ TEST(HardwareProtocolCheck, TheBridgesRecordedVersionComesFirst) {
       EXPECT_EQ(recorded.version(), c.version);
       EXPECT_EQ(recorded.refused(), c.refused);
       EXPECT_EQ(recorded.Refusal().empty(), !c.refused);
-      EXPECT_EQ(recorded.Disagreement().empty(), !c.disagreement);
+      const std::string disagreement = recorded.Disagreement();
+      EXPECT_EQ(disagreement.empty(), !c.disagreement);
+      if (c.disagreement) {
+        EXPECT_NE(disagreement.find(std::to_string(kBuild)), std::string::npos)
+            << disagreement;
+        EXPECT_NE(disagreement.find(std::to_string(kOther)), std::string::npos)
+            << disagreement;
+      }
     }
   }
   std::filesystem::remove_all(dir);
