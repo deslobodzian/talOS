@@ -1293,7 +1293,7 @@ talos::schema::Identity Reading(const char* env) {
 
 // The D2 gate: a field whose type changed while its size did not (level_m
 // float -> int, both 4 bytes) must not attach, however equal the layouts are.
-// REQ-CONTRACT-21
+// REQ-CONTRACT-07, REQ-CONTRACT-21
 TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
   const talos::schema::Identity before = Reading("TALOS_VARIANT_FLOAT_LEVEL");
   const talos::schema::Identity after = Reading("TALOS_VARIANT_INT_LEVEL");
@@ -1303,15 +1303,23 @@ TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
 
   constexpr std::size_t kBytes = 8;  // float or int, then two bytes, padded
   RTMSQueue publisher{path, kBytes, 4, before, 16, publisher_options()};
-  EXPECT_THROW((RTMSQueue{path, kBytes, 4, after, 16, sequence_options()}),
-               std::runtime_error);
+  try {
+    RTMSQueue mismatched{path, kBytes, 4, after, 16, sequence_options()};
+    FAIL() << "expected schema hash mismatch";
+  } catch (const std::runtime_error& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find(talos::schema::Describe(before)), std::string::npos)
+        << what;
+    EXPECT_NE(what.find(talos::schema::Describe(after)), std::string::npos)
+        << what;
+  }
   // The same schema attaches.
   RTMSQueue same{path, kBytes, 4, before, 16, sequence_options()};
   EXPECT_EQ(same.schema_hash(), before.hash);
   EXPECT_EQ(same.schema_name(), "schema_variant.Reading");
 }
 
-// REQ-CONTRACT-21
+// REQ-CONTRACT-07, REQ-CONTRACT-21
 TEST(RTMSSchema, ANameMismatchIsRejectedEvenWithTheSameHash) {
   const std::string path = make_test_path("schema_name");
   shm_unlink(ShmObjectName(path).c_str());
@@ -1321,11 +1329,20 @@ TEST(RTMSSchema, ANameMismatchIsRejectedEvenWithTheSameHash) {
                       kSchema,
                       16,
                       publisher_options()};
-  EXPECT_THROW(
-      RTMSQueue(path, sizeof(Message::TestMessage),
-                alignof(Message::TestMessage),
-                {"Message.Renamed", kSchema.hash}, 16, sequence_options()),
-      std::runtime_error);
+  const talos::schema::Identity renamed{"Message.Renamed", kSchema.hash};
+  try {
+    RTMSQueue mismatched{path,
+                         sizeof(Message::TestMessage),
+                         alignof(Message::TestMessage),
+                         renamed,
+                         16,
+                         sequence_options()};
+    FAIL() << "expected schema name mismatch";
+  } catch (const std::runtime_error& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find(kSchema.name), std::string::npos) << what;
+    EXPECT_NE(what.find(renamed.name), std::string::npos) << what;
+  }
 }
 
 // --- segment lifetime

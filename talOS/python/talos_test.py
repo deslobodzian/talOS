@@ -744,6 +744,125 @@ can_id = 3
         self.assertIsNone(signals.encoder.velocity_age)
         self.assertIsNone(signals.gyro.yaw_rate_time)
 
+    # REQ-CONTRACT-34: before any valid sample, Motor, CANcoder, Encoder and
+    # Gyro read 0.0; across disconnect and stale link, each holds its last
+    # valid position/yaw through any rezero offset while rates and efforts
+    # read 0.0 and connected is False.
+    def test_invalid_and_stale_samples_hold_position_and_zero_rates(self):
+        class Mech:
+            def __init__(self, node):
+                self.motor = talos.Motor(node, "lift")
+                self.cc = talos.CANcoder(node, "cc")
+                self.gyro = talos.Gyro(node, "gyro")
+                self.enc = talos.Encoder(node, "enc")
+
+        toml = ROBOT_TOML + """
+[subsystems.lift.sensors.cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.lift.sensors.gyro]
+type = "Pigeon2"
+can_id = 3
+[subsystems.lift.encoders.enc]
+type = "DutyCycleEncoder"
+dio = 2
+"""
+        sim = Sim.from_toml(toml)
+        mech = sim.add(Mech, "lift")
+
+        # Before first valid sample: disconnected and 0.0 across all reads.
+        sim.step(0.02)
+        self.assertFalse(mech.motor.connected)
+        self.assertEqual(mech.motor.position, 0.0)
+        self.assertEqual(mech.motor.velocity, 0.0)
+        self.assertEqual(mech.motor.voltage, 0.0)
+        self.assertEqual(mech.motor.current, 0.0)
+        self.assertEqual(mech.motor.supply_current_a, 0.0)
+        self.assertFalse(mech.cc.connected)
+        self.assertEqual(mech.cc.position, 0.0)
+        self.assertEqual(mech.cc.velocity, 0.0)
+        self.assertFalse(mech.enc.connected)
+        self.assertEqual(mech.enc.position, 0.0)
+        self.assertEqual(mech.enc.velocity, 0.0)
+        self.assertFalse(mech.gyro.connected)
+        self.assertEqual(mech.gyro.yaw, 0.0)
+        self.assertEqual(mech.gyro.yaw_rate, 0.0)
+
+        # Valid sample + rezero Motor and Gyro.
+        hw = SimHardware(sim)
+        hw.set_motor("lift", "lift", 3.0, 2.0,
+                     temperature_c=40.0, supply_current_a=18.0,
+                     stator_current_a=30.0)
+        hw.set_cancoder("lift", "cc", 0.2, 0.3)
+        hw.set_gyro("lift", "gyro", 0.25, -0.5)
+        hw.set_encoder("lift", "enc", 0.4, 0.6)
+        sim.step(0.02)
+        mech.motor.rezero(1.0)
+        mech.gyro.rezero(0.0)
+        self.assertTrue(mech.motor.zeroed)
+        self.assertTrue(mech.gyro.zeroed)
+        self.assertAlmostEqual(mech.motor.position, 1.0)
+        self.assertAlmostEqual(mech.motor.velocity, 2.0)
+        self.assertAlmostEqual(mech.motor.current, 30.0)
+        self.assertAlmostEqual(mech.motor.supply_current_a, 18.0)
+        self.assertAlmostEqual(mech.gyro.yaw, 0.0)
+        self.assertAlmostEqual(mech.gyro.yaw_rate, -0.5)
+        self.assertAlmostEqual(mech.cc.position, 0.2)
+        self.assertAlmostEqual(mech.enc.position, 0.4)
+
+        # Disconnect every device: positions hold through rezero offsets;
+        # rates and efforts read 0.0.
+        for dev in ("lift", "cc", "gyro", "enc"):
+            hw.set_connected("lift", dev, False)
+        sim.step(0.02)
+        self.assertFalse(mech.motor.connected)
+        self.assertFalse(mech.cc.connected)
+        self.assertFalse(mech.gyro.connected)
+        self.assertFalse(mech.enc.connected)
+        self.assertAlmostEqual(mech.motor.position, 1.0)
+        self.assertAlmostEqual(mech.gyro.yaw, 0.0)
+        self.assertAlmostEqual(mech.cc.position, 0.2)
+        self.assertAlmostEqual(mech.enc.position, 0.4)
+        self.assertEqual(mech.motor.velocity, 0.0)
+        self.assertEqual(mech.motor.voltage, 0.0)
+        self.assertEqual(mech.motor.current, 0.0)
+        self.assertEqual(mech.motor.supply_current_a, 0.0)
+        self.assertEqual(mech.cc.velocity, 0.0)
+        self.assertEqual(mech.gyro.yaw_rate, 0.0)
+        self.assertEqual(mech.enc.velocity, 0.0)
+
+        # Reconnect with new live positions, then drop the link past
+        # command_timeout_us (stale link).
+        hw.set_motor("lift", "lift", 5.0, 2.0,
+                     temperature_c=45.0, supply_current_a=18.0,
+                     stator_current_a=30.0)
+        hw.set_cancoder("lift", "cc", 0.35, 0.3)
+        hw.set_gyro("lift", "gyro", 0.5, -0.5)
+        hw.set_encoder("lift", "enc", 0.55, 0.6)
+        for dev in ("lift", "cc", "gyro", "enc"):
+            hw.set_connected("lift", dev, True)
+        sim.step(0.02)
+        self.assertAlmostEqual(mech.motor.position, 3.0)
+        self.assertAlmostEqual(mech.gyro.yaw, 0.25)
+
+        del hw
+        sim.step(0.15)
+        self.assertFalse(mech.motor.connected)
+        self.assertFalse(mech.cc.connected)
+        self.assertFalse(mech.gyro.connected)
+        self.assertFalse(mech.enc.connected)
+        self.assertAlmostEqual(mech.motor.position, 3.0)
+        self.assertAlmostEqual(mech.gyro.yaw, 0.25)
+        self.assertAlmostEqual(mech.cc.position, 0.35)
+        self.assertAlmostEqual(mech.enc.position, 0.55)
+        self.assertEqual(mech.motor.velocity, 0.0)
+        self.assertEqual(mech.motor.voltage, 0.0)
+        self.assertEqual(mech.motor.current, 0.0)
+        self.assertEqual(mech.motor.supply_current_a, 0.0)
+        self.assertEqual(mech.cc.velocity, 0.0)
+        self.assertEqual(mech.gyro.yaw_rate, 0.0)
+        self.assertEqual(mech.enc.velocity, 0.0)
+
     def test_limit_switches_read_only_from_a_connected_sample(self):
         sim = Sim.from_toml(ROBOT_TOML)
         lift = sim.add(Lift, "lift").lift

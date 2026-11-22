@@ -1256,6 +1256,67 @@ TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
     ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
     ASSERT_EQ(ReceiveConfigs(gateway), 1u);
   }
+
+  // After backing off to 2 s via rejected ACKs, a State from a new boot_id
+  // triggers an immediate push and resets the next retry gate to 50 ms on no
+  // ACK.
+  now += 1000;
+  uint64_t reboot_sample_us = 1000;
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(id, 12, 1, reboot_sample_us), now));
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(id, 12, 1, reboot_sample_us + 49'999),
+                          now + 49'999));
+  EXPECT_EQ(drain_configs(), 0u);
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(id, 12, 1, reboot_sample_us + 50'000),
+                          now + 50'000));
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
+}
+
+// REQ-CONTRACT-04: when no ConfigAck arrives (lost push or ACK), the bridge
+// retries on the 50 ms gate while subsystem commands keep flowing.
+TEST(HardwareNodeTest, LostConfigPushRetriesAt50MsWithoutStoppingCommands) {
+  auto cfg = config::ParseRobotConfigString(kTestToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  const auto id = NodeConfigId(cfg);
+  uint64_t now = 1'000'000;
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
+  const auto drain_configs = [&] {
+    unsigned count = 0;
+    protocol::DecodedFrame frame;
+    while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk)
+      count += frame.header.type == protocol::FrameType::kHardwareConfig;
+    return count;
+  };
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
+
+  ipc::Publisher<Packet> pub{RequestTopic("drivetrain")};
+  const auto before = node.commands_sent();
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now + 49'999),
+                          now + 49'999));
+  EXPECT_EQ(drain_configs(), 0u);
+  Command request{};
+  request.config_id = id;
+  request.boot_id = 11;
+  request.epoch = 1;
+  request.observed_time_us = now + 49'999;
+  request.count = 1;
+  request.motors[0] = {cfg.subsystems.at("drivetrain").motors[0],
+                       Mode::kDutyCycle, 0, 0.2};
+  PublishCommand(pub, request);
+  node.Tick(now + 49'999);
+  EXPECT_GT(node.commands_sent(), before);
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kDutyCycle);
+  EXPECT_EQ(drain_configs(), 0u);
+
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now + 50'000),
+                          now + 50'000));
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
 }
 
 // Run() sleeps between inputs, so every time-driven duty must wake it at the

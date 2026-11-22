@@ -122,10 +122,102 @@ TEST(DriverStationTest, UnterminatedStringsTruncateInsteadOfFailing) {
   EXPECT_STREQ(decoded.joysticks[0].name, "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN");
 }
 
+// REQ-CONTRACT-02
 TEST(DriverStationTest, CorruptPayloadRejection) {
-  std::array<uint8_t, 10> short_data{};
-  DriverStationData ds{};
-  EXPECT_FALSE(Decode(short_data, ds));
+  DriverStationData base{};
+  base.sample_time_us = 1000;
+  base.mode_since_us = 1000;
+  base.boot_id = 7;
+  base.fms.flags = kDsAttached | kEnabled | kTeleop;
+  auto& stick = base.joysticks[0];
+  stick.connected = true;
+  stick.axis_count = 2;
+  stick.button_count = 3;
+  stick.pov_count = 1;
+  stick.buttons = 0x5u;
+  stick.axes[0] = 0.25f;
+  stick.axes[1] = -0.5f;
+  stick.povs[0] = 90;
+  std::memcpy(stick.name, "pad", 3);
+
+  std::array<uint8_t, kMaxEncodedSize + 1> encoded{};
+  const std::size_t size = Encode(base, {encoded.data(), kMaxEncodedSize});
+  ASSERT_GT(size, 0u);
+  DriverStationData decoded{};
+  ASSERT_TRUE(Decode({encoded.data(), size}, decoded));
+
+  // Every prefix truncation 0..size-1 is rejected.
+  for (std::size_t truncated = 0; truncated < size; ++truncated) {
+    EXPECT_FALSE(Decode({encoded.data(), truncated}, decoded))
+        << "accepted truncated length " << truncated << " of " << size;
+  }
+
+  // Trailing byte (size + 1) is rejected.
+  encoded[size] = 0x00;
+  EXPECT_FALSE(Decode({encoded.data(), size + 1}, decoded));
+
+  // Layout offsets for base (game_specific_message and event_name are empty):
+  //   38: game_specific_message length (0)
+  //   39: event_name length (0)
+  //   40: joysticks[0].connected (1)
+  //   41: axis_count (2), 42: button_count (3), 43: pov_count (1)
+  //   44..47: buttons, 48..55: 2 axes, 56..57: 1 pov, 58: name length (3)
+  constexpr std::size_t kGameMsgLenOffset = 38;
+  constexpr std::size_t kEventNameLenOffset = 39;
+  constexpr std::size_t kAxisCountOffset = 41;
+  constexpr std::size_t kButtonCountOffset = 42;
+  constexpr std::size_t kPovCountOffset = 43;
+  constexpr std::size_t kAxesStartOffset = 48;
+  constexpr std::size_t kPovsStartOffset = 56;
+  constexpr std::size_t kStickNameLenOffset = 58;
+  ASSERT_EQ(encoded[kGameMsgLenOffset], 0u);
+  ASSERT_EQ(encoded[kEventNameLenOffset], 0u);
+  ASSERT_EQ(encoded[kAxisCountOffset], 2u);
+  ASSERT_EQ(encoded[kButtonCountOffset], 3u);
+  ASSERT_EQ(encoded[kPovCountOffset], 1u);
+  ASSERT_EQ(encoded[kStickNameLenOffset], 3u);
+
+  const std::vector<uint8_t> valid(encoded.begin(), encoded.begin() + size);
+
+  // Over-cap axis_count (> 12), padded with matching float bytes so only the
+  // cap check rejects it.
+  {
+    auto bad = valid;
+    bad[kAxisCountOffset] = static_cast<uint8_t>(kMaxAxes + 1);
+    bad.insert(bad.begin() + static_cast<std::ptrdiff_t>(kAxesStartOffset + 8),
+               (kMaxAxes + 1 - 2) * 4, 0);
+    EXPECT_FALSE(Decode(bad, decoded));
+  }
+
+  // Over-cap button_count (> 32).
+  {
+    auto bad = valid;
+    bad[kButtonCountOffset] = static_cast<uint8_t>(kMaxButtons + 1);
+    EXPECT_FALSE(Decode(bad, decoded));
+  }
+
+  // Over-cap pov_count (> 4), padded with matching int16 bytes.
+  {
+    auto bad = valid;
+    bad[kPovCountOffset] = static_cast<uint8_t>(kMaxPovs + 1);
+    bad.insert(bad.begin() + static_cast<std::ptrdiff_t>(kPovsStartOffset + 2),
+               (kMaxPovs + 1 - 1) * 2, 0);
+    EXPECT_FALSE(Decode(bad, decoded));
+  }
+
+  // Over-cap string lengths (> 31, i.e. 32 bytes) for every wire string,
+  // padded with matching string bytes so only the length cap rejects it.
+  for (const auto& [offset, old_len] :
+       {std::pair{kGameMsgLenOffset, std::size_t{0}},
+        std::pair{kEventNameLenOffset, std::size_t{0}},
+        std::pair{kStickNameLenOffset, std::size_t{3}}}) {
+    auto bad = valid;
+    constexpr uint8_t kTooLong = 32;  // > 31 max wire length
+    bad[offset] = kTooLong;
+    bad.insert(bad.begin() + static_cast<std::ptrdiff_t>(offset + 1 + old_len),
+               kTooLong - old_len, static_cast<uint8_t>('A'));
+    EXPECT_FALSE(Decode(bad, decoded)) << "offset " << offset;
+  }
 }
 
 DriverStationData Sample(uint64_t time_us, uint32_t flags) {

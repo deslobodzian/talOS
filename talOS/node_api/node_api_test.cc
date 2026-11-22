@@ -598,6 +598,174 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   talos_sim_hardware_destroy(hw);
 }
 
+// REQ-CONTRACT-34: before any valid sample, Motor, CANcoder, Encoder and Gyro
+// read 0.0; across disconnect and stale link, each holds its last valid
+// position/yaw through any rezero offset while rates and efforts read 0.0.
+TEST(NodeApiDevices, InvalidAndStaleSamplesHoldPositionAndZeroRatesAndEfforts) {
+  constexpr const char* kDevicesToml = R"(
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+
+[subsystems.mech.motors.wheel]
+can_id = 1
+[subsystems.mech.sensors.cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.mech.sensors.gyro]
+type = "Pigeon2"
+can_id = 3
+[subsystems.mech.encoders.enc]
+type = "DutyCycleEncoder"
+dio = 2
+)";
+  struct Handles {
+    int64_t wheel = -1;
+    int64_t cc = -1;
+    int64_t gyro = -1;
+    int64_t enc = -1;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& h = *static_cast<Handles*>(user);
+    h.wheel = talos_device(node, TALOS_DEVICE_MOTOR, "wheel");
+    h.cc = talos_device(node, TALOS_DEVICE_CANCODER, "cc");
+    h.gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
+    h.enc = talos_device(node, TALOS_DEVICE_ENCODER, "enc");
+    if (h.wheel < 0 || h.cc < 0 || h.gyro < 0 || h.enc < 0) return 1;
+    return 0;
+  };
+
+  TalosSim* sim = talos_sim_from_toml(kDevicesToml);
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+  Handles h;
+  TalosNode* node = talos_sim_add(sim, "mech", build, &h);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+
+  // Before the first valid sample: valid == 0 and all reads are 0.0.
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+  TalosSample wheel{}, cc{}, gyro{}, enc{};
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_EQ(talos_encoder_sample(node, h.enc, &enc), TALOS_OK);
+  for (const TalosSample* s : {&wheel, &cc, &gyro, &enc}) {
+    EXPECT_EQ(s->valid, 0);
+    EXPECT_EQ(s->position, 0.0);
+    EXPECT_EQ(s->velocity, 0.0);
+  }
+  EXPECT_EQ(wheel.voltage, 0.0);
+  EXPECT_EQ(wheel.current, 0.0);
+  EXPECT_EQ(wheel.supply_current_a, 0.0);
+
+  // Establish live samples and rezero Motor and Gyro.
+  TalosSimHardware* hw = talos_sim_hardware_create(sim);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "mech", "wheel", 3.0, 2.0, 0, 0,
+                                         40.0, 18.0, 30.0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_cancoder(hw, "mech", "cc", 0.2, 0.3, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_gyro(hw, "mech", "gyro", 0.25, -0.5, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_encoder(hw, "mech", "enc", 0.4, 0.6),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+
+  ASSERT_EQ(talos_motor_rezero(node, h.wheel, 1.0), TALOS_OK);
+  ASSERT_EQ(talos_gyro_rezero(node, h.gyro, 0.0), TALOS_OK);
+  ASSERT_EQ(talos_motor_zeroed(node, h.wheel), 1);
+  ASSERT_EQ(talos_gyro_zeroed(node, h.gyro), 1);
+
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_EQ(talos_encoder_sample(node, h.enc, &enc), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 1);
+  EXPECT_DOUBLE_EQ(wheel.position, 1.0);
+  EXPECT_DOUBLE_EQ(wheel.velocity, 2.0);
+  EXPECT_DOUBLE_EQ(wheel.current, 30.0);
+  EXPECT_DOUBLE_EQ(wheel.supply_current_a, 18.0);
+  EXPECT_EQ(cc.valid, 1);
+  EXPECT_DOUBLE_EQ(cc.position, 0.2);
+  EXPECT_DOUBLE_EQ(cc.velocity, 0.3);
+  EXPECT_EQ(gyro.valid, 1);
+  EXPECT_DOUBLE_EQ(gyro.position, 0.0);
+  EXPECT_DOUBLE_EQ(gyro.velocity, -0.5);
+  EXPECT_EQ(enc.valid, 1);
+  EXPECT_DOUBLE_EQ(enc.position, 0.4);
+  EXPECT_DOUBLE_EQ(enc.velocity, 0.6);
+
+  // Disconnect every device: positions hold through rezero offsets; rates and
+  // efforts read 0.0.
+  for (const char* dev : {"wheel", "cc", "gyro", "enc"}) {
+    ASSERT_EQ(talos_sim_hardware_set_connected(hw, "mech", dev, 0), TALOS_OK);
+  }
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_EQ(talos_encoder_sample(node, h.enc, &enc), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 0);
+  EXPECT_EQ(cc.valid, 0);
+  EXPECT_EQ(gyro.valid, 0);
+  EXPECT_EQ(enc.valid, 0);
+  EXPECT_DOUBLE_EQ(wheel.position, 1.0);
+  EXPECT_DOUBLE_EQ(gyro.position, 0.0);
+  EXPECT_DOUBLE_EQ(cc.position, 0.2);
+  EXPECT_DOUBLE_EQ(enc.position, 0.4);
+  EXPECT_EQ(wheel.velocity, 0.0);
+  EXPECT_EQ(wheel.voltage, 0.0);
+  EXPECT_EQ(wheel.current, 0.0);
+  EXPECT_EQ(wheel.supply_current_a, 0.0);
+  EXPECT_EQ(cc.velocity, 0.0);
+  EXPECT_EQ(gyro.velocity, 0.0);
+  EXPECT_EQ(enc.velocity, 0.0);
+
+  // Reconnect with updated live readings, then drop the hardware link past
+  // command_timeout_us (stale link).
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "mech", "wheel", 5.0, 2.0, 0, 0,
+                                         45.0, 18.0, 30.0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_cancoder(hw, "mech", "cc", 0.35, 0.3, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_gyro(hw, "mech", "gyro", 0.5, -0.5, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_encoder(hw, "mech", "enc", 0.55, 0.6),
+            TALOS_OK);
+  for (const char* dev : {"wheel", "cc", "gyro", "enc"}) {
+    ASSERT_EQ(talos_sim_hardware_set_connected(hw, "mech", dev, 1), TALOS_OK);
+  }
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_DOUBLE_EQ(wheel.position, 3.0);
+  ASSERT_DOUBLE_EQ(gyro.position, 0.25);
+
+  talos_sim_hardware_destroy(hw);
+  ASSERT_EQ(talos_sim_step(sim, 150 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_EQ(talos_encoder_sample(node, h.enc, &enc), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 0);
+  EXPECT_EQ(cc.valid, 0);
+  EXPECT_EQ(gyro.valid, 0);
+  EXPECT_EQ(enc.valid, 0);
+  EXPECT_DOUBLE_EQ(wheel.position, 3.0);
+  EXPECT_DOUBLE_EQ(gyro.position, 0.25);
+  EXPECT_DOUBLE_EQ(cc.position, 0.35);
+  EXPECT_DOUBLE_EQ(enc.position, 0.55);
+  EXPECT_EQ(wheel.velocity, 0.0);
+  EXPECT_EQ(wheel.voltage, 0.0);
+  EXPECT_EQ(wheel.current, 0.0);
+  EXPECT_EQ(wheel.supply_current_a, 0.0);
+  EXPECT_EQ(cc.velocity, 0.0);
+  EXPECT_EQ(gyro.velocity, 0.0);
+  EXPECT_EQ(enc.velocity, 0.0);
+
+  talos_sim_destroy(sim);
+}
+
 // A PWM output set to 0 pulses at the centre; after talos_pwm_stop it sends
 // no pulse, and the inspection calls tell the two apart. Like every setter,
 // talos_pwm_stop fails outside update().

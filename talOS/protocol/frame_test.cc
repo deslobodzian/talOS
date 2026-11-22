@@ -91,15 +91,62 @@ TEST(FrameTest, EncodesInPlaceAroundThePayloadAndZeroesReserved) {
 }
 
 // REQ-CONTRACT-01
-TEST(FrameTest, RejectsPreviousProtocolVersion) {
-  std::array<uint8_t, kMaxFrameSize> frame{};
+TEST(FrameTest, RejectsInvalidHeaderVersionMagicAndSize) {
+  std::array<uint8_t, kMaxFrameSize> valid{};
   const auto size = EncodeFrame(FrameType::kHardwareState, kFlagNone, 1, 2,
-                                nullptr, 0, frame.data(), frame.size());
-  frame[8] = static_cast<uint8_t>(kProtocolVersion - 1);
-  frame[9] = 0;
-  DecodedFrame decoded;
-  EXPECT_EQ(DecodeFrame(frame.data(), size, &decoded),
-            DecodeStatus::kUnsupportedVersion);
+                                nullptr, 0, valid.data(), valid.size());
+  ASSERT_EQ(size, kFrameHeaderSize);
+
+  DecodedFrame decoded{};
+  // Too small: 0 B and 39 B (one short of kFrameHeaderSize).
+  EXPECT_EQ(DecodeFrame(valid.data(), 0, &decoded), DecodeStatus::kTooSmall);
+  EXPECT_EQ(DecodeFrame(valid.data(), kFrameHeaderSize - 1, &decoded),
+            DecodeStatus::kTooSmall);
+
+  // Bad magic.
+  {
+    auto frame = valid;
+    frame[0] ^= 0x01;
+    EXPECT_EQ(DecodeFrame(frame.data(), size, &decoded),
+              DecodeStatus::kBadMagic);
+  }
+
+  // Unsupported version: both one below and one above kProtocolVersion.
+  for (const uint16_t bad_version :
+       {static_cast<uint16_t>(kProtocolVersion - 1),
+        static_cast<uint16_t>(kProtocolVersion + 1)}) {
+    auto frame = valid;
+    frame[8] = static_cast<uint8_t>(bad_version & 0xFF);
+    frame[9] = static_cast<uint8_t>(bad_version >> 8);
+    decoded = {};
+    EXPECT_EQ(DecodeFrame(frame.data(), size, &decoded),
+              DecodeStatus::kUnsupportedVersion);
+    EXPECT_EQ(decoded.header.version, bad_version);
+  }
+
+  // Bad header size: 39 B and 41 B.
+  for (const uint16_t bad_header_size :
+       {static_cast<uint16_t>(kFrameHeaderSize - 1),
+        static_cast<uint16_t>(kFrameHeaderSize + 1)}) {
+    auto frame = valid;
+    frame[10] = static_cast<uint8_t>(bad_header_size & 0xFF);
+    frame[11] = static_cast<uint8_t>(bad_header_size >> 8);
+    EXPECT_EQ(DecodeFrame(frame.data(), size, &decoded),
+              DecodeStatus::kBadHeaderSize);
+  }
+
+  // Payload larger than kMaxPayloadSize even when buffer size matches header.
+  {
+    std::array<uint8_t, kMaxFrameSize + 1> oversize{};
+    std::memcpy(oversize.data(), valid.data(), kFrameHeaderSize);
+    constexpr uint32_t kTooLarge = kMaxPayloadSize + 1;
+    oversize[32] = static_cast<uint8_t>(kTooLarge & 0xFF);
+    oversize[33] = static_cast<uint8_t>((kTooLarge >> 8) & 0xFF);
+    oversize[34] = static_cast<uint8_t>((kTooLarge >> 16) & 0xFF);
+    oversize[35] = static_cast<uint8_t>((kTooLarge >> 24) & 0xFF);
+    EXPECT_EQ(DecodeFrame(oversize.data(), oversize.size(), &decoded),
+              DecodeStatus::kPayloadTooLarge);
+  }
 }
 
 // REQ-CONTRACT-02
