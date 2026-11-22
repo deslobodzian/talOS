@@ -531,6 +531,47 @@ TEST(SimulatedEventLoop, DeliveryIsFixedOnceTheRunStarts) {
   EXPECT_THROW(loop.set_delivery(Delivery::BEFORE_TIMERS), std::logic_error);
 }
 
+// Re-entering run_until / run_for from inside a dispatch is refused rather than
+// dispatching nested callbacks or clearing the outer run's in_run_ flag.
+// REQ-RT-04
+TEST(SimulatedEventLoop, ReentrantRunUntilThrowsAndKeepsOuterRunActive) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+
+  int calls = 0;
+  bool other_thread_rejected = false;
+  std::uint16_t timer_id = 0;
+  auto handler = [&](const Context& context) {
+    ++calls;
+    if (calls != 1) return;
+    EXPECT_THROW(loop.run_for(2ms), std::logic_error);
+    EXPECT_THROW(loop.run_until(context.now + 2ms), std::logic_error);
+    EXPECT_EQ(calls, 1) << "re-entrant run dispatched a nested callback";
+    EXPECT_EQ(loop.monotonic_now(), context.now);
+
+    std::thread other{[&] {
+      try {
+        loop.arm_timer(timer_id, context.now + 1ms, 1ms);
+      } catch (const std::logic_error&) {
+        other_thread_rejected = true;
+      }
+    }};
+    other.join();
+  };
+
+  timer_id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(timer_id, MonotonicTime::from_nanos(1'000'000), 1ms);
+
+  loop.run_for(3ms);
+  EXPECT_TRUE(other_thread_rejected)
+      << "rejected re-entrant run cleared outer in_run_";
+  EXPECT_EQ(calls, 3);
+
+  // Outer RunScope cleared in_run_ on normal exit, so the next step runs.
+  loop.run_for(2ms);
+  EXPECT_EQ(calls, 5);
+}
+
 TEST(SimulatedEventLoop, ExitStopsTheLoop) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};
