@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <opencv2/imgcodecs.hpp>
 #include <optional>
 #include <string>
@@ -61,14 +62,11 @@ bool AcceptEstimate(const RobotPoseEstimate& e, double max_reprojection_px,
 }
 
 double WrapAngle(double rad) {
-  constexpr double kPi = 3.14159265358979323846;
-  while (rad > kPi) {
-    rad -= 2.0 * kPi;
+  if (!std::isfinite(rad)) {
+    return std::numeric_limits<double>::quiet_NaN();
   }
-  while (rad < -kPi) {
-    rad += 2.0 * kPi;
-  }
-  return rad;
+  constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
+  return std::remainder(rad, kTwoPi);
 }
 
 struct Rms {
