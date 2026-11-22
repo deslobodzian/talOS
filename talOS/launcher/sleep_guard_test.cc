@@ -1,6 +1,8 @@
 #include "talOS/launcher/sleep_guard.h"
 
 #include <gtest/gtest.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <string>
@@ -147,6 +149,33 @@ TEST(SleepGuard, PlatformAcquireAndReleaseLifecycle) {
   EXPECT_FALSE(moved.active());
   moved.Release();
 #endif
+}
+
+TEST(SleepGuard, ForkedChildWithoutExecSkipsIoKitCleanly) {
+  std::string parent_error;
+  SleepGuard parent_guard =
+      SleepGuard::Acquire("talOS sleep_guard_test parent", &parent_error);
+  ASSERT_TRUE(parent_error.empty());
+
+  const pid_t pid = ::fork();
+  ASSERT_NE(pid, -1);
+  if (pid == 0) {
+    // Releasing an inherited guard or acquiring a new one in a forked child
+    // without exec() must never call CoreFoundation/IOKit on macOS.
+    std::string child_error = "stale";
+    SleepGuard child_guard =
+        SleepGuard::Acquire("talOS sleep_guard_test child", &child_error);
+    const bool ok = !child_guard.active() && child_error.empty();
+    child_guard.Release();
+    parent_guard.Release();
+    ::_exit(ok ? 0 : 1);
+  }
+
+  int status = 0;
+  ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+  EXPECT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+  parent_guard.Release();
 }
 
 }  // namespace

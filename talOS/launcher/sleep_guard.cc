@@ -9,7 +9,11 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOReturn.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include <pthread.h>
+#include <unistd.h>
 
+#include <atomic>
+#include <mutex>
 #include <sstream>
 #endif
 
@@ -17,9 +21,40 @@ namespace talos::launcher {
 namespace {
 
 #ifdef __APPLE__
+// CoreFoundation and IOKit power-management assertions cannot be called in a
+// process forked without exec() after they have been initialized in the parent
+// (macOS aborts or hangs in CoreFoundation/libxpc). Track the process that
+// first touched IOKit plus a pthread_atfork child flag so forked children
+// (such as in-process test forks) skip IOKit cleanly, while exec'd launcher
+// binaries start fresh and always acquire their assertion.
+std::atomic<bool> g_forked_after_iokit{false};
+std::atomic<pid_t> g_iokit_owner_pid{0};
+std::once_flag g_atfork_once;
+
+void EnsureForkGuardRegistered() {
+  std::call_once(g_atfork_once, [] {
+    g_iokit_owner_pid.store(::getpid(), std::memory_order_relaxed);
+    (void)::pthread_atfork(nullptr, nullptr, [] {
+      g_forked_after_iokit.store(true, std::memory_order_relaxed);
+    });
+  });
+}
+
+bool CanUseIoKitInThisProcess() noexcept {
+  if (g_forked_after_iokit.load(std::memory_order_relaxed)) return false;
+  const pid_t owner = g_iokit_owner_pid.load(std::memory_order_relaxed);
+  return owner == 0 || owner == ::getpid();
+}
+
 bool CreateMacOsAssertion(std::string_view reason, std::uint32_t& assertion_id,
                           bool& active, std::string& error, void* /*context*/) {
   static_assert(sizeof(IOPMAssertionID) == sizeof(std::uint32_t));
+  if (!CanUseIoKitInThisProcess()) {
+    assertion_id = 0;
+    active = false;
+    return true;
+  }
+  EnsureForkGuardRegistered();
   CFStringRef owned_name = nullptr;
   CFStringRef name = CFSTR("talOS robot session");
   if (!reason.empty()) {
@@ -50,6 +85,7 @@ bool CreateMacOsAssertion(std::string_view reason, std::uint32_t& assertion_id,
 
 void ReleaseMacOsAssertion(std::uint32_t assertion_id,
                            void* /*context*/) noexcept {
+  if (!CanUseIoKitInThisProcess()) return;
   (void)IOPMAssertionRelease(static_cast<IOPMAssertionID>(assertion_id));
 }
 
