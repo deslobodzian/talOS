@@ -150,10 +150,12 @@ inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
 inline constexpr std::uint64_t kRtmsVersion = 9;
 
-// RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
-// of queues attached to a segment that is not session-owned.
+// RTMSHeader::lifetime: a session-owned flag, a closing flag, an exclusive
+// reclamation flag for an abandoned closing segment, and the count of queues
+// attached to a segment that is not session-owned.
 inline constexpr std::uint64_t kLifetimeSessionOwned = 1ULL << 63;
 inline constexpr std::uint64_t kLifetimeClosing = 1ULL << 62;
+inline constexpr std::uint64_t kLifetimeReclaiming = 1ULL << 61;
 inline constexpr std::uint64_t kLifetimeCountMask = (1ULL << 32) - 1;
 
 // The segment records the writer's owner and each reader slot's claimant as
@@ -260,7 +262,7 @@ class RTMSQueue {
   // read_next() reports INACTIVE rather than share another claimant's cursor.
   std::optional<std::size_t> register_reader();
   // Frees reader slot `id` if this queue claimed it and still holds it.
-  void release_reader(std::size_t id);
+  void release_reader(std::size_t id) noexcept;
 
   // Wake channel (README.md "Wake channel"). Records the wake receiver for
   // a reader slot this queue holds; 0 disables.
