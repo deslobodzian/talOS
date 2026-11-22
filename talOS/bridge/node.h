@@ -561,11 +561,11 @@ class HardwareNode {
   // Set once a frame of another protocol version is logged, until a frame
   // of this version arrives.
   bool version_mismatch_logged_{false};
-  // Bridge-clock receipt time of the last kUnsupportedVersion datagram (0
-  // before one or after any kOk frame) and the protocol version its header
-  // carried. Reported active on /hw/status only while within
+  // Bridge-clock receipt time of the last kUnsupportedVersion datagram
+  // (nullopt before one or after any kOk frame) and the protocol version its
+  // header carried. Reported active on /hw/status only while within
   // config_.command_timeout_us so the alert never latches after the peer stops.
-  uint64_t last_version_mismatch_us_{0};
+  std::optional<uint64_t> last_version_mismatch_us_;
   uint16_t mismatched_protocol_version_{0};
   // Set once an undecodable State is logged, until a State decodes.
   bool state_decode_failure_logged_{false};

@@ -361,7 +361,7 @@ export class DriveModel {
     const s = this.latest;
     if (s && this.carries(s, PROTOCOL_MISMATCH_CHANNEL)) {
       const mismatch = s.channels[PROTOCOL_MISMATCH_CHANNEL];
-      if (mismatch !== undefined && mismatch !== 0) {
+      if (mismatch !== undefined && !Number.isNaN(mismatch) && mismatch !== 0) {
         return {
           link: 'protocol',
           text: 'RoboRIO and main processor protocol versions differ; redeploy both'
