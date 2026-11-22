@@ -1269,10 +1269,11 @@ TEST(LauncherTest, ExpectedLogRateCountsWhatEachLogStoresAtItsRate) {
                        50 * (64 + sizeof(::bridge::BridgeStatus)));
 }
 
-// A control loop the OS kept at timeshare is warned about and recorded in the
-// manifest session_report --strict judges. A later run that got its grant
-// does not clear it: the session still ran that loop without one. Only the
-// actuation path is warned about, and --sim excuses a loop that never asked.
+// REQ-RT-09: a control loop the OS kept at timeshare is warned about and
+// recorded in the manifest session_report --strict judges. A later run that got
+// its grant does not clear it: the session still ran that loop without one.
+// Only the actuation path is warned about, and --sim excuses a loop that never
+// asked.
 TEST(LauncherTest, ARefusedRealtimeGrantIsWarnedAndOutlivesALaterFullRun) {
   using process::LoopTier;
   const process::RealtimeOutcome refused{.tier = LoopTier::kControl,
@@ -5405,8 +5406,9 @@ TEST(LauncherRemoteTest, LocalAddressResolvesAndForwardsToBridge) {
   }
 
   // End-to-end launch: verify both probe and runtime receive the effective
-  // `--local-address` (CLI overriding `[robot] local_address`, including
-  // allowing `--sim` with `--local-address 127.0.0.1`) and that `talos.log`
+  // `--remote` and `--local-address` (CLI overriding `[robot]
+  // controller_address` and `[robot] local_address`, including allowing `--sim`
+  // with `--remote 127.0.0.1 --local-address 127.0.0.1`) and that `talos.log`
   // prints `(local <ip>:<port>)` when bound vs `(local port <port>)` when
   // unset.
   const std::string args_file = TempPath("local_addr_bridge_args");
@@ -5418,6 +5420,21 @@ TEST(LauncherRemoteTest, LocalAddressResolvesAndForwardsToBridge) {
                                         args_file + "'\n" +
                                         base.substr(shebang.size()));
   };
+  const auto split_invocations = [](const std::string& recorded,
+                                    std::vector<std::string>& probe_lines,
+                                    std::vector<std::string>& runtime_lines) {
+    probe_lines.clear();
+    runtime_lines.clear();
+    std::istringstream lines{recorded};
+    for (std::string line; std::getline(lines, line);) {
+      if (line.empty()) continue;
+      if (line.find("--describe") != std::string::npos) {
+        probe_lines.push_back(std::move(line));
+      } else {
+        runtime_lines.push_back(std::move(line));
+      }
+    }
+  };
 
   {
     ::remove(args_file.c_str());
@@ -5427,6 +5444,7 @@ TEST(LauncherRemoteTest, LocalAddressResolvesAndForwardsToBridge) {
       std::string toml{kFixtureToml};
       const std::string header = "[robot]\n";
       toml.insert(toml.find(header) + header.size(),
+                  "controller_address = \"10.56.87.2\"\n"
                   "local_address = \"10.56.87.5\"\n");
       options.config_path = TempPath("local_addr_bound_config") + ".toml";
       std::ofstream{options.config_path} << toml;
@@ -5434,13 +5452,23 @@ TEST(LauncherRemoteTest, LocalAddressResolvesAndForwardsToBridge) {
     options.binary_overrides["//talOS/bridge:hardware_node"] =
         make_recording_bridge("local_addr_bound_hw");
     options.simulation = true;
+    options.remote = "127.0.0.1";
     options.local_address = "127.0.0.1";
     ASSERT_EQ(Launcher{options}.Run(), 0);
     const std::string recorded = ReadFile(args_file);
-    EXPECT_NE(recorded.find("--describe"), std::string::npos) << recorded;
-    EXPECT_NE(recorded.find("--local-address 127.0.0.1"), std::string::npos)
-        << recorded;
-    EXPECT_EQ(recorded.find("10.56.87.5"), std::string::npos) << recorded;
+    std::vector<std::string> probe_lines;
+    std::vector<std::string> runtime_lines;
+    split_invocations(recorded, probe_lines, runtime_lines);
+    ASSERT_EQ(probe_lines.size(), 1u) << recorded;
+    ASSERT_EQ(runtime_lines.size(), 1u) << recorded;
+    for (const std::string& invocation : {probe_lines[0], runtime_lines[0]}) {
+      EXPECT_NE(invocation.find("--remote 127.0.0.1"), std::string::npos)
+          << invocation;
+      EXPECT_NE(invocation.find("--local-address 127.0.0.1"), std::string::npos)
+          << invocation;
+      EXPECT_EQ(invocation.find("10.56.87.2"), std::string::npos) << invocation;
+      EXPECT_EQ(invocation.find("10.56.87.5"), std::string::npos) << invocation;
+    }
     const std::string talos_log = ReadFile(options.output_dir + "/1/talos.log");
     EXPECT_NE(
         talos_log.find(
@@ -5460,7 +5488,17 @@ TEST(LauncherRemoteTest, LocalAddressResolvesAndForwardsToBridge) {
         make_recording_bridge("local_addr_unset_hw");
     ASSERT_EQ(Launcher{options}.Run(), 0);
     const std::string recorded = ReadFile(args_file);
-    EXPECT_EQ(recorded.find("--local-address"), std::string::npos) << recorded;
+    std::vector<std::string> probe_lines;
+    std::vector<std::string> runtime_lines;
+    split_invocations(recorded, probe_lines, runtime_lines);
+    ASSERT_EQ(probe_lines.size(), 1u) << recorded;
+    ASSERT_EQ(runtime_lines.size(), 1u) << recorded;
+    for (const std::string& invocation : {probe_lines[0], runtime_lines[0]}) {
+      EXPECT_NE(invocation.find("--remote 127.0.0.1"), std::string::npos)
+          << invocation;
+      EXPECT_EQ(invocation.find("--local-address"), std::string::npos)
+          << invocation;
+    }
     const std::string talos_log = ReadFile(options.output_dir + "/1/talos.log");
     EXPECT_NE(talos_log.find(
                   "[launcher] Controller 127.0.0.1:5802 (local port 5803)"),
@@ -6284,6 +6322,87 @@ TEST(LauncherGraphTest, DescribeOnlyEnforcesPythonActuatorMinimumPeriod) {
     const std::string graph = fixture.graph_json();
     EXPECT_TRUE(GraphErrors(graph).empty()) << graph;
   }
+}
+
+// REQ-OPS-12: WriteFileAtomically syncs the flushed temporary file before
+// renaming over the target, syncs the parent directory after renaming, and
+// leaves the prior file intact (and cleans up the temp file) if the temp-fd
+// sync fails.
+TEST(LauncherTest, WriteFileAtomicallySyncsTempBeforeRenameAndDirAfterRename) {
+  const std::string dir = TempPath("atomic_write_sync_order");
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string target = dir + "/manifest.json";
+  const std::string temp = target + ".tmp";
+  {
+    std::ofstream out{target, std::ios::binary};
+    out << "prior-version";
+  }
+
+  struct stat dir_stat {};
+  ASSERT_EQ(::stat(dir.c_str(), &dir_stat), 0);
+
+  // Success path: temp-fd synced before rename, dir-fd synced after rename.
+  {
+    std::vector<std::string> events;
+    std::string error;
+    const SyncFunction record_sync = [&](int fd) {
+      struct stat st {};
+      if (::fstat(fd, &st) != 0) {
+        events.push_back("fstat_failed");
+        errno = EIO;
+        return -1;
+      }
+      if (S_ISREG(st.st_mode)) {
+        struct stat tmp_st {};
+        const bool matches_tmp = ::stat(temp.c_str(), &tmp_st) == 0 &&
+                                 st.st_dev == tmp_st.st_dev &&
+                                 st.st_ino == tmp_st.st_ino;
+        const bool target_still_prior = ReadFile(target) == "prior-version";
+        const bool tmp_has_new = ReadFile(temp) == "new-version";
+        events.push_back(matches_tmp && target_still_prior && tmp_has_new
+                             ? "sync_temp_before_rename"
+                             : "sync_temp_wrong_state");
+      } else if (S_ISDIR(st.st_mode)) {
+        const bool matches_dir =
+            st.st_dev == dir_stat.st_dev && st.st_ino == dir_stat.st_ino;
+        const bool target_has_new = ReadFile(target) == "new-version";
+        const bool tmp_gone = !std::filesystem::exists(temp);
+        events.push_back(matches_dir && target_has_new && tmp_gone
+                             ? "sync_dir_after_rename"
+                             : "sync_dir_wrong_state");
+      } else {
+        events.push_back("sync_unexpected_kind");
+      }
+      return 0;
+    };
+    EXPECT_TRUE(WriteFileAtomically(target, "new-version", record_sync, error))
+        << error;
+    EXPECT_EQ(events, (std::vector<std::string>{"sync_temp_before_rename",
+                                                "sync_dir_after_rename"}));
+    EXPECT_EQ(ReadFile(target), "new-version");
+    EXPECT_FALSE(std::filesystem::exists(temp));
+  }
+
+  // Failure path: temp-fd sync failure aborts before rename, leaves the prior
+  // file intact, removes the temporary file, and does not sync the directory.
+  {
+    int sync_calls = 0;
+    std::string error;
+    const SyncFunction fail_temp_sync = [&](int) {
+      ++sync_calls;
+      errno = EIO;
+      return -1;
+    };
+    EXPECT_FALSE(
+        WriteFileAtomically(target, "corrupt-attempt", fail_temp_sync, error));
+    EXPECT_FALSE(error.empty());
+    EXPECT_EQ(sync_calls, 1);
+    EXPECT_EQ(ReadFile(target), "new-version");
+    EXPECT_FALSE(std::filesystem::exists(temp));
+  }
+
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace
