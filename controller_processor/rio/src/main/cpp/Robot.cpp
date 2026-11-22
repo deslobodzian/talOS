@@ -365,9 +365,8 @@ void Robot::StartCompetition() {
 
   std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
   uint64_t last_ds_sample_us = 0;
-  // The mode (ModeKey) of the last packet sent; cleared on a closed-socket
-  // tick so the first open tick sends the new mode generation immediately.
-  std::optional<uint32_t> last_ds_mode;
+  // The mode (ModeKey) of the last packet sent.
+  uint32_t last_ds_mode = 0;
   // Observe every hardware tick, including transitions between DS packets.
   // Real and desktop Driver Stations are both read back through WPILib, by
   // the reader's thread.
@@ -415,7 +414,8 @@ void Robot::StartCompetition() {
     const uint64_t now_us = NowUs();
     const talos::driver_station::DriverStationData& driver_station_view =
         driver_station.Read(now_us, gateway_->config().command_timeout_us);
-    const uint32_t raw_mode_flags = driver_station_view.fms.flags;
+    const uint32_t mode_flags = driver_station_view.fms.flags;
+    ds_mode.Observe(mode_flags, now_us);
     log_->ClosePhase(TickPhase::kDriverStation, NowNs());
     auto open_status = talos::protocol::UdpStatus::kOk;
     int open_errno = 0;
@@ -432,14 +432,6 @@ void Robot::StartCompetition() {
       open_errno = errno;
       return open_status == talos::protocol::UdpStatus::kOk;
     });
-    // Observe the mode the gateway actually ticks with: when the socket is
-    // closed, the else branch ticks the gateway disabled (neutralizing outputs
-    // and bumping epoch), so clear kEnabled here to advance ModeTracker's
-    // generation across short outages (< command_timeout_us) and force
-    // OperatorArming to re-arm on reopen (REQ-SAFE-10).
-    const uint32_t mode_flags =
-        talos::rio::EffectiveDsModeFlags(raw_mode_flags, socket_retry.open());
-    ds_mode.Observe(mode_flags, now_us);
     if (socket_event == talos::rio::SocketRetry::Event::kFailed) {
       // RioLog coalesces these to one line a second with their count. The
       // errno is printed as a number (101 is ENETUNREACH): strerror may take
@@ -575,10 +567,10 @@ void Robot::StartCompetition() {
       // teleop) leaves the State unchanged, so until its generation arrives
       // the old mode's target lanes still drive.
       const uint32_t mode = talos::driver_station::ModeKey(mode_flags);
+      const bool sample_due =
+          now_us - last_ds_sample_us >= talos::driver_station::kSamplePeriodUs;
       // Not on a socket the State send just lost: the replacement sends it.
-      if (socket_retry.open() &&
-          talos::rio::ShouldSendDsSample(now_us, last_ds_sample_us, mode,
-                                         last_ds_mode)) {
+      if (socket_retry.open() && (mode != last_ds_mode || sample_due)) {
         last_ds_sample_us = now_us;
         last_ds_mode = mode;
         // This tick's view, so the packet is one refresh's and agrees with
@@ -610,7 +602,6 @@ void Robot::StartCompetition() {
         }
       }
     } else {
-      last_ds_mode.reset();
       gateway_->Tick(now_us, false);
       // The socket retry and the gateway's tick.
       log_->ClosePhase(TickPhase::kLink, NowNs());
@@ -674,6 +665,12 @@ void Robot::StartCompetition() {
   // owns the devices) BEFORE stopping the watchdog and Driver Station reader
   // (whose teardown can block 100+ ms on NetComm), then poll any in-flight
   // configure to completion disabled and neutralize what it built.
+  // Concurrency invariant for the pre-stop backend_->Neutral(): while
+  // !gateway_->configuring(), device lists are immutable; WatchdogNeutral()
+  // takes try_to_lock(devices_mutex_) and calls only thread-safe device
+  // handles (per-device Phoenix control lock, thread-safe HAL DIO/PWM writes)
+  // without touching Neutral()'s loop-thread bookkeeping or log_, and
+  // Neutral() never locks devices_mutex_, so the two cannot race or deadlock.
   talos::rio::ShutdownRioLoop(
       [&] { return gateway_->configuring(); }, [&] { backend_->Neutral(); },
       [&] { watchdog_->Stop(); }, [&] { driver_station.Stop(); },

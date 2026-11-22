@@ -2,16 +2,11 @@
 
 #include <cstdint>
 #include <limits>
-#include <optional>
-
-#include "driver_station/driver_station.h"
 
 // Safety helpers shared between the RoboRIO main loop (Robot.cpp) and its
 // deterministic unit tests (RobotSafety_test.cpp):
 //   1. Shutdown neutralization order (REQ-SAFE-01, REQ-SAFE-25).
 //   2. Pre-tick and post-tick LoopWatchdog deadline calculation (REQ-SAFE-25).
-//   3. Effective Driver Station mode flags across closed-socket ticks and
-//      immediate DS publication on reopen (REQ-SAFE-10).
 namespace talos::rio {
 
 // Saturating addition on uint64_t so a near-UINT64_MAX clock or large margin
@@ -48,31 +43,16 @@ constexpr uint64_t WatchdogPreArmDeadlineUs(uint64_t now_us, bool enabled,
   return deadline_us == 0 ? 1 : deadline_us;
 }
 
-// Driver Station mode flags aligned with the gateway's effective enable state:
-// a closed-socket tick runs `gateway_->Tick(now_us, false)` (disabling the
-// gateway and bumping epoch), so clearing kEnabled ensures ModeTracker
-// advances its mode generation across short socket outages (< command_timeout)
-// and forces OperatorArming to re-arm on reopen.
-constexpr uint32_t EffectiveDsModeFlags(uint32_t raw_flags, bool socket_open) {
-  return socket_open ? raw_flags
-                     : (raw_flags & ~talos::driver_station::kEnabled);
-}
-
-// Whether an open-socket tick should emit a Driver Station packet: on the
-// first open tick (or the first after a closed-socket disable, where
-// `last_ds_mode` was cleared), on any mode change, or once kSamplePeriodUs has
-// elapsed since the last send.
-constexpr bool ShouldSendDsSample(uint64_t now_us, uint64_t last_ds_sample_us,
-                                  uint32_t mode_key,
-                                  std::optional<uint32_t> last_ds_mode) {
-  return !last_ds_mode || mode_key != *last_ds_mode ||
-         now_us - last_ds_sample_us >= talos::driver_station::kSamplePeriodUs;
-}
-
 // Runs the RoboRIO shutdown sequence after the main loop exits:
 // 1. If no background configure currently owns the devices, neutralizes every
 //    output immediately BEFORE stopping the watchdog or Driver Station reader
-//    (whose teardown can block 100+ ms on NetComm).
+//    (whose teardown can block 100+ ms on NetComm). Running `neutralize()`
+//    while the watchdog thread is still active is concurrency-safe for
+//    PhoenixBackend: `!is_configuring()` guarantees device lists are
+//    immutable, `WatchdogNeutral()` only calls thread-safe device handles
+//    under `try_to_lock(devices_mutex_)` without touching `Neutral()`'s
+//    loop-thread bookkeeping or `log_`, and `Neutral()` does not lock
+//    `devices_mutex_`, so concurrent neutral calls cannot race or deadlock.
 // 2. Stops the watchdog and Driver Station reader.
 // 3. Polls any in-flight configure to completion disabled, then neutralizes
 //    what it built.

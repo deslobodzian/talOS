@@ -5,9 +5,9 @@
 //   2. LoopWatchdog is pre-armed before an enabled Endpoint::Tick() when no
 //      command is active, so a stall inside the first Apply()/ApplyOutputs()
 //      is neutralized (REQ-SAFE-25).
-//   3. ModeTracker observes kEnabled cleared on closed-socket ticks where the
-//      gateway ticks disabled, advancing the mode generation across short
-//      socket outages so OperatorArming must re-arm on reopen (REQ-SAFE-10).
+//   3. ModeTracker observes raw Driver Station flags, so a closed-socket
+//      outage and reopen while DS stays enabled in the same mode does not
+//      bump the mode generation (REQ-SAFE-10).
 #include "RobotSafety.h"
 
 #include <gtest/gtest.h>
@@ -15,7 +15,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <limits>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,9 +26,7 @@
 namespace {
 
 namespace ds = talos::driver_station;
-using talos::rio::EffectiveDsModeFlags;
 using talos::rio::LoopWatchdog;
-using talos::rio::ShouldSendDsSample;
 using talos::rio::ShutdownRioLoop;
 using talos::rio::SocketRetry;
 using talos::rio::WatchdogDeadlineUs;
@@ -219,14 +216,13 @@ TEST(RobotSafety, WatchdogPreArmRefinementDisarmAndOverflowSafety) {
   EXPECT_EQ(WatchdogPreArmDeadlineUs(0, /*enabled=*/true, 0, 0, 0), 1u);
 }
 
-// Defect 3: a permanent UDP error closes the socket while enabled in teleop;
-// on the closed-socket tick(s), Robot.cpp calls gateway_->Tick(now_us, false)
-// (physically disabling the gateway and bumping epoch). Observing the DS mode
-// AFTER SocketRetry::Poll with kEnabled cleared while !socket_retry.open()
-// advances ModeTracker's generation across a short reopen (< command_timeout),
-// forcing OperatorArming to re-arm instead of immediately driving on reopen.
+// Same-mode link-drop contract (REQ-SAFE-10, ARCHITECTURE.md "Targets"):
+// Robot.cpp calls ds_mode.Observe(mode_flags, now_us) on the raw Driver Station
+// flags regardless of whether the companion UDP socket is currently open. A
+// closed-socket tick and 100 ms SocketRetry reopen while DS stays enabled in
+// the same mode must NOT bump ModeTracker's mode generation.
 // REQ-SAFE-10
-TEST(RobotSafety, ClosedSocketDisableAdvancesModeGenerationAcrossShortReopen) {
+TEST(RobotSafety, ClosedSocketOutageDoesNotAdvanceModeGenerationInSameMode) {
   SocketRetry retry;
   ds::ModeTracker tracker;
 
@@ -242,7 +238,7 @@ TEST(RobotSafety, ClosedSocketDisableAdvancesModeGenerationAcrossShortReopen) {
   const uint64_t t1 = 1'000'000;
   ASSERT_EQ(retry.Poll(t1, [] { return true; }), SocketRetry::Event::kOpened);
   ASSERT_TRUE(retry.open());
-  tracker.Observe(EffectiveDsModeFlags(kTeleopEnabled, retry.open()), t1);
+  tracker.Observe(kTeleopEnabled, t1);
   const uint64_t gen_before = stamp(t1, kTeleopEnabled);
   ASSERT_NE(gen_before, 0u);
 
@@ -250,77 +246,23 @@ TEST(RobotSafety, ClosedSocketDisableAdvancesModeGenerationAcrossShortReopen) {
   ASSERT_EQ(retry.SendFailed(t1, ENETUNREACH), SocketRetry::SendEvent::kLost);
   ASSERT_FALSE(retry.open());
 
-  // Tick 2 (5 ms later, < SocketRetry::kPeriodUs): socket stays closed,
-  // gateway ticks disabled; ModeTracker observes kEnabled cleared.
+  // Tick 2 (5 ms later, < SocketRetry::kPeriodUs): socket stays closed while
+  // raw DS flags remain kTeleopEnabled; ModeTracker still observes raw flags.
   const uint64_t t2 = t1 + kPeriodUs;
   ASSERT_EQ(retry.Poll(t2, [] { return true; }), SocketRetry::Event::kNone);
   ASSERT_FALSE(retry.open());
-  tracker.Observe(EffectiveDsModeFlags(kTeleopEnabled, retry.open()), t2);
+  tracker.Observe(kTeleopEnabled, t2);
 
-  // Tick 3 (100 ms after t1, < 200..500 ms command_timeout_us): socket reopens
-  // while raw DS flags stayed kTeleopEnabled throughout.
+  // Tick 3 (100 ms after t1): socket reopens while DS stayed enabled in teleop.
   const uint64_t t3 = t1 + SocketRetry::kPeriodUs;
   ASSERT_EQ(retry.Poll(t3, [] { return true; }), SocketRetry::Event::kReplaced);
   ASSERT_TRUE(retry.open());
-  tracker.Observe(EffectiveDsModeFlags(kTeleopEnabled, retry.open()), t3);
+  tracker.Observe(kTeleopEnabled, t3);
   const uint64_t gen_after = stamp(t3, kTeleopEnabled);
 
-  EXPECT_GT(gen_after, gen_before)
-      << "mode generation stayed " << gen_before
-      << " across a closed-socket gateway disable/re-enable";
-}
-
-// Companion invariant for Defect 3:
-// - A 1-tick socket replacement (when the previous attempt was >= kPeriodUs
-//   ago so Poll reopens on the very next tick and the gateway never ticks
-//   disabled) must NOT spuriously advance the mode generation (REQ-SAFE-10:
-//   not on a same-mode link drop).
-// - After a closed-socket tick clears last_ds_mode, ShouldSendDsSample returns
-//   true immediately on reopen even within kSamplePeriodUs (20 ms), so the new
-//   generation reaches the companion on the same tick the gateway re-enables.
-// REQ-SAFE-10
-TEST(RobotSafety,
-     OneTickReplacementKeepsGenerationAndReopenAfterDisableSendsImmediately) {
-  SocketRetry retry;
-  ds::ModeTracker tracker;
-
-  const uint64_t t_open = 1'000'000;
-  ASSERT_EQ(retry.Poll(t_open, [] { return true; }),
-            SocketRetry::Event::kOpened);
-  tracker.Observe(EffectiveDsModeFlags(kTeleopEnabled, retry.open()), t_open);
-
-  // Steady operation well past kPeriodUs; send fails at t_lost.
-  const uint64_t t_lost = t_open + 500'000;
-  tracker.Observe(EffectiveDsModeFlags(kTeleopEnabled, retry.open()), t_lost);
-  ds::DriverStationData before{};
-  before.sample_time_us = t_lost;
-  before.fms.flags = kTeleopEnabled;
-  tracker.Stamp(before);
-
-  ASSERT_EQ(retry.SendFailed(t_lost, ENETUNREACH),
-            SocketRetry::SendEvent::kLost);
-
-  // Next tick immediately replaces the socket -> gateway never disabled.
-  const uint64_t t_next = t_lost + kPeriodUs;
-  ASSERT_EQ(retry.Poll(t_next, [] { return true; }),
-            SocketRetry::Event::kReplaced);
-  ASSERT_TRUE(retry.open());
-  tracker.Observe(EffectiveDsModeFlags(kTeleopEnabled, retry.open()), t_next);
-  ds::DriverStationData after{};
-  after.sample_time_us = t_next;
-  after.fms.flags = kTeleopEnabled;
-  tracker.Stamp(after);
-  EXPECT_EQ(after.mode_since_us, before.mode_since_us)
-      << "one-tick socket replacement without gateway disable must keep mode "
-         "generation";
-
-  // Clearing last_ds_mode on a closed-socket tick forces immediate DS
-  // publication on reopen even if < kSamplePeriodUs elapsed.
-  const uint32_t teleop_key = ds::ModeKey(kTeleopEnabled);
-  EXPECT_FALSE(ShouldSendDsSample(t_next + 5'000, t_next, teleop_key,
-                                  std::optional<uint32_t>{teleop_key}));
-  EXPECT_TRUE(
-      ShouldSendDsSample(t_next + 5'000, t_next, teleop_key, std::nullopt));
+  EXPECT_EQ(gen_after, gen_before)
+      << "same-mode closed-socket link drop bumped mode generation from "
+      << gen_before << " to " << gen_after;
 }
 
 }  // namespace
