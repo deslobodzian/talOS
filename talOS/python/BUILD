@@ -1,6 +1,6 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
-load("//talOS/build:contract.bzl", "talos_cc_shared_node", "talos_messages")
+load("//talOS/build:contract.bzl", "talos_messages")
 
 # The pip lock, read by //controller_processor/rio:wpilib_lockstep_test.
 exports_files(["requirements.txt"])
@@ -103,7 +103,7 @@ py_test(
 talos_messages(
     name = "test_messages",
     srcs = ["testdata/talos_test_message.fbs"],
-    visibility = ["//visibility:private"],
+    visibility = ["//talOS/node_api:__pkg__"],
 )
 
 py_test(
@@ -204,20 +204,6 @@ py_test(
     ],
 )
 
-# C++ twin nodes for differential_parity_test (talos.parity C++ vs Python).
-talos_cc_shared_node(
-    name = "libdifferential_parity_nodes.so",
-    testonly = True,
-    srcs = ["differential_parity_nodes.cc"],
-    deps = [
-        ":test_messages",
-        "//talOS/devices",
-        "//talOS/mechanisms",
-        "//talOS/msgs:control",
-        "//talOS/msgs:geometry",
-    ],
-)
-
 # Fast C++ vs Python differential parity test across all 8 device kinds,
 # DriverStation, Target/TargetLane/OperatorArming, StateMachine, session_dir,
 # pause/resume, reset_device/reboot, and all 3 talOS/mechanisms classes.
@@ -225,9 +211,9 @@ py_test(
     name = "differential_parity_test",
     size = "small",
     srcs = ["differential_parity_test.py"],
-    data = [":libdifferential_parity_nodes.so"],
+    data = ["//talOS/node_api:libdifferential_parity_nodes.so"],
     env = {
-        "TALOS_PARITY_NODES_LIB": "$(rlocationpath :libdifferential_parity_nodes.so)",
+        "TALOS_PARITY_NODES_LIB": "$(rlocationpath //talOS/node_api:libdifferential_parity_nodes.so)",
     },
     legacy_create_init = False,
     # ctypes cannot initialize sanitizer runtimes inside the Python host.

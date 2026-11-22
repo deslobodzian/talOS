@@ -165,6 +165,22 @@ talos_cc_shared_node(
     ],
 )
 
+# Exported C++ twin nodes for //talOS/python:differential_parity_test (lives in
+# talOS/node_api so talOS/python reaches talOS only through talOS/node_api).
+talos_cc_shared_node(
+    name = "libdifferential_parity_nodes.so",
+    testonly = True,
+    srcs = ["testdata/differential_parity_nodes.cc"],
+    visibility = ["//talOS/python:__pkg__"],
+    deps = [
+        "//talOS/devices",
+        "//talOS/mechanisms",
+        "//talOS/msgs:control",
+        "//talOS/msgs:geometry",
+        "//talOS/python:test_messages",
+    ],
+)
+
 # talos.cpp_node hosts a talos_cc_shared_node library on the process's one
 # libtalos_node: the library's node, devices and hardware calls land in that
 # image, both under talos.testing and with TALOS_NODE_LIB naming a copy of
