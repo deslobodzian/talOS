@@ -303,8 +303,11 @@ UdpStatus RuntimeUdpPeer::Send(std::size_t frame_size) {
                         reinterpret_cast<const char*>(tx_buffer_.data()),
                         static_cast<int>(frame_size), kSendFlags);
 #else
-  const ssize_t sent =
-      send(ToNativeSocket(socket_), tx_buffer_.data(), frame_size, kSendFlags);
+  ssize_t sent = -1;
+  do {
+    sent = ::send(ToNativeSocket(socket_), tx_buffer_.data(), frame_size,
+                  kSendFlags);
+  } while (sent < 0 && errno == EINTR);
 #endif
   if (sent < 0) {
     const int error = LastSocketError();
@@ -336,8 +339,11 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
       recv(ToNativeSocket(socket_), reinterpret_cast<char*>(rx_buffer_.data()),
            static_cast<int>(rx_buffer_.size()), 0);
 #else
-  const ssize_t received =
-      recv(ToNativeSocket(socket_), rx_buffer_.data(), rx_buffer_.size(), 0);
+  ssize_t received = -1;
+  do {
+    received = ::recv(ToNativeSocket(socket_), rx_buffer_.data(),
+                      rx_buffer_.size(), 0);
+  } while (received < 0 && errno == EINTR);
 #endif
   if (received < 0) {
     const int error = LastSocketError();

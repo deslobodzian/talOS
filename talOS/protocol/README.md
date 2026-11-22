@@ -49,7 +49,8 @@ decoding. Clock probes do not authorize actuation and work while disabled.
   (`stats().last_recv_error`); both ends decide with them.
   A new socket is needed on send for `EPIPE` (shut down, or a socket macOS
   marked defunct around sleep and wake), `ENOTCONN`, `EDESTADDRREQ`, `EBADF`,
-  and a source address that left the host: `connect()` fixed the source, so
+  `ENOTSOCK`, and a source address that left the host: `connect()` fixed the
+  source, so
   after an address change (a new DHCP lease, a link that re-addresses) every
   send on the old socket fails, on Linux with `ENETUNREACH` and on macOS with
   `EADDRNOTAVAIL`, while a new socket sends from the new address
