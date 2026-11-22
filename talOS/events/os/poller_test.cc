@@ -64,6 +64,45 @@ TEST(PollerTest, PastDeadlineReturnsImmediately) {
   EXPECT_LT(elapsed, 5 * kMillisecond);
 }
 
+// MonotonicTime::min() must return DEADLINE immediately without signed int64_t
+// overflow when computing a relative timeout from now().
+TEST(PollerTest, MinDeadlineReturnsImmediately) {
+  const auto expect_immediate_deadline = [](Poller& poller) {
+    std::mutex mutex;
+    std::condition_variable finished;
+    bool done = false;
+    std::thread guard([&] {
+      std::unique_lock<std::mutex> lock(mutex);
+      if (!finished.wait_for(lock, std::chrono::milliseconds(200),
+                             [&] { return done; })) {
+        poller.wake();
+      }
+    });
+
+    const Poller::WakeReason reason = poller.wait_until(MonotonicTime::min());
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      done = true;
+    }
+    finished.notify_one();
+    guard.join();
+
+    EXPECT_EQ(reason, Poller::WakeReason::DEADLINE);
+  };
+
+  {
+    Poller poller;
+    expect_immediate_deadline(poller);
+  }
+#if defined(__APPLE__)
+  {
+    // Exercise the kevent() relative-timeout backstop without EVFILT_TIMER.
+    Poller poller(Poller::DeadlineTimer::NOT_ARMED);
+    expect_immediate_deadline(poller);
+  }
+#endif
+}
+
 TEST(PollerTest, WakeFromAnotherThreadReturnsPromptlyNotAfterDeadline) {
   Poller poller;
   std::thread waker([&poller] {

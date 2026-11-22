@@ -253,7 +253,19 @@ class RealtimeEventLoop
         // Under POLL too: the poll tick due at this deadline would otherwise
         // run after the timer (ties break on id), and update() would see
         // inputs one tick late, and later than a node without callbacks.
-        drain_messages(expiration.deadline, now);
+        // Drain any remaining sequence backlog (bounded to one ring's worth of
+        // passes) before dispatch_timer so update() + Flush() never actuate on
+        // stale state while a flooded topic still cannot starve timers.
+        const std::size_t max_passes =
+            (options_.max_messages_per_tick == 0 || options_.slots == 0)
+                ? 1
+                : (options_.slots - 1) / options_.max_messages_per_tick + 2;
+        for (std::size_t pass = 0; pass < max_passes; ++pass) {
+          if (!drain_messages(expiration.deadline, now) || !keep_running()) {
+            break;
+          }
+          now = Poller::now();
+        }
         if (!keep_running()) break;
         now = Poller::now();
         this->dispatch_timer(expiration.id, expiration.deadline, now,
@@ -513,15 +525,20 @@ class RealtimeEventLoop
   // dispatch's now), and latency() is publish-to-dispatch. A watcher that is
   // not prompt waited for the drain by design and keeps the drain's time.
   //
-  // Under Delivery::BEFORE_TIMERS and ON_PUBLISH, a sequence watcher that is
-  // not prompt and stops at max_messages_per_tick sets backlog_, and the run
+  // Returns true when any sequence watcher stopped at max_messages_per_tick.
+  // Before a timer dispatch, run_until() repeats the drain up to one ring's
+  // worth of passes so a burst past the per-drain cap is drained before the
+  // timer runs while a flooded topic still cannot starve timers. Under
+  // Delivery::BEFORE_TIMERS and ON_PUBLISH, a sequence watcher that is not
+  // prompt and stops at max_messages_per_tick also sets backlog_, and the run
   // drains again at once (POLL's next tick drains it anyway). Without that,
   // such a watcher fed faster than the cap per drain would fall further
   // behind at every drain until the ring overwrote what it had not read.
-  void drain_messages(MonotonicTime tick_deadline, MonotonicTime now,
+  bool drain_messages(MonotonicTime tick_deadline, MonotonicTime now,
                       bool woken = false) {
     ++activity_.drains;
     backlog_ = false;
+    bool capped = false;
     auto& sources = this->sources();
 
     // Registration order, which is the order the log records and replay
@@ -578,15 +595,19 @@ class RealtimeEventLoop
                                sources[id].buffer, published);
 
         if (!keep_running()) {
-          return;
+          return false;
         }
         if (sources[id].latest_only) break;
       }
-      if (drained == options_.max_messages_per_tick && !transport.prompt &&
-          options_.delivery != Delivery::POLL) {
-        backlog_ = true;
+      if (!sources[id].latest_only && options_.max_messages_per_tick > 0 &&
+          drained == options_.max_messages_per_tick) {
+        capped = true;
+        if (!transport.prompt && options_.delivery != Delivery::POLL) {
+          backlog_ = true;
+        }
       }
     }
+    return capped;
   }
 
   // Claims a reader slot again for a watcher whose slot was freed under it.
