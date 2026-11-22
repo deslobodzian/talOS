@@ -455,6 +455,29 @@ TEST_F(HttpTest, OpensNoDatagramSocketNoSharedMemoryAndWritesNothing) {
   EXPECT_EQ(before, after);
 
 #if defined(__linux__)
+  // Freeze child_ while taking the /proc/<pid>/fd + /proc/net/* snapshot:
+  // otherwise the server can close the accepted client socket from Get("/")
+  // between reading /proc/<pid>/fd and /proc/net/tcp, making a legitimate TCP
+  // inode disappear from /proc/net/tcp mid-check.
+  struct ChildStopGuard {
+    pid_t pid;
+    explicit ChildStopGuard(pid_t p) : pid(p) {}
+    ~ChildStopGuard() {
+      if (pid > 0) kill(pid, SIGCONT);
+    }
+    ChildStopGuard(const ChildStopGuard&) = delete;
+    ChildStopGuard& operator=(const ChildStopGuard&) = delete;
+  };
+  ASSERT_EQ(kill(child_, SIGSTOP), 0) << strerror(errno);
+  ChildStopGuard resume_child{child_};
+  int stop_status = 0;
+  pid_t waited = -1;
+  while ((waited = waitpid(child_, &stop_status, WUNTRACED)) < 0 &&
+         errno == EINTR) {
+  }
+  ASSERT_EQ(waited, child_) << strerror(errno);
+  ASSERT_TRUE(WIFSTOPPED(stop_status)) << "status=" << stop_status;
+
   const std::string proc_root = "/proc/" + std::to_string(child_);
   std::set<std::uint64_t> held_sockets;
   for (const auto& entry :
