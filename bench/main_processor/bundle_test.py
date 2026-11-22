@@ -397,6 +397,16 @@ class BundleTest(unittest.TestCase):
                         if os.path.getsize(path) == size
                         and filecmp.cmp(path, interpreter, shallow=False)]
                     self.assertEqual(len(copies), 1, (repo, copies))
+                    # On Linux, rules_python's python3 statically links
+                    # libpython; unused libpython3*.so* (~51 MB) must be
+                    # omitted from the bundled runtime's lib/.
+                    if sys.platform.startswith("linux"):
+                        rt_lib = os.path.join(src, "python", repo, "lib")
+                        if os.path.isdir(rt_lib):
+                            leftovers = [
+                                f for f in os.listdir(rt_lib)
+                                if f.startswith("libpython3") and ".so" in f]
+                            self.assertEqual(leftovers, [], (name, repo))
 
 
 def launcher_stop_timeout_s():

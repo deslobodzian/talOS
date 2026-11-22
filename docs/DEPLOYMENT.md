@@ -80,8 +80,13 @@ library; the process stays the one the launcher started. The runtime's
 repository is left out of each node's runfiles and staged once under
 `python/`, and the interpreter's other names there (`python`, `python3.11`,
 which Bazel's runfiles hold as copies of it) are such scripts too, so the
-bundle holds the interpreter once, however many Python nodes it carries. The
-build fails when two nodes carry different files under one runtime's name.
+bundle holds the interpreter once, however many Python nodes it carries. On
+Linux, when the bundled interpreter is an ELF binary that does not list
+`libpython*` in `DT_NEEDED` and no other ELF binary or shared library in the
+bundle does either, unused `libpython3*.so*` shared libraries are omitted
+from the runtime's `lib/` (macOS `.dylib` runtimes and dynamically linked
+Linux runtimes keep them). The build fails when two nodes carry different
+files under one runtime's name.
 
 The launcher copies `config_sha256`, `git_revision` and `git_dirty` (plus
 `talos_git_revision` and `talos_git_dirty` when present) into every
