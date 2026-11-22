@@ -184,3 +184,25 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+# Clean shutdown neutral (REQ-SAFE-01, REQ-OPS-20) and hard 64-datagram/ms
+# receive cap (REQ-RT-20), driven deterministically over loopback UDP without
+# signals or wall-clock sleeps.
+cc_test(
+    name = "shutdown_budget_test",
+    size = "small",
+    srcs = ["shutdown_budget_test.cc"],
+    tags = ["integration"],
+    deps = [
+        ":node_lib",
+        ":node_test_support",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/ipc",
+        "//talOS/process",
+        "//talOS/protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)

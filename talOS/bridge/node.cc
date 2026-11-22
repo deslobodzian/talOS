@@ -515,6 +515,10 @@ void HardwareNode::ReopenSocket(uint64_t now_us) {
 }
 
 void HardwareNode::Tick(uint64_t now_us) {
+  TickWithBudget(now_us, kReceiveBudget);
+}
+
+void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
   tick_datagrams_ = 0;
   tick_requests_ = 0;
   ReopenSocket(now_us);
@@ -536,11 +540,13 @@ void HardwareNode::Tick(uint64_t now_us) {
       probe_waiting_ = true;
     }
   }
-  // 1. Process incoming UDP frames from Gateway, at most kReceiveBudget, so
-  // a burst under overload delays rather than stalls the merge below; Run()
-  // ticks again without waiting when the budget runs out.
-  tick_receive_capped_ = true;
-  for (int i = 0; i < kReceiveBudget; ++i) {
+  // 1. Process incoming UDP frames from Gateway, at most `limit`
+  // (min(kReceiveBudget, remaining window datagram budget) under Pass()), so
+  // a burst delays rather than stalls the merge below and never exceeds
+  // kDatagramBudget in a kCpuWindowUs window (REQ-RT-20).
+  const int limit = std::clamp(receive_budget, 0, kReceiveBudget);
+  tick_receive_capped_ = limit > 0;
+  for (int i = 0; i < limit; ++i) {
     // Closed (SocketCounters), maybe by a State's config push: nothing to
     // read.
     if (!peer_.IsOpen()) {
@@ -1235,7 +1241,23 @@ uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
 }
 
 HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
-  Tick(now_us);
+  // CPU budget: the window restarts at the first pass after it ended.
+  // Evaluated before TickWithBudget() so the receive loop never exceeds the
+  // window's remaining kDatagramBudget (REQ-RT-20), even across staggered
+  // bursts or timed duties that wake mid-window.
+  if (cpu_window_passes_ == 0 || now_us < cpu_window_start_us_ ||
+      now_us - cpu_window_start_us_ >= kCpuWindowUs) {
+    cpu_window_start_us_ = now_us;
+    cpu_window_passes_ = 0;
+    cpu_window_datagrams_ = 0;
+  }
+  const uint64_t remaining_datagrams =
+      cpu_window_datagrams_ < kDatagramBudget
+          ? kDatagramBudget - cpu_window_datagrams_
+          : 0;
+  const int receive_budget =
+      static_cast<int>(std::min<uint64_t>(kReceiveBudget, remaining_datagrams));
+  TickWithBudget(now_us, receive_budget);
   ++wakeups_.passes;
 
   // The per-source counters four times a second, which is enough for a
@@ -1277,12 +1299,6 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
       std::min({NextDutyUs(now_us), next_liveness_us_, next_introspection_us_,
                 now_us + max_wait_us_});
 
-  // CPU budget: the window restarts at the first pass after it ended.
-  if (now_us - cpu_window_start_us_ >= kCpuWindowUs) {
-    cpu_window_start_us_ = now_us;
-    cpu_window_passes_ = 0;
-    cpu_window_datagrams_ = 0;
-  }
   ++cpu_window_passes_;
   cpu_window_datagrams_ += tick_datagrams_;
   if (cpu_window_passes_ >= kPassBudget ||
@@ -1428,7 +1444,9 @@ int HardwareNode::Run(int duration_s) {
       }
     }
   }
-  const uint64_t ran_us = clock_us() - start_us;
+  const uint64_t stop_us = clock_us();
+  SendShutdownNeutral(stop_us);
+  const uint64_t ran_us = stop_us - start_us;
   CloseWaits();
 
   PublishIntrospection();
@@ -1548,9 +1566,36 @@ bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,
   return true;
 }
 
+bool HardwareNode::SendShutdownNeutral(uint64_t now_us) {
+  if (last_boot_id_ == 0 || (!peer_.IsOpen() && frame_sink_.send == nullptr)) {
+    return false;
+  }
+  NeutralizeAll();
+  full_cmd_.config_id = config_id_;
+  full_cmd_.boot_id = last_boot_id_;
+  full_cmd_.epoch = last_epoch_;
+  full_cmd_.observed_time_us = last_sample_time_us_;
+  talos::hardware::Packet cmd_pkt{};
+  cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
+  if (cmd_pkt.size == 0) return false;
+  if (SendToGateway(protocol::FrameType::kHardwareCommand, now_us,
+                    cmd_pkt.data.data(),
+                    cmd_pkt.size) != protocol::UdpStatus::kOk) {
+    return false;
+  }
+  if (cmd_pub_) Publish(*cmd_pub_, 1, cmd_pkt, now_us);
+  ++commands_sent_;
+  last_sent_cmd_ = full_cmd_;
+  last_send_us_ = now_us;
+  have_last_sent_ = true;
+  last_sent_had_active_subsystem_ = false;
+  return true;
+}
+
 void HardwareNode::NeutralizeAll() {
   for (std::size_t j = 0; j < full_cmd_.count; ++j) {
     full_cmd_.motors[j].mode = Mode::kNeutral;
+    full_cmd_.motors[j].slot = 0;
     full_cmd_.motors[j].demand = 0.0;
     full_cmd_.motors[j].feedforward_v = 0.0;
   }

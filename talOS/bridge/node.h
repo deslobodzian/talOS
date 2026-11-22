@@ -123,11 +123,12 @@ class HardwareNode {
   ~HardwareNode() = default;
 
   bool Open();
-  // One merge step at `now_us` (the bridge clock): receives every waiting
-  // gateway datagram up to kReceiveBudget, reads each request topic, merges,
-  // sends the command when it changed or the heartbeat is due, and runs the
-  // time-driven duties (clock probe, owner timeouts, /hw/status). Run() calls
-  // it on every wakeup; tests call it with synthetic time.
+  // One merge step at `now_us` (the bridge clock): receives waiting gateway
+  // datagrams up to kReceiveBudget (Pass() further caps this to the window's
+  // remaining kDatagramBudget), reads each request topic, merges, sends the
+  // command when it changed or the heartbeat is due, and runs the time-driven
+  // duties (clock probe, owner timeouts, /hw/status). Run() calls Pass() on
+  // every wakeup; tests call Tick() or Pass() with synthetic time.
   void Tick(uint64_t now_us);
   // The earliest bridge-clock instant after a Tick(now_us) at which Tick has
   // time-driven work: the next clock probe or its retry, the completion of an
@@ -145,26 +146,38 @@ class HardwareNode {
     uint64_t until_us;
     bool ignore_input;
   };
-  // Run()'s loop body, without its wait: Tick(now_us), the registry's
-  // liveness sample (on every pass, whatever woke it), then arming every
+  // Run()'s loop body, without its wait: resets the kCpuWindowUs CPU budget
+  // window when expired, runs Tick() with its UDP receive loop capped to
+  // min(kReceiveBudget, remaining kDatagramBudget), updates the registry's
+  // liveness sample (on every pass, whatever woke it), then arms every
   // request subscriber's wake. Waits until now_us when input is known to be
-  // waiting (an arm found an unread request, or Tick stopped at
-  // kReceiveBudget), otherwise until the next duty, the full registry
-  // sample, the liveness backstop or the longest wait. Once the CPU budget
-  // is spent (see kCpuWindowUs) it sleeps through input until the window
-  // ends, or until the next duty or registry sample if that is sooner.
+  // waiting (an arm found an unread request, or Tick stopped at its receive
+  // cap), otherwise until the next duty, the full registry sample, the
+  // liveness backstop or the longest wait. Once the CPU budget is spent (see
+  // kCpuWindowUs) it sleeps through input until the window ends, or until the
+  // next duty or registry sample if that is sooner.
   Wait Pass(uint64_t now_us);
   // Passes until a stop (process::stop_requested) or, when duration_s > 0,
-  // that many seconds, then prints the exit summary, and, when no State
-  // arrived, a `hardware_node warning: ended without receiving a State`
-  // line on stderr. Returns the process's exit status: 1 when the packet
-  // log failed or has a gap, or when the run ended at its own duration
-  // without having received one State; else 0, so a stop exits 0 whether
-  // or not the controller was ever heard. The duration's 1 applies only to
-  // a bridge run directly: the launcher ends a bounded session by stopping
+  // that many seconds, then sends a shutdown neutral command
+  // (SendShutdownNeutral) before CloseWaits(), prints the exit summary, and,
+  // when no State arrived, a `hardware_node warning: ended without receiving
+  // a State` line on stderr. Returns the process's exit status: 1 when the
+  // packet log failed or has a gap, or when the run ended at its own duration
+  // without having received one State; else 0, so a stop exits 0 whether or
+  // not the controller was ever heard. The duration's 1 applies only to a
+  // bridge run directly: the launcher ends a bounded session by stopping
   // every member at its deadline, so there the warning line (and
   // session_report's controller-link verdict) is the evidence.
   int Run(int duration_s = 0);
+
+  // Neutralizes every actuator in full_cmd_, stamps it with the latest
+  // observed gateway identity and sample time, and sends it to the gateway
+  // (and publishes it on /hw/command if open). Returns true when a shutdown
+  // neutral command was sent, false when no gateway boot has been observed or
+  // no transport is open or the send failed. Called by Run() right after its
+  // loop exits (before CloseWaits()) and exposed for deterministic unit tests
+  // (REQ-SAFE-01, REQ-OPS-20).
+  bool SendShutdownNeutral(uint64_t now_us);
 
   // Run()'s waits. OpenWaits() builds the poller and watches the UDP socket,
   // a wake receiver every request subscriber names and the stop pipe
@@ -328,6 +341,9 @@ class HardwareNode {
   // Open() after its socket: the shared-memory topics, the packet log and
   // the registry row.
   void OpenTopics();
+  // Tick()'s body with an explicit per-tick UDP receive cap, bounded by both
+  // kReceiveBudget and Pass()'s remaining window datagram budget (REQ-RT-20).
+  void TickWithBudget(uint64_t now_us, int receive_budget);
   // One decoded datagram from the gateway (a State, a Driver Station packet
   // or a config acknowledgement), received at `now_us`: what Tick()'s
   // receive loop does with each frame of this protocol version it reads.
