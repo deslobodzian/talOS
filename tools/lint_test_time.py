@@ -14,8 +14,9 @@ tracked files it finds:
 - `retry`: `flaky = True` or `--flaky_test_attempts` in a BUILD or `.bzl`
   file, `.bazelrc`, a workflow or a shell script.
 
-A test source is a `*_test.cc`, `*_test.cpp`, `*_test.py` or `test_*.py`
-file (`*_test.cpp`: the RoboRIO program's GradleRIO tests), and so is a
+A test source is a `*_test.cc`, `*_test.cpp`, `*_test.py`, `test_*.py`,
+`test.cc`, `test.cpp` or `test.py` file (`*_test.cpp`: the RoboRIO program's
+GradleRIO tests), and so is a
 test helper a test includes or imports: a source whose stem ends in
 `_test_support`, `_test_helpers` or `_testing`, or is `testing` (the
 framework's `Sim` headers and module, which own simulated time), or a
@@ -79,7 +80,8 @@ RETRY_PATTERN = re.compile(r"\bflaky\s*=\s*True\b|--flaky_test_attempts")
 
 def is_test_source(path):
     name = os.path.basename(path)
-    return (name.endswith(("_test.cc", "_test.cpp", "_test.py")) or
+    return (name in ("test.cc", "test.cpp", "test.py") or
+            name.endswith(("_test.cc", "_test.cpp", "_test.py")) or
             (name.startswith("test_") and name.endswith(".py")))
 
 

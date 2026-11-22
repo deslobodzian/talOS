@@ -54,6 +54,22 @@ class LintTestTimeTest(unittest.TestCase):
                 self.assertEqual(failures, 1, out)
                 self.assertIn(f"{path}:1:", out)
 
+    # REQ-RT-17: exact-basename test files (`test.cc`, `test.cpp`, `test.py`)
+    # are test sources too; a non-test suffix like `contest.cc` is not.
+    def test_exact_test_basename_sources_are_scanned(self):
+        for path, text in (
+                ("talOS/rtms/test.cc", CLOCK),
+                ("talOS/rtms/test.cc", SLEEP),
+                ("controller_processor/rio/src/test/cpp/test.cpp", CLOCK),
+                ("talOS/python/test.py", PY_SLEEP),
+                ("test.cc", CLOCK)):
+            with self.subTest(path=path, text=text.strip()):
+                failures, out = lint({path: text})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{path}:1:", out)
+        failures, out = lint({"talOS/rtms/contest.cc": CLOCK + SLEEP})
+        self.assertEqual(failures, 0, out)
+
     # REQ-RT-17: a wait moved out of a test into the header or module it
     # includes is still the test's wait.
     def test_a_test_helper_is_held_to_the_same_rule(self):
