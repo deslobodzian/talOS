@@ -10,7 +10,7 @@ controller_processor/rio/src/test/cpp/ConfigStore_test.cpp clock 6 integration: 
 controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp clock 33 integration: CTRE's Phoenix 6 simulator advances on the real clock; reads poll its status frames until a 10 s deadline that bounds a hang
 controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp sleep 10 integration: CTRE's Phoenix 6 simulator advances on the real clock; reads are paced 10 ms apart as PumpReads paces them
 controller_processor/rio/src/test/cpp/RioLog_test.cpp clock 2 integration: the logger's real thread held in a blocked write; the elapsed bound shows a burst of posts did not wait for it
-bench/main_processor/simulation/soak_test.py clock 4 soak: injected kills and stalls on the real clock (TESTING.md §2)
+bench/main_processor/simulation/soak_test.py clock 2 soak: injected kills and stalls on the real clock (TESTING.md §2)
 bench/main_processor/simulation/soak_test.py sleep 4 soak: injected kills and stalls on the real clock (TESTING.md §2)
 bench/main_processor/swerve_module/send_target.cc clock 2 operator CLI beside the node, sends for a wall-clock duration; not node code
 bench/main_processor/swerve_module/send_target.cc sleep 1 operator CLI beside the node, sends for a wall-clock duration; not node code
