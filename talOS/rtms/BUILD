@@ -114,10 +114,13 @@ cc_test(
     ],
 )
 
+# Over 5 s on 4-vCPU Linux CI (5.1 s): runs three 4-thread busy-spin
+# contention loops totaling 304k atomic-word slot writes; heavy lane.
 cc_test(
     name = "ring_lap_test",
     size = "small",
     srcs = ["ring_lap_test.cc"],
+    tags = ["heavy"],
     deps = [
         ":ring_test_payload",
         ":rtms",
