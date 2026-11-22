@@ -30,24 +30,29 @@ reasons:
    fd from `poller_`, and reopens and re-adds a new fd on the `kReopenRetryUs`
    cadence without restarting the loop.
 2. **Single-pass merge and seven dynamic deadlines.** Every pass runs one
-   ordered `Tick()` (receive UDP frames up to `kReceiveBudget`, read every
-   request topic, enforce trust gates and owner timeouts, send one merged
-   command if due, publish `/hw/status`). Rather than arming and re-arming
-   separate event-loop timers on every state change, `NextDutyUs()` solves the
-   exact next wake instant directly from current state across seven dynamic
-   deadlines: (1) immediate completion of a pending echoed clock probe,
-   (2) closed-socket reopen retry, (3) next periodic clock probe, (4) unanswered
-   clock-probe retry, (5) `/hw/status` period, (6) each merged owner's
-   `ExpiresAtUs()`, and (7) `CommandDueUs()` (immediate on merge change, else
-   command heartbeat), with `kRetryUs` backoff on failed sends and `Pass()`
-   bounding waits by liveness, introspection, and `max_wait_us_`.
+   ordered `Tick()` (receive UDP frames up to `min(kReceiveBudget, remaining
+   window datagram budget)`, read every request topic, enforce trust gates and
+   owner timeouts, send one merged command if due, publish `/hw/status`). Rather
+   than arming and re-arming separate event-loop timers on every state change,
+   `NextDutyUs()` solves the exact next wake instant directly from current state
+   across seven dynamic deadlines: (1) immediate completion of a pending echoed
+   clock probe, (2) closed-socket reopen retry, (3) next periodic clock probe,
+   (4) unanswered clock-probe retry, (5) `/hw/status` period, (6) each merged
+   owner's `ExpiresAtUs()`, and (7) `CommandDueUs()` (immediate on merge change,
+   else command heartbeat), with `kRetryUs` backoff on failed sends and `Pass()`
+   bounding waits by liveness, introspection, and `max_wait_us_`. On clean loop
+   exit, `Run()` calls `SendShutdownNeutral()` before `CloseWaits()` so an
+   active gateway immediately receives a neutral command stamped with the latest
+   observed identity and sample time.
 3. **`kBridge` CPU-budget throttling.** Because `hardware_node` runs in the
    highest realtime tier (`LoopTier::kBridge`, above control nodes on Linux),
    a UDP or request flood would starve control loops if the poller stayed
-   immediately readable. `Pass()` enforces a per-window pass and datagram budget
-   (`kCpuWindowUs`, `kPassBudget`, `kDatagramBudget`); when spent, `Run()` uses
-   `sleep_for` (`wait.ignore_input`) to sleep through input until the window
-   ends or a timed duty falls due—a mode `RealtimeEventLoop` does not have.
+   immediately readable. `Pass()` resets the `kCpuWindowUs` (1 ms) window before
+   each tick, caps `Tick()`'s UDP receive loop to the remaining `kDatagramBudget`
+   (64) so no 1 ms window exceeds 64 received datagrams, and enforces
+   `kPassBudget` (8); when either is spent, `Run()` uses `sleep_for`
+   (`wait.ignore_input`) to sleep through input until the window ends or a timed
+   duty falls due—a mode `RealtimeEventLoop` does not have.
 4. **Selective `.tlog` recording and synthetic-time unit tests.**
    `HardwareNode` records only its outbound `/hw/state`, `/hw/command`, and
    `/hw/status` `SEND`s (omitting `/hw/state/driver_station` and raw UDP
