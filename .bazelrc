@@ -6,3 +6,12 @@ import %workspace%/talos.bazelrc
 
 # --config=release records this checkout's revision (talos.bazelrc).
 build:release --workspace_status_command=tools/workspace_status.sh
+
+# --config=gcp: the bazel-remote cache VM in Google Cloud (scripts/README.md),
+# for builds on a VM in its network (.github/workflows/ci-cd.yml). The address
+# is the VM's reserved internal one, CACHE_IP in scripts/gcp-cicd.env.sh; it is
+# not reachable from anywhere else. The local disk cache stays in front of it.
+build:gcp --remote_cache=grpc://10.10.0.10:9092
+build:gcp --disk_cache=~/.cache/talos-bazel-disk
+build:gcp --remote_upload_local_results=true
+build:gcp --remote_timeout=60

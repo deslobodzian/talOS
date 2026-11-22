@@ -1,0 +1,126 @@
+name: Cloud Build
+
+# Builds //... and runs the replay tests on a 16-core Spot VM in Google
+# Cloud, against the bazel-remote cache VM (scripts/, .bazelrc build:gcp).
+#
+# Started by hand only. It is a trusted writer of the shared cache, so it
+# must never run code from a fork: do not add a pull_request trigger.
+# The repository has no service to deploy, so there is no deploy job.
+#
+# Needs the repository variables scripts/setup-gcp-wif.sh prints.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # the OIDC token Workload Identity Federation exchanges
+
+concurrency:
+  group: cloud-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  ZONE: us-east4-a
+  SUBNET: talos-ci-us-east4
+  BUILD_SA: ci-build-vm@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com
+  # One VM per run attempt, so a re-run never meets the last attempt's VM.
+  VM: talos-ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  spot-build:
+    name: Build and replay tests (Spot VM)
+    runs-on: ubuntu-latest
+    # The VM deletes itself at 20 minutes; the rest is creation and cleanup.
+    timeout-minutes: 30
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+        service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+
+    - name: Set up gcloud
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Create the Spot VM
+      # Deleted three ways: by Google when it is preempted or reaches
+      # --max-run-duration, by the trap below if this step fails part way,
+      # and by the always() step at the end of the job.
+      run: |
+        trap 'status=$?; [ $status -eq 0 ] ||
+          gcloud compute instances delete "$VM" --project="$PROJECT_ID" \
+            --zone="$ZONE" --quiet || true; exit $status' EXIT
+        gcloud compute instances create "$VM" \
+          --project="$PROJECT_ID" --zone="$ZONE" \
+          --machine-type=n2d-standard-16 \
+          --provisioning-model=SPOT \
+          --instance-termination-action=DELETE \
+          --max-run-duration=20m \
+          --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud \
+          --boot-disk-size=100GB --boot-disk-type=pd-balanced \
+          --network-interface="subnet=$SUBNET,no-address" \
+          --tags=ci-build \
+          --service-account="$BUILD_SA" --scopes=logging-write \
+          --metadata=enable-oslogin=TRUE \
+          --labels=purpose=ci,run="$GITHUB_RUN_ID"
+        # sshd is not up the moment the instance is: about a minute at most.
+        for attempt in $(seq 1 30); do
+          if gcloud compute ssh "$VM" --project="$PROJECT_ID" --zone="$ZONE" \
+               --tunnel-through-iap --command=true 2>/dev/null; then
+            exit 0
+          fi
+          echo "waiting for SSH ($attempt/30)"
+          sleep 5
+        done
+        echo "::error::the Spot VM never accepted SSH"
+        exit 1
+
+    - name: Copy the commit to the VM
+      run: |
+        git archive --format=tar.gz --prefix=talos/ -o "$RUNNER_TEMP/src.tar.gz" HEAD
+        gcloud compute scp "$RUNNER_TEMP/src.tar.gz" "$VM":src.tar.gz \
+          --project="$PROJECT_ID" --zone="$ZONE" --tunnel-through-iap
+
+    - name: Build and run the replay tests
+      # A preemption or the 20-minute limit ends the SSH session, which
+      # fails this step; the VM is already gone then.
+      run: |
+        gcloud compute ssh "$VM" --project="$PROJECT_ID" --zone="$ZONE" \
+          --tunnel-through-iap --command='bash -s' <<'REMOTE'
+        set -euo pipefail
+        tar xzf src.tar.gz
+        cd talos
+        # The toolchain the repository's own setup installs (bazelisk as
+        # `bazel`, g++, python3, Node and pnpm); no RoboRIO or lint tools.
+        tools/setup.sh --yes --no-rio --no-lint
+        bazel build --config=gcp //...
+        # Every test target whose name says replay, so a new one is picked
+        # up without editing this file. --keep_going: some external
+        # packages do not load on every host (docs/DEVELOPMENT.md §5).
+        replay="$(bazel query --config=gcp --keep_going \
+          'kind(".*_test rule", //...) intersect filter("replay", //...) except attr(tags, manual, //...)' \
+          2>/dev/null || true)"
+        if [ -z "$replay" ]; then
+          echo "no replay test targets found" >&2
+          exit 1
+        fi
+        echo "Replay tests:"; echo "$replay"
+        # shellcheck disable=SC2086
+        bazel test --config=gcp --test_output=errors $replay
+        REMOTE
+
+    - name: Delete the Spot VM
+      if: always()
+      run: |
+        if gcloud compute instances describe "$VM" --project="$PROJECT_ID" \
+             --zone="$ZONE" >/dev/null 2>&1; then
+          gcloud compute instances delete "$VM" --project="$PROJECT_ID" \
+            --zone="$ZONE" --quiet
+        else
+          echo "VM $VM is already gone"
+        fi
