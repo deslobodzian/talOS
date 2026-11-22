@@ -1865,6 +1865,19 @@ TEST(Supervision, ABoundedSessionEndsAtItsStopNotAtAMembersOwnDuration) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// Releasing a SteppedClock held behind steady_clock::now() must advance from
+// the held time, not jump forward by the elapsed wall time (which would
+// expire kBridgeStopTimeout immediately after HoldAt(deadline) + Release()).
+TEST(Supervision, SteppedClockReleaseContinuesFromHeldWithoutJumpingAhead) {
+  testing::SteppedClock clock;
+  const SupervisionTime behind = clock.Freeze() - 10s;
+  clock.HoldAt(behind);
+  clock.Release();
+  const SupervisionTime after = clock.clock()();
+  EXPECT_GE(after, behind);
+  EXPECT_LT(after, behind + 1s);
+}
+
 // A config that cannot be read refuses the launch before its session
 // directory, <output-dir>/<session_id>/, holds a graph.json (README "Two
 // phases": nothing was described).
