@@ -740,6 +740,121 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
   ::remove(restarted.c_str());
 }
 
+// REQ-OPS-52: a GAP record in a rotated segment (`alpha.segment0.tlog`) marks
+// the member `log_gap: true` and `recorder_failed: true` at shutdown even when
+// the active `alpha.tlog` is clean, and stderr names `alpha` and `alpha.tlog`.
+TEST(LauncherTest, ARotatedSegmentWithAGapMarksTheMemberAtShutdown) {
+  const std::string tag = "rotated_log_gap";
+  const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::create_directories(out_dir);
+  const std::string gapped = TempPath(tag + "_gapped.tlog");
+  const std::string clean = TempPath(tag + "_clean.tlog");
+  {
+    event::log::LogWriter writer{
+        gapped, "alpha",
+        event::log::LogWriterOptions{512, 1, /*background=*/false}};
+    writer.start({}, {});
+    const std::vector<std::byte> small(16, std::byte{1});
+    const std::vector<std::byte> oversized(1024, std::byte{1});
+    for (uint64_t d = 1; d <= 3; ++d) {
+      event::Context context{};
+      context.kind = event::EventKind::TIMER;
+      context.dispatch_index = d;
+      writer.dispatch(context, d == 2 ? oversized : small);
+    }
+    writer.flush();
+    ASSERT_EQ(writer.gaps(), 1u);
+  }
+  {
+    event::log::LogWriter writer{
+        clean, "alpha",
+        event::log::LogWriterOptions{4096, 1, /*background=*/false}};
+    writer.start({}, {});
+    const std::vector<std::byte> small(16, std::byte{1});
+    for (uint64_t d = 1; d <= 2; ++d) {
+      event::Context context{};
+      context.kind = event::EventKind::TIMER;
+      context.dispatch_index = d;
+      writer.dispatch(context, small);
+    }
+    writer.flush();
+    ASSERT_EQ(writer.gaps(), 0u);
+  }
+
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = 0x6AA;
+  options.simulation = true;
+  options.max_restarts = 0;
+  options.heartbeat_startup_grace_ms = 60000;
+  options.config_path = WriteFixtureToml();
+  std::string alpha =
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")});
+  alpha.erase(alpha.rfind("exit 0"));
+  alpha +=
+      "while [ $# -gt 0 ]; do\n"
+      "  if [ \"$1\" = --log ]; then\n"
+      "    shift\n"
+      "    cp '" +
+      gapped +
+      "' \"${1%.tlog}.segment0.tlog\"\n"
+      "    cp '" +
+      clean +
+      "' \"$1\"\n"
+      "  fi\n"
+      "  shift\n"
+      "done\n"
+      "exit 0\n";
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode(tag + "_alpha", alpha);
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta",
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")}));
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+
+  ::testing::internal::CaptureStderr();
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+
+  const std::string session_dir =
+      out_dir + "/" + std::to_string(options.session_id);
+  ASSERT_TRUE(std::filesystem::exists(session_dir + "/alpha.segment0.tlog"));
+  ASSERT_TRUE(std::filesystem::exists(session_dir + "/alpha.tlog"));
+  const std::string manifest = ReadFile(session_dir + "/manifest.json");
+  const auto entry = [&manifest](std::string_view name) {
+    const std::size_t at =
+        manifest.find("\"name\": \"" + std::string{name} + "\"");
+    if (at == std::string::npos) return std::string{};
+    return manifest.substr(at, manifest.find("\"runs\": [", at) - at);
+  };
+  const std::string gapped_entry = entry("alpha");
+  EXPECT_NE(gapped_entry.find("\"log_gap\": true"), std::string::npos)
+      << gapped_entry;
+  EXPECT_NE(gapped_entry.find("\"recorder_failed\": true"), std::string::npos)
+      << gapped_entry;
+  const std::string whole_entry = entry("beta");
+  EXPECT_NE(whole_entry.find("\"log_gap\": false"), std::string::npos)
+      << whole_entry;
+  bool found_stderr_line = false;
+  std::istringstream lines{stderr_text};
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("alpha") != std::string::npos &&
+        line.find("alpha.tlog") != std::string::npos &&
+        line.find("lost records") != std::string::npos) {
+      found_stderr_line = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_stderr_line) << stderr_text;
+
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(gapped);
+  std::filesystem::remove(clean);
+}
+
 // A member that ignores SIGINT is killed (SIGKILL, run reason stop_timeout)
 // at the stop timeout (kStopTimeout), neither before nor after. The test
 // freezes the supervision clock at the stop, holds it 100 ms short of the
@@ -2096,6 +2211,7 @@ TEST(LauncherGraphTest, MissingBinariesAreOneRefusalWithTheBuildCommand) {
   EXPECT_FALSE(fixture.has_manifest());
   const auto errors = GraphErrors(fixture.graph_json());
   ASSERT_EQ(errors.size(), 1u) << fixture.graph_json();
+  EXPECT_NE(errors[0].find("bazel build"), std::string::npos) << errors[0];
   EXPECT_NE(errors[0].find("//example/alpha:node"), std::string::npos)
       << errors[0];
   EXPECT_NE(errors[0].find("//example/beta:node"), std::string::npos)
@@ -2168,6 +2284,58 @@ std::vector<std::string> GraphFindings(const std::string& graph,
     }
   }
   return found;
+}
+
+// REQ-OPS-01: when every missing binary is non-critical (`critical = false`),
+// the single missing-binaries finding is Severity::WARNING with `bazel build`,
+// and launch proceeds for the remaining peers.
+TEST(LauncherGraphTest, MissingNonCriticalBinariesWarnAndLaunchProceeds) {
+  const NodeSpec missing{.name = "alpha",
+                         .target = "//example/alpha:node",
+                         .binary_path = TempPath("never_built_optional_alpha"),
+                         .critical = false,
+                         .owns_actuators = false};
+  const auto finding = MissingBinariesFinding({missing}, "");
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->severity, naming::Severity::WARNING);
+  EXPECT_NE(finding->message.find("bazel build"), std::string::npos)
+      << finding->message;
+  EXPECT_NE(finding->message.find("//example/alpha:node"), std::string::npos)
+      << finding->message;
+
+  const std::string beta_runs = TempPath("missing_noncrit_beta_runs");
+  ::remove(beta_runs.c_str());
+  GraphFixture fixture{"missing_noncrit", kStubWithoutDescribe,
+                       RecordingStub("beta", "//example/beta:node", beta_runs,
+                                     {Sender("/beta/state")})};
+  auto config = toml::parse_file(fixture.options.config_path);
+  auto* alpha = config["subsystems"]["alpha"].as_table();
+  alpha->erase("motors");
+  alpha->insert_or_assign("critical", false);
+  std::ofstream{fixture.options.config_path} << config;
+  fixture.options.binary_overrides["//example/alpha:node"] =
+      missing.binary_path;
+  fixture.options.max_restarts = 0;
+
+  Launcher{fixture.options}.Run();
+  const std::string graph = fixture.graph_json();
+  EXPECT_EQ(GraphErrors(graph), std::vector<std::string>{}) << graph;
+  const auto warnings = GraphFindings(graph, "warning", "alpha");
+  ASSERT_EQ(warnings.size(), 1u) << graph;
+  EXPECT_NE(warnings[0].find("bazel build"), std::string::npos) << warnings[0];
+  EXPECT_NE(warnings[0].find("//example/alpha:node"), std::string::npos)
+      << warnings[0];
+  EXPECT_TRUE(fixture.has_manifest());
+  bool beta_launched = false;
+  std::istringstream lines{ReadFile(beta_runs)};
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("--describe") == std::string::npos &&
+        line.find("beta ") == 0) {
+      beta_launched = true;
+    }
+  }
+  EXPECT_TRUE(beta_launched) << ReadFile(beta_runs);
+  ::remove(beta_runs.c_str());
 }
 
 // REQ-OPS-30, DEPLOY-4: --start-studio-bridge from a checkout that has not
@@ -2406,6 +2574,7 @@ TEST(LauncherGraphTest, NonCriticalActuatorOrTargetProducerRefusesLaunch) {
   }
 }
 
+// REQ-OPS-01
 TEST(LauncherGraphTest, NonCriticalDescribeTimeoutAllowsPeersToLaunch) {
   GraphFixture fixture{
       "optional_timeout", kStubThatHangsOnDescribe,
@@ -2421,8 +2590,9 @@ TEST(LauncherGraphTest, NonCriticalDescribeTimeoutAllowsPeersToLaunch) {
   fixture.options.max_restarts = 0;
   EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
   EXPECT_TRUE(fixture.has_manifest());
-  EXPECT_EQ(fixture.graph_json().find("\"severity\": \"error\""),
-            std::string::npos);
+  const std::string graph = fixture.graph_json();
+  EXPECT_EQ(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
+  EXPECT_EQ(GraphFindings(graph, "warning", "alpha").size(), 1u) << graph;
 }
 
 TEST(LauncherGraphTest, NonCriticalDoesNotRelaxNamingRules) {
@@ -2555,11 +2725,13 @@ TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {
 
 // A binary that cannot be run is reported with the reason its exec failed,
 // not as a node that exited 127.
+// REQ-OPS-01
 TEST(LauncherGraphTest, ProbeReportsWhyABinaryCannotRun) {
   introspect::Description out;
   std::string error;
   EXPECT_FALSE(ProbeDescribe({"/nonexistent/talos_node", "--describe"}, kHang,
                              out, error));
+  EXPECT_NE(error.find("execv"), std::string::npos) << error;
   EXPECT_NE(error.find("/nonexistent/talos_node"), std::string::npos) << error;
   EXPECT_NE(error.find(std::strerror(ENOENT)), std::string::npos) << error;
 }
@@ -4663,6 +4835,7 @@ TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
   EXPECT_EQ(both.record, "") << "a member was run or probed";
 }
 
+// REQ-OPS-08
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   auto options = SessionFixture("killed_manifest");
   std::filesystem::remove_all(options.output_dir);
@@ -4748,43 +4921,131 @@ std::string DescribeThenRecord(
 // launcher there, its manifest unended and its segments left behind.
 // REQ-OPS-03, REQ-OPS-06
 TEST(LauncherSessions, AStopOnceSegmentsExistEndsTheSessionBeforeAnySpawn) {
-  const std::string tag = "stop_after_segments";
-  auto options = SessionFixture(tag);
-  std::filesystem::remove_all(options.output_dir);
-  const std::string record = TempPath(tag + "_runs");
-  ::remove(record.c_str());
-  // Only bounds a launch that missed the stop.
-  options.duration_s = static_cast<int>(kHang.count());
-  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
-      tag + "_hardware",
-      DescribeThenRecord("hardware_node", "//talOS/bridge:hardware_node", {},
-                         record));
-  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      tag + "_alpha", DescribeThenRecord("alpha", "//example/alpha:node",
-                                         {Sender("/alpha/state")}, record));
-  options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      tag + "_beta", DescribeThenRecord("beta", "//example/beta:node",
-                                        {Watcher("/alpha/state")}, record));
-  options.session_segments_created = [] { ::raise(SIGINT); };
-  const pid_t launcher = ForkLauncher(options);
-  ASSERT_GE(launcher, 0);
-  int status = 0;
-  ASSERT_EQ(::waitpid(launcher, &status, 0), launcher);
-  const bool left = SegmentLeft("/alpha/state");
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
-      << "the launcher ended with " << ExitReason(status);
-  EXPECT_EQ(ReadFile(record), "") << "members spawned after the stop";
-  EXPECT_FALSE(left) << "the session's /alpha/state segment was not unlinked";
-  const std::string manifest =
-      ReadFile(options.output_dir + "/1/manifest.json");
-  ASSERT_FALSE(manifest.empty()) << "no manifest.json";
-  EXPECT_EQ(manifest.find("\n  \"end_wall_ns\": 0,"), std::string::npos)
-      << manifest;
-  EXPECT_NE(manifest.find("\n  \"stopped_before_start\": true,"),
-            std::string::npos)
-      << manifest;
-  std::filesystem::remove_all(options.output_dir);
-  ::remove(record.c_str());
+  struct SegmentSnapshot {
+    std::uint64_t lifetime{0};
+    std::uint64_t schema_hash{0};
+    std::uint64_t message_bytes{0};
+    std::uint64_t message_alignment{0};
+    std::uint64_t slots{0};
+    char schema_name[talos::schema::kMaxSchemaName + 1]{};
+    bool had_record_before_spawn{false};
+  };
+  const auto expected = Sender("/alpha/state");
+  const auto snapshot_segment = [&](const std::string& rec_path) {
+    SegmentSnapshot snap{};
+    snap.had_record_before_spawn = !ReadFile(rec_path).empty();
+    SharedMemoryPtr segment{"/alpha/state", sizeof(RTMSHeader)};
+    const auto* header = static_cast<const RTMSHeader*>(segment.ptr());
+    snap.lifetime = header->lifetime.load(std::memory_order_acquire);
+    snap.schema_hash = header->schema_hash;
+    snap.message_bytes = header->message_bytes;
+    snap.message_alignment = header->message_alignment;
+    snap.slots = header->slots;
+    std::memcpy(snap.schema_name, header->schema_name,
+                sizeof(snap.schema_name));
+    return snap;
+  };
+  const auto check_snapshot = [&](const SegmentSnapshot& snap) {
+    EXPECT_FALSE(snap.had_record_before_spawn)
+        << "a member ran before session_segments_created";
+    EXPECT_NE(snap.lifetime & kLifetimeSessionOwned, 0u);
+    EXPECT_EQ(std::string_view{snap.schema_name}, expected.schema);
+    EXPECT_EQ(snap.schema_hash, expected.schema_hash);
+    EXPECT_EQ(snap.message_bytes, expected.message_bytes);
+    EXPECT_EQ(snap.message_alignment, expected.alignment);
+    EXPECT_EQ(snap.slots, expected.slots);
+  };
+
+  // Case 1: stop arriving once segments exist (before any spawn) inspects the
+  // session-owned segment header and unlinks it on stop.
+  {
+    const std::string tag = "stop_after_segments";
+    auto options = SessionFixture(tag);
+    std::filesystem::remove_all(options.output_dir);
+    const std::string record = TempPath(tag + "_runs");
+    ::remove(record.c_str());
+    // Only bounds a launch that missed the stop.
+    options.duration_s = static_cast<int>(kHang.count());
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        tag + "_hardware",
+        DescribeThenRecord("hardware_node", "//talOS/bridge:hardware_node", {},
+                           record));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        tag + "_alpha", DescribeThenRecord("alpha", "//example/alpha:node",
+                                           {expected}, record));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        tag + "_beta", DescribeThenRecord("beta", "//example/beta:node",
+                                          {Watcher("/alpha/state")}, record));
+    int snap_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(snap_pipe), 0);
+    options.session_segments_created = [&, write_fd = snap_pipe[1]] {
+      const SegmentSnapshot snap = snapshot_segment(record);
+      [[maybe_unused]] const ssize_t n = ::write(write_fd, &snap, sizeof(snap));
+      ::close(write_fd);
+      ::raise(SIGINT);
+    };
+    const pid_t launcher = ForkLauncher(options);
+    ASSERT_GE(launcher, 0);
+    ::close(snap_pipe[1]);
+    SegmentSnapshot snap{};
+    const ssize_t got = ::read(snap_pipe[0], &snap, sizeof(snap));
+    ::close(snap_pipe[0]);
+    int status = 0;
+    ASSERT_EQ(::waitpid(launcher, &status, 0), launcher);
+    const bool left = SegmentLeft("/alpha/state");
+    ASSERT_EQ(got, static_cast<ssize_t>(sizeof(snap)))
+        << "session_segments_created did not run";
+    check_snapshot(snap);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "the launcher ended with " << ExitReason(status);
+    EXPECT_EQ(ReadFile(record), "") << "members spawned after the stop";
+    EXPECT_FALSE(left) << "the session's /alpha/state segment was not unlinked";
+    const std::string manifest =
+        ReadFile(options.output_dir + "/1/manifest.json");
+    ASSERT_FALSE(manifest.empty()) << "no manifest.json";
+    EXPECT_EQ(manifest.find("\n  \"end_wall_ns\": 0,"), std::string::npos)
+        << manifest;
+    EXPECT_NE(manifest.find("\n  \"stopped_before_start\": true,"),
+              std::string::npos)
+        << manifest;
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(record.c_str());
+  }
+
+  // Case 2: normal session end also creates /alpha/state matching the probe
+  // before any spawn and unlinks it once the session returns cleanly.
+  {
+    const std::string tag = "normal_end_segments";
+    auto options = SessionFixture(tag);
+    std::filesystem::remove_all(options.output_dir);
+    const std::string record = TempPath(tag + "_runs");
+    ::remove(record.c_str());
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        tag + "_hardware",
+        DescribeThenRecord("hardware_node", "//talOS/bridge:hardware_node", {},
+                           record));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        tag + "_alpha", DescribeThenRecord("alpha", "//example/alpha:node",
+                                           {expected}, record));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        tag + "_beta", DescribeThenRecord("beta", "//example/beta:node",
+                                          {Watcher("/alpha/state")}, record));
+    bool saw_segments = false;
+    SegmentSnapshot snap{};
+    options.session_segments_created = [&] {
+      snap = snapshot_segment(record);
+      saw_segments = true;
+    };
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const bool left = SegmentLeft("/alpha/state");
+    ASSERT_TRUE(saw_segments);
+    check_snapshot(snap);
+    EXPECT_FALSE(left)
+        << "the session's /alpha/state segment survived normal end";
+    EXPECT_NE(ReadFile(record).find("alpha"), std::string::npos);
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(record.c_str());
+  }
 }
 
 // A stop (SIGINT) that arrives between two spawns: the members already
@@ -5964,6 +6225,65 @@ channel = "shooter/status/nope"
   std::remove(hw_stub.c_str());
   std::remove(shooter_stub.c_str());
   std::remove(auto_stub.c_str());
+}
+
+// REQ-RT-23: `--describe-only` enforces the 20 ms minimum period for Python
+// actuator owners (`abi_update: true`): a Python actuator owner at 10 ms fails
+// with an error naming the subsystem, its period and the 20000 us minimum,
+// while a C++ actuator owner (`abi_update: false`) at 5 ms passes.
+TEST(LauncherGraphTest, DescribeOnlyEnforcesPythonActuatorMinimumPeriod) {
+  const auto stub_with_abi = [](std::string_view node, std::string_view target,
+                                bool abi_update) {
+    introspect::Description description;
+    description.name = std::string{node};
+    description.target = std::string{target};
+    description.abi_update = abi_update;
+    return std::string{"#!/bin/sh\n"} +
+           "for arg in \"$@\"; do\n"
+           "  if [ \"$arg\" = \"--describe\" ]; then\n"
+           "    cat <<'TALOS_DESCRIBE'\n" +
+           introspect::DescribeToJson(description) +
+           "TALOS_DESCRIBE\n"
+           "    exit 0\n"
+           "  fi\n"
+           "done\n"
+           "exit 0\n";
+  };
+
+  // Case 1: beta (10 ms motor owner) describes abi_update: true -> refused;
+  // alpha (5 ms motor owner) describes abi_update: false -> no error for alpha.
+  {
+    GraphFixture fixture{
+        "py_period_refused",
+        stub_with_abi("alpha", "//example/alpha:node", /*abi_update=*/false),
+        stub_with_abi("beta", "//example/beta:node", /*abi_update=*/true)};
+    fixture.options.describe_only = true;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(fixture.has_manifest());
+    const std::string graph = fixture.graph_json();
+    const auto beta_errors = GraphFindings(graph, "error", "beta");
+    ASSERT_EQ(beta_errors.size(), 1u) << graph;
+    EXPECT_NE(beta_errors[0].find("10000"), std::string::npos)
+        << beta_errors[0];
+    EXPECT_NE(beta_errors[0].find(std::to_string(kMinPythonActuatorPeriodUs)),
+              std::string::npos)
+        << beta_errors[0];
+    EXPECT_TRUE(GraphFindings(graph, "error", "alpha").empty()) << graph;
+  }
+
+  // Case 2: alpha (5 ms motor owner) and beta (10 ms motor owner) both
+  // describe abi_update: false -> passes --describe-only cleanly.
+  {
+    GraphFixture fixture{
+        "py_period_cpp_ok",
+        stub_with_abi("alpha", "//example/alpha:node", /*abi_update=*/false),
+        stub_with_abi("beta", "//example/beta:node", /*abi_update=*/false)};
+    fixture.options.describe_only = true;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
+    EXPECT_FALSE(fixture.has_manifest());
+    const std::string graph = fixture.graph_json();
+    EXPECT_TRUE(GraphErrors(graph).empty()) << graph;
+  }
 }
 
 }  // namespace

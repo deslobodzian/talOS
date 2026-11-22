@@ -1379,6 +1379,7 @@ TEST(Supervision, FailedSpawnIsRetriedNotAbandoned) {
 // child reports it, rather than a run that exited 127: alpha's first run takes
 // its binary's execute permission away, so its restart cannot exec, and that
 // restart is retried, not counted as a run, and marks alpha recorder_failed.
+// REQ-OPS-01
 TEST(Supervision, ExecFailureIsASpawnFailureThatNamesItsCause) {
   auto options = BaseOptions("exec_failure", "max_restarts = 1\n");
   MakeAlphaNonCritical(options);
@@ -1395,7 +1396,8 @@ TEST(Supervision, ExecFailureIsASpawnFailureThatNamesItsCause) {
     if (fd < 0 || ::dup2(fd, STDERR_FILENO) < 0) ::_exit(100);
     ::_exit(Launcher{options}.Run());
   }
-  // The launcher's line for the failed restart: alpha's binary and the errno.
+  // The launcher's line for the failed restart: execv, alpha's binary, and the
+  // errno.
   const std::string cause = std::strerror(EACCES);
   const auto report = [&] {
     std::istringstream lines{ReadFile(log)};
@@ -1415,6 +1417,7 @@ TEST(Supervision, ExecFailureIsASpawnFailureThatNamesItsCause) {
   while (::waitpid(launcher, nullptr, 0) < 0 && errno == EINTR) {
   }
   EXPECT_FALSE(reported.empty()) << ReadFile(log);
+  EXPECT_NE(reported.find("execv"), std::string::npos) << reported;
   const auto manifest =
       ReadFile(options.output_dir + "/" + std::to_string(options.session_id) +
                "/manifest.json");
@@ -2057,6 +2060,147 @@ TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   std::filesystem::remove_all(dir);
   ::remove(alpha_runs.c_str());
   ::remove(beta_runs.c_str());
+}
+
+// REQ-OPS-04: a quarantined non-critical member does not spawn 1 ms before its
+// retry_at_monotonic_ns deadline; at retry_at_monotonic_ns it spawns once,
+// clearing `quarantined`, and re-enters quarantine if that retry crashes.
+TEST(Supervision,
+     QuarantinedNodeRetriesOnlyAtDeadlineThenRequarantinesOnCrash) {
+  LauncherOptions options =
+      BaseOptions("quarantine_retry_out", "max_restarts = 1\n");
+  MakeAlphaNonCritical(options);
+  options.duration_s = 3600;
+  options.heartbeat_periods = 1'000'000;
+  options.heartbeat_startup_grace_ms = 3'600'000;
+  options.construction_timeout = 1h;
+  testing::SteppedClock clock;
+  clock.Freeze();
+  options.supervision_clock = clock.clock();
+  const std::string alpha_runs = TempPath("quarantine_retry_alpha_runs");
+  const std::string crash_retry = TempPath("quarantine_retry_crash");
+  ::remove(alpha_runs.c_str());
+  ::remove(crash_retry.c_str());
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("quarantine_retry_hw", kRunUntilStopped, "hardware_node");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("quarantine_retry_alpha",
+                RecordLogArgThen(alpha_runs,
+                                 "case \"$log\" in\n"
+                                 "  *restart2.tlog)\n"
+                                 "    while [ ! -e '" +
+                                     crash_retry +
+                                     "' ]; do sleep 0.01; done\n"
+                                     "    exit 3\n"
+                                     "    ;;\n"
+                                     "esac\n"
+                                     "exit 3\n"));
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("quarantine_retry_beta", kRunUntilStopped);
+
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  testing::SupervisionPasses passes;
+  int64_t quarantine_retry_at = 0;
+  bool stayed_quarantined_before_deadline = false;
+  bool retried_and_cleared_quarantine = false;
+  bool requarantined_after_retry_crash = false;
+  int64_t requarantine_retry_at = 0;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    // Drive run 0's crash into restart 1 (the 1 restart allowed in the window).
+    int64_t first_retry_at = 0;
+    if (!WaitFor(stop, [&] {
+          const std::string manifest = ReadFile(live);
+          const auto history = ManifestRuns(manifest, "alpha");
+          first_retry_at = EntryInteger(ManifestEntry(manifest, "alpha"),
+                                        "retry_at_monotonic_ns");
+          return history.size() == 1 &&
+                 history.back().find("\"reason\": \"crash\"") !=
+                     std::string::npos &&
+                 first_retry_at > 0;
+        })) {
+      ::kill(::getpid(), SIGTERM);
+      return;
+    }
+    clock.HoldAt(SupervisionTime{std::chrono::nanoseconds{first_retry_at}});
+    SupervisionWakeup::Wake();
+
+    // Run 1 (restart 1) crashes -> enters quarantine.
+    const bool entered_quarantine = WaitFor(stop, [&] {
+      const std::string manifest = ReadFile(live);
+      const std::string entry = ManifestEntry(manifest, "alpha");
+      const auto history = ManifestRuns(manifest, "alpha");
+      quarantine_retry_at = EntryInteger(entry, "retry_at_monotonic_ns");
+      return history.size() == 2 &&
+             entry.find("\"quarantined\": true") != std::string::npos &&
+             quarantine_retry_at > 0;
+    });
+    if (entered_quarantine) {
+      // Advance 1 ms short of retry_at_monotonic_ns: must NOT spawn.
+      clock.HoldAt(
+          SupervisionTime{std::chrono::nanoseconds{quarantine_retry_at}} - 1ms);
+      const uint64_t after_before = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after_before;
+      });
+      const std::string before_manifest = ReadFile(live);
+      stayed_quarantined_before_deadline =
+          ReadLines(alpha_runs).size() == 2 &&
+          ManifestRuns(before_manifest, "alpha").size() == 2 &&
+          ManifestEntry(before_manifest, "alpha")
+                  .find("\"quarantined\": true") != std::string::npos;
+
+      // Advance to retry_at_monotonic_ns: spawns once and clears quarantined.
+      clock.HoldAt(
+          SupervisionTime{std::chrono::nanoseconds{quarantine_retry_at}});
+      SupervisionWakeup::Wake();
+      retried_and_cleared_quarantine = WaitFor(stop, [&] {
+        const std::string manifest = ReadFile(live);
+        const std::string entry = ManifestEntry(manifest, "alpha");
+        const auto history = ManifestRuns(manifest, "alpha");
+        return ReadLines(alpha_runs).size() == 3 && history.size() == 3 &&
+               history.back().find("\"reason\": \"running\"") !=
+                   std::string::npos &&
+               entry.find("\"quarantined\": false") != std::string::npos;
+      });
+    }
+    if (retried_and_cleared_quarantine) {
+      // Crash the retry run -> re-quarantines with a later retry deadline.
+      std::ofstream{crash_retry}.close();
+      requarantined_after_retry_crash = WaitFor(stop, [&] {
+        const std::string manifest = ReadFile(live);
+        const std::string entry = ManifestEntry(manifest, "alpha");
+        const auto history = ManifestRuns(manifest, "alpha");
+        requarantine_retry_at = EntryInteger(entry, "retry_at_monotonic_ns");
+        return history.size() == 3 &&
+               history.back().find("\"reason\": \"crash\"") !=
+                   std::string::npos &&
+               entry.find("\"quarantined\": true") != std::string::npos &&
+               requarantine_retry_at > quarantine_retry_at;
+      });
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+
+  EXPECT_NE(RunSession(options), 0);
+  driver.join();
+  EXPECT_GT(quarantine_retry_at, 0);
+  EXPECT_TRUE(stayed_quarantined_before_deadline)
+      << "quarantined alpha spawned before retry_at_monotonic_ns";
+  EXPECT_TRUE(retried_and_cleared_quarantine)
+      << "quarantined alpha did not spawn once and clear quarantined at "
+         "retry_at_monotonic_ns";
+  EXPECT_TRUE(requarantined_after_retry_crash)
+      << "alpha did not re-quarantine after its retry run crashed";
+  EXPECT_GT(requarantine_retry_at, quarantine_retry_at);
+  EXPECT_EQ(ReadLines(alpha_runs).size(), 3u);
+
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(alpha_runs.c_str());
+  ::remove(crash_retry.c_str());
 }
 
 // A critical member (here alpha, an actuator owner) that crashes repeatedly
@@ -2705,6 +2849,7 @@ TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
 // running session's topics. It is refused before it writes or starts
 // anything, naming the holder; --describe-only, which starts nothing, still
 // runs; and the lock dies with its holder.
+// REQ-OPS-02
 TEST(Supervision, SecondLaunchInTheNamespaceIsRefused) {
   int ready[2];
   ASSERT_EQ(::pipe(ready), 0);
@@ -2919,6 +3064,7 @@ TEST(Supervision, ARowWhoseProcessIsGoneDoesNotKeepTheRegistry) {
 // alpha's crash is still restarted at once; once the disk recovers, a synced
 // manifest of the running session records the restart (PersistManifest,
 // ManifestWriter).
+// REQ-OPS-08
 TEST(Supervision, StuckManifestSyncDelaysNoRestartAndSyncsItLater) {
   auto options = BaseOptions("stuck_sync");
   // The stubs never register; no heartbeat kill may restart them meanwhile.
@@ -2990,6 +3136,59 @@ TEST(Supervision, StuckManifestSyncDelaysNoRestartAndSyncsItLater) {
       << "no manifest synced mid-session recorded the restart";
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
+}
+
+// REQ-OPS-08: manifest.json is written before spawn 0 returns (verified inside
+// member_spawned) and records each member's binary_sha256 matching
+// FileSha256(binary_path).
+TEST(Supervision, ManifestExistsBeforeFirstSpawnWithBinaryDigests) {
+  auto options = BaseOptions("manifest_before_spawn");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("manifest_before_spawn_alpha", "exit 0\n", "alpha");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("manifest_before_spawn_beta", "exit 0\n", "beta");
+  const std::string live_manifest = options.output_dir + "/" +
+                                    std::to_string(options.session_id) +
+                                    "/manifest.json";
+  const std::string hw_sha =
+      FileSha256(options.binary_overrides["//talOS/bridge:hardware_node"]);
+  const std::string alpha_sha =
+      FileSha256(options.binary_overrides["//example/alpha:node"]);
+  const std::string beta_sha =
+      FileSha256(options.binary_overrides["//example/beta:node"]);
+  ASSERT_EQ(hw_sha.size(), 64u);
+  ASSERT_EQ(alpha_sha.size(), 64u);
+  ASSERT_EQ(beta_sha.size(), 64u);
+
+  int spawn_calls = 0;
+  bool existed_at_first_spawn = false;
+  std::string manifest_at_first_spawn;
+  options.member_spawned = [&](const std::string&) {
+    if (spawn_calls++ == 0) {
+      existed_at_first_spawn = std::filesystem::exists(live_manifest);
+      manifest_at_first_spawn = ReadFile(live_manifest);
+    }
+  };
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_EQ(spawn_calls, 3);
+  EXPECT_TRUE(existed_at_first_spawn)
+      << "manifest.json did not exist inside member_spawned before spawn 0 "
+         "returned";
+  const std::string final_manifest =
+      ReadFile(options.output_dir + "/manifest.json");
+  const std::array<std::pair<std::string_view, const std::string*>, 3> expected{
+      {{"hardware_node", &hw_sha}, {"alpha", &alpha_sha}, {"beta", &beta_sha}}};
+  for (const auto& [name, sha] : expected) {
+    SCOPED_TRACE(name);
+    const std::string needle = "\"binary_sha256\": \"" + *sha + "\"";
+    EXPECT_NE(ManifestEntry(manifest_at_first_spawn, name).find(needle),
+              std::string::npos)
+        << manifest_at_first_spawn;
+    EXPECT_NE(ManifestEntry(final_manifest, name).find(needle),
+              std::string::npos)
+        << final_manifest;
+  }
+  std::filesystem::remove_all(options.output_dir);
 }
 
 // Supplies a shell stub's registry row from the fixture, without giving the
@@ -3997,6 +4196,112 @@ TEST(Supervision, FailingStudioBridgeRestartsBoundedTimesThenIsLeft) {
   }
   std::filesystem::remove_all(options.output_dir);
   for (const auto* path : {&runs, &bridge_runs}) ::remove(path->c_str());
+}
+
+// REQ-OPS-30: a Studio bridge that answers --describe and then fails to spawn
+// (here its --describe handler replaces the script with an executable script
+// whose interpreter does not exist, so execv fails with ENOENT) is retried on
+// the non-critical backoff (50, 100, 200 ms) up to max_restarts times, then
+// left with recorder_failed: true without disturbing any peer or changing the
+// session's exit status.
+TEST(Supervision,
+     StudioBridgeSpawnFailureAfterDescribeRestartsOnNonCriticalBackoff) {
+  const auto runs = TempPath("bridge_spawn_fail_runs");
+  ::remove(runs.c_str());
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  auto options = BridgeOptions("bridge_spawn_fail", runs, clock);
+  introspect::Description desc;
+  desc.name = "studio_bridge";
+  desc.target = "//studio/bridge:studio_bridge";
+  const std::string bridge_bin = TempPath("bridge_spawn_fail_bridge") + ".sh";
+  std::ostringstream script;
+  script << "#!/bin/sh\n"
+         << "for arg in \"$@\"; do\n"
+         << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+         << "    cat <<'TALOS_DESCRIBE'\n"
+         << introspect::DescribeToJson(desc) << "TALOS_DESCRIBE\n"
+         << "    printf '#!/nonexistent/talos_studio_interp\\n' > \"$0.tmp\"\n"
+         << "    chmod +x \"$0.tmp\"\n"
+         << "    mv \"$0.tmp\" \"$0\"\n"
+         << "    exit 0\n"
+         << "  fi\n"
+         << "done\n"
+         << "exit 0\n";
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      testing::WriteWarmStub(bridge_bin, script.str());
+
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  std::vector<SupervisionTime> retries;
+  bool left = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    const auto bridge_failed = [&](std::size_t count, int64_t& retry_at) {
+      const std::string manifest = ReadFile(live);
+      retry_at = EntryInteger(ManifestEntry(manifest, "studio_bridge"),
+                              "retry_at_monotonic_ns");
+      const auto history = ManifestRuns(manifest, "studio_bridge");
+      return history.size() == count &&
+             history.back().find("\"reason\": \"spawn_failed\"") !=
+                 std::string::npos;
+    };
+    for (std::size_t attempt = 1; attempt <= 3; ++attempt) {
+      int64_t retry_at = 0;
+      if (!WaitFor(stop, [&] {
+            return bridge_failed(attempt, retry_at) && retry_at > 0;
+          })) {
+        break;
+      }
+      retries.emplace_back(std::chrono::nanoseconds{retry_at});
+      clock.HoldAt(retries.back());
+      SupervisionWakeup::Wake();
+    }
+    if (retries.size() == 3) {
+      left = WaitFor(stop, [&] {
+        int64_t retry_at = 0;
+        return bridge_failed(4, retry_at) && retry_at == 0 &&
+               ManifestEntry(ReadFile(live), "studio_bridge")
+                       .find("\"recorder_failed\": true") != std::string::npos;
+      });
+    }
+    WaitFor(stop, [&] { return ReadLines(runs).size() == 3; });
+    ::kill(::getpid(), SIGTERM);
+  }};
+
+  const int status = RunSession(options);
+  driver.join();
+  ASSERT_EQ(retries.size(), 3u)
+      << "spawn-failed restart " << retries.size() + 1 << " was not scheduled";
+  const std::array<std::chrono::nanoseconds, 3> gaps{
+      retries[0] - start, retries[1] - retries[0], retries[2] - retries[1]};
+  EXPECT_EQ(gaps[0], 50ms);
+  EXPECT_EQ(gaps[1], 100ms);
+  EXPECT_EQ(gaps[2], 200ms);
+  ASSERT_TRUE(left) << "studio_bridge was not left after exhausting retries";
+  EXPECT_EQ(status, 0);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string bridge = ManifestEntry(manifest, "studio_bridge");
+  EXPECT_EQ(EntryInteger(bridge, "restart_count"), 3) << bridge;
+  EXPECT_EQ(EntryInteger(bridge, "retry_at_monotonic_ns"), 0) << bridge;
+  EXPECT_NE(bridge.find("\"recorder_failed\": true"), std::string::npos)
+      << bridge;
+  const auto history = ManifestRuns(manifest, "studio_bridge");
+  ASSERT_EQ(history.size(), 4u) << manifest;
+  for (const auto& run : history) {
+    EXPECT_NE(run.find("{\"pid\": -1,"), std::string::npos) << run;
+    EXPECT_NE(run.find("\"reason\": \"spawn_failed\""), std::string::npos)
+        << run;
+  }
+  for (const char* name : {"hardware_node", "alpha", "beta"}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(EntryInteger(ManifestEntry(manifest, name), "restart_count"), 0);
+    EXPECT_EQ(ManifestRuns(manifest, name).size(), 1u) << manifest;
+  }
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+  ::remove(bridge_bin.c_str());
 }
 
 // A stop that arrives while the bridge waits out its restart backoff cancels
@@ -5511,6 +5816,127 @@ TEST(Supervision, LateRingLockRefusalWarnsAndMergesIntoManifest) {
       << hw;
 
   std::filesystem::remove_all(options.output_dir);
+}
+
+// REQ-RT-18: the launcher's stall check reads the loop's dispatch_count, never
+// the reporter's heartbeat_monotonic_ns. When alpha's dispatch_count keeps
+// advancing while its heartbeat_monotonic_ns stays frozen past both the stall
+// timeout (startup grace + kMinHeartbeatTimeout) and
+// introspect::kLivenessTimeout (5 s), the launcher does NOT stall-kill alpha.
+TEST(Supervision, AdvancingDispatchCountPreventsStallKillWithFrozenHeartbeat) {
+  auto options = BaseOptions("frozen_hb_out", "max_restarts = 1\n");
+  constexpr auto kGrace = 1000ms;
+  options.heartbeat_periods = 1;
+  options.heartbeat_startup_grace_ms = static_cast<int>(kGrace.count());
+  options.construction_timeout = 1h;
+  options.duration_s = 3600;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  options.supervision_clock = clock.clock();
+  UseHealthyRegisteringNodes(options, "frozen_hb");
+
+  const auto pid_file = TempPath("frozen_hb_pid");
+  const auto runs = TempPath("frozen_hb_runs");
+  ::remove(pid_file.c_str());
+  ::remove(runs.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "frozen_hb_alpha",
+      "trap 'exit 0' INT TERM\n" +
+          RecordLogArgThen(runs, "echo $$ > '" + pid_file + ".tmp' && mv '" +
+                                     pid_file + ".tmp' '" + pid_file +
+                                     "'\nwhile :; do sleep 0.05; done\n"));
+  // PublishStubRow stamps heartbeat_monotonic_ns once when claiming the row;
+  // this tick advances only dispatch_count so heartbeat_monotonic_ns remains
+  // frozen for the entire session.
+  auto publisher =
+      PublishStubRow(options, pid_file, [](introspect::NodeRecord& row) {
+        row.dispatch_count.fetch_add(1, std::memory_order_relaxed);
+      });
+
+  const uint64_t session = options.session_id;
+  const std::string live =
+      options.output_dir + "/" + std::to_string(session) + "/manifest.json";
+  const auto read_alpha_row = [&] {
+    std::pair<int64_t, uint64_t> out{0, 0};
+    introspect::RegistryMapping mapping{introspect::kRegistryPath,
+                                        /*read_only=*/true};
+    for (const auto& row : mapping.header()->nodes) {
+      if (row.state.load(std::memory_order_acquire) !=
+          static_cast<uint64_t>(introspect::SlotState::ACTIVE)) {
+        continue;
+      }
+      if (row.session_id == session &&
+          introspect::read_name(row.name, introspect::kMaxNameBytes) ==
+              "alpha") {
+        out.first = row.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+        out.second = row.dispatch_count.load(std::memory_order_relaxed);
+        break;
+      }
+    }
+    return out;
+  };
+
+  testing::SupervisionPasses passes;
+  int64_t initial_heartbeat = 0;
+  int64_t final_heartbeat = 0;
+  uint64_t initial_dispatch = 0;
+  uint64_t final_dispatch = 0;
+  bool survived_past_liveness_timeout = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    if (!WaitFor(stop, [&] {
+          return Registered("hardware_node", session) &&
+                 Registered("alpha", session) && Registered("beta", session);
+        })) {
+      ::kill(::getpid(), SIGTERM);
+      return;
+    }
+    const auto initial = read_alpha_row();
+    initial_heartbeat = initial.first;
+    initial_dispatch = initial.second;
+    SupervisionTime now = start;
+    const SupervisionTime target =
+        start + kGrace + introspect::kLivenessTimeout + 1s;
+    if (AdvanceClockWithHealthyNodes(stop, clock, passes, session, now,
+                                     target)) {
+      const uint64_t after = passes.Started() + 2;
+      WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after;
+      });
+      const auto current = read_alpha_row();
+      final_heartbeat = current.first;
+      final_dispatch = current.second;
+      const auto history = ManifestRuns(ReadFile(live), "alpha");
+      survived_past_liveness_timeout =
+          history.size() == 1 &&
+          history.front().find("\"reason\": \"running\"") != std::string::npos;
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+
+  EXPECT_EQ(RunSession(options), 0);
+  driver.join();
+  publisher.request_stop();
+  publisher.join();
+
+  EXPECT_GT(initial_heartbeat, 0);
+  EXPECT_EQ(final_heartbeat, initial_heartbeat)
+      << "alpha's heartbeat_monotonic_ns was supposed to stay frozen";
+  EXPECT_GT(final_dispatch, initial_dispatch);
+  EXPECT_TRUE(survived_past_liveness_timeout)
+      << "alpha was stall-killed despite advancing dispatch_count";
+  EXPECT_EQ(ReadLines(runs).size(), 1u);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_EQ(EntryInteger(ManifestEntry(manifest, "alpha"), "restart_count"), 0)
+      << manifest;
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(history.size(), 1u) << manifest;
+  EXPECT_NE(history[0].find("\"reason\": \"stop\""), std::string::npos)
+      << history[0];
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(pid_file.c_str());
+  ::remove(runs.c_str());
 }
 
 }  // namespace

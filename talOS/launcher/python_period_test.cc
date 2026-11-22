@@ -12,10 +12,12 @@
 namespace talos::launcher {
 namespace {
 
+enum class Actuator { kNone, kMotor, kDigitalOutput, kPwmOutput };
+
 struct Case {
   const char* label;
   bool abi_update;     // The node's update() is Python's.
-  bool owns_motor;     // Its own subsystem owns a motor.
+  Actuator actuator;   // What actuator, if any, its own subsystem owns.
   const char* period;  // The subsystem's period_us line, or "" for [robot]'s.
   std::string refused_period;  // Empty when the graph is accepted.
 };
@@ -26,22 +28,49 @@ std::string RobotToml(const Case& c) {
       "[robot]\nperiod_us = 5000\ncommand_timeout_us = 100000\n"
       "[subsystems.arm]\nnode = \"//arm:node\"\n";
   toml += c.period;
-  if (c.owns_motor) {
-    toml +=
-        "[subsystems.arm.motors.lift]\ntype = \"TalonFX\"\nbus = \"test\"\n"
-        "can_id = 1\nslot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, "
-        "a = 0.0, g = 0.0 }\n";
+  switch (c.actuator) {
+    case Actuator::kNone:
+      break;
+    case Actuator::kMotor:
+      toml +=
+          "[subsystems.arm.motors.lift]\ntype = \"TalonFX\"\nbus = \"test\"\n"
+          "can_id = 1\nslot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, "
+          "a = 0.0, g = 0.0 }\n";
+      break;
+    case Actuator::kDigitalOutput:
+      toml += "[subsystems.arm.digital_outputs.solenoid]\ndio = 1\n";
+      break;
+    case Actuator::kPwmOutput:
+      toml += "[subsystems.arm.pwm_outputs.servo]\nchannel = 1\n";
+      break;
   }
   return toml;
 }
 
 TEST(LintPythonActuatorPeriods, RefusesAPythonActuatorOwnerFasterThan20Ms) {
   const std::vector<Case> cases{
-      {"python owner at 10 ms", true, true, "period_us = 10000\n", "10000"},
-      {"python owner at [robot]'s 5 ms", true, true, "", "5000"},
-      {"python owner at 20 ms", true, true, "period_us = 20000\n", ""},
-      {"c++ owner at 5 ms", false, true, "period_us = 5000\n", ""},
-      {"python observer at 10 ms", true, false, "period_us = 10000\n", ""},
+      {"python motor owner at 10 ms", true, Actuator::kMotor,
+       "period_us = 10000\n", "10000"},
+      {"python motor owner at [robot]'s 5 ms", true, Actuator::kMotor, "",
+       "5000"},
+      {"python motor owner at 20 ms", true, Actuator::kMotor,
+       "period_us = 20000\n", ""},
+      {"c++ motor owner at 5 ms", false, Actuator::kMotor, "period_us = 5000\n",
+       ""},
+      {"python DIO-only owner at 10 ms", true, Actuator::kDigitalOutput,
+       "period_us = 10000\n", "10000"},
+      {"python DIO-only owner at 20 ms", true, Actuator::kDigitalOutput,
+       "period_us = 20000\n", ""},
+      {"c++ DIO-only owner at 5 ms", false, Actuator::kDigitalOutput,
+       "period_us = 5000\n", ""},
+      {"python PWM-only owner at 10 ms", true, Actuator::kPwmOutput,
+       "period_us = 10000\n", "10000"},
+      {"python PWM-only owner at 20 ms", true, Actuator::kPwmOutput,
+       "period_us = 20000\n", ""},
+      {"c++ PWM-only owner at 5 ms", false, Actuator::kPwmOutput,
+       "period_us = 5000\n", ""},
+      {"python observer at 10 ms", true, Actuator::kNone, "period_us = 10000\n",
+       ""},
   };
   for (const Case& c : cases) {
     SCOPED_TRACE(c.label);

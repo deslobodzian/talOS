@@ -1034,6 +1034,48 @@ class SessionReportTest(unittest.TestCase):
                 self.assertEqual(lines[src_idx + 1],
                                  "talOS revision: bbbb2222" + suffix)
 
+    # REQ-RT-15: exact verdict boundaries for overall/enabled /hw/state median
+    # ([4.0, 6.0] ms), p99 (< 10.0 ms), and enabled state gaps (< 100.0 ms).
+    def test_state_cadence_and_gap_verdict_boundaries(self):
+        def record(topic, now, **extra):
+            return dict(process="hardware_node", kind="SEND", topic=topic,
+                        now_ms=now, event_ms=now, publish_ms=now, decoded="",
+                        **extra)
+
+        def verdicts_for(times):
+            records = [record("/hw/state/driver_station", 0, ds_enabled=True)]
+            records += [record("/hw/state", t) for t in times]
+            report = session_report.analyze({"end_wall_ns": 1, "nodes": []}, records)
+            return report, {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+
+        # Overall and enabled state median: 3.99 FAIL, 4.0/6.0 PASS, 6.01 FAIL.
+        for interval, expected in ((3.99, "FAIL"), (4.0, "PASS"),
+                                   (6.0, "PASS"), (6.01, "FAIL")):
+            with self.subTest(median_ms=interval):
+                _, verdicts = verdicts_for([0.0, interval, 2 * interval, 3 * interval])
+                self.assertEqual(verdicts["overall state median"], expected)
+                self.assertEqual(verdicts["enabled state median"], expected)
+
+        # Overall and enabled state p99: 9.99 PASS, 10.0 FAIL.
+        # Put the peak interval first so peak - 0.0 is exact in IEEE 754; nine
+        # 5 ms intervals follow (10 total: median = 5 ms, nearest-rank p99 = peak).
+        for peak, expected in ((9.99, "PASS"), (10.0, "FAIL")):
+            with self.subTest(p99_ms=peak):
+                times = [0.0] + [peak + 5.0 * i for i in range(10)]
+                _, verdicts = verdicts_for(times)
+                self.assertEqual(verdicts["overall state median"], "PASS")
+                self.assertEqual(verdicts["enabled state median"], "PASS")
+                self.assertEqual(verdicts["overall state p99"], expected)
+                self.assertEqual(verdicts["enabled state p99"], expected)
+
+        # Enabled state gaps: 99.9 PASS (0 gaps >= 100 ms), 100.0 FAIL (1 gap).
+        for gap_ms, expected, count in ((99.9, "PASS", 0), (100.0, "FAIL", 1)):
+            with self.subTest(gap_ms=gap_ms):
+                times = [0.0, gap_ms, gap_ms + 5.0, gap_ms + 10.0]
+                report, verdicts = verdicts_for(times)
+                self.assertEqual(report["enabled_gaps_ge_100_ms"], count)
+                self.assertEqual(verdicts["enabled state gaps"], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

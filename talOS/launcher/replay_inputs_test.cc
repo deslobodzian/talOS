@@ -717,25 +717,63 @@ TEST_F(ReplayInputsTest, AReplayedNodeKeepsNoSessionState) {
 // cannot match. The node is not started, so it writes no log.
 TEST_F(ReplayInputsTest, ASessionOfAnotherHardwareProtocolIsRefused) {
   Record();
+  const std::uint16_t kBuild = protocol::kProtocolVersion;
+  const std::uint16_t kOther = static_cast<std::uint16_t>(kBuild - 1);
   const std::string session = CopyOfSession("other_protocol");
-  {
+  const auto write_bridge_log = [&](const std::string& filename,
+                                    std::uint16_t version) {
     const event::MonotonicTime origin =
         event::MonotonicTime::from_nanos(2'038'406'047'920);
     event::SimulationEnvironment environment;
     GatewayLoop loop{
         environment,
-        event::log::LogWriter{session + "/hardware_node.tlog", "hardware_node",
+        event::log::LogWriter{session + "/" + filename, "hardware_node",
                               event::log::LogWriterOptions{}, 1},
         GatewayLoop::Options{.start = origin}};
-    RealGateway gateway{loop, config::ParseRobotConfig(config_),
-                        protocol::kProtocolVersion - 1};
+    RealGateway gateway{loop, config::ParseRobotConfig(config_), version};
     loop.run_until(origin + std::chrono::milliseconds{20});
     loop.finish();
-  }
+  };
+  const auto refusal_line = [](const std::string& err) {
+    std::istringstream lines{err};
+    for (std::string line; std::getline(lines, line);) {
+      if (line.find("not replayed") != std::string::npos) return line;
+    }
+    return std::string{};
+  };
+
+  // Subcase 1: single bridge run recording another protocol version.
+  write_bridge_log("hardware_node.tlog", kOther);
   const std::string out = TempPath("other_protocol_out");
   std::filesystem::remove_all(out);
-  EXPECT_NE(Replay("replay_consumer", out, session), 0);
+  ::testing::internal::CaptureStderr();
+  const int single_rc = Replay("replay_consumer", out, session);
+  const std::string single_err = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(single_rc, 0) << single_err;
   EXPECT_FALSE(std::filesystem::exists(out + "/1/replay_consumer.tlog"));
+  const std::string single_refusal = refusal_line(single_err);
+  ASSERT_FALSE(single_refusal.empty()) << single_err;
+  EXPECT_NE(single_refusal.find(std::to_string(kOther)), std::string::npos)
+      << single_refusal;
+  EXPECT_NE(single_refusal.find(std::to_string(kBuild)), std::string::npos)
+      << single_refusal;
+  std::filesystem::remove_all(out);
+
+  // Subcase 2: bridge runs of two different protocol versions in one session.
+  write_bridge_log("hardware_node.restart1.tlog", kBuild);
+  ::testing::internal::CaptureStderr();
+  const int two_rc = Replay("replay_consumer", out, session);
+  const std::string two_err = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(two_rc, 0) << two_err;
+  EXPECT_FALSE(std::filesystem::exists(out + "/1/replay_consumer.tlog"));
+  const std::string two_refusal = refusal_line(two_err);
+  ASSERT_FALSE(two_refusal.empty()) << two_err;
+  EXPECT_NE(two_refusal.find(std::to_string(kOther)), std::string::npos)
+      << two_refusal;
+  EXPECT_NE(two_refusal.find(std::to_string(kBuild)), std::string::npos)
+      << two_refusal;
+  EXPECT_NE(two_refusal.find("different builds"), std::string::npos)
+      << two_refusal;
   std::filesystem::remove_all(out);
   std::filesystem::remove_all(TempPath("other_protocol"));
 }
