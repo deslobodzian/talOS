@@ -60,6 +60,60 @@ builds running in sibling worktrees; `TODO.md` `TEST-24`):
     PASSED** (min 2.3 s, avg 2.5 s, max 3.3 s, dev 0.2 s; elapsed 506.4 s),
     zero timeouts waiting for the Studio bridge's `listening` line.
 
+Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
+`78ebe06a`, idle (`vm.loadavg` 1.39–1.93), no hardware attached (`TODO.md`
+`RT-22`, `CAM-1`):
+
+- **RT-22: Python control node GIL contention under macOS
+  `THREAD_TIME_CONSTRAINT_POLICY` (`TALOS_REALTIME=1`).**
+  - Scratch `talos_py_node` actuator owner (`LoopTier::kControl`, `realtime =
+    "full"`, `time_constraint_active = true` confirmed via
+    `thread_policy_get`; Python worker threads timeshare), 30 s steady-state
+    window per case (`sys.getswitchinterval() = 0.005 s`):
+    - 5 ms period: `none` 5998 ticks (0 missed, `dispatch→exit` p99 56.4 µs /
+      max 133.7 µs, `TIMER` lateness p99 43.9 µs / max 550.2 µs); `socket.recv`
+      5998 ticks (0 missed, p99 45.5 µs / max 155.6 µs); busy Python `loop`
+      5633 ticks (367 missed, `dispatch→exit` p50 5.02 ms / p99 10.05 ms / max
+      15.08 ms — up to 3× switch interval per tick as `ctypes` calls release
+      and reacquire the GIL; `TIMER` lateness p99 5.08 ms / max 10.12 ms);
+      `sorted(2M)` 191 ticks (6067 missed, `dispatch→exit` p99 447.9 ms / max
+      664.8 ms).
+    - 20 ms period: `none` 1498 ticks (0 missed, p99 75.1 µs / max 142.0 µs);
+      `socket.recv` 1498 ticks (0 missed, p99 89.8 µs / max 183.2 µs); `loop`
+      1499 ticks (0 missed, `dispatch→exit` p50 5.03 ms / p99 10.06 ms / max
+      15.12 ms); `sorted(2M)` 196 ticks (1304 missed, p99 441.8 ms / max
+      446.9 ms).
+  - Confirms macOS time-constraint scheduling does not shield a Python control
+    node from GIL contention by a timeshare Python worker thread.
+- **CAM-1: Mac mini coprocessor sim-camera sweep (18 s runs, 4 s warmup, all
+  nodes `realtime = "full"`).**
+  - 4 × 1280×720 @ 60 fps: `auto`/Metal **1.95 cores total (0.49 cores/cam)**,
+    `3358/3358` steady-state (0 dropped, `frame_period_us` 16669, worst camera
+    `TIMER` lateness p99 0.281 ms / max 0.645 ms); `cpu` **2.20 cores total
+    (0.55 cores/cam)**, `3356/3356` (0 dropped, p99 0.402 ms / max 0.883 ms).
+  - 4 × 1280×720 @ 30 fps: Metal 1.25 cores (0.31/cam), `cpu` 1.20 cores
+    (0.30/cam), 0 dropped, zero tag-visibility loss (0.52–0.76 tags/frame).
+  - 4 × 960×540 @ 60 fps: Metal 1.40 cores, `cpu` 1.29 cores (0 dropped);
+    4 × 640×480 @ 60 fps: Metal 1.38 cores, `cpu` 1.25 cores (0 dropped);
+    4 × 640×360 @ 60 fps: Metal 1.30 cores, `cpu` 1.20 cores (loses ~45% of
+    visible tags at `min_tag_px = 12`).
+
+Linux workstation (8 cores, GCC 16.2.1, `libasan.so.8`), commits `78ebe06a` and
+`94cc8727`, no hardware attached (`TODO.md` `BENCH-3`, `CI-3`):
+
+- **BENCH-3: RoboRIO `./gradlew phoenixTest -Pasan` clean with zero
+  suppressions (`78ebe06a`).**
+  - `./gradlew phoenixTest -Pasan`: 106/106 debug + 106/106 release +
+    `rioBuildStampTest` PASS (`BUILD SUCCESSFUL`). Direct runs under strict
+    ASan + verbose LSan (`detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1`):
+    106/106 PASS, 0 ASan errors, 0 LSan leaks, 0 vendor-sim/HAL suppressions.
+    Canary leak and heap-use-after-free checks both triggered and failed cleanly.
+- **CI-3: Full `clang-tidy-18` sweep across all C++ test sources (`94cc8727`).**
+  - All 135 in-graph C++ test files and 38 test-support/testdata/bench `.cc`
+    files (173/173 TUs) passed `clang-tidy-18` with repo `.clang-tidy`
+    (`WarningsAsErrors: '*'`, `--checks=-bugprone-unchecked-optional-access`):
+    **0 latent warnings**.
+
 ## 2026-11-21
 
 Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commits `d942b0b8` and
