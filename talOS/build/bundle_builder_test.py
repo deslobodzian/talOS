@@ -848,6 +848,26 @@ class BundleBuilderTest(unittest.TestCase):
             with self.assertRaises(bb.ElfParseError):
                 bb.elf_needed_libraries(pbad)
 
+            # Corrupt ELF with zero-length PT_DYNAMIC must fail closed.
+            valid = bytearray(make_elf(["libc.so.6"], bits=64, endian="<"))
+            # Second program header (index 1, offset 64 + 56 = 120) is PT_DYNAMIC;
+            # p_filesz is at +32 within the 56-byte Elf64_Phdr.
+            pzero = os.path.join(tmp, "zero_dyn.elf")
+            z = bytearray(valid)
+            z[64 + 56 + 32 : 64 + 56 + 40] = (0).to_bytes(8, "little")
+            put_bytes(pzero, bytes(z))
+            with self.assertRaises(bb.ElfParseError):
+                bb.elf_needed_libraries(pzero)
+
+            # Truncated PT_DYNAMIC without DT_NULL terminator must fail closed.
+            pnoterm = os.path.join(tmp, "noterm_dyn.elf")
+            nt = bytearray(valid)
+            # Shrink PT_DYNAMIC p_filesz to 16 bytes (1 entry, before DT_NULL).
+            nt[64 + 56 + 32 : 64 + 56 + 40] = (16).to_bytes(8, "little")
+            put_bytes(pnoterm, bytes(nt))
+            with self.assertRaises(bb.ElfParseError):
+                bb.elf_needed_libraries(pnoterm)
+
     def test_run_script_through_a_link_passes_the_physical_bundle(self):
         # The boot service starts <prefix>/current/run.sh. Node binaries come
         # from --bundle, so a path through the link would restart nodes from
