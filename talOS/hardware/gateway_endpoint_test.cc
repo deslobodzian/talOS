@@ -201,6 +201,10 @@ class Companion {
   }
 
   uint64_t next_send_sequence() const { return next_send_sequence_; }
+  // The next frame's sequence, to send frames out of sequence order.
+  void set_next_send_sequence(uint64_t sequence) {
+    next_send_sequence_ = sequence;
+  }
 
  private:
   static ::testing::AssertionResult Failed(const char* step) {
@@ -907,6 +911,32 @@ TEST(Endpoint, AppliesOnlyTheNewestQueuedCommand) {
     return HasFailure();
   }));
   EXPECT_EQ(gateway.snapshot().counters.rejected_command_count, 0u);
+
+  // Arrival order is not sequence order: of a tick's commands the highest
+  // sequence is applied, not the last received. On loopback the higher one
+  // arrives first, so the first tick to apply anything applies it; a lower
+  // one drained with it must not replace it.
+  const uint64_t high = companion.next_send_sequence() + 1;
+  for (const uint64_t sequence : {high, high - 1}) {
+    companion.set_next_send_sequence(sequence);
+    command.motors[0].demand = static_cast<double>(sequence) / 100;
+    std::array<uint8_t, kMaxCommandSize> bytes{};
+    const auto size = Encode(command, bytes);
+    ASSERT_GT(size, 0u);
+    ASSERT_EQ(
+        companion.SendFrame(protocol::FrameType::kHardwareCommand,
+                            protocol::kFlagNone, 1000, bytes.data(), size),
+        protocol::UdpStatus::kOk);
+  }
+  const int applied = backend.applied;
+  ASSERT_TRUE(Eventually([&] {
+    EXPECT_EQ(endpoint.Tick(2000, true), protocol::UdpStatus::kOk);
+    return backend.applied != applied || HasFailure();
+  }));
+  EXPECT_EQ(gateway.snapshot().last_command_sequence, high);
+  ASSERT_FALSE(backend.last_requests.empty());
+  EXPECT_DOUBLE_EQ(backend.last_requests[0].demand,
+                   static_cast<double>(high) / 100);
 }
 
 // The RoboRIO's latency line ages each drained command's observation on the

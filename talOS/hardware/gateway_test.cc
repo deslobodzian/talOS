@@ -1001,6 +1001,7 @@ TEST(Gateway, RequiresEnableCommissioningAndMatchingManifest) {
 // keeps forwarding the merge. Counting those refusals would bury every real
 // rejection under a steady climb; a command that asks for output or carries
 // another identity still counts.
+// REQ-SAFE-17
 TEST(Gateway, NeutralRefusedWhileUnableToDriveIsNotARejection) {
   for (const bool commissioned : {true, false}) {
     SCOPED_TRACE(commissioned ? "disabled" : "enabled, uncommissioned");
@@ -1021,6 +1022,16 @@ TEST(Gateway, NeutralRefusedWhileUnableToDriveIsNotARejection) {
     EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
     EXPECT_FALSE(g.Accept(Request(g), 5, 1000));
     EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
+    // A neutral motor request carrying a demand or a feedforward is not the
+    // flush's neutral.
+    auto with_demand = neutral;
+    with_demand.motors[0].demand = 1;
+    EXPECT_FALSE(g.Accept(with_demand, 6, 1000));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 3u);
+    auto with_feedforward = neutral;
+    with_feedforward.motors[0].feedforward_v = 1;
+    EXPECT_FALSE(g.Accept(with_feedforward, 7, 1000));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 4u);
     EXPECT_EQ(backend.applied, 0);
   }
 }
@@ -1063,15 +1074,26 @@ Command AllMotorsNeutral(Command c) {
 // in ten, where operators expect it flat.
 // REQ-SAFE-17
 TEST(Gateway, NeutralInFlightAcrossAnEpochChangeIsNotARejection) {
+  // Every output is addressed and off: all-neutral covers digital and PWM.
+  auto config = SwerveConfig(true);
+  config.digital_outputs.push_back({40, "solenoid", 1});
+  config.pwm_outputs.push_back({41, "servo", 0});
+  const auto outputs_off = [](Command c) {
+    c.digital_output_count = 1;
+    c.digital_outputs[0] = {40, false};
+    c.pwm_output_count = 1;
+    c.pwm_outputs[0] = {41, PwmMode::kOff, 0.0};
+    return c;
+  };
   for (const bool enabling : {true, false}) {
     SCOPED_TRACE(enabling ? "enable edge" : "disable edge");
     FakeBackend backend;
-    Gateway g{SwerveConfig(true), backend, 1};
+    Gateway g{config, backend, 1};
     g.Tick(1000, !enabling);
     if (!enabling) {
-      ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+      ASSERT_TRUE(g.Accept(outputs_off(Request(g)), 1, 1000));
     }
-    const auto in_flight = AllMotorsNeutral(Request(g));
+    const auto in_flight = outputs_off(AllMotorsNeutral(Request(g)));
     g.Tick(2000, enabling);
     ASSERT_GT(g.snapshot().epoch, in_flight.epoch);
     const auto applied = backend.applied;
@@ -1162,6 +1184,7 @@ TEST(Gateway, PwmRequestsReachTheBackendAsSentAndABadOneRejectsTheCommand) {
       {"a pulse of 0", {41, PwmMode::kPulse, 0.0}, true},
       {"a pulse of -1", {41, PwmMode::kPulse, -1.0}, true},
       {"a pulse above 1", {41, PwmMode::kPulse, 1.5}, false},
+      {"a pulse below -1", {41, PwmMode::kPulse, -1.5}, false},
       {"a pulse not finite", {41, PwmMode::kPulse, std::nan("")}, false},
       {"mode 2", {41, static_cast<PwmMode>(2), 0.0}, false},
   };
@@ -1844,10 +1867,11 @@ TEST(Gateway, FeedbackAtTheTimeoutIsolatesItsMotor) {
   const auto steer = MotorIndex(config, Feedback::kRemoteCANcoder);
   const uint16_t drive_id = config.motors[drive].id;
   const uint16_t encoder_id = config.motors[steer].feedback_sensor_id;
-  for (int row = 0; row < 3; ++row) {
+  for (int row = 0; row < 4; ++row) {
     SCOPED_TRACE(row == 0   ? "motor position age"
                  : row == 1 ? "motor velocity age"
-                            : "remote CANcoder position age");
+                 : row == 2 ? "remote CANcoder position age"
+                            : "remote CANcoder velocity age");
     FakeBackend backend;
     Gateway g{config, backend, 1};
     g.Tick(1000, true);
@@ -1855,7 +1879,8 @@ TEST(Gateway, FeedbackAtTheTimeoutIsolatesItsMotor) {
     if (row == 0) backend.position_ages[drive_id] = bound;
     if (row == 1) backend.velocity_ages[drive_id] = bound;
     if (row == 2) backend.position_ages[encoder_id] = bound;
-    const std::size_t isolated = row == 2 ? steer : drive;
+    if (row == 3) backend.velocity_ages[encoder_id] = bound;
+    const std::size_t isolated = row >= 2 ? steer : drive;
     g.Tick(6000, true);
     ASSERT_TRUE(g.Accept(Request(g), 1, 6000));
     for (std::size_t i = 0; i < config.motors.size(); ++i) {
@@ -2096,6 +2121,12 @@ TEST(Gateway, NeutralRefusedDuringTotalLossIsNotARejection) {
   EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
   EXPECT_FALSE(g.Accept(Request(g), 4, 6000));
   EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  // The exemption is for the bridge's own neutral: one that fails an
+  // identity check still counts.
+  auto misidentified = neutral;
+  ++misidentified.config_id;
+  EXPECT_FALSE(g.Accept(misidentified, 5, 6000));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
   EXPECT_EQ(backend.applied, 0);
 }
 
@@ -2265,12 +2296,24 @@ TEST(Gateway, EverySampleMaskedIsTotalLoss) {
   }
 }
 
+// A structure error in any motor, digital output or PWM output refuses the
+// whole command before anything applies, and each refusal is counted.
+// REQ-SAFE-17
 TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
+  auto config = SwerveConfig(true);
+  config.digital_outputs.push_back({40, "solenoid", 1});
+  config.pwm_outputs.push_back({41, "servo", 0});
   FakeBackend backend;
-  Gateway g{SwerveConfig(true), backend, 1};
+  Gateway g{config, backend, 1};
   g.Tick(1000, true);
-  for (int invalid = 0; invalid < 6; ++invalid) {
+  constexpr uint64_t kCases = 10;
+  for (uint64_t invalid = 0; invalid < kCases; ++invalid) {
+    SCOPED_TRACE(invalid);
     auto c = Request(g);
+    c.digital_output_count = 1;
+    c.digital_outputs[0] = {40, false};
+    c.pwm_output_count = 1;
+    c.pwm_outputs[0] = {41, PwmMode::kOff, 0.0};
     auto& m = c.motors[c.count - 1];
     if (invalid == 0) m.id = 65535;
     if (invalid == 1) m.id = c.motors[0].id;
@@ -2278,9 +2321,16 @@ TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
     if (invalid == 3) m.slot = 255;
     if (invalid == 4) m.mode = static_cast<Mode>(255);
     if (invalid == 5) --c.count;
+    if (invalid == 6) c.digital_output_count = 0;
+    if (invalid == 7) c.digital_outputs[0].id = 42;
+    if (invalid == 8) c.pwm_output_count = 0;
+    if (invalid == 9) c.pwm_outputs[0].id = 42;
     EXPECT_FALSE(g.Accept(c, 1, 1000));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, invalid + 1);
   }
   EXPECT_EQ(backend.applied, 0);
+  EXPECT_TRUE(backend.last_digital_outputs.empty());
+  EXPECT_TRUE(backend.last_pwm_outputs.empty());
 }
 // REQ-SAFE-21: outputs are neutralized before devices are reconfigured
 TEST(Gateway, NeutralizesOutputsBeforeReconfiguringDevices) {
@@ -2306,6 +2356,15 @@ TEST(Gateway, NeutralizesOutputsBeforeReconfiguringDevices) {
   EXPECT_EQ(backend.events[0], "neutral");
   EXPECT_EQ(backend.events[1], "configure");
   EXPECT_EQ(backend.events[2], "neutral");
+  // The Endpoint's asynchronous path neutralizes before the backend begins.
+  FakeBackend async;
+  Gateway pending{SwerveConfig(true), async, 2};
+  pending.Tick(1000, false);
+  async.events.clear();
+  ASSERT_TRUE(pending.BeginReconfigure(cfg));
+  ASSERT_GE(async.events.size(), 2u);
+  EXPECT_EQ(async.events[0], "neutral");
+  EXPECT_EQ(async.events[1], "begin_configure");
 }
 // REQ-SAFE-21: an identical push succeeds with no device traffic
 TEST(Gateway, RepeatedConfigurationPushIsIdempotent) {
@@ -2330,6 +2389,28 @@ TEST(Gateway, RepeatedConfigurationPushIsIdempotent) {
   EXPECT_TRUE(g.Reconfigure(changed));
   EXPECT_EQ(backend.configure_calls, configures + 1);
   EXPECT_NE(g.snapshot().epoch, epoch);
+}
+// While a device restore runs, its worker owns the devices: every push is
+// refused, an identical one while enabled included, until PollRestore ends it.
+// REQ-SAFE-21
+TEST(Gateway, IdenticalEnabledPushIsRefusedWhileARestoreRuns) {
+  const auto config = SwerveConfig(true);
+  FakeBackend backend;
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  backend.resets = {config.motors[0].id};
+  backend.pending_ticks = 1;
+  g.Tick(2000, true);  // Finds the reset and begins its restore.
+  ASSERT_EQ(backend.restoring_ids, std::vector<uint16_t>{config.motors[0].id});
+  const int configures = backend.configure_calls;
+  EXPECT_FALSE(g.Reconfigure(config));
+  EXPECT_FALSE(g.BeginReconfigure(config));
+  EXPECT_EQ(backend.configure_calls, configures);
+  g.Tick(3000, true);  // Still restoring.
+  EXPECT_FALSE(g.Reconfigure(config));
+  g.Tick(4000, true);  // The restore ends.
+  EXPECT_TRUE(g.Reconfigure(config));
+  EXPECT_EQ(backend.configure_calls, configures);
 }
 // REQ-SAFE-21: a config change applies only while disabled
 TEST(Gateway, ReconfigurationRequiresDisabledOperation) {
