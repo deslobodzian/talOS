@@ -41,15 +41,27 @@ TEST(SocketRetry, OpensWithinOneRetryPeriodOfTheRouteAppearing) {
   SocketRetry retry;
   uint64_t opened_us = 0;
   uint32_t attempts = 0;
+  uint32_t failed_events = 0;
+  uint32_t none_events = 0;
   for (uint64_t now = kStartUs; now < kStartUs + 10'000'000;
        now += kLoopPeriodUs) {
+    bool attempted = false;
     const auto event = retry.Poll(now, [&] {
+      attempted = true;
       ++attempts;
       return now >= kRouteUpUs;
     });
     if (event == SocketRetry::Event::kOpened) {
+      EXPECT_TRUE(attempted);
       opened_us = now;
       break;
+    }
+    if (attempted) {
+      EXPECT_EQ(event, SocketRetry::Event::kFailed) << now;
+      ++failed_events;
+    } else {
+      EXPECT_EQ(event, SocketRetry::Event::kNone) << now;
+      ++none_events;
     }
   }
   ASSERT_NE(opened_us, 0u) << "never opened";
@@ -57,20 +69,27 @@ TEST(SocketRetry, OpensWithinOneRetryPeriodOfTheRouteAppearing) {
       << "opened " << opened_us - kRouteUpUs
       << " us after the route appeared; bound: one retry period (100 ms) "
          "plus one loop period (5 ms)";
+  EXPECT_EQ(failed_events, attempts - 1);
+  EXPECT_GT(none_events, 0u);
   EXPECT_EQ(retry.failures(), attempts - 1);
   EXPECT_EQ(retry.first_failure_us(), kStartUs);
 }
 
 // A network that never comes up: one attempt per retry period, not one per
 // loop tick, and none once the socket is open.
+// REQ-OPS-28
 TEST(SocketRetry, AttemptsAtMostOncePerPeriod) {
   SocketRetry retry;
   bool up = false;
   uint32_t attempts = 0;
+  uint32_t failed_events = 0;
+  uint32_t none_events = 0;
   uint64_t last_attempt_us = 0;
   for (uint64_t now = kStartUs; now < kStartUs + 10'000'000;
        now += kLoopPeriodUs) {
-    retry.Poll(now, [&] {
+    bool attempted = false;
+    const auto event = retry.Poll(now, [&] {
+      attempted = true;
       if (attempts > 0) {
         EXPECT_GE(now - last_attempt_us, SocketRetry::kPeriodUs)
             << "attempt " << attempts << " at " << now;
@@ -79,8 +98,17 @@ TEST(SocketRetry, AttemptsAtMostOncePerPeriod) {
       last_attempt_us = now;
       return up;
     });
+    if (attempted) {
+      EXPECT_EQ(event, SocketRetry::Event::kFailed) << now;
+      ++failed_events;
+    } else {
+      EXPECT_EQ(event, SocketRetry::Event::kNone) << now;
+      ++none_events;
+    }
   }
   EXPECT_EQ(attempts, 10'000'000 / SocketRetry::kPeriodUs);
+  EXPECT_EQ(failed_events, attempts);
+  EXPECT_GT(none_events, 0u);
 
   up = true;
   const uint64_t later = kStartUs + 10'000'000 + SocketRetry::kPeriodUs;

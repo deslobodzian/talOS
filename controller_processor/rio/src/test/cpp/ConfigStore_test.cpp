@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <new>
 #include <span>
@@ -309,6 +310,10 @@ class GatedStore {
     std::lock_guard lock{mutex_};
     fail_next_ = true;
   }
+  std::vector<uint64_t> started() {
+    std::lock_guard lock{mutex_};
+    return started_;
+  }
   std::vector<uint64_t> finished() {
     std::lock_guard lock{mutex_};
     return finished_;
@@ -419,6 +424,98 @@ TEST(ConfigPersister, StopSavesAConfigurationNeverHandedOver) {
   EXPECT_EQ(persister.Tick(false), 0u);
   persister.Stop();
   EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a)}));
+}
+
+// A configuration acknowledged while enabled is not handed over to the saver
+// until a disabled tick arrives.
+// REQ-CONTRACT-06
+TEST(ConfigPersister, EnabledTickDefersHandoverUntilDisabledTick) {
+  const hw::Config a = ConfigWithMotor(1);
+  GatedStore store;
+  talos::rio::ConfigPersister persister{
+      [&](std::span<const uint8_t> persisted) { return store.Save(persisted); },
+      0};
+  persister.Start();
+  persister.Acknowledged(a);
+  for (int tick = 0; tick < 20; ++tick) {
+    EXPECT_EQ(persister.Tick(false), 0u) << "tick " << tick;
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(store.started().empty())
+      << "Tick(false) handed over an acknowledged config while enabled";
+
+  ASSERT_TRUE(store.TickUntilStarted(persister, 1))
+      << "subsequent Tick(true) never handed over the config";
+  EXPECT_EQ(store.started(), (std::vector<uint64_t>{hw::ConfigurationId(a)}));
+  store.Release();
+  persister.Stop();
+  EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a)}));
+}
+
+// A failed atomic save leaves the previous configuration file intact, and
+// BeginRestore on a missing or corrupt file leaves the gateway unconfigured.
+// REQ-CONTRACT-06
+TEST(ConfigStore,
+     FailedSavePreservesPreviousFileAndInvalidRestoreLeavesUnconfigured) {
+  const hw::Config config_a = ConfigWithMotor(1);
+  const hw::Config config_b = ConfigWithMotor(2);
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto path = (dir / "talos_config_store_atomic_test.bin").string();
+  const auto tmp_dir = std::filesystem::path{path + ".tmp"};
+  std::filesystem::remove(path);
+  std::filesystem::remove_all(tmp_dir);
+
+  ASSERT_TRUE(talos::rio::ConfigFile{path}.Save(hw::PersistedConfig(config_a)));
+  ASSERT_EQ(talos::rio::LoadConfigFile(path), config_a);
+
+  // A non-empty directory at path + ".tmp" forces ConfigFile::Save to fail.
+  ASSERT_TRUE(std::filesystem::create_directory(tmp_dir));
+  {
+    std::ofstream blocker{tmp_dir / "keep", std::ios::binary};
+    blocker << "x";
+  }
+  EXPECT_FALSE(
+      talos::rio::ConfigFile{path}.Save(hw::PersistedConfig(config_b)));
+  EXPECT_EQ(talos::rio::LoadConfigFile(path), config_a)
+      << "a failed save damaged the previously persisted config";
+  std::filesystem::remove_all(tmp_dir);
+  std::filesystem::remove(path);
+
+  // Missing file: BeginRestore yields nullopt and leaves gateway unconfigured.
+  const auto missing = (dir / "talos_config_store_missing_test.bin").string();
+  std::filesystem::remove(missing);
+  {
+    PendingBackend backend;
+    backend.done = true;
+    hw::Gateway gateway{backend, 7};
+    EXPECT_EQ(talos::rio::BeginRestore(gateway, missing), std::nullopt);
+    EXPECT_EQ(backend.begun, 0);
+    gateway.Tick(1000, true);
+    EXPECT_FALSE(gateway.configured());
+  }
+
+  // Corrupt file (bad CRC): BeginRestore yields nullopt and leaves gateway
+  // unconfigured.
+  const auto corrupt = (dir / "talos_config_store_corrupt_test.bin").string();
+  auto bytes = hw::PersistedConfig(config_a);
+  ASSERT_FALSE(bytes.empty());
+  bytes.back() ^= 0xFFu;
+  {
+    std::ofstream out{corrupt, std::ios::binary | std::ios::trunc};
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(static_cast<bool>(out));
+  }
+  {
+    PendingBackend backend;
+    backend.done = true;
+    hw::Gateway gateway{backend, 7};
+    EXPECT_EQ(talos::rio::BeginRestore(gateway, corrupt), std::nullopt);
+    EXPECT_EQ(backend.begun, 0);
+    gateway.Tick(1000, true);
+    EXPECT_FALSE(gateway.configured());
+  }
+  std::filesystem::remove(corrupt);
 }
 
 // A save Stop() runs while the previous one is still uncollected is left
