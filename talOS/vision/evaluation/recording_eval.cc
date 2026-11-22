@@ -174,6 +174,9 @@ Options Parse(int argc, char** argv) {
       o.opencv_distortion = Numbers(value(), 4, 14, "--opencv-distortion");
     } else if (flag == "--hfov-deg") {
       o.hfov_deg = Numbers(value(), 1, 1, "--hfov-deg")[0];
+      if (!(*o.hfov_deg > 0.0 && *o.hfov_deg < 180.0)) {
+        Die("--hfov-deg must be in (0, 180)");
+      }
     } else if (flag == "--equidistant") {
       const auto v = Numbers(value(), 4, 4, "--equidistant");
       o.equidistant = {v[0], v[1], v[2], v[3]};
@@ -308,7 +311,11 @@ class MocapTrack {
     if (it == times_.begin() || it == times_.end()) return std::nullopt;
     const auto i = static_cast<std::size_t>(it - times_.begin());
     const auto t0 = times_[i - 1], t1 = times_[i];
-    if (t1 - t0 > 20'000'000) return std::nullopt;
+    if (t1 <= t0 || t < t0 || t > t1 ||
+        static_cast<std::uint64_t>(t1) - static_cast<std::uint64_t>(t0) >
+            20'000'000u) {
+      return std::nullopt;
+    }
     const double a = static_cast<double>(t - t0) / static_cast<double>(t1 - t0);
     const Eigen::Vector3d p = (1 - a) * positions_[i - 1] + a * positions_[i];
     const Eigen::Quaterniond q =
@@ -436,8 +443,15 @@ int Run(const Options& o) {
   if (o.intrinsics) {
     k = *o.intrinsics;
   } else if (o.hfov_deg) {
+    if (!(*o.hfov_deg > 0.0 && *o.hfov_deg < 180.0)) {
+      Die("--hfov-deg must be in (0, 180)");
+    }
     assumed_intrinsics = true;
-    k.fx = k.fy = width / 2.0 / std::tan(*o.hfov_deg / 2 / kDeg);
+    const double focal = width / 2.0 / std::tan(*o.hfov_deg / 2 / kDeg);
+    if (!std::isfinite(focal) || focal <= 0.0) {
+      Die("--hfov-deg yields non-finite focal length");
+    }
+    k.fx = k.fy = focal;
     k.cx = width / 2.0;
     k.cy = height / 2.0;
   } else {

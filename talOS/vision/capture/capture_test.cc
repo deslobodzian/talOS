@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cfenv>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -236,6 +238,41 @@ TEST(Capture, LinuxControlsReachTheDeviceOrNameTheOneRefused) {
     failure.setup(device);
     const auto error = ApplyV4L2Controls(failure.controls, device);
     EXPECT_EQ(error.rfind(failure.control, 0), 0u) << error;
+  }
+}
+
+TEST(Capture, LinuxControlsRejectNonFiniteAndHugeFiniteValues) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const struct {
+    const char* name;
+    CameraControls controls;
+    const char* control;
+  } cases[] = {
+      {"NaN exposure_ms",
+       {.exposure_ms = nan, .gain = 0},
+       "exposure_time_absolute"},
+      {"-inf exposure_ms",
+       {.exposure_ms = -inf, .gain = 0},
+       "exposure_time_absolute"},
+      {"+inf exposure_ms",
+       {.exposure_ms = inf, .gain = 0},
+       "exposure_time_absolute"},
+      {"huge finite exposure_ms",
+       {.exposure_ms = 1e30, .gain = 0},
+       "exposure_time_absolute"},
+      {"NaN gain", {.exposure_ms = 0, .gain = nan}, "gain"},
+      {"-inf gain", {.exposure_ms = 0, .gain = -inf}, "gain"},
+      {"+inf gain", {.exposure_ms = 0, .gain = inf}, "gain"},
+      {"huge finite gain", {.exposure_ms = 0, .gain = 1e30}, "gain"},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.name);
+    FakeControls device;
+    std::feclearexcept(FE_ALL_EXCEPT);
+    const auto error = ApplyV4L2Controls(c.controls, device);
+    EXPECT_EQ(std::fetestexcept(FE_INVALID), 0);
+    EXPECT_EQ(error.rfind(c.control, 0), 0u) << error;
   }
 }
 #endif

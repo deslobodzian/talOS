@@ -224,6 +224,9 @@ std::vector<Detection> CpuAprilTagBackend::Detect(
   if (gray_data == nullptr || width <= 0 || height <= 0) {
     return {};
   }
+  if (stride > 0 && stride < width) {
+    return {};
+  }
   const int actual_stride = (stride > 0) ? stride : width;
 
   image_u8_t* im = nullptr;

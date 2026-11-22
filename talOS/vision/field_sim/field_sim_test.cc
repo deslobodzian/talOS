@@ -94,8 +94,9 @@ TEST(JsonParser, ParsesNestedValuesAndEscapes) {
 TEST(JsonParser, RejectsMalformed) {
   const std::string deep(200, '[');
   const char* bad_cases[] = {
-      "{",        "[1,]",          R"({"a": })", R"("unterminated)",
-      "{'a': 1}", R"({"a": tru})", deep.c_str()};
+      "{",        "[1,]",           R"({"a": })", R"("unterminated)",
+      "{'a': 1}", R"({"a": tru})",  deep.c_str(), "1e999",
+      "-1e999",   R"({"a": 1e309})"};
   for (const char* bad : bad_cases) {
     JsonValue v;
     std::string err;
@@ -153,6 +154,26 @@ TEST(FieldLayoutLoader, RejectsBadDocuments) {
     std::string err;
     EXPECT_FALSE(LoadFieldLayoutFromJson(text, kTagSize, &data, &err)) << text;
   }
+}
+
+TEST(FieldLayoutLoader, NormalizesLargeFiniteQuaternionWithoutOverflow) {
+  const char* large_quat_json = R"({
+    "tags": [
+      {"ID": 7, "pose": {"translation": {"x": 2.0, "y": 0.0, "z": 0.0},
+       "rotation": {"quaternion": {"W": 1e200, "X": 0.0, "Y": -1e200, "Z": 0.0}}}}
+    ],
+    "field": {"length": 16.5, "width": 8.0}
+  })";
+  FieldLayoutData data;
+  std::string err;
+  ASSERT_TRUE(LoadFieldLayoutFromJson(large_quat_json, kTagSize, &data, &err))
+      << err;
+  const auto pose = data.layout.GetTagPose(7);
+  ASSERT_TRUE(pose.has_value());
+  const Eigen::Matrix3d rot = pose->rotation().rotationMatrix();
+  EXPECT_TRUE(rot.allFinite());
+  EXPECT_NEAR(rot.determinant(), 1.0, 1e-9);
+  EXPECT_NEAR(rot.col(2).x(), -1.0, 1e-6);
 }
 
 TEST(FieldLayoutLoader, ParsesOfficial2026Layout) {

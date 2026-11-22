@@ -360,5 +360,76 @@ TEST_F(RecorderTest, DestructorIsBoundedWithAFullQueueAndSlowWriter) {
       << " ms";
 }
 
+TEST_F(RecorderTest, BackwardTimestampDoesNotUnderflowRateLimit) {
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.context = MakeContext();
+  opts.sample_hz = 1.0;  // 1 s interval
+  opts.rejected_hz = 1.0;
+  opts.queue_slots = 8;
+  FrameRecorder rec{std::move(opts)};
+
+  const Frame frame = MakeGrayFrame();
+  EXPECT_TRUE(rec.Record(frame, MakeRecord(1'000'000'000, "sampled")));
+  // Out-of-order timestamp before the last accepted frame must not underflow
+  // uint64_t subtraction and bypass the rate limit.
+  EXPECT_FALSE(rec.Record(frame, MakeRecord(500'000'000, "sampled")));
+  EXPECT_TRUE(rec.Record(frame, MakeRecord(2'000'000'000, "sampled")));
+  EXPECT_EQ(rec.recorded(), 2u);
+  EXPECT_EQ(rec.dropped(), 0u);
+}
+
+TEST_F(RecorderTest, RejectsFramesFailingHoldsImageCheck) {
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.context = MakeContext();
+  opts.sample_hz = 1e12;
+  opts.queue_slots = 8;
+  FrameRecorder rec{std::move(opts)};
+
+  // 4x2 RGB8 needs stride >= 12; stride == 4 fails holds_image().
+  const Frame bad_stride_rgb{0,
+                             0,
+                             0,
+                             MonotonicTime::from_nanos(0),
+                             4,
+                             2,
+                             4,
+                             PixelFormat::kRgb8,
+                             std::vector<std::uint8_t>(24, 100)};
+  ASSERT_FALSE(bad_stride_rgb.holds_image());
+
+  // 4x2 Gray8 with stride == 4 needs 8 bytes; 4 bytes fails holds_image().
+  const Frame short_gray{0,
+                         0,
+                         0,
+                         MonotonicTime::from_nanos(0),
+                         4,
+                         2,
+                         4,
+                         PixelFormat::kGray8,
+                         std::vector<std::uint8_t>(4, 100)};
+  ASSERT_FALSE(short_gray.holds_image());
+
+  EXPECT_FALSE(rec.Record(bad_stride_rgb, MakeRecord(0, "sampled")));
+  EXPECT_FALSE(rec.Record(short_gray, MakeRecord(1, "sampled")));
+  EXPECT_EQ(rec.recorded(), 0u);
+  EXPECT_EQ(rec.dropped(), 2u);
+
+  // Valid RGB8 frame with proper stride still succeeds.
+  const Frame valid_rgb{0,
+                        0,
+                        0,
+                        MonotonicTime::from_nanos(0),
+                        4,
+                        2,
+                        12,
+                        PixelFormat::kRgb8,
+                        std::vector<std::uint8_t>(24, 100)};
+  ASSERT_TRUE(valid_rgb.holds_image());
+  EXPECT_TRUE(rec.Record(valid_rgb, MakeRecord(2, "sampled")));
+  EXPECT_EQ(rec.recorded(), 1u);
+}
+
 }  // namespace
 }  // namespace talos::vision::recording

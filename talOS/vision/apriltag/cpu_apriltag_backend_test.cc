@@ -1,6 +1,8 @@
 #include "talOS/vision/apriltag/cpu_apriltag_backend.h"
 
 #include <gtest/gtest.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -479,6 +481,31 @@ TEST(CpuAprilTagBackendTest, DetectorPoolThreadsRunAtBackgroundPriority) {
 
   EXPECT_EQ(probe.arrived, 3);
   EXPECT_EQ(probe.background, 3);
+}
+
+TEST(CpuAprilTagBackendTest, RejectsPositiveStrideSmallerThanWidth) {
+  const long raw_page = ::sysconf(_SC_PAGESIZE);
+  ASSERT_GT(raw_page, 0);
+  const size_t page_size = static_cast<size_t>(raw_page);
+  void* mapping = ::mmap(nullptr, 2 * page_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+  ASSERT_NE(mapping, MAP_FAILED);
+  auto* base = static_cast<uint8_t*>(mapping);
+  ASSERT_EQ(::mprotect(base + page_size, page_size, PROT_NONE), 0);
+
+  constexpr int kWidth = 64;
+  constexpr int kHeight = 4;
+  constexpr int kStride = 32;
+  const size_t valid_bytes = static_cast<size_t>(kStride) * kHeight;
+  uint8_t* ptr = base + page_size - valid_bytes;
+  std::memset(ptr, 128, valid_bytes);
+
+  CpuAprilTagBackend backend;
+  const std::vector<Detection> detections =
+      backend.Detect(ptr, kWidth, kHeight, kStride);
+  EXPECT_TRUE(detections.empty());
+
+  ::munmap(mapping, 2 * page_size);
 }
 
 }  // namespace talos::vision::apriltag

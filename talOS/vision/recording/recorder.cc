@@ -29,9 +29,13 @@ constexpr std::uint64_t kNsPerSecond = 1'000'000'000;
 void ToGray(const Frame& frame, std::uint8_t* dst) {
   const std::uint32_t w = frame.width();
   const std::uint32_t h = frame.height();
-  const std::uint32_t stride = frame.stride() == 0 ? w : frame.stride();
+  const std::size_t min_stride =
+      static_cast<std::size_t>(w) * frame.bytes_per_pixel();
+  const std::size_t stride = frame.stride() == 0
+                                 ? min_stride
+                                 : static_cast<std::size_t>(frame.stride());
   const std::uint8_t* src = frame.data();
-  if (src == nullptr) {
+  if (src == nullptr || stride < min_stride) {
     return;
   }
 
@@ -256,7 +260,8 @@ struct FrameRecorder::Impl {
         std::llround(static_cast<double>(kNsPerSecond) / rate));
     bool& seen = rejected ? rejected_seen : sampled_seen;
     std::uint64_t& last = rejected ? last_rejected_ns : last_sampled_ns;
-    if (seen && record.capture_ns - last < *interval_ns) {
+    if (seen &&
+        (record.capture_ns < last || record.capture_ns - last < *interval_ns)) {
       return true;
     }
     last = record.capture_ns;
@@ -390,7 +395,7 @@ FrameRecorder::~FrameRecorder() {
 bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
   {
     std::lock_guard lock(impl_->mutex);
-    if (impl_->stop || frame.data() == nullptr ||
+    if (impl_->stop || !frame.holds_image() || frame.data() == nullptr ||
         frame.width() !=
             static_cast<std::uint32_t>(impl_->options.context.width) ||
         frame.height() !=
