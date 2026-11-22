@@ -133,7 +133,12 @@ def load_config(config):
 
 
 def device_layout(config):
-    """Mirror the config's documented sorted logical-ID and motor-bit order."""
+    """Mirror the config's documented sorted logical-ID and motor-bit order.
+
+    Supports single-level `include` and `[[subsystems]]` path overrides via
+    `load_config()` (sufficient for `robot_soak.toml`; does not resolve
+    subsystem `defaults` chains or inline `[subsystems.<name>]` tables).
+    """
     _, subsystem_files = load_config(config)
     devices = []
     for sub_name, sub_path in subsystem_files.items():
