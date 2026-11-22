@@ -280,10 +280,12 @@ topic holds it), whether the key is required or optional:
 field's pose fields, and `widgets[<i>].kind` for a `match` or `power`
 widget's fixed channels. It then runs `CheckDashboardBudget` for the whole
 feed, every dictionary channel `DriveFeedChannels` carries: the named
-channels, the hardware bridge's `hw/status/alert_error_link_lost` (whatever
-the widgets, so the page can name a lost RoboRIO link; a graph without the
-bridge has no such channel and adds nothing) and, with an `alerts` widget,
-every alert channel of the dictionary, each counted once. The launcher's first `--describe` probe has no graph, so
+channels, the hardware bridge's `hw/status/alert_error_link_lost` and
+`hw/status/alert_error_protocol_mismatch` (whatever
+the widgets, so the page can name a protocol mismatch or a lost RoboRIO link;
+a graph without the bridge has no such channels and adds nothing) and, with an
+`alerts` widget, every alert channel of the dictionary, each counted once. The
+launcher's first `--describe` probe has no graph, so
 it checks only what the file alone decides.
 
 **Worst case.** One drive client can be sent, in a second,
@@ -305,7 +307,8 @@ At 20 Hz a 24,000 B/s budget covers 39 channels.
 
 **`/drive/layout.json`.** One object; every key present, defaults filled
 in, an unset optional number `null`, `"channels"` the sorted distinct
-channels the layout names plus `hw/status/alert_error_link_lost` (the named
+channels the layout names plus `hw/status/alert_error_link_lost` and
+`hw/status/alert_error_protocol_mismatch` (the named
 part of the drive feed's channel mask; a name the dictionary lacks is never
 sent), `"alerts"` whether the feed also carries every alert channel, `"file"`
 the layout's file
@@ -322,7 +325,8 @@ roles are the field names above, for `field` `x`, `y`, `yaw`, `valid`,
 {"version":1,"file":"dashboard.toml","title":"Drive","columns":12,"rows":8,
  "update_hz":20,"budget_bytes_per_s":24000,"drive_clients":2,"alerts":false,
  "channels":["autonomous/state/phase","autonomous/state/routine_index",
-             "hw/status/alert_error_link_lost"],
+             "hw/status/alert_error_link_lost",
+             "hw/status/alert_error_protocol_mismatch"],
  "widgets":[{"kind":"routine","at":[0,0,4,2],"title":"",
    "channels":{"channel":"autonomous/state/routine_index",
                "phase":"autonomous/state/phase"}}]}

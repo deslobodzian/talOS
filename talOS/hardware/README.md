@@ -489,10 +489,14 @@ after a new-epoch acceptance still increments `identity_rejected_count`. Each co
 order.
 The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
 latest accepted health sample, motor fault mask, gateway counters and gateway
-build (`gateway_program`, `gateway_build_id`, `gateway_build_dirty`) and the
+build (`gateway_program`, `gateway_build_id`, `gateway_build_dirty`), the
 bridge's own `kProtocolVersion` (`protocol_version_id`, which the log tools
 read a session under:
 [which logs a build can read](../launcher/README.md#which-logs-a-build-can-read)),
+and while a peer is sending frames of another protocol version (within
+`command_timeout_us`, clearing immediately on any valid frame)
+`alert_error_protocol_mismatch` and `mismatched_protocol_version_id` (the
+observed peer version, 0 otherwise),
 and the bridge prints the build once for each new gateway boot
 (`hardware_node: gateway boot <id>: roborio build <revision>`). A State
 that does not decode is dropped, with one stderr line until a State decodes

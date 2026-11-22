@@ -33,9 +33,11 @@
 //     message, heartbeat included, for SILENCE_MS: the bridge sends one at
 //     least every 100 ms), then telemetry (messages arrive but no new tick),
 //     then the hardware bridge (`hw/status` absent: hardware_node publishes
-//     nothing) and the RoboRIO link (`hw/status/alert_error_link_lost`).
-//     Those two only when the feed carries that channel, which the bridge's
-//     mask does when /drive/layout.json lists it in `channels` or has
+//     nothing), protocol mismatch (`hw/status/alert_error_protocol_mismatch`,
+//     checked before link lost so a partial deploy is named instead of a
+//     generic lost link) and the RoboRIO link (`hw/status/alert_error_link_lost`).
+//     Those only when the feed carries those channels, which the bridge's
+//     mask does when /drive/layout.json lists them in `channels` or has
 //     `alerts` true (an `alerts` widget); otherwise the OK line states that
 //     the RoboRIO link is not judged (and names "no hardware bridge" when the
 //     dictionary lacks `/hw/status`). Right after
@@ -84,6 +86,7 @@ export const DECODE_RETRY_MS = 5000;
 export const DECODE_STREAK_MS = 10_000;
 export const REPLACED_CODE = 4000;
 export const LINK_LOST_CHANNEL = 'hw/status/alert_error_link_lost';
+export const PROTOCOL_MISMATCH_CHANNEL = 'hw/status/alert_error_protocol_mismatch';
 export const STATE_AGE_CHANNEL = 'hw/status/state_age_us';
 // The longest history a graph or a field trail can ask for (README: 30 s),
 // and a cap on points per channel whatever the update rate.
@@ -124,7 +127,7 @@ export type DriveSummary = {
 
 export type Connection = 'connecting'|'open'|'waiting'|'replaced';
 export type Link =
-    'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'roborio'|'replaced'|'refused';
+    'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'protocol'|'roborio'|'replaced'|'refused';
 // `undecodable`: the line names a feed the page could not decode.
 export type LinkStatus = {link: Link; text: string; undecodable?: true};
 
@@ -356,6 +359,15 @@ export class DriveModel {
       return {link: 'telemetry',
               text: 'Telemetry stale: no new tick for ' + seconds(now - this.lastTickAt)};
     const s = this.latest;
+    if (s && this.carries(s, PROTOCOL_MISMATCH_CHANNEL)) {
+      const mismatch = s.channels[PROTOCOL_MISMATCH_CHANNEL];
+      if (mismatch !== undefined && mismatch !== 0) {
+        return {
+          link: 'protocol',
+          text: 'RoboRIO and main processor protocol versions differ; redeploy both'
+        };
+      }
+    }
     if (s && this.carries(s, LINK_LOST_CHANNEL)) {
       const lost = s.channels[LINK_LOST_CHANNEL];
       // No sample of /hw/status: the process that failed is the hardware

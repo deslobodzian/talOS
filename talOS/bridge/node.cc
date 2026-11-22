@@ -586,6 +586,8 @@ void HardwareNode::Tick(uint64_t now_us) {
     if (status == protocol::UdpStatus::kDecodeError &&
         peer_.stats().last_decode_status ==
             protocol::DecodeStatus::kUnsupportedVersion) {
+      last_version_mismatch_us_ = now_us;
+      mismatched_protocol_version_ = peer_.stats().last_unsupported_version;
       // Once per mismatch: a stale RoboRIO program floods every tick.
       if (!version_mismatch_logged_) {
         std::fprintf(
@@ -600,6 +602,8 @@ void HardwareNode::Tick(uint64_t now_us) {
     }
     if (status != protocol::UdpStatus::kOk) continue;
     version_mismatch_logged_ = false;
+    last_version_mismatch_us_ = 0;
+    mismatched_protocol_version_ = 0;
 
     HandleGatewayFrame(frame, now_us);
   }
@@ -1014,6 +1018,11 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       std::string_view{last_config_refusal_reason_.data(),
                        last_config_refusal_reason_len_} ==
           kConfigRefusedEnabledReason;
+  const bool protocol_mismatch =
+      last_version_mismatch_us_ > 0 && now_us >= last_version_mismatch_us_ &&
+      now_us - last_version_mismatch_us_ <= config_.command_timeout_us;
+  const uint16_t mismatched_protocol_version =
+      protocol_mismatch ? mismatched_protocol_version_ : uint16_t{0};
   const HealthSample& health = latest_state_.health;
   const protocol::UdpStats& udp = peer_.stats();
   bridge::BridgeStatus status{
@@ -1048,6 +1057,7 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       health.brownout,
       /*alert_warning_can_bus_unread=*/false,  // can_buses_.Fill
       /*can_bus_count=*/0,
+      /*alert_error_protocol_mismatch=*/protocol_mismatch,
       motor_fault_mask,
       forward_limit_mask,
       reverse_limit_mask,
@@ -1058,6 +1068,7 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       static_cast<bridge::GatewayProgram>(latest_state_.build.program),
       latest_state_.build.dirty,
       protocol::kProtocolVersion,
+      mismatched_protocol_version,
       latest_state_.build.revision,
       clock_.uncertainty_us(),
       clock_.round_trip_us(),

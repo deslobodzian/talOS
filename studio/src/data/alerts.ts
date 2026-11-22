@@ -91,6 +91,8 @@ export function alertLevelName(level: AlertLevel): string {
 // Human-readable descriptions for known status alerts whose field name alone
 // does not explain what failed or what the drive team should do.
 const ALERT_TEXT: Readonly<Record<string, string>> = {
+  'hw/status/alert_error_protocol_mismatch':
+      'Protocol mismatch — RoboRIO and main processor builds differ; redeploy both',
   'hw/status/alert_error_hardware_fault':
       'hardware fault (total feedback loss or gateway fault)',
   'hw/status/alert_error_config_refused_enabled':

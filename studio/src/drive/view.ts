@@ -363,7 +363,8 @@ export function renderWidget(w: Widget, model: DriveModel, now: number): string 
 
 const LINK_WORD: Record<Link, string> = {
   ok: 'OK', connecting: 'CONNECTING', bridge: 'BRIDGE LINK',
-  telemetry: 'TELEMETRY', hardware: 'HARDWARE BRIDGE', roborio: 'ROBORIO LINK',
+  telemetry: 'TELEMETRY', hardware: 'HARDWARE BRIDGE',
+  protocol: 'PROTOCOL MISMATCH', roborio: 'ROBORIO LINK',
   replaced: 'REPLACED', refused: 'LAUNCH REFUSED'
 };
 
@@ -386,7 +387,9 @@ export function renderStatus(model: DriveModel, now: number, skipped = 0): strin
   const summaryText = status.link === 'refused' ?
       status.text.replace(/\s+/g, ' ').trim() : status.text;
   const titleAttr = status.link === 'refused' ? ` title="${esc(status.text)}"` : '';
-  return `<div class="status link-${status.link}" role="status"${titleAttr}>` +
+  const linkClass = status.link === 'protocol' ?
+      'link-protocol link-error' : `link-${status.link}`;
+  return `<div class="status ${linkClass}" role="status"${titleAttr}>` +
       `<b>${LINK_WORD[status.link]}</b> ${esc(summaryText)}` +
       (status.link === 'replaced' ?
            ' <button type="button" data-action="reconnect">Reconnect</button>' : '') +

@@ -27,7 +27,8 @@ constexpr std::uint64_t kStream = 77;
 constexpr std::uint32_t kDictionaryId = 4242;
 constexpr std::int64_t kMs = 1'000'000;
 
-// Channel 0 is named by the layout, 4 is an alert, the rest neither.
+// Channel 0 is named by the layout, 4 and 5 are hardware link/protocol alerts,
+// the rest neither.
 std::vector<ChannelDef> Dictionary() {
   return {
       {"drive/velocity", "m/s", {}, Talos::Telemetry::ChannelKind_Double},
@@ -35,6 +36,11 @@ std::vector<ChannelDef> Dictionary() {
       {"pose/valid", "", {}, Talos::Telemetry::ChannelKind_Bool},
       {"hw/status/clock_boot_id", "", {}, Talos::Telemetry::ChannelKind_UInt},
       {"hw/status/alert_error_link_lost",
+       "",
+       {},
+       Talos::Telemetry::ChannelKind_Bool,
+       Talos::Telemetry::AlertLevel_Error},
+      {"hw/status/alert_error_protocol_mismatch",
        "",
        {},
        Talos::Telemetry::ChannelKind_Bool,
@@ -71,11 +77,11 @@ void Tick(TelemetryState& state, std::uint64_t sequence, double velocity,
   std::vector<std::string> pages;
   flatbuffers::FlatBufferBuilder builder;
   const Talos::Telemetry::Pose chassis{1, 2, 0, 0, 0, 0.5};
-  const std::vector<std::uint32_t> channels{0, 1, 2, 3, 4};
-  const std::vector<std::uint64_t> values{RawFromDouble(velocity), inhibit, 1,
-                                          9, 0};
+  const std::vector<std::uint32_t> channels{0, 1, 2, 3, 4, 5};
+  const std::vector<std::uint64_t> values{
+      RawFromDouble(velocity), inhibit, 1, 9, 0, 0};
   ASSERT_TRUE(talos::telemetry::EncodeValuePages(
-      builder, PageHeader{kStream, sequence, 1000 + sequence, kDictionaryId, 5},
+      builder, PageHeader{kStream, sequence, 1000 + sequence, kDictionaryId, 6},
       chassis, true, channels, values, {},
       [&](std::span<const std::uint8_t> page,
           const talos::telemetry::PageSpan&) {
@@ -142,7 +148,7 @@ TEST(DriveFeed, SendsTheDictionaryThenOnlyItsMask) {
     bool alerts;
     std::set<std::uint32_t> expected;
   };
-  for (const Case& c : {Case{false, {0}}, Case{true, {0, 4}}}) {
+  for (const Case& c : {Case{false, {0}}, Case{true, {0, 4, 5}}}) {
     SCOPED_TRACE(c.alerts ? "with an alerts widget" : "without");
     TelemetryState state = WithDictionary();
     Tick(state, 1, 0.5);
@@ -175,10 +181,10 @@ TEST(DriveFeed, SendsTheDictionaryThenOnlyItsMask) {
 }
 
 // REQ-OPS-35
-// The RoboRIO link's alert channel reaches a drive client whatever the
-// layout's widgets, so the page can name a lost link: a layout with no
-// `alerts` widget gets it beside its own channel, and one with an `alerts`
-// widget gets the same channels.
+// The RoboRIO link and protocol-mismatch alert channels reach a drive client
+// whatever the layout's widgets, so the page can name a protocol mismatch or a
+// lost link: a layout with no `alerts` widget gets both beside its own channel,
+// and one with an `alerts` widget gets the same channels.
 TEST(DriveFeed, CarriesTheRoboRioLinkChannelWithoutAnAlertsWidget) {
   const std::string number =
       "[[widgets]]\nkind = \"number\"\nat = [0, 0, 1, 1]\n"
@@ -197,7 +203,7 @@ TEST(DriveFeed, CarriesTheRoboRioLinkChannelWithoutAnAlertsWidget) {
     Received received;
     Tick(state, 1, 0.5);
     Pump(feed, state, mask.For(state), 0, received);
-    EXPECT_EQ(received.channels(), (std::set<std::uint32_t>{0, 4}));
+    EXPECT_EQ(received.channels(), (std::set<std::uint32_t>{0, 4, 5}));
   }
 }
 

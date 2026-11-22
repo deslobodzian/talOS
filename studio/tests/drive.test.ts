@@ -18,12 +18,13 @@ const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
 
 const LINK_LOST = 'hw/status/alert_error_link_lost';
+const PROTOCOL_MISMATCH = 'hw/status/alert_error_protocol_mismatch';
 const OWNER_TIMED_OUT = 'hw/status/alert_warning_owner_timed_out';
 const ROUTINES = ['preload', 'none', 'shoot_only', 'taxi'];
 
 // The 2026 dictionary as far as the feed carries it: every layout channel
-// (the link-lost alert among them: the bridge always lists it) plus the
-// /hw/status alert channels the alerts widget adds.
+// (the link-lost and protocol-mismatch alerts among them: the bridge always
+// lists both) plus the /hw/status alert channels the alerts widget adds.
 const LABELS: Record<string, string[]> = {
   'hw/state/driver_station/alliance': ['unknown', 'red', 'blue'],
   'hw/state/driver_station/match_type': ['none', 'practice', 'qualification', 'elimination'],
@@ -40,12 +41,13 @@ const DOUBLE = new Set(['hw/state/driver_station/match_time_s', 'hw/status/batte
 const unitOf = (name: string) => name.endsWith('_rps') ? 'rps' : name.endsWith('_v') ? 'V' :
     name.endsWith('_s') ? 's' : name.endsWith('_m') ? 'm' : name.endsWith('_rad') ? 'rad' : '';
 const CHANNELS: ChannelSpec[] = [
-  ...LAYOUT.channels.filter(name => name !== LINK_LOST).map(name => ({
+  ...LAYOUT.channels.filter(name => name !== LINK_LOST && name !== PROTOCOL_MISMATCH).map(name => ({
     name, unit: unitOf(name), labels: LABELS[name],
     kind: DOUBLE.has(name) ? ChannelKind.Double : UINT.has(name) ? ChannelKind.UInt :
                              ChannelKind.Bool
   })),
   {name: LINK_LOST, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
+  {name: PROTOCOL_MISMATCH, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
   {name: OWNER_TIMED_OUT, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Warning}
 ];
 const INDEX = new Map(CHANNELS.map((c, i) => [c.name, i]));
@@ -74,12 +76,13 @@ const NOMINAL: Record<string, number> = {
   'pose_estimator/state/localized': 1,
   'shooter/state/flywheel_velocity_rps': 52.34, 'shooter/state/target_velocity_rps': 55,
   'shooter/state/at_speed': 0, 'shooter/state/beam_broken': 1,
-  [LINK_LOST]: 0, [OWNER_TIMED_OUT]: 0
+  [LINK_LOST]: 0, [PROTOCOL_MISMATCH]: 0, [OWNER_TIMED_OUT]: 0
 };
 
 // The same with /hw/status not published: its alert channels absent.
 const WITHOUT_HW_STATUS_ALERTS = Object.fromEntries(
-    Object.entries(NOMINAL).filter(([name]) => name !== LINK_LOST && name !== OWNER_TIMED_OUT));
+    Object.entries(NOMINAL).filter(
+        ([name]) => name !== LINK_LOST && name !== PROTOCOL_MISMATCH && name !== OWNER_TIMED_OUT));
 
 const raw = (name: string, value: number) =>
     CHANNELS[INDEX.get(name)!].kind === ChannelKind.Double ? rawFromDouble(value) : BigInt(value);
@@ -404,6 +407,19 @@ test('the status line names the failed link', () => {
         h.socket().send(...update(1, {}, false));
       }
     }},
+    {name: 'protocol mismatch takes precedence over RoboRIO link lost', link: 'protocol',
+     textMatch: /protocol versions differ/i, arrange: h => {
+      h.connect(0);
+      h.at(50);
+      h.socket().send(...update(2, {[LINK_LOST]: 1, [PROTOCOL_MISMATCH]: 1}, false));
+    }},
+    {name: 'protocol mismatch named by a layout without an alerts widget', link: 'protocol',
+     carried: {channels: LAYOUT.channels, alerts: false},
+     textMatch: /protocol versions differ/i, arrange: h => {
+      h.connect(0);
+      h.at(50);
+      h.socket().send(...update(2, {[LINK_LOST]: 1, [PROTOCOL_MISMATCH]: 1}, false));
+    }},
     {name: 'RoboRIO link lost', link: 'roborio', arrange: h => {
       h.connect(0);
       h.at(50);
@@ -418,11 +434,12 @@ test('the status line names the failed link', () => {
     {name: 'no hw/status: the hardware bridge is not publishing', link: 'hardware', arrange: h => {
       h.connect(0, WITHOUT_HW_STATUS_ALERTS);
     }},
-    // The feed never carries the channel for this layout, so its absence
+    // The feed never carries the link channels for this layout, so their absence
     // says nothing about the RoboRIO link — and the OK line says it is not
     // judged rather than claiming a verified link.
     {name: 'layout without the link channel', link: 'ok',
-     carried: {channels: LAYOUT.channels.filter(n => n !== LINK_LOST), alerts: false},
+     carried: {channels: LAYOUT.channels.filter(n => n !== LINK_LOST && n !== PROTOCOL_MISMATCH),
+               alerts: false},
      textMatch: /RoboRIO link not judged\)$/,
      arrange: h => {
       h.connect(0, WITHOUT_HW_STATUS_ALERTS);
@@ -434,7 +451,13 @@ test('the status line names the failed link', () => {
     const status = h.model.status(h.clock.now);
     assert.equal(status.link, c.link, `${c.name}: ${status.text}`);
     if (c.textMatch) assert.match(status.text, c.textMatch, `${c.name}: ${status.text}`);
-    assert.match(renderStatus(h.model, h.clock.now), new RegExp(`link-${c.link}`), c.name);
+    const rendered = renderStatus(h.model, h.clock.now);
+    assert.match(rendered, new RegExp(`link-${c.link}`), c.name);
+    if (c.link === 'protocol') {
+      assert.match(rendered, /<b>PROTOCOL MISMATCH<\/b>/, c.name);
+      assert.match(rendered, /link-error/, c.name);
+      assert.doesNotMatch(rendered, /RoboRIO link lost/, c.name);
+    }
   }
 });
 

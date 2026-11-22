@@ -147,11 +147,14 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   but no new tick; or none 1.5 s after connecting, the time a refilling bucket
   may take to send the dictionary, which until then reads as connecting), then
   the hardware bridge (HARDWARE BRIDGE: no `/hw/status` sample, so
-  `hardware_node` on the main processor publishes nothing) and the RoboRIO
-  link (`hw/status/alert_error_link_lost`). It judges those two only when the
-  feed carries that channel, which it does whenever the dictionary has it
-  (`/drive/layout.json` lists it in `"channels"` whatever the widgets); a
-  graph without the hardware bridge has no such channel and reports neither.
+  `hardware_node` on the main processor publishes nothing), protocol mismatch
+  (PROTOCOL MISMATCH: `hw/status/alert_error_protocol_mismatch`, checked before
+  link lost so a partial deploy is named instead of a generic lost link) and
+  the RoboRIO link (`hw/status/alert_error_link_lost`). It judges those only
+  when the feed carries those channels, which it does whenever the dictionary
+  has them (`/drive/layout.json` lists both in `"channels"` whatever the
+  widgets); a graph without the hardware bridge has no such channels and
+  reports none.
 - A drawing error keeps the last grid, marks every widget stale with a
   dashed red border, and says DRAWING ERROR on the status line until a draw
   succeeds.

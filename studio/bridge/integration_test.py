@@ -601,9 +601,12 @@ class BridgeIntegration(unittest.TestCase):
                         f"http://127.0.0.1:{port}/drive/layout.json", timeout=3) as response:
                     layout = json.loads(response.read())
                 self.assertEqual(layout["title"], "Pit")
-                # The RoboRIO link's alert is carried whatever the widgets.
+                # The RoboRIO link and protocol-mismatch alerts are carried
+                # whatever the widgets.
                 self.assertEqual(layout["channels"],
-                                 ["drive/velocity", "hw/status/alert_error_link_lost"])
+                                 ["drive/velocity",
+                                  "hw/status/alert_error_link_lost",
+                                  "hw/status/alert_error_protocol_mismatch"])
                 with self.assertRaises(urllib.error.HTTPError) as absent:
                     urllib.request.urlopen(f"http://127.0.0.1:{bare_port}/drive/layout.json",
                                            timeout=3)

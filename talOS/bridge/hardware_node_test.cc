@@ -415,6 +415,88 @@ TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
   EXPECT_EQ(lines, 1u) << err;
 }
 
+// REQ-OPS-20: receiving a UDP frame with an unsupported protocol version raises
+// alert_error_protocol_mismatch and reports mismatched_protocol_version_id on
+// /hw/status; stopping mismatched frames clears both after command_timeout_us
+// (non-latching), and receiving any valid-version frame clears both at once.
+TEST(HardwareNodeTest, ReportsAndClearsProtocolMismatchOnStatus) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  const bridge::BridgeStatus initial = node.Status(kStartUs);
+  EXPECT_FALSE(initial.alert_error_protocol_mismatch());
+  EXPECT_EQ(initial.mismatched_protocol_version_id(), 0u);
+  EXPECT_EQ(initial.protocol_version_id(), protocol::kProtocolVersion);
+
+  const auto send_wrong_version = [&](uint16_t version, uint64_t seq) {
+    talos::hardware::Packet payload{};
+    payload.size = static_cast<uint32_t>(
+        Encode(TrustState(NodeConfigId(cfg), 42, 1, 1000), payload.data));
+    std::array<uint8_t, protocol::kMaxFrameSize> frame{};
+    const std::size_t size = protocol::EncodeFrame(
+        protocol::FrameType::kHardwareState, protocol::kFlagNone, seq, 1000,
+        payload.data.data(), payload.size, frame.data(), frame.size());
+    ASSERT_NE(size, 0u);
+    frame[8] = static_cast<uint8_t>(version & 0xFFu);
+    frame[9] = static_cast<uint8_t>((version >> 8) & 0xFFu);
+    ASSERT_EQ(::send(link.gateway.NativeFd(), frame.data(), size, 0),
+              static_cast<ssize_t>(size));
+  };
+
+  // Wrong-version frame raises the alert and records the peer's version.
+  const uint16_t older = static_cast<uint16_t>(protocol::kProtocolVersion - 1);
+  send_wrong_version(older, 1);
+  ASSERT_TRUE(DatagramQueued(node));
+  ::testing::internal::CaptureStderr();
+  node.Tick(kStartUs + 1000);
+  (void)::testing::internal::GetCapturedStderr();
+  const bridge::BridgeStatus mismatched = node.Status(kStartUs + 1000);
+  EXPECT_TRUE(mismatched.alert_error_protocol_mismatch());
+  EXPECT_EQ(mismatched.mismatched_protocol_version_id(), older);
+  EXPECT_EQ(mismatched.protocol_version_id(), protocol::kProtocolVersion);
+
+  // Stays active through command_timeout_us, then clears once packets stop.
+  const bridge::BridgeStatus at_boundary =
+      node.Status(kStartUs + 1000 + timeout_us);
+  EXPECT_TRUE(at_boundary.alert_error_protocol_mismatch());
+  EXPECT_EQ(at_boundary.mismatched_protocol_version_id(), older);
+  const bridge::BridgeStatus after_timeout =
+      node.Status(kStartUs + 1000 + timeout_us + 1);
+  EXPECT_FALSE(after_timeout.alert_error_protocol_mismatch());
+  EXPECT_EQ(after_timeout.mismatched_protocol_version_id(), 0u);
+
+  // Another mismatch raises again, and a valid-version frame clears both
+  // immediately (well before command_timeout_us).
+  const uint16_t newer = static_cast<uint16_t>(protocol::kProtocolVersion + 1);
+  const uint64_t t1 = kStartUs + 2 * timeout_us;
+  send_wrong_version(newer, 2);
+  ASSERT_TRUE(DatagramQueued(node));
+  node.Tick(t1);
+  EXPECT_TRUE(node.Status(t1).alert_error_protocol_mismatch());
+  EXPECT_EQ(node.Status(t1).mismatched_protocol_version_id(), newer);
+
+  ConfigAckPayload ack{};
+  ack.config_id = NodeConfigId(cfg);
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 3,
+                                   2000, ack_bytes.data(), ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(WaitFor([&] {
+    node.Tick(t1 + 1000);
+    return node.is_configured();
+  }));
+  const bridge::BridgeStatus cleared = node.Status(t1 + 1000);
+  EXPECT_FALSE(cleared.alert_error_protocol_mismatch());
+  EXPECT_EQ(cleared.mismatched_protocol_version_id(), 0u);
+}
+
 // /hw/status names the build of the gateway boot the bridge accepted, and a
 // new boot's build replaces it: after a RoboRIO rollback the record shows the
 // build that drove the robot, not the first one the bridge heard.

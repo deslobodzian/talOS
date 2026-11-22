@@ -153,3 +153,18 @@ test('operator arming disarmed alert renders actionable text', () => {
   assert.equal(byChannel[CUSTOM_DISARMED].owner, 'operator');
   assert.match(byChannel[CUSTOM_DISARMED].text, /release held joystick input to arm/i);
 });
+
+// REQ-OPS-20: protocol mismatch alert carries actionable guidance to redeploy
+// both RoboRIO and main processor builds.
+test('protocol mismatch alert renders actionable text', () => {
+  const PROTO = 'hw/status/alert_error_protocol_mismatch';
+  const active = activeAlerts({
+    timestamp_ns: '1000000',
+    channels: {[PROTO]: 1},
+    alerts: {[PROTO]: AlertLevel.Error},
+  });
+  assert.equal(active.length, 1);
+  assert.equal(active[0].owner, 'hw');
+  assert.match(active[0].text, /protocol mismatch/i);
+  assert.match(active[0].text, /redeploy both/i);
+});
