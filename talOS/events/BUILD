@@ -45,11 +45,14 @@ cc_test(
 cc_library(
     name = "events_log",
     srcs = [
+        "log/log_file_sink.cc",
         "log/log_reader.cc",
         "log/log_writer.cc",
     ],
     hdrs = [
         "log/format.h",
+        "log/gap_tracker.h",
+        "log/log_file_sink.h",
         "log/log_reader.h",
         "log/log_writer.h",
     ],
