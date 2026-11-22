@@ -14,6 +14,7 @@
 
 #include "ConfigStore.h"
 #include "DriverStationReader.h"
+#include "DriverStationSampler.h"
 #include "LoopConsole.h"
 #include "LoopSchedule.h"
 #include "PhoenixBackend.h"
@@ -364,13 +365,13 @@ void Robot::StartCompetition() {
 #endif
 
   std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
-  uint64_t last_ds_sample_us = 0;
-  // The mode (ModeKey) of the last packet sent.
-  uint32_t last_ds_mode = 0;
-  // Observe every hardware tick, including transitions between DS packets.
-  // Real and desktop Driver Stations are both read back through WPILib, by
-  // the reader's thread.
-  talos::driver_station::ModeTracker ds_mode;
+  // This tick's Driver Station packet, when one is due.
+  talos::driver_station::DriverStationData ds_packet{};
+  // Observes every hardware tick, including transitions between DS packets,
+  // and decides and stamps each packet (DriverStationSampler.h). Real and
+  // desktop Driver Stations are both read back through WPILib, by the
+  // reader's thread.
+  talos::rio::DriverStationSampler ds_sampler;
 
   // Posts the loop's findings no State carries to the logger (LoopConsole.h).
   talos::rio::LoopConsole loop_console{*log_};
@@ -415,7 +416,7 @@ void Robot::StartCompetition() {
     const talos::driver_station::DriverStationData& driver_station_view =
         driver_station.Read(now_us, gateway_->config().command_timeout_us);
     const uint32_t mode_flags = driver_station_view.fms.flags;
-    ds_mode.Observe(mode_flags, now_us);
+    ds_sampler.Observe(mode_flags, now_us);
     log_->ClosePhase(TickPhase::kDriverStation, NowNs());
     auto open_status = talos::protocol::UdpStatus::kOk;
     int open_errno = 0;
@@ -565,25 +566,14 @@ void Robot::StartCompetition() {
       // in the dispatch log downstream, for every real one. A new mode goes
       // out on the tick that observes it: an enabled switch (autonomous to
       // teleop) leaves the State unchanged, so until its generation arrives
-      // the old mode's target lanes still drive.
-      const uint32_t mode = talos::driver_station::ModeKey(mode_flags);
-      const bool sample_due =
-          now_us - last_ds_sample_us >= talos::driver_station::kSamplePeriodUs;
-      // Not on a socket the State send just lost: the replacement sends it.
-      if (socket_retry.open() && (mode != last_ds_mode || sample_due)) {
-        last_ds_sample_us = now_us;
-        last_ds_mode = mode;
-        // This tick's view, so the packet is one refresh's and agrees with
-        // ds_mode and the gateway's enable on the mode.
-        talos::driver_station::DriverStationData ds = driver_station_view;
-        ds.sample_time_us = now_us;
-        ds_mode.Stamp(ds);
-        // The same boot id as this program's State: a consumer orders
-        // packets within one boot and starts over on a new one.
-        ds.boot_id = boot_id;
+      // the old mode's target lanes still drive. Not on a socket the State
+      // send just lost: the replacement sends it.
+      if (ds_sampler.Sample(driver_station_view, now_us, boot_id,
+                            socket_retry.open(), ds_packet)) {
         // Encode() returns 0 if the payload will not fit; send nothing rather
         // than an empty frame the receiver would forward as a decode failure.
-        const auto ds_size = talos::driver_station::Encode(ds, ds_buffer);
+        const auto ds_size =
+            talos::driver_station::Encode(ds_packet, ds_buffer);
         log_->ClosePhase(TickPhase::kDriverStation, NowNs());
         if (ds_size) {
           const auto ds_status =
