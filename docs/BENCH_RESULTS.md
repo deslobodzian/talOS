@@ -33,8 +33,8 @@ Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
     `robot_py.toml`, `robot_bench.toml`, `robot_physics_sim.toml`,
     `examples/superstructure/config/{robot,robot_py}.toml`): PASS.
   - `tools/deploy.sh boot-check`: FAIL as expected under `DEPLOY-8` (`FileVault
-    is On`, `pmset autorestart 0`, `pmset sleep 0`, automatic macOS updates
-    enabled).
+    is On` and `pmset autorestart 0` failed; `pmset sleep 0` ok; automatic macOS
+    updates enabled warning).
   - Warm Python node spawn → event-loop origin (no `sudo purge`, so warm page
     cache; startup grace 5000 ms): `gyro` 106.0 ms first launch / 131.2–133.7 ms
     restarts; `motor` 107.3 ms first launch / 120.0–121.0 ms restarts.
