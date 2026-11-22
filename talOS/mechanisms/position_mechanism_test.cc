@@ -560,6 +560,48 @@ can_id = 2
   expect_refused("gravity_v", toml(ok + "gravity_v = 0.5\n", slot_g));
 }
 
+// The travel widened by absolute_margin_rot must lie strictly inside the one
+// sensor rotation (here (-0.5, 0.5)): just inside either end is accepted, the
+// boundary itself and beyond it are refused. Binary-exact values (margin
+// 0.125, ends 0.375) keep the boundary exact.
+// REQ-SAFE-36
+TEST(PositionMechanism, AbsoluteMarginBoundaryIsStrict) {
+  const auto build = [](double min_rot, double max_rot) {
+    auto sim = Sim::FromToml(std::string{R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+[subsystems.m.motors.m]
+can_id = 1
+[subsystems.m.sensors.cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.m.m]
+tolerance_rot = 0.1
+homing = "absolute"
+absolute_sensor = "cc"
+absolute_margin_rot = 0.125
+)"} + "min_rot = " + std::to_string(min_rot) +
+                             "\nmax_rot = " + std::to_string(max_rot) + "\n");
+    sim.add<PositionNode>("m");
+  };
+  EXPECT_NO_THROW(build(-0.25, 0.374));
+  EXPECT_NO_THROW(build(-0.374, 0.25));
+  for (const auto& [min_rot, max_rot] :
+       {std::pair{-0.25, 0.375}, std::pair{-0.25, 0.376},
+        std::pair{-0.375, 0.25}, std::pair{-0.376, 0.25}}) {
+    SCOPED_TRACE(std::to_string(min_rot) + " .. " + std::to_string(max_rot));
+    try {
+      build(min_rot, max_rot);
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& e) {
+      EXPECT_NE(std::string{e.what()}.find("m.absolute_offset_rot"),
+                std::string::npos)
+          << e.what();
+    }
+  }
+}
+
 // REQ-RT-06
 TEST(PositionMechanism, UpdateDoesNotAllocate) {
   if (const auto why = testing::AllocationProbe::Unsupported(); !why.empty()) {

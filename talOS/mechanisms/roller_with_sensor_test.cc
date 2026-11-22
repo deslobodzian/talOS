@@ -622,6 +622,30 @@ TEST(RollerWithSensor, RequestIsTiedToItsUpdate) {
   EXPECT_EQ(hw.applied_motor("intake", "roller").mode, Mode::kNeutral);
 }
 
+// With no live request (the lane is stale: the owner calls stop()) the roller
+// is neutral, yet the piece sensor is still tracked, and a timed eject still
+// finishes its clock while enabled rather than freezing mid-run.
+// REQ-SAFE-38
+TEST(RollerWithSensor, SensorAndTimedRunsProgressWithNoLiveRequest) {
+  Rig intake{"intake"};
+  intake.Sensor("beam", false);
+  intake.Start();
+  intake.Drive(Command::EJECT, 10ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
+  ASSERT_FALSE(intake.roller().has_piece());
+
+  intake.sim.step(120ms);  // the lane goes stale after 100 ms; eject_us 200 ms
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
+  EXPECT_FALSE(intake.roller().driving());
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+  intake.Sensor("beam", true);
+  intake.sim.step(20ms);
+  EXPECT_TRUE(intake.roller().has_piece()) << "sensor tracked with no request";
+  intake.sim.step(150ms);  // past eject_us
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+}
+
 // REQ-RT-06
 TEST(RollerWithSensor, UpdateDoesNotAllocate) {
   if (const auto why = testing::AllocationProbe::Unsupported(); !why.empty()) {

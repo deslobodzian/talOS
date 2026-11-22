@@ -428,6 +428,67 @@ TEST(VelocityMechanismRequest, RequestIsTiedToItsUpdate) {
   EXPECT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kNeutral);
 }
 
+// A request lasts one tick even where nothing else gates it: with
+// AllowUntargetedOutputs the devices flush does not neutralize a tick with no
+// target, so the mechanism alone must stop driving when the owner stops
+// asking.
+// REQ-SAFE-37
+TEST(VelocityMechanismRequest, OneRequestDrivesOneTick) {
+  struct OnceNode {
+    explicit OnceNode(Node& node) : flywheel{node, "flywheel"} {
+      AllowUntargetedOutputs(node);
+    }
+    void update() {
+      if (ask) flywheel.set_goal(60.0);
+      flywheel.update();
+    }
+    VelocityMechanism flywheel;
+    bool ask = true;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& node = sim.add<OnceNode>("shooter");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(10ms);
+  ASSERT_TRUE(node.flywheel.driving());
+  ASSERT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kVelocity);
+  node.ask = false;
+  sim.step(10ms);
+  EXPECT_FALSE(node.flywheel.driving());
+  EXPECT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kNeutral);
+}
+
+// The entry count is of consecutive ticks: one tick outside the entry band
+// starts it over, so two ticks before and two after are not three.
+// REQ-SAFE-37
+TEST_F(VelocityMechanismTest, EntryCountResetsWhenTheBandIsBroken) {
+  SetVelocity(59.0);
+  Drive(60.0, 5ms);  // in band
+  ASSERT_FALSE(flywheel().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 50.0);
+  Drive(60.0, 10ms);  // out of band
+  ASSERT_FALSE(flywheel().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 59.0);
+  Drive(60.0, 10ms);  // in band again, short of a full count
+  EXPECT_FALSE(flywheel().at_speed());
+  Drive(60.0, 10ms);
+  EXPECT_TRUE(flywheel().at_speed());
+}
+
+// A goal of 1e-3 rps or less is never at speed, even with the flywheel
+// exactly on it; just above that it can be.
+// REQ-SAFE-37
+TEST_F(VelocityMechanismTest, TinyGoalIsNeverAtSpeed) {
+  SetVelocity(0.001);
+  Drive(0.001, 40ms);
+  EXPECT_DOUBLE_EQ(Applied().demand, 0.001);
+  EXPECT_FALSE(flywheel().at_speed());
+  SetVelocity(0.002);
+  Drive(0.002, 40ms);
+  EXPECT_TRUE(flywheel().at_speed());
+}
+
 // REQ-RT-06
 TEST_F(VelocityMechanismTest, UpdateDoesNotAllocate) {
   if (const auto why = testing::AllocationProbe::Unsupported(); !why.empty()) {
