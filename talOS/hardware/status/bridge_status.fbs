@@ -231,7 +231,7 @@ struct BridgeStatus {
   mismatched_protocol_version_id:uint16;
   gateway_build_id:uint64;
   // Causal two-way bound, including residence time, quantization and 1000 ppm
-  // relative oscillator drift. Local logs only (excluded from robot radio).
+  // relative oscillator drift.
   clock_offset_uncertainty_us:uint64;
   clock_min_round_trip_us:uint64;
   socket_send_failures_count:uint64;

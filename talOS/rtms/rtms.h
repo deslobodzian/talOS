@@ -331,8 +331,10 @@ class RTMSQueue {
   // Number of times a read retries when the writer laps it mid-read.
   static constexpr int MAX_READ_ATTEMPTS = 8;
 
-  // Test seam, null in production: invoked by open() each time a loser yields
-  // while waiting for an existing kLifetimeReclaiming claim on `segment_id`.
+  // Test-only hook (null in production, never set by non-test callers;
+  // mutated only via RegistrationPeer in ring_registration_test.cc): invoked
+  // by open() each time a loser yields while waiting for an existing
+  // kLifetimeReclaiming claim on `segment_id`.
   static void (*on_reclaim_wait_)(std::uint64_t segment_id, int wait_count);
 
   // Whether reader slot `reader_id` still holds the word this queue claimed
