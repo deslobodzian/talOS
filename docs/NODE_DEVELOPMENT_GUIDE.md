@@ -412,7 +412,7 @@ Signal acquisition times subtract the signal's existing gateway age (microsecond
 from the mapped hardware State time. They are available while disabled, but
 absent for disconnected feedback, unknown age (`UINT32_MAX`), stale hardware or
 stale/invalid bridge clock mapping. They retain `sample_time()`'s reported
-two-way clock uncertainty (`/hw/status/clock_offset_uncertainty_us`, assuming
+two-way clock uncertainty (`/hw/status` `clock_offset_uncertainty_us`, assuming
 <=1000 ppm relative clock drift); they do not interpolate measurements.
 Software rezero does not change these timestamps.
 `SimHardware.set_motor`, `.set_cancoder` accept optional `position_age_us`,

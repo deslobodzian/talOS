@@ -60,8 +60,10 @@ database, or a standard library clang 18 cannot parse when no fallback is
 available (e.g. an offline host before the GCC 14 cache is populated,
 non-x86_64 Linux, or no installed macOS SDK it parses), where it says so
 and names what it tried.
-Homebrew buildifier and the distribution's buildifier may differ from 8.2.1;
-setup warns about this.
+Homebrew buildifier may differ from 8.2.1, and setup warns about a mismatch on
+macOS; on Linux, a mismatched distribution buildifier is reported
+`wrong-version` and replaced with 8.2.1 in `/usr/local/bin/buildifier` on
+install.
 
 ## Flags
 

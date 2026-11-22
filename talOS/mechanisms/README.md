@@ -295,8 +295,8 @@ and `ZeroWaitsForRest` (no zero while the motor still moves on the
 switch). The
 fixture starts the arm on its switch (closed); `StartOffHome()` opens it.
 `hw.ideal_motors()` makes the simulated motor reach each demand at once,
-so in the last test the switch, never opened, is still closed with the arm
-0.15 above a zero taken 1.9 rotations up its travel. The tests' times and
+so in `StuckSwitchStopsWithinTheMargin` the switch, never opened, is still
+closed with the arm 0.15 above a zero taken 1.9 rotations up its travel. The tests' times and
 positions follow the constants: change them together. The
 [mechanisms README](#positionmechanism)
 treats each case more fully (homing stall checks, settling, timeouts).

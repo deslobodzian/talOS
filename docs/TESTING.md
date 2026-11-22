@@ -223,7 +223,7 @@ Where RULES.md 12 is read too broadly or too narrowly:
    (`//talOS/bridge:run_timing_test` records the gtest property
    `host_unqualified="true"` and `[HOST_UNQUALIFIED]` in its failure message;
    uniform reporting across the remaining perf and timed e2e tests is still
-   open). **[gap: LANE-1]**
+   open). **[review]**
 8. **Statistics over single samples.** A lateness or gap assertion uses the
    quantity the requirement names (the maximum inside a window, or a
    percentile over at least 50 samples), as
@@ -348,7 +348,7 @@ of `examples/robot_repo`), and in the repository
 `bazel run //tools:new_robot -- <name> --standalone DIR` makes of that
 fixture, which also fails when the fixture has a tracked file
 `new_robot`'s template does not place, and whose packages load with talOS
-held at `talos/` as its README's submodule would be **[enforced: CI's dependent-repositories job and
+held at `talos/` as its README's submodule would be **[enforced: CI's robot-repo job and
 `tools/prepush.sh`]**.
 
 ## 8. Flakes
@@ -365,7 +365,7 @@ the host can run it. It is never noise.
    writes its session directory to Bazel's undeclared test outputs, and
    `//studio:drive_browser_test` its session's logs, a screenshot and the
    failing elements when a check fails; the other e2e and perf tests write theirs to temporary directories that do
-   not survive the run **[gap: LANE-1]**. A flake is closed by a named mechanism and a test
+   not survive the run **[review]**. A flake is closed by a named mechanism and a test
    that pins it (§5), not by a green rerun.
 3. **Quarantine is explicit and expires.** A test that fails without a
    product change and cannot be fixed the same day gets the tags

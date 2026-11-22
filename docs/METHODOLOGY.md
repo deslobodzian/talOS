@@ -111,8 +111,8 @@ There are exactly two kinds of input, and they are treated differently.
 | **Observation**: what another node reports | `/<other>/state`, `/<other>/status`, `/hw/...` | the decision that needs it is not made; publish your state with the matching validity flag cleared | `fresh()` plus that message's own validity flags |
 
 - Never dereference a subscription without checking `fresh()` in the same
-  expression. `value()` before the first message is undefined in C++ and
-  `None` in Python. **[review]**
+  expression. `value()` before the first message returns a zero-initialized
+  `M` in C++ and `None` in Python. **[review]**
 - Never hold a last value past its freshness ("keep the last goal"). A
   mechanism that must hold position is told to hold by a producer that keeps
   publishing. **[review]**
@@ -126,7 +126,7 @@ There are exactly two kinds of input, and they are treated differently.
   value it owns through `param_of` in the constructor. Never include
   its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[enforced:
   `tools/check_layers.py` refuses a Bazel dependency on another node package's
-  library; gap: ARCH-2, package-private visibility]**
+  library]**
 
 ## 4. Outputs
 
@@ -250,8 +250,8 @@ Rules:
 
 - Use `node.now()` only. Never `steady_clock`, `time.time()` or sleeps. This is
   what makes `Sim` and replay match the robot. **[enforced:
-  `tools/lint_test_time.py` over the node packages under the robot, example,
-  bench and scaffold directories and the framework nodes, `talOS/teleop` and
+  `tools/lint_test_time.py` over the node packages under `bench/`, `examples/`
+  and `tools/scaffold_testdata/` and the framework nodes, `talOS/teleop` and
   `talOS/telemetry`]**
 - Estimators integrate on measurement sample times (`sample_time_ns`), never
   on arrival or publish time, and call wpimath's time-taking entry points

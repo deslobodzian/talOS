@@ -118,8 +118,10 @@ remote encoder references that do not exist on the motor's bus, and a
 Device tables reject unknown keys in both runtime parsing and manifest checking.
 CANcoder and Pigeon2 accept `type`, `bus`, `can_id`, `inverted`, and `offset_rot`.
 QuadratureEncoder accepts `type`, `dio_a`, `dio_b`, and `counts_per_rev`;
-DutyCycleEncoder accepts `type`, `dio`, and `offset_rot`; digital IO accepts only
-`dio`, while analog inputs and PWM outputs accept only `channel`.
+DutyCycleEncoder accepts `type`, `dio`, and `offset_rot`; `digital_outputs`
+accepts only `dio`, `digital_inputs` accepts `dio` plus the optional
+`sim_motor`, `sim_closed_at_rot`, `sim_closed_above`, and `sim_closed_reads`
+keys, and analog inputs and PWM outputs accept only `channel`.
 
 Motor tables may specify `follow = "master_motor"` and optional
 `oppose_master = true` (default false). The master must be a motor owned by
@@ -1117,10 +1119,11 @@ output on its first tick at or past the last command's expiry, which the
 harness reads from the RoboRIO's own States at the relay. That scenario
 runs `robot.toml` whole, so the bench's undriven devices must read neutral
 too. Each `--wpilib` scenario first deletes the simulation's saved
-configuration (`controller_processor/rio/talos_config.bin`) and fails if the
-program still restores one: a restored configuration configures the
-gateway before the bridge's push, the simulated Driver Station enables on
-it, and a push of the other configuration is then refused while enabled. It
+configuration (`controller_processor/rio/talos_config.bin`) and checks that the
+program starts unconfigured (`config=0`), failing if it still restores one:
+`SimDriverStation` waits for a push acknowledged in this boot rather than
+enabling on a restored configuration, and removing the saved file ensures each
+scenario starts cleanly from an unconfigured gateway. It
 runs Gradle `--offline`, so the first run needs one online
 `./gradlew simulateNative` beforehand. CI's `rio-in-the-loop` job runs
 `--wpilib` on Linux with `--output-dir`, which puts each scenario's log
@@ -1166,7 +1169,7 @@ or without a live command. Both keep each PWM output's last request
 | Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
 | Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`, using the same `R` and `k_e` as `StatorCurrent`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero stator current (slowly coasting only under the motor's no-load drag rather than braking; hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
-| Stator and supply current | Stator zero; supply placeholder `|voltage| / 12 × supply_limit_a` | Winding model with free current: `R = 12 V / stall_current`, `k_e = (12 V − free_current × R) / free_speed`, `back_emf = k_e × rotor_rps` (`MotorModelFor`: Kraken X60 6000 rpm, 366 A stall, 2.0 A free, default; Kraken X44 7530 rpm, 275 A stall, 2.0 A free; Falcon 500 6380 rpm, 257 A stall, 1.5 A free). Stator current is `|applied_volts − back_emf| / R` (equals `free_current` at 12 V free speed and `stall_current` at 12 V stall), 0 while unpowered. `stator_limit_a` and `supply_limit_a` clamp effective winding voltage before rotor integration and are reflected in `applied_volts_` and reported currents. Supply current follows power conservation `|applied_volts × stator_current| / supply_v` (clamped to `supply_limit_a`, 0 when unpowered or `supply_v <= 0`). A motor held at a hard stop or soft limit is stalled. The type is the motor's `motor_type` key (above) |
+| Stator and supply current | Stator zero; supply placeholder `|voltage| / 12 × supply_limit_a` | Winding model with free current: `R = 12 V / stall_current`, `k_e = (12 V − free_current × R) / free_speed`, `back_emf = k_e × rotor_rps` (`MotorModelFor`: Kraken X60 6000 rpm, 366 A stall, 2.0 A free, default; Kraken X44 7530 rpm, 275 A stall, 2.0 A free; Falcon 500 6380 rpm, 257 A stall, 1.5 A free). Stator current is `|applied_volts − back_emf| / R` (equals `free_current` at 12 V free speed and `stall_current` at 12 V stall), 0 while unpowered. `stator_limit_a` and `supply_limit_a` clamp effective winding voltage before rotor integration and are reflected in `applied_volts_` and reported currents. Supply current follows signed power conservation `(rotor_volts × signed_stator_current) / supply_v` (positive battery draw clamped to `supply_limit_a`, negative regenerative braking kept signed, 0 when unpowered or `supply_v <= 0`). A motor held at a hard stop or soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid) and per-device disconnect (invalid), each read as `PhoenixBackend` reads a device whose frames stopped: ages growing from its last sample, limit bits cleared once that sample is 50 ms old and temperature 0 once it is 500 ms old (`kFaultFieldMaxAgeUs`, `kTemperatureMaxAgeUs`, `feedback.h`); controller restart |
 | Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it (the gateway masks it in those States either way); completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
