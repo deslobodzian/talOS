@@ -4,9 +4,11 @@
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -82,6 +84,115 @@ TEST(ProcessTest, RepeatedStopsNeverBlockAndStaleWakesAreReadOut) {
   EXPECT_TRUE(Readable(StopFd()));  // for every other watcher
   stop_requested.store(false);
   EXPECT_FALSE(ConsumeStopWake());
+}
+
+// A stop requested while ConsumeStopWake() is draining stale bytes from
+// StopFd() may have its wake byte drained too. ConsumeStopWake() must still
+// put a byte back so every other watcher on StopFd() sees the stop
+// (process.h: "A stop leaves the pipe readable, so every watcher sees it").
+// REQ-OPS-06
+TEST(ProcessTest, ConsumeStopWakePreservesReadabilityWhenStopLandsMidDrain) {
+  const int fd = StopFd();
+  ASSERT_GE(fd, 0);
+  stop_requested.store(false);
+  ASSERT_FALSE(ConsumeStopWake());
+  ASSERT_FALSE(Readable(fd));
+
+  // Push stale bytes into the stop pipe without filling it (8 KiB stays below
+  // macOS's initial 16 KiB and Linux's 64 KiB pipe buffers so RequestStop()'s
+  // write never hits EAGAIN while giving ConsumeStopWake() 128 read(64) calls).
+  constexpr int kStaleBytes = 8 * 1024;
+  constexpr int kMaxTrials = 32;
+  bool observed_mid_drain = false;
+  for (int trial = 0; trial < kMaxTrials && !observed_mid_drain; ++trial) {
+    stop_requested.store(false);
+    while (ConsumeStopWake()) {
+    }
+    for (int i = 0; i < kStaleBytes; ++i) {
+      RequestStop();
+      stop_requested.store(false);
+    }
+    int initial_pending = 0;
+    ASSERT_EQ(::ioctl(fd, FIONREAD, &initial_pending), 0);
+    ASSERT_EQ(initial_pending, kStaleBytes);
+
+    std::atomic<bool> observer_ready{false};
+    std::atomic<bool> drain_done{false};
+    bool saw_partial_drain = false;
+    std::thread stopper{[&] {
+      observer_ready.store(true, std::memory_order_release);
+      for (;;) {
+        int pending = initial_pending;
+        if (::ioctl(fd, FIONREAD, &pending) == 0 && pending < initial_pending) {
+          saw_partial_drain = pending > 0;
+          RequestStop();
+          return;
+        }
+        if (drain_done.load(std::memory_order_acquire)) {
+          RequestStop();
+          return;
+        }
+      }
+    }};
+
+    while (!observer_ready.load(std::memory_order_acquire)) {
+    }
+    const bool consumed = ConsumeStopWake();
+    drain_done.store(true, std::memory_order_release);
+    stopper.join();
+
+    ASSERT_TRUE(stop_requested.load());
+    // Whether the stop landed mid-drain (consumed == true) or right after the
+    // drain ended (consumed == false), StopFd() must be readable for every
+    // other watcher.
+    EXPECT_TRUE(Readable(fd))
+        << "stop wake lost (consumed=" << consumed
+        << ", saw_partial_drain=" << saw_partial_drain << ")";
+    EXPECT_TRUE(ConsumeStopWake());
+    EXPECT_TRUE(Readable(fd));
+
+    if (consumed && saw_partial_drain) {
+      observed_mid_drain = true;
+    }
+  }
+  EXPECT_TRUE(observed_mid_drain);
+
+  stop_requested.store(false);
+  EXPECT_FALSE(ConsumeStopWake());
+  EXPECT_FALSE(Readable(fd));
+}
+
+// First creation of the stop pipe (StopFd()) racing with a concurrent
+// RequestStop() from another thread must never lose the stop wake: StopFd()
+// must end up readable and ConsumeStopWake() must report true while keeping
+// it readable. Runs in a re-executed child so StopFd()'s static pipe is
+// created fresh inside the race.
+// REQ-OPS-06
+TEST(ProcessTest, ConcurrentRequestStopAndStopFdCreationLeavesStopFdReadable) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        std::atomic<int> ready{0};
+        int fd = -1;
+        std::thread creator{[&] {
+          ready.fetch_add(1, std::memory_order_acq_rel);
+          while (ready.load(std::memory_order_acquire) < 2) {
+          }
+          fd = StopFd();
+        }};
+        std::thread stopper{[&] {
+          ready.fetch_add(1, std::memory_order_acq_rel);
+          while (ready.load(std::memory_order_acquire) < 2) {
+          }
+          RequestStop();
+        }};
+        creator.join();
+        stopper.join();
+        const bool ok = stop_requested.load() && fd >= 0 && Readable(fd) &&
+                        ConsumeStopWake() && Readable(fd);
+        std::_Exit(ok ? 0 : 1);
+      },
+      ::testing::ExitedWithCode(0), "");
 }
 
 // A stop sent to a node the launcher started with the stop signals blocked

@@ -43,9 +43,11 @@ std::atomic<int> stop_write_fd{-1};
 static_assert(std::atomic<int>::is_always_lock_free);
 
 // Async-signal-safe: one write(2), errno kept. EAGAIN means the pipe is full,
-// and so already readable.
+// and so already readable. seq_cst pairs with CreateStopPipe()'s store to
+// stop_write_fd and RequestStop()'s exchange on stop_requested so StoreLoad
+// reordering cannot leave stop_requested true with an empty pipe.
 void WriteStopByte() noexcept {
-  const int fd = stop_write_fd.load(std::memory_order_acquire);
+  const int fd = stop_write_fd.load(std::memory_order_seq_cst);
   if (fd < 0) return;
   const int saved_errno = errno;
   const char byte = 1;
@@ -75,9 +77,9 @@ int CreateStopPipe() noexcept {
     }
   }
 #endif
-  stop_write_fd.store(fds[1], std::memory_order_release);
+  stop_write_fd.store(fds[1], std::memory_order_seq_cst);
   // A stop requested before the pipe existed set only the flag.
-  if (stop_requested.load()) WriteStopByte();
+  if (stop_requested.load(std::memory_order_seq_cst)) WriteStopByte();
   return fds[0];
 }
 
@@ -390,7 +392,7 @@ bool RealtimeRequested(bool simulation) noexcept {
 void RequestStop(int /*signal*/) noexcept {
   // Only the first request since the flag was clear writes, so repeated
   // signals cannot fill the pipe.
-  if (stop_requested.exchange(true)) return;
+  if (stop_requested.exchange(true, std::memory_order_seq_cst)) return;
   WriteStopByte();
 }
 
@@ -411,8 +413,13 @@ bool ConsumeStopWake() noexcept {
     }
   }
   // A byte read above whose stop was requested after the first load: its
-  // flag store came before its write, so this load sees it.
-  return stop_requested.load();
+  // flag store came before its write, so this load sees it. Put a wake byte
+  // back so StopFd() stays readable for every other watcher.
+  if (stop_requested.load()) {
+    WriteStopByte();
+    return true;
+  }
+  return false;
 }
 
 void InstallStopHandlers() {
