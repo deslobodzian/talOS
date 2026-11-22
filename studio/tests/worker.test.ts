@@ -216,6 +216,7 @@ test('a graph of another version is named, not shown', () => {
   text(socket, JSON.stringify(newer));
   advance(8);
   assert.equal(system!.graph, null, 'no liveness from a graph the page cannot read');
+  assert.equal(system!.stale, false, 'version mismatch must not mark the graph stale');
   assert.deepEqual(graphVersionMismatch(system!.error),
                    {bridge: SYSTEM_GRAPH_VERSION + 1, page: SYSTEM_GRAPH_VERSION});
   // The Agent tab answers as the headless agent does.
