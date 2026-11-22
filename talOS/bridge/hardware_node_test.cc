@@ -2193,6 +2193,69 @@ TEST(HardwareNodeTest, ExitSummaryReportsUdpGapsDecodeFailuresAndWouldBlock) {
   EXPECT_NE(output.find("send_would_block=0"), std::string::npos) << output;
 }
 
+// REQ-OPS-20: the bridge's exit summary prints each subsystem's count of
+// owner-timeout episodes (timeouts=) and whether it was silent at the last
+// Tick (timed_out=), leaving an unheard subsystem at timeouts=0 timed_out=0.
+TEST(HardwareNodeTest, ExitSummaryReportsOwnerTimeoutEpisodes) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                                   kStartUs - 500, ack_bytes.data(),
+                                   ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node)) << "no config ACK configured the bridge";
+    node.Tick(kStartUs - 500);
+  }
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 1000), kStartUs));
+
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+  constexpr uint64_t kRequestUs = kStartUs + 1'000;
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(kRequestUs);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.owner_timeouts("intake"), 0u);
+
+  // Keep the link fresh while intake goes silent past its owner timeout.
+  const uint64_t timeout_us = kRequestUs + owner_timeout_us + 1;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 2000),
+                          kRequestUs + owner_timeout_us));
+  node.Tick(timeout_us);
+  ASSERT_EQ(node.owner_timeouts("intake"), 1u);
+
+  process::stop_requested.store(true);
+  ::testing::internal::CaptureStdout();
+  const int exit_code = node.Run();
+  const std::string output = ::testing::internal::GetCapturedStdout();
+  process::stop_requested.store(false);
+
+  EXPECT_EQ(exit_code, 0) << output;
+  EXPECT_NE(
+      output.find(
+          "hardware_node: sub=intake requests=1 timeouts=1 timed_out=1\n"),
+      std::string::npos)
+      << output;
+  EXPECT_NE(
+      output.find(
+          "hardware_node: sub=drivetrain requests=0 timeouts=0 timed_out=0\n"),
+      std::string::npos)
+      << output;
+}
+
 // REQ-OPS-20 (TODO.md RT-17, RT-28): /hw/status carries the bridge's UDP
 // socket and incoming State loss counters (socket_send_failures_count,
 // socket_reopens_count, state_sequence_gaps_count, state_decode_failures_count,
