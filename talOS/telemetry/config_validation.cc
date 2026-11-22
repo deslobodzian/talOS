@@ -169,55 +169,56 @@ std::vector<LabelSpec> ParseLabelSpecs(const config::RobotConfig& config,
 
     const toml::node* channel_node = entry->get("channel");
     if (channel_node == nullptr) RefuseLabel(key, "channel", "is missing");
-    const auto channel = channel_node->value_exact<std::string>();
-    if (!channel) RefuseLabel(key, "channel", "must be a string");
-    if (channel->empty()) RefuseLabel(key, "channel", "is missing");
+    const auto channel_opt = channel_node->value_exact<std::string>();
+    if (!channel_opt) RefuseLabel(key, "channel", "must be a string");
+    const std::string& channel = *channel_opt;
+    if (channel.empty()) RefuseLabel(key, "channel", "is missing");
 
     const toml::node* from_node = entry->get("from");
     if (from_node == nullptr) RefuseLabel(key, "from", "is missing");
-    const auto from = from_node->value_exact<std::string>();
-    if (!from) RefuseLabel(key, "from", "must be a string");
-    if (from->empty()) RefuseLabel(key, "from", "is missing");
+    const auto from_opt = from_node->value_exact<std::string>();
+    if (!from_opt) RefuseLabel(key, "from", "must be a string");
+    const std::string& from = *from_opt;
+    if (from.empty()) RefuseLabel(key, "from", "is missing");
 
-    const std::size_t dot = from->find('.');
-    if (dot == 0 || dot == std::string::npos || dot + 1 == from->size()) {
-      RefuseLabel(key, "from", "'" + *from + "' is not <subsystem>.<key>");
+    const std::size_t dot = from.find('.');
+    if (dot == 0 || dot == std::string::npos || dot + 1 == from.size()) {
+      RefuseLabel(key, "from", "'" + from + "' is not <subsystem>.<key>");
     }
-    const std::string src_subsystem = from->substr(0, dot);
-    const std::string src_key = from->substr(dot + 1);
+    const std::string src_subsystem = from.substr(0, dot);
+    const std::string src_key = from.substr(dot + 1);
 
     const toml::table* src_table = config.GetSubsystemTable(src_subsystem);
     if (src_table == nullptr) {
       RefuseLabel(key, "from",
-                  "'" + *from + "': no [subsystems." + src_subsystem +
+                  "'" + from + "': no [subsystems." + src_subsystem +
                       "] in the config");
     }
     const toml::node_view<const toml::node> src_val =
         src_table->at_path(src_key);
     if (!src_val) {
       RefuseLabel(key, "from",
-                  "'" + *from + "': parameter '" + src_key + "' is missing");
+                  "'" + from + "': parameter '" + src_key + "' is missing");
     }
     const toml::array* src_array = src_val.as_array();
     if (src_array == nullptr) {
-      RefuseLabel(key, "from", "'" + *from + "': must be an array of strings");
+      RefuseLabel(key, "from", "'" + from + "': must be an array of strings");
     }
     std::vector<std::string> labels;
     labels.reserve(src_array->size());
     for (const toml::node& element : *src_array) {
       const auto text = element.value_exact<std::string>();
       if (!text) {
-        RefuseLabel(key, "from",
-                    "'" + *from + "': must be an array of strings");
+        RefuseLabel(key, "from", "'" + from + "': must be an array of strings");
       }
       labels.push_back(*text);
     }
     if (labels.empty()) {
-      RefuseLabel(key, "from", "'" + *from + "' holds no labels");
+      RefuseLabel(key, "from", "'" + from + "' holds no labels");
     }
     if (labels.size() > telemetry_wire::kMaxEnumLabels) {
       RefuseLabel(key, "from",
-                  "'" + *from + "' holds " + std::to_string(labels.size()) +
+                  "'" + from + "' holds " + std::to_string(labels.size()) +
                       " labels, over the " +
                       std::to_string(telemetry_wire::kMaxEnumLabels) +
                       "-label limit");
@@ -226,7 +227,7 @@ std::vector<LabelSpec> ParseLabelSpecs(const config::RobotConfig& config,
       if (label.size() > telemetry_wire::kMaxDictionaryStringBytes) {
         RefuseLabel(
             key, "from",
-            "'" + *from + "' holds a label of " + std::to_string(label.size()) +
+            "'" + from + "' holds a label of " + std::to_string(label.size()) +
                 " bytes, over the " +
                 std::to_string(telemetry_wire::kMaxDictionaryStringBytes) +
                 "-byte dictionary string limit");
@@ -240,7 +241,7 @@ std::vector<LabelSpec> ParseLabelSpecs(const config::RobotConfig& config,
     if (hooks.on_from_string_list) {
       hooks.on_from_string_list(src_subsystem, src_key);
     }
-    specs.push_back(LabelSpec{key, *channel, std::move(labels)});
+    specs.push_back(LabelSpec{key, channel, std::move(labels)});
   }
   return specs;
 }
