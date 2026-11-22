@@ -108,6 +108,48 @@ TEST(TrajectoryTest, HermiteSamplingIsExactForACubic) {
   EXPECT_EQ(trajectory.samples()[1].ax_mps2, 0.0);
 }
 
+// Guards: Hermite sampling over an interval so short that dt * dt underflows
+// to zero (or derivatives overflow) falls back to finite linear interpolation
+// with zero acceleration instead of producing 0/0 = NaN or inf.
+TEST(TrajectoryTest, HermiteTinyDtDoesNotProduceNaNOrInf) {
+  std::vector<TrajectorySample> samples(2);
+  samples[0].t_s = 0.0;
+  samples[0].x_m = 1.0;
+  samples[0].y_m = 2.0;
+  samples[0].heading_rad = 0.5;
+  samples[0].vx_mps = 1.0;
+  samples[0].vy_mps = -0.5;
+  samples[0].omega_radps = 0.25;
+  samples[1].t_s = 1e-200;
+  samples[1].x_m = 1.0;  // p0 == p1 triggers 0/0 when dt*dt == 0
+  samples[1].y_m = 3.0;  // p0 != p1 triggers nonzero/0 when dt*dt == 0
+  samples[1].heading_rad = 0.5;
+  samples[1].vx_mps = 3.0;
+  samples[1].vy_mps = 0.5;
+  samples[1].omega_radps = 0.75;
+
+  const Trajectory trajectory{samples, Interpolation::kHermite};
+  for (const double u : {0.25, 0.5, 0.75}) {
+    SCOPED_TRACE(u);
+    const TrajectorySample s = trajectory.sample(u * samples[1].t_s);
+    EXPECT_TRUE(std::isfinite(s.x_m));
+    EXPECT_TRUE(std::isfinite(s.y_m));
+    EXPECT_TRUE(std::isfinite(s.heading_rad));
+    EXPECT_TRUE(std::isfinite(s.vx_mps));
+    EXPECT_TRUE(std::isfinite(s.vy_mps));
+    EXPECT_TRUE(std::isfinite(s.omega_radps));
+    EXPECT_TRUE(std::isfinite(s.ax_mps2));
+    EXPECT_TRUE(std::isfinite(s.ay_mps2));
+    EXPECT_TRUE(std::isfinite(s.alpha_radps2));
+    EXPECT_NEAR(s.x_m, 1.0, 1e-12);
+    EXPECT_NEAR(s.y_m, 2.0 + u, 1e-12);
+    EXPECT_NEAR(s.vx_mps, 1.0 + 2.0 * u, 1e-12);
+    EXPECT_EQ(s.ax_mps2, 0.0);
+    EXPECT_EQ(s.ay_mps2, 0.0);
+    EXPECT_EQ(s.alpha_radps2, 0.0);
+  }
+}
+
 // Guards: a heading stored wrapped (3.0 then -3.0 rad) is interpolated the
 // short way through pi, never back through 0, in both interpolation modes,
 // and is returned continuous (not wrapped), as Choreo writes headings.
