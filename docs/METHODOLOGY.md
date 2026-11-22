@@ -257,7 +257,11 @@ Rules:
   on arrival or publish time, and call wpimath's time-taking entry points
   (`UpdateWithTime`/`updateWithTime`), never `Update()`/`update()`, which read
   WPILib's own clock. **[review]**
-- No randomness in decisions. Telemetry stream ids are the one exception. **[review]**
+- No randomness in decisions. Telemetry stream ids are the one exception.
+  **[enforced (except `std::random_device`, which telemetry's `RandomStreamId`
+  uses): `tools/lint_test_time.py` over the node packages under `bench/`,
+  `examples/` and `tools/scaffold_testdata/` and the framework nodes,
+  `talOS/teleop` and `talOS/telemetry`]**
 - **Tune offline on recorded inputs.** A node's output is a function of its
   inputs and their times, so a new or changed node (an estimator, a vision
   filter) is tuned against a recorded match with
