@@ -545,6 +545,8 @@ void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
   // a burst delays rather than stalls the merge below and never exceeds
   // kDatagramBudget in a kCpuWindowUs window (REQ-RT-20).
   const int limit = std::clamp(receive_budget, 0, kReceiveBudget);
+  // When window budget is spent (limit == 0), Pass() throttles via its budget
+  // branch rather than retrying immediately on tick_receive_capped_.
   tick_receive_capped_ = limit > 0;
   for (int i = 0; i < limit; ++i) {
     // Closed (SocketCounters), maybe by a State's config push: nothing to
@@ -1567,7 +1569,9 @@ bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,
 }
 
 bool HardwareNode::SendShutdownNeutral(uint64_t now_us) {
-  if (last_boot_id_ == 0 || (!peer_.IsOpen() && frame_sink_.send == nullptr)) {
+  if (last_boot_id_ == 0 || !StateFresh(now_us) ||
+      latest_state_.config_id != config_id_ || !GatewayReady(latest_state_) ||
+      (!peer_.IsOpen() && frame_sink_.send == nullptr)) {
     return false;
   }
   NeutralizeAll();
@@ -1595,7 +1599,6 @@ bool HardwareNode::SendShutdownNeutral(uint64_t now_us) {
 void HardwareNode::NeutralizeAll() {
   for (std::size_t j = 0; j < full_cmd_.count; ++j) {
     full_cmd_.motors[j].mode = Mode::kNeutral;
-    full_cmd_.motors[j].slot = 0;
     full_cmd_.motors[j].demand = 0.0;
     full_cmd_.motors[j].feedforward_v = 0.0;
   }

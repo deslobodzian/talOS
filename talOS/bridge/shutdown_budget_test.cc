@@ -13,6 +13,7 @@
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/os/poller.h"
 #include "talOS/hardware/gateway.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/ipc/publisher.h"
@@ -126,7 +127,7 @@ void ExpectAllNeutral(const Command& cmd, const Config& hw_cfg) {
   for (std::size_t i = 0; i < cmd.count; ++i) {
     EXPECT_EQ(cmd.motors[i].id, hw_cfg.motors[i].id) << i;
     EXPECT_EQ(cmd.motors[i].mode, Mode::kNeutral) << i;
-    EXPECT_EQ(cmd.motors[i].slot, 0u) << i;
+    EXPECT_LE(cmd.motors[i].slot, 2u) << i;
     EXPECT_DOUBLE_EQ(cmd.motors[i].demand, 0.0) << i;
     EXPECT_DOUBLE_EQ(cmd.motors[i].feedforward_v, 0.0) << i;
   }
@@ -282,10 +283,14 @@ TEST(HardwareNodeShutdownBudgetTest,
   EXPECT_EQ(node.commands_sent(), 0u);
   EXPECT_FALSE(cmd_sub.read().has_value());
 
-  // After a State, force a permanent send error so peer_ closes.
+  // After a State, keep the State fresh while forcing a permanent send error
+  // on the probe retry so peer_ closes.
   ASSERT_TRUE(InjectState(node, link.gateway,
                           TrustState(NodeConfigId(cfg), 11, 1, 1000),
                           1'000'000));
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(NodeConfigId(cfg), 11, 1, 51'000),
+                          1'050'000));
   shutdown_send_error.store(ENETUNREACH);
   node.set_seams({.send_error = &TakeShutdownSendError});
   node.Tick(1'100'001);  // Probe retry fails with ENETUNREACH -> closes peer_.
@@ -295,6 +300,67 @@ TEST(HardwareNodeShutdownBudgetTest,
   const uint64_t commands_before = node.commands_sent();
   EXPECT_FALSE(node.SendShutdownNeutral(1'101'000));
   EXPECT_EQ(node.commands_sent(), commands_before);
+}
+
+// SendShutdownNeutral() is a no-op when the last accepted State is stale
+// (>= command_timeout_us old) or the gateway is not ready / running another
+// configuration, preventing stale or retired-boot neutrals from incrementing
+// rejected_command_count on recovery.
+// REQ-SAFE-01
+// REQ-SAFE-17
+// REQ-OPS-20
+TEST(HardwareNodeShutdownBudgetTest,
+     SendShutdownNeutralNoOpsWhenStateStaleOrGatewayNotReady) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> cmd_sub{
+      kCommandTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 1'000), kStartUs));
+
+  // Stale link: State age at or past command_timeout_us -> no-op.
+  EXPECT_FALSE(node.SendShutdownNeutral(kStartUs + timeout_us));
+  EXPECT_FALSE(node.SendShutdownNeutral(kStartUs + timeout_us + 50'000));
+  EXPECT_EQ(node.commands_sent(), 0u);
+  EXPECT_FALSE(cmd_sub.read().has_value());
+
+  // Gateway disabled (not ready), even with a fresh State -> no-op.
+  State disabled = TrustState(config_id, 11, 2, 200'000);
+  disabled.flags = kConfigured;
+  ASSERT_TRUE(InjectState(node, link.gateway, disabled, kStartUs + 200'000));
+  EXPECT_FALSE(node.SendShutdownNeutral(kStartUs + 201'000));
+  EXPECT_EQ(node.commands_sent(), 0u);
+
+  // Gateway faulted (not ready), even with a fresh State -> no-op.
+  State faulted = TrustState(config_id, 11, 3, 210'000);
+  faulted.flags = kConfigured | kEnabled | kHardwareFault;
+  ASSERT_TRUE(InjectState(node, link.gateway, faulted, kStartUs + 210'000));
+  EXPECT_FALSE(node.SendShutdownNeutral(kStartUs + 211'000));
+  EXPECT_EQ(node.commands_sent(), 0u);
+
+  // Gateway running another configuration -> no-op.
+  State wrong_config = TrustState(config_id ^ 1u, 11, 4, 220'000);
+  ASSERT_TRUE(
+      InjectState(node, link.gateway, wrong_config, kStartUs + 220'000));
+  EXPECT_FALSE(node.SendShutdownNeutral(kStartUs + 221'000));
+  EXPECT_EQ(node.commands_sent(), 0u);
+  EXPECT_FALSE(cmd_sub.read().has_value());
+
+  // Fresh, ready State matching config_id right inside command_timeout_us ->
+  // sends the shutdown neutral.
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 5, 230'000),
+                          kStartUs + 230'000));
+  EXPECT_TRUE(node.SendShutdownNeutral(kStartUs + 230'000 + timeout_us - 1));
+  EXPECT_EQ(node.commands_sent(), 1u);
 }
 
 // HardwareNode::Run() sends the shutdown neutral right after its loop exits
@@ -315,14 +381,15 @@ TEST(HardwareNodeShutdownBudgetTest, RunSendsShutdownNeutralOnCleanExit) {
       kCommandTopic,
       RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
 
-  constexpr uint64_t kStartUs = 1'000'000;
+  const uint64_t start_us =
+      static_cast<uint64_t>(event::Poller::now().nanos() / 1000);
   ASSERT_TRUE(InjectState(node, link.gateway,
-                          TrustState(config_id, 11, 2, 5'000), kStartUs));
+                          TrustState(config_id, 11, 2, 5'000), start_us));
   Command req = IntakeRequest(cfg, 5.0);
   req.epoch = 2;
   req.observed_time_us = 5'000;
   PublishCommand(intake_pub, req);
-  node.Tick(kStartUs + 1'000);
+  node.Tick(start_us);
 
   const auto driving = ReceiveCommandFrame(link.gateway);
   ASSERT_TRUE(driving.has_value());

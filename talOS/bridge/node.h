@@ -173,10 +173,12 @@ class HardwareNode {
   // Neutralizes every actuator in full_cmd_, stamps it with the latest
   // observed gateway identity and sample time, and sends it to the gateway
   // (and publishes it on /hw/command if open). Returns true when a shutdown
-  // neutral command was sent, false when no gateway boot has been observed or
-  // no transport is open or the send failed. Called by Run() right after its
-  // loop exits (before CloseWaits()) and exposed for deterministic unit tests
-  // (REQ-SAFE-01, REQ-OPS-20).
+  // neutral command was sent, false when no fresh ready State matching
+  // config_id_ has been observed (StateFresh && GatewayReady), no transport is
+  // open, or the send failed — avoiding stale or retired-boot neutrals that
+  // would increment rejected_command_count (REQ-SAFE-17). Called by Run() right
+  // after its loop exits (before CloseWaits()) and exposed for deterministic
+  // unit tests (REQ-SAFE-01, REQ-OPS-20).
   bool SendShutdownNeutral(uint64_t now_us);
 
   // Run()'s waits. OpenWaits() builds the poller and watches the UDP socket,
@@ -528,7 +530,7 @@ class HardwareNode {
   uint64_t next_introspection_us_{0};
   uint64_t next_liveness_us_{0};
   // What the last Tick did: datagrams it received, requests it read, and
-  // whether it stopped at kReceiveBudget rather than an empty socket.
+  // whether it stopped at its receive cap rather than an empty socket.
   uint32_t tick_datagrams_{0};
   uint32_t tick_requests_{0};
   bool tick_receive_capped_{false};
