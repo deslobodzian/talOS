@@ -15,6 +15,7 @@
 #include <pty.h>
 #endif
 #include <pthread.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -195,17 +196,38 @@ Forked ForkLauncher(const LauncherOptions& options, int output, int reader = -1,
   return {pid, events[0]};
 }
 
+// Waits for `fd` to become readable or hit EOF, up to `timeout_ms`. Uses
+// select() when `fd` fits in FD_SETSIZE because macOS's poll() on an
+// O_NONBLOCK FIFO can miss wakeups while a large write() refills the FIFO.
+bool WaitReadable(int fd, int timeout_ms) {
+  for (;;) {
+    if (fd >= 0 && fd < FD_SETSIZE) {
+      fd_set rfds;
+      FD_ZERO(&rfds);
+      FD_SET(fd, &rfds);
+      timeval tv{};
+      tv.tv_sec = timeout_ms / 1000;
+      tv.tv_usec = static_cast<decltype(tv.tv_usec)>(timeout_ms % 1000) * 1000;
+      const int ready = ::select(fd + 1, &rfds, nullptr, nullptr, &tv);
+      if (ready < 0 && errno == EINTR) continue;
+      return ready > 0;
+    }
+    ::pollfd ready{fd, POLLIN, 0};
+    const int polled = ::poll(&ready, 1, timeout_ms);
+    if (polled < 0 && errno == EINTR) continue;
+    return polled > 0;
+  }
+}
+
 // Reads `fd` into `seen` until `want` appears in it. False when `fd` ends,
 // or stays silent for kHangMs, first.
 bool AwaitText(int fd, std::string& seen, std::string_view want) {
   while (seen.find(want) == std::string::npos) {
-    ::pollfd ready{fd, POLLIN, 0};
-    const int polled = ::poll(&ready, 1, kHangMs);
-    if (polled < 0 && errno == EINTR) continue;
-    if (polled <= 0) return false;
+    if (!WaitReadable(fd, kHangMs)) return false;
     char buffer[4096];
     const ssize_t got = ::read(fd, buffer, sizeof buffer);
-    if (got < 0 && errno == EINTR) continue;
+    if (got < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+      continue;
     if (got <= 0) return false;
     seen.append(buffer, static_cast<std::size_t>(got));
   }
@@ -215,13 +237,11 @@ bool AwaitText(int fd, std::string& seen, std::string_view want) {
 // Reads `fd` until it ends. False when it stays silent for kHangMs first.
 bool AwaitEnd(int fd, std::string& seen) {
   for (;;) {
-    ::pollfd ready{fd, POLLIN, 0};
-    const int polled = ::poll(&ready, 1, kHangMs);
-    if (polled < 0 && errno == EINTR) continue;
-    if (polled <= 0) return false;
+    if (!WaitReadable(fd, kHangMs)) return false;
     char buffer[4096];
     const ssize_t got = ::read(fd, buffer, sizeof buffer);
-    if (got < 0 && errno == EINTR) continue;
+    if (got < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+      continue;
     if (got <= 0) return true;
     seen.append(buffer, static_cast<std::size_t>(got));
   }
@@ -843,13 +863,11 @@ bool WriteAllFd(int fd, std::string_view bytes) {
 // Reads `fd` into `seen` until `seen.size() >= want_bytes`, EOF, or kHangMs.
 bool AwaitSize(int fd, std::string& seen, std::size_t want_bytes) {
   while (seen.size() < want_bytes) {
-    ::pollfd ready{fd, POLLIN, 0};
-    const int polled = ::poll(&ready, 1, kHangMs);
-    if (polled < 0 && errno == EINTR) continue;
-    if (polled <= 0) return false;
+    if (!WaitReadable(fd, kHangMs)) return false;
     char buffer[4096];
     const ssize_t got = ::read(fd, buffer, sizeof buffer);
-    if (got < 0 && errno == EINTR) continue;
+    if (got < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+      continue;
     if (got <= 0) return false;
     seen.append(buffer, static_cast<std::size_t>(got));
   }
