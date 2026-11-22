@@ -266,8 +266,10 @@ class SimulatedEventLoop
   // one instant before it throws std::runtime_error: a handler that
   // publishes on a prompt watcher of its own loop, or on a backlogged one,
   // directly or through another of its handlers, at every delivery would
-  // otherwise never let simulated time advance. A legitimate backlog needs a
-  // few (a full ring is 16 drains of 64).
+  // otherwise never let simulated time advance. A legitimate backlog needs at
+  // most one full ring plus a confirming pass — `(MAX_SLOTS - 1) / 64 + 2`
+  // (17) drains at the default cap of 64; before a timer, run_until() also
+  // caps its pre-timer catch-up drain at that same pass bound.
   static constexpr std::size_t kMaxWokenDrainsPerInstant = 1000;
 
   // A stopped process's clock advances without draining or firing timers.
@@ -351,8 +353,19 @@ class SimulatedEventLoop
           drain_messages(expiration.deadline);
           continue;
         }
-        // Under every delivery, as on the realtime loop.
-        drain_messages(expiration.deadline);
+        // Under every delivery, as on the realtime loop: repeat bounded
+        // sequence drains (up to one full ring plus one confirming pass)
+        // before dispatch_timer so update() + Flush() never actuate on stale
+        // state while a flooded topic still cannot starve timers.
+        const std::size_t max_passes =
+            options_.max_messages_per_tick == 0
+                ? 1
+                : (MAX_SLOTS - 1) / options_.max_messages_per_tick + 2;
+        for (std::size_t pass = 0; pass < max_passes; ++pass) {
+          if (!drain_messages(expiration.deadline) || !this->running_state()) {
+            break;
+          }
+        }
         if (!this->running_state()) break;
         this->dispatch_timer(expiration.id, expiration.deadline, now_,
                              expiration.cycles);
@@ -460,12 +473,17 @@ class SimulatedEventLoop
   // a dispatch from its publication, so its event time is its publication
   // time. A watcher that is not prompt keeps the drain's time.
   //
-  // As on the realtime loop, a drain that stops at max_messages_per_tick on
-  // a watcher that redrains() sets backlog_, which makes the loop due again
+  // Returns true when any sequence watcher stopped at max_messages_per_tick.
+  // Before a timer dispatch, run_until() repeats the drain up to one full ring
+  // plus one confirming pass so a burst past the per-drain cap is drained
+  // before the timer runs while a flooded topic still cannot starve timers. As
+  // on the realtime loop, a drain that stops at max_messages_per_tick on a
+  // watcher that redrains() also sets backlog_, which makes the loop due again
   // at now (next_deadline, run_until).
-  void drain_messages(MonotonicTime tick_deadline, bool woken = false) {
+  bool drain_messages(MonotonicTime tick_deadline, bool woken = false) {
     ++drains_;
     backlog_ = false;
+    bool capped = false;
     auto& sources = this->sources();
 
     for (std::size_t id = 0; id < sources.size(); ++id) {
@@ -501,15 +519,19 @@ class SimulatedEventLoop
             sequence, dropped, sources[id].buffer, published);
 
         if (!this->running()) {
-          return;
+          return false;
         }
         if (sources[id].latest_only) break;
       }
-      if (drained == options_.max_messages_per_tick &&
-          redrains(static_cast<std::uint16_t>(id))) {
-        backlog_ = true;
+      if (!sources[id].latest_only && options_.max_messages_per_tick > 0 &&
+          drained == options_.max_messages_per_tick) {
+        capped = true;
+        if (redrains(static_cast<std::uint16_t>(id))) {
+          backlog_ = true;
+        }
       }
     }
+    return capped;
   }
 
   // Whether a drain that stops at the cap on watcher `id` is followed at

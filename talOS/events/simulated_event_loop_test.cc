@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -590,6 +591,100 @@ TEST(SimulatedEventLoop, ExitStopsTheLoop) {
 
   loop.run_for(100ms);
   EXPECT_EQ(calls, 3);
+}
+
+// A sequence watcher (such as HardwareLink on /hw/state) with more than
+// max_messages_per_tick (64) messages queued before a timer fires must be
+// drained completely before the timer callback runs, matching
+// RealtimeEventLoop.
+// REQ-SAFE-01
+// REQ-RT-04
+TEST(SimulatedEventLoop, TimerDrainsFullSequenceBacklogBeforeDispatching) {
+  constexpr int kQueued = 80;  // over max_messages_per_tick (64), under ring
+  for (const auto delivery :
+       {Delivery::POLL, Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
+    SimulationEnvironment environment;
+    SimulatedEventLoop<> loop{environment};
+    loop.set_delivery(delivery);
+    if (delivery == Delivery::ON_PUBLISH) {
+      loop.set_prompt(WatchSensor(loop, "/wake", Thunk{}));
+    }
+
+    int received = 0;
+    std::int32_t last_value = 0;
+    auto on_message = [&](const Context&, std::span<const std::byte> bytes) {
+      ASSERT_EQ(bytes.size(), sizeof(Sensor));
+      Sensor message{};
+      std::memcpy(&message, bytes.data(), sizeof(message));
+      last_value = message.sensor_id();
+      ++received;
+    };
+    WatchSensor(loop, "/backlog", make_thunk(&on_message));
+
+    int observed_count = 0;
+    std::int32_t observed_value = 0;
+    auto on_timer = [&](const Context&) {
+      observed_count = received;
+      observed_value = last_value;
+      loop.exit();
+    };
+    const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+    loop.arm_timer(timer_id, MonotonicTime{} + 1ms, Duration::zero());
+
+    for (int i = 1; i <= kQueued; ++i) {
+      loop.inject("/backlog", Sensor{i, 0.0F, 0.0F});
+    }
+
+    loop.run_for(5ms);
+    EXPECT_EQ(observed_count, kQueued);
+    EXPECT_EQ(observed_value, kQueued);
+  }
+}
+
+// Pre-timer backlog draining stays bounded under continuous self-flooding so
+// the timer still fires after (MAX_SLOTS - 1) / max_messages_per_tick + 2
+// passes, matching RealtimeEventLoop (RULES.md 3).
+// REQ-RT-04
+TEST(SimulatedEventLoop, PreTimerBacklogDrainIsBoundedUnderFlood) {
+  constexpr std::size_t kCap = 16;
+  constexpr std::size_t kMaxPasses = (MAX_SLOTS - 1) / kCap + 2;
+  constexpr std::size_t kExpectedMaxDrained = kMaxPasses * kCap;
+  constexpr std::size_t kSafetyCap = MAX_SLOTS * 4;
+
+  SimulationEnvironment environment;
+  SimulatedEventLoop<>::Options options;
+  options.max_messages_per_tick = kCap;
+  options.delivery = Delivery::BEFORE_TIMERS;
+
+  SimulatedEventLoop<> loop{environment, options};
+  const std::uint16_t sender = SendSensor(loop, "/flood");
+  std::size_t delivered = 0;
+  auto on_message = [&](const Context&, std::span<const std::byte>) {
+    ++delivered;
+    if (delivered < kSafetyCap) {
+      Send(loop, sender, static_cast<int>(delivered));
+    }
+  };
+  WatchSensor(loop, "/flood", make_thunk(&on_message));
+
+  bool timer_fired = false;
+  std::size_t delivered_before_timer = 0;
+  auto on_timer = [&](const Context&) {
+    timer_fired = true;
+    delivered_before_timer = delivered;
+    loop.exit();
+  };
+  const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+  loop.arm_timer(timer_id, MonotonicTime{} + 1ms, Duration::zero());
+
+  loop.inject("/flood", Sensor{0, 0.0F, 0.0F});
+  loop.run_for(5ms);
+
+  EXPECT_TRUE(timer_fired);
+  EXPECT_EQ(loop.drains(), kMaxPasses);
+  EXPECT_EQ(delivered_before_timer, kExpectedMaxDrained);
+  EXPECT_EQ(delivered, kExpectedMaxDrained);
 }
 
 }  // namespace

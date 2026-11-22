@@ -332,8 +332,13 @@ what it drains by publication time. Subscriptions without per-message
 callbacks dispatch only the newest available message, counting skipped
 messages as dropped;
 callback subscriptions retain sequence delivery, capped at 64 messages per
-topic per drain; a drain that stops at the cap is followed at once by another,
-for a waking topic and a `kAtDrain` callback alike, with due timers between.
+topic per drain (`max_messages_per_tick`). Before dispatching a due timer, the
+event loop repeats bounded sequence drains up to
+`(slots - 1) / max_messages_per_tick + 2` passes (one full ring plus one
+confirming pass), so a queued burst is caught up before `update()` runs while
+a continuously flooded topic stays bounded; between timers, a drain that stops
+at the cap is followed at once by another, for a waking topic and a `kAtDrain`
+callback alike, with due timers between.
 Each realtime timer dispatch samples its own clock. Simulation and replay
 preserve publication-age semantics.
 Simulated topics retain RTMS's

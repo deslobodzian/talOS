@@ -1232,7 +1232,7 @@ TEST(RealtimeEventLoop, TimerDrainsFullSequenceBacklogBeforeDispatching) {
 TEST(RealtimeEventLoop, PreTimerBacklogDrainIsBoundedUnderFlood) {
   constexpr std::size_t kSlots = 128;
   constexpr std::size_t kCap = 16;
-  constexpr std::size_t kMaxPasses = (kSlots + kCap - 1) / kCap + 1;
+  constexpr std::size_t kMaxPasses = (kSlots - 1) / kCap + 2;
   constexpr std::size_t kExpectedMaxDrained = kMaxPasses * kCap;
   constexpr std::size_t kSafetyCap = kSlots * 4;
 
@@ -1278,8 +1278,9 @@ TEST(RealtimeEventLoop, PreTimerBacklogDrainIsBoundedUnderFlood) {
 
   loop.run_for(kHangBound);  // Bound only; on_timer exits.
   EXPECT_TRUE(timer_fired);
-  EXPECT_GE(delivered_before_timer, kSlots);
-  EXPECT_LE(delivered_before_timer, kExpectedMaxDrained);
+  EXPECT_EQ(loop.activity().drains, kMaxPasses);
+  EXPECT_EQ(delivered_before_timer, kExpectedMaxDrained);
+  EXPECT_EQ(delivered, kExpectedMaxDrained);
 }
 
 }  // namespace
