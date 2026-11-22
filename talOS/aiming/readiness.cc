@@ -7,13 +7,20 @@
 namespace talos::aiming {
 namespace {
 
-// Written so that NaN fails: !(|x| <= limit).
-bool Within(double value, double limit) { return std::abs(value) <= limit; }
+// Written so that NaN and +-inf measurements fail even against an infinite
+// speed limit, and non-finite tolerances fail even for direct CheckReadiness()
+// callers.
+bool Within(double value, double limit, bool allow_infinite_limit = false) {
+  return std::isfinite(value) &&
+         (allow_infinite_limit || std::isfinite(limit)) &&
+         std::abs(value) <= limit;
+}
 
-void RequireLimit(double value, const char* key) {
-  if (!(value >= 0.0)) {
-    throw std::invalid_argument(std::string("aiming: ") + key +
-                                " must be >= 0");
+void RequireLimit(double value, const char* key, bool allow_infinity) {
+  if (!(value >= 0.0) || (!allow_infinity && !std::isfinite(value))) {
+    throw std::invalid_argument(
+        std::string("aiming: ") + key +
+        (allow_infinity ? " must be >= 0" : " must be finite and >= 0"));
   }
 }
 
@@ -59,10 +66,12 @@ ReadinessReason CheckReadiness(const ReadinessInput& input,
   if (!input.converged) return ReadinessReason::kNotConverged;
   if (!input.in_range) return ReadinessReason::kOutOfRange;
   if (!input.turret_reachable) return ReadinessReason::kTurretLimit;
-  if (!Within(input.robot_speed_mps, limits.max_robot_speed_mps)) {
+  if (!Within(input.robot_speed_mps, limits.max_robot_speed_mps,
+              /*allow_infinite_limit=*/true)) {
     return ReadinessReason::kRobotTooFast;
   }
-  if (!Within(input.robot_omega_radps, limits.max_robot_omega_radps)) {
+  if (!Within(input.robot_omega_radps, limits.max_robot_omega_radps,
+              /*allow_infinite_limit=*/true)) {
     return ReadinessReason::kRobotRotatingTooFast;
   }
   if (!Within(input.aim_error_rad, limits.aim_tolerance_rad)) {
@@ -81,11 +90,16 @@ ReadinessGate::ReadinessGate(const ReadinessLimits& limits) : limits_(limits) {
   if (limits.max_pose_age_us <= 0) {
     throw std::invalid_argument("aiming: max_pose_age_us must be > 0");
   }
-  RequireLimit(limits.aim_tolerance_rad, "aim_tolerance_rad");
-  RequireLimit(limits.flywheel_tolerance_rps, "flywheel_tolerance_rps");
-  RequireLimit(limits.hood_tolerance_rad, "hood_tolerance_rad");
-  RequireLimit(limits.max_robot_speed_mps, "max_robot_speed_mps");
-  RequireLimit(limits.max_robot_omega_radps, "max_robot_omega_radps");
+  RequireLimit(limits.aim_tolerance_rad, "aim_tolerance_rad",
+               /*allow_infinity=*/false);
+  RequireLimit(limits.flywheel_tolerance_rps, "flywheel_tolerance_rps",
+               /*allow_infinity=*/false);
+  RequireLimit(limits.hood_tolerance_rad, "hood_tolerance_rad",
+               /*allow_infinity=*/false);
+  RequireLimit(limits.max_robot_speed_mps, "max_robot_speed_mps",
+               /*allow_infinity=*/true);
+  RequireLimit(limits.max_robot_omega_radps, "max_robot_omega_radps",
+               /*allow_infinity=*/true);
   if (limits.settle_tick_count < 1) {
     throw std::invalid_argument("aiming: settle_tick_count must be >= 1");
   }

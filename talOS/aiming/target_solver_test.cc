@@ -275,6 +275,30 @@ TEST(TargetSolverStatic, InvalidInputsAndDegenerateGeometry) {
   EXPECT_FALSE(
       turret.SolveStatic(Pose(0.0, 0.0, 0.0), Eigen::Vector2d(3.0, 0.0), nan)
           .valid);
+
+  // Huge finite targets or velocities whose distance or virtual target
+  // overflows to +inf are rejected rather than returned valid with distance_m
+  // == +inf.
+  for (const TargetSolver* solver : {&centred, &left, &turret}) {
+    const Solution huge_target =
+        solver->SolveStatic(Pose(0.0, 0.0, 0.0), Eigen::Vector2d(1e200, 1e200));
+    EXPECT_FALSE(huge_target.valid);
+    EXPECT_EQ(huge_target.distance_m, 0.0);
+
+    const Solution overflow_virtual = solver->SolveWithFieldVelocity(
+        Pose(0.0, 0.0, 0.0), FieldTwist{-1e308, 0.0, 0.0},
+        Eigen::Vector2d(1e308, 0.0));
+    EXPECT_FALSE(overflow_virtual.valid);
+    EXPECT_EQ(overflow_virtual.distance_m, 0.0);
+  }
+
+  // A turret target directly behind with y == -0.0 still reports shot_heading
+  // in (-pi, pi] (+pi, not -pi).
+  const Solution behind_neg_zero =
+      turret.SolveStatic(Pose(0.0, 0.0, 0.0), Eigen::Vector2d(-3.0, -0.0));
+  ASSERT_TRUE(behind_neg_zero.valid);
+  EXPECT_GT(behind_neg_zero.shot_heading_rad, 0.0);
+  EXPECT_NEAR(behind_neg_zero.shot_heading_rad, kPi, kTight);
 }
 
 // a target beyond the table is solved but flagged out of range.

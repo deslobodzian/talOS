@@ -111,7 +111,14 @@ class InterpolatingTable {
   std::size_t size() const { return count_; }
   double min_key() const { return rows_[0].key; }
   double max_key() const { return rows_[count_ - 1].key; }
-  const Row& row(std::size_t index) const { return rows_.at(index); }
+  const Row& row(std::size_t index) const {
+    if (index >= count_) {
+      throw std::out_of_range("interpolating table: row index " +
+                              std::to_string(index) + " out of range (" +
+                              std::to_string(count_) + ")");
+    }
+    return rows_[index];
+  }
 
   // Linear interpolation between the bracketing rows; exact at a row's key.
   // O(log n), no allocation.
@@ -129,7 +136,11 @@ class InterpolatingTable {
                          [](double k, const Row& row) { return k < row.key; });
     const Row& hi = *upper;
     const Row& lo = *(upper - 1);
-    const double fraction = (key - lo.key) / (hi.key - lo.key);
+    const double span = hi.key - lo.key;
+    const double fraction =
+        std::isfinite(span)
+            ? (key - lo.key) / span
+            : (key * 0.5 - lo.key * 0.5) / (hi.key * 0.5 - lo.key * 0.5);
     Lookup out;
     out.in_range = true;
     for (std::size_t i = 0; i < kValueCount; ++i) {

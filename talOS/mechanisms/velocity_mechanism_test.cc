@@ -28,6 +28,14 @@
 #include "talOS/node/testing.h"
 
 namespace talos::mechanisms {
+namespace detail {
+double StepSpinDown(double goal_rps, double previous_rps, double max_rps,
+                    double spin_down_rps2, double dt_s);
+bool StepVelocityReadiness(bool was_at_speed, int& entry_ticks,
+                           double velocity_rps, double goal_rps,
+                           double entry_rps, double exit_rps,
+                           int entry_tick_count, bool velocity_recent);
+}  // namespace detail
 namespace {
 
 using namespace std::chrono_literals;
@@ -284,6 +292,46 @@ TEST_F(VelocityMechanismTest, SpinDownLimitsALiveDropButNotNeutral) {
   EXPECT_DOUBLE_EQ(flywheel().goal_rps(), 0.0);
   sim.step(110ms);  // stale
   ExpectNeutral();
+}
+
+// Negative dt during spin-down must never accelerate away from goal or past
+// +-max_rps, and a NaN velocity while at_speed must drop readiness immediately.
+// REQ-SAFE-37
+TEST(VelocityMechanismGuards, NegativeDtSpinDownAndNaNReadiness) {
+  // Positive speed winding down with negative dt must hold previous, not ramp
+  // up past max_rps.
+  EXPECT_DOUBLE_EQ(
+      detail::StepSpinDown(/*goal_rps=*/0.0, /*previous_rps=*/80.0,
+                           /*max_rps=*/80.0,
+                           /*spin_down_rps2=*/100.0, /*dt_s=*/-0.5),
+      80.0);
+  // Negative speed winding down with negative dt must hold previous, not ramp
+  // more negative past -max_rps.
+  EXPECT_DOUBLE_EQ(
+      detail::StepSpinDown(/*goal_rps=*/0.0,
+                           /*previous_rps=*/-80.0,
+                           /*max_rps=*/80.0,
+                           /*spin_down_rps2=*/100.0, /*dt_s=*/-0.5),
+      -80.0);
+  // Out-of-bounds previous command is clamped to [-max_rps, max_rps].
+  EXPECT_DOUBLE_EQ(detail::StepSpinDown(/*goal_rps=*/0.0,
+                                        /*previous_rps=*/120.0,
+                                        /*max_rps=*/80.0,
+                                        /*spin_down_rps2=*/100.0, /*dt_s=*/0.0),
+                   80.0);
+
+  // NaN or Inf velocity while latched at_speed drops readiness and resets
+  // entry_ticks.
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  for (const double bad_vel : {nan, inf, -inf}) {
+    int entry_ticks = 3;
+    EXPECT_FALSE(detail::StepVelocityReadiness(
+        /*was_at_speed=*/true, entry_ticks, bad_vel, /*goal_rps=*/60.0,
+        /*entry_rps=*/2.0, /*exit_rps=*/6.0, /*entry_tick_count=*/3,
+        /*velocity_recent=*/true));
+    EXPECT_EQ(entry_ticks, 0);
+  }
 }
 
 // Matrix case 2: while disabled the mechanism reports itself disabled,
