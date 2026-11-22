@@ -445,6 +445,8 @@ export interface Surface<E> {
   create(html: string): E;
   // Puts `next` at `index` of the grid, in place of `previous` if any.
   put(index: number, next: E, previous: E|undefined): void;
+  // Removes a trailing or replaced layout's element from the grid.
+  remove?(index: number, previous: E): void;
   // Sizes the element's list body, if any, to the whole rows its cell
   // leaves it (on the grid, so laid out).
   fit(element: E): void;
@@ -461,6 +463,11 @@ function drawErrorHtml(error: unknown): string {
       `The dashboard is not updating; reload the page (${esc(String(error))})</div>`;
 }
 
+function layoutErrorHtml(message: string): string {
+  return '<div class="status link-error" role="alert"><b>LAYOUT ERROR</b> ' +
+      `${esc(message)}</div>`;
+}
+
 // Paints frames widget by widget. The page redraws every RENDER_MS, and with
 // a live producer some widget (a graph, the battery, the match clock)
 // changes nearly every frame: a widget whose markup did not change keeps
@@ -471,8 +478,10 @@ function drawErrorHtml(error: unknown): string {
 // before, it is clamped to a taller body's range, so a list scrolled to its
 // bottom would lose part of a row). A widget drawing error keeps the top
 // status line visible and live, shows a DRAWING ERROR row telling the
-// operator to reload, and marks the grid until a good draw; if drawing the
-// status line itself throws, the status slot carries DRAWING ERROR instead.
+// operator to reload, and marks the grid until a good draw; a layout reload
+// error similarly keeps the top status line live, shows LAYOUT ERROR, and
+// freezes/marks the last grid until a reload succeeds; if drawing the status
+// line itself throws, the status slot carries DRAWING ERROR instead.
 export class Painter<E> {
   private status = '';
   private drawError = '';
@@ -481,7 +490,19 @@ export class Painter<E> {
 
   constructor(private readonly surface: Surface<E>) {}
 
-  paint(drawStatus: () => string, drawWidgets: () => string[]) {
+  // Removes every painted widget element so a reloaded layout mounts fresh
+  // without carrying scroll offsets across unrelated cells. Keeps the status
+  // line and error banner untouched.
+  clearWidgets() {
+    for (let i = this.elements.length - 1; i >= 0; i--) {
+      this.surface.remove?.(i, this.elements[i]);
+    }
+    this.elements.length = 0;
+    this.markup.length = 0;
+  }
+
+  paint(drawStatus: () => string, drawWidgets: () => string[],
+        layoutError: string|null = null) {
     let nextStatus: string;
     try {
       nextStatus = drawStatus();
@@ -494,6 +515,13 @@ export class Painter<E> {
       return;
     }
     if (nextStatus !== this.status) this.surface.status(this.status = nextStatus);
+
+    if (layoutError) {
+      const html = layoutErrorHtml(layoutError);
+      if (html !== this.drawError) this.surface.drawError(this.drawError = html);
+      this.surface.errored(true);
+      return;
+    }
 
     try {
       const nextWidgets = drawWidgets();
@@ -508,6 +536,13 @@ export class Painter<E> {
         this.surface.fit(element);
         if (top > 0) this.surface.setScrollTop(element, top);
       });
+      if (nextWidgets.length < this.elements.length) {
+        for (let i = this.elements.length - 1; i >= nextWidgets.length; i--) {
+          this.surface.remove?.(i, this.elements[i]);
+        }
+        this.elements.length = nextWidgets.length;
+        this.markup.length = nextWidgets.length;
+      }
     } catch (error) {
       const html = drawErrorHtml(error);
       if (html !== this.drawError) this.surface.drawError(this.drawError = html);

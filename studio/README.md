@@ -116,8 +116,10 @@ the bridge. Light and dark follow the browser's colour scheme.
   calls `tick(now)` every 100 ms.
 - [`src/drive/view.ts`](src/drive/view.ts) renders each widget as HTML text,
   and its `Painter` replaces only a widget whose text changed;
-  [`src/drive/main.ts`](src/drive/main.ts) loads the layout and gives the
-  painter the page's elements.
+  [`src/drive/reload.ts`](src/drive/reload.ts) (`LayoutReloader`) re-fetches
+  `/drive/layout.json` on reconnect and mid-connection session/dictionary
+  changes; [`src/drive/main.ts`](src/drive/main.ts) loads the layout and gives
+  the painter the page's elements.
 
 What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 
@@ -159,8 +161,16 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 - A drawing error keeps the last grid, marks every widget stale with a
   dashed red border, and says DRAWING ERROR on the status line until a draw
   succeeds.
-- The layout is read once, when the page loads: after the bridge restarts
-  with an edited layout, reload the page.
+- On every WebSocket reconnect (and on a mid-connection session or telemetry
+  dictionary/stream change), `/drive/layout.json` is re-fetched with
+  `cache: 'no-store'`. An unchanged layout keeps the existing grid elements and
+  list scroll positions; an edited layout updates the title, grid, widgets,
+  tracked histories and carried-channel mask in place without losing latched
+  alerts or forcing a page reload. If a layout reload fetch or validation
+  fails, the page fails closed: it keeps the top status line live, shows a
+  `LAYOUT ERROR` row naming the error, marks and freezes the previous grid
+  until a reload succeeds, and retries every 1 s (backing off to 5 s after 3
+  consecutive failures, and pausing while disconnected or replaced).
 - On a close or error it reconnects every 1 s, one socket at a time: each
   attempt starts 1 s after the previous one started, so a connect that has
   not opened by then is abandoned for the next, and a socket silent for 2 s

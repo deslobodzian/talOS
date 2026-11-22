@@ -126,6 +126,7 @@ export type DriveSummary = {
 };
 
 export type Connection = 'connecting'|'open'|'waiting'|'replaced';
+export type LayoutReloadReason = 'reconnect'|'session'|'dictionary';
 export type Link =
     'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'protocol'|'roborio'|'replaced'|'refused';
 // `undecodable`: the line names a feed the page could not decode.
@@ -228,16 +229,46 @@ export class DriveModel {
   // decode close.
   private decodeFailures = 0;
   private undecodableThisSocket = false;  // a binary message of this socket failed to decode
-  private readonly tracked: Set<string>;
+  private tracked: Set<string>;
+  private carried: Carried;
   private readonly histories = new Map<string, Point[]>();
+
+  // Called when the bridge may be serving a new /drive/layout.json: on a
+  // WebSocket reconnect (including after a failed initial attempt), or when a
+  // new session or telemetry dictionary/stream appears mid-connection.
+  onLayoutCheck: ((reason: LayoutReloadReason) => void)|null = null;
+  // Called when the active socket closes or fails (including close 4000), so
+  // any in-flight layout reload or retry timer can be cancelled.
+  onDisconnect: (() => void)|null = null;
 
   // `tracked`: the channels whose history a graph or a field trail draws;
   // `carried`: what the layout says the feed carries.
   constructor(private readonly url: string,
               private readonly openSocket: SocketFactory,
               tracked: Iterable<string> = [],
-              private readonly carried: Carried = {channels: [], alerts: false}) {
+              carried: Carried = {channels: [], alerts: false}) {
     this.tracked = new Set(tracked);
+    this.carried = carried;
+  }
+
+  // Updates the layout's tracked history channels and carried-channel mask
+  // after /drive/layout.json reloads, preserving held telemetry, summary,
+  // connection state and latched alerts.
+  setLayout(tracked: Iterable<string>, carried: Carried) {
+    const next = new Set(tracked);
+    this.tracked = next;
+    this.carried = carried;
+    for (const channel of this.histories.keys()) {
+      if (!next.has(channel)) this.histories.delete(channel);
+    }
+    if (this.latest) {
+      const t_s = Number(BigInt(this.latest.timestamp_ns) / 1000n) / 1e6;
+      for (const channel of next) {
+        if (this.histories.has(channel)) continue;
+        const v = this.latest.channels[channel];
+        if (v !== undefined) this.histories.set(channel, [{t_s, v}]);
+      }
+    }
   }
 
   // Whether the feed carries `name` in `s`'s dictionary, so its absence is
@@ -421,10 +452,12 @@ export class DriveModel {
   clock: () => number = () => 0;
 
   private onOpen(now: number) {
+    const isReconnect = this.everOpened || this.counters.connects > 1;
     this.connection = 'open';
     this.everOpened = true;
     this.openedAt = now;
     this.lastMessageAt = now;
+    if (isReconnect) this.onLayoutCheck?.('reconnect');
   }
 
   private onMessage(data: unknown, now: number) {
@@ -474,8 +507,15 @@ export class DriveModel {
         this.counters.malformed_text++;
         return;
       }
+      const prev = this.summary;
+      const sameSocket = this.summaryThisSocket;
       this.summary = summary;
       this.summaryThisSocket = true;
+      if (sameSocket && prev !== null &&
+          (prev.session !== summary.session ||
+           Boolean(prev.launch_refused) !== Boolean(summary.launch_refused))) {
+        this.onLayoutCheck?.('session');
+      }
       return;
     }
     if (typeof kind === 'string') this.counters.ignored_text++;
@@ -484,23 +524,28 @@ export class DriveModel {
 
   private onSnapshot(s: Snapshot, now: number) {
     const held = this.latest;
+    const sameSocket = this.tickThisSocket;
     const newer = held === null || s.stream_id !== held.stream_id ||
         BigInt(s.sequence_id) > BigInt(held.sequence_id);
+    const dictChanged = sameSocket && held !== null &&
+        (s.stream_id !== held.stream_id || s.dictionary_id !== held.dictionary_id);
     const keyframe = !this.tickThisSocket;
     this.latest = s;
     if (keyframe) {
       this.tickThisSocket = true;
       this.keyframeAt = now;
     }
-    if (!newer) return;
-    this.alerts.push(s);
-    this.record(s);
-    // The connect-time keyframe is as old as the bridge's newest tick, which
-    // the page cannot tell: only a tick after it on this socket is current.
-    if (!keyframe) {
-      this.lastTickAt = now;
-      this.suspended = false;
+    if (newer) {
+      this.alerts.push(s);
+      this.record(s);
+      // The connect-time keyframe is as old as the bridge's newest tick, which
+      // the page cannot tell: only a tick after it on this socket is current.
+      if (!keyframe) {
+        this.lastTickAt = now;
+        this.suspended = false;
+      }
     }
+    if (dictChanged) this.onLayoutCheck?.('dictionary');
   }
 
   private record(s: Snapshot) {
@@ -523,9 +568,11 @@ export class DriveModel {
     this.decodeFailures = 0;
     if (code === REPLACED_CODE) {
       this.connection = 'replaced';
+      this.onDisconnect?.();
       return;
     }
     this.wait();
+    this.onDisconnect?.();
   }
 
   // Closes the socket as an error; `decode`: the page's own close, for a
@@ -536,6 +583,7 @@ export class DriveModel {
     else if (this.connection === 'open' && now - this.openedAt > DECODE_STREAK_MS) this.decodeFailures = 1;
     else this.decodeFailures++;
     this.wait();
+    this.onDisconnect?.();
   }
 
   // The next attempt starts RECONNECT_MS after this one started: attempts

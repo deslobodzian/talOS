@@ -11,8 +11,9 @@ import {test} from 'node:test';
 
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DECODE_RETRY_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
-import {parseLayout} from '../src/drive/layout';
-import {DrawSchedule, esc, GLYPH_PX, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
+import {type Layout, layoutsEqual, parseLayout, trackedChannels} from '../src/drive/layout';
+import {fetchAndParseLayout, type LayoutFetchResult, LayoutReloader} from '../src/drive/reload';
+import {DrawSchedule, esc, GLYPH_PX, gridStyle, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderGridWidgets, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -1215,6 +1216,10 @@ function fakeSurface() {
       page.grid[index] = next;
       page.puts++;
     },
+    remove: (index, previous) => {
+      previous.attached = false;
+      if (page.grid[index] === previous) page.grid.splice(index, 1);
+    },
     fit: e => {
       if (e.attached) e.height = Math.floor(ROOM / ROW) * ROW;
     },
@@ -1390,4 +1395,529 @@ test('a refused launch renders LAUNCH REFUSED with its reason instead of BRIDGE 
       ...update(1, NOMINAL, true),
       ...update(2, {}, false));
   assert.equal(h.model.status(h.clock.now).link, 'ok');
+});
+
+// Flushes pending Promise microtasks so async layout fetches resolve without
+// wall-clock sleeps.
+async function flushMicrotasks() {
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+}
+
+const okJson = (value: unknown): LayoutFetchResult => ({
+  ok: true, status: 200, json: async () => value
+});
+
+// REQ-OPS-34, REQ-OPS-36, REQ-OPS-37, REQ-OPS-39: after a bridge restart with
+// an edited dashboard layout (or transitioning out of refusal mode), /drive
+// re-fetches /drive/layout.json on WebSocket reconnect, updates the title,
+// grid, widgets, tracked channels and carried-channel mask in place (removing
+// excess widgets), and keeps latched alerts and connect-time keyframe
+// staleness intact without a page reload.
+test('reloads an edited layout on WebSocket reconnect without losing latched alerts', async () => {
+  const editedJson = {
+    title: 'Practice Drive',
+    columns: 6,
+    rows: 4,
+    update_hz: 20,
+    alerts: true,
+    channels: ['hw/status/battery_v', LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [
+      {kind: 'alerts', at: [0, 0, 3, 4], title: 'Alerts', channels: {}},
+      {kind: 'number', at: [3, 0, 3, 2], title: 'Voltage', label: 'Voltage',
+       precision: 2, channels: {channel: 'hw/status/battery_v'}},
+      {kind: 'graph', at: [3, 2, 3, 2], title: 'Battery trace',
+       series: ['hw/status/battery_v'], window_s: 10, channels: {}},
+    ]
+  };
+  let activeLayout: Layout = LAYOUT;
+  let title = LAYOUT.title;
+  let style = gridStyle(LAYOUT);
+  let clearCount = 0;
+  const fetches: {url: string; cache: string}[] = [];
+  let nextResponse: () => Promise<LayoutFetchResult> = async () => okJson(editedJson);
+
+  const h = harness(activeLayout);
+  const {page, surface} = fakeSurface();
+  const painter = new Painter(surface);
+  const clock = {now: 0, wall: 1e12};
+  const {timers} = fakeTimers(clock);
+  const paint = () => painter.paint(
+      () => renderStatus(h.model, h.clock.now, activeLayout.skipped),
+      () => renderGridWidgets(activeLayout, h.model, h.clock.now),
+      reloader.error);
+
+  const reloader = new LayoutReloader(
+      activeLayout,
+      signal => fetchAndParseLayout((url, init) => {
+        fetches.push({url, cache: init.cache});
+        return nextResponse();
+      }, '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) {
+            activeLayout = next;
+            h.model.setLayout(trackedChannels(next), next);
+            title = next.title;
+            style = gridStyle(next);
+            painter.clearWidgets();
+            clearCount++;
+          }
+          paint();
+        },
+        onError: () => paint()
+      });
+  h.model.onLayoutCheck = reason => reloader.trigger(reason);
+  h.model.onDisconnect = () => reloader.cancelPending();
+
+  // Initial connect: no redundant fetch on the very first open.
+  h.connect(0);
+  paint();
+  assert.equal(fetches.length, 0, 'initial connect should not duplicate initial layout fetch');
+  assert.equal(page.grid.length, LAYOUT.widgets.length);
+
+  // Latch a warning alert and record flywheel history before the restart.
+  h.at(50);
+  h.socket().send(...update(2, {[OWNER_TIMED_OUT]: 1}, false));
+  h.at(150);
+  h.socket().send(...update(3, {[OWNER_TIMED_OUT]: 0}, false));
+  assert.ok(h.model.history('shooter/state/flywheel_velocity_rps').length > 0);
+  assert.equal(h.model.alerts.latch().alerts.length, 1);
+
+  // Bridge restarts with the edited layout.
+  h.socket().onclose!({code: 1006, reason: ''});
+  h.at(RECONNECT_MS);
+  h.socket().onopen!();
+  await flushMicrotasks();
+
+  assert.deepEqual(fetches, [{url: '/drive/layout.json', cache: 'no-store'}]);
+  assert.equal(clearCount, 1);
+  assert.equal(title, 'Practice Drive');
+  assert.match(style, /repeat\(6,minmax\(0,1fr\)\).*repeat\(4,minmax\(0,1fr\)\)/);
+  assert.equal(page.grid.length, 3, 'removed widgets from the old layout must not linger');
+  assert.equal(page.errored, false);
+  assert.equal(page.drawError, '');
+  // Tracked channels updated: removed flywheel history dropped, new battery_v seeded/tracked.
+  assert.equal(h.model.history('shooter/state/flywheel_velocity_rps').length, 0);
+  assert.equal(h.model.history('hw/status/battery_v').length, 1);
+
+  // Connect-time keyframe stays stale until a newer tick arrives, and latched
+  // alerts survive intact in the reloaded Alerts widget.
+  h.socket().send(...encodeDictionaryPages(header(10), CHANNELS),
+                  ...update(10, {...NOMINAL, 'hw/status/battery_v': 12.42}, true));
+  paint();
+  assert.match(page.grid[1].html, /STALE/);
+  assert.match(page.grid[1].html, /12\.42/);
+  assert.match(page.grid[0].html, /owner timed out.*×1/);
+  h.at(RECONNECT_MS + 100);
+  h.socket().send(...update(11, {'hw/status/battery_v': 12.45}, false));
+  paint();
+  assert.doesNotMatch(page.grid[1].html, /STALE/);
+  assert.match(page.grid[1].html, /12\.45/);
+  assert.deepEqual(h.model.history('hw/status/battery_v').map(p => p.v), [12.61, 12.42, 12.45]);
+
+  // Also verify refusal-mode (channels: []) -> normal layout updates `carried`
+  // so RoboRIO link status is judged again after recovery.
+  const minimalLayout = parseLayout({
+    title: 'Drive', columns: 1, rows: 1, update_hz: 5, alerts: false, channels: [], widgets: []
+  });
+  let carriedLayout = minimalLayout;
+  const h2 = harness(carriedLayout);
+  const r2 = new LayoutReloader(
+      carriedLayout,
+      signal => fetchAndParseLayout(() => Promise.resolve(okJson(editedJson)),
+                                    '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h2.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) {
+            carriedLayout = next;
+            h2.model.setLayout(trackedChannels(next), next);
+          }
+        },
+        onError: () => {}
+      });
+  h2.model.onLayoutCheck = reason => r2.trigger(reason);
+  h2.connect(0, {...NOMINAL, [LINK_LOST]: 1});
+  assert.equal(h2.model.status(0).link, 'ok', 'minimal layout does not judge RoboRIO link');
+  h2.socket().onclose!({code: 1006, reason: ''});
+  h2.at(RECONNECT_MS);
+  h2.socket().onopen!();
+  await flushMicrotasks();
+  h2.socket().send(...encodeDictionaryPages(header(20), CHANNELS),
+                   ...update(20, {...NOMINAL, [LINK_LOST]: 1}, true),
+                   ...update(21, {}, false));
+  assert.equal(h2.model.status(RECONNECT_MS).link, 'roborio',
+               'reloaded layout must update carried channels so RoboRIO link is judged');
+});
+
+// REQ-OPS-36, REQ-OPS-49: a reconnect to an unchanged layout (even with
+// differently ordered keys in JSON) does not tear down the grid or disturb
+// list element identity and scroll position.
+test('keeps grid elements and list scroll position when reconnect serves an unchanged layout', async () => {
+  const rawLayout = JSON.parse(
+      readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8'));
+  // Reverse channel key order on a widget to prove structural equality.
+  const reordered = structuredClone(rawLayout);
+  const matchWidget = reordered.widgets.find((w: {kind: string}) => w.kind === 'match');
+  matchWidget.channels = Object.fromEntries(Object.entries(matchWidget.channels).reverse());
+  assert.ok(layoutsEqual(LAYOUT, parseLayout(reordered)));
+
+  let onLayoutCalls = 0;
+  const h = harness(LAYOUT);
+  const {page, surface} = fakeSurface();
+  const painter = new Painter(surface);
+  const clock = {now: 0, wall: 1e12};
+  const {timers} = fakeTimers(clock);
+  const reloader = new LayoutReloader(
+      LAYOUT,
+      signal => fetchAndParseLayout(() => Promise.resolve(okJson(reordered)),
+                                    '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: () => {
+          onLayoutCalls++;
+        },
+        onError: () => assert.fail('unexpected layout error')
+      });
+  h.model.onLayoutCheck = reason => reloader.trigger(reason);
+
+  const summary = JSON.stringify({
+    kind: 'talos.drive.summary', session: '42', supervised: true, registry: true, omitted: 0,
+    nodes: Array.from({length: 10}, (_, i) => ({
+      name: `node_${i}`, alive: true, critical: true, restarts: 0, quarantined: false, drives: null
+    }))
+  });
+  h.connect(0);
+  h.socket().send(summary);
+  const paint = () => {
+    painter.paint(
+        () => renderStatus(h.model, h.clock.now, LAYOUT.skipped),
+        () => renderGridWidgets(LAYOUT, h.model, h.clock.now),
+        reloader.error);
+    page.grid.forEach(e => surface.fit(e));
+  };
+  paint();
+  const subIdx = LAYOUT.widgets.findIndex(w => w.kind === 'subsystems');
+  const subElement = page.grid[subIdx];
+  surface.setScrollTop(subElement, 2 * ROW);
+  assert.equal(surface.scrollTop(subElement), 2 * ROW);
+
+  // Reconnect with identical layout: onLayout is not called and element survives.
+  h.socket().onclose!({code: 1006, reason: ''});
+  h.at(RECONNECT_MS);
+  h.socket().onopen!();
+  await flushMicrotasks();
+  assert.equal(onLayoutCalls, 0, 'unchanged layout must not trigger grid teardown');
+  h.socket().send(...encodeDictionaryPages(header(5), CHANNELS), ...update(5, NOMINAL, true),
+                  ...update(6, {}, false), summary);
+  paint();
+  assert.equal(page.grid[subIdx], subElement, 'unchanged list widget must keep its element');
+  assert.equal(surface.scrollTop(page.grid[subIdx]), 2 * ROW);
+});
+
+// REQ-OPS-34, REQ-OPS-39: mid-connection session changes and telemetry
+// dictionary/stream changes trigger a layout reload, coalescing concurrent
+// triggers without duplicating fetches on normal ticks or initial connect.
+test('reloads layout on mid-connection session and dictionary changes', async () => {
+  const layoutA = parseLayout({
+    title: 'Session A', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'A', channels: {channel: 'hw/status/battery_v'}}]
+  });
+  const layoutB = {
+    title: 'Session B', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'B', channels: {channel: 'hw/status/battery_v'}}]
+  };
+  const layoutC = {
+    title: 'Dict C', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'C', channels: {channel: 'hw/status/battery_v'}}]
+  };
+  const reasons: string[] = [];
+  const resolvers: ((r: LayoutFetchResult) => void)[] = [];
+  let appliedTitle = layoutA.title;
+  const h = harness(layoutA);
+  const clock = {now: 0, wall: 1e12};
+  const {timers} = fakeTimers(clock);
+  const reloader = new LayoutReloader(
+      layoutA,
+      signal => fetchAndParseLayout(() => new Promise<LayoutFetchResult>(resolve => {
+        resolvers.push(resolve);
+      }), '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) appliedTitle = next.title;
+        },
+        onError: () => assert.fail('unexpected error')
+      });
+  h.model.onLayoutCheck = reason => {
+    reasons.push(reason);
+    reloader.trigger(reason);
+  };
+
+  h.connect(0);
+  const makeSummary = (session: string) => JSON.stringify({
+    kind: 'talos.drive.summary', session, supervised: true, registry: true, omitted: 0, nodes: []
+  });
+  h.socket().send(makeSummary('100'));
+  h.at(50);
+  h.socket().send(makeSummary('100'), ...update(2, {}, false));
+  assert.deepEqual(reasons, [], 'initial summary and steady ticks must not reload');
+
+  // Mid-connection session epoch change triggers a reload.
+  h.at(100);
+  h.socket().send(makeSummary('101'));
+  assert.deepEqual(reasons, ['session']);
+  assert.equal(resolvers.length, 1);
+
+  // A dictionary/stream change while the first fetch is still in flight
+  // coalesces into one follow-up fetch (never spawns a parallel storm).
+  const newHead = (seq: number) => ({
+    streamId: 99n, sequenceId: BigInt(seq), timestampNs: BigInt(seq) * 50_000_000n,
+    dictionaryId: DICTIONARY_ID, channelCount: CHANNELS.length
+  });
+  h.socket().send(...encodeDictionaryPages(newHead(1), CHANNELS),
+                  ...encodeValuePages(newHead(1), POSE, true, [[INDEX.get('hw/status/battery_v')!, rawFromDouble(12.5)]]));
+  h.socket().send(makeSummary('102'));
+  assert.deepEqual(reasons, ['session', 'dictionary', 'session']);
+  assert.equal(resolvers.length, 1, 'concurrent mid-connection triggers must wait behind in-flight fetch');
+
+  resolvers[0](okJson(layoutB));
+  await flushMicrotasks();
+  assert.equal(appliedTitle, 'Session B');
+  assert.equal(resolvers.length, 2, 'coalesced follow-up fetch must run once');
+
+  resolvers[1](okJson(layoutC));
+  await flushMicrotasks();
+  assert.equal(appliedTitle, 'Dict C');
+});
+
+// REQ-OPS-34, REQ-OPS-36, REQ-OPS-37, REQ-OPS-39, REQ-OPS-49: if reloading
+// /drive/layout.json fails (HTTP error, network error, invalid JSON, or layout
+// validation error), /drive fails closed: the top status line stays live (and
+// still reports link drops), LAYOUT ERROR shows the escaped reason, the
+// previous grid stays frozen and marked errored, alert latching keeps working,
+// retries back off after 3 failures and pause on close 4000, and a subsequent
+// valid layout clears the error cleanly.
+test('fails closed on layout reload errors while keeping status line and alerts live', async () => {
+  const editedJson = {
+    title: 'Recovered Drive',
+    columns: 4,
+    rows: 2,
+    update_hz: 20,
+    alerts: true,
+    channels: ['hw/status/battery_v', LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [
+      {kind: 'alerts', at: [0, 0, 2, 2], title: 'Alerts', channels: {}},
+      {kind: 'number', at: [2, 0, 2, 2], title: 'Battery', label: 'Battery',
+       precision: 2, channels: {channel: 'hw/status/battery_v'}},
+    ]
+  };
+  let activeLayout: Layout = LAYOUT;
+  const h = harness(activeLayout);
+  const {page, surface} = fakeSurface();
+  const painter = new Painter(surface);
+  const clock = {now: 0, wall: 1e12};
+  h.model.clock = () => clock.now;
+  const {timers, run} = fakeTimers(clock);
+  const paint = () => painter.paint(
+      () => renderStatus(h.model, clock.now, activeLayout.skipped),
+      () => renderGridWidgets(activeLayout, h.model, clock.now),
+      reloader.error);
+
+  const responses: (() => Promise<LayoutFetchResult>)[] = [
+    async () => ({ok: false, status: 500}),
+    async () => { throw new TypeError('network <x-net> down'); },
+    async () => ({ok: true, status: 200, json: async () => { throw new SyntaxError('bad json'); }}),
+    async () => okJson({columns: 0, rows: 0, widgets: []}),
+    async () => okJson(editedJson),
+  ];
+  const fetchTimes: number[] = [];
+  const reloader = new LayoutReloader(
+      activeLayout,
+      signal => fetchAndParseLayout(() => {
+        fetchTimes.push(clock.now);
+        const next = responses.shift();
+        if (!next) throw new Error('unexpected extra fetch');
+        return next();
+      }, '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) {
+            activeLayout = next;
+            h.model.setLayout(trackedChannels(next), next);
+            painter.clearWidgets();
+          }
+          paint();
+        },
+        onError: () => paint()
+      });
+  h.model.onLayoutCheck = reason => reloader.trigger(reason);
+  h.model.onDisconnect = () => reloader.cancelPending();
+
+  // Connect and draw initial layout.
+  h.connect(0);
+  paint();
+  const initialWidget0 = page.grid[0];
+  assert.equal(page.errored, false);
+
+  // Reconnect -> failure #1: HTTP 500.
+  h.socket().onclose!({code: 1006, reason: ''});
+  clock.now = RECONNECT_MS;
+  h.model.tick(clock.now);
+  h.socket().onopen!();
+  await flushMicrotasks();
+  assert.equal(page.errored, true, 'grid must be marked errored on layout reload failure');
+  assert.equal(page.grid[0], initialWidget0, 'last valid grid stays frozen until reload succeeds');
+  assert.match(page.drawError, /<b>LAYOUT ERROR<\/b>.*HTTP 500/);
+
+  // Status line stays live while in LAYOUT ERROR: RoboRIO link drop surfaces
+  // immediately in the top status line AND latches in AlertTracker.
+  h.socket().send(...encodeDictionaryPages(header(5), CHANNELS),
+                  ...update(5, NOMINAL, true),
+                  ...update(6, {[LINK_LOST]: 1}, false));
+  paint();
+  assert.match(page.status, /<b>ROBORIO LINK<\/b>.*RoboRIO link lost/);
+  assert.equal(page.errored, true);
+  assert.ok(h.model.alerts.latch().alerts.some(a => a.channel === LINK_LOST),
+            'alerts must still latch while layout reload is errored');
+
+  // Failure #2 (retry after RECONNECT_MS): network error with markup is escaped.
+  run(RECONNECT_MS + RECONNECT_MS - 1);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 1);
+  run(2 * RECONNECT_MS);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 2);
+  assert.match(page.drawError, /<b>LAYOUT ERROR<\/b>/);
+  assert.ok(!page.drawError.includes('<x-net>'), 'error message must be escaped');
+  assert.ok(page.drawError.includes(esc('<x-net>')), page.drawError);
+
+  // Failure #3 (retry after RECONNECT_MS): invalid JSON; now 3 consecutive
+  // failures -> next retry backs off to DECODE_RETRY_MS (5 s).
+  run(3 * RECONNECT_MS);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 3);
+  assert.match(page.drawError, /not valid JSON/);
+
+  // Keep socket alive with updates while verifying 5 s backoff before failure #4.
+  for (let t = 3 * RECONNECT_MS + 1000; t < 3 * RECONNECT_MS + DECODE_RETRY_MS; t += 1000) {
+    clock.now = t;
+    h.socket().send(...update(10 + t / 1000, {}, false));
+    run(t);
+    await flushMicrotasks();
+    assert.equal(fetchTimes.length, 3, `retried early at ${t} ms before DECODE_RETRY_MS`);
+  }
+  run(3 * RECONNECT_MS + DECODE_RETRY_MS);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 4);
+  assert.match(page.drawError, /Invalid dashboard layout.*no valid grid/);
+
+  // Close 4000 (replaced): stops retrying while replaced, keeps error & status.
+  h.socket().onclose!({code: REPLACED_CODE, reason: 'replaced by a newer driver dashboard'});
+  paint();
+  assert.match(page.status, /<b>REPLACED<\/b>/);
+  assert.equal(page.errored, true, 'existing layout error remains fail-closed across close');
+  run(3 * RECONNECT_MS + DECODE_RETRY_MS + 30_000);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 4, 'must not retry layout fetch while replaced (close 4000)');
+
+  // User clicks Reconnect -> fetch #5 returns valid layout -> recovers cleanly.
+  clock.now = 40_000;
+  h.model.reconnect(clock.now);
+  h.socket().onopen!();
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 5);
+  assert.equal(reloader.error, null);
+  assert.equal(page.errored, false);
+  assert.equal(page.drawError, '');
+  assert.equal(page.grid.length, 2);
+  assert.match(page.grid[0].html, /link lost.*×1/, 'latched alert survived recovery');
+});
+
+// REQ-OPS-36, REQ-OPS-39: stale out-of-order layout fetches from an older
+// reconnect are aborted and ignored even if they later resolve or reject, and
+// a socket closing mid-fetch does not flash a spurious LAYOUT ERROR.
+test('ignores stale out-of-order layout fetch responses and aborts on disconnect', async () => {
+  const layoutV2 = {
+    title: 'V2', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'V2', channels: {channel: 'hw/status/battery_v'}}]
+  };
+  const layoutV1 = {
+    title: 'V1-stale', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'V1', channels: {channel: 'hw/status/battery_v'}}]
+  };
+  const pending: {
+    signal?: AbortSignal;
+    resolve: (r: LayoutFetchResult) => void;
+    reject: (e: unknown) => void;
+  }[] = [];
+  const errors: string[] = [];
+  let activeTitle = LAYOUT.title;
+
+  const h = harness(LAYOUT);
+  const clock = {now: 0, wall: 1e12};
+  const {timers} = fakeTimers(clock);
+  const reloader = new LayoutReloader(
+      LAYOUT,
+      signal => fetchAndParseLayout((_url, init) => new Promise<LayoutFetchResult>((resolve, reject) => {
+        pending.push({signal: init.signal, resolve, reject});
+      }), '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) activeTitle = next.title;
+        },
+        onError: msg => errors.push(msg)
+      });
+  h.model.onLayoutCheck = reason => reloader.trigger(reason);
+  h.model.onDisconnect = () => reloader.cancelPending();
+
+  h.connect(0);
+  // Reconnect #1 starts fetch #1 (slow).
+  h.socket().onclose!({code: 1006, reason: ''});
+  h.at(RECONNECT_MS);
+  h.socket().onopen!();
+  assert.equal(pending.length, 1);
+
+  // Socket closes mid-fetch: fetch #1 is aborted, no spurious LAYOUT ERROR.
+  h.socket().onclose!({code: 1006, reason: ''});
+  assert.equal(pending[0].signal?.aborted, true);
+  pending[0].reject(new Error('aborted'));
+  await flushMicrotasks();
+  assert.equal(reloader.error, null);
+  assert.deepEqual(errors, []);
+
+  // Reconnect #2 starts fetch #2 (slow); reconnect #3 supersedes it with fetch #3.
+  h.at(2 * RECONNECT_MS);
+  h.socket().onopen!();
+  assert.equal(pending.length, 2);
+  // Simulate a hung fetch #2 when reconnect #3 arrives directly.
+  reloader.trigger('reconnect');
+  assert.equal(pending[1].signal?.aborted, true);
+  assert.equal(pending.length, 3);
+
+  // Fetch #3 resolves first with V2.
+  pending[2].resolve(okJson(layoutV2));
+  await flushMicrotasks();
+  assert.equal(activeTitle, 'V2');
+  assert.equal(reloader.error, null);
+
+  // Superseded fetch #2 resolves late with V1-stale: must be ignored!
+  pending[1].resolve(okJson(layoutV1));
+  await flushMicrotasks();
+  assert.equal(activeTitle, 'V2', 'stale fetch overwrote newer layout');
+  assert.equal(reloader.error, null);
 });
