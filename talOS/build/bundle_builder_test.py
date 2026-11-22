@@ -11,6 +11,7 @@ import os
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,74 @@ def put(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+
+
+def put_bytes(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def make_elf(needed=(), *, bits=64, endian="<", e_type=3, vaddr_base=0x400000):
+    """Builds a minimal valid ELF32/ELF64 image with PT_LOAD + PT_DYNAMIC
+    listing `needed` as DT_NEEDED entries (or an ET_REL object with no
+    program headers when e_type == 1)."""
+    ei_class = 2 if bits == 64 else 1
+    ei_data = 1 if endian == "<" else 2
+    ident = b"\x7fELF" + bytes([ei_class, ei_data, 1]) + b"\x00" * 9
+    ehdr_size = 64 if bits == 64 else 52
+    phentsize = 56 if bits == 64 else 32
+    if e_type == 1:
+        if bits == 64:
+            hdr = struct.pack(endian + "HHIQQQIHHHHHH",
+                              e_type, 62, 1, 0, 0, 0, 0, ehdr_size, 0, 0, 0, 0, 0)
+        else:
+            hdr = struct.pack(endian + "HHIIIIIHHHHHH",
+                              e_type, 3, 1, 0, 0, 0, 0, ehdr_size, 0, 0, 0, 0, 0)
+        return ident + hdr
+
+    dynstr = bytearray(b"\x00")
+    offsets = []
+    for name in needed:
+        offsets.append(len(dynstr))
+        dynstr.extend(name.encode("utf-8") + b"\x00")
+
+    phoff = ehdr_size
+    phnum = 2
+    dyn_off = phoff + phnum * phentsize
+    dyn_entry_size = 16 if bits == 64 else 8
+    dyn_entries = [(1, off) for off in offsets]  # DT_NEEDED
+    dyn_entries.append((5, 0))   # DT_STRTAB placeholder
+    dyn_entries.append((10, len(dynstr)))  # DT_STRSZ
+    dyn_entries.append((0, 0))   # DT_NULL
+    dyn_size = len(dyn_entries) * dyn_entry_size
+    dynstr_off = dyn_off + dyn_size
+    dyn_entries[-3] = (5, vaddr_base + dynstr_off)
+    total = dynstr_off + len(dynstr)
+
+    if bits == 64:
+        hdr = struct.pack(endian + "HHIQQQIHHHHHH",
+                          e_type, 62, 1, 0, phoff, 0, 0,
+                          ehdr_size, phentsize, phnum, 0, 0, 0)
+        ph_load = struct.pack(endian + "IIQQQQQQ",
+                              1, 5, 0, vaddr_base, vaddr_base, total, total, 0x1000)
+        ph_dyn = struct.pack(endian + "IIQQQQQQ",
+                             2, 6, dyn_off, vaddr_base + dyn_off,
+                             vaddr_base + dyn_off, dyn_size, dyn_size, 8)
+        dyn_bytes = b"".join(struct.pack(endian + "qQ", t, v)
+                             for t, v in dyn_entries)
+    else:
+        hdr = struct.pack(endian + "HHIIIIIHHHHHH",
+                          e_type, 3, 1, 0, phoff, 0, 0,
+                          ehdr_size, phentsize, phnum, 0, 0, 0)
+        ph_load = struct.pack(endian + "IIIIIIII",
+                              1, 0, vaddr_base, vaddr_base, total, total, 5, 0x1000)
+        ph_dyn = struct.pack(endian + "IIIIIIII",
+                             2, dyn_off, vaddr_base + dyn_off,
+                             vaddr_base + dyn_off, dyn_size, dyn_size, 6, 4)
+        dyn_bytes = b"".join(struct.pack(endian + "iI", t, v)
+                             for t, v in dyn_entries)
+    return ident + hdr + ph_load + ph_dyn + dyn_bytes + bytes(dynstr)
 
 
 HARDWARE_NODE = "//talOS/bridge:hardware_node"
@@ -622,6 +691,162 @@ class BundleBuilderTest(unittest.TestCase):
                 self.assertTrue(
                     os.path.isfile(os.path.join(built, RUNTIME_DIR, rf_rel)),
                     f"runtime file was stripped: {rf_rel}")
+
+    def _elf_python_node(self, tmp, interpreter_bytes, extra_runfiles=()):
+        """Builds a single Python node spec whose bundled interpreter carries
+        `interpreter_bytes` (under python, python3 and python3.11) plus
+        libpython3.11.so.1.0, libpython3.so (which itself needs
+        libpython3.11.so.1.0), and libother.so in the runtime's lib/."""
+        src = os.path.join(tmp, "src", "py")
+        real = os.path.join(src, "python3")
+        put_bytes(real, interpreter_bytes)
+        os.chmod(real, 0o755)
+        put(os.path.join(src, "encodings.py"), "")
+        link = os.path.join(src, "venv", "bin", "python3")
+        os.makedirs(os.path.dirname(link))
+        os.symlink("../../../../" + RUNTIME + "/bin/python3", link)
+        libpy11 = os.path.join(src, "libpython3.11.so.1.0")
+        put_bytes(libpy11, make_elf(["libc.so.6"]))
+        os.chmod(libpy11, 0o755)
+        libpy3 = os.path.join(src, "libpython3.so")
+        put_bytes(libpy3, make_elf(["$ORIGIN/../lib/libpython3.11.so.1.0"]))
+        os.chmod(libpy3, 0o755)
+        libother = os.path.join(src, "libother.so")
+        put_bytes(libother, make_elf(["libc.so.6"]))
+        os.chmod(libother, 0o755)
+        rf = [{"src_path": real, "rf_rel": f"{RUNTIME}/bin/{alias}"}
+              for alias in ("python", "python3", "python3.11")]
+        rf += [
+            {"src_path": os.path.join(src, "encodings.py"),
+             "rf_rel": f"{RUNTIME}/lib/python3.11/encodings/__init__.py"},
+            {"src_path": libpy11,
+             "rf_rel": f"{RUNTIME}/lib/libpython3.11.so.1.0"},
+            {"src_path": libpy3,
+             "rf_rel": f"{RUNTIME}/lib/libpython3.so"},
+            {"src_path": libother,
+             "rf_rel": f"{RUNTIME}/lib/libother.so"},
+            {"src_path": link,
+             "rf_rel": "_main/a/_node_bin.venv/bin/python3"},
+        ]
+        for idx, (rf_rel, data) in enumerate(extra_runfiles):
+            p = os.path.join(src, f"extra_{idx}")
+            put_bytes(p, data)
+            rf.append({"src_path": p, "rf_rel": rf_rel})
+        return dict(node(tmp, "a", "//a:node"), language="python", runfiles=rf)
+
+    # REQ-OPS-48
+    def test_strips_unused_libpython_shared_libs_when_statically_linked(self):
+        # On Linux, rules_python's python3 binary statically links libpython
+        # (no libpython* in DT_NEEDED) yet ships a 51 MB libpython3.11.so.1.0
+        # and libpython3.so beside it. When neither python3 nor any other ELF
+        # file in the bundle needs libpython*, the bundler omits them while
+        # keeping unrelated runtime and extension .so files.
+        with tempfile.TemporaryDirectory() as tmp:
+            py = self._elf_python_node(
+                tmp, make_elf(["libpthread.so.0", "libc.so.6"]),
+                extra_runfiles=[(
+                    "wheel/site-packages/pkg/_ext.cpython-311.so",
+                    make_elf(["libc.so.6", "libm.so.6"]),
+                )])
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//a:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            built = os.path.join(tmp, "out")
+            rt_lib = os.path.join(built, RUNTIME_DIR, RUNTIME, "lib")
+            self.assertFalse(os.path.exists(
+                os.path.join(rt_lib, "libpython3.11.so.1.0")))
+            self.assertFalse(os.path.exists(
+                os.path.join(rt_lib, "libpython3.so")))
+            self.assertTrue(os.path.isfile(
+                os.path.join(rt_lib, "libother.so")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                built, "bin", "a.runfiles",
+                "wheel/site-packages/pkg/_ext.cpython-311.so")))
+            # Interpreter copies are still aliased after stripping.
+            with open(os.path.join(built, RUNTIME_DIR, RUNTIME, "bin",
+                                   "python3.11"), "rb") as f:
+                self.assertTrue(f.read(2) == b"#!")
+
+    # REQ-OPS-48
+    def test_keeps_libpython_when_needed_or_non_elf_or_corrupt_elf(self):
+        # Fail-closed safety checks: keep libpython3*.so* whenever python3
+        # itself links libpython, any extension or shared library in the bundle
+        # links libpython, the runtime is non-ELF (macOS Mach-O + .dylib), or
+        # any ELF file in the bundle cannot be parsed.
+        macho = b"\xcf\xfa\xed\xfe" + b"\x00" * 60
+        cases = (
+            ("dynamic python3",
+             make_elf(["$ORIGIN/../lib/libpython3.11.so.1.0", "libc.so.6"]),
+             (), (), True),
+            ("wheel needs libpython3.so",
+             make_elf(["libc.so.6"]),
+             [("wheel/site-packages/abi3/_ext.abi3.so",
+               make_elf(["libpython3.so", "libc.so.6"]))],
+             (), True),
+            ("cpp shared_lib needs libpython",
+             make_elf(["libc.so.6"]),
+             (), [("libembed.so", make_elf(["libpython3.11.so.1.0"]))], True),
+            ("macos macho and dylib",
+             macho,
+             [(f"{RUNTIME}/lib/libpython3.11.dylib", macho)],
+             (), True),
+            ("corrupt elf fails closed",
+             make_elf(["libc.so.6"]),
+             [("wheel/site-packages/pkg/bad.so", b"\x7fELF\x02\x01\x01")],
+             (), True),
+        )
+        for label, interp, extra_rf, cpp_libs, kept in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                py = self._elf_python_node(tmp, interp, extra_rf)
+                hw = node(tmp, "hardware_node", HARDWARE_NODE)
+                for lib_name, lib_bytes in cpp_libs:
+                    p = os.path.join(tmp, "src", "solib", lib_name)
+                    put_bytes(p, lib_bytes)
+                    hw["shared_libs"].append({"src_path": p, "name": lib_name})
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"}, [hw, py], ["//a:node"])
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                rt_lib = os.path.join(tmp, "out", RUNTIME_DIR, RUNTIME, "lib")
+                self.assertEqual(
+                    os.path.isfile(os.path.join(rt_lib, "libpython3.11.so.1.0")),
+                    kept, label)
+                self.assertEqual(
+                    os.path.isfile(os.path.join(rt_lib, "libpython3.so")),
+                    kept, label)
+                if label == "macos macho and dylib":
+                    self.assertTrue(os.path.isfile(
+                        os.path.join(rt_lib, "libpython3.11.dylib")))
+
+    # REQ-OPS-48
+    def test_elf_needed_libraries_parses_formats_and_fails_closed(self):
+        builder_path = runfiles.Create().Rlocation(
+            "_main/talOS/build/bundle_builder.py")
+        spec = importlib.util.spec_from_file_location(
+            "bundle_builder", builder_path)
+        bb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bb)
+        with tempfile.TemporaryDirectory() as tmp:
+            p64 = os.path.join(tmp, "e64")
+            put_bytes(p64, make_elf(["libc.so.6", "libm.so.6"], bits=64, endian="<"))
+            self.assertEqual(bb.elf_needed_libraries(p64), ["libc.so.6", "libm.so.6"])
+
+            p32 = os.path.join(tmp, "e32be")
+            put_bytes(p32, make_elf(["libpython3.so"], bits=32, endian=">"))
+            self.assertEqual(bb.elf_needed_libraries(p32), ["libpython3.so"])
+
+            prel = os.path.join(tmp, "obj.o")
+            put_bytes(prel, make_elf(e_type=1))
+            self.assertEqual(bb.elf_needed_libraries(prel), [])
+
+            ptext = os.path.join(tmp, "script.sh")
+            put(ptext, "#!/bin/sh\n")
+            self.assertIsNone(bb.elf_needed_libraries(ptext))
+
+            pbad = os.path.join(tmp, "bad.elf")
+            put_bytes(pbad, b"\x7fELF" + b"\x00" * 12)
+            with self.assertRaises(bb.ElfParseError):
+                bb.elf_needed_libraries(pbad)
 
     def test_run_script_through_a_link_passes_the_physical_bundle(self):
         # The boot service starts <prefix>/current/run.sh. Node binaries come

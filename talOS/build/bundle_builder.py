@@ -6,9 +6,11 @@ import filecmp
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
+import struct
 import sys
 
 
@@ -204,6 +206,219 @@ def alias_interpreter_copies(interpreter):
             write_exec_script(path, interpreter,
                               f"{entry}: the interpreter, held once as "
                               f"{os.path.basename(interpreter)}.")
+
+
+class ElfParseError(Exception):
+    """Raised when a file starting with the ELF magic cannot be parsed."""
+
+
+_ELF_ET_REL = 1
+_ELF_ET_EXEC = 2
+_ELF_ET_DYN = 3
+_ELF_PT_LOAD = 1
+_ELF_PT_DYNAMIC = 2
+_ELF_DT_NULL = 0
+_ELF_DT_NEEDED = 1
+_ELF_DT_STRTAB = 5
+_ELF_DT_STRSZ = 10
+_ELF_DT_AUXILIARY = 0x7FFFFFFD
+_ELF_DT_FILTER = 0x7FFFFFFF
+_ELF_PN_XNUM = 0xFFFF
+
+# Shared libraries of a Linux CPython runtime that a statically-linked python3
+# binary (rules_python's python-build-standalone) ships unused beside it. Never
+# matches macOS .dylib files.
+LIBPYTHON_SO_RE = re.compile(r"^libpython3(?:\.\d+)?\.so(?:\.\d+)*$")
+
+
+def _is_libpython_needed(soname):
+    return soname.rsplit("/", 1)[-1].startswith("libpython")
+
+
+def elf_needed_libraries(path):
+    """Returns the dynamic dependency names (DT_NEEDED / DT_AUXILIARY /
+    DT_FILTER) of an ELF file, or None when `path` is not an ELF file.
+    Raises ElfParseError on any malformed or unsupported ELF structure so
+    callers fail closed."""
+    with open(path, "rb") as f:
+        ident = f.read(16)
+        if len(ident) < 4 or ident[:4] != b"\x7fELF":
+            return None
+        if len(ident) < 16:
+            raise ElfParseError(f"{path}: truncated ELF ident")
+        ei_class, ei_data, ei_version = ident[4], ident[5], ident[6]
+        if ei_class not in (1, 2) or ei_data not in (1, 2) or ei_version != 1:
+            raise ElfParseError(
+                f"{path}: unsupported ELF header "
+                f"(class={ei_class}, data={ei_data}, version={ei_version})")
+        endian = "<" if ei_data == 1 else ">"
+        is64 = ei_class == 2
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        f.seek(16)
+        if is64:
+            ehdr_size = 64
+            hdr = f.read(48)
+            if len(hdr) < 48:
+                raise ElfParseError(f"{path}: truncated ELF64 header")
+            (e_type, _e_machine, _e_version, _e_entry, e_phoff, _e_shoff,
+             _e_flags, _e_ehsize, e_phentsize, e_phnum) = struct.unpack(
+                endian + "HHIQQQIHHH", hdr[:42])
+            min_phent = 56
+        else:
+            ehdr_size = 52
+            hdr = f.read(36)
+            if len(hdr) < 36:
+                raise ElfParseError(f"{path}: truncated ELF32 header")
+            (e_type, _e_machine, _e_version, _e_entry, e_phoff, _e_shoff,
+             _e_flags, _e_ehsize, e_phentsize, e_phnum) = struct.unpack(
+                endian + "HHIIIIIHHH", hdr[:30])
+            min_phent = 32
+        if e_type == _ELF_ET_REL:
+            return []
+        if e_type not in (_ELF_ET_EXEC, _ELF_ET_DYN):
+            raise ElfParseError(f"{path}: unsupported ELF type {e_type}")
+        if e_phnum == _ELF_PN_XNUM:
+            raise ElfParseError(f"{path}: extended phnum unsupported")
+        if e_phnum == 0:
+            return []
+        if (e_phoff < ehdr_size or e_phentsize < min_phent
+                or e_phoff + e_phnum * e_phentsize > file_size):
+            raise ElfParseError(f"{path}: invalid program header table")
+        loads = []
+        dynamic = None
+        f.seek(e_phoff)
+        ph_data = f.read(e_phnum * e_phentsize)
+        if len(ph_data) != e_phnum * e_phentsize:
+            raise ElfParseError(f"{path}: truncated program header table")
+        for i in range(e_phnum):
+            ent = ph_data[i * e_phentsize : i * e_phentsize + min_phent]
+            if is64:
+                (p_type, _p_flags, p_offset, p_vaddr, _p_paddr, p_filesz,
+                 _p_memsz, _p_align) = struct.unpack(endian + "IIQQQQQQ", ent)
+            else:
+                (p_type, p_offset, p_vaddr, _p_paddr, p_filesz, _p_memsz,
+                 _p_flags, _p_align) = struct.unpack(endian + "IIIIIIII", ent)
+            if p_type == _ELF_PT_LOAD:
+                loads.append((p_vaddr, p_offset, p_filesz))
+            elif p_type == _ELF_PT_DYNAMIC:
+                if dynamic is not None:
+                    raise ElfParseError(f"{path}: multiple PT_DYNAMIC segments")
+                dynamic = (p_offset, p_filesz)
+        if dynamic is None:
+            return []
+        dyn_offset, dyn_filesz = dynamic
+        if dyn_offset + dyn_filesz > file_size:
+            raise ElfParseError(f"{path}: PT_DYNAMIC past EOF")
+        f.seek(dyn_offset)
+        dyn_data = f.read(dyn_filesz)
+        if len(dyn_data) != dyn_filesz:
+            raise ElfParseError(f"{path}: truncated PT_DYNAMIC")
+        entry_size = 16 if is64 else 8
+        entry_fmt = endian + ("qQ" if is64 else "iI")
+        needed_offsets = []
+        strtab_vaddr = None
+        strsz = None
+        for off in range(0, len(dyn_data) - entry_size + 1, entry_size):
+            d_tag, d_val = struct.unpack_from(entry_fmt, dyn_data, off)
+            if d_tag == _ELF_DT_NULL:
+                break
+            if d_tag in (_ELF_DT_NEEDED, _ELF_DT_AUXILIARY, _ELF_DT_FILTER):
+                needed_offsets.append(d_val)
+            elif d_tag == _ELF_DT_STRTAB:
+                strtab_vaddr = d_val
+            elif d_tag == _ELF_DT_STRSZ:
+                strsz = d_val
+        if not needed_offsets:
+            return []
+        if strtab_vaddr is None or strsz is None:
+            raise ElfParseError(
+                f"{path}: DT_NEEDED without DT_STRTAB/DT_STRSZ")
+        strtab_offset = None
+        for p_vaddr, p_offset, p_filesz in loads:
+            if (p_vaddr <= strtab_vaddr
+                    and strtab_vaddr + strsz <= p_vaddr + p_filesz):
+                strtab_offset = p_offset + (strtab_vaddr - p_vaddr)
+                break
+        if strtab_offset is None or strtab_offset + strsz > file_size:
+            raise ElfParseError(f"{path}: DT_STRTAB outside PT_LOAD")
+        f.seek(strtab_offset)
+        strtab = f.read(strsz)
+        if len(strtab) != strsz:
+            raise ElfParseError(f"{path}: truncated DT_STRTAB")
+        needed = []
+        for off in needed_offsets:
+            if off >= strsz:
+                raise ElfParseError(
+                    f"{path}: DT_NEEDED offset {off} out of range ({strsz})")
+            end = strtab.find(b"\x00", off)
+            if end == -1:
+                raise ElfParseError(f"{path}: unterminated DT_NEEDED string")
+            needed.append(
+                strtab[off:end].decode("utf-8", errors="surrogateescape"))
+        return needed
+
+
+def strip_unused_libpython(out_dir, interpreters):
+    """Removes `libpython3*.so*` from each bundled Linux Python runtime's
+    `lib/` when every interpreter of that runtime is an ELF binary that does
+    not list `libpython*` in its dynamic dependencies and no other ELF binary
+    or shared library in the bundle lists `libpython*` (REQ-OPS-48).
+
+    Fails closed: non-ELF runtimes (macOS Mach-O / `.dylib`), dynamically
+    linked Python runtimes, bundles with any extension needing `libpython*`,
+    and any unparseable ELF file leave `libpython3*.so*` untouched."""
+    if not interpreters:
+        return
+    runtime_root = os.path.join(out_dir, RUNTIME_DIR)
+    by_repo = {}
+    for interp in sorted(interpreters):
+        rel = os.path.relpath(interp, runtime_root)
+        parts = rel.split(os.sep)
+        if parts and parts[0] not in (os.curdir, os.pardir):
+            by_repo.setdefault(parts[0], []).append(interp)
+
+    all_candidates = set()
+    for repo, repo_interps in sorted(by_repo.items()):
+        lib_dir = os.path.join(runtime_root, repo, "lib")
+        if not os.path.isdir(lib_dir):
+            continue
+        candidates = {
+            os.path.join(lib_dir, entry)
+            for entry in os.listdir(lib_dir)
+            if LIBPYTHON_SO_RE.match(entry)
+            and os.path.isfile(os.path.join(lib_dir, entry))
+        }
+        if not candidates:
+            continue
+        try:
+            for interp in repo_interps:
+                needed = elf_needed_libraries(interp)
+                if needed is None or any(_is_libpython_needed(n) for n in needed):
+                    candidates = set()
+                    break
+        except ElfParseError:
+            continue
+        all_candidates.update(candidates)
+
+    if not all_candidates:
+        return
+
+    for root, _, files in os.walk(out_dir):
+        for fn in files:
+            path = os.path.join(root, fn)
+            if path in all_candidates or not os.path.isfile(path):
+                continue
+            try:
+                needed = elf_needed_libraries(path)
+            except ElfParseError:
+                return
+            if needed and any(_is_libpython_needed(n) for n in needed):
+                return
+
+    for path in sorted(all_candidates):
+        make_writable(path)
+        os.remove(path)
 
 
 def parse_repo_mappings(paths):
@@ -524,9 +739,6 @@ def main():
             "language": lang,
         })
 
-    for interpreter in sorted(interpreters):
-        alias_interpreter_copies(interpreter)
-
     # 5. Studio: the bridge binary and the built site it serves, which the
     # launcher's LoadBundle registers for --start-studio-bridge.
     studio_lines = []
@@ -551,6 +763,13 @@ def main():
                              canonical_to_apparent)) + "]",
             f"webroot = {json.dumps(webroot_rel)}",
         ]
+
+    # Strip unused libpython3*.so* once every node, library and Studio binary
+    # is staged, before alias_interpreter_copies turns duplicate interpreters
+    # into exec scripts.
+    strip_unused_libpython(out_dir, interpreters)
+    for interpreter in sorted(interpreters):
+        alias_interpreter_copies(interpreter)
 
     # 6. bundle_manifest.toml, read by the launcher's LoadBundle. A JSON string
     # literal (ASCII, \uXXXX escapes) is also a valid TOML basic string.
