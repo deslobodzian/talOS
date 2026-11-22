@@ -1,17 +1,27 @@
 #include "talOS/vision/recording/recorder.h"
 
 #include <gtest/gtest.h>
+#if defined(__linux__)
+#include <poll.h>
+#include <sched.h>
+#include <sys/inotify.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
+#include "talOS/process/process.h"
 #include "talOS/vision/frame.h"
 #include "talOS/vision/recording/recording.h"
 
@@ -430,6 +440,66 @@ TEST_F(RecorderTest, RejectsFramesFailingHoldsImageCheck) {
   EXPECT_TRUE(rec.Record(valid_rgb, MakeRecord(2, "sampled")));
   EXPECT_EQ(rec.recorded(), 1u);
 }
+
+#if defined(__linux__)
+// REQ-RT-10: the frame recorder's writer thread runs at background priority
+// (non-realtime policy, nice >= kBackgroundNice) below every node loop.
+TEST_F(RecorderTest, WriterThreadRunsAtBackgroundPriority) {
+  const auto list_tids = [] {
+    std::set<int> tids;
+    for (const auto& entry :
+         std::filesystem::directory_iterator("/proc/self/task")) {
+      tids.insert(std::stoi(entry.path().filename().string()));
+    }
+    return tids;
+  };
+
+  std::filesystem::create_directories(dir_);
+  const int inotify_fd = ::inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+  ASSERT_GE(inotify_fd, 0);
+  const int wd = ::inotify_add_watch(inotify_fd, dir_.c_str(), IN_MOVED_TO);
+  ASSERT_GE(wd, 0);
+
+  const std::set<int> before = list_tids();
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.context = MakeContext();
+  opts.sample_hz = 1e12;
+  opts.queue_slots = 4;
+  FrameRecorder rec{std::move(opts)};
+
+  std::vector<int> spawned;
+  for (const int tid : list_tids()) {
+    if (!before.contains(tid)) spawned.push_back(tid);
+  }
+  ASSERT_EQ(spawned.size(), 1u);
+  const int writer_tid = spawned.front();
+
+  // Wait for one written JSON pair (moved atomically into dir_) so the writer
+  // thread is guaranteed to have passed ConfigureBackgroundThread().
+  ASSERT_TRUE(rec.Record(MakeGrayFrame(), MakeRecord(0, "sampled")));
+  const auto committed = dir_ / "00000000000000000000_sampled.json";
+  while (!std::filesystem::exists(committed)) {
+    pollfd pfd{.fd = inotify_fd, .events = POLLIN, .revents = 0};
+    const int ready = ::poll(&pfd, 1, 5000);
+    ASSERT_GT(ready, 0) << "timed out waiting for recorder writer";
+    char buf[4096];
+    while (::read(inotify_fd, buf, sizeof buf) > 0) {
+    }
+  }
+  ::close(inotify_fd);
+
+  const int raw_policy = ::sched_getscheduler(writer_tid);
+  ASSERT_GE(raw_policy, 0);
+  const int policy = raw_policy & ~SCHED_RESET_ON_FORK;
+  EXPECT_NE(policy, SCHED_FIFO);
+  EXPECT_NE(policy, SCHED_RR);
+  errno = 0;
+  const int nice = ::getpriority(PRIO_PROCESS, static_cast<id_t>(writer_tid));
+  ASSERT_EQ(errno, 0);
+  EXPECT_GE(nice, talos::process::kBackgroundNice);
+}
+#endif
 
 }  // namespace
 }  // namespace talos::vision::recording

@@ -4,6 +4,9 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -2917,6 +2920,274 @@ TEST_F(ReviewTest, CodecRejectedHardwarePacketRefusesAllHardwareChannels) {
     EXPECT_EQ(tl["hardware_not_decoded"], true);
     EXPECT_TRUE(tl["modes"].empty()) << tl.dump();
 
+    std::filesystem::remove_all(dir);
+  }
+}
+
+// Current resident set size of this process in bytes, or 0 if unavailable.
+std::uint64_t CurrentResidentBytes() {
+#if defined(__linux__)
+  std::ifstream statm{"/proc/self/statm"};
+  std::uint64_t size_pages = 0;
+  std::uint64_t rss_pages = 0;
+  if (!(statm >> size_pages >> rss_pages)) return 0;
+  const long page_bytes = ::sysconf(_SC_PAGESIZE);
+  if (page_bytes <= 0) return 0;
+  return rss_pages * static_cast<std::uint64_t>(page_bytes);
+#elif defined(__APPLE__)
+  mach_task_basic_info_data_t info{};
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (::task_info(::mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info),
+                  &count) != KERN_SUCCESS) {
+    return 0;
+  }
+  return info.resident_size;
+#else
+  return 0;
+#endif
+}
+
+// A reflection schema for a 1024-byte struct with one double field at offset 0.
+std::string WideStructSchema(const std::string& struct_name) {
+  flatbuffers::FlatBufferBuilder fbb;
+  const auto double_type = reflection::CreateType(
+      fbb, reflection::BaseType::Double, reflection::BaseType::None, -1, 0, 8);
+  std::vector<flatbuffers::Offset<reflection::Field>> fields{
+      reflection::CreateFieldDirect(fbb, "position_m", double_type, 0, 0)};
+  std::vector<flatbuffers::Offset<reflection::Object>> objects{
+      reflection::CreateObjectDirect(fbb, struct_name.c_str(), &fields,
+                                     /*is_struct=*/true, /*minalign=*/8,
+                                     /*bytesize=*/1024)};
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+  reflection::FinishSchemaBuffer(
+      fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+  return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+}
+
+// Guards REQ-OPS-42: opening and querying a multi-MiB `.tlog` streams through
+// a fixed read window and never reads the file whole, so both the session's
+// index and the process's RSS delta stay far below the file size on disk.
+// REQ-OPS-42
+TEST_F(ReviewTest, MultiMiBLogStreamsWithoutReadingFileWhole) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+
+  const std::string dir = Library() + "/multi_mib";
+  std::filesystem::create_directories(dir);
+  constexpr std::size_t kPayloadBytes = 1024;
+  constexpr std::uint64_t kRecords = 24'000;  // ~25.7 MiB on disk
+  const std::string log_path = dir + "/wide.tlog";
+  {
+    talos::event::Registration reg;
+    reg.id = 2;
+    reg.kind = SourceKind::SENDER;
+    reg.name = "/wide/state";
+    reg.message_bytes = kPayloadBytes;
+    reg.schema = {"review_test.Wide", 991024,
+                  WideStructSchema("review_test.Wide")};
+    tlog::LogWriter writer{log_path, "wide",
+                           tlog::LogWriterOptions{1u << 20, 4, false}, 1};
+    writer.start({reg}, MonotonicTime::from_nanos(kStartNs));
+    // Fill with non-zero bytes so trailing-zero stripping keeps all 1024 bytes.
+    std::array<std::byte, kPayloadBytes> payload;
+    payload.fill(std::byte{0x5A});
+    for (std::uint64_t i = 0; i < kRecords; ++i) {
+      const double pos = static_cast<double>(i) * 0.25;
+      std::memcpy(payload.data(), &pos, sizeof pos);
+      Context ctx{};
+      ctx.dispatch_index = i + 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(
+          kStartNs + static_cast<std::int64_t>(i) * kMs);
+      writer.send(ctx, 2, payload, 0, i + 1);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  const std::uint64_t file_bytes = std::filesystem::file_size(log_path);
+  ASSERT_GE(file_bytes, std::uint64_t{24} << 20);
+
+  const std::uint64_t rss_before = CurrentResidentBytes();
+  const auto session = Session::Open(dir);
+  const auto ref = session->Find("wide/state/position_m");
+  ASSERT_TRUE(ref.has_value());
+  const auto series = session->ReadSeries(
+      std::span{&*ref, 1}, session->start_ns(), session->end_ns() + 1, 16);
+  ASSERT_EQ(series.size(), 1u);
+  EXPECT_DOUBLE_EQ(series[0].last.back(),
+                   static_cast<double>(kRecords - 1) * 0.25);
+  const auto snap = session->Snapshot(session->end_ns());
+  ASSERT_FALSE(snap.empty());
+  const std::uint64_t rss_after = CurrentResidentBytes();
+
+  // Index is 24 B per log-file second (~24 seconds -> ~576 B), far below the
+  // multi-MiB file size.
+  EXPECT_LE(session->index_bytes(), session->log_seconds() * 24u + 1024u);
+  EXPECT_LT(session->index_bytes(), file_bytes / 1000u);
+  if (rss_before > 0 && rss_after > rss_before) {
+    // Reading the file whole would grow RSS by >= file_bytes (~25+ MiB);
+    // streaming stays far below a quarter of the file size.
+    EXPECT_LT(rss_after - rss_before, file_bytes / 4u)
+        << "rss_before=" << rss_before << " rss_after=" << rss_after
+        << " file_bytes=" << file_bytes;
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
+// Reflection schema for `/hw/status` carrying a `protocol_version_id` ushort.
+std::string BridgeStatusProtocolSchema() {
+  flatbuffers::FlatBufferBuilder fbb;
+  const auto ushort_type = reflection::CreateType(
+      fbb, reflection::BaseType::UShort, reflection::BaseType::None, -1, 0, 2);
+  std::vector<flatbuffers::Offset<reflection::Field>> fields{
+      reflection::CreateFieldDirect(fbb, "protocol_version_id", ushort_type, 0,
+                                    0)};
+  std::vector<flatbuffers::Offset<reflection::Object>> objects{
+      reflection::CreateObjectDirect(fbb, "bridge.BridgeStatus", &fields,
+                                     /*is_struct=*/true, /*minalign=*/2,
+                                     /*bytesize=*/2)};
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+  reflection::FinishSchemaBuffer(
+      fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+  return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+}
+
+// Guards REQ-OPS-51: when a session's bridge `/hw/status` protocol_version_id
+// disagrees with its manifest's hardware_protocol_version, studio_review prints
+// one warning naming both versions and reads the session under the bridge's
+// version (decoding hardware channels when the bridge matches this build even
+// if the manifest disagrees, and refusing them when the bridge is foreign even
+// if the manifest matches this build).
+// REQ-OPS-51
+TEST_F(ReviewTest, BridgeVsManifestProtocolDisagreementWarnsAndUsesBridge) {
+  namespace ds = talos::driver_station;
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  using P = talos::Descriptor<talos::hardware::Packet>;
+
+  const std::uint16_t build = talos::protocol::kProtocolVersion;
+  const std::uint16_t other = static_cast<std::uint16_t>(build - 1);
+  const std::string status_bfbs = BridgeStatusProtocolSchema();
+
+  struct Case {
+    const char* id;
+    std::uint16_t bridge_ver;
+    std::uint16_t manifest_ver;
+    bool expect_decoded;
+  };
+  for (const Case& c : {
+           Case{"disagree_bridge_ok", build, other, true},
+           Case{"disagree_bridge_foreign", other, build, false},
+       }) {
+    SCOPED_TRACE(c.id);
+    const std::string dir = Library() + "/" + c.id;
+    std::filesystem::create_directories(dir);
+    std::ofstream{dir + "/manifest.json"}
+        << "{\n  \"session_id\": 1,\n  \"hardware_protocol_version\": "
+        << c.manifest_ver << ",\n  \"nodes\": []\n}\n";
+    {
+      talos::event::Registration status_src;
+      status_src.id = 2;
+      status_src.kind = SourceKind::SENDER;
+      status_src.name = "/hw/status";
+      status_src.message_bytes = sizeof(std::uint16_t);
+      status_src.schema = {"bridge.BridgeStatus", 77001, status_bfbs};
+
+      talos::event::Registration ds_src;
+      ds_src.id = 3;
+      ds_src.kind = SourceKind::SENDER;
+      ds_src.name = "/hw/state/driver_station";
+      ds_src.message_bytes = sizeof(talos::hardware::Packet);
+      ds_src.schema = {std::string{P::kName}, P::kHash, {}};
+
+      tlog::LogWriter writer{dir + "/hardware_node.tlog", "hardware_node",
+                             tlog::LogWriterOptions{8192, 1, false}, 1};
+      writer.start({status_src, ds_src}, MonotonicTime::from_nanos(kStartNs));
+
+      const std::uint16_t ver = c.bridge_ver;
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(ctx, 2, std::as_bytes(std::span{&ver, 1}), 0, 1);
+
+      ds::DriverStationData ds_data{};
+      ds_data.fms.flags = ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+      ds_data.fms.match_time_s = 42.0f;
+      talos::hardware::Packet ds_pkt{};
+      ds_pkt.size =
+          static_cast<std::uint32_t>(ds::Encode(ds_data, ds_pkt.data));
+      ASSERT_GT(ds_pkt.size, 0u);
+      ctx.dispatch_index = 2;
+      ctx.event_time = ctx.now = MonotonicTime::from_nanos(kStartNs + kMs);
+      writer.send(ctx, 3, std::as_bytes(std::span{&ds_pkt, 1}), 0, 1);
+
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+
+    Review review{Library(), 1u << 20};
+    ::testing::internal::CaptureStderr();
+    const Response channels =
+        review.Get("/review/" + std::string{c.id} + "/channels.json", "");
+    const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+    ASSERT_EQ(channels.status, 200) << channels.body;
+
+    // One disagreement warning line naming both versions and reading under the
+    // bridge's version.
+    const std::string bridge_str = std::to_string(c.bridge_ver);
+    const std::string manifest_str = std::to_string(c.manifest_ver);
+    EXPECT_NE(
+        stderr_text.find("bridge recorded hardware protocol " + bridge_str),
+        std::string::npos)
+        << stderr_text;
+    EXPECT_NE(stderr_text.find("its launcher " + manifest_str),
+              std::string::npos)
+        << stderr_text;
+    EXPECT_NE(stderr_text.find("read under the bridge's"), std::string::npos)
+        << stderr_text;
+    if (c.expect_decoded) {
+      EXPECT_EQ(std::count(stderr_text.begin(), stderr_text.end(), '\n'), 1)
+          << stderr_text;
+    }
+
+    const json listed = json::parse(channels.body);
+    bool has_ds_channel = false;
+    bool has_status_channel = false;
+    for (const auto& ch : listed["channels"]) {
+      const std::string name = ch["name"];
+      if (name == "hw/state/driver_station/match_time_s") {
+        has_ds_channel = true;
+      }
+      if (name == "hw/status/protocol_version_id") {
+        has_status_channel = true;
+      }
+      if (!c.expect_decoded) {
+        EXPECT_FALSE(name.starts_with("hw/state/") ||
+                     name.starts_with("hw/request/") ||
+                     name.starts_with("hw/command"))
+            << name;
+      }
+    }
+    EXPECT_TRUE(has_status_channel) << channels.body;
+    EXPECT_EQ(has_ds_channel, c.expect_decoded) << channels.body;
+
+    const json bounds = json::parse(
+        review.Get("/review/" + std::string{c.id} + "/bounds.json", "").body);
+    if (c.expect_decoded) {
+      EXPECT_TRUE(bounds["hardware_not_decoded"].is_null()) << bounds;
+    } else {
+      ASSERT_TRUE(bounds["hardware_not_decoded"].is_string()) << bounds;
+      const std::string reason = bounds["hardware_not_decoded"];
+      EXPECT_NE(reason.find(bridge_str), std::string::npos) << reason;
+      EXPECT_NE(reason.find(std::to_string(build)), std::string::npos)
+          << reason;
+    }
     std::filesystem::remove_all(dir);
   }
 }

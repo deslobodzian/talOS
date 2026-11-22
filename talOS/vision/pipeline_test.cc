@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "talOS/process/process.h"
 #include "talOS/vision/metal/metal_apriltag_backend.h"
 #include "talOS/vision/synthetic_source.h"
 
@@ -294,6 +296,28 @@ TEST(PipelineTest, AutoFallbackHonorsSettingsAndForcedMetalRejectsThem) {
   ExpectInvalid(config, "detector.sigma");
   config.detector_options.quad_sigma = 0;
   ExpectInvalid(config, "detector.decimate");
+}
+
+// REQ-RT-10: deferred GPU compilation runs on a background thread configured
+// via ConfigureBackgroundThread(), below every realtime node loop.
+TEST(PipelineTest, DeferredGpuInitWorkerRunsAtBackgroundPriority) {
+  auto promise = std::make_shared<std::promise<bool>>();
+  std::future<bool> worker_is_background = promise->get_future();
+  auto gate = std::make_shared<Gate>();
+  gate->Open();
+
+  auto config = Config();
+  config.backend_name = "auto";
+  config.deferred_gpu_init = true;
+  config.gpu_backend_factory = [promise,
+                                gate](const apriltag::DetectorOptions&) {
+    promise->set_value(talos::process::ThreadIsBackground());
+    return std::make_shared<SlowGpuBackend>(gate);
+  };
+  AprilTagPipeline pipeline(config);
+  ASSERT_EQ(worker_is_background.wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+  EXPECT_TRUE(worker_is_background.get());
 }
 
 }  // namespace

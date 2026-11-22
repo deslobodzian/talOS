@@ -456,6 +456,53 @@ class BundleBuilderTest(unittest.TestCase):
                                           os.X_OK))
                 self.assertTrue(os.path.isfile(
                     os.path.join(out, studio["webroot"], "index.html")))
+                self.assertTrue(os.path.isfile(
+                    os.path.join(out, studio["webroot"], "drive.html")))
+
+    # REQ-OPS-39
+    def test_studio_dashboard_layout_stages_under_config_with_matching_bytes(self):
+        # [studio] dashboard is listed in CONFIG_FILES and staged beside the
+        # config under out/config/ with matching bytes and included in
+        # config_sha256.
+        layout = (
+            "[dashboard]\nupdate_hz = 10\n"
+            "[[widgets]]\nkind = \"match\"\nat = [0, 0, 4, 2]\n"
+        )
+        robot_toml = "[robot]\n[studio]\ndashboard = \"layouts/drive.toml\"\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.assemble(
+                tmp,
+                {
+                    "bot/config/robot.toml": robot_toml,
+                    "bot/config/layouts/drive.toml": layout,
+                },
+                [node(tmp, "hardware_node", HARDWARE_NODE)],
+                (),
+                effective={"studio": {"dashboard": "bot/config/layouts/drive.toml"}},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = os.path.join(tmp, "out")
+            staged = os.path.join(out, "config", "layouts", "drive.toml")
+            self.assertTrue(os.path.isfile(staged), staged)
+            with open(staged, encoding="utf-8") as f:
+                self.assertEqual(f.read(), layout)
+            with open(os.path.join(out, "bundle_manifest.toml"), "rb") as f:
+                sha_before = tomllib.load(f)["config_sha256"]
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.assemble(
+                tmp,
+                {
+                    "bot/config/robot.toml": robot_toml,
+                    "bot/config/layouts/drive.toml": layout + "# changed\n",
+                },
+                [node(tmp, "hardware_node", HARDWARE_NODE)],
+                (),
+                effective={"studio": {"dashboard": "bot/config/layouts/drive.toml"}},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(os.path.join(tmp, "out", "bundle_manifest.toml"), "rb") as f:
+                sha_after = tomllib.load(f)["config_sha256"]
+            self.assertNotEqual(sha_before, sha_after)
 
     def test_runfiles_the_bundle_cannot_hold_fail(self):
         # A Python node imports from its runfiles only on the robot. A link

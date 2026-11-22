@@ -41,13 +41,18 @@ import glob
 import json
 import os
 import plistlib
+import re
+import select
 import shlex
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+import urllib.request
 
 from python.runfiles import runfiles
 
@@ -281,6 +286,8 @@ class BundleTest(unittest.TestCase):
                                   out)
                     self.assertTrue(os.path.isfile(os.path.join(
                         where, studio["webroot"], "index.html")), studio)
+                    self.assertTrue(os.path.isfile(os.path.join(
+                        where, studio["webroot"], "drive.html")), studio)
                 for node in graph["nodes"]:
                     self.assertTrue(node.get("described"),
                                     f"{node.get('name')}: {node.get('describe_error')}\n{out}")
@@ -445,6 +452,117 @@ class BundleTest(unittest.TestCase):
                     if os.path.islink(os.path.join(parent, entry))
                 ]
                 self.assertEqual(links, [], (name, links[:10]))
+
+    # REQ-OPS-34: an installed Studio bundle started via run.sh serves `/`
+    # and `/drive` (200, no-cache, bundled HTML bodies) and content-hashed
+    # `/assets/*` (200, public, max-age=31536000, immutable) on the config's
+    # non-default `[studio] http_port`.
+    def test_installed_studio_bundle_serves_studio_and_drive_over_http(self):
+        def free_port(kind, avoid=()):
+            while True:
+                with socket.socket(socket.AF_INET, kind) as s:
+                    s.bind(("127.0.0.1", 0))
+                    port = s.getsockname()[1]
+                if port not in avoid:
+                    return port
+
+        src = runfiles.Create().Rlocation(
+            "_main/bench/main_processor/bench_bundle")
+        self.assertTrue(src and os.path.isdir(src), src)
+        with tempfile.TemporaryDirectory(
+                dir=os.environ["TEST_TMPDIR"],
+                ignore_cleanup_errors=True) as tmp:
+            copy = os.path.join(tmp, "bundle")
+            shutil.copytree(src, copy)
+            with open(os.path.join(copy, "bundle_manifest.toml"), "rb") as f:
+                manifest = tomllib.load(f)
+            http_port = free_port(socket.SOCK_STREAM, avoid=(5800,))
+            remote_port = free_port(socket.SOCK_DGRAM)
+            local_port = free_port(socket.SOCK_DGRAM, avoid=(remote_port,))
+            cfg_path = os.path.join(copy, manifest["config_path"])
+            os.chmod(cfg_path, 0o644)
+            with open(cfg_path, "a", encoding="utf-8") as f:
+                f.write(f"\n[studio]\nhttp_port = {http_port}\n")
+
+            prefix = os.path.join(tmp, "prefix")
+            subprocess.run(
+                ["bash", deploy_script(), "install", copy, "--prefix", prefix,
+                 "--no-warm-up"],
+                check=True, capture_output=True, text=True, timeout=120)
+            installed = os.path.realpath(os.path.join(prefix, "current"))
+            webroot = os.path.join(installed, manifest["studio"]["webroot"])
+            with open(os.path.join(webroot, "index.html"), "rb") as f:
+                index_body = f.read()
+            with open(os.path.join(webroot, "drive.html"), "rb") as f:
+                drive_body = f.read()
+            hashed_re = re.compile(r"^.+-([A-Za-z0-9_-]{8})\.[^.]+$")
+            assets_dir = os.path.join(webroot, "assets")
+            hashed_assets = sorted(
+                name for name in os.listdir(assets_dir)
+                if hashed_re.match(name)
+                and os.path.isfile(os.path.join(assets_dir, name)))
+            self.assertTrue(hashed_assets, os.listdir(assets_dir))
+            asset_name = hashed_assets[0]
+            with open(os.path.join(assets_dir, asset_name), "rb") as f:
+                asset_body = f.read()
+
+            log_dir = os.path.join(prefix, "logs")
+            env = dict(
+                os.environ,
+                TALOS_LOG_DIR=log_dir,
+                TALOS_SHM_NAMESPACE=f"bundle_studio_{os.getpid()}",
+            )
+            proc = subprocess.Popen(
+                [os.path.join(installed, "run.sh"), "--sim",
+                 "--remote", "127.0.0.1",
+                 "--remote-port", str(remote_port),
+                 "--local-port", str(local_port)],
+                cwd=installed, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            output_chunks = []
+            try:
+                marker = f"on http://localhost:{http_port}\n".encode()
+                buf = b""
+                fd = proc.stdout.fileno()
+                while marker not in buf:
+                    ready, _, _ = select.select([fd], [], [], 30)
+                    if not ready:
+                        break
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    output_chunks.append(chunk)
+                    buf += chunk
+                self.assertIn(
+                    marker, buf,
+                    f"studio_bridge did not announce http://localhost:{http_port}:\n"
+                    f"{buf.decode(errors='replace')}")
+
+                for path, expected_cc, expected_body in (
+                        ("/", "no-cache", index_body),
+                        ("/drive", "no-cache", drive_body),
+                        (f"/assets/{asset_name}",
+                         "public, max-age=31536000, immutable",
+                         asset_body)):
+                    with self.subTest(path=path):
+                        with urllib.request.urlopen(
+                                f"http://127.0.0.1:{http_port}{path}",
+                                timeout=5) as resp:
+                            self.assertEqual(resp.status, 200)
+                            self.assertEqual(
+                                resp.headers.get("Cache-Control"), expected_cc)
+                            self.assertEqual(resp.read(), expected_body)
+            finally:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGINT)
+                try:
+                    rest, _ = proc.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    rest, _ = proc.communicate()
+                output_chunks.append(rest or b"")
+            full_output = b"".join(output_chunks).decode(errors="replace")
+            self.assertEqual(proc.returncode, 0, full_output)
 
 
 def launcher_stop_timeout_s():
