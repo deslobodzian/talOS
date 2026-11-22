@@ -259,6 +259,10 @@ function HardwarePanel() {
   const stateAgeUs = num('state_age_us');
   const configured = flag('configured');
   const subsystemCount = num('subsystem_count');
+  const protocolVersion = num('protocol_version_id');
+  const mismatchedProtocol = num('mismatched_protocol_version_id');
+  const protocolMismatch = flag('alert_error_protocol_mismatch') === true ||
+      (mismatchedProtocol !== undefined && mismatchedProtocol !== 0);
   const timeoutUs = num('command_timeout_us');  // not published by the 2026 bridge
 
   const counterRows: CounterRow[] = useMemo(() => {
@@ -285,7 +289,9 @@ function HardwarePanel() {
 
   const anyHardware = present.has(`${HW}battery_v`) ||
       present.has(`${HW}state_age_us`) || counterRows.length > 0 ||
-      present.has(`${HW}clock_offset_us`);
+      present.has(`${HW}clock_offset_us`) ||
+      present.has(`${HW}protocol_version_id`) ||
+      present.has(`${HW}mismatched_protocol_version_id`);
 
   if (!anyHardware) {
     return <div className="hardware">
@@ -359,7 +365,16 @@ function HardwarePanel() {
         <Stat label="Subsystems" channel={`${HW}subsystem_count`}>
           {subsystemCount === undefined ? '—' : integer(subsystemCount)}
         </Stat>
-        <Stat label="Protocol" channel={`${HW}protocol_version_id`}>{count(num('protocol_version_id'))}</Stat>
+        <Stat label="Protocol"
+              channel={protocolMismatch && present.has(`${HW}mismatched_protocol_version_id`) ?
+                  `${HW}mismatched_protocol_version_id` : `${HW}protocol_version_id`}
+              tone={protocolMismatch ? 'warn' : undefined}>
+          {protocolMismatch ?
+              (mismatchedProtocol !== undefined && mismatchedProtocol !== 0 ?
+                  `mismatch (expected ${count(protocolVersion)}, gateway ${integer(mismatchedProtocol)})` :
+                  `mismatch (expected ${count(protocolVersion)})`) :
+              count(protocolVersion)}
+        </Stat>
         <Stat label="State age" channel={`${HW}state_age_us`} tone={stateAgeUs !== undefined && stateAgeUs > 20000 ? 'warn' : undefined}>
           {micros(stateAgeUs)}
         </Stat>

@@ -270,3 +270,40 @@ test('the hardware panel displays UDP socket and State loss counters', () => {
     assert.ok(html.includes(label), `missing counter ${label}`);
   }
 });
+
+// REQ-OPS-20: when the bridge reports a protocol mismatch, the Hardware panel
+// shows both the bridge's expected protocol_version_id and the observed
+// mismatched_protocol_version_id with warning tone; when clear it shows the
+// bridge's protocol version alone.
+test('the hardware panel displays expected and observed mismatched protocol version', () => {
+  const render = (channels: Record<string, number>) => {
+    const studio = createStaticStudio({
+      frames: [{
+        stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+        chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+        channels, units: {}, labels: {}
+      }],
+      playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+    });
+    return renderToStaticMarkup(
+        <StudioProvider studio={studio}>
+          <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                   setConfig={() => {}} instanceId="test"/>
+        </StudioProvider>);
+  };
+
+  const mismatchHtml = render({
+    'hw/status/protocol_version_id': 11,
+    'hw/status/mismatched_protocol_version_id': 10,
+    'hw/status/alert_error_protocol_mismatch': 1,
+  });
+  assert.match(mismatchHtml, /class="warn"[^>]*>.*mismatch \(expected 11, gateway 10\)/);
+
+  const okHtml = render({
+    'hw/status/protocol_version_id': 11,
+    'hw/status/mismatched_protocol_version_id': 0,
+    'hw/status/alert_error_protocol_mismatch': 0,
+  });
+  assert.doesNotMatch(okHtml, /mismatch/);
+  assert.match(okHtml, /<dt>Protocol<\/dt><dd>11<\/dd>/);
+});

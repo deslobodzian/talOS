@@ -1600,6 +1600,9 @@ std::vector<std::string> Alerts(const bridge::BridgeStatus& status) {
   if (status.alert_warning_can_bus_unread()) {
     active.emplace_back("can_bus_unread");
   }
+  if (status.alert_error_protocol_mismatch()) {
+    active.emplace_back("protocol_mismatch");
+  }
   return active;
 }
 

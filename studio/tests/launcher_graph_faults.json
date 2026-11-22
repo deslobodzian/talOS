@@ -53,7 +53,7 @@
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xac2efa019ff2e2b4",
+          "schema_hash": "0xbfa0173d09fd5473",
           "alignment": 8,
           "slots": 1024
         },
@@ -282,7 +282,7 @@
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xac2efa019ff2e2b4",
+          "schema_hash": "0xbfa0173d09fd5473",
           "alignment": 8,
           "slots": 1024
         },
@@ -294,7 +294,7 @@
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xac2efa019ff2e2b4",
+          "schema_hash": "0xbfa0173d09fd5473",
           "alignment": 8,
           "slots": 1024
         },
@@ -471,7 +471,7 @@
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xac2efa019ff2e2b4",
+          "schema_hash": "0xbfa0173d09fd5473",
           "alignment": 8,
           "slots": 1024
         },
@@ -759,7 +759,7 @@
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xac2efa019ff2e2b4",
+          "schema_hash": "0xbfa0173d09fd5473",
           "alignment": 8,
           "slots": 1024
         },
@@ -870,7 +870,7 @@
           "optional": false,
           "observer": true,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xac2efa019ff2e2b4",
+          "schema_hash": "0xbfa0173d09fd5473",
           "alignment": 8,
           "slots": 1024
         },

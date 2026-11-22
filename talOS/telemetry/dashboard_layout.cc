@@ -791,10 +791,12 @@ bool DriveChannels::Carries(std::string_view name, bool alert) const {
 DriveChannels DriveFeedChannels(const DashboardLayout& layout) {
   DriveChannels channels{RequiredChannels(layout),
                          CarriesAlertChannels(layout)};
-  const auto at =
-      std::ranges::lower_bound(channels.named, kDriveLinkLostChannel);
-  if (at == channels.named.end() || *at != kDriveLinkLostChannel) {
-    channels.named.emplace(at, kDriveLinkLostChannel);
+  for (const std::string_view channel :
+       {kDriveLinkLostChannel, kDriveProtocolMismatchChannel}) {
+    const auto at = std::ranges::lower_bound(channels.named, channel);
+    if (at == channels.named.end() || *at != channel) {
+      channels.named.emplace(at, channel);
+    }
   }
   return channels;
 }

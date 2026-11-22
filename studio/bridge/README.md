@@ -360,7 +360,9 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
    values of the tick it is stamped with.
 3. **The mask.** Channel `i` of the dictionary is in the client's mask when
    its name is in `/drive/layout.json` `"channels"` (which always lists
-   `hw/status/alert_error_link_lost`, the RoboRIO link, whatever the
+   `hw/status/alert_error_link_lost` and
+   `hw/status/alert_error_protocol_mismatch`, the RoboRIO link and protocol
+   mismatch alerts, whatever the
    widgets), or when that document's
    `"alerts"` is true and the channel's `alert` is not `None`
    (`/channels.json` `"alert"` other than `"none"`). Only masked channels are
@@ -426,7 +428,8 @@ So a feed client hears something at least every 100 ms (plus the moments
 its bucket needs for a 36 B heartbeat) while the bridge runs and its socket
 drains: 500 ms of silence means the dashboard-to-bridge
 link, a `sequence_id` that stops advancing means stale telemetry, and the
-RoboRIO link is its own alert channel (`hw/status/alert_error_link_lost`).
+RoboRIO link and protocol mismatch are their own alert channels
+(`hw/status/alert_error_link_lost`, `hw/status/alert_error_protocol_mismatch`).
 `DriveFeed` in [`drive.h`](drive.h) is the feed, `//studio/bridge:drive_test`
 its unit tests, and `integration_test.py`'s
 `test_drive_feed_slots_and_layout` the slots, eviction and 404 over a socket.
