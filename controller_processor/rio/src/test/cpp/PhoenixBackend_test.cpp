@@ -289,6 +289,19 @@ ctre::phoenix::StatusCode AwaitAnswer(Request request) {
   return ::testing::AssertionSuccess();
 }
 
+// One restore pass of `ids`, as the gateway runs one after a reset.
+::testing::AssertionResult RestorePass(PhoenixBackend& backend,
+                                       std::span<const uint16_t> ids) {
+  const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+  backend.BeginRestoreAfterReset(ids);
+  while (backend.PollRestore() == hw::Backend::RestoreStatus::kPending) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      return ::testing::AssertionFailure() << "restore still pending";
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return ::testing::AssertionSuccess();
+}
+
 hw::MotorConfig TestMotor(uint16_t id, const std::string& name, int can_id) {
   hw::MotorConfig m;
   m.id = id;
@@ -1463,17 +1476,52 @@ TEST_F(PhoenixBackendRecovery, AMasterWithFollowersSendsItsOutputAt20Hz) {
               20.0);
     EXPECT_GE(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
               20.0);
-    if (status_hz <= 50.0) continue;
-    for (auto* motion :
-         std::initializer_list<ctre::phoenix6::BaseStatusSignal*>{
-             &master.GetPosition(false), &master.GetVelocity(false)}) {
-      ASSERT_TRUE(AwaitAnswer([&] {
-                    return motion->SetUpdateFrequency(units::hertz_t{50});
-                  }).IsOK());
+    if (status_hz > 50.0) {
+      for (auto* motion :
+           std::initializer_list<ctre::phoenix6::BaseStatusSignal*>{
+               &master.GetPosition(false), &master.GetVelocity(false)}) {
+        ASSERT_TRUE(AwaitAnswer([&] {
+                      return motion->SetUpdateFrequency(units::hertz_t{50});
+                    }).IsOK());
+      }
+      EXPECT_DOUBLE_EQ(
+          master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(), 50.0)
+          << "the master's DutyCycle is requested faster than MotorVoltage";
     }
-    EXPECT_DOUBLE_EQ(
-        master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(), 50.0)
-        << "the master's DutyCycle is requested faster than MotorVoltage";
+
+    // Lower every master signal below 20 Hz, then verify RestorePass restores
+    // DutyCycle and MotorVoltage to >= 20 Hz for both status_hz = 8 and 200.
+    ASSERT_TRUE(
+        AwaitAnswer([&] {
+          return ctre::phoenix6::BaseStatusSignal::SetUpdateFrequencyForAll(
+              units::hertz_t{4}, master.GetPosition(false),
+              master.GetVelocity(false), master.GetMotorVoltage(false),
+              master.GetDutyCycle(false), master.GetStatorCurrent(false),
+              master.GetSupplyCurrent(false), master.GetDeviceTemp(false));
+        }).IsOK());
+    ASSERT_LT(master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    ASSERT_LT(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    ASSERT_TRUE(RestorePass(backend, std::array<uint16_t, 1>{10}));
+    EXPECT_GE(master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    EXPECT_GE(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    if (status_hz > 50.0) {
+      ASSERT_TRUE(
+          AwaitAnswer([&] {
+            return ctre::phoenix6::BaseStatusSignal::SetUpdateFrequencyForAll(
+                units::hertz_t{4}, master.GetPosition(false),
+                master.GetVelocity(false), master.GetStatorCurrent(false),
+                master.GetSupplyCurrent(false));
+          }).IsOK());
+      EXPECT_DOUBLE_EQ(
+          master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(), 50.0);
+      EXPECT_DOUBLE_EQ(
+          master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
+          50.0);
+    }
   }
 }
 
@@ -1912,18 +1960,6 @@ class PhoenixBackendFoc : public ::testing::Test {
       if (std::chrono::steady_clock::now() >= deadline)
         return ::testing::AssertionFailure() << hw::FormatConfigError(*error);
     }
-  }
-  // One restore pass of `ids`, as the gateway runs one after a reset.
-  static ::testing::AssertionResult RestorePass(PhoenixBackend& backend,
-                                                std::span<const uint16_t> ids) {
-    const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
-    backend.BeginRestoreAfterReset(ids);
-    while (backend.PollRestore() == hw::Backend::RestoreStatus::kPending) {
-      if (std::chrono::steady_clock::now() >= deadline)
-        return ::testing::AssertionFailure() << "restore still pending";
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return ::testing::AssertionSuccess();
   }
   // Restores the devices a stalled simulator left unavailable, as AwaitReady
   // does; AwaitReady itself refuses a configure error that is not a

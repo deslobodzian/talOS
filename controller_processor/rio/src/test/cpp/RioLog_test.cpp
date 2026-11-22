@@ -144,7 +144,9 @@ TEST(RioLog, FaultTogglesCoalesceToOneLinePerSecondPerMotor) {
 // Overruns (work longer than the period) and late ticks (a short tick that
 // started long after the previous one, a starved loop) are counted and
 // reported at most once per second, each report with that window's maxima.
+// REQ-OPS-29
 TEST(RioLog, LoopOverrunsAndLateTicksAreReportedOncePerSecond) {
+  static_assert(RioLog::kWindowUs == 1'000'000);
   std::vector<std::string> lines;
   RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
   log.RecordTick(0, 4'000, 5'000);
@@ -178,7 +180,9 @@ TEST(RioLog, LoopOverrunsAndLateTicksAreReportedOncePerSecond) {
 // Where a tick's backend time goes, the measurement TODO.md RT-5 sizes a
 // robot from: each 10 s window reports every phase's mean and longest time
 // per tick over that window's ticks only, with the device counts.
+// REQ-OPS-29
 TEST(RioLog, TickPhasesReportEachWindowsMeanAndMaxThenReset) {
+  static_assert(RioLog::kPhaseWindowUs == 10'000'000);
   using talos::rio::TickPhase;
   std::vector<std::string> lines;
   RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
@@ -302,6 +306,8 @@ std::vector<std::string> LatencyLines(const std::vector<std::string>& lines) {
 // handover tick's sample opens the next window, which holds nothing else.
 // REQ-RT-25
 TEST(RioLog, LatencyReportsEachWindowsPercentilesMaxAndCountThenResets) {
+  static_assert(RioLog::kPhaseWindowUs == 10'000'000);
+  EXPECT_EQ(RioLog::kPhaseWindowUs, 10'000'000u);
   std::vector<std::string> lines;
   RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
   log.Drain(0);  // starts the window clock

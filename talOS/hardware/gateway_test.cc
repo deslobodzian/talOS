@@ -2442,6 +2442,7 @@ TEST(Gateway, IdenticalEnabledConfigPreservesLatchedApplyFault) {
     EXPECT_TRUE(g.Accept(Request(g), 11, 3000));
   }
 }
+// REQ-CONTRACT-02
 TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -2529,6 +2530,58 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   for (std::size_t i = 0; i < state_size; ++i) {
     EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), i}, copy));
   }
+  EXPECT_FALSE(
+      Decode(std::span<const uint8_t>{bytes.data(), state_size + 1}, copy));
+
+  // Every device count in State's prefix (starting at byte 70) rejects cap + 1.
+  const std::array<std::pair<std::size_t, uint16_t>, 7> over_cap_counts{{
+      {70, static_cast<uint16_t>(kMaxMotors + 1)},
+      {72, static_cast<uint16_t>(kMaxSensors + 1)},
+      {74, static_cast<uint16_t>(kMaxDigitalInputs + 1)},
+      {76, static_cast<uint16_t>(kMaxDigitalOutputs + 1)},
+      {78, static_cast<uint16_t>(kMaxAnalogInputs + 1)},
+      {80, static_cast<uint16_t>(kMaxEncoders + 1)},
+      {82, static_cast<uint16_t>(kMaxPwmOutputs + 1)},
+  }};
+  for (const auto& [offset, count] : over_cap_counts) {
+    SCOPED_TRACE(offset);
+    auto corrupted = bytes;
+    corrupted[offset] = static_cast<uint8_t>(count & 0xFFu);
+    corrupted[offset + 1] = static_cast<uint8_t>(count >> 8);
+    EXPECT_FALSE(
+        Decode(std::span<const uint8_t>{corrupted.data(), state_size}, copy));
+  }
+
+  // ConfigAck rejects truncated payloads.
+  ConfigAckPayload ack{};
+  ack.config_id = 0x0102030405060708ull;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload) + 1> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ConfigAckPayload decoded_ack{};
+  ASSERT_TRUE(DecodeConfigAck(
+      std::span<const uint8_t>{ack_bytes.data(), sizeof(ConfigAckPayload)},
+      decoded_ack));
+  EXPECT_EQ(decoded_ack.config_id, ack.config_id);
+  EXPECT_EQ(decoded_ack.status, ack.status);
+  EXPECT_FALSE(DecodeConfigAck(
+      std::span<const uint8_t>{ack_bytes.data(), sizeof(ConfigAckPayload) - 1},
+      decoded_ack));
+
+  // ConfigAssembler rejects both truncated and trailing-byte chunks.
+  const auto chunks = CreateConfigChunks(SwerveConfig(false), 200);
+  ASSERT_FALSE(chunks.empty());
+  const auto& chunk = chunks.front();
+  ConfigAssembler assembler;
+  std::string error;
+  EXPECT_EQ(
+      assembler.AddChunk(
+          std::span<const uint8_t>{chunk.data(), chunk.size() - 1}, error),
+      ConfigAssembler::Status::kInvalidChunk);
+  std::vector<uint8_t> oversized = chunk;
+  oversized.push_back(0);
+  EXPECT_EQ(assembler.AddChunk(oversized, error),
+            ConfigAssembler::Status::kInvalidChunk);
 }
 
 // A robot brought up before its first mechanism has no device at all, and
@@ -2784,13 +2837,22 @@ TEST(ConfigWire, ChunkHeaderAndAckAreLittleEndian) {
   ASSERT_GE(first.size(), sizeof(ConfigChunkHeader));
   for (int i = 0; i < 8; ++i)
     EXPECT_EQ(first[i], static_cast<uint8_t>(id >> (8 * i)));
-  const auto total = static_cast<uint32_t>(SerializeConfig(config).size());
+  const auto serialized = SerializeConfig(config);
+  const auto crc = ComputeCrc32(serialized);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_EQ(first[8 + i], static_cast<uint8_t>(crc >> (8 * i)));
+  const auto total = static_cast<uint32_t>(serialized.size());
   for (int i = 0; i < 4; ++i)
     EXPECT_EQ(first[12 + i], static_cast<uint8_t>(total >> (8 * i)));
   EXPECT_EQ(first[16], 0);  // chunk_index 0
   EXPECT_EQ(first[17], 0);
   EXPECT_EQ(first[18], static_cast<uint8_t>(chunks.size()));
   EXPECT_EQ(first[19], 0);
+  const auto chunk_bytes =
+      static_cast<uint32_t>(first.size() - sizeof(ConfigChunkHeader));
+  ASSERT_GT(chunk_bytes, 255u);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_EQ(first[20 + i], static_cast<uint8_t>(chunk_bytes >> (8 * i)));
 
   ConfigAckPayload ack{};
   ack.config_id = 0x0102030405060708ull;
