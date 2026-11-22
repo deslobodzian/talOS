@@ -308,20 +308,23 @@ def elf_needed_libraries(path):
         if dynamic is None:
             return []
         dyn_offset, dyn_filesz = dynamic
-        if dyn_offset + dyn_filesz > file_size:
-            raise ElfParseError(f"{path}: PT_DYNAMIC past EOF")
+        entry_size = 16 if is64 else 8
+        if (dyn_offset < ehdr_size or dyn_filesz < entry_size
+                or dyn_offset + dyn_filesz > file_size):
+            raise ElfParseError(f"{path}: invalid PT_DYNAMIC bounds")
         f.seek(dyn_offset)
         dyn_data = f.read(dyn_filesz)
         if len(dyn_data) != dyn_filesz:
             raise ElfParseError(f"{path}: truncated PT_DYNAMIC")
-        entry_size = 16 if is64 else 8
         entry_fmt = endian + ("qQ" if is64 else "iI")
         needed_offsets = []
         strtab_vaddr = None
         strsz = None
+        saw_null = False
         for off in range(0, len(dyn_data) - entry_size + 1, entry_size):
             d_tag, d_val = struct.unpack_from(entry_fmt, dyn_data, off)
             if d_tag == _ELF_DT_NULL:
+                saw_null = True
                 break
             if d_tag in (_ELF_DT_NEEDED, _ELF_DT_AUXILIARY, _ELF_DT_FILTER):
                 needed_offsets.append(d_val)
@@ -329,6 +332,8 @@ def elf_needed_libraries(path):
                 strtab_vaddr = d_val
             elif d_tag == _ELF_DT_STRSZ:
                 strsz = d_val
+        if not saw_null:
+            raise ElfParseError(f"{path}: PT_DYNAMIC missing DT_NULL")
         if not needed_offsets:
             return []
         if strtab_vaddr is None or strsz is None:
@@ -363,11 +368,14 @@ def strip_unused_libpython(out_dir, interpreters):
     """Removes `libpython3*.so*` from each bundled Linux Python runtime's
     `lib/` when every interpreter of that runtime is an ELF binary that does
     not list `libpython*` in its dynamic dependencies and no other ELF binary
-    or shared library in the bundle lists `libpython*` (REQ-OPS-48).
+    or shared library in the bundle needs `libpython*`.
 
-    Fails closed: non-ELF runtimes (macOS Mach-O / `.dylib`), dynamically
-    linked Python runtimes, bundles with any extension needing `libpython*`,
-    and any unparseable ELF file leave `libpython3*.so*` untouched."""
+    Checks static ELF `DT_NEEDED`/`DT_AUXILIARY`/`DT_FILTER` entries only; a
+    native embedder that calls `dlopen("libpython...")` by name at runtime is
+    not detected statically (talOS has none). Fails closed: non-ELF runtimes
+    (macOS Mach-O / `.dylib`), dynamically linked Python runtimes, bundles with
+    any extension needing `libpython*`, and any unparseable ELF file leave
+    `libpython3*.so*` untouched (REQ-OPS-48)."""
     if not interpreters:
         return
     runtime_root = os.path.join(out_dir, RUNTIME_DIR)
