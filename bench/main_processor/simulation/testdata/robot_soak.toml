@@ -1,0 +1,17 @@
+# Bench soak graph (//bench/main_processor/simulation:soak_test): robot.toml's
+# two 5 ms C++ actuator owners (swerve_module and motor), Python gyro observer,
+# framework teleop, telemetry, and the test-only autonomous target producer
+# (auto_producer), run against the physics simulator (launcher --sim) only.
+include = "../../configuration/robot.toml"
+
+[robot]
+# Simulation-only soak config: the launcher and hardware_node refuse it without
+# --sim.
+simulation_only = true
+
+[robot.targets]
+autonomous = ["auto"]
+
+[[subsystems]]
+name = "auto_producer"
+path = "subsystems/auto.toml"
