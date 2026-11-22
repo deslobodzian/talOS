@@ -86,6 +86,32 @@ class _OnNode:
         return self._owner._handle
 
 
+_INT64_MAX = (1 << 63) - 1
+
+
+def _max_age_ns(max_age):
+    """Converts a fresh(max_age) bound (seconds, timedelta, or None) to
+    int64 nanoseconds for the C ABI: -1 for None (default command timeout),
+    None for NaN or negative (caller returns False), clamped to INT64_MAX
+    for +inf or values >= INT64_MAX ns so c_int64 never wraps negative."""
+    if max_age is None:
+        return -1
+    if isinstance(max_age, timedelta):
+        ns = ((max_age.days * 86400 + max_age.seconds) * 1_000_000
+              + max_age.microseconds) * 1000
+        return None if ns < 0 else min(ns, _INT64_MAX)
+    if isinstance(max_age, int):
+        if max_age < 0:
+            return None
+        return min(max_age * 1_000_000_000, _INT64_MAX)
+    seconds = float(max_age)
+    if math.isnan(seconds) or seconds < 0:
+        return None
+    if math.isinf(seconds) or seconds >= _INT64_MAX / 1e9:
+        return _INT64_MAX
+    return min(round(seconds * 1e9), _INT64_MAX)
+
+
 class HardwareLink(_OnNode):
     """Accepted hardware state; ages are seconds since publication."""
 
@@ -94,17 +120,17 @@ class HardwareLink(_OnNode):
         # Attach the C++ extension during construction, before the loop starts.
         _abi.ok(lib.talos_hardware_fresh(self._node, -1))
 
+    @property
+    def enabled(self) -> bool:
+        """Whether this node's outputs reach the hardware."""
+        return robot_enabled(self._owner)
+
     def fresh(self, max_age=None) -> bool:
         """Whether state is younger than max_age (default command timeout)."""
         node = self._node
-        if max_age is None:
-            ns = -1
-        else:
-            if isinstance(max_age, timedelta):
-                max_age = max_age.total_seconds()
-            if max_age < 0:
-                return False
-            ns = round(max_age * 1e9)
+        ns = _max_age_ns(max_age)
+        if ns is None:
+            return False
         return _abi.boolean(lib.talos_hardware_fresh(node, ns))
 
     @property
@@ -407,9 +433,9 @@ class PwmOutput(_Device):
 
 class Alliance(enum.IntEnum):
     """talos::driver_station::Alliance."""
-    UNKNOWN = 0
-    RED = 1
-    BLUE = 2
+    UNKNOWN = _abi.ALLIANCE_UNKNOWN
+    RED = _abi.ALLIANCE_RED
+    BLUE = _abi.ALLIANCE_BLUE
 
 
 class Joystick:
@@ -660,9 +686,14 @@ class TargetLane(_OnNode):
     def __init__(self, node, msg, subsystem, source, arming=None):
         super().__init__(node)
         self._type = message_type(msg)
-        if arming is not None and arming._owner is not node:
-            raise TalosError(f"{subsystem}/target/{source}: the lane's "
-                             "OperatorArming belongs to another node")
+        if arming is not None:
+            if not isinstance(arming, OperatorArming):
+                raise TypeError(
+                    f"{subsystem}/target/{source}: arming must be an "
+                    f"OperatorArming, got {type(arming).__name__}")
+            if arming._owner is not node:
+                raise TalosError(f"{subsystem}/target/{source}: the lane's "
+                                 "OperatorArming belongs to another node")
         self._index = _abi.index(lib.talos_target_lane_open(
             self._node, _abi.encode(subsystem), _abi.encode(source),
             self._type.size, self._type.alignment, _abi.schema_of(self._type),

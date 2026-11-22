@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 38
+_EXPECTED_ABI_VERSION = 39
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int8, c_uint8, c_int16 = (ctypes.c_int8, ctypes.c_uint8, ctypes.c_int16)
@@ -62,6 +62,9 @@ DS_AUTONOMOUS = 1 << 3
 DS_TELEOP = 1 << 4
 DS_TEST = 1 << 5
 DS_ESTOP = 1 << 6
+ALLIANCE_UNKNOWN = 0
+ALLIANCE_RED = 1
+ALLIANCE_BLUE = 2
 POSITION_PHASE_UNHOMED = 0
 POSITION_PHASE_HOMING = 1
 POSITION_PHASE_READY = 2

@@ -142,6 +142,17 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "safety_abi_test",
+    size = "small",
+    srcs = ["safety_abi_test.cc"],
+    deps = [
+        ":node_api_testing",
+        "//talOS/hardware",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # An exported C++ node for cpp_node_test.
 talos_cc_shared_node(
     name = "libframework_probe.so",

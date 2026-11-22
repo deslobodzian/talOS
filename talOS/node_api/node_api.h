@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 38u
+#define TALOS_NODE_ABI_VERSION 39u
 
 enum {
   TALOS_OK = 0,
@@ -319,6 +319,12 @@ enum {  // talos::driver_station::DsFlags
   TALOS_DS_TELEOP = 1 << 4,
   TALOS_DS_TEST = 1 << 5,
   TALOS_DS_ESTOP = 1 << 6,
+};
+
+enum {  // talos::driver_station::Alliance
+  TALOS_ALLIANCE_UNKNOWN = 0,
+  TALOS_ALLIANCE_RED = 1,
+  TALOS_ALLIANCE_BLUE = 2,
 };
 
 // One joystick port, as talos::Joystick reads it: axes past axis_count are

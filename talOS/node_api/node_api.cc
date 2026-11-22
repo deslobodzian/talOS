@@ -139,6 +139,14 @@ static_assert(SameFlag(TALOS_DS_ATTACHED, driver_station::kDsAttached) &&
               SameFlag(TALOS_DS_TELEOP, driver_station::kTeleop) &&
               SameFlag(TALOS_DS_TEST, driver_station::kTest) &&
               SameFlag(TALOS_DS_ESTOP, driver_station::kEStop));
+constexpr bool SameAlliance(std::int32_t abi,
+                            driver_station::Alliance alliance) {
+  return abi == static_cast<std::int32_t>(alliance);
+}
+static_assert(
+    SameAlliance(TALOS_ALLIANCE_UNKNOWN, driver_station::Alliance::kUnknown) &&
+    SameAlliance(TALOS_ALLIANCE_RED, driver_station::Alliance::kRed) &&
+    SameAlliance(TALOS_ALLIANCE_BLUE, driver_station::Alliance::kBlue));
 
 // Every struct this ABI passes, field by field, as talOS/python/talos/_abi.py
 // mirrors it with ctypes: talos_test.py reads these lines and checks the
@@ -333,6 +341,7 @@ const std::string& LastError() { return g_last_error; }
 using namespace talos::node_api;
 using talos::detail::HardwareAccess;
 using talos::detail::NodeAccess;
+using talos::detail::NodeDetail;
 using talos::detail::TargetAccess;
 
 extern "C" {
@@ -570,7 +579,7 @@ int32_t talos_publisher_send(TalosNode* node, int64_t index, const void* data,
                              uint32_t size) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (data == nullptr) throw std::invalid_argument("null message");
-    return NodeAccess::publisher_send(AsNode(node), Index(index), data, size)
+    return NodeDetail::publisher_send(AsNode(node), Index(index), data, size)
                ? 1
                : 0;
   });
