@@ -85,6 +85,8 @@ cc_test(
     deps = [
         ":events_log",
         ":gap_testing",
+        "//talOS/process",
+        "//talOS/process:durable_sync",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
