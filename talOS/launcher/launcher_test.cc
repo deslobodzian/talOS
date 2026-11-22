@@ -2439,6 +2439,7 @@ TEST(LauncherGraphTest, NonCriticalDoesNotRelaxNamingRules) {
   EXPECT_FALSE(fixture.has_manifest());
 }
 
+// REQ-DEV-04
 TEST(LauncherGraphTest, DescribeOnlyLintsWithoutStartingAnything) {
   GraphFixture fixture{
       "preflight",
@@ -2452,7 +2453,8 @@ TEST(LauncherGraphTest, DescribeOnlyLintsWithoutStartingAnything) {
   EXPECT_NE(fixture.graph_json().find("\"name\": \"beta\""), std::string::npos);
 }
 
-// REQ-OPS-01: a graph error makes --describe-only exit non-zero, no manifest
+// REQ-DEV-04, REQ-OPS-01: a graph error makes --describe-only exit non-zero,
+// no manifest
 TEST(LauncherGraphTest, DescribeOnlyReportsABrokenGraphAsAFailure) {
   GraphFixture fixture{
       "preflight_broken",
@@ -3833,6 +3835,102 @@ std::map<std::string, std::string> DirectoryContents(const std::string& dir) {
         ReadFile(file.path().string());
   }
   return contents;
+}
+
+// REQ-DEV-04: --describe-only lints without touching shared memory or running
+// session retention, even when the log root already exceeds log_keep_sessions.
+TEST(LauncherSessions, DescribeOnlyLeavesSessionsAndSharedMemoryUntouched) {
+  auto options = SessionFixture("describe_only_no_side_effects");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  options.config_path = TempPath("describe_only_no_side_effects") + ".toml";
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 1\n");
+  std::ofstream{options.config_path} << configuration;
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode("describe_only_no_side_effects_alpha",
+                    DescribingStub("alpha", "//example/alpha:node",
+                                   {Sender("/alpha/state")}));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      "describe_only_no_side_effects_beta",
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")}));
+
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  const auto now = std::filesystem::file_time_type::clock::now();
+  std::map<int, std::map<std::string, std::string>> before;
+  for (const int id : {1, 2, 3}) {
+    WriteSessionManifest(dir(id), static_cast<uint64_t>(id), 1000 + id,
+                         1100 + id);
+    WriteTestLog(dir(id) + "/alpha.tlog", "alpha", static_cast<uint64_t>(id),
+                 {1'000'000});
+  }
+  std::filesystem::create_directories(dir(4));
+  std::ofstream{dir(4) + "/graph.json"} << "{}\n";
+  for (const auto& [id, age] :
+       {std::pair{1, 4}, std::pair{2, 3}, std::pair{3, 2}, std::pair{4, 1}}) {
+    std::filesystem::last_write_time(dir(id), now - std::chrono::hours{age});
+    before[id] = DirectoryContents(dir(id));
+  }
+
+  // Isolate into a fresh TALOS_SHM_NAMESPACE when not already under Bazel's
+  // per-shard TEST_TMPDIR, and clear any prior segments in the active
+  // namespace before running.
+  struct ScopedNamespace {
+    bool set = false;
+    ScopedNamespace() {
+      if (std::getenv("TEST_TMPDIR") == nullptr &&
+          std::getenv("TALOS_SHM_NAMESPACE") == nullptr) {
+        const std::string ns =
+            "talos_describe_only_" + std::to_string(::getpid());
+        ::setenv("TALOS_SHM_NAMESPACE", ns.c_str(), 1);
+        set = true;
+      }
+    }
+    ~ScopedNamespace() {
+      if (set) ::unsetenv("TALOS_SHM_NAMESPACE");
+    }
+  } scoped_ns;
+
+  const std::vector<std::string> shm_topics{"/alpha/state",
+                                            "/talos_registry.6"};
+  for (const std::string& topic : shm_topics) {
+    const std::string shm = ShmObjectName(topic);
+    ::shm_unlink(shm.c_str());
+    errno = 0;
+    const int fd = ::shm_open(shm.c_str(), O_RDONLY, 0);
+    ASSERT_EQ(fd, -1) << topic << " (" << shm << ") still exists";
+    ASSERT_EQ(errno, ENOENT) << topic << " (" << shm << ")";
+  }
+
+  options.session_id = 5;
+  options.describe_only = true;
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(dir(5) + "/manifest.json"));
+  EXPECT_TRUE(std::filesystem::exists(dir(5) + "/graph.json"));
+
+  // Every pre-existing session directory remains intact.
+  for (const auto& [id, expected] : before) {
+    ASSERT_TRUE(std::filesystem::exists(dir(id)))
+        << "session dir " << id << " was removed by --describe-only";
+    EXPECT_EQ(DirectoryContents(dir(id)), expected) << "session dir " << id;
+  }
+
+  // Neither declared topics nor the registry were created in shared memory.
+  for (const std::string& topic : shm_topics) {
+    const std::string shm = ShmObjectName(topic);
+    errno = 0;
+    const int fd = ::shm_open(shm.c_str(), O_RDONLY, 0);
+    if (fd >= 0) {
+      ::close(fd);
+      ::shm_unlink(shm.c_str());
+    }
+    EXPECT_EQ(fd, -1) << topic << " (" << shm << ") created by --describe-only";
+    EXPECT_EQ(errno, ENOENT) << topic << " (" << shm << ")";
+  }
+
+  std::filesystem::remove_all(root);
+  std::filesystem::remove(options.config_path);
 }
 
 // REQ-OPS-11: a launch in another shared-memory namespace records into the

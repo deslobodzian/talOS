@@ -437,12 +437,14 @@ TEST(ConfigTest, LocalAddressDefaultsEmptyValidatesIpv4AndPrefersCliOverride) {
   }
 }
 
+// REQ-CONTRACT-17
 // Log retention keys of the wrong type or sign are refused, not defaulted.
 TEST(ConfigTest, RejectsInvalidLogRetention) {
   EXPECT_EQ(Parse("[robot]\nlog_keep_sessions = 3\n").log_keep_sessions, 3);
   ExpectRejected("[robot]\nlog_keep_sessions = \"3\"\n");
   ExpectRejected("[robot]\nlog_keep_sessions = 0\n");
   ExpectRejected("[robot]\nlog_max_bytes = 1.5\n");
+  ExpectRejected("[robot]\nlog_max_bytes = 0\n");
   ExpectRejected("[robot]\nlog_max_bytes = -1\n");
 }
 

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -107,6 +108,29 @@ std::string ConfigFlag() {
 
 // REQ-CONTRACT-12, REQ-OPS-06
 TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
+  const std::string fresh_ns = "describe_no_shm_" + std::to_string(::getpid());
+  struct ScopedNamespace {
+    std::optional<std::string> previous;
+    explicit ScopedNamespace(const std::string& ns) {
+      if (const char* value = std::getenv("TALOS_SHM_NAMESPACE")) {
+        previous = value;
+      }
+      ::setenv("TALOS_SHM_NAMESPACE", ns.c_str(), 1);
+    }
+    ~ScopedNamespace() {
+      if (previous) {
+        ::setenv("TALOS_SHM_NAMESPACE", previous->c_str(), 1);
+      } else {
+        ::unsetenv("TALOS_SHM_NAMESPACE");
+      }
+    }
+  } scoped_ns{fresh_ns};
+
+  for (const char* name : {"/test_node/target", "/test_node/state",
+                           "/test_node/frames", introspect::kRegistryPath}) {
+    ::shm_unlink(ShmObjectName(name, fresh_ns).c_str());
+  }
+
   const Result result = RunBinary("--describe " + ConfigFlag());
   ASSERT_EQ(result.status, 0) << result.output;
   introspect::Description described;
@@ -168,6 +192,27 @@ TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   // A node with no hardware never touches /hw/*.
   for (const auto& source : described.sources) {
     EXPECT_FALSE(source.name.starts_with("/hw/")) << source.name;
+  }
+
+  // --describe touches no shared memory: neither any declared topic nor the
+  // registry exists in the fresh namespace after exit 0.
+  std::vector<std::string> shm_names{std::string{introspect::kRegistryPath}};
+  for (const auto& source : described.sources) {
+    if (source.kind == event::SourceKind::SENDER ||
+        source.kind == event::SourceKind::WATCHER) {
+      shm_names.push_back(source.name);
+    }
+  }
+  for (const std::string& name : shm_names) {
+    const std::string shm = ShmObjectName(name, fresh_ns);
+    errno = 0;
+    const int fd = ::shm_open(shm.c_str(), O_RDONLY, 0);
+    if (fd >= 0) {
+      ::close(fd);
+      ::shm_unlink(shm.c_str());
+    }
+    EXPECT_EQ(fd, -1) << name << " (" << shm << ") created by --describe";
+    EXPECT_EQ(errno, ENOENT) << name << " (" << shm << ")";
   }
 }
 

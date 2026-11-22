@@ -127,6 +127,7 @@ std::optional<hardware::Command> LastCommand(const Sim& sim) {
   return command;
 }
 
+// REQ-CONTRACT-34
 TEST(Devices, NothingIsSentBeforeTheFirstAcceptedState) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -139,6 +140,19 @@ TEST(Devices, NothingIsSentBeforeTheFirstAcceptedState) {
   EXPECT_EQ(link.age(), Duration::max());
   EXPECT_FALSE(mech.a.connected());
   EXPECT_EQ(mech.a.position(), 0.0);
+  EXPECT_EQ(mech.a.velocity(), 0.0);
+  EXPECT_EQ(mech.a.voltage(), 0.0);
+  EXPECT_EQ(mech.a.current(), 0.0);
+  EXPECT_EQ(mech.a.supply_current_a(), 0.0);
+  EXPECT_FALSE(mech.cc.connected());
+  EXPECT_EQ(mech.cc.position(), 0.0);
+  EXPECT_EQ(mech.cc.velocity(), 0.0);
+  EXPECT_FALSE(mech.enc.connected());
+  EXPECT_EQ(mech.enc.position(), 0.0);
+  EXPECT_EQ(mech.enc.velocity(), 0.0);
+  EXPECT_FALSE(mech.gyro.connected());
+  EXPECT_EQ(mech.gyro.yaw(), 0.0);
+  EXPECT_EQ(mech.gyro.yaw_rate(), 0.0);
 
   SimHardware hw{sim};  // the first state goes out now
   sim.step(10ms);
@@ -1466,7 +1480,7 @@ TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
   SimHardware hw{sim};
-  hw.set_motor("mech", "b", 3, 2);
+  hw.set_motor("mech", "b", 3, 2, 0, 0, 40.0, 18.0, 30.0);
   hw.set_gyro("mech", "gyro", 0.25, 0.5);
   hw.set_cancoder("mech", "cc", 0.2, 0.3);
   hw.set_encoder("mech", "enc", 0.4, 0.6);
@@ -1475,6 +1489,8 @@ TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
   mech.gyro.rezero();
   ASSERT_TRUE(mech.b.zeroed());
   ASSERT_TRUE(mech.gyro.zeroed());
+  ASSERT_DOUBLE_EQ(mech.b.current(), 30.0);
+  ASSERT_DOUBLE_EQ(mech.b.supply_current_a(), 18.0);
 
   for (const char* device : {"b", "gyro", "cc", "enc"}) {
     hw.set_connected("mech", device, false);
@@ -1489,6 +1505,9 @@ TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
   EXPECT_DOUBLE_EQ(mech.cc.position(), 0.2);
   EXPECT_DOUBLE_EQ(mech.enc.position(), 0.4);
   EXPECT_EQ(mech.b.velocity(), 0.0);
+  EXPECT_EQ(mech.b.voltage(), 0.0);
+  EXPECT_EQ(mech.b.current(), 0.0);
+  EXPECT_EQ(mech.b.supply_current_a(), 0.0);
   EXPECT_EQ(mech.gyro.yaw_rate(), 0.0);
   EXPECT_EQ(mech.cc.velocity(), 0.0);
   EXPECT_EQ(mech.enc.velocity(), 0.0);

@@ -71,6 +71,21 @@ struct Empty {
   explicit Empty(Node&) {}
 };
 
+template <class Fn>
+void ExpectInvalidArgumentNaming(Fn&& fn,
+                                 const std::vector<std::string_view>& parts) {
+  try {
+    fn();
+    ADD_FAILURE() << "expected std::invalid_argument";
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    for (const std::string_view part : parts) {
+      EXPECT_NE(what.find(part), std::string::npos) << part << " in " << what;
+    }
+  }
+}
+
+// REQ-CONTRACT-18
 TEST(Node, ReadsParamsWithFallbacksAndRejectsMissingOrMistyped) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<Empty>("listener");
@@ -87,7 +102,8 @@ TEST(Node, ReadsParamsWithFallbacksAndRejectsMissingOrMistyped) {
   EXPECT_EQ(node.param<std::string>("absent", "x"), "x");
   EXPECT_DOUBLE_EQ(node.param<double>("gain", 0.0), 2.5);
 
-  EXPECT_THROW((void)node.param<double>("absent"), std::invalid_argument);
+  ExpectInvalidArgumentNaming([&] { (void)node.param<double>("absent"); },
+                              {"'absent'"});
   EXPECT_THROW((void)node.param<bool>("tag"), std::invalid_argument);
   EXPECT_THROW((void)node.param<int>("gain", 0), std::invalid_argument);
   EXPECT_EQ(node.param<std::uint8_t>("whole"), 3);
@@ -138,6 +154,7 @@ dio = 3
             process::LoopTier::kObserver);
 }
 
+// REQ-CONTRACT-18
 TEST(Node, ArrayParamsRejectMissingAndMistypedValues) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<Empty>("listener");
@@ -155,11 +172,13 @@ TEST(Node, ArrayParamsRejectMissingAndMistypedValues) {
   EXPECT_EQ(node.param<Strings>("absent", {"x"}), Strings{"x"});
   EXPECT_EQ(node.param<Doubles>("absent", {}), Doubles{});
 
-  EXPECT_THROW((void)node.param<Strings>("absent"), std::invalid_argument);
+  ExpectInvalidArgumentNaming([&] { (void)node.param<Strings>("absent"); },
+                              {"'absent'"});
   EXPECT_THROW((void)node.param<Doubles>("cameras"), std::invalid_argument);
   EXPECT_THROW((void)node.param<Strings>("offsets_m", {}),
                std::invalid_argument);
-  EXPECT_THROW((void)node.param<Doubles>("mixed"), std::invalid_argument);
+  ExpectInvalidArgumentNaming([&] { (void)node.param<Doubles>("mixed"); },
+                              {"'mixed'", "1"});
   EXPECT_THROW((void)node.param<Strings>("tag"), std::invalid_argument);
   EXPECT_THROW((void)node.param<Doubles>("limits", {}), std::invalid_argument);
   EXPECT_THROW((void)node.param<std::string>("cameras"), std::invalid_argument);
@@ -167,6 +186,7 @@ TEST(Node, ArrayParamsRejectMissingAndMistypedValues) {
 
 // One subsystem reads a value another owns, so it is configured once; a
 // wrong subsystem or key fails construction, not a later tick.
+// REQ-CONTRACT-18
 TEST(Node, ParamOfReadsAnotherSubsystemOnlyInTheConstructor) {
   struct Reader {
     explicit Reader(Node& n)
@@ -201,14 +221,8 @@ TEST(Node, ParamOfReadsAnotherSubsystemOnlyInTheConstructor) {
   struct Mistyped {
     explicit Mistyped(Node& n) { (void)n.param_of<bool>("listener", "tag"); }
   };
-  try {
-    sim.add<MissingKey>("missing_key");
-    ADD_FAILURE() << "a missing key constructed";
-  } catch (const std::invalid_argument& e) {
-    EXPECT_NE(std::string{e.what()}.find("in [subsystems.listener]"),
-              std::string::npos)
-        << e.what();
-  }
+  ExpectInvalidArgumentNaming([&] { sim.add<MissingKey>("missing_key"); },
+                              {"'x'", "in [subsystems.listener]"});
   EXPECT_THROW(sim.add<MissingSubsystem>("missing_subsystem"),
                std::invalid_argument);
   EXPECT_THROW(sim.add<Mistyped>("mistyped"), std::invalid_argument);
