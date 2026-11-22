@@ -26,8 +26,11 @@
 // Rotor state is physical (counterclockwise positive, the sim's mounting). A
 // TalonFX's `inverted` flips its output and its own position and velocity
 // together, as Phoenix 6's MotorOutput.Inverted does, so its closed loops run
-// in the configured positive direction; CANcoders and the chassis see the
-// physical rotor. A follower ignores its own `inverted`, as under Phoenix 6's
+// in the configured positive direction; CANcoders see the physical rotor with
+// their own `inverted` and `offset_rot`, and the chassis applies each drive
+// motor's configured direction and each steer motor's feedback frame
+// (including remote CANcoder inversion and `offset_rot`), matching
+// PhoenixBackend. A follower ignores its own `inverted`, as under Phoenix 6's
 // Follower request: it drives in its master's configured direction, reversed
 // by `oppose_master`, and reports in its master's frame, as PhoenixBackend
 // reports it. A motor whose feedback is a remote CANcoder reports, and closes
@@ -193,8 +196,8 @@ inline AxisState StepAxis(const MotorModel& motor, const MechanismModel& mech,
                           double supply_v, double dt_s) {
   AxisState out = state;
   if (dt_s <= 0.0) return out;
-  const double supply = supply_v > 0.0 ? supply_v : 12.0;
-  const double free_rotor = motor.free_speed_rps_at_12v * (supply / 12.0);
+  const double supply = std::max(0.0, supply_v);
+  const double effective_volts = std::clamp(volts, -supply, supply);
   const double inertia_scale =
       mech.inertia_kg_m2 > 0.0
           ? mech.inertia_kg_m2 / motor.nominal_inertia_kg_m2
@@ -202,13 +205,15 @@ inline AxisState StepAxis(const MotorModel& motor, const MechanismModel& mech,
   double tau = motor.time_constant_s * std::max(0.1, inertia_scale);
   double target = 0.0;
   if (powered) {
-    const double bemf_slope = free_rotor > 0.0 ? supply / free_rotor : 0.0;
+    const double bemf_slope = motor.free_speed_rps_at_12v > 0.0
+                                  ? 12.0 / motor.free_speed_rps_at_12v
+                                  : 0.0;
     const double damping_v_per_rps =
         bemf_slope + motor.viscous_friction_vs_per_rps;
-    target = damping_v_per_rps > 0.0 ? volts / damping_v_per_rps
-                                     : (volts / supply) * free_rotor;
+    target =
+        damping_v_per_rps > 0.0 ? effective_volts / damping_v_per_rps : 0.0;
     if (std::abs(out.rotor_velocity_rps) < 1e-9 &&
-        std::abs(volts) < motor.static_friction_v)
+        std::abs(effective_volts) < motor.static_friction_v)
       target = 0.0;
   } else {
     // Unpowered decay: brake shorts the motor (fast stop), coast lets the
@@ -244,9 +249,9 @@ inline double GravityVoltage(const Gains& gains, double mech_pos) {
 inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
                          double mech_pos, double mech_vel, double supply_v,
                          double& volts_out) {
+  const double supply = std::max(0.0, supply_v);
   const double ceiling =
-      std::min(cfg.max_voltage > 0.0 ? cfg.max_voltage : 12.0,
-               supply_v > 0.0 ? supply_v : 12.0);
+      std::min(cfg.max_voltage > 0.0 ? cfg.max_voltage : 12.0, supply);
   const auto clamp = [](double v, double lim) {
     return std::clamp(v, -lim, lim);
   };
@@ -254,7 +259,7 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
     case Mode::kNeutral:
       return false;
     case Mode::kDutyCycle:
-      volts_out = clamp(req.demand * supply_v, ceiling);
+      volts_out = clamp(req.demand * supply, ceiling);
       return true;
     case Mode::kVoltage:
       volts_out = clamp(req.demand, ceiling);
@@ -275,7 +280,9 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
       // Without positive cruise/acceleration limits, MotionMagic falls back
       // to position control. Profiled requests are handled by the backend.
       const auto& gains = cfg.slots[req.slot < 3 ? req.slot : 0];
-      const double error = req.demand - mech_pos;
+      const double error = cfg.continuous_wrap
+                               ? std::remainder(req.demand - mech_pos, 1.0)
+                               : (req.demand - mech_pos);
       volts_out =
           clamp(req.feedforward_v + gains.p * error - gains.d * mech_vel +
                     GravityVoltage(gains, mech_pos),
@@ -420,6 +427,7 @@ class PhysicsSimBackend final : public Backend {
     pending_resets_.clear();
     restoring_.fill(false);
     supply_v_ = kSimRestingSupplyV;
+    brownout_ = false;
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
     truth_ = {options_.start_x_m, options_.start_y_m, options_.start_yaw_rad};
@@ -479,8 +487,7 @@ class PhysicsSimBackend final : public Backend {
         continue;
       }
       const double gear = Gear(i);
-      const double mech_pos =
-          axes_[i].rotor_position_rot * FeedbackDirection(i) / gear;
+      const double mech_pos = MechPosition(i);
       const double mech_vel =
           axes_[i].rotor_velocity_rps * FeedbackDirection(i) / gear;
       out.valid = true;
@@ -524,24 +531,26 @@ class PhysicsSimBackend final : public Backend {
         out.position_rot = (yaw_rot_ + s.offset_rot) * sign;
         out.velocity_rps = yaw_rate_rps_ * sign;
       } else {
-        // CANcoder mirrors its linked mechanism through the boundary.
+        // CANcoder mirrors its linked mechanism through the boundary; its own
+        // health is independent of whether the linked motor is connected or
+        // frozen.
         out.valid = true;
-        out.position_rot = 0;
-        out.velocity_rps = 0;
+        double pos_rot = 0.0;
+        double vel_rps = 0.0;
         for (std::size_t j = 0; j < config_.motors.size(); ++j) {
-          if (motor_to_sensor_[j] == static_cast<int>(i) &&
-              motor_connected_[j] && !frozen_[j]) {
+          if (motor_to_sensor_[j] == static_cast<int>(i)) {
             const double gear = Gear(j);
-            out.position_rot = axes_[j].rotor_position_rot / gear;
-            out.velocity_rps = axes_[j].rotor_velocity_rps / gear;
+            pos_rot = axes_[j].rotor_position_rot / gear;
+            vel_rps = axes_[j].rotor_velocity_rps / gear;
             break;
           }
         }
         if (s.inverted) {
-          out.position_rot = -out.position_rot;
-          out.velocity_rps = -out.velocity_rps;
+          pos_rot = -pos_rot;
+          vel_rps = -vel_rps;
         }
-        out.position_rot = CANcoderAbsoluteRot(out.position_rot);
+        out.position_rot = CANcoderAbsoluteRot(pos_rot + s.offset_rot);
+        out.velocity_rps = vel_rps;
       }
     }
     for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {
@@ -552,8 +561,7 @@ class PhysicsSimBackend final : public Backend {
     }
     // After the motors, so a soft limit has already stopped each axis.
     for (const BoundHomeSwitch& s : bound_home_switches_) {
-      const double position_rot = axes_[s.motor].rotor_position_rot *
-                                  FeedbackDirection(s.motor) / Gear(s.motor);
+      const double position_rot = MechPosition(s.motor);
       const bool closed = s.closed_above ? position_rot >= s.closed_at_rot
                                          : position_rot <= s.closed_at_rot;
       state.digital_inputs[s.input].value =
@@ -715,6 +723,7 @@ class PhysicsSimBackend final : public Backend {
     restoring_.fill(false);
     motor_connected_.fill(true);
     sensor_connected_.fill(true);
+    brownout_ = false;
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
     gyro_zero_yaw_rad_ = truth_.yaw_rad;
@@ -837,40 +846,89 @@ class PhysicsSimBackend final : public Backend {
   }
 
   // Exact acceleration/cruise/deceleration segments, with a stationary goal.
-  // Replanning from the current setpoint also handles demand changes.
+  // Replanning from the current setpoint handles demand changes, goal
+  // shortening inside the stopping distance, and initial speeds above cruise
+  // without teleporting or exceeding acceleration_rps2.
   double AdvanceProfile(Profile& p, const MotorConfig& cfg, double goal,
                         double dt) {
     if (dt <= 0.0) return 0.0;
-    const double direction = p.profile_pos_rot > goal ? -1.0 : 1.0;
-    const double pos = p.profile_pos_rot * direction;
-    const double vel = p.profile_vel_rps * direction;
     const double accel = cfg.acceleration_rps2;
     const double cruise = cfg.cruise_velocity_rps;
-    const double cutoff_time = vel / accel;
-    const double distance =
-        std::max(0.0, goal * direction - pos + vel * vel / (2.0 * accel));
-    const double accel_time =
-        std::min(cruise / accel, std::sqrt(distance / accel));
-    const double full_speed_distance =
-        std::max(0.0, distance - accel_time * accel_time * accel);
-    const double end_accel = accel_time - cutoff_time;
-    const double end_cruise = end_accel + full_speed_distance / cruise;
-    const double end_decel = end_cruise + accel_time;
-    double next_pos = goal * direction;
-    double next_vel = 0.0;
-    if (dt < end_accel) {
-      next_vel = vel + dt * accel;
-      next_pos = pos + (vel + dt * accel / 2.0) * dt;
-    } else if (dt < end_cruise) {
-      next_vel = cruise;
-      next_pos = pos + (vel + end_accel * accel / 2.0) * end_accel +
-                 cruise * (dt - end_accel);
-    } else if (dt < end_decel) {
-      const double remaining = end_decel - dt;
-      next_vel = remaining * accel;
-      next_pos = goal * direction - remaining * next_vel / 2.0;
-    }
     const double previous_vel = p.profile_vel_rps;
+    const double stop_pos =
+        p.profile_pos_rot +
+        p.profile_vel_rps * std::abs(p.profile_vel_rps) / (2.0 * accel);
+    const double stop_error = goal - stop_pos;
+    const double direction =
+        (stop_error > 0.0 || (stop_error == 0.0 && p.profile_vel_rps < 0.0))
+            ? 1.0
+            : -1.0;
+    double pos = p.profile_pos_rot * direction;
+    double vel = p.profile_vel_rps * direction;
+    const double target = goal * direction;
+    double rem_dt = dt;
+
+    // Moving away from target (including overshoot braking): brake at +accel
+    // until velocity reaches 0.
+    if (vel < 0.0) {
+      const double t_stop = -vel / accel;
+      if (rem_dt <= t_stop) {
+        pos += vel * rem_dt + 0.5 * accel * rem_dt * rem_dt;
+        vel += accel * rem_dt;
+        p.profile_pos_rot = pos * direction;
+        p.profile_vel_rps = vel * direction;
+        return (p.profile_vel_rps - previous_vel) / dt;
+      }
+      pos += vel * t_stop + 0.5 * accel * t_stop * t_stop;
+      vel = 0.0;
+      rem_dt -= t_stop;
+    }
+
+    // Moving toward target faster than cruise: decelerate at -accel down to
+    // cruise. By choice of direction, target - pos >= vel^2 / (2 * accel), so
+    // decelerating to cruise never overshoots target.
+    if (vel > cruise) {
+      const double t_slow = (vel - cruise) / accel;
+      if (rem_dt <= t_slow) {
+        pos += vel * rem_dt - 0.5 * accel * rem_dt * rem_dt;
+        vel -= accel * rem_dt;
+        p.profile_pos_rot = pos * direction;
+        p.profile_vel_rps = vel * direction;
+        return (p.profile_vel_rps - previous_vel) / dt;
+      }
+      pos += 0.5 * (vel + cruise) * t_slow;
+      vel = cruise;
+      rem_dt -= t_slow;
+    }
+
+    // Standard trapezoid with 0 <= vel <= cruise and
+    // rem_dist >= vel^2 / (2 * accel).
+    const double rem_dist = std::max(0.0, target - pos);
+    const double v_peak_tri =
+        std::sqrt(std::max(0.0, rem_dist * accel + 0.5 * vel * vel));
+    const double v_peak = std::clamp(v_peak_tri, vel, cruise);
+    const double t_accel = (v_peak - vel) / accel;
+    const double d_accel = 0.5 * (vel + v_peak) * t_accel;
+    const double t_decel = v_peak / accel;
+    const double d_decel = 0.5 * v_peak * t_decel;
+    const double d_cruise = std::max(0.0, rem_dist - d_accel - d_decel);
+    const double t_cruise = d_cruise > 0.0 ? d_cruise / cruise : 0.0;
+    const double end_cruise = t_accel + t_cruise;
+    const double end_decel = end_cruise + t_decel;
+
+    double next_pos = target;
+    double next_vel = 0.0;
+    if (rem_dt < t_accel) {
+      next_vel = vel + rem_dt * accel;
+      next_pos = pos + (vel + 0.5 * rem_dt * accel) * rem_dt;
+    } else if (rem_dt < end_cruise) {
+      next_vel = cruise;
+      next_pos = pos + d_accel + cruise * (rem_dt - t_accel);
+    } else if (rem_dt < end_decel) {
+      const double remaining = end_decel - rem_dt;
+      next_vel = remaining * accel;
+      next_pos = target - 0.5 * remaining * next_vel;
+    }
     p.profile_pos_rot = next_pos * direction;
     p.profile_vel_rps = next_vel * direction;
     return (p.profile_vel_rps - previous_vel) / dt;
@@ -912,6 +970,19 @@ class PhysicsSimBackend final : public Backend {
     const int sensor = motor_to_sensor_[i];
     if (sensor < 0) return Direction(i);
     return config_.sensors[sensor].inverted ? -1.0 : 1.0;
+  }
+
+  // Offset of motor i's position feedback in mechanism rotations: a remote
+  // CANcoder's magnet offset, else 0.
+  double FeedbackOffset(std::size_t i) const {
+    const int sensor = motor_to_sensor_[i];
+    if (sensor < 0) return 0.0;
+    return config_.sensors[sensor].offset_rot;
+  }
+
+  double MechPosition(std::size_t i) const {
+    return axes_[i].rotor_position_rot * FeedbackDirection(i) / Gear(i) +
+           FeedbackOffset(i);
   }
 
   double Gear(std::size_t i) const {
@@ -995,7 +1066,8 @@ class PhysicsSimBackend final : public Backend {
     if (!stop.min_rot && !stop.max_rot) return false;
     const double gear = Gear(root);
     const double dir = FeedbackDirection(root) * oppose_sign;
-    double mech_pos = axes_[i].rotor_position_rot * dir / gear;
+    const double offset = FeedbackOffset(root);
+    double mech_pos = axes_[i].rotor_position_rot * dir / gear + offset;
     double mech_vel = axes_[i].rotor_velocity_rps * dir / gear;
     bool stopped = false;
     if (stop.min_rot && mech_pos <= *stop.min_rot) {
@@ -1012,7 +1084,7 @@ class PhysicsSimBackend final : public Backend {
         stopped = true;
       }
     }
-    axes_[i].rotor_position_rot = mech_pos * dir * gear;
+    axes_[i].rotor_position_rot = (mech_pos - offset) * dir * gear;
     axes_[i].rotor_velocity_rps = mech_vel * dir * gear;
     return stopped;
   }
@@ -1026,7 +1098,8 @@ class PhysicsSimBackend final : public Backend {
     bool stopped = false;
     if (out.position_rot < lo || out.position_rot > hi) {
       const double clamped = std::clamp(out.position_rot, lo, hi);
-      axes_[i].rotor_position_rot = clamped * FeedbackDirection(i) * gear;
+      axes_[i].rotor_position_rot =
+          (clamped - FeedbackOffset(i)) * FeedbackDirection(i) * gear;
       out.position_rot = clamped;
       if ((out.position_rot <= lo && out.velocity_rps < 0) ||
           (out.position_rot >= hi && out.velocity_rps > 0)) {
@@ -1093,8 +1166,9 @@ class PhysicsSimBackend final : public Backend {
                              double volts) const {
     const MotorModel motor = MotorModelFor(m.motor_type.value);
     const double dir = Direction(i);
-    const double ceiling = std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0,
-                                    supply_v_ > 0.0 ? supply_v_ : 12.0);
+    const double supply = std::max(0.0, supply_v_);
+    const double ceiling =
+        std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply);
     double rotor_volts = std::clamp(dir * volts, -ceiling, ceiling);
     const double back_emf_v =
         motor.back_emf_v_per_rps() * axes_[i].rotor_velocity_rps;
@@ -1105,9 +1179,8 @@ class PhysicsSimBackend final : public Backend {
                                back_emf_v + max_drop_v);
       rotor_volts = std::clamp(rotor_volts, -ceiling, ceiling);
     }
-    if (m.supply_limit_a > 0.0 && supply_v_ > 0.0) {
-      const double max_power_drop =
-          m.supply_limit_a * supply_v_ * resistance_ohm;
+    if (m.supply_limit_a > 0.0 && supply > 0.0) {
+      const double max_power_drop = m.supply_limit_a * supply * resistance_ohm;
       const double draw_drop = rotor_volts * (rotor_volts - back_emf_v);
       if (draw_drop > max_power_drop) {
         const double root =
@@ -1203,8 +1276,7 @@ class PhysicsSimBackend final : public Backend {
       mech.load = LoadKind::kRoller;
       double volts = 0.0;
       const double gear = mech.gear_ratio;
-      const double mech_pos =
-          axes_[i].rotor_position_rot * FeedbackDirection(i) / gear;
+      const double mech_pos = MechPosition(i);
       const double mech_vel =
           axes_[i].rotor_velocity_rps * FeedbackDirection(i) / gear;
       auto& profile = profiles_[i];
@@ -1213,18 +1285,28 @@ class PhysicsSimBackend final : public Backend {
       if (req.mode == Mode::kMotionMagic && m.cruise_velocity_rps > 0.0 &&
           m.acceleration_rps2 > 0.0) {
         if (!profile.active) profile = {mech_pos, mech_vel, true};
-        const double accel = AdvanceProfile(profile, m, req.demand, dt_s);
+        const double goal =
+            m.continuous_wrap
+                ? profile.profile_pos_rot +
+                      std::remainder(req.demand - profile.profile_pos_rot, 1.0)
+                : req.demand;
+        const double accel = AdvanceProfile(profile, m, goal, dt_s);
         const auto& gains = m.slots[req.slot < 3 ? req.slot : 0];
         const double velocity = profile.profile_vel_rps;
         const double sign = velocity > 0.0 ? 1.0 : velocity < 0.0 ? -1.0 : 0.0;
         const double ceiling =
-            std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply_v_);
-        volts = std::clamp(
-            req.feedforward_v + gains.p * (profile.profile_pos_rot - mech_pos) +
-                gains.v * velocity + gains.a * accel + gains.s * sign +
-                gains.d * (velocity - mech_vel) +
-                GravityVoltage(gains, mech_pos),
-            -ceiling, ceiling);
+            std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0,
+                     std::max(0.0, supply_v_));
+        const double pos_error =
+            m.continuous_wrap
+                ? std::remainder(profile.profile_pos_rot - mech_pos, 1.0)
+                : (profile.profile_pos_rot - mech_pos);
+        volts =
+            std::clamp(req.feedforward_v + gains.p * pos_error +
+                           gains.v * velocity + gains.a * accel +
+                           gains.s * sign + gains.d * (velocity - mech_vel) +
+                           GravityVoltage(gains, mech_pos),
+                       -ceiling, ceiling);
         want_power = FeedbackValid(i);
       } else if (req.mode == Mode::kTorqueCurrent) {
         // Powered at any demand: 0 A is zero torque, not neutral.
@@ -1306,16 +1388,16 @@ class PhysicsSimBackend final : public Backend {
     double lever_squared = 0.0;
     for (auto& module : modules_) {
       const double surface_speed =
-          axes_[module.drive].rotor_velocity_rps / Gear(module.drive) * kTau *
-          options_.wheel_radius_m * (1.0 + options_.wheel_radius_error_frac);
+          axes_[module.drive].rotor_velocity_rps * Direction(module.drive) /
+          Gear(module.drive) * kTau * options_.wheel_radius_m *
+          (1.0 + options_.wheel_radius_error_frac);
       const double acceleration =
           (surface_speed - module.previous_surface_speed_mps) / dt_s;
       module.previous_surface_speed_mps = surface_speed;
       const double slip = std::min(
           1.0, options_.wheel_slip_gain * std::abs(acceleration) / 9.80665);
       const double speed = surface_speed * (1.0 - slip);
-      const double angle =
-          axes_[module.steer].rotor_position_rot / Gear(module.steer) * kTau;
+      const double angle = MechPosition(module.steer) * kTau;
       const double vx = speed * std::cos(angle);
       const double vy = speed * std::sin(angle);
       sum_x += module.x_m;
