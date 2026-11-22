@@ -30,7 +30,12 @@ struct CameraIntrinsics {
   uint32_t image_width{0};
   uint32_t image_height{0};
 
-  bool IsValid() const { return fx > 0.0 && fy > 0.0 && cx > 0.0 && cy > 0.0; }
+  bool IsValid() const {
+    return std::isfinite(fx) && std::isfinite(fy) && std::isfinite(cx) &&
+           std::isfinite(cy) && std::isfinite(k1) && std::isfinite(k2) &&
+           std::isfinite(p1) && std::isfinite(p2) && std::isfinite(k3) &&
+           fx > 0.0 && fy > 0.0 && cx > 0.0 && cy > 0.0;
+  }
 
   Eigen::Matrix3d K() const {
     Eigen::Matrix3d k = Eigen::Matrix3d::Identity();
@@ -54,7 +59,7 @@ struct CameraIntrinsics {
   // coordinates.
   bool ProjectPoint(const Eigen::Vector3d& p_cam,
                     Eigen::Vector2d* uv_out) const {
-    if (p_cam.z() <= 1e-6) {
+    if (uv_out == nullptr || !p_cam.allFinite() || !(p_cam.z() > 1e-6)) {
       return false;
     }
 
@@ -73,8 +78,13 @@ struct CameraIntrinsics {
     const double x_dist = x * radial + dx;
     const double y_dist = y * radial + dy;
 
-    uv_out->x() = fx * x_dist + cx;
-    uv_out->y() = fy * y_dist + cy;
+    const double u = fx * x_dist + cx;
+    const double v = fy * y_dist + cy;
+    if (!std::isfinite(u) || !std::isfinite(v)) {
+      return false;
+    }
+    uv_out->x() = u;
+    uv_out->y() = v;
     return true;
   }
 
@@ -83,6 +93,9 @@ struct CameraIntrinsics {
                                            int max_iterations = 8) const {
     const double x_dist = (uv.x() - cx) / fx;
     const double y_dist = (uv.y() - cy) / fy;
+    if (!std::isfinite(x_dist) || !std::isfinite(y_dist)) {
+      return Eigen::Vector2d(x_dist, y_dist);
+    }
 
     double x = x_dist;
     double y = y_dist;
@@ -93,15 +106,20 @@ struct CameraIntrinsics {
       const double r4 = r2 * r2;
       const double r6 = r4 * r2;
       const double radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
-      if (!(radial > 1e-6)) {
+      if (!std::isfinite(radial) || !(radial > 1e-6)) {
         return Eigen::Vector2d(x_dist, y_dist);
       }
 
       const double dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
       const double dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
 
-      x = (x_dist - dx) / radial;
-      y = (y_dist - dy) / radial;
+      const double next_x = (x_dist - dx) / radial;
+      const double next_y = (y_dist - dy) / radial;
+      if (!std::isfinite(next_x) || !std::isfinite(next_y)) {
+        return Eigen::Vector2d(x_dist, y_dist);
+      }
+      x = next_x;
+      y = next_y;
     }
     return Eigen::Vector2d(x, y);
   }

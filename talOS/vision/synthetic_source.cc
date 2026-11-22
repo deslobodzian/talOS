@@ -260,10 +260,10 @@ void SyntheticCameraSource::RenderScene(Frame& frame) {
   const uint32_t stride = frame.stride();
   const PixelFormat format = frame.format();
   uint8_t* buf = frame.mutable_data();
+  if (buf == nullptr || width == 0 || height == 0) return;
 
   // Background color: white (255)
   std::memset(buf, 255, frame.size());
-  if (buf == nullptr || width == 0 || height == 0) return;
 
   // Grayscale-equivalent paint colors per pixel format. Every channel
   // carries the same gray value, so Rgb8/Bgr8 share one spelling; Bgra8
