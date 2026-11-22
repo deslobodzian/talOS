@@ -114,10 +114,12 @@ bazel test //...
 talOS's `.bazelrc` enables a shared Bazel disk cache at
 `~/.cache/talos-bazel-disk` (40 GiB GC cap) so worktrees, `tools/prepush.sh`,
 and `tools/tidy.sh` reuse compiled artifacts; an explicit `--disk_cache` flag
-or `~/.bazelrc` entry overrides it. For faster local C++ rebuilds on the fast
-test lane, pass `--config=dev` (`-O1` instead of `-O3`, skipping `heavy`,
-`integration`, `e2e`, and `perf` tests); `--config=dev` uses separate cache
-keys from the default `-O3` build.
+or `~/.bazelrc` entry overrides it. [`talos.bazelrc`](../talos.bazelrc)
+(imported by talOS's `.bazelrc` and dependent robot repositories) sets
+`--incompatible_strict_action_env` for shell-`PATH`-independent cache keys
+and defines `--config=dev` (`-O1` + the fast test lane; see
+[TESTING.md §9](TESTING.md#9-lanes-and-ci) for the analysis-cache switch
+caveat when alternating with default `-O3` builds or `tools/tidy.sh`).
 
 CI runs the C++ suite with AddressSanitizer + UndefinedBehaviorSanitizer and
 ThreadSanitizer, one leg per sanitizer: on Linux on every push
