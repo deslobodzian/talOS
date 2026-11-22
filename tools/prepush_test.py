@@ -512,7 +512,7 @@ class PrepushTest(unittest.TestCase):
         soak = [args.split() for _, _, args in calls
                 if "//bench/main_processor/simulation:soak_test" in args]
         self.assertEqual(len(soak), 1, out)
-        self.assertIn("--test_env=TALOS_SOAK_SECONDS=36", soak[0])
+        self.assertIn("--test_env=TALOS_SOAK_SECONDS=42", soak[0])
         self.assertIn("--nocache_test_results", soak[0])
 
     # REQ-DEV-25

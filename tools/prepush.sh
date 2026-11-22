@@ -59,7 +59,7 @@
 # MODULE.bazel, third_party/, .bazelversion or talos.bazelrc), under
 # --full only tsan and asan (tools/sanitizer_lane.sh, CI's sanitizer
 # jobs; 5 to 10 minutes each cold) and soak (CI's
-# soak_test with seed 0 for TALOS_SOAK_SECONDS=36, the shortest run that
+# soak_test with seed 0 for TALOS_SOAK_SECONDS=42, the shortest run that
 # injects every fault kind); after a failed build, host-includes, test,
 # tidy, rio-in-the-loop, tsan, asan and soak are SKIPPED; checkout-unchanged, then, when the commits
 # touch studio/,
@@ -500,8 +500,8 @@ fi
 
 # CI's sanitizer jobs, from the commit's own tools/sanitizer_lane.sh (CI
 # runs the same one), and one soak seed: CI's soak with the seed its branch
-# pushes use, for 36 s of teleop rather than 180 s, the shortest run that
-# injects every fault kind once (bench/main_processor/simulation/README.md).
+# pushes use, for 42 s of enabled cycles rather than 180 s, the shortest run
+# that injects every fault kind once (bench/main_processor/simulation/README.md).
 if [ "$full" = 1 ] && [ "$built" = 0 ]; then
   for step in tsan asan soak; do skip "$step" "the build failed"; done
 elif [ "$full" = 1 ]; then
@@ -516,7 +516,7 @@ elif [ "$full" = 1 ]; then
   done
   run_step soak bazel test //bench/main_processor/simulation:soak_test \
     --test_output=errors --nocache_test_results \
-    --test_env=TALOS_SOAK_SECONDS=36 --test_env=TALOS_SOAK_SEED=0 \
+    --test_env=TALOS_SOAK_SECONDS=42 --test_env=TALOS_SOAK_SEED=0 \
     --noshow_progress "--disk_cache=$disk_cache" || true
 else
   report "tsan, asan and soak not run (they run under --full)"
