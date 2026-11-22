@@ -311,7 +311,12 @@ bitmask and each reader's `wake_id`; neither changes a size.
 cannot revive an expired command by draining it. Latest-value subscriptions
 dispatch only the newest available message per drain and count skipped messages
 as dropped; per-message callbacks retain sequence delivery, capped at 64 messages
-per topic per drain by default. Dispatch scheduling latency remains separate.
+per topic per drain (`max_messages_per_tick`) by default. Before dispatching a
+due timer, the event loop repeats bounded sequence drains up to
+`(slots - 1) / max_messages_per_tick + 2` passes (one full ring plus one
+confirming pass) so a queued burst is caught up before `update()` runs while a
+continuously flooded topic stays bounded. Dispatch scheduling latency remains
+separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
