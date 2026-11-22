@@ -35,6 +35,7 @@
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/launcher/session_lock.h"
+#include "talOS/launcher/sleep_guard.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/process/process.h"
 #include "talOS/protocol/types.h"
@@ -1244,6 +1245,20 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // off this thread (PersistManifest).
   PersistManifest(procs, /*durable=*/true);
   manifest_writer_->Start();
+
+  // Hold a macOS IOKit PreventSystemSleep assertion for the running session's
+  // lifetime (no-op on Linux) as defense-in-depth independent of `pmset sleep
+  // 0` against idle or DarkWake maintenance sleep (TODO.md DEPLOY-1).
+  std::string sleep_guard_error;
+  const SleepGuard sleep_guard = SleepGuard::Acquire(
+      "talOS session " + std::to_string(options_.session_id),
+      &sleep_guard_error);
+  if (!sleep_guard_error.empty()) {
+    ConsoleLine(std::cerr)
+        << "[launcher] warning: could not acquire macOS PreventSystemSleep "
+           "assertion ("
+        << sleep_guard_error << "); continuing without sleep guard\n";
+  }
 
   // The deadline starts with the session, so a bridge that never comes up
   // cannot push the session's end out.

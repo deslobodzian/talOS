@@ -285,6 +285,31 @@ cc_test(
     ],
 )
 
+# Holds a macOS IOKit PreventSystemSleep assertion for a running session
+# (silent no-op on Linux; TODO.md DEPLOY-1).
+cc_library(
+    name = "sleep_guard",
+    srcs = ["sleep_guard.cc"],
+    hdrs = ["sleep_guard.h"],
+    linkopts = select({
+        "@platforms//os:macos": [
+            "-Wl,-framework,IOKit",
+            "-Wl,-framework,CoreFoundation",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "sleep_guard_test",
+    size = "small",
+    srcs = ["sleep_guard_test.cc"],
+    deps = [
+        ":sleep_guard",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # The supervisor (Launcher) and the Studio bridge it supervises.
 cc_library(
     name = "launcher_lib",
@@ -312,6 +337,7 @@ cc_library(
         ":log_budget",
         ":roster",
         ":session",
+        ":sleep_guard",
         ":spawn",
         ":supervision_policy",
         "//talOS/bridge:messages",
