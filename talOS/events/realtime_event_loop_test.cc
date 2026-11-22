@@ -240,6 +240,95 @@ TEST(RealtimeEventLoop, LatestBacklogDispatchesNewestWithPublicationAge) {
   EXPECT_EQ(loop.source_counters()[watcher].dropped.load(), 129u);
 }
 
+// A publisher overwrites the oldest slot when a sequence watcher stalls past
+// the ring's capacity, so every publish succeeds and the lapped watcher
+// receives the retained tail in strict sequence order with the exact loss
+// reported in both Context::dropped and SourceCounters::dropped.
+// REQ-RT-12
+TEST(RealtimeEventLoop,
+     SequenceWatcherReportsExactLossWhenLappedByRingOverflow) {
+  constexpr std::size_t kSlots = 16;
+  constexpr std::uint64_t kExtra = 10;
+  constexpr std::uint64_t kPublished = kSlots + kExtra;
+  // Under OVERWRITE_OLDEST, the ring retains the newest `kSlots - 1` messages
+  // because slot `writer_position & (kSlots - 1)` is reserved for the writer's
+  // next overwrite.
+  constexpr std::uint64_t kRetained = kSlots - 1;
+  constexpr std::uint64_t kExpectedDropped = kPublished - kRetained;
+
+  const std::string topic = "/seqlap_" + std::to_string(::getpid());
+
+  RealtimeEventLoop<>::Options options;
+  options.slots = kSlots;
+  options.delivery = Delivery::BEFORE_TIMERS;
+
+  RealtimeEventLoop<> watcher_loop{options};
+  struct Delivered {
+    Context context;
+    std::int32_t sensor_id;
+  };
+  std::vector<Delivered> delivered;
+  auto on_message = [&](const Context& context,
+                        std::span<const std::byte> bytes) {
+    ASSERT_EQ(bytes.size(), sizeof(EventsTest::SensorMessage));
+    EventsTest::SensorMessage message{};
+    std::memcpy(&message, bytes.data(), sizeof(message));
+    delivered.push_back({context, message.sensor_id()});
+  };
+  const auto watcher = watcher_loop.register_watcher(
+      topic, sizeof(EventsTest::SensorMessage),
+      alignof(EventsTest::SensorMessage),
+      talos::schema::Of<EventsTest::SensorMessage>(), make_thunk(&on_message),
+      /*latest_only=*/false);
+  auto stop_watcher = [&](const Context&) { watcher_loop.exit(); };
+  const auto stop_watcher_timer =
+      watcher_loop.register_timer("stop", make_thunk(&stop_watcher));
+  watcher_loop.arm_timer(stop_watcher_timer, watcher_loop.monotonic_now(), {});
+
+  // Publish more messages than the ring holds through RealtimeEventLoop's
+  // OVERWRITE_OLDEST sender while watcher_loop is stalled (not yet running).
+  RealtimeEventLoop<> publisher_loop{options};
+  const auto sender = publisher_loop.register_sender(
+      topic, sizeof(EventsTest::SensorMessage),
+      alignof(EventsTest::SensorMessage),
+      talos::schema::Of<EventsTest::SensorMessage>());
+  auto publish_all = [&](const Context&) {
+    for (std::uint64_t i = 0; i < kPublished; ++i) {
+      const EventsTest::SensorMessage message{static_cast<std::int32_t>(i),
+                                              0.0F, 0.0F};
+      EXPECT_TRUE(publisher_loop.send_message(
+          sender, std::as_bytes(std::span<const EventsTest::SensorMessage, 1>{
+                      &message, 1})))
+          << "publish " << i << " was refused";
+    }
+    publisher_loop.exit();
+  };
+  const auto publish_timer =
+      publisher_loop.register_timer("publish", make_thunk(&publish_all));
+  publisher_loop.arm_timer(publish_timer, publisher_loop.monotonic_now(), {});
+  publisher_loop.run_for(kHangBound);  // Bound only; publish_all exits.
+  ASSERT_EQ(publisher_loop.source_counters()[sender].events.load(), kPublished);
+  ASSERT_EQ(publisher_loop.source_counters()[sender].dropped.load(), 0u);
+
+  // Now drain the stalled watcher.
+  watcher_loop.run_for(kHangBound);  // Bound only; stop_watcher exits.
+
+  ASSERT_EQ(delivered.size(), static_cast<std::size_t>(kRetained));
+  for (std::size_t i = 0; i < delivered.size(); ++i) {
+    SCOPED_TRACE(i);
+    const std::uint64_t expected_sequence = kExpectedDropped + i;
+    EXPECT_EQ(delivered[i].context.sequence, expected_sequence);
+    EXPECT_EQ(delivered[i].sensor_id,
+              static_cast<std::int32_t>(expected_sequence));
+    EXPECT_EQ(delivered[i].context.dropped, i == 0 ? kExpectedDropped : 0u);
+  }
+  EXPECT_EQ(watcher_loop.source_counters()[watcher].events.load(), kRetained);
+  EXPECT_EQ(watcher_loop.source_counters()[watcher].dropped.load(),
+            kExpectedDropped);
+  EXPECT_EQ(watcher_loop.source_counters()[watcher].sequence.load(),
+            kPublished - 1);
+}
+
 // Under POLL the loop sleeps between poll ticks; under ON_PUBLISH it sleeps
 // with its prompt watcher armed, on a topic nobody publishes.
 TEST(RealtimeEventLoop, ExitFromAnotherThreadReturnsPromptly) {
