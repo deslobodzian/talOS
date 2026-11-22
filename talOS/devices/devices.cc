@@ -221,6 +221,7 @@ struct HardwareLink::Impl {
 
   hardware::State state{};
   bool have_state = false;
+  hardware::BootHistory boots;
   Time state_published{};
   std::size_t state_subscription = 0;
   // The bridge's gateway-to-node clock mapping. The state is the gateway's
@@ -328,13 +329,18 @@ struct HardwareLink::Impl {
   }
 
   // Decoded, then latched only when AcceptState takes it: this config's id,
-  // and newer than the last sample from the same boot.
+  // not a recently retired gateway boot, and newer than the last sample from
+  // the same boot.
   void OnState(const void* data) {
     Packet packet{};
     std::memcpy(&packet, data, sizeof packet);
     hardware::State next{};
     if (!hardware::Decode(packet.bytes(), next)) return;
-    if (!hardware::AcceptState(have_state, state, config_id, next)) return;
+    if (!hardware::AcceptState(have_state, state, config_id, next,
+                               boots.retired(next.boot_id))) {
+      return;
+    }
+    if (!boots.current(next.boot_id)) boots.Enter(next.boot_id);
     if (have_state) ForgetZeros(next);
     state = next;
     have_state = true;
