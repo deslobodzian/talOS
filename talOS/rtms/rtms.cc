@@ -519,8 +519,16 @@ uint64_t RTMSQueue::minimum_read_position() const {
       header_->writer.sequence.load(std::memory_order_relaxed);
 
   for (std::size_t i = 0; i < MAX_READERS; ++i) {
-    // Reader hasn't started yet, so position isn't relevent
-    if (!is_active(header_->readers[i])) {
+    // Sequentially consistent, completing the four-operation store-buffering
+    // pair with write()'s seq_cst sequence store and activate_reader_slot()'s
+    // seq_cst activation and sequence load: on ARMv8.3-RCPC (Apple Silicon) an
+    // acquire load emits ldapr, which may reorder before the writer's prior
+    // sequence store. Under seq_cst, either this DROP_NEWEST admission check
+    // observes ACTIVE (and reads the reader's cursor below) or
+    // activate_reader_slot() observes the published sequence and advances the
+    // cursor past any overwritten slot.
+    if ((header_->readers[i].state.load(std::memory_order_seq_cst) & 3) !=
+        static_cast<std::uint64_t>(ReaderState::ACTIVE)) {
       continue;
     }
     const auto position =
@@ -646,10 +654,12 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
     header_->writer.reliable_sequence.store(next_position,
                                             std::memory_order_release);
   }
-  // Sequentially consistent, pairing with arm_wake(): a reader sets its
-  // waiters bit and then loads the sequence, the writer stores the sequence
-  // and then loads the waiters word, so either the reader sees this
-  // publication and does not sleep, or the writer sees the bit and wakes it.
+  // Sequentially consistent, pairing with arm_wake() (reader sets its waiters
+  // bit then loads sequence; writer stores sequence then loads waiters) and
+  // with activate_reader_slot() / minimum_read_position() (reader marks ACTIVE
+  // then loads sequence; DROP_NEWEST writer stores sequence then loads reader
+  // state on its next admission check). Under seq_cst at least one side of
+  // each pair observes the other's store.
   header_->writer.sequence.store(next_position, std::memory_order_seq_cst);
   // No reader asleep: no exchange and no system call.
   if (header_->writer.waiters.load(std::memory_order_seq_cst) != 0) {
@@ -812,15 +822,23 @@ bool RTMSQueue::activate_reader_slot(std::size_t reader_id,
 
   // Only while the claim is still this one: a process that judged this
   // one dead may have freed it meanwhile, and another claimed the slot.
+  // Both this activation CAS and the writer.sequence load below are
+  // sequentially consistent, forming a four-operation store-buffering pair
+  // with write()'s seq_cst sequence store and minimum_read_position()'s
+  // seq_cst reader.state load (on ARMv8.3-RCPC / Apple Silicon, release +
+  // acquire compiles to casl + ldapr, allowing ldapr to reorder before casl).
+  // Under seq_cst, either a DROP_NEWEST writer's admission check sees ACTIVE
+  // and respects this reader's cursor, or writer_after sees the publication
+  // and advances the cursor past any overwritten slot.
   std::uint64_t expected = ReaderWord(ReaderState::CLAIMING);
   if (!reader.state.compare_exchange_strong(expected, active,
-                                            std::memory_order_release,
+                                            std::memory_order_seq_cst,
                                             std::memory_order_relaxed)) {
     return false;
   }
   registered_[reader_id] = active;
   const auto writer_after =
-      header_->writer.sequence.load(std::memory_order_acquire);
+      header_->writer.sequence.load(std::memory_order_seq_cst);
   if (writer_after > current && writer_after - current >= header_->slots) {
     reader.sequence.store(writer_after, std::memory_order_release);
   }
