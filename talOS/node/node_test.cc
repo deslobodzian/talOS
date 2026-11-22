@@ -111,9 +111,9 @@ TEST(Node, ReadsParamsWithFallbacksAndRejectsMissingOrMistyped) {
 }
 
 // The actuation path picks a loop's scheduling tier: a node whose own
-// subsystem has a motor, or that writes a target lane, runs above the
-// observers (sensors only, or publishing only its own topics), wherever the
-// other subsystems' actuators are.
+// subsystem owns an actuator (motor, digital output, or PWM output), or that
+// writes a target lane, runs above the observers (sensors only, or publishing
+// only its own topics), wherever the other subsystems' actuators are.
 struct LanePublisher {
   explicit LanePublisher(Node& n)
       : lane{n.publish<Count>("/arm/target/auto")} {}
@@ -124,6 +124,7 @@ struct StatePublisher {
   Publisher<Count> state;
 };
 
+// REQ-RT-08
 TEST(Node, LoopTierFollowsTheActuationPath) {
   auto sim = Sim::FromToml(R"(
 [robot]
@@ -133,6 +134,12 @@ command_timeout_us = 100000
 [subsystems.arm.motors.lift]
 can_id = 1
 
+[subsystems.solenoid.digital_outputs.latch]
+dio = 4
+
+[subsystems.servo.pwm_outputs.hood]
+channel = 0
+
 [subsystems.gate.digital_inputs.beam]
 dio = 3
 
@@ -140,11 +147,17 @@ dio = 3
 [subsystems.estimator]
 )");
   sim.add<Empty>("arm");
+  sim.add<Empty>("solenoid");
+  sim.add<Empty>("servo");
   sim.add<LanePublisher>("autonomous");
   sim.add<Empty>("gate");
   sim.add<StatePublisher>("estimator");
 
   EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("arm")),
+            process::LoopTier::kControl);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("solenoid")),
+            process::LoopTier::kControl);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("servo")),
             process::LoopTier::kControl);
   EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("autonomous")),
             process::LoopTier::kControl);
@@ -261,6 +274,7 @@ struct Watcher {
   std::vector<Duration> ages;
 };
 
+// REQ-RT-01
 TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& watcher = sim.add<Watcher>("listener");  // 5 ms period
@@ -293,6 +307,78 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_FALSE(watcher.in.fresh());
   EXPECT_TRUE(watcher.in.fresh(1s));
   EXPECT_TRUE(watcher.in.has_value());
+}
+
+// A callback-free node drains immediately before every timer (`update()` and
+// `every()`): a message published between `update()` and `every()` is not
+// drained early, and `every()` sees it at its deadline with its publication
+// age, ahead of the next `update()`.
+// REQ-RT-01
+TEST(Node, CallbackFreeNodeDrainsBeforeEveryTimerAtItsDeadline) {
+  struct DualTimerWatcher {
+    struct Sample {
+      Duration at;
+      bool has_value;
+      std::int64_t value;
+      Duration age;
+    };
+    explicit DualTimerWatcher(Node& n)
+        : node{n}, in{n.subscribe<Count>("/watch/target")} {
+      n.every(3ms, [this] {
+        every_seen.push_back({Duration{node.now().nanos()}, in.has_value(),
+                              in->tick_count(), in.age()});
+      });
+    }
+    void update() {
+      update_seen.push_back({Duration{node.now().nanos()}, in.has_value(),
+                             in->tick_count(), in.age()});
+    }
+    Node& node;
+    Subscription<Count> in;
+    std::vector<Sample> update_seen;
+    std::vector<Sample> every_seen;
+  };
+
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& watcher = sim.add<DualTimerWatcher>("listener");  // update every 5 ms
+
+  // First every() at 3 ms and first update() at 5 ms see nothing yet.
+  sim.step(5ms);
+  ASSERT_EQ(watcher.every_seen.size(), 1u);
+  EXPECT_EQ(watcher.every_seen[0].at, 3ms);
+  EXPECT_FALSE(watcher.every_seen[0].has_value);
+  ASSERT_EQ(watcher.update_seen.size(), 1u);
+  EXPECT_EQ(watcher.update_seen[0].at, 5ms);
+  EXPECT_FALSE(watcher.update_seen[0].has_value);
+
+  // Publish at 5.5 ms, between update() (5 ms) and every() (6 ms).
+  sim.step(500us);
+  sim.publish("/watch/target", Count{42, 0});
+  // Before every()'s deadline (5.9 ms), the callback-free node has not drained.
+  sim.step(400us);
+  EXPECT_FALSE(watcher.in.has_value());
+
+  // At every()'s deadline (6 ms), it drains immediately before running and sees
+  // the publication at its exact age (500 us), ahead of the 10 ms update().
+  sim.step(100us);
+  ASSERT_EQ(watcher.every_seen.size(), 2u);
+  EXPECT_EQ(watcher.every_seen[1].at, 6ms);
+  EXPECT_TRUE(watcher.every_seen[1].has_value);
+  EXPECT_EQ(watcher.every_seen[1].value, 42);
+  EXPECT_EQ(watcher.every_seen[1].age, 500us);
+  EXPECT_EQ(watcher.update_seen.size(), 1u);
+
+  // A second publication at 7 ms is seen by every() at 9 ms (age 2 ms),
+  // still ahead of the next update() at 10 ms.
+  sim.step(1ms);
+  sim.publish("/watch/target", Count{99, 0});
+  sim.step(2ms);
+  ASSERT_EQ(watcher.every_seen.size(), 3u);
+  EXPECT_EQ(watcher.every_seen[2].at, 9ms);
+  EXPECT_TRUE(watcher.every_seen[2].has_value);
+  EXPECT_EQ(watcher.every_seen[2].value, 99);
+  EXPECT_EQ(watcher.every_seen[2].age, 2ms);
+  EXPECT_EQ(watcher.update_seen.size(), 1u);
 }
 
 // REQ-SAFE-08
@@ -769,31 +855,109 @@ TEST(Sim, APausedNodeHearsWhatItMissedWhenThePauseEnds) {
 }
 
 // Two nodes whose callbacks answer each other at once never let time pass.
-// The step fails after its round bound, naming the node still due and its
-// topic, instead of hanging the test.
+// The step fails after exactly 1000 rounds at one instant, naming every node
+// still due and every due prompt topic, instead of hanging the test.
 struct Echo {
   explicit Echo(Node& n)
       : out{n.publish<Count>("state")},
         in{n.subscribe<Count>(
             n.name() == "ping" ? "/pong/state" : "/ping/state",
-            [this](const Count& c) { out.send(c); })} {}
+            [this](const Count& c) {
+              ++callbacks;
+              out.send(c);
+            })} {}
   Publisher<Count> out;
   Subscription<Count> in;
+  int callbacks = 0;
 };
 
 // REQ-RT-05
 TEST(Sim, AZeroTimePublishCycleFailsTheStepNamingWhatIsDue) {
   auto sim = Sim::FromToml(kCausalToml);
-  sim.add<Echo>("ping");
-  sim.add<Echo>("pong");
+  auto& ping = sim.add<Echo>("ping");
+  auto& pong = sim.add<Echo>("pong");
+  // Start both loops before injecting so Settle() accounts for every round.
+  sim.step(0ms);
   sim.publish("/pong/state", Count{0, 0});
   try {
     sim.step(1ms);
     FAIL() << "a zero-time cycle returned";
   } catch (const std::runtime_error& error) {
+    EXPECT_EQ(ping.callbacks, 1000);
+    EXPECT_EQ(pong.callbacks, 1000);
     const std::string what = error.what();
+    EXPECT_NE(what.find("1000 rounds"), std::string::npos) << what;
     EXPECT_NE(what.find("'ping'"), std::string::npos) << what;
     EXPECT_NE(what.find("/pong/state"), std::string::npos) << what;
+  }
+}
+
+// When a zero-time cycle leaves multiple nodes simultaneously due and a node
+// has multiple due prompt topics, the failure after 1000 rounds names each due
+// node and each of its due prompt topics.
+// REQ-RT-05
+TEST(Sim, AZeroTimeCycleNamesMultipleDueNodesAndMultipleDuePromptTopics) {
+  struct MultiPrompt {
+    explicit MultiPrompt(Node& n)
+        : out{n.publish<Count>("state")},
+          in_state{n.subscribe<Count>("/gamma/state",
+                                      [this](const Count& c) {
+                                        ++state_callbacks;
+                                        out.send(c);
+                                      })},
+          in_status{n.subscribe<Count>(
+              "/gamma/status", [this](const Count&) { ++status_callbacks; })} {}
+    Publisher<Count> out;
+    Subscription<Count> in_state;
+    Subscription<Count> in_status;
+    int state_callbacks = 0;
+    int status_callbacks = 0;
+  };
+  struct PeerWatcher {
+    explicit PeerWatcher(Node& n)
+        : in{n.subscribe<Count>("/gamma/state",
+                                [this](const Count&) { ++callbacks; })} {}
+    Subscription<Count> in;
+    int callbacks = 0;
+  };
+  struct Broadcaster {
+    explicit Broadcaster(Node& n)
+        : out_state{n.publish<Count>("state")},
+          out_status{n.publish<Count>("status")},
+          in{n.subscribe<Count>("/alpha/state", [this](const Count& c) {
+            ++callbacks;
+            out_state.send(c);
+            out_status.send(c);
+          })} {}
+    Publisher<Count> out_state;
+    Publisher<Count> out_status;
+    Subscription<Count> in;
+    int callbacks = 0;
+  };
+
+  auto sim = Sim::FromToml(kCausalToml);
+  auto& alpha = sim.add<MultiPrompt>("alpha");
+  auto& beta = sim.add<PeerWatcher>("beta");
+  auto& gamma = sim.add<Broadcaster>("gamma");
+  sim.step(0ms);
+  sim.publish("/gamma/state", Count{0, 0});
+  sim.publish("/gamma/status", Count{0, 0});
+  try {
+    sim.step(1ms);
+    FAIL() << "a zero-time cycle returned";
+  } catch (const std::runtime_error& error) {
+    EXPECT_EQ(alpha.state_callbacks, 1000);
+    EXPECT_EQ(alpha.status_callbacks, 1000);
+    EXPECT_EQ(beta.callbacks, 1000);
+    EXPECT_EQ(gamma.callbacks, 1000);
+    const std::string what = error.what();
+    EXPECT_NE(what.find("1000 rounds"), std::string::npos) << what;
+    EXPECT_NE(what.find("node 'alpha' (/gamma/state, /gamma/status)"),
+              std::string::npos)
+        << what;
+    EXPECT_NE(what.find("node 'beta' (/gamma/state)"), std::string::npos)
+        << what;
+    EXPECT_EQ(what.find("node 'gamma'"), std::string::npos) << what;
   }
 }
 
