@@ -134,12 +134,12 @@ def load_config(config):
 
 def device_layout(config):
     """Mirror the config's documented sorted logical-ID and motor-bit order."""
-    robot = tomllib.loads(config.read_text())
+    _, subsystem_files = load_config(config)
     devices = []
-    for subsystem in robot["subsystems"]:
-        document = tomllib.loads((config.parent / subsystem["path"]).read_text())
+    for sub_name, sub_path in subsystem_files.items():
+        document = tomllib.loads(sub_path.read_text())
         for kind in ("motors", "sensors", "digital_inputs", "digital_outputs",
                      "analog_inputs", "encoders", "pwm_outputs"):
-            devices.extend((subsystem["name"], name, kind)
+            devices.extend((sub_name, name, kind)
                            for name in document.get(kind, {}))
     return [(i, *device) for i, device in enumerate(sorted(devices), 1)]

@@ -1,7 +1,8 @@
 // Test-only autonomous target producer for the bench soak graph
 // (testdata/robot_soak.toml). Publishes nonzero autonomous targets on
-// /swerve_module/target/auto and /motor/target/auto while enabled in autonomous
-// mode, and releases both lanes otherwise.
+// /swerve_module/target/auto, /motor/target/auto, and
+// /python_motor/target/auto while enabled in autonomous mode, and releases all
+// three lanes otherwise.
 #include "motor/motor_message_generated.h"
 #include "swerve_module/module_message_generated.h"
 #include "talOS/devices/devices.h"
@@ -20,18 +21,22 @@ class AutoProducer {
   explicit AutoProducer(talos::Node& node)
       : ds_{node},
         swerve_lane_{node, "swerve_module", "auto"},
-        motor_lane_{node, "motor", "auto"} {}
+        motor_lane_{node, "motor", "auto"},
+        python_motor_lane_{node, "python_motor", "auto"} {}
 
   void update() {
     if (ds_.enabled() && ds_.autonomous() && !ds_.estop()) {
       swerve_lane_.send(swerve_module::ModuleTarget{
           swerve_module::ModuleMode::DRIVE, kAutoDriveVelocityRps, 0.0});
-      motor_lane_.send(motor::MotorTarget{motor::ControlMode::VELOCITY, 0.0,
-                                          kAutoMotorVelocityRps, 0.0, 0.0});
+      const motor::MotorTarget motor_target{motor::ControlMode::VELOCITY, 0.0,
+                                            kAutoMotorVelocityRps, 0.0, 0.0};
+      motor_lane_.send(motor_target);
+      python_motor_lane_.send(motor_target);
       commanding_ = true;
     } else if (commanding_) {
       swerve_lane_.release();
       motor_lane_.release();
+      python_motor_lane_.release();
       commanding_ = false;
     }
   }
@@ -40,6 +45,7 @@ class AutoProducer {
   talos::DriverStation ds_;
   talos::TargetLane<swerve_module::ModuleTarget> swerve_lane_;
   talos::TargetLane<motor::MotorTarget> motor_lane_;
+  talos::TargetLane<motor::MotorTarget> python_motor_lane_;
   bool commanding_{false};
 };
 

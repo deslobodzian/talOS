@@ -75,10 +75,11 @@ def fake_popen(args, **kwargs):
 fake_robot = {"command_timeout_us": 200000, "period_us": 20000}
 sub_file = workspace_dir / "sub.toml"
 sub_file.write_text("[subsystem]\nperiod_us = 5000\n")
-fake_subs = {"swerve_module": sub_file, "motor": sub_file}
+fake_subs = {"swerve_module": sub_file, "motor": sub_file, "python_motor": sub_file}
 fake_layout = [
     (1, "swerve_module", "drive", "motors"),
     (2, "motor", "motor", "motors"),
+    (3, "python_motor", "python_kraken", "motors"),
 ]
 
 os.environ["TALOS_SOAK_SECONDS"] = "3"
@@ -199,10 +200,11 @@ class SoakSigtermCleanupTest(unittest.TestCase):
                 sub_file = work_path / "sub.toml"
                 sub_file.write_text("[subsystem]\nperiod_us = 5000\n")
                 fake_robot = {"command_timeout_us": 200000, "period_us": 20000}
-                fake_subs = {"swerve_module": sub_file, "motor": sub_file}
+                fake_subs = {"swerve_module": sub_file, "motor": sub_file, "python_motor": sub_file}
                 fake_layout = [
                     (1, "swerve_module", "drive", "motors"),
                     (2, "motor", "motor", "motors"),
+                    (3, "python_motor", "python_kraken", "motors"),
                 ]
                 captured_tmp = []
                 killpg_calls = []
