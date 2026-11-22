@@ -49,10 +49,12 @@
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/introspection/lock_file.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
 #include "talOS/memory/residency.h"
+#include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/protocol/types.h"
 #include "talOS/rtms/process_liveness.h"
 #include "talOS/rtms/rtms.h"
@@ -1042,8 +1044,15 @@ TEST(Supervision, AnEarlierRunsRowWithTheSamePidIsNotTheRunsCounts) {
   const auto manifest = ReadFile(options.output_dir + "/manifest.json");
   const auto alpha = ManifestRuns(manifest, "alpha");
   ASSERT_EQ(alpha.size(), 1u) << manifest;
-  EXPECT_EQ(alpha[0].find("\"wake_failures\": 3"), std::string::npos)
-      << "an earlier run's row counted as this run's: " << alpha[0];
+  const auto alpha_entry = ManifestEntry(manifest, "alpha");
+  for (const char* key :
+       {"\"wake_failures\"", "\"stalled_arms\"", "\"wake_fallbacks\"",
+        "\"requests_skipped\"", "\"requests_skipped_by_subsystem\""}) {
+    EXPECT_EQ(alpha_entry.find(key), std::string::npos)
+        << "unseen row must omit " << key << " on node: " << alpha_entry;
+    EXPECT_EQ(alpha[0].find(key), std::string::npos)
+        << "unseen row must omit " << key << " on run: " << alpha[0];
+  }
   std::filesystem::remove_all(options.output_dir);
 }
 
@@ -1904,6 +1913,7 @@ TEST(Supervision, MissingConfigFailsFastWithClearError) {
 // Registry rows held by live processes outside the session are never swept, so
 // a roster that cannot get a row per node is refused before anything starts
 // rather than run until its unregistered nodes are killed.
+// REQ-OPS-19
 TEST(Supervision, RosterThatDoesNotFitTheRegistryIsRefused) {
   auto options = BaseOptions("registry_full");
   const auto runs = TempPath("registry_full_runs");
@@ -1921,8 +1931,16 @@ TEST(Supervision, RosterThatDoesNotFitTheRegistryIsRefused) {
         introspect::NodeRegistration::Identity{.name = "held" +
                                                        std::to_string(i)}));
   }
-  EXPECT_EQ(RunSession(options), 1);
+  ::testing::internal::CaptureStderr();
+  const int refused_status = RunSession(options);
+  const std::string refused_stderr = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(refused_status, 1);
   EXPECT_TRUE(ReadLines(runs).empty());
+  EXPECT_NE(refused_stderr.find("held0"), std::string::npos) << refused_stderr;
+  EXPECT_NE(refused_stderr.find("held29"), std::string::npos) << refused_stderr;
+  EXPECT_NE(refused_stderr.find("pid " + std::to_string(::getpid())),
+            std::string::npos)
+      << refused_stderr;
   held.pop_back();
   // An unanswered Studio bridge is dropped before checking capacity, so 29
   // held rows + 3 active nodes still fit even with --start-studio-bridge.
@@ -1937,6 +1955,104 @@ TEST(Supervision, RosterThatDoesNotFitTheRegistryIsRefused) {
   EXPECT_GE(ReadLines(runs).size(), 2u);
   std::filesystem::remove_all(TempPath("registry_full"));
   ::remove(runs.c_str());
+}
+
+// REQ-OPS-19: The launcher prepares the registry before probing any node and
+// refuses a launch (exit 1, 0 probes) when the registry segment (0444) or its
+// lock file (0000) cannot be opened, naming the file, owner and mode on stderr.
+TEST(Supervision, UnopenableRegistryOrLockFileRefusesLaunchBeforeProbing) {
+  if (::geteuid() == 0) GTEST_SKIP() << "root can open 0444/0000 modes";
+  const std::string mapped = ShmObjectName(introspect::kRegistryPath);
+  const std::string lock_path = introspect::LockFilePath(mapped);
+  const std::string uid_owner = "owner uid " + std::to_string(::geteuid());
+
+  const auto cleanup_registry = [&] {
+    ::chmod(lock_path.c_str(), 0644);
+    ::unlink(lock_path.c_str());
+    introspect::RegistryMapping::unlink();
+  };
+  struct CleanupGuard {
+    std::function<void()> fn;
+    ~CleanupGuard() { fn(); }
+  } guard{cleanup_registry};
+
+  const auto make_probe_recorder = [&](std::string_view tag,
+                                       const std::string& record,
+                                       std::string_view node) {
+    const std::string path = TempPath(tag) + ".sh";
+    introspect::Description description;
+    description.name = std::string{node};
+    description.target = node == "hardware_node"
+                             ? "//talOS/bridge:hardware_node"
+                             : "//example/" + std::string{node} + ":node";
+    std::ostringstream out;
+    out << "#!/bin/sh\n"
+        << "printf '%s\\n' \"$*\" >> '" << record << "'\n"
+        << "for arg in \"$@\"; do\n"
+        << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+        << "    cat <<'TALOS_DESCRIBE'\n"
+        << introspect::DescribeToJson(description) << "TALOS_DESCRIBE\n"
+        << "    exit 0\n"
+        << "  fi\n"
+        << "done\n"
+        << "exit 0\n";
+    return testing::WriteWarmStub(path, out.str());
+  };
+
+  struct Case {
+    const char* name;
+    bool lock_case;
+  };
+  for (const Case c :
+       {Case{"segment_0444", false}, Case{"lock_file_0000", true}}) {
+    SCOPED_TRACE(c.name);
+    cleanup_registry();
+    const std::string probed = TempPath(std::string{"reg_perm_"} + c.name);
+    auto options = BaseOptions(std::string{"reg_perm_"} + c.name);
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        make_probe_recorder(std::string{"reg_perm_hw_"} + c.name, probed,
+                            "hardware_node");
+    options.binary_overrides["//example/alpha:node"] = make_probe_recorder(
+        std::string{"reg_perm_alpha_"} + c.name, probed, "alpha");
+    options.binary_overrides["//example/beta:node"] = make_probe_recorder(
+        std::string{"reg_perm_beta_"} + c.name, probed, "beta");
+    // Clear warm-up probe lines written by WriteWarmStub before launching.
+    ::remove(probed.c_str());
+
+    if (c.lock_case) {
+      const int fd = ::open(lock_path.c_str(),
+                            O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0000);
+      ASSERT_GE(fd, 0) << std::strerror(errno);
+      ASSERT_EQ(::fchmod(fd, 0000), 0);
+      ::close(fd);
+    } else {
+      const int fd =
+          ::shm_open(mapped.c_str(), O_CREAT | O_EXCL | O_RDWR, 0444);
+      ASSERT_GE(fd, 0) << std::strerror(errno);
+      ASSERT_EQ(::fchmod(fd, 0444), 0);
+      ::close(fd);
+    }
+
+    ::testing::internal::CaptureStderr();
+    const int status = RunSession(options);
+    const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+    cleanup_registry();
+
+    EXPECT_EQ(status, 1) << stderr_text;
+    EXPECT_TRUE(ReadLines(probed).empty())
+        << "probes ran despite unopenable registry:\n"
+        << ReadFile(probed);
+    EXPECT_NE(stderr_text.find(c.lock_case ? lock_path : mapped),
+              std::string::npos)
+        << stderr_text;
+    EXPECT_NE(stderr_text.find(uid_owner), std::string::npos) << stderr_text;
+    EXPECT_NE(stderr_text.find(c.lock_case ? "mode 0000" : "mode 0444"),
+              std::string::npos)
+        << stderr_text;
+
+    std::filesystem::remove_all(TempPath(std::string{"reg_perm_"} + c.name));
+    ::remove(probed.c_str());
+  }
 }
 
 TEST(Supervision, SessionsAreIsolatedAndCleanOnlyOwnedDirs) {
@@ -4188,7 +4304,82 @@ TEST(Supervision, FailingStudioBridgeRestartsBoundedTimesThenIsLeft) {
   EXPECT_EQ(EntryInteger(bridge, "retry_at_monotonic_ns"), 0) << bridge;
   EXPECT_NE(bridge.find("\"recorder_failed\": true"), std::string::npos)
       << bridge;
+  const std::string talos_log = ReadFile(options.output_dir + "/talos.log");
+  EXPECT_NE(talos_log.find("will not be restarted again"), std::string::npos)
+      << talos_log;
   EXPECT_EQ(ReadLines(runs).size(), 3u) << "a node was started again";
+  for (const char* name : {"hardware_node", "alpha", "beta"}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(EntryInteger(ManifestEntry(manifest, name), "restart_count"), 0);
+    EXPECT_EQ(ManifestRuns(manifest, name).size(), 1u) << manifest;
+  }
+  std::filesystem::remove_all(options.output_dir);
+  for (const auto* path : {&runs, &bridge_runs}) ::remove(path->c_str());
+}
+
+// REQ-OPS-30: `--max-restarts 0` disables Studio bridge restarts while peers
+// keep running: 1 run, 0 restarts, `recorder_failed: true`, give-up line in
+// talos.log, and session exit status 0.
+TEST(Supervision, StudioBridgeWithZeroMaxRestartsGivesUpWithoutRestarting) {
+  const auto runs = TempPath("bridge_zero_restarts_runs");
+  const auto bridge_runs = TempPath("bridge_zero_restarts_bridge_runs");
+  for (const auto* path : {&runs, &bridge_runs}) ::remove(path->c_str());
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  auto options = BridgeOptions("bridge_zero_restarts", runs, clock);
+  options.max_restarts = 0;
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("bridge_zero_restarts_bridge",
+                BridgeRun(bridge_runs, "exit 1\n"), "studio_bridge");
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  testing::SupervisionPasses passes;
+  bool left = false;
+  bool looked_later = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    left = WaitFor(stop, [&] {
+      if (ReadLines(runs).size() != 3) return false;
+      const std::string manifest = ReadFile(live);
+      const std::string entry = ManifestEntry(manifest, "studio_bridge");
+      const auto history = ManifestRuns(manifest, "studio_bridge");
+      return history.size() == 1 &&
+             history.back().find("\"reason\": \"running\"") ==
+                 std::string::npos &&
+             EntryInteger(entry, "retry_at_monotonic_ns") == 0 &&
+             entry.find("\"recorder_failed\": true") != std::string::npos;
+    });
+    if (left) {
+      clock.HoldAt(start +
+                   std::chrono::milliseconds{options.restart_window_ms} +
+                   kRestartMaxBackoff);
+      const uint64_t later = passes.Started() + 2;
+      looked_later = WaitFor(stop, [&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= later;
+      });
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  const int status = RunSession(options);
+  driver.join();
+
+  ASSERT_TRUE(left) << "bridge with max_restarts=0 was not left";
+  EXPECT_TRUE(looked_later);
+  EXPECT_EQ(status, 0);
+  EXPECT_EQ(ReadLines(bridge_runs).size(), 1u);
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const std::string bridge = ManifestEntry(manifest, "studio_bridge");
+  EXPECT_EQ(EntryInteger(bridge, "restart_count"), 0) << bridge;
+  EXPECT_EQ(EntryInteger(bridge, "retry_at_monotonic_ns"), 0) << bridge;
+  EXPECT_EQ(ManifestRuns(manifest, "studio_bridge").size(), 1u) << manifest;
+  EXPECT_NE(bridge.find("\"recorder_failed\": true"), std::string::npos)
+      << bridge;
+  const std::string talos_log = ReadFile(options.output_dir + "/talos.log");
+  EXPECT_NE(talos_log.find("will not be restarted again"), std::string::npos)
+      << talos_log;
+  EXPECT_EQ(ReadLines(runs).size(), 3u) << "a peer node was disturbed";
   for (const char* name : {"hardware_node", "alpha", "beta"}) {
     SCOPED_TRACE(name);
     EXPECT_EQ(EntryInteger(ManifestEntry(manifest, name), "restart_count"), 0);
@@ -5649,7 +5840,7 @@ TEST(Supervision, ShutdownStopsHardwareNodeBeforeActuatorOwners) {
 // NodeRegistration::note_realtime_refused, and warned/merged by
 // Launcher::NoteRealtime (both after initial full and partial grants, and at
 // reap time via FinalDeliveryCounts) and NodeProcessInfo::RecordRealtime.
-// REQ-RT-01, REQ-OPS-18
+// REQ-RT-09, REQ-OPS-18
 TEST(Supervision, LateRingLockRefusalWarnsAndMergesIntoManifest) {
   // Part 1: residency seam + NodeRegistration::note_realtime_refused guards.
   {

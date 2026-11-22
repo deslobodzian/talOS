@@ -281,5 +281,85 @@ TEST(LauncherRetention, RacingEnoentInRemoveAllIsTreatedCleanlyAsRemoved) {
   }
 }
 
+// REQ-OPS-11: Retention never removes or follows symlinks — neither a symlink
+// in the log root pointing to an external session directory nor symlinks inside
+// a kept session pointing to external files or directories — while still
+// pruning real expired sessions under log_keep_sessions = 1.
+TEST(LauncherRetention, SymlinksInLogRootAndKeptSessionSurviveUntouched) {
+  auto options = RetentionFixture("symlinks");
+  const std::string root = options.output_dir;
+  const std::string external_session = TempPath("symlinks_external_session");
+  const std::string external_file = TempPath("symlinks_external_file.txt");
+  const std::string external_dir = TempPath("symlinks_external_dir");
+  std::filesystem::remove_all(root);
+  std::filesystem::remove_all(external_session);
+  std::filesystem::remove_all(external_dir);
+  std::filesystem::remove(external_file);
+
+  // External session directory linked into the log root as an expired session
+  // id ("1"): retention must ignore the symlink and leave its target intact.
+  WriteSessionManifest(external_session, 1, 1001, 1101);
+  std::ofstream{external_session + "/sentinel.txt"} << "external_session_data";
+  std::filesystem::create_directories(root);
+  std::filesystem::create_directory_symlink(external_session, root + "/1");
+
+  // Ordinary expired session ("2"): proves retention actively pruned under
+  // log_keep_sessions = 1.
+  WriteSessionManifest(root + "/2", 2, 1002, 1102);
+
+  // Kept session ("3", protected match) containing symlinks to an external
+  // file and an external directory: TreeBytes walks it without following or
+  // touching either symlink or its target.
+  std::filesystem::create_directories(root + "/3");
+  std::ofstream{root + "/3/manifest.json"} << "{\n"
+                                           << "  \"session_id\": 3,\n"
+                                           << "  \"simulation\": false,\n"
+                                           << "  \"start_wall_ns\": 1003,\n"
+                                           << "  \"end_wall_ns\": 1103,\n"
+                                           << "  \"nodes\": []\n"
+                                           << "}\n";
+  std::ofstream{root + "/3/" + std::string{kSessionClassFile}} << "match 0\n";
+  std::ofstream{external_file} << "external_file_data";
+  std::filesystem::create_directories(external_dir);
+  std::ofstream{external_dir + "/nested.txt"} << "external_dir_data";
+  std::filesystem::create_symlink(external_file, root + "/3/file_link");
+  std::filesystem::create_directory_symlink(external_dir, root + "/3/dir_link");
+
+  const int result = Launcher{options}.Run();
+  EXPECT_EQ(result, 0);
+
+  // Real expired session 2 was pruned and recorded.
+  EXPECT_FALSE(std::filesystem::exists(root + "/2"));
+  EXPECT_TRUE(std::filesystem::exists(root + "/10/manifest.json"));
+  const std::string retention =
+      ReadFile(root + "/10/" + std::string{kRetentionRecordFile});
+  EXPECT_NE(retention.find(root + "/2"), std::string::npos) << retention;
+  EXPECT_EQ(retention.find(root + "/1"), std::string::npos) << retention;
+  EXPECT_EQ(retention.find(root + "/3"), std::string::npos) << retention;
+
+  // Root-level symlink and its external session target survived untouched.
+  EXPECT_TRUE(std::filesystem::is_symlink(root + "/1"));
+  EXPECT_EQ(std::filesystem::read_symlink(root + "/1"), external_session);
+  EXPECT_TRUE(std::filesystem::exists(external_session + "/manifest.json"));
+  EXPECT_EQ(ReadFile(external_session + "/sentinel.txt"),
+            "external_session_data");
+
+  // Kept session, its symlinks, and their external targets survived untouched.
+  EXPECT_TRUE(std::filesystem::exists(root + "/3/manifest.json"));
+  EXPECT_TRUE(std::filesystem::is_symlink(root + "/3/file_link"));
+  EXPECT_EQ(std::filesystem::read_symlink(root + "/3/file_link"),
+            external_file);
+  EXPECT_EQ(ReadFile(external_file), "external_file_data");
+  EXPECT_TRUE(std::filesystem::is_symlink(root + "/3/dir_link"));
+  EXPECT_EQ(std::filesystem::read_symlink(root + "/3/dir_link"), external_dir);
+  EXPECT_EQ(ReadFile(external_dir + "/nested.txt"), "external_dir_data");
+
+  std::filesystem::remove_all(root);
+  std::filesystem::remove_all(external_session);
+  std::filesystem::remove_all(external_dir);
+  std::filesystem::remove(external_file);
+  std::filesystem::remove(options.config_path);
+}
+
 }  // namespace
 }  // namespace talos::launcher

@@ -116,6 +116,23 @@ TEST(DescribeGraphUnitTest, NonCriticalActuatorOwnersProduceGraphError) {
     EXPECT_NE(findings[0].message.find("critical=false"), std::string::npos)
         << findings[0].message;
 
+    // Even when the actuator owner did not answer --describe (answered =
+    // false), critical = false is still a graph ERROR.
+    std::vector<NodeDescription> unanswered;
+    unanswered.reserve(non_critical_specs.size());
+    for (const auto& spec : non_critical_specs) {
+      unanswered.push_back(NodeDescription{
+          .roster_name = spec.name, .target = spec.target, .answered = false});
+    }
+    const auto unanswered_findings =
+        LintCriticalNodes(non_critical_specs, unanswered);
+    ASSERT_EQ(unanswered_findings.size(), 1u);
+    EXPECT_EQ(unanswered_findings[0].severity, naming::Severity::ERROR);
+    EXPECT_EQ(unanswered_findings[0].subject, "alpha");
+    EXPECT_NE(unanswered_findings[0].message.find("critical=false"),
+              std::string::npos)
+        << unanswered_findings[0].message;
+
     // Default (critical = true) actuator owner -> no error.
     const auto critical_specs =
         DiscoverNodes(config::ParseRobotConfigString(base + c.device_toml),
