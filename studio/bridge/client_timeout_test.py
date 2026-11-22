@@ -18,13 +18,15 @@ from bridge_client import TEXT, bound_port, fast_slots, receive, stop, upgrade
 # Control frames (RFC 6455 section 5.5).
 PING, PONG = 0x89, 0x8A
 
-# The idle timeout this test runs the bridge with, the smallest uWebSockets
-# takes (main.cc kIdleTimeoutS derives the production 16 s). Its margin is
-# 4 s: the bridge pings a client that has sent nothing for 8 - 4 s and
-# closes it if nothing arrives in the next 4. uSockets checks timeouts every
-# 4 s and rounds each phase up to whole checks, so a client that stops
-# answering is closed at most 4 + 4 = 8 s after the last data it sent.
-IDLE_TIMEOUT_S = 8
+# The production idle timeout, which this test runs the bridge with (main.cc
+# kIdleTimeoutS, REQ-OPS-46's 16 s). Its margin is 8 s: the bridge pings a
+# client that has sent nothing for 16 - 8 s and closes it if nothing arrives
+# in the next 8. uSockets checks timeouts every 4 s and rounds each phase up
+# to whole checks, so a client that stops answering is closed 12 to 16 s
+# after the last data it sent. A bridge whose default were smaller closes
+# sooner than EARLIEST_CLOSE_S (12 s less 1 s of slack).
+IDLE_TIMEOUT_S = 16
+EARLIEST_CLOSE_S = 11
 # The bridge's 4 s timeout check is a loop timer, and this test sees the
 # close when its own wait returns: both may run late on a busy host.
 LATE_S = 0.5
@@ -94,9 +96,9 @@ class Healthy(threading.Thread):
             return self.error is None and any(map(predicate, self.counts))
 
 
-def connect(port):
+def connect(port, path="/telemetry"):
     sock = socket.create_connection(("127.0.0.1", port), timeout=HANG_S)
-    return sock, upgrade(sock)
+    return sock, upgrade(sock, path)
 
 
 def closed_by_peer(socks, deadline):
@@ -123,26 +125,35 @@ def closed_by_peer(socks, deadline):
 
 
 class ClientTimeout(unittest.TestCase):
-    # REQ-OPS-23, REQ-OPS-46
+    # REQ-OPS-23, REQ-OPS-36, REQ-OPS-46
     def test_dead_client_slot_is_reclaimed_and_a_quiet_client_stays(self):
-        """Clients that stop answering lose their slots; one answering pings keeps its own.
+        """Clients that stop answering lose their slots; ones answering pings keep theirs.
 
         A Driver Station laptop that drops off the network leaves sockets
         that never read or answer again. With the four slots full, a fifth
         connection is refused until the bridge closes the dead ones, which
-        it must do within the idle timeout, and a client that only receives
-        and answers pings must outlive it.
+        it must do within the default 16 s idle timeout (and not sooner), and
+        a client that only receives and answers pings must outlive it. The
+        same holds for /drive clients, which take no telemetry slot.
         """
         workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
         binaries = workspace / "studio/bridge"
         processes, sockets = [], []
-        healthy = None
-        with tempfile.TemporaryDirectory() as webroot:
+        healthy = drive = None
+        with tempfile.TemporaryDirectory() as webroot, \
+                tempfile.TemporaryDirectory() as configs:
+            Path(configs, "robot.toml").write_text(
+                "[robot]\nperiod_us = 5000\n\n[studio]\ndashboard = \"dashboard.toml\"\n\n"
+                "[subsystems.alpha]\nnode = \"//test:alpha\"\ncritical = false\n")
+            Path(configs, "dashboard.toml").write_text(
+                "[dashboard]\ntitle = \"Pit\"\ndrive_clients = 2\n\n"
+                "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+                "channel = \"drive/velocity\"\n")
             try:
                 # No publisher: the graph alone keeps the healthy client fed.
                 bridge = subprocess.Popen(
                     [str(binaries / "studio_bridge"), f"/test/telemetry/i{os.getpid()}",
-                     "0", webroot, "--idle-timeout-s", str(IDLE_TIMEOUT_S)],
+                     "0", webroot, "--config", str(Path(configs, "robot.toml"))],
                     stdout=subprocess.PIPE, text=True)
                 processes.append(bridge)
                 port = bound_port(bridge)
@@ -152,12 +163,19 @@ class ClientTimeout(unittest.TestCase):
                 self.assertIn(b"101 ", headers)
                 healthy = Healthy(sock)
                 healthy.start()
-                # Three clients that send the upgrade and nothing more, and
-                # never read: the bridge's sends land in their receive buffers.
+                # A /drive client that answers pings, outside the four slots.
+                sock, headers = connect(port, "/drive")
+                sockets.append(sock)
+                self.assertIn(b"101 ", headers)
+                drive = Healthy(sock)
+                drive.start()
+                # Three telemetry clients and one /drive client that send the
+                # upgrade and nothing more, and never read: the bridge's sends
+                # land in their receive buffers.
                 dead = []
-                for _ in range(3):
+                for path in ("/telemetry",) * 3 + ("/drive",):
                     last_data = time.monotonic()
-                    sock, headers = connect(port)
+                    sock, headers = connect(port, path)
                     sockets.append(sock)
                     dead.append(sock)
                     self.assertIn(b"101 ", headers)
@@ -172,6 +190,9 @@ class ClientTimeout(unittest.TestCase):
                                  f"{len(dead) - len(closed)} dead clients still open "
                                  f"{time.monotonic() - last_data:.2f} s after their last "
                                  f"data; bound {IDLE_TIMEOUT_S} s idle timeout + {LATE_S} s late")
+                self.assertGreaterEqual(
+                    min(closed.values()) - last_data, EARLIEST_CLOSE_S,
+                    "a dead client closed before the 16 s default idle timeout")
                 print(f"dead clients closed {max(closed.values()) - last_data:.2f} s after "
                       f"their last data", flush=True)
                 sock, headers = connect(port)
@@ -184,6 +205,8 @@ class ClientTimeout(unittest.TestCase):
                     lambda count: count[0] > opened + IDLE_TIMEOUT_S + LATE_S),
                     f"healthy client closed: {healthy.error}")
                 self.assertGreaterEqual(healthy.pings, 1, "the bridge never pinged")
+                self.assertIsNone(drive.error, f"/drive client closed: {drive.error}")
+                self.assertGreaterEqual(drive.pings, 1, "the bridge never pinged /drive")
             finally:
                 # Shut down, join, then close: a shutdown wakes the healthy
                 # thread's recv at once, but on macOS closing the descriptor
@@ -194,8 +217,9 @@ class ClientTimeout(unittest.TestCase):
                         sock.shutdown(socket.SHUT_RDWR)
                     except OSError:
                         pass
-                if healthy:
-                    healthy.join(HANG_S)
+                for reader in (healthy, drive):
+                    if reader:
+                        reader.join(HANG_S)
                 for sock in sockets:
                     sock.close()
                 stop(processes)
