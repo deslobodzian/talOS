@@ -519,5 +519,104 @@ TEST(RuntimeUdpTest, BlockingReceiveRetriesOnEintr) {
   EXPECT_GE(g_eintr_state.signal_count, 2);
 }
 
+// REQ-OPS-27: a connected RuntimeUdpPeer accepts frames only from the peer
+// address/port it connected to; datagrams from a third, unconnected socket are
+// dropped by the kernel (TryReceive reports kWouldBlock) while frames from its
+// connected peer arrive intact.
+TEST(RuntimeUdpTest, ConnectedPeerDropsFramesFromUnconnectedSender) {
+  const int authorized = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(authorized, 0);
+  struct ScopedFd {
+    int fd;
+    ~ScopedFd() {
+      if (fd >= 0) ::close(fd);
+    }
+  } close_authorized{authorized};
+
+  sockaddr_in auth_addr{};
+  auth_addr.sin_family = AF_INET;
+  auth_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  auth_addr.sin_port = 0;
+  ASSERT_EQ(::bind(authorized, reinterpret_cast<const sockaddr*>(&auth_addr),
+                   sizeof(auth_addr)),
+            0);
+  socklen_t auth_len = sizeof(auth_addr);
+  ASSERT_EQ(::getsockname(authorized, reinterpret_cast<sockaddr*>(&auth_addr),
+                          &auth_len),
+            0);
+  const uint16_t auth_port = ntohs(auth_addr.sin_port);
+  ASSERT_NE(auth_port, 0);
+
+  RuntimeUdpPeer receiver;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", auth_port),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int rogue = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(rogue, 0);
+  ScopedFd close_rogue{rogue};
+  sockaddr_in rogue_addr{};
+  rogue_addr.sin_family = AF_INET;
+  rogue_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  rogue_addr.sin_port = 0;
+  ASSERT_EQ(::bind(rogue, reinterpret_cast<const sockaddr*>(&rogue_addr),
+                   sizeof(rogue_addr)),
+            0);
+  socklen_t rogue_len = sizeof(rogue_addr);
+  ASSERT_EQ(::getsockname(rogue, reinterpret_cast<sockaddr*>(&rogue_addr),
+                          &rogue_len),
+            0);
+  ASSERT_NE(ntohs(rogue_addr.sin_port), auth_port);
+
+  sockaddr_in rx_addr{};
+  rx_addr.sin_family = AF_INET;
+  rx_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  rx_addr.sin_port = htons(rx_port);
+
+  const std::array<uint8_t, 4> rogue_payload = {0xDE, 0xAD, 0xBE, 0xEF};
+  const auto send_rogue = [&](uint64_t seq, uint64_t time_us) {
+    std::array<uint8_t, kFrameHeaderSize + rogue_payload.size()> wire{};
+    const std::size_t n = EncodeFrame(
+        FrameType::kHardwareCommand, kFlagNone, seq, time_us,
+        rogue_payload.data(), rogue_payload.size(), wire.data(), wire.size());
+    ASSERT_EQ(n, wire.size());
+    ASSERT_EQ(
+        ::sendto(rogue, wire.data(), n, 0,
+                 reinterpret_cast<const sockaddr*>(&rx_addr), sizeof(rx_addr)),
+        static_cast<ssize_t>(n));
+  };
+  send_rogue(1, 111);
+
+  DecodedFrame received;
+  EXPECT_EQ(receiver.TryReceive(&received), UdpStatus::kWouldBlock);
+  EXPECT_EQ(receiver.stats().received_frames, 0u);
+
+  // Send another rogue frame immediately followed by one from the connected
+  // peer: only the connected peer's frame is delivered.
+  send_rogue(2, 222);
+
+  const std::array<uint8_t, 4> peer_payload = {1, 2, 3, 4};
+  std::array<uint8_t, kFrameHeaderSize + peer_payload.size()> wire{};
+  const std::size_t wire_size = EncodeFrame(
+      FrameType::kHardwareCommand, kFlagNone, 7, 333, peer_payload.data(),
+      peer_payload.size(), wire.data(), wire.size());
+  ASSERT_EQ(wire_size, wire.size());
+  ASSERT_EQ(
+      ::sendto(authorized, wire.data(), wire_size, 0,
+               reinterpret_cast<const sockaddr*>(&rx_addr), sizeof(rx_addr)),
+      static_cast<ssize_t>(wire_size));
+
+  ASSERT_EQ(testing::ReceiveFrame(receiver, &received), UdpStatus::kOk);
+  EXPECT_EQ(received.header.sequence, 7u);
+  EXPECT_EQ(received.header.monotonic_time_us, 333u);
+  ASSERT_EQ(received.payload_size, peer_payload.size());
+  EXPECT_EQ(
+      std::memcmp(received.payload, peer_payload.data(), peer_payload.size()),
+      0);
+  EXPECT_EQ(receiver.TryReceive(&received), UdpStatus::kWouldBlock);
+  EXPECT_EQ(receiver.stats().received_frames, 1u);
+}
+
 }  // namespace
 }  // namespace talos::protocol

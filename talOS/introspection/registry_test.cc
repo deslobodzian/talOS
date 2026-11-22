@@ -596,7 +596,15 @@ TEST_F(Registry, ADeadClaimantsRowIsFreedByTheNextClaim) {
       << "its process is gone, though its heartbeat is fresh";
 
   std::vector<std::unique_ptr<NodeRegistration>> registrations;
-  for (std::size_t i = 0; i < kMaxNodes; ++i) {
+  registrations.push_back(std::make_unique<NodeRegistration>(
+      NodeRegistration::Identity{.name = "node0"}, path_));
+  {
+    const auto after_first = reader->nodes();
+    ASSERT_EQ(after_first.size(), 1u);
+    EXPECT_EQ(after_first.front().name, "node0");
+    EXPECT_TRUE(after_first.front().alive);
+  }
+  for (std::size_t i = 1; i < kMaxNodes; ++i) {
     registrations.push_back(std::make_unique<NodeRegistration>(
         NodeRegistration::Identity{.name = "node" + std::to_string(i)}, path_));
   }
@@ -900,6 +908,7 @@ TEST_F(Registry, LoopStoresItsProgressWhileTheReporterIsBlocked) {
 // session_report, which read only the row: the tier, that it asked, and which
 // step the OS refused, beside the event log flags. A row whose node has not
 // asked yet reads as unreported, never as a full grant.
+// REQ-RT-09
 TEST_F(Registry, ARefusedRealtimeGrantIsVisibleInTheRow) {
   NodeRegistration registration{{.name = "lift", .flags = kFlagSimulation},
                                 path_};

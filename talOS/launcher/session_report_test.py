@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import zlib
 
 from python.runfiles import runfiles
 from talOS.launcher import session_report
@@ -102,6 +103,115 @@ class SessionReportTest(unittest.TestCase):
         self.assertEqual(len(named), 1, result.stderr)
         self.assertRegex(named[0], r"protocol \d+ ")
         self.assertIsNone(report["never_enabled"])
+
+    # REQ-OPS-51: when the bridge's /hw/status protocol_version_id and
+    # manifest.json's hardware_protocol_version disagree, session_report prints
+    # one warning naming both versions and reads the session under the bridge's
+    # version.
+    def test_bridge_and_manifest_protocol_disagreement_warns_and_uses_bridges_version(self):
+        # Verified reflection.Schema .bfbs for:
+        #   namespace bridge; struct BridgeStatus { protocol_version_id:uint16; }
+        bfbs = bytes([
+            0x1c, 0x00, 0x00, 0x00, 0x42, 0x46, 0x42, 0x53, 0x14, 0x00, 0x1c, 0x00,
+            0x04, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x10, 0x00, 0x00, 0x00, 0x14, 0x00,
+            0x00, 0x00, 0x18, 0x00, 0x14, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00,
+            0x28, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x30, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            0x94, 0xff, 0xff, 0xff, 0x3c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x1c, 0x00, 0x08, 0x00, 0x0c, 0x00,
+            0x07, 0x00, 0x10, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00,
+            0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x28, 0x00, 0x00, 0x00,
+            0x1c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x04, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x2f, 0x2f, 0x73, 0x2e,
+            0x66, 0x62, 0x73, 0x00, 0x01, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00,
+            0x13, 0x00, 0x00, 0x00, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65, 0x2e, 0x42,
+            0x72, 0x69, 0x64, 0x67, 0x65, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x00,
+            0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00,
+            0x28, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00,
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00,
+            0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x02, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x70, 0x72, 0x6f, 0x74,
+            0x6f, 0x63, 0x6f, 0x6c, 0x5f, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
+            0x5f, 0x69, 0x64, 0x00,
+        ])
+
+        def write_bridge_status_log(path, session_id, version):
+            schema_name = b"bridge.BridgeStatus"
+            schema_block = schema_name + bfbs
+            manifest_entry = struct.pack(
+                "<HHIIIqq64sQII",
+                1, 4, 2, 2, 0, 0, 0, b"/hw/status", 1, len(schema_name), len(bfbs))
+            header_crc = zlib.crc32(manifest_entry + schema_block) & 0xFFFFFFFF
+            file_header = struct.pack(
+                "<8sIIQqqII64sQ",
+                b"TALOSLOG", 8, 120, session_id, 1_000_000_000, 0,
+                1, header_crc, b"hardware_node", len(schema_block))
+            payload = struct.pack("<H", version)
+            stored = payload.rstrip(b"\x00")
+            rec_zero = struct.pack(
+                "<IHHQqqqQIIII",
+                0x54524543, 4, 1, 1, 1_000_000_000, 1_000_000_000,
+                1_000_000_000, 1, 0, len(payload), 0, len(stored))
+            rec_crc = zlib.crc32(stored, zlib.crc32(rec_zero)) & 0xFFFFFFFF
+            rec_header = struct.pack(
+                "<IHHQqqqQIIII",
+                0x54524543, 4, 1, 1, 1_000_000_000, 1_000_000_000,
+                1_000_000_000, 1, 0, len(payload), rec_crc, len(stored))
+            with open(path, "wb") as f:
+                f.write(file_header + manifest_entry + schema_block + rec_header + stored)
+
+        files = runfiles.Create()
+        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
+        binary = files.Rlocation("_main/talOS/launcher/session_report")
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([fixture, directory], check=True)
+            manifest_path = os.path.join(directory, "manifest.json")
+            manifest = json.loads(open(manifest_path).read())
+            build_version = manifest["hardware_protocol_version"]
+            other_version = build_version - 1
+            bridge_log = os.path.join(directory, "hardware_node.tlog")
+
+            # Bridge matches build, manifest names another: warns once naming
+            # both and decodes hardware packets under the bridge's version.
+            manifest["hardware_protocol_version"] = other_version
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f)
+            write_bridge_status_log(bridge_log, manifest["session_id"], build_version)
+            result = subprocess.run([binary, "--json", directory],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = (
+                f"session_report: warning: the session's bridge recorded hardware protocol "
+                f"{build_version} (/hw/status protocol_version_id), its launcher "
+                f"{other_version} (manifest.json hardware_protocol_version): read under the bridge's"
+            )
+            self.assertEqual(result.stderr.splitlines().count(expected), 1, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertIsNone(report["hardware_not_decoded"])
+            self.assertEqual(report["state_enabled"]["count"], 5)
+
+            # Bridge names another version, manifest matches build: warns once
+            # naming both and refuses hardware packets under the bridge's version.
+            manifest["hardware_protocol_version"] = build_version
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f)
+            write_bridge_status_log(bridge_log, manifest["session_id"], other_version)
+            result = subprocess.run([binary, "--json", "--strict", directory],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            expected = (
+                f"session_report: warning: the session's bridge recorded hardware protocol "
+                f"{other_version} (/hw/status protocol_version_id), its launcher "
+                f"{build_version} (manifest.json hardware_protocol_version): read under the bridge's"
+            )
+            self.assertEqual(result.stderr.splitlines().count(expected), 1, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertIsNotNone(report["hardware_not_decoded"])
+            verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+            self.assertEqual(verdicts["enabled state median"], "NOT MEASURED")
 
     # REQ-OPS-16: the default session with its enabled States at
     # 5 to 135 ms lost in a log gap. The 0 -> 140 ms interval across the hole
@@ -487,6 +597,33 @@ class SessionReportTest(unittest.TestCase):
         row = session_report.analyze({"nodes": []}, records)["driver_station_to_command_ms"]
         self.assertEqual((row["count"], row["median_ms"], row["max_ms"]), (2, 6.25, 11.25))
 
+    # REQ-OPS-16, REQ-RT-25: a Driver Station to command sample whose span meets
+    # a log gap in the bridge's log or in the selecting/requesting node's log is
+    # excluded (NOT MEASURED) and counted in intervals_across_gaps, while a gap
+    # in an unrelated node's log leaves the sample measured.
+    def test_driver_station_to_command_excludes_samples_across_gaps(self):
+        def gap(process, first, last):
+            return self.chain_record(process, "GAP", "?", last + 1, gap={
+                "start_ms": first, "end_ms": last + 1, "first_lost_ms": first,
+                "last_lost_ms": last, "records": 1, "cause": "pool_full",
+                "closed_at_flush": False})
+        # Packet at 0 ms, selecting tick at 6 ms (lane published at 4 ms, in
+        # packet 0's window [0, 5)), a fresh enabled packet at 5 ms (so
+        # enabled_at(6.3) stays known after a bridge gap at 2 ms), and the
+        # merged command at 6.3 ms.
+        base = [self.ds_packet(0, True), self.ds_packet(5, True),
+                *self.selecting_tick(6, 4, 2, 5000), self.merged_command(6.3, 5000)]
+        for label, process in (("bridge", "hardware_node"), ("node", "lift")):
+            with self.subTest(label):
+                report = session_report.analyze({"nodes": []}, base + [gap(process, 2, 2)])
+                self.assertIsNone(report["driver_station_to_command_ms"])
+                self.assertEqual(report["intervals_across_gaps"]["driver_station_to_command"], 1)
+                self.assertIn("Driver station to command: 1 samples across a log gap not measured.",
+                              session_report.markdown(report).splitlines())
+        unrelated = session_report.analyze({"nodes": []}, base + [gap("camera", 2, 2)])
+        self.assertEqual(unrelated["driver_station_to_command_ms"]["count"], 1)
+        self.assertEqual(unrelated["intervals_across_gaps"]["driver_station_to_command"], 0)
+
     # REQ-RT-25: bridge request to command is split as the bridge decides
     # its send: by the State it holds (GatewayReady: configured, enabled, no
     # hardware fault), held over the whole sample. Ready, it sends a changed
@@ -762,6 +899,8 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual(len(session_report.strict_failures(
                 session_report.analyze(manifest, session))), failures, manifest)
 
+    # REQ-RT-09: session_report --strict rejects a bridge or control loop that
+    # ran without its full realtime grant.
     def test_strict_rejects_an_actuation_loop_without_its_realtime_grant(self):
         # The registry row's outcome, as the launcher records it.
         def node(name, tier, grant, refused=""):

@@ -578,6 +578,65 @@ TEST_F(ReplayInputsTest, ASessionRecordedWithoutSimReplaysWithoutIt) {
   std::filesystem::remove_all(root);
 }
 
+// REQ-OPS-14: a session launched with --sim replays with --sim even when the
+// replay invocation omits --sim (options.simulation = false). Under --sim, the
+// devices layer commissions the config in memory, which changes config_id:
+// replayed without --sim, the motor node would reject every State and read
+// disconnected.
+TEST_F(ReplayInputsTest, ASessionRecordedWithSimReplaysWithIt) {
+  const std::string root = TempPath("sim_hardware");
+  const std::string dir = root + "/1";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(dir);
+  {
+    config::RobotConfig config = config::ParseRobotConfig(config_);
+    config.hardware.commissioned = true;
+    const event::MonotonicTime origin =
+        event::MonotonicTime::from_nanos(2'038'406'047'920);
+    event::SimulationEnvironment environment;
+    GatewayLoop loop{
+        environment,
+        event::log::LogWriter{dir + "/hardware_node.tlog", "hardware_node",
+                              event::log::LogWriterOptions{}, 1},
+        GatewayLoop::Options{.start = origin}};
+    RealGateway gateway{loop, config};
+    loop.run_until(origin + std::chrono::milliseconds{400});
+    loop.finish();
+  }
+  const std::string recording = root + "/replay_motor.tlog";
+  ASSERT_EQ(RunNode(Runfile("TALOS_MOTOR_NODE"),
+                    {"--replay-inputs", dir, "--session-id", "1", "--log",
+                     recording, "--config", config_, "--sim"}),
+            0);
+  std::filesystem::rename(recording, dir + "/replay_motor.tlog");
+  std::ofstream{dir + "/manifest.json"}
+      << "{\n  \"session_id\": 1,\n  \"simulation\": true\n}\n";
+  const auto recorded =
+      SendsByDeadline(dir + "/replay_motor.tlog", "/replay_motor/state");
+  ASSERT_FALSE(recorded.empty());
+  const auto last = As<MotorReading>(recorded.rbegin()->second);
+  ASSERT_TRUE(last.connected());
+  ASSERT_GE(last.sample_time_ns(), 0);
+
+  const std::string out = TempPath("sim_motor_out");
+  std::filesystem::remove_all(out);
+  LauncherOptions options = Options();
+  options.simulation = false;
+  options.config_path = config_;
+  options.output_dir = out;
+  options.replay_inputs = dir;
+  options.only = "replay_motor";
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+
+  const auto replayed =
+      SendsByDeadline(out + "/1/replay_motor.tlog", "/replay_motor/state");
+  EXPECT_EQ(replayed.size(), recorded.size());
+  EXPECT_EQ(replayed, recorded);
+
+  std::filesystem::remove_all(out);
+  std::filesystem::remove_all(root);
+}
+
 // REQ-OPS-14: a node fed /hw/state from the bridge's log is never fed across
 // a gap in it. The session is a real one's shape (as above), its bridge log
 // holding States, then a closed GAP record where its writer's pool filled
@@ -659,11 +718,17 @@ TEST_F(ReplayInputsTest, AReplayFedFromTheBridgesLogStopsAtItsGap) {
   std::filesystem::remove_all(root);
 }
 
+// REQ-OPS-14: a schema mismatch fails before running and names both types.
 TEST_F(ReplayInputsTest, AReaderOfAnotherSchemaIsRefused) {
   Record();
   const std::string out = TempPath("impostor");
   std::filesystem::remove_all(out);
-  EXPECT_NE(Replay("replay_impostor", out), 0);
+  ::testing::internal::CaptureStderr();
+  const int status = Replay("replay_impostor", out);
+  const std::string err = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(status, 0) << err;
+  EXPECT_NE(err.find("replay_inputs_test.Reading"), std::string::npos) << err;
+  EXPECT_NE(err.find("replay_inputs_test.Impostor"), std::string::npos) << err;
 
   std::filesystem::remove_all(out);
 }
@@ -776,6 +841,62 @@ TEST_F(ReplayInputsTest, ASessionOfAnotherHardwareProtocolIsRefused) {
       << two_refusal;
   std::filesystem::remove_all(out);
   std::filesystem::remove_all(TempPath("other_protocol"));
+}
+
+// REQ-OPS-51: when the bridge's /hw/status protocol_version_id and
+// manifest.json's hardware_protocol_version disagree, --replay-inputs prints
+// one warning naming both versions and reads the session under the bridge's
+// version.
+TEST_F(ReplayInputsTest,
+       BridgeAndManifestProtocolDisagreementWarnsAndUsesBridgesVersion) {
+  Record();
+  const std::uint16_t kBuild = protocol::kProtocolVersion;
+  const std::uint16_t kOther = static_cast<std::uint16_t>(kBuild - 1);
+  const std::string session = CopyOfSession("protocol_disagree");
+  {
+    const event::MonotonicTime origin =
+        event::log::LogReader{session + "/replay_source.tlog"}.start_time();
+    event::SimulationEnvironment environment;
+    GatewayLoop loop{
+        environment,
+        event::log::LogWriter{session + "/hardware_node.tlog", "hardware_node",
+                              event::log::LogWriterOptions{}, 1},
+        GatewayLoop::Options{.start = origin}};
+    RealGateway gateway{loop, config::ParseRobotConfig(config_), kBuild};
+    loop.run_until(origin + std::chrono::milliseconds{20});
+    loop.finish();
+  }
+  std::ofstream{session + "/manifest.json"}
+      << "{\n  \"session_id\": 1,\n  \"simulation\": true,\n  "
+         "\"hardware_protocol_version\": "
+      << kOther << ",\n  \"nodes\": []\n}\n";
+
+  const std::string out = TempPath("protocol_disagree_out");
+  std::filesystem::remove_all(out);
+  ::testing::internal::CaptureStderr();
+  const int rc = Replay("replay_consumer", out, session);
+  const std::string err = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(rc, 0) << err;
+  EXPECT_TRUE(std::filesystem::exists(out + "/1/replay_consumer.tlog"));
+
+  std::vector<std::string> warnings;
+  std::istringstream lines{err};
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("the session's bridge recorded hardware protocol ") !=
+        std::string::npos) {
+      warnings.push_back(line);
+    }
+  }
+  ASSERT_EQ(warnings.size(), 1u) << err;
+  EXPECT_NE(warnings.front().find(std::to_string(kBuild)), std::string::npos)
+      << warnings.front();
+  EXPECT_NE(warnings.front().find(std::to_string(kOther)), std::string::npos)
+      << warnings.front();
+  EXPECT_NE(warnings.front().find("read under the bridge's"), std::string::npos)
+      << warnings.front();
+
+  std::filesystem::remove_all(out);
+  std::filesystem::remove_all(TempPath("protocol_disagree"));
 }
 
 TEST_F(ReplayInputsTest, RefusesToWriteIntoTheSessionItReads) {
