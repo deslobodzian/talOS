@@ -389,6 +389,12 @@ NEVER_EXEMPT_INCLUDES = frozenset({
     "talOS/node/internal.h",
     "talOS/devices/access.h",
 })
+FORBIDDEN_INCLUDE_EXACT_LOWER = frozenset(
+    h.lower() for h in FORBIDDEN_INCLUDE_EXACT)
+FORBIDDEN_INCLUDE_PREFIXES_LOWER = tuple(
+    p.lower() for p in FORBIDDEN_INCLUDE_PREFIXES)
+NEVER_EXEMPT_INCLUDES_LOWER = frozenset(
+    h.lower() for h in NEVER_EXEMPT_INCLUDES)
 FORBIDDEN_SYMBOLS = (
     ("NodeAccess", re.compile(r"\bNodeAccess\b")),
     ("add_hardware_request", re.compile(r"\badd_hardware_request\b")),
@@ -945,16 +951,18 @@ def _normalize_include(header):
         norm = norm[3:]
     if norm.startswith("./"):
         norm = norm[2:]
-    marker = "/talOS/"
-    if marker in norm:
-        norm = norm[norm.index(marker) + 1:]
+    marker = "/talos/"
+    lower = norm.lower()
+    if marker in lower:
+        norm = norm[lower.rindex(marker) + 1:]
     return norm
 
 
 def _is_forbidden_include(norm):
-    if norm in FORBIDDEN_INCLUDE_EXACT:
+    lower = norm.lower()
+    if lower in FORBIDDEN_INCLUDE_EXACT_LOWER:
         return True
-    return norm.startswith(FORBIDDEN_INCLUDE_PREFIXES)
+    return lower.startswith(FORBIDDEN_INCLUDE_PREFIXES_LOWER)
 
 
 def _is_non_cpp_include(norm):
@@ -1384,7 +1392,7 @@ def _is_exempt_cli_violation(violation, exempt_cli_files):
         return False
     if violation.kind != "forbidden-include":
         return False
-    if violation.header in NEVER_EXEMPT_INCLUDES:
+    if violation.header.lower() in NEVER_EXEMPT_INCLUDES_LOWER:
         return False
     return violation.header in allowed_headers
 
@@ -1413,7 +1421,7 @@ def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
                   f"delete the entry", file=out)
             continue
         for header in sorted(allowed_headers):
-            if header in NEVER_EXEMPT_INCLUDES:
+            if header.lower() in NEVER_EXEMPT_INCLUDES_LOWER:
                 failures += 1
                 print(f"VIOLATION {path}: exemption cannot allow {header} "
                       f"(NEVER_EXEMPT_INCLUDES)", file=out)
@@ -1437,7 +1445,7 @@ def run_source_checks(files, read, exempt_cli_files=None, out=sys.stdout):
 
     for path, allowed_headers in sorted(exempt_cli_files.items()):
         for header in sorted(allowed_headers):
-            if header in NEVER_EXEMPT_INCLUDES:
+            if header.lower() in NEVER_EXEMPT_INCLUDES_LOWER:
                 continue
             if (path, header) not in used_exemptions:
                 failures += 1

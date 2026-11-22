@@ -122,9 +122,160 @@ def in_package(path, packages):
     return os.path.dirname(path) in packages
 
 
-def is_comment(line):
-    stripped = line.lstrip()
-    return stripped.startswith(("//", "#", "*", "/*"))
+C_COMMENT_SUFFIXES = (".cc", ".h", ".cpp", ".hpp", ".ts", ".tsx")
+PY_COMMENT_SUFFIXES = (".py", ".bzl")
+PY_COMMENT_NAMES = ("BUILD", "BUILD.bazel")
+
+
+def _strip_c_comments(text, is_ts=False):
+    """Replaces `// ...` and `/* ... */` comments with spaces, preserving
+    newlines so 1-based line numbers remain exact."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        # Line comment `// ...`.
+        if ch == "/" and nxt == "/":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        # Block comment `/* ... */` (multi-line state tracked across newlines).
+        if ch == "/" and nxt == "*":
+            out.append("  ")
+            i += 2
+            while i < n:
+                if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
+                    out.append("  ")
+                    i += 2
+                    break
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            continue
+        # C++ raw string literal `R"delim(...)delim"` so comment tokens inside
+        # raw strings do not start comments.
+        if (not is_ts and ch == "R" and nxt == '"' and
+                (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))):
+            paren = text.find("(", i + 2)
+            if paren != -1 and paren - (i + 2) <= 16:
+                delim = text[i + 2:paren]
+                if not any(c in delim for c in " \t\r\n\\()"):
+                    end_marker = ")" + delim + '"'
+                    end = text.find(end_marker, paren + 1)
+                    if end != -1:
+                        end_idx = end + len(end_marker)
+                        out.append(text[i:end_idx])
+                        i = end_idx
+                        continue
+        # C++ numeric literal with optional `'` digit separators (e.g. `1'000`)
+        # so a digit separator is never mistaken for a character literal.
+        if (not is_ts and ch.isdigit() and
+                (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))):
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                c_next = text[i + 1] if i + 1 < n else ""
+                if c == "'" and (c_next.isalnum() or c_next == "_"):
+                    out.append(c)
+                    out.append(c_next)
+                    i += 2
+                    continue
+                if c in ("e", "E", "p", "P") and c_next in ("+", "-"):
+                    out.append(c)
+                    out.append(c_next)
+                    i += 2
+                    continue
+                if c.isalnum() or c in ("_", "."):
+                    out.append(c)
+                    i += 1
+                    continue
+                break
+            continue
+        # Quoted string / char / template literals: keep verbatim so `/*` or
+        # `//` inside a literal does not start a comment.
+        if ch in ('"', "'") or (is_ts and ch == "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                out.append(c)
+                i += 1
+                if c == "\\" and i < n:
+                    out.append(text[i])
+                    i += 1
+                    continue
+                if c == quote:
+                    break
+                if c == "\n" and quote != "`":
+                    break
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _strip_hash_comments(text, python_strings=True):
+    """Replaces `# ...` comments with spaces, preserving newlines."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "#" and (
+                python_strings or i == 0 or text[i - 1] in (" ", "\t", "\n")):
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if ch in ('"', "'"):
+            if python_strings and text[i:i + 3] == ch * 3:
+                quote = ch * 3
+                out.append(quote)
+                i += 3
+                while i < n:
+                    if text[i] == "\\" and i + 1 < n:
+                        out.append(text[i:i + 2])
+                        i += 2
+                        continue
+                    if text[i:i + 3] == quote:
+                        out.append(quote)
+                        i += 3
+                        break
+                    out.append(text[i])
+                    i += 1
+                continue
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                out.append(c)
+                i += 1
+                if c == "\\" and (python_strings or quote == '"') and i < n:
+                    out.append(text[i])
+                    i += 1
+                    continue
+                if c == quote or c == "\n":
+                    break
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def strip_comments(text, path):
+    """Strips comments from `text` according to `path`'s syntax while keeping
+    exact line numbers."""
+    if path.endswith(C_COMMENT_SUFFIXES):
+        return _strip_c_comments(text, is_ts=path.endswith((".ts", ".tsx")))
+    name = os.path.basename(path)
+    python_strings = (path.endswith(PY_COMMENT_SUFFIXES) or
+                      name in PY_COMMENT_NAMES)
+    return _strip_hash_comments(text, python_strings=python_strings)
 
 
 def scan(files, read):
@@ -133,13 +284,13 @@ def scan(files, read):
     packages = node_packages(files, read)
     for path in files:
         patterns = {}
-        text = None
+        stripped = None
         if (is_test_source(path) or is_test_helper(path) or
                 (path.endswith(SOURCE_SUFFIXES) and
                  in_package(path, packages))):
             patterns.update(TIME_PATTERNS)
-            text = read(path)
-            aliases = {a or b for a, b in CLOCK_ALIAS.findall(text)}
+            stripped = strip_comments(read(path), path)
+            aliases = {a or b for a, b in CLOCK_ALIAS.findall(stripped)}
             if aliases:
                 patterns["clock"] = re.compile(
                     TIME_PATTERNS["clock"].pattern + r"|\b(" +
@@ -150,11 +301,9 @@ def scan(files, read):
             patterns["retry"] = RETRY_PATTERN
         if not patterns:
             continue
-        if text is None:
-            text = read(path)
-        for number, line in enumerate(text.splitlines(), 1):
-            if is_comment(line):
-                continue
+        if stripped is None:
+            stripped = strip_comments(read(path), path)
+        for number, line in enumerate(stripped.splitlines(), 1):
             for kind, pattern in patterns.items():
                 if pattern.search(line):
                     hits.setdefault((path, kind), []).append(number)

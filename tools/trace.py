@@ -161,9 +161,9 @@ def split_row(line):
 
 
 def parse_requirements(text):
-    """({id: Requirement}, [package scope entries])."""
-    catalogue, scope, section = {}, [], None
-    for line in text.splitlines():
+    """({id: Requirement}, [package scope entries], [(line_no, req_id)])."""
+    catalogue, scope, duplicates, section = {}, [], [], None
+    for number, line in enumerate(text.splitlines(), 1):
         if line.startswith("## "):
             section = line[3:].strip()
             continue
@@ -171,7 +171,11 @@ def parse_requirements(text):
             continue
         cells = split_row(line)
         if section == "Catalogue" and REQ_ID.fullmatch(cells[0]):
-            catalogue[cells[0]] = Requirement(cells[0], cells[2], cells)
+            req_id = cells[0]
+            if req_id in catalogue:
+                duplicates.append((number, req_id))
+            else:
+                catalogue[req_id] = Requirement(req_id, cells[2], cells)
         elif (section == "Package scope" and len(cells) >= 2 and
               cells[0] not in ("Package", "---")):
             # A parenthesis qualifies the entry before it; it names no
@@ -179,7 +183,7 @@ def parse_requirements(text):
             package_cell = re.sub(r"\([^)]*\)", "", cells[0])
             for token in re.findall(r"`([^`]+)`", package_cell):
                 scope.extend(expand_braces(token))
-    return catalogue, scope
+    return catalogue, scope, duplicates
 
 
 def expand_braces(token):
@@ -286,15 +290,29 @@ def _contains_string_constant(node, target):
 
 def _normalize_pkg_src(package, src):
     """Package-relative repo path for a local file in `srcs`/`main`, or None
-    for a label (`//...`, `@...`, `:...`)."""
-    if src.startswith(("//", "@", ":")):
+    for a cross-package or external label (`//...`, `@...`)."""
+    if src.startswith(("//", "@")):
+        return None
+    if src.startswith(":"):
+        src = src[1:]
+    if not src:
         return None
     joined = os.path.normpath(os.path.join(package, src))
     return joined.replace(os.sep, "/")
 
 
+def _todo_mentions_label(text, label):
+    """True when `text` names `label` as a whole Bazel target label token."""
+    pattern = re.compile(
+        r"(?<![\w./:@+-])" + re.escape(label) +
+        r"(?![\w/@+-]|[.:](?=[\w/@+-]))"
+    )
+    return pattern.search(text) is not None
+
+
 def quarantined_targets(files, read):
-    """[(label, BUILD path, [source paths])] of targets tagged quarantine."""
+    """[(label, BUILD path, [source paths], has_non_literal_srcs)] of targets
+    tagged quarantine."""
     targets = []
     for path in files:
         if os.path.basename(path) not in ("BUILD", "BUILD.bazel"):
@@ -319,20 +337,29 @@ def quarantined_targets(files, read):
             if name is None:
                 name = f"<dynamic:line{getattr(call, 'lineno', 0)}>"
             sources = []
+            non_literal_srcs = False
             if "srcs" in kws:
                 parsed_srcs = _literal_string_list(kws["srcs"])
-                if parsed_srcs is not None:
+                if parsed_srcs is None:
+                    non_literal_srcs = True
+                else:
                     for src in parsed_srcs:
                         norm = _normalize_pkg_src(package, src)
                         if norm is not None:
                             sources.append(norm)
             if "main" in kws:
                 main_src = _literal_string(kws["main"])
-                if main_src is not None:
+                if main_src is None:
+                    non_literal_srcs = True
+                else:
                     norm = _normalize_pkg_src(package, main_src)
                     if norm is not None and norm not in sources:
                         sources.append(norm)
-            targets.append((f"//{package}:{name}", path, sources))
+            if ("srcs" not in kws and "main" not in kws and
+                    any(kw.arg is None for kw in call.keywords)):
+                non_literal_srcs = True
+            targets.append((f"//{package}:{name}", path, sources,
+                            non_literal_srcs))
     return targets
 
 
@@ -490,10 +517,12 @@ def parse_waivers(text, today):
 
 def framework_ids(catalogue, frameworks, read):
     """({id: the framework catalogue holding it}, [failures]): a framework
-    catalogue with no rows, and an ID in two catalogues, fail."""
+    catalogue with no rows, duplicate IDs, or an ID in two catalogues fail."""
     owners, failures = {}, []
     for path in frameworks:
-        ids = parse_requirements(read(path))[0]
+        ids, _, duplicates = parse_requirements(read(path))
+        for number, req_id in duplicates:
+            failures.append(f"{path}:{number}: duplicate requirement {req_id}")
         if not ids:
             failures.append(f"{path}: framework catalogue holds no "
                             f"requirement")
@@ -509,7 +538,10 @@ def framework_ids(catalogue, frameworks, read):
 def trace(files, read, today, frameworks=()):
     """(failures, {id: [(path, line)]}, {id: citation}, catalogue)."""
     failures = []
-    catalogue, scope = parse_requirements(read(REQUIREMENTS))
+    catalogue, scope, duplicates = parse_requirements(read(REQUIREMENTS))
+    for number, req_id in duplicates:
+        failures.append(
+            f"{REQUIREMENTS}:{number}: duplicate requirement {req_id}")
     # A repository with no catalogue of its own has no scope table either.
     check_scope = REQUIREMENTS in files or not frameworks
     framework, errors = framework_ids(catalogue, frameworks, read)
@@ -530,7 +562,7 @@ def trace(files, read, today, frameworks=()):
                 failures.append(err)
 
     quarantined = quarantined_targets(files, read)
-    quarantined_sources = {s for _, _, sources in quarantined for s in sources}
+    quarantined_sources = {s for _, _, sources, _ in quarantined for s in sources}
     source_lanes = test_source_lanes(files, read)
     tests = {}
     for path, number, req_id in find_tags(files, read):
@@ -540,8 +572,14 @@ def trace(files, read, today, frameworks=()):
         elif req_id in catalogue and path not in quarantined_sources:
             tests.setdefault(req_id, []).append((path, number))
 
-    for label, build, _ in quarantined:
-        entries = [text for text in todo_items.values() if label in text]
+    for label, build, _, non_literal_srcs in quarantined:
+        if non_literal_srcs:
+            failures.append(
+                f"{build}: {label} is tagged quarantine with non-literal "
+                f"srcs/main; list literal source paths so its tags can be "
+                f"excluded (docs/TESTING.md §8.3)")
+        entries = [text for text in todo_items.values()
+                   if _todo_mentions_label(text, label)]
         dates = sorted(d for text in entries for d in DATE.findall(text))
         if not dates:
             failures.append(f"{build}: {label} is tagged quarantine without "

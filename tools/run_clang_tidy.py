@@ -121,7 +121,7 @@ def main():
         )
     with open('compile_commands.json') as f:
         db = json.load(f)
-    root = os.getcwd()
+    root = os.path.realpath(os.getcwd())
     tus = set()
     for e in db:
         if e['file'].endswith(SOURCES):
