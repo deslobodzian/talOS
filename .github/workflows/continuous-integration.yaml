@@ -232,8 +232,8 @@ jobs:
         out="$RUNNER_TEMP/failed-tests"
         mkdir -p "$out"
         cp "$RUNNER_TEMP/bazel-test.log" "$out/" || true
-        grep -oE '^//[^ ]+ +(FAILED|TIMEOUT|INCOMPLETE|NO STATUS)' \
-            "$RUNNER_TEMP/bazel-test.log" | awk '{ print $1 }' | sort -u \
+        { grep -oE '^//[^ ]+ +(FAILED|TIMEOUT|INCOMPLETE|NO STATUS)' \
+            "$RUNNER_TEMP/bazel-test.log" || true; } | awk '{ print $1 }' | sort -u \
           | while read -r label; do
               rel="${label#//}"
               rel="${rel/://}"

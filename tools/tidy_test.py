@@ -39,11 +39,32 @@ TIDY_STUB = """#!/bin/sh
 if [ "$1" = --version ]; then echo "LLVM version 18.1.8"; exit 0; fi
 printf '%s\\n' "$*" >> "$TIDY_LOG"
 has_gcc_dir=0
+isysroot=""
+prev=""
 for arg in "$@"; do
+  if [ "$prev" = "-isysroot" ]; then isysroot="$arg"; fi
+  if [ "$prev" = "--extra-arg=-isysroot" ]; then isysroot="${arg#--extra-arg=}"; fi
   case "$arg" in
     --gcc-install-dir=*|--extra-arg=--gcc-install-dir=*) has_gcc_dir=1 ;;
   esac
+  prev="$arg"
 done
+if [ "${STUB_PROBE_SELF_ERROR:-0}" = "1" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      */probe.cc)
+        echo "$arg:1:1: error: simulated probe error" >&2
+        exit 1
+        ;;
+    esac
+  done
+fi
+if [ -n "${STUB_DARWIN_SDK_OK:-}" ]; then
+  if [ "$isysroot" != "$STUB_DARWIN_SDK_OK" ]; then
+    echo "${isysroot:-/Applications/Xcode 16.app/SDKs/MacOSX16.0.sdk}/usr/include/c++/v1/atomic:10:5: error: use of undeclared identifier '__builtin_clzg'" >&2
+    exit 1
+  fi
+fi
 if [ "${STUB_NATIVE_FAIL:-0}" = "1" ] && [ "$has_gcc_dir" = "0" ]; then
   echo "/usr/include/c++/16/bits/atomic_wait.h:55:24: error: use of undeclared identifier '__builtin_popcountg'" >&2
   exit 1
@@ -254,6 +275,60 @@ class TidyFallbackTest(unittest.TestCase):
         self.assertEqual(r.returncode, 3, out)
         self.assertIn("tidy: cannot run here:", out)
         self.assertFalse(os.path.exists(self.curl_log), out)
+
+    # REQ-OPS-33: macOS SDK paths with spaces are not word-split in probe/loop/
+    # diagnostics, and $tmp/probe.cc: is matched as a literal prefix.
+    def test_darwin_spaced_sdk_paths_and_literal_probe_prefix(self):
+        dev = os.path.join(self.tmp, "Xcode 16.app", "Contents", "Developer")
+        sdks_dir = os.path.join(
+            dev, "Platforms", "MacOSX.platform", "Developer", "SDKs")
+        sdk_16 = os.path.join(sdks_dir, "MacOSX16.0.sdk")
+        sdk_15 = os.path.join(sdks_dir, "MacOSX15.2.sdk")
+        os.makedirs(sdk_16)
+        os.makedirs(sdk_15)
+        put(os.path.join(self.bin_dir, "xcrun"),
+            f'#!/bin/sh\nprintf "%s\\n" "{sdk_16}"\n', 0o755)
+        put(os.path.join(self.bin_dir, "xcode-select"),
+            f'#!/bin/sh\nprintf "%s\\n" "{dev}"\n', 0o755)
+
+        special_tmp = os.path.join(self.tmp, "t.m+p dir")
+        os.makedirs(special_tmp)
+
+        # Fallback picks the spaced MacOSX15.2.sdk cleanly.
+        r = self.run_tidy(
+            STUB_OS="Darwin",
+            STUB_DARWIN_SDK_OK=sdk_15,
+            TMPDIR=special_tmp,
+        )
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn(f"using {sdk_15}", out)
+        with open(self.tidy_log, encoding="utf-8") as f:
+            calls = f.read()
+        self.assertIn(f"--extra-arg=-isysroot --extra-arg={sdk_15}", calls)
+
+        # When every spaced SDK fails, each tried path stays intact on its line.
+        r = self.run_tidy(
+            STUB_OS="Darwin",
+            STUB_DARWIN_SDK_OK="/nonexistent/sdk",
+            TMPDIR=special_tmp,
+        )
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 3, out)
+        lines = r.stderr.splitlines()
+        self.assertIn(f"  {sdk_16}", lines, out)
+        self.assertIn(f"  {sdk_15}", lines, out)
+
+        # A non-"file not found" error in $tmp/probe.cc with regex metachars in
+        # TMPDIR still triggers hard probe failure (exit 2), not exit 3.
+        r = self.run_tidy(
+            STUB_OS="Linux",
+            STUB_PROBE_SELF_ERROR="1",
+            TMPDIR=special_tmp,
+        )
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("probe failed for another reason", out)
 
 
 if __name__ == "__main__":

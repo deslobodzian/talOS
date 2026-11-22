@@ -603,6 +603,32 @@ class PrepushTest(unittest.TestCase):
         self.assertIn("prepush: source-lints SKIPPED (this commit has no "
                       "tools/source_lints.sh", out)
 
+    # REQ-OPS-33: deleting or omitting tools/check_robot_repo_scaffold.sh fails
+    # closed on HEAD, and is skipped cleanly only on an older commit predating it.
+    def test_missing_scaffold_script_fails_closed_unless_predated(self):
+        self.commit("examples/robot_repo/MODULE.bazel", "robot_repo")
+        self.commit("examples/wrist_repo/MODULE.bazel", "wrist_repo")
+        old = self.git("rev-parse", "HEAD").strip()
+
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: scaffold-robot_repo SKIPPED (this commit has no "
+                      "tools/check_robot_repo_scaffold.sh)", out)
+
+        put(os.path.join(self.repo, "tools", "check_robot_repo_scaffold.sh"),
+            "#!/bin/sh\nexit 0\n", 0o755)
+        self.git("add", "tools/check_robot_repo_scaffold.sh")
+        self.git("commit", "-qm", "add scaffold check")
+
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: scaffold-robot_repo ok", out)
+
+        status, out, _ = self.prepush("--ref", old, "--skip-gradle",
+                                      "--skip-studio")
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: scaffold-robot_repo skipped", out)
+
     # REQ-DEV-25
     def test_full_is_refused_with_skip_gradle(self):
         # --full promises rio-in-the-loop, which runs through Gradle.
