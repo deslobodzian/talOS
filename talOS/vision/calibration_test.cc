@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace talos::vision {
@@ -133,6 +134,97 @@ TEST(CalibrationTest, UndistortGuardsNonPositiveRadial) {
   EXPECT_TRUE(std::isfinite(p_div.y()));
   EXPECT_DOUBLE_EQ(p_div.x(), 1.4);
   EXPECT_DOUBLE_EQ(p_div.y(), 0.0);
+}
+
+TEST(CalibrationTest, IsValidRejectsNonFiniteIntrinsicsAndDistortion) {
+  auto make_valid = [] {
+    CameraIntrinsics intr;
+    intr.fx = 600.0;
+    intr.fy = 600.0;
+    intr.cx = 320.0;
+    intr.cy = 240.0;
+    return intr;
+  };
+  ASSERT_TRUE(make_valid().IsValid());
+
+  const double bad_values[] = {
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+  };
+  double CameraIntrinsics::*const fields[] = {
+      &CameraIntrinsics::fx, &CameraIntrinsics::fy, &CameraIntrinsics::cx,
+      &CameraIntrinsics::cy, &CameraIntrinsics::k1, &CameraIntrinsics::k2,
+      &CameraIntrinsics::p1, &CameraIntrinsics::p2, &CameraIntrinsics::k3,
+  };
+  for (const double bad : bad_values) {
+    for (auto field : fields) {
+      CameraIntrinsics intr = make_valid();
+      intr.*field = bad;
+      EXPECT_FALSE(intr.IsValid());
+    }
+  }
+}
+
+TEST(CalibrationTest, ProjectPointRejectsNonFiniteInputsAndOverflow) {
+  CameraIntrinsics intr;
+  intr.fx = 500.0;
+  intr.fy = 500.0;
+  intr.cx = 320.0;
+  intr.cy = 240.0;
+  intr.k3 = 1.0;
+
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  Eigen::Vector2d uv(123.0, 456.0);
+
+  EXPECT_FALSE(intr.ProjectPoint({0.0, 0.0, nan}, &uv));
+  EXPECT_FALSE(intr.ProjectPoint({nan, 0.0, 1.0}, &uv));
+  EXPECT_FALSE(intr.ProjectPoint({0.0, inf, 1.0}, &uv));
+  EXPECT_FALSE(intr.ProjectPoint({0.0, 0.0, inf}, &uv));
+  EXPECT_FALSE(intr.ProjectPoint({1e60, 0.0, 1.0}, &uv));
+  EXPECT_FALSE(intr.ProjectPoint({0.0, 0.0, 1.0}, nullptr));
+  // Rejected projections must not clobber uv_out with non-finite values.
+  EXPECT_DOUBLE_EQ(uv.x(), 123.0);
+  EXPECT_DOUBLE_EQ(uv.y(), 456.0);
+}
+
+TEST(CalibrationTest, UndistortGuardsInfiniteRadialAndFinalIterationOverflow) {
+  CameraIntrinsics intr;
+  intr.fx = 600.0;
+  intr.fy = 600.0;
+  intr.cx = 320.0;
+  intr.cy = 240.0;
+  intr.k3 = 1.0;
+
+  // r6 overflows to +inf so radial == +inf; must fall back to (x_dist, y_dist)
+  // rather than collapsing to 0 or producing NaN.
+  const double x_huge = 1e60;
+  const Eigen::Vector2d uv_huge(intr.cx + intr.fx * x_huge, intr.cy);
+  const Eigen::Vector2d p_inf_radial = intr.UndistortNormalizedPoint(uv_huge);
+  EXPECT_TRUE(std::isfinite(p_inf_radial.x()));
+  EXPECT_TRUE(std::isfinite(p_inf_radial.y()));
+  EXPECT_DOUBLE_EQ(p_inf_radial.x(), (uv_huge.x() - intr.cx) / intr.fx);
+  EXPECT_DOUBLE_EQ(p_inf_radial.y(), 0.0);
+
+  // Overflow on the final iteration (radial == 1.0, dx == +inf) must not
+  // return non-finite coordinates.
+  CameraIntrinsics tangential;
+  tangential.fx = 600.0;
+  tangential.fy = 600.0;
+  tangential.cx = 320.0;
+  tangential.cy = 240.0;
+  tangential.p2 = 1e300;
+  const double x_big = 1e10;
+  const Eigen::Vector2d uv_big(tangential.cx + tangential.fx * x_big,
+                               tangential.cy);
+  const Eigen::Vector2d p_overflow =
+      tangential.UndistortNormalizedPoint(uv_big, /*max_iterations=*/1);
+  EXPECT_TRUE(std::isfinite(p_overflow.x()));
+  EXPECT_TRUE(std::isfinite(p_overflow.y()));
+  EXPECT_DOUBLE_EQ(p_overflow.x(),
+                   (uv_big.x() - tangential.cx) / tangential.fx);
+  EXPECT_DOUBLE_EQ(p_overflow.y(), 0.0);
 }
 
 }  // namespace

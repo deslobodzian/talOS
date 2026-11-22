@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -116,6 +117,80 @@ inline std::optional<uint64_t> CaptureMidpoint(uint64_t stamp_ns,
 class Frame {
  public:
   Frame() = default;
+  ~Frame() = default;
+
+  Frame(const Frame& other)
+      : camera_id_{other.camera_id_},
+        session_id_{other.session_id_},
+        sequence_number_{other.sequence_number_},
+        capture_time_{other.capture_time_},
+        raw_timestamp_ns_{other.raw_timestamp_ns_},
+        clock_domain_{other.clock_domain_},
+        timestamp_kind_{other.timestamp_kind_},
+        mapping_quality_{other.mapping_quality_},
+        width_{other.width_},
+        height_{other.height_},
+        stride_{other.stride_},
+        format_{other.format_},
+        borrowed_{other.borrowed_},
+        borrowed_size_{other.borrowed_size_} {
+    if (other.borrowed_ != nullptr) return;
+    if (other.shared_storage_) {
+      shared_storage_ = other.shared_storage_;
+      data_offset_ = other.data_offset_;
+    } else if (other.owned_storage_.size() > other.data_offset_) {
+      CopyIntoAlignedOwned(other.owned_storage_.data() + other.data_offset_,
+                           other.owned_storage_.size() - other.data_offset_);
+    }
+  }
+
+  Frame& operator=(const Frame& other) {
+    if (this == &other) return *this;
+    Frame copy(other);
+    *this = std::move(copy);
+    return *this;
+  }
+
+  Frame(Frame&& other) noexcept
+      : camera_id_{other.camera_id_},
+        session_id_{other.session_id_},
+        sequence_number_{other.sequence_number_},
+        capture_time_{other.capture_time_},
+        raw_timestamp_ns_{other.raw_timestamp_ns_},
+        clock_domain_{other.clock_domain_},
+        timestamp_kind_{other.timestamp_kind_},
+        mapping_quality_{other.mapping_quality_},
+        width_{other.width_},
+        height_{other.height_},
+        stride_{other.stride_},
+        format_{other.format_},
+        owned_storage_{std::move(other.owned_storage_)},
+        shared_storage_{std::move(other.shared_storage_)},
+        data_offset_{std::exchange(other.data_offset_, 0)},
+        borrowed_{std::exchange(other.borrowed_, nullptr)},
+        borrowed_size_{std::exchange(other.borrowed_size_, 0)} {}
+
+  Frame& operator=(Frame&& other) noexcept {
+    if (this == &other) return *this;
+    camera_id_ = other.camera_id_;
+    session_id_ = other.session_id_;
+    sequence_number_ = other.sequence_number_;
+    capture_time_ = other.capture_time_;
+    raw_timestamp_ns_ = other.raw_timestamp_ns_;
+    clock_domain_ = other.clock_domain_;
+    timestamp_kind_ = other.timestamp_kind_;
+    mapping_quality_ = other.mapping_quality_;
+    width_ = other.width_;
+    height_ = other.height_;
+    stride_ = other.stride_;
+    format_ = other.format_;
+    owned_storage_ = std::move(other.owned_storage_);
+    shared_storage_ = std::move(other.shared_storage_);
+    data_offset_ = std::exchange(other.data_offset_, 0);
+    borrowed_ = std::exchange(other.borrowed_, nullptr);
+    borrowed_size_ = std::exchange(other.borrowed_size_, 0);
+    return *this;
+  }
 
   // Constructs a Frame owning an allocated buffer for given dimensions.
   Frame(uint32_t camera_id, uint64_t session_id, uint64_t sequence_number,
@@ -133,7 +208,7 @@ class Frame {
     size_t bpp = BytesPerPixel(format);
     stride_ = (stride > 0) ? stride : width * static_cast<uint32_t>(bpp);
     size_t bytes = static_cast<size_t>(stride_) * height_;
-    owned_storage_.resize(bytes > 0 ? (bytes + 4096) : 0);
+    AllocateAlignedOwned(bytes);
   }
 
   // Constructs a Frame moving an owned buffer.
@@ -243,40 +318,35 @@ class Frame {
   // Buffer accessors
   const uint8_t* data() const {
     if (borrowed_ != nullptr) return borrowed_;
-    const uint8_t* ptr =
-        shared_storage_ ? shared_storage_->data() : owned_storage_.data();
-    if (ptr == nullptr) return nullptr;
-    size_t required = static_cast<size_t>(stride_) * height_;
-    size_t cap =
-        shared_storage_ ? shared_storage_->size() : owned_storage_.size();
-    if (cap >= required + 4096) {
-      uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-      size_t offset = (4096 - (addr % 4096)) % 4096;
-      return ptr + offset;
-    }
-    return ptr;
+    const auto* storage =
+        shared_storage_ ? shared_storage_.get() : &owned_storage_;
+    if (storage->size() <= data_offset_) return nullptr;
+    return storage->data() + data_offset_;
   }
 
   uint8_t* mutable_data() {
     if (borrowed_ != nullptr) {
       // Copy out of borrowed storage before mutating.
-      owned_storage_.assign(borrowed_, borrowed_ + borrowed_size_);
+      const uint8_t* src = borrowed_;
+      const size_t n = borrowed_size_;
       borrowed_ = nullptr;
       borrowed_size_ = 0;
+      CopyIntoAlignedOwned(src, n);
     } else if (shared_storage_) {
-      // Unshare to mutate (copy-on-write semantics)
-      owned_storage_ = *shared_storage_;
-      shared_storage_.reset();
+      // Unshare to mutate (copy-on-write semantics), preserving exact logical
+      // pixel bytes at offset 0 of a freshly page-aligned view.
+      const auto prev = std::move(shared_storage_);
+      const size_t prev_offset = data_offset_;
+      const size_t prev_size =
+          prev->size() > prev_offset ? (prev->size() - prev_offset) : 0;
+      if (prev_size > 0) {
+        CopyIntoAlignedOwned(prev->data() + prev_offset, prev_size);
+      } else {
+        AllocateAlignedOwned(0);
+      }
     }
-    uint8_t* ptr = owned_storage_.data();
-    if (ptr == nullptr) return nullptr;
-    size_t required = static_cast<size_t>(stride_) * height_;
-    if (owned_storage_.size() >= required + 4096) {
-      uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-      size_t offset = (4096 - (addr % 4096)) % 4096;
-      return ptr + offset;
-    }
-    return ptr;
+    if (owned_storage_.size() <= data_offset_) return nullptr;
+    return owned_storage_.data() + data_offset_;
   }
 
   // Declared stride * height bytes, however many the storage holds (the
@@ -323,13 +393,11 @@ class Frame {
     cloned.height_ = height_;
     cloned.stride_ = stride_;
     cloned.format_ = format_;
-    size_t bytes = static_cast<size_t>(stride_) * height_;
-    cloned.owned_storage_.resize(bytes > 0 ? (bytes + 4096) : 0);
-    // A borrowed frame copies only the bytes it was lent.
-    const size_t copied =
-        borrowed_ != nullptr && borrowed_size_ < bytes ? borrowed_size_ : bytes;
+    const size_t bytes = static_cast<size_t>(stride_) * height_;
+    // Never read past the bytes actually stored in the source frame.
+    const size_t copied = std::min(bytes, stored_size());
     if (copied > 0 && data() != nullptr) {
-      std::memcpy(cloned.mutable_data(), data(), copied);
+      cloned.CopyIntoAlignedOwned(data(), copied);
     }
     return cloned;
   }
@@ -338,9 +406,11 @@ class Frame {
   // borrowed frame is cloned instead, since its bytes may not outlive it.
   Frame Share() const {
     if (borrowed_ != nullptr) return Clone();
-    if (!shared_storage_ && !owned_storage_.empty()) {
+    if (!shared_storage_ && owned_storage_.size() > data_offset_) {
+      // Moving std::vector preserves its heap allocation address, so
+      // data_offset_ remains exact and page-aligned without copying.
       shared_storage_ = std::make_shared<const std::vector<uint8_t>>(
-          std::move(const_cast<std::vector<uint8_t>&>(owned_storage_)));
+          std::move(owned_storage_));
     }
     Frame shared;
     shared.camera_id_ = camera_id_;
@@ -356,13 +426,44 @@ class Frame {
     shared.stride_ = stride_;
     shared.format_ = format_;
     shared.shared_storage_ = shared_storage_;
+    shared.data_offset_ = data_offset_;
     return shared;
   }
 
  private:
+  static constexpr size_t kPageAlignment = 4096;
+
+  static size_t AlignmentOffset(const uint8_t* ptr) {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    return (kPageAlignment - (addr % kPageAlignment)) % kPageAlignment;
+  }
+
+  void AllocateAlignedOwned(size_t bytes) {
+    if (bytes == 0) {
+      owned_storage_.clear();
+      data_offset_ = 0;
+      return;
+    }
+    owned_storage_.resize(bytes + kPageAlignment);
+    data_offset_ = AlignmentOffset(owned_storage_.data());
+    // Shrinking within capacity never reallocates, keeping data() page-aligned
+    // while making (owned_storage_.size() - data_offset_) == bytes exact.
+    owned_storage_.resize(data_offset_ + bytes);
+  }
+
+  void CopyIntoAlignedOwned(const uint8_t* src, size_t bytes) {
+    AllocateAlignedOwned(bytes);
+    if (bytes > 0 && src != nullptr) {
+      std::memcpy(owned_storage_.data() + data_offset_, src, bytes);
+    }
+  }
+
   size_t stored_size() const {
     if (borrowed_ != nullptr) return borrowed_size_;
-    return shared_storage_ ? shared_storage_->size() : owned_storage_.size();
+    const auto* storage =
+        shared_storage_ ? shared_storage_.get() : &owned_storage_;
+    return storage->size() > data_offset_ ? (storage->size() - data_offset_)
+                                          : 0;
   }
 
   uint32_t camera_id_{0};
@@ -380,8 +481,9 @@ class Frame {
   uint32_t stride_{0};
   PixelFormat format_{PixelFormat::kGray8};
 
-  std::vector<uint8_t> owned_storage_;
+  mutable std::vector<uint8_t> owned_storage_;
   mutable std::shared_ptr<const std::vector<uint8_t>> shared_storage_;
+  size_t data_offset_{0};
   const uint8_t* borrowed_{nullptr};
   size_t borrowed_size_{0};
 };

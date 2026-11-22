@@ -153,7 +153,7 @@ struct JointFixture {
       tag.T_camera_tag = optical;
       const auto corners = GetTagModelCorners(layout.GetTagSize(id));
       for (size_t j = 0; j < corners.size(); ++j) {
-        Eigen::Vector2d uv;
+        Eigen::Vector2d uv = Eigen::Vector2d::Zero();
         EXPECT_TRUE(intr.ProjectPoint(optical.act(corners[j]), &uv));
         tag.corners[2 * j] = static_cast<float>(uv.x());
         tag.corners[2 * j + 1] = static_cast<float>(uv.y());
@@ -892,6 +892,185 @@ TEST(LocalizationTest, AmbiguityAnnotationIsSingleTagOnly) {
   AnnotateAmbiguityRejection(detections, multi);
   EXPECT_EQ(detections[0].reject_reason, "ambiguity");
   EXPECT_TRUE(detections[1].reject_reason.empty());
+}
+
+TEST(LocalizationTest, OrderPoseCandidatesHandlesNonFiniteErrors) {
+  using Pose = talos::geometry::SE3<double>;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const Pose pose_a(talos::geometry::SO3<double>::Identity(), {1, 0, 3});
+  const Pose pose_b(talos::geometry::SO3<double>::Identity(), {0, 0, 3});
+
+  // NaN primary must be demoted behind a finite secondary and fail closed.
+  {
+    Pose p1 = pose_a, p2 = pose_b;
+    double e1 = nan, e2 = 0.5;
+    const double amb = detail::OrderPoseCandidates(p1, p2, e1, e2);
+    EXPECT_TRUE(p1.matrix().isApprox(pose_b.matrix()));
+    EXPECT_DOUBLE_EQ(e1, 0.5);
+    EXPECT_TRUE(std::isnan(e2));
+    EXPECT_DOUBLE_EQ(amb, 1.0);
+  }
+
+  // NaN secondary must fail closed (ambiguity == 1.0), not look unambiguous.
+  {
+    Pose p1 = pose_a, p2 = pose_b;
+    double e1 = 0.5, e2 = nan;
+    const double amb = detail::OrderPoseCandidates(p1, p2, e1, e2);
+    EXPECT_TRUE(p1.matrix().isApprox(pose_a.matrix()));
+    EXPECT_DOUBLE_EQ(e1, 0.5);
+    EXPECT_DOUBLE_EQ(amb, 1.0);
+  }
+
+  // Both NaN fails closed.
+  {
+    Pose p1 = pose_a, p2 = pose_b;
+    double e1 = nan, e2 = nan;
+    EXPECT_DOUBLE_EQ(detail::OrderPoseCandidates(p1, p2, e1, e2), 1.0);
+  }
+
+  // +Inf secondary is infinitely worse than finite primary -> unambiguous.
+  {
+    Pose p1 = pose_a, p2 = pose_b;
+    double e1 = 0.5, e2 = inf;
+    EXPECT_DOUBLE_EQ(detail::OrderPoseCandidates(p1, p2, e1, e2), 0.0);
+    EXPECT_TRUE(p1.matrix().isApprox(pose_a.matrix()));
+  }
+
+  // +Inf primary swaps behind finite secondary -> unambiguous.
+  {
+    Pose p1 = pose_a, p2 = pose_b;
+    double e1 = inf, e2 = 0.5;
+    EXPECT_DOUBLE_EQ(detail::OrderPoseCandidates(p1, p2, e1, e2), 0.0);
+    EXPECT_TRUE(p1.matrix().isApprox(pose_b.matrix()));
+    EXPECT_DOUBLE_EQ(e1, 0.5);
+  }
+
+  // Both +Inf fails closed.
+  {
+    Pose p1 = pose_a, p2 = pose_b;
+    double e1 = inf, e2 = inf;
+    EXPECT_DOUBLE_EQ(detail::OrderPoseCandidates(p1, p2, e1, e2), 1.0);
+  }
+}
+
+TEST(LocalizationTest, ComputeRobotFieldPoseValidatesFloorStdAndFiniteOutput) {
+  using Pose = talos::geometry::SE3<double>;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  FieldLayout layout;
+  layout.SetTagPose(1,
+                    Pose(talos::geometry::SO3<double>::Identity(), {4, 0, 1}));
+  const auto mount = CameraMounting::Identity();
+  const Pose valid_cam_tag(talos::geometry::SO3<double>::Identity(), {0, 0, 2});
+
+  for (const double bad_std : {0.0, -0.05, nan, inf, -inf}) {
+    PoseSolverOptions bad_z;
+    bad_z.floor_z_std_m = bad_std;
+    const auto res_z = ComputeRobotFieldPose(1, 0, valid_cam_tag, mount, layout,
+                                             0.1, 0.05, {}, nullptr, -1, bad_z);
+    EXPECT_FALSE(res_z.validity.valid);
+    EXPECT_EQ(res_z.validity.reason, PoseInvalidReason::kInvalidCovariance);
+
+    PoseSolverOptions bad_tilt;
+    bad_tilt.floor_tilt_std_rad = bad_std;
+    const auto res_tilt =
+        ComputeRobotFieldPose(1, 0, valid_cam_tag, mount, layout, 0.1, 0.05, {},
+                              nullptr, -1, bad_tilt);
+    EXPECT_FALSE(res_tilt.validity.valid);
+    EXPECT_EQ(res_tilt.validity.reason, PoseInvalidReason::kInvalidCovariance);
+  }
+
+  // Finite T_camera_tag composed with non-finite mounting produces non-finite
+  // T_field_robot and must be rejected.
+  const auto bad_mount = CameraMounting::FromOpticalTransform(
+      Pose(talos::geometry::SO3<double>::Identity(), {nan, 0.0, 0.0}));
+  const auto res_mount =
+      ComputeRobotFieldPose(1, 0, valid_cam_tag, bad_mount, layout, 0.1, 0.05);
+  EXPECT_FALSE(res_mount.validity.valid);
+  EXPECT_EQ(res_mount.validity.reason, PoseInvalidReason::kInvalidRotation);
+
+  // Finite T_camera_tag composed with non-finite layout pose must be rejected.
+  FieldLayout bad_layout;
+  bad_layout.SetTagPose(
+      1, Pose(talos::geometry::SO3<double>::Identity(), {inf, 0.0, 1.0}));
+  const auto res_layout =
+      ComputeRobotFieldPose(1, 0, valid_cam_tag, mount, bad_layout, 0.1, 0.05);
+  EXPECT_FALSE(res_layout.validity.valid);
+  EXPECT_EQ(res_layout.validity.reason, PoseInvalidReason::kInvalidRotation);
+}
+
+TEST(LocalizationTest,
+     SingleTagFloorDisambiguationUsesSecondaryRangeAndPopulatesCameraTag) {
+  using Pose = talos::geometry::SE3<double>;
+  CameraIntrinsics intr;
+  intr.fx = 600.0;
+  intr.fy = 610.0;
+  intr.cx = 320.0;
+  intr.cy = 240.0;
+  const auto mount = CameraMounting::FromExtrinsics(0.2, -0.1, 0.5, 0, 0, 0.1);
+  FieldLayout layout(0.4);
+  const Pose true_robot(talos::geometry::SO3<double>::Exp({0, 0, 0.25}),
+                        {1.0, 2.0, 0.0});
+  const Pose secondary_cam_tag = SolverTagFrameToLayoutFrame(Pose(
+      talos::geometry::SO3<double>::Exp({0.1, 0.15, 0.05}), {0.2, -0.1, 6.0}));
+  layout.SetTagPose(1, true_robot * mount.T_robot_camera * secondary_cam_tag);
+
+  // Primary candidate at a very different range (2.0 m) that puts the robot
+  // well off the floor (> 6 sigma), forcing floor disambiguation to pick
+  // secondary_T_camera_tag (~6.0 m).
+  const Pose off_floor_robot(talos::geometry::SO3<double>::Exp({0, 0, 0.25}),
+                             {5.0, 2.0, -1.2});
+  const auto tag_pose = *layout.GetTagPose(1);
+  const Pose primary_cam_tag =
+      mount.T_robot_camera.inverse() * off_floor_robot.inverse() * tag_pose;
+  ASSERT_GT(primary_cam_tag.translation().z(), 0.5);
+  ASSERT_LT(primary_cam_tag.translation().norm(), 3.0);
+
+  TagDetection3D tag;
+  tag.tag_id = 1;
+  tag.valid = true;
+  tag.T_camera_tag = primary_cam_tag;
+  tag.secondary_T_camera_tag = secondary_cam_tag;
+  tag.reprojection_error = 0.1;
+  tag.secondary_reprojection_error_px = 0.2;
+  tag.ambiguity = 0.9;
+  const auto model = GetTagModelCorners(layout.GetTagSize(1));
+  for (size_t j = 0; j < model.size(); ++j) {
+    Eigen::Vector2d uv;
+    ASSERT_TRUE(intr.ProjectPoint(secondary_cam_tag.act(model[j]), &uv));
+    tag.corners[2 * j] = static_cast<float>(uv.x());
+    tag.corners[2 * j + 1] = static_cast<float>(uv.y());
+  }
+
+  PoseSolverOptions noise;
+  noise.min_xy_std_m = 0.0;
+  noise.min_yaw_std_rad = 0.0;
+  noise.mount_angle_std_rad = 0.05;
+  noise.mount_translation_std_m = 0.0;
+
+  const auto switched =
+      SolveMultiTagRobotPose({tag}, 0, mount, layout, intr, {}, noise);
+  ASSERT_TRUE(switched.validity.valid) << switched.validity.message;
+
+  // Baseline where the true ~6.0 m pose is already primary (no switch).
+  TagDetection3D direct_tag = tag;
+  direct_tag.T_camera_tag = secondary_cam_tag;
+  direct_tag.secondary_reprojection_error_px = -1.0;
+  direct_tag.ambiguity = 0.05;
+  const auto direct =
+      SolveMultiTagRobotPose({direct_tag}, 0, mount, layout, intr, {}, noise);
+  ASSERT_TRUE(direct.validity.valid) << direct.validity.message;
+
+  const double expected_range = secondary_cam_tag.translation().norm();
+  EXPECT_NEAR(switched.average_distance_m, expected_range, 1e-6);
+  EXPECT_NEAR(switched.std_devs.x_std_m, direct.std_devs.x_std_m, 1e-6);
+  EXPECT_NEAR(switched.std_devs.y_std_m, direct.std_devs.y_std_m, 1e-6);
+  EXPECT_TRUE(switched.T_camera_tag.matrix().isApprox(
+      secondary_cam_tag.matrix(), 1e-3));
+  EXPECT_TRUE(
+      direct.T_camera_tag.matrix().isApprox(secondary_cam_tag.matrix(), 1e-3));
 }
 
 }  // namespace
