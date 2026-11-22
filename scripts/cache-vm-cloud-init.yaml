@@ -1,0 +1,37 @@
+#cloud-config
+# Container-Optimized OS user-data for the Bazel cache VM
+# (scripts/create-bazel-cache-vm.sh fills in the __NAMES__). Runs
+# bazel-remote as a systemd unit: a local LRU on the boot disk's stateful
+# partition, with the GCS bucket behind it as the durable store.
+write_files:
+- path: /etc/systemd/system/bazel-remote.service
+  permissions: "0644"
+  owner: root
+  content: |
+    [Unit]
+    Description=bazel-remote cache backed by gs://__BUCKET__
+    Wants=network-online.target docker.service
+    After=network-online.target docker.service
+
+    [Service]
+    # The image runs as uid 1000.
+    ExecStartPre=/bin/mkdir -p /mnt/stateful_partition/bazel-remote
+    ExecStartPre=/bin/chown 1000:1000 /mnt/stateful_partition/bazel-remote
+    # Container-Optimized OS drops inbound TCP except SSH until told otherwise.
+    ExecStartPre=/bin/sh -c 'iptables -w -C INPUT -p tcp --dport 9092 -j ACCEPT || iptables -w -A INPUT -p tcp --dport 9092 -j ACCEPT'
+    ExecStartPre=-/usr/bin/docker rm -f bazel-remote
+    ExecStart=/usr/bin/docker run --rm --name bazel-remote --network=host \
+      -u 1000:1000 -v /mnt/stateful_partition/bazel-remote:/data \
+      __IMAGE__ \
+      --dir=/data --max_size=__MAX_SIZE_GIB__ \
+      --grpc_address=0.0.0.0:9092 --http_address=127.0.0.1:8080 \
+      --gcs_proxy.bucket=__BUCKET__ --gcs_proxy.use_default_credentials=true
+    ExecStop=/usr/bin/docker stop bazel-remote
+    Restart=always
+    RestartSec=10
+
+    [Install]
+    WantedBy=multi-user.target
+runcmd:
+- systemctl daemon-reload
+- systemctl start bazel-remote.service
