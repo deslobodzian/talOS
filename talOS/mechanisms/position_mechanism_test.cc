@@ -382,7 +382,9 @@ TEST(PositionMechanism, RequestOutsideUpdateThrows) {
 // REQ-SAFE-36
 TEST(PositionMechanism, RequestDoesNotCarryIntoTheNextTick) {
   struct SkippingNode {
-    explicit SkippingNode(Node& node) : mech{node, "arm"} {}
+    explicit SkippingNode(Node& node) : mech{node, "arm"} {
+      AllowUntargetedOutputs(node);
+    }
     void update() {
       if (!armed) {
         mech.update();
@@ -393,17 +395,23 @@ TEST(PositionMechanism, RequestDoesNotCarryIntoTheNextTick) {
       } else {
         mech.update();  // tick N + 1 on: nothing asked this tick
       }
+      ever_drove |= mech.driving();
       ++step;
     }
     PositionMechanism mech;
     bool armed = false;
+    bool ever_drove = false;
     int step = 0;
   };
   Rig<SkippingNode> arm{"arm"};
   arm.Start();
   arm.node.armed = true;
-  arm.sim.step(15ms);
+  for (int i = 0; i < 3; ++i) {
+    arm.sim.step(5ms);
+    EXPECT_EQ(arm.Applied().mode, Mode::kNeutral) << "tick " << i;
+  }
   ASSERT_GE(arm.node.step, 2);
+  EXPECT_FALSE(arm.node.ever_drove);
   EXPECT_FALSE(arm.mech().driving());
   EXPECT_EQ(arm.Applied().mode, Mode::kNeutral);
 }
@@ -691,6 +699,26 @@ TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
   EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);
 }
 
+// Stator current alone is not a stop: a mechanism still moving past
+// homing_stall_rps under high load past homing_min_travel_rot and
+// homing_min_push_us + homing_stall_us never homes and faults at timeout.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingRequiresStillnessNotCurrentAlone) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.5, -0.5, 30.0);  // moving faster than homing_stall_rps
+  hood.Start();
+  hood.Drive(0.5, 20ms);
+  hood.SetMotor(2.4, -0.5, 30.0);  // past homing_min_travel_rot (0.05)
+  hood.Drive(0.5, 300ms);          // past homing_min_push_us + homing_stall_us
+  EXPECT_FALSE(hood.mech().homed());
+  EXPECT_EQ(hood.mech().fault(), PositionFault::kNone);
+  hood.ExpectHoming(-1.0);
+  hood.Drive(0.5, 250ms);  // past homing_timeout_us (500 ms)
+  EXPECT_FALSE(hood.mech().homed());
+  EXPECT_EQ(hood.mech().fault(), PositionFault::kHomingTimeout);
+  hood.ExpectNeutral();
+}
+
 // One subsystem of kRobotToml on the physics simulator (sim_gateway
 // --physics). Each Tick() the physics backend runs what the gateway applied
 // last tick, and its motor sample, and the home switch's reading once
@@ -906,6 +934,119 @@ TEST(PositionMechanism, DisableWhileSettlingEndsTheHomingRun) {
   carriage.Drive(0.5, 30ms);
   EXPECT_TRUE(carriage.mech().homed());
   EXPECT_EQ(carriage.Applied().mode, Mode::kMotionMagic);
+}
+
+// Settling after limit-switch zeroing requires home_samples (2) consecutive
+// valid slow feedback readings: one slow reading, a fast reading breaking the
+// run, or a disconnected reading breaking the run leaves the mechanism unhomed
+// and neutral until two consecutive valid slow readings arrive.
+// REQ-SAFE-36
+TEST(PositionMechanism,
+     LimitSwitchSettlingRequiresConsecutiveValidSlowSamples) {
+  Rig carriage{"carriage"};
+  carriage.SetMotor(1.0, -0.5);  // moving down: no stall
+  carriage.hw.set_digital_input("carriage", "carriage_home", true);  // open
+  carriage.Start();
+  carriage.Drive(0.5, 30ms);
+  carriage.ExpectHoming(-1.0);
+  carriage.hw.set_digital_input("carriage", "carriage_home", false);  // closed
+  carriage.Drive(0.5, 30ms);  // switch sets the frame while moving
+  ASSERT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+  ASSERT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  // SimHardware publishes after the node ticks, so a motor update set before
+  // a 5 ms step is read by the node on the following 5 ms step.
+  // 1 valid slow tick -> still !homed() & neutral.
+  carriage.SetMotor(1.0, 0.0);
+  carriage.Drive(0.5, 5ms);  // reads -0.5; publishes 0.0
+  carriage.SetMotor(1.0, -0.5);
+  carriage.Drive(0.5, 5ms);  // reads 0.0 (slow #1); publishes -0.5
+  ASSERT_TRUE(carriage.mech().state().connected());
+  ASSERT_DOUBLE_EQ(carriage.mech().state().velocity_rps(), 0.0);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  // 1 fast tick breaks the run; the next valid slow tick is only #1 again.
+  carriage.SetMotor(1.0, 0.0);
+  carriage.Drive(0.5, 5ms);  // reads -0.5 (resets run); publishes 0.0
+  ASSERT_DOUBLE_EQ(carriage.mech().state().velocity_rps(), -0.5);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  carriage.hw.set_connected("carriage", "carriage", false);
+  carriage.Drive(0.5, 5ms);  // reads 0.0 (slow #1); publishes disconnected
+  ASSERT_TRUE(carriage.mech().state().connected());
+  ASSERT_DOUBLE_EQ(carriage.mech().state().velocity_rps(), 0.0);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  // 1 disconnected tick breaks the run; the next valid slow tick is only #1.
+  carriage.hw.set_connected("carriage", "carriage", true);
+  carriage.SetMotor(1.0, 0.0);
+  carriage.Drive(0.5, 5ms);  // reads disconnected (resets run); publishes 0.0
+  ASSERT_FALSE(carriage.mech().state().connected());
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  carriage.Drive(0.5, 5ms);  // reads 0.0 (slow #1); publishes 0.0
+  ASSERT_TRUE(carriage.mech().state().connected());
+  ASSERT_DOUBLE_EQ(carriage.mech().state().velocity_rps(), 0.0);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  // 2nd consecutive valid slow tick completes settling -> homed.
+  carriage.Drive(0.5, 5ms);  // reads 0.0 (slow #2)
+  EXPECT_TRUE(carriage.mech().homed());
+  EXPECT_EQ(carriage.Applied().mode, Mode::kMotionMagic);
+}
+
+// Settling gets its own homing_timeout_us counted from the first live tick
+// after the switch zeroes the frame: neither time spent pushing before the
+// switch nor idle time without a goal after zeroing eats into it.
+// REQ-SAFE-36
+TEST(PositionMechanism,
+     LimitSwitchSettlingTimeoutCountsFromFirstLiveTickAfterZero) {
+  {
+    SCOPED_TRACE("push 400 ms, hit switch while moving, settle 200 ms");
+    Rig carriage{"carriage"};
+    carriage.SetMotor(1.0, -0.5);
+    carriage.hw.set_digital_input("carriage", "carriage_home", true);  // open
+    carriage.Start();
+    carriage.Drive(0.5, 400ms);  // 400 ms of 500 ms homing_timeout_us
+    carriage.ExpectHoming(-1.0);
+    carriage.hw.set_digital_input("carriage", "carriage_home", false);
+    carriage.Drive(0.5, 200ms);  // 600 ms total > 500 ms, only ~200 ms settling
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+    EXPECT_FALSE(carriage.mech().homed());
+    carriage.ExpectNeutral();
+    carriage.SetMotor(1.0, 0.0);
+    carriage.Drive(0.5, 20ms);
+    EXPECT_TRUE(carriage.mech().homed());
+  }
+  {
+    SCOPED_TRACE("zeroed without a live goal, idle 600 ms, then live goal");
+    Rig carriage{"carriage"};
+    carriage.SetMotor(1.0, -0.5);
+    carriage.hw.set_digital_input("carriage", "carriage_home", false);
+    carriage.Start();
+    carriage.sim.step(600ms);  // switch zeroes while moving; no live goal
+    ASSERT_NEAR(carriage.mech().position_rot(), 0.0, 1e-9);
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.mech().phase(), PositionPhase::kUnhomed);
+    EXPECT_FALSE(carriage.mech().homed());
+
+    carriage.Drive(0.5, 100ms);  // first live tick starts the 500 ms timer
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+    EXPECT_FALSE(carriage.mech().homed());
+    carriage.ExpectNeutral();
+
+    carriage.Drive(0.5, 450ms);  // past 500 ms from the first live tick
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kHomingTimeout);
+    carriage.ExpectNeutral();
+  }
 }
 
 // A mechanism that keeps moving (no stop within reach) times out and faults.
