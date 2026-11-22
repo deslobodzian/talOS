@@ -1456,7 +1456,10 @@ void PhoenixBackend::ConfigureSimulation(const hw::Config& c) {
 
   for (std::size_t i = 0; i < motors_.size() && i < sim_plants_.size(); ++i) {
     const auto& m = c.motors[i];
-    double gear_ratio = m.rotor_to_sensor_ratio * m.sensor_to_mechanism_ratio;
+    double gear_ratio =
+        m.feedback == hw::Feedback::kRemoteCANcoder
+            ? m.rotor_to_sensor_ratio * m.sensor_to_mechanism_ratio
+            : m.sensor_to_mechanism_ratio;
     if (!std::isfinite(gear_ratio) || gear_ratio <= 0.0) gear_ratio = 1.0;
     const units::kilogram_square_meter_t j_mech{kSimRotorInertiaKgM2 *
                                                 gear_ratio * gear_ratio};
@@ -1465,6 +1468,9 @@ void PhoenixBackend::ConfigureSimulation(const hw::Config& c) {
                                    frc::Vectord<2>::Zero(), gear_ratio};
 
     auto& sim = motors_[i]->GetSimState();
+    // Phoenix 6 TalonFXSimState::MotorType only defines KrakenX60 and
+    // KrakenX44 (no Falcon500); WPILib's DCMotorSystem models Falcon500 via
+    // MakeSimDcMotor().
     sim.SetMotorType(m.motor_type.value == hw::MotorType::kKrakenX44
                          ? ph::sim::TalonFXSimState::MotorType::KrakenX44
                          : ph::sim::TalonFXSimState::MotorType::KrakenX60);
@@ -1636,17 +1642,25 @@ void PhoenixBackend::UpdateSimulation(double dt) {
     sim.SetRotorAcceleration(
         units::turns_per_second_squared_t{rotor_accel_rps2});
 
-    // Sync remote CANcoder if mapped.
+    // Sync remote CANcoder if mapped. The CANcoder sits on the sensor shaft
+    // (rotor / rotor_to_sensor_ratio = mechanism * sensor_to_mechanism_ratio),
+    // and Phoenix 6's TalonFX then divides the remote CANcoder reading by
+    // SensorToMechanismRatio once to report mechanism rotations and rps.
     const int sensor_idx = motor_to_sensor_map_[i];
     if (sensor_idx >= 0 &&
         static_cast<std::size_t>(sensor_idx) < sensors_.size() &&
         sensors_[sensor_idx].encoder) {
-      const double mech_rot = plant.state(0) / kTau;
-      const double mech_rps = plant.state(1) / kTau;
+      const double sensor_to_mech =
+          (std::isfinite(m_cfg.sensor_to_mechanism_ratio) &&
+           m_cfg.sensor_to_mechanism_ratio > 0.0)
+              ? m_cfg.sensor_to_mechanism_ratio
+              : 1.0;
+      const double sensor_rot = (plant.state(0) / kTau) * sensor_to_mech;
+      const double sensor_rps = (plant.state(1) / kTau) * sensor_to_mech;
       sensors_[sensor_idx].encoder->GetSimState().SetRawPosition(
-          units::turn_t{mech_rot});
+          units::turn_t{sensor_rot});
       sensors_[sensor_idx].encoder->GetSimState().SetVelocity(
-          units::turns_per_second_t{mech_rps});
+          units::turns_per_second_t{sensor_rps});
     }
   }
 
@@ -1678,7 +1692,13 @@ void PhoenixBackend::UpdateSimulation(double dt) {
                 : (config_.motors[s_idx].inverted ? -1.0 : 1.0);
         angle = steer_sign * sim_plants_[s_idx].state(0);
         if (has_remote_encoder) {
-          angle += config_.sensors[enc_idx].offset_rot * kTau;
+          const double sensor_to_mech =
+              (std::isfinite(config_.motors[s_idx].sensor_to_mechanism_ratio) &&
+               config_.motors[s_idx].sensor_to_mechanism_ratio > 0.0)
+                  ? config_.motors[s_idx].sensor_to_mechanism_ratio
+                  : 1.0;
+          angle +=
+              (config_.sensors[enc_idx].offset_rot / sensor_to_mech) * kTau;
         }
       }
       const double vx = speed * std::cos(angle);
