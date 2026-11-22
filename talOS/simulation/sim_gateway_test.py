@@ -8,9 +8,11 @@ the case writes itself.
 
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -340,6 +342,114 @@ class SimGatewayStartup(unittest.TestCase):
                 expected_ratio = (y_m / (x_m * x_m + y_m * y_m)) * wheel_radius_m
                 self.assertAlmostEqual(
                     pigeon_vel_rps / drive_vel_rps, expected_ratio, places=5)
+
+    # REQ-DEV-05, REQ-DEV-31
+    def test_pause_realigns_ticks_on_node_clock_without_catchup_burst(self):
+        """After a host pause (SIGSTOP/SIGCONT), sim_gateway drops missed
+        deadlines and aligns the next tick to end + period_us instead of firing
+        a zero-sleep UDP burst; State and Driver Station sample timestamps use
+        the node clock (Poller::now())."""
+        period_us = 10000
+        node_clock = (
+            time.CLOCK_MONOTONIC_RAW
+            if sys.platform == "darwin"
+            else time.CLOCK_MONOTONIC
+        )
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+            config = Path(tmp) / "robot.toml"
+            config.write_text(
+                f'[robot]\nname = "pause_test"\nperiod_us = {period_us}\n'
+                'controller_address = "127.0.0.1"\n'
+                '[subsystems.test.motors.motor]\ncan_id = 1\n',
+                encoding="utf-8")
+            receiver.bind(("127.0.0.1", 0))
+            receiver.settimeout(0.1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                reserve.bind(("127.0.0.1", 0))
+                gateway_port = reserve.getsockname()[1]
+            before_us = time.clock_gettime_ns(node_clock) // 1000
+            with subprocess.Popen(
+                    [str(binary()), "--config", str(config),
+                     "--port", str(gateway_port),
+                     "--remote-port", str(receiver.getsockname()[1]),
+                     "--duration-s", "0.5"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True) as proc:
+                state_samples = []
+                ds_samples = []
+                paused = False
+                try:
+                    for _ in range(200):
+                        try:
+                            packet = receiver.recv(4096)
+                        except socket.timeout:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        frame_type = struct.unpack_from("<H", packet, 12)[0]
+                        if frame_type == 20:
+                            sample_us = struct.unpack_from("<Q", packet, 40 + 24)[0]
+                            state_samples.append(sample_us)
+                            if not paused and len(state_samples) >= 3:
+                                paused = True
+                                os.kill(proc.pid, signal.SIGSTOP)
+                                # Drain any in-flight datagram, then wait out
+                                # 150 ms of UDP silence while SIGSTOPped.
+                                receiver.settimeout(0.15)
+                                while True:
+                                    try:
+                                        in_flight = receiver.recv(4096)
+                                    except socket.timeout:
+                                        break
+                                    ft = struct.unpack_from("<H", in_flight, 12)[0]
+                                    if ft == 20:
+                                        state_samples.append(
+                                            struct.unpack_from("<Q", in_flight, 40 + 24)[0]
+                                        )
+                                    elif ft == 24:
+                                        ds_samples.append(
+                                            struct.unpack_from("<Q", in_flight, 40)[0]
+                                        )
+                                receiver.settimeout(0.1)
+                                os.kill(proc.pid, signal.SIGCONT)
+                        elif frame_type == 24:
+                            sample_us = struct.unpack_from("<Q", packet, 40)[0]
+                            ds_samples.append(sample_us)
+                    stdout, stderr = proc.communicate(timeout=5)
+                finally:
+                    if proc.poll() is None:
+                        try:
+                            os.kill(proc.pid, signal.SIGCONT)
+                        except ProcessLookupError:
+                            pass
+                        proc.kill()
+                        proc.communicate()
+            after_us = time.clock_gettime_ns(node_clock) // 1000
+            self.assertEqual(proc.returncode, 0, stdout + stderr)
+            self.assertTrue(paused, "gateway did not emit initial states")
+            self.assertGreater(len(state_samples), 10)
+            self.assertGreater(len(ds_samples), 2)
+            # Both State and Driver Station timestamps come from Poller::now().
+            for sample_us in state_samples + ds_samples:
+                self.assertGreaterEqual(sample_us, before_us)
+                self.assertLessEqual(sample_us, after_us)
+            gaps = [b - a for a, b in zip(state_samples, state_samples[1:])]
+            pause_indices = [i for i, g in enumerate(gaps) if g >= 100_000]
+            self.assertTrue(
+                pause_indices,
+                f"expected >= 100 ms gap from SIGSTOP, got max {max(gaps)} us",
+            )
+            post_pause_gaps = gaps[pause_indices[0] + 1:]
+            self.assertGreaterEqual(len(post_pause_gaps), 5)
+            # Without realignment, ~15 missed ticks fire back-to-back (< 1 ms
+            # apart). With end + period_us realignment, every post-pause tick
+            # waits its period.
+            self.assertGreaterEqual(
+                min(post_pause_gaps),
+                period_us // 2,
+                f"catch-up burst after host pause: post-pause gaps = {post_pause_gaps[:15]}",
+            )
 
 
 if __name__ == "__main__":

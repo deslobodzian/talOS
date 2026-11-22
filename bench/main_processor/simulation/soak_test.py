@@ -372,23 +372,35 @@ class Soak(unittest.TestCase):
                                             stderr=subprocess.STDOUT,
                                             start_new_session=True)
                 deadline = time.monotonic() + 30
+                manifest_path = None
+                schedule_start_ns = None
                 while time.monotonic() < deadline:
                     manifests = list(output.glob("*/manifest.json"))
                     if manifests:
                         manifest_path = manifests[0]
-                        if self.read_nodes(manifest_path).get(
-                                "sim_gateway", {}).get("pid", 0) > 0:
+                        nodes = self.read_nodes(manifest_path)
+                        start_path = manifest_path.parent / "sim_schedule_start"
+                        # Wait for the launcher's sim_schedule_start anchor
+                        # (written atomically once every non-observer node's
+                        # loop has started) so fault injection shares
+                        # sim_gateway's exact node-clock time zero.
+                        if (nodes.get("sim_gateway", {}).get("pid", 0) > 0 and
+                                start_path.is_file()):
+                            schedule_start_ns = int(start_path.read_text().strip())
                             break
                     self.assertIsNone(launcher.poll(), "launcher exited during startup")
                     time.sleep(0.01)
                 else:
-                    self.fail("gateway never started")
-                anchor = time.monotonic()
+                    self.fail("gateway schedule never started")
 
                 for cycle, (start_s, (action, name)) in enumerate(
                         zip(cycle_starts, order)):
-                    at = anchor + start_s + FAULT_AT_S
-                    time.sleep(max(0, at - time.monotonic()))
+                    at_ns = schedule_start_ns + round((start_s + FAULT_AT_S) * 1e9)
+                    while True:
+                        remaining_s = (at_ns - support.node_clock_ns()) / 1e9
+                        if remaining_s <= 0:
+                            break
+                        time.sleep(remaining_s)
                     self.assertIsNone(launcher.poll(), "launcher exited during soak")
                     nodes = self.read_nodes(manifest_path)
 
