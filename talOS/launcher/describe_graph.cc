@@ -541,10 +541,14 @@ std::string StripTelemetryPrefix(std::string_view message) {
 // binaries are built).
 introspect::DeclaredGraph DeclaredGraphForTelemetry(
     const std::vector<NodeDescription>& described,
-    const std::vector<std::string>& telemetry_names, bool& have_graph) {
+    const std::vector<std::string>& telemetry_names,
+    std::string_view studio_bridge_target, bool& have_graph) {
   auto is_telemetry = [&](std::string_view name) {
     return std::ranges::find(telemetry_names, name) != telemetry_names.end();
   };
+  const std::string_view bridge_suffix = studio_bridge_target.empty()
+                                             ? "//studio/bridge:studio_bridge"
+                                             : studio_bridge_target;
   introspect::DeclaredGraph graph;
   std::size_t answered_other = 0;
   std::size_t unanswered_other = 0;
@@ -552,8 +556,9 @@ introspect::DeclaredGraph DeclaredGraphForTelemetry(
     if (is_telemetry(node.roster_name)) continue;
     const bool is_studio_bridge =
         node.roster_name == kStudioBridgeName &&
-        (node.target.ends_with("//studio/bridge:studio_bridge") ||
-         node.declared.target.ends_with("//studio/bridge:studio_bridge"));
+        (node.target == bridge_suffix || node.target.ends_with(bridge_suffix) ||
+         node.declared.target == bridge_suffix ||
+         node.declared.target.ends_with(bridge_suffix));
     if (!node.answered) {
       if (!is_studio_bridge) ++unanswered_other;
       continue;
@@ -610,8 +615,8 @@ std::vector<naming::Diagnostic> LintTelemetryConfig(
   }
 
   bool have_graph = false;
-  const introspect::DeclaredGraph graph =
-      DeclaredGraphForTelemetry(described, telemetry_subsystems, have_graph);
+  const introspect::DeclaredGraph graph = DeclaredGraphForTelemetry(
+      described, telemetry_subsystems, robot_config.studio.bridge, have_graph);
 
   std::vector<std::vector<telemetry::ChannelDef>> dictionaries;
   for (const std::string& name : telemetry_subsystems) {
@@ -658,6 +663,8 @@ std::vector<naming::Diagnostic> LintTelemetryConfig(
                               StripTelemetryPrefix(error.what())});
         }
       }
+      telemetry::CheckDictionaryChannelCap(dict);
+      static_cast<void>(telemetry::MeasurePages(dict));
       dictionaries.push_back(std::move(dict));
     } catch (const std::exception& error) {
       findings.push_back(

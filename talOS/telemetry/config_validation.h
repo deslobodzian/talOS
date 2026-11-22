@@ -6,7 +6,9 @@
 // construction enforce the exact same rules for `[[subsystem.labels]]`
 // (REQ-OPS-38) and `[studio] dashboard` (REQ-OPS-35, REQ-OPS-39).
 
+#include <cstddef>
 #include <functional>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -80,6 +82,25 @@ void CheckDashboardAgainstDictionary(const DashboardLayout& layout,
 std::vector<std::string> ReadTelemetryGlobParam(
     const config::RobotConfig& config, std::string_view subsystem,
     std::string_view key, std::vector<std::string> fallback);
+
+// Validates and appends one channel to `dictionary` unless excluded by
+// `exclude_globs` (then returns `std::numeric_limits<std::size_t>::max()`).
+// Throws `std::invalid_argument` on duplicate channel name, Studio's reserved
+// `derived/` prefix, or any channel name/unit/label over
+// `telemetry_wire::kMaxDictionaryStringBytes`.
+std::size_t AppendValidatedChannel(
+    std::vector<ChannelDef>& dictionary,
+    const std::vector<std::string>& exclude_globs, std::string name,
+    ChannelKind kind, std::string unit = "",
+    std::vector<std::string> labels = {},
+    AlertLevel alert = Talos::Telemetry::AlertLevel_None);
+
+// Refuses a dictionary past `telemetry_wire::kMaxChannels` (including any
+// `uncounted` excess channels per topic), throwing `std::runtime_error` naming
+// the largest sources.
+void CheckDictionaryChannelCap(
+    const std::vector<ChannelDef>& dictionary,
+    const std::map<std::string, std::size_t>& uncounted = {});
 
 // Builds the telemetry dictionary that `Telemetry::BuildFromGraph` constructs
 // from `graph` under `include_globs` and `exclude_globs` (excluding
