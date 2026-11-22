@@ -327,6 +327,7 @@ class Misreader {
   void on_sensor(const Context&, const EventsTest::OtherSensorMessage&) {}
 };
 
+// REQ-OPS-14
 TEST(InputReplay, RefusesATopicRecordedWithAnotherSchemaBeforeDispatch) {
   static_assert(sizeof(EventsTest::OtherSensorMessage) ==
                 sizeof(EventsTest::SensorMessage));
@@ -340,7 +341,19 @@ TEST(InputReplay, RefusesATopicRecordedWithAnotherSchemaBeforeDispatch) {
       log::LogWriter{TempDir("mismatch_out") + "/misreader.tlog", "misreader"},
       Loop::Options{.start = session.start()}};
   Misreader misreader{loop};
-  EXPECT_THROW(ReplayInputs(loop, environment, session), ReplayError);
+  try {
+    ReplayInputs(loop, environment, session);
+    ADD_FAILURE() << "accepted topic recorded with another schema";
+  } catch (const ReplayError& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find(talos::schema::Of<EventsTest::SensorMessage>().name),
+              std::string::npos)
+        << what;
+    EXPECT_NE(
+        what.find(talos::schema::Of<EventsTest::OtherSensorMessage>().name),
+        std::string::npos)
+        << what;
+  }
   // Refused before anything ran.
   EXPECT_EQ(loop.dispatch_count(), 0u);
   std::filesystem::remove_all(dir);
@@ -3727,6 +3740,41 @@ TEST(InputReplay, WrongPayloadSizeRecordDoesNotCloseOpenStretch) {
   const WatcherRun run = ReplayWatcher(session, out);
   ASSERT_TRUE(run.report.stopped_at_gap.has_value());
   EXPECT_EQ(run.report.stopped_at_gap->damage_offset, roff[1]);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
+}
+
+// Tail-only damage (a truncated final record, as from a power loss) prints a
+// stderr warning naming the log and the tail byte count, and replays the intact
+// prefix without stopping at a gap.
+// REQ-OPS-12
+// REQ-OPS-14
+TEST(InputReplay, TailOnlyDamageWarnsOnStderrNamingLogAndTailBytes) {
+  constexpr std::uint64_t kTailBytes = 10;
+  const std::string dir = TempDir("tail_only_damage");
+  const std::string out = TempDir("tail_only_damage_out");
+  const std::vector<std::uint64_t> offsets = WriterLog(dir);
+  // offsets[0..7] are 4 (TIMER, SEND) pairs; offsets[8] is EXIT. Cut 10 bytes
+  // into the 4th SEND so 3 readings stay intact and 10 damaged bytes remain.
+  ASSERT_EQ(offsets.size(), 9u);
+  const std::string wpath = dir + "/writer.tlog";
+  std::filesystem::resize_file(wpath, offsets[7] + kTailBytes);
+
+  ::testing::internal::CaptureStderr();
+  const RecordedSession session{dir};
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+
+  EXPECT_NE(stderr_text.find("warning:"), std::string::npos) << stderr_text;
+  EXPECT_NE(stderr_text.find(wpath), std::string::npos) << stderr_text;
+  EXPECT_NE(stderr_text.find(std::to_string(kTailBytes) + " bytes"),
+            std::string::npos)
+      << stderr_text;
+  EXPECT_NE(stderr_text.find("its intact records replay"), std::string::npos)
+      << stderr_text;
+
+  const WatcherRun run = ReplayWatcher(session, out);
+  EXPECT_FALSE(run.report.stopped_at_gap.has_value());
+  EXPECT_EQ(run.readings, 3);
   std::filesystem::remove_all(dir);
   std::filesystem::remove_all(out);
 }

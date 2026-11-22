@@ -187,20 +187,48 @@ TEST(Replay, ReRecordingIsByteIdenticalForEveryDeliveryPolicy) {
   }
 }
 
+// REQ-OPS-13
 TEST(Replay, DetectsChangedBehaviour) {
   const std::string path = temp_path("divergence");
   record_run(path, 2.5F);
+
+  // Locate the second control timer dispatch: the first runs with zero error
+  // (position == target == 0), and the second acts on the first non-zero error.
+  std::uint64_t expected_dispatch = 0;
+  {
+    log::LogReader inspect{path};
+    log::LogReader::Record record;
+    int control_ticks = 0;
+    while (inspect.next(record)) {
+      if (static_cast<EventKind>(record.header.kind) == EventKind::TIMER &&
+          ++control_ticks == 2) {
+        expected_dispatch = record.header.dispatch_index;
+        break;
+      }
+    }
+  }
+  ASSERT_GT(expected_dispatch, 0u);
 
   log::LogReader reader{path};
   ReplayEventLoop<> loop{reader};
 
   // Same program, different gain: the first control cycle that acts on a
-  // non-zero error must produce different bytes.
+  // non-zero error must produce different bytes, naming dispatch and topic.
   TestRobot<ReplayEventLoop<>> robot{loop, test_topics(), 9.0F};
   robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
                                        1ms);
 
-  EXPECT_THROW(loop.run(), ReplayDivergence);
+  try {
+    loop.run();
+    ADD_FAILURE() << "replay accepted divergent control output";
+  } catch (const ReplayDivergence& e) {
+    EXPECT_EQ(e.divergence().dispatch_index, expected_dispatch);
+    const std::string what = e.what();
+    EXPECT_NE(what.find("dispatch " + std::to_string(expected_dispatch)),
+              std::string::npos)
+        << what;
+    EXPECT_NE(what.find(test_topics().command), std::string::npos) << what;
+  }
 
   std::remove(path.c_str());
 }
@@ -223,6 +251,7 @@ TEST(Replay, CollectsEveryDivergenceWhenAsked) {
   std::remove(path.c_str());
 }
 
+// REQ-OPS-13
 TEST(Replay, RejectsALogFromADifferentProgram) {
   const std::string path = temp_path("manifest");
   record_run(path, 2.5F);
@@ -358,10 +387,12 @@ TEST(Replay, DetectsAMissingExit) {
   EXPECT_EQ(divergence->dispatch_index, 1u);
 }
 
+// REQ-OPS-13
 TEST(Replay, RejectsChangedOrMissingInitialSchedule) {
   const auto path = temp_path("initial_schedule");
   record_timer_program(path);
   for (int change = 0; change < 3; ++change) {
+    SCOPED_TRACE(change);
     log::LogReader reader{path};
     ReplayEventLoop<> loop{reader};
     TimerProgram program{loop};
@@ -372,7 +403,13 @@ TEST(Replay, RejectsChangedOrMissingInitialSchedule) {
       loop.arm_timer(program.id, MonotonicTime::from_nanos(2'000'000), {});
     }
     if (change == 2) loop.disarm_timer(program.id);
-    EXPECT_THROW(loop.run(), ReplayError) << "change " << change;
+    try {
+      loop.run();
+      ADD_FAILURE() << "replay accepted mismatched initial schedule";
+    } catch (const ReplayError& e) {
+      EXPECT_NE(std::string{e.what()}.find(path), std::string::npos)
+          << e.what();
+    }
   }
   std::remove(path.c_str());
 }
@@ -920,6 +957,7 @@ TEST(Replay, ALogCutDuringConstructionEndsBeforeTheFirstDispatch) {
 // Records lost between intact ones would replay a run the program never
 // made, so exact replay refuses the log (input replay stops at them or
 // refuses them).
+// REQ-OPS-13
 TEST(Replay, RefusesALogMissingADamagedRecord) {
   const std::string path = temp_path("damaged");
   record_run(path, 2.5F);
@@ -943,7 +981,12 @@ TEST(Replay, RefusesALogMissingADamagedRecord) {
   }
 
   log::LogReader reader{path};
-  EXPECT_THROW((ReplayEventLoop<>{reader}), ReplayError);
+  try {
+    ReplayEventLoop<> loop{reader};
+    ADD_FAILURE() << "replay accepted a log missing damaged records";
+  } catch (const ReplayError& e) {
+    EXPECT_NE(std::string{e.what()}.find(path), std::string::npos) << e.what();
+  }
   EXPECT_EQ(reader.damage().spans, 1u);
 
   std::remove(path.c_str());
