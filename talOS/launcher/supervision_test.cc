@@ -2029,7 +2029,11 @@ TEST(Supervision, UnopenableRegistryOrLockFileRefusesLaunchBeforeProbing) {
       const int fd =
           ::shm_open(mapped.c_str(), O_CREAT | O_EXCL | O_RDWR, 0444);
       ASSERT_GE(fd, 0) << std::strerror(errno);
-      ASSERT_EQ(::fchmod(fd, 0444), 0);
+      // Linux applies umask to shm_open; macOS applies none and fchmod refuses
+      // shm descriptors with EINVAL (talOS/introspection/registry.h).
+#ifndef __APPLE__
+      ASSERT_EQ(::fchmod(fd, 0444), 0) << std::strerror(errno);
+#endif
       ::close(fd);
     }
 
