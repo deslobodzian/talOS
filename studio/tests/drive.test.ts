@@ -21,6 +21,7 @@ const LAYOUT = parseLayout(JSON.parse(
 const LINK_LOST = 'hw/status/alert_error_link_lost';
 const PROTOCOL_MISMATCH = 'hw/status/alert_error_protocol_mismatch';
 const OWNER_TIMED_OUT = 'hw/status/alert_warning_owner_timed_out';
+const TELEOP_DISARMED = 'teleop/status/alert_warning_disarmed';
 const ROUTINES = ['preload', 'none', 'shoot_only', 'taxi'];
 
 // The 2026 dictionary as far as the feed carries it: every layout channel
@@ -49,7 +50,8 @@ const CHANNELS: ChannelSpec[] = [
   })),
   {name: LINK_LOST, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
   {name: PROTOCOL_MISMATCH, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
-  {name: OWNER_TIMED_OUT, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Warning}
+  {name: OWNER_TIMED_OUT, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Warning},
+  {name: TELEOP_DISARMED, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Warning}
 ];
 const INDEX = new Map(CHANNELS.map((c, i) => [c.name, i]));
 const DICTIONARY_ID = dictionaryId(CHANNELS);
@@ -572,6 +574,23 @@ test('alerts: active by level as a word, and a 100 ms activation latched', () =>
   const after = widgetHtml(render(h), 'Alerts');
   assert.match(after, /<h3>Active<\/h3><p class="none">none<\/p>/);
   assert.match(after, /<b>hw<\/b> link lost<\/span> <span class="meta">×1<\/span>/);
+});
+
+// REQ-OPS-55: /drive shows why operator control is disarmed, as a warning
+// the alerts widget names by its channel, and clears it once armed.
+test('teleop/status/alert_warning_disarmed = 1 draws a disarmed warning', () => {
+  const h = harness();
+  h.connect(0);
+  h.at(50);
+  h.socket().send(...update(2, {[TELEOP_DISARMED]: 1}, false));
+  const active = widgetHtml(render(h), 'Alerts');
+  assert.ok(active.includes(
+      `<span class="level">WARNING</span> <span class="name" title="${TELEOP_DISARMED}">`),
+      active);
+  assert.ok(!active.includes('<p class="none">none</p>'), active);
+  h.at(150);
+  h.socket().send(...update(3, {[TELEOP_DISARMED]: 0}, false));
+  assert.match(widgetHtml(render(h), 'Alerts'), /<h3>Active<\/h3><p class="none">none<\/p>/);
 });
 
 // REQ-OPS-38: the routine widget names the routine from the dictionary's

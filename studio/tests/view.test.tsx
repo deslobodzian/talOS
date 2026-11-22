@@ -456,5 +456,7 @@ test('a graph version mismatch is named by both versions, never as nothing wrong
          assert.ok(html.includes(`data-page-version="${SYSTEM_GRAPH_VERSION}"`), def.id);
          if (def === healthPanel)
            assert.ok(html.includes('data-code="graph-version-mismatch"'));
+         // Named, not marked stale: no graph is held to be stale.
+         assert.ok(!/stale/i.test(html), `${def.id} flags a stale graph`);
        }
      });

@@ -235,7 +235,7 @@ py_test(
     deps = [":bridge_client"],
 )
 
-# Runs the bridge at its smallest idle timeout (8 s), so it takes about 9 s.
+# Runs the bridge at its default idle timeout (16 s), so it takes about 18 s.
 py_test(
     name = "client_timeout_test",
     size = "medium",
