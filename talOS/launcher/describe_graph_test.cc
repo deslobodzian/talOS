@@ -409,6 +409,37 @@ from = "autonomous.routines"
     EXPECT_TRUE(findings.empty());
   }
 
+  // Dictionary-page overflow from an oversized [[subsystem.labels]] array
+  // (500 labels x 40 bytes exceeds the 16 KiB dictionary page) must be refused
+  // in --describe-only rather than slipping through to non-critical runtime.
+  {
+    std::string big_names = "[";
+    for (int i = 0; i < 500; ++i) {
+      if (i > 0) big_names += ", ";
+      big_names +=
+          "\"label_" + std::to_string(i) + "_" + std::string(32, 'x') + "\"";
+    }
+    big_names += "]";
+    const std::string cfg_text =
+        "[robot]\nname = \"r\"\n"
+        "[subsystems.auto]\nnode = \"//example/auto:node\"\n"
+        "routines = " +
+        big_names +
+        "\n"
+        "[subsystems.telemetry]\nnode = \"//talOS/telemetry:node\"\n"
+        "[[subsystems.telemetry.labels]]\n"
+        "channel = \"shooter/status/routine_index\"\n"
+        "from = \"auto.routines\"\n";
+    const auto cfg = config::ParseRobotConfigString(cfg_text);
+    const auto findings = LintTelemetryConfig(cfg, described);
+    ASSERT_EQ(findings.size(), 1u);
+    EXPECT_EQ(findings[0].severity, naming::Severity::ERROR);
+    EXPECT_EQ(findings[0].subject, "telemetry");
+    EXPECT_NE(findings[0].message.find("shooter/status/routine_index"),
+              std::string::npos)
+        << findings[0].message;
+  }
+
   std::filesystem::remove_all(dir);
 }
 

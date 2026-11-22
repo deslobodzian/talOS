@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
+#include <limits>
+#include <map>
 #include <ranges>
 #include <set>
 #include <stdexcept>
@@ -29,20 +32,76 @@ constexpr std::string_view kReadmeHint = " (see talOS/telemetry/README.md)";
                               " " + why + std::string{kReadmeHint});
 }
 
-void AppendChannel(std::vector<ChannelDef>& dictionary,
-                   const std::vector<std::string>& exclude_globs,
-                   std::string name, ChannelKind kind, std::string unit = "",
-                   std::vector<std::string> labels = {},
-                   AlertLevel alert = Talos::Telemetry::AlertLevel_None) {
-  if (MatchesAnyGlob(name, exclude_globs)) return;
-  for (const ChannelDef& existing : dictionary) {
-    if (existing.name == name) return;
+}  // namespace
+
+std::size_t AppendValidatedChannel(
+    std::vector<ChannelDef>& dictionary,
+    const std::vector<std::string>& exclude_globs, std::string name,
+    ChannelKind kind, std::string unit, std::vector<std::string> labels,
+    AlertLevel alert) {
+  if (MatchesAnyGlob(name, exclude_globs)) {
+    return std::numeric_limits<std::size_t>::max();
   }
+  for (const ChannelDef& existing : dictionary) {
+    if (existing.name == name) {
+      throw std::invalid_argument("telemetry: duplicate channel '" + name +
+                                  "'");
+    }
+  }
+  if (name.starts_with("derived/")) {
+    throw std::invalid_argument("telemetry: channel '" + name +
+                                "' is in Studio's reserved derived/ namespace" +
+                                std::string{kReadmeHint});
+  }
+  const auto check_length = [&name](std::string_view what,
+                                    std::string_view text) {
+    if (text.size() > telemetry_wire::kMaxDictionaryStringBytes) {
+      throw std::invalid_argument(
+          "telemetry: channel '" + name + "' " + std::string{what} + " is " +
+          std::to_string(text.size()) + " bytes, over the " +
+          std::to_string(telemetry_wire::kMaxDictionaryStringBytes) +
+          "-byte dictionary string limit" + std::string{kReadmeHint});
+    }
+  };
+  check_length("name", name);
+  check_length("unit", unit);
+  for (const std::string& label : labels) check_length("label", label);
   dictionary.push_back(ChannelDef{std::move(name), std::move(unit),
                                   std::move(labels), kind, alert});
+  return dictionary.size() - 1;
 }
 
-}  // namespace
+void CheckDictionaryChannelCap(
+    const std::vector<ChannelDef>& dictionary,
+    const std::map<std::string, std::size_t>& uncounted) {
+  std::size_t total = dictionary.size();
+  for (const auto& [topic, count] : uncounted) total += count;
+  if (total <= telemetry_wire::kMaxChannels) return;
+  std::map<std::string, std::size_t> per_topic = uncounted;
+  for (const ChannelDef& channel : dictionary) {
+    const std::size_t owner = channel.name.find('/');
+    const std::size_t role = owner == std::string::npos
+                                 ? std::string::npos
+                                 : channel.name.find('/', owner + 1);
+    ++per_topic[channel.name.substr(0, role)];
+  }
+  std::vector<std::pair<std::size_t, std::string>> largest;
+  largest.reserve(per_topic.size());
+  for (const auto& [topic, count] : per_topic) {
+    largest.emplace_back(count, topic);
+  }
+  std::sort(largest.begin(), largest.end(), std::greater<>{});
+  std::string names;
+  for (std::size_t i = 0; i < largest.size() && i < 3; ++i) {
+    if (i != 0) names += ", ";
+    names += largest[i].second + " (" + std::to_string(largest[i].first) + ")";
+  }
+  throw std::runtime_error(
+      "telemetry: " + std::to_string(total) + " channels, over the " +
+      std::to_string(telemetry_wire::kMaxChannels) +
+      "-channel cap; largest sources: " + names +
+      "; exclude channels in telemetry.toml" + std::string{kReadmeHint});
+}
 
 bool MatchesAnyGlob(std::string_view name,
                     const std::vector<std::string>& patterns) {
@@ -291,8 +350,8 @@ std::vector<ChannelDef> BuildTelemetryDictionary(
     const std::vector<std::string>& include_globs,
     const std::vector<std::string>& exclude_globs) {
   std::vector<ChannelDef> dictionary;
-  AppendChannel(dictionary, exclude_globs, "pose/valid",
-                Talos::Telemetry::ChannelKind_Bool);
+  AppendValidatedChannel(dictionary, exclude_globs, "pose/valid",
+                         Talos::Telemetry::ChannelKind_Bool);
 
   std::set<std::string> seen_topics;
   for (const auto& node_desc : graph) {
@@ -308,8 +367,9 @@ std::vector<ChannelDef> BuildTelemetryDictionary(
 
       if (source.name == "/hw/state/driver_station") {
         for (const Channel& channel : DriverStationChannels()) {
-          AppendChannel(dictionary, exclude_globs, channel.name, channel.kind,
-                        channel.unit, channel.labels, channel.alert);
+          AppendValidatedChannel(dictionary, exclude_globs, channel.name,
+                                 channel.kind, channel.unit, channel.labels,
+                                 channel.alert);
         }
       } else if (!source.bfbs.empty()) {
         FlattenOptions options;
@@ -321,9 +381,10 @@ std::vector<ChannelDef> BuildTelemetryDictionary(
         std::vector<Channel> channels =
             FlattenTopic(source.name, source.schema, source.bfbs, options);
         for (Channel& channel : channels) {
-          AppendChannel(dictionary, exclude_globs, std::move(channel.name),
-                        channel.kind, std::move(channel.unit),
-                        std::move(channel.labels), channel.alert);
+          AppendValidatedChannel(dictionary, exclude_globs,
+                                 std::move(channel.name), channel.kind,
+                                 std::move(channel.unit),
+                                 std::move(channel.labels), channel.alert);
         }
       }
     }

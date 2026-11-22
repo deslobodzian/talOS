@@ -272,76 +272,16 @@ class Telemetry {
                          std::string unit = "",
                          std::vector<std::string> labels = {},
                          AlertLevel alert = Talos::Telemetry::AlertLevel_None) {
-    if (MatchesAnyGlob(name, exclude_globs_)) {
-      return std::numeric_limits<std::size_t>::max();
-    }
-    for (const ChannelDef& existing : dictionary_) {
-      if (existing.name == name) {
-        throw std::invalid_argument("telemetry: duplicate channel '" + name +
-                                    "'");
-      }
-    }
-    // Studio refuses a whole dictionary over one channel it cannot decode,
-    // blanking the stream; refuse that channel here instead, by name, so it
-    // can be excluded. EnumLabels (channels.h) keeps label counts within the
-    // limit.
-    if (name.starts_with("derived/")) {
-      throw std::invalid_argument(
-          "telemetry: channel '" + name +
-          "' is in Studio's reserved derived/ namespace (see "
-          "talOS/telemetry/README.md)");
-    }
-    const auto check_length = [&name](std::string_view what,
-                                      std::string_view text) {
-      if (text.size() > telemetry_wire::kMaxDictionaryStringBytes) {
-        throw std::invalid_argument(
-            "telemetry: channel '" + name + "' " + std::string{what} + " is " +
-            std::to_string(text.size()) + " bytes, over the " +
-            std::to_string(telemetry_wire::kMaxDictionaryStringBytes) +
-            "-byte dictionary string limit (see talOS/telemetry/README.md)");
-      }
-    };
-    check_length("name", name);
-    check_length("unit", unit);
-    for (const std::string& label : labels) check_length("label", label);
-    dictionary_.push_back(ChannelDef{std::move(name), std::move(unit),
-                                     std::move(labels), kind, alert});
-    return dictionary_.size() - 1;
+    return AppendValidatedChannel(dictionary_, exclude_globs_, std::move(name),
+                                  kind, std::move(unit), std::move(labels),
+                                  alert);
   }
 
   // Studio's bridge sends a client an update only whole, so the largest one,
   // a keyframe of every channel, must fit its burst: refuse a dictionary past
   // kMaxChannels, naming the topics with the most channels to exclude.
   void CheckChannelCap() const {
-    std::size_t total = dictionary_.size();
-    for (const auto& [topic, count] : uncounted_) total += count;
-    if (total <= telemetry_wire::kMaxChannels) return;
-    std::map<std::string, std::size_t> per_topic = uncounted_;
-    for (const ChannelDef& channel : dictionary_) {
-      const std::size_t owner = channel.name.find('/');
-      const std::size_t role = owner == std::string::npos
-                                   ? std::string::npos
-                                   : channel.name.find('/', owner + 1);
-      ++per_topic[channel.name.substr(0, role)];
-    }
-    std::vector<std::pair<std::size_t, std::string>> largest;
-    largest.reserve(per_topic.size());
-    for (const auto& [topic, count] : per_topic) {
-      largest.emplace_back(count, topic);
-    }
-    std::sort(largest.begin(), largest.end(), std::greater<>{});
-    std::string names;
-    for (std::size_t i = 0; i < largest.size() && i < 3; ++i) {
-      if (i != 0) names += ", ";
-      names +=
-          largest[i].second + " (" + std::to_string(largest[i].first) + ")";
-    }
-    throw std::runtime_error("telemetry: " + std::to_string(total) +
-                             " channels, over the " +
-                             std::to_string(telemetry_wire::kMaxChannels) +
-                             "-channel cap; largest sources: " + names +
-                             "; exclude channels in telemetry.toml (see "
-                             "talOS/telemetry/README.md)");
+    CheckDictionaryChannelCap(dictionary_, uncounted_);
   }
 
   // Pages the dictionary once, which throws, naming the channel, when one
