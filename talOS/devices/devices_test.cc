@@ -211,6 +211,61 @@ TEST(Devices, MotorsAreNeutralUntilEnabledAndEchoTheStateIdentity) {
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
 }
 
+// REQ-SAFE-02: robot_enabled() is false and every motor command goes out
+// neutral when the gateway is not configured (even with kEnabled) or has a
+// hardware fault latched (even with kConfigured | kEnabled).
+TEST(Devices, UnconfiguredOrFaultedStateForcesNeutralEvenWhenEnabled) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  Node& node = sim.node("mech");
+  const std::uint64_t id = hardware::ConfigurationId(
+      node.extension<HardwareLink>().config().hardware);
+  mech.a_velocity = 12.5;
+
+  const auto publish = [&](std::uint64_t sample_time_us, std::uint32_t flags) {
+    hardware::State state{};
+    state.config_id = id;
+    state.boot_id = 7;
+    state.sample_time_us = sample_time_us;
+    state.flags = flags;
+    Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
+    sim.publish(hardware::kStateTopic, packet);
+    sim.step(5ms);
+  };
+
+  publish(1000, hardware::kConfigured | hardware::kEnabled);
+  ASSERT_TRUE(robot_enabled(node));
+  ASSERT_TRUE(mech.enabled_in_update);
+  auto command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  ASSERT_EQ(command->motors[0].mode, Mode::kVelocity);
+
+  publish(2000, hardware::kEnabled);  // missing kConfigured
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(mech.enabled_in_update);
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(command->motors[0].demand, 0.0);
+
+  publish(3000, hardware::kConfigured | hardware::kEnabled);
+  ASSERT_TRUE(robot_enabled(node));
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  ASSERT_EQ(command->motors[0].mode, Mode::kVelocity);
+
+  publish(4000, hardware::kConfigured | hardware::kEnabled |
+                    hardware::kHardwareFault);
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(mech.enabled_in_update);
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(command->motors[0].demand, 0.0);
+}
+
 // REQ-SAFE-02
 TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   auto sim = Sim::FromToml(kRobotToml);
@@ -749,6 +804,7 @@ TEST(Devices, RezeroRefusesAPositionOlderThanTwoStatusPeriods) {
   EXPECT_DOUBLE_EQ(mech.b.position(), 1);
 }
 
+// REQ-SAFE-05
 // A zero holds only in the hardware frame it was taken in: a node restart
 // (a new node) starts unzeroed, a disconnect keeps it, a reset seen in
 // consecutive gateway States drops only the zero of the device it masked
@@ -800,11 +856,13 @@ TEST(Devices, RezeroIsDroppedWhenTheHardwareFrameMayHaveRestarted) {
   EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0);
 }
 
+// REQ-SAFE-05
 // Position goals need a frame no reset has restarted. A rotor-feedback motor
 // has none until the node rezeroes it: never zeroed, or after a reset drops
-// the zero (its own, then an unattributable one in States that were lost);
-// other modes drive regardless. A remote CANcoder's absolute frame drives
-// from the first state and keeps its zero through its own reset.
+// the zero (its own, then an unattributable one in States that were lost, or a
+// gateway reboot); other modes drive regardless. A remote CANcoder's absolute
+// frame drives from the first state and keeps its zero through its own reset
+// and a gateway reboot.
 TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
   struct Positioner {
     explicit Positioner(Node& n) : absolute{n, "a"}, rotor{n, "b"} {
@@ -812,14 +870,20 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
     }
     void update() {
       absolute.set_position(0.25);
-      if (rotor_voltage) {
-        rotor.set_voltage(3);
-      } else {
-        rotor.set_motion_magic(1);
+      switch (rotor_mode) {
+        case Mode::kVoltage:
+          rotor.set_voltage(3);
+          break;
+        case Mode::kPosition:
+          rotor.set_position(1);
+          break;
+        default:
+          rotor.set_motion_magic(1);
+          break;
       }
     }
     Motor absolute, rotor;
-    bool rotor_voltage = false;
+    Mode rotor_mode = Mode::kMotionMagic;
   };
   std::string toml{kRobotToml};
   toml.insert(toml.find("can_id = 1\n") + 11,
@@ -833,13 +897,20 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kPosition);
-  mech.rotor_voltage = true;
+  mech.rotor_mode = Mode::kPosition;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  mech.rotor_mode = Mode::kVoltage;
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kVoltage);
-  mech.rotor_voltage = false;
 
   mech.rotor.rezero();
   mech.absolute.rezero(-1);
+  mech.rotor_mode = Mode::kPosition;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kPosition);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "b").demand, 4);
+  mech.rotor_mode = Mode::kMotionMagic;
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "b").demand, 4);
@@ -849,7 +920,13 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
   ASSERT_TRUE(mech.rotor.connected());
   EXPECT_FALSE(mech.rotor.zeroed());
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  mech.rotor_mode = Mode::kPosition;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
   mech.rotor.rezero();
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kPosition);
+  mech.rotor_mode = Mode::kMotionMagic;
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
 
@@ -865,6 +942,17 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
   mech.rotor.rezero();
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
+
+  hw.reboot();
+  sim.step(10ms);
+  EXPECT_FALSE(mech.rotor.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  mech.rotor_mode = Mode::kPosition;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  EXPECT_TRUE(mech.absolute.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kPosition);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 1.25);
 }
 
 TEST(Devices, NonFiniteDemandIsNeutral) {
@@ -1032,6 +1120,118 @@ TEST(Devices, AcceptStateRejectsAnotherConfigAndStaleSamples) {
   sim.publish(hardware::kStateTopic, StatePacket(id, 2000, false));
   sim.step(2ms);
   EXPECT_FALSE(robot_enabled(node));
+}
+
+// REQ-SAFE-11: HardwareLink orders States only within one gateway boot: a new
+// boot restarts ordering and drops non-absolute zeros, a recently retired
+// boot's delayed State is ignored without rolling back boot_id or wiping
+// motor/gyro zeros, and a wrong-config State never retires the current boot.
+TEST(Devices, HardwareStateFollowsAGatewayRebootAndIgnoresRetiredBoots) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  Node& node = sim.node("mech");
+  const auto& hw_cfg = node.extension<HardwareLink>().config().hardware;
+  const std::uint64_t id = hardware::ConfigurationId(hw_cfg);
+  std::uint16_t a_id = 0;
+  std::uint16_t b_id = 0;
+  std::uint16_t gyro_id = 0;
+  for (const auto& m : hw_cfg.motors) {
+    if (m.name == "a") a_id = m.id;
+    if (m.name == "b") b_id = m.id;
+  }
+  for (const auto& s : hw_cfg.sensors) {
+    if (s.name == "gyro") gyro_id = s.id;
+  }
+  ASSERT_NE(a_id, 0u);
+  ASSERT_NE(b_id, 0u);
+  ASSERT_NE(gyro_id, 0u);
+
+  const auto publish = [&](std::uint64_t config_id, std::uint64_t boot_id,
+                           std::uint64_t sample_time_us, std::uint32_t flags) {
+    hardware::State state{};
+    state.config_id = config_id;
+    state.boot_id = boot_id;
+    state.sample_time_us = sample_time_us;
+    state.flags = flags;
+    state.motor_count = 2;
+    state.motors[0] = {.id = a_id, .valid = true, .position_rot = 1.0};
+    state.motors[1] = {.id = b_id, .valid = true, .position_rot = 3.0};
+    state.sensor_count = 1;
+    state.sensors[0] = {.id = gyro_id, .valid = true, .position_rot = 0.25};
+    Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
+    sim.publish(hardware::kStateTopic, packet);
+    sim.step(5ms);
+  };
+
+  constexpr std::uint32_t kEnabledFlags =
+      hardware::kConfigured | hardware::kEnabled;
+  constexpr std::uint64_t kBootA = 0xA1;
+  constexpr std::uint64_t kBootB = 0xB1;
+  constexpr std::uint64_t kBootC = 0xC1;
+
+  publish(id, kBootA, 900'000'000, kEnabledFlags);
+  ASSERT_TRUE(robot_enabled(node));
+  auto command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  ASSERT_EQ(command->boot_id, kBootA);
+  mech.b.rezero();
+  mech.gyro.rezero();
+  ASSERT_TRUE(mech.b.zeroed());
+  ASSERT_TRUE(mech.gyro.zeroed());
+
+  // Genuine reboot into boot B (clock restarted low): accepted, drops A's
+  // zeros, and retires A.
+  publish(id, kBootB, 1000, kEnabledFlags);
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->boot_id, kBootB);
+  EXPECT_EQ(command->observed_time_us, 1000u);
+  EXPECT_FALSE(mech.b.zeroed());
+  EXPECT_FALSE(mech.gyro.zeroed());
+
+  // Establish new zeros in boot B.
+  mech.b.rezero();
+  mech.gyro.rezero();
+  ASSERT_TRUE(mech.b.zeroed());
+  ASSERT_TRUE(mech.gyro.zeroed());
+
+  // A delayed State from retired boot A must be ignored: boot_id stays B,
+  // enabled stays true, and boot B's motor/gyro zeros are preserved.
+  publish(id, kBootA, 900'020'000, hardware::kConfigured);
+  EXPECT_TRUE(robot_enabled(node));
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->boot_id, kBootB);
+  EXPECT_EQ(command->observed_time_us, 1000u);
+  EXPECT_TRUE(mech.b.zeroed());
+  EXPECT_TRUE(mech.gyro.zeroed());
+
+  // Ordering still holds within boot B: duplicate/older ignored, newer taken.
+  publish(id, kBootB, 1000, hardware::kConfigured);
+  publish(id, kBootB, 500, hardware::kConfigured);
+  EXPECT_TRUE(robot_enabled(node));
+  publish(id, kBootB, 2000, kEnabledFlags);
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->boot_id, kBootB);
+  EXPECT_EQ(command->observed_time_us, 2000u);
+  EXPECT_TRUE(mech.b.zeroed());
+  EXPECT_TRUE(mech.gyro.zeroed());
+
+  // A State from another config_id with a fresh boot_id is rejected and never
+  // retires boot B.
+  publish(id + 1, kBootC, 500, kEnabledFlags);
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->boot_id, kBootB);
+  EXPECT_TRUE(mech.b.zeroed());
+  publish(id, kBootB, 3000, kEnabledFlags);
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->boot_id, kBootB);
+  EXPECT_EQ(command->observed_time_us, 3000u);
 }
 
 TEST(Devices, FirstDrainCannotReviveOldHardwareOrDriverStationState) {
@@ -1787,6 +1987,7 @@ TEST(Devices, DriverStationRejectsReorderedSampleAndModeTimes) {
   EXPECT_EQ(pilot.packets, 2);
 }
 
+// REQ-SAFE-11
 // A RoboRIO reboot restarts the gateway clock: boot B's sample and mode times
 // start low where boot A's were high. A running consumer takes B's packets
 // at once (no restart), keeps ordering within B, and never goes back to A,
@@ -1846,6 +2047,44 @@ TEST(Devices, DriverStationFollowsAGatewayRebootAndRetiresTheOldBoot) {
   sim.step(150ms);  // past [robot] command_timeout_us
   EXPECT_FALSE(pilot.ds.connected());
   EXPECT_FALSE(pilot.ds.enabled());
+}
+
+// REQ-RT-19: a Driver Station listener wakes a timed node on publication
+// rather than waiting for its next periodic update() tick.
+TEST(Devices, DriverStationListenerWakesATimedNodeOnPublish) {
+  struct TimedPilot {
+    explicit TimedPilot(Node& n)
+        : node{n}, ds{n, [this] { packet_time = node.now(); }} {}
+    void update() { ++updates; }
+    Node& node;
+    DriverStation ds;
+    std::optional<Time> packet_time;
+    int updates = 0;
+  };
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+[subsystems.watcher.digital_inputs.switch]
+dio = 3
+)");
+  auto& pilot = sim.add<TimedPilot>("watcher");
+  const Time origin = sim.now();
+  sim.step(2ms);
+  const int updates_at_2ms = pilot.updates;
+  ASSERT_EQ(pilot.packet_time, std::nullopt);
+
+  const auto data = TeleopStick();
+  Packet packet{};
+  packet.size =
+      static_cast<std::uint32_t>(driver_station::Encode(data, packet.data));
+  sim.publish(hardware::kDriverStationTopic, packet);
+  sim.step(1ms);  // 3 ms, well before the 10 ms update()
+
+  EXPECT_EQ(pilot.updates, updates_at_2ms);
+  ASSERT_TRUE(pilot.packet_time.has_value());
+  EXPECT_EQ(*pilot.packet_time - origin, 2ms);
+  EXPECT_TRUE(pilot.ds.teleop());
 }
 
 }  // namespace

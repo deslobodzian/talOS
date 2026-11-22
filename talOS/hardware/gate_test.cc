@@ -23,6 +23,7 @@ State TestState() {
   return state;
 }
 
+// REQ-SAFE-11
 TEST(GateTest, AcceptStateRejectsOtherConfigAndStaleSamplesOfOneBoot) {
   const State prev = TestState();
   // The first sample is gated on the config id only; zero accepts any.
@@ -44,9 +45,15 @@ TEST(GateTest, AcceptStateRejectsOtherConfigAndStaleSamplesOfOneBoot) {
   State newer = TestState();
   newer.sample_time_us = 1001;
   EXPECT_TRUE(AcceptState(true, prev, 7, newer));
-  // A new boot restarts the clock.
+  // A new boot restarts the clock; a recently retired boot is ignored even
+  // with a newer timestamp and matching (or wildcard) config id.
   older.boot_id = 4;
-  EXPECT_TRUE(AcceptState(true, prev, 7, older));
+  EXPECT_TRUE(AcceptState(true, prev, 7, older, /*boot_retired=*/false));
+  State retired = TestState();
+  retired.boot_id = 2;
+  retired.sample_time_us = 2000;
+  EXPECT_FALSE(AcceptState(true, prev, 7, retired, /*boot_retired=*/true));
+  EXPECT_FALSE(AcceptState(true, prev, 0, retired, /*boot_retired=*/true));
 }
 
 // REQ-SAFE-22

@@ -30,11 +30,13 @@ namespace talos::hardware {
 
 // Whether `next` should replace the last accepted state. Every sample is
 // dropped when it carries another config id (zero accepts any, for standalone
-// and simulation runs); beyond that, the first sample is accepted and later
+// and simulation runs) or comes from a recently retired gateway boot
+// (BootHistory::retired); beyond that, the first sample is accepted and later
 // ones must not be stale or duplicate samples from the same boot.
 inline bool AcceptState(bool have_prev, const State& prev, uint64_t config_id,
-                        const State& next) {
+                        const State& next, bool boot_retired = false) {
   if (config_id != 0 && next.config_id != config_id) return false;
+  if (boot_retired) return false;
   if (have_prev && next.boot_id == prev.boot_id &&
       next.sample_time_us <= prev.sample_time_us)
     return false;
