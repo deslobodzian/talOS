@@ -586,8 +586,9 @@ simulated gateway, the Studio bridge: none declares `holds_stop`; a
 framework node holds it) would die of a signal the launcher did not send,
 ending the session 255 and the unit failed. launchd
 needs no such setting: stopping the job (`launchctl bootout`) sends SIGTERM
-to the launcher's process alone, SIGKILL after its `ExitTimeOut` (not set
-in the plist, so launchd's system-defined default; `man launchd.plist`),
+to the launcher's process alone, SIGKILL after `ExitTimeOut` (90 s, set
+explicitly in the plist to match systemd's `TimeoutStopSec=90` rather than
+relying on launchd's system-defined default; `man launchd.plist`),
 and when the launcher exits kills only the launcher's own process group,
 which no member is in.
 
