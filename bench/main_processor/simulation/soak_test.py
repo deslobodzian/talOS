@@ -230,9 +230,15 @@ def fault_order(teleop1_cycles, auto_cycles, teleop2_cycles, rng):
     teleop1_order.extend(pool[idx:idx + need_t1])
     idx += need_t1
     need_auto_extra = auto_cycles - len(auto_faults)
-    auto_order = list(auto_faults) + pool[idx:idx + need_auto_extra]
-    idx += need_auto_extra
-    rng.shuffle(auto_order)
+    # Keep auto_faults within the first batch so long soaks (>= 210 s) preserve
+    # per-batch stratification (one fault kind per len(FAULTS) cycles).
+    first_auto_extra = min(need_auto_extra, len(FAULTS) - len(auto_faults))
+    auto_first = list(auto_faults) + pool[idx:idx + first_auto_extra]
+    idx += first_auto_extra
+    rng.shuffle(auto_first)
+    rem_auto = need_auto_extra - first_auto_extra
+    auto_order = auto_first + pool[idx:idx + rem_auto]
+    idx += rem_auto
     teleop2_order = pool[idx:idx + teleop2_cycles]
     return teleop1_order + auto_order + teleop2_order
 

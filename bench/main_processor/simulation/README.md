@@ -27,7 +27,7 @@ prints.
 
 It runs `TALOS_SOAK_SECONDS` (3 to 600; the test refuses more, so a run fits
 Bazel's 900 s `long` timeout) of enabled 3 s cycles framed by 2 s disabled
-lead/tail legs. For runs of four or more cycles (including 36 s in prepush and
+lead/tail legs. For runs of four or more cycles (including 42 s in prepush and
 180 s in CI), the schedule passes through an initial teleop leg, a 1 s disabled
 transition, an autonomous leg (~20% of enabled time, at least 6 s, or 9 s at
 36 s+), a 1 s disabled transition, and the remaining teleop leg. During teleop
