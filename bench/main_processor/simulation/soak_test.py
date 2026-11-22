@@ -1,25 +1,25 @@
 """Soak the bench's simulated graph for minutes while killing and stalling nodes.
 
 The subject is testdata/robot_soak.toml (built on bench/main_processor/configuration/
-robot.toml): two 5 ms C++ actuator owners (swerve_module and motor), the
-framework teleop node (the operator producer of both teleop lanes, with
-OperatorArming), the test-only C++ auto_producer node (20 ms, producing both
-autonomous lanes), the Python gyro observer, telemetry, the hardware bridge,
-and the Studio bridge (--start-studio-bridge, every [studio] key at its
-default: the bridge target, the webroot under bazel-bin/ of the working
-directory, and the telemetry topic).
+robot.toml): two 5 ms C++ actuator owners (swerve_module and motor), a test-only
+20 ms Python actuator owner (python_motor), the framework teleop node (the
+operator producer of all three teleop lanes, with OperatorArming), the test-only
+C++ auto_producer node (20 ms, producing all three autonomous lanes), the Python
+gyro observer, telemetry, the hardware bridge, and the Studio bridge
+(--start-studio-bridge, every [studio] key at its default: the bridge target,
+the webroot under bazel-bin/ of the working directory, and the telemetry topic).
 
 The scripted Driver Station runs TALOS_SOAK_SECONDS of enabled 3 s cycles
 (default 180, at most 600 so the run fits Bazel's long timeout) framed by
 disabled lead/tail legs (2 s each). Whenever at least four cycles run (including
-36 s in prepush and 180 s in CI), the schedule passes through an initial teleop
+48 s in prepush and 180 s in CI), the schedule passes through an initial teleop
 leg, a 1 s disabled transition, an autonomous leg (~20% of enabled time, at
 least 6 s, or 9 s at 36 s+), a 1 s disabled transition, and the remaining teleop
 leg. During teleop cycles the stick is centred for the first 0.5 s and driving
 the rest (swerve hold-to-run button 6 and drive axis 5 at -0.6, deadband-rescaled
-to ~5.56 rps, and motor voltage axis 1 at -0.6, deadband-rescaled to ~1.11 V);
-during autonomous auto_producer drives swerve at 4.0 rps and motor in velocity
-mode at 8.0 rps.
+to ~5.56 rps, and motor/python_motor voltage axis 1 at -0.6, deadband-rescaled
+to ~1.11 V); during autonomous auto_producer drives swerve at 4.0 rps and both
+motor and python_motor in velocity mode at 8.0 rps.
 
 Each cycle, 1.8 s in, one fault is injected into a running process.
 The first cycle's fault is always the owner restart under a frozen producer:
@@ -41,9 +41,10 @@ crash is the instant the launcher reaped it (the manifest run's
 end_wall_ns, mapped to the node clock at the kill): after the death, before
 the restart's spawn.
 
-- both 5 ms C++ actuator owners' /hw/request gaps stay within their bridge
-  owner timeout except across a fault injected into that node, and a killed or
-  stalled owner sends again within RESTART_LIMIT_MS;
+- all three actuator owners' (two 5 ms C++ owners and the 20 ms Python owner)
+  /hw/request gaps stay within their bridge owner timeout except across a fault
+  injected into that node, and a killed or stalled owner sends again within
+  RESTART_LIMIT_MS;
 - swerve_module, restarted under the frozen producer, sends more than five
   requests before the producer resumes, all neutral from the first and at
   most RESTARTED_GAP_MS apart. The lane's newest target (the frozen producer's
@@ -55,9 +56,10 @@ the restart's spawn.
   too slow for that fails the run as no evidence. The run prints the restart
   latency and that target's age;
 - across mode-generation handoffs (teleop -> disabled -> autonomous -> disabled
-  -> teleop), both swerve_module and motor produce active auto-driven actuation
-  during the autonomous leg (with no teleop leakage) and active teleop-driven
-  actuation in both teleop legs (with no auto leakage);
+  -> teleop), all three actuator owners (swerve_module, motor, python_motor)
+  produce sustained active auto-driven actuation during the autonomous leg (with
+  no teleop leakage) and sustained active teleop-driven actuation in both teleop
+  legs (with no auto leakage);
 - the launcher exits 0, nothing is quarantined, and each node's restart_count
   equals the number of times it was killed (300 ms stalls stay below the
   500 ms progress floor and must not restart or quarantine a node).
@@ -118,6 +120,7 @@ TELEOP_DRIVE_RPS = (0.6 - 0.1) / (1.0 - 0.1) * 10.0  # ~5.56 rps
 TELEOP_MOTOR_V = (0.6 - 0.1) / (1.0 - 0.1) * 2.0  # ~1.11 V
 
 DRIVE = "swerve_module"  # the C++ owner whose lane the frozen-kill check follows
+PY_MOTOR = "python_motor"  # the 20 ms Python actuator owner
 PRODUCER = "teleop"  # the operator producer of every teleop lane
 AUTO_PRODUCER = "auto_producer"  # the test-only autonomous target producer
 # The first cycle's fault: SIGSTOP the producer, SIGKILL the owner, resume
@@ -137,10 +140,12 @@ FAULTS = [
     ("kill", "motor"),
     ("kill", "hardware_node"),
     ("stop", "motor"),
+    ("kill", PY_MOTOR),
+    ("stop", PY_MOTOR),
     ("kill", AUTO_PRODUCER),
     ("stop", AUTO_PRODUCER),
 ]
-OWNERS = (DRIVE, "motor")
+OWNERS = (DRIVE, "motor", PY_MOTOR)
 NEUTRAL = support.NEUTRAL
 
 
@@ -317,15 +322,14 @@ class Soak(unittest.TestCase):
             sub = support.tomllib.loads(subsystem_files[name].read_text())
             period_ms[name] = sub["subsystem"].get("period_us", robot["period_us"]) / 1000
             owner_timeout[name] = min(max(2 * period_ms[name], timeout_ms / 2), timeout_ms)
-        # robot_soak.toml includes robot.toml and adds only auto_producer
-        # (no hardware devices), so the device layout is robot.toml's.
-        layout = support.device_layout(root / "bench/main_processor/configuration/robot.toml")
+        layout = support.device_layout(config)
         motor_ids = {name: [i for i, sub, _, kind in layout
                             if sub == name and kind == "motors"] for name in OWNERS}
         drive_ids = [i for i, sub, name, kind in layout
                      if sub == DRIVE and kind == "motors" and name == "drive"]
         self.assertEqual(len(drive_ids), 1, layout)
         self.assertEqual(len(motor_ids["motor"]), 1, layout)
+        self.assertEqual(len(motor_ids[PY_MOTOR]), 1, layout)
 
         teleop1_cycles, auto_cycles, teleop2_cycles = mode_legs(soak_s)
         schedule, duration, cycle_starts = mode_schedule(
@@ -513,9 +517,10 @@ class Soak(unittest.TestCase):
             if auto_cycles > 0:
                 # Verify system-level mode-generation handoff across
                 # teleop -> disabled -> autonomous -> disabled -> teleop:
-                # both 5 ms C++ owners actuate from auto_producer during
-                # autonomous (with no teleop leakage) and from teleop in both
-                # teleop legs (with no auto leakage).
+                # all three actuator owners (two 5 ms C++ owners and the 20 ms
+                # Python owner) actuate from auto_producer during autonomous
+                # (with no teleop leakage) and from teleop in both teleop legs
+                # (with no auto leakage), sustained across the leg minus faults.
                 auto_ds = [t for t, f, _ in drive_ds
                            if (f & DS_ENABLED) and (f & DS_AUTONOMOUS)]
                 self.assertTrue(auto_ds, "no enabled autonomous Driver Station packets")
@@ -530,69 +535,72 @@ class Soak(unittest.TestCase):
                 self.assertTrue(teleop1_ds, "no enabled teleop packets before autonomous")
                 self.assertTrue(teleop2_ds, "no enabled teleop packets after autonomous")
 
-                drive_id = drive_ids[0]
-                motor_id = motor_ids["motor"][0]
+                owner_check = {
+                    DRIVE: (
+                        drive_ids[0],
+                        lambda req: req[0] == "velocity" and abs(abs(req[2]) - AUTO_DRIVE_RPS) < 0.1,
+                        lambda req: req[0] == "velocity" and abs(abs(req[2]) - TELEOP_DRIVE_RPS) < 0.1,
+                    ),
+                    "motor": (
+                        motor_ids["motor"][0],
+                        lambda req: req[0] == "velocity" and abs(req[2] - AUTO_MOTOR_RPS) < 0.1,
+                        lambda req: req[0] == "voltage" and abs(req[2] - TELEOP_MOTOR_V) < 0.1,
+                    ),
+                    PY_MOTOR: (
+                        motor_ids[PY_MOTOR][0],
+                        lambda req: req[0] == "velocity" and abs(req[2] - AUTO_MOTOR_RPS) < 0.1,
+                        lambda req: req[0] == "voltage" and abs(req[2] - TELEOP_MOTOR_V) < 0.1,
+                    ),
+                }
 
-                def is_auto_drive(req):
-                    return req[0] == "velocity" and abs(abs(req[2]) - AUTO_DRIVE_RPS) < 0.1
+                def min_active_hits(owner, span, driving_fraction, leg_producer):
+                    """Floor on expected active requests over `span`: half of the
+                    driving ticks remaining after conservatively budgeting for
+                    faults in `span` that can pause `owner`."""
+                    affected = {owner, leg_producer, "hardware_node"}
+                    fault_ms = 0.0
+                    for action, target, s_ms, _ in events:
+                        if not (span[0] <= s_ms <= span[1]):
+                            continue
+                        if target in affected:
+                            fault_ms += 1500.0 if action in ("kill", "frozen_kill") else 500.0
+                        elif action == "frozen_kill" and leg_producer == PRODUCER:
+                            # frozen_kill also SIGSTOPs teleop for STALL_S.
+                            fault_ms += 500.0
+                    driving_ms = (span[1] - span[0]) * driving_fraction
+                    expected = max(0.0, driving_ms - fault_ms) / period_ms[owner]
+                    return max(20, int(0.5 * expected))
 
-                def is_teleop_drive(req):
-                    return req[0] == "velocity" and abs(abs(req[2]) - TELEOP_DRIVE_RPS) < 0.1
-
-                def is_auto_motor(req):
-                    return req[0] == "velocity" and abs(req[2] - AUTO_MOTOR_RPS) < 0.1
-
-                def is_teleop_motor(req):
-                    return req[0] == "voltage" and abs(req[2] - TELEOP_MOTOR_V) < 0.1
-
-                swerve_auto = [r[1][drive_id] for r in requests[DRIVE]
-                               if auto_start_ms <= r[0] <= auto_end_ms]
-                motor_auto = [r[1][motor_id] for r in requests["motor"]
-                              if auto_start_ms <= r[0] <= auto_end_ms]
-                swerve_auto_hits = sum(is_auto_drive(m) for m in swerve_auto)
-                motor_auto_hits = sum(is_auto_motor(m) for m in motor_auto)
-                self.assertGreater(
-                    swerve_auto_hits, 20,
-                    f"{DRIVE}: expected auto-driven requests during autonomous")
-                self.assertGreater(
-                    motor_auto_hits, 20,
-                    "motor: expected auto-driven requests during autonomous")
-                self.assertFalse(
-                    any(is_teleop_drive(m) for m in swerve_auto),
-                    f"{DRIVE}: teleop target leaked into autonomous leg")
-                self.assertFalse(
-                    any(is_teleop_motor(m) for m in motor_auto),
-                    "motor: teleop target leaked into autonomous leg")
-
-                teleop_counts = {}
-                for leg, span in (("teleop1", (teleop1_ds[0], teleop1_ds[-1])),
-                                  ("teleop2", (teleop2_ds[0], teleop2_ds[-1]))):
-                    swerve_tel = [r[1][drive_id] for r in requests[DRIVE]
-                                  if span[0] <= r[0] <= span[1]]
-                    motor_tel = [r[1][motor_id] for r in requests["motor"]
-                                 if span[0] <= r[0] <= span[1]]
-                    swerve_tel_hits = sum(is_teleop_drive(m) for m in swerve_tel)
-                    motor_tel_hits = sum(is_teleop_motor(m) for m in motor_tel)
-                    self.assertGreater(
-                        swerve_tel_hits, 20,
-                        f"{DRIVE}: expected teleop-driven requests during {leg}")
-                    self.assertGreater(
-                        motor_tel_hits, 20,
-                        f"motor: expected teleop-driven requests during {leg}")
-                    self.assertFalse(
-                        any(is_auto_drive(m) for m in swerve_tel),
-                        f"{DRIVE}: auto target leaked into {leg}")
-                    self.assertFalse(
-                        any(is_auto_motor(m) for m in motor_tel),
-                        f"motor: auto target leaked into {leg}")
-                    teleop_counts[leg] = (swerve_tel_hits, motor_tel_hits)
-                print(
-                    f"mode handoff: teleop1 (swerve={teleop_counts['teleop1'][0]}, "
-                    f"motor={teleop_counts['teleop1'][1]}), "
-                    f"auto (swerve={swerve_auto_hits}, motor={motor_auto_hits}), "
-                    f"teleop2 (swerve={teleop_counts['teleop2'][0]}, "
-                    f"motor={teleop_counts['teleop2'][1]}) active requests",
-                    flush=True)
+                teleop_fraction = (CYCLE_S - CENTER_S) / CYCLE_S
+                leg_spans = (
+                    ("teleop1", (teleop1_ds[0], teleop1_ds[-1]), False, teleop_fraction, PRODUCER),
+                    ("auto", (auto_start_ms, auto_end_ms), True, 1.0, AUTO_PRODUCER),
+                    ("teleop2", (teleop2_ds[0], teleop2_ds[-1]), False, teleop_fraction, PRODUCER),
+                )
+                leg_counts = {}
+                for leg, span, is_auto, frac, leg_producer in leg_spans:
+                    counts = {}
+                    for owner in OWNERS:
+                        dev_id, auto_pred, teleop_pred = owner_check[owner]
+                        active_pred = auto_pred if is_auto else teleop_pred
+                        leak_pred = teleop_pred if is_auto else auto_pred
+                        leg_reqs = [r[1][dev_id] for r in requests[owner]
+                                    if span[0] <= r[0] <= span[1]]
+                        hits = sum(active_pred(m) for m in leg_reqs)
+                        floor = min_active_hits(owner, span, frac, leg_producer)
+                        self.assertGreaterEqual(
+                            hits, floor,
+                            f"{owner}: expected >= {floor} active requests during "
+                            f"{leg}, got {hits} (of {len(leg_reqs)})")
+                        self.assertFalse(
+                            any(leak_pred(m) for m in leg_reqs),
+                            f"{owner}: wrong-mode target leaked into {leg} leg")
+                        counts[owner] = hits
+                    leg_counts[leg] = counts
+                summary = ", ".join(
+                    f"{leg} (" + ", ".join(f"{o}={leg_counts[leg][o]}" for o in OWNERS) + ")"
+                    for leg, *_ in leg_spans)
+                print(f"mode handoff: {summary} active requests", flush=True)
 
             drive_rows = requests[DRIVE]
             # Restart k follows the k-th kill (restart_count is checked

@@ -118,7 +118,7 @@ its binaries are built with (`MODULE.bazel`, `third_party/`,
 checks when they touch `studio/`. With `--full` it also runs CI's sanitizer
 lanes (`tools/sanitizer_lane.sh tsan` and `asan`, the script CI's sanitizer
 jobs run; 5 to 10 minutes each cold) and CI's soak with its branch seed,
-for 42 s of enabled cycles rather than CI's 180 s (the shortest run that injects
+for 48 s of enabled cycles rather than CI's 180 s (the shortest run that injects
 every fault kind), and the RoboRIO-in-the-loop check whatever the commits
 touch; after a failed build those steps are SKIPPED. **A push of more
 than 20 commits runs `tools/prepush.sh --full`**: without it, such a range
