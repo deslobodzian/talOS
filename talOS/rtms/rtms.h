@@ -327,11 +327,6 @@ class RTMSQueue {
   // Number of times a read retries when the writer laps it mid-read.
   static constexpr int MAX_READ_ATTEMPTS = 8;
 
-  static bool is_active(const Reader& reader) {
-    return (reader.state.load(std::memory_order_acquire) & 3) ==
-           static_cast<std::uint64_t>(ReaderState::ACTIVE);
-  }
-
   // Whether reader slot `reader_id` still holds the word this queue claimed
   // it with. Another process that judged this one dead may have freed the
   // slot and claimed it again: it then reads ACTIVE with that process's word.
