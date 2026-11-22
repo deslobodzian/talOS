@@ -336,6 +336,20 @@ TEST(RuntimeUdpTest, RecordsLastRecvErrorOnSocketError) {
   EXPECT_EQ(peer.stats().last_recv_error, ECONNREFUSED);
 }
 
+// REQ-RT-22: permanent send errors trigger socket replacement, while transient
+// errors such as ICMP port unreachable (ECONNREFUSED) keep it.
+TEST(RuntimeUdpTest, SendErrorNeedsNewSocketClassifiesPermanentAndTransient) {
+  for (const int permanent : {EPIPE, ENOTCONN, EDESTADDRREQ, EBADF, ENOTSOCK,
+                              ENETUNREACH, EADDRNOTAVAIL}) {
+    EXPECT_TRUE(SendErrorNeedsNewSocket(permanent)) << std::strerror(permanent);
+  }
+  for (const int transient : {0, ECONNREFUSED, EAGAIN, EWOULDBLOCK, EINTR,
+                              ENOBUFS, ENETDOWN, EHOSTUNREACH}) {
+    EXPECT_FALSE(SendErrorNeedsNewSocket(transient))
+        << std::strerror(transient);
+  }
+}
+
 // REQ-RT-22: permanent receive errors trigger socket replacement, while
 // transient errors such as ICMP port unreachable (ECONNREFUSED) keep it.
 TEST(RuntimeUdpTest,
