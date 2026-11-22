@@ -20,7 +20,8 @@ Mechanism walkthrough: `examples/superstructure/README.md`.
 Dev environment: `tools/setup.sh` (Linux/macOS; on Windows, inside WSL2); see docs/INSTALL.md.
 
 ```sh
-bazel test --config=fast //...       # everyday loop: skips heavy, integration, e2e, perf lanes
+bazel test --config=fast //...       # everyday loop (-O3): skips heavy, integration, e2e, perf lanes
+bazel test --config=dev //...        # faster C++ edit-compile-test loop (-O1 + fast lane); switches analysis cache vs default -O3 / tools/tidy.sh
 bazel build //...
 bazel test //...                      # CI runs build and test with --test_output=errors
 bazel test //examples/superstructure/...

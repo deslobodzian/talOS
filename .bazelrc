@@ -4,22 +4,10 @@ import %workspace%/talos.bazelrc
 
 # What follows is this checkout's own.
 
-# Fix the default action PATH so differing shell PATHs (agent shells, user
-# terminals, worktrees) do not invalidate Bazel action and disk-cache keys.
-# Tests stay on the strict default PATH (/bin:/usr/bin:/usr/local/bin), which
-# tools/prepush.sh already assumes; Node/Python toolchains are hermetic and
-# drive_browser_test also checks TALOS_BROWSER and macOS Chrome.
-build --incompatible_strict_action_env
-
 # Share compiled artifacts across worktrees, tools/prepush.sh, and tools/tidy.sh.
 # Explicit --disk_cache flags (e.g. prepush.sh) and user ~/.bazelrc take precedence.
 build --disk_cache=~/.cache/talos-bazel-disk
 build --experimental_disk_cache_gc_max_size=40G
-
-# Fast local iteration: lower C++ optimization and run only the fast test lane.
-# Uses separate action cache keys from the default -O3 build.
-build:dev --cxxopt=-O1
-test:dev --config=fast
 
 # --config=release records this checkout's revision (talos.bazelrc).
 build:release --workspace_status_command=tools/workspace_status.sh

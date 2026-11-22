@@ -406,8 +406,13 @@ serialize it (`exclusive`) or run it unsandboxed (`local`).
 
 Each lane has a config in [`talos.bazelrc`](../talos.bazelrc), which talOS's
 `.bazelrc` and a robot repository's import: `bazel test --config=fast //...` is the
-everyday loop; `--config=heavy`, `--config=integration`, `--config=e2e` and
-`--config=perf` run one lane, and `--config=no_e2e` every lane but e2e.
+everyday loop at default `-O3`, and `bazel test --config=dev //...` runs the
+same fast lane with `-O1` for faster C++ edit-compile-test iteration (it uses
+separate analysis and action cache keys from the default `-O3` build, so
+alternating between `--config=dev` and default `-O3` builds or `tools/tidy.sh`
+discards and rebuilds Bazel's analysis cache); `--config=heavy`,
+`--config=integration`, `--config=e2e` and `--config=perf` run one lane, and
+`--config=no_e2e` every lane but e2e.
 `bazel test //...` runs every lane but the soak; it is what runs before a
 push ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)).
 End-to-end simulation tests run on the real clock (`sim_gateway`, the launcher
