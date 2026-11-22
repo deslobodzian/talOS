@@ -123,7 +123,10 @@ class RuntimeUdpPeer {
   uint8_t below_ascending_count_{0};
   UdpStats stats_;
   std::array<uint8_t, kMaxFrameSize> tx_buffer_;
-  std::array<uint8_t, kMaxFrameSize> rx_buffer_;
+  // One byte larger than kMaxFrameSize so a POSIX recv() on an oversized UDP
+  // datagram returns kMaxFrameSize + 1 instead of silently truncating to
+  // kMaxFrameSize and passing DecodeFrame as a valid max-payload frame.
+  std::array<uint8_t, kMaxFrameSize + 1> rx_buffer_;
   // What the last successful Open() asked for, for Reopen(): IPv4 addresses
   // and ports in network byte order.
   bool opened_{false};
@@ -137,12 +140,12 @@ class RuntimeUdpPeer {
 // Whether a send that failed with OS error `error` (UdpStats::last_send_error)
 // may have left a socket that will never send again, whatever the network
 // does, so only a new one can (Reopen): EPIPE, ENOTCONN, EDESTADDRREQ, EBADF,
-// and the socket's source address gone from the host, which Linux reports as
-// ENETUNREACH and macOS as EADDRNOTAVAIL (both are in the set on every OS; on
-// Windows the WSA equivalents: WSAESHUTDOWN, WSAENOTCONN, WSAEDESTADDRREQ,
-// WSAENOTSOCK, WSAENETUNREACH, WSAEADDRNOTAVAIL). Any other error clears by
-// itself on the same socket. Both ends' callers (the bridge's HardwareNode,
-// the RoboRIO program) decide with this one function.
+// ENOTSOCK, and the socket's source address gone from the host, which Linux
+// reports as ENETUNREACH and macOS as EADDRNOTAVAIL (both are in the set on
+// every OS; on Windows the WSA equivalents: WSAESHUTDOWN, WSAENOTCONN,
+// WSAEDESTADDRREQ, WSAENOTSOCK, WSAENETUNREACH, WSAEADDRNOTAVAIL). Any other
+// error clears by itself on the same socket. Both ends' callers (the bridge's
+// HardwareNode, the RoboRIO program) decide with this one function.
 bool SendErrorNeedsNewSocket(int error);
 
 // Whether a receive that failed with OS error `error`

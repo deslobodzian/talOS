@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <array>
@@ -383,6 +384,139 @@ TEST(RuntimeUdpTest, OpenFailsCleanlyWhenLocalAddressIsAbsent) {
   // A subsequent Open with an assigned address still succeeds cleanly.
   EXPECT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", remote), UdpStatus::kOk);
   EXPECT_TRUE(peer.IsOpen());
+}
+
+// REQ-CONTRACT-01: a UDP datagram larger than kMaxFrameSize whose leading
+// kMaxFrameSize bytes form a valid max-payload frame must be rejected as
+// truncated/oversized rather than silently truncated to kMaxFrameSize and
+// decoded as kOk.
+TEST(RuntimeUdpTest, RejectsOversizedDatagramWithValidMaxPayloadPrefix) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+
+  std::array<uint8_t, kMaxPayloadSize> payload{};
+  payload.fill(0x5Au);
+  std::array<uint8_t, kMaxFrameSize + 1> oversized{};
+  ASSERT_EQ(
+      EncodeFrame(FrameType::kHardwareState, kFlagNone, 1, 1000, payload.data(),
+                  payload.size(), oversized.data(), kMaxFrameSize),
+      kMaxFrameSize);
+  oversized[kMaxFrameSize] = 0xAAu;
+
+  ASSERT_EQ(::sendto(raw_sender, oversized.data(), oversized.size(), 0,
+                     reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+            static_cast<ssize_t>(oversized.size()));
+
+  DecodedFrame frame;
+  EXPECT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kDecodeError);
+  EXPECT_EQ(receiver.stats().last_decode_status, DecodeStatus::kTruncated);
+  EXPECT_EQ(receiver.stats().decode_failures, 1u);
+  EXPECT_EQ(receiver.stats().received_frames, 0u);
+
+  // An exact kMaxFrameSize datagram still decodes cleanly.
+  ASSERT_EQ(::sendto(raw_sender, oversized.data(), kMaxFrameSize, 0,
+                     reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+            static_cast<ssize_t>(kMaxFrameSize));
+  ASSERT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kOk);
+  EXPECT_EQ(frame.header.sequence, 1u);
+  EXPECT_EQ(frame.payload_size, kMaxPayloadSize);
+  EXPECT_EQ(receiver.stats().received_frames, 1u);
+  EXPECT_EQ(receiver.stats().received_bytes, kMaxFrameSize);
+
+  ::close(raw_sender);
+}
+
+struct EintrTestState {
+  volatile sig_atomic_t signal_count = 0;
+  int sender_fd = -1;
+  std::array<uint8_t, kFrameHeaderSize> frame{};
+  std::size_t frame_size = 0;
+};
+
+EintrTestState g_eintr_state;
+
+void OnSigAlrmForEintrTest(int /*sig*/) {
+  const int saved_errno = errno;
+  const sig_atomic_t count = g_eintr_state.signal_count + 1;
+  g_eintr_state.signal_count = count;
+  if (count >= 2 && g_eintr_state.sender_fd >= 0) {
+    static_cast<void>(::send(g_eintr_state.sender_fd,
+                             g_eintr_state.frame.data(),
+                             g_eintr_state.frame_size, 0));
+  }
+  errno = saved_errno;
+}
+
+// REQ-RT-22: a signal interrupting a blocking POSIX recv() (EINTR) is retried
+// rather than surfacing kSocketError with last_recv_error == EINTR.
+TEST(RuntimeUdpTest, BlockingReceiveRetriesOnEintr) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions blocking;
+  blocking.non_blocking = false;
+  blocking.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, blocking),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+  ASSERT_EQ(::connect(raw_sender, reinterpret_cast<const sockaddr*>(&dest),
+                      sizeof(dest)),
+            0);
+
+  g_eintr_state.signal_count = 0;
+  g_eintr_state.sender_fd = raw_sender;
+  g_eintr_state.frame_size =
+      EncodeFrame(FrameType::kClockProbe, kFlagNone, 42, 9999, nullptr, 0,
+                  g_eintr_state.frame.data(), g_eintr_state.frame.size());
+  ASSERT_EQ(g_eintr_state.frame_size, kFrameHeaderSize);
+
+  struct sigaction action {};
+  action.sa_handler = OnSigAlrmForEintrTest;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = 0;  // No SA_RESTART so blocking recv() returns EINTR.
+  struct sigaction previous {};
+  ASSERT_EQ(::sigaction(SIGALRM, &action, &previous), 0);
+
+  struct ScopedCleanup {
+    struct sigaction* previous_action;
+    int fd;
+    ~ScopedCleanup() {
+      itimerval disarm{};
+      static_cast<void>(::setitimer(ITIMER_REAL, &disarm, nullptr));
+      static_cast<void>(::sigaction(SIGALRM, previous_action, nullptr));
+      g_eintr_state.sender_fd = -1;
+      ::close(fd);
+    }
+  } cleanup{&previous, raw_sender};
+
+  itimerval timer{};
+  timer.it_value.tv_usec = 20000;
+  timer.it_interval.tv_usec = 20000;
+  ASSERT_EQ(::setitimer(ITIMER_REAL, &timer, nullptr), 0);
+
+  DecodedFrame frame;
+  EXPECT_EQ(receiver.TryReceive(&frame), UdpStatus::kOk);
+  EXPECT_EQ(frame.header.sequence, 42u);
+  EXPECT_EQ(receiver.stats().last_recv_error, 0);
+  EXPECT_GE(g_eintr_state.signal_count, 2);
 }
 
 }  // namespace
