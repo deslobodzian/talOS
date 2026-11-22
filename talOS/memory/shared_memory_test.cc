@@ -218,6 +218,7 @@ long MinorFaults() {
 // its constructor) and after it are written with no minor fault. The control
 // mapping shows the same writes fault without it, so the count measures
 // something.
+// REQ-RT-09
 TEST(SharedMemory, MappingsKeptResidentTakeNoFaultOnFirstWrite) {
   // The sanitizer's shadow memory is mapped lazily, so the instrumented
   // writes fault on shadow pages no matter what the ring does. GCC marks

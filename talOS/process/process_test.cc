@@ -5,15 +5,22 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "talOS/memory/residency.h"
 
@@ -249,6 +256,7 @@ TEST(ProcessTest, TheStopFdIsCloseOnExecAndNonBlocking) {
 // NIC delivering the RoboRIO's packets). On macOS, whose public
 // time-constraint policy has no priority, observers stay off the
 // time-constraint band so they cannot delay a control loop.
+// REQ-RT-08
 TEST(ProcessTest, TiersMapToOrderedPolicies) {
   const LoopPolicy bridge =
       PolicyFor({.period = 1ms, .tier = LoopTier::kBridge});
@@ -257,16 +265,35 @@ TEST(ProcessTest, TiersMapToOrderedPolicies) {
   const LoopPolicy observer =
       PolicyFor({.period = 20ms, .tier = LoopTier::kObserver});
 
+  // Exact NDG "Realtime scheduling" SCHED_FIFO priorities: 49 / 45 / 40.
+  EXPECT_EQ(bridge.fifo_priority, 49);
+  EXPECT_EQ(control.fifo_priority, 45);
+  EXPECT_EQ(observer.fifo_priority, 40);
   EXPECT_LT(0, observer.fifo_priority);
   EXPECT_LT(observer.fifo_priority, control.fifo_priority);
   EXPECT_LT(control.fifo_priority, bridge.fifo_priority);
   EXPECT_LT(bridge.fifo_priority, 50);
 
+  // Exact NDG Mach time-constraint ratios: computation = period/2,
+  // constraint = period; unknown/non-positive period defaults to 1 ms.
   EXPECT_TRUE(bridge.time_constraint);
+  EXPECT_EQ(bridge.period, 1ms);
+  EXPECT_EQ(bridge.computation, 500us);
+  EXPECT_EQ(bridge.constraint, 1ms);
+
   EXPECT_TRUE(control.time_constraint);
+  EXPECT_EQ(control.period, 20ms);
+  EXPECT_EQ(control.computation, 10ms);
+  EXPECT_EQ(control.constraint, 20ms);
+
   EXPECT_FALSE(observer.time_constraint);
-  // An unknown period must not become a zero-length constraint.
-  EXPECT_GT(PolicyFor({.tier = LoopTier::kControl}).constraint, 0ns);
+  for (const LoopTier tier : {LoopTier::kBridge, LoopTier::kControl}) {
+    const LoopPolicy fallback = PolicyFor({.tier = tier});
+    EXPECT_TRUE(fallback.time_constraint);
+    EXPECT_EQ(fallback.period, 1ms);
+    EXPECT_EQ(fallback.computation, 500us);
+    EXPECT_EQ(fallback.constraint, 1ms);
+  }
 }
 
 #if defined(__APPLE__)
@@ -340,6 +367,7 @@ Outcome ConfigureOnFreshThread(LoopTier tier) {
 // afresh): whether rings are kept resident is process-wide and sticky, so a
 // ConfigureRealtime from another test, before this one or in an earlier
 // repeat, must not decide it.
+// REQ-RT-08, REQ-RT-09
 TEST(ProcessTest, RealtimeDisabledByEnvironmentChangesNothing) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_EXIT(
@@ -357,6 +385,7 @@ TEST(ProcessTest, RealtimeDisabledByEnvironmentChangesNothing) {
 
 // Simulation alone does not decide: TALOS_REALTIME=1 qualifies a --sim run
 // under the production policy, and =0 keeps even the robot unprivileged.
+// REQ-RT-08
 TEST(ProcessTest, RealtimeRequestFollowsSimulationUnlessTheEnvironmentSays) {
   ::unsetenv("TALOS_REALTIME");
   EXPECT_TRUE(RealtimeRequested(false));
@@ -377,6 +406,7 @@ TEST(ProcessTest, RealtimeRequestFollowsSimulationUnlessTheEnvironmentSays) {
 // here also grants the stack lock (no rings are mapped), so a memory step
 // that always failed would break the first equality. An unprivileged Linux
 // host refuses SCHED_FIFO, which exercises the refusal.
+// REQ-RT-08, REQ-RT-09
 TEST(ProcessTest, RealtimeReportsWhatTheOsGrantedForEveryTier) {
   ::unsetenv("TALOS_REALTIME");
   static_assert(noexcept(ConfigureRealtime(RealtimeOptions{})));
@@ -397,6 +427,7 @@ TEST(ProcessTest, RealtimeReportsWhatTheOsGrantedForEveryTier) {
 // A helper thread doing unbounded work (camera capture, detection) must run
 // below every loop thread, which runs at the default timeshare priority under
 // --sim.
+// REQ-RT-08, REQ-RT-10
 TEST(ProcessTest, BackgroundThreadRunsBelowTheDefaultPriority) {
   static_assert(noexcept(ConfigureBackgroundThread()));
   bool before = true;
@@ -418,6 +449,7 @@ TEST(ProcessTest, BackgroundThreadRunsBelowTheDefaultPriority) {
 // inherits SCHED_FIFO on Linux. The helper must take it out of realtime, and so
 // must keep any thread it creates afterwards (a detector's worker pool) out of
 // realtime too; on Linux that thread also inherits the background nice value.
+// REQ-RT-08, REQ-RT-10
 TEST(ProcessTest, BackgroundThreadLeavesAnInheritedRealtimePolicy) {
   ::unsetenv("TALOS_REALTIME");
   bool parent_realtime = false;
@@ -497,6 +529,130 @@ TEST(ProcessTest, RealtimeResetsPolicyOnForkAndThreadCreation) {
   }
   EXPECT_EQ(WEXITSTATUS(status), 0)
       << "child failed at step " << WEXITSTATUS(status);
+}
+
+// Child body for MemlockZeroReportsRingAndStackLockRefusalsOnceOnStderr,
+// factored out of EXPECT_EXIT to avoid preprocessor comma splitting.
+[[noreturn]] void RunMemlockZeroChild() {
+  ::unsetenv("TALOS_REALTIME");
+  const rlimit zero{0, 0};
+  if (::setrlimit(RLIMIT_MEMLOCK, &zero) != 0) {
+    std::fprintf(stderr, "setrlimit failed: %s\n", std::strerror(errno));
+    std::fflush(stderr);
+    std::_Exit(10);
+  }
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  const auto map_page = [page]() -> void* {
+    void* p = ::mmap(nullptr, page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+  };
+  void* r1 = map_page();
+  void* r2 = map_page();
+  void* late1 = map_page();
+  void* late2 = map_page();
+  if (r1 == nullptr || r2 == nullptr || late1 == nullptr || late2 == nullptr) {
+    std::fprintf(stderr, "mmap failed\n");
+    std::fflush(stderr);
+    std::_Exit(11);
+  }
+  // Probe what errno mlock returns under RLIMIT_MEMLOCK=0 on this kernel
+  // (EPERM or ENOMEM) without locking anything.
+  const int probe_err = ::mlock(r1, page) == 0 ? 0 : errno;
+  if (probe_err == 0) {
+    // Process holds CAP_IPC_LOCK despite non-root euid.
+    ::munlock(r1, page);
+    std::_Exit(0);
+  }
+
+  memory::TrackMapping(r1, page);
+  memory::TrackMapping(r2, page);
+
+  int pipefd[2]{-1, -1};
+  if (::pipe(pipefd) != 0) std::_Exit(12);
+  const int saved_stderr = ::dup(STDERR_FILENO);
+  if (saved_stderr < 0 || ::dup2(pipefd[1], STDERR_FILENO) < 0) {
+    std::_Exit(13);
+  }
+  ::close(pipefd[1]);
+
+  const RealtimeOutcome outcome =
+      ConfigureRealtime({.period = 10ms, .tier = LoopTier::kControl});
+  // Two late mappings after realtime setup: only the first prints.
+  memory::TrackMapping(late1, page);
+  memory::TrackMapping(late2, page);
+  std::fflush(stderr);
+
+  ::dup2(saved_stderr, STDERR_FILENO);
+  ::close(saved_stderr);
+
+  std::string captured;
+  char buf[512];
+  for (ssize_t n = 0; (n = ::read(pipefd[0], buf, sizeof buf)) > 0;) {
+    captured.append(buf, static_cast<std::size_t>(n));
+  }
+  ::close(pipefd[0]);
+
+  std::vector<std::string> lines;
+  std::istringstream stream{captured};
+  for (std::string line; std::getline(stream, line);) {
+    lines.push_back(line);
+  }
+
+  const bool outcome_ok =
+      outcome.requested && outcome.tier == LoopTier::kControl &&
+      (outcome.refused & kStepMlockall) != 0 &&
+      (outcome.refused & kStepRingLock) != 0 &&
+      (outcome.refused & kStepStackLock) != 0 && memory::LateLockRefused();
+
+  const std::string err_text = std::strerror(probe_err);
+  const std::string expected_prefix =
+      std::string{
+          "talos: realtime scheduling incomplete (control tier, "
+          "grant "} +
+      GrantName(outcome.grant()) + "): mlockall (" + err_text +
+      "); ring mlock (2 of 2: " + err_text + "); stack mlock (" + err_text +
+      ")";
+  const std::string expected_late =
+      "talos: shared memory mapped after realtime setup is prefaulted "
+      "but not locked (mlock: " +
+      err_text + "); further refusals are not reported";
+
+  bool lines_ok = lines.size() == 2 && lines[1] == expected_late;
+  if (lines_ok) {
+    if ((outcome.refused & kStepPolicy) == 0) {
+      lines_ok = lines[0] == expected_prefix;
+    } else {
+      lines_ok = lines[0].starts_with(expected_prefix + "; SCHED_FIFO (");
+    }
+  }
+
+  if (!outcome_ok || !lines_ok) {
+    std::fprintf(stderr,
+                 "outcome_ok=%d refused=0x%x lines=%zu\n"
+                 "captured:\n%s\nexpected0: %s\nexpected1: %s\n",
+                 outcome_ok ? 1 : 0, outcome.refused, lines.size(),
+                 captured.c_str(), expected_prefix.c_str(),
+                 expected_late.c_str());
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+  std::_Exit(0);
+}
+
+// Under RLIMIT_MEMLOCK=0 on Linux, mlockall, ring mlock and stack mlock are
+// refused: ConfigureRealtime reports kStepMlockall, kStepRingLock and
+// kStepStackLock in RealtimeOutcome and prints one summary line to stderr, and
+// subsequent TrackMapping calls print the late-refusal line exactly once.
+// Runs in a re-executed child so MappingsKeptResident starts false and
+// RLIMIT_MEMLOCK=0 is isolated to the child.
+// REQ-RT-09
+TEST(ProcessTest, MemlockZeroReportsRingAndStackLockRefusalsOnceOnStderr) {
+  if (::geteuid() == 0) {
+    GTEST_SKIP() << "root bypasses RLIMIT_MEMLOCK";
+  }
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(RunMemlockZeroChild(), ::testing::ExitedWithCode(0), "");
 }
 #endif
 

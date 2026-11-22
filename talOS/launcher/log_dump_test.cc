@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -114,6 +115,52 @@ class LogDumpTest : public testing::Test {
   static bool HasLine(const std::vector<std::string>& lines,
                       const std::string& line) {
     return std::find(lines.begin(), lines.end(), line) != lines.end();
+  }
+
+  struct RunResult {
+    std::string out;
+    std::string err;
+    std::uint64_t peak_rss_bytes{0};
+  };
+
+  // Dumps the session directory, or only the paths in `args` when
+  // `session` is false, keeping stdout and stderr separate.
+  RunResult RunSplit(std::vector<std::string> args, bool success = true,
+                     bool session = true) {
+    args.insert(args.begin(), binary_);
+    if (session) args.push_back(directory_);
+    const std::string out_path = directory_ + "/stdout.txt";
+    const std::string err_path = directory_ + "/stderr.txt";
+    const pid_t child = fork();
+    if (child == 0) {
+      if (freopen(out_path.c_str(), "w", stdout) == nullptr ||
+          freopen(err_path.c_str(), "w", stderr) == nullptr) {
+        _exit(126);
+      }
+      std::vector<char*> argv;
+      argv.reserve(args.size() + 1);
+      for (auto& arg : args) argv.push_back(arg.data());
+      argv.push_back(nullptr);
+      execv(binary_.c_str(), argv.data());
+      _exit(127);
+    }
+    if (child < 0) throw std::runtime_error("fork failed");
+    int status = 0;
+    struct rusage usage {};
+    EXPECT_EQ(::wait4(child, &status, 0, &usage), child);
+    EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status) == 0, success);
+#if defined(__APPLE__)
+    const auto peak_rss_bytes = static_cast<std::uint64_t>(usage.ru_maxrss);
+#else
+    const auto peak_rss_bytes =
+        static_cast<std::uint64_t>(usage.ru_maxrss) * 1024u;
+#endif
+    std::ifstream out_stream{out_path};
+    std::ifstream err_stream{err_path};
+    return {{std::istreambuf_iterator<char>{out_stream}, {}},
+            {std::istreambuf_iterator<char>{err_stream}, {}},
+            peak_rss_bytes};
   }
 
   // Dumps the session directory, or only the paths in `args` when
@@ -802,6 +849,332 @@ TEST_F(LogDumpGapTest, ALogWithGapsIsWarnedOnce) {
         << format << "\n"
         << output;
   }
+}
+
+// Verified reflection.Schema .bfbs for:
+//   namespace bridge;
+//   struct BridgeStatus { protocol_version_id:uint16; }
+// Generated with flatc --binary --schema so log_dump's protocol-version reader
+// resolves `protocol_version_id` by field name without linking bridge messages.
+constexpr unsigned char kMinimalBridgeStatusBfbs[] = {
+    0x1c, 0x00, 0x00, 0x00, 0x42, 0x46, 0x42, 0x53, 0x14, 0x00, 0x1c, 0x00,
+    0x04, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x10, 0x00, 0x00, 0x00, 0x14, 0x00,
+    0x00, 0x00, 0x18, 0x00, 0x14, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00,
+    0x28, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x30, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x94, 0xff, 0xff, 0xff, 0x3c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x1c, 0x00, 0x08, 0x00, 0x0c, 0x00,
+    0x07, 0x00, 0x10, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00,
+    0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x28, 0x00, 0x00, 0x00,
+    0x1c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x2f, 0x2f, 0x73, 0x2e,
+    0x66, 0x62, 0x73, 0x00, 0x01, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00,
+    0x13, 0x00, 0x00, 0x00, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65, 0x2e, 0x42,
+    0x72, 0x69, 0x64, 0x67, 0x65, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x00,
+    0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x28, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00,
+    0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x02, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x70, 0x72, 0x6f, 0x74,
+    0x6f, 0x63, 0x6f, 0x6c, 0x5f, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
+    0x5f, 0x69, 0x64, 0x00,
+};
+
+// REQ-OPS-12, REQ-OPS-15: a log cut mid-record (power loss) exports every
+// intact record before the tail and warns on stderr naming the log and the
+// tail byte count.
+TEST_F(LogDumpTest, DamagedTailWarnsNamingLogAndTailBytes) {
+  WriteLog("gamma", "/gamma/state", {5, 15, 25});
+  const std::string gamma = directory_ + "/gamma.tlog";
+  std::vector<std::uint64_t> offsets;
+  {
+    talos::event::log::LogReader reader{gamma};
+    talos::event::log::LogReader::Record record;
+    while (reader.next(record)) offsets.push_back(record.offset);
+  }
+  ASSERT_EQ(offsets.size(), 3u);
+  constexpr std::uint64_t kTailBytes = 20;
+  std::filesystem::resize_file(gamma, offsets[2] + kTailBytes);
+
+  const RunResult res = RunSplit({"--format", "jsonl"});
+  EXPECT_EQ(std::count(res.out.begin(), res.out.end(), '\n'), 6) << res.out;
+  EXPECT_NE(res.out.find("\"process\":\"gamma\",\"dispatch_index\":1,"),
+            std::string::npos)
+      << res.out;
+  EXPECT_NE(res.out.find("\"process\":\"gamma\",\"dispatch_index\":2,"),
+            std::string::npos)
+      << res.out;
+  EXPECT_EQ(res.out.find("\"process\":\"gamma\",\"dispatch_index\":3,"),
+            std::string::npos)
+      << res.out;
+  const std::string expected_warning =
+      "warning: damaged log " + gamma + ": no intact record in the last " +
+      std::to_string(kTailBytes) + " bytes (from byte " +
+      std::to_string(offsets[2]) + ")";
+  const auto err_lines = SplitLines(res.err);
+  EXPECT_EQ(std::count(err_lines.begin(), err_lines.end(), expected_warning), 1)
+      << res.err;
+}
+
+// REQ-OPS-12, REQ-OPS-15: log_dump continues past mid-log corruption (exporting
+// records before and after the damaged span alongside intact sibling logs) and
+// skips a sibling whose header was cut short, exiting 0 with warnings on
+// stderr.
+TEST_F(LogDumpTest, MidLogCorruptionAndCutHeaderSiblingExportIntactRecords) {
+  WriteLog("gamma", "/gamma/state", {5, 15, 25, 35});
+  const std::string gamma = directory_ + "/gamma.tlog";
+  std::vector<std::uint64_t> offsets;
+  {
+    talos::event::log::LogReader reader{gamma};
+    talos::event::log::LogReader::Record record;
+    while (reader.next(record)) offsets.push_back(record.offset);
+  }
+  ASSERT_EQ(offsets.size(), 4u);
+  {
+    std::fstream file{gamma, std::ios::binary | std::ios::in | std::ios::out};
+    ASSERT_TRUE(file);
+    file.seekg(static_cast<std::streamoff>(offsets[1] + 8));
+    char byte = 0;
+    ASSERT_TRUE(file.get(byte));
+    file.seekp(static_cast<std::streamoff>(offsets[1] + 8));
+    file.put(static_cast<char>(byte ^ 0xFF));
+  }
+  // A sibling log truncated mid-FileHeader holds no records and is skipped.
+  const std::string cut = directory_ + "/cut.tlog";
+  {
+    std::ifstream src{directory_ + "/alpha.tlog", std::ios::binary};
+    char prefix[16]{};
+    ASSERT_TRUE(src.read(prefix, sizeof prefix));
+    std::ofstream dst{cut, std::ios::binary};
+    dst.write(prefix, sizeof prefix);
+  }
+
+  const RunResult res = RunSplit({"--format", "jsonl"});
+  EXPECT_EQ(std::count(res.out.begin(), res.out.end(), '\n'), 7) << res.out;
+  // Record before corruption and both intact records after it are exported.
+  EXPECT_NE(res.out.find("\"process\":\"gamma\",\"dispatch_index\":1,"),
+            std::string::npos)
+      << res.out;
+  EXPECT_EQ(res.out.find("\"process\":\"gamma\",\"dispatch_index\":2,"),
+            std::string::npos)
+      << res.out;
+  EXPECT_NE(res.out.find("\"process\":\"gamma\",\"dispatch_index\":3,"),
+            std::string::npos)
+      << res.out;
+  EXPECT_NE(res.out.find("\"process\":\"gamma\",\"dispatch_index\":4,"),
+            std::string::npos)
+      << res.out;
+  // Sibling logs still export.
+  EXPECT_NE(res.out.find("\"process\":\"alpha\","), std::string::npos)
+      << res.out;
+  EXPECT_NE(res.out.find("\"process\":\"beta\","), std::string::npos)
+      << res.out;
+
+  const auto err_lines = SplitLines(res.err);
+  const auto damaged_prefix =
+      "warning: damaged log " + gamma + ": 1 damaged span(s) skipped (";
+  const auto first_at = "first at byte " + std::to_string(offsets[1]) + ")";
+  EXPECT_EQ(std::count_if(err_lines.begin(), err_lines.end(),
+                          [&](const std::string& l) {
+                            return l.starts_with(damaged_prefix) &&
+                                   l.find(first_at) != std::string::npos;
+                          }),
+            1)
+      << res.err;
+  EXPECT_EQ(
+      std::count_if(err_lines.begin(), err_lines.end(),
+                    [&](const std::string& l) {
+                      return l.starts_with("warning: skipping " + cut + ": ");
+                    }),
+      1)
+      << res.err;
+}
+
+// REQ-OPS-51: when the bridge's /hw/status protocol_version_id and
+// manifest.json's hardware_protocol_version disagree, log_dump prints one
+// warning naming both versions and reads the session under the bridge's
+// version (decoding when bridge == build, refusing when bridge != build).
+TEST_F(LogDumpTest,
+       BridgeAndManifestProtocolDisagreementWarnsOnceAndUsesBridgesVersion) {
+  namespace hw = talos::hardware;
+  using D = talos::Descriptor<hw::Packet>;
+  const std::uint16_t kBuild = talos::protocol::kProtocolVersion;
+  const std::uint16_t kOther = static_cast<std::uint16_t>(kBuild - 1);
+
+  const auto write_bridge = [&](std::uint16_t bridge_version) {
+    talos::event::Registration status_reg;
+    status_reg.id = 1;
+    status_reg.kind = talos::event::SourceKind::SENDER;
+    status_reg.name = "/hw/status";
+    status_reg.message_bytes = sizeof(std::uint16_t);
+    status_reg.schema = {
+        "bridge.BridgeStatus", 1,
+        std::string{reinterpret_cast<const char*>(kMinimalBridgeStatusBfbs),
+                    sizeof(kMinimalBridgeStatusBfbs)}};
+    talos::event::Registration state_reg;
+    state_reg.id = 2;
+    state_reg.kind = talos::event::SourceKind::SENDER;
+    state_reg.name = hw::kStateTopic;
+    state_reg.message_bytes = sizeof(hw::Packet);
+    state_reg.schema = {std::string{D::kName}, D::kHash, {}};
+
+    talos::event::log::LogWriter writer{
+        directory_ + "/hardware_node.tlog", "hardware_node",
+        talos::event::log::LogWriterOptions{1 << 14, 1, false}, 42};
+    writer.start({status_reg, state_reg},
+                 talos::event::MonotonicTime::from_nanos(1'000'000'000));
+    talos::event::Context ctx{};
+    ctx.kind = talos::event::EventKind::SEND;
+    ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+    ctx.now = ctx.event_time;
+    ctx.publish_time = ctx.event_time;
+    writer.send(ctx, 1, std::as_bytes(std::span{&bridge_version, 1}), 0, 1);
+    hw::Packet state{};
+    state.size =
+        static_cast<std::uint32_t>(hw::Encode(hw::State{}, state.data));
+    ctx.dispatch_index = 2;
+    writer.send(ctx, 2, std::as_bytes(std::span{&state, 1}), 0, 1);
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  };
+
+  // Bridge matches this build; manifest names another: warns once naming both
+  // and decodes under the bridge's version.
+  {
+    std::ofstream{directory_ + "/manifest.json"}
+        << "{\n  \"session_id\": 42,\n  \"hardware_protocol_version\": "
+        << kOther << ",\n  \"nodes\": []\n}\n";
+    write_bridge(kBuild);
+    const RunResult res =
+        RunSplit({"--format", "jsonl", "--node", "hardware_node"});
+    const auto err_lines = SplitLines(res.err);
+    const std::string expected_disagreement =
+        "log_dump: warning: the session's bridge recorded hardware protocol " +
+        std::to_string(kBuild) +
+        " (/hw/status protocol_version_id), its launcher " +
+        std::to_string(kOther) +
+        " (manifest.json hardware_protocol_version): read under the bridge's";
+    EXPECT_EQ(
+        std::count(err_lines.begin(), err_lines.end(), expected_disagreement),
+        1)
+        << res.err;
+    EXPECT_EQ(res.err.find("hardware packets not decoded"), std::string::npos)
+        << res.err;
+    EXPECT_NE(res.out.find("\"hardware\":{\"type\":\"state\""),
+              std::string::npos)
+        << res.out;
+  }
+
+  // Bridge names another version; manifest matches this build: warns once
+  // naming both and refuses hardware packets under the bridge's version.
+  {
+    std::ofstream{directory_ + "/manifest.json"}
+        << "{\n  \"session_id\": 42,\n  \"hardware_protocol_version\": "
+        << kBuild << ",\n  \"nodes\": []\n}\n";
+    write_bridge(kOther);
+    const RunResult res =
+        RunSplit({"--format", "jsonl", "--node", "hardware_node"});
+    const auto err_lines = SplitLines(res.err);
+    const std::string expected_disagreement =
+        "log_dump: warning: the session's bridge recorded hardware protocol " +
+        std::to_string(kOther) +
+        " (/hw/status protocol_version_id), its launcher " +
+        std::to_string(kBuild) +
+        " (manifest.json hardware_protocol_version): read under the bridge's";
+    EXPECT_EQ(
+        std::count(err_lines.begin(), err_lines.end(), expected_disagreement),
+        1)
+        << res.err;
+    EXPECT_NE(res.err.find("hardware packets not decoded"), std::string::npos)
+        << res.err;
+    EXPECT_EQ(res.out.find("\"hardware\":"), std::string::npos) << res.out;
+  }
+}
+
+// REQ-OPS-15: --format summary streams records in bounded memory proportional
+// to topics and fields, not record count: a 50x larger log on the same topics
+// folds every record with peak RSS staying within a small constant slack of
+// the 1k-record run.
+TEST_F(LogDumpTest, SummaryMemoryIsBoundedAcrossRecordCounts) {
+  const auto write_scaled = [&](const std::string& dir, std::uint32_t count) {
+    std::filesystem::create_directories(dir);
+    using D = talos::Descriptor<continuity_test::Count>;
+    talos::event::Registration source;
+    source.id = 1;
+    source.kind = talos::event::SourceKind::TIMER;
+    source.name = "/alpha/state";
+    source.message_bytes = sizeof(continuity_test::Count);
+    source.schema = {std::string{D::kName}, D::kHash,
+                     std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                                 D::kBfbs.size()}};
+    talos::event::log::LogWriter writer{
+        dir + "/alpha.tlog", "alpha",
+        talos::event::log::LogWriterOptions{1u << 20, 4, false}, 42};
+    writer.start({source},
+                 talos::event::MonotonicTime::from_nanos(1'000'000'000));
+    for (std::uint32_t i = 0; i < count; ++i) {
+      const continuity_test::Count value{i, 1};
+      talos::event::Context ctx{};
+      ctx.kind = talos::event::EventKind::TIMER;
+      ctx.source_id = 1;
+      ctx.dispatch_index = static_cast<std::uint64_t>(i) + 1;
+      ctx.event_time = talos::event::MonotonicTime::from_nanos(
+          1'000'000'000 + static_cast<std::int64_t>(i) * 1'000'000);
+      ctx.now = ctx.event_time;
+      ctx.publish_time = ctx.event_time;
+      ctx.sequence = ctx.dispatch_index;
+      writer.dispatch(ctx, std::as_bytes(std::span{&value, 1}));
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+    ASSERT_FALSE(writer.incomplete());
+  };
+
+  constexpr std::uint32_t kSmall = 1'000;
+  constexpr std::uint32_t kLarge = 50'000;
+  const std::string small_dir = directory_ + "/summary_1k";
+  const std::string large_dir = directory_ + "/summary_50k";
+  write_scaled(small_dir, kSmall);
+  write_scaled(large_dir, kLarge);
+
+  const RunResult small_res =
+      RunSplit({"--format", "summary", small_dir}, true, false);
+  const RunResult large_res =
+      RunSplit({"--format", "summary", large_dir}, true, false);
+  const auto large_lines = SplitLines(large_res.out);
+  EXPECT_TRUE(HasLine(large_lines, "  records alpha TIMER 50000"))
+      << large_res.out;
+  EXPECT_TRUE(HasLine(large_lines, "  range run_index 0 49999"))
+      << large_res.out;
+  EXPECT_TRUE(
+      HasLine(large_lines, "  latest {run_index: 49999, sequence_count: 1}"))
+      << large_res.out;
+  EXPECT_TRUE(large_res.err.empty()) << large_res.err;
+
+  // Under ASan/TSan, deferred heap quarantine and shadow pages grow with
+  // transient allocations even when live memory is O(1).
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+  bool sanitized = false;
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer)
+  sanitized = true;
+#endif
+#endif
+  if (!sanitized) {
+    // 50k records is ~3.6 MiB on disk (and >10 MiB if buffered decoded);
+    // streaming TopicSummary keeps peak RSS growth well under 2 MiB.
+    constexpr std::uint64_t kMaxGrowthBytes = 2u << 20;
+    EXPECT_GT(small_res.peak_rss_bytes, 0u);
+    EXPECT_LE(large_res.peak_rss_bytes,
+              small_res.peak_rss_bytes + kMaxGrowthBytes)
+        << "1k RSS=" << small_res.peak_rss_bytes
+        << " B, 50k RSS=" << large_res.peak_rss_bytes << " B";
+  }
+#endif
 }
 
 TEST_F(LogDumpTest, RejectsInvalidOptions) {
