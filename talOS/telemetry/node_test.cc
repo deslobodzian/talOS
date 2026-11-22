@@ -19,9 +19,13 @@
 
 #include "geometry/geometry_generated.h"
 #include "schema_test/shapes_generated.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/simulated_event_loop.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/describe.h"
 #include "talOS/node/allocation_probe.h"
+#include "talOS/node/internal.h"
 #include "talOS/node/testing.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/schema/identity.h"
@@ -1889,6 +1893,293 @@ node = "//talOS/telemetry:node"
     Sim sim = Sim::FromToml(kConfig);
     sim.add<OutOfBoundsValidPoseTopicNode>("pose_estimator");
     EXPECT_THROW(sim.add<Telemetry>("telemetry"), std::invalid_argument);
+  }
+}
+
+// ByteTopic sink that appends every frame published on `/talos/telemetry` in
+// order, unlike testing::Sim's LatestBytes which retains only the last page of
+// each tick.
+class CollectingByteTopic final : public talos::detail::ByteTopic {
+ public:
+  explicit CollectingByteTopic(std::vector<FrameHolder>& frames)
+      : frames_{frames} {}
+
+  bool write(std::span<const std::byte> message) override {
+    frames_.push_back(
+        FrameHolder{std::vector<std::byte>(message.begin(), message.end())});
+    return true;
+  }
+
+ private:
+  std::vector<FrameHolder>& frames_;
+};
+
+class CollectingPort final
+    : public talos::detail::LoopPortFor<event::SimulatedEventLoop<>> {
+ public:
+  CollectingPort(event::SimulatedEventLoop<>& loop,
+                 std::vector<FrameHolder>& frames)
+      : LoopPortFor{loop}, frames_{frames} {}
+
+  std::unique_ptr<talos::detail::ByteTopic> open_byte_topic(
+      std::string_view, std::size_t, const BytePublishOptions&) override {
+    return std::make_unique<CollectingByteTopic>(frames_);
+  }
+
+ private:
+  std::vector<FrameHolder>& frames_;
+};
+
+// Builds a flat reflection schema for a struct of `count` doubles, each field
+// named with `name_bytes` characters.
+std::string MakeDoubleStructSchema(std::string_view object_name,
+                                   std::size_t count, std::size_t name_bytes) {
+  flatbuffers::FlatBufferBuilder builder;
+  std::vector<flatbuffers::Offset<reflection::Field>> fields;
+  fields.reserve(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    std::string name = std::to_string(i);
+    if (name.size() < name_bytes) name.resize(name_bytes, 'x');
+    const auto field_name = builder.CreateString(name);
+    reflection::TypeBuilder type_builder{builder};
+    type_builder.add_base_type(reflection::BaseType::Double);
+    type_builder.add_index(-1);
+    const auto type = type_builder.Finish();
+    reflection::FieldBuilder field_builder{builder};
+    field_builder.add_name(field_name);
+    field_builder.add_type(type);
+    field_builder.add_id(static_cast<std::uint16_t>(i));
+    field_builder.add_offset(static_cast<std::uint16_t>(i * sizeof(double)));
+    fields.push_back(field_builder.Finish());
+  }
+  const auto obj_name = builder.CreateString(object_name);
+  const auto field_vector = builder.CreateVector(fields);
+  reflection::ObjectBuilder object_builder{builder};
+  object_builder.add_name(obj_name);
+  object_builder.add_fields(field_vector);
+  object_builder.add_is_struct(true);
+  object_builder.add_minalign(8);
+  object_builder.add_bytesize(
+      static_cast<std::int32_t>(count * sizeof(double)));
+  const auto object = object_builder.Finish();
+  const auto objects = builder.CreateVector(
+      std::vector<flatbuffers::Offset<reflection::Object>>{object});
+  const auto enums = builder.CreateVector(
+      std::vector<flatbuffers::Offset<reflection::Enum>>{});
+  reflection::SchemaBuilder schema_builder{builder};
+  schema_builder.add_objects(objects);
+  schema_builder.add_enums(enums);
+  reflection::FinishSchemaBuffer(builder, schema_builder.Finish());
+  return {reinterpret_cast<const char*>(builder.GetBufferPointer()),
+          builder.GetSize()};
+}
+
+// Publishes `/budget/state` with enough long-named double channels that both
+// dictionary pages and value pages span multiple frames each tick.
+class MultiPageSourceNode {
+ public:
+  static constexpr std::size_t kFields = 250;
+
+  explicit MultiPageSourceNode(talos::Node& node)
+      : node_{node},
+        schema_{MakeDoubleStructSchema("budget.MultiPage", kFields,
+                                       kLongestFieldName)},
+        pub_index_{talos::detail::NodeAccess::add_publisher(
+            node, "/budget/state", kFields * sizeof(double), 8,
+            talos::schema::Identity{"budget.MultiPage", 54321, schema_})},
+        payload_(kFields, 1.5) {}
+
+  void update() {
+    payload_[0] = static_cast<double>(node_.tick());
+    talos::detail::NodeAccess::publisher_send(
+        node_, pub_index_, payload_.data(), payload_.size() * sizeof(double));
+  }
+
+ private:
+  talos::Node& node_;
+  std::string schema_;
+  std::size_t pub_index_;
+  std::vector<double> payload_;
+};
+
+// REQ-OPS-22: on tick 0 and every 100th tick thereafter (tick 100), Telemetry
+// emits every dictionary page before its value pages; ticks 1..99 emit value
+// pages only.
+TEST(TelemetryTest, DictionaryPagesEmitFirstOnTick0AndEvery100thTick) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(tmp, nullptr);
+  const std::string config_path = std::string{tmp} + "/telemetry_cadence_" +
+                                  std::to_string(::getpid()) + ".toml";
+  {
+    std::ofstream out{config_path};
+    out << R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.budget]
+node = "//budget:node"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)";
+  }
+  const auto config = std::make_shared<const config::RobotConfig>(
+      config::ParseRobotConfig(config_path));
+
+  event::SimulationEnvironment env;
+  event::SimulatedEventLoop<> src_loop{env};
+  talos::detail::LoopPortFor<event::SimulatedEventLoop<>> src_port{src_loop};
+  auto src_node = talos::detail::NodeAccess::create(talos::detail::NodeSetup{
+      .name = "budget",
+      .config_path = config_path,
+      .config = config,
+      .loop = &src_port,
+  });
+  MultiPageSourceNode src{*src_node};
+  talos::detail::NodeAccess::set_update(*src_node, [&] { src.update(); });
+  talos::detail::NodeAccess::start(*src_node);
+
+  talos::detail::DeclaredGraph graph;
+  graph.push_back(talos::detail::DescribeNode(
+      *src_node, "//budget:node", src_loop.manifest(),
+      introspect::LoopSourceFlags(src_loop)));
+
+  std::vector<FrameHolder> collected;
+  event::SimulatedEventLoop<> tel_loop{env};
+  CollectingPort tel_port{tel_loop, collected};
+  auto tel_node = talos::detail::NodeAccess::create(talos::detail::NodeSetup{
+      .name = "telemetry",
+      .config_path = config_path,
+      .config = config,
+      .loop = &tel_port,
+      .graph = [&graph] { return &graph; },
+  });
+  Telemetry telemetry{*tel_node};
+  talos::detail::NodeAccess::set_update(*tel_node, [&] { telemetry.update(); });
+  talos::detail::NodeAccess::start(*tel_node);
+
+  const PageBudget budget = MeasurePages(telemetry.dictionary());
+  ASSERT_GE(budget.dictionary_pages, 2u);
+  ASSERT_GE(budget.value_pages, 2u);
+
+  constexpr std::uint64_t kTicks = 101;
+  for (std::uint64_t tick = 0; tick < kTicks; ++tick) {
+    SCOPED_TRACE("tick " + std::to_string(tick));
+    const std::size_t before = collected.size();
+    const auto at = event::MonotonicTime::from_nanos(
+        static_cast<std::int64_t>((tick + 1) * 10'000'000LL));
+    src_loop.run_until(at);
+    tel_loop.run_until(at);
+
+    const std::size_t emitted = collected.size() - before;
+    const bool expect_dict = (tick % 100 == 0);
+    const std::size_t expected_dict = expect_dict ? budget.dictionary_pages : 0;
+    ASSERT_EQ(emitted, expected_dict + budget.value_pages);
+
+    std::vector<std::string> dict_names;
+    for (std::size_t i = 0; i < expected_dict; ++i) {
+      const Frame* frame = collected[before + i].get();
+      ASSERT_NE(frame, nullptr);
+      EXPECT_EQ(frame->sequence_id(), tick);
+      EXPECT_EQ(frame->stream_id(), telemetry.stream_id());
+      EXPECT_EQ(frame->dictionary_id(), telemetry.dictionary_id());
+      EXPECT_EQ(frame->channel_count(), telemetry.dictionary().size());
+      ASSERT_NE(frame->dictionary(), nullptr);
+      EXPECT_EQ(frame->channels(), nullptr);
+      EXPECT_EQ(frame->page(), i);
+      EXPECT_EQ(frame->page_count(), budget.dictionary_pages);
+      for (const auto* info : *frame->dictionary()) {
+        dict_names.push_back(info->name()->str());
+      }
+    }
+    if (expect_dict) {
+      ASSERT_EQ(dict_names.size(), telemetry.dictionary().size());
+      for (std::size_t c = 0; c < dict_names.size(); ++c) {
+        EXPECT_EQ(dict_names[c], telemetry.dictionary()[c].name);
+      }
+    }
+    for (std::size_t i = 0; i < budget.value_pages; ++i) {
+      const Frame* frame = collected[before + expected_dict + i].get();
+      ASSERT_NE(frame, nullptr);
+      EXPECT_EQ(frame->sequence_id(), tick);
+      EXPECT_EQ(frame->stream_id(), telemetry.stream_id());
+      EXPECT_EQ(frame->dictionary_id(), telemetry.dictionary_id());
+      EXPECT_EQ(frame->channel_count(), telemetry.dictionary().size());
+      EXPECT_EQ(frame->dictionary(), nullptr);
+      EXPECT_TRUE(frame->keyframe());
+      EXPECT_EQ(frame->page(), i);
+      EXPECT_EQ(frame->page_count(), budget.value_pages);
+    }
+  }
+  std::remove(config_path.c_str());
+}
+
+// Publishes four topics with distinct channel counts whose alphabetical order
+// disagrees with their descending size order:
+//   /alpha/state  (10)   - alphabetically first, third largest
+//   /middle/state (1500) - largest
+//   /tiny/state   (1)    - smallest (tied with pose/valid; omitted from top 3)
+//   /zeta/state   (600)  - alphabetically last, second largest
+class DistinctSizedTopicsNode {
+ public:
+  explicit DistinctSizedTopicsNode(talos::Node& node) {
+    const struct {
+      const char* topic;
+      const char* schema;
+      std::size_t fields;
+      std::uint64_t hash;
+    } specs[] = {
+        {"/alpha/state", "sized.Alpha", 10, 1001},
+        {"/middle/state", "sized.Middle", 1500, 1002},
+        {"/tiny/state", "sized.Tiny", 1, 1003},
+        {"/zeta/state", "sized.Zeta", 600, 1004},
+    };
+    schemas_.reserve(4);
+    for (const auto& s : specs) {
+      schemas_.push_back(MakeDoubleStructSchema(s.schema, s.fields, 4));
+      talos::detail::NodeAccess::add_publisher(
+          node, s.topic, s.fields * sizeof(double), 8,
+          talos::schema::Identity{s.schema, s.hash, schemas_.back()});
+    }
+  }
+
+ private:
+  std::vector<std::string> schemas_;
+};
+
+// REQ-OPS-22: when the dictionary exceeds kMaxChannels, construction fails
+// listing the largest contributing topics in descending channel-count order
+// and omitting smaller topics beyond the top three.
+TEST(TelemetryTest, ChannelCapErrorOrdersLargestSourcesDescending) {
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.sized]
+node = "//sized:node"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)");
+  sim.add<DistinctSizedTopicsNode>("sized");
+  try {
+    sim.add<Telemetry>("telemetry");
+    ADD_FAILURE() << "a dictionary past the channel cap constructed";
+  } catch (const std::runtime_error& error) {
+    const std::string_view msg = error.what();
+    // 10 + 1500 + 1 + 600 + 1 (pose/valid) = 2112 channels.
+    EXPECT_NE(msg.find("2112 channels"), std::string_view::npos) << msg;
+    const std::size_t pos_largest = msg.find("middle/state (1500)");
+    const std::size_t pos_second = msg.find("zeta/state (600)");
+    const std::size_t pos_third = msg.find("alpha/state (10)");
+    ASSERT_NE(pos_largest, std::string_view::npos) << msg;
+    ASSERT_NE(pos_second, std::string_view::npos) << msg;
+    ASSERT_NE(pos_third, std::string_view::npos) << msg;
+    EXPECT_LT(pos_largest, pos_second) << msg;
+    EXPECT_LT(pos_second, pos_third) << msg;
+    // Smallest topics fall outside the top three and are omitted.
+    EXPECT_EQ(msg.find("tiny/state"), std::string_view::npos) << msg;
+    EXPECT_EQ(msg.find("pose/valid"), std::string_view::npos) << msg;
   }
 }
 

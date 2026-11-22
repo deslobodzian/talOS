@@ -575,7 +575,7 @@ class BundleBuilderTest(unittest.TestCase):
         interpreter = ('#!/bin/sh\nhome="$(dirname "$(realpath "$0")")/.."\n'
                        'test -d "$home/lib/python3.11/encodings" || {\n'
                        '  echo "No module named encodings" >&2; exit 1; }\n'
-                       'echo "ran $0"\n')
+                       'echo "ran $$ $0"\n')
         with tempfile.TemporaryDirectory() as tmp:
             nodes = self.python_nodes(tmp, {"a": interpreter, "b": interpreter})
             proc = self.assemble(
@@ -596,11 +596,15 @@ class BundleBuilderTest(unittest.TestCase):
                 venv = os.path.join(built, "bin", f"{name}.runfiles", "_main",
                                     name, "_node_bin.venv", "bin", "python3")
                 with self.subTest(node=name):
-                    run = subprocess.run([venv], capture_output=True,
-                                         text=True, timeout=60)
-                    self.assertEqual(run.returncode, 0, run.stderr)
+                    run = subprocess.Popen([venv], stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True)
+                    out, err = run.communicate(timeout=60)
+                    self.assertEqual(run.returncode, 0, err)
+                    _, pid_str, exe_path = out.strip().split(" ", 2)
+                    # The venv wrapper execs the interpreter in place.
+                    self.assertEqual(int(pid_str), run.pid, out)
                     self.assertEqual(
-                        os.path.realpath(run.stdout.split(" ", 1)[1].strip()),
+                        os.path.realpath(exe_path),
                         os.path.realpath(os.path.join(built, held[0])))
 
     # REQ-OPS-48
@@ -1476,7 +1480,20 @@ class DeployTest(unittest.TestCase):
     def test_run_on_linux_starts_nothing_without_the_limit_grant(self):
         import resource
 
-        def lowered():
+        script = os.path.abspath(runfiles.Create().Rlocation(
+            "_main/tools/deploy.sh"))
+
+        def assert_limit_refusal(proc, record):
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            lines = proc.stderr.splitlines()
+            self.assertEqual(len(lines), 1, proc.stderr)
+            self.assertIn("limits.d/talos.conf", lines[0])
+            self.assertIn("rtprio", lines[0])
+            self.assertIn("memlock", lines[0])
+            self.assertFalse(os.path.exists(record), proc.stdout)
+
+        # Kernel RLIMIT_RTPRIO refusal.
+        def lowered_rtprio():
             resource.setrlimit(resource.RLIMIT_RTPRIO, (0, 0))
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1484,12 +1501,104 @@ class DeployTest(unittest.TestCase):
             env = dict(os.environ, PATH=self.host(tmp, "Linux") + os.pathsep
                        + os.environ["PATH"])
             proc = subprocess.run(
-                ["bash", os.path.abspath(runfiles.Create().Rlocation(
-                    "_main/tools/deploy.sh")), "run", "--prefix", prefix],
-                capture_output=True, text=True, env=env, preexec_fn=lowered)
-            self.assertNotEqual(proc.returncode, 0, proc.stdout)
-            self.assertIn("rtprio", proc.stderr)
-            self.assertFalse(os.path.exists(record), proc.stdout)
+                ["bash", script, "run", "--prefix", prefix],
+                capture_output=True, text=True, env=env,
+                preexec_fn=lowered_rtprio)
+            assert_limit_refusal(proc, record)
+
+        # Independent RLIMIT_MEMLOCK failure (rtprio granted, memlock denied),
+        # independent RLIMIT_RTPRIO failure (rtprio denied, memlock granted),
+        # and both-granted control — exercised via BASH_ENV ulimit shim so
+        # memlock is tested independently even on hosts where hard rtprio is 0.
+        for label, rt_ok, ml_ok in (
+                ("memlock_only_fails", True, False),
+                ("rtprio_only_fails", False, True),
+                ("both_succeed", True, True)):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                prefix, record = self.selected(tmp)
+                shim = os.path.join(tmp, "ulimit_shim.sh")
+                put(shim, (
+                    "ulimit() {\n"
+                    f"  case \"$*\" in\n"
+                    f"    '-r 49') return {0 if rt_ok else 1} ;;\n"
+                    f"    '-l unlimited') return {0 if ml_ok else 1} ;;\n"
+                    f"    '-H -r') echo {49 if rt_ok else 0} ;;\n"
+                    f"    '-H -l') echo {'unlimited' if ml_ok else 8192} ;;\n"
+                    f"    *) builtin ulimit \"$@\" ;;\n"
+                    f"  esac\n"
+                    "}\n"
+                ))
+                env = dict(os.environ,
+                           PATH=self.host(tmp, "Linux") + os.pathsep
+                           + os.environ["PATH"],
+                           BASH_ENV=shim)
+                proc = subprocess.run(
+                    ["bash", script, "run", "--prefix", prefix],
+                    capture_output=True, text=True, env=env)
+                if rt_ok and ml_ok:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertTrue(os.path.exists(record), proc.stdout)
+                else:
+                    assert_limit_refusal(proc, record)
+
+    # REQ-OPS-54: an unwritable `<prefix>/logs` root is refused naming
+    # `--output-dir` without starting the launcher, while `--output-dir DIR`
+    # overrides the root, succeeds, and prints the override root.
+    def test_run_refuses_unwritable_log_root_unless_output_dir_given(self):
+        script = os.path.abspath(runfiles.Create().Rlocation(
+            "_main/tools/deploy.sh"))
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, record = self.selected(tmp)
+            logs = os.path.join(prefix, "logs")
+            os.makedirs(logs)
+            env = dict(os.environ, PATH=self.host(tmp, "Darwin") + os.pathsep
+                       + os.environ["PATH"])
+
+            # Writable `<prefix>/logs` succeeds and prints that root.
+            proc = subprocess.run(
+                ["bash", script, "run", "--prefix", prefix],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(logs, proc.stdout)
+            self.assertTrue(os.path.exists(record))
+            os.remove(record)
+
+            # Read-only (0555) `<prefix>/logs` is refused naming --output-dir.
+            if os.geteuid() != 0:
+                os.chmod(logs, 0o555)
+                try:
+                    proc = subprocess.run(
+                        ["bash", script, "run", "--prefix", prefix],
+                        capture_output=True, text=True, env=env)
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                    self.assertIn(logs, proc.stderr)
+                    self.assertIn("--output-dir", proc.stderr)
+                    self.assertFalse(os.path.exists(record), proc.stdout)
+
+                    # Passing `--output-dir <writable>` overrides the root,
+                    # succeeds, prints pid and `--output-dir`, and forwards it.
+                    writable = os.path.join(tmp, "writable_logs")
+                    os.makedirs(writable)
+                    dry = subprocess.run(
+                        ["bash", script, "run", "--dry-run", "--prefix", prefix,
+                         "--output-dir", writable],
+                        capture_output=True, text=True, env=env)
+                    self.assertEqual(dry.returncode, 0, dry.stderr)
+                    self.assertIn(writable, dry.stdout)
+                    self.assertFalse(os.path.exists(record), dry.stdout)
+
+                    proc = subprocess.run(
+                        ["bash", script, "run", "--prefix", prefix,
+                         "--output-dir", writable],
+                        capture_output=True, text=True, env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    with open(record, encoding="utf-8") as f:
+                        pid, _, *args = f.read().splitlines()
+                    self.assertRegex(proc.stdout, rf"\bpid {pid}\b")
+                    self.assertIn("--output-dir", proc.stdout)
+                    self.assertEqual(args, ["--output-dir", writable])
+                finally:
+                    os.chmod(logs, 0o755)
 
     def test_rollback_refuses_a_previous_bundle_that_is_gone(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
