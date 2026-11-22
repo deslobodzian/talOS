@@ -950,6 +950,63 @@ TEST(PhoenixBackendSim, WpilibPlantReflectsMotorTypeFocGearingAndSupply) {
   backend.Neutral();
 }
 
+// Under desktop simulation with kRemoteCANcoder and sensor_to_mechanism_ratio
+// != 1, the simulated CANcoder sits on the sensor shaft (rotor /
+// rotor_to_sensor_ratio = mechanism * sensor_to_mechanism_ratio) so Phoenix 6's
+// TalonFX divides by SensorToMechanismRatio once, reporting rotor / (R * S)
+// rather than rotor / (R * S^2).
+// REQ-DEV-06
+TEST(PhoenixBackendSim, RemoteCancoderAppliesSensorToMechanismRatioOnce) {
+  EnsureHal();
+  EnabledDs ds;
+
+  constexpr double kRotorToSensor = 4.0;
+  constexpr double kSensorToMechanism = 3.0;
+  constexpr double kTotalRatio = kRotorToSensor * kSensorToMechanism;
+
+  hw::Config config;
+  auto rotor_ref = TestMotor(1, "rotor_ref", 1);
+  hw::SensorConfig enc{10, "remote_enc", hw::SensorKind::kCANcoder, 10, "rio"};
+  config.sensors.push_back(enc);
+
+  auto remote = TestMotor(2, "remote_motor", 2);
+  remote.feedback = hw::Feedback::kRemoteCANcoder;
+  remote.feedback_sensor_id = enc.id;
+  remote.rotor_to_sensor_ratio = kRotorToSensor;
+  remote.sensor_to_mechanism_ratio = kSensorToMechanism;
+  config.motors = {rotor_ref, remote};
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  const std::array<hw::MotorRequest, 2> drive_6v{
+      Request(1, hw::Mode::kVoltage, 6.0), Request(2, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, drive_6v, 35);
+  ASSERT_TRUE(state.motors[0].valid);
+  ASSERT_TRUE(state.motors[1].valid);
+  ASSERT_TRUE(state.sensors[0].valid);
+  ASSERT_GT(state.motors[0].velocity_rps, 40.0);
+  ASSERT_GT(state.motors[0].position_rot, 1.0);
+
+  // CANcoder sits on the sensor shaft: rotor / rotor_to_sensor_ratio.
+  EXPECT_NEAR(state.sensors[0].velocity_rps,
+              state.motors[0].velocity_rps / kRotorToSensor, 0.5);
+  // TalonFX divides CANcoder by sensor_to_mechanism_ratio once:
+  // mechanism = rotor / (rotor_to_sensor_ratio * sensor_to_mechanism_ratio).
+  EXPECT_NEAR(state.motors[1].velocity_rps,
+              state.motors[0].velocity_rps / kTotalRatio, 0.25);
+  EXPECT_NEAR(state.motors[1].position_rot,
+              state.motors[0].position_rot / kTotalRatio, 0.15);
+  EXPECT_NEAR(
+      std::remainder(state.sensors[0].position_rot -
+                         state.motors[1].position_rot * kSensorToMechanism,
+                     1.0),
+      0.0, 0.05);
+  backend.Neutral();
+}
+
 // Under desktop simulation, inferred swerve or differential chassis kinematics
 // integrate wheel motion into Pigeon2 yaw and yaw rate, while a non-chassis
 // configuration leaves manually injected SetRawYaw untouched.
