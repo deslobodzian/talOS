@@ -14,6 +14,47 @@
   // A widget showing one of these shows no value.
   const PLACEHOLDER_TAGS = new Set(['NO DATA', 'NO POSE', 'unknown']);
 
+  // Non-intrusive hooks installed before drive.html loads:
+  // 1) A monotonic wall-clock offset so sleep-detection and visibilitychange
+  //    tests can advance Date.now() relative to performance.now() (zero by
+  //    default, leaving Date.now() unchanged for every other check).
+  // 2) Observation of DrawSchedule's freshness-deadline setTimeout (<= 350 ms)
+  //    so the stale-transition check knows the exact STALE_MS + 1 deadline
+  //    armed from the last new telemetry tick.
+  const realDateNow = Date.now.bind(Date);
+  let wallOffsetMs = 0;
+  Date.now = () => realDateNow() + wallOffsetMs;
+  const shiftWallClock = deltaMs => { wallOffsetMs += deltaMs; };
+
+  const realSetTimeout = window.setTimeout.bind(window);
+  const realClearTimeout = window.clearTimeout.bind(window);
+  const trackedTimers = new Map();
+  let lastFiredTimer = null;
+  let lastClearedTimer = null;
+  window.setTimeout = function(fn, ms, ...args) {
+    const delay = Number(ms);
+    const track = typeof fn === 'function' && Number.isFinite(delay) && delay > 0 && delay <= 350;
+    const armedAt = track ? performance.now() : 0;
+    let handle;
+    const wrapped = track ? function(...cbArgs) {
+      const entry = trackedTimers.get(handle);
+      trackedTimers.delete(handle);
+      if (entry) lastFiredTimer = {...entry, firedAt: performance.now()};
+      return fn.apply(this, cbArgs);
+    } : fn;
+    handle = realSetTimeout(wrapped, ms, ...args);
+    if (track) trackedTimers.set(handle, {handle, armedAt, delay, targetAt: armedAt + delay});
+    return handle;
+  };
+  window.clearTimeout = function(handle) {
+    const entry = trackedTimers.get(handle);
+    if (entry) {
+      trackedTimers.delete(handle);
+      lastClearedTimer = {...entry, clearedAt: performance.now()};
+    }
+    return realClearTimeout(handle);
+  };
+
   const box = r => ({left: +r.left.toFixed(3), top: +r.top.toFixed(3),
                      right: +r.right.toFixed(3), bottom: +r.bottom.toFixed(3)});
 
@@ -201,6 +242,48 @@
   const valued = () => current() && !document.querySelector('.w .absent') &&
       ![...document.querySelectorAll('.w .tag, .w .mode')].some(t => PLACEHOLDER_TAGS.has(t.textContent.trim()));
 
+  function headerState(kind) {
+    const w = document.querySelector(`.w-${kind}`);
+    const header = w.querySelector(':scope > header');
+    const c = clipBox(header);
+    const measure = el => {
+      if (!el) return null;
+      const fit = textFit(el);
+      const r = el.getBoundingClientRect();
+      return {
+        text: el.textContent,
+        rect: box(r),
+        scrollWidth: el.scrollWidth,
+        clientWidth: el.clientWidth,
+        textWidth: +fit.text.toFixed(3),
+        contentWidth: +fit.content.toFixed(3),
+        textOverflow: getComputedStyle(el).textOverflow,
+        insideHeader: !outside(r, c),
+      };
+    };
+    return {
+      header: box(c),
+      h2: measure(header.querySelector('h2')),
+      meta: measure(header.querySelector('.meta')),
+      badge: measure(header.querySelector('.out-of-view')),
+    };
+  }
+
+  function staleStyle() {
+    return telemetryWidgets().map(w => {
+      const body = w.querySelector('.body');
+      const big = w.querySelector('.big');
+      return {
+        kind: [...w.classList].find(c => c.startsWith('w-')) ?? '',
+        staleClass: w.classList.contains('stale'),
+        tag: w.querySelector('.tag-stale')?.textContent ?? null,
+        opacity: body ? parseFloat(getComputedStyle(body).opacity) : null,
+        lineThrough: big ? getComputedStyle(big).textDecorationLine.includes('line-through') : null,
+        absentCount: w.querySelectorAll('.absent').length,
+      };
+    });
+  }
+
   // Resolves with `predicate()`'s first truthy value, re-checked on every
   // change to the page; rejects after `boundMs`, which only bounds a hang.
   function waitFor(predicate, boundMs, what) {
@@ -211,13 +294,13 @@
         const value = predicate();
         if (value) {
           observer.disconnect();
-          clearTimeout(timer);
+          realClearTimeout(timer);
           resolve(value);
         }
       });
       observer.observe(document, {subtree: true, childList: true, attributes: true,
                                                   characterData: true});
-      const timer = setTimeout(() => {
+      const timer = realSetTimeout(() => {
         observer.disconnect();
         reject(new Error(`${what}: not within ${boundMs} ms; status ${JSON.stringify(status())}`));
       }, boundMs);
@@ -232,17 +315,94 @@
   // stops the producer after this returns, so the producer's last tick is no
   // earlier than this instant less one producer period.
   function armStale(boundMs) {
+    lastFiredTimer = null;
+    lastClearedTimer = null;
     const armedAt = performance.now();
     window.__stale = (async () => {
       const staleAt = await waitFor(() => telemetryWidgets().every(w => w.classList.contains('stale')) &&
                                         performance.now(), boundMs, 'telemetry widgets stale');
+      const deadlineTimer = lastFiredTimer ?? lastClearedTimer;
+      const styles = staleStyle();
       const named = await waitFor(() => status()?.link === 'link-telemetry' && status(), boundMs,
                                   'status names telemetry');
       return {armedAt, staleAt, status: named, namedAt: performance.now(),
-              widgets: telemetryWidgets().length};
+              widgets: telemetryWidgets().length, deadlineTimer,
+              firedByDeadlineTimer: Boolean(lastFiredTimer), styles};
     })();
     return armedAt;
   }
 
-  window.__probe = {audit, listState, waitFor, frames, current, valued, allUp, status, armStale};
+  // Arms listeners around main.ts's document `visibilitychange` handler:
+  // when the tab hides and then returns to `visible`, the window capture
+  // listener runs before main.ts (recording pre-draw state and shifting the
+  // wall clock by `shiftMs`), main.ts runs `schedule.frame()` synchronously,
+  // and the document target listener registered here runs immediately after
+  // inside the same event dispatch (before any timer or WebSocket callback).
+  function armVisibilityReturn(shiftMs, boundMs) {
+    let sawHidden = false;
+    let before = null;
+    let settled = false;
+    window.__visHidden = new Promise((resolve, reject) => {
+      if (document.visibilityState === 'hidden') return resolve(true);
+      const onHide = () => {
+        if (document.visibilityState === 'hidden') {
+          document.removeEventListener('visibilitychange', onHide);
+          realClearTimeout(hideTimer);
+          resolve(true);
+        }
+      };
+      document.addEventListener('visibilitychange', onHide);
+      const hideTimer = realSetTimeout(() => {
+        document.removeEventListener('visibilitychange', onHide);
+        reject(new Error(`tab did not become hidden within ${boundMs} ms (state=${document.visibilityState})`));
+      }, boundMs);
+    });
+    window.__visReturn = new Promise((resolve, reject) => {
+      const cleanup = () => {
+        window.removeEventListener('visibilitychange', onCapture, true);
+        document.removeEventListener('visibilitychange', onAfter, false);
+        realClearTimeout(timer);
+      };
+      const onCapture = () => {
+        if (document.visibilityState === 'hidden') {
+          sawHidden = true;
+          return;
+        }
+        if (sawHidden && document.visibilityState === 'visible' && !settled) {
+          before = {
+            status: status(),
+            staleCount: document.querySelectorAll('.w.stale').length,
+            totalWidgets: document.querySelectorAll('.w').length,
+          };
+          shiftWallClock(shiftMs);
+        }
+      };
+      const onAfter = () => {
+        if (sawHidden && document.visibilityState === 'visible' && !settled) {
+          settled = true;
+          const after = {
+            status: status(),
+            staleCount: document.querySelectorAll('.w.stale').length,
+            totalWidgets: document.querySelectorAll('.w').length,
+          };
+          cleanup();
+          resolve({sawHidden, before, after});
+        }
+      };
+      window.addEventListener('visibilitychange', onCapture, true);
+      document.addEventListener('visibilitychange', onAfter, false);
+      const timer = realSetTimeout(() => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          reject(new Error(`visibilitychange return: not within ${boundMs} ms (sawHidden=${sawHidden}, state=${document.visibilityState})`));
+        }
+      }, boundMs);
+    });
+    return true;
+  }
+
+  window.__probe = {audit, listState, headerState, staleStyle, waitFor, frames,
+                    current, valued, allUp, status, armStale, shiftWallClock,
+                    armVisibilityReturn};
 })();
