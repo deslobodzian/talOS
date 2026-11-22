@@ -339,16 +339,18 @@ class GradlewRunnerTest(unittest.TestCase):
 
     # REQ-DEV-25, REQ-DEV-30
     def test_sigterm_forwarded_to_gradle_and_releases_lock(self):
+        # Block SIGTERM before signalling readiness and consume it with
+        # sigwait() rather than signal.pause(): pause() sleeps forever if
+        # SIGTERM trips CPython's C handler just before the pause() syscall.
         signal_script = (
-            "def _on_term(signum, _frame):\n"
-            "    payload['received_signal'] = signum\n"
-            "    with open(os.environ['FAKE_JAVA_OUT'], 'w', encoding='utf-8') as out:\n"
-            "        json.dump(payload, out)\n"
-            "    sys.exit(128 + signum)\n"
-            "signal.signal(signal.SIGTERM, _on_term)\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
             "signal.alarm(10)\n"
             "print('FAKE_JAVA_READY', flush=True)\n"
-            "signal.pause()\n"
+            "signum = signal.sigwait({signal.SIGTERM})\n"
+            "payload['received_signal'] = signum\n"
+            "with open(os.environ['FAKE_JAVA_OUT'], 'w', encoding='utf-8') as out:\n"
+            "    json.dump(payload, out)\n"
+            "sys.exit(128 + signum)\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
             cache = os.path.join(tmp, "cache")
