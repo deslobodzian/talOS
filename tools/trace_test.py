@@ -551,6 +551,115 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(failures, 1, out)
         self.assertIn("REQ-SAFE-01", out)
 
+    def test_leading_colon_src_resolves_for_lanes_and_quarantine(self):
+        # Package-local `:node_test.cc` resolves for fast-lane tier checks.
+        colon_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = [":node_test.cc"],\n)\n'
+        )
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="unit")),
+            "talOS/node/BUILD": colon_build,
+        }))
+        self.assertEqual(failures, 0, out)
+
+        # Package-local `:node_test.cc` on a quarantined target still hides its
+        # tags.
+        q_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = [":node_test.cc"],\n'
+            '    tags = ["manual", "quarantine"],\n)\n'
+        )
+        todo = (
+            "- [ ] **ARCH-2 — Layers are unchecked.**\n"
+            "- [ ] **FLAKE-1 — `//talOS/node:node_test` fails.** "
+            "Fix by 2026-11-20.\n"
+        )
+        failures, out = check(tree(**{
+            "talOS/node/BUILD": q_build,
+            "TODO.md": todo,
+        }))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("REQ-SAFE-01 (P0, SAFE) has no tagged test", out)
+
+    def test_quarantined_target_with_non_literal_srcs_fails_closed(self):
+        q_build = (
+            'SRCS = ["node_test.cc"]\n'
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = SRCS,\n'
+            '    tags = ["manual", "quarantine"],\n)\n'
+        )
+        todo = (
+            "- [ ] **ARCH-2 — Layers are unchecked.**\n"
+            "- [ ] **FLAKE-1 — `//talOS/node:node_test` fails.** "
+            "Fix by 2026-11-20.\n"
+        )
+        failures, out = check(tree(**{
+            "docs/REQUIREMENTS.md": catalogue(
+                row("REQ-SAFE-01", "P0", tier="bench")),
+            "talOS/node/BUILD": q_build,
+            "TODO.md": todo,
+        }))
+        self.assertGreaterEqual(failures, 1, out)
+        self.assertIn("non-literal", out)
+
+    def test_quarantine_label_requires_token_boundaries_in_todo(self):
+        q_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["node_test.cc"],\n'
+            '    tags = ["manual", "quarantine"],\n)\n'
+        )
+        # Substring matches (`node_test_extra`, `node_test2`, `node_test-slow`,
+        # `foo//talOS/node:node_test`) must NOT satisfy the quarantine TODO.
+        for bad_ref in (
+            "`//talOS/node:node_test_extra`",
+            "`//talOS/node:node_test2`",
+            "`//talOS/node:node_test-slow`",
+            "`foo//talOS/node:node_test`",
+            "`//talOS/node:node_test.cc`",
+        ):
+            with self.subTest(bad_ref=bad_ref):
+                todo = (
+                    "- [ ] **ARCH-2 — Layers are unchecked.**\n"
+                    f"- [ ] **FLAKE-1 — {bad_ref} fails.** Fix by 2026-11-20.\n"
+                )
+                failures, out = check(tree(**{
+                    "talOS/node/BUILD": q_build,
+                    "TODO.md": todo,
+                }))
+                self.assertEqual(failures, 2, out)
+                self.assertIn("without an open, dated", out)
+
+        # Punctuation delimiters around the exact label still match.
+        for good_ref in (
+            "//talOS/node:node_test.",
+            "//talOS/node:node_test: fails",
+            "(//talOS/node:node_test)",
+        ):
+            with self.subTest(good_ref=good_ref):
+                todo = (
+                    "- [ ] **ARCH-2 — Layers are unchecked.**\n"
+                    f"- [ ] **FLAKE-1 — {good_ref} Fix by 2026-11-20.**\n"
+                )
+                failures, out = check(tree(**{
+                    "talOS/node/BUILD": q_build,
+                    "TODO.md": todo,
+                }))
+                self.assertEqual(failures, 1, out)
+                self.assertNotIn("without an open, dated", out)
+
+    def test_duplicate_requirement_id_row_fails_closed(self):
+        # A duplicate REQ-ID in the same catalogue must fail rather than
+        # silently overwriting the first row.
+        dup_catalogue = catalogue(
+            row("REQ-SAFE-01", "P0", tier="unit"),
+            row("REQ-SAFE-01", "P2", tier="bench"),
+        )
+        failures, out = check(tree(**{"docs/REQUIREMENTS.md": dup_catalogue}))
+        self.assertGreaterEqual(failures, 1, out)
+        self.assertIn("duplicate requirement REQ-SAFE-01", out)
+
 
 if __name__ == "__main__":
     unittest.main()

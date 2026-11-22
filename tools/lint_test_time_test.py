@@ -93,11 +93,45 @@ class LintTestTimeTest(unittest.TestCase):
             "talOS/launcher/launcher.cc": SLEEP + CLOCK,
             "examples/lib/helper.cc": CLOCK,
             "examples/lib/BUILD": "cc_library(name = 'helper')\n",
-            "talOS/rtms/rtms_test.cc": "// " + SLEEP + "# " + PY_CLOCK,
+            "talOS/rtms/rtms_test.cc": (
+                "// " + SLEEP +
+                "/* " + CLOCK.rstrip("\n") + " */\n" +
+                "/*\n" + SLEEP + " * " + CLOCK + " */\n"
+            ),
+            "talOS/python/test_comment.py": "# " + PY_CLOCK + "x = 1  # " + PY_SLEEP,
             "studio/src/worker.ts": TS_SLEEP + TS_CLOCK,
-            "studio/tests/view.test.tsx": "// " + TS_SLEEP,
+            "studio/tests/view.test.tsx": (
+                "// " + TS_SLEEP +
+                "/*\n" + TS_CLOCK + "*/\n"
+            ),
         })
         self.assertEqual(failures, 0, out)
+
+    # REQ-RT-17: inline block comments and leading `*` dereferences must not
+    # hide real-clock or sleep calls.
+    def test_block_comment_prefix_and_pointer_deref_do_not_hide_hits(self):
+        ptr_clock = "*ptr = std::chrono::steady_clock::" + "now();\n"
+        cases = (
+            ("inline_block_comment_before_sleep",
+             "talOS/rtms/rtms_test.cc", "/* ok */ " + SLEEP, 1),
+            ("pointer_deref_clock",
+             "talOS/rtms/rtms_test.cc", ptr_clock, 1),
+            ("multiline_block_comment_trailing_code",
+             "talOS/rtms/rtms_test.cc", "/* line 1\n * line 2 */ " + SLEEP, 2),
+            ("code_before_block_comment",
+             "talOS/rtms/rtms_test.cc", SLEEP.rstrip("\n") + " /* ok\n*/\n", 1),
+            ("ts_inline_block_comment",
+             "studio/tests/agent.test.ts", "/* ok */ " + TS_SLEEP, 1),
+            ("py_code_before_hash_comment",
+             "talOS/python/test_node.py", PY_SLEEP.rstrip("\n") + "  # ok\n", 1),
+            ("cpp_define_not_a_comment",
+             "talOS/rtms/rtms_test.cc", "#define WAIT() " + SLEEP, 1),
+        )
+        for name, path, text, expected_line in cases:
+            with self.subTest(name):
+                failures, out = lint({path: text})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{path}:{expected_line}:", out)
 
     def test_allowlist_needs_a_reason_and_only_shrinks(self):
         files = {"talOS/launcher/launcher_test.cc": SLEEP}

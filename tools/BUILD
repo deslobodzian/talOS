@@ -557,3 +557,17 @@ py_test(
     legacy_create_init = False,
     main = "retry_unacquired_test.py",
 )
+
+# python3 tools/check_runfiles_collisions.py (CI: the Linux job, after the build)
+# Fails on empty/real runfiles collisions, generated _main/**/__init__.py, or
+# zero manifests found.
+py_test(
+    name = "check_runfiles_collisions_test",
+    size = "small",
+    srcs = [
+        "check_runfiles_collisions.py",
+        "check_runfiles_collisions_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_runfiles_collisions_test.py",
+)

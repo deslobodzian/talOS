@@ -1346,6 +1346,44 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 self.assertGreaterEqual(failures, 1, f"{name}: {out}")
                 self.assertIn("bench/arm/arm.cc:1:", out)
 
+    # REQ-SAFE-27, REQ-CONTRACT-16
+    def test_case_and_nested_talos_segment_include_bypasses_are_refused(self):
+        cases = [
+            ("nested_talos_exact",
+             '#include "a/talOS/b/talOS/node/access.h"\n'),
+            ("nested_talos_mixed_case_prefix",
+             '#include "a/talos/b/TALOS/rtms/rtms.h"\n'),
+            ("lowercase_exact",
+             '#include "talos/node/access.h"\n'),
+            ("uppercase_exact",
+             '#include <TALOS/NODE/INTERNAL.H>\n'),
+            ("mixed_case_prefix",
+             '#include "Talos/IPC/Publisher.h"\n'),
+            ("mixed_case_devices_access",
+             '#include "talOS/Devices/Access.h"\n'),
+        ]
+        for name, body in cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": body,
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/arm.cc:1:", out)
+
+        # Starlark defines carrying nested/lowercased forbidden paths fail too.
+        starlark_files = {
+            "bench/arm/BUILD": (
+                'cc_library(name = "arm", srcs = ["arm.cc"], '
+                'defines = ["H=\\"a/talOS/b/talos/devices/access.h\\""])\n'
+            ),
+            "bench/arm/arm.cc": "int ok = 1;\n",
+        }
+        failures, out = run_sources(starlark_files)
+        self.assertGreaterEqual(failures, 1, out)
+        self.assertIn("bench/arm/BUILD:1:", out)
+
 
 if __name__ == "__main__":
     unittest.main()
