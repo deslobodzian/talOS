@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "talOS/devices/devices.h"
@@ -811,6 +812,33 @@ TEST(TargetLane, StampsZeroOnceItsNodesDriverStationViewIsStale) {
   EXPECT_EQ(envelope->mode_since_us(), 0u);
 }
 
+// REQ-SAFE-12: a fresh, attached Driver Station that shows no mode (enabled
+// but e-stopped, or enabled with no mode bit) stamps 0, though the packet
+// itself carries a nonzero mode_since_us the lane could have copied
+TEST(TargetLane, StampsZeroWhileItsNodesDriverStationShowsNoMode) {
+  for (const auto& [label, flags] :
+       {std::pair{"e-stopped teleop", kTeleop | ds::kEStop},
+        std::pair{"enabled, no mode", std::uint32_t{ds::kEnabled}}}) {
+    SCOPED_TRACE(label);
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<Producer>("producer");
+    SimHardware hw{sim};
+    hw.enable();
+    hw.set_driver_station(DsPacket(flags));
+    sim.step(20ms);
+    const auto packet =
+        sim.latest<hardware::Packet>(hardware::kDriverStationTopic);
+    ASSERT_TRUE(packet.has_value());
+    ds::DriverStationData data{};
+    ASSERT_TRUE(ds::Decode(packet->bytes(), data));
+    ASSERT_NE(data.mode_since_us, 0u);
+    const auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+    ASSERT_TRUE(envelope.has_value());
+    EXPECT_EQ(envelope->active, 1);
+    EXPECT_EQ(envelope->mode_since_us(), 0u);
+  }
+}
+
 // A producer with its own lane, for the remapped config.
 struct BlindProducer {
   explicit BlindProducer(Node& node) : lane{node, "lift", "align"} {}
@@ -861,6 +889,7 @@ struct Operator {
       : ds{node}, arming{node}, lane{node, "lift", "teleop", arming} {}
   void update() {
     if (!ds.connected()) saw_stale = true;
+    if (!ds.enabled()) saw_disabled = true;
     const bool held = ds.joystick(0).button(1);
     if (disarm_next) {
       arming.disarm();
@@ -878,6 +907,7 @@ struct Operator {
   TargetLane<Goal> lane;
   bool paused = false;
   bool saw_stale = false;
+  bool saw_disabled = false;
   bool disarm_next = false;  // disarm() on the next update(), then evaluate
 };
 
@@ -1000,6 +1030,66 @@ TEST_F(OperatorArmingTest, InputHeldThroughADisarmWaitsForNeutral) {
   ASSERT_FALSE(op.disarm_next);
   ASSERT_EQ(DriverStationGeneration(sim), generation);
   ExpectReleasedUntilNeutralThenDriving();
+}
+
+// REQ-SAFE-13: held through a disable so brief that no 20 ms evaluation
+// sampled it (one 5 ms packet between two evaluations): its new generation
+// alone disarms.
+TEST_F(OperatorArmingTest, InputHeldThroughAnUnsampledDisableWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  const std::uint64_t generation = DriverStationGeneration(sim);
+  // The operator evaluates at multiples of 20 ms; 140 ms is one. The
+  // disabled packet goes out at 145 ms and is replaced at 150 ms.
+  op.saw_disabled = false;
+  sim.step(5ms);
+  Packet(0, true);
+  sim.step(5ms);
+  Packet(kTeleop, true);
+  sim.step(5ms);
+  ASSERT_NE(DriverStationGeneration(sim), generation);
+  ASSERT_FALSE(op.saw_disabled);
+  ExpectReleasedUntilNeutralThenDriving();
+}
+
+// REQ-SAFE-13: a neutral reading taken while the Driver Station shows no
+// mode does not arm the lane for the enable that follows.
+TEST_F(OperatorArmingTest, NeutralWhileDisabledDoesNotArmTheNextEnable) {
+  Packet(0, false);
+  sim.step(100ms);
+  Packet(kTeleop, true);
+  ExpectReleasedUntilNeutralThenDriving();
+}
+
+// REQ-SAFE-13: held through a gateway reboot whose first packets carry the
+// same mode_since_us as the old boot's: the new boot id alone disarms. The
+// Driver Station stays fresh throughout.
+TEST_F(OperatorArmingTest, InputHeldThroughANewBootOfTheSameGenerationWaits) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  const auto last = sim.latest<hardware::Packet>(hardware::kDriverStationTopic);
+  ASSERT_TRUE(last.has_value());
+  ds::DriverStationData data{};
+  ASSERT_TRUE(ds::Decode(last->bytes(), data));
+  ASSERT_NE(data.mode_since_us, 0u);
+  hw.stop_driver_station();
+  data.boot_id += 1;
+  // The new boot's packets every 5 ms for `d`, with the button held or not.
+  const auto publish = [&](bool held, std::chrono::milliseconds d) {
+    for (auto t = 0ms; t < d; t += 5ms) {
+      data.sample_time_us += 5000;
+      data.joysticks[0].buttons = held ? 1u : 0u;
+      hardware::Packet packet{};
+      packet.size = static_cast<std::uint32_t>(ds::Encode(data, packet.data));
+      sim.publish(hardware::kDriverStationTopic, packet);
+      sim.step(5ms);
+    }
+  };
+  publish(true, 60ms);
+  EXPECT_FALSE(Active());
+  EXPECT_EQ(lift.seen, std::nullopt);
+  publish(false, 40ms);
+  publish(true, 40ms);
+  EXPECT_TRUE(Active());
+  EXPECT_NE(lift.seen, std::nullopt);
 }
 
 // REQ-OPS-55: OperatorArming records the blocking input while disarmed and
@@ -1583,6 +1673,65 @@ TEST(TargetGate, ACentrePulseWithoutATargetIsHeld) {
   EXPECT_EQ(hw.pwm("gate", "servo"), std::nullopt);
   EXPECT_EQ(hw.applied_pwm("gate", "servo"), std::nullopt);
   EXPECT_TRUE(detail::NodeAccess::outputs_held(gate.node));
+}
+
+// Whether a node with no live target reports outputs held and prints the
+// stderr line depends on what its update() set: a digital output set true
+// alone is held, with one line for the spell; setting nothing, or setting
+// every output to its neutral, holds nothing back and prints nothing.
+// REQ-SAFE-41
+TEST(TargetGate, OnlyANonNeutralOutputSetWithoutATargetIsReportedHeld) {
+  enum class Sets { kDigitalOnly, kNothing, kOnlyNeutral };
+  struct Untargeted {
+    explicit Untargeted(Node& n) : node{n}, devices{n} {}
+    void update() {
+      switch (sets) {
+        case Sets::kDigitalOnly:
+          devices.led.set(true);
+          break;
+        case Sets::kNothing:
+          break;
+        case Sets::kOnlyNeutral:
+          devices.motor.stop();
+          devices.led.set(false);
+          devices.servo.stop();
+          break;
+      }
+    }
+    Node& node;
+    GateDevices devices;
+    Sets sets = Sets::kNothing;
+  };
+  struct Case {
+    const char* label;
+    Sets sets;
+    bool held;
+    std::size_t lines;
+  };
+  for (const auto& [label, sets, held, lines] :
+       {Case{"digital output only", Sets::kDigitalOnly, true, 1},
+        Case{"nothing", Sets::kNothing, false, 0},
+        Case{"only neutral", Sets::kOnlyNeutral, false, 0}}) {
+    SCOPED_TRACE(label);
+    auto sim = Sim::FromToml(kGateToml);
+    auto& gate = sim.add<Untargeted>("gate");
+    gate.sets = sets;
+    SimHardware hw{sim};
+    hw.set_driver_station(DsPacket(kTeleop));
+    ::testing::internal::CaptureStderr();
+    hw.enable();
+    sim.step(40ms);
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(robot_enabled(gate.node));
+    EXPECT_FALSE(hw.applied_digital_output("gate", "led"));
+    EXPECT_EQ(detail::NodeAccess::outputs_held(gate.node), held);
+    std::size_t printed = 0;
+    for (std::size_t at = err.find("gate: "); at != std::string::npos;
+         at = err.find("gate: ", at + 1)) {
+      ++printed;
+    }
+    EXPECT_EQ(printed, lines) << err;
+  }
 }
 
 // A 0 A torque-current demand is a driving request, not neutral: in a tick

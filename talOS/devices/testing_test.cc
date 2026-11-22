@@ -1132,5 +1132,52 @@ can_id = 1
   EXPECT_DOUBLE_EQ(hw.applied_motor("lift", "m").demand, 0.25);
 }
 
+// REQ-SAFE-31: a node restarted during a link outage, while no hardware
+// State or Driver Station packet is published, never acts on the ones
+// published before it attached, though they are younger than
+// command_timeout_us: it reads the robot disabled and the Driver Station
+// absent until post-attach ones arrive.
+TEST(SimHardwareRestart, RestartedNodeIgnoresStateAndDriverStationFromBefore) {
+  struct Probe {
+    // Asking once here opens its /hw/state subscription now, as attaching.
+    explicit Probe(Node& n) : node{n}, ds{n} {
+      static_cast<void>(robot_enabled(n));
+    }
+    void update() {
+      ++updates;
+      if (robot_enabled(node)) ++enabled;
+      if (ds.connected()) ++connected;
+    }
+    Node& node;
+    DriverStation ds;
+    int updates = 0;
+    int enabled = 0;
+    int connected = 0;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Probe>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(
+      DsPacket(driver_station::kEnabled | driver_station::kTeleop));
+  sim.step(20ms);
+  ASSERT_TRUE(robot_enabled(sim.node("mech")));
+
+  // Restarted while the next four ticks' States and packets are lost: the
+  // newest one published is at most 20 ms old throughout, inside the 50 ms
+  // command_timeout_us.
+  sim.remove("mech");
+  hw.lose_states(4);
+  auto& restarted = sim.add<Probe>("mech");
+  sim.step(20ms);
+  ASSERT_GE(restarted.updates, 3);
+  EXPECT_EQ(restarted.enabled, 0);
+  EXPECT_EQ(restarted.connected, 0);
+
+  sim.step(10ms);
+  EXPECT_TRUE(robot_enabled(restarted.node));
+  EXPECT_TRUE(restarted.ds.connected());
+}
+
 }  // namespace
 }  // namespace talos::testing
