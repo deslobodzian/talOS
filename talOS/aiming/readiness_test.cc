@@ -14,6 +14,7 @@ namespace talos::aiming {
 namespace {
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+constexpr double kInf = std::numeric_limits<double>::infinity();
 
 ReadinessLimits Limits(int settle_tick_count = 1) {
   ReadinessLimits limits;
@@ -117,7 +118,8 @@ TEST(Readiness, UnknownOrNegativePoseAgeIsStale) {
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kStale);
 }
 
-// A NaN measurement never reads as within tolerance.
+// A NaN or infinite measurement never reads as within tolerance, even when a
+// speed limit is infinite (no limit).
 // REQ-DEV-19
 TEST(Readiness, NaNMeasurementFails) {
   const ReadinessLimits limits = Limits();
@@ -127,6 +129,19 @@ TEST(Readiness, NaNMeasurementFails) {
   in = AllGood();
   in.robot_omega_radps = kNaN;
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kRobotRotatingTooFast);
+
+  ReadinessLimits unlimited = Limits();
+  unlimited.max_robot_speed_mps = kInf;
+  unlimited.max_robot_omega_radps = kInf;
+  for (const double bad : {kInf, -kInf}) {
+    in = AllGood();
+    in.robot_speed_mps = bad;
+    EXPECT_EQ(CheckReadiness(in, unlimited), ReadinessReason::kRobotTooFast);
+    in = AllGood();
+    in.robot_omega_radps = bad;
+    EXPECT_EQ(CheckReadiness(in, unlimited),
+              ReadinessReason::kRobotRotatingTooFast);
+  }
 }
 
 // Ready only after every condition has held on settle_tick_count
@@ -213,11 +228,37 @@ TEST(ReadinessGate, RejectsBadLimits) {
               std::string::npos);
   }
   ReadinessLimits unlimited = Limits();
-  unlimited.max_robot_speed_mps = std::numeric_limits<double>::infinity();
+  unlimited.max_robot_speed_mps = kInf;
+  unlimited.max_robot_omega_radps = kInf;
   ReadinessGate gate(unlimited);
   ReadinessInput fast = AllGood();
   fast.robot_speed_mps = 100.0;
+  fast.robot_omega_radps = 50.0;
   EXPECT_TRUE(gate.Update(fast, 0).ready);
+  fast.robot_speed_mps = kInf;
+  EXPECT_EQ(gate.Update(fast, 1).reason, ReadinessReason::kRobotTooFast);
+
+  // Infinite tolerances are refused (only speed limits may be infinite).
+  for (const auto& [name, mutate] : std::initializer_list<
+           std::pair<const char*, void (*)(ReadinessLimits&)>>{
+           {"aim_tolerance_rad",
+            [](ReadinessLimits& l) { l.aim_tolerance_rad = kInf; }},
+           {"flywheel_tolerance_rps",
+            [](ReadinessLimits& l) { l.flywheel_tolerance_rps = kInf; }},
+           {"hood_tolerance_rad",
+            [](ReadinessLimits& l) { l.hood_tolerance_rad = kInf; }},
+       }) {
+    SCOPED_TRACE(name);
+    ReadinessLimits bad = Limits();
+    mutate(bad);
+    try {
+      ReadinessGate bad_gate(bad);
+      FAIL() << "expected a throw for " << name;
+    } catch (const std::invalid_argument& e) {
+      EXPECT_NE(std::string(e.what()).find(name), std::string::npos)
+          << e.what();
+    }
+  }
 }
 
 }  // namespace

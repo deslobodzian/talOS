@@ -153,10 +153,14 @@ TargetSolver::Aim TargetSolver::AimAt(const SE2<double>& field_to_robot,
     // The turret axis stays where the robot's current pose puts it.
     aim.robot_heading_rad = Wrap(field_to_robot.angle());
     aim.shooter_m = field_to_robot.act(mount_m_);
+    if (!Finite(aim.shooter_m)) return aim;
     const Eigen::Vector2d to_point_m = point_m - aim.shooter_m;
+    if (!Finite(to_point_m)) return aim;
     aim.distance_m = to_point_m.norm();
-    if (!(aim.distance_m > kMinDistance_m)) return aim;
-    aim.shot_heading_rad = std::atan2(to_point_m.y(), to_point_m.x());
+    if (!(aim.distance_m > kMinDistance_m) || !std::isfinite(aim.distance_m)) {
+      return aim;
+    }
+    aim.shot_heading_rad = Wrap(std::atan2(to_point_m.y(), to_point_m.x()));
     aim.valid = true;
     return aim;
   }
@@ -165,16 +169,23 @@ TargetSolver::Aim TargetSolver::AimAt(const SE2<double>& field_to_robot,
   // point is (along, lateral), so the point's lateral coordinate there must
   // equal `lateral`: |d| sin(alpha - phi) = lateral.
   const Eigen::Vector2d to_point_m = point_m - robot_m;
+  if (!Finite(to_point_m)) return aim;
   const double range_m = to_point_m.norm();
-  if (!(range_m > std::abs(lateral_m_) + kMinDistance_m)) return aim;
+  if (!(range_m > std::abs(lateral_m_) + kMinDistance_m) ||
+      !std::isfinite(range_m)) {
+    return aim;
+  }
   const double bearing_rad = std::atan2(to_point_m.y(), to_point_m.x());
   const double shot_rad = bearing_rad - std::asin(lateral_m_ / range_m);
   aim.distance_m =
       std::sqrt(range_m * range_m - lateral_m_ * lateral_m_) - along_m_;
-  if (!(aim.distance_m > kMinDistance_m)) return aim;
+  if (!(aim.distance_m > kMinDistance_m) || !std::isfinite(aim.distance_m)) {
+    return aim;
+  }
   aim.shot_heading_rad = Wrap(shot_rad);
   aim.robot_heading_rad = Wrap(shot_rad - config_.mount.yaw_rad);
   aim.shooter_m = robot_m + SO2<double>(aim.robot_heading_rad).act(mount_m_);
+  if (!Finite(aim.shooter_m)) return aim;
   aim.valid = true;
   return aim;
 }
@@ -223,6 +234,7 @@ Solution TargetSolver::SolveWithFieldVelocity(
     previous_time_of_flight_s = shot.time_of_flight_s;
     virtual_target_m =
         field_target_m - shooter_velocity_mps * previous_time_of_flight_s;
+    if (!Finite(virtual_target_m)) return out;
   }
 
   out.valid = true;

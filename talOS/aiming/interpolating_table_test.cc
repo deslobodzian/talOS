@@ -77,6 +77,32 @@ TEST(InterpolatingTable, NaNKeyIsOutOfRangeWithFiniteValues) {
   EXPECT_EQ(at.values, kRows[0].values);
 }
 
+// Extreme opposite-sign keys whose span overflows double still interpolate
+// accurately without NaN, and row() bounds-checks against size(), not
+// capacity().
+// REQ-DEV-16
+TEST(InterpolatingTable, ExtremeSpanInterpolatesAndRowBoundsChecksSize) {
+  const std::array<Row, 2> wide = {{
+      {-1e308, {0.0, 10.0}},
+      {1e308, {100.0, 20.0}},
+  }};
+  const Table table(wide);
+  const Table::Lookup mid = table.at(0.0);
+  EXPECT_TRUE(mid.in_range);
+  EXPECT_DOUBLE_EQ(mid.values[0], 50.0);
+  EXPECT_DOUBLE_EQ(mid.values[1], 15.0);
+
+  const Table::Lookup three_quarters = table.at(0.5e308);
+  EXPECT_TRUE(three_quarters.in_range);
+  EXPECT_DOUBLE_EQ(three_quarters.values[0], 75.0);
+  EXPECT_DOUBLE_EQ(three_quarters.values[1], 17.5);
+
+  EXPECT_DOUBLE_EQ(table.row(0).key, -1e308);
+  EXPECT_DOUBLE_EQ(table.row(1).key, 1e308);
+  EXPECT_THROW(table.row(table.size()), std::out_of_range);
+  EXPECT_THROW(table.row(Table::capacity() - 1), std::out_of_range);
+}
+
 // one row is a constant table, in range only at its key.
 TEST(InterpolatingTable, SingleRowIsConstant) {
   const std::array<Row, 1> one = {{{3.0, {7.0, 8.0}}}};

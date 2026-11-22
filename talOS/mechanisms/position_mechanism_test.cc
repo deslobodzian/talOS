@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -1454,6 +1455,89 @@ TEST(PositionMechanism, HoldLatchesThePositionAtTheStart) {
   arm.ExpectNeutral();
   arm.Drive(9.0, 20ms);
   EXPECT_DOUBLE_EQ(arm.Applied().demand, 0.32);
+}
+
+// Huge finite goals with wrap_rot < 1 must not overflow wrap() into NaN/Inf.
+// REQ-SAFE-36
+TEST(PositionMechanism, WrapHandlesHugeFiniteGoalWithoutOverflow) {
+  constexpr const char* kSmallWrapToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.turret.motors.turret]
+can_id = 1
+feedback = "RemoteCANcoder"
+feedback_sensor = "turret_cc"
+position_frame = "absolute"
+[subsystems.turret.sensors.turret_cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.turret.turret]
+tolerance_rot = 0.005
+wrap_rot = 0.1
+min_rot = -0.075
+max_rot = 0.075
+)";
+  Sim sim = Sim::FromToml(kSmallWrapToml);
+  auto& node = sim.add<PositionNode>("turret");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  hw.set_motor("turret", "turret", 0.0, 0.0);
+  sim.step(10ms);
+
+  for (const double huge_goal : {1e308, -1e308}) {
+    SCOPED_TRACE(huge_goal);
+    for (int i = 0; i < 4; ++i) {
+      PublishTarget(sim, "turret", "teleop",
+                    control::PositionTarget{huge_goal, 0.0});
+      sim.step(5ms);
+    }
+    EXPECT_TRUE(node.mech.driving());
+    EXPECT_TRUE(std::isfinite(node.mech.goal_rot()));
+    EXPECT_GE(node.mech.goal_rot(), -0.075);
+    EXPECT_LE(node.mech.goal_rot(), 0.075);
+    const hardware::MotorRequest applied = hw.applied_motor("turret", "turret");
+    EXPECT_EQ(applied.mode, Mode::kMotionMagic);
+    EXPECT_DOUBLE_EQ(applied.demand, node.mech.goal_rot());
+  }
+}
+
+// Non-finite motor position (e.g. offset subtraction overflow) must neither
+// latch into hold() nor pass home()'s frame-jump check.
+// REQ-SAFE-36
+TEST(PositionMechanism, NonFinitePositionDoesNotLatchHoldOrPassHomeFrameJump) {
+  {
+    SCOPED_TRACE("hold with non-finite position_rot_ stays neutral");
+    Rig wrist{"wrist"};
+    wrist.SetMotor(-1e308);
+    wrist.hw.set_cancoder("wrist", "angle", 0.0, 0.0);
+    wrist.Start();
+    ASSERT_TRUE(wrist.mech().homed());
+
+    wrist.SetMotor(1e308);  // 1e308 - (-1e308) = +inf in software frame
+    wrist.sim.step(10ms);   // let SimHardware publish +inf and the node read it
+    ASSERT_FALSE(std::isfinite(wrist.mech().position_rot()));
+    wrist.node.hold_mode = true;
+    wrist.Drive(0.25, 20ms);
+    wrist.ExpectNeutral();
+  }
+  {
+    SCOPED_TRACE("stall homing rejects non-finite position_rot_ frame jump");
+    Rig hood{"hood"};
+    hood.SetMotor(-1e308, 0.0, 30.0);
+    hood.Start();
+    hood.Drive(0.5, 300ms);  // homes at raw -1e308 -> offset = -1e308
+    ASSERT_TRUE(hood.mech().homed());
+
+    // Device reset drops zeroed() while keeping position_offset = -1e308.
+    hood.hw.reset_device("hood", "hood");
+    hood.SetMotor(1e308, 0.0,
+                  30.0);  // 1e308 - (-1e308) = +inf; inf - inf = NaN
+    hood.Drive(0.5, 300ms);
+    EXPECT_FALSE(hood.mech().homed());
+  }
 }
 
 }  // namespace
