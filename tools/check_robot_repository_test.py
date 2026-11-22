@@ -226,6 +226,30 @@ class CheckRobotRepositoryTest(unittest.TestCase):
             for args in build_and_test:
                 self.assertIn(flag, args)
 
+    # REQ-OPS-33: two runs that both read a dead holder's pid must not both
+    # remove and retake the copy lock; the retake is serialized via $lock.retake.
+    def test_a_dead_holders_lock_is_retaken_by_one_run_only(self):
+        lock = os.path.join(
+            self.tmpdir, f"talos-robot-check-{os.getuid()}.lock")
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        put(os.path.join(lock, "pid"), f"{dead.pid}\n")
+        # Another run in the middle of retaking it.
+        os.makedirs(lock + ".retake")
+        result = self.run_script(self.robot)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("retaking", result.stderr)
+        self.assertEqual(self.calls(), [])
+        with open(os.path.join(lock, "pid"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), f"{dead.pid}\n")
+
+        # Alone, a run retakes it and leaves neither lock directory behind.
+        os.rmdir(lock + ".retake")
+        result = self.run_script(self.robot)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(os.path.exists(lock))
+        self.assertFalse(os.path.exists(lock + ".retake"))
+
 
 if __name__ == "__main__":
     unittest.main()

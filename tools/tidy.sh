@@ -83,9 +83,11 @@ probe_std() {
       "$tmp/probe.cc" -- -std=c++23 "$@" >"$tmp/probe.out" 2>&1; then
     return 0
   fi
-  if grep -Eq "^[^ ]+:[0-9]+:[0-9]+: (fatal )?error: " "$tmp/probe.out" &&
-     ! grep -E "^[^ ]+:[0-9]+:[0-9]+: (fatal )?error: " "$tmp/probe.out" |
-       grep -v "file not found" | grep -q "^$tmp/probe.cc:"; then
+  if grep -Eq '^.+:[0-9]+:[0-9]+: (fatal )?error: ' "$tmp/probe.out" &&
+     ! { grep -E '^.+:[0-9]+:[0-9]+: (fatal )?error: ' "$tmp/probe.out" |
+         PROBE_PREFIX="$tmp/probe.cc:" awk \
+           'index($0, "file not found") == 0 && index($0, ENVIRON["PROBE_PREFIX"]) == 1 { found = 1 }
+            END { exit !found }'; }; then
     return 1
   fi
   return 2
@@ -254,20 +256,23 @@ if [ "$os_name" = Darwin ]; then
   if [ "$status" != 0 ]; then
     tried="${default_sdk:-(no default SDK)}"
     dev="$(xcode-select -p 2>/dev/null || true)"
-    for sdk in $( { ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX[0-9]*.[0-9]*.sdk
-                    [ -n "$dev" ] && ls -d "$dev"/Platforms/MacOSX.platform/Developer/SDKs/MacOSX[0-9]*.[0-9]*.sdk
-                  } 2>/dev/null |
-                  awk -F/ '{v=$NF; sub(/^MacOSX/, "", v); sub(/\.sdk$/, "", v); split(v, n, ".");
-                            printf "%06d.%06d\t%s\n", n[1], n[2], $0}' |
-                  sort -r | cut -f2 | awk '!seen[$0]++'); do
-      tried="$tried $sdk"
+    { ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX[0-9]*.[0-9]*.sdk 2>/dev/null || true
+      if [ -n "$dev" ]; then
+        ls -d "$dev"/Platforms/MacOSX.platform/Developer/SDKs/MacOSX[0-9]*.[0-9]*.sdk 2>/dev/null || true
+      fi
+    } | awk -F/ '{v=$NF; sub(/^MacOSX/, "", v); sub(/\.sdk$/, "", v); split(v, n, ".");
+                  printf "%06d.%06d\t%s\n", n[1], n[2], $0}' |
+        sort -r | cut -f2- | awk '!seen[$0]++' > "$tmp/sdks"
+    while IFS= read -r sdk; do
+      [ -n "$sdk" ] || continue
+      tried="${tried}"$'\n'"${sdk}"
       status=0; probe_std -isysroot "$sdk" || status=$?
       probe_failed "$status" "$sdk"
       if [ "$status" = 0 ]; then sysroot="$sdk"; break; fi
-    done
+    done < "$tmp/sdks"
     if [ -z "$sysroot" ]; then
       echo "tidy: cannot run here: clang 18 cannot parse the C++ standard library of any installed macOS SDK; tried:" >&2
-      for sdk in $tried; do echo "  $sdk" >&2; done
+      printf '%s\n' "$tried" | sed 's/^/  /' >&2
       grep -E "error: " "$tmp/probe.out" | head -3 | sed 's/^/  last: /' >&2
       exit 3
     fi

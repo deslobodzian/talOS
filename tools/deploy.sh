@@ -690,8 +690,15 @@ release_stops() {
 refuse_testonly() {
   local bundle="$1" manifest="$1/bundle_manifest.toml"
   [ -f "$manifest" ] || return 0
+  [ -r "$manifest" ] || die "cannot read $manifest"
+  local rc=0
   awk '/^\[/ { exit } $0 == "testonly = true" { found = 1 } END { exit !found }' \
-    "$manifest" || return 0
+    "$manifest" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) die "cannot read $manifest" ;;
+  esac
   if [ -n "${TEST_TMPDIR:-}" ] && [ -n "${TEST_TARGET:-}" ] && python3 -c '
 import os, sys
 test, prefix = map(os.path.realpath, sys.argv[1:])
@@ -836,7 +843,10 @@ cmd_boot_check() {
 cmd_enable_boot() {
   local user="talos"
   while [ $# -gt 0 ]; do
-    case "$1" in --user) user="$2"; shift 2 ;; *) break ;; esac
+    case "$1" in
+      --user) [ $# -ge 2 ] || die "--user requires a user name (usage: deploy.sh enable-boot [--prefix DIR] [--user NAME] [--dry-run])"; user="$2"; shift 2 ;;
+      *) break ;;
+    esac
   done
   local darwin=0
   [ "$(uname -s)" = "Darwin" ] && darwin=1
@@ -1320,7 +1330,7 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --) shift; [ $# -eq 0 ] || rest+=("$@"); break ;;
-      --prefix) PREFIX="$2"; shift 2 ;;
+      --prefix) [ $# -ge 2 ] || die "--prefix requires a directory"; PREFIX="$2"; shift 2 ;;
       --dry-run) DRY_RUN=1; shift ;;
       --no-warm-up) WARM_UP=0; shift ;;
       *) rest+=("$1"); shift ;;

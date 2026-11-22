@@ -106,6 +106,48 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(
             given, ["new/bad.cc", "new/bad.h", "new/good.cc", "tracked.cc"])
 
+    # REQ-OPS-33: failing git diff / git ls-files must fail format.sh (not
+    # silently report "no C/C++ files to check") and clean up its temp file.
+    def test_fails_when_git_listing_fails_and_cleans_up_temp_file(self):
+        self.git("init", "-q", "-b", "main")
+        put(os.path.join(self.repo, "tracked.cc"), GOOD)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        base = self.git("rev-parse", "HEAD")
+
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        bin_dir = os.path.join(self.tmp, "bin")
+        git_stub = os.path.join(bin_dir, "git")
+        put(git_stub,
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "${STUB_FAIL_GIT:-}" ]; then\n'
+            '  echo "fatal: simulated git $1 failure" >&2\n'
+            '  exit 128\n'
+            'fi\n'
+            f'exec "{real_git}" "$@"\n')
+        os.chmod(git_stub, 0o755)
+
+        fmt_tmp = os.path.join(self.tmp, "fmt_tmp")
+        os.makedirs(fmt_tmp)
+        env = dict(self.env,
+                   PATH=bin_dir + os.pathsep + self.env.get("PATH", ""),
+                   TMPDIR=fmt_tmp)
+
+        for args, fail_subcmd in (
+                (["--check", "--all"], "ls-files"),
+                (["--check", "--base", base], "diff"),
+                (["--check", "--base", base], "ls-files")):
+            with self.subTest(args=args, fail_subcmd=fail_subcmd):
+                r = subprocess.run(
+                    ["bash", "tools/format.sh", *args],
+                    cwd=self.repo,
+                    env=dict(env, STUB_FAIL_GIT=fail_subcmd),
+                    capture_output=True, text=True, check=False)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f"simulated git {fail_subcmd} failure", r.stderr)
+                self.assertEqual(os.listdir(fmt_tmp), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -68,8 +68,8 @@
 # (see <log>)`, `prepush: <step> SKIPPED (<reason>)`, tidy's `NOT RUN`
 # above); logs stay in a
 # directory under ${TMPDIR:-/tmp}. A commit without the tool a step runs
-# (source_lints.sh, format.sh, tidy.sh, test_rio_in_the_loop.py,
-# sanitizer_lane.sh) has that
+# (source_lints.sh, format.sh, tidy.sh, check_robot_repo_scaffold.sh,
+# test_rio_in_the_loop.py, sanitizer_lane.sh) has that
 # step SKIPPED, unless --ref names another commit than the checkout's HEAD
 # and the upstream it goes to (if any) lacks the tool too: then it predates
 # the tool, and the line says `skipped`, which does not fail the run.
@@ -435,6 +435,8 @@ else
       bash tools/check_robot_repo_scaffold.sh \
       --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
       true
+  else
+    no_tool scaffold-robot_repo tools/check_robot_repo_scaffold.sh
   fi
 fi
 # A robot repository that consumes talOS (TALOS_ROBOT_REPOSITORY, its

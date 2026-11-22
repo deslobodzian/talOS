@@ -21,7 +21,10 @@
 #
 # The pid file appears whole (written beside it, then renamed), as in
 # tools/prepush.sh, so a lock without one is being taken, or its run was
-# killed while taking it.
+# killed while taking it. A dead holder's lock is retaken under a second
+# lock, $lock.retake, held until the new pid is written: two runs that both
+# read the dead pid cannot both remove and retake it, since the second finds
+# the retake lock (or, after it, a live pid).
 take_copy_lock() {
   local lock="$1" what="$2" holder
   if ! mkdir "$lock" 2>/dev/null; then
@@ -31,11 +34,25 @@ take_copy_lock() {
     if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
       die "another check (pid $holder) is using $what"
     fi
+    mkdir "$lock.retake" 2>/dev/null ||
+      die "another check is retaking $lock from a dead run (if none is, rmdir $lock.retake)"
+    # Under the retake lock: the lock must still be the dead holder's.
+    if [ "$(cat "$lock/pid" 2>/dev/null || true)" != "$holder" ]; then
+      rmdir "$lock.retake"
+      die "another check took $lock first"
+    fi
     rm -rf "$lock"
-    mkdir "$lock" 2>/dev/null || die "cannot take $lock"
+    if ! { mkdir "$lock" 2>/dev/null &&
+           echo $$ > "$lock/pid.$$" &&
+           mv -f "$lock/pid.$$" "$lock/pid"; }; then
+      rmdir "$lock.retake"
+      die "cannot take $lock"
+    fi
+    rmdir "$lock.retake"
+  else
+    { echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
+      die "cannot write $lock/pid"
   fi
-  { echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
-    die "cannot write $lock/pid"
 }
 
 point_rc_at_talos() {
