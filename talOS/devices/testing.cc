@@ -652,6 +652,7 @@ struct SimHardware::Impl {
         state.health.brownout,
         false,  // alert_warning_can_bus_unread: can_buses.Fill
         0,      // can_bus_count: can_buses.Fill
+        false,  // alert_error_protocol_mismatch
         0,
         0,
         0,
@@ -662,6 +663,7 @@ struct SimHardware::Impl {
         static_cast<::bridge::GatewayProgram>(state.build.program),
         state.build.dirty,
         protocol::kProtocolVersion,
+        0,  // mismatched_protocol_version_id
         state.build.revision,
         0,
         0,

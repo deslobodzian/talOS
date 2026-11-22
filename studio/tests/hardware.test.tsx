@@ -299,6 +299,13 @@ test('the hardware panel displays expected and observed mismatched protocol vers
   });
   assert.match(mismatchHtml, /class="warn"[^>]*>.*mismatch \(expected 11, gateway 10\)/);
 
+  const mismatchZeroHtml = render({
+    'hw/status/protocol_version_id': 11,
+    'hw/status/mismatched_protocol_version_id': 0,
+    'hw/status/alert_error_protocol_mismatch': 1,
+  });
+  assert.match(mismatchZeroHtml, /class="warn"[^>]*>.*mismatch/);
+
   const okHtml = render({
     'hw/status/protocol_version_id': 11,
     'hw/status/mismatched_protocol_version_id': 0,

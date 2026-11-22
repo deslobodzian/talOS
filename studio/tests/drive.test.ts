@@ -457,6 +457,13 @@ test('the status line names the failed link', () => {
       assert.match(rendered, /<b>PROTOCOL MISMATCH<\/b>/, c.name);
       assert.match(rendered, /link-error/, c.name);
       assert.doesNotMatch(rendered, /RoboRIO link lost/, c.name);
+      // Clearing alert_error_protocol_mismatch (1 -> 0) and link_lost recovers to ok.
+      h.at(h.clock.now + 50);
+      h.socket().send(...update(2, {
+        'hw/status/alert_error_protocol_mismatch': 0,
+        'hw/status/alert_error_link_lost': 0,
+      }, false));
+      assert.equal(h.model.status(h.clock.now).link, 'ok', `${c.name}: recovery`);
     }
   }
 });

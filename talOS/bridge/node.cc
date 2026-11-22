@@ -602,7 +602,7 @@ void HardwareNode::Tick(uint64_t now_us) {
     }
     if (status != protocol::UdpStatus::kOk) continue;
     version_mismatch_logged_ = false;
-    last_version_mismatch_us_ = 0;
+    last_version_mismatch_us_.reset();
     mismatched_protocol_version_ = 0;
 
     HandleGatewayFrame(frame, now_us);
@@ -1019,8 +1019,9 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
                        last_config_refusal_reason_len_} ==
           kConfigRefusedEnabledReason;
   const bool protocol_mismatch =
-      last_version_mismatch_us_ > 0 && now_us >= last_version_mismatch_us_ &&
-      now_us - last_version_mismatch_us_ <= config_.command_timeout_us;
+      last_version_mismatch_us_.has_value() &&
+      now_us >= *last_version_mismatch_us_ &&
+      now_us - *last_version_mismatch_us_ <= config_.command_timeout_us;
   const uint16_t mismatched_protocol_version =
       protocol_mismatch ? mismatched_protocol_version_ : uint16_t{0};
   const HealthSample& health = latest_state_.health;
