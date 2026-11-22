@@ -1869,13 +1869,18 @@ TEST(Supervision, ABoundedSessionEndsAtItsStopNotAtAMembersOwnDuration) {
 // the held time, not jump forward by the elapsed wall time (which would
 // expire kBridgeStopTimeout immediately after HoldAt(deadline) + Release()).
 TEST(Supervision, SteppedClockReleaseContinuesFromHeldWithoutJumpingAhead) {
-  testing::SteppedClock clock;
-  const SupervisionTime behind = clock.Freeze() - 10s;
-  clock.HoldAt(behind);
+  SupervisionTime base_now{100s};
+  testing::SteppedClock clock{[&] { return base_now; }};
+  const SupervisionTime held = clock.Freeze();
+  // Simulate wall time advancing past the held deadline while frozen (e.g.
+  // slow ASan startup + wait), without ever moving HoldAt backwards.
+  base_now += 10s;
+  const SupervisionTime deadline = held + 1s;
+  clock.HoldAt(deadline);
   clock.Release();
-  const SupervisionTime after = clock.clock()();
-  EXPECT_GE(after, behind);
-  EXPECT_LT(after, behind + 1s);
+  EXPECT_EQ(clock.clock()(), deadline);
+  base_now += 250ms;
+  EXPECT_EQ(clock.clock()(), deadline + 250ms);
 }
 
 // A config that cannot be read refuses the launch before its session
