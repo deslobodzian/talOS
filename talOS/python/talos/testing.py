@@ -142,13 +142,13 @@ class Sim:
     def now(self):
         """The Sim clock in float seconds; exact below 2**51 ns (26 days).
         Compare times, and build message times, with now_ns."""
-        return lib.talos_sim_now_ns(self._handle) / _NS
+        return self.now_ns / _NS
 
     @property
     def now_ns(self):
         """The Sim clock in integer nanoseconds (C++ sim.now().nanos()),
         equal to every node's now_ns."""
-        return lib.talos_sim_now_ns(self._handle)
+        return _abi.value(lib.talos_sim_now_ns(self._handle), 0)
 
     def publish(self, msg, topic, message=None, **fields):
         """Publishes on `topic`, like Publisher.send."""
@@ -171,7 +171,8 @@ class Sim:
         """The Driver Station mode generation a producer that has drained
         the newest /hw/state/driver_station packet stamps on its lanes: the
         packet's mode_since_us while it names a mode, else 0."""
-        return lib.talos_sim_driver_station_generation(self._handle)
+        return _abi.value(
+            lib.talos_sim_driver_station_generation(self._handle), 0)
 
     def publish_target(self, msg, subsystem, source, message=None, *,
                        mode_since_us=None, **fields):

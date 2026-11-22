@@ -2,7 +2,8 @@
 
 Checks the version, every exported function's restype and argtypes (types,
 not only counts), every TALOS_* enum/#define value against _abi.py, and that
-devices.Mode takes each member from _abi.MODE_*.
+every Python IntEnum across talos (__init__.py, devices.py, mechanisms.py)
+takes each member from _abi.<PREFIX>_*.
 """
 
 import ast
@@ -70,6 +71,30 @@ def _value(node):
                 {"__builtins__": {}})
 
 
+# Every IntEnum across talos/*.py and the TALOS_<PREFIX>* family in node_api.h
+# its members must bind from _abi.
+_ENUM_PREFIXES = {
+    ("TALOS_ABI_INIT", "Wake"): "WAKE_",
+    ("TALOS_ABI_DEVICES", "Mode"): "MODE_",
+    ("TALOS_ABI_DEVICES", "Alliance"): "ALLIANCE_",
+    ("TALOS_ABI_DEVICES", "ArmingInputKind"): "ARMING_INPUT_",
+    ("TALOS_ABI_MECHANISMS", "PositionPhase"): "POSITION_PHASE_",
+    ("TALOS_ABI_MECHANISMS", "PositionFault"): "POSITION_FAULT_",
+    ("TALOS_ABI_MECHANISMS", "VelocityPhase"): "VELOCITY_PHASE_",
+    ("TALOS_ABI_MECHANISMS", "RollerCommand"): "ROLLER_COMMAND_",
+    ("TALOS_ABI_MECHANISMS", "RollerPhase"): "ROLLER_PHASE_",
+}
+
+
+def _is_int_enum(node):
+    for base in node.bases:
+        if isinstance(base, ast.Name) and base.id == "IntEnum":
+            return True
+        if isinstance(base, ast.Attribute) and base.attr == "IntEnum":
+            return True
+    return False
+
+
 class ApiParityTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -77,7 +102,11 @@ class ApiParityTest(unittest.TestCase):
         read = lambda key: Path(files.Rlocation(os.environ[key])).read_text()
         cls.raw_header = read("TALOS_ABI_HEADER")
         cls.abi_tree = ast.parse(read("TALOS_ABI_PYTHON"))
-        cls.devices_tree = ast.parse(read("TALOS_ABI_DEVICES"))
+        cls.module_trees = {
+            key: ast.parse(read(key))
+            for key in ("TALOS_ABI_INIT", "TALOS_ABI_DEVICES",
+                        "TALOS_ABI_MECHANISMS")
+        }
         cls.header = re.sub(r"/\*.*?\*/|//[^\n]*", "", cls.raw_header,
                             flags=re.DOTALL)
 
@@ -146,17 +175,31 @@ class ApiParityTest(unittest.TestCase):
                 self.assertIn(name, assignments)
                 self.assertEqual(_value(assignments[name]), value)
 
-    def test_mode_members_come_from_abi(self):
-        modes = {name[len("MODE_"):]
-                 for name in _header_constants(self.header)
-                 if name.startswith("MODE_")}
-        members = {}
-        for statement in self.devices_tree.body:
-            if isinstance(statement, ast.ClassDef) and statement.name == "Mode":
-                for item in statement.body:
-                    if isinstance(item, ast.Assign):
-                        members[item.targets[0].id] = ast.unparse(item.value)
-        self.assertEqual(members, {m: f"_abi.MODE_{m}" for m in modes})
+    def test_all_int_enums_come_from_abi(self):
+        constants = _header_constants(self.header)
+        found = {}
+        for key, tree in self.module_trees.items():
+            for statement in tree.body:
+                if (isinstance(statement, ast.ClassDef) and
+                        _is_int_enum(statement)):
+                    members = {}
+                    for item in statement.body:
+                        if isinstance(item, ast.Assign):
+                            members[item.targets[0].id] = ast.unparse(
+                                item.value)
+                    found[(key, statement.name)] = members
+        self.assertEqual(found.keys(), _ENUM_PREFIXES.keys())
+        for (key, class_name), prefix in _ENUM_PREFIXES.items():
+            with self.subTest(enum=class_name):
+                expected_names = {
+                    name[len(prefix):]
+                    for name in constants
+                    if name.startswith(prefix)
+                }
+                self.assertTrue(expected_names, f"no TALOS_{prefix}* in header")
+                self.assertEqual(
+                    found[(key, class_name)],
+                    {m: f"_abi.{prefix}{m}" for m in expected_names})
 
 
 if __name__ == "__main__":

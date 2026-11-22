@@ -128,17 +128,39 @@ py_test(
 )
 
 py_test(
+    name = "safety_parity_test",
+    size = "small",
+    srcs = ["safety_parity_test.py"],
+    legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = [
+        ":mechanisms",
+        ":test_messages_py",
+        ":testing",
+        "//talOS/msgs:control_py",
+    ],
+)
+
+py_test(
     name = "api_parity_test",
     size = "small",
     srcs = ["api_parity_test.py"],
     data = [
+        "talos/__init__.py",
         "talos/_abi.py",
         "talos/devices.py",
+        "talos/mechanisms.py",
         "//talOS/node_api:node_api.h",
     ],
     env = {
         "TALOS_ABI_DEVICES": "$(rlocationpath talos/devices.py)",
         "TALOS_ABI_HEADER": "$(rlocationpath //talOS/node_api:node_api.h)",
+        "TALOS_ABI_INIT": "$(rlocationpath talos/__init__.py)",
+        "TALOS_ABI_MECHANISMS": "$(rlocationpath talos/mechanisms.py)",
         "TALOS_ABI_PYTHON": "$(rlocationpath talos/_abi.py)",
     },
     # A generated empty talos/__init__.py here would collide with the tracked

@@ -123,8 +123,13 @@ class _Mechanism(_OnNode):
         self._refresh()
 
     @property
+    def _live_snapshot(self):
+        _ = self._node
+        return self._snapshot
+
+    @property
     def driving(self):
-        return bool(self._snapshot.driving)
+        return bool(self._live_snapshot.driving)
 
 
 class PositionMechanism(_Mechanism):
@@ -146,20 +151,21 @@ class PositionMechanism(_Mechanism):
         self._call("clear_fault")
         self._refresh()
 
-    phase = property(lambda self: PositionPhase(self._snapshot.phase))
-    fault = property(lambda self: PositionFault(self._snapshot.fault))
-    homed = property(lambda self: bool(self._snapshot.homed))
-    at_goal = property(lambda self: bool(self._snapshot.at_goal))
-    connected = property(lambda self: bool(self._snapshot.connected))
-    position_rot = property(lambda self: self._snapshot.position_rot)
-    position_units = property(lambda self: self._snapshot.position_units)
-    velocity_rps = property(lambda self: self._snapshot.velocity_rps)
-    goal_rot = property(lambda self: self._snapshot.goal_rot)
-    gravity_v = property(lambda self: self._snapshot.gravity_v)
-    tolerance_rot = property(lambda self: self._snapshot.tolerance_rot)
+    phase = property(lambda self: PositionPhase(self._live_snapshot.phase))
+    fault = property(lambda self: PositionFault(self._live_snapshot.fault))
+    homed = property(lambda self: bool(self._live_snapshot.homed))
+    at_goal = property(lambda self: bool(self._live_snapshot.at_goal))
+    connected = property(lambda self: bool(self._live_snapshot.connected))
+    position_rot = property(lambda self: self._live_snapshot.position_rot)
+    position_units = property(lambda self: self._live_snapshot.position_units)
+    velocity_rps = property(lambda self: self._live_snapshot.velocity_rps)
+    goal_rot = property(lambda self: self._live_snapshot.goal_rot)
+    gravity_v = property(lambda self: self._live_snapshot.gravity_v)
+    tolerance_rot = property(lambda self: self._live_snapshot.tolerance_rot)
 
     def state(self):
         """control.PositionState, as the C++ state() returns it."""
+        _ = self._node
         return self._MESSAGE.decode(self._message.raw)
 
 
@@ -172,15 +178,16 @@ class VelocityMechanism(_Mechanism):
     def set_goal(self, velocity_rps, feedforward_v=0.0):
         self._call("set_goal", velocity_rps, feedforward_v)
 
-    phase = property(lambda self: VelocityPhase(self._snapshot.phase))
-    at_speed = property(lambda self: bool(self._snapshot.at_speed))
-    connected = property(lambda self: bool(self._snapshot.connected))
-    velocity_rps = property(lambda self: self._snapshot.velocity_rps)
-    goal_rps = property(lambda self: self._snapshot.goal_rps)
-    commanded_rps = property(lambda self: self._snapshot.commanded_rps)
+    phase = property(lambda self: VelocityPhase(self._live_snapshot.phase))
+    at_speed = property(lambda self: bool(self._live_snapshot.at_speed))
+    connected = property(lambda self: bool(self._live_snapshot.connected))
+    velocity_rps = property(lambda self: self._live_snapshot.velocity_rps)
+    goal_rps = property(lambda self: self._live_snapshot.goal_rps)
+    commanded_rps = property(lambda self: self._live_snapshot.commanded_rps)
 
     def state(self):
         """control.VelocityState, as the C++ state() returns it."""
+        _ = self._node
         return self._MESSAGE.decode(self._message.raw)
 
 
@@ -193,8 +200,8 @@ class RollerWithSensor(_Mechanism):
         """This tick's request: a RollerCommand."""
         self._call("set_goal", int(RollerCommand(command)))
 
-    phase = property(lambda self: RollerPhase(self._snapshot.phase))
-    has_piece = property(lambda self: bool(self._snapshot.has_piece))
+    phase = property(lambda self: RollerPhase(self._live_snapshot.phase))
+    has_piece = property(lambda self: bool(self._live_snapshot.has_piece))
     sensor_connected = property(
-        lambda self: bool(self._snapshot.sensor_connected))
-    output_v = property(lambda self: self._snapshot.output_v)
+        lambda self: bool(self._live_snapshot.sensor_connected))
+    output_v = property(lambda self: self._live_snapshot.output_v)

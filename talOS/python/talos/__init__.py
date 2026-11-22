@@ -38,9 +38,9 @@ from talos.devices import (Alliance, AnalogInput, ArmingBlocker,
                            ArmingInputKind, CANcoder, DigitalInput,
                            DigitalOutput, DriverStation, Encoder, Gyro,
                            HardwareLink, Joystick, Mode, Motor, OperatorArming,
-                           PwmOutput, Target, TargetLane, _OnNode,
-                           allow_untargeted_outputs, hardware_sample_time_ns,
-                           robot_enabled)
+                           PwmOutput, Target, TargetLane, _INT64_MAX, _OnNode,
+                           _max_age_ns, allow_untargeted_outputs,
+                           hardware_sample_time_ns, robot_enabled)
 
 __all__ = [
     "Alliance", "AnalogInput", "ArmingBlocker", "ArmingInputKind",
@@ -123,7 +123,7 @@ class Node:
 
     @property
     def name(self):
-        return lib.talos_node_name(self._handle).decode()
+        return _abi.value(lib.talos_node_name(self._handle), b"").decode()
 
     @property
     def simulation(self):
@@ -141,30 +141,31 @@ class Node:
         """The node clock in float seconds. round(now * 1e9) recovers the
         integer clock only below 2**51 ns (26 days); a message time such as
         sample_time_ns takes now_ns."""
-        return lib.talos_node_now_ns(self._handle) / _NS
+        return self.now_ns / _NS
 
     @property
     def now_ns(self):
         """The node clock in integer nanoseconds (C++ node.now().nanos())."""
-        return lib.talos_node_now_ns(self._handle)
+        return _abi.value(lib.talos_node_now_ns(self._handle), 0)
 
     @property
     def tick(self):  # update() calls so far, one that threw included
-        return lib.talos_node_tick(self._handle)
+        return _abi.value(lib.talos_node_tick(self._handle), 0)
 
     @property
     def period(self):
-        return lib.talos_node_period_ns(self._handle) / _NS
+        return _abi.value(lib.talos_node_period_ns(self._handle), 0) / _NS
 
     @property
     def config_path(self):
-        return lib.talos_node_config_path(self._handle).decode()
+        return _abi.value(lib.talos_node_config_path(self._handle),
+                          b"").decode()
 
     @property
     def session_dir(self):
         """The session output directory (parent of --log), or None without
         --log (tests) and in --describe, --replay and --replay-inputs."""
-        path = lib.talos_node_session_dir(self._handle)
+        path = _abi.value(lib.talos_node_session_dir(self._handle), None)
         return None if path is None else path.decode()
 
     def trajectory_path(self, name):
@@ -237,6 +238,11 @@ class Node:
     def publish_bytes(self, topic, max_bytes, *, slots=1024,
                       drop_newest=False, external=False):
         """A topic of variable-length messages, each at most `max_bytes`."""
+        if max_bytes > 0xFFFFFFFF:
+            raise ValueError(
+                f"max_bytes must be <= 0xFFFFFFFF, got {max_bytes}")
+        if slots > 0xFFFFFFFF:
+            raise ValueError(f"slots must be <= 0xFFFFFFFF, got {slots}")
         index = _abi.index(lib.talos_node_publish_bytes(
             self._handle, _abi.encode(topic), max(0, max_bytes),
             max(0, slots), bool(drop_newest), bool(external)))
@@ -282,13 +288,10 @@ class Subscription(_OnNode):
     def fresh(self, max_age=None):
         """has_value and age < max_age (default [robot] command_timeout)."""
         node = self._node
-        if max_age is None:
-            max_age_ns = -1
-        elif max_age < 0:
+        max_age_ns = _max_age_ns(max_age)
+        if max_age_ns is None:
             _ = self.has_value
             return False
-        else:
-            max_age_ns = round(max_age * _NS)
         return _abi.boolean(lib.talos_subscription_fresh(
             node, self._index, max_age_ns))
 
@@ -296,7 +299,9 @@ class Subscription(_OnNode):
     def age(self):  # seconds since publication; inf before the first
         if not self.has_value:
             return math.inf
-        return lib.talos_subscription_age_ns(self._node, self._index) / _NS
+        return _abi.value(
+            lib.talos_subscription_age_ns(self._node, self._index),
+            _INT64_MAX) / _NS
 
     @property
     def updated(self):  # a message arrived since the previous update() began
@@ -421,6 +426,7 @@ def _factory(cls, built, owner=None, freeze=False):
     """
     def build(handle, _):
         node = Node(handle, owner)
+        built.append((node, None))
         obj = cls(node)
         update = getattr(obj, "update", None)
         if update is not None:
@@ -428,7 +434,7 @@ def _factory(cls, built, owner=None, freeze=False):
                 handle,
                 node._keep(_abi.CALLBACK(_abi.callback(lambda _: update()))),
                 None))
-        built.append((node, obj))
+        built[-1] = (node, obj)
         if freeze:
             _freeze_construction()
     return _abi.FACTORY(_abi.callback(build))
@@ -456,9 +462,15 @@ def run(cls, node_name, node_target, argv=None):
     c_argv = (ctypes.c_char_p * (len(argv) + 1))(
         *[_abi.encode(a) for a in argv], None)
     built = []
-    code = lib.talos_run(len(argv), c_argv, _abi.encode(node_name),
-                         _abi.encode(node_target),
-                         _factory(cls, built, freeze=True), None)
+    try:
+        code = lib.talos_run(len(argv), c_argv, _abi.encode(node_name),
+                             _abi.encode(node_target),
+                             _factory(cls, built, freeze=True), None)
+    finally:
+        for node, _ in built:
+            node._native = None
+            node._callbacks.clear()
+            node._owner = None
     if code != 0 and _abi.pending() is not None:
         _abi.fail()
     return code
