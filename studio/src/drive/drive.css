@@ -179,6 +179,17 @@ html, body {
 }
 
 .w h3 { margin: 4px 0 2px; font-size: 14px; color: var(--muted); font-weight: 600; }
+/* Alerts subheadings and empty-section placeholders share the --drive-row
+ * vertical grid with .alerts li so .w-alerts .body (snapped by fit() to a
+ * multiple of --drive-row) never clips a row by a partial heading height. */
+.w-alerts h3, .w-alerts .none {
+  height: var(--drive-row);
+  line-height: var(--drive-row);
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .body { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 /* A list that cannot fit scrolls, never hides a row; its rows that matter
