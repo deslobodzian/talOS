@@ -1083,6 +1083,7 @@ bool CloseLogDescriptor(const std::string& path) {
   return false;
 }
 
+// REQ-RT-11 REQ-OPS-44
 TEST(LogDurability, FlushReportsFsyncFailure) {
   const auto path = TempPath("flush_sync_closed");
   for (const bool background : {false, true}) {
@@ -1354,11 +1355,6 @@ TEST(LogBackgroundWriter, FullPoolOpensAGapAndHalfAFreePoolResumesIt) {
   for (const auto& file : {path, whole, copied, copy}) ::unlink(file.c_str());
 }
 
-// A gap still open at the stop is closed there: flush() or destruction, once
-// the disk returns, writes its GAP record marked GAP_CLOSED_AT_FLUSH, with
-// the time of the run's EXIT, which found no room and was held, then that
-// EXIT, so the log ends in order. A second flush() adds nothing.
-// REQ-OPS-44
 // Half the pool is rounded up: a pool of three resumes with two chunks free,
 // not one, so between two GAP records the loop still hands over at least
 // half the pool.
@@ -1391,6 +1387,11 @@ TEST(LogBackgroundWriter, AnOddPoolResumesWithHalfOfItRoundedUpFree) {
   ::unlink(path.c_str());
 }
 
+// A gap still open at the stop is closed there: flush() or destruction, once
+// the disk returns, writes its GAP record marked GAP_CLOSED_AT_FLUSH, with
+// the time of the run's EXIT, which found no room and was held, then that
+// EXIT, so the log ends in order. A second flush() adds nothing.
+// REQ-OPS-44
 TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
   for (const bool flush : {true, false}) {
     SCOPED_TRACE(flush ? "flush" : "destruction");
@@ -1440,6 +1441,7 @@ TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
 // with no reader blocks open() the way a create can on a busy disk) all
 // return, and once the file opens it holds the header, then every record in
 // order.
+// REQ-RT-11 REQ-OPS-44
 TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
   const auto path = TempPath("unopened_fifo");
   ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
@@ -1508,6 +1510,7 @@ TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
 // failure names the path, and the writer, with no file to sync, still stops
 // once its periodic sync is due (a writer spinning on it never returns from
 // the destructor).
+// REQ-RT-11 REQ-OPS-44
 TEST(LogBackgroundWriter, UncreatableLogFailsWithoutThrowing) {
   const std::string path = ::testing::TempDir() + "/talos_log_test_missing_" +
                            std::to_string(::getpid()) + "/node.tlog";
@@ -2774,6 +2777,139 @@ TEST(LogBackgroundWriter, SparseRecordsWakeTheWriterOncePerRecord) {
         << kRecords << " records 50 ms apart after a burst, write_interval"
         << " 10 ms";
   }
+  ::unlink(path.c_str());
+}
+
+// A disk failure while multiple chunks are submitted behind a blocked write
+// still advances completed for every queued chunk, so neither flush() nor
+// destruction deadlocks in wait_written() and failed() is reported.
+// REQ-OPS-44
+TEST(LogBackgroundWriter,
+     FlushAndDestructionReturnPromptlyWhenFdFailsWithChunksQueued) {
+  for (const bool call_flush : {true, false}) {
+    SCOPED_TRACE(call_flush ? "flush" : "destruction");
+    const std::string path =
+        TempPath(call_flush ? "fd_fail_flush" : "fd_fail_dtor");
+    WriteGate gate;
+    std::optional<LogWriter> writer;
+    writer.emplace(path, "gated", GatedOptions(gate));
+    const OpenAtExit open_at_exit{gate};
+    writer->start({}, {});
+    GatedDispatch(*writer, 1);
+    writer->flush();
+    const std::uint64_t base = gate.entries();
+
+    gate.close();
+    // Submit all four chunks and open a gap with a held EXIT behind the gate.
+    for (std::uint64_t d = 2; d <= 70; ++d) GatedDispatch(*writer, d);
+    GatedExit(*writer, 71);
+    ASSERT_TRUE(writer->losing());
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 1; }));
+
+    // Invalidate the writer's fd while chunk 0 is paused in before_write() and
+    // chunks 1..3 are queued behind it; no new descriptors are opened until
+    // writer is destroyed.
+    ASSERT_TRUE(CloseLogDescriptor(path));
+    gate.open();
+
+    std::promise<bool> flushed;
+    std::promise<void> destroyed;
+    auto flushed_future = flushed.get_future();
+    auto destroyed_future = destroyed.get_future();
+    std::thread stopper{[&] {
+      bool is_failed = false;
+      if (call_flush) {
+        writer->flush();
+        is_failed = writer->failed();
+      } else {
+        is_failed = Eventually([&] { return writer->failed(); });
+      }
+      flushed.set_value(is_failed);
+      writer.reset();
+      destroyed.set_value();
+    }};
+    const bool flush_returned =
+        flushed_future.wait_for(std::chrono::seconds{10}) ==
+        std::future_status::ready;
+    const bool dtor_returned =
+        flush_returned && destroyed_future.wait_for(std::chrono::seconds{10}) ==
+                              std::future_status::ready;
+    if (dtor_returned) {
+      stopper.join();
+    } else {
+      stopper.detach();
+    }
+    EXPECT_TRUE(flush_returned) << "flush() blocked after fd failure";
+    EXPECT_TRUE(dtor_returned) << "~LogWriter() blocked after fd failure";
+    if (flush_returned) {
+      EXPECT_TRUE(flushed_future.get());
+    }
+    ::unlink(path.c_str());
+  }
+}
+
+// While small records stream into an active chunk faster than write_interval
+// (10 ms), the writer coalesces them and wakes at most once per 10 ms write
+// interval rather than once per record.
+// REQ-RT-21
+TEST(LogBackgroundWriter, StreamingSmallRecordsWakeAtMostOncePerWriteInterval) {
+  const auto path = TempPath("stream_wakeups");
+  std::uint64_t index = 0;
+  {
+    LogWriter::Options options{};
+    ASSERT_EQ(options.write_interval, std::chrono::milliseconds{10});
+    options.sync_interval = std::chrono::hours{1};
+    std::atomic<std::uint64_t> writes{0};
+    options.before_write = [&] {
+      writes.fetch_add(1, std::memory_order_relaxed);
+    };
+    LogWriter writer{path, "stream", options};
+    writer.start({}, {});
+    writer.flush();  // The writer thread creates the file.
+    const auto log_one = [&] {
+      Context context{};
+      context.dispatch_index = ++index;
+      writer.dispatch(context, MakePayload(16, static_cast<int>(index)));
+    };
+
+    // Prime last_write with one record that wakes the idle writer.
+    log_one();
+    ASSERT_TRUE(Eventually([&] { return writes.load() >= 1; }));
+
+    const std::uint64_t base_writes = writes.load();
+    const std::uint64_t base_wakeups = writer.wakeups();
+    constexpr std::uint64_t kIntervals = 10;
+    constexpr std::uint64_t kRecordsPerPoll = 10;
+    std::uint64_t streamed = 0;
+    ASSERT_TRUE(Eventually([&] {
+      for (std::uint64_t i = 0; i < kRecordsPerPoll; ++i) {
+        log_one();
+        ++streamed;
+      }
+      return writes.load() >= base_writes + kIntervals;
+    }));
+    const std::uint64_t stream_writes = writes.load() - base_writes;
+    const std::uint64_t stream_wakeups = writer.wakeups() - base_wakeups;
+
+    EXPECT_GE(stream_writes, kIntervals);
+    // At least one 10 ms interval held back multiple polls before writing.
+    EXPECT_GT(streamed, kIntervals * kRecordsPerPoll);
+    // One wakeup per 10 ms write interval (plus up to 2 for idle->streaming
+    // entry or a delayed poll), never once per record.
+    EXPECT_LE(stream_wakeups, stream_writes + 2)
+        << "streamed=" << streamed << " writes=" << stream_writes;
+    EXPECT_LT(stream_wakeups, streamed / 4)
+        << "streamed=" << streamed << " writes=" << stream_writes;
+    writer.flush();
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  LogReader reader{path};
+  LogReader::Record record{};
+  std::uint64_t read = 0;
+  while (reader.next(record)) {
+    ASSERT_EQ(record.header.dispatch_index, ++read);
+  }
+  EXPECT_EQ(read, index);
   ::unlink(path.c_str());
 }
 

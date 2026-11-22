@@ -571,3 +571,18 @@ py_test(
     legacy_create_init = False,
     main = "check_runfiles_collisions_test.py",
 )
+
+# tools/setup.sh --check (REQ-DEV-12): syntax check and component detection
+# (passing, missing, wrong-version, --no-studio/--no-rio/--no-lint) with a
+# stubbed PATH so nothing installs or depends on host tools.
+py_test(
+    name = "setup_test",
+    size = "small",
+    srcs = ["setup_test.py"],
+    data = [
+        "clang18.sh",
+        "setup.sh",
+    ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)

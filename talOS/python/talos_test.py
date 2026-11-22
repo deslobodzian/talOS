@@ -155,7 +155,7 @@ class TwoNodesTest(unittest.TestCase):
         self.assertEqual(sim.node("follower").period, 0.01)
         self.assertAlmostEqual(sim.now, 0.055)
 
-    # REQ-RT-02
+    # REQ-RT-02, REQ-RT-19
     def test_an_at_drain_callback_hears_every_message_at_the_next_tick(self):
         """wake=Wake.AT_DRAIN reaches the node: goals published at 2 and 3
         ms reach the callback in order at the 10 ms tick's drain, not as
@@ -170,6 +170,35 @@ class TwoNodesTest(unittest.TestCase):
         self.assertEqual(collector.heard, [])
         sim.step(0.007)
         self.assertEqual(collector.heard, [(7, 10), (8, 10)])
+
+    # REQ-RT-19: omitting wake= defaults to Wake.ON_PUBLISH; in a timed node
+    # (10 ms update()), a publication at 2 ms runs the callback at now == 2 ms
+    # before the 10 ms tick.
+    def test_default_subscribe_callback_wakes_timed_node_on_publish(self):
+        class PromptCollector:
+            def __init__(self, node):
+                self.node = node
+                self.heard = []
+                self.updates = 0
+                node.subscribe(Goal, "/planner/goal", callback=self.hear)
+
+            def hear(self, goal):
+                self.heard.append((goal.tick_count, self.node.now_ns))
+
+            def update(self):
+                self.updates += 1
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        collector = sim.add(PromptCollector, "collector")
+        sim.step(0.002)
+        sim.publish(Goal, "/planner/goal", height_rot=0.0, enabled=True,
+                    tick_count=7)
+        sim.step(0.001)
+        self.assertEqual(collector.heard, [(7, 2_000_000)])
+        self.assertEqual(collector.updates, 0)
+        sim.step(0.008)
+        self.assertEqual(collector.updates, 1)
+        self.assertEqual(collector.heard, [(7, 2_000_000)])
 
     # REQ-SAFE-31: Sim.remove destroys the hosted node and invalidates its
     # Python wrappers; mid-run Sim.add starts at now_ns with no catch-up ticks

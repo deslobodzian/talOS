@@ -179,6 +179,7 @@ int32_t BuildWaiter(TalosNode* node, void* user) {
 // TALOS_WAKE_AT_DRAIN keeps the callback but wakes nothing: a message
 // published between ticks reaches it at the next tick's drain (10 ms), not
 // at its publication (2 ms). A wake the enum lacks is refused, naming it.
+// REQ-RT-19
 TEST_F(NodeApi, AnAtDrainCallbackHearsAMessageAtTheNextTick) {
   Waiter waiter;
   ASSERT_NE(talos_sim_add(sim_, "waiter", &BuildWaiter, &waiter), nullptr)
@@ -194,6 +195,51 @@ TEST_F(NodeApi, AnAtDrainCallbackHearsAMessageAtTheNextTick) {
   EXPECT_TRUE(waiter.heard_ns.empty()) << "the publication woke the node";
   ASSERT_EQ(talos_sim_step(sim_, 2 * kMs), TALOS_OK) << talos_last_error();
   EXPECT_EQ(waiter.heard_ns, std::vector<int64_t>{10 * kMs});
+}
+
+// REQ-RT-19: TALOS_WAKE_ON_PUBLISH on a timed node (10 ms update()) wakes the
+// node at publication time (2 ms), before the 10 ms tick, without running
+// update() early.
+TEST_F(NodeApi, AnOnPublishCallbackWakesATimedNodeBeforeItsTick) {
+  struct Prompt {
+    TalosNode* node = nullptr;
+    std::vector<int64_t> heard_ns;
+    int updates = 0;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& p = *static_cast<Prompt*>(user);
+    p.node = node;
+    const auto on_msg = [](const void* /*data*/, uint32_t /*size*/,
+                           void* ctx) -> int32_t {
+      auto& self = *static_cast<Prompt*>(ctx);
+      self.heard_ns.push_back(talos_node_now_ns(self.node));
+      return 0;
+    };
+    const auto on_update = [](void* ctx) -> int32_t {
+      ++static_cast<Prompt*>(ctx)->updates;
+      return 0;
+    };
+    if (talos_node_subscribe(node, "/prompt/in", sizeof(Value), &kValueSchema,
+                             0, TALOS_WAKE_ON_PUBLISH, on_msg, &p) < 0) {
+      return 1;
+    }
+    return talos_node_set_update(node, on_update, &p);
+  };
+
+  Prompt prompt;
+  ASSERT_NE(talos_sim_add(sim_, "prompt", build, &prompt), nullptr)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 2 * kMs), TALOS_OK) << talos_last_error();
+  const Value in{1.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/prompt/in", &in, sizeof in),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 1 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(prompt.heard_ns, std::vector<int64_t>{2 * kMs});
+  EXPECT_EQ(prompt.updates, 0);
+
+  ASSERT_EQ(talos_sim_step(sim_, 8 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(prompt.updates, 1);
+  EXPECT_EQ(prompt.heard_ns, std::vector<int64_t>{2 * kMs});
 }
 
 TEST_F(NodeApi, ATopicRefusesAnEndpointOfAnotherSchema) {
