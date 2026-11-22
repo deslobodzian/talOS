@@ -1072,9 +1072,9 @@ TEST(TeleopNode, BadParameterFailsConstruction) {
 }
 
 // REQ-OPS-55: /teleop/status reports armed state, alert_warning_disarmed
-// (only while enabled in teleop and disarmed; never while disabled or in
-// autonomous), and the exact blocking axis/button/POV until inputs return to
-// neutral.
+// (only while enabled in teleop and disarmed; never while disabled, e-stopped,
+// or in autonomous), and the exact blocking axis/button/POV until inputs return
+// to neutral.
 TEST(TeleopNode, PublishesStatusAndDisarmedAlertForHeldAxisButtonAndPov) {
   constexpr const char* kMultiInputToml = R"(
 [robot]
@@ -1173,6 +1173,14 @@ period_us = 20000
   EXPECT_EQ(st->blocking_joystick_index(), -1);
   EXPECT_EQ(st->blocking_input_index(), -1);
 
+  // E-stopped teleop with an axis held: disarms and keeps
+  // alert_warning_disarmed FALSE.
+  push_sticks(kTeleopEnabled | ds::kEStop, held_axis, neutral_stick());
+  st = latest_status();
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->armed());
+  EXPECT_FALSE(st->alert_warning_disarmed());
+
   // Disable then re-enable with button 3 on port 1 held -> BUTTON / 1 / 3.
   auto held_btn = neutral_stick();
   held_btn.buttons = 1u << 2;  // 1-based button 3
@@ -1219,6 +1227,102 @@ period_us = 20000
   EXPECT_EQ(st->blocking_kind(), ::teleop::BlockingInputKind::NONE);
   EXPECT_EQ(st->blocking_joystick_index(), -1);
   EXPECT_EQ(st->blocking_input_index(), -1);
+}
+
+// REQ-OPS-55, REQ-RT-06: while disarmed with a held axis, button, or POV,
+// Teleop::update() (blocking-input scan, arming evaluation, and /teleop/status
+// publication) allocates nothing.
+TEST(TeleopNode, DisarmedStatusUpdateDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  constexpr const char* kMultiInputToml = R"(
+[robot]
+period_us = 20000
+command_timeout_us = 100000
+
+[subsystems.roller]
+period_us = 20000
+
+[subsystems.roller.teleop]
+defaults = { velocity_rps = 0.0, feedforward_v = 0.0 }
+
+[[subsystems.roller.teleop.bindings]]
+port = 0
+axis = 1
+field = "velocity_rps"
+scale = 10.0
+deadband_frac = 0.1
+
+[[subsystems.roller.teleop.bindings]]
+port = 1
+button = 3
+while_held = { velocity_rps = 20.0 }
+
+[[subsystems.roller.teleop.bindings]]
+port = 0
+pov = 90
+pov_index = 1
+while_held = { velocity_rps = 30.0 }
+
+[subsystems.teleop]
+period_us = 20000
+)";
+  Sim sim = MakeSim(kMultiInputToml);
+  sim.add<ConsumerNode<control::VelocityTarget>>("roller");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+
+  const auto neutral_stick = [] {
+    auto s = MakeStick();
+    s.pov_count = 2;
+    s.povs[0] = -1;
+    s.povs[1] = -1;
+    return s;
+  };
+  auto held_axis = neutral_stick();
+  held_axis.axes[1] = 0.8f;
+  auto held_btn = neutral_stick();
+  held_btn.buttons = 1u << 2;
+  auto held_pov = neutral_stick();
+  held_pov.povs[1] = 180;
+
+  struct Case {
+    const char* label;
+    ds::JoystickData stick0;
+    ds::JoystickData stick1;
+    ::teleop::BlockingInputKind kind;
+  };
+  constexpr std::uint32_t kTeleopDisabled = ds::kTeleop | ds::kDsAttached;
+  for (const Case& c : {Case{"held axis", held_axis, neutral_stick(),
+                             ::teleop::BlockingInputKind::AXIS},
+                        Case{"held button", neutral_stick(), held_btn,
+                             ::teleop::BlockingInputKind::BUTTON},
+                        Case{"held pov", held_pov, neutral_stick(),
+                             ::teleop::BlockingInputKind::POV}}) {
+    SCOPED_TRACE(c.label);
+    ds::DriverStationData data{};
+    data.joysticks[0] = c.stick0;
+    data.joysticks[1] = c.stick1;
+    data.fms.flags = kTeleopDisabled;
+    Push(hw, sim, data);
+    data.fms.flags = kTeleopEnabled;
+    Push(hw, sim, data);
+
+    talos::testing::AllocationProbe probe;
+    probe.start();
+    sim.step(100ms);
+    EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+
+    const auto st =
+        sim.latest<::teleop::TeleopStatus>(::teleop::topics::kStatus);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_FALSE(st->armed());
+    EXPECT_TRUE(st->alert_warning_disarmed());
+    EXPECT_EQ(st->blocking_kind(), c.kind);
+  }
 }
 
 }  // namespace

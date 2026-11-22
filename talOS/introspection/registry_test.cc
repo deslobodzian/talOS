@@ -841,6 +841,7 @@ TEST_F(Registry, SourcesBeyondCapacityAreCountedButNotStored) {
 // blocked in a selection callback mid-sample -- leaves it current. Before, the
 // reporting thread copied it every 10 ms, and a starved one froze the row of
 // a loop that kept time until the launcher killed the node as stalled.
+// REQ-RT-18
 TEST_F(Registry, LoopStoresItsProgressWhileTheReporterIsBlocked) {
   event::RealtimeEventLoop<> loop;
   struct Handler {
@@ -1620,6 +1621,86 @@ TEST_F(Registry, HeldRowsUsesGenerationVerifiedCopy) {
                                .count(),
       std::memory_order_relaxed);
   EXPECT_TRUE(reader->held_rows().empty());
+}
+
+// REQ-RT-18: readers take no lock (open, nodes, and held_rows all complete
+// while RegistryLock is held on another thread/fd), and a writer updating and
+// sampling its own slot leaves every byte of another node's slot untouched.
+TEST_F(Registry, ReadersTakeNoLockAndWritersTouchOnlyTheirOwnSlot) {
+  NodeRegistration writer_a{{.name = "writer_a"}, path_};
+  NodeRegistration writer_b{{.name = "writer_b"}, path_};
+  ASSERT_NE(writer_a.slot(), writer_b.slot());
+  writer_a.publish(sample_manifest());
+  writer_b.publish(sample_manifest());
+  writer_b.publish_selections(std::vector<Policy>{{{"teleop", "auto"}}});
+
+  RegistryMapping mapping{path_, /*read_only=*/true};
+  const auto snapshot_slot_bytes = [&](std::size_t slot) {
+    const auto* bytes =
+        reinterpret_cast<const std::byte*>(&mapping.header()->nodes[slot]);
+    return std::vector<std::byte>(bytes, bytes + sizeof(NodeRecord));
+  };
+  const std::vector<std::byte> slot_b_before =
+      snapshot_slot_bytes(writer_b.slot());
+
+  const std::string mapped = ShmObjectName(path_);
+  std::atomic<bool> locked{false};
+  std::atomic<bool> release{false};
+  std::jthread holder{[&] {
+    const RegistryLock lock{mapped};
+    locked = true;
+    locked.notify_all();
+    release.wait(false);
+  }};
+  struct Unblock {
+    std::atomic<bool>& release;
+    ~Unblock() {
+      release = true;
+      release.notify_all();
+    }
+  } unblock{release};
+  locked.wait(false);
+
+  // Confirm the writer lock is actually held on another fd before reading.
+  EXPECT_THROW((RegistryLock{mapped, 0ms}), std::runtime_error);
+
+  // Writing and sampling slot A takes no lock and leaves slot B byte-identical.
+  writer_a.publish_selections(std::vector<Policy>{{{"teleop", "auto"}}});
+  writer_a.begin_sample();
+  writer_a.heartbeat();
+  writer_a.set_dispatch_count(123);
+  writer_a.set_source(0, /*events=*/10, /*dropped=*/1, /*sequence=*/20,
+                      /*last_monotonic_ns=*/30, /*last_latency_ns=*/40,
+                      /*max_latency_ns=*/50);
+  writer_a.set_selected(0, 1);
+  writer_a.set_wake_loss(1, 2, 3);
+  writer_a.set_recording(/*failed=*/false, /*capped=*/true, /*gap=*/true);
+  writer_a.set_outputs_held(true);
+  writer_a.set_realtime(
+      {.tier = process::LoopTier::kControl, .requested = true});
+  writer_a.end_sample();
+
+  // Readers must return without blocking while RegistryLock is held.
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  const auto held = reader->held_rows();
+  ASSERT_EQ(nodes.size(), 2u);
+  ASSERT_EQ(held.size(), 2u);
+  const auto find_a = [](const std::vector<NodeSnapshot>& list) {
+    return std::find_if(list.begin(), list.end(),
+                        [](const auto& n) { return n.name == "writer_a"; });
+  };
+  const auto node_a = find_a(nodes);
+  ASSERT_NE(node_a, nodes.end());
+  EXPECT_EQ(node_a->dispatch_count, 123u);
+  ASSERT_FALSE(node_a->sources.empty());
+  EXPECT_EQ(node_a->sources[0].events, 10u);
+  ASSERT_EQ(node_a->selections.size(), 1u);
+  EXPECT_EQ(node_a->selections[0].selected, 1);
+  EXPECT_NE(find_a(held), held.end());
+
+  EXPECT_EQ(snapshot_slot_bytes(writer_b.slot()), slot_b_before);
 }
 
 }  // namespace
