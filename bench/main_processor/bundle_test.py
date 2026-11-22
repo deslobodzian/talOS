@@ -440,6 +440,17 @@ class BootServiceTest(unittest.TestCase):
         self.assertGreater(int(stop_s.rstrip("s")), launcher_stop_timeout_s(),
                            service)
 
+    # REQ-OPS-06
+    def test_launchd_sets_exit_timeout_past_launcher_stop_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = enable_boot(os.path.join(tmp, "prefix"), "Darwin")
+        plist = plistlib.loads(
+            out[out.index("<?xml"):out.index("</plist>") + 8].encode())
+        self.assertIn("ExitTimeOut", plist, plist)
+        self.assertIsInstance(plist["ExitTimeOut"], int, plist)
+        self.assertGreater(plist["ExitTimeOut"], launcher_stop_timeout_s(),
+                           plist)
+
 
 if __name__ == "__main__":
     unittest.main()

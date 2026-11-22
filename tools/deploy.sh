@@ -938,6 +938,8 @@ WantedBy=multi-user.target
   <true/>
   <key>ProcessType</key>
   <string>Interactive</string>
+  <key>ExitTimeOut</key>
+  <integer>90</integer>
   <key>StandardOutPath</key>
   <string>/dev/null</string>
   <key>StandardErrorPath</key>
