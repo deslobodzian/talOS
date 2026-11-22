@@ -43,6 +43,12 @@ class RecordingOutputs final : public talos::rio::WatchdogOutputs {
   std::vector<std::string> reports;
 };
 
+// The poll period talOS/hardware/README.md "RoboRIO" states ("checks every
+// 5 ms"): the watchdog acts within it of a deadline passing, the margin
+// REQ-SAFE-25 holds the program to.
+// REQ-SAFE-25
+static_assert(LoopWatchdog::kPollPeriod == std::chrono::milliseconds{5});
+
 // Expiry plus one 5 ms period: the deadline Robot.cpp beats.
 constexpr uint64_t kDeadlineAfterUs = 105'000;
 constexpr uint64_t kPeriodUs = 5'000;

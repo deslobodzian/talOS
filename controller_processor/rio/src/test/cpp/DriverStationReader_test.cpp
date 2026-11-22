@@ -230,7 +230,7 @@ void NoReport(std::string_view line) { ADD_FAILURE() << line; }
 // helper stopped mid-snapshot (B's flags and first axis written, a NetComm
 // call that has not returned), the loop's Read returns at once with the last
 // whole snapshot, A; once the helper finishes, B whole.
-// REQ-SAFE-13, REQ-RT-13, REQ-RT-24
+// REQ-RT-24
 TEST(DriverStationReader, ALoopReadIsOneWholeRefreshAndNeverWaitsForOne) {
   auto gate = std::make_shared<Gate>();
   const TestClock clock = MakeClock();
@@ -270,7 +270,7 @@ TEST(DriverStationReader, ALoopReadIsOneWholeRefreshAndNeverWaitsForOne) {
 // error: on the x86-64 test host a relaxed exchange compiles like an
 // acquire-release one. Ordering is covered only by a thread sanitizer run or
 // an ARM host (TODO.md BENCH-3).
-// REQ-SAFE-13
+// REQ-RT-24
 TEST(DriverStationReader, ReadsDuringConstantRefreshesSeeOnlyWholeRefreshes) {
   constexpr int kRefreshes = 10'000;
   auto gate = std::make_shared<Gate>();
@@ -410,7 +410,6 @@ TEST(DriverStationReader, ReportsTheModeOnlyWhileTheLoopTicks) {
 // and so does the destructor. The abandoned helper owns what it still
 // touches: once its refresh returns it exits, reporting no mode although the
 // loop had ticked, and lets its calls go.
-// REQ-RT-13
 TEST(DriverStationReader, StopAbandonsARefreshThatDoesNotReturn) {
   auto destroyed = std::make_shared<std::promise<std::size_t>>();
   std::future<std::size_t> released = destroyed->get_future();

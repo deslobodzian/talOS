@@ -105,7 +105,7 @@ TICK_PHASES = re.compile(
     r"health \d+\.\d+/\d+\.\d+ us, other \d+\.\d+/\d+\.\d+ us, "
     r"link \d+\.\d+/\d+\.\d+ us, driver station \d+\.\d+/\d+\.\d+ us, "
     r"loop \d+\.\d+/\d+\.\d+ us over (\d+) ticks "
-    r"\(motors=\d+ sensors=\d+\)")
+    r"\(motors=(\d+) sensors=(\d+)\)")
 RIO_LATENCY = re.compile(
     r"\[rio\] latency: command age accepted p50/p99/max "
     r"(?:\d+/\d+/\d+|-/-/-) us over (\d+), "
@@ -390,12 +390,21 @@ class Scenario:
                 f"{self.output / 'gateway.txt'}")
         # REQ-OPS-29: every clean exit flushes the final partial window, so
         # every WPILib scenario emits at least one tick phases line (with
-        # ticks > 0) and one latency line.
-        phase_ticks = [int(t) for t in TICK_PHASES.findall(text)]
-        if not phase_ticks or any(t <= 0 for t in phase_ticks):
+        # ticks > 0) and one latency line. Every scenario pushes the subject
+        # config (two TalonFX and a CANcoder) before it exits, so the last
+        # window's device counts, those of its last tick, are not 0.
+        phases = [tuple(map(int, groups))
+                  for groups in TICK_PHASES.findall(text)]
+        if not phases or any(ticks <= 0 for ticks, _m, _s in phases):
             raise RuntimeError(
                 f"The RoboRIO printed no [rio] tick phases line with positive "
                 f"ticks; see {self.output / 'gateway.txt'}")
+        _ticks, motors, sensors = phases[-1]
+        if motors == 0 or sensors == 0:
+            raise RuntimeError(
+                f"The RoboRIO's last [rio] tick phases line counts "
+                f"motors={motors} sensors={sensors} with the subject config "
+                f"pushed; see {self.output / 'gateway.txt'}")
         if not RIO_LATENCY.search(text):
             raise RuntimeError(
                 f"The RoboRIO printed no [rio] latency line; see "
@@ -846,7 +855,7 @@ def run_driving_scenario(root, wpilib, output_root):
             raise RuntimeError(
                 "The gateway did not neutralize after communication stopped")
         if wpilib:
-            # REQ-OPS-29: driving must record both accepted commands and
+            # REQ-RT-25: driving must record both accepted commands and
             # Driver Station packets across the run's latency windows.
             gateway_text = (output / "gateway.txt").read_text()
             latencies = RIO_LATENCY.findall(gateway_text)

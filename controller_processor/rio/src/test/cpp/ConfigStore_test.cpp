@@ -572,7 +572,7 @@ uint32_t Trailer(std::span<const uint8_t> persisted) {
 // so the save unlinks the temporary and leaves none behind) and a save
 // queued while another is in flight; the file holds the newest one handed
 // over.
-// REQ-CONTRACT-06, REQ-RT-01, REQ-RT-06
+// REQ-CONTRACT-06
 TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
   saver_allocations = 0;
   saver_frees = 0;
@@ -702,7 +702,6 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
 // reconfiguration commit, persistence handover, and RioLog's default console
 // sink all execute with zero heap allocations and zero frees, even when every
 // device and bus name exceeds std::string's SSO threshold.
-// REQ-RT-01, REQ-RT-06, REQ-SAFE-24
 TEST(ConfigStore, ConfigTransferReconfigurePersistAndRioLogSinkZeroHeapAlloc) {
   auto make_long_config = [](int base_can, bool second_motor) {
     hw::Config c;
