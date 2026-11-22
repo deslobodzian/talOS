@@ -111,7 +111,13 @@ pages and a keyframe of the latest tick, then change-only updates
 ([telemetry README](../../talOS/telemetry/README.md#the-live-view-and-the-record)).
 Each update goes out only when the budget affords all of it; otherwise it is
 deferred and the next update carries the changes, so a slow or starved client
-sees fewer, never inconsistent, ticks. A page the socket refuses resynchronizes
+sees fewer, never inconsistent, ticks. Alert channels (`ChannelInfo.alert`
+other than `None`) that rise to active and clear while updates are coalesced
+(whether across a read batch, a budget deferral or `/drive`'s `update_hz`
+limit) are never dropped: the client receives an intermediate activation
+update stamped between its held tick and the latest tick, followed by the
+latest tick clearing them, still within the client's rate limit and egress
+budget (REQ-OPS-37). A page the socket refuses resynchronizes
 that client with a fresh keyframe.
 
 When started with a nonzero `--session-id` (as the launcher passes), the bridge
@@ -371,7 +377,10 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
 4. **Rate.** Updates that carry a change (a value, an absence, the chassis, or
    a keyframe) go at most `update_hz` a second, at least
    `ceil(1e9 / update_hz)` ns apart; changes in between coalesce into the
-   next update.
+   next update, except masked alert channels that rose to active and cleared
+   in between, which go as an activation update at the next interval followed
+   by the clearing tick one interval later (still within `update_hz` and the
+   slot's budget).
 5. **Heartbeat.** When nothing has been sent for 100 ms
    (`telemetry_wire::kHeartbeatIntervalNs`) and the client holds a tick, an
    empty update goes: `keyframe` false, no `channels`, no `absent`, stamped

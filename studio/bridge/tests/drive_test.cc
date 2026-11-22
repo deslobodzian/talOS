@@ -940,5 +940,128 @@ TEST(DriveSummary, OutputsHeldPropagatesForAliveRowsAndIsOmittedWhenFalse) {
   }
 }
 
+// REQ-OPS-35, REQ-OPS-37
+// A /drive client limited to update_hz never loses a masked alert that rises
+// and clears inside one update interval: the activation pulse goes when the
+// interval opens, NextDueNs wakes the bridge one interval later to send the
+// clearing tick (so update_hz is never exceeded), heartbeats at slow rates
+// restamp the held tick without dropping the pending pulse, and unmasked
+// alert channels never trigger a pulse.
+TEST(DriveFeed, CoalescedAlertActivationRespectsMaskUpdateRateAndBudget) {
+  auto tick_with_alerts = [](TelemetryState& state, std::uint64_t sequence,
+                             double velocity, std::uint64_t link_lost,
+                             std::uint64_t mismatch) {
+    std::vector<std::string> pages;
+    flatbuffers::FlatBufferBuilder builder;
+    const Talos::Telemetry::Pose chassis{1, 2, 0, 0, 0, 0.5};
+    const std::vector<std::uint32_t> channels{0, 1, 2, 3, 4, 5};
+    const std::vector<std::uint64_t> values{
+        RawFromDouble(velocity), 0, 1, 9, link_lost, mismatch};
+    ASSERT_TRUE(talos::telemetry::EncodeValuePages(
+        builder,
+        PageHeader{kStream, sequence, 1000 + sequence, kDictionaryId, 6},
+        chassis, true, channels, values, {},
+        [&](std::span<const std::uint8_t> page,
+            const talos::telemetry::PageSpan&) {
+          pages.emplace_back(reinterpret_cast<const char*>(page.data()),
+                             page.size());
+        }));
+    Ingest(state, pages);
+  };
+
+  // 1. Masked alert at 20 Hz (50 ms interval): rise on tick 2, clear on tick 3.
+  {
+    TelemetryState state = WithDictionary();
+    DriveMask mask({{"drive/velocity"}, true});
+    DriveFeed feed;
+    feed.Configure(20);
+    Received received;
+
+    tick_with_alerts(state, 1, 0.5, 0, 0);
+    Pump(feed, state, mask.For(state), 0, received);
+    ASSERT_EQ(received.value_pages.size(), 1u);
+
+    tick_with_alerts(state, 2, 0.6, 1, 0);
+    tick_with_alerts(state, 3, 0.7, 0, 0);
+    Pump(feed, state, mask.For(state), 20 * kMs, received);
+    EXPECT_EQ(received.value_pages.size(), 1u) << "held inside 50 ms interval";
+    EXPECT_EQ(feed.NextDueNs(), 50 * kMs);
+
+    // At 50 ms, the activation pulse goes and NextDueNs schedules 100 ms to
+    // clear it even with no further producer ticks.
+    Pump(feed, state, mask.For(state), 50 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 2u);
+    EXPECT_EQ(received.value_pages[1]->sequence_id(), 2u);
+    ASSERT_NE(received.value_pages[1]->channels(), nullptr);
+    ASSERT_EQ(received.value_pages[1]->channels()->size(), 1u);
+    EXPECT_EQ(received.value_pages[1]->channels()->Get(0), 4u);
+    EXPECT_EQ(received.value_pages[1]->values()->Get(0), 1u);
+    EXPECT_FALSE(feed.telemetry().current(state, &mask.For(state)));
+    EXPECT_EQ(feed.NextDueNs(), 100 * kMs);
+
+    Pump(feed, state, mask.For(state), 99 * kMs, received);
+    EXPECT_EQ(received.value_pages.size(), 2u)
+        << "update_hz must not be exceeded";
+
+    Pump(feed, state, mask.For(state), 100 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 3u);
+    EXPECT_EQ(received.value_pages[2]->sequence_id(), 3u);
+    EXPECT_TRUE(feed.telemetry().current(state, &mask.For(state)));
+    EXPECT_EQ(received.value_times,
+              (std::vector<std::int64_t>{0, 50 * kMs, 100 * kMs}));
+  }
+
+  // 2. Unmasked alert channel never triggers a pulse (REQ-OPS-35).
+  {
+    TelemetryState state = WithDictionary();
+    DriveMask mask({{"drive/velocity"}, false});  // only channel 0
+    DriveFeed feed;
+    feed.Configure(20);
+    Received received;
+
+    tick_with_alerts(state, 1, 0.5, 0, 0);
+    Pump(feed, state, mask.For(state), 0, received);
+    tick_with_alerts(state, 2, 0.5, 1, 1);
+    tick_with_alerts(state, 3, 0.5, 0, 0);
+    EXPECT_TRUE(feed.telemetry().current(state, &mask.For(state)));
+    Pump(feed, state, mask.For(state), 50 * kMs, received);
+    EXPECT_EQ(received.value_pages.size(), 1u)
+        << "unmasked alerts must not cause updates";
+  }
+
+  // 3. Slow layout (2 Hz = 500 ms interval): heartbeat at 100 ms restamps
+  // tick 1 without losing the pending pulse, which goes at 500 ms, then tick 3
+  // clears it at 1000 ms.
+  {
+    TelemetryState state = WithDictionary();
+    DriveMask mask({{"drive/velocity"}, true});
+    DriveFeed feed;
+    feed.Configure(2);
+    Received received;
+
+    tick_with_alerts(state, 1, 0.5, 0, 0);
+    Pump(feed, state, mask.For(state), 0, received);
+    tick_with_alerts(state, 2, 0.5, 1, 0);
+    tick_with_alerts(state, 3, 0.5, 0, 0);
+
+    Pump(feed, state, mask.For(state), 100 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 2u);
+    EXPECT_EQ(received.value_pages[1]->sequence_id(), 1u);
+    EXPECT_EQ(received.value_pages[1]->channels(), nullptr);
+
+    Pump(feed, state, mask.For(state), 500 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 3u);
+    EXPECT_EQ(received.value_pages[2]->sequence_id(), 2u);
+    ASSERT_NE(received.value_pages[2]->channels(), nullptr);
+    EXPECT_EQ(received.value_pages[2]->channels()->Get(0), 4u);
+    EXPECT_EQ(received.value_pages[2]->values()->Get(0), 1u);
+
+    Pump(feed, state, mask.For(state), 1000 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 4u);
+    EXPECT_EQ(received.value_pages[3]->sequence_id(), 3u);
+    EXPECT_TRUE(feed.telemetry().current(state, &mask.For(state)));
+  }
+}
+
 }  // namespace
 }  // namespace studio

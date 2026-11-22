@@ -1651,5 +1651,163 @@ TEST(SharedReservation, MultipleWaitingLargeClientsAreServedFifoWithinBound) {
   }
 }
 
+// REQ-OPS-37
+// An alert channel that activates and clears between two ticks sent to a
+// client (e.g. during read_queue batching or budget deferral) is never
+// coalesced away: the client receives an intermediate activation update with
+// strictly increasing sequence_id and timestamp_ns, followed by the latest
+// tick that clears (or marks absent) the alert. Plain bool channels still
+// coalesce, and a late joiner connecting after the clear gets only a keyframe.
+TEST(ClientFeed, CoalescedAlertActivationIsDeliveredBeforeClearing) {
+  const std::vector<ChannelDef> dictionary{
+      {"drive/velocity", "m/s", {}, Talos::Telemetry::ChannelKind_Double},
+      {"pose/valid", "", {}, Talos::Telemetry::ChannelKind_Bool},
+      {"hw/status/alert_warning_brownout",
+       "",
+       {},
+       Talos::Telemetry::ChannelKind_Bool,
+       Talos::Telemetry::AlertLevel_Warning},
+      {"hw/status/alert_error_link_lost",
+       "",
+       {},
+       Talos::Telemetry::ChannelKind_Bool,
+       Talos::Telemetry::AlertLevel_Error},
+  };
+  TelemetryState state;
+  ASSERT_TRUE(IngestAll(state, DictionaryPages(dictionary)));
+  ASSERT_TRUE(IngestAll(
+      state, TickPages(4, 1, {0, 1, 2, 3}, {RawFromDouble(1.0), 0, 0, 0})));
+
+  ClientFeed feed;
+  std::vector<std::string> sent;
+  Mirror mirror;
+  const auto pump = [&](std::int64_t now) {
+    feed.Pump(
+        state, now, [](std::size_t) { return true; },
+        [&](std::string_view page) {
+          sent.emplace_back(page);
+          mirror.Apply(page);
+          return true;
+        });
+  };
+  pump(0);
+  ASSERT_TRUE(feed.current(state));
+  const std::uint64_t initial_ts = state.timestamp_ns;
+  sent.clear();
+
+  // Coalesce three ticks before pumping: brownout pulses on tick 2, link_lost
+  // pulses on tick 3, plain bool pose/valid pulses on tick 2, and all clear by
+  // tick 4 (with no other channel changing so only the alerts differ).
+  ASSERT_TRUE(IngestAll(
+      state, TickPages(4, 2, {0, 1, 2, 3}, {RawFromDouble(1.0), 1, 1, 0})));
+  ASSERT_TRUE(IngestAll(
+      state, TickPages(4, 3, {0, 1, 2, 3}, {RawFromDouble(1.0), 0, 0, 1})));
+  // A periodic repeat of the same dictionary must not wipe pending alerts.
+  ASSERT_TRUE(IngestAll(state, DictionaryPages(dictionary)));
+  ASSERT_TRUE(IngestAll(
+      state, TickPages(4, 4, {0, 1, 2, 3}, {RawFromDouble(1.0), 0, 0, 0})));
+  EXPECT_FALSE(feed.current(state))
+      << "client has not yet seen the coalesced alert activations";
+
+  pump(10'000'000);
+  const auto pages = ValuePagesOf(sent);
+  ASSERT_EQ(pages.size(), 2u);
+  // First update: activation pulse for both alert channels, never plain bool.
+  EXPECT_FALSE(pages[0]->keyframe());
+  EXPECT_GT(pages[0]->sequence_id(), 1u);
+  EXPECT_LT(pages[0]->sequence_id(), 4u);
+  EXPECT_GT(pages[0]->timestamp_ns(), initial_ts);
+  EXPECT_LT(pages[0]->timestamp_ns(), state.timestamp_ns);
+  ASSERT_NE(pages[0]->channels(), nullptr);
+  ASSERT_EQ(pages[0]->channels()->size(), 2u);
+  EXPECT_EQ(pages[0]->channels()->Get(0), 2u);
+  EXPECT_EQ(pages[0]->values()->Get(0), 1u);
+  EXPECT_EQ(pages[0]->channels()->Get(1), 3u);
+  EXPECT_EQ(pages[0]->values()->Get(1), 1u);
+
+  // Second update: latest tick clears both alerts back to 0.
+  EXPECT_FALSE(pages[1]->keyframe());
+  EXPECT_EQ(pages[1]->sequence_id(), 4u);
+  EXPECT_EQ(pages[1]->timestamp_ns(), state.timestamp_ns);
+  ASSERT_NE(pages[1]->channels(), nullptr);
+  ASSERT_EQ(pages[1]->channels()->size(), 2u);
+  EXPECT_EQ(pages[1]->channels()->Get(0), 2u);
+  EXPECT_EQ(pages[1]->values()->Get(0), 0u);
+  EXPECT_EQ(pages[1]->channels()->Get(1), 3u);
+  EXPECT_EQ(pages[1]->values()->Get(1), 0u);
+  EXPECT_TRUE(feed.current(state));
+  EXPECT_TRUE(mirror.Equals(state));
+
+  // A coalesced alert whose topic then goes absent is pulsed to 1 and then
+  // marked absent on the latest tick.
+  sent.clear();
+  ASSERT_TRUE(IngestAll(
+      state, TickPages(4, 5, {0, 1, 2, 3}, {RawFromDouble(1.0), 0, 1, 0})));
+  ASSERT_TRUE(
+      IngestAll(state, TickPages(4, 6, {0, 1, 3}, {RawFromDouble(1.0), 0, 0})));
+  pump(20'000'000);
+  const auto absent_pages = ValuePagesOf(sent);
+  ASSERT_EQ(absent_pages.size(), 2u);
+  EXPECT_EQ(absent_pages[0]->sequence_id(), 5u);
+  ASSERT_NE(absent_pages[0]->channels(), nullptr);
+  ASSERT_EQ(absent_pages[0]->channels()->size(), 1u);
+  EXPECT_EQ(absent_pages[0]->channels()->Get(0), 2u);
+  EXPECT_EQ(absent_pages[0]->values()->Get(0), 1u);
+  EXPECT_EQ(absent_pages[1]->sequence_id(), 6u);
+  ASSERT_NE(absent_pages[1]->absent(), nullptr);
+  ASSERT_EQ(absent_pages[1]->absent()->size(), 1u);
+  EXPECT_EQ(absent_pages[1]->absent()->Get(0), 2u);
+  EXPECT_TRUE(feed.current(state));
+  EXPECT_TRUE(mirror.Equals(state));
+
+  // A late joiner connecting after the clear gets only the keyframe of tick 6.
+  ClientFeed late_joiner;
+  std::vector<std::string> late_sent;
+  late_joiner.Pump(
+      state, 30'000'000, [](std::size_t) { return true; },
+      [&](std::string_view page) {
+        late_sent.emplace_back(page);
+        return true;
+      });
+  const auto late_pages = ValuePagesOf(late_sent);
+  ASSERT_EQ(late_pages.size(), 1u);
+  EXPECT_TRUE(late_pages[0]->keyframe());
+  EXPECT_EQ(late_pages[0]->sequence_id(), 6u);
+
+  // Under a tight egress budget that affords the pulse first and defers the
+  // clearing tick, both arrive in order once the budget refills.
+  ASSERT_TRUE(IngestAll(
+      state, TickPages(4, 7, {0, 1, 2, 3}, {RawFromDouble(2.0), 0, 0, 1})));
+  ASSERT_TRUE(IngestAll(
+      state, TickPages(4, 8, {0, 1, 2, 3}, {RawFromDouble(3.0), 0, 0, 0})));
+  EgressBudget budget;
+  constexpr double kRate = 1000;
+  ASSERT_TRUE(budget.available(0, kRate, 40'000'000));
+  // Drain to leave room for only the first small page (~110 B).
+  budget.spend(static_cast<std::size_t>(EgressBudget::kBurstBytes) - 160);
+  sent.clear();
+  for (std::int64_t now = 40'000'000;
+       !feed.current(state) && now <= 500'000'000; now += 10'000'000) {
+    feed.Pump(
+        state, now,
+        [&](std::size_t bytes) { return budget.available(bytes, kRate, now); },
+        [&](std::string_view page) {
+          budget.spend(EgressBudget::framed(page.size()));
+          sent.emplace_back(page);
+          mirror.Apply(page);
+          return true;
+        });
+  }
+  const auto budget_pages = ValuePagesOf(sent);
+  ASSERT_EQ(budget_pages.size(), 2u);
+  EXPECT_EQ(budget_pages[0]->sequence_id(), 7u);
+  ASSERT_NE(budget_pages[0]->channels(), nullptr);
+  EXPECT_EQ(budget_pages[0]->channels()->Get(0), 3u);
+  EXPECT_EQ(budget_pages[0]->values()->Get(0), 1u);
+  EXPECT_EQ(budget_pages[1]->sequence_id(), 8u);
+  EXPECT_TRUE(feed.current(state));
+  EXPECT_TRUE(mirror.Equals(state));
+}
+
 }  // namespace
 }  // namespace studio

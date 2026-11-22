@@ -10,7 +10,10 @@
  *   channels whose value changed, at their exact current value. A send the
  *   egress budget cannot afford is not dropped but deferred: the client's
  *   next update carries every change since what it last received, so it never
- *   shows a stale value as current, only skips intermediate samples.
+ *   shows a stale value as current, only skips intermediate samples. Alert
+ *   channels (ChannelInfo.alert != None) that rise to active and clear
+ *   between ticks sent to a client are never coalesced away: the client is
+ *   sent an intermediate activation update before the tick that clears them.
  * - TelemetryJson / ChannelsJson are the self-describing JSON views. Same
  *   rule as system.h: uint64 header fields leave as decimal strings, and an
  *   integer channel value past 2^53 leaves as a decimal string, because a
@@ -73,6 +76,18 @@ struct TelemetryState {
   // Ticks whose pages did not all arrive (the reader was lapped mid-tick):
   // never applied, so no channel mixes two ticks.
   std::uint64_t incomplete_ticks{0};
+
+  // For each alert channel (dictionary[channel].alert != AlertLevel_None),
+  // the latest complete tick in which it was active (present and nonzero), so
+  // ClientFeed never coalesces away a rise-and-clear activation between two
+  // ticks it sends a client (REQ-OPS-37).
+  struct AlertActivation {
+    std::uint32_t channel{0};
+    bool seen{false};
+    std::uint64_t sequence_id{0};
+    std::uint64_t timestamp_ns{0};
+  };
+  std::vector<AlertActivation> alerts;
 
   // Assembly of the dictionary and the tick in progress.
   struct {
@@ -194,6 +209,12 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
       state.values.clear();
       state.present.clear();
       state.pending_tick.active = false;
+      state.alerts.clear();
+      for (std::uint32_t i = 0; i < dictionary.size(); ++i) {
+        if (dictionary[i].alert != Talos::Telemetry::AlertLevel_None) {
+          state.alerts.push_back({.channel = i});
+        }
+      }
     }
     state.dictionary = std::move(dictionary);
     state.dictionary_id = frame->dictionary_id();
@@ -271,6 +292,15 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
                    chassis->roll(), chassis->pitch(), chassis->yaw()};
   state.values.swap(tick.values);
   state.present.swap(tick.present);
+  for (auto& alert : state.alerts) {
+    if (alert.channel < state.present.size() &&
+        state.present[alert.channel] != 0 && state.values[alert.channel] != 0 &&
+        (!alert.seen || state.sequence_id >= alert.sequence_id)) {
+      alert.seen = true;
+      alert.sequence_id = state.sequence_id;
+      alert.timestamp_ns = state.timestamp_ns;
+    }
+  }
   state.received_monotonic_ns = monotonic_ns;
   state.has_frame = true;
   return true;
@@ -392,88 +422,109 @@ class ClientFeed {
       ++dictionary_pages_sent_;
     }
     if (mask != nullptr && mask->size() != count) return;
-    // The client holds this tick: nothing to send until the heartbeat is due.
-    if (!state.has_frame || (has_values_ && sequence_id_ == state.sequence_id &&
-                             now_ns - last_send_ns_ < kHeartbeatNs)) {
-      return;
-    }
-
-    const bool keyframe = !has_values_;
-    channels_.clear();
-    raw_.clear();
-    absent_.clear();
-    for (std::size_t i = 0; i < count; ++i) {
-      if (mask != nullptr && (*mask)[i] == 0) continue;
-      if (state.present[i] != 0) {
-        if (keyframe || present_[i] == 0 || values_[i] != state.values[i]) {
-          channels_.push_back(static_cast<std::uint32_t>(i));
-          raw_.push_back(state.values[i]);
-        }
-      } else if (!keyframe && present_[i] != 0) {
-        absent_.push_back(static_cast<std::uint32_t>(i));
+    // At most two steps: an intermediate activation pulse for alert channels
+    // that rose and cleared while updates were coalesced, then the latest tick
+    // itself (which clears them and delivers all current changes).
+    for (int step = 0; step < 2; ++step) {
+      // The client holds this tick: nothing to send until the heartbeat is due.
+      if (!state.has_frame ||
+          (has_values_ && sequence_id_ == state.sequence_id &&
+           now_ns - last_send_ns_ < kHeartbeatNs)) {
+        return;
       }
-    }
-    const bool changed = keyframe || !channels_.empty() || !absent_.empty() ||
-                         chassis_ != state.chassis;
-    const bool heartbeat_due = now_ns - last_send_ns_ >= kHeartbeatNs;
-    // A change inside the update interval waits; if the heartbeat is due
-    // meanwhile, it restamps the tick the client holds, which is the truth
-    // about the values it shows. A client whose view is unknown has no tick
-    // to restamp and waits for its keyframe.
-    const bool limited = changed && updated_ &&
-                         now_ns - last_update_ns_ < min_update_interval_ns_;
-    held_ = limited;
-    if (!changed && !heartbeat_due) return;
-    if (limited && (!heartbeat_due || keyframe)) return;
-    if (limited) {
+
+      const bool keyframe = !has_values_;
       channels_.clear();
       raw_.clear();
       absent_.clear();
-    }
+      std::uint64_t send_sequence_id = state.sequence_id;
+      std::uint64_t send_timestamp_ns = state.timestamp_ns;
+      const bool is_pulse =
+          !keyframe &&
+          CollectAlertPulse(state, mask, send_sequence_id, send_timestamp_ns);
+      if (!is_pulse) {
+        for (std::size_t i = 0; i < count; ++i) {
+          if (mask != nullptr && (*mask)[i] == 0) continue;
+          if (state.present[i] != 0) {
+            if (keyframe || present_[i] == 0 || values_[i] != state.values[i]) {
+              channels_.push_back(static_cast<std::uint32_t>(i));
+              raw_.push_back(state.values[i]);
+            }
+          } else if (!keyframe && present_[i] != 0) {
+            absent_.push_back(static_cast<std::uint32_t>(i));
+          }
+        }
+      }
+      const bool changed = keyframe || is_pulse || !channels_.empty() ||
+                           !absent_.empty() || chassis_ != state.chassis;
+      const bool heartbeat_due = now_ns - last_send_ns_ >= kHeartbeatNs;
+      // A change inside the update interval waits; if the heartbeat is due
+      // meanwhile, it restamps the tick the client holds, which is the truth
+      // about the values it shows. A client whose view is unknown has no tick
+      // to restamp and waits for its keyframe.
+      const bool limited = changed && updated_ &&
+                           now_ns - last_update_ns_ < min_update_interval_ns_;
+      held_ = limited;
+      if (!changed && !heartbeat_due) return;
+      if (limited && (!heartbeat_due || keyframe)) return;
+      if (limited) {
+        channels_.clear();
+        raw_.clear();
+        absent_.clear();
+      }
 
-    pages_.clear();
-    spans_.clear();
-    std::size_t framed_total = 0;
-    const TelemetryPose& pose = limited ? chassis_ : state.chassis;
-    const talos::telemetry::PageHeader header{
-        .stream_id = state.stream_id,
-        .sequence_id = limited ? sequence_id_ : state.sequence_id,
-        .timestamp_ns = limited ? timestamp_ns_ : state.timestamp_ns,
-        .dictionary_id = state.dictionary_id,
-        .channel_count = static_cast<std::uint32_t>(count)};
-    const Talos::Telemetry::Pose chassis{pose.x,    pose.y,     pose.z,
-                                         pose.roll, pose.pitch, pose.yaw};
-    const bool encoded = talos::telemetry::EncodeValuePages(
-        builder_, header, chassis, keyframe, channels_, raw_, absent_,
-        [&](std::span<const std::uint8_t> page,
-            const talos::telemetry::PageSpan& span) {
-          pages_.emplace_back(reinterpret_cast<const char*>(page.data()),
-                              page.size());
-          spans_.push_back(span);
-          framed_total += EgressBudget::framed(page.size());
-        });
-    // Neither can happen (frames_test; the channel cap); never send what
-    // the client could not apply whole.
-    if (!encoded ||
-        static_cast<double>(framed_total) > EgressBudget::kBurstBytes) {
-      return;
-    }
-    if (!afford(framed_total)) return;
-    for (std::size_t i = 0; i < pages_.size(); ++i) {
-      if (!send(pages_[i])) {
-        Resync(count);
+      pages_.clear();
+      spans_.clear();
+      std::size_t framed_total = 0;
+      const TelemetryPose& pose =
+          (limited || is_pulse) ? chassis_ : state.chassis;
+      const talos::telemetry::PageHeader header{
+          .stream_id = state.stream_id,
+          .sequence_id = limited ? sequence_id_ : send_sequence_id,
+          .timestamp_ns = limited ? timestamp_ns_ : send_timestamp_ns,
+          .dictionary_id = state.dictionary_id,
+          .channel_count = static_cast<std::uint32_t>(count)};
+      const Talos::Telemetry::Pose chassis{pose.x,    pose.y,     pose.z,
+                                           pose.roll, pose.pitch, pose.yaw};
+      const bool encoded = talos::telemetry::EncodeValuePages(
+          builder_, header, chassis, keyframe, channels_, raw_, absent_,
+          [&](std::span<const std::uint8_t> page,
+              const talos::telemetry::PageSpan& span) {
+            pages_.emplace_back(reinterpret_cast<const char*>(page.data()),
+                                page.size());
+            spans_.push_back(span);
+            framed_total += EgressBudget::framed(page.size());
+          });
+      // Neither can happen (frames_test; the channel cap); never send what
+      // the client could not apply whole.
+      if (!encoded ||
+          static_cast<double>(framed_total) > EgressBudget::kBurstBytes) {
         return;
       }
-      Apply(spans_[i], keyframe && i == 0);
-    }
-    last_send_ns_ = now_ns;
-    if (limited) return;
-    sequence_id_ = state.sequence_id;
-    timestamp_ns_ = state.timestamp_ns;
-    chassis_ = state.chassis;
-    if (changed) {
-      updated_ = true;
-      last_update_ns_ = now_ns;
+      if (!afford(framed_total)) return;
+      for (std::size_t i = 0; i < pages_.size(); ++i) {
+        if (!send(pages_[i])) {
+          Resync(count);
+          return;
+        }
+        Apply(spans_[i], keyframe && i == 0);
+      }
+      last_send_ns_ = now_ns;
+      if (limited) return;
+      sequence_id_ = send_sequence_id;
+      timestamp_ns_ = send_timestamp_ns;
+      if (!is_pulse) chassis_ = state.chassis;
+      if (changed) {
+        updated_ = true;
+        last_update_ns_ = now_ns;
+      }
+      if (!is_pulse) return;
+      if (min_update_interval_ns_ > 0) {
+        // The clearing tick waits one update interval so update_hz is never
+        // exceeded; NextDueNs wakes the bridge when that interval ends.
+        held_ = true;
+        return;
+      }
     }
   }
 
@@ -493,12 +544,13 @@ class ClientFeed {
   bool holds_tick() const { return has_values_; }
 
   // True when the client holds exactly the state's latest tick (of the
-  // channels `mask` marks, when given).
+  // channels `mask` marks, when given) and owes no coalesced alert pulse.
   bool current(const TelemetryState& state,
                const std::vector<std::uint8_t>* mask = nullptr) const {
     if (!known_ || !has_values_ || !state.has_frame ||
         stream_id_ != state.stream_id ||
-        dictionary_id_ != state.dictionary_id || chassis_ != state.chassis) {
+        dictionary_id_ != state.dictionary_id || chassis_ != state.chassis ||
+        HasPendingAlertPulse(state, mask)) {
       return false;
     }
     for (std::size_t i = 0; i < state.present.size(); ++i) {
@@ -512,6 +564,68 @@ class ClientFeed {
   }
 
  private:
+  bool HasPendingAlertPulse(const TelemetryState& state,
+                            const std::vector<std::uint8_t>* mask) const {
+    if (state.sequence_id <= sequence_id_ ||
+        state.timestamp_ns <= timestamp_ns_ ||
+        state.timestamp_ns - timestamp_ns_ < 2) {
+      return false;
+    }
+    for (const auto& alert : state.alerts) {
+      const std::uint32_t i = alert.channel;
+      if (i >= present_.size() || i >= state.present.size()) continue;
+      if (mask != nullptr && (i >= mask->size() || (*mask)[i] == 0)) continue;
+      if (!alert.seen || alert.sequence_id <= sequence_id_ ||
+          alert.sequence_id >= state.sequence_id) {
+        continue;
+      }
+      const bool client_active = present_[i] != 0 && values_[i] != 0;
+      const bool state_active = state.present[i] != 0 && state.values[i] != 0;
+      if (!client_active && !state_active) return true;
+    }
+    return false;
+  }
+
+  // Populates `channels_`/`raw_` with masked alert channels that activated and
+  // cleared strictly between the client's held tick and `state`'s latest tick,
+  // setting `pulse_seq` and `pulse_ts` strictly between both so downstream
+  // readers (Timeline, TelemetryStore, DriveModel) accept the activation and
+  // the following clearing tick in order.
+  bool CollectAlertPulse(const TelemetryState& state,
+                         const std::vector<std::uint8_t>* mask,
+                         std::uint64_t& pulse_seq, std::uint64_t& pulse_ts) {
+    if (state.sequence_id <= sequence_id_ ||
+        state.timestamp_ns <= timestamp_ns_ ||
+        state.timestamp_ns - timestamp_ns_ < 2) {
+      return false;
+    }
+    std::uint64_t best_seq = 0;
+    std::uint64_t best_ts = 0;
+    for (const auto& alert : state.alerts) {
+      const std::uint32_t i = alert.channel;
+      if (i >= present_.size() || i >= state.present.size()) continue;
+      if (mask != nullptr && (i >= mask->size() || (*mask)[i] == 0)) continue;
+      if (!alert.seen || alert.sequence_id <= sequence_id_ ||
+          alert.sequence_id >= state.sequence_id) {
+        continue;
+      }
+      const bool client_active = present_[i] != 0 && values_[i] != 0;
+      const bool state_active = state.present[i] != 0 && state.values[i] != 0;
+      if (client_active || state_active) continue;
+      channels_.push_back(i);
+      raw_.push_back(1);
+      if (alert.sequence_id > best_seq) {
+        best_seq = alert.sequence_id;
+        best_ts = alert.timestamp_ns;
+      }
+    }
+    if (channels_.empty()) return false;
+    pulse_seq = best_seq;
+    pulse_ts = (best_ts > timestamp_ns_ && best_ts < state.timestamp_ns)
+                   ? best_ts
+                   : timestamp_ns_ + 1;
+    return true;
+  }
   // The client's view is unknown (it has not joined, or a send failed): the
   // next update is a keyframe, which makes it start from every channel absent.
   void Resync(std::size_t count) {
