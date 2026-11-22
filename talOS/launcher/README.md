@@ -255,14 +255,21 @@ using the same validator the telemetry node runs at construction
 ([talOS/telemetry](../telemetry/README.md#dashboard-layout)). An invalid
 `[[subsystem.labels]]` entry (bad structure, unknown key, missing/non-string
 field, bad `from`, missing/non-string-array source, over 1024 labels or a
-label past the string limit, or a channel absent from the declared graph's
-dictionary, not an integer, or already labelled) or an invalid `[studio]
-dashboard` layout (file syntax/schema/grid/budget errors, a channel absent
-from or excluded from the dictionary, or a drive feed over budget once alerts
-are counted) is a phase-1 error naming the subsystem or layout file and key.
-It refuses `--describe-only`, `deploy.sh install`, and launch even when
-`telemetry` is marked `critical = false` (overridden in simulation only with
-`--sim --allow-graph-errors`).
+label past the string limit) or a `[studio] dashboard` layout the file alone
+refuses (syntax, schema, grid or budget) is a phase-1 error naming the
+subsystem or layout file and key. It refuses `--describe-only`,
+`deploy.sh install`, and launch even when `telemetry` is marked
+`critical = false` (overridden in simulation only with
+`--sim --allow-graph-errors`). A finding checked against the declared graph's
+dictionary (a label's channel absent from it, not an integer, or already
+labelled; a layout channel absent from or excluded from it; a dictionary or
+drive feed over its limit once labels and alerts are counted) is that error
+too when every node other than telemetry and the Studio bridge answered
+`--describe`. When one did not (a `critical = false` node that does not
+answer only warns), its channels are missing from the dictionary, so such a
+finding is a warning that says the declared graph is incomplete and names the
+nodes that did not answer, and the launch is not refused for it. With no
+such node answering at all, nothing is checked against the dictionary.
 
 ## Live endpoints
 
@@ -464,8 +471,8 @@ dashboard = "dashboard.toml"              # driver dashboard layout, relative to
 
 Every key shown is optional. `dashboard` names the driver dashboard's
 layout ([talOS/telemetry](../telemetry/README.md#dashboard-layout)); config
-load refuses a missing file, phase one (`LintTelemetryConfig`) refuses an
-invalid layout as an error even when `telemetry` is `critical = false`, and
+load refuses a missing file, phase one (`LintTelemetryConfig`) checks the
+layout ([telemetry labels and dashboard layout](#telemetry-labels-and-dashboard-layout)), and
 the file is in the config's `CONFIG_FILES` and its bundle. The watched topic
 comes from `[studio] topic`,
 the same setting the telemetry node reads. `--studio-http-port PORT`

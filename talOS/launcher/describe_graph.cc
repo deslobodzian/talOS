@@ -538,11 +538,13 @@ std::string StripTelemetryPrefix(std::string_view message) {
 // of other answered graph readers (such as teleop's `/teleop/status`).
 // Sets `have_graph` to false only when no non-telemetry, non-Studio-bridge
 // roster member answered while at least one such member exists (e.g. before
-// binaries are built).
+// binaries are built), and lists in `unanswered` every such member that did
+// not answer (the graph is then incomplete).
 introspect::DeclaredGraph DeclaredGraphForTelemetry(
     const std::vector<NodeDescription>& described,
     const std::vector<std::string>& telemetry_names,
-    std::string_view studio_bridge_target, bool& have_graph) {
+    std::string_view studio_bridge_target, bool& have_graph,
+    std::vector<std::string>& unanswered) {
   auto is_telemetry = [&](std::string_view name) {
     return std::ranges::find(telemetry_names, name) != telemetry_names.end();
   };
@@ -551,7 +553,7 @@ introspect::DeclaredGraph DeclaredGraphForTelemetry(
                                              : studio_bridge_target;
   introspect::DeclaredGraph graph;
   std::size_t answered_other = 0;
-  std::size_t unanswered_other = 0;
+  unanswered.clear();
   for (const auto& node : described) {
     if (is_telemetry(node.roster_name)) continue;
     const bool is_studio_bridge =
@@ -560,7 +562,7 @@ introspect::DeclaredGraph DeclaredGraphForTelemetry(
          node.declared.target == bridge_suffix ||
          node.declared.target.ends_with(bridge_suffix));
     if (!node.answered) {
-      if (!is_studio_bridge) ++unanswered_other;
+      if (!is_studio_bridge) unanswered.push_back(node.roster_name);
       continue;
     }
     if (!is_studio_bridge) ++answered_other;
@@ -580,8 +582,27 @@ introspect::DeclaredGraph DeclaredGraphForTelemetry(
       graph.push_back(std::move(static_pub));
     }
   }
-  have_graph = (answered_other > 0) || (unanswered_other == 0);
+  have_graph = (answered_other > 0) || unanswered.empty();
   return graph;
+}
+
+// A finding that depends on the dictionary being complete: an error when
+// every node answered --describe, else a warning naming those that did not,
+// since their channels are missing from the dictionary it was checked against.
+naming::Diagnostic DictionaryFinding(
+    std::string subject, std::string message,
+    const std::vector<std::string>& unanswered) {
+  if (unanswered.empty()) {
+    return {naming::Severity::ERROR, std::move(subject), std::move(message)};
+  }
+  std::string names;
+  for (const std::string& name : unanswered) {
+    if (!names.empty()) names += ", ";
+    names += name;
+  }
+  message += " (a warning, not an error: the declared graph is incomplete, " +
+             names + " did not answer --describe)";
+  return {naming::Severity::WARNING, std::move(subject), std::move(message)};
 }
 
 }  // namespace
@@ -615,8 +636,10 @@ std::vector<naming::Diagnostic> LintTelemetryConfig(
   }
 
   bool have_graph = false;
+  std::vector<std::string> unanswered;
   const introspect::DeclaredGraph graph = DeclaredGraphForTelemetry(
-      described, telemetry_subsystems, robot_config.studio.bridge, have_graph);
+      described, telemetry_subsystems, robot_config.studio.bridge, have_graph,
+      unanswered);
 
   std::vector<std::vector<telemetry::ChannelDef>> dictionaries;
   for (const std::string& name : telemetry_subsystems) {
@@ -659,16 +682,16 @@ std::vector<naming::Diagnostic> LintTelemetryConfig(
         try {
           telemetry::ApplyLabelSpecs(label_specs, dict);
         } catch (const std::invalid_argument& error) {
-          findings.push_back({naming::Severity::ERROR, name,
-                              StripTelemetryPrefix(error.what())});
+          findings.push_back(DictionaryFinding(
+              name, StripTelemetryPrefix(error.what()), unanswered));
         }
       }
       telemetry::CheckDictionaryChannelCap(dict);
       static_cast<void>(telemetry::MeasurePages(dict));
       dictionaries.push_back(std::move(dict));
     } catch (const std::exception& error) {
-      findings.push_back(
-          {naming::Severity::ERROR, name, StripTelemetryPrefix(error.what())});
+      findings.push_back(DictionaryFinding(
+          name, StripTelemetryPrefix(error.what()), unanswered));
     }
   }
 
@@ -683,7 +706,7 @@ std::vector<naming::Diagnostic> LintTelemetryConfig(
               telemetry::CheckDashboardAgainstDictionary(layout, dict);
             } catch (const telemetry::DashboardLayoutError& error) {
               findings.push_back(
-                  {naming::Severity::ERROR, "studio", error.what()});
+                  DictionaryFinding("studio", error.what(), unanswered));
             }
           }
         } else if (telemetry_subsystems.empty()) {
@@ -693,7 +716,7 @@ std::vector<naming::Diagnostic> LintTelemetryConfig(
             telemetry::CheckDashboardAgainstDictionary(layout, dict);
           } catch (const std::exception& error) {
             findings.push_back(
-                {naming::Severity::ERROR, "studio", error.what()});
+                DictionaryFinding("studio", error.what(), unanswered));
           }
         }
       }
