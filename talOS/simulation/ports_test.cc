@@ -17,6 +17,8 @@ TEST(GatewayPorts, ConfigPortsUnlessAFlagOverrides) {
   const GatewayPorts from_flags = ResolveGatewayPorts(robot, 6000, 6001);
   EXPECT_EQ(from_flags.listen, 6000);
   EXPECT_EQ(from_flags.send, 6001);
+  EXPECT_THROW(ResolveGatewayPorts(robot, 5901, 0), std::invalid_argument);
+  EXPECT_THROW(ResolveGatewayPorts(robot, 6000, 6000), std::invalid_argument);
 }
 
 }  // namespace

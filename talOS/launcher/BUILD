@@ -422,6 +422,7 @@ cc_binary(
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/hardware",
+        "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/schema:decode",
     ],
@@ -465,6 +466,7 @@ cc_test(
         "//talOS/events:gap_testing",
         "//talOS/hardware",
         "//talOS/protocol",
+        "@flatbuffers//:runtime_cc",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
@@ -1175,5 +1177,25 @@ cc_test(
         "//talOS/events:events_log",
         "//talOS/events:input_replay",
         "@googletest//:gtest_main",
+    ],
+)
+
+# Adversarial boundary tests for bundle loading, pipes, probes, watchdog
+# intervals, JSON UTF-8 escaping, and CLI numeric flag validation.
+cc_test(
+    name = "launcher_adversarial_test",
+    size = "small",
+    srcs = ["launcher_adversarial_test.cc"],
+    data = [":launcher"],
+    env = {"TALOS_LAUNCHER": "$(rlocationpath :launcher)"},
+    deps = [
+        ":describe_graph",
+        ":launcher_lib",
+        ":roster",
+        ":session",
+        ":spawn",
+        "//talOS/introspection:describe",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )

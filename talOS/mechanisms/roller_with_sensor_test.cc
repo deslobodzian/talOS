@@ -715,5 +715,21 @@ eject_v = -6.0
   }
 }
 
+// An unrecognized RollerCommand enum value (e.g. from an unchecked wire cast)
+// fails closed to kIdle instead of staying in kIntaking driving intake_v.
+// REQ-SAFE-38
+TEST(RollerWithSensor, UnknownCommandEnumFailsClosedToIdle) {
+  Rig intake{"intake"};
+  intake.Start();
+  intake.Drive(Command::INTAKE, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kIntaking);
+  ASSERT_DOUBLE_EQ(intake.Applied().demand, 6.0);
+
+  intake.Drive(static_cast<Command>(99), 20ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_FALSE(intake.roller().driving());
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+}
+
 }  // namespace
 }  // namespace talos::mechanisms

@@ -443,7 +443,13 @@ A producer that maps operator input (joysticks, a button board) opens its
 lanes with an `OperatorArming`, so a control held through a disable, reboot,
 Driver Station dropout or stall of the producer does not drive until it has
 been released once (the full list:
-[Architecture: Targets](../ARCHITECTURE.md#targets)):
+[Architecture: Targets](../ARCHITECTURE.md#targets)). Any node that reads
+`DriverStation` (or directly subscribes to `/hw/state/driver_station`) and
+publishes a lane listed in the target subsystem's `teleop` policy **must** open
+that lane with `OperatorArming` (REQ-SAFE-14); otherwise both node startup
+(live runs and `testing::Sim`) and `LintGraph` refuse it. Coordinators that
+use `Target`/`TargetLane` without reading `DriverStation`, and `DriverStation`
+readers that write only `autonomous` lanes, need no `OperatorArming`:
 
 ```cpp
 // in update(), with ds_ a talos::DriverStation:

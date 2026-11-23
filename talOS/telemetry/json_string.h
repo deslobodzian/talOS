@@ -10,7 +10,9 @@ namespace talos::telemetry {
 // and \t, every other byte below 0x20 as \u00XX in lowercase hex, and every
 // byte from 0x20 up (0x7f and non-ASCII included) as is. The dashboard
 // layout (/drive/layout.json) and the Studio bridge's JSON both write their
-// strings through it.
+// strings through it. talOS/vision/recording/recording.cc keeps its own copy
+// with the same escaping rules because talOS/vision does not depend on
+// talOS/telemetry.
 inline void AppendEscaped(std::string& out, std::string_view value) {
   out += '"';
   for (const char c : value) {

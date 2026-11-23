@@ -313,10 +313,23 @@ def talos_topic_problem(topic):
         return quoted + ": role '%s' is not one of %s" % (segments[1], ", ".join(TALOS_TOPIC_ROLES))
     return None
 
+def _is_lower_snake_case(key):
+    if not key or key[0] not in _LOWERCASE.elems() or key.endswith("_") or "__" in key:
+        return False
+    for c in key.elems():
+        if c not in _SEGMENT_CHARACTERS.elems():
+            return False
+    return True
+
 def _check_topics(topics):
+    seen_cc = {}
     for key, topic in topics.items():
-        if not key or not key[0].isalpha() or not key.replace("_", "a").isalnum() or key.lower() != key:
+        if not _is_lower_snake_case(key):
             fail("talos_messages: topic key %r must be a lower_snake_case name" % key)
+        cc_name = "k" + "".join([part.capitalize() for part in key.split("_")])
+        if cc_name in seen_cc:
+            fail("talos_messages: topic keys %r and %r collide as C++ constant %s" % (seen_cc[cc_name], key, cc_name))
+        seen_cc[cc_name] = key
         problem = talos_topic_problem(topic)
         if problem:
             fail("talos_messages: %s (talOS/NAMING.md)" % problem)

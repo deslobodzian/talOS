@@ -504,7 +504,9 @@ class BorrowedLifetimeTest(unittest.TestCase):
                     self.hardware = talos.HardwareLink(node)
                     self.ds = talos.DriverStation(node)
                     self.target = talos.Target(node, Goal)
-                    self.lane = talos.TargetLane(node, Goal, "probe", "teleop")
+                    self.arming = talos.OperatorArming(node)
+                    self.lane = talos.TargetLane(
+                        node, Goal, "probe", "teleop", arming=self.arming)
                     self.sm = talos.StateMachine(node, 0)
 
             config = '''
@@ -516,7 +518,7 @@ class BorrowedLifetimeTest(unittest.TestCase):
             teleop = ["teleop"]
             '''
             for kind in ("node", "lookup", "sub", "pub", "bytes", "motor",
-                         "hardware", "ds", "target", "lane", "sm"):
+                         "hardware", "ds", "target", "arming", "lane", "sm"):
                 sim = Sim.from_toml(config)
                 obj = sim.add(Endpoints, "probe")
                 wrapper = sim.node("probe") if kind == "lookup" else getattr(obj, kind)
@@ -541,6 +543,8 @@ class BorrowedLifetimeTest(unittest.TestCase):
                     assert not wrapper.enabled
                 elif kind == "target":
                     assert wrapper.get() is None
+                elif kind == "arming":
+                    assert not wrapper.armed
                 elif kind == "lane":
                     wrapper.release()
                 elif kind == "sm":

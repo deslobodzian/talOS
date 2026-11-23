@@ -366,6 +366,67 @@ class CheckNodeMatrixTest(unittest.TestCase):
                         self.assertEqual(check_node_matrix.main(
                             ["bot", "--baseline", "baseline.txt"]), code)
 
+    # REQ-CONTRACT-14, REQ-SAFE-38: commented-out C++ tests, skipped or
+    # docstring Python tests, and aliased Python actuator imports must not
+    # bypass the matrix check.
+    def test_commented_skipped_tests_and_aliased_actuator_imports_fail_closed(
+            self):
+        # Commented-out and raw-string C++ tests do not count as present.
+        cpp_commented = (
+            "/*\n"
+            "TEST(Obs, PublishesFromALiveInput) {}\n"
+            "*/\n"
+            'const char* s = R"(\n'
+            "TEST(Obs, StaleInputClearsValidity) {}\n"
+            ')";\n'
+        )
+        _, result = check_node_matrix.check(cpp_commented, "cpp", "observer")
+        self.assertIn(1, missing(result))
+        self.assertIn(3, missing(result))
+
+        # A commented-out C++ test must not satisfy a Python parity claim.
+        claim = '# matrix: parity 3 node_test.cc "stale lane"\n'
+        run = (
+            'SCENARIO = [("stale lane", wait(0.2))]\n'
+            'def test_parity():\n'
+            '    parity.assert_same_behaviour(Cpp, Py, CONFIG, "arm", SCENARIO)\n'
+        )
+        with self.assertRaisesRegex(check_node_matrix.MatrixError, r"parity 3:"):
+            check_node_matrix.check(
+                claim + run, "py", "actuator",
+                lambda name: (
+                    "/*\nTEST_F(ArmTest, StaleLaneGoesNeutral) {}\n*/\n"
+                    if name == "node_test.cc" else None
+                ),
+            )
+
+        # Skipped Python tests (method decorator, class decorator, skipTest)
+        # and defs inside docstrings do not count as present.
+        py_skipped = (
+            '"""\n'
+            'def test_publishes_from_a_live_input(self):\n'
+            '    pass\n'
+            '"""\n'
+            'import unittest\n'
+            'class ObsTest(unittest.TestCase):\n'
+            '    @unittest.skip("broken")\n'
+            '    def test_stale_input_clears_validity(self):\n'
+            '        pass\n'
+            '    def test_bad_parameter_fails_construction(self):\n'
+            '        self.skipTest("later")\n'
+        )
+        _, result = check_node_matrix.check(py_skipped, "py", "observer")
+        self.assertEqual(sorted(missing(result)), [1, 3, 9])
+
+        # A Python actuator importing talos or talos.devices under an alias
+        # is still inferred as actuator (12 cases, not 4).
+        for src in (
+            "import talos as t\nm = t.Motor(node, 'm')\n",
+            "import talos.devices as dev\nm = dev.PwmOutput(node, 'p')\n",
+        ):
+            with self.subTest(src=src):
+                self.assertEqual(check_node_matrix.infer_role([src]), "actuator")
+
 
 if __name__ == "__main__":
     unittest.main()

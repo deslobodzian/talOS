@@ -78,7 +78,9 @@ refuses from the start (RULES.md 2):
   could hide headers from source discovery, and computed `#include MACRO`
   directives that cannot be verified statically;
 - non-comment, non-string references to `NodeAccess`, `add_hardware_request`,
-  `HardwareAccess`, or `note_live_target`, preprocessor token-pasting
+  `add_target_lane_publisher`, `add_internal_driver_station_subscription`,
+  `mark_driver_station_reader`, `HardwareAccess`, or `note_live_target`,
+  preprocessor token-pasting
   operators `##` and `%:%:` (which could otherwise assemble them), and C++
   trigraphs (`??[=/'()!<>-]` in code and comments, plus `??/` in string/char
   literals where it can escape quotes or splice lines under trigraph-enabling
@@ -333,6 +335,7 @@ INCLUDE_DIRECTIVE_RE = re.compile(
 HEADER_NAME_RE = re.compile(r'^(?:"([^"]*)"|<([^>]*)>)')
 TOKEN_PASTE_RE = re.compile(r"##|%:%:")
 TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>-]")
+UCN_RE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})")
 FORBIDDEN_COPT_FLAG_RE = re.compile(
     r"^(?:--?(?:include|imacros|f?trigraphs|fms-(?:extensions|compatibility)|"
     r"iquote|(?:cxx-)?isystem|idirafter|iwithprefix|iwithsysroot)|-I)"
@@ -399,6 +402,11 @@ NEVER_EXEMPT_INCLUDES_LOWER = frozenset(
 FORBIDDEN_SYMBOLS = (
     ("NodeAccess", re.compile(r"\bNodeAccess\b")),
     ("add_hardware_request", re.compile(r"\badd_hardware_request\b")),
+    ("add_target_lane_publisher", re.compile(r"\badd_target_lane_publisher\b")),
+    ("add_internal_driver_station_subscription",
+     re.compile(r"\badd_internal_driver_station_subscription\b")),
+    ("mark_driver_station_reader",
+     re.compile(r"\bmark_driver_station_reader\b")),
     ("HardwareAccess", re.compile(r"\bHardwareAccess\b")),
     ("note_live_target", re.compile(r"\bnote_live_target\b")),
 )
@@ -1025,6 +1033,16 @@ def scan_cpp_text(path, text):
             f"uses C++ trigraph `{m.group(0)}` (can assemble directives, "
             f"token pasting, or line splices under -trigraphs)"))
 
+    # Refuse C++ Universal Character Names (\uXXXX / \UXXXXXXXX) outside
+    # comments and string/char literals, where they can spell forbidden
+    # identifiers such as `Node\u0041ccess`.
+    for m in UCN_RE.finditer(no_strings):
+        lineno = line_map[m.start()] if line_map else 1
+        violations.append(SourceViolation(
+            path, lineno, "ucn-identifier",
+            f"uses C++ universal character name `{m.group(0)}` in code "
+            f"(can spell forbidden framework internals)"))
+
     violations.sort(key=lambda v: (v.line, v.kind, v.detail))
     return violations
 
@@ -1109,7 +1127,8 @@ def _collect_starlark_bindings(tree):
 
 
 def _eval_starlark_str(node, bindings, seen=frozenset()):
-    """Evaluates a Starlark string constant, constant `+` concat, or `.join`."""
+    """Evaluates a Starlark string constant, constant `+` concat, `%` format,
+    `.format(...)`, or `.join(...)`."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.Name) and node.id in bindings:
@@ -1123,6 +1142,60 @@ def _eval_starlark_str(node, bindings, seen=frozenset()):
         if left is not None and right is not None:
             return left + right
         return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        fmt = _eval_starlark_str(node.left, bindings, seen)
+        if fmt is None:
+            return None
+        rhs = node.right
+        if isinstance(rhs, ast.Name) and rhs.id in bindings and rhs.id not in seen:
+            rhs = bindings[rhs.id]
+            seen = seen | {node.right.id}
+        if isinstance(rhs, ast.Tuple):
+            items = [_eval_starlark_str(e, bindings, seen) for e in rhs.elts]
+            if any(v is None for v in items):
+                return None
+            arg = tuple(items)
+        elif isinstance(rhs, ast.Dict):
+            arg = {}
+            for k, v in zip(rhs.keys, rhs.values):
+                if k is None:
+                    return None
+                ks = _eval_starlark_str(k, bindings, seen)
+                vs = _eval_starlark_str(v, bindings, seen)
+                if ks is None or vs is None:
+                    return None
+                arg[ks] = vs
+        else:
+            arg = _eval_starlark_str(rhs, bindings, seen)
+            if arg is None:
+                return None
+        try:
+            return fmt % arg
+        except (TypeError, ValueError, KeyError):
+            return None
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
+            node.func.attr == "format"):
+        fmt = _eval_starlark_str(node.func.value, bindings, seen)
+        if fmt is None:
+            return None
+        pos = []
+        for a in node.args:
+            val = _eval_starlark_str(a, bindings, seen)
+            if val is None:
+                return None
+            pos.append(val)
+        kw = {}
+        for k in node.keywords:
+            if k.arg is None:
+                return None
+            val = _eval_starlark_str(k.value, bindings, seen)
+            if val is None:
+                return None
+            kw[k.arg] = val
+        try:
+            return fmt.format(*pos, **kw)
+        except (ValueError, KeyError, IndexError):
+            return None
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
             node.func.attr == "join" and len(node.args) == 1 and
             not node.keywords and

@@ -36,9 +36,10 @@ inline constexpr std::uintmax_t kMaxStaticFileBytes =
     studio::kMaxStaticFileBytes;
 
 // The built Studio (//studio:web_dist) under `root` at URL path `url`, "/"
-// meaning index.html. 400 for a path holding '%' or '\\' (an encoded or
-// ambiguous name), 404 for one whose normal form leaves `root` (by ".."), is
-// not a regular file, or when `root` is empty; 413 past kMaxStaticFileBytes.
+// meaning index.html. 400 for a path holding '%', '\\', or '\0' (an encoded,
+// NUL-containing, or ambiguous name), 404 for one whose normal form leaves
+// `root` (by ".."), is not a regular file, or when `root` is empty; 413 past
+// kMaxStaticFileBytes.
 // A symlink inside `root` is followed: the root is a build output (Bazel
 // stages one as symlinks), and only the URL comes from the requester.
 Response StaticFile(const std::filesystem::path& root, std::string_view url);

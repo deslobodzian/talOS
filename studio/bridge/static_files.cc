@@ -8,9 +8,8 @@
 #include <array>
 #include <cerrno>
 #include <cstddef>
-#include <fstream>
-#include <iterator>
 #include <system_error>
+#include <utility>
 
 namespace studio {
 namespace {
@@ -18,6 +17,16 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr std::size_t kAssetHashChars = 8;
+
+struct ScopedFd {
+  int fd{-1};
+  explicit ScopedFd(int descriptor) : fd(descriptor) {}
+  ~ScopedFd() {
+    if (fd >= 0) ::close(fd);
+  }
+  ScopedFd(const ScopedFd&) = delete;
+  ScopedFd& operator=(const ScopedFd&) = delete;
+};
 
 }  // namespace
 
@@ -36,7 +45,8 @@ bool ContentHashed(const fs::path& relative) {
   auto part = relative.begin();
   if (part == relative.end() || *part != "assets") return false;
   if (++part == relative.end()) return false;
-  const fs::path& name = *part;
+  // Copy by value before incrementing: path::iterator may stash its element.
+  const fs::path name = *part;
   if (++part != relative.end()) return false;  // not directly under assets/
   const std::string stem = name.stem().string();
   if (name.extension().empty() || stem.size() < kAssetHashChars + 2 ||
@@ -57,6 +67,7 @@ std::string_view CacheControl(const fs::path& relative) {
 }
 
 fs::path LinkedOut(const fs::path& webroot, std::string_view page) {
+  if (page.find('\0') != std::string_view::npos) return {};
   std::error_code error;
   const fs::path root = fs::weakly_canonical(webroot, error);
   if (error) return {};
@@ -70,7 +81,8 @@ fs::path LinkedOut(const fs::path& webroot, std::string_view page) {
 StaticFileResult ReadStaticFile(const fs::path& root, std::string_view url,
                                 StaticFileOptions options) {
   if (url.find('%') != std::string_view::npos ||
-      url.find('\\') != std::string_view::npos) {
+      url.find('\\') != std::string_view::npos ||
+      url.find('\0') != std::string_view::npos) {
     return {.status = 400};
   }
   if (root.empty() || !url.starts_with('/')) {
@@ -106,25 +118,46 @@ StaticFileResult ReadStaticFile(const fs::path& root, std::string_view url,
     file = root / relative;
   }
 
-  if (!fs::is_regular_file(file, error) || error) {
+  // Open non-blocking (+ O_NOFOLLOW for kCanonical) and verify with fstat +
+  // bounded chunked reads so FIFOs, device nodes, TOCTOU symlink swaps, and
+  // growing files cannot hang the loop, escape confinement, or OOM.
+  int open_flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+  if (options.containment == Containment::kCanonical) {
+    open_flags |= O_NOFOLLOW;
+  }
+  const ScopedFd opened{::open(file.c_str(), open_flags)};
+  if (opened.fd < 0) {
     return {.status = 404};
   }
-  const std::uintmax_t size = fs::file_size(file, error);
-  if (error) {
+  struct stat sb {};
+  if (::fstat(opened.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size < 0) {
     return {.status = 404};
   }
-  if (size > options.max_bytes) {
+  if (static_cast<std::uintmax_t>(sb.st_size) > options.max_bytes) {
     return {.status = 413};
   }
-  std::ifstream input(file, std::ios::binary);
-  if (!input) {
-    return {.status = 404};
+  std::string body;
+  body.reserve(static_cast<std::size_t>(sb.st_size));
+  std::array<char, 8192> chunk{};
+  for (;;) {
+    const ssize_t got = ::read(opened.fd, chunk.data(), chunk.size());
+    if (got == 0) break;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      return {.status = 404};
+    }
+    const auto got_size = static_cast<std::size_t>(got);
+    if (static_cast<std::uintmax_t>(got_size) >
+        options.max_bytes - body.size()) {
+      return {.status = 413};
+    }
+    body.append(chunk.data(), got_size);
   }
   return {
       .status = 200,
       .content_type = MimeType(file),
       .cache_control = CacheControl(relative),
-      .body = std::string{std::istreambuf_iterator<char>{input}, {}},
+      .body = std::move(body),
   };
 }
 

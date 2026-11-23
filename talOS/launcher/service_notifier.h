@@ -73,6 +73,26 @@ class ServiceNotifier {
     return half;
   }
 
+  // Earliest steady_clock deadline at least `interval` after `now`, saturating
+  // to time_point::max() instead of overflowing nanoseconds when WATCHDOG_USEC
+  // is near INT64_MAX.
+  static std::chrono::steady_clock::time_point NextDeadline(
+      std::chrono::steady_clock::time_point now,
+      std::chrono::microseconds interval) {
+    if (interval <= std::chrono::microseconds::zero()) return now;
+    constexpr auto kMaxUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::duration::max());
+    if (interval >= kMaxUs) return std::chrono::steady_clock::time_point::max();
+    const auto delta =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            interval);
+    if (now > std::chrono::steady_clock::time_point::max() - delta) {
+      return std::chrono::steady_clock::time_point::max();
+    }
+    return now + delta;
+  }
+
   void Send(std::string_view message) const {
     if (fd_ < 0) return;
     (void)::sendto(fd_, message.data(), message.size(), 0,

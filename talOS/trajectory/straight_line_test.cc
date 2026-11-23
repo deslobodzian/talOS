@@ -263,6 +263,22 @@ TEST(StraightLineTest, RefusesInvalidInputAndClears) {
   }
 }
 
+// Guards: an interval whose endpoint times sum past DBL_MAX computes its
+// midpoint without overflowing to +inf (which otherwise classifies a cruising
+// axis as decelerating and yields non-finite heading samples).
+// REQ-DEV-20
+TEST(StraightLineTest, ExtremeDurationMidpointDoesNotOverflowAcceleration) {
+  Trajectory out;
+  out.reserve(kStraightLineSamples);
+  const StraightLineLimits limits{1.0, 2.5e-308, 1.0, 1e-160};
+  const StraightLineResult result = MakeStraightLine(
+      MakePose(0.0, 0.0, 0.0), MakePose(1.1e308, 0.0, 1.0), limits, out);
+  ASSERT_TRUE(result) << ToString(result.error);
+  const TrajectorySample s = out.sample(1.3e308);
+  EXPECT_TRUE(std::isfinite(s.heading_rad));
+  EXPECT_EQ(s.alpha_radps2, 0.0);
+}
+
 // Guards: the line flipped for the other alliance is the line between the
 // flipped poses, for both symmetries, so a node may flip either the goal or
 // the trajectory.

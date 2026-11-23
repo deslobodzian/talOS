@@ -13,7 +13,13 @@ _PORT_SPAN = 12000
 def udp_ports():
     """Two distinct free UDP ports on 0.0.0.0 below the OS ephemeral range
     (20000..31999; docs/TESTING.md §6.4: probed and released before the
-    launch, since the launcher refuses port 0)."""
+    launch, since the launcher refuses port 0).
+
+    talOS/build/sim_check.py keeps an inline copy with the same probe logic
+    because talos_sim_test (contract.bzl) and standalone py_test targets run
+    sim_check.py directly via srcs without depending on //talOS/build:udp_ports;
+    udp_ports_test.py tests both implementations together.
+    """
     start = random.randrange(_PORT_SPAN)
     held = []
     ports = []

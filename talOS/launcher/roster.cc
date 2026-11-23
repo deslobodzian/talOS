@@ -58,6 +58,26 @@ std::filesystem::path CurrentExecutablePath() {
 #endif
 }
 
+bool ResolveBundleSubpath(const std::filesystem::path& root,
+                          std::string_view raw, std::string_view field,
+                          const std::filesystem::path& manifest_path,
+                          std::filesystem::path& out, std::string& error) {
+  const std::filesystem::path rel{raw};
+  if (raw.empty() || rel.is_absolute() || rel.has_root_path()) {
+    error = manifest_path.string() + ": " + std::string{field} +
+            " must be a relative path inside the bundle: " + std::string{raw};
+    return false;
+  }
+  const std::filesystem::path norm = rel.lexically_normal();
+  if (norm.empty() || *norm.begin() == "..") {
+    error = manifest_path.string() + ": " + std::string{field} +
+            " escapes bundle directory: " + std::string{raw};
+    return false;
+  }
+  out = root / norm;
+  return true;
+}
+
 }  // namespace
 
 RepoMapping ParseRepoMapping(std::string_view content) {
@@ -110,19 +130,31 @@ RepoMapping LoadRepoMapping(std::string_view argv0) {
 }
 
 bool LoadBundle(LauncherOptions& options, std::string& error) {
+  std::error_code ec;
   if (options.bundle_dir.empty()) {
-    if (!std::filesystem::exists(kBundleManifest)) return true;
+    if (!std::filesystem::exists(kBundleManifest, ec) || ec) return true;
     options.bundle_dir = ".";
   }
 
   const std::filesystem::path root{options.bundle_dir};
-  if (!std::filesystem::exists(root)) {
+  const bool root_is_dir = std::filesystem::is_directory(root, ec);
+  if (ec) {
+    error = "cannot access bundle directory " + options.bundle_dir + ": " +
+            ec.message();
+    return false;
+  }
+  if (!root_is_dir) {
     error = "bundle directory does not exist: " + options.bundle_dir;
     return false;
   }
 
   const std::filesystem::path manifest_path = root / kBundleManifest;
-  if (std::filesystem::exists(manifest_path)) {
+  const bool has_manifest = std::filesystem::is_regular_file(manifest_path, ec);
+  if (ec) {
+    error = "cannot access " + manifest_path.string() + ": " + ec.message();
+    return false;
+  }
+  if (has_manifest) {
     toml::table manifest;
     try {
       manifest = toml::parse_file(manifest_path.string());
@@ -134,7 +166,12 @@ bool LoadBundle(LauncherOptions& options, std::string& error) {
 
     if (options.config_path.empty()) {
       if (auto config = manifest["config_path"].value<std::string>()) {
-        options.config_path = (root / *config).string();
+        std::filesystem::path resolved;
+        if (!ResolveBundleSubpath(root, *config, "config_path", manifest_path,
+                                  resolved, error)) {
+          return false;
+        }
+        options.config_path = resolved.string();
       }
     }
     options.bundle_config_sha256 =
@@ -161,7 +198,12 @@ bool LoadBundle(LauncherOptions& options, std::string& error) {
           }
         }
         if (const auto binary = (*node)["binary"].value<std::string>()) {
-          const std::string path = (root / *binary).string();
+          std::filesystem::path resolved;
+          if (!ResolveBundleSubpath(root, *binary, "nodes.binary",
+                                    manifest_path, resolved, error)) {
+            return false;
+          }
+          const std::string path = resolved.string();
           for (const auto& key : keys) {
             options.binary_overrides[key] = path;
           }
@@ -177,7 +219,17 @@ bool LoadBundle(LauncherOptions& options, std::string& error) {
                 ": [studio] needs both `bridge` and `webroot`";
         return false;
       }
-      const std::string path = (root / *bridge).string();
+      std::filesystem::path resolved_bridge;
+      if (!ResolveBundleSubpath(root, *bridge, "[studio].bridge", manifest_path,
+                                resolved_bridge, error)) {
+        return false;
+      }
+      std::filesystem::path resolved_webroot;
+      if (!ResolveBundleSubpath(root, *webroot, "[studio].webroot",
+                                manifest_path, resolved_webroot, error)) {
+        return false;
+      }
+      const std::string path = resolved_bridge.string();
       options.binary_overrides[std::string{kStudioBridgeName}] = path;
       if (const auto* targets = (*studio)["targets"].as_array()) {
         for (const auto& target : *targets) {
@@ -187,16 +239,21 @@ bool LoadBundle(LauncherOptions& options, std::string& error) {
         }
       }
       options.bundle_has_studio = true;
-      options.bundle_studio_webroot = std::filesystem::absolute(root / *webroot)
-                                          .lexically_normal()
-                                          .string();
+      const auto abs_webroot = std::filesystem::absolute(resolved_webroot, ec);
+      if (ec) {
+        error = "cannot resolve studio webroot " + resolved_webroot.string() +
+                ": " + ec.message();
+        return false;
+      }
+      options.bundle_studio_webroot = abs_webroot.lexically_normal().string();
     }
   }
 
   if (options.config_path.empty()) {
     const std::string default_config =
         (root / "config" / "robot.toml").string();
-    if (std::filesystem::exists(default_config)) {
+    ec.clear();
+    if (std::filesystem::exists(default_config, ec) && !ec) {
       options.config_path = default_config;
     }
   }

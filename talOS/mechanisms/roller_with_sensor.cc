@@ -4,6 +4,20 @@
 #include <string>
 
 namespace talos::mechanisms {
+namespace {
+
+RollerCommand NormalizeCommand(RollerCommand command) {
+  switch (command) {
+    case RollerCommand::kIdle:
+    case RollerCommand::kIntake:
+    case RollerCommand::kEject:
+    case RollerCommand::kFeed:
+      return command;
+  }
+  return RollerCommand::kIdle;
+}
+
+}  // namespace
 
 RollerWithSensor::RollerWithSensor(Node& node, std::string_view name)
     : node_{&node},
@@ -45,7 +59,8 @@ void RollerWithSensor::update() {
   const bool enabled = robot_enabled(*node_);
   // A request lasts the update() it was made in (see set_goal()).
   const bool live = requested_ && request_tick_ == node_->tick() && enabled;
-  const RollerCommand command = live ? request_ : RollerCommand::kIdle;
+  const RollerCommand command =
+      live ? NormalizeCommand(request_) : RollerCommand::kIdle;
   requested_ = false;
   // A tick with no live request counts as kIdle, so a release or a stale
   // lane ends an ask: press, release, press is two asks, a held button one.

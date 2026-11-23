@@ -38,6 +38,7 @@ void EncodeInteger(std::byte* dest, BaseType type, std::int64_t val,
     case BaseType::Byte:
       CheckAndCopyInt<std::int8_t>(dest, val, where);
       break;
+    case BaseType::UType:
     case BaseType::UByte:
       CheckAndCopyInt<std::uint8_t>(dest, val, where);
       break;
@@ -66,11 +67,13 @@ void EncodeInteger(std::byte* dest, BaseType type, std::int64_t val,
       break;
     }
     default:
-      break;
+      throw std::invalid_argument(std::string{where} +
+                                  ": field is not an integer type");
   }
 }
 
 constexpr int kMaxDepth = 32;
+constexpr std::size_t kMaxStructVisits = 4096;
 
 std::string ObjectName(const reflection::Object& object) {
   return object.name() != nullptr ? object.name()->str() : "(unnamed)";
@@ -79,8 +82,13 @@ std::string ObjectName(const reflection::Object& object) {
 void AppendScalarPaths(const reflection::Schema& schema,
                        const reflection::Object& object,
                        const std::string& prefix,
-                       std::vector<std::string>& paths, int depth) {
-  if (depth >= kMaxDepth || object.fields() == nullptr) return;
+                       std::vector<std::string>& paths, int depth,
+                       std::vector<bool>& open, std::size_t& visits) {
+  if (depth >= kMaxDepth || !object.is_struct() || object.fields() == nullptr ||
+      visits >= kMaxStructVisits) {
+    return;
+  }
+  ++visits;
   std::vector<const reflection::Field*> fields;
   fields.reserve(object.fields()->size());
   for (const auto* field : *object.fields()) {
@@ -95,6 +103,7 @@ void AppendScalarPaths(const reflection::Schema& schema,
               return a->id() < b->id();
             });
   for (const auto* field : fields) {
+    if (visits >= kMaxStructVisits) return;
     const std::string path = prefix + field->name()->str();
     if (field->type()->base_type() == BaseType::Obj) {
       const auto* objects = schema.objects();
@@ -103,9 +112,14 @@ void AppendScalarPaths(const reflection::Schema& schema,
           static_cast<std::size_t>(idx) >= objects->size()) {
         continue;
       }
+      const auto uidx = static_cast<std::size_t>(idx);
+      if (open[uidx]) continue;
       const auto* next = objects->Get(idx);
       if (next == nullptr || !next->is_struct()) continue;
-      AppendScalarPaths(schema, *next, path + "/", paths, depth + 1);
+      open[uidx] = true;
+      AppendScalarPaths(schema, *next, path + "/", paths, depth + 1, open,
+                        visits);
+      open[uidx] = false;
     } else {
       paths.push_back(path);
     }
@@ -124,6 +138,10 @@ ResolvedField ResolveField(const reflection::Schema& schema,
   if (field_path.front() == '/' || field_path.back() == '/') {
     throw std::invalid_argument(std::string{where} + ": invalid field path '" +
                                 std::string{field_path} + "'");
+  }
+  if (!root.is_struct() || root.bytesize() <= 0) {
+    throw std::invalid_argument(std::string{where} + ": '" + ObjectName(root) +
+                                "' is not a positive-sized struct");
   }
   const reflection::Object* curr_obj = &root;
   std::size_t curr_offset = 0;
@@ -166,6 +184,7 @@ ResolvedField ResolveField(const reflection::Schema& schema,
       throw std::invalid_argument(std::string{where} + ": field '" + seg +
                                   "' has no type");
     }
+    const auto curr_bytes = static_cast<std::size_t>(curr_obj->bytesize());
     if (s + 1 < segments.size()) {
       if (field->type()->base_type() != BaseType::Obj) {
         throw std::invalid_argument(std::string{where} + ": '" + seg +
@@ -179,19 +198,30 @@ ResolvedField ResolveField(const reflection::Schema& schema,
                                     "' has invalid struct index");
       }
       const auto* next_obj = objects->Get(idx);
-      if (next_obj == nullptr || !next_obj->is_struct()) {
+      if (next_obj == nullptr || !next_obj->is_struct() ||
+          next_obj->bytesize() <= 0) {
         throw std::invalid_argument(std::string{where} + ": '" + seg +
                                     "' is not a struct");
+      }
+      const auto next_bytes = static_cast<std::size_t>(next_obj->bytesize());
+      if (field->offset() > curr_bytes ||
+          next_bytes > curr_bytes - field->offset()) {
+        throw std::invalid_argument(std::string{where} + ": field '" + seg +
+                                    "' exceeds enclosing struct bounds");
       }
       curr_offset += field->offset();
       curr_obj = next_obj;
       continue;
     }
     const auto base = field->type()->base_type();
-    if (base == BaseType::Obj || base == BaseType::Vector ||
-        base == BaseType::Array || base == BaseType::None) {
+    const std::size_t size = ScalarSize(base);
+    if (size == 0) {
       throw std::invalid_argument(std::string{where} + ": field '" + seg +
                                   "' must be a scalar");
+    }
+    if (field->offset() > curr_bytes || size > curr_bytes - field->offset()) {
+      throw std::invalid_argument(std::string{where} + ": field '" + seg +
+                                  "' exceeds enclosing struct bounds");
     }
     const reflection::Enum* enum_def = nullptr;
     const auto* enums = schema.enums();
@@ -203,7 +233,7 @@ ResolvedField ResolveField(const reflection::Schema& schema,
     return ResolvedField{
         .offset = curr_offset + field->offset(),
         .base_type = base,
-        .size = ScalarSize(base),
+        .size = size,
         .enum_def = enum_def,
         .leaf_name = seg,
         .enclosing_name = ObjectName(*curr_obj),
@@ -215,7 +245,19 @@ ResolvedField ResolveField(const reflection::Schema& schema,
 std::vector<std::string> ScalarPaths(const reflection::Schema& schema,
                                      const reflection::Object& root) {
   std::vector<std::string> paths;
-  AppendScalarPaths(schema, root, "", paths, 0);
+  const std::size_t num_objects =
+      schema.objects() != nullptr ? schema.objects()->size() : 0;
+  std::vector<bool> open(num_objects, false);
+  if (schema.objects() != nullptr) {
+    for (flatbuffers::uoffset_t i = 0; i < schema.objects()->size(); ++i) {
+      if (schema.objects()->Get(i) == &root) {
+        open[i] = true;
+        break;
+      }
+    }
+  }
+  std::size_t visits = 0;
+  AppendScalarPaths(schema, root, "", paths, 0, open, visits);
   return paths;
 }
 

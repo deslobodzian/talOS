@@ -841,7 +841,7 @@ inline std::size_t EncodeConfigAck(const ConfigAckPayload& ack,
 
 inline bool DecodeConfigAck(std::span<const uint8_t> in,
                             ConfigAckPayload& out) {
-  if (in.size() < sizeof(ConfigAckPayload)) return false;
+  if (in.size() != sizeof(ConfigAckPayload)) return false;
   out.config_id = detail::GetLittleEndian(in.data(), 8);
   out.status = static_cast<ConfigAckStatus>(in[8]);
   std::memcpy(out.reason, in.data() + 9, sizeof(out.reason));

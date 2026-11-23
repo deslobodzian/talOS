@@ -12,8 +12,14 @@
 #include "talOS/vision/calibration.h"
 
 struct apriltag_detector;
+struct apriltag_family;
+struct image_u8;
+struct zarray;
 
 namespace talos::vision::apriltag {
+
+class CpuAprilTagBackend;
+struct Detection;
 
 // Creates `td`'s worker pool, unless it already has one of td->nthreads
 // threads, with every pool thread at background priority
@@ -23,6 +29,25 @@ namespace talos::vision::apriltag {
 // a QoS to a new thread, so each pool thread lowers itself from a task. Call
 // it before each detection: the library keeps a pool of the right size.
 void EnsureBackgroundWorkerPool(apriltag_detector* td);
+
+// Creates or destroys an upstream AprilTag family by name (tag36h11, tag16h5,
+// tag25h9, tagCircle21h7, tagCircle49h12, tagCustom48h12, tagStandard41h12,
+// tagStandard52h13). CreateTagFamily returns nullptr for an unknown name.
+apriltag_family* CreateTagFamily(const std::string& name);
+void DestroyTagFamily(const std::string& name, apriltag_family* family);
+
+// Loads an image file (JPEG via pjpeg, PNG/other via OpenCV grayscale) into an
+// upstream image_u8. Returns nullptr on failure; caller owns the result and
+// frees it with image_u8_destroy().
+image_u8* LoadGrayscaleImageFile(const std::string& filepath);
+
+// Converts upstream `zarray_t` of `apriltag_detection_t*` into `Detection`
+// records (estimating pose when `intrinsics` is non-null and
+// `tag_size_meters > 0`), then destroys `raw_detections` if non-null.
+std::vector<Detection> ExtractDetections(
+    zarray* raw_detections, const CpuAprilTagBackend& pose_backend,
+    const talos::vision::CameraIntrinsics* intrinsics = nullptr,
+    double tag_size_meters = 0.0);
 
 using CameraIntrinsics = talos::vision::CameraIntrinsics;
 

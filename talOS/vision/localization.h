@@ -150,11 +150,82 @@ inline bool EstimateTagPoseFromHomography(
   if (!std::isfinite(temp_det.c[0]) || !std::isfinite(temp_det.c[1])) {
     return false;
   }
+
+  // AprilTag's homography_to_pose normalizes the first two columns using
+  // 32-bit float sqrtf(), and orthogonal_iteration inverts M1 = I - avg(v v^T).
+  // Scale H to unit max-norm (projectively equivalent) and verify both
+  // operations stay finite and well-conditioned before entering C code that
+  // asserts in matd_svd_tall or dereferences NULL on singular M1.
+  double h_max = 0.0;
+  for (int i = 0; i < 9; ++i) {
+    if (!std::isfinite(h_data[i])) return false;
+    h_max = std::max(h_max, std::abs(h_data[i]));
+  }
+  if (!(h_max > 0.0) || !std::isfinite(h_max)) return false;
+  for (int i = 0; i < 9; ++i) h_data[i] /= h_max;
+
+  const Eigen::Vector3d col0(
+      (h_data[0] - intrinsics.cx * h_data[6]) / (-intrinsics.fx),
+      (h_data[3] - intrinsics.cy * h_data[6]) / intrinsics.fy, h_data[6]);
+  const Eigen::Vector3d col1(
+      (h_data[1] - intrinsics.cx * h_data[7]) / (-intrinsics.fx),
+      (h_data[4] - intrinsics.cy * h_data[7]) / intrinsics.fy, h_data[7]);
+  const double tx_num =
+      (h_data[2] - intrinsics.cx * h_data[8]) / (-intrinsics.fx);
+  const double ty_num = (h_data[5] - intrinsics.cy * h_data[8]) / intrinsics.fy;
+  if (!col0.allFinite() || !col1.allFinite() || !std::isfinite(tx_num) ||
+      !std::isfinite(ty_num)) {
+    return false;
+  }
+  const double len1_sq = col0.squaredNorm();
+  const double len2_sq = col1.squaredNorm();
+  const float len1_f = std::sqrt(static_cast<float>(len1_sq));
+  const float len2_f = std::sqrt(static_cast<float>(len2_sq));
+  const float len_prod_f = len1_f * len2_f;
+  if (!std::isfinite(len1_f) || !std::isfinite(len2_f) ||
+      !std::isfinite(len_prod_f) || !(len_prod_f > 0.0f) ||
+      !std::isfinite(1.0 / std::sqrt(static_cast<double>(len_prod_f)))) {
+    return false;
+  }
+  const Eigen::Vector3d col0_unit = col0 / std::sqrt(len1_sq);
+  const Eigen::Vector3d col1_unit = col1 / std::sqrt(len2_sq);
+  if (!col0_unit.allFinite() || !col1_unit.allFinite() ||
+      col0_unit.cross(col1_unit).norm() <= 1e-6) {
+    return false;
+  }
+
+  Eigen::Matrix3d m1 = Eigen::Matrix3d::Identity();
+  for (int c = 0; c < 4; ++c) {
+    const Eigen::Vector3d ray(
+        (temp_det.p[c][0] - intrinsics.cx) / intrinsics.fx,
+        (temp_det.p[c][1] - intrinsics.cy) / intrinsics.fy, 1.0);
+    const double ray_sq = ray.squaredNorm();
+    if (!ray.allFinite() || !std::isfinite(ray_sq) || !(ray_sq > 0.0) ||
+        ray_sq > 1e12) {
+      return false;
+    }
+    m1.noalias() -= 0.25 * (ray * ray.transpose()) / ray_sq;
+  }
+  if (!m1.allFinite()) return false;
+  // AprilTag's matd_plu treats pivots with |LU_jj| < MATD_EPS (1e-8) as
+  // singular and returns NULL from matd_inverse(M1), aborting in matd_multiply.
+  const Eigen::PartialPivLU<Eigen::Matrix3d> m1_lu(m1);
+  if (m1_lu.matrixLU().diagonal().cwiseAbs().minCoeff() <= 1e-6 ||
+      std::abs(m1.determinant()) <= 1e-6 || !m1.inverse().allFinite()) {
+    return false;
+  }
+
+  // Solve orthogonal iteration at unit tag size when tag_size_m is extreme so
+  // intermediate object-space products inside apriltag_pose.c cannot overflow
+  // or underflow double, then scale translations by tag_size_m.
+  const bool extreme_size = tag_size_m < 1e-6 || tag_size_m > 1e6;
+  const double solver_tag_size = extreme_size ? 1.0 : tag_size_m;
+
   temp_det.H = matd_create_data(3, 3, h_data);
 
   apriltag_detection_info_t info{
       .det = &temp_det,
-      .tagsize = tag_size_m,
+      .tagsize = solver_tag_size,
       .fx = intrinsics.fx,
       .fy = intrinsics.fy,
       .cx = intrinsics.cx,
@@ -177,7 +248,7 @@ inline bool EstimateTagPoseFromHomography(
     if (p2.t) matd_destroy(p2.t);
   };
 
-  if (!p1.R || !p1.t) {
+  if (!p1.R || !p1.t || !std::isfinite(err1)) {
     destroy_poses();
     return false;
   }
@@ -191,6 +262,7 @@ inline bool EstimateTagPoseFromHomography(
   }
   Eigen::Vector3d t1(MATD_EL(p1.t, 0, 0), MATD_EL(p1.t, 1, 0),
                      MATD_EL(p1.t, 2, 0));
+  if (extreme_size) t1 *= tag_size_m;
   if (!R1.allFinite() || !t1.allFinite()) {
     destroy_poses();
     return false;
@@ -214,6 +286,7 @@ inline bool EstimateTagPoseFromHomography(
     }
     Eigen::Vector3d t2(MATD_EL(p2.t, 0, 0), MATD_EL(p2.t, 1, 0),
                        MATD_EL(p2.t, 2, 0));
+    if (extreme_size) t2 *= tag_size_m;
     if (R2.allFinite() && t2.allFinite()) {
       const talos::geometry::SE3<double> candidate(
           talos::geometry::SO3<double>::FromMatrixNormalized(R2), t2);

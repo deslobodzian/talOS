@@ -428,7 +428,8 @@ export class SystemGraphStream {
         return {document: root, graph: graphOf(root)};
       }
       const held = this.document;
-      if (!held || root.structure !== held.structure)
+      if (!held || typeof held.structure !== 'string' ||
+          root.structure !== held.structure)
         fail('update for a graph structure not held');
       if (root.kind === 'talos.system_graph.deferred') return null;
       if (root.kind !== 'talos.system_graph.update')
@@ -894,7 +895,7 @@ export class RateWindow {
   private samples: SystemGraph[] = [];
 
   constructor(readonly seconds = 2, readonly capacity = 32) {
-    if (!(seconds > 0)) throw Error('Invalid rate window');
+    if (!Number.isFinite(seconds) || seconds <= 0) throw Error('Invalid rate window');
     if (!Number.isInteger(capacity) || capacity < 2)
       throw Error('Invalid rate window capacity');
   }

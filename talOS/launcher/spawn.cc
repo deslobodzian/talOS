@@ -126,7 +126,7 @@ std::mutex& SpawnMutex() {
 }
 
 void SignalProcessGroup(pid_t pid, int signal) {
-  if (pid > 0) ::kill(-pid, signal);
+  if (pid > 1) ::kill(-pid, signal);
 }
 
 void FinishProcessGroup(pid_t pid) {
@@ -142,14 +142,31 @@ void FinishProcessGroup(pid_t pid) {
 
 bool CloseOnExecPipe(int (&fds)[2]) {
   if (::pipe(fds) != 0) return false;
-  if (::fcntl(fds[0], F_SETFD, FD_CLOEXEC) == 0 &&
-      ::fcntl(fds[1], F_SETFD, FD_CLOEXEC) == 0)
-    return true;
-  const int error = errno;
-  ::close(fds[0]);
-  ::close(fds[1]);
-  errno = error;
-  return false;
+  for (int& fd : fds) {
+    if (fd < 3) {
+      const int moved = ::fcntl(fd, F_DUPFD_CLOEXEC, 3);
+      if (moved < 0) {
+        const int error = errno;
+        ::close(fds[0]);
+        ::close(fds[1]);
+        fds[0] = -1;
+        fds[1] = -1;
+        errno = error;
+        return false;
+      }
+      ::close(fd);
+      fd = moved;
+    } else if (::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+      const int error = errno;
+      ::close(fds[0]);
+      ::close(fds[1]);
+      fds[0] = -1;
+      fds[1] = -1;
+      errno = error;
+      return false;
+    }
+  }
+  return true;
 }
 
 bool IsTransientSpawnFailure(const SpawnFailure& failure) {
@@ -227,6 +244,7 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     if (failure != nullptr) *failure = {std::string{step}, code};
     return pid_t{-1};
   };
+  if (args.empty() || args.front().empty()) return fail("execv", EINVAL);
   if (output != SpawnOutput::kInherit && reader == nullptr)
     return fail("output pipe", EINVAL);
   std::vector<char*> c_args;
@@ -336,7 +354,9 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     // as the node runs: another thread's registry lock would stay locked.
     CloseDescriptorsExcept(lifetime[0]);
     char unused;
-    while (::read(lifetime[0], &unused, 1) < 0 && errno == EINTR) {
+    for (;;) {
+      const ssize_t got = ::read(lifetime[0], &unused, 1);
+      if (got == 0 || (got < 0 && errno != EINTR)) break;
     }
     SignalProcessGroup(group, SIGKILL);
     ::_exit(0);

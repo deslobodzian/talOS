@@ -133,4 +133,115 @@ TEST(DriverStationSampler, SendsOnAModeChangeAndEverySamplePeriod) {
   EXPECT_EQ(sent, expected);
 }
 
+// On the first tick with a small monotonic clock (< kSamplePeriodUs) and zero
+// flags, a packet still goes out immediately; a subsequent backward clock step
+// must not underflow now_us - last_sample_us_ into a spurious send.
+// REQ-SAFE-10, REQ-RT-13
+TEST(DriverStationSampler,
+     InitialZeroModeNearZeroClockSendsAndBackwardClockDoesNotUnderflow) {
+  DriverStationSampler sampler;
+  const Tick first = RunTick(sampler, /*flags=*/0, /*now_us=*/5'000);
+  EXPECT_TRUE(first.sent)
+      << "first tick with flags=0 and now_us < kSamplePeriodUs did not send";
+
+  const Tick backward = RunTick(sampler, /*flags=*/0, /*now_us=*/1'000);
+  EXPECT_FALSE(backward.sent)
+      << "backward clock step underflowed into a spurious send";
+}
+
+// If encoding or sending a mode-change packet fails, RevertSample() rolls back
+// the cadence/mode state so the next open-socket tick retries immediately
+// without waiting kSamplePeriodUs, while preserving the exact mode_since_us
+// generation recorded on the transition tick.
+// REQ-SAFE-10, REQ-RT-13, REQ-RT-22
+TEST(DriverStationSampler,
+     RevertSampleRetriesModeChangeImmediatelyWhileKeepingGeneration) {
+  constexpr uint32_t kTeleopEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+  constexpr uint32_t kAutoEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kAutonomous;
+  DriverStationSampler sampler;
+
+  const Tick initial = RunTick(sampler, kTeleopEnabled, kStartUs);
+  ASSERT_TRUE(initial.sent);
+
+  // Enabled mode switch (teleop -> auto) 5 ms later; simulate UDP send failure.
+  const uint64_t switch_us = kStartUs + kPeriodUs;
+  const Tick failed = RunTick(sampler, kAutoEnabled, switch_us);
+  ASSERT_TRUE(failed.sent);
+  ASSERT_EQ(failed.packet.mode_since_us, switch_us);
+  sampler.RevertSample();
+  // Idempotent on repeated calls without an intervening Sample().
+  sampler.RevertSample();
+
+  // Next tick (still 10 ms < kSamplePeriodUs from initial): must retry at once
+  // with the original transition's mode_since_us generation.
+  const uint64_t retry_us = switch_us + kPeriodUs;
+  const Tick retried = RunTick(sampler, kAutoEnabled, retry_us);
+  ASSERT_TRUE(retried.sent)
+      << "mode change was delayed up to kSamplePeriodUs after failed send";
+  EXPECT_EQ(retried.packet.mode_since_us, switch_us);
+  EXPECT_EQ(retried.packet.sample_time_us, retry_us);
+  EXPECT_EQ(retried.packet.boot_id, kBootId);
+
+  // Once sent, normal kSamplePeriodUs cadence resumes from the successful send.
+  EXPECT_FALSE(RunTick(sampler, kAutoEnabled, retry_us + kPeriodUs).sent);
+  EXPECT_TRUE(
+      RunTick(sampler, kAutoEnabled, retry_us + ds::kSamplePeriodUs).sent);
+}
+
+// An A -> B -> A transition within kSamplePeriodUs where B was never delivered
+// (either RevertSample() after a send failure, or a closed socket during B)
+// advances ModeTracker to a new generation (gen3 > gen1) even though ModeKey
+// returned to A. Sample() must still send gen3 immediately so the main
+// processor's OperatorArming and Target lanes see the new generation at once.
+// REQ-SAFE-10, REQ-SAFE-14, REQ-RT-13
+TEST(
+    DriverStationSampler,
+    BounceBackToSameModeWithinSamplePeriodAfterRevertOrClosedSocketSendsNewGen) {
+  constexpr uint32_t kTeleopEnabled =
+      ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+  constexpr uint32_t kTeleopDisabled = ds::kDsAttached | ds::kTeleop;
+
+  // Case 1: B send failed and was reverted via RevertSample().
+  {
+    DriverStationSampler sampler;
+    const Tick t0 = RunTick(sampler, kTeleopEnabled, kStartUs);
+    ASSERT_TRUE(t0.sent);
+    const uint64_t gen1 = t0.packet.mode_since_us;
+
+    const Tick t1 = RunTick(sampler, kTeleopDisabled, kStartUs + kPeriodUs);
+    ASSERT_TRUE(t1.sent);
+    ASSERT_GT(t1.packet.mode_since_us, gen1);
+    sampler.RevertSample();
+
+    const uint64_t t2_us = kStartUs + 2 * kPeriodUs;
+    const Tick t2 = RunTick(sampler, kTeleopEnabled, t2_us);
+    ASSERT_TRUE(t2.sent)
+        << "new generation suppressed after RevertSample() on A->B->A";
+    EXPECT_EQ(t2.packet.mode_since_us, t2_us);
+    EXPECT_GT(t2.packet.mode_since_us, t1.packet.mode_since_us);
+  }
+
+  // Case 2: socket was closed during B and reopened on return to A.
+  {
+    DriverStationSampler sampler;
+    const Tick t0 = RunTick(sampler, kTeleopEnabled, kStartUs);
+    ASSERT_TRUE(t0.sent);
+    const uint64_t gen1 = t0.packet.mode_since_us;
+
+    const Tick t1 = RunTick(sampler, kTeleopDisabled, kStartUs + kPeriodUs,
+                            /*socket_open=*/false);
+    ASSERT_FALSE(t1.sent);
+
+    const uint64_t t2_us = kStartUs + 2 * kPeriodUs;
+    const Tick t2 =
+        RunTick(sampler, kTeleopEnabled, t2_us, /*socket_open=*/true);
+    ASSERT_TRUE(t2.sent)
+        << "new generation suppressed after closed socket on A->B->A";
+    EXPECT_EQ(t2.packet.mode_since_us, t2_us);
+    EXPECT_GT(t2.packet.mode_since_us, gen1);
+  }
+}
+
 }  // namespace

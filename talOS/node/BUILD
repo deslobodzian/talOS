@@ -218,6 +218,7 @@ cc_test(
         "//talOS/events:gap_testing",
         "//talOS/events:input_replay",
         "//talOS/introspection:describe",
+        "//talOS/introspection:names",
         "//talOS/introspection:registry",
         "//talOS/introspection:reporter",
         "//talOS/process",

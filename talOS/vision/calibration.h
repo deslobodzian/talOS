@@ -128,7 +128,13 @@ struct CameraIntrinsics {
   Eigen::Vector2d UndistortPoint(const Eigen::Vector2d& uv,
                                  int iterations = 8) const {
     const auto p = UndistortNormalizedPoint(uv, iterations);
-    return {fx * p.x() + cx, fy * p.y() + cy};
+    const double u = fx * p.x() + cx;
+    const double v = fy * p.y() + cy;
+    if (uv.allFinite() && IsValid() &&
+        (!std::isfinite(u) || !std::isfinite(v))) {
+      return uv;
+    }
+    return {u, v};
   }
 };
 

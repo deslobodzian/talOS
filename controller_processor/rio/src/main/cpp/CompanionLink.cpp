@@ -169,6 +169,7 @@ void CompanionReporter::Poll(uint64_t now_us) {
                   time, status.frame_age_s);
     sink_.Report(true, text);
   } else if (!status.connected && !reported_unheard_ && status.protocol_ok &&
+             now_us >= first_poll_us_ &&
              now_us - first_poll_us_ >= kStartupGraceUs) {
     // A mismatch already says why nothing is heard.
     reported_unheard_ = true;
@@ -184,7 +185,9 @@ void CompanionReporter::Poll(uint64_t now_us) {
   if (Within(command_us, now_us, kLinkTimeoutUs)) {
     reported_no_commands_ = false;
   } else if (status.connected && !reported_no_commands_ &&
+             now_us >= first_poll_us_ &&
              now_us - first_poll_us_ >= kStartupGraceUs &&
+             now_us >= connected_since_us_ &&
              now_us - connected_since_us_ >= kStartupGraceUs) {
     reported_no_commands_ = true;
     if (command_us == 0) {

@@ -660,6 +660,98 @@ class TraceTest(unittest.TestCase):
         self.assertGreaterEqual(failures, 1, out)
         self.assertIn("duplicate requirement REQ-SAFE-01", out)
 
+    def test_quarantine_variable_tags_kwargs_abs_srcs_and_bad_dates_fail_closed(
+            self):
+        # Quarantine tags hidden behind top-level variables, string
+        # concatenation, or **kwargs splats must still be caught.
+        for name, build in (
+            (
+                "variable_tag_list",
+                'Q = ["manual", "quarantine"]\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = Q,\n)\n',
+            ),
+            (
+                "variable_tag_element",
+                'Q = "quarantine"\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = [Q],\n)\n',
+            ),
+            (
+                "concatenated_tag_string",
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    tags = ["quaran" + "tine"],\n)\n',
+            ),
+            (
+                "kwargs_dict_quarantine",
+                'OPTS = {"tags": ["manual", "quarantine"]}\n'
+                'cc_test(\n    name = "node_test",\n'
+                '    srcs = ["node_test.cc"],\n'
+                '    **OPTS\n)\n',
+            ),
+        ):
+            with self.subTest(case=name):
+                failures, out = check(tree(**{"talOS/node/BUILD": build}))
+                self.assertGreaterEqual(failures, 2, out)
+                self.assertIn("tagged quarantine without an open, dated", out)
+                self.assertIn("REQ-SAFE-01 (P0, SAFE) has no tagged test", out)
+
+        # Repo-absolute `//pkg:file` in quarantined `srcs` must still exclude
+        # that source's tags from requirement coverage.
+        todo = (
+            "- [ ] **ARCH-2 — Layers are unchecked.**\n"
+            "- [ ] **FLAKE-1 — `//talOS/node:node_test` fails.** "
+            "Fix by 2026-11-20.\n"
+        )
+        abs_src_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["//talOS/node:node_test.cc"],\n'
+            '    tags = ["manual", "quarantine"],\n)\n'
+        )
+        failures, out = check(tree(**{
+            "talOS/node/BUILD": abs_src_build,
+            "TODO.md": todo,
+        }))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("REQ-SAFE-01 (P0, SAFE) has no tagged test", out)
+
+        # An invalid calendar date in a quarantine TODO entry must fail cleanly
+        # rather than crashing with ValueError.
+        bad_date_todo = (
+            "- [ ] **ARCH-2 — Layers are unchecked.**\n"
+            "- [ ] **FLAKE-1 — `//talOS/node:node_test` fails.** "
+            "Fix by 2026-02-30.\n"
+        )
+        q_build = (
+            'cc_test(\n    name = "node_test",\n'
+            '    srcs = ["node_test.cc"],\n'
+            '    tags = ["manual", "quarantine"],\n)\n'
+        )
+        failures, out = check(tree(**{
+            "talOS/node/BUILD": q_build,
+            "TODO.md": bad_date_todo,
+        }))
+        self.assertGreaterEqual(failures, 2, out)
+        self.assertIn("invalid", out.lower())
+
+        # A fenced code block containing `## Foo` inside Catalogue must not
+        # stop parsing subsequent requirements.
+        fenced_cat = (
+            "# Requirements\n\n## Catalogue\n\n"
+            "```markdown\n## Not a section\n```\n\n"
+            + HEADER
+            + row("REQ-SAFE-01", "P0")
+            + row("REQ-SAFE-98", "P0")
+            + "\n## Package scope\n\n| Package | Serves |\n|---|---|\n"
+            "| `talOS/node` | REQ-SAFE-01 |\n"
+        )
+        failures, out = check(tree(**{"docs/REQUIREMENTS.md": fenced_cat}))
+        self.assertEqual(failures, 1, out)
+        self.assertIn("REQ-SAFE-98", out)
+
 
 if __name__ == "__main__":
     unittest.main()

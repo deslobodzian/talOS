@@ -200,7 +200,7 @@ StraightLineResult MakeStraightLine(const geometry::SE2<double>& start,
     s.omega_radps = direction * angular.velocity(t_s);
     // The acceleration held until the next sample: the one in force at the
     // interval's midpoint, so it is the same piece on both sides.
-    const double middle_s = 0.5 * (t_s + times[i + 1]);
+    const double middle_s = t_s + 0.5 * (times[i + 1] - t_s);
     const double accel_mps2 = linear.acceleration(middle_s);
     s.ax_mps2 = ux * accel_mps2;
     s.ay_mps2 = uy * accel_mps2;

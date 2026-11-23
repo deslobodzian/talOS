@@ -4,7 +4,7 @@
 // When studio_review served this Studio, `server` is its origin and the
 // picker has no address field.
 
-import {useCallback, useEffect, useState} from 'react';
+import {useCallback, useEffect, useRef, useState} from 'react';
 
 import {RecordedSource} from '../data/recorded';
 import {
@@ -47,18 +47,34 @@ export function ReviewPicker({onClose, fetchFn, server: fixed}: {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const fetcher = fetchFn ?? ((url, init) => fetch(url, init));
+  const fetcherRef = useRef(fetcher);
+  fetcherRef.current = fetcher;
+  const listReqRef = useRef(0);
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      listReqRef.current++;
+    };
+  }, []);
 
   const list = useCallback(async (address: string) => {
+    const req = ++listReqRef.current;
     setBusy(true);
     setError('');
     try {
-      setSessions(await listSessions(address, fetcher));
+      const next = await listSessions(address, fetcherRef.current);
+      if (!mountedRef.current || req !== listReqRef.current) return;
+      setSessions(next);
       if (!fixed) saveServer(address);
     } catch (e) {
+      if (!mountedRef.current || req !== listReqRef.current) return;
       setSessions(null);
       setError(errorMessage(e));
     } finally {
-      setBusy(false);
+      if (mountedRef.current && req === listReqRef.current) setBusy(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -71,15 +87,22 @@ export function ReviewPicker({onClose, fetchFn, server: fixed}: {
   useEscape(onClose);
 
   const open = async (id: string) => {
+    const req = ++listReqRef.current;
     setBusy(true);
     setError('');
     try {
-      studio.openRecorded(await RecordedSource.open(server, id, {fetch: fetcher}));
+      const source = await RecordedSource.open(server, id, {fetch: fetcherRef.current});
+      if (!mountedRef.current || req !== listReqRef.current) {
+        source.close();
+        return;
+      }
+      studio.openRecorded(source);
       onClose();
     } catch (e) {
+      if (!mountedRef.current || req !== listReqRef.current) return;
       setError(errorMessage(e));
     } finally {
-      setBusy(false);
+      if (mountedRef.current && req === listReqRef.current) setBusy(false);
     }
   };
 

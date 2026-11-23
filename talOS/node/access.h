@@ -87,8 +87,10 @@ struct NodeAccess : NodeDetail {
   static bool abi_update(const Node& node);
   // Registers the tick timer (when there is an update() or an after_update
   // hook), arms it one period after now, and picks the loop's delivery: see
-  // require_immediate_delivery. Called once, after the user's object is
-  // built.
+  // require_immediate_delivery. When `!node.describing()`, also checks that
+  // an explicit Driver Station reader publishes no teleop-policy target lane
+  // without OperatorArming (REQ-SAFE-14). Called once, after the user's object
+  // is built.
   static void start(Node& node);
   // Throws std::logic_error, naming the node and `what`, unless called on
   // the thread that built `node`, which runs its loop. A send or a device
@@ -112,6 +114,15 @@ struct NodeAccess : NodeDetail {
   static std::vector<std::string_view> optional_topics(const Node& node);
   // Topics subscribed with add_observer, for describe and the registry.
   static std::vector<std::string_view> observer_topics(const Node& node);
+  // Target-lane topics published with operator_arming = true
+  // (add_target_lane_publisher), for describe and the registry (REQ-SAFE-14).
+  static std::vector<std::string_view> armed_target_lane_topics(
+      const Node& node);
+  // Driver Station topics subscribed solely by internal Target/TargetLane/
+  // OperatorArming plumbing (empty whenever the node explicitly reads the
+  // Driver Station), for describe and the registry (REQ-SAFE-14).
+  static std::vector<std::string_view> internal_driver_station_topics(
+      const Node& node);
 
   // The declared graph (describe.h DeclaredGraph): every other node of the
   // session that does not read it, with each end's schema bytes. Null while
@@ -157,6 +168,29 @@ struct NodeAccess : NodeDetail {
   static std::size_t add_observer(Node& node, std::string_view topic,
                                   std::size_t bytes, std::size_t alignment,
                                   const schema::Identity& schema);
+  // Internal Driver Station subscription opened by DriverStationLink for
+  // Target/TargetLane/OperatorArming plumbing: does not mark the node as an
+  // explicit Driver Station reader, and reports
+  // naming::kSourceFlagInternalDriverStation unless mark_driver_station_reader
+  // or a direct /hw/state/driver_station subscription marks it explicit.
+  static std::size_t add_internal_driver_station_subscription(
+      Node& node, std::string_view topic, std::size_t bytes,
+      std::size_t alignment, const schema::Identity& schema,
+      MessageCallback on_message);
+  // Marks this node as an explicit Driver Station reader (public
+  // talos::DriverStation construction). After start() when not describing,
+  // refuses if the node already publishes any unarmed teleop-policy target
+  // lane before mutating state (REQ-SAFE-14).
+  static void mark_driver_station_reader(Node& node);
+  // Target-lane publisher opened by TargetAccess::open_lane: marks the topic
+  // with naming::kSourceFlagOperatorArming when `operator_arming` is true, and
+  // enforces REQ-SAFE-14 if opened after start() on an explicit DS reader.
+  static std::size_t add_target_lane_publisher(Node& node,
+                                               std::string_view topic,
+                                               std::size_t bytes,
+                                               std::size_t alignment,
+                                               const schema::Identity& schema,
+                                               bool operator_arming);
 
   // The devices layer's flush: this node's hardware request,
   // naming::HardwareRequestTopic(name), never remapped, declared to describe

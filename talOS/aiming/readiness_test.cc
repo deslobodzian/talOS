@@ -107,7 +107,8 @@ TEST(Readiness, UnfilledFieldsFail) {
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kReady);
 }
 
-// A pose the gate cannot date, or one from the future, is stale too.
+// A pose the gate cannot date, or one from the future, is stale too; direct
+// CheckReadiness callers with an invalid max_pose_age_us <= 0 also fail closed.
 // REQ-DEV-19
 TEST(Readiness, UnknownOrNegativePoseAgeIsStale) {
   const ReadinessLimits limits = Limits();
@@ -116,6 +117,12 @@ TEST(Readiness, UnknownOrNegativePoseAgeIsStale) {
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kStale);
   in.pose_age_us = -1;
   EXPECT_EQ(CheckReadiness(in, limits), ReadinessReason::kStale);
+
+  in.pose_age_us = 0;
+  ReadinessLimits zero_age = Limits();
+  zero_age.max_pose_age_us = 0;
+  EXPECT_EQ(CheckReadiness(in, zero_age), ReadinessReason::kStale);
+  EXPECT_EQ(CheckReadiness(in, ReadinessLimits{}), ReadinessReason::kStale);
 }
 
 // A NaN or infinite measurement never reads as within tolerance, even when a
@@ -200,6 +207,16 @@ TEST(ReadinessGate, SkippedTicksRestartTheSettleCount) {
   EXPECT_EQ(r.passing_tick_count, 1);
   r = gate.Update(AllGood(), 50);  // stepped back
   EXPECT_EQ(r.passing_tick_count, 1);
+
+  // Wrapping UINT64_MAX -> 0 is a step back, not a consecutive tick.
+  ReadinessGate wrap_gate(Limits(2));
+  EXPECT_FALSE(
+      wrap_gate.Update(AllGood(), std::numeric_limits<std::uint64_t>::max())
+          .ready);
+  const Readiness wrapped = wrap_gate.Update(AllGood(), 0);
+  EXPECT_FALSE(wrapped.ready);
+  EXPECT_EQ(wrapped.reason, ReadinessReason::kSettling);
+  EXPECT_EQ(wrapped.passing_tick_count, 1);
 }
 
 // settle_tick_count = 1 means no debounce.

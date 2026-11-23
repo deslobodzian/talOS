@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -50,6 +52,7 @@ struct Node::Impl {
     std::unique_ptr<std::byte[]> data;  // operator new[]: aligned for M
     bool optional;
     bool observer = false;
+    bool internal_driver_station = false;
     // Its publications wake the node (require_immediate_delivery).
     bool prompt = false;
     detail::MessageCallback on_message;
@@ -63,7 +66,9 @@ struct Node::Impl {
   struct PublisherSlot {
     std::uint16_t id;
     std::size_t bytes;
+    std::string topic;
     bool is_hardware_request = false;
+    bool operator_arming = false;
   };
   struct BytePublisherSlot {
     std::string topic;
@@ -105,6 +110,9 @@ struct Node::Impl {
   bool abi_update = false;
   // A publisher on a target lane (`/<sub>/target/<source>`) is registered.
   bool writes_target_lane = false;
+  // The node constructed a public DriverStation handle or directly subscribed
+  // to /hw/state/driver_station (non-observer, non-internal).
+  bool explicit_driver_station = false;
   // The topic add_hardware_request registered, or empty.
   std::string hardware_request;
   // NodeAccess::mark_untargeted_outputs was called.
@@ -116,7 +124,7 @@ struct Node::Impl {
   Duration timeout{};
 
   std::vector<std::unique_ptr<SubscriptionSlot>> subscriptions;
-  std::vector<PublisherSlot> publishers;
+  std::deque<PublisherSlot> publishers;
   std::vector<std::unique_ptr<BytePublisherSlot>> byte_publishers;
   std::vector<std::unique_ptr<TimerSlot>> timers;
   std::vector<StateMachineSlot> state_machines;
@@ -178,6 +186,45 @@ struct Node::Impl {
                              " must be called in the constructor");
     }
   }
+
+  // REQ-SAFE-14: an explicit Driver Station reader writing any target lane in
+  // the target subsystem's teleop policy must open it with OperatorArming.
+  void CheckTargetLaneArming(std::string_view topic) const {
+    if (!introspect::naming::IsTargetLane(topic)) return;
+    const auto segments = introspect::naming::detail::Segments(topic);
+    const auto& teleop = config->TargetsFor(segments[0]).teleop;
+    if (std::find(teleop.begin(), teleop.end(), segments[2]) == teleop.end()) {
+      return;
+    }
+    throw std::invalid_argument(
+        name + ": target lane '" + std::string{topic} + "' is in " +
+        std::string{segments[0]} +
+        "'s teleop target policy and this node reads the Driver Station; open "
+        "it with a talos::OperatorArming (talos.OperatorArming in Python) so "
+        "an input held through a disable, reboot, Driver Station dropout or "
+        "stall cannot drive until released once (REQ-SAFE-14)");
+  }
+
+  void CheckOperatorArming(bool explicit_ds) const {
+    if (!explicit_ds) return;
+    for (const auto& pub : publishers) {
+      if (!pub.operator_arming) CheckTargetLaneArming(pub.topic);
+    }
+    for (const auto& bpub : byte_publishers) {
+      CheckTargetLaneArming(bpub->topic);
+    }
+  }
+
+  std::size_t AddSubscription(std::string_view topic, std::size_t bytes,
+                              std::size_t alignment,
+                              const schema::Identity& schema, bool optional,
+                              bool observer, bool internal_ds,
+                              detail::MessageCallback on_message,
+                              bool prompt = false);
+  std::size_t AddPublisher(std::string_view topic, std::size_t bytes,
+                           std::size_t alignment,
+                           const schema::Identity& schema,
+                           bool operator_arming);
 
   const toml::table* Table() const { return config->GetSubsystemTable(name); }
 
@@ -251,8 +298,10 @@ struct Node::Impl {
                         std::span<const std::byte> payload) {
     auto* slot = static_cast<SubscriptionSlot*>(object);
     const std::size_t copied = std::min(payload.size(), slot->bytes);
-    std::memcpy(slot->data.get(), payload.data(), copied);
-    std::memset(slot->data.get() + copied, 0, slot->bytes - copied);
+    if (copied > 0) std::memcpy(slot->data.get(), payload.data(), copied);
+    if (slot->bytes > copied) {
+      std::memset(slot->data.get() + copied, 0, slot->bytes - copied);
+    }
     slot->has_value = true;
     slot->published = context.publish_time;
     slot->sequence = context.sequence;
@@ -322,8 +371,12 @@ Node::Node(detail::NodeSetup setup) : impl_{std::make_unique<Impl>()} {
       period_us = *value;
     }
   }
-  if (period_us <= 0) {
-    throw std::invalid_argument(impl.name + ": period_us must be positive");
+  constexpr std::int64_t kMaxPeriodUs =
+      std::numeric_limits<std::int64_t>::max() / 1000;
+  if (period_us <= 0 || period_us > kMaxPeriodUs) {
+    throw std::invalid_argument(impl.name +
+                                ": period_us must be positive and at most " +
+                                std::to_string(kMaxPeriodUs));
   }
   impl.period = std::chrono::microseconds{period_us};
 }
@@ -367,13 +420,19 @@ void Node::every(Duration period, std::function<void()> fn) {
   if (!fn) {
     throw std::invalid_argument(impl_->name + ": every() needs a function");
   }
+  const Time current = now();
+  if (current.nanos() > 0 &&
+      period > Duration::max() - Duration{current.nanos()}) {
+    throw std::invalid_argument(impl_->name +
+                                ": every() period overflows clock");
+  }
   auto slot = std::make_unique<Impl::TimerSlot>(Impl::TimerSlot{std::move(fn)});
   const std::string label =
       impl_->name + "/every/" + std::to_string(impl_->timers.size());
   const std::uint16_t id = impl_->loop->register_timer(
       label, event::Thunk{slot.get(), &Impl::OnTimer});
   impl_->timers.push_back(std::move(slot));
-  impl_->loop->arm_timer(id, now() + period, period);
+  impl_->loop->arm_timer(id, current + period, period);
 }
 
 BytePublisher Node::publish_bytes(std::string_view topic, std::size_t max_bytes,
@@ -406,11 +465,19 @@ bool NodeAccess::abi_update(const Node& node) { return node.impl_->abi_update; }
 void NodeAccess::start(Node& node) {
   Node::Impl& impl = *node.impl_;
   if (impl.started) throw std::logic_error(impl.name + ": started twice");
+  const bool has_tick = impl.update || !impl.after_update.empty();
+  const Time current = node.now();
+  if (has_tick && current.nanos() > 0 &&
+      impl.period > Duration::max() - Duration{current.nanos()}) {
+    throw std::invalid_argument(impl.name + ": tick period overflows clock");
+  }
+  if (!impl.describing) {
+    impl.CheckOperatorArming(impl.explicit_driver_station);
+  }
   impl.started = true;
   // Draining before timers needs a timer: in a node with none (it only lets
   // its extensions latch values for someone else to read) nothing else would
   // ever drain, so every subscription wakes it.
-  const bool has_tick = impl.update || !impl.after_update.empty();
   const bool timed = has_tick || !impl.timers.empty();
   bool prompt = false;
   for (const auto& slot : impl.subscriptions) {
@@ -424,7 +491,7 @@ void NodeAccess::start(Node& node) {
   if (!has_tick) return;
   const std::uint16_t id = impl.loop->register_timer(
       impl.name, event::Thunk{&impl, &Node::Impl::OnTick});
-  impl.loop->arm_timer(id, node.now() + impl.period, impl.period);
+  impl.loop->arm_timer(id, current + impl.period, impl.period);
 }
 
 void NodeAccess::require_loop_thread(const Node& node, std::string_view what) {
@@ -467,6 +534,26 @@ std::vector<std::string_view> NodeAccess::observer_topics(const Node& node) {
   std::vector<std::string_view> topics;
   for (const auto& slot : node.impl_->subscriptions) {
     if (slot->observer) topics.push_back(slot->topic);
+  }
+  return topics;
+}
+
+std::vector<std::string_view> NodeAccess::armed_target_lane_topics(
+    const Node& node) {
+  std::vector<std::string_view> topics;
+  for (const auto& pub : node.impl_->publishers) {
+    if (pub.operator_arming) topics.push_back(pub.topic);
+  }
+  return topics;
+}
+
+std::vector<std::string_view> NodeAccess::internal_driver_station_topics(
+    const Node& node) {
+  const Node::Impl& impl = *node.impl_;
+  if (impl.explicit_driver_station) return {};
+  std::vector<std::string_view> topics;
+  for (const auto& slot : impl.subscriptions) {
+    if (slot->internal_driver_station) topics.push_back(slot->topic);
   }
   return topics;
 }
@@ -750,28 +837,71 @@ void RefuseHardwareRequest(const std::string& node, std::string_view topic) {
 }
 
 }  // namespace
+}  // namespace detail
 
-std::size_t NodeDetail::add_subscription(Node& node, std::string_view topic,
-                                         std::size_t bytes,
-                                         std::size_t alignment,
-                                         const schema::Identity& schema,
-                                         bool optional,
-                                         MessageCallback on_message) {
-  Node::Impl& impl = *node.impl_;
-  std::string resolved = impl.ResolveTopic(topic);
-  CheckLayout(impl.name, resolved, bytes, alignment);
-  auto slot = std::make_unique<Node::Impl::SubscriptionSlot>();
+std::size_t Node::Impl::AddSubscription(
+    std::string_view topic, std::size_t bytes, std::size_t alignment,
+    const schema::Identity& schema, bool optional, bool observer,
+    bool internal_ds, detail::MessageCallback on_message, bool prompt) {
+  if (prompt) CheckOpen("subscribe with a callback");
+  std::string resolved = ResolveTopic(topic);
+  detail::CheckLayout(name, resolved, bytes, alignment);
+  const bool explicit_ds = !observer && !internal_ds &&
+                           resolved == introspect::naming::kDriverStationTopic;
+  if (explicit_ds && started && !describing) {
+    CheckOperatorArming(/*explicit_ds=*/true);
+  }
+  auto slot = std::make_unique<SubscriptionSlot>();
   slot->topic = std::move(resolved);
   slot->bytes = bytes;
   slot->data = std::make_unique<std::byte[]>(bytes);
   slot->optional = optional;
+  slot->observer = observer;
+  slot->internal_driver_station = internal_ds;
+  slot->prompt = prompt;
   slot->on_message = std::move(on_message);
-  slot->watcher = impl.loop->register_watcher(
+  slot->watcher = loop->register_watcher(
       slot->topic, static_cast<std::uint32_t>(bytes),
       static_cast<std::uint32_t>(alignment), schema,
       event::Thunk{slot.get(), &Node::Impl::OnMessage}, !slot->on_message);
-  impl.subscriptions.push_back(std::move(slot));
-  return impl.subscriptions.size() - 1;
+  subscriptions.push_back(std::move(slot));
+  if (explicit_ds) explicit_driver_station = true;
+  return subscriptions.size() - 1;
+}
+
+std::size_t Node::Impl::AddPublisher(std::string_view topic, std::size_t bytes,
+                                     std::size_t alignment,
+                                     const schema::Identity& schema,
+                                     bool operator_arming) {
+  const std::string resolved = ResolveTopic(topic);
+  detail::RefuseHardwareRequest(name, resolved);
+  detail::CheckLayout(name, resolved, bytes, alignment);
+  if (started && !describing && explicit_driver_station && !operator_arming) {
+    CheckTargetLaneArming(resolved);
+  }
+  const std::uint16_t id =
+      loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
+                            static_cast<std::uint32_t>(alignment), schema);
+  publishers.push_back({.id = id,
+                        .bytes = bytes,
+                        .topic = resolved,
+                        .is_hardware_request = false,
+                        .operator_arming = operator_arming});
+  if (introspect::naming::IsTargetLane(resolved)) {
+    writes_target_lane = true;
+  }
+  return publishers.size() - 1;
+}
+
+namespace detail {
+
+std::size_t NodeDetail::add_subscription(
+    Node& node, std::string_view topic, std::size_t bytes,
+    std::size_t alignment, const schema::Identity& schema, bool optional,
+    MessageCallback on_message, bool prompt) {
+  return node.impl_->AddSubscription(topic, bytes, alignment, schema, optional,
+                                     /*observer=*/false, /*internal_ds=*/false,
+                                     std::move(on_message), prompt);
 }
 
 const void* NodeDetail::subscription_value(const Node& node,
@@ -809,33 +939,50 @@ bool NodeDetail::subscription_updated(const Node& node, std::size_t index) {
 std::size_t NodeAccess::add_observer(Node& node, std::string_view topic,
                                      std::size_t bytes, std::size_t alignment,
                                      const schema::Identity& schema) {
-  const std::size_t index = add_subscription(node, topic, bytes, alignment,
-                                             schema, /*optional=*/false, {});
-  node.impl_->subscriptions[index]->observer = true;
-  return index;
+  return node.impl_->AddSubscription(topic, bytes, alignment, schema,
+                                     /*optional=*/false, /*observer=*/true,
+                                     /*internal_ds=*/false, {});
+}
+
+std::size_t NodeAccess::add_internal_driver_station_subscription(
+    Node& node, std::string_view topic, std::size_t bytes,
+    std::size_t alignment, const schema::Identity& schema,
+    MessageCallback on_message) {
+  return node.impl_->AddSubscription(topic, bytes, alignment, schema,
+                                     /*optional=*/false, /*observer=*/false,
+                                     /*internal_ds=*/true,
+                                     std::move(on_message));
+}
+
+void NodeAccess::mark_driver_station_reader(Node& node) {
+  Node::Impl& impl = *node.impl_;
+  if (impl.explicit_driver_station) return;
+  if (impl.started && !impl.describing) {
+    impl.CheckOperatorArming(/*explicit_ds=*/true);
+  }
+  impl.explicit_driver_station = true;
 }
 
 std::size_t NodeDetail::add_publisher(Node& node, std::string_view topic,
                                       std::size_t bytes, std::size_t alignment,
                                       const schema::Identity& schema) {
-  Node::Impl& impl = *node.impl_;
-  const std::string resolved = impl.ResolveTopic(topic);
-  RefuseHardwareRequest(impl.name, resolved);
-  CheckLayout(impl.name, resolved, bytes, alignment);
-  const std::uint16_t id =
-      impl.loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
-                                 static_cast<std::uint32_t>(alignment), schema);
-  impl.publishers.push_back({id, bytes});
-  if (introspect::naming::IsTargetLane(resolved)) {
-    impl.writes_target_lane = true;
-  }
-  return impl.publishers.size() - 1;
+  return node.impl_->AddPublisher(topic, bytes, alignment, schema,
+                                  /*operator_arming=*/false);
+}
+
+std::size_t NodeAccess::add_target_lane_publisher(
+    Node& node, std::string_view topic, std::size_t bytes,
+    std::size_t alignment, const schema::Identity& schema,
+    bool operator_arming) {
+  return node.impl_->AddPublisher(topic, bytes, alignment, schema,
+                                  operator_arming);
 }
 
 std::size_t NodeAccess::add_hardware_request(Node& node, std::size_t bytes,
                                              std::size_t alignment,
                                              const schema::Identity& schema) {
   Node::Impl& impl = *node.impl_;
+  impl.CheckOpen("add_hardware_request");
   if (!impl.hardware_request.empty()) {
     throw std::logic_error(impl.name + ": hardware request '" +
                            impl.hardware_request + "' is already registered");
@@ -845,7 +992,11 @@ std::size_t NodeAccess::add_hardware_request(Node& node, std::size_t bytes,
   const std::uint16_t id =
       impl.loop->register_sender(topic, static_cast<std::uint32_t>(bytes),
                                  static_cast<std::uint32_t>(alignment), schema);
-  impl.publishers.push_back({id, bytes, /*is_hardware_request=*/true});
+  impl.publishers.push_back({.id = id,
+                             .bytes = bytes,
+                             .topic = topic,
+                             .is_hardware_request = true,
+                             .operator_arming = false});
   impl.hardware_request = std::move(topic);
   return impl.publishers.size() - 1;
 }
@@ -1097,7 +1248,50 @@ struct Flags {
   bool log_set = false;  // --log was passed (vs. the /tmp default)
 };
 
+std::uint64_t ParseUint64Flag(std::string_view value, const char* flag) {
+  if (value.empty()) {
+    throw std::invalid_argument(std::string{flag} +
+                                " requires a nonnegative integer");
+  }
+  std::uint64_t result = 0;
+  const char* begin = value.data();
+  const char* end = begin + value.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, result);
+  if (ec != std::errc{} || ptr != end) {
+    throw std::invalid_argument(std::string{flag} +
+                                ": invalid nonnegative integer '" +
+                                std::string{value} + "'");
+  }
+  return result;
+}
+
+int ParseNonNegativeIntFlag(std::string_view value, const char* flag) {
+  if (value.empty()) {
+    throw std::invalid_argument(std::string{flag} +
+                                " requires a nonnegative integer");
+  }
+  int result = 0;
+  const char* begin = value.data();
+  const char* end = begin + value.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, result);
+  if (ec != std::errc{} || ptr != end || result < 0) {
+    throw std::invalid_argument(std::string{flag} +
+                                ": invalid nonnegative integer '" +
+                                std::string{value} + "'");
+  }
+  return result;
+}
+
 Flags ParseFlags(int argc, char** argv, const char* node_name) {
+  if (node_name == nullptr) throw std::invalid_argument("null node_name");
+  if (argc < 0 || (argc > 0 && argv == nullptr)) {
+    throw std::invalid_argument("invalid argc/argv");
+  }
+  for (int i = 0; i < argc; ++i) {
+    if (argv[i] == nullptr) {
+      throw std::invalid_argument("null argv[" + std::to_string(i) + "]");
+    }
+  }
   Flags flags;
   flags.log_path = std::string{"/tmp/"} + node_name + ".tlog";
   for (int i = 1; i < argc; ++i) {
@@ -1114,11 +1308,11 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.log_path = argv[++i];
       flags.log_set = true;
     } else if (arg == "--log-max-bytes" && i + 1 < argc) {
-      flags.log_max_bytes = std::stoull(argv[++i]);
+      flags.log_max_bytes = ParseUint64Flag(argv[++i], "--log-max-bytes");
     } else if (arg == "--log-window-us" && i + 1 < argc) {
       flags.log_window = event::log::ParseLogWindowUs(argv[++i]);
     } else if (arg == "--session-id" && i + 1 < argc) {
-      flags.session_id = std::stoull(argv[++i]);
+      flags.session_id = ParseUint64Flag(argv[++i], "--session-id");
     } else if (arg == "--config" && i + 1 < argc) {
       flags.config_path = argv[++i];
     } else if (arg == "--graph" && i + 1 < argc) {
@@ -1128,7 +1322,7 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
     } else if (arg == "--replay-inputs" && i + 1 < argc) {
       flags.replay_inputs = argv[++i];
     } else if (arg == "--duration-s" && i + 1 < argc) {
-      flags.duration_s = std::stoi(argv[++i]);
+      flags.duration_s = ParseNonNegativeIntFlag(argv[++i], "--duration-s");
     } else {
       throw std::invalid_argument(
           "usage: node [--sim] [--describe] [--targeted-outputs] "
@@ -1388,8 +1582,9 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
 }
 
 // Endpoint attributes of the loop's sources: the optional subscriptions, the
-// observers and the devices layer's hardware request, marked when the node
-// lifted the flush's live-target gate (mark_untargeted_outputs).
+// observers, armed target-lane publishers, internal-only Driver Station
+// subscriptions, and the devices layer's hardware request (marked when the node
+// lifted the flush's live-target gate via mark_untargeted_outputs).
 std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   std::vector<introspect::EndpointAttribute> attributes;
   for (const std::string_view topic : NodeAccess::optional_topics(node)) {
@@ -1397,6 +1592,16 @@ std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   }
   for (const std::string_view topic : NodeAccess::observer_topics(node)) {
     attributes.push_back({topic, introspect::naming::kSourceFlagObserver});
+  }
+  for (const std::string_view topic :
+       NodeAccess::armed_target_lane_topics(node)) {
+    attributes.push_back(
+        {topic, introspect::naming::kSourceFlagOperatorArming});
+  }
+  for (const std::string_view topic :
+       NodeAccess::internal_driver_station_topics(node)) {
+    attributes.push_back(
+        {topic, introspect::naming::kSourceFlagInternalDriverStation});
   }
   if (const std::string_view topic = NodeAccess::hardware_request(node);
       !topic.empty()) {

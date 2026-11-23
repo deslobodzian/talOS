@@ -536,4 +536,25 @@ TEST(CpuAprilTagBackendTest, NegativeQuadSigmaDoesNotMutateCallerBuffer) {
   EXPECT_EQ(detections[0].id, 0);
 }
 
+TEST(CpuAprilTagBackendTest,
+     RejectsImagesWhoseDecimatedDimensionsAreUnderFour) {
+  const std::vector<uint8_t> small(std::size_t{64} * 8, 128);
+  for (const float decimate : {1.0f, 1.5f, 2.0f}) {
+    DetectorOptions options;
+    options.family_name = "tag36h11";
+    options.quad_decimate = decimate;
+    options.threads = 1;
+    CpuAprilTagBackend backend(options);
+    EXPECT_TRUE(backend.Detect(small.data(), 64, 1, 64).empty());
+    EXPECT_TRUE(backend.Detect(small.data(), 1, 64, 1).empty());
+    EXPECT_TRUE(backend.Detect(small.data(), 3, 3, 3).empty());
+    if (decimate > 1.0f) {
+      EXPECT_TRUE(backend.Detect(small.data(), 5, 5, 5).empty());
+    }
+    if (decimate >= 2.0f) {
+      EXPECT_TRUE(backend.Detect(small.data(), 6, 6, 6).empty());
+    }
+  }
+}
+
 }  // namespace talos::vision::apriltag

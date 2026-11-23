@@ -1,7 +1,9 @@
 #include "talOS/launcher/log_budget.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <limits>
 #include <set>
 
 #include "bridge/topics.h"
@@ -207,21 +209,37 @@ LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
   LogSplit split;
   std::vector<uint64_t>& shares = split.shares;
   shares.assign(logs.size(), 0);
+  const auto valid_rate = [](double rate) {
+    return std::isfinite(rate) && rate >= 0.0;
+  };
   std::size_t known = 0;
   double known_sum = 0;
+  double max_known_rate = 0;
   std::vector<std::size_t> loggers;
   for (std::size_t i = 0; i < logs.size(); ++i) {
     if (!logs[i]) continue;
     loggers.push_back(i);
-    if (rates[i] >= 0) {
+    if (valid_rate(rates[i])) {
       ++known;
       known_sum += rates[i];
+      max_known_rate = std::max(max_known_rate, rates[i]);
     }
   }
   if (loggers.empty()) return split;
-  const double mean = known > 0 ? known_sum / static_cast<double>(known) : 1;
+  double mean = 1.0;
+  if (known > 0) {
+    if (std::isfinite(known_sum)) {
+      mean = known_sum / static_cast<double>(known);
+    } else if (max_known_rate > 0.0) {
+      double scaled = 0.0;
+      for (const std::size_t i : loggers) {
+        if (valid_rate(rates[i])) scaled += rates[i] / max_known_rate;
+      }
+      mean = max_known_rate * (scaled / static_cast<double>(known));
+    }
+  }
   const auto weight = [&](std::size_t i) {
-    return rates[i] >= 0 ? rates[i] : mean;
+    return valid_rate(rates[i]) ? rates[i] : mean;
   };
 
   // Proportional shares; a member whose share would fall below its floor is
@@ -235,17 +253,31 @@ LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
   for (;;) {
     rest = static_cast<double>(budget) - floor_sum;
     total = 0;
+    double max_weight = 0;
     std::size_t free = 0;
     for (const std::size_t i : loggers) {
       if (held.contains(i)) continue;
-      total += weight(i);
+      max_weight = std::max(max_weight, weight(i));
       ++free;
+    }
+    double scaled_total = 0;
+    for (const std::size_t i : loggers) {
+      if (held.contains(i)) continue;
+      const double w = weight(i);
+      total += w;
+      if (max_weight > 0.0) scaled_total += w / max_weight;
     }
     bool changed = false;
     for (const std::size_t i : loggers) {
       if (held.contains(i)) continue;
-      share[i] = total > 0 ? std::max(rest, 0.0) * weight(i) / total
-                           : std::max(rest, 0.0) / static_cast<double>(free);
+      const double positive_rest = std::max(rest, 0.0);
+      if (total > 0.0 && std::isfinite(total)) {
+        share[i] = positive_rest * (weight(i) / total);
+      } else if (max_weight > 0.0 && scaled_total > 0.0) {
+        share[i] = positive_rest * ((weight(i) / max_weight) / scaled_total);
+      } else {
+        share[i] = positive_rest / static_cast<double>(free);
+      }
       if (share[i] < static_cast<double>(floors[i])) {
         held.insert(i);
         floor_sum += static_cast<double>(floors[i]);
@@ -258,10 +290,10 @@ LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
   if (floor_sum > static_cast<double>(budget)) {
     // The floors alone do not fit: share the budget in their proportion.
     for (const std::size_t i : loggers) {
-      share[i] = static_cast<double>(budget) * static_cast<double>(floors[i]) /
-                 floor_sum;
+      share[i] = static_cast<double>(budget) *
+                 (static_cast<double>(floors[i]) / floor_sum);
     }
-  } else if (known > 0 && total > 0 && rest > 0) {
+  } else if (known > 0 && std::isfinite(total) && total > 0 && rest > 0) {
     // T = rest / total: what every free member's share holds at its weight,
     // before its segments' prefixes. It never falls as the budget grows: the
     // shares are max(floor, T x weight) summing to the budget. A member's
@@ -282,16 +314,28 @@ LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
                                 (static_cast<double>(floors[i]) / 2) / w);
     }
     const double window_s = t - std::min(t / 8, cost);
-    // Whole microseconds, rounded down, within a log writer's nanoseconds.
-    constexpr int64_t kMaxWindowUs =
-        std::chrono::nanoseconds::max().count() / 1000 / 2;
-    const double window_us =
-        std::min(window_s * 1e6, static_cast<double>(kMaxWindowUs));
-    split.window = std::chrono::microseconds{
-        static_cast<int64_t>(std::max(window_us, 0.0))};
+    if (std::isfinite(window_s)) {
+      // Whole microseconds, rounded down, within a log writer's nanoseconds.
+      constexpr int64_t kMaxWindowUs =
+          std::chrono::nanoseconds::max().count() / 1000 / 2;
+      const double window_us =
+          std::min(window_s * 1e6, static_cast<double>(kMaxWindowUs));
+      split.window = std::chrono::microseconds{
+          static_cast<int64_t>(std::max(window_us, 0.0))};
+    }
   }
+  // 2^64 is the smallest double strictly above UINT64_MAX; casting any value
+  // >= 2^64 to uint64_t is undefined behavior.
+  constexpr double kU64UpperBound = 18446744073709551616.0;
   for (const std::size_t i : loggers) {
-    shares[i] = std::max<uint64_t>(1, static_cast<uint64_t>(share[i]));
+    const double s = share[i];
+    if (!std::isfinite(s) || s <= 1.0) {
+      shares[i] = 1;
+    } else if (s >= kU64UpperBound) {
+      shares[i] = std::max<uint64_t>(1, budget);
+    } else {
+      shares[i] = std::max<uint64_t>(1, static_cast<uint64_t>(s));
+    }
   }
   return split;
 }

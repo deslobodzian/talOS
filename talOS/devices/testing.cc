@@ -164,8 +164,24 @@ struct SimHardware::Impl {
 
   // The gateway clock, in its microseconds, `before` ago.
   std::uint64_t GatewayUs(Duration before = Duration{}) const {
-    return static_cast<std::uint64_t>(
-        (sim.now().nanos() + (gateway_offset - before).count()) / 1000);
+    const std::int64_t now_ns = sim.now().nanos();
+    const std::int64_t offset_ns = gateway_offset.count();
+    const std::int64_t before_ns = before.count();
+    if ((offset_ns > 0 &&
+         now_ns > std::numeric_limits<std::int64_t>::max() - offset_ns) ||
+        (offset_ns < 0 &&
+         now_ns < std::numeric_limits<std::int64_t>::min() - offset_ns)) {
+      throw std::overflow_error("SimHardware: gateway clock overflow");
+    }
+    const std::int64_t clock_ns = now_ns + offset_ns;
+    if ((before_ns > 0 &&
+         clock_ns < std::numeric_limits<std::int64_t>::min() + before_ns) ||
+        (before_ns < 0 &&
+         clock_ns > std::numeric_limits<std::int64_t>::max() + before_ns) ||
+        clock_ns - before_ns < 0) {
+      throw std::overflow_error("SimHardware: gateway clock before 0");
+    }
+    return static_cast<std::uint64_t>((clock_ns - before_ns) / 1000);
   }
   std::uint16_t Id(std::string_view node, Kind kind,
                    std::string_view device) const {
@@ -784,7 +800,17 @@ void SimHardware::set_gateway_clock(Duration gateway_offset, Duration latency) {
   if (latency < Duration::zero()) {
     throw std::invalid_argument("SimHardware: negative sample latency");
   }
-  if (impl_->sim.now().nanos() + (gateway_offset - latency).count() < 0) {
+  const std::int64_t now_ns = impl_->sim.now().nanos();
+  const std::int64_t offset_ns = gateway_offset.count();
+  const std::int64_t latency_ns = latency.count();
+  if ((offset_ns > 0 &&
+       now_ns > std::numeric_limits<std::int64_t>::max() - offset_ns) ||
+      (offset_ns < 0 &&
+       now_ns < std::numeric_limits<std::int64_t>::min() - offset_ns)) {
+    throw std::invalid_argument("SimHardware: gateway clock offset overflows");
+  }
+  const std::int64_t clock_ns = now_ns + offset_ns;
+  if (clock_ns < latency_ns) {
     throw std::invalid_argument(
         "SimHardware: the gateway clock would read before 0");
   }
@@ -820,6 +846,9 @@ void SimHardware::reset_device(std::string_view node, std::string_view device) {
 
 void SimHardware::lose_states(int count) {
   if (count < 0) throw std::invalid_argument("SimHardware: negative count");
+  if (count > std::numeric_limits<int>::max() - impl_->lost_states) {
+    throw std::invalid_argument("SimHardware: lost_states count overflows");
+  }
   impl_->lost_states += count;
 }
 

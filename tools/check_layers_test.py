@@ -776,6 +776,12 @@ class CheckNodeSourcesTest(unittest.TestCase):
              "void f(talos::Node& n) { NodeAccess::publisher_send(n, 0, 0, 0); }\n"),
             ("add_hardware_request_alone",
              "auto fn = &add_hardware_request;\n"),
+            ("add_target_lane_publisher_alone",
+             "auto fn = &add_target_lane_publisher;\n"),
+            ("add_internal_driver_station_subscription_alone",
+             "auto fn = &add_internal_driver_station_subscription;\n"),
+            ("mark_driver_station_reader_alone",
+             "auto fn = &mark_driver_station_reader;\n"),
             ("hardware_access_note_live_target",
              "void f(talos::HardwareLink& l) {\n"
              "  talos::detail::HardwareAccess::note_live_target(l);\n"
@@ -1470,6 +1476,89 @@ class CheckNodeSourcesTest(unittest.TestCase):
                 failures, out = run_sources(files)
                 self.assertGreaterEqual(failures, 1, f"{name}: {out}")
                 self.assertIn("bench/arm/arm.cc:1:", out)
+
+    # REQ-SAFE-27, REQ-CONTRACT-16
+    def test_ucn_identifiers_and_starlark_format_bypasses_are_refused(self):
+        # C++ Universal Character Names (\uXXXX / \UXXXXXXXX) in code outside
+        # comments and strings can spell forbidden framework identifiers such
+        # as NodeAccess or HardwareAccess and must be refused.
+        for name, body in (
+            ("ucn_node_access", "talos::detail::Node\\u0041ccess::x();\n"),
+            ("ucn_long_hardware",
+             "talos::detail::\\U00000048ardwareAccess::x();\n"),
+        ):
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": body,
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/arm.cc:1:", out)
+
+        # UCNs inside ordinary string literals or comments are not identifiers.
+        clean = {
+            "bench/arm/BUILD": self.NODE_BUILD,
+            "bench/arm/arm.cc": (
+                '// note: \\u0041\n'
+                'const char* s = "\\u00b0";\n'
+            ),
+        }
+        failures, out = run_sources(clean)
+        self.assertEqual(failures, 0, out)
+
+        # Starlark `%` formatting and `.format(...)` must not assemble
+        # forbidden flags, symbols, or header paths.
+        for name, build in (
+            ("percent_flag",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["-in%s" % "clude", "foo.h"])\n'),
+            ("percent_symbol",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'defines = ["X=%s%s" % ("Node", "Access")])\n'),
+            ("percent_header",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'defines = ["H=%s/%s/%s" % ("talOS", "node", "access.h")])\n'),
+            ("str_format_flag",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'copts = ["{}{}".format("-in", "clude"), "foo.h"])\n'),
+            ("str_format_header",
+             'cc_library(name = "arm", srcs = ["arm.cc"], '
+             'defines = ["{a}/{b}".format(a="talOS/node", b="access.h")])\n'),
+        ):
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": build,
+                    "bench/arm/arm.cc": "int ok = 1;\n",
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/BUILD:1:", out)
+
+    # REQ-CONTRACT-16, REQ-DEV-25
+    def test_bazel_query_exit_3_rejects_ansi_prefixed_and_relative_external_errors(
+            self):
+        bazel = check_layers.Bazel()
+        external_ok = (
+            "ERROR: /cache/_bazel/external/opencv+/BUILD.bazel:1:1: "
+            "no such package '@@androidndk//': missing\n"
+        )
+        for name, stderr in (
+            ("csi_erase_line_hides_workspace_error",
+             external_ok +
+             "\x1b[1A\x1b[KERROR: /repo/bench/arm/BUILD:1:1: syntax error\n"),
+            ("relative_workspace_path_named_external",
+             "ERROR: bench/external/arm/BUILD:1:1: syntax error\n"),
+        ):
+            with self.subTest(name=name):
+                proc = subprocess.CompletedProcess(
+                    [], 3, stdout="", stderr=stderr)
+                with mock.patch.object(check_layers.subprocess, "run",
+                                       return_value=proc), \
+                        mock.patch.object(check_layers.sys, "stderr",
+                                          io.StringIO()), \
+                        self.assertRaises(RuntimeError):
+                    bazel.query("somepath(//talOS/..., //bench/...)")
 
 
 if __name__ == "__main__":

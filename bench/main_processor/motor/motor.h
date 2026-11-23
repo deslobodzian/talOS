@@ -87,18 +87,19 @@ class BenchMotor {
     const auto position_time = motor_.position_time();
     const auto velocity_time = motor_.velocity_time();
     constexpr auto unknown = std::numeric_limits<std::uint64_t>::max();
+    const auto micros = [](talos::Duration d) -> std::uint64_t {
+      return static_cast<std::uint64_t>(std::max<std::int64_t>(0, d.count()) /
+                                        1000);
+    };
     const auto age = [&](const auto& time) -> std::uint64_t {
-      return time ? static_cast<std::uint64_t>((node_.now() - *time).count() /
-                                               1000)
-                  : unknown;
+      return time ? micros(node_.now() - *time) : unknown;
     };
     const bool fault_valid = status_.fresh() && status_->health_valid();
     state_.send(MotorState{
         static_cast<std::uint64_t>(node_.now().nanos()), motor_.position(),
         motor_.velocity(), motor_.voltage(), motor_.current(),
-        link.fresh() ? static_cast<std::uint64_t>(link.age().count() / 1000)
-                     : unknown,
-        age(position_time), age(velocity_time),
+        link.fresh() ? micros(link.age()) : unknown, age(position_time),
+        age(velocity_time),
         position_time.has_value() && velocity_time.has_value(),
         motor_.connected(), fault_valid && status_->motor_fault_mask() != 0,
         fault_valid, enabled, mode,

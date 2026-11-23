@@ -23,6 +23,7 @@
 namespace {
 bool fail_truncate = false;
 bool fail_close = false;
+bool fail_mmap = false;
 int unmap_calls = 0;
 // Set to have the next exclusive create find the name and its last holder
 // unlink it before the attach that follows.
@@ -45,6 +46,15 @@ int TestClose(int fd) {
   return result;
 }
 
+void* TestMmap(void* addr, std::size_t length, int prot, int flags, int fd,
+               off_t offset) {
+  if (std::exchange(fail_mmap, false)) {
+    errno = ENOMEM;
+    return MAP_FAILED;
+  }
+  return ::mmap(addr, length, prot, flags, fd, offset);
+}
+
 int TestUnmap(void* address, std::size_t size) {
   ++unmap_calls;
   return ::munmap(address, size);
@@ -65,11 +75,13 @@ int TestShmOpen(const char* name, int oflag, mode_t mode) {
 // failures that need cleanup, and a name unlinked in the middle of an open.
 #define ftruncate TestTruncate
 #define close TestClose
+#define mmap TestMmap
 #define munmap TestUnmap
 #define shm_open TestShmOpen
 #include "shared_memory_ptr.h"
 #undef ftruncate
 #undef close
+#undef mmap
 #undef munmap
 #undef shm_open
 
@@ -93,6 +105,48 @@ TEST(SharedMemory, FailedCloseUnmapsSuccessfulMapping) {
   fail_close = true;
   EXPECT_THROW((SharedMemoryPtr{path, 4096}), std::runtime_error);
   EXPECT_EQ(unmap_calls, before + 1);
+  // A failed CREATE must also unlink the published name so an uninitialized
+  // segment is not leaked.
+  const int fd = shm_open(name.c_str(), O_RDWR, 0666);
+  EXPECT_EQ(fd, -1);
+  if (fd != -1) ::close(fd);
+  shm_unlink(name.c_str());
+}
+
+// REQ-CONTRACT-21: requesting a zero-byte mapping fails upfront without
+// creating or leaking an empty shared-memory object.
+TEST(SharedMemory, ZeroSizeThrowsWithoutCreatingSegment) {
+  const std::string path = "/zero_" + std::to_string(::getpid());
+  const auto name = ShmObjectName(path);
+  shm_unlink(name.c_str());
+  EXPECT_THROW((SharedMemoryPtr{path, 0}), std::invalid_argument);
+  const int fd = shm_open(name.c_str(), O_RDWR, 0666);
+  EXPECT_EQ(fd, -1);
+  if (fd != -1) ::close(fd);
+  shm_unlink(name.c_str());
+}
+
+// REQ-OPS-03: an mmap failure during CREATE unlinks the newly created name so
+// no zero-initialized orphan remains; during ATTACH it leaves the existing
+// segment untouched.
+TEST(SharedMemory, FailedMmapUnlinksOnlyOnCreate) {
+  const std::string path = "/mmap_fail_" + std::to_string(::getpid());
+  const auto name = ShmObjectName(path);
+  shm_unlink(name.c_str());
+
+  fail_mmap = true;
+  EXPECT_THROW((SharedMemoryPtr{path, 4096}), std::runtime_error);
+  const int after_create_fail = shm_open(name.c_str(), O_RDWR, 0666);
+  EXPECT_EQ(after_create_fail, -1);
+  if (after_create_fail != -1) ::close(after_create_fail);
+
+  SharedMemoryPtr existing{path, 4096};
+  ASSERT_EQ(existing.mode(), SharedMemoryMode::CREATE);
+  fail_mmap = true;
+  EXPECT_THROW((SharedMemoryPtr{path, 4096}), std::runtime_error);
+  const int after_attach_fail = shm_open(name.c_str(), O_RDWR, 0666);
+  EXPECT_NE(after_attach_fail, -1);
+  if (after_attach_fail != -1) ::close(after_attach_fail);
   shm_unlink(name.c_str());
 }
 

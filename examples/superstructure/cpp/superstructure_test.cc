@@ -489,6 +489,42 @@ TEST_F(SuperstructureAlone, AtGoalForAnEarlierHeightDoesNotCount) {
   EXPECT_EQ(State(), SuperstructureState::RAISING);
 }
 
+// REQ-SAFE-04: an out-of-range SuperstructureCommand enum byte cancels an
+// active sequence to STOW instead of continuing to raise or eject.
+TEST_F(SuperstructureAlone, UnknownCommandCancelsToStow) {
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+  ASSERT_EQ(State(), SuperstructureState::SCORING);
+
+  Tick(static_cast<SuperstructureCommand>(99), kHolding, kUp);
+  EXPECT_EQ(State(), SuperstructureState::HOLDING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  const auto intake = LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+  ASSERT_TRUE(intake.has_value());
+  EXPECT_EQ(intake->active, 1);
+  EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+}
+
+// REQ-CONTRACT-18, REQ-SAFE-04: a non-finite or non-positive high_rot fails
+// construction naming the key instead of sending NaN/inf or ejecting stowed.
+TEST(SuperstructureConfig, BadHighRotFailsConstruction) {
+  for (const char* value : {"0.0", "-1.0", "nan", "inf", "-inf", "'ten'"}) {
+    SCOPED_TRACE(value);
+    auto sim = Sim::FromToml(
+        std::string{"[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
+                    "[subsystems.superstructure]\nhigh_rot = "} +
+        value + "\n");
+    try {
+      sim.add<demo::Superstructure>("superstructure");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find("high_rot"), std::string::npos)
+          << error.what();
+    }
+  }
+}
+
 // The elevator on its own, driven through its superstructure lane by hand,
 // homed at the bottom.
 class ElevatorAlone : public ::testing::Test {
