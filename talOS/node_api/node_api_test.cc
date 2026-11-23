@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1074,6 +1075,99 @@ TEST(NodeApiFeedforward, AModeWithoutFeedforwardRefusesOne) {
     EXPECT_EQ(request.mode, TALOS_MODE_NEUTRAL) << "mode " << mode;
     EXPECT_EQ(request.ff_volts, 0.0) << "mode " << mode;
   }
+  talos_sim_hardware_destroy(hw);
+  talos_sim_destroy(sim);
+}
+
+// REQ-SAFE-04: non-finite ff_volts (NaN, +Inf, -Inf) in modes that carry no
+// feedforward (neutral, duty cycle, voltage, torque current) fails closed:
+// talos_motor_set returns TALOS_ERR naming the motor, and the motor goes
+// neutral.
+TEST(NodeApiFeedforward, NonFiniteFeedforwardFailsClosedInNonFeedforwardModes) {
+  struct Asker {
+    TalosNode* node = nullptr;
+    int64_t wheel = -1;
+    int32_t mode = TALOS_MODE_VOLTAGE;
+    double demand = 3.0;
+    double ff_volts = 0.0;
+    int32_t result = TALOS_OK;
+    std::string error;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& a = *static_cast<Asker*>(user);
+    a.node = node;
+    a.wheel = talos_device(node, TALOS_DEVICE_MOTOR, "wheel");
+    if (a.wheel < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* u) -> int32_t {
+          auto& asker = *static_cast<Asker*>(u);
+          asker.result = talos_motor_set(asker.node, asker.wheel, asker.mode,
+                                         asker.demand, asker.ff_volts, 0);
+          asker.error =
+              asker.result == TALOS_OK ? "" : std::string{talos_last_error()};
+          return 0;
+        },
+        &a);
+  };
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("can_id = 1\n") + 11,
+              "foc = true\nmax_torque_current_a = 5\n");
+  TalosSim* sim = talos_sim_from_toml(toml.c_str());
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+  Asker asker;
+  ASSERT_NE(talos_sim_add(sim, "roller", build, &asker), nullptr)
+      << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim, 30 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(asker.result, TALOS_OK) << asker.error;
+  TalosMotorRequest request{};
+  ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "roller", "wheel", &request),
+            TALOS_OK);
+  ASSERT_EQ(request.mode, TALOS_MODE_VOLTAGE);
+  ASSERT_DOUBLE_EQ(request.demand, 3.0);
+
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  for (const int32_t mode : {TALOS_MODE_NEUTRAL, TALOS_MODE_DUTY_CYCLE,
+                             TALOS_MODE_VOLTAGE, TALOS_MODE_TORQUE_CURRENT}) {
+    for (const double ff :
+         {std::numeric_limits<double>::quiet_NaN(), kInf, -kInf}) {
+      asker.mode = mode;
+      asker.demand = 0.5;
+      asker.ff_volts = ff;
+      ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+      EXPECT_EQ(asker.result, TALOS_ERR) << "mode " << mode << " ff " << ff;
+      EXPECT_NE(asker.error.find("'wheel'"), std::string::npos) << asker.error;
+      ASSERT_EQ(
+          talos_sim_hardware_motor_request(hw, "roller", "wheel", &request),
+          TALOS_OK);
+      EXPECT_EQ(request.mode, TALOS_MODE_NEUTRAL)
+          << "mode " << mode << " ff " << ff;
+      EXPECT_EQ(request.demand, 0.0);
+      EXPECT_EQ(request.ff_volts, 0.0);
+      ASSERT_EQ(
+          talos_sim_hardware_applied_motor(hw, "roller", "wheel", &request),
+          TALOS_OK);
+      EXPECT_EQ(request.mode, TALOS_MODE_NEUTRAL)
+          << "mode " << mode << " ff " << ff;
+      EXPECT_EQ(request.demand, 0.0);
+      EXPECT_EQ(request.ff_volts, 0.0);
+    }
+  }
+
+  asker.mode = TALOS_MODE_DUTY_CYCLE;
+  asker.demand = 0.5;
+  asker.ff_volts = 0.0;
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(asker.result, TALOS_OK) << asker.error;
+  ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "roller", "wheel", &request),
+            TALOS_OK);
+  EXPECT_EQ(request.mode, TALOS_MODE_DUTY_CYCLE);
+  EXPECT_DOUBLE_EQ(request.demand, 0.5);
+
   talos_sim_hardware_destroy(hw);
   talos_sim_destroy(sim);
 }
