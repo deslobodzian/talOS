@@ -357,6 +357,34 @@ bool Registered(std::string_view name, uint64_t session) {
   });
 }
 
+// Whether the registry holds an active, live row for `pid` named `name` of
+// `session` that is no longer constructing and has published at least one
+// heartbeat and dispatch. Unlike Registered(), this cannot match an earlier
+// SIGKILLed run's still-ACTIVE row.
+bool RegisteredPid(std::string_view name, uint64_t session, pid_t pid) {
+  if (pid <= 0 || ::kill(pid, 0) != 0) return false;
+  const auto registry = introspect::RegistryReader::open();
+  if (!registry) return false;
+  const auto nodes = registry->nodes();
+  return std::any_of(nodes.begin(), nodes.end(), [&](const auto& node) {
+    return node.name == name && node.session_id == session &&
+           node.pid == static_cast<uint64_t>(pid) &&
+           node.heartbeat_monotonic_ns > 0 && node.dispatch_count > 0 &&
+           (node.flags & introspect::kFlagConstructing) == 0;
+  });
+}
+
+// Parses a positive pid line written by a test fixture, or 0 if incomplete.
+pid_t ParsePidLine(std::string_view line) {
+  pid_t pid = 0;
+  const auto [ptr, ec] =
+      std::from_chars(line.data(), line.data() + line.size(), pid);
+  if (ec != std::errc{} || ptr != line.data() + line.size() || pid <= 0) {
+    return 0;
+  }
+  return pid;
+}
+
 // Waits until `done()` holds, `stop` is requested, or `bound` elapses.
 bool WaitFor(const std::stop_token& stop, const std::function<bool()>& done,
              std::chrono::steady_clock::duration bound = std::chrono::seconds{
@@ -3482,6 +3510,9 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
       "alpha", false);
   options.binary_overrides["//example/beta:node"] =
       WriteStub("undescribed_beta", "exit 0\n");
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
   testing::SupervisionPasses passes;
   bool stepped = false;
   std::jthread driver{[&](const std::stop_token& stop) {
@@ -3494,11 +3525,35 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
         })) {
       return;
     }
+    // Keep the clock frozen at start + kMinHeartbeatTimeout while run 1 and
+    // its peers finish exiting cleanly so ReleaseOnExit cannot unfreeze the
+    // clock before run 1 exits and kill run 1 as heartbeat_missing under load.
     clock.HoldAt(start + kMinHeartbeatTimeout);
-    if (!WaitFor(stop, [&] { return ReadLines(runs).size() >= 2; })) return;
+    if (!WaitFor(stop, [&] {
+          SupervisionWakeup::Wake();
+          const std::string manifest = ReadFile(live);
+          const auto alpha_runs = ManifestRuns(manifest, "alpha");
+          if (alpha_runs.size() < 2) return false;
+          for (const char* name : {"hardware_node", "alpha", "beta"}) {
+            const auto member_runs = ManifestRuns(manifest, name);
+            if (member_runs.empty() ||
+                member_runs.back().find("\"reason\": \"running\"") !=
+                    std::string::npos) {
+              return false;
+            }
+          }
+          return true;
+        })) {
+      return;
+    }
     stepped = true;
-    // Past the 50 ms clean-exit backoff so RosterContinues ends the session.
-    clock.HoldAt(start + kMinHeartbeatTimeout + 100ms);
+    // Past every clean-exit backoff (100 ms for restart 2) so RosterContinues
+    // cancels every pending restart and ends the session at once.
+    clock.HoldAt(start + kMinHeartbeatTimeout + 200ms);
+    WaitFor(stop, [&] {
+      SupervisionWakeup::Wake();
+      return false;
+    });
   }};
   EXPECT_EQ(RunSession(options), 0);
   driver.request_stop();
@@ -4677,7 +4732,9 @@ bool AdvanceClockWithHealthyNodes(const std::stop_token& stop,
 TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
   const auto bridge_runs = TempPath("bridge_hang_bridge_runs");
   const auto hang = TempPath("bridge_hang_now");
-  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+  const auto hung_ack = hang + ".hung";
+  for (const auto* path : {&bridge_runs, &hang, &hung_ack})
+    ::remove(path->c_str());
   testing::SteppedClock clock;
   const SupervisionTime start = clock.Freeze();
   auto options = BaseOptions("bridge_hang");
@@ -4713,8 +4770,9 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
       });
     };
     const auto ready = [&] {
-      if (ReadLines(bridge_runs).size() != 1 ||
-          !Registered("studio_bridge", session) ||
+      const auto lines = ReadLines(bridge_runs);
+      if (lines.size() != 1) return false;
+      if (!RegisteredPid("studio_bridge", session, ParsePidLine(lines[0])) ||
           !Registered("hardware_node", session) ||
           !Registered("alpha", session) || !Registered("beta", session))
         return false;
@@ -4723,49 +4781,47 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
         return EntryInteger(ManifestEntry(before, name), "pid") > 0;
       });
     };
-    if (WaitFor(stop, ready) && observe_pass()) {
+    if (WaitFor(stop, ready)) {
+      // Request hang and wait for run 1 to acknowledge it has frozen its
+      // dispatch_count while the clock is still held at `start`, then let one
+      // supervision pass observe run 1's final dispatch_count so
+      // `progress_changed_at_ == start` deterministically.
       std::ofstream{hang}.close();
-      // Step across studio_bridge's 1 s stall timeout in 250 ms increments,
-      // letting supervision observe each step before advancing again so a
-      // step cannot overshoot the 50 ms restart backoff and race
-      // ManifestWriter on history.size() == 1 vs 2.
-      int64_t retry_at = 0;
-      bool already_restarted = false;
-      const auto bridge_stalled = [&] {
-        const std::string manifest = ReadFile(live);
-        retry_at = EntryInteger(ManifestEntry(manifest, "studio_bridge"),
-                                "retry_at_monotonic_ns");
-        const auto history = ManifestRuns(manifest, "studio_bridge");
-        if (history.empty() ||
-            history[0].find("\"reason\": \"stalled\"") == std::string::npos) {
-          return false;
-        }
-        if (history.size() >= 2) {
-          already_restarted = true;
-          return true;
-        }
-        return retry_at > 0;
-      };
-      bool stalled = false;
-      for (int step = 0; step < 12 && !stalled; ++step) {
-        if (!AdvanceClockWithHealthyNodes(stop, clock, passes, session, now,
-                                          now + 250ms) ||
-            !observe_pass()) {
-          break;
-        }
-        stalled = bridge_stalled();
-      }
-      if (!stalled) stalled = WaitFor(stop, bridge_stalled);
-      const bool reached_restart_time =
-          stalled && (already_restarted ||
-                      AdvanceClockWithHealthyNodes(
-                          stop, clock, passes, session, now,
-                          SupervisionTime{std::chrono::nanoseconds{retry_at}}));
-      if (reached_restart_time) {
-        restarted = WaitFor(stop, [&] {
-          return ReadLines(bridge_runs).size() == 2 &&
-                 Registered("studio_bridge", session);
+      if (WaitFor(stop, [&] { return std::filesystem::exists(hung_ack); }) &&
+          observe_pass() &&
+          AdvanceClockWithHealthyNodes(stop, clock, passes, session, now,
+                                       start + kStudioBridgePeriod)) {
+        // Hold the clock at `start + kStudioBridgePeriod` (before the 50 ms
+        // restart backoff) until run 1 is reaped and ManifestWriter flushes
+        // `stalled` + `retry_at_monotonic_ns`: never keep stepping the clock
+        // while waiting on disk sync or child startup.
+        int64_t retry_at = 0;
+        const bool stalled = WaitFor(stop, [&] {
+          const std::string manifest = ReadFile(live);
+          retry_at = EntryInteger(ManifestEntry(manifest, "studio_bridge"),
+                                  "retry_at_monotonic_ns");
+          const auto history = ManifestRuns(manifest, "studio_bridge");
+          return history.size() == 1 &&
+                 history[0].find("\"reason\": \"stalled\"") !=
+                     std::string::npos &&
+                 retry_at > 0;
         });
+        // Advance exactly to `retry_at` and hold there until the restarted
+        // run registers its own live row (distinct from run 1's SIGKILLed
+        // row) and one supervision pass observes it.
+        if (stalled &&
+            AdvanceClockWithHealthyNodes(
+                stop, clock, passes, session, now,
+                SupervisionTime{std::chrono::nanoseconds{retry_at}})) {
+          restarted = WaitFor(stop,
+                              [&] {
+                                const auto lines = ReadLines(bridge_runs);
+                                if (lines.size() != 2) return false;
+                                return RegisteredPid("studio_bridge", session,
+                                                     ParsePidLine(lines[1]));
+                              }) &&
+                      observe_pass();
+        }
       }
     }
     ::kill(::getpid(), SIGTERM);
@@ -4797,7 +4853,8 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
     EXPECT_EQ(ManifestRuns(manifest, name).size(), 1u) << manifest;
   }
   std::filesystem::remove_all(options.output_dir);
-  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+  for (const auto* path : {&bridge_runs, &hang, &hung_ack})
+    ::remove(path->c_str());
 }
 
 // A Studio bridge that hangs on every run is killed as `stalled` and restarted
@@ -4856,8 +4913,14 @@ TEST(Supervision, RepeatedlyHangingStudioBridgeExhaustsRestartsAndIsLeft) {
              Registered("alpha", session) && Registered("beta", session);
     });
     for (std::size_t run = 1; nodes_up && run <= 3; ++run) {
-      if (!WaitFor(stop, [&] { return ReadLines(bridge_runs).size() == run; }))
+      if (!WaitFor(stop, [&] {
+            const auto lines = ReadLines(bridge_runs);
+            if (lines.size() != run) return false;
+            return RegisteredPid("studio_bridge", session,
+                                 ParsePidLine(lines[run - 1]));
+          })) {
         break;
+      }
       // Let one pass observe the registered bridge row at `now`.
       if (!observe_pass()) break;
       if (!AdvanceClockWithHealthyNodes(stop, clock, passes, session, now,
@@ -4924,7 +4987,9 @@ TEST(Supervision, RepeatedlyHangingStudioBridgeExhaustsRestartsAndIsLeft) {
 TEST(Supervision, StudioBridgeLivenessAloneWakesTheLoop) {
   const auto bridge_runs = TempPath("bridge_liveness_wake_runs");
   const auto hang = TempPath("bridge_liveness_wake_hang");
-  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+  const auto hung_ack = hang + ".hung";
+  for (const auto* path : {&bridge_runs, &hang, &hung_ack})
+    ::remove(path->c_str());
   auto options = BaseOptions("bridge_liveness_wake");
   options.duration_s = 3600;
   options.max_restarts = 0;
@@ -5012,7 +5077,8 @@ TEST(Supervision, StudioBridgeLivenessAloneWakesTheLoop) {
   EXPECT_NE(history[0].find("\"exit_signal\": 9"), std::string::npos)
       << history[0];
   std::filesystem::remove_all(options.output_dir);
-  for (const auto* path : {&bridge_runs, &hang}) ::remove(path->c_str());
+  for (const auto* path : {&bridge_runs, &hang, &hung_ack})
+    ::remove(path->c_str());
 }
 
 // The launcher passes --schedule-start-file <session>/sim_schedule_start to a
