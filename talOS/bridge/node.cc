@@ -877,8 +877,11 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     // clock mapping takes a State only when it opens a boot never seen or is
     // strictly newer than the last accepted one of its gateway boot without an
     // unconfirmed jump past elapsed bridge time + ClockOffsetEstimator's jitter
-    // and drift bound (two consecutive physically-consistent jump frames
-    // re-sync the anchor to recover from unseen-boot stall/tail-drop). A
+    // and drift bound (a subsequent State past the bound that is physically
+    // consistent with the pending candidate re-syncs the anchor to recover
+    // from unseen-boot stall/tail-drop; duplicates and reordered frames return
+    // early without clearing the candidate, while normal accepted frames or a
+    // boot change clear it). A
     // duplicate, a reordered frame (with whatever older epoch or enable edge it
     // carries), an isolated or inconsistent corrupt far-future timestamp, or a
     // datagram delayed from a retired boot is dropped whole, counted in

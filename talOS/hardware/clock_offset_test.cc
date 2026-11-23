@@ -2,11 +2,16 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <iterator>
 #include <limits>
+#include <random>
+#include <vector>
 
 namespace talos::hardware {
 namespace {
@@ -617,6 +622,243 @@ TEST(ClockOffset, JumpGuardAcceptsOutagesJitterAndNewBootWhileEnforcingBound) {
     EXPECT_TRUE(clock.Observe(6, 0, 10'010'000));
     EXPECT_FALSE(clock.Observe(6, 1'000'001, 10'010'000));
     EXPECT_TRUE(clock.Observe(6, 5'000, 10'015'000));
+  }
+}
+
+// Seeded property test for RT-29 (AGENTS.md verification #2): drives
+// ClockOffsetEstimator::Observe through a randomized physical model (5/10/20 ms
+// gateway periods, +-1000 ppm relative clock drift, FIFO socket buffers of
+// 64..4000 frames with tail-drop, unseen-boot stalls, bridge stalls, link
+// outages from 10 ms to ~3 h, held bursts, stall-then-dead-link, overloaded
+// bridge reading slower than arrival, and single corrupt frames across all 6
+// fault shapes).
+// Property A (no corruption): never refuses two legitimate frames in a row.
+// Property B (single corrupt frame during streaming): every injection recovers
+// and worst lockout stays <= 1.5 s.
+// REQ-RT-20
+TEST(
+    ClockOffset,
+    RandomizedPhysicalModelNeverRefusesTwoLegitFramesInARowAndBoundsCorruptLockout) {
+  struct Frame {
+    std::uint64_t sample_us;
+    bool corrupt;
+  };
+  struct RunStats {
+    std::uint64_t legit = 0;
+    std::uint64_t max_refused_run = 0;
+    std::uint64_t worst_lockout_us = 0;
+    std::uint64_t unrecovered = 0;
+    std::array<std::uint64_t, 6> corrupt_shapes{};
+  };
+
+  const auto run_boot = [](std::uint64_t seed, bool inject_corrupt,
+                           int events) -> RunStats {
+    RunStats stats;
+    Estimator est;
+    std::mt19937_64 rng{seed};
+    const auto uniform = [&](std::uint64_t lo, std::uint64_t hi) {
+      return std::uniform_int_distribution<std::uint64_t>{lo, hi}(rng);
+    };
+
+    const std::uint64_t boot =
+        uniform(1, std::numeric_limits<std::uint64_t>::max() - 1);
+    const double drift =
+        (static_cast<double>(uniform(0, 2000)) - 1000.0) * 1e-6;
+    const std::uint64_t g0 = uniform(0, 1) != 0
+                                 ? uniform(0, 5'000'000)
+                                 : uniform(0, 4'000'000'000'000ULL);
+    constexpr std::array<std::uint64_t, 4> kPeriods = {5'000, 5'000, 10'000,
+                                                       20'000};
+    constexpr std::array<std::size_t, 4> kCaps = {64, 200, 1000, 4000};
+    const std::uint64_t period =
+        kPeriods[static_cast<std::size_t>(uniform(0, kPeriods.size() - 1))];
+    const std::size_t cap =
+        kCaps[static_cast<std::size_t>(uniform(0, kCaps.size() - 1))];
+    const auto gclock = [&](std::uint64_t bridge_t) {
+      const auto drift_us =
+          static_cast<std::int64_t>(static_cast<double>(bridge_t) * drift);
+      return drift_us >= 0
+                 ? g0 + bridge_t + static_cast<std::uint64_t>(drift_us)
+                 : g0 + bridge_t - static_cast<std::uint64_t>(-drift_us);
+    };
+
+    std::uint64_t t = uniform(1'000'000, 50'000'000);
+    std::uint64_t refused_run = 0;
+    std::uint64_t last_receipt_us = 0;
+    bool lockout_active = false;
+    std::uint64_t lockout_from_us = 0;
+
+    const auto deliver = [&](const Frame& frame, std::uint64_t receipt_us) {
+      receipt_us = std::max(receipt_us, last_receipt_us + 1);
+      last_receipt_us = receipt_us;
+      const bool accepted = est.Observe(boot, frame.sample_us, receipt_us);
+      if (frame.corrupt) return;
+      ++stats.legit;
+      if (!inject_corrupt) {
+        if (!accepted) {
+          ++refused_run;
+          stats.max_refused_run = std::max(stats.max_refused_run, refused_run);
+        } else {
+          refused_run = 0;
+        }
+      } else if (lockout_active && accepted) {
+        const std::uint64_t lockout_us =
+            receipt_us > lockout_from_us ? receipt_us - lockout_from_us : 0;
+        stats.worst_lockout_us = std::max(stats.worst_lockout_us, lockout_us);
+        lockout_active = false;
+      }
+    };
+
+    const auto stream = [&](std::uint64_t dur_us) {
+      const std::uint64_t end = t + dur_us;
+      for (; t < end; t += period) {
+        deliver({gclock(t), false}, t + uniform(50, 2'000));
+      }
+    };
+
+    // Models a FIFO socket buffer of capacity `cap` filling during a stall and
+    // tail-dropping subsequent frames without iterating over dropped ticks.
+    const auto buffer_stall = [&](std::uint64_t dur_us) {
+      std::deque<Frame> queue;
+      const std::uint64_t ticks = (dur_us + period - 1) / period;
+      const std::uint64_t buffered =
+          std::min<std::uint64_t>(ticks, static_cast<std::uint64_t>(cap));
+      for (std::uint64_t i = 0; i < buffered; ++i) {
+        queue.push_back({gclock(t + i * period), false});
+      }
+      t += ticks * period;
+      return queue;
+    };
+
+    const auto drain = [&](const auto& frames) {
+      std::uint64_t r = t;
+      for (const Frame& frame : frames) {
+        r += uniform(5, 40);
+        deliver(frame, r);
+      }
+    };
+
+    if (uniform(0, 2) == 0) {
+      // Unseen-boot stall: first frames drained late, tail dropped.
+      drain(buffer_stall(uniform(10'000, 30'000'000)));
+    }
+    stream(uniform(100'000, 3'000'000));
+
+    for (int e = 0; e < events; ++e) {
+      std::uint64_t kind = uniform(0, inject_corrupt ? 5 : 4);
+      if (!inject_corrupt && kind == 4) kind = 5;
+      // Log-uniform durations from 10 ms to ~2.8 h (~10,000 s).
+      const auto dur = static_cast<std::uint64_t>(
+          10'000.0 * std::pow(1'000'000.0,
+                              static_cast<double>(uniform(0, 1000)) / 1000.0));
+      if (kind == 0) {
+        // Bridge stall: buffer fills, tail-drop, drain at once.
+        drain(buffer_stall(dur));
+      } else if (kind == 1) {
+        // Link outage: frames lost.
+        t += dur - dur % period;
+      } else if (kind == 2) {
+        // Held burst: path holds every frame, then delivers at once.
+        std::vector<Frame> held;
+        const std::uint64_t end = t + std::min<std::uint64_t>(dur, 30'000'000);
+        for (; t < end; t += period) held.push_back({gclock(t), false});
+        drain(held);
+      } else if (kind == 3) {
+        // Stall followed by a dead link before the buffered frames drain.
+        const std::deque<Frame> queue =
+            buffer_stall(std::min<std::uint64_t>(dur, 20'000'000));
+        t += uniform(0, 5'000'000);
+        drain(queue);
+      } else if (kind == 5) {
+        // Overloaded bridge: reads slower than frames arrive while buffer stays
+        // full, then load ends and remaining frames drain at once.
+        std::deque<Frame> queue = buffer_stall(uniform(1'000'000, 8'000'000));
+        const std::uint64_t gap = period + uniform(0, 2 * period);
+        const std::uint64_t end = t + std::min<std::uint64_t>(dur, 60'000'000);
+        std::uint64_t next_read = t;
+        for (; t < end; t += period) {
+          if (queue.size() < cap) queue.push_back({gclock(t), false});
+          while (!queue.empty() && next_read <= t) {
+            deliver(queue.front(), next_read);
+            queue.pop_front();
+            next_read += gap;
+          }
+        }
+        drain(queue);
+      } else {
+        // Single corrupt frame covering all 6 fault shapes.
+        const std::uint64_t now_s = gclock(t);
+        const std::uint64_t shape = uniform(0, 5);
+        ++stats.corrupt_shapes[static_cast<std::size_t>(shape)];
+        std::uint64_t corrupt_s = 0;
+        switch (shape) {
+          case 0:
+            corrupt_s = now_s + uniform(1, 900'000);
+            break;
+          case 1:
+            corrupt_s = now_s + uniform(900'000, 1'100'000);
+            break;
+          case 2:
+            corrupt_s = now_s + uniform(1'100'000, 3'600'000'000ULL);
+            break;
+          case 3:
+            corrupt_s = std::numeric_limits<std::uint64_t>::max();
+            break;
+          case 4:
+            corrupt_s = now_s | (std::uint64_t{1} << uniform(20, 63));
+            break;
+          default:
+            corrupt_s = now_s > 5'000'000 ? now_s - uniform(1, 5'000'000) : 0;
+            break;
+        }
+        lockout_active = true;
+        lockout_from_us = t;
+        deliver({corrupt_s, true}, t + uniform(50, 2'000));
+        t += period;
+      }
+
+      stream(inject_corrupt ? uniform(5'000'000, 20'000'000)
+                            : uniform(20'000, 5'000'000));
+      if (inject_corrupt && lockout_active) {
+        ++stats.unrecovered;
+        lockout_active = false;
+      }
+    }
+    return stats;
+  };
+
+  constexpr std::uint64_t kBoots = 40;
+  constexpr int kEventsPerBoot = 15;
+  std::uint64_t total_legit_a = 0;
+  std::uint64_t worst_refused_run = 0;
+  std::uint64_t worst_lockout_us = 0;
+  std::uint64_t total_unrecovered = 0;
+  std::array<std::uint64_t, 6> shape_counts{};
+
+  for (std::uint64_t seed = 1; seed <= kBoots; ++seed) {
+    const RunStats prop_a =
+        run_boot(seed, /*inject_corrupt=*/false, kEventsPerBoot);
+    total_legit_a += prop_a.legit;
+    worst_refused_run = std::max(worst_refused_run, prop_a.max_refused_run);
+    EXPECT_LE(prop_a.max_refused_run, 1u) << "seed " << seed;
+
+    const RunStats prop_b =
+        run_boot(seed + 1'000'000, /*inject_corrupt=*/true, kEventsPerBoot);
+    worst_lockout_us = std::max(worst_lockout_us, prop_b.worst_lockout_us);
+    total_unrecovered += prop_b.unrecovered;
+    for (std::size_t i = 0; i < shape_counts.size(); ++i) {
+      shape_counts[i] += prop_b.corrupt_shapes[i];
+    }
+    EXPECT_EQ(prop_b.unrecovered, 0u) << "seed " << seed;
+    EXPECT_LE(prop_b.worst_lockout_us, 1'500'000u) << "seed " << seed;
+  }
+
+  EXPECT_GT(total_legit_a, 0u);
+  EXPECT_LE(worst_refused_run, 1u);
+  EXPECT_EQ(total_unrecovered, 0u);
+  EXPECT_LE(worst_lockout_us, 1'500'000u);
+  for (std::size_t i = 0; i < shape_counts.size(); ++i) {
+    EXPECT_GT(shape_counts[i], 0u) << "corrupt fault shape " << i;
   }
 }
 

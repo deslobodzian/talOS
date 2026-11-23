@@ -547,9 +547,14 @@ accuracy threshold is specified: measure uncertainty against fusion requirements
 on the bench. New boots reset the mapping; reordered, retired-boot, and
 isolated or inconsistent far-future `sample_time_us` States (exceeding elapsed
 bridge time plus `ClockOffsetEstimator`'s 1 s jitter margin and 2000 ppm drift
-bound without a consecutive consistent live frame to re-sync; see
-[`talOS/bridge/README.md`](../bridge/README.md#state-ordering-and-forward-jump-gate))
-are dropped whole and counted in `clock_ignored_count`.
+bound without the next `State` past the bound confirming it at a consistent
+rate) are dropped whole and counted in `clock_ignored_count`. A single corrupt
+`State` inside the `1 s + 0.2% * receipt_delta` bound, or two far-future
+`State` frames past the bound that agree within 2000 ppm + 1 s, is accepted and
+blanks the link until real gateway time catches up (or, for a confirmed
+far-future pair, until reboot); see
+[`talOS/bridge/README.md`](../bridge/README.md#state-ordering-and-forward-jump-gate)
+for the exact formula and trade-off.
 
 Driver Station disable/e-stop, command timeout, or total backend feedback loss
 neutralizes outputs. Outside pending asynchronous configuration, neutral is

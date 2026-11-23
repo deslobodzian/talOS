@@ -56,12 +56,13 @@
 // elapsed bridge time plus kMaxSampleJumpMarginUs (1 s) and
 // 1 / kMaxClockDriftDivisor (2000 ppm, twice the 1000 ppm relative oscillator
 // drift assumed above) of elapsed bridge time allows is held as a single-slot
-// jump candidate and ignored; any normal accepted sample clears that
-// candidate, while a second consecutive jump sample strictly advancing past
+// jump candidate and ignored; any normal accepted sample or boot change clears
+// that candidate (a duplicate or reordered sample returns early before
+// touching it), while the next sample past the bound strictly advancing past
 // the candidate with non-decreasing bridge receipt time and a symmetrically
 // consistent physical clock rate re-syncs the anchor and is accepted (so an
 // unseen-boot SIGSTOP / SO_RCVBUF tail-drop recovers on the second live frame
-// while isolated or inconsistent corrupt timestamps cannot lock out the boot).
+// while isolated or inconsistent far-future timestamps are ignored).
 // On normal accepted frames, the anchor advances immediately only when the
 // sample is at least as prompt as it (sample_delta >= receipt_delta), so a
 // delayed buffered frame after a long outage never pulls the anchor back; when
@@ -167,8 +168,10 @@ class ClockOffsetEstimator {
   std::uint64_t next_anchor_since_us_{0};
   std::size_t next_anchor_count_{0};
   // Single-slot forward-jump candidate: holds the most recent rejected
-  // far-future sample until cleared by a normal accepted sample, a new boot,
-  // or confirmed by a consecutive physically-consistent sample.
+  // far-future sample until cleared by a normal accepted sample or a new boot
+  // (duplicates and reordered samples return early without touching it), or
+  // confirmed by the next sample past the bound at a physically consistent
+  // rate.
   bool has_jump_candidate_{false};
   std::uint64_t jump_sample_us_{0};
   std::uint64_t jump_receipt_us_{0};
