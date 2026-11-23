@@ -150,8 +150,12 @@ class Sim:
         equal to every node's now_ns."""
         return _abi.value(lib.talos_sim_now_ns(self._handle), 0)
 
-    def publish(self, msg, topic, message=None, **fields):
+    def publish(self, msg, topic, message=None, /, **fields):
         """Publishes on `topic`, like Publisher.send."""
+        if message is not None and fields:
+            raise TypeError(
+                "publish() takes either a message or field keyword arguments, "
+                "not both")
         mtype = message_type(msg)
         data = mtype.forward(message) if message is not None else (
             mtype.encode(fields))
@@ -174,12 +178,16 @@ class Sim:
         return _abi.value(
             lib.talos_sim_driver_station_generation(self._handle), 0)
 
-    def publish_target(self, msg, subsystem, source, message=None, *,
+    def publish_target(self, msg, subsystem, source, message=None, /, *,
                        mode_since_us=None, **fields):
         """Publishes an active target on /<subsystem>/target/<source>, as a
         talos.TargetLane would: stamped with driver_station_generation, or
         with `mode_since_us` for a producer that has not seen the current
         mode (a target queued from an earlier one, a stale view: 0)."""
+        if message is not None and fields:
+            raise TypeError(
+                "publish_target() takes either a message or field keyword "
+                "arguments, not both")
         mtype = message_type(msg)
         data = mtype.forward(message) if message is not None else (
             mtype.encode(fields))

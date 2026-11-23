@@ -492,6 +492,13 @@ can_id = 2
        "max_rot = 1.0\nhoming_stall_rps = 0.1\nhoming_v = -1.0\n"
        "homing_stall_us = 50000\nhoming_stall_current_a = 20.0\n"
        "homing_min_push_us = 50000\n"},
+      {"homing_timeout_us",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_timeout_us = 18446744073709552\n"
+       "homing_stall_rps = 0.1\nhoming_v = -1.0\n"
+       "homing_stall_us = 50000\nhoming_stall_current_a = 20.0\n"
+       "homing_min_push_us = 50000\nhoming_min_travel_rot = 0.05\n"},
+      {"at_goal_debounce_us", ok + "at_goal_debounce_us = 9223372036854776\n"},
       {"gravity", ok + "gravity = \"down\"\n"},
       // A homed mechanism needs a finite travel.
       {"max_rot",

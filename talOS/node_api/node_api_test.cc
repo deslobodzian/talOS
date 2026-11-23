@@ -251,6 +251,51 @@ TEST_F(NodeApi, ATopicRefusesAnEndpointOfAnotherSchema) {
   EXPECT_EQ(talos_node_publish(nullptr, "/x/state", 8, nullptr), -1);
 }
 
+// REQ-CONTRACT-13: Schema accepts bfbs == nullptr with bfbs_size == 0 without
+// constructing std::string(nullptr, 0) (UB), accepts non-empty bfbs, and
+// refuses null schema, null name, or null bfbs with nonzero size.
+TEST_F(NodeApi, SchemaValidatesNullFieldsAndEmptyBfbs) {
+  struct Probe {
+    int64_t null_schema = 0;
+    int64_t null_name = 0;
+    int64_t null_bfbs_nonzero = 0;
+    std::string null_bfbs_error;
+    int64_t empty_bfbs = -1;
+    int64_t non_empty_bfbs = -1;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& p = *static_cast<Probe*>(user);
+    p.null_schema =
+        talos_node_publish(node, "/probe/a", sizeof(Value), nullptr);
+    constexpr TalosSchema kNullName{nullptr, 1u, nullptr, 0};
+    p.null_name =
+        talos_node_publish(node, "/probe/b", sizeof(Value), &kNullName);
+    constexpr TalosSchema kNullBfbsNonZero{"node_api_test.Bad", 1u, nullptr, 4};
+    p.null_bfbs_nonzero =
+        talos_node_publish(node, "/probe/c", sizeof(Value), &kNullBfbsNonZero);
+    p.null_bfbs_error = talos_last_error();
+    constexpr TalosSchema kEmptyBfbs{"node_api_test.Empty", 2u, nullptr, 0};
+    p.empty_bfbs =
+        talos_node_publish(node, "/probe/d", sizeof(Value), &kEmptyBfbs);
+    static constexpr uint8_t kBfbsBytes[4] = {'B', 'F', 'B', 'S'};
+    constexpr TalosSchema kWithBfbs{"node_api_test.WithBfbs", 3u, kBfbsBytes,
+                                    sizeof kBfbsBytes};
+    p.non_empty_bfbs =
+        talos_node_publish(node, "/probe/e", sizeof(Value), &kWithBfbs);
+    return 0;
+  };
+  Probe probe;
+  ASSERT_NE(talos_sim_add(sim_, "probe", build, &probe), nullptr)
+      << talos_last_error();
+  EXPECT_EQ(probe.null_schema, -1);
+  EXPECT_EQ(probe.null_name, -1);
+  EXPECT_EQ(probe.null_bfbs_nonzero, -1);
+  EXPECT_NE(probe.null_bfbs_error.find("bfbs"), std::string::npos)
+      << probe.null_bfbs_error;
+  EXPECT_GE(probe.empty_bfbs, 0);
+  EXPECT_GE(probe.non_empty_bfbs, 0);
+}
+
 TEST_F(NodeApi, ParamsRejectMissingAndMistypedValues) {
   Relay relay;
   TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &relay);

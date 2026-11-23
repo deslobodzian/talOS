@@ -252,7 +252,9 @@ TalosJoystick JoystickOf(const Joystick& joystick) {
   }
   for (int i = 0; i < TALOS_DS_MAX_POVS; ++i) out.povs[i] = joystick.pov(i);
   const std::string_view name = joystick.name();
-  std::memcpy(out.name, name.data(), std::min(name.size(), sizeof out.name));
+  if (!name.empty()) {
+    std::memcpy(out.name, name.data(), std::min(name.size(), sizeof out.name));
+  }
   return out;
 }
 
@@ -467,7 +469,10 @@ static talos::schema::Identity Schema(const TalosSchema* schema) {
   }
   return talos::schema::Identity{
       schema->name, schema->hash,
-      std::string{static_cast<const char*>(schema->bfbs), schema->bfbs_size}};
+      schema->bfbs_size == 0
+          ? std::string{}
+          : std::string{static_cast<const char*>(schema->bfbs),
+                        schema->bfbs_size}};
 }
 
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
