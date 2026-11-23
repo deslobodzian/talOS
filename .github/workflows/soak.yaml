@@ -1,6 +1,7 @@
 # Minutes of the bench's simulated graph under SIGKILL/SIGSTOP chaos
 # (bench/main_processor/simulation/README.md). Called by
-# continuous-integration.yaml (Linux, every push) and nightly.yaml (macOS).
+# continuous-integration.yaml (Linux, every push) and nightly.yaml (Linux and
+# macOS, multi-seed matrix).
 # The target is `manual`, so `bazel test //...` never runs it.
 name: Soak
 

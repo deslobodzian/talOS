@@ -1,9 +1,9 @@
-# Checks that hosted macOS cannot run on every push without failing on the
-# runner rather than the code: the sanitizer legs (fork costs about 30 ms
-# under ASan and 375 ms under TSan there) and the full-graph soak (the graph
-# needs about 2.5 of the runner's 3 shared vCPUs). Nightly on main, and on
-# demand for any branch (Actions > Nightly > Run workflow). A failure here
-# does not block a merge; it is a TODO.md entry.
+# Checks that run nightly on main (and on demand for any branch via Actions >
+# Nightly > Run workflow): hosted macOS sanitizer legs (fork costs about 30 ms
+# under ASan and 375 ms under TSan there), and multi-seed full-graph soaks on
+# both Linux and macOS (seeds 0, 1, 2; on macOS the graph needs about 2.5 of
+# the runner's 3 shared vCPUs). A failure here does not block a merge; it is a
+# TODO.md entry.
 name: Nightly
 on:
   schedule:
@@ -73,9 +73,26 @@ jobs:
         path: ${{ runner.temp }}/failed-tests/
         if-no-files-found: ignore
 
+  linux-soak:
+    # Multi-seed Linux soak (CI-3): exercises distinct deterministic fault
+    # orders beyond the single per-push seed in continuous-integration.yaml.
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ['0', '1', '2']
+    uses: ./.github/workflows/soak.yaml
+    with:
+      os: ubuntu-latest
+      seed: ${{ matrix.seed }}
+
   macos-soak:
-    # Seed 1, the order main's per-push Linux soak runs.
+    # Multi-seed macOS soak (CI-3): exercises distinct deterministic fault
+    # orders on macOS nightly.
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ['0', '1', '2']
     uses: ./.github/workflows/soak.yaml
     with:
       os: macos-latest
-      seed: '1'
+      seed: ${{ matrix.seed }}
