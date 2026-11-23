@@ -2584,34 +2584,64 @@ class PhoenixBackendPeakVoltage : public PhoenixBackendTorque {};
 
 // The TalonFX's peak voltage, which holds every voltage-based request
 // (VoltageOut, VelocityVoltage, PositionVoltage, MotionMagicVoltage) to
-// max_voltage on the device: configured at ±max_voltage, and applied again
-// by the restore after a reset returned the device to Phoenix's defaults.
+// max_voltage on the device: configured at ±max_voltage on every motor
+// (independent, master, and follower), and applied again by the restore
+// after a reset returned each device to Phoenix's defaults.
 // REQ-SAFE-44
 TEST_F(PhoenixBackendPeakVoltage, IsMaxVoltageAfterConfigureAndRestore) {
   EnsureHal();
   hw::Config config;
-  auto motor = TestMotor(1, "roller", 1);
-  motor.max_voltage = 2.0;
-  config.motors.push_back(motor);
+  auto master = TestMotor(1, "roller", 1);
+  master.max_voltage = 2.0;
+  auto follower = TestMotor(2, "roller_follower", 2);
+  follower.master_id = master.id;
+  follower.max_voltage = 3.5;
+  auto independent = TestMotor(3, "intake", 3);
+  independent.max_voltage = 5.0;
+  config.motors = {master, follower, independent};
   PhoenixBackend backend(true);
   ASSERT_TRUE(backend.Configure(config));
   ASSERT_TRUE(AwaitReady(backend, config));
-  ctre::phoenix6::configs::TalonFXConfiguration applied;
-  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
-  EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), 2.0);
-  EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -2.0);
+
+  const auto expect_peak_voltage = [&](std::size_t i, double volts,
+                                       std::string_view when) {
+    ctre::phoenix6::configs::TalonFXConfiguration applied;
+    ASSERT_TRUE(AppliedConfig(backend, i, applied))
+        << config.motors[i].name << " " << when;
+    EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), volts)
+        << config.motors[i].name << " " << when;
+    EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -volts)
+        << config.motors[i].name << " " << when;
+  };
+
+  expect_peak_voltage(0, 2.0, "after configure");
+  expect_peak_voltage(1, 3.5, "after configure");
+  expect_peak_voltage(2, 5.0, "after configure");
 
   const ctre::phoenix6::configs::TalonFXConfiguration defaults;
-  ASSERT_TRUE(AwaitAnswer([&] {
-                return Motor(backend, 0).GetConfigurator().Apply(defaults);
-              }).IsOK());
-  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
-  ASSERT_NE(applied.Voltage.PeakForwardVoltage.value(), 2.0) << "not reset";
-  const std::array<uint16_t, 1> ids{1};
-  ASSERT_TRUE(RestorePass(backend, ids));
-  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
-  EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), 2.0);
-  EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -2.0);
+  for (std::size_t i = 0; i < config.motors.size(); ++i) {
+    ASSERT_TRUE(AwaitAnswer([&] {
+                  return Motor(backend, i).GetConfigurator().Apply(defaults);
+                }).IsOK())
+        << config.motors[i].name;
+    ctre::phoenix6::configs::TalonFXConfiguration applied;
+    ASSERT_TRUE(AppliedConfig(backend, i, applied)) << config.motors[i].name;
+    ASSERT_NE(applied.Voltage.PeakForwardVoltage.value(),
+              config.motors[i].max_voltage)
+        << config.motors[i].name << " not reset";
+    ASSERT_NE(applied.Voltage.PeakReverseVoltage.value(),
+              -config.motors[i].max_voltage)
+        << config.motors[i].name << " not reset";
+  }
+
+  // Restore the follower on its own first so a restore path that skips
+  // followers fails even if restoring the master would re-apply its chain.
+  ASSERT_TRUE(RestorePass(backend, std::array<uint16_t, 1>{follower.id}));
+  expect_peak_voltage(1, 3.5, "after follower restore");
+  ASSERT_TRUE(
+      RestorePass(backend, std::array<uint16_t, 2>{master.id, independent.id}));
+  expect_peak_voltage(0, 2.0, "after master restore");
+  expect_peak_voltage(2, 5.0, "after independent restore");
 }
 
 // Asynchronous configuration runs on a worker thread and is polled on the
