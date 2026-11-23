@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -72,6 +73,10 @@ class Flattener {
       const std::string field_name = field_def->name()->str();
       const std::string channel_name = std::string{prefix} + "/" + field_name;
       const auto& type = *field_def->type();
+      if (field_def->offset() >
+          std::numeric_limits<std::size_t>::max() - base_offset) {
+        Refuse(field_name, "offset overflows");
+      }
       const std::size_t field_offset = base_offset + field_def->offset();
 
       if (type.base_type() == reflection::BaseType::Obj) {
@@ -85,12 +90,28 @@ class Flattener {
         const bool nested = type.element() == reflection::BaseType::Obj;
         const std::size_t element =
             nested ? ObjectIndex(type.index(), field_name) : 0;
-        const std::size_t element_bytes =
-            nested ? static_cast<std::size_t>(
-                         schema_.objects()
-                             ->Get(static_cast<flatbuffers::uoffset_t>(element))
-                             ->bytesize())
-                   : flatbuffers::GetTypeSize(type.element());
+        std::size_t element_bytes = 0;
+        if (nested) {
+          const std::int32_t raw_bytesize =
+              schema_.objects()
+                  ->Get(static_cast<flatbuffers::uoffset_t>(element))
+                  ->bytesize();
+          if (raw_bytesize <= 0) {
+            Refuse(field_name, "has non-positive struct element size");
+          }
+          element_bytes = static_cast<std::size_t>(raw_bytesize);
+        } else {
+          element_bytes = schema::ScalarSize(type.element());
+          if (element_bytes == 0) {
+            Refuse(field_name, "has non-scalar array element type");
+          }
+        }
+        if (count > 0 &&
+            element_bytes >
+                (std::numeric_limits<std::size_t>::max() - field_offset) /
+                    count) {
+          Refuse(field_name, "array offset overflows");
+        }
         for (std::size_t i = 0; i < count; ++i) {
           const std::string element_name =
               channel_name + "/" + std::to_string(i);
@@ -106,6 +127,9 @@ class Flattener {
         continue;
       }
 
+      if (schema::ScalarSize(type.base_type()) == 0) {
+        Refuse(field_name, "has non-scalar field type");
+      }
       AddScalar(type.base_type(), type.index(), field_name, channel_name,
                 field_offset, true);
     }
@@ -268,6 +292,12 @@ std::vector<Channel> EnvelopeChannels(std::string_view topic,
   channels.push_back(std::move(active));
   for (Channel& channel :
        FlattenTopic(std::string{topic} + "/message", inner, bfbs)) {
+    if (channel.offset > std::numeric_limits<std::size_t>::max() -
+                             schema::kEnvelopeHeaderBytes) {
+      throw std::invalid_argument("telemetry: schema for topic '" +
+                                  std::string{topic} +
+                                  "': envelope offset overflows");
+    }
     channel.offset += schema::kEnvelopeHeaderBytes;
     channels.push_back(std::move(channel));
   }

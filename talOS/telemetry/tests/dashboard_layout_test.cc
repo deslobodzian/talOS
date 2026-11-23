@@ -205,6 +205,29 @@ TEST(DashboardLayoutTest, RefusesAnInvalidLayoutNamingFileIndexAndKey) {
        "[dashboard]\nrows = 4\n[[widgets]]\nkind = \"match\"\nat = [0, 3, 1, "
        "2]\n",
        "widgets[0].at"},
+      {"cell column + width overflows int64",
+       first +
+           "[[widgets]]\nkind = \"match\"\nat = [9223372036854775807, 0, 1, "
+           "1]\n",
+       "widgets[1].at"},
+      {"cell row + height overflows int64",
+       first +
+           "[[widgets]]\nkind = \"match\"\nat = [0, 9223372036854775807, 1, "
+           "1]\n",
+       "widgets[1].at"},
+      {"cell width overflows column + width",
+       first +
+           "[[widgets]]\nkind = \"match\"\nat = [1, 0, 9223372036854775807, "
+           "1]\n",
+       "widgets[1].at"},
+      {"cell height overflows row + height",
+       first + "[[widgets]]\nkind = \"match\"\nat = [0, 1, 1, "
+               "9223372036854775807]\n",
+       "widgets[1].at"},
+      {"cell column and width sum past INT64_MAX",
+       first + "[[widgets]]\nkind = \"match\"\nat = [4611686018427387904, 0, "
+               "4611686018427387904, 1]\n",
+       "widgets[1].at"},
       {"empty cell",
        first + "[[widgets]]\nkind = \"match\"\nat = [2, 0, 0, 1]\n",
        "widgets[1].at"},
