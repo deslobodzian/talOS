@@ -245,16 +245,26 @@ py_test(
     size = "small",
     srcs = ["descriptor_gen_lint_test.py"],
     data = [
+        "contract.bzl",
         "lint_fixtures/bad.bfbs",
         "lint_fixtures/good.bfbs",
         "lint_fixtures/included.bfbs",
+        "testdata/lint_test/bad.fbs",
+        "testdata/lint_test/good.fbs",
+        "testdata/lint_test/included.fbs",
         ":descriptor_gen",
+        "@flatbuffers//:flatc",
     ],
     env = {
+        "TALOS_CONTRACT_BZL": "$(rlocationpath contract.bzl)",
         "TALOS_DESCRIPTOR_GEN": "$(rlocationpath :descriptor_gen)",
+        "TALOS_FLATC": "$(rlocationpath @flatbuffers//:flatc)",
         "TALOS_LINT_BAD": "$(rlocationpath lint_fixtures/bad.bfbs)",
+        "TALOS_LINT_BAD_FBS": "$(rlocationpath testdata/lint_test/bad.fbs)",
         "TALOS_LINT_GOOD": "$(rlocationpath lint_fixtures/good.bfbs)",
+        "TALOS_LINT_GOOD_FBS": "$(rlocationpath testdata/lint_test/good.fbs)",
         "TALOS_LINT_INCLUDED": "$(rlocationpath lint_fixtures/included.bfbs)",
+        "TALOS_LINT_INCLUDED_FBS": "$(rlocationpath testdata/lint_test/included.fbs)",
     },
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
@@ -264,8 +274,8 @@ py_test(
 # authority is naming::CheckTopicName. Each line of the verdicts file is
 # `<kind> <entry> <ok|bad> <topic>`: a `name` probe for each name below, and
 # one probe per role, abbreviation (`<wrong>><right>`) and direction suffix
-# in contract.bzl's tables, so the test also sees an entry either side adds
-# or drops.
+# in contract.bzl's tables (in both qualifier and owner positions), so the
+# test also sees an entry either side adds or drops.
 _GRAMMAR_NAMES = [
     "/hw/state",
     "/hw/state/driver_station",
@@ -307,9 +317,23 @@ _GRAMMAR_PROBES = [("name", "-", topic) for topic in _GRAMMAR_NAMES] + [
     for wrong, right in TALOS_TOPIC_ABBREVIATIONS.items()
 ] + [
     (
+        "owner_abbreviation",
+        wrong + ">" + right,
+        "/" + wrong + "/state",
+    )
+    for wrong, right in TALOS_TOPIC_ABBREVIATIONS.items()
+] + [
+    (
         "suffix",
         suffix,
         "/hw/state/x" + suffix,
+    )
+    for suffix in TALOS_TOPIC_DIRECTION_SUFFIXES
+] + [
+    (
+        "owner_suffix",
+        suffix,
+        "/x" + suffix + "/state",
     )
     for suffix in TALOS_TOPIC_DIRECTION_SUFFIXES
 ]

@@ -1,0 +1,15 @@
+// float_level.fbs with Reading's fields reordered: same size (8),
+// alignment (4), names and types, different field offsets.
+namespace schema_variant;
+
+enum Kind : ubyte { RAW, FILTERED }
+
+struct Reading {
+  kind:Kind;
+  ok:bool;
+  level_m:float;
+}
+
+struct Holder {
+  reading:Reading;
+}

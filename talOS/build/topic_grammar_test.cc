@@ -79,6 +79,7 @@ TEST(TopicGrammar, StarlarkAgreesWithCheckTopicName) {
   EXPECT_GE(rejected, 10);
 }
 
+// REQ-CONTRACT-08
 TEST(TopicGrammar, StarlarkTablesMatchNamesH) {
   const std::vector<Probe> probes = ReadProbes();
 
@@ -93,10 +94,13 @@ TEST(TopicGrammar, StarlarkTablesMatchNamesH) {
   }
   EXPECT_EQ(Entries(probes, "abbreviation", /*expect_ok=*/false),
             abbreviations);
+  EXPECT_EQ(Entries(probes, "owner_abbreviation", /*expect_ok=*/false),
+            abbreviations);
 
   std::set<std::string> suffixes;
   for (const auto suffix : naming::kDirectionSuffixes) suffixes.emplace(suffix);
   EXPECT_EQ(Entries(probes, "suffix", /*expect_ok=*/false), suffixes);
+  EXPECT_EQ(Entries(probes, "owner_suffix", /*expect_ok=*/false), suffixes);
 }
 
 }  // namespace

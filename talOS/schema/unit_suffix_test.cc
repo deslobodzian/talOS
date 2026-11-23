@@ -7,6 +7,7 @@
 namespace talos::schema {
 namespace {
 
+// REQ-CONTRACT-08
 TEST(UnitSuffixTest, SuffixTableMatchesMethodology) {
   const struct {
     const char* field;
@@ -32,6 +33,7 @@ TEST(UnitSuffixTest, SuffixTableMatchesMethodology) {
   }
 }
 
+// REQ-CONTRACT-08
 TEST(UnitSuffixTest, RejectsInvalidNames) {
   EXPECT_FALSE(has_unit_suffix(""));
   EXPECT_FALSE(has_unit_suffix("count"));
