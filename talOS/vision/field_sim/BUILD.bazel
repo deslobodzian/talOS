@@ -12,17 +12,24 @@ cc_library(
     srcs = ["field_layout_loader.cc"],
     hdrs = [
         "field_layout_loader.h",
-        "json_parser.h",
         "sim_camera.h",
         "tag_rasterizer.h",
     ],
     deps = [
+        ":json_parser",
         "//talOS/geometry",
         "//talOS/vision:calibration",
         "@eigen3//:eigen",
         "@opencv//:core",
         "@opencv//:imgproc",
     ],
+)
+
+# The dependency-free JSON reader, also used for its string decoding by the
+# frame recording sidecar parser, which needs none of field_sim's OpenCV.
+cc_library(
+    name = "json_parser",
+    hdrs = ["json_parser.h"],
 )
 
 cc_test(
