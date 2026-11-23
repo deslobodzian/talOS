@@ -4198,6 +4198,22 @@ def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
     if talos:
         build = ("  bazel test //...    # the graph test and manifest check "
                  "of the robot repository")
+    else:
+        build = (f"  bazel build //talOS/launcher //talOS/bridge:hardware_node "
+                 f"//{layout.packages}/...")
+    launcher = f"{talos}//talOS/launcher"
+    # An estimator owns no device, so it has no teleop button (`button` is
+    # None) and its next steps run no joystick-driven simulation.
+    if can_id is None:
+        return f"""\
+Next:
+  bazel test {package}:all
+{build}
+  bazel run {launcher} -- --config $PWD/{layout.config} --describe-only
+  {subsystem}
+    List the camera nodes in `cameras`; point telemetry at the pose with
+    [studio] pose_topic = "/{name}/state"."""
+    if talos:
         if sim_target == sim_path:
             run = f"  {dependent_sim_run(button)}"
         else:
@@ -4213,21 +4229,9 @@ def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
         checks = ("nothing reads until that BUILD has a manifest_sync_test "
                   "and talos_graph_test of it")
     else:
-        build = (f"  bazel build //talOS/launcher //talOS/bridge:hardware_node "
-                 f"//{layout.packages}/...")
         run = f"  ./sim.sh --config {sim_path} {sim_run(button)}"
         sync = "bazel run //tools:sync_manifest --"
         checks = "./sim.sh checks"
-    launcher = f"{talos}//talOS/launcher"
-    if can_id is None:  # an estimator
-        return f"""\
-Next:
-  bazel test {package}:all
-{build}
-  bazel run {launcher} -- --config $PWD/{layout.config} --describe-only
-  {subsystem}
-    List the camera nodes in `cameras`; point telemetry at the pose with
-    [studio] pose_topic = "/{name}/state"."""
     lines = simulation_block(name, kind, button, raw,
                              posixpath.basename(layout.config))
     if sim_exists:
