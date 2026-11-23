@@ -173,6 +173,17 @@ struct LogWriterOptions {
   // its mutex); a test holds it there to stand for a disk that does not
   // return. Empty otherwise.
   std::function<void()> before_write;
+
+  // Tests only: called by drain() after marking the writer as flushing and
+  // before waiting on the writer thread, so a test holding the writer in
+  // before_write can release it deterministically once flush() has begun.
+  // Empty otherwise.
+  std::function<void()> before_flush_wait;
+
+  // Tests only: optional OS syscall seams forwarded to LogFileSink. Empty
+  // fields call the corresponding POSIX / process::DurableSync functions
+  // directly.
+  LogFileSinkOps sink_ops{};
 };
 
 // LogWriterOptions::window from a `--log-window-us` value (microseconds; 0
@@ -231,7 +242,8 @@ class LogWriter {
 
   // Pushes everything buffered to the file and syncs it to disk
   // (process::DurableSync) before returning. Destruction also drains and
-  // syncs before closing the descriptor.
+  // durable-syncs before closing the descriptor when writes remain unsynced
+  // since the last successful durable sync.
   // Safe to call repeatedly, including after a failure.
   void flush() noexcept;
 
@@ -312,7 +324,7 @@ class LogWriter {
   // All state lives behind a pointer so that moving a LogWriter never has to
   // move a running thread, a mutex or a condition variable.
   struct State {
-    explicit State(std::string path);
+    explicit State(std::string path, LogFileSinkOps ops = {});
     ~State();
 
     // What take() did with a record.
@@ -390,6 +402,7 @@ class LogWriter {
     bool file_ready{false};
     std::thread writer;
     std::atomic<bool> stopping{false};
+    std::atomic<bool> flushing{false};
   };
 
   std::unique_ptr<State> state_;

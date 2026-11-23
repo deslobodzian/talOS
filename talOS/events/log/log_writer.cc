@@ -102,11 +102,13 @@ void LogWriter::Wakeup::wait_until(
 
 #endif
 
-LogWriter::State::State(std::string path) : sink{std::move(path)} {}
+LogWriter::State::State(std::string path, LogFileSinkOps ops)
+    : sink{std::move(path), std::move(ops)} {}
 
 LogWriter::LogWriter(std::string_view path, std::string_view process_name,
                      Options options, std::uint64_t session_id)
-    : state_{std::make_unique<State>(std::string{path})} {
+    : state_{std::make_unique<State>(std::string{path},
+                                     std::move(options.sink_ops))} {
   if (options.chunk_bytes == 0) {
     options.chunk_bytes = DEFAULT_CHUNK_BYTES;
   }
@@ -152,7 +154,12 @@ LogWriter::State::~State() {
     submit_active();
   }
   stop_writer();
-  sync(/*durable=*/true);
+  if (sink.needs_durable_sync()) {
+    sync(/*durable=*/true);
+  } else if (capture_error.load() == CaptureError::BYTE_CAP ||
+             sink.head_dropped()) {
+    sink.mark_capped();
+  }
   sink.close();
 }
 
@@ -479,6 +486,15 @@ void LogWriter::State::settle() noexcept {
 }
 
 void LogWriter::State::drain() noexcept {
+  struct FlushingGuard {
+    std::atomic<bool>& flag;
+    explicit FlushingGuard(std::atomic<bool>& f) noexcept : flag{f} {
+      flag.store(true, std::memory_order_release);
+    }
+    ~FlushingGuard() { flag.store(false, std::memory_order_release); }
+  } flushing_guard{flushing};
+
+  if (options.before_flush_wait) options.before_flush_wait();
   settle();
 
   if (!options.background) {
@@ -525,7 +541,11 @@ void LogWriter::State::start_writer() {
       const bool unwritten =
           !raw->sink.failed() &&
           chunk->committed.load(std::memory_order_seq_cst) > chunk->written;
+      const bool suppress_periodic_sync =
+          raw->stopping.load(std::memory_order_acquire) ||
+          raw->flushing.load(std::memory_order_acquire);
       const bool sync_due =
+          !suppress_periodic_sync &&
           now - raw->sink.last_sync() >= raw->options.sync_interval;
       const bool write_due =
           unwritten && (!raw->last_write ||
@@ -550,7 +570,8 @@ void LogWriter::State::start_writer() {
           raw->completed.store(next + 1, std::memory_order_release);
           raw->chunk_ready.notify_all();
         }
-        if (sync_due) {
+        if (sync_due && !raw->stopping.load(std::memory_order_acquire) &&
+            !raw->flushing.load(std::memory_order_acquire)) {
           raw->sync(/*durable=*/false);
         }
         continue;
@@ -581,7 +602,16 @@ void LogWriter::State::start_writer() {
       // that lands before the wait is kept by the semaphore, so none is
       // lost; a stale one only makes the next wait return at once and the
       // loop check again.
-      const auto sync_at = raw->sink.last_sync() + raw->options.sync_interval;
+      // While drain() is running, it will durable-sync once every submitted
+      // chunk is written (and wake us if it submits another). Avoid spinning
+      // on an already-elapsed sync_at while drain() finishes settle() and
+      // acquires mutex for its durable sync.
+      const auto sync_at =
+          raw->flushing.load(std::memory_order_acquire)
+              ? now + std::max<std::chrono::nanoseconds>(
+                          raw->options.sync_interval,
+                          std::chrono::milliseconds{1})
+              : raw->sink.last_sync() + raw->options.sync_interval;
       // A writer that has never written has nothing unwritten and no
       // stream here (an unwritten record would have been due above).
       const auto write_at =
