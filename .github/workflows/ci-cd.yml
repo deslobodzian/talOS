@@ -118,6 +118,13 @@ jobs:
         # The toolchain the repository's own setup installs (bazelisk as
         # `bazel`, g++, python3, Node and pnpm); no RoboRIO or lint tools.
         tools/setup.sh --yes --no-rio --no-lint
+        # Two kernel settings as GitHub's Ubuntu runners have them. Ubuntu
+        # 24.04's 32 bits of mmap randomization put mappings where
+        # ThreadSanitizer cannot track them ("unexpected memory mapping"),
+        # and its AppArmor default refuses the unprivileged user namespace
+        # //talOS/protocol:udp_address_change_test needs.
+        sudo sysctl -w vm.mmap_rnd_bits=28 \
+          kernel.apparmor_restrict_unprivileged_userns=0
         bazel build --config=gcp //...
         case "$LANE" in
           fast) exec bazel test --config=gcp --config=fast --test_output=errors //... ;;
