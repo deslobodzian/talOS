@@ -18,7 +18,7 @@ cc_library(
 cc_library(
     name = "little_endian",
     hdrs = ["little_endian.h"],
-    visibility = ["//talOS:__subpackages__"],
+    visibility = ["//talOS/hardware:__pkg__"],
 )
 
 # The simulators' scripted mode and joystick schedules. Header only, so the

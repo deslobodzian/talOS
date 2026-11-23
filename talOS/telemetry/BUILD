@@ -38,7 +38,7 @@ cc_library(
 cc_library(
     name = "json_string",
     hdrs = ["json_string.h"],
-    visibility = ["//visibility:public"],
+    visibility = ["//studio/bridge:__pkg__"],
 )
 
 # Page encoding: the producer, the Studio bridge and the mock build every
