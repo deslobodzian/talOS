@@ -38,9 +38,20 @@ cleanly leaves its topics in place without disrupting subscribers.
 
 Without the launcher (tests, CLI tools), the first queue to open a name creates
 the segment and the last one to close unlinks it. Dead readers are reclaimed.
-If that last queue's process dies after marking the segment closing but before
-unlinking it, the next queue to open the name waits briefly for the unlink and
-then, when no live process holds the segment, unlinks it itself. A segment
+That last queue marks the segment closing and records its own process as the
+one that will unlink it, in one step. Among processes of one build (the
+segment's format version does not tell builds apart here), a queue that opens
+the name meanwhile waits for that unlink while the process lives, however long
+it is descheduled, and never unlinks the segment in its place (it gives up
+after about a second, a bound for a stopped process). If the process dies
+before unlinking, or its unlink fails and it gives the record up, a later open
+of the name, when no live process holds the segment, records itself in its
+place and unlinks it; an open that recorded itself and then failed to unlink
+fails rather than try again. A recorded process in another pid namespace, or
+one checked by a process whose own namespace cannot be compared, counts as
+running ([process liveness](process_liveness.h)): while it lives it unlinks the
+segment as usual, but if it died or is stuck, such an open waits and then
+fails until the name is unlinked or a session replaces it. A segment
 whose last holder was killed otherwise stays and is reused; every attach,
 publisher or reader, refuses one of another version, layout or schema, which a
 launcher session replaces or `shm_unlink` removes.
