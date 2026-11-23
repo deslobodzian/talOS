@@ -358,6 +358,32 @@ TEST_F(SwerveModuleTest, ZeroVelocityStillSteers) {
   EXPECT_EQ(Applied("drive").demand, 0.0);
 }
 
+// REQ-SAFE-04, REQ-CONTRACT-25: extreme finite rotation counts must not
+// overflow 2*pi*rot into +/-inf inside OptimizeSwerveModule or publish
+// non-finite commanded setpoints.
+TEST_F(SwerveModuleTest, ExtremeFiniteAnglesDoNotOverflow) {
+  Enable();
+  hw.set_motor(kNode, "steer", 0.0, 0.0);
+  // 1e308 is finite (exact integer turns) while 2*pi*1e308 overflows to +inf.
+  Send(Drive(5.0, 1e308));
+  EXPECT_EQ(Applied("drive").mode, Mode::kVelocity);
+  EXPECT_NEAR(Applied("drive").demand, 5.0, kTight);
+  EXPECT_EQ(Applied("steer").mode, Mode::kPosition);
+  EXPECT_NEAR(Applied("steer").demand, 0.0, kTight);
+  EXPECT_TRUE(std::isfinite(State().commanded_drive_velocity_rps()));
+  EXPECT_TRUE(std::isfinite(State().commanded_steer_position_rot()));
+
+  // Extreme finite unwrapped steer position must not overflow 2*pi*measured
+  // into +inf either.
+  hw.set_motor(kNode, "steer", 1e308, 0.0);
+  Send(Drive(5.0, 0.0));
+  EXPECT_EQ(Applied("drive").mode, Mode::kVelocity);
+  EXPECT_NEAR(Applied("drive").demand, 5.0, kTight);
+  EXPECT_EQ(Applied("steer").mode, Mode::kPosition);
+  EXPECT_TRUE(std::isfinite(Applied("steer").demand));
+  EXPECT_TRUE(std::isfinite(State().commanded_steer_position_rot()));
+}
+
 // The bench config binds the motor's lane too, and teleop needs a reader of
 // every bound lane; this stands in for the motor node, whose package this
 // one may not depend on.
