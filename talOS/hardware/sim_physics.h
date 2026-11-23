@@ -381,10 +381,10 @@ struct ChassisDynamics {
 };
 
 // Mechanism inertia and friction parameters for rigid-body rotor ODE on a
-// master motor (matched by CAN id) and its follower chain. Survives every
-// Configure().
+// named master motor and its follower chain. Bound by motor name so it
+// survives every later Configure(), including a config pushed by the bridge.
 struct MechanismSpec {
-  std::uint8_t motor_can_id{0};
+  std::string motor;
   double inertia_kg_m2{
       0.0};  // > 0 activates rigid-body ODE on this master motor
   LoadKind load{LoadKind::kRoller};
@@ -499,8 +499,10 @@ class PhysicsSimBackend final : public SimBackendBase {
             : 0.0;
   }
 
-  // Rigid-body mechanism specs (matched by master motor CAN id), replacing any
-  // set before. Survives every later Configure().
+  // Rigid-body mechanism specs (MechanismSpec), replacing any set before.
+  // Matched by master motor name so they survive every later Configure(),
+  // including a config pushed by the bridge; follower motors, unknown motors,
+  // and non-positive / non-finite inertias are ignored.
   void SetMechanisms(std::vector<MechanismSpec> specs) {
     mechanisms_ = std::move(specs);
     BindMechanisms();
@@ -1266,12 +1268,13 @@ class PhysicsSimBackend final : public SimBackendBase {
     return flags;
   }
 
-  // Resolves mechanisms_ by master motor CAN id against config_. Follower
-  // motors and non-positive / non-finite inertias are ignored.
+  // Resolves mechanisms_ by master motor name against config_. Follower
+  // motors, unknown motors, and non-positive / non-finite inertias are ignored.
   void BindMechanisms() {
     bound_mechanisms_.fill(BoundMechanism{});
     for (const MechanismSpec& spec : mechanisms_) {
-      if (!std::isfinite(spec.inertia_kg_m2) || spec.inertia_kg_m2 <= 0.0) {
+      if (spec.motor.empty() || !std::isfinite(spec.inertia_kg_m2) ||
+          spec.inertia_kg_m2 <= 0.0) {
         continue;
       }
       const double viscous = std::isfinite(spec.viscous_damping_nm_per_radps) &&
@@ -1283,10 +1286,11 @@ class PhysicsSimBackend final : public SimBackendBase {
                                      ? spec.static_friction_nm
                                      : 0.0;
       for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-        if (config_.motors[i].can_id == static_cast<int>(spec.motor_can_id) &&
-            config_.motors[i].master_id == 0) {
-          bound_mechanisms_[i] = {true, spec.inertia_kg_m2, spec.load, viscous,
-                                  static_fric};
+        if (config_.motors[i].name == spec.motor) {
+          if (config_.motors[i].master_id == 0) {
+            bound_mechanisms_[i] = {true, spec.inertia_kg_m2, spec.load,
+                                    viscous, static_fric};
+          }
           break;
         }
       }

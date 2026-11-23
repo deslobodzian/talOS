@@ -348,22 +348,15 @@ int main(int argc, char** argv) {
       }
       mechanisms.reserve(robot_config.simulation.mechanisms.size());
       for (const auto& mech : robot_config.simulation.mechanisms) {
-        for (const auto& motor : hw_config.motors) {
-          if (motor.name == mech.motor) {
-            mechanisms.push_back({
-                .motor_can_id = static_cast<uint8_t>(motor.can_id),
-                .inertia_kg_m2 = mech.inertia_kg_m2,
-                .load =
-                    mech.load == talos::config::SimulationLoadKind::kFlywheel
+        mechanisms.push_back({
+            .motor = mech.motor,
+            .inertia_kg_m2 = mech.inertia_kg_m2,
+            .load = mech.load == talos::config::SimulationLoadKind::kFlywheel
                         ? talos::hardware::sim::LoadKind::kFlywheel
                         : talos::hardware::sim::LoadKind::kRoller,
-                .viscous_damping_nm_per_radps =
-                    mech.viscous_damping_nm_per_radps,
-                .static_friction_nm = mech.static_friction_nm,
-            });
-            break;
-          }
-        }
+            .viscous_damping_nm_per_radps = mech.viscous_damping_nm_per_radps,
+            .static_friction_nm = mech.static_friction_nm,
+        });
       }
     }
     talos::hardware::SimBackend ideal;

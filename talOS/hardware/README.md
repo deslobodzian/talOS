@@ -272,9 +272,9 @@ Like `motor_type` and `sim_motor`, `[simulation]` stays off the wire and out of
 `ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` in
 `PhysicsOptions` and binds `swerve_modules` (`SetSwerveModules`), `hard_stops`
 (`SetHardStops`), `battery` (`SetBatteryModel`), `chassis`
-(`SetChassisDynamics`), and `mechanisms` (resolved to each master motor's CAN
-id via `SetMechanisms`) on `PhysicsSimBackend` before `Reconfigure` so all of
-them survive any later pushed config.
+(`SetChassisDynamics`), and `mechanisms` (`SetMechanisms`) on
+`PhysicsSimBackend` before `Reconfigure` so all of them survive any later
+pushed config.
 
 Each `[subsystems.<sub>.motors.<motor>.slot0]` (also `slot1`, `slot2`) accepts
 `gravity_type = "ElevatorStatic"` (default; alias `"Elevator"`) or
@@ -1198,7 +1198,7 @@ pulse as 0, as the RoboRIO's `PWM::GetSpeed()` does after `SetDisabled`.
 | Position demand | Teleports (no position-jump reset check) | P-loop ramps through voltage; MotionMagic uses trapezoid profiles |
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast (shorted-winding electromagnetic braking under a `MechanismSpec`), coast rolls on (no-load + viscous/static friction decay under a `MechanismSpec`) |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction; a follower drives in its master's direction (reversed if opposed), ignoring its own `inverted`; a remote-CANcoder motor reports and closes its loops on the CANcoder in the CANcoder's direction |
-| Mechanism inertia | Ignored | Opt-in `SetMechanisms` (`sim::MechanismSpec`, bound from `[[simulation.mechanisms]]` by master CAN id; survives `Configure`): 10-substep exact exponential rigid-body ODE reflecting `inertia_kg_m2 / gear_ratio²`, viscous damping, and Coulomb static friction onto the root master shaft, summing active follower torques and re-evaluating current limits each sub-step; motors without a spec keep the legacy first-order lag |
+| Mechanism inertia | Ignored | Opt-in `SetMechanisms` (`sim::MechanismSpec`, bound from `[[simulation.mechanisms]]` by master motor name; survives `Configure`): 10-substep exact exponential rigid-body ODE reflecting `inertia_kg_m2 / gear_ratio²`, viscous damping, and Coulomb static friction onto the root master shaft, summing active follower torques and re-evaluating current limits each sub-step; motors without a spec keep the legacy first-order lag |
 | Chassis dynamics | Ignored | Opt-in `SetChassisDynamics` (`sim::ChassisDynamics`, bound from `[simulation.chassis]`; survives `Configure`): coupled 2D rigid-body swerve dynamics with chassis mass, rotational inertia (defaulting to `mass_kg × mean(x_i² + y_i²)`), per-wheel friction-circle clamping (`mu × m × g / N`), lateral scrub resistance, excess-torque wheel spin-up (physical odometry slip), and exact SE(2) pose stepping; unset keeps kinematic least-squares chassis integration |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
 | Hard stops | Ignored | `SetHardStops` (`sim::HardStop`): physical end-of-travel bounds `[min_rot, max_rot]` per named motor (mechanism rotations in its hardware frame), enforced even when `soft_limits = false` (rezero-frame mechanisms); clamps position and zeroes velocity when driven into a stop so back-EMF drops to 0 and stator current rises to the stall/limited current while allowing motion away from the stop; bound by name, survives a pushed config. `sim_gateway --physics` binds `[[simulation.hard_stops]]` |

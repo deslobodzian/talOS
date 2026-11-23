@@ -2538,7 +2538,7 @@ TEST(SimMechanismOde, FlywheelSpinUpInertiaGearingAndStaticFriction) {
 
   // SetMechanisms before Configure() must survive Configure().
   PhysicsSimBackend backend;
-  backend.SetMechanisms({{.motor_can_id = 1,
+  backend.SetMechanisms({{.motor = "roller",
                           .inertia_kg_m2 = kInertia,
                           .load = sim::LoadKind::kFlywheel}});
   ASSERT_TRUE(backend.Configure(cfg));
@@ -2559,7 +2559,7 @@ TEST(SimMechanismOde, FlywheelSpinUpInertiaGearingAndStaticFriction) {
   const std::array<double, 3> inertias{0.005, 0.02, 0.08};
   for (std::size_t idx = 0; idx < inertias.size(); ++idx) {
     PhysicsSimBackend b;
-    b.SetMechanisms({{.motor_can_id = 1,
+    b.SetMechanisms({{.motor = "roller",
                       .inertia_kg_m2 = inertias[idx],
                       .load = sim::LoadKind::kFlywheel}});
     ASSERT_TRUE(b.Configure(cfg));
@@ -2582,7 +2582,7 @@ TEST(SimMechanismOde, FlywheelSpinUpInertiaGearingAndStaticFriction) {
     Config gcfg = cfg;
     gcfg.motors[0].sensor_to_mechanism_ratio = gear;
     PhysicsSimBackend b;
-    b.SetMechanisms({{.motor_can_id = 1,
+    b.SetMechanisms({{.motor = "roller",
                       .inertia_kg_m2 = 0.05,
                       .load = sim::LoadKind::kFlywheel}});
     ASSERT_TRUE(b.Configure(gcfg));
@@ -2599,7 +2599,7 @@ TEST(SimMechanismOde, FlywheelSpinUpInertiaGearingAndStaticFriction) {
   // spin above breakaway torque.
   {
     PhysicsSimBackend b;
-    b.SetMechanisms({{.motor_can_id = 1,
+    b.SetMechanisms({{.motor = "roller",
                       .inertia_kg_m2 = 0.01,
                       .load = sim::LoadKind::kRoller,
                       .viscous_damping_nm_per_radps = 0.0,
@@ -2639,7 +2639,7 @@ TEST(SimMechanismOde, MasterAndFollowerDoubleAccelerationOnSharedShaft) {
   };
 
   PhysicsSimBackend single_backend;
-  single_backend.SetMechanisms({{.motor_can_id = 1,
+  single_backend.SetMechanisms({{.motor = "roller",
                                  .inertia_kg_m2 = 0.05,
                                  .load = sim::LoadKind::kFlywheel}});
   ASSERT_TRUE(single_backend.Configure(make_single()));
@@ -2669,7 +2669,7 @@ TEST(SimMechanismOde, MasterAndFollowerDoubleAccelerationOnSharedShaft) {
       const std::size_t slave_idx = 1 - master_idx;
 
       PhysicsSimBackend dual_backend;
-      dual_backend.SetMechanisms({{.motor_can_id = 1,
+      dual_backend.SetMechanisms({{.motor = "roller",
                                    .inertia_kg_m2 = 0.05,
                                    .load = sim::LoadKind::kFlywheel}});
       ASSERT_TRUE(dual_backend.Configure(dual));
@@ -2701,7 +2701,7 @@ TEST(SimMechanismOde, BrakeNeutralStopsFasterThanCoastNeutral) {
     cfg.motors[0].stator_limit_a = 400.0;
     cfg.motors[0].supply_limit_a = 400.0;
     PhysicsSimBackend backend;
-    backend.SetMechanisms({{.motor_can_id = 1,
+    backend.SetMechanisms({{.motor = "roller",
                             .inertia_kg_m2 = 0.005,
                             .load = sim::LoadKind::kFlywheel,
                             .viscous_damping_nm_per_radps = viscous}});
@@ -2747,7 +2747,7 @@ TEST(SimMechanismOde, TwelveVoltFreeSpeedAndFreeCurrentMatchDatasheet) {
     cfg.motors[0].stator_limit_a = 1000.0;
     cfg.motors[0].supply_limit_a = 1000.0;
     PhysicsSimBackend backend;
-    backend.SetMechanisms({{.motor_can_id = 1,
+    backend.SetMechanisms({{.motor = "roller",
                             .inertia_kg_m2 = 0.001,
                             .load = sim::LoadKind::kRoller}});
     ASSERT_TRUE(backend.Configure(cfg));
@@ -2776,7 +2776,7 @@ TEST(SimMechanismOde, SmallInertiaRemainsNumericallyStable) {
         cfg.motors[0].stator_limit_a = 80.0;
         cfg.motors[0].supply_limit_a = 40.0;
         PhysicsSimBackend backend;
-        backend.SetMechanisms({{.motor_can_id = 1,
+        backend.SetMechanisms({{.motor = "roller",
                                 .inertia_kg_m2 = j,
                                 .load = sim::LoadKind::kRoller}});
         ASSERT_TRUE(backend.Configure(cfg));
@@ -2807,6 +2807,74 @@ TEST(SimMechanismOde, SmallInertiaRemainsNumericallyStable) {
       }
     }
   }
+}
+
+// REQ-DEV-10: Two master motors sharing the same CAN id on different buses
+// bind MechanismSpec by unique motor name, so attaching a spec to "flywheel"
+// on "rio" drives "flywheel" with the rigid-body ODE while "fl_drive" on
+// "canivore" keeps the legacy first-order lag (and survives Configure()).
+TEST(SimMechanismOde, SharedCanIdAcrossBusesBindsByMotorName) {
+  constexpr double kGear = 2.0;
+  constexpr double kInertia = 0.08;
+  constexpr double kStatorLimit = 40.0;
+  constexpr double kDt = 0.05;  // 10 x 5 ms
+  const sim::MotorModel x60 = sim::MotorModelFor(MotorType::kKrakenX60);
+  const double expected_ode_rps =
+      (kGear * x60.torque_constant_nm_per_a() * kStatorLimit / kInertia) * kDt /
+      kTestTau;
+
+  auto make_motor = [](uint16_t id, const char* name, const char* bus) {
+    MotorConfig m = TestMotor(id, name, /*can_id=*/1);
+    m.bus = bus;
+    m.sensor_to_mechanism_ratio = kGear;
+    m.stator_limit_a = kStatorLimit;
+    m.supply_limit_a = 400.0;
+    return m;
+  };
+
+  // Reference legacy lag velocity for an identical motor with no MechanismSpec.
+  Config legacy_cfg;
+  legacy_cfg.commissioned = true;
+  legacy_cfg.command_timeout_us = 100000;
+  legacy_cfg.motors.push_back(make_motor(1, "fl_drive", "canivore"));
+  PhysicsSimBackend legacy_backend;
+  ASSERT_TRUE(legacy_backend.Configure(legacy_cfg));
+  std::array<MotorRequest, 1> legacy_cmd{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+  ASSERT_TRUE(legacy_backend.Apply(legacy_cmd));
+  State legacy_state{};
+  uint64_t legacy_t = 0;
+  StepBackend(legacy_backend, legacy_state, legacy_t, 5000, 1);
+  StepBackend(legacy_backend, legacy_state, legacy_t, 5000, 10);
+  const double legacy_rps = legacy_state.motors[0].velocity_rps;
+  ASSERT_GT(legacy_rps, 5.0 * expected_ode_rps);
+
+  // Two master motors sharing can_id = 1 across two buses; fl_drive appears
+  // first in config_.motors so CAN-id matching would misbind fl_drive instead
+  // of flywheel.
+  Config cfg;
+  cfg.commissioned = true;
+  cfg.command_timeout_us = 100000;
+  cfg.motors.push_back(make_motor(1, "fl_drive", "canivore"));
+  cfg.motors.push_back(make_motor(2, "flywheel", "rio"));
+
+  PhysicsSimBackend backend;
+  backend.SetMechanisms({{.motor = "flywheel",
+                          .inertia_kg_m2 = kInertia,
+                          .load = sim::LoadKind::kFlywheel}});
+  ASSERT_TRUE(backend.Configure(cfg));
+  std::array<MotorRequest, 2> cmd{
+      {{1, Mode::kVoltage, 0, 12.0, 0.0}, {2, Mode::kVoltage, 0, 12.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(cmd));
+  State s{};
+  uint64_t t = 0;
+  StepBackend(backend, s, t, 5000, 1);   // dt = 0
+  StepBackend(backend, s, t, 5000, 10);  // 50 ms
+
+  // "fl_drive" (index 0, canivore, can_id = 1) keeps the legacy lag.
+  EXPECT_NEAR(s.motors[0].velocity_rps, legacy_rps, 1e-9);
+  // "flywheel" (index 1, rio, can_id = 1) runs the rigid-body ODE.
+  EXPECT_NEAR(s.motors[1].velocity_rps, expected_ode_rps,
+              0.02 * expected_ode_rps);
 }
 
 // REQ-DEV-10: Battery sag solves V_batt = V_oc - R_int * (I_base + sum I_sup)
