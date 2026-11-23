@@ -527,6 +527,82 @@ tasks.register("rioBuildStampTest") {
             check(companionRefusal(it) != null, "invalid companion ${it} was accepted")
         }
 
+        // REQ-OPS-27: end-to-end Gradle enforcement of -Pcompanion=<ipv4>
+        // (no default on buildRio, refusal of ORG_GRADLE_PROJECT_companion and
+        // gradle.properties, refusal of empty -Pcompanion=, diagnostic print
+        // when supplied, and desktop tasks allowed without -Pcompanion).
+        // Runs with --no-daemon --offline and an isolated --project-cache-dir
+        // under temporaryDir so it neither contends with this build's .gradle
+        // lock, mutates a read-only checkout, nor leaves a child daemon behind.
+        def gradlewBin = OperatingSystem.current().isWindows() ?
+                file('gradlew.bat').absolutePath : file('gradlew').absolutePath
+        def workRoot = new File(temporaryDir, 'companion-policy')
+        workRoot.deleteDir()
+        workRoot.mkdirs()
+        def runGradleCheck = { String label, List<String> extraArgs,
+                               Map<String, String> extraEnv = [:] ->
+            def cacheDir = new File(workRoot, "cache-${label}")
+            def cmd = [gradlewBin, '--no-daemon', '--offline',
+                       '--project-cache-dir', cacheDir.absolutePath] + extraArgs
+            def pb = new ProcessBuilder(cmd)
+            pb.directory(projectDir)
+            pb.redirectErrorStream(true)
+            def env = pb.environment()
+            env['JAVA_HOME'] = System.getProperty('java.home')
+            env['GRADLE_USER_HOME'] = gradle.gradleUserHomeDir.absolutePath
+            env.keySet().findAll { it.startsWith('ORG_GRADLE_PROJECT_') }.each { env.remove(it) }
+            extraEnv.each { k, v -> env[k] = v }
+            def proc = pb.start()
+            def output = proc.inputStream.getText('UTF-8')
+            def exitCode = proc.waitFor()
+            return [exitCode, output]
+        }
+
+        try {
+            def (noCompRc, noCompOut) = runGradleCheck('no-companion', ['buildRio', '--dry-run'])
+            check(noCompRc != 0 && noCompOut.contains(
+                    'No RoboRIO companion address supplied: pass -Pcompanion=<ipv4> on the command line'),
+                    "buildRio without -Pcompanion did not fail with expected diagnostic (rc=${noCompRc}):\n${noCompOut}")
+
+            def (envRc, envOut) = runGradleCheck(
+                    'env-companion', ['buildRio', '--dry-run'],
+                    [ORG_GRADLE_PROJECT_companion: '10.0.0.2'])
+            check(envRc != 0 && envOut.contains(
+                    'companion=10.0.0.2 is set outside the command line ' +
+                    '(gradle.properties or ORG_GRADLE_PROJECT_companion)'),
+                    "ORG_GRADLE_PROJECT_companion was not refused (rc=${envRc}):\n${envOut}")
+
+            def propsProject = new File(workRoot, 'gradle-props-project')
+            propsProject.mkdirs()
+            ['build.gradle', 'settings.gradle'].each { name ->
+                new File(propsProject, name).bytes = file(name).bytes
+            }
+            new File(propsProject, 'gradle.properties').text = 'companion=10.0.0.2\n'
+            def (propsRc, propsOut) = runGradleCheck(
+                    'props-companion', ['-p', propsProject.absolutePath, 'buildRio', '--dry-run'])
+            check(propsRc != 0 && propsOut.contains(
+                    'companion=10.0.0.2 is set outside the command line ' +
+                    '(gradle.properties or ORG_GRADLE_PROJECT_companion)'),
+                    "gradle.properties companion was not refused (rc=${propsRc}):\n${propsOut}")
+
+            def (emptyRc, emptyOut) = runGradleCheck(
+                    'empty-companion', ['buildRio', '-Pcompanion=', '--dry-run'])
+            check(emptyRc != 0 && emptyOut.contains('-Pcompanion= refused: it is empty'),
+                    "empty -Pcompanion= was not refused (rc=${emptyRc}):\n${emptyOut}")
+
+            def (okRc, okOut) = runGradleCheck(
+                    'valid-companion', ['buildRio', '-Pcompanion=10.0.0.2', '--dry-run'])
+            check(okRc == 0 && okOut.contains(
+                    'RoboRIO companion address built in: 10.0.0.2 (from -Pcompanion)'),
+                    "buildRio -Pcompanion=10.0.0.2 did not succeed and print built-in address (rc=${okRc}):\n${okOut}")
+
+            def (deskRc, deskOut) = runGradleCheck('desktop-no-companion', ['phoenixTest', '--dry-run'])
+            check(deskRc == 0 && !deskOut.contains('RoboRIO companion address built in:'),
+                    "phoenixTest without -Pcompanion failed or printed a companion address (rc=${deskRc}):\n${deskOut}")
+        } finally {
+            workRoot.deleteDir()
+        }
+
         // Team number parsing.
         check(parseTeamNumber('1234', 'test') == 1234 && parseTeamNumber(99999, 'test') == 99999,
                 'valid team numbers were refused')
