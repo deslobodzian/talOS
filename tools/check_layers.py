@@ -162,14 +162,11 @@ NODE_GENERATORS = ("talos_cc_node", "talos_py_node", "talos_cc_shared_node")
 # RULES.md 2 direct-dependency check.
 CC_NODE_DEP_ROOTS = ("bench", "examples", "tools/scaffold_testdata")
 CC_NODE_GENERATORS = ("talos_cc_node", "talos_cc_shared_node")
-FORBIDDEN_NODE_DEPS = (
-    "talOS/rtms/...",
-    "talOS/ipc/...",
-    "talOS/memory/...",
-    "talOS/hardware:hardware",
-    "talOS/node:*",
-    "talOS/devices:access",
-    "talOS/devices:access_hdr",
+
+# Privileged framework libraries outside the stack's transport layers: no
+# node depends on one directly, and none is visible to a node package. Both
+# FORBIDDEN_NODE_DEPS and RESTRICTED_INTERNAL_TARGETS list them.
+_PRIVILEGED_FRAMEWORK_LIBRARIES = (
     "talOS/events:events",
     "talOS/events:events_os",
     "talOS/events:input_replay",
@@ -182,6 +179,16 @@ FORBIDDEN_NODE_DEPS = (
     "talOS/introspection:reporter",
     "talOS/launcher:launcher_lib",
     "talOS/simulation:schedules",
+)
+FORBIDDEN_NODE_DEPS = (
+    "talOS/rtms/...",
+    "talOS/ipc/...",
+    "talOS/memory/...",
+    "talOS/hardware:hardware",
+    "talOS/node:*",
+    "talOS/devices:access",
+    "talOS/devices:access_hdr",
+    *_PRIVILEGED_FRAMEWORK_LIBRARIES,
 )
 FORBIDDEN_NODE_DEPS_EXCLUDE = ("talOS/node:node",)
 
@@ -198,18 +205,7 @@ RESTRICTED_INTERNAL_TARGETS = (
     "talOS/rtms:process_liveness",
     "talOS/memory:shared_memory",
     "talOS/memory:residency",
-    "talOS/events:events",
-    "talOS/events:events_os",
-    "talOS/events:input_replay",
-    "talOS/telemetry:telemetry",
-    "talOS/telemetry:channels",
-    "talOS/teleop:teleop",
-    "talOS/node_api:node_api",
-    "talOS/bridge:node_lib",
-    "talOS/introspection:registry",
-    "talOS/introspection:reporter",
-    "talOS/launcher:launcher_lib",
-    "talOS/simulation:schedules",
+    *_PRIVILEGED_FRAMEWORK_LIBRARIES,
     "talOS/vision/capture:avfoundation",
 )
 # Hardware wire and raw IPC targets: never //visibility:public, and not visible
