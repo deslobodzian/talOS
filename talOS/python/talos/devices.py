@@ -699,10 +699,14 @@ class TargetLane(_OnNode):
             self._type.size, self._type.alignment, _abi.schema_of(self._type),
             -1 if arming is None else arming._index))
 
-    def send(self, message=None, **fields):
+    def send(self, message=None, /, **fields):
         """send(field=value, ...) with the .fbs field names, or send(message)
         to forward a received one. False when the transport dropped it or the
         lane's arming held it to a release."""
+        if message is not None and fields:
+            raise TypeError(
+                "send() takes either a message or field keyword arguments, "
+                "not both")
         data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
         return _abi.boolean(lib.talos_target_lane_send(

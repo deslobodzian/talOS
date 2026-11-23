@@ -314,9 +314,13 @@ class Publisher(_OnNode):
         super().__init__(node)
         self._type, self._index = mtype, index
 
-    def send(self, message=None, **fields):
+    def send(self, message=None, /, **fields):
         """send(field=value, ...) naming every .fbs field (an omitted one
         raises TypeError), or send(message) to re-send a received one."""
+        if message is not None and fields:
+            raise TypeError(
+                "send() takes either a message or field keyword arguments, "
+                "not both")
         data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
         return _abi.boolean(lib.talos_publisher_send(

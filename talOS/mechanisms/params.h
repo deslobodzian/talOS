@@ -65,10 +65,10 @@ class Params {
   }
   // An optional finite number: nullopt when the key is absent.
   std::optional<double> optional_number(std::string_view k) const {
-    const double value =
-        node_->param<double>(key(k), std::numeric_limits<double>::quiet_NaN());
-    if (std::isnan(value)) return std::nullopt;
-    return finite(k, value);
+    const std::optional<double> value =
+        detail::NodeDetail::find_double(*node_, key(k));
+    if (!value) return std::nullopt;
+    return finite(k, *value);
   }
   // A limit: any number but NaN, so +-inf (the fallback for "none") passes.
   double limit(std::string_view k, double fallback) const {
@@ -95,7 +95,11 @@ class Params {
     return value;
   }
   Duration to_duration(std::string_view k, std::int64_t us) const {
+    constexpr std::int64_t kMaxUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(Duration::max())
+            .count();
     if (us < 0) fail(k, "must be >= 0");
+    if (us > kMaxUs) fail(k, "is out of range");
     return std::chrono::microseconds{us};
   }
 

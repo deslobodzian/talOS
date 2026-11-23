@@ -684,13 +684,25 @@ eject_v = -6.0
     sim.add<RollerNode>("intake");
   };
   EXPECT_NO_THROW(add("sensor = \"beam\"\neject_us = 100000\n"));
+  EXPECT_NO_THROW(
+      add("sensor = \"beam\"\neject_us = 100000\n"
+          "sensor_debounce_us = 9223372036854775\n"));
   const std::vector<std::pair<std::string, std::string>> bad{
       {"roller.sensor", "eject_us = 100000\n"},
       {"beam_typo", "sensor = \"beam_typo\"\neject_us = 100000\n"},
       {"roller.eject_us", "sensor = \"beam\"\neject_us = 0\n"},
       {"roller.eject_us", "sensor = \"beam\"\n"},
+      {"roller.eject_us", "sensor = \"beam\"\neject_us = 18446744073709552\n"},
       {"roller.feed_us", "sensor = \"beam\"\neject_us = 100000\nfeed_us = 0\n"},
+      {"roller.sensor_debounce_us",
+       "sensor = \"beam\"\neject_us = 100000\nsensor_debounce_us = -1\n"},
+      {"roller.sensor_debounce_us",
+       "sensor = \"beam\"\neject_us = 100000\n"
+       "sensor_debounce_us = 9223372036854776\n"},
       {"roller.hold_v", "sensor = \"beam\"\neject_us = 100000\nhold_v = inf\n"},
+      {"roller.hold_v",
+       "sensor = \"beam\"\neject_us = 100000\nhold_v = -inf\n"},
+      {"roller.hold_v", "sensor = \"beam\"\neject_us = 100000\nhold_v = nan\n"},
   };
   for (const auto& [key, table] : bad) {
     SCOPED_TRACE(table);

@@ -1792,6 +1792,54 @@ class MessageTest(unittest.TestCase):
                         send(object())
                     forward.assert_not_called()
 
+    # REQ-CONTRACT-14: passing both a received message and **fields raises
+    # TypeError in every send/publish path instead of silently dropping fields;
+    # publish_target still accepts mode_since_us alongside a message.
+    def test_send_and_publish_reject_message_together_with_fields(self):
+        from talos._messages import message_type
+
+        class Outputs:
+            def __init__(self, node):
+                self.publisher = node.publish(Goal, "/combo/goal")
+                self.lane = talos.TargetLane(node, Goal, "lift", "teleop")
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        outputs = sim.add(Outputs, "planner")
+        goal_type = message_type(Goal)
+        goal = goal_type.decode(goal_type.encode(
+            {"height_rot": 2.5, "enabled": True, "tick_count": 0}))
+
+        paths = (
+            ("publisher",
+             lambda **kw: outputs.publisher.send(goal, **kw),
+             "talos_publisher_send"),
+            ("lane",
+             lambda **kw: outputs.lane.send(goal, **kw),
+             "talos_target_lane_send"),
+            ("sim",
+             lambda **kw: sim.publish(Goal, "/combo/injected", goal, **kw),
+             "talos_sim_publish_raw"),
+            ("sim_target",
+             lambda **kw: sim.publish_target(Goal, "lift", "align", goal, **kw),
+             "talos_sim_publish_target"),
+        )
+        for name, call, symbol in paths:
+            with self.subTest(path=name):
+                with mock.patch.object(talos.lib, symbol) as native:
+                    with self.assertRaises(TypeError):
+                        call(height_rot=9.0)
+                    native.assert_not_called()
+
+        # publish_target accepts mode_since_us with a forwarded message, and
+        # still rejects extra message fields alongside both.
+        sim.publish_target(Goal, "lift", "align", goal, mode_since_us=42)
+        self.assertEqual(sim.latest_target(Goal, "lift", "align"), goal)
+        with mock.patch.object(talos.lib, "talos_sim_publish_target") as native:
+            with self.assertRaises(TypeError):
+                sim.publish_target(Goal, "lift", "align", goal,
+                                   mode_since_us=42, height_rot=9.0)
+            native.assert_not_called()
+
     def test_byte_publisher_takes_buffers_and_reports_oversize(self):
         class Telemeter:
             def __init__(self, node):
