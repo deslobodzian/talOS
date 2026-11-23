@@ -665,8 +665,8 @@ class DevicesTest(unittest.TestCase):
                     accessor("lift", "missing")
 
     # REQ-SAFE-03, REQ-SAFE-06: PwmOutput.set(0.0) is the centre pulse and
-    # stop() no pulse (None), and stop() outside update() raises naming the
-    # device
+    # stop() no pulse (None), and set()/stop() outside update() raise naming
+    # the device
     def test_pwm_stop_sends_no_pulse_and_set_zero_is_the_centre(self):
         class Servo:
             def __init__(self, node):
@@ -685,8 +685,9 @@ class DevicesTest(unittest.TestCase):
 channel = 0
 """)
         servo = sim.add(Servo, "lift")
-        with self.assertRaisesRegex(talos.TalosError,
-                                    r"'servo'.*outside update\(\)"):
+        with self.assertRaisesRegex(talos.TalosError, r"'servo'"):
+            servo.servo.set(0.5)
+        with self.assertRaisesRegex(talos.TalosError, r"'servo'"):
             servo.servo.stop()
         hw = SimHardware(sim)
         hw.enable()
@@ -818,6 +819,36 @@ dio = 2
         self.assertEqual(mech.gyro.yaw, 0.0)
         self.assertEqual(mech.gyro.yaw_rate, 0.0)
 
+        # SimHardware.set_motor leaves MotorSample::voltage at 0.0; patch the
+        # latest encoded /hw/state packet so the live sample carries 11.5 V
+        # before disconnect and staleness (preventing a tautological 0.0 check).
+        def publish_live_motor_voltage(expected_pos, expected_vel, voltage):
+            packet_size = 1436
+            wire = 4  # uint32_t size prefix in hardware::Packet
+            buf = ctypes.create_string_buffer(packet_size)
+            self.assertEqual(
+                _abi.ok(_abi.lib.talos_sim_latest_raw(
+                    sim._handle, b"/hw/state", buf, packet_size)), 1)
+            raw = bytearray(buf.raw)
+            (wire_size,) = struct.unpack_from("<I", raw, 0)
+            self.assertGreaterEqual(wire_size, 84 + 45)
+            self.assertLessEqual(wire_size, packet_size - wire)
+            (motor_count,) = struct.unpack_from("<H", raw, wire + 70)
+            self.assertEqual(motor_count, 1)
+            self.assertEqual(raw[wire + 84 + 2], 1)  # motors[0].valid
+            pos, vel = struct.unpack_from("<dd", raw, wire + 84 + 3)
+            self.assertAlmostEqual(pos, expected_pos)
+            self.assertAlmostEqual(vel, expected_vel)
+            (sample_time_us,) = struct.unpack_from("<Q", raw, wire + 24)
+            (sequence,) = struct.unpack_from("<Q", raw, wire + 48)
+            struct.pack_into("<Q", raw, wire + 24, sample_time_us + 1000)
+            struct.pack_into("<Q", raw, wire + 48, sequence + 1)
+            struct.pack_into("<d", raw, wire + 84 + 19, voltage)
+            hw.lose_states(1)
+            _abi.ok(_abi.lib.talos_sim_publish_raw(
+                sim._handle, b"/hw/state", bytes(raw), packet_size))
+            sim.step(0.01)
+
         # Valid sample + rezero Motor and Gyro.
         hw = SimHardware(sim)
         hw.set_motor("lift", "lift", 3.0, 2.0,
@@ -831,8 +862,10 @@ dio = 2
         mech.gyro.rezero(0.0)
         self.assertTrue(mech.motor.zeroed)
         self.assertTrue(mech.gyro.zeroed)
+        publish_live_motor_voltage(3.0, 2.0, 11.5)
         self.assertAlmostEqual(mech.motor.position, 1.0)
         self.assertAlmostEqual(mech.motor.velocity, 2.0)
+        self.assertAlmostEqual(mech.motor.voltage, 11.5)
         self.assertAlmostEqual(mech.motor.current, 30.0)
         self.assertAlmostEqual(mech.motor.supply_current_a, 18.0)
         self.assertAlmostEqual(mech.gyro.yaw, 0.0)
@@ -872,7 +905,9 @@ dio = 2
         for dev in ("lift", "cc", "gyro", "enc"):
             hw.set_connected("lift", dev, True)
         sim.step(0.02)
+        publish_live_motor_voltage(5.0, 2.0, 11.5)
         self.assertAlmostEqual(mech.motor.position, 3.0)
+        self.assertAlmostEqual(mech.motor.voltage, 11.5)
         self.assertAlmostEqual(mech.gyro.yaw, 0.25)
 
         del hw
@@ -950,27 +985,87 @@ dio = 2
         with self.assertRaises(talos.TalosError):
             sim.step(0.02)
 
-    # REQ-SAFE-06: a motor setter outside update() raises, naming the motor
+    # REQ-SAFE-06: every motor setter outside update() (every(), __init__,
+    # callback, off-thread) raises TalosError naming the motor
     def test_motor_command_outside_update_raises(self):
         # The flush after each update() sends neutral for every motor that
         # update() did not set, so a command from every() would pulse.
-        class Pulser:
+        torque_toml = ROBOT_TOML.replace(
+            "can_id = 1\n",
+            "can_id = 1\nfoc = true\nmax_torque_current_a = 5.0\n")
+        setters = (
+            ("set_duty_cycle", lambda m: m.set_duty_cycle(0.5)),
+            ("set_voltage", lambda m: m.set_voltage(6.0)),
+            ("set_velocity", lambda m: m.set_velocity(10.0)),
+            ("set_position", lambda m: m.set_position(1.0)),
+            ("set_motion_magic", lambda m: m.set_motion_magic(1.0)),
+            ("set_torque_current", lambda m: m.set_torque_current(2.0)),
+            ("stop", lambda m: m.stop()),
+        )
+        for name, call in setters:
+            with self.subTest(setter=name):
+                class Pulser:
+                    def __init__(self, node):
+                        self.lift = talos.Motor(node, "lift")
+                        node.every(0.02, lambda: call(self.lift))
+
+                    def update(self):
+                        pass
+
+                sim = Sim.from_toml(torque_toml)
+                sim.add(Pulser, "lift")
+                with self.assertRaisesRegex(talos.TalosError, r"'lift'"):
+                    sim.step(0.05)
+
+    # REQ-SAFE-06: Motor, DigitalOutput and PwmOutput setters called from
+    # __init__, a message callback, outside update(), or off the loop thread
+    # raise TalosError naming the device
+    def test_output_setters_in_init_callback_and_off_thread_raise(self):
+        toml = ROBOT_TOML + """
+[subsystems.lift.digital_outputs.led]
+dio = 1
+[subsystems.lift.pwm_outputs.servo]
+channel = 0
+"""
+        init_cases = (
+            ("motor", "'lift'",
+             lambda n: talos.Motor(n, "lift").set_voltage(6.0)),
+            ("led", "'led'",
+             lambda n: talos.DigitalOutput(n, "led").set(True)),
+            ("servo_set", "'servo'",
+             lambda n: talos.PwmOutput(n, "servo").set(0.5)),
+            ("servo_stop", "'servo'",
+             lambda n: talos.PwmOutput(n, "servo").stop()),
+        )
+        for label, device, call in init_cases:
+            with self.subTest(context="init", case=label):
+                class Eager:
+                    def __init__(self, node):
+                        call(node)
+
+                sim = Sim.from_toml(toml)
+                with self.assertRaisesRegex(talos.TalosError, device):
+                    sim.add(Eager, "lift")
+
+        # Message callback on the loop thread, outside update().
+        class Listener:
             def __init__(self, node):
-                self.lift = talos.Motor(node, "lift")
-                node.every(0.02, lambda: self.lift.set_voltage(6.0))
+                talos.allow_untargeted_outputs(node)
+                self.led = talos.DigitalOutput(node, "led")
+                node.subscribe(Goal, "/test/poke",
+                               callback=lambda _: self.led.set(True))
 
             def update(self):
                 pass
 
-        sim = Sim.from_toml(ROBOT_TOML)
-        sim.add(Pulser, "lift")
-        with self.assertRaisesRegex(talos.TalosError,
-                                    r"motor 'lift'.*outside update\(\)"):
-            sim.step(0.05)
+        sim = Sim.from_toml(toml)
+        sim.add(Listener, "lift")
+        sim.publish(Goal, "/test/poke", height_rot=0.0, enabled=True,
+                    tick_count=1)
+        with self.assertRaisesRegex(talos.TalosError, r"'led'"):
+            sim.step(0.02)
 
-    # REQ-SAFE-06: a DigitalOutput set() outside update() raises, naming the
-    # device
-    def test_digital_output_set_outside_update_raises(self):
+        # Direct call outside update() on DigitalOutput.
         class Light:
             def __init__(self, node):
                 self.led = talos.DigitalOutput(node, "led")
@@ -978,14 +1073,45 @@ dio = 2
             def update(self):
                 pass
 
-        sim = Sim.from_toml(ROBOT_TOML + """
-[subsystems.lift.digital_outputs.led]
-dio = 1
-""")
+        sim = Sim.from_toml(toml)
         light = sim.add(Light, "lift")
-        with self.assertRaisesRegex(talos.TalosError,
-                                    r"'led'.*outside update\(\)"):
+        with self.assertRaisesRegex(talos.TalosError, r"'led'"):
             light.led.set(True)
+
+        # Off-thread setters while update() is running.
+        class Threaded:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.lift = talos.Motor(node, "lift")
+                self.led = talos.DigitalOutput(node, "led")
+                self.servo = talos.PwmOutput(node, "servo")
+                self.errors = {}
+
+            def update(self):
+                def worker():
+                    for key, fn in (
+                        ("lift", lambda: self.lift.set_voltage(1.0)),
+                        ("led", lambda: self.led.set(True)),
+                        ("servo_set", lambda: self.servo.set(0.5)),
+                        ("servo_stop", lambda: self.servo.stop()),
+                    ):
+                        try:
+                            fn()
+                            self.errors[key] = None
+                        except talos.TalosError as err:
+                            self.errors[key] = str(err)
+
+                thread = threading.Thread(target=worker)
+                thread.start()
+                thread.join()
+
+        sim = Sim.from_toml(toml)
+        threaded = sim.add(Threaded, "lift")
+        sim.step(0.02)
+        self.assertIn("'lift'", threaded.errors["lift"])
+        self.assertIn("'led'", threaded.errors["led"])
+        self.assertIn("'servo'", threaded.errors["servo_set"])
+        self.assertIn("'servo'", threaded.errors["servo_stop"])
 
     # REQ-SAFE-43: set_torque_current reaches the request as stator amperes,
     # clamped to the motor's limit and counted, and on a motor whose config

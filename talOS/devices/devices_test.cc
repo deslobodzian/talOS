@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -15,7 +16,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
@@ -125,6 +128,14 @@ std::optional<hardware::Command> LastCommand(const Sim& sim) {
   hardware::Command command{};
   EXPECT_TRUE(hardware::Decode(packet->bytes(), command));
   return command;
+}
+
+// The newest /hw/state SimHardware published, decoded.
+hardware::State LatestState(const Sim& sim) {
+  const auto packet = sim.latest<Packet>(hardware::kStateTopic);
+  hardware::State state{};
+  EXPECT_TRUE(packet && hardware::Decode(packet->bytes(), state));
+  return state;
 }
 
 // REQ-CONTRACT-34
@@ -869,7 +880,11 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
       AllowUntargetedOutputs(n);
     }
     void update() {
-      absolute.set_position(0.25);
+      if (absolute_mode == Mode::kMotionMagic) {
+        absolute.set_motion_magic(0.25);
+      } else {
+        absolute.set_position(0.25);
+      }
       switch (rotor_mode) {
         case Mode::kVoltage:
           rotor.set_voltage(3);
@@ -883,6 +898,7 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
       }
     }
     Motor absolute, rotor;
+    Mode absolute_mode = Mode::kPosition;
     Mode rotor_mode = Mode::kMotionMagic;
   };
   std::string toml{kRobotToml};
@@ -897,9 +913,13 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kPosition);
+  mech.absolute_mode = Mode::kMotionMagic;
   mech.rotor_mode = Mode::kPosition;
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 0.25);
+  mech.absolute_mode = Mode::kPosition;
   mech.rotor_mode = Mode::kVoltage;
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kVoltage);
@@ -939,6 +959,11 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
   EXPECT_TRUE(mech.absolute.zeroed());
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kPosition);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 1.25);
+  mech.absolute_mode = Mode::kMotionMagic;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 1.25);
+  mech.absolute_mode = Mode::kPosition;
   mech.rotor.rezero();
   sim.step(10ms);
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
@@ -953,6 +978,128 @@ TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
   EXPECT_TRUE(mech.absolute.zeroed());
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kPosition);
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 1.25);
+  mech.absolute_mode = Mode::kMotionMagic;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 1.25);
+}
+
+// REQ-SAFE-05: a device reset counted in a consecutive gateway State
+// (sequence + 1) masks the reset device together with its remote-sensor
+// consumers and followers, dropping their rezero-frame zeros (and holding
+// their position/motion-magic goals neutral) while keeping unrelated devices'
+// zeros intact.
+TEST(Devices, ConsecutiveResetMasksRemoteSensorConsumerAndFollowerZeros) {
+  constexpr const char* kChainToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.mech.sensors.cc]
+type = "CANcoder"
+can_id = 1
+[subsystems.mech.sensors.gyro]
+type = "Pigeon2"
+can_id = 2
+[subsystems.mech.motors.remote]
+can_id = 3
+feedback = "RemoteCANcoder"
+feedback_sensor = "cc"
+[subsystems.mech.motors.master]
+can_id = 4
+[subsystems.mech.motors.follower]
+can_id = 5
+follow = "master"
+[subsystems.mech.motors.unrelated]
+can_id = 6
+)";
+  struct Chain {
+    explicit Chain(Node& n)
+        : remote{n, "remote"},
+          master{n, "master"},
+          follower{n, "follower"},
+          unrelated{n, "unrelated"},
+          gyro{n, "gyro"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      if (remote_motion_magic) {
+        remote.set_motion_magic(1.0);
+      } else {
+        remote.set_position(1.0);
+      }
+      master.set_position(1.0);
+      follower.set_position(1.0);
+      unrelated.set_position(1.0);
+    }
+    Motor remote, master, follower, unrelated;
+    Gyro gyro;
+    bool remote_motion_magic = true;
+  };
+
+  auto sim = Sim::FromToml(kChainToml);
+  auto& mech = sim.add<Chain>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(10ms);
+  mech.remote.rezero();
+  mech.master.rezero();
+  mech.follower.rezero();
+  mech.unrelated.rezero();
+  mech.gyro.rezero();
+  sim.step(10ms);
+  ASSERT_EQ(hw.motor_request("mech", "remote").mode, Mode::kMotionMagic);
+  ASSERT_EQ(hw.motor_request("mech", "master").mode, Mode::kPosition);
+  ASSERT_EQ(hw.motor_request("mech", "follower").mode, Mode::kPosition);
+  ASSERT_EQ(hw.motor_request("mech", "unrelated").mode, Mode::kPosition);
+
+  // Consecutive-State (sequence + 1) reset of the remote CANcoder drops the
+  // rezero-frame consumer's zero and holds both motion-magic and position
+  // neutral, while unrelated motors and the gyro keep theirs.
+  const std::uint64_t seq_before_cc = LatestState(sim).sequence;
+  hw.reset_device("mech", "cc");
+  sim.step(5ms);
+  ASSERT_EQ(LatestState(sim).sequence, seq_before_cc + 1);
+  ASSERT_EQ(LatestState(sim).counters.device_reset_count, 1u);
+  sim.step(20ms);  // drain reset State and restore
+  ASSERT_TRUE(mech.remote.connected());
+  EXPECT_FALSE(mech.remote.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "remote").mode, Mode::kNeutral);
+  mech.remote_motion_magic = false;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "remote").mode, Mode::kNeutral);
+  EXPECT_TRUE(mech.master.zeroed());
+  EXPECT_TRUE(mech.follower.zeroed());
+  EXPECT_TRUE(mech.unrelated.zeroed());
+  EXPECT_TRUE(mech.gyro.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "unrelated").mode, Mode::kPosition);
+
+  // Rezero remote, then reset master in a consecutive State: both master and
+  // its follower drop their zeros and go neutral, while remote, unrelated and
+  // gyro keep theirs.
+  mech.remote_motion_magic = true;
+  mech.remote.rezero();
+  sim.step(10ms);
+  ASSERT_TRUE(mech.remote.zeroed());
+  ASSERT_EQ(hw.motor_request("mech", "remote").mode, Mode::kMotionMagic);
+
+  const std::uint64_t seq_before_master = LatestState(sim).sequence;
+  hw.reset_device("mech", "master");
+  sim.step(5ms);
+  ASSERT_EQ(LatestState(sim).sequence, seq_before_master + 1);
+  ASSERT_EQ(LatestState(sim).counters.device_reset_count, 2u);
+  sim.step(20ms);  // drain reset State and restore
+  ASSERT_TRUE(mech.master.connected());
+  ASSERT_TRUE(mech.follower.connected());
+  EXPECT_FALSE(mech.master.zeroed());
+  EXPECT_FALSE(mech.follower.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "master").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.motor_request("mech", "follower").mode, Mode::kNeutral);
+  EXPECT_TRUE(mech.remote.zeroed());
+  EXPECT_TRUE(mech.unrelated.zeroed());
+  EXPECT_TRUE(mech.gyro.zeroed());
+  EXPECT_EQ(hw.motor_request("mech", "remote").mode, Mode::kMotionMagic);
+  EXPECT_EQ(hw.motor_request("mech", "unrelated").mode, Mode::kPosition);
 }
 
 TEST(Devices, NonFiniteDemandIsNeutral) {
@@ -1120,6 +1267,80 @@ TEST(Devices, AcceptStateRejectsAnotherConfigAndStaleSamples) {
   sim.publish(hardware::kStateTopic, StatePacket(id, 2000, false));
   sim.step(2ms);
   EXPECT_FALSE(robot_enabled(node));
+}
+
+// REQ-SAFE-20: node-side HardwareLink keeps commissioned = false without
+// --sim and forces commissioned = true in memory only under --sim, changing
+// the config id accepted on /hw/state.
+TEST(Devices, HardwareLinkCommissionsConfigIdOnlyUnderSim) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Watcher>("watcher");
+  Node& sim_node = sim.node("watcher");
+  const std::string config_path = sim_node.config_path();
+
+  const config::RobotConfig parsed = config::ParseRobotConfig(config_path);
+  ASSERT_FALSE(parsed.hardware.commissioned);
+  const std::uint64_t uncommissioned_id =
+      hardware::ConfigurationId(parsed.hardware);
+  hardware::Config commissioned_hw = parsed.hardware;
+  commissioned_hw.commissioned = true;
+  const std::uint64_t commissioned_id =
+      hardware::ConfigurationId(commissioned_hw);
+  ASSERT_NE(uncommissioned_id, commissioned_id);
+
+  // Under Sim (simulation() == true): HardwareLink sets commissioned = true
+  // in memory, rejects an uncommissioned State, and accepts the commissioned
+  // one.
+  ASSERT_TRUE(sim_node.simulation());
+  const auto& sim_link = sim_node.extension<HardwareLink>();
+  EXPECT_TRUE(sim_link.config().hardware.commissioned);
+  EXPECT_EQ(hardware::ConfigurationId(sim_link.config().hardware),
+            commissioned_id);
+  sim.publish(hardware::kStateTopic,
+              StatePacket(uncommissioned_id, 1000, true));
+  sim.step(2ms);
+  EXPECT_FALSE(robot_enabled(sim_node));
+  sim.publish(hardware::kStateTopic, StatePacket(commissioned_id, 2000, true));
+  sim.step(2ms);
+  EXPECT_TRUE(robot_enabled(sim_node));
+
+  // Through RunMain --describe without --sim vs with --sim: HardwareLink
+  // preserves commissioned = false when simulation() is false and sets it
+  // true only when --sim is passed.
+  const auto inspect = [&](bool with_sim) {
+    bool saw_simulation = false;
+    bool saw_commissioned = false;
+    std::uint64_t saw_config_id = 0;
+    std::vector<std::string> args = {"probe", "--describe", "--config",
+                                     config_path};
+    if (with_sim) args.push_back("--sim");
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (std::string& arg : args) argv.push_back(arg.data());
+    ::testing::internal::CaptureStdout();
+    const int status = detail::RunMain(
+        static_cast<int>(argv.size()), argv.data(), "watcher",
+        "//talOS/devices:probe", [&](Node& node) -> detail::Instance {
+          saw_simulation = node.simulation();
+          const auto& link = node.extension<HardwareLink>();
+          saw_commissioned = link.config().hardware.commissioned;
+          saw_config_id = hardware::ConfigurationId(link.config().hardware);
+          return std::make_shared<Watcher>(node);
+        });
+    static_cast<void>(::testing::internal::GetCapturedStdout());
+    EXPECT_EQ(status, 0);
+    return std::tuple{saw_simulation, saw_commissioned, saw_config_id};
+  };
+
+  const auto [no_sim_flag, no_sim_commissioned, no_sim_id] = inspect(false);
+  EXPECT_FALSE(no_sim_flag);
+  EXPECT_FALSE(no_sim_commissioned);
+  EXPECT_EQ(no_sim_id, uncommissioned_id);
+
+  const auto [sim_flag, sim_commissioned, sim_id] = inspect(true);
+  EXPECT_TRUE(sim_flag);
+  EXPECT_TRUE(sim_commissioned);
+  EXPECT_EQ(sim_id, commissioned_id);
 }
 
 // REQ-SAFE-11: HardwareLink orders States only within one gateway boot: a new
@@ -1484,44 +1705,96 @@ TEST(Devices, UnknownDeviceThrows) {
 // a constructor command (flushed at most once, on the first tick) is too.
 // REQ-SAFE-06: setters called outside update() throw, naming the device
 TEST(Devices, OutputSettersOutsideUpdateThrow) {
-  struct Pulser {
-    explicit Pulser(Node& node) : motor{node, "a"} {
-      node.every(20ms, [this] { motor.set_voltage(6); });
-    }
-    void update() {}
-    Motor motor;
-  };
   struct EagerLed {
     explicit EagerLed(Node& node) : led{node, "led"} { led.set(true); }
     void update() {}
     DigitalOutput led;
   };
-  // stop() is an output setter too: no pulse from the constructor would
-  // still be a command outside update().
-  struct EagerServo {
-    explicit EagerServo(Node& node) : servo{node, "servo"} { servo.stop(); }
+  // Both set() and stop() are output setters: no pulse from the constructor
+  // would still be a command outside update().
+  struct EagerServoSet {
+    explicit EagerServoSet(Node& node) : servo{node, "servo"} {
+      servo.set(0.5);
+    }
     void update() {}
     PwmOutput servo;
   };
-  {
-    auto sim = Sim::FromToml(kRobotToml);
-    EXPECT_THROW(sim.add<EagerServo>("mech"), std::logic_error);
-  }
-  {
-    auto sim = Sim::FromToml(kRobotToml);
-    sim.add<Pulser>("mech");
+  struct EagerServoStop {
+    explicit EagerServoStop(Node& node) : servo{node, "servo"} { servo.stop(); }
+    void update() {}
+    PwmOutput servo;
+  };
+  struct EagerMotor {
+    explicit EagerMotor(Node& node) : motor{node, "a"} { motor.set_voltage(6); }
+    void update() {}
+    Motor motor;
+  };
+  const auto expect_throws_naming = [](auto fn, std::string_view device) {
     try {
-      sim.step(50ms);
-      ADD_FAILURE() << "a motor command in every() was accepted";
+      fn();
+      ADD_FAILURE() << "output setter outside update() was accepted for "
+                    << device;
     } catch (const std::logic_error& error) {
       const std::string what = error.what();
-      EXPECT_NE(what.find("motor 'a'"), std::string::npos) << what;
-      EXPECT_NE(what.find("set outputs in update()"), std::string::npos)
-          << what;
+      EXPECT_NE(what.find(device), std::string::npos) << what;
     }
+  };
+  expect_throws_naming(
+      [] {
+        auto sim = Sim::FromToml(kRobotToml);
+        sim.add<EagerServoSet>("mech");
+      },
+      "'servo'");
+  expect_throws_naming(
+      [] {
+        auto sim = Sim::FromToml(kRobotToml);
+        sim.add<EagerServoStop>("mech");
+      },
+      "'servo'");
+  expect_throws_naming(
+      [] {
+        auto sim = Sim::FromToml(kRobotToml);
+        sim.add<EagerLed>("mech");
+      },
+      "'led'");
+  expect_throws_naming(
+      [] {
+        auto sim = Sim::FromToml(kRobotToml);
+        sim.add<EagerMotor>("mech");
+      },
+      "'a'");
+
+  // Every Motor output setter called from every() throws std::logic_error
+  // naming the motor (with torque current configured so the update()-gate
+  // fires before any config check).
+  struct MotorSetterCase {
+    const char* name;
+    void (*call)(Motor&);
+  };
+  const MotorSetterCase motor_cases[] = {
+      {"set_duty_cycle", [](Motor& m) { m.set_duty_cycle(0.5); }},
+      {"set_voltage", [](Motor& m) { m.set_voltage(6.0); }},
+      {"set_velocity", [](Motor& m) { m.set_velocity(10.0); }},
+      {"set_position", [](Motor& m) { m.set_position(1.0); }},
+      {"set_motion_magic", [](Motor& m) { m.set_motion_magic(1.0); }},
+      {"set_torque_current", [](Motor& m) { m.set_torque_current(2.0); }},
+      {"stop", [](Motor& m) { m.stop(); }},
+  };
+  struct Pulser {
+    explicit Pulser(Node& node) : motor{node, "a"} {
+      node.every(20ms, [this] { call(motor); });
+    }
+    void update() {}
+    Motor motor;
+    void (*call)(Motor&) = nullptr;
+  };
+  const std::string torque_toml = WithMotorAKeys(kTorqueKeys);
+  for (const auto& [name, call] : motor_cases) {
+    SCOPED_TRACE(name);
+    auto sim = Sim::FromToml(torque_toml);
+    sim.add<Pulser>("mech").call = call;
+    expect_throws_naming([&] { sim.step(50ms); }, "'a'");
   }
-  auto sim = Sim::FromToml(kRobotToml);
-  EXPECT_THROW(sim.add<EagerLed>("mech"), std::logic_error);
 }
 
 // A message callback runs on the loop thread but outside update(); another
@@ -1543,22 +1816,34 @@ TEST(Devices, OutputSettersFromACallbackOrAnotherThreadThrow) {
     Subscription<::bridge::BridgeStatus> poke;
   };
   struct Threaded {
-    explicit Threaded(Node& n) : servo{n, "servo"} {
+    explicit Threaded(Node& n)
+        : motor{n, "a"}, led{n, "led"}, servo{n, "servo"} {
       AllowUntargetedOutputs(n);
     }
     void update() {
       std::thread other{[this] {
-        try {
-          servo.set(0.5);
-          error = "accepted";
-        } catch (const std::logic_error& thrown) {
-          error = thrown.what();
-        }
+        auto capture = [](auto fn, std::string& out) {
+          try {
+            fn();
+            out = "accepted";
+          } catch (const std::logic_error& thrown) {
+            out = thrown.what();
+          }
+        };
+        capture([this] { motor.set_voltage(1.0); }, motor_error);
+        capture([this] { led.set(true); }, led_error);
+        capture([this] { servo.set(0.5); }, servo_set_error);
+        capture([this] { servo.stop(); }, servo_stop_error);
       }};
       other.join();
     }
+    Motor motor;
+    DigitalOutput led;
     PwmOutput servo;
-    std::string error;
+    std::string motor_error;
+    std::string led_error;
+    std::string servo_set_error;
+    std::string servo_stop_error;
   };
   {
     auto sim = Sim::FromToml(kRobotToml);
@@ -1575,10 +1860,14 @@ TEST(Devices, OutputSettersFromACallbackOrAnotherThreadThrow) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& threaded = sim.add<Threaded>("mech");
   sim.step(10ms);
-  EXPECT_NE(threaded.error.find("PwmOutput::set"), std::string::npos)
-      << threaded.error;
-  EXPECT_NE(threaded.error.find("'servo'"), std::string::npos)
-      << threaded.error;
+  EXPECT_NE(threaded.motor_error.find("'a'"), std::string::npos)
+      << threaded.motor_error;
+  EXPECT_NE(threaded.led_error.find("'led'"), std::string::npos)
+      << threaded.led_error;
+  EXPECT_NE(threaded.servo_set_error.find("'servo'"), std::string::npos)
+      << threaded.servo_set_error;
+  EXPECT_NE(threaded.servo_stop_error.find("'servo'"), std::string::npos)
+      << threaded.servo_stop_error;
 }
 
 // The opt-out is fixed with the node: from update() it is refused, naming
@@ -1668,13 +1957,47 @@ TEST(Devices, DisconnectedDevicesReadInvalidAndZero) {
   EXPECT_DOUBLE_EQ(mech.a.position(), 1.5);
 }
 
+// Publishes a valid State derived from the latest SimHardware State with a
+// non-zero applied voltage on `motor_name`, skipping one SimHardware publish
+// so the node drains it before disconnect or link staleness.
+void PublishLiveMotorVoltage(Sim& sim, SimHardware& hw,
+                             std::string_view motor_name, double voltage) {
+  const auto& motors =
+      sim.node("mech").extension<HardwareLink>().config().hardware.motors;
+  std::uint16_t motor_id = 0;
+  for (const auto& cfg : motors) {
+    if (cfg.name == motor_name) motor_id = cfg.id;
+  }
+  ASSERT_NE(motor_id, 0u);
+  hardware::State live = LatestState(sim);
+  bool found = false;
+  for (std::size_t i = 0; i < live.motor_count; ++i) {
+    if (live.motors[i].id == motor_id) {
+      ASSERT_TRUE(live.motors[i].valid);
+      live.motors[i].voltage = voltage;
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
+  live.sample_time_us += 1000;
+  ++live.sequence;
+  Packet packet{};
+  packet.size = static_cast<std::uint32_t>(hardware::Encode(live, packet.data));
+  ASSERT_GT(packet.size, 0u);
+  hw.lose_states(1);
+  sim.publish(hardware::kStateTopic, packet);
+  sim.step(5ms);
+}
+
 // An invalid sample carries zero (hardware::MarkInvalid), which is no
 // position: read through a rezero it would be a jump to -offset, and on any
 // position a jump to 0, that a display, a log or an odometry delta takes for
-// motion. Scenario: a rezeroed motor at 1 (raw 3), a rezeroed gyro at 0 (raw
-// 0.25), a CANcoder at 0.2 and an encoder at 0.4 all stop answering. Each
-// position reads the last valid value it had, connected() reads false, and
-// the rates read the State's zero; the next valid sample is read as it is.
+// motion. Scenario: a rezeroed motor at 1 (raw 3) with non-zero voltage and
+// currents, a rezeroed gyro at 0 (raw 0.25), a CANcoder at 0.2 and an encoder
+// at 0.4 all stop answering. Each position reads the last valid value it had,
+// connected() reads false, and the rates and efforts read the State's zero;
+// the next valid sample is read as it is.
 // REQ-CONTRACT-34
 TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
   auto sim = Sim::FromToml(kRobotToml);
@@ -1689,6 +2012,8 @@ TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
   mech.gyro.rezero();
   ASSERT_TRUE(mech.b.zeroed());
   ASSERT_TRUE(mech.gyro.zeroed());
+  PublishLiveMotorVoltage(sim, hw, "b", 11.5);
+  ASSERT_DOUBLE_EQ(mech.b.voltage(), 11.5);
   ASSERT_DOUBLE_EQ(mech.b.current(), 30.0);
   ASSERT_DOUBLE_EQ(mech.b.supply_current_a(), 18.0);
 
@@ -1724,12 +2049,12 @@ TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
 
 // A stale link is an invalid sample too: connected() reads false, and a node
 // cannot tell it from the gateway's. Scenario: a rezeroed motor at 1 (raw 3)
-// turning at 2 rot/s and drawing current, a rezeroed gyro turning at -0.5
-// rot/s, a CANcoder at 0.2 turning at 0.3 rot/s and a RoboRIO encoder at 0.4
-// turning at 0.6 rot/s, then no State for longer than command_timeout_us.
-// Each position holds its last valid value through its rezero offset, and
-// every rate and effort reads zero, not the last live value (a yaw rate of
-// -0.5 rot/s on a gyro reported disconnected).
+// turning at 2 rot/s with 11.5 V applied and drawing current, a rezeroed gyro
+// turning at -0.5 rot/s, a CANcoder at 0.2 turning at 0.3 rot/s and a RoboRIO
+// encoder at 0.4 turning at 0.6 rot/s, then no State for longer than
+// command_timeout_us. Each position holds its last valid value through its
+// rezero offset, and every rate and effort reads zero, not the last live value
+// (a yaw rate of -0.5 rot/s on a gyro reported disconnected).
 // REQ-CONTRACT-34
 TEST(Devices, StaleLinkHoldsPositionsAndZeroesRatesAndEfforts) {
   auto sim = Sim::FromToml(kRobotToml);
@@ -1744,8 +2069,11 @@ TEST(Devices, StaleLinkHoldsPositionsAndZeroesRatesAndEfforts) {
   mech.gyro.rezero();
   ASSERT_TRUE(mech.b.zeroed());
   ASSERT_TRUE(mech.gyro.zeroed());
+  PublishLiveMotorVoltage(sim, *hw, "b", 11.5);
   ASSERT_DOUBLE_EQ(mech.b.velocity(), 2);
+  ASSERT_DOUBLE_EQ(mech.b.voltage(), 11.5);
   ASSERT_DOUBLE_EQ(mech.b.current(), 30.0);
+  ASSERT_DOUBLE_EQ(mech.b.supply_current_a(), 18.0);
   ASSERT_DOUBLE_EQ(mech.gyro.yaw_rate(), -0.5);
   ASSERT_DOUBLE_EQ(mech.enc.velocity(), 0.6);
 
@@ -1766,14 +2094,6 @@ TEST(Devices, StaleLinkHoldsPositionsAndZeroesRatesAndEfforts) {
   EXPECT_EQ(mech.gyro.yaw_rate(), 0.0);
   EXPECT_EQ(mech.cc.velocity(), 0.0);
   EXPECT_EQ(mech.enc.velocity(), 0.0);
-}
-
-// The newest /hw/state SimHardware published, decoded.
-hardware::State LatestState(const Sim& sim) {
-  const auto packet = sim.latest<Packet>(hardware::kStateTopic);
-  hardware::State state{};
-  EXPECT_TRUE(packet && hardware::Decode(packet->bytes(), state));
-  return state;
 }
 
 // A backend whose every Read returns `read`, as PhoenixBackend reports a

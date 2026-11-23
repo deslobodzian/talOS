@@ -717,10 +717,56 @@ dio = 2
             TALOS_OK);
   ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
 
+  // SimHardware::set_motor leaves MotorSample::voltage at 0.0; patch the
+  // latest encoded /hw/state packet so the live sample carries a non-zero
+  // voltage (11.5 V) before disconnect or staleness, proving voltage -> 0.0
+  // is not tautological.
+  auto publish_live_motor_voltage = [&](double expected_pos,
+                                        double expected_vel, double voltage) {
+    constexpr uint32_t kPacketSize = 1436;
+    constexpr size_t kWire = 4;  // uint32_t size prefix in hardware::Packet
+    std::vector<uint8_t> packet(kPacketSize);
+    ASSERT_EQ(
+        talos_sim_latest_raw(sim, "/hw/state", packet.data(), kPacketSize), 1);
+    uint32_t wire_size = 0;
+    std::memcpy(&wire_size, packet.data(), sizeof wire_size);
+    ASSERT_GE(wire_size, 84u + 45u);
+    ASSERT_LE(wire_size, kPacketSize - kWire);
+    uint16_t motor_count = 0;
+    std::memcpy(&motor_count, packet.data() + kWire + 70, sizeof motor_count);
+    ASSERT_EQ(motor_count, 1u);
+    ASSERT_EQ(packet[kWire + 84 + 2], 1u);  // motors[0].valid
+    double pos = 0;
+    double vel = 0;
+    std::memcpy(&pos, packet.data() + kWire + 84 + 3, sizeof pos);
+    std::memcpy(&vel, packet.data() + kWire + 84 + 11, sizeof vel);
+    ASSERT_DOUBLE_EQ(pos, expected_pos);
+    ASSERT_DOUBLE_EQ(vel, expected_vel);
+    uint64_t sample_time_us = 0;
+    uint64_t sequence = 0;
+    std::memcpy(&sample_time_us, packet.data() + kWire + 24,
+                sizeof sample_time_us);
+    std::memcpy(&sequence, packet.data() + kWire + 48, sizeof sequence);
+    sample_time_us += 1000;
+    ++sequence;
+    std::memcpy(packet.data() + kWire + 24, &sample_time_us,
+                sizeof sample_time_us);
+    std::memcpy(packet.data() + kWire + 48, &sequence, sizeof sequence);
+    std::memcpy(packet.data() + kWire + 84 + 19, &voltage, sizeof voltage);
+    ASSERT_EQ(talos_sim_hardware_lose_states(hw, 1), TALOS_OK)
+        << talos_last_error();
+    ASSERT_EQ(
+        talos_sim_publish_raw(sim, "/hw/state", packet.data(), kPacketSize),
+        TALOS_OK)
+        << talos_last_error();
+    ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+  };
+
   ASSERT_EQ(talos_motor_rezero(node, h.wheel, 1.0), TALOS_OK);
   ASSERT_EQ(talos_gyro_rezero(node, h.gyro, 0.0), TALOS_OK);
   ASSERT_EQ(talos_motor_zeroed(node, h.wheel), 1);
   ASSERT_EQ(talos_gyro_zeroed(node, h.gyro), 1);
+  publish_live_motor_voltage(3.0, 2.0, 11.5);
 
   ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
   ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
@@ -729,6 +775,7 @@ dio = 2
   EXPECT_EQ(wheel.valid, 1);
   EXPECT_DOUBLE_EQ(wheel.position, 1.0);
   EXPECT_DOUBLE_EQ(wheel.velocity, 2.0);
+  EXPECT_DOUBLE_EQ(wheel.voltage, 11.5);
   EXPECT_DOUBLE_EQ(wheel.current, 30.0);
   EXPECT_DOUBLE_EQ(wheel.supply_current_a, 18.0);
   EXPECT_EQ(cc.valid, 1);
@@ -782,9 +829,11 @@ dio = 2
     ASSERT_EQ(talos_sim_hardware_set_connected(hw, "mech", dev, 1), TALOS_OK);
   }
   ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+  publish_live_motor_voltage(5.0, 2.0, 11.5);
   ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
   ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
   ASSERT_DOUBLE_EQ(wheel.position, 3.0);
+  ASSERT_DOUBLE_EQ(wheel.voltage, 11.5);
   ASSERT_DOUBLE_EQ(gyro.position, 0.25);
 
   talos_sim_hardware_destroy(hw);
