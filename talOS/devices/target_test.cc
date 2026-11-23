@@ -2077,5 +2077,31 @@ TEST(Target, AConsumerStartedAfterATargetWasPublishedNeverDrivesOnIt) {
   EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kDutyCycle);
 }
 
+// REQ-CONTRACT-13: TargetEnvelopeBytes rejects sizes that would wrap size_t or
+// exceed uint32_t::max() after adding the 16-byte envelope header.
+TEST(Target, TargetEnvelopeBytesRejectsOverflowAndUint32Truncation) {
+  constexpr std::size_t kSizeWrap =
+      std::numeric_limits<std::size_t>::max() - 7;  // divisible by 8; +16 -> 8
+  constexpr std::size_t kUint32Wrap =
+      std::numeric_limits<std::uint32_t>::max() - 7;  // +16 > UINT32_MAX
+  EXPECT_THROW((void)detail::TargetEnvelopeBytes(kSizeWrap, 8),
+               std::invalid_argument);
+  EXPECT_THROW((void)detail::TargetEnvelopeBytes(kUint32Wrap, 8),
+               std::invalid_argument);
+}
+
+// REQ-SAFE-07: opening a Target after start() fails atomically without leaking
+// lane subscriptions onto the node.
+TEST(Target, LateOpenTargetFailsAtomicallyWithoutLeakingSubscriptions) {
+  struct Empty {
+    explicit Empty(Node&) {}
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("lift");
+  Node& node = sim.node("lift");
+  EXPECT_THROW((void)Target<Goal>(node), std::logic_error);
+  EXPECT_TRUE(detail::NodeAccess::optional_topics(node).empty());
+}
+
 }  // namespace
 }  // namespace talos

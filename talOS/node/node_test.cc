@@ -1924,5 +1924,130 @@ can_id = 1
   }
 }
 
+// REQ-CONTRACT-14: default-constructed Subscription, Publisher, and
+// BytePublisher throw std::logic_error instead of dereferencing null.
+TEST(Node, DefaultConstructedHandlesThrowInsteadOfDereferencingNull) {
+  const Subscription<Count> sub{};
+  EXPECT_THROW((void)sub.has_value(), std::logic_error);
+  EXPECT_THROW((void)sub.value(), std::logic_error);
+  EXPECT_THROW((void)sub.fresh(), std::logic_error);
+  EXPECT_THROW((void)sub.age(), std::logic_error);
+  EXPECT_THROW((void)sub.updated(), std::logic_error);
+
+  Publisher<Count> pub{};
+  EXPECT_THROW((void)pub.send(Count{1, 2}), std::logic_error);
+
+  BytePublisher bpub{};
+  const std::byte byte{0x01};
+  EXPECT_THROW((void)bpub.send(std::span<const std::byte>{&byte, 1}),
+               std::logic_error);
+}
+
+// REQ-RT-05: oversized period_us and Node::every / Sim::step / Sim::pause
+// durations reject int64 nanosecond overflow rather than triggering signed
+// overflow UB, and Sim::pause / Sim::resume reject re-entrancy inside step().
+TEST(Node, PeriodEveryAndSimStepPauseRejectOverflowAndReentrancy) {
+  // Non-actuator subsystem with period_us exceeding int64 nanoseconds / 1000.
+  auto overflow_sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.huge]
+period_us = 10000000000000000
+)");
+  EXPECT_THROW(overflow_sim.add<Empty>("huge"), std::invalid_argument);
+
+  // Node::every() with Duration::max() after sim clock advances would overflow
+  // now() + period; it must reject before registering a timer.
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.step(10ms);
+  struct HugeEvery {
+    explicit HugeEvery(Node& n) {
+      EXPECT_THROW(n.every(Duration::max(), [] {}), std::invalid_argument);
+    }
+  };
+  sim.add<HugeEvery>("talker");
+
+  // Sim::step and Sim::pause reject int64 overflow on now + d.
+  EXPECT_THROW(sim.step(Duration::max()), std::invalid_argument);
+  EXPECT_THROW(sim.pause("talker", Duration::max()), std::invalid_argument);
+
+  // Re-entrant pause / resume from inside step() throws std::logic_error.
+  struct ReentrantPauseResume {
+    explicit ReentrantPauseResume(Node&) {}
+    void update() {
+      if (sim == nullptr || ran) return;
+      ran = true;
+      EXPECT_THROW(sim->pause("talker", 5ms), std::logic_error);
+      EXPECT_THROW(sim->resume("talker"), std::logic_error);
+    }
+    Sim* sim = nullptr;
+    bool ran = false;
+  };
+  auto& probe = sim.add<ReentrantPauseResume>("listener");
+  probe.sim = &sim;
+  sim.step(10ms);
+  EXPECT_TRUE(probe.ran);
+
+  // SimAccess rejects zero-byte and >uint32_t::max() message sizes.
+  const std::byte dummy{0};
+  EXPECT_THROW(detail::SimAccess::publish_raw(sim, "/t/zero", &dummy, 0),
+               std::invalid_argument);
+  EXPECT_THROW((void)detail::SimAccess::message_count(sim, "/t/zero", 0),
+               std::invalid_argument);
+  const std::size_t too_large =
+      static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) + 1;
+  EXPECT_THROW(detail::SimAccess::publish_raw(sim, "/t/big", &dummy, too_large),
+               std::invalid_argument);
+}
+
+// REQ-RT-02: a late Wake::kOnPublish callback subscription after start() fails
+// atomically without leaking a watcher onto the event loop.
+TEST(Node, LateOnPublishSubscribeFailsAtomicallyWithoutLeakingWatcher) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Empty>("listener");
+  Node& node = sim.node("listener");
+  int calls = 0;
+  EXPECT_THROW(
+      (void)node.subscribe<Count>(
+          "/listener/late", [&](const Count&) { ++calls; }, Wake::kOnPublish),
+      std::logic_error);
+  sim.publish("/listener/late", Count{1, 0});
+  sim.step(20ms);
+  EXPECT_EQ(calls, 0);
+}
+
+// REQ-CONTRACT-13: RunMain rejects negative argc, null argv/argv[i], negative
+// unsigned flags, and trailing garbage on numeric CLI flags cleanly.
+TEST(Node, RunMainRejectsNullArgvAndMalformedNumericFlags) {
+  const auto noop_factory = detail::MakeInstance<Empty>();
+  EXPECT_EQ(detail::RunMain(-1, nullptr, "n", "//a:b", noop_factory), 1);
+  EXPECT_EQ(detail::RunMain(2, nullptr, "n", "//a:b", noop_factory), 1);
+
+  char prog[] = "node";
+  char* with_null[] = {prog, nullptr};
+  EXPECT_EQ(detail::RunMain(2, with_null, "n", "//a:b", noop_factory), 1);
+
+  const auto run_with = [&](std::vector<std::string> args) {
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (auto& a : args) argv.push_back(a.data());
+    return detail::RunMain(static_cast<int>(argv.size()), argv.data(),
+                           "listener", "//a:listener", noop_factory);
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  const std::string cfg = detail::SimAccess::config_path(sim);
+  for (const auto& bad : std::vector<std::vector<std::string>>{
+           {"node", "--describe", "--config", cfg, "--log-max-bytes", "-1"},
+           {"node", "--describe", "--config", cfg, "--log-max-bytes", "10abc"},
+           {"node", "--describe", "--config", cfg, "--session-id", "-1"},
+           {"node", "--describe", "--config", cfg, "--session-id", "42xyz"},
+           {"node", "--describe", "--config", cfg, "--duration-s", "5xyz"},
+       }) {
+    EXPECT_EQ(run_with(bad), 1) << bad.back();
+  }
+}
+
 }  // namespace
 }  // namespace talos

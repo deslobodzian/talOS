@@ -9,10 +9,12 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -145,7 +147,10 @@ struct Sim::Impl {
 
   ~Impl() {
     nodes.clear();
-    if (owns_config_file) std::filesystem::remove(config_path);
+    if (owns_config_file) {
+      std::error_code ec;
+      std::filesystem::remove(config_path, ec);
+    }
   }
 
   // Runs every node's loop up to `until` in the order the nodes were added,
@@ -220,11 +225,16 @@ struct Sim::Impl {
 
   void RunPeriodic() {
     for (std::size_t i = 0; i < periodic.size();) {
-      Periodic& p = periodic[i];
       bool keep = true;
-      while (keep && now >= p.next) {
-        keep = p.fn();
-        p.next += p.period;
+      while (keep && now >= periodic[i].next) {
+        // Re-index across fn(): it may append to `periodic` via Sim::every().
+        auto fn = periodic[i].fn;
+        keep = fn();
+        if (periodic[i].period > Duration::max() - periodic[i].next) {
+          periodic[i].next = Duration::max();
+          break;
+        }
+        periodic[i].next += periodic[i].period;
       }
       if (keep) {
         ++i;
@@ -286,10 +296,17 @@ void Sim::remove(std::string_view node_name) {
 }
 
 void Sim::pause(std::string_view node_name, Duration duration) {
+  Impl& impl = *impl_;
+  if (impl.stepping) {
+    throw std::logic_error("Sim: pause() cannot be called inside step()");
+  }
   if (duration < Duration::zero()) {
     throw std::invalid_argument("Sim: negative pause");
   }
-  for (const auto& hosted : impl_->nodes) {
+  if (duration > Duration::max() - impl.now) {
+    throw std::invalid_argument("Sim: pause duration overflows clock");
+  }
+  for (const auto& hosted : impl.nodes) {
     if (hosted->name == node_name) {
       hosted->paused_until = now() + duration;
       return;
@@ -300,7 +317,11 @@ void Sim::pause(std::string_view node_name, Duration duration) {
 }
 
 void Sim::resume(std::string_view node_name) {
-  for (const auto& hosted : impl_->nodes) {
+  Impl& impl = *impl_;
+  if (impl.stepping) {
+    throw std::logic_error("Sim: resume() cannot be called inside step()");
+  }
+  for (const auto& hosted : impl.nodes) {
     if (hosted->name == node_name) {
       if (hosted->paused_until) {
         hosted->paused_until.reset();
@@ -333,6 +354,9 @@ void Sim::step(Duration d) {
   Impl& impl = *impl_;
   if (impl.stepping) {
     throw std::logic_error("Sim: step() cannot be called inside step()");
+  }
+  if (d > Duration::max() - impl.now) {
+    throw std::invalid_argument("Sim: step duration overflows clock");
   }
   struct Stepping {
     bool& flag;
@@ -445,9 +469,27 @@ void SimAccess::every(Sim& sim, Duration period, std::function<bool()> fn) {
   sim.impl_->periodic.push_back({period, sim.impl_->now, std::move(fn)});
 }
 
+namespace {
+
+std::uint32_t CheckRawSize(std::string_view topic, std::size_t bytes) {
+  if (bytes == 0 || bytes > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("Sim: bad message size " +
+                                std::to_string(bytes) + " on '" +
+                                std::string{topic} + "'");
+  }
+  return static_cast<std::uint32_t>(bytes);
+}
+
+}  // namespace
+
 void SimAccess::publish_raw(Sim& sim, std::string_view topic, const void* data,
                             std::size_t bytes) {
-  sim.impl_->environment.channel(topic, static_cast<std::uint32_t>(bytes))
+  const std::uint32_t size = CheckRawSize(topic, bytes);
+  if (data == nullptr) {
+    throw std::invalid_argument("Sim: null message on '" + std::string{topic} +
+                                "'");
+  }
+  sim.impl_->environment.channel(topic, size)
       .publish(std::span<const std::byte>{static_cast<const std::byte*>(data),
                                           bytes},
                sim.now());
@@ -455,15 +497,18 @@ void SimAccess::publish_raw(Sim& sim, std::string_view topic, const void* data,
 
 std::uint64_t SimAccess::message_count(const Sim& sim, std::string_view topic,
                                        std::size_t bytes) {
-  return sim.impl_->environment
-      .channel(topic, static_cast<std::uint32_t>(bytes))
+  return sim.impl_->environment.channel(topic, CheckRawSize(topic, bytes))
       .next_sequence();
 }
 
 void SimAccess::read_raw(const Sim& sim, std::string_view topic,
                          std::size_t bytes, std::uint64_t sequence, void* out) {
-  auto& channel =
-      sim.impl_->environment.channel(topic, static_cast<std::uint32_t>(bytes));
+  const std::uint32_t size = CheckRawSize(topic, bytes);
+  if (out == nullptr) {
+    throw std::invalid_argument("Sim: null output buffer on '" +
+                                std::string{topic} + "'");
+  }
+  auto& channel = sim.impl_->environment.channel(topic, size);
   if (sequence >= channel.next_sequence()) {
     throw std::out_of_range("Sim: no message " + std::to_string(sequence) +
                             " on '" + std::string{topic} + "'");
@@ -482,8 +527,7 @@ SimReads SimAccess::reads(const Sim& sim, std::string_view node_name) {
 
 Time SimAccess::publish_time(const Sim& sim, std::string_view topic,
                              std::size_t bytes, std::uint64_t sequence) {
-  return sim.impl_->environment
-      .channel(topic, static_cast<std::uint32_t>(bytes))
+  return sim.impl_->environment.channel(topic, CheckRawSize(topic, bytes))
       .publish_time(sequence);
 }
 

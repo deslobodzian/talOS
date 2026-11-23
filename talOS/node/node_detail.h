@@ -108,8 +108,8 @@ struct NodeDetail {
   static std::size_t add_subscription(Node& node, std::string_view topic,
                                       std::size_t bytes, std::size_t alignment,
                                       const schema::Identity& schema,
-                                      bool optional,
-                                      MessageCallback on_message);
+                                      bool optional, MessageCallback on_message,
+                                      bool prompt = false);
   static const void* subscription_value(const Node& node, std::size_t index);
   static bool subscription_has_value(const Node& node, std::size_t index);
   static Duration subscription_age(const Node& node, std::size_t index);

@@ -150,4 +150,123 @@ TEST_F(SafetyAbiTest, SetDriverStationRejectsOutOfRangeAllianceStationAndPov) {
       << talos_last_error();
 }
 
+// REQ-CONTRACT-13: talos_run rejects negative argc, null argv, and null
+// argv[i] cleanly instead of dereferencing null.
+TEST_F(SafetyAbiTest, RunRejectsNegativeArgcAndNullArgv) {
+  auto noop = [](TalosNode*, void*) -> int32_t { return 0; };
+  EXPECT_EQ(talos_run(-1, nullptr, "roller", "//a:roller", noop, nullptr), 1);
+  EXPECT_NE(std::string{talos_last_error()}.size(), 0u);
+  EXPECT_EQ(talos_run(2, nullptr, "roller", "//a:roller", noop, nullptr), 1);
+  char prog[] = "node";
+  char* with_null[] = {prog, nullptr};
+  EXPECT_EQ(talos_run(2, with_null, "roller", "//a:roller", noop, nullptr), 1);
+}
+
+// REQ-CONTRACT-13: C ABI sim/target functions reject zero-byte raw topics and
+// envelope sizes that overflow uint32_t.
+TEST_F(SafetyAbiTest, SimRawAndTargetRejectZeroAndOverflowingSizes) {
+  uint8_t buf[8] = {};
+  EXPECT_EQ(talos_sim_publish_raw(sim_, "/roller/zero", buf, 0), TALOS_ERR);
+  EXPECT_EQ(talos_sim_latest_raw(sim_, "/roller/zero", buf, 0), TALOS_ERR);
+
+  constexpr uint32_t kOverflow = 0xFFFFFFF8u;  // +16 exceeds uint32_t::max()
+  int32_t active = -1;
+  EXPECT_EQ(talos_sim_publish_target(sim_, "roller", "teleop", buf, kOverflow,
+                                     8, nullptr),
+            TALOS_ERR);
+  EXPECT_EQ(talos_sim_latest_target(sim_, "roller", "teleop", buf, kOverflow, 8,
+                                    &active),
+            TALOS_ERR);
+
+  struct BadTarget {
+    int64_t target = 0;
+    int64_t lane = 0;
+  } probe;
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& p = *static_cast<BadTarget*>(user);
+    constexpr TalosSchema kSchema{"safety.Big", 1u, nullptr, 0};
+    p.target = talos_target_open(node, kOverflow, 8, &kSchema);
+    p.lane = talos_target_lane_open(node, "roller", "auto", kOverflow, 8,
+                                    &kSchema, -1);
+    return 0;
+  };
+  ASSERT_NE(talos_sim_add(sim_, "roller", build, &probe), nullptr)
+      << talos_last_error();
+  EXPECT_EQ(probe.target, -1);
+  EXPECT_EQ(probe.lane, -1);
+}
+
+// REQ-SAFE-04: talos_motor_set with TALOS_MODE_NEUTRAL clears nonzero demand
+// and slot instead of sending non-zero fields in a neutral request.
+TEST_F(SafetyAbiTest, MotorSetNeutralNormalizesDemandAndSlot) {
+  struct NeutralSender {
+    TalosNode* node = nullptr;
+    int64_t wheel = -1;
+  } sender;
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& s = *static_cast<NeutralSender*>(user);
+    s.node = node;
+    s.wheel = talos_device(node, TALOS_DEVICE_MOTOR, "wheel");
+    if (s.wheel < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<NeutralSender*>(ctx);
+          return talos_motor_set(self.node, self.wheel, TALOS_MODE_NEUTRAL, 5.0,
+                                 0.0, 2);
+        },
+        &s);
+  };
+  ASSERT_NE(talos_sim_add(sim_, "roller", build, &sender), nullptr)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw_, 1), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  TalosMotorRequest req{};
+  ASSERT_EQ(talos_sim_hardware_motor_request(hw_, "roller", "wheel", &req),
+            TALOS_OK);
+  EXPECT_EQ(req.mode, TALOS_MODE_NEUTRAL);
+  EXPECT_DOUBLE_EQ(req.demand, 0.0);
+  EXPECT_EQ(req.slot, 0);
+}
+
+// REQ-RT-05, REQ-CONTRACT-13: C ABI sim step, pause, gateway clock, and
+// lose_states reject signed overflow and re-entrant pause/resume.
+TEST_F(SafetyAbiTest, SimAndHardwareRejectOverflowAndReentrantPauseResume) {
+  struct Reenter {
+    TalosSim* sim = nullptr;
+    int32_t pause_res = TALOS_OK;
+    int32_t resume_res = TALOS_OK;
+  } r{sim_};
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    return talos_node_set_update(
+        node,
+        [](void* ctx) -> int32_t {
+          auto& self = *static_cast<Reenter*>(ctx);
+          self.pause_res = talos_sim_pause(self.sim, "roller", 5 * kMs);
+          self.resume_res = talos_sim_resume(self.sim, "roller");
+          return 0;
+        },
+        user);
+  };
+  ASSERT_NE(talos_sim_add(sim_, "roller", build, &r), nullptr)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(r.pause_res, TALOS_ERR);
+  EXPECT_EQ(r.resume_res, TALOS_ERR);
+
+  EXPECT_EQ(talos_sim_step(sim_, std::numeric_limits<int64_t>::max()),
+            TALOS_ERR);
+  EXPECT_EQ(
+      talos_sim_pause(sim_, "roller", std::numeric_limits<int64_t>::max()),
+      TALOS_ERR);
+  EXPECT_EQ(talos_sim_hardware_set_gateway_clock(
+                hw_, std::numeric_limits<int64_t>::min(), 1),
+            TALOS_ERR);
+  ASSERT_EQ(
+      talos_sim_hardware_lose_states(hw_, std::numeric_limits<int32_t>::max()),
+      TALOS_OK);
+  EXPECT_EQ(talos_sim_hardware_lose_states(hw_, 1), TALOS_ERR);
+}
+
 }  // namespace

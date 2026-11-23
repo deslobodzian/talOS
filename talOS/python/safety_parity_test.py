@@ -498,6 +498,94 @@ class SafetyParityTest(unittest.TestCase):
                 with self.assertRaises(talos.TalosError):
                     getattr(intake, prop)
 
+    # REQ-CONTRACT-13, REQ-CONTRACT-14, REQ-SAFE-04: Python ctypes bindings
+    # reject out-of-range integer arguments instead of silently wrapping modulo
+    # 2**32 or 2**64 into valid C ABI values (e.g. slot=1<<32 -> slot=0,
+    # position_age_us=1<<32 -> 0 fresh, period/step wrap -> small positive).
+    def test_ctypes_integer_bounds_reject_silent_wraparound(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        hw.enable(True)
+        wrap_s = (1 << 64) / 1e9 + 0.01
+
+        class SlotOverflow:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.motor = talos.Motor(node, "wheel")
+                self.sm = talos.StateMachine(node, 0)
+                self.slot_exc = None
+
+            def update(self):
+                if self.slot_exc is None:
+                    try:
+                        self.motor.set_velocity(10.0, slot=(1 << 32))
+                    except (ValueError, OverflowError) as exc:
+                        self.slot_exc = exc
+
+        roller = sim.add(SlotOverflow, "roller")
+        sim.step(0.02)
+        self.assertIsNotNone(roller.slot_exc)
+        self.assertEqual(hw.motor_request("roller", "wheel").mode,
+                         talos.Mode.NEUTRAL)
+
+        with self.assertRaises((ValueError, OverflowError)):
+            roller.sm.go(1 << 63)
+        with self.assertRaises((ValueError, OverflowError)):
+            roller.sm.go(-(1 << 63) - 1)
+
+        class EveryOverflow:
+            def __init__(self, node):
+                node.every(wrap_s, lambda: None)
+
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.add(EveryOverflow, "planner")
+
+        class StateOverflow:
+            def __init__(self, node):
+                talos.StateMachine(node, 1 << 63)
+
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.add(StateOverflow, "planner")
+
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.step(wrap_s)
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.pause("roller", wrap_s)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_gateway_clock(offset=wrap_s, latency=0.0)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_motor("roller", "wheel", 0.0, 0.0, position_age_us=1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_motor("roller", "wheel", 0.0, 0.0, velocity_age_us=-1)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_cancoder("arm", "arm_cc", 0.0, 0.0, position_age_us=1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.lose_states(1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_driver_station(station=1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_driver_station(alliance=1 << 32)
+        with self.assertRaises((ValueError, OverflowError)):
+            hw.set_driver_station(joysticks=[Stick(povs=(1 << 32,))])
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.publish_target(Goal, "roller", "teleop", mode_since_us=-1,
+                               height_rot=1.0, enabled=True, tick_count=1)
+        with self.assertRaises((ValueError, OverflowError)):
+            sim.publish_target(Goal, "roller", "teleop", mode_since_us=1 << 64,
+                               height_rot=1.0, enabled=True, tick_count=1)
+
+    # REQ-CONTRACT-14: destroying a Sim (as during cyclic GC finalization)
+    # destroys and invalidates attached SimHardware wrappers so subsequent calls
+    # raise TalosError instead of dereferencing freed Sim memory (UAF).
+    def test_sim_destroy_invalidates_attached_sim_hardware(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        sim.__del__()
+        with self.assertRaises(talos.TalosError):
+            hw.enable(True)
+        with self.assertRaises(talos.TalosError):
+            hw.motor_request("roller", "wheel")
+
 
 if __name__ == "__main__":
     unittest.main()
