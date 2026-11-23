@@ -224,14 +224,14 @@ std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
 std::size_t CountDeclaredTopics(const std::vector<NodeDescription>& described);
 
 // Phase two's first step: the session owns every declared topic. Each
-// segment is created session-owned (rtms.h "Segment lifetime") before any
-// node starts, replacing whatever the name held, and unlinked when the
-// returned queues are destroyed at the end of the session. Nodes only
-// attach, so a node that is killed and restarted, or that exits cleanly,
-// leaves its topics -- and the subscribers reading them -- in place. A
-// topic of a node that did not answer --describe is not declared, so its
-// first process creates it as outside a session. Throws, naming the topic,
-// if a segment cannot be created.
+// segment is created session-owned before any node starts, replacing what
+// the name held as talOS/rtms/README.md "Segment lifetime" states, and
+// unlinked when the returned queues are destroyed at the end of the
+// session. Nodes only attach, so a node that is killed and restarted, or
+// that exits cleanly, leaves its topics -- and the subscribers reading them
+// -- in place. A topic of a node that did not answer --describe is not
+// declared, so its first process creates it as outside a session. Throws,
+// naming the topic, if a segment cannot be created.
 std::vector<RTMSQueue> CreateSessionSegments(
     const std::vector<NodeDescription>& described);
 
