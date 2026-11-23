@@ -50,11 +50,39 @@ place and unlinks it; an open that recorded itself and then failed to unlink
 fails rather than try again. A recorded process in another pid namespace, or
 one checked by a process whose own namespace cannot be compared, counts as
 running ([process liveness](process_liveness.h)): while it lives it unlinks the
-segment as usual, but if it died or is stuck, such an open waits and then
-fails until the name is unlinked or a session replaces it. A segment
+segment as usual, but if it died or is stuck, such an open, a session's
+included (below), waits and then fails until the name is unlinked. A segment
 whose last holder was killed otherwise stays and is reused; every attach,
 publisher or reader, refuses one of another version, layout or schema, which a
 launcher session replaces or `shm_unlink` removes.
+
+A session replaces the segment a name holds when it creates its own. A previous
+session's segment, one that is not of this build's format (too small, no magic,
+another version), or a name it cannot open or map, it unlinks. A standalone
+segment it unlinks only as the one process recorded to unlink it, so that no
+standalone queue's close or reclaim can unlink the name after the session's
+segment is created: while the recorded process lives the session waits for it
+to unlink the segment, as an open does; otherwise (queues still attached, or a
+recorded process that died or gave the record up) it records itself and unlinks
+the segment, then looks at the name again until it is free. It stops after 200
+attempts to claim, or when its unlink fails; if the name then still holds a
+segment, the launch fails with `RTMS: another process created <topic> while the
+session was creating it`. Queues still attached keep using the unlinked
+segment, and their close unlinks nothing. A session owner killed between
+recording itself and unlinking, or whose unlink failed, leaves such a segment
+closing with those queues still attached: while they hold its writer or a
+reader slot, a standalone open of the name fails with the "stayed closing"
+error, until they exit or the next session replaces it. A recorded process
+still alive after the wait (about a second) fails the launch with `RTMS: a
+session cannot replace <topic>: its claimant, pid <pid>, is still unlinking
+it`, followed by the remedy: stop that pid or wait for it to exit, then start
+the session again. When the session cannot check the recorded process (it is in
+another pid namespace, or the session's `/proc` is not its own pid
+namespace's), it counts as running and its pid may name another process: the
+error then says `pid <pid>, which this process cannot check (another pid
+namespace, or /proc is not this one's), counts as still unlinking it`, and the
+remedy is to `shm_unlink` the name once that process is gone, then start the
+session again.
 
 Publishers (`RTMSOptions::publisher`) atomically claim the header's writer when
 opening. A second live publisher, including another publisher in the same

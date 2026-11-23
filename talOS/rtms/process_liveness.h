@@ -106,6 +106,13 @@ std::uint64_t OwnProcessWord();
 // ProcessWordAliveFrom with this process's namespace code.
 bool ProcessWordAlive(std::uint64_t word);
 
+// Whether this process can check the process a word records: whether
+// ProcessWordAlive looks its pid up, rather than counting it as running
+// because its namespace and this process's checking namespace cannot be
+// compared (another pid namespace, or this process's /proc is not its own
+// pid namespace's).
+bool ProcessWordCheckable(std::uint64_t word);
+
 // Whether the process a word records still runs, as seen from a process in
 // namespace `checker`. A word from a namespace `checker` cannot compare with
 // (ProcessNamespaceComparable) counts as running. Otherwise a process with
