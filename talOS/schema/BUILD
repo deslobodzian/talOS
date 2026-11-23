@@ -20,6 +20,15 @@ cc_library(
     deps = [":descriptor"],
 )
 
+# talos::schema::VerifySchema: structural verification plus raw BaseType range
+# validation over every reflection::Type in a .bfbs schema. Header-only so
+# targets inside libtalos_node.so can share it without affecting link closures.
+cc_library(
+    name = "verify",
+    hdrs = ["verify.h"],
+    deps = ["@flatbuffers//:runtime_cc"],
+)
+
 # talos::schema::DecodeToText: a payload as named fields from its Identity's
 # .bfbs (flatbuffers/reflection.h), for log_dump.
 cc_library(
@@ -28,6 +37,7 @@ cc_library(
     hdrs = ["decode.h"],
     deps = [
         ":identity",
+        ":verify",
         "@flatbuffers//:runtime_cc",
     ],
 )
@@ -39,6 +49,7 @@ cc_test(
     deps = [
         ":decode",
         ":test_messages",
+        "@flatbuffers//:runtime_cc",
         "@googletest//:gtest_main",
     ],
 )
@@ -50,7 +61,10 @@ cc_library(
     name = "field_path",
     srcs = ["field_path.cc"],
     hdrs = ["field_path.h"],
-    deps = ["@flatbuffers//:runtime_cc"],
+    deps = [
+        ":verify",
+        "@flatbuffers//:runtime_cc",
+    ],
 )
 
 cc_test(
@@ -87,7 +101,10 @@ cc_library(
     name = "schema_hash",
     srcs = ["schema_hash.cc"],
     hdrs = ["schema_hash.h"],
-    deps = ["@flatbuffers//:runtime_cc"],
+    deps = [
+        ":verify",
+        "@flatbuffers//:runtime_cc",
+    ],
 )
 
 # Python classes for upstream reflection.fbs (`import reflection`): the

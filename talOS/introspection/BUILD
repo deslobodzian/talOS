@@ -25,6 +25,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//talOS/events:events_core",
+        "//talOS/schema:verify",
         "@flatbuffers//:runtime_cc",
     ],
 )
@@ -104,6 +105,7 @@ cc_test(
         "//talOS/rtms",
         "//talOS/schema:identity",
         "//talOS/schema:test_messages",
+        "@flatbuffers//:runtime_cc",
         "@googletest//:gtest_main",
     ],
 )

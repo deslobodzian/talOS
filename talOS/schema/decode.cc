@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "flatbuffers/reflection.h"
-#include "flatbuffers/verifier.h"
+#include "talOS/schema/verify.h"
 
 namespace talos::schema {
 namespace {
@@ -219,13 +219,12 @@ void AppendHex(std::span<const std::byte> payload, std::string& out) {
 // `name` from `bfbs`, or why it cannot be.
 void AppendMessage(const std::string& bfbs, std::string_view name,
                    std::span<const std::byte> payload, std::string& out) {
-  const auto* bytes = reinterpret_cast<const std::uint8_t*>(bfbs.data());
-  flatbuffers::Verifier verifier{bytes, bfbs.size()};
-  if (!reflection::VerifySchemaBuffer(verifier)) {
+  const reflection::Schema* verified = VerifySchema(bfbs);
+  if (verified == nullptr) {
     out += "<schema bytes are not a reflection schema>";
     return;
   }
-  const reflection::Schema& schema = *reflection::GetSchema(bytes);
+  const reflection::Schema& schema = *verified;
   const reflection::Object* object =
       schema.objects() != nullptr
           ? schema.objects()->LookupByKey(std::string{name}.c_str())

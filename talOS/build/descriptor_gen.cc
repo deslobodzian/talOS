@@ -29,9 +29,9 @@
 #include <vector>
 
 #include "flatbuffers/reflection_generated.h"
-#include "flatbuffers/verifier.h"
 #include "talOS/schema/schema_hash.h"
 #include "talOS/schema/unit_suffix.h"
+#include "talOS/schema/verify.h"
 
 namespace {
 
@@ -49,13 +49,13 @@ bool load(const char* bfbs_path, std::string_view file, Input& in) {
   }
   in.bytes.assign(std::istreambuf_iterator<char>(stream),
                   std::istreambuf_iterator<char>());
-  flatbuffers::Verifier verifier(in.bytes.data(), in.bytes.size());
-  if (!reflection::VerifySchemaBuffer(verifier)) {
+  in.schema = talos::schema::VerifySchema(
+      {reinterpret_cast<const char*>(in.bytes.data()), in.bytes.size()});
+  if (in.schema == nullptr) {
     std::fprintf(stderr, "descriptor_gen: %s is not a reflection.Schema\n",
                  bfbs_path);
     return false;
   }
-  in.schema = reflection::GetSchema(in.bytes.data());
   for (const reflection::Object* object : *in.schema->objects()) {
     if (object->is_struct() && object->declaration_file() != nullptr &&
         object->declaration_file()->string_view() == file) {

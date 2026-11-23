@@ -215,35 +215,45 @@ TEST(FieldPath, GuardsUntrustedSchemaPointersBoundsAndDepth) {
   }
 
   // Out-of-range raw BaseType bytes (-128, 127) in field base_type, field
-  // element, or enum underlying_type are rejected by VerifySchema before any
+  // element, enum underlying_type, enum value union_type, root_table, and
+  // service call request/response are rejected by VerifySchema before any
   // accessor casts them to reflection::BaseType.
+  auto make_raw_type = [](flatbuffers::FlatBufferBuilder& builder,
+                          std::int8_t base, std::int8_t element) {
+    const auto start = builder.StartTable();
+    builder.AddElement<std::int8_t>(reflection::Type::VT_BASE_TYPE, base, 0);
+    builder.AddElement<std::int8_t>(reflection::Type::VT_ELEMENT, element, 0);
+    return flatbuffers::Offset<reflection::Type>{builder.EndTable(start)};
+  };
+  auto make_single_field_object = [&](flatbuffers::FlatBufferBuilder& builder,
+                                      const char* obj_name_str,
+                                      std::int8_t base, std::int8_t element) {
+    const auto obj_name = builder.CreateString(obj_name_str);
+    const auto field_name = builder.CreateString("x");
+    const auto type = make_raw_type(builder, base, element);
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(field_name);
+    fb.add_type(type);
+    const auto field = fb.Finish();
+    const auto fields = builder.CreateVector(&field, 1);
+    reflection::ObjectBuilder ob(builder);
+    ob.add_name(obj_name);
+    ob.add_fields(fields);
+    ob.add_is_struct(true);
+    ob.add_bytesize(8);
+    return ob.Finish();
+  };
   for (const std::int8_t bad_byte :
        {static_cast<std::int8_t>(-128), static_cast<std::int8_t>(127)}) {
     for (const bool in_element : {false, true}) {
+      SCOPED_TRACE("field byte=" + std::to_string(bad_byte) +
+                   " in_element=" + std::to_string(in_element));
       flatbuffers::FlatBufferBuilder builder;
-      const auto obj_name = builder.CreateString("bad.Type");
-      const auto field_name = builder.CreateString("x");
-      const auto type_start = builder.StartTable();
-      builder.AddElement<std::int8_t>(
-          reflection::Type::VT_BASE_TYPE,
+      const auto obj = make_single_field_object(
+          builder, "bad.Type",
           in_element ? static_cast<std::int8_t>(reflection::BaseType::Array)
                      : bad_byte,
-          0);
-      builder.AddElement<std::int8_t>(reflection::Type::VT_ELEMENT,
-                                      in_element ? bad_byte : 0, 0);
-      const flatbuffers::Offset<reflection::Type> type{
-          builder.EndTable(type_start)};
-      reflection::FieldBuilder fb(builder);
-      fb.add_name(field_name);
-      fb.add_type(type);
-      const auto field = fb.Finish();
-      const auto fields = builder.CreateVector(&field, 1);
-      reflection::ObjectBuilder ob(builder);
-      ob.add_name(obj_name);
-      ob.add_fields(fields);
-      ob.add_is_struct(true);
-      ob.add_bytesize(8);
-      const auto obj = ob.Finish();
+          in_element ? bad_byte : std::int8_t{0});
       const auto objects = builder.CreateVector(&obj, 1);
       const auto enums = builder.CreateVector(
           std::vector<flatbuffers::Offset<reflection::Enum>>{});
@@ -251,7 +261,97 @@ TEST(FieldPath, GuardsUntrustedSchemaPointersBoundsAndDepth) {
       sb.add_objects(objects);
       sb.add_enums(enums);
       reflection::FinishSchemaBuffer(builder, sb.Finish());
-
+      EXPECT_EQ(VerifySchema(
+                    {reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                     builder.GetSize()}),
+                nullptr);
+    }
+    for (const bool in_union_type : {false, true}) {
+      SCOPED_TRACE("enum byte=" + std::to_string(bad_byte) +
+                   " in_union_type=" + std::to_string(in_union_type));
+      flatbuffers::FlatBufferBuilder builder;
+      const auto enum_name = builder.CreateString("bad.Enum");
+      const auto val_name = builder.CreateString("V");
+      const auto union_type =
+          make_raw_type(builder, in_union_type ? bad_byte : std::int8_t{0}, 0);
+      reflection::EnumValBuilder vb(builder);
+      vb.add_name(val_name);
+      vb.add_value(0);
+      if (in_union_type) vb.add_union_type(union_type);
+      const auto val = vb.Finish();
+      const auto vals = builder.CreateVector(&val, 1);
+      const auto underlying = make_raw_type(
+          builder,
+          in_union_type ? static_cast<std::int8_t>(reflection::BaseType::UByte)
+                        : bad_byte,
+          0);
+      reflection::EnumBuilder eb(builder);
+      eb.add_name(enum_name);
+      eb.add_values(vals);
+      eb.add_underlying_type(underlying);
+      const auto e = eb.Finish();
+      const auto objects = builder.CreateVector(
+          std::vector<flatbuffers::Offset<reflection::Object>>{});
+      const auto enums = builder.CreateVector(&e, 1);
+      reflection::SchemaBuilder sb(builder);
+      sb.add_objects(objects);
+      sb.add_enums(enums);
+      reflection::FinishSchemaBuffer(builder, sb.Finish());
+      EXPECT_EQ(VerifySchema(
+                    {reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                     builder.GetSize()}),
+                nullptr);
+    }
+    {
+      SCOPED_TRACE("root_table byte=" + std::to_string(bad_byte));
+      flatbuffers::FlatBufferBuilder builder;
+      const auto root =
+          make_single_field_object(builder, "bad.Root", bad_byte, 0);
+      const auto objects = builder.CreateVector(
+          std::vector<flatbuffers::Offset<reflection::Object>>{});
+      const auto enums = builder.CreateVector(
+          std::vector<flatbuffers::Offset<reflection::Enum>>{});
+      reflection::SchemaBuilder sb(builder);
+      sb.add_objects(objects);
+      sb.add_enums(enums);
+      sb.add_root_table(root);
+      reflection::FinishSchemaBuffer(builder, sb.Finish());
+      EXPECT_EQ(VerifySchema(
+                    {reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                     builder.GetSize()}),
+                nullptr);
+    }
+    for (const bool in_response : {false, true}) {
+      SCOPED_TRACE("service byte=" + std::to_string(bad_byte) +
+                   " in_response=" + std::to_string(in_response));
+      flatbuffers::FlatBufferBuilder builder;
+      const auto good_obj = make_single_field_object(
+          builder, "ok.Obj",
+          static_cast<std::int8_t>(reflection::BaseType::Int), 0);
+      const auto bad_obj =
+          make_single_field_object(builder, "bad.Obj", bad_byte, 0);
+      const auto call_name = builder.CreateString("Call");
+      reflection::RPCCallBuilder cb(builder);
+      cb.add_name(call_name);
+      cb.add_request(in_response ? good_obj : bad_obj);
+      cb.add_response(in_response ? bad_obj : good_obj);
+      const auto call = cb.Finish();
+      const auto calls = builder.CreateVector(&call, 1);
+      const auto svc_name = builder.CreateString("bad.Svc");
+      reflection::ServiceBuilder svb(builder);
+      svb.add_name(svc_name);
+      svb.add_calls(calls);
+      const auto svc = svb.Finish();
+      const auto services = builder.CreateVector(&svc, 1);
+      const auto objects = builder.CreateVector(
+          std::vector<flatbuffers::Offset<reflection::Object>>{});
+      const auto enums = builder.CreateVector(
+          std::vector<flatbuffers::Offset<reflection::Enum>>{});
+      reflection::SchemaBuilder sb(builder);
+      sb.add_objects(objects);
+      sb.add_enums(enums);
+      sb.add_services(services);
+      reflection::FinishSchemaBuffer(builder, sb.Finish());
       EXPECT_EQ(VerifySchema(
                     {reinterpret_cast<const char*>(builder.GetBufferPointer()),
                      builder.GetSize()}),

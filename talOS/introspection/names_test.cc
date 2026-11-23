@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "flatbuffers/reflection.h"
 #include "gtest/gtest.h"
 #include "schema_test/shapes_generated.h"
 #include "talOS/hardware/packet.h"
@@ -1565,6 +1566,43 @@ TEST(HardwareConfig, EachCanBusIsWarnedAboveSeventyPercentOnItsOwnLoad) {
       << diagnostics[0].message;
   EXPECT_NE(diagnostics[0].message.find("10 motors"), std::string::npos)
       << diagnostics[0].message;
+}
+
+TEST(AlertPrefixedFields, RejectsOutOfRangeBaseTypeWithoutUb) {
+  for (const std::int8_t bad_byte :
+       {static_cast<std::int8_t>(-128), static_cast<std::int8_t>(127)}) {
+    SCOPED_TRACE("raw BaseType=" + std::to_string(bad_byte));
+    flatbuffers::FlatBufferBuilder builder;
+    const auto obj_name = builder.CreateString("bad.Status");
+    const auto field_name = builder.CreateString("alert_error_fault");
+    const auto type_start = builder.StartTable();
+    builder.AddElement<std::int8_t>(reflection::Type::VT_BASE_TYPE, bad_byte,
+                                    0);
+    const flatbuffers::Offset<reflection::Type> type{
+        builder.EndTable(type_start)};
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(field_name);
+    fb.add_type(type);
+    const auto field = fb.Finish();
+    const auto fields = builder.CreateVector(&field, 1);
+    reflection::ObjectBuilder ob(builder);
+    ob.add_name(obj_name);
+    ob.add_fields(fields);
+    ob.add_is_struct(true);
+    ob.add_bytesize(8);
+    const auto obj = ob.Finish();
+    const auto objects = builder.CreateVector(&obj, 1);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+    const std::string_view bfbs{
+        reinterpret_cast<const char*>(builder.GetBufferPointer()),
+        builder.GetSize()};
+    EXPECT_TRUE(detail::AlertPrefixedFields(bfbs, "bad.Status").empty());
+  }
 }
 
 }  // namespace
