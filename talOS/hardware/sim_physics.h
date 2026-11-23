@@ -38,9 +38,10 @@
 // motor/CANcoder direction mismatch runs away here as on a robot.
 //
 // Sensors cross the hardware boundary. CANcoder samples mirror the linked
-// mechanism, the position wrapped to [-0.5, 0.5) rotations as the RoboRIO
-// reports it (CANcoderAbsoluteRot). Swerve ground motion determines the true
-// field pose; the Pigeon reports true yaw plus optional drift, unless
+// sensor shaft (rotor / rotor_to_sensor_ratio = mechanism *
+// sensor_to_mechanism_ratio), the position wrapped to [-0.5, 0.5) rotations as
+// the RoboRIO reports it (CANcoderAbsoluteRot). Swerve ground motion determines
+// the true field pose; the Pigeon reports true yaw plus optional drift, unless
 // explicitly overridden.
 //
 // Stopping is consistent. Commanded neutral (Mode::kNeutral, and
@@ -531,17 +532,17 @@ class PhysicsSimBackend final : public Backend {
         out.position_rot = (yaw_rot_ + s.offset_rot) * sign;
         out.velocity_rps = yaw_rate_rps_ * sign;
       } else {
-        // CANcoder mirrors its linked mechanism through the boundary; its own
-        // health is independent of whether the linked motor is connected or
-        // frozen.
+        // CANcoder sits on the sensor shaft (rotor / rotor_to_sensor_ratio =
+        // mechanism * sensor_to_mechanism_ratio); its own health is independent
+        // of whether the linked motor is connected or frozen.
         out.valid = true;
         double pos_rot = 0.0;
         double vel_rps = 0.0;
         for (std::size_t j = 0; j < config_.motors.size(); ++j) {
           if (motor_to_sensor_[j] == static_cast<int>(i)) {
-            const double gear = Gear(j);
-            pos_rot = axes_[j].rotor_position_rot / gear;
-            vel_rps = axes_[j].rotor_velocity_rps / gear;
+            const double rotor_to_sensor = RotorToSensor(j);
+            pos_rot = axes_[j].rotor_position_rot / rotor_to_sensor;
+            vel_rps = axes_[j].rotor_velocity_rps / rotor_to_sensor;
             break;
           }
         }
@@ -973,11 +974,12 @@ class PhysicsSimBackend final : public Backend {
   }
 
   // Offset of motor i's position feedback in mechanism rotations: a remote
-  // CANcoder's magnet offset, else 0.
+  // CANcoder's magnet offset divided by sensor_to_mechanism_ratio (matching
+  // Phoenix 6, which divides the remote CANcoder reading once), else 0.
   double FeedbackOffset(std::size_t i) const {
     const int sensor = motor_to_sensor_[i];
     if (sensor < 0) return 0.0;
-    return config_.sensors[sensor].offset_rot;
+    return config_.sensors[sensor].offset_rot / SensorToMechanism(i);
   }
 
   double MechPosition(std::size_t i) const {
@@ -985,10 +987,19 @@ class PhysicsSimBackend final : public Backend {
            FeedbackOffset(i);
   }
 
+  double RotorToSensor(std::size_t i) const {
+    const double ratio = config_.motors[i].rotor_to_sensor_ratio;
+    return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+  }
+
+  double SensorToMechanism(std::size_t i) const {
+    const double ratio = config_.motors[i].sensor_to_mechanism_ratio;
+    return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+  }
+
   double Gear(std::size_t i) const {
-    const double gear = config_.motors[i].rotor_to_sensor_ratio *
-                        config_.motors[i].sensor_to_mechanism_ratio;
-    return gear > 0.0 ? gear : 1.0;
+    const double gear = RotorToSensor(i) * SensorToMechanism(i);
+    return std::isfinite(gear) && gear > 0.0 ? gear : 1.0;
   }
 
   int MotorIndex(uint16_t id) const {
