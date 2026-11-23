@@ -621,26 +621,41 @@ class ClientFeed {
   }
 
  private:
-  bool HasPendingAlertPulse(const TelemetryState& state,
-                            const std::vector<std::uint8_t>* mask) const {
-    if (state.sequence_id <= sequence_id_ ||
-        state.timestamp_ns <= timestamp_ns_ ||
-        state.timestamp_ns - timestamp_ns_ < 2) {
+  // True when `state`'s latest tick is at least two nanoseconds after the
+  // client's held one, so an alert pulse fits strictly between them.
+  bool PulseFits(const TelemetryState& state) const {
+    return state.sequence_id > sequence_id_ &&
+           state.timestamp_ns > timestamp_ns_ &&
+           state.timestamp_ns - timestamp_ns_ >= 2;
+  }
+
+  // True when `alert`'s channel (masked in, when `mask` is given) activated
+  // strictly between the client's held tick and `state`'s latest tick and is
+  // inactive in both, so the client would miss the activation.
+  bool MissedPulse(const TelemetryState& state,
+                   const TelemetryState::AlertActivation& alert,
+                   const std::vector<std::uint8_t>* mask) const {
+    const std::uint32_t i = alert.channel;
+    if (i >= present_.size() || i >= state.present.size()) return false;
+    if (mask != nullptr && (i >= mask->size() || (*mask)[i] == 0)) {
       return false;
     }
-    for (const auto& alert : state.alerts) {
-      const std::uint32_t i = alert.channel;
-      if (i >= present_.size() || i >= state.present.size()) continue;
-      if (mask != nullptr && (i >= mask->size() || (*mask)[i] == 0)) continue;
-      if (!alert.seen || alert.sequence_id <= sequence_id_ ||
-          alert.sequence_id >= state.sequence_id) {
-        continue;
-      }
-      const bool client_active = present_[i] != 0 && values_[i] != 0;
-      const bool state_active = state.present[i] != 0 && state.values[i] != 0;
-      if (!client_active && !state_active) return true;
+    if (!alert.seen || alert.sequence_id <= sequence_id_ ||
+        alert.sequence_id >= state.sequence_id) {
+      return false;
     }
-    return false;
+    const bool client_active = present_[i] != 0 && values_[i] != 0;
+    const bool state_active = state.present[i] != 0 && state.values[i] != 0;
+    return !client_active && !state_active;
+  }
+
+  bool HasPendingAlertPulse(const TelemetryState& state,
+                            const std::vector<std::uint8_t>* mask) const {
+    if (!PulseFits(state)) return false;
+    return std::any_of(state.alerts.begin(), state.alerts.end(),
+                       [&](const TelemetryState::AlertActivation& alert) {
+                         return MissedPulse(state, alert, mask);
+                       });
   }
 
   // Populates `channels_`/`raw_` with masked alert channels that activated and
@@ -651,25 +666,12 @@ class ClientFeed {
   bool CollectAlertPulse(const TelemetryState& state,
                          const std::vector<std::uint8_t>* mask,
                          std::uint64_t& pulse_seq, std::uint64_t& pulse_ts) {
-    if (state.sequence_id <= sequence_id_ ||
-        state.timestamp_ns <= timestamp_ns_ ||
-        state.timestamp_ns - timestamp_ns_ < 2) {
-      return false;
-    }
+    if (!PulseFits(state)) return false;
     std::uint64_t best_seq = 0;
     std::uint64_t best_ts = 0;
     for (const auto& alert : state.alerts) {
-      const std::uint32_t i = alert.channel;
-      if (i >= present_.size() || i >= state.present.size()) continue;
-      if (mask != nullptr && (i >= mask->size() || (*mask)[i] == 0)) continue;
-      if (!alert.seen || alert.sequence_id <= sequence_id_ ||
-          alert.sequence_id >= state.sequence_id) {
-        continue;
-      }
-      const bool client_active = present_[i] != 0 && values_[i] != 0;
-      const bool state_active = state.present[i] != 0 && state.values[i] != 0;
-      if (client_active || state_active) continue;
-      channels_.push_back(i);
+      if (!MissedPulse(state, alert, mask)) continue;
+      channels_.push_back(alert.channel);
       raw_.push_back(1);
       if (alert.sequence_id > best_seq) {
         best_seq = alert.sequence_id;
@@ -1288,32 +1290,8 @@ inline std::string TelemetryJson(const TelemetryState& state,
 inline std::string ChannelsJson(const TelemetryState& state) {
   std::string out;
   out.reserve(2048);
-  out += "{\"kind\":\"talos.telemetry.channels\",\"version\":";
-  out += std::to_string(kTelemetryVersion);
-  out += ",\"stream_id\":";
-  AppendU64(out, state.stream_id);
-  out += ",\"dictionary_id\":";
-  out += std::to_string(state.dictionary_id);
-  out += ",\"channels\":[";
-  for (std::size_t i = 0; i < state.dictionary.size(); ++i) {
-    if (i != 0) out += ',';
-    const TelemetryChannelInfo& channel = state.dictionary[i];
-    out += "{\"name\":";
-    AppendEscaped(out, channel.name);
-    out += ",\"unit\":";
-    AppendEscaped(out, channel.unit);
-    out += ",\"kind\":";
-    AppendEscaped(out, ChannelKindName(channel.kind));
-    out += ",\"labels\":[";
-    for (std::size_t j = 0; j < channel.labels.size(); ++j) {
-      if (j != 0) out += ',';
-      AppendEscaped(out, channel.labels[j]);
-    }
-    out += "],\"alert\":";
-    AppendEscaped(out, AlertLevelName(channel.alert));
-    out += '}';
-  }
-  out += "]}";
+  AppendChannelsDocument(out, state.stream_id, state.dictionary_id,
+                         state.dictionary);
   return out;
 }
 

@@ -4,6 +4,7 @@
 // "open panel" links, still routed to the panel that explains each item.
 
 import {useMemo} from 'react';
+import type {ReactNode} from 'react';
 
 import {AlertLevel, alertLevelName} from '../../data/alerts';
 import {
@@ -40,6 +41,28 @@ type Problem = {
   seekNs?: string;
   code?: string;
 };
+
+// The problems list both the recorded and the live panel end with; `action`
+// is a problem's link (seek to it, or open its panel).
+function Attention({problems, action, empty}: {
+  problems: Problem[];
+  action: (problem: Problem) => ReactNode;
+  empty: ReactNode;
+}) {
+  return <section className="panel wide">
+    <div className="panel-heading">
+      <h2>Attention</h2>
+      <span>{problems.length ? problems.length + ' ITEMS' : 'NOTHING'}</span>
+    </div>
+    {problems.length ?
+         <ul className="attention">{problems.map((problem, i) =>
+           <li key={i} className={problem.severity} data-code={problem.code}>
+             <span>{problem.text}</span>
+             {action(problem)}
+           </li>)}</ul> :
+         <EmptyState>{empty}</EmptyState>}
+  </section>;
+}
 
 function RecordedHealthPanel({recorded}: {recorded: RecordedSource}) {
   const playback = usePlayback();
@@ -237,24 +260,13 @@ function RecordedHealthPanel({recorded}: {recorded: RecordedSource}) {
       </p>}
     </section>
 
-    <section className="panel wide">
-      <div className="panel-heading">
-        <h2>Attention</h2>
-        <span>{problems.length ? problems.length + ' ITEMS' : 'NOTHING'}</span>
-      </div>
-      {problems.length ?
-           <ul className="attention">{problems.map((problem, i) =>
-             <li key={i} className={problem.severity} data-code={problem.code}>
-               <span>{problem.text}</span>
-               {problem.seekNs && <button className="link"
+    <Attention
+        problems={problems}
+        action={problem => problem.seekNs && <button className="link"
                        onClick={() => actions.seek(problem.seekNs!)}>
-                 seek
-               </button>}
-             </li>)}</ul> :
-           <EmptyState>
-             No faults, restarts, alerts, or log gaps recorded.
-           </EmptyState>}
-    </section>
+          seek
+        </button>}
+        empty="No faults, restarts, alerts, or log gaps recorded."/>
   </div>;
 }
 
@@ -429,26 +441,15 @@ function LiveHealthPanel() {
        <p className="text-warn declared-error">{system.declaredError}</p>}
     </section>
 
-    <section className="panel wide">
-      <div className="panel-heading">
-        <h2>Attention</h2>
-        <span>{problems.length ? problems.length + ' ITEMS' : 'NOTHING'}</span>
-      </div>
-      {problems.length ?
-           <ul className="attention">{problems.map((problem, i) =>
-             <li key={i} className={problem.severity} data-code={problem.code}>
-               <span>{problem.text}</span>
-               {problem.panel && <button className="link"
+    <Attention
+        problems={problems}
+        action={problem => problem.panel && <button className="link"
                        onClick={() => navigation.openPanel(problem.panel!)}>
-                 open
-               </button>}
-             </li>)}</ul> :
-           <EmptyState>
-             {graph ?
-                  'Every topic that needs both ends has them, every declared node registered, and no node has gone quiet.' :
-                  'Connect to see what is running.'}
-           </EmptyState>}
-    </section>
+          open
+        </button>}
+        empty={graph ?
+                   'Every topic that needs both ends has them, every declared node registered, and no node has gone quiet.' :
+                   'Connect to see what is running.'}/>
   </div>;
 }
 

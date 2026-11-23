@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "talOS/vision/field_sim/json_parser.h"
+
 namespace talos::vision::recording {
 namespace {
 
@@ -262,80 +264,19 @@ class Parser {
       return Fail(error, "expected '\"'");
     }
     ++pos_;  // opening quote
-    while (pos_ < text_.size()) {
-      const char c = text_[pos_++];
-      if (c == '"') {
+    switch (field_sim::DecodeJsonStringBody(text_, &pos_, out)) {
+      case field_sim::JsonStringError::kNone:
         return true;
-      }
-      if (c == '\\') {
-        if (pos_ >= text_.size()) {
-          break;
-        }
-        const char e = text_[pos_++];
-        switch (e) {
-          case '"':
-            out->push_back('"');
-            break;
-          case '\\':
-            out->push_back('\\');
-            break;
-          case '/':
-            out->push_back('/');
-            break;
-          case 'b':
-            out->push_back('\b');
-            break;
-          case 'f':
-            out->push_back('\f');
-            break;
-          case 'n':
-            out->push_back('\n');
-            break;
-          case 'r':
-            out->push_back('\r');
-            break;
-          case 't':
-            out->push_back('\t');
-            break;
-          case 'u': {
-            if (pos_ + 4 > text_.size()) {
-              return Fail(error, "truncated \\u");
-            }
-            unsigned code = 0;
-            for (int i = 0; i < 4; ++i) {
-              const char h = text_[pos_++];
-              code <<= 4;
-              if (h >= '0' && h <= '9') {
-                code |= h - '0';
-              } else if (h >= 'a' && h <= 'f') {
-                code |= h - 'a' + 10;
-              } else if (h >= 'A' && h <= 'F') {
-                code |= h - 'A' + 10;
-              } else {
-                return Fail(error, "invalid \\u escape");
-              }
-            }
-            if (code < 0x80) {
-              out->push_back(static_cast<char>(code));
-            } else if (code < 0x800) {
-              out->push_back(static_cast<char>(0xC0 | (code >> 6)));
-              out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
-            } else {
-              out->push_back(static_cast<char>(0xE0 | (code >> 12)));
-              out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-              out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
-            }
-            break;
-          }
-          default:
-            return Fail(error, "invalid escape");
-        }
-        continue;
-      }
-      if (static_cast<unsigned char>(c) < 0x20) {
+      case field_sim::JsonStringError::kTruncatedUnicodeEscape:
+        return Fail(error, "truncated \\u");
+      case field_sim::JsonStringError::kInvalidUnicodeEscape:
+        return Fail(error, "invalid \\u escape");
+      case field_sim::JsonStringError::kInvalidEscape:
+        return Fail(error, "invalid escape");
+      case field_sim::JsonStringError::kControlCharacter:
         return Fail(error, "unescaped control character");
-      }
-      out->push_back(c);
+      case field_sim::JsonStringError::kUnterminated:
+        break;
     }
     return Fail(error, "unterminated string");
   }

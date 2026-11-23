@@ -121,20 +121,8 @@ class Frame {
   ~Frame() = default;
 
   Frame(const Frame& other)
-      : camera_id_{other.camera_id_},
-        session_id_{other.session_id_},
-        sequence_number_{other.sequence_number_},
-        capture_time_{other.capture_time_},
-        raw_timestamp_ns_{other.raw_timestamp_ns_},
-        clock_domain_{other.clock_domain_},
-        timestamp_kind_{other.timestamp_kind_},
-        mapping_quality_{other.mapping_quality_},
-        width_{other.width_},
-        height_{other.height_},
-        stride_{other.stride_},
-        format_{other.format_},
-        borrowed_{other.borrowed_},
-        borrowed_size_{other.borrowed_size_} {
+      : borrowed_{other.borrowed_}, borrowed_size_{other.borrowed_size_} {
+    CopyMetadataFrom(other);
     if (other.borrowed_ != nullptr) return;
     if (other.shared_storage_) {
       shared_storage_ = other.shared_storage_;
@@ -158,40 +146,19 @@ class Frame {
   }
 
   Frame(Frame&& other) noexcept
-      : camera_id_{other.camera_id_},
-        session_id_{other.session_id_},
-        sequence_number_{other.sequence_number_},
-        capture_time_{other.capture_time_},
-        raw_timestamp_ns_{other.raw_timestamp_ns_},
-        clock_domain_{other.clock_domain_},
-        timestamp_kind_{other.timestamp_kind_},
-        mapping_quality_{other.mapping_quality_},
-        width_{other.width_},
-        height_{other.height_},
-        stride_{other.stride_},
-        format_{other.format_},
-        owned_storage_{std::move(other.owned_storage_)},
+      : owned_storage_{std::move(other.owned_storage_)},
         shared_storage_{std::move(other.shared_storage_)},
         was_shared_{
             other.was_shared_.exchange(false, std::memory_order_relaxed)},
         data_offset_{std::exchange(other.data_offset_, 0)},
         borrowed_{std::exchange(other.borrowed_, nullptr)},
-        borrowed_size_{std::exchange(other.borrowed_size_, 0)} {}
+        borrowed_size_{std::exchange(other.borrowed_size_, 0)} {
+    CopyMetadataFrom(other);
+  }
 
   Frame& operator=(Frame&& other) noexcept {
     if (this == &other) return *this;
-    camera_id_ = other.camera_id_;
-    session_id_ = other.session_id_;
-    sequence_number_ = other.sequence_number_;
-    capture_time_ = other.capture_time_;
-    raw_timestamp_ns_ = other.raw_timestamp_ns_;
-    clock_domain_ = other.clock_domain_;
-    timestamp_kind_ = other.timestamp_kind_;
-    mapping_quality_ = other.mapping_quality_;
-    width_ = other.width_;
-    height_ = other.height_;
-    stride_ = other.stride_;
-    format_ = other.format_;
+    CopyMetadataFrom(other);
     owned_storage_ = std::move(other.owned_storage_);
     shared_storage_ = std::move(other.shared_storage_);
     was_shared_.store(
@@ -208,18 +175,13 @@ class Frame {
         talos::event::MonotonicTime capture_time, uint32_t width,
         uint32_t height, PixelFormat format = PixelFormat::kGray8,
         uint32_t stride = 0)
-      : camera_id_{camera_id},
-        session_id_{session_id},
-        sequence_number_{sequence_number},
-        capture_time_{capture_time},
-        raw_timestamp_ns_{capture_time.nanos()},
-        width_{width},
-        height_{height},
-        format_{format} {
-    size_t bpp = BytesPerPixel(format);
-    stride_ = (stride > 0) ? stride : width * static_cast<uint32_t>(bpp);
-    size_t bytes = static_cast<size_t>(stride_) * height_;
-    AllocateAlignedOwned(bytes);
+      : Frame(NoStorage{}, camera_id, session_id, sequence_number, capture_time,
+              width, height,
+              (stride > 0)
+                  ? stride
+                  : width * static_cast<uint32_t>(BytesPerPixel(format)),
+              format) {
+    AllocateAlignedOwned(static_cast<size_t>(stride_) * height_);
   }
 
   // Constructs a Frame moving an owned buffer.
@@ -227,33 +189,20 @@ class Frame {
         talos::event::MonotonicTime capture_time, uint32_t width,
         uint32_t height, uint32_t stride, PixelFormat format,
         std::vector<uint8_t> buffer)
-      : camera_id_{camera_id},
-        session_id_{session_id},
-        sequence_number_{sequence_number},
-        capture_time_{capture_time},
-        raw_timestamp_ns_{capture_time.nanos()},
-        width_{width},
-        height_{height},
-        stride_{stride},
-        format_{format},
-        owned_storage_{
-            std::make_shared<std::vector<uint8_t>>(std::move(buffer))} {}
+      : Frame(NoStorage{}, camera_id, session_id, sequence_number, capture_time,
+              width, height, stride, format) {
+    owned_storage_ = std::make_shared<std::vector<uint8_t>>(std::move(buffer));
+  }
 
   // Constructs a Frame sharing buffer storage.
   Frame(uint32_t camera_id, uint64_t session_id, uint64_t sequence_number,
         talos::event::MonotonicTime capture_time, uint32_t width,
         uint32_t height, uint32_t stride, PixelFormat format,
         std::shared_ptr<const std::vector<uint8_t>> shared_buffer)
-      : camera_id_{camera_id},
-        session_id_{session_id},
-        sequence_number_{sequence_number},
-        capture_time_{capture_time},
-        raw_timestamp_ns_{capture_time.nanos()},
-        width_{width},
-        height_{height},
-        stride_{stride},
-        format_{format},
-        shared_storage_{std::move(shared_buffer)} {}
+      : Frame(NoStorage{}, camera_id, session_id, sequence_number, capture_time,
+              width, height, stride, format) {
+    shared_storage_ = std::move(shared_buffer);
+  }
 
   // Constructs a Frame borrowing `borrowed_size` bytes it does not own, such
   // as a capture driver's buffer for the duration of a FrameCallback. Copies
@@ -263,17 +212,11 @@ class Frame {
         talos::event::MonotonicTime capture_time, uint32_t width,
         uint32_t height, uint32_t stride, PixelFormat format,
         const uint8_t* borrowed, size_t borrowed_size)
-      : camera_id_{camera_id},
-        session_id_{session_id},
-        sequence_number_{sequence_number},
-        capture_time_{capture_time},
-        raw_timestamp_ns_{capture_time.nanos()},
-        width_{width},
-        height_{height},
-        stride_{stride},
-        format_{format},
-        borrowed_{borrowed},
-        borrowed_size_{borrowed != nullptr ? borrowed_size : 0} {}
+      : Frame(NoStorage{}, camera_id, session_id, sequence_number, capture_time,
+              width, height, stride, format) {
+    borrowed_ = borrowed;
+    borrowed_size_ = borrowed != nullptr ? borrowed_size : 0;
+  }
 
   // Accessors
   uint32_t camera_id() const { return camera_id_; }
@@ -411,18 +354,7 @@ class Frame {
   // Clones the frame, guaranteeing an owned, independent buffer.
   Frame Clone() const {
     Frame cloned;
-    cloned.camera_id_ = camera_id_;
-    cloned.session_id_ = session_id_;
-    cloned.sequence_number_ = sequence_number_;
-    cloned.capture_time_ = capture_time_;
-    cloned.raw_timestamp_ns_ = raw_timestamp_ns_;
-    cloned.clock_domain_ = clock_domain_;
-    cloned.timestamp_kind_ = timestamp_kind_;
-    cloned.mapping_quality_ = mapping_quality_;
-    cloned.width_ = width_;
-    cloned.height_ = height_;
-    cloned.stride_ = stride_;
-    cloned.format_ = format_;
+    cloned.CopyMetadataFrom(*this);
     const size_t bytes = static_cast<size_t>(stride_) * height_;
     // Never read past the bytes actually stored in the source frame.
     const size_t copied = std::min(bytes, stored_size());
@@ -439,18 +371,7 @@ class Frame {
   Frame Share() const {
     if (borrowed_ != nullptr) return Clone();
     Frame shared;
-    shared.camera_id_ = camera_id_;
-    shared.session_id_ = session_id_;
-    shared.sequence_number_ = sequence_number_;
-    shared.capture_time_ = capture_time_;
-    shared.raw_timestamp_ns_ = raw_timestamp_ns_;
-    shared.clock_domain_ = clock_domain_;
-    shared.timestamp_kind_ = timestamp_kind_;
-    shared.mapping_quality_ = mapping_quality_;
-    shared.width_ = width_;
-    shared.height_ = height_;
-    shared.stride_ = stride_;
-    shared.format_ = format_;
+    shared.CopyMetadataFrom(*this);
     if (shared_storage_) {
       shared.shared_storage_ = shared_storage_;
       shared.data_offset_ = data_offset_;
@@ -464,6 +385,39 @@ class Frame {
 
  private:
   static constexpr size_t kPageAlignment = 4096;
+
+  // Selects the constructor that sets the metadata and dimensions only; the
+  // public constructors delegate to it and then attach their storage.
+  struct NoStorage {};
+
+  Frame(NoStorage /*tag*/, uint32_t camera_id, uint64_t session_id,
+        uint64_t sequence_number, talos::event::MonotonicTime capture_time,
+        uint32_t width, uint32_t height, uint32_t stride, PixelFormat format)
+      : camera_id_{camera_id},
+        session_id_{session_id},
+        sequence_number_{sequence_number},
+        capture_time_{capture_time},
+        raw_timestamp_ns_{capture_time.nanos()},
+        width_{width},
+        height_{height},
+        stride_{stride},
+        format_{format} {}
+
+  // Copies every field but the pixel storage (owned, shared or borrowed).
+  void CopyMetadataFrom(const Frame& other) {
+    camera_id_ = other.camera_id_;
+    session_id_ = other.session_id_;
+    sequence_number_ = other.sequence_number_;
+    capture_time_ = other.capture_time_;
+    raw_timestamp_ns_ = other.raw_timestamp_ns_;
+    clock_domain_ = other.clock_domain_;
+    timestamp_kind_ = other.timestamp_kind_;
+    mapping_quality_ = other.mapping_quality_;
+    width_ = other.width_;
+    height_ = other.height_;
+    stride_ = other.stride_;
+    format_ = other.format_;
+  }
 
   static size_t AlignmentOffset(const uint8_t* ptr) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);

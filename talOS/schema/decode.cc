@@ -57,28 +57,6 @@ std::int64_t ReadInteger(reflection::BaseType base, const std::uint8_t* data) {
 
 constexpr int kMaxDepth = 32;
 
-bool ValueSize(const reflection::Schema& schema, reflection::BaseType base,
-               std::int32_t index, std::size_t& size) {
-  if (base == reflection::BaseType::Obj) {
-    const auto* objects = schema.objects();
-    if (objects == nullptr || index < 0 ||
-        static_cast<std::size_t>(index) >= objects->size())
-      return false;
-    const auto* object = objects->Get(index);
-    if (object == nullptr || !object->is_struct() || object->bytesize() <= 0)
-      return false;
-    size = static_cast<std::size_t>(object->bytesize());
-    return true;
-  }
-  if (base < reflection::BaseType::UType || base > reflection::BaseType::Double)
-    return false;
-  if (index >= 0 && (schema.enums() == nullptr ||
-                     static_cast<std::size_t>(index) >= schema.enums()->size()))
-    return false;
-  size = flatbuffers::GetTypeSize(base);
-  return true;
-}
-
 bool AppendStruct(const reflection::Schema& schema,
                   const reflection::Object& object, const std::uint8_t* data,
                   std::string& out, int depth);

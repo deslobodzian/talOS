@@ -18,6 +18,7 @@ import {
 } from '../data/recorded';
 import {wallTimeNs} from '../data/review';
 import {sessionTime, timestamp, wallDateTime} from '../ui/formatters';
+import {StepInput} from './Timeline';
 
 export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
   source: RecordedSource;
@@ -100,12 +101,7 @@ export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
       </div>
     </div>
     <div className="precision">
-      <label>
-        Step (ns)
-        <input aria-label="Frame step duration in nanoseconds"
-               inputMode="numeric" value={stepNs}
-               onChange={e => onStepNs(e.target.value)}/>
-      </label>
+      <StepInput stepNs={stepNs} onStepNs={onStepNs}/>
     </div>
     <button onClick={onClose}>Close recording</button>
     {error && <div className="alert-error">

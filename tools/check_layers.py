@@ -118,6 +118,11 @@ import re
 import subprocess
 import sys
 
+try:  # under Bazel the workspace root is on sys.path
+    from tools import bazel_query
+except ModuleNotFoundError:  # python3 tools/<script>.py: tools/ is sys.path[0]
+    import bazel_query
+
 # ARCHITECTURE.md "Layers", bottom up. Each entry is (layer, packages).
 STACK = (
     ("rtms", ("talOS/memory", "talOS/ipc", "talOS/rtms")),
@@ -157,14 +162,11 @@ NODE_GENERATORS = ("talos_cc_node", "talos_py_node", "talos_cc_shared_node")
 # RULES.md 2 direct-dependency check.
 CC_NODE_DEP_ROOTS = ("bench", "examples", "tools/scaffold_testdata")
 CC_NODE_GENERATORS = ("talos_cc_node", "talos_cc_shared_node")
-FORBIDDEN_NODE_DEPS = (
-    "talOS/rtms/...",
-    "talOS/ipc/...",
-    "talOS/memory/...",
-    "talOS/hardware:hardware",
-    "talOS/node:*",
-    "talOS/devices:access",
-    "talOS/devices:access_hdr",
+
+# Privileged framework libraries outside the stack's transport layers: no
+# node depends on one directly, and none is visible to a node package. Both
+# FORBIDDEN_NODE_DEPS and RESTRICTED_INTERNAL_TARGETS list them.
+_PRIVILEGED_FRAMEWORK_LIBRARIES = (
     "talOS/events:events",
     "talOS/events:events_os",
     "talOS/events:input_replay",
@@ -177,6 +179,16 @@ FORBIDDEN_NODE_DEPS = (
     "talOS/introspection:reporter",
     "talOS/launcher:launcher_lib",
     "talOS/simulation:schedules",
+)
+FORBIDDEN_NODE_DEPS = (
+    "talOS/rtms/...",
+    "talOS/ipc/...",
+    "talOS/memory/...",
+    "talOS/hardware:hardware",
+    "talOS/node:*",
+    "talOS/devices:access",
+    "talOS/devices:access_hdr",
+    *_PRIVILEGED_FRAMEWORK_LIBRARIES,
 )
 FORBIDDEN_NODE_DEPS_EXCLUDE = ("talOS/node:node",)
 
@@ -193,18 +205,7 @@ RESTRICTED_INTERNAL_TARGETS = (
     "talOS/rtms:process_liveness",
     "talOS/memory:shared_memory",
     "talOS/memory:residency",
-    "talOS/events:events",
-    "talOS/events:events_os",
-    "talOS/events:input_replay",
-    "talOS/telemetry:telemetry",
-    "talOS/telemetry:channels",
-    "talOS/teleop:teleop",
-    "talOS/node_api:node_api",
-    "talOS/bridge:node_lib",
-    "talOS/introspection:registry",
-    "talOS/introspection:reporter",
-    "talOS/launcher:launcher_lib",
-    "talOS/simulation:schedules",
+    *_PRIVILEGED_FRAMEWORK_LIBRARIES,
     "talOS/vision/capture:avfoundation",
 )
 # Hardware wire and raw IPC targets: never //visibility:public, and not visible
@@ -654,47 +655,6 @@ def render(target_set):
     return expr
 
 
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
-_BAZEL_ERROR_LINE_RE = re.compile(r"^ERROR:\s*(.+)$")
-_BAZEL_TRANSITIVE_SUMMARY_RE = re.compile(
-    r"^Evaluation of query .* failed: errors were encountered while computing "
-    r"transitive closure$")
-_BAZEL_WORKSPACE_REF_RE = re.compile(r"referenced by '(?:@@)?//")
-_BAZEL_EXTERNAL_PATH_RE = re.compile(
-    r"^(?:[A-Za-z]:)?[^\s:]*[/\\]external[/\\][^/\\:]+[/\\]")
-_BAZEL_EXTERNAL_PKG_RE = re.compile(
-    r"^(?:error loading package|no such package|Skipping) '@@?[^'/@]+//")
-
-
-def _bazel_exit_3_is_external_only(stderr):
-    """True only when every ERROR line in `stderr` from a `bazel query` exit 3
-    belongs to an external `@` repository (plus Bazel's transitive-closure
-    summary line). Any workspace package error, workspace reference, unknown
-    error, or empty stderr fails closed (returns False)."""
-    workspace_prefix = os.path.realpath(os.getcwd()) + os.sep
-    saw_external = False
-    saw_any_error = False
-    for raw_line in stderr.splitlines():
-        line = _ANSI_ESCAPE_RE.sub("", raw_line).strip()
-        m = _BAZEL_ERROR_LINE_RE.match(line)
-        if not m:
-            continue
-        saw_any_error = True
-        body = m.group(1)
-        if _BAZEL_TRANSITIVE_SUMMARY_RE.match(body):
-            continue
-        if _BAZEL_WORKSPACE_REF_RE.search(body):
-            return False
-        if body.startswith(workspace_prefix):
-            return False
-        if (_BAZEL_EXTERNAL_PATH_RE.match(body) or
-                _BAZEL_EXTERNAL_PKG_RE.match(body)):
-            saw_external = True
-            continue
-        return False
-    return saw_any_error and saw_external
-
-
 class Bazel:
     """Answers the checks with `bazel query` in the current workspace."""
 
@@ -711,7 +671,7 @@ class Bazel:
             sys.stderr.write(proc.stderr)
             raise RuntimeError(f"bazel query failed ({proc.returncode}): "
                                f"{expr}")
-        if proc.returncode == 3 and not _bazel_exit_3_is_external_only(
+        if proc.returncode == 3 and not bazel_query.exit_3_is_external_only(
                 proc.stderr):
             sys.stderr.write(proc.stderr)
             raise RuntimeError(
@@ -809,6 +769,44 @@ def _strip_cpp_comments(text):
         with_strings.append(ch_ws)
         no_strings.append(ch_ns)
         line_map.append(lineno)
+
+    def quoted_literal(start, quote, kind):
+        """Emits the `quote`-delimited literal at `start`, delimiters kept and
+        interior blanked in `no_strings`, and returns the index after it. It
+        ends at its closing quote or an unescaped newline. Refuses `??/`
+        inside it: phase-1 `??/` -> `\\` can escape the closing quote or
+        splice lines under trigraph-enabling flags and desync the lexer."""
+        emit(quote, quote, spliced_lines[start])
+        i = start + 1
+        while i < n:
+            c = src[i]
+            if c == "\\":
+                emit(c, " ", spliced_lines[i])
+                i += 1
+                if i < n and src[i] != "\n":
+                    emit(src[i], " ", spliced_lines[i])
+                    i += 1
+                continue
+            if c == quote:
+                emit(quote, quote, spliced_lines[i])
+                i += 1
+                break
+            if c == "\n":
+                emit("\n", "\n", spliced_lines[i])
+                i += 1
+                break
+            emit(c, " ", spliced_lines[i])
+            i += 1
+        pos = src.find("??/", start, i)
+        while pos != -1:
+            errors.append((
+                spliced_lines[pos],
+                "trigraph",
+                f"uses C++ trigraph `??/` in {kind} "
+                "(can escape quotes or splice lines under -trigraphs)",
+            ))
+            pos = src.find("??/", pos + 3, i)
+        return i
 
     i = 0
     while i < n:
@@ -916,75 +914,13 @@ def _strip_cpp_comments(text):
                 break
             continue
         # Normal string literal: preserve in `with_strings` (for #include),
-        # blank interior in `no_strings`. Refuse `??/` inside literals because
-        # phase-1 `??/` -> `\` can escape the closing quote or splice lines
-        # under trigraph-enabling flags and desync the lexer.
+        # blank interior in `no_strings`. Character literal likewise
+        # (pp-number digit separators were already consumed).
         if ch == '"':
-            lit_start = i
-            emit('"', '"', spliced_lines[i])
-            i += 1
-            while i < n:
-                c = src[i]
-                if c == "\\":
-                    emit(c, " ", spliced_lines[i])
-                    i += 1
-                    if i < n and src[i] != "\n":
-                        emit(src[i], " ", spliced_lines[i])
-                        i += 1
-                    continue
-                if c == '"':
-                    emit('"', '"', spliced_lines[i])
-                    i += 1
-                    break
-                if c == "\n":
-                    emit("\n", "\n", spliced_lines[i])
-                    i += 1
-                    break
-                emit(c, " ", spliced_lines[i])
-                i += 1
-            pos = src.find("??/", lit_start, i)
-            while pos != -1:
-                errors.append((
-                    spliced_lines[pos],
-                    "trigraph",
-                    "uses C++ trigraph `??/` in string literal "
-                    "(can escape quotes or splice lines under -trigraphs)",
-                ))
-                pos = src.find("??/", pos + 3, i)
+            i = quoted_literal(i, '"', "string literal")
             continue
-        # Character literal (pp-number digit separators were already consumed).
         if ch == "'":
-            lit_start = i
-            emit("'", "'", spliced_lines[i])
-            i += 1
-            while i < n:
-                c = src[i]
-                if c == "\\":
-                    emit(c, " ", spliced_lines[i])
-                    i += 1
-                    if i < n and src[i] != "\n":
-                        emit(src[i], " ", spliced_lines[i])
-                        i += 1
-                    continue
-                if c == "'":
-                    emit("'", "'", spliced_lines[i])
-                    i += 1
-                    break
-                if c == "\n":
-                    emit("\n", "\n", spliced_lines[i])
-                    i += 1
-                    break
-                emit(c, " ", spliced_lines[i])
-                i += 1
-            pos = src.find("??/", lit_start, i)
-            while pos != -1:
-                errors.append((
-                    spliced_lines[pos],
-                    "trigraph",
-                    "uses C++ trigraph `??/` in character literal "
-                    "(can escape quotes or splice lines under -trigraphs)",
-                ))
-                pos = src.find("??/", pos + 3, i)
+            i = quoted_literal(i, "'", "character literal")
             continue
         emit(ch, ch, spliced_lines[i])
         i += 1

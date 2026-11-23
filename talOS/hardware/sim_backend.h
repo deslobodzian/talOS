@@ -1,7 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -41,13 +44,74 @@ inline PwmSample PwmSampleOf(const PwmRequest& request) {
   return {request.id, true,
           request.mode == PwmMode::kPulse ? request.output : 0.0};
 }
+// What both simulated backends, the ideal SimBackend and the physics-backed
+// sim::PhysicsSimBackend, do alike with what the gateway hands them: latch
+// the motor requests, keep each digital and PWM output's last request,
+// report every apply as succeeded, hand over the device resets
+// SimulateDeviceReset queued, and finish a restore at once (or fail every
+// restore while SetRestoreFails(true) holds). Each backend reads and clears
+// these members in its own Configure, Read, Neutral and
+// BeginRestoreAfterReset.
+class SimBackendBase : public Backend {
+ public:
+  bool Apply(std::span<const MotorRequest> commands) override {
+    std::copy(commands.begin(), commands.end(), commands_.begin());
+    return true;
+  }
+  std::span<const uint16_t> ApplyFailedDevices() const override { return {}; }
+  bool ApplyOutputs(std::span<const DigitalOutputRequest> digital_outputs,
+                    std::span<const PwmRequest> pwm_outputs) override {
+    for (const auto& d : digital_outputs) {
+      digital_outputs_[d.id] = d.value;
+    }
+    for (const auto& p : pwm_outputs) {
+      pwm_outputs_[p.id] = p;
+    }
+    return true;
+  }
+
+  // Fault injection: the next Tick reports the device as reset, and the
+  // gateway restores it (BeginRestoreAfterReset, PollRestore).
+  void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
+  bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
+    reset_ids = pending_resets_;
+    pending_resets_.clear();
+    return !reset_ids.empty();
+  }
+  RestoreStatus PollRestore() override {
+    if (restore_fails_) return RestoreStatus::kFailed;
+    restoring_.fill(false);
+    return RestoreStatus::kDone;
+  }
+  void SetRestoreFails(bool fails) { restore_fails_ = fails; }
+
+  bool GetDigitalOutput(uint16_t id) const {
+    auto it = digital_outputs_.find(id);
+    return it != digital_outputs_.end() ? it->second : false;
+  }
+  // The request the output last applied; off ({.id = id}) when none has
+  // been applied since the last Neutral().
+  PwmRequest GetPwm(uint16_t id) const {
+    auto it = pwm_outputs_.find(id);
+    return it != pwm_outputs_.end() ? it->second : PwmRequest{.id = id};
+  }
+
+ protected:
+  std::array<MotorRequest, kMaxMotors> commands_{};
+  // A motor whose chain a restore reapplies reads invalid while set.
+  std::array<bool, kMaxMotors> restoring_{};
+  std::vector<uint16_t> pending_resets_;
+  bool restore_fails_{false};
+  std::unordered_map<uint16_t, bool> digital_outputs_{};
+  std::unordered_map<uint16_t, PwmRequest> pwm_outputs_{};
+};
 // A deterministic ideal-actuator fake for integration tests, not a motor or
 // tire physics model. Real hardware always uses the Phoenix backend.
 // Velocity, position and motion-magic demands are reached at once and a
 // voltage demand is reported as applied; duty-cycle and torque-current
 // demands are not modelled (velocity 0, voltage 0): the physics backend
 // (sim_physics.h) models them.
-class SimBackend final : public Backend {
+class SimBackend final : public SimBackendBase {
  public:
   bool Configure(const Config& config) override {
     config_ = config;
@@ -182,21 +246,6 @@ class SimBackend final : public Backend {
     }
     return AnyFeedbackValid(state);
   }
-  bool Apply(std::span<const MotorRequest> commands) override {
-    std::copy(commands.begin(), commands.end(), commands_.begin());
-    return true;
-  }
-  std::span<const uint16_t> ApplyFailedDevices() const override { return {}; }
-  bool ApplyOutputs(std::span<const DigitalOutputRequest> digital_outputs,
-                    std::span<const PwmRequest> pwm_outputs) override {
-    for (const auto& d : digital_outputs) {
-      digital_outputs_[d.id] = d.value;
-    }
-    for (const auto& p : pwm_outputs) {
-      pwm_outputs_[p.id] = p;
-    }
-    return true;
-  }
   // Safe-state policy: every output type turns off on disable, command
   // timeout, and failure. The gateway invokes this Neutral() identically for
   // all three transitions, so they share one safe state: motors fall back to
@@ -211,19 +260,13 @@ class SimBackend final : public Backend {
     pwm_outputs_ = {};
   }
 
-  // Fault injection for reset handling. The next Tick reports the
-  // device as reset; the gateway restores configuration and drops obsolete
-  // demand. Restore clears latched commands without zeroing mechanism
-  // positions (documented ideal-fake limit: positions re-acquire from the
-  // next command, they are not re-measured from hardware). The restored
-  // chain reads invalid until a PollRestore that succeeds (RestoredWith), as
-  // on the robot; SetRestoreFails(true) fails every restore until cleared.
-  void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
-  bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
-    reset_ids = pending_resets_;
-    pending_resets_.clear();
-    return !reset_ids.empty();
-  }
+  // Reset handling (SimulateDeviceReset): the gateway restores
+  // configuration and drops obsolete demand. Restore clears latched commands
+  // without zeroing mechanism positions (documented ideal-fake limit:
+  // positions re-acquire from the next command, they are not re-measured
+  // from hardware). The restored chain reads invalid until a PollRestore that
+  // succeeds (RestoredWith), as on the robot; SetRestoreFails(true) fails
+  // every restore until cleared.
   void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       if (std::find(ids.begin(), ids.end(), config_.motors[i].id) != ids.end())
@@ -231,12 +274,6 @@ class SimBackend final : public Backend {
       if (RestoredWith(config_.motors, i, ids)) restoring_[i] = true;
     }
   }
-  RestoreStatus PollRestore() override {
-    if (restore_fails_) return RestoreStatus::kFailed;
-    restoring_.fill(false);
-    return RestoreStatus::kDone;
-  }
-  void SetRestoreFails(bool fails) { restore_fails_ = fails; }
   // Position demands teleport, so a step says nothing about a reset.
   bool PositionsArePhysical() const override { return false; }
   void SetPowerHealth(double battery_v, bool brownout) {
@@ -249,16 +286,6 @@ class SimBackend final : public Backend {
   }
   void SetEncoder(uint16_t id, double position_rot, double velocity_rps) {
     encoders_[id] = {position_rot, velocity_rps};
-  }
-  bool GetDigitalOutput(uint16_t id) const {
-    auto it = digital_outputs_.find(id);
-    return it != digital_outputs_.end() ? it->second : false;
-  }
-  // The request the output last applied; off ({.id = id}) when none has
-  // been applied since the last Neutral().
-  PwmRequest GetPwm(uint16_t id) const {
-    auto it = pwm_outputs_.find(id);
-    return it != pwm_outputs_.end() ? it->second : PwmRequest{.id = id};
   }
 
  private:
@@ -276,15 +303,9 @@ class SimBackend final : public Backend {
   std::size_t can_bus_count_{};
   SimPower power_{true, kSimRestingSupplyV, false};
   uint64_t previous_time_{};
-  std::vector<uint16_t> pending_resets_;
-  bool restore_fails_{false};
-  std::array<MotorRequest, kMaxMotors> commands_{};
   std::array<MotorSample, kMaxMotors> samples_{};
-  std::array<bool, kMaxMotors> restoring_{};
   std::unordered_map<uint16_t, bool> digital_inputs_{};
-  std::unordered_map<uint16_t, bool> digital_outputs_{};
   std::unordered_map<uint16_t, double> analog_inputs_{};
   std::unordered_map<uint16_t, SimEncoder> encoders_{};
-  std::unordered_map<uint16_t, PwmRequest> pwm_outputs_{};
 };
 }  // namespace talos::hardware

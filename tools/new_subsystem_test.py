@@ -1384,6 +1384,56 @@ class NewSubsystemTest(unittest.TestCase):
             self.assertIn('name = "localizer"', by_rel[
                 "bot/main_processor/configuration/robot.toml"])
 
+    # REQ-DEV-01
+    def test_estimator_wired_into_a_robot_ends_with_its_next_steps(self):
+        # An estimator has no motor, so no teleop button: wiring one into a
+        # talOS robot or a robot repository (both languages, --dry-run or
+        # not) succeeds and prints its next steps, which hold no
+        # joystick-driven simulation command.
+        talos_robot = {
+            "bot/main_processor/configuration/BUILD": "",
+            "bot/main_processor/configuration/robot.toml":
+                '[robot]\nname = "bot"\n\n[[subsystems]]\n'
+                'name = "drivetrain"\npath = "subsystems/drivetrain.toml"\n',
+            "bot/main_processor/configuration/subsystems/drivetrain.toml":
+                '[subsystem]\nname = "drivetrain"\n\n[motors.drive]\n'
+                'type = "TalonFX"\nbus = "rio"\ncan_id = 1\n',
+        }
+        robot_repository = {
+            "MODULE.bazel": 'module(name = "robot")\n',
+            "BUILD.bazel": 'exports_files(glob(["subsystems/*.toml"]))\n',
+            "robot.toml": ROBOT_WITH_ROLLER,
+            "subsystems/roller.toml": ROLLER,
+            "roller/BUILD": "",
+        }
+        for layout, files, flags, repository in (
+                ("talos", talos_robot, ["--robot", "bot"], ""),
+                ("robot_repository", robot_repository, [], "talos+")):
+            for lang, dry_run in (("cpp", False), ("py", True)):
+                with self.subTest(layout=layout, lang=lang, dry_run=dry_run), \
+                        tempfile.TemporaryDirectory() as root, \
+                        mock.patch.object(new_subsystem.sync_manifest,
+                                          "current_repository",
+                                          return_value=repository), \
+                        mock.patch.dict(os.environ,
+                                        BUILD_WORKSPACE_DIRECTORY=root):
+                    for path, text in files.items():
+                        os.makedirs(os.path.dirname(os.path.join(root, path)),
+                                    exist_ok=True)
+                        with open(os.path.join(root, path), "w",
+                                  encoding="utf-8") as f:
+                            f.write(text)
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out), \
+                            contextlib.redirect_stderr(out):
+                        status = new_subsystem.main(
+                            ["localizer", "--lang", lang, "--type",
+                             "estimator", *flags]
+                            + (["--dry-run"] if dry_run else []))
+                    self.assertEqual(status, 0, out.getvalue())
+                    self.assertIn("\nNext:\n", out.getvalue())
+                    self.assertNotIn("joystick", out.getvalue())
+
     # REQ-DEV-01, REQ-DEV-30
     def test_talos_module_and_build_templates_support_custom_repo_name(self):
         # talos_module() reads sync_manifest.talos_repo_prefix() (backed by
