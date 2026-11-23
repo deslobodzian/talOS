@@ -295,7 +295,8 @@ enforce that:
   `--describe`, in the first supervision pass that finds the run's registry row
   active with its sources published, the launcher compares the row's topic ends
   with the probe's: kind, topic, message size, alignment and the `external`,
-  `optional`, `observer` and `untargeted_outputs` attributes, as multisets.
+  `optional`, `observer`, `untargeted_outputs`, `operator_arming` and
+  `internal_driver_station` attributes, as multisets.
   Timers are not endpoints, and the
   loop's latest-only flag, which a probe reports, is a delivery detail, not an
   endpoint attribute. The schema hash is not in

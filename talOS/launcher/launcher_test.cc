@@ -1908,6 +1908,34 @@ TEST(LauncherGraphTest, AnOptOutTheProbeDidNotDescribeIsAnEndpointMismatch) {
   EXPECT_EQ(EndpointMismatch({opted_out}, {opted_out}), "");
 }
 
+// REQ-SAFE-14, REQ-CONTRACT-11: EndpointMismatch catches a live node that
+// drops operator_arming on a target lane or drops internal_driver_station on
+// /hw/state/driver_station compared to its --describe probe.
+TEST(LauncherGraphTest,
+     HiddenUnarmedTeleopLaneOrDriverStationIsAnEndpointMismatch) {
+  auto armed = Sender("/alpha/target/teleop", 24);
+  armed.flags = introspect::naming::kSourceFlagOperatorArming;
+  auto unarmed = Sender("/alpha/target/teleop", 24);
+  const std::string dropped_arming = EndpointMismatch({armed}, {unarmed});
+  EXPECT_NE(dropped_arming.find("/alpha/target/teleop"), std::string::npos)
+      << dropped_arming;
+  EXPECT_NE(dropped_arming.find("operator_arming"), std::string::npos)
+      << dropped_arming;
+  EXPECT_EQ(EndpointMismatch({armed}, {armed}), "");
+
+  auto internal_ds = Watcher("/hw/state/driver_station", 1436);
+  internal_ds.flags = introspect::naming::kSourceFlagInternalDriverStation;
+  auto explicit_ds = Watcher("/hw/state/driver_station", 1436);
+  const std::string dropped_internal =
+      EndpointMismatch({internal_ds}, {explicit_ds});
+  EXPECT_NE(dropped_internal.find("/hw/state/driver_station"),
+            std::string::npos)
+      << dropped_internal;
+  EXPECT_NE(dropped_internal.find("internal_driver_station"), std::string::npos)
+      << dropped_internal;
+  EXPECT_EQ(EndpointMismatch({internal_ds}, {internal_ds}), "");
+}
+
 // SPEC-10 / REQ-SAFE-42, REQ-CONTRACT-11: the launcher passes
 // --targeted-outputs ONLY when the member's --describe probe answered,
 // --allow-graph-errors is not set, and the probe declared a hardware_request

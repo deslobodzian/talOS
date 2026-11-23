@@ -80,6 +80,7 @@ void ExpectSameDescription(const Description& written,
 // the full 64-bit hash, names that need escaping, and parameter keys holding
 // the brackets, braces and field names a scanning reader would stop at.
 // REQ-SAFE-42: the hardware request's untargeted_outputs marking survives.
+// REQ-SAFE-14: operator_arming and internal_driver_station markings survive.
 TEST(Describe, RoundTripsEveryField) {
   event::Manifest manifest = sample_manifest();
   std::string bytes;
@@ -99,7 +100,9 @@ TEST(Describe, RoundTripsEveryField) {
                                       naming::kSourceFlagHardwareRequest |
                                       naming::kSourceFlagUntargetedOutputs},
        {"/drivetrain/target", naming::kSourceFlagOptional},
-       {"/driver_station/state", naming::kSourceFlagObserver}});
+       {"/driver_station/state",
+        naming::kSourceFlagObserver | naming::kSourceFlagInternalDriverStation},
+       {R"(/odd/state/"quoted\path)", naming::kSourceFlagOperatorArming}});
   written.reads_graph = true;
   written.holds_stop = true;
   written.abi_update = true;
@@ -111,6 +114,10 @@ TEST(Describe, RoundTripsEveryField) {
                                           naming::kSourceFlagOptional |
                                           naming::kSourceFlagHardwareRequest |
                                           naming::kSourceFlagUntargetedOutputs);
+  ASSERT_EQ(
+      written.sources[2].flags,
+      naming::kSourceFlagObserver | naming::kSourceFlagInternalDriverStation);
+  ASSERT_EQ(written.sources[4].flags, naming::kSourceFlagOperatorArming);
   ASSERT_EQ(written.sources[3].slots, kSlots);
   ASSERT_EQ(written.sources[1].bfbs, bytes);
 
