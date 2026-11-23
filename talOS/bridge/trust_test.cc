@@ -2296,5 +2296,247 @@ TEST(
   EXPECT_EQ(node.Status(enable_us + 8'000).identity_rejected_count(), 5u);
 }
 
+// A malformed State carrying boot_id == 0 must be dropped before entering the
+// clock estimator or incrementing states_received_: otherwise BootHistory would
+// retire the active gateway boot (locking out all subsequent valid States) or
+// leave state_accepted_ true with last_boot_id_ == 0 and bogus state_age_us.
+// REQ-SAFE-11, REQ-OPS-20
+TEST(HardwareNodeTrustTest,
+     ZeroBootIdStateIsDroppedWithoutPoisoningActiveBootOrStateAge) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Subscriber<Packet> state_sub{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+
+  // 1. Before any valid boot, a boot_id == 0 State is dropped whole: no state
+  // received, no link ready, state_age_us stays 0 (never now_us).
+  constexpr uint64_t kStartUs = 1'000'000;
+  EXPECT_FALSE(gateway.Deliver(TrustState(config_id, /*boot_id=*/0, 1, 1'000),
+                               kStartUs));
+  EXPECT_EQ(node.states_received(), 0u);
+  EXPECT_EQ(node.clock().boot_id(), 0u);
+  EXPECT_FALSE(state_sub.read().has_value());
+  const auto status_before = node.Status(kStartUs + 50'000);
+  EXPECT_TRUE(status_before.alert_error_link_lost());
+  EXPECT_EQ(status_before.state_age_us(), 0u);
+
+  // 2. Once boot 11 is active, a stray boot_id == 0 State must not retire boot
+  // 11: later States from boot 11 must still be accepted and published.
+  const uint64_t boot11_t1 = kStartUs + 60'000;
+  Acknowledge(rig, config_id, boot11_t1 - 500);
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 2'000), boot11_t1));
+  ASSERT_EQ(node.states_received(), 1u);
+  ASSERT_EQ(node.clock().boot_id(), 11u);
+  ASSERT_TRUE(state_sub.read().has_value());
+
+  EXPECT_FALSE(gateway.Deliver(TrustState(config_id, /*boot_id=*/0, 1, 3'000),
+                               boot11_t1 + 5'000));
+  EXPECT_EQ(node.states_received(), 1u);
+  EXPECT_EQ(node.clock().boot_id(), 11u);
+  EXPECT_FALSE(state_sub.read().has_value());
+
+  const uint64_t boot11_t2 = boot11_t1 + 10'000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 12'000), boot11_t2));
+  EXPECT_EQ(node.states_received(), 2u);
+  EXPECT_EQ(node.clock().boot_id(), 11u);
+  const auto published = state_sub.read();
+  ASSERT_TRUE(published.has_value());
+  State decoded{};
+  ASSERT_TRUE(Decode(published->bytes(), decoded));
+  EXPECT_EQ(decoded.boot_id, 11u);
+  EXPECT_EQ(decoded.sample_time_us, 12'000u);
+}
+
+// While the gateway is running a different configuration (for example, a
+// persisted configuration refused-while-enabled), requests stamped with the
+// bridge's own config_id must not pass HasRequestIdentity or
+// IsSupersededNeutral and must not be merged or transmitted to the gateway.
+// REQ-SAFE-17, REQ-SAFE-21, REQ-CONTRACT-05
+TEST(HardwareNodeTrustTest, RequestsRejectedWhileGatewayRunsDifferentConfig) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id + 1, 11, 2, 2'000), kStartUs));
+  const uint64_t commands_before = node.commands_sent();
+
+  // Request carries bridge's config_id + gateway's boot/epoch, but gateway is
+  // actually running config_id + 1: must be rejected and not transmitted.
+  Command mismatched{};
+  mismatched.config_id = config_id;
+  mismatched.boot_id = 11;
+  mismatched.epoch = 2;
+  mismatched.observed_time_us = 2'000;
+  mismatched.count = 1;
+  mismatched.motors[0] = {drive, Mode::kVoltage, 0, 4.0, 0.0};
+  PublishCommand(drive_pub, mismatched);
+  node.Tick(kStartUs + 1'000);
+  EXPECT_EQ(node.identity_rejected(), 1u);
+  EXPECT_EQ(node.commands_sent(), commands_before);
+  EXPECT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+
+  // A superseded-epoch neutral while gateway runs a different config must also
+  // count as identity_rejected_ (not excused by IsSupersededNeutral).
+  Command neutral_old_epoch{};
+  neutral_old_epoch.config_id = config_id;
+  neutral_old_epoch.boot_id = 11;
+  neutral_old_epoch.epoch = 1;
+  neutral_old_epoch.observed_time_us = 2'000;
+  neutral_old_epoch.count = 1;
+  neutral_old_epoch.motors[0] = {drive, Mode::kNeutral, 0, 0.0, 0.0};
+  PublishCommand(drive_pub, neutral_old_epoch);
+  node.Tick(kStartUs + 2'000);
+  EXPECT_EQ(node.identity_rejected(), 2u);
+  EXPECT_EQ(node.commands_sent(), commands_before);
+
+  // Once the gateway runs the matching config, a matching request merges.
+  Acknowledge(rig, config_id, kStartUs + 4'000);
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id, 11, 3, 7'000), kStartUs + 5'000));
+  mismatched.epoch = 3;
+  mismatched.observed_time_us = 7'000;
+  PublishCommand(drive_pub, mismatched);
+  node.Tick(kStartUs + 6'000);
+  EXPECT_EQ(node.identity_rejected(), 2u);
+  EXPECT_EQ(node.commands_sent(), commands_before + 1);
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+}
+
+// Neutralizing a motor via omission, owner timeout, controller transition
+// (InvalidateRequests), or SendShutdownNeutral must clear motor.slot to 0 so
+// no stale non-zero closed-loop slot leaks into neutral commands.
+// REQ-SAFE-01, REQ-RT-13
+TEST(HardwareNodeTrustTest, NeutralizationClearsStaleMotorSlot) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  uint64_t now_us = 1'000'000;
+  Acknowledge(rig, config_id, now_us - 500);
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 1'000), now_us));
+
+  auto send_motor = [&](ipc::Publisher<Packet>& pub, uint16_t id, uint8_t slot,
+                        uint64_t epoch, uint64_t obs_us) {
+    Command cmd{};
+    cmd.config_id = config_id;
+    cmd.boot_id = 11;
+    cmd.epoch = epoch;
+    cmd.observed_time_us = obs_us;
+    cmd.count = 1;
+    cmd.motors[0] = {id, Mode::kVelocity, slot, 5.0, 0.5};
+    PublishCommand(pub, cmd);
+  };
+
+  // Drive both motors on non-zero slots.
+  send_motor(drive_pub, drive, /*slot=*/2, 1, 1'000);
+  send_motor(intake_pub, roller, /*slot=*/1, 1, 1'000);
+  now_us += 1'000;
+  node.Tick(now_us);
+  ASSERT_EQ(node.current_command().motors[0].slot, 2u);
+  ASSERT_EQ(node.current_command().motors[1].slot, 1u);
+
+  // (a) Omission neutralization clears drivetrain's slot to 0.
+  Command omit_drive{};
+  omit_drive.config_id = config_id;
+  omit_drive.boot_id = 11;
+  omit_drive.epoch = 1;
+  omit_drive.observed_time_us = 1'000;
+  omit_drive.count = 0;
+  PublishCommand(drive_pub, omit_drive);
+  now_us += 1'000;
+  node.Tick(now_us);
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(node.current_command().motors[0].slot, 0u);
+
+  // (b) Owner timeout clears intake's slot to 0.
+  now_us += owner_timeout_us + 1;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 2'000), now_us));
+  node.Tick(now_us);
+  EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
+  EXPECT_EQ(node.current_command().motors[1].slot, 0u);
+
+  // (c) Controller transition (InvalidateRequests -> NeutralizeAll) clears
+  // non-zero slot to 0.
+  send_motor(drive_pub, drive, /*slot=*/2, 1, 2'000);
+  now_us += 1'000;
+  node.Tick(now_us);
+  ASSERT_EQ(node.current_command().motors[0].slot, 2u);
+  now_us += 1'000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 2, 4'000), now_us));
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(node.current_command().motors[0].slot, 0u);
+
+  // (d) SendShutdownNeutral transmits canonical neutral with slot == 0.
+  send_motor(drive_pub, drive, /*slot=*/2, 2, 4'000);
+  now_us += 1'000;
+  node.Tick(now_us);
+  ASSERT_EQ(node.current_command().motors[0].slot, 2u);
+  (void)gateway.TakeSent();
+  ASSERT_TRUE(node.SendShutdownNeutral(now_us + 500));
+  const auto frames = gateway.TakeSent();
+  ASSERT_EQ(frames.size(), 1u);
+  ASSERT_EQ(frames[0].type, protocol::FrameType::kHardwareCommand);
+  Command shutdown{};
+  ASSERT_TRUE(Decode(frames[0].payload, shutdown));
+  EXPECT_EQ(shutdown.motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(shutdown.motors[0].slot, 0u);
+  EXPECT_DOUBLE_EQ(shutdown.motors[0].demand, 0.0);
+  EXPECT_DOUBLE_EQ(shutdown.motors[0].feedforward_v, 0.0);
+}
+
+// Backward clock readings must not underflow elapsed-time guards into spurious
+// status publications or config pushes, and deadlines near UINT64_MAX must
+// saturate rather than wrap into the past.
+// REQ-RT-20, REQ-OPS-20
+TEST(HardwareNodeTrustTest, NextDutyAndPassGuardBackwardAndNearMaxClocks) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Subscriber<bridge::BridgeStatus> status_sub{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+
+  // Tick at 10 s, establishing last_status_us_, last_probe_send_us_, and
+  // last_push_time_us_ (via mismatched-config State).
+  constexpr uint64_t kTenSec = 10'000'000;
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id + 1, 11, 1, 1'000), kTenSec));
+  node.Tick(kTenSec);
+  ASSERT_TRUE(status_sub.read().has_value());
+
+  // A backward clock reading (5 s < 10 s) must not underflow and publish
+  // another /hw/status immediately.
+  node.Tick(5'000'000);
+  EXPECT_FALSE(status_sub.read().has_value());
+
+  // Near UINT64_MAX: NextDutyUs and Pass must saturate without wrapping below
+  // now_us.
+  constexpr uint64_t kNearMax = std::numeric_limits<uint64_t>::max() - 500;
+  const uint64_t duty = node.NextDutyUs(kNearMax);
+  EXPECT_GE(duty, kNearMax);
+  const HardwareNode::Wait wait = node.Pass(kNearMax);
+  EXPECT_GE(wait.until_us, kNearMax);
+}
+
 }  // namespace
 }  // namespace talos::hardware
