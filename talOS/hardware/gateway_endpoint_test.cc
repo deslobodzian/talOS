@@ -1312,5 +1312,80 @@ TEST(Endpoint, RefusalAcksCarryTransferConfigId) {
     EXPECT_EQ(ack->config_id, base_id);
   }
 }
+
+// REQ-RT-13: Endpoint::Tick emits exactly one kHardwareState frame per gateway
+// tick across unconfigured-disabled, configured-disabled, enabled, and
+// disabled-again operation.
+TEST(Endpoint, EmitsExactlyOneStatePerTickWhileDisabledAndEnabled) {
+  SimBackend backend;
+  Gateway gateway{backend, 3018};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+
+  constexpr uint64_t kPeriodUs = 5'000;
+  uint64_t now_us = 10'000;
+  uint64_t next_expected_seq = 0;
+
+  const auto check_phase = [&](const char* label, std::size_t count,
+                               bool enabled, bool configured) {
+    SCOPED_TRACE(label);
+    const uint64_t sent_before = endpoint.udp_stats().sent_frames;
+    std::vector<uint64_t> expected_times;
+    expected_times.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      now_us += kPeriodUs;
+      expected_times.push_back(now_us);
+      ASSERT_EQ(endpoint.Tick(now_us, enabled), protocol::UdpStatus::kOk);
+    }
+    EXPECT_EQ(endpoint.udp_stats().sent_frames - sent_before, count);
+
+    // Trailing DriverStation sentinel bounds the batch in loopback order so a
+    // dropped State fails immediately instead of waiting on a hang deadline.
+    const uint64_t sentinel_us = now_us + 1;
+    const std::array<uint8_t, 1> sentinel{0x5A};
+    ASSERT_EQ(endpoint.SendFrame(protocol::FrameType::kDriverStation,
+                                 sentinel_us, sentinel.data(), sentinel.size()),
+              protocol::UdpStatus::kOk);
+
+    std::vector<State> states;
+    std::vector<uint64_t> sequences;
+    uint64_t sentinel_seq = 0;
+    protocol::DecodedFrame frame;
+    while (companion.Receive(&frame) == protocol::UdpStatus::kOk) {
+      if (frame.header.type == protocol::FrameType::kDriverStation &&
+          frame.header.monotonic_time_us == sentinel_us) {
+        sentinel_seq = frame.header.sequence;
+        break;
+      }
+      ASSERT_EQ(frame.header.type, protocol::FrameType::kHardwareState);
+      State state{};
+      ASSERT_TRUE(Decode({frame.payload, frame.payload_size}, state));
+      states.push_back(state);
+      sequences.push_back(frame.header.sequence);
+    }
+    ASSERT_NE(sentinel_seq, 0u);
+    ASSERT_EQ(states.size(), count);
+    for (std::size_t i = 0; i < count; ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(states[i].sample_time_us, expected_times[i]);
+      EXPECT_EQ((states[i].flags & kEnabled) != 0, enabled);
+      EXPECT_EQ((states[i].flags & kConfigured) != 0, configured);
+      if (next_expected_seq != 0) {
+        EXPECT_EQ(sequences[i], next_expected_seq + i);
+      } else if (i > 0) {
+        EXPECT_EQ(sequences[i], sequences[i - 1] + 1);
+      }
+    }
+    next_expected_seq = sentinel_seq + 1;
+  };
+
+  check_phase("unconfigured disabled", 4, /*enabled=*/false,
+              /*configured=*/false);
+  ASSERT_TRUE(gateway.Reconfigure(SwerveConfig(true)));
+  check_phase("configured disabled", 8, /*enabled=*/false, /*configured=*/true);
+  check_phase("configured enabled", 8, /*enabled=*/true, /*configured=*/true);
+  check_phase("disabled again", 4, /*enabled=*/false, /*configured=*/true);
+}
 }  // namespace
 }  // namespace talos::hardware

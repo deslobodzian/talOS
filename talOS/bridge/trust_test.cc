@@ -59,6 +59,19 @@ std::vector<Command> Commands(
   return commands;
 }
 
+// The send times of clock probes among `frames`, in the order sent, checking
+// that each carries an empty payload (DATA_FLOW.md "Link rates and endpoints").
+std::vector<uint64_t> ClockProbes(
+    const std::vector<InProcessGateway::Frame>& frames) {
+  std::vector<uint64_t> sent_us;
+  for (const auto& frame : frames) {
+    if (frame.type != protocol::FrameType::kClockProbe) continue;
+    EXPECT_TRUE(frame.payload.empty());
+    sent_us.push_back(frame.sent_us);
+  }
+  return sent_us;
+}
+
 // How many configuration frames are among `frames`: one per push of the
 // test configs, which fit one chunk.
 unsigned ConfigPushes(const std::vector<InProcessGateway::Frame>& frames) {
@@ -1158,6 +1171,213 @@ TEST(HardwareNodeTrustTest, NotReadyOutputChangeSendsAtOnce) {
       EXPECT_EQ(row.driven(commands[i].command, roller[0]), i == 0);
       EXPECT_EQ(commands[i].command.observed_time_us, 1000u);
     }
+  }
+}
+
+// While the gateway cannot take a command (!GatewayReady), a change of any
+// identity word (epoch, boot_id, or config_id transition) still sends at once
+// without waiting for the heartbeat period, whereas a change of the
+// observation alone right before it does not; subsequent heartbeats count from
+// that immediate send.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, NotReadyIdentityChangeSendsAtOnce) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
+  enum class IdentityChange { kEpoch, kBootId, kConfigId };
+  struct Row {
+    const char* name;
+    IdentityChange kind;
+  };
+  for (const Row row : {Row{"epoch", IdentityChange::kEpoch},
+                        Row{"boot_id", IdentityChange::kBootId},
+                        Row{"config_id", IdentityChange::kConfigId}}) {
+    SCOPED_TRACE(row.name);
+    Bridge rig{cfg};
+    HardwareNode& node = rig.node;
+    InProcessGateway& gateway = rig.gateway;
+    ipc::Publisher<Packet> pub{RequestTopic("intake")};
+    constexpr uint64_t kStartUs = 1'000'000;
+    const uint64_t heartbeat_us = node.heartbeat_us();
+    ASSERT_EQ(heartbeat_us, 20'000u);
+
+    // Initial disabled State and neutral request: establishes last_sent_cmd_.
+    State state = TrustState(config_id, 11, 1, 1'000);
+    state.flags = kConfigured;
+    ASSERT_TRUE(gateway.Deliver(state, kStartUs));
+    PublishCommand(pub, NeutralCommand(state, roller));
+    node.Tick(kStartUs + 1'000);
+    ASSERT_EQ(node.commands_sent(), 1u);
+    gateway.TakeSent();
+
+    // Control: an observation-only change while disabled waits for the
+    // heartbeat (due at kStartUs + 21'000).
+    state.sample_time_us = 2'000;
+    ASSERT_TRUE(gateway.Deliver(state, kStartUs + 2'000));
+    PublishCommand(pub, NeutralCommand(state, roller));
+    node.Tick(kStartUs + 3'000);
+    EXPECT_EQ(node.commands_sent(), 1u)
+        << "observation-only change while disabled must wait for heartbeat";
+    EXPECT_TRUE(Commands(gateway.TakeSent()).empty());
+
+    // Now change the row's identity word well before the heartbeat is due.
+    State next_state = state;
+    if (row.kind == IdentityChange::kEpoch) {
+      next_state.epoch = 2;
+      next_state.sample_time_us = 3'000;
+      ASSERT_TRUE(gateway.Deliver(next_state, kStartUs + 4'000));
+    } else if (row.kind == IdentityChange::kBootId) {
+      // Keep epoch and sample_time_us unchanged so only boot_id differs.
+      next_state.boot_id = 12;
+      next_state.sample_time_us = 1'000;
+      ASSERT_TRUE(gateway.Deliver(next_state, kStartUs + 4'000));
+    } else {
+      // Gateway briefly reports a foreign config_id, then returns to ours
+      // while still unconfigured (!GatewayReady), keeping boot_id and epoch.
+      State foreign = state;
+      foreign.config_id = config_id + 1;
+      foreign.flags = 0;
+      foreign.sample_time_us = 2'500;
+      ASSERT_TRUE(gateway.Deliver(foreign, kStartUs + 3'500));
+      next_state.config_id = config_id;
+      next_state.flags = 0;
+      next_state.sample_time_us = 3'000;
+      ASSERT_TRUE(gateway.Deliver(next_state, kStartUs + 4'000));
+    }
+    gateway.TakeSent();
+
+    std::vector<SentCommand> commands;
+    const auto tick = [&](uint64_t now_us) {
+      node.Tick(now_us);
+      for (const auto& command : Commands(gateway.TakeSent())) {
+        commands.push_back({now_us, command});
+      }
+    };
+
+    constexpr uint64_t kChangedUs = kStartUs + 5'000;
+    PublishCommand(pub, NeutralCommand(next_state, roller));
+    tick(kChangedUs);
+    ASSERT_EQ(commands.size(), 1u)
+        << "identity change while !GatewayReady must send immediately";
+    EXPECT_EQ(commands[0].sent_us, kChangedUs);
+    EXPECT_EQ(commands[0].command.config_id, next_state.config_id);
+    EXPECT_EQ(commands[0].command.boot_id, next_state.boot_id);
+    EXPECT_EQ(commands[0].command.epoch, next_state.epoch);
+    EXPECT_EQ(commands[0].command.observed_time_us, next_state.sample_time_us);
+
+    // Subsequent heartbeats count from kChangedUs, up to before intake's
+    // 50 ms owner timeout at kChangedUs + 50'001.
+    uint64_t now_us = kChangedUs;
+    for (uint64_t due_us = node.NextDutyUs(now_us);
+         due_us < kChangedUs + 48'000; due_us = node.NextDutyUs(now_us)) {
+      ASSERT_GT(due_us, now_us) << "nothing is pending at " << now_us;
+      now_us = due_us;
+      tick(now_us);
+    }
+
+    const std::array<uint64_t, 3> expected_us = {
+        kChangedUs, kChangedUs + heartbeat_us, kChangedUs + (2 * heartbeat_us)};
+    ASSERT_EQ(commands.size(), expected_us.size());
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(commands[i].sent_us, expected_us[i]);
+      EXPECT_EQ(commands[i].command.boot_id, next_state.boot_id);
+      EXPECT_EQ(commands[i].command.epoch, next_state.epoch);
+      EXPECT_EQ(commands[i].command.config_id, next_state.config_id);
+    }
+  }
+}
+
+// Clock probes run on their 20 ms cadence (at most one outstanding, replaced
+// after 100 ms unanswered) regardless of whether the gateway has sent a State,
+// is configured, commissioned, faulted, disabled, or enabled, and without any
+// active subsystem requests.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, ClockProbeCadenceIsIndependentOfGatewayReady) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  constexpr uint64_t kStartUs = 1'000'000;
+  constexpr uint64_t kProbePeriodUs = 20'000;
+  constexpr uint64_t kProbeRetryUs = 100'000;
+
+  // 1. Before any State has been observed (no requests either): initial probe
+  // sends immediately, stays at one outstanding through kProbeRetryUs, and
+  // retries at kProbeRetryUs + 1.
+  {
+    SCOPED_TRACE("before any state");
+    Bridge rig{cfg};
+    rig.node.Tick(kStartUs);
+    EXPECT_EQ(ClockProbes(rig.gateway.TakeSent()),
+              std::vector<uint64_t>{kStartUs});
+    rig.node.Tick(kStartUs + kProbePeriodUs);
+    rig.node.Tick(kStartUs + kProbeRetryUs);
+    EXPECT_TRUE(ClockProbes(rig.gateway.TakeSent()).empty());
+    rig.node.Tick(kStartUs + kProbeRetryUs + 1);
+    EXPECT_EQ(ClockProbes(rig.gateway.TakeSent()),
+              std::vector<uint64_t>{kStartUs + kProbeRetryUs + 1});
+    EXPECT_EQ(rig.node.commands_sent(), 0u);
+  }
+
+  // 2. Across every readiness state (disabled, unconfigured, faulted,
+  // uncommissioned, and enabled): echoed probes advance on the 20 ms cadence
+  // and never send a second probe while one is outstanding.
+  struct Row {
+    const char* name;
+    bool simulation;
+    uint32_t flags;
+  };
+  for (const Row row :
+       {Row{"disabled", true, kConfigured}, Row{"unconfigured", true, 0},
+        Row{"faulted", true, kConfigured | kEnabled | kHardwareFault},
+        Row{"uncommissioned", false, kConfigured | kEnabled},
+        Row{"enabled", true, kConfigured | kEnabled}}) {
+    SCOPED_TRACE(row.name);
+    HardwareNode node{cfg, "127.0.0.1", 5802, 5803, row.simulation};
+    InProcessGateway gateway{node};
+    const uint64_t config_id =
+        row.simulation ? NodeConfigId(cfg) : ConfigurationId(cfg.hardware);
+
+    // Probe 1 at kStartUs.
+    node.Tick(kStartUs);
+    ASSERT_EQ(ClockProbes(gateway.TakeSent()), std::vector<uint64_t>{kStartUs});
+
+    // Echo probe 1 in a State carrying this row's readiness flags.
+    State state = TrustState(config_id, 11, 1, 5'000);
+    state.flags = row.flags;
+    state.clock_probe_time_us = kStartUs;
+    ASSERT_TRUE(gateway.Deliver(state, kStartUs + 5'000));
+    EXPECT_TRUE(ClockProbes(gateway.TakeSent()).empty());
+
+    // 1 us before the 20 ms period: no probe yet; at 20 ms: probe 2 sends.
+    node.Tick(kStartUs + kProbePeriodUs - 1);
+    EXPECT_TRUE(ClockProbes(gateway.TakeSent()).empty());
+    const uint64_t probe2_us = kStartUs + kProbePeriodUs;
+    node.Tick(probe2_us);
+    EXPECT_EQ(ClockProbes(gateway.TakeSent()),
+              std::vector<uint64_t>{probe2_us});
+
+    // While probe 2 is unanswered, another 20 ms passing sends no probe.
+    node.Tick(probe2_us + kProbePeriodUs);
+    EXPECT_TRUE(ClockProbes(gateway.TakeSent()).empty());
+
+    // Echoing probe 2 after >= 20 ms completes it and immediately sends probe
+    // 3; echoing probe 3 then advances to probe 4 exactly 20 ms later.
+    const uint64_t echo2_us = probe2_us + kProbePeriodUs + 5'000;
+    state.sample_time_us = 45'000;
+    state.clock_probe_time_us = probe2_us;
+    ASSERT_TRUE(gateway.Deliver(state, echo2_us));
+    EXPECT_EQ(ClockProbes(gateway.TakeSent()), std::vector<uint64_t>{echo2_us});
+
+    state.sample_time_us = 50'000;
+    state.clock_probe_time_us = echo2_us;
+    ASSERT_TRUE(gateway.Deliver(state, echo2_us + 5'000));
+    EXPECT_TRUE(ClockProbes(gateway.TakeSent()).empty());
+
+    node.Tick(echo2_us + kProbePeriodUs - 1);
+    EXPECT_TRUE(ClockProbes(gateway.TakeSent()).empty());
+    node.Tick(echo2_us + kProbePeriodUs);
+    EXPECT_EQ(ClockProbes(gateway.TakeSent()),
+              std::vector<uint64_t>{echo2_us + kProbePeriodUs});
+    EXPECT_EQ(node.commands_sent(), 0u);
   }
 }
 
