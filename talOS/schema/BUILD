@@ -263,3 +263,25 @@ py_test(
         "@rules_python//python/runfiles",
     ],
 )
+
+# Python's struct_hash against C++'s (descriptor_gen) on seeded generated
+# schemas compiled by flatc.
+py_test(
+    name = "schema_hash_differential_test",
+    size = "small",
+    srcs = ["schema_hash_differential_test.py"],
+    data = [
+        "//talOS/build:descriptor_gen",
+        "@flatbuffers//:flatc",
+    ],
+    env = {
+        "TALOS_DESCRIPTOR_GEN": "$(rlocationpath //talOS/build:descriptor_gen)",
+        "TALOS_FLATC": "$(rlocationpath @flatbuffers//:flatc)",
+    },
+    legacy_create_init = False,
+    main = "schema_hash_differential_test.py",
+    deps = [
+        ":talos_schema",
+        "@rules_python//python/runfiles",
+    ],
+)

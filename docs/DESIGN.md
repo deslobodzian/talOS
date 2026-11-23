@@ -163,7 +163,7 @@ Automated checks that keep the architecture honest.
 | `LintGraph`, `--describe-only`, `talos_graph_test` per config | naming, one writer, schemas, reader cap, target policy, `hw` writers, parameter keys |
 | `talos_messages` action, `unit_suffix_test`, `descriptor_gen_lint_test` | unit suffixes, `.fbs` field naming (lower `snake_case`, no `_<digit>`, no interior 1-letter word before a unit suffix), topic grammar, descriptors |
 | `//talOS/build:topic_grammar_test` | `contract.bzl`'s grammar equals `names.h` |
-| `schema_hash_test`, `schema_hash_py_test`, the hash-checked attach | topics typed by schema identity in both languages |
+| `schema_hash_test`, `schema_hash_py_test`, `schema_hash_differential_test` (generated schemas), the hash-checked attach | topics typed by schema identity in both languages |
 | `//talOS/python:api_parity_test`, `//talOS/python:differential_parity_test`, `node_api.cc` `static_assert`s (device kinds, motor modes, wake modes, arming kinds, Driver Station flags/alliance, ABI struct layouts) | the C ABI equals ctypes, `talOS/python/talos/*.py` stays within the `talOS/node_api` AST import and symbol boundary (`REQ-CONTRACT-15`), and Python framework wrappers match C++ behaviour |
 | size `static_assert`s | DATA_FLOW.md byte budgets |
 | `manifest_sync_test`, the `talos_bundle` stamp | `[[subsystems]]` is the only node list |
