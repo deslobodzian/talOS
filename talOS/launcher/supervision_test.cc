@@ -357,10 +357,13 @@ bool Registered(std::string_view name, uint64_t session) {
   });
 }
 
-// Whether the registry holds an active, live row for `pid` named `name` of
-// `session` that is no longer constructing and has published at least one
-// heartbeat and dispatch. Unlike Registered(), this cannot match an earlier
-// SIGKILLed run's still-ACTIVE row.
+// Whether the registry holds an active row for `pid` named `name` of `session`
+// that is no longer constructing and has published at least one heartbeat and
+// dispatch, with `pid` still present in the process table (`kill(pid, 0)`).
+// Unlike Registered(), matching `node.pid` against the caller's PID (from the
+// new run's own registration line) prevents matching an earlier SIGKILLed run's
+// still-ACTIVE row; `kill(pid, 0)` rejects an already-reaped PID (an unreaped
+// zombie still answers `kill(pid, 0)`).
 bool RegisteredPid(std::string_view name, uint64_t session, pid_t pid) {
   if (pid <= 0 || ::kill(pid, 0) != 0) return false;
   const auto registry = introspect::RegistryReader::open();
@@ -3510,9 +3513,6 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
       "alpha", false);
   options.binary_overrides["//example/beta:node"] =
       WriteStub("undescribed_beta", "exit 0\n");
-  const std::string live = options.output_dir + "/" +
-                           std::to_string(options.session_id) +
-                           "/manifest.json";
   testing::SupervisionPasses passes;
   bool stepped = false;
   std::jthread driver{[&](const std::stop_token& stop) {
@@ -3525,35 +3525,11 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
         })) {
       return;
     }
-    // Keep the clock frozen at start + kMinHeartbeatTimeout while run 1 and
-    // its peers finish exiting cleanly so ReleaseOnExit cannot unfreeze the
-    // clock before run 1 exits and kill run 1 as heartbeat_missing under load.
     clock.HoldAt(start + kMinHeartbeatTimeout);
-    if (!WaitFor(stop, [&] {
-          SupervisionWakeup::Wake();
-          const std::string manifest = ReadFile(live);
-          const auto alpha_runs = ManifestRuns(manifest, "alpha");
-          if (alpha_runs.size() < 2) return false;
-          for (const char* name : {"hardware_node", "alpha", "beta"}) {
-            const auto member_runs = ManifestRuns(manifest, name);
-            if (member_runs.empty() ||
-                member_runs.back().find("\"reason\": \"running\"") !=
-                    std::string::npos) {
-              return false;
-            }
-          }
-          return true;
-        })) {
-      return;
-    }
+    if (!WaitFor(stop, [&] { return ReadLines(runs).size() >= 2; })) return;
     stepped = true;
-    // Past every clean-exit backoff (100 ms for restart 2) so RosterContinues
-    // cancels every pending restart and ends the session at once.
-    clock.HoldAt(start + kMinHeartbeatTimeout + 200ms);
-    WaitFor(stop, [&] {
-      SupervisionWakeup::Wake();
-      return false;
-    });
+    // Past the 50 ms clean-exit backoff so RosterContinues ends the session.
+    clock.HoldAt(start + kMinHeartbeatTimeout + 100ms);
   }};
   EXPECT_EQ(RunSession(options), 0);
   driver.request_stop();
@@ -4807,8 +4783,8 @@ TEST(Supervision, HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes) {
                  retry_at > 0;
         });
         // Advance exactly to `retry_at` and hold there until the restarted
-        // run registers its own live row (distinct from run 1's SIGKILLed
-        // row) and one supervision pass observes it.
+        // run registers its own row (matched by run 2's PID, distinct from
+        // run 1's SIGKILLed row) and one supervision pass observes it.
         if (stalled &&
             AdvanceClockWithHealthyNodes(
                 stop, clock, passes, session, now,
