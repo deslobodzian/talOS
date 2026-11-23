@@ -70,6 +70,7 @@ import argparse
 import ast
 import datetime
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -160,17 +161,33 @@ def split_row(line):
     return cells
 
 
+OPEN_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
+CLOSE_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})[ \t]*$")
+
+
 def parse_requirements(text):
     """({id: Requirement}, [package scope entries], [(line_no, req_id)])."""
     catalogue, scope, duplicates, section = {}, [], [], None
+    fence_char, fence_len = None, 0
     for number, line in enumerate(text.splitlines(), 1):
+        if fence_char is not None:
+            close = CLOSE_FENCE.match(line)
+            if close and close.group(1)[0] == fence_char and len(close.group(1)) >= fence_len:
+                fence_char, fence_len = None, 0
+            continue
+        open_m = OPEN_FENCE.match(line)
+        if open_m:
+            marker, info = open_m.group(1), open_m.group(2)
+            if not (marker[0] == "`" and "`" in info):
+                fence_char, fence_len = marker[0], len(marker)
+                continue
         if line.startswith("## "):
             section = line[3:].strip()
             continue
         if not line.startswith("|"):
             continue
         cells = split_row(line)
-        if section == "Catalogue" and REQ_ID.fullmatch(cells[0]):
+        if section == "Catalogue" and len(cells) >= 3 and REQ_ID.fullmatch(cells[0]):
             req_id = cells[0]
             if req_id in catalogue:
                 duplicates.append((number, req_id))
@@ -282,23 +299,66 @@ def _literal_string_list(node):
     return values
 
 
-def _contains_string_constant(node, target):
-    """Whether any string constant anywhere inside `node` equals `target`."""
-    return any(isinstance(sub, ast.Constant) and sub.value == target
-               for sub in ast.walk(node))
+def _collect_bindings(tree):
+    bindings = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = stmt.value
+    return bindings
+
+
+def _eval_str(node, bindings, seen=frozenset()):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in bindings and node.id not in seen:
+        return _eval_str(bindings[node.id], bindings, seen | {node.id})
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _eval_str(node.left, bindings, seen)
+        right = _eval_str(node.right, bindings, seen)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _contains_string_constant(node, target, bindings=None, seen=frozenset()):
+    """Whether any static string value reachable from `node` (following
+    top-level bindings and `+` string concatenation) equals `target`."""
+    bindings = bindings or {}
+    val = _eval_str(node, bindings, seen)
+    if val is not None:
+        return val == target
+    if isinstance(node, ast.Name) and node.id in bindings and node.id not in seen:
+        return _contains_string_constant(
+            bindings[node.id], target, bindings, seen | {node.id})
+    return any(
+        _contains_string_constant(child, target, bindings, seen)
+        for child in ast.iter_child_nodes(node)
+    )
 
 
 def _normalize_pkg_src(package, src):
-    """Package-relative repo path for a local file in `srcs`/`main`, or None
-    for a cross-package or external label (`//...`, `@...`)."""
-    if src.startswith(("//", "@")):
+    """Workspace-relative repo path for a file label in `srcs`/`main`, or None
+    for an external label (`@...`) or path escaping the workspace."""
+    if not src or src.startswith("@"):
         return None
-    if src.startswith(":"):
-        src = src[1:]
-    if not src:
+    if src.startswith("//"):
+        body = src[2:]
+        if ":" in body:
+            target_pkg, name = body.split(":", 1)
+            candidate = posixpath.join(target_pkg, name) if target_pkg else name
+        else:
+            candidate = body
+    else:
+        rel = src[1:] if src.startswith(":") else src
+        if not rel:
+            return None
+        candidate = posixpath.join(package, rel) if package else rel
+    norm = posixpath.normpath(candidate)
+    if norm in ("", ".") or norm == ".." or norm.startswith("../"):
         return None
-    joined = os.path.normpath(os.path.join(package, src))
-    return joined.replace(os.sep, "/")
+    return norm
 
 
 def _todo_mentions_label(text, label):
@@ -321,16 +381,23 @@ def quarantined_targets(files, read):
         if tree is None:
             continue
         package = os.path.dirname(path)
+        bindings = _collect_bindings(tree)
         for call in _build_calls(tree):
             kws = {kw.arg: kw.value for kw in call.keywords
                    if kw.arg is not None}
             tags_node = kws.get("tags")
-            if tags_node is None:
-                continue
-            parsed_tags = _literal_string_list(tags_node)
-            is_quarantined = (
-                "quarantine" in parsed_tags if parsed_tags is not None
-                else _contains_string_constant(tags_node, "quarantine"))
+            is_quarantined = False
+            if tags_node is not None:
+                parsed_tags = _literal_string_list(tags_node)
+                is_quarantined = (
+                    "quarantine" in parsed_tags if parsed_tags is not None
+                    else _contains_string_constant(tags_node, "quarantine",
+                                                   bindings))
+            if not is_quarantined:
+                is_quarantined = any(
+                    _contains_string_constant(kw.value, "quarantine", bindings)
+                    for kw in call.keywords if kw.arg is None
+                )
             if not is_quarantined:
                 continue
             name = _literal_string(kws.get("name"))
@@ -580,19 +647,31 @@ def trace(files, read, today, frameworks=()):
                 f"excluded (docs/TESTING.md §8.3)")
         entries = [text for text in todo_items.values()
                    if _todo_mentions_label(text, label)]
-        dates = sorted(d for text in entries for d in DATE.findall(text))
-        if not dates:
+        raw_dates = sorted(d for text in entries for d in DATE.findall(text))
+        if not raw_dates:
             failures.append(f"{build}: {label} is tagged quarantine without "
                             f"an open, dated {TODO} item naming it "
                             f"(docs/TESTING.md §8.3)")
             continue
-        expiry = datetime.date.fromisoformat(dates[-1])
+        parsed_dates = []
+        invalid_dates = []
+        for raw in raw_dates:
+            try:
+                parsed_dates.append((datetime.date.fromisoformat(raw), raw))
+            except ValueError:
+                invalid_dates.append(raw)
+        if invalid_dates:
+            failures.append(
+                f"{build}: {label}'s quarantine {TODO} item has invalid "
+                f"date(s): {', '.join(invalid_dates)}")
+            continue
+        expiry, expiry_str = max(parsed_dates)
         if expiry < today:
             failures.append(f"{build}: {label}'s quarantine expired on "
-                            f"{dates[-1]}: fix or delete it "
+                            f"{expiry_str}: fix or delete it "
                             f"(docs/TESTING.md §8.3)")
         elif (expiry - today).days > QUARANTINE_DAYS:
-            failures.append(f"{build}: {label}'s quarantine date {dates[-1]} "
+            failures.append(f"{build}: {label}'s quarantine date {expiry_str} "
                             f"is more than {QUARANTINE_DAYS} days out")
 
     citations = {}

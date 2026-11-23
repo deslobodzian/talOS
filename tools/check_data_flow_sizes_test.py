@@ -62,6 +62,32 @@ class CheckDataFlowSizesTest(unittest.TestCase):
             check_data_flow_sizes.check(
                 check_data_flow_sizes.parse_sizes(sizes_text), doc_text), [])
 
+    # REQ-DEV-35, RULES.md 9
+    def test_empty_sizes_duplicates_malformed_markers_and_decimals_fail_closed(
+            self):
+        # Empty sizes output must never pass silently.
+        self.assertTrue(check_data_flow_sizes.check({}, ""))
+
+        # Duplicate size names in the sizes output fail closed.
+        with self.assertRaises(ValueError):
+            check_data_flow_sizes.parse_sizes(
+                "frame.max_payload_bytes 1432\n"
+                "frame.max_payload_bytes 9999\n")
+
+        sizes = check_data_flow_sizes.parse_sizes(SIZES)
+        # Malformed marker names (uppercase, hyphens, extra spaces) must fail
+        # instead of being silently ignored.
+        malformed = doc() + "<!-- size: Frame.Max-Payload --> 999\n"
+        problems = check_data_flow_sizes.check(sizes, malformed)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("Frame.Max-Payload", problems[0])
+
+        # A fractional value like 1432.5 must not match integer size 1432.
+        decimal = doc(payload="1432.5")
+        problems = check_data_flow_sizes.check(sizes, decimal)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("frame.max_payload_bytes", problems[0])
+
 
 if __name__ == "__main__":
     unittest.main()
