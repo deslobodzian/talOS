@@ -397,6 +397,10 @@ class LogWriter {
 
     mutable std::mutex mutex;
     std::condition_variable chunk_ready;
+    // Notified under `mutex` when drain() clears `flushing` or wait_written()
+    // submits a chunk while `flushing` is true, so the writer parks without
+    // polling while drain() settles and durable-syncs.
+    std::condition_variable flush_cv;
     // Under `mutex`: the writer thread has finished open_file(), so drain()
     // syncs the file it made, not one still being created.
     bool file_ready{false};

@@ -235,15 +235,11 @@ void LogFileSink::rotate_to(std::uint64_t next) noexcept {
 }
 
 void LogFileSink::sync(bool durable, bool capture_stopped) noexcept {
-  const bool need_cap = head_dropped_.load() || capture_stopped;
   if (fd_ < 0) {
     // No file (never created, or lost by a failed rotation): nothing to sync,
     // but the periodic sync is still done, or the writer thread would find
     // it due on every pass, spin, and never see `stopping`.
     last_sync_ = std::chrono::steady_clock::now();
-    if (need_cap) {
-      mark_capped();
-    }
     return;
   }
   const int result = durable ? sys_durable_sync(fd_) : sys_periodic_sync(fd_);
@@ -251,6 +247,7 @@ void LogFileSink::sync(bool durable, bool capture_stopped) noexcept {
     set_error(std::string{"LogWriter: fsync failed: "} + std::strerror(errno));
   }
   last_sync_ = std::chrono::steady_clock::now();
+  const bool need_cap = head_dropped_.load() || capture_stopped;
   if (need_cap) {
     mark_capped();
   }
