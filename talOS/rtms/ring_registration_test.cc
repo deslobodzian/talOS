@@ -24,6 +24,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -234,10 +235,35 @@ TEST(RingRegistration, ReaderRegisteredAcrossLessThanARingReadsEveryMessage) {
       ReadResult::EMPTY);
 }
 
+// The longest topic name RTMSQueue accepts, in bytes after the leading slash
+// (ValidatePath in rtms.cc, the macOS shared-memory name limit; NAMING.md).
+constexpr std::size_t kMaxTopicBytes = 30;
+// The longest pid (Linux pid_max is at most 4194304) and counter suffixes
+// MakeUniquePath appends.
+constexpr std::size_t kMaxPidDigits = 7;
+constexpr int kMaxUniqueCounter = 999;
+constexpr std::size_t kMaxCounterDigits = 3;
+
+// `prefix` plus "_<pid>_<counter>", unique within this binary's run. Refuses
+// a prefix whose name could exceed kMaxTopicBytes with any pid (a sandbox's
+// pid namespace gives two-digit pids, a host up to seven), and more names
+// than the counter's digits allow, so a name too long anywhere fails here.
 std::string MakeUniquePath(const char* prefix) {
   static std::atomic<int> counter{0};
+  const std::string_view name = std::string_view{prefix}.substr(1);
+  if (name.size() + 1 + kMaxPidDigits + 1 + kMaxCounterDigits >
+      kMaxTopicBytes) {
+    throw std::logic_error(std::string{"MakeUniquePath: prefix "} + prefix +
+                           " is too long for a topic with a " +
+                           std::to_string(kMaxPidDigits) + "-digit pid");
+  }
+  const int unique = counter.fetch_add(1, std::memory_order_relaxed);
+  if (unique > kMaxUniqueCounter) {
+    throw std::logic_error("MakeUniquePath: more than " +
+                           std::to_string(kMaxUniqueCounter + 1) + " names");
+  }
   return std::string{prefix} + "_" + std::to_string(::getpid()) + "_" +
-         std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+         std::to_string(unique);
 }
 
 RTMSQueue OpenSubscriber(const std::string& path, std::size_t slots) {
@@ -488,7 +514,7 @@ TEST(RingRegistration, ForkedChildDestructionPreservesParentReaderSlot) {
 // mark the segment closing, or unlink the parent's live shared-memory segment.
 TEST(RingRegistration, ForkedChildDestructionPreservesParentSegmentLifetime) {
   constexpr std::size_t kSlots = 4;
-  const std::string standalone_path = MakeUniquePath("/ring_fork_standalone");
+  const std::string standalone_path = MakeUniquePath("/ring_fork_alone");
   const std::string session_path = MakeUniquePath("/ring_fork_session");
   ::shm_unlink(ShmObjectName(standalone_path).c_str());
   ::shm_unlink(ShmObjectName(session_path).c_str());
@@ -1502,7 +1528,7 @@ TEST(RingRegistration, SessionOwnerReplacesASegmentCreatedDuringItsClaim) {
   ASSERT_NO_FATAL_FAILURE(
       RunChild([] { return talos::OwnProcessWord(); }, dead_word));
 
-  const std::string path = MakeUniquePath("/ring_session_recreated");
+  const std::string path = MakeUniquePath("/ring_recreated");
   auto [old_mapping, old_segment_id] =
       MakeAbandonedClosingSegment(path, kSlots, kLifetimeClosing | dead_word);
 
