@@ -7,12 +7,16 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "talOS/vision/field_sim/field_layout_loader.h"
 #include "talOS/vision/field_sim/json_parser.h"
 #include "talOS/vision/field_sim/sim_camera.h"
+#include "talOS/vision/field_sim/tag_rasterizer.h"
 #include "talOS/vision/localization.h"
 
 namespace talos::vision::field_sim {
@@ -372,6 +376,84 @@ TEST(SimCamera, OpticalMountRoundTripRecoversFlatRobotPose) {
              Eigen::Vector3d::UnitZ())
                 .norm(),
             1e-12);
+}
+
+TEST(TagRasterizer, RejectsNonFiniteMotionAndExposureParameters) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const FieldLayout layout = SingleTagLayout();
+  SimCameraView cam = TestCamera();
+  cam.exposure_ms = 20.0;
+  std::map<int, TagPattern> patterns;
+  patterns.emplace(1, TagPattern{1, {}});
+  RenderScratch scratch;
+  std::vector<uint8_t> pixels;
+
+  ASSERT_EQ(RenderFieldView(layout, patterns, cam, RobotPoseOnField(0, 0, 0),
+                            kTagSize, {}, &pixels, Eigen::Vector3d::Zero(), 0.0,
+                            nullptr, &scratch),
+            1);
+
+  for (const double bad_yaw : {nan, inf, -inf}) {
+    EXPECT_EQ(RenderFieldView(layout, patterns, cam, RobotPoseOnField(0, 0, 0),
+                              kTagSize, {}, &pixels, Eigen::Vector3d::Zero(),
+                              bad_yaw, nullptr, &scratch),
+              0)
+        << bad_yaw;
+  }
+  for (const double bad_v : {nan, inf, -inf}) {
+    EXPECT_EQ(
+        RenderFieldView(layout, patterns, cam, RobotPoseOnField(0, 0, 0),
+                        kTagSize, {}, &pixels, Eigen::Vector3d(bad_v, 0.0, 0.0),
+                        0.0, nullptr, &scratch),
+        0)
+        << bad_v;
+  }
+  for (const double bad_exp : {nan, inf}) {
+    SimCameraView bad_cam = cam;
+    bad_cam.exposure_ms = bad_exp;
+    EXPECT_EQ(RenderFieldView(layout, patterns, bad_cam,
+                              RobotPoseOnField(0, 0, 0), kTagSize, {}, &pixels,
+                              Eigen::Vector3d::Zero(), 0.0, nullptr, &scratch),
+              0)
+        << bad_exp;
+  }
+  EXPECT_EQ(
+      RenderFieldView(layout, patterns, cam, RobotPoseOnField(0, 0, 0), inf, {},
+                      &pixels, Eigen::Vector3d::Zero(), 0.0, nullptr, &scratch),
+      0);
+}
+
+TEST(TagRasterizer, ClampsExtremeProjectedPixelCoordinatesWithoutWraparound) {
+  SimCameraView cam = TestCamera();
+  cam.intrinsics.k1 = 0.01;
+  const double inv_sqrt2 = 1.0 / std::sqrt(2.0);
+  Eigen::Matrix3d rot;
+  rot.col(0) = Eigen::Vector3d(-inv_sqrt2, 0.0, -inv_sqrt2);
+  rot.col(1) = Eigen::Vector3d(inv_sqrt2, 0.0, -inv_sqrt2);
+  rot.col(2) = Eigen::Vector3d(0.0, -1.0, 0.0);
+  // Entire tag sits strictly in p_cam.x > 0 (right of cx=320), with its outer
+  // edge at z = 2e-6 projecting far past INT_MAX.
+  const Eigen::Vector3d trans(0.125 * inv_sqrt2 + 0.05, 0.0,
+                              0.125 * inv_sqrt2 + 2e-6);
+
+  SimTagDetection det{};
+  det.tag_id = 1;
+  det.T_camera_tag =
+      talos::geometry::SE3<double>(talos::geometry::SO3<double>(rot), trans);
+
+  std::map<int, TagPattern> patterns;
+  patterns.emplace(1, TagPattern{1, {}});
+  std::vector<SimTagDetection> dets{det};
+  cv::Mat img(480, 640, CV_8UC1, cv::Scalar(255));
+  ASSERT_EQ(RasterizeProjectedTags(patterns, cam, kTagSize, {}, img, &dets), 1);
+
+  // No pixel left of the optical center should be painted due to int overflow
+  // wraparound from +huge to INT_MIN.
+  for (int x = 0; x < 320; ++x) {
+    ASSERT_EQ(img.at<uint8_t>(240, x), 255)
+        << "unexpected dark pixel on left side at x=" << x;
+  }
 }
 
 }  // namespace

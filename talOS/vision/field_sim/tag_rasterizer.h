@@ -98,9 +98,16 @@ inline int RasterizeProjectedTags(const std::map<int, TagPattern>& patterns,
                                      (1.25 - row * 0.25) * half_m};
         Eigen::Vector2d pixel;
         valid[index] =
-            cam.intrinsics.ProjectPoint(det.T_camera_tag.act(corner), &pixel);
-        if (valid[index])
-          vertices[index] = {cvRound(pixel.x()), cvRound(pixel.y())};
+            cam.intrinsics.ProjectPoint(det.T_camera_tag.act(corner), &pixel) &&
+            std::isfinite(pixel.x()) && std::isfinite(pixel.y());
+        if (valid[index]) {
+          // Clamp within OpenCV's 16-bit fixed-point fillConvexPoly range
+          // (INT_MAX >> 17) to avoid int overflow in cvRound and rasterization.
+          constexpr double kMaxPixelCoord = 16383.0;
+          vertices[index] = {
+              cvRound(std::clamp(pixel.x(), -kMaxPixelCoord, kMaxPixelCoord)),
+              cvRound(std::clamp(pixel.y(), -kMaxPixelCoord, kMaxPixelCoord))};
+        }
       }
     }
     for (int gr = 0; gr < 10; ++gr) {
@@ -142,7 +149,9 @@ inline int RenderInstantaneousFieldView(
   if (gray_out == nullptr) return 0;
   const int w = static_cast<int>(cam.intrinsics.image_width);
   const int h = static_cast<int>(cam.intrinsics.image_height);
-  if (w <= 0 || h <= 0 || !(tag_size_m > 0.0)) return 0;
+  if (w <= 0 || h <= 0 || !std::isfinite(tag_size_m) || !(tag_size_m > 0.0)) {
+    return 0;
+  }
   gray_out->assign(static_cast<size_t>(w) * h, options.background_gray);
   cv::Mat image(h, w, CV_8UC1, gray_out->data());
   SimulateVisibleTags(layout, cam, T_field_robot, tag_size_m, detections, true);
@@ -235,7 +244,9 @@ inline int RenderFieldView(
   if (gray_out == nullptr) return 0;
   const int width = static_cast<int>(cam.intrinsics.image_width);
   const int height = static_cast<int>(cam.intrinsics.image_height);
-  if (width <= 0 || height <= 0 || !(tag_size_m > 0.0)) {
+  if (width <= 0 || height <= 0 || !std::isfinite(tag_size_m) ||
+      !(tag_size_m > 0.0) || !std::isfinite(cam.exposure_ms) ||
+      !std::isfinite(yaw_rate_radps) || !robot_velocity_field_mps.allFinite()) {
     return 0;
   }
   const double exposure_s = std::max(0.0, cam.exposure_ms) * 0.001;

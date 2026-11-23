@@ -508,4 +508,32 @@ TEST(CpuAprilTagBackendTest, RejectsPositiveStrideSmallerThanWidth) {
   ::munmap(mapping, 2 * page_size);
 }
 
+TEST(CpuAprilTagBackendTest, NegativeQuadSigmaDoesNotMutateCallerBuffer) {
+  const std::string src_path = GetTestdataPath("scene_single_tag0.png");
+  image_u8_t* src_im = LoadGrayImageU8(src_path);
+  ASSERT_NE(src_im, nullptr);
+  const int w = src_im->width;
+  const int h = src_im->height;
+  std::vector<uint8_t> raw(static_cast<size_t>(w) * h);
+  for (int y = 0; y < h; ++y) {
+    std::memcpy(&raw[static_cast<size_t>(y) * w],
+                src_im->buf + static_cast<size_t>(y) * src_im->stride,
+                static_cast<size_t>(w));
+  }
+  image_u8_destroy(src_im);
+  const std::vector<uint8_t> original = raw;
+
+  DetectorOptions options;
+  options.family_name = "tag36h11";
+  options.quad_decimate = 1.0f;
+  options.quad_sigma = -0.8f;
+  options.threads = 1;
+  CpuAprilTagBackend backend(options);
+
+  const std::vector<Detection> detections = backend.Detect(raw.data(), w, h, w);
+  EXPECT_EQ(raw, original);
+  ASSERT_EQ(detections.size(), 1u);
+  EXPECT_EQ(detections[0].id, 0);
+}
+
 }  // namespace talos::vision::apriltag

@@ -395,5 +395,31 @@ TEST(SE2, AdjointAndRightJacobian) {
   }
 }
 
+// REQ-CONTRACT-01: SO3::RightJacobianOfExp and SE3::LeftV must avoid
+// catastrophic cancellation near sqrt(eps) where theta >= sqrt(eps) but
+// theta^2 < sqrt(eps).
+TEST(SO3, SmallAngleRightJacobianAndSE3LeftVAvoidCancellation) {
+  for (const double theta : {1.5e-8, 5e-8, 1e-7, 1e-6, 1e-5, 1e-4}) {
+    SCOPED_TRACE(theta);
+    const double c = theta / std::sqrt(2.0);
+    const Eigen::Vector3d w(c, c, 0.0);
+    const double theta_sq = theta * theta;
+    const double expected_a = 0.5 - theta_sq / 24.0;
+    const double expected_b = 1.0 / 6.0 - theta_sq / 120.0;
+
+    const Eigen::Matrix3d jr = SO3<double>::RightJacobianOfExp(w);
+    const double jr_a = -jr(0, 2) / c;
+    const double jr_b = jr(0, 1) / (c * c);
+    EXPECT_NEAR(jr_a, expected_a, 1e-10);
+    EXPECT_NEAR(jr_b, expected_b, 1e-10);
+
+    const Eigen::Matrix3d lv = SE3<double>::LeftV(w);
+    const double lv_a = lv(0, 2) / c;
+    const double lv_b = lv(0, 1) / (c * c);
+    EXPECT_NEAR(lv_a, expected_a, 1e-10);
+    EXPECT_NEAR(lv_b, expected_b, 1e-10);
+  }
+}
+
 }  // namespace
 }  // namespace talos::geometry

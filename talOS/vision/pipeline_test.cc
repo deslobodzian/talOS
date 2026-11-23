@@ -320,5 +320,21 @@ TEST(PipelineTest, DeferredGpuInitWorkerRunsAtBackgroundPriority) {
   EXPECT_TRUE(worker_is_background.get());
 }
 
+TEST(PipelineTest, SyntheticSourceHandlesIntMinTagIdWithoutUb) {
+  SyntheticCameraSource source(0, "synthetic",
+                               {640, 480, 0, PixelFormat::kGray8});
+  source.AddTag({.tag_id = std::numeric_limits<int>::min(),
+                 .center_x = 320,
+                 .center_y = 240,
+                 .size_pixels = 160});
+  const Frame frame = source.GenerateFrame();
+  AprilTagPipeline pipeline(Config());
+  const auto result = pipeline.ProcessFrame(frame);
+  ASSERT_TRUE(result.success) << result.error_message;
+  ASSERT_EQ(result.detections.size(), 1u);
+  // |INT_MIN| % 10 == 2147483648 % 10 == 8.
+  EXPECT_EQ(result.detections.front().tag_id, 8);
+}
+
 }  // namespace
 }  // namespace talos::vision
