@@ -10,9 +10,11 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -59,6 +61,77 @@ def free_ports():
         f"{port_base}-{port_base + port_span - 1}")
 
 
+def _copy_tree_best_effort(src, dst):
+    if not os.path.isdir(src):
+        return
+    try:
+        os.makedirs(dst, exist_ok=True)
+    except OSError:
+        return
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target_root = dst if rel == "." else os.path.join(dst, rel)
+        for name in dirs:
+            try:
+                os.makedirs(os.path.join(target_root, name), exist_ok=True)
+            except OSError:
+                pass
+        for name in files:
+            src_path = os.path.join(root, name)
+            dst_path = os.path.join(target_root, name)
+            if os.path.islink(src_path) and not os.path.exists(src_path):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                shutil.copyfile(src_path, dst_path)
+            except OSError:
+                pass
+
+
+def preserve_failure_artifacts(launch_output, sessions_dir,
+                               subdir="studio_test_failure"):
+    """Best-effort copy of `launch.log` and `sessions_dir` into
+    `TEST_UNDECLARED_OUTPUTS_DIR` on failure (talOS docs/TESTING.md §8.2).
+    Never raises so copy errors cannot mask the test failure."""
+    outputs_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+    if not outputs_dir:
+        return None
+    has_sessions = False
+    if sessions_dir and os.path.isdir(sessions_dir):
+        try:
+            has_sessions = bool(os.listdir(sessions_dir))
+        except OSError:
+            has_sessions = False
+    if not launch_output and not has_sessions:
+        return None
+    try:
+        os.makedirs(outputs_dir, exist_ok=True)
+        dest = None
+        for index in range(1, 1000):
+            name = subdir if index == 1 else f"{subdir}_{index}"
+            candidate = os.path.join(outputs_dir, name)
+            try:
+                os.makedirs(candidate, exist_ok=False)
+                dest = candidate
+                break
+            except FileExistsError:
+                continue
+        if dest is None:
+            dest = tempfile.mkdtemp(prefix=f"{subdir}_", dir=outputs_dir)
+    except OSError:
+        return None
+    if launch_output:
+        try:
+            with open(os.path.join(dest, "launch.log"), "w",
+                      encoding="utf-8", errors="replace") as f:
+                f.write(launch_output)
+        except OSError:
+            pass
+    if has_sessions:
+        _copy_tree_best_effort(sessions_dir, os.path.join(dest, "sessions"))
+    return dest
+
+
 class StudioBridgeInSession(unittest.TestCase):
     # REQ-DEV-30
     def test_the_bridge_serves_drive_and_exits_zero(self):
@@ -67,19 +140,35 @@ class StudioBridgeInSession(unittest.TestCase):
         data give it a folder that exists, and the launcher runs it as a
         member. A bridge the launcher drops leaves no manifest row, so the
         row is required here rather than only its exit."""
-        out = tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR"))
-        try:
-            self.check_session(out)
-        except AssertionError as error:
-            # The bridge's own output, which the launcher does not echo: a
-            # port another process took first reads there, not in the
-            # launch's lines (talOS docs/TESTING.md §6.4).
-            logs = glob.glob(os.path.join(out, "*", "studio_bridge.log"))
-            text = "".join(open(log, encoding="utf-8").read() for log in logs)
-            raise AssertionError(f"{error}\n--- studio_bridge.log ---\n"
-                                 f"{text or '(none written)'}") from None
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("TEST_TMPDIR")) as tmp:
+            out = os.path.join(tmp, "sessions")
+            os.makedirs(out)
+            launch_output = []
+            try:
+                self.check_session(out, launch_output)
+            except BaseException as error:
+                kept = preserve_failure_artifacts(
+                    "".join(launch_output), out)
+                if isinstance(error, AssertionError):
+                    # The bridge's own output, which the launcher does not
+                    # echo: a port another process took first reads there, not
+                    # in the launch's lines (talOS docs/TESTING.md §6.4).
+                    logs = glob.glob(
+                        os.path.join(out, "*", "studio_bridge.log"))
+                    text = "".join(
+                        open(log, encoding="utf-8", errors="replace").read()
+                        for log in logs)
+                    note = f"\nartifacts preserved: {kept}" if kept else ""
+                    raise AssertionError(
+                        f"{error}\n--- studio_bridge.log ---\n"
+                        f"{text or '(none written)'}{note}") from None
+                if kept:
+                    print(f"studio_test: failure artifacts preserved: {kept}",
+                          file=sys.stderr)
+                raise
 
-    def check_session(self, out):
+    def check_session(self, out, output):
         sim = runfiles.Create().Rlocation("_main/sim")
         gateway, bridge = free_ports()
         launch = subprocess.Popen(
@@ -89,7 +178,6 @@ class StudioBridgeInSession(unittest.TestCase):
              "--duration-s", str(HANG_S)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, start_new_session=True)
-        output = []
         up = threading.Event()
 
         def read():
