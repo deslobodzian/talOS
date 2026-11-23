@@ -70,7 +70,7 @@ The rules are ARCHITECTURE.md
 | `talOS/` never depends on a robot, an example or `studio/` | **[enforced]**: `tools/check_layers.py` |
 | Nodes share only messages and topic names | **[enforced]** for Bazel dependencies: `tools/check_layers.py` (a node package's targets, its tests included, depend on another node package only through its `talos_messages` targets or its `talos_cc_shared_node`; outside node packages only a testonly target, such as a robot's cross-node integration test, links a node's library) |
 | `talOS/vision` → `talOS/geometry`, never the reverse | **[enforced]**: `tools/check_layers.py` |
-| Python reaches talOS only through `talOS/node_api` | **[enforced]** for the ABI: `//talOS/python:api_parity_test`, `node_api.cc` `static_assert`s; for Bazel dependencies: `tools/check_layers.py`; **[review]** for "reimplements no wire format" |
+| Python reaches talOS only through `talOS/node_api` | **[enforced]** for the ABI and Python module boundary (`REQ-CONTRACT-15`): `//talOS/python:api_parity_test` (ABI table parity plus AST import & symbol boundary check across `talOS/python/talos/*.py` forbidding transport/IPC/compression imports, dynamic import/exec escapes, `ctypes` loaders outside `_abi.py`/`__init__.py`, and `struct` outside `_messages.py`/`parity.py`), `node_api.cc` `static_assert`s, and `tools/check_layers.py` for Bazel dependencies; **[review]** for pure-Python wire-format reimplementation without those imports |
 | Only the devices-layer flush writes `/hw/request/<node>` | **[enforced]**: `publish`/`publish_bytes` and `NodeDetail::publisher_send` refuse `/hw/request`, `LintGraph` checks the `hardware_request` flag, Bazel visibility and `implementation_deps` keep `//talOS/node:access`, `//talOS/devices:access`, `//talOS/hardware:hardware`, `//talOS/ipc:ipc`, `//talOS/rtms:{rtms,wake}` and `//talOS/memory:shared_memory` out of robot node compile/link graphs, and `tools/check_layers.py` checks visibility, direct deps and C++/Starlark sources |
 | Output setters only inside `update()` | **[enforced]**: they throw elsewhere |
 | Actuation needs `robot_enabled` and a live `Target` | **[enforced]** for "a live target exists this tick": the devices flush (REQ-SAFE-41), surfaced on Studio's node card and the driver dashboard's subsystems row; its node-level opt-out, `AllowUntargetedOutputs`, is marked on the node's hardware request in `--describe` and the registry (REQ-SAFE-42) (owner decision 2026-11-21: a per-device opt-out is deferred until a robot needs one); **[review]** for "the outputs derive from that target": the flush cannot tell a demand taken from the target from one taken from a joystick (`if (target.get()) motor.set(joystick)`) or a value kept from an earlier tick (owner decision 2026-11-21: accepted as review-only residual) |
@@ -114,7 +114,7 @@ the check in the same commit (RULES.md 9).
 | `command_timeout_us` range; actuator `period_us` limit | ARCHITECTURE.md "The tick" | **[enforced]** config load refuses |
 | Owner timeout | ARCHITECTURE.md "The tick" | **[enforced]** bridge and `SimHardware` share `//talOS/hardware:merge` |
 | `update()` allocates nothing | METHODOLOGY.md §10 | **[enforced]** C++ (`AllocationProbe`); **[review]** Python |
-| `update()` p99 duration | METHODOLOGY.md §10 | **[gap: SPEC-4]** no benchmark |
+| `update()` p99 duration | METHODOLOGY.md §10 | **[enforced]** on representative bench and framework C++ nodes (`//bench/main_processor:update_p99_perf_test`, `REQ-RT-07`, `perf` lane); end-to-end budget derivation open (**[gap: SPEC-4]**) |
 | Node hops from driver input to actuator | METHODOLOGY.md §10 | **[enforced]** `LintGraph` warning (`names.h`, `REQ-RT-16`) |
 | `/hw/request` gap in simulation | the [bench simulation README](../bench/main_processor/simulation/README.md) | asserted in simulation by the bench `soak_test` (`manual`); no requirement states it (**[gap: SPEC-4]**) |
 | Target age at the selecting tick | launcher README "Session measurements" | `session_report --strict` on a recorded session; bench run open (TIME-3) |
@@ -160,20 +160,21 @@ Automated checks that keep the architecture honest.
 | Check | Guards |
 |---|---|
 | `LintGraph`, `--describe-only`, `talos_graph_test` per config | naming, one writer, schemas, reader cap, target policy, `hw` writers, parameter keys |
-| `talos_messages` action, `unit_suffix_test`, `descriptor_gen_lint_test` | unit suffixes, topic grammar, descriptors |
+| `talos_messages` action, `unit_suffix_test`, `descriptor_gen_lint_test` | unit suffixes, `.fbs` field naming (lower `snake_case`, no `_<digit>`, no interior 1-letter word before a unit suffix), topic grammar, descriptors |
 | `//talOS/build:topic_grammar_test` | `contract.bzl`'s grammar equals `names.h` |
 | `schema_hash_test`, `schema_hash_py_test`, the hash-checked attach | topics typed by schema identity in both languages |
-| `//talOS/python:api_parity_test`, `//talOS/python:differential_parity_test`, `node_api.cc` `static_assert`s (device kinds, motor modes, wake modes, arming kinds, Driver Station flags/alliance, ABI struct layouts) | the C ABI equals ctypes, and Python framework wrappers match C++ behaviour |
+| `//talOS/python:api_parity_test`, `//talOS/python:differential_parity_test`, `node_api.cc` `static_assert`s (device kinds, motor modes, wake modes, arming kinds, Driver Station flags/alliance, ABI struct layouts) | the C ABI equals ctypes, `talOS/python/talos/*.py` stays within the `talOS/node_api` AST import and symbol boundary (`REQ-CONTRACT-15`), and Python framework wrappers match C++ behaviour |
 | size `static_assert`s | DATA_FLOW.md byte budgets |
 | `manifest_sync_test`, the `talos_bundle` stamp | `[[subsystems]]` is the only node list |
 | the Studio bindings diff in CI | checked-in TypeScript equals `telemetry.fbs` |
 | `AllocationProbe` cases ([METHODOLOGY.md §10](METHODOLOGY.md#10-performance)) | RULES.md 3, allocation part |
+| `//bench/main_processor:update_p99_perf_test` (`perf` lane, `StallMeter` host qualification) | `REQ-RT-07` / [METHODOLOGY.md §10](METHODOLOGY.md#10-performance) `update()` p99 ≤ 10 % of `period_us` on representative bench and framework C++ nodes |
 | `publish` refusing `/hw/request`; setters throwing outside `update()` | RULES.md 2 |
 | config load refusals (timeouts, periods, singular sections, soft limits) | "The tick" numbers |
 | `wpilib_lockstep_test` | GradleRIO and RobotPy wheel versions agree |
 | `new_subsystem_test` golden packages | the scaffold's output builds and passes |
 | `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies" and `studio/review` viewer isolation (`REQ-SAFE-35`: no UDP `talOS/protocol:protocol`, hardware UDP endpoint `talOS/hardware:hardware`, `talOS/memory:shared_memory`, RTMS, IPC, bridge runtime, or node/devices; pure wire codecs `talOS/protocol:frame` and `talOS/hardware:codecs` allowed); its allowlist only shrinks |
-| `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code, no randomness in node code ([METHODOLOGY.md §9](METHODOLOGY.md#9-time-determinism-restart)), and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
+| `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code, no randomness, direct blocking I/O, logging, `print`, or locks in node code ([METHODOLOGY.md §9](METHODOLOGY.md#9-time-determinism-restart), [§10](METHODOLOGY.md#10-performance)), and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
 | `tools/check_links.py` (CI lint job) | every relative markdown link and `#anchor` resolves |
 | `tools/trace.py --check` (CI lint job) | every `REQ-` tag names a catalogue requirement; every SAFE, CONTRACT and P0 requirement has a tagged test at or below its cheapest runnable tier (from Bazel lane tags, GradleRIO `phoenixTest`, and Studio node:test (`tsx --test`)) or cites a bench section or open TODO.md item; quarantines are dated and unexpired; every Bazel package is in the package scope table; its waiver list only shrinks |
 | `tools/slow_tests.py --check --bep` (CI Linux job) | per-target lane time budgets (fast, heavy, integration, e2e, perf; [TESTING.md §9](TESTING.md#9-lanes-and-ci)) |

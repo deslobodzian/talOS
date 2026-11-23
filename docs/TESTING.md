@@ -220,10 +220,12 @@ Where RULES.md 12 is read too broadly or too narrowly:
    incomplete` fails the macOS sim tests), the host did not sleep, and the
    graph's CPU demand fits the cores. A test that cannot hold its bound on a
    host fails as unqualified, distinctly from a product failure
-   (`//talOS/bridge:run_timing_test` records the gtest property
-   `host_unqualified="true"` and `[HOST_UNQUALIFIED]` in its failure message;
-   uniform reporting across the remaining perf and timed e2e tests is still
-   open). **[review]**
+   (`//talOS/bridge:run_timing_test` and
+   `//bench/main_processor:update_p99_perf_test` — the latter using the shared
+   `StallMeter` helper in `//talOS/process:host_qualification` — record the
+   gtest property `host_unqualified="true"` and `[HOST_UNQUALIFIED]` in their
+   failure message; uniform reporting across the remaining perf and timed e2e
+   tests is still open). **[review]**
 8. **Statistics over single samples.** A lateness or gap assertion uses the
    quantity the requirement names (the maximum inside a window, or a
    percentile over at least 50 samples), as
@@ -363,11 +365,16 @@ the host can run it. It is never noise.
    `tools/lint_test_time.py` for `flaky = True` and `--flaky_test_attempts`;
    review for reruns]**
 2. **Diagnose from the artifact.** The bench `soak_test`
-   writes its session directory to Bazel's undeclared test outputs, and
-   `//studio:drive_browser_test` its session's logs, a screenshot and the
-   failing elements when a check fails; the other e2e and perf tests write theirs to temporary directories that do
-   not survive the run **[review]**. A flake is closed by a named mechanism and a test
-   that pins it (§5), not by a green rerun.
+   writes its session directory to Bazel's undeclared test outputs
+   (`TEST_UNDECLARED_OUTPUTS_DIR`), `//studio:drive_browser_test` preserves
+   its session's logs, a screenshot and the failing elements when a check
+   fails, and `talOS/build/sim_check.py` (every `talos_sim_test`),
+   `examples/robot_repo/bundle_install_test.py` and
+   `examples/robot_repo/studio_test.py` preserve `launch.log` and their
+   session/log directories under `TEST_UNDECLARED_OUTPUTS_DIR` on failure;
+   the remaining e2e and perf tests write theirs to temporary directories
+   that do not survive the run **[review]**. A flake is closed by a named
+   mechanism and a test that pins it (§5), not by a green rerun.
 3. **Quarantine is explicit and expires.** A test that fails without a
    product change and cannot be fixed the same day gets the tags
    `["manual", "quarantine"]` (so `bazel test //...` skips it) and a TODO.md
