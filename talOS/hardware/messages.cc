@@ -36,6 +36,27 @@ struct Reader : driver_station::LittleEndianReader {
     return std::bit_cast<int16_t>(static_cast<uint16_t>(Int(2))) / 10.0;
   }
 };
+// A State's digital input or output sample (DigitalInputSample and
+// DigitalOutputSample have the same fields): its id, then valid and value as
+// one byte each, 0 or 1.
+template <typename Sample>
+void WriteDigitalSample(Writer& w, const Sample& d) {
+  w.Int(d.id, 2);
+  w.Int(d.valid ? 1 : 0, 1);
+  w.Int(d.value ? 1 : 0, 1);
+}
+// False, with the payload refused, on a valid or value byte other than 0 or 1.
+template <typename Sample>
+bool ReadDigitalSample(Reader& r, Sample& d) {
+  d.id = r.Int(2);
+  auto valid = r.Int(1);
+  if (valid > 1) return false;
+  d.valid = (valid == 1);
+  auto val = r.Int(1);
+  if (val > 1) return false;
+  d.value = (val == 1);
+  return true;
+}
 // A PWM request off or a pulse, and off in its one encoding: mode 0 and
 // output +0.0 (all eight bytes zero), so off and a pulse of 0 never read as
 // each other. Decode admits only this; Encode writes off this way itself.
@@ -183,16 +204,10 @@ std::size_t EncodeUnsanitizedState(const State& s, std::span<uint8_t> data) {
     w.Int(x.velocity_age_us, 4);
   }
   for (std::size_t i = 0; i < s.digital_input_count; ++i) {
-    const auto& d = s.digital_inputs[i];
-    w.Int(d.id, 2);
-    w.Int(d.valid ? 1 : 0, 1);
-    w.Int(d.value ? 1 : 0, 1);
+    WriteDigitalSample(w, s.digital_inputs[i]);
   }
   for (std::size_t i = 0; i < s.digital_output_count; ++i) {
-    const auto& d = s.digital_outputs[i];
-    w.Int(d.id, 2);
-    w.Int(d.valid ? 1 : 0, 1);
-    w.Int(d.value ? 1 : 0, 1);
+    WriteDigitalSample(w, s.digital_outputs[i]);
   }
   for (std::size_t i = 0; i < s.analog_input_count; ++i) {
     const auto& a = s.analog_inputs[i];
@@ -301,24 +316,10 @@ bool Decode(std::span<const uint8_t> data, State& out) {
     x.velocity_age_us = r.Int(4);
   }
   for (std::size_t i = 0; i < s.digital_input_count; ++i) {
-    auto& d = s.digital_inputs[i];
-    d.id = r.Int(2);
-    auto valid = r.Int(1);
-    if (valid > 1) return false;
-    d.valid = (valid == 1);
-    auto val = r.Int(1);
-    if (val > 1) return false;
-    d.value = (val == 1);
+    if (!ReadDigitalSample(r, s.digital_inputs[i])) return false;
   }
   for (std::size_t i = 0; i < s.digital_output_count; ++i) {
-    auto& d = s.digital_outputs[i];
-    d.id = r.Int(2);
-    auto valid = r.Int(1);
-    if (valid > 1) return false;
-    d.valid = (valid == 1);
-    auto val = r.Int(1);
-    if (val > 1) return false;
-    d.value = (val == 1);
+    if (!ReadDigitalSample(r, s.digital_outputs[i])) return false;
   }
   for (std::size_t i = 0; i < s.analog_input_count; ++i) {
     auto& a = s.analog_inputs[i];
