@@ -1,13 +1,7 @@
 #include "studio/review/review.h"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <array>
 #include <bit>
-#include <cerrno>
 #include <charconv>
 #include <cstring>
 #include <optional>
@@ -16,6 +10,7 @@
 
 #include "nlohmann/json.hpp"
 #include "studio/bridge/json_format.h"
+#include "studio/bridge/static_files.h"
 #include "talOS/launcher/session_retention.h"
 #include "talOS/telemetry/frames.h"
 
@@ -89,50 +84,6 @@ struct SessionEntry {
   std::string_view verdict;
   std::vector<std::pair<std::string, std::uintmax_t>> files;
 };
-
-// Reads one regular non-symlink file up to `max_bytes` using O_NOFOLLOW +
-// O_NONBLOCK + fstat + bounded chunked reads, so symlinks, FIFOs, device nodes,
-// and growing files never escape confinement, hang, or allocate unbounded
-// memory (REQ-OPS-42, REQ-SAFE-35).
-std::optional<std::string> ReadBoundedRegularFile(const fs::path& path,
-                                                  std::uintmax_t max_bytes) {
-  std::error_code error;
-  const fs::file_status st = fs::symlink_status(path, error);
-  if (error || fs::is_symlink(st) || !fs::is_regular_file(st)) {
-    return std::nullopt;
-  }
-  struct ScopedFd {
-    int fd{-1};
-    ~ScopedFd() {
-      if (fd >= 0) ::close(fd);
-    }
-  };
-  const ScopedFd file{
-      ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)};
-  if (file.fd < 0) return std::nullopt;
-  struct stat sb {};
-  if (::fstat(file.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size <= 0 ||
-      static_cast<std::uintmax_t>(sb.st_size) > max_bytes) {
-    return std::nullopt;
-  }
-  std::string body;
-  body.reserve(static_cast<std::size_t>(sb.st_size));
-  std::array<char, 8192> chunk{};
-  for (;;) {
-    const ssize_t got = ::read(file.fd, chunk.data(), chunk.size());
-    if (got == 0) break;
-    if (got < 0) {
-      if (errno == EINTR) continue;
-      return std::nullopt;
-    }
-    if (body.size() + static_cast<std::size_t>(got) > max_bytes) {
-      return std::nullopt;
-    }
-    body.append(chunk.data(), static_cast<std::size_t>(got));
-  }
-  if (body.empty()) return std::nullopt;
-  return body;
-}
 
 // Reads one regular non-symlink JSON file from a session directory up to
 // `max_bytes`, returning 404 when absent, symlinked, non-regular, empty or
