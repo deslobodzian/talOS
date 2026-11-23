@@ -158,7 +158,7 @@ whenever no goal is driven.
 | `stall_time_us` | µs | 0 (off) | short of the goal with `|velocity| <= stall_velocity_rps` and `|current| >= stall_current_a` this long: fault `kStall` |
 | `stall_velocity_rps` | rot/s | 0.05 | |
 | `stall_current_a` | A | 0 | 0 judges by velocity alone |
-| `move_timeout_us` | µs | 0 (off) | one goal (a change beyond `tolerance_rot` restarts it) not reached this long: fault `kMoveTimeout` |
+| `move_timeout_us` | µs | 0 (off) | continuously outside `tolerance_rot` of one goal this long: fault `kMoveTimeout` (a goal change beyond `tolerance_rot` or any tick within `tolerance_rot` restarts the timer, so holding at goal does not time out on a later perturbation, and boundary oscillation across `tolerance_rot` refreshes it) |
 
 Homing sets the frame; until it holds the mechanism drives no goal. Only
 `set_goal()` starts homing: `hold()` on an unhomed mechanism is neutral

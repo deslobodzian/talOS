@@ -1403,6 +1403,59 @@ TEST(PositionMechanism, MoveTimeoutFaults) {
   lift.ExpectNeutral();
 }
 
+// Holding at goal (via set_goal() or hold()) past move_timeout_us refreshes the
+// move timer while in tolerance: a bump past tolerance_rot does not fault on
+// the perturbation tick, recovers if returned within move_timeout_us, and still
+// faults with kMoveTimeout if held away for a full move_timeout_us.
+// REQ-SAFE-36
+TEST(PositionMechanism, MoveTimeoutRefreshesWhileAtGoal) {
+  for (const bool hold_mode : {false, true}) {
+    SCOPED_TRACE(hold_mode ? "hold" : "set_goal");
+    Rig lift{"lift"};
+    lift.node.hold_mode = hold_mode;
+    lift.SetMotor(1.0, 0.0);
+    lift.Start();
+    const double commanded = hold_mode ? 9.0 : 1.0;
+
+    // Hold in tolerance longer than move_timeout_us (1000 ms).
+    lift.Drive(commanded, 1200ms);
+    ASSERT_EQ(lift.mech().phase(), PositionPhase::kAtGoal);
+    ASSERT_EQ(lift.mech().fault(), PositionFault::kNone);
+    ASSERT_DOUBLE_EQ(lift.Applied().demand, 1.0);
+
+    // Perturb just past tolerance_rot (0.05) while moving (so stall cannot
+    // trip): must not fault on the perturbation tick.
+    lift.SetMotor(1.051, 1.0);
+    lift.Drive(commanded, 10ms);  // 1st tick publishes 1.051; 2nd tick reads it
+    ASSERT_DOUBLE_EQ(lift.mech().position_rot(), 1.051);
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kMoving);
+    EXPECT_EQ(lift.Applied().mode, Mode::kMotionMagic);
+    EXPECT_DOUBLE_EQ(lift.Applied().demand, 1.0);
+
+    // Stay outside tolerance briefly, then return within move_timeout_us:
+    // recovers to kAtGoal without faulting.
+    lift.Drive(commanded, 200ms);
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kMoving);
+    lift.SetMotor(1.0, 0.0);
+    lift.Drive(commanded, 50ms);  // past at_goal_debounce_us (30 ms)
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kAtGoal);
+
+    // Perturb again and hold away for a full move_timeout_us (1000 ms): must
+    // still fault with kMoveTimeout.
+    lift.SetMotor(1.051, 1.0);
+    lift.Drive(commanded, 900ms);
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kMoving);
+    lift.Drive(commanded, 150ms);
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kMoveTimeout);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kFaulted);
+    lift.ExpectNeutral();
+  }
+}
+
 // Elevator gravity is a constant +gravity_v wherever the carriage is, added
 // to the target's own feedforward.
 TEST(PositionMechanism, ElevatorGravityIsConstantAndUp) {
