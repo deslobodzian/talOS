@@ -318,9 +318,11 @@ cleanup() {
   # Snapshot the trees before signalling: a parent that exits on TERM
   # reparents its children, and they could no longer be found to KILL.
   for p in $ordered; do tree="$tree $(descendants "$p")"; done
-  for p in $tree; do kill -TERM "$p" 2>/dev/null; done
-  sleep 1
-  for p in $tree; do kill -KILL "$p" 2>/dev/null; done
+  if [ -n "$tree" ]; then
+    for p in $tree; do kill -TERM "$p" 2>/dev/null; done
+    sleep 1
+    for p in $tree; do kill -KILL "$p" 2>/dev/null; done
+  fi
   wait 2>/dev/null
   echo "sim.sh: session logs in $SESSION_DIR (launcher/RIO output in $LOG_DIR)"
 }
