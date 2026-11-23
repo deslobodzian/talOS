@@ -81,6 +81,22 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "verify_fuzz_test",
+    size = "small",
+    srcs = ["verify_fuzz_test.cc"],
+    deps = [
+        ":decode",
+        ":field_path",
+        ":identity",
+        ":schema_hash",
+        ":test_messages",
+        ":verify",
+        "@flatbuffers//:runtime_cc",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # The METHODOLOGY §6 unit suffixes the field-name lint checks against.
 cc_library(
     name = "unit_suffix",

@@ -1780,5 +1780,77 @@ TEST(AlertPrefixedFields, RejectsOutOfRangeBaseTypeWithoutUb) {
   }
 }
 
+TEST(AlertPrefixedFields, DeepObjectChainAndSeededMutationsDoNotCrash) {
+  // Deep 500-object chain must not stack-overflow (and bounds depth safely).
+  {
+    flatbuffers::FlatBufferBuilder builder;
+    constexpr int kChain = 500;
+    std::vector<flatbuffers::Offset<reflection::Object>> objs;
+    objs.reserve(kChain);
+    for (int i = 0; i < kChain; ++i) {
+      const auto obj_name = builder.CreateString("c.o" + std::to_string(i));
+      const auto field_name = builder.CreateString("alert_error_x");
+      reflection::TypeBuilder tb(builder);
+      if (i + 1 < kChain) {
+        tb.add_base_type(reflection::BaseType::Obj);
+        tb.add_index(i + 1);
+      } else {
+        tb.add_base_type(reflection::BaseType::Bool);
+      }
+      const auto type = tb.Finish();
+      reflection::FieldBuilder fb(builder);
+      fb.add_name(field_name);
+      fb.add_type(type);
+      const auto field = fb.Finish();
+      const auto fields = builder.CreateVector(&field, 1);
+      reflection::ObjectBuilder ob(builder);
+      ob.add_name(obj_name);
+      ob.add_fields(fields);
+      ob.add_is_struct(true);
+      ob.add_bytesize(8);
+      objs.push_back(ob.Finish());
+    }
+    const auto objects = builder.CreateVector(objs);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+    const std::string_view bfbs{
+        reinterpret_cast<const char*>(builder.GetBufferPointer()),
+        builder.GetSize()};
+    const auto found = detail::AlertPrefixedFields(bfbs, "c.o0");
+    EXPECT_FALSE(found.empty());
+    EXPECT_LE(found.size(), 64u);
+  }
+
+  // Deterministic seeded mutations over AlertPrefixedFields.
+  const schema::Identity alerts = schema::Of<schema_test::BadAlerts>();
+  std::uint64_t rng_state = 0x414c45525453ULL;
+  auto next_u64 = [&]() {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return rng_state;
+  };
+  for (int iter = 0; iter < 1500; ++iter) {
+    std::string bfbs = alerts.bfbs;
+    const auto op = next_u64() % 3;
+    if (op == 0 && bfbs.size() > 8) {
+      bfbs.resize(1 + (next_u64() % bfbs.size()));
+    } else if (op == 1 && !bfbs.empty()) {
+      for (int k = 0; k < 3; ++k) {
+        bfbs[next_u64() % bfbs.size()] ^=
+            static_cast<char>(1u << (next_u64() % 8));
+      }
+    } else {
+      bfbs.resize(next_u64() % 96);
+      for (char& c : bfbs) c = static_cast<char>(next_u64() & 0xffu);
+    }
+    (void)detail::AlertPrefixedFields(bfbs, "schema_test.BadAlerts");
+  }
+}
+
 }  // namespace
 }  // namespace talos::introspect::naming
