@@ -369,6 +369,12 @@ TEST(HardwareNodeShutdownBudgetTest,
 // REQ-OPS-20
 TEST(HardwareNodeShutdownBudgetTest, RunSendsShutdownNeutralOnCleanExit) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
+  // Use the largest valid command_timeout_us (500 ms) so Run()'s startup
+  // (OpenWaits() + clock read) cannot age out the freshly injected State under
+  // TSan or CI load; the exact command_timeout_us staleness boundary is proved
+  // deterministically in
+  // SendShutdownNeutralNoOpsWhenStateStaleOrGatewayNotReady.
+  cfg.hardware.command_timeout_us = 500'000;
   Config hw_cfg = cfg.hardware;
   hw_cfg.commissioned = true;
   const uint64_t config_id = ConfigurationId(hw_cfg);
@@ -396,6 +402,27 @@ TEST(HardwareNodeShutdownBudgetTest, RunSendsShutdownNeutralOnCleanExit) {
   ASSERT_EQ(
       MotorOf(driving->command, cfg.subsystems.at("intake").motors[0]).mode,
       Mode::kVoltage);
+
+  // Refresh the accepted State after the driving UDP round-trip so setup
+  // latency cannot age out command_timeout_us before Run() calls
+  // SendShutdownNeutral(stop_us). Stamp receipt once the datagram is already
+  // readable on the bridge socket.
+  constexpr uint64_t kRefreshSampleUs = 10'000;
+  const uint64_t states_before_refresh = node.states_received();
+  const uint64_t commands_before_refresh = node.commands_sent();
+  ASSERT_TRUE(
+      SendState(link.gateway, TrustState(config_id, 11, 2, kRefreshSampleUs)));
+  ASSERT_TRUE(WaitFor([&] { return SocketReadable(node); }));
+  const uint64_t refresh_us =
+      static_cast<uint64_t>(event::Poller::now().nanos() / 1000);
+  node.Tick(refresh_us);
+  ASSERT_EQ(node.states_received(), states_before_refresh + 1);
+  uint64_t last_sequence = driving->sequence;
+  for (uint64_t c = commands_before_refresh; c < node.commands_sent(); ++c) {
+    const auto extra = ReceiveCommandFrame(link.gateway);
+    ASSERT_TRUE(extra.has_value());
+    last_sequence = extra->sequence;
+  }
   while (cmd_sub.read().has_value()) {
   }
   const uint64_t commands_before = node.commands_sent();
@@ -418,11 +445,11 @@ TEST(HardwareNodeShutdownBudgetTest, RunSendsShutdownNeutralOnCleanExit) {
 
   const auto shutdown = ReceiveCommandFrame(link.gateway);
   ASSERT_TRUE(shutdown.has_value());
-  EXPECT_GT(shutdown->sequence, driving->sequence);
+  EXPECT_GT(shutdown->sequence, last_sequence);
   EXPECT_EQ(shutdown->command.config_id, config_id);
   EXPECT_EQ(shutdown->command.boot_id, 11u);
   EXPECT_EQ(shutdown->command.epoch, 2u);
-  EXPECT_EQ(shutdown->command.observed_time_us, 5'000u);
+  EXPECT_EQ(shutdown->command.observed_time_us, kRefreshSampleUs);
   ExpectAllNeutral(shutdown->command, hw_cfg);
 
   const auto published = cmd_sub.read();

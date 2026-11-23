@@ -73,7 +73,9 @@ TEST(PollerTest, MinDeadlineReturnsImmediately) {
     bool done = false;
     std::thread guard([&] {
       std::unique_lock<std::mutex> lock(mutex);
-      if (!finished.wait_for(lock, std::chrono::milliseconds(200),
+      // 10 s hang bound (docs/TESTING.md §6.3) so scheduling preemption cannot
+      // falsely turn DEADLINE into WOKEN.
+      if (!finished.wait_for(lock, std::chrono::seconds(10),
                              [&] { return done; })) {
         poller.wake();
       }
@@ -268,7 +270,7 @@ TEST(PollerTest, DeadlineHoldsWhenTimerDeliveryStalls) {
   bool done = false;
   std::thread guard([&] {
     std::unique_lock<std::mutex> lock(mutex);
-    if (!finished.wait_for(lock, std::chrono::seconds(2),
+    if (!finished.wait_for(lock, std::chrono::seconds(10),
                            [&] { return done; })) {
       poller.wake();
     }
@@ -445,7 +447,7 @@ TEST(PollerTest, TimerfdNonPositiveDeadlineReturnsImmediately) {
   bool done = false;
   std::thread guard([&] {
     std::unique_lock<std::mutex> lock(mutex);
-    if (!finished.wait_for(lock, std::chrono::milliseconds(200),
+    if (!finished.wait_for(lock, std::chrono::seconds(10),
                            [&] { return done; })) {
       poller.wake();
     }

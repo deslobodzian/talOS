@@ -156,7 +156,7 @@ TEST_F(RecorderTest, WriterFailureDropsPairsAndStopsRecording) {
   const Frame frame = MakeGrayFrame();
   EXPECT_TRUE(rec.Record(frame, MakeRecord(0, "sampled")));
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{5};
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
   while (rec.dropped() < rec.recorded() &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -310,7 +310,7 @@ TEST_F(RecorderTest, WritesPairsAtomicallyAndDeletesOldestUnderMaxBytes) {
     // after its PNG), rather than assuming a fixed disk/encoder speed.
     const auto newest = dir_ / "00000000000000000005_sampled.json";
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        std::chrono::steady_clock::now() + std::chrono::seconds{10};
     while (!std::filesystem::exists(newest) &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -481,7 +481,8 @@ TEST_F(RecorderTest, WriterThreadRunsAtBackgroundPriority) {
   const auto committed = dir_ / "00000000000000000000_sampled.json";
   while (!std::filesystem::exists(committed)) {
     pollfd pfd{.fd = inotify_fd, .events = POLLIN, .revents = 0};
-    const int ready = ::poll(&pfd, 1, 5000);
+    // 10 s hang bound (docs/TESTING.md §6.3).
+    const int ready = ::poll(&pfd, 1, 10000);
     ASSERT_GT(ready, 0) << "timed out waiting for recorder writer";
     char buf[4096];
     while (::read(inotify_fd, buf, sizeof buf) > 0) {
