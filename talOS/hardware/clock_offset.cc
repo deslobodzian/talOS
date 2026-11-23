@@ -59,11 +59,13 @@ bool ClockOffsetEstimator::Observe(std::uint64_t boot_id,
         receipt_us > anchor_receipt_us_ ? receipt_us - anchor_receipt_us_ : 0;
     if (!WithinClockRateBound(sample_delta_us, receipt_delta_us)) {
       // An isolated far-future sample (corrupt timestamp, UINT64_MAX) is held
-      // as a candidate and ignored. Only a second consecutive jump sample
+      // as a candidate and ignored. Only the next sample past the bound
       // advancing strictly past the candidate with non-decreasing receipt time
       // at a symmetrically consistent physical clock rate (e.g. live frames
       // after an unseen-boot SIGSTOP + SO_RCVBUF tail-drop) re-syncs the
-      // anchor.
+      // anchor; a duplicate or reordered sample returned early above without
+      // touching the candidate, while any normal accepted sample or boot
+      // change clears it.
       const bool confirms_candidate =
           has_jump_candidate_ && sample_time_us > jump_sample_us_ &&
           receipt_us >= jump_receipt_us_ &&

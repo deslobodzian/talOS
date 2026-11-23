@@ -83,17 +83,30 @@ configuration pushes, or `/hw/state`:
   (`1 / kMaxClockDriftDivisor`, twice the estimator's 1000 ppm relative
   oscillator drift assumption) of elapsed bridge time. A `State` that exceeds
   this bound is held in a single-slot forward-jump candidate, dropped whole,
-  and counted in `clock_ignored_count` without locking out subsequent valid
-  `State` frames, invalidating active subsystems, or refreshing `state_age_us`.
-  Any normal accepted `State` or boot change clears the candidate. Only a
-  second consecutive jump `State` strictly advancing past the candidate with
-  non-decreasing bridge receipt time and a symmetrically consistent physical
-  clock rate (both `cand_sample_delta` against `cand_receipt_delta` and
-  `cand_receipt_delta` against `cand_sample_delta` within the same 2000 ppm +
-  1 s bound) re-syncs the anchor and is accepted, recovering an unseen-boot
-  `SIGSTOP` / `SO_RCVBUF` tail-drop on the second live frame while rejecting
-  isolated far-future timestamps (including `UINT64_MAX`) and inconsistent jump
-  pairs.
+  and counted in `clock_ignored_count` without advancing `last_sample_time_us`,
+  invalidating active subsystems, or refreshing `state_age_us`. Any normal
+  accepted `State` or boot change clears the candidate (a duplicate or reordered
+  `State` with `sample_time_us <= last_sample_time_us` returns early before
+  touching it). Only the next `State` past the bound strictly advancing past the
+  candidate with non-decreasing bridge receipt time and a symmetrically
+  consistent physical clock rate (both `cand_sample_delta` against
+  `cand_receipt_delta` and `cand_receipt_delta` against `cand_sample_delta`
+  within the same 2000 ppm + 1 s bound) re-syncs the anchor and is accepted,
+  recovering an unseen-boot `SIGSTOP` / `SO_RCVBUF` tail-drop on the second live
+  frame while rejecting isolated far-future timestamps (including `UINT64_MAX`)
+  and inconsistent jump pairs.
+- **Residual risk**:
+  - A single corrupt `State` *inside* the bound (`<= 1 s + 0.2% * receipt_delta`
+    ahead of the prompt anchor — e.g. up to ~1 s while streaming, ~2.2 s on the
+    first frame after a 600 s outage, ~8.2 s after a 1 h outage) is accepted
+    directly and blanks the link until real gateway time catches up
+    (`sample_time_us > last_sample_time_us`).
+  - Two far-future `State` frames past the bound that agree with each other
+    within 2000 ppm + 1 s (e.g. `+1 h` followed by `+1 h + 5 ms`, with no normal
+    accepted `State` or boot change between them) confirm the jump candidate and
+    lock out the boot until real gateway time catches up or the gateway reboots
+    — the accepted trade-off for recovering unseen-boot `SIGSTOP` / `SO_RCVBUF`
+    tail-drop on the second live frame.
 - **Prompt-anchor tracking**: on a normal accepted `State`, the anchor advances
   immediately only when the sample is at least as prompt as it
   (`sample_delta >= receipt_delta`), so a delayed buffered frame or drained
