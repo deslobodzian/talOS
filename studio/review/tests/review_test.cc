@@ -491,6 +491,44 @@ TEST_F(ReviewTest, SeriesPastItsValueCeilingIsRefused) {
   EXPECT_EQ(at.body.size(), 8 + kFits * kMaxSeriesPoints * 36);
 }
 
+// Guards the series channel-count cap and early-stop query splitting: exactly
+// kMaxSeriesChannels succeeds (trailing comma included), kMaxSeriesChannels + 1
+// is refused with 400 naming the cap, and a ~500 KiB c=a,a,... query stops
+// splitting at kMaxSeriesChannels without allocating hundreds of thousands of
+// channel strings.
+// REQ-OPS-42
+TEST_F(ReviewTest, SeriesPastItsChannelCapIsRefused) {
+  Review review{Library(), 1u << 20};
+  const auto request = [&review](std::size_t channels,
+                                 std::string_view channel_name) {
+    std::string query = "start_ns=" + std::to_string(kStartNs) +
+                        "&end_ns=" + std::to_string(kStartNs + 10 * kSecond) +
+                        "&points=1&c=";
+    query.reserve(query.size() + channels * (channel_name.size() + 1));
+    for (std::size_t i = 0; i < channels; ++i) {
+      query += channel_name;
+      query += ',';
+    }
+    return review.Get("/review/s1/series", query);
+  };
+  const Response at = request(kMaxSeriesChannels, "shooter/state/position_m");
+  ASSERT_EQ(at.status, 200) << at.body;
+  EXPECT_EQ(at.body.size(), 8 + kMaxSeriesChannels * 36);
+
+  const Response over =
+      request(kMaxSeriesChannels + 1, "shooter/state/position_m");
+  ASSERT_EQ(over.status, 400);
+  EXPECT_NE(over.body.find(std::to_string(kMaxSeriesChannels)),
+            std::string::npos)
+      << over.body;
+
+  const Response huge = request(250'000, "a");
+  ASSERT_EQ(huge.status, 400);
+  EXPECT_NE(huge.body.find(std::to_string(kMaxSeriesChannels)),
+            std::string::npos)
+      << huge.body;
+}
+
 // Guards the bound on open sessions: opening one past kMaxOpenSessions
 // closes the least recently used, and a closed session reopens (its index
 // rebuilt) with the same answers. Without it every session ever opened

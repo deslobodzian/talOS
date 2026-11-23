@@ -519,11 +519,18 @@ Response Review::Series(std::string_view id, const Session& session,
     while (begin <= value.size()) {
       const std::size_t comma = value.find(',', begin);
       const std::size_t end = comma == std::string::npos ? value.size() : comma;
-      if (end > begin) names.push_back(value.substr(begin, end - begin));
+      if (end > begin) {
+        if (names.size() >= kMaxSeriesChannels) {
+          return Error(400, "series needs 1.." +
+                                std::to_string(kMaxSeriesChannels) +
+                                " channels (c=)");
+        }
+        names.push_back(value.substr(begin, end - begin));
+      }
       begin = end + 1;
     }
   }
-  if (names.empty() || names.size() > kMaxSeriesChannels) {
+  if (names.empty()) {
     return Error(400, "series needs 1.." + std::to_string(kMaxSeriesChannels) +
                           " channels (c=)");
   }

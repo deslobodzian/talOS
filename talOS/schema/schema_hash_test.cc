@@ -339,4 +339,119 @@ TEST(SchemaHash, RejectsInvalidReflectionIndicesLayoutsAndCycles) {
   }
 }
 
+// Guards against exponential recursion in append_struct: a 22-level diamond DAG
+// hits the struct-visit cap and a 2-field self-cycle hits the per-object cycle
+// guard, both failing cleanly without OOM or hang (REQ-OPS-41,
+// REQ-CONTRACT-20).
+TEST(SchemaHash, RejectsDiamondDagAndTwoFieldSelfCycle) {
+  // 22-level diamond DAG: depth < kMaxDepth (32), no cycle, 2^22 - 1 paths.
+  {
+    flatbuffers::FlatBufferBuilder builder;
+    constexpr int kLevels = 22;
+    std::vector<flatbuffers::Offset<reflection::Object>> objs;
+    objs.reserve(kLevels);
+    for (int i = 0; i < kLevels; ++i) {
+      const auto obj_name = builder.CreateString("dag.o" + std::to_string(i));
+      std::vector<flatbuffers::Offset<reflection::Field>> fields;
+      if (i + 1 == kLevels) {
+        const auto field_name = builder.CreateString("leaf_m");
+        reflection::TypeBuilder tb(builder);
+        tb.add_base_type(reflection::BaseType::Double);
+        const auto ft = tb.Finish();
+        reflection::FieldBuilder fb(builder);
+        fb.add_name(field_name);
+        fb.add_type(ft);
+        fb.add_offset(0);
+        fields.push_back(fb.Finish());
+      } else {
+        for (int k = 0; k < 2; ++k) {
+          const auto field_name = builder.CreateString(k == 0 ? "a" : "b");
+          reflection::TypeBuilder tb(builder);
+          tb.add_base_type(reflection::BaseType::Obj);
+          tb.add_index(i + 1);
+          const auto ft = tb.Finish();
+          reflection::FieldBuilder fb(builder);
+          fb.add_name(field_name);
+          fb.add_type(ft);
+          fb.add_id(static_cast<std::uint16_t>(k));
+          fb.add_offset(0);
+          fields.push_back(fb.Finish());
+        }
+      }
+      const auto fvec = builder.CreateVector(fields);
+      reflection::ObjectBuilder ob(builder);
+      ob.add_name(obj_name);
+      ob.add_fields(fvec);
+      ob.add_is_struct(true);
+      ob.add_minalign(8);
+      ob.add_bytesize(8);
+      objs.push_back(ob.Finish());
+    }
+    const auto objects = builder.CreateVector(objs);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+
+    const std::vector<std::uint8_t> bytes(
+        builder.GetBufferPointer(),
+        builder.GetBufferPointer() + builder.GetSize());
+    flatbuffers::Verifier verifier(bytes.data(), bytes.size());
+    ASSERT_TRUE(reflection::VerifySchemaBuffer(verifier));
+    ASSERT_FALSE(Hash(bytes, "dag.o0"));
+    const auto* schema = reflection::GetSchema(bytes.data());
+    ASSERT_TRUE(
+        talos::schema::canonical_struct(*schema, *schema->objects()->Get(0))
+            .empty());
+  }
+
+  // 2-field self-cycle: bad.C has two fields referencing object 0.
+  {
+    flatbuffers::FlatBufferBuilder builder;
+    const auto obj_name = builder.CreateString("bad.C");
+    std::vector<flatbuffers::Offset<reflection::Field>> fields;
+    for (int k = 0; k < 2; ++k) {
+      const auto field_name = builder.CreateString(k == 0 ? "a" : "b");
+      reflection::TypeBuilder tb(builder);
+      tb.add_base_type(reflection::BaseType::Obj);
+      tb.add_index(0);
+      const auto ft = tb.Finish();
+      reflection::FieldBuilder fb(builder);
+      fb.add_name(field_name);
+      fb.add_type(ft);
+      fb.add_id(static_cast<std::uint16_t>(k));
+      fb.add_offset(0);
+      fields.push_back(fb.Finish());
+    }
+    const auto fvec = builder.CreateVector(fields);
+    reflection::ObjectBuilder ob(builder);
+    ob.add_name(obj_name);
+    ob.add_fields(fvec);
+    ob.add_is_struct(true);
+    ob.add_minalign(8);
+    ob.add_bytesize(8);
+    const auto obj = ob.Finish();
+    const auto objects = builder.CreateVector(&obj, 1);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+
+    const std::vector<std::uint8_t> bytes(
+        builder.GetBufferPointer(),
+        builder.GetBufferPointer() + builder.GetSize());
+    flatbuffers::Verifier verifier(bytes.data(), bytes.size());
+    ASSERT_TRUE(reflection::VerifySchemaBuffer(verifier));
+    EXPECT_FALSE(Hash(bytes, "bad.C"));
+    const auto* schema = reflection::GetSchema(bytes.data());
+    EXPECT_TRUE(
+        talos::schema::canonical_struct(*schema, *schema->objects()->Get(0))
+            .empty());
+  }
+}
+
 }  // namespace
