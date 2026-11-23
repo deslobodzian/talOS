@@ -422,6 +422,7 @@ cc_binary(
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/hardware",
+        "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/schema:decode",
     ],
