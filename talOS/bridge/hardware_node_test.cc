@@ -27,6 +27,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -2733,6 +2734,266 @@ TEST(HardwareNodeTest, PushConfigDuringTickDoesNotAllocate) {
   node.PushConfig(now_us + 1'000);
   const uint64_t allocations = probe.stop();
   EXPECT_EQ(allocations, 0u) << probe.sites();
+}
+
+// Guards RT-29: a corrupt or spoofed far-future State sample_time_us within an
+// active boot (including UINT64_MAX) is dropped at the ordering gate (counted
+// in /hw/status clock_ignored_count) without advancing last_sample_time_us_,
+// publishing on /hw/state, refreshing state_age_us, or invalidating active
+// subsystem demands, so subsequent valid States keep the link alive. Long
+// legitimate outages, burst jitter within the margin, and new gateway boots
+// remain accepted.
+// REQ-RT-20, REQ-OPS-20
+TEST(HardwareNodeTest, FarFutureStateSampleTimeIsIgnoredWithoutLockingOutBoot) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> state_sub{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  // Acknowledge config and establish active driving on boot 11.
+  constexpr uint64_t kStartUs = 1'000'000;
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                                   kStartUs - 500, ack_bytes.data(),
+                                   ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node)) << "no config ACK configured the bridge";
+    node.Tick(kStartUs - 500);
+  }
+
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 1'000), kStartUs));
+  ASSERT_TRUE(state_sub.read().has_value());
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(kStartUs + 1'000);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
+  const uint64_t ignored_before =
+      node.Status(kStartUs + 1'000).clock_ignored_count();
+
+  // 1. Corrupt far-future States (+60 s and UINT64_MAX, even carrying a new
+  // epoch and disabled flags) are dropped whole: nothing published on
+  // /hw/state, active demands stay intact, freshness is NOT refreshed, and
+  // clock_ignored_count increments for each.
+  State future_60s = TrustState(config_id, 11, 9, 60'001'000);
+  future_60s.flags = kConfigured;  // disabled
+  ASSERT_TRUE(InjectState(node, link.gateway, future_60s, kStartUs + 5'000));
+  EXPECT_FALSE(state_sub.read().has_value());
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
+
+  State future_max =
+      TrustState(config_id, 11, 10, std::numeric_limits<uint64_t>::max());
+  ASSERT_TRUE(InjectState(node, link.gateway, future_max, kStartUs + 10'000));
+  EXPECT_FALSE(state_sub.read().has_value());
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
+
+  const bridge::BridgeStatus after_corrupt = node.Status(kStartUs + 10'000);
+  EXPECT_EQ(after_corrupt.clock_ignored_count(), ignored_before + 2);
+  EXPECT_EQ(after_corrupt.state_age_us(), 10'000u)
+      << "dropped far-future States must not refresh freshness";
+
+  // 2. Subsequent valid States of boot 11 are accepted, published, and admit
+  // fresh subsystem requests.
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 16'000),
+                          kStartUs + 15'000));
+  const auto valid_pkt = state_sub.read();
+  ASSERT_TRUE(valid_pkt.has_value());
+  State decoded{};
+  ASSERT_TRUE(Decode(valid_pkt->bytes(), decoded));
+  EXPECT_EQ(decoded.boot_id, 11u);
+  EXPECT_EQ(decoded.sample_time_us, 16'000u);
+  EXPECT_EQ(node.Status(kStartUs + 15'000).state_age_us(), 0u);
+
+  Command next_req = IntakeRequest(cfg, 6.0);
+  next_req.observed_time_us = 16'000;
+  PublishCommand(intake_pub, next_req);
+  node.Tick(kStartUs + 16'000);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 6.0);
+
+  // 3. Burst jitter: a delayed frame followed by a prompt frame at the same
+  // bridge timestamp (within the 1 s margin) is accepted.
+  const uint64_t burst_now = kStartUs + 220'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 21'000), burst_now));
+  ASSERT_TRUE(state_sub.read().has_value());
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 221'000), burst_now));
+  ASSERT_TRUE(state_sub.read().has_value());
+
+  // 4. Legitimate 10 s link outage (both clocks advance 10 s, gateway 1000 ppm
+  // fast = +10 ms) recovers cleanly on the same boot.
+  const uint64_t after_outage_now = burst_now + 10'000'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 221'000 + 10'010'000),
+                          after_outage_now));
+  const auto recovered = state_sub.read();
+  ASSERT_TRUE(recovered.has_value());
+  ASSERT_TRUE(Decode(recovered->bytes(), decoded));
+  EXPECT_EQ(decoded.sample_time_us, 221'000u + 10'010'000u);
+  EXPECT_FALSE(node.Status(after_outage_now).alert_error_link_lost());
+
+  // 5. A new boot resets the baseline and accepts an arbitrary starting
+  // sample_time_us (far above the prior boot).
+  const uint64_t reboot_now = after_outage_now + 5'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 900'000'000'000ULL),
+                          reboot_now));
+  const auto rebooted = state_sub.read();
+  ASSERT_TRUE(rebooted.has_value());
+  ASSERT_TRUE(Decode(rebooted->bytes(), decoded));
+  EXPECT_EQ(decoded.boot_id, 12u);
+  EXPECT_EQ(decoded.sample_time_us, 900'000'000'000ULL);
+}
+
+// Guards RT-29 hardening over loopback UDP:
+// 1. A delayed buffered State after a >500 s outage never pulls the prompt
+//    anchor backward or locks out the live State immediately behind it.
+// 2. An unseen boot whose initial SO_RCVBUF drain carries only stale frames
+//    after a 3 s stall recovers on two consecutive physically-consistent live
+//    States instead of locking out the boot, while still ignoring an isolated
+//    corrupt jump afterward.
+// REQ-RT-20, REQ-OPS-20
+TEST(HardwareNodeTest,
+     StateOrderingRecoversFromLongOutageDelayedFrameAndUnseenBootStall) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> state_sub{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  // Configure bridge and establish boot 11.
+  constexpr uint64_t kStartUs = 1'000'000;
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                                   kStartUs - 500, ack_bytes.data(),
+                                   ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node)) << "no config ACK configured the bridge";
+    node.Tick(kStartUs - 500);
+  }
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 1'000'000), kStartUs));
+  ASSERT_TRUE(state_sub.read().has_value());
+
+  // 1. 1000 s outage + 1.5 s delayed buffered State + live State 5 ms later.
+  const uint64_t delayed_now = kStartUs + 1'001'000'000ULL;
+  const uint64_t delayed_sample = 1'000'000 + 999'500'000ULL;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, delayed_sample),
+                          delayed_now));
+  ASSERT_TRUE(state_sub.read().has_value());
+
+  const uint64_t live_now = delayed_now + 5'000;
+  const uint64_t live_sample = 1'000'000 + 1'001'005'000ULL;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, live_sample), live_now));
+  const auto live_pkt = state_sub.read();
+  ASSERT_TRUE(live_pkt.has_value())
+      << "live State after long-outage delayed packet must not be locked out";
+  State decoded{};
+  ASSERT_TRUE(Decode(live_pkt->bytes(), decoded));
+  EXPECT_EQ(decoded.sample_time_us, live_sample);
+  const bridge::BridgeStatus after_outage = node.Status(live_now);
+  EXPECT_EQ(after_outage.clock_ignored_count(), 0u);
+  EXPECT_FALSE(after_outage.alert_error_link_lost());
+
+  Command live_req = IntakeRequest(cfg, 5.0);
+  live_req.observed_time_us = live_sample;
+  PublishCommand(intake_pub, live_req);
+  node.Tick(live_now + 1'000);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 5.0);
+
+  // 2. Unseen boot 12 starting with a 3 s stall + SO_RCVBUF tail-drop (stale
+  // frames 10.000 s .. 11.000 s drained at receipt 13.000 s .. 13.001 s).
+  const uint64_t boot12_receipt_base = live_now + 10'000'000ULL;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 10'000'000),
+                          boot12_receipt_base));
+  ASSERT_TRUE(state_sub.read().has_value());
+  // Re-ACK config for the new boot so the bridge is configured on boot 12.
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 2,
+                                   boot12_receipt_base + 100, ack_bytes.data(),
+                                   ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node));
+    node.Tick(boot12_receipt_base + 100);
+  }
+  for (uint64_t i = 1; i <= 20; ++i) {
+    ASSERT_TRUE(
+        InjectState(node, link.gateway,
+                    TrustState(config_id, 12, 1, 10'000'000 + 50'000 * i),
+                    boot12_receipt_base + 1'000));
+    ASSERT_TRUE(state_sub.read().has_value());
+  }
+
+  // Live State 1 (2.005 s ahead of the stale anchor): held as jump candidate
+  // and ignored without publishing.
+  const uint64_t live1_now = boot12_receipt_base + 5'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 13'005'000), live1_now));
+  EXPECT_FALSE(state_sub.read().has_value());
+  EXPECT_EQ(node.Status(live1_now).clock_ignored_count(), 1u);
+
+  // Live State 2 (5 ms later, consistent with Live State 1): re-syncs anchor,
+  // publishes on /hw/state, and admits fresh subsystem requests.
+  const uint64_t live2_now = boot12_receipt_base + 10'000;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 13'010'000), live2_now));
+  const auto resynced_pkt = state_sub.read();
+  ASSERT_TRUE(resynced_pkt.has_value())
+      << "second consistent live State must re-sync unseen-boot stale anchor";
+  ASSERT_TRUE(Decode(resynced_pkt->bytes(), decoded));
+  EXPECT_EQ(decoded.boot_id, 12u);
+  EXPECT_EQ(decoded.sample_time_us, 13'010'000u);
+  EXPECT_EQ(node.Status(live2_now).state_age_us(), 0u);
+  EXPECT_FALSE(node.Status(live2_now).alert_error_link_lost());
+
+  Command boot12_req = IntakeRequest(cfg, 7.0);
+  boot12_req.boot_id = 12;
+  boot12_req.observed_time_us = 13'010'000;
+  PublishCommand(intake_pub, boot12_req);
+  node.Tick(live2_now + 1'000);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 7.0);
+
+  // After re-sync, an isolated corrupt +60 s State is still ignored without
+  // locking out live State 3.
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 9, 73'010'000),
+                          live2_now + 5'000));
+  EXPECT_FALSE(state_sub.read().has_value());
+  EXPECT_EQ(node.Status(live2_now + 5'000).clock_ignored_count(), 2u);
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 12, 1, 13'020'000),
+                          live2_now + 10'000));
+  EXPECT_TRUE(state_sub.read().has_value());
 }
 
 }  // namespace

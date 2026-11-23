@@ -1,8 +1,27 @@
 #include "talOS/hardware/clock_offset.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace talos::hardware {
+namespace {
+
+std::uint64_t SaturatingAdd(std::uint64_t a, std::uint64_t b) {
+  return b > std::numeric_limits<std::uint64_t>::max() - a
+             ? std::numeric_limits<std::uint64_t>::max()
+             : a + b;
+}
+
+bool WithinClockRateBound(std::uint64_t delta_a, std::uint64_t delta_b) {
+  const std::uint64_t drift_us =
+      delta_b / ClockOffsetEstimator::kMaxClockDriftDivisor;
+  const std::uint64_t max_delta = SaturatingAdd(
+      delta_b,
+      SaturatingAdd(drift_us, ClockOffsetEstimator::kMaxSampleJumpMarginUs));
+  return delta_a <= max_delta;
+}
+
+}  // namespace
 
 bool ClockOffsetEstimator::Observe(std::uint64_t boot_id,
                                    std::uint64_t sample_time_us,
@@ -24,9 +43,85 @@ bool ClockOffsetEstimator::Observe(std::uint64_t boot_id,
     round_trip_us_ = 0;
     next_exchange_ = 0;
     exchange_count_ = 0;
-  } else if (count_ > 0 && sample_time_us <= last_sample_time_us_) {
-    ++ignored_;
-    return false;
+    anchor_sample_us_ = sample_time_us;
+    anchor_receipt_us_ = receipt_us;
+    next_anchor_count_ = 0;
+    has_jump_candidate_ = false;
+  } else if (count_ > 0) {
+    if (sample_time_us <= last_sample_time_us_) {
+      ++ignored_;
+      return false;
+    }
+    // anchor_sample_us_ is always an earlier accepted sample of this boot, so
+    // anchor_sample_us_ <= last_sample_time_us_ < sample_time_us.
+    const std::uint64_t sample_delta_us = sample_time_us - anchor_sample_us_;
+    const std::uint64_t receipt_delta_us =
+        receipt_us > anchor_receipt_us_ ? receipt_us - anchor_receipt_us_ : 0;
+    if (!WithinClockRateBound(sample_delta_us, receipt_delta_us)) {
+      // An isolated far-future sample (corrupt timestamp, UINT64_MAX) is held
+      // as a candidate and ignored. Only a second consecutive jump sample
+      // advancing strictly past the candidate with non-decreasing receipt time
+      // at a symmetrically consistent physical clock rate (e.g. live frames
+      // after an unseen-boot SIGSTOP + SO_RCVBUF tail-drop) re-syncs the
+      // anchor.
+      const bool confirms_candidate =
+          has_jump_candidate_ && sample_time_us > jump_sample_us_ &&
+          receipt_us >= jump_receipt_us_ &&
+          WithinClockRateBound(sample_time_us - jump_sample_us_,
+                               receipt_us - jump_receipt_us_) &&
+          WithinClockRateBound(receipt_us - jump_receipt_us_,
+                               sample_time_us - jump_sample_us_);
+      if (!confirms_candidate) {
+        has_jump_candidate_ = true;
+        jump_sample_us_ = sample_time_us;
+        jump_receipt_us_ = receipt_us;
+        ++ignored_;
+        return false;
+      }
+      anchor_sample_us_ = sample_time_us;
+      anchor_receipt_us_ = receipt_us;
+      next_anchor_count_ = 0;
+      has_jump_candidate_ = false;
+    } else {
+      has_jump_candidate_ = false;
+      // Advance the anchor immediately only when this sample is at least as
+      // prompt as it (never letting a delayed packet pull the anchor back).
+      // Under sustained bridge-fast drift (or after an unusually prompt early
+      // sample), track the window's promptest accepted sample and promote it
+      // once at least kConvergedSamples frames span kAnchorRefreshUs of bridge
+      // receipt time so the drift allowance stays bounded over long runs.
+      if (sample_delta_us >= receipt_delta_us) {
+        anchor_sample_us_ = sample_time_us;
+        anchor_receipt_us_ = receipt_us;
+        next_anchor_count_ = 0;
+      } else {
+        if (next_anchor_count_ == 0) {
+          next_anchor_sample_us_ = sample_time_us;
+          next_anchor_receipt_us_ = receipt_us;
+          next_anchor_since_us_ = receipt_us;
+          next_anchor_count_ = 1;
+        } else {
+          ++next_anchor_count_;
+          const std::uint64_t next_sample_delta_us =
+              sample_time_us - next_anchor_sample_us_;
+          const std::uint64_t next_receipt_delta_us =
+              receipt_us > next_anchor_receipt_us_
+                  ? receipt_us - next_anchor_receipt_us_
+                  : 0;
+          if (next_sample_delta_us >= next_receipt_delta_us) {
+            next_anchor_sample_us_ = sample_time_us;
+            next_anchor_receipt_us_ = receipt_us;
+          }
+        }
+        if (next_anchor_count_ >= kConvergedSamples &&
+            receipt_us > next_anchor_since_us_ &&
+            receipt_us - next_anchor_since_us_ >= kAnchorRefreshUs) {
+          anchor_sample_us_ = next_anchor_sample_us_;
+          anchor_receipt_us_ = next_anchor_receipt_us_;
+          next_anchor_count_ = 0;
+        }
+      }
+    }
   }
   last_sample_time_us_ = sample_time_us;
   SelectExchange(receipt_us, sample_time_us);

@@ -544,7 +544,12 @@ expire after one second. Eight ordered States and a live exchange are required.
 `clock_offset_spread_us`, the one-way delay spread over the sample window, is
 diagnostic, not an accuracy bound. No fusion
 accuracy threshold is specified: measure uncertainty against fusion requirements
-on the bench. New boots reset the mapping; reordered/retired States are dropped.
+on the bench. New boots reset the mapping; reordered, retired-boot, and
+isolated or inconsistent far-future `sample_time_us` States (exceeding elapsed
+bridge time plus `ClockOffsetEstimator`'s 1 s jitter margin and 2000 ppm drift
+bound without a consecutive consistent live frame to re-sync; see
+[`talOS/bridge/README.md`](../bridge/README.md#state-ordering-and-forward-jump-gate))
+are dropped whole and counted in `clock_ignored_count`.
 
 Driver Station disable/e-stop, command timeout, or total backend feedback loss
 neutralizes outputs. Outside pending asynchronous configuration, neutral is

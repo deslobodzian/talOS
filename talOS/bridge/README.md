@@ -61,3 +61,53 @@ reasons:
    with deterministic synthetic microsecond timestamps and an in-process
    gateway (`in_process_gateway.h`), avoiding any wall-clock or event-loop
    scheduling overhead.
+
+## `State` Ordering and Forward-Jump Gate
+
+Every decoded `kHardwareState` frame with a nonzero `boot_id` passes through
+`ClockOffsetEstimator::Observe(boot_id, sample_time_us, now_us)`
+([`talOS/hardware/clock_offset.h`](../hardware/clock_offset.h)) before
+`HardwareNode::HandleGatewayFrame` updates identity, freshness, active merges,
+configuration pushes, or `/hw/state`:
+
+- **Retired boot or non-increasing `sample_time_us`**: dropped whole and counted
+  in `/hw/status` `clock_ignored_count`.
+- **Forward-jump bound and two-frame re-sync within an active boot**: once a
+  boot's first `State` establishes its clock baseline
+  `(anchor_sample_us, anchor_receipt_us)`, a subsequent `State` of that boot is
+  accepted directly when
+  `sample_time_us - anchor_sample_us <= receipt_delta + receipt_delta / 500 + 1_000_000`
+  (saturating unsigned arithmetic, with
+  `receipt_delta = max(0, now_us - anchor_receipt_us)`): at most
+  `kMaxSampleJumpMarginUs` (1 s) of jitter / burst catch-up plus 2000 ppm
+  (`1 / kMaxClockDriftDivisor`, twice the estimator's 1000 ppm relative
+  oscillator drift assumption) of elapsed bridge time. A `State` that exceeds
+  this bound is held in a single-slot forward-jump candidate, dropped whole,
+  and counted in `clock_ignored_count` without locking out subsequent valid
+  `State` frames, invalidating active subsystems, or refreshing `state_age_us`.
+  Any normal accepted `State` or boot change clears the candidate. Only a
+  second consecutive jump `State` strictly advancing past the candidate with
+  non-decreasing bridge receipt time and a symmetrically consistent physical
+  clock rate (both `cand_sample_delta` against `cand_receipt_delta` and
+  `cand_receipt_delta` against `cand_sample_delta` within the same 2000 ppm +
+  1 s bound) re-syncs the anchor and is accepted, recovering an unseen-boot
+  `SIGSTOP` / `SO_RCVBUF` tail-drop on the second live frame while rejecting
+  isolated far-future timestamps (including `UINT64_MAX`) and inconsistent jump
+  pairs.
+- **Prompt-anchor tracking**: on a normal accepted `State`, the anchor advances
+  immediately only when the sample is at least as prompt as it
+  (`sample_delta >= receipt_delta`), so a delayed buffered frame or drained
+  burst after a pause or >500 s outage cannot pull the anchor back and reject
+  live frames behind it. When sustained bridge-fast oscillator drift (or an
+  unusually prompt early sample) keeps accepted frames slower than the anchor,
+  the estimator tracks the most prompt accepted sample of the spell and
+  promotes it once at least `kConvergedSamples` (8) accepted frames span
+  `kAnchorRefreshUs` (1 s) of bridge receipt time, keeping the drift allowance
+  bounded over long runs. Arbitrarily long link outages recover on the same
+  boot because both clocks advance together.
+- **First frame of an unseen boot**: gateway and bridge clocks are independent
+  monotonic clocks with an arbitrary constant offset, so a new boot's first
+  `State` establishes its baseline and resets the guard. Strict monotonicity
+  within a boot never rolls back (`REQ-SAFE-11`), so a corrupt first frame of a
+  brand-new boot fails safe (link goes stale, robot stays neutral) until the
+  gateway reboots.
