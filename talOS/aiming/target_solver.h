@@ -203,6 +203,7 @@ class TargetSolver {
   // The mount offset in the shot frame (x along the shot): a fixed
   // shooter's exit point is along_m ahead of and lateral_m left of the line
   // through the robot origin parallel to the shot.
+  double mount_yaw_rad_ = 0.0;
   double along_m_ = 0.0;
   double lateral_m_ = 0.0;
 };

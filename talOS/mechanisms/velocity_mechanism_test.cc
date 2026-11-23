@@ -319,6 +319,13 @@ TEST(VelocityMechanismGuards, NegativeDtSpinDownAndNaNReadiness) {
                                         /*max_rps=*/80.0,
                                         /*spin_down_rps2=*/100.0, /*dt_s=*/0.0),
                    80.0);
+  // Opposite-sign tiny velocities whose product underflows to -0.0 still
+  // engage spin-down rather than jumping instantaneously across zero on dt=0.
+  EXPECT_DOUBLE_EQ(detail::StepSpinDown(/*goal_rps=*/-1e-200,
+                                        /*previous_rps=*/1e-200,
+                                        /*max_rps=*/80.0,
+                                        /*spin_down_rps2=*/100.0, /*dt_s=*/0.0),
+                   1e-200);
 
   // NaN or Inf velocity while latched at_speed drops readiness and resets
   // entry_ticks.
