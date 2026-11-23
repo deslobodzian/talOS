@@ -29,7 +29,7 @@ namespace talos::hardware {
 namespace {
 
 // The encodings this file pins and the protocol version they belong to.
-constexpr std::uint16_t kGoldenVersion = 11;
+constexpr std::uint16_t kGoldenVersion = 12;
 constexpr std::size_t kStateBytes = 1419;
 constexpr std::uint64_t kStateHash = 0x270781b104f788b0;
 constexpr std::size_t kCommandBytes = 414;
