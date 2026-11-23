@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1177,6 +1178,89 @@ TEST(SimHardwareRestart, RestartedNodeIgnoresStateAndDriverStationFromBefore) {
   sim.step(10ms);
   EXPECT_TRUE(robot_enabled(restarted.node));
   EXPECT_TRUE(restarted.ds.connected());
+}
+
+// REQ-DEV-08: PublishTarget stamps the newest Driver Station mode generation
+// (0 before any Driver Station packet or when the newest packet names no
+// active mode), or the explicit mode_since_us when given.
+TEST(PublishTargetTest, StampsNewestDriverStationGenerationOrExplicitMode) {
+  auto sim = Sim::FromToml(kRobotToml);
+  SimHardware hw{sim};
+
+  auto expect_envelope = [&](std::string_view source,
+                             std::uint64_t expected_gen,
+                             std::uint8_t expected_active,
+                             double expected_pos) {
+    const std::string topic = "/mech/target/" + std::string{source};
+    const auto raw = sim.latest<TargetEnvelope<target_test::Goal>>(topic);
+    ASSERT_TRUE(raw.has_value());
+    EXPECT_EQ(raw->mode_since_us(), expected_gen);
+    EXPECT_EQ(raw->active, expected_active);
+    EXPECT_EQ(raw->padding, (std::array<std::uint8_t, 7>{}));
+    if (expected_active != 0) {
+      EXPECT_DOUBLE_EQ(raw->message.position_rot(), expected_pos);
+    }
+
+    const auto decoded = LatestTarget<target_test::Goal>(sim, "mech", source);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->mode_since_us(), expected_gen);
+    EXPECT_EQ(decoded->active, expected_active);
+    if (expected_active != 0) {
+      EXPECT_DOUBLE_EQ(decoded->message.position_rot(), expected_pos);
+    }
+  };
+
+  // Before any Driver Station packet is published, generation is 0.
+  EXPECT_EQ(DriverStationGeneration(sim), 0u);
+  PublishTarget(sim, "mech", "teleop", target_test::Goal{1.0});
+  expect_envelope("teleop", 0u, 1u, 1.0);
+
+  // First active mode (teleop): default PublishTarget stamps the DS generation.
+  hw.set_driver_station(
+      DsPacket(driver_station::kEnabled | driver_station::kTeleop));
+  sim.step(10ms);
+  const std::uint64_t teleop_gen = DriverStationGeneration(sim);
+  ASSERT_GT(teleop_gen, 0u);
+  PublishTarget(sim, "mech", "teleop", target_test::Goal{2.0});
+  expect_envelope("teleop", teleop_gen, 1u, 2.0);
+
+  // Disabled DS packet carries a nonzero raw mode_since_us, yet names no
+  // active mode: default PublishTarget stamps 0.
+  hw.set_driver_station(DsPacket(driver_station::kTeleop));
+  sim.step(10ms);
+  {
+    const auto raw_ds =
+        sim.latest<hardware::Packet>(hardware::kDriverStationTopic);
+    ASSERT_TRUE(raw_ds.has_value());
+    driver_station::DriverStationData decoded{};
+    ASSERT_TRUE(driver_station::Decode(raw_ds->bytes(), decoded));
+    ASSERT_GT(decoded.mode_since_us, 0u);
+  }
+  EXPECT_EQ(DriverStationGeneration(sim), 0u);
+  PublishTarget(sim, "mech", "teleop", target_test::Goal{2.5});
+  expect_envelope("teleop", 0u, 1u, 2.5);
+
+  // Mode transition to autonomous increments generation: default PublishTarget
+  // stamps the newest generation rather than an earlier one.
+  hw.set_driver_station(
+      DsPacket(driver_station::kEnabled | driver_station::kAutonomous));
+  sim.step(10ms);
+  const std::uint64_t auto_gen = DriverStationGeneration(sim);
+  ASSERT_GT(auto_gen, teleop_gen);
+  PublishTarget(sim, "mech", "auto", target_test::Goal{3.0});
+  expect_envelope("auto", auto_gen, 1u, 3.0);
+
+  // Explicit mode_since_us overrides the newest DS generation: earlier
+  // generation, explicit 0, and a full-width 64-bit value.
+  for (const std::uint64_t explicit_gen :
+       {teleop_gen, std::uint64_t{0}, std::uint64_t{0x123456789ABCDEF0ULL}}) {
+    PublishTarget(sim, "mech", "auto", target_test::Goal{4.0}, explicit_gen);
+    expect_envelope("auto", explicit_gen, 1u, 4.0);
+  }
+
+  // ReleaseTarget clears active and stamps the newest DS generation.
+  ReleaseTarget<target_test::Goal>(sim, "mech", "auto");
+  expect_envelope("auto", auto_gen, 0u, 0.0);
 }
 
 }  // namespace
