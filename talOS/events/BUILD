@@ -92,6 +92,19 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "log_fuzz_test",
+    size = "small",
+    srcs = ["log/log_fuzz_test.cc"],
+    deps = [
+        ":events_core",
+        ":events_log",
+        ":session_manifest",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # Integration tier (fork, SIGKILL): its own target, out of log_test's lane.
 cc_test(
     name = "log_kill_test",

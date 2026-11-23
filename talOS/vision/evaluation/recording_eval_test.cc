@@ -148,5 +148,33 @@ TEST_F(RecordingEvalFixture, MocapCsvRejectsZeroAndNonFiniteQuaternions) {
       << res.output;
 }
 
+TEST_F(RecordingEvalFixture, RejectsHostileCliAndCalibrationInputsCleanly) {
+  for (const auto& extra_args : std::vector<std::vector<std::string>>{
+           {"--frames", frames_dir_.string(), "--intrinsics", "0,500,320,240",
+            "--aprilgrid", "1,1,0.16,0.3"},
+           {"--frames", frames_dir_.string(), "--intrinsics", "500,500,320,240",
+            "--aprilgrid", "1e20,1,0.16,0.3"},
+           {"--frames", frames_dir_.string(), "--intrinsics", "500,500,320,240",
+            "--aprilgrid", "1,1,0.16,0.3", "--threads", "1e20"},
+           {"--frames", frames_dir_.string(), "--intrinsics", "500,500,320,240",
+            "--aprilgrid", "1,1,0.16,0.3", "--max-frames", "-1"},
+       }) {
+    const auto res = RunBinary(bin_, extra_args);
+    EXPECT_FALSE(res.signaled) << res.output;
+    EXPECT_NE(res.exit_code, 0) << res.output;
+  }
+
+  const fs::path bad_pv = base_dir_ / "bad_pv.json";
+  {
+    std::ofstream out(bad_pv);
+    out << R"({"cameraIntrinsics":{"data":["x",0,320,0,500,240,0,0,1]},"distCoeffs":{"data":[0,0,0,0,0]}})";
+  }
+  const auto pv_res = RunBinary(
+      bin_, {"--frames", frames_dir_.string(), "--photonvision-calibration",
+             bad_pv.string(), "--aprilgrid", "1,1,0.16,0.3"});
+  EXPECT_FALSE(pv_res.signaled) << pv_res.output;
+  EXPECT_NE(pv_res.exit_code, 0) << pv_res.output;
+}
+
 }  // namespace
 }  // namespace talos::vision::evaluation

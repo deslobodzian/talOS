@@ -36,6 +36,7 @@ is an error.
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -54,20 +55,29 @@ UNITTEST_RAN = re.compile(r"^Ran \d+ tests? in ([0-9.]+)s$", re.MULTILINE)
 ACTION_DIR = re.compile(r"^(shard_\d+_of_\d+|run_\d+_of_\d+)(_run_\d+_of_\d+)?$")
 
 
+def _finite_duration(value, what):
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{what}: non-finite or negative duration {value!r}")
+    return value
+
+
 def xml_seconds(text):
     """The run time a test.xml records, or None when it records none."""
     root = ElementTree.fromstring(text)
     if root.get("time"):
-        return float(root.get("time"))
+        return _finite_duration(float(root.get("time")), "test.xml")
     suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
-    timed = [float(s.get("time")) for s in suites if s.get("time")]
+    timed = [_finite_duration(float(s.get("time")), "test.xml")
+             for s in suites if s.get("time")]
     if timed:
         return sum(timed)
-    cases = [float(c.get("time")) for c in root.iter("testcase") if c.get("time")]
+    cases = [_finite_duration(float(c.get("time")), "test.xml")
+             for c in root.iter("testcase") if c.get("time")]
     if not cases:
         return None
     # Bazel's own file: whole seconds, rounded down.
-    ran = [float(m) for m in UNITTEST_RAN.findall(text)]
+    ran = [_finite_duration(float(m), "test.xml")
+           for m in UNITTEST_RAN.findall(text)]
     return max(sum(cases), sum(ran))
 
 
@@ -102,6 +112,8 @@ def cache_status_seconds(data):
                 offset += 8
             elif wire == 2:
                 length, offset = varint(data, offset)
+                if offset + length > len(data):
+                    return None
                 offset += length
             elif wire == 5:
                 offset += 4
@@ -139,7 +151,7 @@ def from_testlogs(testlogs):
         suffix = ""
         if len(parts) > 1 and ACTION_DIR.match(parts[-1]):
             suffix = " (" + parts.pop() + ")"
-        if len(parts) < 2:
+        if parts == ["."]:
             continue
         label = "//" + "/".join(parts[:-1]) + ":" + parts[-1] + suffix
         seconds = action_seconds(directory, files)
@@ -151,10 +163,11 @@ def from_testlogs(testlogs):
 def duration_seconds(result):
     """A BEP testResult's attempt duration: milliseconds, or "12.3s"."""
     if "testAttemptDurationMillis" in result:
-        return int(result["testAttemptDurationMillis"]) / 1000
+        return _finite_duration(int(result["testAttemptDurationMillis"]) / 1000,
+                                "BEP testAttemptDurationMillis")
     duration = result.get("testAttemptDuration")
     if isinstance(duration, str) and duration.endswith("s"):
-        return float(duration[:-1])
+        return _finite_duration(float(duration[:-1]), "BEP testAttemptDuration")
     return None
 
 
@@ -194,12 +207,23 @@ def lane_of(tags):
 
 
 def read_lanes(lines):
-    """{label: lane} from `<label> <lane>` lines."""
+    """{label: lane} from `<label> <lane>` lines; fails closed on malformed
+    lines or unknown lanes."""
     lanes = {}
-    for line in lines:
-        fields = line.split()
-        if len(fields) == 2:
-            lanes[fields[0]] = fields[1]
+    for number, raw in enumerate(lines, 1):
+        stripped = raw.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        fields = stripped.split()
+        if len(fields) != 2:
+            raise ValueError(
+                f"lanes line {number}: expected `<label> <lane>`, got {raw.strip()!r}")
+        label, lane = fields
+        if lane not in BUDGETS:
+            raise ValueError(
+                f"lanes line {number}: unknown lane {lane!r} for {label}; "
+                f"lanes are {', '.join(BUDGETS)}")
+        lanes[label] = lane
     return lanes
 
 
@@ -270,9 +294,9 @@ def main(argv=None):
                         "--check (default: every lane)")
     args = parser.parse_args(argv)
     enforced = set(filter(None, args.enforce.split(",")))
-    if not enforced <= set(BUDGETS):
-        parser.error(f"--enforce: unknown lane in {args.enforce!r}; lanes are "
-                     f"{', '.join(BUDGETS)}")
+    if not enforced or not enforced <= set(BUDGETS):
+        parser.error(f"--enforce: must name at least one lane in "
+                     f"{', '.join(BUDGETS)}; got {args.enforce!r}")
     bep_lanes = {}
     if args.bep:
         with open(args.bep, encoding="utf-8") as handle:
@@ -290,8 +314,11 @@ def main(argv=None):
         report(results, args.threshold, sys.stdout)
         return 0
     if args.lanes:
-        with open(args.lanes, encoding="utf-8") as handle:
-            lanes = read_lanes(handle)
+        try:
+            with open(args.lanes, encoding="utf-8") as handle:
+                lanes = read_lanes(handle)
+        except ValueError as exc:
+            parser.error(str(exc))
     elif bep_lanes and all(label.split(" ", 1)[0] in bep_lanes
                            for label, _ in results):
         lanes = bep_lanes

@@ -17,6 +17,7 @@ The same C++ talos::testing::Sim and SimHardware the C++ tests use
 
 import collections
 import ctypes
+import weakref
 
 import talos
 from talos import _abi
@@ -43,7 +44,8 @@ def _generation(mode_since_us):
     """The C ABI's optional explicit generation: NULL derives it."""
     if mode_since_us is None:
         return None
-    return ctypes.byref(ctypes.c_uint64(mode_since_us))
+    return ctypes.byref(ctypes.c_uint64(
+        _abi.check_int(mode_since_us, 0, _abi.UINT64_MAX, "mode_since_us")))
 
 
 class Sim:
@@ -57,6 +59,7 @@ class Sim:
         self._handle = _handle or _abi.handle(
             lib.talos_sim_create(_abi.encode(config_path)))
         self._nodes = {}  # node_name -> (Node, object), alive while hosted
+        self._hardwares = []  # weakref.ref(SimHardware) attached to this Sim
 
     @classmethod
     def from_toml(cls, robot_toml):
@@ -75,8 +78,15 @@ class Sim:
         if handle:
             self._handle = None
             # Garbage collection may finalize this Sim while other objects
-            # of the same unreachable cycle still hold its nodes: their
-            # handles now raise instead of reaching freed memory.
+            # of the same unreachable cycle still hold its SimHardware or
+            # nodes: destroy attached SimHardwares first (they hold a C++
+            # Sim&), and invalidate every handle so none reaches freed memory.
+            for ref in getattr(self, "_hardwares", ()):
+                hw = ref()
+                if hw is not None:
+                    hw._invalidate()
+            if hasattr(self, "_hardwares"):
+                self._hardwares.clear()
             for node, _ in self._nodes.values():
                 node._native = None
                 node._callbacks.clear()
@@ -127,12 +137,14 @@ class Sim:
 
     def step(self, seconds):
         """Advances virtual time, running every node's timers and messages."""
-        _abi.ok(lib.talos_sim_step(self._handle, round(seconds * _NS)))
+        _abi.ok(lib.talos_sim_step(
+            self._handle, _abi.duration_ns(seconds, "seconds")))
 
     def pause(self, node_name, seconds):
         """Stops one node's timers and deliveries while its clock advances."""
         _abi.ok(lib.talos_sim_pause(
-            self._handle, _abi.encode(node_name), round(seconds * _NS)))
+            self._handle, _abi.encode(node_name),
+            _abi.duration_ns(seconds, "seconds")))
 
     def resume(self, node_name):
         """Ends a pause early; missed timers coalesce, as after SIGCONT."""
@@ -233,12 +245,25 @@ class SimHardware:
 
     def __init__(self, sim):
         self._sim = sim  # outlives this
-        self._handle = _abi.handle(lib.talos_sim_hardware_create(sim._handle))
+        self._native = _abi.handle(lib.talos_sim_hardware_create(sim._handle))
+        sim._hardwares = [ref for ref in sim._hardwares if ref() is not None]
+        sim._hardwares.append(weakref.ref(self))
+
+    @property
+    def _handle(self):
+        if self._native is None:
+            raise _abi.TalosError(
+                "this SimHardware or its Sim has been destroyed")
+        return self._native
+
+    def _invalidate(self):
+        handle = getattr(self, "_native", None)
+        if handle:
+            self._native = None
+            lib.talos_sim_hardware_destroy(handle)
 
     def __del__(self):
-        if getattr(self, "_handle", None):
-            lib.talos_sim_hardware_destroy(self._handle)
-            self._handle = None
+        self._invalidate()
 
     def enable(self, on=True):
         _abi.ok(lib.talos_sim_hardware_enable(self._handle, bool(on)))
@@ -254,6 +279,10 @@ class SimHardware:
                   temperature_c=0, supply_current_a=0, stator_current_a=0):
         """Inject feedback, including controller Celsius, supply amps and
         stator amps (Motor.current)."""
+        position_age_us = _abi.check_int(
+            position_age_us, 0, _abi.UINT32_MAX, "position_age_us")
+        velocity_age_us = _abi.check_int(
+            velocity_age_us, 0, _abi.UINT32_MAX, "velocity_age_us")
         self._set(lib.talos_sim_hardware_set_motor, node, device, position,
                   velocity, position_age_us, velocity_age_us,
                   temperature_c, supply_current_a, stator_current_a)
@@ -278,11 +307,19 @@ class SimHardware:
 
     def set_cancoder(self, node, device, position, velocity,
                      position_age_us=0, velocity_age_us=0):
+        position_age_us = _abi.check_int(
+            position_age_us, 0, _abi.UINT32_MAX, "position_age_us")
+        velocity_age_us = _abi.check_int(
+            velocity_age_us, 0, _abi.UINT32_MAX, "velocity_age_us")
         self._set(lib.talos_sim_hardware_set_cancoder, node, device, position,
                   velocity, position_age_us, velocity_age_us)
 
     def set_gyro(self, node, device, yaw, yaw_rate,
                  yaw_age_us=0, yaw_rate_age_us=0):
+        yaw_age_us = _abi.check_int(
+            yaw_age_us, 0, _abi.UINT32_MAX, "yaw_age_us")
+        yaw_rate_age_us = _abi.check_int(
+            yaw_rate_age_us, 0, _abi.UINT32_MAX, "yaw_rate_age_us")
         self._set(lib.talos_sim_hardware_set_gyro, node, device, yaw, yaw_rate,
                   yaw_age_us, yaw_rate_age_us)
 
@@ -290,7 +327,9 @@ class SimHardware:
         """From now on the gateway clock reads sim time + `offset` seconds,
         and each state is sampled `latency` seconds before it goes out."""
         _abi.ok(lib.talos_sim_hardware_set_gateway_clock(
-            self._handle, round(offset * _NS), round(latency * _NS)))
+            self._handle,
+            _abi.duration_ns(offset, "offset"),
+            _abi.duration_ns(latency, "latency")))
 
     def set_connected(self, node, device, connected):
         """A disconnected device reports connected False (a motor's sample
@@ -314,7 +353,8 @@ class SimHardware:
         """The next `count` gateway ticks (and their sequence numbers) pass
         with nothing published, as over a link outage. Each lost tick still
         observes the Driver Station mode, as the RoboRIO does."""
-        _abi.ok(lib.talos_sim_hardware_lose_states(self._handle, int(count)))
+        count = _abi.check_int(count, _abi.INT32_MIN, _abi.INT32_MAX, "count")
+        _abi.ok(lib.talos_sim_hardware_lose_states(self._handle, count))
 
     def reboot(self):
         """A new gateway boot id from the next state on; every applied output
@@ -336,6 +376,10 @@ class SimHardware:
         """
         if len(joysticks) > _abi.DS_MAX_JOYSTICKS:
             raise ValueError(f"at most {_abi.DS_MAX_JOYSTICKS} joysticks")
+        alliance = _abi.check_int(
+            alliance, _abi.INT32_MIN, _abi.INT32_MAX, "alliance")
+        station = _abi.check_int(
+            station, _abi.INT32_MIN, _abi.INT32_MAX, "station")
         flags = 0
         for on, flag in ((attached, _abi.DS_ATTACHED),
                          (fms_attached, _abi.DS_FMS_ATTACHED),
@@ -344,7 +388,7 @@ class SimHardware:
                          (teleop, _abi.DS_TELEOP), (test, _abi.DS_TEST),
                          (estop, _abi.DS_ESTOP)):
             flags |= flag if on else 0
-        packet = _abi.DriverStationPacket(flags=flags, alliance=int(alliance),
+        packet = _abi.DriverStationPacket(flags=flags, alliance=alliance,
                                           station=station,
                                           match_time_s=match_time)
         for port, stick in enumerate(joysticks):
@@ -415,12 +459,21 @@ def _joystick(stick):
             or not all(1 <= b <= 32 for b in buttons)):
         raise ValueError(f"{stick}: at most {_abi.DS_MAX_AXES} axes and "
                          f"{_abi.DS_MAX_POVS} POVs, buttons 1-32")
+    checked_povs = [
+        _abi.check_int(pov, _abi.INT32_MIN, _abi.INT32_MAX, "pov")
+        for pov in povs
+    ]
+    button_count = (
+        _abi.check_int(stick.button_count, _abi.INT32_MIN, _abi.INT32_MAX,
+                       "button_count")
+        if stick.button_count is not None
+        else max(buttons, default=0)
+    )
     out = _abi.Joystick(
-        connected=1, axis_count=len(axes), pov_count=len(povs),
-        button_count=(stick.button_count if stick.button_count is not None
-                      else max(buttons, default=0)),
+        connected=1, axis_count=len(axes), pov_count=len(checked_povs),
+        button_count=button_count,
         buttons=sum(1 << (b - 1) for b in set(buttons)),
         name=stick.name.encode()[:_abi.DS_NAME_LENGTH])
     out.axes[:len(axes)] = axes
-    out.povs[:len(povs)] = povs
+    out.povs[:len(checked_povs)] = checked_povs
     return out

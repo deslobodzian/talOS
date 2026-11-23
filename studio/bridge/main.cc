@@ -61,15 +61,62 @@ struct Client {
 // so it is capped at Studio's own MAX_MANIFEST_BYTES
 // (studio/src/data/manifest.ts), which rejects anything larger anyway.
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
+
+enum class BoundedReadStatus { kOk, kNotFound, kTooLarge };
+
+// Reads one regular file up to `max_bytes` using O_NONBLOCK + fstat + bounded
+// chunked reads so FIFOs, device nodes, and growing files cannot block the
+// loop thread or allocate unbounded memory.
+BoundedReadStatus ReadBoundedFile(const fs::path& path,
+                                  std::uintmax_t max_bytes, std::string& out) {
+  out.clear();
+  if (path.empty()) return BoundedReadStatus::kNotFound;
+  struct ScopedFd {
+    int fd{-1};
+    explicit ScopedFd(int descriptor) : fd(descriptor) {}
+    ~ScopedFd() {
+      if (fd >= 0) ::close(fd);
+    }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+  };
+  const ScopedFd opened{
+      ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC)};
+  if (opened.fd < 0) return BoundedReadStatus::kNotFound;
+  struct stat sb {};
+  if (::fstat(opened.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size < 0) {
+    return BoundedReadStatus::kNotFound;
+  }
+  if (static_cast<std::uintmax_t>(sb.st_size) > max_bytes) {
+    return BoundedReadStatus::kTooLarge;
+  }
+  out.reserve(static_cast<std::size_t>(sb.st_size));
+  std::array<char, 8192> chunk{};
+  for (;;) {
+    const ssize_t got = ::read(opened.fd, chunk.data(), chunk.size());
+    if (got == 0) break;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      out.clear();
+      return BoundedReadStatus::kNotFound;
+    }
+    const auto got_size = static_cast<std::size_t>(got);
+    if (static_cast<std::uintmax_t>(got_size) > max_bytes - out.size()) {
+      out.clear();
+      return BoundedReadStatus::kTooLarge;
+    }
+    out.append(chunk.data(), got_size);
+  }
+  return BoundedReadStatus::kOk;
+}
+
 // The manifest's bytes, or "" when it is absent, unreadable or over the cap.
 std::string ReadManifest(const std::string& path) {
-  if (path.empty()) return {};
-  std::error_code error;
-  const std::uintmax_t size = fs::file_size(path, error);
-  if (error || size > kMaxManifestBytes) return {};
-  std::ifstream input(path, std::ios::binary);
-  if (!input) return {};
-  return {std::istreambuf_iterator<char>(input), {}};
+  std::string out;
+  if (ReadBoundedFile(path, kMaxManifestBytes, out) != BoundedReadStatus::kOk) {
+    return {};
+  }
+  return out;
 }
 // The id of the segment the shared-memory name `segment` holds now, or
 // nullopt while there is none or its creator has not finished initializing
@@ -891,11 +938,8 @@ int main(int argc, char** argv) try {
   // cannot be subtly wrong.
   std::string declared_json;
   if (!declared_path.empty()) {
-    std::ifstream declared(declared_path, std::ios::binary);
-    if (declared) {
-      declared_json.assign(std::istreambuf_iterator<char>(declared),
-                           std::istreambuf_iterator<char>());
-    } else {
+    if (ReadBoundedFile(declared_path, kMaxManifestBytes, declared_json) !=
+        BoundedReadStatus::kOk) {
       // Logged once, then the bridge carries on. A viewer that cannot show
       // declared-against-actual is a much smaller failure than a bridge that
       // will not start. Under the launcher this file is written atomically
@@ -908,8 +952,13 @@ int main(int argc, char** argv) try {
   // Port 0 asks the OS for a free port; the bound port is reported on stdout
   // once listening, so a test never hands the bridge a port it closed first.
   auto port = [](const char* s) {
-    auto p = std::stoul(s);
-    if (p > 65535) throw std::runtime_error("invalid port");
+    const std::string_view text{s};
+    unsigned long p = 0;
+    const auto [end, error] =
+        std::from_chars(text.data(), text.data() + text.size(), p);
+    if (error != std::errc{} || end != text.data() + text.size() || p > 65535) {
+      throw std::runtime_error("invalid port");
+    }
     return static_cast<std::uint16_t>(p);
   };
   // Resolved per request, not here: a webroot that does not exist (its pages
@@ -1023,8 +1072,7 @@ int main(int argc, char** argv) try {
       return;
     }
     response->template upgrade<Client>(
-        {}, request->getHeader("sec-websocket-key"),
-        request->getHeader("sec-websocket-protocol"),
+        {}, request->getHeader("sec-websocket-key"), {},
         request->getHeader("sec-websocket-extensions"), context);
   };
   behavior.open = [&](auto* ws) {
@@ -1069,8 +1117,7 @@ int main(int argc, char** argv) try {
       return;
     }
     response->template upgrade<Client>(
-        Client{.drive = true}, request->getHeader("sec-websocket-key"),
-        request->getHeader("sec-websocket-protocol"),
+        Client{.drive = true}, request->getHeader("sec-websocket-key"), {},
         request->getHeader("sec-websocket-extensions"), context);
   };
   drive_behavior.open = [&](auto* ws) {
@@ -1177,26 +1224,17 @@ int main(int argc, char** argv) try {
     // as nodes start, restart, and exit, so /manifest.json is the live view of
     // restart counts and exit status. 404 when no path was given or the file
     // is unreadable, so "no manifest" is not confused with "an empty manifest".
-    if (manifest_path.empty()) {
+    std::string body;
+    const BoundedReadStatus status =
+        ReadBoundedFile(manifest_path, kMaxManifestBytes, body);
+    if (status == BoundedReadStatus::kNotFound) {
       res->writeStatus("404 Not Found")->end();
       return;
     }
-    std::error_code error;
-    const std::uintmax_t size = fs::file_size(manifest_path, error);
-    if (error) {
-      res->writeStatus("404 Not Found")->end();
-      return;
-    }
-    if (size > kMaxManifestBytes) {
+    if (status == BoundedReadStatus::kTooLarge) {
       res->writeStatus("413 Content Too Large")->end();
       return;
     }
-    std::ifstream input(manifest_path, std::ios::binary);
-    if (!input) {
-      res->writeStatus("404 Not Found")->end();
-      return;
-    }
-    std::string body((std::istreambuf_iterator<char>(input)), {});
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
         ->writeHeader("Cache-Control", kLiveCacheControl)
@@ -1236,6 +1274,15 @@ int main(int argc, char** argv) try {
       return;
     }
     res->writeStatus("404 Not Found")->end();
+  });
+  app.any("/*", nullptr);
+  app.any("/*", [](auto* res, auto*) {
+    res->writeStatus("405 Method Not Allowed")
+        ->writeHeader("Allow", "GET")
+        ->writeHeader("Content-Type", "text/plain; charset=utf-8")
+        ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
+        ->end("method not allowed\n");
   });
   // Exclusive: uSockets otherwise sets SO_REUSEPORT, and a second bridge of
   // the same user on this port (a developer's ./sim.sh on the robot

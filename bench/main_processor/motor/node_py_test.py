@@ -104,6 +104,31 @@ class BenchMotorTest(unittest.TestCase):
         self.assertEqual(hw.applied_motor("motor", "kraken")[:2],
                          (VOLTAGE, 1.0))
 
+    # REQ-CONTRACT-25: clock-mapping jitter putting acquisition time slightly
+    # ahead of node.now_ns clamps uint64 ages to 0 instead of wrapping near 2**64.
+    def test_future_clock_mapped_acquisition_clamps_age_to_zero(self):
+        from bridge.BridgeStatus import BridgeStatus
+
+        sim = Sim(CONFIG)
+        sim.add(bench.BenchMotor, "motor")
+        hw = SimHardware(sim)
+        hw.enable()
+        hw.set_driver_station(enabled=True, teleop=True)
+        hw.set_motor("motor", "kraken", 1.0, 2.0, 0, 0)
+        sim.step(0.05)
+        mtype = talos.message_type(BridgeStatus)
+        cur = sim.latest(BridgeStatus, "/hw/status")
+        fields = {f: getattr(cur, f) for f in mtype.fields}
+        fields["clock_offset_us"] += 50_000
+        hw.lose_states(2)
+        sim.publish(BridgeStatus, "/hw/status", **fields)
+        sim.step(0.005)
+        state = sim.latest(MotorState, topics.STATE)
+        self.assertTrue(state.connected)
+        self.assertTrue(state.acquisition_valid)
+        self.assertEqual(state.position_age_us, 0)
+        self.assertEqual(state.velocity_age_us, 0)
+
 
 class ModuleLaneReader:
     """The bench config binds the swerve module's lane too, and teleop needs

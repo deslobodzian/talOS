@@ -118,6 +118,27 @@ class BenchGyroTest(unittest.TestCase):
         self.assertAlmostEqual(state.yaw_rad, -math.pi / 4)
         self.assertAlmostEqual(state.yaw_rate_radps, math.pi / 2)
 
+    # REQ-CONTRACT-25: clock-mapping jitter putting acquisition time slightly
+    # ahead of node.now_ns clamps uint64 ages to 0 instead of wrapping near 2**64.
+    def test_future_clock_mapped_acquisition_clamps_age_to_zero(self):
+        from bridge.BridgeStatus import BridgeStatus
+
+        self.hw.set_gyro("gyro", "pigeon", 0.25, -0.5,
+                         yaw_age_us=0, yaw_rate_age_us=0)
+        self.sim.step(2 * PERIOD_S)
+        mtype = talos.message_type(BridgeStatus)
+        cur = self.sim.latest(BridgeStatus, "/hw/status")
+        fields = {f: getattr(cur, f) for f in mtype.fields}
+        fields["clock_offset_us"] += 50_000
+        self.hw.lose_states(3)
+        self.sim.publish(BridgeStatus, "/hw/status", **fields)
+        self.sim.step(PERIOD_S)
+        state = self.state()
+        self.assertTrue(state.connected)
+        self.assertTrue(state.hardware_fresh)
+        self.assertEqual(state.yaw_age_us, 0)
+        self.assertEqual(state.yaw_rate_age_us, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

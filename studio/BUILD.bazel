@@ -151,6 +151,7 @@ js_binary(
 # the code compiles, this proves it runs. declared: parses a graph document
 # the C++ launcher really produced, so a change to its envelope fails here.
 STUDIO_TESTS = {
+    "adversarial_test": "adversarial.test.tsx",
     "agent_test": "agent.test.ts",
     "alerts_test": "alerts.test.ts",
     "commands_test": "commands.test.ts",
@@ -192,6 +193,12 @@ STUDIO_TEST_DATA = {
     "system_test": ["//studio/bridge:golden"],
 }
 
+# Over 5 s on 4-vCPU CI (5.5 s), integration lane: binds live HTTP, WebSocket,
+# and UDP servers via startAgent across an 848-line suite.
+STUDIO_TEST_TAGS = {
+    "agent_test": ["integration"],
+}
+
 [
     js_test(
         name = name,
@@ -200,6 +207,7 @@ STUDIO_TEST_DATA = {
         entry_point = "tests/run.mjs",
         fixed_args = [test_file],
         patch_node_fs = False,
+        tags = STUDIO_TEST_TAGS.get(name, []),
     )
     for name, test_file in STUDIO_TESTS.items()
 ]

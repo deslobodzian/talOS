@@ -66,8 +66,9 @@ export const MAX_FRAME_BYTES = 16384;
 // dictionary the producer emits blanks the stream.
 export const MAX_DICTIONARY_STRING_BYTES = 256;
 export const MAX_ENUM_LABELS = 1024;
-// At least one channel per page in a multi-page dictionary, bounded by
-// kMaxChannels (2048) in talOS/telemetry/wire.h.
+// Maximum channels and multi-page dictionary count, matching kMaxChannels
+// (2048) in talOS/telemetry/wire.h (REQ-CONTRACT-28).
+export const MAX_CHANNELS = 2048;
 export const MAX_DICTIONARY_PAGES = 2048;
 
 // The display string for a channel value: the enum label when the channel
@@ -299,6 +300,11 @@ export class TelemetryDecoder {
     return this.dictionary;
   }
 
+  // Whether an incomplete multi-page value update is currently staged.
+  hasPendingValues(): boolean {
+    return this.pendingValues !== null;
+  }
+
   // Every snapshot the pages in `bytes` complete, in order.
   decodeAll(bytes: Uint8Array): Snapshot[] {
     const out: Snapshot[] = [];
@@ -418,11 +424,15 @@ export class TelemetryDecoder {
 
   private dictionaryPage(f: Frame, streamId: string, page: number,
                          pageCount: number) {
-    if (f.channelsLength() || f.valuesLength())
+    if (f.channelsLength() || f.valuesLength() || f.absentLength())
       throw Error('Dictionary page with values');
     if (pageCount > MAX_DICTIONARY_PAGES) {
       this.pending = null;
       throw Error('Too many dictionary pages');
+    }
+    if (f.channelCount() > MAX_CHANNELS) {
+      this.pending = null;
+      throw Error('Too many channels');
     }
     if (pageCount > 1 && f.dictionaryLength() === 0) {
       this.pending = null;
@@ -457,6 +467,7 @@ export class TelemetryDecoder {
       for (let i = 0; i < part.dictionaryLength(); i++) {
         const info = part.dictionary(i)!;
         const name = info.name()!;
+        if (!name.length) throw Error('Empty channel name');
         if (seen.has(name)) throw Error('Duplicate channel');
         // Studio owns this namespace; never silently overwrite a wire channel.
         if (name.startsWith('derived/'))
@@ -628,7 +639,8 @@ export class JitterBuffer {
   private last: bigint|null = null;
   stats = {skipped: 0, late: 0, invalid: 0};
   constructor(public delayMs = 10) {
-    if (delayMs < 0 || delayMs > 1000) throw Error('Invalid jitter delay');
+    if (!Number.isFinite(delayMs) || delayMs < 0 || delayMs > 1000)
+      throw Error('Invalid jitter delay');
   }
   push(frame: Snapshot, now: number) {
     const seq = BigInt(frame.sequence_id);

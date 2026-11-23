@@ -38,8 +38,9 @@ int main(int argc, char** argv) {
       if (name != config) files.insert(name);
       const fs::path overlay =
           argc >= 3 ? fs::path(argv[2]) / normalized : fs::path{};
+      std::error_code ec;
       if (argc == 4 && name != config && !available.contains(name) &&
-          !fs::is_regular_file(overlay)) {
+          !fs::is_regular_file(overlay, ec)) {
         throw std::invalid_argument("UNLISTED:" + name);
       }
       return std::pair{normalized, overlay};
@@ -47,9 +48,11 @@ int main(int argc, char** argv) {
     auto read = [&](const std::string& path) {
       const auto [normalized, overlay] = track(path);
       const std::string name = normalized.generic_string();
+      std::error_code ec;
       auto document = talos::config::detail::ParseTomlFile(
-          !overlay.empty() && fs::is_regular_file(overlay) ? overlay.string()
-                                                           : name);
+          !overlay.empty() && fs::is_regular_file(overlay, ec)
+              ? overlay.string()
+              : name);
       if (auto subsystem = document["subsystem"]["name"].value<std::string>()) {
         source_paths.try_emplace(*subsystem, name);
       }

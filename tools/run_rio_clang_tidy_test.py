@@ -169,6 +169,16 @@ class MainFailClosedAndObserveTest(unittest.TestCase):
             ),
             'empty_crash_output': 'exit 1\n',
             'signal_kill': 'kill -9 $$\n',
+            'fatal_error_with_lint_warning': (
+                'echo "A.cpp:1:1: warning: sample [bugprone-empty-catch]"\n'
+                'echo "A.cpp:2:10: fatal error: too many errors emitted"\n'
+                'exit 1\n'
+            ),
+            'driver_error_with_lint_warning': (
+                'echo "error: invalid value in -std=c++99"\n'
+                'echo "A.cpp:1:1: warning: sample [bugprone-empty-catch]"\n'
+                'exit 1\n'
+            ),
         }
         for label, body in cases.items():
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:

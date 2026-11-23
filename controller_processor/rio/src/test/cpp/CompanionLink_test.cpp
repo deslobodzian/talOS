@@ -271,4 +271,24 @@ TEST(CompanionReporter, ObserveDoesNotWaitOnABlockedSink) {
   EXPECT_TRUE(finished);
 }
 
+// A backward clock reading in Poll() must not underflow now_us - first_poll_us_
+// or now_us - connected_since_us_ into spurious startup-grace reports.
+// REQ-OPS-24
+TEST(CompanionReporter, BackwardClockDoesNotTriggerFalseGraceReports) {
+  Recorder sink;
+  CompanionReporter reporter{sink};
+  reporter.Poll(10'000'000);
+  EXPECT_TRUE(sink.Take().empty());
+  reporter.Poll(5'000'000);
+  EXPECT_TRUE(sink.Take().empty())
+      << "backward clock step falsely fired companion-not-heard error";
+
+  reporter.Observe(HeardAt(10'500'000));
+  reporter.Poll(10'500'000);
+  ASSERT_EQ(sink.Take().size(), 1u);  // connected
+  reporter.Poll(10'000'000);
+  EXPECT_TRUE(sink.Take().empty())
+      << "backward clock step falsely fired no-actuator-commands warning";
+}
+
 }  // namespace

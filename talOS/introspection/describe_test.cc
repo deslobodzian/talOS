@@ -80,6 +80,7 @@ void ExpectSameDescription(const Description& written,
 // the full 64-bit hash, names that need escaping, and parameter keys holding
 // the brackets, braces and field names a scanning reader would stop at.
 // REQ-SAFE-42: the hardware request's untargeted_outputs marking survives.
+// REQ-SAFE-14: operator_arming and internal_driver_station markings survive.
 TEST(Describe, RoundTripsEveryField) {
   event::Manifest manifest = sample_manifest();
   std::string bytes;
@@ -99,7 +100,9 @@ TEST(Describe, RoundTripsEveryField) {
                                       naming::kSourceFlagHardwareRequest |
                                       naming::kSourceFlagUntargetedOutputs},
        {"/drivetrain/target", naming::kSourceFlagOptional},
-       {"/driver_station/state", naming::kSourceFlagObserver}});
+       {"/driver_station/state",
+        naming::kSourceFlagObserver | naming::kSourceFlagInternalDriverStation},
+       {R"(/odd/state/"quoted\path)", naming::kSourceFlagOperatorArming}});
   written.reads_graph = true;
   written.holds_stop = true;
   written.abi_update = true;
@@ -111,6 +114,10 @@ TEST(Describe, RoundTripsEveryField) {
                                           naming::kSourceFlagOptional |
                                           naming::kSourceFlagHardwareRequest |
                                           naming::kSourceFlagUntargetedOutputs);
+  ASSERT_EQ(
+      written.sources[2].flags,
+      naming::kSourceFlagObserver | naming::kSourceFlagInternalDriverStation);
+  ASSERT_EQ(written.sources[4].flags, naming::kSourceFlagOperatorArming);
   ASSERT_EQ(written.sources[3].slots, kSlots);
   ASSERT_EQ(written.sources[1].bfbs, bytes);
 
@@ -255,6 +262,144 @@ TEST(Describe, MarksExactlyTheLoopsLatestOnlyWatchers) {
   EXPECT_EQ(read.sources[empty].flags, naming::kSourceFlagLatestOnly);
   EXPECT_EQ(read.sources[asked].flags, naming::kSourceFlagLatestOnly);
   EXPECT_EQ(read.sources[sender].flags, 0u);
+}
+
+// REQ-OPS-01: hostile `--describe` JSON with overflowing or out-of-range
+// integers must fail closed with no signed integer overflow UB.
+TEST(Describe, RejectsOverflowingAndOutOfRangeNumbers) {
+  const std::string valid =
+      DescribeToJson(DescribeManifest("d", "//d:d", sample_manifest(), kSlots));
+  const auto replaced = [&valid](std::string_view from, std::string_view to) {
+    std::string json = valid;
+    const std::size_t at = json.find(from);
+    EXPECT_NE(at, std::string::npos) << from;
+    if (at != std::string::npos) json.replace(at, from.size(), to);
+    return json;
+  };
+
+  // INT64_MIN and INT64_MAX parse cleanly without overflow and are reported as
+  // unexpected describe_version values.
+  for (const char* boundary : {"-9223372036854775808", "9223372036854775807"}) {
+    Description out;
+    std::string error;
+    EXPECT_FALSE(DescribeReader::Parse(
+        replaced("\"describe_version\": 1",
+                 std::string{"\"describe_version\": "} + boundary),
+        out, error))
+        << boundary;
+    EXPECT_NE(error.find(boundary), std::string::npos) << error;
+  }
+
+  // Overflowing, negative, non-numeric, or out-of-uint32-range fields fail
+  // closed.
+  struct Case {
+    const char* what;
+    std::string output;
+  };
+  for (const auto& [what, output] : std::vector<Case>{
+           {"describe_version > INT64_MAX",
+            replaced("\"describe_version\": 1",
+                     "\"describe_version\": 9223372036854775808")},
+           {"describe_version < INT64_MIN",
+            replaced("\"describe_version\": 1",
+                     "\"describe_version\": -9223372036854775809")},
+           {"describe_version huge",
+            replaced("\"describe_version\": 1",
+                     "\"describe_version\": 99999999999999999999999999")},
+           {"describe_version lone minus",
+            replaced("\"describe_version\": 1", "\"describe_version\": -")},
+           {"describe_version string",
+            replaced("\"describe_version\": 1", "\"describe_version\": \"1\"")},
+           {"describe_version trailing garbage",
+            replaced("\"describe_version\": 1", "\"describe_version\": 1abc")},
+           {"message_bytes huge",
+            replaced("\"message_bytes\": 48",
+                     "\"message_bytes\": 99999999999999999999999999")},
+           {"message_bytes INT64_MIN",
+            replaced("\"message_bytes\": 48",
+                     "\"message_bytes\": -9223372036854775808")},
+           {"message_bytes negative",
+            replaced("\"message_bytes\": 48", "\"message_bytes\": -1")},
+           {"message_bytes > UINT32_MAX",
+            replaced("\"message_bytes\": 48", "\"message_bytes\": 4294967296")},
+           {"message_bytes non-numeric",
+            replaced("\"message_bytes\": 48", "\"message_bytes\": \"48\"")},
+           {"alignment huge",
+            replaced("\"alignment\": 8",
+                     "\"alignment\": 99999999999999999999999999")},
+           {"alignment negative",
+            replaced("\"alignment\": 8", "\"alignment\": -1")},
+           {"alignment > UINT32_MAX",
+            replaced("\"alignment\": 8", "\"alignment\": 4294967296")},
+           {"slots huge", replaced("\"slots\": 1024",
+                                   "\"slots\": 99999999999999999999999999")},
+           {"slots INT64_MIN",
+            replaced("\"slots\": 1024", "\"slots\": -9223372036854775808")},
+           {"slots negative", replaced("\"slots\": 1024", "\"slots\": -1")},
+           {"slots > UINT32_MAX",
+            replaced("\"slots\": 1024", "\"slots\": 4294967296")},
+       }) {
+    Description out;
+    std::string error;
+    EXPECT_FALSE(DescribeReader::Parse(output, out, error)) << what;
+    EXPECT_FALSE(error.empty()) << what;
+  }
+
+  // UINT32_MAX is still accepted for uint32_t fields.
+  Description out;
+  std::string error;
+  ASSERT_TRUE(DescribeReader::Parse(
+      replaced("\"message_bytes\": 48", "\"message_bytes\": 4294967295"), out,
+      error))
+      << error;
+  ASSERT_GE(out.sources.size(), 2u);
+  EXPECT_EQ(out.sources[1].message_bytes, 4294967295u);
+}
+
+// REQ-OPS-01: AppendJsonString must validate RFC 3629 UTF-8 and escape invalid
+// bytes >= 0x80 as \u00XX so `--describe` and `declared_graph.json` stay valid
+// UTF-8 JSON.
+TEST(Describe, AppendJsonStringEscapesInvalidUtf8AndPreservesValidUtf8) {
+  const auto encode = [](std::string_view input) {
+    std::string out;
+    AppendJsonString(out, input);
+    return out;
+  };
+
+  // Valid 2-, 3-, and 4-byte UTF-8 sequences pass through unchanged.
+  EXPECT_EQ(encode("a\xC3\xA9"), "\"a\xC3\xA9\"");
+  EXPECT_EQ(encode("\xE2\x80\x94"), "\"\xE2\x80\x94\"");
+  EXPECT_EQ(encode("\xF0\x9F\x9A\x80"), "\"\xF0\x9F\x9A\x80\"");
+
+  // Invalid UTF-8 bytes (lone continuations, overlongs, UTF-16 surrogates,
+  // > U+10FFFF, invalid lead bytes, truncated sequences) are escaped as \u00xx.
+  EXPECT_EQ(encode(std::string_view{"ok\xFF\xFE", 4}), "\"ok\\u00ff\\u00fe\"");
+  EXPECT_EQ(encode(std::string_view{"\x80\xBF", 2}), "\"\\u0080\\u00bf\"");
+  EXPECT_EQ(encode(std::string_view{"\xC0\xAF", 2}), "\"\\u00c0\\u00af\"");
+  EXPECT_EQ(encode(std::string_view{"\xC1\xBF", 2}), "\"\\u00c1\\u00bf\"");
+  EXPECT_EQ(encode(std::string_view{"\xE0\x80\xAF", 3}),
+            "\"\\u00e0\\u0080\\u00af\"");
+  EXPECT_EQ(encode(std::string_view{"\xED\xA0\x80", 3}),
+            "\"\\u00ed\\u00a0\\u0080\"");
+  EXPECT_EQ(encode(std::string_view{"\xF0\x80\x80\x80", 4}),
+            "\"\\u00f0\\u0080\\u0080\\u0080\"");
+  EXPECT_EQ(encode(std::string_view{"\xF4\x90\x80\x80", 4}),
+            "\"\\u00f4\\u0090\\u0080\\u0080\"");
+  EXPECT_EQ(encode(std::string_view{"\xF5", 1}), "\"\\u00f5\"");
+  EXPECT_EQ(encode(std::string_view{"\xC3", 1}), "\"\\u00c3\"");
+  EXPECT_EQ(encode(std::string_view{"\xE2\x80", 2}), "\"\\u00e2\\u0080\"");
+  EXPECT_EQ(encode(std::string_view{"\xF0\x9F\x9A", 3}),
+            "\"\\u00f0\\u009f\\u009a\"");
+  // Invalid byte immediately followed by valid UTF-8 escapes only the bad byte.
+  EXPECT_EQ(encode(std::string_view{"\xFF\xC3\xA9", 3}), "\"\\u00ff\xC3\xA9\"");
+
+  // DescribeToJson uses AppendJsonString and emits no raw invalid UTF-8 bytes.
+  Description desc;
+  desc.name = std::string{"bad\xFFname", 8};
+  desc.target = "//x:bad";
+  const std::string json = DescribeToJson(desc);
+  EXPECT_NE(json.find("\"bad\\u00ffname\""), std::string::npos) << json;
+  EXPECT_EQ(json.find('\xFF'), std::string::npos);
 }
 
 }  // namespace

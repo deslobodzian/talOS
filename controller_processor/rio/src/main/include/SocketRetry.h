@@ -58,8 +58,10 @@ class SocketRetry {
   // at most once per kPeriodUs. Never allocates.
   template <typename Open>
   Event Poll(uint64_t now_us, const Open& open) {
-    if (open_ || (attempted_ && now_us - last_attempt_us_ < kPeriodUs))
+    if (open_ || (attempted_ && (now_us < last_attempt_us_ ||
+                                 now_us - last_attempt_us_ < kPeriodUs))) {
       return Event::kNone;
+    }
     attempted_ = true;
     last_attempt_us_ = now_us;
     if (open()) {
@@ -126,8 +128,10 @@ class SocketRetry {
   // this long has passed since its last failure.
   static constexpr uint64_t kSpellQuietUs = 1'000'000;
   SendEvent SendSucceeded(uint64_t now_us) {
-    if (!in_spell_ || now_us - spell_last_failure_us_ < kSpellQuietUs)
+    if (!in_spell_ || now_us < spell_last_failure_us_ ||
+        now_us - spell_last_failure_us_ < kSpellQuietUs) {
       return SendEvent::kNone;
+    }
     in_spell_ = false;
     return spell_reported_ ? SendEvent::kRecovered : SendEvent::kNone;
   }

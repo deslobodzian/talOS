@@ -37,7 +37,6 @@ cc_library(
         "//talOS/vision/apriltag:cpu_apriltag_backend",
         "@apriltag",
         "@eigen3//:eigen",
-        "@opencv//:imgcodecs",
     ] + select({
         "@platforms//os:macos": ["//third_party/metal-cpp:metal-cpp-compute"],
         "//conditions:default": [],

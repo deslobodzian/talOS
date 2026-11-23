@@ -61,9 +61,20 @@ class Flattener {
     }
     const reflection::Object& object =
         *schema_.objects()->Get(static_cast<flatbuffers::uoffset_t>(index));
+    if (!object.is_struct() || object.bytesize() <= 0 ||
+        object.fields() == nullptr) {
+      Refuse(field, "is not a positive-sized struct");
+    }
+    const auto bytes = static_cast<std::size_t>(object.bytesize());
     open_[index] = true;
-    std::vector<const reflection::Field*> fields(object.fields()->begin(),
-                                                 object.fields()->end());
+    std::vector<const reflection::Field*> fields;
+    fields.reserve(object.fields()->size());
+    for (const auto* f : *object.fields()) {
+      if (f == nullptr || f->name() == nullptr || f->type() == nullptr) {
+        Refuse(field, "has incomplete field metadata");
+      }
+      fields.push_back(f);
+    }
     std::sort(fields.begin(), fields.end(),
               [](const reflection::Field* a, const reflection::Field* b) {
                 return a->id() < b->id();
@@ -73,15 +84,27 @@ class Flattener {
       const std::string field_name = field_def->name()->str();
       const std::string channel_name = std::string{prefix} + "/" + field_name;
       const auto& type = *field_def->type();
-      if (field_def->offset() >
-          std::numeric_limits<std::size_t>::max() - base_offset) {
+      if (field_def->offset() > bytes ||
+          field_def->offset() >
+              std::numeric_limits<std::size_t>::max() - base_offset) {
         Refuse(field_name, "offset overflows");
       }
       const std::size_t field_offset = base_offset + field_def->offset();
 
       if (type.base_type() == reflection::BaseType::Obj) {
-        Struct(ObjectIndex(type.index(), field_name), field_name, channel_name,
-               field_offset, depth + 1);
+        const std::size_t nested_idx = ObjectIndex(type.index(), field_name);
+        const reflection::Object* nested_obj = schema_.objects()->Get(
+            static_cast<flatbuffers::uoffset_t>(nested_idx));
+        if (nested_obj == nullptr || !nested_obj->is_struct() ||
+            nested_obj->bytesize() <= 0) {
+          Refuse(field_name, "has non-positive struct size");
+        }
+        const auto nested_bytes =
+            static_cast<std::size_t>(nested_obj->bytesize());
+        if (nested_bytes > bytes - field_def->offset()) {
+          Refuse(field_name, "exceeds enclosing struct bounds");
+        }
+        Struct(nested_idx, field_name, channel_name, field_offset, depth + 1);
         continue;
       }
 
@@ -92,14 +115,13 @@ class Flattener {
             nested ? ObjectIndex(type.index(), field_name) : 0;
         std::size_t element_bytes = 0;
         if (nested) {
-          const std::int32_t raw_bytesize =
-              schema_.objects()
-                  ->Get(static_cast<flatbuffers::uoffset_t>(element))
-                  ->bytesize();
-          if (raw_bytesize <= 0) {
+          const reflection::Object* elem_obj = schema_.objects()->Get(
+              static_cast<flatbuffers::uoffset_t>(element));
+          if (elem_obj == nullptr || !elem_obj->is_struct() ||
+              elem_obj->bytesize() <= 0) {
             Refuse(field_name, "has non-positive struct element size");
           }
-          element_bytes = static_cast<std::size_t>(raw_bytesize);
+          element_bytes = static_cast<std::size_t>(elem_obj->bytesize());
         } else {
           element_bytes = schema::ScalarSize(type.element());
           if (element_bytes == 0) {
@@ -107,9 +129,10 @@ class Flattener {
           }
         }
         if (count > 0 &&
-            element_bytes >
-                (std::numeric_limits<std::size_t>::max() - field_offset) /
-                    count) {
+            (element_bytes > (bytes - field_def->offset()) / count ||
+             element_bytes >
+                 (std::numeric_limits<std::size_t>::max() - field_offset) /
+                     count)) {
           Refuse(field_name, "array offset overflows");
         }
         for (std::size_t i = 0; i < count; ++i) {
@@ -127,8 +150,12 @@ class Flattener {
         continue;
       }
 
-      if (schema::ScalarSize(type.base_type()) == 0) {
+      const std::size_t scalar_bytes = schema::ScalarSize(type.base_type());
+      if (scalar_bytes == 0) {
         Refuse(field_name, "has non-scalar field type");
+      }
+      if (scalar_bytes > bytes - field_def->offset()) {
+        Refuse(field_name, "exceeds enclosing struct bounds");
       }
       AddScalar(type.base_type(), type.index(), field_name, channel_name,
                 field_offset, true);
@@ -218,18 +245,20 @@ AlertLevel AlertLevelOf(std::string_view field) {
 std::vector<std::string> EnumLabels(const reflection::Schema& schema,
                                     std::int32_t enum_index) {
   std::vector<std::string> labels;
-  if (enum_index >= 0 &&
+  if (schema.enums() != nullptr && enum_index >= 0 &&
       enum_index < static_cast<std::int32_t>(schema.enums()->size())) {
     const auto* enum_def = schema.enums()->Get(enum_index);
+    if (enum_def == nullptr || enum_def->values() == nullptr) return labels;
     std::int64_t max_value = -1;
     for (const auto* value : *enum_def->values()) {
-      max_value = std::max(max_value, value->value());
+      if (value != nullptr) max_value = std::max(max_value, value->value());
     }
     if (max_value >= 0 &&
         max_value < static_cast<std::int64_t>(telemetry_wire::kMaxEnumLabels)) {
       labels.resize(static_cast<std::size_t>(max_value) + 1);
       for (const auto* value : *enum_def->values()) {
-        if (value->value() >= 0) {
+        if (value != nullptr && value->name() != nullptr &&
+            value->value() >= 0) {
           labels[static_cast<std::size_t>(value->value())] =
               value->name()->str();
         }
@@ -251,7 +280,9 @@ std::vector<Channel> FlattenTopic(std::string_view topic,
         "'");
   }
   const reflection::Object* object =
-      schema->objects()->LookupByKey(std::string{schema_name}.c_str());
+      schema->objects() != nullptr
+          ? schema->objects()->LookupByKey(std::string{schema_name}.c_str())
+          : nullptr;
   if (object == nullptr) {
     throw std::invalid_argument("telemetry: root schema object '" +
                                 std::string{schema_name} + "' for topic '" +

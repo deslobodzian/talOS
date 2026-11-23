@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -460,6 +461,159 @@ TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweep) {
       kPi - 0.01);
   EXPECT_TRUE(around.turret_reachable);
   EXPECT_NEAR(around.turret_rad, -kPi + 0.2, kTight);
+}
+
+// Extreme measured turret angles, half-infinite travel limits, exact limit
+// boundaries with zero hysteresis, and unwrapped large mount yaw must never
+// emit non-finite or out-of-travel turret commands or lose aim direction.
+// REQ-DEV-17
+// REQ-DEV-18
+TEST(TargetSolverTurret, ExtremeInputsStayFiniteInTravelAndPreserveAim) {
+  const ShotTable table = RealisticTable();
+  const SE2<double> origin = Pose(0.0, 0.0, 0.0);
+  const double inf = std::numeric_limits<double>::infinity();
+
+  // Half-infinite travel limits must stay finite even on huge opposite-sign
+  // measured angles (previously shifted overflowed to +-inf while passing the
+  // infinite bound check).
+  {
+    const TargetSolver neg_half(Turret(0.0, 0.0, 0.0, {-inf, -1e308}), table);
+    const Solution s =
+        neg_half.SolveStatic(origin, Eigen::Vector2d(3.0, 0.0), 1e308);
+    ASSERT_TRUE(s.valid);
+    EXPECT_TRUE(std::isfinite(s.turret_rad));
+    EXPECT_LE(s.turret_rad, -1e308);
+  }
+  {
+    const TargetSolver pos_half(Turret(0.0, 0.0, 0.0, {1e308, inf}), table);
+    const Solution s =
+        pos_half.SolveStatic(origin, Eigen::Vector2d(3.0, 0.0), -1e308);
+    ASSERT_TRUE(s.valid);
+    EXPECT_TRUE(std::isfinite(s.turret_rad));
+    EXPECT_GE(s.turret_rad, 1e308);
+  }
+
+  // Huge measured angles against finite travel must stay inside [min, max]
+  // (never escape via precision loss in nearest - kTau * ceil(...)) and hold
+  // the limit on the turret's side when unreachable.
+  {
+    const TargetSolver wide(Turret(0.0, 0.0, 0.0, {-3.5, 3.5}), table);
+    const Eigen::Vector2d target(3.0 * std::cos(0.5), 3.0 * std::sin(0.5));
+    for (const double measured : {1e16, -1e16, 1e308, -1e308}) {
+      SCOPED_TRACE(measured);
+      const Solution s = wide.SolveStatic(origin, target, measured);
+      ASSERT_TRUE(s.valid);
+      EXPECT_TRUE(s.turret_reachable);
+      EXPECT_GE(s.turret_rad, -3.5);
+      EXPECT_LE(s.turret_rad, 3.5);
+      EXPECT_NEAR(s.turret_rad, 0.5, 1e-9);
+    }
+  }
+  {
+    const TargetSolver front(Turret(0.0, 0.0, 0.0, {-kPi / 2.0, kPi / 2.0}),
+                             table);
+    const Solution s =
+        front.SolveStatic(origin, Eigen::Vector2d(-3.0, -0.5), 1e308);
+    ASSERT_TRUE(s.valid);
+    EXPECT_FALSE(s.turret_reachable);
+    EXPECT_DOUBLE_EQ(s.turret_rad, kPi / 2.0);
+  }
+
+  // Exact limit boundary with zero hysteresis remains reachable even when
+  // measured_turret_rad is offset by full turns.
+  {
+    const TargetSolver bounded(Turret(0.0, 0.0, 0.0, {-1.0, 1.0, 0.0}), table);
+    const Eigen::Vector2d at_max(3.0 * std::cos(1.0), 3.0 * std::sin(1.0));
+    const Solution s = bounded.SolveStatic(origin, at_max, 1.0 + 2.0 * kPi);
+    ASSERT_TRUE(s.valid);
+    EXPECT_TRUE(s.turret_reachable);
+    EXPECT_NEAR(s.turret_rad, 1.0, kTight);
+  }
+
+  // Large unwrapped mount.yaw_rad does not swallow target bearing precision.
+  {
+    const TargetSolver huge_yaw(Fixed(0.0, 0.0, 1e17), table);
+    const Solution east =
+        huge_yaw.SolveStatic(origin, Eigen::Vector2d(3.0, 0.0));
+    const Solution north =
+        huge_yaw.SolveStatic(origin, Eigen::Vector2d(0.0, 3.0));
+    ASSERT_TRUE(east.valid && north.valid);
+    EXPECT_NEAR(Wrap(north.robot_heading_rad - east.robot_heading_rad),
+                kPi / 2.0, 1e-6);
+  }
+}
+
+// Deterministic adversarial property sweep: across fixed, bounded-turret,
+// narrow-turret, and half-infinite-turret configs with NaN/Inf/subnormal/huge
+// inputs, every valid Solution has finite fields, headings in (-pi, pi], and
+// turret_rad inside [min_rad, max_rad]; every invalid Solution is all zeros.
+// REQ-DEV-17
+// REQ-DEV-18
+TEST(TargetSolverTurret, AdversarialPropertySweepPreservesSafetyInvariants) {
+  const ShotTable table = RealisticTable();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const double max_d = std::numeric_limits<double>::max();
+  const double min_d = std::numeric_limits<double>::min();
+  const double denorm = std::numeric_limits<double>::denorm_min();
+  const std::array<double, 25> specials = {
+      0.0,        -0.0,  1.0,    -1.0,   kPi,     -kPi,   2.0 * kPi,
+      -2.0 * kPi, 1e-16, -1e-16, denorm, -denorm, min_d,  -min_d,
+      1e16,       -1e16, 1e17,   -1e17,  1e154,   -1e154, 1e308,
+      -1e308,     max_d, inf,    nan,
+  };
+  const std::array<SolverConfig, 7> configs = {{
+      Fixed(0.0, 0.0, 0.0),
+      Fixed(0.25, -0.3, kPi),
+      Fixed(0.0, 0.5, 1e17),
+      Turret(-0.15, 0.1, 0.0, {-3.5, 3.5, 0.05}),
+      Turret(0.0, 0.0, 0.0, {-kPi / 2.0, kPi / 2.0, 0.0}),
+      Turret(0.0, 0.0, 0.0, {-inf, -1e308, 0.05}),
+      Turret(0.0, 0.0, 0.0, {1e308, inf, 0.05}),
+  }};
+  std::mt19937_64 rng(0x5A17C0DEULL);
+  std::uniform_real_distribution<double> normal(-10.0, 10.0);
+  const auto pick = [&]() {
+    const std::uint64_t r = rng();
+    if ((r & 1u) == 0u) return specials[(r >> 1) % specials.size()];
+    return normal(rng);
+  };
+  for (const SolverConfig& cfg : configs) {
+    const TargetSolver solver(cfg, table);
+    for (int i = 0; i < 600; ++i) {
+      const SE2<double> pose = Pose(pick(), pick(), pick());
+      const FieldTwist vel{pick(), pick(), pick()};
+      const Eigen::Vector2d target(pick(), pick());
+      const double measured = pick();
+      const Solution s =
+          solver.SolveWithFieldVelocity(pose, vel, target, measured);
+      if (s.valid) {
+        for (const double value :
+             {s.distance_m, s.shot_heading_rad, s.robot_heading_rad,
+              s.turret_rad, s.flywheel_rps, s.hood_rad, s.time_of_flight_s,
+              s.shooter_x_m, s.shooter_y_m, s.virtual_target_x_m,
+              s.virtual_target_y_m}) {
+          ASSERT_TRUE(std::isfinite(value));
+        }
+        ASSERT_GT(s.distance_m, 0.0);
+        ASSERT_GT(s.shot_heading_rad, -kPi);
+        ASSERT_LE(s.shot_heading_rad, kPi);
+        ASSERT_GT(s.robot_heading_rad, -kPi);
+        ASSERT_LE(s.robot_heading_rad, kPi);
+        if (cfg.turret) {
+          ASSERT_GE(s.turret_rad, cfg.turret->min_rad);
+          ASSERT_LE(s.turret_rad, cfg.turret->max_rad);
+        }
+      } else {
+        ASSERT_EQ(s.distance_m, 0.0);
+        ASSERT_EQ(s.turret_rad, 0.0);
+        ASSERT_EQ(s.flywheel_rps, 0.0);
+        ASSERT_FALSE(s.converged);
+        ASSERT_FALSE(s.in_range);
+        ASSERT_FALSE(s.turret_reachable);
+      }
+    }
+  }
 }
 
 // --- moving shots ------------------------------------------------------------

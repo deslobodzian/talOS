@@ -48,6 +48,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -342,6 +343,14 @@ int Run(int argc, char** argv);
 
 namespace detail {
 
+inline Node& RequireBoundNode(Node* node, const char* what) {
+  if (node == nullptr) {
+    throw std::logic_error(std::string{what} +
+                           " handle is not bound to a Node");
+  }
+  return *node;
+}
+
 template <class T>
 std::optional<T> FindParam(const Node& node, std::string_view key,
                            ParamTable subsystem = {}) {
@@ -456,10 +465,7 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message, Wake wake,
       };
   const std::size_t index = detail::NodeDetail::add_subscription(
       *this, topic, sizeof(M), kMessageAlignment, schema::Of<M>(),
-      options.optional, std::move(callback));
-  if (wake != Wake::kAtDrain) {
-    detail::NodeDetail::require_immediate_delivery(*this, index);
-  }
+      options.optional, std::move(callback), wake != Wake::kAtDrain);
   return Subscription<M>{this, index};
 }
 
@@ -484,38 +490,45 @@ T& Node::extension() {
 
 template <Message M>
 bool Subscription<M>::has_value() const {
-  return detail::NodeDetail::subscription_has_value(*node_, index_);
+  return detail::NodeDetail::subscription_has_value(
+      detail::RequireBoundNode(node_, "Subscription"), index_);
 }
 template <Message M>
 const M& Subscription<M>::value() const {
-  return *static_cast<const M*>(
-      detail::NodeDetail::subscription_value(*node_, index_));
+  return *static_cast<const M*>(detail::NodeDetail::subscription_value(
+      detail::RequireBoundNode(node_, "Subscription"), index_));
 }
 template <Message M>
 bool Subscription<M>::fresh() const {
-  return fresh(detail::NodeDetail::freshness_timeout(*node_));
+  return fresh(detail::NodeDetail::freshness_timeout(
+      detail::RequireBoundNode(node_, "Subscription")));
 }
 template <Message M>
 bool Subscription<M>::fresh(Duration max_age) const {
-  return detail::NodeDetail::subscription_fresh(*node_, index_, max_age);
+  return detail::NodeDetail::subscription_fresh(
+      detail::RequireBoundNode(node_, "Subscription"), index_, max_age);
 }
 template <Message M>
 Duration Subscription<M>::age() const {
-  return detail::NodeDetail::subscription_age(*node_, index_);
+  return detail::NodeDetail::subscription_age(
+      detail::RequireBoundNode(node_, "Subscription"), index_);
 }
 template <Message M>
 bool Subscription<M>::updated() const {
-  return detail::NodeDetail::subscription_updated(*node_, index_);
+  return detail::NodeDetail::subscription_updated(
+      detail::RequireBoundNode(node_, "Subscription"), index_);
 }
 
 template <Message M>
 bool Publisher<M>::send(const M& message) {
-  return detail::NodeDetail::publisher_send(*node_, index_, &message,
-                                            sizeof(M));
+  return detail::NodeDetail::publisher_send(
+      detail::RequireBoundNode(node_, "Publisher"), index_, &message,
+      sizeof(M));
 }
 
 inline bool BytePublisher::send(std::span<const std::byte> message) {
-  return detail::NodeDetail::byte_publisher_send(*node_, index_, message);
+  return detail::NodeDetail::byte_publisher_send(
+      detail::RequireBoundNode(node_, "BytePublisher"), index_, message);
 }
 
 template <class S>

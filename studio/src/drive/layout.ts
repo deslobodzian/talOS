@@ -59,17 +59,22 @@ const isObject = (v: unknown): v is Json =>
 const str = (v: unknown, fallback = '') => typeof v === 'string' ? v : fallback;
 const num = (v: unknown, fallback: number) =>
     typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+const posNum = (v: unknown, fallback: number) =>
+    typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : fallback;
+const nonNegNum = (v: unknown, fallback: number) =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback;
 const optionalNum = (v: unknown) =>
     typeof v === 'number' && Number.isFinite(v) ? v : null;
 const strings = (v: unknown) =>
     Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : [];
 
-function readCell(v: unknown): Cell|null {
+function readCell(v: unknown, columns: number, rows: number): Cell|null {
   if (!Array.isArray(v) || v.length !== 4 ||
       !v.every(n => Number.isInteger(n) && n >= 0))
     return null;
   const [column, row, width, height] = v as number[];
-  if (width < 1 || height < 1) return null;
+  if (width < 1 || height < 1 || column + width > columns || row + height > rows)
+    return null;
   return {column, row, width, height};
 }
 
@@ -83,9 +88,9 @@ function readItem(v: unknown): CheckItem|null {
           at_least: optionalNum(v.at_least), at_most: optionalNum(v.at_most)};
 }
 
-function readWidget(v: unknown, index: number): Widget|null {
+function readWidget(v: unknown, index: number, columns: number, rows: number): Widget|null {
   if (!isObject(v)) return null;
-  const at = readCell(v.at);
+  const at = readCell(v.at, columns, rows);
   if (!at) return null;  // nowhere to draw even an "unsupported" cell
   const channels: Record<string, string> = Object.create(null);
   if (isObject(v.channels))
@@ -107,7 +112,7 @@ function readWidget(v: unknown, index: number): Widget|null {
       return {...common, kind: 'subsystems', nodes: strings(v.nodes)};
     case 'field':
       return channels.x && channels.y && channels.yaw ?
-          {...common, kind: 'field', trail_s: num(v.trail_s, 5)} :
+          {...common, kind: 'field', trail_s: nonNegNum(v.trail_s, 5)} :
           unsupported(`widgets[${index}] has no pose`);
     case 'number':
       return {...common, kind: 'number', label: str(v.label),
@@ -121,7 +126,7 @@ function readWidget(v: unknown, index: number): Widget|null {
       return {...common, kind: 'text', label: str(v.label)};
     case 'graph':
       return {...common, kind: 'graph', series: strings(v.series),
-              window_s: num(v.window_s, 10), min: optionalNum(v.min),
+              window_s: posNum(v.window_s, 10), min: optionalNum(v.min),
               max: optionalNum(v.max)};
     case 'checks': {
       const items: CheckItem[] = [];
@@ -148,7 +153,7 @@ export function parseLayout(json: unknown): Layout {
   const widgets: Widget[] = [];
   let skipped = 0;
   (Array.isArray(json.widgets) ? json.widgets : []).forEach((w, i) => {
-    const widget = readWidget(w, i);
+    const widget = readWidget(w, i, columns, rows);
     if (widget) widgets.push(widget);
     else skipped++;
   });
@@ -156,7 +161,7 @@ export function parseLayout(json: unknown): Layout {
     title: str(json.title, 'Drive'),
     columns,
     rows,
-    update_hz: num(json.update_hz, 20),
+    update_hz: posNum(json.update_hz, 20),
     alerts: json.alerts === true,
     channels: strings(json.channels),
     widgets,
