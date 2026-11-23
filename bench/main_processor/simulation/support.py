@@ -3,31 +3,21 @@
 import os
 from pathlib import Path
 import re
-import socket
-import struct
 import sys
-import time
 import tomllib
+
+from talOS.build.udp_ports import udp_ports
+from talOS.launcher.tlog_read import (
+    ENTRY as _TLOG_ENTRY,
+    iter_tlog_records,
+    node_clock_ns,
+    read_tlog_header,
+)
 
 
 def workspace():
     return Path(os.environ["TEST_SRCDIR"]) / os.environ.get(
         "TEST_WORKSPACE", "_main")
-
-
-def udp_ports():
-    # Hold both reservations until distinct ephemeral ports have been selected.
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as gateway, \
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge:
-        gateway.bind(("127.0.0.1", 0))
-        bridge.bind(("127.0.0.1", 0))
-        return gateway.getsockname()[1], bridge.getsockname()[1]
-
-
-def tcp_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
 
 
 NEUTRAL = ("neutral", 0, 0.0, 0.0)
@@ -72,20 +62,13 @@ def log_baseline_ns(logs):
     baseline = None
     for path in logs:
         with path.open("rb") as stream:
-            header = stream.read(120)
-            magic, version, header_bytes = struct.unpack_from("<8sII", header)
-            if magic != b"TALOSLOG" or version not in (7, 8):
-                raise ValueError(f"unsupported log format: {path}")
-            manifests, = struct.unpack_from("<I", header, 40)
-            schema_bytes, = struct.unpack_from("<Q", header, 112)
-            stream.seek(header_bytes + 112 * manifests + schema_bytes)
-            while record := stream.read(64):
-                if len(record) != 64:
-                    raise ValueError(f"truncated log header: {path}")
-                timestamp, = struct.unpack_from("<q", record, 16)
-                baseline = timestamp if baseline is None else min(baseline, timestamp)
-                stored, = struct.unpack_from("<I", record, 60)
-                stream.seek(stored, 1)
+            header_bytes, _, count, _, schema_bytes = read_tlog_header(
+                stream, path)
+            stream.seek(header_bytes + _TLOG_ENTRY.size * count + schema_bytes)
+            for _, _, timestamp, _ in iter_tlog_records(
+                    stream, path, allow_truncated=False):
+                baseline = (timestamp if baseline is None
+                            else min(baseline, timestamp))
     return baseline
 
 
@@ -128,11 +111,6 @@ def assert_realtime(test, launcher_output):
     test.assertNotIn("talos: realtime scheduling incomplete", launcher_output)
 
 
-def node_clock_ns():
-    clock = time.CLOCK_MONOTONIC_RAW if sys.platform == "darwin" else time.CLOCK_MONOTONIC
-    return time.clock_gettime_ns(clock)
-
-
 def load_config(config):
     """(robot table, {subsystem name: its file}) of a config with one include.
 
@@ -155,13 +133,18 @@ def load_config(config):
 
 
 def device_layout(config):
-    """Mirror the config's documented sorted logical-ID and motor-bit order."""
-    robot = tomllib.loads(config.read_text())
+    """Mirror the config's documented sorted logical-ID and motor-bit order.
+
+    Supports single-level `include` and `[[subsystems]]` path overrides via
+    `load_config()` (sufficient for `robot_soak.toml`; does not resolve
+    subsystem `defaults` chains or inline `[subsystems.<name>]` tables).
+    """
+    _, subsystem_files = load_config(config)
     devices = []
-    for subsystem in robot["subsystems"]:
-        document = tomllib.loads((config.parent / subsystem["path"]).read_text())
+    for sub_name, sub_path in subsystem_files.items():
+        document = tomllib.loads(sub_path.read_text())
         for kind in ("motors", "sensors", "digital_inputs", "digital_outputs",
                      "analog_inputs", "encoders", "pwm_outputs"):
-            devices.extend((subsystem["name"], name, kind)
+            devices.extend((sub_name, name, kind)
                            for name in document.get(kind, {}))
     return [(i, *device) for i, device in enumerate(sorted(devices), 1)]

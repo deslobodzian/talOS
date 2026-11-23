@@ -1,12 +1,15 @@
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -18,6 +21,30 @@
 namespace talos::event::log {
 namespace {
 
+struct SharedProgress {
+  std::atomic<std::uint64_t> committed{0};
+};
+
+struct MappedProgress {
+  SharedProgress* ptr{nullptr};
+
+  MappedProgress() {
+    void* mem = ::mmap(nullptr, sizeof(SharedProgress), PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANON, -1, 0);
+    if (mem != MAP_FAILED) {
+      ptr = new (mem) SharedProgress{};
+    }
+  }
+  ~MappedProgress() {
+    if (ptr != nullptr) {
+      ptr->~SharedProgress();
+      ::munmap(ptr, sizeof(SharedProgress));
+    }
+  }
+  MappedProgress(const MappedProgress&) = delete;
+  MappedProgress& operator=(const MappedProgress&) = delete;
+};
+
 std::vector<std::byte> Payload(std::uint64_t index) {
   std::vector<std::byte> payload(16);
   for (std::size_t i = 0; i < payload.size(); ++i) {
@@ -26,11 +53,13 @@ std::vector<std::byte> Payload(std::uint64_t index) {
   return payload;
 }
 
-// The child: logs one record every 5 ms, like a 200 Hz node, until killed.
-// The periodic fsync is an hour away and a chunk holds about 3000 of these
-// records (15 s of them), so neither a sync nor a full chunk can be what
-// puts a record in the file within the parent's 10 s wait.
-[[noreturn]] void LogUntilKilled(const std::string& path) {
+// The child: logs one record every 5 ms, like a 200 Hz node, until killed,
+// publishing each committed dispatch_index in shared memory immediately after
+// dispatch() returns. The periodic fsync is an hour away and a chunk holds
+// about 3000 of these records (15 s of them), so neither a sync nor a full
+// chunk can be what puts a record in the file within the parent's wait.
+[[noreturn]] void LogUntilKilled(const std::string& path,
+                                 SharedProgress* progress) {
   LogWriter::Options options{};
   options.sync_interval = std::chrono::hours{1};
   LogWriter writer{path, "killed", options};
@@ -39,6 +68,7 @@ std::vector<std::byte> Payload(std::uint64_t index) {
     Context context{};
     context.dispatch_index = i;
     writer.dispatch(context, Payload(i));
+    progress->committed.store(i, std::memory_order_release);
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
   }
 }
@@ -73,30 +103,51 @@ std::uint64_t IntactPrefix(const std::string& path, bool& in_order) {
 // already written to the kernel. The writer used to write a chunk that was
 // not full only at its periodic sync, once a second, so a SIGKILLed
 // hardware_node lost the last 826 ms of its log on the bench (2026-11-11).
-// Here the parent waits, polling the file, until it holds record kRecords of
-// a child logging at 200 Hz, with no sync and no full chunk possible, then
-// SIGKILLs the child: the file must still hold records 1 to at least
-// kRecords, whole and in order (a record cut by the kill is not read as
-// one). Before the fix the wait hits its 10 s hang deadline. This proves a
-// committed record reaches the kernel without waiting for a sync; how soon
-// (write_interval, 10 ms) is a timing figure this test does not assert.
+// Here the parent verifies the default 10 ms write_interval, waits until the
+// child has written kRecords so the file and writer thread are live, notes a
+// later committed index (committed_before_kill) from shared memory, waits
+// until the writer flushes through committed_before_kill to `.tlog` (still
+// orders of magnitude below the 1 h sync and 15 s chunk, bounded only by the
+// 10 s hang deadline per docs/TESTING.md §6.3), and SIGKILLs the child mid-
+// stream: every record up to committed_before_kill must remain intact and in
+// order in `.tlog`.
 // REQ-OPS-31
 TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
+  constexpr auto kExpectedWriteInterval = std::chrono::milliseconds{10};
+  ASSERT_EQ(LogWriter::Options{}.write_interval, kExpectedWriteInterval);
+
   constexpr std::uint64_t kRecords = 20;
+  constexpr std::uint64_t kAdditionalRecords = 10;
   const std::string path = ::testing::TempDir() + "/talos_log_kill_" +
                            std::to_string(::getpid()) + ".tlog";
 
+  MappedProgress progress;
+  ASSERT_NE(progress.ptr, nullptr);
+
   const pid_t child = ::fork();
   ASSERT_GE(child, 0);
-  if (child == 0) LogUntilKilled(path);
+  if (child == 0) LogUntilKilled(path, progress.ptr);
 
   // The deadline only bounds a hang (docs/TESTING.md §6.3).
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds{10};
   bool in_order = true;
   std::uint64_t seen = 0;
-  while ((seen = IntactPrefix(path, in_order)) < kRecords &&
-         std::chrono::steady_clock::now() < deadline) {
+  std::uint64_t committed_before_kill = 0;
+  std::uint64_t flushed = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (seen < kRecords) {
+      seen = IntactPrefix(path, in_order);
+    } else if (committed_before_kill == 0) {
+      const std::uint64_t committed =
+          progress.ptr->committed.load(std::memory_order_acquire);
+      if (committed >= seen + kAdditionalRecords) {
+        committed_before_kill = committed;
+      }
+    } else {
+      flushed = IntactPrefix(path, in_order);
+      if (flushed >= committed_before_kill) break;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   ASSERT_EQ(::kill(child, SIGKILL), 0);
@@ -105,10 +156,20 @@ TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
   ASSERT_TRUE(WIFSIGNALED(status)) << "child exited with " << status;
   ASSERT_GE(seen, kRecords) << "the log held " << seen << " records after 10 s"
                             << " of logging at 200 Hz with no sync due";
+  ASSERT_GE(committed_before_kill, seen + kAdditionalRecords)
+      << "child did not commit " << kAdditionalRecords << " records after seen";
+  ASSERT_GE(flushed, committed_before_kill)
+      << "writer did not flush committed records within 10 s "
+      << "(flushed=" << flushed
+      << ", committed_before_kill=" << committed_before_kill
+      << ", seen=" << seen << ")";
 
   const std::uint64_t kept = IntactPrefix(path, in_order);
   EXPECT_TRUE(in_order) << "records out of order, damaged or wrong";
-  EXPECT_GE(kept, seen) << "the kill lost records already in the file";
+  EXPECT_GE(kept, committed_before_kill)
+      << "SIGKILL lost records already flushed to the log "
+      << "(kept=" << kept << ", committed_before_kill=" << committed_before_kill
+      << ", seen=" << seen << ")";
   ::unlink(path.c_str());
 }
 

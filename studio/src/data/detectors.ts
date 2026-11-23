@@ -251,7 +251,8 @@ export function createFrameDetectors(): FrameDetector[] {
     detect(prev, next) {
       const a = val(prev, 'hw/status/motor_fault_mask'),
             b = val(next, 'hw/status/motor_fault_mask');
-      if (a === undefined || b === undefined || a === b) return [];
+      if (a === undefined || b === undefined || a === b ||
+          !Number.isFinite(a) || !Number.isFinite(b)) return [];
       const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
       const added = after & ~before, cleared = before & ~after;
       return [
@@ -273,7 +274,8 @@ export function createFrameDetectors(): FrameDetector[] {
     detect(prev, next) {
       const a = val(prev, 'hw/status/timed_out_mask'),
             b = val(next, 'hw/status/timed_out_mask');
-      if (a === undefined || b === undefined || a === b) return [];
+      if (a === undefined || b === undefined || a === b ||
+          !Number.isFinite(a) || !Number.isFinite(b)) return [];
       // A bit is set only while that subsystem's requests have been silent
       // for its owner timeout on a ready link (bit i: the i-th
       // actuator-owning subsystem in sorted name order), and every bit

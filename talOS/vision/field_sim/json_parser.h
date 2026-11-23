@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -296,6 +297,11 @@ class Parser {
     if (end == token.c_str()) {
       pos_ = start;
       Fail(error, "invalid number");
+      return false;
+    }
+    if (!std::isfinite(v)) {
+      pos_ = start;
+      Fail(error, "number out of range");
       return false;
     }
     // strtod may consume fewer bytes than the scan (e.g. "1e"); rewind the

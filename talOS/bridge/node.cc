@@ -1,6 +1,7 @@
 #include "node.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -19,9 +20,58 @@
 #include "talOS/events/os/poller.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/introspection/names.h"
+#include "talOS/memory/residency.h"
 #include "talOS/process/process.h"
 
 namespace talos::hardware {
+namespace {
+
+constexpr std::string_view kConfigRefusedEnabledReason =
+    "disable to accept the new configuration";
+
+const char* ConfigAckStatusName(ConfigAckStatus status) {
+  switch (status) {
+    case ConfigAckStatus::kOk:
+      return "ok";
+    case ConfigAckStatus::kInvalidCrc:
+      return "invalid_crc";
+    case ConfigAckStatus::kMalformed:
+      return "malformed";
+    case ConfigAckStatus::kCeilingExceeded:
+      return "ceiling_exceeded";
+    case ConfigAckStatus::kBackendFailed:
+      return "backend_failed";
+  }
+  return "unknown";
+}
+
+// Whether a subsystem's partial request drives no actuator: every addressed
+// motor is kNeutral with valid slot and zero demand and feedforward, every
+// digital output is false, and every PWM output is kOff (a pulse of 0 is the
+// centre pulse, which drives). Mirrors Gateway's DrivesNothing for a single
+// subsystem's partial request.
+bool RequestDrivesNothing(const Command& partial) {
+  for (std::size_t i = 0; i < partial.count; ++i) {
+    const auto& r = partial.motors[i];
+    if (r.mode != Mode::kNeutral || r.slot > 2 || r.demand != 0.0 ||
+        r.feedforward_v != 0.0) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < partial.digital_output_count; ++i) {
+    if (partial.digital_outputs[i].value) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < partial.pwm_output_count; ++i) {
+    if (partial.pwm_outputs[i].mode != PwmMode::kOff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
 
 // Tests only: when set, called with the options of the bridge's --log just
 // before its writer is made, so a test can hold the writer thread
@@ -42,7 +92,7 @@ static_assert(std::string_view{kNodeName} ==
 // 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out
 // at alignof(Message), so the two agree only while this holds.
 static_assert(alignof(bridge::BridgeStatus) == 8);
-static_assert(sizeof(bridge::BridgeStatus) == 264,
+static_assert(sizeof(bridge::BridgeStatus) == 304,
               "BridgeStatus size changed; update docs/DATA_FLOW.md");
 // Each actuator-owning subsystem owns at least one such device.
 static_assert(kMaxMotors + kMaxDigitalOutputs + kMaxPwmOutputs <= 32,
@@ -53,10 +103,13 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
                            uint16_t local_port, bool simulation,
                            uint64_t session_id, std::string log_path,
                            uint64_t log_max_bytes,
-                           std::chrono::nanoseconds log_window)
+                           std::chrono::nanoseconds log_window,
+                           std::string local_ip)
     : robot_config_{std::move(robot_config)},
       config_{robot_config_.hardware},
       remote_ip_{std::move(remote_ip)},
+      local_ip_{local_ip.empty() ? std::string{"0.0.0.0"}
+                                 : std::move(local_ip)},
       remote_port_{remote_port},
       local_port_{local_port},
       simulation_{simulation},
@@ -152,10 +205,45 @@ void HardwareNode::IndexActuators() {
 }
 
 bool HardwareNode::Open() {
-  if (peer_.Open("0.0.0.0", local_port_, remote_ip_.c_str(), remote_port_) !=
-      protocol::UdpStatus::kOk) {
+  const char* const bind_ip = local_ip_.empty() ? "0.0.0.0" : local_ip_.c_str();
+  errno = 0;
+  const protocol::UdpStatus status =
+      peer_.Open(bind_ip, local_port_, remote_ip_.c_str(), remote_port_);
+  if (status != protocol::UdpStatus::kOk) {
+    const int err = errno;
+    const bool local_pinned = std::string_view{bind_ip} != "0.0.0.0";
+    const bool address_absent = status == protocol::UdpStatus::kSocketError &&
+                                (err == EADDRNOTAVAIL || err == ENETUNREACH);
+    if (local_pinned && address_absent) {
+      socket_lost_ = true;
+      socket_never_opened_ = true;
+      reopen_attempted_ = false;
+      std::fprintf(
+          stderr,
+          "hardware_node: local address %s:%u unavailable (%s, errno %d); "
+          "retrying every %llu us until the interface comes up\n",
+          bind_ip, static_cast<unsigned>(local_port_), std::strerror(err), err,
+          static_cast<unsigned long long>(kReopenRetryUs));
+      OpenTopics();
+      return true;
+    }
+    if (err != 0) {
+      std::fprintf(stderr,
+                   "hardware_node: failed to open UDP socket %s:%u -> "
+                   "%s:%u (%s: %s)\n",
+                   bind_ip, static_cast<unsigned>(local_port_),
+                   remote_ip_.c_str(), static_cast<unsigned>(remote_port_),
+                   protocol::UdpStatusName(status), std::strerror(err));
+    } else {
+      std::fprintf(
+          stderr,
+          "hardware_node: failed to open UDP socket %s:%u -> %s:%u (%s)\n",
+          bind_ip, static_cast<unsigned>(local_port_), remote_ip_.c_str(),
+          static_cast<unsigned>(remote_port_), protocol::UdpStatusName(status));
+    }
     return false;
   }
+  socket_never_opened_ = false;
   OpenTopics();
   return true;
 }
@@ -323,18 +411,21 @@ void HardwareNode::PublishIntrospection() {
     set(tracker.source_index, tracker.requests, tracker.requests_skipped);
   }
 
-  // The bridge's loop is its own, so its wake loss is too: the wake
-  // notifications its publishers failed to send, the request topics whose
-  // failed arms its idle-pass guard (kMaxIdlePasses) stopped holding it
-  // awake, and the runs that could not wait on their inputs (OpenWaits).
+  // The bridge's loop composes WakeChannelWait for its request-subscriber
+  // wake channel: report the wake notifications its publishers failed to send
+  // alongside WakeChannelWait's stalled_arms and wake_fallbacks.
   std::uint64_t wake_failures = 0;
   for (auto* publisher : {state_pub_.get(), cmd_pub_.get(), ds_pub_.get()}) {
     if (publisher != nullptr)
       wake_failures += publisher->queue().wake_failures();
   }
   if (status_pub_) wake_failures += status_pub_->queue().wake_failures();
-  registration_->set_wake_loss(wake_failures, wakeups_.stalled_arms,
-                               wakeups_.wait_fallbacks);
+  const event::WakeLoss wake_loss = wake_wait_.loss();
+  registration_->set_wake_loss(wake_failures, wake_loss.stalled_arms,
+                               wake_loss.wake_fallbacks);
+  if (memory::LateLockRefused()) {
+    registration_->note_realtime_refused(process::kStepRingLock);
+  }
   registration_->end_sample();
 }
 
@@ -394,12 +485,29 @@ void HardwareNode::ReopenSocket(uint64_t now_us) {
   if (reopen_attempted_ && now_us - last_reopen_us_ < kReopenRetryUs) return;
   reopen_attempted_ = true;
   last_reopen_us_ = now_us;
-  // A failure (the port taken meanwhile, out of descriptors) is retried
-  // kReopenRetryUs later.
-  if (peer_.Reopen() != protocol::UdpStatus::kOk) return;
-  ++socket_counters_.reopens;
+  ++socket_counters_.reopen_attempts;
+  const char* const bind_ip = local_ip_.empty() ? "0.0.0.0" : local_ip_.c_str();
+  // A failure (address still absent, port taken meanwhile, out of descriptors)
+  // is retried kReopenRetryUs later.
+  const protocol::UdpStatus status =
+      socket_never_opened_
+          ? peer_.Open(bind_ip, local_port_, remote_ip_.c_str(), remote_port_)
+          : peer_.Reopen();
+  if (status != protocol::UdpStatus::kOk) return;
+  if (socket_never_opened_) {
+    socket_never_opened_ = false;
+    socket_lost_ = false;
+    std::fprintf(stderr, "hardware_node: UDP socket %s:%u -> %s:%u open\n",
+                 bind_ip, static_cast<unsigned>(local_port_),
+                 remote_ip_.c_str(), static_cast<unsigned>(remote_port_));
+  } else {
+    ++socket_counters_.reopens;
+  }
   if (!poller_) return;
   try {
+    if (peer_.NativeFd() < 0) {
+      throw std::runtime_error("the UDP socket has no fd");
+    }
     poller_->add_fd(peer_.NativeFd());
   } catch (const std::exception& e) {
     FallBackToPolling(e.what());
@@ -407,6 +515,10 @@ void HardwareNode::ReopenSocket(uint64_t now_us) {
 }
 
 void HardwareNode::Tick(uint64_t now_us) {
+  TickWithBudget(now_us, kReceiveBudget);
+}
+
+void HardwareNode::TickWithBudget(uint64_t now_us, int receive_budget) {
   tick_datagrams_ = 0;
   tick_requests_ = 0;
   ReopenSocket(now_us);
@@ -428,11 +540,15 @@ void HardwareNode::Tick(uint64_t now_us) {
       probe_waiting_ = true;
     }
   }
-  // 1. Process incoming UDP frames from Gateway, at most kReceiveBudget, so
-  // a burst under overload delays rather than stalls the merge below; Run()
-  // ticks again without waiting when the budget runs out.
-  tick_receive_capped_ = true;
-  for (int i = 0; i < kReceiveBudget; ++i) {
+  // 1. Process incoming UDP frames from Gateway, at most `limit`
+  // (min(kReceiveBudget, remaining window datagram budget) under Pass()), so
+  // a burst delays rather than stalls the merge below and never exceeds
+  // kDatagramBudget in a kCpuWindowUs window (REQ-RT-20).
+  const int limit = std::clamp(receive_budget, 0, kReceiveBudget);
+  // When window budget is spent (limit == 0), Pass() throttles via its budget
+  // branch rather than retrying immediately on tick_receive_capped_.
+  tick_receive_capped_ = limit > 0;
+  for (int i = 0; i < limit; ++i) {
     // Closed (SocketCounters), maybe by a State's config push: nothing to
     // read.
     if (!peer_.IsOpen()) {
@@ -440,7 +556,9 @@ void HardwareNode::Tick(uint64_t now_us) {
       break;
     }
     protocol::DecodedFrame frame;
-    const auto status = peer_.TryReceive(&frame);
+    int recv_error = seams_.recv_error != nullptr ? seams_.recv_error() : 0;
+    const auto status = recv_error != 0 ? protocol::UdpStatus::kSocketError
+                                        : peer_.TryReceive(&frame);
     if (status == protocol::UdpStatus::kWouldBlock) {
       tick_receive_capped_ = false;
       break;
@@ -451,9 +569,33 @@ void HardwareNode::Tick(uint64_t now_us) {
         status == protocol::UdpStatus::kDecodeError) {
       ++tick_datagrams_;
     }
+    if (status == protocol::UdpStatus::kSocketError) {
+      if (recv_error == 0) recv_error = peer_.stats().last_recv_error;
+      ++socket_counters_.recv_failures;
+      socket_counters_.last_recv_error = recv_error;
+      if (protocol::ReceiveErrorNeedsNewSocket(recv_error)) {
+        if (poller_ && peer_.NativeFd() >= 0) {
+          poller_->remove_fd(peer_.NativeFd());
+        }
+        peer_.Close();
+        if (!socket_lost_) {
+          socket_lost_ = true;
+          std::fprintf(stderr,
+                       "hardware_node: the UDP socket to the gateway cannot "
+                       "receive (%s); replacing it, nothing is sent until "
+                       "then\n",
+                       std::strerror(recv_error));
+        }
+        tick_receive_capped_ = false;
+        break;
+      }
+      continue;
+    }
     if (status == protocol::UdpStatus::kDecodeError &&
         peer_.stats().last_decode_status ==
             protocol::DecodeStatus::kUnsupportedVersion) {
+      last_version_mismatch_us_ = now_us;
+      mismatched_protocol_version_ = peer_.stats().last_unsupported_version;
       // Once per mismatch: a stale RoboRIO program floods every tick.
       if (!version_mismatch_logged_) {
         std::fprintf(
@@ -468,9 +610,15 @@ void HardwareNode::Tick(uint64_t now_us) {
     }
     if (status != protocol::UdpStatus::kOk) continue;
     version_mismatch_logged_ = false;
+    last_version_mismatch_us_.reset();
+    mismatched_protocol_version_ = 0;
 
     HandleGatewayFrame(frame, now_us);
   }
+
+  // Refresh link readiness before evaluating owner silence in case no State
+  // arrived and the last accepted State has gone stale.
+  UpdateLinkReady(now_us);
 
   // 2. Read subsystem requests and perform timeout neutralization
   bool any_subsystem_active = false;
@@ -488,7 +636,7 @@ void HardwareNode::Tick(uint64_t now_us) {
     if (received) {
       ++tracker.requests;
       ++tick_requests_;
-      tracker.arm_stalled = false;
+      tracker.stall_guard.reset();
       tracker.requests_skipped += received->dropped;
       // Heard from its first request, accepted, refused or undecodable
       // alike: the topic is this subsystem's alone, written only by its
@@ -507,7 +655,13 @@ void HardwareNode::Tick(uint64_t now_us) {
         // stream of bad requests still times the subsystem out, in the merge
         // and on /hw/status alike.
         if (!HasRequestIdentity(tracker, partial)) {
-          ++identity_rejected_;
+          // A superseded all-neutral request racing a controller transition
+          // (e.g. an enable edge) before any request is accepted in the new
+          // epoch is still dropped without merging or refreshing silence, but
+          // does not increment identity_rejected_ (REQ-OPS-20).
+          if (!IsSupersededNeutral(tracker, partial)) {
+            ++identity_rejected_;
+          }
         } else if (!OwnsRequestDevices(tracker, partial)) {
           ++ownership_rejected_;
         } else {
@@ -613,10 +767,10 @@ void HardwareNode::Tick(uint64_t now_us) {
       talos::hardware::Packet cmd_pkt{};
       cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
       if (cmd_pkt.size > 0) {
-        if (cmd_pub_) Publish(*cmd_pub_, 1, cmd_pkt, now_us);
         if (SendToGateway(protocol::FrameType::kHardwareCommand, now_us,
                           cmd_pkt.data.data(),
                           cmd_pkt.size) == protocol::UdpStatus::kOk) {
+          if (cmd_pub_) Publish(*cmd_pub_, 1, cmd_pkt, now_us);
           ++commands_sent_;
           last_sent_cmd_ = full_cmd_;
           last_send_us_ = now_us;
@@ -646,11 +800,38 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
         if (ack.status == ConfigAckStatus::kOk) {
           is_configured_ = true;
           config_push_backoff_us_ = 50000;
+          config_refusal_logged_ = false;
+          last_config_refusal_status_ = ConfigAckStatus::kOk;
+          last_config_refusal_reason_len_ = 0;
         } else {
           is_configured_ = false;
           config_push_backoff_us_ =
               std::min<uint64_t>(config_push_backoff_us_ * 2, 2000000);
           last_push_time_us_ = now_us;
+          const std::size_t reason_len =
+              ::strnlen(ack.reason, sizeof(ack.reason));
+          const std::string_view reason{ack.reason, reason_len};
+          const std::string_view prev_reason{last_config_refusal_reason_.data(),
+                                             last_config_refusal_reason_len_};
+          if (!config_refusal_logged_ ||
+              ack.status != last_config_refusal_status_ ||
+              reason != prev_reason) {
+            if (reason_len > 0) {
+              std::fprintf(stderr,
+                           "hardware_node: gateway refused config (%s): %.*s\n",
+                           ConfigAckStatusName(ack.status),
+                           static_cast<int>(reason_len), ack.reason);
+            } else {
+              std::fprintf(stderr,
+                           "hardware_node: gateway refused config (%s)\n",
+                           ConfigAckStatusName(ack.status));
+            }
+            config_refusal_logged_ = true;
+            last_config_refusal_status_ = ack.status;
+            std::memcpy(last_config_refusal_reason_.data(), ack.reason,
+                        reason_len);
+            last_config_refusal_reason_len_ = reason_len;
+          }
         }
       }
     }
@@ -692,12 +873,27 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
       pending_probe_sample_us_ = state.sample_time_us;
       pending_probe_boot_id_ = state.boot_id;
     }
+    // If the previous State had gone stale before this one arrived, drop
+    // link_ready_ first so the UpdateLinkReady() below treats this as a link
+    // recovery and restarts each owner's silence window; also clear any prior
+    // config refusal from before the outage until the fresh push is answered.
+    if (state_accepted_ && !StateFresh(now_us)) {
+      if (link_ready_) UpdateLinkReady(now_us);
+      config_refusal_logged_ = false;
+      last_config_refusal_status_ = ConfigAckStatus::kOk;
+      last_config_refusal_reason_len_ = 0;
+    }
     last_state_receipt_us_ = now_us;
     state_accepted_ = true;
     if (state.boot_id != last_boot_id_) {
       config_push_backoff_us_ = 50000;
+      config_refusal_logged_ = false;
+      if (last_boot_id_ != 0) {
+        last_config_refusal_status_ = ConfigAckStatus::kOk;
+        last_config_refusal_reason_len_ = 0;
+      }
       // The new boot's Driver Station clock restarted with it.
-      last_ds_sample_time_us_ = 0;
+      last_ds_sample_time_us_.reset();
       ReportGatewayBuild(state);
     }
     // Configured means the current gateway boot acknowledged our config.
@@ -747,12 +943,14 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
 
   // Driver Station packets are forwarded only from the boot the accepted
   // State is in (a retired boot's delayed packet, or one from a boot whose
-  // State has not arrived yet, is dropped), in sample order within it.
+  // State has not arrived yet, is dropped), in strictly increasing sample
+  // order within it.
   if (frame.header.type == protocol::FrameType::kDriverStation) {
     driver_station::DriverStationData data{};
     if (!driver_station::Decode({frame.payload, frame.payload_size}, data) ||
-        data.boot_id != last_boot_id_ ||
-        data.sample_time_us < last_ds_sample_time_us_) {
+        last_boot_id_ == 0 || data.boot_id != last_boot_id_ ||
+        (last_ds_sample_time_us_ &&
+         data.sample_time_us <= *last_ds_sample_time_us_)) {
       return;
     }
     last_ds_sample_time_us_ = data.sample_time_us;
@@ -819,7 +1017,23 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       states_received_ > 0 && now_us > last_state_receipt_us_
           ? now_us - last_state_receipt_us_
           : 0;
+  const bool state_fresh = StateFresh(now_us);
+  const bool hardware_fault = state_fresh && is_configured_ &&
+                              (last_state_flags_ & kHardwareFault) != 0;
+  const bool config_refused_enabled =
+      state_fresh && !is_configured_ &&
+      last_config_refusal_status_ == ConfigAckStatus::kBackendFailed &&
+      std::string_view{last_config_refusal_reason_.data(),
+                       last_config_refusal_reason_len_} ==
+          kConfigRefusedEnabledReason;
+  const bool protocol_mismatch =
+      last_version_mismatch_us_.has_value() &&
+      now_us >= *last_version_mismatch_us_ &&
+      now_us - *last_version_mismatch_us_ <= config_.command_timeout_us;
+  const uint16_t mismatched_protocol_version =
+      protocol_mismatch ? mismatched_protocol_version_ : uint16_t{0};
   const HealthSample& health = latest_state_.health;
+  const protocol::UdpStats& udp = peer_.stats();
   bridge::BridgeStatus status{
       states_received_,
       commands_sent_,
@@ -846,10 +1060,13 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       static_cast<uint32_t>(clock_.window_count()),
       clock_.converged() && clock_.accuracy_valid(),
       health.valid,
+      /*alert_error_hardware_fault=*/hardware_fault,
+      /*alert_error_config_refused_enabled=*/config_refused_enabled,
       health.battery_v,
       health.brownout,
       /*alert_warning_can_bus_unread=*/false,  // can_buses_.Fill
       /*can_bus_count=*/0,
+      /*alert_error_protocol_mismatch=*/protocol_mismatch,
       motor_fault_mask,
       forward_limit_mask,
       reverse_limit_mask,
@@ -860,9 +1077,15 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       static_cast<bridge::GatewayProgram>(latest_state_.build.program),
       latest_state_.build.dirty,
       protocol::kProtocolVersion,
+      mismatched_protocol_version,
       latest_state_.build.revision,
       clock_.uncertainty_us(),
       clock_.round_trip_us(),
+      socket_counters_.send_failures,
+      socket_counters_.reopens,
+      udp.sequence_gaps,
+      udp.decode_failures,
+      udp.send_would_block,
   };
   can_buses_.Fill(status);
   return status;
@@ -938,8 +1161,15 @@ void HardwareNode::ReportLogFailure() {
   }
 }
 
+bool HardwareNode::StateFresh(uint64_t now_us) const {
+  if (!state_accepted_) return false;
+  const uint64_t age_us =
+      now_us > last_state_receipt_us_ ? now_us - last_state_receipt_us_ : 0;
+  return age_us < config_.command_timeout_us;
+}
+
 void HardwareNode::UpdateLinkReady(uint64_t now_us) {
-  const bool ready = state_accepted_ && is_configured_;
+  const bool ready = state_accepted_ && is_configured_ && StateFresh(now_us);
   if (ready && !link_ready_) {
     for (auto& [name, tracker] : subsystems_) {
       tracker.silence_from_us = now_us;
@@ -951,7 +1181,10 @@ void HardwareNode::UpdateLinkReady(uint64_t now_us) {
 
 bool HardwareNode::OwnerSilent(const SubsystemTracker& tracker,
                                uint64_t now_us) const {
-  if (!link_ready_ || !tracker.heard || !tracker.silence_from_us) return false;
+  if (!link_ready_ || !StateFresh(now_us) || !tracker.heard ||
+      !tracker.silence_from_us) {
+    return false;
+  }
   const uint64_t from_us = *tracker.silence_from_us;
   return now_us > from_us && now_us - from_us > tracker.merge.timeout_us;
 }
@@ -1010,7 +1243,23 @@ uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
 }
 
 HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
-  Tick(now_us);
+  // CPU budget: the window restarts at the first pass after it ended.
+  // Evaluated before TickWithBudget() so the receive loop never exceeds the
+  // window's remaining kDatagramBudget (REQ-RT-20), even across staggered
+  // bursts or timed duties that wake mid-window.
+  if (cpu_window_passes_ == 0 || now_us < cpu_window_start_us_ ||
+      now_us - cpu_window_start_us_ >= kCpuWindowUs) {
+    cpu_window_start_us_ = now_us;
+    cpu_window_passes_ = 0;
+    cpu_window_datagrams_ = 0;
+  }
+  const uint64_t remaining_datagrams =
+      cpu_window_datagrams_ < kDatagramBudget
+          ? kDatagramBudget - cpu_window_datagrams_
+          : 0;
+  const int receive_budget =
+      static_cast<int>(std::min<uint64_t>(kReceiveBudget, remaining_datagrams));
+  TickWithBudget(now_us, receive_budget);
   ++wakeups_.passes;
 
   // The per-source counters four times a second, which is enough for a
@@ -1029,84 +1278,63 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
   next_liveness_us_ = now_us + kLivenessBackstopUs;
 
   // Every request subscriber is armed before the loop may sleep: a request
-  // published after its arm notifies request_wake_, and one published
-  // before it fails the arm (talOS/rtms README.md "Wake channel").
-  bool input_waiting = tick_receive_capped_;
+  // published after its arm notifies wake_wait_, and one published before it
+  // fails the arm (talOS/rtms README.md "Wake channel"). Each subscriber runs
+  // its own StallGuard through WakeChannelWait::arm_reader so steady UDP
+  // traffic or another active subsystem cannot mask a stalled request arm.
+  bool retry_immediately = tick_receive_capped_;
   for (auto& [name, tracker] : subsystems_) {
-    tracker.arm_failed = false;
     // One without a slot cannot be armed; each Tick's read retries the
     // claim, and the longest wait bounds the time to the next Tick.
-    if (!tracker.subscriber || !tracker.subscriber->registered()) continue;
-    const bool caught_up = seams_.arm_request != nullptr
-                               ? seams_.arm_request(*tracker.subscriber)
-                               : tracker.subscriber->arm_wake();
-    if (caught_up) {
-      tracker.arm_stalled = false;
-    } else {
-      tracker.arm_failed = true;
-      input_waiting = true;
+    auto* subscriber = tracker.subscriber.get();
+    if (!subscriber || !subscriber->registered()) continue;
+    if (wake_wait_.arm_reader(tracker.stall_guard, [this, subscriber] {
+          return seams_.arm_request != nullptr ? seams_.arm_request(*subscriber)
+                                               : subscriber->arm_wake();
+        })) {
+      retry_immediately = true;
     }
   }
+  wakeups_.stalled_arms = wake_wait_.loss().stalled_arms;
 
   const uint64_t timed_us =
       std::min({NextDutyUs(now_us), next_liveness_us_, next_introspection_us_,
                 now_us + max_wait_us_});
 
-  // CPU budget: the window restarts at the first pass after it ended.
-  if (now_us - cpu_window_start_us_ >= kCpuWindowUs) {
-    cpu_window_start_us_ = now_us;
-    cpu_window_passes_ = 0;
-    cpu_window_datagrams_ = 0;
-  }
   ++cpu_window_passes_;
   cpu_window_datagrams_ += tick_datagrams_;
   if (cpu_window_passes_ >= kPassBudget ||
       cpu_window_datagrams_ >= kDatagramBudget) {
     // Spent: input waits for the window's end, a duty does not.
     ++wakeups_.throttled;
-    idle_passes_ = 0;
     return {std::min(cpu_window_start_us_ + kCpuWindowUs, timed_us), true};
   }
 
-  if (input_waiting) {
-    if (tick_datagrams_ > 0 || tick_requests_ > 0) {
-      idle_passes_ = 0;
-      return {now_us, false};
-    }
-    if (idle_passes_ < kMaxIdlePasses) {
-      ++idle_passes_;
-      return {now_us, false};
-    }
-    // The guard: each topic whose failed arm it now stops holding the loop
-    // awake is a stalled arm, counted once until it arms or delivers again,
-    // as an event loop counts its watchers' (Activity::stalled_arms).
-    for (auto& [name, tracker] : subsystems_) {
-      if (tracker.arm_failed && !tracker.arm_stalled) {
-        tracker.arm_stalled = true;
-        ++wakeups_.stalled_arms;
-      }
-    }
+  if (retry_immediately) {
+    return {now_us, false};
   }
-  idle_passes_ = 0;
   return {timed_us, false};
 }
 
 bool HardwareNode::OpenWaits() {
   // The loop sleeps until there is something to do: a datagram from the
   // gateway, a request on any /hw/request topic (each subscriber's slot
-  // names request_wake_), a stop, or the next time-driven duty.
+  // names wake_wait_), a stop, or the next time-driven duty.
   try {
     poller_.emplace();
-    if (peer_.NativeFd() < 0) {
+    if (peer_.NativeFd() >= 0) {
+      poller_->add_fd(peer_.NativeFd());
+    } else if (!socket_lost_) {
       throw std::runtime_error("the UDP socket has no fd");
     }
-    poller_->add_fd(peer_.NativeFd());
-    if (seams_.make_wake_receiver != nullptr) {
-      request_wake_.emplace(seams_.make_wake_receiver());
-    } else {
-      request_wake_.emplace();
+    if (!wake_wait_.open(*poller_, "hardware_node: cannot wait for input",
+                         static_cast<std::int64_t>(kRetryUs),
+                         seams_.make_wake_receiver)) {
+      CloseWaits();
+      max_wait_us_ = kRetryUs;
+      wakeups_.wait_fallbacks = wake_wait_.loss().wake_fallbacks;
+      return false;
     }
-    poller_->add_fd(request_wake_->fd());
     // A stop (SIGINT, SIGTERM, process::RequestStop) makes the stop pipe
     // readable, which ends the wait at once.
     if (const int stop_fd = talos::process::StopFd(); stop_fd >= 0) {
@@ -1114,7 +1342,7 @@ bool HardwareNode::OpenWaits() {
     }
     for (auto& [name, tracker] : subsystems_) {
       if (tracker.subscriber) {
-        tracker.subscriber->set_wake_receiver(request_wake_->id());
+        tracker.subscriber->set_wake_receiver(wake_wait_.id());
       }
     }
     max_wait_us_ = kMaxWaitUs;
@@ -1130,18 +1358,16 @@ void HardwareNode::FallBackToPolling(const char* reason) {
   // pass every kRetryUs, as a node's loop falls back to polling.
   CloseWaits();
   max_wait_us_ = kRetryUs;
-  ++wakeups_.wait_fallbacks;
-  std::fprintf(stderr,
-               "hardware_node: cannot wait for input (%s); polling it "
-               "every %llu us\n",
-               reason, static_cast<unsigned long long>(kRetryUs));
+  wake_wait_.record_fallback("hardware_node: cannot wait for input", reason,
+                             static_cast<std::int64_t>(kRetryUs));
+  wakeups_.wait_fallbacks = wake_wait_.loss().wake_fallbacks;
 }
 
 void HardwareNode::CloseWaits() {
   for (auto& [name, tracker] : subsystems_) {
     if (tracker.subscriber) tracker.subscriber->set_wake_receiver(0);
   }
-  request_wake_.reset();
+  wake_wait_.close();
   poller_.reset();
 }
 
@@ -1185,7 +1411,7 @@ int HardwareNode::Run(int duration_s) {
   // that break still counts as a run that reached its duration.
   bool reached_duration = false;
   while (!talos::process::stop_requested.load()) {
-    if (request_wake_) request_wake_->drain();
+    wake_wait_.drain();
     const uint64_t now_us = clock_us();
     if (now_us >= end_us) {
       reached_duration = true;
@@ -1220,7 +1446,9 @@ int HardwareNode::Run(int duration_s) {
       }
     }
   }
-  const uint64_t ran_us = clock_us() - start_us;
+  const uint64_t stop_us = clock_us();
+  SendShutdownNeutral(stop_us);
+  const uint64_t ran_us = stop_us - start_us;
   CloseWaits();
 
   PublishIntrospection();
@@ -1250,9 +1478,15 @@ int HardwareNode::Run(int duration_s) {
       static_cast<unsigned long long>(wakeups_.deadline),
       static_cast<unsigned long long>(wakeups_.throttled),
       static_cast<unsigned long long>(wakeups_.wait_fallbacks));
-  std::printf("hardware_node: send_failures=%llu socket_reopens=%llu\n",
-              static_cast<unsigned long long>(socket_counters_.send_failures),
-              static_cast<unsigned long long>(socket_counters_.reopens));
+  const protocol::UdpStats& udp = peer_.stats();
+  std::printf(
+      "hardware_node: send_failures=%llu socket_reopens=%llu "
+      "sequence_gaps=%llu decode_failures=%llu send_would_block=%llu\n",
+      static_cast<unsigned long long>(socket_counters_.send_failures),
+      static_cast<unsigned long long>(socket_counters_.reopens),
+      static_cast<unsigned long long>(udp.sequence_gaps),
+      static_cast<unsigned long long>(udp.decode_failures),
+      static_cast<unsigned long long>(udp.send_would_block));
   // A log that failed or has a gap exits 1, as RunMain does for event-loop
   // nodes.
   bool log_incomplete = false;
@@ -1303,6 +1537,16 @@ bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,
                               config_.command_timeout_us);
 }
 
+bool HardwareNode::IsSupersededNeutral(const SubsystemTracker& tracker,
+                                       const Command& partial) const {
+  return partial.config_id == config_id_ && partial.boot_id == last_boot_id_ &&
+         partial.epoch != 0 && partial.epoch < last_epoch_ &&
+         !tracker.merge.seen &&
+         tracker.merge.Admits(partial.observed_time_us, last_sample_time_us_,
+                              config_.command_timeout_us) &&
+         OwnsRequestDevices(tracker, partial) && RequestDrivesNothing(partial);
+}
+
 bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,
                                       const Command& partial) const {
   const auto owns = [](const auto& owned, uint16_t id) {
@@ -1321,6 +1565,34 @@ bool HardwareNode::OwnsRequestDevices(const SubsystemTracker& tracker,
       return false;
     }
   }
+  return true;
+}
+
+bool HardwareNode::SendShutdownNeutral(uint64_t now_us) {
+  if (last_boot_id_ == 0 || !StateFresh(now_us) ||
+      latest_state_.config_id != config_id_ || !GatewayReady(latest_state_) ||
+      (!peer_.IsOpen() && frame_sink_.send == nullptr)) {
+    return false;
+  }
+  NeutralizeAll();
+  full_cmd_.config_id = config_id_;
+  full_cmd_.boot_id = last_boot_id_;
+  full_cmd_.epoch = last_epoch_;
+  full_cmd_.observed_time_us = last_sample_time_us_;
+  talos::hardware::Packet cmd_pkt{};
+  cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
+  if (cmd_pkt.size == 0) return false;
+  if (SendToGateway(protocol::FrameType::kHardwareCommand, now_us,
+                    cmd_pkt.data.data(),
+                    cmd_pkt.size) != protocol::UdpStatus::kOk) {
+    return false;
+  }
+  if (cmd_pub_) Publish(*cmd_pub_, 1, cmd_pkt, now_us);
+  ++commands_sent_;
+  last_sent_cmd_ = full_cmd_;
+  last_send_us_ = now_us;
+  have_last_sent_ = true;
+  last_sent_had_active_subsystem_ = false;
   return true;
 }
 

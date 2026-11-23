@@ -40,6 +40,8 @@ int main(int argc, char** argv) {
         options.output_dir = argv[++i];
       } else if (arg == "--remote" && i + 1 < argc) {
         options.remote = argv[++i];
+      } else if (arg == "--local-address" && i + 1 < argc) {
+        options.local_address = argv[++i];
       } else if (arg == "--remote-port" && i + 1 < argc) {
         options.remote_port = talos::config::ParsePortFlag(arg, argv[++i]);
       } else if (arg == "--local-port" && i + 1 < argc) {
@@ -56,12 +58,17 @@ int main(int argc, char** argv) {
         options.sim_gateway_args.emplace_back(argv[++i]);
       } else if (arg == "--start-studio-bridge") {
         options.start_studio_bridge = true;
+      } else if (arg == "--serve-refusal") {
+        options.serve_refusal = true;
       } else if (arg == "--studio-http-port" && i + 1 < argc) {
-        options.studio_http_port = talos::config::ParsePortFlag(arg, argv[++i]);
+        options.studio_http_port =
+            talos::config::ParsePortFlag(arg, argv[++i], /*allow_zero=*/true);
       } else if (arg == "--allow-graph-errors") {
         options.allow_graph_errors = true;
       } else if (arg == "--describe-only") {
         options.describe_only = true;
+      } else if (arg == "--check-session-lock") {
+        options.check_session_lock = true;
       } else if (arg == "--describe-as-launch") {
         options.describe_as_launch = true;
       } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
@@ -70,6 +77,8 @@ int main(int argc, char** argv) {
         options.replay_inputs = argv[++i];
       } else if (arg == "--only" && i + 1 < argc) {
         options.only = argv[++i];
+      } else if (arg == "--allow-capped-replay") {
+        options.allow_capped_replay = true;
       } else if (arg == "--max-restarts" && i + 1 < argc) {
         options.max_restarts = std::stoi(argv[++i]);
         if (*options.max_restarts < 0) {
@@ -87,18 +96,23 @@ int main(int argc, char** argv) {
                "[--output-dir PATH] "
                "[--duration-s N] [--session-id ID] [--sim] "
                "[--start-sim-gateway [--sim-gateway-arg ARG]...] "
-               "[--start-studio-bridge] "
+               "[--start-studio-bridge] [--serve-refusal] "
                "[--studio-http-port PORT] "
                "[--describe-only [--describe-as-launch]] "
+               "[--check-session-lock] "
                "[--allow-graph-errors] [--describe-timeout-ms MS] "
                "[--max-restarts N] "
-               "[--remote IP] [--remote-port PORT] [--local-port PORT] "
-               "[--replay-inputs SESSION_DIR --only NODE]\n"
+               "[--remote IP] [--local-address IP] [--remote-port PORT] "
+               "[--local-port PORT] "
+               "[--replay-inputs SESSION_DIR --only NODE "
+               "[--allow-capped-replay]]\n"
                "\n"
                "  --bundle PATH          launch from a bundle directory "
                "(assembled by talos_bundle)\n"
                "  --remote IP            controller address; overrides "
                "[robot] controller_address\n"
+               "  --local-address IP     local bind IPv4 address; overrides "
+               "[robot] local_address (default: wildcard 0.0.0.0)\n"
                "  --remote-port PORT     controller port; overrides "
                "[robot] controller_port (default 5802)\n"
                "  --local-port PORT      local bind port; overrides "
@@ -107,10 +121,24 @@ int main(int argc, char** argv) {
                "gateway's probe and runtime;\n"
                "                         repeat for each argument, requires "
                "--start-sim-gateway\n"
+               "  --studio-http-port PORT  Studio HTTP port; overrides "
+               "[studio] http_port (0 lets\n"
+               "                         the OS pick a free port, recorded in "
+               "manifest.json)\n"
+               "  --serve-refusal        with --start-studio-bridge, keep the "
+               "Studio bridge running\n"
+               "                         on a phase-1 refusal so /drive shows "
+               "LAUNCH REFUSED instead\n"
+               "                         of BRIDGE LINK until stopped (still "
+               "exits 1)\n"
                "  --describe-only        ask every node in the config "
                "what it is, lint the\n"
                "                         graph they describe, and exit "
                "without starting a robot\n"
+               "  --check-session-lock   test whether this namespace's "
+               "session lock is free\n"
+               "                         (exits 0 if free, 1 naming the "
+               "holder if held)\n"
                "  --describe-as-launch   with --describe-only, also refuse "
                "what the same\n"
                "                         launch would refuse before its "
@@ -132,7 +160,12 @@ int main(int argc, char** argv) {
                "the topics the session\n"
                "                         in DIR logged at their "
                "recorded times; its log goes\n"
-               "                         to --output-dir\n";
+               "                         to --output-dir\n"
+               "  --allow-capped-replay  with --replay-inputs, replay "
+               "byte-capped logs from\n"
+               "                         the start of their kept window "
+               "(warns of pre-window\n"
+               "                         loss; still refuses uncapped gaps)\n";
         return 0;
       } else {
         throw std::invalid_argument("unknown argument: " + arg);

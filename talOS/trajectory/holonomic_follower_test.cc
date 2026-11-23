@@ -340,8 +340,8 @@ TEST(HolonomicFollowerTest, FinishesOnlyAtTheEndAndInTolerance) {
           .finished);
 }
 
-// Guards: a non-finite pose, time or period gives zero speeds and !valid,
-// and does not disturb the integrator.
+// Guards: a non-finite pose, time or period, or a negative period gives zero
+// speeds and !valid, and does not disturb the integrator.
 // REQ-DEV-15
 TEST(HolonomicFollowerTest, NonFiniteInputCommandsZero) {
   FollowerConfig config;
@@ -350,6 +350,7 @@ TEST(HolonomicFollowerTest, NonFiniteInputCommandsZero) {
   HolonomicFollower follower(config);
   HolonomicFollower reference(config);
   const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
   const Trajectory trajectory = AtOrigin();
   for (const FollowerOutput& out :
        {follower.step(trajectory, 0.1, MakePose(nan, 0, 0), 0.02,
@@ -357,6 +358,12 @@ TEST(HolonomicFollowerTest, NonFiniteInputCommandsZero) {
         follower.step(trajectory, nan, MakePose(0, 0, 0), 0.02,
                       SpeedsFrame::kRobot),
         follower.step(trajectory, 0.1, MakePose(0, 0, 0), nan,
+                      SpeedsFrame::kRobot),
+        follower.step(trajectory, 0.1, MakePose(0, 0, 0), -0.02,
+                      SpeedsFrame::kRobot),
+        follower.step(trajectory, 0.1, MakePose(0, 0, 0), inf,
+                      SpeedsFrame::kRobot),
+        follower.step(trajectory, 0.1, MakePose(0, 0, 0), -inf,
                       SpeedsFrame::kRobot),
         follower.step(Trajectory{}, 0.1, MakePose(0, 0, 0), 0.02,
                       SpeedsFrame::kRobot)}) {
@@ -370,6 +377,82 @@ TEST(HolonomicFollowerTest, NonFiniteInputCommandsZero) {
   const FollowerOutput b = reference.step(trajectory, 0.1, MakePose(-1, 0, 0),
                                           0.02, SpeedsFrame::kField);
   EXPECT_EQ(a.speeds.vx_mps, b.speeds.vx_mps);
+}
+
+// Guards: huge finite position errors (where kp * error or hypot(vx, vy)
+// overflows double, or error flips sign with kd == 0) still clamp cleanly to
+// max_linear_mps with finite speeds and valid == true, and a huge finite dt_s
+// spike keeps integrator anti-windup and derivative outputs finite.
+// REQ-DEV-15
+TEST(HolonomicFollowerTest, HugeFiniteErrorAndDtClampWithoutNaN) {
+  const Trajectory trajectory = AtOrigin();
+  {
+    FollowerConfig config;
+    config.translation.kp = 2.0;
+    config.max_linear_mps = 1.5;
+    config.max_angular_radps = 2.0;
+    HolonomicFollower follower(config);
+
+    // kp * x_error overflows to +inf; vy is 0.
+    const FollowerOutput single_axis = follower.step(
+        trajectory, 0.0, MakePose(-1e308, 0.0, 0.0), 0.02, SpeedsFrame::kField);
+    ASSERT_TRUE(single_axis.valid);
+    EXPECT_TRUE(std::isfinite(single_axis.speeds.vx_mps));
+    EXPECT_TRUE(std::isfinite(single_axis.speeds.vy_mps));
+    EXPECT_NEAR(single_axis.speeds.vx_mps, 1.5, 1e-12);
+    EXPECT_NEAR(single_axis.speeds.vy_mps, 0.0, 1e-12);
+
+    // Opposite-sign huge error on the next step with kd == 0 must not produce
+    // 0 * (-inf) = NaN in the derivative term.
+    const FollowerOutput sign_flip = follower.step(
+        trajectory, 0.02, MakePose(1e308, 0.0, 0.0), 0.02, SpeedsFrame::kField);
+    ASSERT_TRUE(sign_flip.valid);
+    EXPECT_TRUE(std::isfinite(sign_flip.speeds.vx_mps));
+    EXPECT_NEAR(sign_flip.speeds.vx_mps, -1.5, 1e-12);
+
+    // Both axes overflow kp * error to +inf.
+    follower.reset();
+    const FollowerOutput both_inf =
+        follower.step(trajectory, 0.0, MakePose(-1e308, -1e308, 0.0), 0.0,
+                      SpeedsFrame::kField);
+    ASSERT_TRUE(both_inf.valid);
+    EXPECT_TRUE(std::isfinite(both_inf.speeds.vx_mps));
+    EXPECT_TRUE(std::isfinite(both_inf.speeds.vy_mps));
+    EXPECT_NEAR(std::hypot(both_inf.speeds.vx_mps, both_inf.speeds.vy_mps), 1.5,
+                1e-12);
+    EXPECT_GT(both_inf.speeds.vx_mps, 0.0);
+    EXPECT_GT(both_inf.speeds.vy_mps, 0.0);
+
+    // Both components finite (1.5e308) while hypot(vx, vy) overflows to +inf.
+    follower.reset();
+    const FollowerOutput hypot_overflow =
+        follower.step(trajectory, 0.0, MakePose(-0.75e308, -0.75e308, 0.0), 0.0,
+                      SpeedsFrame::kField);
+    ASSERT_TRUE(hypot_overflow.valid);
+    EXPECT_NEAR(hypot_overflow.speeds.vx_mps, 1.5 / std::sqrt(2.0), 1e-12);
+    EXPECT_NEAR(hypot_overflow.speeds.vy_mps, 1.5 / std::sqrt(2.0), 1e-12);
+  }
+
+  // Huge finite dt_s spike with integral and derivative gains enabled.
+  {
+    FollowerConfig config;
+    config.translation = {
+        .kp = 0.0, .ki = 1.0, .kd = 0.5, .integral_limit = 0.5};
+    config.max_linear_mps = 4.0;
+    HolonomicFollower follower(config);
+    const FollowerOutput spike = follower.step(
+        trajectory, 0.1, MakePose(-10.0, 0.0, 0.0), 1e308, SpeedsFrame::kField);
+    ASSERT_TRUE(spike.valid);
+    EXPECT_NEAR(spike.speeds.vx_mps, 0.5, 1e-12);
+    EXPECT_TRUE(std::isfinite(spike.speeds.vy_mps));
+    EXPECT_TRUE(std::isfinite(spike.speeds.omega_radps));
+
+    // Following normal step uses clamped integral and remains finite.
+    const FollowerOutput next = follower.step(
+        trajectory, 0.12, MakePose(0.0, 0.0, 0.0), 0.02, SpeedsFrame::kField);
+    ASSERT_TRUE(next.valid);
+    EXPECT_TRUE(std::isfinite(next.speeds.vx_mps));
+  }
 }
 
 // Guards: bad configuration is refused at construction, naming the field.

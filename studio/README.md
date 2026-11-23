@@ -104,9 +104,10 @@ bridge at `/drive` (REQ-OPS-34). It draws the layout `[studio] dashboard` names
 [telemetry README](../talOS/telemetry/README.md#dashboard-layout)) from the
 `/drive` feed ([bridge README](bridge/README.md#driver-dashboard-feed)). It is
 plain TypeScript with no React, a second entry of the same Vite build
-([`vite.config.mjs`](vite.config.mjs)), so it loads about 51 kB
+([`vite.config.mjs`](vite.config.mjs)), so it loads about 55 kB
 (`assets/drive-*.js`, `assets/drive-*.css` and the chunk it shares with
-Studio: the telemetry decoder and the alert model) and makes no request beyond
+Studio, `assets/geometry-*.js`: field geometry, the telemetry decoder and the
+alert model) and makes no request beyond
 the bridge. Light and dark follow the browser's colour scheme.
 
 - [`src/drive/feed.ts`](src/drive/feed.ts) (`DriveModel`) holds the one socket,
@@ -115,8 +116,10 @@ the bridge. Light and dark follow the browser's colour scheme.
   calls `tick(now)` every 100 ms.
 - [`src/drive/view.ts`](src/drive/view.ts) renders each widget as HTML text,
   and its `Painter` replaces only a widget whose text changed;
-  [`src/drive/main.ts`](src/drive/main.ts) loads the layout and gives the
-  painter the page's elements.
+  [`src/drive/reload.ts`](src/drive/reload.ts) (`LayoutReloader`) re-fetches
+  `/drive/layout.json` on reconnect and mid-connection session/dictionary
+  changes; [`src/drive/main.ts`](src/drive/main.ts) loads the layout and gives
+  the painter the page's elements.
 
 What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 
@@ -147,16 +150,27 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   but no new tick; or none 1.5 s after connecting, the time a refilling bucket
   may take to send the dictionary, which until then reads as connecting), then
   the hardware bridge (HARDWARE BRIDGE: no `/hw/status` sample, so
-  `hardware_node` on the main processor publishes nothing) and the RoboRIO
-  link (`hw/status/alert_error_link_lost`). It judges those two only when the
-  feed carries that channel, which it does whenever the dictionary has it
-  (`/drive/layout.json` lists it in `"channels"` whatever the widgets); a
-  graph without the hardware bridge has no such channel and reports neither.
+  `hardware_node` on the main processor publishes nothing), protocol mismatch
+  (PROTOCOL MISMATCH: `hw/status/alert_error_protocol_mismatch`, checked before
+  link lost so a partial deploy is named instead of a generic lost link) and
+  the RoboRIO link (`hw/status/alert_error_link_lost`). It judges those only
+  when the feed carries those channels, which it does whenever the dictionary
+  has them (`/drive/layout.json` lists both in `"channels"` whatever the
+  widgets); a graph without the hardware bridge has no such channels and
+  reports none.
 - A drawing error keeps the last grid, marks every widget stale with a
   dashed red border, and says DRAWING ERROR on the status line until a draw
   succeeds.
-- The layout is read once, when the page loads: after the bridge restarts
-  with an edited layout, reload the page.
+- On every WebSocket reconnect (and on a mid-connection session or telemetry
+  dictionary/stream change), `/drive/layout.json` is re-fetched with
+  `cache: 'no-store'`. An unchanged layout keeps the existing grid elements and
+  list scroll positions; an edited layout updates the title, grid, widgets,
+  tracked histories and carried-channel mask in place without losing latched
+  alerts or forcing a page reload. If a layout reload fetch or validation
+  fails, the page fails closed: it keeps the top status line live, shows a
+  `LAYOUT ERROR` row naming the error, marks and freezes the previous grid
+  until a reload succeeds, and retries every 1 s (backing off to 5 s after 3
+  consecutive failures, and pausing while disconnected or replaced).
 - On a close or error it reconnects every 1 s, one socket at a time: each
   attempt starts 1 s after the previous one started, so a connect that has
   not opened by then is abandoned for the next, and a socket silent for 2 s
@@ -169,11 +183,13 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   from the channel's labels, or `routine #N` out of range. Subsystems lists
   the drive summary's nodes, each with one state word, the most severe:
   `FAILING` (quarantined: the launcher paused its restarts, so it is not
-  running), `unknown` when the registry could not be read, `DOWN`, `UP`.
+  running), `unknown` when the registry could not be read, `DOWN`, `HELD`
+  (alive, `outputs_held`: the devices flush is holding outputs with no live
+  target), `UP`.
   A widget whose `nodes` names them lists exactly those, one the summary
   does not list reading `unknown`. Failed nodes come first (critical ones
-  before others), then one missing from the summary, one driving from a
-  target lane, critical ones, and the rest.
+  before others), then one holding outputs (`HELD`), one missing from the
+  summary, one driving from a target lane, critical ones, and the rest.
 - Lists (subsystems, checks, alerts) never hide a row: rows are 22 px, in as
   many columns as the cell's width holds (subsystems at least 140 px wide,
   checks 220 px), and a list that still overflows scrolls. A list's body is
@@ -187,7 +203,7 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   reads; `listRowsFit` computes from them that the 2026 layout's subsystems
   cell holds 20 rows at 1366x768 (two columns of 10) and 18 at 1280x720
   (two of 9), and its pre-match cell 12 and 10. The
-  [browser check](#driver-dashboard-in-a-browser) sees the 7 subsystem rows
+  [browser check](#driver-dashboard-in-a-browser) sees the 8 subsystem rows
   and 6 checks of a simulated bench session whole at both sizes, in a
   layout of its own. A row too narrow gives up its note (restarts, drives) first, then
   its name down to 64 px (ellipsized; the tooltip has the whole name and the
@@ -200,20 +216,23 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 - A widget kind it does not draw is an "Unsupported widget" cell, and one
   with no cell the page can read is counted on the status line. A message
   that does not decode is counted on the status line (`N malformed messages
-  counted`). A text message, or a binary one before any value page of the
-  connection decoded and within 1.5 s of its opening (before the
-  dictionary), is then ignored. A binary one after that grace with no value
-  page decoded closes the connection and reconnects: the dictionary and a
-  keyframe come within it, so the feed is one the page cannot read (a page
-  from another bridge version fails every page, the dictionary included) or
-  they were lost. So does a binary one after a value page decoded, since the
-  updates carry only changes and a keyframe's first page clears every
+  counted`). A text message is then ignored. A binary message that fails to
+  decode before any value page of the connection decoded and within 1.5 s of
+  its opening (before the dictionary) waits out that 1.5 s grace; if a valid
+  dictionary and value page arrive within the grace the connection recovers,
+  otherwise the connection closes and reconnects once the 1.5 s grace passes
+  (even if no further binary message arrives). A binary one after that grace
+  with no value page decoded closes the connection and reconnects at once: the
+  dictionary and a keyframe come within it, so the feed is one the page cannot
+  read (a page from another bridge version fails every page, the dictionary
+  included) or they were lost. So does a binary one after a value page decoded,
+  since the updates carry only changes and a keyframe's first page clears every
   channel, so a lost page would leave a value wrong or absent. That close is
   the feed's fault, not the link's: the status line reads TELEMETRY
   `Telemetry feed could not be decoded: reload the page` until a later
   connection decodes a value page or stays open past 1.5 s without a binary
-  message that fails to decode (one that fails within the 1.5 s keeps the
-  line until the next one closes the connection), and after 3 such closes
+  message that fails to decode (one that fails within the 1.5 s keeps the line
+  until the grace expires and closes the connection), and after 3 such closes
   in a row (each within
   10 s of its connection opening) attempts start 5 s apart instead of 1 s,
   so a feed that never decodes does not spend the slot's byte budget on a
@@ -226,8 +245,9 @@ out, which the unit tests' fake surface cannot. Its subject is the bench
 robot's physics simulation with the Studio bridge and a dashboard of its own
 ([`tests/browser/robot.toml`](tests/browser/robot.toml), the bench's graph as
 `robot_physics_sim.toml` runs it plus `[studio]`, and
-[`tests/browser/dashboard.toml`](tests/browser/dashboard.toml), a full 12x8
-grid whose subsystems list holds the session's seven rows; the config's
+[`tests/browser/dashboard.toml`](tests/browser/dashboard.toml), a 12x8 grid
+filled except for its bottom-right 2x2 corner whose subsystems list holds the
+session's eight rows; the config's
 `//studio:browser_graph_test` and `//studio:browser_manifest_sync_test` keep
 it launchable). It launches that on ports and a shared-memory namespace of its
 own, opens `/drive` in the host's headless Chromium or Chrome and drives it
@@ -247,22 +267,33 @@ reads OK, it asserts from the live DOM:
   the subsystems and checks lists fit without scrolling (that rows whose
   names differ only past the cell's width read differently is
   `tests/drive.test.ts`'s, on the 2026 layout: the bench has no such rows);
-- at 1366x500, where the subsystems list scrolls: every visible row is whole
-  and the heading's `N above` / `+N below` equals the rows the boxes show,
-  after a scroll by script too; scrolled to the bottom and to the middle, the
-  list keeps its `scrollTop` when SIGKILLing `swerve_module` (the launcher
-  restarts it) changes that row; the list's heading and words are whole;
+- at 1366x500 (subsystems scroll) and 1366x300 (alerts scroll): every visible
+  row is whole and the heading's `N above` / `+N below` equals the rows the
+  boxes show, after a scroll by script too; scrolled to the bottom and to the
+  middle, the subsystems list keeps its `scrollTop` when SIGKILLing
+  `swerve_module` (the launcher restarts it) changes that row; the list's
+  heading and words are whole, and at 1280x720 the subsystems session label
+  yields (ellipsizes) while the heading and out-of-view count stay whole;
 - with the `telemetry` node SIGSTOPped, every widget but subsystems reads
-  STALE within REQ-OPS-36's 500 ms of the producer's last tick at the latest
+  STALE (dimmed, struck-through, last value kept) past `STALE_MS` (300 ms) and
+  within REQ-OPS-36's 500 ms of the producer's last tick at the latest
   (the page's `performance.now()` read just before the stop, plus one 10 ms
-  producer period) and the status line reads TELEMETRY; after SIGCONT the
-  page is current again.
+  producer period) and the status line reads TELEMETRY; a wall-clock jump past
+  `STALE_MS` triggers sleep detection (every widget including subsystems
+  stale) until a new tick arrives; returning from a hidden tab repaints
+  synchronously inside `visibilitychange`; after SIGCONT the page is current
+  again;
+- live HTTP checks on `/drive`, `/`, hashed assets, `/drive/layout.json`, and
+  `/drive/summary.json` confirm the served status codes, bodies, and
+  `Cache-Control` headers.
 
 Every wait is on an event (a file change, a DOM mutation, an animation
-frame), bounded only against a hang. The launcher refuses port 0, so the
-test reserves the bridge's and the gateway link's ports and releases them
-before the launch; a member that then cannot bind one fails the run at
-once, naming the port and the member's log line. Any exit of the test,
+frame), bounded only against a hang. Studio uses `--studio-http-port 0` (its
+OS-assigned port is read from `manifest.json`), while the launcher refuses
+port 0 for the gateway link (`--remote-port`, `--local-port`), so the test
+reserves those two ports and releases them before the launch; a member that
+then cannot bind an explicit port fails the run at once, naming the port and
+the member's log line. Any exit of the test,
 SIGTERM from Bazel's timeout included, stops the session and the browser,
 which run in sessions of their own. A failed check saves a screenshot and
 the failing elements' CSS path, outerHTML and geometry (`<label>.png`,
@@ -348,8 +379,11 @@ remembers, are not there (the browser keeps them per origin).
 
 While a recording is open it replaces the live view on every page, and the
 footer becomes its transport: step back and forward by the step size, play
-and pause at 1x, 2x or 4x, a slider over the whole session, and the playhead
-as session time (from the session's start) and wall time. Each stretch where
+and pause at 1x, 2x or 4x, a slider over the whole session, timeline lanes
+for Driver Station modes (or a striped bar when hardware packets were not
+decoded), alert intervals, and node restarts/unclean exits from
+`timeline.json`, and the playhead as session time (from the session's start)
+and wall time. Each stretch where
 a process's event log dropped records (a log gap in `bounds.json`'s `gaps`)
 is a warning-coloured band over the slider, at least a sliver wide, whose
 tooltip names the process, the duration, the records, dispatches and sends
@@ -371,13 +405,26 @@ shown in the footer with **Retry**; panels keep what they last showed.
 |---|---|
 | Plot | Each channel decimated to the plot's pixel width rounded up to 256, 512, 1024, 2048 or 4096 buckets (so a plot wider than 4096 px gets fewer buckets than pixels), so resizing a plot requests again only where it crosses one, and fetched in as many requests as the server's limit on channels × buckets (its `bounds.json`) needs: the line is each bucket's last sample, at that sample's own publication time, and a bucket of more than one sample also draws its min-to-max range. The window ends at the playhead; "All history" is the session from its start to the playhead. |
 | Field | The pose estimator's pose at the playhead (no pose while its `valid` is false), the trail and camera observations over the window. |
-| Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the snapshot it came from (the snapshot's own time, as live measures against its frame's: a snapshot still trailing a playing playhead does not age its readings), and the alerts active there; the system graph, events, node selections and the alert latch are live-only and show as absent. |
-| Every other panel | "Not available for recorded sessions yet." |
+| 3D Viewport | The chassis pose at the playhead through `useChassis()` (with the same staleness and `pose_topic` rules as Field) and optional local GLB field model. |
+| Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the snapshot it came from (the snapshot's own time, as live measures against its frame's: a snapshot still trailing a playing playhead does not age its readings), and the alerts active and latched up to the playhead from `timeline.json`; the live system graph and node selections are live-only and show as absent. |
+| Subsystems | Discovered subsystem state/status channels, sparklines and demand-vs-measured pairs at the playhead; live registry target selections, liveness, loop rate and latency are absent (`—`) rather than showing stale live state. |
+| Vision | Discovered camera health, FPS, latency, tag count, valid rate, dropped-frame delta, std devs, disagreement and time-aligned observation x/y error against the estimator or sim truth over decimated recorded series. |
+| Events | Chronological events from `timeline.json` and `bounds.json` (`gaps`): Driver Station mode transitions (or a notice when hardware packets were not decoded), alert activations and clears, node restarts and unclean exits from `manifest.json`, and log gaps; clicking an event seeks the recording to its timestamp. |
+| Health | Recorded playback status, `bounds.json` log gaps, active and latched alerts at the playhead, node run history and restarts from `timeline.json`, and the session's declared graph (`declared.json`, when present); explicitly notes that live registry liveness is not present in recordings rather than fabricating live rows. |
+| Inspector | Every channel's value, unit and sample age at the playhead via `DataSource.channelSample`, with 30 s sparklines fetched only for visible expanded numeric channels (capped to 64 channels per render on large recorded dictionaries). |
+| Hardware link | `/hw/status` power, CAN bus utilization (labeled from `declared.json`'s `can_buses`), link age, clock offset, counters and fault/limit bitmasks at the playhead (or the `hardware_not_decoded` notice when hardware packets were not decoded). |
+| Session | The recording's `manifest.json` header and process table (restarts, exit codes/signals/reasons, recorder status, delivery loss, record counts, log paths) merged with `declared.json`; live registry columns (`Alive`, `Loop`, `Latency`) show `—`. |
+| Frames | Offline local-disk camera frame browser (works identically with or without a recording open). |
+| System, Timing, Agent (live-only) | Live-only (`recorded: false`): System and Timing read the live shared-memory registry, and Agent queries the live telemetry worker/headless agent, none of which are stored in `.tlog` recordings. |
 
-Values carry the channel names live telemetry uses. The chassis pose differs:
-live, it is the topic `[studio] pose_topic` names; on a recording, it is the
-estimator that the dictionary shows (the one with
-`<owner>/state/observation_accepted_count`).
+Values carry the channel names live telemetry uses. The chassis pose honors
+`[studio] pose_topic` both live and on a recording (read from the session's
+config via `bounds.json`), falling back on a recording to the estimator that
+the dictionary shows (the one with `<owner>/state/observation_accepted_count`)
+when `pose_topic` is unset or its config is unavailable. Recorded plots break
+lines only at real `bounds.json` log gaps and `timeline.json` process
+restart/exit boundaries, drawing smoothly across normal sparse multi-channel
+buckets.
 
 ## Run
 
@@ -443,9 +490,17 @@ listens on 127.0.0.1 only (there is no flag to change that), and refuses a
 port another listener holds, exiting with `cannot listen on 127.0.0.1:<port>`
 (it never shares a port, as uSockets' `SO_REUSEPORT` default would). It serves the
 review API under `/review/`: `sessions.json`, and per session
-`channels.json`, `bounds.json`, `snapshot?t_ns=` and
-`series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes are in
-[`review/review.h`](review/review.h). Every other path is a file of the built
+`channels.json`, `bounds.json`, `timeline.json`, `declared.json`,
+`manifest.json`, `snapshot?t_ns=` and `series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes
+are in [`review/review.h`](review/review.h). `timeline.json` summarises
+Driver Station mode transitions (empty when `hardware_not_decoded` is true),
+alert active intervals across every `ChannelInfo.alert != None` channel, and
+`manifest.json`'s `nodes[].runs[]` mapped via `origin_wall_ns` (with
+`end_wall_ns == 0` as `null`). `declared.json` serves the session's
+`graph.json` verbatim (up to 1 MiB, `kMaxDeclaredBytes`), and `manifest.json`
+serves the session's `manifest.json` verbatim (up to 4 MiB,
+`kMaxManifestBytes`), each returning 404 when absent.
+Every other path is a file of the built
 Studio (`//studio:web_dist`, from the binary's runfiles, or `--webroot`), so a
 Studio opened there reads the API from its own origin; a path that leaves
 the webroot is refused. A session id is one directory name of the library; a
@@ -518,16 +573,18 @@ Opening a session streams it once, merged, and keeps per log file one
 24-byte checkpoint per second of event time that holds records other than
 GAP records (where that
 second starts, and which sources recorded a value in it, a SEND or MESSAGE
-record). A series seeks to the checkpoints it needs and reads those seconds
-only, one second either side of its range by event time: a message received
-or sent more than a second from its publication time is not found. A
+record), plus each file's observed maximum second-level lead/lag between
+checkpoint event time and publication time (`max_lead_s` / `max_lag_s`), and a
+lazy out-of-line presence bitset allocated only when a file records source ids
+>= 63 (0 bytes for <= 63 sources). A series seeks to the checkpoints it needs
+and reads only those seconds widened by `max_lag_s` / `max_lead_s`, so messages
+published more than a second before or after receipt are still found. A
 snapshot at `t` reads, per log file and per topic source in it, the latest
-second (up to the one after `t`'s) that holds a value of that source, each
-such second once, and the source's next earlier such second only when that
-one yields none (every value in it published after `t`): normally one second
-per source, however long ago the topic was last published. Source ids from 63 on
-share one bit of the checkpoint, so such a source may also read seconds that
-hold only another's values. No log file is read whole.
+seconds (up to `floor(t) + max_lead_s`) that hold a value of that source, each
+such second once, stopping once no earlier checkpoint can hold a newer
+publication (`checkpoint.second < floor(found.publish_ns) - max_lag_s`):
+normally one second per source, however long ago the topic was last published.
+No log file is read whole.
 Series buckets (min, max, last, count) are kept for repeated requests in an
 LRU of at most `--cache-mb`. One series request asks for at most 262,144
 values (channels × points, `kMaxSeriesValues`; 400 past it) and holds at
@@ -535,10 +592,15 @@ most 80 B per value while it is answered (its buckets, each bucket's last
 time and the response), so at most 20 MiB (`kMaxSeriesRequestBytes`). At
 most 4 sessions are open at once (`kMaxOpenSessions`); opening another
 closes the least recently used, whose index is rebuilt when it is opened
-again. So the heap is the open sessions' indexes (24 B per log-file second,
-48 B per GAP record, plus their channel names), plus that cache, plus one request's ceiling (a
-series' 20 MiB; a snapshot's answer, about 100 B per channel of its
-session), plus one read window per log being read (REQ-OPS-42). On a
+again. Each open session's timeline is also bounded by fixed ceilings
+(`kMaxTimelineModes = 4096` and `kMaxTimelineAlerts = 4096`, 24 B each =
+96 KiB per lane, plus `kMaxTimelineRuns = 4096`), with any overflow reported
+in `modes_dropped`, `alerts_dropped` and `runs_dropped` (`runs_dropped` also
+sums each node's manifest `runs_dropped`). So the heap is the open sessions'
+indexes (24 B per log-file second,
+48 B per GAP record, plus their channel names and bounded timeline), plus that cache, plus one request's ceiling (a
+series' 20 MiB; a snapshot's 2 MiB `kMaxSnapshotBytes` and 8,192-channel
+`kMaxSnapshotChannels` cap), plus one read window per log being read (REQ-OPS-42). On a
 generated 203 MiB session (8 logs, 2.75 million records; `bazel run -c opt //studio/review:review_bench`,
 Linux x86-64, a loaded host) the index pass took 0.49 s and kept 66,240 B
 (2,760 log-file seconds), a series of 8 channels over the whole session

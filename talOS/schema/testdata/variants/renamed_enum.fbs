@@ -1,0 +1,15 @@
+// float_level.fbs with Kind renamed to SourceKind: same size (8),
+// alignment (4), field names/offsets, underlying type and enum values.
+namespace schema_variant;
+
+enum SourceKind : ubyte { RAW, FILTERED }
+
+struct Reading {
+  level_m:float;
+  kind:SourceKind;
+  ok:bool;
+}
+
+struct Holder {
+  reading:Reading;
+}

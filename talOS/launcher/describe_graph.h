@@ -67,6 +67,10 @@ naming::TargetSources TargetSourcesOf(const config::RobotConfig& robot_config);
 naming::TargetModeSources TargetModeSourcesOf(
     const config::RobotConfig& robot_config);
 
+// The robot configuration's CAN bus names in `/hw/status` `can_buses` slot
+// order (hardware::CanBuses: slot 0 "rio", then each extra bus in byte order).
+std::vector<std::string> CanBusNamesOf(const config::RobotConfig& robot_config);
+
 // METHODOLOGY §6: every numeric parameter key ends in a unit suffix. One
 // warning per subsystem whose [subsystems.<name>] table has numeric keys (a
 // number, or an array of numbers) without one, listing them. Nested tables
@@ -110,6 +114,25 @@ std::vector<naming::Diagnostic> LintPythonActuatorPeriods(
     const config::RobotConfig& robot_config,
     const std::vector<NodeDescription>& described);
 
+// REQ-SAFE-28: one error per roster member marked critical = false that owns
+// a motor, digital output or PWM output (`spec.owns_actuators`) or describes a
+// target-lane sender (`naming::IsTargetLane`).
+std::vector<naming::Diagnostic> LintCriticalNodes(
+    const std::vector<NodeSpec>& specs,
+    const std::vector<NodeDescription>& described);
+
+// REQ-OPS-34, REQ-OPS-35, REQ-OPS-38, REQ-OPS-39, REQ-CONTRACT-33: validates
+// every telemetry subsystem's `[[subsystem.labels]]` entries and any
+// `[studio] dashboard` layout as phase-1 `ERROR` diagnostics so an invalid
+// label entry or dashboard layout refuses `--describe-only` and launch even
+// when `telemetry` is marked `critical = false`. Checks config/file-level
+// rules unconditionally, and checks dictionary-level rules (channel presence,
+// integer/unlabelled channel, drive-feed budget) whenever the declared graph
+// has described producer nodes (or no other nodes to describe).
+std::vector<naming::Diagnostic> LintTelemetryConfig(
+    const config::RobotConfig& robot_config,
+    const std::vector<NodeDescription>& described);
+
 // Where the launcher writes the declared graph that graph-reading nodes get
 // as `--graph` (introspect::DeclaredGraph): beside graph.json in the session
 // directory.
@@ -120,15 +143,19 @@ std::string DeclaredGraphPath(const LauncherOptions& options);
 // source: a second declaration of the topology is a thing to forget to update.
 //
 // Two passes. A framework node whose topics follow from the other nodes'
-// (telemetry observes every state topic, teleop writes each bound lane with
-// its consumer's schema) asks for the declared graph in its constructor and
-// says so in its description (reads_graph). Every node is described once
-// without a graph; then the descriptions of the nodes that do not read it
-// are written to DeclaredGraphPath, and each graph reader is described
-// again with `--graph` that file, which it is also started with. A graph
-// reader therefore sees every node but the graph readers. Each pass probes
-// its binaries in parallel (ForEachInParallel), so a pass takes about as long
-// as its slowest probe rather than the sum of them.
+// (telemetry observes every state and status topic, teleop writes each bound
+// lane with its consumer's schema) asks for the declared graph in its
+// constructor and says so in its description (reads_graph). Every node is
+// described once without a graph; then the descriptions of the nodes that do
+// not read it, plus the Pass-1 static non-`telemetry`-role `SENDER` endpoints
+// of graph-reading nodes (such as teleop's `/teleop/status`, omitting readers
+// with none), are written to DeclaredGraphPath, and each graph reader is
+// described again with `--graph` that file, which it is also started with.
+// Each graph reader strips its own entry when loading `--graph`, so it sees
+// every non-reader node and every other graph reader's Pass-1 static
+// non-`telemetry` senders, and never itself. Each pass probes its binaries in
+// parallel (ForEachInParallel), so a pass takes about as long as its slowest
+// probe rather than the sum of them.
 // Throws when that file cannot be written: a graph reader is never described,
 // or started, without the graph.
 //
@@ -144,6 +171,11 @@ std::string DeclaredGraphPath(const LauncherOptions& options);
 // `stop_fd` is ProbeDescribe's: once it reads ready, every running probe is
 // killed and none is started, so the result describes no roster and the
 // caller must not act on it.
+//
+// When a hardware bridge declares `/hw/status` as a sender, the lint counts
+// the launcher itself as one additional observer reader on `/hw/status` (the
+// live protocol-version check opens an RTMS reader slot on it), without
+// modifying `out`.
 std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
     std::vector<NodeDescription>& out,
@@ -205,9 +237,13 @@ std::vector<RTMSQueue> CreateSessionSegments(
 
 // The declared graph on disk, beside the session's manifest. uint64 values are
 // decimal strings: a JSON number is a double, and an id past 2^53 would change.
+// When `can_buses` is non-empty, it is written as `"can_buses": [...]` in
+// `/hw/status` slot order (CanBusNamesOf) so Studio can label each slot by bus
+// name.
 std::string GraphToJson(uint64_t session_id, const std::string& config_path,
                         const std::vector<NodeDescription>& described,
                         const std::vector<naming::Diagnostic>& diagnostics,
-                        const std::string& config_sha256 = "");
+                        const std::string& config_sha256 = "",
+                        const std::vector<std::string>& can_buses = {});
 
 }  // namespace talos::launcher

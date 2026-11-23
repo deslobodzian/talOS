@@ -20,7 +20,8 @@ quote that failure in your report. Match the repo's `.clang-format`,
 `.clang-tidy` and buildifier conventions.
 
 Do not run `bazel build` or `bazel test` unless the brief names one narrow
-target, and do not commit; the main session integrates and verifies.
+target, do not spawn subagents, and do not commit; the main session integrates
+and verifies.
 
 Report: files changed; each test added and the failure it guards; docs
 updated; assumptions you made; anything left open.

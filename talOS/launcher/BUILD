@@ -1,7 +1,7 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
 # One launcher console line composed and handed to its stream in one write.
@@ -20,24 +20,40 @@ cc_test(
     ],
 )
 
+# Session classification and retention facts (session_retention.h): reads
+# manifests, .tlog files and the cached verdict without shared memory, locks
+# or UDP (REQ-SAFE-35).
+cc_library(
+    name = "session_retention",
+    srcs = ["session_retention.cc"],
+    hdrs = ["session_retention.h"],
+    visibility = ["//studio/review:__pkg__"],
+    deps = [
+        ":hardware_record",
+        "//talOS/driver_station",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/events:session_manifest",
+        "//talOS/hardware:codecs",
+        "//talOS/protocol:frame",
+    ],
+)
+
 # A session's records: its manifest, run history, lock, retention facts and
 # the atomic writes that keep them.
 cc_library(
     name = "session",
-    srcs = [
-        "session.cc",
-        "session_retention.cc",
-    ],
+    srcs = ["session.cc"],
     hdrs = [
         "file_digest.h",
         "session.h",
         "session_lock.h",
-        "session_retention.h",
     ],
     visibility = ["//studio/review:__pkg__"],
     deps = [
         ":console_line",
         ":hardware_record",
+        ":session_retention",
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
@@ -49,6 +65,38 @@ cc_library(
         "//talOS/process:realtime_outcome",
         "//talOS/protocol",
         "//talOS/schema:identity",
+    ],
+)
+
+cc_test(
+    name = "session_retention_test",
+    size = "small",
+    srcs = ["session_retention_test.cc"],
+    deps = [
+        ":session",
+        "//talOS/events:session_manifest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Retention lock safety (ENOLCK refusal-to-delete vs lockless roots) and
+# racing ENOENT removal sweep (REQ-OPS-11).
+cc_test(
+    name = "launcher_retention_test",
+    size = "small",
+    srcs = ["launcher_retention_test.cc"],
+    tags = [
+        "integration",
+        "no_macos_sanitizer",
+    ],
+    deps = [
+        ":first_exec",
+        ":launcher_lib",
+        ":registry_cleanup",
+        ":session",
+        ":stop_signal_guard",
+        "//talOS/introspection:describe",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -101,6 +149,7 @@ cc_library(
         ":roster",
         ":session",
         ":spawn",
+        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/hardware:config",
@@ -109,6 +158,8 @@ cc_library(
         "//talOS/rtms",
         "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
+        "//talOS/telemetry:config_validation",
+        "//talOS/telemetry:dashboard_layout",
         "@tomlplusplus//:toml++",
     ],
 )
@@ -123,6 +174,24 @@ cc_test(
         ":describe_graph",
         "//talOS/configuration",
         "//talOS/introspection:names",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Unit tests for phase-1 graph and roster criticality rules (REQ-SAFE-28),
+# calling DiscoverNodes and LintCriticalNodes directly without spawning.
+cc_test(
+    name = "describe_graph_test",
+    size = "small",
+    srcs = ["describe_graph_test.cc"],
+    deps = [
+        ":describe_graph",
+        ":roster",
+        "//talOS/configuration",
+        "//talOS/events:events_core",
+        "//talOS/introspection:names",
+        "//talOS/schema:identity",
+        "//talOS/schema:test_messages",
         "@googletest//:gtest_main",
     ],
 )
@@ -216,6 +285,31 @@ cc_test(
     ],
 )
 
+# Holds a macOS IOKit PreventSystemSleep assertion for a running session
+# (silent no-op on Linux; TODO.md DEPLOY-1).
+cc_library(
+    name = "sleep_guard",
+    srcs = ["sleep_guard.cc"],
+    hdrs = ["sleep_guard.h"],
+    linkopts = select({
+        "@platforms//os:macos": [
+            "-Wl,-framework,IOKit",
+            "-Wl,-framework,CoreFoundation",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "sleep_guard_test",
+    size = "small",
+    srcs = ["sleep_guard_test.cc"],
+    deps = [
+        ":sleep_guard",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # The supervisor (Launcher) and the Studio bridge it supervises.
 cc_library(
     name = "launcher_lib",
@@ -229,7 +323,12 @@ cc_library(
         "service_notifier.h",
         "studio_bridge.h",
     ],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//bench/main_processor:__pkg__",
+        "//studio:__subpackages__",
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = [
         ":child_output",
         ":console_line",
@@ -238,19 +337,25 @@ cc_library(
         ":log_budget",
         ":roster",
         ":session",
+        ":sleep_guard",
         ":spawn",
         ":supervision_policy",
+        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:events_os",
         "//talOS/introspection:describe",
+        "//talOS/introspection:hardware_lint",
         "//talOS/introspection:lock_file",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
         "//talOS/memory:shared_memory",
         "//talOS/process",
+        "//talOS/protocol",
         "//talOS/rtms",
         "//talOS/rtms:process_liveness",
+        "//talOS/schema:field_path",
         "@tomlplusplus//:toml++",
     ],
 )
@@ -276,9 +381,10 @@ cc_library(
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/events:session_manifest",
-        "//talOS/hardware",
+        "//talOS/hardware:codecs",
         "//talOS/hardware:config",
-        "//talOS/protocol",
+        "//talOS/protocol:frame",
+        "//talOS/schema:field_path",
         "//talOS/schema:identity",
     ],
 )
@@ -297,7 +403,9 @@ cc_test(
         "//talOS/events:events_log",
         "//talOS/hardware",
         "//talOS/protocol",
+        "//talOS/schema:field_path",
         "//talOS/schema:identity",
+        "@flatbuffers//:runtime_cc",
         "@googletest//:gtest_main",
     ],
 )
@@ -341,6 +449,11 @@ cc_test(
     srcs = ["log_dump_test.cc"],
     data = [":log_dump"],
     env = {"TALOS_LOG_DUMP": "$(rlocationpath :log_dump)"},
+    # Spawns the instrumented log_dump binary across 18 cases; under macOS
+    # TSan each fork+exec costs ~213 ms of kernel CPU (vs 3 ms plain), pushing
+    # a small (60 s) test past its timeout on 3-vCPU hosted runners (TODO.md
+    # CI-13). The Linux sanitizer legs still run this test.
+    tags = ["no_macos_sanitizer"],
     deps = [
         ":alert_message",
         ":continuity_message",
@@ -445,6 +558,13 @@ cc_binary(
     ],
 )
 
+# Binary .tlog header/record reader and node clock helper for Python tools.
+py_library(
+    name = "tlog_read",
+    srcs = ["tlog_read.py"],
+    visibility = ["//visibility:public"],
+)
+
 # bazel run //talOS/launcher:restart_latency -- --config <robot.toml> [...]
 # Per-stage SIGKILL-to-first-request restart latency; see README "Restart
 # latency". The config's nodes come from the workspace's bazel-bin.
@@ -454,6 +574,8 @@ py_binary(
     data = [":launcher"],
     visibility = ["//visibility:public"],
     deps = [
+        ":tlog_read",
+        "//talOS/build:udp_ports",
         "//talOS/memory:shm_name",
         "@rules_python//python/runfiles",
     ],
@@ -468,6 +590,8 @@ py_test(
     ],
     data = [":restart_latency_fixture"],
     deps = [
+        ":tlog_read",
+        "//talOS/build:udp_ports",
         "//talOS/memory:shm_name",
         "@rules_python//python/runfiles",
     ],
@@ -546,6 +670,12 @@ cc_test(
     name = "launcher_test",
     size = "small",
     srcs = ["launcher_test.cc"],
+    data = [
+        "//talOS/telemetry:node",
+    ],
+    env = {
+        "TALOS_TELEMETRY": "$(rlocationpath //talOS/telemetry:node)",
+    },
     # Independent cases (each writes its own files; a stub is written once
     # per process). Unsharded, the Mac mini took up to 58.9 s of the 60 s
     # small limit at ten parallel runs (TODO.md MAC-2); four shards hold
@@ -576,7 +706,10 @@ cc_test(
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/protocol",
+        "//talOS/schema:identity",
+        "//talOS/schema:test_messages",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
@@ -726,6 +859,19 @@ cc_binary(
     ],
 )
 
+# A Studio bridge stub that claims a registry row under --session-id and
+# freezes on command (supervision_test's hung-bridge check).
+cc_binary(
+    name = "hanging_bridge",
+    testonly = True,
+    srcs = ["testdata/hanging_bridge.cc"],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/introspection:registry",
+        "//talOS/process:realtime_outcome",
+    ],
+)
+
 cc_test(
     name = "supervision_test",
     size = "medium",
@@ -735,6 +881,7 @@ cc_test(
         ":byte_wake_loss",
         ":delivery_loss_node",
         ":endpoint_drift",
+        ":hanging_bridge",
         ":held_stop",
         ":session_report",
         "//talOS/bridge:hardware_node",
@@ -745,6 +892,7 @@ cc_test(
         "TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)",
         "TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)",
         "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
+        "TALOS_HANGING_BRIDGE": "$(rlocationpath :hanging_bridge)",
         "TALOS_HELD_STOP_NODE": "$(rlocationpath :held_stop)",
         "TALOS_SESSION_REPORT": "$(rlocationpath :session_report)",
     },
@@ -765,8 +913,13 @@ cc_test(
         ":registry_cleanup",
         ":stop_signal_guard",
         ":supervision_events",
+        "//talOS/bridge:messages",
         "//talOS/introspection:registry",
+        "//talOS/memory:residency",
+        "//talOS/protocol",
+        "//talOS/rtms",
         "//talOS/rtms:process_liveness",
+        "//talOS/schema:identity",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
@@ -958,6 +1111,7 @@ talos_cc_node(
     deps = [
         ":replay_message",
         "//talOS/introspection:describe",
+        "//talOS/node:access",
     ],
 )
 

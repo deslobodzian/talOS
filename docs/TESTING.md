@@ -56,14 +56,14 @@ times the time and adds a source of nondeterminism.
 |---|---|---|
 | A node's decisions, gating, state, parameters | component (`Sim`) | the simulated clock makes stale and fresh exact |
 | Target selection, mode generations, arming | component, in `talOS/devices` | written once in the framework; a node proves only that it uses `Target` (the matrix, §7) |
-| Owner timeout, request merge, boot and epoch rejection | component on `//talOS/bridge:merge`, on `HardwareNode` through its in-process gateway (`//talOS/bridge:trust_test`), and on `SimHardware` | the bridge runs the same code; UDP adds nothing, and `//talOS/bridge:node_test` proves the socket reaches the same frame handler |
+| Owner timeout, request merge, boot and epoch rejection | component on `//talOS/hardware:merge`, on `HardwareNode` through its in-process gateway (`//talOS/bridge:trust_test`), and on `SimHardware` | the bridge runs the same code; UDP adds nothing, and `//talOS/bridge:node_test` proves the socket reaches the same frame handler |
 | Feedback age bound | unit on `FeedbackFresh` (`talOS/hardware/gate.h`); a node sees it through `SimHardware`, which calls it | the gateway and `SimHardware` run the same function |
 | A non-finite reading in the State | component on `Gateway` with a fake backend; a node sees it through `SimHardware`, which calls `hardware::ReplaceNonFinite` (`gateway.h`) | the gateway and `SimHardware` run the same function |
 | Wire layout, slot size, ABI, grammar | contract + compile-time `static_assert` | a size change must fail the build (RULES.md 9) |
 | Supervision: restart, quarantine, deadlines | component with an injected clock for the policy; integration for one real spawn or kill per mechanism | a policy test should not wait out a real deadline |
 | No node moves a motor while disabled, whole graph | e2e, judged from the log | only the session log sees every process |
 | A latency number a requirement states | perf, on a qualified host (§6) | a shared runner cannot hold it |
-| The shared-memory ring's slot hand-off and torn-read guard | component, writer and reader threads on one `RTMSQueue` (`//talOS/rtms:ring_handoff_test`, `:ring_lap_test`) | the thread sanitizer tracks memory by address, and two queues in one process map a segment at two addresses, so it judges the ring only on one mapping. There it proves a slot is filled before its publication is visible, while no slot is reused. A slot a lapping writer overwrites mid-copy is a race by design ([RTMS](../talOS/rtms/README.md)), so the torn-read guard is proven by `:ring_lap_test`'s check of every accepted message's words and time, not by the sanitizer, which that target skips (`no_tsan`) |
+| The shared-memory ring's slot hand-off and torn-read guard | component, writer and reader threads on one `RTMSQueue` (`//talOS/rtms:ring_handoff_test`, `:ring_lap_test`) | the thread sanitizer tracks memory by address, and two queues in one process map a segment at two addresses, so it judges the ring only on one mapping. Both targets run under ThreadSanitizer: `:ring_handoff_test` proves a slot is filled before its publication is visible, and `:ring_lap_test` proves the atomic-word seqlock ([RTMS](../talOS/rtms/README.md)) has no data races under concurrent lapping or `DROP_NEWEST` reuse while checking every accepted message's words and time |
 
 ## 3. Requirements and traceability
 
@@ -75,13 +75,16 @@ test names; the tags are the link. A tag line starts with its first ID
 (`// REQ-SAFE-01, REQ-SAFE-02: why` tags both; a line of a Python docstring
 counts too); an ID later in a sentence is prose, not a tag.
 
-- Every SAFE and CONTRACT requirement has a tagged test at its cheapest tier
-  or below, or names the bench procedure ([BENCH.md](BENCH.md)) or open
+- Every SAFE, CONTRACT, and P0 requirement has a tagged test at its cheapest
+  tier or below, or names the bench procedure ([BENCH.md](BENCH.md)) or open
   TODO.md item that verifies it. **[enforced: `tools/trace.py --check`
-  (CI lint job) for a tagged test or a cited bench section or open TODO.md
-  item; known gaps are listed with their TODO item in
-  `tools/trace_waivers.txt`, which only shrinks; gap: LANE-1 for the tier,
-  which the lane tags (§9) record but nothing checks]** `python3 tools/trace.py --report`
+  (CI lint job) enforces SAFE, CONTRACT, and P0 requirements, checking for a
+  tagged test at or below the requirement's cheapest runnable tier (from
+  Bazel lane tags in §9, plus GradleRIO `phoenixTest` and Studio node:test
+  (`tsx --test`) as `fast`; higher-tier composition tags remain allowed
+  alongside), or a cited bench section or open TODO.md item; known gaps are
+  listed with their TODO item in `tools/trace_waivers.txt`, which only
+  shrinks]** `python3 tools/trace.py --report`
   prints each requirement's tests.
 - A robot repository's catalogue, its own `docs/REQUIREMENTS.md`, holds only
   its own rows, in talOS's one numbering; its tests also tag talOS's rows.
@@ -196,11 +199,14 @@ Where RULES.md 12 is read too broadly or too narrowly:
    `sleep(100ms); EXPECT(...)` is banned.
 4. **Ports are bound at 0** and read back. `exclusive` is for tests that own
    a host-wide resource (the whole-graph e2e tests), not for fixed ports.
-   The exception is a port handed to the launcher, which refuses 0 for the
-   Studio bridge and the gateway link: the test reserves one and releases it
-   before the launch, so another process can take it first, and the test
-   says so when that happens (`//studio:drive_browser_test` names the
-   member's failed-bind log line).
+   Studio's bridge accepts `--studio-http-port 0` and the launcher records
+   its bound port as `http_port` in `manifest.json`. The accepted exception
+   is the gateway UDP link (`--remote-port`, `--local-port`,
+   `sim_gateway --port`), where both ends open mutually `connect()`ed UDP
+   sockets and refuse port 0: tests reserve and release UDP ports below the
+   OS ephemeral range (`20000..31999`) before the launch and report bind
+   failures directly (`HardwareNode::Open()` names failed binds, and
+   `//studio:drive_browser_test` names the member's failed-bind log line).
 5. **Randomness is seeded and printed**, settable from the environment
    (`TALOS_SOAK_SEED`).
 6. **A wall-clock bound comes from a requirement.** A perf test or timed e2e
@@ -213,8 +219,13 @@ Where RULES.md 12 is read too broadly or too narrowly:
    verifies its preconditions: realtime granted (`talos: realtime scheduling
    incomplete` fails the macOS sim tests), the host did not sleep, and the
    graph's CPU demand fits the cores. A test that cannot hold its bound on a
-   host fails as unqualified, distinctly from a product failure. **[gap:
-   LANE-1]**
+   host fails as unqualified, distinctly from a product failure
+   (`//talOS/bridge:run_timing_test` and
+   `//bench/main_processor:update_p99_perf_test` — the latter using the shared
+   `StallMeter` helper in `//talOS/process:host_qualification` — record the
+   gtest property `host_unqualified="true"` and `[HOST_UNQUALIFIED]` in their
+   failure message; uniform reporting across the remaining perf and timed e2e
+   tests is still open). **[review]**
 8. **Statistics over single samples.** A lateness or gap assertion uses the
    quantity the requirement names (the maximum inside a window, or a
    percentile over at least 50 samples), as
@@ -252,8 +263,8 @@ Required cases by role:
 | producer (`TargetLane` writer: `teleop`, a robot's driver or autonomous node) | 1 as `SendsAtALiveInput`; 2 and 6 as `DisabledRobotReleasesItsLanes` and `DriverStationLossReleasesItsLanes`; 9; 11 as `NewGenerationDisarms`; 12 |
 | observer (the bench `gyro`, a camera node, an estimator) | 1 as `PublishesFromALiveInput`; 3 as `StaleInputClearsValidity` (`state` still published, validity cleared, when its input is stale); 9; 12 |
 
-The lint checks the node packages under the robot, example, bench and
-scaffold directories and every package their configs' manifests launch. It
+The lint checks the node packages under `examples`, `bench`, and
+`tools/scaffold_testdata` and every package their configs' manifests launch. It
 takes the role from the package's sources (a `Motor`, `DigitalOutput`,
 `PwmOutput` or a `talos::mechanisms` block owning a motor: actuator; else a
 `TargetLane`, `OperatorArming` or `detail::TargetAccess`: producer; else
@@ -289,7 +300,11 @@ step exercises its case the lint cannot check: that is a review item
 stamped under each earlier generation. Cases 9 and 12 cannot be claimed (a
 parity run compares no construction and no allocation), so construction
 and anything only the Python node does keep their own Python tests.
-`bench/main_processor/motor/node_py_test.py` is the example; the
+`bench/main_processor/motor/node_py_test.py` is the repository's sole
+dual-language robot-node parity pair (other dual-language Python nodes wrap
+their C++ implementations via `talos.cpp_node` under RULES.md 7), alongside
+`//talOS/python:differential_parity_test` which exercises `talos.parity`
+across framework fixtures; the
 [node development guide](NODE_DEVELOPMENT_GUIDE.md#testing) gives the API.
 
 A case that does not apply is a comment in the test file naming why:
@@ -336,7 +351,7 @@ of `examples/robot_repo`), and in the repository
 `bazel run //tools:new_robot -- <name> --standalone DIR` makes of that
 fixture, which also fails when the fixture has a tracked file
 `new_robot`'s template does not place, and whose packages load with talOS
-held at `talos/` as its README's submodule would be **[enforced: CI's dependent-repositories job and
+held at `talos/` as its README's submodule would be **[enforced: CI's robot-repo job and
 `tools/prepush.sh`]**.
 
 ## 8. Flakes
@@ -350,11 +365,16 @@ the host can run it. It is never noise.
    `tools/lint_test_time.py` for `flaky = True` and `--flaky_test_attempts`;
    review for reruns]**
 2. **Diagnose from the artifact.** The bench `soak_test`
-   writes its session directory to Bazel's undeclared test outputs, and
-   `//studio:drive_browser_test` its session's logs, a screenshot and the
-   failing elements when a check fails; the other e2e and perf tests write theirs to temporary directories that do
-   not survive the run **[gap: LANE-1]**. A flake is closed by a named mechanism and a test
-   that pins it (§5), not by a green rerun.
+   writes its session directory to Bazel's undeclared test outputs
+   (`TEST_UNDECLARED_OUTPUTS_DIR`), `//studio:drive_browser_test` preserves
+   its session's logs, a screenshot and the failing elements when a check
+   fails, and `talOS/build/sim_check.py` (every `talos_sim_test`),
+   `examples/robot_repo/bundle_install_test.py` and
+   `examples/robot_repo/studio_test.py` preserve `launch.log` and their
+   session/log directories under `TEST_UNDECLARED_OUTPUTS_DIR` on failure;
+   the remaining e2e and perf tests write theirs to temporary directories
+   that do not survive the run **[review]**. A flake is closed by a named
+   mechanism and a test that pins it (§5), not by a green rerun.
 3. **Quarantine is explicit and expires.** A test that fails without a
    product change and cannot be fixed the same day gets the tags
    `["manual", "quarantine"]` (so `bazel test //...` skips it) and a TODO.md
@@ -395,10 +415,21 @@ serialize it (`exclusive`) or run it unsandboxed (`local`).
 
 Each lane has a config in [`talos.bazelrc`](../talos.bazelrc), which talOS's
 `.bazelrc` and a robot repository's import: `bazel test --config=fast //...` is the
-everyday loop; `--config=heavy`, `--config=integration`, `--config=e2e` and
-`--config=perf` run one lane, and `--config=no_e2e` every lane but e2e.
+everyday loop at default `-O3`, and `bazel test --config=dev //...` runs the
+same fast lane with `-O1` for faster C++ edit-compile-test iteration (it uses
+separate analysis and action cache keys from the default `-O3` build, so
+alternating between `--config=dev` and default `-O3` builds or `tools/tidy.sh`
+discards and rebuilds Bazel's analysis cache); `--config=heavy`,
+`--config=integration`, `--config=e2e` and `--config=perf` run one lane, and
+`--config=no_e2e` every lane but e2e.
 `bazel test //...` runs every lane but the soak; it is what runs before a
 push ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)).
+End-to-end simulation tests run on the real clock (`sim_gateway`, the launcher
+and each node process use host time; talOS does not maintain a discrete-event
+lockstep multi-process simulator), so scripted e2e runs take their wall-clock
+duration; `--config=fast` excludes `e2e` (along with `heavy`, `integration` and
+`perf`) so everyday iteration stays fast while deterministic node and mechanism
+logic runs on `Sim`'s virtual clock.
 Bazel keeps only the last `--test_tag_filters`, so a lane is combined with a
 sanitizer in one filter, not two configs:
 `bazel test --config=asan --test_tag_filters=-no_asan,-heavy,-integration,-e2e,-perf //...`.
@@ -412,10 +443,8 @@ millisecond) over the threshold; `--bep FILE` reads one invocation's
 With `--check` it exits 1 when an action exceeds its lane's budget above
 (lane tags from `--lanes FILE`, the `--bep` file, or `bazel query`, where a
 failed query or one finding no lane-tagged test is an error).
-**[enforced: the Linux job, after the suite, for the heavy, integration,
-e2e and perf lanes; gap: LANE-1 for the fast lane, which a hosted runner
-does not hold (the workflow step names the targets) and which is checked
-locally only]**
+**[enforced: the Linux job, after the suite, for every lane (fast, heavy,
+integration, e2e and perf)]**
 
 CI policy:
 
@@ -429,6 +458,16 @@ CI policy:
 - The Linux suite sets `TALOS_REQUIRE_NETNS=1` and
   `TALOS_REQUIRE_BROWSER=1`, so a test that would skip for want of a
   network namespace or a browser fails there instead.
+- A companion `workflow_run` workflow
+  ([`.github/workflows/retry-unacquired.yaml`](../.github/workflows/retry-unacquired.yaml),
+  `tools/retry_unacquired.py`) automatically runs `gh run rerun --failed` on
+  `Continuous Integration` and `Nightly` only for the host-failure case
+  [DEVELOPMENT.md §6](DEVELOPMENT.md#6-push-and-done) permits: `run_attempt < 3`,
+  the run is still the newest for its workflow and branch/PR at that attempt,
+  every non-passing job (besides `CI gate`) never acquired a hosted runner
+  (0 steps, no runner, and the `"not acquired by Runner"` check-run annotation),
+  and real failures or cancellations are refused. Automatic reruns appear as
+  attempt 2 or 3 in the run's GitHub Actions attempt list.
 
 What each job runs, and on which trigger, is in
 [`.github/workflows/`](../.github/workflows/); this file does not restate it.
@@ -445,7 +484,8 @@ build, reads the build's `.d` files for it).
 `tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them. CI's source lints (test time, links, requirement trace, node test
-matrix, METHODOLOGY.md §13's `bazel_dep` table, and the RULES.md 4
+matrix, METHODOLOGY.md §13's `bazel_dep` table, `layers-src`
+(`tools/check_layers.py --source-only`), and the RULES.md 4
 commissioning check against the diff base) are
 one script, `tools/source_lints.sh`, which CI's lint job and
 prepush's `source-lints` step both run. One doc check needs the compiler
@@ -457,13 +497,17 @@ prints from the defining headers (RULES.md 9). CI's sanitizer jobs are
 runs. Prepush also runs CI's clang-format and clang-tidy checks
 (`tools/format.sh`, `tools/tidy.sh`, which says when this host cannot run
 it), CI's RoboRIO-in-the-loop check, and under `--full`
-a short soak seed. The clang-tidy pass covers what Bazel builds, the sources
-and headers in its `compile_commands.json`; the RoboRIO program's own
-sources under `controller_processor/rio/src` are built by Gradle and checked
-only by the compiler warnings its `build.gradle` sets (`-Wall -Wextra
--pedantic -Werror -Wno-unused-parameter` for the RoboRIO and the Linux and
-macOS desktop builds, macOS adding `-Wno-unknown-warning-option
--Wno-character-conversion`; `/W3 /WX` on Windows). When each runs, and the more-than-20-commits rule for
+a short soak seed. The main clang-tidy pass covers what Bazel builds, the
+sources and headers in its `compile_commands.json`. The RoboRIO program's own
+sources under `controller_processor/rio/src` are built by Gradle with compiler
+warnings (`-Wall -Wextra -pedantic -Werror -Wno-unused-parameter` for the
+RoboRIO and the Linux and macOS desktop builds, macOS adding
+`-Wno-unknown-warning-option -Wno-character-conversion`; `/W3 /WX` on Windows),
+and the CI `rio-adapter` job also runs `tools/run_rio_clang_tidy.py`
+against GradleRIO's `setupCompileCommands` desktop database over
+`controller_processor/rio/src/main/cpp` and `src/main/include`, failing on
+any clang-tidy finding or setup, tool, or parse error. When each runs,
+and the more-than-20-commits rule for
 `--full`, are in [DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder).
 
 No CI builds a robot repository that consumes talOS against a talOS change

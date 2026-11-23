@@ -5,9 +5,11 @@
 #if defined(__linux__)
 #include <linux/videodev2.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -143,13 +145,18 @@ inline std::string ApplyV4L2Controls(const CameraControls& controls,
                             int32_t& device_value) -> std::string {
     const auto range = device.Query(id);
     if (!range) return std::string(name) + ": device has no such control";
-    if (!std::isfinite(value) || std::lround(value) < range->minimum ||
-        std::lround(value) > range->maximum) {
+    const double rounded = std::round(value);
+    if (!std::isfinite(rounded) ||
+        rounded < static_cast<double>(range->minimum) ||
+        rounded > static_cast<double>(range->maximum)) {
       return std::string(name) + ": " + std::to_string(value) +
              " outside the device's range " + std::to_string(range->minimum) +
              ".." + std::to_string(range->maximum);
     }
-    device_value = static_cast<int32_t>(std::lround(value));
+    const double clamped = std::clamp(
+        rounded, static_cast<double>(std::numeric_limits<int32_t>::min()),
+        static_cast<double>(std::numeric_limits<int32_t>::max()));
+    device_value = static_cast<int32_t>(std::lround(clamped));
     return {};
   };
   std::string error;
@@ -176,13 +183,18 @@ inline std::string ApplyV4L2Controls(const CameraControls& controls,
         set(V4L2_CID_EXPOSURE_AUTO_PRIORITY, "exposure_dynamic_framerate", 0);
     if (!error.empty()) return error;
   }
-  if (!controls.auto_exposure && controls.exposure_ms > 0) {
-    int32_t units = 0;
-    error = in_range(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute",
-                     controls.exposure_ms * 10, units);
-    if (!error.empty()) return error;
-    error = set(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute", units);
-    if (!error.empty()) return error;
+  if (!controls.auto_exposure) {
+    if (!std::isfinite(controls.exposure_ms)) {
+      return "exposure_time_absolute: non-finite exposure_ms";
+    }
+    if (controls.exposure_ms > 0) {
+      int32_t units = 0;
+      error = in_range(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute",
+                       controls.exposure_ms * 10, units);
+      if (!error.empty()) return error;
+      error = set(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute", units);
+      if (!error.empty()) return error;
+    }
   }
   const bool has_auto_gain = device.Query(V4L2_CID_AUTOGAIN).has_value();
   if (controls.auto_gain) {
@@ -191,6 +203,9 @@ inline std::string ApplyV4L2Controls(const CameraControls& controls,
              "or camera.auto_gain = false";
     }
     return set(V4L2_CID_AUTOGAIN, "gain_automatic", 1);
+  }
+  if (!std::isfinite(controls.gain)) {
+    return "gain: non-finite gain";
   }
   if (controls.gain > 0) {
     if (has_auto_gain) {

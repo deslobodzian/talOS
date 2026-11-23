@@ -93,12 +93,29 @@ uint64_t WriteLog(LogFile& file, const std::string& path, std::string bytes) {
 }
 
 // A pipe for waking a thread out of poll(): close-on-exec, both ends
-// nonblocking, so a full one already holds a wakeup.
+// nonblocking, so a full one already holds a wakeup. Relocates any end
+// assigned below 3 so closed standard descriptors are never occupied by an
+// internal pipe.
 void WakePipe(int (&fds)[2], const char* what) {
   {
     const std::lock_guard lock{SpawnMutex()};
     if (!CloseOnExecPipe(fds))
       throw std::system_error(errno, std::generic_category(), what);
+    for (int& fd : fds) {
+      if (fd < 3) {
+        const int moved = ::fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        if (moved < 0) {
+          const int code = errno;
+          ::close(fds[0]);
+          ::close(fds[1]);
+          fds[0] = -1;
+          fds[1] = -1;
+          throw std::system_error(code, std::generic_category(), what);
+        }
+        ::close(fd);
+        fd = moved;
+      }
+    }
   }
   for (const int fd : fds)
     ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
@@ -249,7 +266,8 @@ std::streamsize LauncherOutput::Sink::xsputn(const char* data,
 LauncherOutput::LauncherOutput()
     : state_{std::make_shared<State>()}, out_{*state_, 1}, err_{*state_, 2} {
   State& state = *state_;
-  WakePipe(state.wake, "launcher output wake pipe");
+  // Probe and duplicate standard descriptors before opening the wake pipe so
+  // closed fd 0/1/2 can never be hijacked as stdout or stderr.
   struct stat seen[2]{};
   for (std::size_t i = 0; i < 2; ++i) {
     State::Descriptor& descriptor = state.descriptors[i];
@@ -278,6 +296,7 @@ LauncherOutput::LauncherOutput()
     state.descriptors[1].fd = -1;
     state.descriptors[1].closed = true;
   }
+  WakePipe(state.wake, "launcher output wake pipe");
   try {
     const SignalsBlocked blocked;
     descriptor_writer_ =
@@ -597,7 +616,8 @@ ChildOutput::ChildOutput(LauncherOutput* echo) : echo_{echo} {
 ChildOutput::~ChildOutput() { Stop(); }
 
 void ChildOutput::Add(int reader, const std::string& path,
-                      std::string_view name, pid_t pid, bool echo) {
+                      std::string_view name, pid_t pid, bool echo,
+                      std::string watch_prefix) {
   ::fcntl(reader, F_SETFL, ::fcntl(reader, F_GETFL) | O_NONBLOCK);
   {
     const std::lock_guard lock{mutex_};
@@ -608,14 +628,34 @@ void ChildOutput::Add(int reader, const std::string& path,
     // The reader writes the header once it has drained the previous run's
     // pipe, so that run's last output is not credited to this one.
     Pending& pending = pending_[path];
-    added_.push_back({reader, path, echo,
-                      "[launcher] " + std::string{name} + " run " +
-                          std::to_string(pending.runs++) + ", pid " +
-                          std::to_string(pid) + "\n"});
+    if (!watch_prefix.empty()) {
+      pending.watched_pid = pid;
+      pending.watched_line.reset();
+    }
+    added_.push_back(Stream{
+        .fd = reader,
+        .pid = pid,
+        .path = path,
+        .echo = echo,
+        .header = "[launcher] " + std::string{name} + " run " +
+                  std::to_string(pending.runs++) + ", pid " +
+                  std::to_string(pid) + "\n",
+        .watch_prefix = std::move(watch_prefix),
+    });
     dirty_ = true;
   }
   arrived_.notify_all();
   Wake();
+}
+
+std::optional<std::string> ChildOutput::MatchedLine(const std::string& path,
+                                                    pid_t pid) const {
+  const std::lock_guard lock{mutex_};
+  const auto found = pending_.find(path);
+  if (found == pending_.end() || found->second.watched_pid != pid) {
+    return std::nullopt;
+  }
+  return found->second.watched_line;
 }
 
 void ChildOutput::Stop(std::chrono::milliseconds linger) {
@@ -647,7 +687,54 @@ uint64_t ChildOutput::Dropped(const std::string& path) const {
 
 void ChildOutput::Wake() { WakeUp(wake_); }
 
+std::optional<std::string> ChildOutput::ScanWatchedLine(
+    Stream& stream, std::string_view bytes) {
+  while (!bytes.empty() && !stream.watch_matched) {
+    if (stream.watch_discard) {
+      const std::size_t nl = bytes.find('\n');
+      if (nl == std::string_view::npos) return std::nullopt;
+      bytes.remove_prefix(nl + 1);
+      stream.watch_discard = false;
+      continue;
+    }
+    const std::size_t nl = bytes.find('\n');
+    if (nl == std::string_view::npos) {
+      if (stream.watch_held.size() + bytes.size() >
+          kChildOutputWatchLineBytes) {
+        stream.watch_held.clear();
+        stream.watch_discard = true;
+      } else {
+        stream.watch_held.append(bytes);
+      }
+      return std::nullopt;
+    }
+    const std::string_view part = bytes.substr(0, nl);
+    bytes.remove_prefix(nl + 1);
+    if (stream.watch_held.size() + part.size() > kChildOutputWatchLineBytes) {
+      stream.watch_held.clear();
+      continue;
+    }
+    stream.watch_held.append(part);
+    if (!stream.watch_held.empty() && stream.watch_held.back() == '\r') {
+      stream.watch_held.pop_back();
+    }
+    if (stream.watch_held.starts_with(stream.watch_prefix)) {
+      stream.watch_matched = true;
+      std::string matched = std::move(stream.watch_held);
+      stream.watch_held.clear();
+      return matched;
+    }
+    stream.watch_held.clear();
+  }
+  return std::nullopt;
+}
+
 void ChildOutput::Deliver(Stream& stream, const char* data, std::size_t size) {
+  std::optional<std::string> matched;
+  if (!stream.watch_prefix.empty() && !stream.watch_matched) {
+    matched = ScanWatchedLine(stream, std::string_view{data, size});
+  }
+  bool woke_watch = false;
   {
     const std::lock_guard lock{mutex_};
     Pending& pending = pending_[stream.path];
@@ -658,9 +745,14 @@ void ChildOutput::Deliver(Stream& stream, const char* data, std::size_t size) {
     pending.bytes.append(data, kept);
     pending.dropped += size - kept;
     pending.dropped_total += size - kept;
+    if (matched && pending.watched_pid == stream.pid && !pending.watched_line) {
+      pending.watched_line = std::move(*matched);
+      woke_watch = true;
+    }
     dirty_ = true;
   }
   arrived_.notify_all();
+  if (woke_watch) SupervisionWakeup::Wake();
   if (!stream.echo || echo_ == nullptr) return;
   // Whole lines only, so that nothing lands inside one on the console.
   const std::string_view bytes{data, size};
@@ -820,11 +912,14 @@ void ChildOutput::WriteLoop() {
 
 pid_t SpawnDrained(std::vector<std::string> args, std::string& error,
                    ChildOutput& output, const std::string& path,
-                   std::string_view name, bool echo, bool hold_stop) {
+                   std::string_view name, bool echo, bool hold_stop,
+                   std::string watch_prefix) {
   int reader = -1;
   const pid_t pid = SpawnProcess(std::move(args), error, SpawnOutput::kPipe,
                                  &reader, nullptr, hold_stop);
-  if (pid > 0) output.Add(reader, path, name, pid, echo);
+  if (pid > 0) {
+    output.Add(reader, path, name, pid, echo, std::move(watch_prefix));
+  }
   return pid;
 }
 

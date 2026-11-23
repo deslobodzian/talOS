@@ -998,6 +998,249 @@ class NewSubsystemTest(unittest.TestCase):
                     self.assertIn("--config $PWD/cfg/robot_sim.toml --sim",
                                   run)
 
+    # REQ-DEV-01, REQ-DEV-23, REQ-DEV-30
+    def test_standalone_scaffold_retargets_sim_and_is_idempotent(self):
+        # Scaffolding a first mechanism into a standalone robot repository
+        # retargets root `talos_sim(name = "sim")` from robot.toml /
+        # CONFIG_FILES / NODES to robot_sim.toml / SIM_CONFIG_FILES /
+        # SIM_NODES while keeping extra data entries and leaving non-sim
+        # rules on CONFIG_FILES and NODES, so `Next:` prints `bazel run
+        # //:sim -- ...` (even under --dry-run). Scaffolding a second
+        # mechanism leaves BUILD.bazel unchanged and both manifests synced.
+        build_before = (
+            'load("@talos//talOS/build:contract.bzl", "talos_bundle", '
+            '"talos_graph_test", "talos_sim", "talos_sim_test")\n'
+            'load("@talos//tools:sync_manifest.bzl", "manifest_sync_test")\n'
+            'load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")\n\n'
+            'SIMULATOR = "@talos//talOS/simulation:sim_gateway"\n'
+            'STUDIO_BRIDGE = "@talos//studio/bridge:studio_bridge"\n\n'
+            'manifest_sync_test(\n'
+            '    name = "manifest_sync_test",\n'
+            '    config = "robot.toml",\n'
+            '    config_files = CONFIG_FILES,\n'
+            '    manifest = "robot_manifest.bzl",\n'
+            ')\n\n'
+            'talos_graph_test(\n'
+            '    name = "graph_test",\n'
+            '    config = "robot.toml",\n'
+            '    data = CONFIG_FILES,\n'
+            '    nodes = NODES,\n'
+            ')\n\n'
+            'talos_bundle(\n'
+            '    name = "robot_bundle",\n'
+            '    config = "robot.toml",\n'
+            '    config_files = CONFIG_FILES,\n'
+            '    nodes = ["@talos//talOS/bridge:hardware_node"] + NODES,\n'
+            ')\n\n'
+            'talos_sim(\n'
+            '    name = "sim",\n'
+            '    config = "robot.toml",\n'
+            '    data = CONFIG_FILES + [\n'
+            '        SIMULATOR,\n'
+            '        STUDIO_BRIDGE,\n'
+            '        ":studio_webroot",\n'
+            '    ],\n'
+            '    nodes = NODES,\n'
+            ')\n\n'
+            'talos_sim_test(\n'
+            '    name = "sim_smoke_test",\n'
+            '    sim = ":sim",\n'
+            ')\n'
+        )
+        robot_toml = (
+            '[robot]\nname = "my_robot"\nperiod_us = 20000\n'
+            'command_timeout_us = 100000\n'
+            'hardware_node = "@talos//talOS/bridge:hardware_node"\n'
+            'sim_gateway = "@talos//talOS/simulation:sim_gateway"\n\n'
+            '[[subsystems]]\nname = "teleop"\n'
+            'path = "subsystems/teleop.toml"\n'
+        )
+        teleop_toml = (
+            '[subsystem]\nname = "teleop"\n'
+            'node = "@talos//talOS/teleop:node"\nperiod_us = 20000\n'
+        )
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(new_subsystem.sync_manifest,
+                                  "current_repository",
+                                  return_value="talos+"):
+            for path, text in (
+                    ("MODULE.bazel", 'module(name = "my_robot")\n'),
+                    ("BUILD.bazel", build_before),
+                    ("robot.toml", robot_toml),
+                    ("subsystems/teleop.toml", teleop_toml),
+            ):
+                full = os.path.join(root, path)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "w", encoding="utf-8") as f:
+                    f.write(text)
+
+            def run_tool(*argv):
+                out = io.StringIO()
+                with mock.patch.dict(os.environ,
+                                     BUILD_WORKSPACE_DIRECTORY=root), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(out):
+                    code = new_subsystem.main(list(argv))
+                return code, out.getvalue()
+
+            # --dry-run predicts the retargeted `bazel run //:sim --` command
+            # without touching BUILD.bazel on disk.
+            code, dry_out = run_tool("flywheel", "--lang", "py", "--dry-run")
+            self.assertEqual(code, 0, dry_out)
+            self.assertIn("bazel run //:sim -- --duration-s", dry_out)
+            self.assertNotIn("--start-sim-gateway", dry_out)
+            with open(os.path.join(root, "BUILD.bazel"),
+                      encoding="utf-8") as f:
+                self.assertEqual(f.read(), build_before)
+
+            # First mechanism: retargets //:sim and keeps extra data entries.
+            code, first_out = run_tool("flywheel", "--lang", "py")
+            self.assertEqual(code, 0, first_out)
+            self.assertIn("bazel run //:sim -- --duration-s", first_out)
+            self.assertNotIn("--start-sim-gateway", first_out)
+            with open(os.path.join(root, "BUILD.bazel"),
+                      encoding="utf-8") as f:
+                build_after_first = f.read()
+            ast.parse(build_after_first)
+            expected_sim = (
+                'talos_sim(\n'
+                '    name = "sim",\n'
+                '    config = "robot_sim.toml",\n'
+                '    data = SIM_CONFIG_FILES + [\n'
+                '        SIMULATOR,\n'
+                '        STUDIO_BRIDGE,\n'
+                '        ":studio_webroot",\n'
+                '    ],\n'
+                '    nodes = SIM_NODES,\n'
+                ')\n'
+            )
+            self.assertIn(expected_sim, build_after_first)
+            # Non-sim rules stay on robot.toml / CONFIG_FILES / NODES.
+            self.assertIn(
+                'talos_graph_test(\n'
+                '    name = "graph_test",\n'
+                '    config = "robot.toml",\n'
+                '    data = CONFIG_FILES,\n'
+                '    nodes = NODES,\n'
+                ')\n',
+                build_after_first)
+            self.assertEqual(
+                new_subsystem.sync_manifest.check(root, "robot_sim.toml"), "")
+
+            # Second mechanism: BUILD.bazel stays identical, manifests sync,
+            # and Next: still uses `bazel run //:sim --`.
+            code, second_out = run_tool("claw", "--lang", "cpp")
+            self.assertEqual(code, 0, second_out)
+            self.assertIn("bazel run //:sim -- --duration-s", second_out)
+            self.assertNotIn("--start-sim-gateway", second_out)
+            with open(os.path.join(root, "BUILD.bazel"),
+                      encoding="utf-8") as f:
+                self.assertEqual(f.read(), build_after_first)
+            for cfg in ("robot.toml", "robot_sim.toml"):
+                self.assertEqual(
+                    new_subsystem.sync_manifest.check(root, cfg), "", cfg)
+                subsystems, _ = new_subsystem.sync_manifest.effective(
+                    root, cfg)
+                self.assertIn("flywheel", subsystems)
+                self.assertIn("claw", subsystems)
+
+    # REQ-DEV-01, REQ-DEV-23
+    def test_retarget_talos_sim_bails_out_on_non_literal_or_custom_layout(
+            self):
+        # A root talos_sim with a non-literal config, a different config,
+        # custom data/nodes, or a non-top-level call is left untouched and
+        # uncorrupted, while sim_manifest_sync_test and sim_graph_test are
+        # still added and Next: falls back to the launcher command.
+        base_loads = (
+            'load("@talos//talOS/build:contract.bzl", "talos_sim")\n'
+            'load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")\n\n'
+            'SIMULATOR = "@talos//talOS/simulation:sim_gateway"\n\n'
+        )
+        cases = {
+            "non-literal config": (
+                base_loads + 'SIM_CONFIG = "robot.toml"\n\n',
+                'talos_sim(\n    name = "sim",\n    config = SIM_CONFIG,\n'
+                '    data = CONFIG_FILES + [SIMULATOR],\n'
+                '    nodes = NODES,\n)\n',
+            ),
+            "different config": (
+                base_loads,
+                'talos_sim(\n    name = "sim",\n    config = "other.toml",\n'
+                '    data = CONFIG_FILES + [SIMULATOR],\n'
+                '    nodes = NODES,\n)\n',
+            ),
+            "custom data": (
+                base_loads,
+                'talos_sim(\n    name = "sim",\n    config = "robot.toml",\n'
+                '    data = [SIMULATOR],\n    nodes = NODES,\n)\n',
+            ),
+            "custom nodes": (
+                base_loads,
+                'talos_sim(\n    name = "sim",\n    config = "robot.toml",\n'
+                '    data = CONFIG_FILES + [SIMULATOR],\n'
+                '    nodes = ["@talos//talOS/teleop:node"],\n)\n',
+            ),
+            "hand-written CONFIG_FILES": (
+                'load("@talos//talOS/build:contract.bzl", "talos_sim")\n'
+                'load(":robot_manifest.bzl", "NODES")\n\n'
+                'CONFIG_FILES = ["extra.toml"]\n\n',
+                'talos_sim(\n    name = "sim",\n    config = "robot.toml",\n'
+                '    data = CONFIG_FILES,\n    nodes = NODES,\n)\n',
+            ),
+            "loop-generated talos_sim": (
+                base_loads,
+                'for target in ["sim"]:\n'
+                '    talos_sim(\n        name = "sim",\n'
+                '        config = "robot.toml",\n'
+                '        data = CONFIG_FILES,\n'
+                '        nodes = NODES,\n    )\n',
+            ),
+        }
+        robot_toml = (
+            '[robot]\nname = "my_robot"\nperiod_us = 20000\n'
+            'command_timeout_us = 100000\n'
+            'hardware_node = "@talos//talOS/bridge:hardware_node"\n'
+            'sim_gateway = "@talos//talOS/simulation:sim_gateway"\n\n'
+            '[[subsystems]]\nname = "teleop"\n'
+            'path = "subsystems/teleop.toml"\n'
+        )
+        teleop_toml = (
+            '[subsystem]\nname = "teleop"\n'
+            'node = "@talos//talOS/teleop:node"\nperiod_us = 20000\n'
+        )
+        for case, (prefix, sim_block) in cases.items():
+            with self.subTest(case=case), \
+                    tempfile.TemporaryDirectory() as root, \
+                    mock.patch.object(new_subsystem.sync_manifest,
+                                      "current_repository",
+                                      return_value="talos+"):
+                for path, text in (
+                        ("MODULE.bazel", 'module(name = "my_robot")\n'),
+                        ("BUILD.bazel", prefix + sim_block),
+                        ("robot.toml", robot_toml),
+                        ("subsystems/teleop.toml", teleop_toml),
+                ):
+                    full = os.path.join(root, path)
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    with open(full, "w", encoding="utf-8") as f:
+                        f.write(text)
+                out = io.StringIO()
+                with mock.patch.dict(os.environ,
+                                     BUILD_WORKSPACE_DIRECTORY=root), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(out):
+                    code = new_subsystem.main(["intake", "--lang", "py"])
+                steps = out.getvalue()
+                self.assertEqual(code, 0, steps)
+                with open(os.path.join(root, "BUILD.bazel"),
+                          encoding="utf-8") as f:
+                    after = f.read()
+                ast.parse(after)
+                self.assertIn(sim_block, after)
+                self.assertIn('name = "sim_graph_test"', after)
+                self.assertIn("--config $PWD/robot_sim.toml --sim", steps)
+                self.assertNotIn("bazel run //:sim --", steps)
+
     # REQ-DEV-01
     def test_node_tests_spawn_no_binary(self):
         # A generated node_test runs the node's class on Sim; the binary's
@@ -1020,13 +1263,14 @@ class NewSubsystemTest(unittest.TestCase):
     # REQ-DEV-05
     def test_sim_run_outlasts_its_schedule_however_late_the_gateway_starts(
             self):
-        # The launcher counts --duration-s from its first spawn, but
-        # sim_gateway counts its schedules from its own loop start, which
-        # the launcher bounds only by killing a member that has not
-        # registered by its startup grace (talOS/launcher/roster.h
-        # heartbeat_startup_grace_ms, 5000 ms). Each printed run must
-        # outlast that grace plus the joystick schedule's last event, or a
-        # slow start ends the session before the button is held (TOOLS-18).
+        # The launcher counts --duration-s from its first spawn, while
+        # sim_gateway's schedules count from the schedule start the launcher
+        # writes once every non-observer member's loop has started, which the
+        # launcher bounds for unregistered members by its startup grace
+        # (talOS/launcher/roster.h heartbeat_startup_grace_ms, 5000 ms). Each
+        # printed run must outlast that grace plus the joystick schedule's
+        # last event, or a slow start ends the session before the button is
+        # held.
         startup_grace_s = 5
         for run in (new_subsystem.sim_run(3),
                     new_subsystem.launcher_sim_run("@talos", "robot_sim.toml",
@@ -1139,6 +1383,71 @@ class NewSubsystemTest(unittest.TestCase):
             self.assertNotIn("can_id", subsystem)
             self.assertIn('name = "localizer"', by_rel[
                 "bot/main_processor/configuration/robot.toml"])
+
+    # REQ-DEV-01, REQ-DEV-30
+    def test_talos_module_and_build_templates_support_custom_repo_name(self):
+        # talos_module() reads sync_manifest.talos_repo_prefix() (backed by
+        # _repo_mapping) and inspects BUILD_WORKSPACE_DIRECTORY/MODULE.bazel's
+        # bazel_dep(name = "talos", repo_name = ...) via ast.
+        with mock.patch.object(new_subsystem.sync_manifest,
+                               "current_repository", return_value=""):
+            self.assertEqual(new_subsystem.talos_module(), "")
+
+        for canonical, apparent in (("talos+", "my_talos"),
+                                    ("talos~", "my_talos7")):
+            with self.subTest(source="repo_mapping", canonical=canonical), \
+                    tempfile.TemporaryDirectory() as rf_dir:
+                with open(os.path.join(rf_dir, "_repo_mapping"), "w",
+                          encoding="utf-8") as f:
+                    f.write(f",{apparent},{canonical}\n")
+                with mock.patch.dict(os.environ, {"RUNFILES_DIR": rf_dir},
+                                     clear=False), \
+                        mock.patch.object(new_subsystem.sync_manifest,
+                                          "current_repository",
+                                          return_value=canonical):
+                    self.assertEqual(new_subsystem.talos_module(""),
+                                     f"@{apparent}")
+
+        for module_text, expected in (
+                ('module(name = "bot")\n'
+                 'bazel_dep(name = "talos", version = "0.1.0", '
+                 'repo_name = "custom_talos")\n', "@custom_talos"),
+                ('module(name = "bot")\n'
+                 'bazel_dep("talos", repo_name = "pos_talos")\n',
+                 "@pos_talos")):
+            with self.subTest(expected=expected), \
+                    tempfile.TemporaryDirectory() as ws:
+                with open(os.path.join(ws, "MODULE.bazel"), "w",
+                          encoding="utf-8") as f:
+                    f.write(module_text)
+                with mock.patch.object(new_subsystem.sync_manifest,
+                                       "current_repository",
+                                       return_value="talos+"), \
+                        mock.patch.dict(os.environ,
+                                        {"BUILD_WORKSPACE_DIRECTORY": ws}):
+                    self.assertEqual(new_subsystem.talos_module(), expected)
+
+        # BUILD templates substitute @TALOS@ directly and sort deps with
+        # string_list() (no TALOS_LABEL regex post-rewrite).
+        self.assertFalse(hasattr(new_subsystem, "TALOS_LABEL"))
+        bare_talos = re.compile(r"(?<![@\w])//talOS/")
+        for lang in ("cpp", "py"):
+            for kind in ("velocity", "position", "estimator"):
+                with self.subTest(lang=lang, kind=kind):
+                    build = new_subsystem.package_files(
+                        "intake", lang, kind=kind,
+                        talos="@my_talos")["BUILD"]
+                    self.assertIsNone(bare_talos.search(build), build)
+                    self.assertIn(
+                        'load("@my_talos//talOS/build:contract.bzl"', build)
+                    if lang == "cpp":
+                        # @googletest < @my_talos < @rules_cc in buildifier order
+                        self.assertLess(
+                            build.index('"@googletest//:gtest_main"'),
+                            build.index('"@my_talos//talOS/devices:testing"'))
+                        self.assertLess(
+                            build.index('"@my_talos//talOS/node:testing"'),
+                            build.index('"@rules_cc//cc/runfiles"'))
 
 
 if __name__ == "__main__":

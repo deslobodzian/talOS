@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import dgram from 'node:dgram';
 import {once} from 'node:events';
+import fs, {readdirSync, readFileSync} from 'node:fs';
 import {createServer} from 'node:http';
 import type {AddressInfo} from 'node:net';
 import {test} from 'node:test';
@@ -752,3 +754,95 @@ test('oversized RPC WebSocket payloads close only the offending client', async (
     bridge.close();
   }
 });
+
+// REQ-SAFE-35: the agent is a viewer. It may follow a bridge and answer RPC
+// over TCP, and nothing else: no UDP socket (the only way it could reach the
+// RoboRIO gateway), no process, and no file opened for writing.
+const AGENT_DIR = new URL('../agent/', import.meta.url);
+const FORBIDDEN_MODULES = new Set([
+  'dgram', 'fs', 'fs/promises', 'child_process', 'worker_threads', 'cluster',
+  'dns', 'net', 'tls', 'http2', 'vm', 'module'
+]);
+
+test('REQ-SAFE-35: no agent source imports a module that could write or send',
+     () => {
+       const imported: string[] = [];
+       for (const name of readdirSync(AGENT_DIR)) {
+         if (!/\.(ts|mjs)$/.test(name)) continue;
+         const text = readFileSync(new URL(name, AGENT_DIR), 'utf8');
+         for (const m of text.matchAll(
+                  /(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g)) {
+           imported.push(`${name}: ${m[1]}`);
+           assert.ok(!FORBIDDEN_MODULES.has(m[1].replace(/^node:/, '')),
+                     `${name} imports ${m[1]}`);
+         }
+       }
+       // The scan found the agent's own imports, so an empty one cannot pass.
+       assert.ok(imported.some(i => i.endsWith(': ws')), imported.join('\n'));
+     });
+
+test('REQ-SAFE-35: a running agent opens no datagram socket and no file for writing',
+     {timeout: HANG_BOUND_MS}, async () => {
+       const opened: string[] = [];
+       const writable = (flags: unknown) =>
+           typeof flags === 'number' ?
+           (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) !== 0 :
+           typeof flags === 'string' && /[wa+]/.test(flags);
+       const real = {
+         createSocket: dgram.createSocket,
+         open: fs.open,
+         openSync: fs.openSync,
+         promisesOpen: fs.promises.open,
+         createWriteStream: fs.createWriteStream
+       };
+       const note = (what: string, flags: unknown) => {
+         if (writable(flags)) opened.push(`${what} ${String(flags)}`);
+       };
+       (dgram as any).createSocket = (...args: unknown[]) => {
+         opened.push('dgram');
+         return (real.createSocket as any)(...args);
+       };
+       (fs as any).open = (path: unknown, flags: unknown, ...rest: unknown[]) => {
+         note('open', flags);
+         return (real.open as any)(path, flags, ...rest);
+       };
+       (fs as any).openSync = (path: unknown, flags: unknown, ...rest: unknown[]) => {
+         note('openSync', flags);
+         return (real.openSync as any)(path, flags, ...rest);
+       };
+       (fs.promises as any).open = (path: unknown, flags: unknown, ...rest: unknown[]) => {
+         note('promises.open', flags);
+         return (real.promisesOpen as any)(path, flags, ...rest);
+       };
+       (fs as any).createWriteStream = (...args: unknown[]) => {
+         opened.push('createWriteStream');
+         return (real.createWriteStream as any)(...args);
+       };
+       const bridge = await fakeBridge(demoDeclaredGraph(), demoPacket(0n));
+       const agent = startAgent(0, bridge.url);
+       try {
+         await settle(() => !!agent.context().declared &&
+                            agent.timeline.latest() !== null,
+                      'the agent never received the bridge\'s data');
+         agent.ingestSystemGraph(demoSystemGraph(500n));
+         await settle(() => !!agent.server.address(), 'agent did not listen');
+         const {port} = agent.server.address() as AddressInfo;
+         const rpc = await fetch(`http://127.0.0.1:${port}/rpc`, {
+           method: 'POST', headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify(
+               {jsonrpc: '2.0', id: 1, method: 'get_system_graph'})
+         });
+         assert.equal(rpc.status, 200);
+       } finally {
+         agent.close();
+         bridge.close();
+         Object.assign(dgram, {createSocket: real.createSocket});
+         Object.assign(fs, {
+           open: real.open,
+           openSync: real.openSync,
+           createWriteStream: real.createWriteStream
+         });
+         Object.assign(fs.promises, {open: real.promisesOpen});
+       }
+       assert.deepEqual(opened, []);
+     });

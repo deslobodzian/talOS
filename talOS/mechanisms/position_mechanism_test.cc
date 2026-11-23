@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -166,6 +167,20 @@ home_margin_rot = 0.2
 homing_timeout_us = 500000
 homing_stall_rps = 0.05
 homing_stall_us = 200000
+
+[subsystems.sector.motors.sector]
+can_id = 12
+feedback = "RemoteCANcoder"
+feedback_sensor = "sector_cc"
+position_frame = "absolute"
+[subsystems.sector.sensors.sector_cc]
+type = "CANcoder"
+can_id = 13
+[subsystems.sector.sector]
+tolerance_rot = 0.01
+wrap_rot = 1.0
+min_rot = 0.0
+max_rot = 0.75
 )";
 
 // A robot node around one PositionMechanism: its goal is the teleop lane's,
@@ -315,33 +330,50 @@ TEST(PositionMechanism, NonFiniteDemandGoesNeutral) {
 }
 
 // A request outside update() (here a message callback, which would act on
-// a goal no Target selected) is refused, naming the mechanism.
+// a goal no Target selected) is refused for set_goal(), hold() and
+// clear_fault(), naming the mechanism.
 // REQ-SAFE-36
 TEST(PositionMechanism, RequestOutsideUpdateThrows) {
-  struct CallbackNode {
-    explicit CallbackNode(Node& node)
-        : mech{node, "arm"},
-          goal{node.subscribe<control::PositionTarget>(
-              "/test/goal", [this](const control::PositionTarget& t) {
-                mech.set_goal(t.position_rot());
-              })} {}
-    void update() { mech.update(); }
-    PositionMechanism mech;
-    Subscription<control::PositionTarget> goal;
-  };
-  auto sim = Sim::FromToml(kRobotToml);
-  sim.add<CallbackNode>("arm");
-  SimHardware hw{sim};
-  hw.enable();
-  sim.step(10ms);
-  sim.publish("/test/goal", control::PositionTarget{0.2, 0.0});
-  try {
+  enum class Action { kSetGoal, kHold, kClearFault };
+  for (const Action action :
+       {Action::kSetGoal, Action::kHold, Action::kClearFault}) {
+    SCOPED_TRACE(static_cast<int>(action));
+    struct CallbackNode {
+      explicit CallbackNode(Node& node)
+          : mech{node, "arm"},
+            goal{node.subscribe<control::PositionTarget>(
+                "/test/goal", [this](const control::PositionTarget& t) {
+                  switch (action) {
+                    case Action::kSetGoal:
+                      mech.set_goal(t.position_rot());
+                      break;
+                    case Action::kHold:
+                      mech.hold(t.feedforward_v());
+                      break;
+                    case Action::kClearFault:
+                      mech.clear_fault();
+                      break;
+                  }
+                })} {}
+      void update() { mech.update(); }
+      PositionMechanism mech;
+      Action action = Action::kSetGoal;
+      Subscription<control::PositionTarget> goal;
+    };
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<CallbackNode>("arm").action = action;
+    SimHardware hw{sim};
+    hw.enable();
     sim.step(10ms);
-    ADD_FAILURE() << "set_goal() from a callback was accepted";
-  } catch (const std::logic_error& e) {
-    EXPECT_NE(std::string{e.what()}.find("PositionMechanism 'arm'"),
-              std::string::npos)
-        << e.what();
+    sim.publish("/test/goal", control::PositionTarget{0.2, 0.0});
+    try {
+      sim.step(10ms);
+      ADD_FAILURE() << "request from a callback was accepted";
+    } catch (const std::logic_error& e) {
+      EXPECT_NE(std::string{e.what()}.find("PositionMechanism 'arm'"),
+                std::string::npos)
+          << e.what();
+    }
   }
 }
 
@@ -351,7 +383,9 @@ TEST(PositionMechanism, RequestOutsideUpdateThrows) {
 // REQ-SAFE-36
 TEST(PositionMechanism, RequestDoesNotCarryIntoTheNextTick) {
   struct SkippingNode {
-    explicit SkippingNode(Node& node) : mech{node, "arm"} {}
+    explicit SkippingNode(Node& node) : mech{node, "arm"} {
+      AllowUntargetedOutputs(node);
+    }
     void update() {
       if (!armed) {
         mech.update();
@@ -362,17 +396,23 @@ TEST(PositionMechanism, RequestDoesNotCarryIntoTheNextTick) {
       } else {
         mech.update();  // tick N + 1 on: nothing asked this tick
       }
+      ever_drove |= mech.driving();
       ++step;
     }
     PositionMechanism mech;
     bool armed = false;
+    bool ever_drove = false;
     int step = 0;
   };
   Rig<SkippingNode> arm{"arm"};
   arm.Start();
   arm.node.armed = true;
-  arm.sim.step(15ms);
+  for (int i = 0; i < 3; ++i) {
+    arm.sim.step(5ms);
+    EXPECT_EQ(arm.Applied().mode, Mode::kNeutral) << "tick " << i;
+  }
   ASSERT_GE(arm.node.step, 2);
+  EXPECT_FALSE(arm.node.ever_drove);
   EXPECT_FALSE(arm.mech().driving());
   EXPECT_EQ(arm.Applied().mode, Mode::kNeutral);
 }
@@ -419,7 +459,8 @@ can_id = 2
       sim.add<PositionNode>("m");
       ADD_FAILURE() << "constructed";
     } catch (const std::invalid_argument& e) {
-      EXPECT_NE(std::string{e.what()}.find(key), std::string::npos) << e.what();
+      EXPECT_NE(std::string{e.what()}.find("m." + key), std::string::npos)
+          << e.what();
     }
   };
   const std::vector<std::pair<std::string, std::string>> bad{
@@ -451,6 +492,13 @@ can_id = 2
        "max_rot = 1.0\nhoming_stall_rps = 0.1\nhoming_v = -1.0\n"
        "homing_stall_us = 50000\nhoming_stall_current_a = 20.0\n"
        "homing_min_push_us = 50000\n"},
+      {"homing_timeout_us",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_timeout_us = 18446744073709552\n"
+       "homing_stall_rps = 0.1\nhoming_v = -1.0\n"
+       "homing_stall_us = 50000\nhoming_stall_current_a = 20.0\n"
+       "homing_min_push_us = 50000\nhoming_min_travel_rot = 0.05\n"},
+      {"at_goal_debounce_us", ok + "at_goal_debounce_us = 9223372036854776\n"},
       {"gravity", ok + "gravity = \"down\"\n"},
       // A homed mechanism needs a finite travel.
       {"max_rot",
@@ -477,7 +525,7 @@ can_id = 2
                                   "absolute_rot_per_sensor_rot = -1.0\n"},
       // On the window's edge (offset 0.4 maps (-0.1, 0.9)): a hood resting
       // on its stop just below min_rot would read across the discontinuity.
-      {"absolute_margin_rot", absolute + "absolute_offset_rot = 0.4\n"
+      {"absolute_offset_rot", absolute + "absolute_offset_rot = 0.4\n"
                                          "min_rot = -0.1\nmax_rot = 0.8\n"},
       {"absolute_margin_rot",
        "tolerance_rot = 0.1\nhoming = \"absolute\"\nabsolute_sensor = \"cc\"\n"
@@ -517,6 +565,48 @@ can_id = 2
     EXPECT_NO_THROW(sim.add<PositionNode>("m"));
   }
   expect_refused("gravity_v", toml(ok + "gravity_v = 0.5\n", slot_g));
+}
+
+// The travel widened by absolute_margin_rot must lie strictly inside the one
+// sensor rotation (here (-0.5, 0.5)): just inside either end is accepted, the
+// boundary itself and beyond it are refused. Binary-exact values (margin
+// 0.125, ends 0.375) keep the boundary exact.
+// REQ-SAFE-36
+TEST(PositionMechanism, AbsoluteMarginBoundaryIsStrict) {
+  const auto build = [](double min_rot, double max_rot) {
+    auto sim = Sim::FromToml(std::string{R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+[subsystems.m.motors.m]
+can_id = 1
+[subsystems.m.sensors.cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.m.m]
+tolerance_rot = 0.1
+homing = "absolute"
+absolute_sensor = "cc"
+absolute_margin_rot = 0.125
+)"} + "min_rot = " + std::to_string(min_rot) +
+                             "\nmax_rot = " + std::to_string(max_rot) + "\n");
+    sim.add<PositionNode>("m");
+  };
+  EXPECT_NO_THROW(build(-0.25, 0.374));
+  EXPECT_NO_THROW(build(-0.374, 0.25));
+  for (const auto& [min_rot, max_rot] :
+       {std::pair{-0.25, 0.375}, std::pair{-0.25, 0.376},
+        std::pair{-0.375, 0.25}, std::pair{-0.376, 0.25}}) {
+    SCOPED_TRACE(std::to_string(min_rot) + " .. " + std::to_string(max_rot));
+    try {
+      build(min_rot, max_rot);
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& e) {
+      EXPECT_NE(std::string{e.what()}.find("m.absolute_offset_rot"),
+                std::string::npos)
+          << e.what();
+    }
+  }
 }
 
 // REQ-RT-06
@@ -657,6 +747,26 @@ TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
   hood.Drive(0.5, 80ms);
   EXPECT_TRUE(hood.mech().homed());
   EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);
+}
+
+// Stator current alone is not a stop: a mechanism still moving past
+// homing_stall_rps under high load past homing_min_travel_rot and
+// homing_min_push_us + homing_stall_us never homes and faults at timeout.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingRequiresStillnessNotCurrentAlone) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.5, -0.5, 30.0);  // moving faster than homing_stall_rps
+  hood.Start();
+  hood.Drive(0.5, 20ms);
+  hood.SetMotor(2.4, -0.5, 30.0);  // past homing_min_travel_rot (0.05)
+  hood.Drive(0.5, 300ms);          // past homing_min_push_us + homing_stall_us
+  EXPECT_FALSE(hood.mech().homed());
+  EXPECT_EQ(hood.mech().fault(), PositionFault::kNone);
+  hood.ExpectHoming(-1.0);
+  hood.Drive(0.5, 250ms);  // past homing_timeout_us (500 ms)
+  EXPECT_FALSE(hood.mech().homed());
+  EXPECT_EQ(hood.mech().fault(), PositionFault::kHomingTimeout);
+  hood.ExpectNeutral();
 }
 
 // One subsystem of kRobotToml on the physics simulator (sim_gateway
@@ -876,6 +986,119 @@ TEST(PositionMechanism, DisableWhileSettlingEndsTheHomingRun) {
   EXPECT_EQ(carriage.Applied().mode, Mode::kMotionMagic);
 }
 
+// Settling after limit-switch zeroing requires home_samples (2) consecutive
+// valid slow feedback readings: one slow reading, a fast reading breaking the
+// run, or a disconnected reading breaking the run leaves the mechanism unhomed
+// and neutral until two consecutive valid slow readings arrive.
+// REQ-SAFE-36
+TEST(PositionMechanism,
+     LimitSwitchSettlingRequiresConsecutiveValidSlowSamples) {
+  Rig carriage{"carriage"};
+  carriage.SetMotor(1.0, -0.5);  // moving down: no stall
+  carriage.hw.set_digital_input("carriage", "carriage_home", true);  // open
+  carriage.Start();
+  carriage.Drive(0.5, 30ms);
+  carriage.ExpectHoming(-1.0);
+  carriage.hw.set_digital_input("carriage", "carriage_home", false);  // closed
+  carriage.Drive(0.5, 30ms);  // switch sets the frame while moving
+  ASSERT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+  ASSERT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  // SimHardware publishes after the node ticks, so a motor update set before
+  // a 5 ms step is read by the node on the following 5 ms step.
+  // 1 valid slow tick -> still !homed() & neutral.
+  carriage.SetMotor(1.0, 0.0);
+  carriage.Drive(0.5, 5ms);  // reads -0.5; publishes 0.0
+  carriage.SetMotor(1.0, -0.5);
+  carriage.Drive(0.5, 5ms);  // reads 0.0 (slow #1); publishes -0.5
+  ASSERT_TRUE(carriage.mech().state().connected());
+  ASSERT_DOUBLE_EQ(carriage.mech().state().velocity_rps(), 0.0);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  // 1 fast tick breaks the run; the next valid slow tick is only #1 again.
+  carriage.SetMotor(1.0, 0.0);
+  carriage.Drive(0.5, 5ms);  // reads -0.5 (resets run); publishes 0.0
+  ASSERT_DOUBLE_EQ(carriage.mech().state().velocity_rps(), -0.5);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  carriage.hw.set_connected("carriage", "carriage", false);
+  carriage.Drive(0.5, 5ms);  // reads 0.0 (slow #1); publishes disconnected
+  ASSERT_TRUE(carriage.mech().state().connected());
+  ASSERT_DOUBLE_EQ(carriage.mech().state().velocity_rps(), 0.0);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  // 1 disconnected tick breaks the run; the next valid slow tick is only #1.
+  carriage.hw.set_connected("carriage", "carriage", true);
+  carriage.SetMotor(1.0, 0.0);
+  carriage.Drive(0.5, 5ms);  // reads disconnected (resets run); publishes 0.0
+  ASSERT_FALSE(carriage.mech().state().connected());
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  carriage.Drive(0.5, 5ms);  // reads 0.0 (slow #1); publishes 0.0
+  ASSERT_TRUE(carriage.mech().state().connected());
+  ASSERT_DOUBLE_EQ(carriage.mech().state().velocity_rps(), 0.0);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  // 2nd consecutive valid slow tick completes settling -> homed.
+  carriage.Drive(0.5, 5ms);  // reads 0.0 (slow #2)
+  EXPECT_TRUE(carriage.mech().homed());
+  EXPECT_EQ(carriage.Applied().mode, Mode::kMotionMagic);
+}
+
+// Settling gets its own homing_timeout_us counted from the first live tick
+// after the switch zeroes the frame: neither time spent pushing before the
+// switch nor idle time without a goal after zeroing eats into it.
+// REQ-SAFE-36
+TEST(PositionMechanism,
+     LimitSwitchSettlingTimeoutCountsFromFirstLiveTickAfterZero) {
+  {
+    SCOPED_TRACE("push 400 ms, hit switch while moving, settle 200 ms");
+    Rig carriage{"carriage"};
+    carriage.SetMotor(1.0, -0.5);
+    carriage.hw.set_digital_input("carriage", "carriage_home", true);  // open
+    carriage.Start();
+    carriage.Drive(0.5, 400ms);  // 400 ms of 500 ms homing_timeout_us
+    carriage.ExpectHoming(-1.0);
+    carriage.hw.set_digital_input("carriage", "carriage_home", false);
+    carriage.Drive(0.5, 200ms);  // 600 ms total > 500 ms, only ~200 ms settling
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+    EXPECT_FALSE(carriage.mech().homed());
+    carriage.ExpectNeutral();
+    carriage.SetMotor(1.0, 0.0);
+    carriage.Drive(0.5, 20ms);
+    EXPECT_TRUE(carriage.mech().homed());
+  }
+  {
+    SCOPED_TRACE("zeroed without a live goal, idle 600 ms, then live goal");
+    Rig carriage{"carriage"};
+    carriage.SetMotor(1.0, -0.5);
+    carriage.hw.set_digital_input("carriage", "carriage_home", false);
+    carriage.Start();
+    carriage.sim.step(600ms);  // switch zeroes while moving; no live goal
+    ASSERT_NEAR(carriage.mech().position_rot(), 0.0, 1e-9);
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.mech().phase(), PositionPhase::kUnhomed);
+    EXPECT_FALSE(carriage.mech().homed());
+
+    carriage.Drive(0.5, 100ms);  // first live tick starts the 500 ms timer
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+    EXPECT_FALSE(carriage.mech().homed());
+    carriage.ExpectNeutral();
+
+    carriage.Drive(0.5, 450ms);  // past 500 ms from the first live tick
+    EXPECT_EQ(carriage.mech().fault(), PositionFault::kHomingTimeout);
+    carriage.ExpectNeutral();
+  }
+}
+
 // A mechanism that keeps moving (no stop within reach) times out and faults.
 // REQ-SAFE-36
 TEST(PositionMechanism, StallHomingTimesOutWhileStillMoving) {
@@ -1048,6 +1271,43 @@ TEST(PositionMechanism, AbsoluteHomingWaitsForAlignedSamples) {
   EXPECT_EQ(wrist.Applied().mode, Mode::kMotionMagic);
 }
 
+// REQ-SAFE-05: absolute homing compares sample ages from the same latched
+// State (position_age()), so it homes before the bridge's clock mapping
+// converges, and refuses an unknown age (UINT32_MAX).
+// REQ-SAFE-36
+TEST(PositionMechanism,
+     AbsoluteHomingBeforeClockMappingConvergesAndRefusesUnknownAge) {
+  {
+    Rig wrist{"wrist"};
+    const auto& link = wrist.sim.node("wrist").extension<HardwareLink>();
+    wrist.SetMotor(5.0, 1.0);
+    wrist.hw.set_cancoder("wrist", "angle", 0.1, 1.0, 2'000, 0);
+    wrist.Start();  // 10 ms: short of the 8 states the mapping needs
+    ASSERT_FALSE(link.sample_time()) << "the mapping has converged already";
+    EXPECT_TRUE(wrist.mech().homed());
+    EXPECT_NEAR(wrist.mech().position_rot(), 0.35, 1e-9);
+    wrist.Drive(0.35, 10ms);
+    ASSERT_FALSE(link.sample_time()) << "the mapping has converged already";
+    EXPECT_EQ(wrist.Applied().mode, Mode::kMotionMagic);
+    EXPECT_NEAR(wrist.Applied().demand, 5.0, 1e-9);
+  }
+  {
+    Rig wrist{"wrist"};
+    wrist.SetMotor(5.0, 1.0);
+    wrist.hw.set_cancoder("wrist", "angle", 0.1, 1.0, UINT32_MAX, 0);
+    wrist.Start();
+    wrist.Drive(0.35, 80ms);
+    EXPECT_FALSE(wrist.mech().homed());
+    EXPECT_EQ(wrist.mech().phase(), PositionPhase::kUnhomed);
+    wrist.ExpectNeutral();
+
+    wrist.hw.set_cancoder("wrist", "angle", 0.1, 1.0, 4'000, 0);
+    wrist.Drive(0.35, 20ms);
+    EXPECT_TRUE(wrist.mech().homed());
+    EXPECT_NEAR(wrist.mech().position_rot(), 0.35, 1e-9);
+  }
+}
+
 // A goal short of the target that stops moving faults (stall), latched
 // neutral; a stale link does not clear it, a Driver Station disable does.
 // REQ-SAFE-36
@@ -1074,6 +1334,45 @@ TEST(PositionMechanism, StallFaultLatchesUntilTheDriverStationDisables) {
   EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
   lift.Drive(1.0, 20ms);
   EXPECT_EQ(lift.Applied().mode, Mode::kMotionMagic);
+}
+
+// clear_fault() called inside update() clears a latched fault without
+// disabling the Driver Station, returning the mechanism to driving.
+// REQ-SAFE-36
+TEST(PositionMechanism, ClearFaultInsideUpdateResumesDrivingWhileEnabled) {
+  struct ClearableNode {
+    explicit ClearableNode(Node& node)
+        : mech{node, node.name()}, target{node} {}
+    void update() {
+      if (clear_next) {
+        mech.clear_fault();
+        clear_next = false;
+      }
+      if (const control::PositionTarget* t = target.get()) {
+        mech.set_goal(t->position_rot(), t->feedforward_v());
+      } else {
+        mech.stop();
+      }
+      mech.update();
+    }
+    PositionMechanism mech;
+    Target<control::PositionTarget> target;
+    bool clear_next = false;
+  };
+  Rig<ClearableNode> lift{"lift"};
+  lift.Start();
+  lift.Drive(1.0, 250ms);  // stalls (velocity 0) past stall_time_us (200 ms)
+  ASSERT_EQ(lift.mech().phase(), PositionPhase::kFaulted);
+  ASSERT_EQ(lift.mech().fault(), PositionFault::kStall);
+  lift.ExpectNeutral();
+
+  lift.node.clear_next = true;
+  lift.Drive(1.0, 20ms);  // stays enabled throughout
+  EXPECT_FALSE(lift.node.clear_next);
+  EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+  EXPECT_EQ(lift.mech().phase(), PositionPhase::kMoving);
+  EXPECT_EQ(lift.Applied().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(lift.Applied().demand, 1.0);
 }
 
 // A goal not reached within move_timeout_us faults, even while the motor
@@ -1140,6 +1439,37 @@ TEST(PositionMechanism, TurretWrapPicksTheNearestEquivalentInRange) {
   EXPECT_NEAR(demand_for(-0.6, 0.5), -0.5, 1e-9);  // the other way
 }
 
+// When max_rot - min_rot < wrap_rot (a bounded turret with a dead zone), a
+// goal with no equivalent inside [min_rot, max_rot] clamps to the stop nearest
+// the goal instead of wrapping across the range to the far stop.
+// REQ-SAFE-36
+TEST(PositionMechanism, TurretWrapClampsUnreachableGoalToNearestStop) {
+  Rig sector{"sector"};
+  sector.Start();
+  const auto demand_for = [&](double position_rot, double goal_rot) {
+    SCOPED_TRACE(std::to_string(position_rot) + " -> " +
+                 std::to_string(goal_rot));
+    sector.SetMotor(position_rot);
+    sector.Drive(goal_rot, 20ms);
+    EXPECT_NEAR(sector.mech().goal_rot(), sector.Applied().demand, 1e-12);
+    return sector.Applied().demand;
+  };
+  // Dead zone is (0.75, 1.0), midpoint 0.875: -0.01 / 0.99 is 0.01 from min
+  // (0.0) and 0.24 from max (0.75); -0.20 / 0.80 is 0.05 from max and 0.20
+  // from min.
+  EXPECT_NEAR(demand_for(0.1, -0.01), 0.0, 1e-9);
+  EXPECT_NEAR(demand_for(0.7, 0.99), 0.0, 1e-9);
+  EXPECT_NEAR(demand_for(0.1, -0.20), 0.75, 1e-9);
+  EXPECT_NEAR(demand_for(0.7, 0.80), 0.75, 1e-9);
+  // Midpoint of the dead zone breaks ties toward the nearer stop.
+  EXPECT_NEAR(demand_for(0.1, 0.875), 0.0, 1e-9);
+  EXPECT_NEAR(demand_for(0.7, 0.875), 0.75, 1e-9);
+  // Equivalents inside [min_rot, max_rot] and far-out positions still wrap.
+  EXPECT_NEAR(demand_for(0.1, 1.5), 0.5, 1e-9);
+  EXPECT_NEAR(demand_for(-2.0, -0.01), 0.0, 1e-9);
+  EXPECT_NEAR(demand_for(3.0, -0.01), 0.0, 1e-9);
+}
+
 // at_goal needs at_goal_debounce_us of continuous tolerance, and leaves at
 // once.
 TEST(PositionMechanism, AtGoalDebounceEdges) {
@@ -1174,6 +1504,89 @@ TEST(PositionMechanism, HoldLatchesThePositionAtTheStart) {
   arm.ExpectNeutral();
   arm.Drive(9.0, 20ms);
   EXPECT_DOUBLE_EQ(arm.Applied().demand, 0.32);
+}
+
+// Huge finite goals with wrap_rot < 1 must not overflow wrap() into NaN/Inf.
+// REQ-SAFE-36
+TEST(PositionMechanism, WrapHandlesHugeFiniteGoalWithoutOverflow) {
+  constexpr const char* kSmallWrapToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.turret.motors.turret]
+can_id = 1
+feedback = "RemoteCANcoder"
+feedback_sensor = "turret_cc"
+position_frame = "absolute"
+[subsystems.turret.sensors.turret_cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.turret.turret]
+tolerance_rot = 0.005
+wrap_rot = 0.1
+min_rot = -0.075
+max_rot = 0.075
+)";
+  Sim sim = Sim::FromToml(kSmallWrapToml);
+  auto& node = sim.add<PositionNode>("turret");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  hw.set_motor("turret", "turret", 0.0, 0.0);
+  sim.step(10ms);
+
+  for (const double huge_goal : {1e308, -1e308}) {
+    SCOPED_TRACE(huge_goal);
+    for (int i = 0; i < 4; ++i) {
+      PublishTarget(sim, "turret", "teleop",
+                    control::PositionTarget{huge_goal, 0.0});
+      sim.step(5ms);
+    }
+    EXPECT_TRUE(node.mech.driving());
+    EXPECT_TRUE(std::isfinite(node.mech.goal_rot()));
+    EXPECT_GE(node.mech.goal_rot(), -0.075);
+    EXPECT_LE(node.mech.goal_rot(), 0.075);
+    const hardware::MotorRequest applied = hw.applied_motor("turret", "turret");
+    EXPECT_EQ(applied.mode, Mode::kMotionMagic);
+    EXPECT_DOUBLE_EQ(applied.demand, node.mech.goal_rot());
+  }
+}
+
+// Non-finite motor position (e.g. offset subtraction overflow) must neither
+// latch into hold() nor pass home()'s frame-jump check.
+// REQ-SAFE-36
+TEST(PositionMechanism, NonFinitePositionDoesNotLatchHoldOrPassHomeFrameJump) {
+  {
+    SCOPED_TRACE("hold with non-finite position_rot_ stays neutral");
+    Rig wrist{"wrist"};
+    wrist.SetMotor(-1e308);
+    wrist.hw.set_cancoder("wrist", "angle", 0.0, 0.0);
+    wrist.Start();
+    ASSERT_TRUE(wrist.mech().homed());
+
+    wrist.SetMotor(1e308);  // 1e308 - (-1e308) = +inf in software frame
+    wrist.sim.step(10ms);   // let SimHardware publish +inf and the node read it
+    ASSERT_FALSE(std::isfinite(wrist.mech().position_rot()));
+    wrist.node.hold_mode = true;
+    wrist.Drive(0.25, 20ms);
+    wrist.ExpectNeutral();
+  }
+  {
+    SCOPED_TRACE("stall homing rejects non-finite position_rot_ frame jump");
+    Rig hood{"hood"};
+    hood.SetMotor(-1e308, 0.0, 30.0);
+    hood.Start();
+    hood.Drive(0.5, 300ms);  // homes at raw -1e308 -> offset = -1e308
+    ASSERT_TRUE(hood.mech().homed());
+
+    // Device reset drops zeroed() while keeping position_offset = -1e308.
+    hood.hw.reset_device("hood", "hood");
+    hood.SetMotor(1e308, 0.0,
+                  30.0);  // 1e308 - (-1e308) = +inf; inf - inf = NaN
+    hood.Drive(0.5, 300ms);
+    EXPECT_FALSE(hood.mech().homed());
+  }
 }
 
 }  // namespace

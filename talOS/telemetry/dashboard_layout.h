@@ -148,19 +148,22 @@ std::vector<std::string> RequiredChannels(const DashboardLayout& layout);
 // `alerts` widget), which the layout cannot name.
 bool CarriesAlertChannels(const DashboardLayout& layout);
 
-// The hardware bridge's RoboRIO-link alert, which every drive feed carries
-// whatever the layout's widgets, so the page can name a lost RoboRIO link
-// (REQ-OPS-36). A dictionary without it (a graph with no hardware bridge)
-// simply lacks it: nothing requires it.
+// The hardware bridge's RoboRIO-link and protocol-mismatch alerts, which every
+// drive feed carries whatever the layout's widgets, so the page can name a
+// protocol mismatch or a lost RoboRIO link (REQ-OPS-35, REQ-OPS-36). A
+// dictionary without them (a graph with no hardware bridge) simply lacks them:
+// nothing requires them.
 inline constexpr std::string_view kDriveLinkLostChannel =
     "hw/status/alert_error_link_lost";
+inline constexpr std::string_view kDriveProtocolMismatchChannel =
+    "hw/status/alert_error_protocol_mismatch";
 
 // Which dictionary channels a drive client is sent: the one rule the
 // telemetry node's budget check, the Studio bridge's channel mask and
 // /drive/layout.json share.
 struct DriveChannels {
-  // Sorted, distinct: RequiredChannels plus kDriveLinkLostChannel. A name
-  // the dictionary lacks is never sent.
+  // Sorted, distinct: RequiredChannels plus kDriveLinkLostChannel and
+  // kDriveProtocolMismatchChannel. A name the dictionary lacks is never sent.
   std::vector<std::string> named;
   bool alerts{false};  // CarriesAlertChannels: every alert channel too
   bool operator==(const DriveChannels&) const = default;

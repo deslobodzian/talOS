@@ -19,6 +19,7 @@
 
 #include "talOS/bridge/node.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/process/process.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware::bridge_test {
@@ -28,21 +29,26 @@ namespace talos::hardware::bridge_test {
 // is a test's proof that something did not happen.
 inline constexpr std::chrono::seconds kHangBound{10};
 
-// Binds a loopback UDP socket to a port the OS chooses and connects it to
-// itself, so it accepts no datagram from another socket: a bridge sending to
-// the port sees it closed (ECONNREFUSED), as if nothing were bound, while no
-// other socket can be given the port. Returns the socket, or -1.
+// Binds a UDP socket to 0.0.0.0:0 so the chosen port is not already held on a
+// non-loopback interface, then connects it to 127.0.0.1 on that port so it
+// accepts no datagram from another socket (connect narrows the local address to
+// 127.0.0.1 while still blocking later 0.0.0.0 and 127.0.0.1 binds without
+// SO_REUSEADDR). Returns the socket, or -1.
 inline int ReservePort(uint16_t& port) {
   const int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) return -1;
   sockaddr_in address{};
   address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
   socklen_t size = sizeof(address);
   if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-      getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0 ||
-      connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
-          0) {
+      getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+    close(fd);
+    return -1;
+  }
+  sockaddr_in peer = address;
+  peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) != 0) {
     close(fd);
     return -1;
   }
@@ -312,5 +318,27 @@ inline Command IntakeRequest(const config::RobotConfig& cfg, double demand) {
                        demand, 0.0};
   return request;
 }
+
+// Runs the bridge's Run() on its own thread until Stop() or destruction,
+// which stop it as SIGTERM does (process::RequestStop) and join it. The
+// node's counters are read only once it has stopped.
+class RunningBridge {
+ public:
+  explicit RunningBridge(HardwareNode& node)
+      : thread_{[&node] { node.Run(); }} {}
+  RunningBridge(const RunningBridge&) = delete;
+  RunningBridge& operator=(const RunningBridge&) = delete;
+  ~RunningBridge() { Stop(); }
+
+  void Stop() {
+    if (!thread_.joinable()) return;
+    process::RequestStop(0);
+    thread_.join();
+    process::stop_requested.store(false);
+  }
+
+ private:
+  std::thread thread_;
+};
 
 }  // namespace talos::hardware::bridge_test

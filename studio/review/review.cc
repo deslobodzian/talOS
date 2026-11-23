@@ -1,19 +1,21 @@
 #include "studio/review/review.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cerrno>
 #include <charconv>
 #include <cstring>
-#include <fstream>
-#include <iterator>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
 #include "nlohmann/json.hpp"
-#include "studio/bridge/system.h"
-#include "studio/bridge/telemetry.h"
+#include "studio/bridge/json_format.h"
 #include "talOS/launcher/session_retention.h"
 #include "talOS/telemetry/frames.h"
 
@@ -88,44 +90,95 @@ struct SessionEntry {
   std::vector<std::pair<std::string, std::uintmax_t>> files;
 };
 
-// The largest manifest.json the listing parses; a larger one (no launcher
-// writes one) lists the session without its times. The launcher's
-// session_class file is one short line.
-constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
-constexpr std::size_t kMaxClassFileBytes = 256;
+// Reads one regular non-symlink file up to `max_bytes` using O_NOFOLLOW +
+// O_NONBLOCK + fstat + bounded chunked reads, so symlinks, FIFOs, device nodes,
+// and growing files never escape confinement, hang, or allocate unbounded
+// memory (REQ-OPS-42, REQ-SAFE-35).
+std::optional<std::string> ReadBoundedRegularFile(const fs::path& path,
+                                                  std::uintmax_t max_bytes) {
+  std::error_code error;
+  const fs::file_status st = fs::symlink_status(path, error);
+  if (error || fs::is_symlink(st) || !fs::is_regular_file(st)) {
+    return std::nullopt;
+  }
+  struct ScopedFd {
+    int fd{-1};
+    ~ScopedFd() {
+      if (fd >= 0) ::close(fd);
+    }
+  };
+  const ScopedFd file{
+      ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)};
+  if (file.fd < 0) return std::nullopt;
+  struct stat sb {};
+  if (::fstat(file.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size <= 0 ||
+      static_cast<std::uintmax_t>(sb.st_size) > max_bytes) {
+    return std::nullopt;
+  }
+  std::string body;
+  body.reserve(static_cast<std::size_t>(sb.st_size));
+  std::array<char, 8192> chunk{};
+  for (;;) {
+    const ssize_t got = ::read(file.fd, chunk.data(), chunk.size());
+    if (got == 0) break;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      return std::nullopt;
+    }
+    if (body.size() + static_cast<std::size_t>(got) > max_bytes) {
+      return std::nullopt;
+    }
+    body.append(chunk.data(), static_cast<std::size_t>(got));
+  }
+  if (body.empty()) return std::nullopt;
+  return body;
+}
+
+// Reads one regular non-symlink JSON file from a session directory up to
+// `max_bytes`, returning 404 when absent, symlinked, non-regular, empty or
+// oversized.
+Response ReadSessionJsonFile(const fs::path& path, std::uintmax_t max_bytes,
+                             std::string_view missing_message) {
+  auto body = ReadBoundedRegularFile(path, max_bytes);
+  if (!body) return Error(404, std::string{missing_message});
+  return {200, "application/json", std::move(*body)};
+}
 
 // A session's class from what the launcher already decided, never from its
 // logs: a simulation, or a session without a manifest, is "other", as
-// retention classifies it; else the launcher's session_class
-// file when it is current (written by RecordedMatch: "match" for good,
-// "other" while the event logs hold the bytes it counted), else "unknown".
+// retention classifies it; else the launcher's cached session_class verdict
+// when current (CachedRecordedMatch), else "unknown".
 std::string_view ClassOf(const fs::path& dir, const SessionEntry& entry) {
   if (!entry.classified) return "other";
   std::uintmax_t log_bytes = 0;
   for (const auto& [name, bytes] : entry.files) {
     if (name.ends_with(".tlog")) log_bytes += bytes;
   }
-  std::ifstream stream{dir / std::string{talos::launcher::kSessionClassFile}};
-  std::string line(kMaxClassFileBytes, '\0');
-  stream.read(line.data(), static_cast<std::streamsize>(line.size()));
-  line.resize(static_cast<std::size_t>(stream.gcount()));
-  std::istringstream cached{line};
-  std::string verdict;
-  std::uintmax_t bytes = 0;
-  if (cached >> verdict >> bytes) {
-    if (verdict == "match") return "match";
-    if (verdict == "other" && bytes == log_bytes) return "other";
-  }
+  const auto verdict = talos::launcher::CachedRecordedMatch(dir, log_bytes);
+  if (verdict == talos::launcher::MatchVerdict::kMatch) return "match";
+  if (verdict == talos::launcher::MatchVerdict::kOther) return "other";
   return "unknown";
 }
 
-// A library session: a directory holding a manifest or an event log.
+// A library session: a directory holding a regular non-symlink manifest or
+// event log.
 bool IsSession(const fs::path& dir) {
   std::error_code error;
-  if (fs::is_regular_file(dir / "manifest.json", error)) return true;
+  const fs::file_status manifest_st =
+      fs::symlink_status(dir / "manifest.json", error);
+  if (!error && !fs::is_symlink(manifest_st) &&
+      fs::is_regular_file(manifest_st)) {
+    return true;
+  }
+  error.clear();
   for (fs::directory_iterator it{dir, error};
        !error && it != fs::directory_iterator{}; it.increment(error)) {
-    if (it->path().extension() == ".tlog") return true;
+    std::error_code entry_error;
+    const fs::file_status st = it->symlink_status(entry_error);
+    if (!entry_error && !fs::is_symlink(st) && fs::is_regular_file(st) &&
+        it->path().extension() == ".tlog") {
+      return true;
+    }
   }
   return false;
 }
@@ -139,7 +192,8 @@ std::optional<SessionEntry> ReadEntry(const fs::path& dir) {
   for (fs::directory_iterator it{dir, error};
        !error && it != fs::directory_iterator{}; it.increment(error)) {
     std::error_code file_error;
-    if (!it->is_regular_file(file_error)) continue;
+    const fs::file_status st = it->symlink_status(file_error);
+    if (file_error || fs::is_symlink(st) || !fs::is_regular_file(st)) continue;
     const std::string name = it->path().filename().string();
     session = session || name == "manifest.json" || name.ends_with(".tlog");
     const auto bytes = it->file_size(file_error);
@@ -153,26 +207,25 @@ std::optional<SessionEntry> ReadEntry(const fs::path& dir) {
   // A launch's manifest that does not say it was a simulation is
   // classified, as retention classifies it (launcher::InspectSession).
   entry.classified = manifest_file != entry.files.end();
-  std::ifstream stream;
   if (entry.classified && manifest_file->second <= kMaxManifestBytes) {
-    stream.open(dir / "manifest.json");
-  }
-  if (stream.is_open()) {
-    const auto manifest = nlohmann::json::parse(
-        std::string{std::istreambuf_iterator<char>{stream}, {}}, nullptr,
-        /*allow_exceptions=*/false);
-    if (manifest.is_object()) {
-      for (const auto& [key, field] :
-           {std::pair{"start_wall_ns", &entry.start_wall_ns},
-            std::pair{"end_wall_ns", &entry.end_wall_ns}}) {
-        const auto it = manifest.find(key);
-        if (it != manifest.end() && it->is_number_integer()) {
-          *field = it->get<std::int64_t>();
+    if (const auto body =
+            ReadBoundedRegularFile(dir / "manifest.json", kMaxManifestBytes)) {
+      const auto manifest = nlohmann::json::parse(*body, nullptr,
+                                                  /*allow_exceptions=*/false);
+      if (manifest.is_object()) {
+        for (const auto& [key, field] :
+             {std::pair{"start_wall_ns", &entry.start_wall_ns},
+              std::pair{"end_wall_ns", &entry.end_wall_ns}}) {
+          const auto it = manifest.find(key);
+          if (it != manifest.end() && it->is_number_integer()) {
+            *field = it->get<std::int64_t>();
+          }
         }
+        const auto simulation = manifest.find("simulation");
+        entry.classified = simulation == manifest.end() ||
+                           !simulation->is_boolean() ||
+                           !simulation->get<bool>();
       }
-      const auto simulation = manifest.find("simulation");
-      entry.classified = simulation == manifest.end() ||
-                         !simulation->is_boolean() || !simulation->get<bool>();
     }
   }
   return entry;
@@ -222,7 +275,8 @@ Response Review::Get(std::string_view path, std::string_view query) {
   const std::string_view id = path.substr(0, slash);
   const std::string_view route = path.substr(slash + 1);
   if (route != "channels.json" && route != "bounds.json" &&
-      route != "snapshot" && route != "series") {
+      route != "timeline.json" && route != "declared.json" &&
+      route != "manifest.json" && route != "snapshot" && route != "series") {
     return Error(404, "not found");
   }
   Response error;
@@ -231,6 +285,9 @@ Response Review::Get(std::string_view path, std::string_view query) {
   try {
     if (route == "channels.json") return Channels(*session);
     if (route == "bounds.json") return Bounds(*session);
+    if (route == "timeline.json") return Timeline(*session);
+    if (route == "declared.json") return Declared(id);
+    if (route == "manifest.json") return Manifest(id);
     if (route == "snapshot") return Snapshot(*session, query);
     return Series(id, *session, query);
   } catch (const std::exception& e) {
@@ -389,8 +446,86 @@ Response Review::Bounds(const Session& session) const {
     out += gap.closed_at_flush ? "true" : "false";
     out += '}';
   }
-  out += "]}";
+  out += "],\"pose_topic\":";
+  if (session.pose_topic().empty()) {
+    out += "null";
+  } else {
+    AppendEscaped(out, session.pose_topic());
+  }
+  out += '}';
   return {200, "application/json", std::move(out)};
+}
+
+Response Review::Timeline(const Session& session) const {
+  std::string out{"{\"hardware_not_decoded\":"};
+  out += session.hardware_not_decoded().empty() ? "false" : "true";
+  out += ",\"modes\":[";
+  for (std::size_t i = 0; i < session.modes().size(); ++i) {
+    if (i != 0) out += ',';
+    const ModeInterval& mode = session.modes()[i];
+    out += "{\"start_ns\":";
+    AppendI64(out, mode.start_ns);
+    out += ",\"end_ns\":";
+    AppendI64(out, mode.end_ns);
+    out += ",\"mode\":";
+    AppendEscaped(out, ModeKindName(mode.mode));
+    out += ",\"fms\":";
+    out += mode.fms ? "true" : "false";
+    out += '}';
+  }
+  out += "],\"modes_dropped\":";
+  out += std::to_string(session.modes_dropped());
+  out += ",\"alerts\":[";
+  for (std::size_t i = 0; i < session.alerts().size(); ++i) {
+    if (i != 0) out += ',';
+    const AlertInterval& alert = session.alerts()[i];
+    const auto& channel = session.channel(alert.channel());
+    out += "{\"channel\":";
+    AppendEscaped(out, channel.name);
+    out += ",\"level\":";
+    AppendEscaped(out, AlertLevelName(channel.alert));
+    out += ",\"start_ns\":";
+    AppendI64(out, alert.start_ns);
+    out += ",\"end_ns\":";
+    AppendI64(out, alert.end_ns);
+    out += ",\"active_at_end\":";
+    out += alert.active_at_end() ? "true" : "false";
+    out += '}';
+  }
+  out += "],\"alerts_dropped\":";
+  out += std::to_string(session.alerts_dropped());
+  out += ",\"runs\":[";
+  for (std::size_t i = 0; i < session.runs().size(); ++i) {
+    if (i != 0) out += ',';
+    const RunInterval& run = session.runs()[i];
+    out += "{\"node\":";
+    AppendEscaped(out, run.node);
+    out += ",\"start_ns\":";
+    AppendI64(out, run.start_ns);
+    out += ",\"end_ns\":";
+    if (run.end_ns) {
+      AppendI64(out, *run.end_ns);
+    } else {
+      out += "null";
+    }
+    out += ",\"reason\":";
+    AppendEscaped(out, run.reason);
+    out += '}';
+  }
+  out += "],\"runs_dropped\":";
+  out += std::to_string(session.runs_dropped());
+  out += '}';
+  return {200, "application/json", std::move(out)};
+}
+
+Response Review::Declared(std::string_view id) const {
+  return ReadSessionJsonFile(library_ / std::string{id} / "graph.json",
+                             kMaxDeclaredBytes, "no declared graph");
+}
+
+Response Review::Manifest(std::string_view id) const {
+  return ReadSessionJsonFile(library_ / std::string{id} / "manifest.json",
+                             kMaxManifestBytes, "no manifest");
 }
 
 Response Review::Snapshot(const Session& session, std::string_view query) {
@@ -405,21 +540,26 @@ Response Review::Snapshot(const Session& session, std::string_view query) {
   std::string out{"{\"t_ns\":"};
   AppendI64(out, t_ns);
   out += ",\"channels\":{";
+  constexpr std::size_t kClosingBytes = 2;  // "}}"
+  std::string entry;
   bool first = true;
   for (const Sample& sample : samples) {
     const auto& channel = session.channel(sample.channel);
-    if (!first) out += ',';
-    first = false;
-    AppendEscaped(out, channel.name);
-    out += ":{\"value\":";
+    entry.clear();
+    if (!first) entry += ',';
+    AppendEscaped(entry, channel.name);
+    entry += ":{\"value\":";
     if (sample.reading) {
-      AppendSample(out, channel.kind, sample.raw);
+      AppendSample(entry, channel.kind, sample.raw);
     } else {
-      out += "null";
+      entry += "null";
     }
-    out += ",\"sample_ns\":";
-    AppendI64(out, sample.sample_ns);
-    out += '}';
+    entry += ",\"sample_ns\":";
+    AppendI64(entry, sample.sample_ns);
+    entry += '}';
+    if (out.size() + entry.size() + kClosingBytes > kMaxSnapshotBytes) break;
+    out += entry;
+    first = false;
   }
   out += "}}";
   return {200, "application/json", std::move(out)};

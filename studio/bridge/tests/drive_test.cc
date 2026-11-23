@@ -27,7 +27,8 @@ constexpr std::uint64_t kStream = 77;
 constexpr std::uint32_t kDictionaryId = 4242;
 constexpr std::int64_t kMs = 1'000'000;
 
-// Channel 0 is named by the layout, 4 is an alert, the rest neither.
+// Channel 0 is named by the layout, 4 and 5 are hardware link/protocol alerts,
+// the rest neither.
 std::vector<ChannelDef> Dictionary() {
   return {
       {"drive/velocity", "m/s", {}, Talos::Telemetry::ChannelKind_Double},
@@ -35,6 +36,11 @@ std::vector<ChannelDef> Dictionary() {
       {"pose/valid", "", {}, Talos::Telemetry::ChannelKind_Bool},
       {"hw/status/clock_boot_id", "", {}, Talos::Telemetry::ChannelKind_UInt},
       {"hw/status/alert_error_link_lost",
+       "",
+       {},
+       Talos::Telemetry::ChannelKind_Bool,
+       Talos::Telemetry::AlertLevel_Error},
+      {"hw/status/alert_error_protocol_mismatch",
        "",
        {},
        Talos::Telemetry::ChannelKind_Bool,
@@ -71,11 +77,11 @@ void Tick(TelemetryState& state, std::uint64_t sequence, double velocity,
   std::vector<std::string> pages;
   flatbuffers::FlatBufferBuilder builder;
   const Talos::Telemetry::Pose chassis{1, 2, 0, 0, 0, 0.5};
-  const std::vector<std::uint32_t> channels{0, 1, 2, 3, 4};
-  const std::vector<std::uint64_t> values{RawFromDouble(velocity), inhibit, 1,
-                                          9, 0};
+  const std::vector<std::uint32_t> channels{0, 1, 2, 3, 4, 5};
+  const std::vector<std::uint64_t> values{
+      RawFromDouble(velocity), inhibit, 1, 9, 0, 0};
   ASSERT_TRUE(talos::telemetry::EncodeValuePages(
-      builder, PageHeader{kStream, sequence, 1000 + sequence, kDictionaryId, 5},
+      builder, PageHeader{kStream, sequence, 1000 + sequence, kDictionaryId, 6},
       chassis, true, channels, values, {},
       [&](std::span<const std::uint8_t> page,
           const talos::telemetry::PageSpan&) {
@@ -142,7 +148,7 @@ TEST(DriveFeed, SendsTheDictionaryThenOnlyItsMask) {
     bool alerts;
     std::set<std::uint32_t> expected;
   };
-  for (const Case& c : {Case{false, {0}}, Case{true, {0, 4}}}) {
+  for (const Case& c : {Case{false, {0}}, Case{true, {0, 4, 5}}}) {
     SCOPED_TRACE(c.alerts ? "with an alerts widget" : "without");
     TelemetryState state = WithDictionary();
     Tick(state, 1, 0.5);
@@ -175,10 +181,10 @@ TEST(DriveFeed, SendsTheDictionaryThenOnlyItsMask) {
 }
 
 // REQ-OPS-35
-// The RoboRIO link's alert channel reaches a drive client whatever the
-// layout's widgets, so the page can name a lost link: a layout with no
-// `alerts` widget gets it beside its own channel, and one with an `alerts`
-// widget gets the same channels.
+// The RoboRIO link and protocol-mismatch alert channels reach a drive client
+// whatever the layout's widgets, so the page can name a protocol mismatch or a
+// lost link: a layout with no `alerts` widget gets both beside its own channel,
+// and one with an `alerts` widget gets the same channels.
 TEST(DriveFeed, CarriesTheRoboRioLinkChannelWithoutAnAlertsWidget) {
   const std::string number =
       "[[widgets]]\nkind = \"number\"\nat = [0, 0, 1, 1]\n"
@@ -197,7 +203,7 @@ TEST(DriveFeed, CarriesTheRoboRioLinkChannelWithoutAnAlertsWidget) {
     Received received;
     Tick(state, 1, 0.5);
     Pump(feed, state, mask.For(state), 0, received);
-    EXPECT_EQ(received.channels(), (std::set<std::uint32_t>{0, 4}));
+    EXPECT_EQ(received.channels(), (std::set<std::uint32_t>{0, 4, 5}));
   }
 }
 
@@ -382,10 +388,10 @@ TEST(DriveSummary, CapKeepsWholeNodesAndCountsTheRest) {
 // REQ-OPS-35
 // The summary says what the `subsystems` widget shows and channels cannot:
 // each member the launcher supervises, in its manifest's order (the sim
-// gateway the config does not list included, the Studio bridge itself
-// left out), alive from the registry (a dead node raises no alert), its
-// lane from its Target's selection, restarts and quarantine from the
-// manifest, critical from the config by name. Without a manifest the
+// gateway and the Studio bridge included, with `studio_bridge` non-critical so
+// its restarts show on /drive), alive from the registry (a dead node raises no
+// alert), its lane from its Target's selection, restarts and quarantine from
+// the manifest, critical from the config by name. Without a manifest the
 // config's roster is listed and it says so instead of reporting zero
 // restarts as a fact.
 TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
@@ -393,7 +399,7 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
                                              {"drivetrain", true},
                                              {"intake", false},
                                              {"shooter", true}};
-  std::vector<talos::introspect::NodeSnapshot> registry(3);
+  std::vector<talos::introspect::NodeSnapshot> registry(4);
   registry[0].name = "hardware_node";
   registry[0].alive = true;
   registry[0].session_id = 41;
@@ -403,6 +409,8 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   registry[2].name = "intake";  // its row outlived it
   registry[2].alive = false;
   registry[2].selections.push_back({{"teleop"}, 1, 0});
+  registry[3].name = "studio_bridge";
+  registry[3].alive = true;
   // As the launcher writes it with the simulation's gateway and Studio.
   const std::string manifest =
       R"({"session_id": 42, "nodes": [)"
@@ -411,7 +419,7 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
       R"({"name": "intake", "restart_count": 5, "quarantined": true},)"
       R"({"name": "shooter", "restart_count": 0, "quarantined": false},)"
       R"({"name": "sim_gateway", "restart_count": 2, "quarantined": false},)"
-      R"({"name": "studio_bridge", "restart_count": 0, "quarantined": false}]})";
+      R"({"name": "studio_bridge", "restart_count": 3, "quarantined": false}]})";
 
   const DriveSummary summary = BuildDriveSummary(config, &registry, manifest);
   EXPECT_EQ(summary.session, "42");
@@ -419,9 +427,9 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   std::vector<std::string> names;
   names.reserve(summary.nodes.size());
   for (const auto& node : summary.nodes) names.push_back(node.name);
-  ASSERT_EQ(names,
-            (std::vector<std::string>{"hardware_node", "drivetrain", "intake",
-                                      "shooter", "sim_gateway"}));
+  ASSERT_EQ(names, (std::vector<std::string>{"hardware_node", "drivetrain",
+                                             "intake", "shooter", "sim_gateway",
+                                             "studio_bridge"}));
   const auto& hardware = summary.nodes[0];
   EXPECT_TRUE(hardware.alive);
   EXPECT_FALSE(hardware.drives.has_value());
@@ -439,6 +447,11 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   const auto& gateway = summary.nodes[4];
   EXPECT_EQ(gateway.restarts, 2u);
   EXPECT_TRUE(gateway.critical) << "a member the config does not list";
+  const auto& bridge = summary.nodes[5];
+  EXPECT_TRUE(bridge.alive);
+  EXPECT_FALSE(bridge.critical) << "studio_bridge is non-critical";
+  EXPECT_EQ(bridge.restarts, 3u);
+  EXPECT_FALSE(bridge.quarantined);
 
   const DriveSummary unsupervised =
       BuildDriveSummary(config, &registry, "{not json");
@@ -448,6 +461,221 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   EXPECT_EQ(unsupervised.nodes[2].name, "intake");
   EXPECT_FALSE(unsupervised.nodes[2].critical);
   EXPECT_EQ(unsupervised.nodes[2].restarts, 0u);
+}
+
+// REQ-OPS-35
+// Integration of BuildDriveSummary and DriveSummaryJson against a full
+// launcher-shaped manifest.json (every key the launcher writes, including
+// hardware_node, subsystems, sim_gateway and studio_bridge): the JSON stays
+// valid and preserves restarts, quarantine, criticality and liveness, and a
+// serving studio_bridge stays alive even when the registry has no row for it.
+TEST(DriveSummary, BuildsFromLauncherManifestShape) {
+  const std::vector<DriveRosterEntry> config{{"hardware_node", true},
+                                             {"gyro", false},
+                                             {"swerve_module", true},
+                                             {"telemetry", false}};
+  std::vector<talos::introspect::NodeSnapshot> registry(3);
+  registry[0].name = "hardware_node";
+  registry[0].alive = true;
+  registry[0].session_id = 1794813782;
+  registry[1].name = "swerve_module";
+  registry[1].alive = true;
+  registry[1].selections.push_back({{"teleop", "auto"}, 2, 0});
+  registry[2].name = "telemetry";
+  registry[2].alive = true;
+  // Launcher manifest shape matching studio/tests/session_manifest.json plus
+  // studio_bridge with a restart and a quarantined gyro.
+  const std::string manifest = R"({
+    "session_id": 1794813782,
+    "config_path": "/home/robot/talos/bench/main_processor/configuration/robot_physics_sim.toml",
+    "config_sha256": "",
+    "git_revision": "",
+    "git_dirty": false,
+    "output_dir": "/tmp/talos_logs/1794813782",
+    "launcher_log": "/tmp/talos_logs/1794813782/talos.log",
+    "simulation": true,
+    "hardware_protocol_version": 8,
+    "start_wall_ns": 1794813796036418138,
+    "end_wall_ns": 0,
+    "stopped_before_start": false,
+    "nodes": [
+      {
+        "name": "hardware_node",
+        "target": "//talOS/bridge:hardware_node",
+        "binary_path": "bazel-bin/talOS/bridge/hardware_node",
+        "pid": 1205436,
+        "exit_code": 0,
+        "exit_signal": 0,
+        "restart_count": 0,
+        "quarantined": false,
+        "retry_at_monotonic_ns": 0,
+        "recorder_failed": false,
+        "log_capped": false,
+        "log_gap": false,
+        "described": true,
+        "endpoint_mismatch": false,
+        "loop_tier": "bridge",
+        "realtime": "not_requested",
+        "wake_failures": 0,
+        "stalled_arms": 0,
+        "wake_fallbacks": 0,
+        "requests_skipped": 0,
+        "requests_skipped_by_subsystem": {},
+        "record_count": 5254,
+        "runs_dropped": 0,
+        "runs": []
+      },
+      {
+        "name": "gyro",
+        "target": "//bench/main_processor/gyro:node",
+        "pid": 1205438,
+        "restart_count": 4,
+        "quarantined": true,
+        "loop_tier": "observer",
+        "runs": []
+      },
+      {
+        "name": "swerve_module",
+        "target": "//bench/main_processor/swerve_module:node",
+        "pid": 1205443,
+        "restart_count": 1,
+        "quarantined": false,
+        "loop_tier": "control",
+        "runs": []
+      },
+      {
+        "name": "telemetry",
+        "target": "//talOS/telemetry:node",
+        "pid": 1205448,
+        "restart_count": 0,
+        "quarantined": false,
+        "loop_tier": "observer",
+        "runs": []
+      },
+      {
+        "name": "sim_gateway",
+        "target": "//talOS/simulation:sim_gateway",
+        "pid": 1205452,
+        "restart_count": 0,
+        "quarantined": false,
+        "loop_tier": "bridge",
+        "runs": []
+      },
+      {
+        "name": "studio_bridge",
+        "target": "//studio/bridge:studio_bridge",
+        "pid": 1205455,
+        "restart_count": 2,
+        "quarantined": false,
+        "loop_tier": "observer",
+        "runs": []
+      }
+    ]
+  })";
+
+  const DriveSummary summary = BuildDriveSummary(config, &registry, manifest);
+  const std::string wire = DriveSummaryJson(summary);
+  ASSERT_LE(wire.size(), talos::telemetry_wire::kDriveSummaryMaxBytes);
+  const nlohmann::json parsed = nlohmann::json::parse(wire);
+  EXPECT_EQ(parsed["kind"], "talos.drive.summary");
+  EXPECT_EQ(parsed["session"], "1794813782");
+  EXPECT_EQ(parsed["supervised"], true);
+  EXPECT_EQ(parsed["registry"], true);
+  EXPECT_EQ(parsed["omitted"], 0);
+  ASSERT_EQ(parsed["nodes"].size(), 6u);
+
+  const auto& gyro = parsed["nodes"][1];
+  EXPECT_EQ(gyro["name"], "gyro");
+  EXPECT_EQ(gyro["alive"], false);
+  EXPECT_EQ(gyro["critical"], false);
+  EXPECT_EQ(gyro["restarts"], 4);
+  EXPECT_EQ(gyro["quarantined"], true);
+
+  const auto& swerve = parsed["nodes"][2];
+  EXPECT_EQ(swerve["name"], "swerve_module");
+  EXPECT_EQ(swerve["alive"], true);
+  EXPECT_EQ(swerve["critical"], true);
+  EXPECT_EQ(swerve["restarts"], 1);
+  EXPECT_EQ(swerve["drives"], "teleop");
+
+  const auto& bridge = parsed["nodes"][5];
+  EXPECT_EQ(bridge["name"], "studio_bridge");
+  EXPECT_EQ(bridge["alive"], true)
+      << "studio_bridge is serving this summary and has a readable registry";
+  EXPECT_EQ(bridge["critical"], false);
+  EXPECT_EQ(bridge["restarts"], 2);
+  EXPECT_EQ(bridge["quarantined"], false);
+
+  // Without a readable registry, studio_bridge stays alive: false with
+  // registry: false so the page still renders unknown instead of UP.
+  const DriveSummary unreadable = BuildDriveSummary(config, nullptr, manifest);
+  EXPECT_FALSE(unreadable.registry);
+  ASSERT_EQ(unreadable.nodes.size(), 6u);
+  EXPECT_FALSE(unreadable.nodes[5].alive);
+}
+
+// REQ-OPS-30, REQ-OPS-35: BuildDriveSummary reads `studio_bridge` and
+// `critical` directly from the launcher manifest (avoiding name-matching when
+// present), and falls back to config / name-matching on legacy manifests.
+TEST(DriveSummary,
+     ReadsManifestCriticalAndStudioBridgeFlagsWithLegacyFallback) {
+  const std::vector<talos::introspect::NodeSnapshot> empty_registry;
+
+  // New manifest with explicit flags and an empty config:
+  // - launcher-added bridge (`studio_bridge: true`) is alive when registry is
+  //   readable and non-critical, even under a non-default name;
+  // - a robot subsystem named `studio_bridge` (`studio_bridge: false,
+  //   critical: true`) is NOT forced alive and stays critical;
+  // - an explicit `critical: false` subsystem is respected without config.
+  const std::string modern_manifest = R"({
+    "session_id": 99,
+    "nodes": [
+      {"name": "drivetrain", "critical": true, "studio_bridge": false,
+       "restart_count": 0, "quarantined": false},
+      {"name": "telemetry", "critical": false, "studio_bridge": false,
+       "restart_count": 0, "quarantined": false},
+      {"name": "studio_bridge", "critical": true, "studio_bridge": false,
+       "restart_count": 0, "quarantined": false},
+      {"name": "viewer_bridge", "critical": false, "studio_bridge": true,
+       "restart_count": 1, "quarantined": false}
+    ]
+  })";
+  const DriveSummary modern =
+      BuildDriveSummary(/*config=*/{}, &empty_registry, modern_manifest);
+  ASSERT_EQ(modern.nodes.size(), 4u);
+  EXPECT_TRUE(modern.nodes[0].critical);
+  EXPECT_FALSE(modern.nodes[0].alive);
+  EXPECT_FALSE(modern.nodes[1].critical);
+  EXPECT_FALSE(modern.nodes[1].alive);
+  EXPECT_EQ(modern.nodes[2].name, "studio_bridge");
+  EXPECT_TRUE(modern.nodes[2].critical)
+      << "a subsystem named studio_bridge with studio_bridge:false stays "
+         "critical";
+  EXPECT_FALSE(modern.nodes[2].alive)
+      << "a subsystem named studio_bridge with studio_bridge:false is not "
+         "forced alive";
+  EXPECT_EQ(modern.nodes[3].name, "viewer_bridge");
+  EXPECT_FALSE(modern.nodes[3].critical);
+  EXPECT_TRUE(modern.nodes[3].alive)
+      << "studio_bridge:true is alive when the registry is readable";
+
+  // Legacy manifest lacking `studio_bridge` and `critical` falls back to
+  // config lookup and the `studio_bridge` name heuristic.
+  const std::vector<DriveRosterEntry> config{{"intake", false}};
+  const std::string legacy_manifest = R"({
+    "session_id": 100,
+    "nodes": [
+      {"name": "intake", "restart_count": 0, "quarantined": false},
+      {"name": "studio_bridge", "restart_count": 0, "quarantined": false}
+    ]
+  })";
+  const DriveSummary legacy =
+      BuildDriveSummary(config, &empty_registry, legacy_manifest);
+  ASSERT_EQ(legacy.nodes.size(), 2u);
+  EXPECT_FALSE(legacy.nodes[0].critical);
+  EXPECT_FALSE(legacy.nodes[0].alive);
+  EXPECT_FALSE(legacy.nodes[1].critical);
+  EXPECT_TRUE(legacy.nodes[1].alive);
 }
 
 // REQ-OPS-35
@@ -612,6 +840,227 @@ TEST(DriveSlots, ReconnectingNeverMintsBytes) {
   const auto* first_update = Talos::Telemetry::GetSizePrefixedFrame(
       got[state.dictionary_pages.size()].data());
   EXPECT_TRUE(first_update->keyframe());
+}
+
+// REQ-OPS-34, REQ-OPS-35, REQ-OPS-36, TODO.md DEPLOY-12:
+// BuildRefusalDriveSummary and DriveSummaryJson carry launch_refused and
+// refusal_reason within kDriveSummaryMaxBytes (truncating cleanly at a UTF-8
+// boundary), leave normal summaries backwards-compatible (no refusal fields),
+// and kRefusalDriveLayoutJson parses as a valid minimal layout.
+TEST(DriveSummary,
+     RefusalSummaryEncodesReasonWithinCapAndPreservesNormalShape) {
+  // Normal summary stays backwards-compatible (no launch_refused key).
+  const nlohmann::json normal =
+      nlohmann::json::parse(DriveSummaryJson(DriveSummary{}));
+  EXPECT_FALSE(normal.contains("launch_refused"));
+  EXPECT_FALSE(normal.contains("refusal_reason"));
+
+  // Valid last_refusal.json carries exact reason.
+  const DriveSummary refused = BuildRefusalDriveSummary(
+      R"({"refused":true,"reason":"error: alpha: duplicate writer on /alpha/state","config_path":"/opt/talos/current/robot.toml","wall_ns":42})");
+  EXPECT_TRUE(refused.launch_refused);
+  EXPECT_EQ(refused.refusal_reason,
+            "error: alpha: duplicate writer on /alpha/state");
+  const std::string wire = DriveSummaryJson(refused);
+  EXPECT_LE(wire.size(), talos::telemetry_wire::kDriveSummaryMaxBytes);
+  const nlohmann::json parsed = nlohmann::json::parse(wire);
+  EXPECT_EQ(parsed["kind"], "talos.drive.summary");
+  EXPECT_EQ(parsed["launch_refused"], true);
+  EXPECT_EQ(parsed["refusal_reason"],
+            "error: alpha: duplicate writer on /alpha/state");
+  EXPECT_EQ(parsed["nodes"].size(), 0u);
+  EXPECT_EQ(parsed["omitted"], 0);
+
+  // Fallback when file is empty or corrupt still produces a clear refusal.
+  const DriveSummary fallback =
+      BuildRefusalDriveSummary("{not json", "config parse error");
+  EXPECT_TRUE(fallback.launch_refused);
+  EXPECT_EQ(fallback.refusal_reason, "config parse error");
+
+  const DriveSummary empty_fallback = BuildRefusalDriveSummary("");
+  EXPECT_TRUE(empty_fallback.launch_refused);
+  EXPECT_FALSE(empty_fallback.refusal_reason.empty());
+
+  // Oversized UTF-8 reason is truncated within kDriveSummaryMaxBytes as valid
+  // JSON without splitting a multi-byte character.
+  DriveSummary huge;
+  huge.launch_refused = true;
+  for (int i = 0; i < 2000; ++i) huge.refusal_reason += "—refusal ";
+  const std::string capped = DriveSummaryJson(huge);
+  EXPECT_LE(capped.size(), talos::telemetry_wire::kDriveSummaryMaxBytes);
+  const nlohmann::json capped_parsed = nlohmann::json::parse(capped);
+  EXPECT_EQ(capped_parsed["launch_refused"], true);
+  EXPECT_TRUE(
+      capped_parsed["refusal_reason"].get<std::string>().ends_with("..."));
+
+  // Minimal layout JSON is valid and has a 1x1 grid with zero widgets.
+  const nlohmann::json layout = nlohmann::json::parse(kRefusalDriveLayoutJson);
+  EXPECT_EQ(layout["columns"], 1);
+  EXPECT_EQ(layout["rows"], 1);
+  EXPECT_TRUE(layout["widgets"].is_array());
+  EXPECT_TRUE(layout["widgets"].empty());
+}
+
+// REQ-SAFE-41: BuildDriveSummary propagates `kFlagOutputsHeld` for alive rows
+// only, and DriveSummaryJson emits `"outputs_held":true` only when true
+// (omitting the key when false so the 4,096 B cap budget stays unchanged).
+TEST(DriveSummary, OutputsHeldPropagatesForAliveRowsAndIsOmittedWhenFalse) {
+  const std::vector<DriveRosterEntry> config{
+      {"drivetrain", true}, {"shooter", true}, {"intake", false}};
+  std::vector<talos::introspect::NodeSnapshot> registry(3);
+  registry[0].name = "drivetrain";
+  registry[0].alive = true;
+  registry[0].flags = talos::introspect::kFlagOutputsHeld;
+  registry[1].name = "shooter";
+  registry[1].alive = true;
+  registry[1].flags = 0;
+  registry[2].name = "intake";
+  registry[2].alive = false;
+  registry[2].flags = talos::introspect::kFlagOutputsHeld;
+
+  const DriveSummary summary = BuildDriveSummary(config, &registry, "");
+  ASSERT_EQ(summary.nodes.size(), 3u);
+  EXPECT_TRUE(summary.nodes[0].outputs_held);
+  EXPECT_FALSE(summary.nodes[1].outputs_held);
+  EXPECT_FALSE(summary.nodes[2].outputs_held)
+      << "dead rows never report outputs_held";
+
+  const std::string wire = DriveSummaryJson(summary);
+  const nlohmann::json parsed = nlohmann::json::parse(wire);
+  ASSERT_EQ(parsed["nodes"].size(), 3u);
+  EXPECT_EQ(parsed["nodes"][0]["outputs_held"], true);
+  EXPECT_FALSE(parsed["nodes"][1].contains("outputs_held"))
+      << "outputs_held:false must be omitted from JSON: " << wire;
+  EXPECT_FALSE(parsed["nodes"][2].contains("outputs_held"))
+      << "dead node must omit outputs_held: " << wire;
+
+  const DriveSummary unreadable = BuildDriveSummary(config, nullptr, "");
+  for (const auto& node : unreadable.nodes) {
+    EXPECT_FALSE(node.outputs_held);
+  }
+}
+
+// REQ-OPS-35, REQ-OPS-37
+// A /drive client limited to update_hz never loses a masked alert that rises
+// and clears inside one update interval: the activation pulse goes when the
+// interval opens, NextDueNs wakes the bridge one interval later to send the
+// clearing tick (so update_hz is never exceeded), heartbeats at slow rates
+// restamp the held tick without dropping the pending pulse, and unmasked
+// alert channels never trigger a pulse.
+TEST(DriveFeed, CoalescedAlertActivationRespectsMaskUpdateRateAndBudget) {
+  auto tick_with_alerts = [](TelemetryState& state, std::uint64_t sequence,
+                             double velocity, std::uint64_t link_lost,
+                             std::uint64_t mismatch) {
+    std::vector<std::string> pages;
+    flatbuffers::FlatBufferBuilder builder;
+    const Talos::Telemetry::Pose chassis{1, 2, 0, 0, 0, 0.5};
+    const std::vector<std::uint32_t> channels{0, 1, 2, 3, 4, 5};
+    const std::vector<std::uint64_t> values{
+        RawFromDouble(velocity), 0, 1, 9, link_lost, mismatch};
+    ASSERT_TRUE(talos::telemetry::EncodeValuePages(
+        builder,
+        PageHeader{kStream, sequence, 1000 + sequence, kDictionaryId, 6},
+        chassis, true, channels, values, {},
+        [&](std::span<const std::uint8_t> page,
+            const talos::telemetry::PageSpan&) {
+          pages.emplace_back(reinterpret_cast<const char*>(page.data()),
+                             page.size());
+        }));
+    Ingest(state, pages);
+  };
+
+  // 1. Masked alert at 20 Hz (50 ms interval): rise on tick 2, clear on tick 3.
+  {
+    TelemetryState state = WithDictionary();
+    DriveMask mask({{"drive/velocity"}, true});
+    DriveFeed feed;
+    feed.Configure(20);
+    Received received;
+
+    tick_with_alerts(state, 1, 0.5, 0, 0);
+    Pump(feed, state, mask.For(state), 0, received);
+    ASSERT_EQ(received.value_pages.size(), 1u);
+
+    tick_with_alerts(state, 2, 0.6, 1, 0);
+    tick_with_alerts(state, 3, 0.7, 0, 0);
+    Pump(feed, state, mask.For(state), 20 * kMs, received);
+    EXPECT_EQ(received.value_pages.size(), 1u) << "held inside 50 ms interval";
+    EXPECT_EQ(feed.NextDueNs(), 50 * kMs);
+
+    // At 50 ms, the activation pulse goes and NextDueNs schedules 100 ms to
+    // clear it even with no further producer ticks.
+    Pump(feed, state, mask.For(state), 50 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 2u);
+    EXPECT_EQ(received.value_pages[1]->sequence_id(), 2u);
+    ASSERT_NE(received.value_pages[1]->channels(), nullptr);
+    ASSERT_EQ(received.value_pages[1]->channels()->size(), 1u);
+    EXPECT_EQ(received.value_pages[1]->channels()->Get(0), 4u);
+    EXPECT_EQ(received.value_pages[1]->values()->Get(0), 1u);
+    EXPECT_FALSE(feed.telemetry().current(state, &mask.For(state)));
+    EXPECT_EQ(feed.NextDueNs(), 100 * kMs);
+
+    Pump(feed, state, mask.For(state), 99 * kMs, received);
+    EXPECT_EQ(received.value_pages.size(), 2u)
+        << "update_hz must not be exceeded";
+
+    Pump(feed, state, mask.For(state), 100 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 3u);
+    EXPECT_EQ(received.value_pages[2]->sequence_id(), 3u);
+    EXPECT_TRUE(feed.telemetry().current(state, &mask.For(state)));
+    EXPECT_EQ(received.value_times,
+              (std::vector<std::int64_t>{0, 50 * kMs, 100 * kMs}));
+  }
+
+  // 2. Unmasked alert channel never triggers a pulse (REQ-OPS-35).
+  {
+    TelemetryState state = WithDictionary();
+    DriveMask mask({{"drive/velocity"}, false});  // only channel 0
+    DriveFeed feed;
+    feed.Configure(20);
+    Received received;
+
+    tick_with_alerts(state, 1, 0.5, 0, 0);
+    Pump(feed, state, mask.For(state), 0, received);
+    tick_with_alerts(state, 2, 0.5, 1, 1);
+    tick_with_alerts(state, 3, 0.5, 0, 0);
+    EXPECT_TRUE(feed.telemetry().current(state, &mask.For(state)));
+    Pump(feed, state, mask.For(state), 50 * kMs, received);
+    EXPECT_EQ(received.value_pages.size(), 1u)
+        << "unmasked alerts must not cause updates";
+  }
+
+  // 3. Slow layout (2 Hz = 500 ms interval): heartbeat at 100 ms restamps
+  // tick 1 without losing the pending pulse, which goes at 500 ms, then tick 3
+  // clears it at 1000 ms.
+  {
+    TelemetryState state = WithDictionary();
+    DriveMask mask({{"drive/velocity"}, true});
+    DriveFeed feed;
+    feed.Configure(2);
+    Received received;
+
+    tick_with_alerts(state, 1, 0.5, 0, 0);
+    Pump(feed, state, mask.For(state), 0, received);
+    tick_with_alerts(state, 2, 0.5, 1, 0);
+    tick_with_alerts(state, 3, 0.5, 0, 0);
+
+    Pump(feed, state, mask.For(state), 100 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 2u);
+    EXPECT_EQ(received.value_pages[1]->sequence_id(), 1u);
+    EXPECT_EQ(received.value_pages[1]->channels(), nullptr);
+
+    Pump(feed, state, mask.For(state), 500 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 3u);
+    EXPECT_EQ(received.value_pages[2]->sequence_id(), 2u);
+    ASSERT_NE(received.value_pages[2]->channels(), nullptr);
+    EXPECT_EQ(received.value_pages[2]->channels()->Get(0), 4u);
+    EXPECT_EQ(received.value_pages[2]->values()->Get(0), 1u);
+
+    Pump(feed, state, mask.For(state), 1000 * kMs, received);
+    ASSERT_EQ(received.value_pages.size(), 4u);
+    EXPECT_EQ(received.value_pages[3]->sequence_id(), 3u);
+    EXPECT_TRUE(feed.telemetry().current(state, &mask.For(state)));
+  }
 }
 
 }  // namespace

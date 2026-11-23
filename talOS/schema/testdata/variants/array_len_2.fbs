@@ -1,0 +1,12 @@
+// Fixed-array base schema: samples_m occupies 2 bytes followed by 2 bytes
+// of padding before level_m (bytesize = 8, minalign = 4).
+namespace schema_variant;
+
+struct Series {
+  samples_m:[ubyte:2];
+  level_m:float;
+}
+
+struct SeriesHolder {
+  series:Series;
+}

@@ -313,7 +313,7 @@ class SuperstructureAlone : public ::testing::Test {
     EXPECT_EQ(elevator->active, 0);
   }
 
-  const IntakeStatus kHolding{IntakeState::HOLDING, true};
+  const IntakeStatus kHolding{IntakeState::HOLDING, true, true};
   const ElevatorStatus kDown{ElevatorState::STOWED, 0.0, 0.0, true};
   const ElevatorStatus kUp{ElevatorState::AT_GOAL, kHighRot, kHighRot, true};
 
@@ -407,7 +407,7 @@ TEST_F(SuperstructureAlone, PieceLostWhileRaisingDoesNotStartEject) {
   Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
   ASSERT_EQ(State(), SuperstructureState::RAISING);
   Tick(SuperstructureCommand::SCORE_HIGH,
-       IntakeStatus{IntakeState::IDLE, false}, kUp);
+       IntakeStatus{IntakeState::IDLE, false, true}, kUp);
   EXPECT_EQ(State(), SuperstructureState::STOWED);
   EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
   const auto intake = LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
@@ -417,7 +417,7 @@ TEST_F(SuperstructureAlone, PieceLostWhileRaisingDoesNotStartEject) {
 }
 
 TEST_F(SuperstructureAlone, StaleScoringReleasesEjectAndDoesNotReplayIt) {
-  const IntakeStatus empty{IntakeState::IDLE, false};
+  const IntakeStatus empty{IntakeState::IDLE, false, true};
   for (bool stale_intake : {false, true}) {
     Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
     Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
@@ -1057,6 +1057,29 @@ TEST_F(IntakeAlone, EjectDurationUsesMicroseconds) {
   Drive(IntakeCommand::EJECT, 3);
   EXPECT_EQ(Status().state(), IntakeState::IDLE);
   EXPECT_EQ(Roller().mode, Mode::kNeutral);
+}
+
+// REQ-SAFE-46: disconnecting the beam-break sensor clears sensor_connected in
+// /intake/state and leaves the roller neutral while intaking (never blocking
+// indefinitely for a piece that cannot be sensed); reconnecting restores
+// sensor_connected and resumes intaking.
+TEST_F(IntakeAlone, DisconnectedSensorClearsValidityAndLeavesRollerNeutral) {
+  Drive(IntakeCommand::INTAKE, 3);
+  ASSERT_EQ(Applied().mode, Mode::kVoltage);
+  ASSERT_DOUBLE_EQ(Applied().demand, kIntakeVolts);
+  ASSERT_TRUE(Status().sensor_connected());
+
+  hw.set_connected("intake", "beam_break", false);
+  Drive(IntakeCommand::INTAKE, 5);
+  ASSERT_TRUE(talos::robot_enabled(sim.node("intake")));
+  EXPECT_FALSE(Status().sensor_connected());
+  ExpectNeutral();
+
+  hw.set_connected("intake", "beam_break", true);
+  Drive(IntakeCommand::INTAKE, 3);
+  EXPECT_TRUE(Status().sensor_connected());
+  EXPECT_EQ(Applied().mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(Applied().demand, kIntakeVolts);
 }
 
 }  // namespace

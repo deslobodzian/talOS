@@ -1,53 +1,19 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("//talOS/build:contract.bzl", "talos_messages")
 
-# BridgeStatus (namespace bridge) and its topic: hardware_node's health,
-# published every 20 ms on /hw/status.
-talos_messages(
+# Compatibility aliases for BridgeStatus (//talOS/hardware/status:messages) so
+# existing C++ and Python consumers of //talOS/bridge:messages[_py] keep their
+# labels and `bridge/bridge_status_generated.h` / `bridge.BridgeStatus` paths.
+alias(
     name = "messages",
-    srcs = ["bridge_status.fbs"],
-    include_prefix = "bridge",
-    topics = {"status": "/hw/status"},
-)
-
-# The gateway boots a stream has been in, current and recently retired: the
-# State ordering gate (via clock_offset) and every Driver Station consumer.
-cc_library(
-    name = "boot_history",
-    hdrs = ["boot_history.h"],
+    actual = "//talOS/hardware/status:messages",
     visibility = ["//visibility:public"],
 )
 
-# The gateway-to-node clock mapping the bridge publishes on /hw/status, also
-# run by talos::testing::SimHardware when it plays the bridge.
-cc_library(
-    name = "clock_offset",
-    srcs = ["clock_offset.cc"],
-    hdrs = ["clock_offset.h"],
-    visibility = ["//visibility:public"],
-    deps = [":boot_history"],
-)
-
-# The /hw/status CAN bus table, assembled from the one bus slot each State
-# reports, also run by talos::testing::SimHardware when it plays the bridge.
-cc_library(
-    name = "can_buses",
-    hdrs = ["can_buses.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":messages",
-        "//talOS/hardware",
-    ],
-)
-
-# The request merge rules (owner timeout, admission, merged observation),
-# also run by talos::testing::SimHardware when it plays the bridge.
-cc_library(
-    name = "merge",
-    srcs = ["merge.cc"],
-    hdrs = ["merge.h"],
+alias(
+    name = "messages_py",
+    actual = "//talOS/hardware/status:messages_py",
     visibility = ["//visibility:public"],
 )
 
@@ -55,21 +21,26 @@ cc_library(
     name = "node_lib",
     srcs = ["node.cc"],
     hdrs = ["node.h"],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = [
-        ":can_buses",
-        ":clock_offset",
-        ":merge",
-        ":messages",
         "//talOS/configuration",
         "//talOS/driver_station",
+        "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/events:events_os",
         "//talOS/hardware",
+        "//talOS/hardware:bridge_messages",
+        "//talOS/hardware:can_buses",
+        "//talOS/hardware:clock_offset",
+        "//talOS/hardware:merge",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
         "//talOS/ipc",
+        "//talOS/memory:residency",
         "//talOS/process",
         "//talOS/protocol",
         "//talOS/rtms:wake",
@@ -125,13 +96,13 @@ cc_test(
     srcs = ["trust_test.cc"],
     deps = [
         ":in_process_gateway",
-        ":merge",
         ":messages",
         ":node_lib",
         ":node_test_support",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:merge",
         "//talOS/ipc",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
@@ -148,7 +119,6 @@ cc_test(
     env = {"HARDWARE_NODE": "$(rlocationpath :hardware_node)"},
     tags = ["integration"],
     deps = [
-        ":merge",
         ":messages",
         ":node_lib",
         ":node_test_support",
@@ -158,6 +128,7 @@ cc_test(
         "//talOS/events:events_os",
         "//talOS/events:input_replay",
         "//talOS/hardware",
+        "//talOS/hardware:merge",
         "//talOS/introspection:registry",
         "//talOS/ipc",
         "//talOS/node:allocation_probe",
@@ -173,14 +144,14 @@ cc_test(
 
 # Run() on real time and loopback UDP: the integration tier
 # (docs/TESTING.md §2), kept out of node_test's synthetic-time logic tests.
-# Its bounds are ratios of counts, or a requirement's margin judged only on a
-# host whose measured stalls are inside it (§6).
+# Its bounds are ratios of counts and event-driven waits; the wall-clock
+# StallMeter timing test lives in run_timing_test with `exclusive`.
 cc_test(
     name = "run_test",
     size = "medium",
     srcs = ["run_test.cc"],
+    tags = ["integration"],
     deps = [
-        ":merge",
         ":messages",
         ":node_lib",
         ":node_test_support",
@@ -192,34 +163,46 @@ cc_test(
     ],
 )
 
+# Run() wall-clock timing on real time and loopback UDP: isolated from
+# run_test with `exclusive` so parallel Bazel jobs on 3-vCPU macOS CI do not
+# starve its 1 ms StallMeter host-qualification probe (docs/TESTING.md §6.7).
 cc_test(
-    name = "clock_offset_test",
-    size = "small",
-    srcs = ["clock_offset_test.cc"],
+    name = "run_timing_test",
+    size = "medium",
+    srcs = ["run_timing_test.cc"],
+    tags = [
+        "exclusive",
+        "integration",
+    ],
     deps = [
-        ":clock_offset",
+        ":node_lib",
+        ":node_test_support",
+        "//talOS/hardware:merge",
+        "//talOS/ipc",
+        "//talOS/process",
+        "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
 )
 
+# Clean shutdown neutral (REQ-SAFE-01, REQ-OPS-20) and hard 64-datagram/ms
+# receive cap (REQ-RT-20), driven deterministically over loopback UDP without
+# signals or wall-clock sleeps.
 cc_test(
-    name = "can_buses_test",
+    name = "shutdown_budget_test",
     size = "small",
-    srcs = ["can_buses_test.cc"],
+    srcs = ["shutdown_budget_test.cc"],
+    tags = ["integration"],
     deps = [
-        ":can_buses",
-        ":messages",
+        ":node_lib",
+        ":node_test_support",
+        "//talOS/configuration",
+        "//talOS/driver_station",
         "//talOS/hardware",
-        "@googletest//:gtest_main",
-    ],
-)
-
-cc_test(
-    name = "merge_test",
-    size = "small",
-    srcs = ["merge_test.cc"],
-    deps = [
-        ":merge",
+        "//talOS/ipc",
+        "//talOS/process",
+        "//talOS/protocol",
+        "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
 )

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <optional>
@@ -67,10 +68,18 @@ bool ReadTimeline(const std::filesystem::path& directory,
     std::int64_t pts = 0;
     const auto parsed =
         std::from_chars(stamp.data(), stamp.data() + stamp.size(), pts);
+    if (parsed.ec == std::errc::result_out_of_range) {
+      return Fail(error, csv.string() + ":" + std::to_string(number) +
+                             ": pts_ns out of range");
+    }
     if (parsed.ec != std::errc{} || parsed.ptr != stamp.data() + stamp.size()) {
       if (number == 1) continue;  // header
       return Fail(error, csv.string() + ":" + std::to_string(number) +
                              ": pts_ns is not an integer");
+    }
+    if (pts < 0) {
+      return Fail(error, csv.string() + ":" + std::to_string(number) +
+                             ": pts_ns must be non-negative");
     }
     // A name is a file in this directory, never a path out of it.
     const std::filesystem::path file(name);
@@ -127,10 +136,17 @@ std::optional<ImageSequence> ImageSequence::Open(
       return std::nullopt;
     }
     std::sort(files.begin(), files.end());
+    constexpr double kMaxPtsNs =
+        static_cast<double>(std::numeric_limits<std::int64_t>::max());
     for (std::size_t i = 0; i < files.size(); ++i) {
+      const double pts_d = static_cast<double>(i) * 1e9 / fps;
+      if (!std::isfinite(pts_d) || pts_d < 0.0 || pts_d >= kMaxPtsNs) {
+        Fail(error, directory.string() +
+                        ": frame rate produces an out-of-range timestamp");
+        return std::nullopt;
+      }
       sequence.frames_.push_back(
-          {files[i], static_cast<std::int64_t>(
-                         std::llround(static_cast<double>(i) * 1e9 / fps))});
+          {files[i], static_cast<std::int64_t>(std::llround(pts_d))});
     }
   }
   if (sequence.frames_.empty()) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -12,14 +13,16 @@
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
-#include "talOS/bridge/can_buses.h"
-#include "talOS/bridge/clock_offset.h"
-#include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/os/poller.h"
+#include "talOS/events/stall_guard.h"
+#include "talOS/events/wake_channel_wait.h"
+#include "talOS/hardware/can_buses.h"
+#include "talOS/hardware/clock_offset.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/config_wire.h"
+#include "talOS/hardware/merge.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/describe.h"
@@ -93,12 +96,11 @@ struct SubsystemTracker {
   // node's wakes to the bridge fail or the bridge falls behind, and this
   // subsystem merges at a fraction of its rate (TODO.md RT-7).
   uint64_t requests_skipped{0};
-  // HardwareNode::Pass()'s idle-pass guard (kMaxIdlePasses): whether this
-  // topic's arm failed in the last pass, and whether the guard has counted
-  // it in Wakeups::stalled_arms since its arm last succeeded or a read last
-  // returned a request from it.
-  bool arm_failed{false};
-  bool arm_stalled{false};
+  // Per-topic wake-arm stall guard (WakeChannelWait::arm_reader): reset on a
+  // clean arm or when Tick() reads a request from this topic; trips once in
+  // Wakeups::stalled_arms after kMaxIdlePasses consecutive failed arms without
+  // read progress, independent of UDP datagrams or other topics.
+  event::StallGuard stall_guard{event::StallGuard::kDefaultMaxStalled};
 
   // Positions in the merged command of the actuators this subsystem owns,
   // resolved from `devices` by HardwareNode::IndexActuators so a timeout
@@ -115,16 +117,18 @@ class HardwareNode {
                         uint16_t remote_port = 5802, uint16_t local_port = 5803,
                         bool simulation = false, uint64_t session_id = 0,
                         std::string log_path = {}, uint64_t log_max_bytes = 0,
-                        std::chrono::nanoseconds log_window = {});
+                        std::chrono::nanoseconds log_window = {},
+                        std::string local_ip = "0.0.0.0");
 
   ~HardwareNode() = default;
 
   bool Open();
-  // One merge step at `now_us` (the bridge clock): receives every waiting
-  // gateway datagram up to kReceiveBudget, reads each request topic, merges,
-  // sends the command when it changed or the heartbeat is due, and runs the
-  // time-driven duties (clock probe, owner timeouts, /hw/status). Run() calls
-  // it on every wakeup; tests call it with synthetic time.
+  // One merge step at `now_us` (the bridge clock): receives waiting gateway
+  // datagrams up to kReceiveBudget (Pass() further caps this to the window's
+  // remaining kDatagramBudget), reads each request topic, merges, sends the
+  // command when it changed or the heartbeat is due, and runs the time-driven
+  // duties (clock probe, owner timeouts, /hw/status). Run() calls Pass() on
+  // every wakeup; tests call Tick() or Pass() with synthetic time.
   void Tick(uint64_t now_us);
   // The earliest bridge-clock instant after a Tick(now_us) at which Tick has
   // time-driven work: the next clock probe or its retry, the completion of an
@@ -142,26 +146,40 @@ class HardwareNode {
     uint64_t until_us;
     bool ignore_input;
   };
-  // Run()'s loop body, without its wait: Tick(now_us), the registry's
-  // liveness sample (on every pass, whatever woke it), then arming every
+  // Run()'s loop body, without its wait: resets the kCpuWindowUs CPU budget
+  // window when expired, runs Tick() with its UDP receive loop capped to
+  // min(kReceiveBudget, remaining kDatagramBudget), updates the registry's
+  // liveness sample (on every pass, whatever woke it), then arms every
   // request subscriber's wake. Waits until now_us when input is known to be
-  // waiting (an arm found an unread request, or Tick stopped at
-  // kReceiveBudget), otherwise until the next duty, the full registry
-  // sample, the liveness backstop or the longest wait. Once the CPU budget
-  // is spent (see kCpuWindowUs) it sleeps through input until the window
-  // ends, or until the next duty or registry sample if that is sooner.
+  // waiting (an arm found an unread request, or Tick stopped at its receive
+  // cap), otherwise until the next duty, the full registry sample, the
+  // liveness backstop or the longest wait. Once the CPU budget is spent (see
+  // kCpuWindowUs) it sleeps through input until the window ends, or until the
+  // next duty or registry sample if that is sooner.
   Wait Pass(uint64_t now_us);
   // Passes until a stop (process::stop_requested) or, when duration_s > 0,
-  // that many seconds, then prints the exit summary, and, when no State
-  // arrived, a `hardware_node warning: ended without receiving a State`
-  // line on stderr. Returns the process's exit status: 1 when the packet
-  // log failed or has a gap, or when the run ended at its own duration
-  // without having received one State; else 0, so a stop exits 0 whether
-  // or not the controller was ever heard. The duration's 1 applies only to
-  // a bridge run directly: the launcher ends a bounded session by stopping
+  // that many seconds, then sends a shutdown neutral command
+  // (SendShutdownNeutral) before CloseWaits(), prints the exit summary, and,
+  // when no State arrived, a `hardware_node warning: ended without receiving
+  // a State` line on stderr. Returns the process's exit status: 1 when the
+  // packet log failed or has a gap, or when the run ended at its own duration
+  // without having received one State; else 0, so a stop exits 0 whether or
+  // not the controller was ever heard. The duration's 1 applies only to a
+  // bridge run directly: the launcher ends a bounded session by stopping
   // every member at its deadline, so there the warning line (and
   // session_report's controller-link verdict) is the evidence.
   int Run(int duration_s = 0);
+
+  // Neutralizes every actuator in full_cmd_, stamps it with the latest
+  // observed gateway identity and sample time, and sends it to the gateway
+  // (and publishes it on /hw/command if open). Returns true when a shutdown
+  // neutral command was sent, false when no fresh ready State matching
+  // config_id_ has been observed (StateFresh && GatewayReady), no transport is
+  // open, or the send failed — avoiding stale or retired-boot neutrals that
+  // would increment rejected_command_count (REQ-SAFE-17). Called by Run() right
+  // after its loop exits (before CloseWaits()) and exposed for deterministic
+  // unit tests (REQ-SAFE-01, REQ-OPS-20).
+  bool SendShutdownNeutral(uint64_t now_us);
 
   // Run()'s waits. OpenWaits() builds the poller and watches the UDP socket,
   // a wake receiver every request subscriber names and the stop pipe
@@ -180,6 +198,9 @@ class HardwareNode {
   // `send_error`, when set, is asked before each send to the gateway: a
   // nonzero errno fails that send with it, unsent, as if the OS had
   // returned it (a test reaches the errors a loopback socket never gives).
+  // `recv_error`, when set, is asked before each TryReceive() in Tick(): a
+  // nonzero errno fails that receive with it, unread, as if the OS had
+  // returned it.
   // `before_wait`, when set, is called on Run()'s thread right before each
   // wait that input can end, after every request subscriber is armed (a
   // test publishes there what the bridge must then wake for).
@@ -187,6 +208,7 @@ class HardwareNode {
     WakeReceiver (*make_wake_receiver)(){nullptr};
     bool (*arm_request)(ipc::Subscriber<Packet>& subscriber){nullptr};
     int (*send_error)(){nullptr};
+    int (*recv_error)(){nullptr};
     void (*before_wait)(){nullptr};
   };
   void set_seams(Seams seams) { seams_ = seams; }
@@ -209,7 +231,8 @@ class HardwareNode {
   // Passes that may skip the wait on a failed arm without consuming input
   // (a read the writer keeps tearing), before the loop waits anyway: the
   // arm still requested a notification, and the longest wait bounds it.
-  static constexpr uint32_t kMaxIdlePasses = 3;
+  static constexpr uint32_t kMaxIdlePasses =
+      event::StallGuard::kDefaultMaxStalled;
 
   // Run()'s wakeups, by what the loop then found: a gateway datagram, a
   // request, or neither and the wait reached its deadline. A wakeup that
@@ -232,25 +255,29 @@ class HardwareNode {
   };
   const Wakeups& wakeups() const { return wakeups_; }
 
-  // The UDP socket to the gateway. A send that fails with an error the
-  // socket may never recover from (protocol::SendErrorNeedsNewSocket: a
-  // socket shut down or defunct, or its source address gone from the host)
-  // closes it; Tick() then opens a new one on the same ports
-  // (RuntimeUdpPeer::Reopen): the first attempt on the next Tick
-  // (NextDutyUs: kRetryUs later at the latest), then at most once per
-  // kReopenRetryUs, which is also the cadence while the network has no
-  // route to the gateway and each attempt fails.
+  // The UDP socket to the gateway. A send or receive that fails with an error
+  // the socket may never recover from (protocol::SendErrorNeedsNewSocket /
+  // protocol::ReceiveErrorNeedsNewSocket: a socket shut down or defunct, or
+  // its source address gone from the host) closes it; Tick() then opens a new
+  // one on the same addresses and ports (RuntimeUdpPeer::Reopen): the first
+  // attempt on the next Tick (NextDutyUs: kRetryUs later at the latest), then
+  // at most once per kReopenRetryUs, which is also the cadence while the
+  // network has no route to the gateway or a pinned local_address is not yet
+  // on the host and each attempt fails.
   // While it is closed nothing is sent or received, so the gateway times
   // the command out and /hw/status's state_age_us grows, as for any lost
-  // link. Any other send error (ECONNREFUSED while the gateway is down,
-  // ENOBUFS, ...) keeps the socket: it clears by itself, and the failed duty
-  // is retried kRetryUs later.
+  // link. Any other send or receive error (ECONNREFUSED while the gateway is
+  // down, ENOBUFS, ...) keeps the socket: it clears by itself, and a failed
+  // send duty is retried kRetryUs later.
   // stderr gets one line when an outage starts, with its errno, and one when
   // a send succeeds again. Read only while Run() is not running.
   struct SocketCounters {
-    uint64_t send_failures{0};  // sends that failed, of either kind
-    int last_send_error{0};     // the errno of the last; 0 before one
-    uint64_t reopens{0};        // sockets opened to replace a lost one
+    uint64_t send_failures{0};    // sends that failed, of either kind
+    int last_send_error{0};       // the errno of the last send error; 0 before
+    uint64_t recv_failures{0};    // receives that failed with kSocketError
+    int last_recv_error{0};       // the errno of the last recv error; 0 before
+    uint64_t reopens{0};          // sockets opened to replace a lost one
+    uint64_t reopen_attempts{0};  // ReopenSocket() open/reopen attempts made
   };
   const SocketCounters& socket_counters() const { return socket_counters_; }
   // The socket's fd, -1 while it is closed (a test breaks it through this).
@@ -316,6 +343,9 @@ class HardwareNode {
   // Open() after its socket: the shared-memory topics, the packet log and
   // the registry row.
   void OpenTopics();
+  // Tick()'s body with an explicit per-tick UDP receive cap, bounded by both
+  // kReceiveBudget and Pass()'s remaining window datagram budget (REQ-RT-20).
+  void TickWithBudget(uint64_t now_us, int receive_budget);
   // One decoded datagram from the gateway (a State, a Driver Station packet
   // or a config acknowledgement), received at `now_us`: what Tick()'s
   // receive loop does with each frame of this protocol version it reads.
@@ -346,6 +376,16 @@ class HardwareNode {
   // latest State's sample, so it remains the safety backstop.
   bool HasRequestIdentity(const SubsystemTracker& tracker,
                           const Command& partial) const;
+  // Whether a request refused by HasRequestIdentity is an all-neutral request
+  // built from a State just before the current epoch began (for example, at an
+  // enable or disable edge): same configuration and boot, earlier nonzero
+  // epoch, no request accepted from this subsystem in the new epoch yet,
+  // admissible observation age, valid device ownership, and driving nothing.
+  // Such a request is still refused (never merges or refreshes silence), but
+  // is omitted from identity_rejected_, mirroring Gateway::Accept's
+  // superseded_neutral (REQ-OPS-20).
+  bool IsSupersededNeutral(const SubsystemTracker& tracker,
+                           const Command& partial) const;
   // Whether every actuator a request addresses belongs to the subsystem that
   // published it. One stray id rejects the whole request: a partial merge
   // would let a buggy subsystem drive hardware it does not own.
@@ -358,16 +398,21 @@ class HardwareNode {
   // or enabled/fault edge), at `now_us`, which starts the silence of each
   // owner not yet silent (SubsystemTracker::silence_from_us).
   void InvalidateRequests(uint64_t now_us);
-  // Whether the link is ready for requests (a State accepted and the
-  // current gateway boot has acknowledged this configuration), after a
-  // gateway frame received at `now_us`. Becoming ready starts every owner's
-  // silence at `now_us`, as the session's start does.
+  // Whether an accepted State is still fresh at `now_us` (state_age_us <
+  // command_timeout_us).
+  bool StateFresh(uint64_t now_us) const;
+  // Whether the link is ready for requests (a fresh accepted State and the
+  // current gateway boot has acknowledged this configuration) as of `now_us`.
+  // Becoming ready (session start, gateway reboot acknowledgement, or fresh
+  // States returning after a stale link) starts every owner's silence at
+  // `now_us`.
   void UpdateLinkReady(uint64_t now_us);
   // Whether `tracker`'s owner is silent at `now_us` as /hw/status reports
-  // it: the link is ready, the owner has been heard (a request of its
+  // it: the link is ready with a fresh State (state_age_us <
+  // command_timeout_us), the owner has been heard (a request of its
   // received, accepted or not), and nothing restarted its silence
   // (silence_from_us) for longer than its owner timeout. False while the
-  // link is not ready, when alert_error_link_lost or
+  // link is not ready or State is stale, when alert_error_link_lost or
   // alert_error_not_configured says why nothing merges, and for an owner
   // never heard (SubsystemTracker::heard).
   bool OwnerSilent(const SubsystemTracker& tracker, uint64_t now_us) const;
@@ -433,6 +478,7 @@ class HardwareNode {
   Config config_;
   uint64_t config_id_{0};
   std::string remote_ip_;
+  std::string local_ip_;
   uint16_t remote_port_;
   uint16_t local_port_;
   bool simulation_;
@@ -447,10 +493,11 @@ class HardwareNode {
     void* context{nullptr};
   };
   FrameSink frame_sink_{};
-  // What every request subscriber's reader slot names while Run() waits.
-  // Declared before subsystems_, so their slots are released first and no
-  // publisher notifies a closed receiver.
-  std::optional<WakeReceiver> request_wake_;
+  // Shared wake-channel wait helper owning the WakeReceiver every request
+  // subscriber's reader slot names while Run() waits, plus atomic wake-loss
+  // counters. Declared before subsystems_, so their slots are released first
+  // and no publisher notifies a closed receiver.
+  event::WakeChannelWait wake_wait_;
   // Run()'s waits (OpenWaits); empty while it cannot build one.
   std::optional<event::Poller> poller_;
   Seams seams_{};
@@ -483,12 +530,10 @@ class HardwareNode {
   uint64_t next_introspection_us_{0};
   uint64_t next_liveness_us_{0};
   // What the last Tick did: datagrams it received, requests it read, and
-  // whether it stopped at kReceiveBudget rather than an empty socket.
+  // whether it stopped at its receive cap rather than an empty socket.
   uint32_t tick_datagrams_{0};
   uint32_t tick_requests_{0};
   bool tick_receive_capped_{false};
-  // Consecutive passes that found input waiting but consumed none.
-  uint32_t idle_passes_{0};
   // The current CPU budget window: its start, and its passes and datagrams.
   uint64_t cpu_window_start_us_{0};
   uint64_t cpu_window_passes_{0};
@@ -498,9 +543,13 @@ class HardwareNode {
   uint64_t max_wait_us_{kMaxWaitUs};
   Wakeups wakeups_{};
   SocketCounters socket_counters_{};
-  // An outage: from a send that closed the socket to the first send that
-  // succeeds after it.
+  // An outage: from a send/receive that closed the socket (or a pinned
+  // local_address unavailable at Open()) until recovery.
   bool socket_lost_{false};
+  // True when Open() deferred socket creation because a pinned local_address
+  // was not yet on the host (EADDRNOTAVAIL/ENETUNREACH); cleared once the
+  // initial peer_.Open() succeeds.
+  bool socket_never_opened_{false};
   // The last reopen attempt, on the bridge clock; none yet while
   // !reopen_attempted_.
   bool reopen_attempted_{false};
@@ -508,7 +557,7 @@ class HardwareNode {
 
   bool is_configured_{false};
   uint64_t last_boot_id_{0};
-  uint64_t last_ds_sample_time_us_{0};
+  std::optional<uint64_t> last_ds_sample_time_us_;
   uint64_t last_epoch_{0};
   uint64_t last_sample_time_us_{0};
   uint32_t last_state_flags_{0};
@@ -530,8 +579,21 @@ class HardwareNode {
   // Set once a frame of another protocol version is logged, until a frame
   // of this version arrives.
   bool version_mismatch_logged_{false};
+  // Bridge-clock receipt time of the last kUnsupportedVersion datagram
+  // (nullopt before one or after any kOk frame) and the protocol version its
+  // header carried. Reported active on /hw/status only while within
+  // config_.command_timeout_us so the alert never latches after the peer stops.
+  std::optional<uint64_t> last_version_mismatch_us_;
+  uint16_t mismatched_protocol_version_{0};
   // Set once an undecodable State is logged, until a State decodes.
   bool state_decode_failure_logged_{false};
+  // Last refused ConfigAck logged to stderr, so repeated retries with the
+  // same status and reason do not spam; cleared on kOk or a new gateway boot.
+  bool config_refusal_logged_{false};
+  ConfigAckStatus last_config_refusal_status_{ConfigAckStatus::kOk};
+  std::array<char, sizeof(ConfigAckPayload::reason)>
+      last_config_refusal_reason_{};
+  std::size_t last_config_refusal_reason_len_{0};
   uint64_t pending_probe_send_us_{};
   uint64_t pending_probe_sample_us_{};
   uint64_t pending_probe_boot_id_{};

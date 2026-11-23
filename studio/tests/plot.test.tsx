@@ -10,10 +10,12 @@ import {renderToStaticMarkup} from 'react-dom/server';
 
 import {TelemetryDecoder} from '../src/core';
 import type {Snapshot} from '../src/core';
+import {bucketSeries} from '../src/data/recorded';
+import {TelemetryStore} from '../src/data/store';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {demoPacket} from '../src/demo';
 import {assignYAxes, groupByUnit, type PlotChannel} from '../src/panels/plot/axes';
-import {plotPanel} from '../src/panels/plot';
+import {cursorTimestampNs, plotColumn, plotData, plotPanel} from '../src/panels/plot';
 
 const pc = (name: string, unit = '', labels: string[] = []): PlotChannel =>
     ({name, unit, labels});
@@ -153,4 +155,84 @@ test('the plot window selector retains custom configured durations', () => {
         `<option value="${windowSeconds}" selected="">${windowSeconds} s</option>`),
         html);
   }
+});
+
+test('plotColumn and plotData convert NaN/Infinity gaps to null and keep recorded alignment rows undefined',
+     () => {
+       assert.deepEqual(
+           plotColumn(new Float64Array([1, NaN, Infinity, -Infinity, 0])),
+           [1, null, null, null, 0]);
+
+       const makeSnap = (stream: string, seq: number, ts: bigint,
+                         channels: Record<string, number>): Snapshot => ({
+         stream_id: stream,
+         sequence_id: String(seq),
+         timestamp_ns: String(ts),
+         dictionary_id: 1,
+         chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+         channels,
+         units: {},
+         labels: {}
+       });
+
+       // Live store with: later-declared channel `b` (NaN-backfilled at index 0),
+       // a stream restart break between t=1s and t=2s, and non-finite readings.
+       const store = new TelemetryStore(cb => cb());
+       store.ingest([
+         makeSnap('s1', 0, 1_000_000_000n, {a: 1}),
+         makeSnap('s1', 1, 2_000_000_000n, {a: Infinity, b: 10}),
+         makeSnap('s2', 0, 4_000_000_000n, {a: 3, b: -Infinity})
+       ], true);
+       store.setCursor('4000000000');
+       const live = store.series(['a', 'b'], 'all');
+       const [times, colA, colB] = plotData(live, ['a', 'b']);
+       assert.deepEqual(times, [0, 1, 2, 3]);
+       assert.ok(times.every(Number.isFinite));
+       assert.deepEqual(colA, [1, null, null, 3]);
+       assert.deepEqual(colB, [null, 10, null, null]);
+
+       // Recorded multi-channel series: alignment rows (count === 0) map to
+       // undefined so uPlot skips them in getMinMax without breaking lines,
+       // while an actual non-finite bucket reading (count > 0) maps to null.
+       const recorded = bucketSeries(
+           ['a', 'b'],
+           {
+             buckets: 2,
+             channels: [
+               {
+                 t_ns: new Float64Array([1e9, 3e9]),
+                 min: new Float64Array([5, NaN]),
+                 max: new Float64Array([5, NaN]),
+                 last: new Float64Array([5, NaN]),
+                 count: new Uint32Array([1, 1])
+               },
+               {
+                 t_ns: new Float64Array([2e9, 3e9]),
+                 min: new Float64Array([9, 8]),
+                 max: new Float64Array([9, 8]),
+                 last: new Float64Array([9, 8]),
+                 count: new Uint32Array([1, 1])
+               }
+             ]
+           },
+           '0', 0n, 4_000_000_000n);
+       const [recTimes, recA, recB] = plotData(recorded, ['a', 'b']);
+       assert.deepEqual(recTimes, [1, 2, 3]);
+       assert.deepEqual(recA, [5, undefined, null]);
+       assert.deepEqual(recB, [undefined, 9, 8]);
+     });
+
+// REQ-OPS-23: plot double-click and cursor delta must not throw RangeError
+// when the cursor index has no finite x-axis sample.
+test('cursorTimestampNs returns null for missing or non-finite samples and exact ns otherwise', () => {
+  const origin = 1_000_000_000n;
+  assert.equal(cursorTimestampNs([0, 1.25], 1, origin), 2_250_000_000n);
+  assert.equal(cursorTimestampNs([], 0, origin), null);
+  assert.equal(cursorTimestampNs([0], 5, origin), null);
+  assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 0, origin), null);
+  assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 1, origin), null);
+  assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 2, origin), null);
+  assert.equal(cursorTimestampNs([Number.NaN, Infinity, -Infinity, 1e308], 3, origin), null);
+  assert.equal(cursorTimestampNs([0], null, origin), null);
+  assert.equal(cursorTimestampNs([0], 0, null), null);
 });

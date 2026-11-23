@@ -3,8 +3,10 @@
 #include <time.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -13,6 +15,7 @@
 #include <vector>
 
 #include "talOS/events/time.h"
+#include "talOS/process/process.h"
 #include "talOS/vision/frame.h"
 
 namespace talos::vision::playback {
@@ -111,11 +114,21 @@ bool RecordedCameraSource::Start() {
   config_.height = static_cast<uint32_t>(height);
   // The recording ends one frame period after its last frame, so the
   // consumer has that long to take the last frame before the camera goes.
-  const auto period =
-      sequence_->mean_period_ns() > 0 ? sequence_->mean_period_ns()
-      : config_.fps > 0 ? static_cast<std::int64_t>(1e9 / config_.fps)
-                        : std::int64_t{100'000'000};
-  end_ns_ = (*sequence_)[sequence_->size() - 1].pts_ns + period;
+  constexpr double kMaxPtsNs =
+      static_cast<double>(std::numeric_limits<std::int64_t>::max());
+  std::int64_t period = 100'000'000;
+  if (sequence_->mean_period_ns() > 0) {
+    period = sequence_->mean_period_ns();
+  } else if (std::isfinite(config_.fps) && config_.fps > 0.0) {
+    const double period_d = 1e9 / config_.fps;
+    if (std::isfinite(period_d) && period_d > 0.0 && period_d < kMaxPtsNs) {
+      period = static_cast<std::int64_t>(period_d);
+    }
+  }
+  const std::int64_t last_pts = (*sequence_)[sequence_->size() - 1].pts_ns;
+  end_ns_ = last_pts <= std::numeric_limits<std::int64_t>::max() - period
+                ? last_pts + period
+                : std::numeric_limits<std::int64_t>::max();
   ++session_;
   next_ = 0;
   manual_start_ns_.reset();
@@ -169,8 +182,12 @@ void RecordedCameraSource::Emit(std::size_t index, std::int64_t capture_ns) {
   // The recording's own timeline, not asserted to be the exposure midpoint.
   frame.set_timestamp_kind(TimestampKind::kPresentation);
   frame.set_clock_domain(ClockDomain::kHostMonotonic);
-  std::lock_guard lock(callback_mutex_);
-  if (frame_callback_) frame_callback_(frame);
+  FrameCallback callback;
+  {
+    std::lock_guard lock(callback_mutex_);
+    callback = frame_callback_;
+  }
+  if (callback) callback(frame);
 }
 
 std::size_t RecordedCameraSource::DeliverUntil(std::int64_t now_ns) {
@@ -201,6 +218,7 @@ bool RecordedCameraSource::WaitUntil(std::int64_t due_ns) {
 }
 
 void RecordedCameraSource::Play(std::int64_t start_ns) {
+  talos::process::ConfigureBackgroundThread();
   // Play starts only once Open() has loaded the sequence.
   if (!sequence_) return;
   const ImageSequence& sequence = *sequence_;

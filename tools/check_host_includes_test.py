@@ -8,7 +8,7 @@ import io
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 from tools import check_host_includes
 
@@ -76,6 +76,38 @@ class CheckHostIncludesTest(unittest.TestCase):
         # A wrong output path must not read as "no host headers".
         status, _ = run({"a/readme.txt": "x"})
         self.assertEqual(status, 2)
+
+    # REQ-DEV-25
+    def test_double_leading_slash_host_header_is_caught(self):
+        # POSIX normpath preserves leading `//`; it must still match HOST_PREFIXES.
+        dep = (
+            "bazel-out/k8-fastbuild/bin/a.o: \\\n"
+            " talOS/telemetry/a.cc //usr/include/stdio.h \\\n"
+            " //usr/include/toml++/toml.hpp //usr/local/include/foo.h\n"
+        )
+        status, out = run({"a/a.d": dep})
+        self.assertEqual(status, 1, out)
+        self.assertIn("talOS/telemetry/a.cc: /usr/include/toml++/toml.hpp", out)
+        self.assertIn("talOS/telemetry/a.cc: /usr/local/include/foo.h", out)
+        self.assertNotIn("stdio.h", out)
+
+    # REQ-DEV-25
+    def test_unreadable_depfile_fails_closed(self):
+        # A dangling/unreadable .d file beside a valid .d file must fail closed
+        # with exit 2 rather than being silently skipped.
+        with tempfile.TemporaryDirectory() as tmp:
+            good = os.path.join(tmp, "a/wire.pic.d")
+            os.makedirs(os.path.dirname(good), exist_ok=True)
+            with open(good, "w", encoding="utf-8") as f:
+                f.write(TOOLCHAIN_ONLY)
+            broken = os.path.join(tmp, "b/broken.d")
+            os.makedirs(os.path.dirname(broken), exist_ok=True)
+            os.symlink(os.path.join(tmp, "missing_target"), broken)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                status = check_host_includes.main([tmp])
+        self.assertEqual(status, 2, out.getvalue() + err.getvalue())
+        self.assertIn("broken.d", err.getvalue())
 
 
 if __name__ == "__main__":

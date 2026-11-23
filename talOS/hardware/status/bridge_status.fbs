@@ -54,14 +54,16 @@ struct CanBusStatus {
 // payload decodes, those then dropped as reordered or of a retired boot
 // included; a State that does not decode is not counted. timed_out_mask has
 // bit i set while the i-th actuator-owning subsystem, in sorted name order,
-// is silent: the link is ready (a State accepted and the current gateway
+// is silent: the link is ready (a fresh State accepted with
+// state_age_us < command_timeout_us and the current gateway
 // boot has acknowledged this configuration), the bridge has received a
 // request from that subsystem since it started (accepted or refused), and,
 // for longer than its
 // owner timeout (ARCHITECTURE.md "The tick"), none of its requests has been
 // accepted since the latest of its last accepted request (its first
 // received request, until one is accepted), the link becoming ready (the
-// session's start, or a gateway reboot's acknowledgement) and that
+// session's start, a gateway reboot's acknowledgement, or fresh States
+// returning after a stale link) and that
 // subsystem's first controller transition (boot, configuration, epoch,
 // enable or fault edge) after either at which it was not already silent.
 // So a controller transition, a session's start (however late an owner's
@@ -91,10 +93,26 @@ struct CanBusStatus {
 // the bridge already tracks:
 // - alert_error_link_lost: no State accepted yet, or state_age_us above
 //   [robot] command_timeout_us. Clears on the next accepted State.
+// - alert_error_protocol_mismatch: a UDP datagram from the gateway was refused
+//   for kUnsupportedVersion within [robot] command_timeout_us and no valid
+//   frame has arrived since. Clears immediately on any kOk frame, or once no
+//   mismatched frame arrives for longer than command_timeout_us (never
+//   latches). mismatched_protocol_version_id carries the observed peer
+//   protocol version while active, and 0 otherwise.
 // - alert_error_not_configured: configured is false. Clears on the current
 //   boot's acknowledgement.
 // - alert_error_uncommissioned: commissioned is false. Never in simulation.
 // - alert_error_motor_fault: motor_fault_mask is nonzero.
+// - alert_error_hardware_fault: the link is fresh (StateFresh), configured is
+//   true, and the latest accepted State carries kHardwareFault (total feedback
+//   loss or latched gateway apply-failure fault). Clears as soon as the fault
+//   clears, the link goes stale, or configured becomes false.
+// - alert_error_config_refused_enabled: the link is fresh (StateFresh),
+//   configured is false, and the gateway's last config refusal was
+//   kBackendFailed with reason "disable to accept the new configuration" (a
+//   changed configuration pushed while the robot is enabled). Clears on a kOk
+//   acknowledgement, a new gateway boot, a different refusal reason, or a
+//   stale/lost link.
 // - alert_warning_owner_timed_out: timed_out_mask is nonzero, so it raises
 //   neither at a controller transition, which times every owner out in the
 //   merge until its next request, nor at the session's start, nor for an
@@ -107,6 +125,18 @@ struct CanBusStatus {
 // motor_fault, brownout and can_bus_unread describe the last accepted
 // States, as the fields they read do: while link_lost holds they are those
 // States'.
+//
+// UDP socket and State loss counters (cumulative since the bridge started,
+// matching the bridge's exit summary):
+// - socket_send_failures_count: failed UDP sends on the gateway socket.
+// - socket_reopens_count: times the bridge closed and reopened its UDP socket
+//   after a permanent send or receive error.
+// - state_sequence_gaps_count: missed UDP frame sequence numbers detected on
+//   incoming gateway datagrams.
+// - state_decode_failures_count: incoming UDP frames that failed frame
+//   decoding.
+// - socket_send_would_block_count: outbound UDP sends dropped with
+//   EAGAIN/EWOULDBLOCK.
 //
 // can_buses holds one slot per CAN bus the configuration names, slot 0 the
 // RoboRIO's own bus ("rio"), then the others in byte order
@@ -130,6 +160,13 @@ struct CanBusStatus {
 struct BridgeStatus {
   states_received_count:uint64;
   commands_sent_count:uint64;
+  // Subsystem requests refused by the bridge's identity or freshness gate
+  // (wrong config_id, boot_id, epoch, or inadmissible observed_time_us). Omits
+  // a superseded all-neutral request from an earlier nonzero epoch of the same
+  // boot and configuration (valid device ownership, admissible observation
+  // age, before any request has been accepted from that subsystem in the new
+  // epoch), which is still dropped without merging or refreshing silence,
+  // mirroring gateway_rejected_command_count's superseded-neutral rule.
   identity_rejected_count:uint64;
   ownership_rejected_count:uint64;
   driver_station_packet_count:uint64;
@@ -153,11 +190,15 @@ struct BridgeStatus {
   clock_window_count:uint32;
   clock_offset_valid:bool;
   health_valid:bool;
+  // These two fill the padding after health_valid before battery_v.
+  alert_error_hardware_fault:bool;
+  alert_error_config_refused_enabled:bool;
   battery_v:double;
   brownout:bool;
-  // These two fill the padding after brownout.
+  // These three fill the padding after brownout before motor_fault_mask.
   alert_warning_can_bus_unread:bool;
   can_bus_count:ubyte;
+  alert_error_protocol_mismatch:bool;
   // Bit i (configured motor order): invalid feedback or controller fault flags
   // other than an asserted soft or hard limit or an active current limit
   // (hardware::MotorFaulted).
@@ -182,12 +223,21 @@ struct BridgeStatus {
   // The hardware protocol this bridge's own build encodes and decodes
   // (protocol::kProtocolVersion), on every status: what the log tools read a
   // session's hardware packets under (talOS/launcher/hardware_record.h). It
-  // fills the padding after gateway_build_dirty.
+  // and mismatched_protocol_version_id fill the padding after
+  // gateway_build_dirty before gateway_build_id.
   protocol_version_id:uint16;
+  // Header protocol version of the last kUnsupportedVersion frame while
+  // alert_error_protocol_mismatch is active; 0 otherwise.
+  mismatched_protocol_version_id:uint16;
   gateway_build_id:uint64;
   // Causal two-way bound, including residence time, quantization and 1000 ppm
-  // relative oscillator drift. Local logs only (excluded from robot radio).
+  // relative oscillator drift.
   clock_offset_uncertainty_us:uint64;
   clock_min_round_trip_us:uint64;
+  socket_send_failures_count:uint64;
+  socket_reopens_count:uint64;
+  state_sequence_gaps_count:uint64;
+  state_decode_failures_count:uint64;
+  socket_send_would_block_count:uint64;
   can_buses:[CanBusStatus:4];
 }

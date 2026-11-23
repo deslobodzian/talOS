@@ -1,16 +1,25 @@
 #include "studio/review/session.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <array>
+#include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
+#include "nlohmann/json.hpp"
 #include "studio/review/hardware_channels.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/launcher/log_inputs.h"
@@ -47,6 +56,25 @@ bool IsValueRecord(const tlog::RecordHeader& header) {
          tlog::IsAcceptedSend(header);
 }
 
+struct RawAlertInterval {
+  std::int64_t start_ns{0};
+  std::int64_t end_ns{0};
+};
+static_assert(sizeof(RawAlertInterval) == 16,
+              "REQ-OPS-42: 16 B per transient alert interval");
+
+struct AlertChannelState {
+  bool active{false};
+  std::int64_t start_ns{0};
+  std::vector<RawAlertInterval> intervals;
+  std::uint64_t dropped{0};
+};
+
+struct AlertStream {
+  std::vector<AlertChannelState> channels;
+  std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
+};
+
 // A topic as the index pass learns it.
 struct TopicBuild {
   std::string name;
@@ -54,10 +82,323 @@ struct TopicBuild {
   HardwareRecord hardware{HardwareRecord::kNone};
   std::uint64_t schema_hash{0};
   std::vector<Channel> channels;  // struct topics
+  // Indices into `channels` whose alert level is not None.
+  std::vector<std::uint32_t> alert_channels;
+  // Single canonical alert stream tracked during Open(): SEND beats MESSAGE;
+  // lowest file index wins among SENDs, lexicographically smallest path wins
+  // among MESSAGEs (matching the post-scan topic selection below, assuming
+  // launcher log naming where each process's files arrive in file-index order
+  // and distinct processes' log paths do not interleave lexicographically).
+  std::optional<std::size_t> alert_file;
+  bool alert_is_send{false};
+  AlertStream alert_stream;
   // Hardware topics: every channel name seen, with its kind.
   std::map<std::string, ChannelKind> hardware_channels;
   std::int64_t decoded_second{std::numeric_limits<std::int64_t>::min()};
 };
+
+bool SelectCanonicalAlertStream(TopicBuild& topic,
+                                const std::vector<LogFile>& files,
+                                std::size_t file, bool is_send) {
+  const LogFile& log_file = files[file];
+  if (!topic.alert_file.has_value()) {
+    topic.alert_file = file;
+    topic.alert_is_send = is_send;
+    topic.alert_stream.channels.resize(topic.alert_channels.size());
+    return true;
+  }
+  const std::size_t cur_file = *topic.alert_file;
+  const LogFile& cur = files[cur_file];
+  if (topic.alert_is_send) {
+    if (!is_send) return false;
+    if (log_file.process == cur.process) {
+      if (file < cur_file) topic.alert_file = file;
+      return true;
+    }
+    if (file < cur_file) {
+      topic.alert_file = file;
+      topic.alert_stream = AlertStream{};
+      topic.alert_stream.channels.resize(topic.alert_channels.size());
+      return true;
+    }
+    return false;
+  }
+  if (is_send) {
+    topic.alert_file = file;
+    topic.alert_is_send = true;
+    topic.alert_stream = AlertStream{};
+    topic.alert_stream.channels.resize(topic.alert_channels.size());
+    return true;
+  }
+  if (log_file.process == cur.process) {
+    if (log_file.path < cur.path) topic.alert_file = file;
+    return true;
+  }
+  if (log_file.path < cur.path) {
+    topic.alert_file = file;
+    topic.alert_stream = AlertStream{};
+    topic.alert_stream.channels.resize(topic.alert_channels.size());
+    return true;
+  }
+  return false;
+}
+
+constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
+constexpr std::uintmax_t kMaxConfigBytes = std::uintmax_t{1} << 20;
+
+// Reads a non-symlink regular file up to `max_bytes` using O_NOFOLLOW +
+// O_NONBLOCK + fstat + bounded chunked reads so symlinks, FIFOs, device nodes,
+// and growing files never escape confinement, hang, or allocate unbounded
+// memory (REQ-OPS-42, REQ-SAFE-35).
+std::optional<std::string> ReadBoundedRegularFile(const fs::path& path,
+                                                  std::uintmax_t max_bytes) {
+  std::error_code ec;
+  const fs::file_status st = fs::symlink_status(path, ec);
+  if (ec || fs::is_symlink(st) || !fs::is_regular_file(st)) return std::nullopt;
+  struct ScopedFd {
+    int fd{-1};
+    ~ScopedFd() {
+      if (fd >= 0) ::close(fd);
+    }
+  };
+  const ScopedFd file{
+      ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)};
+  if (file.fd < 0) return std::nullopt;
+  struct stat sb {};
+  if (::fstat(file.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size <= 0 ||
+      static_cast<std::uintmax_t>(sb.st_size) > max_bytes) {
+    return std::nullopt;
+  }
+  std::string content;
+  content.reserve(static_cast<std::size_t>(sb.st_size));
+  std::array<char, 8192> chunk{};
+  for (;;) {
+    const ssize_t got = ::read(file.fd, chunk.data(), chunk.size());
+    if (got == 0) break;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      return std::nullopt;
+    }
+    if (content.size() + static_cast<std::size_t>(got) > max_bytes) {
+      return std::nullopt;
+    }
+    content.append(chunk.data(), static_cast<std::size_t>(got));
+  }
+  if (content.empty()) return std::nullopt;
+  return content;
+}
+
+// Resolves `target` strictly within `session_dir` (`canonical_root` is
+// fs::canonical(session_dir)), rejecting any symlink leaf, any symlink
+// directory component inside `session_dir`, non-regular files, and any path
+// escaping `canonical_root` (REQ-OPS-42, REQ-SAFE-35).
+std::optional<fs::path> ConfinedRegularFile(const fs::path& session_dir,
+                                            const fs::path& canonical_root,
+                                            const fs::path& target) {
+  std::error_code ec;
+  const fs::path abs_dir = fs::absolute(session_dir, ec).lexically_normal();
+  if (ec) return std::nullopt;
+  const fs::path path = target.is_absolute() ? target : abs_dir / target;
+  const fs::file_status leaf_st = fs::symlink_status(path, ec);
+  if (ec || fs::is_symlink(leaf_st) || !fs::is_regular_file(leaf_st)) {
+    return std::nullopt;
+  }
+  fs::path canonical_path = fs::canonical(path, ec);
+  if (ec) return std::nullopt;
+  const fs::path rel = canonical_path.lexically_relative(canonical_root);
+  if (rel.empty() || rel == "." || rel.is_absolute() || *rel.begin() == "..") {
+    return std::nullopt;
+  }
+  // Reject any symlink component inside the session directory (while allowing
+  // OS-level symlink ancestors above `session_dir`, e.g. /var -> /private/var).
+  const fs::path norm = path.lexically_normal();
+  fs::path check_base;
+  fs::path check_rel = norm.lexically_relative(abs_dir);
+  if (!check_rel.empty() && !check_rel.is_absolute() &&
+      *check_rel.begin() != "..") {
+    check_base = abs_dir;
+  } else {
+    check_rel = norm.lexically_relative(canonical_root);
+    if (check_rel.empty() || check_rel.is_absolute() ||
+        *check_rel.begin() == "..") {
+      return std::nullopt;
+    }
+    check_base = canonical_root;
+  }
+  fs::path cur = check_base;
+  for (const fs::path& part : check_rel) {
+    cur /= part;
+    const fs::file_status st = fs::symlink_status(cur, ec);
+    if (ec || fs::is_symlink(st)) return std::nullopt;
+  }
+  return canonical_path;
+}
+
+// Reads a confined, non-symlink regular TOML file up to kMaxConfigBytes
+// without hanging on FIFOs or device nodes or allocating unbounded memory
+// (REQ-OPS-42, REQ-SAFE-35).
+std::optional<toml::table> ReadBoundedToml(const fs::path& path) {
+  const auto content = ReadBoundedRegularFile(path, kMaxConfigBytes);
+  if (!content) return std::nullopt;
+  try {
+    return toml::parse(*content, path.string());
+  } catch (const toml::parse_error&) {
+    return std::nullopt;
+  }
+}
+
+// Extracts `[studio] pose_topic` from `config_path` confined within
+// `session_dir` (following at most one direct top-level `include`, also
+// confined within `session_dir`, without following symlinks or expanding
+// subsystem manifests). Returns std::nullopt on any missing, symlinked,
+// out-of-session, non-regular, oversized, or unparseable file.
+std::optional<std::string> ReadPoseTopicFromConfig(
+    const fs::path& session_dir, const fs::path& config_path) {
+  const auto extract =
+      [](const toml::table& tbl,
+         bool& explicit_invalid) -> std::optional<std::string> {
+    if (!tbl.contains("studio")) return std::nullopt;
+    const auto* studio = tbl["studio"].as_table();
+    if (studio == nullptr) {
+      explicit_invalid = true;
+      return std::nullopt;
+    }
+    if (!studio->contains("pose_topic")) return std::nullopt;
+    auto val = (*studio)["pose_topic"].value_exact<std::string>();
+    if (!val || val->empty()) {
+      explicit_invalid = true;
+      return std::nullopt;
+    }
+    return val;
+  };
+
+  std::error_code ec;
+  const fs::path canonical_root = fs::canonical(session_dir, ec);
+  if (ec) return std::nullopt;
+  const auto confined_root =
+      ConfinedRegularFile(session_dir, canonical_root, config_path);
+  if (!confined_root) return std::nullopt;
+  const auto root = ReadBoundedToml(*confined_root);
+  if (!root) return std::nullopt;
+  bool explicit_invalid = false;
+  if (auto pose = extract(*root, explicit_invalid)) return pose;
+  if (explicit_invalid) return std::nullopt;
+
+  if (root->contains("include")) {
+    const auto inc = (*root)["include"].value_exact<std::string>();
+    if (!inc || inc->empty()) return std::nullopt;
+    const fs::path base_dir = confined_root->parent_path();
+    const fs::path inc_rel{*inc};
+    const fs::path inc_path = inc_rel.is_absolute() || base_dir.empty()
+                                  ? inc_rel
+                                  : base_dir / inc_rel;
+    const auto confined_inc =
+        ConfinedRegularFile(session_dir, canonical_root, inc_path);
+    if (!confined_inc) return std::nullopt;
+    const auto base = ReadBoundedToml(*confined_inc);
+    if (!base) return std::nullopt;
+    return extract(*base, explicit_invalid);
+  }
+  return std::nullopt;
+}
+
+ModeKind ModeFromDriverStation(
+    const std::array<std::uint64_t,
+                     talos::telemetry::kDriverStationChannelCount>& raw) {
+  if (raw[5] != 0) return ModeKind::kEstop;
+  if (raw[0] == 0 || raw[1] == 0) return ModeKind::kDisabled;
+  if (raw[2] != 0) return ModeKind::kAuto;
+  if (raw[3] != 0) return ModeKind::kTeleop;
+  if (raw[4] != 0) return ModeKind::kTest;
+  return ModeKind::kDisabled;
+}
+
+struct ModeStream {
+  std::vector<ModeInterval> intervals;
+  std::uint64_t dropped{0};
+  std::int64_t last_publish_ns{std::numeric_limits<std::int64_t>::min()};
+  ModeKind last_mode{ModeKind::kDisabled};
+  bool last_fms{false};
+  bool closed_last{false};
+};
+
+bool ReadManifestInt(const nlohmann::json& object, std::string_view key,
+                     std::int64_t& out) {
+  const auto it = object.find(key);
+  if (it == object.end()) return false;
+  if (it->is_number_integer()) {
+    out = it->get<std::int64_t>();
+    return true;
+  }
+  if (it->is_string()) {
+    const std::string& text = it->get_ref<const std::string&>();
+    const auto [end, ec] =
+        std::from_chars(text.data(), text.data() + text.size(), out);
+    return ec == std::errc{} && end == text.data() + text.size() &&
+           !text.empty();
+  }
+  return false;
+}
+
+void ReadManifestRuns(const fs::path& manifest_path,
+                      std::int64_t origin_wall_ns,
+                      std::vector<RunInterval>& runs,
+                      std::uint64_t& runs_dropped) {
+  const auto content = ReadBoundedRegularFile(manifest_path, kMaxManifestBytes);
+  if (!content) return;
+  const auto manifest = nlohmann::json::parse(*content, nullptr,
+                                              /*allow_exceptions=*/false);
+  if (!manifest.is_object()) return;
+  const auto nodes = manifest.find("nodes");
+  if (nodes == manifest.end() || !nodes->is_array()) return;
+  for (const auto& node : *nodes) {
+    if (!node.is_object()) continue;
+    const auto name_it = node.find("name");
+    if (name_it == node.end() || !name_it->is_string()) continue;
+    const std::string& node_name = name_it->get_ref<const std::string&>();
+    std::int64_t node_dropped = 0;
+    if (ReadManifestInt(node, "runs_dropped", node_dropped) &&
+        node_dropped > 0) {
+      runs_dropped += static_cast<std::uint64_t>(node_dropped);
+    }
+    const auto node_runs = node.find("runs");
+    if (node_runs == node.end() || !node_runs->is_array()) continue;
+    for (const auto& run : *node_runs) {
+      if (!run.is_object()) continue;
+      std::int64_t start_wall_ns = 0;
+      if (!ReadManifestInt(run, "start_wall_ns", start_wall_ns) ||
+          start_wall_ns <= 0) {
+        continue;
+      }
+      const auto reason_it = run.find("reason");
+      if (reason_it == run.end() || !reason_it->is_string()) continue;
+      std::int64_t end_wall_ns = 0;
+      (void)ReadManifestInt(run, "end_wall_ns", end_wall_ns);
+      std::int64_t start_ns = start_wall_ns - origin_wall_ns;
+      if (start_ns < 0) start_ns = 0;
+      std::optional<std::int64_t> end_ns;
+      if (end_wall_ns > 0) {
+        end_ns = std::max(start_ns, end_wall_ns - origin_wall_ns);
+      }
+      runs.push_back({node_name, start_ns, end_ns,
+                      reason_it->get_ref<const std::string&>()});
+    }
+  }
+  std::sort(runs.begin(), runs.end(),
+            [](const RunInterval& a, const RunInterval& b) {
+              const std::int64_t a_end =
+                  a.end_ns.value_or(std::numeric_limits<std::int64_t>::max());
+              const std::int64_t b_end =
+                  b.end_ns.value_or(std::numeric_limits<std::int64_t>::max());
+              return std::tie(a.start_ns, a.node, a_end, a.reason) <
+                     std::tie(b.start_ns, b.node, b_end, b.reason);
+            });
+  if (runs.size() > kMaxTimelineRuns) {
+    runs_dropped += runs.size() - kMaxTimelineRuns;
+    runs.resize(kMaxTimelineRuns);
+  }
+  runs.shrink_to_fit();
+}
 
 // A log file as the index pass learns it: per source id, its topic (-1 for
 // none, kUnresolved before its first value record) and which value record
@@ -66,7 +407,45 @@ constexpr std::int32_t kUnresolved = -2;
 struct FileBuild {
   std::vector<std::int32_t> topic;
   std::vector<std::uint8_t> kinds;  // bit 0 SEND, bit 1 MESSAGE
+  // Transient map from source_id (>= 63) to dense bit index in
+  // LogFile::overflow_source_ids.
+  std::unordered_map<std::uint16_t, std::size_t> overflow_bit;
 };
+
+void RecordOverflowSource(LogFile& log_file, FileBuild& build,
+                          std::size_t cp_idx, std::uint16_t source_id) {
+  const auto [it, inserted] = build.overflow_bit.emplace(
+      source_id, log_file.overflow_source_ids.size());
+  if (inserted) {
+    log_file.overflow_source_ids.push_back(source_id);
+    const std::size_t needed_words =
+        (log_file.overflow_source_ids.size() + 63) / 64;
+    if (needed_words > log_file.overflow_words_per_cp) {
+      const std::size_t old_words = log_file.overflow_words_per_cp;
+      const std::size_t old_cps =
+          old_words == 0 ? 0 : log_file.overflow_bits.size() / old_words;
+      std::vector<std::uint64_t> grown(
+          std::max(old_cps, cp_idx + 1) * needed_words, 0);
+      for (std::size_t c = 0; c < old_cps; ++c) {
+        for (std::size_t w = 0; w < old_words; ++w) {
+          grown[c * needed_words + w] =
+              log_file.overflow_bits[c * old_words + w];
+        }
+      }
+      log_file.overflow_bits = std::move(grown);
+      log_file.overflow_words_per_cp = needed_words;
+    }
+  }
+  const std::size_t bit_idx = it->second;
+  const std::size_t required_size =
+      (cp_idx + 1) * log_file.overflow_words_per_cp;
+  if (log_file.overflow_bits.size() < required_size) {
+    log_file.overflow_bits.resize(required_size, 0);
+  }
+  log_file.overflow_bits[cp_idx * log_file.overflow_words_per_cp +
+                         (bit_idx / 64)] |=
+      (std::uint64_t{1} << (bit_idx % 64));
+}
 
 class Indexer {
  public:
@@ -118,6 +497,11 @@ class Indexer {
             source.name, schema.name, schema.bfbs);
       }
       if (topic.decoder == Decoder::kHardware || !topic.channels.empty()) {
+        for (std::uint32_t c = 0; c < topic.channels.size(); ++c) {
+          if (topic.channels[c].alert != Talos::Telemetry::AlertLevel_None) {
+            topic.alert_channels.push_back(c);
+          }
+        }
         index = static_cast<std::int32_t>(topics.size());
         topics.push_back(std::move(topic));
       }
@@ -133,21 +517,46 @@ class Indexer {
   std::unordered_map<std::string, std::int32_t> by_name_;
 };
 
-// The wall clock and monotonic time a log's header records for its start.
-struct HeaderTimes {
-  std::int64_t wall_ns{0};
-  std::int64_t monotonic_ns{0};
-};
-std::optional<HeaderTimes> ReadHeaderTimes(const std::string& path) {
-  std::ifstream stream{path, std::ios::binary};
-  tlog::FileHeader header{};
-  if (!stream.read(reinterpret_cast<char*>(&header), sizeof header)) {
-    return std::nullopt;
-  }
-  return HeaderTimes{header.start_wall_ns, header.start_monotonic_ns};
+}  // namespace
+
+std::optional<std::size_t> LogFile::OverflowBit(std::uint16_t source_id) const {
+  if (source_id < 63 || overflow_source_ids.empty()) return std::nullopt;
+  const auto it = std::find(overflow_source_ids.begin(),
+                            overflow_source_ids.end(), source_id);
+  if (it == overflow_source_ids.end()) return std::nullopt;
+  return static_cast<std::size_t>(it - overflow_source_ids.begin());
 }
 
-}  // namespace
+bool LogFile::HasSource(std::size_t cp_idx, std::uint16_t source_id,
+                        std::optional<std::size_t> overflow_bit) const {
+  const std::uint64_t mask = checkpoints[cp_idx].sources;
+  if (source_id < 63) return (mask & (std::uint64_t{1} << source_id)) != 0;
+  if ((mask & (std::uint64_t{1} << 63)) == 0 || !overflow_bit ||
+      overflow_words_per_cp == 0) {
+    return false;
+  }
+  const std::size_t word_idx =
+      cp_idx * overflow_words_per_cp + (*overflow_bit / 64);
+  if (word_idx >= overflow_bits.size()) return false;
+  return (overflow_bits[word_idx] &
+          (std::uint64_t{1} << (*overflow_bit % 64))) != 0;
+}
+
+std::string_view ModeKindName(ModeKind mode) {
+  switch (mode) {
+    case ModeKind::kDisabled:
+      return "disabled";
+    case ModeKind::kTeleop:
+      return "teleop";
+    case ModeKind::kAuto:
+      return "auto";
+    case ModeKind::kTest:
+      return "test";
+    case ModeKind::kEstop:
+      return "estop";
+  }
+  return "disabled";
+}
 
 double ValueOf(ChannelKind kind, std::uint64_t raw) {
   switch (kind) {
@@ -176,6 +585,7 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   std::size_t file = 0;
   bool any = false;
   std::vector<HardwareSample> samples;
+  std::map<std::pair<std::string, bool>, ModeStream> mode_streams;
   auto recorded = talos::launcher::RecordedProtocolVersion({dir.string()});
   if (const std::string line = recorded.Disagreement(); !line.empty()) {
     std::cerr << "studio_review: " << dir.string() << ": " << line << '\n';
@@ -222,7 +632,16 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       return true;
     }
     if (!IsValueRecord(r.header)) return true;
-    log_file.checkpoints.back().sources |= SourceBit(r.header.source_id);
+    const std::size_t cp_idx = log_file.checkpoints.size() - 1;
+    const std::int64_t cp_second = log_file.checkpoints[cp_idx].second;
+    const std::int64_t publish_second = FloorSecond(r.header.publish_time_ns);
+    if (cp_second > publish_second) {
+      log_file.max_lead_s =
+          std::max(log_file.max_lead_s, cp_second - publish_second);
+    } else if (publish_second > cp_second) {
+      log_file.max_lag_s =
+          std::max(log_file.max_lag_s, publish_second - cp_second);
+    }
     if (r.source == nullptr || r.payload.empty()) return true;
     FileBuild& build = builds[file];
     const std::uint16_t id = r.header.source_id;
@@ -241,18 +660,90 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
                    r.payload);
     }
     if (build.topic[id] < 0) return true;
-    build.kinds[id] |=
-        r.header.kind == static_cast<std::uint16_t>(EventKind::SEND) ? 1 : 2;
-    TopicBuild& topic =
-        indexer.topics[static_cast<std::size_t>(build.topic[id])];
+    log_file.checkpoints[cp_idx].sources |= SourceBit(id);
+    if (id >= 63) {
+      RecordOverflowSource(log_file, build, cp_idx, id);
+    }
+    const bool is_send =
+        r.header.kind == static_cast<std::uint16_t>(EventKind::SEND);
+    build.kinds[id] |= is_send ? 1 : 2;
+    const auto topic_idx = static_cast<std::size_t>(build.topic[id]);
+    TopicBuild& topic = indexer.topics[topic_idx];
     // A hardware topic's channels are what its packets hold: learned from
-    // its first packet in each second.
-    if (topic.decoder == Decoder::kHardware && topic.decoded_second != second) {
-      topic.decoded_second = second;
-      FlattenHardware(topic.name, topic.hardware, r.payload, samples);
-      for (const HardwareSample& sample : samples) {
-        if (!sample.null)
-          topic.hardware_channels.emplace(sample.name, sample.kind);
+    // its first packet in each second. Never decode foreign-protocol hardware
+    // or Driver Station packets (REQ-OPS-51).
+    if (topic.decoder == Decoder::kHardware) {
+      if (!protocol.foreign() && topic.decoded_second != second) {
+        topic.decoded_second = second;
+        FlattenHardware(topic.name, topic.hardware, r.payload, samples);
+        for (const HardwareSample& sample : samples) {
+          if (!sample.null)
+            topic.hardware_channels.emplace(sample.name, sample.kind);
+        }
+      }
+    } else if (topic.decoder == Decoder::kDriverStation) {
+      if (!protocol.foreign()) {
+        std::array<std::uint64_t, talos::telemetry::kDriverStationChannelCount>
+            values{};
+        if (talos::telemetry::ReadDriverStation(r.payload, values)) {
+          const std::int64_t publish_ns = r.header.publish_time_ns;
+          ModeStream& stream = mode_streams[{log_file.process, is_send}];
+          if (publish_ns >= stream.last_publish_ns) {
+            stream.last_publish_ns = publish_ns;
+            const ModeKind mode = ModeFromDriverStation(values);
+            const bool fms = values[6] != 0;
+            if (stream.intervals.empty()) {
+              stream.intervals.push_back({publish_ns, publish_ns, mode, fms});
+              stream.last_mode = mode;
+              stream.last_fms = fms;
+            } else if (mode != stream.last_mode || fms != stream.last_fms) {
+              if (!stream.closed_last) {
+                stream.intervals.back().end_ns = publish_ns;
+                if (stream.intervals.size() < kMaxTimelineModes) {
+                  stream.intervals.push_back(
+                      {publish_ns, publish_ns, mode, fms});
+                } else {
+                  stream.closed_last = true;
+                  ++stream.dropped;
+                }
+              } else {
+                ++stream.dropped;
+              }
+              stream.last_mode = mode;
+              stream.last_fms = fms;
+            }
+          }
+        }
+      }
+    } else if (topic.decoder == Decoder::kStruct &&
+               !topic.alert_channels.empty()) {
+      if (SelectCanonicalAlertStream(topic, session->files_, file, is_send)) {
+        const std::int64_t publish_ns = r.header.publish_time_ns;
+        AlertStream& stream = topic.alert_stream;
+        if (publish_ns >= stream.last_publish_ns) {
+          stream.last_publish_ns = publish_ns;
+          for (std::size_t i = 0; i < topic.alert_channels.size(); ++i) {
+            const std::uint32_t c = topic.alert_channels[i];
+            std::uint64_t raw = 0;
+            if (!talos::telemetry::ReadChannel(topic.channels[c], r.payload,
+                                               raw)) {
+              continue;
+            }
+            const bool active = raw != 0;
+            AlertChannelState& st = stream.channels[i];
+            if (active && !st.active) {
+              st.active = true;
+              st.start_ns = publish_ns;
+            } else if (!active && st.active) {
+              st.active = false;
+              if (st.intervals.size() < kMaxTimelineAlerts) {
+                st.intervals.push_back({st.start_ns, publish_ns});
+              } else {
+                ++st.dropped;
+              }
+            }
+          }
+        }
       }
     }
     return true;
@@ -279,6 +770,7 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
 
   // Each topic's process: the one that sent it, else the one whose log
   // path sorts first among those that received it.
+  std::vector<std::size_t> topic_build_index;
   for (std::size_t t = 0; t < indexer.topics.size(); ++t) {
     TopicBuild& build = indexer.topics[t];
     std::optional<std::size_t> sender;
@@ -338,6 +830,7 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     if (topic.channels.empty()) continue;
     session->topics_.push_back(std::move(topic));
     session->hardware_index_.push_back(std::move(hardware_index));
+    topic_build_index.push_back(t);
   }
   // Topics by name, so channels.json lists them in a stable order.
   std::vector<std::size_t> order(session->topics_.size());
@@ -347,9 +840,11 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   });
   std::vector<Topic> topics;
   std::vector<std::unordered_map<std::string, std::uint32_t>> hardware_index;
+  std::vector<std::size_t> sorted_build_index;
   for (const std::size_t i : order) {
     topics.push_back(std::move(session->topics_[i]));
     hardware_index.push_back(std::move(session->hardware_index_[i]));
+    sorted_build_index.push_back(topic_build_index[i]);
   }
   session->topics_ = std::move(topics);
   session->hardware_index_ = std::move(hardware_index);
@@ -360,15 +855,98 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     }
   }
 
-  std::optional<HeaderTimes> origin;
+  // Finalize timeline modes and alerts from each topic's canonical stream.
+  std::vector<AlertInterval> combined_alerts;
+  const auto sort_alerts = [&combined_alerts, &session] {
+    std::sort(combined_alerts.begin(), combined_alerts.end(),
+              [&session](const AlertInterval& a, const AlertInterval& b) {
+                if (a.start_ns != b.start_ns) return a.start_ns < b.start_ns;
+                if (a.end_ns != b.end_ns) return a.end_ns < b.end_ns;
+                return session->channel(a.channel()).name <
+                       session->channel(b.channel()).name;
+              });
+  };
+  for (std::uint32_t t = 0; t < session->topics_.size(); ++t) {
+    const Topic& topic = session->topics_[t];
+    const bool is_send = topic.kind == EventKind::SEND;
+    if (!protocol.foreign() && topic.decoder == Decoder::kDriverStation) {
+      const auto it = mode_streams.find({topic.process, is_send});
+      if (it != mode_streams.end()) {
+        session->modes_ = std::move(it->second.intervals);
+        session->modes_dropped_ = it->second.dropped;
+        if (!session->modes_.empty() && !it->second.closed_last) {
+          session->modes_.back().end_ns =
+              std::max(session->modes_.back().start_ns, session->end_ns_);
+        }
+        session->modes_.shrink_to_fit();
+      }
+    } else if (topic.decoder == Decoder::kStruct) {
+      const std::size_t build_idx = sorted_build_index[t];
+      TopicBuild& build = indexer.topics[build_idx];
+      if (build.alert_file.has_value() && build.alert_is_send == is_send &&
+          session->files_[*build.alert_file].process == topic.process) {
+        AlertStream& stream = build.alert_stream;
+        const auto& alert_channels = build.alert_channels;
+        for (std::size_t i = 0; i < alert_channels.size(); ++i) {
+          AlertChannelState& st = stream.channels[i];
+          const ChannelRef ref{t, alert_channels[i]};
+          const std::size_t closed_count = st.intervals.size();
+          for (const RawAlertInterval& iv : st.intervals) {
+            combined_alerts.push_back(AlertInterval::Make(
+                iv.start_ns, iv.end_ns, ref, /*active_at_end=*/false));
+          }
+          std::vector<RawAlertInterval>{}.swap(st.intervals);
+          if (st.active) {
+            if (closed_count < kMaxTimelineAlerts) {
+              combined_alerts.push_back(AlertInterval::Make(
+                  st.start_ns, std::max(st.start_ns, session->end_ns_), ref,
+                  /*active_at_end=*/true));
+            } else {
+              ++st.dropped;
+            }
+          }
+          session->alerts_dropped_ += st.dropped;
+          if (combined_alerts.size() > kMaxTimelineAlerts) {
+            sort_alerts();
+            session->alerts_dropped_ +=
+                combined_alerts.size() - kMaxTimelineAlerts;
+            combined_alerts.resize(kMaxTimelineAlerts);
+          }
+        }
+        stream = AlertStream{};
+      }
+    }
+  }
+  sort_alerts();
+  session->alerts_ = std::move(combined_alerts);
+  session->alerts_.shrink_to_fit();
+
+  std::optional<std::pair<std::int64_t, std::int64_t>> origin;
   for (const LogFile& log_file : session->files_) {
-    const auto times = ReadHeaderTimes(log_file.path);
-    if (times && (!origin || times->monotonic_ns < origin->monotonic_ns)) {
-      origin = times;
+    const tlog::WindowedLogReader reader{log_file.path};
+    const std::int64_t monotonic_ns = reader.start_time().nanos();
+    const std::int64_t wall_ns = reader.start_wall_ns();
+    if (!origin || monotonic_ns < origin->first) {
+      origin = {monotonic_ns, wall_ns};
     }
   }
   if (origin) {
-    session->origin_wall_ns_ = origin->wall_ns - origin->monotonic_ns;
+    session->origin_wall_ns_ = origin->second - origin->first;
+  }
+  ReadManifestRuns(dir / "manifest.json", session->origin_wall_ns_,
+                   session->runs_, session->runs_dropped_);
+  std::error_code manifest_ec;
+  const fs::file_status manifest_st =
+      fs::symlink_status(dir / "manifest.json", manifest_ec);
+  if (!manifest_ec && !fs::is_symlink(manifest_st) &&
+      fs::is_regular_file(manifest_st)) {
+    const std::string config_path =
+        talos::launcher::SessionConfigPath("", {dir.string()});
+    if (!config_path.empty()) {
+      if (auto pose = ReadPoseTopicFromConfig(dir, config_path)) {
+        session->pose_topic_ = std::move(*pose);
+      }
+    }
   }
   return session;
 }
@@ -386,7 +964,12 @@ std::size_t Session::log_seconds() const {
 }
 
 std::size_t Session::index_bytes() const {
-  return log_seconds() * sizeof(Checkpoint) + gaps_.size() * sizeof(Gap);
+  std::size_t bytes =
+      log_seconds() * sizeof(Checkpoint) + gaps_.size() * sizeof(Gap);
+  for (const LogFile& file : files_) {
+    bytes += file.overflow_bits.size() * sizeof(std::uint64_t);
+  }
+  return bytes;
 }
 
 bool Session::Decode(const Topic& topic, std::span<const std::byte> payload,
@@ -491,8 +1074,8 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
   wanted_topics.reserve(wants.size());
   for (const auto& [topic, unused] : wants) wanted_topics.push_back(topic);
 
-  const std::int64_t first_second = FloorSecond(start_ns) - 1;
-  const std::int64_t last_second = FloorSecond(end_ns) + 1;
+  const std::int64_t start_second = FloorSecond(start_ns);
+  const std::int64_t end_second = FloorSecond(end_ns);
   const auto span_ns = static_cast<__int128>(end_ns) - start_ns;
   std::vector<std::uint64_t> raw;
   std::vector<std::uint8_t> present;
@@ -500,25 +1083,64 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
        SourcesByFile(topics_, wanted_topics)) {
     const LogFile& file = files_[file_index];
     const auto& checkpoints = file.checkpoints;
+    const std::int64_t first_second = start_second - file.max_lag_s;
+    const std::int64_t last_second = end_second + file.max_lead_s;
     const auto first = std::lower_bound(
         checkpoints.begin(), checkpoints.end(), first_second,
         [](const Checkpoint& c, std::int64_t s) { return c.second < s; });
-    std::uint64_t mask = 0;
-    for (const auto& [id, topic] : sources) mask |= SourceBit(id);
-    bool holds = false;
-    for (auto it = first; it != checkpoints.end() && it->second <= last_second;
-         ++it) {
-      holds = holds || (it->sources & mask) != 0;
+    const auto end_it = std::upper_bound(
+        first, checkpoints.end(), last_second,
+        [](std::int64_t s, const Checkpoint& c) { return s < c.second; });
+    std::uint64_t low_mask = 0;
+    std::vector<std::pair<std::size_t, std::uint64_t>> overflow_checks;
+    for (const auto& [id, topic] : sources) {
+      if (id < 63) {
+        low_mask |= (std::uint64_t{1} << id);
+      } else if (const auto bit = file.OverflowBit(id)) {
+        overflow_checks.emplace_back(*bit / 64,
+                                     std::uint64_t{1} << (*bit % 64));
+      }
     }
-    if (!holds) continue;
+    const auto cp_holds = [&](std::size_t cp_idx) {
+      const std::uint64_t mask = checkpoints[cp_idx].sources;
+      if ((mask & low_mask) != 0) return true;
+      if (overflow_checks.empty() || (mask & (std::uint64_t{1} << 63)) == 0 ||
+          file.overflow_words_per_cp == 0) {
+        return false;
+      }
+      const std::size_t base = cp_idx * file.overflow_words_per_cp;
+      for (const auto& [word_off, bit_mask] : overflow_checks) {
+        const std::size_t idx = base + word_off;
+        if (idx < file.overflow_bits.size() &&
+            (file.overflow_bits[idx] & bit_mask) != 0) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const auto first_idx =
+        static_cast<std::size_t>(first - checkpoints.begin());
+    const auto end_idx = static_cast<std::size_t>(end_it - checkpoints.begin());
+    std::optional<std::size_t> first_match;
+    std::size_t last_match = 0;
+    for (std::size_t cp = first_idx; cp < end_idx; ++cp) {
+      if (!cp_holds(cp)) continue;
+      if (!first_match) first_match = cp;
+      last_match = cp;
+    }
+    if (!first_match) continue;
+    const std::uint64_t stop_offset =
+        last_match + 1 < checkpoints.size()
+            ? checkpoints[last_match + 1].offset
+            : std::numeric_limits<std::uint64_t>::max();
     if (stats != nullptr) ++stats->seeks;
     tlog::LogVisitor visitor;
     visitor.manifest = [](std::span<const tlog::ManifestEntry>) {
       return true;
     };
     visitor.record = [&](const tlog::LogReader::Record& record) {
+      if (record.offset >= stop_offset) return false;
       const auto& header = record.header;
-      if (FloorSecond(header.event_time_ns) > last_second) return false;
       Count(record, stats);
       const auto source = std::find_if(
           sources.begin(), sources.end(),
@@ -550,7 +1172,8 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
       }
       return true;
     };
-    tlog::VisitLog(file.path, visitor, tlog::VisitOptions{first->offset});
+    tlog::VisitLog(file.path, visitor,
+                   tlog::VisitOptions{checkpoints[*first_match].offset});
   }
   for (Series& series : out) {
     for (std::size_t b = 0; b < points; ++b) {
@@ -564,8 +1187,8 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
   return out;
 }
 
-std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
-                                      ReadStats* stats) const {
+std::vector<Sample> Session::Snapshot(std::int64_t t_ns, ReadStats* stats,
+                                      std::size_t max_channels) const {
   struct Latest {
     std::int64_t publish_ns{std::numeric_limits<std::int64_t>::min()};
     std::vector<std::uint64_t> raw;
@@ -574,40 +1197,44 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
   std::vector<Latest> latest(topics_.size());
   std::vector<std::uint32_t> all(topics_.size());
   for (std::uint32_t t = 0; t < all.size(); ++t) all[t] = t;
-  const std::int64_t last_second = FloorSecond(t_ns) + 1;
+  const std::int64_t target_second = FloorSecond(t_ns);
   std::vector<std::uint64_t> raw;
   std::vector<std::uint8_t> present;
 
   for (const auto& [file_index, sources] : SourcesByFile(topics_, all)) {
     const LogFile& file = files_[file_index];
     const auto& checkpoints = file.checkpoints;
-    // The latest second at or before `from` holding source `id`, or -1.
-    const auto previous = [&](std::uint16_t id, std::ptrdiff_t from) {
+    const std::int64_t last_second = target_second + file.max_lead_s;
+    struct Item {
+      std::uint16_t id;
+      std::uint32_t topic;
+      std::optional<std::size_t> overflow_bit;
+      std::ptrdiff_t candidate;
+      std::ptrdiff_t found_checkpoint{-1};
+      Latest found;
+    };
+    // The latest second at or before `from` holding `item`'s source, or -1.
+    const auto previous = [&](const Item& item, std::ptrdiff_t from) {
       for (std::ptrdiff_t c = from; c >= 0; --c) {
-        const Checkpoint& checkpoint = checkpoints[static_cast<std::size_t>(c)];
-        if (checkpoint.second <= last_second &&
-            (checkpoint.sources & SourceBit(id)) != 0) {
+        const auto cp_idx = static_cast<std::size_t>(c);
+        if (checkpoints[cp_idx].second <= last_second &&
+            file.HasSource(cp_idx, item.id, item.overflow_bit)) {
           return c;
         }
       }
       return std::ptrdiff_t{-1};
     };
-    struct Item {
-      std::uint16_t id;
-      std::uint32_t topic;
-      std::ptrdiff_t candidate;
-      Latest found;
-    };
     std::vector<Item> items;
+    items.reserve(sources.size());
     for (const auto& [id, topic] : sources) {
-      items.push_back(
-          {id,
-           topic,
-           previous(id, static_cast<std::ptrdiff_t>(checkpoints.size()) - 1),
-           {}});
+      Item item{id, topic, file.OverflowBit(id), -1, -1, {}};
+      item.candidate =
+          previous(item, static_cast<std::ptrdiff_t>(checkpoints.size()) - 1);
+      items.push_back(std::move(item));
     }
     // Seconds latest first, each read once, for every item whose candidate
-    // it is; an item that finds nothing there moves to its previous second.
+    // it is; an item keeps checking earlier checkpoints until none can hold a
+    // newer publication (accounting for publish/receipt skew).
     while (true) {
       std::ptrdiff_t second = -1;
       for (const Item& item : items) second = std::max(second, item.candidate);
@@ -631,13 +1258,16 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
           const Topic& topic = topics_[item.topic];
           if (header.kind != static_cast<std::uint16_t>(topic.kind) ||
               !IsValueRecord(header) || header.publish_time_ns > t_ns ||
-              header.publish_time_ns < item.found.publish_ns) {
+              header.publish_time_ns < item.found.publish_ns ||
+              (header.publish_time_ns == item.found.publish_ns &&
+               item.found_checkpoint > second)) {
             continue;
           }
           if (!Decode(topic, record.payload, raw, present)) continue;
           item.found.publish_ns = header.publish_time_ns;
           item.found.raw = raw;
           item.found.present = present;
+          item.found_checkpoint = second;
         }
         return true;
       };
@@ -645,8 +1275,18 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
                      tlog::VisitOptions{checkpoints[at].offset});
       for (Item& item : items) {
         if (item.candidate != second) continue;
-        item.candidate =
-            item.found.raw.empty() ? previous(item.id, second - 1) : -1;
+        if (item.found.raw.empty()) {
+          item.candidate = previous(item, second - 1);
+        } else {
+          const std::int64_t min_second =
+              FloorSecond(item.found.publish_ns) - file.max_lag_s;
+          const std::ptrdiff_t prev = previous(item, second - 1);
+          item.candidate =
+              (prev >= 0 &&
+               checkpoints[static_cast<std::size_t>(prev)].second >= min_second)
+                  ? prev
+                  : -1;
+        }
       }
     }
     for (Item& item : items) {
@@ -660,6 +1300,7 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
   for (std::uint32_t t = 0; t < latest.size(); ++t) {
     const Latest& value = latest[t];
     for (std::uint32_t c = 0; c < value.raw.size(); ++c) {
+      if (samples.size() >= max_channels) return samples;
       samples.push_back(
           {{t, c}, value.raw[c], value.publish_ns, value.present[c] != 0});
     }

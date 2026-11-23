@@ -1,8 +1,11 @@
 // talos_messages' schema step: reads one schema's .bfbs and
 //
 //   descriptor_gen lint <bfbs> <file>
-//       fails when a numeric field of a struct declared in <file> has no
-//       unit suffix (talOS/schema/unit_suffix.h, docs/METHODOLOGY.md §6);
+//       fails when a field of a struct declared in <file> violates the
+//       field-naming rules (lower snake_case, no _<digit> segment, no
+//       interior one-letter segment before a unit suffix) or when a numeric
+//       field has no unit suffix (talOS/schema/unit_suffix.h,
+//       docs/METHODOLOGY.md §6);
 //   descriptor_gen cc <bfbs> <file> <out.h> <label>
 //       writes talos::Descriptor<M> for each struct declared in <file>,
 //       forward-declaring M, so flatc's <file>_generated.h includes it
@@ -26,9 +29,9 @@
 #include <vector>
 
 #include "flatbuffers/reflection_generated.h"
-#include "flatbuffers/verifier.h"
 #include "talOS/schema/schema_hash.h"
 #include "talOS/schema/unit_suffix.h"
+#include "talOS/schema/verify.h"
 
 namespace {
 
@@ -46,13 +49,13 @@ bool load(const char* bfbs_path, std::string_view file, Input& in) {
   }
   in.bytes.assign(std::istreambuf_iterator<char>(stream),
                   std::istreambuf_iterator<char>());
-  flatbuffers::Verifier verifier(in.bytes.data(), in.bytes.size());
-  if (!reflection::VerifySchemaBuffer(verifier)) {
+  in.schema = talos::schema::VerifySchema(
+      {reinterpret_cast<const char*>(in.bytes.data()), in.bytes.size()});
+  if (in.schema == nullptr) {
     std::fprintf(stderr, "descriptor_gen: %s is not a reflection.Schema\n",
                  bfbs_path);
     return false;
   }
-  in.schema = reflection::GetSchema(in.bytes.data());
   for (const reflection::Object* object : *in.schema->objects()) {
     if (object->is_struct() && object->declaration_file() != nullptr &&
         object->declaration_file()->string_view() == file) {
@@ -67,20 +70,95 @@ bool is_scalar_number(reflection::BaseType base) {
          base <= reflection::BaseType::Double;
 }
 
+bool is_lower_snake_case(std::string_view name) {
+  if (name.empty()) return false;
+  if (name.front() < 'a' || name.front() > 'z') return false;
+  if (name.back() == '_') return false;
+  bool prev_underscore = false;
+  for (char c : name) {
+    if (c == '_') {
+      if (prev_underscore) return false;
+      prev_underscore = true;
+    } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+      prev_underscore = false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool has_digit_segment(std::string_view name) {
+  for (std::size_t i = 0; i + 1 < name.size(); ++i) {
+    if (name[i] == '_' && name[i + 1] >= '0' && name[i + 1] <= '9') {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool has_interior_one_letter_before_unit_suffix(std::string_view name) {
+  for (const auto& entry : talos::schema::kUnitSuffixTable) {
+    if (name.size() <= entry.suffix.size() ||
+        name.substr(name.size() - entry.suffix.size()) != entry.suffix) {
+      continue;
+    }
+    const std::string_view stem =
+        name.substr(0, name.size() - entry.suffix.size());
+    if (stem.size() >= 3 && stem[stem.size() - 3] != '_' &&
+        stem[stem.size() - 2] == '_' && stem.back() >= 'a' &&
+        stem.back() <= 'z') {
+      return true;
+    }
+  }
+  return false;
+}
+
 int lint(const Input& in, std::string_view file) {
   int violations = 0;
+  int missing_unit_suffix = 0;
   for (const reflection::Object* object : in.structs) {
     for (const reflection::Field* field : *object->fields()) {
+      const std::string_view name = field->name()->string_view();
+      if (!is_lower_snake_case(name)) {
+        ++violations;
+        std::fprintf(stderr,
+                     "talos_messages: %.*s: %s.%s must be lower snake_case "
+                     "(no uppercase, '__', or leading/trailing '_'; "
+                     "docs/METHODOLOGY.md §6)\n",
+                     static_cast<int>(file.size()), file.data(),
+                     object->name()->c_str(), field->name()->c_str());
+      }
+      if (has_digit_segment(name)) {
+        ++violations;
+        std::fprintf(
+            stderr,
+            "talos_messages: %.*s: %s.%s must not have a '_<digit>' segment "
+            "(e.g. module0, not module_0; docs/METHODOLOGY.md §6)\n",
+            static_cast<int>(file.size()), file.data(), object->name()->c_str(),
+            field->name()->c_str());
+      }
+      if (has_interior_one_letter_before_unit_suffix(name)) {
+        ++violations;
+        std::fprintf(
+            stderr,
+            "talos_messages: %.*s: %s.%s must not have a one-letter word "
+            "before its unit suffix (e.g. x_std_m, not std_x_m; "
+            "docs/METHODOLOGY.md §6)\n",
+            static_cast<int>(file.size()), file.data(), object->name()->c_str(),
+            field->name()->c_str());
+      }
       const reflection::Type& type = *field->type();
       const reflection::BaseType base =
           type.base_type() == reflection::BaseType::Array ? type.element()
                                                           : type.base_type();
       // Bools, enums (a scalar with an enum index) and structs carry no unit.
       if (!is_scalar_number(base) || type.index() >= 0) continue;
-      if (talos::schema::has_unit_suffix(field->name()->string_view())) {
+      if (talos::schema::has_unit_suffix(name)) {
         continue;
       }
       ++violations;
+      ++missing_unit_suffix;
       std::fprintf(
           stderr, "talos_messages: %.*s: %s.%s (%s) has no unit suffix\n",
           static_cast<int>(file.size()), file.data(), object->name()->c_str(),
@@ -88,15 +166,17 @@ int lint(const Input& in, std::string_view file) {
     }
   }
   if (violations == 0) return 0;
-  std::string suffixes;
-  for (std::string_view suffix : talos::schema::kUnitSuffixes) {
-    suffixes += ' ';
-    suffixes += suffix;
+  if (missing_unit_suffix > 0) {
+    std::string suffixes;
+    for (std::string_view suffix : talos::schema::kUnitSuffixes) {
+      suffixes += ' ';
+      suffixes += suffix;
+    }
+    std::fprintf(stderr,
+                 "talos_messages: end every numeric field with a unit suffix "
+                 "(docs/METHODOLOGY.md §6):%s\n",
+                 suffixes.c_str());
   }
-  std::fprintf(stderr,
-               "talos_messages: end every numeric field with a unit suffix "
-               "(docs/METHODOLOGY.md §6):%s\n",
-               suffixes.c_str());
   return 1;
 }
 

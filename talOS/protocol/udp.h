@@ -32,11 +32,13 @@ struct UdpSocketOptions {
 struct UdpStats {
   uint64_t sent_frames = 0;
   uint64_t sent_bytes = 0;
+  uint64_t send_would_block = 0;
   uint64_t received_frames = 0;
   uint64_t received_bytes = 0;
   uint64_t receive_would_block = 0;
   uint64_t decode_failures = 0;
   uint64_t sequence_gaps = 0;
+  uint64_t out_of_order_frames = 0;
   uint64_t last_received_sequence = 0;
   DecodeStatus last_decode_status = DecodeStatus::kOk;
   // The header version of the last kUnsupportedVersion frame; 0 before one.
@@ -45,6 +47,9 @@ struct UdpStats {
   // returned kSocketError from an open socket; 0 before one, or when that
   // send was short with no error.
   int last_send_error = 0;
+  // The OS error (errno; WSAGetLastError() on Windows) of the last receive
+  // that returned kSocketError from an open socket; 0 before one.
+  int last_recv_error = 0;
 };
 
 // Connected UDP runtime peer for the Mac<->Rio hot path.
@@ -114,9 +119,14 @@ class RuntimeUdpPeer {
 
   uintptr_t socket_;
   uint64_t next_send_sequence_;
+  uint64_t last_below_sequence_{0};
+  uint8_t below_ascending_count_{0};
   UdpStats stats_;
   std::array<uint8_t, kMaxFrameSize> tx_buffer_;
-  std::array<uint8_t, kMaxFrameSize> rx_buffer_;
+  // One byte larger than kMaxFrameSize so a POSIX recv() on an oversized UDP
+  // datagram returns kMaxFrameSize + 1 instead of silently truncating to
+  // kMaxFrameSize and passing DecodeFrame as a valid max-payload frame.
+  std::array<uint8_t, kMaxFrameSize + 1> rx_buffer_;
   // What the last successful Open() asked for, for Reopen(): IPv4 addresses
   // and ports in network byte order.
   bool opened_{false};
@@ -130,13 +140,23 @@ class RuntimeUdpPeer {
 // Whether a send that failed with OS error `error` (UdpStats::last_send_error)
 // may have left a socket that will never send again, whatever the network
 // does, so only a new one can (Reopen): EPIPE, ENOTCONN, EDESTADDRREQ, EBADF,
-// and the socket's source address gone from the host, which Linux reports as
-// ENETUNREACH and macOS as EADDRNOTAVAIL (both are in the set on every OS; on
-// Windows the WSA equivalents: WSAESHUTDOWN, WSAENOTCONN, WSAEDESTADDRREQ,
-// WSAENOTSOCK, WSAENETUNREACH, WSAEADDRNOTAVAIL). Any other error clears by
-// itself on the same socket. Both ends' callers (the bridge's HardwareNode,
-// the RoboRIO program) decide with this one function.
+// ENOTSOCK, and the socket's source address gone from the host, which Linux
+// reports as ENETUNREACH and macOS as EADDRNOTAVAIL (both are in the set on
+// every OS; on Windows the WSA equivalents: WSAESHUTDOWN, WSAENOTCONN,
+// WSAEDESTADDRREQ, WSAENOTSOCK, WSAENETUNREACH, WSAEADDRNOTAVAIL). Any other
+// error clears by itself on the same socket. Both ends' callers (the bridge's
+// HardwareNode, the RoboRIO program) decide with this one function.
 bool SendErrorNeedsNewSocket(int error);
+
+// Whether a receive that failed with OS error `error`
+// (UdpStats::last_recv_error) indicates a broken socket that will never
+// receive again, so only a new one can (Reopen): EBADF, ENOTCONN, ENOTSOCK,
+// EPIPE, ENETUNREACH, EADDRNOTAVAIL (on Windows the WSA equivalents:
+// WSAEBADF, WSAENOTSOCK, WSAENOTCONN, WSAESHUTDOWN, WSAENETUNREACH,
+// WSAEADDRNOTAVAIL). Transient errors such as ECONNREFUSED, EAGAIN,
+// EWOULDBLOCK, EINTR and 0 keep the socket. Both ends' callers (the bridge's
+// HardwareNode, the RoboRIO program) decide with this one function.
+bool ReceiveErrorNeedsNewSocket(int error) noexcept;
 
 const char* UdpStatusName(UdpStatus status);
 

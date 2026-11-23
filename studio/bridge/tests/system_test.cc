@@ -353,6 +353,83 @@ TEST(TopicHealth, AnObservedTopicIsReadAsTheLaunchersLintCountsIt) {
             TopicHealth::UNREAD);
 }
 
+// REQ-OPS-23, REQ-CONTRACT-09
+TEST(TopicHealth, OptionalExemptsPerReaderMatchingLintGraph) {
+  introspect::NodeSnapshot optional_reader;
+  optional_reader.name = "auto_pilot";
+  optional_reader.sources = {
+      {.id = 0,
+       .kind = event::SourceKind::FETCHER,
+       .name = "/vision/state",
+       .flags = naming::kSourceFlagOptional},
+      {.id = 1,
+       .kind = event::SourceKind::FETCHER,
+       .name = "/drivetrain/target/auto",
+       .flags = naming::kSourceFlagOptional},
+      {.id = 2,
+       .kind = event::SourceKind::FETCHER,
+       .name = "/odometry/state",
+       .flags = naming::kSourceFlagOptional},
+  };
+  introspect::NodeSnapshot required_reader;
+  required_reader.name = "pose_estimator";
+  required_reader.sources = {
+      {.id = 0, .kind = event::SourceKind::WATCHER, .name = "/vision/state"},
+      {.id = 1, .kind = event::SourceKind::WATCHER, .name = "/hw/state"},
+  };
+  introspect::NodeSnapshot external_reader;
+  external_reader.name = "bridge_peer";
+  external_reader.sources = {
+      {.id = 0,
+       .kind = event::SourceKind::WATCHER,
+       .name = "/hw/state",
+       .flags = naming::kSourceFlagExternal},
+  };
+  introspect::NodeSnapshot telemetry;
+  telemetry.name = "telemetry";
+  telemetry.sources = {
+      {.id = 0,
+       .kind = event::SourceKind::WATCHER,
+       .name = "/odometry/state",
+       .flags = naming::kSourceFlagObserver},
+      {.id = 1,
+       .kind = event::SourceKind::WATCHER,
+       .name = "/gyro/state",
+       .flags = naming::kSourceFlagObserver},
+  };
+  introspect::NodeSnapshot optional_writer;
+  optional_writer.name = "vision";
+  optional_writer.sources = {
+      {.id = 0,
+       .kind = event::SourceKind::SENDER,
+       .name = "/vision/telemetry",
+       .flags = naming::kSourceFlagOptional},
+  };
+
+  const std::vector<TopicRow> topics =
+      TopicsOf({optional_reader, required_reader, external_reader, telemetry,
+                optional_writer});
+
+  // One optional subscriber + one required subscriber, no publisher ->
+  // orphaned (optional excuses only the reader that declared it).
+  EXPECT_EQ(HealthOf(*Row(topics, "/vision/state")), TopicHealth::ORPHANED);
+  // Only optional subscriber(s), no publisher -> unconnected.
+  EXPECT_EQ(HealthOf(*Row(topics, "/drivetrain/target/auto")),
+            TopicHealth::UNCONNECTED);
+  // Optional subscriber + observer, no publisher -> unconnected (LintGraph
+  // exempts observers when another end is optional).
+  EXPECT_EQ(HealthOf(*Row(topics, "/odometry/state")),
+            TopicHealth::UNCONNECTED);
+  // Observer-only with no publisher and no optional end -> orphaned.
+  EXPECT_EQ(HealthOf(*Row(topics, "/gyro/state")), TopicHealth::ORPHANED);
+  // External on any end still makes a half-wired topic bridged even beside a
+  // required subscriber.
+  EXPECT_EQ(HealthOf(*Row(topics, "/hw/state")), TopicHealth::BRIDGED);
+  // Optional publisher with no reader -> unconnected.
+  EXPECT_EQ(HealthOf(*Row(topics, "/vision/telemetry")),
+            TopicHealth::UNCONNECTED);
+}
+
 TEST(TopicHealth, ExternalOutranksOptionalOnTheSameTopic) {
   // Both flags on one topic is not a contradiction: an end can be outside
   // talOS and not yet wired up. `bridged` wins because it is the more specific

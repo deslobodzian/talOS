@@ -3,6 +3,7 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("@studio_npm//:defs.bzl", "npm_link_all_packages")
 load("@studio_npm//studio:typescript/package_json.bzl", tsc_bin = "bin")
 load("@studio_npm//studio:vite/package_json.bzl", vite_bin = "bin")
+load("//studio/bridge:webroot.bzl", "stamped_web_dist")
 load("//talOS/build:contract.bzl", "talos_graph_test")
 load("//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":tests/browser/robot_manifest.bzl", BROWSER_CONFIG_FILES = "CONFIG_FILES", BROWSER_NODES = "NODES")
@@ -61,6 +62,8 @@ vite_bin.vite_binary(
     chdir = "studio",
 )
 
+# Over 5 s: cold `tsc --noEmit` across the TypeScript and `@types/three` graph
+# (8.6 s on Linux CI); heavy lane.
 tsc_bin.tsc_test(
     name = "typecheck",
     args = [
@@ -70,22 +73,54 @@ tsc_bin.tsc_test(
     ],
     chdir = "studio",
     data = [":sources"],
+    tags = ["heavy"],
 )
 
 # The webroot a bundle carries (talos_bundle studio_webroot): index.html
-# (Studio, at /), drive.html (the driver dashboard, at /drive) and their
-# assets/<name>-<hash>.<ext>, both pages from vite.config.mjs's inputs.
+# (Studio, at /), drive.html (the driver dashboard, at /drive), their
+# assets/<name>-<hash>.<ext>, and STUDIO_STAMP.txt (the SHA-256 of Studio's
+# web inputs and talOS/telemetry/telemetry.fbs, checked by studio_web in
+# studio/bridge/webroot.bzl so a dependent repository cannot ship stale pages).
 js_run_binary(
-    name = "web_dist",
+    name = "_web_dist_vite",
     srcs = [":sources"],
     args = [
         "build",
         "--outDir",
-        "dist",
+        "_web_dist_vite",
     ],
     chdir = "studio",
-    out_dirs = ["dist"],
+    out_dirs = ["_web_dist_vite"],
     tool = ":vite",
+    visibility = ["//visibility:private"],
+)
+
+genrule(
+    name = "_web_dist_stamp",
+    srcs = glob(
+        ["src/**"],
+        exclude = ["src/generated/**"],
+    ) + [
+        "agent/rpc.ts",
+        "drive.html",
+        "index.html",
+        "package.json",
+        "pnpm-lock.yaml",
+        "tsconfig.json",
+        "vite.config.mjs",
+        "//talOS/telemetry:telemetry.fbs",
+    ],
+    outs = ["STUDIO_STAMP.txt"],
+    cmd = "$(execpath //studio/bridge:webroot_stamp) --root . --hash-only --out $@",
+    tools = ["//studio/bridge:webroot_stamp"],
+    visibility = ["//visibility:private"],
+)
+
+stamped_web_dist(
+    name = "web_dist",
+    dist = ":_web_dist_vite",
+    out_dir = "dist",
+    stamp = ":_web_dist_stamp",
 )
 
 vite_bin.vite_binary(
@@ -259,6 +294,7 @@ test_suite(
         "//studio/bridge:missing_pages_test",
         "//studio/bridge:system_test",
         "//studio/bridge:telemetry_test",
+        "//studio/bridge:webroot_stamp_test",
         "//talOS/telemetry:wire_test",
     ],
 )

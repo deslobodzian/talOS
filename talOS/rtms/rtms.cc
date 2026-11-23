@@ -7,15 +7,18 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -33,6 +36,52 @@ namespace {
 std::string Remedy(const std::string& path) {
   return " (stop the processes using it, then shm_unlink " +
          ShmObjectName(path) + ", start a launcher session, or reboot)";
+}
+
+std::runtime_error VersionMismatchError(const std::string& path,
+                                        std::uint64_t version) {
+  return std::runtime_error("RTMS shared-memory version mismatch on " + path +
+                            ": segment version " + std::to_string(version) +
+                            ", expected " + std::to_string(kRtmsVersion) +
+                            Remedy(path));
+}
+
+// Minimum prefix needed to identify a talOS RTMS segment and its format
+// version, even when an older format had a smaller RTMSHeader.
+struct HeaderPrefix {
+  std::atomic<std::uint64_t> magic{0};
+  std::uint64_t version{0};
+};
+static_assert(offsetof(RTMSHeader, magic) == offsetof(HeaderPrefix, magic));
+static_assert(offsetof(RTMSHeader, version) == offsetof(HeaderPrefix, version));
+static_assert(sizeof(HeaderPrefix) ==
+              offsetof(RTMSHeader, version) + sizeof(RTMSHeader::version));
+
+// Checks an existing segment's magic/version prefix before SharedMemoryPtr
+// refuses a smaller older-version segment by size. Does not wait on a
+// segment still being created: if it is absent, too small for the prefix, or
+// has not published magic yet, open() proceeds to SharedMemoryPtr.
+void ThrowIfVersionMismatch(const std::string& path) {
+  const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0666);
+  if (fd == -1) return;
+  struct stat info {};
+  std::optional<std::uint64_t> version;
+  if (::fstat(fd, &info) == 0 && info.st_size >= 0 &&
+      static_cast<std::uint64_t>(info.st_size) >= sizeof(HeaderPrefix)) {
+    void* mapped =
+        ::mmap(nullptr, sizeof(HeaderPrefix), PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped != MAP_FAILED) {
+      const auto* prefix = static_cast<const HeaderPrefix*>(mapped);
+      if (prefix->magic.load(std::memory_order_acquire) == kRtmsMagic) {
+        version = prefix->version;
+      }
+      ::munmap(mapped, sizeof(HeaderPrefix));
+    }
+  }
+  ::close(fd);
+  if (version.has_value() && *version != kRtmsVersion) {
+    throw VersionMismatchError(path, *version);
+  }
 }
 
 // Bounded like SharedMemoryPtr's size wait: a creator initializes a header
@@ -175,7 +224,26 @@ bool HeldByLiveProcess(const RTMSHeader& header) {
   return false;
 }
 
+// Releases one counted attachment to a standalone segment using the CAS
+// close protocol. Returns true when this caller dropped the count to zero and
+// marked the segment closing, so it must unlink the segment after unmapping.
+bool ReleaseCountedLifetime(RTMSHeader& header) noexcept {
+  std::uint64_t word = header.lifetime.load(std::memory_order_acquire);
+  for (;;) {
+    const std::uint64_t count = word & kLifetimeCountMask;
+    const std::uint64_t next =
+        count <= 1 ? ((word & ~kLifetimeCountMask) | kLifetimeClosing)
+                   : word - 1;
+    if (header.lifetime.compare_exchange_weak(
+            word, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      return count <= 1;
+    }
+  }
+}
+
 }  // namespace
+
+void (*RTMSQueue::on_reclaim_wait_)(std::uint64_t, int) = nullptr;
 
 RTMSQueue::RTMSQueue(std::string_view path, std::size_t message_size,
                      std::size_t message_alignment,
@@ -235,8 +303,23 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     ::shm_unlink(ShmObjectName(path_).c_str());
   }
 
-  for (int attempt = 0; attempt <= kOpenAttempts; ++attempt) {
-    SharedMemoryPtr ptr{path_, total_bytes_};
+  std::optional<std::uint64_t> closing_segment_id;
+  int closing_waits = 0;
+  int reclaim_waits = 0;
+  bool reclaimed = false;
+  for (;;) {
+    if (!options_.session_owner) {
+      ThrowIfVersionMismatch(path_);
+    }
+    SharedMemoryPtr ptr;
+    try {
+      ptr = SharedMemoryPtr{path_, total_bytes_};
+    } catch (const std::runtime_error&) {
+      if (!options_.session_owner) {
+        ThrowIfVersionMismatch(path_);
+      }
+      throw;
+    }
     auto* header = static_cast<RTMSHeader*>(ptr.ptr());
 
     if (ptr.mode() == SharedMemoryMode::CREATE) {
@@ -285,10 +368,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
           "with shm_unlink, and restart");
     }
     if (header->version != kRtmsVersion) {
-      throw std::runtime_error("RTMS shared-memory version mismatch on " +
-                               path_ + ": segment version " +
-                               std::to_string(header->version) + ", expected " +
-                               std::to_string(kRtmsVersion) + Remedy(path_));
+      throw VersionMismatchError(path_, header->version);
     }
     if (!layout_matches(*header)) {
       throw std::runtime_error(
@@ -326,22 +406,46 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       }
     }
     if (closing) {
+      const std::uint64_t segment_id = header->segment_id;
+      if (!closing_segment_id.has_value() ||
+          *closing_segment_id != segment_id) {
+        closing_segment_id = segment_id;
+        closing_waits = 0;
+        reclaim_waits = 0;
+        reclaimed = false;
+      }
       // Its last holder is unlinking it; the next shm_open creates a fresh
       // segment once the name is gone.
-      if (attempt + 1 < kOpenAttempts) {
+      if (!reclaimed && closing_waits + 1 < kOpenAttempts) {
+        ++closing_waits;
         ::usleep(kInitRetryUs);
         continue;
       }
       // A holder killed after marking it closing never will. Its count
       // reached zero, so no queue is attached; once the wait is spent this
-      // segment -- never a newer one under the name -- is unlinked here,
-      // unless a live process still holds its writer claim or a reader slot.
-      if (attempt + 1 == kOpenAttempts && !HeldByLiveProcess(*header)) {
-        std::fprintf(stderr,
-                     "rtms: reclaiming shared memory %s, whose last holder "
-                     "died before unlinking it\n",
-                     path_.c_str());
-        UnlinkIfSame(path_, header->segment_id);
+      // segment -- never a newer one under the name -- is unlinked here by
+      // whichever opener claims kLifetimeReclaiming, unless a live process
+      // still holds its writer claim or a reader slot. Concurrent openers
+      // that lose the claim wait up to kOpenAttempts retries for the winner's
+      // unlink before superseding a winner that died before UnlinkIfSame().
+      if (!reclaimed && !HeldByLiveProcess(*header)) {
+        const std::uint64_t prior = header->lifetime.fetch_or(
+            kLifetimeReclaiming, std::memory_order_acq_rel);
+        const bool won_claim = (prior & kLifetimeReclaiming) == 0;
+        if (won_claim || reclaim_waits >= kOpenAttempts) {
+          std::fprintf(stderr,
+                       "rtms: reclaiming shared memory %s, whose %s died "
+                       "before unlinking it\n",
+                       path_.c_str(), won_claim ? "last holder" : "reclaimer");
+          UnlinkIfSame(path_, segment_id);
+          reclaimed = true;
+          continue;
+        }
+        ++reclaim_waits;
+        if (on_reclaim_wait_ != nullptr) {
+          on_reclaim_wait_(segment_id, reclaim_waits);
+        }
+        ::usleep(kInitRetryUs);
         continue;
       }
       break;
@@ -351,8 +455,11 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
         ClaimWriter(*header, path_);
       } catch (...) {
         if (counted_) {
-          header->lifetime.fetch_sub(1, std::memory_order_acq_rel);
+          const std::uint64_t segment_id = header->segment_id;
+          const bool unlink = ReleaseCountedLifetime(*header);
           counted_ = false;
+          ptr = SharedMemoryPtr{};
+          if (unlink) UnlinkIfSame(path_, segment_id);
         }
         throw;
       }
@@ -368,6 +475,9 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
 
 void RTMSQueue::close() noexcept {
   if (header_ == nullptr) return;
+  for (std::size_t id = 0; id < MAX_READERS; ++id) {
+    if (registered_[id] != 0) release_reader(id);
+  }
   if (options_.publisher) {
     std::uint64_t expected = OwnProcess();
     header_->writer.owner_pid.compare_exchange_strong(
@@ -376,19 +486,7 @@ void RTMSQueue::close() noexcept {
   const std::uint64_t segment_id = header_->segment_id;
   bool unlink = options_.session_owner;
   if (counted_) {
-    std::uint64_t word = header_->lifetime.load(std::memory_order_acquire);
-    for (;;) {
-      const std::uint64_t count = word & kLifetimeCountMask;
-      const std::uint64_t next =
-          count <= 1 ? ((word & ~kLifetimeCountMask) | kLifetimeClosing)
-                     : word - 1;
-      if (header_->lifetime.compare_exchange_weak(word, next,
-                                                  std::memory_order_acq_rel,
-                                                  std::memory_order_acquire)) {
-        unlink = count <= 1;
-        break;
-      }
-    }
+    unlink = ReleaseCountedLifetime(*header_);
   }
   header_ = nullptr;
   counted_ = false;
@@ -454,8 +552,16 @@ uint64_t RTMSQueue::minimum_read_position() const {
       header_->writer.sequence.load(std::memory_order_relaxed);
 
   for (std::size_t i = 0; i < MAX_READERS; ++i) {
-    // Reader hasn't started yet, so position isn't relevent
-    if (!is_active(header_->readers[i])) {
+    // Sequentially consistent, completing the four-operation store-buffering
+    // pair with write()'s seq_cst sequence store and activate_reader_slot()'s
+    // seq_cst activation and sequence load: on ARMv8.3-RCPC (Apple Silicon) an
+    // acquire load emits ldapr, which may reorder before the writer's prior
+    // sequence store. Under seq_cst, either this DROP_NEWEST admission check
+    // observes ACTIVE (and reads the reader's cursor below) or
+    // activate_reader_slot() observes the published sequence and advances the
+    // cursor past any overwritten slot.
+    if ((header_->readers[i].state.load(std::memory_order_seq_cst) & 3) !=
+        static_cast<std::uint64_t>(ReaderState::ACTIVE)) {
       continue;
     }
     const auto position =
@@ -544,8 +650,10 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
 
   // Revoke a former reliable publisher's full-capacity guarantee before any
   // overwrite, including one interrupted by writer death. The release fence
-  // keeps this invalidation before slot writes; readers fence their slot reads
-  // before checking the marker, as with a seqlock's write-in-progress marker.
+  // keeps this invalidation (and the prior sequence publication) before the
+  // relaxed atomic slot word stores below; a reader that observes any word of
+  // this overwrite synchronizes-with this fence at slot_still_valid()'s
+  // acquire fence ([atomics.fences]/2) and must reject the candidate.
   if (options_.overflow_policy != OverflowPolicy::DROP_NEWEST) {
     header_->writer.reliable_sequence.store(0, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
@@ -556,21 +664,35 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
   auto* next_segment =
       base + header_->data_offset + (slot_index * header_->slot_stride);
 
-  std::memcpy(next_segment, message.data(), message.size());
-  if (message.size() < header_->message_bytes) {
-    std::memset(next_segment + message.size(), 0,
-                header_->message_bytes - message.size());
+  // Copy payload and timestamp as uniform 8-byte relaxed atomic words so a
+  // concurrent read_next() on a lapped slot is well-defined (no C++ data
+  // race). Short writes and sub-8-byte tails are zero-padded in the word
+  // before storing, avoiding mixed-width atomic accesses.
+  for (std::size_t off = 0; off < publish_time_offset_;
+       off += sizeof(std::uint64_t)) {
+    std::uint64_t word = 0;
+    if (off < message.size()) {
+      const std::size_t chunk =
+          std::min<std::size_t>(sizeof(std::uint64_t), message.size() - off);
+      std::memcpy(&word, message.data() + off, chunk);
+    }
+    std::atomic_ref<std::uint64_t>(
+        *reinterpret_cast<std::uint64_t*>(next_segment + off))
+        .store(word, std::memory_order_relaxed);
   }
-  std::memcpy(next_segment + publish_time_offset_, &publish_time_ns,
-              sizeof(publish_time_ns));
+  std::atomic_ref<std::int64_t>(
+      *reinterpret_cast<std::int64_t*>(next_segment + publish_time_offset_))
+      .store(publish_time_ns, std::memory_order_relaxed);
   if (options_.overflow_policy == OverflowPolicy::DROP_NEWEST) {
     header_->writer.reliable_sequence.store(next_position,
                                             std::memory_order_release);
   }
-  // Sequentially consistent, pairing with arm_wake(): a reader sets its
-  // waiters bit and then loads the sequence, the writer stores the sequence
-  // and then loads the waiters word, so either the reader sees this
-  // publication and does not sleep, or the writer sees the bit and wakes it.
+  // Sequentially consistent, pairing with arm_wake() (reader sets its waiters
+  // bit then loads sequence; writer stores sequence then loads waiters) and
+  // with activate_reader_slot() / minimum_read_position() (reader marks ACTIVE
+  // then loads sequence; DROP_NEWEST writer stores sequence then loads reader
+  // state on its next admission check). Under seq_cst at least one side of
+  // each pair observes the other's store.
   header_->writer.sequence.store(next_position, std::memory_order_seq_cst);
   // No reader asleep: no exchange and no system call.
   if (header_->writer.waiters.load(std::memory_order_seq_cst) != 0) {
@@ -581,10 +703,10 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
   return {WriteResult::SUCCESS, writer_position};
 }
 
-const std::byte* RTMSQueue::slot_address(std::uint64_t message_sequence) const {
+std::byte* RTMSQueue::slot_address(std::uint64_t message_sequence) {
   const std::uint64_t slot_index = message_sequence & (header_->slots - 1);
 
-  return static_cast<const std::byte*>(ptr_.ptr()) + header_->data_offset +
+  return static_cast<std::byte*>(ptr_.ptr()) + header_->data_offset +
          (slot_index * header_->slot_stride);
 }
 
@@ -671,10 +793,21 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
       return ReadResult::EMPTY;
     }
 
-    const std::byte* slot = slot_address(candidate.sequence);
-    std::memcpy(destination.data(), slot, header_->message_bytes);
-    std::memcpy(&candidate.publish_time_ns, slot + publish_time_offset_,
-                sizeof(candidate.publish_time_ns));
+    std::byte* slot = slot_address(candidate.sequence);
+    for (std::size_t off = 0; off < publish_time_offset_;
+         off += sizeof(std::uint64_t)) {
+      const std::uint64_t word =
+          std::atomic_ref<std::uint64_t>(
+              *reinterpret_cast<std::uint64_t*>(slot + off))
+              .load(std::memory_order_relaxed);
+      const std::size_t chunk =
+          std::min<std::size_t>(sizeof(std::uint64_t), message_size_ - off);
+      std::memcpy(destination.data() + off, &word, chunk);
+    }
+    candidate.publish_time_ns =
+        std::atomic_ref<std::int64_t>(
+            *reinterpret_cast<std::int64_t*>(slot + publish_time_offset_))
+            .load(std::memory_order_relaxed);
 
     if (!slot_still_valid(candidate.sequence)) {
       continue;
@@ -690,47 +823,67 @@ ReadResult RTMSQueue::read_next(std::uint64_t reader_id,
   return ReadResult::TORN;
 }
 
-std::optional<std::size_t> RTMSQueue::register_reader() {
-  const std::uint64_t claiming = ReaderWord(ReaderState::CLAIMING);
+std::optional<std::uint64_t> RTMSQueue::claim_reader_slot(
+    std::size_t reader_id) {
+  auto& reader = header_->readers[reader_id];
+  std::uint64_t expected = 0;
+
+  // The claim carries this process's pid, so a claimant that dies at any
+  // point after it -- even before it marks the slot active -- leaves a
+  // slot reclaim_dead_readers() can free.
+  if (!reader.state.compare_exchange_strong(
+          expected, ReaderWord(ReaderState::CLAIMING),
+          std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    return std::nullopt;
+  }
+
+  // A previous holder's receiver and arm do not carry over to this one.
+  header_->writer.waiters.fetch_and(~(std::uint64_t{1} << reader_id),
+                                    std::memory_order_acq_rel);
+  reader.wake_id.store(0, std::memory_order_release);
+
+  const auto current = header_->writer.sequence.load(std::memory_order_acquire);
+
+  reader.sequence.store(current, std::memory_order_relaxed);
+  return current;
+}
+
+bool RTMSQueue::activate_reader_slot(std::size_t reader_id,
+                                     std::uint64_t current) {
+  auto& reader = header_->readers[reader_id];
   const std::uint64_t active = ReaderWord(ReaderState::ACTIVE);
+
+  // Only while the claim is still this one: a process that judged this
+  // one dead may have freed it meanwhile, and another claimed the slot.
+  // Both this activation CAS and the writer.sequence load below are
+  // sequentially consistent, forming a four-operation store-buffering pair
+  // with write()'s seq_cst sequence store and minimum_read_position()'s
+  // seq_cst reader.state load (on ARMv8.3-RCPC / Apple Silicon, release +
+  // acquire compiles to casl + ldapr, allowing ldapr to reorder before casl).
+  // Under seq_cst, either a DROP_NEWEST writer's admission check sees ACTIVE
+  // and respects this reader's cursor, or writer_after sees the publication
+  // and advances the cursor past any overwritten slot.
+  std::uint64_t expected = ReaderWord(ReaderState::CLAIMING);
+  if (!reader.state.compare_exchange_strong(expected, active,
+                                            std::memory_order_seq_cst,
+                                            std::memory_order_relaxed)) {
+    return false;
+  }
+  registered_[reader_id] = active;
+  const auto writer_after =
+      header_->writer.sequence.load(std::memory_order_seq_cst);
+  if (writer_after > current && writer_after - current >= header_->slots) {
+    reader.sequence.store(writer_after, std::memory_order_release);
+  }
+  return true;
+}
+
+std::optional<std::size_t> RTMSQueue::register_reader() {
   for (int pass = 0; pass < 2; ++pass) {
     for (std::size_t i = 0; i < MAX_READERS; ++i) {
-      auto& reader = header_->readers[i];
-      std::uint64_t expected = 0;
-
-      // The claim carries this process's pid, so a claimant that dies at any
-      // point after it -- even before it marks the slot active -- leaves a
-      // slot reclaim_dead_readers() can free.
-      if (!reader.state.compare_exchange_strong(expected, claiming,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_relaxed)) {
-        continue;
-      }
-
-      // A previous holder's receiver and arm do not carry over to this one.
-      header_->writer.waiters.fetch_and(~(std::uint64_t{1} << i),
-                                        std::memory_order_acq_rel);
-      reader.wake_id.store(0, std::memory_order_release);
-
-      const auto current =
-          header_->writer.sequence.load(std::memory_order_acquire);
-
-      reader.sequence.store(current, std::memory_order_relaxed);
-
-      // Only while the claim is still this one: a process that judged this
-      // one dead may have freed it meanwhile, and another claimed the slot.
-      expected = claiming;
-      if (!reader.state.compare_exchange_strong(expected, active,
-                                                std::memory_order_release,
-                                                std::memory_order_relaxed)) {
-        continue;
-      }
-      registered_[i] = active;
-      const auto writer_after =
-          header_->writer.sequence.load(std::memory_order_acquire);
-      if (writer_after > current && writer_after - current > header_->slots) {
-        reader.sequence.store(writer_after, std::memory_order_release);
-      }
+      const std::optional<std::uint64_t> current = claim_reader_slot(i);
+      if (!current.has_value()) continue;
+      if (!activate_reader_slot(i, *current)) continue;
       return i;
     }
     if (reclaim_dead_readers() == 0) break;
@@ -738,7 +891,7 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
   return std::nullopt;
 }
 
-void RTMSQueue::release_reader(std::size_t id) {
+void RTMSQueue::release_reader(std::size_t id) noexcept {
   if (header_ == nullptr || id >= MAX_READERS) return;
   // Only a slot this queue claimed in this process -- a forked child
   // inherits its parent's registrations -- and only while it still holds it.

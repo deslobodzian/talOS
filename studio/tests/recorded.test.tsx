@@ -5,20 +5,27 @@
 // review server is a fake `fetch`.
 
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
+import {AlertLevel} from '../src/data/alerts';
 import {readingClock, sampleStale} from '../src/data/freshness';
 import {useChannelStale, useChassis, usePlayback} from '../src/data/hooks';
+import {parseManifest} from '../src/data/manifest';
 import {
+  alertMarks,
   bucketSeries,
-  POINT_SIZES,
-  quantizePoints,
-  RecordedSource,
+  EMPTY_TIMELINE,
   GAP_MIN_WIDTH,
   gapBands,
+  POINT_SIZES,
+  quantizePoints,
+  recordedModeLanes,
+  RecordedSource,
+  restartMarks,
   SERIES_SLOTS,
   type ReviewClock
 } from '../src/data/recorded';
@@ -26,16 +33,33 @@ import {
   decodeSeries,
   detectReviewServer,
   parseBounds,
+  parseTimeline,
   ReviewError,
-  type ReviewGap,
   type FetchLike,
-  type ReviewBounds
+  type ReviewBounds,
+  type ReviewGap,
+  type ReviewTimeline
 } from '../src/data/review';
 import {createStaticStudio, StudioProvider} from '../src/data/studio';
 import type {ChannelInfo} from '../src/data/types';
+import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
+import {panelNode} from '../src/layout/tree';
+import {eventsPanel} from '../src/panels/events';
+import {framesPanel} from '../src/panels/frames';
+import {hardwarePanel} from '../src/panels/hardware';
+import {healthPanel} from '../src/panels/health';
+import {inspectorPanel, MAX_RECORDED_SPARKLINE_CHANNELS} from '../src/panels/inspector';
+import {plotColumn} from '../src/panels/plot';
+import {pose3dPanel} from '../src/panels/pose3d';
+import {PANELS} from '../src/panels/registry';
+import {sessionPanel} from '../src/panels/session';
+import {subsystemsPanel} from '../src/panels/subsystems';
+import {visionPanel} from '../src/panels/vision';
 import {Header} from '../src/shell/Header';
 import {RecordedTransport} from '../src/shell/RecordedTransport';
 import {ReviewPicker} from '../src/shell/ReviewPicker';
+import {WorkspaceArea, type WorkspaceCallbacks} from '../src/shell/WorkspaceArea';
+import {parseDeclaredGraph, parseSystemGraph} from '../src/system';
 
 const SERVER = 'http://review.test';
 const START = 1_000_000_000n;
@@ -442,6 +466,8 @@ test('an HTTP error or malformed payload is an error state, never a throw', asyn
   // Opening: a malformed bounds document rejects with what is wrong.
   const broken = fakeServer(url => url.pathname.endsWith('/bounds.json') ?
       json({start_ns: '5', end_ns: '1', origin_wall_ns: '0'}) :
+      url.pathname.endsWith('/timeline.json') ? json(EMPTY_TIMELINE) :
+      url.pathname.endsWith('/declared.json') ? new Response('', {status: 404}) :
       json({channels: []}));
   await assert.rejects(RecordedSource.open(SERVER, 's1', {fetch: broken.fetchFn}),
                        ReviewError);
@@ -525,7 +551,10 @@ test('a session whose hardware packets were not decoded says why in its status',
 
   const server = fakeServer(url => url.pathname.endsWith('/bounds.json') ?
       json(document) : url.pathname.endsWith('/channels.json') ?
-      json({channels: []}) : echoSnapshot(url));
+      json({channels: []}) : url.pathname.endsWith('/timeline.json') ?
+      json({...EMPTY_TIMELINE, hardware_not_decoded: true}) :
+      url.pathname.endsWith('/declared.json') || url.pathname.endsWith('/manifest.json') ?
+      new Response('', {status: 404}) : echoSnapshot(url));
   const refused = await RecordedSource.open(SERVER, 's1', {fetch: server.fetchFn,
                                                            clock: fakeClock().clock});
   assert.equal(refused.playback.status, `Recorded session s1 · ${reason}`);
@@ -605,4 +634,807 @@ test('the recorded transport counts and draws log gaps', () => {
   assert.doesNotMatch(html(plain), /scrub-gap/);
   plain.close();
   gapped.close();
+});
+
+const SAMPLE_TIMELINE: ReviewTimeline = {
+  hardware_not_decoded: false,
+  modes: [
+    {start_ns: (START + 0n).toString(), end_ns: (START + 2_000_000_000n).toString(),
+     mode: 'disabled', fms: false},
+    {start_ns: (START + 2_000_000_000n).toString(), end_ns: (START + 5_000_000_000n).toString(),
+     mode: 'auto', fms: true},
+    {start_ns: (START + 5_000_000_000n).toString(), end_ns: (START + 8_000_000_000n).toString(),
+     mode: 'teleop', fms: true},
+    {start_ns: (START + 8_000_000_000n).toString(), end_ns: END.toString(),
+     mode: 'estop', fms: false}
+  ],
+  modes_dropped: 0,
+  alerts: [
+    {channel: 'hw/status/alert_error_link_lost', level: 'error',
+     start_ns: (START + 1_000_000_000n).toString(),
+     end_ns: (START + 3_000_000_000n).toString()},
+    {channel: 'hw/status/alert_error_link_lost', level: 'error',
+     start_ns: (START + 6_000_000_000n).toString(),
+     end_ns: END.toString()},
+    {channel: 'shooter/status/alert_warning_temp_high', level: 'warning',
+     start_ns: (START + 4_000_000_000n).toString(),
+     end_ns: (START + 5_000_000_000n).toString()}
+  ],
+  alerts_dropped: 0,
+  runs: [
+    {node: 'shooter', start_ns: START.toString(),
+     end_ns: (START + 6_000_000_000n).toString(), reason: 'crash'},
+    {node: 'shooter', start_ns: (START + 7_000_000_000n).toString(),
+     end_ns: null, reason: 'running'}
+  ],
+  runs_dropped: 0
+};
+
+// REQ-OPS-41, REQ-OPS-37, REQ-CONTRACT-29: RecordedSource.open fetches
+// timeline.json and declared.json (treating 404 on declared.json as null),
+// and parseTimeline rejects malformed payloads.
+test('RecordedSource.open loads timeline and optional declared graph', async () => {
+  const declaredJson = demoDeclaredGraph();
+  const makeServer = (declaredStatus: number, manifestResponse?: Response) => fakeServer(url => {
+    if (url.pathname.endsWith('/channels.json')) return json({channels: []});
+    if (url.pathname.endsWith('/bounds.json')) return json(BOUNDS);
+    if (url.pathname.endsWith('/timeline.json')) return json(SAMPLE_TIMELINE);
+    if (url.pathname.endsWith('/declared.json')) {
+      return declaredStatus === 200 ?
+          new Response(declaredJson, {status: 200, headers: {'content-type': 'application/json'}}) :
+          new Response('no declared graph\n', {status: declaredStatus});
+    }
+    if (url.pathname.endsWith('/manifest.json')) {
+      return manifestResponse ?? new Response('no manifest\n', {status: 404});
+    }
+    return echoSnapshot(url);
+  });
+
+  const withDeclared = await RecordedSource.open(SERVER, 's1', {
+    fetch: makeServer(200).fetchFn, clock: fakeClock().clock
+  });
+  assert.ok(withDeclared.declared);
+  assert.equal(withDeclared.declared.nodes.length, parseDeclaredGraph(declaredJson).nodes.length);
+  assert.equal(withDeclared.timeline.modes.length, 4);
+  withDeclared.close();
+
+  const withoutDeclared = await RecordedSource.open(SERVER, 's1', {
+    fetch: makeServer(404).fetchFn, clock: fakeClock().clock
+  });
+  assert.equal(withoutDeclared.declared, null);
+  withoutDeclared.close();
+
+  assert.throws(() => parseTimeline({...EMPTY_TIMELINE, hardware_not_decoded: 'no'}), ReviewError);
+  assert.throws(() => parseTimeline({
+    ...EMPTY_TIMELINE,
+    modes: [{start_ns: '10', end_ns: '5', mode: 'teleop', fms: false}]
+  }), ReviewError);
+  assert.throws(() => parseTimeline({
+    ...EMPTY_TIMELINE,
+    modes: [{start_ns: '1', end_ns: '5', mode: 'bogus', fms: false}]
+  }), ReviewError);
+  assert.throws(() => parseTimeline({
+    ...EMPTY_TIMELINE,
+    alerts: [{channel: 'a', level: 'fatal', start_ns: '1', end_ns: '2'}]
+  }), ReviewError);
+});
+
+// REQ-OPS-41, REQ-OPS-37, REQ-OPS-51: RecordedSource derives events, modeBands,
+// and playhead-aware alertLatch from timeline.json + bounds.gaps, and never
+// misreports hardware_not_decoded as disabled.
+test('RecordedSource derives events, modeBands, alertLatch and respects hardware_not_decoded', () => {
+  const server = fakeServer(echoSnapshot);
+  const gappedBounds = {...BOUNDS, gaps: [gap({start_ns: (START + 2_500_000_000n).toString(),
+                                               end_ns: (START + 2_800_000_000n).toString()})]};
+  const rec = new RecordedSource(SERVER, 's1', [], gappedBounds, server.fetchFn,
+                                 fakeClock().clock, SAMPLE_TIMELINE, null);
+
+  // Mode bands map 'auto' -> 'autonomous'.
+  assert.deepEqual(rec.modeBands().map(b => b.mode),
+                   ['disabled', 'autonomous', 'teleop', 'estop']);
+
+  // Events are chronologically sorted and cover modes, alerts (raise+clear,
+  // no false clear on active-to-end), crash+restart, and log gaps.
+  const events = rec.events();
+  for (let i = 1; i < events.length; i++) {
+    assert.ok(BigInt(events[i].t_ns) >= BigInt(events[i - 1].t_ns), 'not sorted');
+  }
+  const titles = events.map(e => e.title);
+  assert.ok(titles.includes('Disabled'), titles.join(', '));
+  assert.ok(titles.includes('Enabled · autonomous'), titles.join(', '));
+  assert.ok(titles.includes('FMS attached'), titles.join(', '));
+  assert.ok(titles.includes('Enabled · teleop'), titles.join(', '));
+  assert.ok(titles.includes('E-stop'), titles.join(', '));
+  assert.ok(titles.includes('hw: link lost'), titles.join(', '));
+  assert.ok(titles.includes('hw: link lost cleared'), titles.join(', '));
+  assert.equal(titles.filter(t => t === 'hw: link lost cleared').length, 1);
+  assert.ok(titles.includes('shooter crash'), titles.join(', '));
+  assert.ok(titles.includes('shooter restarted (run 2)'), titles.join(', '));
+  assert.ok(titles.includes('Log gap in bridge'), titles.join(', '));
+
+  // alertLatch tracks active vs latched across playhead positions and returns
+  // a stable reference until the playhead moves.
+  const atStart = rec.alertLatch();
+  assert.equal(atStart.alerts.length, 0);
+  assert.equal(rec.alertLatch(), atStart);
+
+  rec.seek((START + 2_000_000_000n).toString());
+  const duringFirst = rec.alertLatch();
+  assert.equal(duringFirst.alerts.length, 1);
+  assert.equal(duringFirst.alerts[0].channel, 'hw/status/alert_error_link_lost');
+  assert.equal(duringFirst.alerts[0].level, AlertLevel.Error);
+  assert.equal(duringFirst.alerts[0].active, true);
+  assert.equal(duringFirst.alerts[0].count, 1);
+
+  rec.seek((START + 4_500_000_000n).toString());
+  const afterClear = rec.alertLatch();
+  assert.equal(afterClear.alerts.length, 2);
+  assert.equal(afterClear.alerts[0].active, false);  // link lost cleared at 3s
+  assert.equal(afterClear.alerts[1].channel, 'shooter/status/alert_warning_temp_high');
+  assert.equal(afterClear.alerts[1].active, true);
+
+  rec.seek(END.toString());
+  const atEnd = rec.alertLatch();
+  assert.equal(atEnd.alerts[0].active, true);  // second activation lasts to END
+  assert.equal(atEnd.alerts[0].count, 2);
+  assert.equal(atEnd.alerts[1].active, false);
+  rec.close();
+
+  // hardware_not_decoded: modeBands is empty and events emit a single notice,
+  // never pretending the robot was disabled.
+  const undecoded = new RecordedSource(
+      SERVER, 's1', [], {...BOUNDS, hardware_not_decoded: 'protocol mismatch'},
+      server.fetchFn, fakeClock().clock,
+      {...EMPTY_TIMELINE, hardware_not_decoded: true}, null);
+  assert.deepEqual(undecoded.modeBands(), []);
+  assert.equal(undecoded.events().length, 1);
+  assert.equal(undecoded.events()[0].title, 'Hardware packets not decoded');
+  assert.doesNotMatch(undecoded.events()[0].title, /Disabled/);
+  undecoded.close();
+});
+
+// REQ-OPS-41, REQ-OPS-37: Events panel works on recordings and Health panel
+// renders an honest recorded view without fabricating live registry liveness.
+test('Events and Health panels render recorded sessions honestly', () => {
+  assert.equal(eventsPanel.recorded, true);
+  assert.equal(healthPanel.recorded, true);
+
+  const server = fakeServer(echoSnapshot);
+  const declared = parseDeclaredGraph(demoDeclaredGraph());
+  const gappedBounds = {...BOUNDS, gaps: [gap()]};
+  const rec = new RecordedSource(SERVER, 's1', [info('shooter/state/position_m')],
+                                 gappedBounds, server.fetchFn, fakeClock().clock,
+                                 SAMPLE_TIMELINE, declared);
+  rec.seek((START + 7_000_000_000n).toString());
+
+  // Even if studio.system holds a live graph from earlier, Health on a
+  // recorded session must never show live registry counts or fabricate rows.
+  const studio = createStaticStudio({
+    system: {graph: parseSystemGraph(demoSystemGraph(50n)), stale: false}
+  });
+  studio.openRecorded(rec);
+
+  const eventsHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <eventsPanel.component config={eventsPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="ev"/>
+      </StudioProvider>);
+  assert.match(eventsHtml, /Recorded timeline/);
+  assert.match(eventsHtml, /shooter crash/);
+  assert.match(eventsHtml, /hw: link lost/);
+  assert.match(eventsHtml, /Log gap in bridge/);
+
+  const healthHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <healthPanel.component config={healthPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="hl"/>
+      </StudioProvider>);
+  assert.match(healthHtml, /Live registry liveness is not present in recorded sessions/);
+  assert.doesNotMatch(healthHtml, /Nodes live/);
+  assert.doesNotMatch(healthHtml, /Frames forwarded/);
+  assert.match(healthHtml, /Declared nodes/);
+  assert.match(healthHtml, /shooter/);
+  assert.match(healthHtml, /crash/);
+  assert.match(healthHtml, /running/);  // end_ns === null handled honestly
+  assert.match(healthHtml, /link lost/);
+  assert.match(healthHtml, /log gap in bridge/);
+
+  // Without declared.json, Health says so honestly.
+  const noDecl = new RecordedSource(SERVER, 's1', [], BOUNDS, server.fetchFn,
+                                    fakeClock().clock, EMPTY_TIMELINE, null);
+  studio.openRecorded(noDecl);
+  const noDeclHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <healthPanel.component config={healthPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="hl"/>
+      </StudioProvider>);
+  assert.match(noDeclHtml, /No declared graph \(graph\.json\) in this session/);
+  assert.match(noDeclHtml, /No faults, restarts, alerts, or log gaps recorded/);
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41, REQ-OPS-51: RecordedTransport renders mode bands (or an undecoded
+// bar), alert marks, restart/unclean-exit marks, and gap bands.
+test('RecordedTransport renders timeline lanes for modes, alerts, restarts and gaps', () => {
+  const server = fakeServer(echoSnapshot);
+  const rec = new RecordedSource(SERVER, 's1', [], {...BOUNDS, gaps: [gap()]},
+                                 server.fetchFn, fakeClock().clock, SAMPLE_TIMELINE, null);
+  assert.equal(recordedModeLanes(rec.bounds, rec.timeline).length, 4);
+  assert.equal(alertMarks(rec.bounds, rec.timeline).length, 3);
+  assert.equal(restartMarks(rec.bounds, rec.timeline).length, 2);  // crash + restart
+
+  const noop = () => {};
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={createStaticStudio({playback: rec.playback})}>
+        <RecordedTransport source={rec} stepNs="1000000" onStepNs={noop} onClose={noop}/>
+      </StudioProvider>);
+  assert.match(html, /class="scrub-mode disabled"/);
+  assert.match(html, /class="scrub-mode autonomous"/);
+  assert.match(html, /class="scrub-mode teleop"/);
+  assert.match(html, /class="scrub-mode estop"/);
+  assert.match(html, /class="scrub-alert error"/);
+  assert.match(html, /class="scrub-alert warning"/);
+  assert.match(html, /class="scrub-restart exit"/);
+  assert.match(html, /class="scrub-restart restart"/);
+  assert.match(html, /class="scrub-gap"/);
+  rec.close();
+
+  const undecoded = new RecordedSource(
+      SERVER, 's1', [], {...BOUNDS, hardware_not_decoded: 'protocol mismatch'},
+      server.fetchFn, fakeClock().clock,
+      {...EMPTY_TIMELINE, hardware_not_decoded: true}, null);
+  const undecodedHtml = renderToStaticMarkup(
+      <StudioProvider studio={createStaticStudio({playback: undecoded.playback})}>
+        <RecordedTransport source={undecoded} stepNs="1000000" onStepNs={noop} onClose={noop}/>
+      </StudioProvider>);
+  assert.match(undecodedHtml, /class="scrub-mode undecoded"/);
+  assert.doesNotMatch(undecodedHtml, /class="scrub-mode disabled"/);
+  undecoded.close();
+});
+
+// REQ-OPS-37, REQ-OPS-41: an alert that genuinely cleared on exact
+// bounds.end_ns (active_at_end === false) emits a cleared event and reads
+// active: false at playhead === bounds.end_ns, whereas active_at_end === true
+// stays active without a false cleared event.
+test('alert clearing on exact bounds.end_ns is not active at end', () => {
+  const server = fakeServer(echoSnapshot);
+  const timeline: ReviewTimeline = parseTimeline({
+    ...EMPTY_TIMELINE,
+    alerts: [
+      {
+        channel: 'hw/status/alert_error_link_lost',
+        level: 'error',
+        start_ns: (START + 2_000_000_000n).toString(),
+        end_ns: END.toString(),
+        active_at_end: false
+      },
+      {
+        channel: 'shooter/status/alert_warning_temp_high',
+        level: 'warning',
+        start_ns: (START + 3_000_000_000n).toString(),
+        end_ns: END.toString(),
+        active_at_end: true
+      }
+    ]
+  });
+  const rec = new RecordedSource(SERVER, 's1', [], BOUNDS, server.fetchFn,
+                                 fakeClock().clock, timeline, null);
+  const titles = rec.events().map(e => e.title);
+  assert.ok(titles.includes('hw: link lost cleared'), titles.join(', '));
+  assert.ok(!titles.includes('shooter: temp high cleared'), titles.join(', '));
+
+  // Just before END both alerts are active; at exact END only the held one is.
+  rec.seek((END - 1n).toString());
+  const beforeEnd = new Map(rec.alertLatch().alerts.map(a => [a.channel, a.active]));
+  assert.equal(beforeEnd.get('hw/status/alert_error_link_lost'), true);
+  assert.equal(beforeEnd.get('shooter/status/alert_warning_temp_high'), true);
+
+  rec.seek(END.toString());
+  const atEnd = new Map(rec.alertLatch().alerts.map(a => [a.channel, a.active]));
+  assert.equal(atEnd.get('hw/status/alert_error_link_lost'), false);
+  assert.equal(atEnd.get('shooter/status/alert_warning_temp_high'), true);
+  rec.close();
+
+  assert.throws(() => parseTimeline({
+    ...EMPTY_TIMELINE,
+    alerts: [{channel: 'a', level: 'error', start_ns: '1', end_ns: '2', active_at_end: 'no'}]
+  }), ReviewError);
+});
+
+// REQ-OPS-41, REQ-OPS-23: RecordedSource honors bounds.pose_topic ([studio]
+// pose_topic) over discoverEstimate when present, including custom Pose2d field
+// names and valid gating, and falls back to discoverEstimate when absent.
+test('RecordedSource prefers bounds.pose_topic over discoverEstimate', async () => {
+  const channels = [
+    'pose_estimator/state/pose/x_m',
+    'pose_estimator/state/pose/y_m',
+    'pose_estimator/state/pose/yaw_rad',
+    'pose_estimator/state/valid',
+    'pose_estimator/state/observation_accepted_count',
+    'alt_odom/state/robot_pose/x_m',
+    'alt_odom/state/robot_pose/y_m',
+    'alt_odom/state/robot_pose/yaw_rad',
+    'alt_odom/state/valid'
+  ].map(info);
+  const at = START + 2_000_000_000n;
+  let altValid = 1;
+  const server = fakeServer(url => {
+    if (!url.pathname.endsWith('/snapshot')) return undefined;
+    const s = (value: number) => ({value, sample_ns: at.toString()});
+    return json({t_ns: at.toString(), channels: {
+      'pose_estimator/state/pose/x_m': s(1),
+      'pose_estimator/state/pose/y_m': s(2),
+      'pose_estimator/state/pose/yaw_rad': s(0.5),
+      'pose_estimator/state/valid': s(1),
+      'alt_odom/state/robot_pose/x_m': s(7),
+      'alt_odom/state/robot_pose/y_m': s(8),
+      'alt_odom/state/robot_pose/yaw_rad': s(1.5),
+      'alt_odom/state/valid': s(altValid)
+    }});
+  });
+
+  const configuredBounds = parseBounds({...BOUNDS, pose_topic: '/alt_odom/state'});
+  assert.equal(configuredBounds.pose_topic, '/alt_odom/state');
+  assert.equal(parseBounds({...BOUNDS, pose_topic: null}).pose_topic, undefined);
+  assert.throws(() => parseBounds({...BOUNDS, pose_topic: 42}), ReviewError);
+
+  const configured = new RecordedSource(SERVER, 's1', channels, configuredBounds,
+                                        server.fetchFn, fakeClock().clock);
+  configured.seek(at.toString());
+  await settle();
+  assert.equal(configured.chassis()?.pose.x, 7);
+  assert.equal(configured.chassis()?.pose.y, 8);
+  assert.equal(configured.chassis()?.pose.yaw, 1.5);
+  configured.close();
+
+  // valid === 0 on the configured pose_topic suppresses the pose.
+  altValid = 0;
+  const invalidPose = new RecordedSource(SERVER, 's1', channels, configuredBounds,
+                                         server.fetchFn, fakeClock().clock);
+  invalidPose.seek(at.toString());
+  await settle();
+  assert.equal(invalidPose.chassis(), null);
+  invalidPose.close();
+
+  // Without pose_topic (or when pose_topic names an absent topic), falls back
+  // to discoverEstimate.
+  const fallback = new RecordedSource(SERVER, 's1', channels, BOUNDS,
+                                      server.fetchFn, fakeClock().clock);
+  fallback.seek(at.toString());
+  await settle();
+  assert.equal(fallback.chassis()?.pose.x, 1);
+  assert.equal(fallback.chassis()?.pose.y, 2);
+  fallback.close();
+});
+
+// REQ-OPS-23, REQ-OPS-41: bucketSeries inserts explicit NaN (count = 1 ->
+// plotColumn maps to null) break rows ONLY at bounds.gaps and timeline.runs
+// restart/exit boundaries, never on a fixed time threshold, while normal sparse
+// multi-channel buckets keep count = 0 (undefined) and draw smoothly.
+test('bucketSeries inserts uPlot gap breaks only at real gaps and run restarts', async () => {
+  // 1. Sparse multi-channel buckets 8 s apart with NO gaps/runs: NO break rows,
+  //    alignment placeholders keep count = 0 (plotColumn -> undefined).
+  const sparse = decodeSeries(seriesBuffer([
+    {t: [1e9, 9e9], min: [10, 20], max: [10, 20], last: [10, 20], count: [1, 1]},
+    {t: [1e9, 5e9], min: [1, 2], max: [1, 2], last: [1, 2], count: [1, 1]}
+  ]), 2);
+  const noBreaks = bucketSeries(['shooter/state/position_m', 'observer/status/ready'],
+                                sparse, '0', 0n, 10_000_000_000n, [], []);
+  assert.deepEqual([...noBreaks.times], [1, 5, 9]);
+  assert.deepEqual(plotColumn(noBreaks.values['shooter/state/position_m'],
+                              noBreaks.count!['shooter/state/position_m']),
+                   [10, undefined, 20]);
+  assert.deepEqual(plotColumn(noBreaks.values['observer/status/ready'],
+                              noBreaks.count!['observer/status/ready']),
+                   [1, 2, undefined]);
+
+  // 2. Log gap in shooter [3s, 4s] + shooter crash/restart [6s, 7s]: shooter
+  //    gets explicit NaN with count = 1 (plotColumn -> null) at both boundaries,
+  //    while observer (no gap/restart) draws smoothly through both rows.
+  const gappedBuckets = decodeSeries(seriesBuffer([
+    {t: [2e9, NaN, 5e9, 8e9], min: [1, NaN, 2, 3], max: [1, NaN, 2, 3],
+     last: [1, NaN, 2, 3], count: [1, 0, 1, 1]},
+    {t: [2e9, 3.5e9, 5e9, 8e9], min: [9, 8, 7, 6], max: [9, 8, 7, 6],
+     last: [9, 8, 7, 6], count: [1, 1, 1, 1]}
+  ]), 2);
+  // Note: observer has a real sample at 3.5 s (the exact midpoint of shooter's
+  // [3s, 4s] gap) — that real sample must be preserved while shooter breaks!
+  const gaps: ReviewGap[] = [
+    gap({process: 'shooter', start_ns: '3000000000', end_ns: '4000000000'})
+  ];
+  const runs = [
+    {node: 'observer', start_ns: '0', end_ns: '10000000000', reason: 'stop'},
+    {node: 'shooter', start_ns: '0', end_ns: '6000000000', reason: 'crash'},
+    {node: 'shooter', start_ns: '7000000000', end_ns: '10000000000', reason: 'stop'}
+  ];
+  const broken = bucketSeries(['shooter/state/position_m', 'observer/status/ready'],
+                              gappedBuckets, '0', 0n, 10_000_000_000n, gaps, runs);
+  assert.deepEqual([...broken.times], [2, 3.5, 5, 6.5, 8]);
+  assert.deepEqual([...broken.count!['shooter/state/position_m']], [1, 1, 1, 1, 1]);
+  assert.deepEqual(plotColumn(broken.values['shooter/state/position_m'],
+                              broken.count!['shooter/state/position_m']),
+                   [1, null, 2, null, 3]);
+  assert.deepEqual(plotColumn(broken.values['observer/status/ready'],
+                              broken.count!['observer/status/ready']),
+                   [9, 8, 7, undefined, 6]);
+
+  // 3. RecordedSource.series() wires bounds.gaps and timeline.runs end-to-end.
+  const t = [Number(START + 2_000_000_000n), Number(START + 8_000_000_000n)];
+  const body = seriesBuffer([{t, min: [1, 2], max: [1, 2], last: [1, 2], count: [1, 1]}]);
+  const server = fakeServer(url => url.pathname.endsWith('/series') ?
+      new Response(body.slice(0)) : echoSnapshot(url));
+  const rec = new RecordedSource(
+      SERVER, 's1', [info('shooter/state/position_m')], BOUNDS,
+      server.fetchFn, fakeClock().clock, SAMPLE_TIMELINE, null);
+  rec.series(['shooter/state/position_m'], 'all', END.toString(), 256);
+  await settle();
+  const s = rec.series(['shooter/state/position_m'], 'all', END.toString(), 256);
+  const plotted = plotColumn(s.values['shooter/state/position_m'],
+                             s.count!['shooter/state/position_m']);
+  assert.deepEqual(plotted, [1, null, 2]);
+  rec.close();
+});
+
+// REQ-OPS-41: for target-lane channels (<subsystem>/target/<source>/*), the
+// writer process is <source>, not <subsystem>: a <source> gap or restart breaks
+// its target lane, while a <subsystem> crash/restart does not spuriously break it.
+test('bucketSeries attributes target-lane breaks to the source writer, not the subsystem', () => {
+  const buckets = decodeSeries(seriesBuffer([
+    {t: [2e9, 5e9, 8e9], min: [1, 2, 3], max: [1, 2, 3], last: [1, 2, 3], count: [1, 1, 1]},
+    {t: [2e9, 5e9, 8e9], min: [10, 20, 30], max: [10, 20, 30], last: [10, 20, 30], count: [1, 1, 1]}
+  ]), 2);
+  const gaps: ReviewGap[] = [
+    gap({process: 'teleop', start_ns: '3000000000', end_ns: '4000000000'})
+  ];
+  const runs = [
+    // Zero-width run_restart (prev.end_ns === null) on drivetrain at 6.5 s
+    // must NOT spuriously break drivetrain/target/teleop/vx_mps.
+    {node: 'drivetrain', start_ns: '0', end_ns: null, reason: 'crash'},
+    {node: 'drivetrain', start_ns: '6500000000', end_ns: '10000000000', reason: 'stop'}
+  ];
+  const series = bucketSeries(
+      ['drivetrain/target/teleop/vx_mps', 'drivetrain/state/vx_mps'],
+      buckets, '0', 0n, 10_000_000_000n, gaps, runs);
+  assert.deepEqual([...series.times], [2, 3.5, 5, 6.5, 8]);
+  assert.deepEqual(plotColumn(series.values['drivetrain/target/teleop/vx_mps'],
+                              series.count!['drivetrain/target/teleop/vx_mps']),
+                   [1, null, 2, undefined, 3]);
+  assert.deepEqual(plotColumn(series.values['drivetrain/state/vx_mps'],
+                              series.count!['drivetrain/state/vx_mps']),
+                   [10, undefined, 20, null, 30]);
+});
+
+// REQ-OPS-41: the panel registry exposes 12 recorded-capable panels and 3
+// live-only panels (system, timing, agent), and WorkspaceArea explains why
+// each live-only panel is unavailable for recordings.
+test('panel registry splits into 12 recorded panels and 3 live-only panels with reasons', () => {
+  const recordedIds = PANELS.filter(p => p.recorded === true).map(p => p.id).sort();
+  const liveOnlyIds = PANELS.filter(p => !p.recorded).map(p => p.id).sort();
+  assert.deepEqual(recordedIds, [
+    'events', 'field', 'frames', 'hardware', 'health', 'inspector',
+    'plot', 'pose3d', 'robot', 'session', 'subsystems', 'vision'
+  ]);
+  assert.deepEqual(liveOnlyIds, ['agent', 'system', 'timing']);
+
+  const server = fakeServer(echoSnapshot);
+  const rec = source(server);
+  const studio = createStaticStudio();
+  studio.openRecorded(rec);
+  const callbacks: WorkspaceCallbacks = {
+    onSplit() {}, onClose() {}, onSwitch() {}, onConfig() {},
+    onResize() {}, onMaximize() {}, onFocusPanel() {}
+  };
+  for (const id of liveOnlyIds) {
+    const html = renderToStaticMarkup(
+        <StudioProvider studio={studio}>
+          <WorkspaceArea root={panelNode(id, 'p1', undefined)} maximized={null}
+                         callbacks={callbacks}/>
+        </StudioProvider>);
+    assert.match(html, /Live-only:/, id);
+    assert.doesNotMatch(html, /Not available for recorded sessions yet/, id);
+  }
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41: RecordedSource.open loads /review/<id>/manifest.json, and the
+// Session panel renders manifest header + process table (restarts, exit codes,
+// delivery loss, records, log paths) with live registry columns (Alive, Loop,
+// Latency) shown as '—'.
+test('Session panel renders recorded manifest without fabricating live registry state', async () => {
+  const rawManifest = readFileSync(new URL('./session_manifest.json', import.meta.url), 'utf8');
+  const declaredJson = demoDeclaredGraph();
+  const server = fakeServer(url => {
+    if (url.pathname.endsWith('/channels.json')) return json({channels: []});
+    if (url.pathname.endsWith('/bounds.json')) return json(BOUNDS);
+    if (url.pathname.endsWith('/timeline.json')) return json(EMPTY_TIMELINE);
+    if (url.pathname.endsWith('/declared.json')) {
+      return new Response(declaredJson, {status: 200, headers: {'content-type': 'application/json'}});
+    }
+    if (url.pathname.endsWith('/manifest.json')) {
+      return new Response(rawManifest, {status: 200, headers: {'content-type': 'application/json'}});
+    }
+    return echoSnapshot(url);
+  });
+  const rec = await RecordedSource.open(SERVER, 's1', {
+    fetch: server.fetchFn, clock: fakeClock().clock
+  });
+  assert.equal(rec.manifest?.session_id, '1794813782');
+  assert.equal(rec.manifestError, '');
+
+  // Even when studio.system holds a live graph from earlier, Session in
+  // recorded mode must ignore it and render '—' for Alive/Loop/Latency.
+  const studio = createStaticStudio({
+    system: {
+      graph: parseSystemGraph(demoSystemGraph(50n)),
+      stale: false,
+      rates: {'telemetry 0': 50}
+    }
+  });
+  studio.openRecorded(rec);
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <sessionPanel.component config={sessionPanel.defaultConfig}
+                                setConfig={() => {}} instanceId="sess"/>
+      </StudioProvider>);
+  const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+  assert.match(text, /1794813782/);
+  assert.match(text, /MANIFEST ∪ DECLARED/);
+  assert.match(text, /telemetry delivery loss .*wake failures 1 · stalled arms 2/);
+  assert.match(text, /hardware_node delivery loss .*skipped requests 3 \(swerve_module 3\)/);
+  assert.match(text, /hardware_node\.tlog/);
+  assert.doesNotMatch(text, /\blive\b/);
+  assert.doesNotMatch(text, /50\.0 Hz/);
+  studio.closeRecorded();
+
+  // Malformed manifest.json does not fail RecordedSource.open; Session reports
+  // the parse error cleanly.
+  const badServer = fakeServer(url => {
+    if (url.pathname.endsWith('/channels.json')) return json({channels: []});
+    if (url.pathname.endsWith('/bounds.json')) return json(BOUNDS);
+    if (url.pathname.endsWith('/timeline.json')) return json(EMPTY_TIMELINE);
+    if (url.pathname.endsWith('/declared.json')) return new Response('', {status: 404});
+    if (url.pathname.endsWith('/manifest.json')) return new Response('{bad', {status: 200});
+    return echoSnapshot(url);
+  });
+  const badRec = await RecordedSource.open(SERVER, 's1', {
+    fetch: badServer.fetchFn, clock: fakeClock().clock
+  });
+  assert.equal(badRec.manifest, null);
+  assert.match(badRec.manifestError, /Invalid manifest/);
+  badRec.close();
+});
+
+// REQ-OPS-41: Inspector reads channel age from RecordedSource (DataSource)
+// and caps series fan-out on large recorded dictionaries.
+test('Inspector uses DataSource.channelSample and caps series fan-out in recorded mode', async () => {
+  const at = START + 5_000_000_000n;
+  const channels: ChannelInfo[] = [];
+  const snapChannels: Record<string, {value: number; sample_ns: string}> = {};
+  for (let i = 0; i < MAX_RECORDED_SPARKLINE_CHANNELS + 30; i++) {
+    const name = `sub/state/ch_${String(i).padStart(3, '0')}`;
+    channels.push({name, unit: 'm', labels: []});
+    snapChannels[name] = {
+      value: i,
+      // ch_000 is fresh (0.2s old), ch_001 is stale (2.0s old).
+      sample_ns: (i === 1 ? at - 2_000_000_000n : at - 200_000_000n).toString()
+    };
+  }
+  const server = fakeServer(url => {
+    if (url.pathname.endsWith('/snapshot')) {
+      return json({t_ns: at.toString(), channels: snapChannels});
+    }
+    return undefined;
+  });
+  const rec = new RecordedSource(SERVER, 's1', channels, BOUNDS, server.fetchFn, fakeClock().clock);
+  rec.seek(at.toString());
+  await settle();
+
+  const studio = createStaticStudio();
+  studio.openRecorded(rec);
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <inspectorPanel.component config={inspectorPanel.defaultConfig}
+                                  setConfig={() => {}} instanceId="insp"/>
+      </StudioProvider>);
+  assert.match(html, /ch_000/);
+  assert.match(html, /ch_001/);
+  assert.match(html, /STALE/);
+  // Series request must be capped at MAX_RECORDED_SPARKLINE_CHANNELS (64),
+  // not all 94 dictionary channels!
+  const seriesCalls = server.of('/series');
+  assert.equal(seriesCalls.length, 1);
+  const requested = seriesCalls[0].url.searchParams.get('c')!.split(',');
+  assert.equal(requested.length, MAX_RECORDED_SPARKLINE_CHANNELS);
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41: Hardware, Subsystems, Pose3d, Vision and Frames all render
+// cleanly on recorded sessions without leaking stale live system state.
+test('Hardware, Subsystems, Pose3d, Vision and Frames render recorded sessions honestly', async () => {
+  const at = START + 5_000_000_000n;
+  const channels: ChannelInfo[] = [
+    'hw/status/battery_v',
+    'hw/status/can_bus_count',
+    'hw/status/can_buses/0/read_state',
+    'hw/status/can_buses/0/utilization_frac',
+    'hw/status/can_buses/1/read_state',
+    'hw/status/can_buses/1/utilization_frac',
+    'shooter/state/enabled',
+    'shooter/state/target_velocity_rps',
+    'shooter/state/flywheel_velocity_rps',
+    'pose_estimator/state/pose/x_m',
+    'pose_estimator/state/pose/y_m',
+    'pose_estimator/state/pose/yaw_rad',
+    'pose_estimator/state/valid',
+    'pose_estimator/state/observation_accepted_count',
+    'pose_estimator/state/observation_rejected_count',
+    'front_cam/state/pose/x_m',
+    'front_cam/state/pose/y_m',
+    'front_cam/state/x_std_m',
+    'front_cam/state/y_std_m',
+    'front_cam/state/yaw_std_rad',
+    'front_cam/state/tag_count',
+    'front_cam/state/valid',
+    'front_cam/state/sample_time_ns',
+    'front_cam/status/healthy',
+    'front_cam/status/frame_period_us',
+    'front_cam/status/last_latency_us',
+    'front_cam/status/visible_tag_count',
+    'front_cam/status/frames_dropped_count'
+  ].map(name => ({name, unit: name.endsWith('_rps') ? 'rps' : '', labels: []}));
+
+  const s = (value: number, age = 0n) => ({value, sample_ns: (at - age).toString()});
+  const server = fakeServer(url => {
+    if (url.pathname.endsWith('/snapshot')) {
+      return json({
+        t_ns: at.toString(),
+        channels: {
+          'hw/status/battery_v': s(12.34),
+          'hw/status/can_bus_count': s(2),
+          'hw/status/can_buses/0/read_state': s(1),
+          'hw/status/can_buses/0/utilization_frac': s(0.2),
+          'hw/status/can_buses/1/read_state': s(1),
+          'hw/status/can_buses/1/utilization_frac': s(0.45),
+          'shooter/state/enabled': s(1),
+          'shooter/state/target_velocity_rps': s(60),
+          'shooter/state/flywheel_velocity_rps': s(57),
+          'pose_estimator/state/pose/x_m': s(3.0),
+          'pose_estimator/state/pose/y_m': s(2.0),
+          'pose_estimator/state/pose/yaw_rad': s(0.5),
+          'pose_estimator/state/valid': s(1),
+          'front_cam/status/healthy': s(1),
+          'front_cam/status/frame_period_us': s(20000),
+          'front_cam/status/last_latency_us': s(15000),
+          'front_cam/status/visible_tag_count': s(3)
+        }
+      });
+    }
+    return undefined;
+  });
+
+  const recDeclared = {
+    version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'RecordedCanivore']
+  };
+  const rec = new RecordedSource(SERVER, 's1', channels, BOUNDS, server.fetchFn,
+                                 fakeClock().clock, EMPTY_TIMELINE, recDeclared,
+                                 parseManifest(readFileSync(
+                                     new URL('./session_manifest.json', import.meta.url), 'utf8')));
+  rec.seek(at.toString());
+  await settle();
+
+  // Seed stale live system state to verify recorded panels ignore it.
+  const studio = createStaticStudio({
+    system: {
+      graph: parseSystemGraph(demoSystemGraph(50n)),
+      stale: false,
+      declared: {version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'StaleLiveBus']}
+    }
+  });
+  studio.openRecorded(rec);
+
+  const hwHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="hw"/>
+      </StudioProvider>);
+  assert.match(hwHtml, /12\.34 V/);
+  assert.match(hwHtml, /RecordedCanivore/);
+  assert.doesNotMatch(hwHtml, /StaleLiveBus/);
+
+  const subHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <subsystemsPanel.component config={subsystemsPanel.defaultConfig}
+                                   setConfig={() => {}} instanceId="sub"/>
+      </StudioProvider>);
+  assert.match(subHtml, /shooter/);
+  assert.match(subHtml, /no target node/);
+  assert.match(subHtml, /Δ -3\.000 rps/);
+
+  const poseHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <pose3dPanel.component config={pose3dPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="p3d"/>
+      </StudioProvider>);
+  assert.doesNotMatch(poseHtml, /Pose unavailable/);
+  assert.doesNotMatch(poseHtml, /Pose STALE/);
+
+  const visHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <visionPanel.component config={visionPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="vis"/>
+      </StudioProvider>);
+  assert.match(visHtml, /front_cam/);
+  assert.match(visHtml, /HEALTHY/);
+  assert.match(visHtml, /50\.0/);
+
+  const framesHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <framesPanel.component config={framesPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="fr"/>
+      </StudioProvider>);
+  assert.match(framesHtml, /Choose a recorded frames directory/);
+
+  // Every channel requested from /series must be present in channels.json.
+  const declaredNames = new Set(channels.map(c => c.name));
+  for (const call of server.of('/series')) {
+    for (const chName of call.url.searchParams.get('c')!.split(',')) {
+      assert.ok(declaredNames.has(chName), `requested absent channel ${chName}`);
+    }
+  }
+
+  studio.closeRecorded();
+});
+
+// REQ-OPS-41, REQ-OPS-51: studio_review returns HTTP 404 on unknown channel
+// names (which pauses playback), so HardwarePanel on hardware_not_decoded (or
+// partial /hw/status) and VisionPanel on minimal camera/estimator recordings
+// must never request channels absent from the dictionary.
+test('HardwarePanel and VisionPanel never request absent channels on recorded sessions', async () => {
+  // 1. HardwarePanel on hardware_not_decoded: zero /series requests.
+  const undecodedServer = fakeServer(echoSnapshot);
+  const undecoded = new RecordedSource(
+      SERVER, 's1', [],
+      {...BOUNDS, hardware_not_decoded: 'protocol mismatch'},
+      undecodedServer.fetchFn, fakeClock().clock,
+      {...EMPTY_TIMELINE, hardware_not_decoded: true}, null);
+  const studio = createStaticStudio();
+  studio.openRecorded(undecoded);
+  const undecodedHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="hw"/>
+      </StudioProvider>);
+  assert.match(undecodedHtml, /protocol mismatch/);
+  assert.equal(undecodedServer.of('/series').length, 0);
+  studio.closeRecorded();
+
+  // 2. VisionPanel on minimal camera (pose/x_m + x_std_m + tag_count only)
+  //    and minimal estimator (observation_accepted_count only): never requests
+  //    absent camera/estimator fields.
+  const minimalChannels = [
+    'front_cam/state/pose/x_m',
+    'front_cam/state/x_std_m',
+    'front_cam/state/tag_count',
+    'pose_estimator/state/observation_accepted_count'
+  ].map(info);
+  const present = new Set(minimalChannels.map(c => c.name));
+  const visServer = fakeServer(echoSnapshot);
+  const minimalRec = new RecordedSource(
+      SERVER, 's1', minimalChannels, BOUNDS, visServer.fetchFn,
+      fakeClock().clock, EMPTY_TIMELINE, null);
+  studio.openRecorded(minimalRec);
+  const visHtml = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <visionPanel.component config={visionPanel.defaultConfig}
+                               setConfig={() => {}} instanceId="vis"/>
+      </StudioProvider>);
+  assert.match(visHtml, /front_cam/);
+  assert.match(visHtml, /POSE_ESTIMATOR/);
+  const visRequested = visServer.of('/series').flatMap(
+      call => call.url.searchParams.get('c')!.split(','));
+  assert.ok(visRequested.length > 0);
+  for (const chName of visRequested) {
+    assert.ok(present.has(chName), `VisionPanel requested absent channel ${chName}`);
+  }
+  studio.closeRecorded();
 });

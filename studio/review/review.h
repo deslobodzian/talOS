@@ -15,21 +15,56 @@
 //       channel's level, studio::AlertLevelName; stream_id "0")
 //   GET /review/<id>/bounds.json
 //       {"start_ns","end_ns","origin_wall_ns","max_series_values",
-//        "max_series_channels","hardware_not_decoded","gaps"}: the two max_
-//       ones, plain numbers, are kMaxSeriesValues and kMaxSeriesChannels,
-//       which a client splits its series requests by; hardware_not_decoded
-//       is null, or log_dump's line for a session whose hardware packets
-//       are not served (Session::hardware_not_decoded); gaps, always
-//       present, lists every GAP record (Session::gaps, in its order) as
-//       {"process","start_ns","end_ns","records","dispatches","sends",
+//        "max_series_channels","hardware_not_decoded","gaps","pose_topic"}:
+//       the two max_ ones, plain numbers, are kMaxSeriesValues and
+//       kMaxSeriesChannels, which a client splits its series requests by;
+//       hardware_not_decoded is null, or log_dump's line for a session whose
+//       hardware packets are not served (Session::hardware_not_decoded); gaps,
+//       always present, lists every GAP record (Session::gaps, in its order)
+//       as {"process","start_ns","end_ns","records","dispatches","sends",
 //       "closed_at_flush"}: records, dispatches and sends plain numbers,
 //       closed_at_flush true for a gap the writer's stop closed; the
-//       session's start_ns..end_ns covers every gap's span
+//       session's start_ns..end_ns covers every gap's span; pose_topic is
+//       `[studio] pose_topic` from the session's config or null when unset or
+//       unreadable
 //       wall time of a session time t_ns is origin_wall_ns + t_ns
+//   GET /review/<id>/timeline.json
+//       {"hardware_not_decoded","modes","modes_dropped","alerts",
+//        "alerts_dropped","runs","runs_dropped"}: hardware_not_decoded is a
+//       boolean matching bounds.json (when true, modes is empty); modes lists
+//       Driver Station mode transitions as {"start_ns","end_ns","mode","fms"}
+//       where mode is disabled, teleop, auto, test or estop; alerts lists
+//       intervals of every ChannelInfo.alert != None channel as
+//       {"channel","level","start_ns","end_ns","active_at_end"} (first true
+//       publish_ns to first false publish_ns or session end_ns; active_at_end
+//       is true only when still active at session end, false when cleared even
+//       on exact end_ns); runs lists manifest.json's
+//       nodes[].runs[] mapped via origin_wall_ns as
+//       {"node","start_ns","end_ns","reason"} (end_ns is null when
+//       end_wall_ns == 0). Each list is bounded per open session
+//       (kMaxTimelineModes = 4096, kMaxTimelineAlerts = 4096,
+//       kMaxTimelineRuns = 4096; 96 KiB retained each for modes and alerts;
+//       REQ-OPS-42). During Session::Open(), alerts buffer at most
+//       kMaxTimelineAlerts intervals per alert channel on each topic's single
+//       canonical stream (64 KiB per alert channel; non-canonical streams are
+//       skipped or evicted immediately) before merging to the earliest
+//       kMaxTimelineAlerts globally by start_ns, so a flapping peer cannot
+//       starve another alert on the same status topic. Overflow is counted in
+//       modes_dropped, alerts_dropped (per-channel plus global merge drops)
+//       and runs_dropped (which also sums each node's manifest runs_dropped).
+//   GET /review/<id>/declared.json
+//       the session directory's graph.json verbatim (application/json, up to
+//       kMaxDeclaredBytes), or 404 plain text when absent
+//   GET /review/<id>/manifest.json
+//       the session directory's manifest.json verbatim (application/json, up
+//       to kMaxManifestBytes), or 404 plain text when absent
 //   GET /review/<id>/snapshot?t_ns=
 //       {"t_ns","channels":{name:{"value","sample_ns"}}}
 //       value as the bridge's /telemetry.json writes a sample, or null for
-//       no reading; a channel with no sample at or before t_ns is absent
+//       no reading; a channel with no sample at or before t_ns is absent;
+//       bounded to kMaxSnapshotChannels channels and kMaxSnapshotBytes bytes
+//       (REQ-OPS-42; entries past either ceiling are omitted so the JSON stays
+//       valid within the server's heap bound)
 //   GET /review/<id>/series?c=a,b&start_ns=&end_ns=&points=N
 //       application/octet-stream, little-endian: u32 channels, u32 buckets,
 //       then per channel f64 t_ns[buckets], f64 min[], f64 max[], f64 last[],
@@ -80,9 +115,22 @@ inline constexpr std::size_t SeriesRequestBytes(std::size_t channels,
 inline constexpr std::size_t kMaxSeriesRequestBytes =
     SeriesRequestBytes(1, kMaxSeriesValues);
 
+// Fixed ceiling on one snapshot response body (REQ-OPS-42): at most
+// kMaxSnapshotChannels channels (session.h) and at most 2 MiB of JSON
+// (~256 B/channel at the channel cap, well below kMaxSeriesRequestBytes).
+inline constexpr std::size_t kMaxSnapshotBytes = std::size_t{2} << 20;
+
 // The most sessions kept open (indexed) at once; opening one more closes
 // the least recently used, whose index is rebuilt if it is opened again.
 inline constexpr std::size_t kMaxOpenSessions = 4;
+
+// The largest graph.json served at /review/<id>/declared.json, matching
+// Studio's MAX_DECLARED_BYTES (studio/src/system.ts).
+inline constexpr std::uintmax_t kMaxDeclaredBytes = std::uintmax_t{1} << 20;
+
+// The largest manifest.json read for session listing or served at
+// /review/<id>/manifest.json.
+inline constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
 
 struct Response {
   int status{200};
@@ -120,6 +168,9 @@ class Review {
   Response Sessions();
   Response Channels(const Session& session) const;
   Response Bounds(const Session& session) const;
+  Response Timeline(const Session& session) const;
+  Response Declared(std::string_view id) const;
+  Response Manifest(std::string_view id) const;
   Response Snapshot(const Session& session, std::string_view query);
   Response Series(std::string_view id, const Session& session,
                   std::string_view query);

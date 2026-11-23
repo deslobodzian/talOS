@@ -26,6 +26,9 @@
 #   deps         tools/check_deps_listed.py: docs/METHODOLOGY.md §13's
 #                "Bazel module" table lists exactly MODULE.bazel's
 #                bazel_deps
+#   layers-src   tools/check_layers.py --source-only: no C++ node source
+#                outside talOS/ bypasses the devices layer (RULES.md 2,
+#                REQ-SAFE-27)
 #   commissioning  tools/check_commissioning.py --base <rev>: no commit
 #                since the merge base with <rev> sets `commissioned = true`
 #                or changes a CAN id in a robot or bench config (RULES.md 4)
@@ -71,6 +74,7 @@ lint trace python3 tools/trace.py --check
 lint node-matrix python3 tools/check_node_matrix.py \
   --baseline tools/check_node_matrix_baseline.txt
 lint deps python3 tools/check_deps_listed.py
+lint layers-src python3 tools/check_layers.py --source-only
 if [ -n "$base" ]; then
   lint commissioning python3 tools/check_commissioning.py --base "$base"
 else

@@ -252,8 +252,179 @@ test('explicitly empty dictionaries replace cached dictionaries', () => {
   const decoder = new TelemetryDecoder();
   decoder.decode(valueFrame(0n, 9, [1], 42n, {dictionary: ['old']}));
   assert.deepEqual(Object.keys(decoder.decode(
-      valueFrame(1n, 9, [], 42n, {dictionary: []}))!.channels), []);
+      valueFrame(1n, 10, [], 42n, {dictionary: []}))!.channels), []);
   assert.throws(() => decoder.decode(valueFrame(2n, 9, [1])));
+  assert.throws(() => decoder.decode(valueFrame(2n, 10, [1])));
+});
+
+// REQ-OPS-23, REQ-CONTRACT-28: a multi-page tick must commit atomically at its
+// final page; dropped, interleaved, out-of-order or failing continuation pages
+// must not tear or corrupt delta state.
+test('multi-page value updates commit atomically and never tear on drop, interleave, or error', () => {
+  const channels = Array.from({length: 100}, (_, i) => ({
+    name: `test/state/ch_${i}`,
+    unit: '',
+    kind: i === 99 ? ChannelKind.Bool : ChannelKind.Double
+  }));
+  const chassis = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+  const header = (sequenceId: bigint) => ({
+    streamId: 7n, sequenceId, timestampNs: sequenceId * 1000n,
+    dictionaryId: 3, channelCount: channels.length
+  });
+  const initDecoder = () => {
+    const d = new TelemetryDecoder();
+    for (const p of encodeDictionaryPages(header(0n), channels)) d.decode(p);
+    const kf = encodeValuePages(
+        header(1n), chassis, true,
+        channels.map((_, i): [number, bigint] => [i, i === 99 ? 0n : rawFromDouble(i)]));
+    assert.ok(kf.length >= 2);
+    let snap = null;
+    for (const p of kf) snap = d.decode(p);
+    assert.ok(snap);
+    return d;
+  };
+
+  // 1) Dropped page 1 of a 2-page keyframe must not wipe or overwrite prior values.
+  {
+    const d = initDecoder();
+    const kf2 = encodeValuePages(
+        header(2n), chassis, true,
+        channels.map((_, i): [number, bigint] => [i, i === 99 ? 1n : rawFromDouble(1000 + i)]));
+    assert.ok(kf2.length >= 2);
+    assert.equal(d.decode(kf2[0]), null);
+    // Page 1 dropped; a subsequent single-page delta arrives.
+    const delta = encodeValuePages(header(3n), chassis, false, [[1, rawFromDouble(999)]]);
+    assert.equal(delta.length, 1);
+    const snap = d.decode(delta[0])!;
+    assert.equal(snap.channels['test/state/ch_0'], 0, 'dropped keyframe page 0 must not corrupt ch_0');
+    assert.equal(snap.channels['test/state/ch_1'], 999);
+    assert.equal(snap.channels['test/state/ch_99'], 0, 'dropped keyframe page 0 must not wipe ch_99');
+  }
+
+  // 2) Dropped page 1 of an initial keyframe must not mark hasValues = true.
+  {
+    const d = new TelemetryDecoder();
+    for (const p of encodeDictionaryPages(header(0n), channels)) d.decode(p);
+    const kf = encodeValuePages(
+        header(1n), chassis, true,
+        channels.map((_, i): [number, bigint] => [i, i === 99 ? 0n : rawFromDouble(i)]));
+    assert.ok(kf.length >= 2);
+    assert.equal(d.decode(kf[0]), null);
+    const delta = encodeValuePages(header(2n), chassis, false, [[0, rawFromDouble(5)]]);
+    assert.throws(() => d.decode(delta[0]), /before a keyframe/);
+  }
+
+  // 3) Error on page 1 (invalid bool) must not commit page 0's delta changes.
+  {
+    const d = initDecoder();
+    const badDelta = encodeValuePages(
+        header(2n), chassis, false,
+        channels.map((_, i): [number, bigint] => [i, i === 99 ? 2n : rawFromDouble(500 + i)]));
+    assert.ok(badDelta.length >= 2);
+    assert.equal(d.decode(badDelta[0]), null);
+    assert.throws(() => d.decode(badDelta[1]), /Invalid bool/);
+    const next = encodeValuePages(header(3n), chassis, false, [[1, rawFromDouble(777)]]);
+    const snap = d.decode(next[0])!;
+    assert.equal(snap.channels['test/state/ch_0'], 0, 'failed multi-page delta must not leak page 0');
+    assert.equal(snap.channels['test/state/ch_1'], 777);
+  }
+
+  // 4) Interleaved / orphaned continuation pages are rejected without tearing state.
+  {
+    const d = initDecoder();
+    const u2 = encodeValuePages(
+        header(2n), chassis, false,
+        channels.map((_, i): [number, bigint] => [i, i === 99 ? 1n : rawFromDouble(200 + i)]));
+    const u3 = encodeValuePages(
+        header(3n), chassis, false,
+        channels.map((_, i): [number, bigint] => [i, i === 99 ? 0n : rawFromDouble(300 + i)]));
+    assert.ok(u2.length >= 2 && u3.length >= 2);
+    // Orphaned page 1 without page 0.
+    assert.throws(() => d.decode(u2[1]), /out of order/);
+    // Interleaved: u2 page 0, then u3 page 0, then u2 page 1 must be rejected.
+    assert.equal(d.decode(u2[0]), null);
+    assert.equal(d.decode(u3[0]), null);
+    assert.throws(() => d.decode(u2[1]), /out of order/);
+    const check = d.decode(encodeValuePages(header(4n), chassis, false, [])[0])!;
+    assert.equal(check.channels['test/state/ch_0'], 0, 'interleaved pages must not mutate state');
+  }
+});
+
+// REQ-OPS-23, REQ-CONTRACT-28: dictionary pages reject empty intermediate pages,
+// cap buffered page count, and verify identical channels on same (streamId, id).
+test('dictionaryPage rejects empty intermediate pages, huge pageCount, and same-id mismatch', () => {
+  const buildDictPage = (opts: {
+    streamId?: bigint; id: number; page: number; pageCount: number;
+    channelCount: number; firstChannel: number; names: string[];
+    kinds?: ChannelKind[];
+  }): Uint8Array => {
+    const b = new Builder(256);
+    const entries = opts.names.map((name, i) => {
+      const n = b.createString(name);
+      ChannelInfo.startChannelInfo(b);
+      ChannelInfo.addName(b, n);
+      ChannelInfo.addKind(b, opts.kinds?.[i] ?? ChannelKind.Double);
+      return ChannelInfo.endChannelInfo(b);
+    });
+    const dict = Frame.createDictionaryVector(b, entries);
+    Frame.startFrame(b);
+    Frame.addStreamId(b, opts.streamId ?? 42n);
+    Frame.addSequenceId(b, 0n);
+    Frame.addTimestampNs(b, 1n);
+    Frame.addDictionaryId(b, opts.id);
+    Frame.addPage(b, opts.page);
+    Frame.addPageCount(b, opts.pageCount);
+    Frame.addChannelCount(b, opts.channelCount);
+    Frame.addFirstChannel(b, opts.firstChannel);
+    Frame.addDictionary(b, dict);
+    Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
+    return b.asUint8Array().slice();
+  };
+
+  // Empty intermediate page in a multi-page dictionary is refused.
+  {
+    const d = new TelemetryDecoder();
+    assert.throws(() => d.decode(buildDictPage({
+      id: 1, page: 0, pageCount: 2, channelCount: 1, firstChannel: 0, names: []
+    })), /Empty dictionary page/);
+  }
+
+  // Excessive pageCount is refused immediately without buffering.
+  {
+    const d = new TelemetryDecoder();
+    assert.throws(() => d.decode(buildDictPage({
+      id: 1, page: 0, pageCount: 5000, channelCount: 5000, firstChannel: 0, names: ['a']
+    })), /Too many dictionary pages/);
+  }
+
+  // Same (streamId, id) with a different channel list must be rejected instead
+  // of replacing the dictionary while keeping stale raw/present sizing.
+  {
+    const d = new TelemetryDecoder();
+    const first = d.decode(valueFrame(0n, 9, [42], 42n, {dictionary: ['a']}))!;
+    assert.equal(first.channels.a, 42);
+    // Different length with same (streamId=42, id=9).
+    assert.throws(() => d.decode(buildDictPage({
+      id: 9, page: 0, pageCount: 1, channelCount: 2, firstChannel: 0, names: ['a', 'b']
+    })), /Conflicting dictionary/);
+    // Different channel name with same length and same (streamId=42, id=9).
+    assert.throws(() => d.decode(buildDictPage({
+      id: 9, page: 0, pageCount: 1, channelCount: 1, firstChannel: 0, names: ['z']
+    })), /Conflicting dictionary/);
+    // Existing dictionary and delta state remain intact.
+    const next = d.decode(encodeValuePages(
+        {streamId: 42n, sequenceId: 1n, timestampNs: 2n, dictionaryId: 9, channelCount: 1},
+        {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0}, false, [])[0])!;
+    assert.equal(next.channels.a, 42);
+    // Re-sending the exact identical dictionary preserves delta state.
+    assert.equal(d.decode(buildDictPage({
+      id: 9, page: 0, pageCount: 1, channelCount: 1, firstChannel: 0, names: ['a']
+    })), null);
+    const afterResend = d.decode(encodeValuePages(
+        {streamId: 42n, sequenceId: 2n, timestampNs: 3n, dictionaryId: 9, channelCount: 1},
+        {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0}, false, [])[0])!;
+    assert.equal(afterResend.channels.a, 42);
+  }
 });
 
 test('an invalid page changes neither the dictionary, the stream nor the values', () => {

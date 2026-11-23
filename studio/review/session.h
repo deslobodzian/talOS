@@ -46,9 +46,12 @@
 // served, the Driver Station's included, and hardware_not_decoded() holds
 // log_dump's line, also printed on stderr.
 //
-// A read selects records by publication time but walks a file by event
-// time, so it reads one second either side of the range: a message received
-// or sent more than a second from its publication time is not found.
+// A read selects records by publication time while walking a file by event
+// time: each LogFile tracks its observed maximum second-level lead and lag
+// between checkpoint event time and publication time so reads widen their
+// event-time scan window to cover any skew, and keeps a lazy out-of-line
+// presence bitset for source ids >= 63 (0 bytes when all source ids are < 63)
+// so Checkpoint stays 24 B (REQ-OPS-42).
 
 #include <array>
 #include <cstddef>
@@ -99,10 +102,61 @@ struct Gap {
 };
 static_assert(sizeof(Gap) == 48, "REQ-OPS-42: 48 B per GAP record");
 
+// Fixed ceilings on the timeline kept per open session (REQ-OPS-42): 96 KiB
+// each for modes and alerts (4096 x 24 B) and at most 4096 runs from
+// manifest.json, regardless of session length or flapping rate. While
+// Session::Open() scans logs, alerts are capped at kMaxTimelineAlerts per
+// alert channel (4096 x 16 B = 64 KiB transient per alert channel on each
+// topic's single canonical stream; non-canonical streams are skipped or
+// evicted immediately; close order equals start order within one channel)
+// before merging into the global earliest kMaxTimelineAlerts intervals by
+// start_ns, so a flapping alert cannot drop an earlier alert on the same
+// status topic. Excess items are dropped and counted in *_dropped().
+inline constexpr std::size_t kMaxTimelineModes = 4096;
+inline constexpr std::size_t kMaxTimelineAlerts = 4096;
+inline constexpr std::size_t kMaxTimelineRuns = 4096;
+
+// Fixed ceiling on channels returned by one Session::Snapshot (REQ-OPS-42):
+// well above live telemetry's 2048-channel dictionary cap, while bounding
+// snapshot memory even for a crafted session with huge channel counts.
+inline constexpr std::size_t kMaxSnapshotChannels = 8192;
+
+enum class ModeKind : std::uint8_t {
+  kDisabled,
+  kTeleop,
+  kAuto,
+  kTest,
+  kEstop,
+};
+std::string_view ModeKindName(ModeKind mode);
+
+struct ModeInterval {
+  std::int64_t start_ns{0};
+  std::int64_t end_ns{0};
+  ModeKind mode{ModeKind::kDisabled};
+  bool fms{false};
+};
+static_assert(sizeof(ModeInterval) == 24,
+              "REQ-OPS-42: 24 B per timeline mode interval");
+
 struct LogFile {
   std::string path;
   std::string process;
   std::vector<Checkpoint> checkpoints;
+  // Maximum second-level skew observed across value records in this file:
+  // max_lead_s = max(0, checkpoint.second - FloorSecond(publish_ns)),
+  // max_lag_s  = max(0, FloorSecond(publish_ns) - checkpoint.second).
+  std::int64_t max_lead_s{0};
+  std::int64_t max_lag_s{0};
+  // Lazy out-of-line presence bitset for source ids >= 63, allocated only when
+  // a value record with source_id >= 63 is indexed (0 bytes for <= 63 sources).
+  std::vector<std::uint16_t> overflow_source_ids;
+  std::vector<std::uint64_t> overflow_bits;
+  std::size_t overflow_words_per_cp{0};
+
+  std::optional<std::size_t> OverflowBit(std::uint16_t source_id) const;
+  bool HasSource(std::size_t cp_idx, std::uint16_t source_id,
+                 std::optional<std::size_t> overflow_bit) const;
 };
 
 enum class Decoder : std::uint8_t {
@@ -131,6 +185,40 @@ struct Topic {
 struct ChannelRef {
   std::uint32_t topic{0};
   std::uint32_t channel{0};
+};
+
+struct AlertInterval {
+  std::int64_t start_ns{0};
+  std::int64_t end_ns{0};
+  std::uint32_t topic{0};
+  // Low 31 bits: channel index within topic; high bit: active_at_end (true
+  // when still active at session end, false when cleared by a false sample,
+  // even on exact end_ns).
+  std::uint32_t channel_and_active{0};
+
+  static constexpr std::uint32_t kActiveAtEndMask = std::uint32_t{1} << 31;
+
+  static AlertInterval Make(std::int64_t start_ns, std::int64_t end_ns,
+                            ChannelRef ref, bool active_at_end) noexcept {
+    return {start_ns, end_ns, ref.topic,
+            (ref.channel & ~kActiveAtEndMask) |
+                (active_at_end ? kActiveAtEndMask : 0u)};
+  }
+  ChannelRef channel() const noexcept {
+    return {topic, channel_and_active & ~kActiveAtEndMask};
+  }
+  bool active_at_end() const noexcept {
+    return (channel_and_active & kActiveAtEndMask) != 0;
+  }
+};
+static_assert(sizeof(AlertInterval) == 24,
+              "REQ-OPS-42: 24 B per timeline alert interval");
+
+struct RunInterval {
+  std::string node;
+  std::int64_t start_ns{0};
+  std::optional<std::int64_t> end_ns;  // empty when end_wall_ns == 0
+  std::string reason;
 };
 
 // A channel's samples over [start_ns, end_ns), cut into equal buckets (the
@@ -201,6 +289,20 @@ class Session {
   const std::string& hardware_not_decoded() const {
     return hardware_not_decoded_;
   }
+  // `[studio] pose_topic` from the session's robot config (manifest.json
+  // config_path), or empty when unset or unreadable.
+  const std::string& pose_topic() const { return pose_topic_; }
+
+  // Timeline summary derived during Open() (REQ-OPS-41, REQ-OPS-42):
+  // Driver Station mode transitions (empty when hardware_not_decoded() is
+  // non-empty), active alert intervals across all alert channels, and node
+  // runs from manifest.json mapped via origin_wall_ns().
+  const std::vector<ModeInterval>& modes() const { return modes_; }
+  std::uint64_t modes_dropped() const { return modes_dropped_; }
+  const std::vector<AlertInterval>& alerts() const { return alerts_; }
+  std::uint64_t alerts_dropped() const { return alerts_dropped_; }
+  const std::vector<RunInterval>& runs() const { return runs_; }
+  std::uint64_t runs_dropped() const { return runs_dropped_; }
 
   // The index's checkpoints and gaps: what grows with the session's length.
   std::size_t index_bytes() const;
@@ -214,14 +316,17 @@ class Session {
                                  ReadStats* stats = nullptr) const;
 
   // Every channel of each topic with a record published at or before
-  // `t_ns`, from its latest such record, by topic then channel; a topic with
-  // none is absent. Per log file it reads, once each, only the seconds that
-  // hold a value record of one of its topics' sources at or before
-  // floor(t_ns) + 1 s, latest first, stopping per source at the first that
-  // yields its value: normally one second per source however long ago it was
-  // last published (studio/README.md, "Reviewing a session").
-  std::vector<Sample> Snapshot(std::int64_t t_ns,
-                               ReadStats* stats = nullptr) const;
+  // `t_ns`, from its latest such record, by topic then channel, capped at
+  // `max_channels`; a topic with none is absent. Per log file it reads, once
+  // each, only the seconds that hold a value record of one of its topics'
+  // sources at or before floor(t_ns) + file.max_lead_s, latest first, stopping
+  // per source once no earlier checkpoint can hold a newer publication
+  // (checkpoint.second < floor(found.publish_ns) - file.max_lag_s): normally
+  // one second per source however long ago it was last published
+  // (studio/README.md, "Reviewing a session").
+  std::vector<Sample> Snapshot(
+      std::int64_t t_ns, ReadStats* stats = nullptr,
+      std::size_t max_channels = kMaxSnapshotChannels) const;
 
  private:
   Session() = default;
@@ -242,6 +347,13 @@ class Session {
   std::int64_t end_ns_{0};
   std::int64_t origin_wall_ns_{0};
   std::string hardware_not_decoded_;
+  std::string pose_topic_;
+  std::vector<ModeInterval> modes_;
+  std::uint64_t modes_dropped_{0};
+  std::vector<AlertInterval> alerts_;
+  std::uint64_t alerts_dropped_{0};
+  std::vector<RunInterval> runs_;
+  std::uint64_t runs_dropped_{0};
 };
 
 // The value of a raw telemetry sample of `kind` as a double (a bucket's).

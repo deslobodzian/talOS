@@ -56,17 +56,19 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
-// A loopback UDP port nothing holds now, so parallel tests do not share the
-// controller link.
+// A UDP port nothing holds on any interface now, so parallel tests do not share
+// the controller link and hardware_node's 0.0.0.0 bind does not collide with a
+// socket bound to a non-loopback address.
 uint16_t FreeUdpPort() {
   const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
   sockaddr_in address{};
   address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
   socklen_t length = sizeof address;
   if (fd < 0 ||
       ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof address) != 0 ||
       ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+    if (fd >= 0) ::close(fd);
     throw std::runtime_error("no free UDP port");
   }
   ::close(fd);

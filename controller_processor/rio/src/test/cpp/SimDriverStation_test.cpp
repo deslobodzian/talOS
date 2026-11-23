@@ -10,11 +10,15 @@
 #include <hal/HAL.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "DriverStationReader.h"
+#include "RioLog.h"
 
 namespace {
 
@@ -222,6 +226,64 @@ TEST_F(SimDriverStationTest, JoystickScheduleReachesDriverStationPacket) {
   packet = Sampled();
   EXPECT_EQ(packet.fms.flags & ds::kEnabled, 0u);
   EXPECT_FLOAT_EQ(packet.joysticks[0].axes[1], -0.5f);
+}
+
+// The console time prefix of a line printed at `now`, the loop's clock.
+std::string ConsoleTimeAt(SimDriverStation::Clock::time_point now) {
+  return talos::rio::ConsoleTime(static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          now.time_since_epoch())
+          .count()));
+}
+
+// Every console line the stand-in prints (a schedule phase, a joystick
+// event, enabling on a push, disabling at its deadline) starts with the
+// console time prefix of the tick that printed it, like the program's own
+// lines, so a run's log places each against them.
+// REQ-OPS-24
+TEST_F(SimDriverStationTest, EveryConsoleLineStartsWithTheConsoleTime) {
+  const auto t0 = SimDriverStation::Clock::time_point{} + 1h + 123ms;
+  std::vector<std::string> expected;
+  testing::internal::CaptureStdout();
+  {
+    auto settings = Active();
+    settings.schedule = ParseModeSchedule("teleop:1,disabled:1");
+    settings.joysticks = ParseJoystickSchedule(
+        "0:axes=0;buttons=0;pov=-1|0.5:axes=0.5;buttons=1;pov=-1");
+    SimDriverStation sim{settings, t0};
+    sim.ConfigurationAcknowledged();
+    const auto configured = t0 + 7ms;
+    sim.Update(configured, true);          // joystick event 1, then teleop
+    sim.Update(configured + 500ms, true);  // joystick event 2
+    sim.Update(configured + 1s, true);     // disabled
+    expected = {ConsoleTimeAt(configured), ConsoleTimeAt(configured),
+                ConsoleTimeAt(configured + 500ms),
+                ConsoleTimeAt(configured + 1s)};
+  }
+  {
+    auto settings = Active();
+    settings.enable_when_configured = true;
+    settings.disable_after = std::chrono::milliseconds{1000};
+    SimDriverStation sim{settings, t0};
+    sim.ConfigurationAcknowledged();
+    sim.Update(t0 + 101ms, true);   // enabling
+    sim.Update(t0 + 1001ms, true);  // disabling
+    expected.push_back(ConsoleTimeAt(t0 + 101ms));
+    expected.push_back(ConsoleTimeAt(t0 + 1001ms));
+  }
+  std::istringstream output{testing::internal::GetCapturedStdout()};
+  std::vector<std::string> lines;
+  for (std::string line; std::getline(output, line);) {
+    // Only the stand-in's: WPILib may print lines of its own.
+    if (line.find("simulated Driver Station:") != std::string::npos) {
+      lines.push_back(line);
+    }
+  }
+  ASSERT_EQ(lines.size(), expected.size());
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    EXPECT_EQ(lines[i].rfind(expected[i], 0), 0u)
+        << "line " << i << " lacks " << expected[i] << ": " << lines[i];
+  }
 }
 
 // Without a named alliance the pose estimator never trusts its seed, so

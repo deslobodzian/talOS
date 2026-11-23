@@ -31,7 +31,11 @@
 // between steps is stamped now() and wakes its readers at the start of the
 // next step(), at that instant. pause(name, duration) stops only that node's
 // timers and deliveries; at its end, or at resume(name), the node runs its
-// overdue timers and pending wakes at once. Serial stepping proves causality
+// overdue timers and pending wakes at once. remove(name) stops and destroys
+// a hosted node, and add() may be called after step() (including to re-add a
+// removed name): a node added mid-run starts its clock at now(), schedules
+// its first timer at now() + period, and receives only messages published
+// after it attached (REQ-SAFE-31). Serial stepping proves causality
 // and ordering, not concurrent RTMS behaviour or scheduler jitter. Hardware
 // is a layer on top: talOS/devices/testing.h plays the bridge.
 
@@ -58,13 +62,23 @@ class Sim {
   Sim& operator=(Sim&&) noexcept;
 
   // Constructs a Node named `node_name` and T on it; returns the user
-  // object. Add every node before the first step(). The thread that adds a
-  // node is its loop thread (node.h): step the Sim from it, too.
+  // object. May be called before or after step(): a node added mid-run starts
+  // its clock at now(), schedules its first periodic timer at now() + period
+  // (no catch-up from 0), and receives only messages published after it
+  // attached (REQ-SAFE-31). Throws std::invalid_argument if `node_name` is
+  // already hosted, and std::logic_error if called inside step(). The thread
+  // that adds a node is its loop thread (node.h): step the Sim from it, too.
   template <class T>
   T& add(std::string_view node_name) {
     return *static_cast<T*>(detail::SimAccess::add_instance(
         *this, node_name, detail::MakeInstance<T>()));
   }
+
+  // Stops and removes the hosted node named `node_name`, destroying its user
+  // object, Node and simulated loop; the name may be added again later.
+  // Throws std::invalid_argument if `node_name` is not hosted, and
+  // std::logic_error if called inside step().
+  void remove(std::string_view node_name);
 
   // Advances virtual time, running every node's timers and deliveries.
   void step(Duration d);

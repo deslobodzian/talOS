@@ -1,13 +1,15 @@
 #pragma once
 
+#include <array>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
-#include <vector>
 
 #ifdef _WIN32
 #include <thread>
@@ -16,6 +18,7 @@
 #endif
 
 #include "hardware/config.h"
+#include "hardware/config_wire.h"
 #include "hardware/gateway.h"
 
 // The RoboRIO's copy of the last acknowledged hardware configuration, so a
@@ -72,12 +75,11 @@ std::optional<hardware::Config> BeginRestore(hardware::Gateway& gateway,
 // flash). The two share one mutex, which the saver holds only to move a
 // configuration in or a result out, never across a save, and which the loop
 // thread only ever try-locks: when it is taken, the tick goes on and the next
-// one tries again. The loop thread never waits on the save, nor on an
-// allocator lock the saver holds: once started, the saver thread allocates
-// and frees nothing. The loop thread encodes each configuration it hands over
-// (Acknowledged); the saver passes those bytes to `save`, which allocates
-// nothing either (ConfigFile::Save off Windows), and hands them back to
-// Tick() to free.
+// one tries again. Three fixed-size persisted-byte slots are allocated once at
+// construction (unsaved, pending, saving) and swapped by index under the mutex,
+// so once constructed neither the loop thread (Acknowledged, Tick) nor the
+// saver thread allocates or frees (and `save` allocates nothing either:
+// ConfigFile::Save off Windows).
 //
 // The newest acknowledged configuration is the one left on disk: one
 // acknowledged while a save is in flight is saved after it, and one handed
@@ -127,22 +129,26 @@ class ConfigPersister {
   void Stop();
 
   // Loop thread: a configuration the gateway acknowledged
-  // (Endpoint::OnConfigured). Encodes it (hardware::PersistedConfig); never
-  // waits.
+  // (Endpoint::OnConfigured). Encodes it into the preallocated unsaved slot
+  // (hardware::PersistedConfigInto); never waits, allocates or frees.
   void Acknowledged(const hardware::Config& config);
 
   // Loop thread, every tick: collects finished saves and, on a `disabled`
   // tick, hands the newest acknowledged configuration not yet handed over to
   // the saver. Returns how many saves failed since the previous call that
-  // collected results. Never waits; touches the mutex only while a save is
-  // pending or outstanding.
+  // collected results. Never waits, allocates or frees; touches the mutex only
+  // while a save is pending or outstanding.
   uint32_t Tick(bool disabled);
 
  private:
-  // One configuration's ConfigurationId and persisted bytes.
+  // One configuration's ConfigurationId and persisted bytes in fixed storage.
   struct Persisted {
     uint64_t id{0};
-    std::vector<uint8_t> bytes;
+    std::size_t size{0};
+    std::array<uint8_t, hardware::kMaxPersistedConfigSize> bytes{};
+    std::span<const uint8_t> span() const noexcept {
+      return {bytes.data(), size};
+    }
   };
 
   void Run();
@@ -151,9 +157,14 @@ class ConfigPersister {
 #endif
 
   const Save save_;
+  // Three disjoint preallocated slots (allocated once in the constructor) so
+  // unsaved_, pending_, and saving_ hand over by index swap with zero
+  // allocation, zero free, and zero 10 KB copy under mutex_.
+  std::unique_ptr<std::array<Persisted, 3>> slots_;
 
   // Loop-thread state.
-  std::optional<Persisted> unsaved_;
+  std::size_t unsaved_slot_{0};
+  bool has_unsaved_{false};
   // The ConfigurationId the file holds as of the last results collected.
   uint64_t on_disk_id_;
   // Handed over and not yet collected as finished.
@@ -164,18 +175,15 @@ class ConfigPersister {
   // Shared, under mutex_.
   std::mutex mutex_;
   std::condition_variable wake_;
-  std::optional<Persisted> pending_;
-  // The last configuration saved, handed back for Tick() to free.
-  std::optional<Persisted> done_;
+  std::size_t pending_slot_{1};
+  bool has_pending_{false};
   uint64_t finished_{0};
   uint64_t failed_{0};
   uint64_t saved_id_;
   bool stop_{false};
 
-  // Saver-thread state: the configuration being saved, read outside the
-  // mutex. One saved while stopping, when the loop no longer ticks to collect
-  // done_, stays here for Stop() to free after the join.
-  std::optional<Persisted> saving_;
+  // Saver-thread state: the slot currently being written outside mutex_.
+  std::size_t saving_slot_{2};
 
   bool started_{false};
 #ifdef _WIN32

@@ -25,12 +25,15 @@
 #include <tuple>
 #include <utility>
 
+#include "bridge/topics.h"
 #include "talOS/hardware/config.h"
 #include "talOS/launcher/console_line.h"
 #include "talOS/launcher/session.h"
 #include "talOS/launcher/spawn.h"
 #include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
+#include "talOS/telemetry/config_validation.h"
+#include "talOS/telemetry/dashboard_layout.h"
 #include "toml.hpp"
 
 namespace talos::launcher {
@@ -314,6 +317,17 @@ naming::TargetModeSources TargetModeSourcesOf(
   return sources;
 }
 
+std::vector<std::string> CanBusNamesOf(
+    const config::RobotConfig& robot_config) {
+  const hardware::CanBusList buses = hardware::CanBuses(robot_config.hardware);
+  std::vector<std::string> names;
+  names.reserve(buses.count);
+  for (std::size_t i = 0; i < buses.count; ++i) {
+    names.emplace_back(buses.names[i]);
+  }
+  return names;
+}
+
 std::vector<naming::Diagnostic> LintParameterUnits(
     const config::RobotConfig& robot_config) {
   std::vector<naming::Diagnostic> findings;
@@ -480,6 +494,240 @@ std::vector<naming::Diagnostic> LintPythonActuatorPeriods(
   return findings;
 }
 
+std::vector<naming::Diagnostic> LintCriticalNodes(
+    const std::vector<NodeSpec>& specs,
+    const std::vector<NodeDescription>& described) {
+  std::vector<naming::Diagnostic> findings;
+  const std::size_t count = std::min(specs.size(), described.size());
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto& spec = specs[i];
+    const auto& node = described[i];
+    const bool writes_targets =
+        std::any_of(node.declared.sources.begin(), node.declared.sources.end(),
+                    [](const auto& source) {
+                      return source.kind == event::SourceKind::SENDER &&
+                             naming::IsTargetLane(source.name);
+                    });
+    if (!spec.critical && (spec.owns_actuators || writes_targets)) {
+      findings.push_back(
+          {naming::Severity::ERROR,
+           node.roster_name.empty() ? spec.name : node.roster_name,
+           "critical=false is forbidden for an actuator owner or target-lane "
+           "producer"});
+    }
+  }
+  return findings;
+}
+
+namespace {
+
+bool IsTelemetryNodeTarget(std::string_view target) {
+  return target == "//talOS/telemetry:node" ||
+         target.ends_with("//talOS/telemetry:node");
+}
+
+std::string StripTelemetryPrefix(std::string_view message) {
+  constexpr std::string_view kPrefix = "telemetry: ";
+  if (message.starts_with(kPrefix)) message.remove_prefix(kPrefix.size());
+  return std::string{message};
+}
+
+// Builds the DeclaredGraph that a telemetry node observes (matching
+// DescribeGraph Pass 2): every answered non-reader node (excluding
+// `exclude_roster_name`) plus the static non-`telemetry`-role SENDER endpoints
+// of other answered graph readers (such as teleop's `/teleop/status`).
+// Sets `have_graph` to false only when no non-telemetry, non-Studio-bridge
+// roster member answered while at least one such member exists (e.g. before
+// binaries are built), and lists in `unanswered` every such member that did
+// not answer (the graph is then incomplete).
+introspect::DeclaredGraph DeclaredGraphForTelemetry(
+    const std::vector<NodeDescription>& described,
+    const std::vector<std::string>& telemetry_names,
+    std::string_view studio_bridge_target, bool& have_graph,
+    std::vector<std::string>& unanswered) {
+  auto is_telemetry = [&](std::string_view name) {
+    return std::ranges::find(telemetry_names, name) != telemetry_names.end();
+  };
+  const std::string_view bridge_suffix = studio_bridge_target.empty()
+                                             ? "//studio/bridge:studio_bridge"
+                                             : studio_bridge_target;
+  introspect::DeclaredGraph graph;
+  std::size_t answered_other = 0;
+  unanswered.clear();
+  for (const auto& node : described) {
+    if (is_telemetry(node.roster_name)) continue;
+    const bool is_studio_bridge =
+        node.roster_name == kStudioBridgeName &&
+        (node.target == bridge_suffix || node.target.ends_with(bridge_suffix) ||
+         node.declared.target == bridge_suffix ||
+         node.declared.target.ends_with(bridge_suffix));
+    if (!node.answered) {
+      if (!is_studio_bridge) unanswered.push_back(node.roster_name);
+      continue;
+    }
+    if (!is_studio_bridge) ++answered_other;
+    if (!node.declared.reads_graph) {
+      graph.push_back(node.declared);
+      continue;
+    }
+    introspect::Description static_pub = node.declared;
+    static_pub.sources.clear();
+    for (const auto& source : node.declared.sources) {
+      if (source.kind == event::SourceKind::SENDER &&
+          naming::Role(source.name) != "telemetry") {
+        static_pub.sources.push_back(source);
+      }
+    }
+    if (!static_pub.sources.empty()) {
+      graph.push_back(std::move(static_pub));
+    }
+  }
+  have_graph = (answered_other > 0) || unanswered.empty();
+  return graph;
+}
+
+// A finding that depends on the dictionary being complete: an error when
+// every node answered --describe, else a warning naming those that did not,
+// since their channels are missing from the dictionary it was checked against.
+naming::Diagnostic DictionaryFinding(
+    std::string subject, std::string message,
+    const std::vector<std::string>& unanswered) {
+  if (unanswered.empty()) {
+    return {naming::Severity::ERROR, std::move(subject), std::move(message)};
+  }
+  std::string names;
+  for (const std::string& name : unanswered) {
+    if (!names.empty()) names += ", ";
+    names += name;
+  }
+  message += " (a warning, not an error: the declared graph is incomplete, " +
+             names + " did not answer --describe)";
+  return {naming::Severity::WARNING, std::move(subject), std::move(message)};
+}
+
+}  // namespace
+
+std::vector<naming::Diagnostic> LintTelemetryConfig(
+    const config::RobotConfig& robot_config,
+    const std::vector<NodeDescription>& described) {
+  std::vector<naming::Diagnostic> findings;
+  std::vector<std::string> telemetry_subsystems;
+  if (const toml::table* subsystems =
+          robot_config.toml_data["subsystems"].as_table()) {
+    for (const auto& [key, value] : *subsystems) {
+      const auto* table = value.as_table();
+      if (table == nullptr) continue;
+      const std::string name{key.str()};
+      const std::string target = (*table)["node"].value_or(std::string{});
+      bool is_telemetry = IsTelemetryNodeTarget(target) ||
+                          (name == "telemetry" && table->contains("labels"));
+      if (!is_telemetry) {
+        for (const auto& node : described) {
+          if (node.roster_name == name &&
+              (IsTelemetryNodeTarget(node.target) ||
+               IsTelemetryNodeTarget(node.declared.target))) {
+            is_telemetry = true;
+            break;
+          }
+        }
+      }
+      if (is_telemetry) telemetry_subsystems.push_back(name);
+    }
+  }
+
+  bool have_graph = false;
+  std::vector<std::string> unanswered;
+  const introspect::DeclaredGraph graph = DeclaredGraphForTelemetry(
+      described, telemetry_subsystems, robot_config.studio.bridge, have_graph,
+      unanswered);
+
+  std::vector<std::vector<telemetry::ChannelDef>> dictionaries;
+  for (const std::string& name : telemetry_subsystems) {
+    std::vector<std::string> include_globs{"*"};
+    std::vector<std::string> exclude_globs;
+    bool globs_ok = true;
+    try {
+      include_globs = telemetry::ReadTelemetryGlobParam(
+          robot_config, name, "include", std::vector<std::string>{"*"});
+    } catch (const std::invalid_argument& error) {
+      findings.push_back(
+          {naming::Severity::ERROR, name, StripTelemetryPrefix(error.what())});
+      globs_ok = false;
+    }
+    try {
+      exclude_globs = telemetry::ReadTelemetryGlobParam(
+          robot_config, name, "exclude", std::vector<std::string>{});
+    } catch (const std::invalid_argument& error) {
+      findings.push_back(
+          {naming::Severity::ERROR, name, StripTelemetryPrefix(error.what())});
+      globs_ok = false;
+    }
+
+    std::vector<telemetry::LabelSpec> label_specs;
+    bool labels_parsed = false;
+    try {
+      label_specs = telemetry::ParseLabelSpecs(robot_config, name);
+      labels_parsed = true;
+    } catch (const std::invalid_argument& error) {
+      findings.push_back(
+          {naming::Severity::ERROR, name, StripTelemetryPrefix(error.what())});
+    }
+
+    if (!have_graph || !globs_ok) continue;
+    try {
+      std::vector<telemetry::ChannelDef> dict =
+          telemetry::BuildTelemetryDictionary(graph, include_globs,
+                                              exclude_globs);
+      if (labels_parsed) {
+        try {
+          telemetry::ApplyLabelSpecs(label_specs, dict);
+        } catch (const std::invalid_argument& error) {
+          findings.push_back(DictionaryFinding(
+              name, StripTelemetryPrefix(error.what()), unanswered));
+        }
+      }
+      telemetry::CheckDictionaryChannelCap(dict);
+      static_cast<void>(telemetry::MeasurePages(dict));
+      dictionaries.push_back(std::move(dict));
+    } catch (const std::exception& error) {
+      findings.push_back(DictionaryFinding(
+          name, StripTelemetryPrefix(error.what()), unanswered));
+    }
+  }
+
+  if (!robot_config.studio.dashboard.empty()) {
+    try {
+      const telemetry::DashboardLayout layout =
+          telemetry::ParseDashboardLayout(robot_config.studio.dashboard);
+      if (have_graph) {
+        if (!dictionaries.empty()) {
+          for (const auto& dict : dictionaries) {
+            try {
+              telemetry::CheckDashboardAgainstDictionary(layout, dict);
+            } catch (const telemetry::DashboardLayoutError& error) {
+              findings.push_back(
+                  DictionaryFinding("studio", error.what(), unanswered));
+            }
+          }
+        } else if (telemetry_subsystems.empty()) {
+          try {
+            const std::vector<telemetry::ChannelDef> dict =
+                telemetry::BuildTelemetryDictionary(graph, {"*"}, {});
+            telemetry::CheckDashboardAgainstDictionary(layout, dict);
+          } catch (const std::exception& error) {
+            findings.push_back(
+                DictionaryFinding("studio", error.what(), unanswered));
+          }
+        }
+      }
+    } catch (const telemetry::DashboardLayoutError& error) {
+      findings.push_back({naming::Severity::ERROR, "studio", error.what()});
+    }
+  }
+
+  return findings;
+}
+
 std::string DeclaredGraphPath(const LauncherOptions& options) {
   const std::filesystem::path dir =
       options.output_dir.empty()
@@ -547,8 +795,25 @@ std::vector<naming::Diagnostic> DescribeGraph(
   if (any_reader && !StopWithin(stop_fd, std::chrono::milliseconds{0})) {
     introspect::DeclaredGraph graph;
     for (const auto& described : out) {
-      if (described.answered && !described.declared.reads_graph) {
+      if (!described.answered) continue;
+      if (!described.declared.reads_graph) {
         graph.push_back(described.declared);
+        continue;
+      }
+      // Include Pass-1 static senders declared by graph-reading nodes (such as
+      // teleop's /teleop/status) so other graph readers (such as telemetry) can
+      // observe them without cycles; omit telemetry-role outputs and readers
+      // that declare no static senders.
+      introspect::Description static_pub = described.declared;
+      static_pub.sources.clear();
+      for (const auto& source : described.declared.sources) {
+        if (source.kind == event::SourceKind::SENDER &&
+            naming::Role(source.name) != "telemetry") {
+          static_pub.sources.push_back(source);
+        }
+      }
+      if (!static_pub.sources.empty()) {
+        graph.push_back(std::move(static_pub));
       }
     }
     const std::string graph_path = DeclaredGraphPath(options);
@@ -571,29 +836,37 @@ std::vector<naming::Diagnostic> DescribeGraph(
 
   std::vector<naming::NodeShape> shapes;
   std::vector<NodeSpec> missing;
+  auto critical_findings = LintCriticalNodes(specs, out);
+  probe_findings.insert(probe_findings.end(),
+                        std::make_move_iterator(critical_findings.begin()),
+                        std::make_move_iterator(critical_findings.end()));
   for (std::size_t i = 0; i < out.size(); ++i) {
     const auto& described = out[i];
     const auto& spec = specs[i];
-    const bool writes_targets =
-        std::any_of(described.declared.sources.begin(),
-                    described.declared.sources.end(), [](const auto& source) {
-                      return source.kind == event::SourceKind::SENDER &&
-                             naming::IsTargetLane(source.name);
-                    });
-    if (!spec.critical && (spec.owns_actuators || writes_targets)) {
-      probe_findings.push_back(
-          {naming::Severity::ERROR, described.roster_name,
-           "critical=false is forbidden for an actuator owner or target-lane "
-           "producer"});
-    }
     if (described.answered) {
       // The bridge is known by its roster name, `hardware_node`, which no
       // subsystem can take (Launcher::Run refuses two members of one name),
       // so a replacement bridge binary that describes itself by another
       // name still owns `hw`.
+      auto sources = described.declared.sources;
+      if (spec.name == kHardwareNodeName) {
+        // The launcher opens `/hw/status` as an observer reader at runtime to
+        // check `protocol_version_id` against its own build, consuming one
+        // RTMS reader slot; account for it in LintGraph's MAX_READERS check
+        // without altering `out` (graph.json / EndpointMismatch).
+        for (const auto& source : described.declared.sources) {
+          if (source.kind == event::SourceKind::SENDER &&
+              source.name == ::bridge::topics::kStatus) {
+            naming::SourceShape observer = source;
+            observer.kind = event::SourceKind::FETCHER;
+            observer.flags = naming::kSourceFlagObserver;
+            sources.push_back(std::move(observer));
+            break;
+          }
+        }
+      }
       shapes.push_back({described.declared.name, described.declared.target,
-                        described.declared.sources,
-                        spec.name == kHardwareNodeName});
+                        std::move(sources), spec.name == kHardwareNodeName});
       if (described.declared.name != described.roster_name) {
         probe_findings.push_back(
             {naming::Severity::WARNING, described.roster_name,
@@ -781,13 +1054,22 @@ std::vector<RTMSQueue> CreateSessionSegments(
 std::string GraphToJson(uint64_t session_id, const std::string& config_path,
                         const std::vector<NodeDescription>& described,
                         const std::vector<naming::Diagnostic>& diagnostics,
-                        const std::string& config_sha256) {
+                        const std::string& config_sha256,
+                        const std::vector<std::string>& can_buses) {
   std::ostringstream ss;
   ss << "{\n";
   ss << "  \"describe_version\": " << introspect::kDescribeVersion << ",\n";
   ss << "  \"session_id\": \"" << session_id << "\",\n";
   ss << "  \"config_path\": " << Quoted(config_path) << ",\n";
   ss << "  \"config_sha256\": " << Quoted(config_sha256) << ",\n";
+  if (!can_buses.empty()) {
+    ss << "  \"can_buses\": [";
+    for (std::size_t i = 0; i < can_buses.size(); ++i) {
+      if (i > 0) ss << ", ";
+      ss << Quoted(can_buses[i]);
+    }
+    ss << "],\n";
+  }
   ss << "  \"nodes\": [\n";
   for (std::size_t i = 0; i < described.size(); ++i) {
     const auto& node = described[i];

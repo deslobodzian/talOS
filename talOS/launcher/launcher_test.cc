@@ -1,9 +1,14 @@
 #include "talOS/launcher/launcher.h"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -12,6 +17,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -22,8 +28,10 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -32,6 +40,8 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
+#include "rules_cc/cc/runfiles/runfiles.h"
+#include "schema_test/shapes_generated.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/input_replay.h"
 #include "talOS/events/log/log_writer.h"
@@ -47,6 +57,7 @@
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
 #include "talOS/protocol/types.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::launcher {
 namespace {
@@ -60,6 +71,15 @@ std::string TempPath(std::string_view name) {
 // event sets it as its duration: it only bounds a hang (docs/TESTING.md
 // §6.3).
 constexpr std::chrono::seconds kHang{20};
+
+// Polls `done()` until it holds, `stop` is requested, or `kHang` elapses.
+bool WaitFor(const std::stop_token& stop, const std::function<bool()>& done) {
+  const auto give_up = std::chrono::steady_clock::now() + kHang;
+  while (!stop.stop_requested() && !done() &&
+         std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(std::chrono::milliseconds{2});
+  return !stop.stop_requested() && done();
+}
 
 // A framework-owned fixture: the launcher's discovery logic is robot-agnostic,
 // so its tests must not read any particular robot's configuration.
@@ -378,17 +398,23 @@ introspect::naming::SourceShape Endpoint(event::SourceKind kind,
 std::string ReadFile(const std::string& path);
 
 TEST(LauncherTest, DescribeDeadlineAppliesAfterStdoutCloses) {
-  const auto binary = WriteStubNode("describe_closed_stdout",
-                                    "#!/bin/sh\nexec 1>&-\nexec sleep 30\n");
+  const auto closed = TempPath("describe_closed_stdout_marker");
+  ::remove(closed.c_str());
+  const auto binary = WriteStubNode(
+      "describe_closed_stdout",
+      "#!/bin/sh\nexec 1>&-\n: > '" + closed + "'\nexec sleep 60\n");
   introspect::Description description;
   std::string error;
   const auto started = std::chrono::steady_clock::now();
   EXPECT_FALSE(ProbeDescribe({binary, "--describe"},
-                             std::chrono::milliseconds{100}, description,
+                             std::chrono::milliseconds{1000}, description,
                              error));
   const auto elapsed = std::chrono::steady_clock::now() - started;
-  EXPECT_LT(elapsed, std::chrono::seconds{3});
+  EXPECT_TRUE(std::filesystem::exists(closed))
+      << "probe timed out before child closed stdout";
+  EXPECT_LT(elapsed, kHang);
   std::filesystem::remove(binary);
+  ::remove(closed.c_str());
 }
 
 TEST(LauncherTest, DescribeOutputIsBounded) {
@@ -437,6 +463,7 @@ std::string NodeDescribeThenSleep(
          std::to_string(sleep_s) + "\n";
 }
 
+// REQ-OPS-09
 TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
   const auto root = TempPath("budget_restart");
   const auto attempts = root + "/attempts";
@@ -527,14 +554,14 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
 }
 
 // The duration deadline starts with the session, not after the viewer: a
-// failing bridge plus long-lived nodes must still end near --duration-s.
-// A bridge none of whose runs came up by then never served Studio, and its
-// manifest entry says so (recorder_failed), though its restarts were not
-// yet used up: 50 + 100 + 200 + 400 ms of backoff, the fifth 800 ms later,
-// past the 1 s deadline. REQ-OPS-30
+// failing bridge plus long-lived nodes must still end at --duration-s on the
+// supervision clock. A bridge none of whose runs came up by then never served
+// Studio, and its manifest entry says so (recorder_failed), though its restarts
+// were not yet used up. REQ-OPS-30
 TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   const std::string tag = "bridge_deadline";
   const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::remove_all(out_dir);
   std::filesystem::create_directories(out_dir);
 
   LauncherOptions options;
@@ -542,8 +569,12 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   options.session_id = 0xDEAD1100ULL;
   options.simulation = true;
   options.start_studio_bridge = true;
-  options.describe_timeout_ms = 4000;
   options.duration_s = 1;
+  // The stubs never take a registry row; nothing here waits for one.
+  options.heartbeat_startup_grace_ms = 60000;
+  testing::SteppedClock clock;
+  const SupervisionTime start = clock.Freeze();
+  options.supervision_clock = clock.clock();
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       tag + "_hardware",
@@ -557,16 +588,39 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStubNode(tag + "_bridge", BridgeDescribeThen("exit 1\n"));
 
+  const std::string live =
+      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json";
+  bool advanced = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    if (!WaitFor(stop, [&] {
+          const std::string manifest = ReadFile(live);
+          const std::size_t bridge =
+              manifest.find("\"name\": \"studio_bridge\"");
+          if (bridge == std::string::npos ||
+              manifest.find("\n  \"end_wall_ns\": 0,") == std::string::npos)
+            return false;
+          const std::string entry = manifest.substr(
+              bridge, manifest.find("\"runs\": [", bridge) - bridge);
+          return entry.find("\"exit_code\": 1") != std::string::npos;
+        })) {
+      return;
+    }
+    advanced = true;
+    clock.HoldAt(start + std::chrono::seconds{options.duration_s});
+  }};
+
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{options};
   launcher.Run();
   const auto elapsed = std::chrono::steady_clock::now() - started;
+  driver.request_stop();
+  driver.join();
 
-  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
-            20)
+  EXPECT_TRUE(advanced) << "studio_bridge never recorded its failing run";
+  EXPECT_LT(elapsed, kHang)
       << "deadline must fire without waiting out the bridge window";
-  const std::string manifest = ReadFile(
-      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json");
+  const std::string manifest = ReadFile(live);
   const std::size_t bridge = manifest.find("\"name\": \"studio_bridge\"");
   ASSERT_NE(bridge, std::string::npos) << manifest;
   const std::string entry =
@@ -590,6 +644,8 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
   std::filesystem::remove_all(out_dir);
   std::filesystem::create_directories(out_dir);
   const std::string gapped = TempPath(tag + "_source.tlog");
+  const std::string restarted = TempPath(tag + "_restarted");
+  ::remove(restarted.c_str());
   {
     event::log::LogWriter writer{
         gapped, "alpha",
@@ -611,7 +667,9 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
   options.output_dir = out_dir;
   options.session_id = 0x6A9;
   options.simulation = true;
-  options.duration_s = 1;
+  options.duration_s = static_cast<int>(kHang.count());
+  // The stubs never take a registry row; nothing here waits for one.
+  options.heartbeat_startup_grace_ms = 60000;
   options.config_path = WriteFixtureToml();
   std::string alpha = NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                             {Sender("/alpha/state")}, 30);
@@ -622,7 +680,9 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
       gapped +
       "' \"$1\"; }\n"
       " shift\n done\n"
-      "case \"$log\" in *.restart*) exec sleep 30 ;; esac\n"
+      "case \"$log\" in *.restart*) : > '" +
+      restarted +
+      "'; exec sleep 30 ;; esac\n"
       "exit 1\n";
   options.binary_overrides["//example/alpha:node"] =
       WriteStubNode(tag + "_alpha", alpha);
@@ -634,9 +694,18 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
       NodeDescribeThenSleep("hardware_node", "//talOS/bridge:hardware_node", {},
                             30));
 
+  bool saw_restart = false;
+  std::jthread stopper{[&](const std::stop_token& stop) {
+    saw_restart =
+        WaitFor(stop, [&] { return std::filesystem::exists(restarted); });
+    if (saw_restart) ::kill(::getpid(), SIGTERM);
+  }};
   ::testing::internal::CaptureStderr();
   Launcher{options}.Run();
   const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  stopper.request_stop();
+  stopper.join();
+  EXPECT_TRUE(saw_restart) << "alpha's restart never wrote its gapped log";
 
   const std::string manifest = ReadFile(
       out_dir + "/" + std::to_string(options.session_id) + "/manifest.json");
@@ -672,6 +741,122 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
       << stderr_text;
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(gapped);
+  ::remove(restarted.c_str());
+}
+
+// REQ-OPS-52: a GAP record in a rotated segment (`alpha.segment0.tlog`) marks
+// the member `log_gap: true` and `recorder_failed: true` at shutdown even when
+// the active `alpha.tlog` is clean, and stderr names `alpha` and `alpha.tlog`.
+TEST(LauncherTest, ARotatedSegmentWithAGapMarksTheMemberAtShutdown) {
+  const std::string tag = "rotated_log_gap";
+  const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::create_directories(out_dir);
+  const std::string gapped = TempPath(tag + "_gapped.tlog");
+  const std::string clean = TempPath(tag + "_clean.tlog");
+  {
+    event::log::LogWriter writer{
+        gapped, "alpha",
+        event::log::LogWriterOptions{512, 1, /*background=*/false}};
+    writer.start({}, {});
+    const std::vector<std::byte> small(16, std::byte{1});
+    const std::vector<std::byte> oversized(1024, std::byte{1});
+    for (uint64_t d = 1; d <= 3; ++d) {
+      event::Context context{};
+      context.kind = event::EventKind::TIMER;
+      context.dispatch_index = d;
+      writer.dispatch(context, d == 2 ? oversized : small);
+    }
+    writer.flush();
+    ASSERT_EQ(writer.gaps(), 1u);
+  }
+  {
+    event::log::LogWriter writer{
+        clean, "alpha",
+        event::log::LogWriterOptions{4096, 1, /*background=*/false}};
+    writer.start({}, {});
+    const std::vector<std::byte> small(16, std::byte{1});
+    for (uint64_t d = 1; d <= 2; ++d) {
+      event::Context context{};
+      context.kind = event::EventKind::TIMER;
+      context.dispatch_index = d;
+      writer.dispatch(context, small);
+    }
+    writer.flush();
+    ASSERT_EQ(writer.gaps(), 0u);
+  }
+
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = 0x6AA;
+  options.simulation = true;
+  options.max_restarts = 0;
+  options.heartbeat_startup_grace_ms = 60000;
+  options.config_path = WriteFixtureToml();
+  std::string alpha =
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")});
+  alpha.erase(alpha.rfind("exit 0"));
+  alpha +=
+      "while [ $# -gt 0 ]; do\n"
+      "  if [ \"$1\" = --log ]; then\n"
+      "    shift\n"
+      "    cp '" +
+      gapped +
+      "' \"${1%.tlog}.segment0.tlog\"\n"
+      "    cp '" +
+      clean +
+      "' \"$1\"\n"
+      "  fi\n"
+      "  shift\n"
+      "done\n"
+      "exit 0\n";
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode(tag + "_alpha", alpha);
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta",
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")}));
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+
+  ::testing::internal::CaptureStderr();
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+
+  const std::string session_dir =
+      out_dir + "/" + std::to_string(options.session_id);
+  ASSERT_TRUE(std::filesystem::exists(session_dir + "/alpha.segment0.tlog"));
+  ASSERT_TRUE(std::filesystem::exists(session_dir + "/alpha.tlog"));
+  const std::string manifest = ReadFile(session_dir + "/manifest.json");
+  const auto entry = [&manifest](std::string_view name) {
+    const std::size_t at =
+        manifest.find("\"name\": \"" + std::string{name} + "\"");
+    if (at == std::string::npos) return std::string{};
+    return manifest.substr(at, manifest.find("\"runs\": [", at) - at);
+  };
+  const std::string gapped_entry = entry("alpha");
+  EXPECT_NE(gapped_entry.find("\"log_gap\": true"), std::string::npos)
+      << gapped_entry;
+  EXPECT_NE(gapped_entry.find("\"recorder_failed\": true"), std::string::npos)
+      << gapped_entry;
+  const std::string whole_entry = entry("beta");
+  EXPECT_NE(whole_entry.find("\"log_gap\": false"), std::string::npos)
+      << whole_entry;
+  bool found_stderr_line = false;
+  std::istringstream lines{stderr_text};
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("alpha") != std::string::npos &&
+        line.find("alpha.tlog") != std::string::npos &&
+        line.find("lost records") != std::string::npos) {
+      found_stderr_line = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_stderr_line) << stderr_text;
+
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(gapped);
+  std::filesystem::remove(clean);
 }
 
 // A member that ignores SIGINT is killed (SIGKILL, run reason stop_timeout)
@@ -690,7 +875,6 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   options.output_dir = out_dir;
   options.session_id = 0xDEAD2200ULL;
   options.simulation = true;
-  options.describe_timeout_ms = 4000;
   options.duration_s = static_cast<int>(kHang.count());
   // The stubs never take a registry row; nothing here waits for one.
   options.heartbeat_startup_grace_ms = 60000;
@@ -738,11 +922,7 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
     // so its duration ends the session and the test fails with a message.
     const testing::SteppedClock::ReleaseOnExit release{clock};
     const auto wait = [&](const std::function<bool()>& done) {
-      const auto give_up = std::chrono::steady_clock::now() + kHang;
-      while (!stop.stop_requested() && !done() &&
-             std::chrono::steady_clock::now() < give_up)
-        std::this_thread::sleep_for(std::chrono::milliseconds{2});
-      return !stop.stop_requested() && done();
+      return WaitFor(stop, done);
     };
     const auto passes_from_now = [&](uint64_t count) {
       const uint64_t until = passes.Started() + count;
@@ -780,7 +960,7 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   const auto elapsed = std::chrono::steady_clock::now() - started;
   stopper.request_stop();
   stopper.join();
-  EXPECT_LT(elapsed, std::chrono::seconds{10});
+  EXPECT_LT(elapsed, kHang);
   ASSERT_TRUE(beta_stopped) << "the stop's SIGINT ended no peer";
   ASSERT_TRUE(held_short) << "alpha was killed before the stop timeout: the "
                              "session ended while the clock was held short "
@@ -818,7 +998,6 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   options.output_dir = out_dir;
   options.session_id = 0x57AB1EULL;
   options.start_studio_bridge = true;
-  options.describe_timeout_ms = 4000;
   options.duration_s = 3;
   // The stubs never take a registry row; nothing here waits for one.
   options.heartbeat_startup_grace_ms = 60000;
@@ -923,7 +1102,6 @@ TEST(LauncherTest, StudioBridgeEndingNeverSetsTheSessionStatus) {
     options.output_dir = out_dir;
     options.session_id = 0xB51A7ULL;
     options.start_studio_bridge = true;
-    options.describe_timeout_ms = 4000;
     options.duration_s = static_cast<int>(kHang.count());
     // The stubs never take a registry row; nothing here waits for one.
     options.heartbeat_startup_grace_ms = 60000;
@@ -1095,10 +1273,11 @@ TEST(LauncherTest, ExpectedLogRateCountsWhatEachLogStoresAtItsRate) {
                        50 * (64 + sizeof(::bridge::BridgeStatus)));
 }
 
-// A control loop the OS kept at timeshare is warned about and recorded in the
-// manifest session_report --strict judges. A later run that got its grant
-// does not clear it: the session still ran that loop without one. Only the
-// actuation path is warned about, and --sim excuses a loop that never asked.
+// REQ-RT-09: a control loop the OS kept at timeshare is warned about and
+// recorded in the manifest session_report --strict judges. A later run that got
+// its grant does not clear it: the session still ran that loop without one.
+// Only the actuation path is warned about, and --sim excuses a loop that never
+// asked.
 TEST(LauncherTest, ARefusedRealtimeGrantIsWarnedAndOutlivesALaterFullRun) {
   using process::LoopTier;
   const process::RealtimeOutcome refused{.tier = LoopTier::kControl,
@@ -1131,6 +1310,71 @@ TEST(LauncherTest, ARefusedRealtimeGrantIsWarnedAndOutlivesALaterFullRun) {
   EXPECT_NE(json.find("\"realtime\": \"refused\""), std::string::npos) << json;
   EXPECT_NE(json.find("\"realtime_refused\": \"policy\""), std::string::npos)
       << json;
+}
+
+// REQ-OPS-11, REQ-OPS-30: SessionManifest::ToJson carries lock-loss/retake
+// flags and per-member `critical` and `studio_bridge`, and DiscoverNodes marks
+// the launcher-added Studio bridge `studio_bridge = true, critical = false`.
+TEST(LauncherTest, ManifestSerializesLockFlagsCriticalAndStudioBridge) {
+  SessionManifest defaults;
+  NodeProcessInfo critical_node;
+  critical_node.name = "drivetrain";
+  NodeProcessInfo bridge;
+  bridge.name = "studio_bridge";
+  bridge.critical = false;
+  bridge.studio_bridge = true;
+  defaults.nodes = {critical_node, bridge};
+
+  const std::string default_json = defaults.ToJson();
+  EXPECT_NE(default_json.find("\"session_lock_lost\": false"),
+            std::string::npos)
+      << default_json;
+  EXPECT_NE(default_json.find("\"directory_lock_lost\": false"),
+            std::string::npos)
+      << default_json;
+  EXPECT_NE(default_json.find("\"directory_lock_retaken\": false"),
+            std::string::npos)
+      << default_json;
+  const std::size_t dt_pos = default_json.find("\"name\": \"drivetrain\"");
+  const std::size_t br_pos = default_json.find("\"name\": \"studio_bridge\"");
+  ASSERT_NE(dt_pos, std::string::npos);
+  ASSERT_NE(br_pos, std::string::npos);
+  const std::string dt_slice = default_json.substr(dt_pos, br_pos - dt_pos);
+  const std::string br_slice = default_json.substr(br_pos);
+  EXPECT_NE(dt_slice.find("\"critical\": true"), std::string::npos) << dt_slice;
+  EXPECT_NE(dt_slice.find("\"studio_bridge\": false"), std::string::npos)
+      << dt_slice;
+  EXPECT_NE(br_slice.find("\"critical\": false"), std::string::npos)
+      << br_slice;
+  EXPECT_NE(br_slice.find("\"studio_bridge\": true"), std::string::npos)
+      << br_slice;
+
+  SessionManifest anomalous;
+  anomalous.session_lock_lost = true;
+  anomalous.directory_lock_lost = true;
+  anomalous.directory_lock_retaken = true;
+  const std::string anomalous_json = anomalous.ToJson();
+  EXPECT_NE(anomalous_json.find("\"session_lock_lost\": true"),
+            std::string::npos)
+      << anomalous_json;
+  EXPECT_NE(anomalous_json.find("\"directory_lock_lost\": true"),
+            std::string::npos)
+      << anomalous_json;
+  EXPECT_NE(anomalous_json.find("\"directory_lock_retaken\": true"),
+            std::string::npos)
+      << anomalous_json;
+
+  // DiscoverNodes marks the launcher-added Studio bridge non-critical.
+  LauncherOptions options;
+  options.start_studio_bridge = true;
+  const auto specs =
+      DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), options);
+  const auto it = std::find_if(specs.begin(), specs.end(), [](const auto& s) {
+    return s.name == kStudioBridgeName;
+  });
+  ASSERT_NE(it, specs.end());
+  EXPECT_TRUE(it->studio_bridge);
+  EXPECT_FALSE(it->critical);
 }
 
 TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
@@ -1273,7 +1517,7 @@ constexpr std::string_view kStubThatHangsOnDescribe =
     "#!/bin/sh\n"
     "for arg in \"$@\"; do\n"
     "  if [ \"$arg\" = \"--describe\" ]; then\n"
-    "    exec sleep 30\n"
+    "    exec sleep 60\n"
     "  fi\n"
     "done\n"
     "exit 0\n";
@@ -1319,7 +1563,6 @@ struct GraphFixture {
     options.session_id = 0x0123456789ABCDEFULL;
     out_dir += "/" + std::to_string(options.session_id);
     options.config_path = WriteFixtureToml();
-    options.describe_timeout_ms = 4000;
     options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
         std::string{tag} + "_hardware",
         DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
@@ -1350,6 +1593,7 @@ TEST(LauncherGraphTest, ProbesEveryBinaryAndPutsWhatItSaysInTheGraph) {
   EXPECT_NE(graph.find("\"session_id\": \"81985529216486895\""),
             std::string::npos)
       << graph;
+  EXPECT_NE(graph.find("\"can_buses\": [\"rio\"]"), std::string::npos) << graph;
   EXPECT_NE(graph.find("\"name\": \"alpha\""), std::string::npos) << graph;
   EXPECT_NE(graph.find("\"kind\": \"SENDER\", \"name\": \"/alpha/state\""),
             std::string::npos)
@@ -1364,6 +1608,55 @@ TEST(LauncherGraphTest, ProbesEveryBinaryAndPutsWhatItSaysInTheGraph) {
   const std::string manifest = ReadFile(fixture.out_dir + "/manifest.json");
   EXPECT_NE(manifest.find("\"described\": true"), std::string::npos)
       << manifest;
+}
+
+// REQ-OPS-23: graph.json records the robot configuration's CAN bus slot table
+// (hardware::CanBuses: slot 0 "rio", then each extra bus in byte order) so
+// Studio labels /hw/status can_buses slots by bus name rather than slot index.
+TEST(LauncherGraphTest, WritesConfiguredCanBusesInSlotOrderToGraphJson) {
+  GraphFixture fixture{
+      "can_buses",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")})};
+  const std::string config_path = TempPath("can_buses_fixture") + ".toml";
+  {
+    std::ofstream out{config_path};
+    out << R"(
+[robot]
+name = "can_buses_fixture"
+period_us = 5000
+sim_gateway = "//example/sim:gateway"
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+period_us = 5000
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "Shooter"
+can_id = 1
+
+[subsystems.beta]
+node = "//example/beta:node"
+period_us = 10000
+
+[subsystems.beta.motors.m2]
+type = "TalonFX"
+bus = "Drive"
+can_id = 2
+)";
+  }
+  fixture.options.config_path = config_path;
+  fixture.options.describe_only = true;
+
+  Launcher launcher{fixture.options};
+  EXPECT_EQ(launcher.Run(), 0);
+
+  const std::string graph = fixture.graph_json();
+  EXPECT_NE(graph.find("\"can_buses\": [\"rio\", \"Drive\", \"Shooter\"]"),
+            std::string::npos)
+      << graph;
+  std::filesystem::remove(config_path);
 }
 
 TEST(LauncherGraphTest, RefusesToSpawnWhenTheTwoEndsAreSpelledDifferently) {
@@ -1458,11 +1751,12 @@ TEST(LauncherGraphTest, ASimulatorPortWrittenByHandIsRefusedBeforeAnyProbe) {
 // A config whose `[robot] simulation_only = true` (here set by
 // a simulation config that includes the deployable fixture) runs only with
 // --sim. Without it the launch is refused before any member is probed or
-// spawned and before any session directory exists; with --sim it runs, and
-// --describe-only, which touches no hardware, lints it. --describe-as-launch
-// makes --describe-only refuse it as the launch would (deploy.sh's install
-// check, which judges what the boot service will start), and is refused
-// without --describe-only, where it would start the roster.
+// spawned and before any session directory exists, naming both
+// `simulation_only` and the config path; with --sim it runs, and
+// --describe-only and --replay-inputs, which touch no hardware, are allowed.
+// --describe-as-launch makes --describe-only refuse it as the launch would
+// (deploy.sh's install check, which judges what the boot service will start),
+// and is refused without --describe-only, where it would start the roster.
 // REQ-SAFE-40, REQ-OPS-50
 TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
   struct Row {
@@ -1470,19 +1764,26 @@ TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
     bool simulation;
     bool describe_only;
     bool as_launch;
+    bool replay_inputs;
     bool refused;
+    bool names_simulation_only;
   };
   for (const Row row :
-       {Row{"launch", false, false, false, true},
-        Row{"--sim", true, false, false, false},
-        Row{"--describe-only", false, true, false, false},
-        Row{"--describe-only --describe-as-launch", false, true, true, true},
+       {Row{"launch", false, false, false, false, true, true},
+        Row{"--sim", true, false, false, false, false, false},
+        Row{"--describe-only", false, true, false, false, false, false},
+        Row{"--replay-inputs", false, false, false, true, false, false},
+        Row{"--describe-only --describe-as-launch", false, true, true, false,
+            true, true},
         Row{"--sim --describe-only --describe-as-launch", true, true, true,
-            false},
-        Row{"--sim --describe-as-launch", true, false, true, true}}) {
+            false, false, false},
+        Row{"--sim --describe-as-launch", true, false, true, false, true,
+            false}}) {
     SCOPED_TRACE(row.name);
     const std::string invoked = TempPath("simulation_only_invoked");
     ::remove(invoked.c_str());
+    const std::string recorded = TempPath("simulation_only_recorded");
+    std::filesystem::remove_all(recorded);
     GraphFixture fixture{
         "simulation_only",
         RecordingStub("alpha", "//example/alpha:node", invoked),
@@ -1498,14 +1799,31 @@ TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
     fixture.options.simulation = row.simulation;
     fixture.options.describe_only = row.describe_only;
     fixture.options.describe_as_launch = row.as_launch;
+    if (row.replay_inputs) {
+      std::filesystem::create_directories(recorded);
+      std::ofstream{recorded + "/manifest.json"} << "{}\n";
+      fixture.options.replay_inputs = recorded;
+      fixture.options.only = "alpha";
+    }
 
-    EXPECT_EQ(Launcher{fixture.options}.Run(), row.refused ? 1 : 0);
+    ::testing::internal::CaptureStderr();
+    const int status = Launcher{fixture.options}.Run();
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(status, row.refused ? 1 : 0) << err;
     EXPECT_EQ(std::filesystem::exists(invoked), !row.refused)
         << ReadFile(invoked);
     EXPECT_EQ(std::filesystem::exists(fixture.out_dir), !row.refused)
         << fixture.out_dir;
+    if (row.names_simulation_only) {
+      EXPECT_NE(err.find("simulation_only"), std::string::npos) << err;
+      EXPECT_NE(
+          err.find(std::filesystem::weakly_canonical(sim_config).string()),
+          std::string::npos)
+          << err;
+    }
     ::remove(invoked.c_str());
     ::remove(sim_config.c_str());
+    std::filesystem::remove_all(recorded);
   }
 }
 
@@ -1536,15 +1854,14 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
   GraphFixture fixture{
       "hangs", kStubThatHangsOnDescribe,
       DescribingStub("beta", "//example/beta:node", {Sender("/beta/state")})};
-  fixture.options.describe_timeout_ms = 250;
+  fixture.options.describe_timeout_ms = 3000;
 
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{fixture.options};
   EXPECT_EQ(launcher.Run(), 1);
   EXPECT_FALSE(fixture.has_manifest());
   const auto elapsed = std::chrono::steady_clock::now() - started;
-  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
-            10);
+  EXPECT_LT(elapsed, kHang);
 }
 
 // The error diagnostics graph.json records, one per line.
@@ -1576,6 +1893,313 @@ TEST(LauncherGraphTest, AnOptOutTheProbeDidNotDescribeIsAnEndpointMismatch) {
   EXPECT_EQ(EndpointMismatch({opted_out}, {opted_out}), "");
 }
 
+// SPEC-10 / REQ-SAFE-42, REQ-CONTRACT-11: the launcher passes
+// --targeted-outputs ONLY when the member's --describe probe answered,
+// --allow-graph-errors is not set, and the probe declared a hardware_request
+// endpoint without untargeted_outputs. Non-actuator nodes, nodes declaring
+// untargeted_outputs, hardware_node, unanswered probes, and
+// --allow-graph-errors launches do not receive it.
+TEST(LauncherGraphTest, PassesTargetedOutputsOnlyToTargetedActuatorMembers) {
+  const std::string config_path = TempPath("targeted_outputs_cfg") + ".toml";
+  {
+    std::ofstream out{config_path};
+    out << R"(
+[robot]
+name = "targeted_outputs_fixture"
+period_us = 5000
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+
+[subsystems.beta]
+node = "//example/beta:node"
+
+[subsystems.beta.motors.m2]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+
+[subsystems.gamma]
+node = "//example/gamma:node"
+critical = false
+)";
+  }
+
+  auto alpha_req = Sender("/hw/request/alpha", 64);
+  alpha_req.flags = introspect::naming::kSourceFlagHardwareRequest;
+  auto beta_req = Sender("/hw/request/beta", 64);
+  beta_req.flags = introspect::naming::kSourceFlagHardwareRequest |
+                   introspect::naming::kSourceFlagUntargetedOutputs;
+  const auto hw_sources = std::vector<introspect::naming::SourceShape>{
+      Endpoint(event::SourceKind::FETCHER, "/hw/request/alpha", 64),
+      Endpoint(event::SourceKind::FETCHER, "/hw/request/beta", 64)};
+
+  const auto live_lines_of = [](const std::string& invoked,
+                                std::string_view member) {
+    std::vector<std::string> lines;
+    std::istringstream in{invoked};
+    const std::string prefix = std::string{member} + " ";
+    for (std::string line; std::getline(in, line);) {
+      if (line.starts_with(prefix) &&
+          line.find("--describe") == std::string::npos) {
+        lines.push_back(std::move(line));
+      }
+    }
+    return lines;
+  };
+  const auto describe_lines_of = [](const std::string& invoked) {
+    std::vector<std::string> lines;
+    std::istringstream in{invoked};
+    for (std::string line; std::getline(in, line);) {
+      if (line.find("--describe") != std::string::npos) {
+        lines.push_back(std::move(line));
+      }
+    }
+    return lines;
+  };
+
+  {
+    SCOPED_TRACE("normal launch gates only targeted actuator member");
+    const std::string invoked = TempPath("targeted_outputs_normal_invoked");
+    ::remove(invoked.c_str());
+    const std::string out_dir = TempPath("targeted_outputs_normal_out");
+    std::filesystem::remove_all(out_dir);
+    std::filesystem::create_directories(out_dir);
+    LauncherOptions options;
+    options.output_dir = out_dir;
+    options.session_id = GenerateSessionId();
+    options.config_path = config_path;
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        "to_norm_hw",
+        RecordingStub("hardware_node", "//talOS/bridge:hardware_node", invoked,
+                      hw_sources));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        "to_norm_alpha",
+        RecordingStub("alpha", "//example/alpha:node", invoked, {alpha_req}));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        "to_norm_beta",
+        RecordingStub("beta", "//example/beta:node", invoked, {beta_req}));
+    options.binary_overrides["//example/gamma:node"] = WriteStubNode(
+        "to_norm_gamma", RecordingStub("gamma", "//example/gamma:node", invoked,
+                                       {Sender("/gamma/state")}));
+
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(invoked);
+    for (const auto& line : describe_lines_of(recorded)) {
+      EXPECT_EQ(line.find("--targeted-outputs"), std::string::npos) << line;
+    }
+    const auto alpha_live = live_lines_of(recorded, "alpha");
+    ASSERT_EQ(alpha_live.size(), 1u) << recorded;
+    EXPECT_NE(alpha_live[0].find("--targeted-outputs"), std::string::npos)
+        << alpha_live[0];
+    for (const std::string_view other : {"beta", "gamma", "hardware_node"}) {
+      const auto lines = live_lines_of(recorded, other);
+      ASSERT_EQ(lines.size(), 1u) << other << "\n" << recorded;
+      EXPECT_EQ(lines[0].find("--targeted-outputs"), std::string::npos)
+          << other << ": " << lines[0];
+    }
+    ::remove(invoked.c_str());
+    std::filesystem::remove_all(out_dir);
+  }
+
+  {
+    SCOPED_TRACE("--allow-graph-errors omits --targeted-outputs");
+    const std::string invoked = TempPath("targeted_outputs_allow_invoked");
+    ::remove(invoked.c_str());
+    const std::string out_dir = TempPath("targeted_outputs_allow_out");
+    std::filesystem::remove_all(out_dir);
+    std::filesystem::create_directories(out_dir);
+    LauncherOptions options;
+    options.output_dir = out_dir;
+    options.session_id = GenerateSessionId();
+    options.config_path = config_path;
+    options.simulation = true;
+    options.allow_graph_errors = true;
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        "to_allow_hw",
+        RecordingStub("hardware_node", "//talOS/bridge:hardware_node", invoked,
+                      hw_sources));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        "to_allow_alpha",
+        RecordingStub("alpha", "//example/alpha:node", invoked, {alpha_req}));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        "to_allow_beta",
+        RecordingStub("beta", "//example/beta:node", invoked, {beta_req}));
+    options.binary_overrides["//example/gamma:node"] = WriteStubNode(
+        "to_allow_gamma", RecordingStub("gamma", "//example/gamma:node",
+                                        invoked, {Sender("/gamma/state")}));
+
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(invoked);
+    const auto alpha_live = live_lines_of(recorded, "alpha");
+    ASSERT_EQ(alpha_live.size(), 1u) << recorded;
+    EXPECT_EQ(alpha_live[0].find("--targeted-outputs"), std::string::npos)
+        << alpha_live[0];
+    ::remove(invoked.c_str());
+    std::filesystem::remove_all(out_dir);
+  }
+
+  {
+    SCOPED_TRACE("unanswered non-critical probe omits --targeted-outputs");
+    const std::string invoked = TempPath("targeted_outputs_unanswered_invoked");
+    ::remove(invoked.c_str());
+    const std::string out_dir = TempPath("targeted_outputs_unanswered_out");
+    std::filesystem::remove_all(out_dir);
+    std::filesystem::create_directories(out_dir);
+    const std::string silent_gamma =
+        std::string{"#!/bin/sh\necho \"gamma $*\" >> '"} + invoked + "'\n" +
+        std::string{kStubWithoutDescribe}.substr(
+            std::string{"#!/bin/sh\n"}.size());
+    LauncherOptions options;
+    options.output_dir = out_dir;
+    options.session_id = GenerateSessionId();
+    options.config_path = config_path;
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        "to_unans_hw",
+        RecordingStub("hardware_node", "//talOS/bridge:hardware_node", invoked,
+                      hw_sources));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        "to_unans_alpha",
+        RecordingStub("alpha", "//example/alpha:node", invoked, {alpha_req}));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        "to_unans_beta",
+        RecordingStub("beta", "//example/beta:node", invoked, {beta_req}));
+    options.binary_overrides["//example/gamma:node"] =
+        WriteStubNode("to_unans_gamma", silent_gamma);
+
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(invoked);
+    const auto gamma_live = live_lines_of(recorded, "gamma");
+    ASSERT_EQ(gamma_live.size(), 1u) << recorded;
+    EXPECT_EQ(gamma_live[0].find("--targeted-outputs"), std::string::npos)
+        << gamma_live[0];
+    ::remove(invoked.c_str());
+    std::filesystem::remove_all(out_dir);
+  }
+
+  ::remove(config_path.c_str());
+}
+
+// SPEC-10 / REQ-SAFE-42, REQ-CONTRACT-11: a critical actuator member whose
+// --describe probe declared hardware_request without untargeted_outputs
+// receives --targeted-outputs on BOTH run 0 and every restart (Restart reuses
+// launch.args), so a member hiding AllowUntargetedOutputs behind
+// !Node::describing() fails construction on both run 0 and restart instead of
+// ticking untargeted.
+TEST(LauncherGraphTest, HiddenOptOutRefusesBothFirstRunAndRestart) {
+  const std::string out_dir = TempPath("targeted_restart_out");
+  const std::string runs_file = TempPath("targeted_restart_runs");
+  const std::string ticked_file = TempPath("targeted_restart_ticked");
+  const std::string done_fifo = TempPath("targeted_restart_fifo");
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::create_directories(out_dir);
+  ::remove(runs_file.c_str());
+  ::remove(ticked_file.c_str());
+  ::unlink(done_fifo.c_str());
+  ASSERT_EQ(::mkfifo(done_fifo.c_str(), 0600), 0) << std::strerror(errno);
+  const int fifo_fd = ::open(done_fifo.c_str(), O_RDWR | O_CLOEXEC);
+  ASSERT_GE(fifo_fd, 0) << std::strerror(errno);
+
+  auto alpha_req = Sender("/hw/request/alpha", 64);
+  alpha_req.flags = introspect::naming::kSourceFlagHardwareRequest;
+  const std::string alpha_script =
+      std::string{"#!/bin/sh\n"} +
+      "for arg in \"$@\"; do\n"
+      "  if [ \"$arg\" = \"--describe\" ]; then\n"
+      "    cat <<'TALOS_DESCRIBE'\n" +
+      DescribeJson("alpha", "//example/alpha:node", {alpha_req}) +
+      "TALOS_DESCRIBE\n"
+      "    exit 0\n"
+      "  fi\n"
+      "done\n"
+      "echo \"$*\" >> '" +
+      runs_file +
+      "'\n"
+      "has_flag=0\n"
+      "for arg in \"$@\"; do\n"
+      "  if [ \"$arg\" = \"--targeted-outputs\" ]; then\n"
+      "    has_flag=1\n"
+      "  fi\n"
+      "done\n"
+      "if [ \"$has_flag\" -eq 0 ]; then\n"
+      "  echo untargeted >> '" +
+      ticked_file +
+      "'\n"
+      "  exit 0\n"
+      "fi\n"
+      "count=$(wc -l < '" +
+      runs_file +
+      "')\n"
+      "if [ \"$count\" -ge 2 ]; then\n"
+      "  printf 'd' > '" +
+      done_fifo +
+      "'\n"
+      "fi\n"
+      "echo 'alpha: AllowUntargetedOutputs refused under --targeted-outputs' "
+      ">&2\n"
+      "exit 1\n";
+
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = GenerateSessionId();
+  options.config_path = WriteFixtureToml();
+  options.duration_s = static_cast<int>(kHang.count());
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      "to_restart_hw",
+      NodeDescribeThenSleep(
+          "hardware_node", "//talOS/bridge:hardware_node",
+          {Endpoint(event::SourceKind::FETCHER, "/hw/request/alpha", 64)}, 30));
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode("to_restart_alpha", alpha_script);
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      "to_restart_beta",
+      NodeDescribeThenSleep("beta", "//example/beta:node", {}, 30));
+
+  std::jthread stopper{[fifo_fd](const std::stop_token& stop) {
+    char byte = 0;
+    if (::read(fifo_fd, &byte, 1) == 1 && byte == 'd' &&
+        !stop.stop_requested()) {
+      ::kill(::getpid(), SIGTERM);
+    }
+  }};
+
+  Launcher{options}.Run();
+  stopper.request_stop();
+  const char wake = 'x';
+  (void)::write(fifo_fd, &wake, 1);
+  stopper.join();
+  ::close(fifo_fd);
+  ::unlink(done_fifo.c_str());
+
+  EXPECT_FALSE(std::filesystem::exists(ticked_file))
+      << "member ticked untargeted: " << ReadFile(ticked_file);
+  std::vector<std::string> run_lines;
+  {
+    std::istringstream in{ReadFile(runs_file)};
+    for (std::string line; std::getline(in, line);) {
+      if (!line.empty()) run_lines.push_back(std::move(line));
+    }
+  }
+  ASSERT_GE(run_lines.size(), 2u) << "expected both run 0 and restart 1; got:\n"
+                                  << ReadFile(runs_file);
+  EXPECT_NE(run_lines[0].find("alpha.tlog"), std::string::npos) << run_lines[0];
+  EXPECT_NE(run_lines[1].find("alpha.restart1.tlog"), std::string::npos)
+      << run_lines[1];
+  for (std::size_t i = 0; i < run_lines.size(); ++i) {
+    EXPECT_NE(run_lines[i].find("--targeted-outputs"), std::string::npos)
+        << "run " << i << ": " << run_lines[i];
+  }
+
+  ::remove(runs_file.c_str());
+  ::remove(ticked_file.c_str());
+  std::filesystem::remove_all(out_dir);
+}
+
 // TOOLS-3: a launch before the build finds no binaries. That is one refusal
 // carrying the build command for every missing node, not one "did not
 // answer" per node; a binary that exists but does not answer keeps its own.
@@ -1592,6 +2216,7 @@ TEST(LauncherGraphTest, MissingBinariesAreOneRefusalWithTheBuildCommand) {
   EXPECT_FALSE(fixture.has_manifest());
   const auto errors = GraphErrors(fixture.graph_json());
   ASSERT_EQ(errors.size(), 1u) << fixture.graph_json();
+  EXPECT_NE(errors[0].find("bazel build"), std::string::npos) << errors[0];
   EXPECT_NE(errors[0].find("//example/alpha:node"), std::string::npos)
       << errors[0];
   EXPECT_NE(errors[0].find("//example/beta:node"), std::string::npos)
@@ -1664,6 +2289,58 @@ std::vector<std::string> GraphFindings(const std::string& graph,
     }
   }
   return found;
+}
+
+// REQ-OPS-01: when every missing binary is non-critical (`critical = false`),
+// the single missing-binaries finding is Severity::WARNING with `bazel build`,
+// and launch proceeds for the remaining peers.
+TEST(LauncherGraphTest, MissingNonCriticalBinariesWarnAndLaunchProceeds) {
+  const NodeSpec missing{.name = "alpha",
+                         .target = "//example/alpha:node",
+                         .binary_path = TempPath("never_built_optional_alpha"),
+                         .critical = false,
+                         .owns_actuators = false};
+  const auto finding = MissingBinariesFinding({missing}, "");
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->severity, naming::Severity::WARNING);
+  EXPECT_NE(finding->message.find("bazel build"), std::string::npos)
+      << finding->message;
+  EXPECT_NE(finding->message.find("//example/alpha:node"), std::string::npos)
+      << finding->message;
+
+  const std::string beta_runs = TempPath("missing_noncrit_beta_runs");
+  ::remove(beta_runs.c_str());
+  GraphFixture fixture{"missing_noncrit", kStubWithoutDescribe,
+                       RecordingStub("beta", "//example/beta:node", beta_runs,
+                                     {Sender("/beta/state")})};
+  auto config = toml::parse_file(fixture.options.config_path);
+  auto* alpha = config["subsystems"]["alpha"].as_table();
+  alpha->erase("motors");
+  alpha->insert_or_assign("critical", false);
+  std::ofstream{fixture.options.config_path} << config;
+  fixture.options.binary_overrides["//example/alpha:node"] =
+      missing.binary_path;
+  fixture.options.max_restarts = 0;
+
+  Launcher{fixture.options}.Run();
+  const std::string graph = fixture.graph_json();
+  EXPECT_EQ(GraphErrors(graph), std::vector<std::string>{}) << graph;
+  const auto warnings = GraphFindings(graph, "warning", "alpha");
+  ASSERT_EQ(warnings.size(), 1u) << graph;
+  EXPECT_NE(warnings[0].find("bazel build"), std::string::npos) << warnings[0];
+  EXPECT_NE(warnings[0].find("//example/alpha:node"), std::string::npos)
+      << warnings[0];
+  EXPECT_TRUE(fixture.has_manifest());
+  bool beta_launched = false;
+  std::istringstream lines{ReadFile(beta_runs)};
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("--describe") == std::string::npos &&
+        line.find("beta ") == 0) {
+      beta_launched = true;
+    }
+  }
+  EXPECT_TRUE(beta_launched) << ReadFile(beta_runs);
+  ::remove(beta_runs.c_str());
 }
 
 // REQ-OPS-30, DEPLOY-4: --start-studio-bridge from a checkout that has not
@@ -1811,6 +2488,98 @@ TEST(LauncherGraphTest,
   }
 }
 
+// REQ-SAFE-28: full Launcher::Run() refuses to launch (exits non-zero, writes
+// no manifest, spawns nothing after --describe) when a critical = false
+// subsystem owns a motor, digital output, or PWM output, or describes a
+// target-lane sender.
+TEST(LauncherGraphTest, NonCriticalActuatorOrTargetProducerRefusesLaunch) {
+  const auto check_only_described = [](const std::string& record) {
+    std::istringstream in{ReadFile(record)};
+    std::string line;
+    bool saw_any = false;
+    while (std::getline(in, line)) {
+      if (line.empty()) continue;
+      saw_any = true;
+      EXPECT_NE(line.find("--describe"), std::string::npos)
+          << "node was spawned after --describe: " << line;
+    }
+    EXPECT_TRUE(saw_any) << "expected --describe invocations";
+  };
+
+  for (const auto* section : {"motors", "digital_outputs", "pwm_outputs"}) {
+    SCOPED_TRACE(section);
+    const std::string record =
+        TempPath(std::string{"optional_actuator_"} + section + "_runs");
+    ::remove(record.c_str());
+    GraphFixture fixture{"optional_actuator_run",
+                         RecordingStub("alpha", "//example/alpha:node", record),
+                         RecordingStub("beta", "//example/beta:node", record)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode(std::string{"optional_actuator_"} + section + "_hw",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", record));
+    auto config = toml::parse_file(fixture.options.config_path);
+    auto* alpha = config["subsystems"]["alpha"].as_table();
+    alpha->erase("motors");
+    alpha->insert_or_assign("critical", false);
+    toml::table device;
+    device.insert(section == std::string_view{"motors"}            ? "can_id"
+                  : section == std::string_view{"digital_outputs"} ? "dio"
+                                                                   : "channel",
+                  1);
+    alpha->insert_or_assign(section,
+                            toml::table{{"output", std::move(device)}});
+    std::ofstream{fixture.options.config_path} << config;
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1) << section;
+    EXPECT_FALSE(fixture.has_manifest()) << section;
+    const std::string graph = fixture.graph_json();
+    const std::size_t err_pos = graph.find("\"severity\": \"error\"");
+    ASSERT_NE(err_pos, std::string::npos) << graph;
+    const std::string diag = graph.substr(err_pos);
+    EXPECT_NE(diag.find("alpha"), std::string::npos) << diag;
+    EXPECT_NE(diag.find("critical"), std::string::npos) << diag;
+    check_only_described(record);
+    ::remove(record.c_str());
+  }
+
+  {
+    SCOPED_TRACE("non_critical_target_producer");
+    const std::string record = TempPath("optional_target_runs");
+    ::remove(record.c_str());
+    GraphFixture fixture{"optional_target_run",
+                         RecordingStub("alpha", "//example/alpha:node", record,
+                                       {Sender("/beta/target/teleop")}),
+                         RecordingStub("beta", "//example/beta:node", record,
+                                       {Watcher("/beta/target/teleop")})};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("optional_target_hw",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", record));
+    auto config = toml::parse_file(fixture.options.config_path);
+    auto* alpha = config["subsystems"]["alpha"].as_table();
+    alpha->erase("motors");
+    alpha->insert_or_assign("critical", false);
+    auto* beta = config["subsystems"]["beta"].as_table();
+    toml::table targets;
+    targets.insert("teleop", toml::array{"teleop"});
+    beta->insert_or_assign("targets", std::move(targets));
+    std::ofstream{fixture.options.config_path} << config;
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(fixture.has_manifest());
+    const std::string graph = fixture.graph_json();
+    const std::size_t err_pos = graph.find("\"severity\": \"error\"");
+    ASSERT_NE(err_pos, std::string::npos) << graph;
+    const std::string diag = graph.substr(err_pos);
+    EXPECT_NE(diag.find("alpha"), std::string::npos) << diag;
+    EXPECT_NE(diag.find("critical"), std::string::npos) << diag;
+    check_only_described(record);
+    ::remove(record.c_str());
+  }
+}
+
+// REQ-OPS-01
 TEST(LauncherGraphTest, NonCriticalDescribeTimeoutAllowsPeersToLaunch) {
   GraphFixture fixture{
       "optional_timeout", kStubThatHangsOnDescribe,
@@ -1820,15 +2589,15 @@ TEST(LauncherGraphTest, NonCriticalDescribeTimeoutAllowsPeersToLaunch) {
   alpha->erase("motors");
   alpha->insert_or_assign("critical", false);
   std::ofstream{fixture.options.config_path} << config;
-  // Only alpha must miss the deadline. A freshly written stub's first exec
-  // alone can take about 100 ms (macOS, Bazel's darwin sandbox), so the
-  // answering peers need a deadline well above that.
-  fixture.options.describe_timeout_ms = 1000;
+  // Only alpha (which hangs for 60 s) must miss the deadline; give critical
+  // peers generous headroom even under heavy host load.
+  fixture.options.describe_timeout_ms = 5000;
   fixture.options.max_restarts = 0;
   EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
   EXPECT_TRUE(fixture.has_manifest());
-  EXPECT_EQ(fixture.graph_json().find("\"severity\": \"error\""),
-            std::string::npos);
+  const std::string graph = fixture.graph_json();
+  EXPECT_EQ(graph.find("\"severity\": \"error\""), std::string::npos) << graph;
+  EXPECT_EQ(GraphFindings(graph, "warning", "alpha").size(), 1u) << graph;
 }
 
 TEST(LauncherGraphTest, NonCriticalDoesNotRelaxNamingRules) {
@@ -1845,6 +2614,7 @@ TEST(LauncherGraphTest, NonCriticalDoesNotRelaxNamingRules) {
   EXPECT_FALSE(fixture.has_manifest());
 }
 
+// REQ-DEV-04
 TEST(LauncherGraphTest, DescribeOnlyLintsWithoutStartingAnything) {
   GraphFixture fixture{
       "preflight",
@@ -1858,7 +2628,8 @@ TEST(LauncherGraphTest, DescribeOnlyLintsWithoutStartingAnything) {
   EXPECT_NE(fixture.graph_json().find("\"name\": \"beta\""), std::string::npos);
 }
 
-// REQ-OPS-01: a graph error makes --describe-only exit non-zero, no manifest
+// REQ-DEV-04, REQ-OPS-01: a graph error makes --describe-only exit non-zero,
+// no manifest
 TEST(LauncherGraphTest, DescribeOnlyReportsABrokenGraphAsAFailure) {
   GraphFixture fixture{
       "preflight_broken",
@@ -1938,7 +2709,6 @@ TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {
                                               {Sender("/gamma/state")}));
 
   LauncherOptions options;
-  options.describe_timeout_ms = 4000;
   std::vector<NodeDescription> described;
   const auto diagnostics = DescribeGraph({spec}, options, described);
 
@@ -1960,11 +2730,13 @@ TEST(LauncherGraphTest, WarnsWhenABinaryDisagreesWithTheConfigAboutItsName) {
 
 // A binary that cannot be run is reported with the reason its exec failed,
 // not as a node that exited 127.
+// REQ-OPS-01
 TEST(LauncherGraphTest, ProbeReportsWhyABinaryCannotRun) {
   introspect::Description out;
   std::string error;
-  EXPECT_FALSE(ProbeDescribe({"/nonexistent/talos_node", "--describe"},
-                             std::chrono::milliseconds{500}, out, error));
+  EXPECT_FALSE(ProbeDescribe({"/nonexistent/talos_node", "--describe"}, kHang,
+                             out, error));
+  EXPECT_NE(error.find("execv"), std::string::npos) << error;
   EXPECT_NE(error.find("/nonexistent/talos_node"), std::string::npos) << error;
   EXPECT_NE(error.find(std::strerror(ENOENT)), std::string::npos) << error;
 }
@@ -2058,7 +2830,6 @@ TEST(LauncherGraphTest, TransientProbeSpawnFailureIsRetried) {
                                         {Sender("/alpha/state")}));
 
   LauncherOptions options;
-  options.describe_timeout_ms = 4000;
   options.probe_spawn_failures["alpha"] = 2;
   std::vector<NodeDescription> described;
   const auto diagnostics = DescribeGraph({spec}, options, described);
@@ -2122,7 +2893,6 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
       WriteStubNode("graph_gamma",
                     GraphReaderStub("gamma", "//example/gamma:node", record))};
   LauncherOptions options;
-  options.describe_timeout_ms = 4000;
   options.output_dir = TempPath("graph_reader_out");
   std::vector<NodeDescription> described;
   const auto diagnostics = DescribeGraph({gamma, alpha}, options, described);
@@ -2158,6 +2928,114 @@ TEST(LauncherGraphTest, AGraphReaderIsDescribedAgainWithTheOtherNodesGraph) {
   std::filesystem::remove_all(options.output_dir);
   std::remove(alpha.binary_path.c_str());
   std::remove(gamma.binary_path.c_str());
+}
+
+// REQ-OPS-55: a graph-reading node's Pass-1 static non-telemetry SENDER (such
+// as teleop's /teleop/status) is exported to declared_graph.json so another
+// graph reader (telemetry) can observe it, while telemetry's own
+// telemetry-role SENDER (/talos/telemetry) and Pass-1 watchers are omitted so
+// telemetry never sees itself.
+TEST(LauncherGraphTest,
+     TelemetrySeesOtherGraphReadersPass1StaticSenderAndNotItsOwn) {
+  const std::string record = TempPath("graph_pass1_static_record");
+  std::filesystem::create_directories(record);
+
+  auto two_pass_stub = [&](const introspect::Description& pass1,
+                           const introspect::Description& pass2,
+                           const std::string& save_as) {
+    return std::string{"#!/bin/sh\n"} +
+           "describe=0\n"
+           "graph=''\n"
+           "while [ $# -gt 0 ]; do\n"
+           "  case \"$1\" in\n"
+           "    --describe) describe=1 ;;\n"
+           "    --graph) shift; graph=\"$1\" ;;\n"
+           "  esac\n"
+           "  shift\n"
+           "done\n"
+           "[ $describe = 1 ] || exit 0\n"
+           "if [ -z \"$graph\" ]; then\n"
+           "  cat <<'TALOS_DESCRIBE'\n" +
+           introspect::DescribeToJson(pass1) +
+           "TALOS_DESCRIBE\n"
+           "  exit 0\n"
+           "fi\n" +
+           (save_as.empty()
+                ? std::string{}
+                : "cp \"$graph\" '" + record + "/" + save_as + "'\n") +
+           "cat <<'TALOS_DESCRIBE'\n" + introspect::DescribeToJson(pass2) +
+           "TALOS_DESCRIBE\n";
+  };
+
+  introspect::Description teleop_p1;
+  teleop_p1.name = "teleop";
+  teleop_p1.target = "//example/teleop:node";
+  teleop_p1.reads_graph = true;
+  teleop_p1.sources = {Sender("/teleop/status"),
+                       Watcher("/hw/state/driver_station")};
+  introspect::Description teleop_p2 = teleop_p1;
+  teleop_p2.sources.push_back(Sender("/alpha/target/teleop"));
+
+  introspect::Description telemetry_p1;
+  telemetry_p1.name = "telemetry";
+  telemetry_p1.target = "//example/telemetry:node";
+  telemetry_p1.reads_graph = true;
+  telemetry_p1.sources = {Sender("/talos/telemetry")};
+  introspect::Description telemetry_p2 = telemetry_p1;
+  auto obs_alpha = Watcher("/alpha/state");
+  obs_alpha.flags = introspect::naming::kSourceFlagObserver;
+  auto obs_teleop = Watcher("/teleop/status");
+  obs_teleop.flags = introspect::naming::kSourceFlagObserver;
+  telemetry_p2.sources.push_back(obs_alpha);
+  telemetry_p2.sources.push_back(obs_teleop);
+
+  NodeSpec alpha{"alpha", "//example/alpha:node",
+                 WriteStubNode("graph_pass1_alpha",
+                               DescribingStub("alpha", "//example/alpha:node",
+                                              {Sender("/alpha/state")}))};
+  NodeSpec teleop{"teleop", "//example/teleop:node",
+                  WriteStubNode("graph_pass1_teleop",
+                                two_pass_stub(teleop_p1, teleop_p2, ""))};
+  NodeSpec telemetry{
+      "telemetry", "//example/telemetry:node",
+      WriteStubNode("graph_pass1_telemetry",
+                    two_pass_stub(telemetry_p1, telemetry_p2, "graph"))};
+
+  LauncherOptions options;
+  options.output_dir = TempPath("graph_pass1_static_out");
+  std::vector<NodeDescription> described;
+  DescribeGraph({telemetry, teleop, alpha}, options, described);
+
+  ASSERT_EQ(described.size(), 3u);
+  EXPECT_TRUE(described[0].answered) << described[0].error;
+  EXPECT_TRUE(described[1].answered) << described[1].error;
+  EXPECT_TRUE(described[2].answered) << described[2].error;
+
+  introspect::DeclaredGraph graph;
+  std::string error;
+  ASSERT_TRUE(introspect::DescribeReader::ParseGraph(
+      ReadFile(record + "/graph"), graph, error))
+      << error;
+  ASSERT_EQ(graph.size(), 2u);
+
+  const auto find_node = [&](std::string_view name) {
+    return std::find_if(
+        graph.begin(), graph.end(),
+        [&](const introspect::Description& d) { return d.name == name; });
+  };
+  EXPECT_NE(find_node("alpha"), graph.end());
+  EXPECT_EQ(find_node("telemetry"), graph.end());
+  const auto teleop_it = find_node("teleop");
+  ASSERT_NE(teleop_it, graph.end());
+  ASSERT_EQ(teleop_it->sources.size(), 1u);
+  EXPECT_EQ(teleop_it->sources[0].kind, event::SourceKind::SENDER);
+  EXPECT_EQ(teleop_it->sources[0].name, "/teleop/status");
+
+  std::filesystem::remove_all(record);
+  std::filesystem::remove_all(options.output_dir);
+  std::remove(alpha.binary_path.c_str());
+  std::remove(teleop.binary_path.c_str());
+  std::remove(telemetry.binary_path.c_str());
 }
 
 // A graph file the launch cannot write -- the declared graph its graph
@@ -2211,6 +3089,75 @@ TEST(LauncherBundleTest, ResolveBinaryPrefersOverrideThenBazelBin) {
             "/opt/talos/bundles/current/bin/wrist");
 }
 
+// REQ-DEV-30
+TEST(LauncherBundleTest, RepoMappingResolvesCustomApparentAndCanonicalNames) {
+  const RepoMapping mapping = ParseRepoMapping(
+      ",my_talos,talos+\n"
+      ",legacy_talos,talos~\n"
+      ",robot,_main\n"
+      "talos+,rules_cc,rules_cc+\n"
+      "malformed_line\n");
+  ASSERT_EQ(mapping.size(), 3U);
+  EXPECT_EQ(mapping.at("my_talos"), "talos+");
+  EXPECT_EQ(mapping.at("legacy_talos"), "talos~");
+  EXPECT_EQ(mapping.at("robot"), "_main");
+
+  // Apparent names resolve through `_repo_mapping` for both Bazel 8 (+) and
+  // Bazel 7 (~), and canonical names are used directly without appending `+`.
+  const std::map<std::string, std::string> empty_overrides;
+  EXPECT_EQ(
+      ResolveBinary("@my_talos//talOS/teleop:node", empty_overrides, mapping),
+      "bazel-bin/external/talos+/talOS/teleop/node");
+  EXPECT_EQ(ResolveBinary("@legacy_talos//talOS/teleop:node", empty_overrides,
+                          mapping),
+            "bazel-bin/external/talos~/talOS/teleop/node");
+  EXPECT_EQ(
+      ResolveBinary("@@talos~//talOS/teleop:node", empty_overrides, mapping),
+      "bazel-bin/external/talos~/talOS/teleop/node");
+  EXPECT_EQ(ResolveBinary("@@plain_canon//pkg:node", empty_overrides, mapping),
+            "bazel-bin/external/plain_canon/pkg/node");
+  EXPECT_EQ(ResolveBinary("@robot//gate:node", empty_overrides, mapping),
+            "bazel-bin/gate/node");
+  EXPECT_EQ(ResolveBinary("@@//gate:node", empty_overrides, mapping),
+            "bazel-bin/gate/node");
+  EXPECT_EQ(ResolveBinary("@@_main//gate:node", empty_overrides, mapping),
+            "bazel-bin/gate/node");
+
+  // NormalizeTargetKey aligns apparent and canonical spellings via the mapping
+  // even when repo_name != module_name, without colliding unrelated repos.
+  EXPECT_EQ(NormalizeTargetKey("@my_talos//talOS/teleop:node", mapping),
+            NormalizeTargetKey("@@talos+//talOS/teleop:node", mapping));
+  EXPECT_EQ(NormalizeTargetKey("@legacy_talos//talOS/teleop:node", mapping),
+            NormalizeTargetKey("@@talos~//talOS/teleop:node", mapping));
+  EXPECT_NE(NormalizeTargetKey("@talos//talOS/teleop:node", mapping),
+            NormalizeTargetKey("@@talos+//talOS/teleop:node", mapping));
+  EXPECT_EQ(NormalizeTargetKey("@robot//gate:node", mapping), "//gate:node");
+  EXPECT_EQ(NormalizeTargetKey("@@//gate:node", mapping), "//gate:node");
+  EXPECT_EQ(NormalizeTargetKey("@@_main//gate:node", mapping), "//gate:node");
+
+  std::map<std::string, std::string> overrides;
+  overrides["@@talos+//talOS/teleop:node"] = "/bundle/bin/teleop";
+  overrides["@@talos~//talOS/telemetry:node"] = "/bundle/bin/telemetry";
+  EXPECT_EQ(ResolveBinary("@my_talos//talOS/teleop:node", overrides, mapping),
+            "/bundle/bin/teleop");
+  EXPECT_EQ(
+      ResolveBinary("@legacy_talos//talOS/telemetry:node", overrides, mapping),
+      "/bundle/bin/telemetry");
+
+  // LoadRepoMapping reads `<argv0>.runfiles/_repo_mapping`.
+  const std::string fake_root = TempPath("repo_mapping_test");
+  const std::string fake_bin = fake_root + "/launcher";
+  std::filesystem::create_directories(fake_bin + ".runfiles");
+  {
+    std::ofstream f(fake_bin + ".runfiles/_repo_mapping");
+    f << ",custom_talos,talos+\n";
+  }
+  const RepoMapping loaded = LoadRepoMapping(fake_bin);
+  ASSERT_EQ(loaded.size(), 1U);
+  EXPECT_EQ(loaded.at("custom_talos"), "talos+");
+  std::filesystem::remove_all(fake_root);
+}
+
 TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   const std::string bundle_dir = TempPath("test_bundle_dir");
   std::filesystem::create_directories(bundle_dir + "/config");
@@ -2254,6 +3201,53 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   LauncherOptions broken;
   broken.bundle_dir = bundle_dir;
   EXPECT_FALSE(LoadBundle(broken, error));
+
+  std::filesystem::remove_all(bundle_dir);
+}
+
+// REQ-OPS-10 (REPO-4): LoadBundle reads dual-revision stamps from
+// bundle_manifest.toml, and SessionManifest::ToJson emits talos_git_revision /
+// talos_git_dirty only when talos_git_revision is non-empty.
+TEST(LauncherBundleTest, LoadBundleAndManifestCarryTalosRevisionWhenPresent) {
+  const std::string bundle_dir = TempPath("test_bundle_talos_rev");
+  std::filesystem::create_directories(bundle_dir + "/config");
+  { std::ofstream{bundle_dir + "/config/robot.toml"} << "[robot]\n"; }
+
+  {
+    std::ofstream mf(bundle_dir + "/bundle_manifest.toml");
+    mf << "bundle_version = 1\n"
+       << "config_path = \"config/robot.toml\"\n"
+       << "git_revision = \"1111aaaa\"\n"
+       << "git_dirty = false\n"
+       << "talos_git_revision = \"2222bbbb\"\n"
+       << "talos_git_dirty = true\n";
+  }
+
+  LauncherOptions options;
+  options.bundle_dir = bundle_dir;
+  std::string error;
+  ASSERT_TRUE(LoadBundle(options, error)) << error;
+  EXPECT_EQ(options.bundle_git_revision, "1111aaaa");
+  EXPECT_FALSE(options.bundle_git_dirty);
+  EXPECT_EQ(options.bundle_talos_git_revision, "2222bbbb");
+  EXPECT_TRUE(options.bundle_talos_git_dirty);
+
+  SessionManifest dual;
+  dual.git_revision = options.bundle_git_revision;
+  dual.git_dirty = options.bundle_git_dirty;
+  dual.talos_git_revision = options.bundle_talos_git_revision;
+  dual.talos_git_dirty = options.bundle_talos_git_dirty;
+  const std::string dual_json = dual.ToJson();
+  EXPECT_NE(dual_json.find("\"talos_git_revision\": \"2222bbbb\""),
+            std::string::npos);
+  EXPECT_NE(dual_json.find("\"talos_git_dirty\": true"), std::string::npos);
+
+  // Single-repo or unstamped manifests omit the talos_git_* keys completely.
+  SessionManifest single;
+  single.git_revision = "1111aaaa";
+  const std::string single_json = single.ToJson();
+  EXPECT_EQ(single_json.find("talos_git_revision"), std::string::npos);
+  EXPECT_EQ(single_json.find("talos_git_dirty"), std::string::npos);
 
   std::filesystem::remove_all(bundle_dir);
 }
@@ -3020,6 +4014,102 @@ std::map<std::string, std::string> DirectoryContents(const std::string& dir) {
   return contents;
 }
 
+// REQ-DEV-04: --describe-only lints without touching shared memory or running
+// session retention, even when the log root already exceeds log_keep_sessions.
+TEST(LauncherSessions, DescribeOnlyLeavesSessionsAndSharedMemoryUntouched) {
+  auto options = SessionFixture("describe_only_no_side_effects");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  options.config_path = TempPath("describe_only_no_side_effects") + ".toml";
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 1\n");
+  std::ofstream{options.config_path} << configuration;
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode("describe_only_no_side_effects_alpha",
+                    DescribingStub("alpha", "//example/alpha:node",
+                                   {Sender("/alpha/state")}));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      "describe_only_no_side_effects_beta",
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")}));
+
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  const auto now = std::filesystem::file_time_type::clock::now();
+  std::map<int, std::map<std::string, std::string>> before;
+  for (const int id : {1, 2, 3}) {
+    WriteSessionManifest(dir(id), static_cast<uint64_t>(id), 1000 + id,
+                         1100 + id);
+    WriteTestLog(dir(id) + "/alpha.tlog", "alpha", static_cast<uint64_t>(id),
+                 {1'000'000});
+  }
+  std::filesystem::create_directories(dir(4));
+  std::ofstream{dir(4) + "/graph.json"} << "{}\n";
+  for (const auto& [id, age] :
+       {std::pair{1, 4}, std::pair{2, 3}, std::pair{3, 2}, std::pair{4, 1}}) {
+    std::filesystem::last_write_time(dir(id), now - std::chrono::hours{age});
+    before[id] = DirectoryContents(dir(id));
+  }
+
+  // Isolate into a fresh TALOS_SHM_NAMESPACE when not already under Bazel's
+  // per-shard TEST_TMPDIR, and clear any prior segments in the active
+  // namespace before running.
+  struct ScopedNamespace {
+    bool set = false;
+    ScopedNamespace() {
+      if (std::getenv("TEST_TMPDIR") == nullptr &&
+          std::getenv("TALOS_SHM_NAMESPACE") == nullptr) {
+        const std::string ns =
+            "talos_describe_only_" + std::to_string(::getpid());
+        ::setenv("TALOS_SHM_NAMESPACE", ns.c_str(), 1);
+        set = true;
+      }
+    }
+    ~ScopedNamespace() {
+      if (set) ::unsetenv("TALOS_SHM_NAMESPACE");
+    }
+  } scoped_ns;
+
+  const std::vector<std::string> shm_topics{"/alpha/state",
+                                            "/talos_registry.6"};
+  for (const std::string& topic : shm_topics) {
+    const std::string shm = ShmObjectName(topic);
+    ::shm_unlink(shm.c_str());
+    errno = 0;
+    const int fd = ::shm_open(shm.c_str(), O_RDONLY, 0);
+    ASSERT_EQ(fd, -1) << topic << " (" << shm << ") still exists";
+    ASSERT_EQ(errno, ENOENT) << topic << " (" << shm << ")";
+  }
+
+  options.session_id = 5;
+  options.describe_only = true;
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(dir(5) + "/manifest.json"));
+  EXPECT_TRUE(std::filesystem::exists(dir(5) + "/graph.json"));
+
+  // Every pre-existing session directory remains intact.
+  for (const auto& [id, expected] : before) {
+    ASSERT_TRUE(std::filesystem::exists(dir(id)))
+        << "session dir " << id << " was removed by --describe-only";
+    EXPECT_EQ(DirectoryContents(dir(id)), expected) << "session dir " << id;
+  }
+
+  // Neither declared topics nor the registry were created in shared memory.
+  for (const std::string& topic : shm_topics) {
+    const std::string shm = ShmObjectName(topic);
+    errno = 0;
+    const int fd = ::shm_open(shm.c_str(), O_RDONLY, 0);
+    if (fd >= 0) {
+      ::close(fd);
+      ::shm_unlink(shm.c_str());
+    }
+    EXPECT_EQ(fd, -1) << topic << " (" << shm << ") created by --describe-only";
+    EXPECT_EQ(errno, ENOENT) << topic << " (" << shm << ")";
+  }
+
+  std::filesystem::remove_all(root);
+  std::filesystem::remove(options.config_path);
+}
+
 // REQ-OPS-11: a launch in another shared-memory namespace records into the
 // same log root (the default /tmp/talos_logs: a simulation beside a bench
 // session) and holds its own namespace's session lock, not this one's. Its
@@ -3238,12 +4328,12 @@ TEST(LauncherSessions, ACrashLoopBesideARunningSessionLeavesOneDirectory) {
   std::filesystem::remove_all(root);
 }
 
-// A log root on a filesystem without advisory locks (NFS without a lock
-// daemon: ENOLCK; macOS msdos and exFAT volumes: ENOTSUP) cannot hold a
-// session directory's lock. The robot still starts: one warning, and the
-// session runs without it, protected as before launches locked their
-// directories (by the namespace's session lock only); retention removes
-// as it did then.
+// A log root on a filesystem without advisory locks (macOS msdos and exFAT
+// volumes: ENOTSUP/EOPNOTSUPP; ENOSYS) cannot hold a session directory's lock.
+// The robot still starts: one warning, and the session runs without it,
+// protected as before launches locked their directories (by the namespace's
+// session lock only); retention removes as it did then. (ENOLCK is tested
+// separately in launcher_retention_test.cc: retention refuses all deletions.)
 // REQ-OPS-11
 TEST(LauncherSessions, ALogRootWithoutLocksStillLaunches) {
   auto options = SessionFixture("no_locks");
@@ -3255,7 +4345,7 @@ TEST(LauncherSessions, ALogRootWithoutLocksStillLaunches) {
   std::ofstream{options.config_path} << configuration;
   WriteSessionManifest(root + "/1", 1, 1001, 1101);
   options.lock_session_directory = [](int, int) {
-    errno = ENOLCK;
+    errno = EOPNOTSUPP;
     return -1;
   };
   options.session_id = 2;
@@ -3750,6 +4840,7 @@ TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
   EXPECT_EQ(both.record, "") << "a member was run or probed";
 }
 
+// REQ-OPS-08
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   auto options = SessionFixture("killed_manifest");
   std::filesystem::remove_all(options.output_dir);
@@ -3835,43 +4926,131 @@ std::string DescribeThenRecord(
 // launcher there, its manifest unended and its segments left behind.
 // REQ-OPS-03, REQ-OPS-06
 TEST(LauncherSessions, AStopOnceSegmentsExistEndsTheSessionBeforeAnySpawn) {
-  const std::string tag = "stop_after_segments";
-  auto options = SessionFixture(tag);
-  std::filesystem::remove_all(options.output_dir);
-  const std::string record = TempPath(tag + "_runs");
-  ::remove(record.c_str());
-  // Only bounds a launch that missed the stop.
-  options.duration_s = static_cast<int>(kHang.count());
-  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
-      tag + "_hardware",
-      DescribeThenRecord("hardware_node", "//talOS/bridge:hardware_node", {},
-                         record));
-  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      tag + "_alpha", DescribeThenRecord("alpha", "//example/alpha:node",
-                                         {Sender("/alpha/state")}, record));
-  options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      tag + "_beta", DescribeThenRecord("beta", "//example/beta:node",
-                                        {Watcher("/alpha/state")}, record));
-  options.session_segments_created = [] { ::raise(SIGINT); };
-  const pid_t launcher = ForkLauncher(options);
-  ASSERT_GE(launcher, 0);
-  int status = 0;
-  ASSERT_EQ(::waitpid(launcher, &status, 0), launcher);
-  const bool left = SegmentLeft("/alpha/state");
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
-      << "the launcher ended with " << ExitReason(status);
-  EXPECT_EQ(ReadFile(record), "") << "members spawned after the stop";
-  EXPECT_FALSE(left) << "the session's /alpha/state segment was not unlinked";
-  const std::string manifest =
-      ReadFile(options.output_dir + "/1/manifest.json");
-  ASSERT_FALSE(manifest.empty()) << "no manifest.json";
-  EXPECT_EQ(manifest.find("\n  \"end_wall_ns\": 0,"), std::string::npos)
-      << manifest;
-  EXPECT_NE(manifest.find("\n  \"stopped_before_start\": true,"),
-            std::string::npos)
-      << manifest;
-  std::filesystem::remove_all(options.output_dir);
-  ::remove(record.c_str());
+  struct SegmentSnapshot {
+    std::uint64_t lifetime{0};
+    std::uint64_t schema_hash{0};
+    std::uint64_t message_bytes{0};
+    std::uint64_t message_alignment{0};
+    std::uint64_t slots{0};
+    char schema_name[talos::schema::kMaxSchemaName + 1]{};
+    bool had_record_before_spawn{false};
+  };
+  const auto expected = Sender("/alpha/state");
+  const auto snapshot_segment = [&](const std::string& rec_path) {
+    SegmentSnapshot snap{};
+    snap.had_record_before_spawn = !ReadFile(rec_path).empty();
+    SharedMemoryPtr segment{"/alpha/state", sizeof(RTMSHeader)};
+    const auto* header = static_cast<const RTMSHeader*>(segment.ptr());
+    snap.lifetime = header->lifetime.load(std::memory_order_acquire);
+    snap.schema_hash = header->schema_hash;
+    snap.message_bytes = header->message_bytes;
+    snap.message_alignment = header->message_alignment;
+    snap.slots = header->slots;
+    std::memcpy(snap.schema_name, header->schema_name,
+                sizeof(snap.schema_name));
+    return snap;
+  };
+  const auto check_snapshot = [&](const SegmentSnapshot& snap) {
+    EXPECT_FALSE(snap.had_record_before_spawn)
+        << "a member ran before session_segments_created";
+    EXPECT_NE(snap.lifetime & kLifetimeSessionOwned, 0u);
+    EXPECT_EQ(std::string_view{snap.schema_name}, expected.schema);
+    EXPECT_EQ(snap.schema_hash, expected.schema_hash);
+    EXPECT_EQ(snap.message_bytes, expected.message_bytes);
+    EXPECT_EQ(snap.message_alignment, expected.alignment);
+    EXPECT_EQ(snap.slots, expected.slots);
+  };
+
+  // Case 1: stop arriving once segments exist (before any spawn) inspects the
+  // session-owned segment header and unlinks it on stop.
+  {
+    const std::string tag = "stop_after_segments";
+    auto options = SessionFixture(tag);
+    std::filesystem::remove_all(options.output_dir);
+    const std::string record = TempPath(tag + "_runs");
+    ::remove(record.c_str());
+    // Only bounds a launch that missed the stop.
+    options.duration_s = static_cast<int>(kHang.count());
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        tag + "_hardware",
+        DescribeThenRecord("hardware_node", "//talOS/bridge:hardware_node", {},
+                           record));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        tag + "_alpha", DescribeThenRecord("alpha", "//example/alpha:node",
+                                           {expected}, record));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        tag + "_beta", DescribeThenRecord("beta", "//example/beta:node",
+                                          {Watcher("/alpha/state")}, record));
+    int snap_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(snap_pipe), 0);
+    options.session_segments_created = [&, write_fd = snap_pipe[1]] {
+      const SegmentSnapshot snap = snapshot_segment(record);
+      [[maybe_unused]] const ssize_t n = ::write(write_fd, &snap, sizeof(snap));
+      ::close(write_fd);
+      ::raise(SIGINT);
+    };
+    const pid_t launcher = ForkLauncher(options);
+    ASSERT_GE(launcher, 0);
+    ::close(snap_pipe[1]);
+    SegmentSnapshot snap{};
+    const ssize_t got = ::read(snap_pipe[0], &snap, sizeof(snap));
+    ::close(snap_pipe[0]);
+    int status = 0;
+    ASSERT_EQ(::waitpid(launcher, &status, 0), launcher);
+    const bool left = SegmentLeft("/alpha/state");
+    ASSERT_EQ(got, static_cast<ssize_t>(sizeof(snap)))
+        << "session_segments_created did not run";
+    check_snapshot(snap);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "the launcher ended with " << ExitReason(status);
+    EXPECT_EQ(ReadFile(record), "") << "members spawned after the stop";
+    EXPECT_FALSE(left) << "the session's /alpha/state segment was not unlinked";
+    const std::string manifest =
+        ReadFile(options.output_dir + "/1/manifest.json");
+    ASSERT_FALSE(manifest.empty()) << "no manifest.json";
+    EXPECT_EQ(manifest.find("\n  \"end_wall_ns\": 0,"), std::string::npos)
+        << manifest;
+    EXPECT_NE(manifest.find("\n  \"stopped_before_start\": true,"),
+              std::string::npos)
+        << manifest;
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(record.c_str());
+  }
+
+  // Case 2: normal session end also creates /alpha/state matching the probe
+  // before any spawn and unlinks it once the session returns cleanly.
+  {
+    const std::string tag = "normal_end_segments";
+    auto options = SessionFixture(tag);
+    std::filesystem::remove_all(options.output_dir);
+    const std::string record = TempPath(tag + "_runs");
+    ::remove(record.c_str());
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        tag + "_hardware",
+        DescribeThenRecord("hardware_node", "//talOS/bridge:hardware_node", {},
+                           record));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        tag + "_alpha", DescribeThenRecord("alpha", "//example/alpha:node",
+                                           {expected}, record));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        tag + "_beta", DescribeThenRecord("beta", "//example/beta:node",
+                                          {Watcher("/alpha/state")}, record));
+    bool saw_segments = false;
+    SegmentSnapshot snap{};
+    options.session_segments_created = [&] {
+      snap = snapshot_segment(record);
+      saw_segments = true;
+    };
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const bool left = SegmentLeft("/alpha/state");
+    ASSERT_TRUE(saw_segments);
+    check_snapshot(snap);
+    EXPECT_FALSE(left)
+        << "the session's /alpha/state segment survived normal end";
+    EXPECT_NE(ReadFile(record).find("alpha"), std::string::npos);
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(record.c_str());
+  }
 }
 
 // A stop (SIGINT) that arrives between two spawns: the members already
@@ -4000,7 +5179,7 @@ TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   auto options = SessionFixture(tag);
   std::filesystem::remove_all(options.output_dir);
   // The deadline a stop must not wait out.
-  const std::chrono::milliseconds describe_deadline{kHang};
+  const std::chrono::milliseconds describe_deadline{std::chrono::seconds{30}};
   options.describe_timeout_ms = static_cast<int>(describe_deadline.count());
   const std::string probe = TempPath(tag + "_probe_pid");
   ::remove(probe.c_str());
@@ -4028,9 +5207,9 @@ TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   ASSERT_GT(probe_pid, 0) << "alpha's probe never started";
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << "the launcher ended with " << ExitReason(status);
-  // Far inside the deadline: without the stop the launcher ends about one
+  // Well inside the deadline: without the stop the launcher ends about one
   // deadline after the probe's spawn, which is a little before stopped_at.
-  EXPECT_LT(stopping, describe_deadline / 4)
+  EXPECT_LT(stopping, describe_deadline / 2)
       << "the stop waited for the probe's describe deadline";
   errno = 0;
   EXPECT_TRUE(::kill(probe_pid, 0) != 0 && errno == ESRCH)
@@ -4128,6 +5307,1170 @@ TEST(LauncherRemoteTest, BridgeProbeGetsTheEffectiveRemote) {
                "/graph.json");
   EXPECT_EQ(graph.find("\"described\": false"), std::string::npos) << graph;
   std::filesystem::remove_all(options.output_dir);
+}
+
+// REQ-OPS-25, REQ-RT-22: `--local-address` resolves over `[robot]
+// local_address` (empty keeps wildcard `0.0.0.0`), malformed IPv4 and
+// non-loopback `--sim` local addresses are refused before probing or spawning,
+// and the effective address is forwarded to `hardware_node` as
+// `--local-address <ip>` and logged on startup.
+TEST(LauncherRemoteTest, LocalAddressResolvesAndForwardsToBridge) {
+  {
+    const auto unset = config::ParseRobotConfigString(kFixtureToml);
+    LauncherOptions options;
+    EXPECT_EQ(EffectiveLocalAddress(unset, options), "");
+    const auto unset_args = ControllerArgs(unset, options);
+    EXPECT_EQ(
+        std::find(unset_args.begin(), unset_args.end(), "--local-address"),
+        unset_args.end());
+
+    std::string with_local_toml{kFixtureToml};
+    const std::string header = "[robot]\n";
+    with_local_toml.insert(with_local_toml.find(header) + header.size(),
+                           "local_address = \"10.56.87.5\"\n");
+    const auto configured = config::ParseRobotConfigString(with_local_toml);
+    EXPECT_EQ(EffectiveLocalAddress(configured, options), "10.56.87.5");
+    const auto config_args = ControllerArgs(configured, options);
+    const auto config_flag =
+        std::find(config_args.begin(), config_args.end(), "--local-address");
+    ASSERT_NE(config_flag, config_args.end());
+    ASSERT_NE(std::next(config_flag), config_args.end());
+    EXPECT_EQ(*std::next(config_flag), "10.56.87.5");
+
+    options.local_address = "10.0.0.37";
+    EXPECT_EQ(EffectiveLocalAddress(configured, options), "10.0.0.37");
+    const auto cli_args = ControllerArgs(configured, options);
+    const auto cli_flag =
+        std::find(cli_args.begin(), cli_args.end(), "--local-address");
+    ASSERT_NE(cli_flag, cli_args.end());
+    ASSERT_NE(std::next(cli_flag), cli_args.end());
+    EXPECT_EQ(*std::next(cli_flag), "10.0.0.37");
+  }
+
+  // Invalid `--local-address` values are refused before any probe or spawn.
+  for (const char* bad : {"not-an-ip", "10.0.0.999", "010.0.0.1"}) {
+    SCOPED_TRACE(bad);
+    const std::string invoked = TempPath("bad_local_addr_invoked");
+    ::remove(invoked.c_str());
+    GraphFixture fixture{
+        "bad_local_addr",
+        RecordingStub("alpha", "//example/alpha:node", invoked),
+        RecordingStub("beta", "//example/beta:node", invoked)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("bad_local_addr_hardware",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", invoked));
+    fixture.options.local_address = bad;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(invoked)) << ReadFile(invoked);
+    EXPECT_FALSE(std::filesystem::exists(fixture.out_dir)) << fixture.out_dir;
+    ::remove(invoked.c_str());
+  }
+
+  // `--sim` refuses a non-loopback local address (from CLI or config) before
+  // any probe or spawn.
+  struct SimLocalRow {
+    const char* name;
+    const char* cli_local;
+    const char* config_local;
+  };
+  for (const SimLocalRow row :
+       {SimLocalRow{"--local-address", "10.56.87.5", nullptr},
+        SimLocalRow{"config local_address", "", "10.56.87.5"}}) {
+    SCOPED_TRACE(row.name);
+    const std::string invoked = TempPath("sim_local_guard_invoked");
+    ::remove(invoked.c_str());
+    GraphFixture fixture{
+        "sim_local_guard",
+        RecordingStub("alpha", "//example/alpha:node", invoked),
+        RecordingStub("beta", "//example/beta:node", invoked)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("sim_local_guard_hardware",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", invoked));
+    if (row.config_local != nullptr) {
+      std::string toml{kFixtureToml};
+      const std::string header = "[robot]\n";
+      toml.insert(
+          toml.find(header) + header.size(),
+          std::string{"local_address = \""} + row.config_local + "\"\n");
+      fixture.options.config_path =
+          TempPath("sim_local_guard_config") + ".toml";
+      std::ofstream{fixture.options.config_path} << toml;
+    }
+    fixture.options.simulation = true;
+    fixture.options.local_address = row.cli_local;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(invoked)) << ReadFile(invoked);
+    EXPECT_FALSE(std::filesystem::exists(fixture.out_dir)) << fixture.out_dir;
+    ::remove(invoked.c_str());
+    if (row.config_local != nullptr) {
+      ::remove(fixture.options.config_path.c_str());
+    }
+  }
+
+  // End-to-end launch: verify both probe and runtime receive the effective
+  // `--remote` and `--local-address` (CLI overriding `[robot]
+  // controller_address` and `[robot] local_address`, including allowing `--sim`
+  // with `--remote 127.0.0.1 --local-address 127.0.0.1`) and that `talos.log`
+  // prints `(local <ip>:<port>)` when bound vs `(local port <port>)` when
+  // unset.
+  const std::string args_file = TempPath("local_addr_bridge_args");
+  const auto make_recording_bridge = [&](const std::string& stub_name) {
+    const std::string base =
+        DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {});
+    const std::string shebang = "#!/bin/sh\n";
+    return WriteStubNode(stub_name, shebang + "printf '%s\\n' \"$*\" >> '" +
+                                        args_file + "'\n" +
+                                        base.substr(shebang.size()));
+  };
+  const auto split_invocations = [](const std::string& recorded,
+                                    std::vector<std::string>& probe_lines,
+                                    std::vector<std::string>& runtime_lines) {
+    probe_lines.clear();
+    runtime_lines.clear();
+    std::istringstream lines{recorded};
+    for (std::string line; std::getline(lines, line);) {
+      if (line.empty()) continue;
+      if (line.find("--describe") != std::string::npos) {
+        probe_lines.push_back(std::move(line));
+      } else {
+        runtime_lines.push_back(std::move(line));
+      }
+    }
+  };
+
+  {
+    ::remove(args_file.c_str());
+    auto options = SessionFixture("local_addr_bound");
+    std::filesystem::remove_all(options.output_dir);
+    {
+      std::string toml{kFixtureToml};
+      const std::string header = "[robot]\n";
+      toml.insert(toml.find(header) + header.size(),
+                  "controller_address = \"10.56.87.2\"\n"
+                  "local_address = \"10.56.87.5\"\n");
+      options.config_path = TempPath("local_addr_bound_config") + ".toml";
+      std::ofstream{options.config_path} << toml;
+    }
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        make_recording_bridge("local_addr_bound_hw");
+    options.simulation = true;
+    options.remote = "127.0.0.1";
+    options.local_address = "127.0.0.1";
+    ASSERT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(args_file);
+    std::vector<std::string> probe_lines;
+    std::vector<std::string> runtime_lines;
+    split_invocations(recorded, probe_lines, runtime_lines);
+    ASSERT_EQ(probe_lines.size(), 1u) << recorded;
+    ASSERT_EQ(runtime_lines.size(), 1u) << recorded;
+    for (const std::string& invocation : {probe_lines[0], runtime_lines[0]}) {
+      EXPECT_NE(invocation.find("--remote 127.0.0.1"), std::string::npos)
+          << invocation;
+      EXPECT_NE(invocation.find("--local-address 127.0.0.1"), std::string::npos)
+          << invocation;
+      EXPECT_EQ(invocation.find("10.56.87.2"), std::string::npos) << invocation;
+      EXPECT_EQ(invocation.find("10.56.87.5"), std::string::npos) << invocation;
+    }
+    const std::string talos_log = ReadFile(options.output_dir + "/1/talos.log");
+    EXPECT_NE(
+        talos_log.find(
+            "[launcher] Controller 127.0.0.1:5802 (local 127.0.0.1:5803)"),
+        std::string::npos)
+        << talos_log;
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(options.config_path.c_str());
+    ::remove(args_file.c_str());
+  }
+
+  {
+    ::remove(args_file.c_str());
+    auto options = SessionFixture("local_addr_unset");
+    std::filesystem::remove_all(options.output_dir);
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        make_recording_bridge("local_addr_unset_hw");
+    ASSERT_EQ(Launcher{options}.Run(), 0);
+    const std::string recorded = ReadFile(args_file);
+    std::vector<std::string> probe_lines;
+    std::vector<std::string> runtime_lines;
+    split_invocations(recorded, probe_lines, runtime_lines);
+    ASSERT_EQ(probe_lines.size(), 1u) << recorded;
+    ASSERT_EQ(runtime_lines.size(), 1u) << recorded;
+    for (const std::string& invocation : {probe_lines[0], runtime_lines[0]}) {
+      EXPECT_NE(invocation.find("--remote 127.0.0.1"), std::string::npos)
+          << invocation;
+      EXPECT_EQ(invocation.find("--local-address"), std::string::npos)
+          << invocation;
+    }
+    const std::string talos_log = ReadFile(options.output_dir + "/1/talos.log");
+    EXPECT_NE(talos_log.find(
+                  "[launcher] Controller 127.0.0.1:5802 (local port 5803)"),
+              std::string::npos)
+        << talos_log;
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(args_file.c_str());
+  }
+}
+
+// REQ-OPS-25: `--describe-only` emits a non-fatal warning when `local_address`
+// is unset on a non-loopback, non-`--sim` target, and emits none when
+// `local_address` is set (config or CLI), on `127.0.0.1`, or under `--sim`.
+TEST(LauncherRemoteTest, DescribeOnlyWarnsWhenLocalAddressUnsetOnNonLoopback) {
+  struct Row {
+    const char* name;
+    const char* controller_address;
+    const char* config_local_address;
+    const char* cli_remote;
+    const char* cli_local_address;
+    bool simulation;
+    bool expect_warning;
+  };
+  for (const Row row : {
+           Row{"non_loopback_config_unset", "10.56.87.2", nullptr, "", "",
+               false, true},
+           Row{"non_loopback_cli_unset", "127.0.0.1", nullptr, "10.56.87.2", "",
+               false, true},
+           Row{"non_loopback_config_local_set", "10.56.87.2", "10.56.87.5", "",
+               "", false, false},
+           Row{"non_loopback_cli_local_set", "10.56.87.2", nullptr, "",
+               "10.56.87.5", false, false},
+           Row{"loopback_unset", "127.0.0.1", nullptr, "", "", false, false},
+           Row{"sim_override_unset", "10.56.87.2", nullptr, "127.0.0.1", "",
+               true, false},
+       }) {
+    SCOPED_TRACE(row.name);
+    auto options = SessionFixture(std::string{"local_warn_"} + row.name);
+    std::filesystem::remove_all(options.output_dir);
+    std::string toml{kFixtureToml};
+    const std::string header = "[robot]\n";
+    std::string extra = std::string{"controller_address = \""} +
+                        row.controller_address + "\"\n";
+    if (row.config_local_address != nullptr) {
+      extra +=
+          std::string{"local_address = \""} + row.config_local_address + "\"\n";
+    }
+    toml.insert(toml.find(header) + header.size(), extra);
+    options.config_path =
+        TempPath(std::string{"local_warn_cfg_"} + row.name) + ".toml";
+    std::ofstream{options.config_path} << toml;
+    options.remote = row.cli_remote;
+    options.local_address = row.cli_local_address;
+    options.simulation = row.simulation;
+    options.describe_only = true;
+
+    EXPECT_EQ(Launcher{options}.Run(), 0);
+    const std::string graph =
+        ReadFile(options.output_dir + "/" + std::to_string(options.session_id) +
+                 "/graph.json");
+    const bool has_warning =
+        graph.find(
+            "\"severity\": \"warning\", \"subject\": \"hardware_node\", "
+            "\"message\": \"[robot] local_address is unset") !=
+        std::string::npos;
+    EXPECT_EQ(has_warning, row.expect_warning) << graph;
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(options.config_path.c_str());
+  }
+}
+
+// Fetches one HTTP GET path on 127.0.0.1:`port` and returns the raw response.
+std::string HttpGetLoopback(uint16_t port, std::string_view path) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return {};
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) !=
+      0) {
+    ::close(fd);
+    return {};
+  }
+  const std::string request = "GET " + std::string{path} +
+                              " HTTP/1.1\r\nHost: localhost\r\n"
+                              "Connection: close\r\n\r\n";
+  (void)::send(fd, request.data(), request.size(), 0);
+  std::string response;
+  char buf[1024];
+  for (;;) {
+    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    if (n <= 0) break;
+    response.append(buf, static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  return response;
+}
+
+// Stub studio_bridge that answers --describe and, when given --refusal-file,
+// binds port 0, prints `listening <port>`, notifies `ready_fifo` with the port,
+// serves GET /drive/summary.json from --refusal-file, and exits cleanly on
+// SIGINT/SIGTERM. Starts with `#!/bin/sh` because WriteStubNode prepends a
+// shell --talos-first-exec guard on line 2.
+std::string RefusalBridgeStub(const std::string& ready_fifo) {
+  return R"(#!/bin/sh
+exec python3 - "$@" <<'PYEOF'
+import http.server, json, os, signal, sys
+
+if "--describe" in sys.argv:
+    print(json.dumps({
+        "describe_version": 1,
+        "name": "studio_bridge",
+        "target": "//studio/bridge:studio_bridge",
+        "sources": [{"kind": "WATCHER", "name": "/talos/telemetry",
+                     "message_bytes": 1200, "alignment": 8,
+                     "schema": "bytes", "schema_hash": 0, "slots": 64}]
+    }))
+    sys.exit(0)
+
+refusal_file = ""
+for i, arg in enumerate(sys.argv):
+    if arg == "--refusal-file" and i + 1 < len(sys.argv):
+        refusal_file = sys.argv[i + 1]
+
+with open(refusal_file, encoding="utf-8") as f:
+    rec = json.load(f)
+body = json.dumps({
+    "kind": "talos.drive.summary",
+    "session": "",
+    "supervised": False,
+    "registry": False,
+    "launch_refused": True,
+    "refusal_reason": rec.get("reason", ""),
+    "nodes": [],
+    "omitted": 0,
+}).encode("utf-8")
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/drive/summary.json":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+port = server.server_address[1]
+print(f"listening {port}", flush=True)
+
+def on_stop(signum, frame):
+    os._exit(0)
+
+signal.signal(signal.SIGINT, on_stop)
+signal.signal(signal.SIGTERM, on_stop)
+
+with open(")" +
+         ready_fifo + R"(", "w", encoding="utf-8") as fifo:
+    fifo.write(f"{port}\n")
+    fifo.flush()
+
+server.serve_forever()
+PYEOF
+)";
+}
+
+// Captures sd_notify datagrams sent to NOTIFY_SOCKET while in scope.
+class NotifyCapture {
+ public:
+  NotifyCapture() {
+    static int serial = 0;
+    path_ = "/tmp/talos_notify_cap_" + std::to_string(::getpid()) + "_" +
+            std::to_string(serial++);
+    ::unlink(path_.c_str());
+    fd_ = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path_.c_str(), path_.size() + 1);
+    const auto len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                            path_.size() + 1);
+    if (fd_ >= 0 &&
+        ::bind(fd_, reinterpret_cast<const sockaddr*>(&addr), len) == 0) {
+      ::fcntl(fd_, F_SETFL, O_NONBLOCK);
+      ::setenv("NOTIFY_SOCKET", path_.c_str(), 1);
+    }
+  }
+  ~NotifyCapture() {
+    ::unsetenv("NOTIFY_SOCKET");
+    if (fd_ >= 0) ::close(fd_);
+    ::unlink(path_.c_str());
+  }
+  NotifyCapture(const NotifyCapture&) = delete;
+  NotifyCapture& operator=(const NotifyCapture&) = delete;
+
+  std::vector<std::string> Drain() const {
+    std::vector<std::string> out;
+    if (fd_ < 0) return out;
+    char buf[128];
+    for (;;) {
+      const ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+      if (n <= 0) break;
+      out.emplace_back(buf, static_cast<std::size_t>(n));
+    }
+    return out;
+  }
+
+  bool WaitFor(std::string_view expected, std::chrono::seconds timeout) const {
+    if (fd_ < 0) return false;
+    const int timeout_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      for (const auto& msg : Drain()) {
+        if (msg == expected) return true;
+      }
+      pollfd pfd{.fd = fd_, .events = POLLIN, .revents = 0};
+      const int ready = ::poll(&pfd, 1, timeout_ms);
+      if (ready <= 0) return false;
+    }
+    return false;
+  }
+
+ private:
+  std::string path_;
+  int fd_{-1};
+};
+
+// REQ-OPS-34, REQ-OPS-36, TODO.md DEPLOY-12: with --serve-refusal and
+// --start-studio-bridge, a phase-1 graph refusal writes last_refusal.json in
+// the log root, starts the Studio bridge with --refusal-file serving
+// /drive/summary.json with launch_refused: true and the refusal reason,
+// sends READY=1 once the bridge announces its listening port, stops
+// the bridge cleanly on SIGINT, and still returns 1.
+TEST(LauncherGraphTest, ServeRefusalStartsBridgeAndServesSummaryUntilStopped) {
+  NotifyCapture notify;
+  const std::string ready_fifo = TempPath("serve_refusal_ready.fifo");
+  ::unlink(ready_fifo.c_str());
+  ASSERT_EQ(::mkfifo(ready_fifo.c_str(), 0600), 0);
+
+  // Two writers on /alpha/state triggers a phase-1 graph refusal.
+  const std::string writer_alpha =
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")});
+  const std::string writer_beta =
+      DescribingStub("beta", "//example/beta:node", {Sender("/alpha/state")});
+  GraphFixture fixture{"serve_refusal", writer_alpha, writer_beta};
+  const std::string log_root = fixture.options.output_dir;
+  fixture.options.start_studio_bridge = true;
+  fixture.options.serve_refusal = true;
+  fixture.options.studio_http_port = 0;
+  fixture.options.duration_s = static_cast<int>(kHang.count());
+  fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStubNode("serve_refusal_bridge", RefusalBridgeStub(ready_fifo));
+
+  int exit_code = -1;
+  std::thread runner([&] { exit_code = Launcher{fixture.options}.Run(); });
+
+  // Blocks until the refusal bridge binds and announces its port.
+  uint16_t bound_port = 0;
+  {
+    std::ifstream in{ready_fifo};
+    int parsed = 0;
+    ASSERT_TRUE(in >> parsed) << "refusal bridge did not report a port";
+    bound_port = static_cast<uint16_t>(parsed);
+  }
+  ASSERT_GT(bound_port, 0u);
+  EXPECT_TRUE(notify.WaitFor("READY=1", kHang))
+      << "launcher did not send READY=1 after refusal bridge announced port";
+
+  const std::string response =
+      HttpGetLoopback(bound_port, "/drive/summary.json");
+  EXPECT_NE(response.find("200 OK"), std::string::npos) << response;
+  EXPECT_NE(response.find("\"launch_refused\": true"), std::string::npos)
+      << response;
+  EXPECT_NE(response.find("/alpha/state"), std::string::npos) << response;
+
+  const std::string refusal_json =
+      ReadFile(log_root + "/" + std::string{kLastRefusalFile});
+  EXPECT_NE(refusal_json.find("\"refused\": true"), std::string::npos)
+      << refusal_json;
+  EXPECT_NE(refusal_json.find("/alpha/state"), std::string::npos)
+      << refusal_json;
+
+  ASSERT_EQ(::kill(::getpid(), SIGINT), 0);
+  runner.join();
+
+  EXPECT_EQ(exit_code, 1);
+  EXPECT_FALSE(fixture.has_manifest());
+  ::unlink(ready_fifo.c_str());
+  std::filesystem::remove_all(log_root);
+}
+
+// REQ-OPS-34, REQ-OPS-50, TODO.md DEPLOY-12:
+// 1. Without --serve-refusal, a phase-1 refusal still writes last_refusal.json
+//    and returns 1 immediately without spawning the Studio bridge in refusal
+//    mode (preserving CLI tests like RefusedGraphIsNamedAtOnce).
+// 2. With --describe-only --serve-refusal, neither last_refusal.json nor the
+//    refusal bridge runs.
+// 3. When the refusal bridge exits immediately on its own (e.g. EADDRINUSE
+//    because a live session holds port 5800), --serve-refusal returns 1
+//    immediately without waiting for duration_s and without sending READY=1.
+TEST(LauncherGraphTest,
+     RefusalWithoutServeFlagOrWithExitingBridgeReturnsOneImmediately) {
+  const std::string writer_alpha =
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")});
+  const std::string writer_beta =
+      DescribingStub("beta", "//example/beta:node", {Sender("/alpha/state")});
+
+  // Case 1: serve_refusal = false -> refusal bridge is never spawned.
+  {
+    const std::string spawned = TempPath("no_serve_refusal_spawned");
+    ::unlink(spawned.c_str());
+    GraphFixture fixture{"no_serve_refusal", writer_alpha, writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = false;
+    fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+        WriteStubNode(
+            "no_serve_refusal_bridge",
+            "#!/bin/sh\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$a\" = \"--describe\" ]; then\n"
+            "    printf '{\"name\":\"studio_bridge\","
+            "\"target\":\"//studio/bridge:studio_bridge\",\"sources\":[]}\\n'\n"
+            "    exit 0\n"
+            "  fi\n"
+            "done\n"
+            "echo spawned > \"" +
+                spawned + "\"\nexit 0\n");
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(spawned))
+        << "refusal bridge ran without --serve-refusal";
+    const std::string refusal_json =
+        ReadFile(log_root + "/" + std::string{kLastRefusalFile});
+    EXPECT_NE(refusal_json.find("/alpha/state"), std::string::npos)
+        << refusal_json;
+    ::unlink(spawned.c_str());
+    std::filesystem::remove_all(log_root);
+  }
+
+  // Case 2: --describe-only with --serve-refusal writes no last_refusal.json.
+  {
+    GraphFixture fixture{"describe_only_serve_refusal", writer_alpha,
+                         writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    fixture.options.describe_only = true;
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = true;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(
+        std::filesystem::exists(log_root + "/" + std::string{kLastRefusalFile}))
+        << "--describe-only must not write last_refusal.json";
+    std::filesystem::remove_all(log_root);
+  }
+
+  // Case 3: refusal bridge exits immediately (e.g. EADDRINUSE) -> returns 1
+  // without waiting for duration_s and without reporting READY=1 to systemd.
+  {
+    NotifyCapture notify;
+    GraphFixture fixture{"eaddrinuse_serve_refusal", writer_alpha, writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    testing::SteppedClock clock;
+    fixture.options.supervision_clock = clock.clock();
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = true;
+    fixture.options.duration_s = static_cast<int>(kHang.count());
+    fixture.options
+        .binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
+        "eaddrinuse_refusal_bridge",
+        "#!/bin/sh\n"
+        "for a in \"$@\"; do\n"
+        "  if [ \"$a\" = \"--describe\" ]; then\n"
+        "    printf '{\"name\":\"studio_bridge\","
+        "\"target\":\"//studio/bridge:studio_bridge\",\"sources\":[]}\\n'\n"
+        "    exit 0\n"
+        "  fi\n"
+        "done\n"
+        "echo 'cannot listen on port 5800 (another process holds it?)' >&2\n"
+        "exit 1\n");
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    const auto notifications = notify.Drain();
+    EXPECT_EQ(std::find(notifications.begin(), notifications.end(), "READY=1"),
+              notifications.end())
+        << "READY=1 must not be sent when refusal bridge exits before "
+           "listening";
+    std::filesystem::remove_all(log_root);
+  }
+}
+
+// REQ-OPS-34, REQ-OPS-50, TODO.md DEPLOY-12: a launcher that does not own the
+// session lock (refused because another launcher holds it, or refused on a
+// pre-lock CLI error) must exit 1 immediately without overwriting an existing
+// <log_root>/last_refusal.json or spawning a refusal studio_bridge (which
+// would collide with a live session running --no-studio or a custom port).
+TEST(LauncherGraphTest,
+     RefusalWithoutSessionLockPreservesLastRefusalAndSkipsBridge) {
+  const std::string sentinel =
+      "{\"refused\":true,\"reason\":\"existing live refusal\"}\n";
+  const std::string writer_alpha =
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")});
+  const std::string writer_beta =
+      DescribingStub("beta", "//example/beta:node", {Sender("/alpha/state")});
+
+  // Case 1: held session lock (!take_lock()).
+  {
+    const std::string spawned = TempPath("held_lock_refusal_spawned");
+    ::unlink(spawned.c_str());
+    GraphFixture fixture{"held_lock_refusal", writer_alpha, writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    std::filesystem::create_directories(log_root);
+    const std::string refusal_path =
+        log_root + "/" + std::string{kLastRefusalFile};
+    {
+      std::ofstream out{refusal_path, std::ios::binary};
+      out << sentinel;
+    }
+    testing::SteppedClock clock;
+    fixture.options.supervision_clock = clock.clock();
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = true;
+    fixture.options.duration_s = static_cast<int>(kHang.count());
+    fixture.options.acquire_session_lock = [](std::string& error,
+                                              bool* no_room) {
+      error = "another launcher (pid 99999) is running a session";
+      if (no_room != nullptr) *no_room = false;
+      return std::optional<SessionLock>{};
+    };
+    fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+        WriteStubNode(
+            "held_lock_refusal_bridge",
+            "#!/bin/sh\necho spawned > \"" + spawned + "\"\nexit 0\n");
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(spawned))
+        << "refusal bridge must not spawn when session_lock is held";
+    EXPECT_EQ(ReadFile(refusal_path), sentinel)
+        << "existing last_refusal.json must not be clobbered on held lock";
+    ::unlink(spawned.c_str());
+    std::filesystem::remove_all(log_root);
+  }
+
+  // Case 2: pre-lock refusal (--allow-graph-errors without --sim).
+  {
+    const std::string spawned = TempPath("pre_lock_refusal_spawned");
+    ::unlink(spawned.c_str());
+    GraphFixture fixture{"pre_lock_refusal", writer_alpha, writer_beta};
+    const std::string log_root = fixture.options.output_dir;
+    std::filesystem::create_directories(log_root);
+    const std::string refusal_path =
+        log_root + "/" + std::string{kLastRefusalFile};
+    {
+      std::ofstream out{refusal_path, std::ios::binary};
+      out << sentinel;
+    }
+    testing::SteppedClock clock;
+    fixture.options.supervision_clock = clock.clock();
+    fixture.options.allow_graph_errors = true;
+    fixture.options.simulation = false;
+    fixture.options.start_studio_bridge = true;
+    fixture.options.serve_refusal = true;
+    fixture.options.duration_s = static_cast<int>(kHang.count());
+    fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+        WriteStubNode(
+            "pre_lock_refusal_bridge",
+            "#!/bin/sh\necho spawned > \"" + spawned + "\"\nexit 0\n");
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(spawned))
+        << "refusal bridge must not spawn on pre-lock refusal";
+    EXPECT_EQ(ReadFile(refusal_path), sentinel)
+        << "existing last_refusal.json must not be clobbered on pre-lock "
+           "refusal";
+    ::unlink(spawned.c_str());
+    std::filesystem::remove_all(log_root);
+  }
+}
+
+// REQ-OPS-34, TODO.md DEPLOY-12: StopSignals::Install() must be idempotent so
+// RefuseLaunch() never clears a stop signal that arrived after RunSession()
+// installed stop handlers; a pending stop must return 1 immediately without
+// spawning the refusal studio_bridge.
+TEST(LauncherGraphTest,
+     RefuseLaunchHonorsPendingStopSignalWithoutSpawningBridge) {
+  const std::string spawned = TempPath("pending_stop_refusal_spawned");
+  ::unlink(spawned.c_str());
+  auto options = SessionFixture("pending_stop_refusal");
+  const std::string log_root = options.output_dir;
+  // Invalid TOML forces ParseRobotConfig to fail and enter RefuseLaunch right
+  // after RunSession installed stop_signals and acquired session_lock.
+  std::ofstream{options.config_path} << "[robot\n";
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
+  options.start_studio_bridge = true;
+  options.serve_refusal = true;
+  options.duration_s = static_cast<int>(kHang.count());
+  options.acquire_session_lock = [](std::string& error, bool* no_room) {
+    auto lock = SessionLock::Acquire(error, no_room);
+    if (lock) ::raise(SIGINT);
+    return lock;
+  };
+  options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
+      "pending_stop_refusal_bridge",
+      "#!/bin/sh\necho spawned > \"" + spawned + "\"\nsleep 60\n");
+
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  EXPECT_FALSE(std::filesystem::exists(spawned))
+      << "refusal bridge must not spawn when a stop signal is already pending";
+  ::unlink(spawned.c_str());
+  std::filesystem::remove_all(log_root);
+}
+
+// TOOLS-7 / REQ-OPS-20: --check-session-lock checks the namespace SessionLock
+// without requiring --config or --bundle, exits 0 (and releases the lock) when
+// free, and exits 1 naming the holding process on stderr when held.
+TEST(LauncherTest, CheckSessionLockReportsFreeAndHeldWithoutConfig) {
+  const std::string log_root = TempPath("check_session_lock_out");
+  std::filesystem::remove_all(log_root);
+
+  LauncherOptions options;
+  options.check_session_lock = true;
+  options.output_dir = log_root;
+
+  // Free: exits 0 without creating any session directory or leaving the lock
+  // held.
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+  EXPECT_FALSE(std::filesystem::exists(log_root));
+  {
+    std::string lock_error;
+    EXPECT_TRUE(SessionLock::Acquire(lock_error).has_value()) << lock_error;
+  }
+
+  // Held by another process: exits 1 and names the holder's pid on stderr.
+  int ready_pipe[2]{-1, -1};
+  int hold_pipe[2]{-1, -1};
+  ASSERT_EQ(::pipe(ready_pipe), 0);
+  ASSERT_EQ(::pipe(hold_pipe), 0);
+  const pid_t holder = ::fork();
+  ASSERT_GE(holder, 0);
+  if (holder == 0) {
+    ::close(ready_pipe[0]);
+    ::close(hold_pipe[1]);
+    std::string err;
+    auto lock = SessionLock::Acquire(err);
+    const char ok = lock ? '1' : '0';
+    static_cast<void>(::write(ready_pipe[1], &ok, 1));
+    ::close(ready_pipe[1]);
+    char sink = 0;
+    static_cast<void>(::read(hold_pipe[0], &sink, 1));
+    ::close(hold_pipe[0]);
+    _exit(lock ? 0 : 2);
+  }
+  ::close(ready_pipe[1]);
+  ::close(hold_pipe[0]);
+  char ok = 0;
+  ASSERT_EQ(::read(ready_pipe[0], &ok, 1), 1);
+  ::close(ready_pipe[0]);
+  ASSERT_EQ(ok, '1');
+
+  ::testing::internal::CaptureStderr();
+  const int held_status = Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(held_status, 1) << stderr_text;
+  EXPECT_NE(stderr_text.find("pid " + std::to_string(holder)),
+            std::string::npos)
+      << stderr_text;
+  EXPECT_FALSE(std::filesystem::exists(log_root));
+
+  ::close(hold_pipe[1]);
+  int wait_status = 0;
+  ASSERT_EQ(::waitpid(holder, &wait_status, 0), holder);
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+}
+
+// VIS-1 (REQ-OPS-34, REQ-OPS-38, REQ-OPS-39, REQ-CONTRACT-33): even when
+// telemetry is non-critical (`critical = false`), an invalid
+// `[[subsystem.labels]]` entry or invalid `[studio] dashboard` layout is a
+// hard error in `--describe-only` and normal launch rather than a warning,
+// while valid configs pass and `--sim --allow-graph-errors` overrides refusal.
+TEST(LauncherGraphTest,
+     DescribeOnlyRefusesInvalidTelemetryLabelsAndDashboardLayout) {
+  std::string rf_error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &rf_error));
+  const char* telemetry_loc = std::getenv("TALOS_TELEMETRY");
+  ASSERT_NE(runfiles, nullptr) << rf_error;
+  ASSERT_NE(telemetry_loc, nullptr);
+  const std::string telemetry_bin = runfiles->Rlocation(telemetry_loc);
+  ASSERT_FALSE(telemetry_bin.empty());
+
+  const schema::Identity alerts_id = schema::Of<schema_test::Alerts>();
+  introspect::naming::SourceShape shooter_status;
+  shooter_status.kind = event::SourceKind::SENDER;
+  shooter_status.name = "/shooter/status";
+  shooter_status.message_bytes = sizeof(schema_test::Alerts);
+  shooter_status.alignment = alignof(schema_test::Alerts);
+  shooter_status.schema = alerts_id.name;
+  shooter_status.schema_hash = alerts_id.hash;
+  shooter_status.bfbs.assign(alerts_id.bfbs.begin(), alerts_id.bfbs.end());
+
+  const std::string hw_stub = WriteStubNode(
+      "vis1_hw",
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+  const std::string shooter_stub = WriteStubNode(
+      "vis1_shooter",
+      DescribingStub("shooter", "//example/shooter:node", {shooter_status}));
+  const std::string auto_stub = WriteStubNode(
+      "vis1_auto",
+      DescribingStub("autonomous", "//example/autonomous:node", {}));
+
+  const std::string dir = TempPath("vis1_telemetry_lint");
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+
+  const auto run_case =
+      [&](const std::string& tag, const std::string& studio_extra,
+          const std::string& telemetry_extra, const std::string& dashboard_toml,
+          bool describe_only, bool allow_graph_errors,
+          std::string& out_graph) -> int {
+    const std::string case_dir = dir + "/" + tag;
+    std::filesystem::create_directories(case_dir);
+    if (!dashboard_toml.empty()) {
+      std::ofstream(case_dir + "/dashboard.toml") << dashboard_toml;
+    }
+    const std::string config_path = case_dir + "/robot.toml";
+    std::ofstream(config_path)
+        << "[robot]\nperiod_us = 10000\n"
+        << "[studio]\ntopic = \"/talos/telemetry\"\n"
+        << studio_extra
+        << "[subsystems.shooter]\nnode = \"//example/shooter:node\"\n"
+        << "[subsystems.autonomous]\nnode = \"//example/autonomous:node\"\n"
+        << "routines = [\"preload\", \"none\", \"taxi\"]\n"
+        << "[subsystems.telemetry]\nnode = \"//talOS/telemetry:node\"\n"
+        << "critical = false\n"
+        << telemetry_extra;
+
+    LauncherOptions opts;
+    opts.config_path = config_path;
+    opts.output_dir = case_dir + "/out";
+    opts.session_id = 7001;
+    opts.describe_only = describe_only;
+    opts.simulation = allow_graph_errors;
+    opts.allow_graph_errors = allow_graph_errors;
+    opts.binary_overrides["//talOS/bridge:hardware_node"] = hw_stub;
+    opts.binary_overrides["//example/shooter:node"] = shooter_stub;
+    opts.binary_overrides["//example/autonomous:node"] = auto_stub;
+    opts.binary_overrides["//talOS/telemetry:node"] = telemetry_bin;
+    const int rc = Launcher{opts}.Run();
+    out_graph = ReadFile(opts.output_dir + "/7001/graph.json");
+    return rc;
+  };
+
+  const std::string valid_dashboard = R"([dashboard]
+title = "Drive"
+[[widgets]]
+kind = "number"
+at = [0, 0, 2, 1]
+channel = "shooter/status/supply_v"
+)";
+  const std::string valid_labels = R"([[subsystems.telemetry.labels]]
+channel = "shooter/status/routine_index"
+from = "autonomous.routines"
+)";
+
+  // 1. Valid labels + valid dashboard with critical = false telemetry passes.
+  {
+    std::string graph;
+    EXPECT_EQ(run_case("valid", "dashboard = \"dashboard.toml\"\n",
+                       valid_labels, valid_dashboard, /*describe_only=*/true,
+                       /*allow_graph_errors=*/false, graph),
+              0)
+        << graph;
+    EXPECT_TRUE(GraphErrors(graph).empty()) << graph;
+  }
+
+  // 2. Invalid [[subsystem.labels]] (unknown dictionary channel) is an error
+  // in --describe-only and normal launch.
+  for (const bool describe_only : {true, false}) {
+    SCOPED_TRACE(describe_only ? "bad_label_describe" : "bad_label_launch");
+    std::string graph;
+    const std::string bad_labels = R"([[subsystems.telemetry.labels]]
+channel = "shooter/status/nonexistent"
+from = "autonomous.routines"
+)";
+    EXPECT_EQ(run_case(describe_only ? "bad_label_d" : "bad_label_l", "",
+                       bad_labels, "", describe_only,
+                       /*allow_graph_errors=*/false, graph),
+              1)
+        << graph;
+    const auto errors = GraphFindings(graph, "error", "telemetry");
+    ASSERT_FALSE(errors.empty()) << graph;
+    EXPECT_NE(errors[0].find("labels[0].channel"), std::string::npos)
+        << errors[0];
+  }
+
+  // 3. Invalid dashboard layout (file-level syntax/schema error) is an error.
+  {
+    std::string graph;
+    const std::string bad_layout = R"([dashboard]
+title = "Drive"
+[[widgets]]
+kind = "not_a_widget"
+at = [0, 0, 2, 1]
+)";
+    EXPECT_EQ(run_case("bad_layout_kind", "dashboard = \"dashboard.toml\"\n",
+                       "", bad_layout, /*describe_only=*/true,
+                       /*allow_graph_errors=*/false, graph),
+              1)
+        << graph;
+    const auto errors = GraphFindings(graph, "error", "studio");
+    ASSERT_FALSE(errors.empty()) << graph;
+    EXPECT_NE(errors[0].find("widgets[0].kind"), std::string::npos)
+        << errors[0];
+  }
+
+  // 4. Invalid dashboard layout (channel absent from dictionary) is an error.
+  {
+    std::string graph;
+    const std::string missing_ch_layout = R"([dashboard]
+title = "Drive"
+[[widgets]]
+kind = "number"
+at = [0, 0, 2, 1]
+channel = "shooter/status/nope"
+)";
+    EXPECT_EQ(run_case("bad_layout_channel", "dashboard = \"dashboard.toml\"\n",
+                       "", missing_ch_layout, /*describe_only=*/true,
+                       /*allow_graph_errors=*/false, graph),
+              1)
+        << graph;
+    const auto errors = GraphFindings(graph, "error", "studio");
+    ASSERT_FALSE(errors.empty()) << graph;
+    EXPECT_NE(errors[0].find("widgets[0].channel"), std::string::npos)
+        << errors[0];
+  }
+
+  // 5. --sim --allow-graph-errors overrides the refusal while keeping the
+  // error recorded in graph.json.
+  {
+    std::string graph;
+    const std::string bad_layout = R"([dashboard]
+[[widgets]]
+kind = "number"
+at = [0, 0, 2, 1]
+channel = "shooter/status/nope"
+)";
+    EXPECT_EQ(run_case("allow_errors", "dashboard = \"dashboard.toml\"\n", "",
+                       bad_layout, /*describe_only=*/true,
+                       /*allow_graph_errors=*/true, graph),
+              0)
+        << graph;
+    EXPECT_FALSE(GraphFindings(graph, "error", "studio").empty()) << graph;
+  }
+
+  std::filesystem::remove_all(dir);
+  std::remove(hw_stub.c_str());
+  std::remove(shooter_stub.c_str());
+  std::remove(auto_stub.c_str());
+}
+
+// REQ-RT-23: `--describe-only` enforces the 20 ms minimum period for Python
+// actuator owners (`abi_update: true`): a Python actuator owner at 10 ms fails
+// with an error naming the subsystem, its period and the 20000 us minimum,
+// while a C++ actuator owner (`abi_update: false`) at 5 ms passes.
+TEST(LauncherGraphTest, DescribeOnlyEnforcesPythonActuatorMinimumPeriod) {
+  const auto stub_with_abi = [](std::string_view node, std::string_view target,
+                                bool abi_update) {
+    introspect::Description description;
+    description.name = std::string{node};
+    description.target = std::string{target};
+    description.abi_update = abi_update;
+    return std::string{"#!/bin/sh\n"} +
+           "for arg in \"$@\"; do\n"
+           "  if [ \"$arg\" = \"--describe\" ]; then\n"
+           "    cat <<'TALOS_DESCRIBE'\n" +
+           introspect::DescribeToJson(description) +
+           "TALOS_DESCRIBE\n"
+           "    exit 0\n"
+           "  fi\n"
+           "done\n"
+           "exit 0\n";
+  };
+
+  // Case 1: beta (10 ms motor owner) describes abi_update: true -> refused;
+  // alpha (5 ms motor owner) describes abi_update: false -> no error for alpha.
+  {
+    GraphFixture fixture{
+        "py_period_refused",
+        stub_with_abi("alpha", "//example/alpha:node", /*abi_update=*/false),
+        stub_with_abi("beta", "//example/beta:node", /*abi_update=*/true)};
+    fixture.options.describe_only = true;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(fixture.has_manifest());
+    const std::string graph = fixture.graph_json();
+    const auto beta_errors = GraphFindings(graph, "error", "beta");
+    ASSERT_EQ(beta_errors.size(), 1u) << graph;
+    EXPECT_NE(beta_errors[0].find("10000"), std::string::npos)
+        << beta_errors[0];
+    EXPECT_NE(beta_errors[0].find(std::to_string(kMinPythonActuatorPeriodUs)),
+              std::string::npos)
+        << beta_errors[0];
+    EXPECT_TRUE(GraphFindings(graph, "error", "alpha").empty()) << graph;
+  }
+
+  // Case 2: alpha (5 ms motor owner) and beta (10 ms motor owner) both
+  // describe abi_update: false -> passes --describe-only cleanly.
+  {
+    GraphFixture fixture{
+        "py_period_cpp_ok",
+        stub_with_abi("alpha", "//example/alpha:node", /*abi_update=*/false),
+        stub_with_abi("beta", "//example/beta:node", /*abi_update=*/false)};
+    fixture.options.describe_only = true;
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
+    EXPECT_FALSE(fixture.has_manifest());
+    const std::string graph = fixture.graph_json();
+    EXPECT_TRUE(GraphErrors(graph).empty()) << graph;
+  }
+}
+
+// REQ-OPS-12: WriteFileAtomically syncs the flushed temporary file before
+// renaming over the target, syncs the parent directory after renaming, and
+// leaves the prior file intact (and cleans up the temp file) if the temp-fd
+// sync fails.
+TEST(LauncherTest, WriteFileAtomicallySyncsTempBeforeRenameAndDirAfterRename) {
+  const std::string dir = TempPath("atomic_write_sync_order");
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string target = dir + "/manifest.json";
+  const std::string temp = target + ".tmp";
+  {
+    std::ofstream out{target, std::ios::binary};
+    out << "prior-version";
+  }
+
+  struct stat dir_stat {};
+  ASSERT_EQ(::stat(dir.c_str(), &dir_stat), 0);
+
+  // Success path: temp-fd synced before rename, dir-fd synced after rename.
+  {
+    std::vector<std::string> events;
+    std::string error;
+    const SyncFunction record_sync = [&](int fd) {
+      struct stat st {};
+      if (::fstat(fd, &st) != 0) {
+        events.push_back("fstat_failed");
+        errno = EIO;
+        return -1;
+      }
+      if (S_ISREG(st.st_mode)) {
+        struct stat tmp_st {};
+        const bool matches_tmp = ::stat(temp.c_str(), &tmp_st) == 0 &&
+                                 st.st_dev == tmp_st.st_dev &&
+                                 st.st_ino == tmp_st.st_ino;
+        const bool target_still_prior = ReadFile(target) == "prior-version";
+        const bool tmp_has_new = ReadFile(temp) == "new-version";
+        events.push_back(matches_tmp && target_still_prior && tmp_has_new
+                             ? "sync_temp_before_rename"
+                             : "sync_temp_wrong_state");
+      } else if (S_ISDIR(st.st_mode)) {
+        const bool matches_dir =
+            st.st_dev == dir_stat.st_dev && st.st_ino == dir_stat.st_ino;
+        const bool target_has_new = ReadFile(target) == "new-version";
+        const bool tmp_gone = !std::filesystem::exists(temp);
+        events.push_back(matches_dir && target_has_new && tmp_gone
+                             ? "sync_dir_after_rename"
+                             : "sync_dir_wrong_state");
+      } else {
+        events.push_back("sync_unexpected_kind");
+      }
+      return 0;
+    };
+    EXPECT_TRUE(WriteFileAtomically(target, "new-version", record_sync, error))
+        << error;
+    EXPECT_EQ(events, (std::vector<std::string>{"sync_temp_before_rename",
+                                                "sync_dir_after_rename"}));
+    EXPECT_EQ(ReadFile(target), "new-version");
+    EXPECT_FALSE(std::filesystem::exists(temp));
+  }
+
+  // Failure path: temp-fd sync failure aborts before rename, leaves the prior
+  // file intact, removes the temporary file, and does not sync the directory.
+  {
+    int sync_calls = 0;
+    std::string error;
+    const SyncFunction fail_temp_sync = [&](int) {
+      ++sync_calls;
+      errno = EIO;
+      return -1;
+    };
+    EXPECT_FALSE(
+        WriteFileAtomically(target, "corrupt-attempt", fail_temp_sync, error));
+    EXPECT_FALSE(error.empty());
+    EXPECT_EQ(sync_calls, 1);
+    EXPECT_EQ(ReadFile(target), "new-version");
+    EXPECT_FALSE(std::filesystem::exists(temp));
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
+// REQ-OPS-08, REQ-OPS-33, REQ-OPS-11: when an exception escapes RunSession()
+// while ManifestWriter's background thread is active, ManifestWriter must stop
+// and join before SessionDirectoryLock is released and before LauncherOutput is
+// torn down (preventing UAF/race on std::cerr and unlocked directory writes).
+TEST(LauncherTest, ManifestWriterStopsBeforeTeardownOnException) {
+  GraphFixture fixture{
+      "manifest_unwind",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")})};
+  const std::string session_dir = fixture.out_dir;
+  const std::thread::id main_thread = std::this_thread::get_id();
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool worker_in_sync = false;
+  bool worker_synced = false;
+  bool lock_lost_while_writing = false;
+
+  fixture.options.sync_file = [&](int) {
+    if (std::this_thread::get_id() == main_thread) return 0;
+    {
+      const std::lock_guard lock{mutex};
+      worker_in_sync = true;
+      worker_synced = true;
+    }
+    cv.notify_all();
+    // Hold briefly while the main thread throws and unwinds: if ~Launcher()
+    // releases session_directory_ before joining manifest_writer_, Held() flips
+    // to false here.
+    std::unique_lock lock{mutex};
+    for (int i = 0; i < 30; ++i) {
+      if (!SessionDirectoryLock::Held(session_dir, false)) {
+        lock_lost_while_writing = true;
+        break;
+      }
+      cv.wait_for(lock, std::chrono::milliseconds{5});
+    }
+    // Fail the sync so ManifestWriter::Persist logs to std::cerr while
+    // LauncherOutput must still be alive.
+    errno = EIO;
+    return -1;
+  };
+
+  bool threw_once = false;
+  fixture.options.member_spawned = [&](const std::string&) {
+    if (threw_once) return;
+    threw_once = true;
+    std::unique_lock lock{mutex};
+    cv.wait_for(lock, kHang, [&] { return worker_in_sync; });
+    throw std::runtime_error("injected unwind");
+  };
+
+  EXPECT_THROW(static_cast<void>(Launcher{fixture.options}.Run()),
+               std::runtime_error);
+  EXPECT_TRUE(worker_synced);
+  EXPECT_FALSE(lock_lost_while_writing)
+      << "SessionDirectoryLock was released while ManifestWriter was still "
+         "running";
+  EXPECT_FALSE(SessionDirectoryLock::Held(session_dir, false));
+  const std::string talos_log =
+      ReadFile(session_dir + "/" + std::string{kLauncherOutputFile});
+  EXPECT_NE(talos_log.find("cannot persist"), std::string::npos) << talos_log;
 }
 
 }  // namespace

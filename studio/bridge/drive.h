@@ -255,6 +255,9 @@ struct DriveSummaryNode {
   // The target lane source its Target last selected, while it is alive;
   // nullopt when it selected none or reads no target.
   std::optional<std::string> drives;
+  // True while the node is alive and its devices flush is holding back outputs
+  // set with no live target (introspect::kFlagOutputsHeld; REQ-SAFE-41).
+  bool outputs_held{false};
 };
 
 struct DriveSummary {
@@ -262,12 +265,61 @@ struct DriveSummary {
   bool supervised{false};  // restarts and quarantine come from a manifest
   // The live registry was read; when false, `alive` means unknown.
   bool registry{false};
+  // Set when the launcher refused the launch in phase 1 and started the bridge
+  // in refusal mode (`--refusal-file`): /drive renders LAUNCH REFUSED with
+  // `refusal_reason` instead of BRIDGE LINK or stale telemetry.
+  bool launch_refused{false};
+  std::string refusal_reason;
   std::vector<DriveSummaryNode> nodes;
 };
 
+// Minimal valid /drive/layout.json served in refusal mode when no robot
+// dashboard layout is available (e.g., a TOML parse error or early refusal),
+// so /drive loads immediately with zero 404/stuck state and opens its feed.
+inline constexpr std::string_view kRefusalDriveLayoutJson =
+    R"({"title":"Drive","columns":1,"rows":1,"update_hz":5,"alerts":false,"channels":[],"widgets":[]})";
+
+// Builds a refusal DriveSummary from the launcher's `last_refusal.json`
+// (`{"refused":true,"reason":"...","config_path":"...","wall_ns":...}`).
+// Falls back to `fallback_reason`, trimmed raw bytes, or a generic message if
+// the file is unreadable or malformed so /drive always surfaces LAUNCH REFUSED.
+inline DriveSummary BuildRefusalDriveSummary(
+    std::string_view refusal_json, std::string_view fallback_reason = {}) {
+  DriveSummary summary;
+  summary.launch_refused = true;
+  if (!refusal_json.empty()) {
+    const nlohmann::json parsed =
+        nlohmann::json::parse(refusal_json, nullptr, false);
+    if (parsed.is_object() && parsed.contains("reason") &&
+        parsed["reason"].is_string()) {
+      summary.refusal_reason = parsed["reason"].get<std::string>();
+    }
+  }
+  if (summary.refusal_reason.empty() && !fallback_reason.empty()) {
+    summary.refusal_reason.assign(fallback_reason);
+  }
+  if (summary.refusal_reason.empty() && !refusal_json.empty()) {
+    std::string_view trimmed = refusal_json;
+    while (!trimmed.empty() &&
+           (trimmed.front() == ' ' || trimmed.front() == '\t' ||
+            trimmed.front() == '\r' || trimmed.front() == '\n')) {
+      trimmed.remove_prefix(1);
+    }
+    while (!trimmed.empty() &&
+           (trimmed.back() == ' ' || trimmed.back() == '\t' ||
+            trimmed.back() == '\r' || trimmed.back() == '\n')) {
+      trimmed.remove_suffix(1);
+    }
+    if (!trimmed.empty()) summary.refusal_reason.assign(trimmed);
+  }
+  if (summary.refusal_reason.empty()) {
+    summary.refusal_reason = "launch refused; see launcher logs on the robot";
+  }
+  return summary;
+}
+
 // The name the Studio bridge goes by in the registry (Bridge::self) and in
-// the launcher's manifest (its kStudioBridgeName), so the drive summary,
-// which reports the nodes the bridge watches, leaves it out.
+// the launcher's manifest (its kStudioBridgeName).
 inline constexpr std::string_view kStudioBridgeNodeName = "studio_bridge";
 
 // A node the session's config launches: its name and whether the launcher
@@ -280,16 +332,20 @@ struct DriveRosterEntry {
 
 // The drive summary. Its nodes are the launcher's roster as its manifest
 // (`manifest_json`, empty when there is none) lists them, in that order:
-// every member it supervises (the sim gateway included) but the Studio
-// bridge, with `restarts` and `quarantined` from each entry and `critical`
-// from `config` by name (true for a member the config does not list, such
-// as the sim gateway). Without a manifest, or one listing no member yet,
-// they are `config`'s nodes in its order. `alive` and `drives` come from
-// the live registry's rows of that name (`registry`; nullptr when it could
-// not be read, and the summary then says `registry: false` rather than
-// every node dead as a fact). A manifest that does not parse is
-// treated as absent, so the summary says `supervised: false` rather than
-// zero restarts as a fact; the session then comes from the registry.
+// every member it supervises (the sim gateway and the Studio bridge
+// included), with `restarts`, `quarantined`, `critical` and `studio_bridge`
+// from each entry. On legacy manifests lacking `studio_bridge` or `critical`,
+// `studio_bridge` falls back to `name == kStudioBridgeNodeName` not listed in
+// `config`, and `critical` falls back to `config` by name (else
+// `!is_studio_bridge`). Without a manifest, or one listing no member yet, they
+// are `config`'s nodes in its order. `alive`, `drives` and `outputs_held` come
+// from the live registry's rows of that name (`registry`; nullptr when it could
+// not be read, and the summary then says `registry: false` rather than every
+// node dead as a fact); when the registry is readable, the launcher-added
+// Studio bridge (`is_studio_bridge`) is always alive because it is serving this
+// summary. A manifest that does not parse is treated as absent, so the summary
+// says `supervised: false` rather than zero restarts as a fact; the session
+// then comes from the registry.
 inline DriveSummary BuildDriveSummary(
     const std::vector<DriveRosterEntry>& config,
     const std::vector<talos::introspect::NodeSnapshot>* registry,
@@ -319,10 +375,12 @@ inline DriveSummary BuildDriveSummary(
       }
     }
   }
+  std::vector<bool> studio_bridge_flags;
   if (summary.supervised && manifest.contains("nodes") &&
       manifest["nodes"].is_array()) {
     const auto& members = manifest["nodes"];
     summary.nodes.reserve(members.size());
+    studio_bridge_flags.reserve(members.size());
     for (const auto& row : members) {
       if (!row.is_object() || !row.contains("name") ||
           !row["name"].is_string()) {
@@ -330,12 +388,21 @@ inline DriveSummary BuildDriveSummary(
       }
       DriveSummaryNode node;
       node.name = row["name"].get<std::string>();
-      if (node.name == kStudioBridgeNodeName) continue;
       const auto listed = std::find_if(config.begin(), config.end(),
                                        [&node](const DriveRosterEntry& entry) {
                                          return entry.name == node.name;
                                        });
-      node.critical = listed == config.end() || listed->critical;
+      const bool is_studio_bridge =
+          row.contains("studio_bridge") && row["studio_bridge"].is_boolean()
+              ? row["studio_bridge"].get<bool>()
+              : (node.name == kStudioBridgeNodeName && listed == config.end());
+      if (row.contains("critical") && row["critical"].is_boolean()) {
+        node.critical = row["critical"].get<bool>();
+      } else if (listed != config.end()) {
+        node.critical = listed->critical;
+      } else {
+        node.critical = !is_studio_bridge;
+      }
       if (row.contains("restart_count") &&
           row["restart_count"].is_number_unsigned()) {
         node.restarts = row["restart_count"].get<std::uint64_t>();
@@ -344,10 +411,12 @@ inline DriveSummary BuildDriveSummary(
         node.quarantined = row["quarantined"].get<bool>();
       }
       summary.nodes.push_back(std::move(node));
+      studio_bridge_flags.push_back(is_studio_bridge);
     }
   }
   if (summary.nodes.empty()) {
     summary.nodes.reserve(config.size());
+    studio_bridge_flags.assign(config.size(), false);
     for (const DriveRosterEntry& entry : config) {
       DriveSummaryNode node;
       node.name = entry.name;
@@ -355,10 +424,12 @@ inline DriveSummary BuildDriveSummary(
       summary.nodes.push_back(std::move(node));
     }
   }
-  for (DriveSummaryNode& node : summary.nodes) {
+  for (std::size_t i = 0; i < summary.nodes.size(); ++i) {
+    DriveSummaryNode& node = summary.nodes[i];
     for (const auto& row : rows) {
       if (row.name != node.name || !row.alive) continue;
       node.alive = true;
+      node.outputs_held = row.outputs_held();
       for (const auto& selection : row.selections) {
         if (auto source = selection.selected_source()) {
           node.drives = std::move(*source);
@@ -366,6 +437,9 @@ inline DriveSummary BuildDriveSummary(
         }
       }
       break;
+    }
+    if (summary.registry && studio_bridge_flags[i]) {
+      node.alive = true;
     }
   }
   return summary;
@@ -387,6 +461,9 @@ inline void AppendDriveNode(std::string& out, const DriveSummaryNode& node) {
   } else {
     out += "null";
   }
+  if (node.outputs_held) {
+    out += ",\"outputs_held\":true";
+  }
   out += '}';
 }
 
@@ -394,7 +471,9 @@ inline void AppendDriveNode(std::string& out, const DriveSummaryNode& node) {
 
 // The drive summary message (README.md "Driver dashboard feed"), at most
 // `max_bytes`: when every node does not fit, the nodes at the end that do
-// not are left out and counted in "omitted".
+// not are left out and counted in "omitted". When `summary.launch_refused` is
+// true, carries `"launch_refused":true,"refusal_reason":...` (truncating the
+// reason cleanly at a UTF-8 code-point boundary if needed to fit `max_bytes`).
 inline std::string DriveSummaryJson(
     const DriveSummary& summary,
     std::size_t max_bytes = talos::telemetry_wire::kDriveSummaryMaxBytes) {
@@ -402,6 +481,37 @@ inline std::string DriveSummaryJson(
   AppendEscaped(head, summary.session);
   head += summary.supervised ? ",\"supervised\":true" : ",\"supervised\":false";
   head += summary.registry ? ",\"registry\":true" : ",\"registry\":false";
+  if (summary.launch_refused) {
+    head += ",\"launch_refused\":true,\"refusal_reason\":";
+    const std::string suffix = ",\"nodes\":[],\"omitted\":0}";
+    std::string escaped;
+    AppendEscaped(escaped, summary.refusal_reason);
+    if (head.size() + escaped.size() + suffix.size() <= max_bytes) {
+      head += escaped;
+      head += suffix;
+      return head;
+    }
+    std::size_t len = summary.refusal_reason.size();
+    while (len > 0) {
+      --len;
+      while (len > 0 &&
+             (static_cast<unsigned char>(summary.refusal_reason[len]) & 0xC0) ==
+                 0x80) {
+        --len;
+      }
+      escaped.clear();
+      AppendEscaped(escaped,
+                    std::string(summary.refusal_reason.substr(0, len)) + "...");
+      if (head.size() + escaped.size() + suffix.size() <= max_bytes) {
+        head += escaped;
+        head += suffix;
+        return head;
+      }
+    }
+    head += "\"\"";
+    head += suffix;
+    return head;
+  }
   head += ",\"nodes\":[";
   std::vector<std::string> nodes;
   nodes.reserve(summary.nodes.size());

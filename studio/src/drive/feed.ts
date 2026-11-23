@@ -33,11 +33,14 @@
 //     message, heartbeat included, for SILENCE_MS: the bridge sends one at
 //     least every 100 ms), then telemetry (messages arrive but no new tick),
 //     then the hardware bridge (`hw/status` absent: hardware_node publishes
-//     nothing) and the RoboRIO link (`hw/status/alert_error_link_lost`).
-//     Those two only when the feed carries that channel, which the bridge's
-//     mask does when /drive/layout.json lists it in `channels` or has
-//     `alerts` true (an `alerts` widget); otherwise the channel's absence
-//     says nothing, and the status line says nothing of either. Right after
+//     nothing), protocol mismatch (`hw/status/alert_error_protocol_mismatch`,
+//     checked before link lost so a partial deploy is named instead of a
+//     generic lost link) and the RoboRIO link (`hw/status/alert_error_link_lost`).
+//     Those only when the feed carries those channels, which the bridge's
+//     mask does when /drive/layout.json lists them in `channels` or has
+//     `alerts` true (an `alerts` widget); otherwise the OK line states that
+//     the RoboRIO link is not judged (and names "no hardware bridge" when the
+//     dictionary lacks `/hw/status`). Right after
 //     a socket opens the bridge may still be refilling the slot's bucket
 //     before the dictionary (README: at most about 0.8 s on the 2026 config):
 //     for CONNECTING_GRACE_MS that is `connecting`, not a lost link. After
@@ -49,11 +52,12 @@
 //     value page of the socket decoded and within CONNECTING_GRACE_MS of its
 //     opening (a corrupt message before the dictionary), is then ignored. A
 //     binary one after the grace with no value page decoded closes the socket
-//     as an error: the bridge sends the dictionary and a keyframe within the
-//     grace, so the feed is one this page cannot read (a page from another
-//     bridge version fails every page, the dictionary included) or its
-//     dictionary or keyframe was lost. A binary one after a value page
-//     decoded closes it too: the updates carry only changes,
+//     as an error (and so does passing the grace with no value page decoded
+//     after a binary one failed inside it): the bridge sends the dictionary and
+//     a keyframe within the grace, so the feed is one this page cannot read (a
+//     page from another bridge version fails every page, the dictionary
+//     included) or its dictionary or keyframe was lost. A binary one after a
+//     value page decoded closes it too: the updates carry only changes,
 //     and a keyframe's first page clears every channel, so a lost page (or
 //     a later page of a keyframe or an update whose earlier pages the
 //     decoder applied) would leave a value wrong or absent while later
@@ -61,8 +65,8 @@
 //     keyframe. Such a close is the feed's fault, not the link's: the status
 //     names the telemetry feed until a later socket decodes a value page or
 //     stays open past CONNECTING_GRACE_MS with no binary message that fails
-//     to decode (one that fails inside the grace holds the name until the
-//     close the next one makes), and after
+//     to decode (one that fails inside the grace closes the socket once the
+//     grace ends with no value page decoded), and after
 //     DECODE_RETRIES of them in a row (each within DECODE_STREAK_MS of its
 //     socket opening) attempts start DECODE_RETRY_MS apart, so a feed that
 //     never decodes does not spend the slot's byte budget on a dictionary
@@ -82,6 +86,8 @@ export const DECODE_RETRY_MS = 5000;
 export const DECODE_STREAK_MS = 10_000;
 export const REPLACED_CODE = 4000;
 export const LINK_LOST_CHANNEL = 'hw/status/alert_error_link_lost';
+export const PROTOCOL_MISMATCH_CHANNEL = 'hw/status/alert_error_protocol_mismatch';
+export const STATE_AGE_CHANNEL = 'hw/status/state_age_us';
 // The longest history a graph or a field trail can ask for (README: 30 s),
 // and a cap on points per channel whatever the update rate.
 const HISTORY_S = 30;
@@ -105,6 +111,7 @@ export type SummaryNode = {
   restarts: number;
   quarantined: boolean;
   drives: string|null;
+  outputs_held: boolean;
 };
 // talos.drive.summary (README): `registry` false means `alive` and `drives`
 // are unknown, `supervised` false that `restarts` and `quarantined` are.
@@ -114,11 +121,14 @@ export type DriveSummary = {
   registry: boolean;
   nodes: SummaryNode[];
   omitted: number;
+  launch_refused?: boolean;
+  refusal_reason?: string;
 };
 
 export type Connection = 'connecting'|'open'|'waiting'|'replaced';
+export type LayoutReloadReason = 'reconnect'|'session'|'dictionary';
 export type Link =
-    'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'roborio'|'replaced';
+    'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'protocol'|'roborio'|'replaced'|'refused';
 // `undecodable`: the line names a feed the page could not decode.
 export type LinkStatus = {link: Link; text: string; undecodable?: true};
 
@@ -155,16 +165,22 @@ export function parseSummary(v: unknown): DriveSummary|null {
       restarts: typeof node.restarts === 'number' && Number.isFinite(node.restarts) ?
           node.restarts : 0,
       quarantined: node.quarantined === true,
-      drives: typeof node.drives === 'string' ? node.drives : null
+      drives: typeof node.drives === 'string' ? node.drives : null,
+      outputs_held: node.outputs_held === true
     });
   }
-  return {
+  const summary: DriveSummary = {
     session: typeof s.session === 'string' ? s.session : '',
     supervised: s.supervised,
     registry: s.registry,
     nodes,
     omitted: typeof s.omitted === 'number' && s.omitted > 0 ? s.omitted : 0
   };
+  if (s.launch_refused === true) {
+    summary.launch_refused = true;
+    if (typeof s.refusal_reason === 'string') summary.refusal_reason = s.refusal_reason;
+  }
+  return summary;
 }
 
 function bytesOf(data: unknown): Uint8Array|null {
@@ -207,21 +223,52 @@ export class DriveModel {
   // the current socket while no value page has decoded on it and either it
   // has been open at most CONNECTING_GRACE_MS (the dictionary and keyframe's
   // bound) or a binary message on it failed to decode (undecodableThisSocket:
-  // one inside the grace carries the line across it to the decode close the
-  // next one makes). Otherwise the line judges that socket like any other,
-  // while the streak itself carries on to the next decode close.
+  // one inside the grace carries the line across it until tick() or the next
+  // undecodable message closes the socket). Otherwise the line judges that
+  // socket like any other, while the streak itself carries on to the next
+  // decode close.
   private decodeFailures = 0;
   private undecodableThisSocket = false;  // a binary message of this socket failed to decode
-  private readonly tracked: Set<string>;
+  private tracked: Set<string>;
+  private carried: Carried;
   private readonly histories = new Map<string, Point[]>();
+
+  // Called when the bridge may be serving a new /drive/layout.json: on a
+  // WebSocket reconnect (including after a failed initial attempt), or when a
+  // new session or telemetry dictionary/stream appears mid-connection.
+  onLayoutCheck: ((reason: LayoutReloadReason) => void)|null = null;
+  // Called when the active socket closes or fails (including close 4000), so
+  // any in-flight layout reload or retry timer can be cancelled.
+  onDisconnect: (() => void)|null = null;
 
   // `tracked`: the channels whose history a graph or a field trail draws;
   // `carried`: what the layout says the feed carries.
   constructor(private readonly url: string,
               private readonly openSocket: SocketFactory,
               tracked: Iterable<string> = [],
-              private readonly carried: Carried = {channels: [], alerts: false}) {
+              carried: Carried = {channels: [], alerts: false}) {
     this.tracked = new Set(tracked);
+    this.carried = carried;
+  }
+
+  // Updates the layout's tracked history channels and carried-channel mask
+  // after /drive/layout.json reloads, preserving held telemetry, summary,
+  // connection state and latched alerts.
+  setLayout(tracked: Iterable<string>, carried: Carried) {
+    const next = new Set(tracked);
+    this.tracked = next;
+    this.carried = carried;
+    for (const channel of this.histories.keys()) {
+      if (!next.has(channel)) this.histories.delete(channel);
+    }
+    if (this.latest) {
+      const t_s = Number(BigInt(this.latest.timestamp_ns) / 1000n) / 1e6;
+      for (const channel of next) {
+        if (this.histories.has(channel)) continue;
+        const v = this.latest.channels[channel];
+        if (v !== undefined) this.histories.set(channel, [{t_s, v}]);
+      }
+    }
   }
 
   // Whether the feed carries `name` in `s`'s dictionary, so its absence is
@@ -249,6 +296,9 @@ export class DriveModel {
     } else if (this.connection === 'open' &&
                now - this.lastMessageAt >= DEAD_AFTER_MS) {
       this.fail();
+    } else if (this.connection === 'open' && this.undecodableThisSocket &&
+               !this.valuesThisSocket && now - this.openedAt > CONNECTING_GRACE_MS) {
+      this.fail(now, true);
     }
     if (this.connection === 'waiting' && now >= this.nextAttemptAt) this.connect(now);
   }
@@ -310,6 +360,13 @@ export class DriveModel {
     if (now - this.lastMessageAt > SILENCE_MS)
       return {link: 'bridge', text: 'Dashboard to bridge link: nothing heard for ' +
                                     seconds(now - this.lastMessageAt)};
+    if (this.summaryThisSocket && this.summary?.launch_refused) {
+      const reason = this.summary.refusal_reason?.trim();
+      return {
+        link: 'refused',
+        text: reason || 'Robot launch refused; check launcher logs and redeploy'
+      };
+    }
     if (this.suspended)
       return {link: 'telemetry', text: 'Telemetry stale: the page missed time (laptop asleep), ' +
                                        'waiting for a new tick'};
@@ -333,6 +390,15 @@ export class DriveModel {
       return {link: 'telemetry',
               text: 'Telemetry stale: no new tick for ' + seconds(now - this.lastTickAt)};
     const s = this.latest;
+    if (s && this.carries(s, PROTOCOL_MISMATCH_CHANNEL)) {
+      const mismatch = s.channels[PROTOCOL_MISMATCH_CHANNEL];
+      if (mismatch !== undefined && !Number.isNaN(mismatch) && mismatch !== 0) {
+        return {
+          link: 'protocol',
+          text: 'RoboRIO and main processor protocol versions differ; redeploy both'
+        };
+      }
+    }
     if (s && this.carries(s, LINK_LOST_CHANNEL)) {
       const lost = s.channels[LINK_LOST_CHANNEL];
       // No sample of /hw/status: the process that failed is the hardware
@@ -340,8 +406,15 @@ export class DriveModel {
       if (lost === undefined)
         return {link: 'hardware', text: 'Hardware bridge not publishing: no hardware status'};
       if (lost !== 0) return {link: 'roborio', text: 'RoboRIO link lost'};
+      return {link: 'ok', text: 'Connected: telemetry current'};
     }
-    return {link: 'ok', text: 'Connected: telemetry current'};
+    const noHardwareBridge = !s || s.units[LINK_LOST_CHANNEL] === undefined;
+    return {
+      link: 'ok',
+      text: noHardwareBridge ?
+          'Connected: telemetry current (RoboRIO link not judged: no hardware bridge)' :
+          'Connected: telemetry current (RoboRIO link not judged)'
+    };
   }
 
   private connect(now: number) {
@@ -379,10 +452,12 @@ export class DriveModel {
   clock: () => number = () => 0;
 
   private onOpen(now: number) {
+    const isReconnect = this.everOpened || this.counters.connects > 1;
     this.connection = 'open';
     this.everOpened = true;
     this.openedAt = now;
     this.lastMessageAt = now;
+    if (isReconnect) this.onLayoutCheck?.('reconnect');
   }
 
   private onMessage(data: unknown, now: number) {
@@ -432,8 +507,15 @@ export class DriveModel {
         this.counters.malformed_text++;
         return;
       }
+      const prev = this.summary;
+      const sameSocket = this.summaryThisSocket;
       this.summary = summary;
       this.summaryThisSocket = true;
+      if (sameSocket && prev !== null &&
+          (prev.session !== summary.session ||
+           Boolean(prev.launch_refused) !== Boolean(summary.launch_refused))) {
+        this.onLayoutCheck?.('session');
+      }
       return;
     }
     if (typeof kind === 'string') this.counters.ignored_text++;
@@ -442,23 +524,28 @@ export class DriveModel {
 
   private onSnapshot(s: Snapshot, now: number) {
     const held = this.latest;
+    const sameSocket = this.tickThisSocket;
     const newer = held === null || s.stream_id !== held.stream_id ||
         BigInt(s.sequence_id) > BigInt(held.sequence_id);
+    const dictChanged = sameSocket && held !== null &&
+        (s.stream_id !== held.stream_id || s.dictionary_id !== held.dictionary_id);
     const keyframe = !this.tickThisSocket;
     this.latest = s;
     if (keyframe) {
       this.tickThisSocket = true;
       this.keyframeAt = now;
     }
-    if (!newer) return;
-    this.alerts.push(s);
-    this.record(s);
-    // The connect-time keyframe is as old as the bridge's newest tick, which
-    // the page cannot tell: only a tick after it on this socket is current.
-    if (!keyframe) {
-      this.lastTickAt = now;
-      this.suspended = false;
+    if (newer) {
+      this.alerts.push(s);
+      this.record(s);
+      // The connect-time keyframe is as old as the bridge's newest tick, which
+      // the page cannot tell: only a tick after it on this socket is current.
+      if (!keyframe) {
+        this.lastTickAt = now;
+        this.suspended = false;
+      }
     }
+    if (dictChanged) this.onLayoutCheck?.('dictionary');
   }
 
   private record(s: Snapshot) {
@@ -481,9 +568,11 @@ export class DriveModel {
     this.decodeFailures = 0;
     if (code === REPLACED_CODE) {
       this.connection = 'replaced';
+      this.onDisconnect?.();
       return;
     }
     this.wait();
+    this.onDisconnect?.();
   }
 
   // Closes the socket as an error; `decode`: the page's own close, for a
@@ -494,6 +583,7 @@ export class DriveModel {
     else if (this.connection === 'open' && now - this.openedAt > DECODE_STREAK_MS) this.decodeFailures = 1;
     else this.decodeFailures++;
     this.wait();
+    this.onDisconnect?.();
   }
 
   // The next attempt starts RECONNECT_MS after this one started: attempts

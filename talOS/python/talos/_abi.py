@@ -8,9 +8,10 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 35
+_EXPECTED_ABI_VERSION = 39
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
+c_int8, c_uint8, c_int16 = (ctypes.c_int8, ctypes.c_uint8, ctypes.c_int16)
 c_int32, c_int64, c_uint32, c_uint64 = (
     ctypes.c_int32, ctypes.c_int64, ctypes.c_uint32, ctypes.c_uint64)
 c_double, c_float, c_char_p, c_void_p = (
@@ -61,6 +62,9 @@ DS_AUTONOMOUS = 1 << 3
 DS_TELEOP = 1 << 4
 DS_TEST = 1 << 5
 DS_ESTOP = 1 << 6
+ALLIANCE_UNKNOWN = 0
+ALLIANCE_RED = 1
+ALLIANCE_BLUE = 2
 POSITION_PHASE_UNHOMED = 0
 POSITION_PHASE_HOMING = 1
 POSITION_PHASE_READY = 2
@@ -85,6 +89,11 @@ ROLLER_PHASE_INTAKING = 1
 ROLLER_PHASE_HOLDING = 2
 ROLLER_PHASE_EJECTING = 3
 ROLLER_PHASE_FEEDING = 4
+ARMING_INPUT_NONE = 0
+ARMING_INPUT_AXIS = 1
+ARMING_INPUT_BUTTON = 2
+ARMING_INPUT_POV = 3
+ARMING_INPUT_OTHER = 4
 
 
 class TalosError(RuntimeError):
@@ -233,6 +242,7 @@ _SIGNATURES = {
     "talos_motor_time": (c_int32, [c_void_p, c_int64, c_int32, _P(c_int64)]),
     "talos_sensor_time": (c_int32, [c_void_p, c_int64, c_int32, _P(c_int64)]),
     "talos_motor_age": (c_int32, [c_void_p, c_int64, c_int32, _P(c_int64)]),
+    "talos_sensor_age": (c_int32, [c_void_p, c_int64, c_int32, _P(c_int64)]),
     "talos_digital_input_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_analog_input_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_encoder_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
@@ -251,7 +261,11 @@ _SIGNATURES = {
     "talos_target_lane_release": (c_int32, [c_void_p, c_int64]),
     "talos_operator_arming_open": (c_int64, [c_void_p]),
     "talos_operator_arming_evaluate": (c_int32, [c_void_p, c_int64, c_int32]),
+    "talos_operator_arming_evaluate_blocker": (c_int32, [
+        c_void_p, c_int64, c_int32, c_uint8, c_int8, c_int16, _P(c_int32)]),
     "talos_operator_arming_armed": (c_int32, [c_void_p, c_int64]),
+    "talos_operator_arming_blocker": (c_int32, [
+        c_void_p, c_int64, _P(c_uint8), _P(c_int8), _P(c_int16)]),
     "talos_operator_arming_disarm": (c_int32, [c_void_p, c_int64]),
     "talos_position_mechanism_open": (c_int64, [c_void_p, c_char_p]),
     "talos_position_mechanism_set_goal": (c_int32, [c_void_p, c_int64,
@@ -286,6 +300,7 @@ _TESTING_SIGNATURES = {
     "talos_sim_destroy": (None, [c_void_p]),
     "talos_sim_set_session_dir": (c_int32, [c_void_p, c_char_p]),
     "talos_sim_add": (c_void_p, [c_void_p, c_char_p, FACTORY, c_void_p]),
+    "talos_sim_remove": (c_int32, [c_void_p, c_char_p]),
     "talos_sim_node": (c_void_p, [c_void_p, c_char_p]),
     "talos_sim_step": (c_int32, [c_void_p, c_int64]),
     "talos_sim_pause": (c_int32, [c_void_p, c_char_p, c_int64]),
@@ -421,30 +436,34 @@ def fail():
     raise TalosError(lib.talos_last_error().decode())
 
 
-def check(result, failed):
-    if failed(result):
-        fail()
-    return result
-
-
 def ok(status):
     """For int32 status returns: TALOS_ERR (-1) raises."""
-    return check(status, lambda r: r < 0)
+    if status < 0:
+        fail()
+    return status
 
 
-def index(result):
-    return check(result, lambda r: r < 0)
+index = ok
+
+
+def boolean(status):
+    """For int32 boolean/status returns: TALOS_ERR (-1) raises, else bool."""
+    return bool(ok(status))
 
 
 def value(result, failure):
     """For returns whose failure value is also a valid result (0 from
     talos_state_machine_state): the call failed only when it also left a
     talos_last_error(), which a call that succeeds clears."""
-    return check(result, lambda r: r == failure and lib.talos_last_error())
+    if result == failure and lib.talos_last_error():
+        fail()
+    return result
 
 
 def handle(pointer):
-    return check(pointer, lambda p: not p)
+    if not pointer:
+        fail()
+    return pointer
 
 
 def encode(text):

@@ -55,7 +55,10 @@ __pycache__/
 # their module lockfiles would change with every talOS MODULE.bazel edit.
 examples/*/MODULE.bazel.lock
 
-# Agent scratch (plans, session notes)
-.agents/
+# Agent scratch (plans, session notes, worktrees)
+.agents/*
+!.agents/agents/
+!.agents/rules/
+!.agents/skills/
 .claude/*
 !.claude/agents/

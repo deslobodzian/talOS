@@ -1,4 +1,5 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//bench/main_processor/bundle_testdata:robot_manifest.bzl", RELOCATION_CONFIG_FILES = "CONFIG_FILES", RELOCATION_NODES = "NODES")
 load("//bench/main_processor/configuration:robot_bench_manifest.bzl", "CONFIG_FILES", "NODES")
@@ -100,7 +101,8 @@ py_library(
 
 # Over 5 s: three real installs, each paying deploy.sh's warm-up and graph
 # check for every member (on macOS, a new file's first exec and native
-# library load: about 27 s there, docs/DEPLOYMENT.md "Warm-up"); fast lane.
+# library load: about 27 s there, docs/DEPLOYMENT.md "Warm-up"; 5.4-12.2 s on
+# Linux CI); integration lane.
 py_test(
     name = "bundle_test",
     size = "small",
@@ -115,6 +117,7 @@ py_test(
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
         "cpu:7",
+        "integration",
         "no_asan",
         "no_tsan",
     ],
@@ -125,7 +128,8 @@ py_test(
 )
 
 # Over 5 s: three real installs of bench_bundle, each paying deploy.sh's
-# graph check without its warm-up (about 12 s on macOS); fast lane.
+# graph check without its warm-up (about 12 s on macOS, 5.4-12.2 s on Linux
+# CI); integration lane.
 py_test(
     name = "install_check_test",
     size = "small",
@@ -135,6 +139,7 @@ py_test(
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
         "cpu:7",
+        "integration",
         "no_asan",
         "no_tsan",
     ],
@@ -146,17 +151,49 @@ py_test(
 
 # Over 5 s: installs and rollbacks of stub bundles (a stop during the graph
 # check and rollback's graph check among them), one of which waits out a
-# 3 s warm-up bound for a member that never exits (about 9.5 s on macOS);
-# fast lane. Runs only stubs and deploy.sh, no node: no sanitizer tag.
+# 3 s warm-up bound for a member that never exits (about 9.5 s on macOS,
+# 5.4-12.2 s on Linux CI); integration lane. Runs only stubs and deploy.sh,
+# no node: no sanitizer tag.
 py_test(
     name = "warm_up_test",
     size = "small",
     srcs = ["warm_up_test.py"],
     data = [":bundle_test_native_mark.so"],
     legacy_create_init = False,
-    tags = ["cpu:7"],
+    tags = [
+        "cpu:7",
+        "integration",
+    ],
     deps = [
         ":deploy_test_support",
         "@rules_python//python/runfiles",
+    ],
+)
+
+# REQ-RT-07: update() callback entry-to-exit p99 wall-clock benchmark for
+# representative C++ bench and framework nodes (motor, swerve_module, teleop,
+# telemetry) against docs/METHODOLOGY.md §10's 10% period budget, with
+# StallMeter host qualification (docs/TESTING.md §6.7).
+cc_test(
+    name = "update_p99_perf_test",
+    size = "small",
+    srcs = ["update_p99_perf_test.cc"],
+    data = ["//bench/main_processor/configuration:robot_config"],
+    tags = [
+        "exclusive",
+        "perf",
+    ],
+    deps = [
+        "//bench/main_processor/motor",
+        "//bench/main_processor/swerve_module",
+        "//talOS/devices:testing",
+        "//talOS/driver_station",
+        "//talOS/events:events_core",
+        "//talOS/node",
+        "//talOS/node:testing",
+        "//talOS/process:host_qualification",
+        "//talOS/telemetry:testing",
+        "//talOS/teleop:testing",
+        "@googletest//:gtest_main",
     ],
 )

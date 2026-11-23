@@ -21,13 +21,13 @@
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
 #include "talOS/bridge/in_process_gateway.h"
-#include "talOS/bridge/merge.h"
 #include "talOS/bridge/node.h"
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/config_wire.h"
 #include "talOS/hardware/gate.h"
+#include "talOS/hardware/merge.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/ipc/publisher.h"
 #include "talOS/ipc/subscriber.h"
@@ -294,6 +294,8 @@ TEST(HardwareNodeTrustTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {
   node.Tick(1004000);
 
   EXPECT_EQ(node.ownership_rejected(), 3u);
+  // /hw/status reports the three refused requests, and not the two merged.
+  EXPECT_EQ(node.Status(1004000).ownership_rejected_count(), 3u);
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
   const Command& cmd2 = node.current_command();
@@ -615,6 +617,7 @@ TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {
 // datagram delayed from a boot the gateway has since left are dropped before
 // they reach identity, freshness, the cached requests, /hw/state or the config
 // push. A genuine new boot still recovers.
+// REQ-SAFE-11
 TEST(HardwareNodeTrustTest, ReorderedAndRetiredBootStatesChangeNothing) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint16_t drive = cfg.hardware.motors[0].id;
@@ -970,14 +973,8 @@ TEST(HardwareNodeTrustTest, NotReadyCommandRateIsOnePerHeartbeat) {
   }
 }
 
-// NextDutyUsIsWhenTickNextHasWork (hardware_node_test.cc) on a disabled
-// robot: a request that changes only the merged observation does not send,
-// and NextDutyUs() names the heartbeat that carries it rather than now.
-// Ticking just before each duty does nothing, and each duty it names has
-// work (a frame to the gateway or a /hw/status), so the loop neither sends
-// early nor wakes every millisecond for a send Tick will not make.
-// REQ-RT-13
-TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
+// NotReadyNextDutyUsIsTheHeartbeat's case for States carrying `flags`.
+void NotReadyObservationWaitsForTheHeartbeat(uint32_t flags) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
   Bridge rig{cfg};
@@ -993,7 +990,7 @@ TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
   ASSERT_EQ(heartbeat_us, 20'000u);
 
   State state = TrustState(NodeConfigId(cfg), 11, 1, 1000);
-  state.flags = kConfigured;  // disabled
+  state.flags = flags;
   ASSERT_TRUE(gateway.Deliver(state, kStartUs));
   PublishCommand(pub, NeutralCommand(state, roller));
   node.Tick(kRequestUs);
@@ -1037,71 +1034,130 @@ TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
   }
 }
 
-// While the gateway cannot take a command, a change of a demand still sends
-// at once; only a change of the observation alone waits for the heartbeat.
-// The devices layer flushes neutral then, so the change comes from a request
-// published as is, as a node outside the devices layer could: the bridge
-// forwards a demand whatever the State says and the gateway refuses it while
-// disabled, but the neutral that replaces it must not wait a heartbeat. The
-// duties NextDutyUs() names afterwards count the heartbeat from that send.
+// NextDutyUsIsWhenTickNextHasWork (hardware_node_test.cc) while the gateway
+// cannot take a command, for each State that says so (disabled; unconfigured,
+// which an uncommissioned gateway also reports; faulted): a request that
+// changes only the merged observation does not send, and NextDutyUs() names
+// the heartbeat that carries it rather than now. Ticking just before each
+// duty does nothing, and each duty it names has work (a frame to the gateway
+// or a /hw/status), so the loop neither sends early nor wakes every
+// millisecond for a send Tick will not make.
 // REQ-RT-13
-TEST(HardwareNodeTrustTest, NotReadyDemandChangeSendsAtOnce) {
+TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
+  struct Row {
+    const char* name;
+    uint32_t flags;
+  };
+  for (const Row row :
+       {Row{"disabled", kConfigured}, Row{"unconfigured", kEnabled},
+        Row{"faulted", kConfigured | kEnabled | kHardwareFault}}) {
+    SCOPED_TRACE(row.name);
+    NotReadyObservationWaitsForTheHeartbeat(row.flags);
+  }
+}
+
+// While the gateway cannot take a command, a change of a motor demand, a
+// digital output or a PWM output still sends at once; only a change of the
+// observation alone waits for the heartbeat. The devices layer flushes
+// neutral then, so the change comes from a request published as is, as a
+// node outside the devices layer could: the bridge forwards an output
+// whatever the State says and the gateway refuses it while disabled, but the
+// neutral that replaces it must not wait a heartbeat. The duties NextDutyUs()
+// names afterwards count the heartbeat from that send.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, NotReadyOutputChangeSendsAtOnce) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
-  Bridge rig{cfg};
-  HardwareNode& node = rig.node;
-  InProcessGateway& gateway = rig.gateway;
-  ipc::Publisher<Packet> pub{RequestTopic("intake")};
-  constexpr uint64_t kStartUs = 1'000'000;
-  const uint64_t heartbeat_us = node.heartbeat_us();
-  ASSERT_EQ(heartbeat_us, 20'000u);
-
-  State disabled = TrustState(NodeConfigId(cfg), 11, 1, 1000);
-  disabled.flags = kConfigured;
-  ASSERT_TRUE(gateway.Deliver(disabled, kStartUs));
-  const Command neutral = NeutralCommand(disabled, roller);
-  PublishCommand(pub, neutral);
-  node.Tick(kStartUs + 7'000);
-  ASSERT_EQ(node.commands_sent(), 1u);
-  gateway.TakeSent();
-
-  // The same observation, each time: only the demand changes.
-  Command driven = neutral;
-  driven.motors[0].mode = Mode::kVoltage;
-  driven.motors[0].demand = 4.0;
-  std::vector<SentCommand> commands;
-  const auto tick = [&](uint64_t now_us) {
-    node.Tick(now_us);
-    for (const auto& command : Commands(gateway.TakeSent())) {
-      commands.push_back({now_us, command});
-    }
+  const uint16_t beacon = cfg.hardware.digital_outputs[0].id;
+  const uint16_t strip = cfg.hardware.pwm_outputs[0].id;
+  struct Row {
+    const char* name;
+    // Makes `request` drive the row's output.
+    void (*drive)(Command& request, uint16_t beacon, uint16_t strip);
+    // Whether `command` drives it.
+    bool (*driven)(const Command& command, uint16_t roller);
   };
-  constexpr uint64_t kDrivenUs = kStartUs + 9'000;
-  constexpr uint64_t kNeutralUs = kStartUs + 10'000;
-  PublishCommand(pub, driven);
-  tick(kDrivenUs);
-  PublishCommand(pub, neutral);
-  tick(kNeutralUs);
+  const Row rows[] = {
+      {"motor demand",
+       [](Command& request, uint16_t, uint16_t) {
+         request.motors[0].mode = Mode::kVoltage;
+         request.motors[0].demand = 4.0;
+       },
+       [](const Command& command, uint16_t roller) {
+         return MotorOf(command, roller).mode == Mode::kVoltage;
+       }},
+      {"digital output",
+       [](Command& request, uint16_t beacon, uint16_t) {
+         request.digital_output_count = 1;
+         request.digital_outputs[0] = {beacon, true};
+       },
+       [](const Command& command, uint16_t) {
+         return command.digital_outputs[0].value;
+       }},
+      {"PWM output",
+       [](Command& request, uint16_t, uint16_t strip) {
+         request.pwm_output_count = 1;
+         request.pwm_outputs[0] = {strip, PwmMode::kPulse, 0.5};
+       },
+       [](const Command& command, uint16_t) {
+         return command.pwm_outputs[0].mode == PwmMode::kPulse;
+       }},
+  };
+  for (const Row& row : rows) {
+    SCOPED_TRACE(row.name);
+    Bridge rig{cfg};
+    HardwareNode& node = rig.node;
+    InProcessGateway& gateway = rig.gateway;
+    ipc::Publisher<Packet> pub{RequestTopic("intake")};
+    constexpr uint64_t kStartUs = 1'000'000;
+    const uint64_t heartbeat_us = node.heartbeat_us();
+    ASSERT_EQ(heartbeat_us, 20'000u);
 
-  // Up to just before the intake's owner timeout at kNeutralUs + 50'001.
-  uint64_t now_us = kNeutralUs;
-  for (uint64_t due_us = node.NextDutyUs(now_us); due_us < kStartUs + 55'000;
-       due_us = node.NextDutyUs(now_us)) {
-    ASSERT_GT(due_us, now_us) << "nothing is pending at " << now_us;
-    now_us = due_us;
-    tick(now_us);
-  }
+    State disabled = TrustState(NodeConfigId(cfg), 11, 1, 1000);
+    disabled.flags = kConfigured;
+    ASSERT_TRUE(gateway.Deliver(disabled, kStartUs));
+    const Command neutral = NeutralCommand(disabled, roller);
+    PublishCommand(pub, neutral);
+    node.Tick(kStartUs + 7'000);
+    ASSERT_EQ(node.commands_sent(), 1u);
+    gateway.TakeSent();
 
-  const std::array<uint64_t, 4> expected_us = {kDrivenUs, kNeutralUs,
-                                               kNeutralUs + heartbeat_us,
-                                               kNeutralUs + (2 * heartbeat_us)};
-  ASSERT_EQ(commands.size(), expected_us.size());
-  for (std::size_t i = 0; i < commands.size(); ++i) {
-    SCOPED_TRACE(i);
-    EXPECT_EQ(commands[i].sent_us, expected_us[i]);
-    EXPECT_EQ(MotorOf(commands[i].command, roller[0]).mode,
-              i == 0 ? Mode::kVoltage : Mode::kNeutral);
-    EXPECT_EQ(commands[i].command.observed_time_us, 1000u);
+    // The same observation, each time: only the output changes.
+    Command driven = neutral;
+    row.drive(driven, beacon, strip);
+    std::vector<SentCommand> commands;
+    const auto tick = [&](uint64_t now_us) {
+      node.Tick(now_us);
+      for (const auto& command : Commands(gateway.TakeSent())) {
+        commands.push_back({now_us, command});
+      }
+    };
+    constexpr uint64_t kDrivenUs = kStartUs + 9'000;
+    constexpr uint64_t kNeutralUs = kStartUs + 10'000;
+    PublishCommand(pub, driven);
+    tick(kDrivenUs);
+    PublishCommand(pub, neutral);
+    tick(kNeutralUs);
+
+    // Up to just before the intake's owner timeout at kNeutralUs + 50'001.
+    uint64_t now_us = kNeutralUs;
+    for (uint64_t due_us = node.NextDutyUs(now_us); due_us < kStartUs + 55'000;
+         due_us = node.NextDutyUs(now_us)) {
+      ASSERT_GT(due_us, now_us) << "nothing is pending at " << now_us;
+      now_us = due_us;
+      tick(now_us);
+    }
+
+    const std::array<uint64_t, 4> expected_us = {
+        kDrivenUs, kNeutralUs, kNeutralUs + heartbeat_us,
+        kNeutralUs + (2 * heartbeat_us)};
+    ASSERT_EQ(commands.size(), expected_us.size());
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(commands[i].sent_us, expected_us[i]);
+      EXPECT_EQ(row.driven(commands[i].command, roller[0]), i == 0);
+      EXPECT_EQ(commands[i].command.observed_time_us, 1000u);
+    }
   }
 }
 
@@ -1132,6 +1188,61 @@ TEST(HardwareNodeTrustTest, ReadyObservationChangeSendsAtOnce) {
   const auto commands = Commands(gateway.TakeSent());
   ASSERT_EQ(commands.size(), 1u);
   EXPECT_EQ(commands[0].observed_time_us, 2000u);
+}
+
+// Until a State has been observed nothing is commanded, even while a
+// request is merged and active (one stamped with the identity of no State,
+// which the merge admits): there is no boot, epoch or observation a command
+// could carry that the gateway would accept.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, NoCommandBeforeTheFirstState) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  Command request = IntakeRequest(cfg, 4.0);
+  request.boot_id = 0;
+  request.epoch = 0;
+  request.observed_time_us = 0;
+  PublishCommand(pub, request);
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  ASSERT_EQ(MotorOf(node.current_command(), request.motors[0].id).mode,
+            Mode::kVoltage)
+      << "the request did not merge, so nothing could have been sent";
+  // Every millisecond up to the intake's 50 ms owner timeout.
+  for (uint64_t now_us = kStartUs; now_us < kStartUs + 50'000;
+       now_us += 1'000) {
+    node.Tick(now_us);
+    EXPECT_TRUE(Commands(bridge.gateway.TakeSent()).empty()) << "at " << now_us;
+  }
+  EXPECT_EQ(node.commands_sent(), 0u);
+}
+
+// The unchanged-merge heartbeat is a fifth of command_timeout_us, at most
+// 20 ms (DATA_FLOW.md "Link rates and endpoints"): the gateway hears a live
+// merge at least five times per timeout whatever the config chose. Rows span
+// the timeouts config load accepts at a 5 ms [robot] period, 50 ms to 500 ms.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, TheHeartbeatIsAFifthOfTheTimeoutAtMost20Ms) {
+  struct Row {
+    uint32_t command_timeout_us;
+    uint64_t heartbeat_us;
+  };
+  for (const Row row : {Row{50'000, 10'000}, Row{60'000, 12'000},
+                        Row{100'000, 20'000}, Row{500'000, 20'000}}) {
+    SCOPED_TRACE(::testing::Message()
+                 << "command_timeout_us " << row.command_timeout_us);
+    std::string toml{kTrustToml};
+    const std::string period = "period_us = 5000\n";
+    toml.insert(toml.find(period) + period.size(),
+                "command_timeout_us = " +
+                    std::to_string(row.command_timeout_us) + "\n");
+    const auto cfg = config::ParseRobotConfigString(toml);
+    ASSERT_EQ(cfg.hardware.command_timeout_us, row.command_timeout_us);
+    const HardwareNode node{cfg, "127.0.0.1", 5802, 5803, true};
+    EXPECT_EQ(node.heartbeat_us(), row.heartbeat_us);
+  }
 }
 
 // A controller transition resets every owner in the merge until its next
@@ -1273,14 +1384,18 @@ TEST(HardwareNodeTrustTest, TransitionAtTwoPeriodsOfSilenceRaisesNoTimeout) {
   ASSERT_FALSE(node.is_subsystem_timed_out("drivetrain"));
   ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
 
-  // The new epoch, 1 us before both owners' next flush, which it refuses.
+  // The new epoch, 1 us before both owners' next flush, which it refuses
+  // without merging (superseded all-neutral requests do not count in
+  // identity_rejected).
   constexpr uint64_t kTransitionUs = kAcceptedUs + kPeriodUs - 1;
   const State second = TrustState(config_id, 11, 2, 1000 + kPeriodUs);
   ASSERT_TRUE(rig.gateway.Deliver(second, kTransitionUs));
   PublishCommand(drive_pub, NeutralCommand(first, drive));
   PublishCommand(intake_pub, NeutralCommand(first, roller));
   node.Tick(kAcceptedUs + kPeriodUs);
-  ASSERT_EQ(node.identity_rejected(), 2u);
+  ASSERT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.identity_rejected(), 0u);
 
   // Two periods and one microsecond since each owner's last accepted
   // request: no timeout.
@@ -1357,29 +1472,38 @@ TEST(HardwareNodeTrustTest,
 
   // The drivetrain's node stops, then the gateway reboots: nothing is
   // reported until boot 12 acknowledges, though that takes longer than the
-  // owner timeout.
-  const State boot12 = TrustState(config_id, 12, 1, 500);
+  // owner timeout (boot 12 keeps publishing States every 5 ms throughout).
+  State boot12 = TrustState(config_id, 12, 1, 500);
   now_us += 1000;
   ASSERT_TRUE(rig.gateway.Deliver(boot12, now_us));
   EXPECT_TRUE(node.Status(now_us).alert_error_not_configured());
   EXPECT_EQ(TimedOutMask(node, now_us), 0u);
   const uint64_t reready_us = now_us + (2 * owner_timeout_us);
   for (now_us += 5000; now_us < reready_us; now_us += 5000) {
-    node.Tick(now_us);
+    boot12.sample_time_us += 5000;
+    ASSERT_TRUE(rig.gateway.Deliver(boot12, now_us));
     EXPECT_EQ(TimedOutMask(node, now_us), 0u) << "at " << now_us;
   }
   node.Tick(reready_us - 1);
   EXPECT_EQ(TimedOutMask(node, reready_us - 1), 0u);
   EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
   Acknowledge(rig, config_id, reready_us);
-  // Once ready again, the drivetrain (bit 0), heard before the reboot, is
-  // reported one owner timeout later; the intake still is not.
+  boot12.sample_time_us += 5000;
+  ASSERT_TRUE(rig.gateway.Deliver(boot12, reready_us));
+  // Once ready again on a live link, the drivetrain (bit 0), heard before the
+  // reboot, is reported one owner timeout later; the intake still is not.
   EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us), 0u);
   EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us + 1), 0b01u);
   node.Tick(reready_us + owner_timeout_us + 1);
   EXPECT_EQ(node.owner_timeouts("drivetrain"), 1u);
   EXPECT_EQ(node.owner_timeouts("intake"), 0u);
+  for (uint64_t t = reready_us + owner_timeout_us + 5000;
+       t <= reready_us + (10 * owner_timeout_us); t += 5000) {
+    boot12.sample_time_us += 5000;
+    ASSERT_TRUE(rig.gateway.Deliver(boot12, t));
+  }
   EXPECT_EQ(TimedOutMask(node, reready_us + (10 * owner_timeout_us)), 0b01u);
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 1u);
 }
 
 // A Python node's first request reached the bridge about 157 ms into every
@@ -1578,8 +1702,17 @@ std::vector<std::string> Alerts(const bridge::BridgeStatus& status) {
     active.emplace_back("owner_timed_out");
   }
   if (status.alert_warning_brownout()) active.emplace_back("brownout");
+  if (status.alert_error_hardware_fault()) {
+    active.emplace_back("hardware_fault");
+  }
+  if (status.alert_error_config_refused_enabled()) {
+    active.emplace_back("config_refused_enabled");
+  }
   if (status.alert_warning_can_bus_unread()) {
     active.emplace_back("can_bus_unread");
+  }
+  if (status.alert_error_protocol_mismatch()) {
+    active.emplace_back("protocol_mismatch");
   }
   return active;
 }
@@ -1735,6 +1868,432 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   EXPECT_EQ(Alerts(node.Status(now_us)), Names{"not_configured"});
   acknowledge(now_us);
   EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
+}
+
+// REQ-CONTRACT-04: a refused ConfigAck logs status and NUL-bounded reason to
+// stderr once per distinct (status, reason) until a kOk ack clears it, so
+// config-push retries do not spam stderr.
+TEST(HardwareNodeTrustTest, LogsRefusedConfigAckOncePerDistinctReason) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  InProcessGateway& gateway = bridge.gateway;
+
+  const auto send_ack = [&](ConfigAckStatus status, const char* reason,
+                            std::size_t reason_bytes, uint64_t now_us) {
+    ConfigAckPayload ack{};
+    ack.config_id = config_id;
+    ack.status = status;
+    std::memcpy(ack.reason, reason, std::min(reason_bytes, sizeof(ack.reason)));
+    std::array<uint8_t, sizeof(ConfigAckPayload)> bytes{};
+    ASSERT_EQ(EncodeConfigAck(ack, bytes), sizeof(ConfigAckPayload));
+    gateway.Receive(protocol::FrameType::kHardwareConfigAck, now_us, bytes);
+    node.Tick(now_us);
+  };
+
+  ::testing::internal::CaptureStderr();
+  // First refusal (also full 64 bytes without NUL terminator).
+  std::array<char, sizeof(ConfigAckPayload::reason)> full_reason{};
+  full_reason.fill('X');
+  send_ack(ConfigAckStatus::kBackendFailed, full_reason.data(),
+           full_reason.size(), 1000);
+  // Identical retry: must be deduplicated (not logged again).
+  send_ack(ConfigAckStatus::kBackendFailed, full_reason.data(),
+           full_reason.size(), 2000);
+  // Different reason: logged once.
+  const char other[] = "motor 3 offline";
+  send_ack(ConfigAckStatus::kBackendFailed, other, sizeof(other) - 1, 3000);
+  send_ack(ConfigAckStatus::kBackendFailed, other, sizeof(other) - 1, 4000);
+  // kOk clears deduplication; a subsequent refusal with the same reason logs
+  // again.
+  Acknowledge(bridge, config_id, 5000);
+  send_ack(ConfigAckStatus::kBackendFailed, other, sizeof(other) - 1, 6000);
+  const std::string err = ::testing::internal::GetCapturedStderr();
+
+  const std::string sixty_four_x(64, 'X');
+  auto count_substr = [&](const std::string& needle) {
+    std::size_t count = 0;
+    for (auto pos = err.find(needle); pos != std::string::npos;
+         pos = err.find(needle, pos + needle.size())) {
+      ++count;
+    }
+    return count;
+  };
+  EXPECT_EQ(count_substr(sixty_four_x), 1u) << err;
+  EXPECT_EQ(count_substr("motor 3 offline"), 2u) << err;
+  EXPECT_NE(err.find("backend_failed"), std::string::npos) << err;
+}
+
+// A gateway sending States that do not decode sends them every tick: the
+// bridge reports the first of a stretch with one stderr line, and none for
+// the rest, until a State decodes; the next undecodable one is reported
+// again.
+// REQ-OPS-21
+TEST(HardwareNodeTrustTest, ReportsAnUndecodableStateOncePerStretch) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Bridge bridge{cfg};
+  InProcessGateway& gateway = bridge.gateway;
+  const std::array<uint8_t, 3> truncated{1, 2, 3};
+  const auto lines = [](const std::string& text) {
+    return std::count(text.begin(), text.end(), '\n');
+  };
+
+  ::testing::internal::CaptureStderr();
+  for (uint64_t now_us = 1000; now_us <= 3000; now_us += 1000) {
+    gateway.Receive(protocol::FrameType::kHardwareState, now_us, truncated);
+  }
+  const std::string stretch = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(lines(stretch), 1) << stretch;
+
+  ASSERT_TRUE(gateway.Deliver(TrustState(NodeConfigId(cfg), 11, 1, 1000),
+                              4000));  // its stderr is the gateway build's
+
+  ::testing::internal::CaptureStderr();
+  gateway.Receive(protocol::FrameType::kHardwareState, 5000, truncated);
+  gateway.Receive(protocol::FrameType::kHardwareState, 6000, truncated);
+  const std::string after = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(lines(after), 1) << after;
+}
+
+// REQ-SAFE-11: Driver Station packets arriving before any State (even with
+// boot_id == 0) and duplicate timestamps within a boot are dropped; the first
+// packet of a boot is admitted even at sample_time_us == 0.
+TEST(HardwareNodeTrustTest, DropsDriverStationPacketsBeforeStateAndDuplicates) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  InProcessGateway& gateway = bridge.gateway;
+  ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
+
+  const auto send_ds = [&](uint64_t boot_id, uint64_t sample_time_us,
+                           uint64_t now_us) -> bool {
+    driver_station::DriverStationData data{};
+    data.boot_id = boot_id;
+    data.sample_time_us = sample_time_us;
+    data.mode_since_us = sample_time_us;
+    data.fms.flags = driver_station::kDsAttached;
+    std::array<uint8_t, driver_station::kMaxEncodedSize> payload{};
+    const auto size = driver_station::Encode(data, payload);
+    EXPECT_GT(size, 0u);
+    gateway.Receive(protocol::FrameType::kDriverStation, now_us,
+                    std::span<const uint8_t>{payload.data(), size});
+    node.Tick(now_us);
+    return ds_sub.read().has_value();
+  };
+
+  // Before any State arrives, boot_id == 0 must not match initial
+  // last_boot_id_ == 0.
+  EXPECT_FALSE(send_ds(0, 1000, 1000));
+  EXPECT_EQ(node.driver_station_packets_received(), 0u);
+
+  // After a State arrives, sample_time_us == 0 is admitted as first packet of
+  // the boot, then duplicate timestamps are dropped.
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 0xA1, 1, 1000), 1000000));
+  EXPECT_TRUE(send_ds(0xA1, 0, 1001000));
+  EXPECT_FALSE(send_ds(0xA1, 0, 1002000));
+  EXPECT_TRUE(send_ds(0xA1, 1000, 1003000));
+  EXPECT_FALSE(send_ds(0xA1, 1000, 1004000));
+  EXPECT_TRUE(send_ds(0xA1, 2000, 1005000));
+  EXPECT_EQ(node.driver_station_packets_received(), 3u);
+}
+
+// Guards RT-12: when the gateway link goes stale (state_age_us >=
+// command_timeout_us), timed_out_mask and alert_warning_owner_timed_out must
+// not raise (link_lost explains the outage), and when fresh States of the same
+// boot return, owner silence restarts from the return so owners get a full
+// owner-timeout window to react before raising an alert.
+// REQ-OPS-20
+TEST(HardwareNodeTrustTest,
+     OwnerTimeoutDoesNotRaiseWhileStateIsStaleOrOnLinkReturn) {
+  using Names = std::vector<std::string>;
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+  const uint64_t owner_timeout_us = OwnerTimeoutUs(5000, timeout_us);
+  ASSERT_LT(owner_timeout_us, timeout_us);
+
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  const auto publish_both = [&](uint64_t observed_us) {
+    Command cmd{};
+    cmd.config_id = config_id;
+    cmd.boot_id = 11;
+    cmd.epoch = 1;
+    cmd.observed_time_us = observed_us;
+    PublishCommand(drive_pub, cmd);
+    PublishCommand(intake_pub, cmd);
+  };
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  Acknowledge(rig, config_id, kStartUs - 500);
+  publish_both(1000);
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 1000), kStartUs));
+  EXPECT_EQ(TimedOutMask(node, kStartUs), 0u);
+
+  // Owners keep publishing while State is still fresh (within owner_timeout_us
+  // each step, ending at kStartUs + timeout_us - 10'000).
+  publish_both(1000);
+  node.Tick(kStartUs + (owner_timeout_us - 5'000));
+  const uint64_t last_req_us = kStartUs + timeout_us - 10'000;
+  publish_both(1000);
+  node.Tick(last_req_us);
+  EXPECT_EQ(TimedOutMask(node, last_req_us), 0u);
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 0u);
+
+  // No new State arrives and owners stop publishing once the link drops.
+  // At state_age_us == timeout_us and beyond (including well past
+  // last_req_us + owner_timeout_us), State is stale: timed_out_mask and
+  // alert_warning_owner_timed_out must stay clear, and Tick must not record
+  // owner-timeout episodes.
+  const uint64_t stale_edge_us = kStartUs + timeout_us;
+  const uint64_t long_outage_us = last_req_us + (3 * owner_timeout_us);
+  ASSERT_GT(long_outage_us, stale_edge_us);
+  node.Tick(stale_edge_us);
+  EXPECT_EQ(TimedOutMask(node, stale_edge_us), 0u);
+  node.Tick(long_outage_us);
+  EXPECT_EQ(TimedOutMask(node, long_outage_us), 0u);
+  EXPECT_EQ(Alerts(node.Status(long_outage_us)), Names{"link_lost"});
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 0u);
+
+  // Same-boot State returns after the outage: silence restarts from recovery,
+  // so no immediate owner_timed_out fires on the recovery tick; it fires only
+  // if owners stay silent past owner_timeout_us while States stay fresh.
+  const uint64_t recover_us = long_outage_us + 10'000;
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id, 11, 1, 500000), recover_us));
+  EXPECT_EQ(TimedOutMask(node, recover_us), 0u);
+  EXPECT_EQ(Alerts(node.Status(recover_us)), Names{});
+  EXPECT_EQ(TimedOutMask(node, recover_us + owner_timeout_us), 0u);
+  // Keep State fresh through owner_timeout_us + 1 so silence IS reported when
+  // an owner really stays quiet on a healthy link.
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 550000),
+                              recover_us + owner_timeout_us));
+  EXPECT_EQ(TimedOutMask(node, recover_us + owner_timeout_us + 1), 0b11u);
+}
+
+// REQ-OPS-20 (OBS-6, RESET-4): alert_error_hardware_fault is active only while
+// State is fresh, configured is true, and kHardwareFault is set;
+// alert_error_config_refused_enabled is active only while State is fresh,
+// configured is false, and the gateway refused configuration because the robot
+// is enabled, clearing on kOk, a new boot, another refusal reason, or a stale
+// link.
+TEST(HardwareNodeTrustTest,
+     HardwareFaultAndConfigRefusedEnabledAlertsActivateAndClear) {
+  using Names = std::vector<std::string>;
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+
+  const auto send_ack = [&](ConfigAckStatus status, std::string_view reason,
+                            uint64_t now_us) {
+    ConfigAckPayload ack{};
+    ack.config_id = config_id;
+    ack.status = status;
+    std::memcpy(ack.reason, reason.data(),
+                std::min(reason.size(), sizeof(ack.reason)));
+    std::array<uint8_t, sizeof(ConfigAckPayload)> bytes{};
+    ASSERT_EQ(EncodeConfigAck(ack, bytes), sizeof(ConfigAckPayload));
+    gateway.Receive(protocol::FrameType::kHardwareConfigAck, now_us, bytes);
+    node.Tick(now_us);
+  };
+
+  uint64_t now_us = 1'000'000;
+  // 1. Fresh State, unconfigured: a generic backend failure does NOT raise
+  // config_refused_enabled.
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id + 1, 11, 1, 1000), now_us));
+  send_ack(ConfigAckStatus::kBackendFailed, "motor 1 offline", now_us + 1000);
+  now_us += 1000;
+  EXPECT_FALSE(node.Status(now_us).alert_error_config_refused_enabled());
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{"not_configured"});
+
+  // 2. Enabled refusal raises alert_error_config_refused_enabled alongside
+  // not_configured.
+  now_us += 1000;
+  send_ack(ConfigAckStatus::kBackendFailed,
+           "disable to accept the new configuration", now_us);
+  EXPECT_TRUE(node.Status(now_us).alert_error_config_refused_enabled());
+  EXPECT_EQ(Alerts(node.Status(now_us)),
+            (Names{"not_configured", "config_refused_enabled"}));
+
+  // 3. Stale link clears alert_error_config_refused_enabled (and link return
+  // does not resurrect the pre-outage refusal).
+  const uint64_t stale_us = 1'000'000 + timeout_us;
+  EXPECT_FALSE(node.Status(stale_us).alert_error_config_refused_enabled());
+  now_us = stale_us + 5000;
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id + 1, 11, 1, 200000), now_us));
+  EXPECT_FALSE(node.Status(now_us).alert_error_config_refused_enabled());
+
+  // 4. Re-raise on same boot, then a new boot clears it.
+  now_us += 1000;
+  send_ack(ConfigAckStatus::kBackendFailed,
+           "disable to accept the new configuration", now_us);
+  ASSERT_TRUE(node.Status(now_us).alert_error_config_refused_enabled());
+  now_us += 1000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id + 1, 12, 1, 1000), now_us));
+  EXPECT_FALSE(node.Status(now_us).alert_error_config_refused_enabled());
+
+  // 5. Re-raise on boot 12, then kOk clears it; hardware_fault does not raise
+  // while unconfigured even if State carries kHardwareFault.
+  now_us += 1000;
+  State faulted = TrustState(config_id + 1, 12, 1, 2000);
+  faulted.flags |= kHardwareFault;
+  ASSERT_TRUE(gateway.Deliver(faulted, now_us));
+  send_ack(ConfigAckStatus::kBackendFailed,
+           "disable to accept the new configuration", now_us + 1000);
+  now_us += 1000;
+  EXPECT_TRUE(node.Status(now_us).alert_error_config_refused_enabled());
+  EXPECT_FALSE(node.Status(now_us).alert_error_hardware_fault());
+
+  // 6. Configure and deliver fresh configured State with kHardwareFault:
+  // config_refused_enabled clears, hardware_fault activates.
+  now_us += 1000;
+  Acknowledge(rig, config_id, now_us);
+  State configured_fault = TrustState(config_id, 12, 2, 3000);
+  configured_fault.flags |= kHardwareFault;
+  ASSERT_TRUE(gateway.Deliver(configured_fault, now_us + 1000));
+  now_us += 1000;
+  EXPECT_FALSE(node.Status(now_us).alert_error_config_refused_enabled());
+  EXPECT_TRUE(node.Status(now_us).alert_error_hardware_fault());
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{"hardware_fault"});
+
+  // 7. Stale link clears alert_error_hardware_fault.
+  EXPECT_FALSE(node.Status(now_us + timeout_us).alert_error_hardware_fault());
+
+  // 8. Fresh healthy State clears alert_error_hardware_fault cleanly.
+  now_us += 5000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 12, 2, 8000), now_us));
+  EXPECT_FALSE(node.Status(now_us).alert_error_hardware_fault());
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
+}
+
+// Guards RT-12 item (a) (REQ-OPS-20): at a fresh enable edge (epoch bump,
+// before any request is accepted from a subsystem in the new epoch), an
+// in-flight all-neutral request carrying the earlier nonzero epoch is still
+// refused (never merges or refreshes silence), but does not increment
+// identity_rejected_count. Any driving output, wrong device ownership, or
+// stale-epoch neutral arriving after a new-epoch request was already accepted
+// still increments identity_rejected_count.
+TEST(
+    HardwareNodeTrustTest,
+    SupersededNeutralAtEnableEdgeIsRefusedWithoutIncrementingIdentityRejected) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  const uint16_t beacon = cfg.hardware.digital_outputs[0].id;
+  const uint16_t strip = cfg.hardware.pwm_outputs[0].id;
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  Acknowledge(rig, config_id, kStartUs - 500);
+  State disabled = TrustState(config_id, 11, 1, 1'000);
+  disabled.flags = kConfigured;
+  ASSERT_TRUE(gateway.Deliver(disabled, kStartUs));
+
+  auto make_stale_neutral = [&]() {
+    Command cmd{};
+    cmd.config_id = config_id;
+    cmd.boot_id = 11;
+    cmd.epoch = 1;
+    cmd.observed_time_us = 1'000;
+    cmd.count = 1;
+    cmd.motors[0] = {roller, Mode::kNeutral, 0, 0.0, 0.0};
+    cmd.digital_output_count = 1;
+    cmd.digital_outputs[0] = {beacon, false};
+    cmd.pwm_output_count = 1;
+    cmd.pwm_outputs[0] = {strip, PwmMode::kOff, 0.0};
+    return cmd;
+  };
+
+  // Accept one neutral request while disabled in epoch 1 so intake is heard.
+  PublishCommand(intake_pub, make_stale_neutral());
+  node.Tick(kStartUs + 1'000);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.identity_rejected(), 0u);
+
+  // Enable edge: gateway bumps epoch 1 -> 2.
+  const uint64_t enable_us = kStartUs + 5'000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 2, 6'000), enable_us));
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+  const uint64_t commands_before = node.commands_sent();
+
+  // (i) All-neutral stale-epoch request racing the enable edge: refused
+  // (never merges, no command sent, silence_from_us not refreshed), yet
+  // identity_rejected_count stays 0.
+  PublishCommand(intake_pub, make_stale_neutral());
+  node.Tick(enable_us + 2'000);
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.commands_sent(), commands_before);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_EQ(node.Status(enable_us + 2'000).identity_rejected_count(), 0u);
+  // Silence was NOT refreshed at enable_us + 2'000: it still expires at
+  // enable_us + owner_timeout_us + 1.
+  EXPECT_EQ(TimedOutMask(node, enable_us + owner_timeout_us), 0u);
+  EXPECT_EQ(TimedOutMask(node, enable_us + owner_timeout_us + 1), 0b10u);
+
+  // (ii) Driving stale-epoch requests (motor, DIO, PWM pulse) STILL increment
+  // identity_rejected_count.
+  Command driving_motor = make_stale_neutral();
+  driving_motor.motors[0] = {roller, Mode::kVoltage, 0, 3.0, 0.0};
+  PublishCommand(intake_pub, driving_motor);
+  node.Tick(enable_us + 3'000);
+  EXPECT_EQ(node.identity_rejected(), 1u);
+
+  Command driving_dio = make_stale_neutral();
+  driving_dio.digital_outputs[0] = {beacon, true};
+  PublishCommand(intake_pub, driving_dio);
+  node.Tick(enable_us + 4'000);
+  EXPECT_EQ(node.identity_rejected(), 2u);
+
+  Command driving_pwm = make_stale_neutral();
+  driving_pwm.pwm_outputs[0] = {strip, PwmMode::kPulse, 0.0};
+  PublishCommand(intake_pub, driving_pwm);
+  node.Tick(enable_us + 5'000);
+  EXPECT_EQ(node.identity_rejected(), 3u);
+
+  // (iii) Stale-epoch neutral request addressing another subsystem's device
+  // STILL increments identity_rejected_count.
+  Command wrong_owner = make_stale_neutral();
+  wrong_owner.motors[0] = {drive, Mode::kNeutral, 0, 0.0, 0.0};
+  PublishCommand(intake_pub, wrong_owner);
+  node.Tick(enable_us + 6'000);
+  EXPECT_EQ(node.identity_rejected(), 4u);
+  EXPECT_EQ(node.ownership_rejected(), 0u);
+  EXPECT_TRUE(node.is_subsystem_timed_out("intake"));
+
+  // (iv) Once a new-epoch request is accepted, a subsequent stale-epoch
+  // all-neutral request STILL increments identity_rejected_count.
+  Command epoch2_ok = make_stale_neutral();
+  epoch2_ok.epoch = 2;
+  epoch2_ok.observed_time_us = 6'000;
+  PublishCommand(intake_pub, epoch2_ok);
+  node.Tick(enable_us + 7'000);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.identity_rejected(), 4u);
+
+  PublishCommand(intake_pub, make_stale_neutral());
+  node.Tick(enable_us + 8'000);
+  EXPECT_EQ(node.identity_rejected(), 5u);
+  EXPECT_EQ(node.Status(enable_us + 8'000).identity_rejected_count(), 5u);
 }
 
 }  // namespace

@@ -3,6 +3,7 @@
 
 #include "talOS/vision/field_sim/field_layout_loader.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -42,10 +43,12 @@ bool TagPose(const JsonValue& tag, talos::geometry::SE3<double>* out,
   double tx = 0.0, ty = 0.0, tz = 0.0;
   for (const auto& [k, v] : {std::pair{"x", &tx}, {"y", &ty}, {"z", &tz}}) {
     const JsonValue* c = t->Find(k);
-    if (c == nullptr || c->type != JsonValue::Type::kNumber) {
+    if (c == nullptr || c->type != JsonValue::Type::kNumber ||
+        !std::isfinite(c->number)) {
       if (error != nullptr) {
-        *error =
-            std::string("field layout: tag translation missing '") + k + "'";
+        *error = std::string(
+                     "field layout: tag translation missing or non-finite '") +
+                 k + "'";
       }
       return false;
     }
@@ -56,21 +59,34 @@ bool TagPose(const JsonValue& tag, talos::geometry::SE3<double>* out,
   for (const auto& [k, v] :
        {std::pair{"W", &w}, {"X", &x}, {"Y", &y}, {"Z", &z}}) {
     const JsonValue* c = q->Find(k);
-    if (c == nullptr || c->type != JsonValue::Type::kNumber) {
+    if (c == nullptr || c->type != JsonValue::Type::kNumber ||
+        !std::isfinite(c->number)) {
       if (error != nullptr) {
-        *error =
-            std::string("field layout: tag quaternion missing '") + k + "'";
+        *error = std::string(
+                     "field layout: tag quaternion missing or non-finite '") +
+                 k + "'";
       }
       return false;
     }
     *v = c->number;
   }
-  const double norm = std::sqrt(w * w + x * x + y * y + z * z);
-  if (!(norm > 1e-9)) {
+  const double scale =
+      std::max({std::abs(w), std::abs(x), std::abs(y), std::abs(z)});
+  if (!(scale > 0.0) || !std::isfinite(scale)) {
     if (error != nullptr) *error = "field layout: zero-norm tag quaternion";
     return false;
   }
-  const Eigen::Quaterniond quat(w / norm, x / norm, y / norm, z / norm);
+  const double sw = w / scale;
+  const double sx = x / scale;
+  const double sy = y / scale;
+  const double sz = z / scale;
+  const double scaled_norm = std::sqrt(sw * sw + sx * sx + sy * sy + sz * sz);
+  if (!(scale * scaled_norm > 1e-9)) {
+    if (error != nullptr) *error = "field layout: zero-norm tag quaternion";
+    return false;
+  }
+  const Eigen::Quaterniond quat(sw / scaled_norm, sx / scaled_norm,
+                                sy / scaled_norm, sz / scaled_norm);
   *out = talos::geometry::SE3<double>(
       talos::geometry::SO3<double>(quat.toRotationMatrix()), translation);
   return true;
@@ -82,7 +98,7 @@ bool LoadFieldLayoutFromJson(std::string_view text, double tag_size_m,
                              FieldLayoutData* out, std::string* error) {
   if (out == nullptr) return false;
   *out = FieldLayoutData{};
-  if (!(tag_size_m > 0.0)) {
+  if (!std::isfinite(tag_size_m) || !(tag_size_m > 0.0)) {
     if (error != nullptr) *error = "field layout: tag size must be positive";
     return false;
   }
@@ -117,8 +133,9 @@ bool LoadFieldLayoutFromJson(std::string_view text, double tag_size_m,
   const JsonValue* width = dims->Find("width");
   if (length == nullptr || width == nullptr ||
       length->type != JsonValue::Type::kNumber ||
-      width->type != JsonValue::Type::kNumber || !(length->number > 0.0) ||
-      !(width->number > 0.0)) {
+      width->type != JsonValue::Type::kNumber ||
+      !std::isfinite(length->number) || !std::isfinite(width->number) ||
+      !(length->number > 0.0) || !(width->number > 0.0)) {
     if (error != nullptr) {
       *error = "field layout: field dimensions need positive length/width";
     }

@@ -8,6 +8,12 @@ flatbuffer_cc_library(
     srcs = ["test_message.fbs"],
 )
 
+_TRANSPORT_VISIBILITY = [
+    "//studio:__subpackages__",
+    "//talOS:__subpackages__",
+    "//tools:__pkg__",
+]
+
 # Whether a process recorded in shared memory (pid, start time and pid
 # namespace) still runs: RTMS claims and the live registry's rows share this
 # one check.
@@ -15,7 +21,7 @@ cc_library(
     name = "process_liveness",
     srcs = ["process_liveness.cc"],
     hdrs = ["process_liveness.h"],
-    visibility = ["//visibility:public"],
+    visibility = _TRANSPORT_VISIBILITY,
 )
 
 # The cross-process wake channel a publisher uses to wake a reader asleep on
@@ -24,14 +30,14 @@ cc_library(
     name = "wake",
     srcs = ["wake.cc"],
     hdrs = ["wake.h"],
-    visibility = ["//visibility:public"],
+    visibility = _TRANSPORT_VISIBILITY,
 )
 
 cc_library(
     name = "rtms",
     srcs = ["rtms.cc"],
     hdrs = ["rtms.h"],
-    visibility = ["//visibility:public"],
+    visibility = _TRANSPORT_VISIBILITY,
     deps = [
         ":process_liveness",
         ":wake",
@@ -108,11 +114,26 @@ cc_test(
     ],
 )
 
+# Deterministic reader-registration boundary cases (<1 ms; fast lane).
+cc_test(
+    name = "ring_registration_test",
+    size = "small",
+    srcs = ["ring_registration_test.cc"],
+    deps = [
+        ":ring_test_payload",
+        ":rtms",
+        "//talOS/schema:identity",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Over 5 s on 4-vCPU Linux CI (5.1 s): runs three 4-thread busy-spin
+# contention loops totaling 304k atomic-word slot writes; heavy lane.
 cc_test(
     name = "ring_lap_test",
-    size = "small",
+    size = "medium",
     srcs = ["ring_lap_test.cc"],
-    tags = ["no_tsan"],  # the lapped copy is a data race by design; tsan reports it
+    tags = ["heavy"],
     deps = [
         ":ring_test_payload",
         ":rtms",

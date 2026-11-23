@@ -2,7 +2,9 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <array>
@@ -189,6 +191,431 @@ TEST(RuntimeUdpTest, ReopenKeepsThePortsAndTheSendSequence) {
   ASSERT_EQ(testing::ReceiveFrame(rio, &received), UdpStatus::kOk);
   EXPECT_EQ(received.header.monotonic_time_us, 3u);
   EXPECT_EQ(received.header.sequence, 2u);
+}
+
+// REQ-RT-22: sequence_gaps counts actual missed frames on in-order jumps,
+// while out-of-order and duplicate frames increment out_of_order_frames
+// without rolling last_received_sequence backwards (so the next in-order
+// frame creates no phantom gap).
+TEST(RuntimeUdpTest, CountsMissedSequenceGapsAndOutOfOrderWithoutRollback) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+
+  const auto send_seq = [&](uint64_t seq) {
+    std::array<uint8_t, kFrameHeaderSize> buf{};
+    const std::size_t n =
+        EncodeFrame(FrameType::kClockProbe, kFlagNone, seq, seq * 1000, nullptr,
+                    0, buf.data(), buf.size());
+    ASSERT_EQ(n, kFrameHeaderSize);
+    ASSERT_EQ(::sendto(raw_sender, buf.data(), n, 0,
+                       reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+              static_cast<ssize_t>(n));
+    DecodedFrame frame;
+    ASSERT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kOk);
+    EXPECT_EQ(frame.header.sequence, seq);
+  };
+
+  send_seq(1);  // first frame
+  EXPECT_EQ(receiver.stats().sequence_gaps, 0u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 1u);
+
+  send_seq(5);  // jumped 2, 3, 4 -> 3 missed frames
+  EXPECT_EQ(receiver.stats().sequence_gaps, 3u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 0u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 5u);
+
+  send_seq(3);  // delayed out-of-order -> must not roll last_received back
+  EXPECT_EQ(receiver.stats().sequence_gaps, 3u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 1u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 5u);
+
+  send_seq(5);  // duplicate -> out-of-order
+  EXPECT_EQ(receiver.stats().sequence_gaps, 3u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 2u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 5u);
+
+  send_seq(6);  // contiguous after 5 -> 0 additional missed frames
+
+  ::close(raw_sender);
+
+  EXPECT_EQ(receiver.stats().sequence_gaps, 3u);
+  EXPECT_EQ(receiver.stats().out_of_order_frames, 2u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 6u);
+  EXPECT_EQ(receiver.stats().received_frames, 5u);
+  EXPECT_EQ(receiver.stats().send_would_block, 0u);
+}
+
+// REQ-RT-22: when a peer restarts and resets its send sequence to 1,
+// RuntimeUdpPeer re-baselines last_received_sequence so later gaps are still
+// counted (both after a long run and after a short run).
+TEST(RuntimeUdpTest, PeerRestartRebaselinesSequenceGapCounting) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+
+  const auto send_seq = [&](uint64_t seq) {
+    std::array<uint8_t, kFrameHeaderSize> buf{};
+    const std::size_t n =
+        EncodeFrame(FrameType::kClockProbe, kFlagNone, seq, seq * 1000, nullptr,
+                    0, buf.data(), buf.size());
+    ASSERT_EQ(n, kFrameHeaderSize);
+    ASSERT_EQ(::sendto(raw_sender, buf.data(), n, 0,
+                       reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+              static_cast<ssize_t>(n));
+    DecodedFrame frame;
+    ASSERT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kOk);
+  };
+
+  // Long run restart: large backward jump re-baselines immediately.
+  send_seq(120000);
+  send_seq(1);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 1u);
+  EXPECT_EQ(receiver.stats().sequence_gaps, 0u);
+  send_seq(4);  // missed 2, 3 -> 2 missed frames
+  EXPECT_EQ(receiver.stats().sequence_gaps, 2u);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 4u);
+
+  // A 2-frame reorder inside the window must not re-baseline or add false gaps.
+  send_seq(10);  // missed 5..9 -> +5 (total 7)
+  EXPECT_EQ(receiver.stats().sequence_gaps, 7u);
+  send_seq(8);
+  send_seq(9);
+  send_seq(11);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 11u);
+  EXPECT_EQ(receiver.stats().sequence_gaps, 7u);
+
+  // Short run restart (within reorder window): three ascending frames below
+  // last re-baseline.
+  send_seq(1);
+  send_seq(2);
+  send_seq(3);
+  EXPECT_EQ(receiver.stats().last_received_sequence, 3u);
+  send_seq(6);  // missed 4, 5 -> +2 (total 9)
+  EXPECT_EQ(receiver.stats().sequence_gaps, 9u);
+
+  ::close(raw_sender);
+}
+
+// REQ-RT-22: a non-EAGAIN recv() error records errno in last_recv_error.
+TEST(RuntimeUdpTest, RecordsLastRecvErrorOnSocketError) {
+  const uint16_t unbound = FreeLoopbackPort();
+  ASSERT_NE(unbound, 0);
+  RuntimeUdpPeer peer;
+  ASSERT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", unbound), UdpStatus::kOk);
+  ASSERT_EQ(peer.SendFrame(FrameType::kClockProbe, kFlagNone, 1, nullptr, 0),
+            UdpStatus::kOk);
+
+  // Wait for ICMP port unreachable to surface on the connected UDP socket.
+  pollfd pfd{peer.NativeFd(), POLLIN | POLLERR, 0};
+  ASSERT_EQ(::poll(&pfd, 1, 5000), 1);
+
+  DecodedFrame frame;
+  EXPECT_EQ(peer.TryReceive(&frame), UdpStatus::kSocketError);
+  EXPECT_EQ(peer.stats().last_recv_error, ECONNREFUSED);
+}
+
+// REQ-RT-22: permanent send errors trigger socket replacement, while transient
+// errors such as ICMP port unreachable (ECONNREFUSED) keep it.
+TEST(RuntimeUdpTest, SendErrorNeedsNewSocketClassifiesPermanentAndTransient) {
+  for (const int permanent : {EPIPE, ENOTCONN, EDESTADDRREQ, EBADF, ENOTSOCK,
+                              ENETUNREACH, EADDRNOTAVAIL}) {
+    EXPECT_TRUE(SendErrorNeedsNewSocket(permanent)) << std::strerror(permanent);
+  }
+  for (const int transient : {0, ECONNREFUSED, EAGAIN, EWOULDBLOCK, EINTR,
+                              ENOBUFS, ENETDOWN, EHOSTUNREACH}) {
+    EXPECT_FALSE(SendErrorNeedsNewSocket(transient))
+        << std::strerror(transient);
+  }
+}
+
+// REQ-RT-22: permanent receive errors trigger socket replacement, while
+// transient errors such as ICMP port unreachable (ECONNREFUSED) keep it.
+TEST(RuntimeUdpTest,
+     ReceiveErrorNeedsNewSocketClassifiesPermanentAndTransient) {
+  for (const int permanent :
+       {EBADF, ENOTCONN, ENOTSOCK, EPIPE, ENETUNREACH, EADDRNOTAVAIL}) {
+    EXPECT_TRUE(ReceiveErrorNeedsNewSocket(permanent))
+        << std::strerror(permanent);
+  }
+  for (const int transient : {0, ECONNREFUSED, EAGAIN, EWOULDBLOCK, EINTR,
+                              ENOBUFS, ENETDOWN, EHOSTUNREACH}) {
+    EXPECT_FALSE(ReceiveErrorNeedsNewSocket(transient))
+        << std::strerror(transient);
+  }
+}
+
+// REQ-RT-22: binding an IPv4 local_address that is not assigned to the host
+// fails with EADDRNOTAVAIL rather than falling back to 0.0.0.0.
+TEST(RuntimeUdpTest, OpenFailsCleanlyWhenLocalAddressIsAbsent) {
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(remote, 0);
+  RuntimeUdpPeer peer;
+  errno = 0;
+  EXPECT_EQ(peer.Open("192.0.2.254", 0, "127.0.0.1", remote),
+            UdpStatus::kSocketError);
+  EXPECT_EQ(errno, EADDRNOTAVAIL);
+  EXPECT_FALSE(peer.IsOpen());
+  EXPECT_EQ(peer.NativeFd(), -1);
+  EXPECT_EQ(peer.Reopen(), UdpStatus::kInvalidArgument);
+
+  // A subsequent Open with an assigned address still succeeds cleanly.
+  EXPECT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", remote), UdpStatus::kOk);
+  EXPECT_TRUE(peer.IsOpen());
+}
+
+// REQ-CONTRACT-01: a UDP datagram larger than kMaxFrameSize whose leading
+// kMaxFrameSize bytes form a valid max-payload frame must be rejected as
+// truncated/oversized rather than silently truncated to kMaxFrameSize and
+// decoded as kOk.
+TEST(RuntimeUdpTest, RejectsOversizedDatagramWithValidMaxPayloadPrefix) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions unconnected;
+  unconnected.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+
+  std::array<uint8_t, kMaxPayloadSize> payload{};
+  payload.fill(0x5Au);
+  std::array<uint8_t, kMaxFrameSize + 1> oversized{};
+  ASSERT_EQ(
+      EncodeFrame(FrameType::kHardwareState, kFlagNone, 1, 1000, payload.data(),
+                  payload.size(), oversized.data(), kMaxFrameSize),
+      kMaxFrameSize);
+  oversized[kMaxFrameSize] = 0xAAu;
+
+  ASSERT_EQ(::sendto(raw_sender, oversized.data(), oversized.size(), 0,
+                     reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+            static_cast<ssize_t>(oversized.size()));
+
+  DecodedFrame frame;
+  EXPECT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kDecodeError);
+  EXPECT_EQ(receiver.stats().last_decode_status, DecodeStatus::kTruncated);
+  EXPECT_EQ(receiver.stats().decode_failures, 1u);
+  EXPECT_EQ(receiver.stats().received_frames, 0u);
+
+  // An exact kMaxFrameSize datagram still decodes cleanly.
+  ASSERT_EQ(::sendto(raw_sender, oversized.data(), kMaxFrameSize, 0,
+                     reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)),
+            static_cast<ssize_t>(kMaxFrameSize));
+  ASSERT_EQ(testing::ReceiveFrame(receiver, &frame), UdpStatus::kOk);
+  EXPECT_EQ(frame.header.sequence, 1u);
+  EXPECT_EQ(frame.payload_size, kMaxPayloadSize);
+  EXPECT_EQ(receiver.stats().received_frames, 1u);
+  EXPECT_EQ(receiver.stats().received_bytes, kMaxFrameSize);
+
+  ::close(raw_sender);
+}
+
+struct EintrTestState {
+  volatile sig_atomic_t signal_count = 0;
+  int sender_fd = -1;
+  std::array<uint8_t, kFrameHeaderSize> frame{};
+  std::size_t frame_size = 0;
+};
+
+EintrTestState g_eintr_state;
+
+void OnSigAlrmForEintrTest(int /*sig*/) {
+  const int saved_errno = errno;
+  const sig_atomic_t count = g_eintr_state.signal_count + 1;
+  g_eintr_state.signal_count = count;
+  if (count >= 2 && g_eintr_state.sender_fd >= 0) {
+    static_cast<void>(::send(g_eintr_state.sender_fd,
+                             g_eintr_state.frame.data(),
+                             g_eintr_state.frame_size, 0));
+  }
+  errno = saved_errno;
+}
+
+// REQ-RT-22: a signal interrupting a blocking POSIX recv() (EINTR) is retried
+// rather than surfacing kSocketError with last_recv_error == EINTR.
+TEST(RuntimeUdpTest, BlockingReceiveRetriesOnEintr) {
+  RuntimeUdpPeer receiver;
+  UdpSocketOptions blocking;
+  blocking.non_blocking = false;
+  blocking.connect_peer = false;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", 0, blocking),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int raw_sender = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(raw_sender, 0);
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dest.sin_port = htons(rx_port);
+  ASSERT_EQ(::connect(raw_sender, reinterpret_cast<const sockaddr*>(&dest),
+                      sizeof(dest)),
+            0);
+
+  g_eintr_state.signal_count = 0;
+  g_eintr_state.sender_fd = raw_sender;
+  g_eintr_state.frame_size =
+      EncodeFrame(FrameType::kClockProbe, kFlagNone, 42, 9999, nullptr, 0,
+                  g_eintr_state.frame.data(), g_eintr_state.frame.size());
+  ASSERT_EQ(g_eintr_state.frame_size, kFrameHeaderSize);
+
+  struct sigaction action {};
+  action.sa_handler = OnSigAlrmForEintrTest;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = 0;  // No SA_RESTART so blocking recv() returns EINTR.
+  struct sigaction previous {};
+  ASSERT_EQ(::sigaction(SIGALRM, &action, &previous), 0);
+
+  struct ScopedCleanup {
+    struct sigaction* previous_action;
+    int fd;
+    ~ScopedCleanup() {
+      itimerval disarm{};
+      static_cast<void>(::setitimer(ITIMER_REAL, &disarm, nullptr));
+      static_cast<void>(::sigaction(SIGALRM, previous_action, nullptr));
+      g_eintr_state.sender_fd = -1;
+      ::close(fd);
+    }
+  } cleanup{&previous, raw_sender};
+
+  itimerval timer{};
+  timer.it_value.tv_usec = 20000;
+  timer.it_interval.tv_usec = 20000;
+  ASSERT_EQ(::setitimer(ITIMER_REAL, &timer, nullptr), 0);
+
+  DecodedFrame frame;
+  EXPECT_EQ(receiver.TryReceive(&frame), UdpStatus::kOk);
+  EXPECT_EQ(frame.header.sequence, 42u);
+  EXPECT_EQ(receiver.stats().last_recv_error, 0);
+  EXPECT_GE(g_eintr_state.signal_count, 2);
+}
+
+// REQ-OPS-27: a connected RuntimeUdpPeer accepts frames only from the peer
+// address/port it connected to; datagrams from a third, unconnected socket are
+// dropped by the kernel (TryReceive reports kWouldBlock) while frames from its
+// connected peer arrive intact.
+TEST(RuntimeUdpTest, ConnectedPeerDropsFramesFromUnconnectedSender) {
+  const int authorized = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(authorized, 0);
+  struct ScopedFd {
+    int fd;
+    ~ScopedFd() {
+      if (fd >= 0) ::close(fd);
+    }
+  } close_authorized{authorized};
+
+  sockaddr_in auth_addr{};
+  auth_addr.sin_family = AF_INET;
+  auth_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  auth_addr.sin_port = 0;
+  ASSERT_EQ(::bind(authorized, reinterpret_cast<const sockaddr*>(&auth_addr),
+                   sizeof(auth_addr)),
+            0);
+  socklen_t auth_len = sizeof(auth_addr);
+  ASSERT_EQ(::getsockname(authorized, reinterpret_cast<sockaddr*>(&auth_addr),
+                          &auth_len),
+            0);
+  const uint16_t auth_port = ntohs(auth_addr.sin_port);
+  ASSERT_NE(auth_port, 0);
+
+  RuntimeUdpPeer receiver;
+  ASSERT_EQ(receiver.Open("127.0.0.1", 0, "127.0.0.1", auth_port),
+            UdpStatus::kOk);
+  const uint16_t rx_port = BoundPort(receiver);
+  ASSERT_NE(rx_port, 0);
+
+  const int rogue = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  ASSERT_GE(rogue, 0);
+  ScopedFd close_rogue{rogue};
+  sockaddr_in rogue_addr{};
+  rogue_addr.sin_family = AF_INET;
+  rogue_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  rogue_addr.sin_port = 0;
+  ASSERT_EQ(::bind(rogue, reinterpret_cast<const sockaddr*>(&rogue_addr),
+                   sizeof(rogue_addr)),
+            0);
+  socklen_t rogue_len = sizeof(rogue_addr);
+  ASSERT_EQ(::getsockname(rogue, reinterpret_cast<sockaddr*>(&rogue_addr),
+                          &rogue_len),
+            0);
+  ASSERT_NE(ntohs(rogue_addr.sin_port), auth_port);
+
+  sockaddr_in rx_addr{};
+  rx_addr.sin_family = AF_INET;
+  rx_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  rx_addr.sin_port = htons(rx_port);
+
+  const std::array<uint8_t, 4> rogue_payload = {0xDE, 0xAD, 0xBE, 0xEF};
+  const auto send_rogue = [&](uint64_t seq, uint64_t time_us) {
+    std::array<uint8_t, kFrameHeaderSize + rogue_payload.size()> wire{};
+    const std::size_t n = EncodeFrame(
+        FrameType::kHardwareCommand, kFlagNone, seq, time_us,
+        rogue_payload.data(), rogue_payload.size(), wire.data(), wire.size());
+    ASSERT_EQ(n, wire.size());
+    ASSERT_EQ(
+        ::sendto(rogue, wire.data(), n, 0,
+                 reinterpret_cast<const sockaddr*>(&rx_addr), sizeof(rx_addr)),
+        static_cast<ssize_t>(n));
+  };
+  send_rogue(1, 111);
+
+  DecodedFrame received;
+  EXPECT_EQ(receiver.TryReceive(&received), UdpStatus::kWouldBlock);
+  EXPECT_EQ(receiver.stats().received_frames, 0u);
+
+  // Send another rogue frame immediately followed by one from the connected
+  // peer: only the connected peer's frame is delivered.
+  send_rogue(2, 222);
+
+  const std::array<uint8_t, 4> peer_payload = {1, 2, 3, 4};
+  std::array<uint8_t, kFrameHeaderSize + peer_payload.size()> wire{};
+  const std::size_t wire_size = EncodeFrame(
+      FrameType::kHardwareCommand, kFlagNone, 7, 333, peer_payload.data(),
+      peer_payload.size(), wire.data(), wire.size());
+  ASSERT_EQ(wire_size, wire.size());
+  ASSERT_EQ(
+      ::sendto(authorized, wire.data(), wire_size, 0,
+               reinterpret_cast<const sockaddr*>(&rx_addr), sizeof(rx_addr)),
+      static_cast<ssize_t>(wire_size));
+
+  ASSERT_EQ(testing::ReceiveFrame(receiver, &received), UdpStatus::kOk);
+  EXPECT_EQ(received.header.sequence, 7u);
+  EXPECT_EQ(received.header.monotonic_time_us, 333u);
+  ASSERT_EQ(received.payload_size, peer_payload.size());
+  EXPECT_EQ(
+      std::memcmp(received.payload, peer_payload.data(), peer_payload.size()),
+      0);
+  EXPECT_EQ(receiver.TryReceive(&received), UdpStatus::kWouldBlock);
+  EXPECT_EQ(receiver.stats().received_frames, 1u);
 }
 
 }  // namespace

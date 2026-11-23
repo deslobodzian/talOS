@@ -17,6 +17,7 @@
 #include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/replay_event_loop.h"
 #include "talOS/events/simulated_event_loop.h"
 #include "talOS/events/test_robot.h"
@@ -186,20 +187,48 @@ TEST(Replay, ReRecordingIsByteIdenticalForEveryDeliveryPolicy) {
   }
 }
 
+// REQ-OPS-13
 TEST(Replay, DetectsChangedBehaviour) {
   const std::string path = temp_path("divergence");
   record_run(path, 2.5F);
+
+  // Locate the second control timer dispatch: the first runs with zero error
+  // (position == target == 0), and the second acts on the first non-zero error.
+  std::uint64_t expected_dispatch = 0;
+  {
+    log::LogReader inspect{path};
+    log::LogReader::Record record;
+    int control_ticks = 0;
+    while (inspect.next(record)) {
+      if (static_cast<EventKind>(record.header.kind) == EventKind::TIMER &&
+          ++control_ticks == 2) {
+        expected_dispatch = record.header.dispatch_index;
+        break;
+      }
+    }
+  }
+  ASSERT_GT(expected_dispatch, 0u);
 
   log::LogReader reader{path};
   ReplayEventLoop<> loop{reader};
 
   // Same program, different gain: the first control cycle that acts on a
-  // non-zero error must produce different bytes.
+  // non-zero error must produce different bytes, naming dispatch and topic.
   TestRobot<ReplayEventLoop<>> robot{loop, test_topics(), 9.0F};
   robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
                                        1ms);
 
-  EXPECT_THROW(loop.run(), ReplayDivergence);
+  try {
+    loop.run();
+    ADD_FAILURE() << "replay accepted divergent control output";
+  } catch (const ReplayDivergence& e) {
+    EXPECT_EQ(e.divergence().dispatch_index, expected_dispatch);
+    const std::string what = e.what();
+    EXPECT_NE(what.find("dispatch " + std::to_string(expected_dispatch)),
+              std::string::npos)
+        << what;
+    EXPECT_NE(what.find(test_topics().command), std::string::npos) << what;
+  }
 
   std::remove(path.c_str());
 }
@@ -222,6 +251,7 @@ TEST(Replay, CollectsEveryDivergenceWhenAsked) {
   std::remove(path.c_str());
 }
 
+// REQ-OPS-13
 TEST(Replay, RejectsALogFromADifferentProgram) {
   const std::string path = temp_path("manifest");
   record_run(path, 2.5F);
@@ -357,10 +387,12 @@ TEST(Replay, DetectsAMissingExit) {
   EXPECT_EQ(divergence->dispatch_index, 1u);
 }
 
+// REQ-OPS-13
 TEST(Replay, RejectsChangedOrMissingInitialSchedule) {
   const auto path = temp_path("initial_schedule");
   record_timer_program(path);
   for (int change = 0; change < 3; ++change) {
+    SCOPED_TRACE(change);
     log::LogReader reader{path};
     ReplayEventLoop<> loop{reader};
     TimerProgram program{loop};
@@ -371,7 +403,13 @@ TEST(Replay, RejectsChangedOrMissingInitialSchedule) {
       loop.arm_timer(program.id, MonotonicTime::from_nanos(2'000'000), {});
     }
     if (change == 2) loop.disarm_timer(program.id);
-    EXPECT_THROW(loop.run(), ReplayError) << "change " << change;
+    try {
+      loop.run();
+      ADD_FAILURE() << "replay accepted mismatched initial schedule";
+    } catch (const ReplayError& e) {
+      EXPECT_NE(std::string{e.what()}.find(path), std::string::npos)
+          << e.what();
+    }
   }
   std::remove(path.c_str());
 }
@@ -919,6 +957,7 @@ TEST(Replay, ALogCutDuringConstructionEndsBeforeTheFirstDispatch) {
 // Records lost between intact ones would replay a run the program never
 // made, so exact replay refuses the log (input replay stops at them or
 // refuses them).
+// REQ-OPS-13
 TEST(Replay, RefusesALogMissingADamagedRecord) {
   const std::string path = temp_path("damaged");
   record_run(path, 2.5F);
@@ -942,7 +981,12 @@ TEST(Replay, RefusesALogMissingADamagedRecord) {
   }
 
   log::LogReader reader{path};
-  EXPECT_THROW((ReplayEventLoop<>{reader}), ReplayError);
+  try {
+    ReplayEventLoop<> loop{reader};
+    ADD_FAILURE() << "replay accepted a log missing damaged records";
+  } catch (const ReplayError& e) {
+    EXPECT_NE(std::string{e.what()}.find(path), std::string::npos) << e.what();
+  }
   EXPECT_EQ(reader.damage().spans, 1u);
 
   std::remove(path.c_str());
@@ -1047,6 +1091,137 @@ TEST(Replay, RestoresTrailingZerosTheLogDoesNotStore) {
   PaddedEcho echo{loop};
   echo.mark = std::byte{1};
   EXPECT_THROW(loop.run(), ReplayDivergence);
+
+  std::remove(original_path.c_str());
+  std::remove(replayed_path.c_str());
+}
+
+// Watches a sequence topic, then on its timer tick publishes a summary of the
+// messages drained before the tick and exits.
+template <typename Loop>
+struct BacklogProgram {
+  Loop& loop;
+  std::uint16_t sender{0};
+  int received{0};
+  std::int32_t last_value{0};
+  int observed_count{0};
+  std::int32_t observed_value{0};
+
+  BacklogProgram(Loop& event_loop, std::string_view in_topic,
+                 std::string_view out_topic)
+      : loop{event_loop} {
+    watch<EventsTest::SensorMessage, &BacklogProgram::on_sensor>(loop, in_topic,
+                                                                 this);
+    sender =
+        loop.register_sender(out_topic, sizeof(EventsTest::CommandMessage),
+                             alignof(EventsTest::CommandMessage),
+                             talos::schema::Of<EventsTest::CommandMessage>());
+    const auto timer =
+        loop.register_timer("tick", make_thunk<&BacklogProgram::on_tick>(this));
+    loop.arm_timer(timer, loop.monotonic_now(), Duration::zero());
+  }
+
+  void on_sensor(const Context&, const EventsTest::SensorMessage& message) {
+    last_value = message.sensor_id();
+    ++received;
+  }
+
+  void on_tick(const Context&) {
+    observed_count = received;
+    observed_value = last_value;
+    const EventsTest::CommandMessage command{
+        observed_value, static_cast<float>(observed_count), 1};
+    loop.send_message(sender,
+                      std::as_bytes(std::span{&command, std::size_t{1}}));
+    loop.exit();
+  }
+};
+
+// A .tlog recorded by RealtimeEventLoop when > 64 queued sequence messages are
+// drained across multiple passes before a single timer tick replays cleanly
+// through ReplayEventLoop and re-records byte-identically.
+// REQ-OPS-13
+// REQ-SAFE-01
+// REQ-RT-04
+TEST(Replay, MultiPassPreTimerBacklogRecordedOnRealtimeLoopReplaysCleanly) {
+  constexpr int kQueued = 80;  // over default max_messages_per_tick (64)
+  constexpr auto kHangBound = 10s;
+  const std::string pid = std::to_string(::getpid());
+  const std::string in_topic = "/rpb_" + pid;
+  const std::string out_topic = "/rpo_" + pid;
+  const std::string original_path = temp_path("rt_backlog_a");
+  const std::string replayed_path = temp_path("rt_backlog_b");
+
+  {
+    using RecordingLoop = RealtimeEventLoop<log::LogWriter>;
+    RecordingLoop::Options options;
+    options.delivery = Delivery::BEFORE_TIMERS;
+    RecordingLoop loop{log::LogWriter{original_path, "backlog"}, options};
+    BacklogProgram program{loop, in_topic, out_topic};
+
+    RTMSQueue publisher{in_topic,
+                        sizeof(EventsTest::SensorMessage),
+                        alignof(EventsTest::SensorMessage),
+                        talos::schema::Of<EventsTest::SensorMessage>(),
+                        MAX_SLOTS,
+                        RTMSOptions{.publisher = true}};
+    for (int i = 1; i <= kQueued; ++i) {
+      const EventsTest::SensorMessage message{i, 0.0F, 0.0F};
+      ASSERT_EQ(
+          publisher
+              .write(std::as_bytes(
+                  std::span<const EventsTest::SensorMessage, 1>{&message, 1}))
+              .result,
+          WriteResult::SUCCESS);
+    }
+
+    loop.run_for(kHangBound);  // Bound only; on_tick exits.
+    ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+    EXPECT_EQ(loop.activity().drains, 2u);  // 64 + 16 before the single tick
+    EXPECT_EQ(program.observed_count, kQueued);
+    EXPECT_EQ(program.observed_value, kQueued);
+  }
+
+  // Verify the recorded log captured all 80 MESSAGE dispatches ahead of the
+  // single TIMER dispatch.
+  {
+    const LogRecords recorded = read_records(original_path);
+    int messages_before_timer = 0;
+    int timer_count = 0;
+    for (const log::RecordHeader& header : recorded.headers) {
+      const auto kind = static_cast<EventKind>(header.kind);
+      if (kind == EventKind::MESSAGE && timer_count == 0) {
+        ++messages_before_timer;
+      } else if (kind == EventKind::TIMER) {
+        ++timer_count;
+      }
+    }
+    EXPECT_EQ(messages_before_timer, kQueued);
+    EXPECT_EQ(timer_count, 1);
+  }
+
+  {
+    log::LogReader reader{original_path};
+    ReplayEventLoop<log::LogWriter> replay{
+        reader, log::LogWriter{replayed_path, "backlog"}};
+    BacklogProgram program{replay, in_topic, out_topic};
+    replay.run();
+    EXPECT_FALSE(replay.diverged());
+    EXPECT_TRUE(replay.reached_exit());
+    EXPECT_EQ(program.observed_count, kQueued);
+    EXPECT_EQ(program.observed_value, kQueued);
+    ASSERT_FALSE(replay.recorder().failed()) << replay.recorder().error();
+  }
+
+  std::vector<char> original = read_file(original_path);
+  std::vector<char> replayed = read_file(replayed_path);
+  ASSERT_FALSE(original.empty());
+  ASSERT_EQ(original.size(), replayed.size());
+  for (std::size_t i = 0; i < WALL_CLOCK_BYTES; ++i) {
+    original[WALL_CLOCK_OFFSET + i] = 0;
+    replayed[WALL_CLOCK_OFFSET + i] = 0;
+  }
+  EXPECT_EQ(original, replayed);
 
   std::remove(original_path.c_str());
   std::remove(replayed_path.c_str());

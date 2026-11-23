@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -30,15 +31,17 @@
 // longer than the period) and late ticks (one starting more than 1.5 periods
 // after the previous, as when the loop is starved of the CPU, which delays
 // command-timeout enforcement however short the work), with that window's
-// longest work and longest interval. None has a field in State, so all stay
-// RIO-local.
+// longest work, that single worst-work tick's 8-phase split (published
+// lock-free with the window's counters and maxima through double-buffered
+// atomic seqlocks), and longest interval. None has a field in State, so all
+// stay RIO-local.
 //
-// Every 10 s it also prints where the ticks' work went (TickPhase), when that
-// window had ticks: per phase the mean and longest time per tick, and the
-// device counts. The loop thread adds a tick's phases with plain arithmetic
-// and hands a finished window over on the first tick after the logger asks
-// for it: relaxed stores between an acquire load of the request and a
-// release store, once per window.
+// Every 10 s (and on Flush()/Stop() for the final partial window) it also
+// prints where the ticks' work went (TickPhase), when that window had ticks:
+// per phase the mean and longest time per tick, and the device counts. The
+// loop thread adds a tick's phases with plain arithmetic and hands a finished
+// window over on the first tick after the logger asks for it: relaxed stores
+// between an acquire load of the request and a release store, once per window.
 //
 // Beside that line, the same window's latency line (REQ-RT-25): the p50, p99
 // and max of each drained command's observation age (accepted and refused
@@ -196,7 +199,12 @@ class RioLog {
 
   // Starts the logger thread (nice 19 on Linux, best effort), which
   // drains every 20 ms. Stop() (also the destructor) drains, flushes the
-  // coalesced lines and joins it.
+  // coalesced lines and final partial phase/latency window, and joins it.
+  // Precondition for Stop(): the loop thread must have stopped calling
+  // RecordTick, AddPhase/BeginTick/ClosePhase/SetTickDevices, and
+  // RecordCommandAge/RecordDriverStationAge before Stop() is called (and
+  // those calls must happen-before Stop(), e.g. because the loop thread calls
+  // Stop() itself after exiting the loop).
   void Start();
   void Stop();
 
@@ -215,16 +223,16 @@ class RioLog {
     return late_ticks_.load(std::memory_order_relaxed);
   }
   // The longest work and interval since the last summary.
-  uint64_t max_tick_us() const {
-    return max_tick_us_.load(std::memory_order_relaxed);
-  }
-  uint64_t max_interval_us() const {
-    return max_interval_us_.load(std::memory_order_relaxed);
-  }
+  uint64_t max_tick_us() const;
+  uint64_t max_interval_us() const;
 
   // Decode a TalonFX FaultField (SPN 0x34c, frame 0xad).
   static std::string DecodeTalonFaultBits(uint32_t fault_flags);
   static std::string Format(const LogEvent& event);
+  // Writes ConsoleTime(steady_us) + line to `stream` using a stack buffer so
+  // the default sink allocates nothing.
+  static void WriteConsoleLine(uint64_t steady_us, std::string_view line,
+                               std::FILE* stream) noexcept;
 
  private:
   // Bounded multi-producer queue (Vyukov): one sequence number per cell, so
@@ -256,9 +264,6 @@ class RioLog {
   std::atomic<uint64_t> dropped_{0};
   std::atomic<uint64_t> overruns_{0};
   std::atomic<uint64_t> late_ticks_{0};
-  std::atomic<uint64_t> max_tick_us_{0};
-  std::atomic<uint64_t> max_interval_us_{0};
-  std::atomic<uint64_t> period_us_{0};
 
   // Tick phases. Loop-thread state: this tick's phases and the open window.
   static constexpr std::size_t kPhaseCount =
@@ -289,6 +294,50 @@ class RioLog {
   std::array<std::atomic<uint64_t>, kPhaseCount> published_max_ns_{};
   std::atomic<uint32_t> published_motors_{0};
   std::atomic<uint32_t> published_sensors_{0};
+  // Per-window loop timing summary (overruns, late ticks, max work, max
+  // interval, period, and the single worst-work tick's 8-phase split),
+  // double-buffered in two atomic-seqlock slots indexed by `epoch & 1`.
+  // The logger advances `timing_epoch_` (release) from E to E+1 only after
+  // observing a published snapshot for epoch E; by single-writer happens-before
+  // the loop thread will never write to epoch E-1 again, so the logger drains
+  // any straggler ticks from E-1 before recycling that slot for E+1. Each slot
+  // uses a fence-free atomic seqlock (seq odd acq_rel -> release payload stores
+  // -> seq even release; paired with acquire loads in ReadTimingSlot) so
+  // Drain() reads an indivisible snapshot with no locks, heap allocation, or
+  // standalone atomic_thread_fence (-Werror=tsan).
+  struct alignas(64) TimingSlot {
+    std::atomic<uint64_t> seq{0};
+    std::atomic<uint64_t> epoch{0};
+    std::atomic<uint64_t> overruns{0};
+    std::atomic<uint64_t> late_ticks{0};
+    std::atomic<uint64_t> max_tick_us{0};
+    std::atomic<uint64_t> max_interval_us{0};
+    std::atomic<uint64_t> period_us{0};
+    std::array<std::atomic<uint64_t>, kPhaseCount> worst_phase_ns{};
+  };
+  struct TimingSnapshot {
+    bool valid{false};
+    uint64_t epoch{0};
+    uint64_t overruns{0};
+    uint64_t late_ticks{0};
+    uint64_t max_tick_us{0};
+    uint64_t max_interval_us{0};
+    uint64_t period_us{0};
+    std::array<uint64_t, kPhaseCount> worst_phase_ns{};
+  };
+  TimingSnapshot ReadTimingSlot(uint64_t expected_epoch) const;
+  std::atomic<uint64_t> timing_epoch_{1};
+  std::array<TimingSlot, 2> timing_{};
+  // Loop-thread-only timing state for `local_timing_epoch_`.
+  uint64_t local_timing_epoch_{0};
+  uint64_t local_total_overruns_{0};
+  uint64_t local_total_late_ticks_{0};
+  uint64_t local_window_overruns_{0};
+  uint64_t local_window_late_ticks_{0};
+  uint64_t local_max_tick_us_{0};
+  uint64_t local_max_interval_us_{0};
+  uint64_t local_period_us_{0};
+  std::array<uint64_t, kPhaseCount> local_worst_phase_ns_{};
   void WritePhases(uint64_t now_us, bool force);
 
   // Latency: per figure, counts per kLatencyBucketUs bucket and one
@@ -307,6 +356,8 @@ class RioLog {
     LatencyHistogram refused;
     LatencyHistogram driver_station;
   };
+  void EmitPhasesAndLatency(const PhaseWindow& window,
+                            const LatencyWindow& latency);
   struct PendingAge {
     bool present{false};
     bool accepted{false};
@@ -337,6 +388,9 @@ class RioLog {
   uint64_t reported_dropped_{0};
   uint64_t reported_overruns_{0};
   uint64_t reported_late_ticks_{0};
+  uint64_t timing_current_epoch_{1};
+  uint64_t prev_reported_overruns_{0};
+  uint64_t prev_reported_late_ticks_{0};
   uint64_t next_summary_us_{0};
 
   std::atomic<bool> stop_{false};

@@ -144,9 +144,13 @@ export function useAlertLatch(): AlertLatch|null {
 export function useManifest(): {manifest: SessionManifest|null; error: string} {
   const studio = useStudio();
   const manifest = useSyncExternalStore(
-      studio.subscribe, () => studio.manifest, () => studio.manifest);
+      studio.subscribe,
+      () => studio.recorded ? studio.recorded.manifest : studio.manifest,
+      () => studio.recorded ? studio.recorded.manifest : studio.manifest);
   const error = useSyncExternalStore(
-      studio.subscribe, () => studio.manifestError, () => studio.manifestError);
+      studio.subscribe,
+      () => studio.recorded ? studio.recorded.manifestError : studio.manifestError,
+      () => studio.recorded ? studio.recorded.manifestError : studio.manifestError);
   return useMemo(() => ({manifest, error}), [manifest, error]);
 }
 

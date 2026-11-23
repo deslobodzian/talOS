@@ -4,6 +4,11 @@ import %workspace%/talos.bazelrc
 
 # What follows is this checkout's own.
 
+# Share compiled artifacts across worktrees, tools/prepush.sh, and tools/tidy.sh.
+# Explicit --disk_cache flags (e.g. prepush.sh) and user ~/.bazelrc take precedence.
+build --disk_cache=~/.cache/talos-bazel-disk
+build --experimental_disk_cache_gc_max_size=40G
+
 # --config=release records this checkout's revision (talos.bazelrc).
 build:release --workspace_status_command=tools/workspace_status.sh
 

@@ -41,13 +41,18 @@ import glob
 import json
 import os
 import plistlib
+import re
+import select
 import shlex
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+import urllib.request
 
 from python.runfiles import runfiles
 
@@ -63,7 +68,7 @@ BUNDLES = (
 # that must load from the installed files: each package, and the extension
 # module that links the libraries the wheel bundles (gtsam.libs/) or its
 # robotpy-native wheel holds (native/wpimath/, native/wpiutil/). On Linux
-# each module's first name must also name a mapped file.
+# and macOS each module's first name must also name a mapped file.
 NATIVE_IMPORTS = {
     "native_wheel": ("numpy", "numpy._core._multiarray_umath",
                      "gtsam", "gtsam.gtsam",
@@ -80,23 +85,37 @@ CLEAN_ENV = {k: v for k, v in os.environ.items()
 
 # Run by a node's venv interpreter: adds the site-packages directory it is
 # given, imports each module named after it and prints, as JSON, the real
-# path of each module's file and (where /proc exists) of every mapped file
-# whose path names one of their packages.
+# path of each module's file and (on Linux from /proc/self/maps, on macOS
+# from _dyld_get_image_name) of every mapped file whose path names one of
+# their packages.
 IMPORT_PROBE = """
-import importlib, json, os, site, sys
+import ctypes, importlib, json, os, site, sys
 site.addsitedir(sys.argv[1])
 modules = sys.argv[2:]
 files = [os.path.realpath(importlib.import_module(m).__file__)
          for m in modules]
+roots = {m.split(".")[0] for m in modules}
 mapped = set()
 if os.path.exists("/proc/self/maps"):
-    roots = {m.split(".")[0] for m in modules}
     with open("/proc/self/maps") as maps:
         for line in maps:
             fields = line.split(maxsplit=5)
             path = fields[5].strip() if len(fields) == 6 else ""
             if path.startswith("/") and any(r in path for r in roots):
                 mapped.add(os.path.realpath(path))
+elif sys.platform == "darwin":
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    lib._dyld_image_count.argtypes = []
+    lib._dyld_image_count.restype = ctypes.c_uint32
+    lib._dyld_get_image_name.argtypes = [ctypes.c_uint32]
+    lib._dyld_get_image_name.restype = ctypes.c_char_p
+    for i in range(lib._dyld_image_count()):
+        raw = lib._dyld_get_image_name(i)
+        if not raw:
+            continue
+        path = os.fsdecode(raw)
+        if path.startswith("/") and any(r in path for r in roots):
+            mapped.add(os.path.realpath(path))
 print(json.dumps({"files": files, "mapped": sorted(mapped)}))
 """
 
@@ -267,6 +286,8 @@ class BundleTest(unittest.TestCase):
                                   out)
                     self.assertTrue(os.path.isfile(os.path.join(
                         where, studio["webroot"], "index.html")), studio)
+                    self.assertTrue(os.path.isfile(os.path.join(
+                        where, studio["webroot"], "drive.html")), studio)
                 for node in graph["nodes"]:
                     self.assertTrue(node.get("described"),
                                     f"{node.get('name')}: {node.get('describe_error')}\n{out}")
@@ -274,11 +295,21 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue(manifest["config_sha256"])
                 self.assertEqual(graph["config_sha256"],
                                  manifest["config_sha256"])
-                # REQ-OPS-48
-                self.assert_native_wheels_load_from(
-                    os.path.realpath(where), manifest)
+                # REQ-OPS-48: an installed bundle holds zero symlinks anywhere
+                # (deploy.sh preserves any in-bundle symlink, so an internal
+                # link left by bundle_builder would survive here).
+                installed_root = os.path.realpath(where)
+                installed_links = [
+                    os.path.relpath(os.path.join(parent, entry), installed_root)
+                    for parent, dirs, files in os.walk(installed_root)
+                    for entry in dirs + files
+                    if os.path.islink(os.path.join(parent, entry))
+                ]
+                self.assertEqual(installed_links, [],
+                                 (name, installed_links[:10]))
+                self.assert_native_wheels_load_from(installed_root, manifest)
                 self.assert_linked_libraries_load_from(
-                    os.path.realpath(where), manifest, tmp)
+                    installed_root, manifest, tmp)
 
     def assert_linked_libraries_load_from(self, installed, manifest, tmp):
         """Each LINKED_LIBRARIES node, started from `installed` with the
@@ -325,7 +356,7 @@ class BundleTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0,
                              f"{node['name']}: {proc.stderr}")
             loaded = json.loads(proc.stdout)
-            if sys.platform == "linux":
+            if sys.platform in ("linux", "darwin"):
                 for root in {module.split(".")[0] for module in modules}:
                     self.assertTrue(
                         [path for path in loaded["mapped"] if root in path],
@@ -356,14 +387,19 @@ class BundleTest(unittest.TestCase):
                     venvs = python_venvs(src, node)
                     self.assertTrue(venvs, node["name"])
                     for venv in venvs:
-                        proc = subprocess.run(
+                        proc = subprocess.Popen(
                             [venv, "-I", "-S", "-c",
                              "import os, sys; "
-                             "print(os.path.normpath(sys.executable))"],
-                            capture_output=True, text=True, env=env,
-                            timeout=60)
-                        self.assertEqual(proc.returncode, 0, proc.stderr)
-                        ran.add(proc.stdout.strip())
+                             "print(os.getpid(), os.path.normpath(sys.executable))"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env)
+                        out, err = proc.communicate(timeout=60)
+                        self.assertEqual(proc.returncode, 0, err)
+                        pid_str, executable = out.strip().split(" ", 1)
+                        # The venv wrapper execs the interpreter in place.
+                        self.assertEqual(int(pid_str), proc.pid,
+                                         f"{venv} did not exec its interpreter")
+                        ran.add(executable)
                 # Each runtime repository the nodes run is held once, under
                 # python/<repo>/, and all its nodes run that one file.
                 by_repo = {}
@@ -383,6 +419,150 @@ class BundleTest(unittest.TestCase):
                         if os.path.getsize(path) == size
                         and filecmp.cmp(path, interpreter, shallow=False)]
                     self.assertEqual(len(copies), 1, (repo, copies))
+                    # On Linux, rules_python's python3 statically links
+                    # libpython; unused libpython3*.so* (~51 MB) must be
+                    # omitted from the bundled runtime's lib/.
+                    if sys.platform.startswith("linux"):
+                        rt_lib = os.path.join(src, "python", repo, "lib")
+                        if os.path.isdir(rt_lib):
+                            leftovers = [
+                                f for f in os.listdir(rt_lib)
+                                if f.startswith("libpython3") and ".so" in f]
+                            self.assertEqual(leftovers, [], (name, repo))
+
+    # REQ-OPS-48: every real talos_bundle tree artifact holds zero symlinks.
+    # Bazel's sandbox mounts each file of a tree artifact as an individual
+    # symlink into bazel-out; resolving one known file locates the real tree
+    # artifact directory (or, when run unsandboxed, `src` itself) so we walk
+    # the actual bundle bytes produced by bundle_builder.py.
+    def test_bundles_hold_no_symlinks(self):
+        r = runfiles.Create()
+        for name in BUNDLES:
+            with self.subTest(name):
+                src = r.Rlocation(f"_main/{name}")
+                self.assertTrue(src and os.path.isdir(src), src)
+                manifest = os.path.join(src, "bundle_manifest.toml")
+                root = (os.path.dirname(os.path.realpath(manifest))
+                        if os.path.islink(manifest) else src)
+                self.assertTrue(os.path.isdir(root), root)
+                links = [
+                    os.path.relpath(os.path.join(parent, entry), root)
+                    for parent, dirs, files in os.walk(root)
+                    for entry in dirs + files
+                    if os.path.islink(os.path.join(parent, entry))
+                ]
+                self.assertEqual(links, [], (name, links[:10]))
+
+    # REQ-OPS-34: an installed Studio bundle started via run.sh serves `/`
+    # and `/drive` (200, no-cache, bundled HTML bodies) and content-hashed
+    # `/assets/*` (200, public, max-age=31536000, immutable) on the config's
+    # non-default `[studio] http_port`.
+    def test_installed_studio_bundle_serves_studio_and_drive_over_http(self):
+        def free_port(kind, avoid=()):
+            while True:
+                with socket.socket(socket.AF_INET, kind) as s:
+                    s.bind(("127.0.0.1", 0))
+                    port = s.getsockname()[1]
+                if port not in avoid:
+                    return port
+
+        src = runfiles.Create().Rlocation(
+            "_main/bench/main_processor/bench_bundle")
+        self.assertTrue(src and os.path.isdir(src), src)
+        with tempfile.TemporaryDirectory(
+                dir=os.environ["TEST_TMPDIR"],
+                ignore_cleanup_errors=True) as tmp:
+            copy = os.path.join(tmp, "bundle")
+            shutil.copytree(src, copy)
+            with open(os.path.join(copy, "bundle_manifest.toml"), "rb") as f:
+                manifest = tomllib.load(f)
+            http_port = free_port(socket.SOCK_STREAM, avoid=(5800,))
+            remote_port = free_port(socket.SOCK_DGRAM)
+            local_port = free_port(socket.SOCK_DGRAM, avoid=(remote_port,))
+            cfg_path = os.path.join(copy, manifest["config_path"])
+            os.chmod(cfg_path, 0o644)
+            with open(cfg_path, "a", encoding="utf-8") as f:
+                f.write(f"\n[studio]\nhttp_port = {http_port}\n")
+
+            prefix = os.path.join(tmp, "prefix")
+            subprocess.run(
+                ["bash", deploy_script(), "install", copy, "--prefix", prefix,
+                 "--no-warm-up"],
+                check=True, capture_output=True, text=True, timeout=120)
+            installed = os.path.realpath(os.path.join(prefix, "current"))
+            webroot = os.path.join(installed, manifest["studio"]["webroot"])
+            with open(os.path.join(webroot, "index.html"), "rb") as f:
+                index_body = f.read()
+            with open(os.path.join(webroot, "drive.html"), "rb") as f:
+                drive_body = f.read()
+            hashed_re = re.compile(r"^.+-([A-Za-z0-9_-]{8})\.[^.]+$")
+            assets_dir = os.path.join(webroot, "assets")
+            hashed_assets = sorted(
+                name for name in os.listdir(assets_dir)
+                if hashed_re.match(name)
+                and os.path.isfile(os.path.join(assets_dir, name)))
+            self.assertTrue(hashed_assets, os.listdir(assets_dir))
+            asset_name = hashed_assets[0]
+            with open(os.path.join(assets_dir, asset_name), "rb") as f:
+                asset_body = f.read()
+
+            log_dir = os.path.join(prefix, "logs")
+            env = dict(
+                os.environ,
+                TALOS_LOG_DIR=log_dir,
+                TALOS_SHM_NAMESPACE=f"bundle_studio_{os.getpid()}",
+            )
+            proc = subprocess.Popen(
+                [os.path.join(installed, "run.sh"), "--sim",
+                 "--remote", "127.0.0.1",
+                 "--remote-port", str(remote_port),
+                 "--local-port", str(local_port)],
+                cwd=installed, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            output_chunks = []
+            try:
+                marker = f"on http://localhost:{http_port}\n".encode()
+                buf = b""
+                fd = proc.stdout.fileno()
+                while marker not in buf:
+                    ready, _, _ = select.select([fd], [], [], 30)
+                    if not ready:
+                        break
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    output_chunks.append(chunk)
+                    buf += chunk
+                self.assertIn(
+                    marker, buf,
+                    f"studio_bridge did not announce http://localhost:{http_port}:\n"
+                    f"{buf.decode(errors='replace')}")
+
+                for path, expected_cc, expected_body in (
+                        ("/", "no-cache", index_body),
+                        ("/drive", "no-cache", drive_body),
+                        (f"/assets/{asset_name}",
+                         "public, max-age=31536000, immutable",
+                         asset_body)):
+                    with self.subTest(path=path):
+                        with urllib.request.urlopen(
+                                f"http://127.0.0.1:{http_port}{path}",
+                                timeout=5) as resp:
+                            self.assertEqual(resp.status, 200)
+                            self.assertEqual(
+                                resp.headers.get("Cache-Control"), expected_cc)
+                            self.assertEqual(resp.read(), expected_body)
+            finally:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGINT)
+                try:
+                    rest, _ = proc.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    rest, _ = proc.communicate()
+                output_chunks.append(rest or b"")
+            full_output = b"".join(output_chunks).decode(errors="replace")
+            self.assertEqual(proc.returncode, 0, full_output)
 
 
 def launcher_stop_timeout_s():
@@ -415,6 +595,17 @@ class BootServiceTest(unittest.TestCase):
         self.assertRegex(stop_s, r"^\d+s?$", service)
         self.assertGreater(int(stop_s.rstrip("s")), launcher_stop_timeout_s(),
                            service)
+
+    # REQ-OPS-06
+    def test_launchd_sets_exit_timeout_past_launcher_stop_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = enable_boot(os.path.join(tmp, "prefix"), "Darwin")
+        plist = plistlib.loads(
+            out[out.index("<?xml"):out.index("</plist>") + 8].encode())
+        self.assertIn("ExitTimeOut", plist, plist)
+        self.assertIsInstance(plist["ExitTimeOut"], int, plist)
+        self.assertGreater(plist["ExitTimeOut"], launcher_stop_timeout_s(),
+                           plist)
 
 
 if __name__ == "__main__":

@@ -435,7 +435,7 @@ you add a mechanism.
 | `subsystems/*.toml` | one file per subsystem: its node, period, devices and parameters |
 | `robot_manifest.bzl` | generated from `robot.toml` (`bazel run @talos//tools:sync_manifest -- robot.toml`); Bazel reads it because it cannot read TOML |
 | `BUILD.bazel` | `manifest_sync_test`, `graph_test`, `robot_bundle`, `bundle_install_test` (the bundle installed with talOS's `deploy.sh` and run from there), `//:sim` (the robot against the simulator), `sim_smoke_test`, `studio_test`, `talos_pin_test`, `trace_test` (every test tag names a requirement of talOS's catalogue, or of this repository's own `docs/REQUIREMENTS.md` once it has one, whose rows then need tagged tests) |
-| `robot_sim.toml` | the simulation-only config (it includes `robot.toml`, which never reads it): `new_subsystem` writes it with the first mechanism, with its `robot_sim_manifest.bzl` and their `sim_manifest_sync_test` and `sim_graph_test` in `BUILD.bazel` |
+| `robot_sim.toml` | the simulation-only config (it includes `robot.toml`, which never reads it): `new_subsystem` writes it with the first mechanism, with its `robot_sim_manifest.bzl` and their `sim_manifest_sync_test` and `sim_graph_test` in `BUILD.bazel`, and points `//:sim` at it |
 | `MODULE.bazel` | talOS as `@talos`, and where Studio's pages are |
 | `.bazelrc` | imports talOS's build flags (`talos.bazelrc`) from the same checkout; add this repository's own flags below the import |
 | `.bazelversion` | the Bazel version, talOS's (`talos_pin_test` checks it, the import and the default Python) |
@@ -461,6 +461,22 @@ carries no Studio, so a deployed robot has no driver dashboard until its
 `studio_webroot = ":studio_webroot"`, after Studio's pages are built (the
 bundle refuses a webroot without them; talOS's
 `examples/robot_repo/README.md`, "Studio").
+
+In CI (and before building a Studio-bearing `robot_bundle`), build Studio's
+pages in the talOS checkout first and require them in tests:
+
+```sh
+(cd @TALOS@ && bazel build //studio:web_dist)
+bazel test --test_env=TALOS_REQUIRE_STUDIO_PAGES=1 //...
+```
+
+`//studio:web_dist` writes `STUDIO_STAMP.txt` with a hash of Studio's web
+inputs (`studio/src/**` and `talOS/telemetry/telemetry.fbs`). If the `@talos`
+pin moves without rebuilding `//studio:web_dist`, building `//:studio_webroot`,
+`//:sim`, or a Studio-bearing `talos_bundle` fails closed naming the expected
+and actual stamps and the rebuild command above. On a fresh clone before the
+pages are built, `bazel test //...` (without `TALOS_REQUIRE_STUDIO_PAGES=1`)
+still passes while `studio_test` checks the 503 response.
 
 ## Where talOS comes from
 

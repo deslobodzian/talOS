@@ -34,6 +34,12 @@ class Scanner {
             fields.config_path.reset();
             Skip(1);
           }
+        } else if (key == kSimulation) {
+          fields.simulation = OptionalBool();
+        } else if (key == kStartWallNs) {
+          fields.start_wall_ns = Unsigned();
+        } else if (key == kEndWallNs) {
+          fields.end_wall_ns = Unsigned();
         } else if (key == kNodes) {
           fields.nodes = Nodes();
         } else {
@@ -187,6 +193,20 @@ class Scanner {
     return value;
   }
 
+  // A JSON boolean, or nullopt for any other value (skipped).
+  std::optional<bool> OptionalBool() {
+    if (Peek() == 't') {
+      Literal("true");
+      return true;
+    }
+    if (Peek() == 'f') {
+      Literal("false");
+      return false;
+    }
+    Skip(1);
+    return std::nullopt;
+  }
+
   bool Bool(std::string_view key) {
     if (Peek() == 't') {
       Literal("true");
@@ -312,7 +332,11 @@ class Scanner {
         } else if (key == kRecorderFailed) {
           member.recorder_failed = Bool(key);
         } else if (key == kLogPaths) {
-          member.log_paths = LogPaths();
+          member.log_paths = StringArray();
+        } else if (key == kGapLogs) {
+          member.gap_logs = StringArray();
+        } else if (key == kRecorderFailedLogs) {
+          member.recorder_failed_logs = StringArray();
         } else {
           Skip(3);
         }
@@ -323,7 +347,7 @@ class Scanner {
   }
 
   // An array of strings, or nullopt for any other value (skipped).
-  std::optional<std::vector<std::string>> LogPaths() {
+  std::optional<std::vector<std::string>> StringArray() {
     if (Peek() != '[') {
       Skip(3);
       return std::nullopt;

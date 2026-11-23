@@ -244,7 +244,7 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
       return false;
     }
     if (!lock && removal.category() == std::generic_category() &&
-        FlockUnsupported(removal.value())) {
+        (removal.value() == ENOLCK || FlockUnsupported(removal.value()))) {
       say("WARNING: retention passes over " + dir.string() +
           ": cannot lock its " + std::string{kSessionDirectoryLockFile} + " (" +
           removal.message() +
@@ -267,7 +267,7 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
       report("cannot remove", dir, removal);
       return false;
     }
-    fs::remove_all(removing, removal);
+    options_.remove_all(removing, removal);
     // Once its session.lock is gone, another launch's sweep of leftovers
     // (below) may be removing the same tree: what vanished under it is gone.
     if (removal == std::errc::no_such_file_or_directory) removal.clear();
@@ -291,8 +291,18 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
       fs::file_type::not_found)
     return session_budget;
   error.clear();
-  no_locks = LogRootTakesNoLocks(current.parent_path(),
-                                 options_.lock_session_directory);
+  const LogRootLocks root_locks =
+      ProbeLogRootLocks(current.parent_path(), options_.lock_session_directory);
+  if (root_locks == LogRootLocks::kUnavailable) {
+    say("WARNING: retention removes nothing under " +
+        current.parent_path().string() + ": probing " +
+        std::string{kLockProbeFile} + " failed with ENOLCK (" +
+        std::strerror(ENOLCK) +
+        "); refusing to delete any session while advisory locking is "
+        "unavailable");
+    return session_budget;
+  }
+  no_locks = root_locks == LogRootLocks::kUnsupported;
   for (fs::directory_iterator entry{current.parent_path(), error};
        !error && entry != fs::directory_iterator{}; entry.increment(error)) {
     if (entry->path() == current) continue;  // Counted below.
@@ -352,7 +362,7 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
                                    options_.lock_session_directory))
       continue;
     std::error_code removal;
-    fs::remove_all(leftover, removal);
+    options_.remove_all(leftover, removal);
     if (removal && removal != std::errc::no_such_file_or_directory)
       report("cannot remove", leftover, removal);
   }
@@ -482,12 +492,16 @@ bool Launcher::CreateSessionDirectory(const config::RobotConfig& config,
     return false;
   }
   if (!session_directory_->held()) {
+    const bool unavailable =
+        error.category() == std::generic_category() && error.value() == ENOLCK;
     ConsoleLine(std::cerr)
         << "[launcher] WARNING: cannot lock " << current.string() << "/"
-        << kSessionDirectoryLockFile << " (" << error.message()
-        << "; its filesystem takes no advisory locks): retention in "
-           "another shared-memory namespace may remove this session "
-           "while it runs\n";
+        << kSessionDirectoryLockFile << " (" << error.message() << "; "
+        << (unavailable ? "advisory locking is unavailable (ENOLCK)"
+                        : "its filesystem takes no advisory locks")
+        << "): retention in another shared-memory namespace may remove this "
+           "session while it runs"
+        << (unavailable ? " once locking recovers" : "") << "\n";
   }
   if (record.empty()) return true;
   const std::string path =

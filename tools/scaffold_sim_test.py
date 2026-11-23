@@ -14,24 +14,18 @@ A robot scaffolded with --no-mechanism runs the same way: every member
 exits 0, and the bridge's last /hw/status is configured with no alert,
 reject or fault.
 
-The test times the match itself (sim_gateway's --schedule-start-file)
-rather than with the `--duration-s` the printed command passes, which
-counts from the launcher's first spawn while the schedules count from the
-gateway's start, spawned last. That duration is the schedules' length
-(new_subsystem.SIM_SCHEDULE_S) plus the launcher's startup grace, the
-longest the gateway's start can lag without the launcher killing it; but a
-node that comes up after the gateway (a sanitizer build, a loaded host)
-would still miss part of its button's window (TODO.md TOOLS-18), so the
-test starts the schedules itself, for the same length, from a time zero
-after the whole stack is up. Once every member's loop has started and the
-bridge has accepted a State (talOS/build/sim_check.py wait_ready), it
-writes the schedules' time zero for sim_gateway's --schedule-start-file,
-and stops the session with SIGINT, as Ctrl-C does, the schedule's length
-after it."""
+The default cases time the match explicitly via sim_gateway's
+--schedule-start-file (verifying that a caller-supplied schedule start file
+overrides launcher coordination) and stop the session with SIGINT once the
+schedule has run. The late-member case runs `Next:`'s printed command itself
+(--duration-s 13, no --schedule-start-file) while delaying teleop's startup
+past the 3 s button-press edge, proving that the launcher holds sim_gateway's
+schedule start until every non-observer member's loop has started so each
+mechanism still receives its full button window."""
 
 import json
 import os
-import socket
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -88,15 +82,6 @@ def unlink_registry(namespace):
         shm_unlink(shm_name(REGISTRY, namespace))
     except FileNotFoundError:
         pass
-
-
-def udp_ports():
-    """Two distinct free loopback UDP ports (TESTING.md §6: bound at 0)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as gateway, \
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge:
-        gateway.bind(("127.0.0.1", 0))
-        bridge.bind(("127.0.0.1", 0))
-        return gateway.getsockname()[1], bridge.getsockname()[1]
 
 
 def scaffold(work):
@@ -180,6 +165,37 @@ def start_schedule(path):
     os.rename(pending, path)
 
 
+def delay_teleop_startup(work, delay_s):
+    """Wraps bazel-bin/talOS/teleop/node in `work` so runtime startup sleeps
+    `delay_s` before execing the real binary, while --describe passes straight
+    through."""
+    talos_dir = os.path.join(work, "bazel-bin", "talOS")
+    real_talos = os.path.realpath(talos_dir)
+    os.unlink(talos_dir)
+    os.makedirs(talos_dir)
+    for entry in os.listdir(real_talos):
+        if entry == "teleop":
+            continue
+        os.symlink(os.path.join(real_talos, entry),
+                   os.path.join(talos_dir, entry))
+    teleop_dir = os.path.join(talos_dir, "teleop")
+    os.makedirs(teleop_dir)
+    real_teleop = os.path.join(real_talos, "teleop", "node")
+    wrapper = os.path.join(teleop_dir, "node")
+    with open(wrapper, "w", encoding="utf-8") as f:
+        f.write(
+            "#!/bin/sh\n"
+            'for arg in "$@"; do\n'
+            '  if [ "$arg" = "--describe" ]; then\n'
+            f'    exec {shlex.quote(real_teleop)} "$@"\n'
+            "  fi\n"
+            "done\n"
+            f"sleep {delay_s}\n"
+            f'exec {shlex.quote(real_teleop)} "$@"\n'
+        )
+    os.chmod(wrapper, 0o755)
+
+
 class ScaffoldSimTest(unittest.TestCase):
     def launch(self, tmp, work, launcher, env, config, gateway_extra,
                duration_s):
@@ -188,7 +204,7 @@ class ScaffoldSimTest(unittest.TestCase):
         time zero is when the session is up; stops it `duration_s` after
         that (module docstring). Asserts the launcher stops in order and
         exits 0; returns (session directory, launcher output)."""
-        gateway_port, bridge_port = udp_ports()
+        gateway_port, bridge_port = sim_check.udp_ports()
         # Bazel's TEST_TMPDIR is the shared-memory namespace
         # (ARCHITECTURE.md "Topics and messages") and holds the lock files,
         # which Bazel removes with it; only the registry segment, which a
@@ -278,6 +294,62 @@ class ScaffoldSimTest(unittest.TestCase):
                         "gateway_device_reset_count"):
                     self.assertEqual(value, "0", f"{field}: {last}")
 
+    def assert_mechanisms_drove(self, log_dump, session, subsystems,
+                                diagnostics):
+        reached = []  # when position_cpp first reached its goal
+        for mechanism, kind in MECHANISMS:
+            with self.subTest(mechanism=mechanism):
+                (binding,) = subsystems[mechanism]["teleop"]["bindings"]
+                rows = states(log_dump, session, mechanism)
+                driven = [fields for _, fields in rows
+                          if fields["enabled"] == "true"]
+                self.assertTrue(driven, f"{mechanism} never drove: "
+                                f"{diagnostics}")
+                if kind == "position":
+                    goal = binding["while_held"]["position_rot"]
+                    tolerance = subsystems[mechanism][mechanism][
+                        "tolerance_rot"]
+                    positions = [float(f["position_rot"]) for f in driven]
+                    at_goal = [f for f in driven if f["at_goal"] == "true"]
+                    self.assertTrue(
+                        at_goal,
+                        f"{mechanism} never reached {goal} rot within "
+                        f"{tolerance}: positions "
+                        f"{min(positions)}..{max(positions)}, homing "
+                        f"{sorted({f['homing'] for f in driven})}")
+                    reached.append(next(
+                        ms for ms, f in rows if f["enabled"] == "true"
+                        and f["at_goal"] == "true"))
+                    self.assertLessEqual(
+                        abs(float(at_goal[0]["position_rot"]) - goal),
+                        tolerance)
+                    # It homed by driving to the simulated switch, not
+                    # by zeroing where it started on a switch that
+                    # reads closed everywhere.
+                    (switch,) = subsystems[mechanism][
+                        "digital_inputs"].values()
+                    homing = [float(f["position_rot"]) for f in driven
+                              if f["homing"] == "HOMING"]
+                    self.assertTrue(homing, f"{mechanism} never homed")
+                    self.assertLessEqual(min(homing),
+                                         switch["sim_closed_at_rot"])
+                else:
+                    goal = binding["while_held"]["velocity_rps"]
+                    fastest = max(float(f["velocity_rps"]) for f in driven)
+                    # The velocity loop holds its demand: within 1%.
+                    self.assertGreaterEqual(
+                        fastest, 0.99 * goal,
+                        f"{mechanism} reached {fastest} of {goal} rps")
+                    # It stood still until position_cpp, under
+                    # its own button alone, reached its goal.
+                    (moved,) = reached
+                    before = [abs(float(f["velocity_rps"]))
+                              for ms, f in rows if ms <= moved]
+                    self.assertLess(
+                        max(before), 0.1 * goal,
+                        f"{mechanism} moved at {max(before)} rps while "
+                        f"only position_cpp's button was held")
+
     # REQ-DEV-01, REQ-DEV-23
     def test_next_steps_move_each_mechanism_to_its_goal(self):
         r = runfiles.Create()
@@ -294,63 +366,66 @@ class ScaffoldSimTest(unittest.TestCase):
                 tmp, work, launcher, env, config,
                 ["--joystick-schedule", joystick_schedule(buttons)],
                 new_subsystem.SIM_SCHEDULE_S)
+            self.assert_mechanisms_drove(log_dump, session, subsystems,
+                                         diagnostics)
 
-            reached = []  # when position_cpp first reached its goal
-            for mechanism, kind in MECHANISMS:
-                with self.subTest(mechanism=mechanism):
-                    (binding,) = subsystems[mechanism]["teleop"]["bindings"]
-                    rows = states(log_dump, session, mechanism)
-                    driven = [fields for _, fields in rows
-                              if fields["enabled"] == "true"]
-                    self.assertTrue(driven, f"{mechanism} never drove: "
-                                    f"{diagnostics}")
-                    if kind == "position":
-                        goal = binding["while_held"]["position_rot"]
-                        tolerance = subsystems[mechanism][mechanism][
-                            "tolerance_rot"]
-                        positions = [float(f["position_rot"])
-                                     for f in driven]
-                        at_goal = [f for f in driven
-                                   if f["at_goal"] == "true"]
-                        self.assertTrue(
-                            at_goal,
-                            f"{mechanism} never reached {goal} rot within "
-                            f"{tolerance}: positions "
-                            f"{min(positions)}..{max(positions)}, homing "
-                            f"{sorted({f['homing'] for f in driven})}")
-                        reached.append(next(
-                            ms for ms, f in rows if f["enabled"] == "true"
-                            and f["at_goal"] == "true"))
-                        self.assertLessEqual(
-                            abs(float(at_goal[0]["position_rot"]) - goal),
-                            tolerance)
-                        # It homed by driving to the simulated switch, not
-                        # by zeroing where it started on a switch that
-                        # reads closed everywhere.
-                        (switch,) = subsystems[mechanism][
-                            "digital_inputs"].values()
-                        homing = [float(f["position_rot"]) for f in driven
-                                  if f["homing"] == "HOMING"]
-                        self.assertTrue(homing, f"{mechanism} never homed")
-                        self.assertLessEqual(min(homing),
-                                             switch["sim_closed_at_rot"])
-                    else:
-                        goal = binding["while_held"]["velocity_rps"]
-                        fastest = max(float(f["velocity_rps"])
-                                      for f in driven)
-                        # The velocity loop holds its demand: within 1%.
-                        self.assertGreaterEqual(
-                            fastest, 0.99 * goal,
-                            f"{mechanism} reached {fastest} of {goal} rps")
-                        # It stood still until position_cpp, under
-                        # its own button alone, reached its goal.
-                        (moved,) = reached
-                        before = [abs(float(f["velocity_rps"]))
-                                  for ms, f in rows if ms <= moved]
-                        self.assertLess(
-                            max(before), 0.1 * goal,
-                            f"{mechanism} moved at {max(before)} rps while "
-                            f"only position_cpp's button was held")
+    # REQ-DEV-05, REQ-DEV-10
+    def test_printed_command_drives_each_mechanism_when_a_member_starts_late(
+            self):
+        # Runs `Next:`'s printed launcher command (--duration-s 13, mode and
+        # joystick schedules, no --schedule-start-file) while delaying teleop's
+        # startup past the schedule's 3 s button-press edge (3.5 s, inside the
+        # 5 s startup grace). Without launcher-coordinated schedule start,
+        # teleop misses the opening neutral window, OperatorArming refuses to
+        # arm on the held button, and neither mechanism drives. With it, the
+        # launcher waits until every non-observer member's loop has started
+        # before writing sim_schedule_start, so both mechanisms receive their
+        # full windows and reach their goals before --duration-s 13 stops the
+        # session.
+        r = runfiles.Create()
+        log_dump = r.Rlocation("_main/talOS/launcher/log_dump")
+        with tempfile.TemporaryDirectory() as tmp:
+            work, launcher, env = harness.workspace(tmp)
+            buttons = scaffold(work)
+            config = follow_next(work, buttons)
+            subsystems, _ = sync_manifest.effective(work, config)
+            delay_teleop_startup(work, 3.5)
+
+            gateway_port, bridge_port = sim_check.udp_ports()
+            namespace = os.environ.get("TEST_TMPDIR") or tmp
+            env.pop("TALOS_SHM_NAMESPACE", None)
+            env["TEST_TMPDIR"] = namespace
+            self.addCleanup(unlink_registry, namespace)
+            output = os.path.join(tmp, "sessions")
+            os.makedirs(output)
+            args = [
+                launcher, "--config", config, "--sim",
+                "--duration-s", str(new_subsystem.SIM_DURATION_S),
+                "--start-sim-gateway",
+                "--sim-gateway-arg", "--physics",
+                "--sim-gateway-arg", "--mode-schedule",
+                "--sim-gateway-arg", new_subsystem.MODE_SCHEDULE,
+                "--sim-gateway-arg", "--joystick-schedule",
+                "--sim-gateway-arg", joystick_schedule(buttons),
+                "--remote", "127.0.0.1",
+                "--remote-port", str(gateway_port),
+                "--local-port", str(bridge_port),
+                "--output-dir", output,
+            ]
+            run = subprocess.run(
+                args, cwd=work, env=env, capture_output=True, text=True,
+                timeout=new_subsystem.SIM_DURATION_S + 20)
+            diagnostics = run.stdout + run.stderr
+            self.assertEqual(run.returncode, 0, diagnostics)
+            sessions = [d for d in os.listdir(output)
+                        if os.path.isdir(os.path.join(output, d))]
+            self.assertEqual(len(sessions), 1, os.listdir(output))
+            session = os.path.join(output, sessions[0])
+            self.assert_mechanisms_drove(log_dump, session, subsystems,
+                                         diagnostics)
+            self.assertTrue(
+                os.path.isfile(os.path.join(session, "sim_schedule_start")),
+                diagnostics)
 
 
 if __name__ == "__main__":

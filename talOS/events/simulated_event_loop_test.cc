@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -64,6 +65,7 @@ TEST(SimulatedEventLoop, StepsAllowTimerChangesBetweenRuns) {
 
 // A timer change from another thread has no reproducible position in the log
 // and races the scheduler, so it is refused rather than silently accepted.
+// REQ-RT-04
 TEST(SimulatedEventLoop, TimerChangeFromAHandlerlessThreadDuringRunIsRejected) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};
@@ -219,6 +221,7 @@ TEST(SimulatedEventLoop, OverflowMatchesRtmsRetainedWindowAndDropCounts) {
   EXPECT_THROW(channel.publish_time(100), std::out_of_range);
 }
 
+// REQ-RT-03
 TEST(SimulatedEventLoop, PausedClockCoalescesMissedTimersOnOriginalPhase) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};
@@ -233,10 +236,13 @@ TEST(SimulatedEventLoop, PausedClockCoalescesMissedTimersOnOriginalPhase) {
   EXPECT_EQ(ticks.back().now, MonotonicTime{} + 28ms);
   EXPECT_EQ(ticks.back().event_time, MonotonicTime{} + 10ms);
   EXPECT_EQ(ticks.back().sequence, 4u);
+  EXPECT_EQ(loop.source_counters()[id].dropped.load(), 3u);
   loop.run_for(2ms);
   ASSERT_EQ(ticks.size(), 3u);
   EXPECT_EQ(ticks.back().now, MonotonicTime{} + 30ms);
+  EXPECT_EQ(ticks.back().event_time, MonotonicTime{} + 30ms);
   EXPECT_EQ(ticks.back().sequence, 1u);
+  EXPECT_EQ(loop.source_counters()[id].dropped.load(), 3u);
 }
 
 // Under every delivery a message injected before a timer's deadline reaches
@@ -245,6 +251,7 @@ TEST(SimulatedEventLoop, PausedClockCoalescesMissedTimersOnOriginalPhase) {
 // there; POLL also drains on every 1 ms tick. ON_PUBLISH with no prompt
 // watcher (TestRobot marks none) has nothing to wake it and drains as
 // BEFORE_TIMERS does, as the realtime loop would.
+// REQ-RT-01
 TEST(SimulatedEventLoop, EveryDeliveryDrainsRightBeforeEachTimer) {
   for (const auto delivery :
        {Delivery::BEFORE_TIMERS, Delivery::POLL, Delivery::ON_PUBLISH}) {
@@ -531,6 +538,47 @@ TEST(SimulatedEventLoop, DeliveryIsFixedOnceTheRunStarts) {
   EXPECT_THROW(loop.set_delivery(Delivery::BEFORE_TIMERS), std::logic_error);
 }
 
+// Re-entering run_until / run_for from inside a dispatch is refused rather than
+// dispatching nested callbacks or clearing the outer run's in_run_ flag.
+// REQ-RT-04
+TEST(SimulatedEventLoop, ReentrantRunUntilThrowsAndKeepsOuterRunActive) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+
+  int calls = 0;
+  bool other_thread_rejected = false;
+  std::uint16_t timer_id = 0;
+  auto handler = [&](const Context& context) {
+    ++calls;
+    if (calls != 1) return;
+    EXPECT_THROW(loop.run_for(2ms), std::logic_error);
+    EXPECT_THROW(loop.run_until(context.now + 2ms), std::logic_error);
+    EXPECT_EQ(calls, 1) << "re-entrant run dispatched a nested callback";
+    EXPECT_EQ(loop.monotonic_now(), context.now);
+
+    std::thread other{[&] {
+      try {
+        loop.arm_timer(timer_id, context.now + 1ms, 1ms);
+      } catch (const std::logic_error&) {
+        other_thread_rejected = true;
+      }
+    }};
+    other.join();
+  };
+
+  timer_id = loop.register_timer("tick", make_thunk(&handler));
+  loop.arm_timer(timer_id, MonotonicTime::from_nanos(1'000'000), 1ms);
+
+  loop.run_for(3ms);
+  EXPECT_TRUE(other_thread_rejected)
+      << "rejected re-entrant run cleared outer in_run_";
+  EXPECT_EQ(calls, 3);
+
+  // Outer RunScope cleared in_run_ on normal exit, so the next step runs.
+  loop.run_for(2ms);
+  EXPECT_EQ(calls, 5);
+}
+
 TEST(SimulatedEventLoop, ExitStopsTheLoop) {
   SimulationEnvironment environment;
   SimulatedEventLoop<> loop{environment};
@@ -549,6 +597,311 @@ TEST(SimulatedEventLoop, ExitStopsTheLoop) {
 
   loop.run_for(100ms);
   EXPECT_EQ(calls, 3);
+}
+
+// A sequence watcher (such as HardwareLink on /hw/state) with more than
+// max_messages_per_tick (64) messages queued before a timer fires must be
+// drained completely before the timer callback runs, matching
+// RealtimeEventLoop.
+// REQ-SAFE-01
+// REQ-RT-04
+TEST(SimulatedEventLoop, TimerDrainsFullSequenceBacklogBeforeDispatching) {
+  constexpr int kQueued = 80;  // over max_messages_per_tick (64), under ring
+  for (const auto delivery :
+       {Delivery::POLL, Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
+    SimulationEnvironment environment;
+    SimulatedEventLoop<> loop{environment};
+    loop.set_delivery(delivery);
+    if (delivery == Delivery::ON_PUBLISH) {
+      loop.set_prompt(WatchSensor(loop, "/wake", Thunk{}));
+    }
+
+    int received = 0;
+    std::int32_t last_value = 0;
+    auto on_message = [&](const Context&, std::span<const std::byte> bytes) {
+      ASSERT_EQ(bytes.size(), sizeof(Sensor));
+      Sensor message{};
+      std::memcpy(&message, bytes.data(), sizeof(message));
+      last_value = message.sensor_id();
+      ++received;
+    };
+    WatchSensor(loop, "/backlog", make_thunk(&on_message));
+
+    int observed_count = 0;
+    std::int32_t observed_value = 0;
+    auto on_timer = [&](const Context&) {
+      observed_count = received;
+      observed_value = last_value;
+      loop.exit();
+    };
+    const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+    loop.arm_timer(timer_id, MonotonicTime{} + 1ms, Duration::zero());
+
+    for (int i = 1; i <= kQueued; ++i) {
+      loop.inject("/backlog", Sensor{i, 0.0F, 0.0F});
+    }
+
+    loop.run_for(5ms);
+    EXPECT_EQ(observed_count, kQueued);
+    EXPECT_EQ(observed_value, kQueued);
+  }
+}
+
+// Pre-timer backlog draining stays bounded under continuous self-flooding so
+// the timer still fires after (MAX_SLOTS - 1) / max_messages_per_tick + 2
+// passes, matching RealtimeEventLoop (RULES.md 3).
+// REQ-RT-02
+// REQ-RT-04
+TEST(SimulatedEventLoop, PreTimerBacklogDrainIsBoundedUnderFlood) {
+  constexpr std::size_t kCap = 16;
+  constexpr std::size_t kMaxPasses = (MAX_SLOTS - 1) / kCap + 2;
+  constexpr std::size_t kExpectedMaxDrained = kMaxPasses * kCap;
+  constexpr std::size_t kSafetyCap = MAX_SLOTS * 4;
+
+  SimulationEnvironment environment;
+  SimulatedEventLoop<>::Options options;
+  options.max_messages_per_tick = kCap;
+  options.delivery = Delivery::BEFORE_TIMERS;
+
+  SimulatedEventLoop<> loop{environment, options};
+  const std::uint16_t sender = SendSensor(loop, "/flood");
+  std::size_t delivered = 0;
+  auto on_message = [&](const Context&, std::span<const std::byte>) {
+    ++delivered;
+    if (delivered < kSafetyCap) {
+      Send(loop, sender, static_cast<int>(delivered));
+    }
+  };
+  WatchSensor(loop, "/flood", make_thunk(&on_message));
+
+  bool timer_fired = false;
+  std::size_t delivered_before_timer = 0;
+  auto on_timer = [&](const Context&) {
+    timer_fired = true;
+    delivered_before_timer = delivered;
+    loop.exit();
+  };
+  const auto timer_id = loop.register_timer("tick", make_thunk(&on_timer));
+  loop.arm_timer(timer_id, MonotonicTime{} + 1ms, Duration::zero());
+
+  loop.inject("/flood", Sensor{0, 0.0F, 0.0F});
+  loop.run_for(5ms);
+
+  EXPECT_TRUE(timer_fired);
+  EXPECT_EQ(loop.drains(), kMaxPasses);
+  EXPECT_EQ(delivered_before_timer, kExpectedMaxDrained);
+  EXPECT_EQ(delivered, kExpectedMaxDrained);
+}
+
+// Loop-level deterministic dispatch ordering: expired timers run in
+// (deadline, id) order regardless of arming order, and each drain dispatches
+// multiple watched topics in registration order regardless of publication
+// order.
+// REQ-RT-04
+TEST(SimulatedEventLoop,
+     DispatchesTimersInDeadlineIdOrderAndWatchersInRegistrationOrder) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{environment};
+  loop.set_delivery(Delivery::BEFORE_TIMERS);
+
+  std::vector<std::string> order;
+  auto on_w0 = [&](const Context&, std::span<const std::byte>) {
+    order.emplace_back("w0");
+  };
+  auto on_w1 = [&](const Context&, std::span<const std::byte>) {
+    order.emplace_back("w1");
+  };
+  auto on_w2 = [&](const Context&, std::span<const std::byte>) {
+    order.emplace_back("w2");
+  };
+  WatchSensor(loop, "/ord_a", make_thunk(&on_w0));
+  WatchSensor(loop, "/ord_b", make_thunk(&on_w1));
+  WatchSensor(loop, "/ord_c", make_thunk(&on_w2));
+
+  const std::uint16_t send_w0 = SendSensor(loop, "/ord_a");
+  const std::uint16_t send_w1 = SendSensor(loop, "/ord_b");
+  const std::uint16_t send_w2 = SendSensor(loop, "/ord_c");
+
+  auto on_low = [&](const Context&) {
+    order.emplace_back("t_low");
+    Send(loop, send_w2, 2);
+    Send(loop, send_w1, 1);
+  };
+  auto on_high = [&](const Context&) {
+    order.emplace_back("t_high");
+    loop.exit();
+  };
+  auto on_early = [&](const Context&) {
+    order.emplace_back("t_early");
+    Send(loop, send_w2, 2);
+    Send(loop, send_w0, 0);
+  };
+
+  // Register t_low < t_high < t_early by id, then arm in reverse order.
+  const auto low_id = loop.register_timer("low", make_thunk(&on_low));
+  const auto high_id = loop.register_timer("high", make_thunk(&on_high));
+  const auto early_id = loop.register_timer("early", make_thunk(&on_early));
+  ASSERT_LT(low_id, high_id);
+  ASSERT_LT(high_id, early_id);
+
+  const MonotonicTime origin{};
+  loop.arm_timer(high_id, origin + 2ms, Duration::zero());
+  loop.arm_timer(low_id, origin + 2ms, Duration::zero());
+  loop.arm_timer(early_id, origin + 1ms, Duration::zero());
+
+  // Publish in reverse registration order before the first timer.
+  loop.inject("/ord_c", Sensor{2, 0.0F, 0.0F});
+  loop.inject("/ord_b", Sensor{1, 0.0F, 0.0F});
+  loop.inject("/ord_a", Sensor{0, 0.0F, 0.0F});
+
+  loop.run_for(5ms);
+
+  const std::vector<std::string> expected{
+      "w0", "w1", "w2", "t_early", "w0", "w2", "t_low", "w1", "w2", "t_high"};
+  EXPECT_EQ(order, expected);
+}
+
+// run_until(MonotonicTime::max()) must terminate cleanly when no events are
+// pending and after draining finite scheduled events, while still dispatching
+// genuine one-shot timers and prompt publications at MonotonicTime::max().
+// REQ-RT-01
+// REQ-OPS-14
+TEST(SimulatedEventLoop,
+     RunUntilMaxTerminatesWhenIdleAndDispatchesEventsAtMax) {
+  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
+
+    // Nothing scheduled: returns cleanly without spinning or draining.
+    {
+      SimulationEnvironment environment;
+      SimulatedEventLoop<> loop{environment};
+      loop.set_delivery(delivery);
+      if (delivery == Delivery::ON_PUBLISH) {
+        loop.set_prompt(WatchSensor(loop, "/idle_prompt", Thunk{}));
+      }
+      loop.run_until(MonotonicTime::max());
+      EXPECT_EQ(loop.monotonic_now(), MonotonicTime::max());
+      EXPECT_EQ(loop.drains(), 0u);
+      EXPECT_TRUE(loop.due_prompt_topics(MonotonicTime::max()).empty());
+      loop.run_until(MonotonicTime::max());
+      EXPECT_EQ(loop.drains(), 0u);
+    }
+
+    // Finite scheduled events drain, then run_until(max()) returns cleanly.
+    {
+      SimulationEnvironment environment;
+      SimulatedEventLoop<> loop{environment};
+      loop.set_delivery(delivery);
+      std::vector<MonotonicTime> prompt_times;
+      auto on_prompt = [&](const Context& context, std::span<const std::byte>) {
+        prompt_times.push_back(context.now);
+      };
+      if (delivery == Delivery::ON_PUBLISH) {
+        loop.set_prompt(WatchSensor(loop, "/prompt", make_thunk(&on_prompt)));
+      }
+      std::vector<MonotonicTime> timer_times;
+      auto on_timer = [&](const Context& context) {
+        timer_times.push_back(context.now);
+      };
+      const auto timer_id = loop.register_timer("once", make_thunk(&on_timer));
+      const MonotonicTime origin{};
+      loop.arm_timer(timer_id, origin + 5ms, Duration::zero());
+
+      if (delivery == Delivery::ON_PUBLISH) {
+        loop.advance_until(origin + 3ms);
+        loop.inject("/prompt", Sensor{1, 0.0F, 0.0F});
+      }
+
+      loop.run_until(MonotonicTime::max());
+      ASSERT_EQ(timer_times.size(), 1u);
+      EXPECT_EQ(timer_times[0], origin + 5ms);
+      if (delivery == Delivery::ON_PUBLISH) {
+        ASSERT_EQ(prompt_times.size(), 1u);
+        EXPECT_EQ(prompt_times[0], origin + 3ms);
+      }
+      EXPECT_EQ(loop.monotonic_now(), MonotonicTime::max());
+    }
+
+    // A one-shot timer scheduled at MonotonicTime::max() fires once and then
+    // the loop exits cleanly.
+    {
+      SimulationEnvironment environment;
+      SimulatedEventLoop<> loop{environment};
+      loop.set_delivery(delivery);
+      std::vector<Context> firings;
+      auto on_timer = [&](const Context& context) {
+        firings.push_back(context);
+      };
+      const auto timer_id =
+          loop.register_timer("at_max", make_thunk(&on_timer));
+      loop.arm_timer(timer_id, MonotonicTime::max(), Duration::zero());
+
+      loop.run_until(MonotonicTime::max());
+      ASSERT_EQ(firings.size(), 1u);
+      EXPECT_EQ(firings[0].event_time, MonotonicTime::max());
+      EXPECT_EQ(firings[0].now, MonotonicTime::max());
+      EXPECT_EQ(loop.monotonic_now(), MonotonicTime::max());
+    }
+  }
+
+  // Under ON_PUBLISH with no timers armed, a prompt publication stamped at
+  // MonotonicTime::max() is delivered (and due_prompt_topics names only it, not
+  // an idle sibling prompt watcher), then run_until(max()) returns cleanly.
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<> loop{environment};
+    loop.set_delivery(Delivery::ON_PUBLISH);
+    std::vector<Context> heard;
+    auto on_prompt = [&](const Context& context, std::span<const std::byte>) {
+      heard.push_back(context);
+    };
+    loop.set_prompt(WatchSensor(loop, "/active_max", make_thunk(&on_prompt)));
+    loop.set_prompt(WatchSensor(loop, "/quiet_max", Thunk{}));
+
+    loop.advance_until(MonotonicTime::max());
+    loop.run_until(MonotonicTime::max());
+    EXPECT_TRUE(heard.empty());
+
+    loop.inject("/active_max", Sensor{42, 0.0F, 0.0F});
+    EXPECT_EQ(loop.due_prompt_topics(MonotonicTime::max()),
+              std::vector<std::string>{"/active_max"});
+
+    loop.run_until(MonotonicTime::max());
+    ASSERT_EQ(heard.size(), 1u);
+    EXPECT_EQ(heard[0].now, MonotonicTime::max());
+    EXPECT_EQ(heard[0].publish_time, MonotonicTime::max());
+    EXPECT_EQ(heard[0].event_time, MonotonicTime::max());
+    EXPECT_TRUE(loop.due_prompt_topics(MonotonicTime::max()).empty());
+  }
+
+  // A quiet sequence watcher that overflows max_messages_per_tick during a
+  // prompt wake at MonotonicTime::max() sets backlog_ with no timers armed;
+  // run_until(max()) drains the full backlog and then exits cleanly.
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<>::Options options;
+    options.delivery = Delivery::ON_PUBLISH;
+    options.max_messages_per_tick = 16;
+    SimulatedEventLoop<> loop{environment, options};
+    std::size_t quiet_count = 0;
+    auto on_quiet = [&](const Context&, std::span<const std::byte>) {
+      ++quiet_count;
+    };
+    WatchSensor(loop, "/quiet_backlog", make_thunk(&on_quiet));
+    loop.set_prompt(WatchSensor(loop, "/wake_backlog", Thunk{}));
+
+    loop.advance_until(MonotonicTime::max());
+    loop.run_until(MonotonicTime::max());
+    for (int i = 0; i < 40; ++i) {
+      loop.inject("/quiet_backlog", Sensor{i, 0.0F, 0.0F});
+    }
+    loop.inject("/wake_backlog", Sensor{0, 0.0F, 0.0F});
+
+    loop.run_until(MonotonicTime::max());
+    EXPECT_EQ(quiet_count, 40u);
+    EXPECT_EQ(loop.drains(), 3u);
+  }
 }
 
 }  // namespace

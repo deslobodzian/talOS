@@ -80,6 +80,13 @@ std::optional<bool> SessionSimulation(const std::filesystem::path& dir);
 MatchVerdict RecordedMatch(const std::filesystem::path& dir,
                            ClassCache cache = ClassCache::kReadWrite);
 
+// Reads only the cached verdict from `dir / kSessionClassFile` without opening
+// any `.tlog` file or writing to `dir`: kMatch whenever a match was cached,
+// kOther or kUnknown when `log_bytes` (total regular `.tlog` bytes in `dir`)
+// and this build's reader identity match, else nullopt. Never throws.
+std::optional<MatchVerdict> CachedRecordedMatch(
+    const std::filesystem::path& dir, std::uintmax_t log_bytes);
+
 // The bytes an unprivileged writer may still use on the filesystem holding
 // `path` (statvfs: f_bavail * f_frsize), or nullopt when it cannot be read.
 std::optional<std::uint64_t> AvailableBytes(const std::filesystem::path& path);

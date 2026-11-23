@@ -10,12 +10,15 @@ the event Poller (`CLOCK_MONOTONIC_RAW` on macOS, `CLOCK_MONOTONIC` elsewhere).
 `write(bytes, publish_time_ns)` preserves the supplied nanoseconds for simulation
 and replay. `read_next()` returns that timestamp as `MessageInfo::publish_time_ns`
 alongside the sequence and dropped-message count. The payload and timestamp are
-copied before the same slot-validity check; an overwritten candidate exposes
-neither its timestamp nor its metadata as an accepted message. The copy and an
-overwrite of the same slot by a writer that lapped the reader race by design (a
-seqlock: the copy is discarded unless the check after it passes); that is a
-data race by the C++ memory model, which the thread sanitizer reports when
-writer and reader share one mapping
+copied as uniform 8-byte relaxed atomic words (`std::atomic_ref<std::uint64_t>`
+for the payload up to `publish_time_offset_`, zero-padding short writes and any
+sub-8-byte tail, and `std::atomic_ref<std::int64_t>` for the timestamp) before
+the same slot-validity check; an overwritten candidate exposes neither its
+timestamp nor its metadata as an accepted message. Paired with the writer's
+release fence before overwriting a slot and the reader's acquire fence before
+checking `writer.sequence` and `reliable_sequence`, a concurrent overwrite of a
+slot being copied is a well-defined seqlock free of C++ data races, so
+`//talOS/rtms:ring_lap_test` runs under ThreadSanitizer on one mapping
 ([TESTING.md §2](../../docs/TESTING.md#where-a-behaviour-is-tested)). A reader the
 writer laps skips to the oldest message still intact and counts the skipped ones
 as dropped, whatever overflow policy the reader assumed.
@@ -78,7 +81,10 @@ Each topic has 32 reader slots (`MAX_READERS`), including observer
 subscriptions. Dead readers are reclaimed before registration fails. The graph
 lint rejects declared reader counts above this limit before launch; standalone
 `ipc::Subscriber` construction and a realtime loop's watcher registration
-throw with the topic and limit if exhausted.
+throw with the topic and limit if exhausted. Every reader—prompt (woken) or
+polled/observer—holds one of those 32 slots; RTMS does not implement a
+separate process-local cursor-only path for never-woken readers while 32 slots
+per topic hold real robot graphs comfortably.
 
 A queue keeps the state word it claimed each reader slot with. Once the slot
 holds another word -- another process judged this one dead and freed the slot,

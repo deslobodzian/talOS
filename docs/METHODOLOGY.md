@@ -10,7 +10,7 @@ Each rule carries its status:
 | Mark | Meaning |
 |---|---|
 | **[enforced]** | the build, the graph lint or a test fails when it is broken |
-| **[review]** | a convention; the `reviewer` agent (`.claude/agents/reviewer.md`) checks it |
+| **[review]** | a convention; the `reviewer` agent (`.agents/agents/reviewer.md`, `.claude/agents/reviewer.md`) checks it |
 | **[gap]** | stated, but nothing checks it yet; names the TODO.md item that adds the check |
 
 ## 1. What the four goals mean here
@@ -111,8 +111,8 @@ There are exactly two kinds of input, and they are treated differently.
 | **Observation**: what another node reports | `/<other>/state`, `/<other>/status`, `/hw/...` | the decision that needs it is not made; publish your state with the matching validity flag cleared | `fresh()` plus that message's own validity flags |
 
 - Never dereference a subscription without checking `fresh()` in the same
-  expression. `value()` before the first message is undefined in C++ and
-  `None` in Python. **[review]**
+  expression. `value()` before the first message returns a zero-initialized
+  `M` in C++ and `None` in Python. **[review]**
 - Never hold a last value past its freshness ("keep the last goal"). A
   mechanism that must hold position is told to hold by a producer that keeps
   publishing. **[review]**
@@ -126,7 +126,7 @@ There are exactly two kinds of input, and they are treated differently.
   value it owns through `param_of` in the constructor. Never include
   its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[enforced:
   `tools/check_layers.py` refuses a Bazel dependency on another node package's
-  library; gap: ARCH-2, package-private visibility]**
+  library]**
 
 ## 4. Outputs
 
@@ -153,7 +153,7 @@ There are exactly two kinds of input, and they are treated differently.
    controller at neutral but drives a servo to centre; leave it unset (or
    `stop()` it) for no pulse. **[enforced; hardware qualification]**
 4. Never write `/hw/request/<node>` and never send hardware requests outside
-   `update()`. **[enforced: `publish` refuses `/hw/request`, graph lint; gap: ARCH-2, node code can still reach `detail::NodeAccess` and raw RTMS publishers]**
+   `update()`. **[enforced: `publish`/`publish_bytes` and `NodeDetail::publisher_send` refuse `/hw/request`, graph lint, Bazel visibility + `implementation_deps`, and `tools/check_layers.py`]**
 5. Closed loops run on the Talon (`set_velocity`, `set_position`,
    `set_motion_magic`). Run a loop in the node only when it needs data the Talon
    does not have, such as pose or vision. **[review]**
@@ -203,10 +203,12 @@ Rules:
   numbers) without a suffix, naming it. A suffix needs a name before it
   (`count` alone fails; `tick_count` passes). **[enforced]** Numeric
   parameters without a suffix get a `--describe-only` warning. **[enforced (warning)]**
-- No one-letter word before the suffix: `x_std_m`, not `std_x_m`, and
-  `module0`, not `module_0`. flatc camel-cases field names for Python, and
-  talos derives the snake_case names back from them, so `std_x_m` would read
-  as `std_xm` there. **[review]**
+- Struct field names are lower `snake_case`, with no `_<digit>` segment
+  (`module0`, not `module_0`) and no interior one-letter word before a unit
+  suffix (`x_std_m`, not `std_x_m`; leading one-letter names such as `x_m`
+  stay valid). flatc camel-cases field names for Python, and talos derives the
+  snake_case names back from them, so `std_x_m` would read as `std_xm` there.
+  **[enforced: `talOS/build/descriptor_gen.cc` lint]**
 
 ## 7. Messages
 
@@ -250,14 +252,18 @@ Rules:
 
 - Use `node.now()` only. Never `steady_clock`, `time.time()` or sleeps. This is
   what makes `Sim` and replay match the robot. **[enforced:
-  `tools/lint_test_time.py` over the node packages under the robot, example,
-  bench and scaffold directories and the framework nodes, `talOS/teleop` and
+  `tools/lint_test_time.py` over the node packages under `bench/`, `examples/`
+  and `tools/scaffold_testdata/` and the framework nodes, `talOS/teleop` and
   `talOS/telemetry`]**
 - Estimators integrate on measurement sample times (`sample_time_ns`), never
   on arrival or publish time, and call wpimath's time-taking entry points
   (`UpdateWithTime`/`updateWithTime`), never `Update()`/`update()`, which read
   WPILib's own clock. **[review]**
-- No randomness in decisions. Telemetry stream ids are the one exception. **[review]**
+- No randomness in decisions. Telemetry stream ids are the one exception.
+  **[enforced (except `std::random_device`, which telemetry's `RandomStreamId`
+  uses): `tools/lint_test_time.py` over the node packages under `bench/`,
+  `examples/` and `tools/scaffold_testdata/` and the framework nodes,
+  `talOS/teleop` and `talOS/telemetry`]**
 - **Tune offline on recorded inputs.** A node's output is a function of its
   inputs and their times, so a new or changed node (an estimator, a vision
   filter) is tuned against a recorded match with
@@ -291,10 +297,10 @@ Rules:
 
 | Rule | Budget | Status |
 |---|---|---|
-| `update()` p99 wall time | ≤ 10 % of `period_us` | [review; gap: SPEC-4, no benchmark asserts it]; measure callback entry-to-exit duration in a dedicated benchmark, using a monotonic wall clock, and compute the percentile from those durations. Registry / Studio `max_latency` measures maximum dispatch-start lateness, not callback duration or p99. Benchmark clocks must not replace `node.now()` in control logic. |
-| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members); one exception, inside talOS: a publish may send one 1-byte wake datagram to each reader armed on that topic, non-blocking, and connects that reader's endpoint on first use or when the reader's receiver changes ([data flow](DATA_FLOW.md#link-rates-and-endpoints)) | allocations [enforced: `talos::testing::AllocationProbe` (`//talOS/node:allocation_probe`) counts the loop thread's allocations over a window of steady-state ticks in the bench `motor` and `swerve_module`, `talOS/teleop`, `talOS/telemetry` and the examples' C++ node tests and the `talOS/mechanisms` blocks' tests, and over the bridge's `Tick()` on a live gateway link in `talOS/bridge`'s `hardware_node_test`; macOS and glibc, skipped under sanitizers ([TESTING.md §7](TESTING.md#7-the-node-test-matrix))]; the rest [review] |
+| `update()` p99 wall time | ≤ 10 % of `period_us` | **[enforced]** on representative bench and framework C++ nodes (`motor`, `swerve_module`, `teleop`, `telemetry`): `//bench/main_processor:update_p99_perf_test` (`REQ-RT-07`, `perf` lane) measures `update()` + devices-flush entry-to-exit wall-clock p99 with `talos::event::steady_now()` and host qualification (`StallMeter`, failing distinctly as `[HOST_UNQUALIFIED]` on a stalled host); **[review]** for other nodes; the 10 % budget's end-to-end derivation remains open (`TODO.md` `SPEC-4`). Registry / Studio `max_latency` measures maximum dispatch-start lateness, not callback duration or p99. Benchmark clocks must not replace `node.now()` in control logic. |
+| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members); one exception, inside talOS: a publish may send one 1-byte wake datagram to each reader armed on that topic, non-blocking, and connects that reader's endpoint on first use or when the reader's receiver changes ([data flow](DATA_FLOW.md#link-rates-and-endpoints)) | allocations [enforced: `talos::testing::AllocationProbe` (`//talOS/node:allocation_probe`) counts the loop thread's allocations over a window of steady-state ticks in the bench `motor` and `swerve_module`, `talOS/teleop`, `talOS/telemetry` and the examples' C++ node tests and the `talOS/mechanisms` blocks' tests, and over the bridge's `Tick()` on a live gateway link in `talOS/bridge/hardware_node_test.cc` (`//talOS/bridge:node_test`); macOS and glibc, skipped under sanitizers ([TESTING.md §7](TESTING.md#7-the-node-test-matrix))]; direct blocking I/O, logging, `print`, and locks in node packages [enforced: `tools/lint_test_time.py` `io` and `lock` kinds over the node packages under `bench/`, `examples/`, `tools/scaffold_testdata/`, `talOS/teleop`, and `talOS/telemetry`, with construction-only uses tracked in `tools/lint_test_time_allowlist.txt`]; indirect I/O or locks through helper libraries or unenumerated syscalls and Python allocations [review] |
 | Python nodes | cost memory (≈ 30 MB) and add GC/interpreter jitter: a Python node whose own subsystem owns a motor, digital output or PWM output runs at `period_us` ≥ 20000, so hard 5 ms actuator loops belong in C++ (a `talos.cpp_node` counts as C++); 20 ms supervisory/estimator nodes monitor age and watchdog timeouts | the actuator period [enforced: the launcher's graph lint, `--describe-only` and `talos_graph_test` ([launcher](../talOS/launcher/README.md#python-actuator-periods))]; the rest [review] |
-| Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
+| Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [enforced: the launcher's graph lint warns on an operator producer → actuator owner path longer than two node hops ([NAMING.md](../talOS/NAMING.md#topics), `REQ-CONTRACT-09`, `REQ-RT-16`)]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
 
 For timer-drained and callback delivery, see
@@ -359,15 +365,12 @@ asks for; only an override, such as `single_version_override`, fixes one).
 
 | Bazel module | For |
 |---|---|
-| `apple_support` | the Apple C++ toolchain on macOS (`repo_name` `build_bazel_apple_support`); root pin |
+| `apple_support` | the Apple C++ toolchain on macOS under Bazel 8.6 / Xcode (`repo_name` `build_bazel_apple_support`; supplies the configured macOS C++ toolchain targets instead of transitive 1.24.2); root pin |
 | `rules_cc` | C++ rules |
 | `googletest` | C++ tests |
 | `platforms` | OS constraints (`@platforms//os:*`) in `select`s |
 | `flatbuffers` | message schemas, `flatc`, the C++ and Python runtimes |
-| `rules_foreign_cc` | root pin |
 | `aspect_bazel_lib` | `copy_to_bin` and build stamping |
-| `rules_go` | root pin |
-| `rules_java` | root pin |
 | `rules_python` | Python rules, the 3.11 toolchain and the pinned pip lock |
 | `nlohmann_json` | Choreo `.traj` and session manifest reading |
 | `opencv` | `talOS/vision` image conversion and IO (patched, root only) |

@@ -17,14 +17,22 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
-#include "talOS/bridge/boot_history.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/devices/access.h"
+#include "talOS/hardware/boot_history.h"
 #include "talOS/hardware/feedback.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/names.h"
+#include "talOS/node/access.h"
 
 namespace talos {
 namespace {
+
+static_assert(std::string_view{hardware::kRequestTopicPrefix} ==
+                  introspect::naming::kRequestTopicPrefix,
+              "hardware::kRequestTopicPrefix must match "
+              "introspect::naming::kRequestTopicPrefix");
 
 using detail::HardwareAccess;
 using hardware::Packet;
@@ -213,6 +221,7 @@ struct HardwareLink::Impl {
 
   hardware::State state{};
   bool have_state = false;
+  hardware::BootHistory boots;
   Time state_published{};
   std::size_t state_subscription = 0;
   // The bridge's gateway-to-node clock mapping. The state is the gateway's
@@ -320,13 +329,18 @@ struct HardwareLink::Impl {
   }
 
   // Decoded, then latched only when AcceptState takes it: this config's id,
-  // and newer than the last sample from the same boot.
+  // not a recently retired gateway boot, and newer than the last sample from
+  // the same boot.
   void OnState(const void* data) {
     Packet packet{};
     std::memcpy(&packet, data, sizeof packet);
     hardware::State next{};
     if (!hardware::Decode(packet.bytes(), next)) return;
-    if (!hardware::AcceptState(have_state, state, config_id, next)) return;
+    if (!hardware::AcceptState(have_state, state, config_id, next,
+                               boots.retired(next.boot_id))) {
+      return;
+    }
+    if (!boots.current(next.boot_id)) boots.Enter(next.boot_id);
     if (have_state) ForgetZeros(next);
     state = next;
     have_state = true;
@@ -788,12 +802,16 @@ hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
   return sample;
 }
 
-bool HardwareAccess::motor_hard_limit(const HardwareLink& link,
-                                      std::size_t index, bool forward) {
-  const auto sample = motor_sample(link, index);
+bool HardwareAccess::motor_hard_limit(const hardware::MotorSample& sample,
+                                      bool forward) {
   const std::uint32_t flag = forward ? hardware::kMotorForwardHardLimitFlag
                                      : hardware::kMotorReverseHardLimitFlag;
   return sample.valid && (sample.fault_flags & flag) != 0;
+}
+
+bool HardwareAccess::motor_hard_limit(const HardwareLink& link,
+                                      std::size_t index, bool forward) {
+  return motor_hard_limit(motor_sample(link, index), forward);
 }
 
 hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
@@ -808,13 +826,20 @@ hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
 
 namespace {
 template <class Sample>
-std::optional<Time> AcquisitionTime(const HardwareLink& link,
-                                    const Sample& sample, bool velocity) {
+std::optional<Duration> SignalAge(const Sample& sample, bool velocity) {
   const auto age = velocity ? sample.velocity_age_us : sample.position_age_us;
   if (!sample.valid || age == UINT32_MAX) return std::nullopt;
+  return std::chrono::microseconds{age};
+}
+
+template <class Sample>
+std::optional<Time> AcquisitionTime(const HardwareLink& link,
+                                    const Sample& sample, bool velocity) {
+  const auto age = SignalAge(sample, velocity);
+  if (!age) return std::nullopt;
   const auto time = link.sample_time();
   if (!time) return std::nullopt;
-  return *time - std::chrono::microseconds{age};
+  return *time - *age;
 }
 }  // namespace
 
@@ -833,10 +858,13 @@ std::optional<Time> HardwareAccess::sensor_time(const HardwareLink& link,
 std::optional<Duration> HardwareAccess::motor_age(const HardwareLink& link,
                                                   std::size_t index,
                                                   bool velocity) {
-  const auto sample = motor_sample(link, index);
-  const auto age = velocity ? sample.velocity_age_us : sample.position_age_us;
-  if (!sample.valid || age == UINT32_MAX) return std::nullopt;
-  return std::chrono::microseconds{age};
+  return SignalAge(motor_sample(link, index), velocity);
+}
+
+std::optional<Duration> HardwareAccess::sensor_age(const HardwareLink& link,
+                                                   std::size_t index,
+                                                   bool velocity) {
+  return SignalAge(sensor_sample(link, index), velocity);
 }
 
 hardware::DigitalInputSample HardwareAccess::digital_input_sample(
@@ -1007,6 +1035,12 @@ std::optional<Time> CANcoder::position_time() const {
 }
 std::optional<Time> CANcoder::velocity_time() const {
   return HardwareAccess::sensor_time(*link_, index_, true);
+}
+std::optional<Duration> CANcoder::position_age() const {
+  return HardwareAccess::sensor_age(*link_, index_, false);
+}
+std::optional<Duration> CANcoder::velocity_age() const {
+  return HardwareAccess::sensor_age(*link_, index_, true);
 }
 
 Gyro::Gyro(Node& node, std::string_view name)

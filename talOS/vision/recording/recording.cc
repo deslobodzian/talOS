@@ -1,10 +1,12 @@
 #include "talOS/vision/recording/recording.h"
 
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -81,6 +83,13 @@ struct Json {
       return integer;
     }
     if (type == Type::kDouble) {
+      constexpr double kMin =
+          static_cast<double>(std::numeric_limits<std::int64_t>::min());
+      constexpr double kMaxExclusive =
+          static_cast<double>(std::numeric_limits<std::int64_t>::max());
+      if (!std::isfinite(number) || number < kMin || number >= kMaxExclusive) {
+        return fallback;
+      }
       return static_cast<std::int64_t>(number);
     }
     return fallback;
@@ -130,6 +139,14 @@ class Parser {
   }
 
  private:
+  static constexpr int kMaxDepth = 64;
+
+  struct DepthGuard {
+    int& depth;
+    explicit DepthGuard(int& d) : depth(d) { ++depth; }
+    ~DepthGuard() { --depth; }
+  };
+
   bool Fail(std::string* error, const char* what) {
     if (error != nullptr) {
       *error = what;
@@ -169,6 +186,10 @@ class Parser {
     return Fail(error, "unexpected character");
   }
   bool ParseObject(Json* out, std::string* error) {
+    if (depth_ >= kMaxDepth) {
+      return Fail(error, "maximum JSON nesting depth exceeded");
+    }
+    const DepthGuard guard(depth_);
     ++pos_;  // {
     out->type = Json::Type::kObject;
     SkipWs();
@@ -206,6 +227,10 @@ class Parser {
     }
   }
   bool ParseArray(Json* out, std::string* error) {
+    if (depth_ >= kMaxDepth) {
+      return Fail(error, "maximum JSON nesting depth exceeded");
+    }
+    const DepthGuard guard(depth_);
     ++pos_;  // [
     out->type = Json::Type::kArray;
     SkipWs();
@@ -233,6 +258,9 @@ class Parser {
     }
   }
   bool ParseString(std::string* out, std::string* error) {
+    if (pos_ >= text_.size() || text_[pos_] != '"') {
+      return Fail(error, "expected '\"'");
+    }
     ++pos_;  // opening quote
     while (pos_ < text_.size()) {
       const char c = text_[pos_++];
@@ -348,16 +376,19 @@ class Parser {
     const std::string token(text_.substr(start, pos_ - start));
     if (is_int) {
       char* end = nullptr;
-      const std::int64_t v = std::strtoll(token.c_str(), &end, 10);
-      if (end == token.c_str() || *end != '\0') {
+      errno = 0;
+      const auto v = std::strtoll(token.c_str(), &end, 10);
+      if (errno != 0 || end == token.c_str() || *end != '\0') {
         return Fail(error, "invalid integer");
       }
       out->type = Json::Type::kInt;
       out->integer = static_cast<std::int64_t>(v);
     } else {
       char* end = nullptr;
+      errno = 0;
       const double v = std::strtod(token.c_str(), &end);
-      if (end == token.c_str() || *end != '\0') {
+      if (errno != 0 || !std::isfinite(v) || end == token.c_str() ||
+          *end != '\0') {
         return Fail(error, "invalid number");
       }
       out->type = Json::Type::kDouble;
@@ -368,6 +399,7 @@ class Parser {
 
   std::string_view text_;
   std::size_t pos_ = 0;
+  int depth_ = 0;
 };
 
 bool ReadExtrinsics(const Json& o, Extrinsics* out) {

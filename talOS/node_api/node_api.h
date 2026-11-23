@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 35u
+#define TALOS_NODE_ABI_VERSION 39u
 
 enum {
   TALOS_OK = 0,
@@ -289,12 +289,15 @@ int32_t talos_motor_time(TalosNode* node, int64_t index, int32_t velocity,
                          int64_t* out_ns);
 int32_t talos_sensor_time(TalosNode* node, int64_t index, int32_t velocity,
                           int64_t* out_ns);
-// Motor::position_age / velocity_age (velocity selects the rate): the
-// signal's age (ns) at the State it arrived in, read from that State, so
-// without the clock mapping. Returns 1 with *out_ns, 0 unless the motor is
-// connected or when the age is unknown, TALOS_ERR on error.
+// Motor::position_age / velocity_age, CANcoder::position_age / velocity_age
+// (velocity selects the rate): the signal's age (ns) at the State it arrived
+// in, read from that State, so without the clock mapping. Returns 1 with
+// *out_ns, 0 unless the device is connected or when the age is unknown,
+// TALOS_ERR on error.
 int32_t talos_motor_age(TalosNode* node, int64_t index, int32_t velocity,
                         int64_t* out_ns);
+int32_t talos_sensor_age(TalosNode* node, int64_t index, int32_t velocity,
+                         int64_t* out_ns);
 int32_t talos_digital_input_sample(TalosNode* node, int64_t index,
                                    TalosSample* out);
 int32_t talos_analog_input_sample(TalosNode* node, int64_t index,
@@ -316,6 +319,12 @@ enum {  // talos::driver_station::DsFlags
   TALOS_DS_TELEOP = 1 << 4,
   TALOS_DS_TEST = 1 << 5,
   TALOS_DS_ESTOP = 1 << 6,
+};
+
+enum {  // talos::driver_station::Alliance
+  TALOS_ALLIANCE_UNKNOWN = 0,
+  TALOS_ALLIANCE_RED = 1,
+  TALOS_ALLIANCE_BLUE = 2,
 };
 
 // One joystick port, as talos::Joystick reads it: axes past axis_count are
@@ -384,15 +393,33 @@ int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
 int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
                                const void* message, uint32_t size);
 int32_t talos_target_lane_release(TalosNode* node, int64_t lane);
+enum {  // talos::ArmingInputKind
+  TALOS_ARMING_INPUT_NONE = 0,
+  TALOS_ARMING_INPUT_AXIS = 1,
+  TALOS_ARMING_INPUT_BUTTON = 2,
+  TALOS_ARMING_INPUT_POV = 3,
+  TALOS_ARMING_INPUT_OTHER = 4,
+};
 // talos::OperatorArming: opens one (call while the factory runs) and returns
 // its index. evaluate returns 1 when the producer may publish active targets
 // on this reading of its inputs (`neutral` nonzero: every input at rest), 0
-// otherwise; armed returns 1 or 0 without evaluating. All return TALOS_ERR on
-// error.
+// otherwise; evaluate_blocker also records the blocking input (`kind`,
+// `port`, `index`) while disarmed and writes 1 or 0 to `*out_armed` (when
+// non-NULL), returning TALOS_OK; blocker writes the recorded blocker into any
+// non-NULL out pointers and returns TALOS_OK; armed returns 1 or 0 without
+// evaluating. All return TALOS_ERR on error.
 int64_t talos_operator_arming_open(TalosNode* node);
 int32_t talos_operator_arming_evaluate(TalosNode* node, int64_t arming,
                                        int32_t neutral);
+int32_t talos_operator_arming_evaluate_blocker(TalosNode* node, int64_t handle,
+                                               int32_t inputs_neutral,
+                                               uint8_t kind, int8_t port,
+                                               int16_t index,
+                                               int32_t* out_armed);
 int32_t talos_operator_arming_armed(TalosNode* node, int64_t arming);
+int32_t talos_operator_arming_blocker(TalosNode* node, int64_t handle,
+                                      uint8_t* out_kind, int8_t* out_port,
+                                      int16_t* out_index);
 int32_t talos_operator_arming_disarm(TalosNode* node, int64_t arming);
 
 // --- mechanisms (talOS/mechanisms) -----------------------------------------
@@ -520,9 +547,13 @@ void talos_sim_destroy(TalosSim* sim);
 // talos_node_session_dir. `path` NULL or "" clears it. Call before
 // talos_sim_add.
 int32_t talos_sim_set_session_dir(TalosSim* sim, const char* path);
-// Builds a node named `node_name` with `factory`. NULL on error.
+// Builds a node named `node_name` with `factory`, before or after stepping.
+// NULL on error.
 TalosNode* talos_sim_add(TalosSim* sim, const char* node_name,
                          TalosFactory factory, void* user);
+// Stops and removes the hosted node named `node_name`, destroying it so the
+// name may be added again later. Fails if absent or called inside step.
+int32_t talos_sim_remove(TalosSim* sim, const char* node_name);
 TalosNode* talos_sim_node(TalosSim* sim, const char* node_name);
 int32_t talos_sim_step(TalosSim* sim, int64_t duration_ns);
 // Pauses only this node for duration_ns; resume ends a pause early.

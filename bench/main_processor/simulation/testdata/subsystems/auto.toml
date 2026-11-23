@@ -1,0 +1,4 @@
+[subsystem]
+name = "auto_producer"
+node = "//bench/main_processor/simulation/testdata/nodes:auto_producer"
+period_us = 20000

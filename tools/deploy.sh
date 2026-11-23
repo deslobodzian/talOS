@@ -30,6 +30,43 @@ say() { printf 'deploy: %s\n' "$*"; }
 die() { printf 'deploy: error: %s\n' "$*" >&2; exit 1; }
 run() { if [ "$DRY_RUN" = "1" ]; then printf '+ %s\n' "$*"; else "$@"; fi; }
 
+# Reject unsafe prefix paths before writing systemd units or launchd XML plists.
+validate_prefix() {
+  local p="$1"
+  [ -n "$p" ] || die "invalid --prefix: must not be empty"
+  case "$p" in
+    /*) ;;
+    *) die "invalid --prefix '$p': must be an absolute path" ;;
+  esac
+  if (
+    LC_ALL=C
+    case "$p" in
+      *[[:space:][:cntrl:]]*|*[\<\>\&\"\'\\]*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+  ); then
+    die "invalid --prefix: must not contain whitespace, control, quote, backslash, or XML-special characters"
+  fi
+}
+
+validate_user() {
+  local u="$1"
+  if (
+    LC_ALL=C
+    case "$u" in
+      [a-z_]*)
+        case "$u" in
+          *[!a-z0-9_.-]*) exit 0 ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      *) exit 0 ;;
+    esac
+  ); then
+    die "invalid --user: must match ^[a-z_][a-z0-9_.-]*$"
+  fi
+}
+
 # Rename the link itself even when the destination names a directory.
 select_bundle() {
   run python3 -c '
@@ -690,8 +727,15 @@ release_stops() {
 refuse_testonly() {
   local bundle="$1" manifest="$1/bundle_manifest.toml"
   [ -f "$manifest" ] || return 0
+  [ -r "$manifest" ] || die "cannot read $manifest"
+  local rc=0
   awk '/^\[/ { exit } $0 == "testonly = true" { found = 1 } END { exit !found }' \
-    "$manifest" || return 0
+    "$manifest" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) die "cannot read $manifest" ;;
+  esac
   if [ -n "${TEST_TMPDIR:-}" ] && [ -n "${TEST_TARGET:-}" ] && python3 -c '
 import os, sys
 test, prefix = map(os.path.realpath, sys.argv[1:])
@@ -836,8 +880,13 @@ cmd_boot_check() {
 cmd_enable_boot() {
   local user="talos"
   while [ $# -gt 0 ]; do
-    case "$1" in --user) user="$2"; shift 2 ;; *) break ;; esac
+    case "$1" in
+      --user) [ $# -ge 2 ] || die "--user requires a user name (usage: deploy.sh enable-boot [--prefix DIR] [--user NAME] [--dry-run])"; user="$2"; shift 2 ;;
+      *) break ;;
+    esac
   done
+  validate_prefix "$PREFIX"
+  validate_user "$user"
   local darwin=0
   [ "$(uname -s)" = "Darwin" ] && darwin=1
   if [ "$darwin" = "1" ]; then
@@ -891,7 +940,7 @@ StartLimitIntervalSec=0
 Type=notify
 User=$user
 Environment=\"TALOS_LOG_DIR=$PREFIX/logs\"
-ExecStart=$PREFIX/current/run.sh
+ExecStart=\"$PREFIX/current/run.sh\" --serve-refusal
 TimeoutStartSec=1200
 KillMode=mixed
 TimeoutStopSec=90
@@ -925,6 +974,7 @@ WantedBy=multi-user.target
   <key>ProgramArguments</key>
   <array>
     <string>$PREFIX/current/run.sh</string>
+    <string>--serve-refusal</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -937,6 +987,8 @@ WantedBy=multi-user.target
   <true/>
   <key>ProcessType</key>
   <string>Interactive</string>
+  <key>ExitTimeOut</key>
+  <integer>90</integer>
   <key>StandardOutPath</key>
   <string>/dev/null</string>
   <key>StandardErrorPath</key>
@@ -987,7 +1039,7 @@ $stderr_log $user:$group 644 4 1024 * NB"
     printf '%s\n' "$unit"
     return 0
   fi
-  echo "$unit" | sudo tee /etc/systemd/system/talos.service >/dev/null
+  printf '%s' "$unit" | sudo tee /etc/systemd/system/talos.service >/dev/null
   sudo systemctl daemon-reload
   sudo systemctl enable talos.service
   say "boot start enabled (talos.service)"
@@ -1118,7 +1170,12 @@ def when(ns):
 
 def revision(m):
     rev = str(m.get("git_revision") or "")[:12] or "unstamped"
-    return rev + (" dirty" if m.get("git_dirty") else "")
+    text = rev + (" dirty" if m.get("git_dirty") else "")
+    talos = str(m.get("talos_git_revision") or "")[:12]
+    if talos:
+        text += (" talos " + talos
+                 + (" dirty" if m.get("talos_git_dirty") else ""))
+    return text
 
 
 def outcomes(m):
@@ -1312,7 +1369,7 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --) shift; [ $# -eq 0 ] || rest+=("$@"); break ;;
-      --prefix) PREFIX="$2"; shift 2 ;;
+      --prefix) [ $# -ge 2 ] || die "--prefix requires a directory"; PREFIX="$2"; shift 2 ;;
       --dry-run) DRY_RUN=1; shift ;;
       --no-warm-up) WARM_UP=0; shift ;;
       *) rest+=("$1"); shift ;;
@@ -1321,7 +1378,9 @@ main() {
   # Absolute: install writes it into the `current`/`previous` link targets
   # and enable-boot into the unit; neither may depend on the caller's
   # working directory.
+  [ -n "$PREFIX" ] || die "invalid --prefix: must not be empty"
   case "$PREFIX" in /*) ;; *) PREFIX="$(pwd -P)/$PREFIX" ;; esac
+  validate_prefix "$PREFIX"
   if [ "${#rest[@]}" -gt 0 ]; then
     set -- "${rest[@]}"
   else

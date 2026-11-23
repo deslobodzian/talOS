@@ -118,7 +118,7 @@ std::vector<std::string> EnumLabels(const reflection::Schema& schema,
 // recorded log's) is refused rather than read out of bounds or expanded
 // without end. Real messages are far inside them: the deepest nests one
 // struct in another (drivetrain.DrivetrainState's modules), the largest
-// (bridge.BridgeStatus) has 69 channels, and a topic cannot have more
+// (bridge.BridgeStatus) has 76 channels, and a topic cannot have more
 // channels than a whole dictionary holds (kMaxChannels).
 inline constexpr std::size_t kMaxNestingDepth = 16;
 inline constexpr std::size_t kMaxTopicChannels = telemetry_wire::kMaxChannels;

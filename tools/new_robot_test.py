@@ -284,6 +284,173 @@ class NewRobotTest(unittest.TestCase):
                     self.assertGreater(speed, 0)
                     self.assertLessEqual(speed, motor["max_velocity_rps"])
 
+    # REQ-DEV-03
+    def test_adding_node_in_other_language_wires_by_toml_without_cross_language_edits(
+            self):
+        # Adding a node in one language (Python into a C++ robot, or C++ into
+        # a Python robot) changes zero files of the other language or any
+        # existing node package: the diff touches only the new node's package,
+        # TOML configs, and generated manifests. Target policies, teleop
+        # bindings, and telemetry recording are all wired by TOML alone and
+        # accepted by `launcher --describe-only`.
+        def snapshot(directory):
+            tree = {}
+            for current, _, names in os.walk(directory):
+                for name in names:
+                    path = os.path.join(current, name)
+                    rel = os.path.relpath(path, work).replace(os.sep, "/")
+                    with open(path, "rb") as f:
+                        tree[rel] = f.read()
+            return tree
+
+        other_lang_exts = {
+            "py": (".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".c"),
+            "cpp": (".py",),
+        }
+        directions = (
+            ("gripper", "cpp", "scaffold_py", "py"),
+            ("scaffold_py", "py", "gripper", "cpp"),
+        )
+        for existing, existing_lang, added, added_lang in directions:
+            with self.subTest(existing=existing_lang, added=added_lang), \
+                    tempfile.TemporaryDirectory() as tmp:
+                work, launcher, env = workspace(tmp)
+                generate(work, existing, existing_lang)
+                existing_button = new_subsystem.TELEOP_BUTTONS[0]
+                append_simulation_block(work, existing, "velocity",
+                                        button=existing_button)
+                robot_dir = os.path.join(work, "my_robot")
+                before = snapshot(robot_dir)
+
+                # Scaffold the new node in the other language and wire its
+                # TOML teleop binding and target policy in robot_sim.toml.
+                added_button = new_subsystem.teleop_button(work, "my_robot")
+                self.assertNotEqual(added_button, existing_button)
+                writes, can_id = new_subsystem.plan(
+                    work, "my_robot", added, added_lang)
+                self.assertEqual(can_id, 2)
+                for path, _, content in writes:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                stand_in_binary(work, added, added_lang)
+                append_simulation_block(work, added, "velocity",
+                                        button=added_button)
+
+                after = snapshot(robot_dir)
+                removed = sorted(set(before) - set(after))
+                added_files = sorted(set(after) - set(before))
+                modified_files = sorted(
+                    p for p in (set(before) & set(after))
+                    if before[p] != after[p])
+
+                self.assertEqual(removed, [])
+                existing_prefix = f"my_robot/main_processor/{existing}/"
+                added_prefix = f"my_robot/main_processor/{added}/"
+                # Zero files in the existing node's package (other language)
+                # were touched.
+                for path in added_files + modified_files:
+                    self.assertFalse(
+                        path.startswith(existing_prefix),
+                        f"touched existing {existing_lang} package: {path}")
+                # Existing files modified are strictly TOML configs and
+                # generated Bazel manifests (no C++/Python/FlatBuffers code).
+                allowed_modified = {
+                    CONFIG,
+                    SIM_CONFIG,
+                    "my_robot/main_processor/configuration/robot_manifest.bzl",
+                    "my_robot/main_processor/configuration/robot_sim_manifest.bzl",
+                }
+                self.assertTrue(
+                    set(modified_files).issubset(allowed_modified),
+                    f"unexpected modified files: {modified_files}")
+                # Added files outside the new node's own package are strictly
+                # its subsystem TOML file.
+                outside_added = [
+                    p for p in added_files if not p.startswith(added_prefix)
+                ]
+                self.assertEqual(outside_added, [f"{SUBSYSTEMS}/{added}.toml"])
+                # The new node's own package contains no source files of the
+                # other language.
+                for path in added_files:
+                    if path.startswith(added_prefix):
+                        self.assertFalse(
+                            path.endswith(other_lang_exts[added_lang]),
+                            f"new {added_lang} package contains other-language "
+                            f"file: {path}")
+
+                self.assertEqual(sync_manifest.check(work, CONFIG), "")
+                self.assertEqual(sync_manifest.check(work, SIM_CONFIG), "")
+
+                # Enforce target coverage and run the real launcher
+                # --describe-only over both C++ and Python nodes plus teleop,
+                # telemetry, and hardware_node.
+                edit(os.path.join(work, CONFIG),
+                     [("commissioned = false\n",
+                       "commissioned = false\n"
+                       "require_target_coverage = true\n")])
+                status, output, graph = describe(
+                    work, launcher, env, os.path.join(tmp, "out_wired"),
+                    SIM_CONFIG)
+                self.assertEqual(status, 0, output)
+                self.assertNotIn("error:", output)
+                nodes = {n["name"]: n for n in graph["nodes"]}
+                self.assertEqual(
+                    set(nodes),
+                    {"hardware_node", "teleop", "telemetry", existing, added})
+                for name, node in nodes.items():
+                    self.assertTrue(node["described"], name)
+
+                def topics(node_name, kind, observer=None):
+                    return {
+                        s["name"] for s in nodes[node_name]["sources"]
+                        if s["kind"] == kind
+                        and (observer is None or s["observer"] is observer)
+                    }
+
+                # Teleop binding wired by TOML: teleop publishes both lanes.
+                self.assertLessEqual(
+                    {f"/{existing}/target/teleop", f"/{added}/target/teleop"},
+                    topics("teleop", "SENDER"))
+                # Target policy wired by TOML: added node subscribes to its
+                # configured teleop lane.
+                self.assertIn(f"/{added}/target/teleop",
+                              topics(added, "WATCHER"))
+                self.assertNotIn(f"/{added}/target/auto",
+                                 topics(added, "WATCHER"))
+                # Telemetry wired by TOML: telemetry observes both state topics.
+                self.assertIn(f"/{added}/state", topics(added, "SENDER"))
+                self.assertLessEqual(
+                    {f"/{existing}/state", f"/{added}/state"},
+                    topics("telemetry", "WATCHER", observer=True))
+                # Hardware request wired for the new node.
+                self.assertIn(f"/hw/request/{added}", topics(added, "SENDER"))
+                self.assertIn(f"/hw/request/{added}",
+                              topics("hardware_node", "FETCHER"))
+
+                # Changing target policy in TOML alone adds a new target lane
+                # subscription on the node without editing any source code.
+                edit(os.path.join(work, CONFIG),
+                     [("require_target_coverage = true\n", "")])
+                edit(os.path.join(work, SIM_CONFIG),
+                     [(f"[subsystems.{added}.targets]\n"
+                       'teleop = ["teleop"]\nautonomous = []\n',
+                       f"[subsystems.{added}.targets]\n"
+                       'teleop = ["teleop"]\nautonomous = ["auto"]\n')])
+                status, output, graph_auto = describe(
+                    work, launcher, env, os.path.join(tmp, "out_auto"),
+                    SIM_CONFIG)
+                self.assertEqual(status, 0, output)
+                self.assertNotIn("error:", output)
+                added_watchers = {
+                    s["name"]
+                    for n in graph_auto["nodes"] if n["name"] == added
+                    for s in n["sources"] if s["kind"] == "WATCHER"
+                }
+                self.assertLessEqual(
+                    {f"/{added}/target/teleop", f"/{added}/target/auto"},
+                    added_watchers)
+
     # REQ-DEV-23
     def test_refuses_a_bad_name_or_an_existing_directory(self):
         with tempfile.TemporaryDirectory() as root:
@@ -464,6 +631,14 @@ class RobotRepositoryTest(unittest.TestCase):
             for gone in ("roller", "gate"):
                 self.assertNotIn(gone, files["robot.toml"])
                 self.assertNotIn(gone, files["robot_manifest.bzl"])
+            # REPO-7 / TOOLS-7: README documents the CI Studio build step and
+            # stale-pin failure behavior.
+            readme = files["README.md"]
+            self.assertIn("bazel build //studio:web_dist", readme)
+            self.assertIn(
+                "bazel test --test_env=TALOS_REQUIRE_STUDIO_PAGES=1 //...",
+                readme)
+            self.assertIn("STUDIO_STAMP.txt", readme)
             # What the repository's manifest_sync_test checks.
             for path, content in files.items():
                 write(os.path.join(target, path), content)

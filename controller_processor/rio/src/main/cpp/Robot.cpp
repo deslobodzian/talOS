@@ -14,10 +14,12 @@
 
 #include "ConfigStore.h"
 #include "DriverStationReader.h"
+#include "DriverStationSampler.h"
 #include "LoopConsole.h"
 #include "LoopSchedule.h"
 #include "PhoenixBackend.h"
 #include "RioBuild.h"
+#include "RobotSafety.h"
 #include "SocketRetry.h"
 
 #ifdef __linux__
@@ -60,7 +62,7 @@ constexpr const char* kConfigPath = "talos_config.bin";
 
 // RioLog kMessage indices (rate-limit keys) of this file's reports; 0, 7, 8
 // and 16 to 31 are PhoenixBackend's (configure failure, CAN bus status, CAN
-// bus reader, licence refusals), 9 and up LoopConsole's.
+// bus reader, licence refusals), 9 to 12 LoopConsole's.
 constexpr uint16_t kSocketMessage = 1;
 constexpr uint16_t kPersistMessage = 2;
 constexpr uint16_t kSocketOpenMessage = 3;
@@ -253,6 +255,10 @@ void Robot::StartCompetition() {
   // The main processor this program sends State to and, its socket being
   // connected, the only host it accepts frames from: fixed at build time
   // (-Pcompanion, build.gradle), never learned from a datagram.
+#if defined(__FRC_ROBORIO__) && !defined(RUNNING_FRC_TESTS)
+  static_assert(talos::rio::kCompanionAddress[0] != '\0',
+                "RoboRIO build requires -Pcompanion=<ipv4>");
+#endif
   const char* const companion_address =
       IsSimulation() ? "127.0.0.1" : talos::rio::kCompanionAddress;
   // Prefixed, like every RioLog line, with the gateway's clock: on the
@@ -330,7 +336,7 @@ void Robot::StartCompetition() {
       }};
   driver_station.Start(kDriverStationPriority);
 
-  // Disarmed until a tick ends with a command in force.
+  // Disarmed until an enabled tick pre-arms it or ends with a command in force.
   watchdog_->Start(NowUs, kWatchdogPriority);
 
 #ifdef __FRC_ROBORIO__
@@ -359,13 +365,13 @@ void Robot::StartCompetition() {
 #endif
 
   std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
-  uint64_t last_ds_sample_us = 0;
-  // The mode (ModeKey) of the last packet sent.
-  uint32_t last_ds_mode = 0;
-  // Observe every hardware tick, including transitions between DS packets.
-  // Real and desktop Driver Stations are both read back through WPILib, by
-  // the reader's thread.
-  talos::driver_station::ModeTracker ds_mode;
+  // This tick's Driver Station packet, when one is due.
+  talos::driver_station::DriverStationData ds_packet{};
+  // Observes every hardware tick, including transitions between DS packets,
+  // and decides and stamps each packet (DriverStationSampler.h). Real and
+  // desktop Driver Stations are both read back through WPILib, by the
+  // reader's thread.
+  talos::rio::DriverStationSampler ds_sampler;
 
   // Posts the loop's findings no State carries to the logger (LoopConsole.h).
   talos::rio::LoopConsole loop_console{*log_};
@@ -410,7 +416,7 @@ void Robot::StartCompetition() {
     const talos::driver_station::DriverStationData& driver_station_view =
         driver_station.Read(now_us, gateway_->config().command_timeout_us);
     const uint32_t mode_flags = driver_station_view.fms.flags;
-    ds_mode.Observe(mode_flags, now_us);
+    ds_sampler.Observe(mode_flags, now_us);
     log_->ClosePhase(TickPhase::kDriverStation, NowNs());
     auto open_status = talos::protocol::UdpStatus::kOk;
     int open_errno = 0;
@@ -451,7 +457,7 @@ void Robot::StartCompetition() {
       std::snprintf(
           text, sizeof(text),
           "hardware gateway socket replaced after %u failed attempts, %.3f s "
-          "after it could not send",
+          "after it was lost",
           static_cast<unsigned>(socket_retry.failures()),
           static_cast<double>(now_us - socket_retry.lost_us()) / 1e6);
       Report(*log_, kSocketReplacedMessage, text);
@@ -466,16 +472,15 @@ void Robot::StartCompetition() {
     // a second).
     const auto sent = [&](talos::protocol::UdpStatus status) {
       using SendEvent = talos::rio::SocketRetry::SendEvent;
-      SendEvent event = SendEvent::kNone;
-      if (status == talos::protocol::UdpStatus::kOk) {
-        event = socket_retry.SendSucceeded(now_us);
-      } else if (status == talos::protocol::UdpStatus::kSocketError) {
-        event = socket_retry.SendFailed(now_us,
-                                        endpoint_->udp_stats().last_send_error);
-      }
+      const SendEvent event = socket_retry.ObserveSend(
+          now_us, status, endpoint_->udp_stats().last_send_error);
       char text[160];
       switch (event) {
         case SendEvent::kNone:
+          return;
+        case SendEvent::kWouldBlock:
+          loop_console.ObserveSendWouldBlock(
+              endpoint_->udp_stats().send_would_block);
           return;
         case SendEvent::kLost:
           std::snprintf(text, sizeof(text),
@@ -515,11 +520,35 @@ void Robot::StartCompetition() {
       }
     };
     if (socket_retry.open()) {
+      const bool enabled =
+          (mode_flags & talos::driver_station::kEnabled) != 0 &&
+          (mode_flags & talos::driver_station::kEStop) == 0;
+      // Pre-arm the watchdog before Endpoint::Tick() when enabled with no
+      // active command so a stall inside the first Apply()/ApplyOutputs()
+      // after enable, disable or recovery is still neutralized (REQ-SAFE-25).
+      if (const uint64_t pre_arm_us = talos::rio::WatchdogPreArmDeadlineUs(
+              now_us, enabled, gateway_->command_expiry_us(),
+              gateway_->config().command_timeout_us, period_us);
+          pre_arm_us != 0) {
+        watchdog_->Beat(now_us, pre_arm_us);
+      }
       // Endpoint handles clock probes even disabled/uncommissioned, echoing
       // only on a subsequent tick so its sample stamp follows probe receipt.
-      sent(endpoint_->Tick(
-          now_us, (mode_flags & talos::driver_station::kEnabled) != 0 &&
-                      (mode_flags & talos::driver_station::kEStop) == 0));
+      const auto tick_status = endpoint_->Tick(now_us, enabled);
+      // Permanent receive errors close the socket and schedule a 100 ms
+      // SocketRetry reopen; transient errors (ECONNREFUSED) keep it open.
+      socket_retry.ObserveReceive(now_us, endpoint_->last_receive_status(),
+                                  endpoint_->last_receive_error());
+      if (!socket_retry.open()) {
+        endpoint_->Close();
+        char text[160];
+        std::snprintf(text, sizeof(text),
+                      "hardware gateway socket cannot receive (errno %d); "
+                      "replacing it, nothing is sent until then",
+                      socket_retry.last_recv_error());
+        Report(*log_, kSocketLostMessage, text);
+      }
+      sent(tick_status);
       // The socket retry and the endpoint's tick.
       const uint64_t ticked_ns = NowNs();
       log_->ClosePhase(TickPhase::kLink, ticked_ns);
@@ -537,25 +566,14 @@ void Robot::StartCompetition() {
       // in the dispatch log downstream, for every real one. A new mode goes
       // out on the tick that observes it: an enabled switch (autonomous to
       // teleop) leaves the State unchanged, so until its generation arrives
-      // the old mode's target lanes still drive.
-      const uint32_t mode = talos::driver_station::ModeKey(mode_flags);
-      const bool sample_due =
-          now_us - last_ds_sample_us >= talos::driver_station::kSamplePeriodUs;
-      // Not on a socket the State send just lost: the replacement sends it.
-      if (socket_retry.open() && (mode != last_ds_mode || sample_due)) {
-        last_ds_sample_us = now_us;
-        last_ds_mode = mode;
-        // This tick's view, so the packet is one refresh's and agrees with
-        // ds_mode and the gateway's enable on the mode.
-        talos::driver_station::DriverStationData ds = driver_station_view;
-        ds.sample_time_us = now_us;
-        ds_mode.Stamp(ds);
-        // The same boot id as this program's State: a consumer orders
-        // packets within one boot and starts over on a new one.
-        ds.boot_id = boot_id;
+      // the old mode's target lanes still drive. Not on a socket the State
+      // send just lost: the replacement sends it.
+      if (ds_sampler.Sample(driver_station_view, now_us, boot_id,
+                            socket_retry.open(), ds_packet)) {
         // Encode() returns 0 if the payload will not fit; send nothing rather
         // than an empty frame the receiver would forward as a decode failure.
-        const auto ds_size = talos::driver_station::Encode(ds, ds_buffer);
+        const auto ds_size =
+            talos::driver_station::Encode(ds_packet, ds_buffer);
         log_->ClosePhase(TickPhase::kDriverStation, NowNs());
         if (ds_size) {
           const auto ds_status =
@@ -580,17 +598,20 @@ void Robot::StartCompetition() {
     }
 
     // A console line for each command expiry this tick found (no State
-    // reaches the main processor when its loss caused the expiry) and each
-    // changed configuration it refused while enabled.
+    // reaches the main processor when its loss caused the expiry), each
+    // changed configuration it refused while enabled, and any EAGAIN send drop
+    // (including one on an ACK send masked by a State kSocketError).
     loop_console.ObserveGateway(*gateway_);
+    loop_console.ObserveSendWouldBlock(endpoint_->udp_stats().send_would_block);
 
-    // Arms the watchdog only while a command is in force (a tick without one
-    // neutralized every output itself), with the time by which this loop's
-    // next tick would have invalidated it and beaten again: the gateway's
-    // expiry, plus one period for the tick that sees it and one more for that
-    // tick's own work before its beat, so an on-time loop is never acted on.
+    // Refines any pre-arm deadline to the accepted command's expiry plus two
+    // periods (one for the tick that sees it and one for that tick's own work
+    // before its beat), or disarms back to 0 when no command is in force (a
+    // tick without one neutralized every output itself), so an on-time loop is
+    // never acted on.
     const uint64_t expiry_us = gateway_->command_expiry_us();
-    watchdog_->Beat(now_us, expiry_us == 0 ? 0 : expiry_us + 2 * period_us);
+    watchdog_->Beat(now_us,
+                    talos::rio::WatchdogDeadlineUs(expiry_us, period_us));
     // A stall report the watchdog dropped is a stall with no Driver Station
     // error: the console says so.
     loop_console.ObserveWatchdog(*watchdog_);
@@ -630,20 +651,23 @@ void Robot::StartCompetition() {
     SleepUntilUs(next_us);
   }
 
-  // The loop no longer beats; the shutdown below neutralizes on its own.
-  watchdog_->Stop();
-  // Bounded: a reader inside a NetComm call that does not return is
-  // abandoned, not waited for.
-  driver_station.Stop();
-
-  // A configure still running on the backend's worker (the boot restore or a
-  // push) owns the devices; neutralizing them now would race it. Poll it to
-  // completion disabled, then neutralize what it built.
-  while (gateway_->configuring()) {
-    gateway_->Tick(NowUs(), false);
-    std::this_thread::sleep_for(std::chrono::milliseconds{5});
-  }
-  backend_->Neutral();
+  // Neutralize outputs immediately (unless a background configure currently
+  // owns the devices) BEFORE stopping the watchdog and Driver Station reader
+  // (whose teardown can block 100+ ms on NetComm), then poll any in-flight
+  // configure to completion disabled and neutralize what it built.
+  // Concurrency invariant for the pre-stop backend_->Neutral(): while
+  // !gateway_->configuring(), device lists are immutable; WatchdogNeutral()
+  // takes try_to_lock(devices_mutex_) and calls only thread-safe device
+  // handles (per-device Phoenix control lock, thread-safe HAL DIO/PWM writes)
+  // without touching Neutral()'s loop-thread bookkeeping or log_, and
+  // Neutral() never locks devices_mutex_, so the two cannot race or deadlock.
+  talos::rio::ShutdownRioLoop(
+      [&] { return gateway_->configuring(); }, [&] { backend_->Neutral(); },
+      [&] { watchdog_->Stop(); }, [&] { driver_station.Stop(); },
+      [&] {
+        gateway_->Tick(NowUs(), false);
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+      });
 
   // Only after the outputs are neutral: a save handed over finishes first
   // (the file stays whole either way), and its wait must not hold them. One

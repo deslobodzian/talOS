@@ -47,6 +47,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -104,10 +105,25 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
+// Reads a file (including /proc/<pid>/stat) without throwing if the file or
+// process disappears mid-read (ENOENT or ESRCH on Linux).
 std::string ReadFile(const std::string& path) {
-  std::ifstream in{path};
-  return std::string((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return {};
+  std::string out;
+  char buf[512];
+  for (;;) {
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    if (n > 0) {
+      out.append(buf, static_cast<std::size_t>(n));
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0) out.clear();
+    break;
+  }
+  ::close(fd);
+  return out;
 }
 
 // Whether the registry's shared-memory name is namespaced, decided by the
@@ -156,14 +172,16 @@ std::string WriteStub(const std::string& member, bool ignore_termination) {
 std::vector<pid_t> GroupMembers(pid_t group) {
   std::vector<pid_t> members;
 #ifdef __linux__
-  for (const auto& entry : std::filesystem::directory_iterator{"/proc"}) {
-    const std::string name = entry.path().filename().string();
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it{"/proc", ec}, end;
+       !ec && it != end; it.increment(ec)) {
+    const std::string name = it->path().filename().string();
     if (name.empty() || !std::all_of(name.begin(), name.end(), [](char c) {
           return c >= '0' && c <= '9';
         }))
       continue;
     // "pid (comm) state ppid pgrp ...": comm may hold spaces and parentheses.
-    const std::string stat = ReadFile(entry.path().string() + "/stat");
+    const std::string stat = ReadFile(it->path().string() + "/stat");
     const std::size_t close = stat.rfind(')');
     if (close == std::string::npos) continue;
     std::istringstream fields{stat.substr(close + 1)};
@@ -551,6 +569,30 @@ void ExpectGroupsDieWithTheLauncher(bool ignore_termination) {
             << " us after the launcher's SIGKILL\n";
 }
 
+#ifdef __linux__
+// When invoked as a child stub by SpawnedChildCarriesSigkillParentDeathSignal,
+// query PR_GET_PDEATHSIG before gtest_main starts, record "<rc> <sig>\n" to
+// TALOS_PDEATHSIG_PROBE_OUT, and exit 0. PR_SET_PDEATHSIG survives exec.
+[[gnu::constructor]] void MaybeReportPdeathsig() {
+  const char* const out_path = std::getenv("TALOS_PDEATHSIG_PROBE_OUT");
+  if (out_path == nullptr || out_path[0] == '\0') return;
+  int sig = -1;
+  const int rc = ::prctl(PR_GET_PDEATHSIG, &sig);
+  const int fd =
+      ::open(out_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd >= 0) {
+    char buf[64];
+    const int n = std::snprintf(buf, sizeof(buf), "%d %d\n", rc, sig);
+    if (n > 0) {
+      [[maybe_unused]] const ssize_t wrote =
+          ::write(fd, buf, static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+  }
+  ::_exit(0);
+}
+#endif
+
 // REQ-SAFE-30
 // The launcher is SIGKILLed while it supervises the hardware bridge's slot and
 // two subsystems, each of which has forked a grandchild into its group: every
@@ -566,5 +608,108 @@ TEST(LauncherDeathTest, EveryGroupDiesWithTheLauncher) {
 TEST(LauncherDeathTest, GroupsThatIgnoreTerminationDieWithTheLauncher) {
   ExpectGroupsDieWithTheLauncher(/*ignore_termination=*/true);
 }
+
+#ifdef __linux__
+// REQ-SAFE-30
+// On Linux, the launcher sets PR_SET_PDEATHSIG(SIGKILL) on each spawned child
+// before exec; a spawned child stub that queries PR_GET_PDEATHSIG directly must
+// observe SIGKILL.
+TEST(LauncherDeathTest, SpawnedChildCarriesSigkillParentDeathSignal) {
+  const std::string launcher = Runfile("TALOS_LAUNCHER");
+  ASSERT_FALSE(launcher.empty()) << "TALOS_LAUNCHER runfile unavailable";
+  const std::string self_exe =
+      std::filesystem::read_symlink("/proc/self/exe").string();
+  const std::string out_path = TempPath("pdeathsig_out");
+  const std::string config_path = TempPath("pdeathsig_robot") + ".toml";
+  const std::string output_dir = TempPath("pdeathsig_sessions");
+  const std::string log_path = TempPath("pdeathsig_launcher") + ".log";
+  ::remove(out_path.c_str());
+  std::filesystem::remove_all(output_dir);
+
+  const auto write_stub = [&](const std::string& member,
+                              const std::string& body) {
+    const std::string path = TempPath("pdeathsig_" + member) + ".sh";
+    talos::introspect::Description description;
+    description.name = member;
+    description.target = member == "hardware_node"
+                             ? "//talOS/bridge:hardware_node"
+                             : "//example/" + member + ":node";
+    std::ostringstream out;
+    out << "#!/bin/sh\n"
+        << "for arg in \"$@\"; do\n"
+        << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+        << "    cat <<'TALOS_DESCRIBE'\n"
+        << talos::introspect::DescribeToJson(description) << "TALOS_DESCRIBE\n"
+        << "    exit 0\n"
+        << "  fi\n"
+        << "done\n"
+        << body;
+    return talos::launcher::testing::WriteWarmStub(path, out.str());
+  };
+
+  const std::string hw_stub = write_stub("hardware_node", "exit 0\n");
+  const std::string alpha_stub =
+      write_stub("alpha", "TALOS_PDEATHSIG_PROBE_OUT='" + out_path +
+                              "' exec '" + self_exe + "'\n");
+  std::ofstream{config_path} << "[robot]\n"
+                             << "name = \"pdeathsig_fixture\"\n"
+                             << "period_us = 5000\n"
+                             << "hardware_node = \"" << hw_stub << "\"\n\n"
+                             << "[subsystems.alpha]\n"
+                             << "node = \"" << alpha_stub << "\"\n"
+                             << "period_us = 5000\n\n"
+                             << "[subsystems.alpha.motors.m1]\n"
+                             << "type = \"TalonFX\"\n"
+                             << "bus = \"rio\"\n"
+                             << "can_id = 1\n";
+
+  std::vector<std::string> args{
+      launcher,   "--config",       config_path, "--output-dir",
+      output_dir, "--max-restarts", "0",         "--heartbeat-startup-grace-ms",
+      "60000"};
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (auto& arg : args) argv.push_back(arg.data());
+  argv.push_back(nullptr);
+
+  std::cout.flush();
+  std::fflush(nullptr);
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0) << std::strerror(errno);
+  if (pid == 0) {
+    const int log =
+        ::open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log < 0 || ::dup2(log, STDOUT_FILENO) < 0 ||
+        ::dup2(log, STDERR_FILENO) < 0)
+      ::_exit(100);
+    if (log > STDERR_FILENO) ::close(log);
+    ::execv(argv[0], argv.data());
+    ::_exit(101);
+  }
+
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  const std::string reported = ReadFile(out_path);
+  const std::string launcher_log = ReadFile(log_path);
+  std::filesystem::remove_all(output_dir);
+  ::remove(out_path.c_str());
+  ::remove(config_path.c_str());
+  ::remove(log_path.c_str());
+  if (Namespaced()) talos::introspect::RegistryMapping::unlink();
+
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "launcher exited with status " << status << "\n"
+      << launcher_log;
+  int rc = -1;
+  int sig = -1;
+  std::istringstream in{reported};
+  ASSERT_TRUE(static_cast<bool>(in >> rc >> sig))
+      << "missing pdeathsig report; got '" << reported << "'\n"
+      << launcher_log;
+  EXPECT_EQ(rc, 0);
+  EXPECT_EQ(sig, SIGKILL);
+}
+#endif
 
 }  // namespace

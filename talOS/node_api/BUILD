@@ -4,7 +4,15 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_shared_node")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
+
+exports_files(
+    [
+        "node_api.cc",
+        "node_api.h",
+    ],
+    visibility = ["//talOS/python:__pkg__"],
+)
 
 cc_library(
     name = "internal",
@@ -31,14 +39,17 @@ cc_library(
         "node_api.cc",
     ],
     hdrs = ["node_api.h"],
+    visibility = ["//talOS:__subpackages__"],
     deps = [
         ":internal",
         "//talOS/devices",
+        "//talOS/devices:access",
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/mechanisms",
         "//talOS/msgs:control",
         "//talOS/node",
+        "//talOS/node:access",
     ],
     # Every exported symbol must reach the shared objects below, even though
     # nothing in them references them.
@@ -50,6 +61,7 @@ cc_library(
     name = "node_api_testing",
     testonly = True,
     srcs = ["node_api_testing.cc"],
+    visibility = ["//talOS:__subpackages__"],
     deps = [
         ":internal",
         ":node_api",
@@ -89,6 +101,7 @@ cc_shared_library(
     ],
     features = ["set_soname"],
     shared_lib_name = "libtalos_node.so",
+    visibility = ["//visibility:public"],
     deps = [
         ":node_api",
         "//talOS/devices",
@@ -115,6 +128,7 @@ cc_shared_library(
     dynamic_deps = [":libtalos_node.so"],
     features = ["set_soname"],
     shared_lib_name = "libtalos_node_testing.so",
+    visibility = ["//talOS:__subpackages__"],
     deps = [":node_api_testing"],
 )
 
@@ -128,6 +142,17 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "safety_abi_test",
+    size = "small",
+    srcs = ["safety_abi_test.cc"],
+    deps = [
+        ":node_api_testing",
+        "//talOS/hardware",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # An exported C++ node for cpp_node_test.
 talos_cc_shared_node(
     name = "libframework_probe.so",
@@ -136,6 +161,23 @@ talos_cc_shared_node(
     deps = [
         "//talOS/devices",
         "//talOS/hardware",
+        "//talOS/node:access",
+    ],
+)
+
+# Exported C++ twin nodes for //talOS/python:differential_parity_test (lives in
+# talOS/node_api so talOS/python reaches talOS only through talOS/node_api).
+talos_cc_shared_node(
+    name = "libdifferential_parity_nodes.so",
+    testonly = True,
+    srcs = ["testdata/differential_parity_nodes.cc"],
+    visibility = ["//talOS/python:__pkg__"],
+    deps = [
+        "//talOS/devices",
+        "//talOS/mechanisms",
+        "//talOS/msgs:control",
+        "//talOS/msgs:geometry",
+        "//talOS/python:test_messages",
     ],
 )
 
@@ -148,11 +190,15 @@ py_test(
     size = "small",
     srcs = ["cpp_node_test.py"],
     data = [
+        "BUILD",
         ":libframework_probe.so",
         ":libtalos_node.so",
+        "//talOS/build:contract.bzl",
     ],
     env = {
+        "TALOS_CONTRACT_BZL": "$(rlocationpath //talOS/build:contract.bzl)",
         "TALOS_FRAMEWORK_LIB": "$(rlocationpath :libtalos_node.so)",
+        "TALOS_NODE_API_BUILD": "$(rlocationpath BUILD)",
         "TALOS_PROBE_LIB": "$(rlocationpath :libframework_probe.so)",
     },
     legacy_create_init = False,

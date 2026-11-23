@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -45,6 +47,17 @@ TEST(MetricsTest, JitterIgnoresConstantVelocityAndSkipsGaps) {
   const auto jitter = SecondDifferenceJitter<1>(track);
   EXPECT_EQ(jitter.samples, 4u);
   EXPECT_DOUBLE_EQ(jitter.rms_per_axis, 2.0);
+}
+
+TEST(MetricsTest, QuantileFiltersNaNElementsAndRejectsNonFiniteQ) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  EXPECT_DOUBLE_EQ(Quantile({nan, 3.0, nan, 1.0, 2.0}, 0.5), 2.0);
+  EXPECT_DOUBLE_EQ(Quantile({nan, 10.0, nan}, 0.5), 10.0);
+  EXPECT_TRUE(std::isnan(Quantile({nan, nan}, 0.5)));
+  EXPECT_TRUE(std::isnan(Quantile({1.0, 2.0, 3.0}, nan)));
+  EXPECT_TRUE(std::isnan(Quantile({1.0, 2.0, 3.0}, inf)));
+  EXPECT_TRUE(std::isnan(Quantile({1.0, 2.0, 3.0}, -inf)));
 }
 
 }  // namespace

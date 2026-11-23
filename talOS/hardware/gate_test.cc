@@ -23,30 +23,38 @@ State TestState() {
   return state;
 }
 
+// REQ-SAFE-11
 TEST(GateTest, AcceptStateRejectsOtherConfigAndStaleSamplesOfOneBoot) {
   const State prev = TestState();
   // The first sample is gated on the config id only; zero accepts any.
-  EXPECT_TRUE(AcceptState(false, State{}, 7, prev));
-  EXPECT_TRUE(AcceptState(false, State{}, 0, prev));
-  EXPECT_FALSE(AcceptState(false, State{}, 99, prev));
+  EXPECT_TRUE(AcceptState(false, State{}, 7, prev, /*boot_retired=*/false));
+  EXPECT_TRUE(AcceptState(false, State{}, 0, prev, /*boot_retired=*/false));
+  EXPECT_FALSE(AcceptState(false, State{}, 99, prev, /*boot_retired=*/false));
 
   State other_config = TestState();
   other_config.config_id = 8;
   other_config.sample_time_us = 2000;
-  EXPECT_FALSE(AcceptState(true, prev, 7, other_config));
-  EXPECT_TRUE(AcceptState(true, prev, 0, other_config));
+  EXPECT_FALSE(
+      AcceptState(true, prev, 7, other_config, /*boot_retired=*/false));
+  EXPECT_TRUE(AcceptState(true, prev, 0, other_config, /*boot_retired=*/false));
 
   State older = TestState();
   older.sample_time_us = 999;
-  EXPECT_FALSE(AcceptState(true, prev, 7, older));
+  EXPECT_FALSE(AcceptState(true, prev, 7, older, /*boot_retired=*/false));
   // Equal timestamps are duplicates, not new data.
-  EXPECT_FALSE(AcceptState(true, prev, 7, prev));
+  EXPECT_FALSE(AcceptState(true, prev, 7, prev, /*boot_retired=*/false));
   State newer = TestState();
   newer.sample_time_us = 1001;
-  EXPECT_TRUE(AcceptState(true, prev, 7, newer));
-  // A new boot restarts the clock.
+  EXPECT_TRUE(AcceptState(true, prev, 7, newer, /*boot_retired=*/false));
+  // A new boot restarts the clock; a recently retired boot is ignored even
+  // with a newer timestamp and matching (or wildcard) config id.
   older.boot_id = 4;
-  EXPECT_TRUE(AcceptState(true, prev, 7, older));
+  EXPECT_TRUE(AcceptState(true, prev, 7, older, /*boot_retired=*/false));
+  State retired = TestState();
+  retired.boot_id = 2;
+  retired.sample_time_us = 2000;
+  EXPECT_FALSE(AcceptState(true, prev, 7, retired, /*boot_retired=*/true));
+  EXPECT_FALSE(AcceptState(true, prev, 0, retired, /*boot_retired=*/true));
 }
 
 // REQ-SAFE-22

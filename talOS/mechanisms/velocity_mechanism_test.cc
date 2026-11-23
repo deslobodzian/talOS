@@ -28,6 +28,14 @@
 #include "talOS/node/testing.h"
 
 namespace talos::mechanisms {
+namespace detail {
+double StepSpinDown(double goal_rps, double previous_rps, double max_rps,
+                    double spin_down_rps2, double dt_s);
+bool StepVelocityReadiness(bool was_at_speed, int& entry_ticks,
+                           double velocity_rps, double goal_rps,
+                           double entry_rps, double exit_rps,
+                           int entry_tick_count, bool velocity_recent);
+}  // namespace detail
 namespace {
 
 using namespace std::chrono_literals;
@@ -186,6 +194,30 @@ TEST_F(VelocityMechanismTest, ChangedGoalRestartsReadiness) {
   EXPECT_TRUE(flywheel().at_speed());
 }
 
+// Changing an out-of-range request that still clamps to the same goal_rps_
+// does not spuriously reset readiness; moving back inside range does.
+// REQ-SAFE-37
+TEST_F(VelocityMechanismTest, UnchangedClampedGoalKeepsReadiness) {
+  SetVelocity(80.0);
+  Drive(100.0, 20ms);
+  ASSERT_DOUBLE_EQ(flywheel().goal_rps(), 80.0);
+  ASSERT_TRUE(flywheel().at_speed());
+  Drive(120.0, 5ms);
+  EXPECT_DOUBLE_EQ(flywheel().goal_rps(), 80.0);
+  EXPECT_TRUE(flywheel().at_speed());
+  Drive(79.0, 5ms);
+  EXPECT_DOUBLE_EQ(flywheel().goal_rps(), 79.0);
+  EXPECT_FALSE(flywheel().at_speed());
+
+  SetVelocity(-80.0);
+  Drive(-100.0, 20ms);
+  ASSERT_DOUBLE_EQ(flywheel().goal_rps(), -80.0);
+  ASSERT_TRUE(flywheel().at_speed());
+  Drive(-120.0, 5ms);
+  EXPECT_DOUBLE_EQ(flywheel().goal_rps(), -80.0);
+  EXPECT_TRUE(flywheel().at_speed());
+}
+
 // A CAN gap freezes the flywheel's velocity: the gateway keeps reporting the
 // last value, in band, with a growing age, and keeps it valid until that age
 // reaches command_timeout_us (100 ms). at_speed must not ride on it: a
@@ -260,6 +292,46 @@ TEST_F(VelocityMechanismTest, SpinDownLimitsALiveDropButNotNeutral) {
   EXPECT_DOUBLE_EQ(flywheel().goal_rps(), 0.0);
   sim.step(110ms);  // stale
   ExpectNeutral();
+}
+
+// Negative dt during spin-down must never accelerate away from goal or past
+// +-max_rps, and a NaN velocity while at_speed must drop readiness immediately.
+// REQ-SAFE-37
+TEST(VelocityMechanismGuards, NegativeDtSpinDownAndNaNReadiness) {
+  // Positive speed winding down with negative dt must hold previous, not ramp
+  // up past max_rps.
+  EXPECT_DOUBLE_EQ(
+      detail::StepSpinDown(/*goal_rps=*/0.0, /*previous_rps=*/80.0,
+                           /*max_rps=*/80.0,
+                           /*spin_down_rps2=*/100.0, /*dt_s=*/-0.5),
+      80.0);
+  // Negative speed winding down with negative dt must hold previous, not ramp
+  // more negative past -max_rps.
+  EXPECT_DOUBLE_EQ(
+      detail::StepSpinDown(/*goal_rps=*/0.0,
+                           /*previous_rps=*/-80.0,
+                           /*max_rps=*/80.0,
+                           /*spin_down_rps2=*/100.0, /*dt_s=*/-0.5),
+      -80.0);
+  // Out-of-bounds previous command is clamped to [-max_rps, max_rps].
+  EXPECT_DOUBLE_EQ(detail::StepSpinDown(/*goal_rps=*/0.0,
+                                        /*previous_rps=*/120.0,
+                                        /*max_rps=*/80.0,
+                                        /*spin_down_rps2=*/100.0, /*dt_s=*/0.0),
+                   80.0);
+
+  // NaN or Inf velocity while latched at_speed drops readiness and resets
+  // entry_ticks.
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  for (const double bad_vel : {nan, inf, -inf}) {
+    int entry_ticks = 3;
+    EXPECT_FALSE(detail::StepVelocityReadiness(
+        /*was_at_speed=*/true, entry_ticks, bad_vel, /*goal_rps=*/60.0,
+        /*entry_rps=*/2.0, /*exit_rps=*/6.0, /*entry_tick_count=*/3,
+        /*velocity_recent=*/true));
+    EXPECT_EQ(entry_ticks, 0);
+  }
 }
 
 // Matrix case 2: while disabled the mechanism reports itself disabled,
@@ -356,6 +428,67 @@ TEST(VelocityMechanismRequest, RequestIsTiedToItsUpdate) {
   EXPECT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kNeutral);
 }
 
+// A request lasts one tick even where nothing else gates it: with
+// AllowUntargetedOutputs the devices flush does not neutralize a tick with no
+// target, so the mechanism alone must stop driving when the owner stops
+// asking.
+// REQ-SAFE-37
+TEST(VelocityMechanismRequest, OneRequestDrivesOneTick) {
+  struct OnceNode {
+    explicit OnceNode(Node& node) : flywheel{node, "flywheel"} {
+      AllowUntargetedOutputs(node);
+    }
+    void update() {
+      if (ask) flywheel.set_goal(60.0);
+      flywheel.update();
+    }
+    VelocityMechanism flywheel;
+    bool ask = true;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& node = sim.add<OnceNode>("shooter");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(10ms);
+  ASSERT_TRUE(node.flywheel.driving());
+  ASSERT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kVelocity);
+  node.ask = false;
+  sim.step(10ms);
+  EXPECT_FALSE(node.flywheel.driving());
+  EXPECT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kNeutral);
+}
+
+// The entry count is of consecutive ticks: one tick outside the entry band
+// starts it over, so two ticks before and two after are not three.
+// REQ-SAFE-37
+TEST_F(VelocityMechanismTest, EntryCountResetsWhenTheBandIsBroken) {
+  SetVelocity(59.0);
+  Drive(60.0, 5ms);  // in band
+  ASSERT_FALSE(flywheel().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 50.0);
+  Drive(60.0, 10ms);  // out of band
+  ASSERT_FALSE(flywheel().at_speed());
+  hw.set_motor("shooter", "flywheel", 0.0, 59.0);
+  Drive(60.0, 10ms);  // in band again, short of a full count
+  EXPECT_FALSE(flywheel().at_speed());
+  Drive(60.0, 10ms);
+  EXPECT_TRUE(flywheel().at_speed());
+}
+
+// A goal of 1e-3 rps or less is never at speed, even with the flywheel
+// exactly on it; just above that it can be.
+// REQ-SAFE-37
+TEST_F(VelocityMechanismTest, TinyGoalIsNeverAtSpeed) {
+  SetVelocity(0.001);
+  Drive(0.001, 40ms);
+  EXPECT_DOUBLE_EQ(Applied().demand, 0.001);
+  EXPECT_FALSE(flywheel().at_speed());
+  SetVelocity(0.002);
+  Drive(0.002, 40ms);
+  EXPECT_TRUE(flywheel().at_speed());
+}
+
 // REQ-RT-06
 TEST_F(VelocityMechanismTest, UpdateDoesNotAllocate) {
   if (const auto why = testing::AllocationProbe::Unsupported(); !why.empty()) {
@@ -389,9 +522,12 @@ can_id = 1
   const std::vector<std::pair<std::string, std::string>> bad{
       {"at_speed_entry_rps", "at_speed_entry_rps = 0.0\n"},
       {"at_speed_entry_rps", "at_speed_entry_rps = nan\n"},
+      {"at_speed_exit_frac", "at_speed_exit_frac = -0.1\n"},
       {"at_speed_exit_frac", "at_speed_exit_frac = 1.5\n"},
       {"at_speed_entry_tick_count", "at_speed_entry_tick_count = 0\n"},
       {"spin_down_rps2", "spin_down_rps2 = -1.0\n"},
+      {"slot", "slot = -1\n"},
+      {"slot", "slot = 3\n"},
   };
   for (const auto& [key, table] : bad) {
     SCOPED_TRACE(table);
@@ -399,7 +535,9 @@ can_id = 1
       add(table);
       ADD_FAILURE() << "constructed";
     } catch (const std::invalid_argument& e) {
-      EXPECT_NE(std::string{e.what()}.find(key), std::string::npos) << e.what();
+      EXPECT_NE(std::string{e.what()}.find("flywheel." + key),
+                std::string::npos)
+          << e.what();
     }
   }
 }

@@ -122,20 +122,23 @@ talos_sim(
     nodes = NODES,
 )
 
-# e2e: the robot runs against the simulator on free loopback ports until it
-# is up, then 1 s more: every member runs once and exits 0, and the bridge
-# receives State from the simulator (talos_sim_test,
-# talOS/build/contract.bzl). Takes its startup plus 1 s of real time.
+# e2e: the robot runs against the simulator (with Studio's bridge on an
+# ephemeral port) on free loopback ports until it is up and Studio's bridge
+# has settled, then 1 s more: every member runs once and exits 0, Studio's
+# bridge records a bound http_port, and the bridge receives State from the
+# simulator (talos_sim_test, talOS/build/contract.bzl). Takes its startup
+# plus ~2 s of real time.
 talos_sim_test(
     name = "sim_smoke_test",
     sim = ":sim",
+    studio = True,
 )
 
 # e2e: //:sim with --start-studio-bridge until the bridge is up; /drive
 # answers with the page when the talOS checkout built it, else how to build
 # it, and after the stop the bridge ran once and exited 0. About 2 s of real
-# time plus startup. Not a talos_sim_test: that check waits for every
-# member's registry row, and the Studio bridge takes none. no-sandbox: the
+# time plus startup. Not a talos_sim_test: this test also fetches /drive
+# over HTTP to verify //:studio_webroot wiring. no-sandbox: the
 # sandbox stages each file of //:studio_webroot as a link out of it, which
 # the bridge does not serve; outside it the webroot is linked whole, as
 # `bazel run //:sim` sees it.

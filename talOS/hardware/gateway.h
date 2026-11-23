@@ -12,10 +12,10 @@
 
 namespace talos::hardware {
 // Leaves no non-finite value in `state`'s configured samples, the gateway's
-// rule for every backend (Gateway::Tick, after Backend::Read) and
-// testing::SimHardware's for the State it publishes. A motor or CAN sensor
-// whose position or velocity is not finite is invalid (MarkInvalid); a
-// motor's non-finite voltage, current or temperature is 0 and does not by
+// rule for every backend (Gateway::Tick, after Backend::Read),
+// testing::SimHardware, and Encode(const State&, ...) (messages.h). A motor or
+// CAN sensor whose position or velocity is not finite is invalid (MarkInvalid);
+// a motor's non-finite voltage, current or temperature is 0 and does not by
 // itself change its validity; an analog input, encoder or PWM output sample
 // with one is invalid with 0; a non-finite battery voltage is 0 with the
 // health sample invalid; and a CAN bus slot with a non-finite utilization is
@@ -179,8 +179,9 @@ class Gateway {
   // Reconfigure clears the apply-failure latch.
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
   // The State to publish. Every invalid motor or CAN-sensor sample carries
-  // zero measurements (MarkInvalid); while unconfigured (configuring, or the
-  // last configure failed) every sample is invalid, since no Read ran.
+  // zero measurements (MarkInvalid), and no floating field is non-finite
+  // (ReplaceNonFinite); while unconfigured (configuring, or the last configure
+  // failed) every sample is invalid, since no Read ran.
   State snapshot() const;
   const Config& config() const { return config_; }
   bool configured() const { return configured_; }
@@ -224,7 +225,9 @@ class Gateway {
   }
   // Precise failure behind the last rejected configuration, if the
   // backend could say more than "it failed".
-  std::optional<ConfigError> config_error() const { return config_error_; }
+  const std::optional<ConfigError>& config_error() const {
+    return config_error_;
+  }
   uint32_t restore_attempt_count() const { return restore_attempt_count_; }
 
  private:
@@ -266,8 +269,8 @@ class Gateway {
   uint64_t restore_retry_at_{};
   bool configuring_{false};
   Config pending_config_;
-  std::vector<uint16_t> unavailable_;
-  std::vector<uint16_t> restoring_ids_;
+  FixedVector<uint16_t, kMaxMotors + kMaxSensors> unavailable_;
+  FixedVector<uint16_t, kMaxMotors + kMaxSensors> restoring_ids_;
   std::array<MotorRequest, kMaxMotors> last_requests_{};
   // Per motor, the earliest observation time a command may drive it on: one
   // past the last State in which it could not drive (MayDrive false), the

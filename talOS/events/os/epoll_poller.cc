@@ -184,7 +184,11 @@ MonotonicTime EpollPoller::now() {
 
 void EpollPoller::wake() {
   const std::uint64_t one = 1;
-  if (::write(wake_fd_, &one, sizeof(one)) == -1) {
+  ssize_t n;
+  do {
+    n = ::write(wake_fd_, &one, sizeof(one));
+  } while (n == -1 && errno == EINTR);
+  if (n == -1) {
     throw std::system_error(errno, std::generic_category(), "write eventfd");
   }
 }
@@ -228,7 +232,11 @@ void EpollPoller::arm_timer(MonotonicTime deadline) {
     // TFD_TIMER_ABSTIME is passed below, a deadline already in the past
     // makes the timer expire on the very next epoll_wait() instead of
     // blocking -- exactly the "past deadline returns immediately" contract.
-    spec.it_value = ToTimespec(deadline.nanos());
+    // A non-positive deadline would either disarm the timer ({0, 0}) or fail
+    // with EINVAL (negative timespec), so clamp it to 1 ns (earliest valid
+    // absolute time, always in the past).
+    spec.it_value =
+        deadline.nanos() <= 0 ? timespec{0, 1} : ToTimespec(deadline.nanos());
   }
 
   if (::timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &spec, nullptr) == -1) {
@@ -247,12 +255,18 @@ int EpollPoller::wait_for_events(MonotonicTime deadline, epoll_event* events) {
     timespec timeout{};
     const timespec* timeout_ptr = nullptr;
     if (deadline != MonotonicTime::max()) {
-      timeout =
-          ToTimespec(std::max<std::int64_t>(0, (deadline - now()).count()));
+      const MonotonicTime current = now();
+      const std::int64_t remaining =
+          deadline <= current ? 0 : (deadline - current).count();
+      timeout = ToTimespec(remaining);
       timeout_ptr = &timeout;
     }
     const int n = pwait2_(epoll_fd_, events, kMaxEvents, timeout_ptr);
-    if (n >= 0) return n;
+    if (n > 0) return n;
+    if (n == 0) {
+      if (now() >= deadline) return 0;
+      continue;
+    }
     const int error = errno;
     if (error == EINTR) continue;
     if (error != ENOSYS && error != EPERM) {

@@ -108,8 +108,11 @@ PYTHON_EXEMPT = {12: "a Python tick allocates in the interpreter"}
 CELL = {"present": "ok", "n/a": "na", "parity": "pa",
         "missing": "MISSING"}
 
-NODE_RULE = re.compile(r"^\s*talos_(cc|py|cc_shared)_node\(", re.MULTILINE)
-TESTONLY = re.compile(r"\btestonly\s*=\s*True\b")
+NODE_RULE_LANG = {
+    "talos_cc_node": "cpp",
+    "talos_py_node": "py",
+    "talos_cc_shared_node": "cpp",
+}
 NODES = re.compile(r"^NODES = \[(.*?)\]", re.MULTILINE | re.DOTALL)
 LABEL = re.compile(r'"//([^:"]*):[^"]*"')
 ACTUATORS = r"(?:Motor|DigitalOutput|PwmOutput)"
@@ -410,43 +413,39 @@ def package_sources(directory):
             and os.path.isfile(os.path.join(directory, f))]
 
 
-def own_arguments(text, start):
-    """The text of the call whose `(` ends at `start`, keeping only its own
-    level: string literals emptied, comments, nested calls, lists and
-    dicts dropped, so none of them passes for one of its arguments."""
-    kept, depth, i = [], 1, start
-    while i < len(text) and depth:
-        c = text[i]
-        if c in "\"'":
-            end = text.find(c, i + 1)
-            while end > 0 and text[end - 1] == "\\":
-                end = text.find(c, end + 1)
-            i = len(text) if end < 0 else end + 1
-            continue
-        if c == "#":
-            end = text.find("\n", i)
-            i = len(text) if end < 0 else end
-            continue
-        if c in "([{":
-            depth += 1
-        elif c in ")]}":
-            depth -= 1
-        elif depth == 1:
-            kept.append(c)
-        i += 1
-    return "".join(kept)
-
-
 def node_rules(directory):
     """[(language, testonly)] of the nodes `directory`'s BUILD file
-    declares."""
+    declares, parsed via AST (failing closed on SyntaxError)."""
     for build in ("BUILD", "BUILD.bazel"):
         path = os.path.join(directory, build)
         if os.path.isfile(path):
             text = read(path)
-            return [("py" if rule.group(1) == "py" else "cpp",
-                     bool(TESTONLY.search(own_arguments(text, rule.end()))))
-                    for rule in NODE_RULE.finditer(text)]
+            try:
+                tree = ast.parse(text, filename=path)
+            except SyntaxError as error:
+                raise MatrixError(
+                    f"{path}: cannot parse BUILD file: {error}") from error
+            aliases = dict(NODE_RULE_LANG)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and callee(node) == "load":
+                    for kw in node.keywords:
+                        if (kw.arg and isinstance(kw.value, ast.Constant)
+                                and kw.value.value in NODE_RULE_LANG):
+                            aliases[kw.arg] = NODE_RULE_LANG[kw.value.value]
+            rules = []
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                lang = aliases.get(callee(node))
+                if lang is None:
+                    continue
+                is_testonly = any(
+                    kw.arg == "testonly"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is True
+                    for kw in node.keywords)
+                rules.append((lang, is_testonly))
+            return rules
     return []
 
 
@@ -549,17 +548,26 @@ def main(argv):
     workspace = os.environ.get("BUILD_WORKSPACE_DIRECTORY", os.getcwd())
     try:
         found = targets(workspace, args.paths)
-        baseline = set()
-        if args.baseline:
-            baseline = read_baseline(read(os.path.join(workspace,
-                                                       args.baseline)))
     except FileNotFoundError as missing:
         print(f"check_node_matrix: no such file or directory: {missing}",
               file=sys.stderr)
         return 2
     except MatrixError as error:
-        print(f"check_node_matrix: {args.baseline}: {error}", file=sys.stderr)
+        print(f"check_node_matrix: {error}", file=sys.stderr)
         return 2
+    baseline = set()
+    if args.baseline:
+        try:
+            baseline = read_baseline(read(os.path.join(workspace,
+                                                       args.baseline)))
+        except FileNotFoundError as missing:
+            print(f"check_node_matrix: no such file or directory: {missing}",
+                  file=sys.stderr)
+            return 2
+        except MatrixError as error:
+            print(f"check_node_matrix: {args.baseline}: {error}",
+                  file=sys.stderr)
+            return 2
     failed = False
     missing, checked = set(), set()
     for path, role in found:

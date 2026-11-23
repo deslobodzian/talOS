@@ -73,7 +73,7 @@ class Source final : public CameraSource {
   }
   CameraMode CurrentMode() const override { return mode_; }
   bool SetMode(const CameraMode& mode) override {
-    if (running_) return false;
+    if (running_.load(std::memory_order_acquire)) return false;
     if (!mode.width || !mode.height || !std::isfinite(mode.fps) ||
         mode.fps <= 0 || mode.fps > 2147483.0)
       return false;
@@ -82,21 +82,38 @@ class Source final : public CameraSource {
   }
   CameraControls GetControls() const override { return controls_; }
   bool SetControls(const CameraControls& c) override {
-    if (running_) return false;
+    if (running_.load(std::memory_order_acquire)) return false;
     controls_ = c;
     return true;
   }
   void SetFrameCallback(FrameCallback cb) override {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
     callback_ = std::move(cb);
   }
   void SetConnectionCallback(ConnectionCallback cb) override {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
     connection_ = std::move(cb);
   }
-  bool IsRunning() const override { return running_; }
-  bool IsConnected() const override { return running_ && device_.connected; }
+  bool IsRunning() const override {
+    return running_.load(std::memory_order_acquire);
+  }
+  bool IsConnected() const override {
+    if (!running_.load(std::memory_order_acquire) ||
+        !connected_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    @autoreleasepool {
+      AVCaptureDevice* device = nil;
+      {
+        std::lock_guard<std::mutex> lock(device_mutex_);
+        device = device_;
+      }
+      return device != nil && device.connected;
+    }
+  }
   bool controls_applied() const override { return controls_applied_; }
   bool Start() override {
-    if (running_) return true;
+    if (running_.load(std::memory_order_acquire)) return true;
     @autoreleasepool {
       if (device_id_.empty()) {
         const auto devices = DiscoverCaptureDevices();
@@ -105,7 +122,12 @@ class Source final : public CameraSource {
                       "no camera at index " + std::to_string(id_));
         device_id_ = devices[id_].id;
       }
-      device_ = [AVCaptureDevice deviceWithUniqueID:@(device_id_.c_str())];
+      AVCaptureDevice* device =
+          [AVCaptureDevice deviceWithUniqueID:@(device_id_.c_str())];
+      {
+        std::lock_guard<std::mutex> lock(device_mutex_);
+        device_ = device;
+      }
       if (!device_)
         return Fail(ConnectionState::kDisconnected,
                     "no camera with uniqueID " + device_id_);
@@ -216,18 +238,19 @@ class Source final : public CameraSource {
       [session_ commitConfiguration];
       session_id_ = event::steady_now().nanos();
       sequence_ = 0;
-      running_ = true;
+      running_.store(true, std::memory_order_release);
       [session_ startRunning];
       if (!session_.running) {
-        running_ = false;
         return Fail(ConnectionState::kError, "Capture session did not start");
       }
-      if (connection_) connection_(ConnectionState::kConnected, "");
+      connected_.store(true, std::memory_order_release);
+      NotifyConnection(ConnectionState::kConnected, "");
       return true;
     }
   }
   void Stop() override {
-    running_ = false;
+    running_.store(false, std::memory_order_release);
+    connected_.store(false, std::memory_order_release);
     @autoreleasepool {
       [session_ stopRunning];
       [output_ setSampleBufferDelegate:nil queue:nullptr];
@@ -238,7 +261,10 @@ class Source final : public CameraSource {
       delegate_ = nil;
       output_ = nil;
       session_ = nil;
-      device_ = nil;
+      {
+        std::lock_guard<std::mutex> lock(device_mutex_);
+        device_ = nil;
+      }
       dispatch_ = nullptr;
     }
   }
@@ -246,17 +272,28 @@ class Source final : public CameraSource {
   uint64_t dropped_frames() const override { return dropped_frames_.load(); }
 
  private:
-  // Reports why Start failed and returns false.
+  void NotifyConnection(ConnectionState state, const std::string& message) {
+    ConnectionCallback cb;
+    {
+      std::lock_guard<std::mutex> lock(callback_mutex_);
+      cb = connection_;
+    }
+    if (cb) cb(state, message);
+  }
+  // Tears down any partially initialized capture state, reports why Start
+  // failed, and returns false.
   bool Fail(ConnectionState state, const std::string& message) {
-    if (connection_) connection_(state, device_id_ + ": " + message);
+    Stop();
+    NotifyConnection(state, device_id_ + ": " + message);
     return false;
   }
   static std::string Describe(NSError* error) {
-    return error ? std::string(error.localizedDescription.UTF8String)
-                 : std::string("unknown error");
+    if (!error) return "unknown error";
+    const char* desc = error.localizedDescription.UTF8String;
+    return desc ? std::string(desc) : std::string("unknown error");
   }
   void Receive(CMSampleBufferRef sample) {
-    if (!running_) return;
+    if (!running_.load(std::memory_order_acquire)) return;
     CVPixelBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
     if (!pixels ||
         CVPixelBufferLockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly) !=
@@ -298,19 +335,27 @@ class Source final : public CameraSource {
         frame.set_mapping_quality(TimestampMappingQuality::kInterpolated);
       }
     }
-    if (callback_) callback_(frame);
+    FrameCallback cb;
+    {
+      std::lock_guard<std::mutex> lock(callback_mutex_);
+      cb = callback_;
+    }
+    if (cb) cb(frame);
     CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
   }
   uint32_t id_;
   std::string device_id_;
   CameraMode mode_{1280, 720, 30, PixelFormat::kBgra8};
   CameraControls controls_{.auto_exposure = true, .auto_gain = true};
+  mutable std::mutex callback_mutex_;
   FrameCallback callback_;
   ConnectionCallback connection_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> connected_{false};
   std::atomic<uint64_t> dropped_frames_{0};
   bool controls_applied_{true};
   uint64_t session_id_ = 0, sequence_ = 0;
+  mutable std::mutex device_mutex_;
   AVCaptureDevice* device_ = nil;
   AVCaptureSession* session_ = nil;
   AVCaptureVideoDataOutput* output_ = nil;
@@ -329,9 +374,12 @@ std::vector<CaptureDevice> DiscoverCaptureDevices() {
             ]
                                   mediaType:AVMediaTypeVideo
                                    position:AVCaptureDevicePositionUnspecified];
-    for (AVCaptureDevice* device in discovery.devices)
-      result.push_back({device.uniqueID.UTF8String,
-                        device.localizedName.UTF8String, Modes(device)});
+    for (AVCaptureDevice* device in discovery.devices) {
+      const char* uid = device.uniqueID.UTF8String;
+      if (!uid) continue;
+      const char* name = device.localizedName.UTF8String;
+      result.push_back({uid, name ? name : "", Modes(device)});
+    }
     return result;
   }
 }
@@ -342,9 +390,14 @@ std::unique_ptr<CameraSource> CreateCaptureSource(uint32_t id,
 std::unique_ptr<CameraSource> CreatePlatformCameraSource(
     const CameraSourceConfig& config) {
   auto source = std::make_unique<Source>(config.camera_id, config.device_path);
-  source->SetControls({config.exposure_ms, config.gain, config.auto_exposure,
-                       config.auto_gain});
-  source->SetMode({config.width, config.height, config.fps, config.format});
+  if (!source->SetControls({config.exposure_ms, config.gain,
+                            config.auto_exposure, config.auto_gain})) {
+    return nullptr;
+  }
+  if (!source->SetMode(
+          {config.width, config.height, config.fps, config.format})) {
+    return nullptr;
+  }
   return source;
 }
 }  // namespace talos::vision

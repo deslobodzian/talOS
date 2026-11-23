@@ -14,6 +14,7 @@ cc_library(
     hdrs = ["swerve_module.h"],
     include_prefix = "swerve_module",
     strip_include_prefix = ".",
+    visibility = ["//bench/main_processor:__pkg__"],
     deps = [
         ":messages",
         "//talOS/devices",
@@ -39,7 +40,6 @@ cc_binary(
         ":messages",
         "//talOS/devices",
         "//talOS/driver_station",
-        "//talOS/events:events_os",
         "//talOS/hardware",
         "//talOS/introspection:names",
         "//talOS/ipc",
@@ -61,7 +61,7 @@ cc_test(
         "//talOS/devices:testing",
         "//talOS/node:allocation_probe",
         "//talOS/node:testing",
-        "//talOS/teleop",
+        "//talOS/teleop:testing",
         "@googletest//:gtest_main",
     ],
 )

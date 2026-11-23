@@ -35,6 +35,8 @@ bool EnsureSocketRuntime() {
 
 int LastSocketError() { return WSAGetLastError(); }
 
+void SetLastSocketError(int error) { WSASetLastError(error); }
+
 bool IsWouldBlockError(int error) {
   return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
 }
@@ -55,6 +57,8 @@ using NativeSocket = int;
 bool EnsureSocketRuntime() { return true; }
 
 int LastSocketError() { return errno; }
+
+void SetLastSocketError(int error) { errno = error; }
 
 bool IsWouldBlockError(int error) {
   return error == EAGAIN || error == EWOULDBLOCK || error == EINPROGRESS;
@@ -111,6 +115,8 @@ RuntimeUdpPeer::~RuntimeUdpPeer() { Close(); }
 RuntimeUdpPeer::RuntimeUdpPeer(RuntimeUdpPeer&& other) noexcept
     : socket_(std::exchange(other.socket_, kInvalidSocket)),
       next_send_sequence_(other.next_send_sequence_),
+      last_below_sequence_(other.last_below_sequence_),
+      below_ascending_count_(other.below_ascending_count_),
       stats_(other.stats_),
       tx_buffer_(other.tx_buffer_),
       rx_buffer_(other.rx_buffer_),
@@ -126,6 +132,8 @@ RuntimeUdpPeer& RuntimeUdpPeer::operator=(RuntimeUdpPeer&& other) noexcept {
     Close();
     socket_ = std::exchange(other.socket_, kInvalidSocket);
     next_send_sequence_ = other.next_send_sequence_;
+    last_below_sequence_ = other.last_below_sequence_;
+    below_ascending_count_ = other.below_ascending_count_;
     stats_ = other.stats_;
     tx_buffer_ = other.tx_buffer_;
     rx_buffer_ = other.rx_buffer_;
@@ -171,6 +179,8 @@ UdpStatus RuntimeUdpPeer::Open(const char* local_address, uint16_t local_port,
   }
   opened_ = true;
   next_send_sequence_ = 1;
+  last_below_sequence_ = 0;
+  below_ascending_count_ = 0;
   stats_ = {};
   return UdpStatus::kOk;
 }
@@ -193,7 +203,9 @@ UdpStatus RuntimeUdpPeer::OpenSocket() {
 
   const UdpStatus status = ConfigureSocket(options_);
   if (status != UdpStatus::kOk) {
+    const int error = LastSocketError();
     Close();
+    SetLastSocketError(error);
     return status;
   }
 
@@ -203,7 +215,9 @@ UdpStatus RuntimeUdpPeer::OpenSocket() {
   local.sin_port = local_port_;
   if (bind(ToNativeSocket(socket_), reinterpret_cast<const sockaddr*>(&local),
            sizeof(local)) != 0) {
+    const int error = LastSocketError();
     Close();
+    SetLastSocketError(error);
     return UdpStatus::kSocketError;
   }
 
@@ -218,6 +232,7 @@ UdpStatus RuntimeUdpPeer::OpenSocket() {
       const int error = LastSocketError();
       if (!options_.non_blocking || !IsWouldBlockError(error)) {
         Close();
+        SetLastSocketError(error);
         return UdpStatus::kSocketError;
       }
     }
@@ -288,12 +303,16 @@ UdpStatus RuntimeUdpPeer::Send(std::size_t frame_size) {
                         reinterpret_cast<const char*>(tx_buffer_.data()),
                         static_cast<int>(frame_size), kSendFlags);
 #else
-  const ssize_t sent =
-      send(ToNativeSocket(socket_), tx_buffer_.data(), frame_size, kSendFlags);
+  ssize_t sent = -1;
+  do {
+    sent = ::send(ToNativeSocket(socket_), tx_buffer_.data(), frame_size,
+                  kSendFlags);
+  } while (sent < 0 && errno == EINTR);
 #endif
   if (sent < 0) {
     const int error = LastSocketError();
     if (IsWouldBlockError(error)) {
+      ++stats_.send_would_block;
       return UdpStatus::kWouldBlock;
     }
     stats_.last_send_error = error;
@@ -320,8 +339,11 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
       recv(ToNativeSocket(socket_), reinterpret_cast<char*>(rx_buffer_.data()),
            static_cast<int>(rx_buffer_.size()), 0);
 #else
-  const ssize_t received =
-      recv(ToNativeSocket(socket_), rx_buffer_.data(), rx_buffer_.size(), 0);
+  ssize_t received = -1;
+  do {
+    received = ::recv(ToNativeSocket(socket_), rx_buffer_.data(),
+                      rx_buffer_.size(), 0);
+  } while (received < 0 && errno == EINTR);
 #endif
   if (received < 0) {
     const int error = LastSocketError();
@@ -329,6 +351,7 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
       ++stats_.receive_would_block;
       return UdpStatus::kWouldBlock;
     }
+    stats_.last_recv_error = error;
     return UdpStatus::kSocketError;
   }
 
@@ -345,11 +368,43 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
     return UdpStatus::kDecodeError;
   }
 
-  if (stats_.last_received_sequence != 0 &&
-      decoded.header.sequence != stats_.last_received_sequence + 1) {
-    ++stats_.sequence_gaps;
+  constexpr uint64_t kReorderWindow = 64;
+  constexpr uint8_t kRestartAscendingSteps = 2;
+  const uint64_t seq = decoded.header.sequence;
+  const bool below_last = seq > 0 && seq < stats_.last_received_sequence;
+  const bool long_run_restart =
+      below_last && stats_.last_received_sequence - seq > kReorderWindow;
+  const bool short_run_restart =
+      below_last && last_below_sequence_ != 0 && seq > last_below_sequence_ &&
+      below_ascending_count_ + 1 >= kRestartAscendingSteps;
+  if (stats_.last_received_sequence == 0 || long_run_restart ||
+      short_run_restart) {
+    // First frame, or peer restarted and reset its send sequence (large
+    // backward jump after a long run, or three ascending frames below
+    // last_received_sequence after a short run): re-baseline so subsequent
+    // packet loss is still counted in sequence_gaps.
+    stats_.last_received_sequence = seq;
+    last_below_sequence_ = 0;
+    below_ascending_count_ = 0;
+  } else if (seq > stats_.last_received_sequence) {
+    stats_.sequence_gaps += seq - stats_.last_received_sequence - 1;
+    stats_.last_received_sequence = seq;
+    last_below_sequence_ = 0;
+    below_ascending_count_ = 0;
+  } else {
+    ++stats_.out_of_order_frames;
+    if (below_last) {
+      if (last_below_sequence_ != 0 && seq > last_below_sequence_) {
+        ++below_ascending_count_;
+      } else {
+        below_ascending_count_ = 0;
+      }
+      last_below_sequence_ = seq;
+    } else {
+      last_below_sequence_ = 0;
+      below_ascending_count_ = 0;
+    }
   }
-  stats_.last_received_sequence = decoded.header.sequence;
   ++stats_.received_frames;
   stats_.received_bytes += received_size;
   *out = decoded;
@@ -403,8 +458,8 @@ UdpStatus RuntimeUdpPeer::ConfigureSocket(const UdpSocketOptions& options) {
 
 // Shut down for writing, or marked defunct by macOS (EPIPE; seen after sleep
 // and wake); no longer connected (ENOTCONN, EDESTADDRREQ); no socket at all
-// (EBADF); or its source address gone from the host. connect() fixed that
-// source, and every later send on the socket uses it, so the socket stays
+// (EBADF, ENOTSOCK); or its source address gone from the host. connect() fixed
+// that source, and every later send on the socket uses it, so the socket stays
 // broken even once the host has a new address on the same network; a new
 // socket's connect picks the current one. Linux reports a gone source as
 // ENETUNREACH (its route lookup for a source that is not local fails so),
@@ -431,7 +486,19 @@ bool SendErrorNeedsNewSocket(int error) {
          error == WSAENETUNREACH || error == WSAENOTSOCK;
 #else
   return error == EPIPE || error == ENOTCONN || error == EDESTADDRREQ ||
-         error == EADDRNOTAVAIL || error == ENETUNREACH || error == EBADF;
+         error == EADDRNOTAVAIL || error == ENETUNREACH || error == EBADF ||
+         error == ENOTSOCK;
+#endif
+}
+
+bool ReceiveErrorNeedsNewSocket(int error) noexcept {
+#if defined(_WIN32)
+  return error == WSAEBADF || error == WSAENOTCONN || error == WSAENOTSOCK ||
+         error == WSAESHUTDOWN || error == WSAENETUNREACH ||
+         error == WSAEADDRNOTAVAIL;
+#else
+  return error == EBADF || error == ENOTCONN || error == ENOTSOCK ||
+         error == EPIPE || error == ENETUNREACH || error == EADDRNOTAVAIL;
 #endif
 }
 

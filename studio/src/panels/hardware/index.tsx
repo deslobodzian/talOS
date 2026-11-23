@@ -13,7 +13,7 @@
 
 import {useMemo} from 'react';
 
-import {useDictionary, useSeries, useSnapshot} from '../../data/hooks';
+import {useDictionary, useRecorded, useSeries, useSnapshot, useSystem} from '../../data/hooks';
 import {canBuses, canBusReading, canBusUnread, type CanBus} from '../../data/robot';
 import {durationUs, integer} from '../../ui/formatters';
 import {DataTable, type Column} from '../../ui/DataTable';
@@ -37,6 +37,7 @@ const defaultConfig: HardwareConfig = {};
 const parseConfig = (_raw: unknown): HardwareConfig => ({});
 
 const HW = 'hw/status/';
+const EMPTY = new Float64Array(0);
 
 // The counter tallies the bridge and gateway publish on /hw/status, in the
 // order a person cares about them. Explanations come from the bridge_status
@@ -99,6 +100,36 @@ const COUNTERS: CounterSpec[] = [
     label: 'Device resets',
     note: 'Device resets detected since the bridge started; the gateway ' +
         'neutralizes and re-configures after each.'
+  },
+  {
+    name: 'socket_send_failures_count',
+    label: 'Socket send failures',
+    note: 'Failed UDP sends on the bridge→RoboRIO socket since the bridge ' +
+        'started.'
+  },
+  {
+    name: 'socket_reopens_count',
+    label: 'Socket reopens',
+    note: 'Times the bridge closed and reopened its UDP socket after a ' +
+        'permanent send or receive error.'
+  },
+  {
+    name: 'state_sequence_gaps_count',
+    label: 'State sequence gaps',
+    note: 'Missed UDP frame sequence numbers detected on incoming gateway ' +
+        'datagrams.'
+  },
+  {
+    name: 'state_decode_failures_count',
+    label: 'State decode failures',
+    note: 'Incoming UDP frames that failed frame decoding (corrupt or ' +
+        'mismatched protocol).'
+  },
+  {
+    name: 'socket_send_would_block_count',
+    label: 'Socket send would-block',
+    note: 'Outbound UDP sends dropped because the nonblocking socket send ' +
+        'buffer was full.'
   }
 ];
 
@@ -183,6 +214,9 @@ function CanBusTable({buses}: {buses: CanBus[]}) {
 function HardwarePanel() {
   const snapshot = useSnapshot();
   const dictionary = useDictionary();
+  const system = useSystem();
+  const recorded = useRecorded();
+  const busNames = recorded ? recorded.declared?.can_buses : system.declared?.can_buses;
 
   const ch = snapshot?.channels ?? {};
   const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
@@ -192,16 +226,24 @@ function HardwarePanel() {
     return v === undefined ? undefined : v !== 0;
   };
 
-  const buses = canBuses(ch);
+  const buses = canBuses(ch, busNames);
   const busCount = num('can_bus_count');
   const busChannels = useMemo(() => canBusSeriesChannels(busCount), [busCount]);
-  const power = useSeries(
-      [`${HW}battery_v`, `${HW}brownout`, ...busChannels], {seconds: 120});
-  const age = useSeries([`${HW}state_age_us`], {seconds: 120});
-  const masks = useSeries(
-      [`${HW}timed_out_mask`, `${HW}motor_fault_mask`,
-       `${HW}motor_forward_limit_mask`, `${HW}motor_reverse_limit_mask`],
-      'all');
+  const powerChannels = useMemo(
+      () => [`${HW}battery_v`, `${HW}brownout`, ...busChannels]
+          .filter(name => present.has(name)),
+      [busChannels, present]);
+  const power = useSeries(powerChannels, {seconds: 120});
+  const ageChannels = useMemo(
+      () => [`${HW}state_age_us`].filter(name => present.has(name)),
+      [present]);
+  const age = useSeries(ageChannels, {seconds: 120});
+  const maskChannels = useMemo(
+      () => [`${HW}timed_out_mask`, `${HW}motor_fault_mask`,
+             `${HW}motor_forward_limit_mask`, `${HW}motor_reverse_limit_mask`]
+          .filter(name => present.has(name)),
+      [present]);
+  const masks = useSeries(maskChannels, 'all');
 
   const counterNames = useMemo(
       () => COUNTERS.filter(c => present.has(`${HW}${c.name}`))
@@ -217,6 +259,10 @@ function HardwarePanel() {
   const stateAgeUs = num('state_age_us');
   const configured = flag('configured');
   const subsystemCount = num('subsystem_count');
+  const protocolVersion = num('protocol_version_id');
+  const mismatchedProtocol = num('mismatched_protocol_version_id');
+  const protocolMismatch = flag('alert_error_protocol_mismatch') === true ||
+      (mismatchedProtocol !== undefined && mismatchedProtocol !== 0);
   const timeoutUs = num('command_timeout_us');  // not published by the 2026 bridge
 
   const counterRows: CounterRow[] = useMemo(() => {
@@ -227,7 +273,8 @@ function HardwarePanel() {
         ...spec,
         total: count(ch[`${HW}${spec.name}`]),
         rate: rateString(counterRate(
-            counterSeries.times, counterSeries.values[`${HW}${spec.name}`]))
+            counterSeries.times,
+            counterSeries.values[`${HW}${spec.name}`] ?? EMPTY))
       });
     }
     return out;
@@ -242,26 +289,34 @@ function HardwarePanel() {
 
   const anyHardware = present.has(`${HW}battery_v`) ||
       present.has(`${HW}state_age_us`) || counterRows.length > 0 ||
-      present.has(`${HW}clock_offset_us`);
+      present.has(`${HW}clock_offset_us`) ||
+      present.has(`${HW}protocol_version_id`) ||
+      present.has(`${HW}mismatched_protocol_version_id`);
 
   if (!anyHardware) {
     return <div className="hardware">
       <EmptyState>
-        No /hw/status telemetry. Connect to a robot bridge, or start demo data
-        to explore the link and power views.
+        {recorded?.bounds.hardware_not_decoded ?
+            recorded.bounds.hardware_not_decoded :
+         recorded ?
+            'No /hw/status telemetry in this recorded session.' :
+            'No /hw/status telemetry. Connect to a robot bridge, or start demo data to explore the link and power views.'}
       </EmptyState>
     </div>;
   }
 
-  const brownoutBands = flagBands(power.times, power.values[`${HW}brownout`]);
-  const busLines = canBusLines(busCount, power);
+  const brownoutBands =
+      flagBands(power.times, power.values[`${HW}brownout`] ?? EMPTY);
+  const busLines = canBusLines(busCount, power, busNames);
   const timedOutBits = bitHistory(
-      masks.times, masks.values[`${HW}timed_out_mask`], subsystemCount ?? 32);
-  const faultBits = bitHistory(masks.times, masks.values[`${HW}motor_fault_mask`]);
+      masks.times, masks.values[`${HW}timed_out_mask`] ?? EMPTY,
+      subsystemCount ?? 32);
+  const faultBits = bitHistory(
+      masks.times, masks.values[`${HW}motor_fault_mask`] ?? EMPTY);
   const forwardLimitBits = bitHistory(
-      masks.times, masks.values[`${HW}motor_forward_limit_mask`]);
+      masks.times, masks.values[`${HW}motor_forward_limit_mask`] ?? EMPTY);
   const reverseLimitBits = bitHistory(
-      masks.times, masks.values[`${HW}motor_reverse_limit_mask`]);
+      masks.times, masks.values[`${HW}motor_reverse_limit_mask`] ?? EMPTY);
 
   return <div className="hardware">
     <FreshnessNotice prefix={HW}/>
@@ -280,7 +335,8 @@ function HardwarePanel() {
         <h3>Battery voltage · 2 min</h3>
         <TimeSeriesChart
             lines={[{name: 'battery_v', color: 'var(--accent)',
-                     times: power.times, values: power.values[`${HW}battery_v`]}]}
+                     times: power.times,
+                     values: power.values[`${HW}battery_v`] ?? EMPTY}]}
             bands={brownoutBands} height={96} legend={false}/>
         <p className="chart-note">Shaded spans are brownout ({
             brownout === undefined ? 'unknown' : brownout ? 'active' : 'clear'
@@ -309,7 +365,16 @@ function HardwarePanel() {
         <Stat label="Subsystems" channel={`${HW}subsystem_count`}>
           {subsystemCount === undefined ? '—' : integer(subsystemCount)}
         </Stat>
-        <Stat label="Protocol" channel={`${HW}protocol_version_id`}>{count(num('protocol_version_id'))}</Stat>
+        <Stat label="Protocol"
+              channel={protocolMismatch && present.has(`${HW}mismatched_protocol_version_id`) ?
+                  `${HW}mismatched_protocol_version_id` : `${HW}protocol_version_id`}
+              tone={protocolMismatch ? 'warn' : undefined}>
+          {protocolMismatch ?
+              (mismatchedProtocol !== undefined && mismatchedProtocol !== 0 ?
+                  `mismatch (expected ${count(protocolVersion)}, gateway ${integer(mismatchedProtocol)})` :
+                  `mismatch (expected ${count(protocolVersion)})`) :
+              count(protocolVersion)}
+        </Stat>
         <Stat label="State age" channel={`${HW}state_age_us`} tone={stateAgeUs !== undefined && stateAgeUs > 20000 ? 'warn' : undefined}>
           {micros(stateAgeUs)}
         </Stat>
@@ -318,7 +383,8 @@ function HardwarePanel() {
         <h3>State age · 2 min</h3>
         <TimeSeriesChart
             lines={[{name: 'state_age_us', color: 'var(--accent)',
-                     times: age.times, values: age.values[`${HW}state_age_us`]}]}
+                     times: age.times,
+                     values: age.values[`${HW}state_age_us`] ?? EMPTY}]}
             height={96} threshold={timeoutUs} legend={false}/>
         <p className="chart-note">
           {timeoutUs === undefined ?
@@ -392,5 +458,6 @@ export const hardwarePanel: PanelDefinition<HardwareConfig> = {
   description: 'Main-processor ↔ RoboRIO link, power, clock and counters.',
   defaultConfig,
   parseConfig,
-  component: HardwarePanel
+  component: HardwarePanel,
+  recorded: true
 };

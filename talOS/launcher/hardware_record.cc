@@ -11,7 +11,6 @@
 #include <system_error>
 #include <utility>
 
-#include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
@@ -23,6 +22,7 @@
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/protocol/types.h"
+#include "talOS/schema/field_path.h"
 #include "talOS/schema/identity.h"
 
 namespace talos::launcher {
@@ -512,30 +512,49 @@ std::optional<std::uint64_t> LogSessionId(const std::filesystem::path& path) {
 // of each segment, not the whole log.
 constexpr std::int64_t kBridgeStatusSearchNs = 1'000'000'000;
 
+constexpr std::string_view kProtocolVersionField = "protocol_version_id";
+
+bool IsIntegerScalar(reflection::BaseType type) {
+  using reflection::BaseType;
+  switch (type) {
+    case BaseType::Byte:
+    case BaseType::UByte:
+    case BaseType::Short:
+    case BaseType::UShort:
+    case BaseType::Int:
+    case BaseType::UInt:
+    case BaseType::Long:
+    case BaseType::ULong:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // The protocol_version_id of the first /hw/status SEND in the log at `path`,
-// when its manifest registers /hw/status as a sender of this build's
-// BridgeStatus schema (and, with `session`, its header has that session id)
-// and the SEND is within kBridgeStatusSearchNs of the log's first record;
-// nullopt otherwise, and for a log that will not open. Reads records only
-// of a log that registers such a sender, and only to that record or that
-// bound.
+// when its manifest registers /hw/status as a sender whose verified .bfbs
+// schema carries an integer scalar `protocol_version_id` field (and, with
+// `session`, its header has that session id) and the SEND is within
+// kBridgeStatusSearchNs of the log's first record; nullopt otherwise, and
+// for a log that will not open. Reads records only of a log that registers
+// such a sender, and only to that record or that bound.
 std::optional<std::uint16_t> FirstBridgeStatusVersion(
     const std::string& path, std::optional<std::uint64_t> session) {
-  using Status = ::bridge::BridgeStatus;
   try {
     event::log::WindowedLogReader reader{path};
     if (session && reader.session_id() != *session) return std::nullopt;
-    const schema::Identity expected = schema::Of<Status>();
     std::optional<std::uint16_t> id;
+    std::optional<ProtocolVersionField> version_field;
     for (const auto& source : reader.manifest()) {
       if (source.kind == event::SourceKind::SENDER &&
-          source.name == ::bridge::topics::kStatus &&
-          source.schema == expected) {
-        id = source.id;
+          source.name == ::bridge::topics::kStatus) {
+        version_field = ResolveProtocolVersionField(
+            source.schema.bfbs, source.schema.name, source.message_bytes);
+        if (version_field) id = source.id;
         break;
       }
     }
-    if (!id) return std::nullopt;
+    if (!id || !version_field) return std::nullopt;
     event::log::LogReader::Record record;
     std::optional<std::int64_t> first_ns;
     while (reader.next(record)) {
@@ -548,11 +567,7 @@ std::optional<std::uint16_t> FirstBridgeStatusVersion(
               static_cast<std::uint16_t>(event::EventKind::SEND)) {
         continue;
       }
-      if (record.payload.size() != sizeof(Status)) return std::nullopt;
-      Status status;
-      std::memcpy(&status, record.payload.data(), sizeof status);
-      if (status.protocol_version_id() == 0) return std::nullopt;
-      return status.protocol_version_id();
+      return ReadProtocolVersion(*version_field, record.payload);
     }
   } catch (const std::exception&) {
     // An unreadable bridge log records no version: the manifest's is used.
@@ -562,6 +577,67 @@ std::optional<std::uint16_t> FirstBridgeStatusVersion(
 }
 
 }  // namespace
+
+std::optional<ProtocolVersionField> ResolveProtocolVersionField(
+    std::string_view bfbs, std::string_view schema_name,
+    std::size_t message_bytes) {
+  if (bfbs.empty() || schema_name.empty()) return std::nullopt;
+  const reflection::Schema* schema = schema::VerifySchema(bfbs);
+  if (schema == nullptr || schema->objects() == nullptr) return std::nullopt;
+  const reflection::Object* root = nullptr;
+  for (const auto* object : *schema->objects()) {
+    if (object != nullptr && object->name() != nullptr &&
+        object->name()->string_view() == schema_name) {
+      root = object;
+      break;
+    }
+  }
+  if (root == nullptr || !root->is_struct() || root->bytesize() <= 0) {
+    return std::nullopt;
+  }
+  const auto struct_bytes = static_cast<std::size_t>(root->bytesize());
+  if (message_bytes != 0 && message_bytes != struct_bytes) return std::nullopt;
+  const std::size_t expected_bytes =
+      message_bytes != 0 ? message_bytes : struct_bytes;
+  schema::ResolvedField resolved;
+  try {
+    resolved = schema::ResolveField(*schema, *root, kProtocolVersionField,
+                                    ::bridge::topics::kStatus);
+  } catch (const std::invalid_argument&) {
+    return std::nullopt;
+  }
+  if (!IsIntegerScalar(resolved.base_type) || resolved.size == 0) {
+    return std::nullopt;
+  }
+  if (resolved.offset > expected_bytes ||
+      resolved.size > expected_bytes - resolved.offset) {
+    return std::nullopt;
+  }
+  return ProtocolVersionField{
+      .offset = resolved.offset,
+      .size = resolved.size,
+      .message_bytes = expected_bytes,
+      .base_type = static_cast<std::uint8_t>(resolved.base_type)};
+}
+
+std::optional<std::uint16_t> ReadProtocolVersion(
+    const ProtocolVersionField& field, std::span<const std::byte> payload) {
+  const auto base_type = static_cast<reflection::BaseType>(field.base_type);
+  if (!IsIntegerScalar(base_type) || field.size == 0 ||
+      field.size != schema::ScalarSize(base_type) ||
+      payload.size() != field.message_bytes || field.offset > payload.size() ||
+      field.size > payload.size() - field.offset) {
+    return std::nullopt;
+  }
+  const std::int64_t raw =
+      schema::ReadInt64(base_type, payload.data() + field.offset);
+  if (base_type == reflection::BaseType::ULong &&
+      static_cast<std::uint64_t>(raw) > 0xFFFFu) {
+    return std::nullopt;
+  }
+  if (raw < 1 || raw > 0xFFFF) return std::nullopt;
+  return static_cast<std::uint16_t>(raw);
+}
 
 std::string SessionConfigPath(const std::string& config,
                               const std::vector<std::string>& inputs) {

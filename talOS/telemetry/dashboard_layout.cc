@@ -236,7 +236,10 @@ DashboardCell ReadCell(const toml::table& table, const Scope& scope,
                          ": column and row must be at least 0, width and "
                          "height at least 1");
   }
-  if (v[0] + v[2] > layout.columns || v[1] + v[3] > layout.rows) {
+  const std::int64_t columns = layout.columns;
+  const std::int64_t rows = layout.rows;
+  if (v[0] > columns || v[2] > columns - v[0] || v[1] > rows ||
+      v[3] > rows - v[1]) {
     scope.Fail("at", text + " is outside the " +
                          std::to_string(layout.columns) + " x " +
                          std::to_string(layout.rows) + " grid");
@@ -246,8 +249,10 @@ DashboardCell ReadCell(const toml::table& table, const Scope& scope,
 }
 
 bool Overlap(const DashboardCell& a, const DashboardCell& b) {
-  return a.column < b.column + b.width && b.column < a.column + a.width &&
-         a.row < b.row + b.height && b.row < a.row + a.height;
+  return std::uint64_t{a.column} < std::uint64_t{b.column} + b.width &&
+         std::uint64_t{b.column} < std::uint64_t{a.column} + a.width &&
+         std::uint64_t{a.row} < std::uint64_t{b.row} + b.height &&
+         std::uint64_t{b.row} < std::uint64_t{a.row} + a.height;
 }
 
 double Window(const toml::table& table, std::string_view key,
@@ -791,10 +796,12 @@ bool DriveChannels::Carries(std::string_view name, bool alert) const {
 DriveChannels DriveFeedChannels(const DashboardLayout& layout) {
   DriveChannels channels{RequiredChannels(layout),
                          CarriesAlertChannels(layout)};
-  const auto at =
-      std::ranges::lower_bound(channels.named, kDriveLinkLostChannel);
-  if (at == channels.named.end() || *at != kDriveLinkLostChannel) {
-    channels.named.emplace(at, kDriveLinkLostChannel);
+  for (const std::string_view channel :
+       {kDriveLinkLostChannel, kDriveProtocolMismatchChannel}) {
+    const auto at = std::ranges::lower_bound(channels.named, channel);
+    if (at == channels.named.end() || *at != channel) {
+      channels.named.emplace(at, channel);
+    }
   }
   return channels;
 }

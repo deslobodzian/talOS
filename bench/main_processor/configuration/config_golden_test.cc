@@ -42,11 +42,11 @@ constexpr ExpectedSensor kSensors[] = {
     {"pigeon", 0, SensorKind::kPigeon2},
 };
 
-template <typename Device>
-const Device* Find(const std::vector<Device>& devices,
-                   const std::string& name) {
+template <typename Devices>
+const typename Devices::value_type* Find(const Devices& devices,
+                                         std::string_view name) {
   const auto it = std::find_if(devices.begin(), devices.end(),
-                               [&](const Device& d) { return d.name == name; });
+                               [&](const auto& d) { return d.name == name; });
   return it == devices.end() ? nullptr : &*it;
 }
 

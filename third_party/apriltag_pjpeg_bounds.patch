@@ -68,7 +68,39 @@ diff --git a/common/pjpeg-idct.c b/common/pjpeg-idct.c
 diff --git a/common/pjpeg.c b/common/pjpeg.c
 --- a/common/pjpeg.c
 +++ b/common/pjpeg.c
-@@ -341,7 +341,11 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+@@ -223,7 +223,12 @@ static inline uint32_t bd_consume_bits(struct bit_decoder *bd, int nbits)
+ static inline void bd_discard_bytes(struct bit_decoder *bd, int nbytes)
+ {
+     assert(bd->nbits_avail == 0);
+-    bd->inpos += nbytes;
++    if (nbytes <= 0 || bd->inpos >= bd->inlen)
++        return;
++    if ((uint32_t) nbytes > bd->inlen - bd->inpos)
++        bd->inpos = bd->inlen;
++    else
++        bd->inpos += (uint32_t) nbytes;
+ }
+ 
+ static inline int bd_has_more(struct bit_decoder *bd)
+@@ -297,6 +302,8 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+             case 0xfe: // Comment
+             {
+                 uint16_t length = bd_consume_bits(&bd, 16);
++                if (length < 2)
++                    return PJEPG_ERR_UNSUPPORTED;
+                 bd_discard_bytes(&bd, length - 2);
+                 continue;
+             }
+@@ -304,7 +311,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+             case 0xdb: { // DQT Define Quantization Table
+                 uint16_t length = bd_consume_bits(&bd, 16);
+ 
+-                if (((length-2) % 65) != 0)
++                if (length < 2 || ((length-2) % 65) != 0)
+                     return PJPEG_ERR_DQT;
+ 
+                 // can contain multiple DQTs
+@@ -341,11 +348,17 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
  
                  int nf = bd_consume_bits(&bd, 8); // # image components
  
@@ -80,8 +112,15 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
 +                    pjd->width > 16384 || pjd->height > 16384)
                      return PJPEG_ERR_SOF;
  
-                 pjd->ncomponents = nf;
-@@ -358,6 +362,14 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+-                pjd->ncomponents = nf;
+                 pjd->components = calloc(nf, sizeof(struct pjpeg_component));
++                if (pjd->components == NULL)
++                    return PJPEG_ERR_SOF;
++                pjd->ncomponents = nf;
+ 
+                 for (int i = 0; i < nf; i++) {
+                     // comp. identifier
+@@ -358,6 +371,14 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
  
                      // which quant table?
                      pjd->components[i].tq = bd_consume_bits(&bd, 8);
@@ -96,7 +135,46 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
                  }
                  break;
              }
-@@ -448,6 +460,8 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+@@ -383,12 +404,16 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+             case 0xc4: { // DHT Define Huffman Tables
+                 // [ED: the encoding of these tables is really quite
+                 // clever!]
+-                uint16_t length = bd_consume_bits(&bd, 16);
+-                length = length - 2;
++                int remaining = (int) bd_consume_bits(&bd, 16) - 2;
++                if (remaining < 0)
++                    return PJPEG_ERR_DHT;
++
++                while (remaining > 0) {
++                    if (remaining < 17)
++                        return PJPEG_ERR_DHT;
+ 
+-                while (length > 0) {
+                     uint8_t TcTh = bd_consume_bits(&bd, 8);
+-                    length--;
++                    remaining--;
+                     uint8_t Tc = (TcTh >> 4);
+                     int Th = TcTh & 0x0f; // which index are we using?
+ 
+@@ -401,11 +426,15 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+ 
+                     uint8_t L[17]; // how many symbols of each bit length?
+                     L[0] = 0;      // no 0 bit codes :)
++                    int total_symbols = 0;
+                     for (int nbits = 1; nbits <= 16; nbits++) {
+                         L[nbits] = bd_consume_bits(&bd, 8);
+-                        length -= L[nbits];
++                        total_symbols += L[nbits];
+                     }
+-                    length -= 16;
++                    remaining -= 16;
++                    if (remaining < total_symbols)
++                        return PJPEG_ERR_DHT;
++                    remaining -= total_symbols;
+ 
+                     uint32_t code_pos = 0;
+ 
+@@ -448,9 +477,13 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
  
                  // number of components in this scan
                  uint8_t ns = bd_consume_bits(&bd, 8);
@@ -105,7 +183,12 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
  
                  // for each component, what is the index into our pjd->components[] array?
                  uint8_t *comp_idx = calloc(ns, sizeof(uint8_t));
-@@ -469,8 +483,10 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
++                if (comp_idx == NULL)
++                    return PJPEG_ERR_SOS;
+ 
+                 for (int i = 0; i < ns; i++) {
+                     // component name
+@@ -469,8 +502,10 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
                          }
                      }
  
@@ -117,7 +200,7 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
                  }
  
                  // start of spectral selection. baseline == 0
-@@ -482,8 +498,10 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+@@ -482,8 +517,10 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
                  // successive approximation bits. baseline == 0
                  uint8_t Ahl = bd_consume_bits(&bd, 8);
  
@@ -129,13 +212,14 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
  
                  // compute the dimensions of each MCU in pixels
                  int maxmcux = 0, maxmcuy = 0;
-@@ -513,12 +531,20 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+@@ -513,14 +550,27 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
                      if ((comp->stride % alignment) != 0)
                          comp->stride += alignment - (comp->stride % alignment);
  
+-                    comp->data = calloc(comp->height * comp->stride, 1);
 +                    // A second scan of a component replaces its storage.
 +                    free(comp->data);
-                     comp->data = calloc(comp->height * comp->stride, 1);
++                    comp->data = calloc((size_t) comp->height * comp->stride, 1);
 +                    if (comp->data == NULL) {
 +                        free(comp_idx);
 +                        return PJPEG_ERR_SOS;
@@ -145,12 +229,19 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
  
                  // each component has its own DC prediction
                  int32_t *dcpred = calloc(ns, sizeof(int32_t));
++                if (dcpred == NULL) {
++                    free(comp_idx);
++                    return PJPEG_ERR_SOS;
++                }
 +                // Error exits from the scan release its buffers.
 +#define PJPEG_SCAN_FAIL(code) do { free(dcpred); free(comp_idx); return (code); } while (0)
  
                  pjd->reset_count = 0;
++                pjd->reset_next = 0;
  
-@@ -544,7 +570,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+                 for (int mcu_y = 0; mcu_y < mcus_y; mcu_y++) {
+                     for (int mcu_x = 0; mcu_x < mcus_x; mcu_x++) {
+@@ -544,7 +594,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
                              while (1) {
                                  int32_t value = bd_consume_bits(&bd, 8);
                                  if (bd.inpos > bd.inlen)
@@ -159,7 +250,7 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
                                  if (value == 0xff)
                                      break;
                                  printf("RST SYNC\n");
-@@ -554,7 +580,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+@@ -554,12 +604,12 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
  
  //                            printf("%04x: RESET? %02x\n", *bd.inpos,  marker_32);
                              if (marker_32 != (0xd0 + pjd->reset_next))
@@ -168,7 +259,13 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
  
                              pjd->reset_count = 0;
                              pjd->reset_next = (pjd->reset_next + 1) & 0x7;
-@@ -578,9 +604,12 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+ 
+-                            memset(dcpred, 0, sizeof(*dcpred));
++                            memset(dcpred, 0, (size_t) ns * sizeof(*dcpred));
+                         }
+ 
+                         for (int nsidx = 0; nsidx < ns; nsidx++) {
+@@ -578,9 +628,12 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
                                      int dc_huff_table_idx = comp->tda >> 4;
                                      int ac_huff_table_idx = 2 + (comp->tda & 0x0f);
  
@@ -183,7 +280,7 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
  
  
                                      if (1) {
-@@ -592,11 +621,17 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+@@ -592,11 +645,17 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
                                          int ssss = huff_code->code & 0x0f; // ssss == number of additional bits to read
                                          int32_t value = bd_consume_bits(&bd, ssss);
  
@@ -205,7 +302,7 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
                                          block[0] = dcpred[nsidx] * pjd->qtab[qtabidx][0];
                                      }
  
-@@ -619,10 +654,15 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+@@ -619,10 +678,15 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
                                              int32_t value = bd_consume_bits(&bd, ssss);
  
                                              // if high bit is clear, it's negative
@@ -223,7 +320,7 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
  
                                              block[(int) ZZ[coeff]] = value * pjd->qtab[qtabidx][coeff];
                                          }
-@@ -651,6 +691,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+@@ -651,6 +715,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
  
                  free(dcpred);
                  free(comp_idx);
@@ -231,3 +328,180 @@ diff --git a/common/pjpeg.c b/common/pjpeg.c
  
                  break;
              }
+@@ -675,6 +740,8 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+ 
+                 // try to skip it.
+                 uint16_t length = bd_consume_bits(&bd, 16);
++                if (length < 2)
++                    return PJEPG_ERR_UNSUPPORTED;
+                 bd_discard_bytes(&bd, length - 2);
+                 continue;
+             }
+@@ -702,11 +769,13 @@ void pjpeg_destroy(pjpeg_t *pj)
+ // just grab the first component.
+ image_u8_t *pjpeg_to_u8_baseline(pjpeg_t *pj)
+ {
+-    assert(pj->ncomponents > 0);
++    if (pj == NULL || pj->ncomponents <= 0 || pj->components == NULL)
++        return NULL;
+ 
+     pjpeg_component_t *comp = &pj->components[0];
+ 
+-    assert(comp->width >= pj->width && comp->height >= pj->height);
++    if (comp->data == NULL || comp->width < pj->width || comp->height < pj->height)
++        return NULL;
+ 
+     image_u8_t *im = image_u8_create(pj->width, pj->height);
+     for (int y = 0; y < im->height; y++)
+@@ -737,18 +806,29 @@ static inline uint8_t clamp_u8(int32_t v)
+ // color conversion formulas taken from JFIF spec v 1.02
+ image_u8x3_t *pjpeg_to_u8x3_baseline(pjpeg_t *pj)
+ {
+-    assert(pj->ncomponents == 3);
++    if (pj == NULL || pj->ncomponents != 3 || pj->components == NULL)
++        return NULL;
+ 
+     pjpeg_component_t *Y = &pj->components[0];
+     pjpeg_component_t *Cb = &pj->components[1];
+     pjpeg_component_t *Cr = &pj->components[2];
+ 
++    if (Y->data == NULL || Cb->data == NULL || Cr->data == NULL ||
++        Y->width < pj->width || Y->height < pj->height ||
++        Cb->width == 0 || Cb->height == 0 ||
++        Cr->width == 0 || Cr->height == 0)
++        return NULL;
++
+     int Cb_factor_y = Y->height / Cb->height;
+     int Cb_factor_x = Y->width / Cb->width;
+ 
+     int Cr_factor_y = Y->height / Cr->height;
+     int Cr_factor_x = Y->width / Cr->width;
+ 
++    if (Cb_factor_y <= 0 || Cb_factor_x <= 0 ||
++        Cr_factor_y <= 0 || Cr_factor_x <= 0)
++        return NULL;
++
+     image_u8x3_t *im = image_u8x3_create(pj->width, pj->height);
+ 
+     if (Cr_factor_y == 1 && Cr_factor_x == 1 && Cb_factor_y == 1 && Cb_factor_x == 1) {
+@@ -825,30 +905,54 @@ image_u8x3_t *pjpeg_to_u8x3_baseline(pjpeg_t *pj)
+ pjpeg_t *pjpeg_create_from_file(const char *path, uint32_t flags, int *error)
+ {
+     FILE *f = fopen(path, "rb");
+-    if (f == NULL)
++    if (f == NULL) {
++        if (error)
++            *error = PJPEG_ERR_FILE;
+         return NULL;
++    }
+ 
+-    fseek(f, 0, SEEK_END);
++    // Reject non-seekable paths, directories (ftell may return -1, 0, or
++    // LONG_MAX), empty files, and files over 256 MiB before allocating.
++    const long max_buflen = 256L * 1024 * 1024;
++    if (fseek(f, 0, SEEK_END) != 0) {
++        fclose(f);
++        if (error)
++            *error = PJPEG_ERR_FILE;
++        return NULL;
++    }
+     long buflen = ftell(f);
++    if (buflen <= 0 || buflen > max_buflen) {
++        fclose(f);
++        if (error)
++            *error = (buflen == 0) ? PJPEG_ERR_EOF : PJPEG_ERR_FILE;
++        return NULL;
++    }
+ 
+-    uint8_t *buf = malloc(buflen);
+-    fseek(f, 0, SEEK_SET);
+-    int res = fread(buf, 1, buflen, f);
++    uint8_t *buf = malloc((size_t) buflen);
++    if (buf == NULL || fseek(f, 0, SEEK_SET) != 0) {
++        free(buf);
++        fclose(f);
++        if (error)
++            *error = PJPEG_ERR_FILE;
++        return NULL;
++    }
++    size_t res = fread(buf, 1, (size_t) buflen, f);
++    int read_err = ferror(f);
+ 
+-    if ( ferror(f) ){
++    if (read_err) {
+         debug_print ("Read failed");
+         clearerr(f);
+     }
+ 
+     fclose(f);
+-    if (res != buflen) {
++    if (read_err || res != (size_t) buflen) {
+         free(buf);
+         if (error)
+             *error = PJPEG_ERR_FILE;
+         return NULL;
+     }
+ 
+-    pjpeg_t *pj = pjpeg_create_from_buffer(buf, buflen, flags, error);
++    pjpeg_t *pj = pjpeg_create_from_buffer(buf, (int) buflen, flags, error);
+ 
+     free(buf);
+     return pj;
+@@ -856,6 +960,12 @@ pjpeg_t *pjpeg_create_from_file(const char *path, uint32_t flags, int *error)
+ 
+ pjpeg_t *pjpeg_create_from_buffer(uint8_t *buf, int buflen, uint32_t flags, int *error)
+ {
++    if (buf == NULL || buflen <= 0) {
++        if (error)
++            *error = PJPEG_ERR_EOF;
++        return NULL;
++    }
++
+     struct pjpeg_decode_state pjd;
+     memset(&pjd, 0, sizeof(pjd));
+ 
+@@ -872,18 +982,41 @@ pjpeg_t *pjpeg_create_from_buffer(uint8_t *buf, int buflen, uint32_t flags, int
+     pjd.flags = flags;
+ 
+     int result = pjpeg_decode_buffer(&pjd);
++    if (result == PJPEG_OKAY) {
++        if (pjd.ncomponents <= 0 || pjd.components == NULL ||
++            pjd.width == 0 || pjd.height == 0) {
++            result = PJPEG_ERR_EOF;
++        } else {
++            for (int i = 0; i < pjd.ncomponents; i++) {
++                if (pjd.components[i].data == NULL) {
++                    result = PJPEG_ERR_EOF;
++                    break;
++                }
++            }
++        }
++    }
+     if (error)
+         *error = result;
+ 
+     if (result) {
+-        for (int i = 0; i < pjd.ncomponents; i++)
+-            free(pjd.components[i].data);
+-        free(pjd.components);
++        if (pjd.components) {
++            for (int i = 0; i < pjd.ncomponents; i++)
++                free(pjd.components[i].data);
++            free(pjd.components);
++        }
+ 
+         return NULL;
+     }
+ 
+     pjpeg_t *pj = calloc(1, sizeof(pjpeg_t));
++    if (pj == NULL) {
++        for (int i = 0; i < pjd.ncomponents; i++)
++            free(pjd.components[i].data);
++        free(pjd.components);
++        if (error)
++            *error = PJPEG_ERR_FILE;
++        return NULL;
++    }
+ 
+     pj->width = pjd.width;
+     pj->height = pjd.height;

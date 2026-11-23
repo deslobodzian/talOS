@@ -24,6 +24,8 @@
 
 #include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
+#include "talOS/events/log/gap_tracker.h"
+#include "talOS/events/log/log_file_sink.h"
 #include "talOS/events/manifest.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/time.h"
@@ -38,9 +40,9 @@ namespace talos::event::log {
 // semaphore until a chunk is handed over or a sync is due; the producer posts
 // it on every hand-off, asleep or not, and a post neither blocks nor takes a
 // lock (sem_post on Linux, dispatch_semaphore_signal on macOS). The writer
-// runs under the normal scheduling policy whatever the thread that
-// started it runs under, so it never competes with a realtime loop thread
-// for the CPU.
+// runs as a background thread (process::ConfigureBackgroundThread) whatever
+// the thread that started it runs under, so it never competes with a
+// realtime loop thread for the CPU.
 //
 // Two losses are bounded separately. A process killed by a signal (the
 // launcher's stall kill, a segfault, an abort) runs no flush, so its log
@@ -96,20 +98,6 @@ namespace talos::event::log {
 // failures are sticky and surfaced through failed()/error() instead.
 inline constexpr std::size_t DEFAULT_CHUNK_BYTES = 256u << 10;
 inline constexpr std::size_t DEFAULT_CHUNK_COUNT = 4;
-
-// A flags word a writer ORs `bit` into as a gap opens (LogWriterOptions::
-// gap_flags): a node's registry row, `flags` its flags word and `bit`
-// introspect::kFlagLogGap. `owner`, when set, says whose the word is: the
-// bit is set only while it still holds `expected` (an acquire load), so a
-// row another process has claimed since (the registry's generation) is
-// left alone. Every word must outlive the writer, or be taken back first
-// (LogWriter::set_gap_flags).
-struct GapFlagTarget {
-  std::atomic<std::uint32_t>* flags{nullptr};
-  std::uint32_t bit{0};
-  const std::atomic<std::uint64_t>* owner{nullptr};
-  std::uint64_t expected{0};
-};
 
 struct LogWriterOptions {
   // Minimum buffer size. start() grows all chunks to fit the manifest's largest
@@ -192,11 +180,6 @@ struct LogWriterOptions {
 // launcher. Throws std::invalid_argument for a value that is not a whole
 // number or does not fit the window's nanoseconds.
 std::chrono::nanoseconds ParseLogWindowUs(const std::string& value);
-
-// The marker a byte-capped writer leaves next to its log (see max_bytes).
-inline std::string CappedMarkerPath(std::string_view log_path) {
-  return std::string{log_path} + ".capped";
-}
 
 // The most segments a byte-capped log is split into (see max_bytes). Once it
 // rotates, the log holds n - 1 full segments and the one being written, so
@@ -329,6 +312,7 @@ class LogWriter {
   // All state lives behind a pointer so that moving a LogWriter never has to
   // move a running thread, a mutex or a condition variable.
   struct State {
+    explicit State(std::string path);
     ~State();
 
     // What take() did with a record.
@@ -340,9 +324,6 @@ class LogWriter {
     // handing the chunk over as needed. kStopped: the byte cap ended capture.
     Take take(const RecordHeader& header,
               std::span<const std::byte> stored) noexcept;
-    // Producer: the gap bookkeeping (see LogWriter).
-    void open_gap(const RecordHeader& header, GapCause cause) noexcept;
-    void lose(const RecordHeader& header, std::size_t payload_bytes) noexcept;
     bool room_to_resume() const noexcept;
     Take take_gap(std::int64_t now_ns) noexcept;
     // flush() and destruction, once every chunk handed over is written:
@@ -356,31 +337,18 @@ class LogWriter {
     void submit_active() noexcept;
     bool acquire_chunk() noexcept;
     void write_chunk(Chunk& chunk) noexcept;
-    // Writer side: ends the file's segment and starts `segment` at `path`.
-    void rotate_to(std::uint64_t segment) noexcept;
-    void write_all(const void* data, std::size_t size);
-    // `durable`: process::DurableSync (flush(), destruction); otherwise
-    // fsync (the periodic sync).
     void sync(bool durable) noexcept;
-    void mark_capped() noexcept;
     void drain() noexcept;
-    // Writer thread, first: creates `path` and writes the prefix, or (with
-    // no prefix: start() found no room for one) only the cap marker.
-    void open_file() noexcept;
     void start_writer();
     void stop_writer() noexcept;
-    void set_error(std::string message) noexcept;
 
-    int fd{-1};
-    std::string path;
+    LogFileSink sink;
+    GapTracker gaps;
     std::string process_name;
     std::uint64_t session_id{0};
     Options options;
-    // The header, manifest and schema block every segment starts with.
-    std::vector<std::byte> prefix;
     // Bytes per segment; zero when the log does not rotate.
     std::uint64_t segment_bytes{0};
-    std::uint64_t segment_count{1};
     // Producer only, after start(): the segment records are accepted into,
     // and its bytes so far, prefix included.
     std::uint64_t segment{0};
@@ -390,16 +358,8 @@ class LogWriter {
     std::uint64_t segment_span_ns{0};
     // Producer only: the now_ns of the segment's first record.
     std::int64_t segment_first_ns{0};
-    // Writer only (or the only thread): the segment `fd` holds.
-    std::uint64_t file_segment{0};
-    // Writer only: the oldest segment rotation has not deleted yet.
-    std::uint64_t dropped_through{0};
-    std::atomic<bool> head_dropped{false};
-    bool capped_marked{false};  // Writer thread, or drain after it is idle.
 
     std::deque<Chunk> pool;
-    std::chrono::steady_clock::time_point last_sync{
-        std::chrono::steady_clock::now()};
     // Writer only: when it last wrote (see Options::write_interval); empty
     // until its first write, so that a first record is written at once
     // however recently the host booted (the steady clock counts from boot).
@@ -423,22 +383,6 @@ class LogWriter {
     enum class CaptureError { NONE, BYTE_CAP };
     std::atomic<CaptureError> capture_error{CaptureError::NONE};
 
-    // Producer only: the open gap (losing), its first dropped dispatch, the
-    // earliest time a dropped record named (INT64_MAX while none did), and
-    // what it dropped; the dispatch of the last record taken; an EXIT that
-    // found no room.
-    bool losing{false};
-    std::uint64_t gap_first_dispatch{0};
-    std::int64_t gap_start_ns{0};
-    GapRecord gap{};
-    std::uint64_t last_accepted_dispatch{0};
-    std::optional<RecordHeader> held_exit;
-    // For observers (LogWriter::gaps() and the like). Only the producer
-    // stores them, with a relaxed load and store.
-    std::atomic<bool> losing_flag{false};
-    std::atomic<std::uint64_t> gap_count{0};
-    std::atomic<std::uint64_t> lost_records{0};
-
     mutable std::mutex mutex;
     std::condition_variable chunk_ready;
     // Under `mutex`: the writer thread has finished open_file(), so drain()
@@ -446,11 +390,6 @@ class LogWriter {
     bool file_ready{false};
     std::thread writer;
     std::atomic<bool> stopping{false};
-    std::atomic<bool> failed{false};  // Disk failure, independent of capture.
-    // Error reporting also runs while the worker coordination mutex is held
-    // (sync in drain/periodic sync), so it needs independent protection.
-    mutable std::mutex error_mutex;
-    std::string error;
   };
 
   std::unique_ptr<State> state_;

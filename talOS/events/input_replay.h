@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -30,6 +31,17 @@
 // is handed what it received live, at the drains it received it in.
 namespace talos::event {
 
+// Options controlling RecordedSession and ReplayInputs.
+struct InputReplayOptions {
+  // Replay logs capped by [robot] log_max_bytes (`<log>.capped` or manifest
+  // `log_capped`) from the start of the kept window instead of refusing them,
+  // printing a warning to stderr naming the capped log(s) and noting that
+  // pre-window history was lost. Uncapped `log_gap`, `recorder_failed`,
+  // incomplete headers, missing non-head segments, and unbounded damage are
+  // still refused.
+  bool allow_capped{false};
+};
+
 // A topic as a session's logs recorded it.
 struct RecordedTopic {
   std::string name;
@@ -51,11 +63,18 @@ struct RecordedTopic {
   // (a watcher receives in sequence order); both counted along the log
   // across its segments (a later segment starts from the one before it,
   // when read). Where nothing bounds it, the log is refused instead (below).
-  // A reader's stretch, in a log other than the replayed program's, costs
-  // nothing where the session's logs hold every message of the topic whose
-  // sequence lies between its intact receipts around the stretch (from 0
-  // when none precedes it; never when none follows it in its file): the
-  // writer's sends restore all it could have lost.
+  // A writer's or non-replayed reader's damaged stretch costs nothing where
+  // the session's logs hold every message of the topic whose sequence lies
+  // between its intact records around the stretch (from 0 when none precedes
+  // it; closing on the next intact accepted send or receipt in the same file
+  // or a contiguous later segment). For any topic the replayed program did not
+  // watch live, when at least one writer log exists, every writer log of that
+  // topic is intact and exited (no cap/hard/segment refusal, no GAP, no
+  // unrecovered damage on that topic, not truncated, and its run reached EXIT),
+  // and the session holds every sequence from 0 through the maximum recorded
+  // sequence, reader-only caps, marks, gaps and damage are ignored for that
+  // topic (still applied to run_start and topics the replayed program watched
+  // live).
   std::optional<MonotonicTime> first_gap;
   std::string first_gap_log;
   // Where that loss is a damaged stretch: its byte offset in first_gap_log.
@@ -64,8 +83,15 @@ struct RecordedTopic {
   // replay refuses, and why, naming the sign it found: the log's
   // `<log>.capped` marker, the session manifest's `log_capped`, its
   // `log_gap` or `recorder_failed` for a run's log without its EXIT record,
-  // or a damaged stretch
-  // (its byte offset) before which no receipt bounds the topic's lost
+  // a missing or incomplete-header segment (including a missing first segment
+  // without a marker when a later numbered segment remains or the unnumbered
+  // active file's first intact record has dispatch_index > 1, not an
+  // unnumbered-only file starting at dispatch_index <= 1 or a
+  // dispatch_index == 0 bridge log; and a segment missing before the
+  // unnumbered active file whose boundary jumps in dispatch_index (> prev + 1)
+  // or accepted-SEND sequence (> prev + 1) for a sender present on both
+  // sides), or a damaged
+  // stretch (its byte offset) before which no receipt bounds the topic's lost
   // records (the replayed program's own receipts, fed at their drains'
   // event times, which need not follow the log's order; a reader's topic
   // with no intact receipt before it, unless an intact receipt of it
@@ -73,6 +99,13 @@ struct RecordedTopic {
   // message of the topic before that receipt's sequence). Empty when none.
   std::string refused_log;
   std::string refused_reason;
+  // The first byte-capped log (in log_paths() order) this topic is fed from
+  // (`<log>.capped` marker or manifest `log_capped`), and why. Refused unless
+  // InputReplayOptions::allow_capped is set. Empty when none.
+  std::string capped_log;
+  std::string capped_reason;
+  // Distinct capped base logs feeding this topic, in log_paths() order.
+  std::vector<std::string> capped_logs;
 };
 
 struct RecordedMessage {
@@ -117,10 +150,11 @@ struct RecordedMessage {
 // `<stem>.segment<k>.tlog` belongs to, or the session manifest's
 // `log_capped` for its member: its oldest segment deleted, which may have
 // held a GAP record, or capture stopped at the cap), and a run's log without
-// its EXIT record of a member the manifest marks `log_gap` or
-// `recorder_failed`, whose gap that run's end may have cut short before its
-// GAP record was written, or whose recorder failed (a disk error ends
-// capture with no GAP record). A run's
+// its EXIT record that the manifest marks in `gap_logs` or
+// `recorder_failed_logs` (or, for legacy manifests without those arrays, any
+// run of a member marked `log_gap` or `recorder_failed`), whose gap that run's
+// end may have cut short before its GAP record was written, or whose recorder
+// failed (a disk error ends capture with no GAP record). A run's
 // log with its EXIT holds a GAP record for every gap (LogWriter::gaps) and
 // is judged by them. Each topic notes the first such log it is fed from
 // (refused_log), which ReplayInputs refuses, as it does a damaged stretch
@@ -133,10 +167,12 @@ struct RecordedMessage {
 // `manifest.json` in the directory holding the logs
 // (talOS/launcher/README.md, "Session manifest"), used when its session_id
 // is the logs'; it names a member's logs by the paths they were recorded at
-// (`nodes[].log_paths`), matched here by file name, so a session read from
-// another directory still matches. Logs with no such
+// (`nodes[].log_paths`, `nodes[].gap_logs`, `nodes[].recorder_failed_logs`),
+// matched here by file name, so a session read from another directory still
+// matches. Logs with no such
 // manifest beside them (a directory outside a launcher session, another
-// session's manifest) are judged by their `.capped` markers alone.
+// session's manifest) are judged by their `.capped` markers and segment
+// continuity alone.
 class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)
@@ -145,12 +181,18 @@ class RecordedSession {
   // process name of the program to be replayed, or empty for none. Throws
   // std::runtime_error on an unreadable log, on logs from two sessions, on a
   // topic the logs record with two schemas, and on a manifest.json beside them
-  // that is not JSON. A log's damaged records are skipped (log::LogReader) and
-  // mark a loss or a refusal (above); what was skipped is printed to stderr as
-  // a warning naming the file and byte offsets.
+  // that is not JSON; throws ReplayError if two records share `(topic,
+  // sequence)` with differing publish times or payloads or if a single log
+  // observes a non-monotonic sequence on a topic (e.g. a segment re-created
+  // outside a launcher session restarting at 0). A log's damaged records are
+  // skipped (log::LogReader) and mark a loss or a refusal (above); what was
+  // skipped is printed to stderr as a warning naming the file and byte
+  // offsets.
   explicit RecordedSession(const std::string& path,
-                           std::string_view replayed = {});
+                           std::string_view replayed = {},
+                           InputReplayOptions options = {});
 
+  bool allow_capped() const { return allow_capped_; }
   const std::vector<std::string>& log_paths() const { return log_paths_; }
   std::uint64_t session_id() const { return session_id_; }
 
@@ -165,35 +207,63 @@ class RecordedSession {
   // of that run's log holds it; when it armed a timer and fired none that
   // gives it, the now of its first dispatch, at or after the live run start,
   // so no timer armed before the run fires up to that run's last record, as
-  // none did live; a program that ran once ends there, unless its loop was
-  // late when it stopped, and a restarted one replays as one run; the
-  // origin when it had no timer).
+  // none did live; a restarted program replays as one run; the origin when it
+  // had no timer).
   // For a program the session did not log, start() for both.
   // Where the replay ends: the latest time the program's own logs recorded
-  // (its exit), or end().
+  // (its exit), or end(). For a single-run log whose own records have no GAP,
+  // damaged stretch, or broken segment carry, this is clamped to one
+  // nanosecond before the earliest armed timer deadline strictly after the
+  // last recorded TIMER or MESSAGE dispatch's event_time (or any armed
+  // deadline when none ran), avoiding a fabricated firing on a late EXIT or an
+  // offset-0 timer whose only dispatch record is its EXIT. Two cases remain
+  // unclamped: (1) a timer armed via ARM_TIMER relative to live now()
+  // (E + latency) whose replay deadline (E + P) falls before a live EXIT in
+  // [E + P, E + latency + P), and (2) a timer that came due between the
+  // realtime loop's timer pass and a following backlog drain whose handler
+  // called exit() (its deadline precedes that drain's event_time).
   MonotonicTime loop_start() const { return loop_start_; }
   MonotonicTime run_start() const { return run_start_; }
   MonotonicTime loop_end() const { return loop_end_; }
 
   // When the replayed program's first run's log arms a timer: the first
   // file of it read, when that is not its first segment
-  // (log::LogSegmentPath(log, 0); a rotated log keeps its later ones) nor
-  // the log of a run never rotated, and why, naming the sign: that segment's
-  // incomplete header, the log's `<log>.capped` marker, the session
-  // manifest's `log_capped`, or else only that the segment is gone; or the
-  // first file read that does not continue the segment before it (one
-  // between them missing or unread) while no firing was read before it. The
-  // run start's firing may have been in the segment not read; a later one's
-  // first firing may be whole periods later, so ReplayInputs refuses the
-  // log, whatever it feeds. With no firing that gives the run start, also
-  // the first file read when the log holds no record of its run (nothing
-  // gives its start or its end) or a GAP record or damaged stretch (which
-  // may hold its firings). Empty when none.
+  // (log::LogSegmentPath(log, 0); a rotated log keeps its later ones) nor an
+  // unrotated single file whose first intact record before any loss has
+  // dispatch_index <= 1 (a lone unnumbered file starting at
+  // dispatch_index > 1 is refused as missing segment 0, whereas one starting
+  // at dispatch_index <= 1 cannot be told from an unrotated log without a
+  // format change), and why, naming the sign: that segment's incomplete
+  // header, the log's `<log>.capped` marker, the session manifest's
+  // `log_capped`, or else only that the segment is gone; or the first file
+  // read that does not continue the segment before it (one between them
+  // missing or unread, including a missing segment before the unnumbered
+  // active file detected by a dispatch_index > prev + 1 or repeated-sender
+  // accepted-SEND sequence > prev + 1 jump) while no firing was read before
+  // it. The run start's firing may have been in the segment not read; a later
+  // one's first firing may be whole periods later, so ReplayInputs refuses the
+  // log, whatever it feeds. With no firing that gives the run start, also the
+  // first file read when the log holds no record of its run (nothing gives its
+  // start or its end) or a GAP record or damaged stretch (which may hold its
+  // firings). Empty when none.
   const std::string& run_start_refused_log() const {
     return run_start_refused_log_;
   }
   const std::string& run_start_refused_reason() const {
     return run_start_refused_reason_;
+  }
+  // Set when the replayed program's first run's log arms a timer and its first
+  // segment was rotated out by the byte cap (`<log>.capped` or manifest
+  // `log_capped`), with no other run-start refusal. Refused unless
+  // InputReplayOptions::allow_capped is set.
+  const std::string& run_start_capped_log() const {
+    return run_start_capped_log_;
+  }
+  const std::string& run_start_capped_base_log() const {
+    return run_start_capped_base_log_;
+  }
+  const std::string& run_start_capped_reason() const {
+    return run_start_capped_reason_;
   }
 
   const std::vector<RecordedTopic>& topics() const { return topics_; }
@@ -208,6 +278,7 @@ class RecordedSession {
   }
 
  private:
+  bool allow_capped_{false};
   std::vector<std::string> log_paths_;
   std::uint64_t session_id_{0};
   MonotonicTime start_;
@@ -217,6 +288,9 @@ class RecordedSession {
   MonotonicTime loop_end_;
   std::string run_start_refused_log_;
   std::string run_start_refused_reason_;
+  std::string run_start_capped_log_;
+  std::string run_start_capped_base_log_;
+  std::string run_start_capped_reason_;
   std::vector<RecordedTopic> topics_;
   std::vector<RecordedMessage> messages_;
   std::vector<std::byte> bytes_;
@@ -234,6 +308,9 @@ struct InputReplayReport {
   // Topics the program watches that no log recorded: nothing arrives on
   // them, as if their writer had never run.
   std::vector<std::string> unrecorded;
+  // Distinct capped base logs replayed from their kept window under
+  // InputReplayOptions::allow_capped. Empty when none were capped.
+  std::vector<std::string> capped_logs;
   struct Gap {
     std::string topic;
     std::string log;
@@ -254,6 +331,10 @@ struct InputReplayReport {
 const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
                                         const Registration& registration);
 
+// Prints a warning to stderr naming each capped log replayed under
+// InputReplayOptions::allow_capped and noting the lost pre-window history.
+void WarnCappedReplay(const std::vector<std::string>& capped_logs);
+
 // Runs `loop` to session.loop_end(), publishing every recorded message on a
 // topic the program watches with its recorded publish time, just before the
 // first drain at or after its `delivered` time, which delivers it. It never
@@ -266,18 +347,24 @@ const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
 // session.loop_start() with its run starting at session.run_start()
 // (SimulatedEventLoop::Options::start, run_start). Finishes the loop, which
 // closes its recorder's log. Throws ReplayError before running on a schema
-// mismatch, on a topic it would feed from a refused log (refused_log),
-// naming the log, the sign and the topic, and on a run start read from a
-// refused log (run_start_refused_log), naming the log and the sign.
+// mismatch, on a topic it would feed from a refused log (refused_log, or
+// capped_log unless allow_capped is set), naming the log, the sign and the
+// topic, and on a run start read from a refused log (run_start_refused_log, or
+// run_start_capped_log unless allow_capped is set), naming the log and the
+// sign. When allow_capped is true (on `session` or `options`) and any fed topic
+// or the timed run start uses a capped log, prints a warning to stderr listing
+// those capped logs and runs from the start of the kept window.
 template <RecorderPolicy Recorder>
 InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
                                SimulationEnvironment& environment,
-                               const RecordedSession& session) {
+                               const RecordedSession& session,
+                               InputReplayOptions options = {}) {
   if (loop.start_time() != session.loop_start()) {
     throw std::logic_error(
         "input replay needs a loop that starts at the recorded origin "
         "(RecordedSession::loop_start)");
   }
+  const bool allow_capped = session.allow_capped() || options.allow_capped;
   if (!session.run_start_refused_log().empty()) {
     throw ReplayError("input replay refuses " +
                       session.run_start_refused_log() +
@@ -285,8 +372,24 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
                       "read from: " +
                       session.run_start_refused_reason());
   }
-
   InputReplayReport report;
+  const auto note_capped = [&](const std::string& log) {
+    if (std::find(report.capped_logs.begin(), report.capped_logs.end(), log) ==
+        report.capped_logs.end()) {
+      report.capped_logs.push_back(log);
+    }
+  };
+  if (!session.run_start_capped_log().empty()) {
+    if (!allow_capped) {
+      throw ReplayError("input replay refuses " +
+                        session.run_start_capped_log() +
+                        ", which the replayed program's run start would be "
+                        "read from: " +
+                        session.run_start_capped_reason());
+    }
+    note_capped(session.run_start_capped_base_log());
+  }
+
   std::vector<SimulatedChannel*> channels(session.topics().size(), nullptr);
   std::vector<std::size_t> fed_index(session.topics().size(), 0);
   const Manifest& manifest = loop.manifest();
@@ -314,6 +417,14 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
                         ", which topic '" + topic->name +
                         "' would be fed from: " + topic->refused_reason);
     }
+    if (!topic->capped_log.empty()) {
+      if (!allow_capped) {
+        throw ReplayError("input replay refuses " + topic->capped_log +
+                          ", which topic '" + topic->name +
+                          "' would be fed from: " + topic->capped_reason);
+      }
+      for (const std::string& log : topic->capped_logs) note_capped(log);
+    }
     const auto index =
         static_cast<std::size_t>(topic - session.topics().data());
     if (channels[index] != nullptr) continue;  // watched twice
@@ -332,32 +443,49 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
           topic->first_gap_damage_offset};
     }
   }
+  if (allow_capped && !report.capped_logs.empty()) {
+    WarnCappedReplay(report.capped_logs);
+  }
   // Nothing at or past the gap is fed or run: the run ends one nanosecond
   // before it, so no drain there runs.
-  const MonotonicTime end = report.stopped_at_gap.has_value()
-                                ? report.stopped_at_gap->at - Duration{1}
-                                : session.loop_end();
+  const bool gap_at_min = report.stopped_at_gap.has_value() &&
+                          report.stopped_at_gap->at == MonotonicTime::min();
+  const MonotonicTime end =
+      report.stopped_at_gap.has_value()
+          ? (report.stopped_at_gap->at > MonotonicTime::min()
+                 ? report.stopped_at_gap->at - Duration{1}
+                 : MonotonicTime::min())
+          : session.loop_end();
 
-  std::optional<MonotonicTime> instant;
-  for (const RecordedMessage& message : session.messages()) {
-    if (message.delivered > end) break;
-    SimulatedChannel* channel = channels[message.topic];
-    if (channel == nullptr) continue;
-    // Everything due before the message's delivery happens first; then the
-    // clock stands at it, so the drain there, a timer's or a wake's, is the
-    // first to see it. Every message of one instant goes out before that
-    // drain runs.
-    if (instant != message.delivered) {
-      loop.run_until(message.delivered - Duration{1});
-      if (loop.monotonic_now() < message.delivered) {
-        loop.advance_until(message.delivered);
+  if (!gap_at_min && end >= session.run_start()) {
+    std::optional<MonotonicTime> instant;
+    for (const RecordedMessage& message : session.messages()) {
+      if (message.delivered > end) break;
+      SimulatedChannel* channel = channels[message.topic];
+      if (channel == nullptr) continue;
+      // Everything due before the message's delivery happens first; then the
+      // clock stands at it, so the drain there, a timer's or a wake's, is the
+      // first to see it. Every message of one instant goes out before that
+      // drain runs.
+      if (instant != message.delivered) {
+        if (message.delivered > session.run_start()) {
+          loop.run_until(message.delivered - Duration{1});
+          if (loop.monotonic_now() < message.delivered) {
+            loop.advance_until(message.delivered);
+          }
+        }
+        instant = message.delivered;
       }
-      instant = message.delivered;
+      channel->publish(session.payload(message), message.time);
+      ++report.fed[fed_index[message.topic]].messages;
     }
-    channel->publish(session.payload(message), message.time);
-    ++report.fed[fed_index[message.topic]].messages;
+    loop.run_until(end);
+  } else {
+    // Nothing in [run_start, end] (e.g. an offset-0 timer whose run's only
+    // dispatch record is its EXIT, or a gap before run_start): start the loop
+    // without publishing or dispatching anything, then finish.
+    loop.run_until(end);
   }
-  loop.run_until(end);
   loop.finish();
   return report;
 }

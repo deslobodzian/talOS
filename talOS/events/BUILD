@@ -2,8 +2,15 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
+_FRAMEWORK_VISIBILITY = [
+    "//studio:__subpackages__",
+    "//talOS:__subpackages__",
+    "//tools:__pkg__",
+]
+
 # Types shared by every loop: time, dispatch context, callbacks, the source
-# manifest, the timer queue, the recorder policy and the delivery policy.
+# manifest, the timer queue, the wake-arm stall guard, the recorder policy and
+# the delivery policy.
 # Header only, no OS calls.
 cc_library(
     name = "events_core",
@@ -15,6 +22,7 @@ cc_library(
         "manifest.h",
         "recorder.h",
         "scheduler.h",
+        "stall_guard.h",
         "time.h",
     ],
     visibility = ["//visibility:public"],
@@ -37,17 +45,21 @@ cc_test(
 cc_library(
     name = "events_log",
     srcs = [
+        "log/log_file_sink.cc",
         "log/log_reader.cc",
         "log/log_writer.cc",
     ],
     hdrs = [
         "log/format.h",
+        "log/gap_tracker.h",
+        "log/log_file_sink.h",
         "log/log_reader.h",
         "log/log_writer.h",
     ],
     visibility = ["//visibility:public"],
     deps = [
         ":events_core",
+        "//talOS/process",
         "//talOS/process:durable_sync",
     ],
 )
@@ -73,6 +85,8 @@ cc_test(
     deps = [
         ":events_log",
         ":gap_testing",
+        "//talOS/process",
+        "//talOS/process:durable_sync",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
@@ -102,9 +116,15 @@ cc_library(
     hdrs = select({
         "@platforms//os:macos": ["os/kqueue_poller.h"],
         "@platforms//os:linux": ["os/epoll_poller.h"],
-    }) + ["os/poller.h"],
-    visibility = ["//visibility:public"],
-    deps = [":events_core"],
+    }) + [
+        "os/poller.h",
+        "wake_channel_wait.h",
+    ],
+    visibility = _FRAMEWORK_VISIBILITY,
+    deps = [
+        ":events_core",
+        "//talOS/rtms:wake",
+    ],
 )
 
 cc_test(
@@ -137,7 +157,7 @@ cc_library(
         "replay_event_loop.h",
         "simulated_event_loop.h",
     ],
-    visibility = ["//visibility:public"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":events_core",
         ":events_log",
@@ -155,7 +175,7 @@ cc_library(
     name = "input_replay",
     srcs = ["input_replay.cc"],
     hdrs = ["input_replay.h"],
-    visibility = ["//visibility:public"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":events",
         ":events_core",

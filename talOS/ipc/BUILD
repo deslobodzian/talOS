@@ -11,15 +11,29 @@ talos_messages(
     visibility = ["//visibility:private"],
 )
 
+# Message-type concept only (no RTMS dependency), so talOS/node exposes
+# talos::Message without bringing raw IPC/RTMS headers into node compiles.
+cc_library(
+    name = "concepts",
+    hdrs = ["concepts.h"],
+    visibility = ["//visibility:public"],
+    deps = ["@flatbuffers"],
+)
+
 cc_library(
     name = "ipc",
     hdrs = [
-        "concepts.h",
         "publisher.h",
         "subscriber.h",
     ],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//bench/main_processor/swerve_module:__pkg__",
+        "//studio:__subpackages__",
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = [
+        ":concepts",
         "//talOS/rtms",
         "//talOS/schema:identity",
         "@flatbuffers",

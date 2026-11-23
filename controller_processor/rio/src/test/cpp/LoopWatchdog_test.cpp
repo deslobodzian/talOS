@@ -43,6 +43,12 @@ class RecordingOutputs final : public talos::rio::WatchdogOutputs {
   std::vector<std::string> reports;
 };
 
+// The poll period talOS/hardware/README.md "RoboRIO" states ("checks every
+// 5 ms"): the watchdog acts within it of a deadline passing, the margin
+// REQ-SAFE-25 holds the program to.
+// REQ-SAFE-25
+static_assert(LoopWatchdog::kPollPeriod == std::chrono::milliseconds{5});
+
 // Expiry plus one 5 ms period: the deadline Robot.cpp beats.
 constexpr uint64_t kDeadlineAfterUs = 105'000;
 constexpr uint64_t kPeriodUs = 5'000;
@@ -50,6 +56,7 @@ constexpr uint64_t kPeriodUs = 5'000;
 // A loop that beats every period with a command in force is never touched,
 // however long it runs; a missing beat is acted on only once its deadline
 // has passed.
+// REQ-SAFE-25
 TEST(LoopWatchdog, ActsOnlyOnceTheLastArmedDeadlinePasses) {
   RecordingOutputs outputs;
   LoopWatchdog watchdog{outputs};
@@ -78,6 +85,7 @@ TEST(LoopWatchdog, ActsOnlyOnceTheLastArmedDeadlinePasses) {
 
 // A tick that ends with no command in force neutralized the outputs itself:
 // however long the loop then stays silent, the watchdog does nothing.
+// REQ-SAFE-25
 TEST(LoopWatchdog, ADisarmingBeatLeavesALongSilenceAlone) {
   RecordingOutputs outputs;
   LoopWatchdog watchdog{outputs};
@@ -92,6 +100,7 @@ TEST(LoopWatchdog, ADisarmingBeatLeavesALongSilenceAlone) {
 // command it accepted then, and stalls again before its next beat: the
 // re-applied outputs are neutralized on the next poll, and every poll after,
 // with the stall reported once.
+// REQ-SAFE-25
 TEST(LoopWatchdog, OutputsReappliedWithoutABeatAreNeutralizedAgain) {
   RecordingOutputs outputs;
   LoopWatchdog watchdog{outputs};
@@ -115,6 +124,7 @@ TEST(LoopWatchdog, OutputsReappliedWithoutABeatAreNeutralizedAgain) {
 
 // A beat from the resumed loop moves the deadline: no action while it keeps
 // beating, and a second stall is acted on and reported again.
+// REQ-SAFE-25
 TEST(LoopWatchdog, AResumedLoopReArmsIt) {
   RecordingOutputs outputs;
   LoopWatchdog watchdog{outputs};

@@ -11,19 +11,22 @@ import {test} from 'node:test';
 
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DECODE_RETRY_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
-import {parseLayout} from '../src/drive/layout';
-import {DrawSchedule, esc, GLYPH_PX, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
+import {type Layout, layoutsEqual, parseLayout, trackedChannels} from '../src/drive/layout';
+import {fetchAndParseLayout, type LayoutFetchResult, LayoutReloader} from '../src/drive/reload';
+import {DrawSchedule, esc, GLYPH_PX, gridStyle, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderGridWidgets, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
 
 const LINK_LOST = 'hw/status/alert_error_link_lost';
+const PROTOCOL_MISMATCH = 'hw/status/alert_error_protocol_mismatch';
 const OWNER_TIMED_OUT = 'hw/status/alert_warning_owner_timed_out';
+const TELEOP_DISARMED = 'teleop/status/alert_warning_disarmed';
 const ROUTINES = ['preload', 'none', 'shoot_only', 'taxi'];
 
 // The 2026 dictionary as far as the feed carries it: every layout channel
-// (the link-lost alert among them: the bridge always lists it) plus the
-// /hw/status alert channels the alerts widget adds.
+// (the link-lost and protocol-mismatch alerts among them: the bridge always
+// lists both) plus the /hw/status alert channels the alerts widget adds.
 const LABELS: Record<string, string[]> = {
   'hw/state/driver_station/alliance': ['unknown', 'red', 'blue'],
   'hw/state/driver_station/match_type': ['none', 'practice', 'qualification', 'elimination'],
@@ -40,13 +43,15 @@ const DOUBLE = new Set(['hw/state/driver_station/match_time_s', 'hw/status/batte
 const unitOf = (name: string) => name.endsWith('_rps') ? 'rps' : name.endsWith('_v') ? 'V' :
     name.endsWith('_s') ? 's' : name.endsWith('_m') ? 'm' : name.endsWith('_rad') ? 'rad' : '';
 const CHANNELS: ChannelSpec[] = [
-  ...LAYOUT.channels.filter(name => name !== LINK_LOST).map(name => ({
+  ...LAYOUT.channels.filter(name => name !== LINK_LOST && name !== PROTOCOL_MISMATCH).map(name => ({
     name, unit: unitOf(name), labels: LABELS[name],
     kind: DOUBLE.has(name) ? ChannelKind.Double : UINT.has(name) ? ChannelKind.UInt :
                              ChannelKind.Bool
   })),
   {name: LINK_LOST, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
-  {name: OWNER_TIMED_OUT, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Warning}
+  {name: PROTOCOL_MISMATCH, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
+  {name: OWNER_TIMED_OUT, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Warning},
+  {name: TELEOP_DISARMED, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Warning}
 ];
 const INDEX = new Map(CHANNELS.map((c, i) => [c.name, i]));
 const DICTIONARY_ID = dictionaryId(CHANNELS);
@@ -74,12 +79,13 @@ const NOMINAL: Record<string, number> = {
   'pose_estimator/state/localized': 1,
   'shooter/state/flywheel_velocity_rps': 52.34, 'shooter/state/target_velocity_rps': 55,
   'shooter/state/at_speed': 0, 'shooter/state/beam_broken': 1,
-  [LINK_LOST]: 0, [OWNER_TIMED_OUT]: 0
+  [LINK_LOST]: 0, [PROTOCOL_MISMATCH]: 0, [OWNER_TIMED_OUT]: 0
 };
 
 // The same with /hw/status not published: its alert channels absent.
 const WITHOUT_HW_STATUS_ALERTS = Object.fromEntries(
-    Object.entries(NOMINAL).filter(([name]) => name !== LINK_LOST && name !== OWNER_TIMED_OUT));
+    Object.entries(NOMINAL).filter(
+        ([name]) => name !== LINK_LOST && name !== PROTOCOL_MISMATCH && name !== OWNER_TIMED_OUT));
 
 const raw = (name: string, value: number) =>
     CHANNELS[INDEX.get(name)!].kind === ChannelKind.Double ? rawFromDouble(value) : BigInt(value);
@@ -207,29 +213,6 @@ test('a widget the page cannot draw is shown, never a silent blank', () => {
   assert.match(status, /1 layout widget not drawn/, 'a widget with no readable cell vanished silently');
 });
 
-// REQ-OPS-36: a value is shown stale within 500 ms of its last update. The
-// bridge's empty update re-sends the held tick; only a sequence_id that
-// advances keeps the values current.
-test('values go stale within 500 ms of the last new tick, whatever else arrives', () => {
-  const h = harness();
-  h.connect(0);
-  // Heartbeat updates of the same tick every 100 ms: the producer stopped.
-  for (let t = 100; t <= STALE_MS; t += 100) {
-    h.at(t);
-    h.socket().send(...update(1, {}, false));
-  }
-  assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'), 'stale while current');
-  h.at(STALE_MS + 1);
-  const stale = widgetHtml(render(h), 'Flywheel');
-  assert.match(stale, /class="w w-number stale"/);
-  assert.match(stale, /tag-stale">STALE/);
-  assert.match(stale, /52\.3/, 'a stale value is still shown, marked');
-  // A heartbeat of a newer tick makes it current again.
-  h.at(600);
-  h.socket().send(...update(2, {}, false));
-  assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'));
-});
-
 // Timers on a test clock: `run(t)` fires, in order, every timeout due by t.
 function fakeTimers(clock: {now: number; wall: number}) {
   let pending: {at: number; fn: () => void; handle: number}[] = [];
@@ -257,13 +240,14 @@ function fakeTimers(clock: {now: number; wall: number}) {
   return {timers, run};
 }
 
-// REQ-OPS-36: a value is shown stale within 500 ms of its last update. The
-// bridge may deliver the producer's last tick up to its 100 ms heartbeat
-// after the tick, so the page's own share must be STALE_MS and not STALE_MS
-// plus a render period. The page draws every RENDER_MS at a phase unrelated
-// to the ticks while the bridge restamps the last tick every 100 ms;
-// whatever the phase, the first stale draw comes STALE_MS (+ STALE_DRAW_LAG_MS)
-// after the last new tick's receipt.
+// REQ-OPS-36: a value is shown stale within 500 ms of its last update,
+// whatever else arrives (the bridge's empty update re-sends the held tick;
+// only a sequence_id that advances keeps values current). The bridge may
+// deliver the producer's last tick up to its 100 ms heartbeat after the
+// tick, so the page's own share must be STALE_MS and not STALE_MS plus a
+// render period. Whatever the periodic draw phase, the first stale draw
+// comes STALE_MS (+ STALE_DRAW_LAG_MS) after the last new tick's receipt,
+// keeping the last value shown and marked, and a newer tick clears STALE.
 test('the page draws a stopped value stale at its deadline at any draw phase', () => {
   for (let phase = 0; phase < RENDER_MS; phase += 7) {
     const h = harness();
@@ -271,14 +255,19 @@ test('the page draws a stopped value stale at its deadline at any draw phase', (
     h.model.clock = () => clock.now;
     const {timers, run} = fakeTimers(clock);
     let shownStale = Infinity;
+    let staleHtml = '';
     const schedule = new DrawSchedule(h.model, now => {
       h.model.tick(now);
       h.clock.now = now;
-      if (shownStale === Infinity && widgetHtml(render(h), 'Flywheel').includes('STALE'))
+      const html = widgetHtml(render(h), 'Flywheel');
+      if (shownStale === Infinity && html.includes('STALE')) {
         shownStale = now;
+        staleHtml = html;
+      }
     }, timers);
     h.connect(0);  // the last new tick, received at 0
     schedule.frame();
+    assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'), 'stale while current');
     for (let t = 1; t <= 1000 && shownStale === Infinity; t++) {
       run(t);
       clock.now = clock.wall = t;
@@ -289,6 +278,15 @@ test('the page draws a stopped value stale at its deadline at any draw phase', (
     assert.ok(shownStale >= STALE_MS && shownStale <= STALE_MS + STALE_DRAW_LAG_MS,
               `draw phase ${phase} ms: first stale draw at ${shownStale} ms, deadline ` +
               `${STALE_MS} ms + ${STALE_DRAW_LAG_MS} ms (REQ-OPS-36: 500 ms with the bridge's 100 ms heartbeat)`);
+    if (phase === 0) {
+      assert.match(staleHtml, /class="w w-number stale"/);
+      assert.match(staleHtml, /tag-stale">STALE/);
+      assert.match(staleHtml, /52\.3/, 'a stale value is not shown');
+      h.at(600);
+      h.socket().send(...update(2, {}, false));
+      assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'),
+                'a newer tick did not clear STALE');
+    }
   }
 });
 
@@ -321,7 +319,7 @@ test('a connect-time keyframe shows its values stale until a newer tick arrives'
   h.join(0, NOMINAL, 100);
   const flywheel = () => widgetHtml(render(h), 'Flywheel');
   assert.match(flywheel(), /tag-stale">STALE/, 'the connect-time keyframe is shown current');
-  assert.match(flywheel(), /52\.3/, 'the keyframe values are shown, marked');
+  assert.match(flywheel(), /52\.3/, 'the keyframe values are not shown');
   assert.equal(h.model.status(h.clock.now).link, 'connecting');
   // The producer is dead: the bridge restamps tick 100 every 100 ms.
   for (let t = 100; t <= 1000; t += 100) {
@@ -353,7 +351,7 @@ test('a reconnect does not show the connect-time keyframe as current', () => {
   h.socket().send(...encodeDictionaryPages(header(60), CHANNELS),
                   ...update(60, {...NOMINAL, 'shooter/state/flywheel_velocity_rps': 70}, true));
   const held = widgetHtml(render(h), 'Flywheel');
-  assert.match(held, /70\.0/, 'the keyframe does not replace the held values');
+  assert.match(held, /70\.0/, 'the keyframe did not replace the held values');
   assert.match(held, /STALE/, 'the connect-time keyframe after a reconnect is shown current');
   h.at(reconnectedAt + 100);
   h.socket().send(...update(61, {}, false));
@@ -378,7 +376,8 @@ test('a channel never received is shown as no data, not zero', () => {
 // and the bucket refill after connecting reads as connecting.
 test('the status line names the failed link', () => {
   const cases: {name: string; arrange: (h: ReturnType<typeof harness>) => void; link: Link;
-                carried?: {channels: readonly string[]; alerts: boolean}}[] = [
+                carried?: {channels: readonly string[]; alerts: boolean};
+                textMatch?: RegExp}[] = [
     {name: 'all links up', link: 'ok', arrange: h => h.connect(0)},
     {name: 'socket closed', link: 'bridge', arrange: h => {
       h.connect(0);
@@ -411,6 +410,19 @@ test('the status line names the failed link', () => {
         h.socket().send(...update(1, {}, false));
       }
     }},
+    {name: 'protocol mismatch takes precedence over RoboRIO link lost', link: 'protocol',
+     textMatch: /protocol versions differ/i, arrange: h => {
+      h.connect(0);
+      h.at(50);
+      h.socket().send(...update(2, {[LINK_LOST]: 1, [PROTOCOL_MISMATCH]: 1}, false));
+    }},
+    {name: 'protocol mismatch named by a layout without an alerts widget', link: 'protocol',
+     carried: {channels: LAYOUT.channels, alerts: false},
+     textMatch: /protocol versions differ/i, arrange: h => {
+      h.connect(0);
+      h.at(50);
+      h.socket().send(...update(2, {[LINK_LOST]: 1, [PROTOCOL_MISMATCH]: 1}, false));
+    }},
     {name: 'RoboRIO link lost', link: 'roborio', arrange: h => {
       h.connect(0);
       h.at(50);
@@ -425,10 +437,13 @@ test('the status line names the failed link', () => {
     {name: 'no hw/status: the hardware bridge is not publishing', link: 'hardware', arrange: h => {
       h.connect(0, WITHOUT_HW_STATUS_ALERTS);
     }},
-    // The feed never carries the channel for this layout, so its absence
-    // says nothing about the RoboRIO link.
-    {name: 'layout without an alerts widget', link: 'ok',
-     carried: {channels: LAYOUT.channels.filter(n => n !== LINK_LOST), alerts: false},
+    // The feed never carries the link channels for this layout, so their absence
+    // says nothing about the RoboRIO link — and the OK line says it is not
+    // judged rather than claiming a verified link.
+    {name: 'layout without the link channel', link: 'ok',
+     carried: {channels: LAYOUT.channels.filter(n => n !== LINK_LOST && n !== PROTOCOL_MISMATCH),
+               alerts: false},
+     textMatch: /RoboRIO link not judged\)$/,
      arrange: h => {
       h.connect(0, WITHOUT_HW_STATUS_ALERTS);
     }},
@@ -438,8 +453,68 @@ test('the status line names the failed link', () => {
     c.arrange(h);
     const status = h.model.status(h.clock.now);
     assert.equal(status.link, c.link, `${c.name}: ${status.text}`);
-    assert.match(renderStatus(h.model, h.clock.now), new RegExp(`link-${c.link}`), c.name);
+    if (c.textMatch) assert.match(status.text, c.textMatch, `${c.name}: ${status.text}`);
+    const rendered = renderStatus(h.model, h.clock.now);
+    assert.match(rendered, new RegExp(`link-${c.link}`), c.name);
+    if (c.link === 'protocol') {
+      assert.match(rendered, /<b>PROTOCOL MISMATCH<\/b>/, c.name);
+      assert.match(rendered, /link-error/, c.name);
+      assert.doesNotMatch(rendered, /RoboRIO link lost/, c.name);
+      // Clearing alert_error_protocol_mismatch (1 -> 0) and link_lost recovers to ok.
+      h.at(h.clock.now + 50);
+      h.socket().send(...update(2, {
+        'hw/status/alert_error_protocol_mismatch': 0,
+        'hw/status/alert_error_link_lost': 0,
+      }, false));
+      assert.equal(h.model.status(h.clock.now).link, 'ok', `${c.name}: recovery`);
+    }
   }
+});
+
+// REQ-OPS-36: a session with no hardware bridge has no /hw/status in its
+// dictionary, so the OK line states that the RoboRIO link is not judged
+// without a hardware bridge. When a layout does carry hw/status/state_age_us,
+// renderStatus surfaces the State age alongside the status line.
+test('OK line names an absent hardware bridge, and surfaces state age when carried', () => {
+  const noHwChannels: ChannelSpec[] = [
+    {name: 'shooter/state/flywheel_velocity_rps', unit: 'rps', kind: ChannelKind.Double},
+  ];
+  const noHwHead = (seq: number) => ({
+    streamId: 11n, sequenceId: BigInt(seq), timestampNs: BigInt(seq) * 50_000_000n,
+    dictionaryId: dictionaryId(noHwChannels), channelCount: noHwChannels.length
+  });
+  const h = harness();
+  h.model.start(0);
+  h.socket().onopen!();
+  h.socket().send(
+      ...encodeDictionaryPages(noHwHead(0), noHwChannels),
+      ...encodeValuePages(noHwHead(0), POSE, true, [[0, rawFromDouble(10)]]),
+      ...encodeValuePages(noHwHead(1), POSE, false, []));
+  const status = h.model.status(0);
+  assert.equal(status.link, 'ok');
+  assert.match(status.text, /RoboRIO link not judged: no hardware bridge/);
+  assert.match(renderStatus(h.model, 0), /RoboRIO link not judged: no hardware bridge/);
+
+  const ageChannels: ChannelSpec[] = [
+    {name: LINK_LOST, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
+    {name: 'hw/status/state_age_us', unit: 'us', kind: ChannelKind.UInt},
+  ];
+  const ageHead = (seq: number) => ({
+    streamId: 12n, sequenceId: BigInt(seq), timestampNs: BigInt(seq) * 50_000_000n,
+    dictionaryId: dictionaryId(ageChannels), channelCount: ageChannels.length
+  });
+  const withAge = harness({channels: [LINK_LOST, 'hw/status/state_age_us'], alerts: true});
+  withAge.model.start(0);
+  withAge.socket().onopen!();
+  withAge.socket().send(
+      ...encodeDictionaryPages(ageHead(0), ageChannels),
+      ...encodeValuePages(ageHead(0), POSE, true, [[0, 0n], [1, 4200n]]),
+      ...encodeValuePages(ageHead(1), POSE, false, []));
+  assert.match(renderStatus(withAge.model, 0), /state age 4 ms/);
+  withAge.socket().send(...encodeValuePages(ageHead(2), POSE, false, [[0, 1n], [1, 0n]]));
+  assert.match(renderStatus(withAge.model, 0), /link-roborio.*no state received/);
+  withAge.socket().send(...encodeValuePages(ageHead(3), POSE, false, [[0, 1n], [1, 350_000n]]));
+  assert.match(renderStatus(withAge.model, 0), /link-roborio.*state age 350 ms/);
 });
 
 // REQ-OPS-36: on a close or an error the page reconnects every 1 s, one
@@ -455,7 +530,7 @@ test('reconnects every second after a close or an error, one socket at a time', 
   assert.equal(h.sockets.length, 2, 'no reconnect 1 s after the last attempt');
   // The attempt fails at once (the bridge is down): the next goes 1 s later.
   h.sockets[1].onerror!();
-  assert.ok(h.sockets[1].closed, 'an errored socket is closed');
+  assert.ok(h.sockets[1].closed, 'an errored socket is not closed');
   h.at(2 * RECONNECT_MS - 1);
   assert.equal(h.sockets.length, 2, 'reconnected within 1 s of the last attempt');
   h.at(2 * RECONNECT_MS);
@@ -501,6 +576,23 @@ test('alerts: active by level as a word, and a 100 ms activation latched', () =>
   assert.match(after, /<b>hw<\/b> link lost<\/span> <span class="meta">×1<\/span>/);
 });
 
+// REQ-OPS-55: /drive shows why operator control is disarmed, as a warning
+// the alerts widget names by its channel, and clears it once armed.
+test('teleop/status/alert_warning_disarmed = 1 draws a disarmed warning', () => {
+  const h = harness();
+  h.connect(0);
+  h.at(50);
+  h.socket().send(...update(2, {[TELEOP_DISARMED]: 1}, false));
+  const active = widgetHtml(render(h), 'Alerts');
+  assert.ok(active.includes(
+      `<span class="level">WARNING</span> <span class="name" title="${TELEOP_DISARMED}">`),
+      active);
+  assert.ok(!active.includes('<p class="none">none</p>'), active);
+  h.at(150);
+  h.socket().send(...update(3, {[TELEOP_DISARMED]: 0}, false));
+  assert.match(widgetHtml(render(h), 'Alerts'), /<h3>Active<\/h3><p class="none">none<\/p>/);
+});
+
 // REQ-OPS-38: the routine widget names the routine from the dictionary's
 // labels, and shows the number when the index is out of range.
 test('the routine widget shows the label for the index, the number out of range', () => {
@@ -524,10 +616,12 @@ test('the subsystems widget lists the summary, one state word per row', () => {
   h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
     registry: true, omitted: 3, nodes: [
       node('hardware_node', {}), node('drivetrain', {restarts: 2, drives: 'teleop'}),
-      node('shooter', {alive: false, quarantined: true})]}));
+      node('shooter', {alive: false, quarantined: true}),
+      node('studio_bridge', {critical: false, restarts: 3})]}));
   const html = widgetHtml(render(h), 'Subsystems');
   assert.match(html, /drivetrain<\/span><span class="tag tag-good">UP<\/span><span class="meta">restarts 2 · drives teleop/);
   assert.match(html, /shooter<\/span><span class="tag tag-bad">FAILING<\/span>/);
+  assert.match(html, /studio_bridge<\/span><span class="tag tag-good">UP<\/span><span class="meta">restarts 3/);
   for (const row of html.match(/<li>.*?<\/li>/g) ?? [])
     assert.ok((row.match(/class="tag /g) ?? []).length <= 1, `two state words in ${row}`);
   assert.match(html, /\+3 more/);
@@ -692,7 +786,7 @@ test('a feed none of whose pages decode is named and backed off', () => {
   }
   assert.equal(named, CONNECTING_GRACE_MS + 100,
                `an undecodable feed is named at ${named} ms, ${h.model.status(h.clock.now).text}`);
-  assert.deepEqual(starts, [0, 1700, 3400, 3400 + DECODE_RETRY_MS, 3400 + 2 * DECODE_RETRY_MS]);
+  assert.deepEqual(starts, [0, 1600, 3200, 3200 + DECODE_RETRY_MS, 3200 + 2 * DECODE_RETRY_MS]);
 });
 
 // REQ-OPS-36: once named, a feed that stays undecodable stays named on every
@@ -730,6 +824,60 @@ test('an undecodable feed stays named across the grace of each reconnect', () =>
     else if (named) assert.fail(`${t} ms (${t - opened} ms after open): the named feed reads as ${status.text}`);
   }
   assert.ok(reconnects >= 3, `${reconnects} reconnects after the feed was named`);
+});
+
+// REQ-OPS-36: a corrupt binary page within CONNECTING_GRACE_MS followed only by
+// heartbeats (no valid value page ever decodes on the socket) fails once the
+// grace expires, reports the undecodable feed, and backs off reconnects after
+// DECODE_RETRIES consecutive failures. If a valid dictionary and value page
+// arrive before grace expires, the socket recovers and stays open past grace.
+test('a corrupt binary page within grace followed only by heartbeats fails after grace', () => {
+  const dictPage = encodeDictionaryPages(header(0), CHANNELS)[0];
+  const corruptDict = dictPage.slice(0, dictPage.length - 5);
+  const heartbeat = '{"kind":"talos.drive.heartbeat"}';
+
+  const h = harness();
+  const starts: number[] = [];
+  for (let t = 0; t <= 9000; t += 100) {
+    const before = h.sockets.length;
+    h.at(t);
+    if (t === 0) h.model.start(0);
+    if (h.sockets.length !== before) {
+      starts.push(t);
+      h.socket().onopen!();
+      h.socket().send(corruptDict);
+    } else if (h.model.connection === 'open') {
+      h.socket().send(heartbeat);
+    }
+    if (t <= CONNECTING_GRACE_MS) {
+      assert.equal(h.sockets.length, 1, `closed early at ${t} ms within grace`);
+      assert.equal(h.sockets[0].closed, false, `socket closed early at ${t} ms`);
+    } else {
+      const status = h.model.status(t);
+      assert.ok(status.undecodable, `${t} ms: expected undecodable status, got "${status.text}"`);
+      assert.match(status.text, /Telemetry feed could not be decoded/);
+    }
+  }
+  assert.ok(h.sockets[0].closed, 'first socket stayed open past grace after corrupt dictionary');
+  assert.deepEqual(starts, [0, 1600, 3200, 3200 + DECODE_RETRY_MS]);
+
+  // Recovery within grace: a corrupt page followed by a valid dictionary and
+  // value page before grace ends keeps the socket open past CONNECTING_GRACE_MS.
+  const recovered = harness();
+  recovered.at(0);
+  recovered.model.start(0);
+  recovered.socket().onopen!();
+  recovered.socket().send(corruptDict);
+  recovered.at(100);
+  recovered.socket().send(...encodeDictionaryPages(header(0), CHANNELS),
+                          ...update(0, NOMINAL, true), ...update(1, {}, false));
+  for (let t = 200; t <= CONNECTING_GRACE_MS + 500; t += 100) {
+    recovered.at(t);
+    recovered.socket().send(...update(t / 100, {}, false));
+  }
+  assert.equal(recovered.sockets.length, 1, 'recovered socket reconnected after grace');
+  assert.equal(recovered.sockets[0].closed, false, 'recovered socket closed after grace');
+  assert.equal(recovered.model.status(recovered.clock.now).link, 'ok');
 });
 
 // REQ-OPS-36: a keyframe of several pages applies each as it arrives, the
@@ -973,6 +1121,94 @@ test('subsystems rows put failed and driving nodes first', () => {
   assert.deepEqual(order, ['shooter', 'vision', 'drivetrain', 'telemetry', 'camera']);
 });
 
+// REQ-SAFE-41: a live subsystem whose devices flush is holding outputs with no
+// live target (`outputs_held: true`) shows HELD (`tag-warn`) with one state
+// word per row, names "outputs held: no live target" in its note and title,
+// yields to FAILING / unknown / DOWN when those apply, and ranks right after
+// failed nodes ahead of driving and idle subsystems.
+test('subsystems widget renders outputs_held as HELD, ranked right after failed nodes', () => {
+  const node = (name: string, extra: object) => ({name, alive: true, critical: true, restarts: 0,
+                                                  quarantined: false, drives: null, ...extra});
+  const h = harness();
+  h.connect(0);
+  h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
+    registry: true, omitted: 0, nodes: [
+      node('camera', {critical: false}),
+      node('drivetrain', {drives: 'teleop'}),
+      node('intake', {outputs_held: true, restarts: 1}),
+      node('vision', {critical: false, alive: false}),
+      node('shooter', {alive: false, quarantined: true, outputs_held: true}),
+      node('elevator', {alive: false, outputs_held: true})]}));
+  const html = widgetHtml(render(h), 'Subsystems');
+  assert.match(html,
+               /title="intake · outputs held: no live target · restarts 1">intake<\/span><span class="tag tag-warn">HELD<\/span><span class="meta">outputs held: no live target · restarts 1<\/span>/);
+  assert.match(html, /shooter<\/span><span class="tag tag-bad">FAILING<\/span>/);
+  assert.match(html, /elevator<\/span><span class="tag tag-bad">DOWN<\/span>/);
+  assert.match(html, /drivetrain<\/span><span class="tag tag-good">UP<\/span>/);
+  const rows = html.match(/<li>.*?<\/li>/g) ?? [];
+  for (const row of rows)
+    assert.ok((row.match(/class="tag /g) ?? []).length <= 1, `two state words in ${row}`);
+  const shooterRow = rows.find(r => r.includes('>shooter<'));
+  const elevatorRow = rows.find(r => r.includes('>elevator<'));
+  assert.ok(shooterRow && !shooterRow.includes('outputs held'), shooterRow);
+  assert.ok(elevatorRow && !elevatorRow.includes('outputs held'), elevatorRow);
+  const order = [...html.matchAll(/<span class="name"[^>]*>([^<]*)</g)].map(m => m[1]);
+  assert.deepEqual(order, ['shooter', 'elevator', 'vision', 'intake', 'drivetrain', 'camera']);
+
+  // Without a readable registry, unknown wins over outputs_held and no held note shows.
+  h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
+    registry: false, omitted: 0, nodes: [node('intake', {outputs_held: true})]}));
+  const unread = widgetHtml(render(h), 'Subsystems');
+  assert.match(unread, /intake<\/span><span class="tag tag-neutral">unknown<\/span>/);
+  assert.doesNotMatch(unread, /HELD|outputs held/);
+});
+
+// REQ-OPS-49: listRowsFit's box model assumes drive.css keeps zero margin and
+// padding on lists and their items, uses --drive-list-gap only between columns
+// (no row-gap), and sets each list item's height to --drive-row and item gap
+// to --drive-item-gap. Any extra spacing on these selectors would silently
+// overflow the calculated row count.
+test('list selectors keep the margin, padding, gap and height listRowsFit models', () => {
+  const css = readFileSync(new URL('../src/drive/drive.css', import.meta.url), 'utf8')
+                  .replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...css.matchAll(/([^{}@]+)\{([^}]*)\}/g)].map(([, sel, body]) => ({
+    selectors: sel.split(',').map(s => s.trim().replace(/\s+/g, ' ')),
+    body
+  }));
+  const declsFor = (selector: string) => {
+    const out = new Map<string, string>();
+    for (const r of rules) {
+      if (!r.selectors.includes(selector)) continue;
+      for (const part of r.body.split(';')) {
+        const colon = part.indexOf(':');
+        if (colon < 0) continue;
+        out.set(part.slice(0, colon).trim(), part.slice(colon + 1).trim());
+      }
+    }
+    return out;
+  };
+  const ul = declsFor('ul');
+  assert.equal(ul.get('margin'), '0', 'ul must have margin: 0');
+  assert.equal(ul.get('padding'), '0', 'ul must have padding: 0');
+
+  for (const list of ['.nodes', '.checks']) {
+    const d = declsFor(list);
+    assert.equal(d.get('column-gap'), 'var(--drive-list-gap)', `${list} column-gap`);
+    assert.equal(d.get('row-gap'), undefined, `${list} must not set row-gap`);
+    assert.equal(d.get('gap'), undefined, `${list} must not set gap (adds row-gap)`);
+    assert.equal(d.get('margin'), undefined, `${list} must not add margin`);
+    assert.equal(d.get('padding'), undefined, `${list} must not add padding`);
+  }
+
+  for (const item of ['.alerts li', '.nodes li', '.checks li']) {
+    const d = declsFor(item);
+    assert.equal(d.get('height'), 'var(--drive-row)', `${item} height`);
+    assert.equal(d.get('gap'), 'var(--drive-item-gap)', `${item} gap`);
+    assert.equal(d.get('margin'), undefined, `${item} must not add margin`);
+    assert.equal(d.get('padding'), undefined, `${item} must not add padding`);
+  }
+});
+
 // A Surface of plain objects that lays out like a browser: `grid` holds the
 // element at each index, so a test can tell a kept element from a replaced
 // one by identity. Each element's list body holds its `<li>` rows, ROW px
@@ -983,10 +1219,13 @@ test('subsystems rows put failed and driving nodes first', () => {
 const ROW = METRICS.row, ROOM = 100;
 type FakeElement = {html: string; top: number; attached: boolean; height: number; content: number};
 function fakeSurface() {
-  const page = {status: '', errored: false, grid: [] as FakeElement[], puts: 0};
+  const page = {status: '', drawError: '', errored: false, grid: [] as FakeElement[], puts: 0};
   const surface: Surface<FakeElement> = {
     status: html => {
       page.status = html;
+    },
+    drawError: html => {
+      page.drawError = html;
     },
     create: html => ({html, top: 0, attached: false, height: ROOM,
                       content: (html.match(/<li>/g)?.length ?? 0) * ROW}),
@@ -995,6 +1234,10 @@ function fakeSurface() {
       next.attached = true;
       page.grid[index] = next;
       page.puts++;
+    },
+    remove: (index, previous) => {
+      previous.attached = false;
+      if (page.grid[index] === previous) page.grid.splice(index, 1);
     },
     fit: e => {
       if (e.attached) e.height = Math.floor(ROOM / ROW) * ROW;
@@ -1024,12 +1267,12 @@ test('the painter replaces only a changed widget and keeps a list scrolled', () 
   const painter = new Painter(surface);
   // As the page does: each paint, then every list snapped to whole rows.
   const paint = (graph: string, nodes: string) => {
-    painter.paint(() => ({status: '<div>OK</div>', widgets: [graph, nodes]}));
+    painter.paint(() => '<div>OK</div>', () => [graph, nodes]);
     page.grid.forEach(e => surface.fit(e));
   };
   paint('<section>graph 1</section>', rows(10));
   const [graph, list] = page.grid;
-  assert.ok(graph && list, 'the first paint draws every widget');
+  assert.ok(graph && list, 'the first paint did not draw every widget');
   surface.setScrollTop(list, 2 * ROW);  // the driver scrolled the list
   paint('<section>graph 2</section>', rows(10));
   assert.notEqual(page.grid[0], graph, 'a changed widget is not repainted');
@@ -1059,25 +1302,641 @@ test('the out-of-view count of a scrolled list', () => {
   assert.equal(outOfViewText({above: 0, below: 0}), '');
 });
 
-// REQ-OPS-49, REQ-OPS-36: a drawing fault is named on the status line and
-// must not leave the last grid looking current: the frame says so there and
-// marks the grid, which keeps its elements. The next good draw clears the
-// mark and repaints the status line, even when it draws the same text as
-// before the fault.
-test('a drawing error marks the grid and the next good draw clears it', () => {
+// REQ-OPS-49, REQ-OPS-36: a widget drawing fault keeps the top status line
+// visible (and live as link status changes), shows a DRAWING ERROR row
+// telling the operator to reload, and marks the grid while keeping its last
+// elements. If drawing the status line itself throws, the status slot shows
+// DRAWING ERROR; the next good draw clears the mark and repaints cleanly.
+test('a drawing error keeps the status line, says to reload, and clears on recovery', () => {
   const {page, surface} = fakeSurface();
   const painter = new Painter(surface);
-  const good = () => ({status: '<div>status</div>', widgets: ['<section>grid</section>']});
-  painter.paint(good);
+  const okStatus = '<div class="status link-ok"><b>OK</b> Connected</div>';
+  const lostStatus = '<div class="status link-roborio"><b>ROBORIO LINK</b> RoboRIO link lost</div>';
+  const goodWidgets = () => ['<section>grid</section>'];
+
+  painter.paint(() => okStatus, goodWidgets);
   const shown = page.grid[0];
-  painter.paint(() => {
+  // A widget throws while the RoboRIO link also drops: the status line
+  // updates and stays visible, while the DRAWING ERROR row tells the driver
+  // to reload.
+  painter.paint(() => lostStatus, () => {
     throw new Error('<x-fault>');
   });
   assert.equal(page.errored, true, 'a drawing error leaves the grid unmarked');
   assert.equal(page.grid[0], shown);
-  assert.match(page.status, /link-error/);
-  assert.ok(page.status.includes(esc('<x-fault>')), page.status);
-  painter.paint(good);
+  assert.equal(page.status, lostStatus, 'a widget drawing error overwrote the top status line');
+  assert.match(page.drawError, /link-error/);
+  assert.match(page.drawError, /DRAWING ERROR/);
+  assert.match(page.drawError, /reload the page/i);
+  assert.ok(page.drawError.includes(esc('<x-fault>')), page.drawError);
+
+  // Recovery clears the DRAWING ERROR row and grid mark.
+  painter.paint(() => okStatus, goodWidgets);
   assert.equal(page.errored, false);
-  assert.equal(page.status, '<div>status</div>', 'the status line is not repainted after a drawing error');
+  assert.equal(page.drawError, '', 'the DRAWING ERROR row was not cleared on recovery');
+  assert.equal(page.status, okStatus);
+
+  // If drawing the status line itself throws, the status slot falls back to
+  // DRAWING ERROR telling the operator to reload, and recovers on the next
+  // good draw even when the status text matches the pre-fault status.
+  painter.paint(() => {
+    throw new Error('<x-status-fault>');
+  }, goodWidgets);
+  assert.equal(page.errored, true);
+  assert.equal(page.drawError, '');
+  const fallbackStatus: string = page.status;
+  assert.match(fallbackStatus, /link-error.*DRAWING ERROR.*reload the page/i);
+  assert.ok(fallbackStatus.includes(esc('<x-status-fault>')), fallbackStatus);
+  painter.paint(() => okStatus, goodWidgets);
+  assert.equal(page.errored, false);
+  assert.equal(page.status, okStatus, 'the status line was not repainted after a status drawing error');
+});
+
+// REQ-OPS-34, REQ-OPS-36, TODO.md DEPLOY-12: when the bridge runs in refusal
+// mode (`--refusal-file`) and sends a `talos.drive.summary` with
+// `launch_refused: true` and `refusal_reason`, `/drive` renders a clear
+// `LAUNCH REFUSED` banner with the exact escaped refusal reason instead of
+// blaming `BRIDGE LINK` or `TELEMETRY`, even with no telemetry ticks.
+test('a refused launch renders LAUNCH REFUSED with its reason instead of BRIDGE LINK', () => {
+  const minimalLayout = parseLayout({
+    title: 'Drive',
+    columns: 1,
+    rows: 1,
+    update_hz: 5,
+    alerts: false,
+    channels: [],
+    widgets: []
+  });
+  const h = harness(minimalLayout);
+  h.model.start(0);
+  h.socket().onopen!();
+  const reason = 'error: motor_py: unread parameter key <unread.value_m>';
+  h.socket().send(JSON.stringify({
+    kind: 'talos.drive.summary',
+    session: '',
+    supervised: false,
+    registry: false,
+    launch_refused: true,
+    refusal_reason: reason,
+    nodes: [],
+    omitted: 0
+  }));
+
+  // Immediate status and past CONNECTING_GRACE_MS with only heartbeats: stays
+  // LAUNCH REFUSED, never BRIDGE LINK or TELEMETRY.
+  for (let t = 0; t <= CONNECTING_GRACE_MS + 500; t += 100) {
+    h.at(t);
+    if (t > 0) h.socket().send('{"kind":"talos.drive.heartbeat"}');
+    const status = h.model.status(t);
+    assert.equal(status.link, 'refused', `${t} ms: got ${status.link} (${status.text})`);
+    assert.equal(status.text, reason);
+  }
+
+  const statusHtml = renderStatus(h.model, h.clock.now);
+  assert.match(statusHtml, /class="status link-refused"/);
+  assert.match(statusHtml, /<b>LAUNCH REFUSED<\/b>/);
+  assert.ok(statusHtml.includes(esc(reason)), statusHtml);
+  assert.doesNotMatch(statusHtml, /BRIDGE LINK/);
+  assert.doesNotMatch(statusHtml, /TELEMETRY/);
+
+  const pageHtml = renderDashboard(minimalLayout, h.model, h.clock.now);
+  assert.match(pageHtml, /class="w refusal-banner"/);
+  assert.match(pageHtml, /LAUNCH REFUSED/);
+  assert.ok(pageHtml.includes(esc(reason)), pageHtml);
+  assert.doesNotMatch(pageHtml, /BRIDGE LINK/);
+
+  // After a reconnect to a healthy session, LAUNCH REFUSED clears.
+  h.socket().onclose!({code: 1006, reason: ''});
+  h.at(h.clock.now + RECONNECT_MS);
+  h.socket().onopen!();
+  h.socket().send(
+      ...encodeDictionaryPages(header(1), CHANNELS),
+      ...update(1, NOMINAL, true),
+      ...update(2, {}, false));
+  assert.equal(h.model.status(h.clock.now).link, 'ok');
+});
+
+// Flushes pending Promise microtasks so async layout fetches resolve without
+// wall-clock sleeps.
+async function flushMicrotasks() {
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+}
+
+const okJson = (value: unknown): LayoutFetchResult => ({
+  ok: true, status: 200, json: async () => value
+});
+
+// REQ-OPS-34, REQ-OPS-36, REQ-OPS-37, REQ-OPS-39: after a bridge restart with
+// an edited dashboard layout (or transitioning out of refusal mode), /drive
+// re-fetches /drive/layout.json on WebSocket reconnect, updates the title,
+// grid, widgets, tracked channels and carried-channel mask in place (removing
+// excess widgets), and keeps latched alerts and connect-time keyframe
+// staleness intact without a page reload.
+test('reloads an edited layout on WebSocket reconnect without losing latched alerts', async () => {
+  const editedJson = {
+    title: 'Practice Drive',
+    columns: 6,
+    rows: 4,
+    update_hz: 20,
+    alerts: true,
+    channels: ['hw/status/battery_v', LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [
+      {kind: 'alerts', at: [0, 0, 3, 4], title: 'Alerts', channels: {}},
+      {kind: 'number', at: [3, 0, 3, 2], title: 'Voltage', label: 'Voltage',
+       precision: 2, channels: {channel: 'hw/status/battery_v'}},
+      {kind: 'graph', at: [3, 2, 3, 2], title: 'Battery trace',
+       series: ['hw/status/battery_v'], window_s: 10, channels: {}},
+    ]
+  };
+  let activeLayout: Layout = LAYOUT;
+  let title = LAYOUT.title;
+  let style = gridStyle(LAYOUT);
+  let clearCount = 0;
+  const fetches: {url: string; cache: string}[] = [];
+  let nextResponse: () => Promise<LayoutFetchResult> = async () => okJson(editedJson);
+
+  const h = harness(activeLayout);
+  const {page, surface} = fakeSurface();
+  const painter = new Painter(surface);
+  const clock = {now: 0, wall: 1e12};
+  const {timers} = fakeTimers(clock);
+  const paint = () => painter.paint(
+      () => renderStatus(h.model, h.clock.now, activeLayout.skipped),
+      () => renderGridWidgets(activeLayout, h.model, h.clock.now),
+      reloader.error);
+
+  const reloader = new LayoutReloader(
+      activeLayout,
+      signal => fetchAndParseLayout((url, init) => {
+        fetches.push({url, cache: init.cache});
+        return nextResponse();
+      }, '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) {
+            activeLayout = next;
+            h.model.setLayout(trackedChannels(next), next);
+            title = next.title;
+            style = gridStyle(next);
+            painter.clearWidgets();
+            clearCount++;
+          }
+          paint();
+        },
+        onError: () => paint()
+      });
+  h.model.onLayoutCheck = reason => reloader.trigger(reason);
+  h.model.onDisconnect = () => reloader.cancelPending();
+
+  // Initial connect: no redundant fetch on the very first open.
+  h.connect(0);
+  paint();
+  assert.equal(fetches.length, 0, 'initial connect should not duplicate initial layout fetch');
+  assert.equal(page.grid.length, LAYOUT.widgets.length);
+
+  // Latch a warning alert and record flywheel history before the restart.
+  h.at(50);
+  h.socket().send(...update(2, {[OWNER_TIMED_OUT]: 1}, false));
+  h.at(150);
+  h.socket().send(...update(3, {[OWNER_TIMED_OUT]: 0}, false));
+  assert.ok(h.model.history('shooter/state/flywheel_velocity_rps').length > 0);
+  assert.equal(h.model.alerts.latch().alerts.length, 1);
+
+  // Bridge restarts with the edited layout.
+  h.socket().onclose!({code: 1006, reason: ''});
+  h.at(RECONNECT_MS);
+  h.socket().onopen!();
+  await flushMicrotasks();
+
+  assert.deepEqual(fetches, [{url: '/drive/layout.json', cache: 'no-store'}]);
+  assert.equal(clearCount, 1);
+  assert.equal(title, 'Practice Drive');
+  assert.match(style, /repeat\(6,minmax\(0,1fr\)\).*repeat\(4,minmax\(0,1fr\)\)/);
+  assert.equal(page.grid.length, 3, 'removed widgets from the old layout must not linger');
+  assert.equal(page.errored, false);
+  assert.equal(page.drawError, '');
+  // Tracked channels updated: removed flywheel history dropped, new battery_v seeded/tracked.
+  assert.equal(h.model.history('shooter/state/flywheel_velocity_rps').length, 0);
+  assert.equal(h.model.history('hw/status/battery_v').length, 1);
+
+  // Connect-time keyframe stays stale until a newer tick arrives, and latched
+  // alerts survive intact in the reloaded Alerts widget.
+  h.socket().send(...encodeDictionaryPages(header(10), CHANNELS),
+                  ...update(10, {...NOMINAL, 'hw/status/battery_v': 12.42}, true));
+  paint();
+  assert.match(page.grid[1].html, /STALE/);
+  assert.match(page.grid[1].html, /12\.42/);
+  assert.match(page.grid[0].html, /owner timed out.*×1/);
+  h.at(RECONNECT_MS + 100);
+  h.socket().send(...update(11, {'hw/status/battery_v': 12.45}, false));
+  paint();
+  assert.doesNotMatch(page.grid[1].html, /STALE/);
+  assert.match(page.grid[1].html, /12\.45/);
+  assert.deepEqual(h.model.history('hw/status/battery_v').map(p => p.v), [12.61, 12.42, 12.45]);
+
+  // Also verify refusal-mode (channels: []) -> normal layout updates `carried`
+  // so RoboRIO link status is judged again after recovery.
+  const minimalLayout = parseLayout({
+    title: 'Drive', columns: 1, rows: 1, update_hz: 5, alerts: false, channels: [], widgets: []
+  });
+  let carriedLayout = minimalLayout;
+  const h2 = harness(carriedLayout);
+  const r2 = new LayoutReloader(
+      carriedLayout,
+      signal => fetchAndParseLayout(() => Promise.resolve(okJson(editedJson)),
+                                    '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h2.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) {
+            carriedLayout = next;
+            h2.model.setLayout(trackedChannels(next), next);
+          }
+        },
+        onError: () => {}
+      });
+  h2.model.onLayoutCheck = reason => r2.trigger(reason);
+  h2.connect(0, {...NOMINAL, [LINK_LOST]: 1});
+  assert.equal(h2.model.status(0).link, 'ok', 'minimal layout does not judge RoboRIO link');
+  h2.socket().onclose!({code: 1006, reason: ''});
+  h2.at(RECONNECT_MS);
+  h2.socket().onopen!();
+  await flushMicrotasks();
+  h2.socket().send(...encodeDictionaryPages(header(20), CHANNELS),
+                   ...update(20, {...NOMINAL, [LINK_LOST]: 1}, true),
+                   ...update(21, {}, false));
+  assert.equal(h2.model.status(RECONNECT_MS).link, 'roborio',
+               'reloaded layout must update carried channels so RoboRIO link is judged');
+});
+
+// REQ-OPS-36, REQ-OPS-49: a reconnect to an unchanged layout (even with
+// differently ordered keys in JSON) does not tear down the grid or disturb
+// list element identity and scroll position.
+test('keeps grid elements and list scroll position when reconnect serves an unchanged layout', async () => {
+  const rawLayout = JSON.parse(
+      readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8'));
+  // Reverse channel key order on a widget to prove structural equality.
+  const reordered = structuredClone(rawLayout);
+  const matchWidget = reordered.widgets.find((w: {kind: string}) => w.kind === 'match');
+  matchWidget.channels = Object.fromEntries(Object.entries(matchWidget.channels).reverse());
+  assert.ok(layoutsEqual(LAYOUT, parseLayout(reordered)));
+
+  let onLayoutCalls = 0;
+  const h = harness(LAYOUT);
+  const {page, surface} = fakeSurface();
+  const painter = new Painter(surface);
+  const clock = {now: 0, wall: 1e12};
+  const {timers} = fakeTimers(clock);
+  const reloader = new LayoutReloader(
+      LAYOUT,
+      signal => fetchAndParseLayout(() => Promise.resolve(okJson(reordered)),
+                                    '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: () => {
+          onLayoutCalls++;
+        },
+        onError: () => assert.fail('unexpected layout error')
+      });
+  h.model.onLayoutCheck = reason => reloader.trigger(reason);
+
+  const summary = JSON.stringify({
+    kind: 'talos.drive.summary', session: '42', supervised: true, registry: true, omitted: 0,
+    nodes: Array.from({length: 10}, (_, i) => ({
+      name: `node_${i}`, alive: true, critical: true, restarts: 0, quarantined: false, drives: null
+    }))
+  });
+  h.connect(0);
+  h.socket().send(summary);
+  const paint = () => {
+    painter.paint(
+        () => renderStatus(h.model, h.clock.now, LAYOUT.skipped),
+        () => renderGridWidgets(LAYOUT, h.model, h.clock.now),
+        reloader.error);
+    page.grid.forEach(e => surface.fit(e));
+  };
+  paint();
+  const subIdx = LAYOUT.widgets.findIndex(w => w.kind === 'subsystems');
+  const subElement = page.grid[subIdx];
+  surface.setScrollTop(subElement, 2 * ROW);
+  assert.equal(surface.scrollTop(subElement), 2 * ROW);
+
+  // Reconnect with identical layout: onLayout is not called and element survives.
+  h.socket().onclose!({code: 1006, reason: ''});
+  h.at(RECONNECT_MS);
+  h.socket().onopen!();
+  await flushMicrotasks();
+  assert.equal(onLayoutCalls, 0, 'unchanged layout must not trigger grid teardown');
+  h.socket().send(...encodeDictionaryPages(header(5), CHANNELS), ...update(5, NOMINAL, true),
+                  ...update(6, {}, false), summary);
+  paint();
+  assert.equal(page.grid[subIdx], subElement, 'unchanged list widget must keep its element');
+  assert.equal(surface.scrollTop(page.grid[subIdx]), 2 * ROW);
+});
+
+// REQ-OPS-34, REQ-OPS-39: mid-connection session changes and telemetry
+// dictionary/stream changes trigger a layout reload, coalescing concurrent
+// triggers without duplicating fetches on normal ticks or initial connect.
+test('reloads layout on mid-connection session and dictionary changes', async () => {
+  const layoutA = parseLayout({
+    title: 'Session A', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'A', channels: {channel: 'hw/status/battery_v'}}]
+  });
+  const layoutB = {
+    title: 'Session B', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'B', channels: {channel: 'hw/status/battery_v'}}]
+  };
+  const layoutC = {
+    title: 'Dict C', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'C', channels: {channel: 'hw/status/battery_v'}}]
+  };
+  const reasons: string[] = [];
+  const resolvers: ((r: LayoutFetchResult) => void)[] = [];
+  let appliedTitle = layoutA.title;
+  const h = harness(layoutA);
+  const clock = {now: 0, wall: 1e12};
+  const {timers} = fakeTimers(clock);
+  const reloader = new LayoutReloader(
+      layoutA,
+      signal => fetchAndParseLayout(() => new Promise<LayoutFetchResult>(resolve => {
+        resolvers.push(resolve);
+      }), '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) appliedTitle = next.title;
+        },
+        onError: () => assert.fail('unexpected error')
+      });
+  h.model.onLayoutCheck = reason => {
+    reasons.push(reason);
+    reloader.trigger(reason);
+  };
+
+  h.connect(0);
+  const makeSummary = (session: string) => JSON.stringify({
+    kind: 'talos.drive.summary', session, supervised: true, registry: true, omitted: 0, nodes: []
+  });
+  h.socket().send(makeSummary('100'));
+  h.at(50);
+  h.socket().send(makeSummary('100'), ...update(2, {}, false));
+  assert.deepEqual(reasons, [], 'initial summary and steady ticks must not reload');
+
+  // Mid-connection session epoch change triggers a reload.
+  h.at(100);
+  h.socket().send(makeSummary('101'));
+  assert.deepEqual(reasons, ['session']);
+  assert.equal(resolvers.length, 1);
+
+  // A dictionary/stream change while the first fetch is still in flight
+  // coalesces into one follow-up fetch (never spawns a parallel storm).
+  const newHead = (seq: number) => ({
+    streamId: 99n, sequenceId: BigInt(seq), timestampNs: BigInt(seq) * 50_000_000n,
+    dictionaryId: DICTIONARY_ID, channelCount: CHANNELS.length
+  });
+  h.socket().send(...encodeDictionaryPages(newHead(1), CHANNELS),
+                  ...encodeValuePages(newHead(1), POSE, true, [[INDEX.get('hw/status/battery_v')!, rawFromDouble(12.5)]]));
+  h.socket().send(makeSummary('102'));
+  assert.deepEqual(reasons, ['session', 'dictionary', 'session']);
+  assert.equal(resolvers.length, 1, 'concurrent mid-connection triggers must wait behind in-flight fetch');
+
+  resolvers[0](okJson(layoutB));
+  await flushMicrotasks();
+  assert.equal(appliedTitle, 'Session B');
+  assert.equal(resolvers.length, 2, 'coalesced follow-up fetch must run once');
+
+  resolvers[1](okJson(layoutC));
+  await flushMicrotasks();
+  assert.equal(appliedTitle, 'Dict C');
+});
+
+// REQ-OPS-34, REQ-OPS-36, REQ-OPS-37, REQ-OPS-39, REQ-OPS-49: if reloading
+// /drive/layout.json fails (HTTP error, network error, invalid JSON, or layout
+// validation error), /drive fails closed: the top status line stays live (and
+// still reports link drops), LAYOUT ERROR shows the escaped reason, the
+// previous grid stays frozen and marked errored, alert latching keeps working,
+// retries back off after 3 failures and pause on close 4000, and a subsequent
+// valid layout clears the error cleanly.
+test('fails closed on layout reload errors while keeping status line and alerts live', async () => {
+  const editedJson = {
+    title: 'Recovered Drive',
+    columns: 4,
+    rows: 2,
+    update_hz: 20,
+    alerts: true,
+    channels: ['hw/status/battery_v', LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [
+      {kind: 'alerts', at: [0, 0, 2, 2], title: 'Alerts', channels: {}},
+      {kind: 'number', at: [2, 0, 2, 2], title: 'Battery', label: 'Battery',
+       precision: 2, channels: {channel: 'hw/status/battery_v'}},
+    ]
+  };
+  let activeLayout: Layout = LAYOUT;
+  const h = harness(activeLayout);
+  const {page, surface} = fakeSurface();
+  const painter = new Painter(surface);
+  const clock = {now: 0, wall: 1e12};
+  h.model.clock = () => clock.now;
+  const {timers, run} = fakeTimers(clock);
+  const paint = () => painter.paint(
+      () => renderStatus(h.model, clock.now, activeLayout.skipped),
+      () => renderGridWidgets(activeLayout, h.model, clock.now),
+      reloader.error);
+
+  const responses: (() => Promise<LayoutFetchResult>)[] = [
+    async () => ({ok: false, status: 500}),
+    async () => { throw new TypeError('network <x-net> down'); },
+    async () => ({ok: true, status: 200, json: async () => { throw new SyntaxError('bad json'); }}),
+    async () => okJson({columns: 0, rows: 0, widgets: []}),
+    async () => okJson(editedJson),
+  ];
+  const fetchTimes: number[] = [];
+  const reloader = new LayoutReloader(
+      activeLayout,
+      signal => fetchAndParseLayout(() => {
+        fetchTimes.push(clock.now);
+        const next = responses.shift();
+        if (!next) throw new Error('unexpected extra fetch');
+        return next();
+      }, '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) {
+            activeLayout = next;
+            h.model.setLayout(trackedChannels(next), next);
+            painter.clearWidgets();
+          }
+          paint();
+        },
+        onError: () => paint()
+      });
+  h.model.onLayoutCheck = reason => reloader.trigger(reason);
+  h.model.onDisconnect = () => reloader.cancelPending();
+
+  // Connect and draw initial layout.
+  h.connect(0);
+  paint();
+  const initialWidget0 = page.grid[0];
+  assert.equal(page.errored, false);
+
+  // Reconnect -> failure #1: HTTP 500.
+  h.socket().onclose!({code: 1006, reason: ''});
+  clock.now = RECONNECT_MS;
+  h.model.tick(clock.now);
+  h.socket().onopen!();
+  await flushMicrotasks();
+  assert.equal(page.errored, true, 'grid must be marked errored on layout reload failure');
+  assert.equal(page.grid[0], initialWidget0, 'last valid grid stays frozen until reload succeeds');
+  assert.match(page.drawError, /<b>LAYOUT ERROR<\/b>.*HTTP 500/);
+
+  // Status line stays live while in LAYOUT ERROR: RoboRIO link drop surfaces
+  // immediately in the top status line AND latches in AlertTracker.
+  h.socket().send(...encodeDictionaryPages(header(5), CHANNELS),
+                  ...update(5, NOMINAL, true),
+                  ...update(6, {[LINK_LOST]: 1}, false));
+  paint();
+  assert.match(page.status, /<b>ROBORIO LINK<\/b>.*RoboRIO link lost/);
+  assert.equal(page.errored, true);
+  assert.ok(h.model.alerts.latch().alerts.some(a => a.channel === LINK_LOST),
+            'alerts must still latch while layout reload is errored');
+
+  // Failure #2 (retry after RECONNECT_MS): network error with markup is escaped.
+  run(RECONNECT_MS + RECONNECT_MS - 1);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 1);
+  run(2 * RECONNECT_MS);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 2);
+  assert.match(page.drawError, /<b>LAYOUT ERROR<\/b>/);
+  assert.ok(!page.drawError.includes('<x-net>'), 'error message must be escaped');
+  assert.ok(page.drawError.includes(esc('<x-net>')), page.drawError);
+
+  // Failure #3 (retry after RECONNECT_MS): invalid JSON; now 3 consecutive
+  // failures -> next retry backs off to DECODE_RETRY_MS (5 s).
+  run(3 * RECONNECT_MS);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 3);
+  assert.match(page.drawError, /not valid JSON/);
+
+  // Keep socket alive with updates while verifying 5 s backoff before failure #4.
+  for (let t = 3 * RECONNECT_MS + 1000; t < 3 * RECONNECT_MS + DECODE_RETRY_MS; t += 1000) {
+    clock.now = t;
+    h.socket().send(...update(10 + t / 1000, {}, false));
+    run(t);
+    await flushMicrotasks();
+    assert.equal(fetchTimes.length, 3, `retried early at ${t} ms before DECODE_RETRY_MS`);
+  }
+  run(3 * RECONNECT_MS + DECODE_RETRY_MS);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 4);
+  assert.match(page.drawError, /Invalid dashboard layout.*no valid grid/);
+
+  // Close 4000 (replaced): stops retrying while replaced, keeps error & status.
+  h.socket().onclose!({code: REPLACED_CODE, reason: 'replaced by a newer driver dashboard'});
+  paint();
+  assert.match(page.status, /<b>REPLACED<\/b>/);
+  assert.equal(page.errored, true, 'existing layout error remains fail-closed across close');
+  run(3 * RECONNECT_MS + DECODE_RETRY_MS + 30_000);
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 4, 'must not retry layout fetch while replaced (close 4000)');
+
+  // User clicks Reconnect -> fetch #5 returns valid layout -> recovers cleanly.
+  clock.now = 40_000;
+  h.model.reconnect(clock.now);
+  h.socket().onopen!();
+  await flushMicrotasks();
+  assert.equal(fetchTimes.length, 5);
+  assert.equal(reloader.error, null);
+  assert.equal(page.errored, false);
+  assert.equal(page.drawError, '');
+  assert.equal(page.grid.length, 2);
+  assert.match(page.grid[0].html, /link lost.*×1/, 'latched alert survived recovery');
+});
+
+// REQ-OPS-36, REQ-OPS-39: stale out-of-order layout fetches from an older
+// reconnect are aborted and ignored even if they later resolve or reject, and
+// a socket closing mid-fetch does not flash a spurious LAYOUT ERROR.
+test('ignores stale out-of-order layout fetch responses and aborts on disconnect', async () => {
+  const layoutV2 = {
+    title: 'V2', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'V2', channels: {channel: 'hw/status/battery_v'}}]
+  };
+  const layoutV1 = {
+    title: 'V1-stale', columns: 2, rows: 1, update_hz: 20, alerts: false,
+    channels: [LINK_LOST, PROTOCOL_MISMATCH],
+    widgets: [{kind: 'number', at: [0, 0, 2, 1], title: 'V1', channels: {channel: 'hw/status/battery_v'}}]
+  };
+  const pending: {
+    signal?: AbortSignal;
+    resolve: (r: LayoutFetchResult) => void;
+    reject: (e: unknown) => void;
+  }[] = [];
+  const errors: string[] = [];
+  let activeTitle = LAYOUT.title;
+
+  const h = harness(LAYOUT);
+  const clock = {now: 0, wall: 1e12};
+  const {timers} = fakeTimers(clock);
+  const reloader = new LayoutReloader(
+      LAYOUT,
+      signal => fetchAndParseLayout((_url, init) => new Promise<LayoutFetchResult>((resolve, reject) => {
+        pending.push({signal: init.signal, resolve, reject});
+      }), '/drive/layout.json', signal),
+      timers,
+      {
+        isConnected: () => h.model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) activeTitle = next.title;
+        },
+        onError: msg => errors.push(msg)
+      });
+  h.model.onLayoutCheck = reason => reloader.trigger(reason);
+  h.model.onDisconnect = () => reloader.cancelPending();
+
+  h.connect(0);
+  // Reconnect #1 starts fetch #1 (slow).
+  h.socket().onclose!({code: 1006, reason: ''});
+  h.at(RECONNECT_MS);
+  h.socket().onopen!();
+  assert.equal(pending.length, 1);
+
+  // Socket closes mid-fetch: fetch #1 is aborted, no spurious LAYOUT ERROR.
+  h.socket().onclose!({code: 1006, reason: ''});
+  assert.equal(pending[0].signal?.aborted, true);
+  pending[0].reject(new Error('aborted'));
+  await flushMicrotasks();
+  assert.equal(reloader.error, null);
+  assert.deepEqual(errors, []);
+
+  // Reconnect #2 starts fetch #2 (slow); reconnect #3 supersedes it with fetch #3.
+  h.at(2 * RECONNECT_MS);
+  h.socket().onopen!();
+  assert.equal(pending.length, 2);
+  // Simulate a hung fetch #2 when reconnect #3 arrives directly.
+  reloader.trigger('reconnect');
+  assert.equal(pending[1].signal?.aborted, true);
+  assert.equal(pending.length, 3);
+
+  // Fetch #3 resolves first with V2.
+  pending[2].resolve(okJson(layoutV2));
+  await flushMicrotasks();
+  assert.equal(activeTitle, 'V2');
+  assert.equal(reloader.error, null);
+
+  // Superseded fetch #2 resolves late with V1-stale: must be ignored!
+  pending[1].resolve(okJson(layoutV1));
+  await flushMicrotasks();
+  assert.equal(activeTitle, 'V2', 'stale fetch overwrote newer layout');
+  assert.equal(reloader.error, null);
 });

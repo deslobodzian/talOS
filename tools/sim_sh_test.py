@@ -1,12 +1,14 @@
-"""Tests for sim.sh --config: which file a path names, and the refusals that
-stop it before anything builds or starts.
+"""Tests for sim.sh --config and failed-build diagnostics.
 
 sim.sh runs from a copy at the root of a scratch workspace, with a `bazel`
 on PATH that runs the real manifest check (//tools:sync_manifest --check)
-and a resolver stub that stops sim.sh right after it, so no simulation
-starts and nothing is written outside the workspace.
+and a resolver stub that stops sim.sh right after it (or stubs a failing
+build into a test-local TALOS_SIM_LOG_DIR), so no simulation starts and
+nothing is written outside the workspace.
 """
 
+import glob
+import json
 import os
 import shlex
 import shutil
@@ -150,6 +152,228 @@ class SimShConfigTest(unittest.TestCase):
         self.assertEqual(checked, ["--check", CONFIG])
         self.assertIn(f"bazel run //tools:sync_manifest -- {CONFIG}", output)
         self.assertNotIn("cannot resolve", output)
+
+    # REQ-DEV-05
+    def test_failed_build_prints_last_60_lines_and_build_log_path(self):
+        # A failing `bazel build` in sim.sh writes its full output to
+        # $TALOS_SIM_LOG_DIR/<session_id>/sim/build.log, prints only the last
+        # 60 lines to stderr, and names the log's path in the fatal error.
+        resolved = json.dumps({
+            "nodes": ["//bot:node"],
+            "effective": {
+                "robot": {"sim_gateway": "//talOS/simulation:sim_gateway"},
+                "studio": {},
+            },
+        })
+        put(os.path.join(self.root, "bazel-bin", "talOS", "configuration",
+                         "resolve"),
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
+            0o755)
+        check = ("import sys; from tools import sync_manifest; "
+                 "sys.exit(sync_manifest.main(sys.argv[1:]))")
+        bin_dir = os.path.join(self.tmp, "bin")
+        put(os.path.join(bin_dir, "bazel"),
+            "#!/bin/sh\n"
+            'if [ "$1" = build ]; then\n'
+            '  i=1\n'
+            '  while [ "$i" -le 80 ]; do\n'
+            '    printf "build-line-%02d\\n" "$i"\n'
+            '    i=$((i + 1))\n'
+            '  done\n'
+            '  exit 1\n'
+            'fi\n'
+            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
+            'while [ "$1" != -- ]; do shift; done; shift\n'
+            f'printf "%s\\n" "$*" >> {shlex.quote(self.log)}\n'
+            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
+            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
+            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            0o755)
+
+        log_root = os.path.join(self.tmp, "sim_logs")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--sim-gateway",
+             "--no-studio"],
+            cwd=self.root, env=env, capture_output=True, text=True,
+            timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        logs = glob.glob(os.path.join(log_root, "*", "sim", "build.log"))
+        self.assertEqual(len(logs), 1,
+                         f"expected build.log under {log_root}: {proc.stderr}")
+        build_log = logs[0]
+        self.assertIn(build_log, proc.stderr)
+        self.assertNotIn("build-line-20", proc.stderr)
+        self.assertIn("build-line-21", proc.stderr)
+        self.assertIn("build-line-80", proc.stderr)
+        with open(build_log, encoding="utf-8") as f:
+            recorded = f.read().splitlines()
+        self.assertEqual(len(recorded), 80)
+        self.assertEqual(recorded[0], "build-line-01")
+        self.assertEqual(recorded[-1], "build-line-80")
+
+    # REQ-OPS-20
+    def test_wpilib_mode_checks_session_lock_before_build_and_before_gradlew(self):
+        # TOOLS-7: in WPILib mode, sim.sh runs `launcher --check-session-lock`
+        # before `bazel build` if the launcher binary already exists, and again
+        # right before starting `./gradlew simulateNative` after the build.
+        resolved = json.dumps({
+            "nodes": ["//bot:node"],
+            "effective": {"robot": {}, "studio": {}},
+        })
+        put(os.path.join(self.root, "bazel-bin", "talOS", "configuration",
+                         "resolve"),
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
+            0o755)
+        launcher_path = os.path.join(self.root, "bazel-bin", "talOS",
+                                     "launcher", "launcher")
+        build_marker = os.path.join(self.tmp, "bazel_build_called")
+        gradle_marker = os.path.join(self.tmp, "gradlew_called")
+        put(os.path.join(self.root, "controller_processor", "rio", "gradlew"),
+            f"#!/bin/sh\necho called > {shlex.quote(gradle_marker)}\nexit 0\n",
+            0o755)
+        check = ("import sys; from tools import sync_manifest; "
+                 "sys.exit(sync_manifest.main(sys.argv[1:]))")
+        bin_dir = os.path.join(self.tmp, "bin")
+
+        # Case 1: launcher already exists and reports a held lock -> fails
+        # before `bazel build` and before `gradlew`.
+        put(launcher_path,
+            '#!/bin/sh\n'
+            'if [ "$1" = "--check-session-lock" ]; then\n'
+            '  echo "launcher: another launcher (pid 4242) is running a session" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            'exit 0\n',
+            0o755)
+        put(os.path.join(bin_dir, "bazel"),
+            "#!/bin/sh\n"
+            f'if [ "$1" = build ]; then echo build > {shlex.quote(build_marker)}; exit 0; fi\n'
+            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
+            'while [ "$1" != -- ]; do shift; done; shift\n'
+            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
+            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
+            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            0o755)
+        log_root = os.path.join(self.tmp, "sim_logs_lock1")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--headless", "--no-studio"],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("pid 4242", proc.stderr)
+        self.assertFalse(os.path.exists(build_marker),
+                         "bazel build should not run when prebuilt launcher sees held lock")
+        self.assertFalse(os.path.exists(gradle_marker),
+                         "gradlew should not start when session lock is held")
+
+        # Case 2: launcher did not exist before build; build creates it and
+        # post-build lock check fails before `gradlew simulateNative`.
+        os.remove(launcher_path)
+        launcher_script = (
+            "#!/bin/sh\n"
+            'if [ "$1" = "--check-session-lock" ]; then\n'
+            '  echo "launcher: another launcher (pid 5151) is running a session" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            'exit 0\n'
+        )
+        put(os.path.join(bin_dir, "bazel"),
+            "#!/bin/sh\n"
+            'if [ "$1" = build ]; then\n'
+            f'  echo build > {shlex.quote(build_marker)}\n'
+            f'  mkdir -p {shlex.quote(os.path.dirname(launcher_path))}\n'
+            f'  printf %s {shlex.quote(launcher_script)} > {shlex.quote(launcher_path)}\n'
+            f'  chmod 755 {shlex.quote(launcher_path)}\n'
+            '  exit 0\n'
+            'fi\n'
+            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
+            'while [ "$1" != -- ]; do shift; done; shift\n'
+            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
+            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
+            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            0o755)
+        log_root2 = os.path.join(self.tmp, "sim_logs_lock2")
+        env2 = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root2)
+        proc2 = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--headless", "--no-studio"],
+            cwd=self.root, env=env2, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc2.returncode, 1, proc2.stdout + proc2.stderr)
+        self.assertTrue(os.path.exists(build_marker),
+                        "bazel build should run when launcher is not yet built")
+        self.assertIn("pid 5151", proc2.stderr)
+        self.assertFalse(os.path.exists(gradle_marker),
+                         "gradlew must not start when post-build session lock check fails")
+
+    # REQ-OPS-20
+    def test_wpilib_mode_stale_prebuilt_launcher_falls_through_to_build(self):
+        # A stale pre-build launcher that rejects --check-session-lock (or
+        # fails for a non-holder reason) must fall through to `bazel build`
+        # instead of aborting before rebuilding; the post-build check remains
+        # strict and reports non-holder failures accurately.
+        resolved = json.dumps({
+            "nodes": ["//bot:node"],
+            "effective": {"robot": {}, "studio": {}},
+        })
+        put(os.path.join(self.root, "bazel-bin", "talOS", "configuration",
+                         "resolve"),
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(resolved)}\n",
+            0o755)
+        launcher_path = os.path.join(self.root, "bazel-bin", "talOS",
+                                     "launcher", "launcher")
+        build_marker = os.path.join(self.tmp, "bazel_build_stale")
+        gradle_marker = os.path.join(self.tmp, "gradlew_stale")
+        put(os.path.join(self.root, "controller_processor", "rio", "gradlew"),
+            f"#!/bin/sh\necho called > {shlex.quote(gradle_marker)}\nexit 0\n",
+            0o755)
+        check = ("import sys; from tools import sync_manifest; "
+                 "sys.exit(sync_manifest.main(sys.argv[1:]))")
+        bin_dir = os.path.join(self.tmp, "bin")
+
+        # Stale pre-build launcher rejects --check-session-lock as unknown.
+        put(launcher_path,
+            '#!/bin/sh\n'
+            'echo "launcher error: unknown argument: --check-session-lock" >&2\n'
+            'exit 1\n',
+            0o755)
+        # Build replaces it with a current launcher that fails the post-build
+        # check with a non-holder error (e.g. unwritable lock file).
+        rebuilt_launcher = (
+            "#!/bin/sh\n"
+            'if [ "$1" = "--check-session-lock" ]; then\n'
+            '  echo "launcher: cannot open the session lock /tmp/lock: Permission denied" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            'exit 0\n'
+        )
+        put(os.path.join(bin_dir, "bazel"),
+            "#!/bin/sh\n"
+            'if [ "$1" = build ]; then\n'
+            f'  echo build > {shlex.quote(build_marker)}\n'
+            f'  printf %s {shlex.quote(rebuilt_launcher)} > {shlex.quote(launcher_path)}\n'
+            f'  chmod 755 {shlex.quote(launcher_path)}\n'
+            '  exit 0\n'
+            'fi\n'
+            '[ "$1" = run ] || { echo "bazel stub: $*" >&2; exit 97; }\n'
+            'while [ "$1" != -- ]; do shift; done; shift\n'
+            f"BUILD_WORKSPACE_DIRECTORY={shlex.quote(self.root)} "
+            f"PYTHONPATH={shlex.quote(os.pathsep.join(sys.path[1:]))} "
+            f'exec {shlex.quote(sys.executable)} -c {shlex.quote(check)} "$@"\n',
+            0o755)
+
+        log_root = os.path.join(self.tmp, "sim_logs_stale")
+        env = dict(self.env, PWD=self.root, TALOS_SIM_LOG_DIR=log_root)
+        proc = subprocess.run(
+            ["bash", self.sim, "--config", CONFIG, "--headless", "--no-studio"],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertTrue(os.path.exists(build_marker),
+                        "stale pre-build launcher must fall through to bazel build")
+        self.assertFalse(os.path.exists(gradle_marker),
+                         "post-build check must remain strict before gradlew")
+        self.assertIn("Permission denied", proc.stderr)
+        self.assertIn("session lock check failed", proc.stderr)
+        self.assertNotIn("another session holds the session lock", proc.stderr)
 
 
 if __name__ == "__main__":

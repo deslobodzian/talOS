@@ -9,7 +9,7 @@
 
 import {useEffect, useMemo, useRef, useState} from 'react';
 
-import {useActions, useEvents, usePlayback} from '../../data/hooks';
+import {useActions, useEvents, usePlayback, useSourceKind} from '../../data/hooks';
 import type {EventCategory, RobotEvent, Severity} from '../../data/types';
 import {timestamp} from '../../ui/formatters';
 import {EmptyState} from '../../ui/primitives';
@@ -98,6 +98,8 @@ function EventsPanel({config, setConfig}: PanelProps<EventsConfig>) {
   const events = useEvents();
   const playback = usePlayback();
   const actions = useActions();
+  const sourceKind = useSourceKind();
+  const recorded = sourceKind === 'recorded';
 
   const filtered = useMemo(
       () => filterEvents(events, config),
@@ -189,10 +191,11 @@ function EventsPanel({config, setConfig}: PanelProps<EventsConfig>) {
           {severity} {counts[severity]}
         </span>)}
       </div>
-      <button className={'follow' + (config.follow ? ' selected' : '')}
-              onClick={() => setConfig({...config, follow: !config.follow})}>
-        Follow live: {config.follow ? 'on' : 'off'}
-      </button>
+      {recorded ? <span className="text-muted">Recorded timeline</span> :
+        <button className={'follow' + (config.follow ? ' selected' : '')}
+                onClick={() => setConfig({...config, follow: !config.follow})}>
+          Follow live: {config.follow ? 'on' : 'off'}
+        </button>}
     </div>
 
     <div className="events-filters">
@@ -220,8 +223,9 @@ function EventsPanel({config, setConfig}: PanelProps<EventsConfig>) {
     </div>
 
     {events.length === 0 ? <EmptyState>
-      No events yet. Connect to a robot bridge, or start demo data to watch the
-      event timeline.
+      {recorded ?
+        'No events recorded in this session.' :
+        'No events yet. Connect to a robot bridge, or start demo data to watch the event timeline.'}
     </EmptyState> : filtered.length === 0 ? <EmptyState>
       No events match the current filters.
     </EmptyState> : <div className="events-scroll" ref={scrollRef}
@@ -249,5 +253,6 @@ export const eventsPanel: PanelDefinition<EventsConfig> = {
   description: 'A seekable timeline of robot events, filterable by severity, category and text.',
   defaultConfig,
   parseConfig,
-  component: EventsPanel
+  component: EventsPanel,
+  recorded: true
 };

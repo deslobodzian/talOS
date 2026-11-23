@@ -11,6 +11,7 @@
 // NeutralOut for one out of contract.
 #include "PhoenixBackend.h"
 
+#include <frc/DigitalInput.h>
 #include <frc/simulation/DriverStationSim.h>
 #include <frc/simulation/DutyCycleEncoderSim.h>
 #include <frc/simulation/EncoderSim.h>
@@ -24,18 +25,23 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctre/phoenix6/controls/NeutralOut.hpp>
 #include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -284,6 +290,19 @@ ctre::phoenix::StatusCode AwaitAnswer(Request request) {
   return ::testing::AssertionSuccess();
 }
 
+// One restore pass of `ids`, as the gateway runs one after a reset.
+::testing::AssertionResult RestorePass(PhoenixBackend& backend,
+                                       std::span<const uint16_t> ids) {
+  const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+  backend.BeginRestoreAfterReset(ids);
+  while (backend.PollRestore() == hw::Backend::RestoreStatus::kPending) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      return ::testing::AssertionFailure() << "restore still pending";
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return ::testing::AssertionSuccess();
+}
+
 hw::MotorConfig TestMotor(uint16_t id, const std::string& name, int can_id) {
   hw::MotorConfig m;
   m.id = id;
@@ -437,6 +456,60 @@ TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
   ASSERT_TRUE(backend.Read(state));
   EXPECT_TRUE(state.encoders[0].valid);
   EXPECT_NEAR(state.encoders[0].position_rot, 0.275, 1e-9);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+}
+
+// A non-finite duty-cycle reading while connected invalidates only that tick
+// and must not poison last_position_rot so the next valid reading is also
+// invalidated by a NaN velocity finite difference (a backend-internal gap
+// Gateway's ReplaceNonFinite cannot repair).
+// REQ-SAFE-22, REQ-CONTRACT-32
+TEST(PhoenixBackendEncoders,
+     NonFiniteDutyCycleReadingDoesNotPoisonNextValidTick) {
+  EnsureHal();
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "m1", 1));
+  config.encoders.push_back(DutyEncoder(11, "duty", 2, 0.125));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  frc::sim::DutyCycleEncoderSim sim(2);
+  sim.SetConnected(true);
+  sim.Set(0.25);
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  hw::State state{};
+  ASSERT_TRUE(backend.Read(state));
+  ASSERT_TRUE(state.encoders[0].valid);
+
+  // Inject NaN while connected: this tick's encoder sample is invalid and
+  // zeroed, while the backend stays healthy.
+  sim.Set(std::numeric_limits<double>::quiet_NaN());
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_FALSE(state.encoders[0].valid);
+  EXPECT_DOUBLE_EQ(state.encoders[0].position_rot, 0.0);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+
+  // Next tick returns a valid finite reading: must recover immediately at rest
+  // rather than computing remainder(pos - NaN, 1.0).
+  sim.Set(0.4);
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_TRUE(state.encoders[0].valid)
+      << "non-finite reading poisoned last_position_rot on the next valid tick";
+  EXPECT_NEAR(state.encoders[0].position_rot, 0.275, 1e-9);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+
+  // Same for +Inf.
+  sim.Set(std::numeric_limits<double>::infinity());
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_FALSE(state.encoders[0].valid);
+  EXPECT_DOUBLE_EQ(state.encoders[0].position_rot, 0.0);
+  EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
+
+  sim.Set(0.5);
+  ASSERT_TRUE(backend.Read(state));
+  EXPECT_TRUE(state.encoders[0].valid)
+      << "+Inf reading poisoned last_position_rot on the next valid tick";
+  EXPECT_NEAR(state.encoders[0].position_rot, 0.375, 1e-9);
   EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
 }
 
@@ -820,6 +893,313 @@ TEST(PhoenixBackendSim, NeutralPreservesMomentumAndBrakeDecaysFasterThanCoast) {
   EXPECT_GT(coast.after_300ms_rps, 10.0 * std::max(brake.after_300ms_rps, 0.1));
 }
 
+// Desktop simulation drives each motor through WPILib's DCMotorSystem plant
+// (motor type, FOC variant, and gear-reflected inertia) and forwards the
+// simulated RoboRIO battery voltage to each device rather than assuming a
+// fixed 100 rps / 12 V lag.
+// REQ-DEV-06
+TEST(PhoenixBackendSim, WpilibPlantReflectsMotorTypeFocGearingAndSupply) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto x60 = TestMotor(1, "x60", 1);
+  auto x60_foc = TestMotor(2, "x60_foc", 2);
+  x60_foc.foc = true;
+  auto x44 = TestMotor(3, "x44", 3);
+  x44.motor_type.value = hw::MotorType::kKrakenX44;
+  auto geared_x60 = TestMotor(4, "geared_x60", 4);
+  geared_x60.sensor_to_mechanism_ratio = 5.0;
+  config.motors = {x60, x60_foc, x44, geared_x60};
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  const std::array<hw::MotorRequest, 4> drive_6v{
+      Request(1, hw::Mode::kVoltage, 6.0), Request(2, hw::Mode::kVoltage, 6.0),
+      Request(3, hw::Mode::kVoltage, 6.0), Request(4, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, drive_6v, 35);
+  for (std::size_t i = 0; i < 4; ++i) ASSERT_TRUE(state.motors[i].valid) << i;
+
+  // Kraken X44 (7758 rpm) spins noticeably faster than Kraken X60 (6000 rpm),
+  // which spins slightly faster unloaded than Kraken X60 FOC (5800 rpm);
+  // gearing divides reported mechanism speed while preserving rotor dynamics.
+  EXPECT_GT(state.motors[0].velocity_rps, 45.0);
+  EXPECT_GT(state.motors[2].velocity_rps, state.motors[0].velocity_rps * 1.20);
+  EXPECT_GT(state.motors[0].velocity_rps, state.motors[1].velocity_rps + 1.0);
+  EXPECT_NEAR(state.motors[3].velocity_rps, state.motors[0].velocity_rps / 5.0,
+              0.5);
+
+  // Forwarding RoboRIO battery voltage: duty cycle 1.0 at an injected 8 V
+  // battery applies ~8 V instead of hardcoded 12 V, without overwriting the
+  // injected RoboRioSim battery reading.
+  const auto prev_v = frc::sim::RoboRioSim::GetVInVoltage();
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{8.0});
+  struct RestoreBattery {
+    units::volt_t volts;
+    ~RestoreBattery() { frc::sim::RoboRioSim::SetVInVoltage(volts); }
+  } restore{prev_v};
+
+  const std::array<hw::MotorRequest, 4> full_duty{
+      Request(1, hw::Mode::kDutyCycle, 1.0),
+      Request(2, hw::Mode::kNeutral, 0.0), Request(3, hw::Mode::kNeutral, 0.0),
+      Request(4, hw::Mode::kNeutral, 0.0)};
+  PumpReads(backend, state, full_duty, 30);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, 8.0);
+  EXPECT_NEAR(state.motors[0].voltage, 8.0, 0.5);
+
+  // Dropping the simulated battery below Phoenix's 4 V floor (12.8 V -> 3.0 V)
+  // updates simulated device supply to 4.0 V rather than leaving it stuck at
+  // 12.8 V, while keeping the raw 3.0 V RoboRIO battery reading untouched.
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{hw::kSimRestingSupplyV});
+  PumpReads(backend, state, full_duty, 20);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, hw::kSimRestingSupplyV);
+  EXPECT_GT(state.motors[0].voltage, 11.5);
+
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{3.0});
+  PumpReads(backend, state, full_duty, 30);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, 3.0);
+  EXPECT_NEAR(state.motors[0].voltage, 4.0, 0.5);
+  backend.Neutral();
+}
+
+// Under desktop simulation with kRemoteCANcoder and sensor_to_mechanism_ratio
+// != 1, the simulated CANcoder sits on the sensor shaft (rotor /
+// rotor_to_sensor_ratio = mechanism * sensor_to_mechanism_ratio) so Phoenix 6's
+// TalonFX divides by SensorToMechanismRatio once, reporting rotor / (R * S)
+// rather than rotor / (R * S^2).
+// REQ-DEV-06
+TEST(PhoenixBackendSim, RemoteCancoderAppliesSensorToMechanismRatioOnce) {
+  EnsureHal();
+  EnabledDs ds;
+
+  constexpr double kRotorToSensor = 4.0;
+  constexpr double kSensorToMechanism = 3.0;
+  constexpr double kTotalRatio = kRotorToSensor * kSensorToMechanism;
+
+  hw::Config config;
+  auto rotor_ref = TestMotor(1, "rotor_ref", 1);
+  hw::SensorConfig enc{10, "remote_enc", hw::SensorKind::kCANcoder, 10, "rio"};
+  config.sensors.push_back(enc);
+
+  auto remote = TestMotor(2, "remote_motor", 2);
+  remote.feedback = hw::Feedback::kRemoteCANcoder;
+  remote.feedback_sensor_id = enc.id;
+  remote.rotor_to_sensor_ratio = kRotorToSensor;
+  remote.sensor_to_mechanism_ratio = kSensorToMechanism;
+  config.motors = {rotor_ref, remote};
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  const std::array<hw::MotorRequest, 2> drive_6v{
+      Request(1, hw::Mode::kVoltage, 6.0), Request(2, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, drive_6v, 35);
+  ASSERT_TRUE(state.motors[0].valid);
+  ASSERT_TRUE(state.motors[1].valid);
+  ASSERT_TRUE(state.sensors[0].valid);
+  ASSERT_GT(state.motors[0].velocity_rps, 40.0);
+  ASSERT_GT(state.motors[0].position_rot, 1.0);
+
+  // CANcoder sits on the sensor shaft: rotor / rotor_to_sensor_ratio.
+  EXPECT_NEAR(state.sensors[0].velocity_rps,
+              state.motors[0].velocity_rps / kRotorToSensor, 0.5);
+  // TalonFX divides CANcoder by sensor_to_mechanism_ratio once:
+  // mechanism = rotor / (rotor_to_sensor_ratio * sensor_to_mechanism_ratio).
+  EXPECT_NEAR(state.motors[1].velocity_rps,
+              state.motors[0].velocity_rps / kTotalRatio, 0.25);
+  EXPECT_NEAR(state.motors[1].position_rot,
+              state.motors[0].position_rot / kTotalRatio, 0.15);
+  EXPECT_NEAR(
+      std::remainder(state.sensors[0].position_rot -
+                         state.motors[1].position_rot * kSensorToMechanism,
+                     1.0),
+      0.0, 0.05);
+  backend.Neutral();
+}
+
+// Under desktop simulation, inferred swerve or differential chassis kinematics
+// integrate wheel motion into Pigeon2 yaw and yaw rate, while a non-chassis
+// configuration leaves manually injected SetRawYaw untouched.
+// REQ-DEV-06
+TEST(PhoenixBackendPigeon,
+     ChassisKinematicsDrivesYawAndNonChassisPreservesManualYaw) {
+  EnsureHal();
+  EnabledDs ds;
+
+  // 1. Swerve chassis spinning in place CCW+, then reversing CW-.
+  {
+    hw::Config config;
+    const std::array<const char*, 4> corners{"front_left", "front_right",
+                                             "back_left", "back_right"};
+    const std::array<double, 4> spin_angles{0.375, 0.125, -0.375, -0.125};
+    for (std::size_t i = 0; i < corners.size(); ++i) {
+      auto drive = TestMotor(static_cast<uint16_t>(2 * i + 1),
+                             std::string(corners[i]) + "_drive",
+                             static_cast<int>(2 * i + 1));
+      drive.sensor_to_mechanism_ratio = 6.75;
+      auto steer = TestMotor(static_cast<uint16_t>(2 * i + 2),
+                             std::string(corners[i]) + "_steer",
+                             static_cast<int>(2 * i + 2));
+      steer.sensor_to_mechanism_ratio = 12.8;
+      steer.slots[0].p = 6.0;
+      config.motors.push_back(drive);
+      config.motors.push_back(steer);
+    }
+    config.sensors.push_back(
+        hw::SensorConfig{20, "imu", hw::SensorKind::kPigeon2, 30, "rio"});
+
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+
+    std::array<hw::MotorRequest, 8> cmd{};
+    for (std::size_t i = 0; i < 4; ++i) {
+      cmd[2 * i] =
+          Request(static_cast<uint16_t>(2 * i + 1), hw::Mode::kVoltage, 6.0);
+      cmd[2 * i + 1] = Request(static_cast<uint16_t>(2 * i + 2),
+                               hw::Mode::kPosition, spin_angles[i]);
+    }
+    hw::State state;
+    PumpReads(backend, state, cmd, 35);
+    ASSERT_TRUE(state.sensors[0].valid);
+    EXPECT_GT(state.sensors[0].velocity_rps, 0.1);
+    EXPECT_GT(state.sensors[0].position_rot, 0.05);
+
+    for (std::size_t i = 0; i < 4; ++i) {
+      cmd[2 * i] =
+          Request(static_cast<uint16_t>(2 * i + 1), hw::Mode::kVoltage, -6.0);
+    }
+    PumpReads(backend, state, cmd, 35);
+    EXPECT_LT(state.sensors[0].velocity_rps, -0.1);
+    backend.Neutral();
+  }
+
+  // 2. Differential chassis fallback (left/right drive pairs, 0.60 m track).
+  {
+    hw::Config config;
+    auto left = TestMotor(1, "left_drive", 1);
+    left.sensor_to_mechanism_ratio = 6.75;
+    auto right = TestMotor(2, "right_drive", 2);
+    right.sensor_to_mechanism_ratio = 6.75;
+    config.motors = {left, right};
+    config.sensors.push_back(
+        hw::SensorConfig{20, "imu", hw::SensorKind::kPigeon2, 30, "rio"});
+
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+
+    const std::array<hw::MotorRequest, 2> spin_ccw{
+        Request(1, hw::Mode::kVoltage, -6.0),
+        Request(2, hw::Mode::kVoltage, 6.0)};
+    hw::State state;
+    PumpReads(backend, state, spin_ccw, 30);
+    ASSERT_TRUE(state.sensors[0].valid);
+    EXPECT_GT(state.sensors[0].velocity_rps, 0.1);
+    EXPECT_GT(state.sensors[0].position_rot, 0.05);
+    backend.Neutral();
+  }
+
+  // 3. Non-chassis config under desktop simulation keeps manual SetRawYaw.
+  {
+    hw::Config config;
+    config.motors.push_back(TestMotor(1, "roller", 1));
+    config.sensors.push_back(
+        hw::SensorConfig{20, "imu", hw::SensorKind::kPigeon2, 30, "rio"});
+
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+
+    ctre::phoenix6::hardware::Pigeon2 observer(30,
+                                               ctre::phoenix6::CANBus{"rio"});
+    observer.GetSimState().SetRawYaw(units::degree_t{90.0});
+    const std::array<hw::MotorRequest, 1> neutral{
+        Request(1, hw::Mode::kNeutral, 0.0)};
+    hw::State state;
+    PumpReads(backend, state, neutral, 15);
+    ASSERT_TRUE(state.sensors[0].valid);
+    EXPECT_NEAR(state.sensors[0].position_rot, 0.25, 1e-3);
+  }
+}
+
+// Remote-CANcoder swerve modules with nonzero magnet offset and inverted
+// sensor/steer direction close their steer loops on the CANcoder's reported
+// angle (wrap(steer_sign * raw + offset_rot)), so chassis kinematics must apply
+// both steer_sign and offset_rot to integrate Pigeon2 yaw CCW+ rather than
+// cancelling or reversing it.
+// REQ-DEV-06
+TEST(PhoenixBackendPigeon,
+     SwerveRemoteCancoderWithMagnetOffsetAndInversionDrivesYawCcw) {
+  EnsureHal();
+  EnabledDs ds;
+
+  hw::Config config;
+  const std::array<const char*, 4> corners{"front_left", "front_right",
+                                           "back_left", "back_right"};
+  const std::array<double, 4> spin_angles{0.375, 0.125, -0.375, -0.125};
+  for (std::size_t i = 0; i < corners.size(); ++i) {
+    const auto enc_id = static_cast<uint16_t>(10 + i);
+    const int enc_can_id = static_cast<int>(10 + i);
+    hw::SensorConfig enc{enc_id, std::string(corners[i]) + "_enc",
+                         hw::SensorKind::kCANcoder, enc_can_id, "rio"};
+    enc.inverted = true;
+    enc.offset_rot = 0.25;
+    config.sensors.push_back(enc);
+
+    auto drive = TestMotor(static_cast<uint16_t>(2 * i + 1),
+                           std::string(corners[i]) + "_drive",
+                           static_cast<int>(2 * i + 1));
+    drive.sensor_to_mechanism_ratio = 6.75;
+
+    auto steer = TestMotor(static_cast<uint16_t>(2 * i + 2),
+                           std::string(corners[i]) + "_steer",
+                           static_cast<int>(2 * i + 2));
+    steer.inverted = true;
+    steer.feedback = hw::Feedback::kRemoteCANcoder;
+    steer.feedback_sensor_id = enc_id;
+    steer.rotor_to_sensor_ratio = 12.8;
+    steer.sensor_to_mechanism_ratio = 1.0;
+    steer.continuous_wrap = true;
+    steer.slots[0].p = 12.0;
+
+    config.motors.push_back(drive);
+    config.motors.push_back(steer);
+  }
+  config.sensors.push_back(
+      hw::SensorConfig{20, "imu", hw::SensorKind::kPigeon2, 30, "rio"});
+
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  std::array<hw::MotorRequest, 8> cmd{};
+  for (std::size_t i = 0; i < 4; ++i) {
+    cmd[2 * i] =
+        Request(static_cast<uint16_t>(2 * i + 1), hw::Mode::kVoltage, 6.0);
+    cmd[2 * i + 1] = Request(static_cast<uint16_t>(2 * i + 2),
+                             hw::Mode::kPosition, spin_angles[i]);
+  }
+  hw::State state;
+  PumpReads(backend, state, cmd, 50);
+
+  // Steer CANcoders should have converged to the requested spin azimuths.
+  for (std::size_t i = 0; i < 4; ++i) {
+    ASSERT_TRUE(state.sensors[i].valid) << i;
+    const double err =
+        std::remainder(state.sensors[i].position_rot - spin_angles[i], 1.0);
+    EXPECT_NEAR(err, 0.0, 0.05) << "corner " << i;
+  }
+  ASSERT_TRUE(state.sensors[4].valid);
+  EXPECT_GT(state.sensors[4].velocity_rps, 0.1);
+  EXPECT_GT(state.sensors[4].position_rot, 0.05);
+  backend.Neutral();
+}
+
 class PhoenixBackendFollower : public ::testing::TestWithParam<bool> {};
 
 TEST_P(PhoenixBackendFollower, FollowsMasterAndNeutralizesWithMaster) {
@@ -1010,6 +1390,59 @@ class PhoenixBackendRecovery : public ::testing::Test {
   static void MarkUnavailable(PhoenixBackend& backend, uint16_t id) {
     backend.unavailable_.push_back(id);
   }
+  static std::size_t UnavailableCapacity(const PhoenixBackend& backend) {
+    return backend.unavailable_.capacity();
+  }
+  static std::size_t RestoringIdsCapacity(const PhoenixBackend& backend) {
+    return backend.restoring_ids_.capacity();
+  }
+  static const uint16_t* UnavailableData(const PhoenixBackend& backend) {
+    return backend.unavailable_.data();
+  }
+  static const uint16_t* RestoringIdsData(const PhoenixBackend& backend) {
+    return backend.restoring_ids_.data();
+  }
+  static void PushRestoreOp(PhoenixBackend& backend, uint16_t id,
+                            std::function<bool()> op) {
+    backend.restore_operations_.push_back({id, std::move(op)});
+  }
+  static void PopRestoreOp(PhoenixBackend& backend) {
+    backend.restore_operations_.pop_back();
+  }
+  static void SetRestoreException(PhoenixBackend& backend,
+                                  std::exception_ptr ex) {
+    using Result = decltype(backend.restore_.get());
+    std::promise<Result> p;
+    p.set_exception(std::move(ex));
+    backend.restore_ = p.get_future();
+  }
+  using RestoreTask = PhoenixBackend::RestoreTask;
+  static void SetRestoreLauncher(
+      PhoenixBackend& backend,
+      std::function<
+          std::future<std::optional<std::vector<uint16_t>>>(RestoreTask)>
+          launcher) {
+    backend.launch_restore_ = std::move(launcher);
+  }
+  static ::testing::AssertionResult WaitRestoreReady(PhoenixBackend& backend) {
+    if (!backend.restore_.valid())
+      return ::testing::AssertionFailure() << "restore future is not valid";
+    if (backend.restore_.wait_for(kReadyTimeout) != std::future_status::ready)
+      return ::testing::AssertionFailure() << "restore stayed pending";
+    return ::testing::AssertionSuccess();
+  }
+  static void SetConfigureFuture(PhoenixBackend& backend,
+                                 std::future<bool> future) {
+    backend.configure_ = std::move(future);
+  }
+  static ::testing::AssertionResult WaitConfigureReady(
+      PhoenixBackend& backend) {
+    if (!backend.configure_.valid())
+      return ::testing::AssertionFailure() << "configure future is not valid";
+    if (backend.configure_.wait_for(kReadyTimeout) != std::future_status::ready)
+      return ::testing::AssertionFailure() << "configure stayed pending";
+    return ::testing::AssertionSuccess();
+  }
   static void StopRefreshingHealth(PhoenixBackend& backend) {
     auto& motor = Motor(backend, 0);
     std::erase_if(backend.refresh_signals_, [&](auto* signal) {
@@ -1085,17 +1518,52 @@ TEST_F(PhoenixBackendRecovery, AMasterWithFollowersSendsItsOutputAt20Hz) {
               20.0);
     EXPECT_GE(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
               20.0);
-    if (status_hz <= 50.0) continue;
-    for (auto* motion :
-         std::initializer_list<ctre::phoenix6::BaseStatusSignal*>{
-             &master.GetPosition(false), &master.GetVelocity(false)}) {
-      ASSERT_TRUE(AwaitAnswer([&] {
-                    return motion->SetUpdateFrequency(units::hertz_t{50});
-                  }).IsOK());
+    if (status_hz > 50.0) {
+      for (auto* motion :
+           std::initializer_list<ctre::phoenix6::BaseStatusSignal*>{
+               &master.GetPosition(false), &master.GetVelocity(false)}) {
+        ASSERT_TRUE(AwaitAnswer([&] {
+                      return motion->SetUpdateFrequency(units::hertz_t{50});
+                    }).IsOK());
+      }
+      EXPECT_DOUBLE_EQ(
+          master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(), 50.0)
+          << "the master's DutyCycle is requested faster than MotorVoltage";
     }
-    EXPECT_DOUBLE_EQ(
-        master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(), 50.0)
-        << "the master's DutyCycle is requested faster than MotorVoltage";
+
+    // Lower every master signal below 20 Hz, then verify RestorePass restores
+    // DutyCycle and MotorVoltage to >= 20 Hz for both status_hz = 8 and 200.
+    ASSERT_TRUE(
+        AwaitAnswer([&] {
+          return ctre::phoenix6::BaseStatusSignal::SetUpdateFrequencyForAll(
+              units::hertz_t{4}, master.GetPosition(false),
+              master.GetVelocity(false), master.GetMotorVoltage(false),
+              master.GetDutyCycle(false), master.GetStatorCurrent(false),
+              master.GetSupplyCurrent(false), master.GetDeviceTemp(false));
+        }).IsOK());
+    ASSERT_LT(master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    ASSERT_LT(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    ASSERT_TRUE(RestorePass(backend, std::array<uint16_t, 1>{10}));
+    EXPECT_GE(master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    EXPECT_GE(master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
+              20.0);
+    if (status_hz > 50.0) {
+      ASSERT_TRUE(
+          AwaitAnswer([&] {
+            return ctre::phoenix6::BaseStatusSignal::SetUpdateFrequencyForAll(
+                units::hertz_t{4}, master.GetPosition(false),
+                master.GetVelocity(false), master.GetStatorCurrent(false),
+                master.GetSupplyCurrent(false));
+          }).IsOK());
+      EXPECT_DOUBLE_EQ(
+          master.GetDutyCycle(false).GetAppliedUpdateFrequency().value(), 50.0);
+      EXPECT_DOUBLE_EQ(
+          master.GetMotorVoltage(false).GetAppliedUpdateFrequency().value(),
+          50.0);
+    }
   }
 }
 
@@ -1234,43 +1702,30 @@ TEST_F(PhoenixBackendRecovery, LateFeedbackStaysValidAndIsReportedLate) {
 // bit, since an old switch or limiter state is a wrong display (a motor
 // driven into its pressed forward switch, or stalled at its stator limit),
 // but keeps the fault bits it last had: losing the signal never un-faults a
-// motor (BootDuringEnable here, raised by a TalonFX that boots while enabled).
-// Each row first waits until a read shows its bit: the reads that PumpReads
-// gates on fresh motion feedback say nothing of the separate 50 Hz
-// FaultField, and one that finds it 50 ms old reports no limit by this same
-// rule. A simulated TalonFX raises BootDuringEnable only on its first boot in
-// the process, and clears it about 0.5 s after that boot, driven or not; so
-// the boot row takes a CAN id no device here has used, and waits for the bit
-// straight after AwaitReady, without the limit rows' 30-read pump, which
-// takes about as long as the bit lasts.
+// motor (OverSupplyV here, raised deterministically through the simulator's
+// supply-voltage input with no wall-clock window). Each row first waits until
+// a read shows its bit: the reads that PumpReads gates on fresh motion
+// feedback say nothing of the separate 50 Hz FaultField, and one that finds it
+// 50 ms old reports no limit by this same rule.
 // REQ-CONTRACT-32
 TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
-  enum class Row { kForwardHardLimit, kStatorLimiter, kBootFault };
-  // FaultField bit 4, BootDuringEnable: a fault (hw::MotorFaulted).
-  constexpr uint32_t kBootDuringEnableFlag = uint32_t{1} << 4;
-  // CAN ids no other test here uses: one boot row per run of this test
-  // (--gtest_repeat), up to the last TalonFX id.
-  constexpr int kFirstBootCanId = 45;
-  constexpr int kLastCanId = 62;
-  static int next_boot_can_id = kFirstBootCanId;
+  enum class Row { kForwardHardLimit, kStatorLimiter, kOverSupplyFault };
+  // FaultField bit 18, OverSupplyV: a fault (hw::MotorFaulted).
+  constexpr uint32_t kOverSupplyVFlag = uint32_t{1} << 18;
+  static_assert(hw::MotorFaulted(kOverSupplyVFlag));
   for (const Row row :
-       {Row::kForwardHardLimit, Row::kStatorLimiter, Row::kBootFault}) {
+       {Row::kForwardHardLimit, Row::kStatorLimiter, Row::kOverSupplyFault}) {
     const uint32_t bit =
         row == Row::kForwardHardLimit ? hw::kMotorForwardHardLimitFlag
         : row == Row::kStatorLimiter  ? hw::kMotorCurrentLimitFlags
-                                      : kBootDuringEnableFlag;
+                                      : kOverSupplyVFlag;
     SCOPED_TRACE(row == Row::kForwardHardLimit ? "forward hard limit"
                  : row == Row::kStatorLimiter  ? "stator current limit"
-                                               : "boot fault");
+                                               : "over-supply voltage fault");
     EnsureHal();
     EnabledDs ds;
     hw::Config config;
-    if (row == Row::kBootFault) {
-      ASSERT_LE(next_boot_can_id, kLastCanId)
-          << "every CAN id the boot row may take has booted in this process";
-    }
-    auto motor =
-        TestMotor(1, "motor", row == Row::kBootFault ? next_boot_can_id++ : 1);
+    auto motor = TestMotor(1, "motor", 1);
     motor.stator_limit_a = 10;
     config.motors.push_back(motor);
     PhoenixBackend backend(true);
@@ -1280,9 +1735,17 @@ TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
         Request(1, hw::Mode::kVoltage, row == Row::kStatorLimiter ? 6.0 : 2.0)};
     hw::State state;
     auto& sim = Motor(backend, 0).GetSimState();
+    struct SimReset {
+      ctre::phoenix6::sim::TalonFXSimState& sim;
+      ~SimReset() {
+        sim.SetForwardLimit(false);
+        sim.SetSupplyVoltage(units::volt_t{12.0});
+      }
+    } reset{sim};
     if (row == Row::kStatorLimiter) StallRotor(backend);
     if (row == Row::kForwardHardLimit) sim.SetForwardLimit(true);
-    if (row != Row::kBootFault) PumpReads(backend, state, commands, 30);
+    if (row == Row::kOverSupplyFault) sim.SetSupplyVoltage(units::volt_t{30.0});
+    if (row != Row::kOverSupplyFault) PumpReads(backend, state, commands, 30);
     auto& faults = Motor(backend, 0).GetFaultField(false);
     ASSERT_TRUE(ReadUntil(backend, state,
                           [&] {
@@ -1296,14 +1759,22 @@ TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
     PumpReads(backend, state, commands, 30);
     ASSERT_GE(faults.GetTimestamp().GetLatency().value(), 0.05);
     EXPECT_TRUE(state.motors[0].valid);
-    if (row == Row::kBootFault) {
+    if (row == Row::kOverSupplyFault) {
       EXPECT_NE(state.motors[0].fault_flags & bit, 0u)
           << "fault_flags " << state.motors[0].fault_flags;
+      EXPECT_TRUE(hw::MotorFaulted(state.motors[0].fault_flags))
+          << "fault_flags " << state.motors[0].fault_flags;
+      // Restore nominal supply voltage and wait for the simulated TalonFX to
+      // clear OverSupplyV so later rows and tests on CAN id 1 start clean.
+      sim.SetSupplyVoltage(units::volt_t{12.0});
+      ResumeRefreshing(backend, faults);
+      ASSERT_TRUE(ReadUntil(backend, state, [&] {
+        return (state.motors[0].fault_flags & kOverSupplyVFlag) == 0;
+      })) << "OverSupplyV did not clear after restoring 12 V";
     } else {
       EXPECT_EQ(state.motors[0].fault_flags & hw::kMotorNotFaultFlags, 0u)
           << "fault_flags " << state.motors[0].fault_flags;
     }
-    sim.SetForwardLimit(false);
   }
 }
 
@@ -1514,6 +1985,10 @@ class PhoenixBackendFoc : public ::testing::Test {
       std::function<std::optional<bool>(std::size_t)> licensed) {
     backend.pro_licensed_ = std::move(licensed);
   }
+  static void PushRestoreOp(PhoenixBackend& backend, uint16_t id,
+                            std::function<bool()> op) {
+    backend.restore_operations_.push_back({id, std::move(op)});
+  }
   // Configures until no device's answer was lost to a stalled simulator
   // (AwaitAnswer's rule), so the first configure error is the one under
   // test, not a transport timeout recorded before it. A licence read the
@@ -1531,18 +2006,6 @@ class PhoenixBackendFoc : public ::testing::Test {
       if (std::chrono::steady_clock::now() >= deadline)
         return ::testing::AssertionFailure() << hw::FormatConfigError(*error);
     }
-  }
-  // One restore pass of `ids`, as the gateway runs one after a reset.
-  static ::testing::AssertionResult RestorePass(PhoenixBackend& backend,
-                                                std::span<const uint16_t> ids) {
-    const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
-    backend.BeginRestoreAfterReset(ids);
-    while (backend.PollRestore() == hw::Backend::RestoreStatus::kPending) {
-      if (std::chrono::steady_clock::now() >= deadline)
-        return ::testing::AssertionFailure() << "restore still pending";
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return ::testing::AssertionSuccess();
   }
   // Restores the devices a stalled simulator left unavailable, as AwaitReady
   // does; AwaitReady itself refuses a configure error that is not a
@@ -2024,6 +2487,63 @@ TEST_F(PhoenixBackendTorque, AnOutOfContractRequestIsNeutralOut) {
   }
 }
 
+// Every NeutralOut that Apply sends (direct kNeutral, a neutralized follower,
+// and an out-of-contract torque-current request) must be one-shot (0 Hz),
+// matching Neutral() and WatchdogNeutral(), so Phoenix's background control
+// thread does not keep resending periodic 20 Hz frames. And the gateway's
+// neutral, Neutral(), is that one-shot NeutralOut on every configured motor,
+// whatever each was driving: a master, its follower and a torque-current
+// motor.
+// REQ-SAFE-43
+TEST_F(PhoenixBackendTorque, EveryApplyNeutralOutIsOneShot) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto master = TestMotor(10, "master", 1);
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  auto gripper = TorqueMotor(30, "gripper", 3);
+  config.motors = {master, follower, gripper};
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  const auto expect_one_shot_neutral = [&](std::size_t i,
+                                           std::string_view why) {
+    const auto applied = Motor(backend, i).GetAppliedControl();
+    ASSERT_NE(applied, nullptr) << why;
+    const auto neutral =
+        std::dynamic_pointer_cast<const ctre::phoenix6::controls::NeutralOut>(
+            applied);
+    ASSERT_NE(neutral, nullptr) << why << ": got " << applied->GetName();
+    EXPECT_DOUBLE_EQ(neutral->UpdateFreqHz.value(), 0.0) << why;
+  };
+
+  // Drive every motor first so each NeutralOut replaces an active control.
+  const std::array<hw::MotorRequest, 3> drive{
+      Request(10, hw::Mode::kVoltage, 4.0),
+      Request(20, hw::Mode::kVoltage, 0.0),
+      Request(30, hw::Mode::kTorqueCurrent, 2.0)};
+  ASSERT_TRUE(ApplySent(backend, drive));
+
+  // Direct kNeutral on master, follower neutralized with master, and
+  // out-of-contract kTorqueCurrent (over max_torque_current_a) on gripper.
+  const std::array<hw::MotorRequest, 3> neutral_all{
+      Request(10, hw::Mode::kNeutral, 0.0),
+      Request(20, hw::Mode::kVoltage, 4.0),
+      Request(30, hw::Mode::kTorqueCurrent, 10.0)};
+  ASSERT_TRUE(ApplySent(backend, neutral_all));
+  expect_one_shot_neutral(0, "direct kNeutral");
+  expect_one_shot_neutral(1, "follower neutral");
+  expect_one_shot_neutral(2, "out-of-contract torque current");
+
+  ASSERT_TRUE(ApplySent(backend, drive));
+  ASSERT_EQ(AppliedControl(backend, 2), "TorqueCurrentFOC");
+  backend.Neutral();
+  for (std::size_t i = 0; i < config.motors.size(); ++i)
+    expect_one_shot_neutral(i, "Neutral() on " + config.motors[i].name);
+}
+
 class PhoenixBackendPeakVoltage : public PhoenixBackendTorque {};
 
 // The TalonFX's peak voltage, which holds every voltage-based request
@@ -2056,4 +2576,268 @@ TEST_F(PhoenixBackendPeakVoltage, IsMaxVoltageAfterConfigureAndRestore) {
   ASSERT_TRUE(AppliedConfig(backend, 0, applied));
   EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), 2.0);
   EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -2.0);
+}
+
+// Asynchronous configuration runs on a worker thread and is polled on the
+// SCHED_FIFO RoboRIO loop thread. Any exception thrown inside Configure()
+// (validation, WPILib HAL resource allocation) or from configure_.get() must
+// report ConfigureStatus::kFailed with a recorded error and never escape onto
+// the loop thread.
+// REQ-SAFE-21
+TEST_F(PhoenixBackendRecovery, AsyncConfigureCatchesExceptionsAsFailure) {
+  EnsureHal();
+  Console console;
+  PhoenixBackend backend(true, console.log());
+
+  // 1. hw::Validate throws std::invalid_argument inside the async worker.
+  hw::Config invalid;
+  invalid.period_us = 0;
+  ASSERT_NO_THROW(backend.BeginConfigure(invalid));
+  ASSERT_TRUE(WaitConfigureReady(backend));
+  hw::Backend::ConfigureStatus status = hw::Backend::ConfigureStatus::kPending;
+  ASSERT_NO_THROW(status = backend.PollConfigure());
+  EXPECT_EQ(status, hw::Backend::ConfigureStatus::kFailed);
+  ASSERT_TRUE(backend.last_config_error().has_value());
+  EXPECT_FALSE(backend.last_config_error()->message.empty());
+  EXPECT_FALSE(console.Lines({"[phoenix]", "config failed"}).empty());
+
+  // 2. WPILib HAL constructor throws frc::RuntimeError after Validate passes
+  // (e.g. a DIO channel already held by another resource), exercised through
+  // Gateway::BeginReconfigure/Tick as on the RoboRIO loop.
+  frc::DigitalInput occupied_dio{7};
+  hw::Config dio_conflict;
+  hw::DigitalInputConfig di;
+  di.id = 40;
+  di.name = "conflict_di";
+  di.dio = 7;
+  dio_conflict.digital_inputs.push_back(di);
+  hw::Gateway gateway{backend, 1};
+  ASSERT_TRUE(gateway.BeginReconfigure(dio_conflict));
+  ASSERT_TRUE(WaitConfigureReady(backend));
+  ASSERT_NO_THROW(gateway.Tick(5000, false));
+  EXPECT_FALSE(gateway.configuring());
+  EXPECT_FALSE(gateway.configured());
+  EXPECT_TRUE((gateway.snapshot().flags & hw::kHardwareFault) != 0);
+  ASSERT_TRUE(gateway.config_error().has_value());
+  EXPECT_FALSE(gateway.config_error()->message.empty());
+
+  // 3. PollConfigure() itself catches both std::exception and unknown
+  // exceptions stored in configure_.
+  {
+    std::promise<bool> p;
+    p.set_exception(
+        std::make_exception_ptr(std::runtime_error("injected future error")));
+    SetConfigureFuture(backend, p.get_future());
+    ASSERT_NO_THROW(status = backend.PollConfigure());
+    EXPECT_EQ(status, hw::Backend::ConfigureStatus::kFailed);
+    ASSERT_TRUE(backend.last_config_error().has_value());
+    EXPECT_NE(
+        backend.last_config_error()->message.find("injected future error"),
+        std::string::npos);
+  }
+  {
+    std::promise<bool> p;
+    p.set_exception(std::make_exception_ptr(42));
+    SetConfigureFuture(backend, p.get_future());
+    ASSERT_NO_THROW(status = backend.PollConfigure());
+    EXPECT_EQ(status, hw::Backend::ConfigureStatus::kFailed);
+    ASSERT_TRUE(backend.last_config_error().has_value());
+    EXPECT_FALSE(backend.last_config_error()->message.empty());
+  }
+}
+
+// Device restoration runs on a worker thread and is started/polled on the
+// SCHED_FIFO RoboRIO loop thread. Configure() must preallocate unavailable_
+// and restoring_ids_ so BeginRestoreAfterReset never allocates for them on
+// the loop thread, and any exception from a restore operation or restore_.get()
+// must be caught, logged via RioLog, and reported as RestoreStatus::kFailed
+// while keeping the affected IDs unavailable for backed-off retry.
+// REQ-SAFE-24
+// REQ-RT-07
+TEST_F(PhoenixBackendRecovery,
+       RestorePreallocatesAndCatchesExceptionsAsFailure) {
+  EnsureHal();
+  Console console;
+  hw::Config config;
+  auto master = TestMotor(10, "lift", 1);
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  config.motors = {master, follower};
+  PhoenixBackend backend(true, console.log());
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  // 1. Configure() reserves unavailable_ and restoring_ids_ for the full
+  // device budget so BeginRestoreAfterReset does not reallocate them.
+  constexpr std::size_t kBudget = hw::kMaxMotors + hw::kMaxSensors;
+  EXPECT_GE(UnavailableCapacity(backend), kBudget);
+  EXPECT_GE(RestoringIdsCapacity(backend), kBudget);
+  const uint16_t* unavailable_before = UnavailableData(backend);
+  const uint16_t* restoring_before = RestoringIdsData(backend);
+
+  const auto contains = [](const std::vector<uint16_t>& ids, uint16_t id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+  };
+
+  // 2. A restore operation throwing std::exception inside the worker must not
+  // escape PollRestore(), must return kFailed, log, and keep the chain
+  // unavailable without reallocating unavailable_/restoring_ids_.
+  PushRestoreOp(backend, 10, []() -> bool {
+    throw std::runtime_error("injected restore op error");
+  });
+  const std::array<uint16_t, 1> ids{10};
+  ASSERT_NO_THROW(backend.BeginRestoreAfterReset(ids));
+  EXPECT_EQ(UnavailableData(backend), unavailable_before);
+  EXPECT_EQ(RestoringIdsData(backend), restoring_before);
+  ASSERT_TRUE(WaitRestoreReady(backend));
+  hw::Backend::RestoreStatus status = hw::Backend::RestoreStatus::kPending;
+  ASSERT_NO_THROW(status = backend.PollRestore());
+  EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 20));
+  EXPECT_FALSE(
+      console
+          .Lines({"[phoenix]", "restore failed", "injected restore op error"})
+          .empty());
+  PopRestoreOp(backend);
+
+  // 3. Same for a non-std::exception thrown by a restore operation.
+  PushRestoreOp(backend, 10, []() -> bool { throw 42; });
+  ASSERT_NO_THROW(backend.BeginRestoreAfterReset(ids));
+  ASSERT_TRUE(WaitRestoreReady(backend));
+  ASSERT_NO_THROW(status = backend.PollRestore());
+  EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+  PopRestoreOp(backend);
+
+  // 4. PollRestore() itself catches both std::exception and unknown exceptions
+  // stored directly in restore_, keeping the devices unavailable and resetting
+  // restore_ cleanly.
+  {
+    SetRestoreException(
+        backend,
+        std::make_exception_ptr(std::runtime_error("injected future error")));
+    ASSERT_NO_THROW(status = backend.PollRestore());
+    EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+    EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+    EXPECT_FALSE(
+        console.Lines({"[phoenix]", "restore failed", "injected future error"})
+            .empty());
+  }
+  {
+    SetRestoreException(backend, std::make_exception_ptr(42));
+    ASSERT_NO_THROW(status = backend.PollRestore());
+    EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+    EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+  }
+
+  // 5. Thread exhaustion (EAGAIN / std::system_error) when launching the
+  // async restore worker is caught in BeginRestoreAfterReset, logged, leaves
+  // the chain unavailable, and reports RestoreStatus::kFailed on PollRestore.
+  SetRestoreLauncher(
+      backend,
+      [](RestoreTask) -> std::future<std::optional<std::vector<uint16_t>>> {
+        throw std::system_error(
+            std::make_error_code(std::errc::resource_unavailable_try_again),
+            "injected EAGAIN");
+      });
+  ASSERT_NO_THROW(backend.BeginRestoreAfterReset(ids));
+  ASSERT_NO_THROW(status = backend.PollRestore());
+  EXPECT_EQ(status, hw::Backend::RestoreStatus::kFailed);
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 10));
+  EXPECT_TRUE(contains(backend.UnavailableDevices(), 20));
+  EXPECT_FALSE(console.Lines({"[phoenix]", "restore failed", "injected EAGAIN"})
+                   .empty());
+  SetRestoreLauncher(backend, nullptr);
+
+  // 6. After clean failure handling, a subsequent restore pass succeeds and
+  // clears UnavailableDevices().
+  ASSERT_TRUE(RestorePass(backend, ids));
+  EXPECT_TRUE(backend.UnavailableDevices().empty());
+}
+
+// Config validation allows a follower motor to precede its master in
+// config.motors. Configure() must check masters before followers so a follower
+// of an unlicensed foc master is never read itself, and neither Configure() nor
+// PollRestore() may leave a motor in both foc_unlicensed_ and unavailable_
+// (which would churn BeginRestoreAfterReset forever).
+// REQ-CONTRACT-39
+TEST_F(PhoenixBackendFoc,
+       FollowerBeforeUnlicensedMasterIsNotReadAndNeverChurnsUnavailable) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto follower = TestMotor(20, "follower", 2);
+  follower.master_id = 10;
+  auto lift = TestMotor(10, "lift", 1);
+  lift.foc = true;
+  // Follower intentionally precedes its foc master in config.motors.
+  config.motors = {follower, lift};
+  Console console;
+  PhoenixBackend backend(true, console.log());
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  // 1. Configure(): follower would time out (nullopt) if read, while master
+  // reads unlicensed (false). Master must be checked first, follower must not
+  // be read at all, and UnavailableDevices() must be empty.
+  std::vector<std::size_t> checked;
+  SetProLicensed(backend, [&checked](std::size_t i) -> std::optional<bool> {
+    checked.push_back(i);
+    return i == 1 ? std::optional<bool>{false} : std::nullopt;
+  });
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  EXPECT_EQ(std::count(checked.begin(), checked.end(), std::size_t{0}), 0)
+      << "follower was read despite its master being unlicensed";
+  EXPECT_GE(std::count(checked.begin(), checked.end(), std::size_t{1}), 1);
+  EXPECT_TRUE(backend.UnavailableDevices().empty())
+      << "unlicensed follower/master left in UnavailableDevices()";
+  EXPECT_FALSE(
+      console.Lines({"[phoenix]", "check_pro_license", "'lift'"}).empty());
+  EXPECT_FALSE(
+      console.Lines({"[phoenix]", "check_pro_license", "'follower'"}).empty());
+  const std::array<hw::MotorRequest, 2> commands{
+      Request(20, hw::Mode::kVoltage, 0.0),
+      Request(10, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 15);
+  EXPECT_FALSE(state.motors[0].valid);
+  EXPECT_FALSE(state.motors[1].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
+
+  // 2. PollRestore(): both master and follower initially get no answer at
+  // Configure() (both unavailable). During restore, the follower still fails
+  // (timeout/disconnected op) while the master reads unlicensed. PollRestore()
+  // must refuse both and erase both from UnavailableDevices() so the restore
+  // loop never churns on them.
+  std::optional<bool> master_licence;
+  std::optional<bool> follower_licence;
+  checked.clear();
+  SetProLicensed(backend, [&](std::size_t i) -> std::optional<bool> {
+    checked.push_back(i);
+    return i == 1 ? master_licence : follower_licence;
+  });
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  ASSERT_FALSE(backend.UnavailableDevices().empty());
+
+  checked.clear();
+  master_licence = false;
+  follower_licence = std::nullopt;
+  // Also simulate a failing device restore op on the follower (e.g. absent
+  // follower failing apply_talonfx_config) in the same restore pass.
+  PushRestoreOp(backend, 20, []() { return false; });
+  ASSERT_TRUE(RestorePass(backend, backend.UnavailableDevices()));
+  EXPECT_EQ(std::count(checked.begin(), checked.end(), std::size_t{0}), 0)
+      << "follower licence was read during restore after master read "
+         "unlicensed";
+  EXPECT_TRUE(backend.UnavailableDevices().empty())
+      << "unlicensed follower remained in UnavailableDevices() after restore";
+  PumpReads(backend, state, commands, 15);
+  EXPECT_FALSE(state.motors[0].valid);
+  EXPECT_FALSE(state.motors[1].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
 }

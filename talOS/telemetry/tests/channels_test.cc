@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -117,34 +118,62 @@ TEST(TelemetryChannels, EnvelopeChannelsReadTheHeaderAndTheMessageBehindIt) {
   }
 }
 
-// One field of a crafted reflection struct.
+// One field of a crafted reflection struct. Stores raw int8_t bytes so hostile
+// out-of-range BaseType values can be written to the FlatBuffer without UB.
 struct CraftedField {
-  reflection::BaseType base;
-  reflection::BaseType element;
+  std::int8_t base;
+  std::int8_t element;
   std::int32_t index;  // object index for Obj, or Obj elements
   std::uint16_t fixed_length;
+
+  constexpr CraftedField(reflection::BaseType b, reflection::BaseType e,
+                         std::int32_t idx, std::uint16_t len)
+      : base(static_cast<std::int8_t>(b)),
+        element(static_cast<std::int8_t>(e)),
+        index(idx),
+        fixed_length(len) {}
+
+  static constexpr CraftedField Raw(std::int8_t b, std::int8_t e,
+                                    std::int32_t idx, std::uint16_t len) {
+    return CraftedField{b, e, idx, len};
+  }
+
+ private:
+  constexpr CraftedField(std::int8_t b, std::int8_t e, std::int32_t idx,
+                         std::uint16_t len)
+      : base(b), element(e), index(idx), fixed_length(len) {}
 };
 
 // A reflection schema of structs "t.o00", "t.o01", ... (so object i is at
-// index i), each field at offset 0 of a 1-byte struct: offsets do not matter
-// to the bounds, only the shape does.
-std::string CraftSchema(const std::vector<std::vector<CraftedField>>& objects) {
+// index i), each field at offset 0 of a struct with `bytesizes[i]` (default 1):
+// offsets do not matter to the bounds, only the shape and bytesize do.
+std::string CraftSchema(const std::vector<std::vector<CraftedField>>& objects,
+                        const std::vector<std::int32_t>& bytesizes = {}) {
   flatbuffers::FlatBufferBuilder fbb;
   std::vector<flatbuffers::Offset<reflection::Object>> made;
   for (std::size_t i = 0; i < objects.size(); ++i) {
     std::vector<flatbuffers::Offset<reflection::Field>> fields;
     for (std::size_t k = 0; k < objects[i].size(); ++k) {
       const CraftedField& f = objects[i][k];
-      const auto type = reflection::CreateType(fbb, f.base, f.element, f.index,
-                                               f.fixed_length, 1, 1);
+      const auto type_start = fbb.StartTable();
+      fbb.AddElement<std::int8_t>(reflection::Type::VT_BASE_TYPE, f.base, 0);
+      fbb.AddElement<std::int8_t>(reflection::Type::VT_ELEMENT, f.element, 0);
+      fbb.AddElement<std::int32_t>(reflection::Type::VT_INDEX, f.index, -1);
+      fbb.AddElement<std::uint16_t>(reflection::Type::VT_FIXED_LENGTH,
+                                    f.fixed_length, 0);
+      fbb.AddElement<std::uint32_t>(reflection::Type::VT_BASE_SIZE, 1, 4);
+      fbb.AddElement<std::uint32_t>(reflection::Type::VT_ELEMENT_SIZE, 1, 0);
+      const flatbuffers::Offset<reflection::Type> type{
+          fbb.EndTable(type_start)};
       const std::string name = "f" + std::to_string(k) + "_m";
       fields.push_back(reflection::CreateFieldDirect(
           fbb, name.c_str(), type, static_cast<std::uint16_t>(k), 0));
     }
-    char name[8];
+    char name[32];
     std::snprintf(name, sizeof name, "t.o%02zu", i);
+    const std::int32_t bytesize = i < bytesizes.size() ? bytesizes[i] : 1;
     made.push_back(
-        reflection::CreateObjectDirect(fbb, name, &fields, true, 1, 1));
+        reflection::CreateObjectDirect(fbb, name, &fields, true, 1, bytesize));
   }
   std::vector<flatbuffers::Offset<reflection::Enum>> enums;
   reflection::FinishSchemaBuffer(
@@ -152,11 +181,12 @@ std::string CraftSchema(const std::vector<std::vector<CraftedField>>& objects) {
   return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
 }
 
-// REQ-OPS-41: studio_review flattens the schemas a recorded log carries,
-// which may be damaged or crafted. Each is refused with the topic named
-// (std::invalid_argument, as for a schema that does not verify) instead of
-// reading out of bounds, recursing until the stack overflows, or expanding
-// to billions of channels. A real schema still flattens (the test above).
+// REQ-OPS-41, REQ-OPS-42, REQ-CONTRACT-20: studio_review flattens the schemas a
+// recorded log carries, which may be damaged or crafted. Each is refused with
+// the topic named (std::invalid_argument, as for a schema that does not verify)
+// instead of reading out of bounds, recursing until the stack overflows, or
+// expanding to billions of channels. A real schema still flattens (the test
+// above).
 TEST(TelemetryChannels, HostileSchemaIsRefusedNamingTheTopic) {
   using reflection::BaseType;
   constexpr BaseType kNone = BaseType::None;
@@ -169,29 +199,77 @@ TEST(TelemetryChannels, HostileSchemaIsRefusedNamingTheTopic) {
   const struct {
     const char* name;
     std::vector<std::vector<CraftedField>> objects;
+    std::vector<std::int32_t> bytesizes;
   } cases[] = {
       {"field names an object past the schema's",
-       {{{BaseType::Obj, kNone, 99, 0}}}},
+       {{{BaseType::Obj, kNone, 99, 0}}},
+       {}},
       {"array element names an object past the schema's",
-       {{{BaseType::Array, BaseType::Obj, 99, 2}}}},
-      {"struct contains itself", {{{BaseType::Obj, kNone, 0, 0}}}},
-      {"structs nest 18 deep", deep},
+       {{{BaseType::Array, BaseType::Obj, 99, 2}}},
+       {}},
+      {"struct contains itself", {{{BaseType::Obj, kNone, 0, 0}}}, {}},
+      {"structs nest 18 deep", deep, {}},
       {"arrays of arrays expand to 65535 x 65535 channels",
        {{{BaseType::Array, BaseType::Obj, 1, 65535}},
-        {{BaseType::Array, BaseType::Double, -1, 65535}}}},
+        {{BaseType::Array, BaseType::Double, -1, 65535}}},
+       {}},
       {"arrays of fieldless structs expand to 65535 x 65535 instances",
        {{{BaseType::Array, BaseType::Obj, 1, 65535}},
         {{BaseType::Array, BaseType::Obj, 2, 65535}},
-        {}}},
+        {}},
+       {}},
+      {"array element has negative out-of-range BaseType (-128)",
+       {{CraftedField::Raw(static_cast<std::int8_t>(BaseType::Array), -128, -1,
+                           2)}},
+       {}},
+      {"array element has positive out-of-range BaseType (127)",
+       {{CraftedField::Raw(static_cast<std::int8_t>(BaseType::Array), 127, -1,
+                           2)}},
+       {}},
+      {"array element is non-scalar sentinel (MaxBaseType)",
+       {{{BaseType::Array, BaseType::MaxBaseType, -1, 2}}},
+       {}},
+      {"array element is non-scalar non-Obj (String)",
+       {{{BaseType::Array, BaseType::String, -1, 2}}},
+       {}},
+      {"array element is BaseType::None",
+       {{{BaseType::Array, BaseType::None, -1, 2}}},
+       {}},
+      {"array of Obj with negative bytesize",
+       {{{BaseType::Array, BaseType::Obj, 1, 2}},
+        {{BaseType::Double, kNone, -1, 0}}},
+       {8, -1}},
+      {"array of Obj with INT32_MIN bytesize",
+       {{{BaseType::Array, BaseType::Obj, 1, 2}},
+        {{BaseType::Double, kNone, -1, 0}}},
+       {8, std::numeric_limits<std::int32_t>::min()}},
+      {"array of Obj with zero bytesize",
+       {{{BaseType::Array, BaseType::Obj, 1, 2}},
+        {{BaseType::Double, kNone, -1, 0}}},
+       {8, 0}},
+      {"field has non-scalar BaseType (String)",
+       {{{BaseType::String, kNone, -1, 0}}},
+       {}},
+      {"field has out-of-range BaseType (127)",
+       {{CraftedField::Raw(127, static_cast<std::int8_t>(kNone), -1, 0)}},
+       {}},
   };
   for (const auto& c : cases) {
     SCOPED_TRACE(c.name);
-    const std::string bfbs = CraftSchema(c.objects);
+    const std::string bfbs = CraftSchema(c.objects, c.bytesizes);
     try {
       FlattenTopic("/crafted/state", "t.o00", bfbs);
-      ADD_FAILURE() << "flattened";
+      ADD_FAILURE() << "FlattenTopic flattened";
     } catch (const std::invalid_argument& error) {
       EXPECT_NE(std::string{error.what()}.find("/crafted/state"),
+                std::string::npos)
+          << error.what();
+    }
+    try {
+      EnvelopeChannels("/crafted/target/teleop", "t.o00", bfbs);
+      ADD_FAILURE() << "EnvelopeChannels flattened";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find("/crafted/target/teleop"),
                 std::string::npos)
           << error.what();
     }

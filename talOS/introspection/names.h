@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -22,15 +21,17 @@
 #include <vector>
 
 #include "talOS/events/manifest.h"
-#include "talOS/hardware/config.h"
-#include "talOS/hardware/packet.h"
-#include "talOS/rtms/rtms.h"
 
 namespace talos::introspect::naming {
 
 // A topic name is `/owner/role[/qualifier[/qualifier]]`.
 inline constexpr std::size_t kMinSegments = 2;
 inline constexpr std::size_t kMaxSegments = 4;
+
+// The transport's reader-slot limit per topic, observers included: matches
+// RTMS's MAX_READERS (checked by static_assert in names_test.cc so names.h
+// never pulls talOS/rtms/rtms.h into downstream compile sandboxes).
+inline constexpr std::size_t kMaxTopicReaders = 32;
 
 // The transport's limit: macOS caps a shm name at PSHMNAMLEN, which
 // `rtms::ValidatePath` enforces as 30 characters after the slash. When a name
@@ -394,87 +395,6 @@ struct Diagnostic {
   }
 };
 
-// A CAN bus's estimated utilization (0 to 1) above which
-// CheckHardwareConfig warns.
-inline constexpr double kCanBusWarnFrac = 0.70;
-
-// A CAN bus's estimated utilization from its devices (CheckHardwareConfig).
-// Per device at a 100 Hz status rate, from CTR Electronics' Phoenix 6 "CAN
-// Bus Utilization" page
-// (https://v6.docs.ctr-electronics.com/en/stable/docs/migration/canbus-utilization.html),
-// which also advises keeping a bus below 90 %: on CAN FD (a CANivore: any
-// bus but "rio") a Talon FX 0.018, a CANcoder 0.009, a Pigeon 2 0.013; on
-// classic CAN ("rio") 0.041, 0.017 and 0.031. Each device's figure scales
-// with its status rate over 100 Hz, and every CAN device sends at the
-// config's `status_hz` (no device sets its own rate). Each bus adds 0.05
-// for the vendor's diagnostic server. Calibration: the bench's three Talon
-// FX, CANcoder and Pigeon 2 on a CANivore at 200 Hz estimate 0.152 plus
-// that 0.05, against 0.16 to 0.18 measured on /hw/status.
-struct CanBusLoad {
-  std::string bus;
-  std::size_t motors{0}, cancoders{0}, gyros{0};
-  double estimate_frac{0};
-};
-inline std::vector<CanBusLoad> EstimateCanBusLoads(
-    const hardware::Config& config) {
-  std::map<std::string, CanBusLoad, std::less<>> buses;
-  const auto at = [&](const std::string& bus) -> CanBusLoad& {
-    CanBusLoad& load = buses[bus];
-    load.bus = bus;
-    return load;
-  };
-  for (const auto& motor : config.motors) ++at(motor.bus).motors;
-  for (const auto& sensor : config.sensors) {
-    CanBusLoad& load = at(sensor.bus);
-    ++(sensor.kind == hardware::SensorKind::kPigeon2 ? load.gyros
-                                                     : load.cancoders);
-  }
-  std::vector<CanBusLoad> out;
-  out.reserve(buses.size());
-  for (auto& [name, load] : buses) {
-    const bool classic = name == "rio";
-    const double per_100_hz =
-        static_cast<double>(load.motors) * (classic ? 0.041 : 0.018) +
-        static_cast<double>(load.cancoders) * (classic ? 0.017 : 0.009) +
-        static_cast<double>(load.gyros) * (classic ? 0.031 : 0.013);
-    load.estimate_frac = per_100_hz * config.status_hz / 100.0 + 0.05;
-    out.push_back(std::move(load));
-  }
-  return out;
-}
-
-// Advisory hardware limits, not configuration errors.
-inline std::vector<Diagnostic> CheckHardwareConfig(
-    const hardware::Config& config) {
-  std::vector<Diagnostic> out;
-  for (const auto& motor : config.motors) {
-    const double sensor_velocity =
-        motor.max_velocity_rps * motor.sensor_to_mechanism_ratio;
-    if (sensor_velocity > 105.0) {
-      out.push_back(
-          {Severity::WARNING, motor.name,
-           "max_velocity_rps * sensor_to_mechanism_ratio is " +
-               std::to_string(sensor_velocity) +
-               " rps, exceeding the recommended 105 rps; check gearing and "
-               "the configured maximum velocity"});
-    }
-  }
-  for (const auto& load : EstimateCanBusLoads(config)) {
-    if (load.estimate_frac <= kCanBusWarnFrac) continue;
-    char line[256];
-    std::snprintf(line, sizeof line,
-                  "estimated CAN bus utilization %.2f (%zu motors, %zu "
-                  "CANcoders, %zu gyros at status_hz %g, on %s) is above "
-                  "%.2f; reduce status_hz or move devices to another CAN bus",
-                  load.estimate_frac, load.motors, load.cancoders, load.gyros,
-                  config.status_hz,
-                  load.bus == "rio" ? "classic CAN" : "CAN FD",
-                  kCanBusWarnFrac);
-    out.push_back({Severity::WARNING, load.bus, line});
-  }
-  return out;
-}
-
 // Each subsystem's target sources: every `<source>` its target policy lists
 // in any mode ([robot.targets] plus its own [targets]), keyed by subsystem.
 using TargetSources =
@@ -518,22 +438,40 @@ inline bool ObserverReads(std::string_view topic) {
 }
 
 // Whether `topic` is in the hardware request namespace: `/hw/request` or any
-// topic below it, well formed or not. Only a node's devices-layer flush
-// writes there (detail::NodeAccess::add_hardware_request); the generic
-// publishers refuse every such topic, however it was spelled or remapped.
+// topic below it, well formed or not (including multiple leading slashes or
+// dot-separated spellings that ShmObjectName maps to the same POSIX shm name).
+// Only a node's devices-layer flush writes there
+// (detail::NodeAccess::add_hardware_request); the generic publishers refuse
+// every such topic, however it was spelled or remapped.
 inline bool IsHardwareRequest(std::string_view topic) {
+  while (topic.size() > 1 && topic[0] == '/' && topic[1] == '/') {
+    topic.remove_prefix(1);
+  }
   const auto segments = detail::Segments(topic);
-  return segments.size() >= 2 && segments[0] == "hw" &&
-         segments[1] == "request";
+  if (segments.size() >= 2 && segments[0] == "hw" && segments[1] == "request") {
+    return true;
+  }
+  // ShmObjectName maps interior '/' to '.', so '/hw.request...' collides with
+  // '/hw/request/...' in POSIX shared memory.
+  if (topic.starts_with('/')) {
+    const std::string_view rest = topic.substr(1);
+    if (rest == "hw.request" || rest.starts_with("hw.request.") ||
+        rest.starts_with("hw.request/") || rest.starts_with("hw/request.")) {
+      return true;
+    }
+  }
+  return false;
 }
 
-// The hardware request of node `node`: hardware::RequestTopic, the one
-// spelling the bridge also reads.
+// The hardware request topic prefix (`/hw/request/<node>`): matches
+// hardware::kRequestTopicPrefix (checked by static_assert in names_test.cc and
+// talOS/devices/devices.cc so names.h stays independent of talOS/hardware).
+inline constexpr std::string_view kRequestTopicPrefix = "/hw/request/";
+
+// The hardware request of node `node`, the one spelling the bridge also reads.
 inline std::string HardwareRequestTopic(std::string_view node) {
-  return hardware::RequestTopic(node);
+  return std::string{kRequestTopicPrefix} + std::string{node};
 }
-static_assert(std::string_view{hardware::kRequestTopicPrefix} == "/hw/request/",
-              "IsHardwareRequest recognises the prefix the bridge reads");
 
 // Why `/<subsystem>/target/<source>` is not a target lane, or nullopt.
 inline std::optional<std::string> CheckTargetLane(std::string_view subsystem,
@@ -585,18 +523,24 @@ inline std::optional<std::string> HardwareWriterProblem(
 }
 }  // namespace detail
 
+// Maximum node hops from an operator producer to an actuator owner before
+// LintGraph warns (REQ-CONTRACT-09).
+inline constexpr std::size_t kMaxOperatorToActuatorHops = 2;
+
 // Everything checkable about a whole graph, errors first.
 //
 // Errors cannot be correct in any configuration (two writers, a reader with no
 // writer, two schemas or message sizes or ring layouts on one topic, a
 // malformed name, a lane its subsystem never reads, an `hw` topic written by
 // anything but the roster's bridge or, for `/hw/request/<node>`, <node>'s
-// devices-layer flush, an `alert_` field that is not a bool or not
-// ParseAlertField's grammar). Warnings are normal during development or in a
-// partial launch (an unread topic, an owner not in this session, a policy
-// lane nobody writes yet, an alert outside a `status` topic, a node that
+// devices-layer flush, an `alert_` field that is not a bool, not
+// ParseAlertField's grammar, or outside a `status` topic). Warnings are normal
+// during development or in a partial launch (an unread topic, an owner not in
+// this session, a policy lane nobody writes yet, a node that
 // writes its hardware request but reads no target lane of its own, a node
-// whose hardware request is marked untargeted_outputs). Required coverage
+// whose hardware request is marked untargeted_outputs, or an operator producer
+// whose shortest path to an actuator owner exceeds kMaxOperatorToActuatorHops
+// node hops). Required coverage
 // additionally rejects a target-consuming subsystem with no producer for a
 // nonempty mode policy, and makes untargeted_outputs an error. Timers are
 // skipped: their names are labels, not topics.
@@ -622,6 +566,8 @@ inline std::vector<Diagnostic> LintGraph(
     std::string name;
     std::vector<std::string> writers;
     std::vector<std::string> readers;
+    // Regular readers and observers, in declaration order.
+    std::vector<std::string> all_readers;
     // Readers whose end is neither optional nor external: `optional` is one
     // reader's tolerance of a missing writer, so it exempts only that reader.
     std::vector<std::string> required_readers;
@@ -700,7 +646,7 @@ inline std::vector<Diagnostic> LintGraph(
                       ") is not a bool; an alert is active "
                       "while true");
             } else if (role != "status") {
-              add(Severity::WARNING, source.name,
+              add(Severity::ERROR, source.name,
                   "alert field '" + field.path + "' (written by " + node.name +
                       ") is in a '" + role +
                       "' topic; an alert belongs to its node's 'status' "
@@ -739,7 +685,10 @@ inline std::vector<Diagnostic> LintGraph(
         if (!source.optional() && !source.external())
           topic.required_readers.push_back(node.name);
       }
-      if (IsReader(source.kind)) ++topic.reader_count;
+      if (IsReader(source.kind)) {
+        topic.all_readers.push_back(node.name);
+        ++topic.reader_count;
+      }
 
       // Two types on one topic: named by schema identity, which also catches
       // two same-size types a size check cannot tell apart. A shape without
@@ -809,11 +758,11 @@ inline std::vector<Diagnostic> LintGraph(
           "the 'test' namespace is for tests; a node in a session must not "
           "use it");
 
-    if (topic.reader_count > MAX_READERS) {
+    if (topic.reader_count > kMaxTopicReaders) {
       add(Severity::ERROR, topic.name,
           "has " + std::to_string(topic.reader_count) +
-              " readers; RTMS reader limit is " + std::to_string(MAX_READERS) +
-              " (including observers)");
+              " readers; RTMS reader limit is " +
+              std::to_string(kMaxTopicReaders) + " (including observers)");
     }
     if (topic.writers.size() > 1) {
       add(Severity::ERROR, topic.name,
@@ -830,7 +779,7 @@ inline std::vector<Diagnostic> LintGraph(
       // them.
       add(Severity::ERROR, topic.name,
           "is read by " +
-              join(topic.exempt ? topic.required_readers : topic.readers) +
+              join(topic.exempt ? topic.required_readers : topic.all_readers) +
               " but nothing publishes it; either the writer is missing or the "
               "two ends are spelled differently");
     } else if (topic.writers.empty() && !topic.readers.empty() &&
@@ -945,6 +894,145 @@ inline std::vector<Diagnostic> LintGraph(
                   "', but none of its policy lanes has a writer: " +
                   join(lanes));
         }
+      }
+    }
+  }
+
+  // REQ-CONTRACT-09, REQ-RT-16: warn when an operator producer's shortest
+  // command-flow path to an actuator owner exceeds kMaxOperatorToActuatorHops
+  // node hops. Only non-/hw, non-observer command roles (`target`, `request`,
+  // `command`) are traversed — never `state`/`status`/`event`/`telemetry`
+  // feedback — outgoing target lanes from an operator producer must belong to
+  // a subsystem's `teleop` policy, and BFS does not expand past an actuator
+  // owner.
+  {
+    const std::size_t n = nodes.size();
+    std::vector<bool> is_operator_producer(n, false);
+    std::vector<bool> is_actuator_owner(n, false);
+    const auto is_teleop_target_lane = [&](std::string_view topic,
+                                           std::string_view writer_name) {
+      if (!IsTargetLane(topic)) return false;
+      const auto segments = detail::Segments(topic);
+      if (segments[0] == writer_name) return false;
+      const auto sub = target_mode_sources.find(segments[0]);
+      if (sub == target_mode_sources.end()) return false;
+      const auto teleop = sub->second.find("teleop");
+      return teleop != sub->second.end() &&
+             std::find(teleop->second.begin(), teleop->second.end(),
+                       segments[2]) != teleop->second.end();
+    };
+    const auto is_command_role = [](std::string_view role) {
+      return role == "target" || role == "request" || role == "command";
+    };
+    struct TopicCommandEdges {
+      bool is_target_lane{false};
+      std::vector<std::size_t> writers;
+      std::vector<std::size_t> teleop_writers;
+      std::vector<std::size_t> readers;
+    };
+    std::map<std::string_view, TopicCommandEdges> topic_edges;
+
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto& node = nodes[i];
+      if (node.hardware_bridge) continue;
+      bool reads_driver_station = false;
+      bool writes_teleop_lane = false;
+      for (const auto& source : node.sources) {
+        if (IsSender(source.kind) &&
+            (source.flags & kSourceFlagHardwareRequest) != 0) {
+          is_actuator_owner[i] = true;
+        }
+        if (IsReader(source.kind) && !source.observer() &&
+            source.name == "/hw/state/driver_station") {
+          reads_driver_station = true;
+        }
+        const bool teleop_lane = IsSender(source.kind) &&
+                                 is_teleop_target_lane(source.name, node.name);
+        if (teleop_lane) writes_teleop_lane = true;
+        if (!IsSender(source.kind) && !IsReader(source.kind)) continue;
+        if (CheckTopicName(source.name)) continue;
+        const auto segments = detail::Segments(source.name);
+        if (segments[0] == "hw" || !is_command_role(segments[1])) continue;
+        auto& entry = topic_edges[source.name];
+        if (IsTargetLane(source.name)) entry.is_target_lane = true;
+        if (IsSender(source.kind)) {
+          entry.writers.push_back(i);
+          if (teleop_lane) entry.teleop_writers.push_back(i);
+        } else if (!source.observer()) {
+          entry.readers.push_back(i);
+        }
+      }
+      if (reads_driver_station && writes_teleop_lane) {
+        is_operator_producer[i] = true;
+      }
+    }
+
+    std::vector<std::vector<std::size_t>> adj(n);
+    std::vector<std::vector<std::size_t>> producer_adj(n);
+    const auto add_edge = [](std::vector<std::vector<std::size_t>>& graph,
+                             std::size_t u, std::size_t v) {
+      if (u == v) return;
+      if (std::find(graph[u].begin(), graph[u].end(), v) == graph[u].end()) {
+        graph[u].push_back(v);
+      }
+    };
+    for (const auto& [topic, entry] : topic_edges) {
+      for (const std::size_t u : entry.writers) {
+        const bool allowed_from_producer =
+            !entry.is_target_lane ||
+            std::find(entry.teleop_writers.begin(), entry.teleop_writers.end(),
+                      u) != entry.teleop_writers.end();
+        for (const std::size_t v : entry.readers) {
+          add_edge(adj, u, v);
+          if (allowed_from_producer) add_edge(producer_adj, u, v);
+        }
+      }
+    }
+    for (auto& neighbors : adj) std::sort(neighbors.begin(), neighbors.end());
+    for (auto& neighbors : producer_adj) {
+      std::sort(neighbors.begin(), neighbors.end());
+    }
+
+    const std::size_t kUnvisited = n;
+    for (std::size_t p = 0; p < n; ++p) {
+      if (!is_operator_producer[p]) continue;
+      std::vector<std::size_t> dist(n, kUnvisited);
+      std::vector<std::size_t> parent(n, kUnvisited);
+      std::vector<std::size_t> queue;
+      queue.reserve(n);
+      dist[p] = 0;
+      queue.push_back(p);
+      for (std::size_t head = 0; head < queue.size(); ++head) {
+        const std::size_t u = queue[head];
+        if (u != p && is_actuator_owner[u]) continue;
+        const auto& neighbors = (u == p) ? producer_adj[u] : adj[u];
+        for (const std::size_t v : neighbors) {
+          if (dist[v] != kUnvisited) continue;
+          dist[v] = dist[u] + 1;
+          parent[v] = u;
+          queue.push_back(v);
+        }
+      }
+      for (std::size_t a = 0; a < n; ++a) {
+        if (!is_actuator_owner[a] || dist[a] == kUnvisited ||
+            dist[a] <= kMaxOperatorToActuatorHops) {
+          continue;
+        }
+        std::vector<std::size_t> path;
+        for (std::size_t cur = a; cur != kUnvisited; cur = parent[cur]) {
+          path.push_back(cur);
+        }
+        std::reverse(path.begin(), path.end());
+        std::string chain;
+        for (std::size_t k = 0; k < path.size(); ++k) {
+          if (k > 0) chain += " -> ";
+          chain += nodes[path[k]].name;
+        }
+        add(Severity::WARNING, nodes[p].name,
+            "operator producer '" + nodes[p].name +
+                "' reaches actuator owner '" + nodes[a].name + "' in " +
+                std::to_string(dist[a]) + " node hops (limit " +
+                std::to_string(kMaxOperatorToActuatorHops) + "): " + chain);
       }
     }
   }

@@ -11,6 +11,7 @@ the test's own directory, so the worktree it makes is the test's to inspect.
 
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -29,74 +30,60 @@ def put(path, text, mode=None):
 
 
 class PrepushTest(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         r = runfiles.Create()
-        self.script = r.Rlocation("_main/tools/prepush.sh")
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.tmp = os.path.realpath(tmp.name)
-        self.repo = os.path.join(self.tmp, "repo")
-        self.tmpdir = os.path.join(self.tmp, "tmp")
-        os.makedirs(self.tmpdir)
-        self.log = os.path.join(self.tmp, "bazel_calls")
-        self.out_path = os.path.join(self.tmp, "bazel-out")
-        # What the stub's build writes under the output path.
-        self.built = os.path.join(self.tmp, "built")
-        put(os.path.join(self.built, "x.d"), DEPFILE)
+        cls.script = r.Rlocation("_main/tools/prepush.sh")
+        tmpl = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmpl.cleanup)
+        tmpl_root = os.path.realpath(tmpl.name)
 
-        # Each call records its working directory, its arguments, and
-        # whether the tracked file is writable there; a build writes the
-        # `.d` files under self.built to the output path; STUB_FAIL fails
-        # that subcommand.
-        bin_dir = os.path.join(self.tmp, "bin")
-        put(os.path.join(bin_dir, "bazel"),
+        # Shared stub binaries, parameterized per test through STUB_* env vars.
+        # Each bazel call records its working directory, its arguments, and
+        # whether the tracked file is writable there; a build writes the `.d`
+        # files under STUB_BUILT to STUB_OUT_PATH; STUB_FAIL fails that
+        # subcommand.
+        cls._bin_dir = os.path.join(tmpl_root, "bin")
+        put(os.path.join(cls._bin_dir, "bazel"),
             "#!/bin/sh\n"
             'if [ -w src/a.txt ]; then mode=writable; else mode=read-only; fi\n'
-            f'echo "$PWD|$mode|$*" >> {shlex.quote(self.log)}\n'
-            f'[ "$1" = info ] && echo {shlex.quote(self.out_path)}\n'
-            f'[ "$1" = build ] && mkdir -p {shlex.quote(self.out_path)} &&'
-            f' cp -R {shlex.quote(self.built)}/. {shlex.quote(self.out_path)}/\n'
+            'echo "$PWD|$mode|$*" >> "$STUB_BAZEL_LOG"\n'
+            '[ "$1" = info ] && echo "$STUB_OUT_PATH"\n'
+            '[ "$1" = build ] && mkdir -p "$STUB_OUT_PATH" &&'
+            ' cp -R "$STUB_BUILT"/. "$STUB_OUT_PATH"/\n'
             '[ "$1" = "${STUB_FAIL:-}" ] && { echo "stub: $1 failed"; exit 1; }\n'
             "exit 0\n",
             0o755)
         # The network-namespace probe: STUB_NETNS=no refuses it.
-        put(os.path.join(bin_dir, "unshare"),
+        put(os.path.join(cls._bin_dir, "unshare"),
             '#!/bin/sh\n[ "${STUB_NETNS:-yes}" = yes ]\n', 0o755)
         # pnpm: records each run; STUB_PNPM_INSTALL=fail fails an install.
-        self.pnpm_log = os.path.join(self.tmp, "pnpm_calls")
-        put(os.path.join(bin_dir, "pnpm"),
-            f'#!/bin/sh\necho "$*" >> {shlex.quote(self.pnpm_log)}\n'
+        put(os.path.join(cls._bin_dir, "pnpm"),
+            '#!/bin/sh\necho "$*" >> "$STUB_PNPM_LOG"\n'
             '[ "$1" = install ] && [ "${STUB_PNPM_INSTALL:-}" = fail ] && exit 1\n'
             "exit 0\n",
             0o755)
 
-        self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith("GIT_")
-                    and k != "TALOS_ROBOT_REPOSITORY"}
-        self.env.update(
-            PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""),
-            TMPDIR=self.tmpdir, HOME=self.tmp, GIT_CONFIG_GLOBAL=os.devnull,
-            GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t",
-            GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="t",
-            GIT_COMMITTER_EMAIL="t@example.com")
-        put(os.path.join(self.repo, "src", "a.txt"), "a\n")
-        put(os.path.join(self.repo, "MODULE.bazel.lock"), "{}\n")
+        # Template repository initialized once and copied per test to avoid
+        # repeating `git init` + `git add` + initial `git commit` for every
+        # test method.
+        cls._template_repo = os.path.join(tmpl_root, "repo")
+        put(os.path.join(cls._template_repo, "src", "a.txt"), "a\n")
+        put(os.path.join(cls._template_repo, "MODULE.bazel.lock"), "{}\n")
         # The commit's own tools prepush runs; a commit without one fails
         # the run. The RoboRIO-in-the-loop stub records each run in
-        # self.full_log (full_calls()).
-        self.full_log = os.path.join(self.tmp, "full_calls")
-        put(os.path.join(self.repo, "tools", "source_lints.sh"),
+        # STUB_FULL_LOG (full_calls()).
+        put(os.path.join(cls._template_repo, "tools", "source_lints.sh"),
             "#!/bin/sh\nexit 0\n", 0o755)
         # format.sh and tidy.sh record their working directory, whether the
         # tracked file is writable there, and their arguments in
-        # self.clang_log; STUB_FORMAT and STUB_TIDY are their exit codes,
+        # STUB_CLANG_LOG; STUB_FORMAT and STUB_TIDY are their exit codes,
         # and tidy's 3 prints tidy.sh's own reason it cannot run.
-        self.clang_log = os.path.join(self.tmp, "clang_calls")
         for tool, var in (("format", "STUB_FORMAT"), ("tidy", "STUB_TIDY")):
-            put(os.path.join(self.repo, "tools", f"{tool}.sh"),
+            put(os.path.join(cls._template_repo, "tools", f"{tool}.sh"),
                 "#!/bin/sh\n"
                 'if [ -w src/a.txt ]; then mode=writable; else mode=read-only; fi\n'
-                f'echo "$PWD|$mode|{tool} $*" >> {shlex.quote(self.clang_log)}\n'
+                f'echo "$PWD|$mode|{tool} $*" >> "$STUB_CLANG_LOG"\n'
                 f'status="${{{var}:-0}}"\n'
                 '[ "$status" = 3 ] && {\n'
                 '  echo "tidy: cannot run here: clang 18 cannot parse this'
@@ -104,13 +91,52 @@ class PrepushTest(unittest.TestCase):
                 '  echo "  bits/atomic_wait.h:1:1: error: x" >&2; }\n'
                 f'[ "$status" = 0 ] || echo "stub: {tool} exited $status"\n'
                 'exit "$status"\n', 0o755)
-        put(os.path.join(self.repo, "tools", "test_rio_in_the_loop.py"),
+        put(os.path.join(cls._template_repo, "tools",
+                         "test_rio_in_the_loop.py"),
             "import os, sys\n"
-            f"with open({self.full_log!r}, 'a', encoding='utf-8') as f:\n"
+            "with open(os.environ['STUB_FULL_LOG'], 'a', encoding='utf-8') as f:\n"
             "    f.write('|'.join([os.getcwd(), 'rio', *sys.argv[1:]]) + '\\n')\n")
-        for args in (["init", "-q"], ["add", "."], ["commit", "-qm", "one"]):
-            self.git(*args)
-        self.addCleanup(self.git, "worktree", "prune")
+        git_env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("GIT_")}
+        git_env.update(
+            HOME=tmpl_root, GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t",
+            GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="t",
+            GIT_COMMITTER_EMAIL="t@example.com")
+        for args in (["init", "-q", "--template="], ["add", "."],
+                     ["commit", "-qm", "one"]):
+            subprocess.run(["git", *args], cwd=cls._template_repo, env=git_env,
+                           capture_output=True, text=True, check=True)
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        self.repo = os.path.join(self.tmp, "repo")
+        shutil.copytree(self._template_repo, self.repo)
+        self.tmpdir = os.path.join(self.tmp, "tmp")
+        os.makedirs(self.tmpdir)
+        self.log = os.path.join(self.tmp, "bazel_calls")
+        self.out_path = os.path.join(self.tmp, "bazel-out")
+        # What the stub's build writes under the output path.
+        self.built = os.path.join(self.tmp, "built")
+        put(os.path.join(self.built, "x.d"), DEPFILE)
+        self.pnpm_log = os.path.join(self.tmp, "pnpm_calls")
+        self.full_log = os.path.join(self.tmp, "full_calls")
+        self.clang_log = os.path.join(self.tmp, "clang_calls")
+
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("GIT_")
+                    and k != "TALOS_ROBOT_REPOSITORY"}
+        self.env.update(
+            PATH=self._bin_dir + os.pathsep + os.environ.get("PATH", ""),
+            TMPDIR=self.tmpdir, HOME=self.tmp, GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t",
+            GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="t",
+            GIT_COMMITTER_EMAIL="t@example.com",
+            STUB_BAZEL_LOG=self.log, STUB_OUT_PATH=self.out_path,
+            STUB_BUILT=self.built, STUB_PNPM_LOG=self.pnpm_log,
+            STUB_CLANG_LOG=self.clang_log, STUB_FULL_LOG=self.full_log)
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, env=self.env,
@@ -134,6 +160,30 @@ class PrepushTest(unittest.TestCase):
         self.git("add", path)
         self.git("commit", "-qm", message)
         return self.git("rev-parse", "HEAD").strip()
+
+    def commit_many(self, items):
+        """Commits each (path, message) pair in order via one git fast-import."""
+        branch = self.git("symbolic-ref", "HEAD").strip()
+        chunks = []
+        for i, (path, message) in enumerate(items):
+            body = (message + "\n").encode("utf-8")
+            msg = message.encode("utf-8")
+            chunks.append(
+                f"commit {branch}\n"
+                f"committer t <t@example.com> {1700000000 + i} +0000\n"
+                f"data {len(msg)}\n".encode("utf-8"))
+            chunks.append(msg + b"\n")
+            if i == 0:
+                chunks.append(b"from HEAD^0\n")
+            chunks.append(
+                f"M 100644 inline {path}\n"
+                f"data {len(body)}\n".encode("utf-8"))
+            chunks.append(body + b"\n")
+        subprocess.run(
+            ["git", "fast-import", "--quiet"],
+            input=b"".join(chunks), cwd=self.repo, env=self.env,
+            capture_output=True, check=True)
+        self.git("reset", "--hard", "-q", "HEAD")
 
     def add_gradlew(self):
         """Commits a stub gradlew that records each run in self.gradle_log."""
@@ -359,6 +409,92 @@ class PrepushTest(unittest.TestCase):
         with open(self.pnpm_log, encoding="utf-8") as f:
             self.assertEqual([line.split()[0] for line in f], ["install"])
 
+    # REQ-DEV-25: on a branch without an upstream, studio reuses the checkout's
+    # node_modules when its recorded .pnpm/lock.yaml matches the committed
+    # pnpm-lock.yaml, and refuses stale node_modules whose recorded lockfile
+    # differs.
+    def test_studio_reuses_modules_only_when_recorded_lockfile_matches(self):
+        self.commit("studio/pnpm-lock.yaml", "lockfile-v1")
+        put(os.path.join(self.repo, "studio", "node_modules", ".pnpm",
+                         "lock.yaml"), "lockfile-v1\n")
+        status, out, _ = self.prepush("--skip-gradle",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: studio-test ok", out)
+        self.assertIn("prepush: studio-build ok", out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f],
+                             ["test", "build"])
+
+        # Stale node_modules recorded an older lockfile: must not symlink.
+        os.remove(self.pnpm_log)
+        put(os.path.join(self.repo, "studio", "node_modules", ".pnpm",
+                         "lock.yaml"), "lockfile-old\n")
+        status, out, _ = self.prepush("--skip-gradle",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: studio SKIPPED", out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f], ["install"])
+
+    # REQ-DEV-25: an unpushed branch with no upstream falls back to the merge
+    # base with origin/main for optional steps, and still runs everything when
+    # origin/main is absent.
+    def test_optional_steps_fall_back_to_origin_main_without_upstream(self):
+        self.add_gradlew()
+        self.commit("studio/pnpm-lock.yaml", "lockfile-v1")
+        put(os.path.join(self.repo, "studio", "node_modules", ".pnpm",
+                         "lock.yaml"), "lockfile-v1\n")
+
+        # Neither upstream nor origin/main: every optional step runs.
+        self.commit("docs/before_remote.md", "docs before remote")
+        status, out, _ = self.prepush("--ref", "HEAD",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(self.gradle_ran(), out)
+        self.assertEqual([c[1] for c in self.full_calls()], ["rio"], out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f],
+                             ["test", "build"])
+        os.remove(self.pnpm_log)
+
+        # With origin/main present and no upstream, a doc-only change skips
+        # gradle, rio-in-the-loop and studio.
+        remote = os.path.join(self.tmp, "remote.git")
+        self.git("init", "-q", "--bare", remote)
+        self.git("remote", "add", "origin", remote)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/main")
+        self.git("fetch", "-q", "origin")
+        self.commit("docs/only_docs.md", "docs only")
+        status, out, _ = self.prepush("--ref", "HEAD")
+        self.assertEqual(status, 0, out)
+        self.assertFalse(self.gradle_ran(), out)
+        self.assertEqual(self.full_calls(), [], out)
+        self.assertFalse(os.path.exists(self.pnpm_log), out)
+        self.assertIn("gradle not needed (nothing under controller_processor/ "
+                      "talOS/ since origin/main)", out)
+        self.assertIn("studio not needed (nothing under studio/ since "
+                      "origin/main)", out)
+
+        # Touching talOS/ runs gradle and rio-in-the-loop, still skips studio.
+        self.commit("talOS/x.h", "talos header")
+        status, out, _ = self.prepush("--ref", "HEAD")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(self.gradle_ran(), out)
+        self.assertEqual([c[1] for c in self.full_calls()], ["rio"], out)
+        self.assertFalse(os.path.exists(self.pnpm_log), out)
+
+        # Touching studio/ runs studio too.
+        self.commit("studio/x.ts", "studio source")
+        status, out, _ = self.prepush("--ref", "HEAD",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(self.gradle_ran(), out)
+        self.assertEqual([c[1] for c in self.full_calls()], ["rio"], out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f],
+                             ["test", "build"])
+
     # REQ-DEV-25
     def test_gradle_runs_for_any_source_the_roborio_program_compiles(self):
         # build.gradle compiles talOS/driver_station/driver_station.cc and
@@ -426,7 +562,7 @@ class PrepushTest(unittest.TestCase):
         soak = [args.split() for _, _, args in calls
                 if "//bench/main_processor/simulation:soak_test" in args]
         self.assertEqual(len(soak), 1, out)
-        self.assertIn("--test_env=TALOS_SOAK_SECONDS=36", soak[0])
+        self.assertIn("--test_env=TALOS_SOAK_SECONDS=48", soak[0])
         self.assertIn("--nocache_test_results", soak[0])
 
     # REQ-DEV-25
@@ -464,8 +600,7 @@ class PrepushTest(unittest.TestCase):
         self.git("push", "-q", "origin", "HEAD:refs/heads/main")
         self.git("branch", "pushed")
         self.git("branch", "--set-upstream-to=pushed")
-        for i in range(20):
-            self.commit(f"docs/{i}.md", f"docs {i}")
+        self.commit_many([(f"docs/{i}.md", f"docs {i}") for i in range(20)])
         status, out, _ = self.prepush()
         self.assertEqual(status, 0, out)
         self.assertNotIn("prepush: full", out)
@@ -516,6 +651,97 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("prepush: source-lints SKIPPED (this commit has no "
                       "tools/source_lints.sh", out)
+
+    # REQ-OPS-33: deleting or omitting tools/check_robot_repo_scaffold.sh fails
+    # closed on HEAD, and is skipped cleanly only on an older commit predating it.
+    def test_missing_scaffold_script_fails_closed_unless_predated(self):
+        self.commit("examples/robot_repo/MODULE.bazel", "robot_repo")
+        self.commit("examples/wrist_repo/MODULE.bazel", "wrist_repo")
+        old = self.git("rev-parse", "HEAD").strip()
+
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: scaffold-robot_repo SKIPPED (this commit has no "
+                      "tools/check_robot_repo_scaffold.sh)", out)
+
+        put(os.path.join(self.repo, "tools", "check_robot_repo_scaffold.sh"),
+            "#!/bin/sh\nexit 0\n", 0o755)
+        self.git("add", "tools/check_robot_repo_scaffold.sh")
+        self.git("commit", "-qm", "add scaffold check")
+
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: scaffold-robot_repo ok", out)
+
+        status, out, _ = self.prepush("--ref", old, "--skip-gradle",
+                                      "--skip-studio")
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: scaffold-robot_repo skipped", out)
+
+    # REQ-DEV-29: prepush builds and tests @talos//talOS/configuration:config_fuzz_test
+    # inside both dependent repositories (examples/robot_repo and
+    # examples/wrist_repo) whenever MODULE.bazel or third_party/ changes, and
+    # fails the run if either dependent fails.
+    def test_dependents_run_config_fuzz_test_when_module_or_third_party_changes(
+            self):
+        self.commit("examples/robot_repo/MODULE.bazel", "robot_repo")
+        self.commit("examples/wrist_repo/MODULE.bazel", "wrist_repo")
+        put(os.path.join(self.repo, "tools", "check_robot_repo_scaffold.sh"),
+            "#!/bin/sh\nexit 0\n", 0o755)
+        self.git("add", "tools/check_robot_repo_scaffold.sh")
+        self.git("commit", "-qm", "scaffold check")
+        self.git("branch", "pushed")
+        self.git("branch", "--set-upstream-to=pushed")
+
+        def clear_log():
+            if os.path.exists(self.log):
+                os.remove(self.log)
+
+        def dependent_calls(calls, name):
+            suffix = os.sep + os.path.join("examples", name)
+            return [args.split() for cwd, _, args in calls
+                    if cwd.endswith(suffix)]
+
+        # A doc-only change skips dependent repositories.
+        self.commit("docs/note.md", "docs only")
+        clear_log()
+        status, out, calls = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: dependents not needed", out)
+        self.assertEqual(dependent_calls(calls, "robot_repo"), [])
+        self.assertEqual(dependent_calls(calls, "wrist_repo"), [])
+
+        # Touching MODULE.bazel, third_party/, or studio/ runs config_fuzz_test
+        # inside both dependent repositories (examples/robot_repo depends on
+        # @talos//studio/bridge and @talos//studio:web_dist; REQ-DEV-25,
+        # REQ-DEV-30).
+        for path, msg in (("MODULE.bazel", "module change"),
+                          ("third_party/tomlplusplus_parser_ub.patch",
+                           "toml patch change"),
+                          ("studio/bridge/x.cc", "studio bridge change")):
+            with self.subTest(path=path):
+                self.git("branch", "-f", "pushed", "HEAD")
+                self.commit(path, msg)
+                clear_log()
+                status, out, calls = self.prepush()
+                self.assertEqual(status, 0, out)
+                for dep in ("robot_repo", "wrist_repo"):
+                    self.assertIn(f"prepush: dependent-{dep} ok", out)
+                    dep_calls = dependent_calls(calls, dep)
+                    self.assertEqual(len(dep_calls), 1, calls)
+                    self.assertEqual(dep_calls[0][0], "test")
+                    self.assertIn("//...", dep_calls[0])
+                    self.assertIn(
+                        "@talos//talOS/configuration:config_fuzz_test",
+                        dep_calls[0])
+
+        # A failure in dependent test runs fails prepush naming both steps.
+        clear_log()
+        status, out, _ = self.prepush(STUB_FAIL="test")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: dependent-robot_repo FAILED", out)
+        self.assertIn("prepush: dependent-wrist_repo FAILED", out)
+        self.assert_cleaned_up()
 
     # REQ-DEV-25
     def test_full_is_refused_with_skip_gradle(self):
@@ -609,5 +835,35 @@ class PrepushTest(unittest.TestCase):
         os.rename(other + ".away", other)
 
 
+class _ShardedTestLoader(unittest.TestLoader):
+    """Partitions test methods deterministically across Bazel test shards."""
+
+    def __init__(self, shard_index, total_shards):
+        super().__init__()
+        self._shard_index = shard_index
+        self._total_shards = total_shards
+
+    def getTestCaseNames(self, testCaseClass):
+        names = super().getTestCaseNames(testCaseClass)
+        return [name for i, name in enumerate(names)
+                if i % self._total_shards == self._shard_index]
+
+
+def _bazel_test_loader():
+    status_file = os.environ.get("TEST_SHARD_STATUS_FILE")
+    if status_file:
+        with open(status_file, "a", encoding="utf-8"):
+            pass
+    total = int(os.environ.get("TEST_TOTAL_SHARDS") or "1")
+    index = int(os.environ.get("TEST_SHARD_INDEX") or "0")
+    if total <= 1:
+        return unittest.defaultTestLoader
+    if not 0 <= index < total:
+        raise ValueError(
+            f"TEST_SHARD_INDEX={index} out of range for "
+            f"TEST_TOTAL_SHARDS={total}")
+    return _ShardedTestLoader(index, total)
+
+
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(testLoader=_bazel_test_loader())

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -96,6 +97,13 @@ TalosNode* talos_sim_add(TalosSim* sim, const char* node_name,
     const char* name = NonNull(node_name, "node_name");
     SimAccess::add_instance(s, name, MakeFactory(factory, user));
     return talos::node_api::AsHandle(s.node(name));
+  });
+}
+
+int32_t talos_sim_remove(TalosSim* sim, const char* node_name) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    AsSim(sim).remove(NonNull(node_name, "node_name"));
+    return TALOS_OK;
   });
 }
 
@@ -376,7 +384,17 @@ int32_t talos_sim_hardware_set_driver_station(
     namespace ds = talos::driver_station;
     ds::DriverStationData data{};
     data.fms.flags = packet->flags;
+    if (packet->alliance < TALOS_ALLIANCE_UNKNOWN ||
+        packet->alliance > TALOS_ALLIANCE_BLUE) {
+      throw std::invalid_argument("unknown alliance " +
+                                  std::to_string(packet->alliance));
+    }
     data.fms.alliance = static_cast<ds::Alliance>(packet->alliance);
+    if (packet->station < 0 ||
+        packet->station > std::numeric_limits<std::uint8_t>::max()) {
+      throw std::invalid_argument("station out of range: " +
+                                  std::to_string(packet->station));
+    }
     data.fms.station = static_cast<std::uint8_t>(packet->station);
     data.fms.match_time_s = packet->match_time_s;
     for (std::size_t port = 0; port < ds::kMaxJoysticks; ++port) {
@@ -391,9 +409,15 @@ int32_t talos_sim_hardware_set_driver_station(
           std::clamp<int32_t>(in.pov_count, 0, ds::kMaxPovs));
       out.buttons = in.buttons;
       std::copy(std::begin(in.axes), std::end(in.axes), out.axes.begin());
-      std::transform(
-          std::begin(in.povs), std::end(in.povs), out.povs.begin(),
-          [](int32_t pov) { return static_cast<std::int16_t>(pov); });
+      std::transform(std::begin(in.povs), std::end(in.povs), out.povs.begin(),
+                     [](int32_t pov) {
+                       if (pov < std::numeric_limits<std::int16_t>::min() ||
+                           pov > std::numeric_limits<std::int16_t>::max()) {
+                         throw std::invalid_argument("pov out of range: " +
+                                                     std::to_string(pov));
+                       }
+                       return static_cast<std::int16_t>(pov);
+                     });
       std::memcpy(out.name, in.name, sizeof out.name);
     }
     AsHardware(hw).set_driver_station(data);

@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cfenv>
 #include <cstdint>
+#include <limits>
 #include <map>
+#include <memory>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -238,6 +241,41 @@ TEST(Capture, LinuxControlsReachTheDeviceOrNameTheOneRefused) {
     EXPECT_EQ(error.rfind(failure.control, 0), 0u) << error;
   }
 }
+
+TEST(Capture, LinuxControlsRejectNonFiniteAndHugeFiniteValues) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const struct {
+    const char* name;
+    CameraControls controls;
+    const char* control;
+  } cases[] = {
+      {"NaN exposure_ms",
+       {.exposure_ms = nan, .gain = 0},
+       "exposure_time_absolute"},
+      {"-inf exposure_ms",
+       {.exposure_ms = -inf, .gain = 0},
+       "exposure_time_absolute"},
+      {"+inf exposure_ms",
+       {.exposure_ms = inf, .gain = 0},
+       "exposure_time_absolute"},
+      {"huge finite exposure_ms",
+       {.exposure_ms = 1e30, .gain = 0},
+       "exposure_time_absolute"},
+      {"NaN gain", {.exposure_ms = 0, .gain = nan}, "gain"},
+      {"-inf gain", {.exposure_ms = 0, .gain = -inf}, "gain"},
+      {"+inf gain", {.exposure_ms = 0, .gain = inf}, "gain"},
+      {"huge finite gain", {.exposure_ms = 0, .gain = 1e30}, "gain"},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.name);
+    FakeControls device;
+    std::feclearexcept(FE_ALL_EXCEPT);
+    const auto error = ApplyV4L2Controls(c.controls, device);
+    EXPECT_EQ(std::fetestexcept(FE_INVALID), 0);
+    EXPECT_EQ(error.rfind(c.control, 0), 0u) << error;
+  }
+}
 #endif
 TEST(Capture, FrameDurationIsOneTheRangeAccepts) {
   // An Arducam OV9281 (UVC) reports single-rate ranges through AVFoundation,
@@ -295,6 +333,28 @@ TEST(Capture, MissingDeviceFailsAndStopIsIdempotent) {
   source->Stop();
   EXPECT_FALSE(source->Start());
   source->Stop();
+}
+
+TEST(Capture, ConnectionCallbackCanReplaceItselfWhileInvoked) {
+  CameraSourceConfig config;
+  config.device_path = "/talos-nonexistent-camera-device";
+  auto source = CreatePlatformCameraSource(config);
+  if (!source) return;  // Unsupported platforms have no capture implementation.
+  auto token = std::make_shared<int>(42);
+  std::weak_ptr<int> weak = token;
+  bool invoked = false;
+  bool expired_during_callback = true;
+  source->SetConnectionCallback(
+      [&source, &invoked, &expired_during_callback, weak,
+       owned = std::move(token)](ConnectionState, std::string_view) {
+        (void)owned;
+        invoked = true;
+        source->SetConnectionCallback({});
+        expired_during_callback = weak.expired();
+      });
+  EXPECT_FALSE(source->Start());
+  EXPECT_TRUE(invoked);
+  EXPECT_FALSE(expired_during_callback);
 }
 }  // namespace
 }  // namespace talos::vision

@@ -66,6 +66,9 @@ export const MAX_FRAME_BYTES = 16384;
 // dictionary the producer emits blanks the stream.
 export const MAX_DICTIONARY_STRING_BYTES = 256;
 export const MAX_ENUM_LABELS = 1024;
+// At least one channel per page in a multi-page dictionary, bounded by
+// kMaxChannels (2048) in talOS/telemetry/wire.h.
+export const MAX_DICTIONARY_PAGES = 2048;
 
 // The display string for a channel value: the enum label when the channel
 // declared labels and the value is a valid index, else the exact value.
@@ -231,18 +234,52 @@ export function splitPages(bytes: Uint8Array): Uint8Array[] {
   return pages;
 }
 
+function sameDictionary(
+    existing: Dictionary,
+    names: string[],
+    kindList: ChannelKind[],
+    units: Record<string, string>,
+    labels: Record<string, string[]>,
+    alerts: Record<string, AlertLevel>): boolean {
+  if (existing.names.length !== names.length) return false;
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    if (existing.names[i] !== name ||
+        existing.kindList[i] !== kindList[i] ||
+        existing.units[name] !== units[name] ||
+        existing.alerts[name] !== alerts[name])
+      return false;
+    const a = existing.labels[name], b = labels[name];
+    if ((a?.length ?? 0) !== (b?.length ?? 0)) return false;
+    if (a && b) {
+      for (let j = 0; j < a.length; j++) if (a[j] !== b[j]) return false;
+    }
+  }
+  return true;
+}
+
 // Stateful v3 decoder (talOS/telemetry/README.md). Dictionary pages complete a
-// dictionary; value pages apply to the current channel values as they
-// arrive, a keyframe's first page starting from every channel absent, and an
-// update's last page yields its snapshot. The bridge sends the dictionary and
-// a keyframe before any change-only update, so a value page with no
-// dictionary or no keyframe before it is refused, and the caller counts it.
-// Dictionaries are per stream: a new stream_id discards the old one.
+// dictionary; multi-page value updates stage into copies and commit atomically
+// at their last page, a keyframe starting from every channel absent. The bridge
+// sends the dictionary and a keyframe before any change-only update, so a value
+// page with no dictionary or no keyframe before it is refused, and the caller
+// counts it. Dictionaries are per stream: a new stream_id discards the old one.
 export class TelemetryDecoder {
   private stream: string|null = null;
   private dictionary: Dictionary|null = null;
   private pending: {stream: string; id: number; pageCount: number;
                     count: number; pages: Frame[]}|null = null;
+  private pendingValues: {
+    stream: string;
+    dictionaryId: number;
+    sequenceId: bigint;
+    timestampNs: bigint;
+    keyframe: boolean;
+    pageCount: number;
+    nextPage: number;
+    raw: BigUint64Array<ArrayBuffer>;
+    present: Uint8Array<ArrayBuffer>;
+  }|null = null;
   private raw = new BigUint64Array(0);
   private present = new Uint8Array(0);
   private hasValues = false;
@@ -251,6 +288,9 @@ export class TelemetryDecoder {
     this.stream = null;
     this.dictionary = null;
     this.pending = null;
+    this.pendingValues = null;
+    this.raw = new BigUint64Array(0);
+    this.present = new Uint8Array(0);
     this.hasValues = false;
   }
 
@@ -291,32 +331,88 @@ export class TelemetryDecoder {
       throw Error('Value page before its dictionary');
     const keyframe = f.keyframe();
     if (!keyframe && !this.hasValues) throw Error('Update before a keyframe');
-    // Validate the whole page before it changes anything.
-    const chassis = pose(f.chassis());
-    const count = f.channelsLength();
-    if (f.valuesLength() !== count) throw Error('Channels and values differ');
-    const raws: bigint[] = [];
-    for (let i = 0; i < count; i++) {
-      const channel = f.channels(i)!, raw = f.values(i)!;
-      if (channel >= dictionary.names.length) throw Error('Unknown channel');
-      // Any double is a reading, NaN and the infinities included.
-      if (dictionary.kindList[channel] === ChannelKind.Bool && raw > 1n)
-        throw Error('Invalid bool');
-      raws.push(raw);
+    const sequenceId = f.sequenceId();
+    const timestampNs = f.timestampNs();
+    const pending = this.pendingValues;
+    const matchesPending = page > 0 && pending !== null &&
+        pending.stream === streamId &&
+        pending.dictionaryId === dictionary.id &&
+        pending.sequenceId === sequenceId &&
+        pending.timestampNs === timestampNs &&
+        pending.keyframe === keyframe &&
+        pending.pageCount === pageCount &&
+        pending.nextPage === page;
+    if (page > 0 && !matchesPending) {
+      this.pendingValues = null;
+      throw Error('Value page out of order');
     }
-    for (let i = 0; i < f.absentLength(); i++)
-      if (f.absent(i)! >= dictionary.names.length) throw Error('Unknown channel');
 
-    if (keyframe && page === 0) {
-      this.present.fill(0);
-      this.hasValues = true;
+    // Validate the whole page before it changes anything.
+    let chassis: Pose;
+    const count = f.channelsLength();
+    const raws: bigint[] = [];
+    try {
+      chassis = pose(f.chassis());
+      if (f.valuesLength() !== count) throw Error('Channels and values differ');
+      for (let i = 0; i < count; i++) {
+        const channel = f.channels(i)!, raw = f.values(i)!;
+        if (channel >= dictionary.names.length) throw Error('Unknown channel');
+        // Any double is a reading, NaN and the infinities included.
+        if (dictionary.kindList[channel] === ChannelKind.Bool && raw > 1n)
+          throw Error('Invalid bool');
+        raws.push(raw);
+      }
+      for (let i = 0; i < f.absentLength(); i++)
+        if (f.absent(i)! >= dictionary.names.length) throw Error('Unknown channel');
+    } catch (e) {
+      if (matchesPending) this.pendingValues = null;
+      throw e;
+    }
+
+    if (pageCount === 1) {
+      this.pendingValues = null;
+      if (keyframe) {
+        this.present.fill(0);
+        this.hasValues = true;
+      }
+      for (let i = 0; i < count; i++) {
+        this.raw[f.channels(i)!] = raws[i];
+        this.present[f.channels(i)!] = 1;
+      }
+      for (let i = 0; i < f.absentLength(); i++) this.present[f.absent(i)!] = 0;
+      return this.snapshot(f, streamId, chassis, dictionary);
+    }
+
+    // Multi-page update: stage into copies and commit atomically on the last page.
+    let staged: NonNullable<TelemetryDecoder['pendingValues']>;
+    if (page === 0) {
+      const n = dictionary.names.length;
+      staged = {
+        stream: streamId,
+        dictionaryId: dictionary.id,
+        sequenceId,
+        timestampNs,
+        keyframe,
+        pageCount,
+        nextPage: 0,
+        raw: keyframe ? new BigUint64Array(n) : this.raw.slice(),
+        present: keyframe ? new Uint8Array(n) : this.present.slice()
+      };
+      this.pendingValues = staged;
+    } else {
+      staged = pending!;
     }
     for (let i = 0; i < count; i++) {
-      this.raw[f.channels(i)!] = raws[i];
-      this.present[f.channels(i)!] = 1;
+      staged.raw[f.channels(i)!] = raws[i];
+      staged.present[f.channels(i)!] = 1;
     }
-    for (let i = 0; i < f.absentLength(); i++) this.present[f.absent(i)!] = 0;
-    if (page + 1 !== pageCount) return null;
+    for (let i = 0; i < f.absentLength(); i++) staged.present[f.absent(i)!] = 0;
+    staged.nextPage = page + 1;
+    if (staged.nextPage !== pageCount) return null;
+    this.raw = staged.raw;
+    this.present = staged.present;
+    this.hasValues = true;
+    this.pendingValues = null;
     return this.snapshot(f, streamId, chassis, dictionary);
   }
 
@@ -324,6 +420,14 @@ export class TelemetryDecoder {
                          pageCount: number) {
     if (f.channelsLength() || f.valuesLength())
       throw Error('Dictionary page with values');
+    if (pageCount > MAX_DICTIONARY_PAGES) {
+      this.pending = null;
+      throw Error('Too many dictionary pages');
+    }
+    if (pageCount > 1 && f.dictionaryLength() === 0) {
+      this.pending = null;
+      throw Error('Empty dictionary page');
+    }
     const pending = this.pending;
     if (page === 0) {
       this.pending = {stream: streamId, id: f.dictionaryId(), pageCount,
@@ -331,6 +435,7 @@ export class TelemetryDecoder {
     } else if (pending && pending.stream === streamId &&
                pending.id === f.dictionaryId() &&
                pending.pageCount === pageCount &&
+               pending.count === f.channelCount() &&
                pending.pages.length === page) {
       pending.pages.push(f);
     } else {
@@ -376,19 +481,23 @@ export class TelemetryDecoder {
       }
     }
     if (names.length !== complete.count) throw Error('Dictionary is incomplete');
-    const same = this.dictionary && this.stream === streamId &&
+    const same = this.dictionary !== null && this.stream === streamId &&
         this.dictionary.id === complete.id;
+    if (same) {
+      if (!sameDictionary(this.dictionary!, names, kindList, units, labels, alerts))
+        throw Error('Conflicting dictionary for id');
+      return;
+    }
     this.stream = streamId;
     this.dictionary = {
       id: complete.id, names, kindList, units: Object.freeze(units),
       labels: Object.freeze(labels), kinds: Object.freeze(kinds),
       alerts: Object.freeze(alerts)
     };
-    if (!same) {
-      this.raw = new BigUint64Array(names.length);
-      this.present = new Uint8Array(names.length);
-      this.hasValues = false;
-    }
+    this.raw = new BigUint64Array(names.length);
+    this.present = new Uint8Array(names.length);
+    this.hasValues = false;
+    this.pendingValues = null;
   }
 
   private snapshot(f: Frame, streamId: string, chassis: Pose,

@@ -69,7 +69,7 @@ kernel void rgb_to_gray(
     output_buf[gid.y * out_stride + gid.x] = gray;
 }
 
-// 2. decimate_2x: 2x downsampling with box/Gaussian filter
+// 2. decimate_2x: 2x downsampling matching upstream image_u8_decimate(..., 2.0f)
 kernel void decimate_2x(
     device const uchar* input_buf [[buffer(0)]],
     device uchar* output_buf [[buffer(1)]],
@@ -79,8 +79,8 @@ kernel void decimate_2x(
     constant uint& out_stride [[buffer(5)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    uint out_width = in_width / 2;
-    uint out_height = in_height / 2;
+    uint out_width = (in_width > 0) ? (1 + (in_width - 1) / 2) : 0;
+    uint out_height = (in_height > 0) ? (1 + (in_height - 1) / 2) : 0;
     if (gid.x >= out_width || gid.y >= out_height) {
         return;
     }
@@ -103,8 +103,8 @@ kernel void rgb_to_gray_decimate_2x(
     constant uint& format [[buffer(6)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    uint out_width = in_width / 2;
-    uint out_height = in_height / 2;
+    uint out_width = (in_width > 0) ? (1 + (in_width - 1) / 2) : 0;
+    uint out_height = (in_height > 0) ? (1 + (in_height - 1) / 2) : 0;
     if (gid.x >= out_width || gid.y >= out_height) {
         return;
     }

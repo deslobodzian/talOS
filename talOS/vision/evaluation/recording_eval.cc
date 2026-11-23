@@ -8,6 +8,8 @@
 #include <Eigen/Geometry>
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -174,6 +176,9 @@ Options Parse(int argc, char** argv) {
       o.opencv_distortion = Numbers(value(), 4, 14, "--opencv-distortion");
     } else if (flag == "--hfov-deg") {
       o.hfov_deg = Numbers(value(), 1, 1, "--hfov-deg")[0];
+      if (!(*o.hfov_deg > 0.0 && *o.hfov_deg < 180.0)) {
+        Die("--hfov-deg must be in (0, 180)");
+      }
     } else if (flag == "--equidistant") {
       const auto v = Numbers(value(), 4, 4, "--equidistant");
       o.equidistant = {v[0], v[1], v[2], v[3]};
@@ -273,6 +278,28 @@ FieldLayout AprilGridLayout(const std::array<double, 4>& grid, int variant) {
   return layout;
 }
 
+bool ParseInt64Field(const std::string& item, std::int64_t* out) {
+  errno = 0;
+  char* end = nullptr;
+  const long long value = std::strtoll(item.c_str(), &end, 10);
+  if (errno != 0 || end == item.c_str()) return false;
+  while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+  if (*end != '\0') return false;
+  *out = static_cast<std::int64_t>(value);
+  return true;
+}
+
+bool ParseFiniteDoubleField(const std::string& item, double* out) {
+  errno = 0;
+  char* end = nullptr;
+  const double value = std::strtod(item.c_str(), &end);
+  if (errno != 0 || end == item.c_str() || !std::isfinite(value)) return false;
+  while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+  if (*end != '\0') return false;
+  *out = value;
+  return true;
+}
+
 // Mocap pose of the IMU (EuRoC CSV: t_ns, p xyz, q wxyz) at time t, linearly
 // interpolated (translation; rotation by slerp) between samples at most
 // 20 ms apart; nullopt outside the track or across a gap.
@@ -283,24 +310,42 @@ class MocapTrack {
     if (!in) Die("cannot read " + path);
     std::string line;
     while (std::getline(in, line)) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
       if (line.empty() || line[0] == '#') continue;
       std::vector<double> v;
       std::stringstream s(line);
       std::string item;
       std::int64_t t = 0;
       bool first = true;
+      bool valid_row = true;
       while (std::getline(s, item, ',')) {
         if (first) {
-          t = std::stoll(item);
+          if (!ParseInt64Field(item, &t)) {
+            valid_row = false;
+            break;
+          }
           first = false;
         } else {
-          v.push_back(std::stod(item));
+          double field = 0.0;
+          if (!ParseFiniteDoubleField(item, &field)) {
+            valid_row = false;
+            break;
+          }
+          v.push_back(field);
         }
       }
-      if (v.size() < 7) continue;
+      if (!valid_row || first || v.size() < 7) continue;
+      const double qw = v[3], qx = v[4], qy = v[5], qz = v[6];
+      const double scale =
+          std::max({std::abs(qw), std::abs(qx), std::abs(qy), std::abs(qz)});
+      if (!std::isfinite(scale) || scale <= 0.0) continue;
+      const double sw = qw / scale, sx = qx / scale, sy = qy / scale,
+                   sz = qz / scale;
+      const double norm = std::sqrt(sw * sw + sx * sx + sy * sy + sz * sz);
+      if (!std::isfinite(norm) || norm <= 0.0) continue;
       times_.push_back(t);
       positions_.emplace_back(v[0], v[1], v[2]);
-      rotations_.emplace_back(v[3], v[4], v[5], v[6]);
+      rotations_.emplace_back(sw / norm, sx / norm, sy / norm, sz / norm);
     }
   }
   std::optional<SE3<double>> At(std::int64_t t) const {
@@ -308,13 +353,27 @@ class MocapTrack {
     if (it == times_.begin() || it == times_.end()) return std::nullopt;
     const auto i = static_cast<std::size_t>(it - times_.begin());
     const auto t0 = times_[i - 1], t1 = times_[i];
-    if (t1 - t0 > 20'000'000) return std::nullopt;
+    if (t1 <= t0 || t < t0 || t > t1 ||
+        static_cast<std::uint64_t>(t1) - static_cast<std::uint64_t>(t0) >
+            20'000'000u) {
+      return std::nullopt;
+    }
     const double a = static_cast<double>(t - t0) / static_cast<double>(t1 - t0);
     const Eigen::Vector3d p = (1 - a) * positions_[i - 1] + a * positions_[i];
-    const Eigen::Quaterniond q =
-        rotations_[i - 1].normalized().slerp(a, rotations_[i].normalized());
-    return SE3<double>(SO3<double>::FromMatrixNormalized(q.toRotationMatrix()),
-                       p);
+    if (!p.allFinite()) return std::nullopt;
+    const Eigen::Quaterniond& q0 = rotations_[i - 1];
+    const Eigen::Quaterniond& q1 = rotations_[i];
+    if (!q0.coeffs().allFinite() || !q1.coeffs().allFinite() ||
+        !(q0.squaredNorm() > 0.0) || !(q1.squaredNorm() > 0.0)) {
+      return std::nullopt;
+    }
+    const Eigen::Quaterniond q = q0.normalized().slerp(a, q1.normalized());
+    if (!q.coeffs().allFinite() || !(q.squaredNorm() > 0.0)) {
+      return std::nullopt;
+    }
+    const Eigen::Matrix3d rot = q.toRotationMatrix();
+    if (!rot.allFinite()) return std::nullopt;
+    return SE3<double>(SO3<double>::FromMatrixNormalized(rot), p);
   }
 
  private:
@@ -436,8 +495,15 @@ int Run(const Options& o) {
   if (o.intrinsics) {
     k = *o.intrinsics;
   } else if (o.hfov_deg) {
+    if (!(*o.hfov_deg > 0.0 && *o.hfov_deg < 180.0)) {
+      Die("--hfov-deg must be in (0, 180)");
+    }
     assumed_intrinsics = true;
-    k.fx = k.fy = width / 2.0 / std::tan(*o.hfov_deg / 2 / kDeg);
+    const double focal = width / 2.0 / std::tan(*o.hfov_deg / 2 / kDeg);
+    if (!std::isfinite(focal) || focal <= 0.0) {
+      Die("--hfov-deg yields non-finite focal length");
+    }
+    k.fx = k.fy = focal;
     k.cx = width / 2.0;
     k.cy = height / 2.0;
   } else {

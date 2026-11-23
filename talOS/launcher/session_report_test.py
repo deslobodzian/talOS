@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import zlib
 
 from python.runfiles import runfiles
 from talOS.launcher import session_report
@@ -25,9 +26,9 @@ class SessionReportTest(unittest.TestCase):
             report = json.loads(result.stdout)
             self.assertEqual(report["config_sha256"], "fixture-sha256")
             self.assertEqual(report["state_overall"],
-                             {"count": 7, "median_ms": 5, "p99_ms": 200, "max_ms": 200})
+                             {"count": 7, "min_ms": 5, "median_ms": 5, "p99_ms": 200, "max_ms": 200})
             self.assertEqual(report["state_enabled"],
-                             {"count": 5, "median_ms": 5, "p99_ms": 120, "max_ms": 120})
+                             {"count": 5, "min_ms": 5, "median_ms": 5, "p99_ms": 120, "max_ms": 120})
             self.assertEqual(report["enabled_gaps_ge_100_ms"], 1)
             self.assertEqual(report["timer_lateness"]["fixture:update"]["max_ms"], 1)
             self.assertEqual(report["target_receipt_age"]["fixture:/fixture/target/test"]["median_ms"], 3)
@@ -36,7 +37,7 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual(verdicts["enabled state gaps"], "FAIL")
             self.assertEqual(report["target_age_at_tick"],
                              {"fixture:/fixture/target/test":
-                                  {"count": 1, "median_ms": 4, "p99_ms": 4, "max_ms": 4}})
+                                  {"count": 1, "min_ms": 4, "median_ms": 4, "p99_ms": 4, "max_ms": 4}})
             # The manifest's signal death reaches the node summary.
             self.assertEqual(report["nodes"][0]["exit_signal"], 9)
             self.assertEqual(verdicts["target age at tick"], "PASS")
@@ -102,6 +103,115 @@ class SessionReportTest(unittest.TestCase):
         self.assertEqual(len(named), 1, result.stderr)
         self.assertRegex(named[0], r"protocol \d+ ")
         self.assertIsNone(report["never_enabled"])
+
+    # REQ-OPS-51: when the bridge's /hw/status protocol_version_id and
+    # manifest.json's hardware_protocol_version disagree, session_report prints
+    # one warning naming both versions and reads the session under the bridge's
+    # version.
+    def test_bridge_and_manifest_protocol_disagreement_warns_and_uses_bridges_version(self):
+        # Verified reflection.Schema .bfbs for:
+        #   namespace bridge; struct BridgeStatus { protocol_version_id:uint16; }
+        bfbs = bytes([
+            0x1c, 0x00, 0x00, 0x00, 0x42, 0x46, 0x42, 0x53, 0x14, 0x00, 0x1c, 0x00,
+            0x04, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x10, 0x00, 0x00, 0x00, 0x14, 0x00,
+            0x00, 0x00, 0x18, 0x00, 0x14, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00,
+            0x28, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x30, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            0x94, 0xff, 0xff, 0xff, 0x3c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x1c, 0x00, 0x08, 0x00, 0x0c, 0x00,
+            0x07, 0x00, 0x10, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00,
+            0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x28, 0x00, 0x00, 0x00,
+            0x1c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x04, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x2f, 0x2f, 0x73, 0x2e,
+            0x66, 0x62, 0x73, 0x00, 0x01, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00,
+            0x13, 0x00, 0x00, 0x00, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65, 0x2e, 0x42,
+            0x72, 0x69, 0x64, 0x67, 0x65, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x00,
+            0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00,
+            0x28, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00,
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00,
+            0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x02, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x70, 0x72, 0x6f, 0x74,
+            0x6f, 0x63, 0x6f, 0x6c, 0x5f, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
+            0x5f, 0x69, 0x64, 0x00,
+        ])
+
+        def write_bridge_status_log(path, session_id, version):
+            schema_name = b"bridge.BridgeStatus"
+            schema_block = schema_name + bfbs
+            manifest_entry = struct.pack(
+                "<HHIIIqq64sQII",
+                1, 4, 2, 2, 0, 0, 0, b"/hw/status", 1, len(schema_name), len(bfbs))
+            header_crc = zlib.crc32(manifest_entry + schema_block) & 0xFFFFFFFF
+            file_header = struct.pack(
+                "<8sIIQqqII64sQ",
+                b"TALOSLOG", 8, 120, session_id, 1_000_000_000, 0,
+                1, header_crc, b"hardware_node", len(schema_block))
+            payload = struct.pack("<H", version)
+            stored = payload.rstrip(b"\x00")
+            rec_zero = struct.pack(
+                "<IHHQqqqQIIII",
+                0x54524543, 4, 1, 1, 1_000_000_000, 1_000_000_000,
+                1_000_000_000, 1, 0, len(payload), 0, len(stored))
+            rec_crc = zlib.crc32(stored, zlib.crc32(rec_zero)) & 0xFFFFFFFF
+            rec_header = struct.pack(
+                "<IHHQqqqQIIII",
+                0x54524543, 4, 1, 1, 1_000_000_000, 1_000_000_000,
+                1_000_000_000, 1, 0, len(payload), rec_crc, len(stored))
+            with open(path, "wb") as f:
+                f.write(file_header + manifest_entry + schema_block + rec_header + stored)
+
+        files = runfiles.Create()
+        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
+        binary = files.Rlocation("_main/talOS/launcher/session_report")
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([fixture, directory], check=True)
+            manifest_path = os.path.join(directory, "manifest.json")
+            manifest = json.loads(open(manifest_path).read())
+            build_version = manifest["hardware_protocol_version"]
+            other_version = build_version - 1
+            bridge_log = os.path.join(directory, "hardware_node.tlog")
+
+            # Bridge matches build, manifest names another: warns once naming
+            # both and decodes hardware packets under the bridge's version.
+            manifest["hardware_protocol_version"] = other_version
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f)
+            write_bridge_status_log(bridge_log, manifest["session_id"], build_version)
+            result = subprocess.run([binary, "--json", directory],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = (
+                f"session_report: warning: the session's bridge recorded hardware protocol "
+                f"{build_version} (/hw/status protocol_version_id), its launcher "
+                f"{other_version} (manifest.json hardware_protocol_version): read under the bridge's"
+            )
+            self.assertEqual(result.stderr.splitlines().count(expected), 1, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertIsNone(report["hardware_not_decoded"])
+            self.assertEqual(report["state_enabled"]["count"], 5)
+
+            # Bridge names another version, manifest matches build: warns once
+            # naming both and refuses hardware packets under the bridge's version.
+            manifest["hardware_protocol_version"] = build_version
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f)
+            write_bridge_status_log(bridge_log, manifest["session_id"], other_version)
+            result = subprocess.run([binary, "--json", "--strict", directory],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            expected = (
+                f"session_report: warning: the session's bridge recorded hardware protocol "
+                f"{other_version} (/hw/status protocol_version_id), its launcher "
+                f"{build_version} (manifest.json hardware_protocol_version): read under the bridge's"
+            )
+            self.assertEqual(result.stderr.splitlines().count(expected), 1, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertIsNotNone(report["hardware_not_decoded"])
+            verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+            self.assertEqual(verdicts["enabled state median"], "NOT MEASURED")
 
     # REQ-OPS-16: the default session with its enabled States at
     # 5 to 135 ms lost in a log gap. The 0 -> 140 ms interval across the hole
@@ -190,14 +300,14 @@ class SessionReportTest(unittest.TestCase):
                    hardware("hardware_node", "/hw/command", 26, 2)]
         for label, gaps, latency in (
                 ("requester's log", [gap("lift", 20, 20, 1), gap("camera", 0, 30, 9)],
-                 {"count": 1, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25}),
+                 {"count": 1, "min_ms": 0.25, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25}),
                 ("both logs", [gap("lift", 20, 20, 1), gap("hardware_node", 10, 10, 1)],
                  None)):
             with self.subTest(label):
                 report = session_report.analyze({"nodes": []}, traffic + gaps)
                 self.assertEqual(report["bridge_request_to_command"]["disabled"], latency)
         self.assertIn("| bridge request to command hardware_node disabled | NOT MEASURED "
-                      "| — | — | — |", session_report.markdown(report).splitlines())
+                      "| — | — | — | — |", session_report.markdown(report).splitlines())
 
         # A gap at the head of lift's log, before its first kept request:
         # a request carrying observation 1 could be lost there, so the
@@ -303,9 +413,9 @@ class SessionReportTest(unittest.TestCase):
                    state("lift", "MESSAGE", 1, (99999, 99999))]
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["feedback_age_us"], {
-            "motor 3": {"count": 3, "median_us": 2600, "p99_us": 4000, "max_us": 4000,
+            "motor 3": {"count": 3, "min_us": 1200, "median_us": 2600, "p99_us": 4000, "max_us": 4000,
                         "sentinel": 1},
-            "sensor 9": {"count": 3, "median_us": 900, "p99_us": 900, "max_us": 900,
+            "sensor 9": {"count": 3, "min_us": 900, "median_us": 900, "p99_us": 900, "max_us": 900,
                          "sentinel": 0}})
 
     # REQ-RT-25: State to request joins a State's (boot_id, sample_time_us),
@@ -328,8 +438,8 @@ class SessionReportTest(unittest.TestCase):
                    send("arm", "/hw/request/arm", 14, boot_id="7", observed_time_us=sample_us)]
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["state_to_request_ms"], {
-            "arm": {"count": 1, "median_ms": 4, "p99_ms": 4, "max_ms": 4},
-            "lift": {"count": 1, "median_ms": 2, "p99_ms": 2, "max_ms": 2}})
+            "arm": {"count": 1, "min_ms": 4, "median_ms": 4, "p99_ms": 4, "max_ms": 4},
+            "lift": {"count": 1, "min_ms": 2, "median_ms": 2, "p99_ms": 2, "max_ms": 2}})
 
     # REQ-RT-25, REQ-OPS-16: a sample whose span meets a gap of the owner's
     # log is NOT MEASURED, not a pass and not a shorter figure: lift's log
@@ -364,7 +474,7 @@ class SessionReportTest(unittest.TestCase):
                    record("SEND", "/lift/target/teleop", 26, 26)]
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["driver_station_to_lane_ms"],
-                         {"teleop": {"count": 2, "median_ms": 5.5, "p99_ms": 6, "max_ms": 6}})
+                         {"teleop": {"count": 2, "min_ms": 5, "median_ms": 5.5, "p99_ms": 6, "max_ms": 6}})
 
     # REQ-RT-25: Driver Station to lane is the reaction of
     # a producer that is publishing. teleop released its lane once, 3 ms
@@ -387,7 +497,7 @@ class SessionReportTest(unittest.TestCase):
                  for t in [3] + list(range(82, 98, 5)) + list(range(182, 200, 5))]
         report = session_report.analyze({"nodes": []}, packets + sends)
         self.assertEqual(report["driver_station_to_lane_ms"],
-                         {"teleop": {"count": 3, "median_ms": 2, "p99_ms": 3, "max_ms": 3}})
+                         {"teleop": {"count": 3, "min_ms": 2, "median_ms": 2, "p99_ms": 3, "max_ms": 3}})
         self.assertEqual(report["driver_station_to_lane_unanswered"],
                          {"teleop": {"total": 7, "enabled": 4, "other": 3}})
         line = next(line for line in session_report.markdown(report).splitlines()
@@ -455,7 +565,7 @@ class SessionReportTest(unittest.TestCase):
                    command(81.2, 8000)]
         report = session_report.analyze({"nodes": []}, records)
         self.assertEqual(report["driver_station_to_command_ms"],
-                         {"count": 1, "median_ms": 6.3, "p99_ms": 6.3, "max_ms": 6.3})
+                         {"count": 1, "min_ms": 6.3, "median_ms": 6.3, "p99_ms": 6.3, "max_ms": 6.3})
 
     # REQ-RT-25: a tick is built from a packet only if its lane was
     # published before the next packet. Enabled with the sticks neutral the
@@ -468,7 +578,7 @@ class SessionReportTest(unittest.TestCase):
                     self.merged_command(1005.25, 5000)]
         self.assertEqual(session_report.analyze({"nodes": []}, records)
                          ["driver_station_to_command_ms"],
-                         {"count": 1, "median_ms": 5.25, "p99_ms": 5.25, "max_ms": 5.25})
+                         {"count": 1, "min_ms": 5.25, "median_ms": 5.25, "p99_ms": 5.25, "max_ms": 5.25})
 
     # REQ-RT-25: a restarted node logs under its name again from dispatch 0,
     # so a READ joins a request only within one run. lift's first run
@@ -486,6 +596,31 @@ class SessionReportTest(unittest.TestCase):
                    self.merged_command(60001.25, 9000)]
         row = session_report.analyze({"nodes": []}, records)["driver_station_to_command_ms"]
         self.assertEqual((row["count"], row["median_ms"], row["max_ms"]), (2, 6.25, 11.25))
+
+    # REQ-OPS-16, REQ-RT-25: a Driver Station to command sample whose span meets
+    # a log gap in the bridge's log or in the selecting/requesting node's log is
+    # excluded (NOT MEASURED) and counted in intervals_across_gaps, while a gap
+    # in an unrelated node's log leaves the sample measured.
+    def test_driver_station_to_command_excludes_samples_across_gaps(self):
+        def gap(process, first, last):
+            return self.chain_record(process, "GAP", "?", last + 1, gap={
+                "start_ms": first, "end_ms": last + 1, "first_lost_ms": first,
+                "last_lost_ms": last, "records": 1, "cause": "pool_full",
+                "closed_at_flush": False})
+        # Packet at 0 ms, selecting tick at 6 ms (lane published at 4 ms, in
+        # packet 0's window [0, 5)), a fresh enabled packet at 5 ms (so
+        # enabled_at(6.3) stays known after a bridge gap at 2 ms), and the
+        # merged command at 6.3 ms.
+        base = [self.ds_packet(0, True), self.ds_packet(5, True),
+                *self.selecting_tick(6, 4, 2, 5000), self.merged_command(6.3, 5000)]
+        for label, process in (("bridge", "hardware_node"), ("node", "lift")):
+            with self.subTest(label):
+                report = session_report.analyze({"nodes": []}, base + [gap(process, 2, 2)])
+                self.assertIsNone(report["driver_station_to_command_ms"])
+                self.assertEqual(report["intervals_across_gaps"]["driver_station_to_command"], 1)
+        unrelated = session_report.analyze({"nodes": []}, base + [gap("camera", 2, 2)])
+        self.assertEqual(unrelated["driver_station_to_command_ms"]["count"], 1)
+        self.assertEqual(unrelated["intervals_across_gaps"]["driver_station_to_command"], 0)
 
     # REQ-RT-25: bridge request to command is split as the bridge decides
     # its send: by the State it holds (GatewayReady: configured, enabled, no
@@ -513,8 +648,8 @@ class SessionReportTest(unittest.TestCase):
         bridge = session_report.analyze({"nodes": []}, records)["bridge_request_to_command"]
         self.assertEqual(bridge, {
             "process": "hardware_node",
-            "enabled": {"count": 1, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25},
-            "disabled": {"count": 1, "median_ms": 20, "p99_ms": 20, "max_ms": 20}})
+            "enabled": {"count": 1, "min_ms": 0.25, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25},
+            "disabled": {"count": 1, "min_ms": 20, "median_ms": 20, "p99_ms": 20, "max_ms": 20}})
 
     # REQ-RT-25: the clocks' relative drift is the slope of the bridge's
     # valid clock_offset_us over its /hw/status publication times, fitted
@@ -762,6 +897,8 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual(len(session_report.strict_failures(
                 session_report.analyze(manifest, session))), failures, manifest)
 
+    # REQ-RT-09: session_report --strict rejects a bridge or control loop that
+    # ran without its full realtime grant.
     def test_strict_rejects_an_actuation_loop_without_its_realtime_grant(self):
         # The registry row's outcome, as the launcher records it.
         def node(name, tier, grant, refused=""):
@@ -869,6 +1006,212 @@ class SessionReportTest(unittest.TestCase):
             with open(directory + "/manifest.json", "w") as manifest:
                 manifest.write('{"nodes": []}')
             self.assertEqual(session_report.main(), 1)
+
+    # REQ-RT-25 (TODO.md TIME-4): stats() carries min alongside median/p99/max
+    # so state-to-request and other latency rows show whether samples swept a
+    # full period.
+    def test_stats_includes_min_and_markdown_table_shows_it(self):
+        self.assertEqual(session_report.stats([10, 2, 6, 4]),
+                         {"count": 4, "min_ms": 2, "median_ms": 5.0,
+                          "p99_ms": 10, "max_ms": 10})
+        self.assertEqual(session_report.stats([300, 100, 200], "us"),
+                         {"count": 3, "min_us": 100, "median_us": 200,
+                          "p99_us": 300, "max_us": 300})
+        self.assertIsNone(session_report.stats([]))
+        self.assertEqual(
+            session_report.stats_row("row", session_report.stats([10, 2, 6, 4])),
+            "| row | 4 | 2 | 5 | 10 | 10 |")
+        self.assertEqual(
+            session_report.stats_row("row", None),
+            "| row | NOT MEASURED | — | — | — | — |")
+
+    # TODO.md RT-28: count missed /hw/state sequences within each gateway boot,
+    # reporting total missed states, gap count, and the longest consecutive gap
+    # (ignoring boot transitions and intervals across a /hw/state log gap).
+    def test_state_sequence_gaps_within_boot_and_excluding_log_gaps(self):
+        def state(now_ms, boot_id, sequence, process="hardware_node"):
+            return dict(process=process, kind="SEND", topic="/hw/state",
+                        now_ms=now_ms, event_ms=now_ms, publish_ms=now_ms,
+                        decoded="", hardware={"type": "state",
+                                              "boot_id": str(boot_id),
+                                              "sequence": sequence})
+        def gap(first, last, records):
+            return dict(process="hardware_node", kind="GAP", topic="?",
+                        now_ms=last + 1, event_ms=first, publish_ms=0,
+                        decoded="", gap={
+                            "start_ms": first, "end_ms": last + 1,
+                            "first_lost_ms": first, "last_lost_ms": last,
+                            "records": records, "cause": "pool_full",
+                            "closed_at_flush": False})
+        # Boot 1: seq 10->11 (0 missed), 11->14 (2 missed at 5 ms),
+        # 14->15 (0 missed). Boot 2 restarts at seq 1: boot jump is NOT a gap!
+        # Boot 2: seq 1->6 (4 missed at 30 ms), then a log gap hides 6->100
+        # (excluded, disk drop not link loss), then 100->101 (0 missed).
+        records = [
+            state(0, 1, 10),
+            state(5, 1, 11),
+            state(20, 1, 14),
+            state(25, 1, 15),
+            state(30, 2, 1),
+            state(55, 2, 6),
+            gap(60, 100, 8),
+            state(110, 2, 100),
+            state(115, 2, 101),
+        ]
+        report = session_report.analyze({"nodes": []}, records)
+        self.assertEqual(report["state_sequence_gaps"], {
+            "intervals": 5,
+            "missed": 6,
+            "gaps": 2,
+            "longest_run": 4,
+            "longest_at_ms": 30,
+        })
+        self.assertEqual(report["intervals_across_gaps"]["state_sequence"], 1)
+        md = session_report.markdown(report)
+        self.assertIn(
+            "State sequence gaps: 6 missed states across 2 gaps "
+            "(longest consecutive gap: 4 states at 30 ms).",
+            md.splitlines())
+
+        # Contiguous sequences report 0 missed states.
+        clean = [state(0, 1, 1), state(5, 1, 2), state(10, 1, 3)]
+        clean_report = session_report.analyze({"nodes": []}, clean)
+        self.assertEqual(clean_report["state_sequence_gaps"], {
+            "intervals": 2,
+            "missed": 0,
+            "gaps": 0,
+            "longest_run": 0,
+            "longest_at_ms": None,
+        })
+
+        # Unsequenced/undecoded states report None (NOT MEASURED).
+        undecoded = [dict(process="hardware_node", kind="SEND", topic="/hw/state",
+                          now_ms=t, event_ms=t, publish_ms=t, decoded="")
+                     for t in (0, 5, 10)]
+        self.assertIsNone(
+            session_report.analyze({"nodes": []}, undecoded)["state_sequence_gaps"])
+
+    # REQ-OPS-20 (TODO.md RT-17, RT-28): BridgeStatus socket/State loss counters
+    # are surfaced in both JSON (`bridge_socket_counters`) and markdown output.
+    def test_bridge_socket_and_state_loss_counters(self):
+        def status(t, send_fail, reopens, seq_gaps, decode_fail, would_block):
+            decoded = (
+                f"{{states_received_count: 10, "
+                f"socket_send_failures_count: {send_fail}, "
+                f"socket_reopens_count: {reopens}, "
+                f"state_sequence_gaps_count: {seq_gaps}, "
+                f"state_decode_failures_count: {decode_fail}, "
+                f"socket_send_would_block_count: {would_block}}}"
+            )
+            return dict(process="hardware_node", kind="SEND", topic="/hw/status",
+                        now_ms=t, event_ms=t, publish_ms=t, decoded=decoded)
+
+        # Include a bridge restart mid-session so reset/delta accounting is exercised.
+        records = [
+            status(0, 1, 0, 2, 0, 0),
+            status(20, 4, 1, 5, 1, 2),
+            status(40, 0, 0, 1, 0, 0),
+            status(60, 2, 1, 3, 2, 1),
+        ]
+        report = session_report.analyze({"nodes": []}, records)
+        counters = report["bridge_socket_counters"]
+        self.assertIsNotNone(counters)
+        self.assertEqual(set(counters.keys()), set(session_report.BRIDGE_SOCKET_COUNTERS))
+        self.assertEqual(counters["socket_send_failures_count"]["delta"], 5)
+        self.assertEqual(counters["socket_send_failures_count"]["last"], 2)
+        self.assertEqual(counters["socket_send_failures_count"]["resets"], 1)
+        self.assertEqual(counters["socket_reopens_count"]["delta"], 2)
+        self.assertEqual(counters["state_sequence_gaps_count"]["delta"], 5)
+        self.assertEqual(counters["state_decode_failures_count"]["delta"], 3)
+        self.assertEqual(counters["socket_send_would_block_count"]["delta"], 3)
+
+        md = session_report.markdown(report)
+        self.assertIn(
+            "Bridge UDP/State loss counters: "
+            "socket_send_failures_count=delta:5/last:2 (resets=1), "
+            "socket_reopens_count=delta:2/last:1 (resets=1), "
+            "state_sequence_gaps_count=delta:5/last:3 (resets=1), "
+            "state_decode_failures_count=delta:3/last:2 (resets=1), "
+            "socket_send_would_block_count=delta:3/last:1 (resets=1)",
+            md.splitlines(),
+        )
+
+        # Older logs without these fields report None and omit the summary line.
+        legacy = [dict(process="hardware_node", kind="SEND", topic="/hw/status",
+                       now_ms=0, event_ms=0, publish_ms=0,
+                       decoded="{states_received_count: 5}")]
+        legacy_report = session_report.analyze({"nodes": []}, legacy)
+        self.assertIsNone(legacy_report["bridge_socket_counters"])
+        self.assertNotIn("Bridge UDP/State loss counters:",
+                         session_report.markdown(legacy_report))
+
+    # REQ-OPS-10 (REPO-4): session_report prints `talOS revision:` right after
+    # `Source revision:` when manifest.json carries `talos_git_revision`, and
+    # omits both JSON key and markdown line when absent.
+    def test_reports_talos_revision_after_source_revision_when_present(self):
+        plain = session_report.analyze(
+            {"session_id": 1, "git_revision": "aaaa1111", "nodes": []}, [])
+        self.assertNotIn("talos_git_revision", plain)
+        self.assertNotIn("talOS revision:", session_report.markdown(plain))
+
+        for dirty, suffix in ((False, ""), (True, " (dirty)")):
+            with self.subTest(dirty=dirty):
+                report = session_report.analyze({
+                    "session_id": 2,
+                    "git_revision": "aaaa1111",
+                    "git_dirty": False,
+                    "talos_git_revision": "bbbb2222",
+                    "talos_git_dirty": dirty,
+                    "nodes": [],
+                }, [])
+                self.assertEqual(report["talos_git_revision"],
+                                 "bbbb2222" + suffix)
+                lines = session_report.markdown(report).splitlines()
+                src_idx = lines.index("Source revision: aaaa1111")
+                self.assertEqual(lines[src_idx + 1],
+                                 "talOS revision: bbbb2222" + suffix)
+
+    # REQ-RT-15: exact verdict boundaries for overall/enabled /hw/state median
+    # ([4.0, 6.0] ms), p99 (< 10.0 ms), and enabled state gaps (< 100.0 ms).
+    def test_state_cadence_and_gap_verdict_boundaries(self):
+        def record(topic, now, **extra):
+            return dict(process="hardware_node", kind="SEND", topic=topic,
+                        now_ms=now, event_ms=now, publish_ms=now, decoded="",
+                        **extra)
+
+        def verdicts_for(times):
+            records = [record("/hw/state/driver_station", 0, ds_enabled=True)]
+            records += [record("/hw/state", t) for t in times]
+            report = session_report.analyze({"end_wall_ns": 1, "nodes": []}, records)
+            return report, {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+
+        # Overall and enabled state median: 3.99 FAIL, 4.0/6.0 PASS, 6.01 FAIL.
+        for interval, expected in ((3.99, "FAIL"), (4.0, "PASS"),
+                                   (6.0, "PASS"), (6.01, "FAIL")):
+            with self.subTest(median_ms=interval):
+                _, verdicts = verdicts_for([0.0, interval, 2 * interval, 3 * interval])
+                self.assertEqual(verdicts["overall state median"], expected)
+                self.assertEqual(verdicts["enabled state median"], expected)
+
+        # Overall and enabled state p99: 9.99 PASS, 10.0 FAIL.
+        # Put the peak interval first so peak - 0.0 is exact in IEEE 754; nine
+        # 5 ms intervals follow (10 total: median = 5 ms, nearest-rank p99 = peak).
+        for peak, expected in ((9.99, "PASS"), (10.0, "FAIL")):
+            with self.subTest(p99_ms=peak):
+                times = [0.0] + [peak + 5.0 * i for i in range(10)]
+                _, verdicts = verdicts_for(times)
+                self.assertEqual(verdicts["overall state median"], "PASS")
+                self.assertEqual(verdicts["enabled state median"], "PASS")
+                self.assertEqual(verdicts["overall state p99"], expected)
+                self.assertEqual(verdicts["enabled state p99"], expected)
+
+        # Enabled state gaps: 99.9 PASS (0 gaps >= 100 ms), 100.0 FAIL (1 gap).
+        for gap_ms, expected, count in ((99.9, "PASS", 0), (100.0, "FAIL", 1)):
+            with self.subTest(gap_ms=gap_ms):
+                times = [0.0, gap_ms, gap_ms + 5.0, gap_ms + 10.0]
+                report, verdicts = verdicts_for(times)
+                self.assertEqual(report["enabled_gaps_ge_100_ms"], count)
+                self.assertEqual(verdicts["enabled state gaps"], expected)
 
 
 if __name__ == "__main__":

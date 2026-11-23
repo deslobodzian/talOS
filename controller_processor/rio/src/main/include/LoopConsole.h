@@ -12,8 +12,10 @@
 // that leaves no State on the main processor still records when the RoboRIO
 // went neutral; and each changed configuration the gateway refused because
 // it was enabled, which otherwise leaves every node neutral with nothing
-// naming the cause; and each rise in the loop watchdog's dropped stall
-// reports, the stalls whose Driver Station error was lost (LoopWatchdog.h).
+// naming the cause; each rise in the loop watchdog's dropped stall reports,
+// the stalls whose Driver Station error was lost (LoopWatchdog.h); and each
+// rise in the gateway UDP socket's EAGAIN / EWOULDBLOCK send drops (send
+// buffer full).
 //
 // Called on the loop thread, it only compares counters and posts a
 // fixed-size RioLog event when one rose; RioLog's logger thread writes the
@@ -28,6 +30,7 @@ class LoopConsole {
   static constexpr uint16_t kCommandExpiryMessage = 9;
   static constexpr uint16_t kConfigRefusedMessage = 10;
   static constexpr uint16_t kWatchdogReportsDroppedMessage = 11;
+  static constexpr uint16_t kSocketWouldBlockMessage = 12;
 
   explicit LoopConsole(RioLog& log) : log_{log} {}
 
@@ -41,6 +44,11 @@ class LoopConsole {
   // stall reports rose since the previous call.
   void ObserveWatchdog(const LoopWatchdog& watchdog);
 
+  // The loop thread: posts one line (rate-limited by RioLog to at most one per
+  // second, bursts coalesced) when the UDP peer's cumulative send_would_block
+  // (EAGAIN, send buffer full) count rose since the previous call.
+  void ObserveSendWouldBlock(uint64_t send_would_block);
+
  private:
   void ReportExpiry(const hardware::Gateway::CommandExpiry& expiry);
   void ReportRefusal(const hardware::Gateway::EnabledRefusal& refusal);
@@ -49,6 +57,7 @@ class LoopConsole {
   uint64_t reported_expiries_{0};
   uint64_t reported_refusals_{0};
   uint64_t reported_dropped_reports_{0};
+  uint64_t reported_send_would_block_{0};
 };
 
 }  // namespace talos::rio

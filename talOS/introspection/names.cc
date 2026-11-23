@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "flatbuffers/reflection.h"
-#include "flatbuffers/verifier.h"
+#include "talOS/schema/verify.h"
 
 namespace talos::introspect::naming::detail {
 
@@ -52,13 +52,11 @@ class AlertFieldWalk {
 std::vector<AlertPrefixedField> AlertPrefixedFields(std::string_view bfbs,
                                                     std::string_view root) {
   std::vector<AlertPrefixedField> out;
-  // Verified here, not through //talOS/schema:field_path: this library is
-  // part of libtalos_node.so, and a library in that closure is left out of
-  // every talos_cc_shared_node's own link.
-  flatbuffers::Verifier verifier{
-      reinterpret_cast<const std::uint8_t*>(bfbs.data()), bfbs.size()};
-  if (!reflection::VerifySchemaBuffer(verifier)) return out;
-  const reflection::Schema* schema = reflection::GetSchema(bfbs.data());
+  // Uses header-only //talOS/schema:verify rather than :field_path: this
+  // library is part of libtalos_node.so, and a compiled library in that
+  // closure is left out of every talos_cc_shared_node's own link.
+  const reflection::Schema* schema = schema::VerifySchema(bfbs);
+  if (schema == nullptr) return out;
   const auto* objects = schema->objects();
   for (flatbuffers::uoffset_t i = 0; i < objects->size(); ++i) {
     if (objects->Get(i)->name()->string_view() == root) {

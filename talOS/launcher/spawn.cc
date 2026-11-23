@@ -329,6 +329,7 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     // group: it waits for every copy of the error pipe's writer to close.
     IgnoreSignal(SIGINT);
     IgnoreSignal(SIGTERM);
+    IgnoreSignal(SIGHUP);
     ::close(errors[1]);
     // Unlike the node it never execs, so any other descriptor of the
     // launcher's process, close-on-exec or not, would stay open for as long

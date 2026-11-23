@@ -94,6 +94,12 @@ class FakeBackend : public Backend {
     events.push_back("configure");
     return configure_ok;
   }
+  // The asynchronous path records its start, then completes through
+  // Configure as the default does.
+  void BeginConfigure(const Config& config) override {
+    events.push_back("begin_configure");
+    Backend::BeginConfigure(config);
+  }
   std::vector<uint16_t> UnavailableDevices() const override {
     return unavailable;
   }
@@ -120,6 +126,10 @@ class FakeBackend : public Backend {
       if (const auto it = position_ages.find(sensor.id);
           it != position_ages.end()) {
         sensor.position_age_us = it->second;
+      }
+      if (const auto it = velocity_ages.find(sensor.id);
+          it != velocity_ages.end()) {
+        sensor.velocity_age_us = it->second;
       }
     }
     for (auto& input : s.digital_inputs) {
@@ -213,9 +223,9 @@ class FakeBackend : public Backend {
   std::vector<uint16_t> unavailable;
   std::optional<ConfigError> config_error{};
   // Reported motor positions by id; others keep theirs. Every motor's and
-  // sensor's ages are `age_us`, except a position age (motor or sensor) or a
-  // motor velocity age named here. The fake never judges an age itself: the
-  // gateway does, for every backend.
+  // sensor's ages are `age_us`, except a position or velocity age (motor or
+  // sensor) named here. The fake never judges an age itself: the gateway
+  // does, for every backend.
   std::map<uint16_t, double> positions;
   // Every motor's velocity, voltage, stator and supply current, and every
   // sensor's position and velocity, valid or not.

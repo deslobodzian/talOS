@@ -1,17 +1,28 @@
 #include "talOS/vision/recording/recorder.h"
 
 #include <gtest/gtest.h>
+#if defined(__linux__)
+#include <poll.h>
+#include <sched.h>
+#include <sys/inotify.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
+#include <cerrno>
+#include <cfenv>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
+#include "talOS/process/process.h"
 #include "talOS/vision/frame.h"
 #include "talOS/vision/recording/recording.h"
 
@@ -146,7 +157,7 @@ TEST_F(RecorderTest, WriterFailureDropsPairsAndStopsRecording) {
   const Frame frame = MakeGrayFrame();
   EXPECT_TRUE(rec.Record(frame, MakeRecord(0, "sampled")));
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{5};
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
   while (rec.dropped() < rec.recorded() &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -300,7 +311,7 @@ TEST_F(RecorderTest, WritesPairsAtomicallyAndDeletesOldestUnderMaxBytes) {
     // after its PNG), rather than assuming a fixed disk/encoder speed.
     const auto newest = dir_ / "00000000000000000005_sampled.json";
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        std::chrono::steady_clock::now() + std::chrono::seconds{10};
     while (!std::filesystem::exists(newest) &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -358,6 +369,254 @@ TEST_F(RecorderTest, DestructorIsBoundedWithAFullQueueAndSlowWriter) {
   EXPECT_LT(elapsed, std::chrono::milliseconds{500})
       << "destructor took " << static_cast<double>(elapsed.count()) / 1e6
       << " ms";
+}
+
+TEST_F(RecorderTest, BackwardTimestampDoesNotUnderflowRateLimit) {
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.context = MakeContext();
+  opts.sample_hz = 1.0;  // 1 s interval
+  opts.rejected_hz = 1.0;
+  opts.queue_slots = 8;
+  FrameRecorder rec{std::move(opts)};
+
+  const Frame frame = MakeGrayFrame();
+  EXPECT_TRUE(rec.Record(frame, MakeRecord(1'000'000'000, "sampled")));
+  // Out-of-order timestamp before the last accepted frame must not underflow
+  // uint64_t subtraction and bypass the rate limit.
+  EXPECT_FALSE(rec.Record(frame, MakeRecord(500'000'000, "sampled")));
+  EXPECT_TRUE(rec.Record(frame, MakeRecord(2'000'000'000, "sampled")));
+  EXPECT_EQ(rec.recorded(), 2u);
+  EXPECT_EQ(rec.dropped(), 0u);
+}
+
+TEST_F(RecorderTest, RejectsFramesFailingHoldsImageCheck) {
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.context = MakeContext();
+  opts.sample_hz = 1e12;
+  opts.queue_slots = 8;
+  FrameRecorder rec{std::move(opts)};
+
+  // 4x2 RGB8 needs stride >= 12; stride == 4 fails holds_image().
+  const Frame bad_stride_rgb{0,
+                             0,
+                             0,
+                             MonotonicTime::from_nanos(0),
+                             4,
+                             2,
+                             4,
+                             PixelFormat::kRgb8,
+                             std::vector<std::uint8_t>(24, 100)};
+  ASSERT_FALSE(bad_stride_rgb.holds_image());
+
+  // 4x2 Gray8 with stride == 4 needs 8 bytes; 4 bytes fails holds_image().
+  const Frame short_gray{0,
+                         0,
+                         0,
+                         MonotonicTime::from_nanos(0),
+                         4,
+                         2,
+                         4,
+                         PixelFormat::kGray8,
+                         std::vector<std::uint8_t>(4, 100)};
+  ASSERT_FALSE(short_gray.holds_image());
+
+  EXPECT_FALSE(rec.Record(bad_stride_rgb, MakeRecord(0, "sampled")));
+  EXPECT_FALSE(rec.Record(short_gray, MakeRecord(1, "sampled")));
+  EXPECT_EQ(rec.recorded(), 0u);
+  EXPECT_EQ(rec.dropped(), 2u);
+
+  // Valid RGB8 frame with proper stride still succeeds.
+  const Frame valid_rgb{0,
+                        0,
+                        0,
+                        MonotonicTime::from_nanos(0),
+                        4,
+                        2,
+                        12,
+                        PixelFormat::kRgb8,
+                        std::vector<std::uint8_t>(24, 100)};
+  ASSERT_TRUE(valid_rgb.holds_image());
+  EXPECT_TRUE(rec.Record(valid_rgb, MakeRecord(2, "sampled")));
+  EXPECT_EQ(rec.recorded(), 1u);
+}
+
+#if defined(__linux__)
+// REQ-RT-10: the frame recorder's writer thread runs at background priority
+// (non-realtime policy, nice >= kBackgroundNice) below every node loop.
+TEST_F(RecorderTest, WriterThreadRunsAtBackgroundPriority) {
+  const auto list_tids = [] {
+    std::set<int> tids;
+    for (const auto& entry :
+         std::filesystem::directory_iterator("/proc/self/task")) {
+      tids.insert(std::stoi(entry.path().filename().string()));
+    }
+    return tids;
+  };
+
+  std::filesystem::create_directories(dir_);
+  const int inotify_fd = ::inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+  ASSERT_GE(inotify_fd, 0);
+  const int wd = ::inotify_add_watch(inotify_fd, dir_.c_str(), IN_MOVED_TO);
+  ASSERT_GE(wd, 0);
+
+  const std::set<int> before = list_tids();
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.context = MakeContext();
+  opts.sample_hz = 1e12;
+  opts.queue_slots = 4;
+  FrameRecorder rec{std::move(opts)};
+
+  std::vector<int> spawned;
+  for (const int tid : list_tids()) {
+    if (!before.contains(tid)) spawned.push_back(tid);
+  }
+  ASSERT_EQ(spawned.size(), 1u);
+  const int writer_tid = spawned.front();
+
+  // Wait for one written JSON pair (moved atomically into dir_) so the writer
+  // thread is guaranteed to have passed ConfigureBackgroundThread().
+  ASSERT_TRUE(rec.Record(MakeGrayFrame(), MakeRecord(0, "sampled")));
+  const auto committed = dir_ / "00000000000000000000_sampled.json";
+  while (!std::filesystem::exists(committed)) {
+    pollfd pfd{.fd = inotify_fd, .events = POLLIN, .revents = 0};
+    // 10 s hang bound (docs/TESTING.md §6.3).
+    const int ready = ::poll(&pfd, 1, 10000);
+    ASSERT_GT(ready, 0) << "timed out waiting for recorder writer";
+    char buf[4096];
+    while (::read(inotify_fd, buf, sizeof buf) > 0) {
+    }
+  }
+  ::close(inotify_fd);
+
+  const int raw_policy = ::sched_getscheduler(writer_tid);
+  ASSERT_GE(raw_policy, 0);
+  const int policy = raw_policy & ~SCHED_RESET_ON_FORK;
+  EXPECT_NE(policy, SCHED_FIFO);
+  EXPECT_NE(policy, SCHED_RR);
+  errno = 0;
+  const int nice = ::getpriority(PRIO_PROCESS, static_cast<id_t>(writer_tid));
+  ASSERT_EQ(errno, 0);
+  EXPECT_GE(nice, talos::process::kBackgroundNice);
+}
+#endif
+
+TEST_F(RecorderTest,
+       ParseRecordRejectsDeepNestingUnquotedKeysAndOverflowingNumbers) {
+  CameraContext ctx;
+  FrameRecord rec;
+  std::string error;
+
+  // Nesting deeper than kMaxDepth (64) must fail instead of overflowing stack.
+  const std::string deep =
+      "{\"a\":" + std::string(100, '[') + std::string(100, ']') + "}";
+  EXPECT_FALSE(ParseRecord(deep, &ctx, &rec, &error));
+  EXPECT_FALSE(error.empty());
+
+  // Unquoted object keys and truncated object keys must fail (no OOB ++pos_).
+  for (const char* bad : {"{", "{foo:1}", "{x\"width\":1}", "{xwidth\":1}"}) {
+    SCOPED_TRACE(bad);
+    error.clear();
+    EXPECT_FALSE(ParseRecord(bad, &ctx, &rec, &error));
+    EXPECT_FALSE(error.empty());
+  }
+
+  // Overflowing integers and non-finite/overflowing floats must fail.
+  for (const char* bad : {"{\"capture_ns\":99999999999999999999999999999}",
+                          "{\"observation\":{\"x_m\":1e400}}",
+                          "{\"observation\":{\"x_m\":-1e400}}"}) {
+    SCOPED_TRACE(bad);
+    error.clear();
+    EXPECT_FALSE(ParseRecord(bad, &ctx, &rec, &error));
+    EXPECT_FALSE(error.empty());
+  }
+
+  // Out-of-int64-range finite doubles read via AsInt() must return fallback
+  // without undefined float-to-int conversion (verified by ASan/UBSan; do not
+  // assert FE_INVALID because ARM64 clang speculatively hoists fcvtzs before
+  // csel without FENV_ACCESS).
+  ASSERT_TRUE(
+      ParseRecord("{\"width\":1e30,\"height\":-1e30,"
+                  "\"capture_ns\":9223372036854775808.0}",
+                  &ctx, &rec, &error))
+      << error;
+  EXPECT_EQ(ctx.width, 0);
+  EXPECT_EQ(ctx.height, 0);
+  EXPECT_EQ(rec.capture_ns, 0u);
+}
+
+TEST_F(RecorderTest, TinyRateClampsIntervalWithoutUbAndRateLimits) {
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.context = MakeContext();
+  opts.sample_hz = 1e-20;
+  opts.rejected_hz = 1e-20;
+  opts.queue_slots = 4;
+  FrameRecorder rec{std::move(opts)};
+
+  const Frame frame = MakeGrayFrame();
+  std::feclearexcept(FE_ALL_EXCEPT);
+  EXPECT_TRUE(rec.Record(frame, MakeRecord(0, "sampled")));
+  EXPECT_EQ(std::fetestexcept(FE_INVALID), 0);
+  EXPECT_FALSE(rec.Record(frame, MakeRecord(1'000'000'000, "sampled")));
+  EXPECT_EQ(rec.recorded(), 1u);
+}
+
+TEST_F(RecorderTest, DuplicateStemsDisambiguateAndTrimKeepsNewerFile) {
+  const auto dup_dir = dir_ / "dup";
+  const Frame frame = MakeGrayFrame();
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = dup_dir;
+    opts.context = MakeContext();
+    opts.sample_hz = 1e12;
+    opts.queue_slots = 4;
+    FrameRecorder rec{std::move(opts)};
+    FrameRecord first = MakeRecord(42, "sampled");
+    first.detections[0].tag_id = 1;
+    ASSERT_TRUE(rec.Record(frame, first));
+  }  // single queued pair finishes on destruction
+  const auto first_json = dup_dir / "00000000000000000042_sampled.json";
+  const auto first_png = dup_dir / "00000000000000000042_sampled.png";
+  ASSERT_TRUE(std::filesystem::exists(first_json));
+  ASSERT_TRUE(std::filesystem::exists(first_png));
+  const std::uint64_t pair_bytes = std::filesystem::file_size(first_json) +
+                                   std::filesystem::file_size(first_png);
+
+  // Budget fits 1 pair, not 2. Writing a second pair with the same capture_ns
+  // and reason must disambiguate its stem so TrimToBudget deletes only the
+  // older pair instead of double-counting and deleting the newer file.
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = dup_dir;
+    opts.context = MakeContext();
+    opts.sample_hz = 1e12;
+    opts.queue_slots = 4;
+    opts.max_bytes = pair_bytes + pair_bytes / 2;
+    FrameRecorder rec{std::move(opts)};
+    FrameRecord second = MakeRecord(42, "sampled");
+    second.detections[0].tag_id = 2;
+    ASSERT_TRUE(rec.Record(frame, second));
+  }
+
+  std::vector<int> surviving_tag_ids;
+  for (const auto& entry : std::filesystem::directory_iterator(dup_dir)) {
+    const std::string name = entry.path().filename().string();
+    if (name.size() < 5 || name.substr(name.size() - 5) != ".json") continue;
+    const std::string stem = name.substr(0, name.size() - 5);
+    EXPECT_TRUE(std::filesystem::exists(dup_dir / (stem + ".png")));
+    std::ifstream in(entry.path());
+    std::string text((std::istreambuf_iterator<char>(in)), {});
+    CameraContext parsed_ctx;
+    FrameRecord parsed;
+    std::string err;
+    ASSERT_TRUE(ParseRecord(text, &parsed_ctx, &parsed, &err)) << err;
+    ASSERT_EQ(parsed.detections.size(), 1u);
+    surviving_tag_ids.push_back(parsed.detections[0].tag_id);
+  }
+  EXPECT_EQ(surviving_tag_ids, (std::vector<int>{2}));
 }
 
 }  // namespace

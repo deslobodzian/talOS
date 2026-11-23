@@ -23,6 +23,13 @@ common --incompatible_default_to_explicit_init_py
 
 build --enable_platform_specific_config
 
+# Fix the default action PATH so differing shell PATHs (agent shells, user
+# terminals, worktrees) do not invalidate Bazel action and disk-cache keys.
+# Tests stay on the strict default PATH (/bin:/usr/bin:/usr/local/bin), which
+# tools/prepush.sh already assumes; Node/Python toolchains are hermetic and
+# drive_browser_test also checks TALOS_BROWSER and macOS Chrome.
+build --incompatible_strict_action_env
+
 # Parallel py_test / talos_py_node runs share symlinked runfiles directories under
 # Linux processwrapper-sandbox; prevent races writing __pycache__/*.pyc files.
 build --test_env=PYTHONDONTWRITEBYTECODE=1
@@ -84,7 +91,9 @@ build:release --stamp
 # Test lanes (talOS's docs/TESTING.md §9). A test's lane is its tag: `heavy`,
 # `integration`, `e2e` or `perf` (talos_sim_test tags its test `e2e`); an
 # untagged test is in the fast lane, and the soak is `manual`.
-# `bazel test --config=fast //...` is the everyday loop.
+# `bazel test --config=fast //...` is the everyday loop (`--config=dev` adds
+# `-O1` for faster local C++ rebuilds, using separate analysis and action
+# cache keys from the default `-O3` build).
 # Bazel keeps only the last --test_tag_filters, so a lane config and a
 # sanitizer config (or a CI job's own filter) must not be combined: pass one
 # filter naming both, e.g.
@@ -97,3 +106,9 @@ test:perf --test_tag_filters=perf
 # Every lane but e2e: what hosted macOS runs on each push, where the
 # full-graph timed tests cannot hold their bounds.
 test:no_e2e --test_tag_filters=-e2e
+
+# Fast local iteration: lower C++ optimization (-O1 over default -O3) and run
+# only the fast test lane. Uses separate analysis and action cache keys from
+# the default -O3 build (alternating discards and rebuilds the analysis cache).
+build:dev --cxxopt=-O1
+test:dev --config=fast

@@ -38,6 +38,9 @@ channel = 0
 [subsystems.roller.sensors.gyro]
 type = "Pigeon2"
 can_id = 2
+[subsystems.roller.sensors.cc]
+type = "CANcoder"
+can_id = 3
 )";
 
 struct Value {
@@ -176,6 +179,7 @@ int32_t BuildWaiter(TalosNode* node, void* user) {
 // TALOS_WAKE_AT_DRAIN keeps the callback but wakes nothing: a message
 // published between ticks reaches it at the next tick's drain (10 ms), not
 // at its publication (2 ms). A wake the enum lacks is refused, naming it.
+// REQ-RT-19
 TEST_F(NodeApi, AnAtDrainCallbackHearsAMessageAtTheNextTick) {
   Waiter waiter;
   ASSERT_NE(talos_sim_add(sim_, "waiter", &BuildWaiter, &waiter), nullptr)
@@ -193,6 +197,51 @@ TEST_F(NodeApi, AnAtDrainCallbackHearsAMessageAtTheNextTick) {
   EXPECT_EQ(waiter.heard_ns, std::vector<int64_t>{10 * kMs});
 }
 
+// REQ-RT-19: TALOS_WAKE_ON_PUBLISH on a timed node (10 ms update()) wakes the
+// node at publication time (2 ms), before the 10 ms tick, without running
+// update() early.
+TEST_F(NodeApi, AnOnPublishCallbackWakesATimedNodeBeforeItsTick) {
+  struct Prompt {
+    TalosNode* node = nullptr;
+    std::vector<int64_t> heard_ns;
+    int updates = 0;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& p = *static_cast<Prompt*>(user);
+    p.node = node;
+    const auto on_msg = [](const void* /*data*/, uint32_t /*size*/,
+                           void* ctx) -> int32_t {
+      auto& self = *static_cast<Prompt*>(ctx);
+      self.heard_ns.push_back(talos_node_now_ns(self.node));
+      return 0;
+    };
+    const auto on_update = [](void* ctx) -> int32_t {
+      ++static_cast<Prompt*>(ctx)->updates;
+      return 0;
+    };
+    if (talos_node_subscribe(node, "/prompt/in", sizeof(Value), &kValueSchema,
+                             0, TALOS_WAKE_ON_PUBLISH, on_msg, &p) < 0) {
+      return 1;
+    }
+    return talos_node_set_update(node, on_update, &p);
+  };
+
+  Prompt prompt;
+  ASSERT_NE(talos_sim_add(sim_, "prompt", build, &prompt), nullptr)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 2 * kMs), TALOS_OK) << talos_last_error();
+  const Value in{1.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/prompt/in", &in, sizeof in),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 1 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(prompt.heard_ns, std::vector<int64_t>{2 * kMs});
+  EXPECT_EQ(prompt.updates, 0);
+
+  ASSERT_EQ(talos_sim_step(sim_, 8 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(prompt.updates, 1);
+  EXPECT_EQ(prompt.heard_ns, std::vector<int64_t>{2 * kMs});
+}
+
 TEST_F(NodeApi, ATopicRefusesAnEndpointOfAnotherSchema) {
   Relay relay;
   ASSERT_NE(talos_sim_add(sim_, "relay", &BuildRelay, &relay), nullptr);
@@ -200,6 +249,51 @@ TEST_F(NodeApi, ATopicRefusesAnEndpointOfAnotherSchema) {
   EXPECT_EQ(talos_sim_add(sim_, "impostor", &BuildImpostor, &impostor),
             nullptr);
   EXPECT_EQ(talos_node_publish(nullptr, "/x/state", 8, nullptr), -1);
+}
+
+// REQ-CONTRACT-13: Schema accepts bfbs == nullptr with bfbs_size == 0 without
+// constructing std::string(nullptr, 0) (UB), accepts non-empty bfbs, and
+// refuses null schema, null name, or null bfbs with nonzero size.
+TEST_F(NodeApi, SchemaValidatesNullFieldsAndEmptyBfbs) {
+  struct Probe {
+    int64_t null_schema = 0;
+    int64_t null_name = 0;
+    int64_t null_bfbs_nonzero = 0;
+    std::string null_bfbs_error;
+    int64_t empty_bfbs = -1;
+    int64_t non_empty_bfbs = -1;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& p = *static_cast<Probe*>(user);
+    p.null_schema =
+        talos_node_publish(node, "/probe/a", sizeof(Value), nullptr);
+    constexpr TalosSchema kNullName{nullptr, 1u, nullptr, 0};
+    p.null_name =
+        talos_node_publish(node, "/probe/b", sizeof(Value), &kNullName);
+    constexpr TalosSchema kNullBfbsNonZero{"node_api_test.Bad", 1u, nullptr, 4};
+    p.null_bfbs_nonzero =
+        talos_node_publish(node, "/probe/c", sizeof(Value), &kNullBfbsNonZero);
+    p.null_bfbs_error = talos_last_error();
+    constexpr TalosSchema kEmptyBfbs{"node_api_test.Empty", 2u, nullptr, 0};
+    p.empty_bfbs =
+        talos_node_publish(node, "/probe/d", sizeof(Value), &kEmptyBfbs);
+    static constexpr uint8_t kBfbsBytes[4] = {'B', 'F', 'B', 'S'};
+    constexpr TalosSchema kWithBfbs{"node_api_test.WithBfbs", 3u, kBfbsBytes,
+                                    sizeof kBfbsBytes};
+    p.non_empty_bfbs =
+        talos_node_publish(node, "/probe/e", sizeof(Value), &kWithBfbs);
+    return 0;
+  };
+  Probe probe;
+  ASSERT_NE(talos_sim_add(sim_, "probe", build, &probe), nullptr)
+      << talos_last_error();
+  EXPECT_EQ(probe.null_schema, -1);
+  EXPECT_EQ(probe.null_name, -1);
+  EXPECT_EQ(probe.null_bfbs_nonzero, -1);
+  EXPECT_NE(probe.null_bfbs_error.find("bfbs"), std::string::npos)
+      << probe.null_bfbs_error;
+  EXPECT_GE(probe.empty_bfbs, 0);
+  EXPECT_GE(probe.non_empty_bfbs, 0);
 }
 
 TEST_F(NodeApi, ParamsRejectMissingAndMistypedValues) {
@@ -299,6 +393,135 @@ TEST_F(NodeApi, RegistrationFailureFailsTheAdd) {
   Relay relay;
   auto build = [](TalosNode*, void*) -> int32_t { return 1; };
   EXPECT_EQ(talos_sim_add(sim_, "relay", build, &relay), nullptr);
+}
+
+// REQ-SAFE-27: talos_node_publish and talos_node_publish_bytes refuse any
+// /hw/request topic at construction, direct or remapped.
+TEST(NodeApiHardwareRequest, PublishAndPublishBytesRefuseHardwareRequestTopic) {
+  TalosSim* sim = talos_sim_from_toml(R"(
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+
+[subsystems.plain]
+[subsystems.bytes]
+[subsystems.remapped.remap]
+state = "/hw/request/remapped"
+[subsystems.remapped_bytes.remap]
+frames = "/hw/request/remapped_bytes"
+
+[subsystems.roller.motors.wheel]
+can_id = 1
+)");
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+
+  auto build_plain = [](TalosNode* node, void*) -> int32_t {
+    return talos_node_publish(node, "/hw/request/plain", sizeof(Value),
+                              &kValueSchema) < 0
+               ? 1
+               : 0;
+  };
+  auto build_bytes = [](TalosNode* node, void*) -> int32_t {
+    return talos_node_publish_bytes(node, "/hw/request/bytes", 64, 16, 1, 0) < 0
+               ? 1
+               : 0;
+  };
+  auto build_remapped = [](TalosNode* node, void*) -> int32_t {
+    return talos_node_publish(node, "state", sizeof(Value), &kValueSchema) < 0
+               ? 1
+               : 0;
+  };
+  auto build_remapped_bytes = [](TalosNode* node, void*) -> int32_t {
+    return talos_node_publish_bytes(node, "frames", 64, 16, 1, 0) < 0 ? 1 : 0;
+  };
+
+  for (const auto& [name, factory] :
+       {std::pair<const char*, TalosFactory>{"plain", build_plain},
+        std::pair<const char*, TalosFactory>{"bytes", build_bytes},
+        std::pair<const char*, TalosFactory>{"remapped", build_remapped},
+        std::pair<const char*, TalosFactory>{"remapped_bytes",
+                                             build_remapped_bytes}}) {
+    SCOPED_TRACE(name);
+    EXPECT_EQ(talos_sim_add(sim, name, factory, nullptr), nullptr);
+    const std::string err = talos_last_error();
+    EXPECT_NE(err.find("/hw/request"), std::string::npos) << err;
+  }
+  talos_sim_destroy(sim);
+}
+
+TEST_F(NodeApi, RemoveAndMidRunAddRestartNodeAtCurrentSimTime) {
+  Relay first;
+  TalosNode* node = talos_sim_add(sim_, "relay", &BuildRelay, &first);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  const Value in1{4.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/relay/in", &in1, sizeof in1),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 25 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_node_tick(node), 2u);
+  ASSERT_EQ(first.callbacks, 1);
+
+  EXPECT_EQ(talos_sim_remove(nullptr, "relay"), TALOS_ERR);
+  EXPECT_EQ(talos_sim_remove(sim_, nullptr), TALOS_ERR);
+  EXPECT_EQ(talos_sim_remove(sim_, "missing"), TALOS_ERR);
+  ASSERT_EQ(talos_sim_remove(sim_, "relay"), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_sim_remove(sim_, "relay"), TALOS_ERR);
+  EXPECT_EQ(talos_sim_node(sim_, "relay"), nullptr);
+
+  // Messages published while removed must not reach the old or new instance.
+  const Value while_stopped{6.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/relay/in", &while_stopped,
+                                  sizeof while_stopped),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(first.callbacks, 1);
+  ASSERT_EQ(talos_sim_now_ns(sim_), 35 * kMs);
+
+  // Re-adding mid-run starts at sim now (35 ms) with no catch-up ticks and no
+  // pre-attach messages.
+  Relay second;
+  TalosNode* restarted = talos_sim_add(sim_, "relay", &BuildRelay, &second);
+  ASSERT_NE(restarted, nullptr) << talos_last_error();
+  EXPECT_EQ(talos_node_now_ns(restarted), 35 * kMs);
+  EXPECT_EQ(talos_node_tick(restarted), 0u);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_node_tick(restarted), 1u);
+  EXPECT_EQ(second.callbacks, 0);
+  EXPECT_EQ(talos_subscription_has_value(restarted, second.in), 0);
+
+  // A new message published after attach drives the restarted node normally.
+  const Value in2{8.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/relay/in", &in2, sizeof in2),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(second.callbacks, 1);
+  Value out{};
+  ASSERT_EQ(talos_sim_latest_raw(sim_, "/relay/out", &out, sizeof out), 1);
+  EXPECT_DOUBLE_EQ(out.x, 20.0);
+  EXPECT_EQ(out.stamp, 55 * kMs);
+
+  // Re-entrant remove/add from inside talos_sim_step returns TALOS_ERR.
+  struct Reenter {
+    TalosSim* sim = nullptr;
+    int32_t remove_result = TALOS_OK;
+    TalosNode* add_result = nullptr;
+  } reenter{sim_};
+  auto build_reenter = [](TalosNode* n, void* u) -> int32_t {
+    return talos_node_set_update(
+        n,
+        [](void* ctx) -> int32_t {
+          auto& r = *static_cast<Reenter*>(ctx);
+          r.remove_result = talos_sim_remove(r.sim, "relay");
+          r.add_result = talos_sim_add(
+              r.sim, "extra", [](TalosNode*, void*) { return 0; }, nullptr);
+          return 0;
+        },
+        u);
+  };
+  ASSERT_NE(talos_sim_add(sim_, "reenter", build_reenter, &reenter), nullptr)
+      << talos_last_error();
+  ASSERT_EQ(talos_sim_step(sim_, 10 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(reenter.remove_result, TALOS_ERR);
+  EXPECT_EQ(reenter.add_result, nullptr);
 }
 
 struct ByteSender {
@@ -417,6 +640,35 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   EXPECT_EQ(wheel.valid, 1);
   EXPECT_DOUBLE_EQ(wheel.position, 3.0);
   EXPECT_DOUBLE_EQ(wheel.velocity, 1.5);
+  EXPECT_EQ(wheel.forward_limit, 0);
+  EXPECT_EQ(wheel.reverse_limit, 0);
+
+  ASSERT_EQ(talos_sim_hardware_set_limit_switches(hw, "roller", "wheel", 1, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &wheel), TALOS_OK);
+  EXPECT_EQ(wheel.forward_limit, 1);
+  EXPECT_EQ(wheel.reverse_limit, 0);
+
+  ASSERT_EQ(talos_sim_hardware_set_limit_switches(hw, "roller", "wheel", 0, 1),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &wheel), TALOS_OK);
+  EXPECT_EQ(wheel.forward_limit, 0);
+  EXPECT_EQ(wheel.reverse_limit, 1);
+
+  ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, roller.wheel, &wheel), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 0);
+  EXPECT_EQ(wheel.forward_limit, 0);
+  EXPECT_EQ(wheel.reverse_limit, 0);
+
+  ASSERT_EQ(talos_sim_hardware_set_connected(hw, "roller", "wheel", 1),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_limit_switches(hw, "roller", "wheel", 0, 0),
+            TALOS_OK);
 
   ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
   ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
@@ -435,6 +687,223 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
             TALOS_OK);
   EXPECT_EQ(request.mode, TALOS_MODE_NEUTRAL);
   talos_sim_hardware_destroy(hw);
+}
+
+// REQ-CONTRACT-34: before any valid sample, Motor, CANcoder, Encoder and Gyro
+// read 0.0; across disconnect and stale link, each holds its last valid
+// position/yaw through any rezero offset while rates and efforts read 0.0.
+TEST(NodeApiDevices, InvalidAndStaleSamplesHoldPositionAndZeroRatesAndEfforts) {
+  constexpr const char* kDevicesToml = R"(
+[robot]
+period_us = 10000
+command_timeout_us = 100000
+
+[subsystems.mech.motors.wheel]
+can_id = 1
+[subsystems.mech.sensors.cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.mech.sensors.gyro]
+type = "Pigeon2"
+can_id = 3
+[subsystems.mech.encoders.enc]
+type = "DutyCycleEncoder"
+dio = 2
+)";
+  struct Handles {
+    int64_t wheel = -1;
+    int64_t cc = -1;
+    int64_t gyro = -1;
+    int64_t enc = -1;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& h = *static_cast<Handles*>(user);
+    h.wheel = talos_device(node, TALOS_DEVICE_MOTOR, "wheel");
+    h.cc = talos_device(node, TALOS_DEVICE_CANCODER, "cc");
+    h.gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
+    h.enc = talos_device(node, TALOS_DEVICE_ENCODER, "enc");
+    if (h.wheel < 0 || h.cc < 0 || h.gyro < 0 || h.enc < 0) return 1;
+    return 0;
+  };
+
+  TalosSim* sim = talos_sim_from_toml(kDevicesToml);
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+  Handles h;
+  TalosNode* node = talos_sim_add(sim, "mech", build, &h);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+
+  // Before the first valid sample: valid == 0 and all reads are 0.0.
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+  TalosSample wheel{}, cc{}, gyro{}, enc{};
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_EQ(talos_encoder_sample(node, h.enc, &enc), TALOS_OK);
+  for (const TalosSample* s : {&wheel, &cc, &gyro, &enc}) {
+    EXPECT_EQ(s->valid, 0);
+    EXPECT_EQ(s->position, 0.0);
+    EXPECT_EQ(s->velocity, 0.0);
+  }
+  EXPECT_EQ(wheel.voltage, 0.0);
+  EXPECT_EQ(wheel.current, 0.0);
+  EXPECT_EQ(wheel.supply_current_a, 0.0);
+
+  // Establish live samples and rezero Motor and Gyro.
+  TalosSimHardware* hw = talos_sim_hardware_create(sim);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "mech", "wheel", 3.0, 2.0, 0, 0,
+                                         40.0, 18.0, 30.0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_cancoder(hw, "mech", "cc", 0.2, 0.3, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_gyro(hw, "mech", "gyro", 0.25, -0.5, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_encoder(hw, "mech", "enc", 0.4, 0.6),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+
+  // SimHardware::set_motor leaves MotorSample::voltage at 0.0; patch the
+  // latest encoded /hw/state packet so the live sample carries a non-zero
+  // voltage (11.5 V) before disconnect or staleness, proving voltage -> 0.0
+  // is not tautological.
+  auto publish_live_motor_voltage = [&](double expected_pos,
+                                        double expected_vel, double voltage) {
+    constexpr uint32_t kPacketSize = 1436;
+    constexpr size_t kWire = 4;  // uint32_t size prefix in hardware::Packet
+    std::vector<uint8_t> packet(kPacketSize);
+    ASSERT_EQ(
+        talos_sim_latest_raw(sim, "/hw/state", packet.data(), kPacketSize), 1);
+    uint32_t wire_size = 0;
+    std::memcpy(&wire_size, packet.data(), sizeof wire_size);
+    ASSERT_GE(wire_size, 84u + 45u);
+    ASSERT_LE(wire_size, kPacketSize - kWire);
+    uint16_t motor_count = 0;
+    std::memcpy(&motor_count, packet.data() + kWire + 70, sizeof motor_count);
+    ASSERT_EQ(motor_count, 1u);
+    ASSERT_EQ(packet[kWire + 84 + 2], 1u);  // motors[0].valid
+    double pos = 0;
+    double vel = 0;
+    std::memcpy(&pos, packet.data() + kWire + 84 + 3, sizeof pos);
+    std::memcpy(&vel, packet.data() + kWire + 84 + 11, sizeof vel);
+    ASSERT_DOUBLE_EQ(pos, expected_pos);
+    ASSERT_DOUBLE_EQ(vel, expected_vel);
+    uint64_t sample_time_us = 0;
+    uint64_t sequence = 0;
+    std::memcpy(&sample_time_us, packet.data() + kWire + 24,
+                sizeof sample_time_us);
+    std::memcpy(&sequence, packet.data() + kWire + 48, sizeof sequence);
+    sample_time_us += 1000;
+    ++sequence;
+    std::memcpy(packet.data() + kWire + 24, &sample_time_us,
+                sizeof sample_time_us);
+    std::memcpy(packet.data() + kWire + 48, &sequence, sizeof sequence);
+    std::memcpy(packet.data() + kWire + 84 + 19, &voltage, sizeof voltage);
+    ASSERT_EQ(talos_sim_hardware_lose_states(hw, 1), TALOS_OK)
+        << talos_last_error();
+    ASSERT_EQ(
+        talos_sim_publish_raw(sim, "/hw/state", packet.data(), kPacketSize),
+        TALOS_OK)
+        << talos_last_error();
+    ASSERT_EQ(talos_sim_step(sim, 10 * kMs), TALOS_OK) << talos_last_error();
+  };
+
+  ASSERT_EQ(talos_motor_rezero(node, h.wheel, 1.0), TALOS_OK);
+  ASSERT_EQ(talos_gyro_rezero(node, h.gyro, 0.0), TALOS_OK);
+  ASSERT_EQ(talos_motor_zeroed(node, h.wheel), 1);
+  ASSERT_EQ(talos_gyro_zeroed(node, h.gyro), 1);
+  publish_live_motor_voltage(3.0, 2.0, 11.5);
+
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_EQ(talos_encoder_sample(node, h.enc, &enc), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 1);
+  EXPECT_DOUBLE_EQ(wheel.position, 1.0);
+  EXPECT_DOUBLE_EQ(wheel.velocity, 2.0);
+  EXPECT_DOUBLE_EQ(wheel.voltage, 11.5);
+  EXPECT_DOUBLE_EQ(wheel.current, 30.0);
+  EXPECT_DOUBLE_EQ(wheel.supply_current_a, 18.0);
+  EXPECT_EQ(cc.valid, 1);
+  EXPECT_DOUBLE_EQ(cc.position, 0.2);
+  EXPECT_DOUBLE_EQ(cc.velocity, 0.3);
+  EXPECT_EQ(gyro.valid, 1);
+  EXPECT_DOUBLE_EQ(gyro.position, 0.0);
+  EXPECT_DOUBLE_EQ(gyro.velocity, -0.5);
+  EXPECT_EQ(enc.valid, 1);
+  EXPECT_DOUBLE_EQ(enc.position, 0.4);
+  EXPECT_DOUBLE_EQ(enc.velocity, 0.6);
+
+  // Disconnect every device: positions hold through rezero offsets; rates and
+  // efforts read 0.0.
+  for (const char* dev : {"wheel", "cc", "gyro", "enc"}) {
+    ASSERT_EQ(talos_sim_hardware_set_connected(hw, "mech", dev, 0), TALOS_OK);
+  }
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_EQ(talos_encoder_sample(node, h.enc, &enc), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 0);
+  EXPECT_EQ(cc.valid, 0);
+  EXPECT_EQ(gyro.valid, 0);
+  EXPECT_EQ(enc.valid, 0);
+  EXPECT_DOUBLE_EQ(wheel.position, 1.0);
+  EXPECT_DOUBLE_EQ(gyro.position, 0.0);
+  EXPECT_DOUBLE_EQ(cc.position, 0.2);
+  EXPECT_DOUBLE_EQ(enc.position, 0.4);
+  EXPECT_EQ(wheel.velocity, 0.0);
+  EXPECT_EQ(wheel.voltage, 0.0);
+  EXPECT_EQ(wheel.current, 0.0);
+  EXPECT_EQ(wheel.supply_current_a, 0.0);
+  EXPECT_EQ(cc.velocity, 0.0);
+  EXPECT_EQ(gyro.velocity, 0.0);
+  EXPECT_EQ(enc.velocity, 0.0);
+
+  // Reconnect with updated live readings, then drop the hardware link past
+  // command_timeout_us (stale link).
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "mech", "wheel", 5.0, 2.0, 0, 0,
+                                         45.0, 18.0, 30.0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_cancoder(hw, "mech", "cc", 0.35, 0.3, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_gyro(hw, "mech", "gyro", 0.5, -0.5, 0, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_encoder(hw, "mech", "enc", 0.55, 0.6),
+            TALOS_OK);
+  for (const char* dev : {"wheel", "cc", "gyro", "enc"}) {
+    ASSERT_EQ(talos_sim_hardware_set_connected(hw, "mech", dev, 1), TALOS_OK);
+  }
+  ASSERT_EQ(talos_sim_step(sim, 20 * kMs), TALOS_OK) << talos_last_error();
+  publish_live_motor_voltage(5.0, 2.0, 11.5);
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_DOUBLE_EQ(wheel.position, 3.0);
+  ASSERT_DOUBLE_EQ(wheel.voltage, 11.5);
+  ASSERT_DOUBLE_EQ(gyro.position, 0.25);
+
+  talos_sim_hardware_destroy(hw);
+  ASSERT_EQ(talos_sim_step(sim, 150 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_motor_sample(node, h.wheel, &wheel), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.cc, &cc), TALOS_OK);
+  ASSERT_EQ(talos_sensor_sample(node, h.gyro, &gyro), TALOS_OK);
+  ASSERT_EQ(talos_encoder_sample(node, h.enc, &enc), TALOS_OK);
+  EXPECT_EQ(wheel.valid, 0);
+  EXPECT_EQ(cc.valid, 0);
+  EXPECT_EQ(gyro.valid, 0);
+  EXPECT_EQ(enc.valid, 0);
+  EXPECT_DOUBLE_EQ(wheel.position, 3.0);
+  EXPECT_DOUBLE_EQ(gyro.position, 0.25);
+  EXPECT_DOUBLE_EQ(cc.position, 0.35);
+  EXPECT_DOUBLE_EQ(enc.position, 0.55);
+  EXPECT_EQ(wheel.velocity, 0.0);
+  EXPECT_EQ(wheel.voltage, 0.0);
+  EXPECT_EQ(wheel.current, 0.0);
+  EXPECT_EQ(wheel.supply_current_a, 0.0);
+  EXPECT_EQ(cc.velocity, 0.0);
+  EXPECT_EQ(gyro.velocity, 0.0);
+  EXPECT_EQ(enc.velocity, 0.0);
+
+  talos_sim_destroy(sim);
 }
 
 // A PWM output set to 0 pulses at the centre; after talos_pwm_stop it sends
@@ -634,9 +1103,14 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   ASSERT_NE(hw, nullptr) << talos_last_error();
   const auto gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
   ASSERT_GE(gyro, 0);
+  const auto cc = talos_device(node, TALOS_DEVICE_CANCODER, "cc");
+  ASSERT_GE(cc, 0);
   ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 1000,
                                          3000, 0, 0, 0),
             TALOS_OK);
+  ASSERT_EQ(
+      talos_sim_hardware_set_cancoder(hw, "roller", "cc", 0.2, 0.3, 2000, 4000),
+      TALOS_OK);
   ASSERT_EQ(
       talos_sim_hardware_set_gyro(hw, "roller", "gyro", 0.75, -0.5, 5000, 6000),
       TALOS_OK);
@@ -653,6 +1127,18 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   int64_t acquired = -1;
   EXPECT_EQ(talos_motor_time(node, roller.wheel, 0, &acquired), 0);
   EXPECT_EQ(acquired, -1);
+  EXPECT_EQ(talos_sensor_time(node, cc, 0, &acquired), 0);
+  EXPECT_EQ(acquired, -1);
+  // Signal ages come from the State itself: known before the mapping.
+  int64_t age = -1;
+  ASSERT_EQ(talos_motor_age(node, roller.wheel, 0, &age), 1);
+  EXPECT_EQ(age, 1 * kMs);
+  ASSERT_EQ(talos_motor_age(node, roller.wheel, 1, &age), 1);
+  EXPECT_EQ(age, 3 * kMs);
+  ASSERT_EQ(talos_sensor_age(node, cc, 0, &age), 1);
+  EXPECT_EQ(age, 2 * kMs);
+  ASSERT_EQ(talos_sensor_age(node, cc, 1, &age), 1);
+  EXPECT_EQ(age, 4 * kMs);
 
   ASSERT_EQ(talos_sim_step(sim_, 50 * kMs), TALOS_OK) << talos_last_error();
   ASSERT_EQ(talos_hardware_sample_time(node, &sampled), 1);
@@ -666,6 +1152,10 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   EXPECT_EQ(acquired, sampled - kMs);
   ASSERT_EQ(talos_motor_time(node, roller.wheel, 1, &acquired), 1);
   EXPECT_EQ(acquired, sampled - 3 * kMs);
+  ASSERT_EQ(talos_sensor_time(node, cc, 0, &acquired), 1);
+  EXPECT_EQ(acquired, sampled - 2 * kMs);
+  ASSERT_EQ(talos_sensor_time(node, cc, 1, &acquired), 1);
+  EXPECT_EQ(acquired, sampled - 4 * kMs);
   ASSERT_EQ(talos_sensor_time(node, gyro, 0, &acquired), 1);
   EXPECT_EQ(acquired, sampled - 5 * kMs);
   ASSERT_EQ(talos_sensor_time(node, gyro, 1, &acquired), 1);
@@ -673,12 +1163,30 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   EXPECT_EQ(talos_motor_time(node, roller.wheel, 0, nullptr), TALOS_ERR);
   EXPECT_EQ(talos_sensor_time(node, gyro, 0, nullptr), TALOS_ERR);
   EXPECT_EQ(talos_motor_time(node, -1, 0, &acquired), TALOS_ERR);
+  EXPECT_EQ(talos_sensor_age(node, cc, 0, nullptr), TALOS_ERR);
+  EXPECT_EQ(talos_sensor_age(node, -1, 0, &age), TALOS_ERR);
+  EXPECT_EQ(talos_sensor_age(node, roller.wheel, 0, &age), TALOS_ERR);
+
+  // An unknown age invalidates the sample and returns 0.
+  ASSERT_EQ(talos_sim_hardware_set_cancoder(hw, "roller", "cc", 0.2, 0.3,
+                                            UINT32_MAX, 0),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(talos_sensor_age(node, cc, 0, &age), 0);
+  EXPECT_EQ(talos_sensor_age(node, cc, 1, &age), 0);
+  ASSERT_EQ(
+      talos_sim_hardware_set_cancoder(hw, "roller", "cc", 0.2, 0.3, 2000, 4000),
+      TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(talos_sensor_age(node, cc, 0, &age), 1);
+  EXPECT_EQ(age, 2 * kMs);
 
   talos_sim_hardware_destroy(hw);  // the bridge goes silent
   ASSERT_EQ(talos_sim_step(sim_, 150 * kMs), TALOS_OK) << talos_last_error();
   EXPECT_EQ(talos_hardware_sample_time(node, &sampled), 0);
   EXPECT_EQ(talos_motor_time(node, roller.wheel, 0, &acquired), 0);
   EXPECT_EQ(talos_sensor_time(node, gyro, 0, &acquired), 0);
+  EXPECT_EQ(talos_sensor_age(node, cc, 0, &age), 0);
 }
 
 TEST_F(NodeApi, HardwareFreshnessAndAge) {
@@ -858,6 +1366,86 @@ TEST_F(NodeApi, TargetSelectsTheTeleopLaneAndLanesRelease) {
   ASSERT_EQ(talos_target_lane_send(node, lanes.lane, &speed, sizeof speed), 1);
   ASSERT_EQ(talos_sim_step(sim_, 150 * kMs), TALOS_OK) << talos_last_error();
   EXPECT_EQ(talos_target_get(node, lanes.target, &out, &source), 0);
+  talos_sim_hardware_destroy(hw);
+}
+
+// REQ-OPS-55: OperatorArming blocker C ABI round-trips kind/port/index, clears
+// on arm, preserves 1-arg evaluate, and refuses unknown kind or bad handle.
+TEST_F(NodeApi, OperatorArmingBlockerRoundTripsAndValidatesKind) {
+  int64_t arming = -1;
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    *static_cast<int64_t*>(user) = talos_operator_arming_open(node);
+    return *static_cast<int64_t*>(user) < 0 ? 1 : 0;
+  };
+  TalosNode* node = talos_sim_add(sim_, "roller", build, &arming);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  TalosDriverStationPacket packet{};
+  packet.flags = TALOS_DS_ATTACHED | TALOS_DS_ENABLED | TALOS_DS_TELEOP;
+  ASSERT_EQ(talos_sim_hardware_set_driver_station(hw, &packet), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 20 * kMs), TALOS_OK) << talos_last_error();
+
+  uint8_t kind = 99;
+  int8_t port = 99;
+  int16_t index = 99;
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_NONE);
+  EXPECT_EQ(port, -1);
+  EXPECT_EQ(index, -1);
+
+  // Legacy 1-arg evaluate(0) records OTHER/-1/-1.
+  EXPECT_EQ(talos_operator_arming_evaluate(node, arming, 0), 0);
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_OTHER);
+  EXPECT_EQ(port, -1);
+  EXPECT_EQ(index, -1);
+
+  // Blocker overload records exact kind/port/index while disarmed.
+  int32_t may_publish = -1;
+  ASSERT_EQ(talos_operator_arming_evaluate_blocker(
+                node, arming, 0, TALOS_ARMING_INPUT_AXIS, 1, 2, &may_publish),
+            TALOS_OK);
+  EXPECT_EQ(may_publish, 0);
+  EXPECT_EQ(talos_operator_arming_armed(node, arming), 0);
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_AXIS);
+  EXPECT_EQ(port, 1);
+  EXPECT_EQ(index, 2);
+
+  // Neutral evaluation arms and clears blocker.
+  ASSERT_EQ(talos_operator_arming_evaluate_blocker(
+                node, arming, 1, TALOS_ARMING_INPUT_NONE, -1, -1, &may_publish),
+            TALOS_OK);
+  EXPECT_EQ(may_publish, 0);
+  EXPECT_EQ(talos_operator_arming_armed(node, arming), 1);
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_NONE);
+  EXPECT_EQ(port, -1);
+  EXPECT_EQ(index, -1);
+
+  // While armed, non-neutral returns 1 and keeps blocker cleared.
+  ASSERT_EQ(talos_operator_arming_evaluate_blocker(
+                node, arming, 0, TALOS_ARMING_INPUT_BUTTON, 0, 4, &may_publish),
+            TALOS_OK);
+  EXPECT_EQ(may_publish, 1);
+  ASSERT_EQ(talos_operator_arming_blocker(node, arming, &kind, &port, &index),
+            TALOS_OK);
+  EXPECT_EQ(kind, TALOS_ARMING_INPUT_NONE);
+  EXPECT_EQ(port, -1);
+  EXPECT_EQ(index, -1);
+
+  // Invalid kind and invalid handle are refused.
+  EXPECT_EQ(talos_operator_arming_evaluate_blocker(node, arming, 0, 99, 0, 0,
+                                                   &may_publish),
+            TALOS_ERR);
+  EXPECT_EQ(talos_operator_arming_blocker(node, -1, &kind, &port, &index),
+            TALOS_ERR);
   talos_sim_hardware_destroy(hw);
 }
 

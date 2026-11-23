@@ -943,6 +943,28 @@ def _talos_bundle_impl(ctx):
         bundle_dir.path,
     ]
 
+    # Pass Bazel's `_repo_mapping` manifests (from the launcher, nodes, and
+    # Studio bridge) so bundle_builder maps canonical repo names to the main
+    # repository's real apparent names instead of guessing from `+` suffixes.
+    repo_mapping_targets = [ctx.attr.launcher] + list(ctx.attr.nodes)
+    if ctx.attr.studio_bridge:
+        repo_mapping_targets.append(ctx.attr.studio_bridge)
+    seen_repo_mappings = {}
+    for target in repo_mapping_targets:
+        ftr = target[DefaultInfo].files_to_run
+        rm = ftr.repo_mapping_manifest if ftr else None
+        if rm and rm not in seen_repo_mappings:
+            seen_repo_mappings[rm] = True
+            direct_inputs.append(rm)
+            arguments += ["--repo-mapping", rm.path]
+
+    # Also pass apparent -> canonical repo pairs extracted in the caller's
+    # repository context by the talos_bundle macro: when every target in the
+    # bundle lives in an external repo (e.g. @my_talos), none of their
+    # repo_mapping_manifests carry `source == ""` rows.
+    for apparent, canonical in sorted(ctx.attr.apparent_repos.items()):
+        arguments += ["--apparent-repo", "%s=%s" % (apparent, canonical)]
+
     # The source revision only under --stamp (--config=release): the status
     # file changes with every commit, so an unstamped bundle never reads it
     # and stays cached.
@@ -1063,6 +1085,10 @@ _talos_bundle = rule(
             doc = "The built Studio site, one directory holding index.html, that " +
                   "the bundled bridge serves. Set with studio_bridge.",
         ),
+        "apparent_repos": attr.string_dict(
+            default = {},
+            doc = "Apparent-to-canonical repo names extracted in the caller's repository context.",
+        ),
         "_builder": attr.label(
             default = Label("//talOS/build:bundle_builder"),
             executable = True,
@@ -1080,6 +1106,26 @@ _talos_bundle = rule(
         ),
     }, **STAMP_ATTRS),
 )
+
+def _extract_apparent_repos(targets):
+    """Maps apparent repo names seen in caller target strings to canonical names."""
+    mapping = {}
+    for item in targets:
+        if not item or type(item) != "string":
+            continue
+        if not item.startswith("@") or item.startswith("@@"):
+            continue
+        if "//" in item:
+            apparent = item[1:].split("//", 1)[0]
+        elif ":" not in item:
+            apparent = item[1:]
+        else:
+            continue
+        if not apparent or apparent in mapping:
+            continue
+        canonical = native.package_relative_label(item).repo_name
+        mapping[apparent] = canonical if canonical else "_main"
+    return mapping
 
 def talos_bundle(name, config, **kwargs):
     """Assembles a deployable bundle of exactly the nodes `config` launches.
@@ -1107,7 +1153,20 @@ def talos_bundle(name, config, **kwargs):
     manifest = config_label.same_package_label(
         config_label.name.removesuffix(".toml") + "_manifest.bzl",
     )
-    _talos_bundle(name = name, config = config, manifest = manifest, **kwargs)
+    caller_targets = list(kwargs.get("nodes", []))
+    for key in ("hardware_node", "studio_bridge", "launcher"):
+        if kwargs.get(key):
+            caller_targets.append(kwargs[key])
+    apparent_repos = _extract_apparent_repos(caller_targets)
+    if "apparent_repos" in kwargs:
+        apparent_repos.update(kwargs.pop("apparent_repos"))
+    _talos_bundle(
+        name = name,
+        config = config,
+        manifest = manifest,
+        apparent_repos = apparent_repos,
+        **kwargs
+    )
 
 # The launcher and the runner that starts it from a runfiles tree
 # (launcher_runner.py), shared by talos_graph_test and talos_sim.
@@ -1242,7 +1301,7 @@ _LOG_DUMP = Label("//talOS/launcher:log_dump")
 _SESSION_REPORT = Label("//talOS/launcher:session_report")
 _REGISTRY_UNLINK = Label("//talOS/build:registry_unlink")
 
-def talos_sim_test(name, sim, settle_s = 1, **kwargs):
+def talos_sim_test(name, sim, settle_s = 1, studio = False, **kwargs):
     """Runs the talos_sim target `sim` until it is up, stops it and judges its session.
 
     The session runs until the bridge has accepted a State from the
@@ -1254,7 +1313,13 @@ def talos_sim_test(name, sim, settle_s = 1, **kwargs):
     every member of the session's manifest ran exactly once and exited with
     code 0 and no signal; the session holds the simulator and a node besides
     it and the hardware bridge; and the bridge received State (session_report's
-    "controller link" verdict). The check is talOS/build/sim_check.py.
+    "controller link" verdict). When `studio` is True, the session also starts
+    Studio's bridge on an ephemeral HTTP port (`--start-studio-bridge
+    --studio-http-port 0`), waits for it to bind its port and settle past the
+    launcher's settle interval, and fails unless `studio_bridge` appears in the
+    manifest with a valid `http_port`, 1 clean run (`exit_code == 0`,
+    `exit_signal == 0`), `restart_count == 0`, and `recorder_failed == False`.
+    The check is talOS/build/sim_check.py.
 
     Tagged `e2e` (it runs the whole config) and `exclusive` (it does, on as
     many cores as the robot uses), as Bazel's `medium` size (its `moderate`
@@ -1267,27 +1332,32 @@ def talos_sim_test(name, sim, settle_s = 1, **kwargs):
         member that fails soon after starting fails the test. It does not
         bound startup. A value leaving less than 10 s of the timeout for
         startup, after 45 s for the stop, fails the test before it starts.
+      studio: whether to start and verify the supervised Studio bridge
+        (`--studio-bridge`).
       **kwargs: passed to py_test.
     """
     sim_label = native.package_relative_label(sim)
     tags = kwargs.pop("tags", [])
+    args = [
+        "--sim",
+        "$(rlocationpath %s)" % sim_label,
+        "--settle-s",
+        str(settle_s),
+        "--log-dump",
+        "$(rlocationpath %s)" % _LOG_DUMP,
+        "--session-report",
+        _rlocation(_SESSION_REPORT.same_package_label("session_report.py")),
+        "--registry-unlink",
+        "$(rlocationpath %s)" % _REGISTRY_UNLINK,
+    ]
+    if studio:
+        args.append("--studio-bridge")
     py_test(
         name = name,
         size = kwargs.pop("size", "medium"),
         srcs = [_SIM_CHECK],
         main = _SIM_CHECK,
-        args = [
-            "--sim",
-            "$(rlocationpath %s)" % sim_label,
-            "--settle-s",
-            str(settle_s),
-            "--log-dump",
-            "$(rlocationpath %s)" % _LOG_DUMP,
-            "--session-report",
-            _rlocation(_SESSION_REPORT.same_package_label("session_report.py")),
-            "--registry-unlink",
-            "$(rlocationpath %s)" % _REGISTRY_UNLINK,
-        ],
+        args = args,
         data = [sim_label, _LOG_DUMP, _SESSION_REPORT, _REGISTRY_UNLINK],
         legacy_create_init = False,
         tags = tags + [tag for tag in ["e2e", "exclusive"] if tag not in tags],

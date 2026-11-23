@@ -2,9 +2,8 @@
 
 #include <algorithm>
 #include <charconv>
-#include <fstream>
-#include <iterator>
-#include <system_error>
+
+#include "studio/bridge/static_files.h"
 
 namespace studio::review {
 namespace {
@@ -35,17 +34,6 @@ int LoopbackPort(std::string_view text) {
   return -1;
 }
 
-std::string_view ContentType(const fs::path& file) {
-  const std::string ext = file.extension().string();
-  if (ext == ".html") return "text/html; charset=utf-8";
-  if (ext == ".js") return "text/javascript";
-  if (ext == ".css") return "text/css";
-  if (ext == ".json") return "application/json";
-  if (ext == ".svg") return "image/svg+xml";
-  if (ext == ".wasm") return "application/wasm";
-  return "application/octet-stream";
-}
-
 Response Plain(int status, std::string message) {
   return {status, "text/plain; charset=utf-8", std::move(message) + "\n"};
 }
@@ -71,30 +59,22 @@ std::string AllowedOrigin(std::string_view origin) {
 }
 
 Response StaticFile(const fs::path& root, std::string_view url) {
-  if (url.find('%') != std::string_view::npos ||
-      url.find('\\') != std::string_view::npos) {
-    return Plain(400, "bad path");
+  // Contained by name, not by resolving symlinks: the root is a build output,
+  // which Bazel may stage as symlinks to files elsewhere, and only the URL is
+  // the requester's.
+  const std::string_view mapped = url == "/" ? "/index.html" : url;
+  const studio::StaticFileResult result = studio::ReadStaticFile(
+      root, mapped, {.containment = studio::Containment::kLexical});
+  switch (result.status) {
+    case 200:
+      return {200, std::string{result.content_type}, result.body};
+    case 400:
+      return Plain(400, "bad path");
+    case 413:
+      return Plain(413, "too large");
+    default:
+      return Plain(404, "not found");
   }
-  if (root.empty() || !url.starts_with('/')) return Plain(404, "not found");
-  // Contained by name, not by resolving symlinks: the root is a build
-  // output, which Bazel may stage as symlinks to files elsewhere, and only
-  // the URL is the requester's.
-  const fs::path relative =
-      fs::path{url == "/" ? std::string_view{"index.html"} : url.substr(1)}
-          .lexically_normal();
-  if (relative.empty() || relative.is_absolute() || *relative.begin() == "..") {
-    return Plain(404, "not found");
-  }
-  std::error_code error;
-  const fs::path file = root / relative;
-  if (!fs::is_regular_file(file, error)) return Plain(404, "not found");
-  if (fs::file_size(file, error) > kMaxStaticFileBytes || error) {
-    return Plain(413, "too large");
-  }
-  std::ifstream input{file, std::ios::binary};
-  if (!input) return Plain(404, "not found");
-  return {200, std::string{ContentType(file)},
-          std::string{std::istreambuf_iterator<char>{input}, {}}};
 }
 
 }  // namespace studio::review

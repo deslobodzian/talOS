@@ -10,7 +10,13 @@ that follows a hidden HTML comment `size: <name>` is checked:
 `//tools:check_data_flow_sizes_test` fails unless it equals what
 `//tools:data_flow_sizes` prints for that name from the defining headers,
 and unless every printed size is marked somewhere (a new one gets its marker
-in the same change).
+in the same change). Those markers cover the protocol version, UDP frame, payload-codec,
+device-cap, shared-memory slot, framework message slot and byte
+(`pose_observation`, `pose_estimate`, `odometry_sample`), live-registry,
+dispatch-log, and telemetry-page/burst constants defined in framework headers;
+numbers in inline code spans, bench and example config arithmetic and
+bench/example message sizes, measured telemetry and wake-socket tables, and
+Studio bridge egress budgets are intentionally unchecked.
 
 ## Processes and links
 
@@ -55,27 +61,33 @@ shared-memory topics only; its repository documents their rates.
 | Any publisher → the loop of a reader asleep on its topic (wake) | AF_UNIX datagram, Linux abstract address / macOS `/tmp/talos-wake-<id>`; no port ([talOS/rtms](../talOS/rtms/README.md#wake-channel)) | 1 byte, at most one per reader sleep per topic: a write sends one to each reader slot armed since the last publication (a reader of a prompt subscription under `Delivery::ON_PUBLISH`, the bridge's reader of each `/hw/request/<node>`, or `studio_bridge`'s reader of `/talos/telemetry`, between its drain and its next block), none when no reader is armed; a writer taking over a topic sends one to every reader with a receiver. A lost datagram costs a node's loop up to its 1 s backstop, the bridge up to its longest wait, 10000 µs (`HardwareNode::kMaxWaitUs`), and `studio_bridge` up to its next duty, at most its 250 ms graph refresh ([Studio bridge](../studio/bridge/README.md#waking)). A send that fails other than to a gone receiver counts in the writer's registry row (`wake_failures`), and a request the bridge's latest-value read passes over in its subsystem's request row (`requests_skipped`; [wake loss](../talOS/introspection/README.md#wake-loss)). |
 | Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz, each tick as one or more value pages; dictionary pages before the first tick and every 100th (1 Hz at this rate). |
 | studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Per client: graph, dictionary pages and a keyframe on connection, then change-only telemetry updates of at most one per producer tick and system-graph value updates of at most one per 500 ms (the whole graph again when its structure changes), deferred and coalesced when the egress budget is short. HTTP requests are not the value stream. |
-| studio_bridge → driver dashboard (`/drive`) | WebSocket, the same port | Per drive client (at most the layout's `drive_clients`, outside `max_clients`): dictionary pages and a keyframe of the feed's channels (the layout's, `hw/status/alert_error_link_lost`, and with an `alerts` widget every alert channel) on connection, then change-only updates of those channels at most `update_hz` (default 20) a second, an empty update after 100 ms without one, and the drive summary (at most <!-- size: telemetry.drive_summary_bytes -->4,096 B) on change at most every 500 ms; within the layout's `budget_bytes_per_s` (default 24,000 B/s), reserved out of the bridge's 160,000 B/s ([bridge README](../studio/bridge/README.md#driver-dashboard-feed)). |
+| studio_bridge → driver dashboard (`/drive`) | WebSocket, the same port | Per drive client (at most the layout's `drive_clients`, outside `max_clients`): dictionary pages and a keyframe of the feed's channels (the layout's, `hw/status/alert_error_link_lost`, `hw/status/alert_error_protocol_mismatch`, and with an `alerts` widget every alert channel) on connection, then change-only updates of those channels at most `update_hz` (default 20) a second, an empty update after 100 ms without one, and the drive summary (at most <!-- size: telemetry.drive_summary_bytes -->4,096 B) on change at most every 500 ms; within the layout's `budget_bytes_per_s` (default 24,000 B/s), reserved out of the bridge's 160,000 B/s ([bridge README](../studio/bridge/README.md#driver-dashboard-feed)). |
 
 A failed send never kills the bridge (`RuntimeUdpPeer` raises no
-`SIGPIPE`). When a send to the gateway fails with an error its socket never
-recovers from (`protocol::SendErrorNeedsNewSocket`, whose errors per OS are
-in [talOS/protocol](../talOS/protocol/README.md): a socket shut down or
-marked defunct, or one whose source address left the host), the bridge
-closes the socket and opens a new one on the same ports (`Reopen()`, which
-keeps the frame sequence the gateway's replay gate checks): on its next pass,
-at most 1000 µs later, then at most every 100000 µs
-(`HardwareNode::kReopenRetryUs`). While it is closed nothing is sent or
+`SIGPIPE`). When a send or receive on the gateway socket fails with an error its
+socket never recovers from (`protocol::SendErrorNeedsNewSocket` /
+`protocol::ReceiveErrorNeedsNewSocket`, whose errors per OS are in
+[talOS/protocol](../talOS/protocol/README.md): a socket shut down or marked
+defunct, an invalid descriptor, or one whose source address left the host), the
+bridge removes the descriptor from its poller, closes the socket and opens a new
+one on the same addresses and ports (`Reopen()`, which keeps the frame sequence
+the gateway's replay gate checks): on its next pass, at most 1000 µs later, then
+at most every 100000 µs (`HardwareNode::kReopenRetryUs`). When `[robot]
+local_address` (or `--local-address IP`) pins a specific local IPv4 address that
+is not yet on the host at startup (`EADDRNOTAVAIL` / `ENETUNREACH`), the bridge
+starts with the socket closed and retries opening it on that same 100000 µs
+cadence without falling back to `0.0.0.0`. While it is closed nothing is sent or
 received, so the RoboRIO neutralizes at its command timeout and `/hw/status`
 `state_age_us` grows, as for an unplugged cable; with no route to the
 RoboRIO at all, each new socket's open fails and is retried on that
-cadence. Any other send error (`ECONNREFUSED` while the RoboRIO program is
-down, for one) keeps the socket, and the failed send's duty is retried
+cadence. Any other send or receive error (`ECONNREFUSED` while the RoboRIO
+program is down, for one) keeps the socket, and a failed send's duty is retried
 1000 µs later. The bridge prints the errno once per
 outage and one line when a send succeeds again; its exit line counts
 `send_failures` and `socket_reopens`. The RoboRIO program replaces its own
-socket by the same rule (`protocol::SendErrorNeedsNewSocket`), on its 100 ms
-open-retry cadence ([talOS/hardware](../talOS/hardware/README.md#roborio)).
+socket by the same rules (`protocol::SendErrorNeedsNewSocket` and
+`protocol::ReceiveErrorNeedsNewSocket`), on its 100 ms open-retry cadence
+([talOS/hardware](../talOS/hardware/README.md#roborio)).
 
 Camera observation timestamps describe exposure, not publication. Measure
 timestamp bias during [camera bring-up](BRINGUP.md#camera-intrinsics-calibration).
@@ -159,7 +171,7 @@ at 255), failed reads u32 (<!-- size: state.can_bus_bytes -->19 B). All of a rob
 (`hardware::kMaxCanBuses`: "rio" and three more), would not fit the
 headroom, so each State carries one, slot `sequence % count`, and the bridge
 assembles `/hw/status` `can_buses` from consecutive States
-(`CanBusTable`, `talOS/bridge/can_buses.h`); a bus's slot is refreshed every `count` States. A
+(`CanBusTable`, `talOS/hardware/can_buses.h`); a bus's slot is refreshed every `count` States. A
 decoder rejects a count above <!-- size: caps.can_buses -->4, an index at or past the count (or past 0
 when the count is 0), an unknown read state and a utilization that is not
 finite. Command prefix is four u64 + three u16 counts = <!-- size: command.prefix_bytes -->38.
@@ -234,7 +246,7 @@ At caps (<!-- size: ds.axes -->12 axes, <!-- size: ds.povs -->4 POVs, <!-- size:
 `40 + 31 + 31 + 6×96` = <!-- size: ds.max_payload_bytes -->**678 B**; empty strings/all disconnected is <!-- size: ds.empty_bytes -->**46 B**.
 The boot id is the one the same gateway stamps on its State; consumers order
 packets by sample/mode time only within one boot, start over on a new one, and
-ignore the last four retired boots (`talOS/bridge/boot_history.h`); the bridge
+ignore the last four retired boots (`talOS/hardware/boot_history.h`); the bridge
 forwards only packets of the boot its accepted State is in.
 Source: `talOS/driver_station/driver_station.h` and `.cc` (`Encode`).
 
@@ -299,7 +311,12 @@ bitmask and each reader's `wake_id`; neither changes a size.
 cannot revive an expired command by draining it. Latest-value subscriptions
 dispatch only the newest available message per drain and count skipped messages
 as dropped; per-message callbacks retain sequence delivery, capped at 64 messages
-per topic per drain by default. Dispatch scheduling latency remains separate.
+per topic per drain (`max_messages_per_tick`) by default. Before dispatching a
+due timer, the event loop repeats bounded sequence drains up to
+`(slots - 1) / max_messages_per_tick + 2` passes (one full ring plus one
+confirming pass) so a queued burst is caught up before `update()` runs while a
+continuously flooded topic stays bounded. Dispatch scheduling latency remains
+separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
@@ -307,13 +324,13 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/hw/command`: bridge → observers/logging | <!-- size: packet.slot_bytes -->1448 | <!-- size: packet.bytes -->1436 B Packet; merged Command occupied data 98 on the bench, ≤<!-- size: command.max_payload_bytes -->414 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | <!-- size: packet.slot_bytes -->1448 | <!-- size: packet.bytes -->1436 B Packet; DS occupied data <!-- size: ds.empty_bytes -->46–<!-- size: ds.max_payload_bytes -->678 |
 | `/hw/request/<node>`: device owner → bridge | <!-- size: packet.slot_bytes -->1448 | <!-- size: packet.bytes -->1436 B Packet; only that owner's actuator requests, not a full-capacity command |
-| `/hw/status`: bridge → telemetry/observers | <!-- size: bridge_status.slot_bytes -->272 | <!-- size: bridge_status.bytes -->264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`, and the u16 `protocol_version_id` (the bridge's `kProtocolVersion`) the padding after `gateway_build_dirty`; `can_buses` is four <!-- size: bridge_status.can_bus_bytes -->20 B `CanBusStatus` slots at the end. A shared-memory message, in no UDP payload: a change to it is not a hardware protocol change, but a change to its layout makes earlier sessions unreplayable into every node with devices ([replay after a schema change](../talOS/launcher/README.md#replay-after-a-schema-change)) |
+| `/hw/status`: bridge → telemetry/observers | <!-- size: bridge_status.slot_bytes -->312 | <!-- size: bridge_status.bytes -->304 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`, `alert_error_hardware_fault` and `alert_error_config_refused_enabled` fill the 2 B padding after `health_valid`, `alert_warning_can_bus_unread`, `can_bus_count` and `alert_error_protocol_mismatch` fill the 3 B padding after `brownout`, the u16 `protocol_version_id` (the bridge's `kProtocolVersion`) and u16 `mismatched_protocol_version_id` fill the padding after `gateway_build_dirty`, five u64 UDP/State loss counters (40 B) follow `clock_min_round_trip_us`, and `can_buses` is four <!-- size: bridge_status.can_bus_bytes -->20 B `CanBusStatus` slots at the end. A shared-memory message, in no UDP payload: a change to it is not a hardware protocol change, but a change to its layout makes earlier sessions unreplayable into every node with devices ([replay after a schema change](../talOS/launcher/README.md#replay-after-a-schema-change)) |
 | `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; the bench's motor/swerve_module payload 56/40 B (motor's 40 B MotorTarget pinned in the bench motor node), slots 64/48 B; the superstructure example's elevator/intake/superstructure 24/17/17 B, slots 32/32/32 B |
 | `/motor/state` (bench only): motor → telemetry/logs | 104 | 96 B MotorState including device temperature, supply current and limit switches; pinned in bench motor node |
 | `/swerve_module/state` (bench only): swerve_module → telemetry/logs | 128 | 120 B ModuleState: drive, steer and CANcoder feedback, the commanded setpoint and flags; pinned in `swerve_module.h` |
 | `/gyro/state` (bench only): gyro → telemetry/logs | 56 | 48 B GyroState: yaw, yaw rate, their ages and two flags, including padding; Python node, size pinned at import by `bench/main_processor/gyro/node_py_test.py` |
 | `/elevator/state` (examples/superstructure): elevator → superstructure/telemetry | 40 | 32 B demo.ElevatorStatus |
-| `/intake/state` (examples/superstructure): intake → superstructure/telemetry | 16 | 2 B demo.IntakeStatus |
+| `/intake/state` (examples/superstructure): intake → superstructure/telemetry | 16 | 3 B demo.IntakeStatus |
 | `/superstructure/state` (examples/superstructure): superstructure → telemetry | 16 | 1 B demo.SuperstructureStatus |
 | `/wrist/state` (examples/external_subsystem): wrist → logs | 32 | 24 B wrist.WristState |
 | `/<camera>/state`: a robot's camera node → a `new_subsystem --type estimator` node/telemetry | <!-- size: pose_observation.slot_bytes -->72 | <!-- size: pose_observation.bytes -->64 B geometry.PoseObservation, including padding |
@@ -321,7 +338,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/sim/state`: physics sim_gateway → telemetry and a robot's simulated sensors | <!-- size: odometry_sample.slot_bytes -->64 | <!-- size: odometry_sample.bytes -->56 B geometry.OdometrySample: sample_time_ns + Pose2d + Twist2d; 200 Hz, always valid while published; absent with ideal or WPILib/RoboRIO simulation |
 | `/talos/telemetry`: telemetry → studio_bridge | <!-- size: telemetry.slot_stride_bytes -->16392 × <!-- size: telemetry.slot_count -->64 slots | <!-- size: telemetry.dictionary_page_bytes -->16384 B byte payload capacity; ring = <!-- size: telemetry.ring_bytes -->1049088 B of slot storage; the writer overwrites, so a reader more than 63 pages behind (about 0.3 s at 100 Hz with the bench's two value pages a tick) is lapped and counts the missed pages, and a stalled reader never stops publication; the bridge never applies a tick it lost a page of |
 
-Sources: `talOS/hardware/packet.h`, `talOS/bridge/bridge_status.fbs`,
+Sources: `talOS/hardware/packet.h`, `talOS/hardware/status/bridge_status.fbs`,
 `talOS/devices/target.h`, `talOS/msgs/geometry.fbs`, the bench's
 `*_message.fbs` and the examples' `.fbs` files, and `talOS/telemetry/wire.h`;
 each size is the `message_bytes` the `--describe-only` graph (`graph.json`)
@@ -443,11 +460,12 @@ is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
 `log_dump` and `--replay-inputs` read every segment in a
 session directory, and given one log's file each
-reads that log's kept segments with it; `--replay-inputs` refuses to feed a
-node from a log whose `<log>.capped` marker exists (or whose member the
-session manifest marks `log_capped`), since no GAP record
-marks what the cap cost it (its oldest segment, or the records after
-capture stopped). Exact `--replay` refuses a log whose first
+reads that log's kept segments with it; by default `--replay-inputs` refuses to
+feed a node from a log whose `<log>.capped` marker exists (or whose member the
+session manifest marks `log_capped`), since no GAP record marks what the cap
+cost it (its oldest segment, or the records after capture stopped), while
+`--allow-capped-replay` replays from the start of the kept window with a
+warning stating the pre-window loss. Exact `--replay` refuses a log whose first
 dispatch is not 1, since a later segment starts mid-session. Rotation syncs each finished segment and the next one's header
 before renaming it into place, and the cap marker before deleting the oldest,
 so a power loss leaves whole segments; a session reader skips (with a
@@ -479,8 +497,8 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
-| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 129 | 2, 1864 B (largest 1168 / 1200 B) | 1 page, 8424 B |
-| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 136 | 2, 1952 B (largest 1168 / 1200 B) | 1 page, 8808 B |
+| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 143 | 2, 2032 B (largest 1168 / 1200 B) | 1 page, 9312 B |
+| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 150 | 2, 2120 B (largest 1168 / 1200 B) | 1 page, 9696 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):
@@ -521,7 +539,40 @@ message), none is sent to twice before
 every other one has been sent to once (`ClientRotation` in
 `studio/bridge/telemetry.h`). Messages differ in size, so a client whose
 next update is larger than another's can be passed over while the shared
-bucket holds the smaller one but not its own. A client that still has
+bucket holds the smaller one but not its own, up to **500 ms**
+(`kSharedReserveDelayNs`, `SharedReservation` in `studio/bridge/telemetry.h`):
+once a programmer client whose own bucket holds its pending message of framed
+size G ≤ 64,000 B (and whose socket has nothing buffered) has waited 500 ms
+specifically for the shared bucket, the bridge reserves the shared bucket for
+it — granting no bytes from the shared bucket to other programmer clients or
+to that client's own smaller feed — until the shared bucket refills to G and
+it sends (or until it disconnects, backs up, its own bucket can no longer
+afford G, or it no longer needs the send; messages above 64,000 B are never
+reserved, and drive clients use their own buckets and are never deferred).
+One waiting client's shared-bucket wait is therefore bounded independently of
+`max_clients` by
+
+0.5 s + G / R
+
+(**0.90 s** for a 64,000 B message at R = 160,000 B/s without a dashboard
+layout, **1.07 s** at R = 112,000 B/s with the default layout, **1.30 s** at
+the 80,000 B/s minimum programmer share; **0.75 s** / **0.86 s** for a
+40,000 B whole graph; **0.60 s** / **0.65 s** for a 16,394 B framed
+dictionary page), per individual message or dictionary page (a multi-page
+dictionary queues each page on its own wait), plus up to 1 ms of
+whole-millisecond timer rounding per wake (`us_timer_set` in
+`studio/bridge/main.cc`). When k programmer clients wait simultaneously on
+messages of framed sizes G₁, …, Gₖ ≤ G, they are served FIFO by wait start
+(tie-broken by rotation order), so every one of them sends within
+`0.5 s + (G₁ + … + Gₖ) / R ≤ 0.5 s + k × G / R` (**2.10 s** / **2.79 s** for
+all 4 default clients waiting on 64,000 B; **26.1 s** / **37.1 s** for all
+64), plus up to 1 ms wake rounding per hop. While a programmer client holds the
+shared reservation (up to `G / R`, or `k × G / R` across k queued waiters),
+other programmer clients' sends — including `talos.system_graph.deferred`
+notices (and the holder's own notices once its message blocks on the shared
+bucket) — pause while the shared bucket refills, so a programmer client can
+transiently observe graph staleness (`GRAPH_STALE_AFTER_MS` = 1 s) whenever
+that pause pushes silence past 1 s. A client that still has
 output buffered is held: it skips passes, and its telemetry resumes from the
 latest values once it drains. Being held never disconnects a client: the
 bridge sends nothing while output is buffered, so at most one graph message
@@ -556,13 +607,13 @@ joining client's 64,000 B dictionary and keyframe, takes several round trips,
 during which the client is held. HTTP snapshots and static files are outside
 this budget.
 
-160,000 B/s is **1.28 Mbit/s, 32 %** of the **4 Mbit/s** per-team field
-bandwidth limit that WPILib's networking documentation and the FMS whitepaper
-state, citing 2026 manual rule R704. Both the figure and the rule number are
-unverified against the 2026 manual text itself; the event's current
-allocation is authoritative. A full keyframe every tick of the bench's
-physics-simulation graph would be its 1952 B worst case (the telemetry
-table above), 195,200 B/s at 100 Hz, more than the whole budget; the
+160,000 B/s is **1.28 Mbit/s**: **18.3 %** of the **7.0 Mbit/s** per-team
+field bandwidth limit for Vivid Hosting VH-109 radios (and **32 %** of the
+**4.0 Mbit/s** limit for OpenMesh radios) in the 2026 FRC Game Manual
+(Section 8, Rule R704); the event's current allocation is authoritative. A full
+keyframe every tick of the bench's
+physics-simulation graph would be its 2120 B worst case (the telemetry
+table above), 212,000 B/s at 100 Hz, more than the whole budget; the
 change-only updates carry only what changed. The system graph goes to a
 client whole only on connect and when its structure changes; otherwise its
 fast values go at most every 500 ms when they changed
@@ -583,8 +634,9 @@ the 40,000 B/s share of 4 clients without a dashboard layout (**2.9 s** at
 the 28,000 B/s share with the default one), and **55.5 s** for a graph at the
 64,000 B burst at the 2,500 B/s share of `max_clients = 64` (**82.1 s** at
 its 1,750 B/s share with the default layout). The bound is on the client's own
-bucket: the shared bucket refills at the sum of every share, so it adds delay
-only while other clients spend bursts they saved, and a client whose socket
+bucket: once that bucket holds G, the shared bucket adds at most the
+reservation bound above (`0.5 s + G / R` for one waiting client, or
+`0.5 s + k × G / R` when k wait simultaneously), and a client whose socket
 still has output buffered is sent nothing until it drains. Telemetry keeps
 flowing beside the waiting graph, change-only, so the thinning skips samples,
 never values; while a graph waits, a reading goes stale only when one update costs more than
@@ -596,7 +648,8 @@ The cost falls on structure changes. A 40 KB whole graph is a second of a
 or restarts, that client's telemetry runs at four updates a second for about
 that long (at most the bound above) while the graph goes. A whole graph goes at most every 2 s: in
 a crash loop, a client's graph shows restarts up to 2 s late (marked
-deferred, not stale), and its telemetry is thinned for about a second of
+deferred, not stale, except when a shared-bucket reservation pauses notices
+past 1 s), and its telemetry is thinned for about a second of
 every two.
 
 The value-page cap leaves room under a normal MTU, but TCP is a byte stream:
@@ -639,3 +692,38 @@ immediate timeout. The maximum frame fits the IPv4 MTU without fragmentation.
 
 The device caps are a hard one-datagram budget: State has <!-- size: state.headroom_bytes -->**13 B**
 worst-case payload headroom.
+
+### State frame growth
+
+**Supported device scope (owner decision 2026-11-21):** talOS supports CTRE
+Phoenix 6 CAN devices (`TalonFX`, `CANcoder`, `Pigeon2`) plus RoboRIO onboard
+I/O (`DIO`, `AnalogInput`, `Encoder`, `PWM`). REV devices, pneumatics,
+addressable LEDs, and CANrange are explicitly out of scope.
+
+**Current single-frame budget:** A fully populated State payload is
+`84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 47` =
+<!-- size: state.max_payload_bytes -->**1,419 B** at the current caps
+(<!-- size: caps.motors -->16 motors, <!-- size: caps.sensors -->12 CAN
+sensors, <!-- size: caps.digital_inputs -->8 DI,
+<!-- size: caps.digital_outputs -->4 DO,
+<!-- size: caps.analog_inputs -->4 AI, <!-- size: caps.encoders -->4 encoders,
+<!-- size: caps.pwm_outputs -->4 PWM) out of `kMaxPayloadSize` =
+<!-- size: frame.max_payload_bytes -->1,432 B
+(<!-- size: state.headroom_bytes -->**13 B** headroom;
+<!-- size: state.max_frame_bytes -->1,459 B ≤
+<!-- size: frame.max_bytes -->1,472 B Ethernet IPv4/UDP MTU). A 17th motor
+(+<!-- size: state.motor_bytes -->45 B) or any new device kind exceeding the
+13 B headroom therefore cannot fit in one State datagram.
+
+**Growth design (if a robot needs >16 motors or a new device kind; no wire
+change today):** Carry State as multi-frame, tick-coherent chunks carrying
+`frame_index` / `frame_count` keyed by `(boot_id, sequence)` — following the
+same payload-level chunking and reassembly pattern as `ConfigChunkHeader` /
+`ConfigAssembler` (`talOS/hardware/config_wire.h`, `talOS/hardware/endpoint.h`).
+Changing the wire layout bumps `protocol::kProtocolVersion`
+([protocol version](#protocol-version), [RULES.md 9](../RULES.md)). On the
+main processor, `HardwareNode` assembles all chunks for a `(boot_id, sequence)`
+tick before publishing `/hw/state` (sizing `hardware::Packet` for the
+reassembled payload) and drops any incomplete older tick as soon as a newer
+`(boot_id, sequence)` arrives or expires, bounding partial-tick drop so halves
+from different ticks never mix.

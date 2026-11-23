@@ -43,19 +43,31 @@ decoding. Clock probes do not authorize actuation and work while disabled.
   on macOS, which alone covers an SDK without `MSG_NOSIGNAL`): a socket that can no longer send fails it with `kSocketError` and
   the errno in `stats().last_send_error`, and `Reopen()` replaces the socket
   on the same addresses and ports, keeping the send sequence and stats.
-  `SendErrorNeedsNewSocket(errno)` tells an error only a new socket clears
-  from one the network clears on the same socket; both ends decide with it.
-  A new socket is needed for `EPIPE` (shut down, or a socket macOS marked
-  defunct around sleep and wake), `ENOTCONN`, `EDESTADDRREQ`, `EBADF`, and a
-  source address that left the host: `connect()` fixed the source, so after
-  an address change (a new DHCP lease, a link that re-addresses) every send
-  on the old socket fails, on Linux with `ENETUNREACH` and on macOS with
+  `SendErrorNeedsNewSocket(errno)` tells a send error only a new socket clears
+  from one the network clears on the same socket, and
+  `ReceiveErrorNeedsNewSocket(errno)` does the same for `TryReceive()`
+  (`stats().last_recv_error`); both ends decide with them.
+  A new socket is needed on send for `EPIPE` (shut down, or a socket macOS
+  marked defunct around sleep and wake), `ENOTCONN`, `EDESTADDRREQ`, `EBADF`,
+  `ENOTSOCK`, and a source address that left the host: `connect()` fixed the
+  source, so
+  after an address change (a new DHCP lease, a link that re-addresses) every
+  send on the old socket fails, on Linux with `ENETUNREACH` and on macOS with
   `EADDRNOTAVAIL`, while a new socket sends from the new address
   (`udp_address_change_test`). `ENETUNREACH` also means no route at all; a new
   socket's `connect()` then fails the same way, and the caller retries the
-  open on its cadence, as at boot. The socket is kept for `ECONNREFUSED`,
-  `ENETDOWN`, `EHOSTUNREACH` and `ENOBUFS`, which clear on it (Windows: the
-  `WSAE` equivalents).
+  open on its cadence, as at boot. On receive, `ReceiveErrorNeedsNewSocket`
+  replaces the socket for `EBADF`, `ENOTCONN`, `ENOTSOCK`, `EPIPE`,
+  `ENETUNREACH` and `EADDRNOTAVAIL`, and keeps it for transient errors such as
+  `ECONNREFUSED`, `EAGAIN`, `EWOULDBLOCK` and `EINTR`. On send, the socket is
+  kept for `ECONNREFUSED`, `ENETDOWN`, `EHOSTUNREACH` and `ENOBUFS`, which
+  clear on it (Windows: the `WSAE` equivalents).
+  When `Open()` is given a specific IPv4 `local_address` (rather than
+  `"0.0.0.0"` or `""`), `bind()` requires that address to be present on the
+  host (failing with `EADDRNOTAVAIL` while absent instead of falling back to
+  `0.0.0.0`), and `Reopen()` binds the same address again so a second
+  interface on the host cannot hijack the socket's source address
+  (`udp_address_change_test`).
   The bridge's use of it is in the
   [data-flow reference](../../docs/DATA_FLOW.md#link-rates-and-endpoints), the
   RoboRIO program's in [talOS/hardware](../hardware/README.md#roborio).

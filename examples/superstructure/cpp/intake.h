@@ -8,6 +8,8 @@
 
 namespace demo {
 
+static_assert(sizeof(IntakeStatus) == 3);
+
 // Roller + beam break, as a talos::mechanisms::RollerWithSensor named
 // "roller": [motors.roller], and its [roller] parameters (voltages, eject
 // time, the beam break's device name) in intake.toml. Pulls a piece in,
@@ -34,7 +36,8 @@ class Intake {
       roller_.stop();
     }
     roller_.update();
-    status_.send(IntakeStatus{ToState(roller_.phase()), roller_.has_piece()});
+    status_.send(IntakeStatus{ToState(roller_.phase()), roller_.has_piece(),
+                              roller_.sensor_connected()});
   }
 
  private:

@@ -8,6 +8,7 @@
 
 #include <Eigen/Dense>
 #include <cmath>
+#include <limits>
 #include <random>
 
 #include "talOS/geometry/lie.h"
@@ -224,6 +225,27 @@ TEST(SE3, ExpLogRoundTrip) {
     const SE3<double> x = SE3<double>::Exp(tau);
     EXPECT_TRUE(SE3<double>::Exp(x.Log()).matrix().isApprox(x.matrix(), 1e-6));
   }
+  // Near-pi and exact-pi rotations: LeftVInverse stays finite and accurate
+  // without 0/0 cancellation in (1 + cos theta) / (2 theta sin theta).
+  for (const double angle : {kPi - 1e-7, kPi - 1e-8, kPi - 1e-12, kPi}) {
+    SCOPED_TRACE(angle);
+    for (int i = 0; i < 20; ++i) {
+      const Eigen::Vector3d axis = RandomAxis(rng);
+      const Eigen::Vector3d w = angle * axis;
+      const Eigen::Matrix3d v_inv = SE3<double>::LeftVInverse(w);
+      ASSERT_TRUE(v_inv.allFinite());
+      EXPECT_TRUE((SE3<double>::LeftV(w) * v_inv)
+                      .isApprox(Eigen::Matrix3d::Identity(), 1e-11));
+
+      const SE3<double> x(SO3<double>::Exp(w), Eigen::Vector3d(1.0, -2.0, 3.0));
+      const Eigen::Matrix<double, 6, 1> log_x = x.Log();
+      ASSERT_TRUE(log_x.allFinite());
+      const SE3<double> recovered = SE3<double>::Exp(log_x);
+      EXPECT_TRUE(recovered.matrix().isApprox(x.matrix(), 1e-10))
+          << "diff:\n"
+          << (recovered.matrix() - x.matrix());
+    }
+  }
   // boxplus/boxminus round-trip.
   for (int i = 0; i < 200; ++i) {
     const SE3<double> a = RandomSE3(rng);
@@ -294,9 +316,15 @@ TEST(SE2, DiscretizeMatchesIndependentLogOracle) {
                             1e-13));
   EXPECT_TRUE(SE2<double>::Discretize(1.0, -0.5, 0.0, 0.02)
                   .isApprox(Eigen::Vector3d(0.0, 1.0, -0.5), 1e-15));
-  for (const double period : {0.0, -0.1}) {
-    EXPECT_TRUE(SE2<double>::Discretize(1.0, -0.5, 2.0, period)
-                    .isApprox(Eigen::Vector3d(2.0, 1.0, -0.5), 1e-15));
+  for (const double period :
+       {0.0, -0.1, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity()}) {
+    const Eigen::Vector3d twist =
+        SE2<double>::Discretize(1.0, -0.5, 2.0, period);
+    EXPECT_TRUE(twist.allFinite()) << period;
+    EXPECT_TRUE(twist.isApprox(Eigen::Vector3d(2.0, 1.0, -0.5), 1e-15))
+        << period;
   }
 }
 
@@ -364,6 +392,32 @@ TEST(SE2, AdjointAndRightJacobian) {
           (2.0 * h);
     }
     EXPECT_TRUE(SE2<double>::RightJacobianOfExp(tau).isApprox(fd, 1e-6));
+  }
+}
+
+// REQ-CONTRACT-01: SO3::RightJacobianOfExp and SE3::LeftV must avoid
+// catastrophic cancellation near sqrt(eps) where theta >= sqrt(eps) but
+// theta^2 < sqrt(eps).
+TEST(SO3, SmallAngleRightJacobianAndSE3LeftVAvoidCancellation) {
+  for (const double theta : {1.5e-8, 5e-8, 1e-7, 1e-6, 1e-5, 1e-4}) {
+    SCOPED_TRACE(theta);
+    const double c = theta / std::sqrt(2.0);
+    const Eigen::Vector3d w(c, c, 0.0);
+    const double theta_sq = theta * theta;
+    const double expected_a = 0.5 - theta_sq / 24.0;
+    const double expected_b = 1.0 / 6.0 - theta_sq / 120.0;
+
+    const Eigen::Matrix3d jr = SO3<double>::RightJacobianOfExp(w);
+    const double jr_a = -jr(0, 2) / c;
+    const double jr_b = jr(0, 1) / (c * c);
+    EXPECT_NEAR(jr_a, expected_a, 1e-10);
+    EXPECT_NEAR(jr_b, expected_b, 1e-10);
+
+    const Eigen::Matrix3d lv = SE3<double>::LeftV(w);
+    const double lv_a = lv(0, 2) / c;
+    const double lv_b = lv(0, 1) / (c * c);
+    EXPECT_NEAR(lv_a, expected_a, 1e-10);
+    EXPECT_NEAR(lv_b, expected_b, 1e-10);
   }
 }
 

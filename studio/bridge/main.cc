@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "drive.h"
+#include "static_files.h"
 #include "system.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/describe.h"
@@ -42,6 +43,8 @@ extern "C" {
 namespace fs = std::filesystem;
 namespace {
 using studio::EgressBudget;
+using studio::kLiveCacheControl;
+using studio::LinkedOut;
 struct Client {
   // A programmer client's own bucket. A drive client is charged to its
   // slot's (studio::DriveSlots::Budget), which outlives the connection.
@@ -54,12 +57,9 @@ struct Client {
   studio::ClientFeeds feeds;
   studio::DriveFeed drive_feed;
 };
-// Static files and the manifest are read synchronously on the loop thread
-// that also polls RTMS, so each is capped. The static cap is a few times the
-// built Studio bundle's largest asset; the manifest cap is Studio's own
-// MAX_MANIFEST_BYTES (studio/src/data/manifest.ts), which rejects anything
-// larger anyway.
-constexpr std::uintmax_t kMaxStaticFileBytes = std::uintmax_t{4} * 1024 * 1024;
+// The manifest is read synchronously on the loop thread that also polls RTMS,
+// so it is capped at Studio's own MAX_MANIFEST_BYTES
+// (studio/src/data/manifest.ts), which rejects anything larger anyway.
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
 // The manifest's bytes, or "" when it is absent, unreadable or over the cap.
 std::string ReadManifest(const std::string& path) {
@@ -121,6 +121,9 @@ struct Bridge {
   std::string attach_error;
   // Every send to a client leaves in one of its passes (pass_clients).
   studio::ClientRotation<Socket*> clients;
+  // Reserves the shared programmer bucket for a client waiting past
+  // kSharedReserveDelayNs for a large message (studio::SharedReservation).
+  studio::SharedReservation<Socket*> shared_reservation;
   us_listen_socket_t* listener = nullptr;
   // ws_drops counts messages the socket refused; that client is then
   // resynchronized (the whole graph, a telemetry keyframe). A graph or
@@ -156,11 +159,30 @@ struct Bridge {
   std::string manifest_path;
   std::vector<talos::introspect::NodeSnapshot> registry_nodes;
   bool registry_read = false;  // the last refresh could open the registry
+  bool refusal_mode = false;   // --refusal-file: serving a phase-1 refusal
   std::string drive_summary;
   std::uint64_t evicted = 0;
   // Returns from the event loop's wait (every one, whatever woke it), and of
   // them the ones a telemetry publication or a deadline timer woke.
   std::uint64_t wakes = 0, publication_wakes = 0, deadline_wakes = 0;
+  // Live registry claim (claimed only when --session-id is nonzero, as the
+  // launcher passes; standalone runs leave the registry untouched) and the
+  // monotonic pass counter published as dispatch_count so the launcher's
+  // liveness check detects a hung bridge (REQ-OPS-30).
+  std::uint64_t session_id = 0;
+  std::uint64_t loop_passes = 0;
+  std::optional<talos::introspect::NodeRegistration> registration;
+
+  void report_registration() {
+    if (!registration) return;
+    registration->begin_sample();
+    registration->heartbeat();
+    registration->set_dispatch_count(loop_passes);
+    registration->set_source(0, forwarded,
+                             lapped + telemetry_state.incomplete_ticks,
+                             queue ? queue->writer_sequence() : 0, 0, 0, 0);
+    registration->end_sample();
+  }
 
   Bridge() = default;
   Bridge(const Bridge&) = delete;
@@ -246,14 +268,36 @@ struct Bridge {
   // sees the buckets at one level, so a refill landing between two clients
   // cannot hand the turn of one that could not yet afford a message to a
   // later one with a message of the same size.
-  bool affordable(Socket* client, std::size_t framed_bytes, std::int64_t now) {
+  bool affordable(
+      Socket* client, std::size_t framed_bytes, std::int64_t now,
+      studio::ClientFeeds::Feed feed = studio::ClientFeeds::Feed::kGraph) {
     Client* data = client->getUserData();
     EgressBudget* budget = budget_of(client);
     // An evicted drive client holds no slot and is sent nothing more.
     if (budget == nullptr) return false;
+    if (data->drive) {
+      std::int64_t wait_ns = 0;
+      if (!egress.Affordable(*budget, true, framed_bytes, now, wait_ns)) {
+        schedule.Deferred(now, wait_ns);
+        return false;
+      }
+      if (client->getBufferedAmount() != 0) {
+        ++held;
+        return false;
+      }
+      return true;
+    }
+    if (!shared_reservation.MaySpend(client, framed_bytes, *budget,
+                                     client_rate(), now)) {
+      return false;
+    }
+    const bool fits_own = budget->available(framed_bytes, client_rate(), now);
     std::int64_t wait_ns = 0;
-    if (!egress.Affordable(*budget, data->drive, framed_bytes, now, wait_ns)) {
+    if (!egress.Affordable(*budget, false, framed_bytes, now, wait_ns)) {
       schedule.Deferred(now, wait_ns);
+      if (fits_own && client->getBufferedAmount() == 0) {
+        shared_reservation.BlockedOnShared(client, framed_bytes, feed);
+      }
       return false;
     }
     if (client->getBufferedAmount() != 0) {
@@ -279,7 +323,9 @@ struct Bridge {
       return false;
     }
     const auto size = EgressBudget::framed(bytes.size());
-    egress.Spend(*budget, client->getUserData()->drive, size);
+    const bool is_drive = client->getUserData()->drive;
+    egress.Spend(*budget, is_drive, size);
+    if (!is_drive) shared_reservation.OnSend(client);
     egress_bytes += size;
     return true;
   }
@@ -309,38 +355,41 @@ struct Bridge {
     }
     data->feeds.Pump(
         system_graph, telemetry_state, now_ns, client_rate(),
-        [this, client, now_ns](std::size_t framed_bytes) {
-          return affordable(client, framed_bytes, now_ns);
+        [this, client, now_ns](std::size_t framed_bytes,
+                               studio::ClientFeeds::Feed feed) {
+          return affordable(client, framed_bytes, now_ns, feed);
         },
         [this, client](std::string_view text) {
           return send_now(client, text, uWS::OpCode::TEXT);
         },
         [this, client](std::string_view page) {
           return send_now(client, page, uWS::OpCode::BINARY);
-        });
+        },
+        shared_reservation.PreferTelemetry(client));
     return egress_bytes != charged;
   }
 
   // Offers every client what is due: each drive client, whose own bucket
-  // nobody else spends, then the programmer clients in rotation
-  // (studio::ClientRotation).
+  // nobody else spends, then the programmer clients in rotation with shared
+  // bucket reservation (studio::ClientRotation, studio::SharedReservation).
   void pass_clients() {
     const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
     for (Socket* client : drive_clients.clients()) pump(client, now_ns);
-    clients.Pass(
-        [this, now_ns](Socket* client) { return pump(client, now_ns); });
+    shared_reservation.Pass(clients, now_ns, [this, now_ns](Socket* client) {
+      return pump(client, now_ns);
+    });
   }
 
   // A client's output drained: a drive client is offered what is due at
-  // once; a programmer client gets a pass, which offers it its turn
-  // (studio::ClientRotation::Drained).
+  // once; a programmer client gets a pass, which offers it its turn behind
+  // any reserved or earlier client.
   void drained(Socket* client) {
     const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
     if (client->getUserData()->drive) {
       pump(client, now_ns);
       return;
     }
-    clients.Drained(client, [this, now_ns](Socket* offered) {
+    shared_reservation.Pass(clients, now_ns, [this, now_ns](Socket* offered) {
       return pump(offered, now_ns);
     });
   }
@@ -393,9 +442,16 @@ struct Bridge {
     if (layout && !drive_clients.clients().empty()) refresh_drive_summary();
 
     // The bridge is a participant, not a neutral observer: it holds a reader
-    // slot on the telemetry topic. Leaving itself out made that topic report
-    // "published but nobody reads it", which is exactly the fault the topic
-    // view exists to surface -- a false one is worse than none.
+    // slot on the telemetry topic. Replace its own live registry row with
+    // self(), which carries exact forwarded/lapped/sequence counters and keeps
+    // studio_bridge visible even when the registry is unavailable, without
+    // duplicating studio_bridge in /system.json.
+    const auto own_pid = static_cast<std::uint64_t>(::getpid());
+    std::erase_if(input.nodes,
+                  [own_pid](const talos::introspect::NodeSnapshot& node) {
+                    return node.pid == own_pid &&
+                           node.name == studio::kStudioBridgeNodeName;
+                  });
     input.nodes.push_back(self());
 
     system_graph = studio::BuildSystemGraph(input);
@@ -417,12 +473,13 @@ struct Bridge {
     // tells the two message families apart by frame type.
   }
 
-  // This process as the registry would have described it, had it a slot.
+  // This process as /system.json reports it, carrying exact bridge counters.
   talos::introspect::NodeSnapshot self() const {
     talos::introspect::NodeSnapshot node;
     node.name = studio::kStudioBridgeNodeName;
     node.target = "//studio/bridge:studio_bridge";
     node.pid = static_cast<std::uint64_t>(::getpid());
+    node.session_id = session_id;
     node.start_wall_ns = started_wall_ns;
     node.heartbeat_monotonic_ns = talos::introspect::monotonic_now_ns();
     node.alive = true;
@@ -447,55 +504,62 @@ struct Bridge {
   }
 
   // Reads what the topic holds, up to a page budget (`backlog` when it stops
-  // there), and brings every client toward it.
-  void poll() {
+  // there).
+  void read_queue() {
     backlog = false;
-    if (queue) {
-      // Bound work so HTTP and client socket processing cannot starve.
-      for (unsigned count = 0;; ++count) {
-        if (count == 256) {
-          backlog = true;
-          break;
-        }
-        MessageInfo info;
-        const auto result = queue->read_next(reader, frame, info);
-        if (result == ReadResult::TORN) {
-          ++invalid;
-          continue;
-        }
-        if (result != ReadResult::OK) break;
-        lapped += info.dropped;
-        auto bytes = talos::telemetry_wire::payload(frame);
-        if (bytes.empty()) {
-          ++invalid;
-          continue;
-        }
-        const bool had_frame = telemetry_state.has_frame;
-        const std::uint64_t sequence = telemetry_state.sequence_id;
-        if (!studio::IngestTelemetry(telemetry_state, bytes,
-                                     talos::introspect::monotonic_now_ns())) {
-          ++invalid;
-          continue;
-        }
-        if (telemetry_state.has_frame &&
-            (!had_frame || telemetry_state.sequence_id != sequence)) {
-          ++forwarded;
-        }
+    if (!queue) return;
+    // Bound work so HTTP and client socket processing cannot starve.
+    for (unsigned count = 0;; ++count) {
+      if (count == 256) {
+        backlog = true;
+        break;
+      }
+      MessageInfo info;
+      const auto result = queue->read_next(reader, frame, info);
+      if (result == ReadResult::TORN) {
+        ++invalid;
+        continue;
+      }
+      if (result != ReadResult::OK) break;
+      lapped += info.dropped;
+      auto bytes = talos::telemetry_wire::payload(frame);
+      if (bytes.empty()) {
+        ++invalid;
+        continue;
+      }
+      const bool had_frame = telemetry_state.has_frame;
+      const std::uint64_t sequence = telemetry_state.sequence_id;
+      if (!studio::IngestTelemetry(telemetry_state, bytes,
+                                   talos::introspect::monotonic_now_ns())) {
+        ++invalid;
+        continue;
+      }
+      if (telemetry_state.has_frame &&
+          (!had_frame || telemetry_state.sequence_id != sequence)) {
+        ++forwarded;
       }
     }
-    // Every pass, not only on a new tick: a pass woken by the budget's refill
-    // or a client's heartbeat (next_wake_ns) sends what is due.
-    pass_clients();
   }
 
   // One pass of the loop, whatever woke it: the wake channel's protocol
   // (drain, read until empty, arm, and read again while an arm finds a
   // page), the segment check, the graph refresh, and every client's due
-  // sends. Each client is sent its changed counters at most every
-  // GraphFeed::kUpdateNs (or a deferral notice), so Studio keeps measuring
-  // node rates from successive graphs' counters and never marks a merely
-  // deferred graph stale.
+  // sends. Arming before pass_clients() writes to client sockets ensures a
+  // publication arriving while clients are pumped wakes the next wait rather
+  // than racing an unarmed reader. Each client is sent its changed counters
+  // at most every GraphFeed::kUpdateNs (or a deferral notice), so Studio
+  // keeps measuring node rates from successive graphs' counters and does not
+  // mark a merely rate-deferred graph stale unless a shared-bucket
+  // reservation pauses notices past Studio's staleness threshold
+  // (docs/DATA_FLOW.md).
   void service(std::int64_t now_ns) {
+    if (refusal_mode) {
+      schedule.BeginPass();
+      pass_clients();
+      ++loop_passes;
+      report_registration();
+      return;
+    }
     if (wake) wake->drain();
     watch(now_ns);
     schedule.BeginPass();
@@ -505,25 +569,40 @@ struct Bridge {
       schedule.refreshed_ns = now_ns;
       refresh_system();
     }
-    poll();
-    if (!queue || !wake) return;
-    // Three tries: a slot this queue no longer holds never arms, and must
-    // not make the loop spin; it falls back to reading every kFallbackNs.
-    for (int attempt = 0; !backlog; ++attempt) {
-      if (queue->arm_wake(reader)) return;
-      if (attempt == 2) {
-        backlog = true;
-        return;
+    read_queue();
+    if (queue && wake) {
+      // Three tries: a slot this queue no longer holds never arms, and must
+      // not make the loop spin; it falls back to reading every kFallbackNs.
+      for (int attempt = 0; !backlog; ++attempt) {
+        if (queue->arm_wake(reader)) break;
+        if (attempt == 2) {
+          backlog = true;
+          break;
+        }
+        read_queue();
       }
-      poll();
     }
+    // Every pass, not only on a new tick: a pass woken by the budget's refill
+    // or a client's heartbeat (next_wake_ns) sends what is due.
+    pass_clients();
+    ++loop_passes;
+    report_registration();
   }
 
   // When the loop must next run with no socket event or publication
   // (studio::WakeSchedule::NextWakeNs).
   std::int64_t next_wake_ns(std::int64_t now_ns) const {
+    if (refusal_mode) {
+      std::int64_t due = now_ns + 1'000'000'000;
+      for (Socket* client : drive_clients.clients()) {
+        const std::int64_t next = client->getUserData()->drive_feed.NextDueNs();
+        if (next < due) due = next;
+      }
+      return std::max(due, now_ns + 1'000'000);
+    }
     return schedule.NextWakeNs(now_ns, !wake || backlog, system_graph,
                                [this](const auto& visit) {
+                                 visit(shared_reservation);
                                  for (Socket* client : clients.clients())
                                    visit(client->getUserData()->feeds);
                                  for (Socket* client : drive_clients.clients())
@@ -558,55 +637,6 @@ T* WatchedUser(us_internal_callback_t* callback) {
   std::memcpy(bytes.data(), callback + 1, bytes.size());
   return static_cast<T*>(std::bit_cast<void*>(bytes));
 }
-// Cache-Control (REQ-OPS-34). Studio's Vite build names every asset it
-// emits under assets/ `<name>-<hash>.<ext>`, the hash eight characters of
-// base64url (Rollup's default; its alphabet includes '-' and '_'): such a
-// file never changes under its name, so a browser keeps it for a year.
-// Every other static file, index.html and drive.html above all, is
-// revalidated on each load (`no-cache`), so a deploy's new page and the
-// asset names it carries are seen at once. The JSON the bridge generates
-// (or re-reads, like the manifest) is a live snapshot with no validator to
-// revalidate against, so it is never stored (`no-store`).
-constexpr std::string_view kImmutableCacheControl =
-    "public, max-age=31536000, immutable";
-constexpr std::string_view kRevalidateCacheControl = "no-cache";
-constexpr std::string_view kLiveCacheControl = "no-store";
-constexpr std::size_t kAssetHashChars = 8;
-
-// Whether `relative` (a path under the webroot) is a content-hashed asset.
-bool ContentHashed(const fs::path& relative) {
-  auto part = relative.begin();
-  if (part == relative.end() || *part != "assets") return false;
-  if (++part == relative.end()) return false;
-  const fs::path& name = *part;
-  if (++part != relative.end()) return false;  // not directly under assets/
-  const std::string stem = name.stem().string();
-  if (name.extension().empty() || stem.size() < kAssetHashChars + 2 ||
-      stem[stem.size() - kAssetHashChars - 1] != '-') {
-    return false;
-  }
-  return std::all_of(stem.end() - kAssetHashChars, stem.end(), [](char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '-' || c == '_';
-  });
-}
-
-std::string_view CacheControl(const fs::path& relative) {
-  return ContentHashed(relative) ? kImmutableCacheControl
-                                 : kRevalidateCacheControl;
-}
-
-std::string mime(const fs::path& p) {
-  auto ext = p.extension().string();
-  if (ext == ".html") return "text/html; charset=utf-8";
-  if (ext == ".js") return "text/javascript";
-  if (ext == ".css") return "text/css";
-  if (ext == ".json") return "application/json";
-  if (ext == ".svg") return "image/svg+xml";
-  if (ext == ".wasm") return "application/wasm";
-  return "application/octet-stream";
-}
-
 // Where to build the pages is known only to whoever made the webroot: a
 // robot repository's `studio_webroot` (webroot.bzl) leaves NOT_BUILT.txt
 // there naming the talOS checkout its `studio_web` reads, and its first line
@@ -624,23 +654,6 @@ std::string NotBuiltCommand(const fs::path& webroot) {
   return "build them with `bazel build //studio:web_dist` in the talOS "
          "checkout this workspace uses (talOS itself, or the one a robot "
          "repository's MODULE.bazel `talos` override names)";
-}
-
-// Where `page`, a file name in the webroot, resolves when it is a regular
-// file there that links out of the webroot's real tree (empty otherwise).
-// The bridge serves only files inside that tree, so such a page is present
-// but never served: a sandboxed Bazel test's runfiles stage each file of a
-// tree artifact as a link to the execroot. `bazel run` links the webroot
-// directory itself, and an installed bundle holds no links.
-fs::path LinkedOut(const fs::path& webroot, std::string_view page) {
-  std::error_code error;
-  const fs::path root = fs::weakly_canonical(webroot, error);
-  if (error) return {};
-  fs::path file = fs::weakly_canonical(root / page, error);
-  if (error || !fs::is_regular_file(file, error)) return {};
-  const fs::path relative = file.lexically_relative(root);
-  if (!relative.empty() && *relative.begin() != "..") return {};
-  return file;
 }
 
 // What `/` and `/drive` answer, 503, while the webroot holds no such page,
@@ -703,9 +716,9 @@ constexpr unsigned kMaxIdleTimeoutS = 960;
 int main(int argc, char** argv) try {
   // `--describe`: answer what this process is without touching shared memory,
   // sockets, or the HTTP port, so the launcher can probe this binary like any
-  // other node and carry it in the declared graph. `--config` and `--sim` are
-  // accepted and otherwise ignored, because the launcher probes every binary
-  // with the same flags.
+  // other node and carry it in the declared graph. `--config`, `--sim`, and
+  // `--session-id` are accepted and otherwise ignored, because the launcher
+  // probes every binary with the same flags.
   for (int i = 1; i < argc; ++i) {
     if (std::string_view(argv[i]) != "--describe") continue;
     const char* config_path = nullptr;
@@ -749,14 +762,58 @@ int main(int argc, char** argv) try {
   std::string declared_path;
   std::string manifest_path;
   std::string config_path;
+  std::string refusal_file;
+  std::string refusal_reason;
+  std::uint64_t session_id = 0;
+  bool bad_session_id = false;
   unsigned idle_timeout_s = kIdleTimeoutS;
   bool bad_idle_timeout = false;
+  const auto parse_session_id = [&](std::string_view value) {
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), session_id);
+    if (error != std::errc{} || end != value.data() + value.size()) {
+      bad_session_id = true;
+    }
+  };
   for (int i = 0; i < argc; ++i) {
     const std::string_view argument = argv[i];
     static constexpr std::string_view kDeclared = "--declared";
     static constexpr std::string_view kManifest = "--manifest";
+    static constexpr std::string_view kSessionId = "--session-id";
+    static constexpr std::string_view kRefusalFile = "--refusal-file";
+    static constexpr std::string_view kRefusalReason = "--refusal-reason";
     if (argument == "--config" && i + 1 < argc) {
       config_path = argv[++i];
+      continue;
+    }
+    if (argument == kRefusalFile && i + 1 < argc) {
+      refusal_file = argv[++i];
+      continue;
+    }
+    if (argument.starts_with(kRefusalFile) &&
+        argument.size() > kRefusalFile.size() &&
+        argument[kRefusalFile.size()] == '=') {
+      refusal_file = argument.substr(kRefusalFile.size() + 1);
+      continue;
+    }
+    if (argument == kRefusalReason && i + 1 < argc) {
+      refusal_reason = argv[++i];
+      continue;
+    }
+    if (argument.starts_with(kRefusalReason) &&
+        argument.size() > kRefusalReason.size() &&
+        argument[kRefusalReason.size()] == '=') {
+      refusal_reason = argument.substr(kRefusalReason.size() + 1);
+      continue;
+    }
+    if (argument == kSessionId && i + 1 < argc) {
+      parse_session_id(argv[++i]);
+      continue;
+    }
+    if (argument.starts_with(kSessionId) &&
+        argument.size() > kSessionId.size() &&
+        argument[kSessionId.size()] == '=') {
+      parse_session_id(argument.substr(kSessionId.size() + 1));
       continue;
     }
     if (argument == "--idle-timeout-s" && i + 1 < argc) {
@@ -796,16 +853,20 @@ int main(int argc, char** argv) try {
       std::any_of(args.begin() + 1, args.end(), [](const char* argument) {
         return std::string_view(argument).starts_with("--");
       });
-  if (count > 4 || unknown_option || bad_idle_timeout) {
+  if (count > 4 || unknown_option || bad_idle_timeout || bad_session_id) {
     std::cerr
         << "Usage: studio_bridge "
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
+           "       [--session-id ID]     launcher session id for live "
+           "registry (nonzero registers; default 0)\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
            "       [--manifest PATH]   the launcher's manifest.json, served at "
            "/manifest.json\n"
            "       [--config PATH]     reads [studio] max_clients and "
            "dashboard\n"
+           "       [--refusal-file PATH]  serve a launcher phase-1 refusal on "
+           "/drive\n"
            "       [--idle-timeout-s S]  client idle timeout, 8 to 960 "
            "(default 16)\n"
            "       [--describe]          print the --describe envelope and "
@@ -869,58 +930,80 @@ int main(int argc, char** argv) try {
   if (!missing_pages.empty()) std::cerr << MissingPage(webroot, missing_pages);
   Bridge bridge;
   bridge.topic = topic;
-  // Watched by segment name, not by topic. A topic like /talos/telemetry has
-  // an interior slash, which POSIX does not allow in an shm name, so RTMS maps
-  // it (`ShmObjectName`) before touching the OS. The bridge attaches only
-  // once the segment exists: an empty ring of its own would wait for a
-  // publisher that might disagree with its layout.
-  bridge.segment = ShmObjectName(topic);
-  try {
-    bridge.wake.emplace();
-  } catch (const std::exception& e) {
-    std::cerr << "no wake channel (" << e.what()
-              << "); reading the topic every 1 ms\n";
+  bridge.session_id = session_id;
+  bridge.refusal_mode = !refusal_file.empty() || !refusal_reason.empty();
+  if (!bridge.refusal_mode) {
+    // Watched by segment name, not by topic. A topic like /talos/telemetry has
+    // an interior slash, which POSIX does not allow in an shm name, so RTMS
+    // maps it (`ShmObjectName`) before touching the OS. The bridge attaches
+    // only once the segment exists: an empty ring of its own would wait for a
+    // publisher that might disagree with its layout.
+    bridge.segment = ShmObjectName(topic);
+    try {
+      bridge.wake.emplace();
+    } catch (const std::exception& e) {
+      std::cerr << "no wake channel (" << e.what()
+                << "); reading the topic every 1 ms\n";
+    }
   }
   if (!config_path.empty()) {
-    const auto robot = talos::config::ParseRobotConfig(config_path);
-    bridge.max_clients = robot.studio.max_clients;
-    // A layout that does not parse disables only the driver dashboard
-    // (/drive answers 404, nothing is reserved): Studio stays up, and the
-    // telemetry node refuses the same layout by name.
-    if (!robot.studio.dashboard.empty()) {
-      try {
-        bridge.layout =
-            talos::telemetry::ParseDashboardLayout(robot.studio.dashboard);
-      } catch (const std::exception& e) {
-        std::cerr << "driver dashboard disabled: " << e.what() << '\n';
+    try {
+      const auto robot = talos::config::ParseRobotConfig(config_path);
+      bridge.max_clients = robot.studio.max_clients;
+      // A layout that does not parse disables only the driver dashboard
+      // (/drive answers 404, nothing is reserved): Studio stays up, and the
+      // telemetry node refuses the same layout by name.
+      if (!robot.studio.dashboard.empty()) {
+        try {
+          bridge.layout =
+              talos::telemetry::ParseDashboardLayout(robot.studio.dashboard);
+        } catch (const std::exception& e) {
+          std::cerr << "driver dashboard disabled: " << e.what() << '\n';
+        }
       }
-    }
-    // The nodes the config launches: the hardware bridge, then each
-    // subsystem with a `node`, critical unless it says otherwise. The drive
-    // summary lists them only when there is no manifest, whose roster is
-    // the launcher's own; otherwise it takes only `critical` from here.
-    bridge.config_roster.push_back(
-        {std::string{talos::introspect::naming::kHardwareBridgeNode}, true});
-    if (const auto* subsystems = robot.toml_data["subsystems"].as_table()) {
-      bridge.config_roster.reserve(subsystems->size() + 1);
-      for (auto&& [key, value] : *subsystems) {
-        const auto* table = value.as_table();
-        if (table == nullptr || !table->contains("node")) continue;
-        bridge.config_roster.push_back(
-            {std::string{key.str()}, (*table)["critical"].value_or(true)});
+      // The nodes the config launches: the hardware bridge, then each
+      // subsystem with a `node`, critical unless it says otherwise. The drive
+      // summary lists them only when there is no manifest, whose roster is
+      // the launcher's own; otherwise it takes only `critical` from here.
+      bridge.config_roster.push_back(
+          {std::string{talos::introspect::naming::kHardwareBridgeNode}, true});
+      if (const auto* subsystems = robot.toml_data["subsystems"].as_table()) {
+        bridge.config_roster.reserve(subsystems->size() + 1);
+        for (auto&& [key, value] : *subsystems) {
+          const auto* table = value.as_table();
+          if (table == nullptr || !table->contains("node")) continue;
+          bridge.config_roster.push_back(
+              {std::string{key.str()}, (*table)["critical"].value_or(true)});
+        }
       }
+    } catch (const std::exception& e) {
+      if (!bridge.refusal_mode) throw;
+      std::cerr << "refusal mode: ignoring unparseable config " << config_path
+                << " (" << e.what() << ")\n";
     }
   }
   bridge.manifest_path = manifest_path;
+  if (bridge.refusal_mode) {
+    bridge.drive_summary =
+        studio::DriveSummaryJson(studio::BuildRefusalDriveSummary(
+            ReadManifest(refusal_file), refusal_reason));
+  }
+  const std::uint32_t drive_slot_count = bridge.layout
+                                             ? bridge.layout->drive_clients
+                                             : (bridge.refusal_mode ? 4u : 0u);
+  const std::uint32_t drive_budget = bridge.layout
+                                         ? bridge.layout->budget_bytes_per_s
+                                         : (bridge.refusal_mode ? 24000u : 0u);
   bridge.egress = studio::BridgeEgress(studio::EgressPlan::Of(
-      bridge.max_clients, bridge.layout ? bridge.layout->drive_clients : 0,
-      bridge.layout ? bridge.layout->budget_bytes_per_s : 0));
+      bridge.max_clients, drive_slot_count, drive_budget));
   if (bridge.layout) {
     bridge.layout_json = talos::telemetry::DashboardLayoutJson(*bridge.layout);
     bridge.drive_mask =
         studio::DriveMask(talos::telemetry::DriveFeedChannels(*bridge.layout));
-    bridge.drive_clients =
-        studio::DriveSlots<Socket*>(bridge.layout->drive_clients);
+    bridge.drive_clients = studio::DriveSlots<Socket*>(drive_slot_count);
+  } else if (bridge.refusal_mode) {
+    bridge.layout_json = std::string{studio::kRefusalDriveLayoutJson};
+    bridge.drive_clients = studio::DriveSlots<Socket*>(drive_slot_count);
   }
   uWS::App app;
   uWS::App::WebSocketBehavior<Client> behavior{};
@@ -969,6 +1052,7 @@ int main(int argc, char** argv) try {
   // so a client whose writes keep draining is not sent to twice in a turn.
   behavior.drain = [&](auto* ws) { bridge.drained(ws); };
   behavior.close = [&](auto* ws, int, std::string_view) {
+    bridge.shared_reservation.Remove(ws);
     bridge.clients.Remove(ws);
   };
   // The driver dashboard's feed (README.md "Driver dashboard feed"): outside
@@ -980,7 +1064,7 @@ int main(int argc, char** argv) try {
   drive_behavior.idleTimeout = behavior.idleTimeout;
   drive_behavior.sendPingsAutomatically = true;
   drive_behavior.upgrade = [&](auto* response, auto* request, auto* context) {
-    if (!bridge.layout) {
+    if (!bridge.layout && !bridge.refusal_mode) {
       response->writeStatus("404 Not Found")->end();
       return;
     }
@@ -990,8 +1074,9 @@ int main(int argc, char** argv) try {
         request->getHeader("sec-websocket-extensions"), context);
   };
   drive_behavior.open = [&](auto* ws) {
-    if (!bridge.layout) return;  // the upgrade refuses /drive without one
-    ws->getUserData()->drive_feed.Configure(bridge.layout->update_hz);
+    if (!bridge.layout && !bridge.refusal_mode) return;
+    ws->getUserData()->drive_feed.Configure(
+        bridge.layout ? bridge.layout->update_hz : 5);
     // It takes the bucket of the slot it fills, so a reconnect never
     // starts from a fresh burst (studio::DriveSlots).
     if (const auto oldest = bridge.drive_clients.Admit(ws).evicted) {
@@ -1011,7 +1096,7 @@ int main(int argc, char** argv) try {
     // The dictionary, a keyframe of the layout's channels and the summary
     // at once, the summary from the registry as it is now (the refresh
     // rebuilds it while a drive client is held).
-    bridge.refresh_system();
+    if (!bridge.refusal_mode) bridge.refresh_system();
     bridge.pass_clients();
   };
   drive_behavior.drain = [&](auto* ws) { bridge.drained(ws); };
@@ -1021,7 +1106,7 @@ int main(int argc, char** argv) try {
   app.ws<Client>("/telemetry", std::move(behavior));
   app.ws<Client>("/drive", std::move(drive_behavior));
   app.get("/drive/layout.json", [&](auto* res, auto*) {
-    if (!bridge.layout) {
+    if (!bridge.layout && !bridge.refusal_mode) {
       res->writeStatus("404 Not Found")->end();
       return;
     }
@@ -1029,6 +1114,17 @@ int main(int argc, char** argv) try {
         ->writeHeader("X-Content-Type-Options", "nosniff")
         ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(bridge.layout_json);
+  });
+  app.get("/drive/summary.json", [&](auto* res, auto*) {
+    if (!bridge.layout && !bridge.refusal_mode) {
+      res->writeStatus("404 Not Found")->end();
+      return;
+    }
+    if (!bridge.refusal_mode) bridge.refresh_drive_summary();
+    res->writeHeader("Content-Type", "application/json")
+        ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
+        ->end(bridge.drive_summary);
   });
   app.get("/telemetry.json", [&](auto* res, auto*) {
     // 503 until a dictionary and an aligned frame have both arrived: an
@@ -1059,7 +1155,9 @@ int main(int argc, char** argv) try {
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
         ->writeHeader("Cache-Control", kLiveCacheControl)
-        ->end(bridge.system_graph.json);
+        ->end(bridge.system_graph.json.empty()
+                  ? std::string_view{"{}"}
+                  : std::string_view{bridge.system_graph.json});
   });
   app.get("/declared.json", [&](auto* res, auto*) {
     // 404 rather than an empty document: "no declared graph was given" and "the
@@ -1105,53 +1203,39 @@ int main(int argc, char** argv) try {
         ->end(body);
   });
   app.get("/*", [&](auto* res, auto* req) {
-    auto url = std::string(req->getUrl());
-    // Reject encoded/ambiguous paths; serve only canonical descendants.
-    if (url.find('%') != url.npos || url.find('\\') != url.npos) {
+    const std::string_view url = req->getUrl();
+    // `/` is Studio and `/drive` the driver dashboard's page (a WebSocket
+    // upgrade of /drive is the feed, above).
+    const std::string_view mapped = url == "/"        ? "/index.html"
+                                    : url == "/drive" ? "/drive.html"
+                                                      : url;
+    const studio::StaticFileResult result =
+        studio::ReadStaticFile(webroot, mapped);
+    if (result.status == 200) {
+      res->writeHeader("Content-Type", result.content_type)
+          ->writeHeader("X-Content-Type-Options", "nosniff")
+          ->writeHeader("Cache-Control", result.cache_control)
+          ->end(result.body);
+      return;
+    }
+    if (result.status == 400) {
       res->writeStatus("400 Bad Request")->end();
       return;
     }
-    std::error_code error;
-    // `/` is Studio and `/drive` the driver dashboard's page (a WebSocket
-    // upgrade of /drive is the feed, above).
-    const std::string page = url == "/"        ? "index.html"
-                             : url == "/drive" ? "drive.html"
-                                               : url.substr(1);
-    const fs::path root = fs::weakly_canonical(webroot, error);
-    const fs::path file =
-        error ? fs::path{} : fs::weakly_canonical(root / page, error);
-    if (error) {
-      res->writeStatus("404 Not Found")->end();
-      return;
-    }
-    auto relative = file.lexically_relative(root);
-    if (relative.empty() || *relative.begin() == ".." ||
-        !fs::is_regular_file(file, error)) {
-      if (page == "index.html" || page == "drive.html") {
-        res->writeStatus("503 Service Unavailable")
-            ->writeHeader("Content-Type", "text/plain; charset=utf-8")
-            ->writeHeader("Cache-Control", kLiveCacheControl)
-            ->end(MissingPage(root, page));
-        return;
-      }
-      res->writeStatus("404 Not Found")->end();
-      return;
-    }
-    // Files are bounded; uWS owns buffered response bytes after end().
-    if (fs::file_size(file, error) > kMaxStaticFileBytes) {
+    if (result.status == 413) {
       res->writeStatus("413 Content Too Large")->end();
       return;
     }
-    std::ifstream input(file, std::ios::binary);
-    if (!input) {
-      res->writeStatus("404 Not Found")->end();
+    if (mapped == "/index.html" || mapped == "/drive.html") {
+      std::error_code error;
+      const fs::path root = fs::weakly_canonical(webroot, error);
+      res->writeStatus("503 Service Unavailable")
+          ->writeHeader("Content-Type", "text/plain; charset=utf-8")
+          ->writeHeader("Cache-Control", kLiveCacheControl)
+          ->end(MissingPage(error ? webroot : root, mapped.substr(1)));
       return;
     }
-    std::string body((std::istreambuf_iterator<char>(input)), {});
-    res->writeHeader("Content-Type", mime(file))
-        ->writeHeader("X-Content-Type-Options", "nosniff")
-        ->writeHeader("Cache-Control", CacheControl(relative))
-        ->end(body);
+    res->writeStatus("404 Not Found")->end();
   });
   // Exclusive: uSockets otherwise sets SO_REUSEPORT, and a second bridge of
   // the same user on this port (a developer's ./sim.sh on the robot
@@ -1169,6 +1253,37 @@ int main(int argc, char** argv) try {
                              std::to_string(http_port) +
                              " (another process holds it?)");
   }
+  // Only claim a live registry row when supervised by a launcher (--session-id
+  // nonzero) and not in refusal mode. Standalone and refusal runs leave the
+  // host registry untouched, and a supervised run fails fast if claiming fails
+  // instead of serving until the launcher kills it as heartbeat_missing
+  // (REQ-OPS-30).
+  if (bridge.session_id != 0 && !bridge.refusal_mode) {
+    try {
+      bridge.registration.emplace(talos::introspect::NodeRegistration::Identity{
+          .name = std::string{studio::kStudioBridgeNodeName},
+          .target = "//studio/bridge:studio_bridge",
+          .session_id = bridge.session_id,
+          .flags = 0,
+      });
+      talos::event::Registration source;
+      source.id = 0;
+      source.kind = talos::event::SourceKind::WATCHER;
+      source.name = bridge.topic;
+      source.message_bytes =
+          static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
+      source.alignment = 8;
+      source.schema = talos::schema::Bytes();
+      bridge.registration->publish(talos::event::Manifest{source});
+      bridge.registration->set_realtime(
+          {.tier = talos::process::LoopTier::kObserver});
+      bridge.report_registration();
+    } catch (const std::exception& e) {
+      throw std::runtime_error(
+          std::string{"studio_bridge: cannot claim node registry row: "} +
+          e.what());
+    }
+  }
   std::cout << "listening "
             << us_socket_local_port(
                    0, reinterpret_cast<us_socket_t*>(bridge.listener))
@@ -1178,12 +1293,20 @@ int main(int argc, char** argv) try {
   // wake channel's descriptor) or the timer, which is set before each wait
   // to the bridge's next duty (Bridge::next_wake_ns). Every return from the
   // wait ends in the post handler below, which makes the bridge's pass.
+  struct DeadlineTimerExt {
+    Bridge* bridge;
+    studio::DeadlineTimer* deadline;
+  };
+  studio::DeadlineTimer deadline_timer;
   auto* loop = reinterpret_cast<us_loop_t*>(uWS::Loop::get());
-  auto* timer = us_create_timer(loop, 0, sizeof(Bridge*));
+  auto* timer = us_create_timer(loop, 0, sizeof(DeadlineTimerExt));
   if (!timer) throw std::runtime_error("deadline timer allocation failed");
-  *static_cast<Bridge**>(us_timer_ext(timer)) = &bridge;
+  *static_cast<DeadlineTimerExt*>(us_timer_ext(timer)) = {&bridge,
+                                                          &deadline_timer};
   const auto on_deadline = [](us_timer_t* t) {
-    ++(*static_cast<Bridge**>(us_timer_ext(t)))->deadline_wakes;
+    auto* ext = static_cast<DeadlineTimerExt*>(us_timer_ext(t));
+    ++ext->bridge->deadline_wakes;
+    ext->deadline->OnFired();
   };
   us_poll_t* wake_poll = nullptr;
   if (bridge.wake) {
@@ -1200,7 +1323,6 @@ int main(int argc, char** argv) try {
     stop_poll =
         WatchReadable(loop, stop_fd, &bridge, [](us_internal_callback_t*) {});
   }
-  std::int64_t timer_due_ns = 0;
   bool stopping = false;
   const auto pass = [&] {
     if (stopping) return;
@@ -1233,12 +1355,8 @@ int main(int argc, char** argv) try {
     const std::int64_t next_ns = bridge.next_wake_ns(now_ns);
     // Set again only when it would fire too late, or has fired: one that
     // fires early costs a pass that finds nothing due.
-    if (timer_due_ns <= now_ns || next_ns < timer_due_ns) {
-      // Whole milliseconds, rounded up, so it never fires before the duty.
-      const auto ms =
-          static_cast<int>((next_ns - now_ns + 999'999) / 1'000'000);
-      us_timer_set(timer, on_deadline, ms, 0);
-      timer_due_ns = now_ns + std::int64_t{ms} * 1'000'000;
+    if (const auto ms = deadline_timer.ArmMs(now_ns, next_ns)) {
+      us_timer_set(timer, on_deadline, *ms, 0);
     }
   };
   pass();
