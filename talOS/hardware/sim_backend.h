@@ -61,7 +61,8 @@ class SimBackend final : public Backend {
       if (config_.motors[i].feedback == Feedback::kRemoteCANcoder) {
         for (const auto& sensor : config_.sensors) {
           if (sensor.id == config_.motors[i].feedback_sensor_id) {
-            samples_[i].position_rot = sensor.offset_rot;
+            samples_[i].position_rot =
+                sensor.offset_rot / SensorToMechanism(config_.motors[i]);
             break;
           }
         }
@@ -142,11 +143,14 @@ class SimBackend final : public Backend {
       for (std::size_t j = 0; j < config_.motors.size(); ++j) {
         if (config_.motors[j].feedback == Feedback::kRemoteCANcoder &&
             config_.motors[j].feedback_sensor_id == sensor.id) {
-          // Absolute, as the RoboRIO reports a CANcoder; the motor's own
-          // position stays continuous.
+          // Absolute on the sensor shaft (mechanism *
+          // sensor_to_mechanism_ratio), as the RoboRIO reports a CANcoder; the
+          // motor's own mechanism position stays continuous.
+          const double sensor_to_mech = SensorToMechanism(config_.motors[j]);
           state.sensors[i].position_rot =
-              CANcoderAbsoluteRot(samples_[j].position_rot);
-          state.sensors[i].velocity_rps = samples_[j].velocity_rps;
+              CANcoderAbsoluteRot(samples_[j].position_rot * sensor_to_mech);
+          state.sensors[i].velocity_rps =
+              samples_[j].velocity_rps * sensor_to_mech;
           linked = true;
           break;
         }
@@ -258,6 +262,12 @@ class SimBackend final : public Backend {
   }
 
  private:
+  static double SensorToMechanism(const MotorConfig& m) {
+    return std::isfinite(m.sensor_to_mechanism_ratio) &&
+                   m.sensor_to_mechanism_ratio > 0.0
+               ? m.sensor_to_mechanism_ratio
+               : 1.0;
+  }
   struct SimEncoder {
     double position_rot{};
     double velocity_rps{};

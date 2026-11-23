@@ -882,16 +882,18 @@ TEST(SimBelievability, ResetRestorePreservesPhysicalRotorPosition) {
   EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
 }
 
-// CANcoders mirror the linked mechanism through the boundary, reporting its
+// CANcoders mirror the linked sensor shaft through the boundary, reporting its
 // absolute position as the RoboRIO does (AbsoluteSensorDiscontinuityPoint =
-// 0.5): wrapped to [-0.5, 0.5) rotations, while the remote-CANcoder motor's
-// own position stays continuous.
+// 0.5): wrapped to [-0.5, 0.5) rotations on the sensor shaft (mechanism *
+// sensor_to_mechanism_ratio), while the remote-CANcoder motor's own mechanism
+// position stays continuous.
 TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
+  constexpr double kSensorToMechanism = 2.0;
   Config c = SingleMotorConfig();
   c.sensors.push_back({2, "encoder", SensorKind::kCANcoder, 20, "rio"});
   c.motors[0].feedback = Feedback::kRemoteCANcoder;
   c.motors[0].feedback_sensor_id = 2;
-  c.motors[0].sensor_to_mechanism_ratio = 2.0;
+  c.motors[0].sensor_to_mechanism_ratio = kSensorToMechanism;
   PhysicsSimBackend backend;
   ASSERT_TRUE(backend.Configure(c));
   std::array<MotorRequest, kMaxMotors> cmd{};
@@ -904,10 +906,12 @@ TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   ASSERT_GT(s.motors[0].position_rot, 1.0);
   EXPECT_GE(s.sensors[0].position_rot, -0.5);
   EXPECT_LT(s.sensors[0].position_rot, 0.5);
-  EXPECT_NEAR(
-      std::remainder(s.sensors[0].position_rot - s.motors[0].position_rot, 1.0),
-      0.0, 1e-9);
-  EXPECT_NEAR(s.sensors[0].velocity_rps, s.motors[0].velocity_rps, 1e-9);
+  EXPECT_NEAR(std::remainder(s.sensors[0].position_rot -
+                                 s.motors[0].position_rot * kSensorToMechanism,
+                             1.0),
+              0.0, 1e-9);
+  EXPECT_NEAR(s.sensors[0].velocity_rps,
+              s.motors[0].velocity_rps * kSensorToMechanism, 1e-9);
   // Backwards past -0.5 wraps the other way.
   cmd[0] = Duty(1, -0.5);
   ASSERT_TRUE(backend.Apply(cmd));
@@ -915,9 +919,10 @@ TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   ASSERT_LT(s.motors[0].position_rot, -1.0);
   EXPECT_GE(s.sensors[0].position_rot, -0.5);
   EXPECT_LT(s.sensors[0].position_rot, 0.5);
-  EXPECT_NEAR(
-      std::remainder(s.sensors[0].position_rot - s.motors[0].position_rot, 1.0),
-      0.0, 1e-9);
+  EXPECT_NEAR(std::remainder(s.sensors[0].position_rot -
+                                 s.motors[0].position_rot * kSensorToMechanism,
+                             1.0),
+              0.0, 1e-9);
 }
 
 // Commanded neutral coasts/brakes per model; it never teleports to a
@@ -2337,6 +2342,140 @@ TEST(SimHealth, ConfigureAndRestartControllerClearBrownout) {
   StepBackend(backend, s, now_us, 5000, 1);
   EXPECT_FALSE(s.health.brownout);
   EXPECT_DOUBLE_EQ(s.health.battery_v, kSimRestingSupplyV);
+}
+
+// REQ-DEV-05, REQ-DEV-06, REQ-DEV-10: With remote CANcoder feedback and
+// sensor_to_mechanism_ratio != 1, the CANcoder sits on the sensor shaft
+// (rotor / rotor_to_sensor_ratio = mechanism * sensor_to_mechanism_ratio) and
+// the TalonFX divides the CANcoder reading (including offset_rot) by
+// sensor_to_mechanism_ratio once, matching Phoenix 6 and PhoenixBackend.
+TEST(SimBelievability,
+     RemoteCancoderScalesBySensorToMechanismRatioInPhysicsAndIdealBackends) {
+  constexpr double kRotorToSensor = 4.0;
+  constexpr double kSensorToMechanism = 2.0;
+  constexpr double kTotalRatio = kRotorToSensor * kSensorToMechanism;
+  constexpr double kOffsetRot = 0.25;
+
+  for (const bool sensor_inverted : {false, true}) {
+    SCOPED_TRACE(sensor_inverted);
+    Config cfg = SingleMotorConfig();
+    cfg.motors[0].inverted = sensor_inverted;
+    cfg.motors[0].feedback = Feedback::kRemoteCANcoder;
+    cfg.motors[0].feedback_sensor_id = 2;
+    cfg.motors[0].rotor_to_sensor_ratio = kRotorToSensor;
+    cfg.motors[0].sensor_to_mechanism_ratio = kSensorToMechanism;
+    cfg.motors[0].slots[0].p = 10.0;
+    cfg.motors[0].slots[0].d = 0.2;
+    // Reference 1:1 rotor-feedback motor driven identically in
+    // PhysicsSimBackend to verify exact rotor-to-sensor and rotor-to-mechanism
+    // ratios.
+    auto ref = TestMotor(3, "rotor_ref", 3);
+    ref.inverted = sensor_inverted;
+    cfg.motors.push_back(ref);
+    SensorConfig enc{2, "encoder", SensorKind::kCANcoder, 20, "rio"};
+    enc.inverted = sensor_inverted;
+    enc.offset_rot = kOffsetRot;
+    cfg.sensors.push_back(enc);
+
+    // PhysicsSimBackend: resting offset, open-loop rotor/sensor/mechanism
+    // consistency, closed-loop position convergence, and soft limits.
+    {
+      PhysicsSimBackend physics;
+      ASSERT_TRUE(physics.Configure(cfg));
+      State s{};
+      uint64_t now_us = 0;
+      StepBackend(physics, s, now_us, 5000, 1);
+      EXPECT_DOUBLE_EQ(s.motors[0].position_rot,
+                       kOffsetRot / kSensorToMechanism);
+      EXPECT_DOUBLE_EQ(s.sensors[0].position_rot, kOffsetRot);
+
+      std::array<MotorRequest, 2> open_loop{
+          {{1, Mode::kVoltage, 0, 6.0, 0.0}, {3, Mode::kVoltage, 0, 6.0, 0.0}}};
+      ASSERT_TRUE(physics.Apply(open_loop));
+      StepBackend(physics, s, now_us, 5000, 60);
+      ASSERT_GT(s.motors[1].velocity_rps, 10.0);
+      ASSERT_GT(s.motors[1].position_rot, 1.0);
+      EXPECT_NEAR(s.motors[0].velocity_rps,
+                  s.motors[1].velocity_rps / kTotalRatio, 1e-9);
+      EXPECT_NEAR(s.sensors[0].velocity_rps,
+                  s.motors[1].velocity_rps / kRotorToSensor, 1e-9);
+      EXPECT_NEAR(s.sensors[0].velocity_rps,
+                  s.motors[0].velocity_rps * kSensorToMechanism, 1e-9);
+      EXPECT_NEAR(s.motors[0].position_rot,
+                  s.motors[1].position_rot / kTotalRatio +
+                      kOffsetRot / kSensorToMechanism,
+                  1e-9);
+      EXPECT_NEAR(
+          std::remainder(
+              s.sensors[0].position_rot -
+                  (s.motors[1].position_rot / kRotorToSensor + kOffsetRot),
+              1.0),
+          0.0, 1e-9);
+      EXPECT_NEAR(
+          std::remainder(s.sensors[0].position_rot -
+                             s.motors[0].position_rot * kSensorToMechanism,
+                         1.0),
+          0.0, 1e-9);
+
+      // Closed-loop position convergence: 0.6 mech rot -> 1.2 sensor rot ->
+      // +0.2 wrapped CANcoder reading.
+      ASSERT_TRUE(physics.Configure(cfg));
+      std::array<MotorRequest, 2> pos_cmd{{{1, Mode::kPosition, 0, 0.6, 0.0},
+                                           {3, Mode::kNeutral, 0, 0.0, 0.0}}};
+      ASSERT_TRUE(physics.Apply(pos_cmd));
+      StepBackend(physics, s, now_us, 5000, 600);
+      EXPECT_NEAR(s.motors[0].position_rot, 0.6, 0.01);
+      EXPECT_NEAR(s.sensors[0].position_rot, 0.2, 0.02);
+      EXPECT_NEAR(
+          std::remainder(s.sensors[0].position_rot -
+                             s.motors[0].position_rot * kSensorToMechanism,
+                         1.0),
+          0.0, 1e-9);
+
+      // Soft limit clamping holds 0.45 mech rot -> 0.90 sensor rot -> -0.10.
+      Config limited = cfg;
+      limited.motors[0].soft_limits = true;
+      limited.motors[0].reverse_limit_rot = -0.4;
+      limited.motors[0].forward_limit_rot = 0.45;
+      ASSERT_TRUE(physics.Configure(limited));
+      std::array<MotorRequest, 2> drive_cmd{
+          {{1, Mode::kVoltage, 0, 2.0, 0.0}, {3, Mode::kNeutral, 0, 0.0, 0.0}}};
+      ASSERT_TRUE(physics.Apply(drive_cmd));
+      StepBackend(physics, s, now_us, 5000, 400);
+      EXPECT_DOUBLE_EQ(s.motors[0].position_rot, 0.45);
+      EXPECT_NEAR(s.sensors[0].position_rot, -0.1, 1e-9);
+    }
+
+    // SimBackend: resting offset divided by S, velocity and position mirrored
+    // onto sensor shaft (* S).
+    {
+      SimBackend ideal;
+      ASSERT_TRUE(ideal.Configure(cfg));
+      State s{};
+      uint64_t now_us = 0;
+      StepBackend(ideal, s, now_us, 5000, 1);
+      EXPECT_DOUBLE_EQ(s.motors[0].position_rot,
+                       kOffsetRot / kSensorToMechanism);
+      EXPECT_DOUBLE_EQ(s.sensors[0].position_rot, kOffsetRot);
+
+      std::array<MotorRequest, 2> vel_cmd{{{1, Mode::kVelocity, 0, 2.0, 0.0},
+                                           {3, Mode::kNeutral, 0, 0.0, 0.0}}};
+      ASSERT_TRUE(ideal.Apply(vel_cmd));
+      StepBackend(ideal, s, now_us, 100000, 1);  // +0.2 mech rot -> 0.325
+      EXPECT_NEAR(s.motors[0].position_rot, 0.325, 1e-9);
+      EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 2.0);
+      EXPECT_NEAR(s.sensors[0].position_rot, -0.35, 1e-9);  // wrap(0.65)
+      EXPECT_DOUBLE_EQ(s.sensors[0].velocity_rps, 4.0);
+
+      std::array<MotorRequest, 2> pos_cmd{{{1, Mode::kPosition, 0, 0.6, 0.0},
+                                           {3, Mode::kNeutral, 0, 0.0, 0.0}}};
+      ASSERT_TRUE(ideal.Apply(pos_cmd));
+      StepBackend(ideal, s, now_us, 5000, 1);
+      EXPECT_DOUBLE_EQ(s.motors[0].position_rot, 0.6);
+      EXPECT_NEAR(s.sensors[0].position_rot, 0.2, 1e-9);  // wrap(1.2)
+      EXPECT_DOUBLE_EQ(s.sensors[0].velocity_rps, 0.0);
+    }
+  }
 }
 
 }  // namespace
