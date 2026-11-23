@@ -2,6 +2,7 @@
 #define TALOS_SIMULATION_PORTS_H_
 
 #include <cstdint>
+#include <stdexcept>
 
 #include "talOS/configuration/config_parser.h"
 
@@ -21,8 +22,14 @@ struct GatewayPorts {
 inline GatewayPorts ResolveGatewayPorts(const config::RobotConfig& config,
                                         uint16_t port_flag,
                                         uint16_t remote_port_flag) {
-  return {.listen = config::ResolveControllerPort(config, port_flag),
-          .send = config::ResolveLocalPort(config, remote_port_flag)};
+  const GatewayPorts ports{
+      .listen = config::ResolveControllerPort(config, port_flag),
+      .send = config::ResolveLocalPort(config, remote_port_flag)};
+  if (ports.listen == ports.send) {
+    throw std::invalid_argument(
+        "simulator --port and --remote-port must differ");
+  }
+  return ports;
 }
 
 }  // namespace talos::simulation

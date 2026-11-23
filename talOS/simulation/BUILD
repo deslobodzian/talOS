@@ -108,6 +108,17 @@ py_test(
     deps = ["@rules_python//python/runfiles"],
 )
 
+# Fail-closed CLI flag parsing for sim_gateway (fast lane: no sockets/waits).
+py_test(
+    name = "sim_gateway_cli_test",
+    size = "small",
+    srcs = ["sim_gateway_cli_test.py"],
+    data = [":sim_gateway"],
+    env = {"SIM_GATEWAY": "$(rlocationpath :sim_gateway)"},
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)
+
 talos_cc_node(
     name = "bench_motor",
     testonly = True,
