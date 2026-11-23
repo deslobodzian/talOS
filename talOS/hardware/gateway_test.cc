@@ -30,6 +30,7 @@ namespace {
 
 using namespace gateway_test;  // NOLINT(google-build-using-namespace)
 
+// REQ-CONTRACT-02: fully capped State and Command encode at exact maxima
 TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   State state;
   state.motor_count = kMaxMotors;
@@ -890,6 +891,8 @@ Config EveryDeviceKindConfig() {
   roller.max_velocity_rps = 90;
   roller.cruise_velocity_rps = 30;
   roller.acceleration_rps2 = 60;
+  roller.foc = true;
+  roller.max_torque_current_a = 40;
   roller.motor_type.value = MotorType::kKrakenX44;
   c.motors = {arm, follower, roller};
   c.sensors = {
@@ -964,6 +967,160 @@ TEST(ConfigWire, BothEndsComputeOneIdCoveringEveryWireSetting) {
   // changed; every other byte must, or the sweep proves little.
   EXPECT_GT(changed_offsets, bytes.size() * 3 / 4)
       << changed_offsets << " of " << bytes.size() << " bytes";
+
+  // Constrained wire fields that single-bit flips silently skip because
+  // Validate() or DeserializeConfig() rejects a one-byte mutation: mutate each
+  // into another valid config and prove ConfigurationId() changes and matches
+  // the gateway's id over the wire.
+  const auto expect_id_changes = [](const char* label, const Config& base,
+                                    const Config& mutated) {
+    SCOPED_TRACE(label);
+    ASSERT_NO_THROW(Validate(base));
+    ASSERT_NO_THROW(Validate(mutated));
+    const uint64_t base_id = ConfigurationId(base);
+    const uint64_t mutated_id = ConfigurationId(mutated);
+    EXPECT_NE(mutated_id, base_id);
+    EXPECT_EQ(GatewayConfigId(mutated), mutated_id);
+  };
+
+  // foc (isolated on a motor without max_torque_current_a) and
+  // max_torque_current_a (isolated on an FOC motor).
+  {
+    auto m = config;
+    m.motors[0].foc = true;
+    expect_id_changes("arm.foc", config, m);
+  }
+  {
+    auto m = config;
+    m.motors[2].max_torque_current_a = 20;
+    expect_id_changes("roller.max_torque_current_a nonzero", config, m);
+  }
+  {
+    auto m = config;
+    m.motors[2].max_torque_current_a = 0;
+    expect_id_changes("roller.max_torque_current_a zero", config, m);
+    auto no_foc = m;
+    no_foc.motors[2].foc = false;
+    expect_id_changes("roller.foc", m, no_foc);
+  }
+  // follower.master_id: clearing to independent (0) and retargeting to another
+  // valid non-torque master.
+  {
+    auto m = config;
+    m.motors[1].master_id = 0;
+    expect_id_changes("follower.master_id to 0", config, m);
+  }
+  {
+    auto base = config;
+    base.motors[2].max_torque_current_a = 0;
+    auto m = base;
+    m.motors[1].master_id = m.motors[2].id;
+    expect_id_changes("follower.master_id retarget", base, m);
+  }
+  // arm.feedback and arm.feedback_sensor_id (isolated by adding a second
+  // CANcoder on the same bus).
+  {
+    auto m = config;
+    m.motors[0].feedback = Feedback::kRotor;
+    m.motors[0].feedback_sensor_id = 0;
+    expect_id_changes("arm.feedback", config, m);
+  }
+  {
+    auto base = config;
+    base.sensors.push_back(
+        {12, "arm_encoder_alt", SensorKind::kCANcoder, 21, "rio", false, 0.0});
+    auto m = base;
+    m.motors[0].feedback_sensor_id = 12;
+    expect_id_changes("arm.feedback_sensor_id", base, m);
+  }
+  // Referenced device ids and shared CAN bus (must move with their references).
+  {
+    auto m = config;
+    m.motors[0].id = 101;
+    m.motors[1].master_id = 101;
+    expect_id_changes("referenced arm.id", config, m);
+  }
+  {
+    auto m = config;
+    m.sensors[0].id = 110;
+    m.motors[0].feedback_sensor_id = 110;
+    expect_id_changes("referenced sensor.id", config, m);
+  }
+  {
+    auto m = config;
+    m.motors[0].bus = "canivore";
+    m.motors[1].bus = "canivore";
+    m.sensors[0].bus = "canivore";
+    expect_id_changes("referenced CAN bus", config, m);
+  }
+  // Two-bit-apart enums (SensorKind, EncoderKind) that single-bit flips never
+  // land on validly.
+  {
+    auto m = config;
+    m.sensors[1].kind = SensorKind::kCANcoder;
+    expect_id_changes("sensor.kind", config, m);
+  }
+  {
+    auto m = config;
+    m.encoders[0].kind = EncoderKind::kDutyCycle;
+    expect_id_changes("encoder.kind", config, m);
+  }
+  // Every device list count: removing one unreferenced device from each list.
+  {
+    auto m = config;
+    m.motors.pop_back();
+    expect_id_changes("motors.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.sensors.pop_back();
+    expect_id_changes("sensors.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.digital_inputs.pop_back();
+    expect_id_changes("digital_inputs.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.digital_outputs.pop_back();
+    expect_id_changes("digital_outputs.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.analog_inputs.pop_back();
+    expect_id_changes("analog_inputs.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.encoders.pop_back();
+    expect_id_changes("encoders.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.pwm_outputs.pop_back();
+    expect_id_changes("pwm_outputs.size()", config, m);
+  }
+  // Identical element fields in different device lists (id=1, name="dev",
+  // channel/dio=0) must hash differently, proving list counts enter the hash.
+  {
+    Config with_di;
+    with_di.digital_inputs.push_back({1, "dev", 0});
+    Config with_do;
+    with_do.digital_outputs.push_back({1, "dev", 0});
+    Config with_ai;
+    with_ai.analog_inputs.push_back({1, "dev", 0});
+    Config with_pwm;
+    with_pwm.pwm_outputs.push_back({1, "dev", 0});
+    const std::array<uint64_t, 4> list_ids{
+        ConfigurationId(with_di), ConfigurationId(with_do),
+        ConfigurationId(with_ai), ConfigurationId(with_pwm)};
+    for (std::size_t i = 0; i < list_ids.size(); ++i) {
+      for (std::size_t j = i + 1; j < list_ids.size(); ++j) {
+        EXPECT_NE(list_ids[i], list_ids[j]) << "list " << i << " vs " << j;
+      }
+    }
+  }
 }
 // Consumers tell consecutive States from a gap by sequence + 1, so every
 // tick counts, across a reconfigure too.
@@ -986,16 +1143,20 @@ TEST(Gateway, RequiresEnableCommissioningAndMatchingManifest) {
   Gateway g{SwerveConfig(true), backend, 1};
   g.Tick(1000, false);
   EXPECT_FALSE(g.Accept(Request(g), 1, 1000));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
   g.Tick(2000, true);
   auto c = Request(g);
   ++c.config_id;
   EXPECT_FALSE(g.Accept(c, 1, 2000));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
   EXPECT_EQ(backend.applied, 0);
   EXPECT_TRUE(g.Accept(Request(g), 1, 2000));
   FakeBackend other;
   Gateway uncommissioned{SwerveConfig(false), other, 2};
   uncommissioned.Tick(2000, true);
   EXPECT_FALSE(uncommissioned.Accept(Request(uncommissioned), 1, 2000));
+  EXPECT_EQ(other.applied, 0);
+  EXPECT_EQ(uncommissioned.snapshot().counters.rejected_command_count, 1u);
 }
 // While the robot cannot drive, every node flushes neutral and the bridge
 // keeps forwarding the merge. Counting those refusals would bury every real
@@ -2543,8 +2704,36 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   }
   EXPECT_FALSE(
       Decode(std::span<const uint8_t>{bytes.data(), size + 1}, decoded));
-  bytes[32] = 255;
-  EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), size}, decoded));
+  // Every device count in Command's header (starting at byte 32) accepts cap
+  // and rejects cap + 1 even when the wire buffer holds cap + 1 valid records
+  // (so rejection proves the cap check itself, not truncated EOF).
+  struct CountSpec {
+    const char* name;
+    std::size_t offset;
+    std::size_t cap;
+    std::size_t record_size;
+  };
+  const std::array<CountSpec, 3> command_counts{{
+      {"motor_count", 32, kMaxMotors, kMotorRequestSize},
+      {"digital_output_count", 34, kMaxDigitalOutputs,
+       kDigitalOutputRequestSize},
+      {"pwm_output_count", 36, kMaxPwmOutputs, kPwmRequestSize},
+  }};
+  for (const auto& spec : command_counts) {
+    SCOPED_TRACE(spec.name);
+    std::vector<uint8_t> at_cap(kCommandBaseSize + spec.cap * spec.record_size,
+                                0);
+    at_cap[spec.offset] = static_cast<uint8_t>(spec.cap & 0xFFu);
+    at_cap[spec.offset + 1] = static_cast<uint8_t>(spec.cap >> 8);
+    ASSERT_TRUE(Decode(at_cap, decoded));
+
+    const auto over = spec.cap + 1;
+    std::vector<uint8_t> over_cap(kCommandBaseSize + over * spec.record_size,
+                                  0);
+    over_cap[spec.offset] = static_cast<uint8_t>(over & 0xFFu);
+    over_cap[spec.offset + 1] = static_cast<uint8_t>(over >> 8);
+    EXPECT_FALSE(Decode(over_cap, decoded));
+  }
 
   // Full State with every device kind
   State state = g.snapshot();
@@ -2614,23 +2803,32 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   EXPECT_FALSE(
       Decode(std::span<const uint8_t>{bytes.data(), state_size + 1}, copy));
 
-  // Every device count in State's prefix (starting at byte 70) rejects cap + 1.
-  const std::array<std::pair<std::size_t, uint16_t>, 7> over_cap_counts{{
-      {70, static_cast<uint16_t>(kMaxMotors + 1)},
-      {72, static_cast<uint16_t>(kMaxSensors + 1)},
-      {74, static_cast<uint16_t>(kMaxDigitalInputs + 1)},
-      {76, static_cast<uint16_t>(kMaxDigitalOutputs + 1)},
-      {78, static_cast<uint16_t>(kMaxAnalogInputs + 1)},
-      {80, static_cast<uint16_t>(kMaxEncoders + 1)},
-      {82, static_cast<uint16_t>(kMaxPwmOutputs + 1)},
+  // Every device count in State's prefix (starting at byte 70) accepts cap and
+  // rejects cap + 1 even when the wire buffer holds cap + 1 valid records (so
+  // rejection proves the cap check itself, not truncated EOF).
+  const std::array<CountSpec, 7> state_counts{{
+      {"motor_count", 70, kMaxMotors, kMotorSampleSize},
+      {"sensor_count", 72, kMaxSensors, kSensorSampleSize},
+      {"digital_input_count", 74, kMaxDigitalInputs, kDigitalInputSampleSize},
+      {"digital_output_count", 76, kMaxDigitalOutputs,
+       kDigitalOutputSampleSize},
+      {"analog_input_count", 78, kMaxAnalogInputs, kAnalogInputSampleSize},
+      {"encoder_count", 80, kMaxEncoders, kEncoderSampleSize},
+      {"pwm_output_count", 82, kMaxPwmOutputs, kPwmSampleSize},
   }};
-  for (const auto& [offset, count] : over_cap_counts) {
-    SCOPED_TRACE(offset);
-    auto corrupted = bytes;
-    corrupted[offset] = static_cast<uint8_t>(count & 0xFFu);
-    corrupted[offset + 1] = static_cast<uint8_t>(count >> 8);
-    EXPECT_FALSE(
-        Decode(std::span<const uint8_t>{corrupted.data(), state_size}, copy));
+  for (const auto& spec : state_counts) {
+    SCOPED_TRACE(spec.name);
+    std::vector<uint8_t> at_cap(kStateBaseSize + spec.cap * spec.record_size,
+                                0);
+    at_cap[spec.offset] = static_cast<uint8_t>(spec.cap & 0xFFu);
+    at_cap[spec.offset + 1] = static_cast<uint8_t>(spec.cap >> 8);
+    ASSERT_TRUE(Decode(at_cap, copy));
+
+    const auto over = spec.cap + 1;
+    std::vector<uint8_t> over_cap(kStateBaseSize + over * spec.record_size, 0);
+    over_cap[spec.offset] = static_cast<uint8_t>(over & 0xFFu);
+    over_cap[spec.offset + 1] = static_cast<uint8_t>(over >> 8);
+    EXPECT_FALSE(Decode(over_cap, copy));
   }
 
   // ConfigAck rejects truncated payloads.
@@ -2704,6 +2902,8 @@ TEST(ConfigWire, ChunksAndAssemblesConfigLosslessly) {
   }
 }
 
+// REQ-CONTRACT-02: fully capped Config serializes at exact maximum and
+// round-trips through chunk assembly
 TEST(ConfigWire, FullyCappedSerializationMatchesAssemblyLimit) {
   Config config;
   config.motors.resize(kMaxMotors);
