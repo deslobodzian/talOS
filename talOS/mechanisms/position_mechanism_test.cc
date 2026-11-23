@@ -763,6 +763,99 @@ TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
   EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);
 }
 
+// Only signed travel in homing_v's direction counts toward
+// homing_min_travel_rot: backdriving opposite to homing_v by at least
+// homing_min_travel_rot and stalling under load before homing_min_push_us must
+// not falsely home mid-travel, while travelling in homing_v's direction still
+// homes cleanly before homing_min_push_us.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingCountsOnlyTravelTowardHome) {
+  {
+    SCOPED_TRACE("negative homing_v");
+    Rig hood{"hood"};  // homing_v = -1.0, min_push = 200 ms, stall = 50 ms
+    hood.SetMotor(2.0, 0.0, 5.0);
+    hood.Start();
+    hood.Drive(0.5, 10ms);  // starts push at 2.0
+    hood.ExpectHoming(-1.0);
+
+    // Backdriven +0.2 rot (opposite to homing_v = -1.0), past
+    // homing_min_travel_rot (0.05), stalled at 30 A for > homing_stall_us
+    // (50 ms) while still under homing_min_push_us (200 ms): must not home.
+    hood.SetMotor(2.2, 0.0, 30.0);
+    hood.Drive(0.5, 90ms);
+    EXPECT_FALSE(hood.mech().homed());
+    hood.ExpectHoming(-1.0);
+
+    // Move in homing_v's direction to 1.9 (-0.1 rot from push_start_rot 2.0,
+    // step 0.3 <= max_jump_rot 0.5) and stall for > 50 ms while total push
+    // remains under 200 ms: homes via signed travel.
+    hood.SetMotor(1.9, 0.0, 30.0);
+    hood.Drive(0.5, 70ms);
+    EXPECT_TRUE(hood.mech().homed());
+    EXPECT_NEAR(hood.mech().position_rot(), 0.0, 1e-9);
+    EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.4);
+  }
+  {
+    SCOPED_TRACE("positive homing_v");
+    constexpr const char* kPositiveStallToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.hood.motors.hood]
+can_id = 7
+[subsystems.hood.hood]
+tolerance_rot = 0.01
+control = "position"
+min_rot = 0.0
+max_rot = 1.0
+homing = "stall"
+homing_v = 1.0
+home_rot = 1.0
+homing_timeout_us = 500000
+homing_stall_rps = 0.05
+homing_stall_us = 50000
+homing_stall_current_a = 20.0
+homing_min_push_us = 200000
+homing_min_travel_rot = 0.05
+)";
+    Sim sim = Sim::FromToml(kPositiveStallToml);
+    auto& node = sim.add<PositionNode>("hood");
+    SimHardware hw{sim};
+    hw.enable();
+    hw.set_motor("hood", "hood", 2.0, 0.0, 0, 0, 0, 0, 5.0);
+    hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+    sim.step(10ms);
+    const auto drive = [&](std::chrono::milliseconds duration) {
+      for (auto t = 0ms; t < duration; t += 5ms) {
+        PublishTarget(sim, "hood", "teleop", control::PositionTarget{0.5, 0.0});
+        sim.step(5ms);
+      }
+    };
+
+    drive(10ms);  // starts push at 2.0
+    EXPECT_EQ(node.mech.phase(), PositionPhase::kHoming);
+
+    // Backdriven -0.2 rot (opposite to homing_v = +1.0) and stalled under load
+    // before homing_min_push_us (200 ms): must not home.
+    hw.set_motor("hood", "hood", 1.8, 0.0, 0, 0, 0, 0, 30.0);
+    drive(90ms);
+    EXPECT_FALSE(node.mech.homed());
+    EXPECT_EQ(node.mech.phase(), PositionPhase::kHoming);
+    EXPECT_EQ(hw.applied_motor("hood", "hood").mode, Mode::kVoltage);
+    EXPECT_DOUBLE_EQ(hw.applied_motor("hood", "hood").demand, 1.0);
+
+    // Move in homing_v's direction to 2.1 (+0.1 rot from push_start_rot 2.0)
+    // and stall before homing_min_push_us: homes cleanly at home_rot (1.0).
+    hw.set_motor("hood", "hood", 2.1, 0.0, 0, 0, 0, 0, 30.0);
+    drive(70ms);
+    EXPECT_TRUE(node.mech.homed());
+    EXPECT_NEAR(node.mech.position_rot(), 1.0, 1e-9);
+    EXPECT_EQ(hw.applied_motor("hood", "hood").mode, Mode::kPosition);
+    EXPECT_DOUBLE_EQ(hw.applied_motor("hood", "hood").demand, 1.6);
+  }
+}
+
 // Stator current alone is not a stop: a mechanism still moving past
 // homing_stall_rps under high load past homing_min_travel_rot and
 // homing_min_push_us + homing_stall_us never homes and faults at timeout.
@@ -1401,6 +1494,59 @@ TEST(PositionMechanism, MoveTimeoutFaults) {
   lift.Drive(1.5, 200ms);
   EXPECT_EQ(lift.mech().fault(), PositionFault::kMoveTimeout);
   lift.ExpectNeutral();
+}
+
+// Holding at goal (via set_goal() or hold()) past move_timeout_us refreshes the
+// move timer while in tolerance: a bump past tolerance_rot does not fault on
+// the perturbation tick, recovers if returned within move_timeout_us, and still
+// faults with kMoveTimeout if held away for a full move_timeout_us.
+// REQ-SAFE-36
+TEST(PositionMechanism, MoveTimeoutRefreshesWhileAtGoal) {
+  for (const bool hold_mode : {false, true}) {
+    SCOPED_TRACE(hold_mode ? "hold" : "set_goal");
+    Rig lift{"lift"};
+    lift.node.hold_mode = hold_mode;
+    lift.SetMotor(1.0, 0.0);
+    lift.Start();
+    const double commanded = hold_mode ? 9.0 : 1.0;
+
+    // Hold in tolerance longer than move_timeout_us (1000 ms).
+    lift.Drive(commanded, 1200ms);
+    ASSERT_EQ(lift.mech().phase(), PositionPhase::kAtGoal);
+    ASSERT_EQ(lift.mech().fault(), PositionFault::kNone);
+    ASSERT_DOUBLE_EQ(lift.Applied().demand, 1.0);
+
+    // Perturb just past tolerance_rot (0.05) while moving (so stall cannot
+    // trip): must not fault on the perturbation tick.
+    lift.SetMotor(1.051, 1.0);
+    lift.Drive(commanded, 10ms);  // 1st tick publishes 1.051; 2nd tick reads it
+    ASSERT_DOUBLE_EQ(lift.mech().position_rot(), 1.051);
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kMoving);
+    EXPECT_EQ(lift.Applied().mode, Mode::kMotionMagic);
+    EXPECT_DOUBLE_EQ(lift.Applied().demand, 1.0);
+
+    // Stay outside tolerance briefly, then return within move_timeout_us:
+    // recovers to kAtGoal without faulting.
+    lift.Drive(commanded, 200ms);
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kMoving);
+    lift.SetMotor(1.0, 0.0);
+    lift.Drive(commanded, 50ms);  // past at_goal_debounce_us (30 ms)
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kAtGoal);
+
+    // Perturb again and hold away for a full move_timeout_us (1000 ms): must
+    // still fault with kMoveTimeout.
+    lift.SetMotor(1.051, 1.0);
+    lift.Drive(commanded, 900ms);
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kNone);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kMoving);
+    lift.Drive(commanded, 150ms);
+    EXPECT_EQ(lift.mech().fault(), PositionFault::kMoveTimeout);
+    EXPECT_EQ(lift.mech().phase(), PositionPhase::kFaulted);
+    lift.ExpectNeutral();
+  }
 }
 
 // Elevator gravity is a constant +gravity_v wherever the carriage is, added
