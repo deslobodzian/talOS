@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -39,10 +38,13 @@ int MakeResident(void* address, std::size_t size) noexcept {
   // permission, and the first publish would then fault anyway. OR with zero
   // changes nothing, even under a concurrent writer in another process.
   auto* bytes = static_cast<unsigned char*>(address);
-  for (std::size_t offset = 0; offset < size; offset += PageSize()) {
-    __atomic_fetch_or(reinterpret_cast<std::uint64_t*>(bytes + offset),
-                      std::uint64_t{0}, __ATOMIC_RELAXED);
+  const std::size_t page = PageSize();
+  for (std::size_t offset = 0; offset < size; offset += page) {
+    __atomic_fetch_or(bytes + offset, static_cast<unsigned char>(0),
+                      __ATOMIC_RELAXED);
   }
+  __atomic_fetch_or(bytes + size - 1, static_cast<unsigned char>(0),
+                    __ATOMIC_RELAXED);
   return ::mlock(address, size) == 0 ? 0 : errno;
 }
 

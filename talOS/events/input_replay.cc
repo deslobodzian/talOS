@@ -1325,7 +1325,7 @@ RecordedSession::RecordedSession(const std::string& path,
       RecordedTopic& fed = topics_[topic];
       const auto loss = [&](MonotonicTime at,
                             std::optional<std::uint64_t> damage_offset) {
-        if (at < fed.first_gap.value_or(MonotonicTime::max())) {
+        if (!fed.first_gap || at < *fed.first_gap) {
           fed.first_gap = at;
           fed.first_gap_log = log.path;
           fed.first_gap_damage_offset = damage_offset;

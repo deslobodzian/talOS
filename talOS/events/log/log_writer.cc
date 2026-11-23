@@ -327,11 +327,84 @@ void LogWriter::State::append(RecordHeader header,
       return;
     }
     payload = SealRecord(header, payload);
-    if (sizeof(RecordHeader) + payload.size() > pool.front().data.size()) {
+    const std::size_t record_total = sizeof(RecordHeader) + payload.size();
+    const std::size_t chunk_cap = pool.front().data.size();
+    if (record_total > chunk_cap) {
       gaps.lose(header, payload_bytes);
       return;
     }
-    switch (take_gap(header.now_ns)) {
+    RecordHeader gap_header{};
+    const std::span<const std::byte> gap_stored =
+        gaps.seal_gap(gap_header, header.now_ns);
+    const std::size_t gap_total = sizeof(RecordHeader) + gap_stored.size();
+    if (gap_total > chunk_cap) {
+      gaps.lose(header, payload_bytes);
+      return;
+    }
+    if (options.background) {
+      // Ensure GAP and the resuming record can both be taken without hitting
+      // kPoolFull between them (which would submit a GAP-only chunk and open
+      // a second GAP with zero non-GAP records between them).
+      const std::size_t prefix_size = sink.prefix_size();
+      const std::uint64_t limit =
+          segment_bytes != 0 ? segment_bytes : options.max_bytes;
+      const std::uint64_t outstanding =
+          submitted.load(std::memory_order_relaxed) -
+          completed.load(std::memory_order_acquire);
+      const std::uint64_t free_chunks = pool.size() - outstanding;
+
+      std::uint64_t sim_seg_used = segment_used;
+      std::int64_t sim_seg_first_ns = segment_first_ns;
+      std::size_t sim_active_used = active != nullptr ? active->used : 0;
+      std::uint64_t sim_submitted = 0;
+
+      const auto simulate = [&](std::size_t total, std::int64_t now_ns) {
+        const bool full = limit != 0 && sim_seg_used + total > limit;
+        if (full &&
+            (segment_bytes == 0 || prefix_size + total > segment_bytes)) {
+          return true;  // take() returns kStopped; no second GAP can open.
+        }
+        const bool elapsed =
+            segment_span_ns != 0 && sim_seg_used > prefix_size &&
+            now_ns > sim_seg_first_ns &&
+            static_cast<std::uint64_t>(now_ns) -
+                    static_cast<std::uint64_t>(sim_seg_first_ns) >=
+                segment_span_ns;
+        if (full || elapsed) {
+          if (sim_active_used > 0) {
+            ++sim_submitted;
+            sim_active_used = 0;
+          }
+          sim_seg_used = prefix_size;
+        }
+        if (sim_active_used > 0 && sim_active_used + total > chunk_cap) {
+          ++sim_submitted;
+          sim_active_used = 0;
+        }
+        if (sim_seg_used == prefix_size) sim_seg_first_ns = now_ns;
+        sim_seg_used += total;
+        sim_active_used += total;
+        return false;
+      };
+
+      const bool gap_stops = simulate(gap_total, header.now_ns);
+      const std::uint64_t after_gap_submitted = sim_submitted;
+      if (!gap_stops) {
+        simulate(record_total, header.now_ns);
+      }
+      if (sim_submitted + 1 > free_chunks) {
+        // If an already-filled non-GAP active chunk prevents GAP from starting
+        // in it and the total chunks needed exceed the pool size, hand over
+        // those earlier records now so future resumes see active == nullptr.
+        if (sim_submitted + 1 > pool.size() && after_gap_submitted > 0 &&
+            active != nullptr && active->used > 0) {
+          submit_active();
+        }
+        gaps.lose(header, payload_bytes);
+        return;
+      }
+    }
+    switch (take(gap_header, gap_stored)) {
       case Take::kTaken:
         break;
       case Take::kStopped:
@@ -552,14 +625,14 @@ void LogWriter::State::stop_writer() noexcept {
 void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   State& state = *state_;
 
-  // Every chunk and every segment holds a GAP record.
+  // Every chunk holds a GAP record and the largest manifest record together.
   std::size_t largest_record = GAP_RECORD_BYTES;
   for (const auto& reg : manifest) {
     largest_record =
         std::max(largest_record, sizeof(RecordHeader) + reg.message_bytes);
   }
   const std::size_t capacity =
-      std::max(state.options.chunk_bytes, largest_record);
+      std::max(state.options.chunk_bytes, largest_record + GAP_RECORD_BYTES);
   for (auto& chunk : state.pool) chunk.data.resize(capacity);
 
   std::vector<ManifestEntry> entries;

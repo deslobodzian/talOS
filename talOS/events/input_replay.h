@@ -448,11 +448,16 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
   }
   // Nothing at or past the gap is fed or run: the run ends one nanosecond
   // before it, so no drain there runs.
-  const MonotonicTime end = report.stopped_at_gap.has_value()
-                                ? report.stopped_at_gap->at - Duration{1}
-                                : session.loop_end();
+  const bool gap_at_min = report.stopped_at_gap.has_value() &&
+                          report.stopped_at_gap->at == MonotonicTime::min();
+  const MonotonicTime end =
+      report.stopped_at_gap.has_value()
+          ? (report.stopped_at_gap->at > MonotonicTime::min()
+                 ? report.stopped_at_gap->at - Duration{1}
+                 : MonotonicTime::min())
+          : session.loop_end();
 
-  if (end >= session.run_start()) {
+  if (!gap_at_min && end >= session.run_start()) {
     std::optional<MonotonicTime> instant;
     for (const RecordedMessage& message : session.messages()) {
       if (message.delivered > end) break;
