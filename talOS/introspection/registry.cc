@@ -409,6 +409,12 @@ void NodeRegistration::activate() {
   }
 }
 
+void NodeRegistration::mark_quiesced() {
+  if (owns_slot()) {
+    record_->flags.fetch_or(kFlagQuiesced, std::memory_order_release);
+  }
+}
+
 // Checks this node's own name and its topic names against the naming
 // protocol, and prints what it finds to stderr. Once, at publish time: the
 // manifest is frozen by then, so there is nothing new to find later, and the

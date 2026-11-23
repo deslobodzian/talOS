@@ -875,6 +875,18 @@ cc_binary(
     ],
 )
 
+# A hardware_node stub that claims a registry row under --session-id and
+# optionally marks kFlagQuiesced before stalling on shutdown
+# (supervision_test's decoupled bridge-quiescence check).
+cc_binary(
+    name = "quiesce_bridge",
+    testonly = True,
+    srcs = ["testdata/quiesce_bridge.cc"],
+    deps = [
+        "//talOS/introspection:registry",
+    ],
+)
+
 cc_test(
     name = "supervision_test",
     size = "medium",
@@ -886,6 +898,7 @@ cc_test(
         ":endpoint_drift",
         ":hanging_bridge",
         ":held_stop",
+        ":quiesce_bridge",
         ":session_report",
         "//talOS/bridge:hardware_node",
     ],
@@ -897,6 +910,7 @@ cc_test(
         "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
         "TALOS_HANGING_BRIDGE": "$(rlocationpath :hanging_bridge)",
         "TALOS_HELD_STOP_NODE": "$(rlocationpath :held_stop)",
+        "TALOS_QUIESCE_BRIDGE": "$(rlocationpath :quiesce_bridge)",
         "TALOS_SESSION_REPORT": "$(rlocationpath :session_report)",
     },
     # Independent cases; HeartbeatingConstructorStillHasAFiniteDeadline alone
