@@ -127,6 +127,28 @@ def _load_contract_bzl():
     return env, recorded
 
 
+def _lint_fbs(fbs_text):
+    """Compiles an inline lint_test/case.fbs schema and runs descriptor_gen lint."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pkg_dir = os.path.join(tmp, "lint_test")
+        out_dir = os.path.join(tmp, "out")
+        os.makedirs(pkg_dir)
+        os.makedirs(out_dir)
+        fbs_path = os.path.join(pkg_dir, "case.fbs")
+        with open(fbs_path, "w", encoding="utf-8") as f:
+            f.write(fbs_text)
+        flatc = subprocess.run(
+            [_path("TALOS_FLATC"), "--binary", "--schema",
+             "--bfbs-filenames", tmp, "-I", tmp, "-o", out_dir, fbs_path],
+            capture_output=True, text=True, check=False)
+        if flatc.returncode != 0:
+            raise AssertionError(f"flatc failed: {flatc.stderr}")
+        return subprocess.run(
+            [_path("TALOS_DESCRIPTOR_GEN"), "lint",
+             os.path.join(out_dir, "case.bfbs"), "//lint_test/case.fbs"],
+            capture_output=True, text=True, check=False)
+
+
 class FieldNameLintTest(unittest.TestCase):
     # REQ-CONTRACT-08
     def test_unsuffixed_numbers_fail_and_exempt_kinds_pass(self):
@@ -143,6 +165,130 @@ class FieldNameLintTest(unittest.TestCase):
         result = _lint("TALOS_LINT_INCLUDED", "//lint_test/included.fbs")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(_reported(result.stderr), {"Included.raw"})
+
+    # REQ-CONTRACT-08
+    def test_valid_field_names_pass(self):
+        result = _lint_fbs("""
+            namespace lint_test;
+            enum Mode : ubyte { OFF, ON }
+            struct Inner { width_m:float; }
+            struct Valid {
+              x_m:double;
+              y_m:double;
+              z_m:double;
+              q_w:double;
+              v_mps:double;
+              a_mps2:double;
+              x_std_m:double;
+              y_err_rad:double;
+              module0:Inner;
+              slot0_v:double;
+              pose2d:Inner;
+              accel_mps2:double;
+              ok:bool;
+              x:bool;
+              mode:Mode;
+            }
+        """)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    # REQ-CONTRACT-08
+    def test_non_lower_snake_case_fields_fail(self):
+        result = _lint_fbs("""
+            namespace lint_test;
+            enum Mode : ubyte { OFF, ON }
+            struct BadCase {
+              Position_m:double;
+              camelCase:bool;
+              ModeField:Mode;
+              bad__name_m:double;
+              _leading_m:double;
+              trailing_m_:double;
+              flag_:bool;
+              position_m:double;
+              valid:bool;
+            }
+        """)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(
+            _reported(result.stderr),
+            {
+                "BadCase.Position_m",
+                "BadCase.camelCase",
+                "BadCase.ModeField",
+                "BadCase.bad__name_m",
+                "BadCase._leading_m",
+                "BadCase.trailing_m_",
+                "BadCase.flag_",
+            },
+        )
+        self.assertIn("must be lower snake_case", result.stderr)
+
+    # REQ-CONTRACT-08
+    def test_digit_segment_fields_fail(self):
+        result = _lint_fbs("""
+            namespace lint_test;
+            struct Inner { width_m:float; }
+            struct BadDigit {
+              module_0:Inner;
+              motor_1_v:double;
+              sensor_2_ok:bool;
+              samples_0_m:[float:2];
+              module0:Inner;
+              slot0_v:double;
+              accel_mps2:double;
+            }
+        """)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(
+            _reported(result.stderr),
+            {
+                "BadDigit.module_0",
+                "BadDigit.motor_1_v",
+                "BadDigit.sensor_2_ok",
+                "BadDigit.samples_0_m",
+            },
+        )
+        self.assertIn("'_<digit>'", result.stderr)
+        self.assertNotIn("end every numeric field with a unit suffix",
+                         result.stderr)
+
+    # REQ-CONTRACT-08
+    def test_interior_one_letter_before_unit_suffix_fails(self):
+        result = _lint_fbs("""
+            namespace lint_test;
+            struct BadOneLetter {
+              std_x_m:double;
+              err_y_rad:double;
+              pos_z_mps2:double;
+              a_b_m:double;
+              arr_x_v:[float:2];
+              flag_a_id:bool;
+              x_m:double;
+              y_m:double;
+              z_m:double;
+              q_w:double;
+              v_mps:double;
+              x_std_m:double;
+              y_err_rad:double;
+            }
+        """)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(
+            _reported(result.stderr),
+            {
+                "BadOneLetter.std_x_m",
+                "BadOneLetter.err_y_rad",
+                "BadOneLetter.pos_z_mps2",
+                "BadOneLetter.a_b_m",
+                "BadOneLetter.arr_x_v",
+                "BadOneLetter.flag_a_id",
+            },
+        )
+        self.assertIn("one-letter word before its unit suffix", result.stderr)
+        self.assertNotIn("end every numeric field with a unit suffix",
+                         result.stderr)
 
 
 class TalosMessagesMacroContractTest(unittest.TestCase):
