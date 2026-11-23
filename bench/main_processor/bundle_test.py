@@ -53,6 +53,7 @@ import tempfile
 import tomllib
 import unittest
 import urllib.request
+import uuid
 
 from python.runfiles import runfiles
 
@@ -510,7 +511,10 @@ class BundleTest(unittest.TestCase):
             env = dict(
                 os.environ,
                 TALOS_LOG_DIR=log_dir,
-                TALOS_SHM_NAMESPACE=f"bundle_studio_{os.getpid()}",
+                # Not the process id: Bazel's sandbox gives each test its
+                # own process-id namespace, so two tests at once can both
+                # be pid 12, while /dev/shm is the host's.
+                TALOS_SHM_NAMESPACE=f"bundle_studio_{uuid.uuid4().hex}",
             )
             proc = subprocess.Popen(
                 [os.path.join(installed, "run.sh"), "--sim",
