@@ -45,6 +45,7 @@ extern zarray_t* gradient_clusters(apriltag_detector_t* td,
 extern zarray_t* fit_quads(apriltag_detector_t* td, int w, int h,
                            zarray_t* clusters, image_u8_t* im);
 extern image_u8_t* threshold(apriltag_detector_t* td, image_u8_t* im);
+extern zarray_t* apriltag_quad_thresh(apriltag_detector_t* td, image_u8_t* im);
 
 // Internal point structure matching apriltag_quad_thresh.c for debug visualizer
 struct pt {
@@ -716,11 +717,13 @@ static zarray_t* quad_thresh_from_threshim_and_uf(apriltag_detector_t* td,
                                                   image_u8_t* im,
                                                   image_u8_t* threshim,
                                                   unionfind_t* external_uf) {
-  assert(td != NULL);
-  assert(im != NULL);
-  assert(threshim != NULL);
-  assert(im->width == threshim->width);
-  assert(im->height == threshim->height);
+  if (td == NULL || im == NULL || threshim == NULL || im->buf == NULL ||
+      threshim->buf == NULL || im->width <= 0 || im->height <= 0 ||
+      im->width != threshim->width || im->height != threshim->height ||
+      threshim->stride < threshim->width) {
+    if (external_uf != NULL) unionfind_destroy(external_uf);
+    return NULL;
+  }
 
   // threshold()/connected_components()/gradient_clusters()/fit_quads() all
   // dereference td->wp. apriltag_detector_create() leaves wp NULL (deferred
@@ -883,14 +886,18 @@ zarray_t* apriltag_quad_thresh_from_threshim(apriltag_detector_t* td,
 static unionfind_t* unionfind_from_gpu_labels(int w, int h,
                                               const uint32_t* gpu_parents,
                                               const uint32_t* gpu_sizes) {
-  if (gpu_parents == NULL || gpu_sizes == NULL) {
+  if (w <= 0 || h <= 0 || gpu_parents == NULL || gpu_sizes == NULL) {
     return NULL;
   }
-  unionfind_t* uf = unionfind_create((uint32_t)(w * h));
+  const uint64_t npix = (uint64_t)w * (uint64_t)h;
+  if (npix > UINT32_MAX) {
+    return NULL;
+  }
+  unionfind_t* uf = unionfind_create((uint32_t)npix);
   if (uf == NULL) {
     return NULL;
   }
-  const size_t n = (size_t)w * (size_t)h;
+  const size_t n = (size_t)npix;
   memcpy(uf->parent, gpu_parents, n * sizeof(uint32_t));
   for (size_t i = 0; i < n; i++) {
     uint32_t s = gpu_sizes[i];
@@ -905,7 +912,8 @@ zarray_t* apriltag_quad_thresh_from_gpu_labels(apriltag_detector_t* td,
                                                const uint32_t* gpu_parents,
                                                const uint32_t* gpu_sizes) {
   unionfind_t* uf = NULL;
-  if (im != NULL && threshim != NULL) {
+  if (im != NULL && threshim != NULL && im->width > 0 && im->height > 0 &&
+      im->width == threshim->width && im->height == threshim->height) {
     uf = unionfind_from_gpu_labels(im->width, im->height, gpu_parents,
                                    gpu_sizes);
   }
@@ -938,6 +946,10 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
                                              const uint32_t* gpu_parents,
                                              const uint32_t* gpu_sizes,
                                              zarray_t* external_clusters) {
+  if (td == NULL || im_orig == NULL) {
+    destroy_clusters(external_clusters);
+    return NULL;
+  }
   if (threshim == NULL) {
     destroy_clusters(external_clusters);
     return apriltag_detector_detect(td, im_orig);
@@ -1024,11 +1036,19 @@ static zarray_t* detect_with_external_stages(apriltag_detector_t* td,
   } else if (gpu_parents != NULL && gpu_sizes != NULL &&
              quad_im->width == threshim->width &&
              quad_im->height == threshim->height) {
+    destroy_clusters(external_clusters);
     quads = apriltag_quad_thresh_from_gpu_labels(td, quad_im, threshim,
                                                  gpu_parents, gpu_sizes);
-  } else {
+  } else if (quad_im->width == threshim->width &&
+             quad_im->height == threshim->height) {
     destroy_clusters(external_clusters);
     quads = apriltag_quad_thresh_from_threshim(td, quad_im, threshim);
+  } else {
+    destroy_clusters(external_clusters);
+    quads = apriltag_quad_thresh(td, quad_im);
+  }
+  if (quads == NULL) {
+    quads = apriltag_quad_thresh(td, quad_im);
   }
 
   // Quad fitting uses the decimated image; refinement and decoding below
