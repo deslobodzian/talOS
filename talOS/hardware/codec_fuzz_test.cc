@@ -103,6 +103,7 @@ void CheckConfigAckRoundTrip(std::span<const uint8_t> input) {
   if (!DecodeConfigAck(input, ack)) return;
   std::vector<uint8_t> encoded(sizeof(ConfigAckPayload));
   ASSERT_EQ(EncodeConfigAck(ack, encoded), encoded.size());
+  EXPECT_EQ(encoded, std::vector<uint8_t>(input.begin(), input.end()));
   ConfigAckPayload again;
   ASSERT_TRUE(DecodeConfigAck(encoded, again));
   std::vector<uint8_t> roundtrip(encoded.size());

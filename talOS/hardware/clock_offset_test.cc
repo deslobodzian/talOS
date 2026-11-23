@@ -348,6 +348,7 @@ TEST(ClockOffset, BridgeCadenceExchangesKeepTheBoundValidWithoutGaps) {
   EXPECT_EQ(outside_bound, 0u);
 }
 
+// REQ-RT-20
 TEST(ClockOffset, ExtremeTimestampsDoNotOverflowSignedArithmetic) {
   Estimator clock;
   const std::uint64_t max_u64 = std::numeric_limits<std::uint64_t>::max();
@@ -356,10 +357,20 @@ TEST(ClockOffset, ExtremeTimestampsDoNotOverflowSignedArithmetic) {
   // Difference > INT64_MAX between receipt_us and sample_time_us, and spread
   // spanning INT64_MIN..INT64_MAX across samples.
   EXPECT_TRUE(clock.Observe(1, 0, max_i64));
+  EXPECT_EQ(clock.offset_us(), static_cast<std::int64_t>(max_i64));
   EXPECT_TRUE(clock.Observe(1, 1, 0));
+  EXPECT_EQ(clock.offset_us(), -1);
   EXPECT_TRUE(clock.Observe(1, max_u64 / 2, max_u64));
+  EXPECT_EQ(clock.offset_us(), std::numeric_limits<std::int64_t>::min());
   EXPECT_GT(clock.spread_us(), max_i64);
-  clock.ObserveExchange(1, 1000, max_u64 - 10, 2000);
+
+  // Two-way exchange with extreme gateway timestamp (t2 near UINT64_MAX):
+  // mid = 1500, unsigned modular (mid - t2) = 1500 - (max_u64 - 10) = 1511.
+  clock.ObserveExchange(1, /*t1=*/1000, /*t2=*/max_u64 - 10, /*t4=*/2000);
+  EXPECT_TRUE(clock.accuracy_valid());
+  EXPECT_EQ(clock.round_trip_us(), 1000u);
+  EXPECT_EQ(clock.uncertainty_us(), 503u);
+  EXPECT_EQ(clock.bounded_offset_us(), 1511);
 }
 
 }  // namespace
