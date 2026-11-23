@@ -39,7 +39,8 @@ std::vector<std::byte> read_whole_file(std::string_view path) {
                             "LogReader: fstat failed for " + std::string{path});
   }
 
-  std::vector<std::byte> data(static_cast<std::size_t>(st.st_size));
+  std::vector<std::byte> data(
+      st.st_size > 0 ? static_cast<std::size_t>(st.st_size) : std::size_t{0});
   std::size_t read_bytes = 0;
   while (read_bytes < data.size()) {
     const ssize_t n =
@@ -168,7 +169,7 @@ class FileSource {
       throw std::system_error(error, std::generic_category(),
                               "LogReader: fstat failed");
     }
-    size_ = static_cast<std::uint64_t>(st.st_size);
+    size_ = st.st_size > 0 ? static_cast<std::uint64_t>(st.st_size) : 0;
     device_ = st.st_dev;
     inode_ = st.st_ino;
     DescriptorCache& cache = DescriptorCache::instance();
@@ -191,8 +192,8 @@ class FileSource {
   // Up to `n` (at most kChunk) bytes at `offset`, valid until the next call;
   // fewer only at the end of the file.
   std::span<const std::byte> view(std::uint64_t offset, std::size_t n) {
-    if (offset < window_offset_ ||
-        offset + n > window_offset_ + window_.size()) {
+    if (offset < window_offset_ || n > window_.size() ||
+        offset - window_offset_ > window_.size() - n) {
       DescriptorCache& cache = DescriptorCache::instance();
       // Held across the read, so no other source closes this descriptor.
       const std::lock_guard lock{cache.mutex()};
@@ -394,10 +395,14 @@ Registration registration_of(const ManifestEntry& entry,
   reg.offset_ns = entry.offset_ns;
   reg.armed = entry.armed != 0;
   const char* text = reinterpret_cast<const char*>(schema);
-  reg.schema.name.assign(text, entry.schema_name_bytes);
+  if (entry.schema_name_bytes > 0) {
+    reg.schema.name.assign(text, entry.schema_name_bytes);
+  }
   reg.schema.hash = entry.schema_hash;
-  reg.schema.bfbs.assign(text + entry.schema_name_bytes,
-                         entry.schema_bfbs_bytes);
+  if (entry.schema_bfbs_bytes > 0) {
+    reg.schema.bfbs.assign(text + entry.schema_name_bytes,
+                           entry.schema_bfbs_bytes);
+  }
   return reg;
 }
 
@@ -487,13 +492,19 @@ LogReader::LogReader(std::string_view path)
     throw IncompleteLogHeader("LogReader: file too short for its header");
   }
 
-  const std::size_t manifest_bytes_size =
-      static_cast<std::size_t>(header.manifest_count) * sizeof(ManifestEntry);
-  const std::size_t manifest_offset = header.header_bytes;
-  const std::size_t schema_offset = manifest_offset + manifest_bytes_size;
+  const std::uint64_t manifest_bytes_size_u64 =
+      std::uint64_t{header.manifest_count} * sizeof(ManifestEntry);
+  const std::uint64_t manifest_offset = header.header_bytes;
+  if (data_.size() < manifest_offset ||
+      data_.size() - manifest_offset < manifest_bytes_size_u64) {
+    throw IncompleteLogHeader("LogReader: file too short for its manifest");
+  }
+  const auto manifest_bytes_size =
+      static_cast<std::size_t>(manifest_bytes_size_u64);
+  const std::size_t schema_offset =
+      static_cast<std::size_t>(manifest_offset) + manifest_bytes_size;
 
-  if (data_.size() < schema_offset ||
-      data_.size() - schema_offset < header.schema_bytes) {
+  if (data_.size() - schema_offset < header.schema_bytes) {
     throw IncompleteLogHeader("LogReader: file too short for its manifest");
   }
 
@@ -837,7 +848,9 @@ std::optional<LogGap> GapOf(const RecordHeader& header,
 std::string DescribeGap(const LogGap& gap) {
   char seconds[32];
   std::snprintf(seconds, sizeof(seconds), "%.3f",
-                static_cast<double>(gap.resumed_ns - gap.start_ns) / 1e9);
+                (static_cast<double>(gap.resumed_ns) -
+                 static_cast<double>(gap.start_ns)) /
+                    1e9);
   if (!gap.detailed) {
     return std::string{"capture lost records over "} + seconds +
            " s from dispatch " + std::to_string(gap.first_dispatch_index);
