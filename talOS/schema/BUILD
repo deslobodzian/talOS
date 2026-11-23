@@ -162,7 +162,8 @@ py_library(
     deps = ["@pypi//flatbuffers"],
 )
 
-# `import talos_schema`: struct_hash from .bfbs bytes, equal to C++'s.
+# `import talos_schema`: struct lookup and struct_hash from .bfbs bytes,
+# equal to C++'s.
 py_library(
     name = "talos_schema",
     srcs = ["talos_schema/__init__.py"],
