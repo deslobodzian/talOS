@@ -406,7 +406,10 @@ std::string TrappedRun(const std::string& record, std::string_view then) {
   return "trap 'exit 0' INT TERM\n" + RecordLogArgThen(record, then);
 }
 
-// A stub's tail that runs until the session stops it.
+// A stub's tail that runs until the session stops it. Only safe after an
+// active INT/TERM trap (such as TrappedRun): without a trap, bash's
+// wait-and-cooperative-exit can ignore SIGINT when it lands in a child
+// sleep's fork window; untrapped stubs must use `exec sleep 86400`.
 constexpr std::string_view kLoopUntilStopped = "while :; do sleep 0.05; done\n";
 
 // A run whose live endpoints differ from its probe's is reported, recorded
@@ -5585,7 +5588,7 @@ TEST(Supervision, BridgeProtocolMismatchWarnsOncePerRunAndRewarnsOnRestart) {
   options.max_restarts = 2;
   // Run 1 records its pid and waits for `crash_run1`, then exits 1 (triggers
   // immediate restart for critical hardware_node). Run 2 records its pid and
-  // sleeps until stopped.
+  // execs sleep until stopped (no bash WCE loop that could swallow SIGINT).
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       WriteDescribedStub("proto_warn_hw", bridge_desc,
                          "echo $$ >> '" + hw_runs +
@@ -5598,11 +5601,11 @@ TEST(Supervision, BridgeProtocolMismatchWarnsOncePerRunAndRewarnsOnRestart) {
                              "' ]; do sleep 0.01; done\n"
                              "  exit 1\n"
                              "fi\n"
-                             "while :; do sleep 0.05; done\n");
+                             "exec sleep 86400\n");
   options.binary_overrides["//example/alpha:node"] =
-      WriteStub("proto_warn_alpha", "while :; do sleep 0.05; done\n", "alpha");
+      WriteStub("proto_warn_alpha", "exec sleep 86400\n", "alpha");
   options.binary_overrides["//example/beta:node"] =
-      WriteStub("proto_warn_beta", "while :; do sleep 0.05; done\n", "beta");
+      WriteStub("proto_warn_beta", "exec sleep 86400\n", "beta");
 
   const std::string session_dir =
       options.output_dir + "/" + std::to_string(options.session_id);
