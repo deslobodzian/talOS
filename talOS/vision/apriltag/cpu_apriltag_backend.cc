@@ -239,11 +239,12 @@ std::vector<Detection> CpuAprilTagBackend::Detect(
   };
 
   // AprilTag's internal thresholding requires stride to match its aligned
-  // layout. Furthermore, when decimation <= 1 and quad_sigma > 0, apriltag
-  // blurs in-place. If stride != width or in-place blur would occur, copy into
-  // a clean image_u8 buffer to guarantee safety and buffer immutability.
+  // layout. Furthermore, when decimation <= 1 and quad_sigma != 0, apriltag
+  // blurs (> 0) or sharpens (< 0) in-place. If stride != width or in-place
+  // filtering would occur, copy into a clean image_u8 buffer to guarantee
+  // safety and buffer immutability.
   if (actual_stride != width ||
-      (options_.quad_sigma > 0.0f && options_.quad_decimate <= 1.0f)) {
+      (options_.quad_sigma != 0.0f && options_.quad_decimate <= 1.0f)) {
     im = image_u8_create(width, height);
     for (int y = 0; y < height; ++y) {
       std::memcpy(&im->buf[static_cast<size_t>(y) * im->stride],

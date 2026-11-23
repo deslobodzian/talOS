@@ -132,7 +132,7 @@ class SO3 {
     const Matrix3 w_hat = Hat(w);
     const Matrix3 w_hat_sq = w_hat * w_hat;
     Scalar a, b;
-    if (theta < TaylorThreshold()) {
+    if (theta_sq < TaylorThreshold()) {
       a = Scalar(0.5) - theta_sq / Scalar(24);
       b = Scalar(1) / Scalar(6) - theta_sq / Scalar(120);
     } else {

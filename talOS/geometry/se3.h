@@ -111,7 +111,7 @@ class SE3 {
     const Matrix3 w_hat = SO3<Scalar>::Hat(w);
     const Matrix3 w_hat_sq = w_hat * w_hat;
     Scalar a, b;
-    if (theta < TaylorThreshold()) {
+    if (theta_sq < TaylorThreshold()) {
       a = Scalar(0.5) * (Scalar(1) - theta_sq / Scalar(12));
       b = Scalar(1) / Scalar(6) * (Scalar(1) - theta_sq / Scalar(20));
     } else {

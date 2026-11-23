@@ -2,10 +2,12 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <vector>
 
 namespace talos::vision {
@@ -200,6 +202,68 @@ TEST(FrameTest, HoldsImageValidatesDimensionsStrideAndStorage) {
   EXPECT_TRUE(allocated.holds_image());
   allocated.set_height(11);
   EXPECT_FALSE(allocated.holds_image());
+}
+
+TEST(FrameTest, ConcurrentConstShareIsRaceFreeAndPreservesCow) {
+  constexpr int kThreads = 8;
+  constexpr int kRounds = 64;
+  constexpr uint32_t kWidth = 32;
+  constexpr uint32_t kHeight = 16;
+  constexpr size_t kBytes = static_cast<size_t>(kWidth) * kHeight;
+  const auto t0 = talos::event::MonotonicTime::from_nanos(777);
+
+  for (int round = 0; round < kRounds; ++round) {
+    Frame mutable_frame(0, 1, static_cast<uint64_t>(round), t0, kWidth, kHeight,
+                        PixelFormat::kGray8);
+    for (size_t i = 0; i < kBytes; ++i) {
+      mutable_frame.mutable_data()[i] =
+          static_cast<uint8_t>((i + static_cast<size_t>(round)) & 0xFF);
+    }
+    const Frame& orig = mutable_frame;
+    const uint8_t* expected_ptr = orig.data();
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+      threads.emplace_back([&]() {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        Frame shared = orig.Share();
+        if (!shared.is_shared() || !shared.holds_image() ||
+            shared.data() != expected_ptr ||
+            shared.data()[0] != static_cast<uint8_t>(round & 0xFF) ||
+            shared.data()[kBytes - 1] !=
+                static_cast<uint8_t>((kBytes - 1 + round) & 0xFF)) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreads) {
+      std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& th : threads) th.join();
+    ASSERT_EQ(failures.load(), 0) << "round " << round;
+  }
+
+  // Mutating the original frame after Share() must copy-on-write without
+  // mutating previously shared handles.
+  Frame orig(0, 1, 1, t0, kWidth, kHeight, PixelFormat::kGray8);
+  orig.mutable_data()[0] = 11;
+  orig.mutable_data()[kBytes - 1] = 22;
+  const Frame shared = orig.Share();
+  EXPECT_EQ(shared.data(), orig.data());
+  orig.mutable_data()[0] = 99;
+  EXPECT_NE(shared.data(), orig.data());
+  EXPECT_EQ(shared.data()[0], 11);
+  EXPECT_EQ(shared.data()[kBytes - 1], 22);
+  EXPECT_EQ(orig.data()[0], 99);
+  EXPECT_EQ(orig.data()[kBytes - 1], 22);
 }
 
 }  // namespace

@@ -1073,5 +1073,67 @@ TEST(LocalizationTest,
       direct.T_camera_tag.matrix().isApprox(secondary_cam_tag.matrix(), 1e-3));
 }
 
+TEST(LocalizationTest, EstimateTagPoseRejectsNonFiniteInputs) {
+  using Pose = talos::geometry::SE3<double>;
+  CameraIntrinsics intr;
+  intr.fx = 600.0;
+  intr.fy = 600.0;
+  intr.cx = 320.0;
+  intr.cy = 240.0;
+
+  constexpr double kTagSize = 0.2;
+  const Pose frontal = SolverTagFrameToLayoutFrame(
+      Pose(talos::geometry::SO3<double>::Identity(), {0.0, 0.0, 2.0}));
+  const auto model = GetTagModelCorners(kTagSize);
+  std::array<float, 8> valid_corners{};
+  for (size_t i = 0; i < 4; ++i) {
+    Eigen::Vector2d uv;
+    ASSERT_TRUE(intr.ProjectPoint(frontal.act(model[i]), &uv));
+    valid_corners[2 * i] = static_cast<float>(uv.x());
+    valid_corners[2 * i + 1] = static_cast<float>(uv.y());
+  }
+  // Planar homography for the centered frontal tag: u = 30*x + 320, v = 30*y +
+  // 240.
+  const std::array<float, 9> valid_homography = {
+      30.0f, 0.0f, 320.0f, 0.0f, 30.0f, 240.0f, 0.0f, 0.0f, 1.0f};
+
+  Pose p1, p2;
+  double e1 = 0.0, e2 = 0.0, amb = 0.0;
+  ASSERT_TRUE(EstimateTagPoseFromHomography(valid_homography, intr, kTagSize,
+                                            &p1, &p2, &e1, &e2, &amb,
+                                            &valid_corners));
+  ASSERT_TRUE(EstimateTagPoseFromHomography(valid_homography, intr, kTagSize,
+                                            &p1, &p2, &e1, &e2, &amb, nullptr));
+
+  const double d_nan = std::numeric_limits<double>::quiet_NaN();
+  const double d_inf = std::numeric_limits<double>::infinity();
+  const float f_nan = std::numeric_limits<float>::quiet_NaN();
+  const float f_inf = std::numeric_limits<float>::infinity();
+
+  for (const double bad_size : {d_nan, d_inf, -d_inf}) {
+    EXPECT_FALSE(EstimateTagPoseFromHomography(valid_homography, intr, bad_size,
+                                               &p1, &p2, &e1, &e2, &amb,
+                                               &valid_corners))
+        << bad_size;
+  }
+
+  for (const float bad : {f_nan, f_inf, -f_inf}) {
+    auto bad_h = valid_homography;
+    bad_h[0] = bad;
+    EXPECT_FALSE(EstimateTagPoseFromHomography(bad_h, intr, kTagSize, &p1, &p2,
+                                               &e1, &e2, &amb, nullptr));
+
+    auto bad_w_h = valid_homography;
+    bad_w_h[8] = bad;
+    EXPECT_FALSE(EstimateTagPoseFromHomography(bad_w_h, intr, kTagSize, &p1,
+                                               &p2, &e1, &e2, &amb, nullptr));
+
+    auto bad_c = valid_corners;
+    bad_c[0] = bad;
+    EXPECT_FALSE(EstimateTagPoseFromHomography(
+        valid_homography, intr, kTagSize, &p1, &p2, &e1, &e2, &amb, &bad_c));
+  }
+}
+
 }  // namespace
 }  // namespace talos::vision

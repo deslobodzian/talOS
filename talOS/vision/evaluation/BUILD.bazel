@@ -38,3 +38,20 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "recording_eval_test",
+    size = "small",
+    srcs = ["recording_eval_test.cc"],
+    data = [
+        ":recording_eval",
+        "//talOS/vision/testdata",
+    ],
+    env = {
+        "RECORDING_EVAL_BIN": "$(rootpath :recording_eval)",
+    },
+    deps = [
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)

@@ -85,7 +85,8 @@ inline bool EstimateTagPoseFromHomography(
     talos::geometry::SE3<double>* secondary_pose, double* primary_err_out,
     double* secondary_err_out, double* ambiguity_out,
     const std::array<float, 8>* observed_corners = nullptr) {
-  if (!intrinsics.IsValid() || tag_size_m <= 0.0) {
+  if (!intrinsics.IsValid() || !std::isfinite(tag_size_m) ||
+      tag_size_m <= 0.0) {
     return false;
   }
 
@@ -103,8 +104,11 @@ inline bool EstimateTagPoseFromHomography(
     for (int c = 0; c < 4; ++c) {
       const Eigen::Index row = Eigen::Index{2} * c;
       const auto corner = static_cast<std::size_t>(row);
-      const auto uv = intrinsics.UndistortPoint(
-          {(*observed_corners)[corner], (*observed_corners)[corner + 1]});
+      const float obs_u = (*observed_corners)[corner];
+      const float obs_v = (*observed_corners)[corner + 1];
+      if (!std::isfinite(obs_u) || !std::isfinite(obs_v)) return false;
+      const auto uv = intrinsics.UndistortPoint({obs_u, obs_v});
+      if (!uv.allFinite()) return false;
       const double x = xs[c], y = ys[c], u = uv.x(), v = uv.y();
       a.row(row) << x, y, 1, 0, 0, 0, -u * x, -u * y;
       a.row(row + 1) << 0, 0, 0, x, y, 1, -v * x, -v * y;
@@ -113,28 +117,40 @@ inline bool EstimateTagPoseFromHomography(
       temp_det.p[c][0] = u;
       temp_det.p[c][1] = v;
     }
+    if (!a.allFinite() || !b.allFinite()) return false;
     const auto lu = a.fullPivLu();
     if (!lu.isInvertible()) return false;
     const Eigen::Matrix<double, 8, 1> h = lu.solve(b);
+    if (!h.allFinite()) return false;
     for (int i = 0; i < 8; ++i) h_data[i] = h(i);
     h_data[8] = 1;
   } else {
+    for (int i = 0; i < 9; ++i) {
+      if (!std::isfinite(h_data[i])) return false;
+    }
     constexpr double xs[4] = {-1, 1, 1, -1};
     constexpr double ys[4] = {1, 1, -1, -1};
     for (int c = 0; c < 4; ++c) {
       const double w = h_data[6] * xs[c] + h_data[7] * ys[c] + h_data[8];
-      if (std::abs(w) < 1e-12) return false;
+      if (!std::isfinite(w) || std::abs(w) < 1e-12) return false;
       temp_det.p[c][0] =
           (h_data[0] * xs[c] + h_data[1] * ys[c] + h_data[2]) / w;
       temp_det.p[c][1] =
           (h_data[3] * xs[c] + h_data[4] * ys[c] + h_data[5]) / w;
+      if (!std::isfinite(temp_det.p[c][0]) ||
+          !std::isfinite(temp_det.p[c][1])) {
+        return false;
+      }
     }
   }
-  temp_det.H = matd_create_data(3, 3, h_data);
   for (int c = 0; c < 4; ++c) {
     temp_det.c[0] += temp_det.p[c][0] * 0.25;
     temp_det.c[1] += temp_det.p[c][1] * 0.25;
   }
+  if (!std::isfinite(temp_det.c[0]) || !std::isfinite(temp_det.c[1])) {
+    return false;
+  }
+  temp_det.H = matd_create_data(3, 3, h_data);
 
   apriltag_detection_info_t info{
       .det = &temp_det,
@@ -154,11 +170,15 @@ inline bool EstimateTagPoseFromHomography(
       estimate_tag_pose_orthogonal_iteration(&info, &err1, &p1, &err2, &p2, 50);
   matd_destroy(temp_det.H);
 
-  if (!p1.R || !p1.t) {
+  auto destroy_poses = [&]() {
     if (p1.R) matd_destroy(p1.R);
     if (p1.t) matd_destroy(p1.t);
     if (p2.R) matd_destroy(p2.R);
     if (p2.t) matd_destroy(p2.t);
+  };
+
+  if (!p1.R || !p1.t) {
+    destroy_poses();
     return false;
   }
 
@@ -171,13 +191,21 @@ inline bool EstimateTagPoseFromHomography(
   }
   Eigen::Vector3d t1(MATD_EL(p1.t, 0, 0), MATD_EL(p1.t, 1, 0),
                      MATD_EL(p1.t, 2, 0));
+  if (!R1.allFinite() || !t1.allFinite()) {
+    destroy_poses();
+    return false;
+  }
   talos::geometry::SE3<double> pose1(
       talos::geometry::SO3<double>::FromMatrixNormalized(R1), t1);
+  if (!pose1.matrix().allFinite()) {
+    destroy_poses();
+    return false;
+  }
 
-  // Convert p2 to SE3 if available
+  // Convert p2 to SE3 if available and finite
   talos::geometry::SE3<double> pose2 = pose1;
-  const bool has_secondary = p2.R && p2.t;
-  if (p2.R && p2.t) {
+  bool has_secondary = p2.R && p2.t;
+  if (has_secondary) {
     Eigen::Matrix3d R2;
     for (int r = 0; r < 3; ++r) {
       for (int c = 0; c < 3; ++c) {
@@ -186,14 +214,20 @@ inline bool EstimateTagPoseFromHomography(
     }
     Eigen::Vector3d t2(MATD_EL(p2.t, 0, 0), MATD_EL(p2.t, 1, 0),
                        MATD_EL(p2.t, 2, 0));
-    pose2 = talos::geometry::SE3<double>(
-        talos::geometry::SO3<double>::FromMatrixNormalized(R2), t2);
+    if (R2.allFinite() && t2.allFinite()) {
+      const talos::geometry::SE3<double> candidate(
+          talos::geometry::SO3<double>::FromMatrixNormalized(R2), t2);
+      if (candidate.matrix().allFinite()) {
+        pose2 = candidate;
+      } else {
+        has_secondary = false;
+      }
+    } else {
+      has_secondary = false;
+    }
   }
 
-  matd_destroy(p1.R);
-  matd_destroy(p1.t);
-  if (p2.R) matd_destroy(p2.R);
-  if (p2.t) matd_destroy(p2.t);
+  destroy_poses();
 
   // The orthogonal-iteration solutions live in the solver's tag frame;
   // convert to the WPILib/layout frame before anyone composes or reprojects
