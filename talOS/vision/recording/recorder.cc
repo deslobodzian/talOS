@@ -323,6 +323,12 @@ struct FrameRecorder::Impl {
         pending_observation = slot->observation;
         pending_truth = slot->truth;
       }
+      if (options.test_before_pair) {
+        options.test_before_pair([this] {
+          std::lock_guard lock(mutex);
+          return stop;
+        });
+      }
       try {
         WritePair(gray, detections, pending_capture_ns, pending_reason,
                   pending_observation, pending_truth);
@@ -385,9 +391,6 @@ struct FrameRecorder::Impl {
 
     pending_stem = UniqueStem(RecordStem(capture_ns, reason));
     const std::string& stem = pending_stem;
-    if (options.test_write_delay.count() > 0) {
-      std::this_thread::sleep_for(options.test_write_delay);
-    }
     cv::Mat image(options.context.height, options.context.width, CV_8UC1,
                   const_cast<std::uint8_t*>(gray.data()));
     std::vector<std::uint8_t> png;
