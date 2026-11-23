@@ -1,12 +1,15 @@
 #include "studio/review/review.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <charconv>
 #include <cstring>
-#include <fstream>
-#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
@@ -87,38 +90,58 @@ struct SessionEntry {
   std::vector<std::pair<std::string, std::uintmax_t>> files;
 };
 
+// Reads one regular non-symlink file up to `max_bytes` using O_NOFOLLOW +
+// O_NONBLOCK + fstat + bounded chunked reads, so symlinks, FIFOs, device nodes,
+// and growing files never escape confinement, hang, or allocate unbounded
+// memory (REQ-OPS-42, REQ-SAFE-35).
+std::optional<std::string> ReadBoundedRegularFile(const fs::path& path,
+                                                  std::uintmax_t max_bytes) {
+  std::error_code error;
+  const fs::file_status st = fs::symlink_status(path, error);
+  if (error || fs::is_symlink(st) || !fs::is_regular_file(st)) {
+    return std::nullopt;
+  }
+  struct ScopedFd {
+    int fd{-1};
+    ~ScopedFd() {
+      if (fd >= 0) ::close(fd);
+    }
+  };
+  const ScopedFd file{
+      ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)};
+  if (file.fd < 0) return std::nullopt;
+  struct stat sb {};
+  if (::fstat(file.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size <= 0 ||
+      static_cast<std::uintmax_t>(sb.st_size) > max_bytes) {
+    return std::nullopt;
+  }
+  std::string body;
+  body.reserve(static_cast<std::size_t>(sb.st_size));
+  std::array<char, 8192> chunk{};
+  for (;;) {
+    const ssize_t got = ::read(file.fd, chunk.data(), chunk.size());
+    if (got == 0) break;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      return std::nullopt;
+    }
+    if (body.size() + static_cast<std::size_t>(got) > max_bytes) {
+      return std::nullopt;
+    }
+    body.append(chunk.data(), static_cast<std::size_t>(got));
+  }
+  if (body.empty()) return std::nullopt;
+  return body;
+}
+
 // Reads one regular non-symlink JSON file from a session directory up to
 // `max_bytes`, returning 404 when absent, symlinked, non-regular, empty or
 // oversized.
 Response ReadSessionJsonFile(const fs::path& path, std::uintmax_t max_bytes,
                              std::string_view missing_message) {
-  std::error_code error;
-  const fs::file_status st = fs::symlink_status(path, error);
-  if (error || fs::is_symlink(st) || !fs::is_regular_file(st)) {
-    return Error(404, std::string{missing_message});
-  }
-  const auto bytes = fs::file_size(path, error);
-  if (error || bytes == 0 || bytes > max_bytes) {
-    return Error(404, std::string{missing_message});
-  }
-  std::ifstream stream{path, std::ios::binary};
-  if (!stream.is_open()) return Error(404, std::string{missing_message});
-  std::string body;
-  body.reserve(static_cast<std::size_t>(bytes));
-  std::array<char, 8192> chunk{};
-  while (stream) {
-    stream.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-    const std::streamsize got = stream.gcount();
-    if (got <= 0) break;
-    if (body.size() + static_cast<std::size_t>(got) > max_bytes) {
-      return Error(404, std::string{missing_message});
-    }
-    body.append(chunk.data(), static_cast<std::size_t>(got));
-  }
-  if (stream.bad() || body.empty()) {
-    return Error(404, std::string{missing_message});
-  }
-  return {200, "application/json", std::move(body)};
+  auto body = ReadBoundedRegularFile(path, max_bytes);
+  if (!body) return Error(404, std::string{missing_message});
+  return {200, "application/json", std::move(*body)};
 }
 
 // A session's class from what the launcher already decided, never from its
@@ -137,13 +160,25 @@ std::string_view ClassOf(const fs::path& dir, const SessionEntry& entry) {
   return "unknown";
 }
 
-// A library session: a directory holding a manifest or an event log.
+// A library session: a directory holding a regular non-symlink manifest or
+// event log.
 bool IsSession(const fs::path& dir) {
   std::error_code error;
-  if (fs::is_regular_file(dir / "manifest.json", error)) return true;
+  const fs::file_status manifest_st =
+      fs::symlink_status(dir / "manifest.json", error);
+  if (!error && !fs::is_symlink(manifest_st) &&
+      fs::is_regular_file(manifest_st)) {
+    return true;
+  }
+  error.clear();
   for (fs::directory_iterator it{dir, error};
        !error && it != fs::directory_iterator{}; it.increment(error)) {
-    if (it->path().extension() == ".tlog") return true;
+    std::error_code entry_error;
+    const fs::file_status st = it->symlink_status(entry_error);
+    if (!entry_error && !fs::is_symlink(st) && fs::is_regular_file(st) &&
+        it->path().extension() == ".tlog") {
+      return true;
+    }
   }
   return false;
 }
@@ -157,7 +192,8 @@ std::optional<SessionEntry> ReadEntry(const fs::path& dir) {
   for (fs::directory_iterator it{dir, error};
        !error && it != fs::directory_iterator{}; it.increment(error)) {
     std::error_code file_error;
-    if (!it->is_regular_file(file_error)) continue;
+    const fs::file_status st = it->symlink_status(file_error);
+    if (file_error || fs::is_symlink(st) || !fs::is_regular_file(st)) continue;
     const std::string name = it->path().filename().string();
     session = session || name == "manifest.json" || name.ends_with(".tlog");
     const auto bytes = it->file_size(file_error);
@@ -171,26 +207,25 @@ std::optional<SessionEntry> ReadEntry(const fs::path& dir) {
   // A launch's manifest that does not say it was a simulation is
   // classified, as retention classifies it (launcher::InspectSession).
   entry.classified = manifest_file != entry.files.end();
-  std::ifstream stream;
   if (entry.classified && manifest_file->second <= kMaxManifestBytes) {
-    stream.open(dir / "manifest.json");
-  }
-  if (stream.is_open()) {
-    const auto manifest = nlohmann::json::parse(
-        std::string{std::istreambuf_iterator<char>{stream}, {}}, nullptr,
-        /*allow_exceptions=*/false);
-    if (manifest.is_object()) {
-      for (const auto& [key, field] :
-           {std::pair{"start_wall_ns", &entry.start_wall_ns},
-            std::pair{"end_wall_ns", &entry.end_wall_ns}}) {
-        const auto it = manifest.find(key);
-        if (it != manifest.end() && it->is_number_integer()) {
-          *field = it->get<std::int64_t>();
+    if (const auto body =
+            ReadBoundedRegularFile(dir / "manifest.json", kMaxManifestBytes)) {
+      const auto manifest = nlohmann::json::parse(*body, nullptr,
+                                                  /*allow_exceptions=*/false);
+      if (manifest.is_object()) {
+        for (const auto& [key, field] :
+             {std::pair{"start_wall_ns", &entry.start_wall_ns},
+              std::pair{"end_wall_ns", &entry.end_wall_ns}}) {
+          const auto it = manifest.find(key);
+          if (it != manifest.end() && it->is_number_integer()) {
+            *field = it->get<std::int64_t>();
+          }
         }
+        const auto simulation = manifest.find("simulation");
+        entry.classified = simulation == manifest.end() ||
+                           !simulation->is_boolean() ||
+                           !simulation->get<bool>();
       }
-      const auto simulation = manifest.find("simulation");
-      entry.classified = simulation == manifest.end() ||
-                         !simulation->is_boolean() || !simulation->get<bool>();
     }
   }
   return entry;

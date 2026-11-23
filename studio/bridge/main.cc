@@ -1293,12 +1293,20 @@ int main(int argc, char** argv) try {
   // wake channel's descriptor) or the timer, which is set before each wait
   // to the bridge's next duty (Bridge::next_wake_ns). Every return from the
   // wait ends in the post handler below, which makes the bridge's pass.
+  struct DeadlineTimerExt {
+    Bridge* bridge;
+    studio::DeadlineTimer* deadline;
+  };
+  studio::DeadlineTimer deadline_timer;
   auto* loop = reinterpret_cast<us_loop_t*>(uWS::Loop::get());
-  auto* timer = us_create_timer(loop, 0, sizeof(Bridge*));
+  auto* timer = us_create_timer(loop, 0, sizeof(DeadlineTimerExt));
   if (!timer) throw std::runtime_error("deadline timer allocation failed");
-  *static_cast<Bridge**>(us_timer_ext(timer)) = &bridge;
+  *static_cast<DeadlineTimerExt*>(us_timer_ext(timer)) = {&bridge,
+                                                          &deadline_timer};
   const auto on_deadline = [](us_timer_t* t) {
-    ++(*static_cast<Bridge**>(us_timer_ext(t)))->deadline_wakes;
+    auto* ext = static_cast<DeadlineTimerExt*>(us_timer_ext(t));
+    ++ext->bridge->deadline_wakes;
+    ext->deadline->OnFired();
   };
   us_poll_t* wake_poll = nullptr;
   if (bridge.wake) {
@@ -1315,7 +1323,6 @@ int main(int argc, char** argv) try {
     stop_poll =
         WatchReadable(loop, stop_fd, &bridge, [](us_internal_callback_t*) {});
   }
-  std::int64_t timer_due_ns = 0;
   bool stopping = false;
   const auto pass = [&] {
     if (stopping) return;
@@ -1348,12 +1355,8 @@ int main(int argc, char** argv) try {
     const std::int64_t next_ns = bridge.next_wake_ns(now_ns);
     // Set again only when it would fire too late, or has fired: one that
     // fires early costs a pass that finds nothing due.
-    if (timer_due_ns <= now_ns || next_ns < timer_due_ns) {
-      // Whole milliseconds, rounded up, so it never fires before the duty.
-      const auto ms =
-          static_cast<int>((next_ns - now_ns + 999'999) / 1'000'000);
-      us_timer_set(timer, on_deadline, ms, 0);
-      timer_due_ns = now_ns + std::int64_t{ms} * 1'000'000;
+    if (const auto ms = deadline_timer.ArmMs(now_ns, next_ns)) {
+      us_timer_set(timer, on_deadline, *ms, 0);
     }
   };
   pass();
