@@ -1,6 +1,7 @@
 // Deterministic reader-registration boundary tests: a reader registered while
 // a DROP_NEWEST writer publishes, its two steps run one at a time.
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -457,6 +458,145 @@ TEST(RingRegistration, ForkedChildDestructionPreservesParentReaderSlot) {
   EXPECT_EQ(header->writer.waiters.load(std::memory_order_acquire) &
                 (std::uint64_t{1} << slot_id),
             0U);
+}
+
+// REQ-OPS-03, REQ-CONTRACT-21: a forked child destroying inherited standalone
+// or session_owner RTMSQueues must not decrement the parent's lifetime count,
+// mark the segment closing, or unlink the parent's live shared-memory segment.
+TEST(RingRegistration, ForkedChildDestructionPreservesParentSegmentLifetime) {
+  constexpr std::size_t kSlots = 4;
+  const std::string standalone_path = MakeUniquePath("/ring_fork_standalone");
+  const std::string session_path = MakeUniquePath("/ring_fork_session");
+  ::shm_unlink(ShmObjectName(standalone_path).c_str());
+  ::shm_unlink(ShmObjectName(session_path).c_str());
+
+  std::optional<RTMSQueue> standalone;
+  standalone.emplace(RTMSQueue{
+      standalone_path,
+      sizeof(DropNewestPayload),
+      alignof(DropNewestPayload),
+      kDropNewestSchema,
+      kSlots,
+      RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                  .read_mode = ReadMode::SEQUENCE,
+                  .publisher = true},
+  });
+  std::optional<RTMSQueue> session;
+  session.emplace(RTMSQueue{
+      session_path,
+      sizeof(DropNewestPayload),
+      alignof(DropNewestPayload),
+      kDropNewestSchema,
+      kSlots,
+      RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                  .read_mode = ReadMode::SEQUENCE,
+                  .publisher = true,
+                  .session_owner = true},
+  });
+
+  const RTMSHeader* standalone_hdr = RegistrationPeer::Header(*standalone);
+  const std::uint64_t standalone_id = standalone_hdr->segment_id;
+  const std::uint64_t session_id =
+      RegistrationPeer::Header(*session)->segment_id;
+  ASSERT_EQ(standalone_hdr->lifetime.load(std::memory_order_acquire), 1U);
+
+  const pid_t child = ::fork();
+  ASSERT_NE(child, -1);
+  if (child == 0) {
+    standalone.reset();
+    session.reset();
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  EXPECT_EQ(standalone_hdr->lifetime.load(std::memory_order_acquire), 1U)
+      << "forked child corrupted parent's standalone lifetime count";
+  {
+    RTMSQueue peer = OpenSubscriber(standalone_path, kSlots);
+    EXPECT_EQ(RegistrationPeer::Header(peer)->segment_id, standalone_id)
+        << "forked child unlinked parent's standalone segment";
+  }
+  {
+    RTMSQueue peer = OpenSubscriber(session_path, kSlots);
+    EXPECT_EQ(RegistrationPeer::Header(peer)->segment_id, session_id)
+        << "forked child unlinked parent's session_owner segment";
+  }
+}
+
+// REQ-CONTRACT-36: when all MAX_READERS slots hold dead processes and multiple
+// live subscribers call register_reader() concurrently, a subscriber that loses
+// the reclaim_dead_readers() race (freeing 0 slots itself because a peer just
+// freed them) must still rescan and claim a free slot instead of returning
+// nullopt.
+TEST(RingRegistration,
+     ConcurrentRegisterReclaimingFullDeadTableSucceedsForAll) {
+  constexpr std::size_t kSlots = 4;
+  constexpr std::size_t kThreads = 16;
+  const std::string path = MakeUniquePath("/ring_dead_race");
+  ::shm_unlink(ShmObjectName(path).c_str());
+
+  // Obtain a guaranteed-dead pid.
+  const pid_t dead_child = ::fork();
+  ASSERT_NE(dead_child, -1);
+  if (dead_child == 0) ::_exit(0);
+  int status = 0;
+  ASSERT_EQ(::waitpid(dead_child, &status, 0), dead_child);
+  const std::uint64_t dead_state =
+      (static_cast<std::uint64_t>(dead_child) << 2) |
+      static_cast<std::uint64_t>(ReaderState::ACTIVE);
+
+  RTMSQueue owner{
+      path,
+      sizeof(DropNewestPayload),
+      alignof(DropNewestPayload),
+      kDropNewestSchema,
+      kSlots,
+      RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                  .read_mode = ReadMode::SEQUENCE,
+                  .publisher = true,
+                  .session_owner = true},
+  };
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_NE(header, nullptr);
+
+  std::vector<RTMSQueue> subscribers;
+  subscribers.reserve(kThreads);
+  for (std::size_t i = 0; i < kThreads; ++i) {
+    subscribers.push_back(OpenSubscriber(path, kSlots));
+  }
+
+  for (int round = 0; round < 10; ++round) {
+    for (std::size_t i = 0; i < MAX_READERS; ++i) {
+      header->readers[i].state.store(dead_state, std::memory_order_release);
+    }
+
+    std::latch ready{static_cast<std::ptrdiff_t>(kThreads)};
+    std::array<std::optional<std::size_t>, kThreads> slots_claimed{};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (std::size_t t = 0; t < kThreads; ++t) {
+      threads.emplace_back([&, t] {
+        ready.arrive_and_wait();
+        slots_claimed[t] = subscribers[t].register_reader();
+      });
+    }
+    for (auto& thread : threads) thread.join();
+
+    std::array<bool, MAX_READERS> seen{};
+    for (std::size_t t = 0; t < kThreads; ++t) {
+      ASSERT_TRUE(slots_claimed[t].has_value())
+          << "round " << round << " thread " << t
+          << " spuriously failed to register while slots were free";
+      const std::size_t id = *slots_claimed[t];
+      ASSERT_LT(id, MAX_READERS);
+      EXPECT_FALSE(seen[id]) << "duplicate slot " << id;
+      seen[id] = true;
+      subscribers[t].release_reader(id);
+    }
+  }
 }
 
 // REQ-OPS-03: concurrent openers racing to reclaim a kLifetimeClosing segment
