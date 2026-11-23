@@ -668,7 +668,10 @@ class TargetLane(_OnNode):
     which no consumer accepts, while it shows no mode), so a target from an
     earlier enable or mode never drives this one. A lane of operator input
     takes arming=OperatorArming(node): while that is not armed, send()
-    publishes a release and returns False.
+    publishes a release and returns False. Any node that reads DriverStation
+    (or directly subscribes to /hw/state/driver_station) and writes a lane in
+    the target subsystem's teleop policy must pass arming=OperatorArming(node);
+    otherwise startup and LintGraph refuse it (REQ-SAFE-14).
     """
 
     def __init__(self, node, msg, subsystem, source, arming=None):

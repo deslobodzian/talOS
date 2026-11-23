@@ -776,6 +776,12 @@ class CheckNodeSourcesTest(unittest.TestCase):
              "void f(talos::Node& n) { NodeAccess::publisher_send(n, 0, 0, 0); }\n"),
             ("add_hardware_request_alone",
              "auto fn = &add_hardware_request;\n"),
+            ("add_target_lane_publisher_alone",
+             "auto fn = &add_target_lane_publisher;\n"),
+            ("add_internal_driver_station_subscription_alone",
+             "auto fn = &add_internal_driver_station_subscription;\n"),
+            ("mark_driver_station_reader_alone",
+             "auto fn = &mark_driver_station_reader;\n"),
             ("hardware_access_note_live_target",
              "void f(talos::HardwareLink& l) {\n"
              "  talos::detail::HardwareAccess::note_live_target(l);\n"

@@ -109,6 +109,21 @@ devices flush's live-target gate, leaving its outputs gated on
 the format version is unchanged), and the registry carries it as another bit
 of the same `flags` word with no layout or version change.
 
+`kSourceFlagOperatorArming` (bit 6 of `SourceRecord::flags`) marks a target-lane
+publisher opened through `TargetLane` with a `talos::OperatorArming`
+(`detail::NodeAccess::add_target_lane_publisher`, REQ-SAFE-14). `--describe`
+writes it as `"operator_arming": true` on that endpoint alone; absent means
+unarmed, so older binaries fail closed when checked by `LintGraph`.
+
+`kSourceFlagInternalDriverStation` (bit 7 of `SourceRecord::flags`) marks a
+`/hw/state/driver_station` watcher subscribed solely by internal `Target`,
+`TargetLane`, or `OperatorArming` plumbing
+(`detail::NodeAccess::add_internal_driver_station_subscription`), with no
+explicit `DriverStation` handle or direct subscription on the node. `--describe`
+writes it as `"internal_driver_station": true` on that endpoint alone; absent
+means an explicit Driver Station reader, so older binaries fail closed. Both
+bits reuse the existing `flags` word with no registry layout or version change.
+
 
 `publish` checks node and topic names against `names.h` and prints findings to
 stderr without refusing publication. Timer labels are not checked as topics.

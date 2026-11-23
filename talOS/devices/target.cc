@@ -171,7 +171,7 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
   TargetState state{.bytes = bytes,
                     .alignment = alignment,
                     .sources = policy.Sources(),
-                    .ds = DriverStation{node}};
+                    .ds = DriverStationAccess::internal(node)};
   for (const std::string& source : state.sources) {
     // Relative, so [subsystems.<name>.remap] applies. Optional: a lane with
     // no producer is normal (the graph lint warns), and no callback keeps
@@ -281,13 +281,14 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
       introspect::naming::TargetLaneTopic(subsystem, source);
   auto& lanes = node.extension<Targets>().lanes;
   lanes.push_back(LaneState{
-      .publisher = NodeAccess::add_publisher(
-          node, topic, envelope, kMessageAlignment, schema::Envelope(message)),
+      .publisher = NodeAccess::add_target_lane_publisher(
+          node, topic, envelope, kMessageAlignment, schema::Envelope(message),
+          /*operator_arming=*/arming.has_value()),
       .bytes = bytes,
       .alignment = alignment,
       // Subscribed here, so the producer drains the Driver Station right
       // before its timer and send() stamps the packet it saw last.
-      .ds = DriverStation{node},
+      .ds = DriverStationAccess::internal(node),
       .envelope = std::vector<std::byte>(envelope),
       .arming = arming,
   });
@@ -329,7 +330,7 @@ bool TargetAccess::lane_release(Node& node, std::size_t lane) {
 
 std::size_t TargetAccess::open_arming(Node& node) {
   auto& armings = node.extension<Targets>().armings;
-  armings.push_back(ArmingState{.ds = DriverStation{node}});
+  armings.push_back(ArmingState{.ds = DriverStationAccess::internal(node)});
   return armings.size() - 1;
 }
 

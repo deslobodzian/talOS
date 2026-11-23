@@ -235,6 +235,14 @@ inline std::string DescribeToJson(const Description& description) {
     // Only on a request publisher that lifted the live-target gate.
     if ((source.flags & naming::kSourceFlagUntargetedOutputs) != 0)
       out += ", \"untargeted_outputs\": true";
+    // Only on a target-lane publisher opened with OperatorArming; absent means
+    // unarmed.
+    if ((source.flags & naming::kSourceFlagOperatorArming) != 0)
+      out += ", \"operator_arming\": true";
+    // Only on `/hw/state/driver_station` subscribed solely by internal
+    // Target/TargetLane/OperatorArming plumbing; absent means explicit reader.
+    if ((source.flags & naming::kSourceFlagInternalDriverStation) != 0)
+      out += ", \"internal_driver_station\": true";
     // Only on a latest-only watcher; absent means a sequence watcher.
     if ((source.flags & naming::kSourceFlagLatestOnly) != 0)
       out += ", \"latest_only\": true";
@@ -449,6 +457,14 @@ class DescribeReader {
       if (Field(entry, "untargeted_outputs", attribute) &&
           Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagUntargetedOutputs;
+      attribute = 0;
+      if (Field(entry, "operator_arming", attribute) &&
+          Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagOperatorArming;
+      attribute = 0;
+      if (Field(entry, "internal_driver_station", attribute) &&
+          Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagInternalDriverStation;
       attribute = 0;
       if (Field(entry, "latest_only", attribute) && Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagLatestOnly;

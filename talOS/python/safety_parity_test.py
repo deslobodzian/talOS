@@ -331,6 +331,81 @@ class SafetyParityTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "OperatorArming"):
             sim.add(BadArming, "roller")
 
+    # REQ-SAFE-14, REQ-CONTRACT-14: Python operator producers writing a
+    # teleop-policy target lane require OperatorArming, matching C++ semantics
+    # across init order, raw publish, and lazy DriverStation reads in update().
+    def test_operator_producer_teleop_lane_requires_operator_arming(self):
+        class DsBeforeLane:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.lane = talos.TargetLane(node, Goal, "roller", "teleop")
+
+        class LaneBeforeDs:
+            def __init__(self, node):
+                self.lane = talos.TargetLane(node, Goal, "roller", "teleop")
+                self.ds = talos.DriverStation(node)
+
+        class RawPublish:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.pub = node.publish(Goal, "/roller/target/teleop")
+
+        for cls in (DsBeforeLane, LaneBeforeDs, RawPublish):
+            with self.subTest(cls=cls.__name__):
+                sim = Sim.from_toml(ROBOT_TOML)
+                with self.assertRaisesRegex(
+                        talos.TalosError,
+                        r"/roller/target/teleop.*OperatorArming.*REQ-SAFE-14"):
+                    sim.add(cls, "driver")
+
+        # Lazy DriverStation construction in update() throws on every retry.
+        class LazyDs:
+            def __init__(self, node):
+                self.node = node
+                self.lane = talos.TargetLane(node, Goal, "roller", "teleop")
+                self.refused = 0
+                self.succeeded = 0
+
+            def update(self):
+                for _ in range(2):
+                    try:
+                        ds = talos.DriverStation(self.node)
+                        _ = ds.enabled
+                        self.succeeded += 1
+                    except talos.TalosError as err:
+                        if "OperatorArming" in str(err):
+                            self.refused += 1
+
+        sim_lazy = Sim.from_toml(ROBOT_TOML)
+        lazy = sim_lazy.add(LazyDs, "driver")
+        sim_lazy.step(0.02)
+        self.assertEqual(lazy.succeeded, 0)
+        self.assertGreaterEqual(lazy.refused, 2)
+
+        # Allowed: auto lane with DriverStation, coordinator without
+        # DriverStation, and armed teleop lane with DriverStation.
+        class AutoProducer:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.lane = talos.TargetLane(node, Goal, "roller", "auto")
+
+        class Coordinator:
+            def __init__(self, node):
+                self.target = talos.Target(node, Goal)
+                self.lane = talos.TargetLane(node, Goal, "roller", "teleop")
+
+        class ArmedOperator:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.arming = talos.OperatorArming(node)
+                self.lane = talos.TargetLane(
+                    node, Goal, "roller", "teleop", arming=self.arming)
+
+        sim_ok = Sim.from_toml(ROBOT_TOML)
+        sim_ok.add(AutoProducer, "autonomous")
+        sim_ok.add(Coordinator, "superstructure")
+        sim_ok.add(ArmedOperator, "driver")
+
     # REQ-CONTRACT-14: Node.publish_bytes rejects uint32 overflow instead of
     # silently wrapping max_bytes or slots.
     def test_publish_bytes_rejects_uint32_overflow(self):

@@ -78,7 +78,9 @@ refuses from the start (RULES.md 2):
   could hide headers from source discovery, and computed `#include MACRO`
   directives that cannot be verified statically;
 - non-comment, non-string references to `NodeAccess`, `add_hardware_request`,
-  `HardwareAccess`, or `note_live_target`, preprocessor token-pasting
+  `add_target_lane_publisher`, `add_internal_driver_station_subscription`,
+  `mark_driver_station_reader`, `HardwareAccess`, or `note_live_target`,
+  preprocessor token-pasting
   operators `##` and `%:%:` (which could otherwise assemble them), and C++
   trigraphs (`??[=/'()!<>-]` in code and comments, plus `??/` in string/char
   literals where it can escape quotes or splice lines under trigraph-enabling
@@ -399,6 +401,11 @@ NEVER_EXEMPT_INCLUDES_LOWER = frozenset(
 FORBIDDEN_SYMBOLS = (
     ("NodeAccess", re.compile(r"\bNodeAccess\b")),
     ("add_hardware_request", re.compile(r"\badd_hardware_request\b")),
+    ("add_target_lane_publisher", re.compile(r"\badd_target_lane_publisher\b")),
+    ("add_internal_driver_station_subscription",
+     re.compile(r"\badd_internal_driver_station_subscription\b")),
+    ("mark_driver_station_reader",
+     re.compile(r"\bmark_driver_station_reader\b")),
     ("HardwareAccess", re.compile(r"\bHardwareAccess\b")),
     ("note_live_target", re.compile(r"\bnote_live_target\b")),
 )

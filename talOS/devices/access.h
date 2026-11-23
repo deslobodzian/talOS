@@ -118,6 +118,10 @@ enum class DsMode : std::uint8_t { kNone, kTeleop, kAutonomous, kTest };
 DsMode DsModeOf(std::uint32_t flags);
 
 struct DriverStationAccess {
+  // An internal handle for Target, TargetLane and OperatorArming plumbing:
+  // shares the node's DriverStationLink without marking the node as an
+  // explicit Driver Station reader (REQ-SAFE-14).
+  static DriverStation internal(Node& node);
   static DsMode mode(const DriverStation& ds);
   // The current mode generation: the latest packet's mode_since_us while
   // mode() is not none, else 0.

@@ -972,7 +972,9 @@ std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
       std::tuple<std::string, int, std::uint32_t, std::uint32_t, std::uint32_t>;
   constexpr std::uint32_t kLinted =
       naming::kSourceFlagExternal | naming::kSourceFlagOptional |
-      naming::kSourceFlagObserver | naming::kSourceFlagUntargetedOutputs;
+      naming::kSourceFlagObserver | naming::kSourceFlagUntargetedOutputs |
+      naming::kSourceFlagOperatorArming |
+      naming::kSourceFlagInternalDriverStation;
   const auto keys = [](const std::vector<naming::SourceShape>& sources) {
     std::vector<Key> out;
     for (const auto& source : sources) {
@@ -996,6 +998,12 @@ std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
       if ((flags & naming::kSourceFlagObserver) != 0) out += ", observer";
       if ((flags & naming::kSourceFlagUntargetedOutputs) != 0) {
         out += ", untargeted_outputs";
+      }
+      if ((flags & naming::kSourceFlagOperatorArming) != 0) {
+        out += ", operator_arming";
+      }
+      if ((flags & naming::kSourceFlagInternalDriverStation) != 0) {
+        out += ", internal_driver_station";
       }
       out += ")";
     }

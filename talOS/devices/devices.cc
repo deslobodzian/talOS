@@ -33,6 +33,10 @@ static_assert(std::string_view{hardware::kRequestTopicPrefix} ==
                   introspect::naming::kRequestTopicPrefix,
               "hardware::kRequestTopicPrefix must match "
               "introspect::naming::kRequestTopicPrefix");
+static_assert(std::string_view{hardware::kDriverStationTopic} ==
+                  introspect::naming::kDriverStationTopic,
+              "hardware::kDriverStationTopic must match "
+              "introspect::naming::kDriverStationTopic");
 
 using detail::HardwareAccess;
 using hardware::Packet;
@@ -1127,10 +1131,9 @@ namespace detail {
 class DriverStationLink {
  public:
   explicit DriverStationLink(Node& node) : node_{node} {
-    subscription_ = NodeAccess::add_subscription(
+    subscription_ = NodeAccess::add_internal_driver_station_subscription(
         node, hardware::kDriverStationTopic, sizeof(Packet), alignof(Packet),
-        schema::Of<Packet>(), /*optional=*/false,
-        [this](const void* data) { OnPacket(data); });
+        schema::Of<Packet>(), [this](const void* data) { OnPacket(data); });
   }
 
   // A listener runs as each packet arrives, so the packet's publications
@@ -1210,6 +1213,9 @@ DsMode DsModeOf(std::uint32_t flags) {
   return DsMode::kNone;
 }
 
+DriverStation DriverStationAccess::internal(Node& node) {
+  return DriverStation{&node.extension<DriverStationLink>()};
+}
 DsMode DriverStationAccess::mode(const DriverStation& ds) {
   return ds.link_->Mode();
 }
@@ -1251,8 +1257,20 @@ std::string_view Joystick::name() const {
   return {data_.name, static_cast<std::size_t>(end - data_.name)};
 }
 
+namespace {
+
+detail::DriverStationLink* AttachPublicDriverStation(Node& node) {
+  // Mark (and check REQ-SAFE-14 if already started) BEFORE attaching the
+  // extension so a refused late construction leaves no DriverStationLink on
+  // the node.
+  detail::NodeAccess::mark_driver_station_reader(node);
+  return &node.extension<detail::DriverStationLink>();
+}
+
+}  // namespace
+
 DriverStation::DriverStation(Node& node)
-    : link_{&node.extension<detail::DriverStationLink>()} {}
+    : link_{AttachPublicDriverStation(node)} {}
 
 DriverStation::DriverStation(Node& node, std::function<void()> on_packet)
     : DriverStation{node} {

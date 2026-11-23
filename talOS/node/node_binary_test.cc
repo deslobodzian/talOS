@@ -40,6 +40,7 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/introspection/describe.h"
+#include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/introspection/reporter.h"
 #include "talOS/node/internal.h"
@@ -1060,6 +1061,246 @@ TEST(Binary, LiveRegistryRowCarriesUntargetedOutputsIffAllowed) {
                introspect::naming::kSourceFlagUntargetedOutputs) != 0u,
               opt_out);
     ::shm_unlink(ShmObjectName("/hw/request/test_node").c_str());
+  }
+
+  std::filesystem::remove(log);
+}
+
+// REQ-SAFE-14, REQ-CONTRACT-09, REQ-CONTRACT-11: --describe emits
+// "operator_arming": true on armed target lanes, emits
+// "internal_driver_station": true only when the node has no explicit Driver
+// Station reader, and does not throw on an unarmed operator producer so
+// LintGraph reports the structured error. Live runs refuse an unarmed operator
+// producer (including one hidden behind `if (!node.describing())`) with exit 1
+// and 0 ticks even standalone (no launcher flag), and live registry rows carry
+// both flags faithfully for EndpointMismatch.
+TEST(Binary, OperatorArmingFlagsInDescribeRegistryAndLiveEnforcement) {
+  const std::string log = TempFile("operator_arming_binary.tlog");
+  const auto find_source =
+      [](const std::vector<introspect::naming::SourceShape>& sources,
+         std::string_view name) -> const introspect::naming::SourceShape* {
+    const auto it = std::find_if(sources.begin(), sources.end(),
+                                 [&](const auto& s) { return s.name == name; });
+    return it == sources.end() ? nullptr : &*it;
+  };
+  const auto make_producer = [](bool explicit_ds, bool armed,
+                                bool hide_unarmed_in_describe,
+                                std::atomic<int>& ticks) {
+    return [explicit_ds, armed, hide_unarmed_in_describe,
+            &ticks](Node& node) -> detail::Instance {
+      detail::NodeAccess::add_internal_driver_station_subscription(
+          node, introspect::naming::kDriverStationTopic, sizeof(Count),
+          alignof(Count), schema::Of<Count>(), {});
+      if (explicit_ds) detail::NodeAccess::mark_driver_station_reader(node);
+      const bool use_arming =
+          armed || (hide_unarmed_in_describe && node.describing());
+      detail::NodeAccess::add_target_lane_publisher(
+          node, "/mechanism/target/teleop", sizeof(Count), kMessageAlignment,
+          schema::Of<Count>(), use_arming);
+      detail::NodeAccess::set_update(node, [&ticks] {
+        ticks.fetch_add(1);
+        process::stop_requested.store(true);
+      });
+      return std::make_shared<int>(0);
+    };
+  };
+
+  {
+    SCOPED_TRACE("--describe: armed explicit DS emits operator_arming only");
+    std::atomic<int> ticks{0};
+    const CapturedRun probe = RunInProcess(
+        "--describe " + ConfigFlag(),
+        make_producer(/*explicit_ds=*/true, /*armed=*/true, false, ticks));
+    ASSERT_EQ(probe.status, 0) << probe.err;
+    EXPECT_EQ(ticks.load(), 0);
+    EXPECT_NE(probe.out.find("\"operator_arming\": true"), std::string::npos)
+        << probe.out;
+    EXPECT_EQ(probe.out.find("\"internal_driver_station\": true"),
+              std::string::npos)
+        << probe.out;
+    introspect::Description described;
+    std::string error;
+    ASSERT_TRUE(introspect::DescribeReader::Parse(probe.out, described, error))
+        << error;
+    const auto* ds =
+        find_source(described.sources, introspect::naming::kDriverStationTopic);
+    const auto* lane =
+        find_source(described.sources, "/mechanism/target/teleop");
+    ASSERT_NE(ds, nullptr);
+    ASSERT_NE(lane, nullptr);
+    EXPECT_EQ(ds->flags & introspect::naming::kSourceFlagInternalDriverStation,
+              0u);
+    EXPECT_NE(lane->flags & introspect::naming::kSourceFlagOperatorArming, 0u);
+  }
+
+  {
+    SCOPED_TRACE("--describe: internal-only DS coordinator emits flag");
+    std::atomic<int> ticks{0};
+    const CapturedRun probe = RunInProcess(
+        "--describe " + ConfigFlag(),
+        make_producer(/*explicit_ds=*/false, /*armed=*/false, false, ticks));
+    ASSERT_EQ(probe.status, 0) << probe.err;
+    EXPECT_NE(probe.out.find("\"internal_driver_station\": true"),
+              std::string::npos)
+        << probe.out;
+    EXPECT_EQ(probe.out.find("\"operator_arming\": true"), std::string::npos)
+        << probe.out;
+    introspect::Description described;
+    std::string error;
+    ASSERT_TRUE(introspect::DescribeReader::Parse(probe.out, described, error))
+        << error;
+    const auto* ds =
+        find_source(described.sources, introspect::naming::kDriverStationTopic);
+    const auto* lane =
+        find_source(described.sources, "/mechanism/target/teleop");
+    ASSERT_NE(ds, nullptr);
+    ASSERT_NE(lane, nullptr);
+    EXPECT_NE(ds->flags & introspect::naming::kSourceFlagInternalDriverStation,
+              0u);
+    EXPECT_EQ(lane->flags & introspect::naming::kSourceFlagOperatorArming, 0u);
+  }
+
+  {
+    SCOPED_TRACE(
+        "--describe does not throw on unarmed operator node; LintGraph errors");
+    std::atomic<int> ticks{0};
+    const CapturedRun probe = RunInProcess(
+        "--describe " + ConfigFlag(),
+        make_producer(/*explicit_ds=*/true, /*armed=*/false, false, ticks));
+    ASSERT_EQ(probe.status, 0) << probe.err;
+    introspect::Description described;
+    std::string error;
+    ASSERT_TRUE(introspect::DescribeReader::Parse(probe.out, described, error))
+        << error;
+    const auto* ds =
+        find_source(described.sources, introspect::naming::kDriverStationTopic);
+    const auto* lane =
+        find_source(described.sources, "/mechanism/target/teleop");
+    ASSERT_NE(ds, nullptr);
+    ASSERT_NE(lane, nullptr);
+    EXPECT_EQ(ds->flags & introspect::naming::kSourceFlagInternalDriverStation,
+              0u);
+    EXPECT_EQ(lane->flags & introspect::naming::kSourceFlagOperatorArming, 0u);
+
+    const std::vector<introspect::naming::NodeShape> graph = {
+        {"hardware_node",
+         "//talOS/bridge:hardware_node",
+         {{event::SourceKind::SENDER,
+           std::string{introspect::naming::kDriverStationTopic}, sizeof(Count),
+           0, "node_test.Count", Descriptor<Count>::kHash, alignof(Count),
+           1024}},
+         /*hardware_bridge=*/true},
+        {described.name, "//talOS/node:test_node", described.sources},
+        {"mechanism",
+         "//robot/mechanism:node",
+         {{event::SourceKind::WATCHER, "/mechanism/target/teleop",
+           sizeof(Count), 0, "node_test.Count", Descriptor<Count>::kHash,
+           kMessageAlignment, 1024}}},
+    };
+    const auto diagnostics = introspect::naming::LintGraph(
+        graph, {{"mechanism", {"teleop"}}},
+        {{"mechanism", {{"teleop", {"teleop"}}}}});
+    ASSERT_TRUE(introspect::naming::HasError(diagnostics));
+    const auto err_it =
+        std::find_if(diagnostics.begin(), diagnostics.end(), [](const auto& d) {
+          return d.severity == introspect::naming::Severity::ERROR &&
+                 d.subject == "/mechanism/target/teleop" &&
+                 d.message.find("OperatorArming") != std::string::npos;
+        });
+    EXPECT_NE(err_it, diagnostics.end());
+  }
+
+  {
+    SCOPED_TRACE(
+        "hidden unarmed lane behind !node.describing() passes --describe but "
+        "exits 1 with 0 ticks on live standalone run");
+    std::atomic<int> ticks{0};
+    const CapturedRun probe =
+        RunInProcess("--describe " + ConfigFlag(),
+                     make_producer(/*explicit_ds=*/true, /*armed=*/false,
+                                   /*hide_unarmed_in_describe=*/true, ticks));
+    ASSERT_EQ(probe.status, 0) << probe.err;
+    EXPECT_NE(probe.out.find("\"operator_arming\": true"), std::string::npos)
+        << probe.out;
+
+    ticks.store(0);
+    const CapturedRun live =
+        RunInProcess("--sim --duration-s 5 --log '" + log + "' " + ConfigFlag(),
+                     make_producer(/*explicit_ds=*/true, /*armed=*/false,
+                                   /*hide_unarmed_in_describe=*/true, ticks));
+    EXPECT_EQ(live.status, 1) << live.out << "\n" << live.err;
+    EXPECT_EQ(ticks.load(), 0) << "refused node must never tick";
+    EXPECT_NE(live.err.find("/mechanism/target/teleop"), std::string::npos)
+        << live.err;
+    EXPECT_NE(live.err.find("OperatorArming"), std::string::npos) << live.err;
+    EXPECT_NE(live.err.find("REQ-SAFE-14"), std::string::npos) << live.err;
+  }
+
+  {
+    SCOPED_TRACE("live registry carries operator_arming & internal DS flags");
+    const auto read_live_sources =
+        []() -> std::vector<introspect::naming::SourceShape> {
+      const auto reader = introspect::RegistryReader::open();
+      if (!reader) return {};
+      std::uint64_t best_gen = 0;
+      std::vector<introspect::naming::SourceShape> out;
+      for (const auto& row : reader->nodes()) {
+        if (row.name != "test_node" ||
+            row.pid != static_cast<std::uint64_t>(::getpid()) || !row.alive ||
+            row.generation < best_gen) {
+          continue;
+        }
+        best_gen = row.generation;
+        out.clear();
+        for (const auto& s : row.sources) {
+          out.push_back(
+              {s.kind, s.name, s.message_bytes, s.flags, {}, 0, s.alignment});
+        }
+      }
+      return out;
+    };
+
+    for (const bool explicit_ds : {true, false}) {
+      SCOPED_TRACE(explicit_ds ? "explicit armed operator"
+                               : "internal-DS coordinator");
+      std::vector<introspect::naming::SourceShape> observed;
+      const CapturedRun run = RunInProcess(
+          "--sim --duration-s 5 --log '" + log + "' " + ConfigFlag(),
+          [explicit_ds, &observed,
+           &read_live_sources](Node& node) -> detail::Instance {
+            detail::NodeAccess::add_internal_driver_station_subscription(
+                node, introspect::naming::kDriverStationTopic, sizeof(Count),
+                alignof(Count), schema::Of<Count>(), {});
+            if (explicit_ds) {
+              detail::NodeAccess::mark_driver_station_reader(node);
+            }
+            detail::NodeAccess::add_target_lane_publisher(
+                node, "/mechanism/target/teleop", sizeof(Count),
+                kMessageAlignment, schema::Of<Count>(),
+                /*operator_arming=*/explicit_ds);
+            detail::NodeAccess::set_update(
+                node, [&observed, &read_live_sources] {
+                  observed = read_live_sources();
+                  process::stop_requested.store(true);
+                });
+            return std::make_shared<int>(0);
+          });
+      ASSERT_EQ(run.status, 0) << run.out << "\n" << run.err;
+      const auto* ds =
+          find_source(observed, introspect::naming::kDriverStationTopic);
+      const auto* lane = find_source(observed, "/mechanism/target/teleop");
+      ASSERT_NE(ds, nullptr);
+      ASSERT_NE(lane, nullptr);
+      EXPECT_EQ((ds->flags &
+                 introspect::naming::kSourceFlagInternalDriverStation) != 0u,
+                !explicit_ds);
+      EXPECT_EQ(
+          (lane->flags & introspect::naming::kSourceFlagOperatorArming) != 0u,
+          explicit_ds);
+      ::shm_unlink(
+          ShmObjectName(introspect::naming::kDriverStationTopic).c_str());
+      ::shm_unlink(ShmObjectName("/mechanism/target/teleop").c_str());
+    }
   }
 
   std::filesystem::remove(log);
