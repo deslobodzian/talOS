@@ -19,14 +19,27 @@ namespace {
 
 // Defined once, in this file, for the reason process.h gives for
 // stop_requested: a node library loaded RTLD_LOCAL must share these with
-// libtalos_node.so.
-std::mutex mappings_mutex;
-std::vector<std::pair<void*, std::size_t>> mappings;
+// libtalos_node.so. Heap-allocated and intentionally immortal so static
+// SharedMemoryPtr destructors in other TUs never touch a destroyed mutex or
+// vector during process teardown.
+struct MappingState {
+  std::mutex mutex;
+  std::vector<std::pair<void*, std::size_t>> mappings;
+};
+
+MappingState& Mappings() {
+  static auto* const state = new MappingState{};
+  return *state;
+}
+
 std::atomic<bool> keep_resident{false};
 std::atomic<bool> reported_late_failure{false};
 
 std::size_t PageSize() {
-  static const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  static const std::size_t page = [] {
+    const long size = ::sysconf(_SC_PAGESIZE);
+    return size > 0 ? static_cast<std::size_t>(size) : std::size_t{4096};
+  }();
   return page;
 }
 
@@ -51,9 +64,10 @@ int MakeResident(void* address, std::size_t size) noexcept {
 Residency KeepMappingsResident() noexcept {
   Residency result;
   try {
-    const std::scoped_lock lock{mappings_mutex};
+    MappingState& state = Mappings();
+    const std::scoped_lock lock{state.mutex};
     keep_resident.store(true, std::memory_order_relaxed);
-    for (const auto& [address, size] : mappings) {
+    for (const auto& [address, size] : state.mappings) {
       ++result.ranges;
       result.bytes += size;
       if (const int error = MakeResident(address, size); error != 0) {
@@ -82,8 +96,9 @@ void SetLateLockRefusedForTest(bool refused) noexcept {
 }
 
 void TrackMapping(void* address, std::size_t size) {
-  const std::scoped_lock lock{mappings_mutex};
-  mappings.emplace_back(address, size);
+  MappingState& state = Mappings();
+  const std::scoped_lock lock{state.mutex};
+  state.mappings.emplace_back(address, size);
   if (!keep_resident.load(std::memory_order_relaxed)) return;
   const int error = MakeResident(address, size);
   if (error != 0 && !reported_late_failure.exchange(true)) {
@@ -99,11 +114,12 @@ void TrackMapping(void* address, std::size_t size) {
 // entry would have KeepMappingsResident touch unmapped memory, so ending the
 // process (this runs from a noexcept destructor) is the safer failure.
 void UntrackMapping(void* address) noexcept {
-  const std::scoped_lock lock{mappings_mutex};
+  MappingState& state = Mappings();
+  const std::scoped_lock lock{state.mutex};
   const auto found = std::find_if(
-      mappings.begin(), mappings.end(),
+      state.mappings.begin(), state.mappings.end(),
       [address](const auto& entry) { return entry.first == address; });
-  if (found != mappings.end()) mappings.erase(found);
+  if (found != state.mappings.end()) state.mappings.erase(found);
 }
 
 }  // namespace talos::memory
