@@ -2743,7 +2743,7 @@ TEST(HardwareNodeTest, PushConfigDuringTickDoesNotAllocate) {
 // subsystem demands, so subsequent valid States keep the link alive. Long
 // legitimate outages, burst jitter within the margin, and new gateway boots
 // remain accepted.
-// REQ-RT-20, REQ-OPS-20
+// REQ-RT-27, REQ-OPS-20
 TEST(HardwareNodeTest, FarFutureStateSampleTimeIsIgnoredWithoutLockingOutBoot) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const uint64_t config_id = NodeConfigId(cfg);
@@ -2867,7 +2867,7 @@ TEST(HardwareNodeTest, FarFutureStateSampleTimeIsIgnoredWithoutLockingOutBoot) {
 //    after a 3 s stall recovers on two consecutive physically-consistent live
 //    States instead of locking out the boot, while still ignoring an isolated
 //    corrupt jump afterward.
-// REQ-RT-20, REQ-OPS-20
+// REQ-RT-27, REQ-OPS-20
 TEST(HardwareNodeTest,
      StateOrderingRecoversFromLongOutageDelayedFrameAndUnseenBootStall) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
