@@ -33,25 +33,34 @@ class DriverStationSampler {
   bool Sample(const driver_station::DriverStationData& view, uint64_t now_us,
               uint64_t boot_id, bool socket_open,
               driver_station::DriverStationData& packet) {
-    const uint32_t mode = driver_station::ModeKey(view.fms.flags);
+    if (!socket_open) return false;
+    // Stamp a candidate copy first so a new ModeTracker generation (e.g. an
+    // A -> B -> A bounce within kSamplePeriodUs where B was reverted or
+    // occurred while the socket was closed) triggers an immediate send even
+    // when ModeKey matches the last sent packet.
+    driver_station::DriverStationData candidate = view;
+    candidate.sample_time_us = now_us;
+    mode_.Stamp(candidate);
+    const uint32_t mode = driver_station::ModeKey(candidate.fms.flags);
+    const uint64_t generation = candidate.mode_since_us;
     const bool sample_due = !has_sent_ || (now_us >= last_sample_us_ &&
                                            now_us - last_sample_us_ >=
                                                driver_station::kSamplePeriodUs);
-    if (!socket_open || (mode == last_mode_ && !sample_due)) return false;
+    if (mode == last_mode_ && generation == last_generation_ && !sample_due) {
+      return false;
+    }
     prev_has_sent_ = has_sent_;
     prev_sample_us_ = last_sample_us_;
     prev_mode_ = last_mode_;
+    prev_generation_ = last_generation_;
     has_sent_ = true;
     last_sample_us_ = now_us;
     last_mode_ = mode;
-    // The tick's view, so the packet is one refresh's and agrees with the
-    // observed mode and the gateway's enable.
-    packet = view;
-    packet.sample_time_us = now_us;
-    mode_.Stamp(packet);
+    last_generation_ = generation;
     // The same boot id as this program's State: a consumer orders packets
     // within one boot and starts over on a new one.
-    packet.boot_id = boot_id;
+    candidate.boot_id = boot_id;
+    packet = candidate;
     return true;
   }
 
@@ -62,17 +71,20 @@ class DriverStationSampler {
     has_sent_ = prev_has_sent_;
     last_sample_us_ = prev_sample_us_;
     last_mode_ = prev_mode_;
+    last_generation_ = prev_generation_;
   }
 
  private:
   driver_station::ModeTracker mode_;
   bool has_sent_{false};
   uint64_t last_sample_us_{0};
-  // The mode (ModeKey) of the last packet sent.
+  // The mode (ModeKey) and generation (mode_since_us) of the last packet sent.
   uint32_t last_mode_{0};
+  uint64_t last_generation_{0};
   bool prev_has_sent_{false};
   uint64_t prev_sample_us_{0};
   uint32_t prev_mode_{0};
+  uint64_t prev_generation_{0};
 };
 
 }  // namespace talos::rio
