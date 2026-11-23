@@ -52,7 +52,10 @@ gh workflow run "Cloud Build" --ref main -f lane=stress -f count=20 -f max_minut
 gh workflow run "Cloud Build" --ref main -f lane=rtprio                                 # //talOS/process under a realtime grant
 ```
 
-`soak` takes about four minutes a seed. `stress` reports a test that fails
+One lane runs at a time: the project's quota is 16 N2D CPUs in the region,
+which one build VM uses, so a lane started while another runs fails at
+"Create the Spot VM" with the quota error. `soak` takes about four minutes a
+seed. `stress` reports a test that fails
 even once, which is a flake to fix ([docs/TESTING.md §8](../docs/TESTING.md#8-flakes)).
 `rtprio` raises the realtime limit before Bazel starts and fails unless
 `ProcessTest.BackgroundThreadLeavesAnInheritedRealtimePolicy`, which skips
