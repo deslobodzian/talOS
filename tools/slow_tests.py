@@ -198,14 +198,57 @@ def read_lanes(lines):
     return lanes
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_BAZEL_ERROR_LINE_RE = re.compile(r"^ERROR:\s*(.+)$")
+_BAZEL_TRANSITIVE_SUMMARY_RE = re.compile(
+    r"^Evaluation of query .* failed: errors were encountered while computing "
+    r"transitive closure$")
+_BAZEL_WORKSPACE_REF_RE = re.compile(r"referenced by '(?:@@)?//")
+_BAZEL_EXTERNAL_PATH_RE = re.compile(
+    r"^(?:[A-Za-z]:)?[^\s:]*[/\\]external[/\\][^/\\:]+[/\\]")
+_BAZEL_EXTERNAL_PKG_RE = re.compile(
+    r"^(?:error loading package|no such package|Skipping) '@@?[^'/@]+//")
+
+
+def _bazel_exit_3_is_external_only(stderr):
+    """True only when every ERROR line in `stderr` from a `bazel query` exit 3
+    belongs to an external `@` repository (plus Bazel's transitive-closure
+    summary line). Any workspace package failure or unexplained exit 3 fails
+    closed (returns False)."""
+    workspace_prefix = os.path.realpath(os.getcwd()) + os.sep
+    saw_external = False
+    saw_any_error = False
+    for raw_line in stderr.splitlines():
+        line = _ANSI_ESCAPE_RE.sub("", raw_line).strip()
+        m = _BAZEL_ERROR_LINE_RE.match(line)
+        if not m:
+            continue
+        saw_any_error = True
+        body = m.group(1)
+        if _BAZEL_TRANSITIVE_SUMMARY_RE.match(body):
+            continue
+        if _BAZEL_WORKSPACE_REF_RE.search(body):
+            return False
+        if body.startswith(workspace_prefix):
+            return False
+        if (_BAZEL_EXTERNAL_PATH_RE.match(body) or
+                _BAZEL_EXTERNAL_PKG_RE.match(body)):
+            saw_external = True
+            continue
+        return False
+    return saw_any_error and saw_external
+
+
 def query_lanes():
     """{label: lane} for every test carrying a lane tag, from bazel query.
 
-    Exits when a query fails (any exit but 0, or 3: a partial result under
-    --keep_going) or when no test carries a lane tag: either would put every
-    test in the fast lane and pass an enforced lane's overrun."""
+    Iterates `reversed(LANE_TAGS)` so precedence matches `lane_of`
+    (`heavy > integration > e2e > perf`). Exits when a query fails (any exit
+    but 0, or 3 with only external `@` repository errors under --keep_going)
+    or when no test carries a lane tag: either would put tests in the wrong
+    lane and pass an enforced lane's overrun."""
     lanes = {}
-    for lane in LANE_TAGS:
+    for lane in reversed(LANE_TAGS):
         expression = f"attr(tags, '[\\[ ]{lane}[,\\]]', tests(//...))"
         query = subprocess.run(
             ["bazel", "query", "--keep_going", "--noshow_progress", expression],
@@ -213,6 +256,11 @@ def query_lanes():
         if query.returncode not in (0, 3):
             sys.exit(f"slow_tests: bazel query for the {lane} lane exited "
                      f"{query.returncode}; lanes unknown\n{query.stderr}")
+        if query.returncode == 3 and not _bazel_exit_3_is_external_only(
+                query.stderr):
+            sys.exit(f"slow_tests: bazel query for the {lane} lane exited 3 "
+                     f"with non-external package error; lanes unknown\n"
+                     f"{query.stderr}")
         for label in query.stdout.split():
             lanes[label] = lane
     if not lanes:

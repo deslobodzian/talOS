@@ -328,7 +328,7 @@ NON_CPP_BASENAMES_LOWER = frozenset(b.lower() for b in NON_CPP_BASENAMES)
 FORBIDDEN_INCLUDE_SUFFIXES = NON_CPP_SUFFIXES | frozenset({".txt"})
 
 INCLUDE_DIRECTIVE_RE = re.compile(
-    r"^[ \t]*(?:#|%:)[ \t]*(include(?:_next)?|import)\b(.*)$")
+    r"^[ \t\v\f]*(?:#|%:)[ \t\v\f]*(include(?:_next)?|import)\b(.*)$")
 HEADER_NAME_RE = re.compile(r'^(?:"([^"]*)"|<([^>]*)>)')
 TOKEN_PASTE_RE = re.compile(r"##|%:%:")
 TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>-]")
@@ -654,13 +654,55 @@ def render(target_set):
     return expr
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_BAZEL_ERROR_LINE_RE = re.compile(r"^ERROR:\s*(.+)$")
+_BAZEL_TRANSITIVE_SUMMARY_RE = re.compile(
+    r"^Evaluation of query .* failed: errors were encountered while computing "
+    r"transitive closure$")
+_BAZEL_WORKSPACE_REF_RE = re.compile(r"referenced by '(?:@@)?//")
+_BAZEL_EXTERNAL_PATH_RE = re.compile(
+    r"^(?:[A-Za-z]:)?[^\s:]*[/\\]external[/\\][^/\\:]+[/\\]")
+_BAZEL_EXTERNAL_PKG_RE = re.compile(
+    r"^(?:error loading package|no such package|Skipping) '@@?[^'/@]+//")
+
+
+def _bazel_exit_3_is_external_only(stderr):
+    """True only when every ERROR line in `stderr` from a `bazel query` exit 3
+    belongs to an external `@` repository (plus Bazel's transitive-closure
+    summary line). Any workspace package error, workspace reference, unknown
+    error, or empty stderr fails closed (returns False)."""
+    workspace_prefix = os.path.realpath(os.getcwd()) + os.sep
+    saw_external = False
+    saw_any_error = False
+    for raw_line in stderr.splitlines():
+        line = _ANSI_ESCAPE_RE.sub("", raw_line).strip()
+        m = _BAZEL_ERROR_LINE_RE.match(line)
+        if not m:
+            continue
+        saw_any_error = True
+        body = m.group(1)
+        if _BAZEL_TRANSITIVE_SUMMARY_RE.match(body):
+            continue
+        if _BAZEL_WORKSPACE_REF_RE.search(body):
+            return False
+        if body.startswith(workspace_prefix):
+            return False
+        if (_BAZEL_EXTERNAL_PATH_RE.match(body) or
+                _BAZEL_EXTERNAL_PKG_RE.match(body)):
+            saw_external = True
+            continue
+        return False
+    return saw_any_error and saw_external
+
+
 class Bazel:
     """Answers the checks with `bazel query` in the current workspace."""
 
     def query(self, expr, output="label"):
         # --keep_going: some external packages cannot load on every host
         # (opencv's Android branch); the query then exits 3 with every
-        # other edge evaluated (docs/DEVELOPMENT.md §5).
+        # other edge evaluated (docs/DEVELOPMENT.md §5). Fail closed if any
+        # load/eval error occurs outside allowed external `@` repositories.
         proc = subprocess.run(
             ["bazel", "query", "--keep_going", "--noimplicit_deps",
              "--noshow_progress", f"--output={output}", expr],
@@ -669,6 +711,12 @@ class Bazel:
             sys.stderr.write(proc.stderr)
             raise RuntimeError(f"bazel query failed ({proc.returncode}): "
                                f"{expr}")
+        if proc.returncode == 3 and not _bazel_exit_3_is_external_only(
+                proc.stderr):
+            sys.stderr.write(proc.stderr)
+            raise RuntimeError(
+                f"bazel query exited 3 with non-external package error: "
+                f"{expr}")
         return [line for line in proc.stdout.splitlines() if line]
 
     def node_sample_targets(self):
@@ -736,7 +784,7 @@ def _strip_cpp_comments(text):
         ch = text[i]
         if ch == "\\":
             j = i + 1
-            while j < n and text[j] in (" ", "\t"):
+            while j < n and text[j] in (" ", "\t", "\v", "\f"):
                 j += 1
             if j < n and text[j] == "\r":
                 j += 1
@@ -810,7 +858,7 @@ def _strip_cpp_comments(text):
                 paren = src.find("(", j + 1)
                 delim = src[j + 1:paren] if paren != -1 else ""
                 if (paren == -1 or len(delim) > 16 or
-                        any(c in (" ", "\t", "\r", "\n", "\\", ")")
+                        any(c in (" ", "\t", "\v", "\f", "\r", "\n", "\\", ")")
                             for c in delim)):
                     errors.append((spliced_lines[i], "unterminated-string",
                                    "malformed raw string literal"))
@@ -981,14 +1029,19 @@ def scan_cpp_text(path, text):
         violations.append(SourceViolation(path, lineno, kind, detail))
 
     # Check every logical line for #include / #include_next directives.
+    # Split only on '\n' (not str.splitlines(), which splits on \v and \f —
+    # horizontal whitespace in GCC/Clang preprocessor directives).
     offset = 0
-    for segment in with_strings.splitlines(keepends=True):
-        line_text = segment.rstrip("\r\n")
+    total_len = len(with_strings)
+    while offset < total_len:
+        nl = with_strings.find("\n", offset)
+        end = total_len if nl == -1 else nl + 1
+        line_text = with_strings[offset:end].rstrip("\r\n")
         m = INCLUDE_DIRECTIVE_RE.match(line_text)
         if m:
             lineno = line_map[offset + m.start()] if line_map else 1
             directive = m.group(1)
-            rest = m.group(2).strip()
+            rest = m.group(2).strip(" \t\v\f")
             hm = HEADER_NAME_RE.match(rest)
             if not hm:
                 violations.append(SourceViolation(
@@ -1008,7 +1061,7 @@ def scan_cpp_text(path, text):
                         path, lineno, "non-cpp-include",
                         f"#{directive} \"{raw_header}\" (non-C++ filename "
                         f"cannot be included; bypasses source discovery)"))
-        offset += len(segment)
+        offset = end
 
     # Check non-comment, non-string code for forbidden internal symbols.
     for symbol, pattern in FORBIDDEN_SYMBOLS:

@@ -37,7 +37,8 @@
 # (<its reason>)`, which does not fail the run), then, when the commits to push
 # (<ref>@{upstream}...<ref>, else since the merge base with origin/main,
 # else every file when neither exists) touch MODULE.bazel, REPO.bazel,
-# third_party/, talOS/, tools/ or the fixtures,
+# talos.bazelrc, .bazelversion, third_party/, talOS/, studio/, tools/ or
+# the fixtures,
 # dependent-robot_repo and dependent-wrist_repo (`bazel test //...
 # @talos//talOS/configuration:config_fuzz_test` inside examples/robot_repo
 # and examples/wrist_repo, the repositories that depend on talOS) and
@@ -410,12 +411,12 @@ fi
 # bazel-* links and lockfiles), which checkout-unchanged then confirms.
 # What they build from talOS: its module file, REPO.bazel (which applies to
 # @talos as to any repository), the toml++ build file and patch in
-# third_party/, and packages under talOS/ and tools/ (`bazel query
-# 'buildfiles(deps(//...))'` in each). Each fixture's .bazelrc imports
-# talOS's talos.bazelrc, and robot_repo's talos_pin_test compares its
-# .bazelversion with talOS's; talOS's own .bazelrc and studio/ are not
-# read there.
-dependent_paths=(MODULE.bazel REPO.bazel talos.bazelrc .bazelversion third_party/ talOS/ tools/ examples/robot_repo/ examples/wrist_repo/)
+# third_party/, and packages under talOS/, studio/ (examples/robot_repo
+# depends on @talos//studio/bridge and @talos//studio:web_dist), and tools/
+# (`bazel query 'buildfiles(deps(//...))'` in each). Each fixture's .bazelrc
+# imports talOS's talos.bazelrc, and robot_repo's talos_pin_test compares its
+# .bazelversion with talOS's; talOS's own .bazelrc is not read there.
+dependent_paths=(MODULE.bazel REPO.bazel talos.bazelrc .bazelversion third_party/ talOS/ studio/ tools/ examples/robot_repo/ examples/wrist_repo/)
 if ! touches "${dependent_paths[@]}"; then
   report "dependents not needed (nothing under ${dependent_paths[*]} since $touches_from)"
 elif [ ! -d "$wt/examples/robot_repo" ]; then

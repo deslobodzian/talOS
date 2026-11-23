@@ -543,7 +543,7 @@ detect_llvm() {
 }
 install_llvm() {
   have uv || have python3 || { warn "need uv or python3 for the clang wheels"; return 1; }
-  run bash -c ". '$ROOT/tools/clang18.sh' && clang18_setup"
+  run bash -c '. "$1" && clang18_setup' _ "$ROOT/tools/clang18.sh"
 }
 
 detect_buildifier() {

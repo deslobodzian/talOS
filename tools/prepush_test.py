@@ -662,11 +662,14 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(dependent_calls(calls, "robot_repo"), [])
         self.assertEqual(dependent_calls(calls, "wrist_repo"), [])
 
-        # Touching MODULE.bazel or third_party/ runs config_fuzz_test inside
-        # both dependent repositories.
+        # Touching MODULE.bazel, third_party/, or studio/ runs config_fuzz_test
+        # inside both dependent repositories (examples/robot_repo depends on
+        # @talos//studio/bridge and @talos//studio:web_dist; REQ-DEV-25,
+        # REQ-DEV-30).
         for path, msg in (("MODULE.bazel", "module change"),
                           ("third_party/tomlplusplus_parser_ub.patch",
-                           "toml patch change")):
+                           "toml patch change"),
+                          ("studio/bridge/x.cc", "studio bridge change")):
             with self.subTest(path=path):
                 self.git("branch", "-f", "pushed", "HEAD")
                 self.commit(path, msg)

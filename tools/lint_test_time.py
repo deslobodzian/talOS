@@ -64,6 +64,7 @@ a listed (path, kind) with no hit left; with a count, so do more hits than
 it, or fewer (lower the count), so the list only shrinks. Exits 1 on any.
 """
 
+import bisect
 import os
 import re
 import subprocess
@@ -81,9 +82,10 @@ SOURCE_SUFFIXES = (".cc", ".h", ".cpp", ".hpp", ".py")
 
 TIME_PATTERNS = {
     "sleep": re.compile(r"\b(sleep_for|sleep_until|usleep|nanosleep|sleep)"
-                        r"\s*\("),
+                        r"\s*\(", re.MULTILINE),
     "clock": re.compile(r"\b(steady_clock|system_clock|high_resolution_clock)"
-                        r"\s*::\s*now\s*\(|\btime\.(time|monotonic)\s*\("),
+                        r"\s*::\s*now\s*\(|\btime\s*\.\s*(time|monotonic)\s*\(",
+                        re.MULTILINE),
 }
 # Node code (non-test sources in node packages) is additionally barred from
 # POSIX/Poller/Python wall-clock APIs, randomness (REQ-RT-17; METHODOLOGY §9),
@@ -97,57 +99,66 @@ NODE_TIME_PATTERNS = {
         r"|\b(?:clock_gettime|gettimeofday)\s*\(" +
         r"|\bPoller\s*::\s*now\s*\(" +
         r"|\bstd\s*::\s*time\s*\(" +
-        r"|\btime\.(?:time_ns|monotonic_ns|perf_counter(?:_ns)?|"
+        r"|\btime\s*\.\s*(?:time_ns|monotonic_ns|perf_counter(?:_ns)?|"
         r"process_time(?:_ns)?)\s*\(" +
-        r"|\bdatetime\.(?:now|utcnow|today)\s*\("
+        r"|\bdatetime\s*\.\s*(?:now|utcnow|today)\s*\(",
+        re.MULTILINE,
     ),
     "random": re.compile(
         r"(?<![.>])\b(?:std\s*::\s*)?(?:s?rand|drand48|lrand48|mrand48|"
         r"arc4random(?:_uniform|_buf)?)\s*\(" +
         r"|\b(?:std\s*::\s*)?(?:mt19937(?:_64)?|default_random_engine|"
         r"minstd_rand0?|ranlux24_base|ranlux48_base|ranlux24|ranlux48|"
-        r"knuth_b)\b"
+        r"knuth_b)\b",
+        re.MULTILINE,
     ),
     "io": re.compile(
         r"\bstd\s*::\s*(?:cout|cerr|clog|cin|ifstream|ofstream|fstream)\b" +
         r"|(?:\bstd\s*::\s*|(?<![\w.>])::\s*|(?<![.>])(?<!::)\b)"
         r"(?:printf|fprintf|puts|fopen)\s*\(" +
         r"|(?:(?<![\w.>])::\s*|(?<![.>])(?<!::)\b)"
-        r"(?:socket|bind|listen|accept|connect|sendto|recvfrom)\s*\("
+        r"(?:socket|bind|listen|accept|connect|sendto|recvfrom)\s*\(",
+        re.MULTILINE,
     ),
     "lock": re.compile(
         r"\bstd\s*::\s*(?:mutex|shared_mutex|recursive_mutex|"
         r"lock_guard|unique_lock|scoped_lock|condition_variable(?:_any)?)\b" +
-        r"|\bpthread_mutex_lock\b"
+        r"|\bpthread_mutex_lock\b",
+        re.MULTILINE,
     ),
 }
 # Python-only node patterns (scoped to `.py` files so C++ struct members such
 # as `random.value` never false-positive).
 PY_NODE_CLOCK_EXTRA = re.compile(
-    r"(?:^|;)\s*from\s+time\s+import\b"
-    r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*time\b"
+    r"(?:^|;)[ \t]*from\s+time\s+import\b"
+    r"|(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*time\b",
+    re.MULTILINE,
 )
 PY_NODE_RANDOM_PATTERN = re.compile(
-    r"\brandom\.\w+"
-    r"|(?:^|;)\s*from\s+random\s+import\b"
-    r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*random\b"
-    r"|\bos\.urandom\s*\("
-    r"|(?:^|;)\s*from\s+os\s+import\b[^\n;#]*\burandom\b"
-    r"|\bsecrets\.\w+"
-    r"|(?:^|;)\s*from\s+secrets\s+import\b"
-    r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*secrets\b"
+    r"\brandom\s*\.\s*\w+"
+    r"|(?:^|;)[ \t]*from\s+random\s+import\b"
+    r"|(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*random\b"
+    r"|\bos\s*\.\s*urandom\s*\("
+    r"|(?:^|;)[ \t]*from\s+os\s+import(?:\s*\([^)]*?\burandom\b|[^\n;#]*\burandom\b)"
+    r"|\bsecrets\s*\.\s*\w+"
+    r"|(?:^|;)[ \t]*from\s+secrets\s+import\b"
+    r"|(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*secrets\b",
+    re.MULTILINE,
 )
 PY_NODE_IO_PATTERN = re.compile(
     r"(?<!\.)(?<!def )\b(?:print|open)\s*\("
-    r"|(?:^|;)\s*from\s+(?:socket|urllib|requests|subprocess|logging)"
+    r"|(?:^|;)[ \t]*from\s+(?:socket|urllib|requests|subprocess|logging)"
     r"(?:\.[\w.]+)?\s+import\b"
-    r"|(?:^|;)\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*"
-    r"(?:socket|urllib|requests|subprocess|logging)\b"
+    r"|(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*"
+    r"(?:socket|urllib|requests|subprocess|logging)\b",
+    re.MULTILINE,
 )
 PY_NODE_LOCK_PATTERN = re.compile(
-    r"\bthreading\.(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b"
-    r"|(?:^|;)\s*from\s+threading\s+import\b[^\n;#]*\b"
+    r"\bthreading\s*\.\s*(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b"
+    r"|(?:^|;)[ \t]*from\s+threading\s+import(?:\s*\([^)]*?\b"
     r"(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b"
+    r"|[^\n;#]*\b(?:Lock|RLock|Semaphore|BoundedSemaphore|Condition)\b)",
+    re.MULTILINE,
 )
 # `using Clock = std::chrono::steady_clock;` or a typedef of one: the alias's
 # `::now(` is a clock read too.
@@ -169,10 +180,11 @@ NODE_CLOCK_ALIAS = re.compile(
     r"(?:utc_clock|tai_clock|gps_clock|file_clock)\s+(\w+)\s*;"
 )
 TS_TIME_PATTERNS = {
-    "sleep": re.compile(r"\bsetTimeout\s*\("),
-    "clock": re.compile(r"\b(Date|performance)\.now\s*\("),
+    "sleep": re.compile(r"\bsetTimeout\s*\(", re.MULTILINE),
+    "clock": re.compile(r"\b(Date|performance)\s*\.\s*now\s*\(", re.MULTILINE),
 }
-RETRY_PATTERN = re.compile(r"\bflaky\s*=\s*True\b|--flaky_test_attempts")
+RETRY_PATTERN = re.compile(r"\bflaky\s*=\s*True\b|--flaky_test_attempts",
+                           re.MULTILINE)
 
 
 def is_test_source(path):
@@ -214,9 +226,19 @@ def node_packages(files, read):
     return packages
 
 
-def in_package(path, packages):
-    """True when `path` sits directly in one of `packages` (not below)."""
-    return os.path.dirname(path) in packages
+def in_package(path, packages, build_dirs=None):
+    """True when `path` belongs to one of `packages` (directly in it, or in a
+    subdirectory below it with no intervening BUILD/BUILD.bazel boundary)."""
+    directory = os.path.dirname(path)
+    while True:
+        if directory in packages:
+            return True
+        if build_dirs is not None and directory in build_dirs:
+            return False
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return False
+        directory = parent
 
 
 C_COMMENT_SUFFIXES = (".cc", ".h", ".cpp", ".hpp", ".ts", ".tsx")
@@ -327,6 +349,17 @@ def _strip_c_comments(text, is_ts=False, strip_strings=False):
                     break
                 out.append(("\n" if c == "\n" else " ") if blank else c)
             continue
+        # Backslash line continuation outside strings: replace `\` with space
+        # while keeping `\n` intact so multiline invocations match `\s*` and
+        # 1-based line numbers stay exact.
+        if ch == "\\":
+            j = i + 1
+            while j < n and text[j] in (" ", "\t", "\r"):
+                j += 1
+            if j < n and text[j] == "\n":
+                out.append(" ")
+                i += 1
+                continue
         out.append(ch)
         i += 1
     return "".join(out)
@@ -401,6 +434,17 @@ def _strip_hash_comments(text, python_strings=True, strip_strings=False):
                     break
                 out.append(" " if blank else c)
             continue
+        # Backslash line continuation outside strings: replace `\` with space
+        # while keeping `\n` intact so multiline invocations match `\s*` and
+        # 1-based line numbers stay exact.
+        if ch == "\\":
+            j = i + 1
+            while j < n and text[j] in (" ", "\t", "\r"):
+                j += 1
+            if j < n and text[j] == "\n":
+                out.append(" ")
+                i += 1
+                continue
         out.append(ch)
         i += 1
     return "".join(out)
@@ -419,16 +463,31 @@ def strip_comments(text, path, strip_strings=False):
                                 strip_strings=strip_strings)
 
 
+def _line_starts(text):
+    """0-based starting character offsets for each 1-based line in `text`."""
+    starts = [0]
+    idx = text.find("\n")
+    while idx != -1:
+        starts.append(idx + 1)
+        idx = text.find("\n", idx + 1)
+    return starts
+
+
 def scan(files, read):
     """{(path, kind): [line numbers]} of every hit in `files`."""
     hits = {}
     packages = node_packages(files, read)
+    build_dirs = {
+        os.path.dirname(path)
+        for path in files
+        if os.path.basename(path) in ("BUILD", "BUILD.bazel")
+    }
     for path in files:
         patterns = {}
         stripped = None
         is_test = is_test_source(path) or is_test_helper(path)
         is_node = (not is_test and path.endswith(SOURCE_SUFFIXES) and
-                   in_package(path, packages))
+                   in_package(path, packages, build_dirs))
         if is_test:
             patterns.update(TIME_PATTERNS)
         elif is_node:
@@ -436,7 +495,7 @@ def scan(files, read):
             if path.endswith(".py"):
                 patterns["clock"] = re.compile(
                     patterns["clock"].pattern + "|" +
-                    PY_NODE_CLOCK_EXTRA.pattern)
+                    PY_NODE_CLOCK_EXTRA.pattern, re.MULTILINE)
                 patterns["random"] = PY_NODE_RANDOM_PATTERN
                 patterns["io"] = PY_NODE_IO_PATTERN
                 patterns["lock"] = PY_NODE_LOCK_PATTERN
@@ -452,7 +511,8 @@ def scan(files, read):
             if aliases:
                 patterns["clock"] = re.compile(
                     patterns["clock"].pattern + r"|\b(" +
-                    "|".join(sorted(aliases)) + r")\s*::\s*now\s*\(")
+                    "|".join(sorted(aliases)) + r")\s*::\s*now\s*\(",
+                    re.MULTILINE)
         if is_studio_test(path):
             patterns.update(TS_TIME_PATTERNS)
         if is_retry_config(path):
@@ -461,10 +521,17 @@ def scan(files, read):
             continue
         if stripped is None:
             stripped = strip_comments(read(path), path)
-        for number, line in enumerate(stripped.splitlines(), 1):
-            for kind, pattern in patterns.items():
-                if pattern.search(line):
-                    hits.setdefault((path, kind), []).append(number)
+        starts = _line_starts(stripped)
+        for kind, pattern in patterns.items():
+            lines = []
+            last_line = 0
+            for match in pattern.finditer(stripped):
+                number = bisect.bisect_right(starts, match.start())
+                if number != last_line:
+                    lines.append(number)
+                    last_line = number
+            if lines:
+                hits[(path, kind)] = lines
     return hits
 
 

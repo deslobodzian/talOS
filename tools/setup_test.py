@@ -285,6 +285,62 @@ class SetupShTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("unknown argument: --no-such-flag", r.stderr)
 
+    # REQ-OPS-15: single quotes and shell metacharacters in $ROOT must not
+    # inject commands when install_llvm invokes clang18_setup.
+    def test_install_llvm_does_not_inject_commands_from_quoted_root(self):
+        pwned = os.path.join(self.tmp, "pwned")
+        # Directory name containing single quote and shell command payload.
+        evil_repo = os.path.join(self.tmp, "repo';touch pwned;#")
+        os.makedirs(os.path.join(evil_repo, "tools"))
+        shutil.copy(self.setup_src,
+                    os.path.join(evil_repo, "tools", "setup.sh"))
+        put(
+            os.path.join(evil_repo, "tools", "clang18.sh"),
+            'CLANG18_VERSION="18.1.8"\n'
+            'clang18_setup() {\n'
+            '  echo "clang18_setup_invoked"\n'
+            '  mkdir -p "${XDG_CACHE_HOME}/talos/clang-18/venv/bin"\n'
+            '  printf "#!/bin/sh\\nexit 0\\n" > "${XDG_CACHE_HOME}/talos/clang-18/venv/bin/clang-format"\n'
+            '  printf "#!/bin/sh\\nexit 0\\n" > "${XDG_CACHE_HOME}/talos/clang-18/venv/bin/clang-tidy"\n'
+            '  chmod +x "${XDG_CACHE_HOME}/talos/clang-18/venv/bin/clang-format" '
+            '"${XDG_CACHE_HOME}/talos/clang-18/venv/bin/clang-tidy"\n'
+            '  printf "%s\\n" "$CLANG18_VERSION" > "${XDG_CACHE_HOME}/talos/clang-18/version"\n'
+            '}\n',
+        )
+        put(os.path.join(evil_repo, ".bazelversion"), "8.6.0\n")
+        os.remove(os.path.join(self.clang_home, "version"))
+
+        # Ensure mkdir, chmod, touch are available on PATH for the test.
+        for tool in ("mkdir", "chmod", "touch"):
+            dst = os.path.join(self.sys_bin, tool)
+            if not os.path.exists(dst):
+                real = shutil.which(tool)
+                self.assertIsNotNone(real)
+                os.symlink(real, dst)
+
+        env = {
+            "HOME": self.home,
+            "XDG_CACHE_HOME": self.cache,
+            "GRADLE_USER_HOME": self.gradle,
+            "JAVA_HOME": self.fake_jdk,
+            "PATH": self.bin_dir + os.pathsep + self.sys_bin,
+        }
+        r = subprocess.run(
+            ["bash", os.path.join(evil_repo, "tools", "setup.sh"),
+             "--yes", "--no-studio", "--no-rio"],
+            cwd=self.tmp,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        out = r.stdout + r.stderr
+        self.assertFalse(os.path.exists(pwned),
+                         f"shell injection via quoted $ROOT created {pwned}:\n{out}")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("clang18_setup_invoked", out)
+
 
 if __name__ == "__main__":
     unittest.main()
