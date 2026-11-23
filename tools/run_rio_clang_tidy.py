@@ -59,7 +59,9 @@ TOOL_ERROR_MARKERS = (
     'Unknown command line argument',
     'error: unable to handle compilation',
     'Error while trying to load a compilation database',
+    ': fatal error: ',
 )
+DRIVER_ERROR_RE = re.compile(r'^error:\s', re.MULTILINE)
 TIDY_DIAGNOSTIC_RE = re.compile(
     r':\d+:\d+: (?:warning|error): .+ \[([^\]\s]+)\]'
 )
@@ -153,6 +155,8 @@ def is_lint_finding_only(returncode, output):
     if returncode != 1:
         return False
     if any(marker in output for marker in TOOL_ERROR_MARKERS):
+        return False
+    if DRIVER_ERROR_RE.search(output):
         return False
     checks = TIDY_DIAGNOSTIC_RE.findall(output)
     return bool(checks) and all(

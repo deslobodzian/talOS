@@ -361,8 +361,14 @@ export function Shell() {
              aria-label="Import workspace JSON"
              onChange={async e => {
                const file = e.target.files?.[0];
-               if (file) onImport(await file.text());
                e.target.value = '';
+               if (!file) return;
+               try {
+                 onImport(await file.text());
+               } catch (err) {
+                 setTransportError(
+                     err instanceof Error ? err.message : 'Could not read workspace file');
+               }
              }}/>
       {paletteOpen &&
        <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)}/>}

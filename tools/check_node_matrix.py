@@ -167,10 +167,150 @@ def reason(text):
     return text.strip().lstrip("(-:–—").rstrip(")").strip()
 
 
+TALOS_IMPORT_ALIAS = re.compile(
+    r"(?:^|;)[ \t]*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*"
+    r"talos(?:\.devices)?\s+as\s+(\w+)\b",
+    re.MULTILINE,
+)
+
+
+def _strip_cpp_comments_and_strings(text):
+    """Strips C++ comments and string/char literal bodies (including raw
+    strings) while preserving newlines so commented-out or quoted TEST(...)
+    macros never count as real tests."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if ch == "/" and nxt == "/":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            out.append("  ")
+            i += 2
+            while i < n:
+                if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
+                    out.append("  ")
+                    i += 2
+                    break
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            continue
+        if ch == "_" or ch.isalpha():
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            ident = text[i:j]
+            if (ident in ("R", "u8R", "uR", "UR", "LR") and
+                    j < n and text[j] == '"'):
+                paren = text.find("(", j + 1)
+                if paren != -1 and paren - (j + 1) <= 16:
+                    delim = text[j + 1:paren]
+                    if not any(c in delim for c in " \t\v\f\r\n\\()"):
+                        end_marker = ")" + delim + '"'
+                        end = text.find(end_marker, paren + 1)
+                        if end != -1:
+                            end_idx = end + len(end_marker)
+                            out.append('"')
+                            for c in text[i + 1:end_idx - 1]:
+                                out.append("\n" if c == "\n" else " ")
+                            out.append('"')
+                            i = end_idx
+                            continue
+            out.append(ident)
+            i = j
+            continue
+        if ch.isdigit() and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                c_next = text[i + 1] if i + 1 < n else ""
+                if c == "'" and (c_next.isalnum() or c_next == "_"):
+                    out.append(c)
+                    out.append(c_next)
+                    i += 2
+                    continue
+                if c in ("e", "E", "p", "P") and c_next in ("+", "-"):
+                    out.append(c)
+                    out.append(c_next)
+                    i += 2
+                    continue
+                if c.isalnum() or c in ("_", "."):
+                    out.append(c)
+                    i += 1
+                    continue
+                break
+            continue
+        if ch in ('"', "'"):
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                i += 1
+                if c == "\\" and i < n:
+                    escaped = text[i]
+                    i += 1
+                    out.append("\n" if escaped == "\n" else "  ")
+                    continue
+                if c == ch or c == "\n":
+                    out.append(c)
+                    break
+                out.append(" ")
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _cpp_test_names(text):
+    return set(CC_TEST.findall(_strip_cpp_comments_and_strings(text)))
+
+
+def _python_test_names(text):
+    """Active (non-skipped, non-docstring) Python `test_*` functions/methods."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as error:
+        raise MatrixError(f"cannot parse the file: {error}") from error
+    names = set()
+
+    def is_skipped_scope(node):
+        return any(callee(d) in SKIPS for d in getattr(node, "decorator_list", ()))
+
+    def has_skip_call(fn):
+        return any(
+            isinstance(n, ast.Call) and callee(n) in SKIPS
+            for n in own_nodes(fn)
+        )
+
+    def collect(body, class_skipped=False):
+        for stmt in body:
+            if isinstance(stmt, ast.ClassDef):
+                collect(stmt.body, class_skipped or is_skipped_scope(stmt))
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not stmt.name.startswith("test_"):
+                    continue
+                if class_skipped or is_skipped_scope(stmt) or has_skip_call(stmt):
+                    continue
+                names.add(stmt.name)
+
+    collect(tree.body)
+    return names
+
+
 def infer_role(sources):
     """The role of a node package from the text of its non-test sources."""
     if any(p.search(text) for p in ACTUATOR for text in sources):
         return "actuator"
+    for text in sources:
+        for alias in TALOS_IMPORT_ALIAS.findall(text):
+            if re.search(rf"\b{re.escape(alias)}\.(?:devices\.)?{ACTUATORS}\b", text):
+                return "actuator"
     if any(PRODUCER.search(text) for text in sources):
         return "producer"
     if any(HOSTED.search(text) for text in sources) and not any(
@@ -328,7 +468,7 @@ def parity_claims(text, role, sibling):
             raise MatrixError(f"matrix: parity {case}: no C++ test file "
                               f"{cc_file}")
         name = CASES[role][case]
-        if name not in CC_TEST.findall(cc_text):
+        if name not in _cpp_test_names(cc_text):
             raise MatrixError(f"matrix: parity {case}: {cc_file} has no "
                               f"test {name}")
         for step in steps:
@@ -349,7 +489,7 @@ def check(text, lang, role, sibling=lambda name: None):
     the parity claim. `sibling(name)` reads a file beside the test (None
     when there is none), for a parity claim's C++ test. Raises MatrixError
     for a role override or a parity claim the rules refuse."""
-    names = set((PY_TEST if lang == "py" else CC_TEST).findall(text))
+    names = _python_test_names(text) if lang == "py" else _cpp_test_names(text)
     for match in ROLE.finditer(text):
         override, why = match.group(1), reason(match.group(2))
         if override not in CASES:

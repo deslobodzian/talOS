@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "apriltag_pose_ambiguity.patch",
     "tomlplusplus_parser_ub.patch",
+    "uws_security_and_ub.patch",
 ])
 
 alias(

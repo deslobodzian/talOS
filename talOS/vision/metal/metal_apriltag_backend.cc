@@ -1,39 +1,28 @@
 #include "talOS/vision/metal/metal_apriltag_backend.h"
 
 #include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <format>
-#include <iostream>
 #include <memory>
 #include <mutex>
-#include <opencv2/imgcodecs.hpp>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "talOS/geometry/se3.h"
-#include "talOS/geometry/so3.h"
 #include "talOS/vision/apriltag/cpu_apriltag_backend.h"
 #include "talOS/vision/compute_backend.h"
-#include "talOS/vision/localization.h"
 #include "talOS/vision/metal/apriltag_metal_adapter.h"
 #include "talOS/vision/metal/gpu_sparse_clusters.h"
 #include "talOS/vision/metal/metal_shaders.h"
 
 extern "C" {
 #include "apriltag.h"
-#include "apriltag_pose.h"
 #include "common/image_u8.h"
-#include "common/image_u8x3.h"
-#include "common/pjpeg.h"
 #include "common/timeprofile.h"
-#include "tag16h5.h"
-#include "tag25h9.h"
-#include "tag36h11.h"
 }
 
 #if defined(__APPLE__)
@@ -63,24 +52,68 @@ uint32_t FormatToMetalCode(PixelFormat format) {
       return 3;
   }
 }
-#endif
 
-apriltag_family_t* CreateFamily(const std::string& name) {
-  if (name == "tag16h5") return tag16h5_create();
-  if (name == "tag25h9") return tag25h9_create();
-  return tag36h11_create();
-}
-
-void DestroyFamily(const std::string& name, apriltag_family_t* tf) {
-  if (!tf) return;
-  if (name == "tag16h5") {
-    tag16h5_destroy(tf);
-  } else if (name == "tag25h9") {
-    tag25h9_destroy(tf);
-  } else {
-    tag36h11_destroy(tf);
+template <typename T>
+void ReleaseAndNull(T*& ptr) {
+  if (ptr != nullptr) {
+    ptr->release();
+    ptr = nullptr;
   }
 }
+
+// Grow-only StorageModeShared Metal buffer reused across frames.
+struct CachedBuffer {
+  MTL::Buffer* buffer{nullptr};
+  size_t capacity{0};
+
+  void Release() {
+    ReleaseAndNull(buffer);
+    capacity = 0;
+  }
+
+  MTL::Buffer* Ensure(MTL::Device* dev, size_t bytes) {
+    if (buffer == nullptr || capacity < bytes) {
+      Release();
+      buffer = dev->newBuffer(bytes, MTL::ResourceStorageModeShared);
+      capacity = (buffer != nullptr) ? bytes : 0;
+    }
+    return buffer;
+  }
+};
+
+void Dispatch2D(MTL::ComputeCommandEncoder* enc, uint32_t width,
+                uint32_t height) {
+  const MTL::Size tg_size = MTL::Size::Make(16, 16, 1);
+  const MTL::Size tg_count =
+      MTL::Size::Make((static_cast<NS::UInteger>(width) + 15) / 16,
+                      (static_cast<NS::UInteger>(height) + 15) / 16, 1);
+  enc->dispatchThreadgroups(tg_count, tg_size);
+}
+
+void Dispatch1D(MTL::ComputeCommandEncoder* enc, uint32_t count) {
+  const MTL::Size tg_size = MTL::Size::Make(256, 1, 1);
+  const MTL::Size tg_count =
+      MTL::Size::Make((static_cast<NS::UInteger>(count) + 255) / 256, 1, 1);
+  enc->dispatchThreadgroups(tg_count, tg_size);
+}
+
+void EncodeColorConvert(MTL::ComputeCommandEncoder* enc,
+                        MTL::ComputePipelineState* pso, MTL::Buffer* in_buf,
+                        MTL::Buffer* out_buf, uint32_t width, uint32_t height,
+                        uint32_t in_stride, uint32_t out_stride,
+                        uint32_t format, uint32_t dispatch_w,
+                        uint32_t dispatch_h) {
+  enc->setComputePipelineState(pso);
+  enc->setBuffer(in_buf, 0, 0);
+  enc->setBuffer(out_buf, 0, 1);
+  enc->setBytes(&width, sizeof(width), 2);
+  enc->setBytes(&height, sizeof(height), 3);
+  enc->setBytes(&in_stride, sizeof(in_stride), 4);
+  enc->setBytes(&out_stride, sizeof(out_stride), 5);
+  enc->setBytes(&format, sizeof(format), 6);
+  Dispatch2D(enc, dispatch_w, dispatch_h);
+}
+#endif
 
 // Stage 2 (GPU connected-components) is default-ON in Detect();
 // TALOS_METAL_STAGE2=0 opts out (keeps the Stage 1 CPU path).
@@ -101,6 +134,7 @@ struct MetalAprilTagBackend::Impl {
   std::recursive_mutex mutex;
   apriltag_family_t* tf{nullptr};
   apriltag_detector_t* td{nullptr};
+  std::string active_family;
 
   talos::vision::StageTimings last_timings;
   bool is_fallback{false};
@@ -119,28 +153,19 @@ struct MetalAprilTagBackend::Impl {
   MTL::ComputePipelineState* pso_tile_min_max_4x4{nullptr};
   MTL::ComputePipelineState* pso_tile_blur_and_threshold{nullptr};
 
-  MTL::Buffer* cached_in_buf{nullptr};
-  size_t cached_in_capacity{0};
-  MTL::Buffer* cached_gray_buf{nullptr};
-  MTL::Buffer* cached_thresh_buf{nullptr};
-  size_t cached_thresh_capacity{0};
-  MTL::Buffer* cached_im_min_buf{nullptr};
-  size_t cached_im_min_capacity{0};
-  MTL::Buffer* cached_im_max_buf{nullptr};
-  size_t cached_im_max_capacity{0};
-  size_t cached_gray_capacity{0};
-  MTL::Buffer* cached_dec_buf{nullptr};
-  size_t cached_dec_capacity{0};
+  CachedBuffer cached_in;
+  CachedBuffer cached_gray;
+  CachedBuffer cached_thresh;
+  CachedBuffer cached_im_min;
+  CachedBuffer cached_im_max;
+  CachedBuffer cached_dec;
   // Stage 2: GPU CCL path with CPU fallback preserved. All StorageModeShared,
-  // grow-only, like cached_thresh_buf. Lifetimes are Impl members so contents
+  // grow-only, like cached_thresh. Lifetimes are Impl members so contents
   // outlive Detect().
-  MTL::Buffer* cached_parent_buf{nullptr};
-  size_t cached_parent_capacity{0};
-  MTL::Buffer* cached_size_buf{nullptr};
-  size_t cached_size_capacity{0};
-  MTL::Buffer* cached_cand_buf{nullptr};
-  size_t cached_cand_capacity{0};
-  MTL::Buffer* cached_cand_count_buf{nullptr};
+  CachedBuffer cached_parent;
+  CachedBuffer cached_size;
+  CachedBuffer cached_cand;
+  CachedBuffer cached_cand_count;
   MTL::ComputePipelineState* pso_ccl_init{nullptr};
   MTL::ComputePipelineState* pso_ccl_union{nullptr};
   MTL::ComputePipelineState* pso_ccl_flatten{nullptr};
@@ -165,7 +190,12 @@ struct MetalAprilTagBackend::Impl {
   }
 
   void InitDetector() {
-    tf = CreateFamily(options.family_name);
+    tf = talos::vision::apriltag::CreateTagFamily(options.family_name);
+    if (tf == nullptr) {
+      throw std::invalid_argument("Unsupported AprilTag family: " +
+                                  options.family_name);
+    }
+    active_family = options.family_name;
     td = apriltag_detector_create();
     apriltag_detector_add_family_bits(td, tf, options.max_hamming);
     td->nthreads = options.threads;
@@ -176,106 +206,41 @@ struct MetalAprilTagBackend::Impl {
   }
 
   void DestroyDetector() {
-    if (td) {
+    if (td != nullptr) {
       apriltag_detector_destroy(td);
       td = nullptr;
     }
-    if (tf) {
-      DestroyFamily(options.family_name, tf);
+    if (tf != nullptr) {
+      talos::vision::apriltag::DestroyTagFamily(active_family, tf);
       tf = nullptr;
     }
+    active_family.clear();
   }
 
   void DestroyMetal() {
 #if defined(__APPLE__)
-    if (cached_in_buf) {
-      cached_in_buf->release();
-      cached_in_buf = nullptr;
-    }
-    if (cached_gray_buf) {
-      cached_gray_buf->release();
-      cached_gray_buf = nullptr;
-    }
-    if (cached_thresh_buf) {
-      cached_thresh_buf->release();
-      cached_thresh_buf = nullptr;
-    }
-    if (cached_im_min_buf) {
-      cached_im_min_buf->release();
-      cached_im_min_buf = nullptr;
-    }
-    if (cached_im_max_buf) {
-      cached_im_max_buf->release();
-      cached_im_max_buf = nullptr;
-    }
-    if (cached_dec_buf) {
-      cached_dec_buf->release();
-      cached_dec_buf = nullptr;
-    }
-    if (cached_parent_buf) {
-      cached_parent_buf->release();
-      cached_parent_buf = nullptr;
-    }
-    if (cached_size_buf) {
-      cached_size_buf->release();
-      cached_size_buf = nullptr;
-    }
-    if (cached_cand_buf) {
-      cached_cand_buf->release();
-      cached_cand_buf = nullptr;
-    }
-    if (cached_cand_count_buf) {
-      cached_cand_count_buf->release();
-      cached_cand_count_buf = nullptr;
-    }
-    if (pso_ccl_init) {
-      pso_ccl_init->release();
-      pso_ccl_init = nullptr;
-    }
-    if (pso_ccl_union) {
-      pso_ccl_union->release();
-      pso_ccl_union = nullptr;
-    }
-    if (pso_ccl_flatten) {
-      pso_ccl_flatten->release();
-      pso_ccl_flatten = nullptr;
-    }
-    if (pso_ccl_sizes) {
-      pso_ccl_sizes->release();
-      pso_ccl_sizes = nullptr;
-    }
-    if (pso_extract_cands) {
-      pso_extract_cands->release();
-      pso_extract_cands = nullptr;
-    }
-    if (pso_rgb_to_gray) {
-      pso_rgb_to_gray->release();
-      pso_rgb_to_gray = nullptr;
-    }
-    if (pso_rgb_to_gray_decimate_2x) {
-      pso_rgb_to_gray_decimate_2x->release();
-      pso_rgb_to_gray_decimate_2x = nullptr;
-    }
-    if (pso_tile_min_max_4x4) {
-      pso_tile_min_max_4x4->release();
-      pso_tile_min_max_4x4 = nullptr;
-    }
-    if (pso_tile_blur_and_threshold) {
-      pso_tile_blur_and_threshold->release();
-      pso_tile_blur_and_threshold = nullptr;
-    }
-    if (queue) {
-      queue->release();
-      queue = nullptr;
-    }
-    if (library) {
-      library->release();
-      library = nullptr;
-    }
-    if (device) {
-      device->release();
-      device = nullptr;
-    }
+    cached_in.Release();
+    cached_gray.Release();
+    cached_thresh.Release();
+    cached_im_min.Release();
+    cached_im_max.Release();
+    cached_dec.Release();
+    cached_parent.Release();
+    cached_size.Release();
+    cached_cand.Release();
+    cached_cand_count.Release();
+    ReleaseAndNull(pso_ccl_init);
+    ReleaseAndNull(pso_ccl_union);
+    ReleaseAndNull(pso_ccl_flatten);
+    ReleaseAndNull(pso_ccl_sizes);
+    ReleaseAndNull(pso_extract_cands);
+    ReleaseAndNull(pso_rgb_to_gray);
+    ReleaseAndNull(pso_rgb_to_gray_decimate_2x);
+    ReleaseAndNull(pso_tile_min_max_4x4);
+    ReleaseAndNull(pso_tile_blur_and_threshold);
+    ReleaseAndNull(queue);
+    ReleaseAndNull(library);
+    ReleaseAndNull(device);
 #endif
   }
 
@@ -419,7 +384,6 @@ struct MetalAprilTagBackend::Impl {
     }
 
 #if defined(__APPLE__)
-    std::lock_guard<std::recursive_mutex> lock(mutex);
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
     // Fresh counters every frame: threshold/CCL accumulate with += below,
@@ -448,15 +412,9 @@ struct MetalAprilTagBackend::Impl {
                        tag_size_meters);
     };
     if (in_buf == nullptr) {
-      if (!cached_in_buf || cached_in_capacity < in_bytes) {
-        if (cached_in_buf) cached_in_buf->release();
-        cached_in_buf =
-            device->newBuffer(in_bytes, MTL::ResourceStorageModeShared);
-        cached_in_capacity = (cached_in_buf != nullptr) ? in_bytes : 0;
-      }
-      if (!cached_in_buf || !cached_in_buf->contents()) return cpu_fallback();
-      std::memcpy(cached_in_buf->contents(), data, in_bytes);
-      in_buf = cached_in_buf;
+      in_buf = cached_in.Ensure(device, in_bytes);
+      if (!in_buf || !in_buf->contents()) return cpu_fallback();
+      std::memcpy(in_buf->contents(), data, in_bytes);
     }
     if (!in_buf->contents()) return cpu_fallback();
 
@@ -465,26 +423,12 @@ struct MetalAprilTagBackend::Impl {
     const int detect_w = use_gpu_decimated ? (1 + (width - 1) / 2) : width;
     const int detect_h = use_gpu_decimated ? (1 + (height - 1) / 2) : height;
     MTL::Buffer* dec_buf = nullptr;
-    MTL::Buffer* gray_buf = nullptr;
-
     if (use_gpu_decimated) {
       const size_t dec_bytes =
           static_cast<size_t>(detect_w) * static_cast<size_t>(detect_h);
-      if (!cached_dec_buf || cached_dec_capacity < dec_bytes) {
-        if (cached_dec_buf) cached_dec_buf->release();
-        cached_dec_buf =
-            device->newBuffer(dec_bytes, MTL::ResourceStorageModeShared);
-        cached_dec_capacity = (cached_dec_buf != nullptr) ? dec_bytes : 0;
-      }
-      dec_buf = cached_dec_buf;
+      dec_buf = cached_dec.Ensure(device, dec_bytes);
     }
-    if (!cached_gray_buf || cached_gray_capacity < gray_bytes) {
-      if (cached_gray_buf) cached_gray_buf->release();
-      cached_gray_buf =
-          device->newBuffer(gray_bytes, MTL::ResourceStorageModeShared);
-      cached_gray_capacity = (cached_gray_buf != nullptr) ? gray_bytes : 0;
-    }
-    gray_buf = cached_gray_buf;
+    MTL::Buffer* gray_buf = cached_gray.Ensure(device, gray_bytes);
     if (!gray_buf || !gray_buf->contents() ||
         (use_gpu_decimated && (!dec_buf || !dec_buf->contents()))) {
       return cpu_fallback();
@@ -499,42 +443,23 @@ struct MetalAprilTagBackend::Impl {
       return cpu_fallback();
     }
 
-    uint32_t w = width;
-    uint32_t h = height;
-    uint32_t in_s = actual_stride;
-    uint32_t fmt = FormatToMetalCode(format);
-    MTL::Size tg_size = MTL::Size::Make(16, 16, 1);
+    const uint32_t w = static_cast<uint32_t>(width);
+    const uint32_t h = static_cast<uint32_t>(height);
+    const uint32_t in_s = static_cast<uint32_t>(actual_stride);
+    const uint32_t fmt = FormatToMetalCode(format);
 
     if (format == PixelFormat::kGray8 && actual_stride == width) {
       std::memcpy(gray_buf->contents(), data, gray_bytes);
     } else {
-      enc->setComputePipelineState(pso_rgb_to_gray);
-      enc->setBuffer(in_buf, 0, 0);
-      enc->setBuffer(gray_buf, 0, 1);
-      enc->setBytes(&w, sizeof(w), 2);
-      enc->setBytes(&h, sizeof(h), 3);
-      enc->setBytes(&in_s, sizeof(in_s), 4);
-      uint32_t out_s = width;
-      enc->setBytes(&out_s, sizeof(out_s), 5);
-      enc->setBytes(&fmt, sizeof(fmt), 6);
-      enc->dispatchThreadgroups(
-          MTL::Size::Make((width + 15) / 16, (height + 15) / 16, 1), tg_size);
+      EncodeColorConvert(enc, pso_rgb_to_gray, in_buf, gray_buf, w, h, in_s, w,
+                         fmt, w, h);
       enc->memoryBarrier(MTL::BarrierScopeBuffers);
     }
     if (use_gpu_decimated) {
-      enc->setComputePipelineState(pso_rgb_to_gray_decimate_2x);
-      enc->setBuffer(in_buf, 0, 0);
-      enc->setBuffer(dec_buf, 0, 1);
-      enc->setBytes(&w, sizeof(w), 2);
-      enc->setBytes(&h, sizeof(h), 3);
-      enc->setBytes(&in_s, sizeof(in_s), 4);
-      uint32_t out_s = static_cast<uint32_t>(detect_w);
-      enc->setBytes(&out_s, sizeof(out_s), 5);
-      enc->setBytes(&fmt, sizeof(fmt), 6);
-      MTL::Size dec_tg_count =
-          MTL::Size::Make((static_cast<NS::UInteger>(detect_w) + 15) / 16,
-                          (static_cast<NS::UInteger>(detect_h) + 15) / 16, 1);
-      enc->dispatchThreadgroups(dec_tg_count, tg_size);
+      const uint32_t dw = static_cast<uint32_t>(detect_w);
+      const uint32_t dh = static_cast<uint32_t>(detect_h);
+      EncodeColorConvert(enc, pso_rgb_to_gray_decimate_2x, in_buf, dec_buf, w,
+                         h, in_s, dw, fmt, dw, dh);
     }
 
     enc->memoryBarrier(MTL::BarrierScopeBuffers);
@@ -570,9 +495,9 @@ struct MetalAprilTagBackend::Impl {
           static_cast<uint32_t>(detect_h), static_cast<uint32_t>(detect_w),
           static_cast<uint32_t>(td->qtp.min_white_black_diff), enc);
       enc->memoryBarrier(MTL::BarrierScopeBuffers);
-      if (threshold_ok && cached_thresh_buf != nullptr &&
-          cached_thresh_buf->contents() != nullptr) {
-        threshim.buf = static_cast<uint8_t*>(cached_thresh_buf->contents());
+      if (threshold_ok && cached_thresh.buffer != nullptr &&
+          cached_thresh.buffer->contents() != nullptr) {
+        threshim.buf = static_cast<uint8_t*>(cached_thresh.buffer->contents());
         threshim_ptr = &threshim;
       }
     }
@@ -608,97 +533,74 @@ struct MetalAprilTagBackend::Impl {
             static_cast<size_t>(detect_w) * static_cast<size_t>(detect_h);
         if (npix > 0 && npix <= static_cast<size_t>(64) * 1024 * 1024) {
           const size_t parent_bytes = npix * sizeof(uint32_t);
-          if (cached_parent_buf == nullptr ||
-              cached_parent_capacity < parent_bytes) {
-            if (cached_parent_buf) cached_parent_buf->release();
-            cached_parent_buf =
-                device->newBuffer(parent_bytes, MTL::ResourceStorageModeShared);
-            cached_parent_capacity =
-                (cached_parent_buf != nullptr) ? parent_bytes : 0;
-          }
-          if (cached_size_buf == nullptr ||
-              cached_size_capacity < parent_bytes) {
-            if (cached_size_buf) cached_size_buf->release();
-            cached_size_buf =
-                device->newBuffer(parent_bytes, MTL::ResourceStorageModeShared);
-            cached_size_capacity =
-                (cached_size_buf != nullptr) ? parent_bytes : 0;
-          }
+          MTL::Buffer* parent_buf = cached_parent.Ensure(device, parent_bytes);
+          MTL::Buffer* size_buf = cached_size.Ensure(device, parent_bytes);
           // Candidate capacity at half the pixels: busy photographic frames
           // reach ~40% edge density, far above sparse assumptions. Slots are
           // packed uint32 (flags/y/x), one uint32 each.
           size_t max_cands = npix / 2;
           if (max_cands == 0) max_cands = 1;
           const size_t cand_bytes = max_cands * sizeof(uint32_t);
-          if (cached_cand_buf == nullptr || cached_cand_capacity < max_cands) {
-            if (cached_cand_buf) cached_cand_buf->release();
-            cached_cand_buf =
-                device->newBuffer(cand_bytes, MTL::ResourceStorageModeShared);
-            cached_cand_capacity = (cached_cand_buf != nullptr) ? max_cands : 0;
-          }
-          if (cached_cand_count_buf == nullptr) {
-            cached_cand_count_buf = device->newBuffer(
-                sizeof(uint32_t), MTL::ResourceStorageModeShared);
-          }
-          if (cached_parent_buf != nullptr && cached_size_buf != nullptr &&
-              cached_cand_buf != nullptr && cached_cand_count_buf != nullptr &&
-              cached_thresh_buf != nullptr && cached_parent_buf->contents() &&
-              cached_size_buf->contents() && cached_cand_buf->contents() &&
-              cached_cand_count_buf->contents() &&
-              cached_thresh_buf->contents()) {
-            *static_cast<uint32_t*>(cached_cand_count_buf->contents()) = 0;
-            MTL::ComputeCommandEncoder* cenc = enc;
+          MTL::Buffer* cand_buf = cached_cand.Ensure(device, cand_bytes);
+          MTL::Buffer* cand_count_buf =
+              cached_cand_count.Ensure(device, sizeof(uint32_t));
+          if (parent_buf != nullptr && size_buf != nullptr &&
+              cand_buf != nullptr && cand_count_buf != nullptr &&
+              cached_thresh.buffer != nullptr && parent_buf->contents() &&
+              size_buf->contents() && cand_buf->contents() &&
+              cand_count_buf->contents() && cached_thresh.buffer->contents()) {
+            *static_cast<uint32_t*>(cand_count_buf->contents()) = 0;
             const uint32_t dw = static_cast<uint32_t>(detect_w);
             const uint32_t dh = static_cast<uint32_t>(detect_h);
             const uint32_t ds = static_cast<uint32_t>(detect_w);
             const uint32_t total = static_cast<uint32_t>(npix);
             const uint32_t maxc = static_cast<uint32_t>(max_cands);
-            const MTL::Size tg2 = MTL::Size::Make(16, 16, 1);
-            const MTL::Size n2 =
-                MTL::Size::Make((dw + 15) / 16, (dh + 15) / 16, 1);
-            cenc->setComputePipelineState(pso_ccl_init);
-            cenc->setBuffer(cached_thresh_buf, 0, 0);
-            cenc->setBuffer(cached_parent_buf, 0, 1);
-            cenc->setBuffer(cached_size_buf, 0, 2);
-            cenc->setBytes(&dw, sizeof(dw), 3);
-            cenc->setBytes(&dh, sizeof(dh), 4);
-            cenc->setBytes(&ds, sizeof(ds), 5);
-            cenc->dispatchThreadgroups(n2, tg2);
-            cenc->memoryBarrier(MTL::BarrierScopeBuffers);
-            cenc->setComputePipelineState(pso_ccl_union);
-            cenc->setBuffer(cached_thresh_buf, 0, 0);
-            cenc->setBuffer(cached_parent_buf, 0, 1);
-            cenc->setBytes(&dw, sizeof(dw), 2);
-            cenc->setBytes(&dh, sizeof(dh), 3);
-            cenc->setBytes(&ds, sizeof(ds), 4);
-            cenc->dispatchThreadgroups(n2, tg2);
-            cenc->memoryBarrier(MTL::BarrierScopeBuffers);
-            const MTL::Size tg1 = MTL::Size::Make(256, 1, 1);
-            const MTL::Size n1 = MTL::Size::Make((total + 255) / 256, 1, 1);
-            cenc->setComputePipelineState(pso_ccl_flatten);
-            cenc->setBuffer(cached_parent_buf, 0, 0);
-            cenc->setBytes(&total, sizeof(total), 1);
-            cenc->dispatchThreadgroups(n1, tg1);
-            cenc->memoryBarrier(MTL::BarrierScopeBuffers);
-            cenc->setComputePipelineState(pso_ccl_sizes);
-            cenc->setBuffer(cached_parent_buf, 0, 0);
-            cenc->setBuffer(cached_size_buf, 0, 1);
-            cenc->setBytes(&total, sizeof(total), 2);
-            cenc->dispatchThreadgroups(n1, tg1);
-            cenc->memoryBarrier(MTL::BarrierScopeBuffers);
-            cenc->setComputePipelineState(pso_extract_cands);
-            cenc->setBuffer(cached_thresh_buf, 0, 0);
-            cenc->setBuffer(cached_cand_buf, 0, 1);
-            cenc->setBuffer(cached_cand_count_buf, 0, 2);
-            cenc->setBytes(&dw, sizeof(dw), 3);
-            cenc->setBytes(&dh, sizeof(dh), 4);
-            cenc->setBytes(&ds, sizeof(ds), 5);
-            cenc->setBytes(&maxc, sizeof(maxc), 6);
-            cenc->dispatchThreadgroups(n2, tg2);
+
+            enc->setComputePipelineState(pso_ccl_init);
+            enc->setBuffer(cached_thresh.buffer, 0, 0);
+            enc->setBuffer(parent_buf, 0, 1);
+            enc->setBuffer(size_buf, 0, 2);
+            enc->setBytes(&dw, sizeof(dw), 3);
+            enc->setBytes(&dh, sizeof(dh), 4);
+            enc->setBytes(&ds, sizeof(ds), 5);
+            Dispatch2D(enc, dw, dh);
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+            enc->setComputePipelineState(pso_ccl_union);
+            enc->setBuffer(cached_thresh.buffer, 0, 0);
+            enc->setBuffer(parent_buf, 0, 1);
+            enc->setBytes(&dw, sizeof(dw), 2);
+            enc->setBytes(&dh, sizeof(dh), 3);
+            enc->setBytes(&ds, sizeof(ds), 4);
+            Dispatch2D(enc, dw, dh);
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+            enc->setComputePipelineState(pso_ccl_flatten);
+            enc->setBuffer(parent_buf, 0, 0);
+            enc->setBytes(&total, sizeof(total), 1);
+            Dispatch1D(enc, total);
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+            enc->setComputePipelineState(pso_ccl_sizes);
+            enc->setBuffer(parent_buf, 0, 0);
+            enc->setBuffer(size_buf, 0, 1);
+            enc->setBytes(&total, sizeof(total), 2);
+            Dispatch1D(enc, total);
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+            enc->setComputePipelineState(pso_extract_cands);
+            enc->setBuffer(cached_thresh.buffer, 0, 0);
+            enc->setBuffer(cand_buf, 0, 1);
+            enc->setBuffer(cand_count_buf, 0, 2);
+            enc->setBytes(&dw, sizeof(dw), 3);
+            enc->setBytes(&dh, sizeof(dh), 4);
+            enc->setBytes(&ds, sizeof(ds), 5);
+            enc->setBytes(&maxc, sizeof(maxc), 6);
+            Dispatch2D(enc, dw, dh);
+
             stage2_parents =
-                static_cast<const uint32_t*>(cached_parent_buf->contents());
-            stage2_sizes =
-                static_cast<const uint32_t*>(cached_size_buf->contents());
+                static_cast<const uint32_t*>(parent_buf->contents());
+            stage2_sizes = static_cast<const uint32_t*>(size_buf->contents());
             stage2_max_cands = maxc;
           }
         }
@@ -716,12 +618,12 @@ struct MetalAprilTagBackend::Impl {
         (gpu_sec > 0.0) ? static_cast<uint64_t>(gpu_sec * 1e6) : 0;
     if (stage2_parents != nullptr) {
       const uint32_t count =
-          *static_cast<uint32_t*>(cached_cand_count_buf->contents());
-      // Compare against this frame's maxc (not grow-only cached_cand_capacity)
+          *static_cast<uint32_t*>(cached_cand_count.buffer->contents());
+      // Compare against this frame's maxc (not grow-only cached_cand.capacity)
       // so overflow falls back to Stage 2a instead of reading stale tail slots.
       if (count <= stage2_max_cands) {
         stage2_cands =
-            static_cast<const uint32_t*>(cached_cand_buf->contents());
+            static_cast<const uint32_t*>(cached_cand.buffer->contents());
         stage2_cand_count = count;
       }
     }
@@ -789,46 +691,9 @@ struct MetalAprilTagBackend::Impl {
     }
 
     auto t_pose_start = std::chrono::steady_clock::now();
-    std::vector<talos::vision::apriltag::Detection> results;
-    if (raw_detections) {
-      const int count = zarray_size(raw_detections);
-      results.reserve(count);
-
-      for (int i = 0; i < count; ++i) {
-        apriltag_detection_t* raw_det = nullptr;
-        zarray_get(raw_detections, i, reinterpret_cast<void*>(&raw_det));
-        if (!raw_det) continue;
-
-        talos::vision::apriltag::Detection det;
-        det.id = raw_det->id;
-        det.hamming = raw_det->hamming;
-        det.decision_margin = raw_det->decision_margin;
-        det.center =
-            talos::vision::apriltag::Point2D{raw_det->c[0], raw_det->c[1]};
-
-        for (int j = 0; j < 4; ++j) {
-          det.corners[j] = talos::vision::apriltag::Point2D{raw_det->p[j][0],
-                                                            raw_det->p[j][1]};
-        }
-
-        if (raw_det->H != nullptr) {
-          for (int r = 0; r < 3; ++r) {
-            for (int c = 0; c < 3; ++c) {
-              det.homography(r, c) = MATD_EL(raw_det->H, r, c);
-            }
-          }
-        }
-
-        if (p_intrinsics != nullptr && tag_size_meters > 0.0) {
-          det.pose =
-              cpu_backend->EstimatePose(det, *p_intrinsics, tag_size_meters);
-        }
-
-        results.push_back(std::move(det));
-      }
-      apriltag_detections_destroy(raw_detections);
-    }
-
+    std::vector<talos::vision::apriltag::Detection> results =
+        talos::vision::apriltag::ExtractDetections(
+            raw_detections, *cpu_backend, p_intrinsics, tag_size_meters);
     auto t_pose_end = std::chrono::steady_clock::now();
     last_timings.pose_us =
         std::chrono::duration_cast<std::chrono::microseconds>(t_pose_end -
@@ -845,10 +710,6 @@ struct MetalAprilTagBackend::Impl {
     pool->release();
     return results;
 #else
-    if (p_intrinsics != nullptr && tag_size_meters > 0.0) {
-      return CpuDetect(data, width, height, stride, format, p_intrinsics,
-                       tag_size_meters);
-    }
     return CpuDetect(data, width, height, stride, format, p_intrinsics,
                      tag_size_meters);
 #endif
@@ -876,36 +737,15 @@ struct MetalAprilTagBackend::Impl {
     }
 
     const size_t min_max_bytes = static_cast<size_t>(tw) * th;
-    if (!cached_im_min_buf || cached_im_min_capacity < min_max_bytes) {
-      if (cached_im_min_buf) cached_im_min_buf->release();
-      cached_im_min_buf =
-          device->newBuffer(min_max_bytes, MTL::ResourceStorageModeShared);
-      cached_im_min_capacity =
-          (cached_im_min_buf != nullptr) ? min_max_bytes : 0;
-    }
-    if (!cached_im_max_buf || cached_im_max_capacity < min_max_bytes) {
-      if (cached_im_max_buf) cached_im_max_buf->release();
-      cached_im_max_buf =
-          device->newBuffer(min_max_bytes, MTL::ResourceStorageModeShared);
-      cached_im_max_capacity =
-          (cached_im_max_buf != nullptr) ? min_max_bytes : 0;
-    }
+    MTL::Buffer* im_min_buf = cached_im_min.Ensure(device, min_max_bytes);
+    MTL::Buffer* im_max_buf = cached_im_max.Ensure(device, min_max_bytes);
 
     const size_t thresh_bytes = static_cast<size_t>(actual_stride) * height;
-    MTL::Buffer* out_thresh = thresh_buf;
-    if (!out_thresh) {
-      if (!cached_thresh_buf || cached_thresh_capacity < thresh_bytes) {
-        if (cached_thresh_buf) cached_thresh_buf->release();
-        cached_thresh_buf =
-            device->newBuffer(thresh_bytes, MTL::ResourceStorageModeShared);
-        cached_thresh_capacity =
-            (cached_thresh_buf != nullptr) ? thresh_bytes : 0;
-      }
-      out_thresh = cached_thresh_buf;
-    }
-    if (!gray_buf->contents() || !cached_im_min_buf ||
-        !cached_im_min_buf->contents() || !cached_im_max_buf ||
-        !cached_im_max_buf->contents() || !out_thresh ||
+    MTL::Buffer* out_thresh = (thresh_buf != nullptr)
+                                  ? thresh_buf
+                                  : cached_thresh.Ensure(device, thresh_bytes);
+    if (!gray_buf->contents() || !im_min_buf || !im_min_buf->contents() ||
+        !im_max_buf || !im_max_buf->contents() || !out_thresh ||
         !out_thresh->contents()) {
       return false;
     }
@@ -920,33 +760,26 @@ struct MetalAprilTagBackend::Impl {
     // Pass 1: tile_min_max_4x4
     enc->setComputePipelineState(pso_tile_min_max_4x4);
     enc->setBuffer(gray_buf, 0, 0);
-    enc->setBuffer(cached_im_min_buf, 0, 1);
-    enc->setBuffer(cached_im_max_buf, 0, 2);
+    enc->setBuffer(im_min_buf, 0, 1);
+    enc->setBuffer(im_max_buf, 0, 2);
     enc->setBytes(&width, sizeof(width), 3);
     enc->setBytes(&height, sizeof(height), 4);
     enc->setBytes(&actual_stride, sizeof(actual_stride), 5);
-
-    const MTL::Size tg_size = MTL::Size::Make(16, 16, 1);
-    const MTL::Size tg_count_min_max =
-        MTL::Size::Make((tw + 15) / 16, (th + 15) / 16, 1);
-    enc->dispatchThreadgroups(tg_count_min_max, tg_size);
+    Dispatch2D(enc, tw, th);
 
     enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
     // Pass 2: tile_blur_and_threshold
     enc->setComputePipelineState(pso_tile_blur_and_threshold);
     enc->setBuffer(gray_buf, 0, 0);
-    enc->setBuffer(cached_im_min_buf, 0, 1);
-    enc->setBuffer(cached_im_max_buf, 0, 2);
+    enc->setBuffer(im_min_buf, 0, 1);
+    enc->setBuffer(im_max_buf, 0, 2);
     enc->setBuffer(out_thresh, 0, 3);
     enc->setBytes(&width, sizeof(width), 4);
     enc->setBytes(&height, sizeof(height), 5);
     enc->setBytes(&actual_stride, sizeof(actual_stride), 6);
     enc->setBytes(&min_diff, sizeof(min_diff), 7);
-
-    const MTL::Size tg_count_thresh =
-        MTL::Size::Make((width + 15) / 16, (height + 15) / 16, 1);
-    enc->dispatchThreadgroups(tg_count_thresh, tg_size);
+    Dispatch2D(enc, width, height);
 
     if (shared_encoder == nullptr) enc->endEncoding();
     return true;
@@ -1024,29 +857,7 @@ MetalAprilTagBackend::DetectImageFile(
     const std::string& filepath,
     const talos::vision::apriltag::CameraIntrinsics& intrinsics,
     double tag_size_meters) {
-  image_u8_t* im = nullptr;
-
-  if (filepath.ends_with(".jpg") || filepath.ends_with(".jpeg") ||
-      filepath.ends_with(".JPG") || filepath.ends_with(".JPEG")) {
-    pjpeg_t* pjpeg = pjpeg_create_from_file(filepath.c_str(), 0, nullptr);
-    if (pjpeg != nullptr) {
-      im = pjpeg_to_u8_baseline(pjpeg);
-      pjpeg_destroy(pjpeg);
-    }
-  } else {
-    // PNG and anything else: OpenCV grayscale decode (replaces the
-    // upstream PNM loader; fixtures are PNG).
-    const cv::Mat gray = cv::imread(filepath, cv::IMREAD_GRAYSCALE);
-    if (!gray.empty() && gray.cols > 0 && gray.rows > 0) {
-      im = image_u8_create(static_cast<uint32_t>(gray.cols),
-                           static_cast<uint32_t>(gray.rows));
-      for (int y = 0; y < gray.rows; ++y) {
-        std::memcpy(im->buf + static_cast<size_t>(y) * im->stride,
-                    gray.ptr<uint8_t>(y), static_cast<size_t>(gray.cols));
-      }
-    }
-  }
-
+  image_u8_t* im = talos::vision::apriltag::LoadGrayscaleImageFile(filepath);
   if (im == nullptr) {
     return {};
   }
@@ -1099,23 +910,7 @@ talos::vision::BackendExecutionResult MetalAprilTagBackend::Execute(
   result.detections.reserve(dets.size());
 
   for (const auto& det : dets) {
-    talos::vision::RawTagDetection raw;
-    raw.id = det.id;
-    raw.hamming = det.hamming;
-    raw.decision_margin = det.decision_margin;
-    raw.center_x = static_cast<float>(det.center.x);
-    raw.center_y = static_cast<float>(det.center.y);
-    for (size_t c = 0; c < 4; ++c) {
-      raw.corners[c * 2] = static_cast<float>(det.corners[c].x);
-      raw.corners[c * 2 + 1] = static_cast<float>(det.corners[c].y);
-    }
-    for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 3; ++c) {
-        raw.homography[r * 3 + c] = static_cast<float>(det.homography(r, c));
-      }
-    }
-    raw.valid = true;
-    result.detections.push_back(raw);
+    result.detections.push_back(talos::vision::ToRawTagDetection(det));
   }
 
   result.success = true;

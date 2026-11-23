@@ -121,6 +121,12 @@ namespace talos::introspect {
 // target" -- all an earlier build could have said -- and every earlier
 // reader tests only the bits it knows.
 //
+// Nor did naming::kSourceFlagOperatorArming (bit 6) or
+// naming::kSourceFlagInternalDriverStation (bit 7): bits of
+// SourceRecord::flags that every earlier writer left clear, which fail closed
+// as "unarmed" and "explicit Driver Station reader", and every earlier reader
+// ignores.
+//
 // Nor did counting a timer's missed periods in SourceRecord::dropped: a
 // timer's `dropped` was always 0, which still reads as "no overrun".
 //

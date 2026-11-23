@@ -353,8 +353,9 @@ export class RecordedSource implements DataSource {
 
   private tick() {
     const now = this.clock.now();
-    const elapsedMs = Math.max(0, now - this.lastTickMs);
+    const elapsedMs = now - this.lastTickMs;
     this.lastTickMs = now;
+    if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return;
     const next = this.playhead + BigInt(Math.round(elapsedMs * 1e6 * this.rate));
     if (next >= this.end) {
       this.pause();
@@ -398,11 +399,11 @@ export class RecordedSource implements DataSource {
   }
 
   private applySnapshot(review: ReviewSnapshot) {
-    const channels: Record<string, number> = {};
-    const exact: Record<string, string> = {};
-    const units: Record<string, string> = {};
-    const labels: Record<string, string[]> = {};
-    const alerts: Record<string, AlertLevel> = {};
+    const channels: Record<string, number> = Object.create(null);
+    const exact: Record<string, string> = Object.create(null);
+    const units: Record<string, string> = Object.create(null);
+    const labels: Record<string, string[]> = Object.create(null);
+    const alerts: Record<string, AlertLevel> = Object.create(null);
     const samples = new Map<string, ChannelSample>();
     for (const [name, sample] of review.channels) {
       channels[name] = sample.value;
@@ -492,6 +493,8 @@ export class RecordedSource implements DataSource {
             this.settle(key, created);
             if (isAbort(e)) return null;
             this.failed.add(key);
+            if (this.failed.size > 256)
+              this.failed.delete(this.failed.values().next().value!);
             this.setError(errorMessage(e));
             return null;
           });
@@ -559,19 +562,21 @@ export class RecordedSource implements DataSource {
          points = DEFAULT_POINTS): Series {
     if (!channels.length || cursor_ns === null || this.end === this.start)
       return emptySeries(this.bounds.start_ns, channels);
-    const size = quantizePoints(points);
+    const requested = Number.isFinite(points) && points > 0 ? points : DEFAULT_POINTS;
+    const size = quantizePoints(requested);
     const plan = this.plan(window, BigInt(cursor_ns), size);
+    const cappedPoints = Math.max(1, Math.min(plan.points, this.bounds.max_series_values));
     const start = plan.start.toString(), end = plan.end.toString();
     const windowName = window === 'all' ? 'all' : window.seconds;
     // Requests within the server's limits (bounds.json): the channels split
     // into groups that each fit at full resolution, merged back below.
     const perRequest = Math.max(1, Math.min(
         this.bounds.max_series_channels,
-        Math.floor(this.bounds.max_series_values / plan.points)));
+        Math.floor(this.bounds.max_series_values / cappedPoints)));
     const parts: (SeriesBuckets|undefined)[] = [];
     for (let at = 0; at < channels.length; at += perRequest) {
       const group = channels.slice(at, at + perRequest);
-      const key = seriesKey(group, start, end, plan.points);
+      const key = seriesKey(group, start, end, cappedPoints);
       const slot = `${group.join(',')}|${windowName}|${size}`;
       if (this.pass.version !== this.version) {
         this.pass = {version: this.version, slots: new Set()};
@@ -583,7 +588,7 @@ export class RecordedSource implements DataSource {
       // (the cursor or the plot moved) is. One already answered and kept for
       // this consumer is not asked again.
       if (!have && !this.failed.has(key) && !this.closed)
-        void this.fetchSeries(group, start, end, plan.points, slot);
+        void this.fetchSeries(group, start, end, cappedPoints, slot);
       parts.push(have ?? last?.buckets);
     }
     const buckets = mergeParts(parts, channels.length, perRequest);
@@ -654,7 +659,7 @@ function mergeParts(parts: (SeriesBuckets|undefined)[], count: number,
 }
 
 function emptySeries(t0_ns: string, channels: string[]): Series {
-  const values: Record<string, Float64Array> = {};
+  const values: Record<string, Float64Array> = Object.create(null);
   for (const name of channels) values[name] = new Float64Array(0);
   return {t0_ns, times: new Float64Array(0), values};
 }
@@ -810,10 +815,10 @@ export function bucketSeries(channels: string[], buckets: SeriesBuckets, t0_ns: 
   const rowTimes = [...times].sort((a, b) => a - b);
   const rowOf = new Map(rowTimes.map((t, row) => [t, row]));
   const t0 = Number(t0_ns);
-  const values: Record<string, Float64Array> = {};
-  const min: Record<string, Float64Array> = {};
-  const max: Record<string, Float64Array> = {};
-  const count: Record<string, Uint32Array> = {};
+  const values: Record<string, Float64Array> = Object.create(null);
+  const min: Record<string, Float64Array> = Object.create(null);
+  const max: Record<string, Float64Array> = Object.create(null);
+  const count: Record<string, Uint32Array> = Object.create(null);
   channels.forEach((name, c) => {
     const column = buckets.channels[c];
     values[name] = new Float64Array(rowTimes.length).fill(NaN);

@@ -1,10 +1,33 @@
 #include "talOS/launcher/supervision_policy.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 
 #include "talOS/launcher/session.h"
 
 namespace talos::launcher {
+namespace {
+
+// Upper bound on HeartbeatTimeout so period_us * heartbeat_periods, us->ns
+// conversion, and steady_clock::now() + timeout never overflow signed int64_t.
+constexpr std::chrono::nanoseconds kMaxHeartbeatTimeout =
+    std::chrono::hours{24 * 365};
+
+SupervisionTime AddClamped(SupervisionTime base,
+                           std::chrono::nanoseconds delta) {
+  if (delta > std::chrono::nanoseconds::zero()) {
+    return base > SupervisionTime::max() - delta ? SupervisionTime::max()
+                                                 : base + delta;
+  }
+  if (delta < std::chrono::nanoseconds::zero()) {
+    return base < SupervisionTime::min() - delta ? SupervisionTime::min()
+                                                 : base + delta;
+  }
+  return base;
+}
+
+}  // namespace
 
 std::chrono::milliseconds RestartBackoff(int restart, bool clean_exit,
                                          bool critical) {
@@ -26,9 +49,16 @@ bool ShouldRestartNode(bool clean_exit, bool critical, int max_restarts,
 
 std::chrono::nanoseconds HeartbeatTimeout(int64_t period_us,
                                           int heartbeat_periods) {
-  return std::chrono::microseconds{
-      std::max<int64_t>(std::chrono::microseconds{kMinHeartbeatTimeout}.count(),
-                        period_us * heartbeat_periods)};
+  constexpr int64_t kMinUs =
+      std::chrono::microseconds{kMinHeartbeatTimeout}.count();
+  constexpr int64_t kMaxUs =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          kMaxHeartbeatTimeout)
+          .count();
+  if (period_us <= 0 || heartbeat_periods <= 0) return kMinHeartbeatTimeout;
+  const auto periods = static_cast<int64_t>(heartbeat_periods);
+  if (period_us > kMaxUs / periods) return kMaxHeartbeatTimeout;
+  return std::chrono::microseconds{std::max(kMinUs, period_us * periods)};
 }
 
 std::chrono::milliseconds RestartSchedule::Schedule(
@@ -39,8 +69,10 @@ std::chrono::milliseconds RestartSchedule::Schedule(
   const int recent = static_cast<int>(starts_.size());
   quarantined_ = !critical_ && recent > 0 && recent >= limits.max_restarts;
   pending_ = true;
-  at_ = (quarantined_ ? starts_.front() + limits.window : now) +
-        RestartBackoff(recent + 1, last_exit_clean_, critical_);
+  const SupervisionTime base =
+      quarantined_ ? AddClamped(starts_.front(), limits.window) : now;
+  at_ =
+      AddClamped(base, RestartBackoff(recent + 1, last_exit_clean_, critical_));
   return std::chrono::duration_cast<std::chrono::milliseconds>(at_ - now);
 }
 
@@ -66,7 +98,8 @@ void ShowRestart(NodeProcessInfo& proc, const RestartSchedule& restart) {
 }
 
 std::chrono::nanoseconds LivenessLookInterval(const LivenessLimits& limits) {
-  return limits.heartbeat_timeout / kLivenessLooksPerTimeout;
+  return std::max(std::chrono::nanoseconds{1},
+                  limits.heartbeat_timeout / kLivenessLooksPerTimeout);
 }
 
 void RunLiveness::Begin(SupervisionTime spawned) {
@@ -80,13 +113,16 @@ void RunLiveness::Begin(SupervisionTime spawned) {
 }
 
 SupervisionTime RunLiveness::NextLook(const LivenessLimits& limits) const {
-  SupervisionTime next = looked_at_ + LivenessLookInterval(limits);
+  SupervisionTime next = AddClamped(looked_at_, LivenessLookInterval(limits));
   const auto consider = [&](SupervisionTime deadline) {
     if (deadline > looked_at_) next = std::min(next, deadline);
   };
-  consider(std::max(started_at_ + limits.startup_grace,
-                    progress_changed_at_ + limits.heartbeat_timeout));
-  if (!constructed_) consider(started_at_ + limits.construction_timeout);
+  consider(
+      std::max(AddClamped(started_at_, limits.startup_grace),
+               AddClamped(progress_changed_at_, limits.heartbeat_timeout)));
+  if (!constructed_) {
+    consider(AddClamped(started_at_, limits.construction_timeout));
+  }
   return next;
 }
 

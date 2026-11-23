@@ -8,9 +8,18 @@ bazel test --test_output=errors --test_env=TALOS_SOAK_SECONDS=180 \
 `soak_test` is tagged `manual` (`bazel test //...` and `:all` skip it); the
 [soak workflow](../../../.github/workflows/soak.yaml) runs it for 180 s of
 enabled cycles on Linux for `hardening/**` and `feature/**` pushes (seed 0) and
-for pushes to `main` (seed 1), and on macOS nightly (seed 1, `nightly.yaml`).
+for pushes to `main` (seed 1), and nightly on both Linux and macOS across
+deterministic fault-order seeds `0`, `1`, and `2` (`nightly.yaml`).
 `robot_soak_graph_test` runs `--describe-only` on the soak config in regular
 `bazel test //...`.
+
+For sanitizer lanes (`tools/sanitizer_lane.sh asan|tsan`), where Python nodes
+cannot load instrumented C++ libraries via `ctypes`, `testdata/robot_cpp_sim.toml`
+mirrors `robot.toml` without the Python `gyro` observer (`hardware_node`,
+`sim_gateway --physics`, `studio_bridge`, `swerve_module`, `motor`, `teleop`,
+`telemetry`). `robot_cpp_sim_graph_test` runs `--describe-only` and
+`cpp_full_graph_sim_test` runs a deterministic disabled → teleop actuation →
+disabled session across all seven C++ processes under plain, ASan, and TSan.
 
 Its graph is [`testdata/robot_soak.toml`](testdata/robot_soak.toml) (including
 [`robot.toml`](../configuration/robot.toml) with `simulation_only = true` and

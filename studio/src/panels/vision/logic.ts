@@ -119,8 +119,8 @@ export function observationErrors(
         refY.length);
     for (let i = 0; i < n; i++) {
       if (valid[i] !== 1) continue;
-      if (!finite(camX[i]) || !finite(camY[i]) || !finite(refX[i]) ||
-          !finite(refY[i]))
+      if (!finite(times[i]) || !finite(camX[i]) || !finite(camY[i]) ||
+          !finite(refX[i]) || !finite(refY[i]))
         continue;
       out.push({t: times[i], x: camX[i] - refX[i], y: camY[i] - refY[i]});
     }

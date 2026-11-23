@@ -109,6 +109,28 @@ class CheckHostIncludesTest(unittest.TestCase):
         self.assertEqual(status, 2, out.getvalue() + err.getvalue())
         self.assertIn("broken.d", err.getvalue())
 
+    # REQ-DEV-25
+    def test_crlf_tab_and_malformed_depfiles_fail_closed(self):
+        # CRLF line continuations and tab-after-colon rules must still catch
+        # host headers rather than dropping the rule.
+        crlf_tab_dep = (
+            "bazel-out/a.o:\t\\\r\n"
+            " talOS/a.cc /usr/include/toml++/toml.hpp\r\n"
+        )
+        status, out = run({"a/a.d": crlf_tab_dep})
+        self.assertEqual(status, 1, out)
+        self.assertIn("talOS/a.cc: /usr/include/toml++/toml.hpp", out)
+
+        # A non-empty depfile with no parseable Make rule beside a valid .d
+        # file must fail closed (exit 2) rather than being silently skipped.
+        with redirect_stderr(io.StringIO()) as err:
+            status, out = run({
+                "a/wire.pic.d": TOOLCHAIN_ONLY,
+                "b/corrupt.d": "not a valid make rule\n",
+            })
+        self.assertEqual(status, 2, out + err.getvalue())
+        self.assertIn("corrupt.d", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

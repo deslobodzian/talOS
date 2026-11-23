@@ -61,7 +61,15 @@ subsystem's target policy, and an `hw` topic written by anything but the
 hardware bridge (the launcher's `hardware_node` roster entry, whatever binary
 `[robot] hardware_node` names and whatever name it describes), except
 `/hw/request/<node>`, which only `<node>`'s devices-layer flush writes (its
-endpoint carries the `hardware_request` attribute; RULES.md 2). Under
+endpoint carries the `hardware_request` attribute; RULES.md 2), and an
+operator producer (a non-bridge node reading `/hw/state/driver_station`
+explicitly — neither as an `observer` nor with `internal_driver_station`, which
+marks subscriptions opened solely by internal `Target`/`TargetLane`/
+`OperatorArming` plumbing — and writing a target lane in a subsystem's `teleop`
+policy) that writes any `teleop`-policy target lane without the
+`operator_arming` attribute (opened via `TargetLane` with `talos::OperatorArming`
+/ `talos.OperatorArming`; REQ-SAFE-14, enforced at node startup as well,
+regardless of `--allow-graph-errors`). Under
 `[robot] require_target_coverage` (which `commissioned = true` sets) it also
 rejects a node whose hardware request carries the `untargeted_outputs`
 attribute (its constructor called `talos::AllowUntargetedOutputs`, so its
@@ -81,7 +89,8 @@ finding names the readers and the owner), a node whose hardware request carries 
 that coverage, or a node that writes its hardware request but reads no target
 lane of its own and has not opted out (its outputs never drive; REQ-SAFE-41), is a
 warning; each of the last two names the node. The graph lint also warns when an operator producer (a non-bridge node reading
-`/hw/state/driver_station` and writing a target lane in a subsystem's `teleop`
+`/hw/state/driver_station` explicitly — not `observer` and not
+`internal_driver_station` — and writing a target lane in a subsystem's `teleop`
 policy) has a shortest command-flow path (non-`/hw`, non-observer `target`,
 `request`, or `command` topics, starting from its `teleop`-policy target lanes
 or command/request topics and not expanding past an actuator owner) to an

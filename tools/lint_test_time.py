@@ -64,6 +64,7 @@ a listed (path, kind) with no hit left; with a count, so do more hits than
 it, or fewer (lower the count), so the list only shrinks. Exits 1 on any.
 """
 
+import ast
 import bisect
 import os
 import re
@@ -76,6 +77,11 @@ NODE_ROOTS = ("bench/", "examples/", "tools/scaffold_testdata/")
 # Framework nodes: packages outside NODE_ROOTS whose sources are node code.
 FRAMEWORK_NODE_PACKAGES = ("talOS/teleop", "talOS/telemetry")
 STUDIO_TESTS = "studio/tests/"
+NODE_MACRO_NAMES = frozenset({
+    "talos_cc_node",
+    "talos_py_node",
+    "talos_cc_shared_node",
+})
 NODE_MACRO = re.compile(r"\b(talos_cc_node|talos_py_node|talos_cc_shared_node)"
                         r"\s*\(")
 SOURCE_SUFFIXES = (".cc", ".h", ".cpp", ".hpp", ".py")
@@ -183,7 +189,7 @@ TS_TIME_PATTERNS = {
     "sleep": re.compile(r"\bsetTimeout\s*\(", re.MULTILINE),
     "clock": re.compile(r"\b(Date|performance)\s*\.\s*now\s*\(", re.MULTILINE),
 }
-RETRY_PATTERN = re.compile(r"\bflaky\s*=\s*True\b|--flaky_test_attempts",
+RETRY_PATTERN = re.compile(r"\bflaky\s*=\s*(?:True|1)\b|--flaky_test_attempts",
                            re.MULTILINE)
 
 
@@ -214,6 +220,28 @@ def is_retry_config(path):
              name.endswith((".yaml", ".yml"))))
 
 
+def _build_declares_node(text):
+    """True when a BUILD file invokes any node macro (directly or via an
+    aliased `load()`). Falls back to regex on SyntaxError to fail closed."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return bool(NODE_MACRO.search(text))
+    aliases = set(NODE_MACRO_NAMES)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+                node.func.id == "load"):
+            for kw in node.keywords:
+                if (kw.arg and isinstance(kw.value, ast.Constant) and
+                        kw.value.value in NODE_MACRO_NAMES):
+                    aliases.add(kw.arg)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+                node.func.id in aliases):
+            return True
+    return False
+
+
 def node_packages(files, read):
     """Directories under NODE_ROOTS whose BUILD declares a node, and the
     framework nodes' packages."""
@@ -221,7 +249,7 @@ def node_packages(files, read):
     for path in files:
         if (path.startswith(NODE_ROOTS) and
                 os.path.basename(path) in ("BUILD", "BUILD.bazel") and
-                NODE_MACRO.search(read(path))):
+                _build_declares_node(read(path))):
             packages.add(os.path.dirname(path))
     return packages
 
@@ -284,76 +312,159 @@ def _is_line_continuation(text, i):
     return j < n and text[j] == "\n"
 
 
-def _strip_c_comments(text, is_ts=False, strip_strings=False):
-    """Replaces `// ...` and `/* ... */` comments (and, when `strip_strings` is
-    set, non-template string/char literal interiors) with spaces, preserving
-    newlines so 1-based line numbers remain exact."""
-    out = []
+def _splice_cpp_continuations(text):
+    """C++ translation phase 2: removes backslash-newline continuations
+    (including optional trailing horizontal whitespace) and returns
+    `(spliced_text, line_map)` mapping each output character index to its
+    1-based original line number."""
+    spliced = []
+    line_map = []
+    line = 1
     i = 0
     n = len(text)
     while i < n:
         ch = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
+        if ch == "\\":
+            j = i + 1
+            while j < n and text[j] in (" ", "\t", "\v", "\f"):
+                j += 1
+            if j < n and text[j] == "\r":
+                j += 1
+            if j < n and text[j] == "\n":
+                i = j + 1
+                line += 1
+                continue
+        spliced.append(ch)
+        line_map.append(line)
+        if ch == "\n":
+            line += 1
+        i += 1
+    return "".join(spliced), line_map
+
+
+def _strip_c_comments_with_lines(text, is_ts=False, strip_strings=False):
+    """Replaces `// ...` and `/* ... */` comments (and, when `strip_strings` is
+    set, non-template string/char literal interiors) with spaces, returning
+    `(stripped, line_map)` with exact 1-based original line numbers."""
+    if is_ts:
+        src = text
+        src_lines = None
+    else:
+        src, src_lines = _splice_cpp_continuations(text)
+
+    out = []
+    out_lines = [] if src_lines is not None else None
+    i = 0
+    n = len(src)
+
+    def emit(s, line_no):
+        out.append(s)
+        if out_lines is not None:
+            out_lines.extend([line_no] * len(s))
+
+    def copy_quoted_tracked(start, quote, blank, multiline=False):
+        idx = start
+        while idx < n:
+            c = src[idx]
+            ln = src_lines[idx] if src_lines is not None else 0
+            idx += 1
+            if c == "\\" and idx < n:
+                escaped = src[idx]
+                ln2 = src_lines[idx] if src_lines is not None else 0
+                idx += 1
+                if blank:
+                    emit("\n" if escaped == "\n" else " ", ln)
+                    if escaped != "\n":
+                        emit(" ", ln2)
+                else:
+                    emit(c, ln)
+                    emit(escaped, ln2)
+                continue
+            if c == quote or (c == "\n" and not multiline):
+                emit(c, ln)
+                break
+            emit(("\n" if c == "\n" else " ") if blank else c, ln)
+        return idx
+
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        ln = src_lines[i] if src_lines is not None else 0
         # Line comment `// ...`.
         if ch == "/" and nxt == "/":
-            while i < n and text[i] != "\n":
-                out.append(" ")
+            while i < n and src[i] != "\n":
+                emit(" ", src_lines[i] if src_lines is not None else 0)
                 i += 1
             continue
         # Block comment `/* ... */` (multi-line state tracked across newlines).
         if ch == "/" and nxt == "*":
-            out.append("  ")
+            emit(" ", ln)
+            emit(" ", src_lines[i + 1] if src_lines is not None else 0)
             i += 2
             while i < n:
-                if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
-                    out.append("  ")
+                if src[i] == "*" and i + 1 < n and src[i + 1] == "/":
+                    emit(" ", src_lines[i] if src_lines is not None else 0)
+                    emit(" ", src_lines[i + 1] if src_lines is not None else 0)
                     i += 2
                     break
-                out.append("\n" if text[i] == "\n" else " ")
+                emit("\n" if src[i] == "\n" else " ",
+                     src_lines[i] if src_lines is not None else 0)
                 i += 1
             continue
-        # C++ raw string literal `R"delim(...)delim"` so comment tokens inside
-        # raw strings do not start comments.
-        if (not is_ts and ch == "R" and nxt == '"' and
-                (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))):
-            paren = text.find("(", i + 2)
-            if paren != -1 and paren - (i + 2) <= 16:
-                delim = text[i + 2:paren]
-                if not any(c in delim for c in " \t\r\n\\()"):
-                    end_marker = ")" + delim + '"'
-                    end = text.find(end_marker, paren + 1)
-                    if end != -1:
-                        end_idx = end + len(end_marker)
-                        if strip_strings:
-                            out.append('"')
-                            for c in text[i + 1:end_idx - 1]:
-                                out.append("\n" if c == "\n" else " ")
-                            out.append('"')
-                        else:
-                            out.append(text[i:end_idx])
-                        i = end_idx
-                        continue
+        # C++ identifier or raw string literal `[u8|u|U|L]R"delim(...)delim"`
+        # so quotes or comment tokens inside prefixed raw strings never desync
+        # lexing or swallow the rest of the file.
+        if not is_ts and (ch == "_" or ch.isalpha()):
+            j = i + 1
+            while j < n and (src[j].isalnum() or src[j] == "_"):
+                j += 1
+            ident = src[i:j]
+            if (ident in ("R", "u8R", "uR", "UR", "LR") and
+                    j < n and src[j] == '"'):
+                paren = src.find("(", j + 1)
+                if paren != -1 and paren - (j + 1) <= 16:
+                    delim = src[j + 1:paren]
+                    if not any(c in delim for c in " \t\v\f\r\n\\()"):
+                        end_marker = ")" + delim + '"'
+                        end = src.find(end_marker, paren + 1)
+                        if end != -1:
+                            end_idx = end + len(end_marker)
+                            if strip_strings:
+                                emit('"', src_lines[i])
+                                for k in range(i + 1, end_idx - 1):
+                                    emit("\n" if src[k] == "\n" else " ",
+                                         src_lines[k])
+                                emit('"', src_lines[end_idx - 1])
+                            else:
+                                for k in range(i, end_idx):
+                                    emit(src[k], src_lines[k])
+                            i = end_idx
+                            continue
+            for k in range(i, j):
+                emit(src[k], src_lines[k])
+            i = j
+            continue
         # C++ numeric literal with optional `'` digit separators (e.g. `1'000`)
         # so a digit separator is never mistaken for a character literal.
         if (not is_ts and ch.isdigit() and
-                (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))):
-            out.append(ch)
+                (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))):
+            emit(ch, ln)
             i += 1
             while i < n:
-                c = text[i]
-                c_next = text[i + 1] if i + 1 < n else ""
+                c = src[i]
+                c_next = src[i + 1] if i + 1 < n else ""
                 if c == "'" and (c_next.isalnum() or c_next == "_"):
-                    out.append(c)
-                    out.append(c_next)
+                    emit(c, src_lines[i])
+                    emit(c_next, src_lines[i + 1])
                     i += 2
                     continue
                 if c in ("e", "E", "p", "P") and c_next in ("+", "-"):
-                    out.append(c)
-                    out.append(c_next)
+                    emit(c, src_lines[i])
+                    emit(c_next, src_lines[i + 1])
                     i += 2
                     continue
                 if c.isalnum() or c in ("_", "."):
-                    out.append(c)
+                    emit(c, src_lines[i])
                     i += 1
                     continue
                 break
@@ -364,17 +475,23 @@ def _strip_c_comments(text, is_ts=False, strip_strings=False):
         # which can evaluate `${...}`).
         if ch in ('"', "'") or (is_ts and ch == "`"):
             blank = strip_strings and ch != "`"
-            out.append(ch)
-            i = _copy_quoted(text, i + 1, ch, out, blank,
-                             multiline=ch == "`")
+            emit(ch, ln)
+            i = copy_quoted_tracked(i + 1, ch, blank, multiline=ch == "`")
             continue
-        if ch == "\\" and _is_line_continuation(text, i):
-            out.append(" ")
+        if is_ts and ch == "\\" and _is_line_continuation(src, i):
+            emit(" ", ln)
             i += 1
             continue
-        out.append(ch)
+        emit(ch, ln)
         i += 1
-    return "".join(out)
+    return "".join(out), out_lines
+
+
+def _strip_c_comments(text, is_ts=False, strip_strings=False):
+    """Replaces `// ...` and `/* ... */` comments (and, when `strip_strings` is
+    set, non-template string/char literal interiors) with spaces."""
+    return _strip_c_comments_with_lines(
+        text, is_ts=is_ts, strip_strings=strip_strings)[0]
 
 
 def _strip_hash_comments(text, python_strings=True, strip_strings=False):
@@ -439,17 +556,22 @@ def _strip_hash_comments(text, python_strings=True, strip_strings=False):
     return "".join(out)
 
 
-def strip_comments(text, path, strip_strings=False):
-    """Strips comments (and optionally non-executing string literals) from
-    `text` according to `path`'s syntax while keeping exact line numbers."""
+def _strip_comments_with_lines(text, path, strip_strings=False):
     if path.endswith(C_COMMENT_SUFFIXES):
-        return _strip_c_comments(text, is_ts=path.endswith((".ts", ".tsx")),
-                                 strip_strings=strip_strings)
+        return _strip_c_comments_with_lines(
+            text, is_ts=path.endswith((".ts", ".tsx")),
+            strip_strings=strip_strings)
     name = os.path.basename(path)
     python_strings = (path.endswith(PY_COMMENT_SUFFIXES) or
                       name in PY_COMMENT_NAMES)
     return _strip_hash_comments(text, python_strings=python_strings,
-                                strip_strings=strip_strings)
+                                strip_strings=strip_strings), None
+
+
+def strip_comments(text, path, strip_strings=False):
+    """Strips comments (and optionally non-executing string literals) from
+    `text` according to `path`'s syntax while keeping exact line numbers."""
+    return _strip_comments_with_lines(text, path, strip_strings=strip_strings)[0]
 
 
 def _line_starts(text):
@@ -474,6 +596,7 @@ def scan(files, read):
     for path in files:
         patterns = {}
         stripped = None
+        line_map = None
         is_test = is_test_source(path) or is_test_helper(path)
         is_node = (not is_test and path.endswith(SOURCE_SUFFIXES) and
                    in_package(path, packages, build_dirs))
@@ -489,7 +612,8 @@ def scan(files, read):
                 patterns["io"] = PY_NODE_IO_PATTERN
                 patterns["lock"] = PY_NODE_LOCK_PATTERN
         if is_test or is_node:
-            stripped = strip_comments(read(path), path, strip_strings=True)
+            stripped, line_map = _strip_comments_with_lines(
+                read(path), path, strip_strings=True)
             aliases = {a or b for a, b in CLOCK_ALIAS.findall(stripped)}
             if is_node:
                 aliases |= {
@@ -509,13 +633,16 @@ def scan(files, read):
         if not patterns:
             continue
         if stripped is None:
-            stripped = strip_comments(read(path), path)
-        starts = _line_starts(stripped)
+            stripped, line_map = _strip_comments_with_lines(read(path), path)
+        starts = None if line_map is not None else _line_starts(stripped)
         for kind, pattern in patterns.items():
             lines = []
             last_line = 0
             for match in pattern.finditer(stripped):
-                number = bisect.bisect_right(starts, match.start())
+                if line_map is not None:
+                    number = line_map[match.start()] if line_map else 1
+                else:
+                    number = bisect.bisect_right(starts, match.start())
                 if number != last_line:
                     lines.append(number)
                     last_line = number
@@ -545,7 +672,12 @@ def parse_allowlist(text):
             errors.append(f"{ALLOWLIST}:{number}: want `<path> sleep|clock|"
                           f"random|io|lock|retry [<count>] <reason>`: {line}")
             continue
-        entries[(fields[0], fields[1])] = count
+        key = (fields[0], fields[1])
+        if key in entries:
+            errors.append(f"{ALLOWLIST}:{number}: duplicate entry for "
+                          f"`{fields[0]} {fields[1]}`")
+            continue
+        entries[key] = count
     return entries, errors
 
 

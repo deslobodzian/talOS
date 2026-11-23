@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "talOS/launcher/log_budget.h"
@@ -110,6 +111,24 @@ TEST(SplitLogBudget, WindowNeverShrinksAsTheBudgetGrows) {
       }
     }
   }
+}
+
+// REQ-OPS-32: extreme uint64 budgets (where double rounds up to 2^64) and
+// non-finite rates never trigger float-cast-overflow UB.
+TEST(SplitLogBudget, ExtremeBudgetAndNonFiniteRatesDoNotOverflow) {
+  const uint64_t max_u64 = std::numeric_limits<uint64_t>::max();
+  const LogSplit huge = SplitLogBudget(max_u64, {true}, {100.0}, {0});
+  ASSERT_EQ(huge.shares.size(), 1u);
+  EXPECT_EQ(huge.shares[0], max_u64);
+
+  const double inf = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const LogSplit bad_rates = SplitLogBudget(4000, {true, true, true},
+                                            {inf, nan, 100.0}, {100, 100, 0});
+  ASSERT_EQ(bad_rates.shares.size(), 3u);
+  EXPECT_GE(bad_rates.shares[0], 100u);
+  EXPECT_GE(bad_rates.shares[1], 100u);
+  EXPECT_GT(bad_rates.shares[2], 1000u);
 }
 
 }  // namespace

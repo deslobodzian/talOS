@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -46,7 +47,11 @@ struct JsonValue {
   }
 
   int AsInt(int fallback) const {
-    if (type != Type::kNumber) return fallback;
+    if (type != Type::kNumber || !std::isfinite(number) ||
+        number < static_cast<double>(std::numeric_limits<int>::min()) ||
+        number > static_cast<double>(std::numeric_limits<int>::max())) {
+      return fallback;
+    }
     return static_cast<int>(number);
   }
 

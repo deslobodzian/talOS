@@ -1,0 +1,38 @@
+# Pure-C++ bench full-graph simulation config for sanitizer lanes
+# (//bench/main_processor/simulation:cpp_full_graph_sim_test and
+# :robot_cpp_sim_graph_test). Mirrors bench/main_processor/configuration/robot.toml
+# without the Python gyro observer so every launched member is a C++ binary
+# instrumented under --config=asan and --config=tsan.
+[robot]
+name = "bench_cpp_sim"
+period_us = 5000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+simulation_only = true
+require_target_coverage = true
+controller_address = "127.0.0.1"
+controller_port = 5802
+local_port = 5803
+sim_gateway = "//talOS/simulation:sim_gateway"
+
+[robot.targets]
+teleop = ["teleop"]
+autonomous = []
+test = []
+
+[[subsystems]]
+name = "motor"
+path = "../../configuration/subsystems/motor.toml"
+
+[[subsystems]]
+name = "swerve_module"
+path = "../../configuration/subsystems/swerve_module.toml"
+
+[[subsystems]]
+name = "teleop"
+path = "../../configuration/subsystems/teleop.toml"
+
+[[subsystems]]
+name = "telemetry"
+path = "../../configuration/subsystems/telemetry.toml"

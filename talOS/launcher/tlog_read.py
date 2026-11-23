@@ -25,11 +25,20 @@ def node_clock_ns():
     return time.clock_gettime_ns(clock)
 
 
+def _file_size(stream):
+    pos = stream.tell()
+    stream.seek(0, 2)
+    size = stream.tell()
+    stream.seek(pos)
+    return size
+
+
 def read_tlog_header(stream, path):
     """Reads and validates a .tlog file header.
 
     Returns (header_bytes, origin_ns, manifest_count, process_name, schema_bytes).
     """
+    file_size = _file_size(stream)
     header = stream.read(FILE.size)
     if len(header) < FILE.size:
         raise ValueError(f"{path}: truncated file header")
@@ -37,8 +46,18 @@ def read_tlog_header(stream, path):
      schema_bytes) = FILE.unpack(header)
     if magic != b"TALOSLOG" or version not in VERSIONS:
         raise ValueError(f"{path}: not a version 7 or 8 .tlog")
-    return (header_bytes, origin, count,
-            process.split(b"\0", 1)[0].decode(), schema_bytes)
+    if header_bytes < FILE.size or header_bytes > file_size:
+        raise ValueError(f"{path}: invalid header_bytes {header_bytes}")
+    manifest_end = header_bytes + count * ENTRY.size
+    if manifest_end > file_size:
+        raise ValueError(f"{path}: truncated manifest")
+    if manifest_end + schema_bytes > file_size:
+        raise ValueError(f"{path}: truncated schema section")
+    try:
+        process_name = process.split(b"\0", 1)[0].decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"{path}: invalid UTF-8 process name") from None
+    return header_bytes, origin, count, process_name, schema_bytes
 
 
 def iter_tlog_records(stream, path, *, allow_truncated=True):
@@ -46,8 +65,10 @@ def iter_tlog_records(stream, path, *, allow_truncated=True):
 
     Payloads are skipped by seeking `stored` bytes after each header. When
     `allow_truncated` is True, a truncated or damaged tail ends iteration (as a
-    SIGKILLed run leaves); when False, a short record header raises ValueError.
+    SIGKILLed run leaves); when False, a short record header or truncated
+    payload raises ValueError.
     """
+    end = _file_size(stream)
     while raw := stream.read(RECORD.size):
         if len(raw) < RECORD.size:
             if allow_truncated:
@@ -58,6 +79,10 @@ def iter_tlog_records(stream, path, *, allow_truncated=True):
             if allow_truncated:
                 break
             raise ValueError(f"bad record magic: {path}")
+        if stream.tell() + stored > end:
+            if allow_truncated:
+                break
+            raise ValueError(f"truncated record payload: {path}")
         yield kind, source_id, event, now
         stream.seek(stored, 1)
 
@@ -77,9 +102,13 @@ def read_tlog(path):
             if len(raw) < ENTRY.size:
                 raise ValueError(f"{path}: truncated manifest")
             source_id, kind, _, _, armed, period, offset, name, *_ = ENTRY.unpack(raw)
+            try:
+                source_name = name.split(b"\0", 1)[0].decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError(f"{path}: invalid UTF-8 source name") from None
             sources[source_id] = {
                 "kind": kind,
-                "name": name.split(b"\0", 1)[0].decode(),
+                "name": source_name,
                 "armed": armed != 0,
                 "period_ns": period,
                 "offset_ns": offset,

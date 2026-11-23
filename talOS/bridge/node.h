@@ -477,6 +477,9 @@ class HardwareNode {
   config::RobotConfig robot_config_;
   Config config_;
   uint64_t config_id_{0};
+  // Pre-encoded configuration chunks built once at construction so PushConfig()
+  // never allocates on the realtime bridge loop (RULES.md 3).
+  std::vector<std::vector<uint8_t>> config_chunks_;
   std::string remote_ip_;
   std::string local_ip_;
   uint16_t remote_port_;
@@ -566,8 +569,8 @@ class HardwareNode {
   uint64_t ownership_rejected_{0};
   uint64_t commands_sent_{0};
   uint64_t driver_station_packets_received_{0};
-  // Bridge-clock receipt time of the last /hw/state frame; meaningful once
-  // states_received_ is non-zero.
+  // Bridge-clock receipt time of the last accepted /hw/state frame; meaningful
+  // once state_accepted_ is true.
   uint64_t last_state_receipt_us_{0};
   // Whether a State has been accepted (past the ordering gate) yet.
   bool state_accepted_{false};

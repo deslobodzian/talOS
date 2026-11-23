@@ -76,7 +76,8 @@ struct StaticFileResult {
 };
 
 // Reads a static file at URL path `url` under `root`.
-// `url` must start with '/' and contain neither '%' nor '\\' (else 400 / 404).
+// `url` must start with '/' and contain none of '%', '\\', or '\0' (else
+// 400 / 404).
 // The caller resolves any route aliases (such as "/" -> "/index.html" or
 // "/drive" -> "/drive.html") before calling.
 StaticFileResult ReadStaticFile(const std::filesystem::path& root,

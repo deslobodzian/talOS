@@ -111,8 +111,10 @@ reset_copy() {
   grep -qxF '    path = "../..",' "$module" &&
     grep -qxF '    path = "../../bazel-bin/studio/dist",' "$module" ||
     die "$fixture/MODULE.bazel no longer names talOS as ../..; update this script"
-  sed -e "s|^    path = \"\\.\\./\\.\\.\",\$|    path = \"$talos\",|" \
-    -e "s|^    path = \"\\.\\./\\.\\./bazel-bin/studio/dist\",\$|    path = \"$talos/bazel-bin/studio/dist\",|" \
+  local talos_sed
+  talos_sed="$(printf '%s' "$talos" | sed 's/[\&|]/\\&/g')"
+  sed -e "s|^    path = \"\\.\\./\\.\\.\",\$|    path = \"$talos_sed\",|" \
+    -e "s|^    path = \"\\.\\./\\.\\./bazel-bin/studio/dist\",\$|    path = \"$talos_sed/bazel-bin/studio/dist\",|" \
     "$module" > "$module.new" && mv "$module.new" "$module" ||
     die "cannot rewrite $module"
   # .bazelrc takes talOS's flags from the same checkout (talos_pin_test).

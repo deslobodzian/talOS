@@ -9,7 +9,50 @@ diff --git a/apriltag_pose.c b/apriltag_pose.c
  #include "apriltag_pose.h"
  #include "common/homography.h"
  
-@@ -256,7 +255,7 @@
+@@ -66,6 +65,18 @@
+     matd_destroy(avg_F);
+     matd_destroy(M1);
+ 
++    if (M1_inv == NULL) {
++        matd_destroy(I3);
++        for (int i = 0; i < n_points; i++) {
++            matd_destroy(p_res[i]);
++            matd_destroy(F[i]);
++        }
++        free(p_res);
++        free(F);
++        matd_destroy(p_mean);
++        return HUGE_VAL;
++    }
++
+     double prev_error = HUGE_VAL;
+     // Iterate.
+     for (int i = 0; i < n_steps; i++) {
+@@ -96,6 +107,23 @@
+             matd_add_inplace(M3, M3_update);
+             matd_destroy(M3_update);
+         }
++        int m3_finite = 1;
++        for (unsigned int k = 0; k < M3->nrows * M3->ncols; k++) {
++            if (!isfinite(M3->data[k])) {
++                m3_finite = 0;
++                break;
++            }
++        }
++        if (!m3_finite) {
++            matd_destroy(M3);
++            matd_destroy(q_mean);
++            for (int j = 0; j < n_points; j++) {
++                matd_destroy(q[j]);
++            }
++            free(q);
++            prev_error = HUGE_VAL;
++            break;
++        }
+         matd_svd_t M3_svd = matd_svd(M3);
+         matd_destroy(M3);
+         matd_destroy(*R);
+@@ -256,15 +284,38 @@
  /**
   * Given a local minima of the pose error tries to find the other minima.
   */
@@ -18,7 +61,86 @@ diff --git a/apriltag_pose.c b/apriltag_pose.c
      matd_t* I3 = matd_identity(3);
  
      // 1. Find R_t
-@@ -435,9 +434,6 @@
++    double t_sq = MATD_EL(t, 0, 0) * MATD_EL(t, 0, 0) +
++                  MATD_EL(t, 1, 0) * MATD_EL(t, 1, 0) +
++                  MATD_EL(t, 2, 0) * MATD_EL(t, 2, 0);
++    if (!(t_sq > 0.0) || !isfinite(t_sq)) {
++        matd_destroy(I3);
++        *n_minima_out = 0;
++        return NULL;
++    }
+     matd_t* R_t_3 = matd_vec_normalize(t);
+ 
+     matd_t* e_x = matd_create(3, 1);
+-    MATD_EL(e_x, 0, 0) = 1;
++    if (fabs(MATD_EL(R_t_3, 0, 0)) > 0.9) {
++        MATD_EL(e_x, 1, 0) = 1;
++    } else {
++        MATD_EL(e_x, 0, 0) = 1;
++    }
+     matd_t* R_t_1_tmp = matd_op("M-(M'*M)*M", e_x, e_x, R_t_3, R_t_3);
++    double r1_sq = MATD_EL(R_t_1_tmp, 0, 0) * MATD_EL(R_t_1_tmp, 0, 0) +
++                   MATD_EL(R_t_1_tmp, 1, 0) * MATD_EL(R_t_1_tmp, 1, 0) +
++                   MATD_EL(R_t_1_tmp, 2, 0) * MATD_EL(R_t_1_tmp, 2, 0);
++    if (!(r1_sq > 0.0) || !isfinite(r1_sq)) {
++        matd_destroy(e_x);
++        matd_destroy(R_t_1_tmp);
++        matd_destroy(R_t_3);
++        matd_destroy(I3);
++        *n_minima_out = 0;
++        return NULL;
++    }
+     matd_t* R_t_1 = matd_vec_normalize(R_t_1_tmp);
+     matd_destroy(e_x);
+     matd_destroy(R_t_1_tmp);
+@@ -320,7 +371,27 @@
+     }
+     matd_scale_inplace(avg_F_trans, 1.0/n_points);
+ 
+-    matd_t* G = matd_op("(M-M)^-1", I3, avg_F_trans);
++    matd_t* I3_minus_avg = matd_subtract(I3, avg_F_trans);
++    matd_t* G = matd_inverse(I3_minus_avg);
++    matd_destroy(I3_minus_avg);
++    if (G == NULL) {
++        for (int i = 0; i < n_points; i++) {
++            matd_destroy(p_trans[i]);
++            matd_destroy(v_trans[i]);
++            matd_destroy(F_trans[i]);
++        }
++        free(p_trans);
++        free(v_trans);
++        free(F_trans);
++        matd_destroy(avg_F_trans);
++        matd_destroy(R_t);
++        matd_destroy(R_gamma);
++        matd_destroy(R_z);
++        matd_destroy(R_1_prime);
++        matd_destroy(I3);
++        *n_minima_out = 0;
++        return NULL;
++    }
+     matd_scale_inplace(G, 1.0/n_points);
+ 
+     matd_t* M1 = matd_create_data(3, 3, (double[]) {
+@@ -393,6 +464,17 @@
+ 
+ 
+     // 4. Solve for minima of Eos.
++    if (!isfinite(a0) || !isfinite(a1) || !isfinite(a2) || !isfinite(a3) || !isfinite(a4)) {
++        matd_destroy(I3);
++        matd_destroy(M1);
++        matd_destroy(M2);
++        matd_destroy(R_t);
++        matd_destroy(R_gamma);
++        matd_destroy(R_z);
++        matd_destroy(R_1_prime);
++        *n_minima_out = 0;
++        return NULL;
++    }
+     double p0 = a1;
+     double p1 = 2*a2 - 4*a0;
+     double p2 = 3*a3 - 3*a1;
+@@ -435,9 +517,6 @@
          matd_scale_inplace(R_beta, 1/(1 + t_cur*t_cur));
          ret = matd_op("M'MMM'", R_t, R_gamma, R_beta, R_z);
          matd_destroy(R_beta);
@@ -28,7 +150,7 @@ diff --git a/apriltag_pose.c b/apriltag_pose.c
      }
      matd_destroy(I3);
      matd_destroy(M1);
-@@ -446,6 +442,7 @@
+@@ -446,6 +525,7 @@
      matd_destroy(R_gamma);
      matd_destroy(R_z);
      matd_destroy(R_1_prime);
@@ -36,7 +158,7 @@ diff --git a/apriltag_pose.c b/apriltag_pose.c
      return ret;
  }
  
-@@ -487,7 +484,7 @@
+@@ -487,7 +567,7 @@
  /**
   * Estimate tag pose using orthogonal iteration.
   */
@@ -45,7 +167,7 @@ diff --git a/apriltag_pose.c b/apriltag_pose.c
          apriltag_detection_info_t* info,
          double* err1,
          apriltag_pose_t* solution1,
-@@ -508,7 +505,8 @@
+@@ -508,7 +588,8 @@
  
      estimate_pose_for_tag_homography(info, solution1);
      *err1 = orthogonal_iteration(v, p, &solution1->t, &solution1->R, 4, nIters);
@@ -55,7 +177,7 @@ diff --git a/apriltag_pose.c b/apriltag_pose.c
      if (solution2->R) {
          solution2->t = matd_create(3, 1);
          *err2 = orthogonal_iteration(v, p, &solution2->t, &solution2->R, 4, nIters);
-@@ -520,6 +518,7 @@
+@@ -520,6 +601,7 @@
          matd_destroy(p[i]);
          matd_destroy(v[i]);
      }

@@ -1,6 +1,8 @@
 #include "talOS/schema/schema_hash.h"
 
+#include <cstddef>
 #include <string>
+#include <vector>
 
 #include "flatbuffers/hash.h"
 #include "flatbuffers/reflection.h"
@@ -10,19 +12,27 @@ namespace talos::schema {
 namespace {
 
 constexpr int kMaxDepth = 32;
+constexpr std::size_t kMaxStructVisits = 4096;
 
 bool append_struct(const reflection::Schema& schema,
                    const reflection::Object& object, std::string& out,
-                   int depth);
+                   int depth, std::vector<bool>& open, std::size_t& visits);
 
 // A struct field's type, or an array's element: `base` and `index` (an enum
 // or struct in `schema`, or -1) as reflection::Type spells them.
 bool append_type(const reflection::Schema& schema, reflection::BaseType base,
-                 std::int32_t index, std::string& out, int depth) {
+                 std::int32_t index, std::string& out, int depth,
+                 std::vector<bool>& open, std::size_t& visits) {
   std::size_t size;
   if (!ValueSize(schema, base, index, size)) return false;
   if (base == reflection::BaseType::Obj) {
-    return append_struct(schema, *schema.objects()->Get(index), out, depth);
+    const auto uidx = static_cast<std::size_t>(index);
+    if (uidx >= open.size() || open[uidx]) return false;
+    open[uidx] = true;
+    const bool ok = append_struct(schema, *schema.objects()->Get(index), out,
+                                  depth, open, visits);
+    open[uidx] = false;
+    return ok;
   }
   if (index < 0) {
     out += reflection::EnumNameBaseType(base);
@@ -49,10 +59,12 @@ bool append_type(const reflection::Schema& schema, reflection::BaseType base,
 
 bool append_struct(const reflection::Schema& schema,
                    const reflection::Object& object, std::string& out,
-                   int depth) {
-  if (depth >= kMaxDepth || !object.is_struct() || object.bytesize() <= 0 ||
-      object.name() == nullptr || object.fields() == nullptr)
+                   int depth, std::vector<bool>& open, std::size_t& visits) {
+  if (depth >= kMaxDepth || visits >= kMaxStructVisits || !object.is_struct() ||
+      object.bytesize() <= 0 || object.name() == nullptr ||
+      object.fields() == nullptr)
     return false;
+  ++visits;
   out += "struct ";
   out += object.name()->str();
   out += ' ';
@@ -81,15 +93,16 @@ bool append_struct(const reflection::Schema& schema,
     out += ':';
     if (type.base_type() == reflection::BaseType::Array) {
       out += '[';
-      if (!append_type(schema, type.element(), type.index(), out, depth + 1)) {
+      if (!append_type(schema, type.element(), type.index(), out, depth + 1,
+                       open, visits)) {
         return false;
       }
       out += '*';
       out += std::to_string(type.fixed_length());
       out += ']';
     } else {
-      if (!append_type(schema, type.base_type(), type.index(), out,
-                       depth + 1)) {
+      if (!append_type(schema, type.base_type(), type.index(), out, depth + 1,
+                       open, visits)) {
         return false;
       }
     }
@@ -104,7 +117,19 @@ bool append_struct(const reflection::Schema& schema,
 std::string canonical_struct(const reflection::Schema& schema,
                              const reflection::Object& object) {
   std::string out;
-  if (!append_struct(schema, object, out, 0)) return {};
+  const std::size_t num_objects =
+      schema.objects() != nullptr ? schema.objects()->size() : 0;
+  std::vector<bool> open(num_objects, false);
+  if (schema.objects() != nullptr) {
+    for (flatbuffers::uoffset_t i = 0; i < schema.objects()->size(); ++i) {
+      if (schema.objects()->Get(i) == &object) {
+        open[i] = true;
+        break;
+      }
+    }
+  }
+  std::size_t visits = 0;
+  if (!append_struct(schema, object, out, 0, open, visits)) return {};
   return out;
 }
 

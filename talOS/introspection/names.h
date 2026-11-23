@@ -107,6 +107,16 @@ inline constexpr std::uint32_t kSourceFlagHardwareRequest = 1u << 4;
 // A bit of the existing flags word, like the two above: an older registry
 // reader ignores it, and an older `--describe` reads as "targeted".
 inline constexpr std::uint32_t kSourceFlagUntargetedOutputs = 1u << 5;
+// A target-lane publisher opened through TargetLane with an OperatorArming
+// (detail::NodeAccess::add_target_lane_publisher, REQ-SAFE-14). Absent (0)
+// means unarmed, so an older `--describe` or registry row fails closed when
+// an operator producer writes a teleop-policy target lane.
+inline constexpr std::uint32_t kSourceFlagOperatorArming = 1u << 6;
+// A `/hw/state/driver_station` watcher subscribed solely by internal
+// Target/TargetLane/OperatorArming plumbing, with no explicit DriverStation
+// handle or direct subscription on the node. Absent (0) means an explicit
+// Driver Station reader, so an older binary fails closed.
+inline constexpr std::uint32_t kSourceFlagInternalDriverStation = 1u << 7;
 
 // The hardware bridge's roster name: the launcher lists the bridge under it
 // (launcher kHardwareNodeName), whatever binary `[robot] hardware_node` names,
@@ -468,6 +478,12 @@ inline bool IsHardwareRequest(std::string_view topic) {
 // talOS/devices/devices.cc so names.h stays independent of talOS/hardware).
 inline constexpr std::string_view kRequestTopicPrefix = "/hw/request/";
 
+// The forwarded Driver Station topic (`/hw/state/driver_station`): matches
+// hardware::kDriverStationTopic (checked by static_assert in names_test.cc and
+// talOS/devices/devices.cc so names.h stays independent of talOS/hardware).
+inline constexpr std::string_view kDriverStationTopic =
+    "/hw/state/driver_station";
+
 // The hardware request of node `node`, the one spelling the bridge also reads.
 inline std::string HardwareRequestTopic(std::string_view node) {
   return std::string{kRequestTopicPrefix} + std::string{node};
@@ -533,17 +549,19 @@ inline constexpr std::size_t kMaxOperatorToActuatorHops = 2;
 // writer, two schemas or message sizes or ring layouts on one topic, a
 // malformed name, a lane its subsystem never reads, an `hw` topic written by
 // anything but the roster's bridge or, for `/hw/request/<node>`, <node>'s
-// devices-layer flush, an `alert_` field that is not a bool, not
-// ParseAlertField's grammar, or outside a `status` topic). Warnings are normal
-// during development or in a partial launch (an unread topic, an owner not in
-// this session, a policy lane nobody writes yet, a node that
-// writes its hardware request but reads no target lane of its own, a node
-// whose hardware request is marked untargeted_outputs, or an operator producer
-// whose shortest path to an actuator owner exceeds kMaxOperatorToActuatorHops
-// node hops). Required coverage
-// additionally rejects a target-consuming subsystem with no producer for a
-// nonempty mode policy, and makes untargeted_outputs an error. Timers are
-// skipped: their names are labels, not topics.
+// devices-layer flush, an operator producer — a non-bridge node reading
+// `/hw/state/driver_station` explicitly, i.e., neither observer nor
+// `kSourceFlagInternalDriverStation` — writing a `teleop`-policy target lane
+// without `kSourceFlagOperatorArming`, an `alert_` field that is not a bool,
+// not ParseAlertField's grammar, or outside a `status` topic). Warnings are
+// normal during development or in a partial launch (an unread topic, an owner
+// not in this session, a policy lane nobody writes yet, a node that writes its
+// hardware request but reads no target lane of its own, a node whose hardware
+// request is marked untargeted_outputs, or an operator producer whose shortest
+// path to an actuator owner exceeds kMaxOperatorToActuatorHops node hops).
+// Required coverage additionally rejects a target-consuming subsystem with no
+// producer for a nonempty mode policy, and makes untargeted_outputs an error.
+// Timers are skipped: their names are labels, not topics.
 // A subsystem absent from target_sources is not lane-checked.
 inline std::vector<Diagnostic> LintGraph(
     const std::vector<NodeShape>& nodes,
@@ -943,7 +961,8 @@ inline std::vector<Diagnostic> LintGraph(
           is_actuator_owner[i] = true;
         }
         if (IsReader(source.kind) && !source.observer() &&
-            source.name == "/hw/state/driver_station") {
+            source.name == kDriverStationTopic &&
+            (source.flags & kSourceFlagInternalDriverStation) == 0) {
           reads_driver_station = true;
         }
         const bool teleop_lane = IsSender(source.kind) &&
@@ -964,6 +983,20 @@ inline std::vector<Diagnostic> LintGraph(
       }
       if (reads_driver_station && writes_teleop_lane) {
         is_operator_producer[i] = true;
+        for (const auto& source : node.sources) {
+          if (IsSender(source.kind) &&
+              is_teleop_target_lane(source.name, node.name) &&
+              (source.flags & kSourceFlagOperatorArming) == 0) {
+            add(Severity::ERROR, source.name,
+                "is written by operator producer '" + node.name +
+                    "' without OperatorArming; open it with a "
+                    "talos::OperatorArming (talos.OperatorArming in Python) so "
+                    "an input held through a disable, reboot, Driver Station "
+                    "dropout or stall cannot drive until released once "
+                    "(REQ-SAFE-14), or the binary predates the operator_arming "
+                    "attribute; rebuild it");
+          }
+        }
       }
     }
 

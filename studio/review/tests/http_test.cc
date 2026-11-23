@@ -265,6 +265,88 @@ TEST_F(HttpTest, AllowsOnlyLoopbackOrigins) {
   }
 }
 
+// Guards against HTTP request smuggling (duplicate Host, duplicate
+// Content-Length, empty Transfer-Encoding + Content-Length), signed-char
+// stripping of 0x80..0xFF bytes from Host/Origin, duplicate Origin headers,
+// and non-GET requests bypassing the loopback Host check.
+// REQ-OPS-41
+TEST_F(HttpTest, RejectsHttpSmugglingDuplicateOriginAndNonGetMethods) {
+  const auto send_raw = [this](const std::string& raw) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port_);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    std::string data;
+    if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof address) !=
+        0) {
+      close(fd);
+      return data;
+    }
+    (void)!write(fd, raw.data(), raw.size());
+    char buffer[8192];
+    for (;;) {
+      const ssize_t n = read(fd, buffer, sizeof buffer);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) break;
+      data.append(buffer, static_cast<std::size_t>(n));
+    }
+    close(fd);
+    return data;
+  };
+  const std::string host = "127.0.0.1:" + std::to_string(port_);
+
+  // Duplicate Host header -> 400 Bad Request.
+  EXPECT_EQ(send_raw("GET /review/sessions.json HTTP/1.1\r\nHost: " + host +
+                     "\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
+                .rfind("HTTP/1.1 400 ", 0),
+            0u);
+
+  // CL.CL smuggling -> single 400 Bad Request, no smuggled second response.
+  const std::string cl_smuggle =
+      send_raw("GET /review/sessions.json HTTP/1.1\r\nHost: " + host +
+               "\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n"
+               "GET /index.html HTTP/1.1\r\nHost: " +
+               host + "\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(cl_smuggle.rfind("HTTP/1.1 400 ", 0), 0u) << cl_smuggle;
+  EXPECT_EQ(cl_smuggle.find("HTTP/1.1 ", 9), std::string::npos) << cl_smuggle;
+
+  // Empty Transfer-Encoding + Content-Length -> 400 Bad Request.
+  EXPECT_EQ(send_raw("GET /review/sessions.json HTTP/1.1\r\nHost: " + host +
+                     "\r\nTransfer-Encoding: \r\nContent-Length: 3\r\n\r\nabc")
+                .rfind("HTTP/1.1 400 ", 0),
+            0u);
+
+  // Non-ASCII 0xFF wrapping Host/Origin must not be trimmed into valid values.
+  EXPECT_EQ(Get(port_, "/review/sessions.json", "\xff" + host + "\xff").status,
+            403);
+  const Reply obs_origin = Get(port_, "/review/sessions.json", "",
+                               "Origin: \xffhttp://127.0.0.1:5800\xff\r\n");
+  EXPECT_EQ(obs_origin.status, 200);
+  EXPECT_EQ(obs_origin.headers.find("Access-Control-Allow-Origin:"),
+            std::string::npos);
+
+  // Duplicate Origin header must emit no Access-Control-Allow-Origin.
+  const Reply dup_origin =
+      Get(port_, "/review/sessions.json", "",
+          "Origin: http://127.0.0.1:5800\r\nOrigin: http://evil.example\r\n");
+  EXPECT_EQ(dup_origin.status, 200);
+  EXPECT_EQ(dup_origin.headers.find("Access-Control-Allow-Origin:"),
+            std::string::npos);
+
+  // Non-GET methods still enforce AllowedHost (403) and otherwise answer 405.
+  const std::string post_bad_host = send_raw(
+      "POST /review/sessions.json HTTP/1.1\r\nHost: evil.example\r\n"
+      "Connection: close\r\n\r\n");
+  EXPECT_EQ(post_bad_host.rfind("HTTP/1.1 403 ", 0), 0u) << post_bad_host;
+  const std::string post_ok_host =
+      send_raw("POST /review/sessions.json HTTP/1.1\r\nHost: " + host +
+               "\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(post_ok_host.rfind("HTTP/1.1 405 ", 0), 0u) << post_ok_host;
+  EXPECT_NE(post_ok_host.find("Allow: GET\r\n"), std::string::npos)
+      << post_ok_host;
+}
+
 // Guards that nothing off this machine can reach the server: the socket is
 // bound to 127.0.0.1 (as the kernel reports it), and a connection to any
 // other address of this host is refused.

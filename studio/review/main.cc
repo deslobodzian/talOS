@@ -57,6 +57,8 @@ const char* StatusLine(int status) {
       return "403 Forbidden";
     case 404:
       return "404 Not Found";
+    case 405:
+      return "405 Method Not Allowed";
     case 413:
       return "413 Content Too Large";
     case 422:
@@ -170,6 +172,33 @@ int Run(int argc, char** argv) {
   studio::review::Review review{library, cache_mb << 20};
   std::uint16_t bound_port = 0;  // set once listening, before any request
   uWS::App app;
+  const auto send_response = [](auto* res, auto* req,
+                                const studio::review::Response& response,
+                                bool allow_get_header = false) {
+    // Emit Access-Control-Allow-Origin only when there is a single valid
+    // loopback Origin header (rejecting duplicate Origin ambiguity).
+    std::string origin;
+    int origin_count = 0;
+    for (const auto& [key, value] : *req) {
+      if (key == "origin") {
+        ++origin_count;
+        if (origin_count == 1) {
+          origin = studio::review::AllowedOrigin(value);
+        } else {
+          origin.clear();
+        }
+      }
+    }
+    res->writeStatus(StatusLine(response.status));
+    if (allow_get_header) res->writeHeader("Allow", "GET");
+    if (!origin.empty())
+      res->writeHeader("Access-Control-Allow-Origin", origin);
+    res->writeHeader("Vary", "Origin")
+        ->writeHeader("Content-Type", response.content_type)
+        ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", "no-store")
+        ->end(response.body);
+  };
   app.get("/*", [&](auto* res, auto* req) {
     studio::review::Response response;
     const std::string_view url = req->getUrl();
@@ -182,16 +211,22 @@ int Run(int argc, char** argv) {
     } else {
       response = studio::review::StaticFile(webroot, url);
     }
-    const std::string origin =
-        studio::review::AllowedOrigin(req->getHeader("origin"));
-    res->writeStatus(StatusLine(response.status));
-    if (!origin.empty())
-      res->writeHeader("Access-Control-Allow-Origin", origin);
-    res->writeHeader("Vary", "Origin")
-        ->writeHeader("Content-Type", response.content_type)
-        ->writeHeader("X-Content-Type-Options", "nosniff")
-        ->writeHeader("Cache-Control", "no-store")
-        ->end(response.body);
+    send_response(res, req, response);
+  });
+  // Enforce the loopback Host check on non-GET methods too, and answer with
+  // plain-text 405 instead of uWebSockets' default HTML 404.
+  app.any("/*", nullptr);
+  app.any("/*", [&](auto* res, auto* req) {
+    if (!studio::review::AllowedHost(req->getHeader("host"), bound_port)) {
+      send_response(res, req,
+                    {403, "text/plain; charset=utf-8",
+                     "studio_review answers only 127.0.0.1, localhost or "
+                     "[::1] with its port\n"});
+      return;
+    }
+    send_response(res, req,
+                  {405, "text/plain; charset=utf-8", "method not allowed\n"},
+                  /*allow_get_header=*/true);
   });
   // Exclusive: uSockets otherwise sets SO_REUSEPORT, and a second server on
   // this port would listen beside this one, the kernel splitting
@@ -205,9 +240,11 @@ int Run(int argc, char** argv) {
                              ':' + std::to_string(port));
   }
   const std::string bound = BoundAddress(listener);
+  const std::size_t colon = bound.rfind(':');
   std::uint64_t parsed_port = 0;
-  if (!ParseUnsigned(std::string_view{bound}.substr(bound.rfind(':') + 1),
-                     65535, parsed_port)) {
+  if (colon == std::string::npos ||
+      !ParseUnsigned(std::string_view{bound}.substr(colon + 1), 65535,
+                     parsed_port)) {
     throw std::runtime_error("cannot read the bound port");
   }
   bound_port = static_cast<std::uint16_t>(parsed_port);

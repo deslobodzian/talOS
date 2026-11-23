@@ -99,7 +99,7 @@ def main():
         command += ["--config", str(args.config)]
     try:
         result = subprocess.run(command + [str(args.session)], capture_output=True,
-                                text=True, check=True)
+                                text=True, errors="replace", check=True)
         lines = list(trial_lines(json.loads(text) for text in result.stdout.splitlines()))
     except NotDecoded as error:
         print(f"stop_paths: {error}", file=sys.stderr)
@@ -107,7 +107,8 @@ def main():
         if found:
             print(f"stop_paths: {found[1]}", file=sys.stderr)
         return 1
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, RecursionError,
+            subprocess.CalledProcessError) as error:
         print(f"stop_paths: {error}", file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError):
             print(error.stderr, file=sys.stderr)

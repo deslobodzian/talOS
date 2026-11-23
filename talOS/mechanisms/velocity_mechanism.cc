@@ -13,8 +13,10 @@ double StepSpinDown(double goal_rps, double previous_rps, double max_rps,
                     double spin_down_rps2, double dt_s) {
   double commanded = goal_rps;
   if (spin_down_rps2 > 0) {
-    const bool winding_down = std::abs(goal_rps) < std::abs(previous_rps) ||
-                              goal_rps * previous_rps < 0;
+    const bool opposite_sign = (goal_rps < 0.0 && previous_rps > 0.0) ||
+                               (goal_rps > 0.0 && previous_rps < 0.0);
+    const bool winding_down =
+        std::abs(goal_rps) < std::abs(previous_rps) || opposite_sign;
     if (winding_down) {
       const double step = spin_down_rps2 * (dt_s > 0.0 ? dt_s : 0.0);
       commanded = goal_rps > previous_rps
