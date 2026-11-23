@@ -559,7 +559,10 @@ std::optional<std::uint16_t> FirstBridgeStatusVersion(
     std::optional<std::int64_t> first_ns;
     while (reader.next(record)) {
       if (!first_ns) first_ns = record.header.event_time_ns;
-      if (record.header.event_time_ns - *first_ns > kBridgeStatusSearchNs) {
+      if (record.header.event_time_ns > *first_ns &&
+          static_cast<std::uint64_t>(record.header.event_time_ns) -
+                  static_cast<std::uint64_t>(*first_ns) >
+              static_cast<std::uint64_t>(kBridgeStatusSearchNs)) {
         return std::nullopt;
       }
       if (record.header.source_id != *id ||
@@ -806,38 +809,42 @@ std::string RecordedProtocol::Disagreement() const {
 RecordedProtocol RecordedProtocolVersion(
     const std::vector<std::string>& inputs) {
   for (const auto& input : inputs) {
-    RecordedProtocol found;
-    std::vector<std::string> logs;
-    std::optional<std::uint64_t> session;
-    std::error_code ec;
-    if (std::filesystem::is_directory(input, ec)) {
-      found.manifest = ManifestProtocolVersion(ManifestFields(input));
-      logs = event::log::FindLogFiles(input);
-    } else {
-      // A log named alone: with its session when the manifest beside it is
-      // that log's session's, else alone.
-      const std::filesystem::path file{input};
-      const std::filesystem::path dir = file.has_parent_path()
-                                            ? file.parent_path()
-                                            : std::filesystem::path{"."};
-      const event::session_manifest::Fields manifest = ManifestFields(dir);
-      session = LogSessionId(file);
-      if (manifest.session_id && manifest.session_id == session) {
-        found.manifest = ManifestProtocolVersion(manifest);
-        logs = event::log::FindLogFiles(dir.string());
+    try {
+      RecordedProtocol found;
+      std::vector<std::string> logs;
+      std::optional<std::uint64_t> session;
+      std::error_code ec;
+      if (std::filesystem::is_directory(input, ec)) {
+        found.manifest = ManifestProtocolVersion(ManifestFields(input));
+        logs = event::log::FindLogFiles(input);
       } else {
-        logs = {input};
-        session.reset();
+        // A log named alone: with its session when the manifest beside it is
+        // that log's session's, else alone.
+        const std::filesystem::path file{input};
+        const std::filesystem::path dir = file.has_parent_path()
+                                              ? file.parent_path()
+                                              : std::filesystem::path{"."};
+        const event::session_manifest::Fields manifest = ManifestFields(dir);
+        session = LogSessionId(file);
+        if (manifest.session_id && manifest.session_id == session) {
+          found.manifest = ManifestProtocolVersion(manifest);
+          logs = event::log::FindLogFiles(dir.string());
+        } else {
+          logs = {input};
+          session.reset();
+        }
       }
-    }
-    for (const auto& log : logs) {
-      const auto version = FirstBridgeStatusVersion(log, session);
-      if (version && std::find(found.bridge.begin(), found.bridge.end(),
-                               *version) == found.bridge.end()) {
-        found.bridge.push_back(*version);
+      for (const auto& log : logs) {
+        const auto version = FirstBridgeStatusVersion(log, session);
+        if (version && std::find(found.bridge.begin(), found.bridge.end(),
+                                 *version) == found.bridge.end()) {
+          found.bridge.push_back(*version);
+        }
       }
+      if (found.manifest || !found.bridge.empty()) return found;
+    } catch (const std::exception&) {
+      continue;
     }
-    if (found.manifest || !found.bridge.empty()) return found;
   }
   return {};
 }

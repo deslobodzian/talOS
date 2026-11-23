@@ -32,9 +32,75 @@ uint64_t GenerateSessionId() {
   return id == 0 ? 1 : id;
 }
 
+namespace {
+
+// Length of a well-formed RFC 3629 UTF-8 sequence starting at `text[0]` (a
+// non-ASCII byte), or 0 if invalid.
+std::size_t Utf8Length(std::string_view text) {
+  const auto at = [&](std::size_t i) {
+    return static_cast<unsigned char>(text[i]);
+  };
+  const unsigned char lead = at(0);
+  std::size_t length = 0;
+  unsigned char low = 0x80;
+  unsigned char high = 0xBF;
+  if (lead >= 0xC2 && lead <= 0xDF) {
+    length = 2;
+  } else if (lead >= 0xE0 && lead <= 0xEF) {
+    length = 3;
+    if (lead == 0xE0) low = 0xA0;
+    if (lead == 0xED) high = 0x9F;
+  } else if (lead >= 0xF0 && lead <= 0xF4) {
+    length = 4;
+    if (lead == 0xF0) low = 0x90;
+    if (lead == 0xF4) high = 0x8F;
+  } else {
+    return 0;
+  }
+  if (text.size() < length) return 0;
+  if (at(1) < low || at(1) > high) return 0;
+  for (std::size_t i = 2; i < length; ++i) {
+    if (at(i) < 0x80 || at(i) > 0xBF) return 0;
+  }
+  return length;
+}
+
+}  // namespace
+
 std::string Quoted(std::string_view value) {
+  constexpr char kHex[] = "0123456789abcdef";
   std::string out;
-  introspect::AppendJsonString(out, value);
+  out.reserve(value.size() + 2);
+  const auto escape = [&](unsigned char c) {
+    out += "\\u00";
+    out += kHex[c >> 4];
+    out += kHex[c & 15];
+  };
+  out += '"';
+  for (std::size_t i = 0; i < value.size();) {
+    const auto c = static_cast<unsigned char>(value[i]);
+    if (c < 0x80) {
+      if (c == '"' || c == '\\') {
+        out += '\\';
+        out += static_cast<char>(c);
+      } else if (c < 0x20) {
+        escape(c);
+      } else {
+        out += static_cast<char>(c);
+      }
+      ++i;
+      continue;
+    }
+    const std::size_t length = Utf8Length(value.substr(i));
+    if (length == 0) {
+      escape(c);
+      ++i;
+    } else {
+      out += value.substr(i, length);
+      i += length;
+    }
+  }
+  out += '"';
   return out;
 }
 
