@@ -464,6 +464,26 @@ py_test(
     deps = ["@rules_python//python/runfiles"],
 )
 
+# REQ-DEV-29: talOS fetches patched toml++ through a module-visible
+# http_archive (not a root-only override), dependent repositories
+# (examples/robot_repo, examples/wrist_repo, and standalone scaffolds) carry
+# no override or patch file for it, and CI/prepush run
+# @talos//talOS/configuration:config_fuzz_test in both dependents. Reads
+# source-tree files (.bazelignore hides examples/*_repo from Bazel labels),
+# so it is never cached (`external`); well under a second.
+py_test(
+    name = "dependent_toml_test",
+    size = "small",
+    srcs = [
+        "dependent_toml_test.py",
+        "new_subsystem.py",
+    ],
+    legacy_create_init = False,
+    main = "dependent_toml_test.py",
+    tags = ["external"],
+    deps = [":sync_manifest_lib"],
+)
+
 # tools/prepush.sh sources prepush_robot_repository.sh for whether its
 # robot-repository step runs, is skipped or fails (TALOS_ROBOT_REPOSITORY).
 py_test(
