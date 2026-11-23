@@ -78,6 +78,7 @@ class LogFileSink {
   // Syncs the active descriptor (`durable`: process::DurableSync for flush()
   // and destruction; otherwise periodic fsync), updates last_sync(), and
   // creates `<path>.capped` once head_dropped() or `capture_stopped` holds.
+  // A successful durable sync clears needs_durable_sync().
   void sync(bool durable, bool capture_stopped = false) noexcept;
 
   // Creates and durable-syncs `<path>.capped` once.
@@ -92,6 +93,7 @@ class LogFileSink {
   std::chrono::steady_clock::time_point last_sync() const noexcept {
     return last_sync_;
   }
+  bool needs_durable_sync() const noexcept { return needs_durable_sync_; }
 
   bool failed() const noexcept { return failed_.load(); }
   std::string error() const;
@@ -117,6 +119,7 @@ class LogFileSink {
   std::uint64_t dropped_through_{0};
   std::atomic<bool> head_dropped_{false};
   bool capped_marked_{false};
+  bool needs_durable_sync_{false};
   std::chrono::steady_clock::time_point last_sync_{
       std::chrono::steady_clock::now()};
   std::atomic<bool> failed_{false};

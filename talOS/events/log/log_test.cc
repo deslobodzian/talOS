@@ -1119,6 +1119,186 @@ TEST(LogDurability, IdleBackgroundWriterFsyncsWithoutExplicitFlush) {
   ::unlink(path.c_str());
 }
 
+// REQ-OPS-12: flush() durable-syncs the file once; destroying LogWriter with
+// no further writes skips a redundant DurableSync, while additional writes
+// after flush() or a failed flush() still durable-sync on destruction.
+TEST(LogDurability, DestructionSkipsRedundantDurableSyncAfterFlush) {
+  const auto path = TempPath("skip_redundant_durable_sync");
+  for (const bool background : {false, true}) {
+    SCOPED_TRACE(background ? "background" : "synchronous");
+
+    // Case 1: write, flush(), destroy with no further writes -> 1 durable sync.
+    {
+      std::atomic<int> durable_syncs{0};
+      LogWriter::Options options{4096, 2, background};
+      options.sync_interval = std::chrono::hours{1};
+      options.sink_ops.durable_sync = [&](int fd) {
+        durable_syncs.fetch_add(1);
+        return process::DurableSync(fd);
+      };
+      {
+        LogWriter writer{path, "no_double_sync", std::move(options)};
+        writer.start({}, {});
+        Context ctx{};
+        ctx.dispatch_index = 1;
+        writer.dispatch(ctx, MakePayload(16, 1));
+        ctx.kind = EventKind::EXIT;
+        ctx.dispatch_index = 2;
+        writer.finish(ctx);
+        writer.flush();
+        ASSERT_FALSE(writer.failed()) << writer.error();
+        EXPECT_EQ(durable_syncs.load(), 1);
+      }
+      EXPECT_EQ(durable_syncs.load(), 1)
+          << "destructor ran a redundant DurableSync after flush()";
+    }
+
+    // Case 2: write after flush() -> destructor durable-syncs the new bytes.
+    {
+      std::atomic<int> durable_syncs{0};
+      LogWriter::Options options{4096, 2, background};
+      options.sync_interval = std::chrono::hours{1};
+      options.sink_ops.durable_sync = [&](int fd) {
+        durable_syncs.fetch_add(1);
+        return process::DurableSync(fd);
+      };
+      {
+        LogWriter writer{path, "dirty_after_flush", std::move(options)};
+        writer.start({}, {});
+        Context ctx{};
+        ctx.dispatch_index = 1;
+        writer.dispatch(ctx, MakePayload(16, 1));
+        writer.flush();
+        ASSERT_EQ(durable_syncs.load(), 1);
+        ctx.dispatch_index = 2;
+        writer.dispatch(ctx, MakePayload(16, 2));
+      }
+      EXPECT_EQ(durable_syncs.load(), 2)
+          << "destructor skipped DurableSync after post-flush writes";
+    }
+
+    // Case 3: failed durable_sync during flush() leaves needs_durable_sync set.
+    {
+      std::atomic<int> durable_syncs{0};
+      LogWriter::Options options{4096, 2, background};
+      options.sync_interval = std::chrono::hours{1};
+      options.sink_ops.durable_sync = [&](int fd) {
+        if (durable_syncs.fetch_add(1) == 0) {
+          errno = EIO;
+          return -1;
+        }
+        return process::DurableSync(fd);
+      };
+      {
+        LogWriter writer{path, "failed_flush_sync", std::move(options)};
+        writer.start({}, {});
+        Context ctx{};
+        ctx.dispatch_index = 1;
+        writer.dispatch(ctx, MakePayload(16, 1));
+        writer.flush();
+        EXPECT_TRUE(writer.failed());
+        ASSERT_EQ(durable_syncs.load(), 1);
+      }
+      EXPECT_EQ(durable_syncs.load(), 2)
+          << "failed durable sync must not clear needs_durable_sync";
+    }
+  }
+  ::unlink(path.c_str());
+}
+
+// REQ-OPS-12: when flush() coincides with a due periodic sync, the background
+// writer skips periodic sync(false) so flush() does not stack periodic fsync
+// and DurableSync back-to-back.
+TEST(LogDurability, FlushSkipsCoincidingPeriodicSync) {
+  const auto path = TempPath("flush_skips_periodic_sync");
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool open_released = false;
+  bool write_released = false;
+  std::atomic<bool> open_entered{false};
+  std::atomic<int> write_entries{0};
+  std::atomic<int> periodic_syncs{0};
+  std::atomic<int> durable_syncs{0};
+  int periodic_at_durable = -1;
+
+  {
+    LogWriter::Options options{4096, 2, /*background=*/true};
+    options.write_interval = std::chrono::hours{1};
+    // Always elapsed so sync_due would fire on every pass unless suppressed.
+    options.sync_interval = std::chrono::nanoseconds{0};
+    options.sink_ops.open = [&](const char* target, int flags, mode_t mode) {
+      open_entered.store(true);
+      {
+        std::unique_lock lock{gate_mutex};
+        gate_cv.wait(lock, [&] { return open_released; });
+      }
+      return (flags & O_CREAT) != 0 ? ::open(target, flags, mode)
+                                    : ::open(target, flags);
+    };
+    options.sink_ops.periodic_sync = [&](int /*fd*/) {
+      periodic_syncs.fetch_add(1);
+      return 0;
+    };
+    options.sink_ops.durable_sync = [&](int fd) {
+      durable_syncs.fetch_add(1);
+      if (periodic_at_durable < 0) {
+        periodic_at_durable = periodic_syncs.load();
+      }
+      return process::DurableSync(fd);
+    };
+    options.before_write = [&] {
+      write_entries.fetch_add(1);
+      std::unique_lock lock{gate_mutex};
+      gate_cv.wait(lock, [&] { return write_released; });
+    };
+    options.before_flush_wait = [&] {
+      {
+        std::lock_guard lock{gate_mutex};
+        write_released = true;
+      }
+      gate_cv.notify_all();
+    };
+
+    LogWriter writer{path, "flush_periodic", std::move(options)};
+    struct ReleaseGates {
+      std::mutex& mutex;
+      std::condition_variable& cv;
+      bool& open_flag;
+      bool& write_flag;
+      ~ReleaseGates() {
+        {
+          std::lock_guard lock{mutex};
+          open_flag = true;
+          write_flag = true;
+        }
+        cv.notify_all();
+      }
+    } release_gates{gate_mutex, gate_cv, open_released, write_released};
+    writer.start({}, {});
+    ASSERT_TRUE(Eventually([&] { return open_entered.load(); }));
+    Context ctx{};
+    ctx.dispatch_index = 1;
+    writer.dispatch(ctx, MakePayload(16, 1));
+    {
+      std::lock_guard lock{gate_mutex};
+      open_released = true;
+    }
+    gate_cv.notify_all();
+    ASSERT_TRUE(Eventually([&] { return write_entries.load() == 1; }));
+    ASSERT_EQ(periodic_syncs.load(), 0);
+
+    // flush() sets flushing, releases before_write via before_flush_wait,
+    // drains the submitted chunk, and calls DurableSync.
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+    EXPECT_EQ(periodic_at_durable, 0)
+        << "writer ran periodic sync right before flush()'s DurableSync";
+    EXPECT_EQ(durable_syncs.load(), 1);
+  }
+  EXPECT_EQ(durable_syncs.load(), 1);
+  ::unlink(path.c_str());
+}
+
 // Segment rotation must leave whole segments across any power cut: durable-sync
 // the finished segment, write and durable-sync `.next` before renaming it into
 // place, durable-sync `.capped` and the parent directory before unlinking the
