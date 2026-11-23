@@ -67,21 +67,37 @@ double HolonomicFollower::Axis::update(const PidGains& gains, double error,
     }
   }
   pending_dt_s += dt_s;
-  if (!has_previous) {
+  if (!std::isfinite(error)) {
+    // Do not latch an overflowing error into derivative history.
+    previous_error = 0.0;
+    pending_dt_s = 0.0;
+    derivative = 0.0;
+    has_previous = false;
+  } else if (!has_previous) {
     previous_error = error;
-    pending_dt_s = 0;
+    pending_dt_s = 0.0;
     has_previous = true;
   } else if (pending_dt_s >= kMinDerivativePeriod_s) {
     if (gains.kd > 0) {
       const double raw_change =
           (error == previous_error) ? 0.0 : error - previous_error;
-      const double change = angular ? WrapAngle(raw_change) : raw_change;
-      derivative = change / pending_dt_s;
+      if (std::isfinite(raw_change)) {
+        const double change = angular ? WrapAngle(raw_change) : raw_change;
+        const double next_derivative = change / pending_dt_s;
+        // Guard non-finite derivative or d_term so +-inf never latches across
+        // subsequent dt_s < kMinDerivativePeriod_s ticks.
+        derivative = (std::isfinite(next_derivative) &&
+                      std::isfinite(gains.kd * next_derivative))
+                         ? next_derivative
+                         : 0.0;
+      } else {
+        derivative = 0.0;
+      }
     } else {
-      derivative = 0;
+      derivative = 0.0;
     }
     previous_error = error;
-    pending_dt_s = 0;
+    pending_dt_s = 0.0;
   }
   const double p_term = gains.kp > 0 ? gains.kp * error : 0.0;
   const double i_term =
