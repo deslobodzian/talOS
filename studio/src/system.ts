@@ -12,6 +12,8 @@
 // already follow: a JSON number is a double, and a sequence counter or a
 // nanosecond timestamp loses precision past 2^53.
 
+import {bool, boundedString, fail, flag, list, parsing, record} from './data/validate';
+
 export const MAX_SYSTEM_BYTES = 1 << 20;
 
 // studio/bridge/system.h's kSystemGraphVersion: the document's fields and
@@ -175,37 +177,13 @@ const MAX_MESSAGE = 2048;
 // /hw/status carries at most hardware::kMaxCanBuses (4) CAN bus slots.
 const MAX_CAN_BUSES = 4;
 
-const fail = (what: string): never => {
-  throw Error(what);
-};
-
 // Every check below raises the bare complaint. The entry points name the
 // document it was about, so one set of helpers serves both the live graph and
 // the declared one and neither error loses its subject -- including the
 // SyntaxError from JSON.parse, which on its own does not say what failed to
 // parse.
-function parsing<T>(document: string, body: () => T): T {
-  try {
-    return body();
-  } catch (e) {
-    throw Error(
-        `Invalid ${document}: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
-
-function record(value: unknown, what: string): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value))
-    fail(`${what} must be an object`);
-  return value as Record<string, unknown>;
-}
-
-function str(source: Record<string, unknown>, key: string,
-             cap = MAX_STRING): string {
-  const value = source[key];
-  if (typeof value !== 'string' || value.length > cap)
-    fail(`${key} must be a string of at most ${cap} characters`);
-  return value as string;
-}
+const str = (source: Record<string, unknown>, key: string, cap = MAX_STRING) =>
+    boundedString(source, key, cap);
 
 // A uint64 as the wire carries it. Kept as a string rather than converted: the
 // UI formats it, and BigInt() on demand costs less than converting every field
@@ -225,31 +203,10 @@ function num(source: Record<string, unknown>, key: string): number {
   return value as number;
 }
 
-function bool(source: Record<string, unknown>, key: string): boolean {
-  const value = source[key];
-  if (typeof value !== 'boolean') fail(`${key} must be a boolean`);
-  return value as boolean;
-}
-
-// An endpoint attribute. Absent is read as false rather than refused: a bridge
-// built before endpoint attributes existed sends neither field, and rejecting
-// its whole document over a flag whose default is the ordinary case would blank
-// a working view to report that a topic is ordinary. A field that is present
-// still has to be a boolean -- "true" is a mistake, not a value.
-function flag(source: Record<string, unknown>, key: string): boolean {
-  const value = source[key];
-  if (value === undefined) return false;
-  if (typeof value !== 'boolean') fail(`${key} must be a boolean`);
-  return value as boolean;
-}
-
-function list(source: Record<string, unknown>, key: string,
-              cap: number): unknown[] {
-  const value = source[key];
-  if (!Array.isArray(value) || value.length > cap)
-    fail(`${key} must be an array of at most ${cap} entries`);
-  return value as unknown[];
-}
+// An endpoint attribute is read with flag(): a bridge built before endpoint
+// attributes existed sends neither field, and rejecting its whole document over
+// a flag whose default is the ordinary case would blank a working view to
+// report that a topic is ordinary.
 
 function names(source: Record<string, unknown>, key: string): string[] {
   return list(source, key, MAX_NODES).map((entry, i) => {

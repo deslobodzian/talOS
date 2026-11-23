@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "talOS/introspection/names.h"
+#include "talOS/telemetry/json_string.h"
 #include "talOS/telemetry/wire.h"
 #include "toml.hpp"
 
@@ -576,40 +577,6 @@ DashboardLayout Parse(const toml::table& document, const std::string& file) {
   return layout;
 }
 
-void AppendString(std::string& out, std::string_view text) {
-  out += '"';
-  for (const char c : text) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          static constexpr char kHex[] = "0123456789abcdef";
-          out += "\\u00";
-          const auto byte = static_cast<unsigned char>(c);
-          out += kHex[byte >> 4];
-          out += kHex[byte & 0xf];
-        } else {
-          out += c;
-        }
-    }
-  }
-  out += '"';
-}
-
 void AppendNumber(std::string& out, double value) {
   std::array<char, 32> buffer{};
   const auto [end, error] =
@@ -627,7 +594,7 @@ void AppendOptional(std::string& out, const std::optional<double>& value) {
 
 void AppendKey(std::string& out, std::string_view key) {
   out += ',';
-  AppendString(out, key);
+  AppendEscaped(out, key);
   out += ':';
 }
 
@@ -635,26 +602,26 @@ void AppendStrings(std::string& out, const std::vector<std::string>& values) {
   out += '[';
   for (std::size_t i = 0; i < values.size(); ++i) {
     if (i > 0) out += ',';
-    AppendString(out, values[i]);
+    AppendEscaped(out, values[i]);
   }
   out += ']';
 }
 
 void AppendWidget(std::string& out, const DashboardWidget& widget) {
   out += "{\"kind\":";
-  AppendString(out, DashboardWidgetKindName(widget.kind));
+  AppendEscaped(out, DashboardWidgetKindName(widget.kind));
   out += ",\"at\":[" + std::to_string(widget.at.column) + "," +
          std::to_string(widget.at.row) + "," + std::to_string(widget.at.width) +
          "," + std::to_string(widget.at.height) + "]";
   AppendKey(out, "title");
-  AppendString(out, widget.title);
+  AppendEscaped(out, widget.title);
   AppendKey(out, "channels");
   out += '{';
   for (std::size_t i = 0; i < widget.channels.size(); ++i) {
     if (i > 0) out += ',';
-    AppendString(out, widget.channels[i].role);
+    AppendEscaped(out, widget.channels[i].role);
     out += ':';
-    AppendString(out, widget.channels[i].name);
+    AppendEscaped(out, widget.channels[i].name);
   }
   out += '}';
   switch (widget.kind) {
@@ -676,7 +643,7 @@ void AppendWidget(std::string& out, const DashboardWidget& widget) {
       break;
     case Kind::kNumber:
       AppendKey(out, "label");
-      AppendString(out, widget.label);
+      AppendEscaped(out, widget.label);
       AppendKey(out, "precision");
       out += std::to_string(widget.precision);
       AppendKey(out, "warn_below");
@@ -686,13 +653,13 @@ void AppendWidget(std::string& out, const DashboardWidget& widget) {
       break;
     case Kind::kBoolean:
       AppendKey(out, "label");
-      AppendString(out, widget.label);
+      AppendEscaped(out, widget.label);
       AppendKey(out, "good");
       out += widget.good ? "true" : "false";
       break;
     case Kind::kText:
       AppendKey(out, "label");
-      AppendString(out, widget.label);
+      AppendEscaped(out, widget.label);
       break;
     case Kind::kGraph:
       AppendKey(out, "series");
@@ -711,9 +678,9 @@ void AppendWidget(std::string& out, const DashboardWidget& widget) {
         const auto& item = widget.items[i];
         if (i > 0) out += ',';
         out += "{\"label\":";
-        AppendString(out, item.label);
+        AppendEscaped(out, item.label);
         AppendKey(out, "channel");
-        AppendString(out, item.channel);
+        AppendEscaped(out, item.channel);
         AppendKey(out, "equals");
         if (!item.equals) {
           out += "null";
@@ -722,7 +689,7 @@ void AppendWidget(std::string& out, const DashboardWidget& widget) {
         } else if (const auto* number = std::get_if<double>(&*item.equals)) {
           AppendNumber(out, *number);
         } else {
-          AppendString(out, std::get<std::string>(*item.equals));
+          AppendEscaped(out, std::get<std::string>(*item.equals));
         }
         AppendKey(out, "at_least");
         AppendOptional(out, item.at_least);
@@ -841,9 +808,9 @@ void CheckDashboardBudget(const DashboardLayout& layout,
 std::string DashboardLayoutJson(const DashboardLayout& layout) {
   std::string out = "{\"version\":1";
   AppendKey(out, "file");
-  AppendString(out, layout.file.filename().string());
+  AppendEscaped(out, layout.file.filename().string());
   AppendKey(out, "title");
-  AppendString(out, layout.title);
+  AppendEscaped(out, layout.title);
   out +=
       ",\"columns\":" + std::to_string(layout.columns) +
       ",\"rows\":" + std::to_string(layout.rows) +

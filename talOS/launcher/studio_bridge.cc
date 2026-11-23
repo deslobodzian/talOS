@@ -4,7 +4,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <csignal>
@@ -12,6 +11,7 @@
 #include <iostream>
 #include <optional>
 #include <string_view>
+#include <variant>
 
 #include "talOS/launcher/console_line.h"
 #include "talOS/launcher/spawn.h"
@@ -144,33 +144,13 @@ bool StudioBridge::Watch(NodeProcessInfo& proc,
   }
   uint32_t row_flags = 0;
   const auto read_row = [&]() -> RowObservation {
-    if (registry == nullptr) return {};
-    for (const auto& record : registry->header()->nodes) {
-      const auto generation = record.generation.load(std::memory_order_acquire);
-      if (record.state.load(std::memory_order_acquire) !=
-          static_cast<uint64_t>(introspect::SlotState::ACTIVE))
-        continue;
-      if (record.pid != static_cast<uint64_t>(proc.pid) ||
-          record.session_id != session_id_)
-        continue;
-      const auto beat =
-          record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
-      if (beat < spawned_monotonic_ns_) continue;
-      const auto dispatch =
-          record.dispatch_count.load(std::memory_order_relaxed);
-      const auto flags = record.flags.load(std::memory_order_acquire);
-      std::atomic_thread_fence(std::memory_order_acquire);
-      if (record.generation.load(std::memory_order_relaxed) != generation ||
-          record.state.load(std::memory_order_relaxed) !=
-              static_cast<uint64_t>(introspect::SlotState::ACTIVE))
-        continue;
-      row_flags = flags;
-      return {.found = true,
-              .constructing = (flags & introspect::kFlagConstructing) != 0,
-              .heartbeat = beat,
-              .dispatch = dispatch};
-    }
-    return {};
+    const auto row =
+        ReadRunRow(registry, proc.pid, session_id_, spawned_monotonic_ns_,
+                   [](const introspect::NodeRecord& /*record*/,
+                      uint32_t /*flags*/) { return std::monostate{}; });
+    if (!row) return {};
+    row_flags = row->flags;
+    return row->observation;
   };
   const LivenessCheck check =
       liveness_.Watch(clock, read_row, liveness_limits_);

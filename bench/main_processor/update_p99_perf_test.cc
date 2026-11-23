@@ -43,6 +43,7 @@ using talos::process::StallMeter;
 using talos::testing::DsPacket;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
+using talos::testing::TimedNode;
 
 constexpr const char* kConfig = "bench/main_processor/configuration/robot.toml";
 
@@ -56,38 +57,6 @@ constexpr std::size_t kMeasuredTicks = 1000;
 // stall ceiling (docs/TESTING.md §6.7): an ordinary thread's 1 ms sleep
 // overrunning by 25 ms or more means the host slept or was severely starved.
 constexpr std::uint64_t kMaxHostStallUs = 25'000;
-
-template <class T>
-class TimedNode {
- public:
-  explicit TimedNode(talos::Node& node) : inner_{node} {
-    // Registered after inner_'s constructor, so this hook runs after the
-    // devices layer's hardware-request flush and captures update() + flush.
-    node.after_update([this] {
-      const auto elapsed_ns =
-          (talos::event::steady_now() - tick_start_).count();
-      if (recording_ != nullptr && *recording_ && samples_ns_ != nullptr) {
-        samples_ns_->push_back(elapsed_ns);
-      }
-    });
-  }
-
-  void bind(std::vector<std::int64_t>* samples_ns, const bool* recording) {
-    samples_ns_ = samples_ns;
-    recording_ = recording;
-  }
-
-  void update() {
-    tick_start_ = talos::event::steady_now();
-    inner_.update();
-  }
-
- private:
-  T inner_;
-  talos::event::MonotonicTime tick_start_{};
-  std::vector<std::int64_t>* samples_ns_ = nullptr;
-  const bool* recording_ = nullptr;
-};
 
 std::string FormatUs(double us) {
   std::ostringstream out;

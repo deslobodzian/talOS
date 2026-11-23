@@ -390,7 +390,7 @@ std::unique_ptr<Node> NodeAccess::create(NodeSetup setup) {
   return std::unique_ptr<Node>{new Node{std::move(setup)}};
 }
 
-void NodeAccess::set_update(Node& node, std::function<void()> update) {
+void NodeDetail::set_update(Node& node, std::function<void()> update) {
   node.impl_->CheckOpen("set_update");
   node.impl_->update = std::move(update);
   node.impl_->abi_update = false;
@@ -436,7 +436,7 @@ void NodeAccess::require_loop_thread(const Node& node, std::string_view what) {
 
 bool NodeAccess::in_update(const Node& node) { return node.impl_->in_update; }
 
-void NodeAccess::require_immediate_delivery(Node& node,
+void NodeDetail::require_immediate_delivery(Node& node,
                                             std::size_t subscription) {
   Node::Impl& impl = *node.impl_;
   impl.CheckOpen("subscribe with a callback");
@@ -451,7 +451,7 @@ std::uint64_t NodeAccess::next_update(const Node& node) {
   return node.impl_->in_update ? node.impl_->ticks + 1 : node.impl_->ticks;
 }
 
-Duration NodeAccess::freshness_timeout(const Node& node) {
+Duration NodeDetail::freshness_timeout(const Node& node) {
   return node.impl_->timeout;
 }
 
@@ -504,27 +504,27 @@ std::optional<std::filesystem::path> NodeAccess::session_dir(const Node& node) {
   return node.impl_->session_dir;
 }
 
-std::size_t NodeAccess::add_state_machine(Node& node, std::int64_t initial) {
+std::size_t NodeDetail::add_state_machine(Node& node, std::int64_t initial) {
   node.impl_->state_machines.push_back(Node::Impl::StateMachineSlot{
       .state = initial,
       .previous = initial,
-      .entered_update = next_update(node),
+      .entered_update = NodeAccess::next_update(node),
       .entered_at = node.now(),
   });
   return node.impl_->state_machines.size() - 1;
 }
 
-std::int64_t NodeAccess::state_machine_state(const Node& node,
+std::int64_t NodeDetail::state_machine_state(const Node& node,
                                              std::size_t index) {
   return node.impl_->StateMachineAt(index).state;
 }
 
-std::int64_t NodeAccess::state_machine_previous(const Node& node,
+std::int64_t NodeDetail::state_machine_previous(const Node& node,
                                                 std::size_t index) {
   return node.impl_->StateMachineAt(index).previous;
 }
 
-void NodeAccess::state_machine_go(Node& node, std::size_t index,
+void NodeDetail::state_machine_go(Node& node, std::size_t index,
                                   std::int64_t next) {
   auto& slot = node.impl_->StateMachineAt(index);
   if (next == slot.state) return;
@@ -532,27 +532,27 @@ void NodeAccess::state_machine_go(Node& node, std::size_t index,
   slot.state = next;
   slot.entered_at = node.now();
   // Entered during update() k: the first update to start in it is k + 1.
-  slot.entered_update = next_update(node);
+  slot.entered_update = NodeAccess::next_update(node);
 }
 
-Duration NodeAccess::state_machine_time_in_state(const Node& node,
+Duration NodeDetail::state_machine_time_in_state(const Node& node,
                                                  std::size_t index) {
   return node.now() - node.impl_->StateMachineAt(index).entered_at;
 }
 
-bool NodeAccess::state_machine_just_entered(const Node& node,
+bool NodeDetail::state_machine_just_entered(const Node& node,
                                             std::size_t index) {
   return node.tick() == node.impl_->StateMachineAt(index).entered_update;
 }
 
-void* NodeAccess::find_extension(const Node& node, std::type_index type) {
+void* NodeDetail::find_extension(const Node& node, std::type_index type) {
   for (const auto& [key, object] : node.impl_->extensions) {
     if (key == type) return object.get();
   }
   return nullptr;
 }
 
-void NodeAccess::add_extension(Node& node, std::type_index type,
+void NodeDetail::add_extension(Node& node, std::type_index type,
                                std::shared_ptr<void> object) {
   if (find_extension(node, type) != nullptr) {
     throw std::logic_error(node.impl_->name + ": extension added twice");
@@ -562,7 +562,7 @@ void NodeAccess::add_extension(Node& node, std::type_index type,
 
 // --- params ------------------------------------------------------------------
 
-std::optional<bool> NodeAccess::find_bool(const Node& node,
+std::optional<bool> NodeDetail::find_bool(const Node& node,
                                           std::string_view key,
                                           ParamTable subsystem) {
   const auto value = node.impl_->Param(key, subsystem);
@@ -571,7 +571,7 @@ std::optional<bool> NodeAccess::find_bool(const Node& node,
   param_error(node, key, "must be a boolean", subsystem);
 }
 
-std::optional<std::int64_t> NodeAccess::find_int(const Node& node,
+std::optional<std::int64_t> NodeDetail::find_int(const Node& node,
                                                  std::string_view key,
                                                  ParamTable subsystem) {
   const auto value = node.impl_->Param(key, subsystem);
@@ -580,7 +580,7 @@ std::optional<std::int64_t> NodeAccess::find_int(const Node& node,
   param_error(node, key, "must be an integer", subsystem);
 }
 
-std::optional<double> NodeAccess::find_double(const Node& node,
+std::optional<double> NodeDetail::find_double(const Node& node,
                                               std::string_view key,
                                               ParamTable subsystem) {
   const auto value = node.impl_->Param(key, subsystem);
@@ -591,7 +591,7 @@ std::optional<double> NodeAccess::find_double(const Node& node,
   param_error(node, key, "must be a number", subsystem);
 }
 
-std::optional<std::string> NodeAccess::find_string(const Node& node,
+std::optional<std::string> NodeDetail::find_string(const Node& node,
                                                    std::string_view key,
                                                    ParamTable subsystem) {
   const auto value = node.impl_->Param(key, subsystem);
@@ -666,7 +666,7 @@ std::vector<double> DoubleList(const Node& node, std::string_view key,
 
 }  // namespace
 
-std::optional<std::vector<std::string>> NodeAccess::find_string_list(
+std::optional<std::vector<std::string>> NodeDetail::find_string_list(
     const Node& node, std::string_view key, ParamTable subsystem) {
   constexpr std::string_view kExpected = "must be an array of strings";
   const auto value = node.impl_->Param(key, subsystem);
@@ -676,7 +676,7 @@ std::optional<std::vector<std::string>> NodeAccess::find_string_list(
   return StringList(node, key, subsystem, *array, kExpected);
 }
 
-std::optional<std::vector<double>> NodeAccess::find_double_list(
+std::optional<std::vector<double>> NodeDetail::find_double_list(
     const Node& node, std::string_view key, ParamTable subsystem) {
   constexpr std::string_view kExpected = "must be an array of numbers";
   const auto value = node.impl_->Param(key, subsystem);
@@ -711,7 +711,7 @@ std::optional<ParamValue> NodeAccess::find_param(const Node& node,
               subsystem);
 }
 
-void NodeAccess::param_error(const Node& node, std::string_view key,
+void NodeDetail::param_error(const Node& node, std::string_view key,
                              std::string_view problem, ParamTable subsystem) {
   const std::string& name = node.impl_->name;
   const std::string table{subsystem.value_or(name)};
@@ -751,7 +751,7 @@ void RefuseHardwareRequest(const std::string& node, std::string_view topic) {
 
 }  // namespace
 
-std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
+std::size_t NodeDetail::add_subscription(Node& node, std::string_view topic,
                                          std::size_t bytes,
                                          std::size_t alignment,
                                          const schema::Identity& schema,
@@ -774,16 +774,16 @@ std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
   return impl.subscriptions.size() - 1;
 }
 
-const void* NodeAccess::subscription_value(const Node& node,
+const void* NodeDetail::subscription_value(const Node& node,
                                            std::size_t index) {
   return node.impl_->SubscriptionAt(index).data.get();
 }
 
-bool NodeAccess::subscription_has_value(const Node& node, std::size_t index) {
+bool NodeDetail::subscription_has_value(const Node& node, std::size_t index) {
   return node.impl_->SubscriptionAt(index).has_value;
 }
 
-Duration NodeAccess::subscription_age(const Node& node, std::size_t index) {
+Duration NodeDetail::subscription_age(const Node& node, std::size_t index) {
   const auto& slot = node.impl_->SubscriptionAt(index);
   if (!slot.has_value) return Duration::max();
   return node.now() - slot.published;
@@ -796,13 +796,13 @@ void NodeAccess::record_read(Node& node, std::size_t index) {
                                 slot.sequence);
 }
 
-bool NodeAccess::subscription_fresh(const Node& node, std::size_t index,
+bool NodeDetail::subscription_fresh(const Node& node, std::size_t index,
                                     Duration max_age) {
   return subscription_has_value(node, index) &&
          subscription_age(node, index) < max_age;
 }
 
-bool NodeAccess::subscription_updated(const Node& node, std::size_t index) {
+bool NodeDetail::subscription_updated(const Node& node, std::size_t index) {
   return node.impl_->SubscriptionAt(index).updated;
 }
 
@@ -815,7 +815,7 @@ std::size_t NodeAccess::add_observer(Node& node, std::string_view topic,
   return index;
 }
 
-std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
+std::size_t NodeDetail::add_publisher(Node& node, std::string_view topic,
                                       std::size_t bytes, std::size_t alignment,
                                       const schema::Identity& schema) {
   Node::Impl& impl = *node.impl_;
@@ -903,81 +903,8 @@ bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
       std::span<const std::byte>{static_cast<const std::byte*>(data), bytes});
 }
 
-// --- NodeDetail (non-privileged public-API thunks) ---------------------------
+// --- NodeDetail::publisher_send (refuses the hardware request slot) --------
 
-void NodeDetail::set_update(Node& node, std::function<void()> update) {
-  NodeAccess::set_update(node, std::move(update));
-}
-void NodeDetail::require_immediate_delivery(Node& node,
-                                            std::size_t subscription) {
-  NodeAccess::require_immediate_delivery(node, subscription);
-}
-Duration NodeDetail::freshness_timeout(const Node& node) {
-  return NodeAccess::freshness_timeout(node);
-}
-std::optional<bool> NodeDetail::find_bool(const Node& node,
-                                          std::string_view key,
-                                          ParamTable subsystem) {
-  return NodeAccess::find_bool(node, key, subsystem);
-}
-std::optional<std::int64_t> NodeDetail::find_int(const Node& node,
-                                                 std::string_view key,
-                                                 ParamTable subsystem) {
-  return NodeAccess::find_int(node, key, subsystem);
-}
-std::optional<double> NodeDetail::find_double(const Node& node,
-                                              std::string_view key,
-                                              ParamTable subsystem) {
-  return NodeAccess::find_double(node, key, subsystem);
-}
-std::optional<std::string> NodeDetail::find_string(const Node& node,
-                                                   std::string_view key,
-                                                   ParamTable subsystem) {
-  return NodeAccess::find_string(node, key, subsystem);
-}
-std::optional<std::vector<std::string>> NodeDetail::find_string_list(
-    const Node& node, std::string_view key, ParamTable subsystem) {
-  return NodeAccess::find_string_list(node, key, subsystem);
-}
-std::optional<std::vector<double>> NodeDetail::find_double_list(
-    const Node& node, std::string_view key, ParamTable subsystem) {
-  return NodeAccess::find_double_list(node, key, subsystem);
-}
-void NodeDetail::param_error(const Node& node, std::string_view key,
-                             std::string_view problem, ParamTable subsystem) {
-  NodeAccess::param_error(node, key, problem, subsystem);
-}
-std::size_t NodeDetail::add_subscription(Node& node, std::string_view topic,
-                                         std::size_t bytes,
-                                         std::size_t alignment,
-                                         const schema::Identity& schema,
-                                         bool optional,
-                                         MessageCallback on_message) {
-  return NodeAccess::add_subscription(node, topic, bytes, alignment, schema,
-                                      optional, std::move(on_message));
-}
-const void* NodeDetail::subscription_value(const Node& node,
-                                           std::size_t index) {
-  return NodeAccess::subscription_value(node, index);
-}
-bool NodeDetail::subscription_has_value(const Node& node, std::size_t index) {
-  return NodeAccess::subscription_has_value(node, index);
-}
-Duration NodeDetail::subscription_age(const Node& node, std::size_t index) {
-  return NodeAccess::subscription_age(node, index);
-}
-bool NodeDetail::subscription_fresh(const Node& node, std::size_t index,
-                                    Duration max_age) {
-  return NodeAccess::subscription_fresh(node, index, max_age);
-}
-bool NodeDetail::subscription_updated(const Node& node, std::size_t index) {
-  return NodeAccess::subscription_updated(node, index);
-}
-std::size_t NodeDetail::add_publisher(Node& node, std::string_view topic,
-                                      std::size_t bytes, std::size_t alignment,
-                                      const schema::Identity& schema) {
-  return NodeAccess::add_publisher(node, topic, bytes, alignment, schema);
-}
 bool NodeDetail::publisher_send(Node& node, std::size_t index, const void* data,
                                 std::size_t bytes) {
   NodeAccess::require_loop_thread(node, "Publisher::send");
@@ -993,40 +920,6 @@ bool NodeDetail::publisher_send(Node& node, std::size_t index, const void* data,
         "leave only through the devices-layer flush (RULES.md 2)");
   }
   return NodeAccess::publisher_send(node, index, data, bytes);
-}
-bool NodeDetail::byte_publisher_send(Node& node, std::size_t index,
-                                     std::span<const std::byte> message) {
-  return NodeAccess::byte_publisher_send(node, index, message);
-}
-std::size_t NodeDetail::add_state_machine(Node& node, std::int64_t initial) {
-  return NodeAccess::add_state_machine(node, initial);
-}
-std::int64_t NodeDetail::state_machine_state(const Node& node,
-                                             std::size_t index) {
-  return NodeAccess::state_machine_state(node, index);
-}
-std::int64_t NodeDetail::state_machine_previous(const Node& node,
-                                                std::size_t index) {
-  return NodeAccess::state_machine_previous(node, index);
-}
-void NodeDetail::state_machine_go(Node& node, std::size_t index,
-                                  std::int64_t next) {
-  NodeAccess::state_machine_go(node, index, next);
-}
-Duration NodeDetail::state_machine_time_in_state(const Node& node,
-                                                 std::size_t index) {
-  return NodeAccess::state_machine_time_in_state(node, index);
-}
-bool NodeDetail::state_machine_just_entered(const Node& node,
-                                            std::size_t index) {
-  return NodeAccess::state_machine_just_entered(node, index);
-}
-void* NodeDetail::find_extension(const Node& node, std::type_index type) {
-  return NodeAccess::find_extension(node, type);
-}
-void NodeDetail::add_extension(Node& node, std::type_index type,
-                               std::shared_ptr<void> object) {
-  NodeAccess::add_extension(node, type, std::move(object));
 }
 
 // --- byte topics -------------------------------------------------------------
@@ -1096,9 +989,9 @@ std::size_t NodeAccess::add_byte_publisher(Node& node, std::string_view topic,
   return impl.byte_publishers.size() - 1;
 }
 
-bool NodeAccess::byte_publisher_send(Node& node, std::size_t index,
+bool NodeDetail::byte_publisher_send(Node& node, std::size_t index,
                                      std::span<const std::byte> message) {
-  require_loop_thread(node, "BytePublisher::send");
+  NodeAccess::require_loop_thread(node, "BytePublisher::send");
   Node::Impl::BytePublisherSlot& slot = node.impl_->ByteAt(index);
   if (message.size() > slot.max_bytes || !slot.sink->write(message)) {
     slot.dropped.fetch_add(1, std::memory_order_relaxed);

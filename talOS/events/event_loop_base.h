@@ -16,6 +16,7 @@
 #include "talOS/events/dispatch_observer.h"
 #include "talOS/events/manifest.h"
 #include "talOS/events/recorder.h"
+#include "talOS/events/scheduler.h"
 #include "talOS/events/time.h"
 
 namespace talos::event {
@@ -299,6 +300,23 @@ class EventLoopBase {
     operation.sequence = static_cast<std::uint64_t>(period.count());
     operation.dropped = 0;
     recorder_.dispatch(operation, {});
+  }
+
+  // arm_timer and disarm_timer of a loop that fires timers from its own
+  // `scheduler` (the realtime and simulated loops; replay fires them from
+  // the log): the change is classified before the scheduler is touched,
+  // applied, then logged when timer_change_is_recorded says so.
+  void arm_scheduled_timer(Scheduler& scheduler, std::uint16_t id,
+                           MonotonicTime deadline, Duration period) {
+    const bool record = timer_change_is_recorded(id, true, deadline, period);
+    scheduler.schedule(id, deadline, period);
+    if (record) record_operation(EventKind::ARM_TIMER, id, deadline, period);
+  }
+
+  void disarm_scheduled_timer(Scheduler& scheduler, std::uint16_t id) {
+    const bool record = timer_change_is_recorded(id, false, {}, {});
+    scheduler.disable(id);
+    if (record) record_operation(EventKind::DISARM_TIMER, id);
   }
 
   // Classifies a timer change and returns true when it has to appear in the

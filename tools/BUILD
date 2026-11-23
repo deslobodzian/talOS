@@ -189,16 +189,25 @@ py_test(
     deps = ["@rules_python//python/runfiles"],
 )
 
+# Shared unittest sharding loader for sharded py_test targets under tools/.
+py_library(
+    name = "sharded_test_loader",
+    srcs = ["sharded_test_loader.py"],
+)
+
 # ./sim.sh --config: which file a path names, and its refusals (missing,
 # outside the repository, ambiguous, stale manifest), with a stub bazel and
-# resolver so nothing builds or starts.
+# resolver so nothing builds or starts. Sharded across 2 actions to stay well
+# under the fast lane's 5 s budget on CI.
 py_test(
     name = "sim_sh_test",
     size = "small",
     srcs = ["sim_sh_test.py"],
     data = ["//:sim.sh"],
     legacy_create_init = False,
+    shard_count = 2,
     deps = [
+        ":sharded_test_loader",
         ":sync_manifest_lib",
         "@rules_python//python/runfiles",
     ],
@@ -258,6 +267,13 @@ py_test(
     deps = [":sync_manifest_lib"],
 )
 
+# The `bazel query --keep_going` exit-3 classifier check_layers.py and
+# slow_tests.py share.
+py_library(
+    name = "bazel_query",
+    srcs = ["bazel_query.py"],
+)
+
 # python3 tools/check_layers.py (CI: the Linux job, after the build) and
 # python3 tools/check_layers.py --source-only (tools/source_lints.sh)
 # Checks the Bazel graph against ARCHITECTURE.md's layers with bazel query,
@@ -271,6 +287,7 @@ py_test(
     ],
     legacy_create_init = False,
     main = "check_layers_test.py",
+    deps = [":bazel_query"],
 )
 
 # python3 tools/lint_test_time.py (CI: the lint job)
@@ -424,6 +441,7 @@ py_test(
     ],
     legacy_create_init = False,
     main = "slow_tests_test.py",
+    deps = [":bazel_query"],
 )
 
 # tools/prepush.sh [--ref C] [--keep] [--full] [--skip-gradle] [--skip-studio]
@@ -447,7 +465,10 @@ py_test(
     legacy_create_init = False,
     shard_count = 4,
     tags = ["integration"],
-    deps = ["@rules_python//python/runfiles"],
+    deps = [
+        ":sharded_test_loader",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 # tools/check_robot_repository.sh PATH [BAZEL_FLAG...] (tools/prepush.sh,

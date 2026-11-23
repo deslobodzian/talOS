@@ -1887,51 +1887,33 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   std::optional<std::vector<naming::SourceShape>> live;
   bool live_complete = true;
   std::optional<DeliveryCounts> delivery;
+  struct RowReads {
+    std::optional<std::vector<naming::SourceShape>> published;
+    DeliveryCounts loss;
+  };
   const auto read_row = [&]() -> RowObservation {
-    if (registry == nullptr) return {};
-    for (const auto& record : registry->header()->nodes) {
-      const auto generation = record.generation.load(std::memory_order_acquire);
-      if (record.state.load(std::memory_order_acquire) !=
-          static_cast<uint64_t>(introspect::SlotState::ACTIVE))
-        continue;
-      if (record.pid != static_cast<uint64_t>(proc.pid) ||
-          record.session_id != options_.session_id)
-        continue;
-      const auto beat =
-          record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
-      // An earlier run's row whose pid this run reuses, left active by its
-      // kill until the next claim frees it: every row this run claims beats
-      // at or after its spawn (FinalDeliveryCounts reads the same way).
-      if (beat < launch.spawned_monotonic_ns) continue;
-      const auto dispatch =
-          record.dispatch_count.load(std::memory_order_relaxed);
-      const auto flags = record.flags.load(std::memory_order_acquire);
-      // Once per run, from the pass that first sees its row active
-      // with its endpoints published (CheckEndpoints).
-      std::optional<std::vector<naming::SourceShape>> published;
-      if (launch.compare_endpoints && !launch.endpoints_checked &&
-          (flags & introspect::kFlagConstructing) == 0) {
-        published = PublishedEndpoints(record, live_complete);
-      }
-      const bool loop_ready =
-          (flags & introspect::kFlagConstructing) == 0 &&
-          (introspect::RealtimeOf(flags).has_value() || dispatch > 0);
-      DeliveryCounts loss = DeliveryCountsOf(record);
-      std::atomic_thread_fence(std::memory_order_acquire);
-      if (record.generation.load(std::memory_order_relaxed) != generation ||
-          record.state.load(std::memory_order_relaxed) !=
-              static_cast<uint64_t>(introspect::SlotState::ACTIVE))
-        continue;
-      live = std::move(published);
-      delivery = std::move(loss);
-      recording = flags;
-      row_loop_started = loop_ready;
-      return {.found = true,
-              .constructing = (flags & introspect::kFlagConstructing) != 0,
-              .heartbeat = beat,
-              .dispatch = dispatch};
-    }
-    return {};
+    // FinalDeliveryCounts reads a reaped run's row by the same rule.
+    auto row = ReadRunRow(
+        registry, proc.pid, options_.session_id, launch.spawned_monotonic_ns,
+        [&](const introspect::NodeRecord& record, uint32_t flags) {
+          RowReads reads;
+          // Once per run, from the pass that first sees its row active
+          // with its endpoints published (CheckEndpoints).
+          if (launch.compare_endpoints && !launch.endpoints_checked &&
+              (flags & introspect::kFlagConstructing) == 0) {
+            reads.published = PublishedEndpoints(record, live_complete);
+          }
+          reads.loss = DeliveryCountsOf(record);
+          return reads;
+        });
+    if (!row) return {};
+    live = std::move(row->extra.published);
+    delivery = std::move(row->extra.loss);
+    recording = row->flags;
+    row_loop_started = (row->flags & introspect::kFlagConstructing) == 0 &&
+                       (introspect::RealtimeOf(row->flags).has_value() ||
+                        row->observation.dispatch > 0);
+    return row->observation;
   };
   // The clock is read around the row read, not taken from the pass's
   // start: the launcher's own stall earlier in the pass must not count

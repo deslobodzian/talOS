@@ -57,6 +57,18 @@ function ScrubTrack() {
   </svg>;
 }
 
+// The frame step duration both transports edit, in nanoseconds as typed.
+export function StepInput({stepNs, onStepNs}: {
+  stepNs: string; onStepNs: (value: string) => void;
+}) {
+  return <label>
+    Step (ns)
+    <input aria-label="Frame step duration in nanoseconds"
+           inputMode="numeric" value={stepNs}
+           onChange={e => onStepNs(e.target.value)}/>
+  </label>;
+}
+
 export function Timeline({stepNs, onStepNs, transportError, onTransportError}: {
   stepNs: string;
   onStepNs: (value: string) => void;
@@ -116,12 +128,7 @@ export function Timeline({stepNs, onStepNs, transportError, onTransportError}: {
                inputMode="numeric"/>
         <button disabled={!playback.bounds}>Seek</button>
       </form>
-      <label>
-        Step (ns)
-        <input aria-label="Frame step duration in nanoseconds"
-               inputMode="numeric" value={stepNs}
-               onChange={e => onStepNs(e.target.value)}/>
-      </label>
+      <StepInput stepNs={stepNs} onStepNs={onStepNs}/>
     </div>
     <label className="file button">
       Import log

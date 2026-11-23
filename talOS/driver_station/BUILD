@@ -9,6 +9,16 @@ cc_library(
     name = "driver_station",
     srcs = ["driver_station.cc"],
     hdrs = ["driver_station.h"],
+    deps = [":little_endian"],
+)
+
+# The bounded little-endian payload cursors this codec and the hardware
+# Command and State codecs (//talOS/hardware:codecs) derive theirs from.
+# Header only, so the RoboRIO program's GradleRIO build compiles it too.
+cc_library(
+    name = "little_endian",
+    hdrs = ["little_endian.h"],
+    visibility = ["//talOS/hardware:__pkg__"],
 )
 
 # The simulators' scripted mode and joystick schedules. Header only, so the
