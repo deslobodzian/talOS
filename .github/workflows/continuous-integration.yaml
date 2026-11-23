@@ -407,8 +407,8 @@ jobs:
   soak:
     name: Soak (Linux)
     # Pushes only, with fault-order seed 0 on topic branches and seed 1 on
-    # main, so main runs an order the branches did not. The macOS soak runs
-    # in nightly.yaml.
+    # main, so main runs an order the branches did not. Multi-seed Linux and
+    # macOS soaks (seeds 0, 1, 2) run in nightly.yaml.
     if: ${{ github.event_name == 'push' }}
     uses: ./.github/workflows/soak.yaml
     with:

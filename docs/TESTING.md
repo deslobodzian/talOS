@@ -453,8 +453,10 @@ CI policy:
   request is not required.
 - Linux carries the full per-push gate: build, suite, sanitizers, lint.
 - CI jobs select lanes by the configs above: Linux runs `//...` plain and under `--config=asan` and
-  `--config=tsan`; hosted macOS runs only the build and `--config=no_e2e`
-  on each push; macOS sanitizers and the macOS soak run nightly.
+  `--config=tsan` (including the pure-C++ full-graph simulation test
+  `//bench/main_processor/simulation:cpp_full_graph_sim_test`); hosted macOS runs
+  only the build and `--config=no_e2e` on each push; macOS sanitizers and the
+  multi-seed Linux and macOS soaks (seeds `0`, `1`, `2`) run nightly.
 - The Linux suite sets `TALOS_REQUIRE_NETNS=1` and
   `TALOS_REQUIRE_BROWSER=1`, so a test that would skip for want of a
   network namespace or a browser fails there instead.
