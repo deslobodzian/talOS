@@ -484,29 +484,56 @@ inline std::string DriveSummaryJson(
   if (summary.launch_refused) {
     head += ",\"launch_refused\":true,\"refusal_reason\":";
     const std::string suffix = ",\"nodes\":[],\"omitted\":0}";
-    std::string escaped;
-    AppendEscaped(escaped, summary.refusal_reason);
-    if (head.size() + escaped.size() + suffix.size() <= max_bytes) {
-      head += escaped;
-      head += suffix;
-      return head;
-    }
-    std::size_t len = summary.refusal_reason.size();
-    while (len > 0) {
-      --len;
-      while (len > 0 &&
-             (static_cast<unsigned char>(summary.refusal_reason[len]) & 0xC0) ==
-                 0x80) {
-        --len;
-      }
-      escaped.clear();
-      AppendEscaped(escaped,
-                    std::string(summary.refusal_reason.substr(0, len)) + "...");
+    const std::string_view reason = summary.refusal_reason;
+    // Fast path: only escape the whole reason when its unescaped length can
+    // still fit inside max_bytes (escaped length >= reason.size() + 2).
+    if (head.size() + suffix.size() + 2 <= max_bytes &&
+        reason.size() <= max_bytes - head.size() - suffix.size() - 2) {
+      std::string escaped;
+      AppendEscaped(escaped, reason);
       if (head.size() + escaped.size() + suffix.size() <= max_bytes) {
         head += escaped;
         head += suffix;
         return head;
       }
+    }
+    // Truncate at a UTF-8 code-point boundary with "..." in a single
+    // O(max_bytes) pass so a large refusal file (up to 1 MiB) cannot stall.
+    constexpr std::size_t kQuotesAndEllipsis = 5;  // '"' + "..." + '"'
+    if (head.size() + suffix.size() + kQuotesAndEllipsis <= max_bytes) {
+      const std::size_t budget =
+          max_bytes - head.size() - suffix.size() - kQuotesAndEllipsis;
+      const auto escaped_byte_len = [](unsigned char c) -> std::size_t {
+        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
+          return 2;
+        }
+        return c < 0x20 ? 6 : 1;
+      };
+      std::size_t kept = 0;
+      std::size_t used = 0;
+      while (kept < reason.size()) {
+        // Group one lead byte with up to 3 trailing UTF-8 continuation bytes
+        // (0x80..0xBF) so a valid multi-byte code point is never split.
+        std::size_t step = 1;
+        while (kept + step < reason.size() && step < 4 &&
+               (static_cast<unsigned char>(reason[kept + step]) & 0xC0) ==
+                   0x80) {
+          ++step;
+        }
+        std::size_t cost = 0;
+        for (std::size_t i = 0; i < step; ++i) {
+          cost +=
+              escaped_byte_len(static_cast<unsigned char>(reason[kept + i]));
+        }
+        if (used + cost > budget) break;
+        used += cost;
+        kept += step;
+      }
+      std::string escaped;
+      AppendEscaped(escaped, std::string(reason.substr(0, kept)) + "...");
+      head += escaped;
+      head += suffix;
+      return head;
     }
     head += "\"\"";
     head += suffix;
