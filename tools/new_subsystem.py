@@ -219,6 +219,11 @@ def string_list(labels, indent):
                    for label in buildifier_sorted(labels)) + f"{pad}]"
 
 
+def bazel_list(labels):
+    """A BUILD attribute's multi-line list value, closed at indent 4."""
+    return "[\n" + string_list(labels, 4)
+
+
 # ---------------------------------------------------------------- templates
 
 FBS = """\
@@ -370,6 +375,15 @@ class @PASCAL@ {
 
 }  // namespace @NAME@
 """
+# The first paragraph of a position node's class comment, both kinds.
+CC_POSITION_CLASS_DOC = """\
+// Drives the mechanism to the position its target asks for and reports
+// what it did on /@NAME@/state. Producers write lanes
+// /@NAME@/target/<source> with talos::TargetLane; the
+// policy comes from [robot.targets] or the subsystem's [targets].
+//
+"""
+
 CC_POSITION_HEADER = """\
 #pragma once
 
@@ -377,11 +391,7 @@ CC_POSITION_HEADER = """\
 
 namespace @NAME@ {
 
-// Drives the mechanism to the position its target asks for and reports
-// what it did on /@NAME@/state. Producers write lanes
-// /@NAME@/target/<source> with talos::TargetLane; the
-// policy comes from [robot.targets] or the subsystem's [targets].
-//
+""" + CC_POSITION_CLASS_DOC + """\
 // The control is a talos::mechanisms::PositionMechanism, configured by the
 // subsystem file: the motor [motors.@NAME@] and the
 // parameter table [@NAME@] (keys and units in the talos repository's
@@ -450,11 +460,7 @@ CC_POSITION_RAW_HEADER = """\
 
 namespace @NAME@ {
 
-// Drives the mechanism to the position its target asks for and reports
-// what it did on /@NAME@/state. Producers write lanes
-// /@NAME@/target/<source> with talos::TargetLane; the
-// policy comes from [robot.targets] or the subsystem's [targets].
-//
+""" + CC_POSITION_CLASS_DOC + """\
 // Every line of the control is here, in this file: it homes on the switch
 // @NAME@_home, then runs Motion Magic inside a fixed travel.
 // Positions count from that switch, not from where the motor powered on.
@@ -580,7 +586,9 @@ CC_SOURCE = """\
 TALOS_NODE(@NAME@::@PASCAL@)
 """
 
-CC_TEST = """\
+# Fragments of every node_test.cc (CC_TEST, CC_ESTIMATOR_TEST): its first
+# lines, its Runfile() and the end of its fixture.
+CC_TEST_HEAD = """\
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -597,16 +605,9 @@ namespace @NAME@ {
 namespace {
 
 using namespace std::chrono_literals;
-using talos::hardware::Mode;
-using talos::testing::AllocationProbe;
-using talos::testing::DriverStationGeneration;
-using talos::testing::DsPacket;
-using talos::testing::PublishTarget;
-using talos::testing::ReleaseTarget;
-using talos::testing::Sim;
-using talos::testing::SimHardware;
-namespace ds = talos::driver_station;
+"""
 
+CC_TEST_RUNFILE = """\
 std::string Runfile(const char* env) {
   std::string error;
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
@@ -619,7 +620,33 @@ std::string Runfile(const char* env) {
   }
   return runfiles->Rlocation(location);
 }
+"""
 
+CC_TEST_FIXTURE_END = """\
+  State Latest() const {
+    const auto state = sim.latest<State>(topics::kState);
+    EXPECT_TRUE(state.has_value());
+    return state.value_or(State{});
+  }
+
+  Sim sim{Runfile("TALOS_TEST_CONFIG")};
+  @PASCAL@& node = sim.add<@PASCAL@>("@NAME@");
+  SimHardware hw{sim};
+};
+"""
+
+CC_TEST = CC_TEST_HEAD + """\
+using talos::hardware::Mode;
+using talos::testing::AllocationProbe;
+using talos::testing::DriverStationGeneration;
+using talos::testing::DsPacket;
+using talos::testing::PublishTarget;
+using talos::testing::ReleaseTarget;
+using talos::testing::Sim;
+using talos::testing::SimHardware;
+namespace ds = talos::driver_station;
+
+""" + CC_TEST_RUNFILE + """
 // The node test matrix, docs/TESTING.md §7 in the talos repository: the case
 // names are the matrix's, which talos's //tools:check_node_matrix looks for.
 class @PASCAL@Test : public ::testing::Test {
@@ -649,17 +676,7 @@ class @PASCAL@Test : public ::testing::Test {
   Mode Applied() const {
     return hw.applied_motor("@NAME@", "@NAME@_motor").mode;
   }
-  State Latest() const {
-    const auto state = sim.latest<State>(topics::kState);
-    EXPECT_TRUE(state.has_value());
-    return state.value_or(State{});
-  }
-
-  Sim sim{Runfile("TALOS_TEST_CONFIG")};
-  @PASCAL@& node = sim.add<@PASCAL@>("@NAME@");
-  SimHardware hw{sim};
-};
-
+""" + CC_TEST_FIXTURE_END + """
 // REQ-SAFE-07
 TEST_F(@PASCAL@Test, DrivesAtALiveLane) {
   hw.ideal_motors();
@@ -1009,15 +1026,38 @@ TEST_F(@PASCAL@Test, ZeroWaitsForRest) {
 
 """
 
-CC_TESTDATA_ROBOT = """\
-# Local @NAME@ fixture. Device IDs are assigned by the normal parser.
-# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
-# is one device lost, as on a robot, which only the node's own feedback
-# gate stops. Losing every motor and CAN sensor is the gateway's fault.
+# Fragments of the test robots below. Every one has this [robot] table.
+TESTDATA_ROBOT_TABLE = """\
 [robot]
 name = "@NAME@_test"
 period_us = @PERIOD@
 command_timeout_us = 100000
+"""
+
+# Why a mechanism's test robot has a neighbor, and that [robot] table.
+TESTDATA_NEIGHBOR_ROBOT = """\
+# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
+""" + TESTDATA_ROBOT_TABLE
+
+# A position mechanism's test parameters, under its [<name>] table.
+TESTDATA_POSITION_PARAMETERS = """\
+tolerance_rot = 0.05
+min_rot = 0.0
+max_rot = 100.0
+homing = "limit_switch"
+limit_switch = "@NAME@_home"
+homing_v = -1.0
+homing_timeout_us = 500000
+homing_stall_rps = 0.1
+homing_stall_us = 200000
+home_margin_rot = 0.5
+"""
+
+CC_TESTDATA_ROBOT = """\
+# Local @NAME@ fixture. Device IDs are assigned by the normal parser.
+""" + TESTDATA_NEIGHBOR_ROBOT + """\
 status_hz = 200.0
 commissioned = false
 
@@ -1042,11 +1082,28 @@ bus = "rio"
 can_id = 2
 """
 
-CC_TESTDATA_SUBSYSTEM = """\
+# A subsystem file's head in the C++ test robot.
+CC_TESTDATA_SUBSYSTEM_TABLE = """\
 [subsystem]
 name = "@NAME@"
 period_us = @PERIOD@
 
+"""
+
+# A position mechanism's motor and home switch in the C++ test robot.
+CC_TESTDATA_POSITION_DEVICES = """\
+[motors.@NAME@]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+position_frame = "rezero"
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[digital_inputs.@NAME@_home]
+dio = 0
+"""
+
+CC_TESTDATA_SUBSYSTEM = CC_TESTDATA_SUBSYSTEM_TABLE + """\
 [motors.@NAME@_motor]
 type = "TalonFX"
 bus = "rio"
@@ -1054,49 +1111,12 @@ can_id = 1
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 """
 
-CC_POSITION_TESTDATA_SUBSYSTEM = """\
-[subsystem]
-name = "@NAME@"
-period_us = @PERIOD@
+CC_POSITION_TESTDATA_SUBSYSTEM = (
+    CC_TESTDATA_SUBSYSTEM_TABLE + "[@NAME@]\n" + TESTDATA_POSITION_PARAMETERS
+    + "\n" + CC_TESTDATA_POSITION_DEVICES)
 
-[@NAME@]
-tolerance_rot = 0.05
-min_rot = 0.0
-max_rot = 100.0
-homing = "limit_switch"
-limit_switch = "@NAME@_home"
-homing_v = -1.0
-homing_timeout_us = 500000
-homing_stall_rps = 0.1
-homing_stall_us = 200000
-home_margin_rot = 0.5
-
-[motors.@NAME@]
-type = "TalonFX"
-bus = "rio"
-can_id = 1
-position_frame = "rezero"
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
-
-[digital_inputs.@NAME@_home]
-dio = 0
-"""
-
-CC_POSITION_RAW_TESTDATA_SUBSYSTEM = """\
-[subsystem]
-name = "@NAME@"
-period_us = @PERIOD@
-
-[motors.@NAME@]
-type = "TalonFX"
-bus = "rio"
-can_id = 1
-position_frame = "rezero"
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
-
-[digital_inputs.@NAME@_home]
-dio = 0
-"""
+CC_POSITION_RAW_TESTDATA_SUBSYSTEM = (CC_TESTDATA_SUBSYSTEM_TABLE
+                                      + CC_TESTDATA_POSITION_DEVICES)
 
 PY_BUILD = """\
 load("@rules_python//python:defs.bzl", "py_test")
@@ -1165,13 +1185,17 @@ class @PASCAL@:
                         connected=self.motor.connected)
 '''
 
-PY_POSITION_NODE = '''\
+# The first paragraphs of a position node's docstring, both kinds.
+PY_POSITION_DOC = '''\
 """@PASCAL@: drives the mechanism to the position its target asks for.
 
 Reports what it did on /@NAME@/state. Producers write lanes
 /@NAME@/target/<source> with talos.TargetLane; the policy comes from
 [robot.targets] or the subsystem's [targets].
 
+'''
+
+PY_POSITION_NODE = PY_POSITION_DOC + '''\
 The control is a talos.mechanisms.PositionMechanism (the C++
 talos::mechanisms::PositionMechanism), configured by the subsystem file: the
 motor [motors.@NAME@] and the parameter table [@NAME@] (keys and units in
@@ -1222,13 +1246,7 @@ class @PASCAL@:
 
 # --type position --raw in Python: CC_POSITION_RAW_HEADER's control, line for
 # line.
-PY_POSITION_RAW_NODE = '''\
-"""@PASCAL@: drives the mechanism to the position its target asks for.
-
-Reports what it did on /@NAME@/state. Producers write lanes
-/@NAME@/target/<source> with talos.TargetLane; the policy comes from
-[robot.targets] or the subsystem's [targets].
-
+PY_POSITION_RAW_NODE = PY_POSITION_DOC + '''\
 Every line of the control is here, in this file: it homes on the switch
 @NAME@_home, then runs Motion Magic inside a fixed travel.
 Positions count from that switch, not from where the motor powered on. Until
@@ -1345,14 +1363,9 @@ class @PASCAL@:
                         connected=connected, at_goal=at_goal, homing=homing)
 '''
 
-PY_TEST = '''\
-"""Node tests: the class on talos.testing.Sim.
-
-@PASCAL@Test is the node test matrix, docs/TESTING.md §7 in the talos
-repository: the case names are the matrix's, which talos's
-//tools:check_node_matrix looks for.
-"""
-
+# Fragments of every node_test.py (PY_TEST, PY_ESTIMATOR_TEST): its imports
+# from `os` on, through setUp's SimHardware, and its end.
+PY_TEST_SETUP = '''\
 import os
 import unittest
 
@@ -1369,6 +1382,25 @@ class @PASCAL@Test(unittest.TestCase):
         self.sim = Sim(CONFIG)
         self.sim.add(node_py.@PASCAL@, "@NAME@")
         self.hw = SimHardware(self.sim)
+'''
+
+PY_TEST_END = '''\
+    # matrix: n/a 12 (a Python tick allocates in the interpreter)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+PY_TEST = '''\
+"""Node tests: the class on talos.testing.Sim.
+
+@PASCAL@Test is the node test matrix, docs/TESTING.md §7 in the talos
+repository: the case names are the matrix's, which talos's
+//tools:check_node_matrix looks for.
+"""
+
+''' + PY_TEST_SETUP + '''\
         self.hw.set_motor("@NAME@", "@NAME@_motor", 0.0, 12.5)
 
     def teleop(self, enabled=True):
@@ -1538,12 +1570,7 @@ class @PASCAL@Test(unittest.TestCase):
         self.sim.step(0.02)
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
 
-    # matrix: n/a 12 (a Python tick allocates in the interpreter)
-
-
-if __name__ == "__main__":
-    unittest.main()
-'''
+''' + PY_TEST_END
 
 # Replaces PY_TEST's case 9 for a position mechanism.
 PY_POSITION_PARAMETERS = '''\
@@ -1705,28 +1732,9 @@ PY_POSITION_RAW_TESTS = '''
         self.assertEqual(self.mode(), talos.Mode.MOTION_MAGIC)
 '''
 
-PY_POSITION_TESTDATA_ROBOT = """\
-# @PASCAL@ test robot: one motor homed on one switch, and a neighbor.
-# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
-# is one device lost, as on a robot, which only the node's own feedback
-# gate stops. Losing every motor and CAN sensor is the gateway's fault.
-[robot]
-name = "@NAME@_test"
-period_us = @PERIOD@
-command_timeout_us = 100000
-
-[subsystems.@NAME@.@NAME@]
-tolerance_rot = 0.05
-min_rot = 0.0
-max_rot = 100.0
-homing = "limit_switch"
-limit_switch = "@NAME@_home"
-homing_v = -1.0
-homing_timeout_us = 500000
-homing_stall_rps = 0.1
-homing_stall_us = 200000
-home_margin_rot = 0.5
-
+# The Python test robots, each in one file: a position mechanism's motor and
+# home switch, and the neighbor's motor every one ends with.
+PY_TESTDATA_POSITION_DEVICES = """\
 [subsystems.@NAME@.motors.@NAME@]
 type = "TalonFX"
 bus = "test"
@@ -1737,70 +1745,55 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 [subsystems.@NAME@.digital_inputs.@NAME@_home]
 dio = 0
 
+"""
+
+PY_TESTDATA_NEIGHBOR = """\
 [subsystems.@NEIGHBOR@.motors.wheel]
 type = "TalonFX"
 bus = "test"
 can_id = 2
 """
+
+PY_POSITION_TESTDATA_ROBOT = """\
+# @PASCAL@ test robot: one motor homed on one switch, and a neighbor.
+""" + TESTDATA_NEIGHBOR_ROBOT + "\n[subsystems.@NAME@.@NAME@]\n" + (
+    TESTDATA_POSITION_PARAMETERS + "\n" + PY_TESTDATA_POSITION_DEVICES
+    + PY_TESTDATA_NEIGHBOR)
 
 PY_POSITION_RAW_TESTDATA_ROBOT = """\
 # @PASCAL@ test robot: one motor homed on one switch, and a neighbor.
-# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
-# is one device lost, as on a robot, which only the node's own feedback
-# gate stops. Losing every motor and CAN sensor is the gateway's fault.
-[robot]
-name = "@NAME@_test"
-period_us = @PERIOD@
-command_timeout_us = 100000
-
-[subsystems.@NAME@.motors.@NAME@]
-type = "TalonFX"
-bus = "test"
-can_id = 1
-position_frame = "rezero"
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
-
-[subsystems.@NAME@.digital_inputs.@NAME@_home]
-dio = 0
-
-[subsystems.@NEIGHBOR@.motors.wheel]
-type = "TalonFX"
-bus = "test"
-can_id = 2
-"""
+""" + TESTDATA_NEIGHBOR_ROBOT + "\n" + PY_TESTDATA_POSITION_DEVICES + (
+    PY_TESTDATA_NEIGHBOR)
 
 PY_TESTDATA_ROBOT = """\
 # @PASCAL@ test robot: one motor, and a neighbor.
-# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
-# is one device lost, as on a robot, which only the node's own feedback
-# gate stops. Losing every motor and CAN sensor is the gateway's fault.
-[robot]
-name = "@NAME@_test"
-period_us = @PERIOD@
-command_timeout_us = 100000
-
+""" + TESTDATA_NEIGHBOR_ROBOT + """
 [subsystems.@NAME@.motors.@NAME@_motor]
 type = "TalonFX"
 bus = "test"
 can_id = 1
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
-[subsystems.@NEIGHBOR@.motors.wheel]
-type = "TalonFX"
-bus = "test"
-can_id = 2
-"""
+""" + PY_TESTDATA_NEIGHBOR
 
-SUBSYSTEM_TOML = """\
+# Fragments of the subsystem files below, the same in each.
+# Its first lines; the raw position file continues the last one.
+SUBSYSTEM_FILE_HEADER = """\
 # @PASCAL@ subsystem, generated by //tools:new_subsystem. Parsed via the
 # [[subsystems]] manifest in @CONFIG@
 # and merged with the other subsystem files into one canonical view before
-# validation.
+# validation."""
+
+SUBSYSTEM_TABLE = """\
 [subsystem]
 name = "@NAME@"
 node = "//@PACKAGE@:node"
 period_us = @PERIOD@
+"""
 
+# The commented teleop binding up to its `while_held` line (each file's
+# own), and the commented [targets] table after it.
+TELEOP_BINDING_COMMENT = """\
 # Zero-code robot wiring: uncomment to have the teleop node write a
 # Driver Station button on the /@NAME@/target/teleop lane, without editing any
 # C++ or Python files in other packages. Only once slot0 is tuned on the
@@ -1808,23 +1801,47 @@ period_us = @PERIOD@
 # binding goes in the simulation-only config new_subsystem's `Next:` names.
 # [[teleop.bindings]]
 # button = @BUTTON@
-# while_held = { velocity_rps = 20.0 }
+"""
 
+TARGETS_COMMENT = """\
 # Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
 # mode, highest priority first. Without this table [robot.targets] applies
 # (teleop = ["teleop"], autonomous = ["auto"]); listed modes replace it.
 # [targets]
 # teleop = ["teleop"]
 # autonomous = ["auto"]
+"""
 
-# Device names are robot-wide, so the key carries the subsystem's name.
-[motors.@NAME@_motor]
+# A motor's type, bus and placeholder CAN id.
+MOTOR_CAN_ID = """\
 type = "TalonFX"
 bus = "rio"
 # PLACEHOLDER: the lowest id the robot config does not use yet, not the
 # motor's.
 # Replace it with the physical CAN id before the robot drives this motor.
 can_id = @CAN_ID@
+"""
+
+# A position motor's table up to its supply limit.
+POSITION_MOTOR_HEAD = """\
+# Device names are robot-wide, so the motor is named after the subsystem.
+[motors.@NAME@]
+""" + MOTOR_CAN_ID + """\
+# Flip `inverted` if a positive position moves the mechanism the wrong way;
+# `brake` resists motion while no target drives it, coast lets it move freely.
+inverted = false
+brake = true
+supply_limit_a = 40.0
+"""
+
+SUBSYSTEM_TOML = (SUBSYSTEM_FILE_HEADER + "\n" + SUBSYSTEM_TABLE + "\n"
+                  + TELEOP_BINDING_COMMENT) + """\
+# while_held = { velocity_rps = 20.0 }
+
+""" + TARGETS_COMMENT + """
+# Device names are robot-wide, so the key carries the subsystem's name.
+[motors.@NAME@_motor]
+""" + MOTOR_CAN_ID + """\
 # Flip `inverted` if a positive velocity turns the mechanism the wrong way;
 # `brake` holds it at stop, coast lets it spin down freely.
 inverted = false
@@ -1840,16 +1857,8 @@ max_velocity_rps = 100.0
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 """
 
-POSITION_SUBSYSTEM_TOML = """\
-# @PASCAL@ subsystem, generated by //tools:new_subsystem. Parsed via the
-# [[subsystems]] manifest in @CONFIG@
-# and merged with the other subsystem files into one canonical view before
-# validation.
-[subsystem]
-name = "@NAME@"
-node = "//@PACKAGE@:node"
-period_us = @PERIOD@
-
+POSITION_SUBSYSTEM_TOML = (SUBSYSTEM_FILE_HEADER + "\n"
+                           + SUBSYSTEM_TABLE) + """
 # The @NAME@'s talos::mechanisms::PositionMechanism parameters (keys and
 # units: talOS/mechanisms/README.md in the talos repository).
 [@NAME@]
@@ -1880,35 +1889,10 @@ home_margin_rot = 0.5
 # consecutive ticks, so one glitched sample mid-travel does not.
 home_samples = 3
 
-# Zero-code robot wiring: uncomment to have the teleop node write a
-# Driver Station button on the /@NAME@/target/teleop lane, without editing any
-# C++ or Python files in other packages. Only once slot0 is tuned on the
-# mechanism: every config of this robot reads this file. A simulation-only
-# binding goes in the simulation-only config new_subsystem's `Next:` names.
-# [[teleop.bindings]]
-# button = @BUTTON@
+""" + TELEOP_BINDING_COMMENT + """\
 # while_held = { position_rot = 0.0 }
 
-# Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
-# mode, highest priority first. Without this table [robot.targets] applies
-# (teleop = ["teleop"], autonomous = ["auto"]); listed modes replace it.
-# [targets]
-# teleop = ["teleop"]
-# autonomous = ["auto"]
-
-# Device names are robot-wide, so the motor is named after the subsystem.
-[motors.@NAME@]
-type = "TalonFX"
-bus = "rio"
-# PLACEHOLDER: the lowest id the robot config does not use yet, not the
-# motor's.
-# Replace it with the physical CAN id before the robot drives this motor.
-can_id = @CAN_ID@
-# Flip `inverted` if a positive position moves the mechanism the wrong way;
-# `brake` resists motion while no target drives it, coast lets it move freely.
-inverted = false
-brake = true
-supply_limit_a = 40.0
+""" + TARGETS_COMMENT + "\n" + POSITION_MOTOR_HEAD + """\
 stator_limit_a = 80.0
 # homing_v may be at most half of this.
 max_voltage = 12.0
@@ -1954,47 +1938,14 @@ dio = @DIO@
 
 # --type position --raw: the travel, push and margin are constants in the
 # node's own file, so the subsystem file has no [<name>] table.
-POSITION_RAW_SUBSYSTEM_TOML = """\
-# @PASCAL@ subsystem, generated by //tools:new_subsystem. Parsed via the
-# [[subsystems]] manifest in @CONFIG@
-# and merged with the other subsystem files into one canonical view before
-# validation. The @NAME@'s travel, homing push and switch margin are
+POSITION_RAW_SUBSYSTEM_TOML = SUBSYSTEM_FILE_HEADER + """\
+ The @NAME@'s travel, homing push and switch margin are
 # constants in its node (kMaxRot, kHomingVolts, kMaxPushTicks,
 # kHomeMarginRot in C++; MAX_ROT, ... in Python), not keys here.
-[subsystem]
-name = "@NAME@"
-node = "//@PACKAGE@:node"
-period_us = @PERIOD@
-
-# Zero-code robot wiring: uncomment to have the teleop node write a
-# Driver Station button on the /@NAME@/target/teleop lane, without editing any
-# C++ or Python files in other packages. Only once slot0 is tuned on the
-# mechanism: every config of this robot reads this file. A simulation-only
-# binding goes in the simulation-only config new_subsystem's `Next:` names.
-# [[teleop.bindings]]
-# button = @BUTTON@
+""" + SUBSYSTEM_TABLE + "\n" + TELEOP_BINDING_COMMENT + """\
 # while_held = { position_rot = 0.0 }
 
-# Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
-# mode, highest priority first. Without this table [robot.targets] applies
-# (teleop = ["teleop"], autonomous = ["auto"]); listed modes replace it.
-# [targets]
-# teleop = ["teleop"]
-# autonomous = ["auto"]
-
-# Device names are robot-wide, so the motor is named after the subsystem.
-[motors.@NAME@]
-type = "TalonFX"
-bus = "rio"
-# PLACEHOLDER: the lowest id the robot config does not use yet, not the
-# motor's.
-# Replace it with the physical CAN id before the robot drives this motor.
-can_id = @CAN_ID@
-# Flip `inverted` if a positive position moves the mechanism the wrong way;
-# `brake` resists motion while no target drives it, coast lets it move freely.
-inverted = false
-brake = true
-supply_limit_a = 40.0
+""" + TARGETS_COMMENT + "\n" + POSITION_MOTOR_HEAD + """\
 # How hard any command, the homing push included, can drive the mechanism
 # into a stop. PLACEHOLDER: a provisional low value, not the motor's 80 A
 # limit; choose the real one for your mechanism.
@@ -2054,21 +2005,41 @@ module(
 bazel_dep(name = "talos", version = "0.1.0")
 @EXTRA_DEPS@"""
 
-STANDALONE_DEFAULTS_TOML = """\
-# @PASCAL@ subsystem defaults, shipped by the @@NAME@ repository.
-# The robot's own subsystem file starts as a copy of this one, with the
-# motor's physical can_id added; inversions and tuned slot0 gains go there.
-[subsystem]
-name = "@NAME@"
-node = "@@NAME@//:node"
-period_us = @PERIOD@
+# Fragments of the defaults files below: SUBSYSTEM_TABLE naming the
+# repository's node, a motor's first keys, and a position motor's last keys
+# with its home switch.
+STANDALONE_SUBSYSTEM_TABLE = SUBSYSTEM_TABLE.replace('"//@PACKAGE@:node"',
+                                                     '"@@NAME@//:node"')
 
-[motors.@NAME@_motor]
+STANDALONE_MOTOR_HEAD = """\
 type = "TalonFX"
 bus = "rio"
 inverted = false
 brake = true
 supply_limit_a = 40.0
+"""
+
+STANDALONE_POSITION_MOTOR_TAIL = """\
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+cruise_velocity_rps = 1.0
+acceleration_rps2 = 2.0
+position_frame = "rezero"
+soft_limits = false
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+# The home switch, normally open to ground; the robot's file adds its dio.
+[digital_inputs.@NAME@_home]
+"""
+
+STANDALONE_DEFAULTS_TOML = """\
+# @PASCAL@ subsystem defaults, shipped by the @@NAME@ repository.
+# The robot's own subsystem file starts as a copy of this one, with the
+# motor's physical can_id added; inversions and tuned slot0 gains go there.
+""" + STANDALONE_SUBSYSTEM_TABLE + """
+[motors.@NAME@_motor]
+""" + STANDALONE_MOTOR_HEAD + """\
 stator_limit_a = 80.0
 max_voltage = 12.0
 sensor_to_mechanism_ratio = 1.0
@@ -2086,11 +2057,7 @@ STANDALONE_POSITION_DEFAULTS_TOML = """\
 # (normally open, to ground) and has no hardware soft limits; see the node's
 # header comment and talOS/mechanisms/README.md in the talos repository for
 # the [@NAME@] keys.
-[subsystem]
-name = "@NAME@"
-node = "@@NAME@//:node"
-period_us = @PERIOD@
-
+""" + STANDALONE_SUBSYSTEM_TABLE + """
 [@NAME@]
 tolerance_rot = 0.05
 min_rot = 0.0
@@ -2105,24 +2072,8 @@ home_margin_rot = 0.5
 home_samples = 3
 
 [motors.@NAME@]
-type = "TalonFX"
-bus = "rio"
-inverted = false
-brake = true
-supply_limit_a = 40.0
-stator_limit_a = 80.0
-max_voltage = 12.0
-sensor_to_mechanism_ratio = 1.0
-max_velocity_rps = 100.0
-cruise_velocity_rps = 1.0
-acceleration_rps2 = 2.0
-position_frame = "rezero"
-soft_limits = false
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
-
-# The home switch, normally open to ground; the robot's file adds its dio.
-[digital_inputs.@NAME@_home]
-"""
+""" + STANDALONE_MOTOR_HEAD + "stator_limit_a = 80.0\n" + (
+    STANDALONE_POSITION_MOTOR_TAIL)
 
 STANDALONE_POSITION_RAW_DEFAULTS_TOML = """\
 # @PASCAL@ subsystem defaults, shipped by the @@NAME@ repository.
@@ -2133,30 +2084,10 @@ STANDALONE_POSITION_RAW_DEFAULTS_TOML = """\
 # for the mechanism. The motor requires a zero from the home switch
 # (normally open, to ground) and has no hardware soft limits; see the node's
 # header comment.
-[subsystem]
-name = "@NAME@"
-node = "@@NAME@//:node"
-period_us = @PERIOD@
-
+""" + STANDALONE_SUBSYSTEM_TABLE + """
 [motors.@NAME@]
-type = "TalonFX"
-bus = "rio"
-inverted = false
-brake = true
-supply_limit_a = 40.0
-stator_limit_a = 20.0
-max_voltage = 12.0
-sensor_to_mechanism_ratio = 1.0
-max_velocity_rps = 100.0
-cruise_velocity_rps = 1.0
-acceleration_rps2 = 2.0
-position_frame = "rezero"
-soft_limits = false
-slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
-
-# The home switch, normally open to ground; the robot's file adds its dio.
-[digital_inputs.@NAME@_home]
-"""
+""" + STANDALONE_MOTOR_HEAD + "stator_limit_a = 20.0\n" + (
+    STANDALONE_POSITION_MOTOR_TAIL)
 
 # ---------------------------------------------------- estimator archetype
 
@@ -2320,40 +2251,12 @@ class @PASCAL@ {
 }  // namespace @NAME@
 """
 
-CC_ESTIMATOR_TEST = """\
-#include <gtest/gtest.h>
-
-#include <chrono>
-#include <cstdint>
-#include <cstdlib>
-#include <limits>
-#include <memory>
-#include <stdexcept>
-#include <string>
-
-@INCLUDES@
-
-namespace @NAME@ {
-namespace {
-
-using namespace std::chrono_literals;
+CC_ESTIMATOR_TEST = CC_TEST_HEAD + """\
 using talos::testing::AllocationProbe;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
 
-std::string Runfile(const char* env) {
-  std::string error;
-  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
-      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
-                                                      &error));
-  const char* location = std::getenv(env);
-  if (!runfiles || location == nullptr) {
-    throw std::runtime_error(std::string{"runfile unavailable: "} + env + " " +
-                             error);
-  }
-  return runfiles->Rlocation(location);
-}
-
+""" + CC_TEST_RUNFILE + """
 // The node test matrix for an observer, docs/TESTING.md §7 in the talos
 // repository: the case names are the matrix's, which talos's
 // //tools:check_node_matrix looks for.
@@ -2370,16 +2273,7 @@ class @PASCAL@Test : public ::testing::Test {
         Observation{static_cast<std::uint64_t>(sim.now().nanos()),
                     geometry::Pose2d{x, y, 0.5}, std_m, std_m, 0.05, 2, valid});
   }
-  State Latest() const {
-    const auto state = sim.latest<State>(topics::kState);
-    EXPECT_TRUE(state.has_value());
-    return state.value_or(State{});
-  }
-
-  Sim sim{Runfile("TALOS_TEST_CONFIG")};
-  @PASCAL@& node = sim.add<@PASCAL@>("@NAME@");
-  SimHardware hw{sim};
-};
+""" + CC_TEST_FIXTURE_END + """\
 
 TEST_F(@PASCAL@Test, PublishesFromALiveInput) {
   sim.step(20ms);
@@ -2589,23 +2483,7 @@ the talos repository: the case names are the matrix's, which talos's
 """
 
 import math
-import os
-import unittest
-
-import talos
-@FROM_IMPORTS@
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG = os.path.join(HERE, "testdata", "robot.toml")
-node_py = talos.load(os.path.join(HERE, "@NAME@.py"))
-
-
-class @PASCAL@Test(unittest.TestCase):
-    def setUp(self):
-        self.sim = Sim(CONFIG)
-        self.sim.add(node_py.@PASCAL@, "@NAME@")
-        self.hw = SimHardware(self.sim)
-
+''' + PY_TEST_SETUP + '''
     def observe(self, camera, x, y, valid=True, std_m=0.1):
         """A camera's observation of (x, y), taken now."""
         self.sim.publish(
@@ -2690,21 +2568,12 @@ class @PASCAL@Test(unittest.TestCase):
                                             key):
                     sim.add(node_py.@PASCAL@, "@NAME@")
 
-    # matrix: n/a 12 (a Python tick allocates in the interpreter)
-
-
-if __name__ == "__main__":
-    unittest.main()
-'''
+''' + PY_TEST_END
 
 ESTIMATOR_TESTDATA_ROBOT = """\
 # @PASCAL@ test robot: the estimator and two cameras (the tests publish
 # their observations).
-[robot]
-name = "@NAME@_test"
-period_us = @PERIOD@
-command_timeout_us = 100000
-
+""" + TESTDATA_ROBOT_TABLE + """
 [subsystems.@NAME@]
 period_us = @PERIOD@
 cameras = ["front_camera", "back_camera"]
@@ -2723,10 +2592,7 @@ ESTIMATOR_SUBSYSTEM_TOML = """\
 # [[subsystems]] manifest in @CONFIG@.
 # It owns no devices. Point consumers at it with config only, e.g.
 # [studio] pose_topic = "/@NAME@/state".
-[subsystem]
-name = "@NAME@"
-node = "//@PACKAGE@:node"
-period_us = @PERIOD@
+""" + SUBSYSTEM_TABLE + """\
 # Camera nodes, each publishing geometry.PoseObservation on /<name>/state.
 cameras = []
 # The estimate is invalid once no usable observation arrived for this long.
@@ -2735,10 +2601,7 @@ observation_timeout_us = 500000
 
 STANDALONE_ESTIMATOR_DEFAULTS_TOML = """\
 # @PASCAL@ pose estimator defaults, shipped by the @@NAME@ repository.
-[subsystem]
-name = "@NAME@"
-node = "@@NAME@//:node"
-period_us = @PERIOD@
+""" + STANDALONE_SUBSYSTEM_TABLE + """\
 cameras = []
 observation_timeout_us = 500000
 """
@@ -2760,18 +2623,11 @@ def estimator_files(name, lang, talos=""):
                          "talOS/node/testing.h"]
         # The node reads no devices; only its test drives SimHardware.
         lib_deps = [":messages", f"{talos}//talOS/node"]
-        test_deps = [
-            f":{name}",
-            f"{talos}//talOS/devices:testing",
-            f"{talos}//talOS/node:allocation_probe",
-            f"{talos}//talOS/node:testing",
-            "@googletest//:gtest_main",
-            "@rules_cc//cc/runfiles",
-        ]
         build = fill(CC_BUILD, MESSAGES=messages,
-                     DATA="[\n" + string_list(["testdata/robot.toml"], 4),
-                     LIB_DEPS="[\n" + string_list(lib_deps, 4),
-                     TEST_DEPS="[\n" + string_list(test_deps, 4), **values)
+                     DATA=bazel_list(["testdata/robot.toml"]),
+                     LIB_DEPS=bazel_list(lib_deps),
+                     TEST_DEPS=bazel_list(cc_test_deps(name, talos)),
+                     **values)
         files.update({
             "BUILD": build,
             f"{name}.h": fill(CC_ESTIMATOR_HEADER,
@@ -2789,19 +2645,17 @@ def estimator_files(name, lang, talos=""):
             "geometry.PoseObservation": "PoseObservation",
             "talos.testing": "Sim, SimHardware",
         }
-        from_imports = "\n".join(
-            f"from {module} import {imports[module]}"
-            for module in sorted(imports, key=str.lower))
         test_deps = [":messages_py", f"{talos}//talOS/python:testing"]
         files.update({
             "BUILD": fill(PY_BUILD, MESSAGES=messages,
-                          DATA="[\n" + string_list(
-                              [f"{name}.py", "testdata/robot.toml"], 4),
+                          DATA=bazel_list([f"{name}.py",
+                                           "testdata/robot.toml"]),
                           NODE_DEPS='[":messages_py"]',
-                          TEST_DEPS="[\n" + string_list(test_deps, 4),
+                          TEST_DEPS=bazel_list(test_deps),
                           **values),
             f"{name}.py": fill(PY_ESTIMATOR_NODE, DOC=doc, **values),
-            "node_test.py": fill(PY_ESTIMATOR_TEST, FROM_IMPORTS=from_imports,
+            "node_test.py": fill(PY_ESTIMATOR_TEST,
+                                 FROM_IMPORTS=import_lines(imports),
                                  **values),
         })
     return files
@@ -2874,18 +2728,11 @@ def mechanism_files(name, lang, kind, raw=False, talos=""):
                     f"{talos}//talOS/node"]
         if kind == "position" and not raw:
             lib_deps.append(f"{talos}//talOS/mechanisms")
-        test_deps = [
-            f":{name}",
-            f"{talos}//talOS/devices:testing",
-            f"{talos}//talOS/node:allocation_probe",
-            f"{talos}//talOS/node:testing",
-            "@googletest//:gtest_main",
-            "@rules_cc//cc/runfiles",
-        ]
         build = fill(CC_BUILD, MESSAGES=messages,
-                     DATA="[\n" + string_list(data, 4),
-                     LIB_DEPS="[\n" + string_list(lib_deps, 4),
-                     TEST_DEPS="[\n" + string_list(test_deps, 4), **values)
+                     DATA=bazel_list(data),
+                     LIB_DEPS=bazel_list(lib_deps),
+                     TEST_DEPS=bazel_list(cc_test_deps(name, talos)),
+                     **values)
         hdr_template = CC_POSITION_HEADER if kind == "position" else CC_HEADER
         cc_test = fill(CC_TEST, INCLUDES=includes(test_includes), **values)
         testdata_subsystem = CC_TESTDATA_SUBSYSTEM
@@ -2971,7 +2818,6 @@ def mechanism_files(name, lang, kind, raw=False, talos=""):
     else:
         data = [f"{name}.py", "testdata/robot.toml"]
         pascal_name = pascal(name)
-        # isort order: by module, case-insensitively.
         imports = {
             name: "topics",
             f"{name}.{pascal_name}State": f"{pascal_name}State",
@@ -2980,22 +2826,19 @@ def mechanism_files(name, lang, kind, raw=False, talos=""):
         }
         if kind == "position":
             imports[f"{name}.{pascal_name}Homing"] = f"{pascal_name}Homing"
-        from_imports = "\n".join(
-            f"from {module} import {imports[module]}"
-            for module in sorted(imports, key=str.lower))
         py_test_deps = [":messages_py", f"{talos}//talOS/python:testing"]
         if kind == "position" and not raw:
-            py_node_deps = "[\n" + string_list(
-                [":messages_py", f"{talos}//talOS/python:mechanisms"], 4)
+            py_node_deps = bazel_list(
+                [":messages_py", f"{talos}//talOS/python:mechanisms"])
             py_test_deps.append(f"{talos}//talOS/python:mechanisms")
         else:
             py_node_deps = '[":messages_py"]'
         build = fill(PY_BUILD, MESSAGES=messages,
-                     DATA="[\n" + string_list(data, 4),
+                     DATA=bazel_list(data),
                      NODE_DEPS=py_node_deps,
-                     TEST_DEPS="[\n" + string_list(py_test_deps, 4), **values)
+                     TEST_DEPS=bazel_list(py_test_deps), **values)
         node = fill(PY_NODE, **values)
-        py_test = fill(PY_TEST, FROM_IMPORTS=from_imports, **values)
+        py_test = fill(PY_TEST, FROM_IMPORTS=import_lines(imports), **values)
         testdata_robot = PY_TESTDATA_ROBOT
         node_imports = {
             name: "topics",
@@ -3021,9 +2864,8 @@ def mechanism_files(name, lang, kind, raw=False, talos=""):
         if kind == "position" and raw:
             # The node's own homing and limits on its Motor and home switch:
             # no talos.mechanisms, no parameter table.
-            node = fill(PY_POSITION_RAW_NODE, FROM_IMPORTS="\n".join(
-                f"from {module} import {node_imports[module]}"
-                for module in sorted(node_imports, key=str.lower)), **values)
+            node = fill(PY_POSITION_RAW_NODE,
+                        FROM_IMPORTS=import_lines(node_imports), **values)
             py_test = edited(py_test, [
                 # A motor at rest on its home switch zeroes on its first
                 # tick.
@@ -3056,9 +2898,8 @@ def mechanism_files(name, lang, kind, raw=False, talos=""):
             # A thin node over talos.mechanisms.PositionMechanism, whose name
             # is both its motor and its parameter table.
             node_imports["talos.mechanisms"] = "PositionMechanism, PositionPhase"
-            node = fill(PY_POSITION_NODE, FROM_IMPORTS="\n".join(
-                f"from {module} import {node_imports[module]}"
-                for module in sorted(node_imports, key=str.lower)), **values)
+            node = fill(PY_POSITION_NODE,
+                        FROM_IMPORTS=import_lines(node_imports), **values)
             py_test = edited(py_test, [
                 (f"    # matrix: n/a 9 (the {name} reads no parameters)\n",
                  fill(PY_POSITION_PARAMETERS, **values)),
@@ -3088,49 +2929,60 @@ def edited(text, replacements):
     return text
 
 
+def cc_test_deps(name, talos):
+    """node_test's deps in a C++ package of either archetype."""
+    return [
+        f":{name}",
+        f"{talos}//talOS/devices:testing",
+        f"{talos}//talOS/node:allocation_probe",
+        f"{talos}//talOS/node:testing",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ]
+
+
+def import_lines(imports):
+    """`from <module> import <names>` per {module: names}, in isort order: by
+    module, case-insensitively."""
+    return "\n".join(f"from {module} import {imports[module]}"
+                     for module in sorted(imports, key=str.lower))
+
+
 def includes(paths):
     # clang-format's SortIncludes order within one block.
     return "\n".join(f'#include "{path}"' for path in sorted(paths))
 
 
-def used_can_ids(subsystems):
-    """Every can_id in the effective [subsystems] view: inherited through
-    `include`, layered from `defaults` files, read from custom `path`s."""
-    ids = set()
+def int_values(tree, keys):
+    """Every int under one of `keys` anywhere in `tree` (nested dicts and
+    lists)."""
+    found = set()
 
     def walk(value):
         if isinstance(value, dict):
             for key, item in value.items():
-                if key == "can_id" and isinstance(item, int):
-                    ids.add(item)
+                if key in keys and isinstance(item, int):
+                    found.add(item)
                 else:
                     walk(item)
         elif isinstance(value, list):
             for item in value:
                 walk(item)
 
-    walk(subsystems)
-    return ids
+    walk(tree)
+    return found
+
+
+def used_can_ids(subsystems):
+    """Every can_id in the effective [subsystems] view: inherited through
+    `include`, layered from `defaults` files, read from custom `path`s."""
+    return int_values(subsystems, ("can_id",))
 
 
 def used_dio_channels(subsystems):
     """Every DIO channel (dio, dio_a, dio_b) in the effective [subsystems]
     view."""
-    channels = set()
-
-    def walk(value):
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key in ("dio", "dio_a", "dio_b") and isinstance(item, int):
-                    channels.add(item)
-                else:
-                    walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
-    walk(subsystems)
-    return channels
+    return int_values(subsystems, ("dio", "dio_a", "dio_b"))
 
 
 # A binding a subsystem file keeps commented until its gains are tuned, as
@@ -3777,19 +3629,21 @@ def launcher_sim_run(talos, config, button):
     return (f"bazel run {talos}//talOS/launcher -- --config $PWD/{config} "
             f"--sim --duration-s {SIM_DURATION_S} \\\n      "
             "--start-sim-gateway --sim-gateway-arg --physics \\\n      "
-            f"--sim-gateway-arg --mode-schedule "
-            f"--sim-gateway-arg '{MODE_SCHEDULE}' \\\n      "
-            f"--sim-gateway-arg --joystick-schedule "
-            f"--sim-gateway-arg '{joystick_schedule(button)}'")
+            + gateway_schedule_args(button))
 
 
 def dependent_sim_run(button):
     """sim_run's schedules as a robot repository's `bazel run //:sim`
     (talos_sim: the launcher with --sim --start-sim-gateway) takes them."""
     return (f"bazel run //:sim -- --duration-s {SIM_DURATION_S} \\\n      "
-            f"--sim-gateway-arg --mode-schedule "
+            + gateway_schedule_args(button))
+
+
+def gateway_schedule_args(button):
+    """sim_run's schedules passed through the launcher to the simulator."""
+    return ("--sim-gateway-arg --mode-schedule "
             f"--sim-gateway-arg '{MODE_SCHEDULE}' \\\n      "
-            f"--sim-gateway-arg --joystick-schedule "
+            "--sim-gateway-arg --joystick-schedule "
             f"--sim-gateway-arg '{joystick_schedule(button)}'")
 
 
