@@ -762,5 +762,147 @@ TEST(SimulatedEventLoop,
   EXPECT_EQ(order, expected);
 }
 
+// run_until(MonotonicTime::max()) must terminate cleanly when no events are
+// pending and after draining finite scheduled events, while still dispatching
+// genuine one-shot timers and prompt publications at MonotonicTime::max().
+// REQ-RT-01
+// REQ-OPS-14
+TEST(SimulatedEventLoop,
+     RunUntilMaxTerminatesWhenIdleAndDispatchesEventsAtMax) {
+  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    SCOPED_TRACE(static_cast<int>(delivery));
+
+    // Nothing scheduled: returns cleanly without spinning or draining.
+    {
+      SimulationEnvironment environment;
+      SimulatedEventLoop<> loop{environment};
+      loop.set_delivery(delivery);
+      if (delivery == Delivery::ON_PUBLISH) {
+        loop.set_prompt(WatchSensor(loop, "/idle_prompt", Thunk{}));
+      }
+      loop.run_until(MonotonicTime::max());
+      EXPECT_EQ(loop.monotonic_now(), MonotonicTime::max());
+      EXPECT_EQ(loop.drains(), 0u);
+      EXPECT_TRUE(loop.due_prompt_topics(MonotonicTime::max()).empty());
+      loop.run_until(MonotonicTime::max());
+      EXPECT_EQ(loop.drains(), 0u);
+    }
+
+    // Finite scheduled events drain, then run_until(max()) returns cleanly.
+    {
+      SimulationEnvironment environment;
+      SimulatedEventLoop<> loop{environment};
+      loop.set_delivery(delivery);
+      std::vector<MonotonicTime> prompt_times;
+      auto on_prompt = [&](const Context& context, std::span<const std::byte>) {
+        prompt_times.push_back(context.now);
+      };
+      if (delivery == Delivery::ON_PUBLISH) {
+        loop.set_prompt(WatchSensor(loop, "/prompt", make_thunk(&on_prompt)));
+      }
+      std::vector<MonotonicTime> timer_times;
+      auto on_timer = [&](const Context& context) {
+        timer_times.push_back(context.now);
+      };
+      const auto timer_id = loop.register_timer("once", make_thunk(&on_timer));
+      const MonotonicTime origin{};
+      loop.arm_timer(timer_id, origin + 5ms, Duration::zero());
+
+      if (delivery == Delivery::ON_PUBLISH) {
+        loop.advance_until(origin + 3ms);
+        loop.inject("/prompt", Sensor{1, 0.0F, 0.0F});
+      }
+
+      loop.run_until(MonotonicTime::max());
+      ASSERT_EQ(timer_times.size(), 1u);
+      EXPECT_EQ(timer_times[0], origin + 5ms);
+      if (delivery == Delivery::ON_PUBLISH) {
+        ASSERT_EQ(prompt_times.size(), 1u);
+        EXPECT_EQ(prompt_times[0], origin + 3ms);
+      }
+      EXPECT_EQ(loop.monotonic_now(), MonotonicTime::max());
+    }
+
+    // A one-shot timer scheduled at MonotonicTime::max() fires once and then
+    // the loop exits cleanly.
+    {
+      SimulationEnvironment environment;
+      SimulatedEventLoop<> loop{environment};
+      loop.set_delivery(delivery);
+      std::vector<Context> firings;
+      auto on_timer = [&](const Context& context) {
+        firings.push_back(context);
+      };
+      const auto timer_id =
+          loop.register_timer("at_max", make_thunk(&on_timer));
+      loop.arm_timer(timer_id, MonotonicTime::max(), Duration::zero());
+
+      loop.run_until(MonotonicTime::max());
+      ASSERT_EQ(firings.size(), 1u);
+      EXPECT_EQ(firings[0].event_time, MonotonicTime::max());
+      EXPECT_EQ(firings[0].now, MonotonicTime::max());
+      EXPECT_EQ(loop.monotonic_now(), MonotonicTime::max());
+    }
+  }
+
+  // Under ON_PUBLISH with no timers armed, a prompt publication stamped at
+  // MonotonicTime::max() is delivered (and due_prompt_topics names only it, not
+  // an idle sibling prompt watcher), then run_until(max()) returns cleanly.
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<> loop{environment};
+    loop.set_delivery(Delivery::ON_PUBLISH);
+    std::vector<Context> heard;
+    auto on_prompt = [&](const Context& context, std::span<const std::byte>) {
+      heard.push_back(context);
+    };
+    loop.set_prompt(WatchSensor(loop, "/active_max", make_thunk(&on_prompt)));
+    loop.set_prompt(WatchSensor(loop, "/quiet_max", Thunk{}));
+
+    loop.advance_until(MonotonicTime::max());
+    loop.run_until(MonotonicTime::max());
+    EXPECT_TRUE(heard.empty());
+
+    loop.inject("/active_max", Sensor{42, 0.0F, 0.0F});
+    EXPECT_EQ(loop.due_prompt_topics(MonotonicTime::max()),
+              std::vector<std::string>{"/active_max"});
+
+    loop.run_until(MonotonicTime::max());
+    ASSERT_EQ(heard.size(), 1u);
+    EXPECT_EQ(heard[0].now, MonotonicTime::max());
+    EXPECT_EQ(heard[0].publish_time, MonotonicTime::max());
+    EXPECT_EQ(heard[0].event_time, MonotonicTime::max());
+    EXPECT_TRUE(loop.due_prompt_topics(MonotonicTime::max()).empty());
+  }
+
+  // A quiet sequence watcher that overflows max_messages_per_tick during a
+  // prompt wake at MonotonicTime::max() sets backlog_ with no timers armed;
+  // run_until(max()) drains the full backlog and then exits cleanly.
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<>::Options options;
+    options.delivery = Delivery::ON_PUBLISH;
+    options.max_messages_per_tick = 16;
+    SimulatedEventLoop<> loop{environment, options};
+    std::size_t quiet_count = 0;
+    auto on_quiet = [&](const Context&, std::span<const std::byte>) {
+      ++quiet_count;
+    };
+    WatchSensor(loop, "/quiet_backlog", make_thunk(&on_quiet));
+    loop.set_prompt(WatchSensor(loop, "/wake_backlog", Thunk{}));
+
+    loop.advance_until(MonotonicTime::max());
+    loop.run_until(MonotonicTime::max());
+    for (int i = 0; i < 40; ++i) {
+      loop.inject("/quiet_backlog", Sensor{i, 0.0F, 0.0F});
+    }
+    loop.inject("/wake_backlog", Sensor{0, 0.0F, 0.0F});
+
+    loop.run_until(MonotonicTime::max());
+    EXPECT_EQ(quiet_count, 40u);
+    EXPECT_EQ(loop.drains(), 3u);
+  }
+}
+
 }  // namespace
 }  // namespace talos::event

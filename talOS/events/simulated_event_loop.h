@@ -237,7 +237,8 @@ class SimulatedEventLoop
   // now.
   MonotonicTime next_deadline() const {
     if (started_ && !this->running()) return MonotonicTime::max();
-    return std::min({scheduler_.next_deadline(), next_publication(),
+    return std::min({scheduler_.next_deadline(),
+                     next_publication().value_or(MonotonicTime::max()),
                      backlog_ ? now_ : MonotonicTime::max()});
   }
 
@@ -248,15 +249,20 @@ class SimulatedEventLoop
   std::vector<std::string> due_prompt_topics(MonotonicTime at) const {
     std::vector<std::string> topics;
     for (const std::uint16_t id : prompt_watchers_) {
-      if (next_publication(id) <= at) {
+      const std::optional<MonotonicTime> published = next_publication(id);
+      if (published && *published <= at) {
         topics.push_back(this->manifest()[id].name);
       }
     }
     if (!backlog_) return topics;
     for (std::size_t id = 0; id < this->sources().size(); ++id) {
       const auto watcher = static_cast<std::uint16_t>(id);
-      if (redrains(watcher) && next_publication(watcher) <= at) {
-        topics.push_back(this->manifest()[id].name);
+      if (redrains(watcher)) {
+        const std::optional<MonotonicTime> published =
+            next_publication(watcher);
+        if (published && *published <= at) {
+          topics.push_back(this->manifest()[id].name);
+        }
       }
     }
     return topics;
@@ -322,19 +328,30 @@ class SimulatedEventLoop
     std::optional<MonotonicTime> woken_at;
     std::size_t woken_drains = 0;
     while (this->running_state()) {
-      const MonotonicTime timer = scheduler_.next_deadline();
-      const MonotonicTime deadline = std::min(
-          {timer, next_publication(), backlog_ ? now_ : MonotonicTime::max()});
-      if (deadline > end) {
+      const std::optional<MonotonicTime> timer =
+          scheduler_.empty()
+              ? std::nullopt
+              : std::optional<MonotonicTime>{scheduler_.next_deadline()};
+      const std::optional<MonotonicTime> publication = next_publication();
+      const std::optional<MonotonicTime> backlog =
+          backlog_ ? std::optional<MonotonicTime>{now_} : std::nullopt;
+      std::optional<MonotonicTime> deadline = timer;
+      if (publication && (!deadline || *publication < *deadline)) {
+        deadline = *publication;
+      }
+      if (backlog && (!deadline || *backlog < *deadline)) {
+        deadline = *backlog;
+      }
+      if (!deadline || *deadline > end) {
         break;
       }
 
-      now_ = std::max(now_, deadline);
+      now_ = std::max(now_, *deadline);
 
       // Nothing but a prompt publication is due: the realtime loop's wake. A
       // backlog the last drain left goes first, as the realtime loop drains
       // it before it waits: a drain it was not woken for.
-      if (timer > now_) {
+      if (!timer || *timer > now_) {
         if (woken_at != now_) {
           woken_at = now_;
           woken_drains = 0;
@@ -428,23 +445,26 @@ class SimulatedEventLoop
   }
 
   // Under Delivery::ON_PUBLISH, the publication time of prompt watcher
-  // `id`'s next unread message, or MonotonicTime::max() when it has none.
-  MonotonicTime next_publication(std::uint16_t id) const {
+  // `id`'s next unread message, or std::nullopt when it has none.
+  std::optional<MonotonicTime> next_publication(std::uint16_t id) const {
     const Cursor& cursor = cursors_[id];
     const SimulatedChannel& channel = *cursor.channel;
     if (cursor.sequence >= channel.next_sequence()) {
-      return MonotonicTime::max();
+      return std::nullopt;
     }
     return channel.publish_time(
         std::max(cursor.sequence, channel.oldest_sequence()));
   }
 
   // The earliest of those over every prompt watcher: when the realtime loop
-  // would next be woken.
-  MonotonicTime next_publication() const {
-    MonotonicTime earliest = MonotonicTime::max();
+  // would next be woken, or std::nullopt when none has an unread message.
+  std::optional<MonotonicTime> next_publication() const {
+    std::optional<MonotonicTime> earliest;
     for (const std::uint16_t id : prompt_watchers_) {
-      earliest = std::min(earliest, next_publication(id));
+      const std::optional<MonotonicTime> published = next_publication(id);
+      if (published && (!earliest || *published < *earliest)) {
+        earliest = *published;
+      }
     }
     return earliest;
   }
