@@ -1,11 +1,13 @@
 #pragma once
 
-// Verified FlatBuffers reflection schema loading.
+// Verified FlatBuffers reflection schema loading, and the value-size check
+// its readers share.
 //
 // Header-only so targets inside libtalos_node.so (such as
 // //talOS/introspection:names) can share it without adding a compiled object
 // to the shared-node link closure.
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -99,6 +101,35 @@ inline const reflection::Schema* VerifySchema(std::string_view bfbs) {
     }
   }
   return schema;
+}
+
+// The byte size of a struct field's value, or of an array's element: `base`
+// and `index` (an enum or struct in `schema`, or -1) as reflection::Type
+// spells them. False, leaving `size` unset, for a non-scalar base, an index
+// outside the schema's objects or enums, or an object that is not a struct
+// of positive size: the semantic checks the structural verifier leaves to
+// each reader.
+inline bool ValueSize(const reflection::Schema& schema,
+                      reflection::BaseType base, std::int32_t index,
+                      std::size_t& size) {
+  if (base == reflection::BaseType::Obj) {
+    const auto* objects = schema.objects();
+    if (objects == nullptr || index < 0 ||
+        static_cast<std::size_t>(index) >= objects->size())
+      return false;
+    const auto* object = objects->Get(index);
+    if (object == nullptr || !object->is_struct() || object->bytesize() <= 0)
+      return false;
+    size = static_cast<std::size_t>(object->bytesize());
+    return true;
+  }
+  if (base < reflection::BaseType::UType || base > reflection::BaseType::Double)
+    return false;
+  if (index >= 0 && (schema.enums() == nullptr ||
+                     static_cast<std::size_t>(index) >= schema.enums()->size()))
+    return false;
+  size = flatbuffers::GetTypeSize(base);
+  return true;
 }
 
 }  // namespace talos::schema
