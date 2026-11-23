@@ -997,12 +997,25 @@ TEST(PhoenixBackendSim, RemoteCancoderAppliesSensorToMechanismRatioOnce) {
   const std::array<hw::MotorRequest, 2> drive_6v{
       Request(1, hw::Mode::kVoltage, 6.0), Request(2, hw::Mode::kVoltage, 6.0)};
   hw::State state;
-  PumpReads(backend, state, drive_6v, 35);
-  ASSERT_TRUE(state.motors[0].valid);
-  ASSERT_TRUE(state.motors[1].valid);
-  ASSERT_TRUE(state.sensors[0].valid);
-  ASSERT_GT(state.motors[0].velocity_rps, 40.0);
-  ASSERT_GT(state.motors[0].position_rot, 1.0);
+  // Wait for rotor_ref to approach its ~50 rps 6 V terminal speed with steady
+  // fresh reads so velocity comparisons see near-zero acceleration even when
+  // host scheduling delays individual status frames.
+  int settled = 0;
+  ASSERT_TRUE(ReadUntil(backend, state,
+                        [&] {
+                          const bool ready =
+                              FeedbackFresh(state) && state.motors[0].valid &&
+                              state.motors[1].valid && state.sensors[0].valid &&
+                              state.motors[0].velocity_rps > 48.0 &&
+                              state.motors[0].position_rot > 1.0;
+                          settled = ready ? settled + 1 : 0;
+                          if (settled >= kSteadyReads) return true;
+                          backend.Apply(drive_6v);
+                          return false;
+                        }))
+      << "motors did not reach steady 6 V speed; rotor_ref vel="
+      << state.motors[0].velocity_rps
+      << " pos=" << state.motors[0].position_rot;
 
   // CANcoder sits on the sensor shaft: rotor / rotor_to_sensor_ratio.
   EXPECT_NEAR(state.sensors[0].velocity_rps,
@@ -1011,6 +1024,30 @@ TEST(PhoenixBackendSim, RemoteCancoderAppliesSensorToMechanismRatioOnce) {
   // mechanism = rotor / (rotor_to_sensor_ratio * sensor_to_mechanism_ratio).
   EXPECT_NEAR(state.motors[1].velocity_rps,
               state.motors[0].velocity_rps / kTotalRatio, 0.25);
+
+  // Brake both motors to standstill before comparing positions: Phoenix's
+  // simulator runs on the wall clock and refreshes CANcoder and remote TalonFX
+  // frames asynchronously, so a moving mechanism skews sensors[0].position_rot
+  // against motors[1].position_rot * kSensorToMechanism on a loaded host.
+  backend.Neutral();
+  int stopped = 0;
+  ASSERT_TRUE(ReadUntil(backend, state,
+                        [&] {
+                          const bool still =
+                              FeedbackFresh(state) && state.motors[0].valid &&
+                              state.motors[1].valid && state.sensors[0].valid &&
+                              std::abs(state.motors[0].velocity_rps) < 1e-3 &&
+                              std::abs(state.motors[1].velocity_rps) < 1e-3 &&
+                              std::abs(state.sensors[0].velocity_rps) < 1e-3;
+                          stopped = still ? stopped + 1 : 0;
+                          if (stopped >= kSteadyReads) return true;
+                          backend.Neutral();
+                          return false;
+                        }))
+      << "motors did not stop under brake neutral; vel=("
+      << state.motors[0].velocity_rps << ", " << state.motors[1].velocity_rps
+      << ", " << state.sensors[0].velocity_rps << ")";
+  ASSERT_GT(state.motors[0].position_rot, 1.0);
   EXPECT_NEAR(state.motors[1].position_rot,
               state.motors[0].position_rot / kTotalRatio, 0.15);
   EXPECT_NEAR(
@@ -1018,7 +1055,6 @@ TEST(PhoenixBackendSim, RemoteCancoderAppliesSensorToMechanismRatioOnce) {
                          state.motors[1].position_rot * kSensorToMechanism,
                      1.0),
       0.0, 0.05);
-  backend.Neutral();
 }
 
 // Under desktop simulation, inferred swerve or differential chassis kinematics

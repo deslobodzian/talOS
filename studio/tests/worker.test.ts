@@ -6,11 +6,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {demoPacket, demoSystemGraph} from '../src/demo';
-import {ChannelKind, concatPages, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
+import {AlertLevel, ChannelKind, concatPages, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
+import type {AlertLatch} from '../src/data/alerts';
 import {GRAPH_STALE_AFTER_MS, readingClock, sampleStale} from '../src/data/freshness';
 import type {SessionManifest} from '../src/data/manifest';
 import {TelemetryStore} from '../src/data/store';
 import type {PlaybackState, Snapshot, SystemState} from '../src/data/types';
+import {UPDATE_CAPACITY} from '../src/data/worker-stream';
 import {graphVersionMismatch, SYSTEM_GRAPH_VERSION} from '../src/system';
 
 let now = 1000;
@@ -42,19 +44,24 @@ function apply(m: Record<string, unknown>) {
     if (m.reset) frames = [];
     frames.push(...(m.frames as Snapshot[]));
     store.ingest(m.frames as Snapshot[], m.reset as boolean);
+  } else if (m.type === 'alerts') {
+    store.setAlertLatch(m.latch as AlertLatch);
   }
 }
 let exported: ArrayBuffer|null = null;
 let rpcResponse: unknown = null;
+let autoAck = true;
+let droppedUpdates = 0;
 const ctx = {
   onmessage: null as Listener,
   postMessage(message: {type: string; messages?: Record<string, unknown>[];
-                        buffer?: ArrayBuffer; response?: unknown}) {
+                        dropped?: number; buffer?: ArrayBuffer; response?: unknown}) {
     if (message.type === 'export') exported = message.buffer!;
     if (message.type === 'rpc') rpcResponse = message.response;
     if (message.type !== 'updates') return;
+    droppedUpdates = message.dropped ?? 0;
     for (const m of message.messages!) apply(m);
-    send({type: 'ack'});
+    if (autoAck) send({type: 'ack'});
   }
 };
 function send(data: object) {
@@ -404,4 +411,106 @@ test('a reconnect resets the decoder so stale delta state never leaks', () => {
   assert.equal(frames.at(-1)!.sequence_id, '1',
                'delta before reconnect dictionary/keyframe must not be accepted');
   assert.equal(playback!.stats.invalid, invalidBefore + 1);
+});
+
+// REQ-OPS-37: when a stalled main thread withholds `ack` long enough for
+// WorkerUpdateStream to drop buffered frames past UPDATE_CAPACITY, alert
+// activations (and match transitions) in the dropped frames must still appear
+// in the store's alert latch once the main thread resumes.
+test('alert activations in frames dropped by WorkerUpdateStream stay latched', () => {
+  const ALERT = 'hw/status/alert_error_link_lost';
+  const DS_ENABLED = 'hw/state/driver_station/enabled';
+  const DS_MATCH = 'hw/state/driver_station/match_number';
+  const DS_TYPE = 'hw/state/driver_station/match_type';
+  const specs = [
+    {name: ALERT, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error},
+    {name: DS_ENABLED, unit: '', kind: ChannelKind.Bool},
+    {name: DS_MATCH, unit: '', kind: ChannelKind.UInt},
+    {name: DS_TYPE, unit: '', kind: ChannelKind.UInt}
+  ];
+  const dictId = dictionaryId(specs);
+  const chassis = {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0};
+  const head = (seq: bigint, ts: bigint) => ({
+    streamId: 77n, sequenceId: seq, timestampNs: ts, dictionaryId: dictId,
+    channelCount: specs.length
+  });
+  const socket = connect();
+  // Initial dictionary + keyframe delivered and acknowledged so WorkerUpdateStream
+  // is ready, then withhold ack on the next flush to simulate a stalled UI.
+  binary(socket, concatPages([
+    ...encodeDictionaryPages(head(1n, 1_000_000n), specs),
+    ...encodeValuePages(head(1n, 1_000_000n), chassis, true,
+                        [[0, 0n], [1, 0n], [2, 1n], [3, 2n]])
+  ]));
+  advance(20);
+  assert.equal(store.alertLatch().alerts.length, 0);
+
+  autoAck = false;
+  const droppedBefore = droppedUpdates;
+  try {
+    // Frame 2 flushes into the in-flight batch (unacknowledged), locking
+    // WorkerUpdateStream so subsequent frames queue in its bounded ring.
+    binary(socket, concatPages(encodeValuePages(
+        head(2n, 2_000_000n), chassis, false, [])));
+    advance(20);
+
+    // Match 2 begins on frame 3; alert activates on frame 4 and clears on frame 5.
+    // All three will be evicted from WorkerUpdateStream when > UPDATE_CAPACITY
+    // newer frames arrive before the UI acknowledges.
+    binary(socket, concatPages(encodeValuePages(
+        head(3n, 3_000_000n), chassis, false, [[2, 2n]])));
+    binary(socket, concatPages(encodeValuePages(
+        head(4n, 4_000_000n), chassis, false, [[0, 1n]])));
+    binary(socket, concatPages(encodeValuePages(
+        head(5n, 5_000_000n), chassis, false, [[0, 0n]])));
+    advance(20);
+
+    // Flood UPDATE_CAPACITY + 20 empty delta updates with strictly increasing
+    // sequence_id and timestamp_ns. Pre-encode one template and patch its two
+    // uint64 header fields directly so pushing 30k frames stays fast.
+    const seqSentinel = 0x1122334455667788n;
+    const tsSentinel = 0x2233445566778899n;
+    const template = encodeValuePages(head(seqSentinel, tsSentinel), chassis, false, [])[0];
+    const view = new DataView(template.buffer, template.byteOffset, template.byteLength);
+    let seqOffset = -1, tsOffset = -1;
+    for (let i = 0; i <= template.byteLength - 8; i++) {
+      const v = view.getBigUint64(i, true);
+      if (v === seqSentinel) seqOffset = i;
+      if (v === tsSentinel) tsOffset = i;
+    }
+    assert.ok(seqOffset >= 0 && tsOffset >= 0, 'failed to locate header fields in template');
+    const total = UPDATE_CAPACITY + 25;
+    for (let i = 6; i <= total; i++) {
+      view.setBigUint64(seqOffset, BigInt(i), true);
+      view.setBigUint64(tsOffset, BigInt(i) * 1_000_000n, true);
+      binary(socket, template);
+      if (i % 2000 === 0) advance(12);
+    }
+    advance(20);
+  } finally {
+    autoAck = true;
+  }
+
+  // Resume UI acknowledgements and drain the worker's remaining batches.
+  send({type: 'ack'});
+  for (let i = 0; i < 20; i++) advance(4);
+
+  assert.ok(droppedUpdates > droppedBefore, 'WorkerUpdateStream must have dropped frames');
+  assert.ok(!frames.some(f => f.sequence_id === '4'),
+            'frame 4 (the alert activation) must have been dropped before reaching store.ingest');
+  const latch = store.alertLatch();
+  assert.equal(latch.matchKey, '2:2', 'match transition in dropped frames must be preserved');
+  assert.equal(latch.matchStart_ns, '3000000');
+  assert.equal(latch.alerts.length, 1, 'alert activation in dropped frames must stay latched');
+  assert.equal(latch.alerts[0].channel, ALERT);
+  assert.equal(latch.alerts[0].first_ns, '4000000');
+  assert.equal(latch.alerts[0].last_ns, '4000000');
+  assert.equal(latch.alerts[0].count, 1);
+  assert.equal(latch.alerts[0].active, false);
+
+  // Starting a new connection resets the worker's latch cleanly.
+  connect();
+  advance(8);
+  assert.equal(store.alertLatch().alerts.length, 0);
+  assert.equal(store.alertLatch().matchKey, null);
 });

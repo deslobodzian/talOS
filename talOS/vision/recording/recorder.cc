@@ -151,8 +151,8 @@ struct FrameRecorder::Impl {
   bool stop = false;
   std::thread writer;
 
-  // Rate-limit state; Record() is called from one thread (the node's live
-  // worker or its loop), so these need no synchronization.
+  // Rate-limit state (guarded by mutex; committed only when a slot is
+  // enqueued so queue-full or stop drops do not suppress later frames).
   bool sampled_seen = false;
   bool rejected_seen = false;
   std::uint64_t last_sampled_ns = 0;
@@ -270,7 +270,7 @@ struct FrameRecorder::Impl {
     }
   }
 
-  bool RateLimited(const FrameRecord& record, std::uint64_t* interval_ns) {
+  bool IsRateLimited(const FrameRecord& record) const {
     const bool rejected = record.reason == "rejected";
     const double rate = rejected ? options.rejected_hz : options.sample_hz;
     if (!std::isfinite(rate) || rate <= 0.0) {
@@ -279,22 +279,28 @@ struct FrameRecorder::Impl {
     const double raw_interval = static_cast<double>(kNsPerSecond) / rate;
     constexpr double kMaxSafeInterval =
         static_cast<double>(std::numeric_limits<std::int64_t>::max());
+    std::uint64_t interval_ns = 0;
     if (!std::isfinite(raw_interval) || raw_interval >= kMaxSafeInterval) {
-      *interval_ns = std::numeric_limits<std::uint64_t>::max();
+      interval_ns = std::numeric_limits<std::uint64_t>::max();
     } else if (raw_interval <= 0.0) {
-      *interval_ns = 0;
+      interval_ns = 0;
     } else {
-      *interval_ns = static_cast<std::uint64_t>(std::llround(raw_interval));
+      interval_ns = static_cast<std::uint64_t>(std::llround(raw_interval));
     }
-    bool& seen = rejected ? rejected_seen : sampled_seen;
-    std::uint64_t& last = rejected ? last_rejected_ns : last_sampled_ns;
-    if (seen &&
-        (record.capture_ns < last || record.capture_ns - last < *interval_ns)) {
-      return true;
+    const bool seen = rejected ? rejected_seen : sampled_seen;
+    const std::uint64_t last = rejected ? last_rejected_ns : last_sampled_ns;
+    return seen &&
+           (record.capture_ns < last || record.capture_ns - last < interval_ns);
+  }
+
+  void CommitRateLimit(const FrameRecord& record) {
+    if (record.reason == "rejected") {
+      last_rejected_ns = record.capture_ns;
+      rejected_seen = true;
+    } else {
+      last_sampled_ns = record.capture_ns;
+      sampled_seen = true;
     }
-    last = record.capture_ns;
-    seen = true;
-    return false;
   }
 
   void WriterLoop() {
@@ -429,19 +435,12 @@ FrameRecorder::~FrameRecorder() {
 }
 
 bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
-  {
-    std::lock_guard lock(impl_->mutex);
-    if (impl_->stop || !frame.holds_image() || frame.data() == nullptr ||
-        frame.width() !=
-            static_cast<std::uint32_t>(impl_->options.context.width) ||
-        frame.height() !=
-            static_cast<std::uint32_t>(impl_->options.context.height)) {
-      ++impl_->dropped_count;
-      return false;
-    }
-  }
-  std::uint64_t interval_ns = 0;
-  if (impl_->RateLimited(record, &interval_ns)) {
+  if (!frame.holds_image() || frame.data() == nullptr ||
+      frame.width() !=
+          static_cast<std::uint32_t>(impl_->options.context.width) ||
+      frame.height() !=
+          static_cast<std::uint32_t>(impl_->options.context.height)) {
+    ++impl_->dropped_count;
     return false;
   }
 
@@ -450,6 +449,9 @@ bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
     std::lock_guard lock(impl_->mutex);
     if (impl_->stop) {
       ++impl_->dropped_count;
+      return false;
+    }
+    if (impl_->IsRateLimited(record)) {
       return false;
     }
     if (impl_->count == impl_->slots.size()) {
@@ -476,6 +478,7 @@ bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
     impl_->write_index = (impl_->write_index + 1) % impl_->slots.size();
     ++impl_->count;
     ++impl_->recorded_count;
+    impl_->CommitRateLimit(record);
   }
   impl_->cv.notify_one();
   return true;

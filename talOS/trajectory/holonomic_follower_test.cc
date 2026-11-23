@@ -455,6 +455,140 @@ TEST(HolonomicFollowerTest, HugeFiniteErrorAndDtClampWithoutNaN) {
   }
 }
 
+// Guards: an overflowing derivative (from error - previous_error, division by
+// dt_s, kd * derivative, or an overflowing position error) never latches
+// non-finite state into Axis across a subsequent dt_s < kMinDerivativePeriod_s
+// tick, and stays deterministic and finite.
+// REQ-DEV-15
+TEST(HolonomicFollowerTest, DerivativeOverflowDoesNotLatchAcrossZeroDt) {
+  const Trajectory trajectory = AtOrigin();
+
+  // Case 1: error - previous_error overflows to -inf with kd > 0; a following
+  // dt_s == 0 tick at zero error must not stay saturated at -max_linear_mps.
+  {
+    FollowerConfig config;
+    config.translation = {.kp = 2.0, .kd = 0.5};
+    config.max_linear_mps = 1.5;
+    config.max_angular_radps = 2.0;
+    HolonomicFollower a(config);
+    HolonomicFollower b(config);
+
+    const auto run_seq = [&](HolonomicFollower& f) {
+      const FollowerOutput s1 = f.step(trajectory, 0.0, MakePose(-1e308, 0, 0),
+                                       0.02, SpeedsFrame::kField);
+      EXPECT_TRUE(s1.valid);
+      EXPECT_NEAR(s1.speeds.vx_mps, 1.5, 1e-12);
+
+      const FollowerOutput s2 = f.step(trajectory, 0.02, MakePose(1e308, 0, 0),
+                                       0.02, SpeedsFrame::kField);
+      EXPECT_TRUE(s2.valid);
+      EXPECT_NEAR(s2.speeds.vx_mps, -1.5, 1e-12);
+
+      const FollowerOutput s3 =
+          f.step(trajectory, 0.02, MakePose(0, 0, 0), 0.0, SpeedsFrame::kField);
+      EXPECT_TRUE(s3.valid);
+      EXPECT_TRUE(std::isfinite(s3.speeds.vx_mps));
+      EXPECT_NEAR(s3.speeds.vx_mps, 0.0, 1e-12);
+      EXPECT_NEAR(s3.speeds.vy_mps, 0.0, 1e-12);
+
+      const FollowerOutput s4 = f.step(trajectory, 0.0201, MakePose(0, 0, 0),
+                                       1e-4, SpeedsFrame::kField);
+      EXPECT_TRUE(s4.valid);
+      EXPECT_NEAR(s4.speeds.vx_mps, 0.0, 1e-12);
+      return s3;
+    };
+    const FollowerOutput oa = run_seq(a);
+    const FollowerOutput ob = run_seq(b);
+    EXPECT_EQ(oa.speeds.vx_mps, ob.speeds.vx_mps);
+    EXPECT_EQ(oa.speeds.vy_mps, ob.speeds.vy_mps);
+    EXPECT_EQ(oa.speeds.omega_radps, ob.speeds.omega_radps);
+  }
+
+  // Case 2: finite error delta divided by kMinDerivativePeriod_s overflows to
+  // +inf; subsequent dt_s == 0 tick at zero error must output zero, not +1.5.
+  {
+    FollowerConfig config;
+    config.translation = {.kp = 0.0, .kd = 0.5};
+    config.max_linear_mps = 1.5;
+    HolonomicFollower follower(config);
+
+    ASSERT_TRUE(
+        follower
+            .step(trajectory, 0.0, MakePose(0, 0, 0), 0.02, SpeedsFrame::kField)
+            .valid);
+    const FollowerOutput overflow = follower.step(
+        trajectory, 0.001, MakePose(-1e307, 0, 0),
+        HolonomicFollower::kMinDerivativePeriod_s, SpeedsFrame::kField);
+    ASSERT_TRUE(overflow.valid);
+    EXPECT_TRUE(std::isfinite(overflow.speeds.vx_mps));
+
+    const FollowerOutput zero_dt = follower.step(
+        trajectory, 0.001, MakePose(0, 0, 0), 0.0, SpeedsFrame::kField);
+    ASSERT_TRUE(zero_dt.valid);
+    EXPECT_NEAR(zero_dt.speeds.vx_mps, 0.0, 1e-12);
+    EXPECT_NEAR(zero_dt.speeds.vy_mps, 0.0, 1e-12);
+  }
+
+  // Case 3: finite derivative whose kd * derivative product overflows to +inf
+  // must neither saturate a following dt_s == 0 tick at zero error nor cancel
+  // an opposite-sign p_term into NaN.
+  {
+    FollowerConfig config;
+    config.translation = {.kp = 200.0, .kd = 100.0};
+    config.max_linear_mps = 1.5;
+    HolonomicFollower follower(config);
+
+    ASSERT_TRUE(
+        follower
+            .step(trajectory, 0.0, MakePose(0, 0, 0), 0.01, SpeedsFrame::kField)
+            .valid);
+    const FollowerOutput spike = follower.step(
+        trajectory, 0.01, MakePose(-1e306, 0, 0), 0.01, SpeedsFrame::kField);
+    ASSERT_TRUE(spike.valid);
+    EXPECT_NEAR(spike.speeds.vx_mps, 1.5, 1e-12);
+
+    const FollowerOutput zero_dt = follower.step(
+        trajectory, 0.01, MakePose(0, 0, 0), 0.0, SpeedsFrame::kField);
+    ASSERT_TRUE(zero_dt.valid);
+    EXPECT_NEAR(zero_dt.speeds.vx_mps, 0.0, 1e-12);
+
+    const FollowerOutput opposite = follower.step(
+        trajectory, 0.01, MakePose(1e307, 0, 0), 0.0, SpeedsFrame::kField);
+    ASSERT_TRUE(opposite.valid);
+    EXPECT_NEAR(opposite.speeds.vx_mps, -1.5, 1e-12);
+  }
+
+  // Case 4: reference.x_m - measured_x_m overflowing to +inf must not latch
+  // non-finite previous_error into subsequent ticks.
+  {
+    std::vector<TrajectorySample> samples(2);
+    samples[0].x_m = 1e308;
+    samples[1].x_m = 1e308;
+    samples[1].t_s = 1.0;
+    const Trajectory far_trajectory{samples};
+
+    FollowerConfig config;
+    config.translation = {.kp = 2.0, .kd = 0.5};
+    config.max_linear_mps = 1.5;
+    HolonomicFollower follower(config);
+
+    const FollowerOutput s1 = follower.step(
+        far_trajectory, 0.0, MakePose(-1e308, 0, 0), 0.02, SpeedsFrame::kField);
+    ASSERT_TRUE(s1.valid);
+    EXPECT_NEAR(s1.speeds.vx_mps, 1.5, 1e-12);
+
+    const FollowerOutput s2 = follower.step(
+        far_trajectory, 0.0, MakePose(1e308, 0, 0), 0.0, SpeedsFrame::kField);
+    ASSERT_TRUE(s2.valid);
+    EXPECT_NEAR(s2.speeds.vx_mps, 0.0, 1e-12);
+
+    const FollowerOutput s3 = follower.step(
+        far_trajectory, 0.02, MakePose(1e308, 0, 0), 0.02, SpeedsFrame::kField);
+    ASSERT_TRUE(s3.valid);
+    EXPECT_NEAR(s3.speeds.vx_mps, 0.0, 1e-12);
+  }
+}
+
 // Guards: bad configuration is refused at construction, naming the field.
 TEST(HolonomicFollowerTest, RejectsBadConfig) {
   FollowerConfig negative_gain;

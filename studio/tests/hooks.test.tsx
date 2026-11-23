@@ -315,3 +315,34 @@ test('createWorkerStudio acknowledges via timer when document is hidden and rAF 
     else delete (globalThis as Record<string, unknown>).document;
   }
 });
+
+// REQ-OPS-37: createWorkerStudio installs worker-computed alert latches into
+// TelemetryStore with stable references across non-alert batches, and resets
+// them cleanly when a new session's reset frames arrive.
+test('createWorkerStudio applies worker alert latches and resets them on reset frames', () => {
+  const w = workerStudio();
+  const latch = {
+    matchStart_ns: '3000000',
+    matchKey: '2:2',
+    alerts: [{
+      channel: 'hw/status/alert_error_link_lost',
+      level: 3,
+      owner: 'hw',
+      text: 'link lost',
+      first_ns: '4000000',
+      last_ns: '4000000',
+      count: 1,
+      active: false
+    }]
+  };
+  w.deliver({type: 'frames', reset: false, frames: [snap(50, '50000000', {fast: 1})]},
+            {type: 'alerts', latch});
+  assert.strictEqual(w.studio.source.alertLatch(), latch);
+  // Subsequent frame batches without a new alerts message preserve the latch reference.
+  w.deliver({type: 'frames', reset: false, frames: [snap(51, '51000000', {fast: 2})]});
+  assert.strictEqual(w.studio.source.alertLatch(), latch);
+  // A reset clears the prior worker latch.
+  w.deliver({type: 'frames', reset: true, frames: []});
+  assert.deepEqual(w.studio.source.alertLatch()?.alerts, []);
+  w.crash();
+});

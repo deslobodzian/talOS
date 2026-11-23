@@ -74,9 +74,11 @@ An alert channel is one the telemetry dictionary marks with a level
 at the cursor by level, then name, each tagged with its level as a word and a
 glyph, and below them every alert raised since the current match began, with
 when it was first raised and how many times. A channel with no reading is
-neither active nor clear. The store feeds every frame to the latch, so it
-spans more than the retained history and holds as of the newest frame; a new
-connection, demo or import clears it. When a match begins, and what the model
+neither active nor clear. The telemetry worker feeds every ordered frame to
+`AlertTracker` ahead of `WorkerUpdateStream` and posts the resulting latch to
+the store, so it spans more than the retained history, survives UI stalls that
+drop buffered frames, and holds as of the newest frame; a new connection, demo
+or import clears it. When a match begins, and what the model
 guarantees for a short activation, is in
 [`src/data/alerts.ts`](src/data/alerts.ts). The demo cycles through numbered
 matches with one alert of each level.
