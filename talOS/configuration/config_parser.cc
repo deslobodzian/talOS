@@ -11,6 +11,7 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -19,6 +20,8 @@
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -190,14 +193,27 @@ std::vector<std::pair<std::string, std::string>> ReadTrajectories(
   return out;
 }
 
+// Checks that `path` has no embedded NUL byte and names an existing regular
+// file (avoiding std::filesystem::filesystem_error on ELOOP/ENAMETOOLONG).
+void RequireRegularFile(const std::string& context, const std::string& path) {
+  if (path.find('\0') != std::string::npos) {
+    throw std::invalid_argument(context + ": invalid path containing NUL byte");
+  }
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(path, ec)) {
+    std::string message = context + ": no such file '" + path + "'";
+    if (ec) {
+      message += " (" + ec.message() + ")";
+    }
+    throw std::invalid_argument(std::move(message));
+  }
+}
+
 // A [trajectories] file must exist; the error names where it was set, the
 // key and the path as resolved.
 void RequireTrajectoryFile(const std::string& where, const std::string& name,
                            const std::string& path) {
-  if (!std::filesystem::is_regular_file(path)) {
-    throw std::invalid_argument(where + ": trajectories." + name +
-                                ": no such file '" + path + "'");
-  }
+  RequireRegularFile(where + ": trajectories." + name, path);
 }
 
 // Where each [trajectories] entry (by name) was set, for the errors of the
@@ -267,10 +283,7 @@ std::string RebaseStudioDashboard(toml::table& document,
 // The dashboard layout file must exist; the error names where it was set,
 // the key and the path as resolved.
 void RequireStudioDashboard(const std::string& where, const std::string& path) {
-  if (!std::filesystem::is_regular_file(path)) {
-    throw std::invalid_argument(where + ": [studio] dashboard: no such file '" +
-                                path + "'");
-  }
+  RequireRegularFile(where + ": [studio] dashboard", path);
 }
 
 // [trajectories] belongs at a subsystem file's top level. Under its
@@ -303,11 +316,16 @@ void RebaseSubsystemTablesTrajectories(
   }
 }
 
-void MergeTables(toml::table& base, const toml::table& over) {
+constexpr int kMaxMergeDepth = 512;
+
+void MergeTables(toml::table& base, const toml::table& over, int depth = 0) {
+  if (depth > kMaxMergeDepth) {
+    throw std::invalid_argument("configuration table nesting exceeds limit");
+  }
   for (auto&& [k, v] : over) {
     if (const auto* over_sub = v.as_table()) {
       if (auto* base_sub = base[k.str()].as_table()) {
-        MergeTables(*base_sub, *over_sub);
+        MergeTables(*base_sub, *over_sub, depth + 1);
         continue;
       }
     }
@@ -1062,7 +1080,15 @@ std::filesystem::path RobotConfig::TrajectoryPath(std::string_view subsystem,
   const auto sub = trajectories.find(subsystem);
   if (sub != trajectories.end()) {
     if (const auto it = sub->second.find(name); it != sub->second.end()) {
-      return std::filesystem::absolute(it->second).lexically_normal();
+      std::error_code ec;
+      const auto abs = std::filesystem::absolute(it->second, ec);
+      if (ec) {
+        throw std::invalid_argument("[subsystems." + std::string(subsystem) +
+                                    "] trajectories." + std::string(name) +
+                                    ": invalid path '" + it->second + "' (" +
+                                    ec.message() + ")");
+      }
+      return abs.lexically_normal();
     }
   }
   std::string declared;
@@ -1080,6 +1106,14 @@ std::filesystem::path RobotConfig::TrajectoryPath(std::string_view subsystem,
 namespace detail {
 
 toml::table ParseTomlFile(const std::string& path) {
+  if (path.find('\0') != std::string::npos) {
+    throw std::invalid_argument("cannot open file: invalid path with NUL byte");
+  }
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) {
+    throw std::invalid_argument("cannot open file: " + path +
+                                " (is a directory)");
+  }
   std::ifstream f(path);
   if (!f.is_open()) {
     throw std::invalid_argument("cannot open file: " + path);
@@ -1386,12 +1420,18 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
   }
 
   // Deterministic logical ids: sort by (subsystem, device), number from 1.
+  if (raw_devices.size() > std::numeric_limits<uint16_t>::max()) {
+    throw std::invalid_argument("invalid hardware device count");
+  }
   std::sort(raw_devices.begin(), raw_devices.end(),
             [](const RawDevice& a, const RawDevice& b) {
               if (a.subsystem != b.subsystem) return a.subsystem < b.subsystem;
               return a.name < b.name;
             });
   uint16_t next_id = 1;
+  std::unordered_map<std::string_view, const RawDevice*> by_name;
+  std::unordered_map<std::string_view, const RawDevice*> motors_by_name;
+  by_name.reserve(raw_devices.size());
   for (auto& dev : raw_devices) {
     std::visit(
         [&](auto& c) {
@@ -1399,13 +1439,15 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
           c.name = dev.name;
         },
         dev.config);
+    by_name.try_emplace(dev.name, &dev);
+    if (std::holds_alternative<hardware::MotorConfig>(dev.config)) {
+      motors_by_name.try_emplace(dev.name, &dev);
+    }
   }
 
   auto find = [&](const std::string& name) -> const RawDevice* {
-    for (const auto& d : raw_devices) {
-      if (d.name == name) return &d;
-    }
-    return nullptr;
+    const auto it = by_name.find(name);
+    return it == by_name.end() ? nullptr : it->second;
   };
   auto require_same_subsystem = [](const RawDevice& target,
                                    const std::string& subsystem,
@@ -1521,7 +1563,7 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
         throw std::invalid_argument(
             "[simulation] field 'swerve_modules' must be an array of tables");
       }
-      std::vector<std::string> seen_motors;
+      std::unordered_set<std::string> seen_motors;
       s.swerve_modules.reserve(modules->size());
       for (std::size_t i = 0; i < modules->size(); ++i) {
         const std::string entry_where =
@@ -1568,22 +1610,15 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
               mod.drive + "'");
         }
         auto check_motor = [&](const char* role, const std::string& name) {
-          const bool is_motor = std::any_of(
-              raw_devices.begin(), raw_devices.end(), [&](const RawDevice& d) {
-                return d.name == name &&
-                       std::holds_alternative<hardware::MotorConfig>(d.config);
-              });
-          if (!is_motor) {
+          if (!motors_by_name.contains(name)) {
             throw std::invalid_argument(entry_where + ": " + role + " '" +
                                         name + "' names no configured motor");
           }
-          if (std::find(seen_motors.begin(), seen_motors.end(), name) !=
-              seen_motors.end()) {
+          if (!seen_motors.insert(name).second) {
             throw std::invalid_argument(
                 entry_where + ": motor '" + name +
                 "' is already used by another swerve module");
           }
-          seen_motors.push_back(name);
         };
         check_motor("drive", mod.drive);
         check_motor("steer", mod.steer);
@@ -1596,7 +1631,7 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
         throw std::invalid_argument(
             "[simulation] field 'hard_stops' must be an array of tables");
       }
-      std::vector<std::string> seen_motors;
+      std::unordered_set<std::string> seen_motors;
       s.hard_stops.reserve(stops->size());
       for (std::size_t i = 0; i < stops->size(); ++i) {
         const std::string entry_where =
@@ -1643,30 +1678,25 @@ RobotConfig ParseRobotConfigTable(toml::table tbl, bool validate_hardware) {
           throw std::invalid_argument(
               entry_where + ": 'min_rot' must be less than 'max_rot'");
         }
-        const auto motor_it = std::find_if(
-            raw_devices.begin(), raw_devices.end(), [&](const RawDevice& d) {
-              return d.name == stop.motor &&
-                     std::holds_alternative<hardware::MotorConfig>(d.config);
-            });
-        if (motor_it == raw_devices.end()) {
+        const auto motor_it = motors_by_name.find(stop.motor);
+        if (motor_it == motors_by_name.end()) {
           throw std::invalid_argument(entry_where + ": motor '" + stop.motor +
                                       "' names no configured motor");
         }
+        const auto* motor_raw = motor_it->second;
         const auto& motor_cfg =
-            std::get<hardware::MotorConfig>(motor_it->config);
+            std::get<hardware::MotorConfig>(motor_raw->config);
         if (motor_cfg.master_id != 0) {
           throw std::invalid_argument(
               entry_where + ": motor '" + stop.motor + "' follows '" +
-              motor_it->follow_motor +
+              motor_raw->follow_motor +
               "'; configure the hard stop on its master instead");
         }
-        if (std::find(seen_motors.begin(), seen_motors.end(), stop.motor) !=
-            seen_motors.end()) {
+        if (!seen_motors.insert(stop.motor).second) {
           throw std::invalid_argument(entry_where +
                                       ": duplicate hard stop for motor '" +
                                       stop.motor + "'");
         }
-        seen_motors.push_back(stop.motor);
         s.hard_stops.push_back(std::move(stop));
       }
     }
