@@ -36,6 +36,8 @@ constexpr std::size_t kCommandBytes = 414;
 constexpr std::uint64_t kCommandHash = 0xa05ceda133052918;
 constexpr std::size_t kConfigBytes = 10227;
 constexpr std::uint64_t kConfigHash = 0x181304adda19ad10;
+constexpr std::size_t kConfigAckBytes = 73;
+constexpr std::uint64_t kConfigAckHash = 0x5bb2a6a1ba54817a;
 
 std::uint64_t Fnv1a64(std::span<const std::uint8_t> bytes) {
   std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -295,6 +297,27 @@ TEST(WireGolden, ConfigBytesBelongToTheirProtocolVersion) {
       << "the config encoding changed: bump kProtocolVersion and regenerate "
          "this constant (now "
       << config.size() << " bytes, hash " << Hex(config_hash) << ")";
+}
+
+// Guards: the ConfigAck bytes of protocol kGoldenVersion. A failure here is a
+// wire change: bump kProtocolVersion (docs/DATA_FLOW.md) and regenerate the
+// constants above.
+// REQ-OPS-51, REQ-CONTRACT-02
+TEST(WireGolden, ConfigAckBytesBelongToTheirProtocolVersion) {
+  ASSERT_EQ(protocol::kProtocolVersion, kGoldenVersion);
+  ConfigAckPayload ack{};
+  ack.config_id = 0x0102030405060708ull;
+  ack.status = ConfigAckStatus::kCeilingExceeded;
+  for (std::size_t i = 0; i < sizeof(ack.reason); ++i) {
+    ack.reason[i] = static_cast<char>('A' + (i % 26));
+  }
+  std::array<std::uint8_t, sizeof(ConfigAckPayload)> bytes{};
+  const std::size_t size = EncodeConfigAck(ack, bytes);
+  const std::uint64_t hash = Fnv1a64(std::span{bytes}.first(size));
+  EXPECT_TRUE(size == kConfigAckBytes && hash == kConfigAckHash)
+      << "the ConfigAck encoding changed: bump kProtocolVersion and regenerate "
+         "this constant (now "
+      << size << " bytes, hash " << Hex(hash) << ")";
 }
 
 }  // namespace
