@@ -12,6 +12,7 @@
 #include <cstring>
 #include <format>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -261,4 +262,57 @@ TEST(SharedMemory, MappingsKeptResidentTakeNoFaultOnFirstWrite) {
   for (const char* suffix : {"_control", "_before", "_after"}) {
     shm_unlink(ShmObjectName(base + suffix).c_str());
   }
+}
+
+// MakeResident must stay strictly within [address, address + size) and use
+// 1-byte atomic operations so unaligned or sub-8-byte buffers never fault past
+// their end or trigger misaligned 8-byte atomic UB.
+// REQ-RT-09
+TEST(SharedMemory, MakeResidentHandlesUnalignedSmallBuffersWithinBounds) {
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  ASSERT_GT(page, 8u);
+
+  // Place a 3-byte unaligned buffer at the very end of a writable page right
+  // before a PROT_NONE guard page: an 8-byte RMW crosses into the guard page
+  // and crashes immediately.
+  void* raw = ::mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(raw, MAP_FAILED);
+  auto* base = static_cast<unsigned char*>(raw);
+  ASSERT_EQ(::mprotect(base + page, page, PROT_NONE), 0);
+
+  unsigned char* tail = base + page - 3;
+  tail[0] = 0x11;
+  tail[1] = 0x22;
+  tail[2] = 0x33;
+
+  const int guard_err = talos::memory::MakeResident(tail, 3);
+  EXPECT_TRUE(guard_err == 0 || guard_err == ENOMEM || guard_err == EPERM)
+      << "unexpected errno " << guard_err;
+  EXPECT_EQ(tail[0], 0x11);
+  EXPECT_EQ(tail[1], 0x22);
+  EXPECT_EQ(tail[2], 0x33);
+
+  ASSERT_EQ(::munmap(raw, 2 * page), 0);
+
+  // Also cover an unaligned 3-byte stack buffer and 3-byte heap buffer.
+  alignas(8) unsigned char stack_buf[4] = {0xaa, 0x44, 0x55, 0x66};
+  const int stack_err = talos::memory::MakeResident(stack_buf + 1, 3);
+  EXPECT_TRUE(stack_err == 0 || stack_err == ENOMEM || stack_err == EPERM)
+      << "unexpected errno " << stack_err;
+  EXPECT_EQ(stack_buf[0], 0xaa);
+  EXPECT_EQ(stack_buf[1], 0x44);
+  EXPECT_EQ(stack_buf[2], 0x55);
+  EXPECT_EQ(stack_buf[3], 0x66);
+
+  auto heap_buf = std::make_unique<unsigned char[]>(3);
+  heap_buf[0] = 0x77;
+  heap_buf[1] = 0x88;
+  heap_buf[2] = 0x99;
+  const int heap_err = talos::memory::MakeResident(heap_buf.get(), 3);
+  EXPECT_TRUE(heap_err == 0 || heap_err == ENOMEM || heap_err == EPERM)
+      << "unexpected errno " << heap_err;
+  EXPECT_EQ(heap_buf[0], 0x77);
+  EXPECT_EQ(heap_buf[1], 0x88);
+  EXPECT_EQ(heap_buf[2], 0x99);
 }

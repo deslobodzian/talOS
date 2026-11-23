@@ -3779,5 +3779,106 @@ TEST(InputReplay, TailOnlyDamageWarnsOnStderrNamingLogAndTailBytes) {
   std::filesystem::remove_all(out);
 }
 
+// Extreme GAP timestamps: a GAP starting at INT64_MIN must saturate end to
+// MonotonicTime::min() without signed int64 underflow (feeding zero messages),
+// and a GAP starting at INT64_MAX must still be recorded as first_gap rather
+// than silently dropped by value_or(MonotonicTime::max()).
+// REQ-OPS-14
+TEST(InputReplay, ExtremeGapTimestampsStopAtInt64MinAndDetectInt64Max) {
+  const auto append_gap = [](const std::string& path, std::int64_t start_ns,
+                             std::int64_t now_ns) {
+    log::RecordHeader header{};
+    header.kind = static_cast<std::uint16_t>(EventKind::GAP);
+    header.source_id = log::GAP_SOURCE_ID;
+    header.dispatch_index = 1;
+    header.event_time_ns = start_ns;
+    header.now_ns = now_ns;
+    log::GapRecord detail{};
+    detail.cause = static_cast<std::uint16_t>(log::GapCause::POOL_FULL);
+    detail.first_lost_ns = start_ns;
+    detail.last_lost_ns = start_ns;
+    detail.last_dispatch_index = 1;
+    detail.records = 1;
+    detail.bytes = sizeof(log::RecordHeader);
+    const auto stored = log::SealRecord(
+        header,
+        std::span<const std::byte>{reinterpret_cast<const std::byte*>(&detail),
+                                   sizeof(detail)});
+    std::ofstream out{path, std::ios::binary | std::ios::app};
+    ASSERT_TRUE(out.is_open());
+    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    out.write(reinterpret_cast<const char*>(stored.data()),
+              static_cast<std::streamsize>(stored.size()));
+    ASSERT_TRUE(out.good());
+  };
+
+  {
+    SCOPED_TRACE("GAP timestamp at INT64_MIN");
+    const std::string dir = TempDir("gap_int64_min");
+    const std::string out = TempDir("gap_int64_min_out");
+    WriterLog(dir);
+    const std::string wpath = dir + "/writer.tlog";
+    append_gap(wpath, std::numeric_limits<std::int64_t>::min(),
+               (kOrigin + 6ms).nanos());
+
+    const RecordedSession session{dir};
+    const RecordedTopic* sensor = session.find(kTopics.sensor);
+    ASSERT_NE(sensor, nullptr);
+    ASSERT_TRUE(sensor->first_gap.has_value());
+    EXPECT_EQ(*sensor->first_gap, MonotonicTime::min());
+
+    const WatcherRun run = ReplayWatcher(session, out);
+    ASSERT_TRUE(run.report.stopped_at_gap.has_value());
+    EXPECT_EQ(run.report.stopped_at_gap->at, MonotonicTime::min());
+    EXPECT_EQ(run.readings, 0);
+
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+
+  {
+    SCOPED_TRACE("GAP timestamp at INT64_MAX");
+    const std::string dir = TempDir("gap_int64_max");
+    const std::string out = TempDir("gap_int64_max_out");
+    const std::string wpath = dir + "/writer.tlog";
+    const MonotonicTime near_max = MonotonicTime::max() - 10ms;
+    {
+      log::LogWriter writer{wpath, "writer",
+                            log::LogWriterOptions{.background = false}};
+      writer.start(ManifestOf<SensorWriter>(dir + "/unused.tlog"), near_max);
+      for (int i = 1; i <= 2; ++i) {
+        const Context tick{
+            .kind = EventKind::TIMER,
+            .source_id = 1,
+            .dispatch_index = static_cast<std::uint64_t>(i),
+            .event_time = near_max + std::chrono::milliseconds{i},
+            .now = near_max + std::chrono::milliseconds{i},
+            .sequence = 1};
+        writer.dispatch(tick, {});
+        const EventsTest::SensorMessage reading{i, 1.0F, 1.0F};
+        writer.send(tick, 0, std::as_bytes(std::span{&reading, 1}), 0,
+                    static_cast<std::uint64_t>(i - 1));
+      }
+      writer.flush();
+    }
+    append_gap(wpath, std::numeric_limits<std::int64_t>::max(),
+               std::numeric_limits<std::int64_t>::max());
+
+    const RecordedSession session{dir};
+    const RecordedTopic* sensor = session.find(kTopics.sensor);
+    ASSERT_NE(sensor, nullptr);
+    ASSERT_TRUE(sensor->first_gap.has_value());
+    EXPECT_EQ(*sensor->first_gap, MonotonicTime::max());
+
+    const WatcherRun run = ReplayWatcher(session, out);
+    ASSERT_TRUE(run.report.stopped_at_gap.has_value());
+    EXPECT_EQ(run.report.stopped_at_gap->at, MonotonicTime::max());
+    EXPECT_EQ(run.readings, 2);
+
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
 }  // namespace
 }  // namespace talos::event

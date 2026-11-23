@@ -194,21 +194,27 @@ void LogFileSink::rotate_to(std::uint64_t next) noexcept {
   // the log lost its head is on disk.
   const bool drop = next >= segment_count_;
   if (drop && !capped_marked_) {
-    head_dropped_.store(true);
     mark_capped();
-    if (sync_directory() != 0) {
+    if (failed_.load() || !capped_marked_ || sync_directory() != 0) {
+      if (!failed_.load()) fail("sync the directory of", path_);
       sys_close(next_fd);
-      return fail("sync the directory of", path_);
+      sys_unlink(staged.c_str());
+      return;
     }
+    head_dropped_.store(true);
   }
   if (sys_rename(path_.c_str(), LogSegmentPath(path_, file_segment_).c_str()) !=
       0) {
+    fail("rename", path_);
     sys_close(next_fd);
-    return fail("rename", path_);
+    sys_unlink(staged.c_str());
+    return;
   }
   if (sys_rename(staged.c_str(), path_.c_str()) != 0) {
+    fail("rename", staged);
     sys_close(next_fd);
-    return fail("rename", staged);
+    sys_unlink(staged.c_str());
+    return;
   }
   fd_ = next_fd;
   file_segment_ = next;
@@ -242,7 +248,6 @@ void LogFileSink::sync(bool durable, bool capture_stopped) noexcept {
 
 void LogFileSink::mark_capped() noexcept {
   if (capped_marked_) return;
-  capped_marked_ = true;
   const std::string marker = CappedMarkerPath(path_);
   const int marker_fd =
       sys_open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -251,11 +256,15 @@ void LogFileSink::mark_capped() noexcept {
               std::strerror(errno));
     return;
   }
-  if (sys_durable_sync(marker_fd) != 0) {
+  const int synced = sys_durable_sync(marker_fd);
+  if (synced != 0) {
     set_error(std::string{"LogWriter: cannot sync "} + marker + ": " +
               std::strerror(errno));
   }
   sys_close(marker_fd);
+  if (synced == 0) {
+    capped_marked_ = true;
+  }
 }
 
 void LogFileSink::close() noexcept {
