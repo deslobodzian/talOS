@@ -432,7 +432,8 @@ py_test(
 # read-only step, and tools/check_host_includes.py runs after the build. The
 # test runs it with a stub bazel against a throwaway repository.
 # Over 5 s: spawns temporary git repositories and full prepush.sh worktree
-# checks (9.7 s on Linux CI); integration lane.
+# checks (sharded across 4 actions to stay well under the 60 s small timeout
+# on 3-vCPU macOS CI); integration lane.
 py_test(
     name = "prepush_test",
     size = "small",
@@ -444,6 +445,7 @@ py_test(
         "prepush_robot_repository.sh",
     ],
     legacy_create_init = False,
+    shard_count = 4,
     tags = ["integration"],
     deps = ["@rules_python//python/runfiles"],
 )
