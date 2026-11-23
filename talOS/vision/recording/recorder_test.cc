@@ -10,6 +10,7 @@
 #endif
 
 #include <cerrno>
+#include <cfenv>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -501,6 +502,122 @@ TEST_F(RecorderTest, WriterThreadRunsAtBackgroundPriority) {
   EXPECT_GE(nice, talos::process::kBackgroundNice);
 }
 #endif
+
+TEST_F(RecorderTest,
+       ParseRecordRejectsDeepNestingUnquotedKeysAndOverflowingNumbers) {
+  CameraContext ctx;
+  FrameRecord rec;
+  std::string error;
+
+  // Nesting deeper than kMaxDepth (64) must fail instead of overflowing stack.
+  const std::string deep =
+      "{\"a\":" + std::string(100, '[') + std::string(100, ']') + "}";
+  EXPECT_FALSE(ParseRecord(deep, &ctx, &rec, &error));
+  EXPECT_FALSE(error.empty());
+
+  // Unquoted object keys and truncated object keys must fail (no OOB ++pos_).
+  for (const char* bad : {"{", "{foo:1}", "{x\"width\":1}", "{xwidth\":1}"}) {
+    SCOPED_TRACE(bad);
+    error.clear();
+    EXPECT_FALSE(ParseRecord(bad, &ctx, &rec, &error));
+    EXPECT_FALSE(error.empty());
+  }
+
+  // Overflowing integers and non-finite/overflowing floats must fail.
+  for (const char* bad : {"{\"capture_ns\":99999999999999999999999999999}",
+                          "{\"observation\":{\"x_m\":1e400}}",
+                          "{\"observation\":{\"x_m\":-1e400}}"}) {
+    SCOPED_TRACE(bad);
+    error.clear();
+    EXPECT_FALSE(ParseRecord(bad, &ctx, &rec, &error));
+    EXPECT_FALSE(error.empty());
+  }
+
+  // Out-of-int64-range finite doubles read via AsInt() must return fallback
+  // without undefined float-to-int conversion.
+  std::feclearexcept(FE_ALL_EXCEPT);
+  ASSERT_TRUE(
+      ParseRecord("{\"width\":1e30,\"height\":-1e30,"
+                  "\"capture_ns\":9223372036854775808.0}",
+                  &ctx, &rec, &error))
+      << error;
+  EXPECT_EQ(std::fetestexcept(FE_INVALID), 0);
+  EXPECT_EQ(ctx.width, 0);
+  EXPECT_EQ(ctx.height, 0);
+  EXPECT_EQ(rec.capture_ns, 0u);
+}
+
+TEST_F(RecorderTest, TinyRateClampsIntervalWithoutUbAndRateLimits) {
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.context = MakeContext();
+  opts.sample_hz = 1e-20;
+  opts.rejected_hz = 1e-20;
+  opts.queue_slots = 4;
+  FrameRecorder rec{std::move(opts)};
+
+  const Frame frame = MakeGrayFrame();
+  std::feclearexcept(FE_ALL_EXCEPT);
+  EXPECT_TRUE(rec.Record(frame, MakeRecord(0, "sampled")));
+  EXPECT_EQ(std::fetestexcept(FE_INVALID), 0);
+  EXPECT_FALSE(rec.Record(frame, MakeRecord(1'000'000'000, "sampled")));
+  EXPECT_EQ(rec.recorded(), 1u);
+}
+
+TEST_F(RecorderTest, DuplicateStemsDisambiguateAndTrimKeepsNewerFile) {
+  const auto dup_dir = dir_ / "dup";
+  const Frame frame = MakeGrayFrame();
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = dup_dir;
+    opts.context = MakeContext();
+    opts.sample_hz = 1e12;
+    opts.queue_slots = 4;
+    FrameRecorder rec{std::move(opts)};
+    FrameRecord first = MakeRecord(42, "sampled");
+    first.detections[0].tag_id = 1;
+    ASSERT_TRUE(rec.Record(frame, first));
+  }  // single queued pair finishes on destruction
+  const auto first_json = dup_dir / "00000000000000000042_sampled.json";
+  const auto first_png = dup_dir / "00000000000000000042_sampled.png";
+  ASSERT_TRUE(std::filesystem::exists(first_json));
+  ASSERT_TRUE(std::filesystem::exists(first_png));
+  const std::uint64_t pair_bytes = std::filesystem::file_size(first_json) +
+                                   std::filesystem::file_size(first_png);
+
+  // Budget fits 1 pair, not 2. Writing a second pair with the same capture_ns
+  // and reason must disambiguate its stem so TrimToBudget deletes only the
+  // older pair instead of double-counting and deleting the newer file.
+  {
+    FrameRecorder::Options opts;
+    opts.output_dir = dup_dir;
+    opts.context = MakeContext();
+    opts.sample_hz = 1e12;
+    opts.queue_slots = 4;
+    opts.max_bytes = pair_bytes + pair_bytes / 2;
+    FrameRecorder rec{std::move(opts)};
+    FrameRecord second = MakeRecord(42, "sampled");
+    second.detections[0].tag_id = 2;
+    ASSERT_TRUE(rec.Record(frame, second));
+  }
+
+  std::vector<int> surviving_tag_ids;
+  for (const auto& entry : std::filesystem::directory_iterator(dup_dir)) {
+    const std::string name = entry.path().filename().string();
+    if (name.size() < 5 || name.substr(name.size() - 5) != ".json") continue;
+    const std::string stem = name.substr(0, name.size() - 5);
+    EXPECT_TRUE(std::filesystem::exists(dup_dir / (stem + ".png")));
+    std::ifstream in(entry.path());
+    std::string text((std::istreambuf_iterator<char>(in)), {});
+    CameraContext parsed_ctx;
+    FrameRecord parsed;
+    std::string err;
+    ASSERT_TRUE(ParseRecord(text, &parsed_ctx, &parsed, &err)) << err;
+    ASSERT_EQ(parsed.detections.size(), 1u);
+    surviving_tag_ids.push_back(parsed.detections[0].tag_id);
+  }
+  EXPECT_EQ(surviving_tag_ids, (std::vector<int>{2}));
+}
 
 }  // namespace
 }  // namespace talos::vision::recording

@@ -5,11 +5,15 @@
 
 #include <gtest/gtest.h>
 
+#include <cfenv>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <optional>
@@ -17,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "talOS/process/process.h"
 #include "talOS/vision/field_sim/sim_camera.h"
 #include "talOS/vision/field_sim/tag_patterns.h"
 #include "talOS/vision/field_sim/tag_rasterizer.h"
@@ -210,6 +215,94 @@ TEST(RecordedCameraSourceTest, RecordingOfAnotherSizeFailsStartWithItsSize) {
   EXPECT_EQ(reports[0].first, ConnectionState::kError);
   EXPECT_NE(reports[0].second.find("640x480"), std::string::npos)
       << reports[0].second;
+}
+
+TEST(ImageSequenceTest, RejectsNegativeAndOverflowingTimestamps) {
+  const auto dir = NewDirectory("overflow_timeline");
+  RenderFrame(dir, "a.png", 2.0);
+  RenderFrame(dir, "b.png", 2.0);
+  for (const auto& [name, text] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"negative pts", "a.png,-1\nb.png,10\n"},
+           {"int64_min pts", "a.png,-9223372036854775808\nb.png,10\n"},
+           {"overflowing pts on first line",
+            "a.png,99999999999999999999999\nb.png,10\n"},
+           {"overflowing pts on second line",
+            "a.png,0\nb.png,99999999999999999999999\n"}}) {
+    SCOPED_TRACE(name);
+    WriteTimeline(dir, text);
+    std::string error;
+    EXPECT_FALSE(ImageSequence::Open(dir, 30.0, &error));
+    EXPECT_FALSE(error.empty());
+  }
+  std::filesystem::remove(dir / kTimestampsFile);
+  std::string error;
+  std::feclearexcept(FE_ALL_EXCEPT);
+  EXPECT_FALSE(ImageSequence::Open(dir, 1e-12, &error));
+  EXPECT_EQ(std::fetestexcept(FE_INVALID), 0);
+  EXPECT_FALSE(error.empty());
+}
+
+TEST(RecordedCameraSourceTest, FrameCallbackCanMutateCallbacksWithoutDeadlock) {
+  const auto dir = NewDirectory("reentrant_cb");
+  RenderFrame(dir, "0.png", 1.5);
+  RenderFrame(dir, "1.png", 2.0);
+  WriteTimeline(dir, "0.png,0\n1.png,30000000\n");
+  CameraSourceConfig config;
+  config.device_path = dir.string();
+  config.width = kWidth;
+  config.height = kHeight;
+  RecordedCameraSource source(config, RecordedCameraSource::Pacing::kManual);
+
+  int first_calls = 0;
+  int second_calls = 0;
+  source.SetFrameCallback([&](const Frame&) {
+    ++first_calls;
+    source.SetConnectionCallback([](ConnectionState, std::string_view) {});
+    source.SetFrameCallback([&](const Frame&) { ++second_calls; });
+  });
+  ASSERT_TRUE(source.Start());
+  EXPECT_EQ(source.DeliverUntil(1'000'000'000), 1u);
+  EXPECT_EQ(source.DeliverUntil(1'030'000'000), 1u);
+  EXPECT_EQ(first_calls, 1);
+  EXPECT_EQ(second_calls, 1);
+}
+
+// REQ-RT-10: the recorded camera source's realtime playback thread runs at
+// background priority below every loop thread.
+TEST(RecordedCameraSourceTest, RealtimePlaybackThreadRunsAtBackgroundPriority) {
+  const auto dir = NewDirectory("rt_bg");
+  RenderFrame(dir, "0.png", 2.0);
+  WriteTimeline(dir, "0.png,0\n");
+  CameraSourceConfig config;
+  config.device_path = dir.string();
+  config.width = kWidth;
+  config.height = kHeight;
+  config.fps = 30.0;
+  RecordedCameraSource source(config, RecordedCameraSource::Pacing::kRealtime);
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool delivered = false;
+  bool is_background = false;
+  source.SetFrameCallback([&](const Frame&) {
+    const bool bg = talos::process::ThreadIsBackground();
+    {
+      std::lock_guard lock(mu);
+      is_background = bg;
+      delivered = true;
+    }
+    cv.notify_one();
+  });
+  ASSERT_TRUE(source.Start());
+  {
+    std::unique_lock lock(mu);
+    // 10 s hang bound (docs/TESTING.md §6.3).
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds{10}, [&] { return delivered; }));
+  }
+  source.Stop();
+  EXPECT_TRUE(is_background);
 }
 
 }  // namespace

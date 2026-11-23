@@ -49,6 +49,7 @@ cc_library(
         "@platforms//os:macos": [":avfoundation"],
         "@platforms//os:linux": [
             "//talOS/events:events_os",
+            "//talOS/process",
             "@opencv//:core",
             "@opencv//:imgcodecs",
         ],

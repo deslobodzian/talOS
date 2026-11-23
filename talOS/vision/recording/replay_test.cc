@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <string>
@@ -230,6 +231,21 @@ TEST_F(ReplayTest, HugeFiniteYawDoesNotHangWrapAngle) {
   EXPECT_EQ(stats.frames, 1u);
   EXPECT_TRUE(std::isfinite(stats.rms_yaw_before));
   EXPECT_LE(stats.rms_yaw_before, 3.15);
+}
+
+TEST_F(ReplayTest, MissingOrNonDirectoryFramesPathReturnsError) {
+  ReplayStats stats;
+  std::string error;
+  EXPECT_FALSE(ReplayFrames((dir_ / "missing").string(), MakeLayout(),
+                            DetectorOverrides{}, &stats, &error));
+  EXPECT_FALSE(error.empty());
+
+  const auto file_path = dir_ / "not_a_dir";
+  std::ofstream(file_path) << "hello";
+  error.clear();
+  EXPECT_FALSE(ReplayFrames(file_path.string(), MakeLayout(),
+                            DetectorOverrides{}, &stats, &error));
+  EXPECT_FALSE(error.empty());
 }
 
 }  // namespace

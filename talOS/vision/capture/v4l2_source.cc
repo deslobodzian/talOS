@@ -1,6 +1,7 @@
 #include "talOS/vision/capture/v4l2_source.h"
 
 #include "talOS/events/os/poller.h"
+#include "talOS/process/process.h"
 #if defined(__linux__)
 #include <fcntl.h>
 #include <linux/videodev2.h>
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <stop_token>
@@ -204,9 +206,11 @@ class Source final : public CameraSource {
     return true;
   }
   void SetFrameCallback(FrameCallback cb) override {
+    std::lock_guard lock(callback_mutex_);
     callback_ = std::move(cb);
   }
   void SetConnectionCallback(ConnectionCallback cb) override {
+    std::lock_guard lock(callback_mutex_);
     connection_ = std::move(cb);
   }
   bool IsRunning() const override { return running_; }
@@ -343,9 +347,7 @@ class Source final : public CameraSource {
     running_ = true;
     worker_ =
         std::jthread([this](const std::stop_token& stop) { Capture(stop); });
-    if (connection_) {
-      connection_(ConnectionState::kConnected, "");
-    }
+    ReportConnection(ConnectionState::kConnected, "");
     return true;
   }
   void Stop() override {
@@ -372,17 +374,26 @@ class Source final : public CameraSource {
   }
 
  private:
+  void ReportConnection(ConnectionState state, std::string_view message) {
+    ConnectionCallback connection;
+    {
+      std::lock_guard lock(callback_mutex_);
+      connection = connection_;
+    }
+    if (connection) {
+      connection(state, message);
+    }
+  }
   // Reports why Start failed; `error` is the errno of the failed call, or 0.
   bool Fail(const char* step, int error) {
     Stop();
-    if (connection_) {
-      std::string message = device_id() + ": " + step;
-      if (error != 0) message += std::string(": ") + std::strerror(error);
-      connection_(ConnectionState::kError, message);
-    }
+    std::string message = device_id() + ": " + step;
+    if (error != 0) message += std::string(": ") + std::strerror(error);
+    ReportConnection(ConnectionState::kError, message);
     return false;
   }
   void Capture(const std::stop_token& stop) {
+    talos::process::ConfigureBackgroundThread();
     std::string reason = "capture stopped";
     while (!stop.stop_requested()) {
       pollfd poll_fd{fd_, POLLIN, 0};
@@ -430,10 +441,12 @@ class Source final : public CameraSource {
           buffer.index < mappings_.size() &&
           !(buffer.flags & V4L2_BUF_FLAG_ERROR) &&
           (mjpeg_
-               ? DecodeMjpegGray(
-                     static_cast<const uint8_t*>(mappings_[buffer.index].data),
-                     buffer.bytesused, mode_.width, mode_.height, decoded_)
-               : buffer.bytesused >= size);
+               ? (buffer.bytesused <= mappings_[buffer.index].size &&
+                  DecodeMjpegGray(
+                      static_cast<const uint8_t*>(mappings_[buffer.index].data),
+                      buffer.bytesused, mode_.width, mode_.height, decoded_))
+               : (size <= mappings_[buffer.index].size &&
+                  buffer.bytesused >= size));
       if (delivered) {
         // The frame borrows the dequeued driver buffer until it is queued
         // again below; the consumer copies what it keeps (FrameMailbox).
@@ -449,8 +462,13 @@ class Source final : public CameraSource {
         frame.set_raw_timestamp_ns(driver_monotonic ? driver_time : delivery);
         frame.set_timestamp_kind(V4L2TimestampKind(buffer.flags, driver_));
         frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
-        if (callback_) {
-          callback_(frame);
+        FrameCallback callback;
+        {
+          std::lock_guard lock(callback_mutex_);
+          callback = callback_;
+        }
+        if (callback) {
+          callback(frame);
         }
       } else {
         // An errored or short driver buffer, or an MJPG frame that is
@@ -464,8 +482,9 @@ class Source final : public CameraSource {
       }
     }
     running_ = false;
-    if (!stop.stop_requested() && connection_) {
-      connection_(ConnectionState::kDisconnected, device_id() + ": " + reason);
+    if (!stop.stop_requested()) {
+      ReportConnection(ConnectionState::kDisconnected,
+                       device_id() + ": " + reason);
     }
   }
   struct Mapping {
@@ -475,6 +494,7 @@ class Source final : public CameraSource {
   CameraSourceConfig config_;
   CameraMode mode_;
   CameraControls controls_;
+  std::mutex callback_mutex_;
   FrameCallback callback_;
   ConnectionCallback connection_;
   int fd_{-1};
