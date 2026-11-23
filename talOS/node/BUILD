@@ -99,6 +99,7 @@ cc_library(
         ":node",
         "//talOS/configuration",
         "//talOS/events",
+        "//talOS/events:events_core",
     ],
 )
 

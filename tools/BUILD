@@ -258,6 +258,13 @@ py_test(
     deps = [":sync_manifest_lib"],
 )
 
+# The `bazel query --keep_going` exit-3 classifier check_layers.py and
+# slow_tests.py share.
+py_library(
+    name = "bazel_query",
+    srcs = ["bazel_query.py"],
+)
+
 # python3 tools/check_layers.py (CI: the Linux job, after the build) and
 # python3 tools/check_layers.py --source-only (tools/source_lints.sh)
 # Checks the Bazel graph against ARCHITECTURE.md's layers with bazel query,
@@ -271,6 +278,7 @@ py_test(
     ],
     legacy_create_init = False,
     main = "check_layers_test.py",
+    deps = [":bazel_query"],
 )
 
 # python3 tools/lint_test_time.py (CI: the lint job)
@@ -424,6 +432,7 @@ py_test(
     ],
     legacy_create_init = False,
     main = "slow_tests_test.py",
+    deps = [":bazel_query"],
 )
 
 # tools/prepush.sh [--ref C] [--keep] [--full] [--skip-gradle] [--skip-studio]

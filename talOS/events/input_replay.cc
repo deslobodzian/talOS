@@ -403,6 +403,16 @@ RecordedSession::RecordedSession(const std::string& path,
         reader.manifest().size());
     std::vector<TimerState> timer_state(reader.manifest().size());
     bool timer_state_uncertain = false;
+    // Records lost in a damaged stretch or a gap may hold TIMER firings or
+    // ARM_TIMER/DISARM_TIMER calls: forget every tracked deadline so a stale
+    // one never clamps loop_end() below real firings.
+    const auto forget_timer_state = [&] {
+      timer_state_uncertain = true;
+      for (TimerState& timer : timer_state) {
+        timer.armed = false;
+        timer.deadline_ns.reset();
+      }
+    };
     std::optional<MonotonicTime> run_start;
     bool timed = false;
     // The now_ns of this file's first record of a dispatch, and the latest
@@ -593,13 +603,7 @@ RecordedSession::RecordedSession(const std::string& path,
       // it lost of each topic source, by when that could be fed at.
       if (reader.damage().spans != spans) {
         seen_loss_in_file = true;
-        if (own_log) {
-          timer_state_uncertain = true;
-          for (TimerState& timer : timer_state) {
-            timer.armed = false;
-            timer.deadline_ns.reset();
-          }
-        }
+        if (own_log) forget_timer_state();
         const std::vector<std::optional<std::uint64_t>> prev_sent_seq =
             last_sent_seq;
         last_dispatch.reset();
@@ -692,16 +696,7 @@ RecordedSession::RecordedSession(const std::string& path,
       }
       if (const auto marked = log::GapOf(header, record.payload)) {
         seen_loss_in_file = true;
-        if (own_log) {
-          // Records dropped in the gap may hold TIMER firings or
-          // ARM_TIMER/DISARM_TIMER calls; invalidate tracked timer state so a
-          // stale pre-gap deadline never clamps loop_end() below real firings.
-          timer_state_uncertain = true;
-          for (TimerState& timer : timer_state) {
-            timer.armed = false;
-            timer.deadline_ns.reset();
-          }
-        }
+        if (own_log) forget_timer_state();
         if (marked->detailed) {
           last_dispatch = marked->detail.last_dispatch_index;
         } else {
@@ -815,6 +810,22 @@ RecordedSession::RecordedSession(const std::string& path,
       }
       const std::uint32_t topic = topic_of[header.source_id];
       if (record.payload.size() != topics_[topic].message_bytes) continue;
+      // A record of a (topic, sequence) already read must repeat its
+      // payload, and its time, which each caller compares.
+      const auto same_payload = [&](const RecordedMessage& known) {
+        const std::span<const std::byte> known_payload{
+            bytes_.data() + known.offset, topics_[topic].message_bytes};
+        return std::equal(record.payload.begin(), record.payload.end(),
+                          known_payload.begin());
+      };
+      const auto conflicting_records = [&] {
+        throw ReplayError(
+            "conflicting records for topic '" + topics_[topic].name +
+            "' sequence " + std::to_string(header.sequence) + " in " +
+            log_path +
+            " (different publish time or payload; a segment may have been "
+            "re-created outside a launcher session)");
+      };
       if (header.source_id < last_monotonic_seq.size()) {
         if (last_monotonic_seq[header.source_id].has_value() &&
             header.sequence <= *last_monotonic_seq[header.source_id]) {
@@ -842,17 +853,9 @@ RecordedSession::RecordedSession(const std::string& path,
             own_seen.try_emplace({topic, header.sequence}, own.size());
         if (!inserted) {
           RecordedMessage& known = own[it->second];
-          const std::span<const std::byte> known_payload{
-              bytes_.data() + known.offset, topics_[topic].message_bytes};
           if (header.publish_time_ns != own_publish_ns[it->second] ||
-              !std::equal(record.payload.begin(), record.payload.end(),
-                          known_payload.begin())) {
-            throw ReplayError(
-                "conflicting records for topic '" + topics_[topic].name +
-                "' sequence " + std::to_string(header.sequence) + " in " +
-                log_path +
-                " (different publish time or payload; a segment may have been "
-                "re-created outside a launcher session)");
+              !same_payload(known)) {
+            conflicting_records();
           }
           if (delivered < known.delivered) {
             known.delivered = delivered;
@@ -883,18 +886,7 @@ RecordedSession::RecordedSession(const std::string& path,
           seen.try_emplace({topic, header.sequence}, messages_.size());
       if (!inserted) {
         const RecordedMessage& known = messages_[it->second];
-        const std::span<const std::byte> known_payload{
-            bytes_.data() + known.offset, topics_[topic].message_bytes};
-        if (time != known.time ||
-            !std::equal(record.payload.begin(), record.payload.end(),
-                        known_payload.begin())) {
-          throw ReplayError(
-              "conflicting records for topic '" + topics_[topic].name +
-              "' sequence " + std::to_string(header.sequence) + " in " +
-              log_path +
-              " (different publish time or payload; a segment may have been "
-              "re-created outside a launcher session)");
-        }
+        if (time != known.time || !same_payload(known)) conflicting_records();
         continue;
       }
       messages_.push_back({time, time, topic, header.sequence, bytes_.size()});

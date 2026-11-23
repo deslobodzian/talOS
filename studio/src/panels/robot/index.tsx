@@ -131,7 +131,8 @@ export function phaseFromSeries(
   return {current, previous, seconds: series.times[end] - series.times[earliestFinite]};
 }
 
-const MODE_LABEL: Record<DriverStationMode, string> = {
+// Also the status strip's.
+export const MODE_LABEL: Record<DriverStationMode, string> = {
   disconnected: 'DISCONNECTED',
   disabled: 'DISABLED',
   autonomous: 'AUTONOMOUS',

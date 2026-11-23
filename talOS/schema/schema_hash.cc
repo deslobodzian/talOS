@@ -11,29 +11,6 @@ namespace {
 
 constexpr int kMaxDepth = 32;
 
-// Semantic validation complements the reflection buffer's structural verifier.
-bool type_size(const reflection::Schema& schema, reflection::BaseType base,
-               std::int32_t index, std::size_t& size) {
-  if (base == reflection::BaseType::Obj) {
-    const auto* objects = schema.objects();
-    if (objects == nullptr || index < 0 ||
-        static_cast<std::size_t>(index) >= objects->size())
-      return false;
-    const auto* object = objects->Get(index);
-    if (object == nullptr || !object->is_struct() || object->bytesize() <= 0)
-      return false;
-    size = static_cast<std::size_t>(object->bytesize());
-    return true;
-  }
-  if (base < reflection::BaseType::UType || base > reflection::BaseType::Double)
-    return false;
-  if (index >= 0 && (schema.enums() == nullptr ||
-                     static_cast<std::size_t>(index) >= schema.enums()->size()))
-    return false;
-  size = flatbuffers::GetTypeSize(base);
-  return true;
-}
-
 bool append_struct(const reflection::Schema& schema,
                    const reflection::Object& object, std::string& out,
                    int depth);
@@ -43,7 +20,7 @@ bool append_struct(const reflection::Schema& schema,
 bool append_type(const reflection::Schema& schema, reflection::BaseType base,
                  std::int32_t index, std::string& out, int depth) {
   std::size_t size;
-  if (!type_size(schema, base, index, size)) return false;
+  if (!ValueSize(schema, base, index, size)) return false;
   if (base == reflection::BaseType::Obj) {
     return append_struct(schema, *schema.objects()->Get(index), out, depth);
   }
@@ -90,7 +67,7 @@ bool append_struct(const reflection::Schema& schema,
     const reflection::Type& type = *field->type();
     const bool array = type.base_type() == reflection::BaseType::Array;
     std::size_t size;
-    if (!type_size(schema, array ? type.element() : type.base_type(),
+    if (!ValueSize(schema, array ? type.element() : type.base_type(),
                    type.index(), size))
       return false;
     const std::size_t count = array ? type.fixed_length() : 1;

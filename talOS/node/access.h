@@ -73,12 +73,13 @@ struct NodeSetup {
 using ParamValue = std::variant<bool, std::int64_t, double, std::string,
                                 std::vector<std::string>, std::vector<double>>;
 
-struct NodeAccess {
+// NodeDetail's members (node_detail.h: params, subscriptions, publishers,
+// state machines, extensions) are NodeAccess's too; it adds the privileged
+// hooks below. Its publisher_send is the devices flush's: unlike
+// NodeDetail::publisher_send it accepts the hardware request slot.
+struct NodeAccess : NodeDetail {
   static std::unique_ptr<Node> create(NodeSetup setup);
 
-  // Called on every tick before the after_update hooks. Set before start().
-  // Clears abi_update.
-  static void set_update(Node& node, std::function<void()> update);
   // node_api's talos_node_set_update: the update() just set is a callback
   // through the C ABI, a Python node's, so its ticks run the interpreter.
   // --describe reports it (introspect::Description::abi_update).
@@ -101,26 +102,12 @@ struct NodeAccess {
   // each update() sends neutral for every output that update() did not set.
   // Read it only on the loop thread (after require_loop_thread).
   static bool in_update(const Node& node);
-  // Some handler must see each message on subscription `subscription` as it
-  // arrives (a subscribe callback with Wake::kOnPublish, a Driver Station
-  // listener), so its publications wake the node: start() marks its watcher
-  // prompt and picks Delivery::ON_PUBLISH. A callback subscription without
-  // it (Wake::kAtDrain, the devices layer's /hw/state) is a sequence watcher
-  // that waits for the next drain. A node with a timer (update(), an
-  // after_update hook or every()) and no such subscription drains only right
-  // before its own timers (Delivery::BEFORE_TIMERS), which is all a node
-  // that reads latched values there needs; in a node with no timer every
-  // subscription wakes it regardless. Call before start(); throws
-  // std::out_of_range for an index add_subscription did not return.
-  static void require_immediate_delivery(Node& node, std::size_t subscription);
   // Index of the update() currently running (1 for the first), or between
   // ticks of the last one to run, which the after_update hooks read; an
   // update() that threw keeps its index, so the next one never shares it.
   // State machines stamp transitions with it, a Target its READ log entry
   // and its live target, and the devices layer each output it sets.
   static std::uint64_t next_update(const Node& node);
-  // [robot] command_timeout_us: how old a message may be and still be fresh.
-  static std::chrono::nanoseconds freshness_timeout(const Node& node);
   // Topics subscribed with optional = true, for describe and the registry.
   static std::vector<std::string_view> optional_topics(const Node& node);
   // Topics subscribed with add_observer, for describe and the registry.
@@ -149,58 +136,14 @@ struct NodeAccess {
   // The session output directory (parent of --log), or nullopt without --log.
   static std::optional<std::filesystem::path> session_dir(const Node& node);
 
-  // A parameter of this node's subsystem table, or, with `subsystem`, of
-  // that subsystem's table (Node::param_of: constructor only, and a
-  // subsystem the config lacks throws). nullopt when the key is absent. A
-  // present key of another type throws, naming it.
-  using ParamTable = std::optional<std::string_view>;
-  static std::optional<bool> find_bool(const Node& node, std::string_view key,
-                                       ParamTable subsystem = {});
-  static std::optional<std::int64_t> find_int(const Node& node,
-                                              std::string_view key,
-                                              ParamTable subsystem = {});
-  static std::optional<double> find_double(const Node& node,
-                                           std::string_view key,
-                                           ParamTable subsystem = {});
-  static std::optional<std::string> find_string(const Node& node,
-                                                std::string_view key,
-                                                ParamTable subsystem = {});
-  // A TOML array: of strings, or of numbers (integers convert). An empty
-  // array is valid. A non-array, or an element of another type, throws
-  // naming the element's index and type.
-  static std::optional<std::vector<std::string>> find_string_list(
-      const Node& node, std::string_view key, ParamTable subsystem = {});
-  static std::optional<std::vector<double>> find_double_list(
-      const Node& node, std::string_view key, ParamTable subsystem = {});
-  // Whatever type the key has (bool, integer, float, string, or an array of
+  using ParamTable = detail::ParamTable;  // node_detail.h
+  // A parameter, as NodeDetail::find_bool and the others read one, of
+  // whatever type the key has (bool, integer, float, string, or an array of
   // strings or of numbers; an empty array is an empty double list).
   static std::optional<ParamValue> find_param(const Node& node,
                                               std::string_view key,
                                               ParamTable subsystem = {});
-  // Throws std::invalid_argument naming the node, the key, the problem and
-  // the subsystem table read.
-  [[noreturn]] static void param_error(const Node& node, std::string_view key,
-                                       std::string_view problem,
-                                       ParamTable subsystem = {});
 
-  // `schema` is the topic's identity (talOS/schema/identity.h): what the
-  // segment checks at attach, describe reports and the log records.
-  // Without `on_message` each drain keeps only the newest message (skipped
-  // ones count as dropped); with it every message arrives in sequence, at
-  // most 64 per drain. subscription_age() is now minus the writer's
-  // publication time for both kinds.
-  static std::size_t add_subscription(Node& node, std::string_view topic,
-                                      std::size_t bytes, std::size_t alignment,
-                                      const schema::Identity& schema,
-                                      bool optional,
-                                      MessageCallback on_message);
-  static const void* subscription_value(const Node& node, std::size_t index);
-  static bool subscription_has_value(const Node& node, std::size_t index);
-  static std::chrono::nanoseconds subscription_age(const Node& node,
-                                                   std::size_t index);
-  static bool subscription_fresh(const Node& node, std::size_t index,
-                                 std::chrono::nanoseconds max_age);
-  static bool subscription_updated(const Node& node, std::size_t index);
   // Logs, in the dispatch log of the handler running now, that it acted on
   // subscription `index`'s latched message: an EventKind::READ record with
   // the watcher, now, that message's publish time and its RTMS sequence.
@@ -215,12 +158,6 @@ struct NodeAccess {
                                   std::size_t bytes, std::size_t alignment,
                                   const schema::Identity& schema);
 
-  // Refuses (std::invalid_argument) a topic that resolves into the hardware
-  // request namespace (naming::IsHardwareRequest), as add_byte_publisher
-  // does: only add_hardware_request opens one.
-  static std::size_t add_publisher(Node& node, std::string_view topic,
-                                   std::size_t bytes, std::size_t alignment,
-                                   const schema::Identity& schema);
   // The devices layer's flush: this node's hardware request,
   // naming::HardwareRequestTopic(name), never remapped, declared to describe
   // and the registry with naming::kSourceFlagHardwareRequest (the graph lint
@@ -256,8 +193,6 @@ struct NodeAccess {
   static std::size_t add_byte_publisher(Node& node, std::string_view topic,
                                         std::size_t max_bytes,
                                         const BytePublishOptions& options);
-  static bool byte_publisher_send(Node& node, std::size_t index,
-                                  std::span<const std::byte> message);
   // Byte topics in registration order, for describe and the registry: they
   // bypass the loop, so its manifest does not list them. Their schema is
   // schema::Bytes().
@@ -294,19 +229,6 @@ struct NodeAccess {
                                                         std::size_t index);
   // The last set_selected() value of `index`. Safe to call from any thread.
   static std::int32_t selected(const Node& node, std::size_t index);
-
-  static std::size_t add_state_machine(Node& node, std::int64_t initial);
-  static std::int64_t state_machine_state(const Node& node, std::size_t index);
-  static std::int64_t state_machine_previous(const Node& node,
-                                             std::size_t index);
-  static void state_machine_go(Node& node, std::size_t index,
-                               std::int64_t next);
-  static Duration state_machine_time_in_state(const Node& node,
-                                              std::size_t index);
-  static bool state_machine_just_entered(const Node& node, std::size_t index);
-  static void* find_extension(const Node& node, std::type_index type);
-  static void add_extension(Node& node, std::type_index type,
-                            std::shared_ptr<void> object);
 };
 
 }  // namespace talos::detail

@@ -1,12 +1,7 @@
 #include "studio/review/session.h"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -18,6 +13,7 @@
 #include <utility>
 
 #include "nlohmann/json.hpp"
+#include "studio/bridge/static_files.h"
 #include "studio/review/hardware_channels.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/format.h"
@@ -145,48 +141,6 @@ bool SelectCanonicalAlertStream(TopicBuild& topic,
 
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
 constexpr std::uintmax_t kMaxConfigBytes = std::uintmax_t{1} << 20;
-
-// Reads a non-symlink regular file up to `max_bytes` using O_NOFOLLOW +
-// O_NONBLOCK + fstat + bounded chunked reads so symlinks, FIFOs, device nodes,
-// and growing files never escape confinement, hang, or allocate unbounded
-// memory (REQ-OPS-42, REQ-SAFE-35).
-std::optional<std::string> ReadBoundedRegularFile(const fs::path& path,
-                                                  std::uintmax_t max_bytes) {
-  std::error_code ec;
-  const fs::file_status st = fs::symlink_status(path, ec);
-  if (ec || fs::is_symlink(st) || !fs::is_regular_file(st)) return std::nullopt;
-  struct ScopedFd {
-    int fd{-1};
-    ~ScopedFd() {
-      if (fd >= 0) ::close(fd);
-    }
-  };
-  const ScopedFd file{
-      ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)};
-  if (file.fd < 0) return std::nullopt;
-  struct stat sb {};
-  if (::fstat(file.fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size <= 0 ||
-      static_cast<std::uintmax_t>(sb.st_size) > max_bytes) {
-    return std::nullopt;
-  }
-  std::string content;
-  content.reserve(static_cast<std::size_t>(sb.st_size));
-  std::array<char, 8192> chunk{};
-  for (;;) {
-    const ssize_t got = ::read(file.fd, chunk.data(), chunk.size());
-    if (got == 0) break;
-    if (got < 0) {
-      if (errno == EINTR) continue;
-      return std::nullopt;
-    }
-    if (content.size() + static_cast<std::size_t>(got) > max_bytes) {
-      return std::nullopt;
-    }
-    content.append(chunk.data(), static_cast<std::size_t>(got));
-  }
-  if (content.empty()) return std::nullopt;
-  return content;
-}
 
 // Resolves `target` strictly within `session_dir` (`canonical_root` is
 // fs::canonical(session_dir)), rejecting any symlink leaf, any symlink

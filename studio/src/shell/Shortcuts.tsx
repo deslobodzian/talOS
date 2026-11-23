@@ -12,7 +12,8 @@ const SHORTCUTS: {keys: string; label: string}[] = [
   {keys: 'Esc', label: 'Close'}
 ];
 
-export function ShortcutsOverlay({onClose}: {onClose: () => void}) {
+// Escape anywhere on the page calls `onClose` while the overlay is mounted.
+export function useEscape(onClose: () => void) {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -23,6 +24,10 @@ export function ShortcutsOverlay({onClose}: {onClose: () => void}) {
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
+}
+
+export function ShortcutsOverlay({onClose}: {onClose: () => void}) {
+  useEscape(onClose);
 
   return <div className="palette-backdrop"
               onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
