@@ -109,6 +109,7 @@ cc_library(
     ],
     deps = [
         ":config",
+        "//talOS/driver_station:little_endian",
         "//talOS/protocol:frame",
         "//talOS/schema:identity",
     ],

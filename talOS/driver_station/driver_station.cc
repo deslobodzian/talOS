@@ -6,27 +6,14 @@
 #include <cstring>
 #include <span>
 
+#include "little_endian.h"
+
 namespace talos::driver_station {
 
 static_assert(sizeof(float) == 4);
 
 namespace {
-struct Writer {
-  std::span<uint8_t> data;
-  std::size_t pos{};
-  bool ok{true};
-
-  void Int(uint64_t value, int size) {
-    for (int i = 0; i < size; ++i) {
-      if (pos == data.size()) {
-        ok = false;
-        return;
-      }
-      data[pos++] = static_cast<uint8_t>(value);
-      value >>= 8;
-    }
-  }
-
+struct Writer : LittleEndianWriter {
   void Float(float x) {
     if (!std::isfinite(x)) x = 0.0f;
     Int(std::bit_cast<uint32_t>(x), 4);
@@ -48,29 +35,7 @@ struct Writer {
   }
 };
 
-struct Reader {
-  std::span<const uint8_t> data;
-  std::size_t pos{};
-  bool ok{true};
-
-  uint64_t Int(int size) {
-    uint64_t value{};
-    for (int i = 0; i < size; ++i) {
-      if (pos == data.size()) {
-        ok = false;
-        return 0;
-      }
-      value |= uint64_t{data[pos++]} << (i * 8);
-    }
-    return value;
-  }
-
-  float Float() {
-    const float x = std::bit_cast<float>(static_cast<uint32_t>(Int(4)));
-    ok &= std::isfinite(x);
-    return x;
-  }
-
+struct Reader : LittleEndianReader {
   void Str(char* out, std::size_t max_len) {
     std::memset(out, 0, max_len);
     uint8_t len = static_cast<uint8_t>(Int(1));
@@ -87,8 +52,6 @@ struct Reader {
     }
     out[len] = '\0';
   }
-
-  bool Done() const { return ok && pos == data.size(); }
 };
 }  // namespace
 
@@ -108,7 +71,7 @@ void ModeTracker::Stamp(DriverStationData& ds) {
 }
 
 std::size_t Encode(const DriverStationData& ds, std::span<uint8_t> data) {
-  Writer w{data};
+  Writer w{{data}};
   w.Int(ds.sample_time_us, 8);
   w.Int(ds.mode_since_us, 8);
   w.Int(ds.boot_id, 8);
@@ -153,7 +116,7 @@ std::size_t Encode(const DriverStationData& ds, std::span<uint8_t> data) {
 
 bool Decode(std::span<const uint8_t> data, DriverStationData& out) {
   DriverStationData ds{};
-  Reader r{data};
+  Reader r{{data}};
 
   ds.sample_time_us = r.Int(8);
   ds.mode_since_us = r.Int(8);
