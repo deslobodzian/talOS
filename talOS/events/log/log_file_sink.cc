@@ -94,10 +94,12 @@ void LogFileSink::open_sync() {
     throw std::system_error(errno, std::generic_category(),
                             "LogWriter: open failed for " + path_);
   }
+  needs_durable_sync_ = true;
 }
 
 void LogFileSink::write_prefix_sync() {
   write_all_to(fd_, prefix_.data(), prefix_.size());
+  needs_durable_sync_ = true;
 }
 
 void LogFileSink::abort_for_tiny_cap_sync() noexcept {
@@ -119,6 +121,7 @@ void LogFileSink::open_file() noexcept {
               std::strerror(errno));
     return;
   }
+  needs_durable_sync_ = true;
   try {
     write_all_to(fd_, prefix_.data(), prefix_.size());
   } catch (const std::system_error& e) {
@@ -136,10 +139,12 @@ std::size_t LogFileSink::write_bytes(const void* data,
       if (errno == EINTR) continue;
       set_error(std::string{"LogWriter: flush failed: "} +
                 std::strerror(errno));
+      if (total > 0) needs_durable_sync_ = true;
       return total;
     }
     total += static_cast<std::size_t>(n);
   }
+  if (total > 0) needs_durable_sync_ = true;
   return total;
 }
 
@@ -218,6 +223,7 @@ void LogFileSink::rotate_to(std::uint64_t next) noexcept {
   }
   fd_ = next_fd;
   file_segment_ = next;
+  needs_durable_sync_ = true;
   if (drop) {
     for (std::uint64_t old = dropped_through_; old <= next - segment_count_;
          ++old) {
@@ -241,13 +247,18 @@ void LogFileSink::sync(bool durable, bool capture_stopped) noexcept {
     set_error(std::string{"LogWriter: fsync failed: "} + std::strerror(errno));
   }
   last_sync_ = std::chrono::steady_clock::now();
-  if (head_dropped_.load() || capture_stopped) {
+  const bool need_cap = head_dropped_.load() || capture_stopped;
+  if (need_cap) {
     mark_capped();
+  }
+  if (durable && result == 0 && (!need_cap || capped_marked_)) {
+    needs_durable_sync_ = false;
   }
 }
 
 void LogFileSink::mark_capped() noexcept {
   if (capped_marked_) return;
+  needs_durable_sync_ = true;
   const std::string marker = CappedMarkerPath(path_);
   const int marker_fd =
       sys_open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
