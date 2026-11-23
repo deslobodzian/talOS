@@ -125,6 +125,13 @@ jobs:
         # //talOS/protocol:udp_address_change_test needs.
         sudo sysctl -w vm.mmap_rnd_bits=28 \
           kernel.apparmor_restrict_unprivileged_userns=0
+        # A short output base. The OS Login account's name is 24 characters,
+        # and under ~/.cache/bazel the hermetic Python's path passes the
+        # kernel's 255-character limit on a script's "#!" line, which a test
+        # that writes such a script (//talOS/build:sim_check_no_state_test)
+        # then fails on with "Exec format error".
+        sudo install -d -o "$(id -u)" -g "$(id -g)" /b
+        echo 'startup --output_user_root=/b' >> ~/.bazelrc
         bazel build --config=gcp //...
         case "$LANE" in
           fast) exec bazel test --config=gcp --config=fast --test_output=errors //... ;;
