@@ -277,6 +277,88 @@ TEST(Devices, UnconfiguredOrFaultedStateForcesNeutralEvenWhenEnabled) {
   EXPECT_EQ(command->motors[0].demand, 0.0);
 }
 
+// REQ-SAFE-02: robot_enabled(node) is false and outputs stay neutral (a) before
+// any /hw/state is published, and (b) when a kConfigured | kEnabled /hw/state
+// arrives carrying a mismatched config_id (both before and after an accepted
+// disabled State).
+TEST(Devices,
+     NoAcceptedStateOrMismatchedConfigIdDisablesAndKeepsOutputsNeutral) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  Node& node = sim.node("mech");
+  const std::uint64_t id = hardware::ConfigurationId(
+      node.extension<HardwareLink>().config().hardware);
+  mech.a_velocity = 12.5;
+  mech.led_on = true;
+  mech.servo_out = 0.75;
+
+  const auto publish = [&](std::uint64_t config_id,
+                           std::uint64_t sample_time_us, std::uint32_t flags) {
+    hardware::State state{};
+    state.config_id = config_id;
+    state.boot_id = 7;
+    state.sample_time_us = sample_time_us;
+    state.flags = flags;
+    Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(hardware::Encode(state, packet.data));
+    sim.publish(hardware::kStateTopic, packet);
+    sim.step(5ms);
+  };
+
+  // (a) Before any /hw/state is published: disabled and nothing sent.
+  EXPECT_FALSE(robot_enabled(node));
+  sim.step(20ms);
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(mech.enabled_in_update);
+  EXPECT_EQ(Sent(sim), 0u);
+
+  // (b) A kConfigured | kEnabled /hw/state with a mismatched config_id is
+  // rejected before any accepted state: still disabled and nothing sent.
+  publish(id ^ 1u, 1000, hardware::kConfigured | hardware::kEnabled);
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(mech.enabled_in_update);
+  EXPECT_EQ(Sent(sim), 0u);
+
+  // Accept a matching disabled state so flushes emit /hw/request/mech, then
+  // send a mismatched kConfigured | kEnabled state: robot_enabled stays false
+  // and every flushed output (motor, DIO, PWM) stays neutral.
+  publish(id, 2000, hardware::kConfigured);
+  ASSERT_FALSE(robot_enabled(node));
+  ASSERT_FALSE(mech.enabled_in_update);
+  ASSERT_GT(Sent(sim), 0u);
+
+  publish(id ^ 1u, 3000, hardware::kConfigured | hardware::kEnabled);
+  EXPECT_FALSE(robot_enabled(node));
+  EXPECT_FALSE(mech.enabled_in_update);
+  auto command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->observed_time_us, 2000u);
+  EXPECT_EQ(command->motors[0].mode, Mode::kNeutral);
+  EXPECT_EQ(command->motors[0].demand, 0.0);
+  EXPECT_EQ(command->motors[1].mode, Mode::kNeutral);
+  ASSERT_EQ(command->digital_output_count, 1);
+  EXPECT_FALSE(command->digital_outputs[0].value);
+  ASSERT_EQ(command->pwm_output_count, 1);
+  EXPECT_EQ(command->pwm_outputs[0],
+            hardware::PwmRequest{.id = command->pwm_outputs[0].id});
+
+  // Control check: a matching kConfigured | kEnabled state enables and drives.
+  publish(id, 4000, hardware::kConfigured | hardware::kEnabled);
+  EXPECT_TRUE(robot_enabled(node));
+  EXPECT_TRUE(mech.enabled_in_update);
+  command = LastCommand(sim);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(command->observed_time_us, 4000u);
+  EXPECT_EQ(command->motors[0].mode, Mode::kVelocity);
+  EXPECT_DOUBLE_EQ(command->motors[0].demand, 12.5);
+  ASSERT_EQ(command->digital_output_count, 1);
+  EXPECT_TRUE(command->digital_outputs[0].value);
+  ASSERT_EQ(command->pwm_output_count, 1);
+  EXPECT_EQ(command->pwm_outputs[0].mode, hardware::PwmMode::kPulse);
+  EXPECT_DOUBLE_EQ(command->pwm_outputs[0].output, 0.75);
+}
+
 // REQ-SAFE-02
 TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   auto sim = Sim::FromToml(kRobotToml);
