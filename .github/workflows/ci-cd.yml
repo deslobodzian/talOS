@@ -102,9 +102,16 @@ jobs:
         # Every test target whose name says replay, so a new one is picked
         # up without editing this file. --keep_going: some external
         # packages do not load on every host (docs/DEVELOPMENT.md §5).
-        replay="$(bazel query --config=gcp --keep_going \
+        # No --config=gcp: it is a build config, and query refuses a config
+        # no query line defines. Exit 3 is a partial result, which is usable.
+        status=0
+        replay="$(bazel query --keep_going \
           'kind(".*_test rule", //...) intersect filter("replay", //...) except attr(tags, manual, //...)' \
-          2>/dev/null || true)"
+          2>query.log)" || status=$?
+        if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+          cat query.log >&2
+          exit "$status"
+        fi
         if [ -z "$replay" ]; then
           echo "no replay test targets found" >&2
           exit 1
