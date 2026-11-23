@@ -156,8 +156,7 @@ LogWriter::State::~State() {
   stop_writer();
   if (sink.needs_durable_sync()) {
     sync(/*durable=*/true);
-  } else if (capture_error.load() == CaptureError::BYTE_CAP ||
-             sink.head_dropped()) {
+  } else if (capture_error.load() == CaptureError::BYTE_CAP && sink.is_open()) {
     sink.mark_capped();
   }
   sink.close();
@@ -468,6 +467,9 @@ void LogWriter::State::wait_written() noexcept {
   if (!options.background || !writer.joinable()) return;
   wake.post();
   std::unique_lock lock{mutex};
+  // Wake a writer parked on `flush_cv` while `flushing` is true (e.g. when
+  // close_at_stop() submits a follow-up chunk inside settle()).
+  flush_cv.notify_one();
   chunk_ready.wait(lock, [this] {
     return file_ready && completed.load() == submitted.load();
   });
@@ -487,12 +489,16 @@ void LogWriter::State::settle() noexcept {
 
 void LogWriter::State::drain() noexcept {
   struct FlushingGuard {
-    std::atomic<bool>& flag;
-    explicit FlushingGuard(std::atomic<bool>& f) noexcept : flag{f} {
-      flag.store(true, std::memory_order_release);
+    State& state;
+    explicit FlushingGuard(State& s) noexcept : state{s} {
+      state.flushing.store(true, std::memory_order_release);
     }
-    ~FlushingGuard() { flag.store(false, std::memory_order_release); }
-  } flushing_guard{flushing};
+    ~FlushingGuard() {
+      std::lock_guard lock{state.mutex};
+      state.flushing.store(false, std::memory_order_release);
+      state.flush_cv.notify_one();
+    }
+  } flushing_guard{*this};
 
   if (options.before_flush_wait) options.before_flush_wait();
   settle();
@@ -587,6 +593,20 @@ void LogWriter::State::start_writer() {
         if (raw->submitted.load(std::memory_order_seq_cst) != next) continue;
         return;
       }
+      if (raw->flushing.load(std::memory_order_acquire)) {
+        // drain() will durable-sync once every submitted chunk is written and
+        // notify `flush_cv` when it finishes (or when wait_written() needs a
+        // newly submitted chunk drained). Park on `flush_cv` under `mutex`
+        // rather than polling `wake` against an already-elapsed sync_interval.
+        streaming = false;
+        timed = false;
+        raw->flush_cv.wait(lock, [&] {
+          return !raw->flushing.load(std::memory_order_acquire) ||
+                 raw->stopping.load(std::memory_order_seq_cst) ||
+                 raw->submitted.load(std::memory_order_seq_cst) != next;
+        });
+        continue;
+      }
 
       // Sleep, without the mutex. A record that arrived within
       // write_interval of the last write waits for the next write to be
@@ -602,16 +622,7 @@ void LogWriter::State::start_writer() {
       // that lands before the wait is kept by the semaphore, so none is
       // lost; a stale one only makes the next wait return at once and the
       // loop check again.
-      // While drain() is running, it will durable-sync once every submitted
-      // chunk is written (and wake us if it submits another). Avoid spinning
-      // on an already-elapsed sync_at while drain() finishes settle() and
-      // acquires mutex for its durable sync.
-      const auto sync_at =
-          raw->flushing.load(std::memory_order_acquire)
-              ? now + std::max<std::chrono::nanoseconds>(
-                          raw->options.sync_interval,
-                          std::chrono::milliseconds{1})
-              : raw->sink.last_sync() + raw->options.sync_interval;
+      const auto sync_at = raw->sink.last_sync() + raw->options.sync_interval;
       // A writer that has never written has nothing unwritten and no
       // stream here (an unwritten record would have been due above).
       const auto write_at =

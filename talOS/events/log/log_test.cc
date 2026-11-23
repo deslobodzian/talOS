@@ -1220,6 +1220,8 @@ TEST(LogDurability, FlushSkipsCoincidingPeriodicSync) {
   std::atomic<int> periodic_syncs{0};
   std::atomic<int> durable_syncs{0};
   int periodic_at_durable = -1;
+  std::uint64_t wakeups_at_durable = 999;
+  const LogWriter* writer_ptr = nullptr;
 
   {
     LogWriter::Options options{4096, 2, /*background=*/true};
@@ -1243,6 +1245,7 @@ TEST(LogDurability, FlushSkipsCoincidingPeriodicSync) {
       durable_syncs.fetch_add(1);
       if (periodic_at_durable < 0) {
         periodic_at_durable = periodic_syncs.load();
+        wakeups_at_durable = writer_ptr->wakeups();
       }
       return process::DurableSync(fd);
     };
@@ -1260,6 +1263,7 @@ TEST(LogDurability, FlushSkipsCoincidingPeriodicSync) {
     };
 
     LogWriter writer{path, "flush_periodic", std::move(options)};
+    writer_ptr = &writer;
     struct ReleaseGates {
       std::mutex& mutex;
       std::condition_variable& cv;
@@ -1293,10 +1297,111 @@ TEST(LogDurability, FlushSkipsCoincidingPeriodicSync) {
     ASSERT_FALSE(writer.failed()) << writer.error();
     EXPECT_EQ(periodic_at_durable, 0)
         << "writer ran periodic sync right before flush()'s DurableSync";
+    EXPECT_EQ(wakeups_at_durable, 0u)
+        << "writer polled wake while parked in flush_cv during drain()";
     EXPECT_EQ(durable_syncs.load(), 1);
   }
   EXPECT_EQ(durable_syncs.load(), 1);
   ::unlink(path.c_str());
+}
+
+// REQ-OPS-12: when a non-rotating byte cap trips after flush() cleared
+// needs_durable_sync_ with zero new bytes written, destruction must still
+// create and durable-sync `<path>.capped` without re-syncing the log file;
+// LogFileSink::sync() with no open descriptor (fd_ < 0) must not create
+// `<path>.capped`.
+TEST(LogDurability, DestructionMarksCappedWhenByteCapTripsAfterFlush) {
+  const auto path = TempPath("byte_cap_after_flush");
+  const auto marker = CappedMarkerPath(path);
+
+  // Unopened sink (fd_ < 0): sync() does not create `<path>.capped`.
+  {
+    ::unlink(path.c_str());
+    ::unlink(marker.c_str());
+    LogFileSink sink{path};
+    sink.sync(/*durable=*/true, /*capture_stopped=*/true);
+    EXPECT_FALSE(std::filesystem::exists(marker));
+  }
+
+  for (const bool background : {false, true}) {
+    SCOPED_TRACE(background ? "background" : "synchronous");
+    ::unlink(path.c_str());
+    ::unlink(marker.c_str());
+
+    std::mutex fd_mutex;
+    std::map<int, std::string> fd_paths;
+    std::atomic<int> log_durable_syncs{0};
+    std::atomic<int> marker_durable_syncs{0};
+
+    LogWriter::Options options{4096, 2, background};
+    options.sync_interval = std::chrono::hours{1};
+    // Fits FileHeader + one 16-byte record exactly (and < 2 * (prefix + GAP),
+    // so segment_bytes == 0 and the second record trips BYTE_CAP with 0 bytes
+    // written after flush()).
+    options.max_bytes = sizeof(FileHeader) + sizeof(RecordHeader) + 16;
+    options.sink_ops.open = [&](const char* target, int flags, mode_t mode) {
+      const int fd = (flags & O_CREAT) != 0 ? ::open(target, flags, mode)
+                                            : ::open(target, flags);
+      if (fd >= 0) {
+        std::lock_guard lock{fd_mutex};
+        fd_paths[fd] = target;
+      }
+      return fd;
+    };
+    options.sink_ops.close = [&](int fd) {
+      {
+        std::lock_guard lock{fd_mutex};
+        fd_paths.erase(fd);
+      }
+      return ::close(fd);
+    };
+    options.sink_ops.durable_sync = [&](int fd) {
+      std::string target;
+      {
+        std::lock_guard lock{fd_mutex};
+        if (const auto it = fd_paths.find(fd); it != fd_paths.end()) {
+          target = it->second;
+        }
+      }
+      if (target == path) {
+        log_durable_syncs.fetch_add(1);
+      } else if (target == marker) {
+        marker_durable_syncs.fetch_add(1);
+      }
+      return process::DurableSync(fd);
+    };
+
+    {
+      LogWriter writer{path, "cap_after_flush", std::move(options)};
+      writer.start({}, {});
+      Context ctx{};
+      ctx.dispatch_index = 1;
+      writer.dispatch(ctx, MakePayload(16, 1));
+      writer.flush();
+      ASSERT_FALSE(writer.failed()) << writer.error();
+      ASSERT_FALSE(writer.capture_stopped());
+      ASSERT_FALSE(std::filesystem::exists(marker));
+      ASSERT_EQ(log_durable_syncs.load(), 1);
+      ASSERT_EQ(marker_durable_syncs.load(), 0);
+
+      // Second record crosses max_bytes -> BYTE_CAP with zero bytes written.
+      ctx.dispatch_index = 2;
+      writer.dispatch(ctx, MakePayload(16, 2));
+      ASSERT_TRUE(writer.capture_stopped());
+      ASSERT_TRUE(writer.capped());
+    }
+
+    EXPECT_TRUE(std::filesystem::exists(marker))
+        << "destructor failed to create `<path>.capped` when BYTE_CAP tripped "
+           "after flush()";
+    EXPECT_EQ(log_durable_syncs.load(), 1)
+        << "destructor redundantly synced the log file after flush()";
+    EXPECT_EQ(marker_durable_syncs.load(), 1)
+        << "destructor must durable-sync `<path>.capped` once";
+  }
+
+  ::unlink(path.c_str());
+  ::unlink(marker.c_str());
 }
 
 // Segment rotation must leave whole segments across any power cut: durable-sync
