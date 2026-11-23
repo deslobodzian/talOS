@@ -409,6 +409,205 @@ TEST_F(MetalAprilTagParityTest, RepeatedIdSpatialMatchingParity) {
   tag36h11_destroy(tf);
 }
 
+TEST_F(MetalAprilTagParityTest, OddDimensionsDecimate2xParity) {
+  talos::vision::apriltag::DetectorOptions dec_opts = options_;
+  dec_opts.quad_decimate = 2.0f;
+  dec_opts.refine_edges = true;
+  cpu_backend_->SetOptions(dec_opts);
+  metal_backend_->SetOptions(dec_opts);
+
+  apriltag_family_t* tf = tag36h11_create();
+  image_u8_t* tag_im = apriltag_to_image(tf, 5);
+  ASSERT_NE(tag_im, nullptr);
+
+  // Odd dimensions (643x487) decimate to ceil dims 322x244 in upstream
+  // image_u8_decimate(..., 2.0f); Metal must match ceil dims rather than floor.
+  const int width = 643;
+  const int height = 487;
+  std::vector<uint8_t> rgb_buf(static_cast<size_t>(width) * height * 3, 200);
+  std::vector<uint8_t> gray_buf(static_cast<size_t>(width) * height, 200);
+
+  const int start_x = 261;
+  const int start_y = 183;
+  const int scale = 10;
+  for (int ty = 0; ty < tag_im->height; ++ty) {
+    for (int tx = 0; tx < tag_im->width; ++tx) {
+      const uint8_t v = tag_im->buf[ty * tag_im->stride + tx];
+      for (int sy = 0; sy < scale; ++sy) {
+        for (int sx = 0; sx < scale; ++sx) {
+          const int px = start_x + tx * scale + sx;
+          const int py = start_y + ty * scale + sy;
+          if (px < width && py < height) {
+            gray_buf[py * width + px] = v;
+            const int idx = (py * width + px) * 3;
+            rgb_buf[idx + 0] = v;
+            rgb_buf[idx + 1] = v;
+            rgb_buf[idx + 2] = v;
+          }
+        }
+      }
+    }
+  }
+
+  const auto cpu_dets = cpu_backend_->Detect(gray_buf.data(), width, height,
+                                             width, intrinsics_, tag_size_m_);
+  const auto metal_rgb_dets =
+      metal_backend_->Detect(rgb_buf.data(), width, height, width * 3,
+                             PixelFormat::kRgb8, intrinsics_, tag_size_m_);
+  const auto metal_gray_dets =
+      metal_backend_->Detect(gray_buf.data(), width, height, width,
+                             PixelFormat::kGray8, intrinsics_, tag_size_m_);
+
+  ASSERT_EQ(cpu_dets.size(), 1u);
+  EXPECT_EQ(cpu_dets[0].id, 5);
+  AssertAcceptanceContract(cpu_dets, metal_rgb_dets,
+                           "OddDimensionsDecimate2xRgb");
+  AssertAcceptanceContract(cpu_dets, metal_gray_dets,
+                           "OddDimensionsDecimate2xGray");
+
+  Frame odd_frame(0, 0, 0, event::steady_now(), width, height,
+                  PixelFormat::kGray8, width);
+  std::memcpy(odd_frame.mutable_data(), gray_buf.data(), gray_buf.size());
+  const auto exec = metal_backend_->Execute(odd_frame);
+  ASSERT_TRUE(exec.success);
+  ASSERT_EQ(exec.detections.size(), 1u);
+  EXPECT_EQ(exec.detections[0].id, 5);
+  EXPECT_TRUE(exec.detections[0].valid);
+  if (metal_backend_->supports_gpu()) {
+    EXPECT_EQ(exec.effective_backend, "metal");
+  }
+
+  // Also exercise a tiny odd image (65x49 -> 33x25) with 2x decimation.
+  const int small_w = 65;
+  const int small_h = 49;
+  std::vector<uint8_t> small_gray(static_cast<size_t>(small_w) * small_h, 180);
+  const auto small_cpu =
+      cpu_backend_->Detect(small_gray.data(), small_w, small_h, small_w);
+  const auto small_metal = metal_backend_->Detect(
+      small_gray.data(), small_w, small_h, small_w, PixelFormat::kGray8);
+  AssertAcceptanceContract(small_cpu, small_metal,
+                           "TinyOddDimensionsDecimate2x");
+
+  image_u8_destroy(tag_im);
+  tag36h11_destroy(tf);
+
+  cpu_backend_->SetOptions(options_);
+  metal_backend_->SetOptions(options_);
+}
+
+TEST_F(MetalAprilTagParityTest, HammingOneRawValidMatchesCpuBackend) {
+  apriltag_family_t* tf = tag36h11_create();
+  image_u8_t* tag_im = apriltag_to_image(tf, 0);
+  ASSERT_NE(tag_im, nullptr);
+
+  // Flip exactly one interior payload bit so apriltag decodes ID 0 with
+  // hamming == 1 (accepted under max_hamming = 2).
+  tag_im->buf[3 * tag_im->stride + 3] =
+      static_cast<uint8_t>(255 - tag_im->buf[3 * tag_im->stride + 3]);
+
+  const int width = 320;
+  const int height = 240;
+  Frame frame(0, 0, 0, event::steady_now(), width, height, PixelFormat::kGray8,
+              width);
+  std::memset(frame.mutable_data(), 220, static_cast<size_t>(width) * height);
+
+  const int start_x = 110;
+  const int start_y = 70;
+  const int scale = 10;
+  for (int ty = 0; ty < tag_im->height; ++ty) {
+    for (int tx = 0; tx < tag_im->width; ++tx) {
+      const uint8_t v = tag_im->buf[ty * tag_im->stride + tx];
+      for (int sy = 0; sy < scale; ++sy) {
+        for (int sx = 0; sx < scale; ++sx) {
+          frame.mutable_data()[(start_y + ty * scale + sy) * width +
+                               (start_x + tx * scale + sx)] = v;
+        }
+      }
+    }
+  }
+  image_u8_destroy(tag_im);
+  tag36h11_destroy(tf);
+
+  talos::vision::CpuAprilTagBackend cpu_compute(options_);
+  const auto cpu_res = cpu_compute.Execute(frame);
+  const auto metal_res = metal_backend_->Execute(frame);
+
+  ASSERT_TRUE(cpu_res.success);
+  ASSERT_TRUE(metal_res.success);
+  ASSERT_EQ(cpu_res.detections.size(), 1u);
+  ASSERT_EQ(metal_res.detections.size(), 1u);
+  EXPECT_EQ(cpu_res.detections[0].id, 0);
+  EXPECT_EQ(metal_res.detections[0].id, 0);
+  EXPECT_EQ(cpu_res.detections[0].hamming, 1);
+  EXPECT_EQ(metal_res.detections[0].hamming, 1);
+  EXPECT_TRUE(cpu_res.detections[0].valid);
+  EXPECT_EQ(metal_res.detections[0].valid, cpu_res.detections[0].valid);
+}
+
+TEST_F(MetalAprilTagParityTest, Stage2CandidateOverflowAfterLargerFrame) {
+  // First run a large frame (800x600) so Metal's grow-only cached_cand_capacity
+  // is 240,000, much larger than the next frame's maxc.
+  const int big_w = 800;
+  const int big_h = 600;
+  std::vector<uint8_t> big_gray(static_cast<size_t>(big_w) * big_h, 128);
+  for (int y = 0; y < big_h; ++y) {
+    for (int x = 0; x < big_w; ++x) {
+      big_gray[y * big_w + x] = ((x + y) & 1) ? 240 : 15;
+    }
+  }
+  (void)metal_backend_->Detect(big_gray.data(), big_w, big_h, big_w,
+                               PixelFormat::kGray8);
+
+  // Now run a smaller 256x256 frame (maxc = 32,768) where most pixels are a
+  // 1px checkerboard (> 32,768 edge candidates, yet <= 240,000 cached capacity)
+  // around a clean tag36h11 ID 2. Stage 2 must detect overflow against this
+  // frame's maxc and fall back cleanly to Stage 2a without reading stale slots.
+  const int w = 256;
+  const int h = 256;
+  std::vector<uint8_t> small_gray(static_cast<size_t>(w) * h);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      small_gray[y * w + x] = ((x + y) & 1) ? 240 : 15;
+    }
+  }
+
+  // Clear a quiet margin around the stamped tag so it decodes cleanly.
+  const int start_x = 88;
+  const int start_y = 88;
+  const int scale = 8;
+  for (int y = start_y - 8; y < start_y + 10 * scale + 8; ++y) {
+    for (int x = start_x - 8; x < start_x + 10 * scale + 8; ++x) {
+      small_gray[y * w + x] = 220;
+    }
+  }
+  apriltag_family_t* tf = tag36h11_create();
+  image_u8_t* tag_im = apriltag_to_image(tf, 2);
+  ASSERT_NE(tag_im, nullptr);
+  for (int ty = 0; ty < tag_im->height; ++ty) {
+    for (int tx = 0; tx < tag_im->width; ++tx) {
+      const uint8_t v = tag_im->buf[ty * tag_im->stride + tx];
+      for (int sy = 0; sy < scale; ++sy) {
+        for (int sx = 0; sx < scale; ++sx) {
+          small_gray[(start_y + ty * scale + sy) * w +
+                     (start_x + tx * scale + sx)] = v;
+        }
+      }
+    }
+  }
+  image_u8_destroy(tag_im);
+  tag36h11_destroy(tf);
+
+  const auto cpu_dets = cpu_backend_->Detect(small_gray.data(), w, h, w,
+                                             intrinsics_, tag_size_m_);
+  const auto metal_dets =
+      metal_backend_->Detect(small_gray.data(), w, h, w, PixelFormat::kGray8,
+                             intrinsics_, tag_size_m_);
+  ASSERT_EQ(cpu_dets.size(), 1u);
+  EXPECT_EQ(cpu_dets[0].id, 2);
+  AssertAcceptanceContract(cpu_dets, metal_dets,
+                           "Stage2CandidateOverflowAfterLargerFrame");
+}
+
 #if defined(__APPLE__)
 void AssertThresholdParity(MetalAprilTagBackend& backend, image_u8_t* im,
                            uint32_t min_diff = 5,

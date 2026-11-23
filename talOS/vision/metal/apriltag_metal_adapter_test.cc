@@ -356,6 +356,112 @@ TEST_F(AprilTagMetalAdapterTest, DecimatedImageParity) {
   image_u8_destroy(im);
 }
 
+TEST_F(AprilTagMetalAdapterTest,
+       OddDimensionDecimatedFallbackAndMatchingCeilParity) {
+  td_->quad_decimate = 2.0f;
+
+  // Build an odd-dimension image (643x487) containing a valid tag36h11 ID 0.
+  // Upstream image_u8_decimate(..., 2.0f) produces ceil dims 322x244, while a
+  // floor-sized threshim is 321x243.
+  const int width = 643;
+  const int height = 487;
+  image_u8_t* im = image_u8_create(width, height);
+  ASSERT_NE(im, nullptr);
+  std::memset(im->buf, 200, static_cast<size_t>(im->stride) * height);
+
+  image_u8_t* tag_im = apriltag_to_image(tf_, 0);
+  ASSERT_NE(tag_im, nullptr);
+  const int start_x = 260;
+  const int start_y = 180;
+  const int scale = 10;
+  for (int ty = 0; ty < tag_im->height; ++ty) {
+    for (int tx = 0; tx < tag_im->width; ++tx) {
+      const uint8_t v = tag_im->buf[ty * tag_im->stride + tx];
+      for (int sy = 0; sy < scale; ++sy) {
+        for (int sx = 0; sx < scale; ++sx) {
+          im->buf[(start_y + ty * scale + sy) * im->stride +
+                  (start_x + tx * scale + sx)] = v;
+        }
+      }
+    }
+  }
+  image_u8_destroy(tag_im);
+
+  zarray_t* standard_dets = apriltag_detector_detect(td_, im);
+  ASSERT_NE(standard_dets, nullptr);
+  ASSERT_EQ(zarray_size(standard_dets), 1);
+
+  // 1. Matching ceil-dimension threshim (322x244) must achieve exact parity.
+  image_u8_t* dec_im = image_u8_decimate(im, 2.0f);
+  ASSERT_NE(dec_im, nullptr);
+  EXPECT_EQ(dec_im->width, 322);
+  EXPECT_EQ(dec_im->height, 244);
+  image_u8_t* matching_thresh = apriltag_threshold_cpu(td_, dec_im);
+  ASSERT_NE(matching_thresh, nullptr);
+
+  zarray_t* matching_dets =
+      apriltag_detector_detect_with_threshim(td_, im, matching_thresh);
+  ASSERT_NE(matching_dets, nullptr);
+  ASSERT_EQ(zarray_size(matching_dets), 1);
+
+  // 2. Mismatched floor-dimension threshim (321x243) must NOT abort or
+  // over-read: direct quad_thresh helpers return NULL, and detect_* helpers
+  // fall back cleanly to CPU quad_thresh with identical detections.
+  image_u8_t* floor_thresh = image_u8_create(width / 2, height / 2);
+  ASSERT_NE(floor_thresh, nullptr);
+  std::memset(floor_thresh->buf, 127,
+              static_cast<size_t>(floor_thresh->stride) * floor_thresh->height);
+
+  EXPECT_EQ(apriltag_quad_thresh_from_threshim(td_, dec_im, floor_thresh),
+            nullptr);
+  std::vector<uint32_t> floor_parents(
+      static_cast<size_t>(floor_thresh->width) * floor_thresh->height,
+      0xFFFFFFFFu);
+  std::vector<uint32_t> floor_sizes(floor_parents.size(), 0u);
+  EXPECT_EQ(
+      apriltag_quad_thresh_from_gpu_labels(
+          td_, dec_im, floor_thresh, floor_parents.data(), floor_sizes.data()),
+      nullptr);
+
+  zarray_t* fallback_thresh_dets =
+      apriltag_detector_detect_with_threshim(td_, im, floor_thresh);
+  ASSERT_NE(fallback_thresh_dets, nullptr);
+  ASSERT_EQ(zarray_size(fallback_thresh_dets), 1);
+
+  zarray_t* fallback_labels_dets = apriltag_detector_detect_with_gpu_labels(
+      td_, im, floor_thresh, floor_parents.data(), floor_sizes.data());
+  ASSERT_NE(fallback_labels_dets, nullptr);
+  ASSERT_EQ(zarray_size(fallback_labels_dets), 1);
+
+  zarray_t* empty_clusters = zarray_create(sizeof(zarray_t*));
+  zarray_t* fallback_clusters_dets = apriltag_detector_detect_with_gpu_clusters(
+      td_, im, floor_thresh, empty_clusters);
+  ASSERT_NE(fallback_clusters_dets, nullptr);
+  ASSERT_EQ(zarray_size(fallback_clusters_dets), 1);
+
+  apriltag_detection_t* det_std = nullptr;
+  zarray_get(standard_dets, 0, reinterpret_cast<void*>(&det_std));
+  for (zarray_t* dets : {matching_dets, fallback_thresh_dets,
+                         fallback_labels_dets, fallback_clusters_dets}) {
+    apriltag_detection_t* det = nullptr;
+    zarray_get(dets, 0, reinterpret_cast<void*>(&det));
+    EXPECT_EQ(det->id, det_std->id);
+    EXPECT_EQ(det->hamming, det_std->hamming);
+    EXPECT_NEAR(det->c[0], det_std->c[0], 0.1);
+    EXPECT_NEAR(det->c[1], det_std->c[1], 0.1);
+  }
+
+  apriltag_detections_destroy(standard_dets);
+  apriltag_detections_destroy(matching_dets);
+  apriltag_detections_destroy(fallback_thresh_dets);
+  apriltag_detections_destroy(fallback_labels_dets);
+  apriltag_detections_destroy(fallback_clusters_dets);
+  image_u8_destroy(floor_thresh);
+  image_u8_destroy(matching_thresh);
+  image_u8_destroy(dec_im);
+  image_u8_destroy(im);
+}
+
 #if defined(__APPLE__)
 TEST_F(AprilTagMetalAdapterTest, GpuGeneratedThreshimDetection) {
   MTL::Device* device = MTL::CreateSystemDefaultDevice();
