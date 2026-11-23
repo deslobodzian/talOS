@@ -40,11 +40,13 @@ check below.
   | **BRIDGE LINK** `Dashboard to bridge link down` or `nothing heard` | the laptop does not reach the main processor's port 5800: main processor off, still booting, off the robot network, or started with `--no-studio`; or the Studio bridge that serves the page died. The launcher restarts a dead bridge within about a second, a few times ([Studio bridge](../talOS/launcher/README.md#studio-bridge)), and the page reconnects by itself; one that keeps dying, or hangs, stays down for the rest of the session while the robot drives on | wait a few seconds; if it persists, [main processor not reachable](#main-processor-not-reachable) tells which; when only the dashboard is down, [dashboard down for the session](#dashboard-down-for-the-session) |
   | **TELEMETRY** `Telemetry stale` | the bridge is up but the telemetry node publishes nothing new: every value is stale | check the telemetry node in Studio at `/` (the pit); the robot can drive, but the dashboard shows nothing current. With `the page missed time (laptop asleep)`: the laptop slept, wait a second for a new tick |
   | **TELEMETRY** `Telemetry feed could not be decoded: reload the page` | the page could not decode what the bridge sent (a page built for another bridge version, or a corrupt message); it reconnects by itself, every 5 s after 3 failures in a row | reload the page; if it persists, the page and the bridge come from different builds: redeploy the bundle |
-  | **ROBORIO LINK** `RoboRIO link lost` | the main processor accepts no hardware state from the RoboRIO: RoboRIO off, its program not running, a wrong address, or another protocol version; every output is neutral | read the Driver Station message log; on a protocol error redeploy both sides from one checkout ([DEPLOYMENT.md](DEPLOYMENT.md#roborio)) |
+  | **PROTOCOL MISMATCH** `RoboRIO and main processor protocol versions differ; redeploy both` | the main processor received UDP frames from the RoboRIO of another hardware protocol version (checked before **ROBORIO LINK**); every output is neutral | redeploy both the RoboRIO program and the main processor bundle from one checkout ([DEPLOYMENT.md](DEPLOYMENT.md#roborio)) |
   | **HARDWARE BRIDGE** `Hardware bridge not publishing` | no hardware status: the hardware bridge (`hardware_node`) on the main processor is not publishing, so the RoboRIO link cannot be judged | check Subsystems below |
+  | **ROBORIO LINK** `RoboRIO link lost` | the main processor accepts no hardware state from the RoboRIO: RoboRIO off, its program not running, or a wrong address; every output is neutral | read the Driver Station message log; check RoboRIO power, code, and network |
   | `/drive` shows `Studio's pages are missing from the installed bundle` (or `are not built`) instead of the dashboard | the bridge runs, but the installed bundle has no dashboard pages | with the robot disabled, install a bundle built from the current checkout and restart the service ([DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor)); installing the same bundle again changes nothing |
   | **REPLACED** | another `/drive` page took this page's slot (the layout's `drive_clients` are held) | close the other page, then press Reconnect, which takes the oldest page's slot |
   | **DRAWING ERROR** `The dashboard is not updating; reload the page` | a widget threw while drawing; the top status line stays live while the grid keeps its last drawn values, dimmed and outlined in red | reload the page |
+  | **LAYOUT ERROR** | reloading `/drive/layout.json` after a reconnect or session change failed; the top status line stays live while the previous grid stays frozen and marked errored while retrying automatically | wait for recovery or check the deployed layout config |
 
 - [ ] Match: `DISABLED`; the alliance and station are the assigned ones; at
   the field, the match number and `FMS`. `NO DRIVER STATION`: the main
@@ -56,7 +58,7 @@ check below.
   `[[subsystem.labels]]` names in the deployed config
   ([automatic channels](../talOS/telemetry/README.md#automatic-channels-and-units)).
 - [ ] Alerts: Active reads `none`. Each alert names its owner and its
-  condition (`hw link lost`, `hw not configured`, `hw uncommissioned`,
+  condition (`hw link lost`, `hw Protocol mismatch — RoboRIO and main processor builds differ; redeploy both`, `hw not configured`, `hw uncommissioned`,
   `hw motor fault`, `hw hardware fault (total feedback loss or gateway fault)`,
   `hw config refused while enabled: disable to accept the new configuration`,
   `hw owner timed out`, `hw brownout`, `hw can bus unread`; what each means:

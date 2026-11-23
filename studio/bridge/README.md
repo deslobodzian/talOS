@@ -53,6 +53,9 @@ These named options are removed before positional parsing:
   `/declared.json`.
 - `--manifest PATH` or `--manifest=PATH`: read the file on each
   `/manifest.json` request.
+- `--refusal-file PATH` or `--refusal-file=PATH`: serve a launcher phase-1
+  refusal on `/drive` without opening shared memory or the registry (see
+  [Driver dashboard feed](#driver-dashboard-feed)).
 
 `--describe` prints the node description and exits without opening shared memory
 or sockets. In that mode, `--config PATH` supplies `[studio] topic`.
@@ -68,8 +71,9 @@ The manual runtime command still takes its topic positionally.
 | `/declared.json` | Startup copy of the declared graph file | 404 if absent, empty or unreadable |
 | `/manifest.json` | Current manifest file | 404 if absent or unreadable; 413 above 1 MiB (Studio's own manifest limit) |
 | `/telemetry` | WebSocket: binary telemetry and text system graphs | Excess clients receive 503 |
-| `/drive/layout.json` | The driver dashboard's layout (`DashboardLayoutJson`) | 404 without a layout |
-| `/drive` | WebSocket upgrade: the [driver dashboard feed](#driver-dashboard-feed); any other GET: `drive.html` from the web directory | 404 without a layout (the upgrade); 404 without the file (the page) |
+| `/drive/layout.json` | The driver dashboard's layout (`DashboardLayoutJson`) | 404 without a layout (unless `--refusal-file`) |
+| `/drive/summary.json` | Latest `talos.drive.summary` JSON | 404 without a layout (unless `--refusal-file`) |
+| `/drive` | WebSocket upgrade: the [driver dashboard feed](#driver-dashboard-feed); any other GET: `drive.html` from the web directory | 404 without a layout (the upgrade, unless `--refusal-file`); 503 without the file (the page) |
 
 Every 200 carries `Cache-Control` (REQ-OPS-34):
 
