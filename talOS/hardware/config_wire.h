@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../driver_station/little_endian.h"
 #include "../protocol/frame.h"
 #include "config.h"
 
@@ -124,47 +125,20 @@ struct ByteWriter {
   }
 };
 
-struct SpanByteWriter {
-  std::span<uint8_t> buf;
-  std::size_t pos{};
-  bool ok{true};
-  void Int(uint64_t value, int bytes) noexcept {
-    if (!ok || pos + static_cast<std::size_t>(bytes) > buf.size()) {
-      ok = false;
-      return;
-    }
-    for (int i = 0; i < bytes; ++i) {
-      buf[pos++] = static_cast<uint8_t>(value & 0xFF);
-      value >>= 8;
-    }
-  }
+struct SpanByteWriter : driver_station::LittleEndianWriter {
   void Real(double x) noexcept { Int(std::bit_cast<uint64_t>(x), 8); }
   void Text(std::string_view s) noexcept {
     Int(s.size(), 2);
-    if (!ok || pos + s.size() > buf.size()) {
+    if (!ok || s.size() > data.size() - pos) {
       ok = false;
       return;
     }
-    if (!s.empty()) std::memcpy(buf.data() + pos, s.data(), s.size());
+    if (!s.empty()) std::memcpy(data.data() + pos, s.data(), s.size());
     pos += s.size();
   }
 };
 
-struct ByteReader {
-  std::span<const uint8_t> data;
-  std::size_t pos{};
-  bool ok{true};
-  uint64_t Int(int bytes) noexcept {
-    uint64_t val{};
-    for (int i = 0; i < bytes; ++i) {
-      if (pos >= data.size()) {
-        ok = false;
-        return 0;
-      }
-      val |= uint64_t{data[pos++]} << (i * 8);
-    }
-    return val;
-  }
+struct ByteReader : driver_station::LittleEndianReader {
   // Signed 32-bit fields (CAN ids, DIO/PWM channels) travel as their
   // two's-complement bits; the conversion back is modular (C++20).
   int32_t Int32() noexcept {
@@ -177,7 +151,7 @@ struct ByteReader {
   }
   ConfigString Text() noexcept {
     const auto len = Int(2);
-    if (!ok || len > kMaxConfigNameLength || pos + len > data.size()) {
+    if (!ok || len > kMaxConfigNameLength || len > data.size() - pos) {
       ok = false;
       return {};
     }
@@ -186,7 +160,6 @@ struct ByteReader {
     pos += len;
     return s;
   }
-  bool Done() const noexcept { return ok && pos == data.size(); }
 };
 
 template <typename Writer>
@@ -285,7 +258,7 @@ void WriteConfig(Writer& w, const Config& c) {
 
 inline std::size_t SerializeConfigInto(const Config& c,
                                        std::span<uint8_t> out) noexcept {
-  detail::SpanByteWriter w{out};
+  detail::SpanByteWriter w{{out}};
   detail::WriteConfig(w, c);
   return w.ok ? w.pos : 0;
 }
@@ -300,7 +273,7 @@ inline std::vector<uint8_t> SerializeConfig(const Config& c) {
 inline bool DeserializeConfig(std::span<const uint8_t> bytes,
                               Config& out) noexcept {
   Config c{};
-  detail::ByteReader r{bytes};
+  detail::ByteReader r{{bytes}};
   c.period_us = r.Int(4);
   c.command_timeout_us = r.Int(4);
   c.status_hz = r.Real();
@@ -815,10 +788,10 @@ inline bool LoadPersistedConfig(std::span<const uint8_t> bytes,
   if (!std::equal(kPersistedConfigMagic.begin(), kPersistedConfigMagic.end(),
                   bytes.begin()))
     return false;
-  detail::ByteReader version{bytes.subspan(kPersistedConfigMagic.size(), 2)};
+  detail::ByteReader version{{bytes.subspan(kPersistedConfigMagic.size(), 2)}};
   if (version.Int(2) != protocol::kProtocolVersion) return false;
   const auto covered = bytes.first(bytes.size() - 4);
-  detail::ByteReader trailer{bytes.last(4)};
+  detail::ByteReader trailer{{bytes.last(4)}};
   if (ComputeCrc32(covered) != trailer.Int(4)) return false;
   Config parsed;
   if (!DeserializeConfig(covered.subspan(kPersistedConfigHeaderBytes),

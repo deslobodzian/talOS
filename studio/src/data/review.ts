@@ -12,6 +12,7 @@ import {AlertLevel} from '../generated/talos/telemetry/alert-level';
 import {parseDeclaredGraph, type DeclaredGraph} from '../system';
 import {parseManifest, type SessionManifest} from './manifest';
 import type {ChannelInfo} from './types';
+import {bool as checkBool, nonNegInt as checkNonNegInt, record as checkRecord} from './validate';
 
 export const DEFAULT_REVIEW_URL = 'http://127.0.0.1:5805';
 
@@ -104,12 +105,18 @@ export type SeriesColumns = {
 };
 export type SeriesBuckets = {buckets: number; channels: SeriesColumns[]};
 
-function record(value: unknown, what: string): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value))
-    fail(`${what} must be an object`);
-  return value as Record<string, unknown>;
-}
+const record = (value: unknown, what: string): Record<string, unknown> =>
+    checkRecord(value, what, fail);
 
+const bool = (source: Record<string, unknown>, key: string, where: string): boolean =>
+    checkBool(source, key, fail, `${where}.${key}`);
+
+const nonNegInt = (value: unknown, where: string): number =>
+    checkNonNegInt(value, where, fail);
+
+// Review responses carry uncapped strings and arrays with `${where}.${key}`
+// error paths (unlike validate.ts's boundedString/list for untrusted live
+// frames), so str stays local while record/bool/nonNegInt share validate.ts.
 function str(source: Record<string, unknown>, key: string, where: string): string {
   const value = source[key];
   if (typeof value !== 'string') fail(`${where}.${key} must be a string`);
@@ -231,21 +238,14 @@ function parseGaps(raw: unknown): ReviewGap[] {
   for (const entry of raw) {
     try {
       const g = record(entry, 'gap');
-      const count = (key: string) => {
-        const value = g[key];
-        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
-          fail(`gap.${key} must be a non-negative integer`);
-        return value as number;
-      };
-      if (typeof g.closed_at_flush !== 'boolean') fail('gap.closed_at_flush must be a boolean');
       const gap: ReviewGap = {
         process: str(g, 'process', 'gap'),
         start_ns: u64(g.start_ns, 'gap.start_ns'),
         end_ns: u64(g.end_ns, 'gap.end_ns'),
-        records: count('records'),
-        dispatches: count('dispatches'),
-        sends: count('sends'),
-        closed_at_flush: g.closed_at_flush as boolean
+        records: nonNegInt(g.records, 'gap.records'),
+        dispatches: nonNegInt(g.dispatches, 'gap.dispatches'),
+        sends: nonNegInt(g.sends, 'gap.sends'),
+        closed_at_flush: bool(g, 'closed_at_flush', 'gap')
       };
       if (BigInt(gap.end_ns) < BigInt(gap.start_ns)) fail('gap.end_ns is before gap.start_ns');
       out.push(gap);
@@ -289,16 +289,9 @@ const TIMELINE_MODES: ReadonlySet<string> =
 const TIMELINE_ALERT_LEVELS: ReadonlySet<string> =
     new Set(['error', 'warning', 'info']);
 
-function nonNegInt(value: unknown, where: string): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
-    fail(`${where} must be a non-negative integer`);
-  return value as number;
-}
-
 export function parseTimeline(raw: unknown): ReviewTimeline {
   const source = record(raw, 'timeline.json');
-  if (typeof source.hardware_not_decoded !== 'boolean')
-    fail('timeline.hardware_not_decoded must be a boolean');
+  const hardware_not_decoded = bool(source, 'hardware_not_decoded', 'timeline');
   if (!Array.isArray(source.modes)) fail('timeline.modes must be an array');
   if (!Array.isArray(source.alerts)) fail('timeline.alerts must be an array');
   if (!Array.isArray(source.runs)) fail('timeline.runs must be an array');
@@ -311,8 +304,7 @@ export function parseTimeline(raw: unknown): ReviewTimeline {
     const mode = str(m, 'mode', where);
     if (!TIMELINE_MODES.has(mode))
       fail(`${where}.mode must be disabled, teleop, auto, test or estop`);
-    if (typeof m.fms !== 'boolean') fail(`${where}.fms must be a boolean`);
-    return {start_ns, end_ns, mode: mode as TimelineMode, fms: m.fms as boolean};
+    return {start_ns, end_ns, mode: mode as TimelineMode, fms: bool(m, 'fms', where)};
   });
   const alerts: ReviewAlertInterval[] = (source.alerts as unknown[]).map((entry, i) => {
     const where = `timeline.alerts[${i}]`;
@@ -349,7 +341,7 @@ export function parseTimeline(raw: unknown): ReviewTimeline {
     };
   });
   return {
-    hardware_not_decoded: source.hardware_not_decoded as boolean,
+    hardware_not_decoded,
     modes,
     modes_dropped: nonNegInt(source.modes_dropped, 'timeline.modes_dropped'),
     alerts,
