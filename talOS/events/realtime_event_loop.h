@@ -189,18 +189,11 @@ class RealtimeEventLoop
   MonotonicTime now_impl() const { return Poller::now(); }
 
   void arm_timer(std::uint16_t id, MonotonicTime deadline, Duration period) {
-    const bool record =
-        this->timer_change_is_recorded(id, true, deadline, period);
-    scheduler_.schedule(id, deadline, period);
-    if (record) {
-      this->record_operation(EventKind::ARM_TIMER, id, deadline, period);
-    }
+    this->arm_scheduled_timer(scheduler_, id, deadline, period);
   }
 
   void disarm_timer(std::uint16_t id) {
-    const bool record = this->timer_change_is_recorded(id, false, {}, {});
-    scheduler_.disable(id);
-    if (record) this->record_operation(EventKind::DISARM_TIMER, id);
+    this->disarm_scheduled_timer(scheduler_, id);
   }
 
   // Runs until exit() is called.
