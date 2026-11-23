@@ -332,6 +332,7 @@ class Motor(_Rezeroable, _PositionTimedInput):
         return bool(self._sample().reverse_limit)
 
     def _set(self, mode, demand, ff_volts=0.0, slot=0):
+        slot = _abi.check_int(slot, _abi.INT32_MIN, _abi.INT32_MAX, "slot")
         _abi.ok(lib.talos_motor_set(self._node, self._index, mode, demand,
                                     ff_volts, slot))
 

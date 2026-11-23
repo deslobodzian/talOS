@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -252,8 +253,31 @@ struct HardwareLink::Impl {
     if (!clock.clock_offset_valid() || clock.clock_boot_id() != state.boot_id) {
       return std::nullopt;
     }
-    const std::int64_t us = static_cast<std::int64_t>(state.sample_time_us) +
-                            clock.clock_offset_us();
+    constexpr std::int64_t kMaxUs =
+        std::numeric_limits<std::int64_t>::max() / 1000;
+    constexpr std::int64_t kMinUs =
+        std::numeric_limits<std::int64_t>::min() / 1000;
+    const std::uint64_t sample_us = state.sample_time_us;
+    const std::int64_t offset_us = clock.clock_offset_us();
+    std::int64_t us = 0;
+    if (offset_us >= 0) {
+      const auto max_us = static_cast<std::uint64_t>(kMaxUs);
+      const auto off = static_cast<std::uint64_t>(offset_us);
+      if (sample_us > max_us || off > max_us - sample_us) return std::nullopt;
+      us = static_cast<std::int64_t>(sample_us + off);
+    } else {
+      const std::uint64_t neg =
+          static_cast<std::uint64_t>(-(offset_us + 1)) + 1;
+      if (sample_us >= neg) {
+        const std::uint64_t diff = sample_us - neg;
+        if (diff > static_cast<std::uint64_t>(kMaxUs)) return std::nullopt;
+        us = static_cast<std::int64_t>(diff);
+      } else {
+        const std::uint64_t mag = neg - sample_us;
+        if (mag > static_cast<std::uint64_t>(-kMinUs)) return std::nullopt;
+        us = -static_cast<std::int64_t>(mag);
+      }
+    }
     return Time::from_nanos(us * 1000);
   }
 
@@ -568,17 +592,38 @@ void RequireInUpdate(const Node& node, std::string_view what) {
   }
 }
 
+namespace {
+
+Duration StatusPeriodsBound(double status_hz, double periods, bool ceil_round) {
+  // INT64_MAX / 1000.0 = 9223372036854776.0 in IEEE-754 double, so strictly
+  // less yields at most 9223372036854774.0, guaranteeing us * 1000 <=
+  // INT64_MAX.
+  constexpr double kMaxMicros =
+      static_cast<double>(std::numeric_limits<std::int64_t>::max()) / 1000.0;
+  if (!std::isfinite(status_hz) || status_hz <= 0.0) {
+    throw std::invalid_argument("status_hz must be finite and positive");
+  }
+  const double raw_us = periods * 1e6 / status_hz;
+  const double rounded_us = ceil_round ? std::ceil(raw_us) : std::round(raw_us);
+  if (!std::isfinite(rounded_us) || rounded_us >= kMaxMicros) {
+    throw std::invalid_argument("status_hz is too small for age bound");
+  }
+  return std::chrono::microseconds{static_cast<std::int64_t>(rounded_us)};
+}
+
+}  // namespace
+
 Duration RezeroAgeBound(const hardware::Config& config) {
   constexpr double kStatusPeriods = 2;
-  return std::chrono::microseconds{
-      std::llround(kStatusPeriods * 1e6 / config.status_hz)};
+  return StatusPeriodsBound(config.status_hz, kStatusPeriods,
+                            /*ceil_round=*/false);
 }
 
 Duration ReadinessAgeBound(const hardware::Config& config) {
   // The RoboRIO's LATE threshold, rounded as it rounds it.
   constexpr double kStatusPeriods = 4;
-  return std::chrono::microseconds{static_cast<std::int64_t>(
-      std::ceil(kStatusPeriods * 1e6 / config.status_hz))};
+  return StatusPeriodsBound(config.status_hz, kStatusPeriods,
+                            /*ceil_round=*/true);
 }
 
 std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
@@ -633,6 +678,12 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                double ff_volts, int slot) {
   HardwareLink::Impl::Device& device =
       link.impl_->Output(index, Kind::kMotor, "Motor command");
+  if (static_cast<std::uint8_t>(mode) >
+      static_cast<std::uint8_t>(hardware::kLastMode)) {
+    throw std::invalid_argument(std::string{link.impl_->node.name()} +
+                                ": unknown motor mode " +
+                                std::to_string(static_cast<int>(mode)));
+  }
   if (slot < 0 || slot > 2) {
     throw std::invalid_argument(std::string{link.impl_->node.name()} +
                                 ": motor slot " + std::to_string(slot) +
@@ -682,8 +733,11 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
   const double requested_demand = demand;
   const double requested_ff = ff_volts;
   // A non-finite demand is no demand: neutral, rather than handing the
-  // gateway a NaN.
-  if (!std::isfinite(demand) || !std::isfinite(ff_volts)) {
+  // gateway a NaN. A neutral request always carries zero demand, zero
+  // feedforward and slot 0 so it matches Motor::stop() and the gateway's
+  // neutral representation.
+  if (!std::isfinite(demand) || !std::isfinite(ff_volts) ||
+      mode == hardware::Mode::kNeutral) {
     mode = hardware::Mode::kNeutral;
     demand = 0;
     ff_volts = 0;
@@ -843,6 +897,9 @@ std::optional<Time> AcquisitionTime(const HardwareLink& link,
   if (!age) return std::nullopt;
   const auto time = link.sample_time();
   if (!time) return std::nullopt;
+  if (time->nanos() < std::numeric_limits<std::int64_t>::min() + age->count()) {
+    return std::nullopt;
+  }
   return *time - *age;
 }
 }  // namespace
@@ -941,6 +998,14 @@ namespace {
 
 HardwareLink* LinkOf(Node& node) { return &node.extension<HardwareLink>(); }
 
+HardwareLink& RequireLink(HardwareLink* link, const char* what) {
+  if (link == nullptr) {
+    throw std::logic_error(std::string{what} +
+                           " handle is not bound to a Node");
+  }
+  return *link;
+}
+
 }  // namespace
 
 using hardware::Mode;
@@ -949,176 +1014,214 @@ Motor::Motor(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kMotor, name)} {}
 void Motor::set_duty_cycle(double fraction) {
-  HardwareAccess::motor_set(*link_, index_, Mode::kDutyCycle, fraction, 0, 0);
+  HardwareAccess::motor_set(RequireLink(link_, "Motor"), index_,
+                            Mode::kDutyCycle, fraction, 0, 0);
 }
 void Motor::set_voltage(double volts) {
-  HardwareAccess::motor_set(*link_, index_, Mode::kVoltage, volts, 0, 0);
+  HardwareAccess::motor_set(RequireLink(link_, "Motor"), index_, Mode::kVoltage,
+                            volts, 0, 0);
 }
 void Motor::set_velocity(double rps, double ff_volts, int slot) {
-  HardwareAccess::motor_set(*link_, index_, Mode::kVelocity, rps, ff_volts,
-                            slot);
+  HardwareAccess::motor_set(RequireLink(link_, "Motor"), index_,
+                            Mode::kVelocity, rps, ff_volts, slot);
 }
 void Motor::set_position(double rot, double ff_volts, int slot) {
-  HardwareAccess::motor_set(*link_, index_, Mode::kPosition, rot, ff_volts,
-                            slot);
+  HardwareAccess::motor_set(RequireLink(link_, "Motor"), index_,
+                            Mode::kPosition, rot, ff_volts, slot);
 }
 void Motor::set_motion_magic(double rot, double ff_volts, int slot) {
-  HardwareAccess::motor_set(*link_, index_, Mode::kMotionMagic, rot, ff_volts,
-                            slot);
+  HardwareAccess::motor_set(RequireLink(link_, "Motor"), index_,
+                            Mode::kMotionMagic, rot, ff_volts, slot);
 }
 void Motor::set_torque_current(double amperes) {
-  HardwareAccess::motor_set(*link_, index_, Mode::kTorqueCurrent, amperes, 0,
-                            0);
+  HardwareAccess::motor_set(RequireLink(link_, "Motor"), index_,
+                            Mode::kTorqueCurrent, amperes, 0, 0);
 }
 void Motor::stop() {
-  HardwareAccess::motor_set(*link_, index_, Mode::kNeutral, 0, 0, 0);
+  HardwareAccess::motor_set(RequireLink(link_, "Motor"), index_, Mode::kNeutral,
+                            0, 0, 0);
 }
 std::uint64_t Motor::clamped_count() const {
-  return HardwareAccess::motor_clamped_count(*link_, index_);
+  return HardwareAccess::motor_clamped_count(RequireLink(link_, "Motor"),
+                                             index_);
 }
 void Motor::rezero(double position_rot) {
-  HardwareAccess::motor_rezero(*link_, index_, position_rot);
+  HardwareAccess::motor_rezero(RequireLink(link_, "Motor"), index_,
+                               position_rot);
 }
 bool Motor::zeroed() const {
-  return HardwareAccess::motor_zeroed(*link_, index_);
+  return HardwareAccess::motor_zeroed(RequireLink(link_, "Motor"), index_);
 }
 double Motor::position() const {
-  return HardwareAccess::motor_sample(*link_, index_).position_rot;
+  return HardwareAccess::motor_sample(RequireLink(link_, "Motor"), index_)
+      .position_rot;
 }
 double Motor::velocity() const {
-  return HardwareAccess::motor_sample(*link_, index_).velocity_rps;
+  return HardwareAccess::motor_sample(RequireLink(link_, "Motor"), index_)
+      .velocity_rps;
 }
 double Motor::voltage() const {
-  return HardwareAccess::motor_sample(*link_, index_).voltage;
+  return HardwareAccess::motor_sample(RequireLink(link_, "Motor"), index_)
+      .voltage;
 }
 double Motor::current() const {
-  return HardwareAccess::motor_sample(*link_, index_).stator_current_a;
+  return HardwareAccess::motor_sample(RequireLink(link_, "Motor"), index_)
+      .stator_current_a;
 }
 double Motor::temperature_c() const {
-  return HardwareAccess::motor_sample(*link_, index_).temperature_c;
+  return HardwareAccess::motor_sample(RequireLink(link_, "Motor"), index_)
+      .temperature_c;
 }
 double Motor::supply_current_a() const {
-  return HardwareAccess::motor_sample(*link_, index_).supply_current_a;
+  return HardwareAccess::motor_sample(RequireLink(link_, "Motor"), index_)
+      .supply_current_a;
 }
 bool Motor::connected() const {
-  return HardwareAccess::motor_sample(*link_, index_).valid;
+  return HardwareAccess::motor_sample(RequireLink(link_, "Motor"), index_)
+      .valid;
 }
 bool Motor::forward_limit() const {
-  return HardwareAccess::motor_hard_limit(*link_, index_, true);
+  return HardwareAccess::motor_hard_limit(RequireLink(link_, "Motor"), index_,
+                                          true);
 }
 bool Motor::reverse_limit() const {
-  return HardwareAccess::motor_hard_limit(*link_, index_, false);
+  return HardwareAccess::motor_hard_limit(RequireLink(link_, "Motor"), index_,
+                                          false);
 }
 std::optional<Time> Motor::position_time() const {
-  return HardwareAccess::motor_time(*link_, index_, false);
+  return HardwareAccess::motor_time(RequireLink(link_, "Motor"), index_, false);
 }
 std::optional<Time> Motor::velocity_time() const {
-  return HardwareAccess::motor_time(*link_, index_, true);
+  return HardwareAccess::motor_time(RequireLink(link_, "Motor"), index_, true);
 }
 std::optional<Duration> Motor::position_age() const {
-  return HardwareAccess::motor_age(*link_, index_, false);
+  return HardwareAccess::motor_age(RequireLink(link_, "Motor"), index_, false);
 }
 std::optional<Duration> Motor::velocity_age() const {
-  return HardwareAccess::motor_age(*link_, index_, true);
+  return HardwareAccess::motor_age(RequireLink(link_, "Motor"), index_, true);
 }
 
 CANcoder::CANcoder(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kCANcoder, name)} {}
 double CANcoder::position() const {
-  return HardwareAccess::sensor_sample(*link_, index_).position_rot;
+  return HardwareAccess::sensor_sample(RequireLink(link_, "CANcoder"), index_)
+      .position_rot;
 }
 double CANcoder::velocity() const {
-  return HardwareAccess::sensor_sample(*link_, index_).velocity_rps;
+  return HardwareAccess::sensor_sample(RequireLink(link_, "CANcoder"), index_)
+      .velocity_rps;
 }
 bool CANcoder::connected() const {
-  return HardwareAccess::sensor_sample(*link_, index_).valid;
+  return HardwareAccess::sensor_sample(RequireLink(link_, "CANcoder"), index_)
+      .valid;
 }
 std::optional<Time> CANcoder::position_time() const {
-  return HardwareAccess::sensor_time(*link_, index_, false);
+  return HardwareAccess::sensor_time(RequireLink(link_, "CANcoder"), index_,
+                                     false);
 }
 std::optional<Time> CANcoder::velocity_time() const {
-  return HardwareAccess::sensor_time(*link_, index_, true);
+  return HardwareAccess::sensor_time(RequireLink(link_, "CANcoder"), index_,
+                                     true);
 }
 std::optional<Duration> CANcoder::position_age() const {
-  return HardwareAccess::sensor_age(*link_, index_, false);
+  return HardwareAccess::sensor_age(RequireLink(link_, "CANcoder"), index_,
+                                    false);
 }
 std::optional<Duration> CANcoder::velocity_age() const {
-  return HardwareAccess::sensor_age(*link_, index_, true);
+  return HardwareAccess::sensor_age(RequireLink(link_, "CANcoder"), index_,
+                                    true);
 }
 
 Gyro::Gyro(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kGyro, name)} {}
 void Gyro::rezero(double yaw_rot) {
-  HardwareAccess::gyro_rezero(*link_, index_, yaw_rot);
+  HardwareAccess::gyro_rezero(RequireLink(link_, "Gyro"), index_, yaw_rot);
 }
 bool Gyro::zeroed() const {
-  return HardwareAccess::gyro_zeroed(*link_, index_);
+  return HardwareAccess::gyro_zeroed(RequireLink(link_, "Gyro"), index_);
 }
 double Gyro::yaw() const {
-  return HardwareAccess::sensor_sample(*link_, index_).position_rot;
+  return HardwareAccess::sensor_sample(RequireLink(link_, "Gyro"), index_)
+      .position_rot;
 }
 double Gyro::yaw_rate() const {
-  return HardwareAccess::sensor_sample(*link_, index_).velocity_rps;
+  return HardwareAccess::sensor_sample(RequireLink(link_, "Gyro"), index_)
+      .velocity_rps;
 }
 bool Gyro::connected() const {
-  return HardwareAccess::sensor_sample(*link_, index_).valid;
+  return HardwareAccess::sensor_sample(RequireLink(link_, "Gyro"), index_)
+      .valid;
 }
 std::optional<Time> Gyro::yaw_time() const {
-  return HardwareAccess::sensor_time(*link_, index_, false);
+  return HardwareAccess::sensor_time(RequireLink(link_, "Gyro"), index_, false);
 }
 std::optional<Time> Gyro::yaw_rate_time() const {
-  return HardwareAccess::sensor_time(*link_, index_, true);
+  return HardwareAccess::sensor_time(RequireLink(link_, "Gyro"), index_, true);
 }
 
 DigitalInput::DigitalInput(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kDigitalInput, name)} {}
 bool DigitalInput::get() const {
-  return HardwareAccess::digital_input_sample(*link_, index_).value;
+  return HardwareAccess::digital_input_sample(
+             RequireLink(link_, "DigitalInput"), index_)
+      .value;
 }
 bool DigitalInput::connected() const {
-  return HardwareAccess::digital_input_sample(*link_, index_).valid;
+  return HardwareAccess::digital_input_sample(
+             RequireLink(link_, "DigitalInput"), index_)
+      .valid;
 }
 
 DigitalOutput::DigitalOutput(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kDigitalOutput, name)} {}
 void DigitalOutput::set(bool value) {
-  HardwareAccess::digital_output_set(*link_, index_, value);
+  HardwareAccess::digital_output_set(RequireLink(link_, "DigitalOutput"),
+                                     index_, value);
 }
 
 AnalogInput::AnalogInput(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kAnalogInput, name)} {}
 double AnalogInput::voltage() const {
-  return HardwareAccess::analog_input_sample(*link_, index_).voltage;
+  return HardwareAccess::analog_input_sample(RequireLink(link_, "AnalogInput"),
+                                             index_)
+      .voltage;
 }
 bool AnalogInput::connected() const {
-  return HardwareAccess::analog_input_sample(*link_, index_).valid;
+  return HardwareAccess::analog_input_sample(RequireLink(link_, "AnalogInput"),
+                                             index_)
+      .valid;
 }
 
 Encoder::Encoder(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kEncoder, name)} {}
 double Encoder::position() const {
-  return HardwareAccess::encoder_sample(*link_, index_).position_rot;
+  return HardwareAccess::encoder_sample(RequireLink(link_, "Encoder"), index_)
+      .position_rot;
 }
 double Encoder::velocity() const {
-  return HardwareAccess::encoder_sample(*link_, index_).velocity_rps;
+  return HardwareAccess::encoder_sample(RequireLink(link_, "Encoder"), index_)
+      .velocity_rps;
 }
 bool Encoder::connected() const {
-  return HardwareAccess::encoder_sample(*link_, index_).valid;
+  return HardwareAccess::encoder_sample(RequireLink(link_, "Encoder"), index_)
+      .valid;
 }
 
 PwmOutput::PwmOutput(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kPwm, name)} {}
 void PwmOutput::set(double output) {
-  HardwareAccess::pwm_set(*link_, index_, output);
+  HardwareAccess::pwm_set(RequireLink(link_, "PwmOutput"), index_, output);
 }
-void PwmOutput::stop() { HardwareAccess::pwm_stop(*link_, index_); }
+void PwmOutput::stop() {
+  HardwareAccess::pwm_stop(RequireLink(link_, "PwmOutput"), index_);
+}
 
 // --- Driver Station ----------------------------------------------------------
 
@@ -1213,17 +1316,28 @@ DsMode DsModeOf(std::uint32_t flags) {
   return DsMode::kNone;
 }
 
+namespace {
+
+DriverStationLink& RequireDriverStationLink(DriverStationLink* link) {
+  if (link == nullptr) {
+    throw std::logic_error("DriverStation handle is not bound to a Node");
+  }
+  return *link;
+}
+
+}  // namespace
+
 DriverStation DriverStationAccess::internal(Node& node) {
   return DriverStation{&node.extension<DriverStationLink>()};
 }
 DsMode DriverStationAccess::mode(const DriverStation& ds) {
-  return ds.link_->Mode();
+  return RequireDriverStationLink(ds.link_).Mode();
 }
 std::uint64_t DriverStationAccess::generation(const DriverStation& ds) {
-  return ds.link_->Generation();
+  return RequireDriverStationLink(ds.link_).Generation();
 }
 std::uint64_t DriverStationAccess::recoveries(const DriverStation& ds) {
-  return ds.link_->Recoveries();
+  return RequireDriverStationLink(ds.link_).Recoveries();
 }
 
 }  // namespace detail
@@ -1267,6 +1381,14 @@ detail::DriverStationLink* AttachPublicDriverStation(Node& node) {
   return &node.extension<detail::DriverStationLink>();
 }
 
+detail::DriverStationLink& RequirePublicDriverStationLink(
+    detail::DriverStationLink* link) {
+  if (link == nullptr) {
+    throw std::logic_error("DriverStation handle is not bound to a Node");
+  }
+  return *link;
+}
+
 }  // namespace
 
 DriverStation::DriverStation(Node& node)
@@ -1277,9 +1399,12 @@ DriverStation::DriverStation(Node& node, std::function<void()> on_packet)
   if (on_packet) link_->Listen(std::move(on_packet));
 }
 
-bool DriverStation::connected() const { return link_->Connected(); }
+bool DriverStation::connected() const {
+  return RequirePublicDriverStationLink(link_).Connected();
+}
 bool DriverStation::flag(driver_station::DsFlags flag) const {
-  return connected() && (link_->data().fms.flags & flag) != 0;
+  return connected() &&
+         (RequirePublicDriverStationLink(link_).data().fms.flags & flag) != 0;
 }
 bool DriverStation::enabled() const { return flag(driver_station::kEnabled); }
 bool DriverStation::autonomous() const {
@@ -1293,11 +1418,13 @@ bool DriverStation::fms_attached() const {
 }
 
 driver_station::Alliance DriverStation::alliance() const {
-  return link_->data().fms.alliance;
+  return RequirePublicDriverStationLink(link_).data().fms.alliance;
 }
-int DriverStation::station() const { return link_->data().fms.station; }
+int DriverStation::station() const {
+  return RequirePublicDriverStationLink(link_).data().fms.station;
+}
 double DriverStation::match_time() const {
-  return link_->data().fms.match_time_s;
+  return RequirePublicDriverStationLink(link_).data().fms.match_time_s;
 }
 
 Joystick DriverStation::joystick(std::size_t port) const {
@@ -1308,11 +1435,11 @@ Joystick DriverStation::joystick(std::size_t port) const {
                             ")");
   }
   if (!connected()) return Joystick{};
-  return Joystick{link_->data().joysticks[port]};
+  return Joystick{RequirePublicDriverStationLink(link_).data().joysticks[port]};
 }
 
 const driver_station::DriverStationData& DriverStation::data() const {
-  return link_->data();
+  return RequirePublicDriverStationLink(link_).data();
 }
 
 }  // namespace talos
