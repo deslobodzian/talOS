@@ -246,6 +246,44 @@ PY_COMMENT_SUFFIXES = (".py", ".bzl")
 PY_COMMENT_NAMES = ("BUILD", "BUILD.bazel")
 
 
+def _copy_quoted(text, i, quote, out, blank, escapes=True, multiline=False):
+    """Appends to `out` the rest of a quoted literal whose interior starts at
+    `text[i]`, through its closing `quote`, and returns the index after it. A
+    newline ends it unless `multiline`; a backslash escapes the next
+    character when `escapes`. With `blank`, the interior becomes spaces (two
+    for an escape), newlines kept."""
+    n = len(text)
+    while i < n:
+        c = text[i]
+        i += 1
+        if c == "\\" and escapes and i < n:
+            escaped = text[i]
+            i += 1
+            if blank:
+                out.append("\n" if escaped == "\n" else "  ")
+            else:
+                out.append(c)
+                out.append(escaped)
+            continue
+        if c == quote or (c == "\n" and not multiline):
+            out.append(c)
+            break
+        out.append(("\n" if c == "\n" else " ") if blank else c)
+    return i
+
+
+def _is_line_continuation(text, i):
+    r"""True when the backslash at `text[i]` (outside strings) ends its line
+    but for spaces, tabs or `\r`. The strippers replace it with a space,
+    keeping `\n`, so multiline invocations match `\s*` and 1-based line
+    numbers stay exact."""
+    n = len(text)
+    j = i + 1
+    while j < n and text[j] in (" ", "\t", "\r"):
+        j += 1
+    return j < n and text[j] == "\n"
+
+
 def _strip_c_comments(text, is_ts=False, strip_strings=False):
     """Replaces `// ...` and `/* ... */` comments (and, when `strip_strings` is
     set, non-template string/char literal interiors) with spaces, preserving
@@ -325,41 +363,15 @@ def _strip_c_comments(text, is_ts=False, strip_strings=False):
         # characters when `strip_strings` is set (except TS template literals,
         # which can evaluate `${...}`).
         if ch in ('"', "'") or (is_ts and ch == "`"):
-            quote = ch
-            blank = strip_strings and quote != "`"
+            blank = strip_strings and ch != "`"
             out.append(ch)
-            i += 1
-            while i < n:
-                c = text[i]
-                i += 1
-                if c == "\\" and i < n:
-                    escaped = text[i]
-                    i += 1
-                    if blank:
-                        out.append("\n" if escaped == "\n" else "  ")
-                    else:
-                        out.append(c)
-                        out.append(escaped)
-                    continue
-                if c == quote:
-                    out.append(c)
-                    break
-                if c == "\n" and quote != "`":
-                    out.append(c)
-                    break
-                out.append(("\n" if c == "\n" else " ") if blank else c)
+            i = _copy_quoted(text, i + 1, ch, out, blank,
+                             multiline=ch == "`")
             continue
-        # Backslash line continuation outside strings: replace `\` with space
-        # while keeping `\n` intact so multiline invocations match `\s*` and
-        # 1-based line numbers stay exact.
-        if ch == "\\":
-            j = i + 1
-            while j < n and text[j] in (" ", "\t", "\r"):
-                j += 1
-            if j < n and text[j] == "\n":
-                out.append(" ")
-                i += 1
-                continue
+        if ch == "\\" and _is_line_continuation(text, i):
+            out.append(" ")
+            i += 1
+            continue
         out.append(ch)
         i += 1
     return "".join(out)
@@ -414,37 +426,14 @@ def _strip_hash_comments(text, python_strings=True, strip_strings=False):
                     out.append(("\n" if c == "\n" else " ") if blank else c)
                     i += 1
                 continue
-            quote = ch
             out.append(ch)
-            i += 1
-            while i < n:
-                c = text[i]
-                i += 1
-                if c == "\\" and (python_strings or quote == '"') and i < n:
-                    escaped = text[i]
-                    i += 1
-                    if blank:
-                        out.append("\n" if escaped == "\n" else "  ")
-                    else:
-                        out.append(c)
-                        out.append(escaped)
-                    continue
-                if c == quote or c == "\n":
-                    out.append(c)
-                    break
-                out.append(" " if blank else c)
+            i = _copy_quoted(text, i + 1, ch, out, blank,
+                             escapes=python_strings or ch == '"')
             continue
-        # Backslash line continuation outside strings: replace `\` with space
-        # while keeping `\n` intact so multiline invocations match `\s*` and
-        # 1-based line numbers stay exact.
-        if ch == "\\":
-            j = i + 1
-            while j < n and text[j] in (" ", "\t", "\r"):
-                j += 1
-            if j < n and text[j] == "\n":
-                out.append(" ")
-                i += 1
-                continue
+        if ch == "\\" and _is_line_continuation(text, i):
+            out.append(" ")
+            i += 1
+            continue
         out.append(ch)
         i += 1
     return "".join(out)
