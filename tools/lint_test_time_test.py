@@ -50,6 +50,60 @@ PY_FROM_RANDOM = "from " + "random import randint\n"
 PY_URANDOM = "b = os." + "urandom(8)\n"
 PY_SECRETS = "b = secrets." + "token_bytes(8)\n"
 
+# Node-only blocking I/O and lock snippets (RULES.md 3; METHODOLOGY.md §10).
+STD_COUT = "std::" + "cout << 1;\n"
+STD_CERR = "std::" + "cerr << 1;\n"
+STD_CLOG = "std::" + "clog << 1;\n"
+STD_CIN = "std::" + "cin >> x;\n"
+BARE_PRINTF = "prin" + 'tf("%d\\n", x);\n'
+STD_PRINTF = "std::prin" + 'tf("%d\\n", x);\n'
+GLOBAL_PRINTF = "::prin" + 'tf("%d\\n", x);\n'
+STD_FPRINTF = "std::fprin" + 'tf(stderr, "%s\\n", msg);\n'
+BARE_PUTS = "pu" + 'ts("hi");\n'
+BARE_FOPEN = "FILE* f = fo" + 'pen("a.txt", "r");\n'
+STD_IFSTREAM = "std::if" + 'stream in("a.txt");\n'
+STD_OFSTREAM = "std::of" + 'stream out("a.txt");\n'
+STD_FSTREAM = "std::f" + 'stream io("a.txt");\n'
+POSIX_SOCKET = "int fd = sock" + "et(AF_INET, SOCK_DGRAM, 0);\n"
+POSIX_GLOBAL_SOCKET = "int fd = ::sock" + "et(AF_INET, SOCK_DGRAM, 0);\n"
+POSIX_BIND = "bi" + "nd(fd, addr, len);\n"
+POSIX_LISTEN = "list" + "en(fd, 5);\n"
+POSIX_ACCEPT = "acc" + "ept(fd, nullptr, nullptr);\n"
+POSIX_CONNECT = "conn" + "ect(fd, addr, len);\n"
+POSIX_SENDTO = "send" + "to(fd, buf, n, 0, addr, len);\n"
+POSIX_RECVFROM = "recv" + "from(fd, buf, n, 0, addr, &len);\n"
+
+PY_PRINT = "pri" + 'nt("hi")\n'
+PY_OPEN = "f = op" + 'en("a.txt")\n'
+PY_FSTRING_OPEN = 's = f"{op' + "en('a.txt')}\"\n"
+PY_IMPORT_SOCKET = "import " + "socket\n"
+PY_IMPORT_URLLIB = "import " + "urllib.request\n"
+PY_IMPORT_REQUESTS = "import " + "requests\n"
+PY_IMPORT_SUBPROCESS = "import " + "subprocess\n"
+PY_IMPORT_LOGGING = "import " + "logging\n"
+PY_IMPORT_MULTI_LOGGING = "import os, " + "logging as log\n"
+PY_FROM_SOCKET = "from " + "socket import AF_INET\n"
+PY_FROM_URLLIB = "from " + "urllib.request import urlopen\n"
+PY_FROM_REQUESTS = "from " + "requests import get\n"
+PY_FROM_SUBPROCESS = "from " + "subprocess import run\n"
+PY_FROM_LOGGING = "from " + "logging import getLogger\n"
+
+STD_MUTEX = "std::" + "mutex mu_;\n"
+STD_SHARED_MUTEX = "std::" + "shared_mutex mu_;\n"
+STD_RECURSIVE_MUTEX = "std::" + "recursive_mutex mu_;\n"
+STD_LOCK_GUARD = "std::" + "lock_guard<int> lk(mu_);\n"
+STD_UNIQUE_LOCK = "std::" + "unique_lock<int> lk(mu_);\n"
+STD_SCOPED_LOCK = "std::" + "scoped_lock lk(mu_);\n"
+STD_CONDVAR = "std::" + "condition_variable cv_;\n"
+PTHREAD_LOCK = "pthread_" + "mutex_lock(&mu_);\n"
+
+PY_THREADING_LOCK = "mu = threading." + "Lock()\n"
+PY_THREADING_RLOCK = "mu = threading." + "RLock()\n"
+PY_THREADING_SEMAPHORE = "sem = threading." + "Semaphore(1)\n"
+PY_THREADING_CONDITION = "cv = threading." + "Condition()\n"
+PY_FROM_THREADING_LOCK = "from threading import " + "Lock\n"
+PY_FROM_THREADING_MULTI = "from threading import Event, " + "RLock\n"
+
 
 def lint(files, allowlist=""):
     out = io.StringIO()
@@ -294,6 +348,170 @@ class LintTestTimeTest(unittest.TestCase):
         }
         failures, out = lint(files, f"{path} random 1 documented exception")
         self.assertEqual(failures, 0, out)
+
+    # REQ-RT-06, REQ-RT-17: node code may not do blocking I/O, logging, print,
+    # or take locks (RULES.md 3; METHODOLOGY.md §10).
+    def test_node_code_catches_io_and_lock_apis(self):
+        cc_node = ("bench/main_processor/motor/motor.cc",
+                   {"bench/main_processor/motor/BUILD": NODE_BUILD})
+        py_node = ("examples/arm/arm.py",
+                   {"examples/arm/BUILD.bazel": PY_NODE_BUILD})
+        framework_node = ("talOS/teleop/node.cc", {})
+        cases = (
+            ("std_cout", *cc_node, STD_COUT, "io"),
+            ("std_cerr", *cc_node, STD_CERR, "io"),
+            ("std_clog", *cc_node, STD_CLOG, "io"),
+            ("std_cin", *cc_node, STD_CIN, "io"),
+            ("bare_printf", *cc_node, BARE_PRINTF, "io"),
+            ("std_printf", *cc_node, STD_PRINTF, "io"),
+            ("global_printf", *cc_node, GLOBAL_PRINTF, "io"),
+            ("std_fprintf", *cc_node, STD_FPRINTF, "io"),
+            ("bare_puts", *cc_node, BARE_PUTS, "io"),
+            ("bare_fopen", *cc_node, BARE_FOPEN, "io"),
+            ("std_ifstream", *cc_node, STD_IFSTREAM, "io"),
+            ("std_ofstream", *cc_node, STD_OFSTREAM, "io"),
+            ("std_fstream", *cc_node, STD_FSTREAM, "io"),
+            ("posix_socket", *cc_node, POSIX_SOCKET, "io"),
+            ("posix_global_socket", *cc_node, POSIX_GLOBAL_SOCKET, "io"),
+            ("posix_bind", *cc_node, POSIX_BIND, "io"),
+            ("posix_listen", *cc_node, POSIX_LISTEN, "io"),
+            ("posix_accept", *cc_node, POSIX_ACCEPT, "io"),
+            ("posix_connect", *cc_node, POSIX_CONNECT, "io"),
+            ("posix_sendto", *cc_node, POSIX_SENDTO, "io"),
+            ("posix_recvfrom", *cc_node, POSIX_RECVFROM, "io"),
+            ("framework_std_cerr", *framework_node, STD_CERR, "io"),
+            ("py_print", *py_node, PY_PRINT, "io"),
+            ("py_open", *py_node, PY_OPEN, "io"),
+            ("py_fstring_open", *py_node, PY_FSTRING_OPEN, "io"),
+            ("py_import_socket", *py_node, PY_IMPORT_SOCKET, "io"),
+            ("py_import_urllib", *py_node, PY_IMPORT_URLLIB, "io"),
+            ("py_import_requests", *py_node, PY_IMPORT_REQUESTS, "io"),
+            ("py_import_subprocess", *py_node, PY_IMPORT_SUBPROCESS, "io"),
+            ("py_import_logging", *py_node, PY_IMPORT_LOGGING, "io"),
+            ("py_import_multi_logging", *py_node, PY_IMPORT_MULTI_LOGGING,
+             "io"),
+            ("py_from_socket", *py_node, PY_FROM_SOCKET, "io"),
+            ("py_from_urllib", *py_node, PY_FROM_URLLIB, "io"),
+            ("py_from_requests", *py_node, PY_FROM_REQUESTS, "io"),
+            ("py_from_subprocess", *py_node, PY_FROM_SUBPROCESS, "io"),
+            ("py_from_logging", *py_node, PY_FROM_LOGGING, "io"),
+            ("std_mutex", *cc_node, STD_MUTEX, "lock"),
+            ("std_shared_mutex", *cc_node, STD_SHARED_MUTEX, "lock"),
+            ("std_recursive_mutex", *cc_node, STD_RECURSIVE_MUTEX, "lock"),
+            ("std_lock_guard", *cc_node, STD_LOCK_GUARD, "lock"),
+            ("std_unique_lock", *cc_node, STD_UNIQUE_LOCK, "lock"),
+            ("std_scoped_lock", *cc_node, STD_SCOPED_LOCK, "lock"),
+            ("std_condvar", *cc_node, STD_CONDVAR, "lock"),
+            ("pthread_mutex_lock", *cc_node, PTHREAD_LOCK, "lock"),
+            ("framework_std_mutex", *framework_node, STD_MUTEX, "lock"),
+            ("inline_comment_before_mutex", *cc_node, "/* ok */ " + STD_MUTEX,
+             "lock"),
+            ("py_threading_lock", *py_node, PY_THREADING_LOCK, "lock"),
+            ("py_threading_rlock", *py_node, PY_THREADING_RLOCK, "lock"),
+            ("py_threading_semaphore", *py_node, PY_THREADING_SEMAPHORE,
+             "lock"),
+            ("py_threading_condition", *py_node, PY_THREADING_CONDITION,
+             "lock"),
+            ("py_from_threading_lock", *py_node, PY_FROM_THREADING_LOCK,
+             "lock"),
+            ("py_from_threading_multi", *py_node, PY_FROM_THREADING_MULTI,
+             "lock"),
+        )
+        for name, path, extra, text, kind in cases:
+            with self.subTest(name):
+                failures, out = lint({path: text, **extra})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{path}:1: {kind}", out)
+
+    # REQ-RT-06, REQ-RT-17: io and lock patterns exclude test sources,
+    # non-node libraries, comments, non-executing strings, member calls,
+    # qualified non-POSIX calls, and unrelated identifiers.
+    def test_node_io_and_lock_exclude_tests_comments_strings_and_members(self):
+        failures, out = lint({
+            "bench/main_processor/motor/BUILD": NODE_BUILD,
+            # Test sources in a node package are not held to node io/lock rules.
+            "bench/main_processor/motor/node_test.cc": (
+                STD_COUT + STD_MUTEX + POSIX_SOCKET + PTHREAD_LOCK
+            ),
+            "examples/arm/BUILD.bazel": PY_NODE_BUILD,
+            "examples/arm/arm_test.py": (
+                PY_PRINT + PY_OPEN + PY_IMPORT_LOGGING + PY_THREADING_LOCK
+            ),
+            # Non-node library code is unscanned.
+            "examples/lib/BUILD": "cc_library(name = 'helper')\n",
+            "examples/lib/helper.cc": STD_COUT + STD_MUTEX + BARE_PRINTF,
+            # C++ comments, strings, raw strings, headers, member calls, and
+            # non-POSIX qualified calls do not hit.
+            "bench/main_processor/motor/motor.cc": (
+                "#include <fstream>\n"
+                "#include <mutex>\n"
+                "#include <sys/socket.h>\n"
+                "// " + STD_COUT +
+                "// " + STD_MUTEX +
+                "/* " + POSIX_CONNECT.rstrip("\n") + " */\n"
+                "/*\n * " + STD_LOCK_GUARD + " */\n"
+                'const char* a = "' + STD_COUT.rstrip("\n") + '";\n'
+                'const char* b = "' + STD_MUTEX.rstrip("\n") + '";\n'
+                'const char* c = R"(std::ifstream x; connect(fd, a, l);)";\n'
+                "obj.connect(1);\n"
+                "ptr->bind(1);\n"
+                "obj.listen(1);\n"
+                "ptr->accept(1);\n"
+                "obj.printf(\"ok\");\n"
+                "ptr->fopen(\"x\", \"r\");\n"
+                "auto fn = std::bind(&Foo::bar, this);\n"
+                "my_ns::connect(1);\n"
+                "std::ostringstream ss;\n"
+                "std::snprintf(buf, sizeof(buf), \"%d\", 1);\n"
+                "int mutex = 0;\n"
+            ),
+            # Python comments, plain/triple/raw strings, method calls, method
+            # definitions, and unrelated imports do not hit.
+            "examples/arm/arm.py": (
+                "# " + PY_PRINT +
+                "# " + PY_OPEN +
+                "# " + PY_THREADING_LOCK +
+                'msg = "' + PY_PRINT.rstrip("\n") + '"\n'
+                "path = '" + PY_OPEN.rstrip("\n") + "'\n"
+                'doc = """\n' + PY_IMPORT_SOCKET + PY_THREADING_LOCK + '"""\n'
+                'raw = r"open(x) print(y)"\n'
+                "class Gripper:\n"
+                "    def open(self):\n"
+                "        pass\n"
+                "obj.open('x')\n"
+                "self.print('x')\n"
+                "reopen('x')\n"
+                "from mypkg import socket\n"
+                "from mypkg import logging\n"
+                "from mypkg import Lock\n"
+                "import my_logging\n"
+                "x = obj.Lock()\n"
+            ),
+        })
+        self.assertEqual(failures, 0, out)
+
+    # REQ-RT-06, REQ-RT-17: io and lock allowlist entries enforce exact
+    # shrink-only counts just like sleep, clock, and random.
+    def test_io_and_lock_allowlist_counts_only_shrink(self):
+        path = "bench/main_processor/motor/motor.cc"
+        extra = {"bench/main_processor/motor/BUILD": NODE_BUILD}
+        for kind, snippet in (("io", STD_CERR), ("lock", STD_MUTEX)):
+            files = {path: snippet + "int x;\n" + snippet, **extra}
+            for count, expected, said in (
+                    ("2", 0, "no new"),
+                    ("1", 1, f"{path}:1, 3: 2 {kind} hits, 1 allowed"),
+                    ("3", 1, "lower it to 2")):
+                with self.subTest(kind=kind, count=count):
+                    failures, out = lint(
+                        files, f"{path} {kind} {count} construction-only")
+                    self.assertEqual(failures, expected, out)
+                    self.assertIn(said, out)
+            with self.subTest(kind=kind, case="stale"):
+                failures, out = lint(
+                    {path: "int x;\n", **extra},
+                    f"{path} {kind} 1 construction-only")
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"stale entry `{path} {kind}`", out)
 
 
 if __name__ == "__main__":
