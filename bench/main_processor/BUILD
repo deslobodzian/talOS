@@ -1,4 +1,5 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//bench/main_processor/bundle_testdata:robot_manifest.bzl", RELOCATION_CONFIG_FILES = "CONFIG_FILES", RELOCATION_NODES = "NODES")
 load("//bench/main_processor/configuration:robot_bench_manifest.bzl", "CONFIG_FILES", "NODES")
@@ -166,5 +167,33 @@ py_test(
     deps = [
         ":deploy_test_support",
         "@rules_python//python/runfiles",
+    ],
+)
+
+# REQ-RT-07: update() callback entry-to-exit p99 wall-clock benchmark for
+# representative C++ bench and framework nodes (motor, swerve_module, teleop,
+# telemetry) against docs/METHODOLOGY.md §10's 10% period budget, with
+# StallMeter host qualification (docs/TESTING.md §6.7).
+cc_test(
+    name = "update_p99_perf_test",
+    size = "small",
+    srcs = ["update_p99_perf_test.cc"],
+    data = ["//bench/main_processor/configuration:robot_config"],
+    tags = [
+        "exclusive",
+        "perf",
+    ],
+    deps = [
+        "//bench/main_processor/motor",
+        "//bench/main_processor/swerve_module",
+        "//talOS/devices:testing",
+        "//talOS/driver_station",
+        "//talOS/events:events_core",
+        "//talOS/node",
+        "//talOS/node:testing",
+        "//talOS/process:host_qualification",
+        "//talOS/telemetry:testing",
+        "//talOS/teleop:testing",
+        "@googletest//:gtest_main",
     ],
 )

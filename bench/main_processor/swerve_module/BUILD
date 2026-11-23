@@ -14,6 +14,7 @@ cc_library(
     hdrs = ["swerve_module.h"],
     include_prefix = "swerve_module",
     strip_include_prefix = ".",
+    visibility = ["//bench/main_processor:__pkg__"],
     deps = [
         ":messages",
         "//talOS/devices",

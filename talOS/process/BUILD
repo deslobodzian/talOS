@@ -25,6 +25,15 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+# Host scheduling-noise probe and latency percentile helper for timed perf and
+# integration tests (docs/TESTING.md §6.7, §6.8).
+cc_library(
+    name = "host_qualification",
+    testonly = True,
+    hdrs = ["host_qualification.h"],
+    visibility = ["//visibility:public"],
+)
+
 cc_test(
     name = "process_test",
     size = "small",
