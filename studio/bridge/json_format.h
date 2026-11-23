@@ -14,6 +14,7 @@
 #include <string_view>
 
 #include "talOS/telemetry/frames.h"
+#include "talOS/telemetry/json_string.h"
 #include "talOS/telemetry/telemetry_generated.h"
 
 namespace studio {
@@ -21,42 +22,8 @@ namespace studio {
 inline constexpr int kTelemetryVersion = 3;
 
 using talos::telemetry::AlertLevel;
+using talos::telemetry::AppendEscaped;
 using talos::telemetry::ChannelKind;
-
-inline void AppendEscaped(std::string& out, std::string_view value) {
-  out += '"';
-  for (const char c : value) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        // Control characters have no literal form in JSON, and a topic name
-        // should never contain one; emit the escape rather than invalid JSON.
-        if (static_cast<unsigned char>(c) < 0x20) {
-          static constexpr char kHex[] = "0123456789abcdef";
-          out += "\\u00";
-          out += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
-          out += kHex[static_cast<unsigned char>(c) & 0xF];
-        } else {
-          out += c;
-        }
-    }
-  }
-  out += '"';
-}
 
 // uint64 and int64 leave as quoted decimals: JSON numbers are doubles and
 // silently lose precision past 2^53.

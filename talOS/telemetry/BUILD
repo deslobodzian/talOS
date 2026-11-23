@@ -34,6 +34,13 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+# How the dashboard layout and the Studio bridge write a JSON string.
+cc_library(
+    name = "json_string",
+    hdrs = ["json_string.h"],
+    visibility = ["//visibility:public"],
+)
+
 # Page encoding: the producer, the Studio bridge and the mock build every
 # TLM3 page through it.
 cc_library(
@@ -200,6 +207,7 @@ cc_library(
     hdrs = ["dashboard_layout.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":json_string",
         ":wire",
         "//talOS/introspection:names",
         "@tomlplusplus//:toml++",
