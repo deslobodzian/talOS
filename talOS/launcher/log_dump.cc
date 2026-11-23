@@ -23,6 +23,7 @@
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_inputs.h"
@@ -151,21 +152,8 @@ bool Matches(const Options& options, const talos::launcher::MergedRecord& r,
 }
 
 std::string JsonString(std::string_view value) {
-  std::string result{"\""};
-  constexpr char hex[] = "0123456789abcdef";
-  for (const unsigned char c : value) {
-    if (c == '"' || c == '\\') {
-      result += '\\';
-      result += static_cast<char>(c);
-    } else if (c < 0x20) {
-      result += "\\u00";
-      result += hex[c >> 4];
-      result += hex[c & 15];
-    } else {
-      result += static_cast<char>(c);
-    }
-  }
-  result += '"';
+  std::string result;
+  talos::introspect::AppendJsonString(result, value);
   return result;
 }
 

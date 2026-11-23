@@ -19,6 +19,10 @@ namespace {
 
 // --- JSON writing ----------------------------------------------------------
 
+// Kept separate from talOS/telemetry/json_string.h (talos::telemetry::
+// AppendEscaped) because talOS/vision is a standalone library beside the stack
+// and does not depend on talOS/telemetry. Keep the escaping rules identical
+// (\", \\, \n, \r, \t, and lowercase \u00XX for other bytes < 0x20).
 void AppendEscaped(std::string& out, std::string_view value) {
   out += '"';
   for (const unsigned char c : value) {
