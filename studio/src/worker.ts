@@ -83,6 +83,9 @@ let postedSystemStale = true;
 // A held graph is only current while the source that sent it is.
 const graphConnected = () => connection === 'live' || connection === 'demo';
 function systemStale(now: number) {
+  // REQ-OPS-23: a graph version mismatch names the bridge's version instead of
+  // showing or marking the graph stale.
+  if (systemMismatch !== null) return false;
   return graphStale(systemArrival, now, graphConnected());
 }
 
@@ -374,6 +377,7 @@ function connect(url: string, gen: number) {
       if (gen !== generation) return;
       status = 'WebSocket connected';
       connection = 'live';
+      decoder.reset();
       // The bridge answers an open with its graph and then, when it has
       // them, the dictionary and a keyframe: the first update on a socket.
       firstUpdate = true;

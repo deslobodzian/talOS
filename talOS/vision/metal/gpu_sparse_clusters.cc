@@ -14,7 +14,9 @@ constexpr uint32_t kMinSetPixels = 25;
 inline uint32_t RepresentativeOf(const uint32_t* parents, uint32_t total,
                                  uint32_t id) {
   if (id >= total) return 0xFFFFFFFFu;
-  return parents[id];
+  const uint32_t rep = parents[id];
+  if (rep >= total) return 0xFFFFFFFFu;
+  return rep;
 }
 
 }  // namespace
@@ -117,7 +119,8 @@ extern "C" zarray_t* BuildSparseClustersFromGpuLabels(
       // unionfind_get_set_size semantics.
       const uint64_t rep0 = RepresentativeOf(gpu_parents, total,
                                              static_cast<uint32_t>(y * w + x));
-      if (rep0 == 0xFFFFFFFFu || gpu_sizes[rep0] < kMinSetPixels) {
+      if (rep0 == 0xFFFFFFFFu || rep0 >= total ||
+          gpu_sizes[rep0] < kMinSetPixels) {
         connected_last = false;
         continue;
       }
@@ -129,7 +132,8 @@ extern "C" zarray_t* BuildSparseClustersFromGpuLabels(
         if (v0 + v1 == 255) {
           const uint64_t rep1 = RepresentativeOf(
               gpu_parents, total, static_cast<uint32_t>((y + dy) * w + x + dx));
-          if (rep1 != 0xFFFFFFFFu && gpu_sizes[rep1] > kMinSetPixels - 1) {
+          if (rep1 != 0xFFFFFFFFu && rep1 < total &&
+              gpu_sizes[rep1] > kMinSetPixels - 1) {
             const uint64_t clusterid =
                 (rep0 < rep1) ? ((rep1 << 32) + rep0) : ((rep0 << 32) + rep1);
 

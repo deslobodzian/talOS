@@ -174,6 +174,7 @@ void SimDriverStation::Update(Clock::time_point now, bool configured) {
 }
 
 void SimDriverStation::UpdateJoystick(Clock::time_point now) {
+  if (!configured_at_) return;
   const auto elapsed = now - *configured_at_;
   const auto& events = settings_.joysticks;
   const std::size_t before = joystick_event_;

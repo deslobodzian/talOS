@@ -21,6 +21,18 @@ reading the existing tags follow (`// REQ-SAFE-09`, `# REQ-A, REQ-B: why`).
   a quoted BRINGUP.md heading after `BR`, or a BENCH.md heading after
   `BENCH.md`. Tags in the sources of a quarantined target do not count
   (TESTING.md §8.3);
+- a SAFE, CONTRACT or P0 requirement whose `Cheapest tier` names a
+  Bazel-runnable tier (`unit`, `component`, `contract`, `fuzz`/`property`,
+  `integration`, `e2e`) and that has tagged tests (and no open TODO.md
+  citation tracking the gap) but no tagged test at or below that tier; or
+  whose `Cheapest tier` contains an unrecognized or missing tier token.
+  Bazel test targets are parsed with `ast.parse` from `BUILD` / `BUILD.bazel`
+  and mapped to lanes from their literal `tags` (`fast` untagged, `heavy`,
+  `integration`, `e2e`, `perf`, or `soak` when `manual`; non-literal `tags`
+  or `srcs`, unwired files, and BUILD syntax errors fail closed as `unknown`).
+  GradleRIO `controller_processor/rio/src/test/cpp/*` and Studio node:test
+  (`tsx --test`) `studio/tests/*.test.ts*` map to `fast`. Higher-tier composition tags remain
+  allowed as additional evidence;
 - a target tagged `quarantine` in a BUILD file without an open TODO.md item
   naming its label (`//pkg:name`), or whose latest date (YYYY-MM-DD) is past
   or more than 14 days out;
@@ -29,12 +41,6 @@ reading the existing tags follow (`// REQ-SAFE-09`, `# REQ-A, REQ-B: why`).
   scope" table names or contains, and an entry naming no tracked directory.
   An entry is a backticked path from the repository root;
   `a/{b,c}` expands.
-
-Not enforced: the tier clause ("at its Cheapest tier or below"). A test's tier
-is not derivable from the tree today: tiers are defined by the resources a
-test touches (TESTING.md §2) and the lanes are not yet Bazel tags (LANE-1),
-so `--report` prints each requirement's Cheapest tier beside its tests for a
-reviewer to judge, and the check asks only for a tagged test.
 
 Framework catalogues. A robot repository keeps its own rows in its
 docs/REQUIREMENTS.md and tags its tests with talOS's rows too. Each
@@ -61,6 +67,7 @@ the future, so the list only shrinks.
 """
 
 import argparse
+import ast
 import datetime
 import os
 import re
@@ -81,6 +88,49 @@ TODO_ITEM = re.compile(r"^- \[ \] \*\*([A-Z][A-Z0-9]*-\d+)\b")
 TODO_ID = re.compile(r"(?<![\w-])([A-Z][A-Z0-9]*-\d+)\b")
 DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 QUARANTINE_DAYS = 14
+
+# Bazel lane -> numeric rank (docs/TESTING.md §9). Lower rank is cheaper.
+# `fast` covers unit, component, contract and bounded fuzz; `heavy` covers
+# CPU-bound deterministic component/contract tests; `soak`/`manual` and
+# `unknown` (a test source wired to no test rule) never satisfy a runnable
+# cheapest tier.
+LANE_RANK = {
+    "fast": 0,
+    "heavy": 1,
+    "integration": 2,
+    "e2e": 3,
+    "perf": 4,
+    "soak": 5,
+}
+UNKNOWN_LANE_RANK = 99
+
+# Cheapest-tier token (from docs/REQUIREMENTS.md's "Cheapest tier" column)
+# -> (canonical tier name, maximum allowed lane rank, max lane display name).
+RUNNABLE_TIERS = {
+    "unit": ("unit", 0, "fast"),
+    "component": ("component", 1, "heavy"),
+    "contract": ("contract", 1, "heavy"),
+    "fuzz": ("fuzz/property", 1, "heavy"),
+    "property": ("fuzz/property", 1, "heavy"),
+    "integration": ("integration", 2, "integration"),
+    "e2e": ("e2e", 3, "e2e"),
+}
+
+# Explicit non-runnable tier tokens allowed in docs/REQUIREMENTS.md's
+# "Cheapest tier" column (outside parenthetical notes). Any other word fails
+# closed so typos such as `unt` or `integraton` cannot silently skip tier
+# enforcement.
+NON_RUNNABLE_TIERS = frozenset({
+    "bench",
+    "bringup",
+    "build",
+    "hardware",
+    "manual",
+    "perf",
+    "review",
+    "robot",
+    "soak",
+})
 
 
 class Requirement:
@@ -111,9 +161,9 @@ def split_row(line):
 
 
 def parse_requirements(text):
-    """({id: Requirement}, [package scope entries])."""
-    catalogue, scope, section = {}, [], None
-    for line in text.splitlines():
+    """({id: Requirement}, [package scope entries], [(line_no, req_id)])."""
+    catalogue, scope, duplicates, section = {}, [], [], None
+    for number, line in enumerate(text.splitlines(), 1):
         if line.startswith("## "):
             section = line[3:].strip()
             continue
@@ -121,7 +171,11 @@ def parse_requirements(text):
             continue
         cells = split_row(line)
         if section == "Catalogue" and REQ_ID.fullmatch(cells[0]):
-            catalogue[cells[0]] = Requirement(cells[0], cells[2], cells)
+            req_id = cells[0]
+            if req_id in catalogue:
+                duplicates.append((number, req_id))
+            else:
+                catalogue[req_id] = Requirement(req_id, cells[2], cells)
         elif (section == "Package scope" and len(cells) >= 2 and
               cells[0] not in ("Package", "---")):
             # A parenthesis qualifies the entry before it; it names no
@@ -129,7 +183,7 @@ def parse_requirements(text):
             package_cell = re.sub(r"\([^)]*\)", "", cells[0])
             for token in re.findall(r"`([^`]+)`", package_cell):
                 scope.extend(expand_braces(token))
-    return catalogue, scope
+    return catalogue, scope, duplicates
 
 
 def expand_braces(token):
@@ -189,30 +243,221 @@ def find_tags(files, read):
     return tags
 
 
-def build_rules(text):
-    """Yields each top-level rule call's text in a BUILD file."""
-    starts = [m.start() for m in re.finditer(r"^[A-Za-z_]\w*\(", text, re.M)]
-    for begin, end in zip(starts, starts[1:] + [len(text)]):
-        yield text[begin:end]
+def _parse_build_file(path, text):
+    """(ast.Module | None, error_str | None) for a BUILD / BUILD.bazel file."""
+    try:
+        return ast.parse(text, filename=path), None
+    except SyntaxError as exc:
+        loc = f" (line {exc.lineno})" if exc.lineno else ""
+        return None, f"{path}: cannot parse BUILD file: {exc.msg}{loc}"
+
+
+def _build_calls(tree):
+    """Yields every named function call in a BUILD AST in source order."""
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+    calls.sort(key=lambda n: (getattr(n, "lineno", 0),
+                              getattr(n, "col_offset", 0)))
+    return calls
+
+
+def _literal_string(node):
+    """Returns str if `node` is a string constant, else None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _literal_string_list(node):
+    """Returns [str, ...] if `node` is a list/tuple of string constants,
+    else None (non-literal expression)."""
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return None
+    values = []
+    for elt in node.elts:
+        val = _literal_string(elt)
+        if val is None:
+            return None
+        values.append(val)
+    return values
+
+
+def _contains_string_constant(node, target):
+    """Whether any string constant anywhere inside `node` equals `target`."""
+    return any(isinstance(sub, ast.Constant) and sub.value == target
+               for sub in ast.walk(node))
+
+
+def _normalize_pkg_src(package, src):
+    """Package-relative repo path for a local file in `srcs`/`main`, or None
+    for a cross-package or external label (`//...`, `@...`)."""
+    if src.startswith(("//", "@")):
+        return None
+    if src.startswith(":"):
+        src = src[1:]
+    if not src:
+        return None
+    joined = os.path.normpath(os.path.join(package, src))
+    return joined.replace(os.sep, "/")
+
+
+def _todo_mentions_label(text, label):
+    """True when `text` names `label` as a whole Bazel target label token."""
+    pattern = re.compile(
+        r"(?<![\w./:@+-])" + re.escape(label) +
+        r"(?![\w/@+-]|[.:](?=[\w/@+-]))"
+    )
+    return pattern.search(text) is not None
 
 
 def quarantined_targets(files, read):
-    """[(label, BUILD path, [source paths])] of targets tagged quarantine."""
+    """[(label, BUILD path, [source paths], has_non_literal_srcs)] of targets
+    tagged quarantine."""
     targets = []
     for path in files:
         if os.path.basename(path) not in ("BUILD", "BUILD.bazel"):
             continue
+        tree, _ = _parse_build_file(path, read(path))
+        if tree is None:
+            continue
         package = os.path.dirname(path)
-        for rule in build_rules(read(path)):
-            tags = re.search(r"\btags\s*=\s*\[([^\]]*)\]", rule)
-            name = re.search(r'\bname\s*=\s*"([^"]+)"', rule)
-            if not (tags and name and '"quarantine"' in tags.group(1)):
+        for call in _build_calls(tree):
+            kws = {kw.arg: kw.value for kw in call.keywords
+                   if kw.arg is not None}
+            tags_node = kws.get("tags")
+            if tags_node is None:
                 continue
-            srcs = re.search(r"\bsrcs\s*=\s*\[([^\]]*)\]", rule)
-            sources = [os.path.join(package, s) for s in
-                       re.findall(r'"([^":]+)"', srcs.group(1))] if srcs else []
-            targets.append((f"//{package}:{name.group(1)}", path, sources))
+            parsed_tags = _literal_string_list(tags_node)
+            is_quarantined = (
+                "quarantine" in parsed_tags if parsed_tags is not None
+                else _contains_string_constant(tags_node, "quarantine"))
+            if not is_quarantined:
+                continue
+            name = _literal_string(kws.get("name"))
+            if name is None:
+                name = f"<dynamic:line{getattr(call, 'lineno', 0)}>"
+            sources = []
+            non_literal_srcs = False
+            if "srcs" in kws:
+                parsed_srcs = _literal_string_list(kws["srcs"])
+                if parsed_srcs is None:
+                    non_literal_srcs = True
+                else:
+                    for src in parsed_srcs:
+                        norm = _normalize_pkg_src(package, src)
+                        if norm is not None:
+                            sources.append(norm)
+            if "main" in kws:
+                main_src = _literal_string(kws["main"])
+                if main_src is None:
+                    non_literal_srcs = True
+                else:
+                    norm = _normalize_pkg_src(package, main_src)
+                    if norm is not None and norm not in sources:
+                        sources.append(norm)
+            if ("srcs" not in kws and "main" not in kws and
+                    any(kw.arg is None for kw in call.keywords)):
+                non_literal_srcs = True
+            targets.append((f"//{package}:{name}", path, sources,
+                            non_literal_srcs))
     return targets
+
+
+def rule_lane(rule_tags):
+    """The Bazel lane of a test rule from its tags (docs/TESTING.md §9)."""
+    if "manual" in rule_tags:
+        return "soak"
+    # Fail closed: if multiple lane tags appear on one rule, take the
+    # costliest (highest rank) lane.
+    for lane in ("perf", "e2e", "integration", "heavy"):
+        if lane in rule_tags:
+            return lane
+    return "fast"
+
+
+def test_source_lanes(files, read):
+    """{source_path: {lane, ...}} for every non-quarantined test source."""
+    lanes = {}
+    for path in files:
+        if os.path.basename(path) in ("BUILD", "BUILD.bazel"):
+            tree, _ = _parse_build_file(path, read(path))
+            if tree is None:
+                continue
+            package = os.path.dirname(path)
+            for call in _build_calls(tree):
+                if not call.func.id.endswith("_test"):
+                    continue
+                kws = {kw.arg: kw.value for kw in call.keywords
+                       if kw.arg is not None}
+                has_splat = any(kw.arg is None for kw in call.keywords)
+                if "tags" in kws:
+                    parsed_tags = _literal_string_list(kws["tags"])
+                    if parsed_tags is None:
+                        # Fail closed on non-literal tags (variable, select(),
+                        # list concatenation, etc.).
+                        lane = "unknown"
+                    else:
+                        rule_tags = set(parsed_tags)
+                        if "quarantine" in rule_tags:
+                            continue
+                        lane = rule_lane(rule_tags)
+                elif has_splat:
+                    # `**kwargs` may pass lane/quarantine tags dynamically.
+                    lane = "unknown"
+                else:
+                    lane = "fast"
+
+                rel_srcs = []
+                if "srcs" in kws:
+                    parsed_srcs = _literal_string_list(kws["srcs"])
+                    if parsed_srcs is not None:
+                        rel_srcs.extend(parsed_srcs)
+                if "main" in kws:
+                    main_src = _literal_string(kws["main"])
+                    if main_src is not None:
+                        rel_srcs.append(main_src)
+                for src in rel_srcs:
+                    joined = _normalize_pkg_src(package, src)
+                    if joined is not None:
+                        lanes.setdefault(joined, set()).add(lane)
+        elif path.startswith("controller_processor/rio/src/test/cpp/"):
+            lanes.setdefault(path, set()).add("fast")
+        elif (path.startswith("studio/tests/") and
+              re.search(r"\.test\.tsx?$", path)):
+            lanes.setdefault(path, set()).add("fast")
+    return lanes
+
+
+def parse_cheapest_tier(tier_text):
+    """(cheapest_runnable, unknown_tokens, has_known_tier) for a
+    docs/REQUIREMENTS.md "Cheapest tier" cell.
+
+    Parenthetical qualifiers (including nested parentheses) are stripped; every
+    remaining word must appear in RUNNABLE_TIERS or NON_RUNNABLE_TIERS.
+    """
+    stripped = tier_text
+    while True:
+        reduced = re.sub(r"\([^()]*\)", "", stripped)
+        if reduced == stripped:
+            break
+        stripped = reduced
+    tokens = re.findall(r"[a-z0-9]+", stripped.lower())
+    runnable = [RUNNABLE_TIERS[token] for token in tokens
+                if token in RUNNABLE_TIERS]
+    known_non_runnable = [token for token in tokens
+                          if token in NON_RUNNABLE_TIERS]
+    unknown = [token for token in tokens
+               if token not in RUNNABLE_TIERS
+               and token not in NON_RUNNABLE_TIERS]
+    cheapest = min(runnable, key=lambda item: item[1]) if runnable else None
+    return cheapest, unknown, bool(runnable or known_non_runnable)
+
+
+def cheapest_runnable_tier(tier_text):
+    """(tier_name, max_lane_rank, max_lane_name) for the cheapest
+    Bazel-runnable tier named in `tier_text`, or None if it names no
+    runnable tier."""
+    return parse_cheapest_tier(tier_text)[0]
 
 
 def bazel_packages(files):
@@ -272,10 +517,12 @@ def parse_waivers(text, today):
 
 def framework_ids(catalogue, frameworks, read):
     """({id: the framework catalogue holding it}, [failures]): a framework
-    catalogue with no rows, and an ID in two catalogues, fail."""
+    catalogue with no rows, duplicate IDs, or an ID in two catalogues fail."""
     owners, failures = {}, []
     for path in frameworks:
-        ids = parse_requirements(read(path))[0]
+        ids, _, duplicates = parse_requirements(read(path))
+        for number, req_id in duplicates:
+            failures.append(f"{path}:{number}: duplicate requirement {req_id}")
         if not ids:
             failures.append(f"{path}: framework catalogue holds no "
                             f"requirement")
@@ -291,7 +538,10 @@ def framework_ids(catalogue, frameworks, read):
 def trace(files, read, today, frameworks=()):
     """(failures, {id: [(path, line)]}, {id: citation}, catalogue)."""
     failures = []
-    catalogue, scope = parse_requirements(read(REQUIREMENTS))
+    catalogue, scope, duplicates = parse_requirements(read(REQUIREMENTS))
+    for number, req_id in duplicates:
+        failures.append(
+            f"{REQUIREMENTS}:{number}: duplicate requirement {req_id}")
     # A repository with no catalogue of its own has no scope table either.
     check_scope = REQUIREMENTS in files or not frameworks
     framework, errors = framework_ids(catalogue, frameworks, read)
@@ -305,8 +555,15 @@ def trace(files, read, today, frameworks=()):
     waivers, errors = parse_waivers(read(WAIVERS), today)
     failures.extend(errors)
 
+    for path in files:
+        if os.path.basename(path) in ("BUILD", "BUILD.bazel"):
+            _, err = _parse_build_file(path, read(path))
+            if err:
+                failures.append(err)
+
     quarantined = quarantined_targets(files, read)
-    quarantined_sources = {s for _, _, sources in quarantined for s in sources}
+    quarantined_sources = {s for _, _, sources, _ in quarantined for s in sources}
+    source_lanes = test_source_lanes(files, read)
     tests = {}
     for path, number, req_id in find_tags(files, read):
         if req_id not in catalogue and req_id not in framework:
@@ -315,8 +572,14 @@ def trace(files, read, today, frameworks=()):
         elif req_id in catalogue and path not in quarantined_sources:
             tests.setdefault(req_id, []).append((path, number))
 
-    for label, build, _ in quarantined:
-        entries = [text for text in todo_items.values() if label in text]
+    for label, build, _, non_literal_srcs in quarantined:
+        if non_literal_srcs:
+            failures.append(
+                f"{build}: {label} is tagged quarantine with non-literal "
+                f"srcs/main; list literal source paths so its tags can be "
+                f"excluded (docs/TESTING.md §8.3)")
+        entries = [text for text in todo_items.values()
+                   if _todo_mentions_label(text, label)]
         dates = sorted(d for text in entries for d in DATE.findall(text))
         if not dates:
             failures.append(f"{build}: {label} is tagged quarantine without "
@@ -338,16 +601,53 @@ def trace(files, read, today, frameworks=()):
                                       bringup_headings)
         if citation:
             citations[req.id] = citation
-        gap = req.must_verify() and req.id not in tests and not citation
+        has_todo_citation = bool(citation and citation.startswith("TODO.md "))
+        missing_test = req.must_verify() and req.id not in tests and not citation
+        tier_gap_msg = None
+        if req.must_verify():
+            required, unknown_tiers, has_known_tier = parse_cheapest_tier(
+                req.tier)
+            if unknown_tiers:
+                unknown_text = ", ".join(f"`{t}`" for t in unknown_tiers)
+                failures.append(
+                    f"{REQUIREMENTS}: {req.id} ({req.priority}, {req.area}) "
+                    f"has unrecognized Cheapest tier token(s): {unknown_text} "
+                    f"in `{req.tier}`")
+            elif not has_known_tier:
+                failures.append(
+                    f"{REQUIREMENTS}: {req.id} ({req.priority}, {req.area}) "
+                    f"has no recognized Cheapest tier token in `{req.tier}`")
+            elif (required is not None and req.id in tests and
+                  not has_todo_citation):
+                tier_name, max_rank, max_lane = required
+                found_lanes = set()
+                for path, _ in tests[req.id]:
+                    found_lanes.update(source_lanes.get(path, {"unknown"}))
+                min_rank = min(LANE_RANK.get(lane, UNKNOWN_LANE_RANK)
+                               for lane in found_lanes)
+                if min_rank > max_rank:
+                    lanes_text = ", ".join(sorted(found_lanes))
+                    files_text = ", ".join(sorted({p for p, _ in tests[req.id]}))
+                    tier_gap_msg = (
+                        f"{REQUIREMENTS}: {req.id} ({req.priority}, {req.area}) "
+                        f"requires cheapest tier `{tier_name}` (lane <= `{max_lane}`), "
+                        f"but only has tagged tests in: {lanes_text} ({files_text}); "
+                        f"add a test at or below `{tier_name}` "
+                        f"(docs/TESTING.md §2, §3)")
+        gap = missing_test or (tier_gap_msg is not None)
         waiver = waivers.pop(req.id, None)
         if gap and not waiver:
-            failures.append(
-                f"{REQUIREMENTS}: {req.id} ({req.priority}, {req.area}) has "
-                f"no tagged test and cites no open TODO.md item or bench "
-                f"section; tag the test that proves it (docs/TESTING.md §3)")
+            if missing_test:
+                failures.append(
+                    f"{REQUIREMENTS}: {req.id} ({req.priority}, {req.area}) has "
+                    f"no tagged test and cites no open TODO.md item or bench "
+                    f"section; tag the test that proves it (docs/TESTING.md §3)")
+            else:
+                failures.append(tier_gap_msg)
         elif waiver and not gap:
             why = ("needs no test by this check" if not req.must_verify() else
-                   "now has a tagged test or a cited verification")
+                   "now has a tagged test at or below its cheapest tier "
+                   "or a cited verification")
             failures.append(f"{WAIVERS}:{waiver[2]}: stale waiver: {req.id} "
                             f"{why}; delete the line")
 
@@ -387,7 +687,7 @@ def check(files, read, today, out=sys.stdout, frameworks=()):
     if not failures:
         waived = len(parse_waivers(read(WAIVERS), today)[0])
         print(f"trace: {len(catalogue)} requirements, {len(tests)} with "
-              f"tagged tests, {waived} waived; tier not checked (LANE-1)" +
+              f"tagged tests, {waived} waived; cheapest tier enforced" +
               "".join(f"; tags of {path} accepted" for path in frameworks),
               file=out)
     return len(failures)

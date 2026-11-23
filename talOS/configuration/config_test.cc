@@ -28,6 +28,16 @@ void ExpectRejected(std::string_view body) {
   EXPECT_THROW(Parse(body), std::invalid_argument) << body;
 }
 
+void ExpectRejectedNaming(std::string_view body, std::string_view key) {
+  try {
+    static_cast<void>(Parse(body));
+    ADD_FAILURE() << "accepted:\n" << body;
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string{error.what()}.find(key), std::string::npos)
+        << error.what();
+  }
+}
+
 TEST(ConfigTest, RejectsNonBooleanCriticalFlag) {
   for (const auto value : {"0", "\"false\"", "[]", "{}"}) {
     EXPECT_THROW(
@@ -207,12 +217,15 @@ can_id = 3
 feedback_sensor = "enc"
 )");  // Rotor feedback naming a sensor.
   // A rotor frame restarts with the TalonFX, so it is never absolute.
-  ExpectRejected(
+  // REQ-SAFE-26
+  ExpectRejectedNaming(
       "[subsystems.test.motors.m2]\ncan_id = 2\nposition_frame = "
-      "\"absolute\"\n");
-  ExpectRejected(
+      "\"absolute\"\n",
+      "position_frame");
+  ExpectRejectedNaming(
       "[subsystems.test.motors.m2]\ncan_id = 2\nposition_frame = "
-      "\"power_on\"\n");
+      "\"power_on\"\n",
+      "position_frame");
   ExpectRejected(R"(
 [subsystems.test.motors.steer]
 can_id = 2
@@ -281,21 +294,23 @@ feedback_sensor = "imu"
 // Every node's Driver Station view expires at command_timeout_us, and a packet
 // can follow the previous one by 20000 us plus a gateway period: the timeout
 // spans two such gaps, 2 * (20000 + period_us).
+// REQ-SAFE-26
 TEST(ConfigTest, CommandTimeoutSpansTwoDriverStationPacketGaps) {
-  const auto robot = [](int period_us, int timeout_us) {
-    return Parse("[robot]\nperiod_us = " + std::to_string(period_us) +
-                 "\ncommand_timeout_us = " + std::to_string(timeout_us) + "\n");
+  const auto robot_toml = [](int period_us, int timeout_us) {
+    return "[robot]\nperiod_us = " + std::to_string(period_us) +
+           "\ncommand_timeout_us = " + std::to_string(timeout_us) + "\n";
   };
-  EXPECT_THROW(robot(5000, 49999), std::invalid_argument);
-  EXPECT_NO_THROW(robot(5000, 50000));
-  EXPECT_THROW(robot(20000, 79999), std::invalid_argument);
-  EXPECT_NO_THROW(robot(20000, 80000));
+  ExpectRejectedNaming(robot_toml(5000, 49999), "command_timeout_us");
+  EXPECT_NO_THROW(Parse(robot_toml(5000, 50000)));
+  ExpectRejectedNaming(robot_toml(20000, 79999), "command_timeout_us");
+  EXPECT_NO_THROW(Parse(robot_toml(20000, 80000)));
 }
 
 // The bridge holds an actuator owner's last request for at least two of its
 // periods and at least half the command timeout, and the gateway refuses a
 // merged command whose oldest observation is command_timeout_us old, so every
 // owner's period is at most a quarter of it.
+// REQ-SAFE-26
 TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostAQuarterOfTheCommandTimeout) {
   const auto parse = [](const std::string& subsystems) {
     return ParseRobotConfigString("[robot]\ncommand_timeout_us = 100000\n" +
@@ -312,7 +327,14 @@ TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostAQuarterOfTheCommandTimeout) {
           "\n[subsystems.arm." + device + std::string{kMotor});
     };
     EXPECT_NO_THROW(owner(25000)) << device;
-    EXPECT_THROW(owner(25001), std::invalid_argument) << device;
+    try {
+      static_cast<void>(owner(25001));
+      ADD_FAILURE() << "accepted period_us = 25001 for " << device;
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("period_us"), std::string::npos) << what;
+      EXPECT_NE(what.find("command_timeout_us"), std::string::npos) << what;
+    }
   }
   // A node that only reads may be slow.
   EXPECT_NO_THROW(
@@ -350,14 +372,79 @@ local_port = 5805
     EXPECT_THROW(ParsePortFlag("--remote-port", bad), std::invalid_argument)
         << bad;
   }
+  // Ephemeral port 0 is accepted only when the flag opts in
+  // (--studio-http-port).
+  EXPECT_EQ(ParsePortFlag("--studio-http-port", "0", /*allow_zero=*/true), 0);
+  EXPECT_EQ(ParsePortFlag("--studio-http-port", "65535", /*allow_zero=*/true),
+            65535);
+  for (const char* bad : {"65536", "70000", "-1", "0x", ""}) {
+    EXPECT_THROW(ParsePortFlag("--studio-http-port", bad, /*allow_zero=*/true),
+                 std::invalid_argument)
+        << bad;
+  }
 }
 
+// REQ-OPS-25, REQ-CONTRACT-17: [robot] local_address defaults to empty
+// (wildcard), validates IPv4 literals strictly when set, and yields to a
+// non-empty CLI --local-address override.
+TEST(ConfigTest, LocalAddressDefaultsEmptyValidatesIpv4AndPrefersCliOverride) {
+  const auto omitted = Parse("");
+  EXPECT_TRUE(omitted.local_address.empty());
+  EXPECT_EQ(ResolveLocalAddress(omitted, ""), "");
+  EXPECT_EQ(ResolveLocalAddress(omitted, "10.56.87.6"), "10.56.87.6");
+
+  const auto configured = Parse("[robot]\nlocal_address = \"10.56.87.5\"\n");
+  EXPECT_EQ(configured.local_address, "10.56.87.5");
+  EXPECT_EQ(ResolveLocalAddress(configured, ""), "10.56.87.5");
+  EXPECT_EQ(ResolveLocalAddress(configured, "10.0.0.9"), "10.0.0.9");
+
+  for (const char* bad : {"\"\"", "123", "\"roborio.local\"", "\"10.0.0\"",
+                          "\"256.0.0.1\"", "\"10.0.0.1.2\"", "\"::1\"",
+                          "\"fe80::1\"", "\"010.56.87.5\"", "\"10.00.87.5\""}) {
+    SCOPED_TRACE(bad);
+    try {
+      Parse(std::string("[robot]\nlocal_address = ") + bad + "\n");
+      ADD_FAILURE() << "accepted invalid local_address " << bad;
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find("local_address"),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+
+  for (const char* bad_cli :
+       {"roborio.local", "10.0.0", "256.0.0.1", "::1", "010.56.87.5"}) {
+    SCOPED_TRACE(bad_cli);
+    try {
+      (void)ResolveLocalAddress(configured, bad_cli);
+      ADD_FAILURE() << "accepted invalid --local-address " << bad_cli;
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find("--local-address"),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+
+  RobotConfig invalid_config = omitted;
+  invalid_config.local_address = "010.0.0.1";
+  try {
+    (void)ResolveLocalAddress(invalid_config, "");
+    ADD_FAILURE() << "accepted invalid config.local_address";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string_view{error.what()}.find("local_address"),
+              std::string_view::npos)
+        << error.what();
+  }
+}
+
+// REQ-CONTRACT-17
 // Log retention keys of the wrong type or sign are refused, not defaulted.
 TEST(ConfigTest, RejectsInvalidLogRetention) {
   EXPECT_EQ(Parse("[robot]\nlog_keep_sessions = 3\n").log_keep_sessions, 3);
   ExpectRejected("[robot]\nlog_keep_sessions = \"3\"\n");
   ExpectRejected("[robot]\nlog_keep_sessions = 0\n");
   ExpectRejected("[robot]\nlog_max_bytes = 1.5\n");
+  ExpectRejected("[robot]\nlog_max_bytes = 0\n");
   ExpectRejected("[robot]\nlog_max_bytes = -1\n");
 }
 
@@ -385,6 +472,7 @@ TEST(ConfigTest, CommissionedRefusesTargetCoverageTurnedOff) {
 }
 
 TEST(ConfigTest, RejectsInvalidStudioOptions) {
+  ExpectRejected("[studio]\nhttp_port = 0\n");
   ExpectRejected("[studio]\nhttp_port = 70000\n");
   ExpectRejected("[studio]\nmax_clients = 0\n");
   ExpectRejected("[studio]\nmax_clients = 65\n");
@@ -633,6 +721,7 @@ TEST_F(ManifestTest, StudioDashboardResolvesAgainstTheFileThatSetsIt) {
 
 // The TalonFX applies soft limits in its own position frame, which a reset
 // restarts unless it is a remote CANcoder's absolute frame.
+// REQ-SAFE-26
 TEST_F(ManifestTest, RefusesSoftLimitsOutsideAnAbsolutePositionFrame) {
   Write("robot.toml",
         "[[subsystems]]\nname = \"lift\"\npath = \"subsystems/lift.toml\"\n");
@@ -644,11 +733,12 @@ TEST_F(ManifestTest, RefusesSoftLimitsOutsideAnAbsolutePositionFrame) {
     ADD_FAILURE() << "soft limits on a rezero-frame motor were accepted";
   } catch (const std::invalid_argument& error) {
     const std::string what = error.what();
+    EXPECT_NE(what.find("soft_limits"), std::string::npos) << what;
     EXPECT_NE(what.find("winch"), std::string::npos) << what;
     EXPECT_NE(what.find("position_frame = \"absolute\""), std::string::npos)
         << what;
   }
-  ExpectRejected("soft_limits = true\n");
+  ExpectRejectedNaming("soft_limits = true\n", "soft_limits");
   const auto absolute = Parse(R"(
 [subsystems.test.sensors.encoder]
 can_id = 2
@@ -696,6 +786,23 @@ TEST_F(ManifestTest, MotorTypeSetsThePhysicsModelAndRefusesUnknownTypes) {
   } catch (const std::invalid_argument& error) {
     const std::string what = error.what();
     for (const char* part : {"motor_type", "winch", "subsystems/lift.toml"}) {
+      EXPECT_NE(what.find(part), std::string::npos) << what;
+    }
+  }
+}
+
+TEST_F(ManifestTest, UnknownMotorKeyReportsSubsystemFilePath) {
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"lift\"\npath = \"subsystems/lift.toml\"\n");
+  Write("subsystems/lift.toml",
+        "[subsystem]\nname = \"lift\"\n[motors.winch]\ncan_id = 1\n"
+        "unknown_key = 1\n");
+  try {
+    ParseRobotConfig(Robot());
+    ADD_FAILURE() << "an unknown motor key was accepted";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    for (const char* part : {"unknown_key", "winch", "subsystems/lift.toml"}) {
       EXPECT_NE(what.find(part), std::string::npos) << what;
     }
   }
@@ -1044,6 +1151,54 @@ TEST(ConfigTest, RejectsInvalidTeleopDefaultTypes) {
   }
 }
 
+// REQ-CONTRACT-17: unknown keys in [robot] (such as a misspelled safety or
+// timing key) are refused naming the key instead of silently using defaults.
+TEST(ConfigTest, RejectsUnknownRobotKeys) {
+  try {
+    Parse("[robot]\ncommand_timout_us = 100000\n");
+    ADD_FAILURE() << "unknown [robot] key was accepted";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("[robot]"), std::string::npos) << what;
+    EXPECT_NE(what.find("command_timout_us"), std::string::npos) << what;
+  }
+  // Every known [robot] key still loads.
+  EXPECT_NO_THROW(Parse(R"(
+[robot]
+name = "bench"
+period_us = 5000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+require_target_coverage = false
+simulation_only = false
+controller_address = "10.56.87.2"
+controller_port = 5802
+local_port = 5803
+log_keep_sessions = 5
+log_max_bytes = 1048576
+max_restarts = 3
+hardware_node = "//talOS/bridge:hardware_node"
+sim_gateway = "//talOS/simulation:sim_gateway"
+[robot.targets]
+teleop = ["teleop"]
+)"));
+}
+
+// REQ-CONTRACT-17: non-finite floats in teleop scale or defaults are refused
+// at config load instead of propagating NaN/Inf into teleop targets.
+TEST(ConfigTest, RejectsNonFiniteTeleopScaleAndDefaults) {
+  for (const std::string_view bad : {"nan", "inf", "-inf"}) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(
+        "[[subsystems.test.teleop.bindings]]\naxis = 0\n"
+        "field = \"velocity_rps\"\nscale = " +
+        std::string{bad} + "\n");
+    ExpectRejected("[subsystems.test.teleop.defaults]\nvelocity_rps = " +
+                   std::string{bad} + "\n");
+  }
+}
+
 // Other binding shapes are cases in testdata/.
 TEST(ConfigTest, RejectsNegativePovAndFractionalPovIndex) {
   for (const std::string binding : {"pov = -45\nwhile_held = { x = 1 }",
@@ -1152,6 +1307,250 @@ TEST(ConfigTest, SharedResolutionCases) {
     }
     for (const auto& f : others) fs::remove(f);
     EXPECT_EQ(Nodes(ParseRobotConfig(path)), Strings(expect, "nodes"));
+  }
+}
+
+// REQ-DEV-05, REQ-DEV-23: [simulation] configures physics wheel radius and
+// swerve module placement, defaults when omitted, stays off the hardware wire
+// (ConfigurationId unchanged), and rejects invalid keys, values or motor refs.
+TEST(ConfigTest, SimulationTableParsesDefaultsStaysOffWireAndValidates) {
+  const std::string devices = R"(
+[subsystems.drive.motors]
+m_d0 = { can_id = 10 }
+m_s0 = { can_id = 11 }
+m_d1 = { can_id = 12 }
+m_s1 = { can_id = 13 }
+[subsystems.drive.sensors.imu]
+type = "Pigeon2"
+can_id = 20
+)";
+  const auto plain = Parse(devices);
+  EXPECT_DOUBLE_EQ(plain.simulation.wheel_radius_m, 0.0508);
+  EXPECT_TRUE(plain.simulation.swerve_modules.empty());
+
+  const auto with_sim = Parse(devices + R"(
+[simulation]
+wheel_radius_m = 0.06
+[[simulation.swerve_modules]]
+drive = "m_d0"
+steer = "m_s0"
+x_m = 0.40
+y_m = 0.25
+[[simulation.swerve_modules]]
+drive = "m_d1"
+steer = "m_s1"
+x_m = -0.40
+y_m = -0.25
+)");
+  EXPECT_DOUBLE_EQ(with_sim.simulation.wheel_radius_m, 0.06);
+  ASSERT_EQ(with_sim.simulation.swerve_modules.size(), 2u);
+  EXPECT_EQ(with_sim.simulation.swerve_modules[0],
+            (SimulationSwerveModule{"m_d0", "m_s0", 0.40, 0.25}));
+  EXPECT_EQ(with_sim.simulation.swerve_modules[1],
+            (SimulationSwerveModule{"m_d1", "m_s1", -0.40, -0.25}));
+  EXPECT_EQ(hardware::ConfigurationId(with_sim.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  // Invalid [simulation] table shapes, keys and wheel_radius_m values.
+  for (const std::string_view bad : {
+           "simulation = 1\n",
+           "[simulation]\nunknown = 1\n",
+           "[simulation]\nwheel_radius_m = 0.0\n",
+           "[simulation]\nwheel_radius_m = -0.05\n",
+           "[simulation]\nwheel_radius_m = nan\n",
+           "[simulation]\nwheel_radius_m = inf\n",
+           "[simulation]\nwheel_radius_m = -inf\n",
+           "[simulation]\nwheel_radius_m = \"0.05\"\n",
+           "[simulation]\nswerve_modules = {}\n",
+           "[simulation]\nswerve_modules = [1]\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(devices + std::string{bad});
+  }
+
+  // Invalid [[simulation.swerve_modules]] entries.
+  for (const std::string_view bad : {
+           // Unknown key.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\nz_m = "
+           "0\n",
+           // Missing required keys.
+           "[[simulation.swerve_modules]]\n"
+           "steer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\n",
+           // Empty motor names.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"\"\nx_m = 0.3\ny_m = 0.3\n",
+           // Non-finite or zero coordinates.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = nan\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = inf\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.0\ny_m = 0.0\n",
+           // Unknown motor or non-motor device.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"missing\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"imu\"\nx_m = 0.3\ny_m = 0.3\n",
+           // Same motor as drive and steer, or reused across modules.
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_d0\"\nx_m = 0.3\ny_m = 0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n"
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s1\"\nx_m = -0.3\ny_m = -0.3\n",
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_d0\"\nsteer = \"m_s0\"\nx_m = 0.3\ny_m = 0.3\n"
+           "[[simulation.swerve_modules]]\n"
+           "drive = \"m_s0\"\nsteer = \"m_s1\"\nx_m = -0.3\ny_m = -0.3\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(devices + std::string{bad});
+  }
+}
+
+TEST_F(ManifestTest, SimulationTableMergesAcrossIncludeOverlays) {
+  Write("robot.toml", R"(
+[robot]
+period_us = 5000
+
+[simulation]
+wheel_radius_m = 0.055
+
+[[simulation.swerve_modules]]
+drive = "d0"
+steer = "s0"
+x_m = 0.35
+y_m = 0.25
+
+[subsystems.drive.motors]
+d0 = { can_id = 1 }
+s0 = { can_id = 2 }
+d1 = { can_id = 3 }
+s1 = { can_id = 4 }
+)");
+  // Overlay overrides only wheel_radius_m and inherits swerve_modules.
+  Write("override_radius.toml", R"(
+include = "robot.toml"
+
+[simulation]
+wheel_radius_m = 0.065
+)");
+  const auto radius_only =
+      ParseRobotConfig((dir_ / "override_radius.toml").string());
+  EXPECT_DOUBLE_EQ(radius_only.simulation.wheel_radius_m, 0.065);
+  ASSERT_EQ(radius_only.simulation.swerve_modules.size(), 1u);
+  EXPECT_EQ(radius_only.simulation.swerve_modules[0],
+            (SimulationSwerveModule{"d0", "s0", 0.35, 0.25}));
+
+  // Overlay replaces swerve_modules while inheriting wheel_radius_m.
+  Write("override_modules.toml", R"(
+include = "robot.toml"
+
+[[simulation.swerve_modules]]
+drive = "d1"
+steer = "s1"
+x_m = -0.40
+y_m = -0.20
+)");
+  const auto modules_only =
+      ParseRobotConfig((dir_ / "override_modules.toml").string());
+  EXPECT_DOUBLE_EQ(modules_only.simulation.wheel_radius_m, 0.055);
+  ASSERT_EQ(modules_only.simulation.swerve_modules.size(), 1u);
+  EXPECT_EQ(modules_only.simulation.swerve_modules[0],
+            (SimulationSwerveModule{"d1", "s1", -0.40, -0.20}));
+}
+
+// REQ-DEV-10: [[simulation.hard_stops]] configures physical end-of-travel
+// bounds per motor off the hardware wire (ConfigurationId unchanged) and
+// rejects invalid shapes, bounds, unknown keys, unknown/non-motor devices, and
+// duplicate motors.
+TEST(ConfigTest, SimulationHardStopsParseStayOffWireAndValidate) {
+  const std::string devices = R"(
+[subsystems.lift.motors]
+m_lift = { can_id = 10 }
+m_arm = { can_id = 11 }
+m_wrist = { can_id = 12 }
+[subsystems.lift.sensors.enc]
+can_id = 20
+)";
+  const auto plain = Parse(devices);
+  EXPECT_TRUE(plain.simulation.hard_stops.empty());
+
+  const auto with_stops = Parse(devices + R"(
+[simulation]
+[[simulation.hard_stops]]
+motor = "m_lift"
+min_rot = -0.3
+max_rot = 5.0
+[[simulation.hard_stops]]
+motor = "m_arm"
+min_rot = 0.0
+[[simulation.hard_stops]]
+motor = "m_wrist"
+max_rot = 1.5
+)");
+  ASSERT_EQ(with_stops.simulation.hard_stops.size(), 3u);
+  EXPECT_EQ(with_stops.simulation.hard_stops[0],
+            (SimulationHardStop{"m_lift", -0.3, 5.0}));
+  EXPECT_EQ(with_stops.simulation.hard_stops[1],
+            (SimulationHardStop{"m_arm", 0.0, std::nullopt}));
+  EXPECT_EQ(with_stops.simulation.hard_stops[2],
+            (SimulationHardStop{"m_wrist", std::nullopt, 1.5}));
+  EXPECT_EQ(hardware::ConfigurationId(with_stops.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  for (const std::string_view bad : {
+           "[simulation]\nhard_stops = {}\n",
+           "[simulation]\nhard_stops = [1]\n",
+           // Unknown key.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = 0.0\n"
+           "extra = 1\n",
+           // Missing or empty motor.
+           "[[simulation.hard_stops]]\nmin_rot = 0.0\n",
+           "[[simulation.hard_stops]]\nmotor = \"\"\nmin_rot = 0.0\n",
+           // Neither min_rot nor max_rot set.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\n",
+           // Non-finite bounds or wrong type.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = nan\n",
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmax_rot = inf\n",
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = \"0\"\n",
+           // min_rot >= max_rot.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = 1.0\n"
+           "max_rot = 1.0\n",
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = 2.0\n"
+           "max_rot = 1.0\n",
+           // Unknown motor or non-motor device.
+           "[[simulation.hard_stops]]\nmotor = \"missing\"\nmin_rot = 0.0\n",
+           "[[simulation.hard_stops]]\nmotor = \"enc\"\nmin_rot = 0.0\n",
+           // Duplicate motor.
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmin_rot = 0.0\n"
+           "[[simulation.hard_stops]]\nmotor = \"m_lift\"\nmax_rot = 2.0\n",
+       }) {
+    SCOPED_TRACE(bad);
+    ExpectRejected(devices + std::string{bad});
+  }
+
+  // A hard stop targeting a follower motor is refused, naming both follower and
+  // master so the user configures the stop on the master instead.
+  try {
+    Parse(devices +
+          "[subsystems.lift.motors.m_follower]\ncan_id = 13\n"
+          "follow = \"m_lift\"\n"
+          "[[simulation.hard_stops]]\nmotor = \"m_follower\"\nmin_rot = 0.0\n");
+    ADD_FAILURE() << "accepted hard stop on follower motor";
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find("m_follower"), std::string::npos) << what;
+    EXPECT_NE(what.find("m_lift"), std::string::npos) << what;
   }
 }
 

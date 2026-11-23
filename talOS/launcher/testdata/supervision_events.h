@@ -10,16 +10,18 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "talOS/launcher/spawn.h"
 #include "talOS/launcher/supervision_policy.h"
@@ -87,33 +89,52 @@ class SupervisionPasses {
 // last looked. Copies share one state.
 class SteppedClock {
  public:
+  explicit SteppedClock(SupervisionClock base =
+                            [] { return std::chrono::steady_clock::now(); })
+      : state_{std::make_shared<State>(std::move(base))} {}
+
   SupervisionClock clock() const {
     return [state = state_] { return state->Now(); };
   }
   void Advance(std::chrono::nanoseconds by) {
-    state_->ahead.fetch_add(by.count());
+    {
+      std::lock_guard<std::mutex> lock{state_->mu};
+      state_->ahead += by.count();
+    }
     SupervisionWakeup::Wake();
   }
   // Holds the clock where it reads now, which it returns.
   SupervisionTime Freeze() {
-    const SupervisionTime now = state_->Now();
-    HoldAt(now);
+    SupervisionTime now;
+    {
+      std::lock_guard<std::mutex> lock{state_->mu};
+      now = state_->NowLocked();
+      state_->held = now.time_since_epoch().count();
+    }
+    SupervisionWakeup::Wake();
     return now;
   }
   // The clock reads exactly `at`, no earlier than it has read, until
   // HoldAt again or Release.
   void HoldAt(SupervisionTime at) {
-    state_->held.store(at.time_since_epoch().count());
+    {
+      std::lock_guard<std::mutex> lock{state_->mu};
+      const int64_t target =
+          std::max(state_->last, at.time_since_epoch().count());
+      state_->held = target;
+      state_->last = target;
+    }
     SupervisionWakeup::Wake();
   }
   // The clock runs on from where it is held.
   void Release() {
-    const int64_t held = state_->held.load();
-    if (held == kFree) return;
-    const int64_t real =
-        std::chrono::steady_clock::now().time_since_epoch().count();
-    state_->ahead.store(std::max(state_->ahead.load(), held - real));
-    state_->held.store(kFree);
+    {
+      std::lock_guard<std::mutex> lock{state_->mu};
+      if (state_->held == kFree) return;
+      const int64_t real = state_->base().time_since_epoch().count();
+      state_->ahead = state_->held - real;
+      state_->held = kFree;
+    }
     SupervisionWakeup::Wake();
   }
 
@@ -134,16 +155,26 @@ class SteppedClock {
  private:
   static constexpr int64_t kFree = INT64_MAX;
   struct State {
-    std::atomic<int64_t> ahead{0};
-    std::atomic<int64_t> held{kFree};
-    SupervisionTime Now() const {
-      const int64_t at = held.load();
-      if (at != kFree) return SupervisionTime{std::chrono::nanoseconds{at}};
-      return std::chrono::steady_clock::now() +
-             std::chrono::nanoseconds{ahead.load()};
+    explicit State(SupervisionClock base_clock) : base{std::move(base_clock)} {}
+    mutable std::mutex mu;
+    SupervisionClock base;
+    int64_t ahead{0};
+    int64_t held{kFree};
+    int64_t last{INT64_MIN};
+
+    SupervisionTime NowLocked() {
+      const int64_t raw =
+          (held != kFree) ? held : base().time_since_epoch().count() + ahead;
+      last = std::max(last, raw);
+      return SupervisionTime{std::chrono::nanoseconds{last}};
+    }
+
+    SupervisionTime Now() {
+      std::lock_guard<std::mutex> lock{mu};
+      return NowLocked();
     }
   };
-  std::shared_ptr<State> state_{std::make_shared<State>()};
+  std::shared_ptr<State> state_;
 };
 
 }  // namespace talos::launcher::testing

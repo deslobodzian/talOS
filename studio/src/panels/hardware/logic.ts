@@ -128,7 +128,8 @@ export function canBusSeriesChannels(count: number|undefined): string[] {
 export function canBusLines(
     count: number|undefined,
     series: {times: ArrayLike<number>;
-             values: Record<string, ArrayLike<number>|undefined>}): CanBusLine[] {
+             values: Record<string, ArrayLike<number>|undefined>},
+    busNames?: readonly string[]): CanBusLine[] {
   const out: CanBusLine[] = [];
   const n = series.times.length;
   for (let index = 0; index < busesInUse(count); index++) {
@@ -139,7 +140,7 @@ export function canBusLines(
       for (let i = 0; i < n; i++)
         if (canBusReadState(state[i]) === 'ok') values[i] = frac[i];
     }
-    out.push({index, name: canBusLabel(index), values});
+    out.push({index, name: canBusLabel(index, busNames), values});
   }
   return out;
 }

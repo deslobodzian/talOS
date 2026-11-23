@@ -205,8 +205,9 @@ decode it to a `process::RealtimeOutcome`, whose `grant()` is `full`,
 `partial` (only a memory step refused), `refused` (the scheduling policy
 refused: the loop runs at timeshare) or `not_requested`. Like the event log
 flags, these are bits every earlier writer left clear and every earlier reader
-ignores, so the layout and version are unchanged. A ring whose lock is
-refused after the loop starts is not in the row (stderr only).
+ignores, so the layout and version are unchanged. A ring whose lock is refused
+after the loop starts sets `memory::LateLockRefused()` and is recorded in the
+row via `note_realtime_refused(process::kStepRingLock)` on subsequent samples.
 
 ## Wake loss
 
@@ -415,7 +416,8 @@ gives the segment and lock file their modes under a restrictive umask and
 refuses a segment it cannot open read-write.
 
 `:registry` is the segment and both ends of it, and depends only on
-`//talOS/events:events_core`, `:names`, `:lock_file` and
+`//talOS/events:events_core`, `:names`, `:lock_file`,
+`//talOS/memory:shared_memory`, `//talOS/process:realtime_outcome` and
 `//talOS/rtms:process_liveness` — a reader such as Studio's bridge does not
 pull in an event loop. It does not depend on `:describe` either, and
 `publish`'s attribute overload is a template on the container for that reason:

@@ -103,7 +103,7 @@ py_test(
 talos_messages(
     name = "test_messages",
     srcs = ["testdata/talos_test_message.fbs"],
-    visibility = ["//visibility:private"],
+    visibility = ["//talOS/node_api:__pkg__"],
 )
 
 py_test(
@@ -128,18 +128,39 @@ py_test(
 )
 
 py_test(
+    name = "safety_parity_test",
+    size = "small",
+    srcs = ["safety_parity_test.py"],
+    legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = [
+        ":mechanisms",
+        ":test_messages_py",
+        ":testing",
+        "//talOS/msgs:control_py",
+    ],
+)
+
+_TALOS_PY_SRCS = glob(["talos/**/*.py"])
+
+py_test(
     name = "api_parity_test",
     size = "small",
     srcs = ["api_parity_test.py"],
-    data = [
-        "talos/_abi.py",
-        "talos/devices.py",
+    data = _TALOS_PY_SRCS + [
         "//talOS/node_api:node_api.h",
     ],
     env = {
         "TALOS_ABI_DEVICES": "$(rlocationpath talos/devices.py)",
         "TALOS_ABI_HEADER": "$(rlocationpath //talOS/node_api:node_api.h)",
+        "TALOS_ABI_INIT": "$(rlocationpath talos/__init__.py)",
+        "TALOS_ABI_MECHANISMS": "$(rlocationpath talos/mechanisms.py)",
         "TALOS_ABI_PYTHON": "$(rlocationpath talos/_abi.py)",
+        "TALOS_PY_SRCS": ":".join(["$(rlocationpath %s)" % s for s in _TALOS_PY_SRCS]),
     },
     # A generated empty talos/__init__.py here would collide with the tracked
     # one in every other test's runfiles (see tools/check_runfiles_collisions.py).
@@ -178,6 +199,33 @@ py_test(
         "//talOS/msgs:geometry_py",
         "//talOS/schema:test_messages_py",
         "@pypi//flatbuffers",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+# Fast C++ vs Python differential parity test across all 8 device kinds,
+# DriverStation, Target/TargetLane/OperatorArming, StateMachine, session_dir,
+# pause/resume, reset_device/reboot, and all 3 talOS/mechanisms classes.
+py_test(
+    name = "differential_parity_test",
+    size = "small",
+    srcs = ["differential_parity_test.py"],
+    data = ["//talOS/node_api:libdifferential_parity_nodes.so"],
+    env = {
+        "TALOS_PARITY_NODES_LIB": "$(rlocationpath //talOS/node_api:libdifferential_parity_nodes.so)",
+    },
+    legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = [
+        ":mechanisms",
+        ":parity",
+        ":test_messages_py",
+        "//talOS/msgs:control_py",
+        "//talOS/msgs:geometry_py",
         "@rules_python//python/runfiles",
     ],
 )

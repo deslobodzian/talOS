@@ -43,11 +43,28 @@ class Endpoint {
     return peer_.Open(local, local_port, remote, remote_port);
   }
   // A new socket on the ports of the last successful Open(), keeping the
-  // frame sequence (RuntimeUdpPeer::Reopen): for a caller whose sends found
-  // the socket unable to send again (protocol::SendErrorNeedsNewSocket on
-  // udp_stats().last_send_error).
+  // frame sequence (RuntimeUdpPeer::Reopen): for a caller whose sends or
+  // receives found the socket broken (protocol::SendErrorNeedsNewSocket /
+  // protocol::ReceiveErrorNeedsNewSocket).
   protocol::UdpStatus Reopen() { return peer_.Reopen(); }
+  void Close() { peer_.Close(); }
   const protocol::UdpStats& udp_stats() const { return peer_.stats(); }
+  // The last receive-side socket error observed during the most recent Tick()
+  // (kOk and 0 when no kSocketError occurred). Callers pass these to
+  // SocketRetry::ObserveReceive() so permanent receive errors reopen the
+  // socket while transient ones (ECONNREFUSED) keep it open (REQ-RT-22).
+  protocol::UdpStatus last_receive_status() const {
+    return last_receive_status_;
+  }
+  int last_receive_error() const { return last_receive_error_; }
+  bool receive_needs_reopen() const {
+    return last_receive_status_ == protocol::UdpStatus::kSocketError &&
+           protocol::ReceiveErrorNeedsNewSocket(last_receive_error_);
+  }
+  // Test seam (null in production): when set, asked before each TryReceive()
+  // in Tick(); a nonzero errno fails that receive with kSocketError and that
+  // error, so tests can reach OS receive errors loopback never produces.
+  void SetReceiveErrorSeam(int (*seam)()) { receive_error_seam_ = seam; }
   // Link fault injection drops outbound traffic, never inbound commands or
   // gateway safety ticks. Suppressed datagrams are not queued for recovery.
   void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
@@ -58,7 +75,9 @@ class Endpoint {
   // so only the newest completed transfer's ACK ever goes out (the bridge
   // would otherwise wait for its next push). Returns the State send's
   // status, or, when that succeeded, the first failed ACK send's: either way a
-  // send that found the socket unable to send reaches the caller.
+  // send that found the socket unable to send reaches the caller. If State
+  // fails to encode, no kHardwareState frame is sent and kInvalidArgument is
+  // returned unless an ACK send already failed.
   protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
     gateway_.Tick(now_us, enabled);
     // Only echo probes received on a previous tick: now_us was sampled before
@@ -72,7 +91,7 @@ class Endpoint {
                        ? ConfigAckStatus::kOk
                        : ConfigAckStatus::kBackendFailed;
       if (ack.status != ConfigAckStatus::kOk) {
-        const auto error = gateway_.config_error();
+        const auto& error = gateway_.config_error();
         if (error)
           std::snprintf(ack.reason, sizeof(ack.reason), "%s: %s",
                         error->device_name.c_str(), error->message.c_str());
@@ -90,10 +109,22 @@ class Endpoint {
     bool have_command = false;
     uint64_t command_sequence = 0;
     Command newest;
+    last_receive_status_ = protocol::UdpStatus::kOk;
+    last_receive_error_ = 0;
     for (int i = 0; i < kReceiveBudget; ++i) {
       protocol::DecodedFrame frame;
-      const auto result = peer_.TryReceive(&frame);
+      int recv_error =
+          receive_error_seam_ != nullptr ? receive_error_seam_() : 0;
+      const auto result = recv_error != 0 ? protocol::UdpStatus::kSocketError
+                                          : peer_.TryReceive(&frame);
       if (result == protocol::UdpStatus::kWouldBlock) break;
+      if (result == protocol::UdpStatus::kSocketError) {
+        if (recv_error == 0) recv_error = peer_.stats().last_recv_error;
+        last_receive_status_ = result;
+        last_receive_error_ = recv_error;
+        if (protocol::ReceiveErrorNeedsNewSocket(recv_error)) break;
+        continue;
+      }
       if (result == protocol::UdpStatus::kDecodeError &&
           peer_.stats().last_decode_status ==
               protocol::DecodeStatus::kUnsupportedVersion) {
@@ -110,11 +141,13 @@ class Endpoint {
         continue;
       }
       if (frame.header.type == protocol::FrameType::kHardwareConfig) {
-        std::string err;
-        auto status =
-            assembler_.AddChunk({frame.payload, frame.payload_size}, err);
+        std::array<char, sizeof(ConfigAckPayload::reason)> err{};
+        auto status = assembler_.AddChunk({frame.payload, frame.payload_size},
+                                          std::span<char>{err});
         if (status == ConfigAssembler::Status::kComplete) {
           if (gateway_.configuring()) continue;
+          const uint64_t enabled_refusals_before =
+              gateway_.last_enabled_refusal().count;
           bool ok = gateway_.BeginReconfigure(assembler_.config());
           // Bounded backends can complete immediately; Phoenix only polls its
           // worker here and returns without waiting for CAN transactions.
@@ -141,8 +174,13 @@ class Endpoint {
             // generic string. Compact "device: cause" summary so both survive
             // truncation to the 64-byte reason; snprintf always
             // NUL-terminates.
-            const auto config_error = gateway_.config_error();
-            if (config_error.has_value()) {
+            const auto& refusal = gateway_.last_enabled_refusal();
+            const auto& config_error = gateway_.config_error();
+            if (refusal.count != enabled_refusals_before &&
+                refusal.refused_id == assembler_.config_id()) {
+              std::snprintf(ack.reason, sizeof(ack.reason),
+                            "disable to accept the new configuration");
+            } else if (config_error.has_value()) {
               std::snprintf(ack.reason, sizeof(ack.reason), "%s: %s",
                             config_error->device_name.c_str(),
                             config_error->message.c_str());
@@ -163,7 +201,7 @@ class Endpoint {
           } else {
             ack.status = ConfigAckStatus::kMalformed;
           }
-          std::snprintf(ack.reason, sizeof(ack.reason), "%s", err.c_str());
+          std::snprintf(ack.reason, sizeof(ack.reason), "%s", err.data());
           QueueAck(ack);
           ack_status = Worse(ack_status, SendAck(now_us));
         }
@@ -189,6 +227,9 @@ class Endpoint {
     auto state = gateway_.snapshot();
     state.clock_probe_time_us = clock_probe_time_us;
     const auto size = Encode(state, buffer_);
+    if (size == 0) {
+      return Worse(ack_status, protocol::UdpStatus::kInvalidArgument);
+    }
     return Worse(
         Send(protocol::FrameType::kHardwareState, now_us, buffer_.data(), size),
         ack_status);
@@ -236,6 +277,9 @@ class Endpoint {
   // with one CAN write pass each.
   static constexpr int kReceiveBudget = 64;
   bool send_enabled_{true};
+  int (*receive_error_seam_)(){nullptr};
+  protocol::UdpStatus last_receive_status_{protocol::UdpStatus::kOk};
+  int last_receive_error_{0};
   PeerContact contact_;
   DrainedCommand drained_;
   uint64_t pending_probe_time_us_{};

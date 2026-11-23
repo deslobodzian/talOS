@@ -42,16 +42,68 @@ def current_repository():
     return (files.CurrentRepository() if files else "") or ""
 
 
+def _repo_mapping_path():
+    """Path to Bazel's `_repo_mapping` file from `RUNFILES_DIR` or
+    `RUNFILES_MANIFEST_FILE` (checking explicit env vars before runfiles'
+    EnvVars), or None."""
+    def from_env(env):
+        rf_dir = env.get("RUNFILES_DIR")
+        if rf_dir:
+            candidate = os.path.join(rf_dir, "_repo_mapping")
+            if os.path.isfile(candidate):
+                return candidate
+        manifest = env.get("RUNFILES_MANIFEST_FILE")
+        if manifest and os.path.isfile(manifest):
+            with open(manifest, encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("_repo_mapping "):
+                        target = line.split(" ", 1)[1].strip()
+                        if os.path.isfile(target):
+                            return target
+        return None
+
+    if found := from_env(os.environ):
+        return found
+    files = runfiles.Create()
+    return from_env(files.EnvVars()) if files else None
+
+
+def _apparent_from_repo_mapping(canonical, path):
+    """Apparent repository name visible from the main repository (`source == ""`)
+    for `canonical` in `_repo_mapping` file `path`, or None."""
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\r\n").split(",")
+            if len(parts) != 3:
+                continue
+            source, apparent, target = parts
+            if source == "" and target == canonical and apparent:
+                return apparent
+    return None
+
+
+def talos_repo_prefix():
+    """The Bazel label prefix of talOS as the main repository names it:
+    `//` when talOS is the main repository, else `@<apparent>//` read from
+    Bazel's `_repo_mapping` (falling back to stripping `+`/`~` when no mapping
+    covers `current_repository()`)."""
+    repository = current_repository()
+    if not repository:
+        return "//"
+    apparent = _apparent_from_repo_mapping(repository, _repo_mapping_path())
+    if apparent:
+        return f"@{apparent}//"
+    module = repository.split("+", 1)[0].split("~", 1)[0]
+    return f"@{module}//"
+
+
 def command():
     """The regenerate command as the repository being worked in runs it:
-    `//tools:sync_manifest` in talOS, `@<module>//tools:sync_manifest` where
-    talOS is a dependency (its canonical name, `<module>+`, less the suffix:
-    the name a dependent MODULE.bazel's bazel_dep gives it by default)."""
-    repository = current_repository()
-    if repository:
-        module = repository.split("+", 1)[0].split("~", 1)[0]
-        return f"bazel run @{module}//tools:sync_manifest --"
-    return "bazel run //tools:sync_manifest --"
+    `//tools:sync_manifest` in talOS, `@<apparent>//tools:sync_manifest` where
+    talOS is a dependency."""
+    return f"bazel run {talos_repo_prefix()}tools:sync_manifest --"
 
 
 class ManifestError(Exception):

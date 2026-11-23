@@ -5,11 +5,9 @@ cc_library(
     name = "process",
     srcs = ["process.cc"],
     hdrs = ["process.h"],
+    implementation_deps = ["//talOS/memory:residency"],
     visibility = ["//visibility:public"],
-    deps = [
-        ":realtime_outcome",
-        "//talOS/memory:residency",
-    ],
+    deps = [":realtime_outcome"],
 )
 
 # The loop tier and ConfigureRealtime's outcome, without the code that applies
@@ -24,6 +22,15 @@ cc_library(
 cc_library(
     name = "durable_sync",
     hdrs = ["durable_sync.h"],
+    visibility = ["//visibility:public"],
+)
+
+# Host scheduling-noise probe and latency percentile helper for timed perf and
+# integration tests (docs/TESTING.md §6.7, §6.8).
+cc_library(
+    name = "host_qualification",
+    testonly = True,
+    hdrs = ["host_qualification.h"],
     visibility = ["//visibility:public"],
 )
 

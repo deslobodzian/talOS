@@ -403,7 +403,7 @@ Killed LookUntilKilled(
 // Looking only when NextLook says, never on a poll, a stalled run is killed
 // at least one heartbeat timeout and at most that plus one look interval
 // after its last dispatch, wherever in a look interval the stall begins.
-// REQ-OPS-05
+// REQ-OPS-05, REQ-OPS-45
 TEST(SupervisionPolicy, ScheduledLooksKillAStallWithinTheTimeoutAndOneLook) {
   const LivenessLimits limits = SessionLivenessLimits();
   const auto look = LivenessLookInterval(limits);
@@ -430,7 +430,7 @@ TEST(SupervisionPolicy, ScheduledLooksKillAStallWithinTheTimeoutAndOneLook) {
 // registered, the construction deadline for one still constructing; and a
 // deadline already decided (the construction deadline of a run that has no
 // row, which only the grace ends) never holds the next look back.
-// REQ-OPS-05
+// REQ-OPS-05, REQ-OPS-45
 TEST(SupervisionPolicy, ScheduledLooksFallOnTheGraceAndConstructionDeadlines) {
   const RowObservation none;
   int64_t beat = 0;
@@ -464,6 +464,41 @@ TEST(SupervisionPolicy, ScheduledLooksFallOnTheGraceAndConstructionDeadlines) {
     const Killed killed = LookUntilKilled(run, limits, c.row_at);
     EXPECT_EQ(killed.reason, c.reason) << At(killed.at);
     EXPECT_EQ(killed.at, kT0 + c.at) << At(killed.at);
+  }
+}
+
+// A registered run whose dispatch count stops inside its startup grace (S = 1s,
+// grace = 5s) is not killed before the end of its grace (5s), and is killed as
+// kRunStalled at 5s (the later of grace end and S + heartbeat timeout).
+// REQ-OPS-05, REQ-OPS-45
+TEST(SupervisionPolicy, RegisteredRunStallingInsideGraceIsKilledAtGraceEnd) {
+  const LivenessLimits limits = SessionLivenessLimits();
+  ASSERT_EQ(limits.startup_grace, 5s);
+  ASSERT_EQ(limits.heartbeat_timeout, 500ms);
+  const SupervisionTime stall_at = kT0 + 1s;
+
+  // Scheduled-look path: LookUntilKilled fails if any look kills early or
+  // skips a deadline.
+  {
+    RunLiveness run;
+    run.Begin(kT0);
+    const Killed killed = LookUntilKilled(run, limits, [&](SupervisionTime t) {
+      return RowObservation{.found = true,
+                            .dispatch = static_cast<uint64_t>(
+                                (std::min(t, stall_at) - kT0) / 1ms)};
+    });
+    EXPECT_EQ(killed.reason, kRunStalled) << At(killed.at);
+    EXPECT_EQ(killed.at, kT0 + 5s) << At(killed.at);
+  }
+
+  // Direct boundary check: alive at 5s - 1ns, kRunStalled at 5s.
+  {
+    RunLiveness run;
+    run.Begin(kT0);
+    RowObservation row{.found = true, .dispatch = 1};
+    EXPECT_EQ(run.Judge(row, stall_at, limits), std::string_view{});
+    EXPECT_EQ(run.Judge(row, kT0 + 5s - 1ns, limits), std::string_view{});
+    EXPECT_EQ(run.Judge(row, kT0 + 5s, limits), kRunStalled);
   }
 }
 

@@ -10,7 +10,6 @@
 #include <optional>
 #include <random>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -27,6 +26,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/ipc/publisher.h"
+#include "talOS/memory/residency.h"
 #include "talOS/process/process.h"
 #include "talOS/simulation/ports.h"
 #include "talOS/simulation/schedules.h"
@@ -49,6 +49,45 @@ constexpr const char* kUsage =
 
 // Shared-memory slot contract: docs/DATA_FLOW.md.
 static_assert(sizeof(geometry::OdometrySample) == 56);
+
+// REQ-SAFE-02: matches Robot.cpp's enable gate — e-stop disables the gateway
+// even if kEnabled is still set in the control word.
+constexpr bool GatewayEnabled(uint32_t ds_flags) {
+  return (ds_flags & ds::kEnabled) != 0 && (ds_flags & ds::kEStop) == 0;
+}
+static_assert(GatewayEnabled(ds::kDsAttached | ds::kEnabled | ds::kTeleop));
+static_assert(!GatewayEnabled(ds::kDsAttached | ds::kEnabled | ds::kTeleop |
+                              ds::kEStop));
+static_assert(!GatewayEnabled(ds::kDsAttached | ds::kTeleop));
+static_assert(!GatewayEnabled(ds::kDsAttached | ds::kEStop));
+
+// Next loop deadline on the node clock after a tick finishes at `end`, with
+// `deadline` the previous deadline and `period` the configured tick period.
+// While each tick finishes on time, advancing by `period` keeps phase; after a
+// host pause or tick overrun (`deadline + period <= end`), missed deadlines are
+// dropped and the next tick aligns to `end + period` instead of firing a
+// zero-sleep UDP catch-up burst (matching LoopSchedule::NextWakeUs semantics).
+constexpr talos::event::MonotonicTime NextTickDeadline(
+    talos::event::MonotonicTime deadline, talos::event::MonotonicTime end,
+    talos::event::Duration period) {
+  const auto next = deadline + period;
+  return next > end ? next : end + period;
+}
+static_assert(
+    NextTickDeadline(talos::event::MonotonicTime::from_nanos(10'000'000),
+                     talos::event::MonotonicTime::from_nanos(10'500'000),
+                     std::chrono::milliseconds{5}) ==
+    talos::event::MonotonicTime::from_nanos(15'000'000));
+static_assert(
+    NextTickDeadline(talos::event::MonotonicTime::from_nanos(10'000'000),
+                     talos::event::MonotonicTime::from_nanos(15'000'000),
+                     std::chrono::milliseconds{5}) ==
+    talos::event::MonotonicTime::from_nanos(20'000'000));
+static_assert(
+    NextTickDeadline(talos::event::MonotonicTime::from_nanos(10'000'000),
+                     talos::event::MonotonicTime::from_nanos(200'000'000),
+                     std::chrono::milliseconds{5}) ==
+    talos::event::MonotonicTime::from_nanos(205'000'000));
 
 double FiniteNumber(const std::string& text) {
   std::size_t used = 0;
@@ -212,6 +251,40 @@ int main(int argc, char** argv) {
           "nothing downstream would ever move");
     }
     talos::process::InstallStopHandlers();
+    talos::simulation::GatewayPorts ports{};
+    talos::hardware::Config hw_config;
+    std::vector<talos::hardware::sim::HomeSwitch> home_switches;
+    std::vector<talos::hardware::sim::SwerveModuleSpec> swerve_modules;
+    std::vector<talos::hardware::sim::HardStop> hard_stops;
+    {
+      const auto robot_config = talos::config::ParseRobotConfig(config_path);
+      ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
+                                                     remote_port_flag);
+      options.wheel_radius_m = robot_config.simulation.wheel_radius_m;
+      hw_config = robot_config.hardware;
+      hw_config.commissioned = true;
+      home_switches.reserve(hw_config.digital_inputs.size());
+      for (const auto& input : hw_config.digital_inputs) {
+        const auto& sim = input.sim_home_switch;
+        if (sim.motor.empty()) continue;
+        home_switches.push_back({.input = input.name.str(),
+                                 .motor = sim.motor,
+                                 .closed_at_rot = sim.closed_at_rot,
+                                 .closed_above = sim.closed_above,
+                                 .closed_reads = sim.closed_reads});
+      }
+      swerve_modules.reserve(robot_config.simulation.swerve_modules.size());
+      for (const auto& m : robot_config.simulation.swerve_modules) {
+        swerve_modules.push_back(
+            {.drive = m.drive, .steer = m.steer, .x_m = m.x_m, .y_m = m.y_m});
+      }
+      hard_stops.reserve(robot_config.simulation.hard_stops.size());
+      for (const auto& stop : robot_config.simulation.hard_stops) {
+        hard_stops.push_back({.motor = stop.motor,
+                              .min_rot = stop.min_rot,
+                              .max_rot = stop.max_rot});
+      }
+    }
     talos::hardware::SimBackend ideal;
     talos::hardware::sim::PhysicsSimBackend physics_backend{options};
     talos::hardware::Backend& backend =
@@ -236,37 +309,22 @@ int main(int argc, char** argv) {
     // commissioned hardware, and a simulator that coasts every demand to
     // zero for lack of a commissioning bit would conceal the control it is
     // meant to exercise.
-    talos::simulation::GatewayPorts ports{};
-    {
-      auto robot_config = talos::config::ParseRobotConfig(config_path);
-      ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
-                                                     remote_port_flag);
-      auto hw_config = robot_config.hardware;
-      hw_config.commissioned = true;
-      // The wire carries no motor type: a config the bridge pushes later
-      // keeps each motor's type from this parse, matched by name.
-      physics_backend.SetLocalMotorTypes(hw_config);
-      // Nor home switches ([digital_inputs.*] sim_motor): bound by name,
-      // they survive a pushed config too. Set before Reconfigure, which
-      // binds them, so the first State already reads them.
-      std::vector<talos::hardware::sim::HomeSwitch> home_switches;
-      home_switches.reserve(hw_config.digital_inputs.size());
-      for (const auto& input : hw_config.digital_inputs) {
-        const auto& sim = input.sim_home_switch;
-        if (sim.motor.empty()) continue;
-        home_switches.push_back({.input = input.name,
-                                 .motor = sim.motor,
-                                 .closed_at_rot = sim.closed_at_rot,
-                                 .closed_above = sim.closed_above,
-                                 .closed_reads = sim.closed_reads});
-      }
-      physics_backend.SetHomeSwitches(std::move(home_switches));
-      if (!gateway.Reconfigure(hw_config)) {
-        throw std::runtime_error(
-            "sim_gateway: Reconfigure failed for the robot config");
-      }
-      talos::simulation::ResolveFaults(faults, hw_config);
+    //
+    // The wire carries no motor type, home switches ([digital_inputs.*]
+    // sim_motor) or [simulation] swerve geometry / hard stops: bound by name
+    // before Reconfigure, they apply on the first State and survive any config
+    // the bridge pushes later.
+    physics_backend.SetLocalMotorTypes(hw_config);
+    physics_backend.SetHomeSwitches(std::move(home_switches));
+    physics_backend.SetHardStops(std::move(hard_stops));
+    if (!swerve_modules.empty()) {
+      physics_backend.SetSwerveModules(std::move(swerve_modules));
     }
+    if (!gateway.Reconfigure(hw_config)) {
+      throw std::runtime_error(
+          "sim_gateway: Reconfigure failed for the robot config");
+    }
+    talos::simulation::ResolveFaults(faults, hw_config);
     talos::hardware::Endpoint endpoint{gateway};
     if (endpoint.Open("127.0.0.1", ports.listen, "127.0.0.1", ports.send) !=
         talos::protocol::UdpStatus::kOk) {
@@ -300,13 +358,20 @@ int main(int argc, char** argv) {
            .tier = realtime.tier});
     }
     if (registration) registration->set_realtime(realtime);
-    auto next = std::chrono::steady_clock::now();
+    // One node clock (Poller::now(): CLOCK_MONOTONIC on Linux,
+    // CLOCK_MONOTONIC_RAW on macOS) drives schedules, State/DS stamps,
+    // /sim/state truth, and loop wakeups so macOS sleep never skews them apart.
+    talos::event::Poller poller;
+    if (const int stop_fd = talos::process::StopFd(); stop_fd >= 0) {
+      poller.add_fd(stop_fd);
+    }
+    auto next = talos::event::Poller::now();
     // The mode, joystick and fault schedules and --duration-s count from one
     // node-clock time zero, so a harness that chose it times its own actions
     // from the same instant. Until it is known and reached, the gateway holds
     // the schedules' time-zero state.
     std::optional<int64_t> start_ns;
-    if (!schedule_start_file) start_ns = talos::event::Poller::now().nanos();
+    if (!schedule_start_file) start_ns = next.nanos();
     std::size_t phase = 0;
     std::size_t joystick_event = 0;
     ds::ModeTracker mode_tracker;
@@ -323,7 +388,7 @@ int main(int argc, char** argv) {
     uint64_t truth_sequence = 0;
     int64_t last_truth_ns = 0;
     while (!talos::process::stop_requested.load()) {
-      const auto tick_time = std::chrono::steady_clock::now();
+      const auto tick_time = talos::event::Poller::now();
       if (!start_ns) {
         // Written atomically by the harness (rename), so a read sees all of
         // it or no file.
@@ -335,8 +400,7 @@ int main(int argc, char** argv) {
           } catch (const std::invalid_argument& e) {
             throw std::invalid_argument(*schedule_start_file + ": " + e.what());
           }
-          const int64_t late_ns =
-              talos::event::Poller::now().nanos() - *start_ns;
+          const int64_t late_ns = tick_time.nanos() - *start_ns;
           if (late_ns > 0) {
             std::fprintf(stderr,
                          "sim_gateway: schedule start is %.1f ms in the past\n",
@@ -347,9 +411,7 @@ int main(int argc, char** argv) {
         }
       }
       const int64_t since_ns =
-          start_ns ? std::max<int64_t>(
-                         0, talos::event::Poller::now().nanos() - *start_ns)
-                   : 0;
+          start_ns ? std::max<int64_t>(0, tick_time.nanos() - *start_ns) : 0;
       const auto elapsed = std::chrono::floor<std::chrono::microseconds>(
           std::chrono::nanoseconds{since_ns});
       const double elapsed_s = std::chrono::duration<double>(elapsed).count();
@@ -363,16 +425,14 @@ int main(int argc, char** argv) {
       }
       endpoint.SetSendEnabled(
           !talos::simulation::ApplyFaults(faults, elapsed_s, physics_backend));
-      driver_station.sample_time_us =
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              tick_time.time_since_epoch())
-              .count();
+      const uint64_t now =
+          static_cast<uint64_t>(std::max<int64_t>(0, tick_time.nanos()) / 1000);
+      driver_station.sample_time_us = now;
       driver_station.fms.flags =
           phases.empty() ? ds::kDsAttached | ds::kEnabled | ds::kTeleop
                          : phases[phase].flags;
       mode_tracker.Stamp(driver_station);
-      const auto now = driver_station.sample_time_us;
-      endpoint.Tick(now, (driver_station.fms.flags & ds::kEnabled) != 0);
+      endpoint.Tick(now, GatewayEnabled(driver_station.fms.flags));
       if (truth_publisher) {
         const auto sample_time = talos::event::Poller::now();
         const auto& truth = physics_backend.truth();
@@ -409,13 +469,26 @@ int main(int argc, char** argv) {
           registration->set_source(0, truth_samples, truth_dropped,
                                    truth_sequence, last_truth_ns, 0, 0);
         }
+        if (talos::memory::LateLockRefused()) {
+          registration->note_realtime_refused(talos::process::kStepRingLock);
+        }
         registration->end_sample();
       }
       active_ticks +=
           (gateway.snapshot().flags & talos::hardware::kCommandActive) != 0;
-      next += std::chrono::microseconds{
-          gateway.configured() ? gateway.config().period_us : 5000};
-      std::this_thread::sleep_until(next);
+      const auto period = talos::event::Duration{std::chrono::microseconds{
+          gateway.configured() ? gateway.config().period_us : 5000}};
+      next = NextTickDeadline(next, talos::event::Poller::now(), period);
+      while (!talos::process::stop_requested.load()) {
+        if (poller.wait_until(next) ==
+            talos::event::Poller::WakeReason::DEADLINE) {
+          break;
+        }
+        if (poller.reported_readable(talos::process::StopFd()) &&
+            talos::process::ConsumeStopWake()) {
+          break;
+        }
+      }
     }
     backend.Neutral();
     double first_wheel_rot = gateway.snapshot().motor_count > 0

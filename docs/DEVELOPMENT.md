@@ -95,6 +95,7 @@ Rung 3 is `tools/prepush.sh [--ref <commit>] [--full]`. It checks the commit out
 new worktree under `${TMPDIR:-/tmp}`, makes its tracked files read-only with
 CI's own step, runs CI's source lints (`tools/source_lints.sh`: test time,
 links, requirement trace, node test matrix, `bazel_dep` listing,
+`layers-src` (`tools/check_layers.py --source-only`),
 commissioning) and `tools/format.sh --check`
 on the branch's diff against its merge base with `origin/main`, as CI's
 clang-format job, then `bazel build //...`, then `tools/check_host_includes.py`
@@ -103,10 +104,13 @@ compile read a header from the host's include tree but the C library's,
 the kernel's or the C++ standard library's), then `bazel test //...` with no
 cached test result (build results come from the disk cache
 `~/.cache/talos-bazel-disk`), then `tools/tidy.sh` on the same diff (on a
-host whose standard library clang 18 cannot parse, it prints `tidy NOT RUN`
+host where clang 18 cannot parse the standard library and no fallback is
+available, it prints `tidy NOT RUN`
 with the reason and does not fail the run: CI is then the first to run
 clang-tidy), runs the gradle checks when the commits to
-push touch the RoboRIO program or anything under `talOS/` (its
+push (since the checked branch's upstream, else since the merge base with
+`origin/main`; every file when neither exists) touch the RoboRIO program or
+anything under `talOS/` (its
 `build.gradle` takes headers from all of it), runs CI's RoboRIO-in-the-loop
 check (`tools/test_rio_in_the_loop.py --wpilib`, about 30 s) when they touch
 that tool, `bench/`, the RoboRIO program, anything under `talOS/`, or what
@@ -115,7 +119,7 @@ its binaries are built with (`MODULE.bazel`, `third_party/`,
 checks when they touch `studio/`. With `--full` it also runs CI's sanitizer
 lanes (`tools/sanitizer_lane.sh tsan` and `asan`, the script CI's sanitizer
 jobs run; 5 to 10 minutes each cold) and CI's soak with its branch seed,
-for 36 s of teleop rather than CI's 180 s (the shortest run that injects
+for 48 s of enabled cycles rather than CI's 180 s (the shortest run that injects
 every fault kind), and the RoboRIO-in-the-loop check whatever the commits
 touch; after a failed build those steps are SKIPPED. **A push of more
 than 20 commits runs `tools/prepush.sh --full`**: without it, such a range
@@ -123,17 +127,26 @@ than 20 commits runs `tools/prepush.sh --full`**: without it, such a range
 branch) is reported first as the step `full` SKIPPED, the other steps still
 run, and the run exits nonzero. Every robot and example config's
 `--describe-only` runs as its `talos_graph_test`, the bundle test's fixture
-`bench/main_processor/bundle_testdata` included. Beyond those, it differs
-from CI in three places
+`bench/main_processor/bundle_testdata` included. When the commits to push
+touch `MODULE.bazel`, `REPO.bazel`, `talos.bazelrc`, `.bazelversion`,
+`third_party/`, `talOS/`, `studio/`, `tools/`, `examples/robot_repo/`, or
+`examples/wrist_repo/`, prepush also runs `dependent-robot_repo` and
+`dependent-wrist_repo` (`bazel test //... @talos//talOS/configuration:config_fuzz_test`
+in each; CI's `robot-repo` job also sets `--test_env=TALOS_REQUIRE_STUDIO_PAGES=1`) and `scaffold-robot_repo` (`tools/check_robot_repo_scaffold.sh`).
+CI additionally runs `buildifier`, the full `tools/check_layers.py` Bazel
+query, `tools/check_runfiles_collisions.py`, the generated-TS diff,
+`tools/slow_tests.py --check`, and `tools/run_rio_clang_tidy.py`; among the
+steps prepush runs (besides `tidy`), it differs from CI in three places
 where the host decides, and says which applies: where the host refuses an unprivileged network namespace it
 leaves `TALOS_REQUIRE_NETNS=1` unset, so
 `//talOS/protocol:udp_address_change_test` may skip where CI fails it;
 where it finds no browser
 ([the test's search](../studio/README.md#driver-dashboard-in-a-browser))
 it leaves `TALOS_REQUIRE_BROWSER=1` unset, so `//studio:drive_browser_test`
-skips where CI fails it; and Studio's checks use the checkout's installed `studio/node_modules`
-(an offline `pnpm install` when there is none or the commits change
-`studio/pnpm-lock.yaml`, and studio SKIPPED if that fails). It prints one
+skips where CI fails it; and Studio's checks reuse the checkout's installed `studio/node_modules`
+when its `studio/node_modules/.pnpm/lock.yaml` matches the worktree's
+`studio/pnpm-lock.yaml` (otherwise running an offline `pnpm install`, and
+reporting studio SKIPPED if that fails). It prints one
 line per step and exits nonzero if any failed; the script's header lists
 its flags and steps. With `TALOS_ROBOT_REPOSITORY` set to the checkout of
 a robot repository that consumes talOS, it also runs
@@ -169,6 +182,10 @@ commit, or the work reported as "pushed, CI pending".
 Every 25 commits or weekly, record as TODO.md entries and fixes: targets
 that failed twice in the last 20 CI runs without a product change; expired
 `quarantine` tags; new tests against
-[TESTING.md §4](TESTING.md#4-what-makes-a-test-meaningful); doc numbers,
-flags and names against code (a `scout` per doc); `[review]` marks that
-could be `[enforced]`; TODO.md items now passing or 60 days without evidence.
+[TESTING.md §4](TESTING.md#4-what-makes-a-test-meaningful); a sample of 10
+requirements in [REQUIREMENTS.md](REQUIREMENTS.md) audited against their
+tagged tests to confirm each test proves the requirement's sentence (not
+merely that a tag exists); doc numbers, flags and names against code (a
+`scout` per doc); `[review]` marks that could be `[enforced]` (the global
+whole-codebase clauses of `REQ-SAFE-14` and `REQ-SAFE-45` are accepted as
+review-only); TODO.md items now passing or 60 days without evidence.

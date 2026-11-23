@@ -1,8 +1,10 @@
 # tools/lint_test_time.py allowlist:
-# `<path> sleep|clock|retry [<count>] <reason>`.
-# A line lets that file use the real clock (sleep, clock) or a test retry
-# (retry) on <count> lines. Only an integration, e2e, soak or perf test, or
-# code outside a node, belongs here (docs/TESTING.md §2, §6).
+# `<path> sleep|clock|random|io|lock|retry [<count>] <reason>`.
+# A line lets that file use the real clock (sleep, clock), randomness
+# (random), non-update() I/O or locks (io, lock), or a test retry (retry)
+# on <count> lines. Only an integration, e2e, soak or perf test, or code
+# outside a node's update() loop, belongs here (RULES.md 3;
+# docs/TESTING.md §2, §6; docs/METHODOLOGY.md §9, §10).
 # More hits than the count fail the lint, and so do fewer (lower the count)
 # or none (delete the line), so the list only shrinks.
 
@@ -10,9 +12,10 @@ controller_processor/rio/src/test/cpp/ConfigStore_test.cpp clock 6 integration: 
 controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp clock 33 integration: CTRE's Phoenix 6 simulator advances on the real clock; reads poll its status frames until a 10 s deadline that bounds a hang
 controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp sleep 10 integration: CTRE's Phoenix 6 simulator advances on the real clock; reads are paced 10 ms apart as PumpReads paces them
 controller_processor/rio/src/test/cpp/RioLog_test.cpp clock 2 integration: the logger's real thread held in a blocked write; the elapsed bound shows a burst of posts did not wait for it
-bench/main_processor/simulation/soak_test.py clock 4 soak: injected kills and stalls on the real clock (TESTING.md §2)
+bench/main_processor/simulation/soak_test.py clock 2 soak: injected kills and stalls on the real clock (TESTING.md §2)
 bench/main_processor/simulation/soak_test.py sleep 4 soak: injected kills and stalls on the real clock (TESTING.md §2)
 bench/main_processor/swerve_module/send_target.cc clock 2 operator CLI beside the node, sends for a wall-clock duration; not node code
+bench/main_processor/swerve_module/send_target.cc io 1 operator CLI beside the node, prints argument/runtime errors to stderr in main(); not node code
 bench/main_processor/swerve_module/send_target.cc sleep 1 operator CLI beside the node, sends for a wall-clock duration; not node code
 studio/bridge/bandwidth_test.py clock 6 integration: bounds a fixed-length load window on a real bridge and reports its measured rate (--measure)
 studio/bridge/client_timeout_test.py clock 8 integration: times a real bridge's idle-timeout close against its stated bound (main.cc kIdleTimeoutS)
@@ -24,8 +27,10 @@ talOS/bridge/hardware_node_test.cc clock 4 integration: the bridge over UDP loop
 talOS/bridge/hardware_node_test.cc sleep 1 integration: the bridge as a child process; State frames are resent 5 ms apart until it answers or exits
 talOS/bridge/node_test_support.h clock 6 integration helpers: the bridge over UDP loopback; kHangBound (10 s) deadlines only bound a hang
 talOS/bridge/node_test_support.h sleep 1 integration helpers: WaitFor polls 100 us apart a condition the bridge's Run() thread makes true without notifying the test
-talOS/bridge/run_test.cc clock 8 integration: Run() on the real clock; measures registry-progress gaps (stall timeout), wakes per elapsed window (REQ-RT-20) and the host's 1 ms sleep overrun (§6.7)
-talOS/bridge/run_test.cc sleep 2 integration: samples the registry row 1 ms apart for its gaps, and StallMeter's 1 ms sleep is the host-qualification probe (§6.7)
+talOS/bridge/run_test.cc clock 6 integration: Run() on the real clock; measures registry-progress gaps (stall timeout) and wakes per elapsed window (REQ-RT-20)
+talOS/bridge/run_test.cc sleep 1 integration: samples the registry row 1 ms apart for its gaps
+talOS/bridge/run_timing_test.cc clock 2 integration: StallMeter measures the host's 1 ms sleep overrun (§6.7)
+talOS/bridge/run_timing_test.cc sleep 1 integration: StallMeter's 1 ms sleep is the host-qualification probe (§6.7)
 talOS/events/log/log_kill_test.cc clock 2 integration: kills a writer process, waits with a deadline
 talOS/events/log/log_kill_test.cc sleep 2 integration: kills a writer process, waits with a deadline
 talOS/events/log/log_test.cc clock 4 integration: the writer thread; Eventually's 10 s deadline only bounds a hang, and UncreatableLogFailsWithoutThrowing needs its periodic sync due
@@ -45,13 +50,16 @@ talOS/launcher/log_budget_test.cc clock 4 integration: an in-test gateway stamps
 talOS/launcher/log_budget_test.cc sleep 2 integration: the in-test gateway ticks every 5 ms as the RoboRIO does; polls for the rotated segments 20 ms apart (no notification exists)
 talOS/launcher/outputs_held_test.cc clock 4 integration: a gateway in the test process ticks a real bridge and node on the real clock; deadline of the registry poll
 talOS/launcher/outputs_held_test.cc sleep 2 integration: paces the in-process gateway's 5 ms tick and the registry poll
-talOS/launcher/supervision_test.cc clock 46 integration: one real spawn or kill per mechanism; deadlines (10-20 s) bound polls of the manifest, registry and pid files, and a measured supervision-pass window
-talOS/launcher/supervision_test.cc sleep 28 integration: paces polls of files the spawned processes write (no notification exists) and stub registry heartbeats every 5 ms for the launcher's real-time stall check
-talOS/launcher/testdata/supervision_events.h clock 2 integration helper: SteppedClock runs on the real clock when a test is not holding it (Release, Now), as the launcher under test does
+talOS/launcher/supervision_test.cc clock 42 integration: one real spawn or kill per mechanism; deadlines (10-20 s) bound polls of the manifest, registry and pid files, and a measured supervision-pass window
+talOS/launcher/supervision_test.cc sleep 26 integration: paces polls of files the spawned processes write (no notification exists) and stub registry heartbeats every 5 ms for the launcher's real-time stall check
+talOS/launcher/testdata/supervision_events.h clock 1 integration helper: SteppedClock runs on the real clock when a test is not holding it (Release, Now), as the launcher under test does
 talOS/node/node_binary_test.cc clock 4 integration: a 20 s deadline bounds the wait for a spawned node's registry row, and the stop latency shows SIGTERM did not wait out --duration-s
 talOS/node/node_binary_test.cc sleep 1 integration: paces the poll for a spawned node's registry row (no notification exists)
 talOS/protocol/udp_test_helpers.h clock 2 integration helper: ReceiveFrame's deadline (kReceiveHangBound, 10 s, by default) only bounds a hang
+talOS/rtms/test.cc clock 4 concurrency: WriteThread/ReadThread spin-yield loops across real threads; 5 s steady_clock deadlines only bound a hang (TESTING.md §6.3)
 talOS/simulation/sim_gateway_test.py clock 4 integration: the simulator as a child process; deadlines on its UDP datagrams only bound a hang (TESTING.md §6)
+talOS/telemetry/dashboard_layout.cc io 1 construction-only: ParseDashboardLayout reads the [studio] dashboard TOML file via std::ifstream during Telemetry construction, never in update()
+talOS/telemetry/node.h io 1 construction-only: ReportPages prints the channel/page budget to std::cerr once in Telemetry's constructor (and --describe-only), never in update()
 talOS/vision/pipeline_test.cc clock 2 integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/pipeline_test.cc sleep 1 integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/recording/recorder_test.cc clock 6 integration: recorder thread, condition wait with a deadline

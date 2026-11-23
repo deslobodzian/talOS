@@ -153,10 +153,32 @@ bool NodeProcessInfo::RecordLogGap(const std::string& log) {
   return true;
 }
 
-bool NodeProcessInfo::RecordRealtime(const process::RealtimeOutcome& outcome) {
-  if (realtime && realtime->grant() >= outcome.grant()) return false;
-  realtime = outcome;
+bool NodeProcessInfo::RecordRecorderFailure(const std::string& log) {
+  const bool was_failed = failed;
+  failed = true;
+  if (log.empty()) return !was_failed;
+  if (std::find(recorder_failed_logs.begin(), recorder_failed_logs.end(),
+                log) != recorder_failed_logs.end()) {
+    return !was_failed;
+  }
+  recorder_failed_logs.push_back(log);
   return true;
+}
+
+bool NodeProcessInfo::RecordRealtime(const process::RealtimeOutcome& outcome) {
+  if (!realtime || outcome.grant() > realtime->grant()) {
+    realtime = outcome;
+    return true;
+  }
+  if (outcome.grant() == realtime->grant()) {
+    const auto merged =
+        static_cast<std::uint8_t>(realtime->refused | outcome.refused);
+    if (merged != realtime->refused) {
+      realtime->refused = merged;
+      return true;
+    }
+  }
+  return false;
 }
 
 uint64_t DeliveryCounts::requests_skipped_total() const {
@@ -260,6 +282,11 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"config_sha256\": " << Quoted(config_sha256) << ",\n";
   ss << "  \"git_revision\": " << Quoted(git_revision) << ",\n";
   ss << "  \"git_dirty\": " << (git_dirty ? "true" : "false") << ",\n";
+  if (!talos_git_revision.empty()) {
+    ss << "  \"talos_git_revision\": " << Quoted(talos_git_revision) << ",\n";
+    ss << "  \"talos_git_dirty\": " << (talos_git_dirty ? "true" : "false")
+       << ",\n";
+  }
   ss << "  \"output_dir\": " << Quoted(output_dir) << ",\n";
   ss << "  \"launcher_log\": " << Quoted(launcher_log) << ",\n";
   ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";
@@ -271,12 +298,21 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"end_wall_ns\": " << end_wall_ns << ",\n";
   ss << "  \"stopped_before_start\": "
      << (stopped_before_start ? "true" : "false") << ",\n";
+  ss << "  \"session_lock_lost\": " << (session_lock_lost ? "true" : "false")
+     << ",\n";
+  ss << "  \"directory_lock_lost\": "
+     << (directory_lock_lost ? "true" : "false") << ",\n";
+  ss << "  \"directory_lock_retaken\": "
+     << (directory_lock_retaken ? "true" : "false") << ",\n";
   ss << "  " << Key(keys::kNodes) << "[\n";
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& n = nodes[i];
     ss << "    {\n";
     ss << "      \"name\": " << Quoted(n.name) << ",\n";
     ss << "      \"target\": " << Quoted(n.target) << ",\n";
+    ss << "      \"critical\": " << (n.critical ? "true" : "false") << ",\n";
+    ss << "      \"studio_bridge\": " << (n.studio_bridge ? "true" : "false")
+       << ",\n";
     ss << "      \"binary_path\": " << Quoted(n.binary_path) << ",\n";
     ss << "      \"binary_sha256\": " << Quoted(n.binary_sha256) << ",\n";
     ss << "      \"log_path\": " << Quoted(n.log_path) << ",\n";
@@ -295,10 +331,20 @@ std::string SessionManifest::ToJson() const {
        << ",\n";
     ss << "      " << Key(keys::kRecorderFailed)
        << (n.failed ? "true" : "false") << ",\n";
+    ss << "      " << Key(keys::kRecorderFailedLogs) << "[";
+    for (std::size_t j = 0; j < n.recorder_failed_logs.size(); ++j) {
+      ss << (j ? ", " : "") << Quoted(n.recorder_failed_logs[j]);
+    }
+    ss << "],\n";
     ss << "      " << Key(keys::kLogCapped) << (n.log_capped ? "true" : "false")
        << ",\n";
     ss << "      " << Key(keys::kLogGap) << (n.log_gap ? "true" : "false")
        << ",\n";
+    ss << "      " << Key(keys::kGapLogs) << "[";
+    for (std::size_t j = 0; j < n.gap_logs.size(); ++j) {
+      ss << (j ? ", " : "") << Quoted(n.gap_logs[j]);
+    }
+    ss << "],\n";
     ss << "      \"described\": " << (n.described ? "true" : "false") << ",\n";
     ss << "      \"endpoint_mismatch\": "
        << (n.endpoint_mismatch ? "true" : "false") << ",\n";
@@ -330,6 +376,9 @@ std::string SessionManifest::ToJson() const {
     }
     ss << "      \"record_count\": " << n.record_count << ",\n";
     ss << "      \"runs_dropped\": " << n.runs_dropped << ",\n";
+    if (n.http_port) {
+      ss << "      \"http_port\": " << *n.http_port << ",\n";
+    }
     // Last: a run holds no nested object or array, and no node field
     // follows the runs.
     ss << "      \"runs\": [";

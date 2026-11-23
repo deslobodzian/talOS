@@ -176,4 +176,49 @@ TEST_F(LoopConsoleTest, DroppedWatchdogReportsArePrintedWhenTheyRise) {
       << lines_[1];
 }
 
+// A TX stall that fills the socket send buffer produces UdpStatus::kWouldBlock
+// (EAGAIN): the console prints the first drop immediately and coalesces a burst
+// through RioLog to at most one line per second carrying the cumulative
+// send_would_block count, without printing anything when no drop occurred.
+// REQ-RT-22, REQ-OPS-16
+TEST_F(LoopConsoleTest,
+       SendWouldBlockBurstPrintsAtMostOncePerSecondWithCumulativeCount) {
+  console_.ObserveSendWouldBlock(0);
+  log_.Drain(1'000'000);
+  ASSERT_TRUE(lines_.empty()) << "zero drops should print nothing";
+
+  // First drop prints immediately.
+  console_.ObserveSendWouldBlock(1);
+  log_.Drain(1'000'000);
+  ASSERT_EQ(lines_.size(), 1u);
+  EXPECT_NE(lines_[0].find("EAGAIN"), std::string::npos) << lines_[0];
+  EXPECT_NE(lines_[0].find("1 dropped since start"), std::string::npos)
+      << lines_[0];
+  EXPECT_NE(lines_[0].find("keeping the socket"), std::string::npos)
+      << lines_[0];
+
+  // A burst of 50 more drops within RioLog::kWindowUs prints nothing
+  // mid-window.
+  for (uint64_t total = 2; total <= 51; ++total) {
+    console_.ObserveSendWouldBlock(total);
+  }
+  log_.Drain(1'500'000);
+  ASSERT_EQ(lines_.size(), 1u) << "burst must be rate-limited to 1 line/sec";
+
+  // Once the 1-second window expires, one coalesced line carries the latest
+  // cumulative count.
+  log_.Drain(2'000'000);
+  ASSERT_EQ(lines_.size(), 2u);
+  EXPECT_NE(lines_[1].find("51 dropped since start"), std::string::npos)
+      << lines_[1];
+  EXPECT_NE(lines_[1].find("50 changes coalesced"), std::string::npos)
+      << lines_[1];
+
+  // Repeated ticks with no new drops print nothing further.
+  console_.ObserveSendWouldBlock(51);
+  console_.ObserveSendWouldBlock(51);
+  log_.Drain(5'000'000);
+  EXPECT_EQ(lines_.size(), 2u);
+}
+
 }  // namespace

@@ -54,6 +54,20 @@ class SimBackend final : public Backend {
     can_bus_count_ = CanBuses(config_).count;
     pending_resets_.clear();
     restoring_.fill(false);
+    commands_.fill(MotorRequest{});
+    samples_.fill(MotorSample{});
+    previous_time_ = 0;
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (config_.motors[i].feedback == Feedback::kRemoteCANcoder) {
+        for (const auto& sensor : config_.sensors) {
+          if (sensor.id == config_.motors[i].feedback_sensor_id) {
+            samples_[i].position_rot =
+                sensor.offset_rot / SensorToMechanism(config_.motors[i]);
+            break;
+          }
+        }
+      }
+    }
     return true;
   }
   bool Read(State& state) override {
@@ -118,21 +132,31 @@ class SimBackend final : public Backend {
       if (restoring_[i]) MarkInvalid(state.motors[i]);
     }
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
-      state.sensors[i] = {config_.sensors[i].id, true, 0, 0};
-      if (config_.sensors[i].kind == SensorKind::kPigeon2) {
-        const auto& sensor = config_.sensors[i];
+      const auto& sensor = config_.sensors[i];
+      state.sensors[i] = {sensor.id, true, 0, 0};
+      if (sensor.kind == SensorKind::kPigeon2) {
         state.sensors[i].position_rot =
             sensor.offset_rot * (sensor.inverted ? -1.0 : 1.0);
         continue;  // The ideal fake has no chassis motion.
       }
+      bool linked = false;
       for (std::size_t j = 0; j < config_.motors.size(); ++j) {
-        if (config_.motors[j].feedback_sensor_id == config_.sensors[i].id) {
-          // Absolute, as the RoboRIO reports a CANcoder; the motor's own
-          // position stays continuous.
+        if (config_.motors[j].feedback == Feedback::kRemoteCANcoder &&
+            config_.motors[j].feedback_sensor_id == sensor.id) {
+          // Absolute on the sensor shaft (mechanism *
+          // sensor_to_mechanism_ratio), as the RoboRIO reports a CANcoder; the
+          // motor's own mechanism position stays continuous.
+          const double sensor_to_mech = SensorToMechanism(config_.motors[j]);
           state.sensors[i].position_rot =
-              CANcoderAbsoluteRot(samples_[j].position_rot);
-          state.sensors[i].velocity_rps = samples_[j].velocity_rps;
+              CANcoderAbsoluteRot(samples_[j].position_rot * sensor_to_mech);
+          state.sensors[i].velocity_rps =
+              samples_[j].velocity_rps * sensor_to_mech;
+          linked = true;
+          break;
         }
+      }
+      if (!linked) {
+        state.sensors[i].position_rot = CANcoderAbsoluteRot(sensor.offset_rot);
       }
     }
     for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {
@@ -238,6 +262,12 @@ class SimBackend final : public Backend {
   }
 
  private:
+  static double SensorToMechanism(const MotorConfig& m) {
+    return std::isfinite(m.sensor_to_mechanism_ratio) &&
+                   m.sensor_to_mechanism_ratio > 0.0
+               ? m.sensor_to_mechanism_ratio
+               : 1.0;
+  }
   struct SimEncoder {
     double position_rot{};
     double velocity_rps{};

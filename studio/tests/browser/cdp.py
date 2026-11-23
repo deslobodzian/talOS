@@ -169,6 +169,26 @@ class Page:
         data = self.call("Page.captureScreenshot", format="png")["data"]
         Path(path).write_bytes(base64.b64decode(data))
 
+    def reload(self):
+        """Reloads the page and waits for the new document's load event."""
+        message_id = next(self.ids)
+        message = {"id": message_id, "method": "Page.reload", "params": {}}
+        if self.session is not None:
+            message["sessionId"] = self.session
+        self.ws.send(json.dumps(message))
+        replied = False
+        loaded = False
+        while not (replied and loaded):
+            msg = json.loads(self.ws.receive())
+            if msg.get("sessionId") != self.session:
+                continue
+            if msg.get("id") == message_id:
+                if "error" in msg:
+                    raise RuntimeError(f"Page.reload: {msg['error']}")
+                replied = True
+            elif msg.get("method") == "Page.loadEventFired":
+                loaded = True
+
 
 class Browser:
     """A headless browser with a fresh profile under `tmp`, and its one page."""
@@ -217,10 +237,11 @@ class Browser:
                                    f"{self.log_path.name} ends: {tail!r}") from late
             port, path = found.split("\n")[:2]
             self.ws = WebSocket(f"ws://127.0.0.1:{port.strip()}{path.strip()}", timeout_s)
-            browser = Page(self.ws, None)
-            target = browser.call("Target.createTarget", url="about:blank")["targetId"]
-            session = browser.call("Target.attachToTarget", targetId=target,
-                                   flatten=True)["sessionId"]
+            self.browser = Page(self.ws, None)
+            self.target_id = self.browser.call("Target.createTarget",
+                                               url="about:blank")["targetId"]
+            session = self.browser.call("Target.attachToTarget", targetId=self.target_id,
+                                        flatten=True)["sessionId"]
             self.page = Page(self.ws, session)
             self.page.call("Page.enable")
         except BaseException:

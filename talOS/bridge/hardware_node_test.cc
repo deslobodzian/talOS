@@ -41,7 +41,6 @@
 #include "bridge/topics.h"
 #include "node.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
-#include "talOS/bridge/merge.h"
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
@@ -54,6 +53,7 @@
 #include "talOS/events/time.h"
 #include "talOS/hardware/endpoint.h"
 #include "talOS/hardware/gateway.h"
+#include "talOS/hardware/merge.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/process/process.h"
@@ -91,7 +91,11 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
 
   ipc::Subscriber<talos::hardware::Packet> ds_sub{kDriverStationTopic};
 
+  ASSERT_TRUE(InjectState(node, gateway_peer,
+                          TrustState(NodeConfigId(cfg), 42, 1, 1000), 1000));
+
   driver_station::DriverStationData data{};
+  data.boot_id = 42;
   data.sample_time_us = 1000;
   std::vector<uint8_t> dummy_payload(1024);
   dummy_payload.resize(driver_station::Encode(data, dummy_payload));
@@ -216,12 +220,21 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   state.motors[0].fault_flags = 5;
   state.motors[1].id = cfg.hardware.motors[0].id;
   state.motors[1].valid = true;
+  // REQ-OPS-20: the gateway's counters, each its own value so a swap shows.
+  state.counters = {.rejected_command_count = 7,
+                    .neutralized_motor_count = 5,
+                    .apply_failure_count = 3,
+                    .device_reset_count = 2};
   ASSERT_TRUE(InjectState(node, gateway, state, 1000000));
   const auto status = node.Status(1001000);
   EXPECT_TRUE(status.health_valid());
   EXPECT_DOUBLE_EQ(status.battery_v(), 9.5);
   EXPECT_TRUE(status.brownout());
   EXPECT_EQ(status.motor_fault_mask(), 2u);
+  EXPECT_EQ(status.gateway_rejected_command_count(), 7u);
+  EXPECT_EQ(status.gateway_neutralized_motor_count(), 5u);
+  EXPECT_EQ(status.gateway_apply_failure_count(), 3u);
+  EXPECT_EQ(status.gateway_device_reset_count(), 2u);
   state.health = {};
   EXPECT_EQ(status.motor_forward_limit_mask(), 0u);
   EXPECT_EQ(status.motor_reverse_limit_mask(), 0u);
@@ -384,16 +397,17 @@ TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
               static_cast<ssize_t>(size));
   }
   // A current frame behind them: once the bridge has it, it read both.
-  driver_station::DriverStationData data{};
-  data.sample_time_us = 1000;
-  std::vector<uint8_t> ds(1024);
-  ds.resize(driver_station::Encode(data, ds));
-  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kDriverStation, 1, 1000,
-                                   ds.data(), ds.size()),
+  ConfigAckPayload ack{};
+  ack.config_id = NodeConfigId(cfg);
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                                   1000, ack_bytes.data(), ack_bytes.size()),
             protocol::UdpStatus::kOk);
   const bool delivered = WaitFor([&] {
     node.Tick(1'000'000);
-    return node.driver_station_packets_received() > 0;
+    return node.is_configured();
   });
   const std::string err = ::testing::internal::GetCapturedStderr();
   ASSERT_TRUE(delivered);
@@ -410,10 +424,93 @@ TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
   EXPECT_EQ(lines, 1u) << err;
 }
 
+// REQ-OPS-20: receiving a UDP frame with an unsupported protocol version raises
+// alert_error_protocol_mismatch and reports mismatched_protocol_version_id on
+// /hw/status; stopping mismatched frames clears both after command_timeout_us
+// (non-latching), and receiving any valid-version frame clears both at once.
+TEST(HardwareNodeTest, ReportsAndClearsProtocolMismatchOnStatus) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  const bridge::BridgeStatus initial = node.Status(kStartUs);
+  EXPECT_FALSE(initial.alert_error_protocol_mismatch());
+  EXPECT_EQ(initial.mismatched_protocol_version_id(), 0u);
+  EXPECT_EQ(initial.protocol_version_id(), protocol::kProtocolVersion);
+
+  const auto send_wrong_version = [&](uint16_t version, uint64_t seq) {
+    talos::hardware::Packet payload{};
+    payload.size = static_cast<uint32_t>(
+        Encode(TrustState(NodeConfigId(cfg), 42, 1, 1000), payload.data));
+    std::array<uint8_t, protocol::kMaxFrameSize> frame{};
+    const std::size_t size = protocol::EncodeFrame(
+        protocol::FrameType::kHardwareState, protocol::kFlagNone, seq, 1000,
+        payload.data.data(), payload.size, frame.data(), frame.size());
+    ASSERT_NE(size, 0u);
+    frame[8] = static_cast<uint8_t>(version & 0xFFu);
+    frame[9] = static_cast<uint8_t>((version >> 8) & 0xFFu);
+    ASSERT_EQ(::send(link.gateway.NativeFd(), frame.data(), size, 0),
+              static_cast<ssize_t>(size));
+  };
+
+  // Wrong-version frame raises the alert and records the peer's version.
+  const uint16_t older = static_cast<uint16_t>(protocol::kProtocolVersion - 1);
+  send_wrong_version(older, 1);
+  ASSERT_TRUE(DatagramQueued(node));
+  ::testing::internal::CaptureStderr();
+  node.Tick(kStartUs + 1000);
+  (void)::testing::internal::GetCapturedStderr();
+  const bridge::BridgeStatus mismatched = node.Status(kStartUs + 1000);
+  EXPECT_TRUE(mismatched.alert_error_protocol_mismatch());
+  EXPECT_EQ(mismatched.mismatched_protocol_version_id(), older);
+  EXPECT_EQ(mismatched.protocol_version_id(), protocol::kProtocolVersion);
+
+  // Stays active through command_timeout_us, then clears once packets stop.
+  const bridge::BridgeStatus at_boundary =
+      node.Status(kStartUs + 1000 + timeout_us);
+  EXPECT_TRUE(at_boundary.alert_error_protocol_mismatch());
+  EXPECT_EQ(at_boundary.mismatched_protocol_version_id(), older);
+  const bridge::BridgeStatus after_timeout =
+      node.Status(kStartUs + 1000 + timeout_us + 1);
+  EXPECT_FALSE(after_timeout.alert_error_protocol_mismatch());
+  EXPECT_EQ(after_timeout.mismatched_protocol_version_id(), 0u);
+
+  // Another mismatch raises again, and a valid-version frame clears both
+  // immediately (well before command_timeout_us).
+  const uint16_t newer = static_cast<uint16_t>(protocol::kProtocolVersion + 1);
+  const uint64_t t1 = kStartUs + 2 * timeout_us;
+  send_wrong_version(newer, 2);
+  ASSERT_TRUE(DatagramQueued(node));
+  node.Tick(t1);
+  EXPECT_TRUE(node.Status(t1).alert_error_protocol_mismatch());
+  EXPECT_EQ(node.Status(t1).mismatched_protocol_version_id(), newer);
+
+  ConfigAckPayload ack{};
+  ack.config_id = NodeConfigId(cfg);
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 3,
+                                   2000, ack_bytes.data(), ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  ASSERT_TRUE(WaitFor([&] {
+    node.Tick(t1 + 1000);
+    return node.is_configured();
+  }));
+  const bridge::BridgeStatus cleared = node.Status(t1 + 1000);
+  EXPECT_FALSE(cleared.alert_error_protocol_mismatch());
+  EXPECT_EQ(cleared.mismatched_protocol_version_id(), 0u);
+}
+
 // /hw/status names the build of the gateway boot the bridge accepted, and a
 // new boot's build replaces it: after a RoboRIO rollback the record shows the
-// build that drove the robot, not the first one the bridge heard.
-// REQ-CONTRACT-30
+// build that drove the robot, not the first one the bridge heard. Its stderr
+// names each boot's build once, however many States the boot sends.
+// REQ-CONTRACT-30, REQ-OPS-21
 TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -423,6 +520,7 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
             bridge::GatewayProgram::UNKNOWN);
   EXPECT_EQ(node.Status(999000).gateway_build_id(), 0u);
 
+  ::testing::internal::CaptureStderr();
   State state = TrustState(NodeConfigId(cfg), 42, 1, 1000);
   state.build = {0x0123456789abcdefull, GatewayProgram::kRoboRio, true};
   ASSERT_TRUE(InjectState(node, link.gateway, state, 1000000));
@@ -430,6 +528,8 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   EXPECT_EQ(status.gateway_program(), bridge::GatewayProgram::ROBORIO);
   EXPECT_TRUE(status.gateway_build_dirty());
   EXPECT_EQ(status.gateway_build_id(), 0x0123456789abcdefull);
+  state.sample_time_us = 6000;
+  ASSERT_TRUE(InjectState(node, link.gateway, state, 1000500));
 
   State rollback = TrustState(NodeConfigId(cfg), 43, 1, 50);
   rollback.build = {0x00fedcba98765432ull, GatewayProgram::kRoboRio, false};
@@ -438,6 +538,19 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   EXPECT_EQ(status.gateway_program(), bridge::GatewayProgram::ROBORIO);
   EXPECT_FALSE(status.gateway_build_dirty());
   EXPECT_EQ(status.gateway_build_id(), 0x00fedcba98765432ull);
+  rollback.sample_time_us = 5050;
+  ASSERT_TRUE(InjectState(node, link.gateway, rollback, 1006000));
+  const std::string err = ::testing::internal::GetCapturedStderr();
+  const auto count = [&err](const std::string& revision) {
+    std::size_t lines = 0;
+    for (auto at = err.find(revision); at != std::string::npos;
+         at = err.find(revision, at + 1)) {
+      ++lines;
+    }
+    return lines;
+  };
+  EXPECT_EQ(count("0123456789abcdef"), 1u) << err;
+  EXPECT_EQ(count("00fedcba98765432"), 1u) << err;
 }
 
 // Guards: hardware_node --log records the merged /hw/command, the decoded
@@ -686,14 +799,17 @@ TEST(HardwareNodeTest, ASimulationOnlyConfigRunsOnlyWithSim) {
   };
 
   // The controller's end: a bound loopback socket the bridge would send its
-  // probes and configuration to.
+  // probes and configuration to. The bridge's own port stays reserved
+  // through its run: a bridge that refuses before it opens a socket never
+  // needs it, and one that opened it first would fail to bind and say so
+  // instead of naming the key, so the refusal is proved to come first.
   uint16_t gateway_port = 0;
   uint16_t node_port = 0;
   int gateway_reservation = ReservePort(gateway_port);
   int node_reservation = ReservePort(node_port);
   const bool reserved = gateway_reservation >= 0 && node_reservation >= 0;
   Release(gateway_reservation);
-  Release(node_reservation);
+  if (!reserved) Release(node_reservation);
   ASSERT_TRUE(reserved);
   protocol::RuntimeUdpPeer gateway;
   ASSERT_EQ(gateway.Open("127.0.0.1", gateway_port, "127.0.0.1", node_port),
@@ -707,6 +823,7 @@ TEST(HardwareNodeTest, ASimulationOnlyConfigRunsOnlyWithSim) {
                  std::to_string(node_port), "--duration-s", "1"},
                 run_output),
             1);
+  Release(node_reservation);
   const std::string message = read(run_output);
   EXPECT_NE(message.find(config_path + " sets [robot] simulation_only = true; "
                                        "hardware_node runs it only with --sim"),
@@ -1169,6 +1286,67 @@ TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
     ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
     ASSERT_EQ(ReceiveConfigs(gateway), 1u);
   }
+
+  // After backing off to 2 s via rejected ACKs, a State from a new boot_id
+  // triggers an immediate push and resets the next retry gate to 50 ms on no
+  // ACK.
+  now += 1000;
+  uint64_t reboot_sample_us = 1000;
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(id, 12, 1, reboot_sample_us), now));
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(id, 12, 1, reboot_sample_us + 49'999),
+                          now + 49'999));
+  EXPECT_EQ(drain_configs(), 0u);
+  ASSERT_TRUE(InjectState(node, gateway,
+                          TrustState(id, 12, 1, reboot_sample_us + 50'000),
+                          now + 50'000));
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
+}
+
+// REQ-CONTRACT-04: when no ConfigAck arrives (lost push or ACK), the bridge
+// retries on the 50 ms gate while subsystem commands keep flowing.
+TEST(HardwareNodeTest, LostConfigPushRetriesAt50MsWithoutStoppingCommands) {
+  auto cfg = config::ParseRobotConfigString(kTestToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  const auto id = NodeConfigId(cfg);
+  uint64_t now = 1'000'000;
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
+  const auto drain_configs = [&] {
+    unsigned count = 0;
+    protocol::DecodedFrame frame;
+    while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk)
+      count += frame.header.type == protocol::FrameType::kHardwareConfig;
+    return count;
+  };
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
+
+  ipc::Publisher<Packet> pub{RequestTopic("drivetrain")};
+  const auto before = node.commands_sent();
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now + 49'999),
+                          now + 49'999));
+  EXPECT_EQ(drain_configs(), 0u);
+  Command request{};
+  request.config_id = id;
+  request.boot_id = 11;
+  request.epoch = 1;
+  request.observed_time_us = now + 49'999;
+  request.count = 1;
+  request.motors[0] = {cfg.subsystems.at("drivetrain").motors[0],
+                       Mode::kDutyCycle, 0, 0.2};
+  PublishCommand(pub, request);
+  node.Tick(now + 49'999);
+  EXPECT_GT(node.commands_sent(), before);
+  EXPECT_EQ(node.current_command().motors[0].mode, Mode::kDutyCycle);
+  EXPECT_EQ(drain_configs(), 0u);
+
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now + 50'000),
+                          now + 50'000));
+  ASSERT_EQ(ReceiveConfigs(gateway), 1u);
 }
 
 // Run() sleeps between inputs, so every time-driven duty must wake it at the
@@ -1288,7 +1466,8 @@ TEST(HardwareNodeTest, NextDutyUsIsWhenTickNextHasWork) {
 // without sleeping in between, until the window's datagram budget is spent:
 // then the loop sleeps through input to the end of the window, and drains
 // the rest after it. The old 1 ms poll took 32 datagrams a millisecond;
-// this takes at most kDatagramBudget plus the one pass that crosses it.
+// this takes at most the 64 a 1000 us window allows, the requirement's
+// numbers, asserted as such rather than as the constants that set them.
 // REQ-RT-20
 TEST(HardwareNodeTest, PassDrainsABacklogWithinItsCpuBudget) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -1323,12 +1502,11 @@ TEST(HardwareNodeTest, PassDrainsABacklogWithinItsCpuBudget) {
     const HardwareNode::Wait wait = node.Pass(now_us);
     const uint64_t received = node.driver_station_packets_received() - before;
     in_window += received;
-    EXPECT_LE(in_window, HardwareNode::kDatagramBudget + kReceiveBudget)
-        << "at " << now_us;
+    EXPECT_LE(in_window, 64u) << "at " << now_us;
     if (wait.ignore_input) {
       saw_spent = true;
       EXPECT_GT(wait.until_us, now_us);
-      EXPECT_LE(wait.until_us, now_us + HardwareNode::kCpuWindowUs);
+      EXPECT_LE(wait.until_us, now_us + 1000);
       now_us = wait.until_us;
       in_window = 0;
     } else if (received == kReceiveBudget) {
@@ -1393,12 +1571,13 @@ TEST(HardwareNodeTest, AFloodOfRequestsIsHeldToThePassBudget) {
   const uint64_t passes = node.wakeups().passes - passes_before;
   EXPECT_EQ(node.identity_rejected() - rejected_before, passes)
       << "a pass that did not read the flood";
-  // kPassBudget a window, plus one pass per duty that ends a sleep early
-  // (100 ms: 5 statuses, 3 heartbeats or the neutral, a probe retry; the
-  // registry's liveness rides the passes); unbudgeted, the flood makes
+  // 8 passes a 1000 us window (the requirement's numbers, not the constants
+  // that set them), plus one pass per duty that ends a sleep early (100 ms:
+  // 5 statuses, 3 heartbeats or the neutral, a probe retry; the registry's
+  // liveness rides the passes); unbudgeted, the flood makes
   // kFloodUs / kPassCostUs.
-  const uint64_t windows = kFloodUs / HardwareNode::kCpuWindowUs + 1;
-  EXPECT_LE(passes, (windows * HardwareNode::kPassBudget) + 10)
+  const uint64_t windows = (kFloodUs / 1000) + 1;
+  EXPECT_LE(passes, (windows * 8) + 10)
       << passes << " passes, " << node.wakeups().throttled << " throttled";
 
   std::vector<SentCommand> commands;
@@ -1466,7 +1645,8 @@ bool NeverCaughtUp(ipc::Subscriber<Packet>& /*subscriber*/) { return false; }
 // the loop waits for its next duty anyway: it cannot spin. Each request
 // topic whose failed arm the guard stops holding the loop awake counts once
 // in stalled_arms, which reaches the bridge's registry row (TODO.md RT-7),
-// until a read returns a request from that topic.
+// stays stalled across subsequent passes without re-spinning, and arms fresh
+// again once a read returns a request from that topic.
 // REQ-RT-20, REQ-OPS-43
 TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -1477,10 +1657,10 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   ASSERT_TRUE(reader.has_value());
   node.set_seams({.arm_request = &NeverCaughtUp});
   uint64_t now_us = 1'000'000;
-  // kMaxIdlePasses immediate passes, then one that waits (the guard) until
-  // the time it returns, where the next pass runs.
-  const auto stall = [&node, &now_us] {
-    for (uint64_t i = 0; i < HardwareNode::kMaxIdlePasses; ++i, ++now_us) {
+  // `retries` immediate passes, then one that waits (the guard) until the time
+  // it returns, where the next pass runs.
+  const auto stall = [&node, &now_us](uint64_t retries) {
+    for (uint64_t i = 0; i < retries; ++i, ++now_us) {
       EXPECT_EQ(node.Pass(now_us).until_us, now_us) << i;
     }
     const HardwareNode::Wait wait = node.Pass(now_us);
@@ -1490,19 +1670,23 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
     now_us = wait.until_us;
     return waited_us;
   };
-  EXPECT_EQ(stall(), 10'000u);  // the longest wait
+  EXPECT_EQ(stall(HardwareNode::kMaxIdlePasses), 10'000u);  // the longest wait
   // Both subsystems' arms (drivetrain, intake) stalled.
   EXPECT_EQ(node.wakeups().stalled_arms, 2u);
-  stall();
+  // Once stalled, subsequent passes wait immediately (here until the next
+  // 20 ms /hw/status duty) without re-spinning or recounting stalled_arms.
+  EXPECT_EQ(stall(0), 10'000u - HardwareNode::kMaxIdlePasses);
   EXPECT_EQ(node.wakeups().stalled_arms, 2u) << "once per stall, not per pass";
 
   ipc::Publisher<Packet> intake{RequestTopic("intake")};
   Command request{};
   request.config_id = NodeConfigId(cfg);
   PublishCommand(intake, request);
+  // Reading intake's request resets intake's StallGuard; its failed arm in the
+  // same pass uses the first of its kMaxIdlePasses retries.
   EXPECT_EQ(node.Pass(now_us).until_us, now_us) << "read the request";
   ++now_us;
-  stall();
+  EXPECT_GT(stall(HardwareNode::kMaxIdlePasses - 1), 0u);
   EXPECT_EQ(node.wakeups().stalled_arms, 3u) << "intake stalled again";
 
   node.PublishIntrospection();
@@ -1515,6 +1699,67 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   }
   ASSERT_TRUE(bridge.has_value());
   EXPECT_EQ(bridge->delivery_loss().stalled_arms, 3u);
+}
+
+// Guards ARCH-5 / RT-7: each request subscriber tracks its own StallGuard via
+// WakeChannelWait::arm_reader, so steady UDP State datagrams arriving on every
+// tick must NOT reset a stalled request subscriber's guard or hide it from
+// stalled_arms.
+// REQ-RT-20, REQ-OPS-43
+TEST(HardwareNodeTest, StalledRequestArmTripsUnderSteadyUdpTraffic) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
+  node.set_seams({.arm_request = &NeverCaughtUp});
+
+  uint64_t now_us = 1'000'000;
+  uint64_t sample_us = 1'000;
+  const uint64_t config_id = NodeConfigId(cfg);
+  const auto pass_with_udp_state = [&]() {
+    sample_us += 1'000;
+    const uint64_t states_before = node.states_received();
+    EXPECT_TRUE(
+        SendState(link.gateway, TrustState(config_id, 11, 1, sample_us)));
+    EXPECT_TRUE(DatagramQueued(node));
+    const HardwareNode::Wait wait = node.Pass(now_us);
+    EXPECT_EQ(node.states_received(), states_before + 1)
+        << "each pass must consume a UDP datagram";
+    return wait;
+  };
+
+  // kMaxIdlePasses retries, each consuming a real UDP datagram, then the next
+  // pass trips both request subscribers' guards and waits instead of spinning.
+  for (uint64_t i = 0; i < HardwareNode::kMaxIdlePasses; ++i, now_us += 2'000) {
+    const HardwareNode::Wait wait = pass_with_udp_state();
+    EXPECT_FALSE(wait.ignore_input) << i;
+    EXPECT_EQ(wait.until_us, now_us) << i;
+  }
+  const HardwareNode::Wait tripped = pass_with_udp_state();
+  EXPECT_FALSE(tripped.ignore_input);
+  EXPECT_GT(tripped.until_us, now_us)
+      << "stalled request arms must stop spinning even with UDP traffic";
+  EXPECT_EQ(node.wakeups().stalled_arms, 2u);
+
+  // Another pass with another UDP datagram stays stalled without recounting.
+  now_us += 2'000;
+  const HardwareNode::Wait still_stalled = pass_with_udp_state();
+  EXPECT_FALSE(still_stalled.ignore_input);
+  EXPECT_GT(still_stalled.until_us, now_us);
+  EXPECT_EQ(node.wakeups().stalled_arms, 2u);
+
+  node.PublishIntrospection();
+  std::optional<introspect::NodeSnapshot> bridge;
+  for (auto& row : reader->nodes()) {
+    if (row.name == kNodeName &&
+        row.pid == static_cast<std::uint64_t>(getpid()) &&
+        (!bridge || row.generation > bridge->generation))
+      bridge = std::move(row);
+  }
+  ASSERT_TRUE(bridge.has_value());
+  EXPECT_EQ(bridge->delivery_loss().stalled_arms, 2u);
 }
 
 // A UDP socket bound to `port` on every address, so binding the port again
@@ -1613,6 +1858,8 @@ TEST(HardwareNodeTest, OnlyASendErrorTheSocketKeepsRepeatingReplacesIt) {
     node.Tick(now_us);  // the probe is due, and fails
     EXPECT_EQ(node.socket_counters().last_send_error, row.error);
     EXPECT_EQ(node.udp_fd() < 0, row.replaced);
+    // The loop wakes for it 1 ms later, not at the probe's next period.
+    EXPECT_EQ(node.NextDutyUs(now_us), now_us + 1'000);
     node.Tick(now_us + 1'000);
     reopens += row.replaced ? 1 : 0;
     EXPECT_EQ(node.socket_counters().reopens, reopens);
@@ -1846,6 +2093,7 @@ TEST(HardwareNodeTest, TheLivenessSampleRidesEveryPass) {
 // registry samples, arming the request wakes and the next deadline. Tick()
 // and Pass() run on this thread, which is the only one AllocationProbe
 // counts.
+// REQ-RT-06
 TEST(HardwareNodeTest, SteadyStateTickDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
@@ -1947,6 +2195,477 @@ TEST(HardwareNodeTest, SteadyStateTickDoesNotAllocate) {
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_EQ(node.identity_rejected(), 0u);
   EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 15.0 + 595);
+}
+
+// REQ-OPS-21, REQ-RT-22: /hw/command is published and logged only when
+// SendToGateway succeeds, so IPC observers and the event log match what
+// actually left on the wire.
+TEST(HardwareNodeTest, FailedCommandSendIsNotPublishedOrLogged) {
+  const std::string log_path = ::testing::TempDir() + "/bridge_failed_send_" +
+                               std::to_string(getpid()) + ".tlog";
+  std::filesystem::remove(log_path);
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, true, log_path, 61));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> cmd_sub{
+      kCommandTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::SEQUENCE}};
+  ipc::Publisher<Packet> intake{RequestTopic("intake")};
+
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(NodeConfigId(cfg), 11, 1, 1000),
+                          1'000'000));
+  // Fail the first command send with a transient socket error.
+  pending_send_error = ECONNREFUSED;
+  node.set_seams({.send_error = &TakeSendError});
+  PublishCommand(intake, IntakeRequest(cfg, 4.0));
+  node.Tick(1'001'000);
+  EXPECT_EQ(node.commands_sent(), 0u);
+  EXPECT_FALSE(cmd_sub.read().has_value())
+      << "failed UDP send must not publish on /hw/command";
+
+  // Next retry succeeds: published and logged once.
+  node.Tick(1'002'000);
+  EXPECT_EQ(node.commands_sent(), 1u);
+  EXPECT_TRUE(cmd_sub.read().has_value());
+
+  link.node.reset();  // flushes the log
+  event::log::LogReader reader{log_path};
+  std::size_t logged_commands = 0;
+  event::log::LogReader::Record record;
+  while (reader.next(record)) {
+    if (record.header.kind !=
+        static_cast<std::uint16_t>(event::EventKind::SEND)) {
+      continue;
+    }
+    if (reader.manifest()[record.header.source_id].name == kCommandTopic) {
+      ++logged_commands;
+    }
+  }
+  EXPECT_EQ(logged_commands, 1u);
+  std::filesystem::remove(log_path);
+}
+
+// REQ-RT-22 (TODO.md RT-28): the exit summary prints UDP transport loss and
+// decode counters from peer_.stats().
+TEST(HardwareNodeTest, ExitSummaryReportsUdpGapsDecodeFailuresAndWouldBlock) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+
+  // Send seq 1, a corrupt frame (decode failure), then seq 5 (gap of 3) over
+  // the connected gateway socket so the bridge accepts them.
+  auto send_raw_seq = [&](uint64_t seq) {
+    std::array<uint8_t, protocol::kFrameHeaderSize> buf{};
+    const std::size_t n = protocol::EncodeFrame(
+        protocol::FrameType::kClockProbe, protocol::kFlagNone, seq, seq * 1000,
+        nullptr, 0, buf.data(), buf.size());
+    ASSERT_EQ(::send(link.gateway.NativeFd(), buf.data(), n, 0),
+              static_cast<ssize_t>(n));
+  };
+
+  // Deliver each datagram and drain it before sending the next so macOS
+  // loopback delivery of later datagrams cannot lag behind the first
+  // DatagramQueued() wake.
+  uint64_t now_us = 1'000'000;
+  auto deliver = [&](auto&& send_one) {
+    send_one();
+    for (;;) {
+      ASSERT_TRUE(DatagramQueued(node));
+      const bool had_bytes = QueuedBytes(node) > 0;
+      now_us += 1'000;
+      node.Tick(now_us);
+      if (had_bytes && QueuedBytes(node) == 0) break;
+    }
+  };
+
+  deliver([&] { send_raw_seq(1); });
+  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  deliver([&] {
+    ASSERT_EQ(::send(link.gateway.NativeFd(), garbage, sizeof(garbage), 0),
+              static_cast<ssize_t>(sizeof(garbage)));
+  });
+  deliver([&] { send_raw_seq(5); });
+
+  process::stop_requested.store(true);
+  ::testing::internal::CaptureStdout();
+  static_cast<void>(node.Run());
+  const std::string output = ::testing::internal::GetCapturedStdout();
+  process::stop_requested.store(false);
+
+  EXPECT_NE(output.find("sequence_gaps=3"), std::string::npos) << output;
+  EXPECT_NE(output.find("decode_failures=1"), std::string::npos) << output;
+  EXPECT_NE(output.find("send_would_block=0"), std::string::npos) << output;
+}
+
+// REQ-OPS-20: the bridge's exit summary prints each subsystem's count of
+// owner-timeout episodes (timeouts=) and whether it was silent at the last
+// Tick (timed_out=), leaving an unheard subsystem at timeouts=0 timed_out=0.
+TEST(HardwareNodeTest, ExitSummaryReportsOwnerTimeoutEpisodes) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+
+  constexpr uint64_t kStartUs = 1'000'000;
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
+                                   kStartUs - 500, ack_bytes.data(),
+                                   ack_bytes.size()),
+            protocol::UdpStatus::kOk);
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node)) << "no config ACK configured the bridge";
+    node.Tick(kStartUs - 500);
+  }
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 1000), kStartUs));
+
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+  constexpr uint64_t kRequestUs = kStartUs + 1'000;
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(kRequestUs);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.owner_timeouts("intake"), 0u);
+
+  // Keep the link fresh while intake goes silent past its owner timeout, then
+  // recovers, times out a second time, and recovers again so requests (3),
+  // cumulative timeouts (2), and final timed_out (0) are pairwise distinct.
+  const uint64_t timeout1_us = kRequestUs + owner_timeout_us + 1;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 2000),
+                          kRequestUs + owner_timeout_us));
+  node.Tick(timeout1_us);
+  ASSERT_EQ(node.owner_timeouts("intake"), 1u);
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+
+  const uint64_t request2_us = timeout1_us + 1'000;
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(request2_us);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+
+  const uint64_t timeout2_us = request2_us + owner_timeout_us + 1;
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(config_id, 11, 1, 3000),
+                          request2_us + owner_timeout_us));
+  node.Tick(timeout2_us);
+  ASSERT_EQ(node.owner_timeouts("intake"), 2u);
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+
+  const uint64_t request3_us = timeout2_us + 1'000;
+  PublishCommand(intake_pub, IntakeRequest(cfg, 4.0));
+  node.Tick(request3_us);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  ASSERT_EQ(node.owner_timeouts("intake"), 2u);
+
+  struct RunStopGuard {
+    bool capturing{false};
+    ~RunStopGuard() {
+      if (capturing) (void)::testing::internal::GetCapturedStdout();
+      process::stop_requested.store(false);
+      static_cast<void>(process::ConsumeStopWake());
+    }
+    RunStopGuard() = default;
+    RunStopGuard(const RunStopGuard&) = delete;
+    RunStopGuard& operator=(const RunStopGuard&) = delete;
+  };
+  RunStopGuard guard;
+  process::stop_requested.store(true);
+  ::testing::internal::CaptureStdout();
+  guard.capturing = true;
+  const int exit_code = node.Run();
+  guard.capturing = false;
+  const std::string output = ::testing::internal::GetCapturedStdout();
+  process::stop_requested.store(false);
+  static_cast<void>(process::ConsumeStopWake());
+
+  EXPECT_EQ(exit_code, 0) << output;
+  EXPECT_NE(
+      output.find(
+          "hardware_node: sub=intake requests=3 timeouts=2 timed_out=0\n"),
+      std::string::npos)
+      << output;
+  EXPECT_NE(
+      output.find(
+          "hardware_node: sub=drivetrain requests=0 timeouts=0 timed_out=0\n"),
+      std::string::npos)
+      << output;
+}
+
+// REQ-OPS-20 (TODO.md RT-17, RT-28): /hw/status carries the bridge's UDP
+// socket and incoming State loss counters (socket_send_failures_count,
+// socket_reopens_count, state_sequence_gaps_count, state_decode_failures_count,
+// socket_send_would_block_count).
+TEST(HardwareNodeTest, BridgeStatusReportsUdpSocketAndStateLossCounters) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<bridge::BridgeStatus> status_sub{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+
+  // 1. Trigger a permanent send error (reopens the socket) and a transient
+  // send error (counts a send failure without reopening).
+  node.set_seams({.send_error = &TakeSendError});
+  pending_send_error = EPIPE;
+  node.Tick(1'000'000);  // clock probe fails -> send_failures=1, socket closed
+  ASSERT_EQ(node.socket_counters().send_failures, 1u);
+  ASSERT_EQ(node.socket_counters().reopens, 0u);
+  node.Tick(1'001'000);  // reopens socket -> reopens=1, probe succeeds
+  ASSERT_EQ(node.socket_counters().reopens, 1u);
+
+  pending_send_error = ECONNREFUSED;
+  node.Tick(1'200'000);  // next probe fails transiently -> send_failures=2
+  ASSERT_EQ(node.socket_counters().send_failures, 2u);
+  ASSERT_EQ(node.socket_counters().reopens, 1u);
+
+  // 2. Send seq 1, a corrupt frame (decode failure), then seq 6 (gap of 4).
+  auto send_raw_seq = [&](uint64_t seq) {
+    std::array<uint8_t, protocol::kFrameHeaderSize> buf{};
+    const std::size_t n = protocol::EncodeFrame(
+        protocol::FrameType::kClockProbe, protocol::kFlagNone, seq, seq * 1000,
+        nullptr, 0, buf.data(), buf.size());
+    ASSERT_EQ(::send(link.gateway.NativeFd(), buf.data(), n, 0),
+              static_cast<ssize_t>(n));
+  };
+  // Deliver each datagram and drain it before sending the next so macOS
+  // loopback delivery of later datagrams cannot lag behind the first
+  // DatagramQueued() wake.
+  uint64_t now_us = 1'220'000;
+  auto deliver = [&](auto&& send_one) {
+    send_one();
+    for (;;) {
+      ASSERT_TRUE(DatagramQueued(node));
+      const bool had_bytes = QueuedBytes(node) > 0;
+      now_us += 5'000;
+      node.Tick(now_us);
+      if (had_bytes && QueuedBytes(node) == 0) break;
+    }
+  };
+  deliver([&] { send_raw_seq(1); });
+  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  deliver([&] {
+    ASSERT_EQ(::send(link.gateway.NativeFd(), garbage, sizeof(garbage), 0),
+              static_cast<ssize_t>(sizeof(garbage)));
+  });
+  deliver([&] { send_raw_seq(6); });
+
+  // Ensure a fresh /hw/status publication after draining.
+  now_us += 20'000;
+  node.Tick(now_us);
+
+  const auto published = status_sub.read();
+  ASSERT_TRUE(published.has_value());
+  const bridge::BridgeStatus status = *published;
+  EXPECT_EQ(status.socket_send_failures_count(), 2u);
+  EXPECT_EQ(status.socket_reopens_count(), 1u);
+  EXPECT_EQ(status.state_sequence_gaps_count(), 4u);
+  EXPECT_EQ(status.state_decode_failures_count(), 1u);
+  EXPECT_EQ(status.socket_send_would_block_count(), 0u);
+  EXPECT_TRUE(status == node.Status(now_us));
+
+  // 3. A send the socket cannot take now (EAGAIN), from a socket whose send
+  // buffer is full: a stream pair, filled to the last byte, put in place of
+  // the bridge's socket on its descriptor. A datagram socket's sends on
+  // loopback do not block, and a full Unix datagram socket says ENOBUFS on
+  // macOS.
+  std::array<int, 2> pair{-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair.data()), 0);
+  ASSERT_EQ(::fcntl(pair[0], F_SETFL, O_NONBLOCK), 0);
+  std::array<uint8_t, 4096> fill{};
+  while (::send(pair[0], fill.data(), fill.size(), 0) > 0) {
+  }
+  while (::send(pair[0], fill.data(), 1, 0) > 0) {
+  }
+  ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << std::strerror(errno);
+  ASSERT_GE(::dup2(pair[0], node.udp_fd()), 0);
+  ::close(pair[0]);
+  uint64_t would_block = 0;
+  // Each Tick to the next unanswered probe's retry, which finds it full.
+  for (int i = 0; i < 10 && would_block == 0; ++i) {
+    now_us += 20'000;
+    node.Tick(now_us);
+    const auto latest = status_sub.read();
+    if (latest) would_block = latest->socket_send_would_block_count();
+  }
+  EXPECT_GE(would_block, 1u);
+  link.node.reset();  // closes the full end before its peer
+  ::close(pair[1]);
+}
+
+int pending_recv_error = 0;
+int TakeRecvError() { return std::exchange(pending_recv_error, 0); }
+
+// Permanent receive errors close and reopen the socket on the 100 ms cadence
+// (incrementing /hw/status socket_reopens_count), while transient errors such
+// as ECONNREFUSED keep the socket open.
+// REQ-RT-22
+TEST(HardwareNodeTest,
+     PermanentReceiveErrorReopensSocketWhileTransientKeepsIt) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<bridge::BridgeStatus> status_sub{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+
+  // 1. Real OS EBADF on TryReceive(): tick with no send due so TryReceive()
+  // hits the closed fd directly.
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  ASSERT_EQ(NextProbeUs(link.gateway), kStartUs);
+  const int fd = node.udp_fd();
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const uint64_t lost_us = kStartUs + 5'000;
+  node.Tick(lost_us);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().recv_failures, 1u);
+  EXPECT_EQ(node.socket_counters().last_recv_error, EBADF);
+  EXPECT_EQ(node.socket_counters().reopens, 0u);
+  // First reopen is scheduled on the next Tick (1 ms later at the latest).
+  const uint64_t reopen_us = lost_us + 1'000;
+  EXPECT_EQ(node.NextDutyUs(lost_us), reopen_us);
+  node.Tick(reopen_us);
+  EXPECT_GE(node.udp_fd(), 0);
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+  ASSERT_TRUE(InjectState(node, link.gateway,
+                          TrustState(NodeConfigId(cfg), 11, 1, 1000),
+                          reopen_us + 1'000));
+
+  // Publish /hw/status and verify socket_reopens_count reflects the reopen.
+  uint64_t now_us = reopen_us + 25'000;
+  node.Tick(now_us);
+  auto published = status_sub.read();
+  ASSERT_TRUE(published.has_value());
+  EXPECT_EQ(published->socket_reopens_count(), 1u);
+
+  // 2. Transient ECONNREFUSED keeps the socket open without reopening.
+  node.set_seams({.recv_error = &TakeRecvError});
+  pending_recv_error = ECONNREFUSED;
+  now_us += 20'000;
+  const int fd_before = node.udp_fd();
+  node.Tick(now_us);
+  EXPECT_EQ(node.udp_fd(), fd_before);
+  EXPECT_EQ(node.socket_counters().last_recv_error, ECONNREFUSED);
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+
+  // 3. Permanent ENETUNREACH closes and reopens once kReopenRetryUs has passed
+  // since the previous reopen, incrementing socket_reopens_count on /hw/status.
+  now_us = reopen_us + HardwareNode::kReopenRetryUs;
+  pending_recv_error = ENETUNREACH;
+  node.Tick(now_us);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().last_recv_error, ENETUNREACH);
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+
+  now_us += 1'000;
+  node.Tick(now_us);
+  EXPECT_GE(node.udp_fd(), 0);
+  EXPECT_EQ(node.socket_counters().reopens, 2u);
+
+  // 4. Another permanent receive error inside kReopenRetryUs is throttled.
+  const uint64_t second_reopen_us = now_us;
+  pending_recv_error = EADDRNOTAVAIL;
+  node.Tick(second_reopen_us + 5'000);
+  EXPECT_EQ(node.udp_fd(), -1);
+  node.Tick(second_reopen_us + HardwareNode::kReopenRetryUs - 1);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().reopens, 2u);
+
+  now_us = second_reopen_us + HardwareNode::kReopenRetryUs;
+  node.Tick(now_us);
+  EXPECT_GE(node.udp_fd(), 0);
+  EXPECT_EQ(node.socket_counters().reopens, 3u);
+
+  now_us += 25'000;
+  node.Tick(now_us);
+  published = status_sub.read();
+  ASSERT_TRUE(published.has_value());
+  EXPECT_EQ(published->socket_reopens_count(), 3u);
+}
+
+// A HardwareNode pinned to an absent local_address (EADDRNOTAVAIL) does not
+// crash or fall back to 0.0.0.0: Open() logs one stderr line naming the
+// address and errno, enters deferred open, keeps OpenWaits() out of polling
+// fallback, and retries every 100 ms until the interface appears. An address
+// conflict (EADDRINUSE) still fails hard.
+// REQ-RT-22, REQ-OPS-25
+TEST(HardwareNodeTest, AbsentLocalAddressRetriesEvery100MsWithoutFallback) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  // RFC 5737 TEST-NET-1: never assigned to a local interface -> EADDRNOTAVAIL.
+  constexpr const char* kAbsentIp = "192.0.2.1";
+  uint16_t gateway_port = 0;
+  uint16_t node_port = 0;
+  int gw_res = ReservePort(gateway_port);
+  int node_res = ReservePort(node_port);
+  ASSERT_GE(gw_res, 0);
+  ASSERT_GE(node_res, 0);
+  Release(node_res);
+
+  HardwareNode node{cfg, "127.0.0.1", gateway_port, node_port, true, 0,
+                    {},  0,           {},           kAbsentIp};
+  ::testing::internal::CaptureStderr();
+  const bool opened = node.Open();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  EXPECT_TRUE(opened) << stderr_text;
+  EXPECT_NE(stderr_text.find(kAbsentIp), std::string::npos) << stderr_text;
+  EXPECT_NE(stderr_text.find(std::to_string(EADDRNOTAVAIL)), std::string::npos)
+      << stderr_text;
+  EXPECT_EQ(node.udp_fd(), -1)
+      << "must not fall back to 0.0.0.0 when local_address is absent";
+
+  // OpenWaits() must succeed without falling back to polling.
+  EXPECT_TRUE(node.OpenWaits());
+  EXPECT_EQ(node.wakeups().wait_fallbacks, 0u);
+  node.CloseWaits();
+
+  // First Tick makes the initial retry attempt; subsequent retries happen on
+  // the 100 ms kReopenRetryUs cadence and never before.
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 1u);
+  EXPECT_EQ(node.socket_counters().reopens, 0u);
+
+  node.Tick(kStartUs + 20'000);
+  node.Tick(kStartUs + 50'000);
+  node.Tick(kStartUs + HardwareNode::kReopenRetryUs - 1);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 1u);
+
+  node.Tick(kStartUs + HardwareNode::kReopenRetryUs);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 2u);
+
+  node.Tick(kStartUs + 2 * HardwareNode::kReopenRetryUs - 1);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 2u);
+  node.Tick(kStartUs + 2 * HardwareNode::kReopenRetryUs);
+  EXPECT_EQ(node.socket_counters().reopen_attempts, 3u);
+  EXPECT_TRUE(node.Status(kStartUs + 2 * HardwareNode::kReopenRetryUs)
+                  .alert_error_link_lost());
+
+  // EADDRINUSE on a pinned local address still fails Open() hard.
+  int holder = HoldPort(node_port);
+  ASSERT_GE(holder, 0);
+  HardwareNode conflicting{cfg, "127.0.0.1", gateway_port, node_port,  true, 0,
+                           {},  0,           {},           "127.0.0.1"};
+  ::testing::internal::CaptureStderr();
+  EXPECT_FALSE(conflicting.Open());
+  const std::string conflict_err = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(conflict_err.find("127.0.0.1"), std::string::npos) << conflict_err;
+  Release(holder);
+  Release(gw_res);
 }
 
 }  // namespace

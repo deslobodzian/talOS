@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -27,6 +29,38 @@ struct CeilingCheckResult {
   bool ok{true};
   std::string reason;
 };
+
+inline bool CheckCeilingsInto(const Config& config,
+                              std::span<char> reason) noexcept {
+  const auto fail = [reason](const ConfigString& name, const char* what,
+                             double value, double ceiling) noexcept {
+    if (!reason.empty()) {
+      std::snprintf(
+          reason.data(), reason.size(), "motor '%.*s' %s %f > ceiling %f",
+          static_cast<int>(name.size()), name.data(), what, value, ceiling);
+    }
+    return false;
+  };
+  for (const auto& m : config.motors) {
+    if (m.supply_limit_a > kCeilingMaxSupplyCurrentA) {
+      return fail(m.name, "supply limit", m.supply_limit_a,
+                  kCeilingMaxSupplyCurrentA);
+    }
+    if (m.stator_limit_a > kCeilingMaxStatorCurrentA) {
+      return fail(m.name, "stator limit", m.stator_limit_a,
+                  kCeilingMaxStatorCurrentA);
+    }
+    if (m.max_voltage > kCeilingMaxVoltageV) {
+      return fail(m.name, "voltage", m.max_voltage, kCeilingMaxVoltageV);
+    }
+    if (m.max_velocity_rps > kCeilingMaxVelocityRps) {
+      return fail(m.name, "velocity", m.max_velocity_rps,
+                  kCeilingMaxVelocityRps);
+    }
+  }
+  if (!reason.empty()) reason[0] = '\0';
+  return true;
+}
 
 inline CeilingCheckResult CheckCeilings(const Config& config) {
   for (const auto& m : config.motors) {
@@ -90,11 +124,37 @@ struct ByteWriter {
   }
 };
 
+struct SpanByteWriter {
+  std::span<uint8_t> buf;
+  std::size_t pos{};
+  bool ok{true};
+  void Int(uint64_t value, int bytes) noexcept {
+    if (!ok || pos + static_cast<std::size_t>(bytes) > buf.size()) {
+      ok = false;
+      return;
+    }
+    for (int i = 0; i < bytes; ++i) {
+      buf[pos++] = static_cast<uint8_t>(value & 0xFF);
+      value >>= 8;
+    }
+  }
+  void Real(double x) noexcept { Int(std::bit_cast<uint64_t>(x), 8); }
+  void Text(std::string_view s) noexcept {
+    Int(s.size(), 2);
+    if (!ok || pos + s.size() > buf.size()) {
+      ok = false;
+      return;
+    }
+    if (!s.empty()) std::memcpy(buf.data() + pos, s.data(), s.size());
+    pos += s.size();
+  }
+};
+
 struct ByteReader {
   std::span<const uint8_t> data;
   std::size_t pos{};
   bool ok{true};
-  uint64_t Int(int bytes) {
+  uint64_t Int(int bytes) noexcept {
     uint64_t val{};
     for (int i = 0; i < bytes; ++i) {
       if (pos >= data.size()) {
@@ -107,31 +167,30 @@ struct ByteReader {
   }
   // Signed 32-bit fields (CAN ids, DIO/PWM channels) travel as their
   // two's-complement bits; the conversion back is modular (C++20).
-  int32_t Int32() {
+  int32_t Int32() noexcept {
     return static_cast<int32_t>(static_cast<uint32_t>(Int(4)));
   }
-  double Real() {
+  double Real() noexcept {
     const double x = std::bit_cast<double>(Int(8));
     ok &= std::isfinite(x);
     return x;
   }
-  std::string Text() {
+  ConfigString Text() noexcept {
     const auto len = Int(2);
-    if (!ok || pos + len > data.size()) {
+    if (!ok || len > kMaxConfigNameLength || pos + len > data.size()) {
       ok = false;
       return {};
     }
-    std::string s(reinterpret_cast<const char*>(data.data() + pos), len);
+    ConfigString s(std::string_view(
+        reinterpret_cast<const char*>(data.data() + pos), len));
     pos += len;
     return s;
   }
-  bool Done() const { return ok && pos == data.size(); }
+  bool Done() const noexcept { return ok && pos == data.size(); }
 };
-}  // namespace detail
 
-inline std::vector<uint8_t> SerializeConfig(const Config& c) {
-  std::vector<uint8_t> buf;
-  detail::ByteWriter w{buf};
+template <typename Writer>
+void WriteConfig(Writer& w, const Config& c) {
   w.Int(c.period_us, 4);
   w.Int(c.command_timeout_us, 4);
   w.Real(c.status_hz);
@@ -221,11 +280,25 @@ inline std::vector<uint8_t> SerializeConfig(const Config& c) {
     w.Text(pwm.name);
     w.Int(pwm.channel, 4);
   }
+}
+}  // namespace detail
 
+inline std::size_t SerializeConfigInto(const Config& c,
+                                       std::span<uint8_t> out) noexcept {
+  detail::SpanByteWriter w{out};
+  detail::WriteConfig(w, c);
+  return w.ok ? w.pos : 0;
+}
+
+inline std::vector<uint8_t> SerializeConfig(const Config& c) {
+  std::vector<uint8_t> buf;
+  detail::ByteWriter w{buf};
+  detail::WriteConfig(w, c);
   return buf;
 }
 
-inline bool DeserializeConfig(std::span<const uint8_t> bytes, Config& out) {
+inline bool DeserializeConfig(std::span<const uint8_t> bytes,
+                              Config& out) noexcept {
   Config c{};
   detail::ByteReader r{bytes};
   c.period_us = r.Int(4);
@@ -509,17 +582,25 @@ class ConfigAssembler {
   };
 
   Status AddChunk(std::span<const uint8_t> payload,
-                  std::string& error_reason) noexcept try {
+                  std::span<char> error_reason) noexcept {
+    const auto set_reason = [error_reason](const char* msg) noexcept {
+      if (!error_reason.empty()) {
+        std::snprintf(error_reason.data(), error_reason.size(), "%s", msg);
+      }
+    };
+    if (!error_reason.empty()) error_reason[0] = '\0';
     if (payload.size() < sizeof(ConfigChunkHeader)) {
-      error_reason = "chunk payload smaller than header";
+      last_config_id_ = 0;
+      set_reason("chunk payload smaller than header");
       return Status::kInvalidChunk;
     }
 
     const ConfigChunkHeader hdr = DecodeConfigChunkHeader(payload.data());
+    last_config_id_ = hdr.config_id;
 
     if (hdr.chunk_bytes == 0 || hdr.chunk_bytes > kMaxConfigChunkData ||
         payload.size() != sizeof(ConfigChunkHeader) + hdr.chunk_bytes) {
-      error_reason = "chunk byte count mismatch";
+      set_reason("chunk byte count mismatch");
       return Status::kInvalidChunk;
     }
 
@@ -527,7 +608,7 @@ class ConfigAssembler {
         hdr.chunk_count == 0 || hdr.chunk_count > kMaxConfigChunkCount ||
         hdr.chunk_count > hdr.total_bytes ||
         hdr.chunk_index >= hdr.chunk_count) {
-      error_reason = "invalid chunk index or count";
+      set_reason("invalid chunk index or count");
       return Status::kInvalidChunk;
     }
 
@@ -538,7 +619,7 @@ class ConfigAssembler {
     if (final_chunk && hdr.chunk_count > 1) {
       if (hdr.chunk_bytes >= hdr.total_bytes ||
           (hdr.total_bytes - hdr.chunk_bytes) % (hdr.chunk_count - 1) != 0) {
-        error_reason = "invalid final chunk size";
+        set_reason("invalid final chunk size");
         return Status::kInvalidChunk;
       }
       stride = (hdr.total_bytes - hdr.chunk_bytes) / (hdr.chunk_count - 1);
@@ -549,7 +630,7 @@ class ConfigAssembler {
         offset >= hdr.total_bytes ||
         hdr.chunk_bytes !=
             std::min(stride, std::size_t{hdr.total_bytes} - offset)) {
-      error_reason = "chunk data exceeds transfer bounds";
+      set_reason("chunk data exceeds transfer bounds");
       return Status::kInvalidChunk;
     }
 
@@ -560,22 +641,22 @@ class ConfigAssembler {
       total_bytes_ = hdr.total_bytes;
       chunk_count_ = hdr.chunk_count;
       chunk_stride_ = stride;
-      received_chunks_.assign(chunk_count_, false);
-      assembled_buffer_.assign(total_bytes_, 0);
+      received_chunks_.reset();
+      std::memset(assembled_buffer_.data(), 0, total_bytes_);
       received_count_ = 0;
     } else {
       if (hdr.total_bytes != total_bytes_ || hdr.total_crc32 != total_crc32_ ||
           hdr.chunk_count != chunk_count_ || stride != chunk_stride_) {
-        error_reason = "inconsistent chunk metadata";
-        Reset();
+        set_reason("inconsistent chunk metadata");
+        ResetAssembly();
         return Status::kInvalidChunk;
       }
     }
 
-    if (!received_chunks_[hdr.chunk_index]) {
+    if (!received_chunks_.test(hdr.chunk_index)) {
       std::memcpy(assembled_buffer_.data() + offset,
                   payload.data() + sizeof(ConfigChunkHeader), hdr.chunk_bytes);
-      received_chunks_[hdr.chunk_index] = true;
+      received_chunks_.set(hdr.chunk_index);
       ++received_count_;
     }
 
@@ -584,66 +665,91 @@ class ConfigAssembler {
     }
 
     // All chunks arrived! Verify CRC32.
-    const uint32_t actual_crc = ComputeCrc32(assembled_buffer_);
+    const std::span<const uint8_t> assembled{assembled_buffer_.data(),
+                                             total_bytes_};
+    const uint32_t actual_crc = ComputeCrc32(assembled);
     if (actual_crc != total_crc32_) {
-      error_reason = "assembled CRC mismatch (expected " +
-                     std::to_string(total_crc32_) + ", got " +
-                     std::to_string(actual_crc) + ")";
-      Reset();
+      if (!error_reason.empty()) {
+        std::snprintf(error_reason.data(), error_reason.size(),
+                      "assembled CRC mismatch (expected %u, got %u)",
+                      total_crc32_, actual_crc);
+      }
+      ResetAssembly();
       return Status::kCrcMismatch;
     }
 
     Config parsed;
-    if (!DeserializeConfig(assembled_buffer_, parsed)) {
-      error_reason = "failed to deserialize config bytes";
-      Reset();
+    if (!DeserializeConfig(assembled, parsed)) {
+      set_reason("failed to deserialize config bytes");
+      ResetAssembly();
+      return Status::kMalformedConfig;
+    }
+
+    const uint64_t actual_id = TryConfigurationId(parsed);
+    if (actual_id == 0 || actual_id != active_config_id_) {
+      set_reason(actual_id == 0 ? "config failed validation"
+                                : "config id mismatch");
+      ResetAssembly();
       return Status::kMalformedConfig;
     }
 
     // Check ceilings!
-    const auto ceiling_res = CheckCeilings(parsed);
-    if (!ceiling_res.ok) {
-      error_reason = ceiling_res.reason;
-      Reset();
+    if (!CheckCeilingsInto(parsed, error_reason)) {
+      ResetAssembly();
       return Status::kCeilingExceeded;
     }
 
     config_ = parsed;
-    const auto completed_id = active_config_id_;
-    Reset();
-    active_config_id_ = completed_id;
+    ResetAssembly();
     return Status::kComplete;
+  }
+
+  Status AddChunk(std::span<const uint8_t> payload,
+                  std::string& error_reason) noexcept try {
+    std::array<char, 160> buf{};
+    const Status status = AddChunk(payload, std::span<char>{buf});
+    if (buf[0] != '\0') error_reason = buf.data();
+    return status;
   } catch (...) {
-    // Allocation/deserialization failures must not escape the gateway's
-    // safety loop. Even reporting an error must remain allocation-free here.
+    // Allocation failures in error reporting must not escape the gateway's
+    // safety loop.
     Reset();
     error_reason.clear();
     return Status::kInvalidChunk;
   }
 
   const Config& config() const { return config_; }
-  uint64_t config_id() const { return active_config_id_; }
+  // The header config_id of the most recently processed chunk (0 before any
+  // chunk, after Reset(), or after a chunk shorter than ConfigChunkHeader).
+  // Preserved across completion and refusal resets so Endpoint::Tick stamps
+  // the rejected transfer's config_id onto refusal ACKs (REQ-CONTRACT-04).
+  uint64_t config_id() const { return last_config_id_; }
 
-  void Reset() {
+  void Reset() noexcept {
+    ResetAssembly();
+    last_config_id_ = 0;
+  }
+
+ private:
+  void ResetAssembly() noexcept {
     active_config_id_ = 0;
     total_crc32_ = 0;
     total_bytes_ = 0;
     chunk_count_ = 0;
     received_count_ = 0;
     chunk_stride_ = 0;
-    received_chunks_.clear();
-    assembled_buffer_.clear();
+    received_chunks_.reset();
   }
 
- private:
   uint64_t active_config_id_{0};
+  uint64_t last_config_id_{0};
   uint32_t total_crc32_{0};
   uint32_t total_bytes_{0};
   uint16_t chunk_count_{0};
   uint16_t received_count_{0};
   std::size_t chunk_stride_{0};
-  std::vector<bool> received_chunks_{};
-  std::vector<uint8_t> assembled_buffer_{};
+  std::bitset<kMaxConfigChunkCount> received_chunks_{};
+  std::array<uint8_t, kMaxSerializedConfigSize> assembled_buffer_{};
   Config config_{};
 };
 
@@ -668,6 +774,25 @@ inline constexpr std::array<uint8_t, 8> kPersistedConfigMagic{
     'T', 'A', 'L', 'O', 'S', 'C', 'F', 'G'};
 inline constexpr std::size_t kPersistedConfigHeaderBytes =
     kPersistedConfigMagic.size() + 2;
+inline constexpr std::size_t kMaxPersistedConfigSize =
+    kPersistedConfigHeaderBytes + kMaxSerializedConfigSize + 4;
+
+inline std::size_t PersistedConfigInto(const Config& config,
+                                       std::span<uint8_t> out) noexcept {
+  if (out.size() < kPersistedConfigHeaderBytes + 4) return 0;
+  std::memcpy(out.data(), kPersistedConfigMagic.data(),
+              kPersistedConfigMagic.size());
+  detail::PutLittleEndian(out.data() + kPersistedConfigMagic.size(),
+                          protocol::kProtocolVersion, 2);
+  const std::size_t body_budget = out.size() - kPersistedConfigHeaderBytes - 4;
+  const std::size_t body_size = SerializeConfigInto(
+      config, out.subspan(kPersistedConfigHeaderBytes, body_budget));
+  if (body_size == 0) return 0;
+  const std::size_t covered = kPersistedConfigHeaderBytes + body_size;
+  detail::PutLittleEndian(out.data() + covered,
+                          ComputeCrc32(out.first(covered)), 4);
+  return covered + 4;
+}
 
 inline std::vector<uint8_t> PersistedConfig(const Config& config) {
   const auto body = SerializeConfig(config);
@@ -698,11 +823,7 @@ inline bool LoadPersistedConfig(std::span<const uint8_t> bytes,
   Config parsed;
   if (!DeserializeConfig(covered.subspan(kPersistedConfigHeaderBytes),
                          parsed) ||
-      !CheckCeilings(parsed).ok)
-    return false;
-  try {
-    Validate(parsed);
-  } catch (...) {
+      !CheckCeilingsInto(parsed, {}) || !IsValid(parsed)) {
     return false;
   }
   config = std::move(parsed);

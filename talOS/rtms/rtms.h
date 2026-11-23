@@ -19,6 +19,10 @@
 #include "talOS/rtms/wake.h"
 #include "talOS/schema/identity.h"
 
+namespace talos::rtms_test {
+class RegistrationPeer;  // ring_lap_test.cc
+}  // namespace talos::rtms_test
+
 inline constexpr size_t CACHE_LINE = 64;  // C++ I think as a function for this.
 inline constexpr size_t MAX_SLOTS = 1u << 10;  // 1024 slots maximum
 inline constexpr size_t MASK = MAX_SLOTS - 1;  // Mask for fixed size
@@ -49,6 +53,12 @@ inline constexpr std::size_t rtms_slot_stride(std::size_t message_size,
 }
 
 static_assert(sizeof(std::int64_t) == 8);
+static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free);
+static_assert(std::atomic_ref<std::uint64_t>::required_alignment <=
+              alignof(std::int64_t));
+static_assert(std::atomic_ref<std::int64_t>::is_always_lock_free);
+static_assert(std::atomic_ref<std::int64_t>::required_alignment <=
+              alignof(std::int64_t));
 static_assert(rtms_slot_stride(1, 1) == 16);
 static_assert(rtms_slot_stride(8, 4) == 16);
 static_assert(rtms_slot_stride(16, 8) == 24);
@@ -140,10 +150,14 @@ inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
 inline constexpr std::uint64_t kRtmsVersion = 9;
 
-// RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
-// of queues attached to a segment that is not session-owned.
+// RTMSHeader::lifetime: a session-owned flag, a closing flag, an exclusive
+// reclamation flag for an abandoned closing segment, and the count of queues
+// attached to a segment that is not session-owned.
+// kLifetimeReclaiming assumes single-bundle builds (same kRtmsVersion): all
+// peers sharing a standalone segment are built together and observe it.
 inline constexpr std::uint64_t kLifetimeSessionOwned = 1ULL << 63;
 inline constexpr std::uint64_t kLifetimeClosing = 1ULL << 62;
+inline constexpr std::uint64_t kLifetimeReclaiming = 1ULL << 61;
 inline constexpr std::uint64_t kLifetimeCountMask = (1ULL << 32) - 1;
 
 // The segment records the writer's owner and each reader slot's claimant as
@@ -250,7 +264,7 @@ class RTMSQueue {
   // read_next() reports INACTIVE rather than share another claimant's cursor.
   std::optional<std::size_t> register_reader();
   // Frees reader slot `id` if this queue claimed it and still holds it.
-  void release_reader(std::size_t id);
+  void release_reader(std::size_t id) noexcept;
 
   // Wake channel (README.md "Wake channel"). Records the wake receiver for
   // a reader slot this queue holds; 0 disables.
@@ -310,13 +324,18 @@ class RTMSQueue {
   }
 
  private:
+  // Runs register_reader()'s claim and activate steps with writes between
+  // them, which no thread schedule can be made to do on demand.
+  friend class talos::rtms_test::RegistrationPeer;
+
   // Number of times a read retries when the writer laps it mid-read.
   static constexpr int MAX_READ_ATTEMPTS = 8;
 
-  static bool is_active(const Reader& reader) {
-    return (reader.state.load(std::memory_order_acquire) & 3) ==
-           static_cast<std::uint64_t>(ReaderState::ACTIVE);
-  }
+  // Test-only hook (null in production, never set by non-test callers;
+  // mutated only via RegistrationPeer in ring_registration_test.cc): invoked
+  // by open() each time a loser yields while waiting for an existing
+  // kLifetimeReclaiming claim on `segment_id`.
+  static void (*on_reclaim_wait_)(std::uint64_t segment_id, int wait_count);
 
   // Whether reader slot `reader_id` still holds the word this queue claimed
   // it with. Another process that judged this one dead may have freed the
@@ -340,6 +359,17 @@ class RTMSQueue {
   // session-owned, or the session owner, unlinks it.
   void close() noexcept;
 
+  // register_reader()'s two steps for reader slot `reader_id`. The claim
+  // marks a free slot CLAIMING and starts its cursor at the writer's
+  // position, which it returns; nullopt when the slot is not free.
+  std::optional<std::uint64_t> claim_reader_slot(std::size_t reader_id);
+  // Marks a slot claimed at writer position `current` ACTIVE, false when the
+  // claim was lost meanwhile. When a writer that saw no active reader has
+  // published `slots` or more messages since the claim, the cursor's slot
+  // was overwritten or may be being overwritten: the cursor then moves to
+  // the writer.
+  bool activate_reader_slot(std::size_t reader_id, std::uint64_t current);
+
   // Chooses the sequence this reader should observe next and fills in how
   // many messages were skipped to reach it. Returns false when the reader is
   // caught up with the writer.
@@ -349,7 +379,7 @@ class RTMSQueue {
   // `message_sequence`, i.e. the bytes just read were not overwritten.
   bool slot_still_valid(std::uint64_t message_sequence) const;
 
-  const std::byte* slot_address(std::uint64_t message_sequence) const;
+  std::byte* slot_address(std::uint64_t message_sequence);
 
   // Notifies the wake receiver of each reader slot in `mask` that has one.
   void notify_readers(std::uint64_t mask);

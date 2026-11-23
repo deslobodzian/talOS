@@ -1,6 +1,6 @@
 // The /hw/status CAN bus table the bridge (and SimHardware) assembles from
 // the one bus slot each State reports: unit tier, no transport.
-#include "talOS/bridge/can_buses.h"
+#include "talOS/hardware/can_buses.h"
 
 #include <gtest/gtest.h>
 

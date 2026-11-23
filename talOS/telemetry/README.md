@@ -190,13 +190,19 @@ to 8 are the node's own.
 
    The labels travel as the channel's `labels`, like an enum's, so Studio
    and the dashboard show the routine's name and never read TOML. The node
-   reads `from` with `param_of`; construction is refused, naming the key
-   (`labels[<i>].channel` or `labels[<i>].from`), for a missing key, a
+   reads `from` with `param_of`; both node construction and the launcher's
+   phase-1 lint (`--describe-only` and launch, even when `telemetry` is
+   `critical = false`) refuse, naming the key (`labels`, `labels[<i>]`,
+   `labels[<i>].channel`, `labels[<i>].from`, or an unknown key), a
+   malformed `labels` value, an unknown key, a missing or non-string field, a
    `from` that is not `<subsystem>.<key>`, a subsystem the config lacks, a
    missing parameter, a value that is not a non-empty array of strings,
    more than 1024 labels or a label over the dictionary string limit, and,
    once the graph is known, a channel absent from the dictionary (excluded,
-   or in no state or status topic), not an integer, or already labelled.
+   or in no state or status topic), not an integer, or already labelled. The
+   lint reports those last three as warnings naming the nodes that did not
+   answer `--describe` when the declared graph is incomplete
+   ([launcher](../launcher/README.md#telemetry-labels-and-dashboard-layout)).
    The labels cost dictionary bytes only, nothing per tick.
 
 ## Dashboard layout
@@ -268,23 +274,32 @@ name, or one listed twice in a widget; a check with no condition or with
 distinct channels than the limits above; drive reservations over 80,000 B/s;
 and a budget below the worst case.
 
-**Against the dictionary.** The telemetry node parses the layout at
-construction, so a bad layout refuses the node: `talos_graph_test`, which
-requires every node described, fails, while `--describe-only` only warns
-that telemetry did not answer. Once the declared graph has built its
-dictionary, it also refuses, naming the file and the key, a channel the
+**Against the dictionary.** Both the telemetry node at construction and the
+launcher's phase-1 lint (`LintTelemetryConfig`, run by `--describe-only`,
+`talos_graph_test`, `deploy.sh install`, and every launch even when
+`telemetry` is `critical = false`) validate the layout via the shared
+`config_validation` and `dashboard_layout` checks, so an invalid layout is a
+hard error naming the file and key (unless overridden in simulation with
+`--sim --allow-graph-errors`). Once the declared graph has built its
+dictionary, they also refuse (the lint only warns, naming the nodes that did
+not answer `--describe`, while that graph is incomplete;
+[launcher](../launcher/README.md#telemetry-labels-and-dashboard-layout)),
+naming the file and the key, a channel the
 layout names that the dictionary lacks (excluded, or no state or status
 topic holds it), whether the key is required or optional:
 `widgets[<i>].<key>`, `widgets[<i>].channels[<k>]` for a graph,
 `widgets[<i>].items[<j>].channel` for a check, `widgets[<i>].pose` for a
 field's pose fields, and `widgets[<i>].kind` for a `match` or `power`
-widget's fixed channels. It then runs `CheckDashboardBudget` for the whole
+widget's fixed channels. They then run `CheckDashboardBudget` for the whole
 feed, every dictionary channel `DriveFeedChannels` carries: the named
-channels, the hardware bridge's `hw/status/alert_error_link_lost` (whatever
-the widgets, so the page can name a lost RoboRIO link; a graph without the
-bridge has no such channel and adds nothing) and, with an `alerts` widget,
-every alert channel of the dictionary, each counted once. The launcher's first `--describe` probe has no graph, so
-it checks only what the file alone decides.
+channels, the hardware bridge's `hw/status/alert_error_link_lost` and
+`hw/status/alert_error_protocol_mismatch` (whatever
+the widgets, so the page can name a protocol mismatch or a lost RoboRIO link;
+a graph without the bridge has no such channels and adds nothing) and, with an
+`alerts` widget, every alert channel of the dictionary, each counted once. The
+launcher's first `--describe` probe has no graph, so telemetry checks only
+what the file alone decides there, and the second pass and phase-1 lint check
+against the declared graph's dictionary.
 
 **Worst case.** One drive client can be sent, in a second,
 `update_hz` keyframes of the feed's channels plus two summaries and ten
@@ -305,7 +320,8 @@ At 20 Hz a 24,000 B/s budget covers 39 channels.
 
 **`/drive/layout.json`.** One object; every key present, defaults filled
 in, an unset optional number `null`, `"channels"` the sorted distinct
-channels the layout names plus `hw/status/alert_error_link_lost` (the named
+channels the layout names plus `hw/status/alert_error_link_lost` and
+`hw/status/alert_error_protocol_mismatch` (the named
 part of the drive feed's channel mask; a name the dictionary lacks is never
 sent), `"alerts"` whether the feed also carries every alert channel, `"file"`
 the layout's file
@@ -322,7 +338,8 @@ roles are the field names above, for `field` `x`, `y`, `yaw`, `valid`,
 {"version":1,"file":"dashboard.toml","title":"Drive","columns":12,"rows":8,
  "update_hz":20,"budget_bytes_per_s":24000,"drive_clients":2,"alerts":false,
  "channels":["autonomous/state/phase","autonomous/state/routine_index",
-             "hw/status/alert_error_link_lost"],
+             "hw/status/alert_error_link_lost",
+             "hw/status/alert_error_protocol_mismatch"],
  "widgets":[{"kind":"routine","at":[0,0,4,2],"title":"",
    "channels":{"channel":"autonomous/state/routine_index",
                "phase":"autonomous/state/phase"}}]}

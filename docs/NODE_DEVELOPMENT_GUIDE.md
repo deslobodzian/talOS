@@ -21,7 +21,7 @@ the constructor; `update()` runs every period.
 | `now().nanos()` | `node.now_ns` | the node clock in integer ns, for a message time such as `sample_time_ns` (`round(node.now * 1e9)` is exact only below 2^51 ns, 26 days of node clock) |
 | `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests) and in every offline run, `--log` or not (`--describe`, `--replay`, `--replay-inputs`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/`; state a node keeps per session or across restarts (an autonomous node's routine selection and progress, for one) is gated on it, so a replay never reads or writes the robot's copy |
 | `trajectory_path("name")` → `std::filesystem::path` | `node.trajectory_path("name")` → `str` | the absolute path of this subsystem's [`[trajectories]`](#parameters) entry; an undeclared name is an error naming the subsystem and `trajectories.<name>` |
-| `describing()` → `bool` | `node.describing` → `bool` | true only while the binary builds the node for `--describe`, the launcher's probe, which has a deadline (`--describe-timeout-ms`) and never runs `update()`, `every()` or a callback; false under `Sim`, `--sim`, `--replay` and on the robot (a `talos.cpp_node` shares its host's node). Use it to skip building heavy native backends (a pose estimator need not import wpimath or GTSAM then) and to open no device: the probe must touch no shared memory, hardware, network or camera. Validate every parameter and declare every subscription and publication either way: the endpoints must be identical, since the launcher builds the graph from the probe, and it [compares each run's live endpoints with the probe](../talOS/launcher/README.md#live-endpoints) and refuses a run that differs |
+| `describing()` → `bool` | `node.describing` → `bool` | true only while the binary builds the node for `--describe`, the launcher's probe, which has a deadline (`--describe-timeout-ms`) and never runs `update()`, `every()` or a callback; false under `Sim`, `--sim`, `--replay` and on the robot (a `talos.cpp_node` shares its host's node). Use it to skip building heavy native backends (a pose estimator need not import wpimath or GTSAM then) and to open no device: the probe must touch no shared memory, hardware, network or camera. Validate every parameter and declare every subscription, publication and `AllowUntargetedOutputs` opt-out either way: the endpoints must be identical, since the launcher builds the graph from the probe, [passes `--targeted-outputs` to every run of a targeted actuator node](../talOS/launcher/README.md#live-endpoints) (refusing `AllowUntargetedOutputs` at construction, restarts included) and compares each run's live endpoints with the probe |
 | `sub.value()`, `sub->field()`, `has_value()` | `sub.value` (`None` before the first), `has_value` | |
 | `sub.fresh()`, `fresh(max_age)`, `age()`, `updated()` | `sub.fresh()`, `fresh(max_age)`, `age`, `updated` | fresh: younger than `[robot] command_timeout_us` |
 | `pub.send(M{...})` | `pub.send(field=value, ...)` or `send(message)` | Python names every field, as the C++ constructor takes every one: an omitted field raises `TypeError` naming it (also for `TargetLane.send`, `sim.publish`, `sim.publish_target`) |
@@ -120,7 +120,9 @@ subsystem owns a motor, digital output or PWM output or which writes a target
 lane (`teleop`, a driver or autonomous node), is a control node; every other node
 (telemetry, cameras, a pose estimator, Python observers) is an observer.
 
-- Linux: `SCHED_FIFO` priority 49 for the bridge, 45 for control nodes and 40
+- Linux: `SCHED_FIFO` (with `SCHED_RESET_ON_FORK`, so forked child processes
+  and threads created later start at `SCHED_OTHER` instead of inheriting
+  `SCHED_FIFO`) priority 49 for the bridge, 45 for control nodes and 40
   for observers, so a runnable loop preempts every loop of a lower tier. All
   are below the `SCHED_FIFO` 50 PREEMPT_RT gives threaded interrupt handlers
   (among them the NIC's, which carries the RoboRIO's packets), so no loop
@@ -183,12 +185,14 @@ production policy, against a simulated gateway (which itself never runs
 realtime) (`talOS/process` `RealtimeRequested`). Nodes and the bridge
 inherit the variable from the launcher.
 
-A thread the node starts must not run at the loop's priority. On Linux a
-thread created after the loop thread went realtime inherits `SCHED_FIFO`, so
-an unbounded helper (capture, detection, encoding) would preempt every control
-loop; under timeshare (`--sim`) it competes with them as an equal. A helper
+A thread the node starts must not run at the loop's priority. On Linux
+`ConfigureRealtime` passes `SCHED_RESET_ON_FORK`, so children and threads
+created afterwards start at `SCHED_OTHER` (with any negative nice reset to 0)
+rather than inheriting `SCHED_FIFO`; without `ConfigureBackgroundThread()`, an
+unbounded helper (capture, detection, encoding) still competes at normal
+priority with timeshare (`--sim`) loops. A helper
 thread calls `talos::process::ConfigureBackgroundThread()` first: on Linux it
-leaves an inherited realtime policy for `SCHED_OTHER` at nice
+leaves any inherited realtime policy for `SCHED_OTHER` at nice
 `kBackgroundNice` (10), which threads it creates inherit; on macOS it sets
 `QOS_CLASS_UTILITY`, which new threads do not inherit, so each thread calls it
 itself (a dispatch queue takes the QoS in its attributes). In the vision
@@ -271,11 +275,11 @@ Handles are named by their device key in the subsystem config
 | `CANcoder`, `Gyro` (`yaw`, `yaw_rate`), `Encoder`, `DigitalInput` (`get()`), `AnalogInput` (`voltage()`), `DigitalOutput`, `PwmOutput` (`set()`, `stop()`) | same names; `DigitalInput.value`; DIO/PWM commands, like motor commands, are gated on `robot_enabled` and a live `Target` (false/off while disabled, while state is stale, and in a tick in which no `Target` returned a target: see [Targets](#targets)). A PWM output's neutral is off, no pulse: a servo goes limp and a PWM motor controller sees no signal. `set(0.0)` is the 1.5 ms centre pulse, which holds a motor controller at neutral but drives a servo to centre, so it counts as actuation; `stop()`, a non-finite `set()` and not setting it in `update()` send no pulse |
 | `talos::DriverStation ds{node}`: `connected()`, `enabled()`, `autonomous()`, `teleop()`, `test()`, `estop()`, `alliance()`, `match_time()`, `joystick(port)` → `axis(i)`, `button(n)` (1-based), `pov(i)` | `talos.DriverStation(node)`, same as properties/methods |
 | `talos::robot_enabled(node)` | `talos.robot_enabled(node)` |
-| `talos::AllowUntargetedOutputs(node)` (constructor only; a test or bench fixture with no producer): outputs drive on `robot_enabled` alone, and `--describe` marks the hardware request `untargeted_outputs` | `talos.allow_untargeted_outputs(node)` (in `__init__`; later raises `TalosError`) |
+| `talos::AllowUntargetedOutputs(node)` (constructor only; a test or bench fixture with no producer): outputs drive on `robot_enabled` alone, and `--describe` marks the hardware request `untargeted_outputs`. Refused with `std::logic_error` after construction or when the binary is started with `--targeted-outputs` (passed by the launcher whenever `--describe` declared a `hardware_request` without `untargeted_outputs`, unless `--allow-graph-errors` is set; ignored under `--describe`) | `talos.allow_untargeted_outputs(node)` (in `__init__`; later or under `--targeted-outputs` raises `TalosError`) |
 | `node.extension<talos::HardwareLink>().sample_time()`: node-clock `Time` the latest hardware state was sampled at, `nullopt` while stale or before the bridge's clock mapping converges (8 states) | `talos.hardware_sample_time_ns(node)` (int ns, or `None`) |
-| `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
+| `node.extension<talos::HardwareLink>().enabled()`, `.fresh()` / `.fresh(max_age)`, and `.age()` | `link = talos.HardwareLink(node)`; `link.enabled`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
 | `Motor` / `CANcoder`: `position_time()`, `velocity_time()`; `Gyro`: `yaw_time()`, `yaw_rate_time()` | same names as properties: integer node-clock nanoseconds, or `None` |
-| `Motor`: `position_age()`, `velocity_age()`: the sample's age at the State it arrived in, `std::optional<Duration>`, read from that State (no clock mapping needed); `nullopt` unless `connected()` or when the age is unknown | same names as properties: integer nanoseconds, or `None` |
+| `Motor` / `CANcoder`: `position_age()`, `velocity_age()`: the sample's age at the State it arrived in, `std::optional<Duration>`, read from that State (no clock mapping needed); `nullopt` unless `connected()` or when the age is unknown | same names as properties: integer nanoseconds, or `None` |
 
 Actuator flush and disable semantics are in
 [Architecture: The tick](../ARCHITECTURE.md#the-tick).
@@ -352,9 +356,9 @@ one status period old when the RoboRIO reads it; the second period absorbs
 jitter. A refused rezero changes nothing (`zeroed()` stays as it was), so a
 homing node calls it again on a later tick, as `PositionMechanism` does.
 `PositionMechanism`'s absolute homing also requires the CANcoder and motor
-positions it combines to have been acquired within the same bound of each
-other (`position_time()`, so not before the bridge's clock mapping
-converges).
+positions it combines to have sample ages (`position_age()`, read from the
+same State) within the same bound of each other, so it does not wait for
+the bridge's clock mapping either.
 Motor position and gyro yaw subtract the offset; velocity/rate are unchanged.
 Motor position and motion-magic goals translate back to hardware coordinates
 before clamping. Configured soft limits remain in the **hardware frame**,
@@ -408,7 +412,7 @@ Signal acquisition times subtract the signal's existing gateway age (microsecond
 from the mapped hardware State time. They are available while disabled, but
 absent for disconnected feedback, unknown age (`UINT32_MAX`), stale hardware or
 stale/invalid bridge clock mapping. They retain `sample_time()`'s reported
-two-way clock uncertainty (`/hw/status/clock_offset_uncertainty_us`, assuming
+two-way clock uncertainty (`/hw/status` `clock_offset_uncertainty_us`, assuming
 <=1000 ppm relative clock drift); they do not interpolate measurements.
 Software rezero does not change these timestamps.
 `SimHardware.set_motor`, `.set_cancoder` accept optional `position_age_us`,
@@ -433,7 +437,7 @@ mode generations and policy defaults. API:
 | `target_.source()`: `"teleop"`, `"auto"`, ... or `""` | `target.source` |
 | `talos::TargetLane<M> lane_{node, "wrist", "auto"}`: `send(M{...})` (stamped with this node's mode generation), `release()` | `talos.TargetLane(node, M, "wrist", "auto")`: `send(field=...)` or `send(message)`, `release()` |
 | `talos::OperatorArming arming_{node}`; `talos::TargetLane<M> lane_{node, "climber", "operator", arming_}`: `send()` goes out as a release (and returns false) while `arming_.armed()` is false | `talos.OperatorArming(node)`; `talos.TargetLane(node, M, "climber", "operator", arming=arming)` |
-| `arming_.evaluate(neutral)` on every reading of the inputs: true when this reading may publish; otherwise a neutral reading arms it at once (a send on that neutral reading is active). `disarm()` for producer-specific reasons (a joystick reconnecting) | `arming.evaluate(neutral)`, `arming.armed`, `arming.disarm()` |
+| `arming_.evaluate(neutral)` (or `arming_.evaluate(neutral, ArmingBlocker{kind, port, index})`) on every reading of the inputs: true when this reading may publish; otherwise a neutral reading arms it at once (a send on that neutral reading is active). `arming_.blocker()` returns the recorded `ArmingBlocker` while disarmed and `{kNone, -1, -1}` once armed or neutral (zero allocation). `disarm()` for producer-specific reasons (a joystick reconnecting) | `arming.evaluate(neutral, blocker=None)`, `arming.armed`, `arming.blocker`, `arming.disarm()` (`talos.ArmingBlocker`, `talos.ArmingInputKind`) |
 
 A producer that maps operator input (joysticks, a button board) opens its
 lanes with an `OperatorArming`, so a control held through a disable, reboot,
@@ -588,7 +592,11 @@ Which cases every node tests, and how: [TESTING.md](TESTING.md#7-the-node-test-m
 
 `talos::testing::Sim` (`//talOS/node:testing`) runs nodes on one simulated clock
 with in-memory topics; `talos::testing::SimHardware` (`//talOS/devices:testing`)
-stands in for the bridge.
+stands in for the bridge. `sim.remove(name)` stops and destroys a hosted node,
+and `sim.add` may be called after `step()` (including to re-add a removed name)
+to model a node restart: a node added mid-run starts its clock at `sim.now()`,
+fires its first periodic timer at `sim.now() + period`, and receives only
+messages published after it attached.
 
 ```cpp
 Sim sim{config_path};                 // or Sim::FromToml(inline_toml)
@@ -624,7 +632,7 @@ explicitly requested value; `pwm` and `applied_pwm` return the pulse
 (`std::optional<double>`, Python `float`), 0 being the centre pulse, or
 `std::nullopt` (`None`) for no pulse. Use `applied_motor`, `applied_digital_output`, and
 `applied_pwm` to inspect effective outputs: requests merge by the bridge's
-rules (`//talOS/bridge:merge`), so a node's outputs go neutral at its
+rules (`//talOS/hardware:merge`), so a node's outputs go neutral at its
 [owner timeout](../ARCHITECTURE.md#the-tick) and every output stops, as the
 gateway's do, once the oldest observation of any node still merged is
 `command_timeout_us` old; omitted outputs are neutral, and disabled hardware
@@ -649,8 +657,8 @@ velocity below `0.01 rps` snaps to zero. Position continues integrating during
 decay. Python exposes the same accessors.
 
 Python: `from talos.testing import Sim, SimHardware` (`//talOS/python:testing`),
-the same methods (`Sim.from_toml`, `sim.step(seconds)`,
-`sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`,
+the same methods (`Sim.from_toml`, `sim.add(Cls, name)`, `sim.remove(name)`,
+`sim.step(seconds)`, `sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`,
 `sim.publish_target(M, sub, source, **fields)`, `sim.release_target(M, sub,
 source)`, `sim.latest_target(M, sub, source)`, `hw.set_driver_station(enabled=True,
 teleop=True)`, `hw.stop_driver_station()`, `sim.latest_bytes(topic)`). The

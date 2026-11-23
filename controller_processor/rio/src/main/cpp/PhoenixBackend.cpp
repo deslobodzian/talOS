@@ -15,6 +15,7 @@
 #include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
 #include <ctre/phoenix6/controls/VelocityVoltage.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
+#include <exception>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -23,6 +24,9 @@
 
 #ifndef __FRC_ROBORIO__
 #include <frc/simulation/RoboRioSim.h>
+#include <units/angular_acceleration.h>
+#include <units/angular_velocity.h>
+#include <units/moment_of_inertia.h>
 #include <units/voltage.h>
 
 #include "hardware/sim_backend.h"
@@ -105,8 +109,8 @@ double TorqueDutyCap(double max_voltage, double battery_v) {
 
 // Posts a feedback validity change: the loop thread only copies it.
 void LogFeedbackChange(talos::rio::RioLog& log, talos::rio::LogKind kind,
-                       std::size_t index, const std::string& name, uint16_t id,
-                       const std::string& bus, int can_id, bool valid,
+                       std::size_t index, std::string_view name, uint16_t id,
+                       std::string_view bus, int can_id, bool valid,
                        const ph::BaseStatusSignal& p,
                        const ph::BaseStatusSignal& v) {
   talos::rio::LogEvent event;
@@ -130,8 +134,8 @@ void LogFeedbackChange(talos::rio::RioLog& log, talos::rio::LogKind kind,
 // gateway's bound changes no validity, so this line is what shows it.
 // Loop thread: a copy into the queue, never a write.
 void NoteLateness(talos::rio::RioLog& log, talos::rio::LogKind kind,
-                  std::size_t index, const std::string& name, uint16_t id,
-                  const std::string& bus, int can_id, uint32_t late_us,
+                  std::size_t index, std::string_view name, uint16_t id,
+                  std::string_view bus, int can_id, uint32_t late_us,
                   const ph::BaseStatusSignal& p, const ph::BaseStatusSignal& v,
                   bool& late, uint32_t& peak_age_us) {
   const uint32_t age_us = std::max(Age(p), Age(v));
@@ -170,26 +174,50 @@ ctre::phoenix::StatusCode Retry(Call call) {
   return status;
 }
 
-// Desktop-sim neutral decay time constants (rotor velocity, first order).
-// Neutral removes drive but keeps momentum: brake shorts the windings and
-// stops the rotor quickly, coast lets the load roll on. Matches the unpowered
-// branch of talos::hardware::sim::StepAxis (talOS/hardware/sim_physics.h), so
-// disable-time behaviour agrees between the two simulators.
-constexpr double kSimNeutralBrakeTauS = 0.05;
+#ifndef __FRC_ROBORIO__
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kTau = 2.0 * kPi;
+// Rotor-side inertia reflected through each motor's gear ratio (J_mech =
+// J_rotor * gear_ratio^2), giving a ~44.5 ms electrical time constant for a
+// Kraken X60 across gearing ratios.
+constexpr double kSimRotorInertiaKgM2 = 0.0005;
+// Open-circuit viscous coast time constant when neutral with brake = false.
+// Brake neutral instead steps WPILib's DCMotorSystem with u = {0 V} (shorted
+// windings back-EMF braking).
 constexpr double kSimNeutralCoastTauS = 1.0;
 // Friction holds a nearly-stopped unpowered rotor instead of creeping forever
-// (same standstill snap as StepAxis).
+// (same standstill snap as sim_physics.h StepAxis).
 constexpr double kSimNeutralStandstillRps = 0.01;
+// Minimum supply voltage Phoenix 6 simulation accepts without clamping.
+constexpr double kSimMinSupplyV = 4.0;
+// Default wheel radius (4 in wheel) and half-span (0.60 m trackwidth / ±0.30 m
+// swerve corners), matching talOS/hardware/sim_physics.h.
+constexpr double kSimWheelRadiusM = 0.0508;
+constexpr double kSimChassisHalfSpanM = 0.30;
+
+frc::DCMotor MakeSimDcMotor(const hw::MotorConfig& m) {
+  switch (m.motor_type.value) {
+    case hw::MotorType::kKrakenX44:
+      return m.foc ? frc::DCMotor::KrakenX44FOC(1) : frc::DCMotor::KrakenX44(1);
+    case hw::MotorType::kFalcon500:
+      return m.foc ? frc::DCMotor::Falcon500FOC(1) : frc::DCMotor::Falcon500(1);
+    case hw::MotorType::kKrakenX60:
+    default:
+      return m.foc ? frc::DCMotor::KrakenX60FOC(1) : frc::DCMotor::KrakenX60(1);
+  }
+}
+#endif
 // The slowest a master's output status signal may run under a Phoenix
 // Follower ("no slower than 20 Hz", controls/Follower.hpp).
 constexpr double kFollowerSignalMinHz = 20.0;
 // RioLog kMessage indices (rate-limit keys) of this file's lines; Robot.cpp
-// uses 1 to 6, LoopConsole 9 to 11. A licence refusal's line is keyed by its
+// uses 1 to 6, LoopConsole 9 to 12. A licence refusal's line is keyed by its
 // motor (16 to 31),
 // so the logger coalesces no motor's line into another's.
 constexpr uint16_t kConfigureFailedMessage = 0;
 constexpr uint16_t kCanBusStatusMessage = 7;
 constexpr uint16_t kCanBusReaderMessage = 8;
+constexpr uint16_t kRestoreFailedMessage = 13;
 constexpr uint16_t kProLicenceRefusedMessage = 16;
 static_assert(kProLicenceRefusedMessage + hw::kMaxMotors <= 32);
 
@@ -255,6 +283,42 @@ void LogCanBusStatus(talos::rio::RioLog& log, std::string_view bus,
   }
   log.Post(event);
 }
+
+// Records an exception from Configure() or its future as a failed configure
+// without letting a secondary exception escape onto the SCHED_FIFO loop thread.
+void RecordConfigureException(std::optional<hw::ConfigError>& last_error,
+                              talos::rio::RioLog& log,
+                              const char* detail) noexcept {
+  try {
+    hw::ConfigError err;
+    err.device_name = "phoenix";
+    err.operation = "configure";
+    err.message = (detail != nullptr && detail[0] != '\0')
+                      ? detail
+                      : "unexpected exception";
+    last_error = err;
+    talos::rio::LogEvent event;
+    event.index = kConfigureFailedMessage;
+    event.SetText("[phoenix] " + hw::FormatConfigError(err));
+    log.Post(event);
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // Never let a secondary exception (e.g. bad_alloc) escape.
+  }
+}
+
+// Logs an exception from BeginRestoreAfterReset() or PollRestore() without
+// heap allocation on the SCHED_FIFO loop thread or letting any exception
+// escape.
+void LogRestoreException(talos::rio::RioLog& log, const char* detail) noexcept {
+  talos::rio::LogEvent event;
+  event.index = kRestoreFailedMessage;
+  const char* message = (detail != nullptr && detail[0] != '\0')
+                            ? detail
+                            : "unexpected exception";
+  std::snprintf(event.text, sizeof event.text, "[phoenix] restore failed: %s",
+                message);
+  log.Post(event);
+}
 }  // namespace
 
 PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
@@ -270,6 +334,8 @@ PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
                      log_->Post(event);
                    }},
       is_simulation_{is_simulation} {
+  unavailable_.reserve(hw::kMaxMotors + hw::kMaxSensors);
+  restoring_ids_.reserve(hw::kMaxMotors + hw::kMaxSensors);
   if (owned_log_) owned_log_->Start();
 #ifndef __FRC_ROBORIO__
   // WPILib's simulated battery defaults to 12 V, below a pre-match battery
@@ -285,15 +351,40 @@ std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
 }
 
 void PhoenixBackend::BeginConfigure(const hw::Config& config) {
-  configure_ = std::async(std::launch::async,
-                          [this, config] { return Configure(config); });
+  try {
+    configure_ = std::async(std::launch::async, [this, config] {
+      try {
+        return Configure(config);
+      } catch (const std::exception& e) {
+        RecordConfigureException(last_error_, *log_, e.what());
+        return false;
+      } catch (...) {
+        RecordConfigureException(last_error_, *log_, "unknown exception");
+        return false;
+      }
+    });
+  } catch (const std::exception& e) {
+    configure_ = {};
+    RecordConfigureException(last_error_, *log_, e.what());
+  } catch (...) {
+    configure_ = {};
+    RecordConfigureException(last_error_, *log_, "unknown exception");
+  }
 }
 
 PhoenixBackend::ConfigureStatus PhoenixBackend::PollConfigure() {
   if (!configure_.valid()) return ConfigureStatus::kFailed;
   if (configure_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
     return ConfigureStatus::kPending;
-  return configure_.get() ? ConfigureStatus::kDone : ConfigureStatus::kFailed;
+  try {
+    return configure_.get() ? ConfigureStatus::kDone : ConfigureStatus::kFailed;
+  } catch (const std::exception& e) {
+    RecordConfigureException(last_error_, *log_, e.what());
+    return ConfigureStatus::kFailed;
+  } catch (...) {
+    RecordConfigureException(last_error_, *log_, "unknown exception");
+    return ConfigureStatus::kFailed;
+  }
 }
 
 bool PhoenixBackend::Configure(const hw::Config& c) {
@@ -306,6 +397,10 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   const std::lock_guard devices_lock{devices_mutex_};
   restore_operations_.clear();
   unavailable_.clear();
+  unavailable_.reserve(hw::kMaxMotors + hw::kMaxSensors);
+  restoring_ids_.clear();
+  restoring_ids_.reserve(hw::kMaxMotors + hw::kMaxSensors);
+  restore_launch_failed_ = false;
   foc_unlicensed_.clear();
   signal_ids_.clear();
   last_error_.reset();
@@ -324,9 +419,8 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   last_brownout_ = false;
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
-  const auto note_failure = [this](const std::string& name,
-                                   const std::string& bus, int can_id,
-                                   const std::string& operation,
+  const auto note_failure = [this](std::string_view name, std::string_view bus,
+                                   int can_id, const std::string& operation,
                                    const ctre::phoenix::StatusCode& code) {
     if (code.IsOK()) return true;
     uint16_t id = 0;
@@ -360,12 +454,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   rio_encoders_.clear();
   pwm_outputs_.clear();
 
-  sim_rotor_velocity_.fill(0.0);
-  sim_rotor_position_.fill(0.0);
-  motor_to_sensor_map_.fill(-1);
   sim_neutral_.fill(true);
-  sim_yaw_deg_ = 0.0;
-  last_sim_time_ = std::nullopt;
 
   for (const auto& d : c.digital_inputs) {
     digital_inputs_.push_back(std::make_unique<frc::DigitalInput>(d.dio));
@@ -546,17 +635,17 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   licence_read_.fill(false);
   foc_unlicensed_.reserve(hw::kMaxMotors);
   bool first_error_posted = false;
-  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+  const auto check_licence = [&](std::size_t i) {
     const auto& m = c.motors[i];
     const bool master_foc =
         m.master_id != 0 &&
         std::any_of(c.motors.begin(), c.motors.end(), [&](const auto& other) {
           return other.id == m.master_id && other.foc;
         });
-    if (!m.foc && !master_foc) continue;
+    if (!m.foc && !master_foc) return;
     restore_operations_.push_back(
         {m.id, [this, i] { return RestoreProLicence(i); }});
-    if (licence_refused_[i]) continue;  // Its master's refusal took it.
+    if (licence_refused_[i]) return;  // Its master's refusal took it.
     ctre::phoenix::StatusCode status;
     const auto licensed = ReadProLicence(i, status);
     if (!licensed) {
@@ -567,44 +656,25 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       RefuseProLicence(i, true);
       first_error_posted |= !had_error && last_error_.has_value();
     }
+  };
+  // Pass 1: check masters before followers so a follower preceding its
+  // unlicensed foc master in config.motors is never read itself
+  // (REQ-CONTRACT-39) and its restore op runs after its master's.
+  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+    if (c.motors[i].master_id == 0) check_licence(i);
   }
-  for (std::size_t i = 0; i < c.motors.size(); ++i)
-    if (licence_refused_[i]) foc_unlicensed_.push_back(c.motors[i].id);
+  // Pass 2: check followers of foc masters not already refused with their
+  // master.
+  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+    if (c.motors[i].master_id != 0) check_licence(i);
+  }
   GroupSignalsByNetwork(c);
 
+#ifndef __FRC_ROBORIO__
   if (is_simulation_) {
-    for (auto& motor : motors_) {
-      auto& sim = motor->GetSimState();
-      sim.SetSupplyVoltage(12_V);
-      sim.SetRawRotorPosition(0_tr);
-      sim.SetRotorVelocity(0_tps);
-    }
-    for (auto& device : sensors_) {
-      if (device.encoder) {
-        auto& sim = device.encoder->GetSimState();
-        sim.SetSupplyVoltage(12_V);
-        sim.SetRawPosition(0_tr);
-        sim.SetVelocity(0_tps);
-      } else if (device.imu) {
-        auto& sim = device.imu->GetSimState();
-        sim.SetSupplyVoltage(12_V);
-        sim.SetRawYaw(0_deg);
-      }
-    }
-    for (std::size_t m_idx = 0;
-         m_idx < c.motors.size() && m_idx < motor_to_sensor_map_.size();
-         ++m_idx) {
-      const auto& m = c.motors[m_idx];
-      if (m.feedback == hw::Feedback::kRemoteCANcoder) {
-        for (std::size_t s_idx = 0; s_idx < c.sensors.size(); ++s_idx) {
-          if (c.sensors[s_idx].id == m.feedback_sensor_id) {
-            motor_to_sensor_map_[m_idx] = static_cast<int>(s_idx);
-            break;
-          }
-        }
-      }
-    }
+    ConfigureSimulation(c);
   }
+#endif
 
   for (std::size_t i = 0; i < signals_.size(); ++i) {
     auto* signal = signals_[i];
@@ -682,6 +752,11 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     restore_operations_.push_back(
         {s.id, [operation] { return operation().IsOK(); }});
   }
+  // A licence refusal is permanent until the next Configure: populate
+  // foc_unlicensed_ and erase every refused motor (and follower) from
+  // unavailable_ so no failed config or signal-rate apply leaves it churning
+  // the restore loop.
+  SyncUnlicensedAndPruneUnavailable();
   // A licence refusal posted its own line already.
   if (!ok && last_error_ && !first_error_posted) {
     const auto& error = *last_error_;
@@ -784,6 +859,21 @@ bool PhoenixBackend::RestoreProLicence(std::size_t index) {
   return true;
 }
 
+void PhoenixBackend::SyncUnlicensedAndPruneUnavailable() {
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    const uint16_t id = config_.motors[i].id;
+    if (licence_refused_[i] &&
+        std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), id) ==
+            foc_unlicensed_.end()) {
+      foc_unlicensed_.push_back(id);
+    }
+  }
+  std::erase_if(unavailable_, [this](uint16_t id) {
+    return std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), id) !=
+           foc_unlicensed_.end();
+  });
+}
+
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
   const PhaseTimer timer{*log_, talos::rio::TickPhase::kDevices};
   // HasResetOccurred reports (and clears) one device's reset latch.
@@ -827,58 +917,110 @@ bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
 }
 
 void PhoenixBackend::BeginRestoreAfterReset(std::span<const uint16_t> ids) {
-  restoring_ids_.assign(ids.begin(), ids.end());
+  restore_launch_failed_ = false;
+  restoring_ids_.clear();
+  const auto restoring_contains = [&](uint16_t id) {
+    return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
+           restoring_ids_.end();
+  };
+  for (const uint16_t id : ids) {
+    if (!restoring_contains(id) &&
+        restoring_ids_.size() < restoring_ids_.capacity()) {
+      restoring_ids_.push_back(id);
+    }
+  }
   // Re-apply the affected control chain, never unrelated device settings.
   for (std::size_t pass = 0; pass < config_.motors.size(); ++pass) {
     for (const auto& motor : config_.motors) {
-      const auto contains = [&](uint16_t id) {
-        return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
-               restoring_ids_.end();
-      };
-      if (!contains(motor.id) &&
-          ((motor.master_id != 0 && contains(motor.master_id)) ||
+      if (!restoring_contains(motor.id) &&
+          ((motor.master_id != 0 && restoring_contains(motor.master_id)) ||
            (motor.feedback == hw::Feedback::kRemoteCANcoder &&
-            contains(motor.feedback_sensor_id))))
+            restoring_contains(motor.feedback_sensor_id))) &&
+          restoring_ids_.size() < restoring_ids_.capacity()) {
         restoring_ids_.push_back(motor.id);
+      }
     }
   }
-  for (auto id : restoring_ids_) {
+  for (const uint16_t id : restoring_ids_) {
     if (std::find(unavailable_.begin(), unavailable_.end(), id) ==
-        unavailable_.end())
+            unavailable_.end() &&
+        unavailable_.size() < unavailable_.capacity()) {
       unavailable_.push_back(id);
-  }
-  restore_ = std::async(std::launch::async, [this, ids = restoring_ids_] {
-    std::vector<uint16_t> failures;
-    for (const auto& operation : restore_operations_) {
-      if (std::find(ids.begin(), ids.end(), operation.id) == ids.end())
-        continue;
-      if (!operation.apply() && std::find(failures.begin(), failures.end(),
-                                          operation.id) == failures.end())
-        failures.push_back(operation.id);
     }
-    return failures;
-  });
+  }
+  hw::FixedVector<uint16_t, hw::kMaxMotors + hw::kMaxSensors> worker_ids;
+  for (const uint16_t id : restoring_ids_) {
+    if (worker_ids.size() < worker_ids.capacity()) worker_ids.push_back(id);
+  }
+  auto work = [this,
+               ids = worker_ids]() -> std::optional<std::vector<uint16_t>> {
+    try {
+      std::vector<uint16_t> failures;
+      for (const auto& operation : restore_operations_) {
+        if (std::find(ids.begin(), ids.end(), operation.id) == ids.end())
+          continue;
+        if (!operation.apply() && std::find(failures.begin(), failures.end(),
+                                            operation.id) == failures.end()) {
+          failures.push_back(operation.id);
+        }
+      }
+      return failures;
+    } catch (const std::exception& e) {
+      LogRestoreException(*log_, e.what());
+      return std::nullopt;
+    } catch (...) {
+      LogRestoreException(*log_, "unknown exception");
+      return std::nullopt;
+    }
+  };
+  try {
+    restore_ = launch_restore_
+                   ? launch_restore_(std::move(work))
+                   : std::async(std::launch::async, std::move(work));
+  } catch (const std::exception& e) {
+    restore_ = {};
+    restore_launch_failed_ = true;
+    LogRestoreException(*log_, e.what());
+  } catch (...) {
+    restore_ = {};
+    restore_launch_failed_ = true;
+    LogRestoreException(*log_, "unknown exception");
+  }
 }
 
 PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
+  if (restore_launch_failed_) {
+    restore_launch_failed_ = false;
+    return RestoreStatus::kFailed;
+  }
   if (!restore_.valid()) return RestoreStatus::kDone;
   if (restore_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
     return RestoreStatus::kPending;
-  const auto failures = restore_.get();
+  std::optional<std::vector<uint16_t>> failures;
+  try {
+    failures = restore_.get();
+  } catch (const std::exception& e) {
+    restore_ = {};
+    LogRestoreException(*log_, e.what());
+    SyncUnlicensedAndPruneUnavailable();
+    return RestoreStatus::kFailed;
+  } catch (...) {
+    restore_ = {};
+    LogRestoreException(*log_, "unknown exception");
+    SyncUnlicensedAndPruneUnavailable();
+    return RestoreStatus::kFailed;
+  }
   // A licence the restore read unlicensed fails its motor before the motor
   // leaves unavailable_, so it is never reported valid in between. Reserved
   // at Configure: no allocation on the loop thread.
-  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-    const uint16_t id = config_.motors[i].id;
-    if (licence_refused_[i] &&
-        std::find(foc_unlicensed_.begin(), foc_unlicensed_.end(), id) ==
-            foc_unlicensed_.end())
-      foc_unlicensed_.push_back(id);
+  SyncUnlicensedAndPruneUnavailable();
+  if (!failures.has_value()) {
+    return RestoreStatus::kFailed;
   }
   std::erase_if(unavailable_, [this, &failures](uint16_t id) {
     return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
                restoring_ids_.end() &&
-           std::find(failures.begin(), failures.end(), id) == failures.end();
+           std::find(failures->begin(), failures->end(), id) == failures->end();
   });
   return RestoreStatus::kDone;
 }
@@ -903,6 +1045,7 @@ bool PhoenixBackend::Read(hw::State& s) {
   s.health.can_bus = can_health_.Slot(s.health.can_bus_index);
   uint64_t refresh_start_ns = NowNs();
   log_->AddPhase(TickPhase::kHealth, refresh_start_ns - read_start_ns);
+#ifndef __FRC_ROBORIO__
   if (is_simulation_) {
     const auto now = std::chrono::steady_clock::now();
     double dt =
@@ -916,6 +1059,7 @@ bool PhoenixBackend::Read(hw::State& s) {
     log_->AddPhase(TickPhase::kOther, simulated_ns - refresh_start_ns);
     refresh_start_ns = simulated_ns;
   }
+#endif
   // One RefreshAll per CAN network: Phoenix refreshes nothing for a call
   // whose signals span two (GroupSignalsByNetwork).
   for (std::size_t g = 0; g < refresh_group_count_; ++g) {
@@ -1108,7 +1252,7 @@ bool PhoenixBackend::Read(hw::State& s) {
       const bool connected = dev.duty_cycle->IsConnected();
       const double pos = dev.duty_cycle->Get() - dev.config.offset_rot;
       double vel = 0.0;
-      if (connected) {
+      if (connected && std::isfinite(pos)) {
         const auto now = std::chrono::steady_clock::now();
         if (dev.last_time && now > *dev.last_time) {
           const double dt =
@@ -1248,7 +1392,8 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
                            !feedback_valid;
       sim_neutral_[i] = neutral;
       if (neutral) {
-        result = m.SetControl(ph::controls::NeutralOut{});
+        result =
+            m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
       } else {
         result = m.SetControl(
             ph::controls::Follower{master->can_id, config.oppose_master}
@@ -1260,7 +1405,8 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
     sim_neutral_[i] = r.mode == hw::Mode::kNeutral;
     switch (r.mode) {
       case hw::Mode::kNeutral:
-        result = m.SetControl(ph::controls::NeutralOut{});
+        result =
+            m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
         break;
       case hw::Mode::kDutyCycle:
         result = m.SetControl(ph::controls::DutyCycleOut{r.demand}
@@ -1306,7 +1452,8 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
         // neutralized is this motor's neutral here too.
         if (!hw::TorqueCurrentAllowed(config, r)) {
           sim_neutral_[i] = true;
-          result = m.SetControl(ph::controls::NeutralOut{});
+          result =
+              m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
           break;
         }
         result = m.SetControl(
@@ -1396,55 +1543,291 @@ bool PhoenixBackend::WatchdogNeutral() {
   return sent;
 }
 
-void PhoenixBackend::UpdateSimulation(double dt) {
-  for (std::size_t i = 0; i < motors_.size(); ++i) {
-    const auto& m_cfg = config_.motors[i];
-    auto& sim = motors_[i]->GetSimState();
+#ifndef __FRC_ROBORIO__
+void PhoenixBackend::ConfigureSimulation(const hw::Config& c) {
+  motor_to_sensor_map_.fill(-1);
+  sim_chassis_module_count_ = 0;
+  sim_yaw_deg_ = 0.0;
+  last_sim_time_ = std::nullopt;
+
+  const double battery_v = frc::RobotController::GetBatteryVoltage().value();
+  const double supply_v = (std::isfinite(battery_v) && battery_v > 0.0)
+                              ? std::max(battery_v, kSimMinSupplyV)
+                              : hw::kSimRestingSupplyV;
+  last_sim_supply_v_ = supply_v;
+
+  for (std::size_t i = 0; i < motors_.size() && i < sim_plants_.size(); ++i) {
+    const auto& m = c.motors[i];
     double gear_ratio =
-        m_cfg.rotor_to_sensor_ratio * m_cfg.sensor_to_mechanism_ratio;
-    if (gear_ratio <= 0.0) gear_ratio = 1.0;
+        m.feedback == hw::Feedback::kRemoteCANcoder
+            ? m.rotor_to_sensor_ratio * m.sensor_to_mechanism_ratio
+            : m.sensor_to_mechanism_ratio;
+    if (!std::isfinite(gear_ratio) || gear_ratio <= 0.0) gear_ratio = 1.0;
+    const units::kilogram_square_meter_t j_mech{kSimRotorInertiaKgM2 *
+                                                gear_ratio * gear_ratio};
+    sim_plants_[i] = SimMotorPlant{frc::LinearSystemId::DCMotorSystem(
+                                       MakeSimDcMotor(m), j_mech, gear_ratio),
+                                   frc::Vectord<2>::Zero(), gear_ratio};
 
-    // Voltage is the only driver (Kraken X60 free speed: 100 rps at 12 V).
-    // A closed-loop request with missing gains produces ~0 V, so the rotor
-    // coasts to a stop here instead of jumping to the requested demand. Never
-    // consult the request demand for physics: that shortcut hides bad tuning.
-    // Neutral is unpowered: velocity decays per the brake config and the
-    // position keeps integrating while the rotor rolls on. Under
-    // TorqueCurrentFOC Phoenix reports the volts its current loop applies
-    // against this rotor's speed, up to the duty cap, so a demand
-    // accelerates the rotor; at 0 A it reports 0 V, and this model then
-    // stops the rotor (talOS/hardware/README.md says what is known of 0 A).
-    double target_rotor_rps = 0.0;
-    double tau = 0.01;
-    if (sim_neutral_[i]) {
-      tau = m_cfg.brake ? kSimNeutralBrakeTauS : kSimNeutralCoastTauS;
-    } else {
-      const double volts = sim.GetMotorVoltage().value();
-      target_rotor_rps = (volts / 12.0) * 100.0;
+    auto& sim = motors_[i]->GetSimState();
+    // Phoenix 6 TalonFXSimState::MotorType only defines KrakenX60 and
+    // KrakenX44 (no Falcon500); WPILib's DCMotorSystem models Falcon500 via
+    // MakeSimDcMotor().
+    sim.SetMotorType(m.motor_type.value == hw::MotorType::kKrakenX44
+                         ? ph::sim::TalonFXSimState::MotorType::KrakenX44
+                         : ph::sim::TalonFXSimState::MotorType::KrakenX60);
+    sim.SetSupplyVoltage(units::volt_t{supply_v});
+    sim.SetRawRotorPosition(0_tr);
+    sim.SetRotorVelocity(0_tps);
+    sim.SetRotorAcceleration(units::turns_per_second_squared_t{0.0});
+
+    if (m.feedback == hw::Feedback::kRemoteCANcoder) {
+      for (std::size_t s_idx = 0; s_idx < c.sensors.size(); ++s_idx) {
+        if (c.sensors[s_idx].id == m.feedback_sensor_id) {
+          motor_to_sensor_map_[i] = static_cast<int>(s_idx);
+          break;
+        }
+      }
     }
-    const double alpha = std::min(1.0, dt / tau);
-    sim_rotor_velocity_[i] +=
-        (target_rotor_rps - sim_rotor_velocity_[i]) * alpha;
-    if (sim_neutral_[i] &&
-        std::abs(sim_rotor_velocity_[i]) < kSimNeutralStandstillRps) {
-      sim_rotor_velocity_[i] = 0.0;
+  }
+  for (auto& device : sensors_) {
+    if (device.encoder) {
+      auto& sim = device.encoder->GetSimState();
+      sim.SetSupplyVoltage(units::volt_t{supply_v});
+      sim.SetRawPosition(0_tr);
+      sim.SetVelocity(0_tps);
+    } else if (device.imu) {
+      auto& sim = device.imu->GetSimState();
+      sim.SetSupplyVoltage(units::volt_t{supply_v});
+      sim.SetRawYaw(0_deg);
+      sim.SetAngularVelocityZ(units::degrees_per_second_t{0.0});
     }
+  }
 
-    sim_rotor_position_[i] += sim_rotor_velocity_[i] * dt;
-    sim.SetRotorVelocity(units::turns_per_second_t{sim_rotor_velocity_[i]});
-    sim.SetRawRotorPosition(units::turn_t{sim_rotor_position_[i]});
-
-    // Sync remote CANcoder if mapped
-    int sensor_idx = motor_to_sensor_map_[i];
-    if (sensor_idx >= 0 &&
-        static_cast<std::size_t>(sensor_idx) < sensors_.size() &&
-        sensors_[sensor_idx].encoder) {
-      double mech_rot = sim_rotor_position_[i] / gear_ratio;
-      double mech_rps = sim_rotor_velocity_[i] / gear_ratio;
-      sensors_[sensor_idx].encoder->GetSimState().SetRawPosition(
-          units::turn_t{mech_rot});
-      sensors_[sensor_idx].encoder->GetSimState().SetVelocity(
-          units::turns_per_second_t{mech_rps});
+  // Infer swerve modules from conventional names (<prefix>_drive +
+  // <prefix>_steer with front/back/rear and left/right -> ±0.30 m, matching
+  // talOS/hardware/sim_physics.h).
+  for (std::size_t i = 0;
+       i < c.motors.size() &&
+       sim_chassis_module_count_ < sim_chassis_modules_.size();
+       ++i) {
+    const std::string_view name = c.motors[i].name.view();
+    if (!name.ends_with("_drive")) continue;
+    const std::string_view prefix = name.substr(0, name.size() - 6);
+    for (std::size_t j = 0; j < c.motors.size(); ++j) {
+      if (j == i) continue;
+      const std::string_view other = c.motors[j].name.view();
+      if (other.size() != prefix.size() + 6 || !other.starts_with(prefix) ||
+          !other.ends_with("_steer")) {
+        continue;
+      }
+      const double x = prefix.find("front") != std::string_view::npos
+                           ? kSimChassisHalfSpanM
+                       : (prefix.find("back") != std::string_view::npos ||
+                          prefix.find("rear") != std::string_view::npos)
+                           ? -kSimChassisHalfSpanM
+                           : 0.0;
+      const double y = prefix.find("left") != std::string_view::npos
+                           ? kSimChassisHalfSpanM
+                       : prefix.find("right") != std::string_view::npos
+                           ? -kSimChassisHalfSpanM
+                           : 0.0;
+      if (x != 0.0 || y != 0.0) {
+        sim_chassis_modules_[sim_chassis_module_count_++] =
+            SimChassisModule{i, static_cast<int>(j), x, y};
+        break;
+      }
+    }
+  }
+  // Fall back to differential left/right drive pairs (trackwidth 0.60 m) when
+  // no swerve pairs were inferred.
+  if (sim_chassis_module_count_ == 0) {
+    std::array<std::size_t, hw::kMaxMotors> left_drives{};
+    std::array<std::size_t, hw::kMaxMotors> right_drives{};
+    std::size_t left_count = 0;
+    std::size_t right_count = 0;
+    for (std::size_t i = 0; i < c.motors.size(); ++i) {
+      if (c.motors[i].master_id != 0) continue;
+      const std::string_view name = c.motors[i].name.view();
+      const bool is_drive_name = name.find("drive") != std::string_view::npos ||
+                                 name == "left" || name == "right";
+      if (!is_drive_name) continue;
+      const bool has_left = name.find("left") != std::string_view::npos;
+      const bool has_right = name.find("right") != std::string_view::npos;
+      if (has_left && !has_right && left_count < left_drives.size()) {
+        left_drives[left_count++] = i;
+      } else if (has_right && !has_left && right_count < right_drives.size()) {
+        right_drives[right_count++] = i;
+      }
+    }
+    if (left_count > 0 && right_count > 0) {
+      for (std::size_t k = 0; k < left_count && sim_chassis_module_count_ <
+                                                    sim_chassis_modules_.size();
+           ++k) {
+        sim_chassis_modules_[sim_chassis_module_count_++] =
+            SimChassisModule{left_drives[k], -1, 0.0, kSimChassisHalfSpanM};
+      }
+      for (std::size_t k = 0;
+           k < right_count &&
+           sim_chassis_module_count_ < sim_chassis_modules_.size();
+           ++k) {
+        sim_chassis_modules_[sim_chassis_module_count_++] =
+            SimChassisModule{right_drives[k], -1, 0.0, -kSimChassisHalfSpanM};
+      }
     }
   }
 }
+
+void PhoenixBackend::UpdateSimulation(double dt) {
+  // Forward the RoboRIO's simulated battery voltage to Phoenix devices whenever
+  // it changes. Never call RoboRioSim::SetVInVoltage here so battery injections
+  // from tests or the Sim GUI read back untouched.
+  const double battery_v = frc::RobotController::GetBatteryVoltage().value();
+  if (std::isfinite(battery_v) && battery_v > 0.0) {
+    const double supply_v = std::max(battery_v, kSimMinSupplyV);
+    if (supply_v != last_sim_supply_v_) {
+      last_sim_supply_v_ = supply_v;
+      const units::volt_t supply{supply_v};
+      for (auto& motor : motors_) {
+        motor->GetSimState().SetSupplyVoltage(supply);
+      }
+      for (auto& device : sensors_) {
+        if (device.encoder) {
+          device.encoder->GetSimState().SetSupplyVoltage(supply);
+        } else if (device.imu) {
+          device.imu->GetSimState().SetSupplyVoltage(supply);
+        }
+      }
+    }
+  }
+
+  for (std::size_t i = 0; i < motors_.size() && i < sim_plants_.size(); ++i) {
+    const auto& m_cfg = config_.motors[i];
+    auto& sim = motors_[i]->GetSimState();
+    auto& plant = sim_plants_[i];
+    const double prev_vel_radps = plant.state(1);
+
+    // Voltage is the only driver: a closed-loop request with missing gains
+    // produces ~0 V, so the plant brakes/coasts instead of jumping to the
+    // requested demand. Powered and brake-neutral step WPILib's DCMotorSystem
+    // plant (0 V for brake neutral = shorted windings back-EMF braking). Under
+    // TorqueCurrentFOC Phoenix reports the volts its current loop applies
+    // against this rotor's speed, up to the duty cap; at 0 A it reports 0 V
+    // (talOS/hardware/README.md says what is known of 0 A). Coast neutral opens
+    // the windings, decaying exponentially with tau = 1.0 s.
+    if (!sim_neutral_[i] || m_cfg.brake) {
+      const double raw_v =
+          sim_neutral_[i] ? 0.0 : sim.GetMotorVoltage().value();
+      const double applied_v = std::isfinite(raw_v) ? raw_v : 0.0;
+      const frc::Vectord<1> u{applied_v};
+      plant.state =
+          plant.system.CalculateX(plant.state, u, units::second_t{dt});
+    } else {
+      const double decay = std::exp(-dt / kSimNeutralCoastTauS);
+      plant.state(0) += prev_vel_radps * kSimNeutralCoastTauS * (1.0 - decay);
+      plant.state(1) = prev_vel_radps * decay;
+    }
+
+    double rotor_vel_rps = plant.state(1) * plant.gear_ratio / kTau;
+    if (sim_neutral_[i] && std::abs(rotor_vel_rps) < kSimNeutralStandstillRps) {
+      plant.state(1) = 0.0;
+      rotor_vel_rps = 0.0;
+    }
+    const double rotor_pos_rot = plant.state(0) * plant.gear_ratio / kTau;
+    const double rotor_accel_rps2 =
+        dt > 0.0
+            ? ((plant.state(1) - prev_vel_radps) / dt) * plant.gear_ratio / kTau
+            : 0.0;
+
+    sim.SetRawRotorPosition(units::turn_t{rotor_pos_rot});
+    sim.SetRotorVelocity(units::turns_per_second_t{rotor_vel_rps});
+    sim.SetRotorAcceleration(
+        units::turns_per_second_squared_t{rotor_accel_rps2});
+
+    // Sync remote CANcoder if mapped. The CANcoder sits on the sensor shaft
+    // (rotor / rotor_to_sensor_ratio = mechanism * sensor_to_mechanism_ratio),
+    // and Phoenix 6's TalonFX then divides the remote CANcoder reading by
+    // SensorToMechanismRatio once to report mechanism rotations and rps.
+    const int sensor_idx = motor_to_sensor_map_[i];
+    if (sensor_idx >= 0 &&
+        static_cast<std::size_t>(sensor_idx) < sensors_.size() &&
+        sensors_[sensor_idx].encoder) {
+      const double sensor_to_mech =
+          (std::isfinite(m_cfg.sensor_to_mechanism_ratio) &&
+           m_cfg.sensor_to_mechanism_ratio > 0.0)
+              ? m_cfg.sensor_to_mechanism_ratio
+              : 1.0;
+      const double sensor_rot = (plant.state(0) / kTau) * sensor_to_mech;
+      const double sensor_rps = (plant.state(1) / kTau) * sensor_to_mech;
+      sensors_[sensor_idx].encoder->GetSimState().SetRawPosition(
+          units::turn_t{sensor_rot});
+      sensors_[sensor_idx].encoder->GetSimState().SetVelocity(
+          units::turns_per_second_t{sensor_rps});
+    }
+  }
+
+  // Only drive Pigeon2 yaw when chassis modules were inferred, so non-chassis
+  // unit tests injecting SetRawYaw are not overwritten with 0.
+  if (sim_chassis_module_count_ >= 2 && dt > 0.0) {
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    double sum_vx = 0.0;
+    double sum_vy = 0.0;
+    double moment = 0.0;
+    double lever_squared = 0.0;
+    for (std::size_t k = 0; k < sim_chassis_module_count_; ++k) {
+      const auto& mod = sim_chassis_modules_[k];
+      const double drive_sign =
+          config_.motors[mod.drive_index].inverted ? -1.0 : 1.0;
+      const double speed =
+          drive_sign * sim_plants_[mod.drive_index].state(1) * kSimWheelRadiusM;
+      double angle = 0.0;
+      if (mod.steer_index >= 0) {
+        const auto s_idx = static_cast<std::size_t>(mod.steer_index);
+        const int enc_idx = motor_to_sensor_map_[s_idx];
+        const bool has_remote_encoder =
+            enc_idx >= 0 &&
+            static_cast<std::size_t>(enc_idx) < config_.sensors.size();
+        const double steer_sign =
+            has_remote_encoder
+                ? (config_.sensors[enc_idx].inverted ? -1.0 : 1.0)
+                : (config_.motors[s_idx].inverted ? -1.0 : 1.0);
+        angle = steer_sign * sim_plants_[s_idx].state(0);
+        if (has_remote_encoder) {
+          const double sensor_to_mech =
+              (std::isfinite(config_.motors[s_idx].sensor_to_mechanism_ratio) &&
+               config_.motors[s_idx].sensor_to_mechanism_ratio > 0.0)
+                  ? config_.motors[s_idx].sensor_to_mechanism_ratio
+                  : 1.0;
+          angle +=
+              (config_.sensors[enc_idx].offset_rot / sensor_to_mech) * kTau;
+        }
+      }
+      const double vx = speed * std::cos(angle);
+      const double vy = speed * std::sin(angle);
+      sum_x += mod.x_m;
+      sum_y += mod.y_m;
+      sum_vx += vx;
+      sum_vy += vy;
+      moment += mod.x_m * vy - mod.y_m * vx;
+      lever_squared += mod.x_m * mod.x_m + mod.y_m * mod.y_m;
+    }
+    const double n = static_cast<double>(sim_chassis_module_count_);
+    const double centered_lever =
+        lever_squared - (sum_x * sum_x + sum_y * sum_y) / n;
+    if (centered_lever > 1e-12) {
+      const double omega_radps =
+          (moment - (sum_x * sum_vy - sum_y * sum_vx) / n) / centered_lever;
+      const double omega_degps = omega_radps * (180.0 / kPi);
+      sim_yaw_deg_ += omega_degps * dt;
+      for (auto& device : sensors_) {
+        if (device.imu) {
+          auto& imu_sim = device.imu->GetSimState();
+          imu_sim.SetRawYaw(units::degree_t{sim_yaw_deg_});
+          imu_sim.SetAngularVelocityZ(units::degrees_per_second_t{omega_degps});
+        }
+      }
+    }
+  }
+}
+#endif

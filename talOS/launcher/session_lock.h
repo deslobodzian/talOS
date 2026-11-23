@@ -186,39 +186,58 @@ inline constexpr std::string_view kSessionQuietFiles[] = {
 // (LauncherOptions::lock_session_directory).
 using FlockFunction = std::function<int(int fd, int operation)>;
 
-// Whether a flock(2) failure with `code` looks like the file's filesystem
-// takes no advisory locks: NFS without a lock daemon (ENOLCK), filesystems
-// without flock such as macOS's msdos and exFAT (ENOTSUP, EOPNOTSUPP), and
-// other refusals of the call itself (EINVAL, ENOSYS). One such failure says
-// that of one call only: an NFS lock daemon that stops answering fails a
-// call so on a filesystem whose locks a running launch holds. Whether a log
-// root takes no locks is decided by LogRootTakesNoLocks.
+// Whether a flock(2) failure with `code` says the filesystem itself takes no
+// advisory locks: filesystems without flock such as macOS's msdos and exFAT
+// (ENOTSUP, EOPNOTSUPP), and other refusals of the call itself (EINVAL,
+// ENOSYS). Excludes ENOLCK, which signals an unavailable lock service (e.g. a
+// network lock daemon that is down or out of locks on a filesystem where
+// another namespace may hold a running session's lock). Whether a log root
+// takes no locks or has an unavailable lock service is decided by
+// ProbeLogRootLocks.
 inline bool FlockUnsupported(int code) {
-  return code == ENOLCK || code == ENOTSUP || code == EOPNOTSUPP ||
-         code == EINVAL || code == ENOSYS;
+  return code == ENOTSUP || code == EOPNOTSUPP || code == EINVAL ||
+         code == ENOSYS;
 }
 
-// The file in a log root that LogRootTakesNoLocks locks. Not a directory, so
+// The file in a log root that ProbeLogRootLocks locks. Not a directory, so
 // retention never takes it for a session.
 inline constexpr std::string_view kLockProbeFile = ".talos-lock-probe";
 
-// Whether the filesystem holding the log root `root` takes no advisory
-// locks: a shared, nonblocking flock of its kLockProbeFile (created when
-// absent) fails with FlockUnsupported. Retention and the session
-// directory's creation each decide it once, by this probe, and act unlocked
-// only on its word: a flock elsewhere failing so on a root whose probe
+// What probing the log root's kLockProbeFile reported about advisory locks.
+enum class LogRootLocks {
+  kSupported,    // The probe locked (or could not be opened: fail closed).
+  kUnsupported,  // FlockUnsupported (EOPNOTSUPP, ENOTSUP, EINVAL, ENOSYS).
+  kUnavailable,  // ENOLCK: lock service unavailable (e.g. lock daemon down).
+};
+
+// Probes the filesystem holding the log root `root` by taking a shared,
+// nonblocking flock on its kLockProbeFile (created when absent). Retention and
+// the session directory's creation each decide once, by this probe, and act
+// unlocked only on its word: a flock elsewhere failing on a root whose probe
 // locked is a refusal of that call, which proves no launch's lock absent.
-// False when the probe file cannot be opened: what cannot be probed is not
-// taken for a root without locks.
-inline bool LogRootTakesNoLocks(const std::filesystem::path& root,
-                                const FlockFunction& lock = ::flock) {
+// Returns kSupported when the probe file cannot be opened: what cannot be
+// probed is not taken for a root without locks. Returns kUnavailable on ENOLCK
+// so retention refuses to delete any session rather than treating the root as
+// lockless (REQ-OPS-11).
+inline LogRootLocks ProbeLogRootLocks(const std::filesystem::path& root,
+                                      const FlockFunction& lock = ::flock) {
   const int fd =
       introspect::OpenLockFile((root / kLockProbeFile).string(), O_RDONLY);
-  if (fd < 0) return false;
+  if (fd < 0) return LogRootLocks::kSupported;
   const bool refused = lock(fd, LOCK_SH | LOCK_NB) != 0;
   const int code = errno;
   ::close(fd);
-  return refused && FlockUnsupported(code);
+  if (!refused) return LogRootLocks::kSupported;
+  if (code == ENOLCK) return LogRootLocks::kUnavailable;
+  if (FlockUnsupported(code)) return LogRootLocks::kUnsupported;
+  return LogRootLocks::kSupported;
+}
+
+// Whether the filesystem holding the log root `root` takes no advisory locks
+// (ProbeLogRootLocks == kUnsupported; never true for ENOLCK).
+inline bool LogRootTakesNoLocks(const std::filesystem::path& root,
+                                const FlockFunction& lock = ::flock) {
+  return ProbeLogRootLocks(root, lock) == LogRootLocks::kUnsupported;
 }
 
 // Whether a session directory's launch is still running, read from the
@@ -303,6 +322,15 @@ class SessionDirectoryLock {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
         continue;
       }
+      if (code == ENOLCK) {
+        error = {code, std::generic_category()};
+        if (ProbeLogRootLocks(dir.parent_path(), lock) ==
+            LogRootLocks::kUnavailable) {
+          return SessionDirectoryLock{-1, path};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        continue;
+      }
       if (code != EWOULDBLOCK && code != EINTR) {
         error = {code, std::generic_category()};
         return std::nullopt;
@@ -318,8 +346,8 @@ class SessionDirectoryLock {
   // False when `dir` holds no lock file: a launch holds one from before its
   // directory holds anything; and on a root without advisory locks
   // (`root_takes_no_locks`, LogRootTakesNoLocks). On a root whose locks
-  // work, a flock failing as FlockUnsupported cannot say, and counts as
-  // held. Creates nothing.
+  // work, a flock failing as FlockUnsupported or ENOLCK cannot say, and counts
+  // as held. ENOLCK always counts as held. Creates nothing.
   static bool Held(const std::filesystem::path& dir, bool root_takes_no_locks,
                    const FlockFunction& lock = ::flock) {
     const int fd = ::open((dir / kSessionDirectoryLockFile).c_str(),
@@ -328,7 +356,7 @@ class SessionDirectoryLock {
     const bool refused = lock(fd, LOCK_SH | LOCK_NB) != 0;
     const int code = errno;
     ::close(fd);
-    return refused && (code == EWOULDBLOCK ||
+    return refused && (code == EWOULDBLOCK || code == ENOLCK ||
                        (FlockUnsupported(code) && !root_takes_no_locks));
   }
 

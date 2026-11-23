@@ -17,6 +17,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -32,6 +33,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/reporter.h"
+#include "talOS/node/access.h"
 #include "talOS/node/internal.h"
 #include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
@@ -61,6 +63,7 @@ struct Node::Impl {
   struct PublisherSlot {
     std::uint16_t id;
     std::size_t bytes;
+    bool is_hardware_request = false;
   };
   struct BytePublisherSlot {
     std::string topic;
@@ -93,6 +96,7 @@ struct Node::Impl {
   std::shared_ptr<const config::RobotConfig> config;
   bool simulation = false;
   bool describing = false;
+  bool require_targeted_outputs = false;
   detail::LoopPort* loop = nullptr;
   detail::GraphSource graph;
   std::optional<std::filesystem::path> session_dir;
@@ -300,6 +304,7 @@ Node::Node(detail::NodeSetup setup) : impl_{std::make_unique<Impl>()} {
   impl.config = std::move(setup.config);
   impl.simulation = setup.simulation;
   impl.describing = setup.describing;
+  impl.require_targeted_outputs = setup.require_targeted_outputs;
   impl.loop = setup.loop;
   impl.graph = std::move(setup.graph);
   impl.session_dir = std::move(setup.session_dir);
@@ -735,7 +740,7 @@ void CheckLayout(const std::string& node, std::string_view topic,
 // publisher there would skip all of that, so none is opened, however the
 // topic was spelled or remapped, whatever --allow-graph-errors says.
 void RefuseHardwareRequest(const std::string& node, std::string_view topic) {
-  if (introspect::naming::IsHardwareRequest(topic)) {
+  if (introspect::naming::IsHardwareRequest(topic) || topic.starts_with("/~")) {
     throw std::invalid_argument(
         node + ": cannot publish '" + std::string{topic} +
         "': hardware requests are sent only by the devices layer's flush "
@@ -840,7 +845,7 @@ std::size_t NodeAccess::add_hardware_request(Node& node, std::size_t bytes,
   const std::uint16_t id =
       impl.loop->register_sender(topic, static_cast<std::uint32_t>(bytes),
                                  static_cast<std::uint32_t>(alignment), schema);
-  impl.publishers.push_back({id, bytes});
+  impl.publishers.push_back({id, bytes, /*is_hardware_request=*/true});
   impl.hardware_request = std::move(topic);
   return impl.publishers.size() - 1;
 }
@@ -851,6 +856,14 @@ std::string_view NodeAccess::hardware_request(const Node& node) {
 
 void NodeAccess::mark_untargeted_outputs(Node& node) {
   node.impl_->CheckOpen("AllowUntargetedOutputs");
+  if (node.impl_->require_targeted_outputs) {
+    throw std::logic_error(
+        node.impl_->name +
+        ": AllowUntargetedOutputs refused under --targeted-outputs: "
+        "its --describe probe declared a hardware request without "
+        "untargeted_outputs; call AllowUntargetedOutputs unconditionally in "
+        "the constructor so the graph lint sees it");
+  }
   node.impl_->untargeted_outputs = true;
 }
 
@@ -888,6 +901,132 @@ bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
   return impl.loop->send(
       publisher.id,
       std::span<const std::byte>{static_cast<const std::byte*>(data), bytes});
+}
+
+// --- NodeDetail (non-privileged public-API thunks) ---------------------------
+
+void NodeDetail::set_update(Node& node, std::function<void()> update) {
+  NodeAccess::set_update(node, std::move(update));
+}
+void NodeDetail::require_immediate_delivery(Node& node,
+                                            std::size_t subscription) {
+  NodeAccess::require_immediate_delivery(node, subscription);
+}
+Duration NodeDetail::freshness_timeout(const Node& node) {
+  return NodeAccess::freshness_timeout(node);
+}
+std::optional<bool> NodeDetail::find_bool(const Node& node,
+                                          std::string_view key,
+                                          ParamTable subsystem) {
+  return NodeAccess::find_bool(node, key, subsystem);
+}
+std::optional<std::int64_t> NodeDetail::find_int(const Node& node,
+                                                 std::string_view key,
+                                                 ParamTable subsystem) {
+  return NodeAccess::find_int(node, key, subsystem);
+}
+std::optional<double> NodeDetail::find_double(const Node& node,
+                                              std::string_view key,
+                                              ParamTable subsystem) {
+  return NodeAccess::find_double(node, key, subsystem);
+}
+std::optional<std::string> NodeDetail::find_string(const Node& node,
+                                                   std::string_view key,
+                                                   ParamTable subsystem) {
+  return NodeAccess::find_string(node, key, subsystem);
+}
+std::optional<std::vector<std::string>> NodeDetail::find_string_list(
+    const Node& node, std::string_view key, ParamTable subsystem) {
+  return NodeAccess::find_string_list(node, key, subsystem);
+}
+std::optional<std::vector<double>> NodeDetail::find_double_list(
+    const Node& node, std::string_view key, ParamTable subsystem) {
+  return NodeAccess::find_double_list(node, key, subsystem);
+}
+void NodeDetail::param_error(const Node& node, std::string_view key,
+                             std::string_view problem, ParamTable subsystem) {
+  NodeAccess::param_error(node, key, problem, subsystem);
+}
+std::size_t NodeDetail::add_subscription(Node& node, std::string_view topic,
+                                         std::size_t bytes,
+                                         std::size_t alignment,
+                                         const schema::Identity& schema,
+                                         bool optional,
+                                         MessageCallback on_message) {
+  return NodeAccess::add_subscription(node, topic, bytes, alignment, schema,
+                                      optional, std::move(on_message));
+}
+const void* NodeDetail::subscription_value(const Node& node,
+                                           std::size_t index) {
+  return NodeAccess::subscription_value(node, index);
+}
+bool NodeDetail::subscription_has_value(const Node& node, std::size_t index) {
+  return NodeAccess::subscription_has_value(node, index);
+}
+Duration NodeDetail::subscription_age(const Node& node, std::size_t index) {
+  return NodeAccess::subscription_age(node, index);
+}
+bool NodeDetail::subscription_fresh(const Node& node, std::size_t index,
+                                    Duration max_age) {
+  return NodeAccess::subscription_fresh(node, index, max_age);
+}
+bool NodeDetail::subscription_updated(const Node& node, std::size_t index) {
+  return NodeAccess::subscription_updated(node, index);
+}
+std::size_t NodeDetail::add_publisher(Node& node, std::string_view topic,
+                                      std::size_t bytes, std::size_t alignment,
+                                      const schema::Identity& schema) {
+  return NodeAccess::add_publisher(node, topic, bytes, alignment, schema);
+}
+bool NodeDetail::publisher_send(Node& node, std::size_t index, const void* data,
+                                std::size_t bytes) {
+  NodeAccess::require_loop_thread(node, "Publisher::send");
+  const Node::Impl& impl = *node.impl_;
+  if (index >= impl.publishers.size()) {
+    throw std::out_of_range(impl.name + ": no publisher at index " +
+                            std::to_string(index));
+  }
+  if (impl.publishers[index].is_hardware_request) {
+    throw std::logic_error(
+        impl.name +
+        ": Publisher::send refused on hardware request slot; hardware requests "
+        "leave only through the devices-layer flush (RULES.md 2)");
+  }
+  return NodeAccess::publisher_send(node, index, data, bytes);
+}
+bool NodeDetail::byte_publisher_send(Node& node, std::size_t index,
+                                     std::span<const std::byte> message) {
+  return NodeAccess::byte_publisher_send(node, index, message);
+}
+std::size_t NodeDetail::add_state_machine(Node& node, std::int64_t initial) {
+  return NodeAccess::add_state_machine(node, initial);
+}
+std::int64_t NodeDetail::state_machine_state(const Node& node,
+                                             std::size_t index) {
+  return NodeAccess::state_machine_state(node, index);
+}
+std::int64_t NodeDetail::state_machine_previous(const Node& node,
+                                                std::size_t index) {
+  return NodeAccess::state_machine_previous(node, index);
+}
+void NodeDetail::state_machine_go(Node& node, std::size_t index,
+                                  std::int64_t next) {
+  NodeAccess::state_machine_go(node, index, next);
+}
+Duration NodeDetail::state_machine_time_in_state(const Node& node,
+                                                 std::size_t index) {
+  return NodeAccess::state_machine_time_in_state(node, index);
+}
+bool NodeDetail::state_machine_just_entered(const Node& node,
+                                            std::size_t index) {
+  return NodeAccess::state_machine_just_entered(node, index);
+}
+void* NodeDetail::find_extension(const Node& node, std::type_index type) {
+  return NodeAccess::find_extension(node, type);
+}
+void NodeDetail::add_extension(Node& node, std::type_index type,
+                               std::shared_ptr<void> object) {
+  NodeAccess::add_extension(node, type, std::move(object));
 }
 
 // --- byte topics -------------------------------------------------------------
@@ -1060,6 +1199,8 @@ struct Flags {
   std::chrono::nanoseconds log_window{0};
   bool simulation = false;
   bool describe = false;
+  bool targeted_outputs = false;
+  bool allow_capped_replay = false;
   bool log_set = false;  // --log was passed (vs. the /tmp default)
 };
 
@@ -1072,6 +1213,10 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.simulation = true;
     } else if (arg == "--describe") {
       flags.describe = true;
+    } else if (arg == "--targeted-outputs") {
+      flags.targeted_outputs = true;
+    } else if (arg == "--allow-capped-replay") {
+      flags.allow_capped_replay = true;
     } else if (arg == "--log" && i + 1 < argc) {
       flags.log_path = argv[++i];
       flags.log_set = true;
@@ -1093,15 +1238,21 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.duration_s = std::stoi(argv[++i]);
     } else {
       throw std::invalid_argument(
-          "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
+          "usage: node [--sim] [--describe] [--targeted-outputs] "
+          "[--duration-s N] [--log PATH] "
           "[--log-max-bytes N] [--log-window-us N] [--session-id ID] "
           "[--config PATH] "
-          "[--graph PATH] [--replay PATH] [--replay-inputs SESSION_DIR]");
+          "[--graph PATH] [--replay PATH] [--replay-inputs SESSION_DIR "
+          "[--allow-capped-replay]]");
     }
   }
   if (!flags.replay_path.empty() && !flags.replay_inputs.empty()) {
     throw std::invalid_argument(
         "--replay and --replay-inputs exclude each other");
+  }
+  if (flags.allow_capped_replay && flags.replay_inputs.empty()) {
+    throw std::invalid_argument(
+        "--allow-capped-replay requires --replay-inputs SESSION_DIR");
   }
   if (flags.duration_s < 0) {
     throw std::invalid_argument("duration must be nonnegative");
@@ -1112,10 +1263,12 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
   return flags;
 }
 
-// The declared graph from --graph, read on first use. Without the flag:
-// under --replay-inputs, the one the replayed session was launched with
-// (<session dir>/declared_graph.json, which the launcher writes into a
-// session that runs a graph reader); none yet under --describe (the
+// The declared graph from --graph, read on first use, with this node's own
+// entry stripped (declared_graph.json carries Pass-1 static senders of
+// graph-reading nodes for other graph readers, so a reader never sees itself).
+// Without the flag: under --replay-inputs, the one the replayed session was
+// launched with (<session dir>/declared_graph.json, which the launcher writes
+// into a session that runs a graph reader); none yet under --describe (the
 // launcher's first pass); and an error otherwise, since a node that reads the
 // graph cannot be built without one.
 GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
@@ -1140,8 +1293,8 @@ GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
     };
   }
   auto graph = std::make_shared<std::optional<DeclaredGraph>>();
-  return [graph, path = std::move(path),
-          unreadable = std::move(unreadable)]() -> const DeclaredGraph* {
+  return [graph, path = std::move(path), unreadable = std::move(unreadable),
+          self_name = std::string{node_name}]() -> const DeclaredGraph* {
     if (!graph->has_value()) {
       std::ifstream file{path};
       if (!file) throw std::runtime_error(unreadable);
@@ -1151,6 +1304,9 @@ GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
       if (!introspect::DescribeReader::ParseGraph(text, parsed, error)) {
         throw std::runtime_error("--graph " + path + ": " + error);
       }
+      std::erase_if(parsed, [&](const introspect::Description& described) {
+        return described.name == self_name;
+      });
       graph->emplace(std::move(parsed));
     }
     return &**graph;
@@ -1188,6 +1344,9 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
       config::ParseRobotConfig(flags.config_path));
   setup.simulation = flags.simulation;
   setup.describing = flags.describe;
+  // Ignored under --describe so a probe always reports the opt-out it declares
+  // for the graph lint to judge; enforced on every run started with the flag.
+  setup.require_targeted_outputs = flags.targeted_outputs && !flags.describe;
   setup.loop = hosted.port.get();
   setup.graph = GraphFromFlags(flags, node_name);
   setup.session_dir = std::move(session_dir);
@@ -1228,27 +1387,50 @@ class OfflinePort final : public LoopPortFor<Loop> {
 
 // --replay-inputs: this node, on a simulated loop on the recorded clock, fed
 // every message the session logged on a topic it watches at its recorded
-// time (talOS/events/input_replay.h). A node the session logged runs on its
-// own recorded timeline (origin and run start, so its timers fire at the
-// recorded deadlines) and is handed what it received live, at the drains it
-// received it in. What it sends is logged to --log. A topic recorded with
-// another schema fails before anything runs; topics nobody recorded are
-// listed. The run ends before the earliest gap or damaged stretch in a log
-// it is fed from, says where, and exits 1 (event::ReplayInputs), as does a
-// run whose own output log has a gap. A log it would be fed from that may
-// have lost records nothing in it marks or bounds is refused before anything
-// runs (a ReplayError, exit 1): one with a `.capped` marker or whose member
-// the session manifest marks log_capped, a run's log without its EXIT record
-// of a member it marks log_gap or recorder_failed, and one whose damaged
-// stretch nothing bounds. So is the node's own first-run log when it arms a
-// timer and its first segment, or a segment before its first firing read,
-// is gone or unreadable: the firing its run start is read from may have been
-// in it; and, with no firing that gives the run start, when it holds no
-// record of its run or a loss that may hold its firings.
+// time (talOS/events/input_replay.h). Its path must be a session directory
+// (SESSION_DIR); a non-directory is refused naming the path as given, and any
+// other filesystem error (such as EACCES) names the path and OS error. A node
+// the session logged runs on its own recorded timeline (origin and run start,
+// so its timers fire at the recorded deadlines, with loop_end() clamped before
+// an unfired armed deadline for a lossless single-run log; see input_replay.h
+// for the ARM_TIMER live-latency and backlog-drain-exit exceptions) and is
+// handed what it received live, at the drains it received it in. What it sends
+// is logged to --log. A topic recorded with another schema fails before
+// anything runs; topics nobody recorded are listed. The run ends before the
+// earliest gap or damaged stretch in a log it is fed from, says where, and
+// exits 1 (event::ReplayInputs), as does a run whose own output log has a gap.
+// A log it would be fed from that may have lost records nothing in it marks or
+// bounds is refused before anything runs (a ReplayError, exit 1): one with a
+// `.capped` marker or whose member the session manifest marks log_capped, a
+// run's log without its EXIT record of a member it marks log_gap or
+// recorder_failed, one with a missing or incomplete-header segment (including
+// a first segment gone without a marker when a later numbered segment remains
+// or the unnumbered active file's first intact record has dispatch_index > 1,
+// or a missing segment before the unnumbered active file whose boundary jumps
+// in dispatch_index (> prev + 1) or repeated-sender accepted-SEND sequence
+// (> prev + 1)), and one whose damaged stretch nothing bounds. So is the
+// node's own first-run log when it arms a timer and its first segment, or a
+// segment before its first firing read, is gone or unreadable: the firing its
+// run start is read from may have been in it; and, with no firing that gives
+// the run start, when it holds no record of its run or a loss that may hold
+// its firings.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
+  std::error_code ec;
+  if (!std::filesystem::is_directory(flags.replay_inputs, ec)) {
+    if (ec && ec != std::errc::no_such_file_or_directory &&
+        ec != std::errc::not_a_directory) {
+      throw std::invalid_argument("--replay-inputs " + flags.replay_inputs +
+                                  ": " + ec.message());
+    }
+    throw std::invalid_argument("--replay-inputs " + flags.replay_inputs +
+                                " is not a session directory");
+  }
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
-  const event::RecordedSession session{flags.replay_inputs, node_name};
+  const event::InputReplayOptions replay_options{.allow_capped =
+                                                     flags.allow_capped_replay};
+  const event::RecordedSession session{flags.replay_inputs, node_name,
+                                       replay_options};
   event::SimulationEnvironment environment;
   event::log::LogWriterOptions log_options;
   if (log_options_for_test) log_options_for_test(log_options);
@@ -1260,7 +1442,7 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   const Hosted hosted =
       Host(std::make_unique<OfflinePort<Loop>>(loop), node_name, flags, make);
   const event::InputReplayReport report =
-      event::ReplayInputs(loop, environment, session);
+      event::ReplayInputs(loop, environment, session, replay_options);
 
   std::printf(
       "replay-inputs: %zu logs of session %llu, %.3f s\n",

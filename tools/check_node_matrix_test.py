@@ -274,6 +274,64 @@ class CheckNodeMatrixTest(unittest.TestCase):
                 self.assertEqual(check_node_matrix.main(["bot/fixture"]), 0)
             self.assertIn("bot/fixture  [fixture]  skipped", out.getvalue())
 
+    # REQ-SAFE-38: BUILD parsing uses AST, not regex/string-tracking, so
+    # escaped backslashes, triple-quoted strings, comments, or syntax errors
+    # cannot spoof `testonly = True` or bypass matrix checks.
+    def test_testonly_cannot_be_spoofed_by_strings_and_syntax_error_fails_closed(
+            self):
+        packages = {
+            "escaped_backslash": (
+                'talos_cc_node(\n'
+                '    name = "node",\n'
+                '    desc = "\\\\",\n'
+                '    note = "testonly = True",\n'
+                ')\n'
+            ),
+            "triple_quote": (
+                'talos_cc_node(\n'
+                '    name = "node",\n'
+                '    doc = """hello "testonly = True" world""",\n'
+                ')\n'
+            ),
+            "fake_in_string": (
+                'DOC = """\n'
+                'talos_cc_node(\n'
+                '    name = "fake",\n'
+                '    testonly = True,\n'
+                ')\n'
+                '"""\n'
+            ),
+            "aliased_load": (
+                'load("//talOS/build:contract.bzl", my_node = "talos_cc_node")\n'
+                'my_node(name = "node")\n'
+            ),
+        }
+        with tempfile.TemporaryDirectory() as root:
+            for name, build in packages.items():
+                os.makedirs(os.path.join(root, "bot", name))
+                with open(os.path.join(root, "bot", name, "BUILD"), "w",
+                          encoding="utf-8") as f:
+                    f.write(build)
+            self.assertEqual(
+                check_node_matrix.targets(root, ["bot"]),
+                [(os.path.join(root, "bot", name), "observer")
+                 for name in ("aliased_load", "escaped_backslash",
+                              "triple_quote")])
+
+            # A BUILD file with a syntax error fails closed.
+            os.makedirs(os.path.join(root, "broken"))
+            with open(os.path.join(root, "broken", "BUILD"), "w",
+                      encoding="utf-8") as f:
+                f.write('talos_cc_node(name = "node",\n')
+            with self.assertRaises(check_node_matrix.MatrixError):
+                check_node_matrix.targets(root, ["broken"])
+            err = io.StringIO()
+            with mock.patch.dict(os.environ,
+                                 {"BUILD_WORKSPACE_DIRECTORY": root}), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(check_node_matrix.main(["broken"]), 2)
+            self.assertIn("broken/BUILD", err.getvalue())
+
     def test_baseline_fails_on_a_new_missing_case_and_a_stale_entry(self):
         # CI runs the lint over a baseline of the cases missing today,
         # which may only shrink: an unlisted missing case fails,

@@ -76,6 +76,10 @@ cc_test(
         "//talOS/vision/testdata",
         "@apriltag//:test_data",
     ],
+    tags = [
+        "exclusive",
+        "perf",
+    ],
     deps = [
         ":metal_apriltag_backend",
         "//talOS/geometry",

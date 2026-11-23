@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "../protocol/frame.h"
+#include "gateway.h"
 
 namespace talos::hardware {
 static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
@@ -157,7 +158,8 @@ bool Decode(std::span<const uint8_t> data, Command& out) {
   out = c;
   return true;
 }
-std::size_t Encode(const State& s, std::span<uint8_t> data) {
+namespace detail {
+std::size_t EncodeUnsanitizedState(const State& s, std::span<uint8_t> data) {
   if (s.motor_count > kMaxMotors || s.sensor_count > kMaxSensors ||
       s.digital_input_count > kMaxDigitalInputs ||
       s.digital_output_count > kMaxDigitalOutputs ||
@@ -263,6 +265,12 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
   w.Int(s.counters.apply_failure_count, 4);
   w.Int(s.counters.device_reset_count, 4);
   return w.ok ? w.pos : 0;
+}
+}  // namespace detail
+std::size_t Encode(const State& s, std::span<uint8_t> data) {
+  State sanitized = s;
+  ReplaceNonFinite(sanitized);
+  return detail::EncodeUnsanitizedState(sanitized, data);
 }
 bool Decode(std::span<const uint8_t> data, State& out) {
   State s{};

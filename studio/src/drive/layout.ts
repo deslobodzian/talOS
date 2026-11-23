@@ -163,3 +163,39 @@ export function parseLayout(json: unknown): Layout {
     skipped
   };
 }
+
+// The channels whose history a graph or a field trail draws.
+export function trackedChannels(layout: Layout): string[] {
+  const names: string[] = [];
+  for (const w of layout.widgets) {
+    if (w.kind === 'graph') names.push(...w.series);
+    if (w.kind === 'field') names.push(w.channels.x, w.channels.y);
+  }
+  return names;
+}
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null)
+    return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++)
+      if (!deepEqual(a[i], b[i])) return false;
+    return true;
+  }
+  const ao = a as Record<string, unknown>, bo = b as Record<string, unknown>;
+  const ak = Object.keys(ao), bk = Object.keys(bo);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (!Object.prototype.hasOwnProperty.call(bo, k) || !deepEqual(ao[k], bo[k]))
+      return false;
+  }
+  return true;
+}
+
+// Structural equality of two parsed layouts, so a reconnect whose layout did
+// not change keeps the existing grid elements and list scroll positions.
+export function layoutsEqual(a: Layout, b: Layout): boolean {
+  return deepEqual(a, b);
+}

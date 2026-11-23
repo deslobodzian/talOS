@@ -193,3 +193,124 @@ test('the hardware panel shows a failed CAN bus as failed, not as 0%', () => {
   assert.ok(html.includes('can-unread">failed<'), 'the failed bus is not marked');
   assert.ok(!html.includes('>0%<'), 'the failed bus reads as an idle one');
 });
+
+// REQ-OPS-23: when the declared graph carries can_buses, the hardware panel's
+// table and CAN utilization chart series label slots by configured bus name
+// rather than "CAN bus N".
+test('the hardware panel and chart label CAN buses from the declared graph', () => {
+  const series = canBusSeries([
+    {state: [1, 1, 1], frac: [0.1, 0.2, 0.3]},
+    {state: [1, 1, 1], frac: [0.4, 0.5, 0.6]}
+  ]);
+  assert.deepEqual(
+      canBusLines(2, series, ['rio', 'Shooter']).map(l => l.name),
+      ['rio', 'Shooter']);
+  assert.deepEqual(
+      canBusLines(2, series).map(l => l.name),
+      ['rio', 'CAN bus 1']);
+
+  const B = 'hw/status/can_buses/';
+  const studio = createStaticStudio({
+    frames: [{
+      stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+      chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+      channels: {
+        'hw/status/battery_v': 12.0, 'hw/status/can_bus_count': 2,
+        [B + '0/read_state']: 1, [B + '0/utilization_frac']: 0.15,
+        [B + '1/read_state']: 1, [B + '1/utilization_frac']: 0.42
+      },
+      units: {}, labels: {}
+    }],
+    playback: {mode: 'PAUSED', cursor_ns: '1000000000'},
+    system: {
+      declared: {version: 1, nodes: [], diagnostics: [], can_buses: ['rio', 'Shooter']}
+    }
+  });
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  assert.ok(html.includes('>rio<'), html);
+  assert.ok(html.includes('>Shooter<'), html);
+  assert.ok(!html.includes('CAN bus 1'), html);
+});
+
+// REQ-OPS-20 (RT-17, RT-28): the five UDP socket and incoming State loss
+// counters on /hw/status appear in the Hardware panel's Counters table when
+// declared by the bridge.
+test('the hardware panel displays UDP socket and State loss counters', () => {
+  const studio = createStaticStudio({
+    frames: [{
+      stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+      chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+      channels: {
+        'hw/status/socket_send_failures_count': 3,
+        'hw/status/socket_reopens_count': 1,
+        'hw/status/state_sequence_gaps_count': 7,
+        'hw/status/state_decode_failures_count': 2,
+        'hw/status/socket_send_would_block_count': 4,
+      },
+      units: {}, labels: {}
+    }],
+    playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+  });
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  for (const label of [
+    'Socket send failures',
+    'Socket reopens',
+    'State sequence gaps',
+    'State decode failures',
+    'Socket send would-block',
+  ]) {
+    assert.ok(html.includes(label), `missing counter ${label}`);
+  }
+});
+
+// REQ-OPS-20: when the bridge reports a protocol mismatch, the Hardware panel
+// shows both the bridge's expected protocol_version_id and the observed
+// mismatched_protocol_version_id with warning tone; when clear it shows the
+// bridge's protocol version alone.
+test('the hardware panel displays expected and observed mismatched protocol version', () => {
+  const render = (channels: Record<string, number>) => {
+    const studio = createStaticStudio({
+      frames: [{
+        stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+        chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+        channels, units: {}, labels: {}
+      }],
+      playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+    });
+    return renderToStaticMarkup(
+        <StudioProvider studio={studio}>
+          <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                   setConfig={() => {}} instanceId="test"/>
+        </StudioProvider>);
+  };
+
+  const mismatchHtml = render({
+    'hw/status/protocol_version_id': 11,
+    'hw/status/mismatched_protocol_version_id': 10,
+    'hw/status/alert_error_protocol_mismatch': 1,
+  });
+  assert.match(mismatchHtml, /class="warn"[^>]*>.*mismatch \(expected 11, gateway 10\)/);
+
+  const mismatchZeroHtml = render({
+    'hw/status/protocol_version_id': 11,
+    'hw/status/mismatched_protocol_version_id': 0,
+    'hw/status/alert_error_protocol_mismatch': 1,
+  });
+  assert.match(mismatchZeroHtml, /class="warn"[^>]*>.*mismatch/);
+
+  const okHtml = render({
+    'hw/status/protocol_version_id': 11,
+    'hw/status/mismatched_protocol_version_id': 0,
+    'hw/status/alert_error_protocol_mismatch': 0,
+  });
+  assert.doesNotMatch(okHtml, /mismatch/);
+  assert.match(okHtml, /<dt>Protocol<\/dt><dd>11<\/dd>/);
+});

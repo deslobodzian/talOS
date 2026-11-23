@@ -7,6 +7,48 @@
 #include <string>
 
 namespace talos::mechanisms {
+namespace detail {
+
+double StepSpinDown(double goal_rps, double previous_rps, double max_rps,
+                    double spin_down_rps2, double dt_s) {
+  double commanded = goal_rps;
+  if (spin_down_rps2 > 0) {
+    const bool winding_down = std::abs(goal_rps) < std::abs(previous_rps) ||
+                              goal_rps * previous_rps < 0;
+    if (winding_down) {
+      const double step = spin_down_rps2 * (dt_s > 0.0 ? dt_s : 0.0);
+      commanded = goal_rps > previous_rps
+                      ? std::min(goal_rps, previous_rps + step)
+                      : std::max(goal_rps, previous_rps - step);
+    }
+  }
+  return std::clamp(commanded, -max_rps, max_rps);
+}
+
+bool StepVelocityReadiness(bool was_at_speed, int& entry_ticks,
+                           double velocity_rps, double goal_rps,
+                           double entry_rps, double exit_rps,
+                           int entry_tick_count, bool velocity_recent) {
+  const double error_rps = std::abs(velocity_rps - goal_rps);
+  if (!velocity_recent) {
+    entry_ticks = 0;
+    return false;
+  }
+  if (was_at_speed) {
+    if (!(error_rps <= exit_rps)) {
+      entry_ticks = 0;
+      return false;
+    }
+    return true;
+  }
+  if (error_rps <= entry_rps) {
+    return ++entry_ticks >= entry_tick_count;
+  }
+  entry_ticks = 0;
+  return false;
+}
+
+}  // namespace detail
 
 VelocityMechanism::VelocityMechanism(Node& node, std::string_view name)
     : node_{&node},
@@ -61,17 +103,10 @@ void VelocityMechanism::update() {
     double commanded = goal_rps_;
     // Spin-down: a live goal smaller than (or opposite to) the last command
     // is approached at no more than spin_down_rps2.
-    if (spin_down_rps2_ > 0 && last_drive_) {
-      const double previous = last_commanded_rps_;
-      const bool winding_down =
-          std::abs(goal_rps_) < std::abs(previous) || goal_rps_ * previous < 0;
-      if (winding_down) {
-        const double step =
-            spin_down_rps2_ *
-            std::chrono::duration<double>(now - *last_drive_).count();
-        commanded = goal_rps_ > previous ? std::min(goal_rps_, previous + step)
-                                         : std::max(goal_rps_, previous - step);
-      }
+    if (last_drive_) {
+      commanded = detail::StepSpinDown(
+          goal_rps_, last_commanded_rps_, max_rps_, spin_down_rps2_,
+          std::chrono::duration<double>(now - *last_drive_).count());
     }
     commanded_rps_ = commanded;
     last_commanded_rps_ = commanded;
@@ -82,7 +117,7 @@ void VelocityMechanism::update() {
   velocity_rps_ = motor_.velocity();
   velocity_recent_ = velocity_recent();
   current_a_ = motor_.current();
-  readiness(spin ? request_rps_ : 0.0);
+  readiness(goal_rps_);
 }
 
 // The velocity's age at its State against ReadinessAgeBound; an unknown age
@@ -106,22 +141,11 @@ void VelocityMechanism::readiness(double requested_rps) {
       entry_ticks_ = 0;
       readiness_goal_rps_ = requested_rps;
     }
-    const double error_rps = std::abs(velocity_rps_ - goal_rps_);
     const double exit_rps =
         std::max(entry_rps_, exit_frac_ * std::abs(goal_rps_));
-    if (!velocity_recent_) {
-      at_speed = false;
-      entry_ticks_ = 0;
-    } else if (at_speed) {
-      if (error_rps > exit_rps) {
-        at_speed = false;
-        entry_ticks_ = 0;
-      }
-    } else if (error_rps <= entry_rps_) {
-      at_speed = ++entry_ticks_ >= entry_tick_count_;
-    } else {
-      entry_ticks_ = 0;
-    }
+    at_speed = detail::StepVelocityReadiness(
+        at_speed, entry_ticks_, velocity_rps_, goal_rps_, entry_rps_, exit_rps,
+        entry_tick_count_, velocity_recent_);
   }
   phase_ = !driving_  ? VelocityPhase::kStopped
            : at_speed ? VelocityPhase::kAtSpeed

@@ -267,6 +267,82 @@ TEST(LayoutValidation, AVersion8SegmentIsRefusedUntilASessionReplacesIt) {
   EXPECT_TRUE(reader.register_reader().has_value());
 }
 
+// REQ-CONTRACT-36: an old version-8 segment smaller than v9's 2368 B
+// RTMSHeader must still report the version-mismatch diagnostic and shm_unlink
+// remedy rather than failing an opaque size check before reading version.
+TEST(LayoutValidation, SmallVersion8SegmentReportsVersionMismatchWithRemedy) {
+  constexpr std::size_t kSlots = 16;
+  const std::string path = make_test_path("v8_small");
+  // Both a header-only v8 segment (832 B) and a complete small-ring v8 segment
+  // are smaller than v9's sizeof(RTMSHeader) (2368 B).
+  static_assert(sizeof(Version8Header) < sizeof(RTMSHeader));
+  const std::vector<std::byte> left = LeaveVersion8Segment(path, kSlots, 0);
+  ASSERT_FALSE(left.empty());
+  ASSERT_LT(left.size(), sizeof(RTMSHeader));
+
+  for (const RTMSOptions options :
+       {overwrite_sequence_options(), RTMSOptions{.publisher = true}}) {
+    SCOPED_TRACE(options.publisher ? "writer" : "reader");
+    try {
+      RTMSQueue queue{path,
+                      sizeof(Message::TestMessage),
+                      alignof(Message::TestMessage),
+                      kSchema,
+                      kSlots,
+                      options};
+      FAIL() << "expected version-mismatch runtime_error";
+    } catch (const std::runtime_error& err) {
+      const std::string message = err.what();
+      EXPECT_NE(message.find(path), std::string::npos) << message;
+      EXPECT_NE(message.find("version 8"), std::string::npos) << message;
+      EXPECT_NE(message.find("expected " + std::to_string(kRtmsVersion)),
+                std::string::npos)
+          << message;
+      EXPECT_NE(message.find("shm_unlink " + ShmObjectName(path)),
+                std::string::npos)
+          << message;
+    }
+    EXPECT_EQ(SegmentBytes(path, left.size()), left)
+        << "the refused attach wrote to it";
+  }
+
+  // Also check a segment truncated to just Version8Header (no ring slots).
+  const std::string trunc_path = make_test_path("v8_hdr");
+  ::shm_unlink(ShmObjectName(trunc_path).c_str());
+  const int fd = ::shm_open(ShmObjectName(trunc_path).c_str(),
+                            O_CREAT | O_EXCL | O_RDWR, 0666);
+  ASSERT_GE(fd, 0) << std::strerror(errno);
+  ASSERT_EQ(::ftruncate(fd, static_cast<off_t>(sizeof(Version8Header))), 0);
+  void* mapped = ::mmap(nullptr, sizeof(Version8Header), PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, 0);
+  ::close(fd);
+  ASSERT_NE(mapped, MAP_FAILED);
+  Version8Header header{};
+  header.magic = kRtmsMagic;
+  header.version = 8;
+  std::memcpy(mapped, &header, sizeof(header));
+  ::munmap(mapped, sizeof(Version8Header));
+
+  try {
+    RTMSQueue queue{trunc_path,
+                    sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage),
+                    kSchema,
+                    kSlots,
+                    overwrite_sequence_options()};
+    FAIL() << "expected version-mismatch runtime_error";
+  } catch (const std::runtime_error& err) {
+    const std::string message = err.what();
+    EXPECT_NE(message.find(trunc_path), std::string::npos) << message;
+    EXPECT_NE(message.find("version 8"), std::string::npos) << message;
+    EXPECT_NE(message.find("shm_unlink " + ShmObjectName(trunc_path)),
+              std::string::npos)
+        << message;
+  }
+  ::shm_unlink(ShmObjectName(trunc_path).c_str());
+  ::shm_unlink(ShmObjectName(path).c_str());
+}
+
 TEST(ReaderOwnership, ReleaseRejectsInvalidFreeAndForeignReaders) {
   const auto path = make_test_path("release");
   RTMSQueue queue{path, 8, 8, kSchema, 2};
@@ -1217,7 +1293,7 @@ talos::schema::Identity Reading(const char* env) {
 
 // The D2 gate: a field whose type changed while its size did not (level_m
 // float -> int, both 4 bytes) must not attach, however equal the layouts are.
-// REQ-CONTRACT-21
+// REQ-CONTRACT-07, REQ-CONTRACT-21
 TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
   const talos::schema::Identity before = Reading("TALOS_VARIANT_FLOAT_LEVEL");
   const talos::schema::Identity after = Reading("TALOS_VARIANT_INT_LEVEL");
@@ -1227,15 +1303,23 @@ TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
 
   constexpr std::size_t kBytes = 8;  // float or int, then two bytes, padded
   RTMSQueue publisher{path, kBytes, 4, before, 16, publisher_options()};
-  EXPECT_THROW((RTMSQueue{path, kBytes, 4, after, 16, sequence_options()}),
-               std::runtime_error);
+  try {
+    RTMSQueue mismatched{path, kBytes, 4, after, 16, sequence_options()};
+    FAIL() << "expected schema hash mismatch";
+  } catch (const std::runtime_error& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find(talos::schema::Describe(before)), std::string::npos)
+        << what;
+    EXPECT_NE(what.find(talos::schema::Describe(after)), std::string::npos)
+        << what;
+  }
   // The same schema attaches.
   RTMSQueue same{path, kBytes, 4, before, 16, sequence_options()};
   EXPECT_EQ(same.schema_hash(), before.hash);
   EXPECT_EQ(same.schema_name(), "schema_variant.Reading");
 }
 
-// REQ-CONTRACT-21
+// REQ-CONTRACT-07, REQ-CONTRACT-21
 TEST(RTMSSchema, ANameMismatchIsRejectedEvenWithTheSameHash) {
   const std::string path = make_test_path("schema_name");
   shm_unlink(ShmObjectName(path).c_str());
@@ -1245,11 +1329,20 @@ TEST(RTMSSchema, ANameMismatchIsRejectedEvenWithTheSameHash) {
                       kSchema,
                       16,
                       publisher_options()};
-  EXPECT_THROW(
-      RTMSQueue(path, sizeof(Message::TestMessage),
-                alignof(Message::TestMessage),
-                {"Message.Renamed", kSchema.hash}, 16, sequence_options()),
-      std::runtime_error);
+  const talos::schema::Identity renamed{"Message.Renamed", kSchema.hash};
+  try {
+    RTMSQueue mismatched{path,
+                         sizeof(Message::TestMessage),
+                         alignof(Message::TestMessage),
+                         renamed,
+                         16,
+                         sequence_options()};
+    FAIL() << "expected schema name mismatch";
+  } catch (const std::runtime_error& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find(kSchema.name), std::string::npos) << what;
+    EXPECT_NE(what.find(renamed.name), std::string::npos) << what;
+  }
 }
 
 // --- segment lifetime
@@ -1422,6 +1515,45 @@ TEST(RTMSLifetime, ASegmentLeftClosingByAKilledHolderIsReclaimed) {
                      sequence_options()};
   // A fresh segment, not the abandoned one holding the child's message.
   EXPECT_EQ(reopened.writer_sequence(), 0u);
+}
+
+// REQ-CONTRACT-21 / REQ-OPS-03: when ClaimWriter() fails during open() on a
+// standalone segment, a non-last opener drops its count leaving the segment
+// alive, while a last-holder opener runs the CAS close/unlink protocol so the
+// shared-memory segment is not leaked.
+TEST(RTMSLifetime, ClaimWriterFailureAsLastHolderUnlinksStandaloneSegment) {
+  const std::string path = make_test_path("claim_fail");
+  shm_unlink(ShmObjectName(path).c_str());
+  RTMSQueue owner{path,
+                  sizeof(Message::TestMessage),
+                  alignof(Message::TestMessage),
+                  kSchema,
+                  16,
+                  publisher_options()};
+  SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+  auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+  ASSERT_EQ(header->lifetime.load(std::memory_order_acquire), 1u);
+
+  // While another holder remains, a failed ClaimWriter keeps the segment alive
+  // and restores the holder count.
+  EXPECT_THROW((RTMSQueue{path, sizeof(Message::TestMessage),
+                          alignof(Message::TestMessage), kSchema, 16,
+                          publisher_options()}),
+               std::runtime_error);
+  EXPECT_TRUE(SegmentExists(path));
+  EXPECT_EQ(header->lifetime.load(std::memory_order_acquire), 1u);
+
+  // Simulate the concurrent close of the previous holder before the failing
+  // opener's catch block runs (count drops to 0 before the opener releases its
+  // increment, while owner_pid is still live so ClaimWriter throws).
+  header->lifetime.store(0, std::memory_order_release);
+  EXPECT_THROW((RTMSQueue{path, sizeof(Message::TestMessage),
+                          alignof(Message::TestMessage), kSchema, 16,
+                          publisher_options()}),
+               std::runtime_error);
+  EXPECT_FALSE(SegmentExists(path));
+  EXPECT_NE(header->lifetime.load(std::memory_order_acquire) & kLifetimeClosing,
+            0u);
 }
 
 // --- dead readers

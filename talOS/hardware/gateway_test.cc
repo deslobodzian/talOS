@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "config_wire.h"
+#include "endpoint.h"
 #include "gateway_test_support.h"
 #include "sim_backend.h"
 #include "sim_physics.h"
@@ -29,6 +30,7 @@ namespace {
 
 using namespace gateway_test;  // NOLINT(google-build-using-namespace)
 
+// REQ-CONTRACT-02: fully capped State and Command encode at exact maxima
 TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   State state;
   state.motor_count = kMaxMotors;
@@ -177,16 +179,18 @@ TEST(Messages, MotorDiagnosticsUseSaturatingSignedTenths) {
   EXPECT_DOUBLE_EQ(decoded.motors[0].supply_current_a, 3276.7);
   EXPECT_DOUBLE_EQ(decoded.motors[0].stator_current_a, 3276.7);
 
+  // The raw codec rejects non-finite signed-tenths fields; public Encode
+  // sanitizes them through ReplaceNonFinite (tested below).
   for (double invalid : {std::numeric_limits<double>::infinity(),
                          std::numeric_limits<double>::quiet_NaN()}) {
     motor.temperature_c = invalid;
-    EXPECT_EQ(Encode(state, bytes), 0u);
+    EXPECT_EQ(detail::EncodeUnsanitizedState(state, bytes), 0u);
     motor.temperature_c = 25;
     motor.supply_current_a = invalid;
-    EXPECT_EQ(Encode(state, bytes), 0u);
+    EXPECT_EQ(detail::EncodeUnsanitizedState(state, bytes), 0u);
     motor.supply_current_a = 0;
     motor.stator_current_a = invalid;
-    EXPECT_EQ(Encode(state, bytes), 0u);
+    EXPECT_EQ(detail::EncodeUnsanitizedState(state, bytes), 0u);
     motor.stator_current_a = 0;
   }
 }
@@ -887,6 +891,8 @@ Config EveryDeviceKindConfig() {
   roller.max_velocity_rps = 90;
   roller.cruise_velocity_rps = 30;
   roller.acceleration_rps2 = 60;
+  roller.foc = true;
+  roller.max_torque_current_a = 40;
   roller.motor_type.value = MotorType::kKrakenX44;
   c.motors = {arm, follower, roller};
   c.sensors = {
@@ -961,6 +967,160 @@ TEST(ConfigWire, BothEndsComputeOneIdCoveringEveryWireSetting) {
   // changed; every other byte must, or the sweep proves little.
   EXPECT_GT(changed_offsets, bytes.size() * 3 / 4)
       << changed_offsets << " of " << bytes.size() << " bytes";
+
+  // Constrained wire fields that single-bit flips silently skip because
+  // Validate() or DeserializeConfig() rejects a one-byte mutation: mutate each
+  // into another valid config and prove ConfigurationId() changes and matches
+  // the gateway's id over the wire.
+  const auto expect_id_changes = [](const char* label, const Config& base,
+                                    const Config& mutated) {
+    SCOPED_TRACE(label);
+    ASSERT_NO_THROW(Validate(base));
+    ASSERT_NO_THROW(Validate(mutated));
+    const uint64_t base_id = ConfigurationId(base);
+    const uint64_t mutated_id = ConfigurationId(mutated);
+    EXPECT_NE(mutated_id, base_id);
+    EXPECT_EQ(GatewayConfigId(mutated), mutated_id);
+  };
+
+  // foc (isolated on a motor without max_torque_current_a) and
+  // max_torque_current_a (isolated on an FOC motor).
+  {
+    auto m = config;
+    m.motors[0].foc = true;
+    expect_id_changes("arm.foc", config, m);
+  }
+  {
+    auto m = config;
+    m.motors[2].max_torque_current_a = 20;
+    expect_id_changes("roller.max_torque_current_a nonzero", config, m);
+  }
+  {
+    auto m = config;
+    m.motors[2].max_torque_current_a = 0;
+    expect_id_changes("roller.max_torque_current_a zero", config, m);
+    auto no_foc = m;
+    no_foc.motors[2].foc = false;
+    expect_id_changes("roller.foc", m, no_foc);
+  }
+  // follower.master_id: clearing to independent (0) and retargeting to another
+  // valid non-torque master.
+  {
+    auto m = config;
+    m.motors[1].master_id = 0;
+    expect_id_changes("follower.master_id to 0", config, m);
+  }
+  {
+    auto base = config;
+    base.motors[2].max_torque_current_a = 0;
+    auto m = base;
+    m.motors[1].master_id = m.motors[2].id;
+    expect_id_changes("follower.master_id retarget", base, m);
+  }
+  // arm.feedback and arm.feedback_sensor_id (isolated by adding a second
+  // CANcoder on the same bus).
+  {
+    auto m = config;
+    m.motors[0].feedback = Feedback::kRotor;
+    m.motors[0].feedback_sensor_id = 0;
+    expect_id_changes("arm.feedback", config, m);
+  }
+  {
+    auto base = config;
+    base.sensors.push_back(
+        {12, "arm_encoder_alt", SensorKind::kCANcoder, 21, "rio", false, 0.0});
+    auto m = base;
+    m.motors[0].feedback_sensor_id = 12;
+    expect_id_changes("arm.feedback_sensor_id", base, m);
+  }
+  // Referenced device ids and shared CAN bus (must move with their references).
+  {
+    auto m = config;
+    m.motors[0].id = 101;
+    m.motors[1].master_id = 101;
+    expect_id_changes("referenced arm.id", config, m);
+  }
+  {
+    auto m = config;
+    m.sensors[0].id = 110;
+    m.motors[0].feedback_sensor_id = 110;
+    expect_id_changes("referenced sensor.id", config, m);
+  }
+  {
+    auto m = config;
+    m.motors[0].bus = "canivore";
+    m.motors[1].bus = "canivore";
+    m.sensors[0].bus = "canivore";
+    expect_id_changes("referenced CAN bus", config, m);
+  }
+  // Two-bit-apart enums (SensorKind, EncoderKind) that single-bit flips never
+  // land on validly.
+  {
+    auto m = config;
+    m.sensors[1].kind = SensorKind::kCANcoder;
+    expect_id_changes("sensor.kind", config, m);
+  }
+  {
+    auto m = config;
+    m.encoders[0].kind = EncoderKind::kDutyCycle;
+    expect_id_changes("encoder.kind", config, m);
+  }
+  // Every device list count: removing one unreferenced device from each list.
+  {
+    auto m = config;
+    m.motors.pop_back();
+    expect_id_changes("motors.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.sensors.pop_back();
+    expect_id_changes("sensors.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.digital_inputs.pop_back();
+    expect_id_changes("digital_inputs.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.digital_outputs.pop_back();
+    expect_id_changes("digital_outputs.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.analog_inputs.pop_back();
+    expect_id_changes("analog_inputs.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.encoders.pop_back();
+    expect_id_changes("encoders.size()", config, m);
+  }
+  {
+    auto m = config;
+    m.pwm_outputs.pop_back();
+    expect_id_changes("pwm_outputs.size()", config, m);
+  }
+  // Identical element fields in different device lists (id=1, name="dev",
+  // channel/dio=0) must hash differently, proving list counts enter the hash.
+  {
+    Config with_di;
+    with_di.digital_inputs.push_back({1, "dev", 0});
+    Config with_do;
+    with_do.digital_outputs.push_back({1, "dev", 0});
+    Config with_ai;
+    with_ai.analog_inputs.push_back({1, "dev", 0});
+    Config with_pwm;
+    with_pwm.pwm_outputs.push_back({1, "dev", 0});
+    const std::array<uint64_t, 4> list_ids{
+        ConfigurationId(with_di), ConfigurationId(with_do),
+        ConfigurationId(with_ai), ConfigurationId(with_pwm)};
+    for (std::size_t i = 0; i < list_ids.size(); ++i) {
+      for (std::size_t j = i + 1; j < list_ids.size(); ++j) {
+        EXPECT_NE(list_ids[i], list_ids[j]) << "list " << i << " vs " << j;
+      }
+    }
+  }
 }
 // Consumers tell consecutive States from a gap by sequence + 1, so every
 // tick counts, across a reconfigure too.
@@ -983,21 +1143,26 @@ TEST(Gateway, RequiresEnableCommissioningAndMatchingManifest) {
   Gateway g{SwerveConfig(true), backend, 1};
   g.Tick(1000, false);
   EXPECT_FALSE(g.Accept(Request(g), 1, 1000));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
   g.Tick(2000, true);
   auto c = Request(g);
   ++c.config_id;
   EXPECT_FALSE(g.Accept(c, 1, 2000));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
   EXPECT_EQ(backend.applied, 0);
   EXPECT_TRUE(g.Accept(Request(g), 1, 2000));
   FakeBackend other;
   Gateway uncommissioned{SwerveConfig(false), other, 2};
   uncommissioned.Tick(2000, true);
   EXPECT_FALSE(uncommissioned.Accept(Request(uncommissioned), 1, 2000));
+  EXPECT_EQ(other.applied, 0);
+  EXPECT_EQ(uncommissioned.snapshot().counters.rejected_command_count, 1u);
 }
 // While the robot cannot drive, every node flushes neutral and the bridge
 // keeps forwarding the merge. Counting those refusals would bury every real
 // rejection under a steady climb; a command that asks for output or carries
 // another identity still counts.
+// REQ-SAFE-17
 TEST(Gateway, NeutralRefusedWhileUnableToDriveIsNotARejection) {
   for (const bool commissioned : {true, false}) {
     SCOPED_TRACE(commissioned ? "disabled" : "enabled, uncommissioned");
@@ -1018,6 +1183,16 @@ TEST(Gateway, NeutralRefusedWhileUnableToDriveIsNotARejection) {
     EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
     EXPECT_FALSE(g.Accept(Request(g), 5, 1000));
     EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
+    // A neutral motor request carrying a demand or a feedforward is not the
+    // flush's neutral.
+    auto with_demand = neutral;
+    with_demand.motors[0].demand = 1;
+    EXPECT_FALSE(g.Accept(with_demand, 6, 1000));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 3u);
+    auto with_feedforward = neutral;
+    with_feedforward.motors[0].feedforward_v = 1;
+    EXPECT_FALSE(g.Accept(with_feedforward, 7, 1000));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 4u);
     EXPECT_EQ(backend.applied, 0);
   }
 }
@@ -1060,15 +1235,26 @@ Command AllMotorsNeutral(Command c) {
 // in ten, where operators expect it flat.
 // REQ-SAFE-17
 TEST(Gateway, NeutralInFlightAcrossAnEpochChangeIsNotARejection) {
+  // Every output is addressed and off: all-neutral covers digital and PWM.
+  auto config = SwerveConfig(true);
+  config.digital_outputs.push_back({40, "solenoid", 1});
+  config.pwm_outputs.push_back({41, "servo", 0});
+  const auto outputs_off = [](Command c) {
+    c.digital_output_count = 1;
+    c.digital_outputs[0] = {40, false};
+    c.pwm_output_count = 1;
+    c.pwm_outputs[0] = {41, PwmMode::kOff, 0.0};
+    return c;
+  };
   for (const bool enabling : {true, false}) {
     SCOPED_TRACE(enabling ? "enable edge" : "disable edge");
     FakeBackend backend;
-    Gateway g{SwerveConfig(true), backend, 1};
+    Gateway g{config, backend, 1};
     g.Tick(1000, !enabling);
     if (!enabling) {
-      ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+      ASSERT_TRUE(g.Accept(outputs_off(Request(g)), 1, 1000));
     }
-    const auto in_flight = AllMotorsNeutral(Request(g));
+    const auto in_flight = outputs_off(AllMotorsNeutral(Request(g)));
     g.Tick(2000, enabling);
     ASSERT_GT(g.snapshot().epoch, in_flight.epoch);
     const auto applied = backend.applied;
@@ -1159,6 +1345,7 @@ TEST(Gateway, PwmRequestsReachTheBackendAsSentAndABadOneRejectsTheCommand) {
       {"a pulse of 0", {41, PwmMode::kPulse, 0.0}, true},
       {"a pulse of -1", {41, PwmMode::kPulse, -1.0}, true},
       {"a pulse above 1", {41, PwmMode::kPulse, 1.5}, false},
+      {"a pulse below -1", {41, PwmMode::kPulse, -1.5}, false},
       {"a pulse not finite", {41, PwmMode::kPulse, std::nan("")}, false},
       {"mode 2", {41, static_cast<PwmMode>(2), 0.0}, false},
   };
@@ -1337,7 +1524,7 @@ bool AllFinite(const State& s) {
 // the health sample) invalid where it has a validity, and a CAN bus slot with
 // one a failed read. Every motor and CAN sensor non-finite is total loss, as
 // any other invalid feedback is.
-// REQ-SAFE-22, REQ-CONTRACT-32
+// REQ-SAFE-22, REQ-CONTRACT-32, REQ-CONTRACT-43
 TEST(Gateway, ANonFiniteReadingInvalidatesOnlyItsSampleAndTheStateDecodes) {
   constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
   constexpr double kInf = std::numeric_limits<double>::infinity();
@@ -1478,6 +1665,319 @@ TEST(Gateway, ANonFiniteReadingInvalidatesOnlyItsSampleAndTheStateDecodes) {
   }
 }
 
+// Public Encode(const State&, ...) is the single encoding boundary for every
+// State producer: it leaves finite wire bytes bit-for-bit identical to
+// detail::EncodeUnsanitizedState, never mutates the caller's State, replaces
+// every non-finite field per ReplaceNonFinite so Decode always succeeds where
+// raw encoding would either return 0 or emit undecodable bytes, and still
+// returns 0 cleanly on structural errors (including out-of-range device counts
+// without OOB access).
+// REQ-SAFE-22, REQ-CONTRACT-32, REQ-CONTRACT-43
+TEST(Messages, EncodeStateSanitizesEveryNonFiniteFieldAndPreservesFiniteBytes) {
+  State base;
+  base.config_id = 0x1122334455667788ull;
+  base.boot_id = 42;
+  base.epoch = 3;
+  base.sample_time_us = 123456;
+  base.motor_count = 2;
+  base.motors[0] = {1, true, 1.5, -2.5, 6.0, 12.5, 100, 200, 7, 35.5, 4.5};
+  base.motors[1] = {2, true, 3.0, 4.0, 5.0, 8.0, 50, 60, 0, 28.0, 3.0};
+  base.sensor_count = 2;
+  base.sensors[0] = {10, true, 0.25, -0.75, 150, 250};
+  base.sensors[1] = {11, true, -0.125, 1.25, 10, 20};
+  base.analog_input_count = 1;
+  base.analog_inputs[0] = {20, true, 3.3, 300};
+  base.encoder_count = 1;
+  base.encoders[0] = {30, true, 2.25, -1.5, 400};
+  base.pwm_output_count = 1;
+  base.pwm_outputs[0] = {40, true, 0.5};
+  base.health = {.valid = true,
+                 .battery_v = 12.4,
+                 .brownout = true,
+                 .can_bus_count = 1,
+                 .can_bus_index = 0,
+                 .can_bus = {CanBusReadState::kOk, 0.25F, 5, 6, 7, 8, 9}};
+
+  std::array<uint8_t, kMaxStateSize> raw_bytes{};
+  std::array<uint8_t, kMaxStateSize> sanitized_bytes{};
+  const std::size_t raw_size = detail::EncodeUnsanitizedState(base, raw_bytes);
+  const std::size_t sanitized_size = Encode(base, sanitized_bytes);
+  ASSERT_GT(raw_size, 0u);
+  EXPECT_EQ(sanitized_size, raw_size);
+  EXPECT_EQ(sanitized_bytes, raw_bytes);
+
+  const double kNonFinite[] = {
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+  };
+
+  struct Case {
+    const char* name;
+    void (*inject)(State&, double);
+    void (*verify)(const State&);
+  };
+  const Case cases[] = {
+      {"motor.position_rot",
+       [](State& s, double v) { s.motors[0].position_rot = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].position_rot, 0.0);
+         EXPECT_EQ(d.motors[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.motors[0].voltage, 0.0);
+         EXPECT_EQ(d.motors[0].stator_current_a, 0.0);
+         EXPECT_EQ(d.motors[0].supply_current_a, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].temperature_c, 35.5);
+         EXPECT_EQ(d.motors[0].fault_flags, 7u);
+         EXPECT_TRUE(d.motors[1].valid);
+         EXPECT_DOUBLE_EQ(d.motors[1].position_rot, 3.0);
+       }},
+      {"motor.velocity_rps",
+       [](State& s, double v) { s.motors[0].velocity_rps = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].position_rot, 0.0);
+         EXPECT_EQ(d.motors[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.motors[0].voltage, 0.0);
+         EXPECT_TRUE(d.motors[1].valid);
+       }},
+      {"motor.voltage", [](State& s, double v) { s.motors[0].voltage = v; },
+       [](const State& d) {
+         EXPECT_TRUE(d.motors[0].valid);
+         EXPECT_DOUBLE_EQ(d.motors[0].position_rot, 1.5);
+         EXPECT_DOUBLE_EQ(d.motors[0].velocity_rps, -2.5);
+         EXPECT_EQ(d.motors[0].voltage, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].stator_current_a, 12.5);
+       }},
+      {"motor.stator_current_a",
+       [](State& s, double v) { s.motors[0].stator_current_a = v; },
+       [](const State& d) {
+         EXPECT_TRUE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].stator_current_a, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].supply_current_a, 4.5);
+       }},
+      {"motor.supply_current_a",
+       [](State& s, double v) { s.motors[0].supply_current_a = v; },
+       [](const State& d) {
+         EXPECT_TRUE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].supply_current_a, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].stator_current_a, 12.5);
+       }},
+      {"motor.temperature_c",
+       [](State& s, double v) { s.motors[0].temperature_c = v; },
+       [](const State& d) {
+         EXPECT_TRUE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].temperature_c, 0.0);
+         EXPECT_DOUBLE_EQ(d.motors[0].position_rot, 1.5);
+       }},
+      {"motor.position_rot+temperature_c",
+       [](State& s, double v) {
+         s.motors[0].position_rot = v;
+         s.motors[0].temperature_c = v;
+       },
+       [](const State& d) {
+         EXPECT_FALSE(d.motors[0].valid);
+         EXPECT_EQ(d.motors[0].position_rot, 0.0);
+         EXPECT_EQ(d.motors[0].temperature_c, 0.0);
+       }},
+      {"sensor.position_rot",
+       [](State& s, double v) { s.sensors[0].position_rot = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.sensors[0].valid);
+         EXPECT_EQ(d.sensors[0].position_rot, 0.0);
+         EXPECT_EQ(d.sensors[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.sensors[0].position_age_us, 150u);
+         EXPECT_TRUE(d.sensors[1].valid);
+       }},
+      {"sensor.velocity_rps",
+       [](State& s, double v) { s.sensors[0].velocity_rps = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.sensors[0].valid);
+         EXPECT_EQ(d.sensors[0].position_rot, 0.0);
+         EXPECT_EQ(d.sensors[0].velocity_rps, 0.0);
+         EXPECT_TRUE(d.sensors[1].valid);
+       }},
+      {"analog_input.voltage",
+       [](State& s, double v) { s.analog_inputs[0].voltage = v; },
+       [](const State& d) {
+         EXPECT_EQ(d.analog_inputs[0].id, 20u);
+         EXPECT_FALSE(d.analog_inputs[0].valid);
+         EXPECT_EQ(d.analog_inputs[0].voltage, 0.0);
+         EXPECT_EQ(d.analog_inputs[0].age_us, 300u);
+       }},
+      {"encoder.position_rot",
+       [](State& s, double v) { s.encoders[0].position_rot = v; },
+       [](const State& d) {
+         EXPECT_EQ(d.encoders[0].id, 30u);
+         EXPECT_FALSE(d.encoders[0].valid);
+         EXPECT_EQ(d.encoders[0].position_rot, 0.0);
+         EXPECT_EQ(d.encoders[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.encoders[0].age_us, 400u);
+       }},
+      {"encoder.velocity_rps",
+       [](State& s, double v) { s.encoders[0].velocity_rps = v; },
+       [](const State& d) {
+         EXPECT_EQ(d.encoders[0].id, 30u);
+         EXPECT_FALSE(d.encoders[0].valid);
+         EXPECT_EQ(d.encoders[0].position_rot, 0.0);
+         EXPECT_EQ(d.encoders[0].velocity_rps, 0.0);
+         EXPECT_EQ(d.encoders[0].age_us, 400u);
+       }},
+      {"pwm_output.output",
+       [](State& s, double v) { s.pwm_outputs[0].output = v; },
+       [](const State& d) {
+         EXPECT_EQ(d.pwm_outputs[0].id, 40u);
+         EXPECT_FALSE(d.pwm_outputs[0].valid);
+         EXPECT_EQ(d.pwm_outputs[0].output, 0.0);
+       }},
+      {"health.battery_v", [](State& s, double v) { s.health.battery_v = v; },
+       [](const State& d) {
+         EXPECT_FALSE(d.health.valid);
+         EXPECT_EQ(d.health.battery_v, 0.0);
+         EXPECT_TRUE(d.health.brownout);
+         EXPECT_EQ(d.health.can_bus.read_state, CanBusReadState::kOk);
+       }},
+      {"health.can_bus.utilization_frac (kOk)",
+       [](State& s, double v) {
+         s.health.can_bus.read_state = CanBusReadState::kOk;
+         s.health.can_bus.utilization_frac = static_cast<float>(v);
+       },
+       [](const State& d) {
+         EXPECT_EQ(d.health.can_bus.utilization_frac, 0.0F);
+         EXPECT_EQ(d.health.can_bus.read_state, CanBusReadState::kFailed);
+         EXPECT_EQ(d.health.can_bus.bus_off_count, 5u);
+       }},
+      {"health.can_bus.utilization_frac (kPending)",
+       [](State& s, double v) {
+         s.health.can_bus.read_state = CanBusReadState::kPending;
+         s.health.can_bus.utilization_frac = static_cast<float>(v);
+       },
+       [](const State& d) {
+         EXPECT_EQ(d.health.can_bus.utilization_frac, 0.0F);
+         EXPECT_EQ(d.health.can_bus.read_state, CanBusReadState::kFailed);
+       }},
+      {"health.can_bus.utilization_frac (kStale preserved)",
+       [](State& s, double v) {
+         s.health.can_bus.read_state = CanBusReadState::kStale;
+         s.health.can_bus.utilization_frac = static_cast<float>(v);
+       },
+       [](const State& d) {
+         EXPECT_EQ(d.health.can_bus.utilization_frac, 0.0F);
+         EXPECT_EQ(d.health.can_bus.read_state, CanBusReadState::kStale);
+       }},
+  };
+
+  for (const auto& c : cases) {
+    for (const double bad_value : kNonFinite) {
+      SCOPED_TRACE(c.name);
+      State dirty = base;
+      c.inject(dirty, bad_value);
+
+      // Raw encoding either refuses the State (tenths) or emits bytes Decode
+      // rejects: skipping sanitization cannot pass silently.
+      std::array<uint8_t, kMaxStateSize> raw{};
+      const std::size_t raw_written =
+          detail::EncodeUnsanitizedState(dirty, raw);
+      State raw_decoded{};
+      EXPECT_FALSE(raw_written > 0 &&
+                   Decode(std::span{raw}.first(raw_written), raw_decoded));
+
+      std::array<uint8_t, kMaxStateSize> clean{};
+      const std::size_t clean_written = Encode(dirty, clean);
+      ASSERT_EQ(clean_written, raw_size);
+      // Caller's State still holds its injected non-finite field.
+      EXPECT_FALSE(AllFinite(dirty));
+
+      State decoded{};
+      ASSERT_TRUE(Decode(std::span{clean}.first(clean_written), decoded));
+      EXPECT_TRUE(AllFinite(decoded));
+      c.verify(decoded);
+    }
+  }
+
+  // Structural errors still return 0 cleanly without out-of-bounds access.
+  using Mutator = void (*)(State&);
+  const Mutator mutators[] = {
+      [](State& s) { s.motor_count = kMaxMotors + 1; },
+      [](State& s) { s.sensor_count = kMaxSensors + 1; },
+      [](State& s) { s.digital_input_count = kMaxDigitalInputs + 1; },
+      [](State& s) { s.digital_output_count = kMaxDigitalOutputs + 1; },
+      [](State& s) { s.analog_input_count = kMaxAnalogInputs + 1; },
+      [](State& s) { s.encoder_count = kMaxEncoders + 1; },
+      [](State& s) { s.pwm_output_count = kMaxPwmOutputs + 1; },
+      [](State& s) {
+        s.build.program = static_cast<GatewayProgram>(
+            static_cast<uint8_t>(kLastGatewayProgram) + 1);
+      },
+      [](State& s) { s.health.can_bus_count = kMaxCanBuses + 1; },
+      [](State& s) { s.health.can_bus_index = 1; },
+      [](State& s) {
+        s.health.can_bus.read_state = static_cast<CanBusReadState>(
+            static_cast<uint8_t>(kLastCanBusReadState) + 1);
+      },
+  };
+  for (const Mutator mutate : mutators) {
+    State bad = base;
+    mutate(bad);
+    EXPECT_EQ(Encode(bad, sanitized_bytes), 0u);
+  }
+  EXPECT_EQ(Encode(base, std::span{sanitized_bytes}.first(raw_size - 1)), 0u);
+}
+
+// Endpoint::Tick encodes through Encode (which applies ReplaceNonFinite), and
+// Gateway::snapshot() also enforces ReplaceNonFinite even while unconfigured:
+// non-finite HAL-like readings (battery voltage, analog input, PWM output,
+// motor effort, CAN bus utilization) never cause Endpoint::Tick to fail with
+// kInvalidArgument and always yield a decodable State with expected validity
+// cleared and 0 substituted.
+// REQ-SAFE-22, REQ-CONTRACT-32
+TEST(Gateway, EndpointEncodesNonFiniteHalReadingsAsValidDecodableState) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  auto config = SwerveConfig(true);
+  config.analog_inputs = {{22, "pressure", 2}};
+  config.pwm_outputs = {{25, "servo", 5}};
+  NonFiniteBackend backend;
+  backend.measurement = 0.5;
+  backend.overwrite = [&](State& s) {
+    s.health.valid = true;
+    s.health.battery_v = kNaN;
+    s.health.can_bus = {
+        .read_state = CanBusReadState::kOk,
+        .utilization_frac = std::numeric_limits<float>::quiet_NaN(),
+        .bus_off_count = 2};
+    s.analog_inputs[0] = {22, true, kInf, 77};
+    s.pwm_outputs[0] = {25, true, -kInf};
+    s.motors[0].stator_current_a = kNaN;
+    s.motors[0].temperature_c = kInf;
+  };
+  Gateway gateway{config, backend, 7};
+  Endpoint endpoint{gateway};
+  endpoint.SetSendEnabled(false);
+
+  EXPECT_EQ(endpoint.Tick(1000, true), protocol::UdpStatus::kOk);
+  const State snap = gateway.snapshot();
+  EXPECT_TRUE(AllFinite(snap));
+  std::array<uint8_t, kMaxStateSize> bytes{};
+  const std::size_t size = Encode(snap, bytes);
+  ASSERT_GT(size, 0u);
+  State decoded{};
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_FALSE(decoded.health.valid);
+  EXPECT_EQ(decoded.health.battery_v, 0.0);
+  EXPECT_EQ(decoded.health.can_bus.read_state, CanBusReadState::kFailed);
+  EXPECT_EQ(decoded.health.can_bus.utilization_frac, 0.0F);
+  EXPECT_EQ(decoded.health.can_bus.bus_off_count, 2u);
+  EXPECT_FALSE(decoded.analog_inputs[0].valid);
+  EXPECT_EQ(decoded.analog_inputs[0].voltage, 0.0);
+  EXPECT_EQ(decoded.analog_inputs[0].age_us, 77u);
+  EXPECT_FALSE(decoded.pwm_outputs[0].valid);
+  EXPECT_EQ(decoded.pwm_outputs[0].output, 0.0);
+  EXPECT_TRUE(decoded.motors[0].valid);
+  EXPECT_EQ(decoded.motors[0].stator_current_a, 0.0);
+  EXPECT_EQ(decoded.motors[0].temperature_c, 0.0);
+}
+
 // The bench's CAN silences froze the feedback of its one Talon FX for
 // 64-66 ms (TODO.md RESET-3). Feedback younger than command_timeout_us still
 // counts: through the gap the command in force keeps driving, with no
@@ -1528,10 +2028,11 @@ TEST(Gateway, FeedbackAtTheTimeoutIsolatesItsMotor) {
   const auto steer = MotorIndex(config, Feedback::kRemoteCANcoder);
   const uint16_t drive_id = config.motors[drive].id;
   const uint16_t encoder_id = config.motors[steer].feedback_sensor_id;
-  for (int row = 0; row < 3; ++row) {
+  for (int row = 0; row < 4; ++row) {
     SCOPED_TRACE(row == 0   ? "motor position age"
                  : row == 1 ? "motor velocity age"
-                            : "remote CANcoder position age");
+                 : row == 2 ? "remote CANcoder position age"
+                            : "remote CANcoder velocity age");
     FakeBackend backend;
     Gateway g{config, backend, 1};
     g.Tick(1000, true);
@@ -1539,7 +2040,8 @@ TEST(Gateway, FeedbackAtTheTimeoutIsolatesItsMotor) {
     if (row == 0) backend.position_ages[drive_id] = bound;
     if (row == 1) backend.velocity_ages[drive_id] = bound;
     if (row == 2) backend.position_ages[encoder_id] = bound;
-    const std::size_t isolated = row == 2 ? steer : drive;
+    if (row == 3) backend.velocity_ages[encoder_id] = bound;
+    const std::size_t isolated = row >= 2 ? steer : drive;
     g.Tick(6000, true);
     ASSERT_TRUE(g.Accept(Request(g), 1, 6000));
     for (std::size_t i = 0; i < config.motors.size(); ++i) {
@@ -1780,7 +2282,54 @@ TEST(Gateway, NeutralRefusedDuringTotalLossIsNotARejection) {
   EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
   EXPECT_FALSE(g.Accept(Request(g), 4, 6000));
   EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  // The exemption is for the bridge's own neutral: one that fails an
+  // identity check still counts.
+  auto misidentified = neutral;
+  ++misidentified.config_id;
+  EXPECT_FALSE(g.Accept(misidentified, 5, 6000));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
   EXPECT_EQ(backend.applied, 0);
+}
+
+// While enabled and faulted (e.g. after consecutive global apply failures
+// latch fault_), State carries kHardwareFault, so every node flushes neutral
+// and the bridge forwards that merge with the fault's epoch. Refusing those
+// current neutrals is the gate working and must not inflate
+// rejected_command_count; a driving or misidentified command still counts.
+// REQ-OPS-20
+TEST(Gateway, NeutralRefusedWhileFaultedIsNotARejection) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  backend.apply_ok = false;
+  uint64_t seq = 1;
+  uint64_t now = 1000;
+  for (uint32_t i = 0; i < Gateway::kConsecutiveApplyFailureLimit; ++i) {
+    now += 5000;
+    g.Tick(now, true);
+    EXPECT_FALSE(g.Accept(Request(g), seq++, now));
+  }
+  ASSERT_TRUE((g.snapshot().flags & kHardwareFault) != 0u);
+  ASSERT_EQ(g.snapshot().counters.apply_failure_count,
+            Gateway::kConsecutiveApplyFailureLimit);
+  ASSERT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+
+  const int applied_before = backend.applied;
+  const auto neutral = AllMotorsNeutral(Request(g));
+  ASSERT_EQ(neutral.epoch, g.snapshot().epoch);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_FALSE(g.Accept(neutral, seq++, now));
+  }
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+
+  // Driving or misidentified commands while faulted still count as rejections.
+  EXPECT_FALSE(g.Accept(Request(g), seq++, now));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  auto misidentified = neutral;
+  ++misidentified.config_id;
+  EXPECT_FALSE(g.Accept(misidentified, seq++, now));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 2u);
+  EXPECT_EQ(backend.applied, applied_before);
 }
 
 // Total loss is not latched and clears in its own epoch, so a command built
@@ -1908,12 +2457,24 @@ TEST(Gateway, EverySampleMaskedIsTotalLoss) {
   }
 }
 
+// A structure error in any motor, digital output or PWM output refuses the
+// whole command before anything applies, and each refusal is counted.
+// REQ-SAFE-17
 TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
+  auto config = SwerveConfig(true);
+  config.digital_outputs.push_back({40, "solenoid", 1});
+  config.pwm_outputs.push_back({41, "servo", 0});
   FakeBackend backend;
-  Gateway g{SwerveConfig(true), backend, 1};
+  Gateway g{config, backend, 1};
   g.Tick(1000, true);
-  for (int invalid = 0; invalid < 6; ++invalid) {
+  constexpr uint64_t kCases = 10;
+  for (uint64_t invalid = 0; invalid < kCases; ++invalid) {
+    SCOPED_TRACE(invalid);
     auto c = Request(g);
+    c.digital_output_count = 1;
+    c.digital_outputs[0] = {40, false};
+    c.pwm_output_count = 1;
+    c.pwm_outputs[0] = {41, PwmMode::kOff, 0.0};
     auto& m = c.motors[c.count - 1];
     if (invalid == 0) m.id = 65535;
     if (invalid == 1) m.id = c.motors[0].id;
@@ -1921,9 +2482,16 @@ TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
     if (invalid == 3) m.slot = 255;
     if (invalid == 4) m.mode = static_cast<Mode>(255);
     if (invalid == 5) --c.count;
+    if (invalid == 6) c.digital_output_count = 0;
+    if (invalid == 7) c.digital_outputs[0].id = 42;
+    if (invalid == 8) c.pwm_output_count = 0;
+    if (invalid == 9) c.pwm_outputs[0].id = 42;
     EXPECT_FALSE(g.Accept(c, 1, 1000));
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, invalid + 1);
   }
   EXPECT_EQ(backend.applied, 0);
+  EXPECT_TRUE(backend.last_digital_outputs.empty());
+  EXPECT_TRUE(backend.last_pwm_outputs.empty());
 }
 // REQ-SAFE-21: outputs are neutralized before devices are reconfigured
 TEST(Gateway, NeutralizesOutputsBeforeReconfiguringDevices) {
@@ -1949,6 +2517,15 @@ TEST(Gateway, NeutralizesOutputsBeforeReconfiguringDevices) {
   EXPECT_EQ(backend.events[0], "neutral");
   EXPECT_EQ(backend.events[1], "configure");
   EXPECT_EQ(backend.events[2], "neutral");
+  // The Endpoint's asynchronous path neutralizes before the backend begins.
+  FakeBackend async;
+  Gateway pending{SwerveConfig(true), async, 2};
+  pending.Tick(1000, false);
+  async.events.clear();
+  ASSERT_TRUE(pending.BeginReconfigure(cfg));
+  ASSERT_GE(async.events.size(), 2u);
+  EXPECT_EQ(async.events[0], "neutral");
+  EXPECT_EQ(async.events[1], "begin_configure");
 }
 // REQ-SAFE-21: an identical push succeeds with no device traffic
 TEST(Gateway, RepeatedConfigurationPushIsIdempotent) {
@@ -1973,6 +2550,28 @@ TEST(Gateway, RepeatedConfigurationPushIsIdempotent) {
   EXPECT_TRUE(g.Reconfigure(changed));
   EXPECT_EQ(backend.configure_calls, configures + 1);
   EXPECT_NE(g.snapshot().epoch, epoch);
+}
+// While a device restore runs, its worker owns the devices: every push is
+// refused, an identical one while enabled included, until PollRestore ends it.
+// REQ-SAFE-21
+TEST(Gateway, IdenticalEnabledPushIsRefusedWhileARestoreRuns) {
+  const auto config = SwerveConfig(true);
+  FakeBackend backend;
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  backend.resets = {config.motors[0].id};
+  backend.pending_ticks = 1;
+  g.Tick(2000, true);  // Finds the reset and begins its restore.
+  ASSERT_EQ(backend.restoring_ids, std::vector<uint16_t>{config.motors[0].id});
+  const int configures = backend.configure_calls;
+  EXPECT_FALSE(g.Reconfigure(config));
+  EXPECT_FALSE(g.BeginReconfigure(config));
+  EXPECT_EQ(backend.configure_calls, configures);
+  g.Tick(3000, true);  // Still restoring.
+  EXPECT_FALSE(g.Reconfigure(config));
+  g.Tick(4000, true);  // The restore ends.
+  EXPECT_TRUE(g.Reconfigure(config));
+  EXPECT_EQ(backend.configure_calls, configures);
 }
 // REQ-SAFE-21: a config change applies only while disabled
 TEST(Gateway, ReconfigurationRequiresDisabledOperation) {
@@ -2085,6 +2684,7 @@ TEST(Gateway, IdenticalEnabledConfigPreservesLatchedApplyFault) {
     EXPECT_TRUE(g.Accept(Request(g), 11, 3000));
   }
 }
+// REQ-CONTRACT-02
 TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -2104,8 +2704,36 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   }
   EXPECT_FALSE(
       Decode(std::span<const uint8_t>{bytes.data(), size + 1}, decoded));
-  bytes[32] = 255;
-  EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), size}, decoded));
+  // Every device count in Command's header (starting at byte 32) accepts cap
+  // and rejects cap + 1 even when the wire buffer holds cap + 1 valid records
+  // (so rejection proves the cap check itself, not truncated EOF).
+  struct CountSpec {
+    const char* name;
+    std::size_t offset;
+    std::size_t cap;
+    std::size_t record_size;
+  };
+  const std::array<CountSpec, 3> command_counts{{
+      {"motor_count", 32, kMaxMotors, kMotorRequestSize},
+      {"digital_output_count", 34, kMaxDigitalOutputs,
+       kDigitalOutputRequestSize},
+      {"pwm_output_count", 36, kMaxPwmOutputs, kPwmRequestSize},
+  }};
+  for (const auto& spec : command_counts) {
+    SCOPED_TRACE(spec.name);
+    std::vector<uint8_t> at_cap(kCommandBaseSize + spec.cap * spec.record_size,
+                                0);
+    at_cap[spec.offset] = static_cast<uint8_t>(spec.cap & 0xFFu);
+    at_cap[spec.offset + 1] = static_cast<uint8_t>(spec.cap >> 8);
+    ASSERT_TRUE(Decode(at_cap, decoded));
+
+    const auto over = spec.cap + 1;
+    std::vector<uint8_t> over_cap(kCommandBaseSize + over * spec.record_size,
+                                  0);
+    over_cap[spec.offset] = static_cast<uint8_t>(over & 0xFFu);
+    over_cap[spec.offset + 1] = static_cast<uint8_t>(over >> 8);
+    EXPECT_FALSE(Decode(over_cap, decoded));
+  }
 
   // Full State with every device kind
   State state = g.snapshot();
@@ -2172,6 +2800,67 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   for (std::size_t i = 0; i < state_size; ++i) {
     EXPECT_FALSE(Decode(std::span<const uint8_t>{bytes.data(), i}, copy));
   }
+  EXPECT_FALSE(
+      Decode(std::span<const uint8_t>{bytes.data(), state_size + 1}, copy));
+
+  // Every device count in State's prefix (starting at byte 70) accepts cap and
+  // rejects cap + 1 even when the wire buffer holds cap + 1 valid records (so
+  // rejection proves the cap check itself, not truncated EOF).
+  const std::array<CountSpec, 7> state_counts{{
+      {"motor_count", 70, kMaxMotors, kMotorSampleSize},
+      {"sensor_count", 72, kMaxSensors, kSensorSampleSize},
+      {"digital_input_count", 74, kMaxDigitalInputs, kDigitalInputSampleSize},
+      {"digital_output_count", 76, kMaxDigitalOutputs,
+       kDigitalOutputSampleSize},
+      {"analog_input_count", 78, kMaxAnalogInputs, kAnalogInputSampleSize},
+      {"encoder_count", 80, kMaxEncoders, kEncoderSampleSize},
+      {"pwm_output_count", 82, kMaxPwmOutputs, kPwmSampleSize},
+  }};
+  for (const auto& spec : state_counts) {
+    SCOPED_TRACE(spec.name);
+    std::vector<uint8_t> at_cap(kStateBaseSize + spec.cap * spec.record_size,
+                                0);
+    at_cap[spec.offset] = static_cast<uint8_t>(spec.cap & 0xFFu);
+    at_cap[spec.offset + 1] = static_cast<uint8_t>(spec.cap >> 8);
+    ASSERT_TRUE(Decode(at_cap, copy));
+
+    const auto over = spec.cap + 1;
+    std::vector<uint8_t> over_cap(kStateBaseSize + over * spec.record_size, 0);
+    over_cap[spec.offset] = static_cast<uint8_t>(over & 0xFFu);
+    over_cap[spec.offset + 1] = static_cast<uint8_t>(over >> 8);
+    EXPECT_FALSE(Decode(over_cap, copy));
+  }
+
+  // ConfigAck rejects truncated payloads.
+  ConfigAckPayload ack{};
+  ack.config_id = 0x0102030405060708ull;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload) + 1> ack_bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, ack_bytes), sizeof(ConfigAckPayload));
+  ConfigAckPayload decoded_ack{};
+  ASSERT_TRUE(DecodeConfigAck(
+      std::span<const uint8_t>{ack_bytes.data(), sizeof(ConfigAckPayload)},
+      decoded_ack));
+  EXPECT_EQ(decoded_ack.config_id, ack.config_id);
+  EXPECT_EQ(decoded_ack.status, ack.status);
+  EXPECT_FALSE(DecodeConfigAck(
+      std::span<const uint8_t>{ack_bytes.data(), sizeof(ConfigAckPayload) - 1},
+      decoded_ack));
+
+  // ConfigAssembler rejects both truncated and trailing-byte chunks.
+  const auto chunks = CreateConfigChunks(SwerveConfig(false), 200);
+  ASSERT_FALSE(chunks.empty());
+  const auto& chunk = chunks.front();
+  ConfigAssembler assembler;
+  std::string error;
+  EXPECT_EQ(
+      assembler.AddChunk(
+          std::span<const uint8_t>{chunk.data(), chunk.size() - 1}, error),
+      ConfigAssembler::Status::kInvalidChunk);
+  std::vector<uint8_t> oversized = chunk;
+  oversized.push_back(0);
+  EXPECT_EQ(assembler.AddChunk(oversized, error),
+            ConfigAssembler::Status::kInvalidChunk);
 }
 
 // A robot brought up before its first mechanism has no device at all, and
@@ -2213,6 +2902,8 @@ TEST(ConfigWire, ChunksAndAssemblesConfigLosslessly) {
   }
 }
 
+// REQ-CONTRACT-02: fully capped Config serializes at exact maximum and
+// round-trips through chunk assembly
 TEST(ConfigWire, FullyCappedSerializationMatchesAssemblyLimit) {
   Config config;
   config.motors.resize(kMaxMotors);
@@ -2427,13 +3118,22 @@ TEST(ConfigWire, ChunkHeaderAndAckAreLittleEndian) {
   ASSERT_GE(first.size(), sizeof(ConfigChunkHeader));
   for (int i = 0; i < 8; ++i)
     EXPECT_EQ(first[i], static_cast<uint8_t>(id >> (8 * i)));
-  const auto total = static_cast<uint32_t>(SerializeConfig(config).size());
+  const auto serialized = SerializeConfig(config);
+  const auto crc = ComputeCrc32(serialized);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_EQ(first[8 + i], static_cast<uint8_t>(crc >> (8 * i)));
+  const auto total = static_cast<uint32_t>(serialized.size());
   for (int i = 0; i < 4; ++i)
     EXPECT_EQ(first[12 + i], static_cast<uint8_t>(total >> (8 * i)));
   EXPECT_EQ(first[16], 0);  // chunk_index 0
   EXPECT_EQ(first[17], 0);
   EXPECT_EQ(first[18], static_cast<uint8_t>(chunks.size()));
   EXPECT_EQ(first[19], 0);
+  const auto chunk_bytes =
+      static_cast<uint32_t>(first.size() - sizeof(ConfigChunkHeader));
+  ASSERT_GT(chunk_bytes, 255u);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_EQ(first[20 + i], static_cast<uint8_t>(chunk_bytes >> (8 * i)));
 
   ConfigAckPayload ack{};
   ack.config_id = 0x0102030405060708ull;
@@ -3404,6 +4104,7 @@ TEST(PhysicsSimBackend, AMotorResetBesideAValidSensorIsLocal) {
 // so a command observed before it never drives the restarted frame. The
 // restored motor's first sample starts a new reference rather than reading
 // as another jump; the late latch is counted as one more reset.
+// REQ-SAFE-24
 TEST(Gateway, RotorPositionJumpIsAResetBeforeItsLatchArrives) {
   const auto config = SwerveConfig(true);
   const auto index = MotorIndex(config, Feedback::kRotor);
@@ -3923,6 +4624,226 @@ TEST(ConfigWire, PersistenceValidatesCrcAndAssemblerResetsAfterCompletion) {
   }
   EXPECT_EQ(assembler.AddChunk(chunks[0], error),
             ConfigAssembler::Status::kIncomplete);
+}
+
+// Allocation-free config codec helpers match their vector-returning
+// counterparts byte for byte, reject undersized output spans, and agree with
+// Validate()/ConfigurationId() on valid and invalid configs.
+// REQ-CONTRACT-05, REQ-CONTRACT-06
+TEST(ConfigWire, AllocationFreeHelpersMatchWireBytesAndValidation) {
+  const auto config = SwerveConfig(true);
+  const auto expected_ser = SerializeConfig(config);
+  const auto expected_persisted = PersistedConfig(config);
+
+  std::array<uint8_t, kMaxSerializedConfigSize> ser_buf{};
+  const std::size_t ser_len = SerializeConfigInto(config, ser_buf);
+  ASSERT_EQ(ser_len, expected_ser.size());
+  EXPECT_TRUE(
+      std::equal(expected_ser.begin(), expected_ser.end(), ser_buf.begin()));
+  EXPECT_EQ(SerializeConfigInto(config, std::span{ser_buf}.first(ser_len - 1)),
+            0u);
+
+  std::array<uint8_t, kMaxPersistedConfigSize> persist_buf{};
+  const std::size_t persist_len = PersistedConfigInto(config, persist_buf);
+  ASSERT_EQ(persist_len, expected_persisted.size());
+  EXPECT_TRUE(std::equal(expected_persisted.begin(), expected_persisted.end(),
+                         persist_buf.begin()));
+  EXPECT_EQ(PersistedConfigInto(config,
+                                std::span{persist_buf}.first(persist_len - 1)),
+            0u);
+
+  EXPECT_TRUE(IsValid(config));
+  EXPECT_EQ(TryConfigurationId(config), ConfigurationId(config));
+
+  Config bad_name = config;
+  bad_name.motors[0].name = std::string(kMaxConfigNameLength + 1, 'a');
+  EXPECT_TRUE(bad_name.motors[0].name.overflowed());
+  EXPECT_FALSE(IsValid(bad_name));
+  EXPECT_EQ(TryConfigurationId(bad_name), 0u);
+  EXPECT_THROW(Validate(bad_name), std::invalid_argument);
+}
+
+// ConfigAssembler verifies that the deserialized Config is valid and its
+// TryConfigurationId matches hdr.config_id before returning kComplete, and
+// preserves hdr.config_id across every refusal reset so Endpoint::Tick stamps
+// the transfer's id onto refusal ACKs (while clearing assembly state).
+// REQ-SAFE-21, REQ-CONTRACT-04, REQ-CONTRACT-05, REQ-OPS-20
+TEST(ConfigWire, RefusalsPreserveHeaderConfigIdAndRejectIdMismatch) {
+  const auto valid = SwerveConfig(true);
+  const uint64_t valid_id = ConfigurationId(valid);
+  ASSERT_NE(valid_id, 0u);
+
+  const auto make_single_chunk =
+      [](uint64_t config_id, std::span<const uint8_t> body, uint32_t crc) {
+        std::vector<uint8_t> chunk(sizeof(ConfigChunkHeader) + body.size());
+        ConfigChunkHeader hdr{};
+        hdr.config_id = config_id;
+        hdr.total_crc32 = crc;
+        hdr.total_bytes = static_cast<uint32_t>(body.size());
+        hdr.chunk_index = 0;
+        hdr.chunk_count = 1;
+        hdr.chunk_bytes = static_cast<uint32_t>(body.size());
+        EncodeConfigChunkHeader(hdr, chunk.data());
+        std::memcpy(chunk.data() + sizeof(ConfigChunkHeader), body.data(),
+                    body.size());
+        return chunk;
+      };
+
+  // 1. Valid payload and valid CRC, but mismatched hdr.config_id must be
+  // rejected as kMalformedConfig while preserving the rejected hdr.config_id.
+  {
+    const uint64_t wrong_id = valid_id ^ 0x55AAULL;
+    auto chunks = CreateConfigChunks(valid, 200);
+    ASSERT_GT(chunks.size(), 1u);
+    for (auto& ch : chunks) {
+      ConfigChunkHeader hdr = DecodeConfigChunkHeader(ch.data());
+      hdr.config_id = wrong_id;
+      EncodeConfigChunkHeader(hdr, ch.data());
+    }
+    ConfigAssembler assembler;
+    std::string error;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size()
+                    ? ConfigAssembler::Status::kMalformedConfig
+                    : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), wrong_id);
+    EXPECT_FALSE(error.empty());
+    // Assembly state was cleared, so a valid transfer completes cleanly next.
+    const auto good_chunks = CreateConfigChunks(valid, 200);
+    for (std::size_t i = 0; i < good_chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(good_chunks[i], error),
+                i + 1 == good_chunks.size()
+                    ? ConfigAssembler::Status::kComplete
+                    : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), valid_id);
+  }
+
+  // 2. Deserializable but invalid config (TryConfigurationId == 0) is rejected
+  // even when hdr.config_id == 0 (0 must never match 0).
+  {
+    Config invalid;
+    MotorConfig motor;
+    motor.id = 1;
+    motor.name = "bad_motor";
+    motor.can_id = 1;
+    motor.bus = "rio";
+    motor.max_voltage = -1.0;
+    invalid.motors.push_back(motor);
+    ASSERT_EQ(TryConfigurationId(invalid), 0u);
+    const auto body = SerializeConfig(invalid);
+    ASSERT_LE(body.size(), kMaxConfigChunkData);
+    const uint32_t crc = ComputeCrc32(body);
+    const auto zero_id_chunk = make_single_chunk(0, body, crc);
+    ConfigAssembler assembler;
+    std::string error;
+    EXPECT_EQ(assembler.AddChunk(zero_id_chunk, error),
+              ConfigAssembler::Status::kMalformedConfig);
+    EXPECT_EQ(assembler.config_id(), 0u);
+
+    constexpr uint64_t kNonZeroId = 0x123456789ABCDEF0ULL;
+    const auto nonzero_id_chunk = make_single_chunk(kNonZeroId, body, crc);
+    EXPECT_EQ(assembler.AddChunk(nonzero_id_chunk, error),
+              ConfigAssembler::Status::kMalformedConfig);
+    EXPECT_EQ(assembler.config_id(), kNonZeroId);
+  }
+
+  // 3. CRC mismatch preserves hdr.config_id.
+  {
+    auto chunks = CreateConfigChunks(valid, 200);
+    chunks.front().back() ^= 0xFF;
+    ConfigAssembler assembler;
+    std::string error;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size() ? ConfigAssembler::Status::kCrcMismatch
+                                       : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), valid_id);
+  }
+
+  // 4. Undeserializable payload with valid CRC preserves hdr.config_id.
+  {
+    constexpr uint64_t kMalformedId = 0xCAFEBABE11223344ULL;
+    const std::array<uint8_t, 8> garbage{1, 2, 3, 4, 5, 6, 7, 8};
+    const auto chunk =
+        make_single_chunk(kMalformedId, garbage, ComputeCrc32(garbage));
+    ConfigAssembler assembler;
+    std::string error;
+    EXPECT_EQ(assembler.AddChunk(chunk, error),
+              ConfigAssembler::Status::kMalformedConfig);
+    EXPECT_EQ(assembler.config_id(), kMalformedId);
+  }
+
+  // 5. Ceiling violation preserves hdr.config_id.
+  {
+    auto ceiling = valid;
+    ceiling.motors[0].stator_limit_a = 150.0;
+    const uint64_t ceiling_id = ConfigurationId(ceiling);
+    ASSERT_NE(ceiling_id, 0u);
+    const auto chunks = CreateConfigChunks(ceiling, 200);
+    ConfigAssembler assembler;
+    std::string error;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size()
+                    ? ConfigAssembler::Status::kCeilingExceeded
+                    : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), ceiling_id);
+  }
+
+  // 6. Mid-transfer inconsistent chunk metadata preserves hdr.config_id and
+  // resets assembly state so a subsequent transfer succeeds.
+  {
+    const auto chunks = CreateConfigChunks(valid, 200);
+    ASSERT_GT(chunks.size(), 2u);
+    ConfigAssembler assembler;
+    std::string error;
+    ASSERT_EQ(assembler.AddChunk(chunks[0], error),
+              ConfigAssembler::Status::kIncomplete);
+    auto bad_meta = chunks[1];
+    ConfigChunkHeader hdr = DecodeConfigChunkHeader(bad_meta.data());
+    ++hdr.total_bytes;
+    EncodeConfigChunkHeader(hdr, bad_meta.data());
+    EXPECT_EQ(assembler.AddChunk(bad_meta, error),
+              ConfigAssembler::Status::kInvalidChunk);
+    EXPECT_EQ(assembler.config_id(), valid_id);
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
+                                       : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), valid_id);
+  }
+
+  // 7. A chunk shorter than ConfigChunkHeader reports config_id == 0 (never
+  // leaking a prior transfer's id) without disturbing an in-progress assembly,
+  // and explicit Reset() clears config_id to 0.
+  {
+    const auto chunks = CreateConfigChunks(valid, 200);
+    ASSERT_GT(chunks.size(), 1u);
+    ConfigAssembler assembler;
+    std::string error;
+    ASSERT_EQ(assembler.AddChunk(chunks[0], error),
+              ConfigAssembler::Status::kIncomplete);
+    EXPECT_EQ(assembler.config_id(), valid_id);
+    const std::array<uint8_t, 4> tiny{1, 2, 3, 4};
+    EXPECT_EQ(assembler.AddChunk(tiny, error),
+              ConfigAssembler::Status::kInvalidChunk);
+    EXPECT_EQ(assembler.config_id(), 0u);
+    // Remaining chunks of the in-progress transfer still complete it.
+    for (std::size_t i = 1; i < chunks.size(); ++i) {
+      EXPECT_EQ(assembler.AddChunk(chunks[i], error),
+                i + 1 == chunks.size() ? ConfigAssembler::Status::kComplete
+                                       : ConfigAssembler::Status::kIncomplete);
+    }
+    EXPECT_EQ(assembler.config_id(), valid_id);
+    assembler.Reset();
+    EXPECT_EQ(assembler.config_id(), 0u);
+  }
 }
 
 }  // namespace

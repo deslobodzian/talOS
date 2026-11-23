@@ -8,12 +8,14 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -29,9 +31,13 @@ constexpr std::uint64_t kNsPerSecond = 1'000'000'000;
 void ToGray(const Frame& frame, std::uint8_t* dst) {
   const std::uint32_t w = frame.width();
   const std::uint32_t h = frame.height();
-  const std::uint32_t stride = frame.stride() == 0 ? w : frame.stride();
+  const std::size_t min_stride =
+      static_cast<std::size_t>(w) * frame.bytes_per_pixel();
+  const std::size_t stride = frame.stride() == 0
+                                 ? min_stride
+                                 : static_cast<std::size_t>(frame.stride());
   const std::uint8_t* src = frame.data();
-  if (src == nullptr) {
+  if (src == nullptr || stride < min_stride) {
     return;
   }
 
@@ -157,6 +163,7 @@ struct FrameRecorder::Impl {
 
   // max_bytes accounting: what this camera has on disk, oldest first.
   std::deque<FileEntry> files;
+  std::unordered_set<std::string> active_stems;
   std::uint64_t total_bytes = 0;
 
   explicit Impl(Options o) : options{std::move(o)} {
@@ -229,10 +236,26 @@ struct FrameRecorder::Impl {
     std::sort(found.begin(), found.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     for (auto& [stem, bytes] : found) {
+      active_stems.insert(stem);
       files.push_back(FileEntry{std::move(stem), bytes});
       total_bytes += bytes;
     }
     TrimToBudget();
+  }
+
+  std::string UniqueStem(const std::string& base) const {
+    if (!active_stems.contains(base)) {
+      return base;
+    }
+    for (std::uint64_t suffix = 1;; ++suffix) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "_%04llu",
+                    static_cast<unsigned long long>(suffix));
+      std::string candidate = base + buf;
+      if (!active_stems.contains(candidate)) {
+        return candidate;
+      }
+    }
   }
 
   void TrimToBudget() {
@@ -242,6 +265,7 @@ struct FrameRecorder::Impl {
       std::filesystem::remove(options.output_dir / (oldest.stem + ".png"), ec);
       std::filesystem::remove(options.output_dir / (oldest.stem + ".json"), ec);
       total_bytes -= oldest.bytes;
+      active_stems.erase(oldest.stem);
       files.pop_front();
     }
   }
@@ -249,14 +273,23 @@ struct FrameRecorder::Impl {
   bool RateLimited(const FrameRecord& record, std::uint64_t* interval_ns) {
     const bool rejected = record.reason == "rejected";
     const double rate = rejected ? options.rejected_hz : options.sample_hz;
-    if (rate <= 0.0) {
-      return true;  // zero rate records nothing
+    if (!std::isfinite(rate) || rate <= 0.0) {
+      return true;  // zero or non-finite rate records nothing
     }
-    *interval_ns = static_cast<std::uint64_t>(
-        std::llround(static_cast<double>(kNsPerSecond) / rate));
+    const double raw_interval = static_cast<double>(kNsPerSecond) / rate;
+    constexpr double kMaxSafeInterval =
+        static_cast<double>(std::numeric_limits<std::int64_t>::max());
+    if (!std::isfinite(raw_interval) || raw_interval >= kMaxSafeInterval) {
+      *interval_ns = std::numeric_limits<std::uint64_t>::max();
+    } else if (raw_interval <= 0.0) {
+      *interval_ns = 0;
+    } else {
+      *interval_ns = static_cast<std::uint64_t>(std::llround(raw_interval));
+    }
     bool& seen = rejected ? rejected_seen : sampled_seen;
     std::uint64_t& last = rejected ? last_rejected_ns : last_sampled_ns;
-    if (seen && record.capture_ns - last < *interval_ns) {
+    if (seen &&
+        (record.capture_ns < last || record.capture_ns - last < *interval_ns)) {
       return true;
     }
     last = record.capture_ns;
@@ -315,7 +348,9 @@ struct FrameRecorder::Impl {
   }
 
   void StopAfterWriteFailure(const char* reason) {
-    const std::string stem = RecordStem(pending_capture_ns, pending_reason);
+    const std::string stem =
+        pending_stem.empty() ? RecordStem(pending_capture_ns, pending_reason)
+                             : pending_stem;
     std::error_code ec;
     std::filesystem::remove(options.output_dir / (stem + ".png.tmp"), ec);
     std::filesystem::remove(options.output_dir / (stem + ".json.tmp"), ec);
@@ -332,6 +367,7 @@ struct FrameRecorder::Impl {
   // Writer-only scratch for the pair it is about to encode.
   std::uint64_t pending_capture_ns = 0;
   std::string pending_reason;
+  std::string pending_stem;
   ObservationRecord pending_observation;
   std::optional<TruthRecord> pending_truth;
 
@@ -347,7 +383,8 @@ struct FrameRecorder::Impl {
     record.observation = observation;
     record.truth = truth;
 
-    const std::string stem = RecordStem(capture_ns, reason);
+    pending_stem = UniqueStem(RecordStem(capture_ns, reason));
+    const std::string& stem = pending_stem;
     if (options.test_write_delay.count() > 0) {
       std::this_thread::sleep_for(options.test_write_delay);
     }
@@ -367,6 +404,7 @@ struct FrameRecorder::Impl {
 
     // files/total_bytes are writer-owned (Record() never touches them), so no
     // lock is needed; trimming does disk I/O and must not hold the queue lock.
+    active_stems.insert(stem);
     files.push_back(FileEntry{stem, png.size() + json.size()});
     total_bytes += png.size() + json.size();
     TrimToBudget();
@@ -390,7 +428,7 @@ FrameRecorder::~FrameRecorder() {
 bool FrameRecorder::Record(const Frame& frame, const FrameRecord& record) {
   {
     std::lock_guard lock(impl_->mutex);
-    if (impl_->stop || frame.data() == nullptr ||
+    if (impl_->stop || !frame.holds_image() || frame.data() == nullptr ||
         frame.width() !=
             static_cast<std::uint32_t>(impl_->options.context.width) ||
         frame.height() !=

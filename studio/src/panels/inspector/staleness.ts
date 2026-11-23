@@ -4,7 +4,7 @@
 // pure so the unit tests can cover it without a worker or a browser.
 
 import {readingClock, sampleStale} from '../../data/freshness';
-import type {TelemetryStore} from '../../data/store';
+import type {DataSource} from '../../data/source';
 import type {PlaybackState} from '../../data/types';
 
 // `age_ns` is a decimal string so a 64-bit age stays exact; '0' means the
@@ -14,9 +14,9 @@ export type ChannelAge = {age_ns: string|null; stale: boolean};
 
 // Null when the channel has no reading at or before the cursor.
 export function channelAge(
-    store: Pick<TelemetryStore, 'channelSample'>, name: string,
+    source: Pick<DataSource, 'channelSample'>, name: string,
     playback: Pick<PlaybackState, 'clock_ns'|'cursor_ns'>): ChannelAge|null {
-  const sample = store.channelSample(name, playback.cursor_ns);
+  const sample = source.channelSample(name, playback.cursor_ns);
   if (!sample) return null;
   const clock = readingClock(playback);
   if (clock === null) return {age_ns: null, stale: true};

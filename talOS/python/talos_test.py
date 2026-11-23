@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 import textwrap
@@ -150,11 +151,12 @@ class TwoNodesTest(unittest.TestCase):
                          [0, 1, 2, 3, 4])
         self.assertTrue(follower.goal.fresh())
         self.assertFalse(follower.goal.fresh(max_age=0.001))
+        self.assertFalse(follower.goal.fresh(max_age=-0.01))
         self.assertLess(follower.goal.age, 0.01)
         self.assertEqual(sim.node("follower").period, 0.01)
         self.assertAlmostEqual(sim.now, 0.055)
 
-    # REQ-RT-02
+    # REQ-RT-02, REQ-RT-19
     def test_an_at_drain_callback_hears_every_message_at_the_next_tick(self):
         """wake=Wake.AT_DRAIN reaches the node: goals published at 2 and 3
         ms reach the callback in order at the 10 ms tick's drain, not as
@@ -169,6 +171,111 @@ class TwoNodesTest(unittest.TestCase):
         self.assertEqual(collector.heard, [])
         sim.step(0.007)
         self.assertEqual(collector.heard, [(7, 10), (8, 10)])
+
+    # REQ-RT-19: omitting wake= defaults to Wake.ON_PUBLISH; in a timed node
+    # (10 ms update()), a publication at 2 ms runs the callback at now == 2 ms
+    # before the 10 ms tick.
+    def test_default_subscribe_callback_wakes_timed_node_on_publish(self):
+        class PromptCollector:
+            def __init__(self, node):
+                self.node = node
+                self.heard = []
+                self.updates = 0
+                node.subscribe(Goal, "/planner/goal", callback=self.hear)
+
+            def hear(self, goal):
+                self.heard.append((goal.tick_count, self.node.now_ns))
+
+            def update(self):
+                self.updates += 1
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        collector = sim.add(PromptCollector, "collector")
+        sim.step(0.002)
+        sim.publish(Goal, "/planner/goal", height_rot=0.0, enabled=True,
+                    tick_count=7)
+        sim.step(0.001)
+        self.assertEqual(collector.heard, [(7, 2_000_000)])
+        self.assertEqual(collector.updates, 0)
+        sim.step(0.008)
+        self.assertEqual(collector.updates, 1)
+        self.assertEqual(collector.heard, [(7, 2_000_000)])
+
+    # REQ-SAFE-31: Sim.remove destroys the hosted node and invalidates its
+    # Python wrappers; mid-run Sim.add starts at now_ns with no catch-up ticks
+    # and delivers only messages published after attach.
+    def test_remove_and_mid_run_add_restart_node_cleanly(self):
+        import gc
+        import weakref
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        first = sim.add(Follower, "follower")
+        first_node = sim.node("follower")
+        first_sub = first.goal
+        first_ref = weakref.ref(first)
+
+        sim.publish(Goal, "/planner/goal", height_rot=1.0, enabled=True,
+                    tick_count=1)
+        sim.step(0.025)
+        self.assertEqual(len(first.received), 1)
+        self.assertEqual(first_node.tick, 2)
+
+        sim.remove("follower")
+        # Stale handles raise TalosError rather than touching freed memory.
+        with self.assertRaises(talos.TalosError):
+            _ = first_node.name
+        with self.assertRaises(talos.TalosError):
+            _ = first_sub.has_value
+        with self.assertRaises(talos.TalosError):
+            sim.remove("follower")
+        with self.assertRaises(talos.TalosError):
+            sim.node("follower")
+
+        # Callback tables were cleared so the removed node object is collectible.
+        del first, first_node, first_sub
+        gc.collect()
+        self.assertIsNone(first_ref())
+
+        # Publications before re-add must not reach the restarted node.
+        sim.publish(Goal, "/planner/goal", height_rot=2.0, enabled=True,
+                    tick_count=2)
+        sim.step(0.01)
+        self.assertEqual(sim.now_ns, 35_000_000)
+
+        restarted = sim.add(Follower, "follower")
+        restarted_node = sim.node("follower")
+        self.assertEqual(restarted_node.now_ns, 35_000_000)
+        self.assertEqual(restarted_node.tick, 0)
+        sim.step(0.01)
+        self.assertEqual(restarted_node.tick, 1)
+        self.assertEqual(restarted.received, [])
+        self.assertFalse(restarted.goal.has_value)
+
+        sim.publish(Goal, "/planner/goal", height_rot=3.0, enabled=True,
+                    tick_count=3)
+        sim.step(0.01)
+        self.assertEqual([g.tick_count for g in restarted.received], [3])
+        status = sim.latest(Status, "/follower/status")
+        self.assertEqual(status.height_rot, 6.0)
+
+        # Calling remove() or add() from inside step() raises TalosError.
+        class Reenter:
+            def __init__(self, node):
+                self.action = None
+
+            def update(self):
+                if self.action is not None:
+                    self.action()
+
+        reenter = sim.add(Reenter, "planner")
+        reenter.action = lambda: sim.remove("follower")
+        with self.assertRaises(talos.TalosError):
+            sim.step(0.01)
+        reenter.action = lambda: sim.add(Clock, "vision")
+        with self.assertRaises(talos.TalosError):
+            sim.step(0.02)
+        reenter.action = None
+        sim.step(0.02)
 
 
 class AtDrainCollector:
@@ -305,6 +412,76 @@ class RunTest(unittest.TestCase):
                   if source.get("untargeted_outputs")}
         self.assertEqual(marked, {"/hw/request/lift"})
 
+    # REQ-SAFE-42: under --targeted-outputs (passed by the launcher when
+    # --describe declared a hardware request without untargeted_outputs),
+    # talos.allow_untargeted_outputs raises TalosError at construction so the
+    # Python node exits non-zero before update() runs; without the flag, the
+    # same node constructs and ticks.
+    def test_targeted_outputs_refuses_allow_untargeted_outputs_at_construction(
+        self,
+    ):
+        probe = textwrap.dedent("""
+            import os, signal, sys, tempfile
+            import talos
+
+            mode = sys.argv[1]
+            robot_toml = sys.argv[2]
+            ticks = []
+
+            class Probe:
+                def __init__(self, node):
+                    self.lift = talos.Motor(node, "lift")
+                    talos.allow_untargeted_outputs(node)
+
+                def update(self):
+                    ticks.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                config = os.path.join(tmp, "robot.toml")
+                log = os.path.join(tmp, "lift.tlog")
+                with open(config, "w") as f:
+                    f.write(robot_toml)
+                argv = ["probe", "--sim", "--duration-s", "5",
+                        "--log", log, "--config", config]
+                if mode == "targeted":
+                    argv.insert(2, "--targeted-outputs")
+                    try:
+                        code = talos.run(Probe, "lift", "//talOS/python:probe",
+                                         argv)
+                    except talos.TalosError as err:
+                        assert not ticks, f"refused node ticked: {len(ticks)}"
+                        print(f"TALOS_ERROR:{err}", flush=True)
+                        raise
+                    raise AssertionError(
+                        f"expected TalosError, got exit code {code} "
+                        f"(ticks={len(ticks)})"
+                    )
+                code = talos.run(Probe, "lift", "//talOS/python:probe", argv)
+                assert code == 0, f"expected exit 0, got {code}"
+                assert ticks, "expected update() to run"
+        """)
+
+        refused = subprocess.run(
+            [sys.executable, "-c", probe, "targeted", ROBOT_TOML],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(refused.returncode, 0,
+                            refused.stdout + refused.stderr)
+        self.assertIn("TALOS_ERROR:", refused.stdout,
+                      refused.stdout + refused.stderr)
+        self.assertIn("lift", refused.stdout)
+        self.assertIn("AllowUntargetedOutputs", refused.stdout)
+        self.assertIn("--targeted-outputs", refused.stdout)
+        self.assertIn("TalosError", refused.stderr)
+
+        allowed = subprocess.run(
+            [sys.executable, "-c", probe, "standalone", ROBOT_TOML],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(allowed.returncode, 0,
+                         allowed.stdout + allowed.stderr)
+
 
 class BorrowedLifetimeTest(unittest.TestCase):
     def test_wrappers_keep_sim_alive_until_native_teardown(self):
@@ -390,10 +567,13 @@ class AbiErrorsTest(unittest.TestCase):
                 with self.assertRaises(talos.TalosError):
                     getattr(stepper.sm, name)
         subscription = follower.goal
+        node = sim.node("follower")
         self.assertIsNone(subscription.value)
         with mock.patch.object(talos.lib, "talos_last_error",
-                               return_value=b"subscription failed"):
+                               return_value=b"abi call failed"):
             for symbol, read in (
+                ("talos_node_simulation", lambda: node.simulation),
+                ("talos_node_describing", lambda: node.describing),
                 ("talos_subscription_has_value",
                  lambda: subscription.has_value),
                 ("talos_subscription_fresh", lambda: subscription.fresh()),
@@ -409,6 +589,17 @@ class AbiErrorsTest(unittest.TestCase):
                                        return_value=None):
                     with self.assertRaises(talos.TalosError):
                         _ = subscription.value
+        # Negative max_age still validates handle/index before returning False.
+        subscription._index = 99
+        with self.assertRaises(talos.TalosError):
+            subscription.fresh(-0.01)
+        node._native = None
+        with self.assertRaises(talos.TalosError):
+            subscription.fresh(-0.01)
+        link = talos.HardwareLink(sim.node("planner"))
+        sim.node("planner")._native = None
+        with self.assertRaises(talos.TalosError):
+            link.fresh(-0.01)
 
 
 class CallbackErrorTest(unittest.TestCase):
@@ -474,8 +665,8 @@ class DevicesTest(unittest.TestCase):
                     accessor("lift", "missing")
 
     # REQ-SAFE-03, REQ-SAFE-06: PwmOutput.set(0.0) is the centre pulse and
-    # stop() no pulse (None), and stop() outside update() raises naming the
-    # device
+    # stop() no pulse (None), and set()/stop() outside update() raise naming
+    # the device
     def test_pwm_stop_sends_no_pulse_and_set_zero_is_the_centre(self):
         class Servo:
             def __init__(self, node):
@@ -494,8 +685,9 @@ class DevicesTest(unittest.TestCase):
 channel = 0
 """)
         servo = sim.add(Servo, "lift")
-        with self.assertRaisesRegex(talos.TalosError,
-                                    r"'servo'.*outside update\(\)"):
+        with self.assertRaisesRegex(talos.TalosError, r"'servo'"):
+            servo.servo.set(0.5)
+        with self.assertRaisesRegex(talos.TalosError, r"'servo'"):
             servo.servo.stop()
         hw = SimHardware(sim)
         hw.enable()
@@ -532,9 +724,13 @@ can_id = 3
         hw.set_gyro("lift", "gyro", 0.75, -0.5, 5000, 6000)
         sim.step(0.02)
         self.assertIsNone(signals.motor.position_time)
-        # Motor ages come from the State: known before the clock mapping.
+        self.assertIsNone(signals.encoder.position_time)
+        # Motor and CANcoder ages come from the State: known before the clock
+        # mapping.
         self.assertEqual((signals.motor.position_age,
                           signals.motor.velocity_age), (1_000_000, 3_000_000))
+        self.assertEqual((signals.encoder.position_age,
+                          signals.encoder.velocity_age), (2_000_000, 4_000_000))
         sim.step(0.08)
         sampled = talos.hardware_sample_time_ns(node)
         self.assertIsInstance(sampled, int)
@@ -555,16 +751,182 @@ can_id = 3
         self.assertFalse(signals.motor.connected)
         self.assertIsNone(signals.motor.velocity_time)
         self.assertIsNone(signals.motor.velocity_age)
+        self.assertFalse(signals.encoder.connected)
         self.assertIsNone(signals.encoder.position_time)
+        self.assertIsNone(signals.encoder.position_age)
+        self.assertIsNone(signals.encoder.velocity_age)
         self.assertIsNone(signals.gyro.yaw_rate_time)
         hw.set_motor("lift", "lift", 3, 2, 1000, 3000)
+        hw.set_cancoder("lift", "cc", 0.2, 0.3, 2000, 4000)
         hw.set_connected("lift", "lift", False)
+        hw.set_connected("lift", "cc", False)
         sim.step(0.02)
         self.assertIsNone(signals.motor.velocity_time)
+        self.assertIsNone(signals.encoder.position_age)
+        self.assertIsNone(signals.encoder.velocity_age)
+        hw.set_connected("lift", "cc", True)
+        sim.step(0.02)
+        self.assertEqual((signals.encoder.position_age,
+                          signals.encoder.velocity_age), (2_000_000, 4_000_000))
         del hw
         sim.step(0.15)
         self.assertIsNone(signals.encoder.position_time)
+        self.assertIsNone(signals.encoder.position_age)
+        self.assertIsNone(signals.encoder.velocity_age)
         self.assertIsNone(signals.gyro.yaw_rate_time)
+
+    # REQ-CONTRACT-34: before any valid sample, Motor, CANcoder, Encoder and
+    # Gyro read 0.0; across disconnect and stale link, each holds its last
+    # valid position/yaw through any rezero offset while rates and efforts
+    # read 0.0 and connected is False.
+    def test_invalid_and_stale_samples_hold_position_and_zero_rates(self):
+        class Mech:
+            def __init__(self, node):
+                self.motor = talos.Motor(node, "lift")
+                self.cc = talos.CANcoder(node, "cc")
+                self.gyro = talos.Gyro(node, "gyro")
+                self.enc = talos.Encoder(node, "enc")
+
+        toml = ROBOT_TOML + """
+[subsystems.lift.sensors.cc]
+type = "CANcoder"
+can_id = 2
+[subsystems.lift.sensors.gyro]
+type = "Pigeon2"
+can_id = 3
+[subsystems.lift.encoders.enc]
+type = "DutyCycleEncoder"
+dio = 2
+"""
+        sim = Sim.from_toml(toml)
+        mech = sim.add(Mech, "lift")
+
+        # Before first valid sample: disconnected and 0.0 across all reads.
+        sim.step(0.02)
+        self.assertFalse(mech.motor.connected)
+        self.assertEqual(mech.motor.position, 0.0)
+        self.assertEqual(mech.motor.velocity, 0.0)
+        self.assertEqual(mech.motor.voltage, 0.0)
+        self.assertEqual(mech.motor.current, 0.0)
+        self.assertEqual(mech.motor.supply_current_a, 0.0)
+        self.assertFalse(mech.cc.connected)
+        self.assertEqual(mech.cc.position, 0.0)
+        self.assertEqual(mech.cc.velocity, 0.0)
+        self.assertFalse(mech.enc.connected)
+        self.assertEqual(mech.enc.position, 0.0)
+        self.assertEqual(mech.enc.velocity, 0.0)
+        self.assertFalse(mech.gyro.connected)
+        self.assertEqual(mech.gyro.yaw, 0.0)
+        self.assertEqual(mech.gyro.yaw_rate, 0.0)
+
+        # SimHardware.set_motor leaves MotorSample::voltage at 0.0; patch the
+        # latest encoded /hw/state packet so the live sample carries 11.5 V
+        # before disconnect and staleness (preventing a tautological 0.0 check).
+        def publish_live_motor_voltage(expected_pos, expected_vel, voltage):
+            packet_size = 1436
+            wire = 4  # uint32_t size prefix in hardware::Packet
+            buf = ctypes.create_string_buffer(packet_size)
+            self.assertEqual(
+                _abi.ok(_abi.lib.talos_sim_latest_raw(
+                    sim._handle, b"/hw/state", buf, packet_size)), 1)
+            raw = bytearray(buf.raw)
+            (wire_size,) = struct.unpack_from("<I", raw, 0)
+            self.assertGreaterEqual(wire_size, 84 + 45)
+            self.assertLessEqual(wire_size, packet_size - wire)
+            (motor_count,) = struct.unpack_from("<H", raw, wire + 70)
+            self.assertEqual(motor_count, 1)
+            self.assertEqual(raw[wire + 84 + 2], 1)  # motors[0].valid
+            pos, vel = struct.unpack_from("<dd", raw, wire + 84 + 3)
+            self.assertAlmostEqual(pos, expected_pos)
+            self.assertAlmostEqual(vel, expected_vel)
+            (sample_time_us,) = struct.unpack_from("<Q", raw, wire + 24)
+            (sequence,) = struct.unpack_from("<Q", raw, wire + 48)
+            struct.pack_into("<Q", raw, wire + 24, sample_time_us + 1000)
+            struct.pack_into("<Q", raw, wire + 48, sequence + 1)
+            struct.pack_into("<d", raw, wire + 84 + 19, voltage)
+            hw.lose_states(1)
+            _abi.ok(_abi.lib.talos_sim_publish_raw(
+                sim._handle, b"/hw/state", bytes(raw), packet_size))
+            sim.step(0.01)
+
+        # Valid sample + rezero Motor and Gyro.
+        hw = SimHardware(sim)
+        hw.set_motor("lift", "lift", 3.0, 2.0,
+                     temperature_c=40.0, supply_current_a=18.0,
+                     stator_current_a=30.0)
+        hw.set_cancoder("lift", "cc", 0.2, 0.3)
+        hw.set_gyro("lift", "gyro", 0.25, -0.5)
+        hw.set_encoder("lift", "enc", 0.4, 0.6)
+        sim.step(0.02)
+        mech.motor.rezero(1.0)
+        mech.gyro.rezero(0.0)
+        self.assertTrue(mech.motor.zeroed)
+        self.assertTrue(mech.gyro.zeroed)
+        publish_live_motor_voltage(3.0, 2.0, 11.5)
+        self.assertAlmostEqual(mech.motor.position, 1.0)
+        self.assertAlmostEqual(mech.motor.velocity, 2.0)
+        self.assertAlmostEqual(mech.motor.voltage, 11.5)
+        self.assertAlmostEqual(mech.motor.current, 30.0)
+        self.assertAlmostEqual(mech.motor.supply_current_a, 18.0)
+        self.assertAlmostEqual(mech.gyro.yaw, 0.0)
+        self.assertAlmostEqual(mech.gyro.yaw_rate, -0.5)
+        self.assertAlmostEqual(mech.cc.position, 0.2)
+        self.assertAlmostEqual(mech.enc.position, 0.4)
+
+        # Disconnect every device: positions hold through rezero offsets;
+        # rates and efforts read 0.0.
+        for dev in ("lift", "cc", "gyro", "enc"):
+            hw.set_connected("lift", dev, False)
+        sim.step(0.02)
+        self.assertFalse(mech.motor.connected)
+        self.assertFalse(mech.cc.connected)
+        self.assertFalse(mech.gyro.connected)
+        self.assertFalse(mech.enc.connected)
+        self.assertAlmostEqual(mech.motor.position, 1.0)
+        self.assertAlmostEqual(mech.gyro.yaw, 0.0)
+        self.assertAlmostEqual(mech.cc.position, 0.2)
+        self.assertAlmostEqual(mech.enc.position, 0.4)
+        self.assertEqual(mech.motor.velocity, 0.0)
+        self.assertEqual(mech.motor.voltage, 0.0)
+        self.assertEqual(mech.motor.current, 0.0)
+        self.assertEqual(mech.motor.supply_current_a, 0.0)
+        self.assertEqual(mech.cc.velocity, 0.0)
+        self.assertEqual(mech.gyro.yaw_rate, 0.0)
+        self.assertEqual(mech.enc.velocity, 0.0)
+
+        # Reconnect with new live positions, then drop the link past
+        # command_timeout_us (stale link).
+        hw.set_motor("lift", "lift", 5.0, 2.0,
+                     temperature_c=45.0, supply_current_a=18.0,
+                     stator_current_a=30.0)
+        hw.set_cancoder("lift", "cc", 0.35, 0.3)
+        hw.set_gyro("lift", "gyro", 0.5, -0.5)
+        hw.set_encoder("lift", "enc", 0.55, 0.6)
+        for dev in ("lift", "cc", "gyro", "enc"):
+            hw.set_connected("lift", dev, True)
+        sim.step(0.02)
+        publish_live_motor_voltage(5.0, 2.0, 11.5)
+        self.assertAlmostEqual(mech.motor.position, 3.0)
+        self.assertAlmostEqual(mech.motor.voltage, 11.5)
+        self.assertAlmostEqual(mech.gyro.yaw, 0.25)
+
+        del hw
+        sim.step(0.15)
+        self.assertFalse(mech.motor.connected)
+        self.assertFalse(mech.cc.connected)
+        self.assertFalse(mech.gyro.connected)
+        self.assertFalse(mech.enc.connected)
+        self.assertAlmostEqual(mech.motor.position, 3.0)
+        self.assertAlmostEqual(mech.gyro.yaw, 0.25)
+        self.assertAlmostEqual(mech.cc.position, 0.35)
+        self.assertAlmostEqual(mech.enc.position, 0.55)
+        self.assertEqual(mech.motor.velocity, 0.0)
+        self.assertEqual(mech.motor.voltage, 0.0)
+        self.assertEqual(mech.motor.current, 0.0)
+        self.assertEqual(mech.motor.supply_current_a, 0.0)
+        self.assertEqual(mech.cc.velocity, 0.0)
+        self.assertEqual(mech.gyro.yaw_rate, 0.0)
+        self.assertEqual(mech.enc.velocity, 0.0)
 
     def test_limit_switches_read_only_from_a_connected_sample(self):
         sim = Sim.from_toml(ROBOT_TOML)
@@ -602,27 +964,108 @@ can_id = 3
         self.assertEqual(hw.motor_request("lift", "lift"),
                          (talos.Mode.MOTION_MAGIC, 1.5, 0.25, 2))
 
-    # REQ-SAFE-06: a motor setter outside update() raises, naming the motor
+    # REQ-SAFE-42: talos.allow_untargeted_outputs raises TalosError once the
+    # node's event loop has started (after __init__ or inside update()).
+    def test_allow_untargeted_outputs_after_loop_start_raises(self):
+        class LateOptOut:
+            def __init__(self, node):
+                self.node = node
+                self.lift = talos.Motor(node, "lift")
+                self.opt_out_in_update = False
+
+            def update(self):
+                if self.opt_out_in_update:
+                    talos.allow_untargeted_outputs(self.node)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        late = sim.add(LateOptOut, "lift")
+        with self.assertRaises(talos.TalosError):
+            talos.allow_untargeted_outputs(sim.node("lift"))
+        late.opt_out_in_update = True
+        with self.assertRaises(talos.TalosError):
+            sim.step(0.02)
+
+    # REQ-SAFE-06: every motor setter outside update() (every(), __init__,
+    # callback, off-thread) raises TalosError naming the motor
     def test_motor_command_outside_update_raises(self):
         # The flush after each update() sends neutral for every motor that
         # update() did not set, so a command from every() would pulse.
-        class Pulser:
+        torque_toml = ROBOT_TOML.replace(
+            "can_id = 1\n",
+            "can_id = 1\nfoc = true\nmax_torque_current_a = 5.0\n")
+        setters = (
+            ("set_duty_cycle", lambda m: m.set_duty_cycle(0.5)),
+            ("set_voltage", lambda m: m.set_voltage(6.0)),
+            ("set_velocity", lambda m: m.set_velocity(10.0)),
+            ("set_position", lambda m: m.set_position(1.0)),
+            ("set_motion_magic", lambda m: m.set_motion_magic(1.0)),
+            ("set_torque_current", lambda m: m.set_torque_current(2.0)),
+            ("stop", lambda m: m.stop()),
+        )
+        for name, call in setters:
+            with self.subTest(setter=name):
+                class Pulser:
+                    def __init__(self, node):
+                        self.lift = talos.Motor(node, "lift")
+                        node.every(0.02, lambda: call(self.lift))
+
+                    def update(self):
+                        pass
+
+                sim = Sim.from_toml(torque_toml)
+                sim.add(Pulser, "lift")
+                with self.assertRaisesRegex(talos.TalosError, r"'lift'"):
+                    sim.step(0.05)
+
+    # REQ-SAFE-06: Motor, DigitalOutput and PwmOutput setters called from
+    # __init__, a message callback, outside update(), or off the loop thread
+    # raise TalosError naming the device
+    def test_output_setters_in_init_callback_and_off_thread_raise(self):
+        toml = ROBOT_TOML + """
+[subsystems.lift.digital_outputs.led]
+dio = 1
+[subsystems.lift.pwm_outputs.servo]
+channel = 0
+"""
+        init_cases = (
+            ("motor", "'lift'",
+             lambda n: talos.Motor(n, "lift").set_voltage(6.0)),
+            ("led", "'led'",
+             lambda n: talos.DigitalOutput(n, "led").set(True)),
+            ("servo_set", "'servo'",
+             lambda n: talos.PwmOutput(n, "servo").set(0.5)),
+            ("servo_stop", "'servo'",
+             lambda n: talos.PwmOutput(n, "servo").stop()),
+        )
+        for label, device, call in init_cases:
+            with self.subTest(context="init", case=label):
+                class Eager:
+                    def __init__(self, node):
+                        call(node)
+
+                sim = Sim.from_toml(toml)
+                with self.assertRaisesRegex(talos.TalosError, device):
+                    sim.add(Eager, "lift")
+
+        # Message callback on the loop thread, outside update().
+        class Listener:
             def __init__(self, node):
-                self.lift = talos.Motor(node, "lift")
-                node.every(0.02, lambda: self.lift.set_voltage(6.0))
+                talos.allow_untargeted_outputs(node)
+                self.led = talos.DigitalOutput(node, "led")
+                node.subscribe(Goal, "/test/poke",
+                               callback=lambda _: self.led.set(True))
 
             def update(self):
                 pass
 
-        sim = Sim.from_toml(ROBOT_TOML)
-        sim.add(Pulser, "lift")
-        with self.assertRaisesRegex(talos.TalosError,
-                                    r"motor 'lift'.*outside update\(\)"):
-            sim.step(0.05)
+        sim = Sim.from_toml(toml)
+        sim.add(Listener, "lift")
+        sim.publish(Goal, "/test/poke", height_rot=0.0, enabled=True,
+                    tick_count=1)
+        with self.assertRaisesRegex(talos.TalosError, r"'led'"):
+            sim.step(0.02)
 
-    # REQ-SAFE-06: a DigitalOutput set() outside update() raises, naming the
-    # device
-    def test_digital_output_set_outside_update_raises(self):
+        # Direct call outside update() on DigitalOutput.
         class Light:
             def __init__(self, node):
                 self.led = talos.DigitalOutput(node, "led")
@@ -630,14 +1073,45 @@ can_id = 3
             def update(self):
                 pass
 
-        sim = Sim.from_toml(ROBOT_TOML + """
-[subsystems.lift.digital_outputs.led]
-dio = 1
-""")
+        sim = Sim.from_toml(toml)
         light = sim.add(Light, "lift")
-        with self.assertRaisesRegex(talos.TalosError,
-                                    r"'led'.*outside update\(\)"):
+        with self.assertRaisesRegex(talos.TalosError, r"'led'"):
             light.led.set(True)
+
+        # Off-thread setters while update() is running.
+        class Threaded:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.lift = talos.Motor(node, "lift")
+                self.led = talos.DigitalOutput(node, "led")
+                self.servo = talos.PwmOutput(node, "servo")
+                self.errors = {}
+
+            def update(self):
+                def worker():
+                    for key, fn in (
+                        ("lift", lambda: self.lift.set_voltage(1.0)),
+                        ("led", lambda: self.led.set(True)),
+                        ("servo_set", lambda: self.servo.set(0.5)),
+                        ("servo_stop", lambda: self.servo.stop()),
+                    ):
+                        try:
+                            fn()
+                            self.errors[key] = None
+                        except talos.TalosError as err:
+                            self.errors[key] = str(err)
+
+                thread = threading.Thread(target=worker)
+                thread.start()
+                thread.join()
+
+        sim = Sim.from_toml(toml)
+        threaded = sim.add(Threaded, "lift")
+        sim.step(0.02)
+        self.assertIn("'lift'", threaded.errors["lift"])
+        self.assertIn("'led'", threaded.errors["led"])
+        self.assertIn("'servo'", threaded.errors["servo_set"])
+        self.assertIn("'servo'", threaded.errors["servo_stop"])
 
     # REQ-SAFE-43: set_torque_current reaches the request as stator amperes,
     # clamped to the motor's limit and counted, and on a motor whose config
@@ -687,6 +1161,8 @@ dio = 1
         self.assertGreaterEqual(link.age, 0)
         self.assertLess(link.age, 0.1)
         self.assertFalse(link.fresh(0))
+        self.assertFalse(link.fresh(-0.01))
+        self.assertFalse(link.fresh(timedelta(seconds=-0.01)))
         self.assertFalse(link.fresh(link.age))
         self.assertTrue(link.fresh(link.age + 1e-9))
         self.assertTrue(link.fresh(timedelta(seconds=1)))
@@ -911,6 +1387,84 @@ class TargetTest(unittest.TestCase):
         self.hold("teleop", 2.0, 0.01)
         self.assertEqual(self.applied(), (talos.Mode.VOLTAGE, 2.0))
 
+    # REQ-DEV-08
+    def test_publish_target_stamps_newest_ds_generation_or_explicit_mode(self):
+        from talos._messages import message_type
+
+        goal_type = message_type(Goal)
+        envelope_size = 16 + goal_type.size
+
+        def read_envelope(sim, subsystem, source):
+            buf = ctypes.create_string_buffer(envelope_size)
+            topic = f"/{subsystem}/target/{source}".encode()
+            found = _abi.ok(_abi.lib.talos_sim_latest_raw(
+                sim._handle, topic, buf, envelope_size))
+            self.assertEqual(found, 1)
+            mode_since_us, active, padding = struct.unpack_from(
+                "=QB7s", buf.raw, 0)
+            self.assertEqual(padding, b"\0" * 7)
+            return mode_since_us, active, goal_type.decode(buf.raw[16:])
+
+        # Before any Driver Station packet is published, generation is 0.
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        self.assertEqual(sim.driver_station_generation, 0)
+        sim.publish_target(Goal, "lift", "teleop", height_rot=1.0,
+                           enabled=True, tick_count=1)
+        gen, active, msg = read_envelope(sim, "lift", "teleop")
+        self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                         (0, 1, 1.0, 1))
+
+        # First active mode (teleop): default publish_target stamps DS gen.
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.02)
+        teleop_gen = sim.driver_station_generation
+        self.assertGreater(teleop_gen, 0)
+        sim.publish_target(Goal, "lift", "teleop", height_rot=2.0,
+                           enabled=True, tick_count=2)
+        gen, active, msg = read_envelope(sim, "lift", "teleop")
+        self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                         (teleop_gen, 1, 2.0, 2))
+
+        # Disabled DS packet names no active mode: default stamps 0.
+        hw.set_driver_station(enabled=False, teleop=True)
+        sim.step(0.02)
+        self.assertEqual(sim.driver_station_generation, 0)
+        sim.publish_target(Goal, "lift", "teleop", height_rot=2.5,
+                           enabled=True, tick_count=3)
+        gen, active, msg = read_envelope(sim, "lift", "teleop")
+        self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                         (0, 1, 2.5, 3))
+
+        # Mode transition to autonomous increments generation: default stamps
+        # the newest generation (covering pre-built message forwarding too).
+        hw.set_driver_station(enabled=True, autonomous=True)
+        sim.step(0.02)
+        auto_gen = sim.driver_station_generation
+        self.assertGreater(auto_gen, teleop_gen)
+        pre_built = goal_type.decode(goal_type.encode(
+            {"height_rot": 3.0, "enabled": True, "tick_count": 4}))
+        sim.publish_target(Goal, "lift", "auto", pre_built)
+        gen, active, msg = read_envelope(sim, "lift", "auto")
+        self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                         (auto_gen, 1, 3.0, 4))
+
+        # Explicit mode_since_us overrides the newest DS generation: earlier
+        # generation, explicit 0 (not treated as None), and a 64-bit value.
+        for explicit_gen in (teleop_gen, 0, 0x123456789ABCDEF0):
+            with self.subTest(mode_since_us=explicit_gen):
+                sim.publish_target(Goal, "lift", "auto", height_rot=4.0,
+                                   enabled=True, tick_count=5,
+                                   mode_since_us=explicit_gen)
+                gen, active, msg = read_envelope(sim, "lift", "auto")
+                self.assertEqual((gen, active, msg.height_rot, msg.tick_count),
+                                 (explicit_gen, 1, 4.0, 5))
+
+        # release_target clears active and stamps the newest DS generation.
+        sim.release_target(Goal, "lift", "auto")
+        gen, active, _ = read_envelope(sim, "lift", "auto")
+        self.assertEqual((gen, active), (auto_gen, 0))
+
     def test_lane_sends_and_releases(self):
         sim = Sim.from_toml(ROBOT_TOML)
         driver = sim.add(Driver, "planner")
@@ -954,6 +1508,80 @@ class TargetTest(unittest.TestCase):
         driver_station(held=False)
         driver_station(held=True)
         self.assertEqual(lift.seen.height_rot, 0.5)
+
+    # REQ-OPS-55
+    def test_operator_arming_blocker_tracks_held_input_and_clears_on_arm(self):
+        class BlockerOperator:
+            def __init__(self, node):
+                self.ds = talos.DriverStation(node)
+                self.arming = talos.OperatorArming(node)
+                self.last_blocker = talos.ArmingBlocker()
+                self.last_armed = False
+
+            def update(self):
+                stick = self.ds.joystick(0)
+                if stick.connected and stick.button(1):
+                    blocker = talos.ArmingBlocker(
+                        talos.ArmingInputKind.BUTTON, 0, 1)
+                    self.arming.evaluate(False, blocker)
+                elif stick.connected and abs(stick.axis(1)) > 0.1:
+                    blocker = talos.ArmingBlocker(
+                        talos.ArmingInputKind.AXIS, 0, 1)
+                    self.arming.evaluate(False, blocker)
+                else:
+                    self.arming.evaluate(True, talos.ArmingBlocker())
+                self.last_armed = self.arming.armed
+                self.last_blocker = self.arming.blocker
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        op = sim.add(BlockerOperator, "planner")
+        hw = SimHardware(sim)
+        hw.enable()
+
+        hw.set_driver_station(
+            enabled=True, teleop=True,
+            joysticks=[Stick(axes=(0.0, 0.75))])
+        sim.step(0.04)
+        self.assertFalse(op.last_armed)
+        self.assertEqual(
+            op.last_blocker,
+            talos.ArmingBlocker(talos.ArmingInputKind.AXIS, 0, 1))
+
+        hw.set_driver_station(
+            enabled=True, teleop=True,
+            joysticks=[Stick(buttons=(1,))])
+        sim.step(0.04)
+        self.assertFalse(op.last_armed)
+        self.assertEqual(
+            op.last_blocker,
+            talos.ArmingBlocker(talos.ArmingInputKind.BUTTON, 0, 1))
+
+        hw.set_driver_station(enabled=True, teleop=True, joysticks=[Stick()])
+        sim.step(0.04)
+        self.assertTrue(op.last_armed)
+        self.assertEqual(op.last_blocker, talos.ArmingBlocker())
+
+        # Once armed, holding a button leaves blocker cleared.
+        hw.set_driver_station(
+            enabled=True, teleop=True, joysticks=[Stick(buttons=(1,))])
+        sim.step(0.04)
+        self.assertTrue(op.last_armed)
+        self.assertEqual(op.last_blocker, talos.ArmingBlocker())
+
+        # ArmingBlocker validates int8 port (-128..127) and int16 index
+        # (-32768..32767) instead of silently wrapping in ctypes.
+        self.assertEqual(
+            talos.ArmingBlocker(talos.ArmingInputKind.AXIS, -128, -32768).port,
+            -128)
+        self.assertEqual(
+            talos.ArmingBlocker(talos.ArmingInputKind.AXIS, 127, 32767).index,
+            32767)
+        for bad_port in (-129, 128, 256, True):
+            with self.assertRaises(ValueError):
+                talos.ArmingBlocker(talos.ArmingInputKind.AXIS, bad_port, 0)
+        for bad_index in (-32769, 32768, 65536, False):
+            with self.assertRaises(ValueError):
+                talos.ArmingBlocker(talos.ArmingInputKind.AXIS, 0, bad_index)
 
 
 class StateMachineTest(unittest.TestCase):
@@ -1164,6 +1792,54 @@ class MessageTest(unittest.TestCase):
                         send(object())
                     forward.assert_not_called()
 
+    # REQ-CONTRACT-14: passing both a received message and **fields raises
+    # TypeError in every send/publish path instead of silently dropping fields;
+    # publish_target still accepts mode_since_us alongside a message.
+    def test_send_and_publish_reject_message_together_with_fields(self):
+        from talos._messages import message_type
+
+        class Outputs:
+            def __init__(self, node):
+                self.publisher = node.publish(Goal, "/combo/goal")
+                self.lane = talos.TargetLane(node, Goal, "lift", "teleop")
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        outputs = sim.add(Outputs, "planner")
+        goal_type = message_type(Goal)
+        goal = goal_type.decode(goal_type.encode(
+            {"height_rot": 2.5, "enabled": True, "tick_count": 0}))
+
+        paths = (
+            ("publisher",
+             lambda **kw: outputs.publisher.send(goal, **kw),
+             "talos_publisher_send"),
+            ("lane",
+             lambda **kw: outputs.lane.send(goal, **kw),
+             "talos_target_lane_send"),
+            ("sim",
+             lambda **kw: sim.publish(Goal, "/combo/injected", goal, **kw),
+             "talos_sim_publish_raw"),
+            ("sim_target",
+             lambda **kw: sim.publish_target(Goal, "lift", "align", goal, **kw),
+             "talos_sim_publish_target"),
+        )
+        for name, call, symbol in paths:
+            with self.subTest(path=name):
+                with mock.patch.object(talos.lib, symbol) as native:
+                    with self.assertRaises(TypeError):
+                        call(height_rot=9.0)
+                    native.assert_not_called()
+
+        # publish_target accepts mode_since_us with a forwarded message, and
+        # still rejects extra message fields alongside both.
+        sim.publish_target(Goal, "lift", "align", goal, mode_since_us=42)
+        self.assertEqual(sim.latest_target(Goal, "lift", "align"), goal)
+        with mock.patch.object(talos.lib, "talos_sim_publish_target") as native:
+            with self.assertRaises(TypeError):
+                sim.publish_target(Goal, "lift", "align", goal,
+                                   mode_since_us=42, height_rot=9.0)
+            native.assert_not_called()
+
     def test_byte_publisher_takes_buffers_and_reports_oversize(self):
         class Telemeter:
             def __init__(self, node):
@@ -1182,6 +1858,31 @@ class MessageTest(unittest.TestCase):
         self.assertEqual(sim.latest_bytes("/planner/frames"), b"")
         with self.assertRaises(TypeError):
             telemeter.frames.send("not bytes")
+
+    # REQ-SAFE-27: publish and publish_bytes refuse any /hw/request topic at
+    # construction, direct or remapped.
+    def test_publish_and_publish_bytes_refuse_hardware_request_topics(self):
+        toml = ROBOT_TOML + """
+[subsystems.remapped.remap]
+state = "/hw/request/remapped"
+[subsystems.remapped_bytes.remap]
+frames = "/hw/request/remapped_bytes"
+"""
+        cases = (
+            ("planner", lambda n: n.publish(Goal, "/hw/request/planner")),
+            ("planner", lambda n: n.publish_bytes("/hw/request/planner", 64)),
+            ("remapped", lambda n: n.publish(Goal, "state")),
+            ("remapped_bytes", lambda n: n.publish_bytes("frames", 64)),
+        )
+        for subsystem, register in cases:
+            with self.subTest(subsystem=subsystem):
+                class BadWriter:
+                    def __init__(self, node):
+                        register(node)
+
+                sim = Sim.from_toml(toml)
+                with self.assertRaisesRegex(talos.TalosError, r"/hw/request"):
+                    sim.add(BadWriter, subsystem)
 
 
 if __name__ == "__main__":

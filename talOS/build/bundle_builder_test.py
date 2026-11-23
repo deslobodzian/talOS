@@ -5,11 +5,13 @@ runtime once, in python/) and of C++ nodes' shared libraries in lib/, its check 
 against the config, and its run.sh (including the Studio it starts), and
 tools/deploy.sh's bundle selection, pruning and session commands."""
 
+import importlib.util
 import json
 import os
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,74 @@ def put(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+
+
+def put_bytes(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def make_elf(needed=(), *, bits=64, endian="<", e_type=3, vaddr_base=0x400000):
+    """Builds a minimal valid ELF32/ELF64 image with PT_LOAD + PT_DYNAMIC
+    listing `needed` as DT_NEEDED entries (or an ET_REL object with no
+    program headers when e_type == 1)."""
+    ei_class = 2 if bits == 64 else 1
+    ei_data = 1 if endian == "<" else 2
+    ident = b"\x7fELF" + bytes([ei_class, ei_data, 1]) + b"\x00" * 9
+    ehdr_size = 64 if bits == 64 else 52
+    phentsize = 56 if bits == 64 else 32
+    if e_type == 1:
+        if bits == 64:
+            hdr = struct.pack(endian + "HHIQQQIHHHHHH",
+                              e_type, 62, 1, 0, 0, 0, 0, ehdr_size, 0, 0, 0, 0, 0)
+        else:
+            hdr = struct.pack(endian + "HHIIIIIHHHHHH",
+                              e_type, 3, 1, 0, 0, 0, 0, ehdr_size, 0, 0, 0, 0, 0)
+        return ident + hdr
+
+    dynstr = bytearray(b"\x00")
+    offsets = []
+    for name in needed:
+        offsets.append(len(dynstr))
+        dynstr.extend(name.encode("utf-8") + b"\x00")
+
+    phoff = ehdr_size
+    phnum = 2
+    dyn_off = phoff + phnum * phentsize
+    dyn_entry_size = 16 if bits == 64 else 8
+    dyn_entries = [(1, off) for off in offsets]  # DT_NEEDED
+    dyn_entries.append((5, 0))   # DT_STRTAB placeholder
+    dyn_entries.append((10, len(dynstr)))  # DT_STRSZ
+    dyn_entries.append((0, 0))   # DT_NULL
+    dyn_size = len(dyn_entries) * dyn_entry_size
+    dynstr_off = dyn_off + dyn_size
+    dyn_entries[-3] = (5, vaddr_base + dynstr_off)
+    total = dynstr_off + len(dynstr)
+
+    if bits == 64:
+        hdr = struct.pack(endian + "HHIQQQIHHHHHH",
+                          e_type, 62, 1, 0, phoff, 0, 0,
+                          ehdr_size, phentsize, phnum, 0, 0, 0)
+        ph_load = struct.pack(endian + "IIQQQQQQ",
+                              1, 5, 0, vaddr_base, vaddr_base, total, total, 0x1000)
+        ph_dyn = struct.pack(endian + "IIQQQQQQ",
+                             2, 6, dyn_off, vaddr_base + dyn_off,
+                             vaddr_base + dyn_off, dyn_size, dyn_size, 8)
+        dyn_bytes = b"".join(struct.pack(endian + "qQ", t, v)
+                             for t, v in dyn_entries)
+    else:
+        hdr = struct.pack(endian + "HHIIIIIHHHHHH",
+                          e_type, 3, 1, 0, phoff, 0, 0,
+                          ehdr_size, phentsize, phnum, 0, 0, 0)
+        ph_load = struct.pack(endian + "IIIIIIII",
+                              1, 0, vaddr_base, vaddr_base, total, total, 5, 0x1000)
+        ph_dyn = struct.pack(endian + "IIIIIIII",
+                             2, dyn_off, vaddr_base + dyn_off,
+                             vaddr_base + dyn_off, dyn_size, dyn_size, 6, 4)
+        dyn_bytes = b"".join(struct.pack(endian + "iI", t, v)
+                             for t, v in dyn_entries)
+    return ident + hdr + ph_load + ph_dyn + dyn_bytes + bytes(dynstr)
 
 
 HARDWARE_NODE = "//talOS/bridge:hardware_node"
@@ -165,6 +235,7 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertIn(f'binary_sha256 = "{empty_sha256}"', manifest)
             # Unstamped: no revision rather than a stale or made-up one.
             self.assertNotIn("git_revision", manifest)
+            self.assertNotIn("talos_git_revision", manifest)
         with tempfile.TemporaryDirectory() as tmp:
             status = os.path.join(tmp, "stable-status.txt")
             put(status, "BUILD_HOST h\nSTABLE_GIT_COMMIT 0123abcd\n"
@@ -173,6 +244,128 @@ class BundleBuilderTest(unittest.TestCase):
                                      extra=("--stable-status", status))
             self.assertIn('git_revision = "0123abcd"', manifest)
             self.assertIn("git_dirty = true", manifest)
+            self.assertNotIn("talos_git_revision", manifest)
+        # Dual-revision stamp from a separate robot repository (REPO-4).
+        with tempfile.TemporaryDirectory() as tmp:
+            status = os.path.join(tmp, "stable-status.txt")
+            put(status,
+                "STABLE_GIT_COMMIT 1111aaaa\nSTABLE_GIT_DIRTY 0\n"
+                "STABLE_TALOS_GIT_COMMIT 2222bbbb\nSTABLE_TALOS_GIT_DIRTY 1\n")
+            _, manifest = self.build(tmp, {"c/robot.toml": "[robot]\n"},
+                                     extra=("--stable-status", status))
+            self.assertIn('git_revision = "1111aaaa"', manifest)
+            self.assertIn("git_dirty = false", manifest)
+            self.assertIn('talos_git_revision = "2222bbbb"', manifest)
+            self.assertIn("talos_git_dirty = true", manifest)
+        # talOS checkout stamped even when the robot directory is not a git repo.
+        with tempfile.TemporaryDirectory() as tmp:
+            status = os.path.join(tmp, "stable-status.txt")
+            put(status,
+                "STABLE_TALOS_GIT_COMMIT 3333cccc\nSTABLE_TALOS_GIT_DIRTY 0\n")
+            _, manifest = self.build(tmp, {"c/robot.toml": "[robot]\n"},
+                                     extra=("--stable-status", status))
+            self.assertNotIn("\ngit_revision =", "\n" + manifest)
+            self.assertIn('talos_git_revision = "3333cccc"', manifest)
+            self.assertIn("talos_git_dirty = false", manifest)
+
+    # REQ-OPS-10, REQ-DEV-30 (REPO-4): workspace_status.sh stamps both the
+    # robot repo and talOS when invoked from a separate robot repository,
+    # omits STABLE_TALOS_GIT_* in a single repo or vendored tree, and still
+    # stamps talOS when the robot directory is outside git.
+    def test_workspace_status_stamps_separate_robot_and_talos_repos(self):
+        status_src = os.path.abspath(
+            runfiles.Create().Rlocation("_main/tools/workspace_status.sh"))
+
+        def git(repo, *args):
+            env = dict(os.environ,
+                       GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="t@example.com",
+                       GIT_COMMITTER_NAME="Test",
+                       GIT_COMMITTER_EMAIL="t@example.com")
+            for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+                env.pop(k, None)
+            proc = subprocess.run(
+                ["git", "-C", repo, *args],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+
+        def init_repo(path, files, executable=()):
+            os.makedirs(path, exist_ok=True)
+            git(path, "init", "-q")
+            for rel, content in files.items():
+                full = os.path.join(path, rel)
+                put(full, content)
+                if rel in executable:
+                    os.chmod(full, 0o755)
+            git(path, "add", ".")
+            git(path, "commit", "-q", "-m", "init")
+            return git(path, "rev-parse", "HEAD")
+
+        def run_status(script, cwd):
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+            proc = subprocess.run(["bash", script], cwd=cwd,
+                                  capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            parsed = {}
+            for line in proc.stdout.splitlines():
+                k, _, v = line.partition(" ")
+                parsed[k] = v
+            return parsed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(status_src, encoding="utf-8") as f:
+                script_body = f.read()
+            talos_dir = os.path.join(tmp, "talos")
+            talos_rev = init_repo(
+                talos_dir, {"tools/workspace_status.sh": script_body},
+                executable=("tools/workspace_status.sh",))
+            talos_script = os.path.join(talos_dir, "tools", "workspace_status.sh")
+
+            # 1. Single repo (inside talOS): emits only STABLE_GIT_*.
+            self.assertEqual(run_status(talos_script, talos_dir), {
+                "STABLE_GIT_COMMIT": talos_rev,
+                "STABLE_GIT_DIRTY": "0",
+            })
+
+            # 2. Separate clean robot repo: emits both revisions, both clean.
+            robot_dir = os.path.join(tmp, "robot")
+            robot_rev = init_repo(robot_dir, {"robot.toml": "[robot]\n"})
+            self.assertEqual(run_status(talos_script, robot_dir), {
+                "STABLE_GIT_COMMIT": robot_rev,
+                "STABLE_GIT_DIRTY": "0",
+                "STABLE_TALOS_GIT_COMMIT": talos_rev,
+                "STABLE_TALOS_GIT_DIRTY": "0",
+            })
+
+            # 3. Dirty robot + dirty talOS: both dirty bits flip to 1.
+            put(os.path.join(robot_dir, "untracked.txt"), "dirty\n")
+            put(os.path.join(talos_dir, "untracked.txt"), "dirty\n")
+            self.assertEqual(run_status(talos_script, robot_dir), {
+                "STABLE_GIT_COMMIT": robot_rev,
+                "STABLE_GIT_DIRTY": "1",
+                "STABLE_TALOS_GIT_COMMIT": talos_rev,
+                "STABLE_TALOS_GIT_DIRTY": "1",
+            })
+
+            # 4. Non-git robot directory: does not exit early; stamps talOS.
+            nongit_dir = os.path.join(tmp, "nongit")
+            os.makedirs(nongit_dir)
+            self.assertEqual(run_status(talos_script, nongit_dir), {
+                "STABLE_TALOS_GIT_COMMIT": talos_rev,
+                "STABLE_TALOS_GIT_DIRTY": "1",
+            })
+
+            # 5. Vendored copy inside robot repo (no separate talOS .git):
+            # toplevel != TALOS_DIR, so STABLE_TALOS_GIT_* is not emitted.
+            vendored = os.path.join(
+                robot_dir, "vendor", "talos", "tools", "workspace_status.sh")
+            put(vendored, script_body)
+            os.chmod(vendored, 0o755)
+            self.assertEqual(run_status(vendored, robot_dir), {
+                "STABLE_GIT_COMMIT": robot_rev,
+                "STABLE_GIT_DIRTY": "1",
+            })
 
     def test_cpp_nodes_shared_libraries_land_once_in_lib(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,6 +456,53 @@ class BundleBuilderTest(unittest.TestCase):
                                           os.X_OK))
                 self.assertTrue(os.path.isfile(
                     os.path.join(out, studio["webroot"], "index.html")))
+                self.assertTrue(os.path.isfile(
+                    os.path.join(out, studio["webroot"], "drive.html")))
+
+    # REQ-OPS-39
+    def test_studio_dashboard_layout_stages_under_config_with_matching_bytes(self):
+        # [studio] dashboard is listed in CONFIG_FILES and staged beside the
+        # config under out/config/ with matching bytes and included in
+        # config_sha256.
+        layout = (
+            "[dashboard]\nupdate_hz = 10\n"
+            "[[widgets]]\nkind = \"match\"\nat = [0, 0, 4, 2]\n"
+        )
+        robot_toml = "[robot]\n[studio]\ndashboard = \"layouts/drive.toml\"\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.assemble(
+                tmp,
+                {
+                    "bot/config/robot.toml": robot_toml,
+                    "bot/config/layouts/drive.toml": layout,
+                },
+                [node(tmp, "hardware_node", HARDWARE_NODE)],
+                (),
+                effective={"studio": {"dashboard": "bot/config/layouts/drive.toml"}},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = os.path.join(tmp, "out")
+            staged = os.path.join(out, "config", "layouts", "drive.toml")
+            self.assertTrue(os.path.isfile(staged), staged)
+            with open(staged, encoding="utf-8") as f:
+                self.assertEqual(f.read(), layout)
+            with open(os.path.join(out, "bundle_manifest.toml"), "rb") as f:
+                sha_before = tomllib.load(f)["config_sha256"]
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.assemble(
+                tmp,
+                {
+                    "bot/config/robot.toml": robot_toml,
+                    "bot/config/layouts/drive.toml": layout + "# changed\n",
+                },
+                [node(tmp, "hardware_node", HARDWARE_NODE)],
+                (),
+                effective={"studio": {"dashboard": "bot/config/layouts/drive.toml"}},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(os.path.join(tmp, "out", "bundle_manifest.toml"), "rb") as f:
+                sha_after = tomllib.load(f)["config_sha256"]
+            self.assertNotEqual(sha_before, sha_after)
 
     def test_runfiles_the_bundle_cannot_hold_fail(self):
         # A Python node imports from its runfiles only on the robot. A link
@@ -382,7 +622,7 @@ class BundleBuilderTest(unittest.TestCase):
         interpreter = ('#!/bin/sh\nhome="$(dirname "$(realpath "$0")")/.."\n'
                        'test -d "$home/lib/python3.11/encodings" || {\n'
                        '  echo "No module named encodings" >&2; exit 1; }\n'
-                       'echo "ran $0"\n')
+                       'echo "ran $$ $0"\n')
         with tempfile.TemporaryDirectory() as tmp:
             nodes = self.python_nodes(tmp, {"a": interpreter, "b": interpreter})
             proc = self.assemble(
@@ -403,11 +643,15 @@ class BundleBuilderTest(unittest.TestCase):
                 venv = os.path.join(built, "bin", f"{name}.runfiles", "_main",
                                     name, "_node_bin.venv", "bin", "python3")
                 with self.subTest(node=name):
-                    run = subprocess.run([venv], capture_output=True,
-                                         text=True, timeout=60)
-                    self.assertEqual(run.returncode, 0, run.stderr)
+                    run = subprocess.Popen([venv], stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True)
+                    out, err = run.communicate(timeout=60)
+                    self.assertEqual(run.returncode, 0, err)
+                    _, pid_str, exe_path = out.strip().split(" ", 2)
+                    # The venv wrapper execs the interpreter in place.
+                    self.assertEqual(int(pid_str), run.pid, out)
                     self.assertEqual(
-                        os.path.realpath(run.stdout.split(" ", 1)[1].strip()),
+                        os.path.realpath(exe_path),
                         os.path.realpath(os.path.join(built, held[0])))
 
     # REQ-OPS-48
@@ -444,6 +688,237 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertIn(RUNTIME, proc.stderr)
             self.assertIn("'a'", proc.stderr)
 
+    # REQ-OPS-48
+    def test_strips_test_only_wheels_from_python_node_runfiles(self):
+        # gtsam's wheel metadata pulls in pytest and its four dependencies
+        # (pluggy, iniconfig, pygments, packaging) as test-only wheels (~7 MB).
+        # The bundler strips those external site-packages wheel directories while
+        # keeping real wheels (including numpy/_pytesttester.py), runtime files,
+        # and any user code under _main/.
+        with tempfile.TemporaryDirectory() as tmp:
+            (py,) = self.python_nodes(tmp, {"a": "#!/bin/sh\n"})
+            stripped = (
+                "rules_python++pip+pypi_311_pytest_py3_none_any_07acdcf8/site-packages/pytest/__init__.py",
+                "rules_python++pip+pypi_311_pytest_py3_none_any_07acdcf8/site-packages/_pytest/main.py",
+                "rules_python++pip+pypi_311_pytest_py3_none_any_07acdcf8/site-packages/py.py",
+                "rules_python++pip+pypi_311_pytest_py3_none_any_07acdcf8/site-packages/pytest-9.2.0.dist-info/METADATA",
+                "rules_python++pip+pypi_311_pluggy_py3_none_any_7dd7b0d8/site-packages/pluggy/__init__.py",
+                "rules_python++pip+pypi_311_pluggy_py3_none_any_7dd7b0d8/site-packages/pluggy-1.7.0.dist-info/METADATA",
+                "rules_python++pip+pypi_311_iniconfig_py3_none_any_9121e2c1/site-packages/iniconfig/__init__.py",
+                "rules_python++pip+pypi_311_iniconfig_py3_none_any_9121e2c1/site-packages/iniconfig-2.3.1.dist-info/METADATA",
+                "rules_python++pip+pypi_311_pygments_py3_none_any_2363c69b/site-packages/pygments/__init__.py",
+                "rules_python++pip+pypi_311_pygments_py3_none_any_2363c69b/site-packages/pygments-2.21.0.dist-info/METADATA",
+                "rules_python++pip+pypi_311_packaging_py3_none_any_d7193f7c/site-packages/packaging/__init__.py",
+                "rules_python++pip+pypi_311_packaging_py3_none_any_d7193f7c/site-packages/packaging-26.3.dist-info/METADATA",
+            )
+            kept_in_runfiles = (
+                "rules_python++pip+pypi_311_gtsam_cp311_manylinux/site-packages/gtsam/__init__.py",
+                "rules_python++pip+pypi_311_numpy_cp311_manylinux/site-packages/numpy/_pytesttester.py",
+                "_main/packaging/node.py",
+                "_main/site-packages/pytest/user_code.py",
+            )
+            kept_in_runtime = (
+                RUNTIME + "/lib/python3.11/site-packages/pip/_vendor/packaging/__init__.py",
+            )
+            for idx, rf_rel in enumerate(stripped + kept_in_runfiles + kept_in_runtime):
+                src = os.path.join(tmp, "src", "extra", f"f{idx}.py")
+                put(src, f"# {rf_rel}\n")
+                py["runfiles"].append({"src_path": src, "rf_rel": rf_rel})
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//a:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            built = os.path.join(tmp, "out")
+            rf_root = os.path.join(built, "bin", "a.runfiles")
+            for rf_rel in stripped:
+                self.assertFalse(
+                    os.path.exists(os.path.join(rf_root, rf_rel)),
+                    f"test-only wheel file was not stripped: {rf_rel}")
+            for rf_rel in kept_in_runfiles:
+                self.assertTrue(
+                    os.path.isfile(os.path.join(rf_root, rf_rel)),
+                    f"non-test runfile was stripped: {rf_rel}")
+            for rf_rel in kept_in_runtime:
+                self.assertTrue(
+                    os.path.isfile(os.path.join(built, RUNTIME_DIR, rf_rel)),
+                    f"runtime file was stripped: {rf_rel}")
+
+    def _elf_python_node(self, tmp, interpreter_bytes, extra_runfiles=()):
+        """Builds a single Python node spec whose bundled interpreter carries
+        `interpreter_bytes` (under python, python3 and python3.11) plus
+        libpython3.11.so.1.0, libpython3.so (which itself needs
+        libpython3.11.so.1.0), and libother.so in the runtime's lib/."""
+        src = os.path.join(tmp, "src", "py")
+        real = os.path.join(src, "python3")
+        put_bytes(real, interpreter_bytes)
+        os.chmod(real, 0o755)
+        put(os.path.join(src, "encodings.py"), "")
+        link = os.path.join(src, "venv", "bin", "python3")
+        os.makedirs(os.path.dirname(link))
+        os.symlink("../../../../" + RUNTIME + "/bin/python3", link)
+        libpy11 = os.path.join(src, "libpython3.11.so.1.0")
+        put_bytes(libpy11, make_elf(["libc.so.6"]))
+        os.chmod(libpy11, 0o755)
+        libpy3 = os.path.join(src, "libpython3.so")
+        put_bytes(libpy3, make_elf(["$ORIGIN/../lib/libpython3.11.so.1.0"]))
+        os.chmod(libpy3, 0o755)
+        libother = os.path.join(src, "libother.so")
+        put_bytes(libother, make_elf(["libc.so.6"]))
+        os.chmod(libother, 0o755)
+        rf = [{"src_path": real, "rf_rel": f"{RUNTIME}/bin/{alias}"}
+              for alias in ("python", "python3", "python3.11")]
+        rf += [
+            {"src_path": os.path.join(src, "encodings.py"),
+             "rf_rel": f"{RUNTIME}/lib/python3.11/encodings/__init__.py"},
+            {"src_path": libpy11,
+             "rf_rel": f"{RUNTIME}/lib/libpython3.11.so.1.0"},
+            {"src_path": libpy3,
+             "rf_rel": f"{RUNTIME}/lib/libpython3.so"},
+            {"src_path": libother,
+             "rf_rel": f"{RUNTIME}/lib/libother.so"},
+            {"src_path": link,
+             "rf_rel": "_main/a/_node_bin.venv/bin/python3"},
+        ]
+        for idx, (rf_rel, data) in enumerate(extra_runfiles):
+            p = os.path.join(src, f"extra_{idx}")
+            put_bytes(p, data)
+            rf.append({"src_path": p, "rf_rel": rf_rel})
+        return dict(node(tmp, "a", "//a:node"), language="python", runfiles=rf)
+
+    # REQ-OPS-48
+    def test_strips_unused_libpython_shared_libs_when_statically_linked(self):
+        # On Linux, rules_python's python3 binary statically links libpython
+        # (no libpython* in DT_NEEDED) yet ships a 51 MB libpython3.11.so.1.0
+        # and libpython3.so beside it. When neither python3 nor any other ELF
+        # file in the bundle needs libpython*, the bundler omits them while
+        # keeping unrelated runtime and extension .so files.
+        with tempfile.TemporaryDirectory() as tmp:
+            py = self._elf_python_node(
+                tmp, make_elf(["libpthread.so.0", "libc.so.6"]),
+                extra_runfiles=[(
+                    "wheel/site-packages/pkg/_ext.cpython-311.so",
+                    make_elf(["libc.so.6", "libm.so.6"]),
+                )])
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//a:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            built = os.path.join(tmp, "out")
+            rt_lib = os.path.join(built, RUNTIME_DIR, RUNTIME, "lib")
+            self.assertFalse(os.path.exists(
+                os.path.join(rt_lib, "libpython3.11.so.1.0")))
+            self.assertFalse(os.path.exists(
+                os.path.join(rt_lib, "libpython3.so")))
+            self.assertTrue(os.path.isfile(
+                os.path.join(rt_lib, "libother.so")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                built, "bin", "a.runfiles",
+                "wheel/site-packages/pkg/_ext.cpython-311.so")))
+            # Interpreter copies are still aliased after stripping.
+            with open(os.path.join(built, RUNTIME_DIR, RUNTIME, "bin",
+                                   "python3.11"), "rb") as f:
+                self.assertTrue(f.read(2) == b"#!")
+
+    # REQ-OPS-48
+    def test_keeps_libpython_when_needed_or_non_elf_or_corrupt_elf(self):
+        # Fail-closed safety checks: keep libpython3*.so* whenever python3
+        # itself links libpython, any extension or shared library in the bundle
+        # links libpython, the runtime is non-ELF (macOS Mach-O + .dylib), or
+        # any ELF file in the bundle cannot be parsed.
+        macho = b"\xcf\xfa\xed\xfe" + b"\x00" * 60
+        cases = (
+            ("dynamic python3",
+             make_elf(["$ORIGIN/../lib/libpython3.11.so.1.0", "libc.so.6"]),
+             (), (), True),
+            ("wheel needs libpython3.so",
+             make_elf(["libc.so.6"]),
+             [("wheel/site-packages/abi3/_ext.abi3.so",
+               make_elf(["libpython3.so", "libc.so.6"]))],
+             (), True),
+            ("cpp shared_lib needs libpython",
+             make_elf(["libc.so.6"]),
+             (), [("libembed.so", make_elf(["libpython3.11.so.1.0"]))], True),
+            ("macos macho and dylib",
+             macho,
+             [(f"{RUNTIME}/lib/libpython3.11.dylib", macho)],
+             (), True),
+            ("corrupt elf fails closed",
+             make_elf(["libc.so.6"]),
+             [("wheel/site-packages/pkg/bad.so", b"\x7fELF\x02\x01\x01")],
+             (), True),
+        )
+        for label, interp, extra_rf, cpp_libs, kept in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                py = self._elf_python_node(tmp, interp, extra_rf)
+                hw = node(tmp, "hardware_node", HARDWARE_NODE)
+                for lib_name, lib_bytes in cpp_libs:
+                    p = os.path.join(tmp, "src", "solib", lib_name)
+                    put_bytes(p, lib_bytes)
+                    hw["shared_libs"].append({"src_path": p, "name": lib_name})
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"}, [hw, py], ["//a:node"])
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                rt_lib = os.path.join(tmp, "out", RUNTIME_DIR, RUNTIME, "lib")
+                self.assertEqual(
+                    os.path.isfile(os.path.join(rt_lib, "libpython3.11.so.1.0")),
+                    kept, label)
+                self.assertEqual(
+                    os.path.isfile(os.path.join(rt_lib, "libpython3.so")),
+                    kept, label)
+                if label == "macos macho and dylib":
+                    self.assertTrue(os.path.isfile(
+                        os.path.join(rt_lib, "libpython3.11.dylib")))
+
+    # REQ-OPS-48
+    def test_elf_needed_libraries_parses_formats_and_fails_closed(self):
+        builder_path = runfiles.Create().Rlocation(
+            "_main/talOS/build/bundle_builder.py")
+        spec = importlib.util.spec_from_file_location(
+            "bundle_builder", builder_path)
+        bb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bb)
+        with tempfile.TemporaryDirectory() as tmp:
+            p64 = os.path.join(tmp, "e64")
+            put_bytes(p64, make_elf(["libc.so.6", "libm.so.6"], bits=64, endian="<"))
+            self.assertEqual(bb.elf_needed_libraries(p64), ["libc.so.6", "libm.so.6"])
+
+            p32 = os.path.join(tmp, "e32be")
+            put_bytes(p32, make_elf(["libpython3.so"], bits=32, endian=">"))
+            self.assertEqual(bb.elf_needed_libraries(p32), ["libpython3.so"])
+
+            prel = os.path.join(tmp, "obj.o")
+            put_bytes(prel, make_elf(e_type=1))
+            self.assertEqual(bb.elf_needed_libraries(prel), [])
+
+            ptext = os.path.join(tmp, "script.sh")
+            put(ptext, "#!/bin/sh\n")
+            self.assertIsNone(bb.elf_needed_libraries(ptext))
+
+            pbad = os.path.join(tmp, "bad.elf")
+            put_bytes(pbad, b"\x7fELF" + b"\x00" * 12)
+            with self.assertRaises(bb.ElfParseError):
+                bb.elf_needed_libraries(pbad)
+
+            # Corrupt ELF with zero-length PT_DYNAMIC must fail closed.
+            valid = bytearray(make_elf(["libc.so.6"], bits=64, endian="<"))
+            # Second program header (index 1, offset 64 + 56 = 120) is PT_DYNAMIC;
+            # p_filesz is at +32 within the 56-byte Elf64_Phdr.
+            pzero = os.path.join(tmp, "zero_dyn.elf")
+            z = bytearray(valid)
+            z[64 + 56 + 32 : 64 + 56 + 40] = (0).to_bytes(8, "little")
+            put_bytes(pzero, bytes(z))
+            with self.assertRaises(bb.ElfParseError):
+                bb.elf_needed_libraries(pzero)
+
+            # Truncated PT_DYNAMIC without DT_NULL terminator must fail closed.
+            pnoterm = os.path.join(tmp, "noterm_dyn.elf")
+            nt = bytearray(valid)
+            # Shrink PT_DYNAMIC p_filesz to 16 bytes (1 entry, before DT_NULL).
+            nt[64 + 56 + 32 : 64 + 56 + 40] = (16).to_bytes(8, "little")
+            put_bytes(pnoterm, bytes(nt))
+            with self.assertRaises(bb.ElfParseError):
+                bb.elf_needed_libraries(pnoterm)
+
     def test_run_script_through_a_link_passes_the_physical_bundle(self):
         # The boot service starts <prefix>/current/run.sh. Node binaries come
         # from --bundle, so a path through the link would restart nodes from
@@ -462,9 +937,9 @@ class BundleBuilderTest(unittest.TestCase):
 
     # REQ-OPS-34
     def test_run_script_starts_a_carried_studio_unless_declined(self):
-        # The boot service runs run.sh bare, so the default is what a booted
-        # robot gets. --no-studio is run.sh's own and must not reach the
-        # launcher, which would refuse it.
+        # The boot service runs run.sh --serve-refusal without --no-studio, so
+        # the default is what a booted robot gets. --no-studio is run.sh's own
+        # and must not reach the launcher, which would refuse it.
         for carried, given, starts in ((True, [], True),
                                        (True, ["--no-studio"], False),
                                        (False, [], False)):
@@ -495,6 +970,187 @@ class BundleBuilderTest(unittest.TestCase):
                 self.assertEqual("--start-studio-bridge" in args, starts, args)
                 self.assertNotIn("--no-studio", args)
                 self.assertEqual(args[-2:], ["--duration-s", "1"])
+
+    # REQ-DEV-30
+    def test_repo_mapping_maps_custom_apparent_names_for_nodes_and_studio(self):
+        # A robot repository with `bazel_dep(name = "talos", repo_name =
+        # "my_talos")` names talOS nodes as `@my_talos//...` in its config while
+        # Bazel's canonical labels are `@@talos+//...` (Bazel 8) or
+        # `@@talos~//...` (Bazel 7). `_repo_mapping` supplies the real apparent
+        # name to check_nodes, check_studio, and bundle_manifest.toml.
+        for canonical, apparent in (("talos+", "my_talos"),
+                                    ("talos~", "my_talos7")):
+            with self.subTest(canonical=canonical, apparent=apparent), \
+                    tempfile.TemporaryDirectory() as tmp:
+                repo_mapping = os.path.join(tmp, "_repo_mapping")
+                put(repo_mapping,
+                    f",{apparent},{canonical}\n"
+                    f"{canonical},rules_cc,rules_cc+\n")
+                bridge = os.path.join(tmp, "src", "studio_bridge")
+                put(bridge, "")
+                webroot = os.path.join(tmp, "src", "dist")
+                put(os.path.join(webroot, "index.html"), "<html>")
+                put(os.path.join(webroot, "drive.html"), "<html>")
+                hw_canon = f"@@{canonical}//talOS/bridge:hardware_node"
+                teleop_canon = f"@@{canonical}//talOS/teleop:node"
+                studio_canon = f"@@{canonical}//studio/bridge:studio_bridge"
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"},
+                    [node(tmp, "hardware_node", hw_canon),
+                     node(tmp, "teleop", teleop_canon)],
+                    [f"@{apparent}//talOS/teleop:node"],
+                    robot={"hardware_node":
+                           f"@{apparent}//talOS/bridge:hardware_node"},
+                    extra=("--repo-mapping", repo_mapping),
+                    studio={"bridge_path": bridge,
+                            "bridge_label": studio_canon,
+                            "webroot_path": webroot},
+                    effective={"studio": {
+                        "bridge":
+                        f"@{apparent}//studio/bridge:studio_bridge"}})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                with open(os.path.join(tmp, "out", "bundle_manifest.toml"),
+                          "rb") as f:
+                    manifest = tomllib.load(f)
+                by_name = {n["name"]: n["targets"] for n in manifest["nodes"]}
+                self.assertEqual(
+                    by_name["teleop"],
+                    [teleop_canon, f"@{apparent}//talOS/teleop:node"])
+                self.assertEqual(
+                    manifest["studio"]["targets"],
+                    [studio_canon, f"@{apparent}//studio/bridge:studio_bridge"])
+
+    # REQ-DEV-30
+    def test_apparent_repo_maps_external_targets_without_main_repo_mapping_rows(self):
+        # When 100% of a bundle's targets live in an external repo (`@my_talos`),
+        # their `repo_mapping_manifest` files carry no `source == ""` main-repo
+        # rows. The `talos_bundle` macro extracts `apparent=canonical` pairs in
+        # the caller's repo context and passes `--apparent-repo`, so `check_nodes`,
+        # `check_studio`, and `bundle_manifest.toml` still resolve `@my_talos`.
+        for canonical, apparent in (("talos+", "my_talos"),
+                                    ("talos~", "my_talos7")):
+            with self.subTest(canonical=canonical, apparent=apparent), \
+                    tempfile.TemporaryDirectory() as tmp:
+                # External-repo manifest only: zero `source == ""` rows.
+                repo_mapping = os.path.join(tmp, "_repo_mapping")
+                put(repo_mapping,
+                    f"{canonical},rules_cc,rules_cc+\n"
+                    f"{canonical},rules_python,rules_python+\n")
+                bridge = os.path.join(tmp, "src", "studio_bridge")
+                put(bridge, "")
+                webroot = os.path.join(tmp, "src", "dist")
+                put(os.path.join(webroot, "index.html"), "<html>")
+                put(os.path.join(webroot, "drive.html"), "<html>")
+                hw_canon = f"@@{canonical}//talOS/bridge:hardware_node"
+                teleop_canon = f"@@{canonical}//talOS/teleop:node"
+                studio_canon = f"@@{canonical}//studio/bridge:studio_bridge"
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"},
+                    [node(tmp, "hardware_node", hw_canon),
+                     node(tmp, "teleop", teleop_canon)],
+                    [f"@{apparent}//talOS/teleop:node"],
+                    robot={"hardware_node":
+                           f"@{apparent}//talOS/bridge:hardware_node"},
+                    extra=("--repo-mapping", repo_mapping,
+                           "--apparent-repo", f"{apparent}={canonical}"),
+                    studio={"bridge_path": bridge,
+                            "bridge_label": studio_canon,
+                            "webroot_path": webroot},
+                    effective={"studio": {
+                        "bridge":
+                        f"@{apparent}//studio/bridge:studio_bridge"}})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                with open(os.path.join(tmp, "out", "bundle_manifest.toml"),
+                          "rb") as f:
+                    manifest = tomllib.load(f)
+                by_name = {n["name"]: n["targets"] for n in manifest["nodes"]}
+                self.assertEqual(
+                    by_name["hardware_node"],
+                    [hw_canon, f"@{apparent}//talOS/bridge:hardware_node"])
+                self.assertEqual(
+                    by_name["teleop"],
+                    [teleop_canon, f"@{apparent}//talOS/teleop:node"])
+                self.assertEqual(
+                    manifest["studio"]["targets"],
+                    [studio_canon, f"@{apparent}//studio/bridge:studio_bridge"])
+
+        # Canonical main-repo `@@//pkg:node` normalizes to `//pkg:node` cleanly.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE),
+                 node(tmp, "arm", "@@//arm:node")],
+                ["//arm:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(os.path.join(tmp, "out", "bundle_manifest.toml"),
+                      "rb") as f:
+                manifest = tomllib.load(f)
+            by_name = {n["name"]: n["targets"] for n in manifest["nodes"]}
+            self.assertEqual(by_name["arm"], ["@@//arm:node", "//arm:node"])
+
+    # REQ-DEV-30
+    def test_launcher_runner_derives_main_repo_without_hardcoding_main(self):
+        runner_path = runfiles.Create().Rlocation(
+            "_main/talOS/build/launcher_runner.py")
+        spec = importlib.util.spec_from_file_location(
+            "launcher_runner", runner_path)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "runfiles")
+            put(os.path.join(root, "_repo_mapping"),
+                ",my_robot,custom_main\n"
+                ",my_talos,talos+\n"
+                "+_repo_rules+toml,talos,_main\n"
+                "talos+,rules_cc,rules_cc+\n"
+                "talos+,transitive_plain,transitive_plain\n")
+            put(os.path.join(root, "custom_main", "robot.toml"), "[robot]\n")
+            launcher = os.path.join(
+                root, "talos+", "talOS", "launcher", "launcher")
+            put(launcher, "")
+            self.assertEqual(
+                runner.split_config("_main/robot.toml", root),
+                ("_main", "robot.toml"))
+            self.assertEqual(
+                runner.split_config("custom_main/robot.toml", root),
+                ("custom_main", "robot.toml"))
+            for bad in ("talos+/bench/robot.toml",
+                        "rules_cc+/bench/robot.toml",
+                        "legacy~dep/bench/robot.toml",
+                        "transitive_plain/bench/robot.toml"):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(SystemExit) as caught:
+                        runner.split_config(bad, root)
+                    self.assertIn("not in the main repository",
+                                  str(caught.exception))
+            old_rf = os.environ.get("RUNFILES_DIR")
+            os.environ["RUNFILES_DIR"] = root
+            try:
+                work_dir, config, env = runner.workspace(
+                    os.path.join(tmp, "work"), launcher,
+                    "custom_main/robot.toml")
+                # Guard against runfiles.Create() returning None.
+                orig_create = runner.runfiles.Create
+                runner.runfiles.Create = lambda: None
+                try:
+                    work_dir2, config2, env2 = runner.workspace(
+                        os.path.join(tmp, "work2"), launcher,
+                        "custom_main/robot.toml")
+                finally:
+                    runner.runfiles.Create = orig_create
+            finally:
+                if old_rf is None:
+                    os.environ.pop("RUNFILES_DIR", None)
+                else:
+                    os.environ["RUNFILES_DIR"] = old_rf
+            self.assertEqual(config, "robot.toml")
+            self.assertEqual(env["RUNFILES_DIR"], root)
+            self.assertTrue(os.path.isfile(os.path.join(work_dir, "robot.toml")))
+            self.assertTrue(os.path.isdir(
+                os.path.join(work_dir, "bazel-bin", "external", "talos+")))
+            self.assertEqual(config2, "robot.toml")
+            self.assertEqual(env2["RUNFILES_DIR"], root)
+            self.assertTrue(os.path.isfile(os.path.join(work_dir2, "robot.toml")))
 
 
 class DeployTest(unittest.TestCase):
@@ -590,6 +1246,23 @@ class DeployTest(unittest.TestCase):
             self.assertIn("last=stop", fields("arm:"))
             self.assertIn("restarts=1", fields("arm:"))
             self.assertNotIn("left no manifest", out)
+            self.assertNotIn("talos", summary)
+
+    # REQ-OPS-10 (REPO-4): deploy.sh logs surfaces talos_git_revision when
+    # present in a session's manifest.json and omits it otherwise.
+    def test_logs_reports_talos_revision_when_present(self):
+        second = 1_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            self.session(
+                tmp, "dual", 1 * second, start_ns=1_700_000_100 * second,
+                git_revision="1111222233334444", git_dirty=False,
+                talos_git_revision="abcdef0123456789", talos_git_dirty=True)
+            proc = self.deploy(tmp, "logs")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            header = next(line for line in proc.stdout.splitlines()
+                          if line.startswith("session dual"))
+            self.assertIn("revision 111122223333 talos abcdef012345 dirty",
+                          header)
 
     def test_logs_shows_launcher_stderr_a_failed_launch_left(self):
         second = 1_000_000_000
@@ -854,7 +1527,20 @@ class DeployTest(unittest.TestCase):
     def test_run_on_linux_starts_nothing_without_the_limit_grant(self):
         import resource
 
-        def lowered():
+        script = os.path.abspath(runfiles.Create().Rlocation(
+            "_main/tools/deploy.sh"))
+
+        def assert_limit_refusal(proc, record):
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            lines = proc.stderr.splitlines()
+            self.assertEqual(len(lines), 1, proc.stderr)
+            self.assertIn("limits.d/talos.conf", lines[0])
+            self.assertIn("rtprio", lines[0])
+            self.assertIn("memlock", lines[0])
+            self.assertFalse(os.path.exists(record), proc.stdout)
+
+        # Kernel RLIMIT_RTPRIO refusal.
+        def lowered_rtprio():
             resource.setrlimit(resource.RLIMIT_RTPRIO, (0, 0))
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -862,12 +1548,104 @@ class DeployTest(unittest.TestCase):
             env = dict(os.environ, PATH=self.host(tmp, "Linux") + os.pathsep
                        + os.environ["PATH"])
             proc = subprocess.run(
-                ["bash", os.path.abspath(runfiles.Create().Rlocation(
-                    "_main/tools/deploy.sh")), "run", "--prefix", prefix],
-                capture_output=True, text=True, env=env, preexec_fn=lowered)
-            self.assertNotEqual(proc.returncode, 0, proc.stdout)
-            self.assertIn("rtprio", proc.stderr)
-            self.assertFalse(os.path.exists(record), proc.stdout)
+                ["bash", script, "run", "--prefix", prefix],
+                capture_output=True, text=True, env=env,
+                preexec_fn=lowered_rtprio)
+            assert_limit_refusal(proc, record)
+
+        # Independent RLIMIT_MEMLOCK failure (rtprio granted, memlock denied),
+        # independent RLIMIT_RTPRIO failure (rtprio denied, memlock granted),
+        # and both-granted control — exercised via BASH_ENV ulimit shim so
+        # memlock is tested independently even on hosts where hard rtprio is 0.
+        for label, rt_ok, ml_ok in (
+                ("memlock_only_fails", True, False),
+                ("rtprio_only_fails", False, True),
+                ("both_succeed", True, True)):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                prefix, record = self.selected(tmp)
+                shim = os.path.join(tmp, "ulimit_shim.sh")
+                put(shim, (
+                    "ulimit() {\n"
+                    f"  case \"$*\" in\n"
+                    f"    '-r 49') return {0 if rt_ok else 1} ;;\n"
+                    f"    '-l unlimited') return {0 if ml_ok else 1} ;;\n"
+                    f"    '-H -r') echo {49 if rt_ok else 0} ;;\n"
+                    f"    '-H -l') echo {'unlimited' if ml_ok else 8192} ;;\n"
+                    f"    *) builtin ulimit \"$@\" ;;\n"
+                    f"  esac\n"
+                    "}\n"
+                ))
+                env = dict(os.environ,
+                           PATH=self.host(tmp, "Linux") + os.pathsep
+                           + os.environ["PATH"],
+                           BASH_ENV=shim)
+                proc = subprocess.run(
+                    ["bash", script, "run", "--prefix", prefix],
+                    capture_output=True, text=True, env=env)
+                if rt_ok and ml_ok:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertTrue(os.path.exists(record), proc.stdout)
+                else:
+                    assert_limit_refusal(proc, record)
+
+    # REQ-OPS-54: an unwritable `<prefix>/logs` root is refused naming
+    # `--output-dir` without starting the launcher, while `--output-dir DIR`
+    # overrides the root, succeeds, and prints the override root.
+    def test_run_refuses_unwritable_log_root_unless_output_dir_given(self):
+        script = os.path.abspath(runfiles.Create().Rlocation(
+            "_main/tools/deploy.sh"))
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, record = self.selected(tmp)
+            logs = os.path.join(prefix, "logs")
+            os.makedirs(logs)
+            env = dict(os.environ, PATH=self.host(tmp, "Darwin") + os.pathsep
+                       + os.environ["PATH"])
+
+            # Writable `<prefix>/logs` succeeds and prints that root.
+            proc = subprocess.run(
+                ["bash", script, "run", "--prefix", prefix],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(logs, proc.stdout)
+            self.assertTrue(os.path.exists(record))
+            os.remove(record)
+
+            # Read-only (0555) `<prefix>/logs` is refused naming --output-dir.
+            if os.geteuid() != 0:
+                os.chmod(logs, 0o555)
+                try:
+                    proc = subprocess.run(
+                        ["bash", script, "run", "--prefix", prefix],
+                        capture_output=True, text=True, env=env)
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                    self.assertIn(logs, proc.stderr)
+                    self.assertIn("--output-dir", proc.stderr)
+                    self.assertFalse(os.path.exists(record), proc.stdout)
+
+                    # Passing `--output-dir <writable>` overrides the root,
+                    # succeeds, prints pid and `--output-dir`, and forwards it.
+                    writable = os.path.join(tmp, "writable_logs")
+                    os.makedirs(writable)
+                    dry = subprocess.run(
+                        ["bash", script, "run", "--dry-run", "--prefix", prefix,
+                         "--output-dir", writable],
+                        capture_output=True, text=True, env=env)
+                    self.assertEqual(dry.returncode, 0, dry.stderr)
+                    self.assertIn(writable, dry.stdout)
+                    self.assertFalse(os.path.exists(record), dry.stdout)
+
+                    proc = subprocess.run(
+                        ["bash", script, "run", "--prefix", prefix,
+                         "--output-dir", writable],
+                        capture_output=True, text=True, env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    with open(record, encoding="utf-8") as f:
+                        pid, _, *args = f.read().splitlines()
+                    self.assertRegex(proc.stdout, rf"\bpid {pid}\b")
+                    self.assertIn("--output-dir", proc.stdout)
+                    self.assertEqual(args, ["--output-dir", writable])
+                finally:
+                    os.chmod(logs, 0o755)
 
     def test_rollback_refuses_a_previous_bundle_that_is_gone(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

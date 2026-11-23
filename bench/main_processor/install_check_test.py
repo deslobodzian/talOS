@@ -170,24 +170,56 @@ class InstallCheckTest(unittest.TestCase):
     # predate --describe-as-launch (a rollback to a bundle built before
     # it). Its unknown-argument refusal is not taken for the bundle's: the
     # check runs again with --describe-only alone and says what it did not
-    # check, and the bundle installs.
+    # check, and a valid bundle installs while a broken graph is still
+    # refused with the warning and its copy removed.
     def test_a_launcher_without_describe_as_launch_is_checked_without_it(self):
+        def wrap_old_launcher(bundle_dir):
+            launcher = os.path.join(bundle_dir, "launcher")
+            os.rename(launcher, launcher + ".real")
+            with open(launcher, "w", encoding="utf-8") as f:
+                f.write('#!/usr/bin/env bash\nfor arg in "$@"; do\n'
+                        '  if [ "$arg" = --describe-as-launch ]; then\n'
+                        '    echo "launcher error: unknown argument: $arg" >&2\n'
+                        '    exit 1\n  fi\ndone\n'
+                        'exec "$(dirname "$0")/launcher.real" "$@"\n')
+            os.chmod(launcher, 0o755)
+
         old = os.path.join(self.tmp, "old")
         shutil.copytree(self.src, old)
-        launcher = os.path.join(old, "launcher")
-        os.rename(launcher, launcher + ".real")
-        with open(launcher, "w", encoding="utf-8") as f:
-            f.write('#!/usr/bin/env bash\nfor arg in "$@"; do\n'
-                    '  if [ "$arg" = --describe-as-launch ]; then\n'
-                    '    echo "launcher error: unknown argument: $arg" >&2\n'
-                    '    exit 1\n  fi\ndone\n'
-                    'exec "$(dirname "$0")/launcher.real" "$@"\n')
-        os.chmod(launcher, 0o755)
+        wrap_old_launcher(old)
         proc = self.deploy("install", old)
         out = proc.stdout + proc.stderr
         self.assertEqual(proc.returncode, 0, out)
         self.assertIn("predates --describe-as-launch", proc.stderr)
         self.assertIn("the launcher accepts the graph", proc.stdout)
+
+        # Broken-graph subcase: fallback --describe-only must still run,
+        # refuse the broken graph, emit the warning, and remove the copy.
+        broken = os.path.join(self.tmp, "old_broken")
+        shutil.copytree(self.src, broken)
+        wrap_old_launcher(broken)
+        motor = os.path.join(broken, os.path.dirname(self.config),
+                             "subsystems", "motor.toml")
+        with open(motor, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("max_bench_voltage_v = 2.0\n", text)
+        os.chmod(motor, 0o644)
+        with open(motor, "w", encoding="utf-8") as f:
+            f.write(text.replace("max_bench_voltage_v = 2.0\n",
+                                 "max_bench_voltage_v = 2.0\n"
+                                 "max_bench_voltag_v = 2.0\n"))
+        broken_prefix = os.path.join(self.tmp, "broken_prefix")
+        proc = self.deploy("install", broken, prefix=broken_prefix)
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("predates --describe-as-launch", proc.stderr)
+        self.assertIn("max_bench_voltag_v", out)
+        self.assertIn("refusing to start", out)
+        self.assertIn(f"{broken} not installed", out)
+        self.assertEqual(os.listdir(os.path.join(broken_prefix, "bundles")),
+                         [], out)
+        self.assertFalse(os.path.lexists(os.path.join(broken_prefix,
+                                                      "current")), out)
 
     # REQ-OPS-48: an installed bundle runs from its installed files alone.
     # A bundle whose files link into a build tree (Bazel's sandbox stages a

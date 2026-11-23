@@ -2,12 +2,27 @@ load("@aspect_bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 exports_files([
     "uws.BUILD.bazel",
     "usockets.BUILD.bazel",
+    "webroot_stamp.py",
 ])
+
+# Pure JSON formatting helpers shared by :system, :telemetry and
+# //studio/review: escaping, 64-bit integer strings, telemetry sample
+# formatting and channel/alert enum names. Zero registry or shared-memory
+# dependency (REQ-SAFE-35).
+cc_library(
+    name = "json_format",
+    hdrs = ["json_format.h"],
+    visibility = ["//studio:__subpackages__"],
+    deps = [
+        "//talOS/telemetry:frames",
+        "//talOS/telemetry:schema",
+    ],
+)
 
 # The system graph: what the live registry holds, as the JSON document Studio
 # and agents consume. Separate from the bridge binary so it can be tested
@@ -17,6 +32,7 @@ cc_library(
     hdrs = ["system.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":json_format",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
     ],
@@ -30,11 +46,22 @@ cc_library(
     hdrs = ["telemetry.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":json_format",
         ":system",
         "//talOS/telemetry:frames",
         "//talOS/telemetry:schema",
         "@flatbuffers",
     ],
+)
+
+# Static HTTP file serving shared by :studio_bridge and //studio/review:
+# MIME lookup, hashed-asset Cache-Control, path containment, symlink-escape
+# detection and bounded file reading.
+cc_library(
+    name = "static_files",
+    srcs = ["static_files.cc"],
+    hdrs = ["static_files.h"],
+    visibility = ["//studio:__subpackages__"],
 )
 
 # The driver dashboard's feed (/drive): the reserved egress budget, the
@@ -156,6 +183,7 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":drive",
+        ":static_files",
         ":system",
         ":telemetry",
         "//talOS/configuration",
@@ -186,7 +214,10 @@ py_test(
         "integration",
         "local",
     ],
-    deps = [":bridge_client"],
+    deps = [
+        ":bridge_client",
+        "//talOS/memory:shm_name",
+    ],
 )
 
 py_test(
@@ -204,7 +235,7 @@ py_test(
     deps = [":bridge_client"],
 )
 
-# Runs the bridge at its smallest idle timeout (8 s), so it takes about 9 s.
+# Runs the bridge at its default idle timeout (16 s), so it takes about 18 s.
 py_test(
     name = "client_timeout_test",
     size = "medium",
@@ -265,6 +296,27 @@ py_test(
     ],
 )
 
+cc_test(
+    name = "registration_test",
+    size = "small",
+    srcs = ["tests/registration_test.cc"],
+    data = [":studio_bridge"],
+    env = {"TALOS_STUDIO_BRIDGE": "$(rlocationpath :studio_bridge)"},
+    tags = [
+        "integration",
+        "local",
+    ],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/introspection:registry",
+        "//talOS/process:realtime_outcome",
+        "//talOS/telemetry:wire",
+        "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 # --describe answers with no ports, shm, or robot, so this stays hermetic.
 py_test(
     name = "describe_test",
@@ -273,4 +325,23 @@ py_test(
         "testdata/robot.toml",
         ":studio_bridge",
     ],
+)
+
+# Deterministic SHA-256 stamp over Studio's web inputs and telemetry.fbs,
+# run by //studio:web_dist (writing STUDIO_STAMP.txt) and by studio_web in
+# webroot.bzl (rejecting stale builds from another talOS revision).
+py_binary(
+    name = "webroot_stamp",
+    srcs = ["webroot_stamp.py"],
+    visibility = ["//studio:__pkg__"],
+)
+
+py_test(
+    name = "webroot_stamp_test",
+    size = "small",
+    srcs = [
+        "webroot_stamp.py",
+        "webroot_stamp_test.py",
+    ],
+    main = "webroot_stamp_test.py",
 )

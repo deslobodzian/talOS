@@ -17,8 +17,10 @@ import {
   parseJson,
   parseSessions,
   parseSnapshot,
+  parseTimeline,
   wallTimeNs
 } from '../src/data/review';
+import {parseDeclaredGraph} from '../src/system';
 
 const golden = (name: string) =>
     readFileSync(new URL(`../review/testdata/golden/${name}`, import.meta.url));
@@ -39,7 +41,7 @@ test('sessions, channels and bounds decode to the fixture session', () => {
   assert.equal(session.start_wall_ns, START_WALL_NS.toString());
   assert.equal(session.end_wall_ns, (START_WALL_NS + 10_000_000_000n).toString());
   assert.deepEqual(session.files.map(f => f.path), [
-    'manifest.json', 'observer.tlog', 'shooter.restart1.tlog',
+    'graph.json', 'manifest.json', 'observer.tlog', 'shooter.restart1.tlog',
     'shooter.segment0.tlog', 'shooter.segment1.tlog', 'shooter.tlog'
   ]);
 
@@ -47,6 +49,7 @@ test('sessions, channels and bounds decode to the fixture session', () => {
   assert.equal(channels.get('shooter/state/position_m')?.unit, 'm');
   assert.ok(channels.has('shooter/state/shot_id'));
   assert.ok(channels.has('shooter/status/boot_id'));
+  assert.ok(channels.has('observer/status/alert_error_link_lost'));
   assert.ok(channels.has('hw/state/driver_station/enabled'));
 
   const bounds = parseBounds(document('bounds.json'));
@@ -59,6 +62,7 @@ test('sessions, channels and bounds decode to the fixture session', () => {
   // The fixture is recorded under this build's hardware protocol (REQ-OPS-51):
   // its null reason leaves no notice.
   assert.equal(bounds.hardware_not_decoded, undefined);
+  assert.equal(bounds.pose_topic, undefined);
 });
 
 test('a snapshot keeps NaN, an integer past 2^53 exactly, and each sample time', () => {
@@ -98,4 +102,58 @@ test('a series holds empty buckets, a NaN last value and a channel with no data'
                             START_NS, START_NS + 10_100_000_000n);
   assert.deepEqual([...rows.times], [9.9405, 9.9805]);
   assert.deepEqual([...rows.values.boot], [NaN, NaN]);
+});
+
+test('timeline.json and declared.json decode to the fixture session', () => {
+  const timeline = parseTimeline(document('timeline.json'));
+  assert.equal(timeline.hardware_not_decoded, false);
+  assert.equal(timeline.modes_dropped, 0);
+  assert.equal(timeline.alerts_dropped, 0);
+  assert.equal(timeline.runs_dropped, 0);
+  assert.deepEqual(timeline.modes, [
+    {
+      start_ns: START_NS.toString(),
+      end_ns: (START_NS + 5_000_000_000n).toString(),
+      mode: 'disabled',
+      fms: false
+    },
+    {
+      start_ns: (START_NS + 5_000_000_000n).toString(),
+      end_ns: (START_NS + 10_002_000_000n).toString(),
+      mode: 'teleop',
+      fms: false
+    }
+  ]);
+  assert.deepEqual(timeline.alerts, [{
+    channel: 'observer/status/alert_error_link_lost',
+    level: 'error',
+    start_ns: (START_NS + 2_001_000_000n).toString(),
+    end_ns: (START_NS + 4_001_000_000n).toString(),
+    active_at_end: false
+  }]);
+  assert.deepEqual(timeline.runs, [
+    {
+      node: 'observer',
+      start_ns: (START_NS - 500_000_000n).toString(),
+      end_ns: (START_NS + 10_002_000_000n).toString(),
+      reason: 'stop'
+    },
+    {
+      node: 'shooter',
+      start_ns: START_NS.toString(),
+      end_ns: (START_NS + 6_000_000_000n).toString(),
+      reason: 'crash'
+    },
+    {
+      node: 'shooter',
+      start_ns: (START_NS + 7_000_000_000n).toString(),
+      end_ns: (START_NS + 10_000_000_000n).toString(),
+      reason: 'stop'
+    }
+  ]);
+
+  const declared = parseDeclaredGraph(golden('declared.json').toString('utf8'));
+  assert.deepEqual(declared.nodes.map(n => n.name), ['observer', 'shooter']);
+  assert.deepEqual(declared.can_buses, ['rio']);
+  assert.deepEqual(declared.diagnostics, []);
 });

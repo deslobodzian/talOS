@@ -172,6 +172,9 @@ const MAX_SELECTIONS = 64;
 const MAX_DIAGNOSTICS = 1024;
 const MAX_MESSAGE = 2048;
 
+// /hw/status carries at most hardware::kMaxCanBuses (4) CAN bus slots.
+const MAX_CAN_BUSES = 4;
+
 const fail = (what: string): never => {
   throw Error(what);
 };
@@ -554,6 +557,10 @@ export type DeclaredDiagnostic = {
 
 export type DeclaredGraph = {
   version: number; nodes: DeclaredNode[]; diagnostics: DeclaredDiagnostic[];
+  // The robot configuration's CAN bus names in `/hw/status` `can_buses` slot
+  // order (`hardware::CanBuses`: slot 0 "rio", then extra buses in byte order).
+  // Absent or empty in declared graphs written before this field was added.
+  can_buses?: string[];
 };
 
 function parseDeclaredSource(value: unknown, where: string): DeclaredSource {
@@ -627,6 +634,15 @@ export function declaredUrl(socketUrl: string): string|null {
   }
 }
 
+function parseCanBuses(root: Record<string, unknown>): string[] {
+  if (root.can_buses === undefined) return [];
+  return list(root, 'can_buses', MAX_CAN_BUSES).map((entry, i) => {
+    if (typeof entry !== 'string' || entry.length > MAX_STRING)
+      fail(`can_buses[${i}] must be a string`);
+    return entry as string;
+  });
+}
+
 export function parseDeclaredGraph(text: string): DeclaredGraph {
   return parsing('declared graph', () => {
     if (text.length > MAX_DECLARED_BYTES) fail('document too large');
@@ -650,7 +666,8 @@ export function parseDeclaredGraph(text: string): DeclaredGraph {
       diagnostics: root.diagnostics === undefined ?
           [] :
           list(root, 'diagnostics', MAX_DIAGNOSTICS)
-              .map((entry, i) => parseDiagnostic(entry, `diagnostics[${i}]`))
+              .map((entry, i) => parseDiagnostic(entry, `diagnostics[${i}]`)),
+      can_buses: parseCanBuses(root)
     };
   });
 }
@@ -666,37 +683,57 @@ export const TOPIC_HEALTH: TopicHealth[] =
     ['ok', 'orphaned', 'unread', 'lossy', 'idle', 'bridged', 'unconnected'];
 
 // What both ends of a topic said about their far end, gathered across the nodes
-// that hold them.
-export type TopicEnds = {external: boolean; optional: boolean};
+// that hold them. `requiredReader` is true when any non-observer subscriber
+// declared neither `optional` nor `external`, matching naming::LintGraph.
+export type TopicEnds = {
+  external: boolean;
+  optional: boolean;
+  requiredReader: boolean;
+};
 
-const PLAIN_ENDS: TopicEnds = {external: false, optional: false};
+const PLAIN_ENDS: TopicEnds = {
+  external: false,
+  optional: false,
+  requiredReader: false
+};
 
 // Anything that holds ends: a live node, or a declared one. Both answer the
 // same question about a topic, so both feed the same aggregation.
 type EndHolder = {
-  sources: readonly
-      {kind: SourceKind; name: string; external: boolean; optional: boolean}[];
+  sources: readonly {
+    kind: SourceKind;
+    name: string;
+    external: boolean;
+    optional: boolean;
+    observer: boolean;
+  }[];
 };
 
 // The endpoint attributes of every topic, by name.
 //
 // Derived from the ends rather than read off a topic row. The bridge
-// aggregates the same two booleans onto each topic and sends those as well, and
-// this deliberately ignores them: the ends are the only place the answer exists
-// for a declared graph, which has no topic rows at all. Like the bridge's
-// HealthOf, it treats `optional` as the whole topic's when any end says so;
-// the launcher's lint (naming::CheckGraph) judges `optional` per reader, so a
-// required reader beside an optional one is a lint error that these verdicts
-// do not show.
+// aggregates the `external` and `optional` booleans onto each topic and sends
+// those as well, and this deliberately ignores them: the ends are the only
+// place the per-reader attributes exist, and the only place they exist at all
+// for a declared graph, which has no topic rows. Like the bridge's HealthOf
+// and the launcher's lint (naming::LintGraph), `external` applies to the whole
+// topic while `optional` exempts only the reader that declared it (and
+// observers beside an optional end), so a required reader beside an optional
+// one keeps `requiredReader: true`.
 export function topicEnds(nodes: readonly EndHolder[]): Map<string, TopicEnds> {
   const ends = new Map<string, TopicEnds>();
   for (const node of nodes) {
     for (const source of node.sources) {
       // A timer has a name but nothing on the other end, so it is not a topic.
       if (source.kind === 'TIMER') continue;
-      const current = ends.get(source.name) ?? {external: false, optional: false};
+      const current = ends.get(source.name) ??
+          {external: false, optional: false, requiredReader: false};
       current.external = current.external || source.external;
       current.optional = current.optional || source.optional;
+      if (isSubscriber(source.kind) && !source.observer && !source.optional &&
+          !source.external) {
+        current.requiredReader = true;
+      }
       ends.set(source.name, current);
     }
   }
@@ -718,7 +755,9 @@ const observerReads = (topic: string): boolean =>
 // view can surface, so a missing end comes first -- but only when a missing end
 // is news. An end declared `external` has its peer outside talOS and no
 // shared-memory counterpart will ever appear; an end declared `optional` is
-// allowed to be waiting for one. Calling either a fault is how an attention
+// allowed to be waiting for one, exempting only the reader that declared it
+// (and observers when another end is optional), matching naming::LintGraph and
+// the bridge's HealthOf. Calling designed absence a fault is how an attention
 // list earns the habit of being ignored, which costs more than the two states
 // it would have reported.
 //
@@ -732,9 +771,10 @@ export function topicHealth(topic: SystemTopic,
       (topic.observers.length > 0 && observerReads(topic.name));
   const halfWired = !topic.publishers.length || !read;
   if (halfWired && ends.external) return 'bridged';
-  if (halfWired && ends.optional) return 'unconnected';
-  if (!topic.publishers.length) return 'orphaned';
-  if (!read) return 'unread';
+  if (!topic.publishers.length) {
+    return ends.optional && !ends.requiredReader ? 'unconnected' : 'orphaned';
+  }
+  if (!read) return ends.optional ? 'unconnected' : 'unread';
   if (topic.dropped !== '0') return 'lossy';
   if (topic.published === '0') return 'idle';
   return 'ok';

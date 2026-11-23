@@ -5,22 +5,22 @@
 # and a routine an autonomous node, which the bench has not), and every
 # channel is in the bench graph's telemetry dictionary. The subsystems
 # cell is one list column
-# wide, so the session's 7 rows (5 nodes, hardware_node, sim_gateway) show
-# whole at 1366x768 (10 fit) and 1280x720 (9), and at 1366x500 (5 fit) two
-# rows are out of view, so the test can scroll to the bottom and to a middle
-# row.
+# wide, so the session's 8 rows (5 nodes, hardware_node, sim_gateway,
+# studio_bridge) show whole at 1366x768 (10 fit) and 1280x720 (9), and at
+# 1366x500 (5 fit) three rows are out of view, so the test can scroll to the
+# bottom and to a middle row.
 #
 # The feed's worst case: 32 named channels (the match widget's 12 included)
-# plus the seven /hw/status alerts the alerts widget carries, 39 channels at
-# 20 Hz, is 23,872 B/s of the 24,000 budget, which covers 39 channels: one
-# more channel or alert needs a larger budget.
+# plus the eleven alerts the alerts widget carries (ten /hw/status plus
+# /teleop/status/alert_warning_disarmed), 43 channels at 20 Hz, is
+# 24,832 B/s of the 25,000 budget, which covers up to 43 channels.
 
 [dashboard]
 title = "Drive"
 columns = 12
 rows = 8
 update_hz = 20
-budget_bytes_per_s = 24000
+budget_bytes_per_s = 25000
 drive_clients = 2
 
 [[widgets]]

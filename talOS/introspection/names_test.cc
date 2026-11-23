@@ -18,12 +18,23 @@
 #include <utility>
 #include <vector>
 
+#include "flatbuffers/reflection.h"
 #include "gtest/gtest.h"
 #include "schema_test/shapes_generated.h"
+#include "talOS/hardware/packet.h"
+#include "talOS/introspection/hardware_lint.h"
+#include "talOS/rtms/rtms.h"
 #include "talOS/schema/identity.h"
 
 namespace talos::introspect::naming {
 namespace {
+
+static_assert(std::string_view{hardware::kRequestTopicPrefix} ==
+                  kRequestTopicPrefix,
+              "naming::kRequestTopicPrefix must match "
+              "hardware::kRequestTopicPrefix");
+static_assert(kMaxTopicReaders == MAX_READERS,
+              "naming::kMaxTopicReaders must match rtms MAX_READERS");
 
 using event::SourceKind;
 
@@ -345,6 +356,40 @@ TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
       << Describe(diagnostics);
 }
 
+// REQ-SAFE-27: ShmObjectName strips all leading '/' and maps interior '/' to
+// '.', so IsHardwareRequest must recognise multiple-leading-slash and
+// dot-colliding spellings so Node::publish / publish_bytes refuse them all.
+TEST(TopicName, IsHardwareRequestRecognisesLeadingSlashesAndDotCollisions) {
+  for (const std::string_view topic : {
+           "/hw/request",
+           "/hw/request/foo",
+           "//hw/request",
+           "//hw/request/foo",
+           "///hw/request/foo",
+           "////hw/request/foo/bar",
+           "/hw.request",
+           "/hw.request.foo",
+           "//hw.request.foo",
+           "/hw.request/foo",
+           "/hw/request.foo",
+       }) {
+    EXPECT_TRUE(IsHardwareRequest(topic)) << topic;
+  }
+  for (const std::string_view topic : {
+           "",
+           "/",
+           "//",
+           "///",
+           "hw/request/foo",
+           "/hw/state",
+           "/hw/requests/foo",
+           "/other/request/foo",
+           "/hw/request_other/foo",
+       }) {
+    EXPECT_FALSE(IsHardwareRequest(topic)) << topic;
+  }
+}
+
 // RULES.md 2: the roster's bridge writes the hw namespace, and
 // /hw/request/<node> is written only by <node>'s devices-layer flush
 // (kSourceFlagHardwareRequest), the one path that gates a request on
@@ -353,7 +398,7 @@ TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
 // one error on that topic. The bridge is its roster slot, not its name: a
 // replacement bridge binary may call itself anything, and a node calling
 // itself hardware_node gains nothing.
-// REQ-CONTRACT-09
+// REQ-CONTRACT-09, REQ-SAFE-27
 TEST(LintGraph, OnlyTheBridgeAndEachNodesFlushWriteTheHwNamespace) {
   struct Case {
     const char* writer;
@@ -818,12 +863,61 @@ TEST(LintGraph, AnOptionalReaderExemptsOnlyItselfFromTheUnwrittenError) {
                                         reader("panel", kSourceFlagExternal)});
     EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
   }
+  {
+    SCOPED_TRACE("observer only on unwritten topic");
+    const NodeShape bad_telemetry{
+        "telemetry",
+        "//talOS/telemetry:node",
+        {Watcher("/motor/state", 32, kSourceFlagObserver),
+         Watcher("/motor/state/wheel", 32, kSourceFlagObserver),
+         Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+    const auto diagnostics = LintGraph({motor, bad_telemetry});
+    const auto* error =
+        Find(diagnostics, Severity::ERROR, "/motor/state/wheel");
+    ASSERT_NE(error, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(error->message, "telemetry")) << error->message;
+    EXPECT_EQ(error->message.find("is read by  but"), std::string::npos)
+        << error->message;
+    EXPECT_EQ(Errors(diagnostics), 1) << Describe(diagnostics);
+  }
+  {
+    SCOPED_TRACE("regular reader and observer on unwritten topic");
+    const NodeShape bad_telemetry{
+        "telemetry",
+        "//talOS/telemetry:node",
+        {Watcher("/motor/state", 32, kSourceFlagObserver),
+         Watcher("/motor/state/wheel", 32, kSourceFlagObserver),
+         Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+    const auto diagnostics =
+        LintGraph({motor, bad_telemetry, reader("arm", 0)});
+    const auto* error =
+        Find(diagnostics, Severity::ERROR, "/motor/state/wheel");
+    ASSERT_NE(error, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(error->message, "arm")) << error->message;
+    EXPECT_TRUE(Names(error->message, "telemetry")) << error->message;
+    EXPECT_EQ(Errors(diagnostics), 1) << Describe(diagnostics);
+  }
+  {
+    SCOPED_TRACE("observer plus optional reader stays non-error");
+    const NodeShape bad_telemetry{
+        "telemetry",
+        "//talOS/telemetry:node",
+        {Watcher("/motor/state", 32, kSourceFlagObserver),
+         Watcher("/motor/state/wheel", 32, kSourceFlagObserver),
+         Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+    const auto diagnostics =
+        LintGraph({motor, bad_telemetry, reader("panel", kSourceFlagOptional)});
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+    EXPECT_NE(Find(diagnostics, Severity::WARNING, "/motor/state/wheel"),
+              nullptr)
+        << Describe(diagnostics);
+  }
 }
 
 // REQ-CONTRACT-33: from the writer's schema, an `alert_` field that is not a
-// bool or not of a known level is an error naming the field (nested structs
-// included), and a well-formed alert outside a `status` topic is a warning.
-// A reader's end, which carries the same schema, adds nothing.
+// bool, not of a known level, or outside a `status` topic is an error naming
+// the field (nested structs included). A reader's end, which carries the same
+// schema, adds nothing.
 TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
   const auto with = [](SourceShape shape, const schema::Identity& identity) {
     shape.schema = identity.name;
@@ -880,7 +974,31 @@ TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
     const auto findings = alert_findings(LintGraph(nodes), "/shooter/state");
     ASSERT_EQ(findings.size(), 3u) << Describe(findings);
     for (const auto& finding : findings) {
-      EXPECT_EQ(finding.severity, Severity::WARNING) << finding.ToString();
+      EXPECT_EQ(finding.severity, Severity::ERROR) << finding.ToString();
+    }
+  }
+  {
+    SCOPED_TRACE("nested alerts outside a status topic");
+    const std::vector<NodeShape> nodes = {
+        {"shooter",
+         "//robot/shooter:node",
+         {with(Sender("/shooter/state"), bad)}},
+        {"odometry",
+         "//robot/odometry:node",
+         {with(Watcher("/shooter/state"), bad)}},
+    };
+    const auto findings = alert_findings(LintGraph(nodes), "/shooter/state");
+    ASSERT_EQ(findings.size(), 5u) << Describe(findings);
+    for (const auto* field :
+         {"alert_error_fault_count", "alert_fatal_overheat",
+          "nested.alert_error_link_lost", "nested.alert_warning_hot",
+          "nested.alert_info_homed"}) {
+      const auto it = std::find_if(
+          findings.begin(), findings.end(), [field](const Diagnostic& d) {
+            return d.message.find(field) != std::string::npos;
+          });
+      ASSERT_NE(it, findings.end()) << field << Describe(findings);
+      EXPECT_EQ(it->severity, Severity::ERROR) << field;
     }
   }
   {
@@ -952,6 +1070,407 @@ TEST(LintGraph, AMalformedNameDoesNotStopTheLint) {
   // The rest of the graph is still checked: /odometry/state is unread.
   EXPECT_NE(Find(diagnostics, Severity::WARNING, "/odometry/state"), nullptr)
       << Describe(diagnostics);
+}
+
+// REQ-CONTRACT-09, REQ-RT-16: an operator producer (a non-bridge node reading
+// /hw/state/driver_station and writing a target lane in a subsystem's teleop
+// policy) reaching an actuator owner in more than 2 node hops over non-/hw,
+// non-observer command-flow edges (target/request/command; teleop-policy target
+// lanes out of the producer; not expanding past an actuator owner) is a warning
+// naming the producer, the actuator owner, the hop count, and the shortest node
+// chain.
+TEST(LintGraph, OperatorToActuatorPathOverTwoHopsWarns) {
+  const auto bridge = [](std::vector<SourceShape> requests) {
+    requests.push_back(Sender("/hw/state/driver_station"));
+    return NodeShape{"hardware_node", "//talOS/bridge:hardware_node",
+                     std::move(requests), /*hardware_bridge=*/true};
+  };
+
+  {
+    SCOPED_TRACE("1-hop direct teleop -> arm is clean");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/arm")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"), Sender("/arm/target/teleop")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/target/teleop"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{{"arm", {{"teleop", {"teleop"}}}}};
+    const auto diagnostics = LintGraph(nodes, {{"arm", {"teleop"}}}, modes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
+
+  {
+    SCOPED_TRACE("2-hop teleop -> planner -> arm is clean");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/arm")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"),
+          Sender("/planner/target/teleop")}},
+        {"planner",
+         "//robot/planner:node",
+         {Watcher("/planner/target/teleop"), Sender("/arm/target/planner")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/target/planner"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"planner", {{"teleop", {"teleop"}}}},
+        {"arm", {{"teleop", {"planner"}}}},
+    };
+    const auto diagnostics = LintGraph(
+        nodes, {{"planner", {"teleop"}}, {"arm", {"planner"}}}, modes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
+
+  {
+    SCOPED_TRACE("3-hop teleop -> planner -> coordinator -> arm warns");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/arm")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"),
+          Sender("/planner/target/teleop")}},
+        {"planner",
+         "//robot/planner:node",
+         {Watcher("/planner/target/teleop"),
+          Sender("/coordinator/target/planner")}},
+        {"coordinator",
+         "//robot/coordinator:node",
+         {Watcher("/coordinator/target/planner"),
+          Sender("/arm/target/coordinator")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/target/coordinator"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"planner", {{"teleop", {"teleop"}}}},
+        {"coordinator", {{"teleop", {"planner"}}}},
+        {"arm", {{"teleop", {"coordinator"}}}},
+    };
+    const auto diagnostics = LintGraph(nodes,
+                                       {{"planner", {"teleop"}},
+                                        {"coordinator", {"planner"}},
+                                        {"arm", {"coordinator"}}},
+                                       modes);
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+    const auto* warning = Find(diagnostics, Severity::WARNING, "teleop");
+    ASSERT_NE(warning, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(warning->message, "teleop")) << warning->message;
+    EXPECT_TRUE(Names(warning->message, "arm")) << warning->message;
+    EXPECT_NE(warning->message.find('3'), std::string::npos)
+        << warning->message;
+    EXPECT_NE(warning->message.find("teleop -> planner -> coordinator -> arm"),
+              std::string::npos)
+        << warning->message;
+    EXPECT_EQ(diagnostics.size(), 1u) << Describe(diagnostics);
+  }
+
+  {
+    SCOPED_TRACE(
+        "autonomous DS reader writing only an auto lane does not warn");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/arm")}),
+        {"autonomous",
+         "//robot/autonomous:node",
+         {Watcher("/hw/state/driver_station"), Sender("/planner/target/auto")}},
+        {"planner",
+         "//robot/planner:node",
+         {Watcher("/planner/target/auto"),
+          Sender("/coordinator/target/planner")}},
+        {"coordinator",
+         "//robot/coordinator:node",
+         {Watcher("/coordinator/target/planner"),
+          Sender("/arm/target/coordinator")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/target/coordinator"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"planner", {{"autonomous", {"auto"}}, {"teleop", {"teleop"}}}},
+        {"coordinator", {{"autonomous", {"planner"}}}},
+        {"arm", {{"autonomous", {"coordinator"}}}},
+    };
+    const auto diagnostics = LintGraph(nodes,
+                                       {{"planner", {"auto", "teleop"}},
+                                        {"coordinator", {"planner"}},
+                                        {"arm", {"coordinator"}}},
+                                       modes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
+
+  {
+    SCOPED_TRACE("observer edges are not traversed");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/arm")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"), Sender("/planner/target/teleop"),
+          Sender("/teleop/state")}},
+        {"planner",
+         "//robot/planner:node",
+         {Watcher("/planner/target/teleop")}},
+        {"telemetry",
+         "//talOS/telemetry:node",
+         {Watcher("/teleop/state", 32, kSourceFlagObserver),
+          Sender("/coordinator/target/telemetry")}},
+        {"coordinator",
+         "//robot/coordinator:node",
+         {Watcher("/coordinator/target/telemetry"),
+          Sender("/arm/target/coordinator")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/target/coordinator"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"planner", {{"teleop", {"teleop"}}}},
+        {"coordinator", {{"teleop", {"telemetry"}}}},
+        {"arm", {{"teleop", {"coordinator"}}}},
+    };
+    const auto diagnostics = LintGraph(nodes,
+                                       {{"planner", {"teleop"}},
+                                        {"coordinator", {"telemetry"}},
+                                        {"arm", {"coordinator"}}},
+                                       modes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
+
+  {
+    SCOPED_TRACE(
+        "state feedback out of an actuator owner does not cause a false "
+        "positive on another subsystem");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/drivetrain"),
+                Watcher("/hw/request/shooter")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"),
+          Sender("/drivetrain/target/teleop")}},
+        {"drivetrain",
+         "//robot/drivetrain:node",
+         {Watcher("/drivetrain/target/teleop"), Sender("/drivetrain/state"),
+          Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest)}},
+        {"pose",
+         "//robot/pose:node",
+         {Watcher("/drivetrain/state"), Sender("/pose/state")}},
+        {"shooter",
+         "//robot/shooter:node",
+         {Watcher("/pose/state"), Watcher("/shooter/target/auto"),
+          Sender("/hw/request/shooter", 32, kSourceFlagHardwareRequest)}},
+        {"autonomous",
+         "//robot/autonomous:node",
+         {Sender("/shooter/target/auto")}},
+    };
+    const TargetModeSources modes{
+        {"drivetrain", {{"teleop", {"teleop"}}}},
+        {"shooter", {{"autonomous", {"auto"}}}},
+    };
+    const auto diagnostics = LintGraph(
+        nodes, {{"drivetrain", {"teleop"}}, {"shooter", {"auto"}}}, modes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
+
+  {
+    SCOPED_TRACE(
+        "dual teleop and auto producer does not warn via its 3-hop auto lane");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/drivetrain"), Watcher("/hw/request/arm")}),
+        {"operator",
+         "//robot/operator:node",
+         {Watcher("/hw/state/driver_station"),
+          Sender("/drivetrain/target/teleop"), Sender("/planner/target/auto")}},
+        {"drivetrain",
+         "//robot/drivetrain:node",
+         {Watcher("/drivetrain/target/teleop"),
+          Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest)}},
+        {"planner",
+         "//robot/planner:node",
+         {Watcher("/planner/target/auto"),
+          Sender("/coordinator/target/planner")}},
+        {"coordinator",
+         "//robot/coordinator:node",
+         {Watcher("/coordinator/target/planner"),
+          Sender("/arm/target/coordinator")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/target/coordinator"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"drivetrain", {{"teleop", {"teleop"}}}},
+        {"planner", {{"autonomous", {"auto"}}}},
+        {"coordinator", {{"autonomous", {"planner"}}}},
+        {"arm", {{"autonomous", {"coordinator"}}}},
+    };
+    const auto diagnostics = LintGraph(nodes,
+                                       {{"drivetrain", {"teleop"}},
+                                        {"planner", {"auto"}},
+                                        {"coordinator", {"planner"}},
+                                        {"arm", {"coordinator"}}},
+                                       modes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
+
+  {
+    SCOPED_TRACE(
+        "reading producer status does not mask a real 3-hop command chain");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/arm")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"), Sender("/teleop/status"),
+          Sender("/planner/target/teleop")}},
+        {"planner",
+         "//robot/planner:node",
+         {Watcher("/planner/target/teleop"),
+          Sender("/coordinator/target/planner")}},
+        {"coordinator",
+         "//robot/coordinator:node",
+         {Watcher("/coordinator/target/planner"),
+          Sender("/arm/target/coordinator")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/teleop/status"), Watcher("/arm/target/coordinator"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"planner", {{"teleop", {"teleop"}}}},
+        {"coordinator", {{"teleop", {"planner"}}}},
+        {"arm", {{"teleop", {"coordinator"}}}},
+    };
+    const auto diagnostics = LintGraph(nodes,
+                                       {{"planner", {"teleop"}},
+                                        {"coordinator", {"planner"}},
+                                        {"arm", {"coordinator"}}},
+                                       modes);
+    ASSERT_EQ(diagnostics.size(), 1u) << Describe(diagnostics);
+    const auto* warning = Find(diagnostics, Severity::WARNING, "teleop");
+    ASSERT_NE(warning, nullptr) << Describe(diagnostics);
+    EXPECT_NE(warning->message.find("teleop -> planner -> coordinator -> arm"),
+              std::string::npos)
+        << warning->message;
+  }
+
+  {
+    SCOPED_TRACE("3-hop path via request and command roles warns");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/arm")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"),
+          Sender("/planner/target/teleop")}},
+        {"planner",
+         "//robot/planner:node",
+         {Watcher("/planner/target/teleop"), Sender("/coordinator/request")}},
+        {"coordinator",
+         "//robot/coordinator:node",
+         {Watcher("/coordinator/request"), Sender("/arm/command")}},
+        {"autonomous", "//robot/autonomous:node", {Sender("/arm/target/auto")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/command"), Watcher("/arm/target/auto"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"planner", {{"teleop", {"teleop"}}}},
+        {"arm", {{"autonomous", {"auto"}}}},
+    };
+    const auto diagnostics =
+        LintGraph(nodes, {{"planner", {"teleop"}}, {"arm", {"auto"}}}, modes);
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+    ASSERT_EQ(diagnostics.size(), 1u) << Describe(diagnostics);
+    const auto* warning = Find(diagnostics, Severity::WARNING, "teleop");
+    ASSERT_NE(warning, nullptr) << Describe(diagnostics);
+    EXPECT_TRUE(Names(warning->message, "teleop")) << warning->message;
+    EXPECT_TRUE(Names(warning->message, "arm")) << warning->message;
+    EXPECT_NE(warning->message.find('3'), std::string::npos)
+        << warning->message;
+    EXPECT_NE(warning->message.find("teleop -> planner -> coordinator -> arm"),
+              std::string::npos)
+        << warning->message;
+  }
+
+  {
+    SCOPED_TRACE(
+        "actuator owner emitting target and command edges does not expand past "
+        "the first actuator owner");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/drivetrain"), Watcher("/hw/request/arm")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"),
+          Sender("/drivetrain/target/teleop")}},
+        {"drivetrain",
+         "//robot/drivetrain:node",
+         {Watcher("/drivetrain/target/teleop"),
+          Sender("/coordinator/target/drivetrain"),
+          Sender("/coordinator/command"),
+          Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest)}},
+        {"coordinator",
+         "//robot/coordinator:node",
+         {Watcher("/coordinator/target/drivetrain"),
+          Watcher("/coordinator/command"), Sender("/arm/target/coordinator")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/target/coordinator"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"drivetrain", {{"teleop", {"teleop"}}}},
+        {"coordinator", {{"teleop", {"drivetrain"}}}},
+        {"arm", {{"teleop", {"coordinator"}}}},
+    };
+    const auto diagnostics = LintGraph(nodes,
+                                       {{"drivetrain", {"teleop"}},
+                                        {"coordinator", {"drivetrain"}},
+                                        {"arm", {"coordinator"}}},
+                                       modes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
+
+  {
+    SCOPED_TRACE(
+        "diamond graph with both 1-hop and 3-hop paths uses shortest path and "
+        "does not warn");
+    const std::vector<NodeShape> nodes = {
+        bridge({Watcher("/hw/request/arm")}),
+        {"teleop",
+         "//robot/teleop:node",
+         {Watcher("/hw/state/driver_station"), Sender("/planner/target/teleop"),
+          Sender("/arm/target/teleop")}},
+        {"planner",
+         "//robot/planner:node",
+         {Watcher("/planner/target/teleop"),
+          Sender("/coordinator/target/planner")}},
+        {"coordinator",
+         "//robot/coordinator:node",
+         {Watcher("/coordinator/target/planner"),
+          Sender("/arm/target/coordinator")}},
+        {"arm",
+         "//robot/arm:node",
+         {Watcher("/arm/target/teleop"), Watcher("/arm/target/coordinator"),
+          Sender("/hw/request/arm", 32, kSourceFlagHardwareRequest)}},
+    };
+    const TargetModeSources modes{
+        {"planner", {{"teleop", {"teleop"}}}},
+        {"coordinator", {{"teleop", {"planner"}}}},
+        {"arm", {{"teleop", {"teleop", "coordinator"}}}},
+    };
+    const auto diagnostics = LintGraph(nodes,
+                                       {{"planner", {"teleop"}},
+                                        {"coordinator", {"planner"}},
+                                        {"arm", {"teleop", "coordinator"}}},
+                                       modes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
 }
 
 TEST(HardwareConfig, SensorVelocityLimitIsAdvisoryAndUsesMechanismRatio) {
@@ -1047,6 +1566,43 @@ TEST(HardwareConfig, EachCanBusIsWarnedAboveSeventyPercentOnItsOwnLoad) {
       << diagnostics[0].message;
   EXPECT_NE(diagnostics[0].message.find("10 motors"), std::string::npos)
       << diagnostics[0].message;
+}
+
+TEST(AlertPrefixedFields, RejectsOutOfRangeBaseTypeWithoutUb) {
+  for (const std::int8_t bad_byte :
+       {static_cast<std::int8_t>(-128), static_cast<std::int8_t>(127)}) {
+    SCOPED_TRACE("raw BaseType=" + std::to_string(bad_byte));
+    flatbuffers::FlatBufferBuilder builder;
+    const auto obj_name = builder.CreateString("bad.Status");
+    const auto field_name = builder.CreateString("alert_error_fault");
+    const auto type_start = builder.StartTable();
+    builder.AddElement<std::int8_t>(reflection::Type::VT_BASE_TYPE, bad_byte,
+                                    0);
+    const flatbuffers::Offset<reflection::Type> type{
+        builder.EndTable(type_start)};
+    reflection::FieldBuilder fb(builder);
+    fb.add_name(field_name);
+    fb.add_type(type);
+    const auto field = fb.Finish();
+    const auto fields = builder.CreateVector(&field, 1);
+    reflection::ObjectBuilder ob(builder);
+    ob.add_name(obj_name);
+    ob.add_fields(fields);
+    ob.add_is_struct(true);
+    ob.add_bytesize(8);
+    const auto obj = ob.Finish();
+    const auto objects = builder.CreateVector(&obj, 1);
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder sb(builder);
+    sb.add_objects(objects);
+    sb.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, sb.Finish());
+    const std::string_view bfbs{
+        reinterpret_cast<const char*>(builder.GetBufferPointer()),
+        builder.GetSize()};
+    EXPECT_TRUE(detail::AlertPrefixedFields(bfbs, "bad.Status").empty());
+  }
 }
 
 }  // namespace

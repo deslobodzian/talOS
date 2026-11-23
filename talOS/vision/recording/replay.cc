@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <opencv2/imgcodecs.hpp>
 #include <optional>
 #include <string>
@@ -61,14 +62,11 @@ bool AcceptEstimate(const RobotPoseEstimate& e, double max_reprojection_px,
 }
 
 double WrapAngle(double rad) {
-  constexpr double kPi = 3.14159265358979323846;
-  while (rad > kPi) {
-    rad -= 2.0 * kPi;
+  if (!std::isfinite(rad)) {
+    return std::numeric_limits<double>::quiet_NaN();
   }
-  while (rad < -kPi) {
-    rad += 2.0 * kPi;
-  }
-  return rad;
+  constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
+  return std::remainder(rad, kTwoPi);
 }
 
 struct Rms {
@@ -108,12 +106,23 @@ bool ReplayFrames(const std::string& frames_dir,
   try {
     std::vector<std::string> stems;
     std::error_code ec;
-    for (const auto& entry :
-         std::filesystem::directory_iterator(frames_dir, ec)) {
+    std::filesystem::directory_iterator it(frames_dir, ec);
+    if (ec) {
+      if (error != nullptr) {
+        *error = "cannot list " + frames_dir + ": " + ec.message();
+      }
+      return false;
+    }
+    for (const std::filesystem::directory_iterator end; it != end;
+         it.increment(ec)) {
       if (ec) {
         break;
       }
-      if (!entry.is_regular_file()) {
+      const auto& entry = *it;
+      if (!entry.is_regular_file(ec) || ec) {
+        if (ec) {
+          break;
+        }
         continue;
       }
       const std::string name = entry.path().filename().string();
@@ -121,6 +130,12 @@ bool ReplayFrames(const std::string& frames_dir,
         continue;
       }
       stems.push_back(name.substr(0, name.size() - 5));
+    }
+    if (ec) {
+      if (error != nullptr) {
+        *error = "cannot list " + frames_dir + ": " + ec.message();
+      }
+      return false;
     }
     std::sort(stems.begin(), stems.end());
 

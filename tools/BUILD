@@ -10,6 +10,7 @@ exports_files([
     "deploy.sh",
     "sync_manifest.py",
     "trace.py",
+    "workspace_status.sh",
 ])
 
 # bazel run //tools:new_subsystem -- <name> --lang cpp|py [--type T [--raw]] (--robot R | --standalone DIR) [--dry-run]
@@ -136,9 +137,14 @@ py_test(
     ],
     legacy_create_init = False,
     main = "scaffold_sim_test.py",
+    # Launches six instrumented processes per session (two fork()s + exec per
+    # spawn); under macOS TSan on a 3-vCPU hosted runner start-up takes ~1 s
+    # per member and overruns the 15 s ready wait (TODO.md CI-13). The Linux
+    # sanitizer legs still run this test.
     tags = [
         "e2e",
         "exclusive",
+        "no_macos_sanitizer",
     ],
     deps = [
         ":sync_manifest_lib",
@@ -252,8 +258,10 @@ py_test(
     deps = [":sync_manifest_lib"],
 )
 
-# python3 tools/check_layers.py (CI: the Linux job, after the build)
-# Checks the Bazel graph against ARCHITECTURE.md's layers with bazel query.
+# python3 tools/check_layers.py (CI: the Linux job, after the build) and
+# python3 tools/check_layers.py --source-only (tools/source_lints.sh)
+# Checks the Bazel graph against ARCHITECTURE.md's layers with bazel query,
+# and scans C++ node sources outside talOS/ for RULES.md 2 bypasses.
 py_test(
     name = "check_layers_test",
     size = "small",
@@ -378,6 +386,20 @@ py_test(
 # RULES.md 4: no commit since the merge base sets `commissioned = true` or
 # changes a CAN id in a robot or bench config without the person's
 # `Commissioned-By: <name>` trailer.
+# Fast-lane unit tests (no git subprocesses) for REQ-DEV-33.
+py_test(
+    name = "check_commissioning_unit_test",
+    size = "small",
+    srcs = [
+        "check_commissioning.py",
+        "check_commissioning_unit_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_commissioning_unit_test.py",
+)
+
+# Over 5 s on 4-vCPU CI (6.8 s), integration lane: spawns dozens of real git
+# subprocesses (init, add, commit, diff-tree, merge) on scratch repositories.
 py_test(
     name = "check_commissioning_test",
     size = "small",
@@ -387,6 +409,7 @@ py_test(
     ],
     legacy_create_init = False,
     main = "check_commissioning_test.py",
+    tags = ["integration"],
 )
 
 # python3 tools/slow_tests.py [--threshold 5] [--check] (CI: the Linux job,
@@ -408,6 +431,9 @@ py_test(
 # read-only worktree of the commit; tools/make_sources_read_only.py is CI's
 # read-only step, and tools/check_host_includes.py runs after the build. The
 # test runs it with a stub bazel against a throwaway repository.
+# Over 5 s: spawns temporary git repositories and full prepush.sh worktree
+# checks (sharded across 4 actions to stay well under the 60 s small timeout
+# on 3-vCPU macOS CI); integration lane.
 py_test(
     name = "prepush_test",
     size = "small",
@@ -419,6 +445,8 @@ py_test(
         "prepush_robot_repository.sh",
     ],
     legacy_create_init = False,
+    shard_count = 4,
+    tags = ["integration"],
     deps = ["@rules_python//python/runfiles"],
 )
 
@@ -436,6 +464,26 @@ py_test(
     ],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
+)
+
+# REQ-DEV-29: talOS fetches patched toml++ through a module-visible
+# http_archive (not a root-only override), dependent repositories
+# (examples/robot_repo, examples/wrist_repo, and standalone scaffolds) carry
+# no override or patch file for it, and CI/prepush run
+# @talos//talOS/configuration:config_fuzz_test in both dependents. Reads
+# source-tree files (.bazelignore hides examples/*_repo from Bazel labels),
+# so it is never cached (`external`); well under a second.
+py_test(
+    name = "dependent_toml_test",
+    size = "small",
+    srcs = [
+        "dependent_toml_test.py",
+        "new_subsystem.py",
+    ],
+    legacy_create_init = False,
+    main = "dependent_toml_test.py",
+    tags = ["external"],
+    deps = [":sync_manifest_lib"],
 )
 
 # tools/prepush.sh sources prepush_robot_repository.sh for whether its
@@ -474,4 +522,89 @@ py_test(
     ],
     legacy_create_init = False,
     main = "check_host_includes_test.py",
+)
+
+# python3 tools/run_clang_tidy.py BASE (CI and tools/tidy.sh)
+# Selects changed C++ sources and includer TUs for changed headers, falling
+# back to test TUs when no production TU includes a changed header.
+py_test(
+    name = "run_clang_tidy_test",
+    size = "small",
+    srcs = [
+        "run_clang_tidy.py",
+        "run_clang_tidy_test.py",
+    ],
+    legacy_create_init = False,
+    main = "run_clang_tidy_test.py",
+)
+
+# tools/tidy.sh (CI's clang-tidy selection locally, with Linux x86_64 GCC 14
+# libstdc++ fallback when clang 18 cannot parse the host standard library).
+py_test(
+    name = "tidy_test",
+    size = "small",
+    srcs = ["tidy_test.py"],
+    data = [
+        "clang18.sh",
+        "run_clang_tidy.py",
+        "tidy.sh",
+    ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)
+
+# python3 tools/run_rio_clang_tidy.py (CI's rio-adapter job)
+# Sanitizes GradleRIO's compile_commands.json and runs clang-tidy-18 over
+# controller_processor/rio/src/main/cpp and src/main/include (CI-12).
+py_test(
+    name = "run_rio_clang_tidy_test",
+    size = "small",
+    srcs = [
+        "run_rio_clang_tidy.py",
+        "run_rio_clang_tidy_test.py",
+    ],
+    legacy_create_init = False,
+    main = "run_rio_clang_tidy_test.py",
+)
+
+# python3 tools/retry_unacquired.py (.github/workflows/retry-unacquired.yaml)
+# Fail-closed retry decider for unacquired hosted macOS runners (CI-11).
+py_test(
+    name = "retry_unacquired_test",
+    size = "small",
+    srcs = [
+        "retry_unacquired.py",
+        "retry_unacquired_test.py",
+    ],
+    legacy_create_init = False,
+    main = "retry_unacquired_test.py",
+)
+
+# python3 tools/check_runfiles_collisions.py (CI: the Linux job, after the build)
+# Fails on empty/real runfiles collisions, generated _main/**/__init__.py, or
+# zero manifests found.
+py_test(
+    name = "check_runfiles_collisions_test",
+    size = "small",
+    srcs = [
+        "check_runfiles_collisions.py",
+        "check_runfiles_collisions_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_runfiles_collisions_test.py",
+)
+
+# tools/setup.sh --check (REQ-DEV-12): syntax check and component detection
+# (passing, missing, wrong-version, --no-studio/--no-rio/--no-lint) with a
+# stubbed PATH so nothing installs or depends on host tools.
+py_test(
+    name = "setup_test",
+    size = "small",
+    srcs = ["setup_test.py"],
+    data = [
+        "clang18.sh",
+        "setup.sh",
+    ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
 )

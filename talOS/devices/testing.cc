@@ -16,14 +16,14 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
-#include "talOS/bridge/can_buses.h"
-#include "talOS/bridge/clock_offset.h"
-#include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
+#include "talOS/hardware/can_buses.h"
+#include "talOS/hardware/clock_offset.h"
 #include "talOS/hardware/feedback.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/gateway.h"
+#include "talOS/hardware/merge.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/names.h"
 #include "talOS/protocol/types.h"
@@ -97,7 +97,7 @@ struct SimHardware::Impl {
   std::map<std::uint16_t, bool> applied_digital_outputs;
   std::map<std::uint16_t, double> applied_pwm_outputs;
   // One per actuator-owning subsystem, merged by the bridge's rules
-  // (talOS/bridge/merge.h) on sim-time microseconds.
+  // (talOS/hardware/merge.h) on sim-time microseconds.
   struct RequestTracker {
     std::string topic;
     std::uint64_t cursor = 0;
@@ -416,19 +416,15 @@ struct SimHardware::Impl {
         hardware::MarkInvalid(state.sensors[i]);
       }
     }
-    for (std::size_t i = 0; i < state.motor_count; ++i) {
-      if (hardware::MasterSampleInvalid(motors, state, i)) {
-        hardware::MarkInvalid(state.motors[i]);
-      }
-    }
     unable.clear();
-    for (std::size_t i = 0; i < state.motor_count; ++i) {
-      if (hardware::MotorMayDrive(motors, state, i)) continue;
-      const std::uint16_t id = state.motors[i].id;
-      unable.insert(id);
-      motor_drives_from[id] = state.sample_time_us + 1;
-      applied_motors[id] = hardware::MotorRequest{.id = id};
-    }
+    hardware::MaskFollowersAndDriveCutoffs(
+        motors, state, [](std::size_t) {},
+        [&](std::size_t i, std::uint64_t drives_from_us) {
+          const std::uint16_t id = state.motors[i].id;
+          unable.insert(id);
+          motor_drives_from[id] = drives_from_us;
+          applied_motors[id] = hardware::MotorRequest{.id = id};
+        });
   }
 
   // The gateway's total-loss rule (Gateway::Tick), judged as the gateway
@@ -650,10 +646,13 @@ struct SimHardware::Impl {
         static_cast<std::uint32_t>(clock.window_count()),
         clock.converged(),
         state.health.valid,
+        (state.flags & hardware::kHardwareFault) != 0,
+        false,  // alert_error_config_refused_enabled
         state.health.battery_v,
         state.health.brownout,
         false,  // alert_warning_can_bus_unread: can_buses.Fill
         0,      // can_bus_count: can_buses.Fill
+        false,  // alert_error_protocol_mismatch
         0,
         0,
         0,
@@ -664,8 +663,14 @@ struct SimHardware::Impl {
         static_cast<::bridge::GatewayProgram>(state.build.program),
         state.build.dirty,
         protocol::kProtocolVersion,
+        0,  // mismatched_protocol_version_id
         state.build.revision,
         0,
+        0,
+        0,  // socket_send_failures_count
+        0,  // socket_reopens_count
+        0,  // state_sequence_gaps_count
+        0,  // state_decode_failures_count
         0};
     can_buses.Fill(status);
     sim.publish(::bridge::topics::kStatus, status);

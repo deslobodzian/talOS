@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <iterator>
 #include <opencv2/imgproc.hpp>
 #include <utility>
 #include <vector>
@@ -260,10 +261,10 @@ void SyntheticCameraSource::RenderScene(Frame& frame) {
   const uint32_t stride = frame.stride();
   const PixelFormat format = frame.format();
   uint8_t* buf = frame.mutable_data();
+  if (buf == nullptr || width == 0 || height == 0) return;
 
   // Background color: white (255)
   std::memset(buf, 255, frame.size());
-  if (buf == nullptr || width == 0 || height == 0) return;
 
   // Grayscale-equivalent paint colors per pixel format. Every channel
   // carries the same gray value, so Rgb8/Bgr8 share one spelling; Bgra8
@@ -306,12 +307,11 @@ void SyntheticCameraSource::RenderScene(Frame& frame) {
     if (size <= 0.0) continue;
 
     // Tag codeword: lookup in table or fallback to deterministic hash
-    uint64_t code = 0;
-    if (tag.tag_id >= 0 && tag.tag_id < 10) {
-      code = kTag36h11Codes[tag.tag_id];
-    } else {
-      code = kTag36h11Codes[std::abs(tag.tag_id) % 10];
-    }
+    constexpr size_t kCodebookSize = std::size(kTag36h11Codes);
+    const uint64_t abs_id =
+        tag.tag_id < 0 ? (static_cast<uint64_t>(-(tag.tag_id + 1)) + 1ULL)
+                       : static_cast<uint64_t>(tag.tag_id);
+    const uint64_t code = kTag36h11Codes[abs_id % kCodebookSize];
 
     // Forward map from tag-normalized coords (rx, ry in [0, 1]) to pixels:
     // the exact inverse of the former point-sampled mapping, so each

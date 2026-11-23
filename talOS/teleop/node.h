@@ -17,7 +17,6 @@
 
 #include "flatbuffers/reflection.h"
 #include "talOS/configuration/config_parser.h"
-#include "talOS/devices/access.h"
 #include "talOS/devices/devices.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/introspection/describe.h"
@@ -28,8 +27,22 @@
 #include "talOS/schema/identity.h"
 #include "talOS/schema/schema_hash.h"
 #include "talOS/teleop/deadband.h"
+#include "teleop/status_generated.h"
+#include "teleop/topics.h"
 
 namespace talos::teleop {
+
+static_assert(
+    static_cast<std::uint8_t>(talos::ArmingInputKind::kNone) ==
+        static_cast<std::uint8_t>(::teleop::BlockingInputKind::NONE) &&
+    static_cast<std::uint8_t>(talos::ArmingInputKind::kAxis) ==
+        static_cast<std::uint8_t>(::teleop::BlockingInputKind::AXIS) &&
+    static_cast<std::uint8_t>(talos::ArmingInputKind::kButton) ==
+        static_cast<std::uint8_t>(::teleop::BlockingInputKind::BUTTON) &&
+    static_cast<std::uint8_t>(talos::ArmingInputKind::kPov) ==
+        static_cast<std::uint8_t>(::teleop::BlockingInputKind::POV) &&
+    static_cast<std::uint8_t>(talos::ArmingInputKind::kOther) ==
+        static_cast<std::uint8_t>(::teleop::BlockingInputKind::OTHER));
 
 namespace detail {
 
@@ -81,7 +94,9 @@ class Teleop {
   explicit Teleop(talos::Node& node)
       : node_{node},
         ds_{node},
-        arming_{talos::detail::TargetAccess::open_arming(node)} {
+        arming_{talos::detail::TargetAccess::open_arming(node)},
+        status_{
+            node.publish<::teleop::TeleopStatus>(::teleop::topics::kStatus)} {
     using talos::detail::NodeAccess;
 
     const introspect::DeclaredGraph* graph = NodeAccess::declared_graph(node);
@@ -99,7 +114,7 @@ class Teleop {
   void update() {
     using talos::detail::TargetAccess;
 
-    const bool ds_ok = ds_.enabled() && ds_.teleop();
+    const bool ds_ok = ds_.enabled() && ds_.teleop() && !ds_.estop();
     if (!ds_ok) TargetAccess::arming_disarm(node_, arming_);
     // A stick that (re)appears may already be deflected; an absent spare
     // controller is no input and does not block the others.
@@ -115,8 +130,21 @@ class Teleop {
     // The arming (talos::OperatorArming) also disarms on its own in every
     // new mode generation or gateway boot, after a stale Driver Station
     // link, and after this node's evaluations stall for command_timeout_us.
-    if (!TargetAccess::arming_evaluate(node_, arming_,
-                                       ds_ok && InputsNeutral())) {
+    const talos::ArmingBlocker input_blocker = FirstBlockingInput();
+    const bool neutral =
+        ds_ok && input_blocker.kind == talos::ArmingInputKind::kNone;
+    const bool may_publish =
+        TargetAccess::arming_evaluate(node_, arming_, neutral, input_blocker);
+    const bool armed = TargetAccess::arming_armed(node_, arming_);
+    const talos::ArmingBlocker blocker =
+        TargetAccess::arming_blocker(node_, arming_);
+    // Alert is active only while enabled in teleop and disarmed (never while
+    // disabled, e-stopped, or outside teleop; REQ-OPS-55).
+    status_.send(::teleop::TeleopStatus{
+        armed, ds_ok && !armed,
+        static_cast<::teleop::BlockingInputKind>(blocker.kind), blocker.port,
+        blocker.index});
+    if (!may_publish) {
       for (auto& sub : subsystems_) {
         for (auto& binding : sub.bindings) {
           binding.toggled = false;
@@ -221,23 +249,36 @@ class Teleop {
                         : stick.button(binding.button));
   }
 
-  // Every connected bound input at rest: axes finite and inside their
+  // First non-neutral connected bound input in config order, or kNone when
+  // every connected bound input is at rest: axes finite and inside their
   // deadband (ArmingNeutral), buttons released, POVs centred (a bound POV
-  // held in another direction is not at rest).
-  bool InputsNeutral() const {
+  // held in another direction is not at rest). Zero allocations.
+  talos::ArmingBlocker FirstBlockingInput() const noexcept {
     for (const auto& sub : subsystems_) {
       for (const auto& binding : sub.bindings) {
         const talos::Joystick stick = ds_.joystick(binding.port);
         if (!stick.connected()) continue;
-        const bool released = binding.pov ? stick.pov(binding.pov_index) < 0
-                                          : !Pressed(binding, stick);
-        const double axis = binding.is_button ? 0.0 : stick.axis(binding.axis);
-        if (!released || !ArmingNeutral(axis, binding.deadband_frac)) {
-          return false;
+        const auto port = static_cast<std::int8_t>(binding.port);
+        if (binding.is_button) {
+          if (binding.pov) {
+            if (stick.pov(binding.pov_index) >= 0) {
+              return {talos::ArmingInputKind::kPov, port,
+                      static_cast<std::int16_t>(binding.pov_index)};
+            }
+          } else if (stick.button(binding.button)) {
+            return {talos::ArmingInputKind::kButton, port,
+                    static_cast<std::int16_t>(binding.button)};
+          }
+        } else {
+          const double axis = stick.axis(binding.axis);
+          if (!ArmingNeutral(axis, binding.deadband_frac)) {
+            return {talos::ArmingInputKind::kAxis, port,
+                    static_cast<std::int16_t>(binding.axis)};
+          }
         }
       }
     }
-    return true;
+    return {};
   }
 
   void BuildSubsystem(const std::string& sub_name,
@@ -430,6 +471,7 @@ class Teleop {
   talos::DriverStation ds_;
   // A talos::OperatorArming by index: the lanes are opened by index too.
   std::size_t arming_;
+  talos::Publisher<::teleop::TeleopStatus> status_;
   std::vector<detail::SubsystemState> subsystems_;
 };
 

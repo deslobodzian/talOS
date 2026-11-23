@@ -6,10 +6,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -141,7 +144,9 @@ TEST(RioLog, FaultTogglesCoalesceToOneLinePerSecondPerMotor) {
 // Overruns (work longer than the period) and late ticks (a short tick that
 // started long after the previous one, a starved loop) are counted and
 // reported at most once per second, each report with that window's maxima.
+// REQ-OPS-29
 TEST(RioLog, LoopOverrunsAndLateTicksAreReportedOncePerSecond) {
+  static_assert(RioLog::kWindowUs == 1'000'000);
   std::vector<std::string> lines;
   RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
   log.RecordTick(0, 4'000, 5'000);
@@ -175,7 +180,9 @@ TEST(RioLog, LoopOverrunsAndLateTicksAreReportedOncePerSecond) {
 // Where a tick's backend time goes, the measurement TODO.md RT-5 sizes a
 // robot from: each 10 s window reports every phase's mean and longest time
 // per tick over that window's ticks only, with the device counts.
+// REQ-OPS-29
 TEST(RioLog, TickPhasesReportEachWindowsMeanAndMaxThenReset) {
+  static_assert(RioLog::kPhaseWindowUs == 10'000'000);
   using talos::rio::TickPhase;
   std::vector<std::string> lines;
   RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
@@ -252,7 +259,7 @@ TEST(RioLog, TickPhasesSumToTheTicksWork) {
   // Besides the loop timing line the overrun prints.
   const auto phases =
       std::find_if(lines.begin(), lines.end(), [](const std::string& line) {
-        return line.find("tick phases") != std::string::npos;
+        return line.find("[rio] tick phases:") != std::string::npos;
       });
   ASSERT_NE(phases, lines.end());
   for (const char* expected :
@@ -299,6 +306,8 @@ std::vector<std::string> LatencyLines(const std::vector<std::string>& lines) {
 // handover tick's sample opens the next window, which holds nothing else.
 // REQ-RT-25
 TEST(RioLog, LatencyReportsEachWindowsPercentilesMaxAndCountThenResets) {
+  static_assert(RioLog::kPhaseWindowUs == 10'000'000);
+  EXPECT_EQ(RioLog::kPhaseWindowUs, 10'000'000u);
   std::vector<std::string> lines;
   RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
   log.Drain(0);  // starts the window clock
@@ -354,6 +363,233 @@ TEST(RioLog, LatencyIgnoresAnAgeThatWrapped) {
   EXPECT_NE(latency[0].find("refresh to send -/-/- us over 0"),
             std::string::npos)
       << latency[0];
+}
+
+// The 1 s loop timing summary names the exact 8-phase split of the single
+// worst-work tick in that window (never the per-phase max or sum across
+// different ticks), and resets across windows.
+// REQ-OPS-29
+TEST(RioLog, LoopTimingCarriesWorstTicksOwnPhaseSplitAndResets) {
+  using talos::rio::TickPhase;
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(0);
+
+  // Tick 1: moderate work (3000 us), with a large devices phase (2500 us).
+  log.AddPhase(TickPhase::kRefresh, 500'000);
+  log.AddPhase(TickPhase::kDevices, 2'500'000);
+  log.RecordTick(5'000, 3'000, 5'000);
+
+  // Tick 2: worst work in window (12000 us, overrun), with smaller devices
+  // (200 us) than Tick 1 and distinct values across all 8 phases.
+  log.AddPhase(TickPhase::kRefresh, 1'100'000);
+  log.AddPhase(TickPhase::kDevices, 200'000);
+  log.AddPhase(TickPhase::kControl, 300'000);
+  log.AddPhase(TickPhase::kHealth, 400'000);
+  log.AddPhase(TickPhase::kOther, 500'000);
+  log.AddPhase(TickPhase::kLink, 8'000'000);
+  log.AddPhase(TickPhase::kDriverStation, 700'000);
+  log.AddPhase(TickPhase::kLoop, 800'000);
+  log.RecordTick(5'000, 12'000, 5'000);
+
+  // Tick 3: shorter work (4000 us, late tick), with a larger control phase
+  // (3900 us) than Tick 2; must not overwrite Tick 2's snapshot.
+  log.AddPhase(TickPhase::kControl, 3'900'000);
+  log.AddPhase(TickPhase::kLoop, 100'000);
+  log.RecordTick(30'000, 4'000, 5'000);
+
+  log.Drain(1'000'000);
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(
+      lines[0].find(
+          "max work 12000 us, max interval 30000 us, period 5000 us; "
+          "worst tick phases: refresh 1100.0 us, devices 200.0 us, "
+          "control 300.0 us, health 400.0 us, other 500.0 us, link 8000.0 us, "
+          "driver station 700.0 us, loop 800.0 us\n"),
+      std::string::npos)
+      << lines[0];
+
+  // Next 1 s window: a smaller overrun (6000 us) must replace the previous
+  // window's worst tick rather than carrying 12000 us or its phases forward.
+  log.AddPhase(TickPhase::kRefresh, 100'000);
+  log.AddPhase(TickPhase::kControl, 5'500'000);
+  log.AddPhase(TickPhase::kLoop, 400'000);
+  log.RecordTick(5'000, 6'000, 5'000);
+
+  log.Drain(2'000'000);
+  ASSERT_EQ(lines.size(), 2u);
+  EXPECT_NE(lines[1].find(
+                "max work 6000 us, max interval 5000 us, period 5000 us; "
+                "worst tick phases: refresh 100.0 us, devices 0.0 us, "
+                "control 5500.0 us, health 0.0 us, other 0.0 us, link 0.0 us, "
+                "driver station 0.0 us, loop 400.0 us\n"),
+            std::string::npos)
+      << lines[1];
+}
+
+// Runs shorter than the 10 s phase window emit their final partial tick phases
+// and latency lines on Flush() and on Stop(), then reset so a second flush
+// emits nothing.
+// REQ-OPS-29
+TEST(RioLog, FlushAndStopEmitFinalPartialPhaseAndLatencyWindow) {
+  using talos::rio::TickPhase;
+  {
+    std::vector<std::string> lines;
+    RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+    log.Drain(0);
+    log.SetTickDevices(4, 2);
+    log.AddPhase(TickPhase::kRefresh, 100'000);
+    log.AddPhase(TickPhase::kLink, 300'000);
+    log.RecordCommandAge(1'200, true);
+    log.RecordDriverStationAge(4'500);
+    log.RecordTick(0, 400, 5'000);
+
+    log.AddPhase(TickPhase::kRefresh, 200'000);
+    log.AddPhase(TickPhase::kLoop, 50'000);
+    log.RecordCommandAge(9'000, false);
+    log.RecordTick(5'000, 250, 5'000);
+
+    log.Drain(5'000'000);  // < 10 s: nothing emitted yet
+    EXPECT_TRUE(lines.empty());
+
+    log.Flush(5'000'000);
+    ASSERT_EQ(lines.size(), 2u);
+    for (const char* expected :
+         {"[rio] tick phases: refresh mean/max 150.0/200.0 us",
+          "link 150.0/300.0 us", "loop 25.0/50.0 us",
+          "over 2 ticks (motors=4 sensors=2)"}) {
+      EXPECT_NE(lines[0].find(expected), std::string::npos)
+          << "expected \"" << expected << "\" in: " << lines[0];
+    }
+    EXPECT_EQ(lines[1],
+              "[rio] latency: command age accepted p50/p99/max 1200/1200/1200 "
+              "us over 1, refused 9000/9000/9000 us over 1; driver station "
+              "refresh to send 4500/4500/4500 us over 1\n");
+
+    // Reset after flushing: a second flush emits nothing.
+    log.Flush(6'000'000);
+    EXPECT_EQ(lines.size(), 2u);
+  }
+
+  // Real logger thread: Stop()'s release/acquire handshake makes the loop
+  // thread's last ticks and latency samples visible to Flush() without races.
+  {
+    std::mutex mutex;
+    std::vector<std::string> lines;
+    RioLog log{[&](std::string_view line) {
+      std::lock_guard lock{mutex};
+      lines.emplace_back(line);
+    }};
+    log.Start();
+    log.SetTickDevices(2, 1);
+    for (int i = 0; i < 4; ++i) {
+      if (i == 2) {
+        // Distinct phases for the overrun tick so the test proves the summary
+        // reports the overrun's own phase split, not another tick's.
+        log.AddPhase(TickPhase::kRefresh, 400'000);
+        log.AddPhase(TickPhase::kDevices, 300'000);
+        log.AddPhase(TickPhase::kControl, 500'000);
+        log.AddPhase(TickPhase::kLink, 4'800'000);
+      } else {
+        log.AddPhase(TickPhase::kRefresh, 200'000);
+        log.AddPhase(TickPhase::kControl, 100'000);
+        log.AddPhase(TickPhase::kLink, 700'000);
+      }
+      log.RecordCommandAge(2'000, true);
+      log.RecordDriverStationAge(3'000);
+      log.RecordTick(5'000, i == 2 ? 6'000 : 1'000, 5'000);
+    }
+    log.Stop();
+
+    bool has_phases = false;
+    bool has_latency = false;
+    bool has_worst = false;
+    for (const auto& line : lines) {
+      if (line.find("[rio] tick phases:") != std::string::npos &&
+          line.find("over 4 ticks (motors=2 sensors=1)") != std::string::npos) {
+        has_phases = true;
+      }
+      if (line.find("[rio] latency: command age accepted p50/p99/max "
+                    "2000/2000/2000 us over 4") != std::string::npos &&
+          line.find(
+              "driver station refresh to send 3000/3000/3000 us over 4") !=
+              std::string::npos) {
+        has_latency = true;
+      }
+      if (line.find("[rio] loop timing:") != std::string::npos &&
+          line.find("max work 6000 us") != std::string::npos &&
+          line.find("; worst tick phases: refresh 400.0 us, devices 300.0 us, "
+                    "control 500.0 us, health 0.0 us, other 0.0 us, link "
+                    "4800.0 us, driver station 0.0 us, loop 0.0 us\n") !=
+              std::string::npos) {
+        has_worst = true;
+      }
+    }
+    EXPECT_TRUE(has_phases) << "Stop() did not emit final partial tick phases";
+    EXPECT_TRUE(has_latency) << "Stop() did not emit final partial latency";
+    EXPECT_TRUE(has_worst) << "Stop() did not emit loop timing worst phases";
+  }
+}
+
+// Concurrent RecordTick() and Drain() never pair an overrun's max work with an
+// earlier normal tick's phases or all zeros, and never lose overruns across
+// 1 s window boundaries.
+// REQ-OPS-29
+TEST(RioLog, LoopTimingConcurrentOverrunAlwaysMatchesItsOwnPhases) {
+  using talos::rio::TickPhase;
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(0);
+
+  constexpr int kTotalTicks = 20'000;
+  constexpr int kOverrunStride = 20;
+  constexpr uint64_t kExpectedOverruns = kTotalTicks / kOverrunStride;
+  std::atomic<bool> writer_done{false};
+  std::thread writer{[&] {
+    for (int i = 0; i < kTotalTicks; ++i) {
+      if (i % kOverrunStride == kOverrunStride / 2) {
+        log.AddPhase(TickPhase::kRefresh, 1'000'000);
+        log.AddPhase(TickPhase::kDevices, 2'000'000);
+        log.AddPhase(TickPhase::kLink, 9'000'000);
+        log.RecordTick(5'000, 12'000, 5'000);
+      } else {
+        log.AddPhase(TickPhase::kRefresh, 400'000);
+        log.AddPhase(TickPhase::kLink, 100'000);
+        log.RecordTick(5'000, 500, 5'000);
+      }
+    }
+    writer_done.store(true, std::memory_order_release);
+  }};
+
+  uint64_t now_us = RioLog::kWindowUs;
+  while (!writer_done.load(std::memory_order_acquire)) {
+    log.Drain(now_us);
+    now_us += RioLog::kWindowUs;
+  }
+  writer.join();
+  log.Flush(now_us);
+
+  uint64_t sum_overruns = 0;
+  uint64_t timing_lines = 0;
+  for (const auto& line : lines) {
+    if (line.find("[rio] loop timing: ") == std::string::npos) continue;
+    ++timing_lines;
+    unsigned long long delta = 0;
+    ASSERT_EQ(
+        std::sscanf(line.c_str(), "[rio] loop timing: %llu overruns", &delta),
+        1)
+        << line;
+    sum_overruns += delta;
+    EXPECT_NE(line.find("max work 12000 us"), std::string::npos) << line;
+    EXPECT_NE(line.find("; worst tick phases: refresh 1000.0 us, devices "
+                        "2000.0 us, control 0.0 us, health 0.0 us, other "
+                        "0.0 us, link 9000.0 us, driver station 0.0 us, "
+                        "loop 0.0 us\n"),
+              std::string::npos)
+        << line;
+  }
+  EXPECT_GT(timing_lines, 0u);
+  EXPECT_EQ(sum_overruns, kExpectedOverruns);
 }
 
 }  // namespace

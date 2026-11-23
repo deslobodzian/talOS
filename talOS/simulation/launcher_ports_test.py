@@ -4,7 +4,6 @@ ports, with no port written by hand, so the bridge receives its State."""
 import json
 import os
 import signal
-import socket
 import subprocess
 import tempfile
 import threading
@@ -12,6 +11,7 @@ import unittest
 
 from _posixshmem import shm_unlink  # what multiprocessing.shared_memory uses
 from python.runfiles import runfiles
+from talOS.build.udp_ports import udp_ports
 from talOS.memory.shm_name import shm_name
 
 # Each bounds a hang, not the run (docs/TESTING.md §6): the test waits for
@@ -36,17 +36,6 @@ def unlink_registry(namespace):
         shm_unlink(shm_name(REGISTRY, namespace))
     except FileNotFoundError:
         pass
-
-
-def udp_ports():
-    """Two distinct free loopback UDP ports, neither 5802 nor 5803
-    (docs/TESTING.md §6: bound at 0 and released before the launch, since
-    the launcher refuses port 0)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as gateway, \
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge:
-        gateway.bind(("127.0.0.1", 0))
-        bridge.bind(("127.0.0.1", 0))
-        return gateway.getsockname()[1], bridge.getsockname()[1]
 
 
 def states_published(log_dump, session):

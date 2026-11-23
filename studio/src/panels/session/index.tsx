@@ -22,7 +22,7 @@
 
 import {useMemo, useState, type ReactNode} from 'react';
 
-import {useManifest, useSystem} from '../../data/hooks';
+import {useManifest, useRecorded, useSystem} from '../../data/hooks';
 import type {SessionManifest} from '../../data/manifest';
 import type {SystemGraph} from '../../system';
 import {duration, hertz, integer} from '../../ui/formatters';
@@ -155,15 +155,22 @@ function SessionHeader(
   </div>;
 }
 
+const EMPTY_RATES: Record<string, number> = {};
+
 function SessionPanel() {
   const {manifest, error} = useManifest();
   const system = useSystem();
+  const recorded = useRecorded();
   const [copied, setCopied] = useState<string|null>(null);
 
+  const graph = recorded ? null : system.graph;
+  const declared = recorded ? recorded.declared : system.declared;
+  const rates = recorded ? EMPTY_RATES : system.rates;
+  const graphStale = recorded ? false : system.stale;
+
   const rows = useMemo(
-      () => mergeProcesses(manifest, system.graph, system.declared,
-                           system.rates, system.stale),
-      [manifest, system.graph, system.declared, system.rates, system.stale]);
+      () => mergeProcesses(manifest, graph, declared, rates, graphStale),
+      [manifest, graph, declared, rates, graphStale]);
   const summary = useMemo(() => summarize(rows), [rows]);
 
   const copyPath = (path: string) => {
@@ -178,30 +185,35 @@ function SessionPanel() {
         <h2>Session</h2><span>MANIFEST</span>
       </div>
       {manifest ?
-          <SessionHeader manifest={manifest} graph={system.graph}
+          <SessionHeader manifest={manifest} graph={graph}
                          copied={copied} onCopy={copyPath}/> :
        error ? <EmptyState>{error}</EmptyState> :
        <EmptyState>
-         Session manifest not offered. This is demo or replay data, or the
-         bridge was started without --manifest.
+         {recorded ?
+             'Session manifest (manifest.json) is not present in this recording.' :
+             'Session manifest not offered. This is demo or replay data, or the bridge was started without --manifest.'}
        </EmptyState>}
     </section>
 
     <section className="card wide">
       <div className="card-heading">
-        <h2>Processes</h2><span>MANIFEST ∪ REGISTRY ∪ DECLARED</span>
+        <h2>Processes</h2>
+        <span>{recorded ? 'MANIFEST ∪ DECLARED' : 'MANIFEST ∪ REGISTRY ∪ DECLARED'}</span>
       </div>
-      <GraphFreshnessNotice/>
-      <GraphVersionNotice/>
+      {!recorded && <GraphFreshnessNotice/>}
+      {!recorded && <GraphVersionNotice/>}
       <div className="system-counts session-counts">
         {/* Without a current graph nothing says which processes run. */}
-        <span>{!system.graph || system.stale ? '?' : summary.running}/{summary.total} processes running</span>
+        {recorded ?
+            <span>{summary.total} process{summary.total === 1 ? '' : 'es'}</span> :
+            <span>{!graph || graphStale ? '?' : summary.running}/{summary.total} processes running</span>}
         <span>{summary.restarts} restart{summary.restarts === 1 ? '' : 's'}</span>
       </div>
       {rows.length === 0 ?
           <EmptyState>
-            No processes. Connect to a robot bridge, or start demo data to
-            explore the session view.
+            {recorded ?
+                'No processes in this recording\'s manifest or declared graph.' :
+                'No processes. Connect to a robot bridge, or start demo data to explore the session view.'}
           </EmptyState> :
           <div className="table-scroll">
             <table className="grid session-table">
@@ -294,5 +306,6 @@ export const sessionPanel: PanelDefinition<SessionConfig> = {
   description: 'What launched, from which config, and how each process fared.',
   defaultConfig,
   parseConfig,
-  component: SessionPanel
+  component: SessionPanel,
+  recorded: true
 };

@@ -154,6 +154,12 @@ int64_t WallClockNanos();
 struct NodeProcessInfo {
   std::string name;
   std::string target;
+  // Whether the launcher supervises this member as critical (false for
+  // non-critical subsystems and for the launcher-added Studio bridge).
+  bool critical{true};
+  // Whether this member is the launcher-added Studio bridge (true only for
+  // NodeSpec::studio_bridge, never for a robot subsystem named studio_bridge).
+  bool studio_bridge{false};
   std::string binary_path;
   // SHA-256 of binary_path when the session started (FileSha256); empty when
   // it could not be read.
@@ -197,17 +203,30 @@ struct NodeProcessInfo {
   // (introspect::RealtimeOf; process::RealtimeGrant order); empty until one
   // did.
   std::optional<process::RealtimeOutcome> realtime;
+  // The HTTP port the Studio bridge bound (from its `listening <port>` line);
+  // empty for other members and until the bridge reports it.
+  std::optional<uint16_t> http_port;
 
-  // Keeps `outcome` when it is worse than the one recorded; returns whether
-  // it was.
+  // Keeps `outcome` when its grant is worse than the one recorded, or merges
+  // newly refused step bits at the same grant (e.g. a late ring mlock refusal
+  // after an initial partial grant); returns whether `realtime` changed.
   bool RecordRealtime(const process::RealtimeOutcome& outcome);
 
   // Marks the run whose event log is `log` gapped: log_gap and failed (a
   // gapped log is incomplete evidence). Returns whether `log` was not named
   // before, so each gapped run's log gets its one line.
   bool RecordLogGap(const std::string& log);
-  // The logs RecordLogGap has named. Not in the manifest.
+  // The logs RecordLogGap has named, serialized as `gap_logs`.
   std::vector<std::string> gap_logs;
+
+  // Marks the run whose event log is `log` as having failed recording
+  // (live kFlagRecorderFailed, or damaged/unreadable at shutdown; not
+  // SpawnFailed which has no log). Sets `failed` and adds non-empty `log`
+  // once. Returns whether `failed` or `recorder_failed_logs` changed.
+  bool RecordRecorderFailure(const std::string& log);
+  // The logs RecordRecorderFailure has named, serialized as
+  // `recorder_failed_logs`.
+  std::vector<std::string> recorder_failed_logs;
 
   // Every run, first first, capped at kMaxRecordedRuns: the first run and
   // the newest; `runs_dropped` counts the ones between that were dropped.
@@ -252,6 +271,12 @@ struct SessionManifest {
   // uncommitted changes. Empty and false otherwise.
   std::string git_revision;
   bool git_dirty{false};
+  // The talOS checkout revision a --stamp build in a separate robot repository
+  // recorded (bundle_manifest.toml talos_git_revision), and whether its tree
+  // had uncommitted changes. Empty and false otherwise; omitted from
+  // manifest.json when empty.
+  std::string talos_git_revision;
+  bool talos_git_dirty{false};
   std::string output_dir;
   // The launcher's own output log, talos.log (README "Node output"); empty
   // for none.
@@ -268,6 +293,17 @@ struct SessionManifest {
   // A stop request arrived before every member was started: the members
   // with no run were never started.
   bool stopped_before_start{false};
+  // The namespace session lock file (`SessionLock`) was removed while this
+  // session held it, so a second launcher in this namespace would no longer be
+  // refused.
+  bool session_lock_lost{false};
+  // The session directory's `session.lock` was removed while this session held
+  // it and could not be locked again (retention holds it or moved the
+  // directory away).
+  bool directory_lock_lost{false};
+  // The session directory's `session.lock` was removed while this session held
+  // it and locked again on a new file.
+  bool directory_lock_retaken{false};
   std::size_t declared_topics{0};
   std::vector<NodeProcessInfo> nodes;
 

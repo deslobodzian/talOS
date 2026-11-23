@@ -92,13 +92,25 @@ GATEWAY_STARTED = re.compile(r"hardware gateway config=(\d+) commissioned=\d+ "
 
 SUMMARY = re.compile(r"^sim_(?:gateway|robot):.*$", re.MULTILINE)
 
-# RioLog's periodic timing report and LoopWatchdog's stall report (through
-# HAL_SendError, "Error at talos loop watchdog: [<s>.<ms>] RoboRIO loop
-# stalled ...").
+# RioLog's periodic timing, phase and latency reports and LoopWatchdog's stall
+# report (through HAL_SendError, "Error at talos loop watchdog: [<s>.<ms>]
+# RoboRIO loop stalled ...").
 LOOP_TIMING = re.compile(
     r"\[rio\] loop timing: (\d+) overruns .*?, (\d+) late ticks .*"
     r"max interval (\d+) us")
 LOOP_STALLED = "RoboRIO loop stalled past an expired command"
+TICK_PHASES = re.compile(
+    r"\[rio\] tick phases: refresh mean/max \d+\.\d+/\d+\.\d+ us, "
+    r"devices \d+\.\d+/\d+\.\d+ us, control \d+\.\d+/\d+\.\d+ us, "
+    r"health \d+\.\d+/\d+\.\d+ us, other \d+\.\d+/\d+\.\d+ us, "
+    r"link \d+\.\d+/\d+\.\d+ us, driver station \d+\.\d+/\d+\.\d+ us, "
+    r"loop \d+\.\d+/\d+\.\d+ us over (\d+) ticks "
+    r"\(motors=(\d+) sensors=(\d+)\)")
+RIO_LATENCY = re.compile(
+    r"\[rio\] latency: command age accepted p50/p99/max "
+    r"(?:\d+/\d+/\d+|-/-/-) us over (\d+), "
+    r"refused (?:\d+/\d+/\d+|-/-/-) us over (\d+); "
+    r"driver station refresh to send (?:\d+/\d+/\d+|-/-/-) us over (\d+)")
 
 # The silent-main-processor scenario. The robot runs this long from its
 # gateway socket opening: bring-up and driving take about 2 s, the judged
@@ -376,6 +388,27 @@ class Scenario:
             raise RuntimeError(
                 f"The RoboRIO loop watchdog reported a stalled loop; see "
                 f"{self.output / 'gateway.txt'}")
+        # REQ-OPS-29: every clean exit flushes the final partial window, so
+        # every WPILib scenario emits at least one tick phases line (with
+        # ticks > 0) and one latency line. Every scenario pushes the subject
+        # config (two TalonFX and a CANcoder) before it exits, so the last
+        # window's device counts, those of its last tick, are not 0.
+        phases = [tuple(map(int, groups))
+                  for groups in TICK_PHASES.findall(text)]
+        if not phases or any(ticks <= 0 for ticks, _m, _s in phases):
+            raise RuntimeError(
+                f"The RoboRIO printed no [rio] tick phases line with positive "
+                f"ticks; see {self.output / 'gateway.txt'}")
+        _ticks, motors, sensors = phases[-1]
+        if motors == 0 or sensors == 0:
+            raise RuntimeError(
+                f"The RoboRIO's last [rio] tick phases line counts "
+                f"motors={motors} sensors={sensors} with the subject config "
+                f"pushed; see {self.output / 'gateway.txt'}")
+        if not RIO_LATENCY.search(text):
+            raise RuntimeError(
+                f"The RoboRIO printed no [rio] latency line; see "
+                f"{self.output / 'gateway.txt'}")
 
     def summary(self):
         text = (self.output / "gateway.txt").read_text()
@@ -490,7 +523,9 @@ def subject_config(config, output):
     subject's [[subsystems]] entry with its paths made absolute, so its
     subsystem file is read in place: the same robot settings, devices, CAN
     ids and buses, with the subject's drive motor first, and nothing copied
-    by hand. [studio] is left out (no Studio runs here). It is cut line by
+    by hand. [studio] and [simulation] (including [simulation.*] and
+    [[simulation.*]]) are left out (no Studio or physics simulator runs here).
+    It is cut line by
     line, not through tomllib, which the system python3 the sim_gateway mode
     supports (3.8) lacks, and it fails closed: a top-level key, a table it
     does not know (a future hardware table must not be dropped unseen), a
@@ -517,9 +552,13 @@ def subject_config(config, output):
             kept += lines
         elif bracket == "[" and name == "studio":
             continue
+        elif (bracket == "[" and name == "simulation") or name.startswith(
+                "simulation."):
+            continue
         elif bracket != "[[" or name != "subsystems":
             raise RuntimeError(f"{config}: {lines[0].strip()} is not "
-                               f"[robot], [robot.*], [studio] or "
+                               f"[robot], [robot.*], [studio], [simulation], "
+                               f"[simulation.*], [[simulation.*]] or "
                                f"[[subsystems]], so the subject config "
                                f"would drop it")
         else:
@@ -815,6 +854,21 @@ def run_driving_scenario(root, wpilib, output_root):
         if "first_wheel_rps=0.000000 command_active=0" not in summary:
             raise RuntimeError(
                 "The gateway did not neutralize after communication stopped")
+        if wpilib:
+            # REQ-RT-25: driving must record both accepted commands and
+            # Driver Station packets across the run's latency windows.
+            gateway_text = (output / "gateway.txt").read_text()
+            latencies = RIO_LATENCY.findall(gateway_text)
+            accepted = sum(int(a) for a, _r, _ds in latencies)
+            driver_station = sum(int(ds) for _a, _r, ds in latencies)
+            if accepted == 0:
+                raise RuntimeError(
+                    f"The RoboRIO reported no accepted command latency "
+                    f"samples; see {output / 'gateway.txt'}")
+            if driver_station == 0:
+                raise RuntimeError(
+                    f"The RoboRIO reported no Driver Station latency samples; "
+                    f"see {output / 'gateway.txt'}")
 
         print(summary)
         print((output / "bridge.txt").read_text().strip())

@@ -32,7 +32,7 @@ class SE2 {
   // part goes through V(omega * dt)^-1, which grows without bound near the
   // nonzero multiples of 2 pi where no twist with that rate translates.
   static Vector3 Discretize(Scalar vx, Scalar vy, Scalar omega, Scalar dt) {
-    if (dt <= Scalar(0)) return Vector3(omega, vx, vy);
+    if (!(dt > Scalar(0)) || !std::isfinite(dt)) return Vector3(omega, vx, vy);
     Vector3 tau;
     tau(0) = omega;
     tau.template tail<2>() = InverseV(omega * dt) * Vector2(vx, vy);

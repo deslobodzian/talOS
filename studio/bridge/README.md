@@ -38,6 +38,10 @@ port <port>` and exits 1 (`//studio/bridge:listen_test`).
 
 These named options are removed before positional parsing:
 
+- `--session-id ID` or `--session-id=ID`: unsigned integer session id; when
+  nonzero (as the launcher passes), the bridge claims a live registry row under
+  that session id and exits nonzero if claiming fails; default `0` (standalone:
+  claims no registry row). Ignored in `--describe`.
 - `--config PATH`: read `[studio] max_clients` and `[studio] dashboard` (the
   driver dashboard's layout; see [Driver dashboard feed](#driver-dashboard-feed))
   from robot configuration, and each subsystem's `critical` for the drive
@@ -49,6 +53,9 @@ These named options are removed before positional parsing:
   `/declared.json`.
 - `--manifest PATH` or `--manifest=PATH`: read the file on each
   `/manifest.json` request.
+- `--refusal-file PATH` or `--refusal-file=PATH`: serve a launcher phase-1
+  refusal on `/drive` without opening shared memory or the registry (see
+  [Driver dashboard feed](#driver-dashboard-feed)).
 
 `--describe` prints the node description and exits without opening shared memory
 or sockets. In that mode, `--config PATH` supplies `[studio] topic`.
@@ -64,8 +71,9 @@ The manual runtime command still takes its topic positionally.
 | `/declared.json` | Startup copy of the declared graph file | 404 if absent, empty or unreadable |
 | `/manifest.json` | Current manifest file | 404 if absent or unreadable; 413 above 1 MiB (Studio's own manifest limit) |
 | `/telemetry` | WebSocket: binary telemetry and text system graphs | Excess clients receive 503 |
-| `/drive/layout.json` | The driver dashboard's layout (`DashboardLayoutJson`) | 404 without a layout |
-| `/drive` | WebSocket upgrade: the [driver dashboard feed](#driver-dashboard-feed); any other GET: `drive.html` from the web directory | 404 without a layout (the upgrade); 404 without the file (the page) |
+| `/drive/layout.json` | The driver dashboard's layout (`DashboardLayoutJson`) | 404 without a layout (unless `--refusal-file`) |
+| `/drive/summary.json` | Latest `talos.drive.summary` JSON | 404 without a layout (unless `--refusal-file`) |
+| `/drive` | WebSocket upgrade: the [driver dashboard feed](#driver-dashboard-feed); any other GET: `drive.html` from the web directory | 404 without a layout (the upgrade, unless `--refusal-file`); 503 without the file (the page) |
 
 Every 200 carries `Cache-Control` (REQ-OPS-34):
 
@@ -107,10 +115,25 @@ pages and a keyframe of the latest tick, then change-only updates
 ([telemetry README](../../talOS/telemetry/README.md#the-live-view-and-the-record)).
 Each update goes out only when the budget affords all of it; otherwise it is
 deferred and the next update carries the changes, so a slow or starved client
-sees fewer, never inconsistent, ticks. A page the socket refuses resynchronizes
+sees fewer, never inconsistent, ticks. Alert channels (`ChannelInfo.alert`
+other than `None`) that rise to active and clear while updates are coalesced
+(whether across a read batch, a budget deferral or `/drive`'s `update_hz`
+limit) are never dropped: the client receives an intermediate activation
+update stamped between its held tick and the latest tick, followed by the
+latest tick clearing them, still within the client's rate limit and egress
+budget (REQ-OPS-37). A page the socket refuses resynchronizes
 that client with a fresh keyframe.
 
-The system graph includes the bridge itself and refreshes every 250 ms of
+When started with a nonzero `--session-id` (as the launcher passes), the bridge
+claims a live registry row (`studio_bridge`, `LoopTier::kObserver`, one
+`WATCHER` source on its telemetry topic), advancing `heartbeat_monotonic_ns`
+and `dispatch_count` on every loop pass, and exits nonzero if claiming fails so
+the launcher detects and restarts a hung or failed bridge
+([Studio bridge](../../talOS/launcher/README.md#studio-bridge)). Standalone
+runs (`--session-id 0` or omitted) claim no registry row.
+The system graph includes the bridge itself (replacing its own live registry
+row with `self()` so `/system.json` carries a single `studio_bridge` entry with
+exact bridge counters) and refreshes every 250 ms of
 the monotonic clock (see [Waking](#waking)). `/system.json` serves the whole document,
 with a `structure` id covering everything but its fast values (wall time,
 counters, heartbeats, liveness, selected sources, held outputs, topic
@@ -146,17 +169,23 @@ sent
 `{"kind":"talos.system_graph.deferred","structure":...}`, so Studio, which
 marks the graph stale after `GRAPH_STALE_AFTER_MS`
 ([`freshness.ts`](../src/data/freshness.ts)) without a graph message, does
-not mark a late graph stale. A whole graph larger than the egress burst
+not mark a merely rate-deferred graph stale unless a shared-bucket reservation
+pauses notices past 1 s
+([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)). A whole graph larger than the egress burst
 ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary))
 can never be sent: the bridge logs that once when the graph crosses the
 burst, sends no notice (the client's graph goes stale, which is the truth),
 and still serves it at `/system.json`. It opens the registry lazily. Topic health is
-computed in [`system.h`](system.h): missing ends are `bridged` when external,
-otherwise `unconnected` when optional, otherwise `orphaned` or `unread`
+computed in [`system.h`](system.h): missing ends are `bridged` when any end is
+`external`; with no publisher, `unconnected` when an end is `optional` and no
+non-observer subscriber requires it (neither `optional` nor `external`),
+otherwise `orphaned` (matching the launcher's
+[graph lint](../../talOS/NAMING.md#topics), where `optional` exempts only the
+reader that declared it and observers beside an optional end); with a publisher
+and no reader, `unconnected` when an end is `optional`, otherwise `unread`
 (an observer counts as a reader for `unread` only of a `state`, `status`,
-`event` or `telemetry` topic, as in the launcher's
-[graph lint](../../talOS/NAMING.md#topics), so Studio and the launcher name the
-same unread topics);
+`event` or `telemetry` topic, as in the graph lint, so Studio and the launcher
+name the same orphaned and unread topics);
 connected topics are `lossy` when an end lost messages, `idle` before
 publication, and `ok` otherwise. A topic's `dropped` sums every end except
 latest-only watchers (source `latest_only: true`): the registry records one
@@ -250,12 +279,28 @@ the bridge runs on without it. The code is [`drive.h`](drive.h).
 **Endpoints**, on the same port as Studio:
 
 - `GET /drive` without a WebSocket upgrade: `drive.html` from the web
-  directory (404 when it has none).
+  directory (503 with build/install instructions when it has none).
 - `GET /drive/layout.json`: the layout as `DashboardLayoutJson` writes it
   (shape in the telemetry README's `/drive/layout.json`). 404 without a
-  layout.
+  layout; in refusal mode (`--refusal-file`), serves a minimal valid layout
+  so `/drive` renders immediately without a robot config.
+- `GET /drive/summary.json`: the latest `talos.drive.summary` JSON (404
+  without a layout or refusal mode).
 - `ws://<host>:<port>/drive`: the feed. The upgrade answers 404 without a
-  layout and is otherwise always accepted: never 503.
+  layout (unless `--refusal-file` is set) and is otherwise always accepted:
+  never 503.
+
+**Refusal mode (`--refusal-file PATH`).** Started by the launcher under
+`--serve-refusal --start-studio-bridge` when phase 1 refuses a launch
+([launcher README](../../talOS/launcher/README.md#refusal-visibility---serve-refusal)).
+The bridge reads `PATH` (`last_refusal.json`), opens no shared memory or
+registry, serves `drive.html`, a minimal `/drive/layout.json`,
+`/drive/summary.json`, and `ws://<host>:<port>/drive` with a
+`talos.drive.summary` carrying `"launch_refused": true` and `"refusal_reason"`,
+plus the 100 ms `talos.drive.heartbeat` so `/drive` renders **LAUNCH REFUSED**
+rather than **BRIDGE LINK**. Port bind remains exclusive
+(`LIBUS_LISTEN_EXCLUSIVE_PORT`), so an already-running session holding port
+5800 causes the refusal bridge to exit nonzero immediately.
 
 **Slots.** At most the layout's `drive_clients` feed connections are held.
 They are not counted against `[studio] max_clients`, so programmer clients
@@ -325,7 +370,9 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
    values of the tick it is stamped with.
 3. **The mask.** Channel `i` of the dictionary is in the client's mask when
    its name is in `/drive/layout.json` `"channels"` (which always lists
-   `hw/status/alert_error_link_lost`, the RoboRIO link, whatever the
+   `hw/status/alert_error_link_lost` and
+   `hw/status/alert_error_protocol_mismatch`, the RoboRIO link and protocol
+   mismatch alerts, whatever the
    widgets), or when that document's
    `"alerts"` is true and the channel's `alert` is not `None`
    (`/channels.json` `"alert"` other than `"none"`). Only masked channels are
@@ -334,7 +381,10 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
 4. **Rate.** Updates that carry a change (a value, an absence, the chassis, or
    a keyframe) go at most `update_hz` a second, at least
    `ceil(1e9 / update_hz)` ns apart; changes in between coalesce into the
-   next update.
+   next update, except masked alert channels that rose to active and cleared
+   in between, which go as an activation update at the next interval followed
+   by the clearing tick one interval later (still within `update_hz` and the
+   slot's budget).
 5. **Heartbeat.** When nothing has been sent for 100 ms
    (`telemetry_wire::kHeartbeatIntervalNs`) and the client holds a tick, an
    empty update goes: `keyframe` false, no `channels`, no `absent`, stamped
@@ -375,20 +425,24 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   | `session` | string | the launcher's session id (the manifest's `session_id`), else a live registry row's, else `""` |
   | `supervised` | bool | the manifest was read; when false, `restarts` 0 and `quarantined` false mean unknown, not none |
   | `registry` | bool | the live registry could be read at this refresh; when false, every `alive` false and `drives` null mean unknown, not dead |
-  | `nodes` | array | with a manifest, every member of its `nodes` in its order but the Studio bridge itself (`studio_bridge`), so `sim_gateway` too when the launcher supervises one; without a manifest, or while it lists no member yet, every node the config launches: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
+  | `nodes` | array | with a manifest, every member of its `nodes` in its order, `sim_gateway` and `studio_bridge` included when the launcher supervises them; without a manifest, or while it lists no member yet, every node the config launches: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
   | `nodes[].name` | string | the node name |
-  | `nodes[].alive` | bool | a live registry row of that name exists (a node that never registered, or died, is false) |
-  | `nodes[].critical` | bool | the config's `critical` for that subsystem (default true); true for a member the config does not list (`hardware_node`, `sim_gateway`) |
+  | `nodes[].alive` | bool | a live registry row of that name exists (a node that never registered, or died, is false; the launcher-added `studio_bridge`, which serves the summary, is true whenever the registry is readable) |
+  | `nodes[].critical` | bool | the launcher manifest's `critical` for the member; on legacy manifests lacking it (or without a manifest), falls back to the config's `critical` for that subsystem (default true), else `!studio_bridge` (false for the launcher-added `studio_bridge`, true for other members such as `hardware_node` and `sim_gateway`) |
   | `nodes[].restarts` | number | the manifest's `restart_count` for the node |
   | `nodes[].quarantined` | bool | the manifest's `quarantined` for the node |
   | `nodes[].drives` | string or null | the target lane source (`teleop`, `auto`, ...) its first `Target` with a selection last selected; null when it is not alive, reads no target, or its `Target::get()` was last null |
+  | `nodes[].outputs_held` | bool (optional) | present and `true` only while the node is alive and its devices flush is holding back outputs set with no live target (`kFlagOutputsHeld`; REQ-SAFE-41); omitted when false |
   | `omitted` | number | nodes left off the end of `nodes` to keep the message within 4,096 bytes; normally 0 |
+  | `launch_refused` | bool (optional) | present and `true` only in refusal mode (`--refusal-file`), when the launcher refused phase 1 |
+  | `refusal_reason` | string (optional) | present with `launch_refused: true`: the launcher's refusal reason, truncated if needed to keep the message within 4,096 bytes |
 
 So a feed client hears something at least every 100 ms (plus the moments
 its bucket needs for a 36 B heartbeat) while the bridge runs and its socket
 drains: 500 ms of silence means the dashboard-to-bridge
 link, a `sequence_id` that stops advancing means stale telemetry, and the
-RoboRIO link is its own alert channel (`hw/status/alert_error_link_lost`).
+RoboRIO link and protocol mismatch are their own alert channels
+(`hw/status/alert_error_link_lost`, `hw/status/alert_error_protocol_mismatch`).
 `DriveFeed` in [`drive.h`](drive.h) is the feed, `//studio/bridge:drive_test`
 its unit tests, and `integration_test.py`'s
 `test_drive_feed_slots_and_layout` the slots, eviction and 404 over a socket.

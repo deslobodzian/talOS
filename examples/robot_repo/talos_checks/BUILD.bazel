@@ -1,9 +1,19 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_python//python:defs.bzl", "py_test")
 
 # Checks of talOS itself from a repository that depends on it, not of this
 # robot: `//tools:new_robot --standalone` leaves this package out of the
 # robot repositories it copies from this fixture (TEMPLATE in
 # tools/new_robot.py).
+
+# @talos//third_party:tomlplusplus exports talOS's patched toml++ to dependent
+# repositories (`#include "toml.hpp"`, REQ-DEV-29): build-only so
+# `bazel build //...` and `bazel test //...` prove dependents compile it.
+cc_library(
+    name = "tomlplusplus_compile_check",
+    srcs = ["tomlplusplus_compile_check.cc"],
+    deps = ["@talos//third_party:tomlplusplus"],
+)
 
 # talOS's session_report finds its log_dump with talOS as a dependency: it
 # reports on a session talOS's fixture records.
@@ -18,6 +28,20 @@ py_test(
     env = {
         "SESSION_REPORT": "$(rlocationpath @talos//talOS/launcher:session_report)",
         "SESSION_REPORT_FIXTURE": "$(rlocationpath @talos//talOS/launcher:session_report_fixture)",
+    },
+    deps = ["@rules_python//python/runfiles"],
+)
+
+# @talos//controller_processor/rio:gradlew stages the RoboRIO Gradle project
+# and its talOS sources from @talos into a cache directory, stamps the talOS
+# checkout's revision, and forwards this repository's .wpilib preferences.
+py_test(
+    name = "rio_gradlew_test",
+    size = "small",
+    srcs = ["rio_gradlew_test.py"],
+    data = ["@talos//controller_processor/rio:gradlew"],
+    env = {
+        "RIO_GRADLEW": "$(rlocationpath @talos//controller_processor/rio:gradlew)",
     },
     deps = ["@rules_python//python/runfiles"],
 )

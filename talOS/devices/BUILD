@@ -2,10 +2,36 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
+# Safe, non-privileged thunks behind target.h's templates.
+cc_library(
+    name = "target_detail",
+    hdrs = ["target_detail.h"],
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/schema:identity"],
+)
+
+# Private header target for devices.cc/target.cc's implementation_deps so
+# talOS/devices/access.h never enters downstream robot-node compile sandboxes
+# (ARCH-2 / RULES.md 2).
+cc_library(
+    name = "access_hdr",
+    hdrs = ["access.h"],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":target_detail",
+        "//talOS/events:events_core",
+        "//talOS/hardware",
+        "//talOS/schema:identity",
+    ],
+)
+
 # Robot hardware for talos::Node: Motor, CANcoder, Gyro, digital/analog I/O,
 # encoders and PWM through the bridge, attached as a Node extension, the
 # Driver Station the bridge forwards, and target lanes (Target, TargetLane)
 # resolved by that Driver Station's mode.
+# Hardware wire/packet/access deps stay in implementation_deps so their
+# headers are excluded from downstream robot-node compile sandboxes
+# (ARCH-2 / RULES.md 2).
 cc_library(
     name = "devices",
     srcs = [
@@ -13,20 +39,44 @@ cc_library(
         "target.cc",
     ],
     hdrs = [
-        "access.h",
         "devices.h",
         "target.h",
     ],
-    visibility = ["//visibility:public"],
-    deps = [
-        "//talOS/bridge:boot_history",
-        "//talOS/bridge:messages",
+    implementation_deps = [
+        ":access_hdr",
         "//talOS/configuration",
-        "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/hardware",
+        "//talOS/hardware:boot_history",
+        "//talOS/hardware:bridge_messages",
         "//talOS/introspection:names",
+        "//talOS/node:access",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":target_detail",
+        "//talOS/driver_station",
         "//talOS/node",
+        "//talOS/schema:identity",
+    ],
+)
+
+# Privileged hardware-link plumbing (HardwareAccess, including note_live_target
+# and device_id, and DriverStationAccess). Restricted to framework layers only
+# so robot node code cannot include or link it.
+cc_library(
+    name = "access",
+    hdrs = ["access.h"],
+    visibility = [
+        "//talOS/devices:__pkg__",
+        "//talOS/mechanisms:__pkg__",
+        "//talOS/node_api:__pkg__",
+    ],
+    deps = [
+        ":devices",
+        "//talOS/events:events_core",
+        "//talOS/hardware",
+        "//talOS/schema:identity",
     ],
 )
 
@@ -38,14 +88,15 @@ cc_library(
     hdrs = ["testing.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":access",
         ":devices",
-        "//talOS/bridge:can_buses",
-        "//talOS/bridge:clock_offset",
-        "//talOS/bridge:merge",
-        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:bridge_messages",
+        "//talOS/hardware:can_buses",
+        "//talOS/hardware:clock_offset",
+        "//talOS/hardware:merge",
         "//talOS/introspection:names",
         "//talOS/node:testing",
         "//talOS/protocol",
@@ -57,12 +108,14 @@ cc_test(
     size = "small",
     srcs = ["testing_test.cc"],
     deps = [
+        ":access",
         ":devices",
+        ":target_test_message",
         ":testing",
-        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:bridge_messages",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],
@@ -75,9 +128,11 @@ cc_test(
     deps = [
         ":devices",
         ":testing",
-        "//talOS/bridge:messages",
+        "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/hardware:bridge_messages",
+        "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],
 )
@@ -99,6 +154,7 @@ cc_test(
         ":testing",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/node:access",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
     ],

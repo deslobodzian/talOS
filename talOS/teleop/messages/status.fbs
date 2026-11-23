@@ -1,0 +1,17 @@
+namespace teleop;
+
+enum BlockingInputKind : ubyte {
+  NONE = 0,
+  AXIS = 1,
+  BUTTON = 2,
+  POV = 3,
+  OTHER = 4,
+}
+
+struct TeleopStatus {
+  armed:bool;
+  alert_warning_disarmed:bool;
+  blocking_kind:BlockingInputKind;
+  blocking_joystick_index:byte;
+  blocking_input_index:short;
+}

@@ -1,29 +1,15 @@
 #include "talOS/events/log/log_writer.h"
 
-#include <fcntl.h>
-#include <pthread.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <limits>
 #include <stdexcept>
-#include <system_error>
 #include <utility>
 
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#include <mach/thread_policy.h>
-#else
-#include <sched.h>
-#endif
-
-#include "talOS/process/durable_sync.h"
+#include "talOS/process/process.h"
 
 namespace talos::event::log {
 
@@ -31,41 +17,6 @@ namespace {
 
 std::span<const std::byte> as_bytes(const void* data, std::size_t size) {
   return {reinterpret_cast<const std::byte*>(data), size};
-}
-
-// Puts the calling thread (the writer) under the normal time-sharing policy.
-// A thread created by one running under process::ConfigureRealtime inherits
-// SCHED_FIFO on Linux; the writer must not preempt control loops to write a
-// log. Best effort: leaving realtime needs no privilege, and a refusal is
-// reported to stderr, not as a log fault.
-void UseNormalScheduling() noexcept {
-#if defined(__APPLE__)
-  // Whether or not a time-constraint policy reached this thread, the
-  // standard policy replaces it.
-  thread_standard_policy_data_t policy{};
-  const kern_return_t result = ::thread_policy_set(
-      ::pthread_mach_thread_np(::pthread_self()), THREAD_STANDARD_POLICY,
-      reinterpret_cast<thread_policy_t>(&policy), THREAD_STANDARD_POLICY_COUNT);
-  if (result != KERN_SUCCESS) {
-    std::fprintf(stderr, "talos: log writer kept its scheduling policy (%d)\n",
-                 static_cast<int>(result));
-  }
-#else
-  int current = SCHED_OTHER;
-  sched_param param{};
-  if (::pthread_getschedparam(::pthread_self(), &current, &param) == 0 &&
-      current == SCHED_OTHER) {
-    return;
-  }
-  param = sched_param{};
-  param.sched_priority = 0;
-  const int result =
-      ::pthread_setschedparam(::pthread_self(), SCHED_OTHER, &param);
-  if (result != 0) {
-    std::fprintf(stderr, "talos: log writer kept its scheduling policy (%s)\n",
-                 std::strerror(result));
-  }
-#endif
 }
 
 }  // namespace
@@ -151,9 +102,11 @@ void LogWriter::Wakeup::wait_until(
 
 #endif
 
+LogWriter::State::State(std::string path) : sink{std::move(path)} {}
+
 LogWriter::LogWriter(std::string_view path, std::string_view process_name,
                      Options options, std::uint64_t session_id)
-    : state_{std::make_unique<State>()} {
+    : state_{std::make_unique<State>(std::string{path})} {
   if (options.chunk_bytes == 0) {
     options.chunk_bytes = DEFAULT_CHUNK_BYTES;
   }
@@ -161,28 +114,22 @@ LogWriter::LogWriter(std::string_view path, std::string_view process_name,
     options.chunk_count = 1;
   }
 
-  state_->path = std::string{path};
   state_->process_name = std::string{process_name};
   state_->session_id = session_id;
-  state_->options = options;
+  state_->options = std::move(options);
+  state_->gaps.set_gap_flags(state_->options.gap_flags);
 
-  state_->pool.resize(options.chunk_count);
+  state_->pool.resize(state_->options.chunk_count);
   for (Chunk& chunk : state_->pool) {
-    chunk.data.resize(options.chunk_bytes);
+    chunk.data.resize(state_->options.chunk_bytes);
   }
 
   state_->active = &state_->pool.front();
 
   // A background writer's file is created by its thread (open_file): the
   // constructor runs on the thread that will run the loop.
-  if (options.background) return;
-  state_->fd =
-      ::open(std::string{path}.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-  if (state_->fd < 0) {
-    throw std::system_error(errno, std::generic_category(),
-                            "LogWriter: open failed for " + std::string{path});
-  }
+  if (state_->options.background) return;
+  state_->sink.open_sync();
 }
 
 LogWriter::LogWriter(std::string_view path, std::string_view process_name,
@@ -199,42 +146,14 @@ std::uint64_t LogWriter::session_id() const noexcept {
 LogWriter::State::~State() {
   // Explicit flush is optional; destruction drains the accepted prefix too,
   // and marks an open gap closed, with the writer still running to make room.
-  if (losing || held_exit) {
+  if (gaps.has_pending_stop()) {
     settle();
   } else if (active != nullptr && active->used > 0) {
     submit_active();
   }
   stop_writer();
   sync(/*durable=*/true);
-
-  if (fd >= 0) {
-    ::close(fd);
-    fd = -1;
-  }
-}
-
-void LogWriter::State::set_error(std::string message) noexcept {
-  std::lock_guard lock{error_mutex};
-  failed = true;
-  if (error.empty()) {
-    error = std::move(message);
-  }
-}
-
-void LogWriter::State::write_all(const void* data, std::size_t size) {
-  const auto* bytes = reinterpret_cast<const char*>(data);
-  std::size_t written = 0;
-  while (written < size) {
-    const ssize_t n = ::write(fd, bytes + written, size - written);
-    if (n < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      throw std::system_error(errno, std::generic_category(),
-                              "LogWriter: write failed");
-    }
-    written += static_cast<std::size_t>(n);
-  }
+  sink.close();
 }
 
 // Runs on the writer thread (or inline when background is off). Never throws:
@@ -245,150 +164,21 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
                                ? chunk.committed.load(std::memory_order_acquire)
                                : chunk.used;
 
-  if (failed || size == 0) return;
+  if (sink.failed() || size == 0) return;
   if (options.background && options.before_write) options.before_write();
   // The chunk's segment is read only once it holds records: the producer set
   // it before committing the first.
-  if (chunk.written == 0 && chunk.segment != file_segment) {
-    rotate_to(chunk.segment);
-    if (failed) return;
+  if (chunk.written == 0 && chunk.segment != sink.file_segment()) {
+    sink.rotate_to(chunk.segment);
+    if (sink.failed()) return;
   }
 
-  while (chunk.written < size) {
-    const ssize_t n =
-        ::write(fd, chunk.data.data() + chunk.written, size - chunk.written);
-    if (n < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      set_error(std::string{"LogWriter: flush failed: "} +
-                std::strerror(errno));
-      return;
-    }
-    chunk.written += static_cast<std::size_t>(n);
-  }
-}
-
-// Syncs the directory holding `path`, so renames, creations and unlinks in
-// it survive a power loss. 0, or -1 with errno set.
-static int SyncDirectoryOf(const std::string& path) noexcept {
-  const auto slash = path.rfind('/');
-  const std::string directory =
-      slash == std::string::npos ? "." : path.substr(0, slash == 0 ? 1 : slash);
-  const int fd = ::open(directory.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return -1;
-  const int result = process::DurableSync(fd);
-  const int code = errno;
-  ::close(fd);
-  errno = code;
-  return result;
-}
-
-// Runs where write_chunk does, before the chunk's first byte. A rename and a
-// fresh file rather than a rewrite: every segment stays an append-only log
-// that a power loss can only shorten. The order makes every cut leave whole
-// segments: the finished one is synced durably; the next one's prefix is
-// written and synced under a name no reader takes for a log (`.next`) before
-// it is renamed into place; the cap marker is durable before the oldest
-// segment goes; the directory is synced last.
-void LogWriter::State::rotate_to(std::uint64_t next) noexcept {
-  sync(/*durable=*/true);
-  ::close(fd);
-  fd = -1;
-  const auto fail = [this](std::string_view step, const std::string& what) {
-    set_error("LogWriter: cannot " + std::string{step} + " " + what + ": " +
-              std::strerror(errno));
-  };
-
-  const std::string staged = path + ".next";
-  int next_fd =
-      ::open(staged.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (next_fd < 0) return fail("open", staged);
-  std::swap(fd, next_fd);  // write_all writes to fd.
-  try {
-    write_all(prefix.data(), prefix.size());
-  } catch (const std::system_error& e) {
-    set_error(e.what());
-  }
-  std::swap(fd, next_fd);
-  if (failed || process::DurableSync(next_fd) != 0) {
-    if (!failed) fail("sync", staged);
-    ::close(next_fd);
-    ::unlink(staged.c_str());
-    return;
-  }
-
-  // At most segment_count segments, the new one included: those the last
-  // rotation kept that now fall out are deleted, after the marker that says
-  // the log lost its head is on disk.
-  const bool drop = next >= segment_count;
-  if (drop && !capped_marked) {
-    head_dropped.store(true);
-    mark_capped();
-    if (SyncDirectoryOf(path) != 0) {
-      ::close(next_fd);
-      return fail("sync the directory of", path);
-    }
-  }
-  if (::rename(path.c_str(), LogSegmentPath(path, file_segment).c_str()) != 0) {
-    ::close(next_fd);
-    return fail("rename", path);
-  }
-  if (::rename(staged.c_str(), path.c_str()) != 0) {
-    ::close(next_fd);
-    return fail("rename", staged);
-  }
-  fd = next_fd;
-  file_segment = next;
-  if (drop) {
-    for (std::uint64_t old = dropped_through; old <= next - segment_count;
-         ++old) {
-      ::unlink(LogSegmentPath(path, old).c_str());
-    }
-    dropped_through = next - segment_count + 1;
-  }
-  if (SyncDirectoryOf(path) != 0) fail("sync the directory of", path);
+  chunk.written +=
+      sink.write_bytes(chunk.data.data() + chunk.written, size - chunk.written);
 }
 
 void LogWriter::State::sync(bool durable) noexcept {
-  if (fd < 0) {
-    // No file (never created, or lost by a failed rotation): nothing to sync,
-    // but the periodic sync is still done, or the writer thread would find
-    // it due on every pass, spin, and never see `stopping`.
-    last_sync = std::chrono::steady_clock::now();
-    return;
-  }
-  int result;
-  if (durable) {
-    result = process::DurableSync(fd);
-  } else {
-    do {
-      result = ::fsync(fd);
-    } while (result < 0 && errno == EINTR);
-  }
-  if (result < 0) {
-    set_error(std::string{"LogWriter: fsync failed: "} + std::strerror(errno));
-  }
-  last_sync = std::chrono::steady_clock::now();
-  mark_capped();
-}
-
-// Off the producer path: the periodic sync, drain and close call it.
-void LogWriter::State::mark_capped() noexcept {
-  if (capped_marked ||
-      (!head_dropped.load() && capture_error.load() != CaptureError::BYTE_CAP))
-    return;
-  capped_marked = true;
-  const std::string marker = CappedMarkerPath(path);
-  const int marker_fd =
-      ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (marker_fd < 0) {
-    set_error(std::string{"LogWriter: cannot create "} + marker + ": " +
-              std::strerror(errno));
-    return;
-  }
-  ::fsync(marker_fd);
-  ::close(marker_fd);
+  sink.sync(durable, capture_error.load() == CaptureError::BYTE_CAP);
 }
 
 void LogWriter::State::submit_active() noexcept {
@@ -445,10 +235,11 @@ LogWriter::State::Take LogWriter::State::take(
   // is dropped (a gap), never allocated for, before it can end a segment or
   // hand a chunk over.
   if (total > pool.front().data.size()) return Take::kTooLarge;
+  const std::size_t prefix_size = sink.prefix_size();
   const std::uint64_t limit =
       segment_bytes != 0 ? segment_bytes : options.max_bytes;
   const bool full = limit != 0 && segment_used + total > limit;
-  if (full && (segment_bytes == 0 || prefix.size() + total > segment_bytes)) {
+  if (full && (segment_bytes == 0 || prefix_size + total > segment_bytes)) {
     capture_error.store(CaptureError::BYTE_CAP);
     return Take::kStopped;
   }
@@ -456,7 +247,7 @@ LogWriter::State::Take LogWriter::State::take(
   // Nonzero only for a rotating log; the segment holds a record (the first
   // set segment_first_ns); a time at or before the first never ends it, and
   // the difference is taken unsigned only once it is positive.
-  const bool elapsed = segment_span_ns != 0 && segment_used > prefix.size() &&
+  const bool elapsed = segment_span_ns != 0 && segment_used > prefix_size &&
                        header.now_ns > segment_first_ns &&
                        static_cast<std::uint64_t>(header.now_ns) -
                                static_cast<std::uint64_t>(segment_first_ns) >=
@@ -466,7 +257,7 @@ LogWriter::State::Take LogWriter::State::take(
     // rotates the file before writing it.
     submit_active();
     ++segment;
-    segment_used = prefix.size();
+    segment_used = prefix_size;
     if (active != nullptr) {
       active->segment = segment;  // Synchronous: the same, emptied chunk.
     }
@@ -485,7 +276,7 @@ LogWriter::State::Take LogWriter::State::take(
                 stored.data(), stored.size());
   }
   active->used += total;
-  if (segment_used == prefix.size()) segment_first_ns = header.now_ns;
+  if (segment_used == prefix_size) segment_first_ns = header.now_ns;
   segment_used += total;
   if (options.background) {
     // Sequentially consistent, like the writer_idle check after it: either
@@ -496,68 +287,12 @@ LogWriter::State::Take LogWriter::State::take(
         writer_idle.exchange(false, std::memory_order_seq_cst)) {
       wake.post();
     }
-  } else if (std::chrono::steady_clock::now() - last_sync >=
+  } else if (std::chrono::steady_clock::now() - sink.last_sync() >=
              options.sync_interval) {
     submit_active();
     sync(/*durable=*/false);
   }
   return Take::kTaken;
-}
-
-void LogWriter::State::open_gap(const RecordHeader& header,
-                                GapCause cause) noexcept {
-  losing = true;
-  losing_flag.store(true, std::memory_order_relaxed);
-  gap_count.store(gap_count.load(std::memory_order_relaxed) + 1,
-                  std::memory_order_relaxed);
-  // Reported now, not at a later sample: a run killed before its GAP
-  // record is written has said its log lost records.
-  const GapFlagTarget& target = options.gap_flags;
-  if (target.flags != nullptr &&
-      (target.owner == nullptr ||
-       target.owner->load(std::memory_order_acquire) == target.expected)) {
-    target.flags->fetch_or(target.bit, std::memory_order_relaxed);
-  }
-  gap = GapRecord{};
-  gap.cause = static_cast<std::uint16_t>(cause);
-  gap.first_lost_ns = header.now_ns;
-  gap.last_lost_ns = std::numeric_limits<std::int64_t>::min();
-  // The dispatch the gap starts in had records taken before it.
-  if (header.dispatch_index != 0 &&
-      header.dispatch_index == last_accepted_dispatch) {
-    gap.flags |= GAP_SPLITS_DISPATCH;
-  }
-  gap_first_dispatch = header.dispatch_index;
-  gap_start_ns = std::numeric_limits<std::int64_t>::max();
-}
-
-// A dropped record: counted in the open gap, or, an EXIT, held for the stop.
-// No copy, no checksum, no trailing-zero scan.
-void LogWriter::State::lose(const RecordHeader& header,
-                            std::size_t payload_bytes) noexcept {
-  const auto kind = static_cast<EventKind>(header.kind);
-  if (kind == EventKind::EXIT) {
-    held_exit = header;
-    return;
-  }
-  ++gap.records;
-  gap.bytes += sizeof(RecordHeader) + payload_bytes;
-  const bool opens = kind == EventKind::TIMER || kind == EventKind::MESSAGE;
-  const bool sends = kind == EventKind::SEND;
-  if (opens) ++gap.dispatches;
-  if (sends) ++gap.sends;
-  // Operation records (READ, ARM_TIMER, ...) name no time of their own: they
-  // belong to a dispatch whose opener is counted or was recorded.
-  if (opens || sends) {
-    gap_start_ns = std::min(gap_start_ns, header.event_time_ns);
-  }
-  if (kind == EventKind::MESSAGE || sends) {
-    gap_start_ns = std::min(gap_start_ns, header.publish_time_ns);
-  }
-  gap.last_lost_ns = std::max(gap.last_lost_ns, header.now_ns);
-  gap.last_dispatch_index = header.dispatch_index;
-  lost_records.store(lost_records.load(std::memory_order_relaxed) + 1,
-                     std::memory_order_relaxed);
 }
 
 // Capture resumes only with half the pool free, rounded up (2 of 3): a gap
@@ -575,92 +310,147 @@ bool LogWriter::State::room_to_resume() const noexcept {
 LogWriter::State::Take LogWriter::State::take_gap(
     std::int64_t now_ns) noexcept {
   RecordHeader header{};
-  header.kind = static_cast<std::uint16_t>(EventKind::GAP);
-  header.source_id = GAP_SOURCE_ID;
-  header.dispatch_index = gap_first_dispatch;
-  // With only operation records dropped, none named a time: the first
-  // dropped record's.
-  header.event_time_ns =
-      gap_start_ns == std::numeric_limits<std::int64_t>::max()
-          ? gap.first_lost_ns
-          : gap_start_ns;
-  header.now_ns = now_ns;
-  const std::span<const std::byte> stored =
-      SealRecord(header, as_bytes(&gap, sizeof(gap)));
+  const std::span<const std::byte> stored = gaps.seal_gap(header, now_ns);
   return take(header, stored);
 }
 
 void LogWriter::State::append(RecordHeader header,
                               std::span<const std::byte> payload) noexcept {
-  if (failed || capture_error.load() != CaptureError::NONE) return;
+  if (sink.failed() || capture_error.load() != CaptureError::NONE) return;
   const std::size_t payload_bytes = payload.size();
 
-  if (losing) {
+  if (gaps.is_losing()) {
     // Resume only at a record that starts a new dispatch (or belongs to
     // none), so the records after a GAP are whole dispatches.
-    const bool opens = header.dispatch_index == 0 ||
-                       header.dispatch_index != gap.last_dispatch_index;
-    if (!opens || !room_to_resume()) {
-      lose(header, payload_bytes);
+    if (!gaps.can_resume_at(header) || !room_to_resume()) {
+      gaps.lose(header, payload_bytes);
       return;
     }
     payload = SealRecord(header, payload);
-    if (sizeof(RecordHeader) + payload.size() > pool.front().data.size()) {
-      lose(header, payload_bytes);
+    const std::size_t record_total = sizeof(RecordHeader) + payload.size();
+    const std::size_t chunk_cap = pool.front().data.size();
+    if (record_total > chunk_cap) {
+      gaps.lose(header, payload_bytes);
       return;
     }
-    switch (take_gap(header.now_ns)) {
+    RecordHeader gap_header{};
+    const std::span<const std::byte> gap_stored =
+        gaps.seal_gap(gap_header, header.now_ns);
+    const std::size_t gap_total = sizeof(RecordHeader) + gap_stored.size();
+    if (gap_total > chunk_cap) {
+      gaps.lose(header, payload_bytes);
+      return;
+    }
+    if (options.background) {
+      // Ensure GAP and the resuming record can both be taken without hitting
+      // kPoolFull between them (which would submit a GAP-only chunk and open
+      // a second GAP with zero non-GAP records between them).
+      const std::size_t prefix_size = sink.prefix_size();
+      const std::uint64_t limit =
+          segment_bytes != 0 ? segment_bytes : options.max_bytes;
+      const std::uint64_t outstanding =
+          submitted.load(std::memory_order_relaxed) -
+          completed.load(std::memory_order_acquire);
+      const std::uint64_t free_chunks = pool.size() - outstanding;
+
+      std::uint64_t sim_seg_used = segment_used;
+      std::int64_t sim_seg_first_ns = segment_first_ns;
+      std::size_t sim_active_used = active != nullptr ? active->used : 0;
+      std::uint64_t sim_submitted = 0;
+
+      const auto simulate = [&](std::size_t total, std::int64_t now_ns) {
+        const bool full = limit != 0 && sim_seg_used + total > limit;
+        if (full &&
+            (segment_bytes == 0 || prefix_size + total > segment_bytes)) {
+          return true;  // take() returns kStopped; no second GAP can open.
+        }
+        const bool elapsed =
+            segment_span_ns != 0 && sim_seg_used > prefix_size &&
+            now_ns > sim_seg_first_ns &&
+            static_cast<std::uint64_t>(now_ns) -
+                    static_cast<std::uint64_t>(sim_seg_first_ns) >=
+                segment_span_ns;
+        if (full || elapsed) {
+          if (sim_active_used > 0) {
+            ++sim_submitted;
+            sim_active_used = 0;
+          }
+          sim_seg_used = prefix_size;
+        }
+        if (sim_active_used > 0 && sim_active_used + total > chunk_cap) {
+          ++sim_submitted;
+          sim_active_used = 0;
+        }
+        if (sim_seg_used == prefix_size) sim_seg_first_ns = now_ns;
+        sim_seg_used += total;
+        sim_active_used += total;
+        return false;
+      };
+
+      const bool gap_stops = simulate(gap_total, header.now_ns);
+      const std::uint64_t after_gap_submitted = sim_submitted;
+      if (!gap_stops) {
+        simulate(record_total, header.now_ns);
+      }
+      if (sim_submitted + 1 > free_chunks) {
+        // If an already-filled non-GAP active chunk prevents GAP from starting
+        // in it and the total chunks needed exceed the pool size, hand over
+        // those earlier records now so future resumes see active == nullptr.
+        if (sim_submitted + 1 > pool.size() && after_gap_submitted > 0 &&
+            active != nullptr && active->used > 0) {
+          submit_active();
+        }
+        gaps.lose(header, payload_bytes);
+        return;
+      }
+    }
+    switch (take(gap_header, gap_stored)) {
       case Take::kTaken:
         break;
       case Take::kStopped:
         // The byte cap ended capture: that gap stays unmarked.
-        losing = false;
-        losing_flag.store(false, std::memory_order_relaxed);
+        gaps.close();
         return;
       case Take::kPoolFull:
       case Take::kTooLarge:
-        lose(header, payload_bytes);  // Still open.
+        gaps.lose(header, payload_bytes);  // Still open.
         return;
     }
-    losing = false;
-    losing_flag.store(false, std::memory_order_relaxed);
+    gaps.close();
   } else {
     payload = SealRecord(header, payload);
   }
 
   const Take taken = take(header, payload);
   if (taken == Take::kTaken) {
-    last_accepted_dispatch = header.dispatch_index;
+    gaps.note_accepted(header.dispatch_index);
     return;
   }
   if (taken == Take::kStopped) return;
   // An EXIT that finds no room opens no gap: it is held for the stop.
   if (static_cast<EventKind>(header.kind) != EventKind::EXIT) {
-    open_gap(header, taken == Take::kTooLarge ? GapCause::RECORD_TOO_LARGE
-                                              : GapCause::POOL_FULL);
+    gaps.open(header, taken == Take::kTooLarge ? GapCause::RECORD_TOO_LARGE
+                                               : GapCause::POOL_FULL);
   }
-  lose(header, payload_bytes);
+  gaps.lose(header, payload_bytes);
 }
 
 bool LogWriter::State::close_at_stop() noexcept {
   const auto open = [this] {
-    return !failed && capture_error.load() == CaptureError::NONE;
+    return !sink.failed() && capture_error.load() == CaptureError::NONE;
   };
   bool took = false;
-  if (losing) {
-    losing = false;
-    losing_flag.store(false, std::memory_order_relaxed);
+  if (gaps.is_losing()) {
+    gaps.close();
     if (open()) {
-      gap.flags |= GAP_CLOSED_AT_FLUSH;
-      took = take_gap(held_exit ? held_exit->now_ns : gap.last_lost_ns) ==
-             Take::kTaken;
+      gaps.mark_closed_at_flush();
+      took = take_gap(gaps.stop_gap_now_ns()) == Take::kTaken;
     }
   }
-  if (held_exit) {
-    RecordHeader exit = *held_exit;
-    held_exit.reset();
-    if (open() && take(exit, SealRecord(exit, {})) == Take::kTaken) {
-      last_accepted_dispatch = exit.dispatch_index;
+  if (std::optional<RecordHeader> exit = gaps.take_held_exit();
+      exit.has_value()) {
+    if (open() && take(*exit, SealRecord(*exit, {})) == Take::kTaken) {
+      gaps.note_accepted(exit->dispatch_index);
       took = true;
     }
   }
@@ -705,35 +495,15 @@ void LogWriter::State::drain() noexcept {
   sync(/*durable=*/true);
 }
 
-void LogWriter::State::open_file() noexcept {
-  if (prefix.empty()) {
-    mark_capped();
-    return;
-  }
-  fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0) {
-    // Sticky: append() accepts nothing more, and write_chunk() drops what
-    // was already handed over, so drain() and destruction still return.
-    set_error("LogWriter: open failed for " + path + ": " +
-              std::strerror(errno));
-    return;
-  }
-  try {
-    write_all(prefix.data(), prefix.size());
-  } catch (const std::system_error& e) {
-    set_error(e.what());
-  }
-}
-
 void LogWriter::State::start_writer() {
   if (writer.joinable()) return;
 
   State* raw = this;
   writer = std::thread{[raw] {
-    UseNormalScheduling();
+    process::ConfigureBackgroundThread();
     // Before any chunk, so the prefix leads the file. Records handed over
     // meanwhile wait in the pool; the producer never waits for this.
-    raw->open_file();
+    raw->sink.open_file();
     std::unique_lock lock{raw->mutex};
     raw->file_ready = true;
     raw->chunk_ready.notify_all();
@@ -753,9 +523,10 @@ void LogWriter::State::start_writer() {
       // A failed writer drops what is left (write_chunk), so it has nothing
       // to wait for.
       const bool unwritten =
-          !raw->failed &&
+          !raw->sink.failed() &&
           chunk->committed.load(std::memory_order_seq_cst) > chunk->written;
-      const bool sync_due = now - raw->last_sync >= raw->options.sync_interval;
+      const bool sync_due =
+          now - raw->sink.last_sync() >= raw->options.sync_interval;
       const bool write_due =
           unwritten && (!raw->last_write ||
                         now - *raw->last_write >= raw->options.write_interval);
@@ -810,7 +581,7 @@ void LogWriter::State::start_writer() {
       // that lands before the wait is kept by the semaphore, so none is
       // lost; a stale one only makes the next wait return at once and the
       // loop check again.
-      const auto sync_at = raw->last_sync + raw->options.sync_interval;
+      const auto sync_at = raw->sink.last_sync() + raw->options.sync_interval;
       // A writer that has never written has nothing unwritten and no
       // stream here (an unwritten record would have been due above).
       const auto write_at =
@@ -827,8 +598,9 @@ void LogWriter::State::start_writer() {
         timed = false;
         raw->writer_idle.store(true, std::memory_order_seq_cst);
         if (raw->completed.load() == raw->submitted.load() &&
-            (raw->failed || chunk->committed.load(std::memory_order_seq_cst) ==
-                                chunk->written) &&
+            (raw->sink.failed() ||
+             chunk->committed.load(std::memory_order_seq_cst) ==
+                 chunk->written) &&
             !raw->stopping.load()) {
           raw->wake.wait_until(sync_at);
           raw->wakeups.fetch_add(1, std::memory_order_relaxed);
@@ -853,14 +625,14 @@ void LogWriter::State::stop_writer() noexcept {
 void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   State& state = *state_;
 
-  // Every chunk and every segment holds a GAP record.
+  // Every chunk holds a GAP record and the largest manifest record together.
   std::size_t largest_record = GAP_RECORD_BYTES;
   for (const auto& reg : manifest) {
     largest_record =
         std::max(largest_record, sizeof(RecordHeader) + reg.message_bytes);
   }
   const std::size_t capacity =
-      std::max(state.options.chunk_bytes, largest_record);
+      std::max(state.options.chunk_bytes, largest_record + GAP_RECORD_BYTES);
   for (auto& chunk : state.pool) chunk.data.resize(capacity);
 
   std::vector<ManifestEntry> entries;
@@ -918,21 +690,19 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
       state.start_writer();
       return;
     }
-    ::close(state.fd);
-    state.fd = -1;
-    ::unlink(state.path.c_str());
-    state.mark_capped();
+    state.sink.abort_for_tiny_cap_sync();
     return;
   }
 
   // Kept for every later segment's start (rotate_to).
-  state.prefix.reserve(prefix_bytes);
+  std::vector<std::byte> prefix;
+  prefix.reserve(prefix_bytes);
   const auto header_bytes = as_bytes(&header, sizeof(header));
-  state.prefix.insert(state.prefix.end(), header_bytes.begin(),
-                      header_bytes.end());
-  state.prefix.insert(state.prefix.end(), manifest_bytes.begin(),
-                      manifest_bytes.end());
-  state.prefix.insert(state.prefix.end(), schemas.begin(), schemas.end());
+  prefix.insert(prefix.end(), header_bytes.begin(), header_bytes.end());
+  prefix.insert(prefix.end(), manifest_bytes.begin(), manifest_bytes.end());
+  prefix.insert(prefix.end(), schemas.begin(), schemas.end());
+
+  std::uint64_t segment_count = 1;
   state.segment_used = prefix_bytes;
   if (state.options.max_bytes != 0) {
     // Segments that each hold the prefix and the largest record.
@@ -940,7 +710,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     const std::uint64_t count =
         std::min(kLogSegments, state.options.max_bytes / smallest);
     if (count >= 2) {
-      state.segment_count = count;
+      segment_count = count;
       state.segment_bytes = state.options.max_bytes / count;
       if (state.options.window.count() > 0) {
         // Never sooner than sync_interval: each rotation syncs durably and
@@ -953,6 +723,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
       }
     }
   }
+  state.sink.configure_segments(std::move(prefix), segment_count);
 
   if (state.options.background) {
     // The writer thread opens the file and writes the prefix: this thread
@@ -961,7 +732,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     return;
   }
   // Synchronous: the constructor opened the file, and the prefix leads it.
-  state.write_all(state.prefix.data(), state.prefix.size());
+  state.sink.write_prefix_sync();
 }
 
 void LogWriter::dispatch(const Context& context,
@@ -1008,47 +779,44 @@ void LogWriter::finish(const Context& context) noexcept {
 
 void LogWriter::flush() noexcept { state_->drain(); }
 
-bool LogWriter::failed() const noexcept { return state_->failed; }
+bool LogWriter::failed() const noexcept { return state_->sink.failed(); }
 
 std::string LogWriter::error() const {
-  std::lock_guard lock{state_->error_mutex};
-  if (state_->error.empty() &&
+  std::string message = state_->sink.error();
+  if (message.empty() &&
       state_->capture_error.load() == State::CaptureError::BYTE_CAP) {
     return "LogWriter: byte cap of " +
            std::to_string(state_->options.max_bytes) +
            " reached; capture stopped";
   }
-  return state_->error;
+  return message;
 }
 
 bool LogWriter::capture_stopped() const noexcept {
   return state_->capture_error.load() == State::CaptureError::BYTE_CAP;
 }
 
-std::uint64_t LogWriter::gaps() const noexcept {
-  return state_->gap_count.load(std::memory_order_relaxed);
-}
+std::uint64_t LogWriter::gaps() const noexcept { return state_->gaps.gaps(); }
 
 void LogWriter::set_gap_flags(const GapFlagTarget& target) noexcept {
   state_->options.gap_flags = target;
+  state_->gaps.set_gap_flags(target);
 }
 
 std::uint64_t LogWriter::lost_records() const noexcept {
-  return state_->lost_records.load(std::memory_order_relaxed);
+  return state_->gaps.lost_records();
 }
 
 bool LogWriter::incomplete() const noexcept { return failed() || gaps() > 0; }
 
-bool LogWriter::losing() const noexcept {
-  return state_->losing_flag.load(std::memory_order_relaxed);
-}
+bool LogWriter::losing() const noexcept { return state_->gaps.losing(); }
 
 std::uint64_t LogWriter::wakeups() const noexcept {
   return state_->wakeups.load(std::memory_order_relaxed);
 }
 
 bool LogWriter::capped() const noexcept {
-  return state_->head_dropped.load() ||
+  return state_->sink.head_dropped() ||
          state_->capture_error.load() == State::CaptureError::BYTE_CAP;
 }
 

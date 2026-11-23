@@ -386,12 +386,13 @@ node = "//talOS/launcher:replay_graph_reader"
     return Replay(node, out_dir, session_dir_);
   }
   int Replay(const std::string& node, const std::string& out_dir,
-             const std::string& session) {
+             const std::string& session, bool allow_capped_replay = false) {
     LauncherOptions options = Options();
     options.config_path = config_;
     options.output_dir = out_dir;
     options.replay_inputs = session;
     options.only = node;
+    options.allow_capped_replay = allow_capped_replay;
     return Launcher{options}.Run();
   }
 
@@ -577,6 +578,65 @@ TEST_F(ReplayInputsTest, ASessionRecordedWithoutSimReplaysWithoutIt) {
   std::filesystem::remove_all(root);
 }
 
+// REQ-OPS-14: a session launched with --sim replays with --sim even when the
+// replay invocation omits --sim (options.simulation = false). Under --sim, the
+// devices layer commissions the config in memory, which changes config_id:
+// replayed without --sim, the motor node would reject every State and read
+// disconnected.
+TEST_F(ReplayInputsTest, ASessionRecordedWithSimReplaysWithIt) {
+  const std::string root = TempPath("sim_hardware");
+  const std::string dir = root + "/1";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(dir);
+  {
+    config::RobotConfig config = config::ParseRobotConfig(config_);
+    config.hardware.commissioned = true;
+    const event::MonotonicTime origin =
+        event::MonotonicTime::from_nanos(2'038'406'047'920);
+    event::SimulationEnvironment environment;
+    GatewayLoop loop{
+        environment,
+        event::log::LogWriter{dir + "/hardware_node.tlog", "hardware_node",
+                              event::log::LogWriterOptions{}, 1},
+        GatewayLoop::Options{.start = origin}};
+    RealGateway gateway{loop, config};
+    loop.run_until(origin + std::chrono::milliseconds{400});
+    loop.finish();
+  }
+  const std::string recording = root + "/replay_motor.tlog";
+  ASSERT_EQ(RunNode(Runfile("TALOS_MOTOR_NODE"),
+                    {"--replay-inputs", dir, "--session-id", "1", "--log",
+                     recording, "--config", config_, "--sim"}),
+            0);
+  std::filesystem::rename(recording, dir + "/replay_motor.tlog");
+  std::ofstream{dir + "/manifest.json"}
+      << "{\n  \"session_id\": 1,\n  \"simulation\": true\n}\n";
+  const auto recorded =
+      SendsByDeadline(dir + "/replay_motor.tlog", "/replay_motor/state");
+  ASSERT_FALSE(recorded.empty());
+  const auto last = As<MotorReading>(recorded.rbegin()->second);
+  ASSERT_TRUE(last.connected());
+  ASSERT_GE(last.sample_time_ns(), 0);
+
+  const std::string out = TempPath("sim_motor_out");
+  std::filesystem::remove_all(out);
+  LauncherOptions options = Options();
+  options.simulation = false;
+  options.config_path = config_;
+  options.output_dir = out;
+  options.replay_inputs = dir;
+  options.only = "replay_motor";
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+
+  const auto replayed =
+      SendsByDeadline(out + "/1/replay_motor.tlog", "/replay_motor/state");
+  EXPECT_EQ(replayed.size(), recorded.size());
+  EXPECT_EQ(replayed, recorded);
+
+  std::filesystem::remove_all(out);
+  std::filesystem::remove_all(root);
+}
+
 // REQ-OPS-14: a node fed /hw/state from the bridge's log is never fed across
 // a gap in it. The session is a real one's shape (as above), its bridge log
 // holding States, then a closed GAP record where its writer's pool filled
@@ -658,11 +718,17 @@ TEST_F(ReplayInputsTest, AReplayFedFromTheBridgesLogStopsAtItsGap) {
   std::filesystem::remove_all(root);
 }
 
+// REQ-OPS-14: a schema mismatch fails before running and names both types.
 TEST_F(ReplayInputsTest, AReaderOfAnotherSchemaIsRefused) {
   Record();
   const std::string out = TempPath("impostor");
   std::filesystem::remove_all(out);
-  EXPECT_NE(Replay("replay_impostor", out), 0);
+  ::testing::internal::CaptureStderr();
+  const int status = Replay("replay_impostor", out);
+  const std::string err = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(status, 0) << err;
+  EXPECT_NE(err.find("replay_inputs_test.Reading"), std::string::npos) << err;
+  EXPECT_NE(err.find("replay_inputs_test.Impostor"), std::string::npos) << err;
 
   std::filesystem::remove_all(out);
 }
@@ -716,27 +782,121 @@ TEST_F(ReplayInputsTest, AReplayedNodeKeepsNoSessionState) {
 // cannot match. The node is not started, so it writes no log.
 TEST_F(ReplayInputsTest, ASessionOfAnotherHardwareProtocolIsRefused) {
   Record();
+  const std::uint16_t kBuild = protocol::kProtocolVersion;
+  const std::uint16_t kOther = static_cast<std::uint16_t>(kBuild - 1);
   const std::string session = CopyOfSession("other_protocol");
-  {
+  const auto write_bridge_log = [&](const std::string& filename,
+                                    std::uint16_t version) {
     const event::MonotonicTime origin =
         event::MonotonicTime::from_nanos(2'038'406'047'920);
+    event::SimulationEnvironment environment;
+    GatewayLoop loop{
+        environment,
+        event::log::LogWriter{session + "/" + filename, "hardware_node",
+                              event::log::LogWriterOptions{}, 1},
+        GatewayLoop::Options{.start = origin}};
+    RealGateway gateway{loop, config::ParseRobotConfig(config_), version};
+    loop.run_until(origin + std::chrono::milliseconds{20});
+    loop.finish();
+  };
+  const auto refusal_line = [](const std::string& err) {
+    std::istringstream lines{err};
+    for (std::string line; std::getline(lines, line);) {
+      if (line.find("not replayed") != std::string::npos) return line;
+    }
+    return std::string{};
+  };
+
+  // Subcase 1: single bridge run recording another protocol version.
+  write_bridge_log("hardware_node.tlog", kOther);
+  const std::string out = TempPath("other_protocol_out");
+  std::filesystem::remove_all(out);
+  ::testing::internal::CaptureStderr();
+  const int single_rc = Replay("replay_consumer", out, session);
+  const std::string single_err = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(single_rc, 0) << single_err;
+  EXPECT_FALSE(std::filesystem::exists(out + "/1/replay_consumer.tlog"));
+  const std::string single_refusal = refusal_line(single_err);
+  ASSERT_FALSE(single_refusal.empty()) << single_err;
+  EXPECT_NE(single_refusal.find(std::to_string(kOther)), std::string::npos)
+      << single_refusal;
+  EXPECT_NE(single_refusal.find(std::to_string(kBuild)), std::string::npos)
+      << single_refusal;
+  std::filesystem::remove_all(out);
+
+  // Subcase 2: bridge runs of two different protocol versions in one session.
+  write_bridge_log("hardware_node.restart1.tlog", kBuild);
+  ::testing::internal::CaptureStderr();
+  const int two_rc = Replay("replay_consumer", out, session);
+  const std::string two_err = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(two_rc, 0) << two_err;
+  EXPECT_FALSE(std::filesystem::exists(out + "/1/replay_consumer.tlog"));
+  const std::string two_refusal = refusal_line(two_err);
+  ASSERT_FALSE(two_refusal.empty()) << two_err;
+  EXPECT_NE(two_refusal.find(std::to_string(kOther)), std::string::npos)
+      << two_refusal;
+  EXPECT_NE(two_refusal.find(std::to_string(kBuild)), std::string::npos)
+      << two_refusal;
+  EXPECT_NE(two_refusal.find("different builds"), std::string::npos)
+      << two_refusal;
+  std::filesystem::remove_all(out);
+  std::filesystem::remove_all(TempPath("other_protocol"));
+}
+
+// REQ-OPS-51: when the bridge's /hw/status protocol_version_id and
+// manifest.json's hardware_protocol_version disagree, --replay-inputs prints
+// one warning naming both versions and reads the session under the bridge's
+// version.
+TEST_F(ReplayInputsTest,
+       BridgeAndManifestProtocolDisagreementWarnsAndUsesBridgesVersion) {
+  Record();
+  const std::uint16_t kBuild = protocol::kProtocolVersion;
+  const std::uint16_t kOther = static_cast<std::uint16_t>(kBuild - 1);
+  const std::string session = CopyOfSession("protocol_disagree");
+  {
+    const event::MonotonicTime origin =
+        event::log::LogReader{session + "/replay_source.tlog"}.start_time();
     event::SimulationEnvironment environment;
     GatewayLoop loop{
         environment,
         event::log::LogWriter{session + "/hardware_node.tlog", "hardware_node",
                               event::log::LogWriterOptions{}, 1},
         GatewayLoop::Options{.start = origin}};
-    RealGateway gateway{loop, config::ParseRobotConfig(config_),
-                        protocol::kProtocolVersion - 1};
+    RealGateway gateway{loop, config::ParseRobotConfig(config_), kBuild};
     loop.run_until(origin + std::chrono::milliseconds{20});
     loop.finish();
   }
-  const std::string out = TempPath("other_protocol_out");
+  std::ofstream{session + "/manifest.json"}
+      << "{\n  \"session_id\": 1,\n  \"simulation\": true,\n  "
+         "\"hardware_protocol_version\": "
+      << kOther << ",\n  \"nodes\": []\n}\n";
+
+  const std::string out = TempPath("protocol_disagree_out");
   std::filesystem::remove_all(out);
-  EXPECT_NE(Replay("replay_consumer", out, session), 0);
-  EXPECT_FALSE(std::filesystem::exists(out + "/1/replay_consumer.tlog"));
+  ::testing::internal::CaptureStderr();
+  const int rc = Replay("replay_consumer", out, session);
+  const std::string err = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(rc, 0) << err;
+  EXPECT_TRUE(std::filesystem::exists(out + "/1/replay_consumer.tlog"));
+
+  std::vector<std::string> warnings;
+  std::istringstream lines{err};
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("the session's bridge recorded hardware protocol ") !=
+        std::string::npos) {
+      warnings.push_back(line);
+    }
+  }
+  ASSERT_EQ(warnings.size(), 1u) << err;
+  EXPECT_NE(warnings.front().find(std::to_string(kBuild)), std::string::npos)
+      << warnings.front();
+  EXPECT_NE(warnings.front().find(std::to_string(kOther)), std::string::npos)
+      << warnings.front();
+  EXPECT_NE(warnings.front().find("read under the bridge's"), std::string::npos)
+      << warnings.front();
+
   std::filesystem::remove_all(out);
-  std::filesystem::remove_all(TempPath("other_protocol"));
+  std::filesystem::remove_all(TempPath("protocol_disagree"));
 }
 
 TEST_F(ReplayInputsTest, RefusesToWriteIntoTheSessionItReads) {
@@ -745,6 +905,135 @@ TEST_F(ReplayInputsTest, RefusesToWriteIntoTheSessionItReads) {
   EXPECT_NE(Replay("replay_consumer", session, session), 0);
   EXPECT_FALSE(std::filesystem::exists(session + "/replay_consumer.tlog"));
   std::filesystem::remove_all(TempPath("refused_session"));
+}
+
+// REQ-OPS-14: --allow-capped-replay requires --replay-inputs on both the
+// launcher and node binaries; with --replay-inputs, it forwards to the node so
+// a byte-capped session replays deterministically from the kept window with a
+// warning on stderr, while default replay still refuses it and uncapped
+// log_gap sessions without EXIT are still refused.
+TEST_F(ReplayInputsTest, AllowCappedReplayFlagEndToEnd) {
+  // 1. Launcher refuses --allow-capped-replay without --replay-inputs.
+  {
+    LauncherOptions options = Options();
+    options.config_path = config_;
+    options.output_dir = TempPath("allow_capped_no_replay");
+    options.allow_capped_replay = true;
+    ::testing::internal::CaptureStderr();
+    const int status = Launcher{options}.Run();
+    const std::string err = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(status, 1) << err;
+    EXPECT_NE(err.find("--allow-capped-replay"), std::string::npos) << err;
+    EXPECT_NE(err.find("--replay-inputs"), std::string::npos) << err;
+    std::filesystem::remove_all(options.output_dir);
+  }
+
+  // 2. Node binary refuses --allow-capped-replay without --replay-inputs.
+  EXPECT_NE(RunNode(Runfile("TALOS_CONSUMER_NODE"),
+                    {"--allow-capped-replay", "--config", config_}),
+            0);
+
+  // 3. Capped session: default refuses, --allow-capped-replay replays
+  // deterministically and warns on stderr.
+  Record();
+  const std::string session = CopyOfSession("capped_session");
+  const std::string source_log = session + "/replay_source.tlog";
+  std::ofstream{event::log::CappedMarkerPath(source_log)}.close();
+
+  const std::string refused_out = TempPath("capped_refused");
+  std::filesystem::remove_all(refused_out);
+  EXPECT_NE(Replay("replay_consumer", refused_out, session,
+                   /*allow_capped_replay=*/false),
+            0);
+  std::filesystem::remove_all(refused_out);
+
+  const std::string out1 = TempPath("capped_out1");
+  const std::string out2 = TempPath("capped_out2");
+  std::filesystem::remove_all(out1);
+  std::filesystem::remove_all(out2);
+  ASSERT_EQ(
+      Replay("replay_consumer", out1, session, /*allow_capped_replay=*/true),
+      0);
+  ASSERT_EQ(
+      Replay("replay_consumer", out2, session, /*allow_capped_replay=*/true),
+      0);
+  const std::vector<Sent> sends1 =
+      Sends(out1 + "/1/replay_consumer.tlog", "/replay_consumer/state");
+  ASSERT_FALSE(sends1.empty());
+  EXPECT_EQ(Sends(out2 + "/1/replay_consumer.tlog", "/replay_consumer/state"),
+            sends1);
+
+  // Verify the node itself prints the capped-replay warning to stderr.
+  {
+    int pipefd[2];
+    ASSERT_EQ(::pipe(pipefd), 0);
+    const std::string direct_log = TempPath("capped_direct_out.tlog");
+    std::filesystem::remove(direct_log);
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      ::close(pipefd[0]);
+      ::dup2(pipefd[1], STDERR_FILENO);
+      ::close(pipefd[1]);
+      const std::string bin = Runfile("TALOS_CONSUMER_NODE");
+      ::execl(bin.c_str(), bin.c_str(), "--replay-inputs", session.c_str(),
+              "--allow-capped-replay", "--session-id", "1", "--log",
+              direct_log.c_str(), "--config", config_.c_str(), nullptr);
+      ::_exit(127);
+    }
+    ::close(pipefd[1]);
+    std::string node_stderr;
+    char buf[256];
+    for (ssize_t n = 0; (n = ::read(pipefd[0], buf, sizeof(buf))) > 0;) {
+      node_stderr.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(pipefd[0]);
+    int status = 0;
+    ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << node_stderr;
+    EXPECT_NE(node_stderr.find(source_log), std::string::npos) << node_stderr;
+    EXPECT_NE(node_stderr.find("kept window"), std::string::npos)
+        << node_stderr;
+    std::filesystem::remove(direct_log);
+  }
+
+  // 4. Uncapped log_gap without EXIT is still refused under
+  // --allow-capped-replay.
+  {
+    const std::string gap_session = CopyOfSession("capped_with_log_gap");
+    const std::string gap_source = gap_session + "/replay_source.tlog";
+    std::uint64_t exit_offset = 0;
+    {
+      event::log::LogReader reader{gap_source};
+      event::log::LogReader::Record rec;
+      while (reader.next(rec)) {
+        if (rec.header.kind ==
+            static_cast<std::uint16_t>(event::EventKind::EXIT)) {
+          exit_offset = rec.offset;
+        }
+      }
+    }
+    ASSERT_GT(exit_offset, 0u);
+    std::filesystem::resize_file(gap_source, exit_offset);
+    std::ofstream{event::log::CappedMarkerPath(gap_source)}.close();
+    std::ofstream{gap_session + "/manifest.json"}
+        << "{\n  \"session_id\": 1,\n  \"simulation\": true,\n  \"nodes\": "
+           "[{\"name\": \"replay_source\", \"log_paths\": [\""
+        << gap_source
+        << "\"], \"log_gap\": true, \"log_capped\": true, "
+           "\"recorder_failed\": false}]\n}\n";
+    const std::string gap_out = TempPath("capped_gap_out");
+    std::filesystem::remove_all(gap_out);
+    EXPECT_NE(Replay("replay_consumer", gap_out, gap_session,
+                     /*allow_capped_replay=*/true),
+              0);
+    std::filesystem::remove_all(gap_out);
+    std::filesystem::remove_all(TempPath("capped_with_log_gap"));
+  }
+
+  std::filesystem::remove_all(out1);
+  std::filesystem::remove_all(out2);
+  std::filesystem::remove_all(TempPath("capped_session"));
 }
 
 }  // namespace

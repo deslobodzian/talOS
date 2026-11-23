@@ -12,7 +12,7 @@ import {useMemo} from 'react';
 
 import {discoverSubsystems, type Subsystem} from '../../data/discovery';
 import {nodeLiveness} from '../../data/freshness';
-import {useChannelStale, useDictionary, useSeries, useSnapshot, useSystem} from '../../data/hooks';
+import {useChannelStale, useDictionary, useRecorded, useSeries, useSnapshot, useSystem} from '../../data/hooks';
 import type {ChannelInfo} from '../../data/types';
 import type {SystemNode} from '../../system';
 import {rateKey} from '../../system';
@@ -29,6 +29,8 @@ import './subsystems.css';
 export type SubsystemsConfig = {selected: string[] | null};
 
 const defaultConfig: SubsystemsConfig = {selected: null};
+const EMPTY_RATES: Record<string, number> = {};
+const SPARKLINE_WIDTH = 150;
 
 function parseConfig(raw: unknown): SubsystemsConfig {
   const obj = raw && typeof raw === 'object' && !Array.isArray(raw) ?
@@ -137,6 +139,61 @@ function PairRow(
   </li>;
 }
 
+const BLOCKING_KIND_FALLBACK = ['NONE', 'AXIS', 'BUTTON', 'POV', 'OTHER'] as const;
+
+// Human-readable arming status for any operator node publishing
+// `<owner>/status/armed` and `<owner>/status/blocking_kind` (REQ-OPS-55).
+function formatDisarmedStatus(
+    sub: Subsystem,
+    infoBy: Map<string, ChannelInfo>,
+    snapshot: {channels: Record<string, number>} | null): string | null {
+  const armedChannel = sub.statusChannels.find(c => channelLeaf(c) === 'armed');
+  const kindChannel = sub.statusChannels.find(c => channelLeaf(c) === 'blocking_kind');
+  if (!armedChannel || !kindChannel || !snapshot) return null;
+  const armed = snapshot.channels[armedChannel];
+  if (armed === undefined || armed !== 0) return null;
+
+  const kindVal = snapshot.channels[kindChannel];
+  const labels = infoBy.get(kindChannel)?.labels ?? [];
+  let kindLabel = 'NONE';
+  if (kindVal !== undefined && Number.isInteger(kindVal) && kindVal >= 0) {
+    if (kindVal < labels.length) {
+      kindLabel = labels[kindVal].toUpperCase();
+    } else if (kindVal < BLOCKING_KIND_FALLBACK.length) {
+      kindLabel = BLOCKING_KIND_FALLBACK[kindVal];
+    }
+  }
+
+  const joyChannel = sub.statusChannels.find(c => channelLeaf(c) === 'blocking_joystick_index');
+  const inputChannel = sub.statusChannels.find(c => channelLeaf(c) === 'blocking_input_index');
+  const joy = joyChannel !== undefined ? snapshot.channels[joyChannel] : undefined;
+  const input = inputChannel !== undefined ? snapshot.channels[inputChannel] : undefined;
+  const hasIds = joy !== undefined && input !== undefined &&
+      Number.isInteger(joy) && Number.isInteger(input) && joy >= 0 && input >= 0;
+
+  if (kindLabel === 'AXIS') {
+    return hasIds ? `Disarmed — joystick ${joy} axis ${input} held` :
+                    'Disarmed — joystick axis held';
+  }
+  if (kindLabel === 'BUTTON') {
+    return hasIds ? `Disarmed — joystick ${joy} button ${input} held` :
+                    'Disarmed — joystick button held';
+  }
+  if (kindLabel === 'POV') {
+    return hasIds ? `Disarmed — joystick ${joy} POV ${input} held` :
+                    'Disarmed — joystick POV held';
+  }
+  if (kindLabel === 'OTHER') {
+    return 'Disarmed — release held input to arm';
+  }
+  const alertChannel =
+      sub.statusChannels.find(c => channelLeaf(c) === 'alert_warning_disarmed');
+  if (alertChannel !== undefined && snapshot.channels[alertChannel] === 0) {
+    return null;
+  }
+  return 'Disarmed — release inputs to arm';
+}
+
 function SubsystemCard(
     {sub, infoBy, snapshot, node, graphStale, rates, series}: {
       sub: Subsystem;
@@ -166,6 +223,7 @@ function SubsystemCard(
   }, [channels, infoBy]);
 
   const selection = sub.selection;
+  const disarmedStatus = formatDisarmedStatus(sub, infoBy, snapshot);
   const liveness = node ? nodeLiveness(node, {stale: graphStale}) : null;
   const loop = node ? loopRate(node, rates) : undefined;
   const latency = node ? worstLatency(node) : undefined;
@@ -185,6 +243,10 @@ function SubsystemCard(
         {enabledValue === undefined ? '—' : enabledValue === 1 ? 'enabled' : 'disabled'}
       </span>
     </header>
+
+    {disarmedStatus && <div className="subsystem-meta">
+      <em className="text-warn">{disarmedStatus}</em>
+    </div>}
 
     <div className="subsystem-meta">
       <div className="subsystem-lanes">
@@ -233,10 +295,12 @@ function SubsystemCard(
 function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
   const dictionary = useDictionary();
   const system = useSystem();
+  const recorded = useRecorded();
   const snapshot = useSnapshot();
+  const graph = recorded ? null : system.graph;
 
   const subsystems = useMemo(
-      () => discoverSubsystems(dictionary, system.graph), [dictionary, system.graph]);
+      () => discoverSubsystems(dictionary, graph), [dictionary, graph]);
 
   const infoBy = useMemo(() => {
     const map = new Map<string, ChannelInfo>();
@@ -260,7 +324,7 @@ function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
     return [...names].sort();
   }, [visible, infoBy]);
 
-  const series = useSeries(seriesChannels, {seconds: 30});
+  const series = useSeries(seriesChannels, {seconds: 30}, SPARKLINE_WIDTH);
 
   const toggle = (name: string) => {
     const selected = config.selected;
@@ -304,9 +368,9 @@ function SubsystemsPanel({config, setConfig}: PanelProps<SubsystemsConfig>) {
            {visible.map(sub =>
              <SubsystemCard key={sub.name} sub={sub} infoBy={infoBy}
                             snapshot={snapshot}
-                            node={system.graph?.nodes.find(n => n.name === sub.name)}
-                            graphStale={system.stale}
-                            rates={system.rates} series={series}/>)}
+                            node={graph?.nodes.find(n => n.name === sub.name)}
+                            graphStale={recorded ? false : system.stale}
+                            rates={recorded ? EMPTY_RATES : system.rates} series={series}/>)}
          </div>}
   </div>;
 }
@@ -318,5 +382,6 @@ export const subsystemsPanel: PanelDefinition<SubsystemsConfig> = {
   description: 'One card per subsystem: state, status and demand-vs-measured.',
   defaultConfig,
   parseConfig,
-  component: SubsystemsPanel
+  component: SubsystemsPanel,
+  recorded: true
 };

@@ -58,6 +58,16 @@ std::int64_t ToMachTicks(std::int64_t nanos) {
   return nanos / numer * denom + ((nanos % numer) * denom + numer - 1) / numer;
 }
 
+// Applies a single kevent change, retrying EINTR: kevent(2) is never
+// auto-restarted by SA_RESTART on macOS/XNU.
+int ApplyChange(int kq_fd, const struct kevent& kev) noexcept {
+  int rc = 0;
+  do {
+    rc = ::kevent(kq_fd, &kev, 1, nullptr, 0, nullptr);
+  } while (rc == -1 && errno == EINTR);
+  return rc;
+}
+
 }  // namespace
 
 KqueuePoller::KqueuePoller(DeadlineTimer deadline_timer)
@@ -84,7 +94,7 @@ KqueuePoller::KqueuePoller(DeadlineTimer deadline_timer)
   // to drain by hand).
   struct kevent kev;
   EV_SET(&kev, kWakeIdent, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
-  if (::kevent(kq_fd_, &kev, 1, nullptr, 0, nullptr) == -1) {
+  if (ApplyChange(kq_fd_, kev) == -1) {
     const int saved_errno = errno;
     ::close(kq_fd_);
     throw std::system_error(saved_errno, std::generic_category(),
@@ -130,7 +140,7 @@ MonotonicTime KqueuePoller::now() {
 void KqueuePoller::wake() {
   struct kevent kev;
   EV_SET(&kev, kWakeIdent, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
-  if (::kevent(kq_fd_, &kev, 1, nullptr, 0, nullptr) == -1) {
+  if (ApplyChange(kq_fd_, kev) == -1) {
     throw std::system_error(errno, std::generic_category(),
                             "kevent NOTE_TRIGGER");
   }
@@ -139,7 +149,7 @@ void KqueuePoller::wake() {
 void KqueuePoller::add_fd(int fd) {
   struct kevent kev;
   EV_SET(&kev, fd, EVFILT_READ, EV_ADD, 0, 0, nullptr);
-  if (::kevent(kq_fd_, &kev, 1, nullptr, 0, nullptr) == -1) {
+  if (ApplyChange(kq_fd_, kev) == -1) {
     throw std::system_error(errno, std::generic_category(), "kevent EV_ADD fd");
   }
 }
@@ -151,7 +161,7 @@ void KqueuePoller::remove_fd(int fd) {
   // never watched (the documented no-op case), and any other failure (say,
   // the fd was already closed) leaves nothing for the caller to act on --
   // removal is best-effort cleanup, not a resource acquisition.
-  ::kevent(kq_fd_, &kev, 1, nullptr, 0, nullptr);
+  ApplyChange(kq_fd_, kev);
 }
 
 bool KqueuePoller::reported_readable(int fd) const noexcept {
@@ -177,9 +187,10 @@ KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
     EV_SET(&timer, kDeadlineIdent, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
     // A separate call: deleting a knote that is already gone (a delivered
     // one-shot) fails with ENOENT, which in the waiting call would come back
-    // as an EV_ERROR event and end the wait at once. ENOENT is the expected
-    // case and nothing else leaves a timer armed, so errors are ignored.
-    ::kevent(kq_fd_, &timer, 1, nullptr, 0, nullptr);
+    // as an EV_ERROR event and end the wait at once. ApplyChange retries
+    // EINTR so a signal cannot leave a previously armed timer active; other
+    // errors (ENOENT is the expected case) are ignored.
+    ApplyChange(kq_fd_, timer);
   } else if (arm_deadline_timer_) {
     // A deadline already past arms a timer that fires at once, so the wait
     // still returns promptly (after collecting any readable fd or wake).
@@ -194,8 +205,9 @@ KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
     // for what is left. A deadline already past polls (a zero timeout).
     struct timespec timeout {};
     if (finite) {
+      const MonotonicTime current = now();
       const std::int64_t left =
-          std::max<std::int64_t>(0, (deadline - now()).count());
+          deadline <= current ? 0 : (deadline - current).count();
       timeout.tv_sec = static_cast<time_t>(left / 1'000'000'000);
       timeout.tv_nsec = static_cast<long>(left % 1'000'000'000);
     }

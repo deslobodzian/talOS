@@ -33,6 +33,7 @@ TEST(Scheduler, EmptyHasNoDeadline) {
   EXPECT_FALSE(scheduler.pop_expired(at(1'000), expiration));
 }
 
+// REQ-RT-04
 TEST(Scheduler, FiresInDeadlineOrder) {
   Scheduler scheduler;
 
@@ -48,6 +49,7 @@ TEST(Scheduler, FiresInDeadlineOrder) {
 // The whole point of the id tiebreak: two timers due in the same iteration
 // must fire in a fixed order, or a replayed run could dispatch them the other
 // way round and diverge for no reason.
+// REQ-RT-04
 TEST(Scheduler, TiesBreakOnIdRegardlessOfInsertionOrder) {
   Scheduler ascending;
   ascending.schedule(1, at(500));
@@ -75,6 +77,7 @@ TEST(Scheduler, NotDueBeforeDeadline) {
   EXPECT_EQ(expiration.cycles, 1u);
 }
 
+// REQ-RT-03
 TEST(Scheduler, PeriodicStaysOnPhaseGrid) {
   Scheduler scheduler;
   scheduler.schedule(1, at(1'000), Duration{1'000});
@@ -92,6 +95,7 @@ TEST(Scheduler, PeriodicStaysOnPhaseGrid) {
 // After an overrun the timer fires once and says how many periods it missed,
 // rather than firing once per missed period. A control loop that fell behind
 // must not then be handed a burst it also cannot service.
+// REQ-RT-03
 TEST(Scheduler, OverrunReportsCyclesAndDoesNotBurst) {
   Scheduler scheduler;
   scheduler.schedule(1, at(1'000), Duration{1'000});

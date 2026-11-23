@@ -356,14 +356,16 @@ class EventLoopBase {
 
   bool registration_closed() const { return registration_closed_; }
 
-  // Marks the loop as being inside its run function, which is what makes a
-  // timer change from another thread detectable.
+  // Marks the loop as being inside its run function, which refuses re-entrant
+  // or concurrent runs and makes a timer change from another thread detectable.
   class RunScope {
    public:
     explicit RunScope(EventLoopBase& loop) : loop_{loop} {
-      loop_.in_run_ = true;
+      if (loop_.in_run_.exchange(true, std::memory_order_acq_rel)) {
+        throw std::logic_error("event loop is already running");
+      }
     }
-    ~RunScope() { loop_.in_run_ = false; }
+    ~RunScope() { loop_.in_run_.store(false, std::memory_order_release); }
 
     RunScope(const RunScope&) = delete;
     RunScope& operator=(const RunScope&) = delete;

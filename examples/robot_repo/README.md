@@ -33,6 +33,7 @@ bazel run //:sim -- --duration-s 10    # the robot against the simulator
 bazel run //:sim -- --start-studio-bridge   # with Studio (below)
 bazel run @talos//talOS/launcher:session_report -- <session dir>   # a recorded session's report
 bazel run @talos//tools:sync_manifest -- robot.toml   # after editing [[subsystems]]
+bazel run @talos//controller_processor/rio:gradlew -- buildRio -Pcompanion=<ipv4>  # RoboRIO binary (deploy also needs -PteamNumber or .wpilib/wpilib_preferences.json)
 ```
 
 ## Add a subsystem
@@ -56,11 +57,13 @@ package elsewhere. A repository without a simulation config gets one with
 its first mechanism: `robot_sim.toml` beside the config (it includes the
 config, which never reads it), `robot_sim_manifest.bzl`, and its
 `sim_manifest_sync_test` and `sim_graph_test` in the config's `BUILD`, so
-`bazel test //...` checks it. Its `Next:` lists the placeholders to replace
-(the CAN id) and simulation-only lines to append to `robot_sim.toml`, then
-the command that
-runs it: `bazel run //:sim` when the root `talos_sim` names that file, else
-(as here, where `//:sim` runs `robot.toml`) `@talos//talOS/launcher` on it
+`bazel test //...` checks it. When the root `BUILD` has a `talos_sim(name =
+"sim")` pointed at the robot config with its manifest's `CONFIG_FILES` and
+`NODES` (as here), the scaffold also points `//:sim` at `robot_sim.toml`,
+`SIM_CONFIG_FILES` and `SIM_NODES`. Its `Next:` lists the placeholders to
+replace (the CAN id) and simulation-only lines to append to
+`robot_sim.toml`, then the command that runs it: `bazel run //:sim` when
+the root `talos_sim` names that file, else `@talos//talOS/launcher` on it
 with `--sim --start-sim-gateway`.
 
 `bazel test //...` passes right after the scaffold. In a robot whose config
@@ -87,11 +90,12 @@ unless ARGS include `--start-studio-bridge`. The simulator is the one
 `data`. The launcher gives it the bridge's ports (`[robot] controller_port`
 and `local_port`, or ARGS' `--remote-port` and `--local-port`).
 
-`sim_smoke_test` is `talos_sim_test(sim = ":sim")`: it runs `//:sim` with
-those two flags on free ports until the bridge has accepted a State and
-every member's loop has started, then 1 s more, stops it, and fails unless
-every member the session records ran once and exited 0 and the bridge
-received State from the simulator. A robot repository adds the same few lines; what the check
+`sim_smoke_test` is `talos_sim_test(sim = ":sim", studio = True)`: it runs `//:sim` with
+those two flags and `--start-studio-bridge --studio-http-port 0` until the bridge has
+accepted a State, `studio_bridge` has settled on its ephemeral port, and every member's
+loop has started, then 1 s more, stops it, and fails unless every member the session
+records (including `studio_bridge`) ran once and exited 0 and the bridge received State
+from the simulator. A robot repository adds the same few lines; what the check
 judges is in `talos_sim_test`'s docstring (`talOS/build/contract.bzl`).
 
 ## Studio
@@ -124,21 +128,45 @@ next `bazel run //:sim` serves them. This robot has no `[studio] dashboard`
 layout, so `/drive` shows no widgets
 ([talOS/telemetry](../../talOS/telemetry/README.md#dashboard-layout)).
 
-`studio_test` runs `//:sim --start-studio-bridge` on free ports until the
-launcher reports the bridge up. It requires `/drive` to answer with the page
-when `//:studio_webroot` holds no `NOT_BUILT.txt`, else with that command
-naming `//:studio_webroot`'s folder and a talOS checkout that exists (so a
-webroot the config or `//:sim`'s `data` miswires fails it). It then stops
-the session and requires the bridge to have run once and exited 0. It runs
-outside Bazel's sandbox, which would stage each page as a link out of the
-webroot, a file the bridge does not serve. It is not a `talos_sim_test`, which waits for every
-member's registry row; the bridge takes none.
+`studio_test` runs `//:sim --start-studio-bridge --studio-http-port 0` until the
+manifest records the bridge's bound `http_port`. It requires `/drive` to answer
+HTTP 200 with the HTML page when `//:studio_webroot` holds no `NOT_BUILT.txt`,
+else 503 with the build command naming `//:studio_webroot`'s folder and a talOS
+checkout that exists (so a webroot the config or `//:sim`'s `data` miswires
+fails it); setting `--test_env=TALOS_REQUIRE_STUDIO_PAGES=1` fails the test if
+the pages are not built. It then stops the session and requires the bridge to
+have run once and exited 0. It runs outside Bazel's sandbox, which would stage
+each page as a link out of the webroot, a file the bridge does not serve.
+Unlike `sim_smoke_test` (which checks process lifecycle and registration via
+`talos_sim_test(..., studio = True)`), `studio_test` verifies the served HTTP
+`/drive` and webroot responses.
 
-`robot_bundle` carries no Studio: `talos_bundle` refuses a webroot without
-`index.html`, and this fixture's checks run where the pages are not built.
-A robot repository that builds them adds
+**Stale-pin detection:** `//studio:web_dist` writes `STUDIO_STAMP.txt` into
+`bazel-bin/studio/dist` holding a deterministic SHA-256 over Studio's web
+inputs (`studio/src/**`, its HTML/config/lock files, and
+`talOS/telemetry/telemetry.fbs`). `studio_web` checks that stamp against the
+pinned `@talos` checkout whenever built pages exist. If the talOS pin moves (or
+Studio's inputs change) without rebuilding `//studio:web_dist`, `studio_web`
+writes `STALE.txt` instead of symlinking the old pages, and building
+`//:studio_webroot`, `//:sim`, or a Studio-bearing `talos_bundle` fails closed
+printing the expected and actual stamps and the exact rebuild command
+(`(cd <talOS checkout> && bazel build //studio:web_dist)`), while `bazel query`
+and targets that do not use `//:studio_webroot` still load and build.
+
+**Fresh clones, bundles, and CI:** On a fresh clone before `//studio:web_dist`
+has been built, `bazel test //...` (with `TALOS_REQUIRE_STUDIO_PAGES` unset)
+still passes because `//:studio_webroot` carries `NOT_BUILT.txt`. `robot_bundle`
+carries no Studio here because `talos_bundle` refuses a `studio_webroot`
+without `index.html` and `drive.html`; a robot repository that adds
 `studio_bridge = "@talos//studio/bridge:studio_bridge"` and
-`studio_webroot = ":studio_webroot"` to its `talos_bundle`.
+`studio_webroot = ":studio_webroot"` to its `talos_bundle` (and any CI job that
+exercises Studio pages end to end) must build `//studio:web_dist` in the talOS
+checkout first:
+
+```sh
+(cd <talOS checkout> && bazel build //studio:web_dist)
+bazel test --test_env=TALOS_REQUIRE_STUDIO_PAGES=1 //...
+```
 
 ## What a robot repository names by `@talos//`
 
@@ -151,8 +179,11 @@ repository name nothing.
 
 `bazel build --config=release //:robot_bundle` builds what the robot's main
 processor installs, stamped with this repository's git revision
-(`.bazelrc`'s `--workspace_status_command`, talOS's
-`tools/workspace_status.sh` run here), and `@talos//tools:deploy.sh install`
+(`git_revision`, `git_dirty`) and, when talOS is a separate git checkout,
+talOS's git revision (`talos_git_revision`, `talos_git_dirty`, both emitted by
+`.bazelrc`'s `--workspace_status_command`, talOS's `tools/workspace_status.sh`
+run here, and reported by `manifest.json`, `session_report`, and `deploy.sh
+logs`), and `@talos//tools:deploy.sh install`
 installs it ([docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)).
 `bundle_install_test` (e2e, about 2 s) does that into a scratch prefix: the
 install exits 0 with no warm-up warning (its graph check ran the bundle's
@@ -164,6 +195,15 @@ that leaves it or a file naming Bazel's output base or either checkout, so
 the bundle runs where the build tree is not. A robot repository gets the
 same test: talOS's own bundle tests install bundles built inside talOS,
 never one built under `@talos`'s external name.
+
+To build or deploy the RoboRIO gateway program from this repository, run
+`bazel run @talos//controller_processor/rio:gradlew -- buildRio -Pcompanion=<ipv4>`
+or `bazel run @talos//controller_processor/rio:gradlew -- deploy -Pcompanion=<ipv4> -PteamNumber=<team>`
+(or commit `.wpilib/wpilib_preferences.json` with `"teamNumber"` in the robot
+repository; talOS carries no default team number or companion address). It
+stages the Gradle project and required `talOS/` sources into a cache directory
+without modifying the talOS checkout and stamps `-PtalosRevision` and
+`-PtalosDirty` from `@talos`.
 
 ## Requirements
 

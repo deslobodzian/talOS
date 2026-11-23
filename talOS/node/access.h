@@ -19,6 +19,7 @@
 #include <variant>
 #include <vector>
 
+#include "talOS/node/node_detail.h"
 #include "talOS/schema/identity.h"
 
 namespace talos {
@@ -57,6 +58,10 @@ struct NodeSetup {
   std::shared_ptr<const config::RobotConfig> config;  // parsed config_path
   bool simulation = false;
   bool describing = false;  // --describe: Node::describing()
+  // --targeted-outputs: set by the launcher when --describe declared a
+  // hardware_request endpoint without untargeted_outputs (REQ-SAFE-42), so
+  // mark_untargeted_outputs is refused at construction.
+  bool require_targeted_outputs = false;
   LoopPort* loop = nullptr;
   GraphSource graph;  // unset: no graph (null)
   // The session output directory the launcher started this node under (the
@@ -65,20 +70,6 @@ struct NodeSetup {
   std::optional<std::filesystem::path> session_dir;
 };
 
-// The user's object, type-erased so the runner and the harness need not be
-// templates. The factory builds it against a Node and installs its update().
-using Instance = std::shared_ptr<void>;
-using InstanceFactory = std::function<Instance(Node&)>;
-
-template <class T>
-InstanceFactory MakeInstance();  // node.h
-
-// The binary's main: flags, describe/replay/realtime, logging, the live
-// registry.
-int RunMain(int argc, char** argv, const char* node_name,
-            const char* node_target, const InstanceFactory& make);
-
-using MessageCallback = std::function<void(const void*)>;
 using ParamValue = std::variant<bool, std::int64_t, double, std::string,
                                 std::vector<std::string>, std::vector<double>>;
 
@@ -244,8 +235,10 @@ struct NodeAccess {
   // talos::AllowUntargetedOutputs (talOS/devices/devices.h): the devices
   // flush gates this node's outputs on robot_enabled alone, and describe and
   // the registry mark its hardware request with
-  // naming::kSourceFlagUntargetedOutputs. Constructor only: afterwards it
-  // throws std::logic_error naming the node.
+  // naming::kSourceFlagUntargetedOutputs. Constructor only, and refused when
+  // the node was started with --targeted-outputs (its --describe probe
+  // declared a hardware request without untargeted_outputs): throws
+  // std::logic_error naming the node.
   static void mark_untargeted_outputs(Node& node);
   static bool untargeted_outputs(const Node& node);
   // Whether the devices flush is holding back outputs this node set: its

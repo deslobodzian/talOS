@@ -56,7 +56,7 @@ class Sim:
     def __init__(self, config_path=None, *, _handle=None):
         self._handle = _handle or _abi.handle(
             lib.talos_sim_create(_abi.encode(config_path)))
-        self._nodes = []  # (Node, object) per node, alive with the sim
+        self._nodes = {}  # node_name -> (Node, object), alive while hosted
 
     @classmethod
     def from_toml(cls, robot_toml):
@@ -77,22 +77,53 @@ class Sim:
             # Garbage collection may finalize this Sim while other objects
             # of the same unreachable cycle still hold its nodes: their
             # handles now raise instead of reaching freed memory.
-            for node, _ in self._nodes:
+            for node, _ in self._nodes.values():
                 node._native = None
+                node._callbacks.clear()
+            self._nodes.clear()
             lib.talos_sim_destroy(handle)
 
     def add(self, cls, node_name):
-        """Builds cls on a node named node_name; returns the object."""
-        factory = talos._factory(cls, self._nodes, self)
-        _abi.handle(lib.talos_sim_add(self._handle, _abi.encode(node_name),
-                                      factory, None))
-        return self._nodes[-1][1]
+        """Builds cls on a node named node_name; returns the object.
+
+        May be called before or after step(): a node added mid-run starts at
+        now_ns and receives only messages published after it attached."""
+        key = node_name.decode() if isinstance(node_name, bytes) else node_name
+        built = []
+        factory = talos._factory(cls, built, self)
+        try:
+            _abi.handle(lib.talos_sim_add(self._handle, _abi.encode(node_name),
+                                          factory, None))
+        except BaseException:
+            for node, _ in built:
+                node._native = None
+                node._callbacks.clear()
+                node._owner = None
+            raise
+        node, obj = built[0]
+        self._nodes[key] = (node, obj)
+        return obj
+
+    def remove(self, node_name):
+        """Stops and removes node_name, destroying its native node.
+
+        The name may be added again later; any existing wrapper for the
+        removed node raises TalosError."""
+        _abi.ok(lib.talos_sim_remove(self._handle, _abi.encode(node_name)))
+        key = node_name.decode() if isinstance(node_name, bytes) else node_name
+        entry = self._nodes.pop(key, None)
+        if entry is not None:
+            node, _ = entry
+            node._native = None
+            node._callbacks.clear()
+            node._owner = None
 
     def node(self, node_name):
         """The talos.Node add() built for node_name."""
         handle = _abi.handle(
             lib.talos_sim_node(self._handle, _abi.encode(node_name)))
-        return next(node for node, _ in self._nodes if node._native == handle)
+        return next(node for node, _ in self._nodes.values()
+                    if node._native == handle)
 
     def step(self, seconds):
         """Advances virtual time, running every node's timers and messages."""
@@ -111,16 +142,20 @@ class Sim:
     def now(self):
         """The Sim clock in float seconds; exact below 2**51 ns (26 days).
         Compare times, and build message times, with now_ns."""
-        return lib.talos_sim_now_ns(self._handle) / _NS
+        return self.now_ns / _NS
 
     @property
     def now_ns(self):
         """The Sim clock in integer nanoseconds (C++ sim.now().nanos()),
         equal to every node's now_ns."""
-        return lib.talos_sim_now_ns(self._handle)
+        return _abi.value(lib.talos_sim_now_ns(self._handle), 0)
 
-    def publish(self, msg, topic, message=None, **fields):
+    def publish(self, msg, topic, message=None, /, **fields):
         """Publishes on `topic`, like Publisher.send."""
+        if message is not None and fields:
+            raise TypeError(
+                "publish() takes either a message or field keyword arguments, "
+                "not both")
         mtype = message_type(msg)
         data = mtype.forward(message) if message is not None else (
             mtype.encode(fields))
@@ -140,14 +175,19 @@ class Sim:
         """The Driver Station mode generation a producer that has drained
         the newest /hw/state/driver_station packet stamps on its lanes: the
         packet's mode_since_us while it names a mode, else 0."""
-        return lib.talos_sim_driver_station_generation(self._handle)
+        return _abi.value(
+            lib.talos_sim_driver_station_generation(self._handle), 0)
 
-    def publish_target(self, msg, subsystem, source, message=None, *,
+    def publish_target(self, msg, subsystem, source, message=None, /, *,
                        mode_since_us=None, **fields):
         """Publishes an active target on /<subsystem>/target/<source>, as a
         talos.TargetLane would: stamped with driver_station_generation, or
         with `mode_since_us` for a producer that has not seen the current
         mode (a target queued from an earlier one, a stale view: 0)."""
+        if message is not None and fields:
+            raise TypeError(
+                "publish_target() takes either a message or field keyword "
+                "arguments, not both")
         mtype = message_type(msg)
         data = mtype.forward(message) if message is not None else (
             mtype.encode(fields))
@@ -332,50 +372,51 @@ class SimHardware:
         """Last explicitly requested (mode, demand, ff_volts, slot), neutral
         before any request. Expiry, omitted outputs and disable do not alter
         it."""
-        out = _abi.MotorRequest()
-        _abi.ok(lib.talos_sim_hardware_motor_request(
-            self._handle, _abi.encode(node), _abi.encode(device), out))
-        return MotorRequest(talos.Mode(out.mode), out.demand, out.ff_volts,
-                            out.slot)
+        return self._motor(lib.talos_sim_hardware_motor_request, node, device)
 
     def digital_output(self, node, device):
         """Last explicitly requested digital value (False before any)."""
-        return bool(_abi.ok(lib.talos_sim_hardware_digital_output(
-            self._handle, _abi.encode(node), _abi.encode(device))))
+        return self._digital_output(
+            lib.talos_sim_hardware_digital_output, node, device)
 
     def pwm(self, node, device):
         """The pulse the last request carrying this PWM output asked for (0
         is the centre pulse), None when it asked for no pulse or none
         carried it."""
-        out = ctypes.c_double()
-        pulsing = _abi.ok(lib.talos_sim_hardware_pwm(
-            self._handle, _abi.encode(node), _abi.encode(device), out))
-        return out.value if pulsing else None
+        return self._pwm(lib.talos_sim_hardware_pwm, node, device)
 
     def applied_motor(self, node, device):
         """Applied (mode, demand, ff_volts, slot), after expiry/neutral gates."""
-        out = _abi.MotorRequest()
-        _abi.ok(lib.talos_sim_hardware_applied_motor(
-            self._handle, _abi.encode(node), _abi.encode(device), out))
-        return MotorRequest(talos.Mode(out.mode), out.demand, out.ff_volts,
-                            out.slot)
+        return self._motor(lib.talos_sim_hardware_applied_motor, node, device)
 
     def applied_digital_output(self, node, device):
         """Applied digital value, False on expiry, omission or disable."""
-        return bool(_abi.ok(lib.talos_sim_hardware_applied_digital_output(
-            self._handle, _abi.encode(node), _abi.encode(device))))
+        return self._digital_output(
+            lib.talos_sim_hardware_applied_digital_output, node, device)
 
     def applied_pwm(self, node, device):
         """Applied PWM pulse; None (no pulse) on expiry, omission, disable,
         stop() or a non-finite set."""
+        return self._pwm(lib.talos_sim_hardware_applied_pwm, node, device)
+
+    def _motor(self, function, node, device):
+        out = _abi.MotorRequest()
+        self._set(function, node, device, out)
+        return MotorRequest(talos.Mode(out.mode), out.demand, out.ff_volts,
+                            out.slot)
+
+    def _digital_output(self, function, node, device):
+        return _abi.boolean(function(
+            self._handle, _abi.encode(node), _abi.encode(device)))
+
+    def _pwm(self, function, node, device):
         out = ctypes.c_double()
-        pulsing = _abi.ok(lib.talos_sim_hardware_applied_pwm(
-            self._handle, _abi.encode(node), _abi.encode(device), out))
+        pulsing = self._set(function, node, device, out)
         return out.value if pulsing else None
 
     def _set(self, function, node, device, *values):
-        _abi.ok(function(self._handle, _abi.encode(node), _abi.encode(device),
-                         *values))
+        return _abi.ok(function(
+            self._handle, _abi.encode(node), _abi.encode(device), *values))
 
 
 def _joystick(stick):

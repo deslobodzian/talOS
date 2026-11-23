@@ -16,6 +16,9 @@ cc_library(
         "image_sequence.h",
         "recorded_source.h",
     ],
+    implementation_deps = [
+        "//talOS/process",
+    ],
     deps = [
         "//talOS/events:events_core",
         "//talOS/vision:camera_source",
@@ -32,6 +35,7 @@ cc_test(
     srcs = ["playback_test.cc"],
     deps = [
         ":playback",
+        "//talOS/process",
         "//talOS/vision:pipeline",
         "//talOS/vision/field_sim",
         "//talOS/vision/field_sim:field_sim_patterns",

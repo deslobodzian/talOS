@@ -49,7 +49,8 @@ TrajectorySample ConstantAcceleration(const TrajectorySample& a, double t_s) {
 TrajectorySample Hermite(const TrajectorySample& a, const TrajectorySample& b,
                          double t_s) {
   const double dt = b.t_s - a.t_s;
-  const double u = (t_s - a.t_s) / dt;
+  const double dt2 = dt * dt;
+  const double u = dt > 0.0 ? std::clamp((t_s - a.t_s) / dt, 0.0, 1.0) : 0.0;
   const double u2 = u * u;
   const double u3 = u2 * u;
   struct Axis {
@@ -58,18 +59,36 @@ TrajectorySample Hermite(const TrajectorySample& a, const TrajectorySample& b,
     double acceleration;
   };
   const auto axis = [&](double p0, double v0, double p1, double v1) {
+    if (!(dt2 > 0.0 && std::isfinite(dt2))) {
+      return Axis{
+          (1.0 - u) * p0 + u * p1,
+          (1.0 - u) * v0 + u * v1,
+          0.0,
+      };
+    }
+    const double pos = (2 * u3 - 3 * u2 + 1) * p0 +
+                       (u3 - 2 * u2 + u) * dt * v0 + (-2 * u3 + 3 * u2) * p1 +
+                       (u3 - u2) * dt * v1;
+    const double vel = (6 * u2 - 6 * u) * (p0 - p1) / dt +
+                       (3 * u2 - 4 * u + 1) * v0 + (3 * u2 - 2 * u) * v1;
+    const double acc = (12 * u - 6) * (p0 - p1) / dt2 + (6 * u - 4) * v0 / dt +
+                       (6 * u - 2) * v1 / dt;
+    if (std::isfinite(pos) && std::isfinite(vel) && std::isfinite(acc)) {
+      return Axis{pos, vel, acc};
+    }
     return Axis{
-        (2 * u3 - 3 * u2 + 1) * p0 + (u3 - 2 * u2 + u) * dt * v0 +
-            (-2 * u3 + 3 * u2) * p1 + (u3 - u2) * dt * v1,
-        (6 * u2 - 6 * u) * (p0 - p1) / dt + (3 * u2 - 4 * u + 1) * v0 +
-            (3 * u2 - 2 * u) * v1,
-        (12 * u - 6) * (p0 - p1) / (dt * dt) + (6 * u - 4) * v0 / dt +
-            (6 * u - 2) * v1 / dt,
+        (1.0 - u) * p0 + u * p1,
+        (1.0 - u) * v0 + u * v1,
+        0.0,
     };
   };
   // The end heading taken the shorter way round from the start heading.
-  const double heading_end =
-      a.heading_rad + WrapAngle(b.heading_rad - a.heading_rad);
+  const double heading_diff = b.heading_rad - a.heading_rad;
+  const double wrapped_diff =
+      std::isfinite(heading_diff)
+          ? WrapAngle(heading_diff)
+          : WrapAngle(WrapAngle(b.heading_rad) - WrapAngle(a.heading_rad));
+  const double heading_end = a.heading_rad + wrapped_diff;
   const Axis x = axis(a.x_m, a.vx_mps, b.x_m, b.vx_mps);
   const Axis y = axis(a.y_m, a.vy_mps, b.y_m, b.vy_mps);
   const Axis h = axis(a.heading_rad, a.omega_radps, heading_end, b.omega_radps);

@@ -56,6 +56,14 @@ def main(argv):
         for rpath, is_empty in parse(manifest):
             (empty if is_empty else real)[rpath].add(name)
 
+    if count == 0:
+        print(
+            f"check_runfiles_collisions: no *.runfiles_manifest files found "
+            f"under {root}; run `bazel build //...` first",
+            file=sys.stderr,
+        )
+        return 2
+
     errors = []
     for rpath in sorted(empty):
         if rpath in real:

@@ -38,15 +38,21 @@ clang18_base "$base_arg"
 
 pat=('*.c' '*.cc' '*.cpp' '*.h' '*.hpp' ':!third_party/')
 files=()
+tmp_dir="${TMPDIR:-/tmp}"
+list_file="$(mktemp "${tmp_dir%/}/talos-format.XXXXXX")"
+trap 'rm -f "$list_file"' EXIT
 if [ -z "$BASE" ]; then
-  while IFS= read -r -d '' f; do files+=("$f"); done < <(git ls-files -z -- "${pat[@]}")
+  git ls-files -z -- "${pat[@]}" > "$list_file"
+  while IFS= read -r -d '' f; do files+=("$f"); done < "$list_file"
 else
+  git diff --name-only --diff-filter=d -z "$BASE" -- "${pat[@]}" > "$list_file"
   while IFS= read -r -d '' f; do
-    [ -f "$f" ] && files+=("$f")
-  done < <(git diff --name-only --diff-filter=d -z "$BASE" -- "${pat[@]}")
+    if [ -f "$f" ]; then files+=("$f"); fi
+  done < "$list_file"
+  git ls-files --others --exclude-standard -z -- "${pat[@]}" > "$list_file"
   while IFS= read -r -d '' f; do
-    [ -f "$f" ] && files+=("$f")
-  done < <(git ls-files --others --exclude-standard -z -- "${pat[@]}")
+    if [ -f "$f" ]; then files+=("$f"); fi
+  done < "$list_file"
 fi
 [ ${#files[@]} -gt 0 ] || { echo "format: no C/C++ files to check"; exit 0; }
 

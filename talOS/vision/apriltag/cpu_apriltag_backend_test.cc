@@ -1,6 +1,8 @@
 #include "talOS/vision/apriltag/cpu_apriltag_backend.h"
 
 #include <gtest/gtest.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -479,6 +481,59 @@ TEST(CpuAprilTagBackendTest, DetectorPoolThreadsRunAtBackgroundPriority) {
 
   EXPECT_EQ(probe.arrived, 3);
   EXPECT_EQ(probe.background, 3);
+}
+
+TEST(CpuAprilTagBackendTest, RejectsPositiveStrideSmallerThanWidth) {
+  const long raw_page = ::sysconf(_SC_PAGESIZE);
+  ASSERT_GT(raw_page, 0);
+  const size_t page_size = static_cast<size_t>(raw_page);
+  void* mapping = ::mmap(nullptr, 2 * page_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+  ASSERT_NE(mapping, MAP_FAILED);
+  auto* base = static_cast<uint8_t*>(mapping);
+  ASSERT_EQ(::mprotect(base + page_size, page_size, PROT_NONE), 0);
+
+  constexpr int kWidth = 64;
+  constexpr int kHeight = 4;
+  constexpr int kStride = 32;
+  const size_t valid_bytes = static_cast<size_t>(kStride) * kHeight;
+  uint8_t* ptr = base + page_size - valid_bytes;
+  std::memset(ptr, 128, valid_bytes);
+
+  CpuAprilTagBackend backend;
+  const std::vector<Detection> detections =
+      backend.Detect(ptr, kWidth, kHeight, kStride);
+  EXPECT_TRUE(detections.empty());
+
+  ::munmap(mapping, 2 * page_size);
+}
+
+TEST(CpuAprilTagBackendTest, NegativeQuadSigmaDoesNotMutateCallerBuffer) {
+  const std::string src_path = GetTestdataPath("scene_single_tag0.png");
+  image_u8_t* src_im = LoadGrayImageU8(src_path);
+  ASSERT_NE(src_im, nullptr);
+  const int w = src_im->width;
+  const int h = src_im->height;
+  std::vector<uint8_t> raw(static_cast<size_t>(w) * h);
+  for (int y = 0; y < h; ++y) {
+    std::memcpy(&raw[static_cast<size_t>(y) * w],
+                src_im->buf + static_cast<size_t>(y) * src_im->stride,
+                static_cast<size_t>(w));
+  }
+  image_u8_destroy(src_im);
+  const std::vector<uint8_t> original = raw;
+
+  DetectorOptions options;
+  options.family_name = "tag36h11";
+  options.quad_decimate = 1.0f;
+  options.quad_sigma = -0.8f;
+  options.threads = 1;
+  CpuAprilTagBackend backend(options);
+
+  const std::vector<Detection> detections = backend.Detect(raw.data(), w, h, w);
+  EXPECT_EQ(raw, original);
+  ASSERT_EQ(detections.size(), 1u);
+  EXPECT_EQ(detections[0].id, 0);
 }
 
 }  // namespace talos::vision::apriltag

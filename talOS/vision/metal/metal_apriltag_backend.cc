@@ -115,25 +115,19 @@ struct MetalAprilTagBackend::Impl {
   MTL::Library* library{nullptr};
   MTL::CommandQueue* queue{nullptr};
   MTL::ComputePipelineState* pso_rgb_to_gray{nullptr};
-  MTL::ComputePipelineState* pso_decimate_2x{nullptr};
   MTL::ComputePipelineState* pso_rgb_to_gray_decimate_2x{nullptr};
-  MTL::ComputePipelineState* pso_grad_thresh{nullptr};
-  MTL::ComputePipelineState* pso_cand_mask{nullptr};
   MTL::ComputePipelineState* pso_tile_min_max_4x4{nullptr};
   MTL::ComputePipelineState* pso_tile_blur_and_threshold{nullptr};
 
   MTL::Buffer* cached_in_buf{nullptr};
   size_t cached_in_capacity{0};
   MTL::Buffer* cached_gray_buf{nullptr};
-  MTL::Buffer* cached_grad_mag_buf{nullptr};
-  MTL::Buffer* cached_grad_dir_buf{nullptr};
   MTL::Buffer* cached_thresh_buf{nullptr};
   size_t cached_thresh_capacity{0};
   MTL::Buffer* cached_im_min_buf{nullptr};
   size_t cached_im_min_capacity{0};
   MTL::Buffer* cached_im_max_buf{nullptr};
   size_t cached_im_max_capacity{0};
-  MTL::Buffer* cached_cand_mask_buf{nullptr};
   size_t cached_gray_capacity{0};
   MTL::Buffer* cached_dec_buf{nullptr};
   size_t cached_dec_capacity{0};
@@ -202,14 +196,6 @@ struct MetalAprilTagBackend::Impl {
       cached_gray_buf->release();
       cached_gray_buf = nullptr;
     }
-    if (cached_grad_mag_buf) {
-      cached_grad_mag_buf->release();
-      cached_grad_mag_buf = nullptr;
-    }
-    if (cached_grad_dir_buf) {
-      cached_grad_dir_buf->release();
-      cached_grad_dir_buf = nullptr;
-    }
     if (cached_thresh_buf) {
       cached_thresh_buf->release();
       cached_thresh_buf = nullptr;
@@ -221,10 +207,6 @@ struct MetalAprilTagBackend::Impl {
     if (cached_im_max_buf) {
       cached_im_max_buf->release();
       cached_im_max_buf = nullptr;
-    }
-    if (cached_cand_mask_buf) {
-      cached_cand_mask_buf->release();
-      cached_cand_mask_buf = nullptr;
     }
     if (cached_dec_buf) {
       cached_dec_buf->release();
@@ -270,21 +252,9 @@ struct MetalAprilTagBackend::Impl {
       pso_rgb_to_gray->release();
       pso_rgb_to_gray = nullptr;
     }
-    if (pso_decimate_2x) {
-      pso_decimate_2x->release();
-      pso_decimate_2x = nullptr;
-    }
     if (pso_rgb_to_gray_decimate_2x) {
       pso_rgb_to_gray_decimate_2x->release();
       pso_rgb_to_gray_decimate_2x = nullptr;
-    }
-    if (pso_grad_thresh) {
-      pso_grad_thresh->release();
-      pso_grad_thresh = nullptr;
-    }
-    if (pso_cand_mask) {
-      pso_cand_mask->release();
-      pso_cand_mask = nullptr;
     }
     if (pso_tile_min_max_4x4) {
       pso_tile_min_max_4x4->release();
@@ -325,52 +295,7 @@ struct MetalAprilTagBackend::Impl {
       compile_options->release();
 
       if (library != nullptr) {
-        NS::String* n_rgb =
-            NS::String::string("rgb_to_gray", NS::UTF8StringEncoding);
-        NS::String* n_dec =
-            NS::String::string("decimate_2x", NS::UTF8StringEncoding);
-        NS::String* n_fused = NS::String::string("rgb_to_gray_decimate_2x",
-                                                 NS::UTF8StringEncoding);
-        NS::String* n_gt = NS::String::string("gradient_and_threshold",
-                                              NS::UTF8StringEncoding);
-        NS::String* n_cm =
-            NS::String::string("candidate_mask", NS::UTF8StringEncoding);
-        NS::String* n_tmm =
-            NS::String::string("tile_min_max_4x4", NS::UTF8StringEncoding);
-        NS::String* n_tbt = NS::String::string("tile_blur_and_threshold",
-                                               NS::UTF8StringEncoding);
-
-        MTL::Function* fn_rgb = library->newFunction(n_rgb);
-        MTL::Function* fn_dec = library->newFunction(n_dec);
-        MTL::Function* fn_fused = library->newFunction(n_fused);
-        MTL::Function* fn_gt = library->newFunction(n_gt);
-        MTL::Function* fn_cm = library->newFunction(n_cm);
-        MTL::Function* fn_tmm = library->newFunction(n_tmm);
-        MTL::Function* fn_tbt = library->newFunction(n_tbt);
-
-        NS::Error* pso_err = nullptr;
-        pso_rgb_to_gray = device->newComputePipelineState(fn_rgb, &pso_err);
-        pso_decimate_2x = device->newComputePipelineState(fn_dec, &pso_err);
-        pso_rgb_to_gray_decimate_2x =
-            device->newComputePipelineState(fn_fused, &pso_err);
-        pso_grad_thresh = device->newComputePipelineState(fn_gt, &pso_err);
-        pso_cand_mask = device->newComputePipelineState(fn_cm, &pso_err);
-        pso_tile_min_max_4x4 =
-            device->newComputePipelineState(fn_tmm, &pso_err);
-        pso_tile_blur_and_threshold =
-            device->newComputePipelineState(fn_tbt, &pso_err);
-
-        fn_rgb->release();
-        fn_dec->release();
-        fn_fused->release();
-        fn_gt->release();
-        fn_cm->release();
-        fn_tmm->release();
-        fn_tbt->release();
-
-        // Stage 2: GPU CCL + edge candidates. Tolerate nullptr (missing kernel
-        // or PSO failure auto-disables Stage 2; Stage 1 remains the default).
-        auto make_stage2_pso = [&](const char* kernel_name) {
+        auto make_pso = [&](const char* kernel_name) {
           NS::String* n =
               NS::String::string(kernel_name, NS::UTF8StringEncoding);
           MTL::Function* fn = library->newFunction(n);
@@ -383,18 +308,33 @@ struct MetalAprilTagBackend::Impl {
           fn->release();
           return pso;
         };
-        pso_ccl_init = make_stage2_pso("ccl_init");
-        pso_ccl_union = make_stage2_pso("ccl_union_pass");
-        pso_ccl_flatten = make_stage2_pso("ccl_flatten");
-        pso_ccl_sizes = make_stage2_pso("ccl_compute_sizes");
-        pso_extract_cands = make_stage2_pso("extract_edge_candidates");
 
-        if (pso_rgb_to_gray && pso_decimate_2x && pso_rgb_to_gray_decimate_2x &&
-            pso_grad_thresh && pso_cand_mask && pso_tile_min_max_4x4 &&
-            pso_tile_blur_and_threshold) {
+        pso_rgb_to_gray = make_pso("rgb_to_gray");
+        pso_rgb_to_gray_decimate_2x = make_pso("rgb_to_gray_decimate_2x");
+        pso_tile_min_max_4x4 = make_pso("tile_min_max_4x4");
+        pso_tile_blur_and_threshold = make_pso("tile_blur_and_threshold");
+
+        // Stage 2: GPU CCL + edge candidates. Tolerate nullptr (missing kernel
+        // or PSO failure auto-disables Stage 2; Stage 1 remains the default).
+        pso_ccl_init = make_pso("ccl_init");
+        pso_ccl_union = make_pso("ccl_union_pass");
+        pso_ccl_flatten = make_pso("ccl_flatten");
+        pso_ccl_sizes = make_pso("ccl_compute_sizes");
+        pso_extract_cands = make_pso("extract_edge_candidates");
+
+        if (pso_rgb_to_gray && pso_rgb_to_gray_decimate_2x &&
+            pso_tile_min_max_4x4 && pso_tile_blur_and_threshold) {
           queue = device->newCommandQueue();
-          device_name = device->name()->utf8String();
-          is_fallback = false;
+          if (queue != nullptr) {
+            const NS::String* name = device->name();
+            device_name = (name != nullptr && name->utf8String() != nullptr)
+                              ? name->utf8String()
+                              : "Metal";
+            is_fallback = false;
+          } else {
+            is_fallback = true;
+            device_name = "CPU (Command queue creation failed)";
+          }
         } else {
           is_fallback = true;
           device_name = "CPU (Pipeline creation failed)";
@@ -512,7 +452,7 @@ struct MetalAprilTagBackend::Impl {
         if (cached_in_buf) cached_in_buf->release();
         cached_in_buf =
             device->newBuffer(in_bytes, MTL::ResourceStorageModeShared);
-        cached_in_capacity = in_bytes;
+        cached_in_capacity = (cached_in_buf != nullptr) ? in_bytes : 0;
       }
       if (!cached_in_buf || !cached_in_buf->contents()) return cpu_fallback();
       std::memcpy(cached_in_buf->contents(), data, in_bytes);
@@ -521,16 +461,20 @@ struct MetalAprilTagBackend::Impl {
     if (!in_buf->contents()) return cpu_fallback();
 
     const bool use_gpu_decimated = (options.quad_decimate >= 2.0f);
+    // Match upstream image_u8_decimate(..., 2.0f): ceil dims 1 + (dim - 1) / 2.
+    const int detect_w = use_gpu_decimated ? (1 + (width - 1) / 2) : width;
+    const int detect_h = use_gpu_decimated ? (1 + (height - 1) / 2) : height;
     MTL::Buffer* dec_buf = nullptr;
     MTL::Buffer* gray_buf = nullptr;
 
     if (use_gpu_decimated) {
-      uint32_t dec_bytes = (width / 2) * (height / 2);
+      const size_t dec_bytes =
+          static_cast<size_t>(detect_w) * static_cast<size_t>(detect_h);
       if (!cached_dec_buf || cached_dec_capacity < dec_bytes) {
         if (cached_dec_buf) cached_dec_buf->release();
         cached_dec_buf =
             device->newBuffer(dec_bytes, MTL::ResourceStorageModeShared);
-        cached_dec_capacity = dec_bytes;
+        cached_dec_capacity = (cached_dec_buf != nullptr) ? dec_bytes : 0;
       }
       dec_buf = cached_dec_buf;
     }
@@ -538,7 +482,7 @@ struct MetalAprilTagBackend::Impl {
       if (cached_gray_buf) cached_gray_buf->release();
       cached_gray_buf =
           device->newBuffer(gray_bytes, MTL::ResourceStorageModeShared);
-      cached_gray_capacity = gray_bytes;
+      cached_gray_capacity = (cached_gray_buf != nullptr) ? gray_bytes : 0;
     }
     gray_buf = cached_gray_buf;
     if (!gray_buf || !gray_buf->contents() ||
@@ -546,8 +490,14 @@ struct MetalAprilTagBackend::Impl {
       return cpu_fallback();
     }
 
-    MTL::CommandBuffer* cmd_buf = queue->commandBuffer();
+    MTL::CommandBuffer* cmd_buf = queue ? queue->commandBuffer() : nullptr;
+    if (cmd_buf == nullptr) {
+      return cpu_fallback();
+    }
     MTL::ComputeCommandEncoder* enc = cmd_buf->computeCommandEncoder();
+    if (enc == nullptr) {
+      return cpu_fallback();
+    }
 
     uint32_t w = width;
     uint32_t h = height;
@@ -578,18 +528,16 @@ struct MetalAprilTagBackend::Impl {
       enc->setBytes(&w, sizeof(w), 2);
       enc->setBytes(&h, sizeof(h), 3);
       enc->setBytes(&in_s, sizeof(in_s), 4);
-      uint32_t out_s = width / 2;
+      uint32_t out_s = static_cast<uint32_t>(detect_w);
       enc->setBytes(&out_s, sizeof(out_s), 5);
       enc->setBytes(&fmt, sizeof(fmt), 6);
       MTL::Size dec_tg_count =
-          MTL::Size::Make((width / 2 + 15) / 16, (height / 2 + 15) / 16, 1);
+          MTL::Size::Make((static_cast<NS::UInteger>(detect_w) + 15) / 16,
+                          (static_cast<NS::UInteger>(detect_h) + 15) / 16, 1);
       enc->dispatchThreadgroups(dec_tg_count, tg_size);
     }
 
     enc->memoryBarrier(MTL::BarrierScopeBuffers);
-
-    const int detect_w = use_gpu_decimated ? (width / 2) : width;
-    const int detect_h = use_gpu_decimated ? (height / 2) : height;
 
     image_u8_t im{
         .width = width,
@@ -641,6 +589,7 @@ struct MetalAprilTagBackend::Impl {
     const uint32_t* stage2_sizes = nullptr;
     const uint32_t* stage2_cands = nullptr;
     uint32_t stage2_cand_count = 0;
+    uint32_t stage2_max_cands = 0;
     if (threshim_ptr != nullptr) {
       // Stage 2 (GPU CCL + sparse clustering) is default-ON: parity-proven
       // against CPU on all fixtures. Opt out per-process with
@@ -649,10 +598,12 @@ struct MetalAprilTagBackend::Impl {
       const bool stage2_enabled =
           !(stage2_env != nullptr && stage2_env[0] == '0' &&
             stage2_env[1] == '\0');
+      // 14-bit x/y packing in extract_edge_candidates bounds dims to 16384.
       if (stage2_enabled && pso_ccl_init != nullptr &&
           pso_ccl_union != nullptr && pso_ccl_flatten != nullptr &&
           pso_ccl_sizes != nullptr && pso_extract_cands != nullptr &&
-          detect_w > 0 && detect_h > 0) {
+          detect_w > 0 && detect_h > 0 && detect_w <= 16384 &&
+          detect_h <= 16384) {
         const size_t npix =
             static_cast<size_t>(detect_w) * static_cast<size_t>(detect_h);
         if (npix > 0 && npix <= static_cast<size_t>(64) * 1024 * 1024) {
@@ -748,6 +699,7 @@ struct MetalAprilTagBackend::Impl {
                 static_cast<const uint32_t*>(cached_parent_buf->contents());
             stage2_sizes =
                 static_cast<const uint32_t*>(cached_size_buf->contents());
+            stage2_max_cands = maxc;
           }
         }
       }
@@ -757,17 +709,17 @@ struct MetalAprilTagBackend::Impl {
     cmd_buf->commit();
     cmd_buf->waitUntilCompleted();
     if (cmd_buf->status() != MTL::CommandBufferStatusCompleted) {
-      if (in_buf_needs_release) in_buf->release();
-      pool->release();
-      return CpuDetect(data, width, height, stride, format, p_intrinsics,
-                       tag_size_meters);
+      return cpu_fallback();
     }
-    last_timings.threshold_us = static_cast<uint64_t>(
-        (cmd_buf->GPUEndTime() - cmd_buf->GPUStartTime()) * 1e6);
+    const double gpu_sec = cmd_buf->GPUEndTime() - cmd_buf->GPUStartTime();
+    last_timings.threshold_us =
+        (gpu_sec > 0.0) ? static_cast<uint64_t>(gpu_sec * 1e6) : 0;
     if (stage2_parents != nullptr) {
       const uint32_t count =
           *static_cast<uint32_t*>(cached_cand_count_buf->contents());
-      if (count <= cached_cand_capacity) {
+      // Compare against this frame's maxc (not grow-only cached_cand_capacity)
+      // so overflow falls back to Stage 2a instead of reading stale tail slots.
+      if (count <= stage2_max_cands) {
         stage2_cands =
             static_cast<const uint32_t*>(cached_cand_buf->contents());
         stage2_cand_count = count;
@@ -907,7 +859,7 @@ struct MetalAprilTagBackend::Impl {
                        uint32_t stride, uint32_t min_diff,
                        MTL::ComputeCommandEncoder* shared_encoder = nullptr) {
 #if defined(__APPLE__)
-    if (!cmd_buf || !gray_buf || width == 0 || height == 0) {
+    if (!device || !cmd_buf || !gray_buf || width == 0 || height == 0) {
       return false;
     }
     if (!pso_tile_min_max_4x4 || !pso_tile_blur_and_threshold) {
@@ -928,13 +880,15 @@ struct MetalAprilTagBackend::Impl {
       if (cached_im_min_buf) cached_im_min_buf->release();
       cached_im_min_buf =
           device->newBuffer(min_max_bytes, MTL::ResourceStorageModeShared);
-      cached_im_min_capacity = min_max_bytes;
+      cached_im_min_capacity =
+          (cached_im_min_buf != nullptr) ? min_max_bytes : 0;
     }
     if (!cached_im_max_buf || cached_im_max_capacity < min_max_bytes) {
       if (cached_im_max_buf) cached_im_max_buf->release();
       cached_im_max_buf =
           device->newBuffer(min_max_bytes, MTL::ResourceStorageModeShared);
-      cached_im_max_capacity = min_max_bytes;
+      cached_im_max_capacity =
+          (cached_im_max_buf != nullptr) ? min_max_bytes : 0;
     }
 
     const size_t thresh_bytes = static_cast<size_t>(actual_stride) * height;
@@ -944,7 +898,8 @@ struct MetalAprilTagBackend::Impl {
         if (cached_thresh_buf) cached_thresh_buf->release();
         cached_thresh_buf =
             device->newBuffer(thresh_bytes, MTL::ResourceStorageModeShared);
-        cached_thresh_capacity = thresh_bytes;
+        cached_thresh_capacity =
+            (cached_thresh_buf != nullptr) ? thresh_bytes : 0;
       }
       out_thresh = cached_thresh_buf;
     }
@@ -958,6 +913,9 @@ struct MetalAprilTagBackend::Impl {
     MTL::ComputeCommandEncoder* enc = shared_encoder != nullptr
                                           ? shared_encoder
                                           : cmd_buf->computeCommandEncoder();
+    if (enc == nullptr) {
+      return false;
+    }
 
     // Pass 1: tile_min_max_4x4
     enc->setComputePipelineState(pso_tile_min_max_4x4);
@@ -1156,7 +1114,7 @@ talos::vision::BackendExecutionResult MetalAprilTagBackend::Execute(
         raw.homography[r * 3 + c] = static_cast<float>(det.homography(r, c));
       }
     }
-    raw.valid = (det.hamming == 0);
+    raw.valid = true;
     result.detections.push_back(raw);
   }
 

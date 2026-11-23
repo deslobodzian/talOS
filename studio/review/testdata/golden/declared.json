@@ -1,0 +1,28 @@
+{
+  "describe_version": 1,
+  "session_id": "24149",
+  "can_buses": ["rio"],
+  "nodes": [
+    {
+      "name": "observer",
+      "target": "//studio/review:observer",
+      "sources": [
+        {"kind": "TIMER", "name": "update", "message_bytes": 0},
+        {"kind": "WATCHER", "name": "/shooter/state", "message_bytes": 24, "schema": "review_test.Shot", "schema_hash": "0x4a07032797e5d35e"},
+        {"kind": "WATCHER", "name": "/hw/state/driver_station", "message_bytes": 1436, "schema": "talos.hardware.Packet", "schema_hash": "0x33d751e0cdc32d34"},
+        {"kind": "SENDER", "name": "/observer/status", "message_bytes": 2, "schema": "review_test.Health", "schema_hash": "0xaeda6f8c2f729cb3"}
+      ]
+    },
+    {
+      "name": "shooter",
+      "target": "//studio/review:shooter",
+      "sources": [
+        {"kind": "TIMER", "name": "update", "message_bytes": 0},
+        {"kind": "SENDER", "name": "/shooter/state", "message_bytes": 24, "schema": "review_test.Shot", "schema_hash": "0x4a07032797e5d35e"},
+        {"kind": "SENDER", "name": "/hw/request/shooter", "message_bytes": 1436, "external": true, "schema": "talos.hardware.Packet", "schema_hash": "0x33d751e0cdc32d34"},
+        {"kind": "SENDER", "name": "/shooter/status", "message_bytes": 8, "schema": "review_test.Status", "schema_hash": "0x39b44f438e0644cd"}
+      ]
+    }
+  ],
+  "diagnostics": []
+}

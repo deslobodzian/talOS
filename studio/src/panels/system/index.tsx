@@ -117,7 +117,9 @@ export const systemPanel: PanelDefinition<SystemConfig> = {
   description: 'Nodes, wiring and topic health from the live registry.',
   defaultConfig,
   parseConfig,
-  component: SystemPanel
+  component: SystemPanel,
+  recorded: false,
+  liveOnlyReason: 'Live-only: System reads the live shared-memory registry (node heartbeats, wiring and topic rates), which is not stored in .tlog recordings. Use Session or Health for recorded process history and declared graphs.'
 };
 
 export {NodeCard, Wiring, TopicTable, DeclaredPanel, GraphVersionNotice};

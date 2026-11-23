@@ -3,6 +3,11 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
+import React from 'react';
+import {renderToStaticMarkup} from 'react-dom/server';
+
+import {EMPTY_TIMELINE, RecordedSource} from '../src/data/recorded';
+import {createStaticStudio, StudioProvider} from '../src/data/studio';
 import type {EventCategory, RobotEvent, Severity} from '../src/data/types';
 import {eventsPanel} from '../src/panels/events';
 import {
@@ -90,3 +95,63 @@ test('events config parsing accepts valid input and cleans malformed input',
        assert.deepEqual(eventsPanel.parseConfig(eventsPanel.defaultConfig),
                         eventsPanel.defaultConfig);
      });
+
+test('clicking a recorded event row seeks the RecordedSource to its timestamp', () => {
+  const fetchFn = () => new Promise<Response>(() => {});
+  const clock = {now: () => 0, every: () => () => {}};
+  const recorded = new RecordedSource(
+      'http://review.test', 's1', [],
+      {start_ns: '1000000000', end_ns: '5000000000', origin_wall_ns: '0',
+       max_series_values: 1000, max_series_channels: 10, gaps: []},
+      fetchFn, clock,
+      {
+        ...EMPTY_TIMELINE,
+        alerts: [{channel: 'shooter/status/alert_error_jam', level: 'error',
+                  start_ns: '2500000000', end_ns: '3500000000'}]
+      },
+      null);
+  const studio = createStaticStudio();
+  studio.openRecorded(recorded);
+
+  // Inspect the rendered tree to invoke the row's onClick handler directly.
+  const clicks: (() => void)[] = [];
+  function walk(node: unknown) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    const el = node as React.ReactElement<Record<string, unknown>>;
+    if (typeof el.type === 'function') {
+      walk((el.type as (p: unknown) => unknown)(el.props));
+      return;
+    }
+    if (el.props?.className && String(el.props.className).includes('event-row') &&
+        typeof el.props.onClick === 'function') {
+      clicks.push(el.props.onClick as () => void);
+    }
+    if (el.props?.children) walk(el.props.children);
+  }
+  function Probe() {
+    const Component = eventsPanel.component as React.FC<{
+      config: typeof eventsPanel.defaultConfig;
+      setConfig: (c: typeof eventsPanel.defaultConfig) => void;
+      instanceId: string;
+    }>;
+    const out = Component({
+      config: eventsPanel.defaultConfig,
+      setConfig() {},
+      instanceId: 'ev'
+    });
+    walk(out);
+    return null;
+  }
+  renderToStaticMarkup(<StudioProvider studio={studio}><Probe/></StudioProvider>);
+  // Two rows: alert cleared (3.5 s, newest first) and alert raised (2.5 s).
+  assert.equal(clicks.length, 2);
+  clicks[1]();
+  assert.equal(recorded.playback.cursor_ns, '2500000000');
+  clicks[0]();
+  assert.equal(recorded.playback.cursor_ns, '3500000000');
+  studio.closeRecorded();
+});

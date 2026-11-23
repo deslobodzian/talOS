@@ -215,6 +215,7 @@ class WindowedLogReader {
   // The manifest block's entries as stored, in order.
   std::span<const ManifestEntry> manifest_entries() const noexcept;
   MonotonicTime start_time() const noexcept;
+  std::int64_t start_wall_ns() const noexcept;
   const std::string& process_name() const noexcept;
   std::uint64_t session_id() const noexcept;
 

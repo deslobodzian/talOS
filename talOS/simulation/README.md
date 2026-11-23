@@ -53,11 +53,16 @@ The schedules and `--duration-s` count from one time zero on the
 main-processor node clock (`talos::event::Poller::now()`: `CLOCK_MONOTONIC` on
 Linux, `CLOCK_MONOTONIC_RAW` on macOS, which counts host sleep). By default it
 is the gateway's loop start. `--schedule-start-file PATH` instead takes it from
-`PATH`, which a harness writes (atomically, by rename) with the time in
-decimal nanoseconds, so it can start the match once the stack is up and time
-its own actions from the same instant. Until the file exists and its time
-arrives, the gateway holds the schedules' time-zero state (first mode phase,
-time-0 joystick and fault events). Content that is not a non-negative integer
+`PATH`, which the launcher or a harness writes (atomically, by rename) with
+the time in decimal nanoseconds, so it can start the match once the stack is
+up and time its own actions from the same instant. Under `--sim
+--start-sim-gateway`, the launcher passes
+`--schedule-start-file <session_dir>/sim_schedule_start` automatically (unless
+`--sim-gateway-arg` already supplies `--schedule-start-file`) and writes it
+once every non-observer member's loop has started
+([launcher](../launcher/README.md#lightweight-simulation-gateway)). Until the
+file exists and its time arrives, the gateway holds the schedules' time-zero
+state (first mode phase, time-0 joystick and fault events). Content that is not a non-negative integer
 stops the gateway with an error naming the file. A start already past (logged
 to stderr) joins the schedule partway, as does a restarted gateway: fault
 intervals that already ended are skipped, not replayed.
@@ -146,9 +151,21 @@ Physics-only flags (all values must be finite; supplying any without
 | Flag | Default | Meaning |
 |---|---|---|
 | `--start-pose X_M,Y_M,YAW_RAD` | `2,2,0` | Physical field start pose, independent of estimator parameters |
-| `--wheel-radius-error FRAC` | `0` | True radius `0.0508 × (1 + FRAC)` m; strictly `-0.5 < FRAC < 0.5` |
+| `--wheel-radius-error FRAC` | `0` | True radius `wheel_radius_m × (1 + FRAC)` m (`wheel_radius_m` defaults to `0.0508`); strictly `-0.5 < FRAC < 0.5` |
 | `--wheel-slip-gain G` | `0` | Nonnegative acceleration-dependent traction loss |
 | `--gyro-drift-radps R` | `0` | Reported yaw bias grows by `R × elapsed_seconds`, yaw rate gains `R` |
+
+Nominal wheel radius, swerve module coordinates, and mechanical end-of-travel
+hard stops come from the optional top-level `[simulation]` table
+(`wheel_radius_m`, `[[simulation.swerve_modules]]` with `drive`, `steer`,
+`x_m`, `y_m`, and `[[simulation.hard_stops]]` with `motor` and optional
+`min_rot` / `max_rot` in hardware mechanism rotations), falling back to
+`0.0508` m, ±0.30 m name inference, and no hard stops when omitted. Hard stops
+are enforced in `--physics` even when `soft_limits = false` (as required for
+rezero-frame mechanisms), stopping the rotor so back-EMF drops to zero and
+stator current rises for stall homing. `[simulation]` never enters the hardware
+wire format or `ConfigurationId`
+([hardware configuration](../hardware/README.md#configuration)).
 
 Encoders truthfully measure wheel rotations; radius error changes ground
 travel only. Each wheel's slip fraction is
@@ -163,8 +180,11 @@ The ideal backend and WPILib/RoboRIO simulation publish **no** `/sim/state`.
 Their simulated camera nodes emit invalid observations rather than inventing
 truth from odometry.
 
-For ideal/physics backend behavior and model hooks, see
-[hardware simulation backends](../hardware/README.md).
+For ideal/physics backend behavior, model hooks, and choosing between
+`SimBackend`, `sim_gateway --physics` (scripted schedules, `/sim/state` truth,
+and fault injection — no USB gamepad), and WPILib desktop simulation (`./sim.sh`
+with a live USB gamepad), see
+[which simulator to use for what](../hardware/README.md#which-simulator-to-use-for-what).
 
 ## Realtime scheduling
 
@@ -184,7 +204,8 @@ start the bridge and the simulator on a config's non-default ports, with no
 port argument written by hand, and checks that the bridge publishes the
 simulator's State. `sim_gateway_test` (integration, about 1 s) runs the
 simulator alone: `--describe` and its flag checks, a run without a config,
-the Driver Station packets of a mode and joystick schedule, and the home
-switches `--physics` reads from a config. A robot's full-graph tests against the simulator live
+the Driver Station packets of a mode and joystick schedule, the home
+switches `--physics` reads from a config, and `[simulation]` wheel radius and
+swerve module geometry. A robot's full-graph tests against the simulator live
 with the robot (the bench's:
 [bench simulation tests](../../bench/main_processor/simulation/README.md)).

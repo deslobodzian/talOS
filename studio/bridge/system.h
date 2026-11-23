@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "studio/bridge/json_format.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/registry.h"
 
@@ -64,54 +65,6 @@ struct BridgeStats {
   std::uint64_t refused{0};
   std::uint64_t egress_bytes{0};
 };
-
-inline void AppendEscaped(std::string& out, std::string_view value) {
-  out += '"';
-  for (const char c : value) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        // Control characters have no literal form in JSON, and a topic name
-        // should never contain one; emit the escape rather than invalid JSON.
-        if (static_cast<unsigned char>(c) < 0x20) {
-          static constexpr char kHex[] = "0123456789abcdef";
-          out += "\\u00";
-          out += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
-          out += kHex[static_cast<unsigned char>(c) & 0xF];
-        } else {
-          out += c;
-        }
-    }
-  }
-  out += '"';
-}
-
-// uint64 and int64 leave as quoted decimals; see the note at the top.
-inline void AppendU64(std::string& out, std::uint64_t value) {
-  out += '"';
-  out += std::to_string(value);
-  out += '"';
-}
-
-inline void AppendI64(std::string& out, std::int64_t value) {
-  out += '"';
-  out += std::to_string(value);
-  out += '"';
-}
 
 // Where the document's fast values sit: the counters, heartbeats and verdicts
 // that change from one refresh to the next. Everything else is the graph's
@@ -154,15 +107,15 @@ struct TopicRow {
   // still carries the whole count.
   std::uint64_t dropped{0};
 
-  // True when any end of this topic said so. Topic health treats both flags
-  // as the whole topic's. naming::LintGraph does so for `external` only: its
-  // `optional` exempts just the reader that declared it, so a required read
-  // beside an optional one is a lint error while this row shows UNCONNECTED.
-  // A flag describes one endpoint's expectation about its far side: the
-  // sender of `/hw/command` is the only party that knows its subscriber
-  // lives across a UDP link.
+  // True when any end of this topic said so. `external` applies to the whole
+  // topic: the sender of `/hw/command` is the only party that knows its
+  // subscriber lives across a UDP link. `optional` exempts only the reader
+  // that declared it (and observers when another end is optional), matching
+  // naming::LintGraph: `required_reader` tracks whether any non-observer
+  // subscriber declared neither `optional` nor `external`.
   bool external{false};
   bool optional{false};
+  bool required_reader{false};
 };
 
 // What is worth flagging about a topic, in the order a person cares about it.
@@ -213,9 +166,16 @@ inline TopicHealth HealthOf(const TopicRow& row) {
     // A missing end is a fault only when both ends were meant to be here.
     // EXTERNAL is checked first because it is the more specific statement: it
     // says where the far end actually is, not merely that it may be absent.
+    // Matching naming::LintGraph: `external` excuses the whole topic; with no
+    // publisher, `optional` excuses only the reader that declared it (and
+    // observers when another end is optional), so any required subscriber
+    // still makes the topic orphaned.
     if (row.external) return TopicHealth::BRIDGED;
-    if (row.optional) return TopicHealth::UNCONNECTED;
-    return row.publishers.empty() ? TopicHealth::ORPHANED : TopicHealth::UNREAD;
+    if (row.publishers.empty()) {
+      return (row.optional && !row.required_reader) ? TopicHealth::UNCONNECTED
+                                                    : TopicHealth::ORPHANED;
+    }
+    return row.optional ? TopicHealth::UNCONNECTED : TopicHealth::UNREAD;
   }
   if (row.dropped != 0) return TopicHealth::LOSSY;
   if (row.published == 0) return TopicHealth::IDLE;
@@ -249,6 +209,9 @@ inline std::vector<TopicRow> TopicsOf(
       } else {
         row.subscribers.push_back(node.name);
         row.received += source.events;
+        if (!source.optional() && !source.external()) {
+          row.required_reader = true;
+        }
       }
     }
   }
@@ -566,7 +529,8 @@ class GraphFeed {
   static constexpr std::int64_t kResendNs = 2'000'000'000;
   // Past the update interval, so an update only briefly held (the usual case
   // beside telemetry) arrives without a notice; under Studio's one-second
-  // GRAPH_STALE_AFTER_MS, so a held graph never reads as stale.
+  // GRAPH_STALE_AFTER_MS, so a rate-deferred graph does not read as stale
+  // while notices can spend from the shared bucket (docs/DATA_FLOW.md).
   static constexpr std::int64_t kNoticeNs = 750'000'000;
 
   // `afford(bytes)` says whether a message of that many payload bytes may be

@@ -20,7 +20,6 @@ from pathlib import Path
 import platform
 import shutil
 import signal
-import socket
 import statistics
 import struct
 import subprocess
@@ -30,18 +29,9 @@ import time
 import uuid
 
 from python.runfiles import runfiles
+from talOS.build.udp_ports import udp_ports
+from talOS.launcher.tlog_read import SEND, TIMER, node_clock_ns, read_tlog
 from talOS.memory.shm_name import shm_name
-
-# talOS/events/log/format.h (versions 7 and 8). EventKind (events/context.h)
-# and SourceKind (events/manifest.h) both number TIMER 1; EventKind SEND is 4.
-# Only TIMER and SEND records are read, so a GAP record (10, version 8) is
-# passed over like any other kind.
-_FILE = struct.Struct("<8sIIQqqII64sQ")
-_ENTRY = struct.Struct("<HHIIIqq64sQII")
-_RECORD = struct.Struct("<IHHQqqqQIIII")
-_RECORD_MAGIC = 0x54524543
-_VERSIONS = (7, 8)  # OLDEST_READABLE_VERSION to FORMAT_VERSION
-TIMER, SEND = 1, 4
 
 STAGES = [("kill_to_origin", "SIGKILL → event-loop origin"),
           ("origin_to_run", "origin → `run()`"),
@@ -62,47 +52,6 @@ while True:
     os.fsync(fd)
     os.close(fd)
 """
-
-
-def node_clock_ns():
-    """The clock a node stamps its event log with (talOS/events Poller)."""
-    clock = time.CLOCK_MONOTONIC_RAW if sys.platform == "darwin" else time.CLOCK_MONOTONIC
-    return time.clock_gettime_ns(clock)
-
-
-def read_tlog(path):
-    """A .tlog's origin, manifest and record headers; payloads are skipped.
-
-    A truncated or damaged tail ends the records, as a SIGKILLed run leaves.
-    """
-    with open(path, "rb") as stream:
-        header = stream.read(_FILE.size)
-        if len(header) < _FILE.size:
-            raise ValueError(f"{path}: truncated file header")
-        (magic, version, header_bytes, _, origin, _, count, _, process,
-         schema_bytes) = _FILE.unpack(header)
-        if magic != b"TALOSLOG" or version not in _VERSIONS:
-            raise ValueError(f"{path}: not a version 7 or 8 .tlog")
-        stream.seek(header_bytes)
-        sources = {}
-        for _ in range(count):
-            raw = stream.read(_ENTRY.size)
-            if len(raw) < _ENTRY.size:
-                raise ValueError(f"{path}: truncated manifest")
-            source_id, kind, _, _, armed, period, offset, name, *_ = _ENTRY.unpack(raw)
-            sources[source_id] = {"kind": kind, "name": name.split(b"\0", 1)[0].decode(),
-                                  "armed": armed != 0, "period_ns": period,
-                                  "offset_ns": offset}
-        stream.seek(schema_bytes, 1)
-        records = []
-        while len(raw := stream.read(_RECORD.size)) == _RECORD.size:
-            magic, kind, source_id, _, event, now, *_, stored = _RECORD.unpack(raw)
-            if magic != _RECORD_MAGIC:
-                break
-            records.append((kind, source_id, event, now))
-            stream.seek(stored, 1)
-    return {"process": process.split(b"\0", 1)[0].decode(), "origin_ns": origin,
-            "sources": sources, "records": records}
 
 
 def restart_stages(log, kill_ns, node):
@@ -237,15 +186,6 @@ def remove_segments(session, namespace):
             pass
     for name in (REGISTRY, SESSION_LOCK):
         lock_file(name, namespace).unlink(missing_ok=True)
-
-
-def udp_ports():
-    # Hold both reservations until distinct ephemeral ports have been selected.
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as gateway, \
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bridge:
-        gateway.bind(("127.0.0.1", 0))
-        bridge.bind(("127.0.0.1", 0))
-        return gateway.getsockname()[1], bridge.getsockname()[1]
 
 
 def launcher_path():

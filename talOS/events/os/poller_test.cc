@@ -64,6 +64,47 @@ TEST(PollerTest, PastDeadlineReturnsImmediately) {
   EXPECT_LT(elapsed, 5 * kMillisecond);
 }
 
+// MonotonicTime::min() must return DEADLINE immediately without signed int64_t
+// overflow when computing a relative timeout from now().
+TEST(PollerTest, MinDeadlineReturnsImmediately) {
+  const auto expect_immediate_deadline = [](Poller& poller) {
+    std::mutex mutex;
+    std::condition_variable finished;
+    bool done = false;
+    std::thread guard([&] {
+      std::unique_lock<std::mutex> lock(mutex);
+      // 10 s hang bound (docs/TESTING.md §6.3) so scheduling preemption cannot
+      // falsely turn DEADLINE into WOKEN.
+      if (!finished.wait_for(lock, std::chrono::seconds(10),
+                             [&] { return done; })) {
+        poller.wake();
+      }
+    });
+
+    const Poller::WakeReason reason = poller.wait_until(MonotonicTime::min());
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      done = true;
+    }
+    finished.notify_one();
+    guard.join();
+
+    EXPECT_EQ(reason, Poller::WakeReason::DEADLINE);
+  };
+
+  {
+    Poller poller;
+    expect_immediate_deadline(poller);
+  }
+#if defined(__APPLE__)
+  {
+    // Exercise the kevent() relative-timeout backstop without EVFILT_TIMER.
+    Poller poller(Poller::DeadlineTimer::NOT_ARMED);
+    expect_immediate_deadline(poller);
+  }
+#endif
+}
+
 TEST(PollerTest, WakeFromAnotherThreadReturnsPromptlyNotAfterDeadline) {
   Poller poller;
   std::thread waker([&poller] {
@@ -229,7 +270,7 @@ TEST(PollerTest, DeadlineHoldsWhenTimerDeliveryStalls) {
   bool done = false;
   std::thread guard([&] {
     std::unique_lock<std::mutex> lock(mutex);
-    if (!finished.wait_for(lock, std::chrono::seconds(2),
+    if (!finished.wait_for(lock, std::chrono::seconds(10),
                            [&] { return done; })) {
       poller.wake();
     }
@@ -393,6 +434,69 @@ TEST(PollerTest, KernelWithoutEpollPwait2FallsBackToTheTimerfd) {
   EXPECT_EQ(unsupported_pwait2_calls, 1);
   for (const Duration late : lateness) EXPECT_GE(late, Duration::zero());
   EXPECT_LT(Median(lateness), 2 * kMillisecond);
+}
+
+// Non-positive deadlines on the timerfd path must return DEADLINE immediately
+// rather than disarming timerfd ({0, 0}) or throwing EINVAL (negative).
+TEST(PollerTest, TimerfdNonPositiveDeadlineReturnsImmediately) {
+  Poller poller(&UnsupportedPwait2);
+
+  // Guard against an infinite hang when {0, 0} disarms timerfd.
+  std::mutex mutex;
+  std::condition_variable finished;
+  bool done = false;
+  std::thread guard([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!finished.wait_for(lock, std::chrono::seconds(10),
+                           [&] { return done; })) {
+      poller.wake();
+    }
+  });
+
+  const Poller::WakeReason zero_reason =
+      poller.wait_until(MonotonicTime::from_nanos(0));
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    done = true;
+  }
+  finished.notify_one();
+  guard.join();
+
+  EXPECT_EQ(zero_reason, Poller::WakeReason::DEADLINE);
+  EXPECT_EQ(poller.wait_until(MonotonicTime::from_nanos(-1)),
+            Poller::WakeReason::DEADLINE);
+}
+
+int early_timeout_pwait2_calls = 0;
+
+int EarlyTimeoutOncePwait2(int epoll_fd, epoll_event* events, int max_events,
+                           const timespec* timeout) {
+  ++early_timeout_pwait2_calls;
+  if (early_timeout_pwait2_calls == 1) {
+    return 0;  // Spurious/early timeout before deadline.
+  }
+  if (const auto real = EpollPoller::system_pwait2(); real != nullptr) {
+    return real(epoll_fd, events, max_events, timeout);
+  }
+  const int timeout_ms =
+      timeout == nullptr
+          ? -1
+          : static_cast<int>(timeout->tv_sec * 1000 +
+                             (timeout->tv_nsec + 999'999) / 1'000'000);
+  return ::epoll_wait(epoll_fd, events, max_events, timeout_ms);
+}
+
+// When epoll_pwait2 returns 0 (timeout) before the deadline has actually
+// elapsed, wait_until must keep waiting until now() >= deadline.
+TEST(PollerTest, EpollPwait2EarlyTimeoutRetriesUntilDeadline) {
+  early_timeout_pwait2_calls = 0;
+  Poller poller(&EarlyTimeoutOncePwait2);
+  const MonotonicTime deadline = Poller::now() + 20 * kMillisecond;
+  const Poller::WakeReason reason = poller.wait_until(deadline);
+
+  EXPECT_EQ(reason, Poller::WakeReason::DEADLINE);
+  EXPECT_GE(Poller::now(), deadline);
+  EXPECT_GE(early_timeout_pwait2_calls, 2);
 }
 #endif
 

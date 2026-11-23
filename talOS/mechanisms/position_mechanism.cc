@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -37,8 +38,9 @@ bool ParseMotionMagic(const Params& params) {
   params.fail("control", "must be \"motion_magic\" or \"position\"");
 }
 
-// Both acquisition times known and at most `bound` apart.
-bool Aligned(std::optional<Time> a, std::optional<Time> b, Duration bound) {
+// Both sample ages at the same latched State known and at most `bound` apart.
+bool Aligned(std::optional<Duration> a, std::optional<Duration> b,
+             Duration bound) {
   return a.has_value() && b.has_value() &&
          (*a > *b ? *a - *b : *b - *a) <= bound;
 }
@@ -304,8 +306,7 @@ void PositionMechanism::update() {
   if (!motor_.zeroed()) settling_ = false;  // a dropped zero homes again
   if (absolute_.has_value() && !motor_.zeroed() && connected_ &&
       absolute_->connected() &&
-      Aligned(motor_.position_time(), absolute_->position_time(),
-              rezero_skew_)) {
+      Aligned(motor_.position_age(), absolute_->position_age(), rezero_skew_)) {
     motor_.rezero(absolute_->position() * absolute_rot_per_sensor_rot_ +
                   absolute_offset_rot_);
   }
@@ -360,16 +361,21 @@ void PositionMechanism::update() {
 bool PositionMechanism::home(Time now) {
   if (!homing_since_) homing_since_ = now;
   // A position step faster than the motor can turn the mechanism in the
-  // time since the last push tick is a frame jump (a reset, a glitch), not
-  // motion: the push starts over from here, and its evidence with it.
+  // time since the last push tick, or a non-finite position reading, is a
+  // frame jump (a reset, a glitch), not motion: the push starts over from
+  // here, and its evidence with it.
+  const double max_jump_rot =
+      now > push_last_at_
+          ? max_velocity_rps_ *
+                std::chrono::duration<double>(now - push_last_at_).count()
+          : 0.0;
   if (push_since_ &&
-      std::abs(position_rot_ - push_last_rot_) >
-          max_velocity_rps_ *
-              std::chrono::duration<double>(now - push_last_at_).count()) {
+      (!std::isfinite(position_rot_) ||
+       !(std::abs(position_rot_ - push_last_rot_) <= max_jump_rot))) {
     push_since_.reset();
     homing_still_since_.reset();
   }
-  if (!push_since_) {
+  if (!push_since_ && std::isfinite(position_rot_)) {
     push_since_ = now;
     push_start_rot_ = position_rot_;
   }
@@ -389,10 +395,12 @@ bool PositionMechanism::home(Time now) {
     // that starts slowly is not yet at its stop). Motion from an earlier,
     // interrupted push does not count.
     const bool moved =
+        push_since_.has_value() &&
         std::abs(position_rot_ - push_start_rot_) >= homing_min_travel_rot_;
-    still_counts = slow &&
-                   std::abs(motor_.current()) >= homing_stall_current_a_ &&
-                   (moved || now - *push_since_ >= homing_min_push_);
+    still_counts =
+        slow && std::abs(motor_.current()) >= homing_stall_current_a_ &&
+        (moved ||
+         (push_since_.has_value() && now - *push_since_ >= homing_min_push_));
   }
   if (!still_counts) {
     homing_still_since_.reset();
@@ -445,14 +453,26 @@ void PositionMechanism::drive_goal(Request request, double request_rot,
                                    double request_ff_v, Time now) {
   double goal = request_rot;
   if (request == Request::kHold) {
-    if (!held_rot_) held_rot_ = position_rot_;
+    if (!held_rot_) {
+      if (!std::isfinite(position_rot_)) {
+        idle(PositionPhase::kReady);
+        return;
+      }
+      held_rot_ = position_rot_;
+    }
     goal = *held_rot_;
   } else {
     held_rot_.reset();
   }
-  goal = std::clamp(wrap(goal), min_rot_, max_rot_);
-  gravity_ff_v_ = gravity_at(position_rot_);
-  const double feedforward_v = request_ff_v + gravity_ff_v_;
+  const double wrapped_goal = std::clamp(wrap(goal), min_rot_, max_rot_);
+  const double gravity_v = gravity_at(position_rot_);
+  const double feedforward_v = request_ff_v + gravity_v;
+  if (!std::isfinite(wrapped_goal) || !std::isfinite(feedforward_v)) {
+    idle(PositionPhase::kReady);
+    return;
+  }
+  goal = wrapped_goal;
+  gravity_ff_v_ = gravity_v;
   if (motion_magic_) {
     motor_.set_motion_magic(goal, feedforward_v, slot_);
   } else {
@@ -511,18 +531,46 @@ void PositionMechanism::idle(PositionPhase phase) {
 }
 
 // The equivalent of `goal` (goal + k * wrap_rot) nearest the current
-// position, moved inside [min_rot, max_rot] when one equivalent is.
+// position, moved inside [min_rot, max_rot] when one equivalent is; when the
+// travel is narrower than wrap_rot and no equivalent lies inside it, the one
+// nearest [min_rot, max_rot] so clamping goes to the nearest stop.
 double PositionMechanism::wrap(double goal) const {
   if (wrap_rot_ <= 0) return goal;
-  double best =
-      goal + std::round((position_rot_ - goal) / wrap_rot_) * wrap_rot_;
+  const double ref = std::isfinite(position_rot_)
+                         ? std::clamp(position_rot_, min_rot_, max_rot_)
+                         : 0.5 * min_rot_ + 0.5 * max_rot_;
+  const double turns = (ref - goal) / wrap_rot_;
+  double best = std::numeric_limits<double>::quiet_NaN();
+  if (std::isfinite(turns) && std::abs(turns) < 1e12) {
+    best = goal + std::round(turns) * wrap_rot_;
+  }
+  if (!std::isfinite(best)) {
+    const double g_rem = std::remainder(goal, wrap_rot_);
+    const double r_rem = std::remainder(ref, wrap_rot_);
+    const double delta = std::remainder(g_rem - r_rem, wrap_rot_);
+    best = ref + delta;
+    if (!std::isfinite(best)) {
+      best = delta > 0 ? ref + (delta - wrap_rot_) : ref + (delta + wrap_rot_);
+    }
+  }
+  if (best >= min_rot_ && best <= max_rot_) return best;
+  double below = 0.0;
+  double above = 0.0;
   if (best > max_rot_) {
-    best -= std::ceil((best - max_rot_) / wrap_rot_) * wrap_rot_;
+    const double step = std::ceil((best - max_rot_) / wrap_rot_) * wrap_rot_;
+    below = std::isfinite(step) ? best - step : max_rot_;
+    if (below >= min_rot_) return below;
+    above = below + wrap_rot_;
+  } else {
+    const double step = std::ceil((min_rot_ - best) / wrap_rot_) * wrap_rot_;
+    above = std::isfinite(step) ? best + step : min_rot_;
+    if (above <= max_rot_) return above;
+    below = above - wrap_rot_;
   }
-  if (best < min_rot_) {
-    best += std::ceil((min_rot_ - best) / wrap_rot_) * wrap_rot_;
-  }
-  return best;
+  const double d_below = min_rot_ - below;
+  const double d_above = above - max_rot_;
+  if (d_below != d_above) return d_below < d_above ? below : above;
+  return (ref - min_rot_) <= (max_rot_ - ref) ? below : above;
 }
 
 double PositionMechanism::gravity_at(double position_rot) const {

@@ -1,11 +1,13 @@
 #include "talOS/launcher/launcher.h"
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -21,22 +23,112 @@
 #include <system_error>
 #include <utility>
 
+#include "bridge/topics.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/events/os/poller.h"
+#include "talOS/introspection/hardware_lint.h"
 #include "talOS/introspection/lock_file.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/launcher/console_line.h"
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/launcher/session_lock.h"
+#include "talOS/launcher/sleep_guard.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/process/process.h"
+#include "talOS/protocol/types.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
 namespace talos::launcher {
+
+struct Launcher::BridgeStatusObserver {
+  struct Sample {
+    bool received{false};
+    std::optional<std::uint16_t> version;
+  };
+
+  RTMSQueue queue;
+  std::size_t reader_id{0};
+  ProtocolVersionField version_field;
+  std::vector<std::byte> scratch;
+
+  BridgeStatusObserver(RTMSQueue q, std::size_t id, ProtocolVersionField field,
+                       std::size_t bytes)
+      : queue{std::move(q)},
+        reader_id{id},
+        version_field{field},
+        scratch(bytes) {}
+  ~BridgeStatusObserver() { queue.release_reader(reader_id); }
+  BridgeStatusObserver(const BridgeStatusObserver&) = delete;
+  BridgeStatusObserver& operator=(const BridgeStatusObserver&) = delete;
+
+  void Drain() {
+    MessageInfo info{};
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      const ReadResult result = queue.read_next(reader_id, scratch, info);
+      if (result != ReadResult::TORN) return;
+    }
+  }
+
+  Sample ReadLatest() {
+    MessageInfo info{};
+    const ReadResult result = queue.read_next(reader_id, scratch, info);
+    if (result != ReadResult::OK) return {};
+    return {true, ReadProtocolVersion(version_field, scratch)};
+  }
+
+  static std::unique_ptr<BridgeStatusObserver> Open(
+      const std::vector<NodeDescription>& described) {
+    for (const auto& node : described) {
+      if (node.roster_name != kHardwareNodeName || !node.answered) continue;
+      for (const auto& source : node.declared.sources) {
+        if (source.kind != event::SourceKind::SENDER ||
+            source.name != ::bridge::topics::kStatus) {
+          continue;
+        }
+        const auto field = ResolveProtocolVersionField(
+            source.bfbs, source.schema, source.message_bytes);
+        if (!field) return nullptr;
+        try {
+          RTMSQueue queue{
+              source.name,
+              source.message_bytes,
+              source.alignment,
+              schema::Identity{source.schema, source.schema_hash, {}},
+              source.slots,
+              RTMSOptions{.read_mode = ReadMode::LATEST,
+                          .publisher = false,
+                          .session_owner = false}};
+          const auto reader_id = queue.register_reader();
+          if (!reader_id) return nullptr;
+          return std::make_unique<BridgeStatusObserver>(
+              std::move(queue), *reader_id, *field, source.message_bytes);
+        } catch (const std::exception& e) {
+          ConsoleLine(std::cerr)
+              << "[launcher] cannot observe " << source.name
+              << " for hardware protocol check: " << e.what() << "\n";
+          return nullptr;
+        }
+      }
+    }
+    return nullptr;
+  }
+};
+
 namespace {
+
+// How often Supervise polls `/hw/status` while waiting for the current bridge
+// run's first status message to check `protocol_version_id`. Stops once that
+// run's version has been checked.
+constexpr std::chrono::milliseconds kBridgeProtocolPoll{20};
+
+// How often Supervise checks whether every non-observer member's loop has
+// started while waiting to write kSimScheduleStartFile. Stops once written or
+// once sim_gateway exits with no pending restart.
+constexpr std::chrono::milliseconds kSimScheduleStartPoll{20};
 
 // The topic ends a registry row published, or nullopt while it has
 // published none: a row is visible from its claim, and a writer that never
@@ -88,7 +180,7 @@ DeliveryCounts DeliveryCountsOf(const introspect::NodeRecord& record) {
                             static_cast<event::SourceKind>(source.kind), name))
       continue;
     // `/hw/request/<subsystem>`, as the bridge reads it.
-    const std::string_view prefix{hardware::kRequestTopicPrefix};
+    const std::string_view prefix{introspect::naming::kRequestTopicPrefix};
     if (name.starts_with(prefix)) name.erase(0, prefix.size());
     counts.requests_skipped.emplace_back(std::move(name), dropped);
   }
@@ -297,7 +389,8 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
     auto& proc = procs[i];
     // Every run's log: a restarted node's records are the sum of its runs.
     for (const auto& path : proc.log_paths) {
-      if (std::filesystem::exists(event::log::CappedMarkerPath(path)))
+      std::error_code ec;
+      if (std::filesystem::exists(event::log::CappedMarkerPath(path), ec))
         proc.log_capped = true;
       bool gapped = false;
       // The segments a capped log kept, then the newest (LogSegmentFiles).
@@ -306,14 +399,14 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
         try {
           const auto summary = event::log::SummarizeLog(file);
           proc.record_count += summary.record_count;
-          if (!summary.damage.clean()) proc.failed = true;
+          if (!summary.damage.clean()) proc.RecordRecorderFailure(path);
           if (summary.gaps > 0) gapped = true;
         } catch (const event::log::IncompleteLogHeader& e) {
           // Cut while it was being created: no records to count.
           ConsoleLine(std::cerr)
               << "[launcher] skipping " << file << ": " << e.what() << "\n";
         } catch (...) {
-          proc.failed = true;
+          proc.RecordRecorderFailure(path);
         }
       }
       // A gap the live row did not show (a reporter that never sampled it)
@@ -401,7 +494,216 @@ Launcher::Launcher(LauncherOptions options) : options_{std::move(options)} {
   if (options_.session_id == 0) options_.session_id = GenerateSessionId();
   const std::filesystem::path root =
       options_.output_dir.empty() ? "/tmp/talos_logs" : options_.output_dir;
+  log_root_ = root.string();
   options_.output_dir = (root / std::to_string(options_.session_id)).string();
+}
+
+int Launcher::RefuseLaunch(std::string_view reason,
+                           const config::RobotConfig* robot_config,
+                           StopSignals& stop_signals) {
+  // Without owning `session_lock_`, another session may already be live
+  // (possibly with --no-studio or a custom HTTP port) or already serving a
+  // real refusal: never overwrite <log_root>/last_refusal.json or bind the
+  // Studio HTTP port unless this launcher holds the session lock.
+  if (options_.describe_only || !options_.replay_inputs.empty() ||
+      session_lock_ == nullptr) {
+    return 1;
+  }
+
+  const std::string refusal_path =
+      (std::filesystem::path{log_root_} / kLastRefusalFile).string();
+  std::string json = "{\n  \"refused\": true,\n  \"reason\": ";
+  json += Quoted(reason);
+  json += ",\n  \"config_path\": ";
+  json += Quoted(options_.config_path);
+  json += ",\n  \"wall_ns\": ";
+  json += std::to_string(WallClockNanos());
+  json += "\n}\n";
+
+  std::error_code dir_error;
+  std::filesystem::create_directories(log_root_, dir_error);
+  std::string write_error;
+  const bool refusal_written =
+      !dir_error &&
+      WriteFileAtomically(refusal_path, json, options_.sync_file, write_error);
+  if (!refusal_written) {
+    ConsoleLine(std::cerr) << "[launcher] cannot write " << refusal_path << " ("
+                           << (dir_error ? dir_error.message() : write_error)
+                           << ")\n";
+  }
+
+  if (!options_.serve_refusal || !options_.start_studio_bridge ||
+      BundleWithoutStudio(options_)) {
+    return 1;
+  }
+
+  const std::string target = robot_config != nullptr
+                                 ? robot_config->studio.bridge
+                                 : std::string{"//studio/bridge:studio_bridge"};
+  const NodeSpec spec =
+      MakeNodeSpec(kStudioBridgeName, target, options_, /*studio_bridge=*/true);
+  if (spec.binary_path.empty() ||
+      ::access(spec.binary_path.c_str(), X_OK) != 0) {
+    ConsoleLine(std::cerr)
+        << "[launcher] cannot serve refusal: studio_bridge not executable at '"
+        << (spec.binary_path.empty() ? target : spec.binary_path) << "'\n";
+    return 1;
+  }
+
+  const decltype(config::RobotConfig::studio) defaults{};
+  const uint16_t http_port = options_.studio_http_port.value_or(
+      robot_config != nullptr ? robot_config->studio.http_port
+                              : defaults.http_port);
+  const std::string webroot =
+      robot_config != nullptr ? EffectiveStudioWebroot(*robot_config, options_)
+                              : (options_.bundle_has_studio &&
+                                         !options_.bundle_studio_webroot.empty()
+                                     ? options_.bundle_studio_webroot
+                                     : defaults.webroot);
+  const std::string topic =
+      robot_config != nullptr ? robot_config->studio.topic : defaults.topic;
+
+  std::vector<std::string> args{spec.binary_path,          topic,
+                                std::to_string(http_port), webroot,
+                                "--refusal-file",          refusal_path};
+  if (!refusal_written) {
+    args.emplace_back("--refusal-reason");
+    args.emplace_back(reason);
+  }
+
+  stop_signals.Install();
+  if (process::stop_requested.load()) return 1;
+
+  SupervisionWakeup wakeup;
+  int stdout_fd = -1;
+  std::string spawn_error;
+  const pid_t pid = SpawnProcess(std::move(args), spawn_error,
+                                 SpawnOutput::kStdoutPipe, &stdout_fd);
+  if (pid < 0) {
+    ConsoleLine(std::cerr) << "[launcher] cannot spawn refusal studio_bridge ("
+                           << spawn_error << ")\n";
+    return 1;
+  }
+  if (stdout_fd >= 0) {
+    const int flags = ::fcntl(stdout_fd, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(stdout_fd, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  ServiceNotifier notifier;
+  const auto watchdog = notifier.watchdog_interval();
+  const auto start_time = options_.supervision_clock();
+  SupervisionTime next_watchdog = SupervisionTime::max();
+  const SupervisionTime deadline =
+      options_.duration_s > 0
+          ? start_time + std::chrono::seconds(options_.duration_s)
+          : SupervisionTime::max();
+
+  bool stop_sent = false;
+  bool ready_sent = false;
+  SupervisionTime shutdown_deadline = SupervisionTime::max();
+  bool port_announced = false;
+  std::string stdout_buf;
+
+  const auto drain_stdout = [&] {
+    if (stdout_fd < 0) return;
+    char chunk[256];
+    for (;;) {
+      const ssize_t n = ::read(stdout_fd, chunk, sizeof(chunk));
+      if (n > 0) {
+        if (!port_announced && stdout_buf.size() < 4096) {
+          stdout_buf.append(chunk, static_cast<std::size_t>(n));
+        }
+        continue;
+      }
+      if (n == 0) {
+        ::close(stdout_fd);
+        stdout_fd = -1;
+      }
+      break;
+    }
+    if (!port_announced) {
+      std::size_t pos = 0;
+      for (std::size_t nl = stdout_buf.find('\n', pos); nl != std::string::npos;
+           nl = stdout_buf.find('\n', pos)) {
+        std::string_view line(stdout_buf.data() + pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        constexpr std::string_view kPrefix = "listening ";
+        if (line.starts_with(kPrefix)) {
+          const std::string_view value = line.substr(kPrefix.size());
+          int bound = 0;
+          const auto* end = value.data() + value.size();
+          const auto [ptr, ec] = std::from_chars(value.data(), end, bound);
+          if (!value.empty() && ec == std::errc{} && ptr == end && bound >= 1 &&
+              bound <= 65535) {
+            port_announced = true;
+            ConsoleLine(std::cout)
+                << "[launcher] Launch refused; serving refusal on "
+                   "http://localhost:"
+                << bound << "/drive\n";
+            pos = nl + 1;
+            break;
+          }
+        }
+        pos = nl + 1;
+      }
+      if (pos > 0) stdout_buf.erase(0, pos);
+    }
+  };
+
+  for (;;) {
+    drain_stdout();
+    int status = 0;
+    const pid_t reaped = ::waitpid(pid, &status, WNOHANG);
+    if (reaped == pid) {
+      FinishProcessGroup(pid);
+      drain_stdout();
+      if (stdout_fd >= 0) {
+        ::close(stdout_fd);
+        stdout_fd = -1;
+      }
+      if (!stop_sent) {
+        ConsoleLine(std::cerr) << "[launcher] refusal studio_bridge exited ("
+                               << ExitReason(status) << ")\n";
+      }
+      break;
+    }
+    const SupervisionTime now = options_.supervision_clock();
+    // Notify systemd READY=1 only once the bridge is alive and has announced
+    // its listening port, so an immediate EADDRINUSE exit never falsely
+    // reports READY=1 before returning 1.
+    if (port_announced && !ready_sent) {
+      notifier.Send("READY=1");
+      ready_sent = true;
+      if (watchdog) next_watchdog = now + *watchdog;
+    }
+    if (ready_sent && watchdog && now >= next_watchdog) {
+      notifier.Send("WATCHDOG=1");
+      next_watchdog = now + *watchdog;
+    }
+    if (!stop_sent && (process::stop_requested.load() || now >= deadline)) {
+      stop_sent = true;
+      shutdown_deadline = now + kStopTimeout;
+      SignalProcessGroup(pid, kStopSignal);
+    }
+    if (stop_sent && now >= shutdown_deadline) {
+      SignalProcessGroup(pid, SIGKILL);
+    }
+    auto wake = SupervisionTime::max();
+    const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
+    if (ready_sent && watchdog) due(next_watchdog);
+    if (stop_sent) {
+      if (now < shutdown_deadline) due(shutdown_deadline);
+    } else {
+      due(deadline);
+      if (!port_announced && stdout_fd >= 0) {
+        due(now + std::chrono::milliseconds{10});
+      }
+    }
+    wakeup.Wait(wake == SupervisionTime::max()
+                    ? std::chrono::nanoseconds::max()
+                    : wake - options_.supervision_clock());
+  }
+  return 1;
 }
 
 int Launcher::Run() {
@@ -448,50 +750,71 @@ int Launcher::Run() {
 }
 
 int Launcher::RunSession(StopSignals& stop_signals) {
+  session_lock_ = nullptr;
+  if (options_.check_session_lock) {
+    std::string error;
+    const auto lock = options_.acquire_session_lock(error, nullptr);
+    if (!lock) {
+      ConsoleLine(std::cerr) << "launcher: " << error << "\n";
+      return 1;
+    }
+    return 0;
+  }
   // The flag overrides every graph refusal, the safety ones included
   // (REQ-SAFE-27/28) and the live-endpoint refusal, so it never reaches a
   // real controller: --sim requires the loopback remote (below). Refused
   // before the config is read, so nothing is probed, written or spawned.
   if (options_.allow_graph_errors && !options_.simulation) {
-    ConsoleLine(std::cerr)
-        << "launcher: --allow-graph-errors is accepted only with --sim; "
-           "nothing was described or started\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "--allow-graph-errors is accepted only with --sim; nothing was "
+        "described or started";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   // Alone it would start the roster, which whoever passed it meant to check.
   if (options_.describe_as_launch && !options_.describe_only) {
-    ConsoleLine(std::cerr)
-        << "launcher: --describe-as-launch requires --describe-only; "
-           "nothing was described or started\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "--describe-as-launch requires --describe-only; nothing was described "
+        "or started";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
-    ConsoleLine(std::cerr)
-        << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "--sim-gateway-arg requires --start-sim-gateway";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
+  }
+  if (options_.allow_capped_replay && options_.replay_inputs.empty()) {
+    constexpr std::string_view kMessage =
+        "--allow-capped-replay requires --replay-inputs SESSION_DIR";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   // The launcher gives the simulator the bridge's ports (SimulatorArgs); a
   // port written by hand as well could only disagree with the bridge's.
   for (const std::string& arg : options_.sim_gateway_args) {
     if (IsSimulatorPortArg(arg)) {
-      ConsoleLine(std::cerr)
-          << "launcher: --sim-gateway-arg " << arg
-          << " is refused: the launcher passes the simulator --port "
-             "and --remote-port from [robot] controller_port and "
-             "local_port, or from its --remote-port and --local-port; "
-             "set those instead\n";
-      return 1;
+      const std::string message =
+          "--sim-gateway-arg " + arg +
+          " is refused: the launcher passes the simulator --port "
+          "and --remote-port from [robot] controller_port and "
+          "local_port, or from its --remote-port and --local-port; "
+          "set those instead";
+      ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+      return RefuseLaunch(message, nullptr, stop_signals);
     }
   }
   std::string bundle_error;
   if (!LoadBundle(options_, bundle_error)) {
     ConsoleLine(std::cerr) << "launcher: " << bundle_error << "\n";
-    return 1;
+    return RefuseLaunch(bundle_error, nullptr, stop_signals);
   }
   if (options_.config_path.empty()) {
-    ConsoleLine(std::cerr)
-        << "launcher: --config PATH or --bundle PATH is required\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "--config PATH or --bundle PATH is required";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, nullptr, stop_signals);
   }
   // Recorded absolute (manifest.json, graph.json, every member's --config):
   // a relative path names nothing once the launcher's working directory is
@@ -546,14 +869,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   const auto take_lock = [&] {
     bool no_room = false;
     session_lock = options_.acquire_session_lock(lock_error, &no_room);
-    if (session_lock) session_lock_ = &*session_lock;
+    session_lock_ = session_lock ? &*session_lock : nullptr;
     lock_needs_room = !session_lock && no_room && LockSharesLogFilesystem();
     return session_lock.has_value() || lock_needs_room;
   };
   if (starts_roster) {
     if (!take_lock()) {
       ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
-      return 1;
+      return RefuseLaunch(lock_error, nullptr, stop_signals);
     }
     if (lock_needs_room) {
       ConsoleLine(std::cerr)
@@ -568,8 +891,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   try {
     robot_config = config::ParseRobotConfig(options_.config_path);
   } catch (const std::exception& e) {
-    ConsoleLine(std::cerr) << "launcher: failed to load config from "
-                           << options_.config_path << ": " << e.what() << "\n";
+    const std::string message =
+        "failed to load config from " + options_.config_path + ": " + e.what();
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
     if (config_was_relative) {
       ConsoleLine(std::cerr)
           << "launcher: working directory is "
@@ -577,7 +901,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
           << "; run from the repository root or pass an absolute "
              "--config path\n";
     }
-    return 1;
+    return RefuseLaunch(message, nullptr, stop_signals);
   }
   // A simulation config (its gains, bindings and travel) never drives real
   // hardware. --describe-only and --replay-inputs touch none, but
@@ -588,43 +912,58 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // preparation and capacity stay the launch's alone.
   if (robot_config.simulation_only && !options_.simulation &&
       (starts_roster || options_.describe_as_launch)) {
-    ConsoleLine(std::cerr)
-        << "launcher: " << options_.config_path
-        << " sets [robot] simulation_only = true; "
-        << (options_.describe_as_launch
-                ? "a launch of it without --sim is refused, so it "
-                  "cannot be installed as the robot's; nothing was "
-                  "started\n"
-                : "run it with --sim (or --describe-only); nothing "
-                  "was started\n");
-    return 1;
+    const std::string message =
+        options_.config_path + " sets [robot] simulation_only = true; " +
+        (options_.describe_as_launch
+             ? "a launch of it without --sim is refused, so it cannot be "
+               "installed as the robot's; nothing was started"
+             : "run it with --sim (or --describe-only); nothing was started");
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
   }
   std::string effective_remote;
   try {
     effective_remote = EffectiveRemoteAddress(robot_config, options_);
   } catch (const std::exception& e) {
     ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-    return 1;
+    return RefuseLaunch(e.what(), &robot_config, stop_signals);
   }
   if (options_.simulation && effective_remote != "127.0.0.1") {
-    ConsoleLine(std::cerr)
-        << "launcher: --sim requires remote 127.0.0.1; effective remote "
-        << effective_remote << "\n";
-    return 1;
+    const std::string message =
+        "--sim requires remote 127.0.0.1; effective remote " + effective_remote;
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
+  }
+  std::string effective_local_address;
+  try {
+    effective_local_address = EffectiveLocalAddress(robot_config, options_);
+  } catch (const std::exception& e) {
+    ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
+    return RefuseLaunch(e.what(), &robot_config, stop_signals);
+  }
+  if (options_.simulation && !effective_local_address.empty() &&
+      effective_local_address != "127.0.0.1") {
+    const std::string message =
+        "--sim requires local_address unset or 127.0.0.1; effective local "
+        "address " +
+        effective_local_address;
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
   }
   std::string restart_error;
   int max_restarts = kDefaultMaxRestarts;
   if (!ResolveMaxRestarts(robot_config, options_, max_restarts,
                           restart_error)) {
     ConsoleLine(std::cerr) << "launcher: " << restart_error << "\n";
-    return 1;
+    return RefuseLaunch(restart_error, &robot_config, stop_signals);
   }
   if (options_.restart_window_ms <= 0 || options_.heartbeat_periods <= 0 ||
       options_.heartbeat_startup_grace_ms < 0) {
-    std::cerr
-        << "launcher: restart window and heartbeat periods must be positive; "
-           "startup grace must be nonnegative\n";
-    return 1;
+    constexpr std::string_view kMessage =
+        "restart window and heartbeat periods must be positive; startup grace "
+        "must be nonnegative";
+    std::cerr << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, &robot_config, stop_signals);
   }
   restart_limits_ = {max_restarts,
                      std::chrono::milliseconds{options_.restart_window_ms}};
@@ -637,8 +976,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
            "without Studio\n";
   }
   if (node_specs.empty()) {
-    ConsoleLine(std::cerr) << "launcher: no nodes declared in config\n";
-    return 1;
+    constexpr std::string_view kMessage = "no nodes declared in config";
+    ConsoleLine(std::cerr) << "launcher: " << kMessage << "\n";
+    return RefuseLaunch(kMessage, &robot_config, stop_signals);
   }
   // A member's name is its file names (<name>.log, <name>.tlog) and its
   // registry row. Subsystem keys are unique, so two members of one name are
@@ -651,14 +991,15 @@ int Launcher::RunSession(StopSignals& stop_signals) {
       if (node_specs[i].name != node_specs[j].name) continue;
       const NodeSpec& added =
           node_specs[i].studio_bridge ? node_specs[i] : node_specs[j];
-      ConsoleLine(std::cerr)
-          << "launcher: [subsystems." << node_specs[i].name
-          << "] has the name of the launcher's own "
-          << (added.studio_bridge
-                  ? "Studio bridge, which --start-studio-bridge adds"
-                  : "roster member of that name")
-          << "; rename the subsystem\n";
-      return 1;
+      const std::string message =
+          "[subsystems." + node_specs[i].name +
+          "] has the name of the launcher's own " +
+          (added.studio_bridge
+               ? "Studio bridge, which --start-studio-bridge adds"
+               : "roster member of that name") +
+          "; rename the subsystem";
+      ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+      return RefuseLaunch(message, &robot_config, stop_signals);
     }
   }
   // A member's name is its file names (<name>.log, <name>.tlog). One that
@@ -670,19 +1011,19 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   for (const NodeSpec& spec : node_specs) {
     const auto problem = naming::CheckNodeName(spec.name);
     if (!problem) continue;
-    ConsoleLine(std::cerr)
-        << "launcher: roster member '" << spec.name << "': " << *problem
-        << "; refused even with --allow-graph-errors, since the name "
-           "is its output and event log file names (the launcher's own "
-           "is "
-        << kLauncherOutputFile << ")\n";
-    return 1;
+    const std::string message =
+        "roster member '" + spec.name + "': " + *problem +
+        "; refused even with --allow-graph-errors, since the name is its "
+        "output and event log file names (the launcher's own is " +
+        std::string{kLauncherOutputFile} + ")";
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
   }
   // Checked again right before retention lists the log root: another
   // launch may have taken the lock meanwhile.
   if (lock_needs_room && !take_lock()) {
     ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
-    return 1;
+    return RefuseLaunch(lock_error, &robot_config, stop_signals);
   }
   const Pruning pruning = session_lock      ? Pruning::kLocked
                           : lock_needs_room ? Pruning::kUnlocked
@@ -693,11 +1034,13 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   if (lock_needs_room && (!take_lock() || !session_lock)) {
     ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
     ReportUnwrittenRetention(retention_record);
-    return 1;
+    return RefuseLaunch(lock_error, &robot_config, stop_signals);
   }
   if (!CreateSessionDirectory(robot_config, node_specs.size(),
                               pruning != Pruning::kNone, retention_record)) {
-    return 1;
+    return RefuseLaunch(
+        "cannot create or lock session directory " + options_.output_dir,
+        &robot_config, stop_signals);
   }
   launcher_output_->Record(options_.output_dir + "/" +
                            std::string{kLauncherOutputFile});
@@ -710,20 +1053,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     namespace_names.RegistryPrepared();
     try {
       introspect::PrepareRegistry();
-      // Every member but Studio's bridge registers a row; the sim gateway
-      // registers its own.
-      const auto registering = static_cast<std::size_t>(std::count_if(
-          node_specs.begin(), node_specs.end(),
-          [](const NodeSpec& spec) { return !spec.studio_bridge; }));
-      const std::string full =
-          RegistryCapacityError(introspect::RegistryReader{}, registering);
-      if (!full.empty()) {
-        ConsoleLine(std::cerr) << "launcher: " << full << "\n";
-        return 1;
-      }
     } catch (const std::exception& e) {
       ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-      return 1;
+      return RefuseLaunch(e.what(), &robot_config, stop_signals);
     }
   }
 
@@ -737,7 +1069,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
         starts_roster ? process::StopFd() : -1);
   } catch (const std::exception& e) {
     ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-    return 1;
+    return RefuseLaunch(e.what(), &robot_config, stop_signals);
   }
   // A stop kills the probes it finds running (ProbeDescribe), so their
   // descriptions are not the roster's: nothing is linted or recorded.
@@ -752,8 +1084,19 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   for (auto& finding : LintPythonActuatorPeriods(robot_config, described)) {
     diagnostics.push_back(std::move(finding));
   }
+  for (auto& finding : LintTelemetryConfig(robot_config, described)) {
+    diagnostics.push_back(std::move(finding));
+  }
   for (auto& finding : naming::CheckHardwareConfig(robot_config.hardware)) {
     diagnostics.push_back(std::move(finding));
+  }
+  if (effective_local_address.empty() && !options_.simulation &&
+      effective_remote != "127.0.0.1") {
+    diagnostics.push_back(
+        {naming::Severity::WARNING, std::string{kHardwareNodeName},
+         "[robot] local_address is unset; hardware_node binds 0.0.0.0 and may "
+         "pick another interface on route changes (set [robot] local_address "
+         "or --local-address)"});
   }
   const std::size_t declared_topics = CountDeclaredTopics(described);
 
@@ -762,22 +1105,57 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   if (!WriteFileAtomically(
           graph_path,
           GraphToJson(options_.session_id, options_.config_path, described,
-                      diagnostics, options_.bundle_config_sha256),
+                      diagnostics, options_.bundle_config_sha256,
+                      CanBusNamesOf(robot_config)),
           options_.sync_file, graph_error)) {
-    ConsoleLine(std::cerr) << "launcher: cannot write " << graph_path << " ("
-                           << graph_error << "); nothing was started\n";
-    return 1;
+    const std::string message = "cannot write " + graph_path + " (" +
+                                graph_error + "); nothing was started";
+    ConsoleLine(std::cerr) << "launcher: " << message << "\n";
+    return RefuseLaunch(message, &robot_config, stop_signals);
   }
   PrintDeclaredGraph(described, diagnostics, declared_topics, graph_path);
   // Its warning is in the graph above; an observer's absence stops nothing.
   DropUnansweredStudioBridge(node_specs, described);
+
+  // Checked after dropping an unanswered Studio bridge so an absent observer
+  // never causes an off-by-one capacity refusal.
+  if (starts_roster) {
+    try {
+      // Every remaining member registers a row, including the sim gateway and
+      // Studio's bridge when present.
+      const std::string full = RegistryCapacityError(
+          introspect::RegistryReader{}, node_specs.size());
+      if (!full.empty()) {
+        ConsoleLine(std::cerr) << "launcher: " << full << "\n";
+        return RefuseLaunch(full, &robot_config, stop_signals);
+      }
+    } catch (const std::exception& e) {
+      ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
+      return RefuseLaunch(e.what(), &robot_config, stop_signals);
+    }
+  }
 
   if (naming::HasError(diagnostics) && !options_.allow_graph_errors) {
     ConsoleLine(std::cerr)
         << "launcher: the declared graph has errors; refusing to "
            "start. Fix the errors above, or, in simulation, pass "
            "--allow-graph-errors with --sim to launch anyway.\n";
-    return 1;
+    std::string details;
+    int error_count = 0;
+    for (const auto& diagnostic : diagnostics) {
+      if (diagnostic.severity != naming::Severity::ERROR) continue;
+      if (error_count < 5) {
+        if (!details.empty()) details += "; ";
+        details += diagnostic.ToString();
+      }
+      ++error_count;
+    }
+    if (details.empty()) {
+      details = "the declared graph has errors";
+    } else if (error_count > 5) {
+      details += " (+" + std::to_string(error_count - 5) + " more)";
+    }
+    return RefuseLaunch(details, &robot_config, stop_signals);
   }
   if (options_.describe_only) {
     ConsoleLine(std::cout) << "[launcher] describe-only: nothing was started\n";
@@ -792,10 +1170,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     segments = CreateSessionSegments(described);
   } catch (const std::exception& e) {
     ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
-    return 1;
+    return RefuseLaunch(e.what(), &robot_config, stop_signals);
   }
   ConsoleLine(std::cout) << "[launcher] Created " << segments.size()
                          << " session-owned topic segments\n";
+  // Declared after `segments` so the observer reader detaches before the
+  // session unlinks `/hw/status`.
+  std::unique_ptr<BridgeStatusObserver> status_observer =
+      BridgeStatusObserver::Open(described);
   if (options_.session_segments_created) options_.session_segments_created();
 
   SessionManifest manifest;
@@ -804,6 +1186,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   manifest.config_sha256 = options_.bundle_config_sha256;
   manifest.git_revision = options_.bundle_git_revision;
   manifest.git_dirty = options_.bundle_git_dirty;
+  manifest.talos_git_revision = options_.bundle_talos_git_revision;
+  manifest.talos_git_dirty = options_.bundle_talos_git_dirty;
   manifest.output_dir = options_.output_dir;
   // Recorded since the session directory's creation (above).
   manifest.launcher_log =
@@ -826,17 +1210,22 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   std::vector<NodeProcessInfo> procs;
   procs.reserve(node_specs.size());
   std::optional<StudioBridge> studio;
+  std::optional<std::size_t> sim_gateway_index;
   for (std::size_t i = 0; i < node_specs.size(); ++i) {
     const auto& spec = node_specs[i];
     NodeProcessInfo& proc = procs.emplace_back();
     proc.name = spec.name;
     proc.target = spec.target;
+    proc.critical = !spec.studio_bridge && spec.critical;
+    proc.studio_bridge = spec.studio_bridge;
     proc.binary_path = spec.binary_path;
     proc.binary_sha256 = FileSha256(spec.binary_path);
     // The launcher's gateway is started without --log, so it writes no
     // event log.
     if (!spec.sim_gateway) {
       proc.log_path = NodeLogPath(options_.output_dir, spec.name, 0);
+    } else if (!HasSimulatorScheduleStartArg(options_.sim_gateway_args)) {
+      sim_gateway_index = i;
     }
     proc.described = described[i].answered;
     if (spec.studio_bridge) {
@@ -857,6 +1246,30 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // off this thread (PersistManifest).
   PersistManifest(procs, /*durable=*/true);
   manifest_writer_->Start();
+  struct StopManifestWriter {
+    explicit StopManifestWriter(std::unique_ptr<ManifestWriter>& writer_ref)
+        : writer{writer_ref} {}
+    ~StopManifestWriter() {
+      if (writer) writer->Stop();
+    }
+    StopManifestWriter(const StopManifestWriter&) = delete;
+    StopManifestWriter& operator=(const StopManifestWriter&) = delete;
+    std::unique_ptr<ManifestWriter>& writer;
+  } stop_manifest_writer{manifest_writer_};
+
+  // Hold a macOS IOKit PreventSystemSleep assertion for the running session's
+  // lifetime (no-op on Linux) as defense-in-depth independent of `pmset sleep
+  // 0` against idle or DarkWake maintenance sleep (TODO.md DEPLOY-1).
+  std::string sleep_guard_error;
+  const SleepGuard sleep_guard = SleepGuard::Acquire(
+      "talOS session " + std::to_string(options_.session_id),
+      &sleep_guard_error);
+  if (!sleep_guard_error.empty()) {
+    ConsoleLine(std::cerr)
+        << "[launcher] warning: could not acquire macOS PreventSystemSleep "
+           "assertion ("
+        << sleep_guard_error << "); continuing without sleep guard\n";
+  }
 
   // The deadline starts with the session, so a bridge that never comes up
   // cannot push the session's end out.
@@ -865,15 +1278,21 @@ int Launcher::RunSession(StopSignals& stop_signals) {
                                   std::chrono::seconds(options_.duration_s)
                             : std::chrono::steady_clock::time_point::max();
 
-  const std::string remote = EffectiveRemoteAddress(robot_config, options_);
   const uint16_t remote_port = EffectiveRemotePort(robot_config, options_);
   const uint16_t local_port = EffectiveLocalPort(robot_config, options_);
   ConsoleLine(std::cout) << "[launcher] Starting session "
                          << options_.session_id << " with " << procs.size()
                          << " nodes...\n";
-  ConsoleLine(std::cout) << "[launcher] Controller " << remote << ":"
-                         << remote_port << " (local port " << local_port
-                         << ")\n";
+  if (effective_local_address.empty()) {
+    ConsoleLine(std::cout) << "[launcher] Controller " << effective_remote
+                           << ":" << remote_port << " (local port "
+                           << local_port << ")\n";
+  } else {
+    ConsoleLine(std::cout) << "[launcher] Controller " << effective_remote
+                           << ":" << remote_port << " (local "
+                           << effective_local_address << ":" << local_port
+                           << ")\n";
+  }
 
   // From the segments on, a stop ends the session through supervision and
   // the final manifest, as any stop does: a member it finds not yet started
@@ -910,7 +1329,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     studio->Start(procs[studio->index()], options_.supervision_clock);
   PersistManifest(procs);
 
-  Supervise(procs, launches, studio, deadline);
+  Supervise(manifest, procs, launches, studio, sim_gateway_index,
+            status_observer.get(), deadline);
   manifest.end_wall_ns = WallClockNanos();
   // Every run has been reaped and its group killed, so the pipes end.
   output_->Stop();
@@ -972,6 +1392,11 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
     // 0, which every mechanism rejects.
     args.insert(args.end(), {"--config", options_.config_path, "--session-id",
                              std::to_string(options_.session_id)});
+    if (!HasSimulatorScheduleStartArg(options_.sim_gateway_args)) {
+      args.insert(args.end(), {"--schedule-start-file",
+                               options_.output_dir + "/" +
+                                   std::string{kSimScheduleStartFile}});
+    }
   } else {
     args.insert(args.end(),
                 {"--session-id", std::to_string(options_.session_id), "--log"});
@@ -990,6 +1415,22 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
     // Started with the graph it was described with (DescribeGraph).
     if (described.answered && described.declared.reads_graph) {
       args.insert(args.end(), {"--graph", DeclaredGraphPath(options_)});
+    }
+    // REQ-SAFE-42: when the probe declared a hardware_request endpoint without
+    // untargeted_outputs, pass --targeted-outputs so neither the first run nor
+    // any restart (which reuses launch.args) can hide AllowUntargetedOutputs
+    // behind !Node::describing(). Only real talos::Run / talos.run actuator
+    // nodes declare kSourceFlagHardwareRequest; hardware_node, sim_gateway,
+    // studio_bridge and non-actuator nodes never do.
+    if (described.answered && !options_.allow_graph_errors) {
+      const bool targeted_actuator = std::any_of(
+          described.declared.sources.begin(), described.declared.sources.end(),
+          [](const naming::SourceShape& source) {
+            return naming::IsSender(source.kind) &&
+                   (source.flags & naming::kSourceFlagHardwareRequest) != 0 &&
+                   (source.flags & naming::kSourceFlagUntargetedOutputs) == 0;
+          });
+      if (targeted_actuator) args.push_back("--targeted-outputs");
     }
   }
   // The hardware bridge's controller addresses are among them
@@ -1096,6 +1537,7 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
                                 "--config",
                                 options_.config_path};
   if (simulation) args.push_back("--sim");
+  if (options_.allow_capped_replay) args.push_back("--allow-capped-replay");
   std::string error;
   const pid_t pid = SpawnProcess(std::move(args), error);
   if (pid < 0) {
@@ -1135,11 +1577,10 @@ std::string Launcher::StallReport(const NodeLaunch& launch, bool constructing,
 }
 
 void Launcher::StopSignals::Install() {
-  if (!installed_) {
-    for (std::size_t i = 0; i < kSignals.size(); ++i)
-      ::sigaction(kSignals[i], nullptr, &saved_[i]);
-    installed_ = true;
-  }
+  if (installed_) return;
+  for (std::size_t i = 0; i < kSignals.size(); ++i)
+    ::sigaction(kSignals[i], nullptr, &saved_[i]);
+  installed_ = true;
   InstallSignals();
 }
 
@@ -1207,7 +1648,10 @@ void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
   kill_reason = {};
   heartbeat_killed = false;
   endpoints_checked = false;
-  realtime_reported = false;
+  realtime_seen.reset();
+  loop_started = false;
+  protocol_checked = false;
+  run_recorder_failed = false;
 }
 
 void Launcher::SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -1262,7 +1706,8 @@ uint64_t Launcher::RestartLogBudget(NodeProcessInfo& proc, uint64_t budget) {
 }
 
 void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
-                       SupervisionTime now) {
+                       SupervisionTime now,
+                       BridgeStatusObserver* status_observer) {
   if (launch.restart.quarantined())
     ConsoleLine(std::cout) << "[launcher] " << proc.name
                            << " retrying after quarantine\n";
@@ -1276,6 +1721,11 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
         NodeLogPath(options_.output_dir, proc.name, restart);
     launch.args[launch.log_arg + 2] =
         std::to_string(RestartLogBudget(proc, launch.log_budget));
+  }
+  if (proc.name == kHardwareNodeName && status_observer != nullptr) {
+    // Discard any unread status written by the prior bridge run before the new
+    // run starts so the next read observes only the new run's status.
+    status_observer->Drain();
   }
   std::string error;
   launch.spawned_monotonic_ns = introspect::monotonic_now_ns();
@@ -1303,17 +1753,44 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
   line << ")\n";
 }
 
+void Launcher::CheckBridgeProtocol(
+    const NodeProcessInfo& proc, NodeLaunch& launch,
+    BridgeStatusObserver* status_observer) const {
+  if (status_observer == nullptr || proc.name != kHardwareNodeName ||
+      launch.protocol_checked) {
+    return;
+  }
+  const BridgeStatusObserver::Sample sample = status_observer->ReadLatest();
+  if (!sample.received) return;
+  launch.protocol_checked = true;
+  if (sample.version && *sample.version != protocol::kProtocolVersion) {
+    ConsoleLine(std::cerr)
+        << "[launcher] warning: " << proc.name << " (pid " << proc.pid
+        << ") reports hardware protocol " << *sample.version << " on "
+        << ::bridge::topics::kStatus
+        << ", but this launcher was built for hardware protocol "
+        << protocol::kProtocolVersion
+        << "; hardware packets in this session may not match this build\n";
+  }
+}
+
 bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
                             uint32_t flags) const {
-  if (launch.realtime_reported) return false;
   const std::optional<process::RealtimeOutcome> outcome =
       introspect::RealtimeOf(flags);
   if (!outcome) return false;
-  launch.realtime_reported = true;
-  const std::string warning =
-      RealtimeWarning(proc.name, proc.pid, *outcome, options_.simulation);
+  if (launch.realtime_seen) {
+    const auto added = static_cast<std::uint8_t>(
+        outcome->refused & ~launch.realtime_seen->refused);
+    if (added == 0) return false;
+    launch.realtime_seen->refused |= added;
+  } else {
+    launch.realtime_seen = *outcome;
+  }
+  const std::string warning = RealtimeWarning(
+      proc.name, proc.pid, *launch.realtime_seen, options_.simulation);
   if (!warning.empty()) ConsoleLine(std::cerr) << warning;
-  return proc.RecordRealtime(*outcome);
+  return proc.RecordRealtime(*launch.realtime_seen);
 }
 
 bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -1324,10 +1801,18 @@ bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
   const bool gap =
       (flags & introspect::kFlagLogGap) != 0 && proc.RecordLogGap(log);
   if (gap) PrintLogGap(proc.name, log);
+  // Once per run: record this run's log in recorder_failed_logs independently
+  // of the per-member stderr-once flags in recording_reported.
+  bool changed = gap;
+  if ((flags & introspect::kFlagRecorderFailed) != 0 &&
+      !launch.run_recorder_failed) {
+    launch.run_recorder_failed = true;
+    if (proc.RecordRecorderFailure(log)) changed = true;
+  }
   const uint32_t fresh =
       flags & ~launch.recording_reported &
       (introspect::kFlagRecorderFailed | introspect::kFlagLogCapped);
-  if (fresh == 0) return gap;
+  if (fresh == 0) return changed;
   launch.recording_reported |= fresh;
   if ((fresh & introspect::kFlagRecorderFailed) != 0) {
     proc.failed = true;
@@ -1393,19 +1878,22 @@ bool Launcher::RosterContinues(const std::vector<NodeProcessInfo>& procs,
 }
 
 bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
-                        const introspect::RegistryMapping* registry) {
+                        const introspect::RegistryMapping* registry,
+                        BridgeStatusObserver* status_observer) {
+  CheckBridgeProtocol(proc, launch, status_observer);
   bool changed = false;
   uint32_t recording = 0;
+  bool row_loop_started = false;
   std::optional<std::vector<naming::SourceShape>> live;
   bool live_complete = true;
   std::optional<DeliveryCounts> delivery;
   const auto read_row = [&]() -> RowObservation {
     if (registry == nullptr) return {};
     for (const auto& record : registry->header()->nodes) {
+      const auto generation = record.generation.load(std::memory_order_acquire);
       if (record.state.load(std::memory_order_acquire) !=
           static_cast<uint64_t>(introspect::SlotState::ACTIVE))
         continue;
-      const auto generation = record.generation.load(std::memory_order_acquire);
       if (record.pid != static_cast<uint64_t>(proc.pid) ||
           record.session_id != options_.session_id)
         continue;
@@ -1425,14 +1913,19 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
           (flags & introspect::kFlagConstructing) == 0) {
         published = PublishedEndpoints(record, live_complete);
       }
+      const bool loop_ready =
+          (flags & introspect::kFlagConstructing) == 0 &&
+          (introspect::RealtimeOf(flags).has_value() || dispatch > 0);
       DeliveryCounts loss = DeliveryCountsOf(record);
-      if (record.generation.load(std::memory_order_acquire) != generation ||
-          record.state.load(std::memory_order_acquire) !=
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (record.generation.load(std::memory_order_relaxed) != generation ||
+          record.state.load(std::memory_order_relaxed) !=
               static_cast<uint64_t>(introspect::SlotState::ACTIVE))
         continue;
       live = std::move(published);
       delivery = std::move(loss);
       recording = flags;
+      row_loop_started = loop_ready;
       return {.found = true,
               .constructing = (flags & introspect::kFlagConstructing) != 0,
               .heartbeat = beat,
@@ -1445,6 +1938,7 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   // against this run (RunLiveness).
   const LivenessCheck check = launch.liveness.Watch(options_.supervision_clock,
                                                     read_row, launch.limits);
+  if (row_loop_started) launch.loop_started = true;
   if (NoteRecording(proc, launch, recording)) changed = true;
   if (NoteRealtime(proc, launch, recording)) changed = true;
   // Kept every pass, posted only when a count first leaves 0: a later
@@ -1473,16 +1967,24 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   return changed;
 }
 
-void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
+void Launcher::Supervise(SessionManifest& manifest,
+                         std::vector<NodeProcessInfo>& procs,
                          std::vector<NodeLaunch>& launches,
                          std::optional<StudioBridge>& studio,
+                         std::optional<std::size_t> sim_gateway_index,
+                         BridgeStatusObserver* status_observer,
                          std::chrono::steady_clock::time_point deadline) {
-  bool stop_sent = false;
+  enum class StopPhase { kNone, kBridge, kAllSignaled };
+  StopPhase stop_phase = StopPhase::kNone;
+  bool bridge_killed = false;
+  bool sim_schedule_done = !sim_gateway_index.has_value();
+  auto bridge_stop_deadline = std::chrono::steady_clock::time_point::max();
   auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
   std::optional<introspect::RegistryMapping> registry;
   // Every first run's liveness counts from here, not its spawn.
   const auto started = options_.supervision_clock();
   for (auto& launch : launches) launch.NewRun(started);
+  if (studio) studio->BeginSupervision(started);
   ServiceNotifier notifier;
   const auto watchdog = notifier.watchdog_interval();
   // A pass starts as soon as a child exits or a stop signal arrives.
@@ -1498,8 +2000,8 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     notifier.Send("WATCHDOG=1");
     const auto now = options_.supervision_clock();
     const bool past_deadline = now >= deadline;
-    const bool stopping =
-        process::stop_requested.load() || stop_sent || past_deadline;
+    const bool stopping = process::stop_requested.load() ||
+                          stop_phase != StopPhase::kNone || past_deadline;
     // A stop signal can land after `stopping` was sampled: systemctl stop
     // signals the launcher and then every node, so a node killed by it can
     // be reaped in this pass. Restart decisions read the flag again, so
@@ -1515,6 +2017,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       if (session_lock_ != nullptr && !session_lock_->Refresh() &&
           !lock_lost_reported) {
         lock_lost_reported = true;
+        manifest.session_lock_lost = true;
+        session_manifest_.session_lock_lost = true;
+        manifest_changed = true;
         ConsoleLine(std::cerr)
             << "[launcher] the session lock " << session_lock_->path()
             << " was removed; a second launcher in this namespace "
@@ -1525,7 +2030,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       // and then hourly: between two tries a retention whose probe locks
       // again may remove this session, and on a network log root this flock
       // can block supervision and the watchdog ping (README "Session
-      // segments and logs"; TODO.md LOG-10).
+      // segments and logs").
       const Refreshed directory =
           session_directory_
               ? session_directory_->Refresh(options_.lock_session_directory)
@@ -1539,6 +2044,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       } else if (directory == Refreshed::kRetaken &&
                  !directory_lock_retaken_reported) {
         directory_lock_retaken_reported = true;
+        manifest.directory_lock_retaken = true;
+        session_manifest_.directory_lock_retaken = true;
+        manifest_changed = true;
         ConsoleLine(std::cerr)
             << "[launcher] " << session_directory_->path()
             << " was removed while this session held it; locked it "
@@ -1547,6 +2055,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       } else if (directory == Refreshed::kLost &&
                  !directory_lock_lost_reported) {
         directory_lock_lost_reported = true;
+        manifest.directory_lock_lost = true;
+        session_manifest_.directory_lock_lost = true;
+        manifest_changed = true;
         ConsoleLine(std::cerr)
             << "[launcher] " << session_directory_->path()
             << " was removed and cannot be locked again (retention "
@@ -1570,18 +2081,23 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       auto& proc = procs[i];
       auto& launch = launches[i];
       if (proc.pid <= 0 || proc.exited) continue;
-      // Every member but Studio's bridge, which takes no registry row, is
-      // supervised by its row; the simulation gateway registers like a node.
-      if (!stopping && !launch.heartbeat_killed &&
-          !(studio && i == studio->index())) {
-        if (WatchRun(proc, launch, registry ? &*registry : nullptr))
+      // Every member is supervised by its registry row; Studio's bridge runs
+      // its own observer liveness and bounded restart policy (StudioBridge).
+      if (studio && i == studio->index()) {
+        if (studio->Watch(proc, registry ? &*registry : nullptr,
+                          options_.supervision_clock, stopping))
+          manifest_changed = true;
+      } else if (!stopping && !launch.heartbeat_killed) {
+        if (WatchRun(proc, launch, registry ? &*registry : nullptr,
+                     status_observer))
           manifest_changed = true;
       }
       int status = 0;
       if (::waitpid(proc.pid, &status, WNOHANG) != proc.pid) continue;
       FinishProcessGroup(proc.pid);
+      CheckBridgeProtocol(proc, launch, status_observer);
       // The run's counts as it ended, before EndRun closes the run. Studio's
-      // bridge takes no row.
+      // bridge reports no delivery-loss counts.
       if (registry && !(studio && i == studio->index())) {
         uint32_t flags = 0;
         if (const auto loss =
@@ -1589,8 +2105,10 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                                     launch.spawned_monotonic_ns, flags)) {
           proc.RecordDeliveryLoss(*loss);
           // A run that ended before a supervision pass saw its row's event
-          // log flags (one killed during a gap) is marked from them here.
+          // log flags (one killed during a gap) or late realtime refusal is
+          // marked from them here.
           NoteRecording(proc, launch, flags);
+          NoteRealtime(proc, launch, flags);
         }
       }
       proc.exited = true;
@@ -1602,8 +2120,12 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       // from the stop flag: a stop signal from elsewhere that ended the run
       // first is not the session's (EndedByOwnStopSignal). Recorded in the
       // run, which the exit status reads too (exit_not_counted).
-      proc.EndRun(RunEndReason(launch.kill_reason, stop_arrived(), status),
-                  EndedByOwnStopSignal(launch.kill_reason, status));
+      const std::string_view kill_reason =
+          (studio && i == studio->index() && !studio->kill_reason().empty())
+              ? studio->kill_reason()
+              : launch.kill_reason;
+      proc.EndRun(RunEndReason(kill_reason, stop_arrived(), status),
+                  EndedByOwnStopSignal(kill_reason, status));
       // An observer's restarts are its own, on a non-critical schedule that
       // touches no other member (StudioBridge).
       if (studio && i == studio->index()) {
@@ -1644,9 +2166,60 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
               << " finished with the rest of the roster; not "
                  "restarted\n";
         } else {
-          Restart(procs[i], launch, now);
+          Restart(procs[i], launch, now, status_observer);
         }
         manifest_changed = true;
+      }
+    }
+    bool sim_schedule_polling = false;
+    if (!sim_schedule_done && sim_gateway_index && !stop_arrived()) {
+      const auto& gw_proc = procs[*sim_gateway_index];
+      const auto& gw_launch = launches[*sim_gateway_index];
+      const bool gw_running = gw_proc.pid > 0 && !gw_proc.exited;
+      if (!gw_running && !gw_launch.restart.pending()) {
+        // sim_gateway exited or failed to spawn with no pending restart: stop
+        // waiting and stop the 20 ms schedule-start poll for the rest of the
+        // session.
+        sim_schedule_done = true;
+      } else if (gw_running) {
+        bool roster_ready = gw_launch.loop_started;
+        bool waiting_for_running_loop = !gw_launch.loop_started;
+        for (std::size_t i = 0; i < procs.size(); ++i) {
+          if (studio && i == studio->index()) continue;
+          if (i == *sim_gateway_index) continue;
+          const auto& proc = procs[i];
+          const auto& launch = launches[i];
+          if (proc.pid > 0 && !proc.exited) {
+            if (!launch.loop_started) {
+              roster_ready = false;
+              waiting_for_running_loop = true;
+            }
+          } else if (launch.restart.pending() &&
+                     !launch.restart.quarantined()) {
+            // Exited or unspawned: wait only while a non-quarantined restart is
+            // pending, so a finished, unrestartable or quarantined member
+            // cannot hold the simulator's schedules forever.
+            roster_ready = false;
+          }
+        }
+        if (roster_ready) {
+          const std::string path =
+              options_.output_dir + "/" + std::string{kSimScheduleStartFile};
+          const std::string stamp =
+              std::to_string(event::Poller::now().nanos()) + "\n";
+          std::string write_error;
+          if (WriteFileAtomically(path, stamp, SyncFunction{}, write_error)) {
+            ConsoleLine(std::cout)
+                << "[launcher] Started sim_gateway schedule (" << path << ")\n";
+          } else {
+            ConsoleLine(std::cerr)
+                << "[launcher] cannot write " << path << " (" << write_error
+                << "); sim_gateway schedule not started\n";
+          }
+          sim_schedule_done = true;
+        } else {
+          sim_schedule_polling = waiting_for_running_loop;
+        }
       }
     }
     if (studio) {
@@ -1658,7 +2231,8 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       const uint64_t began = runs();
       const int64_t retry_at = bridge.retry_at_monotonic_ns;
       const bool failed = bridge.failed;
-      studio->Supervise(procs[studio->index()], now, stop_arrived());
+      studio->Supervise(procs[studio->index()], now, options_.supervision_clock,
+                        stop_arrived());
       if (began != runs() || retry_at != bridge.retry_at_monotonic_ns ||
           failed != bridge.failed)
         manifest_changed = true;
@@ -1690,11 +2264,22 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       return;
     }
 
-    if (!stop_sent && (process::stop_requested.load() || past_deadline ||
-                       endpoints_refused_)) {
-      stop_sent = true;
+    // Two-phase shutdown (REQ-OPS-20): stop `hardware_node` first so the
+    // bridge stops forwarding commands (and sends its neutral) before actuator
+    // owners exit; bound the wait at kBridgeStopTimeout (SIGKILL if hung), and
+    // only after `hardware_node` has been reaped signal the remaining children.
+    const auto running_bridge = [&]() -> std::optional<std::size_t> {
+      for (std::size_t i = 0; i < procs.size(); ++i) {
+        if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
+            !procs[i].exited) {
+          return i;
+        }
+      }
+      return std::nullopt;
+    };
+    const auto signal_remaining = [&] {
+      stop_phase = StopPhase::kAllSignaled;
       shutdown_deadline = now + kStopTimeout;
-      ConsoleLine(std::cout) << "[launcher] Stopping children...\n";
       for (std::size_t i = 0; i < procs.size(); ++i) {
         const auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
@@ -1703,8 +2288,34 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
         SignalProcessGroup(proc.pid, kStopSignal);
         if (launches[i].kill_reason.empty()) launches[i].kill_reason = kRunStop;
       }
+    };
+    if (stop_phase == StopPhase::kNone &&
+        (process::stop_requested.load() || past_deadline ||
+         endpoints_refused_)) {
+      ConsoleLine(std::cout) << "[launcher] Stopping children...\n";
+      if (const auto bridge_idx = running_bridge()) {
+        stop_phase = StopPhase::kBridge;
+        bridge_stop_deadline = now + kBridgeStopTimeout;
+        SignalProcessGroup(procs[*bridge_idx].pid, kStopSignal);
+        if (launches[*bridge_idx].kill_reason.empty()) {
+          launches[*bridge_idx].kill_reason = kRunStop;
+        }
+      } else {
+        signal_remaining();
+      }
+    } else if (stop_phase == StopPhase::kBridge) {
+      const auto bridge_idx = running_bridge();
+      if (!bridge_idx) {
+        signal_remaining();
+      } else if (!bridge_killed && now >= bridge_stop_deadline) {
+        bridge_killed = true;
+        SignalProcessGroup(procs[*bridge_idx].pid, SIGKILL);
+        if (launches[*bridge_idx].kill_reason == kRunStop) {
+          launches[*bridge_idx].kill_reason = kRunStopTimeout;
+        }
+      }
     }
-    if (stop_sent && now >= shutdown_deadline) {
+    if (stop_phase == StopPhase::kAllSignaled && now >= shutdown_deadline) {
       for (std::size_t i = 0; i < procs.size(); ++i) {
         const auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
@@ -1722,11 +2333,25 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     // The pass's WATCHDOG=1 went out at about `now`.
     if (watchdog) due(now + *watchdog);
     if (refreshes_locks) due(next_lock_refresh);
-    if (stop_sent) {
+    if (stop_phase == StopPhase::kBridge) {
+      if (!bridge_killed && now < bridge_stop_deadline) {
+        due(bridge_stop_deadline);
+      }
+    } else if (stop_phase == StopPhase::kAllSignaled) {
       // Once passed, its SIGKILLs are sent; the exits they cause wake it.
       if (now < shutdown_deadline) due(shutdown_deadline);
     } else {
       due(deadline);
+      if (sim_schedule_polling) due(now + kSimScheduleStartPoll);
+      if (status_observer != nullptr) {
+        for (std::size_t i = 0; i < procs.size(); ++i) {
+          if (procs[i].name == kHardwareNodeName && procs[i].pid > 0 &&
+              !procs[i].exited && !launches[i].protocol_checked) {
+            due(now + kBridgeProtocolPoll);
+            break;
+          }
+        }
+      }
       // Each run the next pass watches (WatchRun): its row's next look.
       for (std::size_t i = 0; i < procs.size(); ++i) {
         if (procs[i].pid <= 0 || procs[i].exited ||
@@ -1738,7 +2363,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     for (const auto& launch : launches) {
       if (launch.restart.pending()) due(launch.restart.due_at());
     }
-    if (studio) due(studio->NextCheck());
+    if (studio) due(studio->NextCheck(stop_phase != StopPhase::kNone));
     wakeup.Wait(wake == SupervisionTime::max()
                     ? std::chrono::nanoseconds::max()
                     : wake - options_.supervision_clock());

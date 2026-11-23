@@ -7,7 +7,7 @@
 import {channelDisplay, type Snapshot} from '../core';
 import {alertLevelName, type ActiveAlert, type LatchedAlert} from '../data/alerts';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../panels/field/geometry';
-import {type DriveModel, type DriveSummary, type Link, STALE_MS, type SummaryNode} from './feed';
+import {type DriveModel, type DriveSummary, type Link, STALE_MS, STATE_AGE_CHANNEL, type SummaryNode} from './feed';
 import type {Cell, CheckItem, Layout, Widget} from './layout';
 
 export function esc(text: string): string {
@@ -158,18 +158,20 @@ function alertsWidget(model: DriveModel): string {
 
 // The rows that matter come first, so a list that overflows its cell (the
 // body then scrolls) hides the least: a node down or quarantined (critical
-// ones first), a named node the summary lacks, one driving from a target
-// lane, a critical one, then the rest; summary order within each.
+// ones first), a node whose devices flush is holding outputs with no live
+// target (REQ-SAFE-41), a named node the summary lacks, one driving from a
+// target lane, a critical one, then the rest; summary order within each.
 function nodeRank(n: SummaryNode|string, summary: DriveSummary): number {
-  if (typeof n === 'string') return 2;
+  if (typeof n === 'string') return 3;
   const failed = (summary.registry && !n.alive) || (summary.supervised && n.quarantined);
   if (failed) return n.critical ? 0 : 1;
-  if (summary.registry && n.drives !== null) return 3;
-  return n.critical ? 4 : 5;
+  if (summary.registry && n.outputs_held) return 2;
+  if (summary.registry && n.drives !== null) return 4;
+  return n.critical ? 5 : 6;
 }
 
 // A subsystems row's state words (the row width model sizes for the widest).
-export const NODE_STATE = {failing: 'FAILING', down: 'DOWN', up: 'UP', unknown: 'unknown'} as const;
+export const NODE_STATE = {failing: 'FAILING', down: 'DOWN', held: 'HELD', up: 'UP', unknown: 'unknown'} as const;
 
 function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): string {
   const summary = model.summary;
@@ -187,16 +189,20 @@ function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): st
       return `<li><span class="name" title="${esc(n)}">${esc(n)}</span>${tag(NODE_STATE.unknown, 'neutral')}` +
           '<span class="meta">not in the summary</span></li>';
     // One state word, the most severe: a quarantined node is not running
-    // (the launcher paused its restarts), so FAILING says all DOWN would.
+    // (the launcher paused its restarts), so FAILING says all DOWN would; an
+    // alive node whose flush is holding outputs with no live target shows HELD.
     const state = summary.supervised && n.quarantined ? tag(NODE_STATE.failing, 'bad') :
         !summary.registry ? tag(NODE_STATE.unknown, 'neutral') :
-        n.alive           ? tag(NODE_STATE.up, 'good') :
-                            tag(NODE_STATE.down, n.critical ? 'bad' : 'warn');
+        !n.alive          ? tag(NODE_STATE.down, n.critical ? 'bad' : 'warn') :
+        n.outputs_held    ? tag(NODE_STATE.held, 'warn') :
+                            tag(NODE_STATE.up, 'good');
+    const held = !(summary.supervised && n.quarantined) && summary.registry &&
+        n.alive && n.outputs_held ? 'outputs held: no live target' : '';
     const restarts = summary.supervised && n.restarts > 0 ? `restarts ${n.restarts}` : '';
     const drives = summary.registry && n.drives !== null ? `drives ${n.drives}` : '';
     // The name's tooltip repeats what a narrow row may cut off.
-    // One note for both, so a narrow row loses one gap to it, not two.
-    const note = [restarts, drives].filter(Boolean).join(' · ');
+    // One note for all, so a narrow row loses one gap to it.
+    const note = [held, restarts, drives].filter(Boolean).join(' · ');
     const title = [n.name, note].filter(Boolean).join(' · ');
     return `<li><span class="name" title="${esc(title)}">${esc(n.name)}</span>${state}` +
         (note ? `<span class="meta">${esc(note)}</span>` : '') + '</li>';
@@ -357,8 +363,9 @@ export function renderWidget(w: Widget, model: DriveModel, now: number): string 
 
 const LINK_WORD: Record<Link, string> = {
   ok: 'OK', connecting: 'CONNECTING', bridge: 'BRIDGE LINK',
-  telemetry: 'TELEMETRY', hardware: 'HARDWARE BRIDGE', roborio: 'ROBORIO LINK',
-  replaced: 'REPLACED'
+  telemetry: 'TELEMETRY', hardware: 'HARDWARE BRIDGE',
+  protocol: 'PROTOCOL MISMATCH', roborio: 'ROBORIO LINK',
+  replaced: 'REPLACED', refused: 'LAUNCH REFUSED'
 };
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -368,10 +375,25 @@ export function renderStatus(model: DriveModel, now: number, skipped = 0): strin
   const status = model.status(now);
   const c = model.counters;
   const malformed = c.malformed_binary + c.malformed_text;
-  return `<div class="status link-${status.link}" role="status">` +
-      `<b>${LINK_WORD[status.link]}</b> ${esc(status.text)}` +
+  let stateAge = '';
+  if ((status.link === 'ok' || status.link === 'roborio') && model.latest) {
+    const ageUs = model.latest.channels[STATE_AGE_CHANNEL];
+    if (ageUs !== undefined && Number.isFinite(ageUs) && ageUs >= 0) {
+      stateAge = status.link === 'roborio' && ageUs === 0 ?
+          ' <span class="meta">no state received</span>' :
+          ` <span class="meta">state age ${Math.round(ageUs / 1000)} ms</span>`;
+    }
+  }
+  const summaryText = status.link === 'refused' ?
+      status.text.replace(/\s+/g, ' ').trim() : status.text;
+  const titleAttr = status.link === 'refused' ? ` title="${esc(status.text)}"` : '';
+  const linkClass = status.link === 'protocol' ?
+      'link-protocol link-error' : `link-${status.link}`;
+  return `<div class="status ${linkClass}" role="status"${titleAttr}>` +
+      `<b>${LINK_WORD[status.link]}</b> ${esc(summaryText)}` +
       (status.link === 'replaced' ?
            ' <button type="button" data-action="reconnect">Reconnect</button>' : '') +
+      stateAge +
       (malformed ? ` <span class="meta">${plural(malformed, 'malformed message')} counted</span>` : '') +
       (skipped > 0 ?
            ` <span class="meta bad">${plural(skipped, 'layout widget')} not drawn: no cell this page can read</span>` :
@@ -379,9 +401,33 @@ export function renderStatus(model: DriveModel, now: number, skipped = 0): strin
       '</div>';
 }
 
+function renderRefusalBanner(reason: string): string {
+  return '<section class="w refusal-banner" role="alert" style="grid-column:1 / -1;grid-row:1 / -1">' +
+      '<header><h2>LAUNCH REFUSED</h2></header>' +
+      '<div class="body">' +
+      '<div class="big bad">LAUNCH REFUSED</div>' +
+      `<pre class="refusal-reason">${esc(reason)}</pre>` +
+      '<p class="small refusal-hint">The robot did not start because the launcher refused this configuration or bundle. ' +
+      'Fix the error above, install a passing bundle, and restart the robot service (see Pre-match checklist).</p>' +
+      '</div></section>';
+}
+
+// Each grid cell's markup, in order, for Painter (main.ts) and renderWidgets.
+// When the layout has no widgets (the minimal layout served in refusal mode),
+// draws a full-grid LAUNCH REFUSED banner while refused.
+export function renderGridWidgets(layout: Layout, model: DriveModel, now: number): string[] {
+  if (layout.widgets.length > 0)
+    return layout.widgets.map(w => renderWidget(w, model, now));
+  const status = model.status(now);
+  if (status.link === 'refused') return [renderRefusalBanner(status.text)];
+  return ['<section class="w" style="grid-column:1 / -1;grid-row:1 / -1">' +
+      '<header><h2>Robot status</h2></header>' +
+      `<div class="body"><p class="none">${esc(status.text)}</p></div></section>`];
+}
+
 // The widgets, for the grid element (gridStyle sizes it).
 export function renderWidgets(layout: Layout, model: DriveModel, now: number): string {
-  return layout.widgets.map(w => renderWidget(w, model, now)).join('');
+  return renderGridWidgets(layout, model, now).join('');
 }
 
 export function gridStyle(layout: Layout): string {
@@ -393,9 +439,14 @@ export function gridStyle(layout: Layout): string {
 // plain objects. `E` is one widget's element.
 export interface Surface<E> {
   status(html: string): void;
+  // A dedicated DRAWING ERROR row beneath the top status bar (empty when
+  // clear), so a widget drawing fault never hides the link status line.
+  drawError(html: string): void;
   create(html: string): E;
   // Puts `next` at `index` of the grid, in place of `previous` if any.
   put(index: number, next: E, previous: E|undefined): void;
+  // Removes a trailing or replaced layout's element from the grid.
+  remove?(index: number, previous: E): void;
   // Sizes the element's list body, if any, to the whole rows its cell
   // leaves it (on the grid, so laid out).
   fit(element: E): void;
@@ -407,8 +458,15 @@ export interface Surface<E> {
   errored(on: boolean): void;
 }
 
-// One frame: the status line, and each widget's markup in layout order.
-export type Frame = {status: string; widgets: string[]};
+function drawErrorHtml(error: unknown): string {
+  return '<div class="status link-error" role="alert"><b>DRAWING ERROR</b> ' +
+      `The dashboard is not updating; reload the page (${esc(String(error))})</div>`;
+}
+
+function layoutErrorHtml(message: string): string {
+  return '<div class="status link-error" role="alert"><b>LAYOUT ERROR</b> ' +
+      `${esc(message)}</div>`;
+}
 
 // Paints frames widget by widget. The page redraws every RENDER_MS, and with
 // a live producer some widget (a graph, the battery, the match clock)
@@ -418,40 +476,80 @@ export type Frame = {status: string; widgets: string[]};
 // one's list scroll position: read before the old element leaves the grid
 // (off it, it reads 0) and set once the new body is sized to whole rows (set
 // before, it is clamped to a taller body's range, so a list scrolled to its
-// bottom would lose part of a row). A drawing error leaves the grid as it
-// is, marks it (it shows values no longer updated) and says so on the
-// status line.
+// bottom would lose part of a row). A widget drawing error keeps the top
+// status line visible and live, shows a DRAWING ERROR row telling the
+// operator to reload, and marks the grid until a good draw; a layout reload
+// error similarly keeps the top status line live, shows LAYOUT ERROR, and
+// freezes/marks the last grid until a reload succeeds; if drawing the status
+// line itself throws, the status slot carries DRAWING ERROR instead.
 export class Painter<E> {
   private status = '';
+  private drawError = '';
   private markup: string[] = [];
   private elements: E[] = [];
 
   constructor(private readonly surface: Surface<E>) {}
 
-  paint(draw: () => Frame) {
-    let next: Frame;
+  // Removes every painted widget element so a reloaded layout mounts fresh
+  // without carrying scroll offsets across unrelated cells. Keeps the status
+  // line and error banner untouched.
+  clearWidgets() {
+    for (let i = this.elements.length - 1; i >= 0; i--) {
+      this.surface.remove?.(i, this.elements[i]);
+    }
+    this.elements.length = 0;
+    this.markup.length = 0;
+  }
+
+  paint(drawStatus: () => string, drawWidgets: () => string[],
+        layoutError: string|null = null) {
+    let nextStatus: string;
     try {
-      next = draw();
+      nextStatus = drawStatus();
     } catch (error) {
       // Forget the status shown, so the first good draw repaints it.
       this.status = '';
-      this.surface.status('<div class="status link-error" role="status"><b>DRAWING ERROR</b> ' +
-                          `The dashboard is not updating: ${esc(String(error))}</div>`);
+      if (this.drawError !== '') this.surface.drawError(this.drawError = '');
+      this.surface.status(drawErrorHtml(error));
       this.surface.errored(true);
       return;
     }
-    if (next.status !== this.status) this.surface.status(this.status = next.status);
-    next.widgets.forEach((html, i) => {
-      if (html === this.markup[i]) return;
-      this.markup[i] = html;
-      const previous = this.elements[i];
-      const top = previous === undefined ? 0 : this.surface.scrollTop(previous);
-      const element = this.surface.create(html);
-      this.surface.put(i, element, previous);
-      this.elements[i] = element;
-      this.surface.fit(element);
-      if (top > 0) this.surface.setScrollTop(element, top);
-    });
+    if (nextStatus !== this.status) this.surface.status(this.status = nextStatus);
+
+    if (layoutError) {
+      const html = layoutErrorHtml(layoutError);
+      if (html !== this.drawError) this.surface.drawError(this.drawError = html);
+      this.surface.errored(true);
+      return;
+    }
+
+    try {
+      const nextWidgets = drawWidgets();
+      nextWidgets.forEach((html, i) => {
+        if (html === this.markup[i]) return;
+        const previous = this.elements[i];
+        const top = previous === undefined ? 0 : this.surface.scrollTop(previous);
+        const element = this.surface.create(html);
+        this.surface.put(i, element, previous);
+        this.elements[i] = element;
+        this.markup[i] = html;
+        this.surface.fit(element);
+        if (top > 0) this.surface.setScrollTop(element, top);
+      });
+      if (nextWidgets.length < this.elements.length) {
+        for (let i = this.elements.length - 1; i >= nextWidgets.length; i--) {
+          this.surface.remove?.(i, this.elements[i]);
+        }
+        this.elements.length = nextWidgets.length;
+        this.markup.length = nextWidgets.length;
+      }
+    } catch (error) {
+      const html = drawErrorHtml(error);
+      if (html !== this.drawError) this.surface.drawError(this.drawError = html);
+      this.surface.errored(true);
+      return;
+    }
+    if (this.drawError !== '') this.surface.drawError(this.drawError = '');
     this.surface.errored(false);
   }
 }
@@ -596,7 +694,7 @@ export function listRowsFit(layout: {columns: number; rows: number}, at: Cell,
 }
 
 // How many characters of a row's name show beside `word` and `notes` notes
-// (a subsystems row has at most one, restarts and drives: shrunk to nothing
+// (a subsystems row has at most one, held, restarts and drives: shrunk to nothing
 // first, still a gap) in a list
 // column `width` px wide, by the GLYPH_PX model: what the row leaves after
 // its gaps and the word's box, less one character for the ellipsis of a cut
@@ -614,6 +712,7 @@ export function renderShell(layout: Layout, status = '', grid = ''): string {
   return `<div class="page" style="${pageStyle()}">` +
       `<header class="top"><h1>${esc(layout.title)}</h1>` +
       `<div class="status-slot">${status}</div></header>` +
+      '<div class="draw-error"></div>' +
       `<main class="grid" style="${gridStyle(layout)}">${grid}</main>` +
       '</div>';
 }

@@ -35,8 +35,9 @@
 # (tools/tidy.sh with format's base, CI's clang-tidy selection; where it
 # exits 3, cannot run on this host, the line `prepush: tidy NOT RUN
 # (<its reason>)`, which does not fail the run), then, when the commits to push
-# (<ref>@{upstream}..<ref>; every file when <ref> is not a branch with an
-# upstream) touch MODULE.bazel, REPO.bazel, third_party/, talOS/, tools/ or
+# (<ref>@{upstream}...<ref>, else since the merge base with origin/main,
+# else every file when neither exists) touch MODULE.bazel, REPO.bazel,
+# talos.bazelrc, .bazelversion, third_party/, talOS/, studio/, tools/ or
 # the fixtures,
 # dependent-robot_repo and dependent-wrist_repo (`bazel test //...
 # @talos//talOS/configuration:config_fuzz_test` inside examples/robot_repo
@@ -49,7 +50,7 @@
 # it; unset, one `skipped` line that does not fail the run; set, empty
 # included, to something that is not a directory, the step FAILED, since it
 # names no robot repository; tools/prepush_robot_repository.sh decides),
-# gradle (`phoenixTest buildRio -Pheadless --offline`, when the commits
+# gradle (`phoenixTest buildRio -Pcompanion=10.0.0.2 -Pheadless --offline`, when the commits
 # touch controller_processor/ or talOS/, whose headers the RoboRIO
 # program's build.gradle exports), rio-in-the-loop (`python3
 # tools/test_rio_in_the_loop.py --wpilib --output-dir <logs>/rio-in-the-loop`,
@@ -59,7 +60,7 @@
 # MODULE.bazel, third_party/, .bazelversion or talos.bazelrc), under
 # --full only tsan and asan (tools/sanitizer_lane.sh, CI's sanitizer
 # jobs; 5 to 10 minutes each cold) and soak (CI's
-# soak_test with seed 0 for TALOS_SOAK_SECONDS=36, the shortest run that
+# soak_test with seed 0 for TALOS_SOAK_SECONDS=48, the shortest run that
 # injects every fault kind); after a failed build, host-includes, test,
 # tidy, rio-in-the-loop, tsan, asan and soak are SKIPPED; checkout-unchanged, then, when the commits
 # touch studio/,
@@ -68,8 +69,8 @@
 # (see <log>)`, `prepush: <step> SKIPPED (<reason>)`, tidy's `NOT RUN`
 # above); logs stay in a
 # directory under ${TMPDIR:-/tmp}. A commit without the tool a step runs
-# (source_lints.sh, format.sh, tidy.sh, test_rio_in_the_loop.py,
-# sanitizer_lane.sh) has that
+# (source_lints.sh, format.sh, tidy.sh, check_robot_repo_scaffold.sh,
+# test_rio_in_the_loop.py, sanitizer_lane.sh) has that
 # step SKIPPED, unless --ref names another commit than the checkout's HEAD
 # and the upstream it goes to (if any) lacks the tool too: then it predates
 # the tool, and the line says `skipped`, which does not fail the run.
@@ -86,9 +87,9 @@
 # where it finds the browser //studio:drive_browser_test would use, it sets
 # TALOS_REQUIRE_BROWSER=1 (and passes TALOS_BROWSER when set); with none,
 # that test skips and the run says so. JAVA_HOME, when unset, defaults to
-# ~/wpilib/2026/jdk if that directory exists. Studio trusts the checkout's installed
-# studio/node_modules when present, unless the commits to push change
-# studio/pnpm-lock.yaml: then, as when none is installed, it runs `pnpm
+# ~/wpilib/2026/jdk if that directory exists. Studio reuses the checkout's
+# installed studio/node_modules when its studio/node_modules/.pnpm/lock.yaml
+# matches the worktree's studio/pnpm-lock.yaml; otherwise it runs `pnpm
 # install --frozen-lockfile --offline` and reports studio SKIPPED if that
 # fails.
 #
@@ -229,13 +230,22 @@ skip() {  # skip NAME REASON: a step that should have run and did not.
 
 # Which optional steps the commits to push need.
 # The range is from the checked branch's upstream (--ref's own when it
-# names a branch); for any other commit there is none, and every optional
-# step runs.
+# names a branch), else from the merge base with origin/main; when neither
+# exists (or shares no history with the commit), every optional step runs.
 upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name "$ref@{upstream}" 2>/dev/null || true)"
+touches_base=""
+touches_from=""
+if [ -n "$upstream" ]; then
+  touches_base="$upstream"
+  touches_from="$upstream"
+elif git -C "$repo" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+  touches_base="$(git -C "$repo" merge-base refs/remotes/origin/main "$commit" 2>/dev/null || true)"
+  touches_from="origin/main"
+fi
 touches() {  # touches PATH...: the pushed range changes something under PATH.
-  [ -z "$upstream" ] && return 0
+  [ -z "$touches_base" ] && return 0
   local changed
-  changed="$(git -C "$repo" diff --name-only "$upstream...$commit" -- "$@")" || return 0
+  changed="$(git -C "$repo" diff --name-only "$touches_base...$commit" -- "$@")" || return 0
   [ -n "$changed" ]
 }
 
@@ -401,14 +411,14 @@ fi
 # bazel-* links and lockfiles), which checkout-unchanged then confirms.
 # What they build from talOS: its module file, REPO.bazel (which applies to
 # @talos as to any repository), the toml++ build file and patch in
-# third_party/, and packages under talOS/ and tools/ (`bazel query
-# 'buildfiles(deps(//...))'` in each). Each fixture's .bazelrc imports
-# talOS's talos.bazelrc, and robot_repo's talos_pin_test compares its
-# .bazelversion with talOS's; talOS's own .bazelrc and studio/ are not
-# read there.
-dependent_paths=(MODULE.bazel REPO.bazel talos.bazelrc .bazelversion third_party/ talOS/ tools/ examples/robot_repo/ examples/wrist_repo/)
+# third_party/, and packages under talOS/, studio/ (examples/robot_repo
+# depends on @talos//studio/bridge and @talos//studio:web_dist), and tools/
+# (`bazel query 'buildfiles(deps(//...))'` in each). Each fixture's .bazelrc
+# imports talOS's talos.bazelrc, and robot_repo's talos_pin_test compares its
+# .bazelversion with talOS's; talOS's own .bazelrc is not read there.
+dependent_paths=(MODULE.bazel REPO.bazel talos.bazelrc .bazelversion third_party/ talOS/ studio/ tools/ examples/robot_repo/ examples/wrist_repo/)
 if ! touches "${dependent_paths[@]}"; then
-  report "dependents not needed (nothing under ${dependent_paths[*]} since $upstream)"
+  report "dependents not needed (nothing under ${dependent_paths[*]} since $touches_from)"
 elif [ ! -d "$wt/examples/robot_repo" ]; then
   report "dependents not needed (this commit has no examples/robot_repo)"
 else
@@ -426,6 +436,8 @@ else
       bash tools/check_robot_repo_scaffold.sh \
       --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
       true
+  else
+    no_tool scaffold-robot_repo tools/check_robot_repo_scaffold.sh
   fi
 fi
 # A robot repository that consumes talOS (TALOS_ROBOT_REPOSITORY, its
@@ -459,10 +471,10 @@ rio_paths=(controller_processor/ talOS/)
 if [ "$skip_gradle" = 1 ]; then
   report "gradle skipped (--skip-gradle)"
 elif ! touches "${rio_paths[@]}"; then
-  report "gradle not needed (nothing under ${rio_paths[*]} since $upstream)"
+  report "gradle not needed (nothing under ${rio_paths[*]} since $touches_from)"
 else
   run_step gradle sh -c \
-    'cd controller_processor/rio && ./gradlew phoenixTest buildRio -Pheadless --offline' ||
+    'cd controller_processor/rio && ./gradlew phoenixTest buildRio -Pcompanion=10.0.0.2 -Pheadless --offline' ||
     true
 fi
 
@@ -479,7 +491,7 @@ rio_loop_paths=(tools/test_rio_in_the_loop.py bench/ controller_processor/
 if [ "$skip_gradle" = 1 ]; then
   report "rio-in-the-loop skipped (--skip-gradle)"
 elif [ "$full" = 0 ] && ! touches "${rio_loop_paths[@]}"; then
-  report "rio-in-the-loop not needed (nothing under ${rio_loop_paths[*]} since $upstream)"
+  report "rio-in-the-loop not needed (nothing under ${rio_loop_paths[*]} since $touches_from)"
 elif [ ! -f "$wt/tools/test_rio_in_the_loop.py" ]; then
   no_tool rio-in-the-loop tools/test_rio_in_the_loop.py
 elif [ "$built" = 0 ]; then
@@ -491,8 +503,8 @@ fi
 
 # CI's sanitizer jobs, from the commit's own tools/sanitizer_lane.sh (CI
 # runs the same one), and one soak seed: CI's soak with the seed its branch
-# pushes use, for 36 s of teleop rather than 180 s, the shortest run that
-# injects every fault kind once (bench/main_processor/simulation/README.md).
+# pushes use, for 48 s of enabled cycles rather than 180 s, the shortest run
+# that injects every fault kind once (bench/main_processor/simulation/README.md).
 if [ "$full" = 1 ] && [ "$built" = 0 ]; then
   for step in tsan asan soak; do skip "$step" "the build failed"; done
 elif [ "$full" = 1 ]; then
@@ -507,7 +519,7 @@ elif [ "$full" = 1 ]; then
   done
   run_step soak bazel test //bench/main_processor/simulation:soak_test \
     --test_output=errors --nocache_test_results \
-    --test_env=TALOS_SOAK_SECONDS=36 --test_env=TALOS_SOAK_SEED=0 \
+    --test_env=TALOS_SOAK_SECONDS=48 --test_env=TALOS_SOAK_SEED=0 \
     --noshow_progress "--disk_cache=$disk_cache" || true
 else
   report "tsan, asan and soak not run (they run under --full)"
@@ -520,10 +532,12 @@ run_step checkout-unchanged sh -c \
 if [ "$skip_studio" = 1 ]; then
   report "studio skipped (--skip-studio)"
 elif ! touches studio/; then
-  report "studio not needed (nothing under studio/ since $upstream)"
+  report "studio not needed (nothing under studio/ since $touches_from)"
 else
   studio_ready=1
-  if [ -d "$repo/studio/node_modules" ] && ! touches studio/pnpm-lock.yaml; then
+  if [ -d "$repo/studio/node_modules" ] &&
+      [ -f "$repo/studio/node_modules/.pnpm/lock.yaml" ] &&
+      cmp -s "$repo/studio/node_modules/.pnpm/lock.yaml" "$wt/studio/pnpm-lock.yaml"; then
     ln -s "$repo/studio/node_modules" "$wt/studio/node_modules"
   elif ! run_step studio-install sh -c \
       'cd studio && pnpm install --frozen-lockfile --offline'; then

@@ -26,7 +26,7 @@ that bus's Talon FX, CANcoder and Pigeon 2 counts at the config's
 `status_hz`, with CTR Electronics' per-device figures (classic CAN on
 `"rio"`, CAN FD on a CANivore) plus 5 % for the vendor's diagnostic server,
 calibrated to the bench's measured CANivore utilization
-(`EstimateCanBusLoads` in `talOS/introspection/names.h`); the warning names
+(`EstimateCanBusLoads` in `talOS/introspection/hardware_lint.h`); the warning names
 the bus, its estimate and its device counts.
 
 Subsystems default to `critical = true`. A failed probe (timeout, crash or
@@ -87,10 +87,10 @@ passes it. Of a launch's refusals before its probes:
 
 | Refusal | `--describe-only` | with `--describe-as-launch` |
 |---|---|---|
-| `--allow-graph-errors` without `--sim`; `--sim-gateway-arg` without `--start-sim-gateway` or naming a port; an unloadable bundle or config; `--sim` with a remote other than `127.0.0.1`; a bad restart setting; a duplicate or misnamed member | refused | refused |
+| `--allow-graph-errors` without `--sim`; `--sim-gateway-arg` without `--start-sim-gateway` or naming a port; an unloadable bundle or config; an invalid `--remote` or `--local-address`; `--sim` with a remote other than `127.0.0.1` or a `local_address` other than unset/`127.0.0.1`; a bad restart setting; a duplicate or misnamed member | refused | refused |
 | [`[robot] simulation_only`](#lightweight-simulation-gateway) without `--sim` | accepted | refused |
 | the [session lock](#one-session-per-namespace) held by another launch | not checked | not checked: it is held by the session a check runs beside |
-| the [live registry](../introspection/README.md#prepared-by-the-launcher) cannot be prepared or has no room | not checked | not checked: it is shared memory, and its rows are the running session's |
+| the [live registry](../introspection/README.md#prepared-by-the-launcher) cannot be prepared (registry capacity is checked after probes, once any unanswered Studio bridge is dropped, and is skipped by both modes too) | not checked | not checked: it is shared memory, and its rows are the running session's |
 
 A port the bridges bind is not checked either way: it is bound only by a
 member that has started (the hardware bridge's link, the Studio bridge's
@@ -118,6 +118,11 @@ running session's topics, and that session's restarted nodes would attach to
 segments its other nodes no longer share. The second launch is refused instead:
 
     launcher: another launcher (pid 4242) is running a session in this shared-memory namespace (...)
+
+`--check-session-lock` runs that lock check on its own without a config,
+exiting 0 if the namespace's session lock is free and 1 naming the holder on
+stderr if it is held (`sim.sh` calls it before starting WPILib simulation, and
+before `bazel build` when the launcher binary is already built).
 
 The namespace is `ShmObjectName`'s ([ARCHITECTURE.md](../../ARCHITECTURE.md#topics-and-messages)):
 sessions and test runs under their own `TALOS_SHM_NAMESPACE` or Bazel
@@ -242,27 +247,65 @@ Since an actuator owner's `period_us` is also at most a quarter of
 `command_timeout_us` ([the tick](../../ARCHITECTURE.md#the-tick)), a config
 with a Python actuator owner needs a `command_timeout_us` of at least 80000.
 
+## Telemetry labels and dashboard layout
+
+After phase one the launcher runs `LintTelemetryConfig` over every telemetry
+subsystem's `[[subsystem.labels]]` entries and any `[studio] dashboard` layout
+using the same validator the telemetry node runs at construction
+([talOS/telemetry](../telemetry/README.md#dashboard-layout)). An invalid
+`[[subsystem.labels]]` entry (bad structure, unknown key, missing/non-string
+field, bad `from`, missing/non-string-array source, over 1024 labels or a
+label past the string limit) or a `[studio] dashboard` layout the file alone
+refuses (syntax, schema, grid or budget) is a phase-1 error naming the
+subsystem or layout file and key. It refuses `--describe-only`,
+`deploy.sh install`, and launch even when `telemetry` is marked
+`critical = false` (overridden in simulation only with
+`--sim --allow-graph-errors`). A finding checked against the declared graph's
+dictionary (a label's channel absent from it, not an integer, or already
+labelled; a layout channel absent from or excluded from it; a dictionary or
+drive feed over its limit once labels and alerts are counted) is that error
+too when every node other than telemetry and the Studio bridge answered
+`--describe`. When one did not (a `critical = false` node that does not
+answer only warns), its channels are missing from the dictionary, so such a
+finding is a warning that says the declared graph is incomplete and names the
+nodes that did not answer, and the launch is not refused for it. With no
+such node answering at all, nothing is checked against the dictionary.
+
 ## Live endpoints
 
 The lint checks the graph the probes declared, so a node must declare the same
 endpoints whether or not `Node::describing()`
-([node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md)). The launcher
-checks that each run did. Once per run of every member that answered
-`--describe`, in the first supervision pass that finds the run's registry row
-active with its sources published, it compares the row's topic ends with the
-probe's: kind, topic, message size, alignment and the `external`, `optional`,
-`observer` and `untargeted_outputs` attributes, as multisets, so a node that
-lifts its flush's target gate only when it is not describing
-(REQ-SAFE-42) is refused as below. Timers are not endpoints, and the
-loop's latest-only flag, which a probe reports, is a delivery detail, not an
-endpoint attribute. The schema hash is not in
-the registry; it needs no comparison, because every declared topic's
-session-owned segment was created with its declared schema and an end with
-another one fails at attach, while an undeclared topic differs by name. A row
-publishes its sources once per claim, before it clears `kFlagConstructing`
-(or, for the hardware bridge and the simulation gateway, which never set it,
-before any source shows), so the comparison never sees a half-written table;
-a run that registers no source at all is not compared.
+([node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md)). Two checks
+enforce that:
+
+- **Targeted-outputs construction gate (REQ-SAFE-42).** When a member's
+  `--describe` probe answered and declared a `hardware_request` endpoint without
+  `untargeted_outputs`, and `--allow-graph-errors` is not set, the launcher
+  passes `--targeted-outputs` to that member on its first run and on every
+  restart (`Restart` reuses `launch.args`). A node started with
+  `--targeted-outputs` refuses `talos::AllowUntargetedOutputs`
+  (`talos.allow_untargeted_outputs` in Python) at construction with
+  `std::logic_error` (`TalosError`) and exits non-zero before its loop starts,
+  so an opt-out hidden behind `!Node::describing()` can never tick untargeted
+  on a first run or after a critical restart. Non-actuator nodes,
+  `hardware_node`, `sim_gateway`, `studio_bridge`, nodes whose probe declared
+  `untargeted_outputs`, unanswered probes and `--allow-graph-errors` launches do
+  not receive `--targeted-outputs`.
+- **Live endpoint comparison.** Once per run of every member that answered
+  `--describe`, in the first supervision pass that finds the run's registry row
+  active with its sources published, the launcher compares the row's topic ends
+  with the probe's: kind, topic, message size, alignment and the `external`,
+  `optional`, `observer` and `untargeted_outputs` attributes, as multisets.
+  Timers are not endpoints, and the
+  loop's latest-only flag, which a probe reports, is a delivery detail, not an
+  endpoint attribute. The schema hash is not in
+  the registry; it needs no comparison, because every declared topic's
+  session-owned segment was created with its declared schema and an end with
+  another one fails at attach, while an undeclared topic differs by name. A row
+  publishes its sources once per claim, before it clears `kFlagConstructing`
+  (or, for the hardware bridge and the simulation gateway, which never set it,
+  before any source shows), so the comparison never sees a half-written table;
+  a run that registers no source at all is not compared.
 
 A difference is one error line naming the member, its pid and each end only
 the live run or only the probe holds:
@@ -299,6 +342,7 @@ configuration, with a CLI override for one-off runs:
 ```toml
 [robot]
 controller_address = "10.56.87.2"  # RoboRIO as seen from this companion
+local_address = "10.56.87.5"       # optional companion interface IPv4; unset binds 0.0.0.0
 controller_port = 5802             # gateway port on the controller
 local_port = 5803                  # bind port on the companion
 ```
@@ -306,24 +350,40 @@ local_port = 5803                  # bind port on the companion
 
 ```sh
 bazel run //talOS/launcher:launcher -- --config bench/main_processor/configuration/robot.toml
-bazel run //talOS/launcher:launcher -- --config bench/main_processor/configuration/robot.toml --remote 10.56.87.2
+bazel run //talOS/launcher:launcher -- --config bench/main_processor/configuration/robot.toml --remote 10.56.87.2 --local-address 10.56.87.5
 ```
 
-`--remote` overrides `[robot] controller_address`; `--remote-port` and
-`--local-port` override their config counterparts the same way. The address
-must be an IPv4 literal (the bridge's socket resolves no hostname), and a port,
-in the config or a flag, is an integer in [1, 65535]; config load or flag
-parsing refuses anything else. The launcher
-resolves the effective endpoint once per launch, prints it
-(`[launcher] Controller <addr>:<port> ...`), and always starts
-`hardware_node` with an explicit `--remote/--remote-port/--local-port` triple,
-which its `--describe` probe gets too (`ControllerArgs`): the bridge refuses
-`--sim` without the loopback remote, so a probe left to the config's
-address would refuse `--sim --remote 127.0.0.1` on a config naming the
-RoboRIO.
-Running the bridge standalone resolves identically: its own `--remote` wins,
-otherwise its `--config` supplies the address. Simulation requires the loopback
-remote. On hardware, commissioning gates commands; see
+`--remote` overrides `[robot] controller_address`, `--local-address` overrides
+`[robot] local_address`, and `--remote-port` and `--local-port` override their
+config counterparts the same way. Every address must be an IPv4 literal without
+leading zeros (the bridge's socket resolves no hostname), and a port, in the
+config or a flag, is an integer in [1, 65535]; config load or flag validation
+refuses anything else before probing or spawning. The launcher resolves the
+effective endpoint once per launch, prints it (`[launcher] Controller
+<addr>:<port> (local <ip>:<port>)` when `local_address` is set, or `(local port
+<port>)` when unset), and always starts `hardware_node` with an explicit
+`--remote/--remote-port/--local-port` triple plus `--local-address <ip>` when
+`local_address` is non-empty, which its `--describe` probe gets too
+(`ControllerArgs`): the bridge refuses `--sim` without the loopback remote, so
+a probe left to the config's address would refuse `--sim --remote 127.0.0.1` on
+a config naming the RoboRIO.
+
+When `[robot] local_address` (or `--local-address`) is set, `hardware_node`
+binds that IPv4 interface address on its first open and on every socket reopen,
+preventing a multi-homed companion (such as a Mac mini with Ethernet and Wi-Fi
+on the same subnet) from drifting onto another source IP after a cable pull or
+route change (`REQ-RT-22`). When unset on a non-`--sim`, non-loopback
+(`!= 127.0.0.1`) controller target, phase one (and `--describe-only`) emits a
+non-fatal warning (`warning: hardware_node: [robot] local_address is unset;
+...`) so field configs catch an unpinned bind before deployment (`REQ-OPS-25`);
+loopback (`127.0.0.1`) and `--sim` launches emit no warning.
+
+Running the bridge standalone resolves identically: its own `--remote` and
+`--local-address` win, otherwise its `--config` supplies them. Simulation
+requires the loopback remote (`127.0.0.1`) and either an unset or `127.0.0.1`
+local address (a field config that sets `[robot] local_address` can be run
+under `--sim` by also passing `--local-address 127.0.0.1`). On hardware,
+commissioning gates commands; see
 [hardware configuration](../hardware/README.md#configuration).
 
 ## Lightweight simulation gateway
@@ -340,7 +400,18 @@ is refused naming its `[subsystems.sim_gateway]` key. The launcher passes the ga
 ports (`SimulatorArgs`): `--port` is the effective controller port the bridge
 sends to (`[robot] controller_port`, or `--remote-port`) and `--remote-port` the
 effective local port the bridge listens on (`[robot] local_port`, or
-`--local-port`), so the two always agree. Repeat `--sim-gateway-arg ARG` to
+`--local-port`), so the two always agree. Unless `--sim-gateway-arg` already
+supplies `--schedule-start-file`, the launcher also passes
+`--schedule-start-file <output_dir>/<session_id>/sim_schedule_start` at runtime
+and writes the node-clock timestamp there atomically once every non-observer
+member's loop has started (its live registry row is active without
+`kFlagConstructing` and has reported its realtime outcome or a dispatch; the
+Studio bridge, an observer, never delays it, nor does a member that has exited
+without a pending non-quarantined restart). Until then `sim_gateway` holds its
+schedules' time-zero state, so a slow-starting node never misses its opening
+mode or joystick window, and a restarted gateway rejoins the same schedule
+partway; passing `--sim-gateway-arg --schedule-start-file` leaves coordination
+to the caller. Repeat `--sim-gateway-arg ARG` to
 forward further arguments verbatim, in order, after those, to **both** its
 `--describe` probe and runtime. The forwarding flag requires
 `--start-sim-gateway`, and a `--port` or `--remote-port` among its values is
@@ -400,10 +471,17 @@ dashboard = "dashboard.toml"              # driver dashboard layout, relative to
 
 Every key shown is optional. `dashboard` names the driver dashboard's
 layout ([talOS/telemetry](../telemetry/README.md#dashboard-layout)); config
-load refuses a missing file, and the file is in the config's
-`CONFIG_FILES` and its bundle. The watched topic comes from `[studio] topic`,
+load refuses a missing file, phase one (`LintTelemetryConfig`) checks the
+layout ([telemetry labels and dashboard layout](#telemetry-labels-and-dashboard-layout)), and
+the file is in the config's `CONFIG_FILES` and its bundle. The watched topic
+comes from `[studio] topic`,
 the same setting the telemetry node reads. `--studio-http-port PORT`
-overrides `[studio] http_port` for one run. The default webroot exists only
+overrides `[studio] http_port` for one run; `--studio-http-port 0` asks the
+OS for a free port (`[studio] http_port` in the config still requires
+`[1, 65535]`). The launcher captures the bridge's `listening <port>` line
+from its output pipe, records the bound port as `http_port` on the
+`studio_bridge` entry in `manifest.json`, and prints that port in
+`Started studio_bridge ... on http://localhost:<port>` (never port 0). The default webroot exists only
 in a checkout that has run `bazel build //studio:web_dist`; elsewhere set
 `[studio] webroot` (a robot repository's: [built pages](../../studio/README.md#built-pages)).
 The bridge needs the binary (`[studio] bridge`, resolved under `bazel-bin/`
@@ -427,18 +505,26 @@ bundled bridge), and the bundle's webroot replaces a relative
 `[studio] webroot` (an absolute one is kept). A bundle built without them has
 no bridge: the flag adds none to the roster and the launcher says the bundle
 carries no Studio. The bridge answers `--describe`
-like any other node, and the launcher starts it with the session's `graph.json`
-as `--declared` and the session's `manifest.json` as `--manifest`; its stdout
-and stderr land in `<output_dir>/<session_id>/studio_bridge.log`
-(plaintext, not a `.tlog`) beside the manifest, like every member's
-[output](#node-output), but are not echoed to the launcher's stdout.
+like any other node, and the launcher starts it with `--session-id`, the
+session's `graph.json` as `--declared` and the session's `manifest.json` as
+`--manifest`; its stdout and stderr land in
+`<output_dir>/<session_id>/studio_bridge.log` (plaintext, not a `.tlog`) beside
+the manifest, like every member's [output](#node-output), but are not echoed to
+the launcher's stdout.
 
 The bridge is the one roster member supervised differently (`StudioBridge` in
 `studio_bridge.h`); it waits for the telemetry segment itself (see the
 [bridge README](../../studio/bridge/README.md#publisher-and-serving-constraints)).
-It is an observer: its spawns, exits, restarts and final give-up never start,
-stop, restart or delay another member, and never change the launcher's exit
-status. Its first run spawns with the nodes. Every ending of a run while the
+It is an observer: its spawns, exits, liveness kills, restarts and final
+give-up never start, stop, restart or delay another member, and never change
+the launcher's exit status. Its first run spawns with the nodes, and it claims
+a live registry row (observer tier, updating `heartbeat_monotonic_ns` and
+`dispatch_count` on every loop pass, at least every 250 ms). The launcher
+watches that row with `RunLiveness` (1 s period, `kStudioBridgePeriod`, with
+the session's `--heartbeat-periods` and `--heartbeat-startup-grace-ms`): a
+bridge whose loop stops making progress is SIGKILLed as `stalled` (or
+`heartbeat_missing` if it never registers past the grace and timeout) and
+restarted on the bridge's schedule below. Every ending of a run while the
 session is not stopping is a failure, exit 0 included (a server that ends
 before the stop has failed), and so is a spawn that fails; each is restarted
 on a non-critical member's schedule ([restarts](#restarts)): 50 ms, doubling
@@ -453,12 +539,12 @@ Where a node would be quarantined, the bridge is left for the rest of the
 session instead: one line names it and says it will not be restarted again,
 its manifest entry is marked `recorder_failed`, and the session runs on
 without Studio. The bound counts starts inside the rolling restart window,
-not over the session: a bridge that dies fewer than `max_restarts` times
-per window is restarted every time, for the whole session. A bridge that
+not over the session: a bridge that dies or hangs fewer than `max_restarts`
+times per window is restarted every time, for the whole session. A bridge that
 fails at once on every run therefore costs at
 most `max_restarts` + 1 spawns, 6 by default, all within about 1.6 s of the
 first (50 + 100 + 200 + 400 + 800 ms of backoff), then none: no busy loop
-and no fork storm, and since it takes no registry row, no registry churn.
+and no fork storm.
 `--max-restarts 0` leaves it at its first ending. A stop cancels a pending
 restart, so no bridge is spawned once the stop has begun, and the session
 ends without waiting out the backoff. A run counts as up once it has run
@@ -471,22 +557,49 @@ roster's completion. Its restarts are in its manifest entry
 (`restart_count`, which counts every restart attempt, one whose spawn
 failed included, as its restart lines number them;
 `retry_at_monotonic_ns` while one is pending; and each
-run's `runs[]` entry with the reason it ended), and so in
+run's `runs[]` entry with the reason it ended, `stalled` and
+`heartbeat_missing` included), and so in
 [`session_report`](#session-measurements)'s node and run tables and Studio's
 session panel; how it ended (a kill, a crash, its exit code) is never in
 the launcher's exit status: an operator's stop of a session whose bridge
 died still exits 0.
 
-A restart binds the same `[studio] http_port`. The bridge holds its port
+A restart binds the same HTTP port: the configured port, or the port learned
+from the first run's `listening <port>` line when started with
+`--studio-http-port 0`. The bridge holds its port
 exclusively (`SO_REUSEADDR`, never `SO_REUSEPORT`;
 [studio/bridge](../../studio/bridge/README.md)), and the launcher kills a dead
-run's process group before it schedules the restart, so the port is free again
-for the restart. A port another listener holds, such as another launcher's
-bridge on the same port (a developer's `./sim.sh` on the robot computer), is
-refused: every run prints `cannot listen on port <port>` and exits, which the
-bound above ends, with the reason in `studio_bridge.log`. The launcher sees
-the bridge only through its exits: it takes no registry row, so a bridge that
-hangs without exiting is not detected or restarted.
+or hung run's process group before it schedules the restart, so the port is
+free again for the restart. A port another listener holds, such as another
+launcher's bridge on the same port (a developer's `./sim.sh` on the robot
+computer), is refused: every run prints `cannot listen on port <port>` and
+exits, which the bound above ends, with the reason in `studio_bridge.log`.
+
+### Refusal visibility (`--serve-refusal`)
+
+On any phase-1 refusal after the launcher acquires the namespace `SessionLock` (a bad
+config, a graph or naming error, `simulation_only` without `--sim`, a full node
+registry, or a failed probe; never on `--describe-only`, `--replay-inputs`, a
+held session lock, or a pre-lock CLI/bundle argument refusal so another live
+session's log root and `/drive` port are never disturbed), the launcher
+atomically writes `<output_dir>/last_refusal.json` (`{"refused": true,
+"reason": "...", "config_path": "...", "wall_ns": ...}`) in the log root (when
+writable or creatable).
+
+Without `--serve-refusal`, the launcher still exits 1 immediately. With both
+`--serve-refusal` and `--start-studio-bridge` (`tools/deploy.sh enable-boot`
+passes `--serve-refusal` to the boot service's `run.sh`, which adds
+`--start-studio-bridge` for bundles carrying Studio), the launcher starts the
+Studio bridge in refusal mode (`--refusal-file <output_dir>/last_refusal.json`,
+using `--studio-http-port`, `[studio] http_port`, or default `5800` and the
+bundle's or configured webroot so even a TOML parse error still serves
+`/drive`), notifies systemd (`READY=1` and `WATCHDOG=1`) once the bridge
+announces its listening port, and waits until a stop signal, `--duration-s` (if
+> 0), or the bridge's own exit (e.g. `EADDRINUSE` when another process outside
+the lock already holds port 5800), then stops the bridge cleanly and still
+exits 1. While it runs, `/drive` renders **LAUNCH REFUSED** with the exact
+refusal reason instead of **BRIDGE LINK**
+([PRE_MATCH.md](../../docs/PRE_MATCH.md#driver-dashboard-top-to-bottom)).
 
 ## Node output
 
@@ -567,6 +680,10 @@ and the node takes it as a stop during construction and exits 0, provided
 it reaches its stop handlers within the stop timeout (`kStopTimeout`, 2 s)
 of the launcher's stop. One still starting then is SIGKILLed and recorded
 `stop_timeout`, as a stuck constructor is, and the session ends nonzero.
+On shutdown, the launcher stops `hardware_node` first (`kStopSignal`, up to
+`kBridgeStopTimeout`, 500 ms, before SIGKILLing a hung bridge) and signals the
+remaining members only after `hardware_node` has been reaped, so the bridge
+quiesces and stops forwarding before actuator owners exit.
 Probes, group guardians, `--replay-inputs` runs, members that do not say so
 (`hardware_node`, `sim_gateway`, the Studio bridge, foreign binaries) and
 members whose `--describe` probe did not answer (a non-critical member the
@@ -757,8 +874,8 @@ the heartbeat timeout have elapsed; registration is required even when
 `--allow-graph-errors` permits a failed description. The launcher prepared the
 registry before starting them ([one session per namespace](#one-session-per-namespace)),
 and rows of killed runs are freed by the next claim. Rows held by live
-processes outside the session are not, so a launch whose roster (every member
-but Studio's bridge, which takes no row) does not fit beside them in the 32
+processes outside the session are not, so a launch whose roster (every member,
+including `sim_gateway` and `studio_bridge`) does not fit beside them in the 32
 rows is refused before anything starts, naming the holders.
 
 Construction is visible in the registry before endpoints are available and has
@@ -805,6 +922,18 @@ lock a node can hold: its registry attach is read-only, which
 See [deployment](../../docs/DEPLOYMENT.md) for the generated systemd watchdog
 policy and macOS's launchd limitations.
 
+### Sleep prevention
+
+While a session runs (phase two, from starting the roster until the session
+ends; not `--describe-only`, `--replay-inputs`, or `--check-session-lock`), the
+launcher holds a macOS IOKit `kIOPMAssertionTypePreventSystemSleep` assertion
+(`SleepGuard` in `sleep_guard.h`, equivalent to `caffeinate -s`) and releases it
+cleanly via RAII when the session exits. This is defense-in-depth independent of
+`pmset sleep 0` ([deployment](../../docs/DEPLOYMENT.md#on-the-main-processor))
+against idle or DarkWake maintenance sleep on a Mac mini. If IOKit refuses the
+assertion, the launcher logs a non-fatal warning to stderr (and `talos.log`) and
+continues the session. On Linux, `SleepGuard` is a silent no-op.
+
 ### Supervision passes
 
 The supervision loop does not poll. After each pass it sleeps until the
@@ -818,11 +947,12 @@ hold and touches no disk. The times it sleeps until:
 
 | Deadline | Decides |
 |---|---|
-| each running member's next look at its registry row (`RunLiveness::NextLook`): one look interval (its heartbeat timeout / 4) after the last, its stall deadline (the startup grace's end or one heartbeat timeout after the progress last seen, whichever is later), and its construction deadline until a look sees it constructed | `stalled`, `heartbeat_missing`, `construction_deadline`; the row's endpoints, recording and realtime flags and delivery counts, read at each look |
+| each running member's next look at its registry row (`RunLiveness::NextLook`, the Studio bridge's included): one look interval (its heartbeat timeout / 4) after the last, its stall deadline (the startup grace's end or one heartbeat timeout after the progress last seen, whichever is later), and its construction deadline until a look sees it constructed | `stalled`, `heartbeat_missing`, `construction_deadline`; the row's endpoints, recording and realtime flags and delivery counts, read at each look |
 | each pending restart's start, the Studio bridge's included | the restart backoff, a quarantined member's retry |
 | one settle interval (1 s) after the Studio bridge's last spawn, until that run is up | whether it holds the session open ([Studio bridge](#studio-bridge)) |
+| 20 ms startup polls while waiting to write `sim_schedule_start` (`kSimScheduleStartPoll`, until written or `sim_gateway` exits with no pending restart) or for the bridge run's first `/hw/status` (`kBridgeProtocolPoll`, until its protocol version is checked) | starting `sim_gateway`'s schedule; bridge protocol check |
 | `--duration-s`'s end, until the stop is sent | the stop |
-| the stop timeout (2 s after the stop), until its SIGKILLs are sent | `stop_timeout` |
+| two-phase stop timeouts: first `hardware_node` (500 ms, `kBridgeStopTimeout`), then the remaining members (2 s, `kStopTimeout`), until their SIGKILLs are sent | `stop_timeout` |
 | half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |
 | the hourly refresh of the session lock and of the session directory's `session.lock` and quiet files | [one session per namespace](#one-session-per-namespace), [retention](#session-segments-and-logs) |
 
@@ -904,12 +1034,16 @@ with `--replay-inputs` takes `--sim` only as given. A topic the node did not
 watch live (all of them, for a node the session did not run) is fed from
 every log that recorded it, the writer's `SEND`s (the hardware bridge's
 `--log` included) and readers' receipts, each publication once, with the
-sequence and publication time live readers saw. A node the session ran
-replays on its own recorded timeline: its
+sequence and publication time live readers saw. A node the session ran replays on its own recorded timeline: its
 timers fire at the deadlines they fired at live (a node that fired none
 starts its run at its first dispatch and fires none up to that run's last
-record; a node that ran once ends there, unless its loop was late when it
-stopped; a restarted node replays as one run), and it is handed what it
+record; for a single-run log with no own-log gap, damaged stretch or broken
+segment carry, `loop_end()` is clamped before the earliest armed timer deadline
+strictly after the last recorded `TIMER` or `MESSAGE` dispatch so a late `EXIT`
+or an offset-0 exit-only run does not fabricate a firing, except for the
+`ARM_TIMER` live-latency and backlog-drain-exit cases in
+[input replay](../events/README.md#replaying-another-sessions-inputs);
+a restarted node replays as one run), and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and
 ages measured from it). The node is never fed across a log gap: the run ends
@@ -920,22 +1054,42 @@ the time, and the launcher exits 1 with it. A log it would be fed from that
 may have lost records no GAP record marks is refused before the node runs,
 naming the log and the sign, and the launcher exits 1: one with a
 `<log>.capped` marker or of a member the session manifest marks
-`log_capped`, a run's log without its EXIT record of a member it marks
-`log_gap` or `recorder_failed` ([session manifest](#session-manifest)), and
-one whose damaged
-records nothing bounds the time of. The node's own first run's log is
+`log_capped`, a run's log without its EXIT record named in the manifest's
+`gap_logs` or `recorder_failed_logs` (or, for legacy manifests without those
+arrays, any run of a member marked `log_gap` or `recorder_failed`;
+[session manifest](#session-manifest)), one
+with a missing or incomplete-header segment (including a missing first segment
+without a marker when a later numbered segment remains or the unnumbered active
+file's first intact record has `dispatch_index > 1`, or a segment missing
+before the active file detected by a `dispatch_index > prev + 1` or
+repeated-sender accepted-`SEND` sequence `> prev + 1` jump; see
+[input replay](../events/README.md#replaying-another-sessions-inputs) for the
+unnumbered-file limits), and one whose damaged
+records nothing bounds the time of. Passing `--allow-capped-replay` (accepted
+only with `--replay-inputs`; forwarded to the replayed node) overrides the
+`<log>.capped` / `log_capped` refusal and replays from the start of the kept
+window, printing a warning to stderr naming the capped log(s) and noting that
+pre-window history was lost; uncapped `log_gap`, `recorder_failed`, incomplete
+headers, missing non-head segments, and unbounded damage are still refused. The
+node's own first run's log is
 refused the same way, whatever it feeds, when the node had a timer and
 that log's first segment, or a segment before its first firing read, is
 gone or unreadable (the byte cap deleted it, or its header is incomplete):
-it may have held the firing its recorded timeline starts from. So is a
+it may have held the firing its recorded timeline starts from (with
+`--allow-capped-replay`, a byte-capped log whose first segment was rotated out
+starts the timed node at the kept window's earliest recorded firing or
+dispatch). So is a
 timed node's log with no such firing that holds no record of its run, or
-a gap or damaged stretch that may hold its firings. A damaged stretch in another reader's
-log of a topic is no loss only where an intact receipt of the topic follows
-it in that file and the session's other logs (the writer's sends) hold
-every message that reader could have lost there
+a gap or damaged stretch that may hold its firings. A writer's or another
+reader's damaged stretch is no loss when an intact accepted send or receipt
+follows it in the same file or a contiguous later segment and the session's
+other logs hold every message in that sequence range, and reader-only caps,
+marks, gaps or damage on a topic the replayed node did not watch live are
+ignored when every writer log of that topic is intact and exited and the
+session holds every sequence from `0` through the maximum recorded sequence
 ([the rule](../events/README.md#replaying-another-sessions-inputs)). See
 [input replay](../events/README.md#replaying-another-sessions-inputs) for
-timing and schema checks.
+timing, duplicate-sequence and schema checks.
 
 A node that reads the declared graph (`telemetry`, `teleop`) replays on the
 one the session was launched with, the session's `declared_graph.json` (a
@@ -951,11 +1105,13 @@ neither read nor written.
 ## graph.json
 
 Phase one writes `<output_dir>/<session_id>/graph.json` beside the session's
-`manifest.json`: the session id, the config it came from, every node with its
+`manifest.json`: the session id, the config it came from, the configuration's
+CAN bus slot names (`can_buses`, `hardware::CanBuses`, slot 0 `"rio"` then each
+extra bus in byte order), every node with its
 name, target, whether it answered, and each source's kind, name, message size
 and endpoint attributes, followed by every diagnostic. Studio's bridge serves it
-so a viewer can show the declared graph next to the live one and mark the
-difference.
+so a viewer can show the declared graph next to the live one, mark the
+difference, and label `/hw/status` CAN bus slots by bus name.
 It is written to a temporary file and renamed into place, as is the
 `declared_graph.json` beside it that graph-reading nodes are described and
 started with as `--graph`. A launch that cannot write either exits 1 before
@@ -978,13 +1134,22 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   bridge recorded on `/hw/status`, and under this one only when no bridge
   recorded one
   ([which logs a build can read](#which-logs-a-build-can-read)).
-- `config_sha256`, `git_revision`, `git_dirty`: the bundle's config identity
-  and the source revision of a `--config=release` build
+- `config_sha256`, `git_revision`, `git_dirty` (and, when a separate robot
+  repository was stamped against a talOS git checkout, `talos_git_revision`,
+  `talos_git_dirty`, omitted when empty): the bundle's config identity
+  and the source revision(s) of a `--config=release` build
   ([deployment](../../docs/DEPLOYMENT.md#build-a-bundle)); empty (and
-  `false`) outside a bundle or for an unstamped one. The RoboRIO program's
-  build is not here: every `/hw/state` record of the bridge's log carries it
-  (`log_dump`'s `hardware` field,
+  `false`) outside a bundle or for an unstamped one. `session_report` prints
+  `talOS revision: <rev>[ (dirty)]` after `Source revision:` when present. The
+  RoboRIO program's build is not here: every `/hw/state` record of the bridge's
+  log carries it (`log_dump`'s `hardware` field,
   [filtering and exporting logs](#filtering-and-exporting-logs)).
+- per node, `critical` and `studio_bridge`: `critical` is `true` for the
+  hardware bridge, the simulation gateway and critical subsystems, and `false`
+  for non-critical subsystems (`[subsystems.<name>] critical = false`) and the
+  launcher-added Studio bridge; `studio_bridge` is `true` only for the
+  launcher-added Studio bridge (`--start-studio-bridge`), never for a robot
+  subsystem named `studio_bridge`.
 - per node, `binary_sha256`: the SHA-256 of `binary_path` as the session
   starts, empty if it cannot be read. It covers that file only: not the
   shared libraries a C++ node loads, nor a Python node's runfiles.
@@ -1027,16 +1192,33 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   `requests_skipped_by_subsystem` splits the bridge's `requests_skipped` by
   the subsystem whose `/hw/request/<subsystem>` it passed over (only
   nonzero ones). A run, or a node, whose row was never seen (a spawn that
-  failed, Studio's bridge) has none of these fields. A count leaving 0
+  failed) or that reports no delivery-loss counts (Studio's bridge) has none of
+  these fields. A count leaving 0
   posts a manifest version of its own; a later increase waits for the next
   version the launcher posts anyway, at the latest the one the run's end
   posts, so a healthy session adds no version, and a killed launcher loses
   only the increases after a count's first.
-- per node, `recorder_failed`, `log_gap` and `log_capped`: what its runs'
-  event logs lost ([restarts](#restarts)).
+- per node, `recorder_failed`, `recorder_failed_logs`, `log_gap`, `gap_logs`
+  and `log_capped`: what its runs' event logs lost ([restarts](#restarts)).
+  `gap_logs` and `recorder_failed_logs` list the per-run event log paths that
+  suffered a gap or a recording failure (live `kFlagRecorderFailed`, or
+  damaged/unreadable at shutdown; a failed spawn sets `recorder_failed` without
+  adding a log path), so input replay scopes missing-`EXIT` refusals to the
+  affected run(s) while falling back to member-wide marks on legacy manifests
+  without those arrays.
+- on `studio_bridge`, `http_port`: the HTTP port the bridge bound (captured
+  from its `listening <port>` line); absent for other members and until the
+  bridge reports it.
 - `stopped_before_start`: a stop request arrived before every member had
   started ([two phases](#two-phases)); the members without `runs` were
   never started.
+- `session_lock_lost`, `directory_lock_lost`, `directory_lock_retaken`:
+  whether the hourly lock refresh found the namespace session lock file removed
+  (`session_lock_lost`), found `session.lock` removed and could not lock it
+  again (`directory_lock_lost`), or found `session.lock` removed and locked it
+  again on a new file (`directory_lock_retaken`); each defaults to `false` and
+  persists into the live manifest as soon as observed
+  ([session segments and logs](#session-segments-and-logs)).
 - `launcher_log`: the launcher's own `talos.log` ([node output](#node-output)).
   A member's output log is not listed: it is always
   `<output_dir>/<session_id>/<name>.log`, and the launcher's end-of-session
@@ -1052,7 +1234,7 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 | `construction_deadline` | was killed for constructing longer than the deadline |
 | `endpoint_mismatch` | was killed, or its session stopped, for [live endpoints](#live-endpoints) that differ from its probe |
 | `stop` | ended as the session's stop (signal, `--duration-s`) asks: exit 0, SIGINT or SIGTERM (which of these leave the launcher's exit status 0: [restarts](#restarts)) |
-| `stop_timeout` | outlived the 2 s after the stop's SIGINT and was killed (SIGKILL) |
+| `stop_timeout` | outlived the stop timeout after its SIGINT (500 ms for `hardware_node`, 2 s for other members) and was killed (SIGKILL) |
 | `spawn_failed` | could not be spawned (`exit_code` -1, `exit_signal` 0) |
 
 A kill of the launcher's own (`stalled`, `heartbeat_missing`,
@@ -1082,15 +1264,18 @@ header:
 
 | Library | Files | Holds |
 |---|---|---|
-| `:session` | `session.h`, `session_lock.h`, `session_retention.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock and session directory lock, what retention reads of a recorded session, the log budget split |
+| `:session` | `session.h`, `session_lock.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock and session directory lock |
+| `:session_retention` | `session_retention.h` | session classification and what retention reads of a recorded session |
+| `:log_budget` | `log_budget.h` | each member's share of the session's event-log budget |
 | `:spawn` | `spawn.h` | `SpawnProcess` (process group, guardian, child reports), `SupervisionWakeup` |
 | `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output), and `LauncherOutput`, the launcher's own stdout, stderr and `talos.log` |
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
-| `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
+| `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter, Python-period and telemetry/dashboard lints, `EndpointMismatch`, session segments, `graph.json` |
 | `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and Studio's review's inputs name, each once |
 | `:hardware_record` | `hardware_record.h` | the hardware packets decoded with the wire codecs (`HardwareRecordOf`, `HardwareRecordJson`), the check that a session's packets are of this build's protocol (`RecordedProtocolVersion`, `HardwareProtocolCheck`) and the run config's device names (`SessionConfigPath`, `LoadDeviceNames`), for `log_dump` and Studio's review |
 | `:log_merge` | `log_merge.h` | `MergeLogs`, a session's records streamed to a visitor in time order; `log_dump` and Studio's review link it, not the supervisor |
 | `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read, and when to look at the row next ([supervision passes](#supervision-passes)) |
+| `:sleep_guard` | `sleep_guard.h` | `SleepGuard`: macOS IOKit `PreventSystemSleep` RAII assertion held for a running session (silent no-op on Linux; [sleep prevention](#sleep-prevention)) |
 | `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
 
 
@@ -1101,8 +1286,10 @@ header:
 the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 `manifest.json` is written before nodes start, then replaced atomically
 (written beside it, then renamed over it) at each process lifecycle change,
-when a node reports a stopped event log, when a run's endpoints differ from
-its probe and when a run's delivery-loss count first leaves 0
+when `studio_bridge` reports its bound `http_port`, when a node reports a
+stopped event log, when a run's endpoints differ from its probe, when a run's
+delivery-loss count first leaves 0, and when an hourly lock refresh observes a
+lost or retaken session or directory lock
 ([session manifest](#session-manifest)): a reader always sees one complete
 version. `graph.json`,
 `declared_graph.json` and every manifest version from the roster about to
@@ -1229,7 +1416,9 @@ holding the lock, and removes it there; a launch creating that path
 meanwhile finds the lock held or the directory gone and creates it again,
 so no launch writes into a directory being removed. A
 `.talos-removing-<session_id>` directory a removal cut short goes at the
-next launch's retention. The supervision loop touches its `session.lock`
+next launch's retention; if a concurrent sweep removes the tree first
+(`ENOENT`), both `remove_idle` and the leftover sweep treat it cleanly as
+removed without reporting an error (`launcher_retention_test.cc`). The supervision loop touches its `session.lock`
 hourly, with the session lock (one `futimens` on the held descriptor, which
 writes and syncs nothing itself), and with it the session's files a launch
 writes once and may leave for days (`manifest.json` in a quiet session,
@@ -1246,33 +1435,39 @@ server blocks for as long as the mount retries it (without end on a hard
 mount), and with it supervision and the watchdog's ping. If the path stops naming the
 locked file (removed by hand, or by a cleaner before a refresh), retention
 could take the directory from then on; the next refresh locks the file the
-path names (creating it, never the directory) and says so once on stderr. That adds
+path names (creating it, never the directory), says so once on stderr, and
+records `directory_lock_retaken: true` in `manifest.json`. That adds
 no window: it and a retention lock the same file, so either the launch
 holds it first and every later retention passes the session over, or a
-retention holds it and is removing the directory, which is reported too. A
+retention holds it and is removing the directory, which is reported on stderr
+and recorded as `directory_lock_lost: true` in `manifest.json` (similarly, a
+removed namespace session lock is reported on stderr and recorded as
+`session_lock_lost: true`). A
 running launcher that holds no `session.lock` (one built before it existed)
 is protected only from launches in its own namespace. So is one whose log
-root's filesystem takes no advisory locks (NFS without a lock daemon,
-macOS's msdos and exFAT volumes): its launch warns once and runs without
-the lock rather than being refused, and retention there removes sessions as
-it did before launches locked them. Such a launch tries the lock again at
-each hourly refresh, and once it takes it (the lock and the probe failed in
-one lock-daemon hiccup, and the daemon answers again) says so once on stderr
-and is passed over by retention from then on. Until that refresh it is not:
-once the daemon answers again, a retention from another namespace whose
-probe now locks can take the unheld lock and remove the running session, a
-window of up to one refresh period (an hour). The retry is a `flock` on the
+root's filesystem takes no advisory locks (`EOPNOTSUPP`, `ENOTSUP`, `EINVAL`,
+`ENOSYS`, such as macOS's msdos and exFAT volumes): its launch warns once and
+runs without the lock rather than being refused, and retention there removes
+sessions as it did before launches locked them. `ENOLCK` is separated from
+`FlockUnsupported`: when probing `.talos-lock-probe` on the log root returns
+`ENOLCK` (such as a network lock daemon being down), retention prints a warning
+naming `ENOLCK` and refuses/skips all deletions, leaving every existing session
+untouched so a running session in another namespace can never be deleted
+(`REQ-OPS-11`, `launcher_retention_test.cc`). Such a launch (started unlocked
+while the lock daemon was down) tries the lock again at each hourly refresh,
+and once it takes it says so once on stderr and is passed over by retention
+from then on. Until that refresh it is not: once the daemon answers again, a
+retention from another namespace whose probe now locks can take the unheld lock
+and remove the running session, a window of up to one refresh period (an hour).
+The retry is a `flock` on the
 supervision thread, against a lock service that has just failed: on a
 network filesystem (a hard-mounted NFS root) that call can block through its
 RPC retries, and with it supervision and the service watchdog's ping, so the
-log root should be on a local disk. Whether a log root takes no locks is
-decided once by retention, and once by the session directory's creation,
-by a shared lock of the root's `.talos-lock-probe` file, never by one
-failing call. A lock daemon already down at that probe therefore makes a
-root whose locks work read as one that takes none for that whole retention
-(`LogRootTakesNoLocks`): while the daemon stays down, a running session's
-`session.lock` fails the same way, reads as unheld, and that retention may
-remove the session. On a root whose probe locked, a session whose `session.lock`
+log root should be on a local disk. Whether a log root supports advisory locks,
+takes none, or has an unavailable lock service (`ENOLCK`) is decided once by
+retention, and once by the session directory's creation, by a shared lock of
+the root's `.talos-lock-probe` file (`ProbeLogRootLocks`), never by one failing
+call. On a root whose probe locked, a session whose `session.lock`
 cannot be locked for such a reason (an NFS lock daemon that stops
 answering) is passed over, with a warning, and a launch whose own lock
 fails so tries again rather than running without it: up to 100 attempts
@@ -1626,11 +1821,18 @@ version on every `/hw/status` (`bridge.BridgeStatus` `protocol_version_id`),
 and the launcher puts its build's in `manifest.json`, as
 `hardware_protocol_version` ([session manifest](#session-manifest)). The
 tools read a session under the bridge's: the first `/hw/status` the bridge
-sent in each of its logs (each run and segment), when its log records the
-topic with this build's `BridgeStatus` schema. They use the manifest's only
-when no log does: a session from before the field, one with no bridge, or
-a bridge from before the field, whose `/hw/status` has another schema
-(`RecordedProtocolVersion`, `hardware_record.h`). Finding the bridge's
+sent in each of its logs (each run and segment), resolving `protocol_version_id`
+by field name from the recorded `.bfbs` schema so a `BridgeStatus` layout change
+does not hide it. They use the manifest's only when no log records a `/hw/status`
+whose schema carries an integer `protocol_version_id`: a session from before
+the field, one with no bridge, or a bridge whose schema lacks the field
+(`RecordedProtocolVersion`, `hardware_record.h`). While a session runs, the
+launcher also opens `/hw/status` as an observer reader (using the bridge's
+declared shape and resolving `protocol_version_id` from its `.bfbs`, counted as
+one observer reader slot on `/hw/status` during phase-one graph lint) and warns
+once per bridge run (to stderr and `talos.log`, re-warning if the bridge
+restarts) when the live `protocol_version_id` differs from the launcher build's
+`protocol::kProtocolVersion`. Finding the bridge's
 costs a read of each log's header, and of the bridge's logs up to their
 first status, never past their first second of records: the bridge's
 `--log` records every status it publishes, on its first pass and every
@@ -1768,7 +1970,8 @@ launcher's `talos.log` says were dropped (a member's `<name>.log`,
 `talos.log` itself, the launcher's stdout or stderr, with the count; NOT
 RECORDED for a manifest without `launcher_log`; informational, since the
 output logs are not the measured record), an unfinished
-session, state inter-arrival median/nearest-rank p99/max,
+session, state inter-arrival min/median/nearest-rank p99/max, missed
+`/hw/state` sequence counts per boot (`state_sequence_gaps`),
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
 lateness, the bridge's request-to-command delay in enabled and disabled
 time, the [latency rows](#latency-rows), every scalar `/hw/status` field,
@@ -1804,12 +2007,13 @@ timeout's neutral command, even when the node's next request observes the
 same State), is not counted, so no value is negative. The request's time is
 its tick's, stamped before that tick's work; the command's is its publication
 on `/hw/command`, after the bridge's merge. So the row measures request tick
-to command publication, the requesting node's work included, not delivery to
-the RoboRIO: a command is logged when published whether or not its UDP send
-succeeded (its record's status is the shared-memory write's), so after a
-failed send, and while a socket is being replaced, the row still counts a
-command the RoboRIO received later or never; the bridge's `send_failures`
-(exit line, below) says whether that happened. With several owners the
+to command publication, the requesting node's work included, not arrival at
+the RoboRIO: `/hw/command` is published and logged only after the bridge's
+UDP send succeeds (`socket_send_failures_count` and
+`socket_send_would_block_count` on `/hw/status`, and `send_failures` /
+`send_would_block` in the exit line, count sends that did not go out), though
+UDP delivery across the wire
+is still unacknowledged. With several owners the
 merged observation can be an older request's, overstating it. Each sample
 is counted in enabled or disabled time (`bridge_request_to_command`
 `enabled` and `disabled` in `--json`, each with the bridge's `process`) as
@@ -1825,9 +2029,13 @@ disabled node's requests are neutral) waits for the bridge's heartbeat
 measures its reaction. The rows are informational: REQ-RT-20's 1 ms bound is verified by
 the bridge's component test. The bridge's `wait_fallbacks` and stalled request topics reach the
 report as its row's `wake_fallbacks` and `stalled_arms` (delivery loss,
-above); its other wake counters (`passes`, `throttled`) and its socket
-counters (`send_failures`, `socket_reopens`) are only in its exit lines on
-stdout, in its [node output](#node-output) log, not in the report.
+above). Its five socket and UDP counters (`send_failures`, `socket_reopens`,
+`sequence_gaps`, `decode_failures`, `send_would_block`) are published on
+`/hw/status` and surfaced in `session_report` (`bridge_socket_counters` in
+`--json`, `Bridge UDP/State loss counters:` in Markdown) as well as its exit
+lines; only its other wake counters (`passes`, `udp`, `request`, `deadline`,
+`throttled`) are only in its exit lines on stdout, in its
+[node output](#node-output) log, not in the report.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
 exports also carry `ds_enabled`, the Driver Station `hardware.enabled` bit,
@@ -1876,7 +2084,8 @@ missed ticks or overruns. A row whose intervals all meet a gap is NOT
 MEASURED, never a pass, and its detail (or, for request to command and the
 latency rows, a line under their table) names how many intervals were left
 out; `--json` gives the counts in `intervals_across_gaps`
-(`bridge_request_to_command`, `state_to_request`, `driver_station_to_lane`,
+(`state_overall`, `state_enabled`, `state_sequence`,
+`bridge_request_to_command`, `state_to_request`, `driver_station_to_lane`,
 `driver_station_to_command`). A session without a gap reports
 exactly as before, with none of these keys.
 
@@ -1945,7 +2154,7 @@ other. A RoboRIO time (`sample_time_us`, `observed_time_us`) is only matched
 or ordered against another of the same `boot_id`, never subtracted from a
 main-processor one, whose mapping to it is uncertain by milliseconds
 ([gateway clock accuracy](../../docs/DATA_FLOW.md#gateway-clock-accuracy)).
-Each row is p50 (median), nearest-rank p99
+Each row is min, p50 (median), nearest-rank p99
 and max with its count, as the timing rows are, and NOT MEASURED when it has
 no sample (never 0). The rows are informational: `--strict` judges none of
 them, since REQ-RT-26's bound is judged at the bench.

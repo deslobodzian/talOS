@@ -23,17 +23,20 @@
 
 // Relative, as in the rest of the gateway: the RoboRIO's GradleRIO build
 // compiles gateway.cc with talOS/, not the repository root, on its path.
+#include "feedback.h"
 #include "messages.h"
 
 namespace talos::hardware {
 
 // Whether `next` should replace the last accepted state. Every sample is
 // dropped when it carries another config id (zero accepts any, for standalone
-// and simulation runs); beyond that, the first sample is accepted and later
+// and simulation runs) or comes from a recently retired gateway boot
+// (BootHistory::retired); beyond that, the first sample is accepted and later
 // ones must not be stale or duplicate samples from the same boot.
 inline bool AcceptState(bool have_prev, const State& prev, uint64_t config_id,
-                        const State& next) {
+                        const State& next, bool boot_retired) {
   if (config_id != 0 && next.config_id != config_id) return false;
+  if (boot_retired) return false;
   if (have_prev && next.boot_id == prev.boot_id &&
       next.sample_time_us <= prev.sample_time_us)
     return false;
@@ -93,6 +96,37 @@ inline bool MotorMayDrive(std::span<const MotorConfig> motors,
     }
   }
   return false;
+}
+
+// Propagates invalid master samples to their followers in `state` (after every
+// master and sensor has been masked; config refuses follower chains, so a
+// master is never a follower), then visits every motor that may not drive in
+// `state` (MotorMayDrive) with the earliest observation time that may drive it
+// again (`state.sample_time_us + 1`).
+//
+// `on_follower_masked(std::size_t i)` runs for each follower invalidated here,
+// after MarkInvalid zeroes its sample.
+// `on_motor_unable(std::size_t i, uint64_t drives_from_us)` runs for each
+// motor that may not drive in `state`.
+template <typename OnFollowerMasked, typename OnMotorUnable>
+inline void MaskFollowersAndDriveCutoffs(std::span<const MotorConfig> motors,
+                                         State& state,
+                                         OnFollowerMasked&& on_follower_masked,
+                                         OnMotorUnable&& on_motor_unable) {
+  const std::size_t count =
+      motors.size() < state.motor_count ? motors.size() : state.motor_count;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (MasterSampleInvalid(motors, state, i)) {
+      MarkInvalid(state.motors[i]);
+      on_follower_masked(i);
+    }
+  }
+  const uint64_t drives_from_us = state.sample_time_us + 1;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (!MotorMayDrive(motors, state, i)) {
+      on_motor_unable(i, drives_from_us);
+    }
+  }
 }
 
 // Whether a torque-current request may drive motor `m` (REQ-SAFE-43): `m`

@@ -97,23 +97,57 @@ export function acceptancePct(
   return total === 0 ? null : accepted / total;
 }
 
+// Maximum time skew (seconds) between a camera observation and its nearest
+// reference sample when aligning separate decimated recorded series.
+const MAX_REF_SKEW_S = 0.5;
+
 // Per-observation x/y error of a camera against a reference pose (the
 // estimator, or sim ground truth). One point per accepted observation: where
-// valid=1 and both the camera and reference poses are present.
+// valid=1 and both the camera and reference poses are present. When `refTimes`
+// is provided (separate or sparsely-aligned camera and reference time axes,
+// such as decimated recorded series), matches each observation to the nearest
+// finite reference sample within MAX_REF_SKEW_S.
 export function observationErrors(
     times: ArrayLike<number>,
     camX: ArrayLike<number>, camY: ArrayLike<number>, valid: ArrayLike<number>,
-    refX: ArrayLike<number>, refY: ArrayLike<number>): ErrorPoint[] {
+    refX: ArrayLike<number>, refY: ArrayLike<number>,
+    refTimes?: ArrayLike<number>): ErrorPoint[] {
   const out: ErrorPoint[] = [];
-  const n = Math.min(
-      times.length, camX.length, camY.length, valid.length, refX.length,
-      refY.length);
-  for (let i = 0; i < n; i++) {
+  if (!refTimes) {
+    const n = Math.min(
+        times.length, camX.length, camY.length, valid.length, refX.length,
+        refY.length);
+    for (let i = 0; i < n; i++) {
+      if (valid[i] !== 1) continue;
+      if (!finite(camX[i]) || !finite(camY[i]) || !finite(refX[i]) ||
+          !finite(refY[i]))
+        continue;
+      out.push({t: times[i], x: camX[i] - refX[i], y: camY[i] - refY[i]});
+    }
+    return out;
+  }
+  const rn = Math.min(refTimes.length, refX.length, refY.length);
+  const refs: {t: number; x: number; y: number}[] = [];
+  for (let j = 0; j < rn; j++) {
+    const t = refTimes[j], rx = refX[j], ry = refY[j];
+    if (finite(t) && finite(rx) && finite(ry)) refs.push({t, x: rx, y: ry});
+  }
+  if (!refs.length) return out;
+  const cn = Math.min(times.length, camX.length, camY.length, valid.length);
+  let r = 0;
+  for (let i = 0; i < cn; i++) {
     if (valid[i] !== 1) continue;
-    if (!finite(camX[i]) || !finite(camY[i]) || !finite(refX[i]) ||
-        !finite(refY[i]))
-      continue;
-    out.push({t: times[i], x: camX[i] - refX[i], y: camY[i] - refY[i]});
+    const t = times[i], cx = camX[i], cy = camY[i];
+    if (!finite(t) || !finite(cx) || !finite(cy)) continue;
+    while (r + 1 < refs.length && refs[r + 1].t <= t) r++;
+    let best = refs[r];
+    if (r + 1 < refs.length &&
+        Math.abs(refs[r + 1].t - t) < Math.abs(best.t - t)) {
+      best = refs[r + 1];
+    }
+    if (Math.abs(best.t - t) <= MAX_REF_SKEW_S) {
+      out.push({t, x: cx - best.x, y: cy - best.y});
+    }
   }
   return out;
 }

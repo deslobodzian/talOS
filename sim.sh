@@ -104,8 +104,9 @@ Options:
   --http-port N     Studio HTTP port (default 5800)
   -h, --help        this message
 
-Each run's session logs go to /tmp/talos_logs/<session_id> (launcher and
-controller output in its sim/ subdirectory).
+Each run's session logs go to /tmp/talos_logs/<session_id> (override the root
+with TALOS_SIM_LOG_DIR; launcher and controller output go in its sim/
+subdirectory).
 USAGE
 }
 
@@ -253,11 +254,39 @@ if [ "$WANT_GATEWAY" = "1" ] && [ -z "$(target sim_gateway)" ]; then
   die "$CONFIG sets no [robot] sim_gateway for --sim-gateway to start"
 fi
 
+# In WPILib mode, fail fast if another session already holds this namespace's
+# session lock so we never spend time building or booting Gradle/WPILib only
+# to have the launcher refuse startup afterwards. Before the build, a stale
+# pre-build binary may lack --check-session-lock or fail to load; only an
+# active-holder message aborts early, while other failures fall through to
+# `bazel build` and the strict post-build check below.
+check_session_lock() {
+  local strict="${1:-strict}"
+  local err status
+  err="$(./bazel-bin/talOS/launcher/launcher --check-session-lock 2>&1)"
+  status=$?
+  [ "$status" = 0 ] && return 0
+  case "$err" in
+    *"another launcher"*|*"session lock held"*)
+      printf '%s\n' "$err" >&2
+      die "another session holds the session lock; stop it before starting WPILib simulation"
+      ;;
+  esac
+  if [ "$strict" = "strict" ]; then
+    printf '%s\n' "$err" >&2
+    die "session lock check failed (exit $status); refusing to start WPILib simulation"
+  fi
+  return 0
+}
+if [ "$WANT_RIO" = "1" ] && [ -x ./bazel-bin/talOS/launcher/launcher ]; then
+  check_session_lock prebuild
+fi
+
 # The launcher takes a number (uint64). The second alone collides for two
 # starts in one second; the shell's pid (below 2^22 on Linux, 99999 on macOS,
 # so seven digits) makes the key unique among concurrent runs.
 SESSION_ID="$(date +%s)$(printf '%07d' "$$")"
-OUT_DIR="/tmp/talos_logs"
+OUT_DIR="${TALOS_SIM_LOG_DIR:-/tmp/talos_logs}"
 SESSION_DIR="${OUT_DIR}/${SESSION_ID}"
 LOG_DIR="${SESSION_DIR}/sim"
 mkdir -p "$LOG_DIR"
@@ -324,6 +353,7 @@ tail -5 "$BUILD_LOG"
 
 # --- 1. the controller processor (WPILib sim) -------------------------------
 if [ "$WANT_RIO" = "1" ]; then
+  check_session_lock
   # The robot's own RoboRIO program when it has one beside its
   # main_processor/, else talOS's; the bridge sends either its hardware
   # config.
@@ -390,26 +420,25 @@ fi
 
 # --- 2. the node graph ------------------------------------------------------
 say "starting node graph (log: $LOG_DIR/launcher.log)"
-LAUNCH_ARGS="--config $CONFIG --sim --session-id $SESSION_ID --output-dir $OUT_DIR"
-[ -n "$DURATION" ] && LAUNCH_ARGS="$LAUNCH_ARGS --duration-s $DURATION"
+LAUNCH_ARGS=(--config "$CONFIG" --sim --session-id "$SESSION_ID" --output-dir "$OUT_DIR")
+[ -n "$DURATION" ] && LAUNCH_ARGS+=(--duration-s "$DURATION")
 # Studio's bridge is a declared node in the launcher's graph ([studio] in the
 # robot config): the launcher starts and supervises it, so sim.sh only asks
 # for it and forwards the HTTP port override.
 if [ "$WANT_STUDIO" = "1" ]; then
-  LAUNCH_ARGS="$LAUNCH_ARGS --start-studio-bridge"
-  [ "$HTTP_PORT" != "5800" ] && LAUNCH_ARGS="$LAUNCH_ARGS --studio-http-port $HTTP_PORT"
+  LAUNCH_ARGS+=(--start-studio-bridge)
+  [ "$HTTP_PORT" != "5800" ] && LAUNCH_ARGS+=(--studio-http-port "$HTTP_PORT")
 fi
 # The lightweight sim gateway stands in for the controller processor only
 # in mode 3 (--sim-gateway). In mode 1 WPILib publishes /hw/state; in mode 2
 # an existing controller does. Starting the gateway alongside either would
 # create two publishers on /hw/state.
 if [ "$WANT_GATEWAY" = "1" ]; then
-  LAUNCH_ARGS="$LAUNCH_ARGS --start-sim-gateway --sim-gateway-arg --physics"
+  LAUNCH_ARGS+=(--start-sim-gateway --sim-gateway-arg --physics)
 fi
 # Bash 3.2 treats an empty array as unset under nounset; the + expansion
 # preserves each forwarded argument without expanding an unset array.
-# shellcheck disable=SC2086
-./bazel-bin/talOS/launcher/launcher $LAUNCH_ARGS ${GATEWAY_ARGS[@]+"${GATEWAY_ARGS[@]}"} > "$LOG_DIR/launcher.log" 2>&1 &
+./bazel-bin/talOS/launcher/launcher "${LAUNCH_ARGS[@]}" ${GATEWAY_ARGS[@]+"${GATEWAY_ARGS[@]}"} > "$LOG_DIR/launcher.log" 2>&1 &
 LAUNCHER_PID=$!
 track "$LAUNCHER_PID" "launcher"
 

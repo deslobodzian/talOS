@@ -3,9 +3,18 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_cc_node")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
 
-exports_files(["telemetry.fbs"])
+_FRAMEWORK_VISIBILITY = [
+    "//studio:__subpackages__",
+    "//talOS:__subpackages__",
+    "//tools:__pkg__",
+]
+
+exports_files(
+    ["telemetry.fbs"],
+    visibility = ["//visibility:public"],
+)
 
 # The Studio feed contract: the telemetry frame FlatBuffers schema plus the
 # slot-geometry wire header. Its only dependency is flatbuffers, so robot
@@ -14,6 +23,7 @@ exports_files(["telemetry.fbs"])
 flatbuffer_cc_library(
     name = "schema",
     srcs = ["telemetry.fbs"],
+    visibility = ["//visibility:public"],
 )
 
 # The slot geometry is a contract between the bridge and whatever produces
@@ -21,6 +31,7 @@ flatbuffer_cc_library(
 cc_library(
     name = "wire",
     hdrs = ["wire.h"],
+    visibility = ["//visibility:public"],
 )
 
 # Page encoding: the producer, the Studio bridge and the mock build every
@@ -28,6 +39,7 @@ cc_library(
 cc_library(
     name = "frames",
     hdrs = ["frames.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":schema",
         ":wire",
@@ -63,12 +75,13 @@ cc_library(
     name = "channels",
     srcs = ["channels.cc"],
     hdrs = ["channels.h"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":frames",
         ":schema",
         ":wire",
         "//talOS/driver_station",
-        "//talOS/hardware",
+        "//talOS/hardware:codecs",
         "//talOS/introspection:names",
         "//talOS/schema:field_path",
         "//talOS/schema:identity",
@@ -94,8 +107,10 @@ cc_test(
 )
 
 cc_library(
-    name = "telemetry",
-    hdrs = ["node.h"],
+    name = "config_validation",
+    srcs = ["config_validation.cc"],
+    hdrs = ["config_validation.h"],
+    visibility = _FRAMEWORK_VISIBILITY,
     deps = [
         ":channels",
         ":dashboard_layout",
@@ -105,17 +120,53 @@ cc_library(
         "//talOS/configuration",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
+        "@tomlplusplus//:toml++",
+    ],
+)
+
+cc_library(
+    name = "telemetry",
+    hdrs = ["node.h"],
+    visibility = _FRAMEWORK_VISIBILITY,
+    deps = [
+        ":channels",
+        ":config_validation",
+        ":dashboard_layout",
+        ":frames",
+        ":schema",
+        ":wire",
+        "//talOS/configuration",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
         "//talOS/node",
+        "//talOS/node:access",
         "//talOS/schema:field_path",
         "//talOS/schema:identity",
         "@flatbuffers//:runtime_cc",
     ],
 )
 
+# Test helper for robot/bench Sim tests to add the telemetry node without
+# exposing talOS/telemetry/node.h or talOS/node/access.h.
+cc_library(
+    name = "testing",
+    testonly = True,
+    srcs = ["testing.cc"],
+    hdrs = ["testing.h"],
+    implementation_deps = [
+        ":telemetry",
+        "//talOS/events:events_core",
+        "//talOS/node",
+        "//talOS/node:testing",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 talos_cc_node(
     name = "node",
     srcs = ["node.cc"],
     node_name = "telemetry",
+    visibility = ["//visibility:public"],
     deps = [":telemetry"],
 )
 
@@ -130,6 +181,7 @@ cc_test(
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/msgs:geometry",
+        "//talOS/node:access",
         "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "//talOS/rtms",
@@ -146,6 +198,7 @@ cc_library(
     name = "dashboard_layout",
     srcs = ["dashboard_layout.cc"],
     hdrs = ["dashboard_layout.h"],
+    visibility = ["//visibility:public"],
     deps = [
         ":wire",
         "//talOS/introspection:names",

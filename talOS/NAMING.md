@@ -43,8 +43,8 @@ doubled or trailing `_`.
   `naming::ParseAlertField` is the only reader of this grammar: the
   telemetry dictionary carries each alert's level (`ChannelInfo.alert`), so
   no viewer parses names. The graph lint refuses an `alert_` field that is
-  not a `bool` or not of these levels (nested structs included), and warns
-  on an alert outside a `status` topic.
+  not a `bool` or not of these levels (nested structs included), and refuses
+  an alert outside a `status` topic.
 
 Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 `pos`, `vel`, …; use the full word), and so are direction suffixes (`_in`,
@@ -80,7 +80,14 @@ misspelled or the owner does not publish it in this configuration; the
 finding names the readers and the owner), a node whose hardware request carries `untargeted_outputs` without
 that coverage, or a node that writes its hardware request but reads no target
 lane of its own and has not opted out (its outputs never drive; REQ-SAFE-41), is a
-warning; each of the last two names the node.
+warning; each of the last two names the node. The graph lint also warns when an operator producer (a non-bridge node reading
+`/hw/state/driver_station` and writing a target lane in a subsystem's `teleop`
+policy) has a shortest command-flow path (non-`/hw`, non-observer `target`,
+`request`, or `command` topics, starting from its `teleop`-policy target lanes
+or command/request topics and not expanding past an actuator owner) to an
+actuator owner (a node writing its `/hw/request/<node>`) longer than two node
+hops, naming the producer, the actuator owner, the hop count, and the shortest
+node chain (REQ-CONTRACT-09, REQ-RT-16).
 
 Examples: `/drivetrain/state`, `/drivetrain/target/teleop` (written by the
 operator interface), `/drivetrain/target/auto`, `/hw/state`,

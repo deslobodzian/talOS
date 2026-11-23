@@ -18,6 +18,7 @@
 #include <functional>
 #include <future>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -31,8 +32,11 @@
 
 #include "gtest/gtest.h"
 #include "talOS/events/log/gap_testing.h"
+#include "talOS/events/log/log_file_sink.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/process/durable_sync.h"
+#include "talOS/process/process.h"
 
 namespace talos::event::log {
 namespace {
@@ -787,6 +791,30 @@ TEST(WindowedLogReaderLimits, MoreReadersThanTheDescriptorLimit) {
   ::unlink(source.c_str());
 }
 
+// Guards WindowedLogReader::start_wall_ns() and start_time() against LogReader:
+// callers mapping monotonic log times to wall clock (studio_review) read both
+// from WindowedLogReader without re-opening raw FileHeaders.
+// REQ-OPS-41
+TEST(WindowedLogReaderLimits, StartWallNsMatchesLogReader) {
+  const std::string path = TempPath("start_wall_ns");
+  WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  constexpr std::int64_t kPinnedWallNs = 1'767'225'600'123'456'789LL;
+  {
+    std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
+    ASSERT_TRUE(file.is_open());
+    file.seekp(offsetof(FileHeader, start_wall_ns));
+    file.write(reinterpret_cast<const char*>(&kPinnedWallNs),
+               sizeof kPinnedWallNs);
+    ASSERT_TRUE(file);
+  }
+  const LogReader full{path};
+  const WindowedLogReader windowed{path};
+  EXPECT_EQ(windowed.start_wall_ns(), kPinnedWallNs);
+  EXPECT_EQ(windowed.start_wall_ns(), full.start_wall_ns());
+  EXPECT_EQ(windowed.start_time().nanos(), full.start_time().nanos());
+  ::unlink(path.c_str());
+}
+
 // Where the fixture's record of `kind` in dispatch `dispatch` is.
 std::size_t FixtureIndex(const std::vector<ExpectedRecord>& expected,
                          std::uint64_t dispatch, EventKind kind) {
@@ -1059,6 +1087,7 @@ bool CloseLogDescriptor(const std::string& path) {
   return false;
 }
 
+// REQ-RT-11 REQ-OPS-44
 TEST(LogDurability, FlushReportsFsyncFailure) {
   const auto path = TempPath("flush_sync_closed");
   for (const bool background : {false, true}) {
@@ -1088,6 +1117,263 @@ TEST(LogDurability, IdleBackgroundWriterFsyncsWithoutExplicitFlush) {
     EXPECT_TRUE(Eventually([&] { return writer.failed(); }));
   }
   ::unlink(path.c_str());
+}
+
+// Segment rotation must leave whole segments across any power cut: durable-sync
+// the finished segment, write and durable-sync `.next` before renaming it into
+// place, durable-sync `.capped` and the parent directory before unlinking the
+// oldest segment once the cap is crossed, and durable-sync the parent directory
+// last.
+// REQ-OPS-12
+TEST(LogDurability, RotateToDurableSyncsSegmentsMarkerAndDirectoryInOrder) {
+  const std::string dir = ::testing::TempDir() + "/talos_log_rotate_ops12_" +
+                          std::to_string(::getpid());
+  std::filesystem::remove_all(dir);
+  ASSERT_TRUE(std::filesystem::create_directories(dir));
+  const std::string path = dir + "/node.tlog";
+  const std::string staged = path + ".next";
+  const std::string marker = CappedMarkerPath(path);
+
+  struct Event {
+    std::string op;
+    std::string detail;
+    off_t size{0};
+  };
+  std::map<int, std::string> fd_paths;
+  std::vector<Event> events;
+
+  LogFileSinkOps ops;
+  ops.open = [&](const char* target, int flags, mode_t mode) {
+    const int fd = (flags & O_CREAT) != 0 ? ::open(target, flags, mode)
+                                          : ::open(target, flags);
+    if (fd >= 0) fd_paths[fd] = target;
+    return fd;
+  };
+  ops.close = [&](int fd) {
+    fd_paths.erase(fd);
+    return ::close(fd);
+  };
+  ops.durable_sync = [&](int fd) {
+    struct stat st {};
+    const off_t size = ::fstat(fd, &st) == 0 ? st.st_size : -1;
+    const auto it = fd_paths.find(fd);
+    events.push_back({"durable_sync",
+                      it != fd_paths.end() ? it->second : "<unknown>", size});
+    return process::DurableSync(fd);
+  };
+  ops.rename = [&](const char* from, const char* to) {
+    events.push_back({"rename", std::string{from} + "->" + to, 0});
+    for (auto& [open_fd, mapped] : fd_paths) {
+      if (mapped == from) mapped = to;
+    }
+    return ::rename(from, to);
+  };
+  ops.unlink = [&](const char* target) {
+    events.push_back({"unlink", target, 0});
+    return ::unlink(target);
+  };
+
+  {
+    const std::vector<std::byte> prefix = MakePayload(128, 1);
+    const std::vector<std::byte> body0 = MakePayload(32, 2);
+    const std::vector<std::byte> body1 = MakePayload(48, 3);
+
+    LogFileSink sink{path, ops};
+    sink.open_sync();
+    sink.configure_segments(prefix, /*segment_count=*/2);
+    sink.write_prefix_sync();
+    ASSERT_EQ(sink.write_bytes(body0.data(), body0.size()), body0.size());
+
+    // Segment 0 -> 1: under segment_count (2), so no segment is unlinked yet.
+    events.clear();
+    sink.rotate_to(1);
+    ASSERT_FALSE(sink.failed()) << sink.error();
+    EXPECT_FALSE(sink.head_dropped());
+    EXPECT_EQ(sink.file_segment(), 1u);
+    ASSERT_EQ(events.size(), 5u);
+    EXPECT_EQ(events[0].op, "durable_sync");
+    EXPECT_EQ(events[0].detail, path);
+    EXPECT_EQ(events[0].size, static_cast<off_t>(prefix.size() + body0.size()));
+    EXPECT_EQ(events[1].op, "durable_sync");
+    EXPECT_EQ(events[1].detail, staged);
+    EXPECT_EQ(events[1].size, static_cast<off_t>(prefix.size()));
+    EXPECT_EQ(events[2].op, "rename");
+    EXPECT_EQ(events[2].detail, path + "->" + LogSegmentPath(path, 0));
+    EXPECT_EQ(events[3].op, "rename");
+    EXPECT_EQ(events[3].detail, staged + "->" + path);
+    EXPECT_EQ(events[4].op, "durable_sync");
+    EXPECT_EQ(events[4].detail, dir);
+
+    // Segment 1 -> 2: reaches segment_count (2), so `.capped` and its directory
+    // must be durable-synced before renaming and unlinking segment 0, followed
+    // by a final directory durable-sync.
+    ASSERT_EQ(sink.write_bytes(body1.data(), body1.size()), body1.size());
+    events.clear();
+    sink.rotate_to(2);
+    ASSERT_FALSE(sink.failed()) << sink.error();
+    EXPECT_TRUE(sink.head_dropped());
+    EXPECT_EQ(sink.file_segment(), 2u);
+    ASSERT_EQ(events.size(), 8u);
+    EXPECT_EQ(events[0].op, "durable_sync");
+    EXPECT_EQ(events[0].detail, path);
+    EXPECT_EQ(events[0].size, static_cast<off_t>(prefix.size() + body1.size()));
+    EXPECT_EQ(events[1].op, "durable_sync");
+    EXPECT_EQ(events[1].detail, staged);
+    EXPECT_EQ(events[1].size, static_cast<off_t>(prefix.size()));
+    EXPECT_EQ(events[2].op, "durable_sync");
+    EXPECT_EQ(events[2].detail, marker);
+    EXPECT_EQ(events[2].size, 0);
+    EXPECT_EQ(events[3].op, "durable_sync");
+    EXPECT_EQ(events[3].detail, dir);
+    EXPECT_EQ(events[4].op, "rename");
+    EXPECT_EQ(events[4].detail, path + "->" + LogSegmentPath(path, 1));
+    EXPECT_EQ(events[5].op, "rename");
+    EXPECT_EQ(events[5].detail, staged + "->" + path);
+    EXPECT_EQ(events[6].op, "unlink");
+    EXPECT_EQ(events[6].detail, LogSegmentPath(path, 0));
+    EXPECT_EQ(events[7].op, "durable_sync");
+    EXPECT_EQ(events[7].detail, dir);
+
+    // Segment 2 -> 3: `.capped` is already durable on disk; rotation still
+    // durable-syncs finished segment, `.next` before rename, unlinks segment 1,
+    // and durable-syncs the directory last.
+    events.clear();
+    sink.rotate_to(3);
+    ASSERT_FALSE(sink.failed()) << sink.error();
+    EXPECT_EQ(sink.file_segment(), 3u);
+    ASSERT_EQ(events.size(), 6u);
+    EXPECT_EQ(events[0].op, "durable_sync");
+    EXPECT_EQ(events[0].detail, path);
+    EXPECT_EQ(events[1].op, "durable_sync");
+    EXPECT_EQ(events[1].detail, staged);
+    EXPECT_EQ(events[1].size, static_cast<off_t>(prefix.size()));
+    EXPECT_EQ(events[2].op, "rename");
+    EXPECT_EQ(events[2].detail, path + "->" + LogSegmentPath(path, 2));
+    EXPECT_EQ(events[3].op, "rename");
+    EXPECT_EQ(events[3].detail, staged + "->" + path);
+    EXPECT_EQ(events[4].op, "unlink");
+    EXPECT_EQ(events[4].detail, LogSegmentPath(path, 1));
+    EXPECT_EQ(events[5].op, "durable_sync");
+    EXPECT_EQ(events[5].detail, dir);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// If creating/syncing `<path>.capped`, syncing its directory, or renaming the
+// active segment fails during rotate_to(), rotation aborts before renaming or
+// unlinking the oldest segment, keeps head_dropped() false until the marker and
+// directory sync succeed, and unlinks the staged `.next` file.
+// REQ-OPS-09
+// REQ-OPS-14
+TEST(LogDurability,
+     RotateToAbortsWithoutUnlinkingOrLeakingStagedWhenMarkerOrDirSyncFails) {
+  enum class Failure {
+    kMarkerOpen,
+    kMarkerSync,
+    kDirSyncAfterMarker,
+    kRenameActive,
+  };
+  for (const Failure failure :
+       {Failure::kMarkerOpen, Failure::kMarkerSync,
+        Failure::kDirSyncAfterMarker, Failure::kRenameActive}) {
+    SCOPED_TRACE(static_cast<int>(failure));
+    const std::string dir = ::testing::TempDir() + "/talos_log_rotate_fail_" +
+                            std::to_string(::getpid()) + "_" +
+                            std::to_string(static_cast<int>(failure));
+    std::filesystem::remove_all(dir);
+    ASSERT_TRUE(std::filesystem::create_directories(dir));
+    const std::string path = dir + "/node.tlog";
+    const std::string staged = path + ".next";
+    const std::string marker = CappedMarkerPath(path);
+    const std::string seg0 = LogSegmentPath(path, 0);
+
+    std::map<int, std::string> fd_paths;
+    bool arm_failure = false;
+    int rename_calls = 0;
+    int seg0_unlinks = 0;
+
+    LogFileSinkOps ops;
+    ops.open = [&](const char* target, int flags, mode_t mode) {
+      if (arm_failure && failure == Failure::kMarkerOpen &&
+          std::string_view{target} == marker) {
+        errno = ENOSPC;
+        return -1;
+      }
+      const int fd = (flags & O_CREAT) != 0 ? ::open(target, flags, mode)
+                                            : ::open(target, flags);
+      if (fd >= 0) fd_paths[fd] = target;
+      return fd;
+    };
+    ops.close = [&](int fd) {
+      fd_paths.erase(fd);
+      return ::close(fd);
+    };
+    ops.durable_sync = [&](int fd) {
+      const auto it = fd_paths.find(fd);
+      const std::string target = it != fd_paths.end() ? it->second : "";
+      if (arm_failure && failure == Failure::kMarkerSync && target == marker) {
+        errno = EIO;
+        return -1;
+      }
+      if (arm_failure && failure == Failure::kDirSyncAfterMarker &&
+          target == dir) {
+        errno = EIO;
+        return -1;
+      }
+      return process::DurableSync(fd);
+    };
+    ops.rename = [&](const char* from, const char* to) {
+      if (arm_failure) {
+        ++rename_calls;
+        if (failure == Failure::kRenameActive &&
+            std::string_view{from} == path) {
+          errno = EIO;
+          return -1;
+        }
+      }
+      for (auto& [open_fd, mapped] : fd_paths) {
+        if (mapped == from) mapped = to;
+      }
+      return ::rename(from, to);
+    };
+    ops.unlink = [&](const char* target) {
+      if (arm_failure && std::string_view{target} == seg0) {
+        ++seg0_unlinks;
+      }
+      return ::unlink(target);
+    };
+
+    {
+      const std::vector<std::byte> prefix = MakePayload(128, 1);
+      const std::vector<std::byte> body0 = MakePayload(32, 2);
+      const std::vector<std::byte> body1 = MakePayload(48, 3);
+      LogFileSink sink{path, ops};
+      sink.open_sync();
+      sink.configure_segments(prefix, /*segment_count=*/2);
+      sink.write_prefix_sync();
+      ASSERT_EQ(sink.write_bytes(body0.data(), body0.size()), body0.size());
+      sink.rotate_to(1);
+      ASSERT_FALSE(sink.failed()) << sink.error();
+      ASSERT_TRUE(std::filesystem::exists(seg0));
+      ASSERT_EQ(sink.write_bytes(body1.data(), body1.size()), body1.size());
+
+      arm_failure = true;
+      sink.rotate_to(2);
+      EXPECT_TRUE(sink.failed());
+      EXPECT_EQ(sink.file_segment(), 1u);
+      EXPECT_EQ(seg0_unlinks, 0);
+      EXPECT_TRUE(std::filesystem::exists(seg0));
+      EXPECT_FALSE(std::filesystem::exists(staged))
+          << "staged .next file leaked after rotation failure";
+      if (failure != Failure::kRenameActive) {
+        EXPECT_FALSE(sink.head_dropped());
+        EXPECT_EQ(rename_calls, 0);
+      } else {
+        EXPECT_TRUE(sink.head_dropped());
+      }
+    }
+    std::filesystem::remove_all(dir);
+  }
 }
 
 std::vector<char> FileBytes(const std::string& path) {
@@ -1330,11 +1616,6 @@ TEST(LogBackgroundWriter, FullPoolOpensAGapAndHalfAFreePoolResumesIt) {
   for (const auto& file : {path, whole, copied, copy}) ::unlink(file.c_str());
 }
 
-// A gap still open at the stop is closed there: flush() or destruction, once
-// the disk returns, writes its GAP record marked GAP_CLOSED_AT_FLUSH, with
-// the time of the run's EXIT, which found no room and was held, then that
-// EXIT, so the log ends in order. A second flush() adds nothing.
-// REQ-OPS-44
 // Half the pool is rounded up: a pool of three resumes with two chunks free,
 // not one, so between two GAP records the loop still hands over at least
 // half the pool.
@@ -1367,47 +1648,296 @@ TEST(LogBackgroundWriter, AnOddPoolResumesWithHalfOfItRoundedUpFree) {
   ::unlink(path.c_str());
 }
 
-TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
-  for (const bool flush : {true, false}) {
-    SCOPED_TRACE(flush ? "flush" : "destruction");
-    const std::string path = TempPath("closed_gap");
-    const std::string whole = TempPath("closed_gap_whole");
-    const std::string copy = TempPath("closed_gap_copy");
-    WriteGate gate;
-    {
-      LogWriter writer{path, "gated", GatedOptions(gate)};
-      const OpenAtExit open_at_exit{gate};
-      writer.start({}, {});
-      GatedDispatch(writer, 1);
-      writer.flush();
-      gate.close();
-      for (std::uint64_t d = 2; d <= 70; ++d) GatedDispatch(writer, d);
-      GatedExit(writer, 71);
-      EXPECT_TRUE(writer.losing());
-      gate.open();
-      if (flush) {
-        writer.flush();
-        EXPECT_FALSE(writer.losing());
-        const auto size = std::filesystem::file_size(path);
-        writer.flush();
-        EXPECT_EQ(std::filesystem::file_size(path), size);
+// A 2-chunk pool must never emit consecutive GAP records with zero non-GAP
+// records between them: start() sizes chunks to fit GAP + the largest manifest
+// record, and append() refuses to emit a GAP unless both GAP and the resuming
+// record can be taken without exhausting the pool between them (whether due to
+// chunk space or a segment rotation boundary).
+// REQ-RT-11
+TEST(LogBackgroundWriter,
+     TwoChunkPoolNeverEmitsConsecutiveGapsWithZeroDataRecords) {
+  const auto assert_no_consecutive_gaps = [](const std::string& log_path) {
+    bool prev_gap = false;
+    std::size_t gap_count = 0;
+    for (const std::string& file : LogSegmentFiles(log_path)) {
+      LogReader reader{file};
+      LogReader::Record record{};
+      while (reader.next(record)) {
+        const bool is_gap =
+            record.header.kind == static_cast<std::uint16_t>(EventKind::GAP);
+        EXPECT_FALSE(prev_gap && is_gap)
+            << "consecutive GAP records with zero data records between them in "
+            << file;
+        if (is_gap) ++gap_count;
+        prev_gap = is_gap;
       }
     }
-    const ReadBack back = ReadAll(path, false);
-    ASSERT_EQ(back.records.size(), 2u * 65 + 2);
-    const ReadBack::Read& read = back.records[std::size_t{2} * 65];
-    const std::optional<LogGap> gap = GapOf(read.header, read.payload);
-    ASSERT_TRUE(gap.has_value());
-    EXPECT_EQ(gap->detail.flags, GAP_CLOSED_AT_FLUSH);
-    EXPECT_EQ(gap->resumed_ns, 71'010);  // the held EXIT's
-    EXPECT_EQ(gap->detail.records, 2u * 5);
-    EXPECT_EQ(back.records.back().header.kind,
-              static_cast<std::uint16_t>(EventKind::EXIT));
+    return gap_count;
+  };
 
-    WriteGatedReference(whole, 70);
-    CopyWithGap(whole, copy, std::size_t{2} * 65, std::size_t{2} * 70 + 1);
-    EXPECT_EQ(RecordBytes(path), RecordBytes(copy));
-    for (const auto& file : {path, whole, copy}) ::unlink(file.c_str());
+  {
+    SCOPED_TRACE("manifested message with tight chunk_bytes and chunk_count=2");
+    const std::string path = TempPath("two_chunk_manifest_gap");
+    WriteGate gate;
+    constexpr std::size_t kPayload = 200;
+    Manifest manifest = MakeManifest();
+    manifest[0].message_bytes = kPayload;
+    {
+      LogWriter::Options options{256, 2, /*background=*/true};
+      options.write_interval = std::chrono::hours{24 * 365 * 100};
+      options.sync_interval = std::chrono::hours{1};
+      options.before_write = gate.hook();
+      LogWriter writer{path, "two_chunk_manifest", options};
+      const OpenAtExit open_at_exit{gate};
+      writer.start(manifest, {});
+      Context context{};
+      context.dispatch_index = 1;
+      writer.dispatch(context, MakePayload(kPayload, 1));
+      writer.flush();
+      const std::uint64_t base = gate.entries();
+      gate.close();
+
+      // Fill both chunks and open a gap while the writer is blocked.
+      std::uint64_t d = 2;
+      while (!writer.losing() && d < 200) {
+        context.dispatch_index = d;
+        context.event_time =
+            MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+        context.now = context.event_time;
+        writer.dispatch(context, MakePayload(kPayload, static_cast<int>(d)));
+        ++d;
+      }
+      ASSERT_TRUE(writer.losing());
+      ASSERT_EQ(writer.gaps(), 1u);
+      ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 1; }));
+
+      // Free exactly 1 of 2 chunks (room_to_resume() is true for pool size 2).
+      gate.permit();
+      ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 2; }));
+
+      // Dispatching a manifested 200-byte record must fit with GAP in that 1
+      // chunk, resuming cleanly without opening a second gap.
+      context.dispatch_index = d;
+      context.event_time =
+          MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+      context.now = context.event_time;
+      writer.dispatch(context, MakePayload(kPayload, static_cast<int>(d)));
+      EXPECT_FALSE(writer.losing());
+      EXPECT_EQ(writer.gaps(), 1u);
+
+      gate.open();
+      writer.flush();
+      EXPECT_EQ(writer.gaps(), 1u);
+      EXPECT_FALSE(writer.failed()) << writer.error();
+    }
+    EXPECT_EQ(assert_no_consecutive_gaps(path), 1u);
+    ::unlink(path.c_str());
+  }
+
+  {
+    SCOPED_TRACE(
+        "unmanifested record larger than chunk_bytes - GAP_RECORD_BYTES");
+    const std::string path = TempPath("two_chunk_unmanifest_gap");
+    WriteGate gate;
+    // Empty manifest -> start() sizes chunks to max(256, 256) = 256.
+    // A 160-byte payload gives record_total = 224 <= 256, but
+    // GAP(128) + 224 = 352 > 256 so GAP and R cannot share a chunk.
+    constexpr std::size_t kPayload = 160;
+    {
+      LogWriter::Options options{256, 2, /*background=*/true};
+      options.write_interval = std::chrono::hours{24 * 365 * 100};
+      options.sync_interval = std::chrono::hours{1};
+      options.before_write = gate.hook();
+      LogWriter writer{path, "two_chunk_unmanifest", options};
+      const OpenAtExit open_at_exit{gate};
+      writer.start({}, {});
+      Context context{};
+      context.dispatch_index = 1;
+      writer.dispatch(context, MakePayload(kPayload, 1));
+      writer.flush();
+      const std::uint64_t base = gate.entries();
+      gate.close();
+
+      std::uint64_t d = 2;
+      while (!writer.losing() && d < 200) {
+        context.dispatch_index = d;
+        context.event_time =
+            MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+        context.now = context.event_time;
+        writer.dispatch(context, MakePayload(kPayload, static_cast<int>(d)));
+        ++d;
+      }
+      ASSERT_TRUE(writer.losing());
+      ASSERT_EQ(writer.gaps(), 1u);
+      ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 1; }));
+
+      // Free 1 of 2 chunks: GAP + R cannot share one chunk and only 1 chunk is
+      // free, so append() must keep the gap open rather than emitting a
+      // GAP-only chunk and immediately reopening gap #2.
+      gate.permit();
+      ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 2; }));
+      context.dispatch_index = d++;
+      context.event_time =
+          MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+      context.now = context.event_time;
+      writer.dispatch(context, MakePayload(kPayload, static_cast<int>(d)));
+      EXPECT_TRUE(writer.losing());
+      EXPECT_EQ(writer.gaps(), 1u);
+
+      // Once both chunks are free, GAP takes chunk 0 and R takes chunk 1.
+      gate.open();
+      ASSERT_TRUE(Eventually([&] {
+        context.dispatch_index = d++;
+        context.event_time =
+            MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+        context.now = context.event_time;
+        writer.dispatch(context, MakePayload(kPayload, static_cast<int>(d)));
+        return !writer.losing();
+      }));
+      EXPECT_EQ(writer.gaps(), 1u);
+      writer.flush();
+      EXPECT_EQ(writer.gaps(), 1u);
+      EXPECT_FALSE(writer.failed()) << writer.error();
+    }
+    EXPECT_EQ(assert_no_consecutive_gaps(path), 1u);
+    ::unlink(path.c_str());
+  }
+
+  {
+    SCOPED_TRACE("segment rotation between GAP and resuming record");
+    const std::string path = TempPath("two_chunk_segment_gap");
+    const std::string marker = CappedMarkerPath(path);
+    for (const auto& f : LogSegmentFiles(path)) ::unlink(f.c_str());
+    ::unlink(marker.c_str());
+    WriteGate gate;
+    constexpr std::size_t kPayload = 128;
+    constexpr std::size_t kRecord = sizeof(RecordHeader) + kPayload;  // 192
+    // Two segments, each holding prefix + 192 bytes: GAP (<=128) fits in a
+    // fresh segment, but GAP + R (128 + 192 = 320 > 192) forces rotation!
+    const std::uint64_t cap = 2 * (RecordsOffset() + kRecord);
+    {
+      LogWriter::Options options{4096, 2, /*background=*/true, cap};
+      options.write_interval = std::chrono::hours{24 * 365 * 100};
+      options.sync_interval = std::chrono::hours{1};
+      options.before_write = gate.hook();
+      LogWriter writer{path, "two_chunk_seg", options};
+      const OpenAtExit open_at_exit{gate};
+      writer.start(MakeManifest(), {});
+      Context context{};
+      context.dispatch_index = 1;
+      writer.dispatch(context, MakePayload(kPayload, 1));
+      writer.flush();
+      const std::uint64_t base = gate.entries();
+      gate.close();
+
+      // Each 192-byte record rotates the segment and submits a chunk.
+      // 2nd record fills chunk 0, 3rd rotates & fills chunk 1, 4th rotates &
+      // hits kPoolFull -> opens gap #1.
+      std::uint64_t d = 2;
+      while (!writer.losing() && d < 50) {
+        context.dispatch_index = d;
+        context.event_time =
+            MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+        context.now = context.event_time;
+        writer.dispatch(context, MakePayload(kPayload, static_cast<int>(d)));
+        ++d;
+      }
+      ASSERT_TRUE(writer.losing());
+      ASSERT_EQ(writer.gaps(), 1u);
+      ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 1; }));
+
+      // Free 1 of 2 chunks: GAP fits in the fresh segment, then R would force
+      // rotation to a second chunk that isn't free. Must NOT emit a GAP-only
+      // chunk and open gap #2.
+      gate.permit();
+      ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 2; }));
+      context.dispatch_index = d++;
+      context.event_time =
+          MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+      context.now = context.event_time;
+      writer.dispatch(context, MakePayload(kPayload, static_cast<int>(d)));
+      EXPECT_TRUE(writer.losing());
+      EXPECT_EQ(writer.gaps(), 1u);
+
+      gate.open();
+      ASSERT_TRUE(Eventually([&] {
+        context.dispatch_index = d++;
+        context.event_time =
+            MonotonicTime::from_nanos(static_cast<std::int64_t>(d) * 1000);
+        context.now = context.event_time;
+        writer.dispatch(context, MakePayload(kPayload, static_cast<int>(d)));
+        return !writer.losing();
+      }));
+      EXPECT_EQ(writer.gaps(), 1u);
+      writer.flush();
+      EXPECT_EQ(writer.gaps(), 1u);
+      EXPECT_FALSE(writer.failed()) << writer.error();
+    }
+    EXPECT_LE(assert_no_consecutive_gaps(path), 1u);
+    for (const auto& f : LogSegmentFiles(path)) ::unlink(f.c_str());
+    ::unlink(marker.c_str());
+  }
+}
+
+// A gap still open at the stop is closed there: flush() or destruction, once
+// the disk returns, writes its GAP record marked GAP_CLOSED_AT_FLUSH. When the
+// run called finish() during the gap, the held EXIT follows it and gives it its
+// time; when no finish() was called, the GAP takes the last dropped record's
+// time and ends the log with no trailing EXIT. A second flush() adds nothing.
+// REQ-OPS-44
+TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
+  for (const bool with_exit : {true, false}) {
+    for (const bool flush : {true, false}) {
+      SCOPED_TRACE(std::string{flush ? "flush" : "destruction"} +
+                   (with_exit ? "_with_exit" : "_without_exit"));
+      const std::string path = TempPath("closed_gap");
+      const std::string whole = TempPath("closed_gap_whole");
+      const std::string copy = TempPath("closed_gap_copy");
+      WriteGate gate;
+      {
+        LogWriter writer{path, "gated", GatedOptions(gate)};
+        const OpenAtExit open_at_exit{gate};
+        writer.start({}, {});
+        GatedDispatch(writer, 1);
+        writer.flush();
+        gate.close();
+        for (std::uint64_t d = 2; d <= 70; ++d) GatedDispatch(writer, d);
+        if (with_exit) GatedExit(writer, 71);
+        EXPECT_TRUE(writer.losing());
+        gate.open();
+        if (flush) {
+          writer.flush();
+          EXPECT_FALSE(writer.losing());
+          const auto size = std::filesystem::file_size(path);
+          writer.flush();
+          EXPECT_EQ(std::filesystem::file_size(path), size);
+        }
+      }
+      const ReadBack back = ReadAll(path, false);
+      ASSERT_EQ(back.records.size(), 2u * 65 + (with_exit ? 2u : 1u));
+      EXPECT_EQ(back.gaps, 1u);
+      EXPECT_TRUE(back.damage.clean());
+      const ReadBack::Read& read = back.records[std::size_t{2} * 65];
+      const std::optional<LogGap> gap = GapOf(read.header, read.payload);
+      ASSERT_TRUE(gap.has_value());
+      EXPECT_EQ(gap->detail.flags, GAP_CLOSED_AT_FLUSH);
+      EXPECT_EQ(gap->detail.records, 2u * 5);
+      if (with_exit) {
+        EXPECT_EQ(gap->resumed_ns, 71'010);  // the held EXIT's
+        EXPECT_EQ(back.records.back().header.kind,
+                  static_cast<std::uint16_t>(EventKind::EXIT));
+
+        WriteGatedReference(whole, 70);
+        CopyWithGap(whole, copy, std::size_t{2} * 65, std::size_t{2} * 70 + 1);
+        EXPECT_EQ(RecordBytes(path), RecordBytes(copy));
+      } else {
+        EXPECT_EQ(gap->resumed_ns, 70'010);  // last_lost_ns, no held EXIT
+        EXPECT_EQ(gap->resumed_ns, gap->detail.last_lost_ns);
+        EXPECT_EQ(back.records.back().header.kind,
+                  static_cast<std::uint16_t>(EventKind::GAP));
+      }
+      for (const auto& file : {path, whole, copy}) ::unlink(file.c_str());
+    }
   }
 }
 
@@ -1416,6 +1946,7 @@ TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
 // with no reader blocks open() the way a create can on a busy disk) all
 // return, and once the file opens it holds the header, then every record in
 // order.
+// REQ-RT-11 REQ-OPS-44
 TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
   const auto path = TempPath("unopened_fifo");
   ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
@@ -1484,6 +2015,7 @@ TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
 // failure names the path, and the writer, with no file to sync, still stops
 // once its periodic sync is due (a writer spinning on it never returns from
 // the destructor).
+// REQ-RT-11 REQ-OPS-44
 TEST(LogBackgroundWriter, UncreatableLogFailsWithoutThrowing) {
   const std::string path = ::testing::TempDir() + "/talos_log_test_missing_" +
                            std::to_string(::getpid()) + "/node.tlog";
@@ -2753,6 +3285,139 @@ TEST(LogBackgroundWriter, SparseRecordsWakeTheWriterOncePerRecord) {
   ::unlink(path.c_str());
 }
 
+// A disk failure while multiple chunks are submitted behind a blocked write
+// still advances completed for every queued chunk, so neither flush() nor
+// destruction deadlocks in wait_written() and failed() is reported.
+// REQ-OPS-44
+TEST(LogBackgroundWriter,
+     FlushAndDestructionReturnPromptlyWhenFdFailsWithChunksQueued) {
+  for (const bool call_flush : {true, false}) {
+    SCOPED_TRACE(call_flush ? "flush" : "destruction");
+    const std::string path =
+        TempPath(call_flush ? "fd_fail_flush" : "fd_fail_dtor");
+    WriteGate gate;
+    std::optional<LogWriter> writer;
+    writer.emplace(path, "gated", GatedOptions(gate));
+    const OpenAtExit open_at_exit{gate};
+    writer->start({}, {});
+    GatedDispatch(*writer, 1);
+    writer->flush();
+    const std::uint64_t base = gate.entries();
+
+    gate.close();
+    // Submit all four chunks and open a gap with a held EXIT behind the gate.
+    for (std::uint64_t d = 2; d <= 70; ++d) GatedDispatch(*writer, d);
+    GatedExit(*writer, 71);
+    ASSERT_TRUE(writer->losing());
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 1; }));
+
+    // Invalidate the writer's fd while chunk 0 is paused in before_write() and
+    // chunks 1..3 are queued behind it; no new descriptors are opened until
+    // writer is destroyed.
+    ASSERT_TRUE(CloseLogDescriptor(path));
+    gate.open();
+
+    std::promise<bool> flushed;
+    std::promise<void> destroyed;
+    auto flushed_future = flushed.get_future();
+    auto destroyed_future = destroyed.get_future();
+    std::thread stopper{[&] {
+      bool is_failed = false;
+      if (call_flush) {
+        writer->flush();
+        is_failed = writer->failed();
+      } else {
+        is_failed = Eventually([&] { return writer->failed(); });
+      }
+      flushed.set_value(is_failed);
+      writer.reset();
+      destroyed.set_value();
+    }};
+    const bool flush_returned =
+        flushed_future.wait_for(std::chrono::seconds{10}) ==
+        std::future_status::ready;
+    const bool dtor_returned =
+        flush_returned && destroyed_future.wait_for(std::chrono::seconds{10}) ==
+                              std::future_status::ready;
+    if (dtor_returned) {
+      stopper.join();
+    } else {
+      stopper.detach();
+    }
+    EXPECT_TRUE(flush_returned) << "flush() blocked after fd failure";
+    EXPECT_TRUE(dtor_returned) << "~LogWriter() blocked after fd failure";
+    if (flush_returned) {
+      EXPECT_TRUE(flushed_future.get());
+    }
+    ::unlink(path.c_str());
+  }
+}
+
+// While small records stream into an active chunk faster than write_interval
+// (10 ms), the writer coalesces them and wakes at most once per 10 ms write
+// interval rather than once per record.
+// REQ-RT-21
+TEST(LogBackgroundWriter, StreamingSmallRecordsWakeAtMostOncePerWriteInterval) {
+  const auto path = TempPath("stream_wakeups");
+  std::uint64_t index = 0;
+  {
+    LogWriter::Options options{};
+    ASSERT_EQ(options.write_interval, std::chrono::milliseconds{10});
+    options.sync_interval = std::chrono::hours{1};
+    std::atomic<std::uint64_t> writes{0};
+    options.before_write = [&] {
+      writes.fetch_add(1, std::memory_order_relaxed);
+    };
+    LogWriter writer{path, "stream", options};
+    writer.start({}, {});
+    writer.flush();  // The writer thread creates the file.
+    const auto log_one = [&] {
+      Context context{};
+      context.dispatch_index = ++index;
+      writer.dispatch(context, MakePayload(16, static_cast<int>(index)));
+    };
+
+    // Prime last_write with one record that wakes the idle writer.
+    log_one();
+    ASSERT_TRUE(Eventually([&] { return writes.load() >= 1; }));
+
+    const std::uint64_t base_writes = writes.load();
+    const std::uint64_t base_wakeups = writer.wakeups();
+    constexpr std::uint64_t kIntervals = 10;
+    constexpr std::uint64_t kRecordsPerPoll = 10;
+    std::uint64_t streamed = 0;
+    ASSERT_TRUE(Eventually([&] {
+      for (std::uint64_t i = 0; i < kRecordsPerPoll; ++i) {
+        log_one();
+        ++streamed;
+      }
+      return writes.load() >= base_writes + kIntervals;
+    }));
+    const std::uint64_t stream_writes = writes.load() - base_writes;
+    const std::uint64_t stream_wakeups = writer.wakeups() - base_wakeups;
+
+    EXPECT_GE(stream_writes, kIntervals);
+    // At least one 10 ms interval held back multiple polls before writing.
+    EXPECT_GT(streamed, kIntervals * kRecordsPerPoll);
+    // One wakeup per 10 ms write interval (plus up to 2 for idle->streaming
+    // entry or a delayed poll), never once per record.
+    EXPECT_LE(stream_wakeups, stream_writes + 2)
+        << "streamed=" << streamed << " writes=" << stream_writes;
+    EXPECT_LT(stream_wakeups, streamed / 4)
+        << "streamed=" << streamed << " writes=" << stream_writes;
+    writer.flush();
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  LogReader reader{path};
+  LogReader::Record record{};
+  std::uint64_t read = 0;
+  while (reader.next(record)) {
+    ASSERT_EQ(record.header.dispatch_index, ++read);
+  }
+  EXPECT_EQ(read, index);
+  ::unlink(path.c_str());
+}
+
 // A writer whose disk refused a write while a chunk held unwritten records
 // accepts nothing more, so it must not keep waking to retry: it used to
 // wake every write_interval for ever.
@@ -2775,6 +3440,173 @@ TEST(LogBackgroundWriter, FailedWriterGoesQuiet) {
     // None is due for an hour; retrying every write_interval gave about 20.
     EXPECT_LE(writer.wakeups() - start, 1u) << "over 200 ms after the failure";
   }
+  ::unlink(path.c_str());
+}
+
+// Once a write_interval (10 ms) passes after a streaming burst with no further
+// records, a healthy idle writer stops waking until its periodic sync (here an
+// hour away): 0 wakeups over ~20 write intervals.
+// REQ-RT-21
+TEST(LogBackgroundWriter, HealthyIdleWriterProducesZeroWakeupsAfterBurst) {
+  const auto path = TempPath("healthy_idle_wakeups");
+  {
+    LogWriter::Options options{};
+    ASSERT_EQ(options.write_interval, std::chrono::milliseconds{10});
+    options.sync_interval = std::chrono::hours{1};
+    std::atomic<std::uint64_t> writes{0};
+    std::atomic<std::uint64_t> stop_checks{0};
+    options.before_write = [&] {
+      writes.fetch_add(1, std::memory_order_relaxed);
+    };
+    options.before_stop_check = [&](const std::atomic<bool>&) {
+      stop_checks.fetch_add(1, std::memory_order_relaxed);
+    };
+    LogWriter writer{path, "healthy_idle", options};
+    writer.start({}, {});
+    writer.flush();  // The writer thread creates the file.
+
+    std::uint64_t index = 0;
+    const std::vector<std::byte> payload(16, std::byte{0x5a});
+    const auto log_one = [&] {
+      Context context{};
+      context.dispatch_index = ++index;
+      writer.dispatch(context, payload);
+    };
+
+    // Prime last_write, then stream enough records to enter streaming mode.
+    log_one();
+    ASSERT_TRUE(Eventually([&] { return writes.load() >= 1; }));
+    const std::uint64_t base_writes = writes.load();
+    ASSERT_TRUE(Eventually([&] {
+      for (int i = 0; i < 10; ++i) log_one();
+      return writes.load() >= base_writes + 3;
+    }));
+
+    // Wait for every burst record to reach the file.
+    const auto expected_bytes = static_cast<off_t>(
+        sizeof(FileHeader) + index * (sizeof(RecordHeader) + 16));
+    ASSERT_TRUE(Eventually([&] {
+      struct stat status {};
+      return ::stat(path.c_str(), &status) == 0 &&
+             status.st_size >= expected_bytes;
+    }));
+
+    // Wait past the post-burst write_interval and its single empty timed wake
+    // (on macOS QOS_CLASS_BACKGROUND, a 10 ms timed wait can coalesce >30 ms):
+    // stop_checks goes quiet once the writer enters idle sleep (capped at 400
+    // polls so a polling bug still reaches the assertion below quickly).
+    std::uint64_t last_checks = stop_checks.load(std::memory_order_relaxed);
+    int quiet_polls = 0;
+    int settle_polls = 0;
+    ASSERT_TRUE(Eventually([&] {
+      const std::uint64_t current = stop_checks.load(std::memory_order_relaxed);
+      if (current == last_checks) {
+        ++quiet_polls;
+      } else {
+        last_checks = current;
+        quiet_polls = 0;
+      }
+      return quiet_polls >= 150 || ++settle_polls >= 400;
+    }));
+
+    // Observe ~20 write intervals (~200 ms) of idle time: 0 wakeups allowed.
+    const std::uint64_t idle_start = writer.wakeups();
+    int idle_polls = 0;
+    ASSERT_TRUE(Eventually([&] { return ++idle_polls >= 200; }));
+    EXPECT_EQ(writer.wakeups() - idle_start, 0u)
+        << "healthy idle writer woke after post-burst write_interval";
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  ::unlink(path.c_str());
+}
+
+// Once the log file is open (fd >= 0), a stalled disk write in before_write
+// past two write intervals (> 20 ms) never blocks the producer's dispatch()
+// calls, even after the chunk pool fills and opens a gap.
+// REQ-OPS-31
+TEST(LogBackgroundWriter, DispatchNeverBlocksWhenWriteStallsPastWriteInterval) {
+  const auto path = TempPath("dispatch_nonblocking_write_stall");
+  WriteGate gate;
+  {
+    LogWriter::Options options{4096, 4, /*background=*/true};
+    ASSERT_EQ(options.write_interval, std::chrono::milliseconds{10});
+    options.sync_interval = std::chrono::hours{1};
+    options.before_write = gate.hook();
+    LogWriter writer{path, "stall_nonblocking", options};
+    const OpenAtExit open_at_exit{gate};
+    writer.start({}, {});
+    writer.flush();  // Writer thread opened the file (fd >= 0).
+    struct stat status {};
+    ASSERT_EQ(::stat(path.c_str(), &status), 0);
+
+    const std::uint64_t base = gate.entries();
+    gate.close();
+    GatedDispatch(writer, 1);
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 1; }));
+
+    // Dispatch across > 20 ms (30 x 1 ms polls via Eventually) while the writer
+    // stays blocked in before_write, overflowing the pool to open a gap too.
+    std::promise<void> done;
+    auto future = done.get_future();
+    std::thread producer{[&] {
+      std::uint64_t d = 2;
+      int polls = 0;
+      EXPECT_TRUE(Eventually([&] {
+        for (int i = 0; i < 5; ++i) GatedDispatch(writer, d++);
+        return ++polls >= 30;
+      }));
+      done.set_value();
+    }};
+
+    const bool finished =
+        future.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+    EXPECT_TRUE(finished) << "dispatch() blocked while before_write was held";
+    EXPECT_EQ(gate.entries(), base + 1)
+        << "writer left before_write while gate was closed";
+    EXPECT_TRUE(writer.losing());
+    EXPECT_EQ(writer.gaps(), 1u);
+    EXPECT_FALSE(writer.failed()) << writer.error();
+
+    gate.open();
+    if (finished) {
+      producer.join();
+    } else {
+      producer.detach();
+    }
+    writer.flush();
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  const ReadBack back = ReadAll(path, false);
+  EXPECT_EQ(back.gaps, 1u);
+  EXPECT_TRUE(back.damage.clean());
+  ::unlink(path.c_str());
+}
+
+// The background writer thread configures itself via ConfigureBackgroundThread
+// (SCHED_OTHER + nice >= kBackgroundNice on Linux, QOS_CLASS_UTILITY on macOS)
+// so it runs below every loop thread, verifiable without realtime privilege.
+// REQ-RT-10
+TEST(LogBackgroundWriter, WriterThreadRunsAsBackground) {
+  const auto path = TempPath("writer_background");
+  std::atomic<bool> observed{false};
+  std::atomic<bool> is_background{false};
+  {
+    LogWriter::Options options{};
+    options.before_write = [&] {
+      is_background.store(process::ThreadIsBackground(),
+                          std::memory_order_relaxed);
+      observed.store(true, std::memory_order_release);
+    };
+    LogWriter writer{path, "background_check", options};
+    writer.start({}, {});
+    Context context{};
+    context.dispatch_index = 1;
+    writer.dispatch(context, MakePayload(16, 1));
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  EXPECT_TRUE(observed.load(std::memory_order_acquire));
+  EXPECT_TRUE(is_background.load(std::memory_order_relaxed));
   ::unlink(path.c_str());
 }
 
@@ -2811,10 +3643,10 @@ long VoluntarySwitches(pid_t id) {
   return -1;
 }
 
-// A node calls process::ConfigureRealtime (SCHED_FIFO) on its loop thread
-// before the loop starts the log writer, and Linux threads inherit their
-// creator's policy: the writer must put itself back under SCHED_OTHER rather
-// than compete with control loops for the CPU.
+// Even when a creator thread holds a plain SCHED_FIFO policy (without
+// SCHED_RESET_ON_FORK), Linux threads inherit their creator's policy: the log
+// writer must still put itself back under SCHED_OTHER rather than compete with
+// control loops for the CPU.
 TEST(LogBackgroundWriter, WriterLeavesTheRealtimePolicyOfItsCreator) {
   const auto path = TempPath("writer_policy");
   bool realtime = false;

@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/node/sim_access.h"
+#include "target_test/target_test_message_generated.h"
 
 namespace talos::testing {
 namespace {
@@ -1032,6 +1034,233 @@ TEST_F(SimHardwareTest, ModeChangeOnALostTickStartsANewGeneration) {
   hw.set_driver_station(teleop);
   sim.step(5ms);
   EXPECT_GT(mode_since_us(), before);
+}
+
+// REQ-SAFE-31: an actuator node stopped and re-added mid-run inside
+// command_timeout_us (and inside the bridge's owner timeout) never drives on a
+// pre-restart target even though that target is still younger than
+// command_timeout_us and in the same mode generation: its subscriptions deliver
+// only what is published after attach, so its first flush neutralizes the motor
+// until a new target arrives. Kept stopped past the owner timeout, the bridge
+// neutralizes the motor before the node is re-added, and SimHardware cleanly
+// reads the restarted node's /hw/request/<node> once it returns.
+TEST(SimHardwareRestart,
+     RestartedActuatorNodeStaysNeutralOnPreRestartTargetAndResumesOnNewTarget) {
+  struct Lift {
+    explicit Lift(Node& n) : node{n}, target{n}, motor{n, "m"} {}
+    void update() {
+      if (const auto* goal = target.get()) {
+        motor.set_duty_cycle(goal->position_rot());
+      }
+      ++updates;
+    }
+    Node& node;
+    Target<target_test::Goal> target;
+    Motor motor;
+    int updates = 0;
+  };
+  constexpr std::string_view kToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.lift.motors.m]
+can_id = 1
+)";
+  constexpr std::uint32_t kTeleop =
+      driver_station::kEnabled | driver_station::kTeleop;
+
+  auto sim = Sim::FromToml(kToml);
+  sim.add<Lift>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+
+  // Part 1: restart inside the 50 ms owner timeout and 100 ms command_timeout.
+  const Time published = sim.now();
+  const std::uint64_t generation = DriverStationGeneration(sim);
+  ASSERT_NE(generation, 0u);
+  PublishTarget(sim, "lift", "teleop", target_test::Goal{0.5});
+  sim.step(10ms);  // now = 20 ms
+  ASSERT_EQ(hw.applied_motor("lift", "m").mode, Mode::kDutyCycle);
+  ASSERT_DOUBLE_EQ(hw.applied_motor("lift", "m").demand, 0.5);
+
+  sim.remove("lift");
+  sim.step(10ms);  // now = 30 ms: still inside the 50 ms owner timeout
+  ASSERT_EQ(hw.applied_motor("lift", "m").mode, Mode::kDutyCycle);
+
+  auto& restarted = sim.add<Lift>("lift");
+  EXPECT_EQ(sim.now(), Time{} + 30ms);
+  EXPECT_EQ(sim.node("lift").now(), sim.now());
+  // At 35 ms restarted ticks before SimHardware publishes (no State yet);
+  // at 40 ms it drains the 35 ms State & DS packet (robot_enabled == true)
+  // and flushes neutral, neutralizing the motor inside the owner timeout.
+  sim.step(10ms);  // now = 40 ms
+  EXPECT_EQ(DriverStationGeneration(sim), generation);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(restarted.updates, 2);
+  EXPECT_EQ(restarted.target.get(), nullptr);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kNeutral);
+
+  // Stay neutral for the entire remaining lifetime of the pre-restart target.
+  for (; sim.now() - published < 95ms; sim.step(5ms)) {
+    EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kNeutral)
+        << "target age " << (sim.now() - published).count() / 1'000'000
+        << " ms";
+  }
+
+  // A new target published after attach drives the restarted node immediately.
+  PublishTarget(sim, "lift", "teleop", target_test::Goal{0.75});
+  sim.step(10ms);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kDutyCycle);
+  EXPECT_DOUBLE_EQ(hw.applied_motor("lift", "m").demand, 0.75);
+
+  // Part 2: stopped past command_timeout_us (and owner timeout), the motor
+  // goes neutral before re-add; re-adding resumes cleanly on a new target.
+  sim.remove("lift");
+  sim.step(105ms);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kNeutral);
+
+  sim.add<Lift>("lift");
+  sim.step(10ms);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kNeutral);
+
+  PublishTarget(sim, "lift", "teleop", target_test::Goal{0.25});
+  sim.step(10ms);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, Mode::kDutyCycle);
+  EXPECT_DOUBLE_EQ(hw.applied_motor("lift", "m").demand, 0.25);
+}
+
+// REQ-SAFE-31: a node restarted during a link outage, while no hardware
+// State or Driver Station packet is published, never acts on the ones
+// published before it attached, though they are younger than
+// command_timeout_us: it reads the robot disabled and the Driver Station
+// absent until post-attach ones arrive.
+TEST(SimHardwareRestart, RestartedNodeIgnoresStateAndDriverStationFromBefore) {
+  struct Probe {
+    // Asking once here opens its /hw/state subscription now, as attaching.
+    explicit Probe(Node& n) : node{n}, ds{n} {
+      static_cast<void>(robot_enabled(n));
+    }
+    void update() {
+      ++updates;
+      if (robot_enabled(node)) ++enabled;
+      if (ds.connected()) ++connected;
+    }
+    Node& node;
+    DriverStation ds;
+    int updates = 0;
+    int enabled = 0;
+    int connected = 0;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Probe>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(
+      DsPacket(driver_station::kEnabled | driver_station::kTeleop));
+  sim.step(20ms);
+  ASSERT_TRUE(robot_enabled(sim.node("mech")));
+
+  // Restarted while the next four ticks' States and packets are lost: the
+  // newest one published is at most 20 ms old throughout, inside the 50 ms
+  // command_timeout_us.
+  sim.remove("mech");
+  hw.lose_states(4);
+  auto& restarted = sim.add<Probe>("mech");
+  sim.step(20ms);
+  ASSERT_GE(restarted.updates, 3);
+  EXPECT_EQ(restarted.enabled, 0);
+  EXPECT_EQ(restarted.connected, 0);
+
+  sim.step(10ms);
+  EXPECT_TRUE(robot_enabled(restarted.node));
+  EXPECT_TRUE(restarted.ds.connected());
+}
+
+// REQ-DEV-08: PublishTarget stamps the newest Driver Station mode generation
+// (0 before any Driver Station packet or when the newest packet names no
+// active mode), or the explicit mode_since_us when given.
+TEST(PublishTargetTest, StampsNewestDriverStationGenerationOrExplicitMode) {
+  auto sim = Sim::FromToml(kRobotToml);
+  SimHardware hw{sim};
+
+  auto expect_envelope = [&](std::string_view source,
+                             std::uint64_t expected_gen,
+                             std::uint8_t expected_active,
+                             double expected_pos) {
+    const std::string topic = "/mech/target/" + std::string{source};
+    const auto raw = sim.latest<TargetEnvelope<target_test::Goal>>(topic);
+    ASSERT_TRUE(raw.has_value());
+    EXPECT_EQ(raw->mode_since_us(), expected_gen);
+    EXPECT_EQ(raw->active, expected_active);
+    EXPECT_EQ(raw->padding, (std::array<std::uint8_t, 7>{}));
+    if (expected_active != 0) {
+      EXPECT_DOUBLE_EQ(raw->message.position_rot(), expected_pos);
+    }
+
+    const auto decoded = LatestTarget<target_test::Goal>(sim, "mech", source);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->mode_since_us(), expected_gen);
+    EXPECT_EQ(decoded->active, expected_active);
+    if (expected_active != 0) {
+      EXPECT_DOUBLE_EQ(decoded->message.position_rot(), expected_pos);
+    }
+  };
+
+  // Before any Driver Station packet is published, generation is 0.
+  EXPECT_EQ(DriverStationGeneration(sim), 0u);
+  PublishTarget(sim, "mech", "teleop", target_test::Goal{1.0});
+  expect_envelope("teleop", 0u, 1u, 1.0);
+
+  // First active mode (teleop): default PublishTarget stamps the DS generation.
+  hw.set_driver_station(
+      DsPacket(driver_station::kEnabled | driver_station::kTeleop));
+  sim.step(10ms);
+  const std::uint64_t teleop_gen = DriverStationGeneration(sim);
+  ASSERT_GT(teleop_gen, 0u);
+  PublishTarget(sim, "mech", "teleop", target_test::Goal{2.0});
+  expect_envelope("teleop", teleop_gen, 1u, 2.0);
+
+  // Disabled DS packet carries a nonzero raw mode_since_us, yet names no
+  // active mode: default PublishTarget stamps 0.
+  hw.set_driver_station(DsPacket(driver_station::kTeleop));
+  sim.step(10ms);
+  {
+    const auto raw_ds =
+        sim.latest<hardware::Packet>(hardware::kDriverStationTopic);
+    ASSERT_TRUE(raw_ds.has_value());
+    driver_station::DriverStationData decoded{};
+    ASSERT_TRUE(driver_station::Decode(raw_ds->bytes(), decoded));
+    ASSERT_GT(decoded.mode_since_us, 0u);
+  }
+  EXPECT_EQ(DriverStationGeneration(sim), 0u);
+  PublishTarget(sim, "mech", "teleop", target_test::Goal{2.5});
+  expect_envelope("teleop", 0u, 1u, 2.5);
+
+  // Mode transition to autonomous increments generation: default PublishTarget
+  // stamps the newest generation rather than an earlier one.
+  hw.set_driver_station(
+      DsPacket(driver_station::kEnabled | driver_station::kAutonomous));
+  sim.step(10ms);
+  const std::uint64_t auto_gen = DriverStationGeneration(sim);
+  ASSERT_GT(auto_gen, teleop_gen);
+  PublishTarget(sim, "mech", "auto", target_test::Goal{3.0});
+  expect_envelope("auto", auto_gen, 1u, 3.0);
+
+  // Explicit mode_since_us overrides the newest DS generation: earlier
+  // generation, explicit 0, and a full-width 64-bit value.
+  for (const std::uint64_t explicit_gen :
+       {teleop_gen, std::uint64_t{0}, std::uint64_t{0x123456789ABCDEF0ULL}}) {
+    PublishTarget(sim, "mech", "auto", target_test::Goal{4.0}, explicit_gen);
+    expect_envelope("auto", explicit_gen, 1u, 4.0);
+  }
+
+  // ReleaseTarget clears active and stamps the newest DS generation.
+  ReleaseTarget<target_test::Goal>(sim, "mech", "auto");
+  expect_envelope("auto", auto_gen, 0u, 0.0);
 }
 
 }  // namespace

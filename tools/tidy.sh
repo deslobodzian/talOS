@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 #
 # Run clang-tidy 18, the version CI runs, on the C++ files changed against a
-# base. The selection logic is not copied: this extracts the Python step
-# "Run clang-tidy on changed sources and headers" from
-# .github/workflows/continuous-integration.yaml and runs it, so the changed
+# base. Both this script and CI invoke tools/run_clang_tidy.py, so the changed
 # sources, the includers analysed for a changed header, the test-code check
-# exemption and the OFF_GRAPH list are CI's own. It sees committed changes
+# exemption and the OFF_GRAPH list are shared. It sees committed changes
 # only (git diff BASE HEAD, as in CI): commit first. Tool setup:
 # tools/clang18.sh.
 #
@@ -22,14 +20,27 @@
 # targets), as CI's build step does before tidy.
 #
 # On macOS, when clang 18 cannot parse the default SDK's libc++, it analyses
-# against the newest installed SDK that it can parse, and says which.
+# against the newest installed SDK that it can parse, and says which. On Linux
+# x86_64, when clang 18 cannot parse the host's libstdc++ (e.g. GCC 16 on
+# Arch), it fetches pinned Debian GCC 14 libstdc++/libgcc headers into
+# ${XDG_CACHE_HOME:-~/.cache}/talos/gcc-14-sysroot-<version> (verified by
+# SHA-256) and analyses against them with --gcc-install-dir.
 #
 # Exit: 0 clean, 1 findings, 2 usage or tool error, 3 cannot run on this host
 # (no bazel, the database could not be produced, or clang 18 cannot parse the
-# host's C++ standard library: a libstdc++ too new, or no macOS SDK it parses).
+# host's C++ standard library and no fallback is available).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 . "$(dirname "${BASH_SOURCE[0]}")/clang18.sh"
+
+# Pinned Debian GCC 14 headers for Linux x86_64 hosts whose system libstdc++
+# is newer than clang 18 can parse (e.g. Arch Linux GCC 16).
+GCC14_DEB_VERSION="14.2.0-19"
+GCC14_SNAPSHOT_BASE="https://snapshot.debian.org/archive/debian/20250315T204837Z/pool/main/g/gcc-14"
+GCC14_LIBSTDCXX_DEB="libstdc++-14-dev_${GCC14_DEB_VERSION}_amd64.deb"
+GCC14_LIBSTDCXX_SHA256="4b962fac5f1af0bd8b1b3f97e0f47b9d8e9a79e88802143f00ebfbd78ad87a7b"
+GCC14_LIBGCC_DEB="libgcc-14-dev_${GCC14_DEB_VERSION}_amd64.deb"
+GCC14_LIBGCC_SHA256="ca6f2d36d96b19b3eb71405b0b80134d8c89380b02204a2512e5c58ceb090628"
 
 base_arg=origin/main
 refresh=0
@@ -44,12 +55,15 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-wf=.github/workflows/continuous-integration.yaml
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-sed -n "/python3 - \"\\\$BASE\" <<'PYEOF'/,/^ *PYEOF\$/p" "$wf" | sed '1d;$d;s/^        //' > "$tmp/tidy.py"
-grep -q 'clang-tidy-18' "$tmp/tidy.py" ||
-  clang18_die "could not extract the clang-tidy step from $wf; update tools/tidy.sh"
+staging=""
+cleanup() {
+  rm -rf "$tmp"
+  if [ -n "${staging:-}" ]; then
+    rm -rf "$staging"
+  fi
+}
+trap cleanup EXIT
 
 command -v python3 >/dev/null 2>&1 || clang18_die "need python3"
 clang18_setup
@@ -69,9 +83,11 @@ probe_std() {
       "$tmp/probe.cc" -- -std=c++23 "$@" >"$tmp/probe.out" 2>&1; then
     return 0
   fi
-  if grep -Eq "^[^ ]+:[0-9]+:[0-9]+: (fatal )?error: " "$tmp/probe.out" &&
-     ! grep -E "^[^ ]+:[0-9]+:[0-9]+: (fatal )?error: " "$tmp/probe.out" |
-       grep -v "file not found" | grep -q "^$tmp/probe.cc:"; then
+  if grep -Eq '^.+:[0-9]+:[0-9]+: (fatal )?error: ' "$tmp/probe.out" &&
+     ! { grep -E '^.+:[0-9]+:[0-9]+: (fatal )?error: ' "$tmp/probe.out" |
+         PROBE_PREFIX="$tmp/probe.cc:" awk \
+           'index($0, "file not found") == 0 && index($0, ENVIRON["PROBE_PREFIX"]) == 1 { found = 1 }
+            END { exit !found }'; }; then
     return 1
   fi
   return 2
@@ -87,8 +103,150 @@ probe_failed() {  # probe_failed <status> <what was probed>
 # CI's step runs clang-tidy-18 by name, so extra arguments go through a
 # wrapper ahead of it on PATH. (Arrays are not used: macOS's bash 3.2 treats
 # an empty one as unbound under set -u.)
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+  fi
+}
+
+extract_deb() {
+  local deb="$1" dest="$2"
+  if command -v dpkg-deb >/dev/null 2>&1; then
+    dpkg-deb -x "$deb" "$dest"
+  elif command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -xOf "$deb" 'data.tar.*' | bsdtar -xf - -C "$dest"
+  elif command -v ar >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+    local member
+    member="$(ar t "$deb" | grep -m1 '^data\.tar\.')" || return 1
+    [ -n "$member" ] || return 1
+    case "$member" in
+      *.xz) ar p "$deb" "$member" | tar -xJf - -C "$dest" ;;
+      *.gz) ar p "$deb" "$member" | tar -xzf - -C "$dest" ;;
+      *.zst) ar p "$deb" "$member" | tar --zstd -xf - -C "$dest" ;;
+      *) ar p "$deb" "$member" | tar -xf - -C "$dest" ;;
+    esac
+  else
+    return 127
+  fi
+}
+
+gcc14_ready() {
+  [ -f "$gcc14_marker" ] &&
+    [ "$(cat "$gcc14_marker" 2>/dev/null || true)" = "$gcc14_fingerprint" ] &&
+    [ -d "$gcc14_root/usr/lib/gcc/x86_64-linux-gnu/14" ]
+}
+
+fetch_and_extract_deb() {
+  local deb="$1" expected_sha="$2" dest="$3"
+  local url="$GCC14_SNAPSHOT_BASE/$deb"
+  local archive="$tmp/$deb"
+  local err actual_sha
+  if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "$archive" "$url" 2>"$tmp/curl.err"; then
+    err="$(head -n 1 "$tmp/curl.err" 2>/dev/null || true)"
+    fallback_reason="failed to download $deb (${err:-curl failed})"
+    return 1
+  fi
+  actual_sha="$(sha256_file "$archive")" || {
+    fallback_reason="failed to compute SHA-256 for $deb"
+    return 1
+  }
+  if [ "$actual_sha" != "$expected_sha" ]; then
+    fallback_reason="SHA-256 mismatch for $deb (expected $expected_sha, got $actual_sha)"
+    return 1
+  fi
+  if ! extract_deb "$archive" "$dest" 2>"$tmp/extract.err"; then
+    err="$(head -n 1 "$tmp/extract.err" 2>/dev/null || true)"
+    fallback_reason="failed to extract $deb (${err:-extraction failed})"
+    return 1
+  fi
+}
+
+populate_gcc14_sysroot() {
+  if gcc14_ready; then
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    fallback_reason="need curl to fetch Debian GCC 14 packages"
+    return 1
+  fi
+  if ! command -v dpkg-deb >/dev/null 2>&1 &&
+     ! command -v bsdtar >/dev/null 2>&1 &&
+     { ! command -v ar >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; }; then
+    fallback_reason="need dpkg-deb, bsdtar, or ar+tar to extract Debian GCC 14 packages"
+    return 1
+  fi
+  # Clean up any stale staging directory left behind by a prior SIGKILL/SIGTERM
+  # (safe here: populate_gcc14_sysroot runs under the cache flock when available).
+  if command -v flock >/dev/null 2>&1; then
+    rm -rf "$cache_root/.gcc-14-sysroot-${GCC14_DEB_VERSION}".staging.* 2>/dev/null || true
+  fi
+  staging="$(mktemp -d "$cache_root/.gcc-14-sysroot-${GCC14_DEB_VERSION}.staging.XXXXXX")" || {
+    staging=""
+    fallback_reason="cannot create staging directory in $cache_root"
+    return 1
+  }
+  echo "tidy: fetching pinned Debian GCC 14 libstdc++ ($GCC14_DEB_VERSION) into $gcc14_root" >&2
+  if ! fetch_and_extract_deb "$GCC14_LIBSTDCXX_DEB" "$GCC14_LIBSTDCXX_SHA256" "$staging" ||
+     ! fetch_and_extract_deb "$GCC14_LIBGCC_DEB" "$GCC14_LIBGCC_SHA256" "$staging"; then
+    rm -rf "$staging"
+    staging=""
+    return 1
+  fi
+  if [ ! -d "$staging/usr/lib/gcc/x86_64-linux-gnu/14" ]; then
+    rm -rf "$staging"
+    staging=""
+    fallback_reason="extracted GCC 14 packages missing usr/lib/gcc/x86_64-linux-gnu/14"
+    return 1
+  fi
+  if ! printf '%s\n' "$gcc14_fingerprint" > "$staging/.ready"; then
+    fallback_reason="cannot write readiness marker in $staging"
+    rm -rf "$staging"
+    staging=""
+    return 1
+  fi
+  if [ -e "$gcc14_root" ] && ! gcc14_ready; then
+    rm -rf "$gcc14_root" || {
+      rm -rf "$staging"
+      staging=""
+      fallback_reason="cannot replace incomplete cache $gcc14_root"
+      return 1
+    }
+  fi
+  if python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$staging" "$gcc14_root" 2>/dev/null; then
+    staging=""
+    return 0
+  fi
+  rm -rf "$staging"
+  staging=""
+  if gcc14_ready; then
+    return 0
+  fi
+  fallback_reason="failed to move $gcc14_root into place"
+  return 1
+}
+
+ensure_gcc14_sysroot() {
+  if gcc14_ready; then
+    return 0
+  fi
+  if ! mkdir -p "$cache_root" 2>/dev/null || [ ! -w "$cache_root" ]; then
+    fallback_reason="cache directory $cache_root is not writable"
+    return 1
+  fi
+  if command -v flock >/dev/null 2>&1; then
+    local lock_file="$cache_root/.gcc-14-sysroot-${GCC14_DEB_VERSION}.lock"
+    { flock 9 && populate_gcc14_sysroot; } 9>"$lock_file"
+  else
+    populate_gcc14_sysroot
+  fi
+}
+
 sysroot=""
-if [ "$(uname -s)" = Darwin ]; then
+gcc_install_dir=""
+os_name="$(uname -s)"
+if [ "$os_name" = Darwin ]; then
   # The compilation database builds against the default SDK; Apple's newest
   # may need a newer clang. Then try the installed SDKs, newest first (the
   # unversioned and major-only names are links to one of them).
@@ -98,20 +256,23 @@ if [ "$(uname -s)" = Darwin ]; then
   if [ "$status" != 0 ]; then
     tried="${default_sdk:-(no default SDK)}"
     dev="$(xcode-select -p 2>/dev/null || true)"
-    for sdk in $( { ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX[0-9]*.[0-9]*.sdk
-                    [ -n "$dev" ] && ls -d "$dev"/Platforms/MacOSX.platform/Developer/SDKs/MacOSX[0-9]*.[0-9]*.sdk
-                  } 2>/dev/null |
-                  awk -F/ '{v=$NF; sub(/^MacOSX/, "", v); sub(/\.sdk$/, "", v); split(v, n, ".");
-                            printf "%06d.%06d\t%s\n", n[1], n[2], $0}' |
-                  sort -r | cut -f2 | awk '!seen[$0]++'); do
-      tried="$tried $sdk"
+    { ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX[0-9]*.[0-9]*.sdk 2>/dev/null || true
+      if [ -n "$dev" ]; then
+        ls -d "$dev"/Platforms/MacOSX.platform/Developer/SDKs/MacOSX[0-9]*.[0-9]*.sdk 2>/dev/null || true
+      fi
+    } | awk -F/ '{v=$NF; sub(/^MacOSX/, "", v); sub(/\.sdk$/, "", v); split(v, n, ".");
+                  printf "%06d.%06d\t%s\n", n[1], n[2], $0}' |
+        sort -r | cut -f2- | awk '!seen[$0]++' > "$tmp/sdks"
+    while IFS= read -r sdk; do
+      [ -n "$sdk" ] || continue
+      tried="${tried}"$'\n'"${sdk}"
       status=0; probe_std -isysroot "$sdk" || status=$?
       probe_failed "$status" "$sdk"
       if [ "$status" = 0 ]; then sysroot="$sdk"; break; fi
-    done
+    done < "$tmp/sdks"
     if [ -z "$sysroot" ]; then
       echo "tidy: cannot run here: clang 18 cannot parse the C++ standard library of any installed macOS SDK; tried:" >&2
-      for sdk in $tried; do echo "  $sdk" >&2; done
+      printf '%s\n' "$tried" | sed 's/^/  /' >&2
       grep -E "error: " "$tmp/probe.out" | head -3 | sed 's/^/  last: /' >&2
       exit 3
     fi
@@ -121,16 +282,46 @@ else
   status=0; probe_std || status=$?
   probe_failed "$status" "host standard library"
   if [ "$status" != 0 ]; then
-    echo "tidy: cannot run here: clang 18 cannot parse this host's C++ standard library:" >&2
-    grep -E "error: " "$tmp/probe.out" | head -3 | sed 's/^/  /' >&2
-    echo "tidy: (CI uses Ubuntu's GCC 13/14 libstdc++.) Run it on macOS or rely on CI." >&2
-    exit 3
+    native_errors="$(grep -E "error: " "$tmp/probe.out" | head -3 || true)"
+    arch_name="$(uname -m)"
+    if [ "$os_name" = Linux ] && [ "$arch_name" = x86_64 ]; then
+      cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/talos"
+      gcc14_root="$cache_root/gcc-14-sysroot-${GCC14_DEB_VERSION}"
+      gcc14_marker="$gcc14_root/.ready"
+      gcc14_fingerprint="${GCC14_DEB_VERSION}:${GCC14_LIBSTDCXX_SHA256}:${GCC14_LIBGCC_SHA256}"
+      fallback_reason=""
+      if ! ensure_gcc14_sysroot; then
+        echo "tidy: cannot run here: clang 18 cannot parse this host's C++ standard library, and GCC 14 fallback failed (${fallback_reason:-unknown error}):" >&2
+        [ -n "$native_errors" ] && printf '%s\n' "$native_errors" | sed 's/^/  /' >&2
+        echo "tidy: (CI uses Ubuntu's GCC 13/14 libstdc++.) Rely on CI or check network access." >&2
+        exit 3
+      fi
+      candidate_gcc_dir="$gcc14_root/usr/lib/gcc/x86_64-linux-gnu/14"
+      status=0; probe_std "--gcc-install-dir=$candidate_gcc_dir" || status=$?
+      if [ "$status" != 0 ]; then
+        echo "tidy: cannot run here: clang 18 cannot parse this host's C++ standard library, and GCC 14 fallback ($candidate_gcc_dir) failed to parse:" >&2
+        grep -E "error: " "$tmp/probe.out" | head -3 | sed 's/^/  /' >&2
+        exit 3
+      fi
+      gcc_install_dir="$candidate_gcc_dir"
+      echo "tidy: clang 18 cannot parse this host's C++ standard library; using $gcc_install_dir" >&2
+    else
+      echo "tidy: cannot run here: clang 18 cannot parse this host's C++ standard library:" >&2
+      [ -n "$native_errors" ] && printf '%s\n' "$native_errors" | sed 's/^/  /' >&2
+      echo "tidy: (CI uses Ubuntu's GCC 13/14 libstdc++; automatic fallback is Linux x86_64 only.) Run it on macOS or rely on CI." >&2
+      exit 3
+    fi
   fi
 fi
-if [ -n "$sysroot" ]; then
+if [ -n "$sysroot" ] || [ -n "$gcc_install_dir" ]; then
   mkdir -p "$tmp/bin"
-  printf '#!/bin/sh\nexec %q --extra-arg=-isysroot --extra-arg=%q "$@"\n' \
-    "$(command -v clang-tidy-18)" "$sysroot" > "$tmp/bin/clang-tidy-18"
+  if [ -n "$sysroot" ]; then
+    printf '#!/usr/bin/env bash\nexec %q --extra-arg=-isysroot --extra-arg=%q "$@"\n' \
+      "$(command -v clang-tidy-18)" "$sysroot" > "$tmp/bin/clang-tidy-18"
+  else
+    printf '#!/usr/bin/env bash\nexec %q --extra-arg=%q "$@"\n' \
+      "$(command -v clang-tidy-18)" "--gcc-install-dir=$gcc_install_dir" > "$tmp/bin/clang-tidy-18"
+  fi
   chmod +x "$tmp/bin/clang-tidy-18"
   export PATH="$tmp/bin:$PATH"
 fi
@@ -140,7 +331,8 @@ if [ "$refresh" = 1 ] || [ ! -f compile_commands.json ]; then
     echo "tidy: cannot run here: no compile_commands.json and no bazel to make it" >&2
     exit 3
   fi
-  bazel run --disk_cache="$HOME/.cache/bazel-disk" --noshow_progress \
+  disk_cache="${TALOS_BAZEL_DISK_CACHE:-$HOME/.cache/talos-bazel-disk}"
+  bazel run --disk_cache="$disk_cache" --noshow_progress \
     @hedron_compile_commands//:refresh_all ||
     { echo "tidy: cannot run here: compilation database refresh failed" >&2; exit 3; }
 fi
@@ -151,4 +343,4 @@ if [ "$base_arg" = --all ]; then
 else
   clang18_base "$base_arg"
 fi
-python3 "$tmp/tidy.py" "$BASE"
+python3 tools/run_clang_tidy.py "$BASE"

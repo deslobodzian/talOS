@@ -56,7 +56,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "talOS/bridge/boot_history.h"
+#include "talOS/hardware/boot_history.h"
 
 namespace talos::hardware {
 

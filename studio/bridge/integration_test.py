@@ -1,8 +1,12 @@
 """Exercise real IPC -> WebSocket bytes with bridge_client's stdlib WebSocket client."""
 import base64
+import ctypes
 import json
+import mmap
 import os
 from pathlib import Path
+import re
+import shutil
 import signal
 import socket
 import struct
@@ -17,6 +21,7 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridge_client import (BINARY, CLOSE, TEXT, any_frame, bound_port, fast_slots,
                            frame_of, receive, stop, upgrade)
+from talOS.memory.shm_name import shm_name
 
 
 # An RTMS segment's header (talOS/rtms/rtms.h RTMSHeader, version 9, 2368 B):
@@ -35,6 +40,17 @@ RTMS_READERS, RTMS_MAX_READERS = 320, 32
 PID_MASK = (1 << 22) - 1
 
 
+def parse_rtms_header(header):
+    """(writer_pid_or_None, reader_pids) from an RTMS v9 header, or None."""
+    if (len(header) < RTMS_HEADER_BYTES
+            or struct.unpack_from("<QQ", header) != (RTMS_MAGIC, RTMS_VERSION)):
+        return None
+    owner = struct.unpack_from("<Q", header, RTMS_WRITER_OWNER)[0]
+    readers = {(struct.unpack_from("<Q", header, RTMS_READERS + 64 * i + 8)[0] >> 2) & PID_MASK
+               for i in range(RTMS_MAX_READERS)}
+    return (owner & PID_MASK if owner else None, readers - {0})
+
+
 def rtms_segments():
     """(name, writer pid, reader pids) of every RTMS segment this user can read."""
     segments = []
@@ -44,14 +60,90 @@ def rtms_segments():
                 header = handle.read(RTMS_HEADER_BYTES)
         except OSError:
             continue
-        if (len(header) < RTMS_HEADER_BYTES
-                or struct.unpack_from("<QQ", header) != (RTMS_MAGIC, RTMS_VERSION)):
+        parsed = parse_rtms_header(header)
+        if parsed is None:
             continue
-        owner = struct.unpack_from("<Q", header, RTMS_WRITER_OWNER)[0]
-        readers = {(struct.unpack_from("<Q", header, RTMS_READERS + 64 * i + 8)[0] >> 2) & PID_MASK
-                   for i in range(RTMS_MAX_READERS)}
-        segments.append((entry.name, owner & PID_MASK if owner else None, readers - {0}))
+        segments.append((entry.name, parsed[0], parsed[1]))
     return segments
+
+
+VMMAP_REGION_RE = re.compile(r"\]\s+([r-][w-][x-])/([r-][w-][x-])\s+SM=(\S+)")
+DARWIN_NON_SOCKET_TYPES = frozenset({
+    "REG", "VREG", "DIR", "VDIR", "CHR", "VCHR", "BLK", "VBLK",
+    "FIFO", "VFIFO", "PIPE", "KQUEUE", "VNODE", "NPOLICY", "GUARD",
+    "PSXSHM", "PSXSEM", "FSEVENTS", "NEXUS", "CHANNEL",
+})
+
+
+def darwin_rtms_segment(topic):
+    """(writer pid, reader pids) of `topic`'s POSIX shm segment on macOS."""
+    if "TALOS_SHM_NAMESPACE" in os.environ:
+        ns = os.environ["TALOS_SHM_NAMESPACE"]
+    else:
+        ns = os.environ.get("TEST_TMPDIR", "")
+    segment = shm_name(topic, ns) if ns else "/" + topic.lstrip("/").replace("/", ".")
+    libc = ctypes.CDLL(None, use_errno=True)
+    # Declare only the two fixed parameters: O_RDONLY never reads the variadic
+    # mode_t argument, keeping arm64 macOS ABI exact.
+    libc.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    libc.shm_open.restype = ctypes.c_int
+    fd = libc.shm_open(segment.encode(), os.O_RDONLY)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), segment)
+    try:
+        with mmap.mmap(fd, RTMS_HEADER_BYTES, access=mmap.ACCESS_READ) as mapping:
+            header = mapping[:RTMS_HEADER_BYTES]
+    finally:
+        os.close(fd)
+    parsed = parse_rtms_header(header)
+    if parsed is None:
+        raise AssertionError(f"segment {segment} for {topic} is not an RTMS v{RTMS_VERSION} header")
+    return parsed
+
+
+def darwin_tool(name, fallback):
+    """Locates a macOS inspection tool even when Bazel's PATH omits /usr/sbin."""
+    return shutil.which(name) or fallback
+
+
+def darwin_writable_shm_regions(pid):
+    """Writable `SM=SHM` region lines from `vmmap -wide <pid>` on macOS.
+
+    Catches closed-fd `SharedMemoryPtr` mappings that `lsof` cannot see.
+    """
+    proc = subprocess.run(
+        [darwin_tool("vmmap", "/usr/bin/vmmap"), "-wide", str(pid)],
+        capture_output=True, text=True, timeout=15,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"vmmap failed ({proc.returncode}): {proc.stderr}")
+    writable = []
+    for line in proc.stdout.splitlines():
+        match = VMMAP_REGION_RE.search(line)
+        if match and "w" in match.group(1) and match.group(3) == "SHM":
+            writable.append(line.strip())
+    return writable
+
+
+def parse_lsof_fields(text):
+    """Parses `lsof -F ftPTan` output into a list of per-fd dicts."""
+    records = []
+    current = None
+    for line in text.splitlines():
+        if not line:
+            continue
+        tag, value = line[0], line[1:]
+        if tag == "f":
+            current = {"fd": value}
+            records.append(current)
+        elif current is not None:
+            if tag == "T":
+                if value.startswith("ST="):
+                    current["state"] = value[3:]
+            else:
+                current[tag] = value
+    return records
 
 
 def socket_inodes(pid):
@@ -83,8 +175,10 @@ def table_inodes(*tables):
 
 class BridgeIntegration(unittest.TestCase):
     # REQ-SAFE-35
-    @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "reads /dev/shm and /proc, which only Linux has")
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") or sys.platform == "darwin",
+        "inspects open sockets and shared memory via /proc+/dev/shm (Linux) or lsof+shm_open (macOS)",
+    )
     def test_running_bridge_opens_no_writer_and_no_datagram_socket(self):
         """A bridge serving a client holds no RTMS writer and no UDP or raw socket.
 
@@ -117,23 +211,120 @@ class BridgeIntegration(unittest.TestCase):
                     # attached, read the topic and sent on the socket.
                     self.assertEqual(frame_of(ws, BINARY)[8:12], b"TLM3")
 
-                    segments = rtms_segments()
-                    written = [name for name, writer, _ in segments if writer == bridge.pid]
-                    self.assertEqual(written, [], f"bridge pid {bridge.pid} writes {written}")
-                    telemetry = [(writer, readers) for _, writer, readers in segments
-                                 if bridge.pid in readers]
-                    self.assertIn((mock.pid, {bridge.pid}), telemetry,
-                                  f"no segment written by the mock ({mock.pid}) and read by "
-                                  f"the bridge ({bridge.pid}): {segments}")
+                    if sys.platform.startswith("linux"):
+                        segments = rtms_segments()
+                        written = [name for name, writer, _ in segments if writer == bridge.pid]
+                        self.assertEqual(written, [], f"bridge pid {bridge.pid} writes {written}")
+                        telemetry = [(writer, readers) for _, writer, readers in segments
+                                     if bridge.pid in readers]
+                        self.assertIn((mock.pid, {bridge.pid}), telemetry,
+                                      f"no segment written by the mock ({mock.pid}) and read by "
+                                      f"the bridge ({bridge.pid}): {segments}")
 
-                    held = socket_inodes(bridge.pid)
-                    datagram = held & table_inodes("udp", "udp6", "udplite", "udplite6",
-                                                   "raw", "raw6")
-                    self.assertEqual(datagram, set(), f"bridge holds UDP or raw sockets {datagram}")
-                    tcp, unix = table_inodes("tcp", "tcp6"), table_inodes("unix")
-                    self.assertTrue(held & tcp, f"none of {held} is TCP: the listener is missing")
-                    self.assertEqual(held - tcp - unix, set(),
-                                     f"bridge sockets neither TCP nor Unix: {held - tcp - unix}")
+                        held = socket_inodes(bridge.pid)
+                        datagram = held & table_inodes("udp", "udp6", "udplite", "udplite6",
+                                                       "raw", "raw6")
+                        self.assertEqual(datagram, set(),
+                                         f"bridge holds UDP or raw sockets {datagram}")
+                        tcp, unix = table_inodes("tcp", "tcp6"), table_inodes("unix")
+                        self.assertTrue(held & tcp,
+                                        f"none of {held} is TCP: the listener is missing")
+                        self.assertEqual(held - tcp - unix, set(),
+                                         f"bridge sockets neither TCP nor Unix: {held - tcp - unix}")
+                    else:
+                        # macOS: verify the RTMS header directly via
+                        # shm_open(O_RDONLY), check writable SM=SHM VM regions
+                        # via vmmap (catches closed-fd SharedMemoryPtr maps),
+                        # and enforce a strict socket allowlist via lsof.
+                        writer, readers = darwin_rtms_segment(topic)
+                        self.assertNotEqual(writer, bridge.pid,
+                                            f"bridge pid {bridge.pid} owns writer on {topic}")
+                        self.assertEqual(writer, mock.pid,
+                                         f"expected mock pid {mock.pid} as writer, got {writer}")
+                        self.assertIn(bridge.pid, readers,
+                                      f"bridge pid {bridge.pid} not listed in readers {readers}")
+
+                        # RegistryReader maps O_RDONLY (r--/r--) and --session-id
+                        # is unset, so only the subscribed telemetry topic is
+                        # mapped rw- SM=SHM.
+                        writable_shm = darwin_writable_shm_regions(bridge.pid)
+                        self.assertEqual(
+                            len(writable_shm), 1,
+                            f"expected exactly 1 writable SM=SHM region (telemetry topic), "
+                            f"got {len(writable_shm)}: {writable_shm}",
+                        )
+
+                        lsof_bin = darwin_tool("lsof", "/usr/sbin/lsof")
+                        udp = subprocess.run(
+                            [lsof_bin, "-n", "-P", "-a", "-p", str(bridge.pid), "-i", "UDP"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertIn(udp.returncode, (0, 1), udp.stderr)
+                        if udp.returncode == 1:
+                            self.assertEqual(udp.stderr, "",
+                                             f"lsof -i UDP failed: {udp.stderr}")
+                        self.assertEqual(udp.stdout.strip(), "",
+                                         f"bridge holds UDP sockets:\n{udp.stdout}")
+
+                        all_fds = subprocess.run(
+                            [lsof_bin, "-n", "-P", "-a", "-p", str(bridge.pid), "-F", "ftPTan"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertEqual(all_fds.returncode, 0, all_fds.stderr)
+                        records = parse_lsof_fields(all_fds.stdout)
+                        self.assertTrue(records, "lsof returned no descriptors for bridge")
+
+                        port_re = re.compile(rf":{port}(?:$|[^0-9])")
+                        ws_port_re = re.compile(rf":{ws.getsockname()[1]}(?:$|[^0-9])")
+                        tcp_listeners = []
+                        tcp_clients = []
+                        for rec in records:
+                            fd_type = rec.get("t", "")
+                            proto = rec.get("P", "")
+                            state = rec.get("state", "")
+                            access = rec.get("a", "")
+                            name = rec.get("n", "")
+                            if fd_type == "PSXSHM":
+                                self.assertNotIn(access, ("w", "u"),
+                                                 f"bridge holds writable shm descriptor: {rec}")
+                                continue
+                            if fd_type in DARWIN_NON_SOCKET_TYPES and not proto:
+                                continue
+                            if fd_type == "unix":
+                                continue
+                            # macOS libnetwork/getaddrinfo opens an internal
+                            # com.apple.netsrc kernel-control socket for
+                            # address-selection queries (cannot transmit).
+                            if (fd_type == "systm"
+                                    and name.startswith("[ctl com.apple.netsrc ")):
+                                continue
+                            # Strict socket allowlist: reject every non-unix
+                            # socket (IPv4/IPv6 non-TCP, systm, KCTL, ROUTE,
+                            # RAW, NDRV, etc.) except the single TCP LISTEN
+                            # socket on :{port} and this test's ESTABLISHED ws.
+                            self.assertIn(fd_type, ("IPv4", "IPv6"),
+                                          f"bridge holds disallowed socket type: {rec}")
+                            self.assertEqual(proto, "TCP",
+                                             f"bridge holds non-TCP socket: {rec}")
+                            local, sep, remote = name.partition("->")
+                            if not sep and state == "LISTEN" and port_re.search(local):
+                                tcp_listeners.append(rec)
+                            elif (sep and state == "ESTABLISHED"
+                                  and port_re.search(local)
+                                  and ws_port_re.search(remote)):
+                                tcp_clients.append(rec)
+                            else:
+                                self.fail(f"bridge holds unexpected TCP socket: {rec}")
+                        self.assertEqual(
+                            len(tcp_listeners), 1,
+                            f"expected exactly 1 TCP LISTEN socket on port {port}, "
+                            f"got {tcp_listeners} in {records}",
+                        )
+                        self.assertEqual(
+                            len(tcp_clients), 1,
+                            f"expected 1 ESTABLISHED ws client socket, "
+                            f"got {tcp_clients} in {records}",
+                        )
             finally:
                 stop(processes)
                 for process in processes:
@@ -410,9 +601,12 @@ class BridgeIntegration(unittest.TestCase):
                         f"http://127.0.0.1:{port}/drive/layout.json", timeout=3) as response:
                     layout = json.loads(response.read())
                 self.assertEqual(layout["title"], "Pit")
-                # The RoboRIO link's alert is carried whatever the widgets.
+                # The RoboRIO link and protocol-mismatch alerts are carried
+                # whatever the widgets.
                 self.assertEqual(layout["channels"],
-                                 ["drive/velocity", "hw/status/alert_error_link_lost"])
+                                 ["drive/velocity",
+                                  "hw/status/alert_error_link_lost",
+                                  "hw/status/alert_error_protocol_mismatch"])
                 with self.assertRaises(urllib.error.HTTPError) as absent:
                     urllib.request.urlopen(f"http://127.0.0.1:{bare_port}/drive/layout.json",
                                            timeout=3)
@@ -614,6 +808,80 @@ class BridgeIntegration(unittest.TestCase):
             finally:
                 if mock.stdin:
                     mock.stdin.close()
+                stop(processes)
+                for process in processes:
+                    self.assertEqual(process.returncode, 0)
+
+    # REQ-OPS-34, REQ-OPS-35, REQ-OPS-36, TODO.md DEPLOY-12
+    def test_refusal_file_serves_drive_summary_layout_and_ws_without_config(self):
+        """With --refusal-file, the bridge binds port 0, serves /drive,
+        a minimal /drive/layout.json, /drive/summary.json, and ws /drive with
+        launch_refused + refusal_reason (plus heartbeats), and fails fast if
+        the requested port is already held."""
+        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
+        bridge_bin = str(workspace / "studio/bridge/studio_bridge")
+        with tempfile.TemporaryDirectory() as tmp:
+            webroot = Path(tmp, "webroot")
+            webroot.mkdir()
+            (webroot / "drive.html").write_text("<html>drive</html>")
+            refusal_path = Path(tmp, "last_refusal.json")
+            refusal_path.write_text(json.dumps({
+                "refused": True,
+                "reason": "error: motor_py: unread parameter key unread.value_m",
+                "config_path": "/opt/talos/current/robot.toml",
+                "wall_ns": 123456789,
+            }))
+            bridge = subprocess.Popen(
+                [bridge_bin, "/talos/telemetry", "0", str(webroot),
+                 "--refusal-file", str(refusal_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            processes = [bridge]
+            try:
+                port = bound_port(bridge)
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/drive", timeout=3) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertIn(b"drive", resp.read())
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/drive/layout.json", timeout=3) as resp:
+                    layout = json.loads(resp.read())
+                    self.assertEqual(layout["columns"], 1)
+                    self.assertEqual(layout["rows"], 1)
+                    self.assertEqual(layout["widgets"], [])
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/drive/summary.json", timeout=3) as resp:
+                    summary = json.loads(resp.read())
+                    self.assertEqual(summary["kind"], "talos.drive.summary")
+                    self.assertTrue(summary["launch_refused"])
+                    self.assertIn("unread.value_m", summary["refusal_reason"])
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as ws:
+                    self.assertIn(b"101 Switching Protocols", upgrade(ws, "/drive"))
+                    ws.settimeout(3)
+                    got_summary = None
+                    got_heartbeat = False
+                    for _ in range(10):
+                        opcode, payload = any_frame(ws)
+                        self.assertEqual(opcode, TEXT)
+                        doc = json.loads(payload)
+                        if doc["kind"] == "talos.drive.summary":
+                            got_summary = doc
+                        elif doc["kind"] == "talos.drive.heartbeat":
+                            got_heartbeat = True
+                        if got_summary and got_heartbeat:
+                            break
+                    self.assertIsNotNone(got_summary)
+                    self.assertTrue(got_summary["launch_refused"])
+                    self.assertIn("unread.value_m", got_summary["refusal_reason"])
+                    self.assertTrue(got_heartbeat)
+
+                # A second refusal bridge on the same port fails immediately.
+                conflict = subprocess.run(
+                    [bridge_bin, "/talos/telemetry", str(port), str(webroot),
+                     "--refusal-file", str(refusal_path)],
+                    capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(conflict.returncode, 0)
+                self.assertNotIn("listening", conflict.stdout)
+            finally:
                 stop(processes)
                 for process in processes:
                     self.assertEqual(process.returncode, 0)

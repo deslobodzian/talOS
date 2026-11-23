@@ -19,8 +19,13 @@
 //       every 5th /shooter/state, received 1 ms after its publication, and
 //       a /hw/state/driver_station packet every 100 ms from 0 s to 10 s,
 //       received 2 ms after its publication, enabled from 5 s; the record of
-//       packet 40 is damaged (a payload byte flipped)
-//   manifest.json                          a finished --sim session
+//       packet 40 is damaged (a payload byte flipped); also sends
+//       /observer/status (review_test.Health) raising alert_error_link_lost
+//       at 2.001 s and clearing it at 4.001 s
+//   manifest.json                          a finished --sim session with
+//                                          observer (1 run) and shooter (2
+//                                          runs)
+//   graph.json                             the declared graph of the two nodes
 //
 // Times are kStartNs plus the offsets above, on the recording's monotonic
 // clock. Every log header's wall clock is kStartWallNs at kStartNs, as the

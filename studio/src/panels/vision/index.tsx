@@ -85,30 +85,39 @@ function Cell({value, children}: {value: unknown; children: ReactNode}) {
 function VisionPanel() {
   const dictionary = useDictionary();
   const snapshot = useSnapshot();
+  const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
   const cameras = useMemo(() => discoverCameras(dictionary), [dictionary]);
   const estimators = useMemo(() => discoverEstimators(dictionary), [dictionary]);
   const estimator = estimators[0] ?? null;
 
   // Collect the windowed channels once, then read them out of a few series
-  // rather than one hook per camera per window.
+  // rather than one hook per camera per window. Every channel is filtered
+  // against the dictionary so recorded playback never requests an absent
+  // channel (studio_review returns 404 on unknown channel names).
   const wants = useMemo(() => {
     const sample: string[] = [], valid: string[] = [], dropped: string[] = [];
     const detail: string[] = [];
+    const add = (list: string[], name: string) => {
+      if (present.has(name)) list.push(name);
+    };
     for (const c of cameras) {
-      sample.push(channel(c.name, 'state/sample_time_ns'));
-      valid.push(channel(c.name, 'state/valid'));
-      dropped.push(channel(c.name, 'status/frames_dropped_count'));
-      detail.push(
-          channel(c.name, 'state/pose/x_m'), channel(c.name, 'state/pose/y_m'),
-          channel(c.name, 'state/valid'),
-          channel(c.name, 'status/frame_period_us'),
-          channel(c.name, 'status/last_latency_us'),
-          channel(c.name, 'status/visible_tag_count'));
+      add(sample, channel(c.name, 'state/sample_time_ns'));
+      add(valid, channel(c.name, 'state/valid'));
+      add(dropped, channel(c.name, 'status/frames_dropped_count'));
+      for (const suffix of [
+        'state/pose/x_m', 'state/pose/y_m', 'state/valid',
+        'status/frame_period_us', 'status/last_latency_us',
+        'status/visible_tag_count'
+      ]) {
+        add(detail, channel(c.name, suffix));
+      }
     }
     return {sample, valid, dropped, detail};
-  }, [cameras]);
+  }, [cameras, present]);
 
-  const rate5 = useSeries([...wants.sample, ...wants.valid], {seconds: 5});
+  const rate5Channels = useMemo(
+      () => [...wants.sample, ...wants.valid], [wants]);
+  const rate5 = useSeries(rate5Channels, {seconds: 5});
   const drop10 = useSeries(wants.dropped, {seconds: 10});
   const detail30 = useSeries(wants.detail, {seconds: 30});
 
@@ -118,12 +127,18 @@ function VisionPanel() {
   const refOwner = simPresent ? 'sim' : estimator?.name ?? null;
   const refX = refOwner ? channel(refOwner, 'state/pose/x_m') : null;
   const refY = refOwner ? channel(refOwner, 'state/pose/y_m') : null;
-  const ref30 = useSeries(refX && refY ? [refX, refY] : [], {seconds: 30});
+  const refChannels = useMemo(
+      () => (refX && refY ? [refX, refY].filter(name => present.has(name)) : []),
+      [refX, refY, present]);
+  const ref30 = useSeries(refChannels, {seconds: 30});
 
-  const est10 = useSeries(estimator ? [
-    channel(estimator.name, 'state/observation_accepted_count'),
-    channel(estimator.name, 'state/observation_rejected_count')
-  ] : [], {seconds: 10});
+  const estChannels = useMemo(
+      () => (estimator ? [
+        channel(estimator.name, 'state/observation_accepted_count'),
+        channel(estimator.name, 'state/observation_rejected_count')
+      ].filter(name => present.has(name)) : []),
+      [estimator, present]);
+  const est10 = useSeries(estChannels, {seconds: 10});
 
   const ch = snapshot?.channels ?? {};
 
@@ -202,7 +217,7 @@ function VisionPanel() {
       const points = observationErrors(
           d.times, col(channel(c.name, 'state/pose/x_m'))(d),
           col(channel(c.name, 'state/pose/y_m'))(d),
-          col(channel(c.name, 'state/valid'))(d), rX, rY);
+          col(channel(c.name, 'state/valid'))(d), rX, rY, ref30.times);
       const times: number[] = [], xs: number[] = [], ys: number[] = [];
       for (const p of points) {
         times.push(p.t);
@@ -387,5 +402,6 @@ export const visionPanel: PanelDefinition<VisionConfig> = {
   description: 'Camera health, frame stats and estimator agreement.',
   defaultConfig,
   parseConfig,
-  component: VisionPanel
+  component: VisionPanel,
+  recorded: true
 };

@@ -47,10 +47,10 @@ and the protocol version that wrote them and followed by a CRC32
 configuration over on its first disabled tick after the acknowledgement, or
 at a clean exit (`ConfigPersister::Stop`), and a saver thread (`talos-config`, nice 19) syncs storage while the loop ticks
 on: the loop only try-locks the handover, never waits on the save, and polls
-its outcome on later ticks. The loop encodes the configuration it hands over
-and frees those bytes itself once they are saved; once started, the saver
-thread allocates and frees nothing (system calls only, on paths built at
-startup), so it never holds an allocator lock the loop could wait on. A
+its outcome on later ticks. The loop encodes the configuration into a preallocated slot and swaps it by
+index under the lock; once constructed, neither the loop thread nor the saver
+thread allocates or frees during configuration persistence (system calls only,
+on paths built at startup). A
 configuration acknowledged while a save runs is
 saved after it, newest last; a failed save prints `cannot persist hardware
 configuration`, keeps the previous file, and an identical push saves it
@@ -118,8 +118,10 @@ remote encoder references that do not exist on the motor's bus, and a
 Device tables reject unknown keys in both runtime parsing and manifest checking.
 CANcoder and Pigeon2 accept `type`, `bus`, `can_id`, `inverted`, and `offset_rot`.
 QuadratureEncoder accepts `type`, `dio_a`, `dio_b`, and `counts_per_rev`;
-DutyCycleEncoder accepts `type`, `dio`, and `offset_rot`; digital IO accepts only
-`dio`, while analog inputs and PWM outputs accept only `channel`.
+DutyCycleEncoder accepts `type`, `dio`, and `offset_rot`; `digital_outputs`
+accepts only `dio`, `digital_inputs` accepts `dio` plus the optional
+`sim_motor`, `sim_closed_at_rot`, `sim_closed_above`, and `sim_closed_reads`
+keys, and analog inputs and PWM outputs accept only `channel`.
 
 Motor tables may specify `follow = "master_motor"` and optional
 `oppose_master = true` (default false). The master must be a motor owned by
@@ -188,12 +190,15 @@ configuration, so after a reset at 30 rotations limits of [0, 50] would allow
 
 `motor_type` names the motor the TalonFX drives: `"kraken_x60"` (the
 default), `"kraken_x44"` or `"falcon_500"`; config load refuses any other
-value, naming the key, the motor and its file. Only the physics simulator
-reads it, for its winding model (stator current, free speed; see the backend
-table below). It is not in the wire format or the configuration fingerprint,
-so a config the bridge pushes to `sim_gateway` carries none: the physics
-backend gives each pushed motor the type of the motor of the same name in
-`sim_gateway`'s own parse of `--config` (`PhysicsSimBackend::SetLocalMotorTypes`).
+value, naming the key, the motor and its file. It is not in the wire format or
+the configuration fingerprint, so a config the bridge pushes over UDP carries
+none: `sim_gateway --physics` reads it locally from its own parse of `--config`
+(`PhysicsSimBackend::SetLocalMotorTypes`) for its winding model (stator
+current, free speed; see the backend table below), while the WPILib desktop
+simulator (`PhoenixBackend` under `./sim.sh`) receives only pushed configs and
+therefore defaults to `KrakenX60` (or `KrakenX60FOC` when `foc = true`),
+selecting `KrakenX44` or `Falcon500` only when `MotorConfig::motor_type` is
+populated in-process (e.g., unit tests).
 
 `forward_limit_switch` and `reverse_limit_switch` set the switches wired to
 the TalonFX's own forward and reverse limit inputs: `"NormallyOpen"` (the
@@ -240,6 +245,21 @@ only the physics simulator reads them; they are not in the wire format or the
 configuration fingerprint. `sim_gateway --physics` binds them from its own
 parse of `--config` (`PhysicsSimBackend::SetHomeSwitches`; the backend table
 below gives the switch's behaviour).
+
+An optional top-level `[simulation]` table configures physics chassis geometry
+and end-of-travel hard stops:
+`wheel_radius_m` (positive finite double, default `0.0508` m),
+`[[simulation.swerve_modules]]` entries (`drive`, `steer`, `x_m`, `y_m`, where
+`drive` and `steer` name distinct configured motors, no motor appears twice,
+and `(x_m, y_m)` is finite and nonzero), and `[[simulation.hard_stops]]`
+entries (`motor` naming a configured motor with no duplicates, optional finite
+`min_rot` and/or `max_rot` with at least one set and `min_rot < max_rot` when
+both are set, in mechanism rotations of the motor's hardware frame). Like
+`motor_type` and `sim_motor`, `[simulation]` stays off the wire and out of
+`ConfigurationId`; `sim_gateway --physics` passes `wheel_radius_m` in
+`PhysicsOptions`, binds any `swerve_modules` with
+`PhysicsSimBackend::SetSwerveModules`, and binds any `hard_stops` with
+`PhysicsSimBackend::SetHardStops`.
 
 Each `[subsystems.<sub>.motors.<motor>.slot0]` (also `slot1`, `slot2`) accepts
 `gravity_type = "ElevatorStatic"` (default; alias `"Elevator"`) or
@@ -300,6 +320,16 @@ encoder velocity is finite-difference across Reads.
 Besides motors and CAN sensors, the manifest accepts RIO digital inputs and
 outputs, analog inputs, quadrature and duty-cycle encoders, and PWM outputs.
 Phoenix and both sims implement all of them.
+
+### Device scope
+
+The supported hardware scope is CTRE Phoenix 6 CAN devices (`TalonFX`,
+`CANcoder`, `Pigeon2`) plus RoboRIO onboard I/O (DIO inputs and outputs, analog
+inputs, quadrature and duty-cycle encoders, and PWM outputs). REV motor
+controllers, pneumatics, addressable LEDs, and CANrange are out of scope. Adding
+another device kind or exceeding the per-frame device caps requires growing the
+hardware `State` transport beyond a single UDP payload; see
+[state frame growth](../../docs/DATA_FLOW.md#state-frame-growth).
 
 A PWM output's request is off or a pulse (`PwmMode`, `messages.h`). Off sends
 no pulse (`PWM::SetDisabled`): a servo goes limp and a PWM motor controller
@@ -446,19 +476,29 @@ commands, neutralized motors, apply failures, and device resets. The refused
 count omits two refusals of an all-neutral command (every motor neutral with
 zero demand and feedforward, every digital output off, every PWM output
 off): a current one while the gateway is disabled, uncommissioned,
-unconfigured or in total feedback loss (below), since the bridge keeps
+unconfigured, faulted or in total feedback loss (below), since the bridge keeps
 forwarding those while the robot cannot drive; and one that passes every other check but carries an earlier epoch
 while no command is in force, since the bridge built it from a State read
 before this epoch began (at an enable or a disable, for example). Any other
 refused command counts, an earlier-epoch command that drives an output
-included. Each command supplies every configured motor in manifest
+included. The bridge applies the same superseded-neutral omission to
+`/hw/status` `identity_rejected_count`: an earlier-nonzero-epoch all-neutral
+request of the same configuration, boot, and device ownership with an
+admissible observation age, arriving before that subsystem has had a request
+accepted in the new epoch, is still dropped without merging or refreshing
+silence, while any driving demand, ownership violation, or stale-epoch request
+after a new-epoch acceptance still increments `identity_rejected_count`. Each command supplies every configured motor in manifest
 order.
 The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
 latest accepted health sample, motor fault mask, gateway counters and gateway
-build (`gateway_program`, `gateway_build_id`, `gateway_build_dirty`) and the
+build (`gateway_program`, `gateway_build_id`, `gateway_build_dirty`), the
 bridge's own `kProtocolVersion` (`protocol_version_id`, which the log tools
 read a session under:
 [which logs a build can read](../launcher/README.md#which-logs-a-build-can-read)),
+and while a peer is sending frames of another protocol version (within
+`command_timeout_us`, clearing immediately on any valid frame)
+`alert_error_protocol_mismatch` and `mismatched_protocol_version_id` (the
+observed peer version, 0 otherwise),
 and the bridge prints the build once for each new gateway boot
 (`hardware_node: gateway boot <id>: roborio build <revision>`). A State
 that does not decode is dropped, with one stderr line until a State decodes
@@ -477,18 +517,21 @@ only in its readers' logs (receipts), and none when no node reads it;
 
 The bridge's exit lines (stdout, so the session's
 `<output_dir>/<session_id>/hardware_node.log`, [node
-output](../launcher/README.md#node-output)) carry counters `/hw/status` does
-not: `passes`, the wake reasons, `wait_fallbacks`, `send_failures`,
-`socket_reopens`, and `throttled`, the passes that spent the loop's CPU
+output](../launcher/README.md#node-output)) carry wake and CPU-budget counters
+`/hw/status` does not: `passes`, the wake reasons (`udp`, `request`,
+`deadline`), `wait_fallbacks` (reported as `wake_fallbacks` in the registry
+and manifest), and `throttled`, the passes that spent the loop's CPU
 budget (8 passes or 64 received datagrams in a 1 ms window,
 `HardwareNode::kCpuWindowUs`) and so slept through input until the window
-ended. A nonzero `throttled` means a gateway or a node flooded the bridge;
-normal traffic stays far below the budget.
+ended, alongside the five UDP/socket loss counters (`send_failures`,
+`socket_reopens`, `sequence_gaps`, `decode_failures`, `send_would_block`) that
+`/hw/status` also publishes. A nonzero `throttled` means a gateway or a node
+flooded the bridge; normal traffic stays far below the budget.
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
 `talos.hardware_sample_time_ns(node)`). The bridge keeps the mapping
-(`talOS/bridge/clock_offset.h`) and publishes it on `/hw/status`. Empty clock
+(`talOS/hardware/clock_offset.h`) and publishes it on `/hw/status`. Empty clock
 probes run at most 50 Hz even while disabled/uncommissioned, with one probe
 outstanding at a time and an unanswered probe replaced after 100 ms, so one
 lost probe or echo never outlasts the exchange already held.
@@ -592,7 +635,11 @@ would take for a lost link): any other non-finite reading is sent as 0, its
 sample invalid where it has a validity of its own; a motor's voltage,
 currents and temperature have none, so they read 0 with the motor still
 valid, as for stale effort. What each field becomes is stated once, at
-`hardware::ReplaceNonFinite` (`gateway.h`).
+`hardware::ReplaceNonFinite` (`gateway.h`). `hardware::Encode(const State&,
+...)` (`messages.h`) applies `ReplaceNonFinite` to a copy before encoding for
+the wire, so no State producer can put a non-finite value on the wire even if
+it did not sanitize beforehand; the raw unsanitized encoder is internal to
+`hardware::detail::EncodeUnsanitizedState` for codec tests only.
 While the gateway is unconfigured (a configure in progress, every boot
 restore included, or the last configure failed) it reads no device, so every
 State it publishes then carries no measurement: every motor and CAN-sensor
@@ -648,23 +695,32 @@ DIO/analog/PWM and RIO encoder validity never sink the backend.
 
 `controller_processor/rio/src/main/cpp/Robot.cpp` is the thin WPILib
 adapter. Its companion (main processor) address is fixed when it is built:
-`./gradlew deploy -Pcompanion=<ipv4>` (or `buildRio`), `10.56.87.11` without
-the property. `build.gradle` takes it only from the command line: a
+`./gradlew deploy -PteamNumber=<team> -Pcompanion=<ipv4>` (or `buildRio -Pcompanion=<ipv4>`,
+or from a robot repository `bazel run @talos//controller_processor/rio:gradlew -- ...`).
+There is no built-in team number or companion default: `buildRio` and `deploy`
+fail without `-Pcompanion=<ipv4>`, and `deploy` also requires a team number
+(`-PteamNumber=<team>` or `.wpilib/wpilib_preferences.json`). `build.gradle`
+takes `-Pcompanion` only from the command line: a
 `companion` set in a `gradle.properties` or `ORG_GRADLE_PROJECT_companion`
 fails the build, so a bench address cannot carry into a later deploy from the
 same laptop. It also fails the build on an empty value (a bare `-Pcompanion`
 or an unset shell variable) and on anything but a dotted IPv4 literal without
 leading zeros outside `0.0.0.0/8`, loopback `127.0.0.0/8` and `224.0.0.0/3`
 (multicast, reserved, broadcast), addresses the RoboRIO's socket could not
-open or send to. Every Gradle run prints the address it builds in and whether
-it is the default (`RoboRIO companion address built in: ...`). It is
+open or send to. Every RoboRIO build prints the address it builds in
+(`RoboRIO companion address built in: ...`). It is
 never learned from an incoming datagram: the gateway's socket is connected to
 that one peer, which is what keeps any other host on the network from
 commanding the robot ([protocol](../protocol/README.md)). Runtime ports are
 5802 on the gateway and 5803 on the companion.
 The other direction -- the companion finding the gateway -- is
 `[robot] controller_address` in the robot config (see [launcher addressing](../launcher/README.md#controller-addressing)),
-overridden per launch by `launcher --remote`. Real hardware uses Driver Station
+overridden per launch by `launcher --remote`. `[robot] local_address` (or
+`hardware_node --local-address IP`) optionally pins the bridge's UDP bind
+address to a specific IPv4 interface instead of `0.0.0.0`; when pinned and
+absent at startup (`EADDRNOTAVAIL` / `ENETUNREACH`), `hardware_node` logs one
+stderr line naming the address and errno and retries every 100 ms until the
+interface comes up rather than falling back to `0.0.0.0` or exiting. Real hardware uses Driver Station
 enable and e-stop.
 The socket is opened from the adapter's main loop. After a RoboRIO boot the
 program can start before the network has a route to the companion, and the
@@ -675,15 +731,16 @@ until the socket opens. The console reports the failures
 (`hardware gateway socket failed: <status> (errno <n>)`, coalesced to one line
 a second) and, once it opens, `hardware gateway socket open after <n> failed
 attempts, <s> s after the first`.
-A send that fails with an error the socket may never recover from
-(`protocol::SendErrorNeedsNewSocket`, whose errors are in
-[talOS/protocol](../protocol/README.md): among them `ENETUNREACH`, Linux's
-error once the RoboRIO's address changes under the connected socket; the
-bridge's rule in
+A send or receive that fails with an error the socket may never recover from
+(`protocol::SendErrorNeedsNewSocket` / `protocol::ReceiveErrorNeedsNewSocket`,
+whose errors are in [talOS/protocol](../protocol/README.md): among them
+`ENETUNREACH`, Linux's error once the RoboRIO's address changes under the
+connected socket, and `EBADF`; the bridge's rule in
 [data flow](../../docs/DATA_FLOW.md#link-rates-and-endpoints)) loses the
-socket: nothing more is sent that tick, and the loop opens a new socket on
-the same ports (`Endpoint::Reopen`, keeping the frame sequence) on the same
-100 ms cadence, at once when no attempt was made in the last 100 ms, so a
+socket: on a permanent receive error the adapter closes it immediately
+(`Endpoint::Close()`), nothing more is sent that tick, and the loop opens a new
+socket on the same ports (`Endpoint::Reopen`, keeping the frame sequence) on the
+same 100 ms cadence, at once when no attempt was made in the last 100 ms, so a
 condition that breaks every new socket costs at most ten sockets a second.
 Usually the next tick replaces it and runs as any other: the replacement is
 a link gap of one tick, and the command in force keeps its usual expiry
@@ -693,17 +750,23 @@ sequence, boot, epoch and age checks. A tick with no socket open (the
 attempt failed, or is not due yet) ticks the gateway disabled, all outputs
 neutral, and sends nothing, as before the first open. The console prints
 `hardware gateway socket cannot send (errno <n>); replacing it, nothing is
-sent until then` and, once replaced, `hardware gateway socket replaced after
-<n> failed attempts, <s> s after it could not send` (each coalesced to one
-line a second). Any other send error (`ENOBUFS`, `ECONNREFUSED`, ...) keeps
-the socket. Every failed send is counted in a spell, which ends at a good
+sent until then` (or `hardware gateway socket cannot receive (errno <n>);
+replacing it, nothing is sent until then`) and, once replaced, `hardware
+gateway socket replaced after <n> failed attempts, <s> s after it was lost`
+(each coalesced to one line a second). Any other send or receive error
+(`ENOBUFS`, `ECONNREFUSED`, ...) keeps the socket. Every failed send is counted in a spell, which ends at a good
 send one second after its last failure (with the companion's port closed
 every other send fails with `ECONNREFUSED`); a spell prints `hardware
 gateway socket send failed (errno <n>); keeping the socket` at its first
 failure that keeps the socket and, once such a spell ends, `hardware gateway
 socket sending again: <n> sends failed over <s> s (errno <n>[, last errno <m>])`,
-`<s>` from its first failure to its last (at most one line a second). A send
-raises no `SIGPIPE` on either end
+`<s>` from its first failure to its last (at most one line a second). A
+non-blocking send refused with `EAGAIN` / `EWOULDBLOCK` (`UdpStatus::kWouldBlock`,
+send buffer full) keeps the socket open without triggering a reopen and prints
+`hardware gateway socket send would block (EAGAIN, send buffer full): <n>
+dropped since start; keeping the socket` (rate-limited by `RioLog` to at most
+one line a second, bursts coalesced with the cumulative `send_would_block`
+count). A send raises no `SIGPIPE` on either end
 ([protocol](../protocol/README.md)).
 
 A tick that invalidates the command in force because it reached its expiry
@@ -734,11 +797,15 @@ for the bits that are not faults (`kMotorNotFaultFlags`), `limit
 raised`/`limit cleared`, then the active `faults=[...]` and `limits=[...]`;
 the `motor_fault_mask changed` line counts faults only. Once
 in any second that saw them, it also prints the dropped-event count and the
-loop's timing faults: overruns (a tick's work, from wake to sleep, longer than
-the period) and late ticks (a tick starting more than 1.5 periods after the
-previous, a starved loop however short its work), with that second's longest
-work and interval. Every 10 s, when the loop ticked in that window, it
-prints where those ticks' work went:
+loop's timing faults (`[rio] loop timing:`): overruns (a tick's work, from wake
+to sleep, longer than the period) and late ticks (a tick starting more than 1.5
+periods after the previous, a starved loop however short its work), with that
+second's longest work, longest interval, period, and that single worst-work
+tick's 8-phase split (`; worst tick phases: refresh <r> us, devices <d> us,
+control <c> us, health <h> us, other <o> us, link <l> us, driver station <ds>
+us, loop <lp> us`). Every 10 s — and on clean exit (`RioLog::Flush` / `Stop`)
+for the final partial window — when the loop ticked in that window, it prints
+where those ticks' work went:
 
 ```
 [rio] tick phases: refresh mean/max <a>/<b> us, devices <a>/<b> us, control <a>/<b> us, health <a>/<b> us, other <a>/<b> us, link <a>/<b> us, driver station <a>/<b> us, loop <a>/<b> us over <n> ticks (motors=<m> sensors=<s>)
@@ -830,16 +897,26 @@ CANcoder's feedback is `command_timeout_us` old.
 If the loop stops ticking right after it applied a command, nothing else
 stops the outputs: its TalonFX controls are one-shot (their device-side
 expiry is unmeasured), and DIO and PWM outputs hold their last value. So
-each tick ends with a beat to a loop watchdog
-(`src/main/include/LoopWatchdog.h`) carrying, while a command is still in
-force, the time by which the loop's next tick would have invalidated it: the
-gateway's `command_expiry_us()` (the older of the command's acceptance and
-the State it was built from, plus `command_timeout_us`) plus two loop
-periods (one for the tick that sees the expiry, one for that tick's work
-before its beat); with no command in force it carries nothing (that tick neutralized
-every output itself). The watchdog's own thread, at `SCHED_FIFO` 30 on the
-RoboRIO (above the loop's `SCHED_FIFO` 10 and the kernel's interrupt
-threads), checks every 5 ms. Once that
+the loop beats a loop watchdog (`src/main/include/LoopWatchdog.h`) before
+`Endpoint::Tick()` on an enabled tick with no active command
+(`command_expiry_us() == 0`) — pre-arming it at
+`now + command_timeout_us + 2 * period_us` (`WatchdogPreArmDeadlineUs` in
+`src/main/include/RobotSafety.h`) so a stall inside that tick's first
+`Apply()` or `ApplyOutputs()` is still neutralized — and again at the end
+of every tick. That post-tick beat refines the deadline, while a command is
+still in force, to the time by which the loop's next tick would have
+invalidated it: the gateway's `command_expiry_us()` (the older of the
+command's acceptance and the State it was built from, plus
+`command_timeout_us`) plus two loop periods (one for the tick that sees the
+expiry, one for that tick's work before its beat); with no command in force
+it disarms back to `0` (that tick neutralized every output itself). If the
+loop stalls after `Endpoint::Tick()` returns with no command (for example
+in Driver Station send or console logging) before that post-tick beat runs,
+the pre-arm deadline stays armed and the watchdog will fire about
+`command_timeout_us + 2 * period_us` later on already-neutral outputs and
+report a `talos loop watchdog` stall to the Driver Station. The watchdog's
+own thread, at `SCHED_FIFO` 30 on the RoboRIO (above the loop's
+`SCHED_FIFO` 10 and the kernel's interrupt threads), checks every 5 ms. Once that
 time has passed it disables PWM outputs, sets DIO outputs false and sends
 `NeutralOut` to every motor, on every check until a beat moves the time (so
 outputs a resumed loop re-applies on a stale clock reading before stalling
@@ -989,9 +1066,11 @@ build from a copy with no git history passes
 `-PtalosRevision=<16 lowercase hex digits> -PtalosDirty=true|false` on the
 command line instead, which replaces git: the commit is those digits and the
 dirty flag is `-PtalosDirty` (true when the copy differs from that commit).
-The two are required together, and the pair is refused while git sees a work
-tree in the project directory, where git stamps the build itself and an
-override could only hide uncommitted changes. Like `-Pcompanion` both are
+The two are required together, and the pair is refused while git's work-tree
+root matches the talOS root being built from, where git stamps the build itself
+and an override could only hide uncommitted changes (a staged copy inside an
+unrelated git repository is not stamped with that repository's commit and
+accepts the override). Like `-Pcompanion` both are
 refused from a `gradle.properties` or the environment, and a revision that is
 not exactly 16 lowercase hex digits, or is all zeros (revision 0 means
 unknown), or a `-PtalosDirty` that is not exactly `true` or `false`, fails
@@ -1007,8 +1086,8 @@ Build without deploying:
 
 ```sh
 cd controller_processor/rio
-./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, LoopConsole, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader; and rioBuildStampTest
+./gradlew buildRio -Pcompanion=<ipv4>
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, LoopConsole, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader, DriverStationSampler, RobotSafety; and rioBuildStampTest
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway
@@ -1053,10 +1132,11 @@ output on its first tick at or past the last command's expiry, which the
 harness reads from the RoboRIO's own States at the relay. That scenario
 runs `robot.toml` whole, so the bench's undriven devices must read neutral
 too. Each `--wpilib` scenario first deletes the simulation's saved
-configuration (`controller_processor/rio/talos_config.bin`) and fails if the
-program still restores one: a restored configuration configures the
-gateway before the bridge's push, the simulated Driver Station enables on
-it, and a push of the other configuration is then refused while enabled. It
+configuration (`controller_processor/rio/talos_config.bin`) and checks that the
+program starts unconfigured (`config=0`), failing if it still restores one:
+`SimDriverStation` waits for a push acknowledged in this boot rather than
+enabling on a restored configuration, and removing the saved file ensures each
+scenario starts cleanly from an unconfigured gateway. It
 runs Gradle `--offline`, so the first run needs one online
 `./gradlew simulateNative` beforehand. CI's `rio-in-the-loop` job runs
 `--wpilib` on Linux with `--output-dir`, which puts each scenario's log
@@ -1065,8 +1145,11 @@ must be free. Both modes fail a run during which the host slept (more than
 50 ms of sleep), since a frozen host reads as a stalled robot; on macOS the
 harness holds `caffeinate -s` for the run, which also holds off a headless
 Mac's DarkWake maintenance sleep. `--wpilib` also fails when the RoboRIO
-loop's watchdog reports a stall or its timing report shows more than 250 ms
-between ticks, naming whether the tick overran or only started late.
+loop's watchdog reports a stall, when its timing report shows more than 250 ms
+between ticks (naming whether the tick overran or only started late), or when a
+scenario prints no `[rio] tick phases` (with positive tick count) or `[rio]
+latency` line (and in the driving scenario, when accepted command or Driver
+Station latency sample counts are zero).
 
 ## Simulation Backends: Ideal vs Physics-Backed
 
@@ -1094,21 +1177,45 @@ or without a live command. Both keep each PWM output's last request
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction; a follower drives in its master's direction (reversed if opposed), ignoring its own `inverted`; a remote-CANcoder motor reports and closes its loops on the CANcoder in the CANcoder's direction |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
-| CANcoder position | Its motor's position, wrapped to [-0.5, 0.5) rotations as the RoboRIO reports it | The linked mechanism's, wrapped the same way |
+| Hard stops | Ignored | `SetHardStops` (`sim::HardStop`): physical end-of-travel bounds `[min_rot, max_rot]` per named motor (mechanism rotations in its hardware frame), enforced even when `soft_limits = false` (rezero-frame mechanisms); clamps position and zeroes velocity when driven into a stop so back-EMF drops to 0 and stator current rises to the stall/limited current while allowing motion away from the stop; bound by name, survives a pushed config. `sim_gateway --physics` binds `[[simulation.hard_stops]]` |
+| CANcoder position | Its linked motor's sensor-shaft reading (`mechanism × sensor_to_mechanism_ratio`, with motor initial offset `offset_rot / sensor_to_mechanism_ratio`), position wrapped to [-0.5, 0.5) rotations as the RoboRIO reports it | The linked sensor shaft (`rotor / rotor_to_sensor_ratio = mechanism × sensor_to_mechanism_ratio`), position wrapped the same way; the remote-CANcoder motor divides `offset_rot` by `sensor_to_mechanism_ratio` to match Phoenix 6 |
 | Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
-| Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero torque, so a free rotor spins on (hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
-| Stator current | Zero | (applied volts - back-EMF) / R, clamped to `stator_limit_a`; R and free speed from the motor type's published 12 V stall current and free speed (`MotorModelFor`: Kraken X60 366 A and 6000 rpm, the default; Kraken X44 275 A and 7530 rpm; Falcon 500 257 A and 6380 rpm). A motor held at a soft limit is stalled. The type is the motor's `motor_type` key (above) |
+| Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`, using the same `R` and `k_e` as `StatorCurrent`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero stator current (slowly coasting only under the motor's no-load drag rather than braking; hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
+| Stator and supply current | Stator zero; supply placeholder `|voltage| / 12 × supply_limit_a` | Winding model with free current: `R = 12 V / stall_current`, `k_e = (12 V − free_current × R) / free_speed`, `back_emf = k_e × rotor_rps` (`MotorModelFor`: Kraken X60 6000 rpm, 366 A stall, 2.0 A free, default; Kraken X44 7530 rpm, 275 A stall, 2.0 A free; Falcon 500 6380 rpm, 257 A stall, 1.5 A free). Stator current is `|applied_volts − back_emf| / R` (equals `free_current` at 12 V free speed and `stall_current` at 12 V stall), 0 while unpowered. `stator_limit_a` and `supply_limit_a` clamp effective winding voltage before rotor integration and are reflected in `applied_volts_` and reported currents. Supply current follows signed power conservation `(rotor_volts × signed_stator_current) / supply_v` (positive battery draw clamped to `supply_limit_a`, negative regenerative braking kept signed, 0 when unpowered or `supply_v <= 0`). A motor held at a hard stop or soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid) and per-device disconnect (invalid), each read as `PhoenixBackend` reads a device whose frames stopped: ages growing from its last sample, limit bits cleared once that sample is 50 ms old and temperature 0 once it is 500 ms old (`kFaultFieldMaxAgeUs`, `kTemperatureMaxAgeUs`, `feedback.h`); controller restart |
 | Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it (the gateway masks it in those States either way); completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
 
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see
-[`talOS/simulation/README.md`](../simulation/README.md)). The RoboRIO desktop model
-keeps its own first-order Kraken model (same 100 rps at 12 V family) and the
-same neutral rule: neutral removes drive and the rotor decays per `brake`
-(about 0.05 s braked, 1.0 s coasting) instead of stopping instantly.
+[`talOS/simulation/README.md`](../simulation/README.md)). The RoboRIO desktop
+simulation (`PhoenixBackend`, compiled off-RoboRIO only) uses WPILib's
+`LinearSystemId::DCMotorSystem` with `DCMotor` ratings (choosing the FOC
+variant when `foc = true`; over UDP under `./sim.sh`, `motor_type` stays
+off-wire so pushed configs default to `KrakenX60` / `KrakenX60FOC`, while
+`KrakenX44` and `Falcon500` are selected when `MotorConfig::motor_type` is
+populated in-process, e.g., unit tests) at
+`J_rotor = 0.0005 kg·m²` reflected across each motor's gear ratio
+(`J_mech = J_rotor × gear_ratio²`, ~44.5 ms electrical time constant for a
+Kraken X60), writing rotor position, velocity, and acceleration plus remote
+CANcoder state and forwarding any positive simulated RoboRIO battery voltage
+(clamped to Phoenix 6's `4 V` floor) to each simulated device on change. Brake neutral drives `0 V` into the plant
+(shorted-winding back-EMF braking), while coast neutral decays exponentially
+(`tau = 1.0 s`) with the `0.01 rps` standstill snap. When swerve drive/steer
+pairs (`front`/`back`/`rear`, `left`/`right`, ±0.30 m) or differential
+left/right drive pairs (0.60 m trackwidth) are inferred from motor names,
+centered rigid-body kinematics integrate yaw and yaw rate into every configured
+`Pigeon2`; non-chassis configurations leave manually injected `Pigeon2` raw yaw
+untouched.
+
+### Which simulator to use for what
+
+| Path | How to run | Motor / chassis model | Driver Station & gamepad | Truth (`/sim/state`) & faults | Use for |
+|---|---|---|---|---|---|
+| Ideal (`SimBackend`) | `sim_gateway` (default, no `--physics`), or `SimHardware` in unit tests | Instant velocity/position; zero gains still move; zero Pigeon2 raw yaw | Scripted `--mode-schedule` / `--joystick-schedule` | None (resets & I/O setters in C++ tests only) | Fast logic, wiring, sequencing, mode/timeout unit tests |
+| Lightweight physics (`sim_gateway --physics`) | `./sim.sh --sim-gateway` (or `sim_gateway --physics`) | `sim::PhysicsSimBackend`: winding/current-limit model, gearing, hard stops, home switches, swerve ground pose & Pigeon2 yaw | Scripted `--mode-schedule` / `--joystick-schedule` (no USB gamepad) | Publishes `/sim/state` for cameras; odometry error (`--wheel-radius-error`, `--wheel-slip-gain`, `--gyro-drift-radps`) & `--fault-schedule` | Headless CI/soak runs, vision/odometry error tests, fault injection, PID/limit/homing verification |
+| WPILib desktop sim (`PhoenixBackend`) | `./sim.sh` (or `./gradlew simulateNative` in `controller_processor/rio`) | Real Phoenix 6 simulator + WPILib `LinearSystemId::DCMotorSystem` plant (`KrakenX60`/`KrakenX60FOC` over UDP since `motor_type` is off-wire; `KrakenX44`/`Falcon500` when populated in-process) + inferred swerve/differential Pigeon2 yaw | WPILib Sim GUI with live USB gamepad (or `--headless` scripted schedules) | None (cameras emit invalid observations) | Interactive driving with a USB gamepad, testing real Phoenix 6 closed-loop/FOC/status-signal behaviour, RoboRIO-in-the-loop verification |
 
 ### Ground truth and odometry error
 
@@ -1117,13 +1224,17 @@ and field-frame velocity (m/s, rad/s). Each step converts every registered
 swerve wheel's surface velocity and steer azimuth into ground velocity, solves
 the rigid-body least-squares chassis motion, and integrates the field pose.
 Conventional `front`/`back` (`rear`), `left`/`right` drive/steer names infer
-module coordinates at ±0.30 m; `SetSwerveModuleGeometry` registers other names
-or dimensions. No gyro is required to compute truth.
+module coordinates at ±0.30 m when no explicit modules are set;
+`SetSwerveModules` binds explicit drive/steer pairs by motor name (surviving
+every later `Configure` and replacing name inference), and
+`SetSwerveModuleGeometry` overrides or registers modules by logical id. No gyro
+is required to compute truth.
 
-`sim::PhysicsOptions` selects the start pose and three deterministic errors
+`sim::PhysicsOptions` selects the start pose, nominal wheel radius
+(`wheel_radius_m`, default `0.0508` m), and three deterministic errors
 (all errors default to zero):
 
-- `wheel_radius_error_frac = e`: true radius is `0.0508 × (1 + e)` m.
+- `wheel_radius_error_frac = e`: true radius is `wheel_radius_m × (1 + e)` m.
   Rotor/encoder readings still measure wheel rotation faithfully; only ground
   travel changes, so odometry using the nominal radius drifts.
 - `wheel_slip_gain = g`: each module's slip fraction is

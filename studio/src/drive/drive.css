@@ -86,6 +86,8 @@ html, body {
 .top h1 { font-size: 22px; margin: 0; white-space: nowrap; }
 
 .status-slot { flex: 1; min-width: 0; }
+.draw-error { flex: none; }
+.draw-error:empty { display: none; }
 
 .status {
   font-size: 20px;
@@ -102,11 +104,12 @@ html, body {
 .status.link-ok b { color: var(--good); }
 .status.link-connecting b { color: var(--info); }
 .status.link-bridge, .status.link-telemetry, .status.link-hardware, .status.link-roborio,
-.status.link-replaced, .status.link-error {
+.status.link-replaced, .status.link-error, .status.link-refused {
   border-color: var(--bad);
 }
 .status.link-bridge b, .status.link-telemetry b, .status.link-hardware b,
-.status.link-roborio b, .status.link-replaced b, .status.link-error b { color: var(--bad); }
+.status.link-roborio b, .status.link-replaced b, .status.link-error b,
+.status.link-refused b { color: var(--bad); }
 .status .meta.bad { color: var(--bad); }
 
 .status button {
@@ -176,6 +179,17 @@ html, body {
 }
 
 .w h3 { margin: 4px 0 2px; font-size: 14px; color: var(--muted); font-weight: 600; }
+/* Alerts subheadings and empty-section placeholders share the --drive-row
+ * vertical grid with .alerts li so .w-alerts .body (snapped by fit() to a
+ * multiple of --drive-row) never clips a row by a partial heading height. */
+.w-alerts h3, .w-alerts .none {
+  height: var(--drive-row);
+  line-height: var(--drive-row);
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .body { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 /* A list that cannot fit scrolls, never hides a row; its rows that matter
@@ -305,4 +319,29 @@ ul { list-style: none; margin: 0; padding: 0; }
   border: 2px dashed var(--bad);
   padding: 6px;
   margin: 4px 0 0;
+}
+
+.refusal-banner {
+  border: 3px solid var(--bad);
+  padding: 16px 20px;
+}
+.refusal-banner .body {
+  gap: 12px;
+  overflow-y: auto;
+  padding-top: 8px;
+}
+.refusal-reason {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: 600 18px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.refusal-hint {
+  margin: 0;
+  color: var(--muted);
 }

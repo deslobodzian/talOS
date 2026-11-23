@@ -731,5 +731,75 @@ TEST_F(MetalCclClusteringTest, GpuConnectedComponentsParity) {
 #endif
 }
 
+TEST(GpuSparseClustersTest, RejectsOutOfBoundsParentLabels) {
+  constexpr int kWidth = 8;
+  constexpr int kHeight = 8;
+  constexpr uint32_t kTotal = static_cast<uint32_t>(kWidth * kHeight);
+  image_u8_t* threshim = image_u8_create(kWidth, kHeight);
+  ASSERT_NE(threshim, nullptr);
+  std::memset(threshim->buf, 127,
+              static_cast<size_t>(threshim->stride) * kHeight);
+  threshim->buf[2 * threshim->stride + 2] = 0;
+  threshim->buf[2 * threshim->stride + 3] = 255;
+
+  // Candidate at (2, 2) with flag 1 (+x neighbor (3, 2)).
+  const uint32_t candidate = 2u | (2u << 14) | (1u << 28);
+
+  auto destroy_clusters = [](zarray_t* clusters) {
+    for (int i = 0; i < zarray_size(clusters); ++i) {
+      zarray_t* c = nullptr;
+      zarray_get(clusters, i, reinterpret_cast<void*>(&c));
+      zarray_destroy(c);
+    }
+    zarray_destroy(clusters);
+  };
+
+  // Sanity: valid labels build one cluster containing the edge point.
+  {
+    std::vector<uint32_t> parents(kTotal, 0xFFFFFFFFu);
+    std::vector<uint32_t> sizes(kTotal, 0);
+    parents[2 * kWidth + 2] = 0;
+    parents[2 * kWidth + 3] = 1;
+    sizes[0] = 30;
+    sizes[1] = 30;
+    zarray_t* clusters = BuildSparseClustersFromGpuLabels(
+        threshim, kWidth, kHeight, threshim->stride, parents.data(),
+        sizes.data(), &candidate, 1);
+    ASSERT_NE(clusters, nullptr);
+    EXPECT_EQ(zarray_size(clusters), 1);
+    destroy_clusters(clusters);
+  }
+
+  // Corrupt rep0 >= total (both at boundary and far OOB) must be ignored.
+  for (const uint32_t bad_parent : {kTotal, 0x7FFFFFFEu}) {
+    std::vector<uint32_t> parents(kTotal, 0xFFFFFFFFu);
+    std::vector<uint32_t> sizes(kTotal, 30);
+    parents[2 * kWidth + 2] = bad_parent;
+    parents[2 * kWidth + 3] = 1;
+    zarray_t* clusters = BuildSparseClustersFromGpuLabels(
+        threshim, kWidth, kHeight, threshim->stride, parents.data(),
+        sizes.data(), &candidate, 1);
+    ASSERT_NE(clusters, nullptr);
+    EXPECT_EQ(zarray_size(clusters), 0);
+    destroy_clusters(clusters);
+  }
+
+  // Corrupt rep1 >= total must be ignored without indexing gpu_sizes OOB.
+  for (const uint32_t bad_parent : {kTotal, 0x7FFFFFFEu}) {
+    std::vector<uint32_t> parents(kTotal, 0xFFFFFFFFu);
+    std::vector<uint32_t> sizes(kTotal, 30);
+    parents[2 * kWidth + 2] = 0;
+    parents[2 * kWidth + 3] = bad_parent;
+    zarray_t* clusters = BuildSparseClustersFromGpuLabels(
+        threshim, kWidth, kHeight, threshim->stride, parents.data(),
+        sizes.data(), &candidate, 1);
+    ASSERT_NE(clusters, nullptr);
+    EXPECT_EQ(zarray_size(clusters), 0);
+    destroy_clusters(clusters);
+  }
+
+  image_u8_destroy(threshim);
+}
+
 }  // namespace
 }  // namespace talos::vision::metal

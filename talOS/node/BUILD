@@ -14,28 +14,71 @@ cc_library(
     ],
 )
 
+# Safe, non-privileged thunks behind node.h's templates.
+cc_library(
+    name = "node_detail",
+    hdrs = ["node_detail.h"],
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/schema:identity"],
+)
+
+# Private header target for node.cc's implementation_deps so talOS/node/access.h
+# never enters downstream robot-node compile sandboxes (ARCH-2 / RULES.md 2).
+cc_library(
+    name = "access_hdr",
+    hdrs = ["access.h"],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":node_detail",
+        "//talOS/schema:identity",
+    ],
+)
+
 # The node authoring API: talos::Node, Subscription, Publisher, StateMachine,
 # talos::Run and TALOS_NODE. Generic: no hardware (see //talOS/devices).
+# Internal framework deps stay in implementation_deps so their headers are
+# excluded from downstream robot-node compile sandboxes (ARCH-2 / RULES.md 2).
 cc_library(
     name = "node",
     srcs = ["node.cc"],
-    hdrs = [
-        "access.h",
-        "node.h",
-    ],
-    visibility = ["//visibility:public"],
-    deps = [
+    hdrs = ["node.h"],
+    implementation_deps = [
+        ":access_hdr",
         ":loop_port",
         "//talOS/configuration",
         "//talOS/events",
-        "//talOS/events:events_core",
         "//talOS/events:input_replay",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/introspection:reporter",
-        "//talOS/ipc",
         "//talOS/process",
         "//talOS/rtms",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":node_detail",
+        "//talOS/events:events_core",
+        "//talOS/ipc:concepts",
+        "//talOS/schema:identity",
+    ],
+)
+
+# Privileged Node framework hooks (NodeAccess: add_hardware_request,
+# mark_untargeted_outputs, create/start, declared_graph, add_observer).
+# Restricted to framework layers only so robot node code cannot link it.
+cc_library(
+    name = "access",
+    hdrs = ["access.h"],
+    visibility = [
+        "//talOS/devices:__pkg__",
+        "//talOS/launcher:__pkg__",
+        "//talOS/node:__pkg__",
+        "//talOS/node_api:__pkg__",
+        "//talOS/telemetry:__pkg__",
+        "//talOS/teleop:__pkg__",
+    ],
+    deps = [
+        ":node",
         "//talOS/schema:identity",
     ],
 )
@@ -51,6 +94,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":access",
         ":loop_port",
         ":node",
         "//talOS/configuration",
@@ -117,7 +161,10 @@ talos_cc_node(
     srcs = ["testdata/graph_node.cc"],
     node_name = "graph_node",
     visibility = ["//visibility:private"],
-    deps = ["//talOS/introspection:describe"],
+    deps = [
+        ":access",
+        "//talOS/introspection:describe",
+    ],
 )
 
 # A node that prints Node::describing() from its constructor.
@@ -161,6 +208,7 @@ cc_test(
     },
     tags = ["integration"],
     deps = [
+        ":access",
         ":node",
         ":test_messages",
         ":testing",
@@ -186,6 +234,7 @@ cc_test(
     data = ["testdata/robot.toml"],
     env = {"TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)"},
     deps = [
+        ":access",
         ":loop_port",
         ":node",
         ":test_messages",

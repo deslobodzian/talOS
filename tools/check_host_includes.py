@@ -21,7 +21,7 @@ leaves no `.d` file on disk). Paths outside the host prefixes
 bazel-out/) are never reported. --allow adds a header path, or a directory
 ending in '/', to the allowlist.
 
-Exit: 0 clean, 1 host headers found, 2 usage error or no `.d` file found.
+Exit: 0 clean, 1 host headers found, 2 usage error, unreadable `.d` file, or no `.d` file found.
 """
 
 import argparse
@@ -94,6 +94,8 @@ def host_violation(path, allow):
     if not path.startswith("/"):
         return None
     norm = os.path.normpath(path)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
     prefix = next((p for p in HOST_PREFIXES if norm.startswith(p)), None)
     if prefix is None:
         return None
@@ -122,14 +124,16 @@ def depfiles(paths):
 
 
 def check(paths, allow):
-    """Returns ([(source, header)], depfile count)."""
+    """Returns ([(source, header)], depfile count, [(depfile, error)])."""
     found = []
+    read_errors = []
     count = 0
     for depfile in depfiles(paths):
         try:
             with open(depfile, encoding="utf-8", errors="replace") as f:
                 text = f.read()
-        except OSError:
+        except OSError as exc:
+            read_errors.append((depfile, str(exc)))
             continue
         rules = parse_depfile(text)
         if not rules:
@@ -140,7 +144,7 @@ def check(paths, allow):
                 bad = host_violation(header, allow)
                 if bad is not None:
                     found.append((prerequisites[0], bad))
-    return sorted(set(found)), count
+    return sorted(set(found)), count, read_errors
 
 
 def main(argv):
@@ -150,7 +154,12 @@ def main(argv):
     parser.add_argument("paths", nargs="+")
     parser.add_argument("--allow", action="append", default=[])
     args = parser.parse_args(argv)
-    found, count = check(args.paths, args.allow)
+    found, count, read_errors = check(args.paths, args.allow)
+    if read_errors:
+        for depfile, detail in read_errors:
+            print(f"check_host_includes: cannot read {depfile}: {detail}",
+                  file=sys.stderr)
+        return 2
     if count == 0:
         # Not a pass: nothing was checked.
         print("check_host_includes: no .d files under "

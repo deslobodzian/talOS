@@ -6,8 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <string>
@@ -178,6 +180,72 @@ TEST_F(ReplayTest, RaisingMinDecisionMarginReducesValidDetections) {
       << error;
   EXPECT_EQ(high_stats.rejections_after["(valid)"], 0u);
   EXPECT_GT(high_stats.rejections_after["decision_margin"], 0u);
+}
+
+TEST_F(ReplayTest, HugeFiniteYawDoesNotHangWrapAngle) {
+  FrameRecorder::Options opts;
+  opts.output_dir = dir_;
+  opts.sample_hz = 1e12;
+  opts.rejected_hz = 1e12;
+  opts.context.camera = "test_camera";
+  opts.context.width = kWidth;
+  opts.context.height = kHeight;
+  opts.context.intrinsics = MakeCamera().intrinsics;
+  opts.context.mounting = {0.0, 0.0, 0.5, 0.0, 0.0, 0.0};
+  opts.context.detector = {.backend = "cpu",
+                           .decimate = 1.0,
+                           .threads = 1,
+                           .sigma = 0.0,
+                           .refine_edges = true,
+                           .hamming_threshold = 1,
+                           .min_decision_margin = 30.0};
+  {
+    FrameRecorder recorder{std::move(opts)};
+    std::vector<std::uint8_t> gray(static_cast<std::size_t>(kWidth) * kHeight,
+                                   128);
+    Frame frame{0,
+                0,
+                0,
+                MonotonicTime::from_nanos(0),
+                kWidth,
+                kHeight,
+                kWidth,
+                PixelFormat::kGray8,
+                std::move(gray)};
+    FrameRecord record;
+    record.capture_ns = 1'000'000;
+    record.reason = "sampled";
+    record.observation.valid = true;
+    record.observation.x_m = 2.0;
+    record.observation.y_m = 2.0;
+    record.observation.yaw_rad = 1e20;
+    record.truth = TruthRecord{2.0, 2.0, 0.0};
+    ASSERT_TRUE(recorder.Record(frame, record));
+  }
+
+  ReplayStats stats;
+  std::string error;
+  ASSERT_TRUE(ReplayFrames(dir_.string(), MakeLayout(), DetectorOverrides{},
+                           &stats, &error))
+      << error;
+  EXPECT_EQ(stats.frames, 1u);
+  EXPECT_TRUE(std::isfinite(stats.rms_yaw_before));
+  EXPECT_LE(stats.rms_yaw_before, 3.15);
+}
+
+TEST_F(ReplayTest, MissingOrNonDirectoryFramesPathReturnsError) {
+  ReplayStats stats;
+  std::string error;
+  EXPECT_FALSE(ReplayFrames((dir_ / "missing").string(), MakeLayout(),
+                            DetectorOverrides{}, &stats, &error));
+  EXPECT_FALSE(error.empty());
+
+  const auto file_path = dir_ / "not_a_dir";
+  std::ofstream(file_path) << "hello";
+  error.clear();
+  EXPECT_FALSE(ReplayFrames(file_path.string(), MakeLayout(),
+                            DetectorOverrides{}, &stats, &error));
+  EXPECT_FALSE(error.empty());
 }
 
 }  // namespace

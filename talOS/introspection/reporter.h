@@ -49,6 +49,7 @@
 #include "talOS/events/manifest.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/memory/residency.h"
 
 namespace talos::introspect {
 
@@ -391,6 +392,9 @@ class Reporter {
     }
     registration.set_outputs_held(options_.outputs_held &&
                                   options_.outputs_held());
+    if (memory::LateLockRefused()) {
+      registration.note_realtime_refused(process::kStepRingLock);
+    }
     registration.end_sample();
   }
 

@@ -3,16 +3,21 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_cc_shared_node")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
 
 cc_library(
     name = "deadband",
     hdrs = ["deadband.h"],
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
     name = "teleop",
     hdrs = ["node.h"],
+    visibility = [
+        "//talOS:__subpackages__",
+        "//tools:__pkg__",
+    ],
     deps = [
         ":deadband",
         "//talOS/configuration",
@@ -22,23 +27,43 @@ cc_library(
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/node",
+        "//talOS/node:access",
         "//talOS/schema:field_path",
         "//talOS/schema:identity",
         "//talOS/schema:schema_hash",
+        "//talOS/teleop/messages",
         "@flatbuffers//:runtime_cc",
     ],
+)
+
+# Test helper for robot/bench Sim tests to add the declarative teleop node
+# without exposing talOS/teleop/node.h or talOS/node/access.h.
+cc_library(
+    name = "testing",
+    testonly = True,
+    srcs = ["testing.cc"],
+    hdrs = ["testing.h"],
+    implementation_deps = [
+        ":teleop",
+        "//talOS/events:events_core",
+        "//talOS/node",
+        "//talOS/node:testing",
+    ],
+    visibility = ["//visibility:public"],
 )
 
 talos_cc_node(
     name = "node",
     srcs = ["node.cc"],
     node_name = "teleop",
+    visibility = ["//visibility:public"],
     deps = [":teleop"],
 )
 
 talos_cc_shared_node(
     name = "libteleop.so",
     srcs = ["teleop_abi.cc"],
+    visibility = ["//talOS:__subpackages__"],
     deps = [":teleop"],
 )
 
@@ -57,6 +82,7 @@ py_test(
         "//talOS/msgs:control_py",
         "//talOS/python:teleop",
         "//talOS/python:testing",
+        "//talOS/teleop/messages:messages_py",
     ],
 )
 
@@ -75,6 +101,7 @@ cc_test(
         "//talOS/node:testing",
         "//talOS/schema:field_path",
         "//talOS/schema:test_messages",
+        "//talOS/teleop/messages",
         "@googletest//:gtest_main",
     ],
 )

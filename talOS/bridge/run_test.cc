@@ -1,7 +1,7 @@
 // Run() against real time and loopback UDP (the integration tier,
 // docs/TESTING.md §2): its wakeups, its duties and its registry progress.
-// Bounds are ratios of counts that hold however loaded the host is, or a
-// requirement's margin judged only on a host whose stalls are inside it.
+// Bounds are ratios of counts that hold however loaded the host is; the
+// wall-clock StallMeter timing test is isolated in run_timing_test.cc.
 // Run()'s logic, the exact duty instants included, is tested on synthetic
 // time in hardware_node_test.cc.
 
@@ -10,17 +10,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
-#include "talOS/bridge/merge.h"
 #include "talOS/bridge/node.h"
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/introspection/registry.h"
@@ -29,28 +28,6 @@
 namespace talos::hardware {
 namespace {
 using namespace bridge_test;  // NOLINT(google-build-using-namespace)
-
-// Runs the bridge's Run() on its own thread until Stop() or destruction,
-// which stop it as SIGTERM does (process::RequestStop) and join it. The
-// node's counters are read only once it has stopped.
-class RunningBridge {
- public:
-  explicit RunningBridge(HardwareNode& node)
-      : thread_{[&node] { node.Run(); }} {}
-  RunningBridge(const RunningBridge&) = delete;
-  RunningBridge& operator=(const RunningBridge&) = delete;
-  ~RunningBridge() { Stop(); }
-
-  void Stop() {
-    if (!thread_.joinable()) return;
-    process::RequestStop(0);
-    thread_.join();
-    process::stop_requested.store(false);
-  }
-
- private:
-  std::thread thread_;
-};
 
 // The arm seam of RunEndsItsWaitOnAStop: on the first arm after
 // `stop_at_next_arm`, it notes the deadline wakes so far and requests a stop
@@ -81,37 +58,6 @@ void PublishBeforeWait() {
     PublishCommand(*waiting_publisher, IntakeRequest(*waiting_config, demand));
   }
 }
-
-// The host's scheduling noise over a test: the longest a 1 ms sleep of an
-// ordinary thread overran, for a timed test to read before it judges
-// (docs/TESTING.md §6.7), so a stalled host fails as unqualified.
-class StallMeter {
- public:
-  StallMeter()
-      : thread_{[this](const std::stop_token& stop) {
-          while (!stop.stop_requested()) {
-            const auto before = std::chrono::steady_clock::now();
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-            const auto over = std::chrono::steady_clock::now() - before -
-                              std::chrono::milliseconds{1};
-            const auto over_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(over)
-                    .count();
-            worst_us_.store(std::max<std::int64_t>(worst_us_.load(), over_us));
-          }
-        }} {}
-
-  // Stops measuring; the worst overrun, in microseconds.
-  uint64_t Stop() {
-    thread_.request_stop();
-    if (thread_.joinable()) thread_.join();
-    return static_cast<uint64_t>(std::max<std::int64_t>(worst_us_.load(), 0));
-  }
-
- private:
-  std::atomic<std::int64_t> worst_us_{0};
-  std::jthread thread_;
-};
 
 // The launcher kills a running node whose dispatch count stops for its stall
 // timeout (500 ms for the bridge). Run() must store it far more often than
@@ -354,61 +300,87 @@ TEST(HardwareNodeTest, ExitStatusWithoutAStateIsZeroOnlyForAStop) {
   }
 }
 
-// Under Run(), with one request and nothing after it, the heartbeats and the
-// owner timeout's neutral command still go out on their own. The bounds are
-// the requirement's: each frame no earlier than its duty, and before the
-// gateway's command_timeout_us would have expired the last one.
-// NextDutyUsIsWhenTickNextHasWork pins the exact instants; this proves Run()
-// sleeps until them rather than past them.
-// REQ-SAFE-15
-// REQ-RT-20
-TEST(HardwareNodeTest, RunSendsHeartbeatsAndTheTimeoutNeutralOnItsOwn) {
+std::atomic<int> run_pending_recv_error{0};
+int TakeRunRecvError() { return run_pending_recv_error.exchange(0); }
+
+// Under Run() with its poller active, a transient receive error (ECONNREFUSED)
+// keeps the socket open, while a permanent receive error (ENETUNREACH) closes
+// the socket, removes its fd from the poller, reopens it, registers the new fd
+// so subsequent States still arrive, and reports the reopen on /hw/status.
+// REQ-RT-22
+TEST(HardwareNodeTest, RunReopensSocketOnPermanentReceiveErrorAndKeepsRunning) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
-  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
   Link link;
   ASSERT_TRUE(link.Open(cfg));
   HardwareNode& node = link.node.value();
+  run_pending_recv_error.store(0);
+  node.set_seams({.recv_error = &TakeRunRecvError});
   ipc::Subscriber<Packet> states{
       kStateTopic,
       RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
-  ipc::Publisher<Packet> pub{RequestTopic("intake")};
-  std::vector<SentCommand> commands;
-  StallMeter host;
+  ipc::Subscriber<bridge::BridgeStatus> statuses{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
   {
     RunningBridge run{node};
     ASSERT_TRUE(
         SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 1000)));
     ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 1000); }));
-    PublishCommand(pub, IntakeRequest(cfg, 4.0));
-    do {
-      auto sent = NextCommand(link.gateway);
-      ASSERT_TRUE(sent) << "after " << commands.size() << " commands";
-      commands.push_back(*sent);
-    } while (MotorOf(commands.back().command, roller).mode != Mode::kNeutral);
+
+    // Transient ECONNREFUSED keeps the socket open and frames keep arriving.
+    run_pending_recv_error.store(ECONNREFUSED);
+    ASSERT_TRUE(
+        SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 2000)));
+    ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 2000); }));
+
+    // Permanent ENETUNREACH triggers a reopen and re-adds the fd to poller_.
+    run_pending_recv_error.store(ENETUNREACH);
+    ASSERT_TRUE(WaitFor([&] {
+      const auto status = statuses.read();
+      return status && status->socket_reopens_count() >= 1u;
+    }));
+    ASSERT_TRUE(
+        SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 3000)));
+    ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 3000); }));
   }
-  const uint64_t heartbeat_us = node.heartbeat_us();
-  const uint64_t command_timeout_us = cfg.hardware.command_timeout_us;
-  const uint64_t timeout_us = OwnerTimeoutUs(5000, command_timeout_us);
-  // Judged only on a host whose stalls are well inside the margin the
-  // bounds below leave (the neutral's: command_timeout_us less the owner
-  // timeout); otherwise the host, not the bridge, is unqualified.
-  const uint64_t stall_us = host.Stop();
-  ASSERT_LT(stall_us, (command_timeout_us - timeout_us) / 2)
-      << "host unqualified: an ordinary thread's 1 ms sleep overran by "
-      << stall_us << " us";
-  // The request's command, at least one heartbeat, the neutral command.
-  ASSERT_GE(commands.size(), 3u);
-  for (std::size_t i = 1; i + 1 < commands.size(); ++i) {
-    SCOPED_TRACE(i);
-    EXPECT_EQ(MotorOf(commands[i].command, roller).mode, Mode::kVoltage);
-    const uint64_t gap_us = commands[i].sent_us - commands[i - 1].sent_us;
-    EXPECT_GE(gap_us, heartbeat_us);
-    EXPECT_LT(gap_us, command_timeout_us);
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+  EXPECT_EQ(node.wakeups().wait_fallbacks, 0u);
+}
+
+// Under Run(), a HardwareNode pinned to an absent local_address starts cleanly,
+// keeps its poller active without falling back to 1 ms polling, and retries
+// opening on the 100 ms cadence rather than falling back to 0.0.0.0.
+// REQ-RT-22, REQ-OPS-25
+TEST(HardwareNodeTest,
+     RunRetriesAbsentLocalAddressWithoutCrashingOrPollingFallback) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  uint16_t gateway_port = 0;
+  uint16_t node_port = 0;
+  int gw_res = ReservePort(gateway_port);
+  int node_res = ReservePort(node_port);
+  ASSERT_GE(gw_res, 0);
+  ASSERT_GE(node_res, 0);
+  Release(node_res);
+
+  HardwareNode node{cfg, "127.0.0.1", gateway_port, node_port,  true, 0,
+                    {},  0,           {},           "192.0.2.1"};
+  ASSERT_TRUE(node.Open());
+  ipc::Subscriber<bridge::BridgeStatus> statuses{bridge::topics::kStatus};
+  uint64_t status_count = 0;
+  {
+    RunningBridge run{node};
+    // 10 status publications at 20 ms each (~180 ms) guarantees at least two
+    // 100 ms reopen attempts on the bridge clock.
+    ASSERT_TRUE(WaitFor([&] {
+      while (statuses.read()) ++status_count;
+      return status_count >= 10;
+    }));
   }
-  const uint64_t neutral_after_us =
-      commands.back().sent_us - commands.front().sent_us;
-  EXPECT_GT(neutral_after_us, timeout_us);
-  EXPECT_LT(neutral_after_us, command_timeout_us);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.wakeups().wait_fallbacks, 0u);
+  EXPECT_GE(node.socket_counters().reopen_attempts, 2u);
+  EXPECT_EQ(node.socket_counters().reopens, 0u);
+  Release(gw_res);
 }
 
 }  // namespace

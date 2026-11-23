@@ -12,5 +12,5 @@ spec is ambiguous, an edit would touch a file outside the brief, or a change
 would affect behaviour beyond what was described, stop and report instead of
 guessing.
 
-Do not run `bazel build` or `bazel test`, and do not commit. Report every file
-you changed and anything you skipped and why.
+Do not run `bazel build` or `bazel test`, do not spawn subagents, and do not
+commit. Report every file you changed and anything you skipped and why.

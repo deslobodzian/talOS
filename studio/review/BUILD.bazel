@@ -1,4 +1,4 @@
-load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -23,15 +23,16 @@ cc_library(
         "session.h",
     ],
     deps = [
-        "//studio/bridge:system",
-        "//studio/bridge:telemetry",
+        "//studio/bridge:json_format",
+        "//studio/bridge:static_files",
+        "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
-        "//talOS/hardware",
+        "//talOS/hardware:codecs",
         "//talOS/launcher:hardware_record",
         "//talOS/launcher:log_inputs",
         "//talOS/launcher:log_merge",
-        "//talOS/launcher:session",
+        "//talOS/launcher:session_retention",
         "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
         "//talOS/telemetry:channels",
@@ -89,7 +90,11 @@ cc_library(
 # decodes them with studio/src/data/review.ts, so a shape change on either
 # side fails the other side's test (studio/README.md, "Reviewing a
 # session", says how to update them).
-js_library(
+# copy_to_bin, not rules_js's js_library: this package stays free of
+# aspect_rules_js, a development dependency of talOS that a dependent module
+# does not get. The copies sit in the output tree, where //studio's js_test
+# reads data.
+copy_to_bin(
     name = "golden",
     srcs = glob(["testdata/golden/*"]),
     visibility = ["//studio:__pkg__"],
@@ -111,11 +116,13 @@ cc_test(
         ":fixture",
         ":review",
         ":review_test_message",
+        "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/events:gap_testing",
         "//talOS/hardware",
         "//talOS/launcher:hardware_record",
+        "//talOS/launcher:session",
         "//talOS/protocol",
         "//talOS/telemetry:frames",
         "@flatbuffers//:runtime_cc",

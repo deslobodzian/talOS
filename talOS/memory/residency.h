@@ -34,6 +34,15 @@ Residency KeepMappingsResident() noexcept;
 // Whether KeepMappingsResident has been called in this process.
 bool MappingsKeptResident() noexcept;
 
+// Whether any mapping registered after KeepMappingsResident() had mlock
+// refused (TrackMapping). Stays true once set; checked by each node's
+// registry reporter so late ring-lock refusals surface in its live row.
+bool LateLockRefused() noexcept;
+
+// Test seam: sets or clears the late-lock-refused flag so tests can exercise
+// registry reporting without exhausting RLIMIT_MEMLOCK.
+void SetLateLockRefusedForTest(bool refused) noexcept;
+
 // SharedMemoryPtr's bookkeeping: a mapping registers when mapped (and is
 // made resident then if KeepMappingsResident was called) and unregisters
 // before it is unmapped.

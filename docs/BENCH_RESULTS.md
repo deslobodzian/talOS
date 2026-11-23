@@ -22,6 +22,237 @@ Hosts named below: the **bench** is BENCH.md's RoboRIO (image
 FRC_roboRIO_2026_v1.2, two cores) and CAN devices; the **Linux workstation**
 has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
+## 2026-11-22
+
+Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
+`820a06d5`, no hardware attached (`TODO.md` `MAC-1`, `INC-3`, `DEPLOY-10`):
+
+- **MAC-1: `tools/mac_qualify.sh` full build, suite, configs, and warm spawns.**
+  - `bazel build //...`: PASS (41 s); `bazel test --test_output=errors //...`:
+    PASS (118 s, 100% green); all 6 `--describe-only` configs (`robot.toml`,
+    `robot_py.toml`, `robot_bench.toml`, `robot_physics_sim.toml`,
+    `examples/superstructure/config/{robot,robot_py}.toml`): PASS.
+  - `tools/deploy.sh boot-check`: FAIL as expected under `DEPLOY-8` (`FileVault
+    is On` and `pmset autorestart 0` failed; `pmset sleep 0` ok; automatic macOS
+    updates enabled warning).
+  - Warm Python node spawn → event-loop origin (no `sudo purge`, so warm page
+    cache; startup grace 5000 ms): `gyro` 106.0 ms first launch / 131.2–133.7 ms
+    restarts; `motor` 107.3 ms first launch / 120.0–121.0 ms restarts.
+- **INC-3: `//talOS/launcher:restart_latency` on `swerve_module` (10/10 SIGKILLs).**
+  - Idle: total **26.4 ms** median (range **25.2–31.1 ms**; `SIGKILL → origin`
+    18.8 ms median, 18.0–19.9 ms).
+  - Under `--disk-load 8` (8 writers rewriting and syncing 256 MiB files): total
+    **11.1 ms** median (range **10.4–357.7 ms**; per kill: 15.8, **357.7**,
+    10.6, 10.8, 10.4, 10.6, 36.9, 77.4, 11.3, 10.8 ms). The single **357.7 ms**
+    outlier (`SIGKILL → origin` 351.0 ms) exceeds the 300 ms frozen-driver
+    window even on M4 Pro, keeping `INC-3` open.
+- **DEPLOY-10: `//bench/main_processor:bench_bundle` (with Studio) `SIGTERM` stop.**
+  - Five consecutive runs of `bench_bundle/run.sh --sim --remote 127.0.0.1
+    --studio-http-port 0` stopped with `SIGTERM`: 5/5 exited 0 in **79.7–88.9 ms**
+    (median **84.2 ms**), against explicit launchd `ExitTimeOut = 90` s.
+
+Linux workstation (8 cores), commit `820a06d5`, loaded (concurrent worker Bazel
+builds running in sibling worktrees; `TODO.md` `TEST-24`):
+
+- **TEST-24: `//studio:drive_browser_test` 200/200 PASS on loaded Linux.**
+  - `bazel test --runs_per_test=200 --test_output=errors
+    --test_env=TALOS_REQUIRE_BROWSER=1 //studio:drive_browser_test`: **200/200
+    PASSED** (min 2.3 s, avg 2.5 s, max 3.3 s, dev 0.2 s; elapsed 506.4 s),
+    zero timeouts waiting for the Studio bridge's `listening` line.
+
+Mac mini (M4 Pro, 12 cores, macOS 26.3 / Darwin 25.3.0 arm64), commit
+`78ebe06a`, idle (`vm.loadavg` 1.39–1.93), no hardware attached (`TODO.md`
+`RT-22`, `CAM-1`):
+
+- **RT-22: Python control node GIL contention under macOS
+  `THREAD_TIME_CONSTRAINT_POLICY` (`TALOS_REALTIME=1`).**
+  - Scratch `talos_py_node` actuator owner (`LoopTier::kControl`, `realtime =
+    "full"`, `time_constraint_active = true` confirmed via
+    `thread_policy_get`; Python worker threads timeshare), 30 s steady-state
+    window per case (`sys.getswitchinterval() = 0.005 s`):
+    - 5 ms period: `none` 5998 ticks (0 missed, `dispatch→exit` p99 56.4 µs /
+      max 133.7 µs, `TIMER` lateness p99 43.9 µs / max 550.2 µs); `socket.recv`
+      5998 ticks (0 missed, p99 45.5 µs / max 155.6 µs); busy Python `loop`
+      5633 ticks (367 missed, `dispatch→exit` p50 5.02 ms / p99 10.05 ms / max
+      15.08 ms — up to 3× switch interval per tick as `ctypes` calls release
+      and reacquire the GIL; `TIMER` lateness p99 5.08 ms / max 10.12 ms);
+      `sorted(2M)` 191 ticks (6067 missed, `dispatch→exit` p99 447.9 ms / max
+      664.8 ms).
+    - 20 ms period: `none` 1498 ticks (0 missed, p99 75.1 µs / max 142.0 µs);
+      `socket.recv` 1498 ticks (0 missed, p99 89.8 µs / max 183.2 µs); `loop`
+      1499 ticks (0 missed, `dispatch→exit` p50 5.03 ms / p99 10.06 ms / max
+      15.12 ms); `sorted(2M)` 196 ticks (1304 missed, p99 441.8 ms / max
+      446.9 ms).
+  - Confirms macOS time-constraint scheduling does not shield a Python control
+    node from GIL contention by a timeshare Python worker thread.
+- **CAM-1: Mac mini coprocessor sim-camera sweep (18 s runs, 4 s warmup, all
+  nodes `realtime = "full"`).**
+  - 4 × 1280×720 @ 60 fps: `auto`/Metal **1.95 cores total (0.49 cores/cam)**,
+    `3358/3358` steady-state (0 dropped, `frame_period_us` 16669, worst camera
+    `TIMER` lateness p99 0.281 ms / max 0.645 ms); `cpu` **2.20 cores total
+    (0.55 cores/cam)**, `3356/3356` (0 dropped, p99 0.402 ms / max 0.883 ms).
+  - 4 × 1280×720 @ 30 fps: Metal 1.25 cores (0.31/cam), `cpu` 1.20 cores
+    (0.30/cam), 0 dropped, zero tag-visibility loss (0.52–0.76 tags/frame).
+  - 4 × 960×540 @ 60 fps: Metal 1.40 cores, `cpu` 1.29 cores (0 dropped);
+    4 × 640×480 @ 60 fps: Metal 1.38 cores, `cpu` 1.25 cores (0 dropped);
+    4 × 640×360 @ 60 fps: Metal 1.30 cores, `cpu` 1.20 cores (loses ~45% of
+    visible tags at `min_tag_px = 12`).
+
+Linux workstation (8 cores, GCC 16.2.1, `libasan.so.8`), commits `78ebe06a` and
+`94cc8727`, no hardware attached (`TODO.md` `BENCH-3`, `CI-3`):
+
+- **BENCH-3: RoboRIO `./gradlew phoenixTest -Pasan` clean with zero
+  suppressions (`78ebe06a`).**
+  - `./gradlew phoenixTest -Pasan`: 106/106 debug + 106/106 release +
+    `rioBuildStampTest` PASS (`BUILD SUCCESSFUL`). Direct runs under strict
+    ASan + verbose LSan (`detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1`):
+    106/106 PASS, 0 ASan errors, 0 LSan leaks, 0 vendor-sim/HAL suppressions.
+    Canary leak and heap-use-after-free checks both triggered and failed cleanly.
+- **CI-3: Full `clang-tidy-18` sweep across all C++ test sources (`94cc8727`).**
+  - All 135 in-graph C++ test files and 38 test-support/testdata/bench `.cc`
+    files (173/173 TUs) passed `clang-tidy-18` with repo `.clang-tidy`
+    (`WarningsAsErrors: '*'`, `--checks=-bugprone-unchecked-optional-access`):
+    **0 latent warnings**.
+
+## 2026-11-21
+
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commits `d942b0b8` and
+`6037f7ff`, no hardware attached, idle. Measurements for `TODO.md` `LOG-8`,
+`TRACE-1`, `TEST-10`, and `TEST-22`:
+
+- **LOG-8: enabled simulation time-cut log window stays within 8/7 of the
+  printed window (`REQ-OPS-32`).** At `d942b0b8`, 60 s enabled teleop physics
+  simulation (`robot_physics_sim.toml` with `[robot] log_max_bytes = 33554432`,
+  `--mode-schedule teleop:60`, active stick demand from t=2 s): printed
+  `Event-log window 20331671 us` (`20.332 s`); all 6 logging members exited 0
+  with `log_capped = true`, `log_gap = false`, `recorder_failed = false` and
+  kept spans `hardware_node` `19.307 s` (`W/span = 1.0531`), `swerve_module`
+  `19.273 s` (`1.0549`), `teleop` `19.268 s` (`1.0552`), `telemetry` `19.185 s`
+  (`1.0597`), `gyro` `19.103 s` (`1.0643`), `motor` `18.938 s` (`1.0736`); worst
+  ratio `1.0736 <= 8/7 (1.1429)`.
+- **TRACE-1: macOS death and idle-timeout checks pass on the Mac mini.** At
+  `d942b0b8`, `bazel test --test_output=errors //talOS/launcher:launcher_death_test //studio/bridge:client_timeout_test`
+  passed (`launcher_death_test` 1.3 s, `client_timeout_test` 9.1 s). In Linux
+  CI run `44855147331` (`d942b0b8`), `//talOS/protocol:udp_address_change_test`
+  ran under `TALOS_REQUIRE_NETNS=1` and passed in 0.2 s (0 skips).
+- **TEST-10 & TEST-22: repeated macOS runs pass with 0 failures.** At
+  `6037f7ff`, `bazel test --nocache_test_results --runs_per_test=5` passed
+  `//talOS/launcher:launcher_test` (20/20 shard runs, max 51.2 s),
+  `//talOS/launcher:supervision_test` (15/15 shard runs, max 71.9 s), and
+  `//talOS/bridge:run_timing_test` (5/5 runs, max 0.1 s).
+
+## 2026-11-20
+
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `1218376d`, no
+hardware attached. Three consecutive uncached full suites
+(`bazel test --nocache_test_results --test_output=errors //...`, 251 tests)
+each started immediately after driving 1-minute `vm.loadavg` to >= 9.0
+(`TODO.md` `MAC-2`, `TEST-10`):
+
+- **MAC-2: `//bench/main_processor:bundle_test` passes 3 of 3 full suites
+  started at load >= 9.**
+  - Run 1 (start load `9.01 5.18 3.54`, elapsed 166 s):
+    `//bench/main_processor:bundle_test` PASSED in 33.8 s (`install_check_test`
+    27.1 s, `warm_up_test` 18.1 s). Two unrelated tests failed under the initial
+    load spike: `//talOS/launcher:supervision_test`
+    (`Supervision.HungStudioBridgeIsKilledAndRestartedWithoutDisturbingNodes`,
+    6430 ms; real wall-clock deadlines, `TEST-10`) and `//tools:prepush_test`
+    (TIMEOUT in 60.0 s).
+  - Run 2 (start load `9.16 6.88 4.63`, elapsed 128 s):
+    `//bench/main_processor:bundle_test` PASSED in 50.8 s (`install_check_test`
+    42.3 s, `warm_up_test` 14.6 s); 251/251 tests passed.
+  - Run 3 (start load `9.12 6.91 4.99`, elapsed 139 s):
+    `//bench/main_processor:bundle_test` PASSED in 55.6 s (`install_check_test`
+    26.8 s, `warm_up_test` 15.4 s); 251/251 tests passed.
+
+Mac mini (M4 Pro, 12 cores, Darwin 25.3.0 arm64), commit `0cebbd0d`, no
+hardware attached, idle (load 1.2). Measurements for `TODO.md` `SCALE-1`,
+`RT-7`, `STUDIO-2`, `MAC-2`, and `INC-3`:
+
+- **SCALE-1: `wake_fanout_bench` at 32 armed readers on macOS.**
+  `bazel run -c opt //talOS/rtms:wake_fanout_bench` (2000 publications after
+  200 warm-up, `MAX_READERS` 32, segment version 9): 0 armed / 32 held:
+  0.00 us median, 1.00 us p99, 3.00 us max; 1 armed / 1 held: 2.00 us median,
+  5.00 us p99, 16.00 us max; 8 armed / 8 held: 16.00 us median, 30.00 us p99,
+  62.00 us max (2.00 us/armed); 8 armed / 32 held: 15.00 us median, 26.00 us
+  p99, 29.00 us max (1.88 us/armed); 32 armed / 32 held: 71.00 us median,
+  93.00 us p99, 97.00 us max (2.22 us/armed); `walk` 32/32: 0.00 us median,
+  1.00 us p99, 4.00 us max.
+- **RT-7: descriptor count on macOS enabled in simulation (`REQ-OPS-43`).**
+  Physics simulation (`robot_physics_sim.toml`, `--sim-gateway --physics`,
+  15 s teleop with stick demand, `ulimit -n` soft 256 / hard unlimited),
+  sampled mid-run via `lsof -a -p <pid> -d 0-9999`: `launcher` 36 open FDs,
+  `hardware_node` 9 (7 ipc/sock/kqueue), `swerve_module` 8 (6), `motor` 8 (6),
+  `gyro` 7 (5), `telemetry` 7 (5), `teleop` 7 (5), `sim_gateway` 6 (5).
+  `session_report --strict` passed all verdicts (first accepted State 4.16 ms,
+  0 enabled gaps >= 100 ms, worst target age 2.20 ms <= 25 ms,
+  `alert_warning_owner_timed_out` false across all 749 samples).
+- **STUDIO-2: real bench sessions reviewed on the Mac mini (`REQ-OPS-41`).**
+  `bazel run -c opt //studio/review:studio_review` against the 2026-11-17 bench
+  logs (`~/talos-bench/logs/U`, `V`, `W`):
+  - Session `U` (`7798953721310323380`, 300.0 s, 25 files, 182.8 MiB):
+    `bounds.json` (cold `Open()`) 392.0 ms, `channels.json` 0.4 ms (243
+    channels), `timeline.json` 0.3 ms (3 modes, 3 alerts, 6 runs),
+    `declared.json` 0.3 ms, `snapshot` 4.2 ms (19.3 KB), `series` (1 ch, 400
+    pts) 54.7 ms. Headless Google Chrome rendered `index.html` (`talOS ·
+    Telemetry Studio`, HTTP 200) against `127.0.0.1` serving `U`.
+  - Session `V` (`17289576640307273572`, 1094.6 s, 66 files, 580.1 MiB,
+    `log_capped`): `bounds.json` 1302.3 ms, `channels.json` 0.4 ms (243 ch),
+    `timeline.json` 0.2 ms (23 modes, 6 alerts, 7 runs), `snapshot` 11.8 ms,
+    `series` 164.2 ms.
+  - Session `W` (`1111857340715075397`, 1178.1 s, 68 files, 720.5 MiB,
+    `log_capped`): `bounds.json` 1626.7 ms, `channels.json` 0.4 ms (231 ch),
+    `timeline.json` 0.3 ms (1 mode, 2 alerts, 7 runs), `snapshot` 14.2 ms,
+    `series` 217.4 ms.
+- **MAC-2: fresh `bench_bundle` install and first-launch timing (`REQ-OPS-47`).**
+  Fresh `tools/deploy.sh install` of `//bench/main_processor:bench_bundle` into
+  a temporary prefix took 4.05 s (including warm-up); first
+  `run.sh --sim --describe-only` took 0.13 s (against the 15 s probe deadline);
+  first `run.sh --sim --duration-s 5` took 5.22 s total (0.22 s startup
+  overhead).
+- **INC-3: `restart_latency` baseline on Mac mini (`swerve_module`, physics sim).**
+  Idle (10 kills): SIGKILL to first `/hw/request/swerve_module` median 26.2 ms
+  (range 24.8–31.2 ms; Python `gyro`/`motor` warm spawn-to-origin 84.9–123.9 ms).
+  Under `--disk-load 8` (10 kills): median 10.6 ms (range 10.1–40.5 ms; Python
+  79.3–124.2 ms).
+
+Mac mini (M4 Pro, 12 cores, macOS arm64), commit `1e3bb1c8`, no hardware
+attached, idle. Verification of `TODO.md` STUDIO-1 macOS bridge listener and
+idle-timeout tests:
+
+- **STUDIO-1: exclusive port bind and client idle-timeout tests pass on macOS.**
+  `bazel test --nocache_test_results --test_output=errors //studio/bridge:listen_test //studio/bridge:client_timeout_test`
+  passed with 0 skips (`listen_test` 0.2 s, confirming a second listener on an
+  in-use port fails on macOS; `client_timeout_test` 8.9 s, confirming an
+  unresponsive client frees its slot within the 12–16 s idle-timeout window).
+
+Mac mini (M4 Pro, 12 cores, macOS arm64), commit `6dd79706`, no hardware
+attached. Investigation of nightly `Bazel (tsan, macOS)` failures (`TODO.md`
+CI-13) and kept CI logs from Nightly runs `43877022665` (`6c701709`) and
+`44122679143` (`d702c99d`).
+
+- **CI-13: zero ThreadSanitizer race reports; mechanism is ~100x macOS TSan
+  fork/exec kernel overhead.** Neither nightly run's logs contain any
+  `WARNING: ThreadSanitizer` finding. Standalone Apple clang measurements on
+  the Mac mini: `fork()` from a 3-thread process took 120 ms under TSan vs
+  0.5 ms plain; `fork` + `exec /usr/bin/true` took 213 ms vs 3 ms; 10 empty
+  `main` starts took 1.94 s (mostly kernel CPU) vs 0.02 s; 24 concurrent empty
+  `main` starts consumed 10.7 s kernel CPU in 0.96 s wall. Starting
+  `no_state_sim` took 0.9 s plain vs 2.9 s TSan idle, and 1.9 s plain vs
+  12.6 s TSan for 3 concurrent sessions pinned to efficiency cores
+  (`taskpolicy -c background`).
+- **CI-13: 3-of-3 reproduction of Nightly `44122679143` failures.** Running
+  `bazel test --config=tsan --nocache_test_results --runs_per_test=3
+  --local_test_jobs=3 '--run_under=taskpolicy -c background'` reproduced the
+  exact CI failure messages 3 of 3 on `//talOS/build:sim_check_no_state_test`
+  (14 s ready bound exceeded after the case's 4 s sleep) and
+  `//tools:scaffold_sim_test` (15 s ready wait exceeded across 6 members), and
+  pushed `//talOS/launcher:log_dump_test` (18 subprocess spawns, 60 s small
+  limit) to 48 s. On the idle 12-core Mac mini all three passed
+  (15.6 s, 24.2 s, 16.0 s). Because the Linux sanitizer lanes still run all
+  three targets, they take `no_macos_sanitizer` alongside the other
+  session-spawning tests in `talOS/launcher/BUILD`.
+
 ## 2026-11-17
 
 Bench, RoboRIO build c6c04a67 with companion 10.0.0.37, Mac mini (12 cores,

@@ -4,7 +4,7 @@
 
 #include "flatbuffers/hash.h"
 #include "flatbuffers/reflection.h"
-#include "flatbuffers/verifier.h"
+#include "talOS/schema/verify.h"
 
 namespace talos::schema {
 namespace {
@@ -20,7 +20,8 @@ bool type_size(const reflection::Schema& schema, reflection::BaseType base,
         static_cast<std::size_t>(index) >= objects->size())
       return false;
     const auto* object = objects->Get(index);
-    if (!object->is_struct() || object->bytesize() <= 0) return false;
+    if (object == nullptr || !object->is_struct() || object->bytesize() <= 0)
+      return false;
     size = static_cast<std::size_t>(object->bytesize());
     return true;
   }
@@ -50,13 +51,16 @@ bool append_type(const reflection::Schema& schema, reflection::BaseType base,
     out += reflection::EnumNameBaseType(base);
     return true;
   }
-  const reflection::Enum& e = *schema.enums()->Get(index);
+  const reflection::Enum* e = schema.enums()->Get(index);
+  if (e == nullptr || e->name() == nullptr || e->values() == nullptr)
+    return false;
   out += "enum ";
-  out += e.name()->str();
+  out += e->name()->str();
   out += ':';
   out += reflection::EnumNameBaseType(base);
   out += " {";
-  for (const reflection::EnumVal* value : *e.values()) {
+  for (const reflection::EnumVal* value : *e->values()) {
+    if (value == nullptr || value->name() == nullptr) return false;
     out += value->name()->str();
     out += '=';
     out += std::to_string(value->value());
@@ -70,7 +74,7 @@ bool append_struct(const reflection::Schema& schema,
                    const reflection::Object& object, std::string& out,
                    int depth) {
   if (depth >= kMaxDepth || !object.is_struct() || object.bytesize() <= 0 ||
-      object.fields() == nullptr)
+      object.name() == nullptr || object.fields() == nullptr)
     return false;
   out += "struct ";
   out += object.name()->str();
@@ -80,6 +84,9 @@ bool append_struct(const reflection::Schema& schema,
   out += std::to_string(object.minalign());
   out += " {";
   for (const reflection::Field* field : *object.fields()) {
+    if (field == nullptr || field->type() == nullptr ||
+        field->name() == nullptr)
+      return false;
     const reflection::Type& type = *field->type();
     const bool array = type.base_type() == reflection::BaseType::Array;
     std::size_t size;
@@ -134,11 +141,14 @@ std::uint64_t struct_hash(const reflection::Schema& schema,
 std::optional<std::uint64_t> struct_hash(const std::uint8_t* bfbs,
                                          std::size_t size,
                                          std::string_view name) {
-  flatbuffers::Verifier verifier(bfbs, size);
-  if (!reflection::VerifySchemaBuffer(verifier)) return std::nullopt;
-  const reflection::Schema& schema = *reflection::GetSchema(bfbs);
+  const reflection::Schema* verified =
+      VerifySchema({reinterpret_cast<const char*>(bfbs), size});
+  if (verified == nullptr) return std::nullopt;
+  const reflection::Schema& schema = *verified;
   const reflection::Object* object =
-      schema.objects()->LookupByKey(std::string(name).c_str());
+      schema.objects() != nullptr
+          ? schema.objects()->LookupByKey(std::string(name).c_str())
+          : nullptr;
   if (object == nullptr || !object->is_struct()) return std::nullopt;
   const std::string canonical = canonical_struct(schema, *object);
   if (canonical.empty()) return std::nullopt;

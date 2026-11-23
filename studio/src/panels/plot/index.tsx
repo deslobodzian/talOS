@@ -181,6 +181,52 @@ function ChannelDrawer({channels, selected, onToggle}: {
   </aside>;
 }
 
+// Convert a Float64Array y-series column for uPlot: uPlot 1.6 only breaks
+// lines on `null` and ignores nullish (`null`/`undefined`) in `getMinMax`,
+// whereas `NaN`/`±Infinity` pass `!= null`, drawing across breaks and
+// poisoning `[min, max]` to `[NaN, NaN]` when a series starts with `NaN`.
+// When `count` is provided (recorded decimated series), rows with `count[i] === 0`
+// are alignment placeholders for another channel's bucket timestamp and map to
+// `undefined` so uPlot skips them in `getMinMax` while drawing through them.
+export function plotColumn(col: Float64Array): (number | null)[];
+export function plotColumn(
+    col: Float64Array, count: Uint32Array | undefined): (number | null | undefined)[];
+export function plotColumn(
+    col: Float64Array, count?: Uint32Array): (number | null | undefined)[] {
+  const out = new Array<number | null | undefined>(col.length);
+  for (let i = 0; i < col.length; i++) {
+    const v = col[i];
+    if (Number.isFinite(v)) out[i] = v;
+    else if (count && i < count.length && count[i] === 0) out[i] = undefined;
+    else out[i] = null;
+  }
+  return out;
+}
+
+export function plotData(
+    series: Series,
+    ordered: string[]): [number[], ...(number | null | undefined)[][]] {
+  const times = Array.from(series.times);
+  const values = ordered.map(
+      name => plotColumn(series.values[name] ?? new Float64Array(0),
+                         series.count?.[name]));
+  return [times, ...values];
+}
+
+// Convert a plot cursor's x-axis sample (seconds since `origin`) to an exact
+// nanosecond timestamp, or null when the cursor has no finite sample.
+export function cursorTimestampNs(
+    times: ArrayLike<number | null | undefined> | undefined,
+    index: number | null | undefined,
+    origin: bigint | null): bigint | null {
+  if (index == null || origin === null || !times) return null;
+  const sample = times[index];
+  if (typeof sample !== 'number' || !Number.isFinite(sample)) return null;
+  const ns = Math.round(sample * 1e9);
+  if (!Number.isFinite(ns)) return null;
+  return origin + BigInt(ns);
+}
+
 function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
   const dictionary = useDictionary();
   const playback = usePlayback();
@@ -322,13 +368,9 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
           ],
           hooks: {
             setCursor: [u => {
-              const index = u.cursor.idx;
-              if (index == null || anchor.current == null) return;
-              const sample = u.data[0][index];
-              if (sample != null && originRef.current != null)
-                setDelta(Number(BigInt(
-                    originRef.current + BigInt(Math.round(sample * 1e9))) -
-                    anchor.current) / 1e9);
+              if (anchor.current == null) return;
+              const t = cursorTimestampNs(u.data[0], u.cursor.idx, originRef.current);
+              if (t !== null) setDelta(Number(t - anchor.current) / 1e9);
             }],
             draw: [u => {
               drawEnvelope(u, seriesRef.current, orderedRef.current.ordered,
@@ -341,10 +383,8 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
     chart.current = plot;
 
     const click = () => {
-      const index = plot.cursor.idx;
-      if (index != null && originRef.current != null) {
-        const t = originRef.current +
-            BigInt(Math.round(plot.data[0][index] * 1e9));
+      const t = cursorTimestampNs(plot.data[0], plot.cursor.idx, originRef.current);
+      if (t !== null) {
         anchor.current = t;
         latest.current.seek(t.toString());
       }
@@ -397,12 +437,11 @@ function PlotPanel({config, setConfig}: PanelProps<PlotConfig>) {
       return;
     }
     originRef.current = BigInt(series.t0_ns);
-    const times = Array.from(series.times);
-    const values = ordered.map(
-        name => Array.from(series.values[name] ?? new Float64Array(0)));
+    const data = plotData(series, ordered);
+    const times = data[0];
     const resetScales = windowChanged || playback.mode === 'LIVE_STREAMING' ||
         times.length === 0;
-    plot.setData([times, ...values], resetScales);
+    plot.setData(data, resetScales);
     if (windowChanged && config.windowSeconds !== null && times.length > 0 &&
         times[0] < times[times.length - 1])
       plot.setScale('x', {min: times[0], max: times[times.length - 1]});

@@ -41,15 +41,27 @@ TEST(SocketRetry, OpensWithinOneRetryPeriodOfTheRouteAppearing) {
   SocketRetry retry;
   uint64_t opened_us = 0;
   uint32_t attempts = 0;
+  uint32_t failed_events = 0;
+  uint32_t none_events = 0;
   for (uint64_t now = kStartUs; now < kStartUs + 10'000'000;
        now += kLoopPeriodUs) {
+    bool attempted = false;
     const auto event = retry.Poll(now, [&] {
+      attempted = true;
       ++attempts;
       return now >= kRouteUpUs;
     });
     if (event == SocketRetry::Event::kOpened) {
+      EXPECT_TRUE(attempted);
       opened_us = now;
       break;
+    }
+    if (attempted) {
+      EXPECT_EQ(event, SocketRetry::Event::kFailed) << now;
+      ++failed_events;
+    } else {
+      EXPECT_EQ(event, SocketRetry::Event::kNone) << now;
+      ++none_events;
     }
   }
   ASSERT_NE(opened_us, 0u) << "never opened";
@@ -57,20 +69,27 @@ TEST(SocketRetry, OpensWithinOneRetryPeriodOfTheRouteAppearing) {
       << "opened " << opened_us - kRouteUpUs
       << " us after the route appeared; bound: one retry period (100 ms) "
          "plus one loop period (5 ms)";
+  EXPECT_EQ(failed_events, attempts - 1);
+  EXPECT_GT(none_events, 0u);
   EXPECT_EQ(retry.failures(), attempts - 1);
   EXPECT_EQ(retry.first_failure_us(), kStartUs);
 }
 
 // A network that never comes up: one attempt per retry period, not one per
 // loop tick, and none once the socket is open.
+// REQ-OPS-28
 TEST(SocketRetry, AttemptsAtMostOncePerPeriod) {
   SocketRetry retry;
   bool up = false;
   uint32_t attempts = 0;
+  uint32_t failed_events = 0;
+  uint32_t none_events = 0;
   uint64_t last_attempt_us = 0;
   for (uint64_t now = kStartUs; now < kStartUs + 10'000'000;
        now += kLoopPeriodUs) {
-    retry.Poll(now, [&] {
+    bool attempted = false;
+    const auto event = retry.Poll(now, [&] {
+      attempted = true;
       if (attempts > 0) {
         EXPECT_GE(now - last_attempt_us, SocketRetry::kPeriodUs)
             << "attempt " << attempts << " at " << now;
@@ -79,8 +98,17 @@ TEST(SocketRetry, AttemptsAtMostOncePerPeriod) {
       last_attempt_us = now;
       return up;
     });
+    if (attempted) {
+      EXPECT_EQ(event, SocketRetry::Event::kFailed) << now;
+      ++failed_events;
+    } else {
+      EXPECT_EQ(event, SocketRetry::Event::kNone) << now;
+      ++none_events;
+    }
   }
   EXPECT_EQ(attempts, 10'000'000 / SocketRetry::kPeriodUs);
+  EXPECT_EQ(failed_events, attempts);
+  EXPECT_GT(none_events, 0u);
 
   up = true;
   const uint64_t later = kStartUs + 10'000'000 + SocketRetry::kPeriodUs;
@@ -191,6 +219,141 @@ TEST(SocketRetry, AFailingSpellThatKeepsTheSocketReportsItsStartAndEnd) {
   EXPECT_EQ(retry.SendSucceeded(lost_us + kLoopPeriodUs), SendEvent::kNone);
   EXPECT_EQ(retry.SendSucceeded(lost_us + SocketRetry::kSpellQuietUs),
             SendEvent::kNone);
+}
+
+// A non-blocking send refused with EAGAIN / EWOULDBLOCK
+// (UdpStatus::kWouldBlock, send buffer full) is reported to the loop without
+// marking the socket lost, triggering a reopen, or ending an open
+// kSocketError spell. REQ-RT-22
+TEST(SocketRetry, WouldBlockReportsDropAndKeepsTheSocketOpen) {
+  using SendEvent = SocketRetry::SendEvent;
+  using UdpStatus = talos::protocol::UdpStatus;
+  SocketRetry retry;
+  // Before the socket opens, a would-block status is ignored.
+  EXPECT_EQ(retry.ObserveSend(kStartUs, UdpStatus::kWouldBlock, 0),
+            SendEvent::kNone);
+
+  ASSERT_EQ(retry.Poll(kStartUs, [] { return true; }),
+            SocketRetry::Event::kOpened);
+  const uint64_t burst_us = kStartUs + SocketRetry::kPeriodUs;
+  for (uint32_t i = 1; i <= 5; ++i) {
+    EXPECT_EQ(retry.ObserveSend(burst_us + i * kLoopPeriodUs,
+                                UdpStatus::kWouldBlock, 0),
+              SendEvent::kWouldBlock);
+    EXPECT_TRUE(retry.open());
+    EXPECT_FALSE(retry.replacing());
+    EXPECT_EQ(retry.Poll(burst_us + i * kLoopPeriodUs,
+                         [] {
+                           ADD_FAILURE()
+                               << "kWouldBlock must not trigger reopen";
+                           return true;
+                         }),
+              SocketRetry::Event::kNone);
+  }
+
+  // A kWouldBlock during an open kSocketError spell does not end the spell or
+  // inflate spell_failures; a later kOk after kSpellQuietUs still recovers it.
+  const uint64_t fail_us = burst_us + 1'000'000;
+  EXPECT_EQ(retry.ObserveSend(fail_us, UdpStatus::kSocketError, ENOBUFS),
+            SendEvent::kFailing);
+  EXPECT_EQ(retry.ObserveSend(fail_us + SocketRetry::kSpellQuietUs,
+                              UdpStatus::kWouldBlock, 0),
+            SendEvent::kWouldBlock);
+  EXPECT_EQ(retry.spell_failures(), 1u);
+  EXPECT_EQ(retry.spell_error(), ENOBUFS);
+  EXPECT_TRUE(retry.open());
+  EXPECT_EQ(
+      retry.ObserveSend(fail_us + SocketRetry::kSpellQuietUs + kLoopPeriodUs,
+                        UdpStatus::kOk, 0),
+      SendEvent::kRecovered);
+}
+
+// Permanent receive errors lose the socket and schedule replacement on the
+// same kPeriodUs cadence as ObserveSend, while non-socket outcomes (kOk,
+// kWouldBlock, kDecodeError) and transient errors (ECONNREFUSED) keep it open.
+// REQ-RT-22
+TEST(SocketRetry, PermanentReceiveErrorReopensWhileTransientKeepsSocket) {
+  using UdpStatus = talos::protocol::UdpStatus;
+
+  // Before open, receive errors are ignored.
+  {
+    SocketRetry retry;
+    retry.ObserveReceive(kStartUs, UdpStatus::kSocketError, EBADF);
+    EXPECT_FALSE(retry.open());
+    EXPECT_FALSE(retry.replacing());
+  }
+
+  // Non-socket statuses and transient errors keep the socket open.
+  {
+    SocketRetry retry;
+    ASSERT_EQ(retry.Poll(kStartUs, [] { return true; }),
+              SocketRetry::Event::kOpened);
+    const uint64_t t = kStartUs + SocketRetry::kPeriodUs;
+    for (const auto status :
+         {UdpStatus::kOk, UdpStatus::kWouldBlock, UdpStatus::kDecodeError,
+          UdpStatus::kInvalidArgument}) {
+      retry.ObserveReceive(t, status, EBADF);
+      EXPECT_TRUE(retry.open());
+      EXPECT_FALSE(retry.replacing());
+    }
+    for (const int transient : {0, ECONNREFUSED, EAGAIN, EWOULDBLOCK, EINTR}) {
+      SCOPED_TRACE(std::strerror(transient));
+      retry.ObserveReceive(t, UdpStatus::kSocketError, transient);
+      EXPECT_TRUE(retry.open());
+      EXPECT_FALSE(retry.replacing());
+      EXPECT_EQ(retry.Poll(t + kLoopPeriodUs,
+                           [] {
+                             ADD_FAILURE()
+                                 << "transient receive error triggered reopen";
+                             return true;
+                           }),
+                SocketRetry::Event::kNone);
+    }
+  }
+
+  // Every permanent receive error transitions into replacing state and the
+  // next due Poll replaces the socket on the kPeriodUs cadence.
+  uint64_t now = kStartUs;
+  for (const int permanent :
+       {EBADF, ENOTCONN, ENOTSOCK, EPIPE, ENETUNREACH, EADDRNOTAVAIL}) {
+    SCOPED_TRACE(std::strerror(permanent));
+    SocketRetry retry;
+    ASSERT_EQ(retry.Poll(now, [] { return true; }),
+              SocketRetry::Event::kOpened);
+    const uint64_t lost_us = now + SocketRetry::kPeriodUs;
+    retry.ObserveReceive(lost_us, UdpStatus::kSocketError, permanent);
+    EXPECT_FALSE(retry.open());
+    EXPECT_TRUE(retry.replacing());
+    EXPECT_EQ(retry.lost_us(), lost_us);
+    EXPECT_EQ(retry.last_recv_error(), permanent);
+
+    const uint64_t replaced_us = lost_us + kLoopPeriodUs;
+    ASSERT_EQ(retry.Poll(replaced_us, [] { return true; }),
+              SocketRetry::Event::kReplaced);
+    EXPECT_TRUE(retry.open());
+    EXPECT_FALSE(retry.replacing());
+
+    // A permanent receive error immediately after replacement respects the
+    // kPeriodUs throttle.
+    retry.ObserveReceive(replaced_us + kLoopPeriodUs, UdpStatus::kSocketError,
+                         permanent);
+    EXPECT_FALSE(retry.open());
+    EXPECT_TRUE(retry.replacing());
+    for (uint64_t tick = replaced_us + 2 * kLoopPeriodUs;
+         tick < replaced_us + SocketRetry::kPeriodUs; tick += kLoopPeriodUs) {
+      EXPECT_EQ(retry.Poll(tick,
+                           [] {
+                             ADD_FAILURE() << "reopened before kPeriodUs";
+                             return true;
+                           }),
+                SocketRetry::Event::kNone)
+          << tick;
+    }
+    EXPECT_EQ(
+        retry.Poll(replaced_us + SocketRetry::kPeriodUs, [] { return true; }),
+        SocketRetry::Event::kReplaced);
+    now += 1'000'000;
+  }
 }
 
 #ifndef _WIN32

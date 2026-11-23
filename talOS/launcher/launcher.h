@@ -28,6 +28,7 @@
 #include "talOS/launcher/child_output.h"
 #include "talOS/launcher/describe_graph.h"
 #include "talOS/launcher/file_digest.h"
+#include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/roster.h"
 #include "talOS/launcher/service_notifier.h"
 #include "talOS/launcher/session.h"
@@ -77,9 +78,19 @@ bool CappedLogStopped(const std::string& log_path);
 // The signal a stopping session sends every running member's group, once.
 inline constexpr int kStopSignal = SIGINT;
 
+// How long a stopping session gives `hardware_node` after its kStopSignal to
+// exit before SIGKILLing it and proceeding to stop the remaining members
+// (two-phase shutdown, REQ-OPS-20).
+inline constexpr std::chrono::milliseconds kBridgeStopTimeout{500};
+
 // How long a stopping session gives a member after its kStopSignal before it
 // kills the member's group (SIGKILL; run reason stop_timeout).
 inline constexpr std::chrono::seconds kStopTimeout{2};
+
+// Refusal record written atomically under the log root on a phase-1 refusal
+// (not --describe-only or --replay-inputs), served on /drive when
+// --serve-refusal and --start-studio-bridge are set.
+inline constexpr std::string_view kLastRefusalFile = "last_refusal.json";
 
 // Whether a run ended by the stop signal the launcher sent it: the session's
 // stop signaled it (`kill_reason` kRunStop, or kRunStopTimeout when the
@@ -142,6 +153,17 @@ class Launcher {
   // Run's body, with the launcher's output taken. A launch that starts the
   // roster installs `stop_signals` before it creates anything.
   int RunSession(StopSignals& stop_signals);
+
+  // Records a phase-1 refusal atomically to `<log_root_>/last_refusal.json`
+  // (when not --describe-only and not --replay-inputs). When
+  // `options_.serve_refusal && options_.start_studio_bridge` (and the bundle
+  // carries Studio), runs the Studio bridge in refusal mode until a stop
+  // signal, `--duration-s` (if > 0), or the bridge's own exit (e.g.
+  // EADDRINUSE when another session holds the port), stops it cleanly, and
+  // still returns 1.
+  int RefuseLaunch(std::string_view reason,
+                   const config::RobotConfig* robot_config,
+                   StopSignals& stop_signals);
 
   // Replaces manifest.json with the session's state and `procs`. Before the
   // first node starts, and for the final manifest, it is written here and in
@@ -249,10 +271,26 @@ class Launcher {
     RunLiveness liveness;
     LivenessLimits limits{};
     bool heartbeat_killed{false};
-    // Event log flags of its registry rows already reported (NoteRecording).
+    // Event log flags of its registry rows already reported on stderr
+    // (NoteRecording, once per member and kind).
     uint32_t recording_reported{0};
-    // This run's realtime outcome was seen in its row (NoteRealtime).
-    bool realtime_reported{false};
+    // Whether this run already recorded kFlagRecorderFailed into
+    // proc.recorder_failed_logs (cleared by NewRun so a later run's failure is
+    // still recorded per run even after recording_reported suppressed stderr).
+    bool run_recorder_failed{false};
+    // This run's realtime outcome last seen in its row (NoteRealtime), so
+    // late refused bits (e.g. kStepRingLock) added after an initial full or
+    // partial grant are still warned about and merged into the manifest.
+    std::optional<process::RealtimeOutcome> realtime_seen;
+    // This run's loop has started: its registry row was seen active without
+    // kFlagConstructing and with either a realtime outcome or a dispatch.
+    // Cleared by NewRun.
+    bool loop_started{false};
+    // For the hardware bridge: whether this run's `/hw/status`
+    // `protocol_version_id` was already observed and checked against
+    // `protocol::kProtocolVersion`. Reset by NewRun so a restarted bridge is
+    // checked again.
+    bool protocol_checked{false};
     // The member answered --describe: its runs' live endpoints are compared
     // with `declared` (CheckEndpoints), once per run, after the run's row
     // has published them; `endpoints_checked` says this run's was.
@@ -333,10 +371,22 @@ class Launcher {
   // run it shortened capped (`<log>.capped`, `log_capped`).
   static uint64_t RestartLogBudget(NodeProcessInfo& proc, uint64_t budget);
 
+  // Observer reader on the bridge's declared `/hw/status` topic, opened after
+  // session segments are created and destroyed before they are unlinked so
+  // Supervise checks `protocol_version_id` once per bridge run (LOG-16).
+  struct BridgeStatusObserver;
+
   // Starts `proc`'s pending run: restart `restart_count + 1` into a fresh
   // event log or, when no run has spawned yet, the first. The attempt counts
   // against the rolling budget whether or not it spawns.
-  void Restart(NodeProcessInfo& proc, NodeLaunch& launch, SupervisionTime now);
+  void Restart(NodeProcessInfo& proc, NodeLaunch& launch, SupervisionTime now,
+               BridgeStatusObserver* status_observer);
+
+  // Checks the bridge's live `/hw/status` `protocol_version_id` once per
+  // bridge run, warning once to stderr + talos.log when it differs from
+  // `protocol::kProtocolVersion`.
+  void CheckBridgeProtocol(const NodeProcessInfo& proc, NodeLaunch& launch,
+                           BridgeStatusObserver* status_observer) const;
 
   // A run's registry row reports its loop's realtime outcome once the node
   // asked for it, or decided not to (introspect::RealtimeOf; introspection
@@ -396,9 +446,11 @@ class Launcher {
   // restart do not hold the session open. Between passes it sleeps until
   // the earliest deadline a pass decides on, woken at once by a child's exit
   // or a stop signal (SupervisionWakeup; README "Supervision passes").
-  void Supervise(std::vector<NodeProcessInfo>& procs,
+  void Supervise(SessionManifest& manifest, std::vector<NodeProcessInfo>& procs,
                  std::vector<NodeLaunch>& launches,
                  std::optional<StudioBridge>& studio,
+                 std::optional<std::size_t> sim_gateway_index,
+                 BridgeStatusObserver* status_observer,
                  std::chrono::steady_clock::time_point deadline);
 
   // One supervision pass over a running member other than Studio's bridge:
@@ -409,7 +461,8 @@ class Launcher {
   // clock reads around that row read (RunLiveness::Watch). Returns whether
   // `proc` changed.
   bool WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
-                const introspect::RegistryMapping* registry);
+                const introspect::RegistryMapping* registry,
+                BridgeStatusObserver* status_observer);
 
   // Fills `launch` for a member's first run: its supervision settings and
   // the command line it is spawned with, its event log capped at
@@ -423,22 +476,28 @@ class Launcher {
                      NodeLaunch& launch) const;
 
   LauncherOptions options_;
+  // Log root directory (--output-dir before /<session_id> is appended).
+  std::string log_root_;
   SessionManifest session_manifest_;
-  std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
   // Set by Run from --max-restarts or the config, and the window.
   RestartLimits restart_limits_{};
-  // The launcher's stdout and stderr while Run runs; empty otherwise.
-  std::optional<LauncherOutput> launcher_output_;
-  // Drains every member's output for the session (Run), echoing through
-  // launcher_output_; empty before it.
-  std::optional<ChildOutput> output_;
   // Held by Run for the session, refreshed by Supervise; null without one.
   const SessionLock* session_lock_{nullptr};
   // The new session directory's lock (CreateSessionDirectory), held until
   // Run returns, so no launch's retention, in any shared-memory namespace,
   // removes the directory while this launch writes it; refreshed by
-  // Supervise with the session lock.
+  // Supervise with the session lock. Declared before the output and manifest
+  // writers so exception unwinding destroys them while the directory stays
+  // locked.
   std::optional<SessionDirectoryLock> session_directory_;
+  // The launcher's stdout and stderr while Run runs; empty otherwise.
+  std::optional<LauncherOutput> launcher_output_;
+  // Drains every member's output for the session (Run), echoing through
+  // launcher_output_; empty before it.
+  std::optional<ChildOutput> output_;
+  // Declared after session_directory_ and launcher_output_ so its background
+  // thread stops and joins before either is destroyed on exception unwind.
+  std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
   // A critical member's first run's live endpoints differed from its probe
   // and --allow-graph-errors was not given (CheckEndpoints): Supervise stops
   // the session and Run returns 1.

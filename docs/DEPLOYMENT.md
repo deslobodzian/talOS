@@ -24,7 +24,10 @@ bazel build --config=release //bench/main_processor:bench_bundle
 ```
 
 `--config=release` stamps the build: the bundle records the git revision of
-the workspace Bazel runs in and whether that tree had uncommitted changes.
+the workspace Bazel runs in and whether that tree had uncommitted changes
+(`git_revision` and `git_dirty`), and when a separate robot repository builds
+against a talOS git checkout, talOS's revision and dirty state as well
+(`talos_git_revision` and `talos_git_dirty`).
 The config (`build:release --stamp`) is in [`talos.bazelrc`](../talos.bazelrc),
 which talOS's `.bazelrc` and every robot repository's import; the revision
 comes from the `--workspace_status_command` each workspace's own `.bazelrc`
@@ -46,7 +49,7 @@ subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
 `studio_bridge` (`//studio/bridge:studio_bridge`) and `studio_webroot`
 (`//studio:web_dist`, the built site), both or neither; the build fails when
 `studio_bridge` is not the config's `[studio] bridge` (when it sets one) or
-the site has no `index.html`. The bench robot and `tools/new_robot`'s robots
+the site has no `index.html` or `drive.html`. The bench robot and `tools/new_robot`'s robots
 inside talOS set both, which add about 2.5 MB; a robot repository made by
 `new_robot --standalone` sets neither, so its deployed robot has no driver
 dashboard until someone builds the pages and adds
@@ -65,7 +68,7 @@ It writes the bundle directory `bazel-bin/<package>/<name>/`
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `studio/` | with `studio_bridge` and `studio_webroot` only: the bridge binary (`studio/studio_bridge`) and the site it serves (`studio/webroot/`) |
 | `config/` | the robot config and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
-| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; from a `testonly` `talos_bundle`, `testonly = true` ([install](#on-the-main-processor) refuses it); with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
+| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty` (and, when a separate robot repository is built against a talOS git checkout, `talos_git_revision` and `talos_git_dirty`); from a `testonly` `talos_bundle`, `testonly = true` ([install](#on-the-main-processor) refuses it); with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
 
 The bundle holds no symlinks. Bazel may restore a tree artifact from its
 disk or remote cache with each symlink in it replaced by a copy of its
@@ -77,10 +80,16 @@ library; the process stays the one the launcher started. The runtime's
 repository is left out of each node's runfiles and staged once under
 `python/`, and the interpreter's other names there (`python`, `python3.11`,
 which Bazel's runfiles hold as copies of it) are such scripts too, so the
-bundle holds the interpreter once, however many Python nodes it carries. The
-build fails when two nodes carry different files under one runtime's name.
+bundle holds the interpreter once, however many Python nodes it carries. On
+Linux, when the bundled interpreter is an ELF binary that does not list
+`libpython*` in `DT_NEEDED` and no other ELF binary or shared library in the
+bundle does either, unused `libpython3*.so*` shared libraries are omitted
+from the runtime's `lib/` (macOS `.dylib` runtimes and dynamically linked
+Linux runtimes keep them). The build fails when two nodes carry different
+files under one runtime's name.
 
-The launcher copies `config_sha256`, `git_revision` and `git_dirty` into every
+The launcher copies `config_sha256`, `git_revision` and `git_dirty` (plus
+`talos_git_revision` and `talos_git_dirty` when present) into every
 session manifest, and records each member's binary SHA-256 again when the
 session starts ([session manifest](../talOS/launcher/README.md#session-manifest)).
 A digest covers only the file under `bin/`: not a C++ node's shared libraries
@@ -99,8 +108,15 @@ changes it.
 A robot's bundle config is a field overlay of its simulation config: the
 bench's `robot_bench.toml` includes the base
 [robot config](../bench/main_processor/configuration/robot.toml) and changes
-only `[robot] controller_address`, to the RoboRIO's `10.56.87.2` (and restates
-`commissioned = false`). Simulation and its tests keep using the base config
+`[robot] controller_address` to the RoboRIO's `10.56.87.2` (and restates
+`commissioned = false`). A field overlay for a multi-homed companion can also
+set `[robot] local_address` to the companion's Ethernet IPv4 address (matching
+the RoboRIO build's `-Pcompanion=<ipv4>`) so `hardware_node` binds that
+interface on every socket open and reopen rather than `0.0.0.0`; leaving it
+unset on a non-loopback target emits a non-fatal warning during
+`--describe-only` and `deploy.sh install`'s graph check
+([controller addressing](../talOS/launcher/README.md#controller-addressing)).
+Simulation and its tests keep using the base config
 with loopback (`127.0.0.1`), so no source edits are needed when switching
 between simulation and the field bundle. Such an overlay does not change CAN
 ids or commissioning: hardware must still be checked and commissioned through
@@ -120,20 +136,25 @@ warning, when the bundled bridge cannot run on the robot (it does not answer
 `--describe`), and from a checkout whose bridge is not built (the warning
 gives the `bazel build` command).
 
-To bring up the bundle against a different controller address without editing
-the config, run `./run.sh --remote <ip>` (for example,
-`./run.sh --remote 10.56.87.3`). This overrides the effective address for that
-launch; use `--remote-port` and `--local-port` if the ports also differ.
+To bring up the bundle against a different controller or companion interface
+address without editing the config, run `./run.sh --remote <ip>` (for example,
+`./run.sh --remote 10.56.87.3 --local-address 10.56.87.5`). These override
+`[robot] controller_address` and `[robot] local_address` for that launch; use
+`--remote-port` and `--local-port` if the ports also differ.
 
-An installed bundle runs simulated with `./run.sh --sim --remote 127.0.0.1`:
-`--sim` requires the loopback remote, and the hardware bridge's `--describe`
-probe and its runs both get the effective one
+An installed bundle runs simulated with `./run.sh --sim --remote 127.0.0.1`
+(plus `--local-address 127.0.0.1` if the bundle's config sets `[robot]
+local_address` to a physical interface):
+`--sim` requires the loopback remote and an unset or loopback local address,
+and the hardware bridge's `--describe` probe and its runs both get the
+effective values
 ([controller addressing](../talOS/launcher/README.md#controller-addressing)).
-A bundle carries no simulator (`--start-sim-gateway` reports the
-`[robot] sim_gateway` binary missing from the bundle), so something else must stand in for the
-RoboRIO on that host: a `sim_gateway` run from a checkout with `--config`
-naming the bundle's config, which then uses that config's `[robot]
-controller_port` and `local_port`, or the RoboRIO program under WPILib
+A bundle intentionally carries no simulator (`--start-sim-gateway` reports the
+`[robot] sim_gateway` binary missing from the bundle): deployed bundles carry
+only robot code and its config, so running a bundle simulated uses an external
+simulator standing in for the RoboRIO on that host—a `sim_gateway` run from a
+checkout with `--config` naming the bundle's config (which uses that config's
+`[robot] controller_port` and `local_port`), or the RoboRIO program under WPILib
 simulation. A launch that changes the ports with `--remote-port` and
 `--local-port` needs the same values given to a hand-run `sim_gateway` as
 `--port` and `--remote-port`.
@@ -198,9 +219,11 @@ A relative `--prefix` is resolved against the working directory.
   that step's processes, selects nothing, removes the copy and exits 128
   plus the signal's number, so no stray `bundles/<stamp>` is left for
   `prune` to count among the newest.
-- **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
+- **enable-boot** starts `<prefix>/current/run.sh --serve-refusal` at
   boot as `--user` (default `talos`; the account must exist), so a booted
-  robot serves the Studio its bundle carries ([above](#build-a-bundle)).
+  robot serves the Studio its bundle carries ([above](#build-a-bundle)) and
+  serves a phase-1 refusal reason on `/drive` if startup is refused
+  ([refusal visibility](../talOS/launcher/README.md#refusal-visibility---serve-refusal)).
   Linux: writes and enables
   `/etc/systemd/system/talos.service` (`Type=notify`, `Restart=always`, a
   three-second supervision watchdog, a stop through the launcher alone
@@ -210,7 +233,10 @@ A relative `--prefix` is resolved against the working directory.
   nodes request). macOS: refuses while FileVault is on (`fdesetup status`
   is anything but `FileVault is Off.`), since the daemon then cannot start
   until someone logs in; sets `pmset -a autorestart 1 sleep 0` (power back on
-  after a power loss, never sleep while idle); writes the
+  after a power loss, never sleep while idle; as defense-in-depth independent of
+  `pmset`, the launcher also holds a macOS IOKit `PreventSystemSleep` assertion
+  for every running session,
+  [sleep prevention](../talOS/launcher/README.md#sleep-prevention)); writes the
   LaunchDaemon `/Library/LaunchDaemons/org.talos.robot.plist` (`KeepAlive`,
   `ProcessType` `Interactive`, stderr to `/Library/Logs/talos/launchd.stderr.log`,
   [below](#boot-service-output)) and the rotation rule
@@ -266,7 +292,8 @@ A relative `--prefix` is resolved against the working directory.
 - **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`),
   oldest first by the `start_wall_ns` their manifest records (the directory's
   modification time without one; session ids are not ordered in time), each
-  with its start, `git_revision` (and `dirty`), the launcher's match
+  with its start, `git_revision` (and `dirty`, plus `talos_git_revision` /
+  `talos_git_dirty` when present), the launcher's match
   classification from its `session_class` file (`match`, `other`, `unknown`,
   or `unclassified` before retention has read it; a `--sim` session is never
   classified, so it stays `unclassified`) and its runs counted by
@@ -550,11 +577,12 @@ stops the service deliberately. Notifications use `NOTIFY_SOCKET` directly,
 including Linux abstract (`@...`) Unix datagram sockets, without libsystemd.
 
 A stop goes through the launcher alone. `KillMode=mixed` sends systemd's
-SIGTERM only to the launcher, which stops the session in order: SIGINT to
-each member, SIGKILL to any still alive 2 s later (`stop_timeout` in the
-[session manifest](../talOS/launcher/README.md#session-manifest)), then
-the final manifest. systemd SIGKILLs whatever remains once the launcher
-exits, or at `TimeoutStopSec=90`: 90 s against the launcher's 2 s, so the
+SIGTERM only to the launcher, which stops the session in two phases: first
+SIGINT to `hardware_node` (SIGKILL if still alive 500 ms later), then SIGINT to
+the remaining members (SIGKILL to any still alive 2 s later; `stop_timeout` in
+the [session manifest](../talOS/launcher/README.md#session-manifest)), then the
+final manifest. systemd SIGKILLs whatever remains once the launcher exits, or
+at `TimeoutStopSec=90`: 90 s against the launcher's up to 2.5 s, so the
 launcher's own escalation and its final write always come first. systemd's
 default, `KillMode=control-group`, would SIGTERM every member as well, and
 a member that does not hold a stop while starting (`hardware_node`, the
@@ -562,8 +590,9 @@ simulated gateway, the Studio bridge: none declares `holds_stop`; a
 framework node holds it) would die of a signal the launcher did not send,
 ending the session 255 and the unit failed. launchd
 needs no such setting: stopping the job (`launchctl bootout`) sends SIGTERM
-to the launcher's process alone, SIGKILL after its `ExitTimeOut` (not set
-in the plist, so launchd's system-defined default; `man launchd.plist`),
+to the launcher's process alone, SIGKILL after `ExitTimeOut` (90 s, set
+explicitly in the plist to match systemd's `TimeoutStopSec=90` rather than
+relying on launchd's system-defined default; `man launchd.plist`),
 and when the launcher exits kills only the launcher's own process group,
 which no member is in.
 
@@ -597,15 +626,51 @@ reader's time namespace, so a node in another would judge live claims dead.
 
 ## RoboRIO
 
-`controller_processor/rio` is deployed with GradleRIO
-(`./gradlew deploy` in that directory). It sends to the companion address it
-was built with, port 5803: `10.56.87.11` unless the main processor's address
-differs, then `./gradlew deploy -Pcompanion=<ipv4>`
-([RoboRIO](../talOS/hardware/README.md#roborio)). Deployed from a copy with no
-git history, add `-PtalosRevision=<first 16 hex digits of its commit>
--PtalosDirty=true|false` (whether the copy differs from that commit) so its
-State still names the build; from a git checkout the build refuses them
-([build stamp](../talOS/hardware/README.md#roborio)).
+`controller_processor/rio` is built and deployed with GradleRIO. talOS has no
+built-in team number or companion address:
+
+- Every RoboRIO target build (`buildRio` or `deploy`) requires
+  `-Pcompanion=<ipv4>` on the command line — the main processor's IPv4 address
+  (port 5803; refused from `gradle.properties` or the environment,
+  [RoboRIO](../talOS/hardware/README.md#roborio)). Desktop `phoenixTest` and
+  `simulateNative` use `127.0.0.1` and need neither `-Pcompanion` nor a team
+  number.
+- `deploy` also requires a team number: pass `-PteamNumber=<team>` on the
+  command line, or provide `.wpilib/wpilib_preferences.json` with
+  `"teamNumber"` in the robot repository.
+
+From a robot repository, build and deploy through Bazel without touching the
+pinned talOS checkout:
+
+```sh
+bazel run @talos//controller_processor/rio:gradlew -- buildRio -Pcompanion=<ipv4>
+bazel run @talos//controller_processor/rio:gradlew -- deploy -Pcompanion=<ipv4>                 # uses .wpilib/wpilib_preferences.json
+bazel run @talos//controller_processor/rio:gradlew -- deploy -PteamNumber=<team> -Pcompanion=<ipv4>
+```
+
+`@talos//controller_processor/rio:gradlew` stages the Gradle project and the
+`talOS/` sources it compiles into a cache directory (`$XDG_CACHE_HOME/talos/rio`
+or `~/.cache/talos/rio`, keyed by both the talOS root and the calling workspace
+and preferences so concurrent robot repositories sharing one talOS checkout do
+not collide, and serialized with an exclusive lock across staging and Gradle),
+computes `-PtalosRevision` and `-PtalosDirty` from the pinned talOS git work
+tree before copying (refusing caller-supplied `talosRevision` or `talosDirty`
+overrides when a git checkout stamp exists), and forwards the robot
+repository's `.wpilib/wpilib_preferences.json` (if present). From a talOS
+checkout directly, run `(cd controller_processor/rio && ./gradlew deploy
+-PteamNumber=<team> -Pcompanion=<ipv4>)` (or `bazel run
+//controller_processor/rio:gradlew -- ...`).
+
+Deployed from a copy with no talOS git history — including when a robot
+repository fetches talOS via `git_override` or an archive (so Bazel's external
+`@talos` repository contains no `.git` directory), or a copy placed inside an
+unrelated git repository whose work-tree root does not match the talOS root —
+`@talos//controller_processor/rio:gradlew` builds with revision `0`
+(`"unknown"`) unless `-PtalosRevision=<first 16 hex digits of its commit>
+-PtalosDirty=true|false` (whether the copy differs from that commit) is passed
+on the command line; inside a talOS git checkout itself (including
+`local_path_override` or a git submodule), both the runner and `build.gradle`
+refuse those overrides ([build stamp](../talOS/hardware/README.md#roborio)).
 Deploy it from the talOS checkout the main-processor bundle was built
 against (the one a robot repository's `MODULE.bazel` names): each side
 rejects frames of another protocol version (currently 11; see

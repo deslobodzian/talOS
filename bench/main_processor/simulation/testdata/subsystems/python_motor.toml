@@ -1,0 +1,35 @@
+# Simulation-only 20 ms Python actuator owner for the bench soak graph
+# (testdata/robot_soak.toml, which sets simulation_only = true). Uses virtual
+# CAN id 20 (unused on the physical bench) and shares joystick 0 axis 1 with
+# motor so teleop drives both during teleop legs while auto_producer drives
+# both during autonomous legs.
+[subsystem]
+name = "python_motor"
+node = "//bench/main_processor/simulation/testdata/nodes:python_motor"
+period_us = 20000
+max_bench_voltage_v = 2.0
+
+[motors.python_kraken]
+type = "TalonFX"
+bus = "Shooter"
+can_id = 20
+motor_type = "kraken_x44"
+inverted = false
+brake = false
+supply_limit_a = 30.0
+stator_limit_a = 40.0
+max_voltage = 2.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 30.0
+cruise_velocity_rps = 10.0
+acceleration_rps2 = 20.0
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.095, a = 0.0, g = 0.0 }
+
+[teleop]
+defaults = { mode = "VOLTAGE", voltage_v = 0.0, velocity_rps = 0.0, voltage_frac = 0.0, torque_current_a = 0.0 }
+
+[[teleop.bindings]]
+axis = 1
+field = "voltage_frac"
+scale = -1.0
+deadband_frac = 0.1

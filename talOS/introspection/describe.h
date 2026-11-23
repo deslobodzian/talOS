@@ -95,10 +95,13 @@ struct Description {
 };
 
 // The declared graph a framework node reads (telemetry observes every state
-// topic in it, teleop finds each lane's schema in it): the descriptions of
-// every node in the session that does not read the graph itself, schema
-// bytes included. The launcher writes it as DeclaredGraphToJson and passes
-// its path as `--graph`; testing::Sim builds it from the nodes added so far.
+// and status topic in it, teleop finds each lane's schema in it): the
+// descriptions of every node in the session that does not read the graph
+// itself, plus the Pass-1 static non-`telemetry`-role `SENDER` endpoints of
+// other graph-reading nodes (each reader strips its own entry when loading
+// `--graph`, so a reader never sees itself), schema bytes included. The
+// launcher writes it as DeclaredGraphToJson and passes its path as `--graph`;
+// testing::Sim builds the same view from the nodes added so far.
 using DeclaredGraph = std::vector<Description>;
 
 inline constexpr std::string_view kBase64Alphabet =

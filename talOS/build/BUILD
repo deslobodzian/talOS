@@ -1,12 +1,13 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load(
     ":contract.bzl",
     "TALOS_TOPIC_ABBREVIATIONS",
     "TALOS_TOPIC_DIRECTION_SUFFIXES",
     "TALOS_TOPIC_ROLES",
     "talos_sim",
+    "talos_sim_test",
     "talos_topic_problem",
 )
 
@@ -17,6 +18,30 @@ exports_files([
     # The check talos_sim_test runs.
     "sim_check.py",
 ])
+
+# Free wildcard UDP port pair selection for test and tool launches.
+py_library(
+    name = "udp_ports",
+    srcs = ["udp_ports.py"],
+    visibility = ["//visibility:public"],
+)
+
+# unit (REQ-DEV-25, REQ-DEV-30): UDP port helpers pick two distinct free
+# 0.0.0.0 ports below the OS ephemeral range and reject ports held on
+# non-loopback addresses.
+py_test(
+    name = "udp_ports_test",
+    size = "small",
+    srcs = [
+        "sim_check.py",
+        "udp_ports_test.py",
+    ],
+    legacy_create_init = False,
+    deps = [
+        ":udp_ports",
+        "@rules_python//python/runfiles",
+    ],
+)
 
 # Unlinks the test namespace's live registry after talos_sim_test's session
 # (sim_check.py).
@@ -76,7 +101,82 @@ py_test(
         "SIM": "$(rlocationpath :no_state_sim)",
     },
     legacy_create_init = False,
-    tags = ["e2e"],
+    # Spawns an instrumented launcher and members (each spawn is two fork()s
+    # plus exec); under macOS TSan one fork costs ~120 ms and an empty main
+    # ~194 ms of kernel CPU (vs 0.5/2 ms plain), so on a 3-vCPU hosted runner
+    # session start-up overruns the 14 s ready bound (TODO.md CI-13). The
+    # Linux sanitizer legs still run this test.
+    tags = [
+        "e2e",
+        "no_macos_sanitizer",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+# The session sim_check_studio_pass_test judges: telemetry, the hardware
+# bridge, sim_gateway, and the testdata studio_bridge stub.
+talos_sim(
+    name = "studio_sim",
+    testonly = True,
+    config = "//talOS/build/testdata/sim_check:studio_robot.toml",
+    data = [
+        "//talOS/build/testdata/sim_check:studio_bridge",
+        "//talOS/simulation:sim_gateway",
+    ],
+    nodes = ["//talOS/telemetry:node"],
+)
+
+# e2e (REQ-DEV-30, REQ-OPS-30, REQ-OPS-34): talos_sim_test(studio = True)
+# passes when studio_bridge is present, binds an ephemeral HTTP port, settles,
+# and exits cleanly on SIGINT.
+talos_sim_test(
+    name = "sim_check_studio_pass_test",
+    sim = ":studio_sim",
+    studio = True,
+    # Same macOS TSan fork/exec overhead as sim_check_no_state_test (CI-13).
+    tags = ["no_macos_sanitizer"],
+)
+
+# Same config without studio_bridge in runfiles: the launcher drops the
+# unanswered bridge from the roster and manifest (DropUnansweredStudioBridge),
+# which sim_check_studio_test proves sim_check(studio=True) catches.
+talos_sim(
+    name = "missing_studio_sim",
+    testonly = True,
+    config = "//talOS/build/testdata/sim_check:studio_robot.toml",
+    data = ["//talOS/simulation:sim_gateway"],
+    nodes = ["//talOS/telemetry:node"],
+)
+
+# e2e (REQ-DEV-30, REQ-OPS-30, REQ-OPS-34): sim_check(studio=True) fails
+# cleanly without hanging when studio_bridge is missing from the session
+# manifest, and judge(studio=True) rejects missing/bad http_port, restarts,
+# recorder_failed, and nonzero exit/signal.
+py_test(
+    name = "sim_check_studio_test",
+    size = "medium",
+    timeout = "short",
+    srcs = [
+        "sim_check.py",
+        "sim_check_studio_test.py",
+    ],
+    data = [
+        ":missing_studio_sim",
+        ":registry_unlink",
+        "//talOS/launcher:log_dump",
+        "//talOS/launcher:session_report",
+    ],
+    env = {
+        "LOG_DUMP": "$(rlocationpath //talOS/launcher:log_dump)",
+        "MISSING_STUDIO_SIM": "$(rlocationpath :missing_studio_sim)",
+        "REGISTRY_UNLINK": "$(rlocationpath :registry_unlink)",
+    },
+    legacy_create_init = False,
+    # Same macOS TSan fork/exec overhead as sim_check_no_state_test (CI-13).
+    tags = [
+        "e2e",
+        "no_macos_sanitizer",
+    ],
     deps = ["@rules_python//python/runfiles"],
 )
 
@@ -87,15 +187,20 @@ py_binary(
     srcs = ["bundle_builder.py"],
 )
 
+# Over 5 s on 4-vCPU CI (6.5 s), integration lane: executes bundle_builder.py,
+# workspace_status.sh, and real git subprocesses across temporary repositories.
 py_test(
     name = "bundle_builder_test",
     size = "small",
     srcs = ["bundle_builder_test.py"],
     data = [
         "bundle_builder.py",
+        "launcher_runner.py",
         "//tools:deploy.sh",
+        "//tools:workspace_status.sh",
     ],
     legacy_create_init = False,
+    tags = ["integration"],
     deps = ["@rules_python//python/runfiles"],
 )
 
@@ -108,6 +213,7 @@ cc_binary(
     deps = [
         "//talOS/schema:schema_hash",
         "//talOS/schema:unit_suffix",
+        "//talOS/schema:verify",
         "@flatbuffers//:runtime_cc",
     ],
 )
@@ -140,16 +246,26 @@ py_test(
     size = "small",
     srcs = ["descriptor_gen_lint_test.py"],
     data = [
+        "contract.bzl",
         "lint_fixtures/bad.bfbs",
         "lint_fixtures/good.bfbs",
         "lint_fixtures/included.bfbs",
+        "testdata/lint_test/bad.fbs",
+        "testdata/lint_test/good.fbs",
+        "testdata/lint_test/included.fbs",
         ":descriptor_gen",
+        "@flatbuffers//:flatc",
     ],
     env = {
+        "TALOS_CONTRACT_BZL": "$(rlocationpath contract.bzl)",
         "TALOS_DESCRIPTOR_GEN": "$(rlocationpath :descriptor_gen)",
+        "TALOS_FLATC": "$(rlocationpath @flatbuffers//:flatc)",
         "TALOS_LINT_BAD": "$(rlocationpath lint_fixtures/bad.bfbs)",
+        "TALOS_LINT_BAD_FBS": "$(rlocationpath testdata/lint_test/bad.fbs)",
         "TALOS_LINT_GOOD": "$(rlocationpath lint_fixtures/good.bfbs)",
+        "TALOS_LINT_GOOD_FBS": "$(rlocationpath testdata/lint_test/good.fbs)",
         "TALOS_LINT_INCLUDED": "$(rlocationpath lint_fixtures/included.bfbs)",
+        "TALOS_LINT_INCLUDED_FBS": "$(rlocationpath testdata/lint_test/included.fbs)",
     },
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
@@ -159,8 +275,8 @@ py_test(
 # authority is naming::CheckTopicName. Each line of the verdicts file is
 # `<kind> <entry> <ok|bad> <topic>`: a `name` probe for each name below, and
 # one probe per role, abbreviation (`<wrong>><right>`) and direction suffix
-# in contract.bzl's tables, so the test also sees an entry either side adds
-# or drops.
+# in contract.bzl's tables (in both qualifier and owner positions), so the
+# test also sees an entry either side adds or drops.
 _GRAMMAR_NAMES = [
     "/hw/state",
     "/hw/state/driver_station",
@@ -202,9 +318,23 @@ _GRAMMAR_PROBES = [("name", "-", topic) for topic in _GRAMMAR_NAMES] + [
     for wrong, right in TALOS_TOPIC_ABBREVIATIONS.items()
 ] + [
     (
+        "owner_abbreviation",
+        wrong + ">" + right,
+        "/" + wrong + "/state",
+    )
+    for wrong, right in TALOS_TOPIC_ABBREVIATIONS.items()
+] + [
+    (
         "suffix",
         suffix,
         "/hw/state/x" + suffix,
+    )
+    for suffix in TALOS_TOPIC_DIRECTION_SUFFIXES
+] + [
+    (
+        "owner_suffix",
+        suffix,
+        "/x" + suffix + "/state",
     )
     for suffix in TALOS_TOPIC_DIRECTION_SUFFIXES
 ]

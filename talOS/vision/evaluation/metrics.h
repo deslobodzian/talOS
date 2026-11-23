@@ -104,13 +104,16 @@ JitterStats SecondDifferenceJitter(
   return stats;
 }
 
-// The q-quantile (0..1) of `values` by nearest rank; NaN when empty.
+// The q-quantile (0..1) of non-NaN `values` by nearest rank; NaN when empty or
+// `q` is non-finite.
 inline double Quantile(std::vector<double> values, double q) {
+  if (!std::isfinite(q)) return std::numeric_limits<double>::quiet_NaN();
+  std::erase_if(values, [](double v) { return std::isnan(v); });
   if (values.empty()) return std::numeric_limits<double>::quiet_NaN();
   std::sort(values.begin(), values.end());
   const auto rank = static_cast<std::size_t>(
       std::ceil(std::clamp(q, 0.0, 1.0) * static_cast<double>(values.size())));
-  return values[rank == 0 ? 0 : rank - 1];
+  return values[rank == 0 ? 0 : std::min(rank, values.size()) - 1];
 }
 
 }  // namespace talos::vision::evaluation

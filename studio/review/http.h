@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 
+#include "studio/bridge/static_files.h"
 #include "studio/review/review.h"
 
 namespace studio::review {
@@ -31,7 +32,8 @@ std::string AllowedOrigin(std::string_view origin);
 
 // The largest file the static handler serves: a few times the built
 // Studio's largest asset, as the live bridge's cap.
-inline constexpr std::uintmax_t kMaxStaticFileBytes = std::uintmax_t{4} << 20;
+inline constexpr std::uintmax_t kMaxStaticFileBytes =
+    studio::kMaxStaticFileBytes;
 
 // The built Studio (//studio:web_dist) under `root` at URL path `url`, "/"
 // meaning index.html. 400 for a path holding '%' or '\\' (an encoded or

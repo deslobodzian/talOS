@@ -43,9 +43,9 @@ const talos::schema::Identity kSchema{"test.RingWords", 0x52494e47};
 // reader copies a slot only after acquiring the sequence the writer released
 // once the slot was filled. Under --config=tsan a publication made visible
 // before its slot is filled is reported as a data race whether or not a copy
-// happens to tear; the payload check is the oracle the plain build has. A
-// slot's reuse by a writer that laps its reader is a race by design, which
-// //talOS/rtms:ring_lap_test covers and the sanitizer does not.
+// happens to tear; the payload check is the oracle the plain build has. Slot
+// reuse when a writer laps its reader (using relaxed atomic word copies under
+// the seqlock) is covered under ThreadSanitizer by //talOS/rtms:ring_lap_test.
 TEST(RingHandoff, EveryReaderGetsEveryMessageIntactOnOneMapping) {
   constexpr std::size_t kSlots = 1024;
   constexpr std::uint64_t kMessages = kSlots - 1;

@@ -7,20 +7,12 @@
 import './drive.css';
 
 import {DriveModel, type DriveSocket, RECONNECT_MS, RENDER_MS} from './feed';
-import {type Layout, parseLayout} from './layout';
-import {DrawSchedule, esc, METRICS, outOfView, outOfViewText, Painter, renderShell, renderStatus, renderWidget, type Surface} from './view';
+import {type Layout, parseLayout, trackedChannels} from './layout';
+import {fetchAndParseLayout, LayoutReloader} from './reload';
+import {DrawSchedule, esc, gridStyle, METRICS, outOfView, outOfViewText, Painter, renderGridWidgets, renderShell, renderStatus, type Surface} from './view';
 
 const root = document.getElementById('drive')!;
 const now = () => performance.now();
-
-function tracked(layout: Layout): string[] {
-  const names: string[] = [];
-  for (const w of layout.widgets) {
-    if (w.kind === 'graph') names.push(...w.series);
-    if (w.kind === 'field') names.push(w.channels.x, w.channels.y);
-  }
-  return names;
-}
 
 async function loadLayout(): Promise<Layout> {
   for (;;) {
@@ -37,16 +29,18 @@ async function loadLayout(): Promise<Layout> {
 }
 
 async function run() {
-  const layout = await loadLayout();
+  let layout = await loadLayout();
   document.title = `${layout.title} · talOS`;
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const model = new DriveModel(`${scheme}//${location.host}/drive`,
                                // A WebSocket's handlers take an Event the model does not read.
                                url => new WebSocket(url) as unknown as DriveSocket,
-                               tracked(layout), layout);
+                               trackedChannels(layout), layout);
   model.clock = now;
   root.innerHTML = renderShell(layout);
+  const titleEl = root.querySelector<HTMLElement>('.top h1')!;
   const status = root.querySelector('.status-slot')!;
+  const drawError = root.querySelector('.draw-error')!;
   const grid = root.querySelector<HTMLElement>('.grid')!;
   const body = (e: Element) => e.querySelector<HTMLElement>('.body');
   // Each list widget's body shows whole rows only: its height snapped to a
@@ -65,6 +59,9 @@ async function run() {
     status: html => {
       status.innerHTML = html;
     },
+    drawError: html => {
+      drawError.innerHTML = html;
+    },
     create: html => {
       const template = document.createElement('template');
       template.innerHTML = html;
@@ -73,6 +70,9 @@ async function run() {
     put: (_index, next, previous) => {
       if (previous) grid.replaceChild(next, previous);
       else grid.appendChild(next);
+    },
+    remove: (_index, previous) => {
+      previous.remove();
     },
     fit,
     scrollTop: e => body(e)?.scrollTop ?? 0,
@@ -105,14 +105,47 @@ async function run() {
   grid.addEventListener('scroll', countOutOfView, {capture: true, passive: true});
   window.addEventListener('resize', countOutOfView);
   // A drawing fault must not stop the page or leave the grid looking
-  // current: Painter reports it, and the grid is marked until a good draw.
+  // current: Painter keeps the status line visible, shows DRAWING ERROR, and
+  // marks the grid until a good draw. A failed /drive/layout.json reload
+  // similarly keeps the status line live, shows LAYOUT ERROR, and marks the
+  // grid until a reload succeeds.
   const painter = new Painter(surface);
+  const reloader = new LayoutReloader(
+      layout,
+      signal => fetchAndParseLayout(
+          (url, init) => fetch(url, init), '/drive/layout.json', signal),
+      {
+        setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+        clearTimeout: handle => window.clearTimeout(handle)
+      },
+      {
+        isConnected: () => model.connection === 'open',
+        onLayout: (next, changed) => {
+          if (changed) {
+            layout = next;
+            model.setLayout(trackedChannels(next), next);
+            document.title = `${next.title} · talOS`;
+            titleEl.textContent = next.title;
+            grid.setAttribute('style', gridStyle(next));
+            painter.clearWidgets();
+          }
+          schedule.frame();
+        },
+        onError: () => {
+          schedule.frame();
+        }
+      });
+  model.onLayoutCheck = reason => reloader.trigger(reason);
+  model.onDisconnect = () => reloader.cancelPending();
+
   const schedule = new DrawSchedule(model, t => {
-    painter.paint(() => {
-      model.tick(t);
-      return {status: renderStatus(model, t, layout.skipped),
-              widgets: layout.widgets.map(w => renderWidget(w, model, t))};
-    });
+    painter.paint(
+        () => {
+          model.tick(t);
+          return renderStatus(model, t, layout.skipped);
+        },
+        () => renderGridWidgets(layout, model, t),
+        reloader.error);
     countOutOfView();
   }, {
     now,

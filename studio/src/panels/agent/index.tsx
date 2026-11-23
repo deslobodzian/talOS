@@ -101,5 +101,7 @@ export const agentPanel: PanelDefinition<AgentConfig> = {
   description: 'JSON-RPC queries against the same code path as the headless agent.',
   defaultConfig,
   parseConfig,
-  component: AgentPanel
+  component: AgentPanel,
+  recorded: false,
+  liveOnlyReason: 'Live-only: Agent runs JSON-RPC queries against the live telemetry worker and headless agent, which are not available for recorded sessions.'
 };

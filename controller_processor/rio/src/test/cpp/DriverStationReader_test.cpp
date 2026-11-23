@@ -8,7 +8,10 @@
 // events, never on time (TESTING.md §6.3); the clock is injected.
 #include "DriverStationReader.h"
 
+#include <frc/simulation/DriverStationSim.h>
 #include <gtest/gtest.h>
+#include <hal/HAL.h>
+#include <hal/simulation/DriverStationData.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +25,10 @@
 #include <vector>
 
 #include "driver_station/driver_station.h"
+
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 namespace {
 
@@ -223,7 +230,7 @@ void NoReport(std::string_view line) { ADD_FAILURE() << line; }
 // helper stopped mid-snapshot (B's flags and first axis written, a NetComm
 // call that has not returned), the loop's Read returns at once with the last
 // whole snapshot, A; once the helper finishes, B whole.
-// REQ-SAFE-13, REQ-RT-13, REQ-RT-24
+// REQ-RT-24
 TEST(DriverStationReader, ALoopReadIsOneWholeRefreshAndNeverWaitsForOne) {
   auto gate = std::make_shared<Gate>();
   const TestClock clock = MakeClock();
@@ -263,7 +270,7 @@ TEST(DriverStationReader, ALoopReadIsOneWholeRefreshAndNeverWaitsForOne) {
 // error: on the x86-64 test host a relaxed exchange compiles like an
 // acquire-release one. Ordering is covered only by a thread sanitizer run or
 // an ARM host (TODO.md BENCH-3).
-// REQ-SAFE-13
+// REQ-RT-24
 TEST(DriverStationReader, ReadsDuringConstantRefreshesSeeOnlyWholeRefreshes) {
   constexpr int kRefreshes = 10'000;
   auto gate = std::make_shared<Gate>();
@@ -403,7 +410,6 @@ TEST(DriverStationReader, ReportsTheModeOnlyWhileTheLoopTicks) {
 // and so does the destructor. The abandoned helper owns what it still
 // touches: once its refresh returns it exits, reporting no mode although the
 // loop had ticked, and lets its calls go.
-// REQ-RT-13
 TEST(DriverStationReader, StopAbandonsARefreshThatDoesNotReturn) {
   auto destroyed = std::make_shared<std::promise<std::size_t>>();
   std::future<std::size_t> released = destroyed->get_future();
@@ -434,6 +440,142 @@ TEST(DriverStationReader, StopAbandonsARefreshThatDoesNotReturn) {
             std::future_status::ready)
       << "the abandoned helper never exited";
   EXPECT_EQ(released.get(), 0u) << "the abandoned helper reported a mode";
+}
+
+// The real WPILib backend wiring: both timing bounds are 20 ms, the talos-ds
+// helper refreshes periodically on kWaitTimeoutUs without any Driver Station
+// notification, and HALSIM_NotifyDriverStationNewData wakes it to refresh and
+// publish the updated control word and joystick snapshot.
+// REQ-RT-24
+TEST(DriverStationReader, WpilibCallsRefreshPeriodicallyAndOnNewData) {
+  static_assert(DriverStationReader::kWaitTimeoutUs == 20'000);
+  static_assert(DriverStationReader::kLoopTickWindowUs == 20'000);
+  EXPECT_EQ(DriverStationReader::kWaitTimeoutUs, 20'000u);
+  EXPECT_EQ(DriverStationReader::kLoopTickWindowUs, 20'000u);
+
+  HAL_Initialize(500, 0);
+  struct ResetSimDs {
+    ~ResetSimDs() {
+      frc::sim::DriverStationSim::SetAutonomous(false);
+      frc::sim::DriverStationSim::SetTest(false);
+      frc::sim::DriverStationSim::SetEnabled(false);
+      frc::sim::DriverStationSim::SetJoystickAxisCount(0, 0);
+      frc::sim::DriverStationSim::SetJoystickButtonCount(0, 0);
+      frc::sim::DriverStationSim::SetJoystickPOVCount(0, 0);
+      frc::sim::DriverStationSim::NotifyNewData();
+    }
+  } reset_sim_ds;
+
+  frc::sim::DriverStationSim::SetDsAttached(true);
+  frc::sim::DriverStationSim::SetAutonomous(false);
+  frc::sim::DriverStationSim::SetTest(false);
+  frc::sim::DriverStationSim::SetEnabled(false);
+  frc::sim::DriverStationSim::SetJoystickAxisCount(0, 0);
+  frc::sim::DriverStationSim::SetJoystickButtonCount(0, 0);
+  frc::sim::DriverStationSim::SetJoystickPOVCount(0, 0);
+  frc::sim::DriverStationSim::NotifyNewData();
+
+  struct Probe {
+    std::mutex mutex;
+    std::condition_variable changed;
+    int refreshes{0};
+    int published_refreshes{0};
+    bool saw_enabled{false};
+    bool published_enabled{false};
+    std::string thread_name;
+  };
+  auto probe = std::make_shared<Probe>();
+  const auto wpilib = DriverStationReader::WpilibCalls();
+  DriverStationReader::Calls wrapped = wpilib;
+  wrapped.wait = [probe, wait = wpilib.wait] {
+    {
+      const std::lock_guard lock{probe->mutex};
+      probe->published_refreshes = probe->refreshes;
+      if (probe->saw_enabled) probe->published_enabled = true;
+    }
+    probe->changed.notify_all();
+    wait();
+  };
+  wrapped.refresh = [probe,
+                     refresh = wpilib.refresh](ds::DriverStationData& out) {
+    refresh(out);
+    {
+      const std::lock_guard lock{probe->mutex};
+#ifdef __linux__
+      if (probe->thread_name.empty()) {
+        char name[16] = {};
+        if (pthread_getname_np(pthread_self(), name, sizeof(name)) == 0) {
+          probe->thread_name = name;
+        }
+      }
+#endif
+      ++probe->refreshes;
+      if ((out.fms.flags &
+           (ds::kDsAttached | ds::kEnabled | ds::kAutonomous)) ==
+              (ds::kDsAttached | ds::kEnabled | ds::kAutonomous) &&
+          out.joysticks[0].connected) {
+        probe->saw_enabled = true;
+      }
+    }
+    probe->changed.notify_all();
+  };
+
+  const TestClock clock = MakeClock();
+  {
+    DriverStationReader reader{std::move(wrapped), ClockThrough(clock),
+                               NoReport, std::chrono::seconds{5}};
+    reader.Start(0);
+    reader.Read(kT0, kTimeoutUs);
+
+    // Without any new-data notification, kWaitTimeoutUs (20 ms) still drives
+    // periodic refreshes and publishes a fresh snapshot.
+    {
+      std::unique_lock lock{probe->mutex};
+      ASSERT_TRUE(probe->changed.wait_for(lock, std::chrono::seconds{5}, [&] {
+        return probe->published_refreshes >= 2;
+      })) << "WpilibCalls did not refresh periodically on kWaitTimeoutUs";
+    }
+    const ds::DriverStationData periodic = reader.Read(kT0, kTimeoutUs);
+    EXPECT_EQ(reader.refreshed_us(), kT0);
+    EXPECT_EQ(periodic.fms.flags & ds::kEnabled, 0u);
+#ifdef __linux__
+    {
+      const std::lock_guard lock{probe->mutex};
+      EXPECT_EQ(probe->thread_name, "talos-ds");
+    }
+#endif
+
+    // HALSIM_NotifyDriverStationNewData wakes the helper to refresh and
+    // publish the new control word and joystick snapshot.
+    clock->store(kT0 + 5'000);
+    frc::sim::DriverStationSim::SetDsAttached(true);
+    frc::sim::DriverStationSim::SetAutonomous(true);
+    frc::sim::DriverStationSim::SetEnabled(true);
+    frc::sim::DriverStationSim::SetJoystickAxisCount(0, 2);
+    frc::sim::DriverStationSim::SetJoystickAxis(0, 0, 0.5);
+    frc::sim::DriverStationSim::SetJoystickAxis(0, 1, -0.25);
+    frc::sim::DriverStationSim::SetJoystickButtonCount(0, 2);
+    frc::sim::DriverStationSim::SetJoystickButtons(0, 1u);
+    HALSIM_NotifyDriverStationNewData();
+
+    {
+      std::unique_lock lock{probe->mutex};
+      ASSERT_TRUE(probe->changed.wait_for(lock, std::chrono::seconds{5}, [&] {
+        return probe->published_enabled;
+      })) << "WpilibCalls did not publish HALSIM_NotifyDriverStationNewData";
+    }
+    const ds::DriverStationData notified = reader.Read(kT0 + 5'000, kTimeoutUs);
+    EXPECT_EQ(reader.refreshed_us(), kT0 + 5'000);
+    EXPECT_EQ(
+        notified.fms.flags & (ds::kDsAttached | ds::kEnabled | ds::kAutonomous),
+        ds::kDsAttached | ds::kEnabled | ds::kAutonomous);
+    ASSERT_TRUE(notified.joysticks[0].connected);
+    EXPECT_FLOAT_EQ(notified.joysticks[0].axes[0], 0.5f);
+    EXPECT_FLOAT_EQ(notified.joysticks[0].axes[1], -0.25f);
+    EXPECT_EQ(notified.joysticks[0].buttons, 1u);
+
+    reader.Stop();
+  }
 }
 
 }  // namespace

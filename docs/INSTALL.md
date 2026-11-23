@@ -50,12 +50,20 @@ script, and needs `compile_commands.json` (it runs
 touched packages. It first checks that clang 18 parses the host's C++
 standard library. On macOS the newest SDK's libc++ may need a newer clang
 (the 26.x SDKs do); it then analyses against the newest installed SDK
-(Command Line Tools or Xcode) that clang 18 parses, and prints which. It
-exits 3 when it cannot run: no bazel to make the database, or a standard
-library clang 18 cannot parse (Arch's GCC 16 libstdc++, or no installed macOS
-SDK), where it says so and names what it tried.
-Homebrew buildifier and the distribution's buildifier may differ from 8.2.1;
-setup warns about this.
+(Command Line Tools or Xcode) that clang 18 parses, and prints which. On
+Linux x86_64, when clang 18 cannot parse the host's libstdc++ (such as
+Arch's GCC 16), it fetches pinned Debian GCC 14 `libstdc++-14-dev` and
+`libgcc-14-dev` headers (SHA-256 verified) into
+`${XDG_CACHE_HOME:-~/.cache}/talos/gcc-14-sysroot-14.2.0-19` and analyses against them with
+`--gcc-install-dir`. It exits 3 when it cannot run: no bazel to make the
+database, or a standard library clang 18 cannot parse when no fallback is
+available (e.g. an offline host before the GCC 14 cache is populated,
+non-x86_64 Linux, or no installed macOS SDK it parses), where it says so
+and names what it tried.
+Homebrew buildifier may differ from 8.2.1, and setup warns about a mismatch on
+macOS; on Linux, a mismatched distribution buildifier is reported
+`wrong-version` and replaced with 8.2.1 in `/usr/local/bin/buildifier` on
+install.
 
 ## Flags
 
@@ -105,6 +113,16 @@ bazel test //...
 ./sim.sh --sim-gateway --no-studio
 ```
 
+talOS's `.bazelrc` enables a shared Bazel disk cache at
+`~/.cache/talos-bazel-disk` (40 GiB GC cap) so worktrees, `tools/prepush.sh`,
+and `tools/tidy.sh` reuse compiled artifacts; an explicit `--disk_cache` flag
+or `~/.bazelrc` entry overrides it. [`talos.bazelrc`](../talos.bazelrc)
+(imported by talOS's `.bazelrc` and dependent robot repositories) sets
+`--incompatible_strict_action_env` for shell-`PATH`-independent cache keys
+and defines `--config=dev` (`-O1` + the fast test lane; see
+[TESTING.md §9](TESTING.md#9-lanes-and-ci) for the analysis-cache switch
+caveat when alternating with default `-O3` builds or `tools/tidy.sh`).
+
 CI runs the C++ suite with AddressSanitizer + UndefinedBehaviorSanitizer and
 ThreadSanitizer, one leg per sanitizer: on Linux on every push
 (`continuous-integration.yaml`), on macOS nightly (`nightly.yaml`). Run sanitizer builds in their own output
@@ -150,13 +168,14 @@ Third-party patches in `third_party/` that sanitizer runs depend on:
   only its `--config=tsan` runs report that flag's race. (talOS fetches
   toml++ as its own patched archive instead, so its parser patch reaches
   every repository that depends on talOS.)
-- `third_party/apriltag_pjpeg_bounds.patch`: bounds and overflow fixes in AprilTag's JPEG
-  decoder (`pjpeg.c`), used only by the offline `DetectImageFile` API; live
-  capture passes raw GREY/YUYV buffers to `Detect`.
-  `//talOS/vision/sanitizer:jpeg_loader_test` runs only 64 deterministic
-  corrupt-scan variants of one fixture photograph under ASan/UBSan (memory
-  safety only); intact photographs are decoded in
-  `//talOS/vision/apriltag:cpu_apriltag_backend_test`.
+- `third_party/apriltag_pjpeg_bounds.patch`: bounds, overflow, malformed-header/file,
+  and restart-marker (`RST`) DC-predictor fixes in AprilTag's JPEG decoder (`pjpeg.c`),
+  used only by the offline `DetectImageFile` API; live capture passes raw GREY/YUYV
+  buffers to `Detect`. `//talOS/vision/sanitizer:jpeg_loader_test` runs 64 deterministic
+  corrupt-scan variants of one fixture photograph (memory safety under ASan/UBSan),
+  regression cases for empty/missing-scan inputs, marker lengths < 2, truncated DHT
+  segments, and directory paths, plus a multi-component `RST` decode check; intact
+  photographs are decoded in `//talOS/vision/apriltag:cpu_apriltag_backend_test`.
 
 ## Building without a network
 
@@ -192,7 +211,9 @@ when:
   module version.
 
 Each of these needs the network: do it, then run `bazel fetch //...` again,
-before leaving.
+before leaving. This documented preparation in the target checkout and output
+base is the supported offline workflow; talOS does not patch `rules_python` or
+`grpc` to suppress those PyPI index queries.
 
 ## Realtime grant for deploy.sh run
 

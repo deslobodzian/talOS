@@ -14,6 +14,7 @@ cc_library(
     hdrs = ["motor.h"],
     include_prefix = "motor",
     strip_include_prefix = ".",
+    visibility = ["//bench/main_processor:__pkg__"],
     deps = [
         ":messages",
         "//talOS/bridge:messages",
@@ -48,7 +49,7 @@ cc_test(
         "//talOS/devices:testing",
         "//talOS/node:allocation_probe",
         "//talOS/node:testing",
-        "//talOS/teleop",
+        "//talOS/teleop:testing",
         "@googletest//:gtest_main",
     ],
 )

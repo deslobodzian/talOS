@@ -22,6 +22,7 @@ units and reads 0 (connected False) until the first state.
 """
 
 import ctypes
+import dataclasses
 import enum
 import math
 from datetime import timedelta
@@ -44,7 +45,7 @@ class Mode(enum.IntEnum):
 
 def robot_enabled(node):
     """Whether this node's outputs reach the hardware."""
-    return bool(_abi.ok(lib.talos_robot_enabled(node._handle)))
+    return _abi.boolean(lib.talos_robot_enabled(node._handle))
 
 
 def allow_untargeted_outputs(node):
@@ -85,6 +86,32 @@ class _OnNode:
         return self._owner._handle
 
 
+_INT64_MAX = (1 << 63) - 1
+
+
+def _max_age_ns(max_age):
+    """Converts a fresh(max_age) bound (seconds, timedelta, or None) to
+    int64 nanoseconds for the C ABI: -1 for None (default command timeout),
+    None for NaN or negative (caller returns False), clamped to INT64_MAX
+    for +inf or values >= INT64_MAX ns so c_int64 never wraps negative."""
+    if max_age is None:
+        return -1
+    if isinstance(max_age, timedelta):
+        ns = ((max_age.days * 86400 + max_age.seconds) * 1_000_000
+              + max_age.microseconds) * 1000
+        return None if ns < 0 else min(ns, _INT64_MAX)
+    if isinstance(max_age, int):
+        if max_age < 0:
+            return None
+        return min(max_age * 1_000_000_000, _INT64_MAX)
+    seconds = float(max_age)
+    if math.isnan(seconds) or seconds < 0:
+        return None
+    if math.isinf(seconds) or seconds >= _INT64_MAX / 1e9:
+        return _INT64_MAX
+    return min(round(seconds * 1e9), _INT64_MAX)
+
+
 class HardwareLink(_OnNode):
     """Accepted hardware state; ages are seconds since publication."""
 
@@ -93,12 +120,18 @@ class HardwareLink(_OnNode):
         # Attach the C++ extension during construction, before the loop starts.
         _abi.ok(lib.talos_hardware_fresh(self._node, -1))
 
+    @property
+    def enabled(self) -> bool:
+        """Whether this node's outputs reach the hardware."""
+        return robot_enabled(self._owner)
+
     def fresh(self, max_age=None) -> bool:
         """Whether state is younger than max_age (default command timeout)."""
-        if isinstance(max_age, timedelta):
-            max_age = max_age.total_seconds()
-        ns = -1 if max_age is None else round(max_age * 1e9)
-        return bool(_abi.ok(lib.talos_hardware_fresh(self._node, ns)))
+        node = self._node
+        ns = _max_age_ns(max_age)
+        if ns is None:
+            return False
+        return _abi.boolean(lib.talos_hardware_fresh(node, ns))
 
     @property
     def age(self) -> float:
@@ -135,16 +168,24 @@ class _Input(_Device):
         return bool(self._sample().valid)
 
 
-class Motor(_Input):
-    _KIND = _abi.DEVICE_MOTOR
-    _SAMPLE = lib.talos_motor_sample
-    _TIME = lib.talos_motor_time
+class _TimedInput(_Input):
+    _TIME = None  # its talos_*_time entry point
 
     def _time(self, velocity):
         sampled = ctypes.c_int64()
         found = _abi.ok(self._TIME(
             self._node, self._index, velocity, ctypes.byref(sampled)))
         return sampled.value if found else None
+
+
+class _PositionTimedInput(_TimedInput):
+    _AGE = None  # its talos_*_age entry point
+
+    def _age(self, velocity):
+        age = ctypes.c_int64()
+        found = _abi.ok(self._AGE(
+            self._node, self._index, velocity, ctypes.byref(age)))
+        return age.value if found else None
 
     @property
     def position_time(self):
@@ -156,18 +197,11 @@ class Motor(_Input):
         """Acquisition time, integer node-clock ns, or None if unavailable."""
         return self._time(True)
 
-    def _age(self, velocity):
-        age = ctypes.c_int64()
-        found = _abi.ok(lib.talos_motor_age(
-            self._node, self._index, velocity, ctypes.byref(age)))
-        return age.value if found else None
-
     @property
     def position_age(self):
-        """The position sample's age at the State it arrived in, integer ns
-        (Motor::position_age): read from the State, so known without the
-        clock mapping position_time needs. None unless connected, or when
-        the age is unknown."""
+        """The position sample's age at the State it arrived in, integer ns:
+        read from the State, so known without the clock mapping position_time
+        needs. None unless connected, or when the age is unknown."""
         return self._age(False)
 
     @property
@@ -175,6 +209,37 @@ class Motor(_Input):
         """The velocity sample's age at its State, integer ns, or None, as
         position_age."""
         return self._age(True)
+
+
+class _Rezeroable:
+    _REZERO = None
+    _ZEROED = None
+
+    def _rezero(self, offset_rot=0):
+        _abi.ok(self._REZERO(self._node, self._index, offset_rot))
+
+    @property
+    def zeroed(self):
+        """Whether a rezero holds: False until one takes (a restarted node
+        starts unzeroed), and again once one is dropped: on a gateway boot
+        change, a reset that masks this device in the next gateway State, or
+        any device reset across a sequence gap. A disconnect keeps it, and so
+        does every reset of a motor whose config sets
+        position_frame = "absolute". A dropped zero keeps its offset
+        (dropping does not move position or yaw). Motor set_position and
+        set_motion_magic go out neutral while no rezero holds, unless
+        position_frame = "absolute" (a remote CANcoder's frame, usable from
+        the first state)."""
+        return _abi.boolean(self._ZEROED(self._node, self._index))
+
+
+class Motor(_Rezeroable, _PositionTimedInput):
+    _KIND = _abi.DEVICE_MOTOR
+    _SAMPLE = lib.talos_motor_sample
+    _TIME = lib.talos_motor_time
+    _AGE = lib.talos_motor_age
+    _REZERO = lib.talos_motor_rezero
+    _ZEROED = lib.talos_motor_zeroed
 
     def rezero(self, position_rot=0):
         """Set the node-shared software position on connected finite feedback.
@@ -184,21 +249,7 @@ class Motor(_Input):
         than two status periods at its State (C++ RezeroAgeBound), leaves the
         offset unchanged: zeroed stays as it was, so retry on a later tick.
         """
-        _abi.ok(lib.talos_motor_rezero(self._node, self._index, position_rot))
-
-    @property
-    def zeroed(self):
-        """Whether a rezero holds: False until one takes (a restarted node
-        starts unzeroed), and again once one is dropped: on a gateway boot
-        change, a reset that masks this motor in the next gateway State, or
-        any device reset across a sequence gap. A disconnect keeps it, and so
-        does every reset of a motor whose config sets
-        position_frame = "absolute". A dropped zero keeps its offset
-        (dropping does not move position). set_position and set_motion_magic
-        go out neutral while no rezero holds, unless position_frame =
-        "absolute" (a remote CANcoder's frame, usable from the first
-        state)."""
-        return bool(_abi.ok(lib.talos_motor_zeroed(self._node, self._index)))
+        self._rezero(position_rot)
 
     @property
     def clamped_count(self):
@@ -281,13 +332,11 @@ class Motor(_Input):
                                     ff_volts, slot))
 
 
-class CANcoder(_Input):
+class CANcoder(_PositionTimedInput):
     _KIND = _abi.DEVICE_CANCODER
     _SAMPLE = lib.talos_sensor_sample
     _TIME = lib.talos_sensor_time
-    _time = Motor._time
-    position_time = Motor.position_time
-    velocity_time = Motor.velocity_time
+    _AGE = lib.talos_sensor_age
 
     @property
     def position(self):  # rotations
@@ -298,24 +347,27 @@ class CANcoder(_Input):
         return self._sample().velocity
 
 
-class Gyro(_Input):
+class Gyro(_Rezeroable, _TimedInput):
     """A Pigeon2. Rotations and rotations/s, CCW+."""
     _KIND = _abi.DEVICE_GYRO
     _SAMPLE = lib.talos_sensor_sample
     _TIME = lib.talos_sensor_time
-    _time = Motor._time
-    yaw_time = Motor.position_time
-    yaw_rate_time = Motor.velocity_time
+    _REZERO = lib.talos_gyro_rezero
+    _ZEROED = lib.talos_gyro_zeroed
+
+    @property
+    def yaw_time(self):
+        """Acquisition time, integer node-clock ns, or None if unavailable."""
+        return self._time(False)
+
+    @property
+    def yaw_rate_time(self):
+        """Acquisition time, integer node-clock ns, or None if unavailable."""
+        return self._time(True)
 
     def rezero(self, yaw_rot=0):
         """Set node-shared software yaw on connected finite feedback/input."""
-        _abi.ok(lib.talos_gyro_rezero(self._node, self._index, yaw_rot))
-
-    @property
-    def zeroed(self):
-        """Whether a rezero holds; dropped like Motor.zeroed, keeping its
-        offset, so dropping does not move yaw."""
-        return bool(_abi.ok(lib.talos_gyro_zeroed(self._node, self._index)))
+        self._rezero(yaw_rot)
 
     @property
     def yaw(self):
@@ -381,9 +433,9 @@ class PwmOutput(_Device):
 
 class Alliance(enum.IntEnum):
     """talos::driver_station::Alliance."""
-    UNKNOWN = 0
-    RED = 1
-    BLUE = 2
+    UNKNOWN = _abi.ALLIANCE_UNKNOWN
+    RED = _abi.ALLIANCE_RED
+    BLUE = _abi.ALLIANCE_BLUE
 
 
 class Joystick:
@@ -512,9 +564,40 @@ class Target(_OnNode):
         if not _abi.ok(lib.talos_target_get(self._node, self._index, None,
                                             self._source)):
             return ""
-        return _abi.check(lib.talos_target_source_name(
-            self._node, self._index, self._source.value),
-            lambda name: name is None).decode()
+        name = lib.talos_target_source_name(
+            self._node, self._index, self._source.value)
+        if name is None:
+            _abi.fail()
+        return name.decode()
+
+
+class ArmingInputKind(enum.IntEnum):
+    """Which kind of operator input blocks OperatorArming (REQ-OPS-55)."""
+    NONE = _abi.ARMING_INPUT_NONE
+    AXIS = _abi.ARMING_INPUT_AXIS
+    BUTTON = _abi.ARMING_INPUT_BUTTON
+    POV = _abi.ARMING_INPUT_POV
+    OTHER = _abi.ARMING_INPUT_OTHER
+
+
+@dataclasses.dataclass(frozen=True)
+class ArmingBlocker:
+    """Fixed-size description of the input blocking OperatorArming."""
+    kind: ArmingInputKind = ArmingInputKind.NONE
+    port: int = -1
+    index: int = -1
+
+    def __post_init__(self):
+        if (isinstance(self.port, bool) or not isinstance(self.port, int) or
+                not -128 <= self.port <= 127):
+            raise ValueError(
+                f"ArmingBlocker.port must be an int8 (-128..127), "
+                f"got {self.port!r}")
+        if (isinstance(self.index, bool) or not isinstance(self.index, int) or
+                not -32768 <= self.index <= 32767):
+            raise ValueError(
+                f"ArmingBlocker.index must be an int16 (-32768..32767), "
+                f"got {self.index!r}")
 
 
 class OperatorArming(_OnNode):
@@ -527,7 +610,9 @@ class OperatorArming(_OnNode):
                                       "operator", arming=self.arming)
         ...
         held = self.ds.joystick(1).button(3)
-        if self.arming.evaluate(neutral=not held) and held:
+        blocker = (talos.ArmingBlocker(talos.ArmingInputKind.BUTTON, 1, 3)
+                   if held else talos.ArmingBlocker())
+        if self.arming.evaluate(neutral=not held, blocker=blocker) and held:
             self.climb.send(...)
         else:
             self.climb.release()
@@ -544,17 +629,41 @@ class OperatorArming(_OnNode):
     def __init__(self, node):
         super().__init__(node)
         self._index = _abi.index(lib.talos_operator_arming_open(self._node))
+        self._armed_out = ctypes.c_int32(0)
+        self._kind_out = ctypes.c_uint8(0)
+        self._port_out = ctypes.c_int8(-1)
+        self._index_out = ctypes.c_int16(-1)
 
-    def evaluate(self, neutral) -> bool:
-        return bool(_abi.ok(lib.talos_operator_arming_evaluate(
-            self._node, self._index, 1 if neutral else 0)))
+    def evaluate(self, neutral, blocker=None) -> bool:
+        if blocker is None:
+            return _abi.boolean(lib.talos_operator_arming_evaluate(
+                self._node, self._index, 1 if neutral else 0))
+        if not isinstance(blocker, ArmingBlocker):
+            blocker = ArmingBlocker(blocker.kind, blocker.port, blocker.index)
+        _abi.ok(lib.talos_operator_arming_evaluate_blocker(
+            self._node, self._index, 1 if neutral else 0,
+            int(ArmingInputKind(blocker.kind)), blocker.port,
+            blocker.index, ctypes.byref(self._armed_out)))
+        return bool(self._armed_out.value)
 
     @property
     def armed(self) -> bool:
         """Armed now, without evaluating: what an armed lane's send()
         checks."""
-        return bool(_abi.ok(lib.talos_operator_arming_armed(
-            self._node, self._index)))
+        return _abi.boolean(lib.talos_operator_arming_armed(
+            self._node, self._index))
+
+    @property
+    def blocker(self) -> ArmingBlocker:
+        """The blocking input recorded while disarmed, or NONE/-1/-1 when
+        armed or neutral."""
+        _abi.ok(lib.talos_operator_arming_blocker(
+            self._node, self._index, ctypes.byref(self._kind_out),
+            ctypes.byref(self._port_out), ctypes.byref(self._index_out)))
+        return ArmingBlocker(
+            ArmingInputKind(self._kind_out.value),
+            self._port_out.value,
+            self._index_out.value)
 
     def disarm(self):
         _abi.ok(lib.talos_operator_arming_disarm(self._node, self._index))
@@ -577,23 +686,32 @@ class TargetLane(_OnNode):
     def __init__(self, node, msg, subsystem, source, arming=None):
         super().__init__(node)
         self._type = message_type(msg)
-        if arming is not None and arming._owner is not node:
-            raise TalosError(f"{subsystem}/target/{source}: the lane's "
-                             "OperatorArming belongs to another node")
+        if arming is not None:
+            if not isinstance(arming, OperatorArming):
+                raise TypeError(
+                    f"{subsystem}/target/{source}: arming must be an "
+                    f"OperatorArming, got {type(arming).__name__}")
+            if arming._owner is not node:
+                raise TalosError(f"{subsystem}/target/{source}: the lane's "
+                                 "OperatorArming belongs to another node")
         self._index = _abi.index(lib.talos_target_lane_open(
             self._node, _abi.encode(subsystem), _abi.encode(source),
             self._type.size, self._type.alignment, _abi.schema_of(self._type),
             -1 if arming is None else arming._index))
 
-    def send(self, message=None, **fields):
+    def send(self, message=None, /, **fields):
         """send(field=value, ...) with the .fbs field names, or send(message)
         to forward a received one. False when the transport dropped it or the
         lane's arming held it to a release."""
+        if message is not None and fields:
+            raise TypeError(
+                "send() takes either a message or field keyword arguments, "
+                "not both")
         data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
-        return bool(_abi.ok(lib.talos_target_lane_send(
-            self._node, self._index, data, len(data))))
+        return _abi.boolean(lib.talos_target_lane_send(
+            self._node, self._index, data, len(data)))
 
     def release(self):
-        return bool(_abi.ok(lib.talos_target_lane_release(
-            self._node, self._index)))
+        return _abi.boolean(lib.talos_target_lane_release(
+            self._node, self._index))

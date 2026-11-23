@@ -9,7 +9,10 @@ repository's checklist, beside its `[studio] dashboard` layout.
 
 Open the driver dashboard on the Driver Station laptop:
 `http://10.56.87.11:5800/drive` (`http://<main processor>:5800/drive`; what
-it draws: [Studio README](../studio/README.md#driver-dashboard)). The boot
+it draws: [Studio README](../studio/README.md#driver-dashboard)). Full screen
+at 1366x768 (or 1280x720) every list fits without scrolling; above a docked
+Driver Station the viewport is shorter and lists scroll (the heading shows
+how many rows are out of view). The boot
 service, or `run.sh`, starts the Studio bridge that serves it
 ([DEPLOYMENT.md](DEPLOYMENT.md#build-a-bundle)). The full Studio at `/` is
 for the pit. A widget dimmed and tagged
@@ -27,18 +30,23 @@ check below.
 
 ## Driver dashboard, top to bottom
 
-- [ ] Status line reads **OK** `Connected: telemetry current`. Otherwise:
+- [ ] Status line reads **OK** `Connected: telemetry current` (a session with
+  no hardware bridge adds `(RoboRIO link not judged: no hardware bridge)`). Otherwise:
 
   | Status line | Meaning | Do |
   |---|---|---|
   | **CONNECTING** | the page is opening its feed, or waiting for the first telemetry | wait a few seconds |
+  | **LAUNCH REFUSED** `<reason>` | the main processor is powered and on the network, but the launcher refused to start the robot (a bad config, a graph error, `simulation_only = true`, a failed probe, or a full node registry); no robot node is running and the RoboRIO holds every output neutral. Distinct from **BRIDGE LINK**, which means power, network, or the bridge itself | read the refusal reason shown on `/drive` (also saved in `<prefix>/logs/last_refusal.json`); with the robot disabled, fix the config or bundle, install a passing bundle (or roll back with `tools/deploy.sh rollback`), and restart the service ([DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor)) |
   | **BRIDGE LINK** `Dashboard to bridge link down` or `nothing heard` | the laptop does not reach the main processor's port 5800: main processor off, still booting, off the robot network, or started with `--no-studio`; or the Studio bridge that serves the page died. The launcher restarts a dead bridge within about a second, a few times ([Studio bridge](../talOS/launcher/README.md#studio-bridge)), and the page reconnects by itself; one that keeps dying, or hangs, stays down for the rest of the session while the robot drives on | wait a few seconds; if it persists, [main processor not reachable](#main-processor-not-reachable) tells which; when only the dashboard is down, [dashboard down for the session](#dashboard-down-for-the-session) |
   | **TELEMETRY** `Telemetry stale` | the bridge is up but the telemetry node publishes nothing new: every value is stale | check the telemetry node in Studio at `/` (the pit); the robot can drive, but the dashboard shows nothing current. With `the page missed time (laptop asleep)`: the laptop slept, wait a second for a new tick |
   | **TELEMETRY** `Telemetry feed could not be decoded: reload the page` | the page could not decode what the bridge sent (a page built for another bridge version, or a corrupt message); it reconnects by itself, every 5 s after 3 failures in a row | reload the page; if it persists, the page and the bridge come from different builds: redeploy the bundle |
-  | **ROBORIO LINK** `RoboRIO link lost` | the main processor accepts no hardware state from the RoboRIO: RoboRIO off, its program not running, a wrong address, or another protocol version; every output is neutral | read the Driver Station message log; on a protocol error redeploy both sides from one checkout ([DEPLOYMENT.md](DEPLOYMENT.md#roborio)) |
+  | **PROTOCOL MISMATCH** `RoboRIO and main processor protocol versions differ; redeploy both` | the main processor received UDP frames from the RoboRIO of another hardware protocol version (checked before **ROBORIO LINK**); every output is neutral | redeploy both the RoboRIO program and the main processor bundle from one checkout ([DEPLOYMENT.md](DEPLOYMENT.md#roborio)) |
   | **HARDWARE BRIDGE** `Hardware bridge not publishing` | no hardware status: the hardware bridge (`hardware_node`) on the main processor is not publishing, so the RoboRIO link cannot be judged | check Subsystems below |
+  | **ROBORIO LINK** `RoboRIO link lost` | the main processor accepts no hardware state from the RoboRIO: RoboRIO off, its program not running, or a wrong address; every output is neutral | read the Driver Station message log; check RoboRIO power, code, and network |
   | `/drive` shows `Studio's pages are missing from the installed bundle` (or `are not built`) instead of the dashboard | the bridge runs, but the installed bundle has no dashboard pages | with the robot disabled, install a bundle built from the current checkout and restart the service ([DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor)); installing the same bundle again changes nothing |
   | **REPLACED** | another `/drive` page took this page's slot (the layout's `drive_clients` are held) | close the other page, then press Reconnect, which takes the oldest page's slot |
+  | **DRAWING ERROR** `The dashboard is not updating; reload the page` | a widget threw while drawing; the top status line stays live while the grid keeps its last drawn values, dimmed and outlined in red | reload the page |
+  | **LAYOUT ERROR** | reloading `/drive/layout.json` after a reconnect or session change failed; the top status line stays live while the previous grid stays frozen and marked errored while retrying automatically | wait for recovery or check the deployed layout config |
 
 - [ ] Match: `DISABLED`; the alliance and station are the assigned ones; at
   the field, the match number and `FMS`. `NO DRIVER STATION`: the main
@@ -50,15 +58,20 @@ check below.
   `[[subsystem.labels]]` names in the deployed config
   ([automatic channels](../talOS/telemetry/README.md#automatic-channels-and-units)).
 - [ ] Alerts: Active reads `none`. Each alert names its owner and its
-  condition (`hw link lost`, `hw not configured`, `hw uncommissioned`,
-  `hw motor fault`, `hw owner timed out`, `hw brownout`, `hw can bus
-  unread`; what each means:
-  [bridge_status.fbs](../talOS/bridge/bridge_status.fbs)). `owner timed out`: an actuator node is
-  not commanding (down or crash-looping; see Subsystems). `can bus unread`:
-  a CAN bus's status read is failing or stopped, so its health is unknown
-  (Studio's Hardware panel shows which bus by its slot, `rio` first; the
-  RoboRIO console names it). The Raised list
-  keeps every alert seen this match with its count: read it after the match.
+  condition (`hw link lost`, `hw Protocol mismatch — RoboRIO and main processor builds differ; redeploy both`, `hw not configured`, `hw uncommissioned`,
+  `hw motor fault`, `hw hardware fault (total feedback loss or gateway fault)`,
+  `hw config refused while enabled: disable to accept the new configuration`,
+  `hw owner timed out`, `hw brownout`, `hw can bus unread`; what each means:
+  [bridge_status.fbs](../talOS/hardware/status/bridge_status.fbs)). `hardware fault`:
+  the gateway reports `kHardwareFault` (total feedback loss across configured
+  motors/sensors or three consecutive backend apply failures). `config refused
+  while enabled`: a changed hardware configuration was pushed while the robot
+  was enabled — disable the robot so the RoboRIO can accept it. `owner timed
+  out`: an actuator node is not commanding (down or crash-looping; see
+  Subsystems). `can bus unread`: a CAN bus's status read is failing or stopped,
+  so its health is unknown (Studio's Hardware panel shows which bus by its
+  slot, `rio` first; the RoboRIO console names it). The Raised list keeps every
+  alert seen this match with its count: read it after the match.
 - [ ] Field: the robot drawn at its starting position, with no `POSE NOT
   VALID` (the layout's `valid` channel false) or `NOT LOCALIZED` (its
   `localized` channel false) tag.
@@ -80,7 +93,9 @@ check below.
 
 ## Main processor not reachable
 
-When the dashboard does not load or stays on **BRIDGE LINK**, the main
+When the dashboard does not load or stays on **BRIDGE LINK** (as distinct from
+**LAUNCH REFUSED**, where the dashboard loads and names why the launcher
+refused to start), the main
 processor's own view is unavailable, and only the RoboRIO's remains: the
 `SmartDashboard/companion/` values it publishes through NetworkTables (what
 each means: [RoboRIO](../talOS/hardware/README.md#roborio)), read in any

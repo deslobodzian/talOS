@@ -201,17 +201,12 @@ jobs:
     - name: Lane budgets (docs/TESTING.md §9)
       # Each test action's time against its lane's budget, from this
       # invocation's build events (a cached result keeps the time of the
-      # run that produced it). The fast lane's 5 s is printed, not
-      # enforced: the budgets were measured on an idle 8-core workstation,
-      # where every fast target ran under 5 s, and this runner ran three
-      # over it (run 43357369179: the 2026 robot's bundle_test 6.8 s and
-      # pose_estimator node_test 5.6 s, when talOS held that robot, and
-      # //studio:typecheck 5.6 s). TODO.md LANE-1.
+      # run that produced it). Enforces every lane (fast, heavy, integration,
+      # e2e, perf) against docs/TESTING.md §9's budgets.
       if: ${{ !cancelled() && (steps.test.outcome == 'success' || steps.test.outcome == 'failure') }}
       run: >-
         python3 tools/slow_tests.py --check
         --bep "$RUNNER_TEMP/test-events.json"
-        --enforce heavy,integration,e2e,perf
 
     - &checkout-unchanged
       name: Checkout unchanged by the build and tests
@@ -237,8 +232,8 @@ jobs:
         out="$RUNNER_TEMP/failed-tests"
         mkdir -p "$out"
         cp "$RUNNER_TEMP/bazel-test.log" "$out/" || true
-        grep -oE '^//[^ ]+ +(FAILED|TIMEOUT|INCOMPLETE|NO STATUS)' \
-            "$RUNNER_TEMP/bazel-test.log" | awk '{ print $1 }' | sort -u \
+        { grep -oE '^//[^ ]+ +(FAILED|TIMEOUT|INCOMPLETE|NO STATUS)' \
+            "$RUNNER_TEMP/bazel-test.log" || true; } | awk '{ print $1 }' | sort -u \
           | while read -r label; do
               rel="${label#//}"
               rel="${rel/://}"
@@ -278,141 +273,7 @@ jobs:
 
     - name: Run clang-tidy on changed sources and headers
       if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-      run: |
-        # Analyze TUs in the Bazel graph: each changed source, tests
-        # included, plus up to TUS_PER_HEADER includers of each changed
-        # header (direct or transitive; production includers for a
-        # production header). A changed source missing from the database
-        # fails the step.
-        # NUL-delimited git output also handles paths containing whitespace.
-        python3 - "$BASE" <<'PYEOF'
-        import concurrent.futures, json, os, pathlib, re, subprocess, sys, time
-        SOURCES = ('.c', '.cc', '.cpp')
-        HEADERS = ('.h', '.hpp')
-        # Sources the Linux build graph never compiles, so they have no
-        # compilation database entry: the GradleRIO program and its tests
-        # (rio-adapter job) and sources selected only for other platforms.
-        # Paths in .bazelignore are outside the graph too and are read from
-        # there.
-        OFF_GRAPH = ('controller_processor/rio/',
-                     'talOS/events/os/kqueue_poller.cc',
-                     'talOS/vision/capture/unsupported_source.cc')
-        # A changed header is analyzed through at most this many translation
-        # units that include it, nearest includers first.
-        TUS_PER_HEADER = 4
-        # Test code reads an optional after gtest's ASSERT_TRUE(opt), which
-        # this check cannot see through; every other check applies to tests.
-        TEST_CHECKS = '-bugprone-unchecked-optional-access'
-
-        def git(*args):
-            return [p for p in subprocess.check_output(['git', *args]).decode().split('\0') if p]
-
-        def ours(rel):
-            return not {'external', 'third_party'}.intersection(
-                pathlib.PurePosixPath(rel).parts)
-
-        def production(rel):
-            path = pathlib.PurePosixPath(rel)
-            return ours(rel) and not (
-                {'test', 'tests', 'testing', 'testdata'}.intersection(path.parts) or
-                path.stem in {'test', 'testing'} or
-                path.stem.endswith(('_test', '_testing')) or
-                'fuzz' in path.stem)
-
-        with open('.bazelignore') as f:
-            ignored = tuple(line.strip().rstrip('/') + '/' for line in f
-                            if line.strip() and not line.startswith('#'))
-        with open('compile_commands.json') as f:
-            db = json.load(f)
-        root = os.getcwd()
-        tus = set()
-        for e in db:
-            if e['file'].endswith(SOURCES):
-                rel = os.path.relpath(os.path.realpath(os.path.join(e['directory'], e['file'])), root)
-                if ours(rel):
-                    tus.add(rel)
-
-        changed = [rel for rel in git('diff', '--name-only', '--diff-filter=d', '-z', sys.argv[1], 'HEAD',
-                                      '--', *('*' + ext for ext in SOURCES + HEADERS))
-                   if ours(rel) and not rel.startswith(ignored)]
-        targets, missing = [], []
-        for rel in changed:
-            if not rel.endswith(SOURCES):
-                continue
-            if rel in tus:
-                targets.append(rel)
-            elif not rel.startswith(OFF_GRAPH):
-                missing.append(rel)
-
-        headers = [rel for rel in changed if rel.endswith(HEADERS)]
-        if headers:
-            # Reverse include graph over tracked files. A quoted include next to its
-            # includer resolves there; otherwise to every tracked header whose path
-            # ends with the spelling, which over-approximates when two headers share
-            # a suffix: an extra includer is analyzed, none missed.
-            tracked = git('ls-files', '-z', *('*' + ext for ext in SOURCES + HEADERS))
-            tracked_set = set(tracked)
-            by_name = {}
-            for rel in tracked:
-                if rel.endswith(HEADERS):
-                    by_name.setdefault(os.path.basename(rel), []).append(rel)
-            include = re.compile(rb'^\s*#\s*include\s*(["<])([^">]+)[">]', re.M)
-            includers = {}
-            for rel in tracked:
-                with open(rel, 'rb') as f:
-                    for quote, spelled in include.findall(f.read()):
-                        spelled = spelled.decode(errors='replace')
-                        local = os.path.normpath(os.path.join(os.path.dirname(rel), spelled))
-                        if quote == b'"' and local in tracked_set:
-                            resolved = [local]
-                        else:
-                            resolved = [h for h in by_name.get(os.path.basename(spelled), ())
-                                        if h == spelled or h.endswith('/' + spelled)]
-                        for header in resolved:
-                            includers.setdefault(header, set()).add(rel)
-            for header in headers:
-                found, seen, frontier = [], {header}, [header]
-                while frontier and len(found) < TUS_PER_HEADER:
-                    level = sorted({i for h in frontier for i in includers.get(h, ())} - seen,
-                                   key=lambda p: (os.path.dirname(p) != os.path.dirname(header), p))
-                    seen.update(level)
-                    found += [p for p in level if p in tus and
-                              (production(p) or not production(header))][:TUS_PER_HEADER - len(found)]
-                    frontier = [p for p in level if p.endswith(HEADERS)]
-                if found:
-                    print(f'{header}: via {", ".join(found)}')
-                    targets += found
-                elif production(header):
-                    print(f'{header}: no production translation unit includes it; not analyzed')
-                else:
-                    print(f'{header}: no translation unit includes it; not analyzed')
-        targets = list(dict.fromkeys(targets))
-
-        for rel in missing:
-            print(f'::error file={rel}::changed source has no compilation '
-                  'database entry; add it to a Bazel target or to OFF_GRAPH in this step')
-        if not targets:
-            print('No changed C++ to analyze.')
-            sys.exit(1 if missing else 0)
-        # One clang-tidy per core: a single process over a large PR's
-        # translation units ran for most of an hour.
-        def tidy(path):
-            checks = [] if production(path) else [f'--checks={TEST_CHECKS}']
-            return subprocess.run(['clang-tidy-18', '-p', '.', '--quiet', *checks, path],
-                                  capture_output=True, text=True)
-        failed = 0
-        start = time.monotonic()
-        with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
-            for path, r in zip(targets, pool.map(tidy, targets)):
-                if r.returncode != 0:
-                    failed += 1
-                    print(f'::group::{path}')
-                    print(r.stdout + r.stderr, end='')
-                    print('::endgroup::')
-        print(f'clang-tidy: {len(targets)} files, {failed} with findings, '
-              f'{time.monotonic() - start:.1f}s')
-        sys.exit(1 if failed or missing else 0)
-        PYEOF
+      run: python3 tools/run_clang_tidy.py "$BASE"
 
   sanitizers:
     name: Bazel (${{ matrix.sanitizer }}, Linux)
@@ -465,10 +326,16 @@ jobs:
         disk-cache: robot-repo
         repository-cache: true
         cache-save: ${{ github.ref == 'refs/heads/main' }}
+    - name: Build Studio pages for dependent repositories
+      # Writes bazel-bin/studio/dist (with STUDIO_STAMP.txt) so examples/robot_repo
+      # exercises real HTTP 200 /drive serving (TALOS_REQUIRE_STUDIO_PAGES=1).
+      run: bazel build --noshow_progress //studio:web_dist
     - name: Robot repository (graph, node and sim tests, bundle)
       working-directory: examples/robot_repo
       run: |
-        bazel test --test_output=errors //... \
+        bazel test --test_output=errors \
+          --test_env=TALOS_REQUIRE_STUDIO_PAGES=1 \
+          //... \
           @talos//talOS/configuration:config_fuzz_test
     - name: Scaffolded subsystems in a copy of the robot repository
       # new_subsystem's C++ and Python output, built and tested in a copy
@@ -584,7 +451,25 @@ jobs:
     - name: RoboRIO target build
       # Cross-compile the deployed frcUserProgram for linuxathena. This is
       # the artifact `deploy` ships; it never runs in CI, it must compile.
-      run: ./gradlew buildRio
+      # talOS has no built-in companion address, so -Pcompanion=<ipv4> is
+      # required for every RoboRIO target build.
+      run: ./gradlew buildRio -Pcompanion=10.0.0.2
+
+    - name: Generate RoboRIO compilation database
+      # Export desktop compile_commands.json for clang-tidy-18 (CI-12).
+      run: ./gradlew setupCompileCommands
+
+    - name: Install clang-tidy
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-tidy-18
+
+    - name: Run clang-tidy on RoboRIO sources
+      # Runs clang-tidy-18 over controller_processor/rio/src/main/cpp and
+      # src/main/include against GradleRIO's desktop compilation database,
+      # failing on any lint finding, missing DB/source, or compiler error.
+      working-directory: .
+      run: python3 tools/run_rio_clang_tidy.py
 
   rio-in-the-loop:
     name: RoboRIO program in the loop (WPILib sim)
@@ -766,6 +651,9 @@ jobs:
         exit "$status"
 
   gate:
+    # Name matched by tools/retry_unacquired.py (AGGREGATOR_JOB_NAMES) so an
+    # unacquired-runner retry allows `CI gate`'s dependent failure; update both
+    # together if renamed.
     name: CI gate
     # The one check to require: it fails unless every job above succeeded.
     # Only the soak may be skipped (it runs on pushes, not pull requests).

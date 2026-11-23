@@ -114,3 +114,57 @@ test('without a match number, auto then teleop is one match and the next enable 
   assert.equal(tracker.latch().matchStart_ns, '500000000');
   assert.deepEqual(latched(tracker), []);
 });
+
+// REQ-OPS-20 (OBS-6, RESET-4): hardware_fault and config_refused_enabled carry
+// actionable human-readable labels in Studio and on /drive.
+test('hardware fault and enabled config refusal alerts render actionable text', () => {
+  const HW_FAULT = 'hw/status/alert_error_hardware_fault';
+  const REFUSED_ENABLED = 'hw/status/alert_error_config_refused_enabled';
+  const active = activeAlerts({
+    timestamp_ns: '1000000',
+    channels: {[HW_FAULT]: 1, [REFUSED_ENABLED]: 1},
+    alerts: {[HW_FAULT]: AlertLevel.Error, [REFUSED_ENABLED]: AlertLevel.Error},
+  });
+  const byChannel = Object.fromEntries(active.map(a => [a.channel, a]));
+  assert.equal(byChannel[HW_FAULT].owner, 'hw');
+  assert.match(byChannel[HW_FAULT].text, /hardware fault/i);
+  assert.equal(byChannel[REFUSED_ENABLED].owner, 'hw');
+  assert.ok(
+      byChannel[REFUSED_ENABLED].text.includes('disable to accept the new configuration'),
+      byChannel[REFUSED_ENABLED].text);
+});
+
+// REQ-OPS-55: disarmed operator arming alert carries actionable guidance for
+// both /teleop/status and any custom robot operator node.
+test('operator arming disarmed alert renders actionable text', () => {
+  const TELEOP_DISARMED = 'teleop/status/alert_warning_disarmed';
+  const CUSTOM_DISARMED = 'operator/status/alert_warning_disarmed';
+  const active = activeAlerts({
+    timestamp_ns: '1000000',
+    channels: {[TELEOP_DISARMED]: 1, [CUSTOM_DISARMED]: 1},
+    alerts: {
+      [TELEOP_DISARMED]: AlertLevel.Warning,
+      [CUSTOM_DISARMED]: AlertLevel.Warning,
+    },
+  });
+  const byChannel = Object.fromEntries(active.map(a => [a.channel, a]));
+  assert.equal(byChannel[TELEOP_DISARMED].owner, 'teleop');
+  assert.match(byChannel[TELEOP_DISARMED].text, /release held joystick input to arm/i);
+  assert.equal(byChannel[CUSTOM_DISARMED].owner, 'operator');
+  assert.match(byChannel[CUSTOM_DISARMED].text, /release held joystick input to arm/i);
+});
+
+// REQ-OPS-20: protocol mismatch alert carries actionable guidance to redeploy
+// both RoboRIO and main processor builds.
+test('protocol mismatch alert renders actionable text', () => {
+  const PROTO = 'hw/status/alert_error_protocol_mismatch';
+  const active = activeAlerts({
+    timestamp_ns: '1000000',
+    channels: {[PROTO]: 1},
+    alerts: {[PROTO]: AlertLevel.Error},
+  });
+  assert.equal(active.length, 1);
+  assert.equal(active[0].owner, 'hw');
+  assert.match(active[0].text, /protocol mismatch/i);
+  assert.match(active[0].text, /redeploy both/i);
+});
