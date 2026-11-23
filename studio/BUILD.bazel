@@ -151,6 +151,7 @@ js_binary(
 # the code compiles, this proves it runs. declared: parses a graph document
 # the C++ launcher really produced, so a change to its envelope fails here.
 STUDIO_TESTS = {
+    "adversarial_test": "adversarial.test.tsx",
     "agent_test": "agent.test.ts",
     "alerts_test": "alerts.test.ts",
     "commands_test": "commands.test.ts",

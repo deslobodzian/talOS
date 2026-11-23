@@ -100,8 +100,10 @@ function NotForRecorded({reason, children}: {
       <>{children}</>;
 }
 
-function renderPanel(node: PanelNode, callbacks: WorkspaceCallbacks,
-                     maximized: string|null) {
+function PanelBody({node, callbacks}: {
+  node: PanelNode;
+  callbacks: WorkspaceCallbacks;
+}) {
   const def = panelById(node.panelId);
   const Component = def?.component;
   const config = def ? def.parseConfig(node.config) : undefined;
@@ -111,9 +113,14 @@ function renderPanel(node: PanelNode, callbacks: WorkspaceCallbacks,
                  config={config} instanceId={node.instanceId}
                  setConfig={c => callbacks.onConfig(node.instanceId, c)}/> :
       <UnknownPanel panelId={node.panelId} config={node.config}/>;
-  const content = def?.recorded ? panel :
+  return def?.recorded ? panel :
       <NotForRecorded key={`${node.instanceId}:${node.panelId}`}
                       reason={def?.liveOnlyReason}>{panel}</NotForRecorded>;
+}
+
+function renderPanel(node: PanelNode, callbacks: WorkspaceCallbacks,
+                     maximized: string|null) {
+  const def = panelById(node.panelId);
 
   return <PanelChrome key={node.instanceId}
       panelId={node.panelId}
@@ -127,7 +134,7 @@ function renderPanel(node: PanelNode, callbacks: WorkspaceCallbacks,
       onInteract={() => callbacks.onFocusPanel(node.instanceId)}
       maximized={maximized === node.instanceId}>
     <PanelErrorBoundary key={`${node.instanceId}:${node.panelId}`}>
-      {content}
+      <PanelBody key={`${node.instanceId}:${node.panelId}`} node={node} callbacks={callbacks}/>
     </PanelErrorBoundary>
   </PanelChrome>;
 }

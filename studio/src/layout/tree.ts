@@ -277,8 +277,12 @@ const isString = (v: unknown): v is string => typeof v === 'string' && !!v;
 const isObject = (v: unknown): v is Record<string, unknown> =>
     !!v && typeof v === 'object' && !Array.isArray(v);
 
-function parseNode(value: unknown, seenInstanceIds: Set<string>): LayoutNode|null {
-  if (!isObject(value)) return null;
+const MAX_LAYOUT_DEPTH = 32;
+const MAX_LAYOUT_PAGES = 64;
+const MAX_SPLIT_CHILDREN = 32;
+
+function parseNode(value: unknown, seenInstanceIds: Set<string>, depth = 0): LayoutNode|null {
+  if (depth > MAX_LAYOUT_DEPTH || !isObject(value)) return null;
   if (value.type === 'panel') {
     if (!isString(value.instanceId) || !isString(value.panelId)) return null;
     let instanceId = value.instanceId;
@@ -293,10 +297,12 @@ function parseNode(value: unknown, seenInstanceIds: Set<string>): LayoutNode|nul
   }
   if (value.type === 'split') {
     if (value.direction !== 'row' && value.direction !== 'column') return null;
-    if (!Array.isArray(value.children) || value.children.length < 1) return null;
+    if (!Array.isArray(value.children) || value.children.length < 1 ||
+        value.children.length > MAX_SPLIT_CHILDREN)
+      return null;
     const children: LayoutNode[] = [];
     for (const child of value.children) {
-      const parsed = parseNode(child, seenInstanceIds);
+      const parsed = parseNode(child, seenInstanceIds, depth + 1);
       // One malformed branch is dropped, not the whole split: a stray bad leaf
       // should not blank a page that is otherwise readable.
       if (parsed) children.push(parsed);
@@ -326,7 +332,8 @@ function parseNode(value: unknown, seenInstanceIds: Set<string>): LayoutNode|nul
 export function parseWorkspace(raw: unknown): Workspace {
   if (!isObject(raw)) return emptyWorkspace();
   if (raw.version !== WORKSPACE_VERSION) return emptyWorkspace();
-  if (!Array.isArray(raw.pages)) return emptyWorkspace();
+  if (!Array.isArray(raw.pages) || raw.pages.length > MAX_LAYOUT_PAGES)
+    return emptyWorkspace();
 
   const pages: Page[] = [];
   const seenIds = new Set<string>();

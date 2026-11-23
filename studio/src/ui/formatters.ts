@@ -6,9 +6,15 @@ import type {SystemGraph, SystemNode} from '../system';
 // A uint64 counter or timestamp carried as a decimal string (or an already-safe
 // number) with thousands separators, so "1,204,338" not "1204338".
 export const integer = (value: string|number) => {
-  const n =
-      typeof value === 'string' ? BigInt(value) : BigInt(Math.round(value));
-  return n.toLocaleString('en-US');
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return '—';
+    return BigInt(Math.round(value)).toLocaleString('en-US');
+  }
+  try {
+    return BigInt(value).toLocaleString('en-US');
+  } catch {
+    return '—';
+  }
 };
 
 // Robot timing lives in microseconds and milliseconds; a bare nanosecond count
@@ -34,9 +40,10 @@ export function durationUs(micros: string|number): string {
 }
 
 export const hertz = (rate: number|undefined) =>
-    rate === undefined ? '—' : rate >= 100 ? `${rate.toFixed(0)} Hz` :
-    rate >= 1         ? `${rate.toFixed(1)} Hz` :
-                        `${rate.toFixed(2)} Hz`;
+    rate === undefined || !Number.isFinite(rate) ? '—' :
+    rate >= 100 ? `${rate.toFixed(0)} Hz` :
+    rate >= 1   ? `${rate.toFixed(1)} Hz` :
+                  `${rate.toFixed(2)} Hz`;
 
 // Node age is computed against the graph's own wall clock rather than the
 // browser's: the two machines need not agree, and a viewer that says a healthy
