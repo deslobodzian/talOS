@@ -68,12 +68,6 @@ mount_flag="$(sandbox_mount_talos "$talos")"
 [ -n "$mount_flag" ] && bazel_flags+=("$mount_flag")
 
 bazel_started=0
-remove_copy() {
-  if [ -e "$copy" ]; then
-    chmod -R u+w "$copy" 2>/dev/null
-    rm -rf "$copy"
-  fi
-}
 cleanup() {
   if [ "$bazel_started" = 1 ] && [ -d "$copy" ]; then
     (cd "$copy" && bazel shutdown >/dev/null 2>&1)
