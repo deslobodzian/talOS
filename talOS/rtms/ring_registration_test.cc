@@ -838,6 +838,7 @@ TEST(RingRegistration, LiveReclaimerHeldPastTheWaitIsNotSuperseded) {
 
   UnlinkHold hold;
   HoldGuard guard{hold};
+  const WaitAttemptsGuard unbounded{std::numeric_limits<int>::max()};
   std::latch ready{static_cast<std::ptrdiff_t>(kOpeners)};
   std::vector<std::optional<RTMSQueue>> queues(kOpeners);
   std::vector<std::string> errors(kOpeners);
@@ -885,6 +886,7 @@ TEST(RingRegistration, LiveCloserHeldBeforeUnlinkIsNotSuperseded) {
 
   UnlinkHold hold;
   HoldGuard guard{hold};
+  const WaitAttemptsGuard unbounded{std::numeric_limits<int>::max()};
   std::optional<RTMSQueue> only;
   only.emplace(OpenSubscriber(path, kSlots));
   const std::uint64_t old_segment_id =
@@ -1638,6 +1640,28 @@ TEST(RingRegistration, SessionOwnerRefusesALiveClaimantThatOutlastsTheWait) {
       << "the name holds another segment";
   EXPECT_EQ(outcome.named->lifetime, kLifetimeClosing | talos::OwnProcessWord())
       << "the session owner changed the claim";
+}
+
+// REQ-OPS-03: a queue opens a name whose standalone segment's live claimant
+// is held before its unlink for longer than an opener waits. The open gives
+// up with the "stayed closing" error naming the topic, and neither claims nor
+// unlinks the segment: the name still holds it, closing with the same
+// claimant.
+TEST(RingRegistration, OpenerRefusesALiveClaimantThatOutlastsTheWait) {
+  constexpr std::size_t kSlots = 4;
+  const std::string path = MakeUniquePath("/ring_opener_bound");
+  const HeldClaimantOutcome outcome = OpenPastAHeldClaimant(
+      path, kSlots, [&] { return OpenSubscriber(path, kSlots); });
+
+  SCOPED_TRACE(
+      std::format("opener's waits for the held claimant: {}", outcome.waits));
+  EXPECT_FALSE(outcome.error.empty()) << "the open returned";
+  EXPECT_NE(outcome.error.find(path), std::string::npos) << outcome.error;
+  ASSERT_TRUE(outcome.named.has_value()) << "the name was unlinked";
+  EXPECT_EQ(outcome.named->segment_id, outcome.claimant_segment_id)
+      << "the name holds another segment";
+  EXPECT_EQ(outcome.named->lifetime, kLifetimeClosing | talos::OwnProcessWord())
+      << "the opener changed the claim";
 }
 
 }  // namespace
