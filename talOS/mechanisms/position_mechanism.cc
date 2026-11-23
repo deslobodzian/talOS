@@ -512,6 +512,14 @@ void PositionMechanism::drive_goal(Request request, double request_rot,
   phase_ = at_goal_debounce_state_.update(near, now) ? PositionPhase::kAtGoal
                                                      : PositionPhase::kMoving;
   if (near) {
+    // Refresh the move timer while in tolerance so move_timeout_us measures
+    // continuous time spent away from goal, not cumulative time since the goal
+    // was first commanded (which would immediately fault on a single
+    // perturbation tick after holding longer than move_timeout_us). Note that
+    // a mechanism oscillating repeatedly across the tolerance_rot_ boundary
+    // refreshes goal_since_ on each in-tolerance tick and will not trip
+    // kMoveTimeout.
+    goal_since_ = now;
     stall_debounce_.reset();
     return;
   }
