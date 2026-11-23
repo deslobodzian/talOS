@@ -85,7 +85,7 @@ check first, then the implementations:
 | Change | Contract edited first | Check that goes red, then green |
 |---|---|---|
 | A message or topic | the package's `.fbs` and `talos_messages(topics = ...)` | unit-suffix lint; schema hash; `--describe-only`; the Studio bindings diff |
-| A node-API feature | `talOS/node_api/node_api.h` | `api_parity_test` (ABI version, exports, return and parameter types, `TALOS_*` constants; `talos.Mode` takes its values from `_abi.py`); then `node_api_test` and `talos_test` exercise the new symbol, one case each |
+| A node-API feature | `talOS/node_api/node_api.h` | `api_parity_test` (ABI version, exports, return and parameter types, `TALOS_*` constants; every `talos` `IntEnum` takes its values from `_abi.py`); then `node_api_test` and `talos_test` exercise the new symbol, one case each |
 | A device type | `talOS/hardware` config and wire structs | wire `static_assert`s; codec round trip; `phoenixTest` |
 | A UDP frame, slot size or telemetry budget | DATA_FLOW.md and its size assert | the `static_assert`; the Studio decoder test; `//tools:check_data_flow_sizes_test` (DATA_FLOW.md's marked sizes equal the compiled values) |
 | A config key | the node constructor's `param` | the launcher refuses a key no node read; `talos_graph_test` and `--describe-only` on every affected config |
@@ -98,7 +98,7 @@ With the contract fixed, per-layer slices are independent
 **One implementation per concept** (RULES.md 7). Search for the concept
 before writing it. A second copy is allowed only where languages cannot share
 code (Starlark, a build-time check), and then a contract test pins it to the
-first (`topic_grammar_test`). Each known copy is a TODO.md item (ARCH-3).
+first (`topic_grammar_test`).
 **[review]**
 
 ## 5. Budgets
@@ -136,13 +136,13 @@ accumulated.
    - **deleted:** removed in one commit whose `Why:` records what it did and
      how to recover it (`git revert`).
 3. **Two ways to do one thing** is a deletion candidate, by RULES.md 7's
-   logic. Open scope questions are TODO.md SCOPE items.
+   logic.
 4. **A feature is not started without a requirement** (RULES.md 15). TODO.md
    "Optional work" is the waiting room.
 5. **A deletion deletes everything**: code, BUILD targets, config keys,
    tests, docs, TODO.md items, CI steps. Grep the name across the tree before
    committing.
-6. A header-only monolith (ARCH-1) or a file over about 1,500 lines is split
+6. A header-only monolith or a file over about 1,500 lines is split
    along its seams when next touched for a behaviour change.
 
 ## 7. Ambiguities are design debt
@@ -163,7 +163,7 @@ Automated checks that keep the architecture honest.
 | `talos_messages` action, `unit_suffix_test`, `descriptor_gen_lint_test` | unit suffixes, topic grammar, descriptors |
 | `//talOS/build:topic_grammar_test` | `contract.bzl`'s grammar equals `names.h` |
 | `schema_hash_test`, `schema_hash_py_test`, the hash-checked attach | topics typed by schema identity in both languages |
-| `//talOS/python:api_parity_test`, `node_api.cc` `static_assert`s (device kinds, motor modes, Driver Station flags) | the C ABI equals ctypes |
+| `//talOS/python:api_parity_test`, `//talOS/python:differential_parity_test`, `node_api.cc` `static_assert`s (device kinds, motor modes, wake modes, arming kinds, Driver Station flags/alliance, ABI struct layouts) | the C ABI equals ctypes, and Python framework wrappers match C++ behaviour |
 | size `static_assert`s | DATA_FLOW.md byte budgets |
 | `manifest_sync_test`, the `talos_bundle` stamp | `[[subsystems]]` is the only node list |
 | the Studio bindings diff in CI | checked-in TypeScript equals `telemetry.fbs` |
@@ -173,7 +173,7 @@ Automated checks that keep the architecture honest.
 | `wpilib_lockstep_test` | GradleRIO and RobotPy wheel versions agree |
 | `new_subsystem_test` golden packages | the scaffold's output builds and passes |
 | `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies" and `studio/review` viewer isolation (`REQ-SAFE-35`: no UDP `talOS/protocol:protocol`, hardware UDP endpoint `talOS/hardware:hardware`, `talOS/memory:shared_memory`, RTMS, IPC, bridge runtime, or node/devices; pure wire codecs `talOS/protocol:frame` and `talOS/hardware:codecs` allowed); its allowlist only shrinks |
-| `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
+| `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code, no randomness in node code ([METHODOLOGY.md §9](METHODOLOGY.md#9-time-determinism-restart)), and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
 | `tools/check_links.py` (CI lint job) | every relative markdown link and `#anchor` resolves |
 | `tools/trace.py --check` (CI lint job) | every `REQ-` tag names a catalogue requirement; every SAFE, CONTRACT and P0 requirement has a tagged test at or below its cheapest runnable tier (from Bazel lane tags, GradleRIO `phoenixTest`, and Studio node:test (`tsx --test`)) or cites a bench section or open TODO.md item; quarantines are dated and unexpired; every Bazel package is in the package scope table; its waiver list only shrinks |
 | `tools/slow_tests.py --check --bep` (CI Linux job) | per-target lane time budgets (fast, heavy, integration, e2e, perf; [TESTING.md §9](TESTING.md#9-lanes-and-ci)) |
@@ -184,8 +184,8 @@ Automated checks that keep the architecture honest.
 
 ### To add
 
-The checks the **[gap]** marks name are TODO.md's "Method enforcement and
-test corrections" items, plus ARCH-3.
+The checks the **[gap]** marks name are in TODO.md's "Method enforcement and
+test corrections" and "Open specification questions" sections.
 
 A new **[review]** rule is accepted only with a sentence saying why it
 cannot be enforced.
