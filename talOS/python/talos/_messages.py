@@ -251,6 +251,17 @@ class MessageType:
     def decode(self, data):
         return Message(self, data)
 
+    def payload(self, call, message, fields):
+        """The bytes `call`(message) or `call`(**fields) sends: a received
+        message forwarded, or the fields encoded. Raises TypeError when it
+        is given both."""
+        if message is not None and fields:
+            raise TypeError(
+                f"{call}() takes either a message or field keyword arguments, "
+                "not both")
+        return self.forward(message) if message is not None else (
+            self.encode(fields))
+
 
 @functools.lru_cache(maxsize=None)
 def message_type(cls):
