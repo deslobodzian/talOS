@@ -339,7 +339,7 @@ struct HardStop {
 };
 
 // Physics-backed Backend. See the header comment for the item-by-item map.
-class PhysicsSimBackend final : public Backend {
+class PhysicsSimBackend final : public SimBackendBase {
  public:
   explicit PhysicsSimBackend(PhysicsOptions options = {}) : options_{options} {
     if (!std::isfinite(options_.wheel_radius_m) ||
@@ -593,19 +593,6 @@ class PhysicsSimBackend final : public Backend {
     return healthy;
   }
 
-  bool Apply(std::span<const MotorRequest> commands) override {
-    std::copy(commands.begin(), commands.end(), commands_.begin());
-    return true;
-  }
-  std::span<const uint16_t> ApplyFailedDevices() const override { return {}; }
-
-  bool ApplyOutputs(std::span<const DigitalOutputRequest> digital_outputs,
-                    std::span<const PwmRequest> pwm_outputs) override {
-    for (const auto& d : digital_outputs) digital_outputs_[d.id] = d.value;
-    for (const auto& p : pwm_outputs) pwm_outputs_[p.id] = p;
-    return true;
-  }
-
   // Safe-state policy mirrors SimBackend: every output type turns off on
   // disable, command timeout, and failure (motors to kNeutral, PWM off,
   // digital outputs de-energized). Neutral removes drive but does NOT zero
@@ -652,12 +639,6 @@ class PhysicsSimBackend final : public Backend {
   // The gateway neutralizes dependent motors before starting restoration.
   // The restored chain reads invalid until a PollRestore that succeeds
   // (RestoredWith), as on the robot.
-  void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
-  bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
-    reset_ids = pending_resets_;
-    pending_resets_.clear();
-    return !reset_ids.empty();
-  }
   void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       if (RestoredWith(config_.motors, i, ids)) restoring_[i] = true;
@@ -680,12 +661,6 @@ class PhysicsSimBackend final : public Backend {
         if (config_.sensors[j].id == id) sensor_connected_[j] = true;
     }
   }
-  RestoreStatus PollRestore() override {
-    if (restore_fails_) return RestoreStatus::kFailed;
-    restoring_.fill(false);
-    return RestoreStatus::kDone;
-  }
-  void SetRestoreFails(bool fails) { restore_fails_ = fails; }
   void FreezeFeedback(uint16_t motor_id) {
     if (const int i = MotorIndex(motor_id); i >= 0) frozen_[i] = true;
   }
@@ -766,15 +741,6 @@ class PhysicsSimBackend final : public Backend {
   double applied_voltage(std::size_t motor_index) const {
     return motor_index < applied_volts_.size() ? applied_volts_[motor_index]
                                                : 0.0;
-  }
-  bool GetDigitalOutput(uint16_t id) const {
-    const auto it = digital_outputs_.find(id);
-    return it != digital_outputs_.end() ? it->second : false;
-  }
-  // As SimBackend::GetPwm: off ({.id = id}) when none since Neutral().
-  PwmRequest GetPwm(uint16_t id) const {
-    const auto it = pwm_outputs_.find(id);
-    return it != pwm_outputs_.end() ? it->second : PwmRequest{.id = id};
   }
 
  private:
@@ -1464,7 +1430,6 @@ class PhysicsSimBackend final : public Backend {
   double gyro_zero_yaw_rad_{};
   double elapsed_s_{};
   std::optional<uint64_t> previous_time_;
-  std::array<MotorRequest, kMaxMotors> commands_{};
   std::array<AxisState, kMaxMotors> axes_{};
   std::array<Profile, kMaxMotors> profiles_{};
   std::vector<Module> modules_;
@@ -1483,10 +1448,8 @@ class PhysicsSimBackend final : public Backend {
   // Filled with -1 by Configure; valid only after Configure.
   std::array<int, kMaxMotors> motor_to_sensor_;
   std::unordered_map<uint16_t, bool> digital_inputs_{};
-  std::unordered_map<uint16_t, bool> digital_outputs_{};
   std::unordered_map<uint16_t, double> analog_inputs_{};
   std::unordered_map<uint16_t, ManualEncoder> encoders_{};
-  std::unordered_map<uint16_t, PwmRequest> pwm_outputs_{};
   // By motor name; SetLocalMotorTypes.
   std::unordered_map<std::string, MotorType> local_motor_types_{};
   // SetHomeSwitches, and those of them config_ names, by index.
@@ -1509,9 +1472,6 @@ class PhysicsSimBackend final : public Backend {
   double supply_v_{kSimRestingSupplyV};
   double yaw_rot_{0.0};
   double yaw_rate_rps_{0.0};
-  std::vector<uint16_t> pending_resets_;
-  bool restore_fails_{false};
-  std::array<bool, kMaxMotors> restoring_{};
 };
 
 }  // namespace talos::hardware::sim

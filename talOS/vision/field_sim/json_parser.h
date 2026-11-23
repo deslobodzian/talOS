@@ -59,6 +59,100 @@ struct JsonValue {
   }
 };
 
+// Why DecodeJsonStringBody stopped before a string's closing quote.
+enum class JsonStringError {
+  kNone,
+  kTruncatedUnicodeEscape,  // fewer than four bytes after \u
+  kInvalidUnicodeEscape,    // a non-hex digit among those four
+  kInvalidEscape,           // a backslash before any other byte
+  kControlCharacter,        // an unescaped byte below 0x20
+  kUnterminated,            // the text ended first
+};
+
+// Decodes the JSON string whose opening quote is just before text[*pos],
+// appending its bytes to *out, and advances *pos past the closing quote. On
+// an error *pos is just past the byte that failed (text.size() when the
+// string is unterminated). A \uXXXX escape is written as the UTF-8 of that
+// one code unit: surrogate pairs are not combined, so a surrogate becomes a
+// three-byte sequence that is not valid UTF-8. Every other byte, including
+// non-ASCII, is copied as is.
+inline JsonStringError DecodeJsonStringBody(std::string_view text, size_t* pos,
+                                            std::string* out) {
+  size_t& p = *pos;
+  while (p < text.size()) {
+    const char c = text[p++];
+    if (c == '"') return JsonStringError::kNone;
+    if (c == '\\') {
+      if (p >= text.size()) break;
+      const char e = text[p++];
+      switch (e) {
+        case '"':
+          out->push_back('"');
+          break;
+        case '\\':
+          out->push_back('\\');
+          break;
+        case '/':
+          out->push_back('/');
+          break;
+        case 'b':
+          out->push_back('\b');
+          break;
+        case 'f':
+          out->push_back('\f');
+          break;
+        case 'n':
+          out->push_back('\n');
+          break;
+        case 'r':
+          out->push_back('\r');
+          break;
+        case 't':
+          out->push_back('\t');
+          break;
+        case 'u': {
+          if (p + 4 > text.size()) {
+            return JsonStringError::kTruncatedUnicodeEscape;
+          }
+          unsigned code = 0;
+          for (int i = 0; i < 4; ++i) {
+            const char h = text[p++];
+            code <<= 4;
+            if (h >= '0' && h <= '9') {
+              code |= static_cast<unsigned>(h - '0');
+            } else if (h >= 'a' && h <= 'f') {
+              code |= static_cast<unsigned>(h - 'a' + 10);
+            } else if (h >= 'A' && h <= 'F') {
+              code |= static_cast<unsigned>(h - 'A' + 10);
+            } else {
+              return JsonStringError::kInvalidUnicodeEscape;
+            }
+          }
+          if (code < 0x80) {
+            out->push_back(static_cast<char>(code));
+          } else if (code < 0x800) {
+            out->push_back(static_cast<char>(0xC0 | (code >> 6)));
+            out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+          } else {
+            out->push_back(static_cast<char>(0xE0 | (code >> 12)));
+            out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+            out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+          }
+          break;
+        }
+        default:
+          return JsonStringError::kInvalidEscape;
+      }
+      continue;
+    }
+    if (static_cast<unsigned char>(c) < 0x20) {
+      return JsonStringError::kControlCharacter;
+    }
+    out->push_back(c);
+  }
+  return JsonStringError::kUnterminated;
+}
+
 namespace json_detail {
 
 inline constexpr int kMaxDepth = 64;
@@ -177,82 +271,23 @@ class Parser {
 
   bool ParseString(std::string* out, std::string* error) {
     ++pos_;  // opening quote
-    while (pos_ < text_.size()) {
-      const char c = text_[pos_++];
-      if (c == '"') return true;
-      if (c == '\\') {
-        if (pos_ >= text_.size()) break;
-        const char e = text_[pos_++];
-        switch (e) {
-          case '"':
-            out->push_back('"');
-            break;
-          case '\\':
-            out->push_back('\\');
-            break;
-          case '/':
-            out->push_back('/');
-            break;
-          case 'b':
-            out->push_back('\b');
-            break;
-          case 'f':
-            out->push_back('\f');
-            break;
-          case 'n':
-            out->push_back('\n');
-            break;
-          case 'r':
-            out->push_back('\r');
-            break;
-          case 't':
-            out->push_back('\t');
-            break;
-          case 'u': {
-            if (pos_ + 4 > text_.size()) {
-              Fail(error, "truncated unicode escape");
-              return false;
-            }
-            unsigned code = 0;
-            for (int i = 0; i < 4; ++i) {
-              const char h = text_[pos_++];
-              code <<= 4;
-              if (h >= '0' && h <= '9')
-                code |= static_cast<unsigned>(h - '0');
-              else if (h >= 'a' && h <= 'f')
-                code |= static_cast<unsigned>(h - 'a' + 10);
-              else if (h >= 'A' && h <= 'F')
-                code |= static_cast<unsigned>(h - 'A' + 10);
-              else {
-                Fail(error, "invalid unicode escape");
-                return false;
-              }
-            }
-            // Encode as UTF-8 (no surrogate-pair combining: layout files
-            // are ASCII; anything exotic degrades to U+FFFD).
-            if (code < 0x80) {
-              out->push_back(static_cast<char>(code));
-            } else if (code < 0x800) {
-              out->push_back(static_cast<char>(0xC0 | (code >> 6)));
-              out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
-            } else {
-              out->push_back(static_cast<char>(0xE0 | (code >> 12)));
-              out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-              out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
-            }
-            break;
-          }
-          default:
-            Fail(error, "invalid escape");
-            return false;
-        }
-        continue;
-      }
-      if (static_cast<unsigned char>(c) < 0x20) {
+    switch (DecodeJsonStringBody(text_, &pos_, out)) {
+      case JsonStringError::kNone:
+        return true;
+      case JsonStringError::kTruncatedUnicodeEscape:
+        Fail(error, "truncated unicode escape");
+        return false;
+      case JsonStringError::kInvalidUnicodeEscape:
+        Fail(error, "invalid unicode escape");
+        return false;
+      case JsonStringError::kInvalidEscape:
+        Fail(error, "invalid escape");
+        return false;
+      case JsonStringError::kControlCharacter:
         Fail(error, "unescaped control character");
         return false;
-      }
-      out->push_back(c);
+      case JsonStringError::kUnterminated:
+        break;
     }
     Fail(error, "unterminated string");
     return false;

@@ -178,7 +178,19 @@ class _TimedInput(_Input):
         return sampled.value if found else None
 
 
-class _PositionTimedInput(_TimedInput):
+class _Rotations:
+    """position and velocity of a rotational sensor's sample."""
+
+    @property
+    def position(self):  # rotations
+        return self._sample().position
+
+    @property
+    def velocity(self):  # rotations/s
+        return self._sample().velocity
+
+
+class _PositionTimedInput(_Rotations, _TimedInput):
     _AGE = None  # its talos_*_age entry point
 
     def _age(self, velocity):
@@ -288,14 +300,6 @@ class Motor(_Rezeroable, _PositionTimedInput):
         self._set(Mode.NEUTRAL, 0.0)
 
     @property
-    def position(self):  # rotations
-        return self._sample().position
-
-    @property
-    def velocity(self):  # rotations/s
-        return self._sample().velocity
-
-    @property
     def voltage(self):  # applied volts
         return self._sample().voltage
 
@@ -337,14 +341,6 @@ class CANcoder(_PositionTimedInput):
     _SAMPLE = lib.talos_sensor_sample
     _TIME = lib.talos_sensor_time
     _AGE = lib.talos_sensor_age
-
-    @property
-    def position(self):  # rotations
-        return self._sample().position
-
-    @property
-    def velocity(self):  # rotations/s
-        return self._sample().velocity
 
 
 class Gyro(_Rezeroable, _TimedInput):
@@ -396,17 +392,9 @@ class AnalogInput(_Input):
         return self._sample().voltage
 
 
-class Encoder(_Input):
+class Encoder(_Rotations, _Input):
     _KIND = _abi.DEVICE_ENCODER
     _SAMPLE = lib.talos_encoder_sample
-
-    @property
-    def position(self):  # rotations
-        return self._sample().position
-
-    @property
-    def velocity(self):  # rotations/s
-        return self._sample().velocity
 
 
 class DigitalOutput(_Device):
@@ -703,12 +691,7 @@ class TargetLane(_OnNode):
         """send(field=value, ...) with the .fbs field names, or send(message)
         to forward a received one. False when the transport dropped it or the
         lane's arming held it to a release."""
-        if message is not None and fields:
-            raise TypeError(
-                "send() takes either a message or field keyword arguments, "
-                "not both")
-        data = self._type.forward(message) if message is not None else (
-            self._type.encode(fields))
+        data = self._type.payload("send", message, fields)
         return _abi.boolean(lib.talos_target_lane_send(
             self._node, self._index, data, len(data)))
 

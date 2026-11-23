@@ -54,6 +54,34 @@ function categoryFor(name: string): EventCategory {
   return 'mechanism';
 }
 
+// Bits newly set in a hardware mask (a warning) and bits newly cleared (news),
+// each listed after `prefix` in its event's detail.
+function maskEdge(id: string, channel: string, setTitle: string,
+                  clearedTitle: string, prefix: string): FrameDetector {
+  return {
+    id,
+    detect(prev, next) {
+      const a = val(prev, channel), b = val(next, channel);
+      if (a === undefined || b === undefined || a === b ||
+          !Number.isFinite(a) || !Number.isFinite(b)) return [];
+      const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
+      const added = after & ~before, cleared = before & ~after;
+      return [
+        ...(added ? [{
+          severity: 'warn' as const, category: 'hardware' as const,
+          title: setTitle, detail: `${prefix}${maskDetail(Number(added))}`,
+          channel
+        }] : []),
+        ...(cleared ? [{
+          severity: 'info' as const, category: 'hardware' as const,
+          title: clearedTitle, detail: `${prefix}${maskDetail(Number(cleared))}`,
+          channel
+        }] : [])
+      ];
+    }
+  };
+}
+
 // A boolean edge on one channel, both directions.
 function boolEdge(id: string, channel: string, category: EventCategory,
                   onTitle: string, offTitle: string, onSeverity: Severity,
@@ -246,59 +274,15 @@ export function createFrameDetectors(): FrameDetector[] {
   boolEdge('link-configured', 'hw/status/configured', 'hardware',
            'Config acknowledged', 'Config not acknowledged', 'info', 'warn'),
   // Motor faults distinguish newly set bits from resolved bits.
-  {
-    id: 'link-fault-mask',
-    detect(prev, next) {
-      const a = val(prev, 'hw/status/motor_fault_mask'),
-            b = val(next, 'hw/status/motor_fault_mask');
-      if (a === undefined || b === undefined || a === b ||
-          !Number.isFinite(a) || !Number.isFinite(b)) return [];
-      const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
-      const added = after & ~before, cleared = before & ~after;
-      return [
-        ...(added ? [{
-          severity: 'warn' as const, category: 'hardware' as const,
-          title: 'Motor fault bits set', detail: maskDetail(Number(added)),
-          channel: 'hw/status/motor_fault_mask'
-        }] : []),
-        ...(cleared ? [{
-          severity: 'info' as const, category: 'hardware' as const,
-          title: 'Motor fault bits resolved', detail: maskDetail(Number(cleared)),
-          channel: 'hw/status/motor_fault_mask'
-        }] : [])
-      ];
-    }
-  },
-  {
-    id: 'link-timeout-mask',
-    detect(prev, next) {
-      const a = val(prev, 'hw/status/timed_out_mask'),
-            b = val(next, 'hw/status/timed_out_mask');
-      if (a === undefined || b === undefined || a === b ||
-          !Number.isFinite(a) || !Number.isFinite(b)) return [];
-      // A bit is set only while that subsystem's requests have been silent
-      // for its owner timeout on a ready link (bit i: the i-th
-      // actuator-owning subsystem in sorted name order), and every bit
-      // clears while the gateway is not configured: a set bit is the
-      // problem, a cleared one its end.
-      const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
-      const added = after & ~before, cleared = before & ~after;
-      return [
-        ...(added ? [{
-          severity: 'warn' as const, category: 'hardware' as const,
-          title: 'Subsystem requests timed out',
-          detail: `subsystem ${maskDetail(Number(added))}`,
-          channel: 'hw/status/timed_out_mask'
-        }] : []),
-        ...(cleared ? [{
-          severity: 'info' as const, category: 'hardware' as const,
-          title: 'Subsystem request timeouts cleared',
-          detail: `subsystem ${maskDetail(Number(cleared))}`,
-          channel: 'hw/status/timed_out_mask'
-        }] : [])
-      ];
-    }
-  },
+  maskEdge('link-fault-mask', 'hw/status/motor_fault_mask',
+           'Motor fault bits set', 'Motor fault bits resolved', ''),
+  // A bit is set only while that subsystem's requests have been silent for
+  // its owner timeout on a ready link (bit i: the i-th actuator-owning
+  // subsystem in sorted name order), and every bit clears while the gateway
+  // is not configured: a set bit is the problem, a cleared one its end.
+  maskEdge('link-timeout-mask', 'hw/status/timed_out_mask',
+           'Subsystem requests timed out', 'Subsystem request timeouts cleared',
+           'subsystem '),
   // Link counters, reported as runs: gateway counts and identity rejections
   // (warn: an obsolete request from before a reconfiguration or epoch change
   // is dropped by design), ownership rejections (error: a subsystem

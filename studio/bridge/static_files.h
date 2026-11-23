@@ -2,10 +2,13 @@
 
 // Static HTTP file serving shared by studio_bridge and studio_review:
 // MIME lookup, Vite hashed-asset Cache-Control, path containment, symlink
-// escape detection (LinkedOut), size capping and file reading.
+// escape detection (LinkedOut), size capping and file reading; and the
+// bounded, no-follow read of one regular file studio_review's session
+// library uses (ReadBoundedRegularFile).
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -79,5 +82,14 @@ struct StaticFileResult {
 StaticFileResult ReadStaticFile(const std::filesystem::path& root,
                                 std::string_view url,
                                 StaticFileOptions options = {});
+
+// Reads one regular non-symlink file up to `max_bytes` using O_NOFOLLOW +
+// O_NONBLOCK + fstat + bounded chunked reads, so symlinks, FIFOs, device nodes,
+// and growing files never escape confinement, hang, or allocate unbounded
+// memory (REQ-OPS-42, REQ-SAFE-35). Empty when the path is a symlink, not a
+// regular file, empty, larger than `max_bytes` (at open or while read), or
+// unreadable.
+std::optional<std::string> ReadBoundedRegularFile(
+    const std::filesystem::path& path, std::uintmax_t max_bytes);
 
 }  // namespace studio

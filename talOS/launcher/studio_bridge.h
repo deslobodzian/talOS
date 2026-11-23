@@ -2,11 +2,15 @@
 
 #include <sys/types.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
@@ -53,6 +57,61 @@ inline constexpr std::chrono::seconds kStudioBridgeSettleInterval{1};
 // Matches studio_bridge's <= 1 s wake cadence (250 ms graph refresh and 1 s
 // attached segment check, even with zero clients and zero telemetry).
 inline constexpr std::chrono::seconds kStudioBridgePeriod{1};
+
+// One supervision pass's read of a run's registry row (Launcher::WatchRun
+// and StudioBridge::Watch): what RunLiveness judges, the row's `flags`, and
+// what else the caller read from it (`extra`).
+template <typename Extra>
+struct RunRow {
+  RowObservation observation;
+  uint32_t flags{0};
+  Extra extra;
+};
+
+// Reads the row of the run `pid` started in `session_id` at `spawned_ns`
+// (host monotonic): an ACTIVE row with that pid and session and a heartbeat
+// at or after the spawn. An earlier run's row whose pid this run reuses,
+// left active by its kill until the next claim frees it, beats before it:
+// every row this run claims beats at or after its spawn. After the
+// dispatch count and flags, `read(record, flags)` reads what else the
+// caller needs from the row; a row reclaimed or released during the read
+// (its generation or state changed) is passed over, and its reads with it.
+// Nothing without a registry or a matching row. Loads from the mapped
+// segment only: no lock, no disk.
+template <typename Read>
+auto ReadRunRow(const introspect::RegistryMapping* registry, pid_t pid,
+                uint64_t session_id, int64_t spawned_ns, Read&& read)
+    -> std::optional<RunRow<
+        std::invoke_result_t<Read&, const introspect::NodeRecord&, uint32_t>>> {
+  constexpr auto kActive = static_cast<uint64_t>(introspect::SlotState::ACTIVE);
+  if (registry == nullptr) return std::nullopt;
+  for (const auto& record : registry->header()->nodes) {
+    const auto generation = record.generation.load(std::memory_order_acquire);
+    if (record.state.load(std::memory_order_acquire) != kActive) continue;
+    if (record.pid != static_cast<uint64_t>(pid) ||
+        record.session_id != session_id)
+      continue;
+    const auto beat =
+        record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+    if (beat < spawned_ns) continue;
+    const auto dispatch = record.dispatch_count.load(std::memory_order_relaxed);
+    const auto flags = record.flags.load(std::memory_order_acquire);
+    auto extra = read(record, flags);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (record.generation.load(std::memory_order_relaxed) != generation ||
+        record.state.load(std::memory_order_relaxed) != kActive)
+      continue;
+    return RunRow<decltype(extra)>{
+        .observation = {.found = true,
+                        .constructing =
+                            (flags & introspect::kFlagConstructing) != 0,
+                        .heartbeat = beat,
+                        .dispatch = dispatch},
+        .flags = flags,
+        .extra = std::move(extra)};
+  }
+  return std::nullopt;
+}
 
 // Removes Studio's bridge from `specs` and `described` (index for index)
 // when its --describe probe did not answer, missing binary included:

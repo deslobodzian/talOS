@@ -8,12 +8,14 @@
  */
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
 
 #include "talOS/telemetry/frames.h"
+#include "talOS/telemetry/json_string.h"
 #include "talOS/telemetry/telemetry_generated.h"
 
 namespace studio {
@@ -21,42 +23,8 @@ namespace studio {
 inline constexpr int kTelemetryVersion = 3;
 
 using talos::telemetry::AlertLevel;
+using talos::telemetry::AppendEscaped;
 using talos::telemetry::ChannelKind;
-
-inline void AppendEscaped(std::string& out, std::string_view value) {
-  out += '"';
-  for (const char c : value) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        // Control characters have no literal form in JSON, and a topic name
-        // should never contain one; emit the escape rather than invalid JSON.
-        if (static_cast<unsigned char>(c) < 0x20) {
-          static constexpr char kHex[] = "0123456789abcdef";
-          out += "\\u00";
-          out += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
-          out += kHex[static_cast<unsigned char>(c) & 0xF];
-        } else {
-          out += c;
-        }
-    }
-  }
-  out += '"';
-}
 
 // uint64 and int64 leave as quoted decimals: JSON numbers are doubles and
 // silently lose precision past 2^53.
@@ -140,6 +108,44 @@ inline std::string_view AlertLevelName(AlertLevel level) {
     default:
       return "none";
   }
+}
+
+// The /channels.json document: its header (the feed's stream id and the
+// dictionary's id), then each channel's name, unit, kind, enum labels and
+// alert level, in dictionary order. The live bridge (ChannelsJson) and the
+// offline reviewer (Review::Channels) both write it here; `Channels` is a
+// range of either's channel struct (name, unit, labels, kind, alert).
+template <class Channels>
+void AppendChannelsDocument(std::string& out, std::uint64_t stream_id,
+                            std::uint32_t dictionary_id,
+                            const Channels& channels) {
+  out += "{\"kind\":\"talos.telemetry.channels\",\"version\":";
+  out += std::to_string(kTelemetryVersion);
+  out += ",\"stream_id\":";
+  AppendU64(out, stream_id);
+  out += ",\"dictionary_id\":";
+  out += std::to_string(dictionary_id);
+  out += ",\"channels\":[";
+  bool first = true;
+  for (const auto& channel : channels) {
+    if (!first) out += ',';
+    first = false;
+    out += "{\"name\":";
+    AppendEscaped(out, channel.name);
+    out += ",\"unit\":";
+    AppendEscaped(out, channel.unit);
+    out += ",\"kind\":";
+    AppendEscaped(out, ChannelKindName(channel.kind));
+    out += ",\"labels\":[";
+    for (std::size_t j = 0; j < channel.labels.size(); ++j) {
+      if (j != 0) out += ',';
+      AppendEscaped(out, channel.labels[j]);
+    }
+    out += "],\"alert\":";
+    AppendEscaped(out, AlertLevelName(channel.alert));
+    out += '}';
+  }
+  out += "]}";
 }
 
 }  // namespace studio

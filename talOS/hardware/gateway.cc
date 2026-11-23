@@ -44,6 +44,40 @@ bool DrivesNothing(const Command& c, const Config& config) {
   return true;
 }
 
+// Sizes `state`'s device tables and CAN bus count to `config` and gives each
+// slot its device's id, in manifest order: what a Read under `config` fills.
+void PlaceConfiguredDevices(State& state, const Config& config) {
+  state.motor_count = config.motors.size();
+  state.sensor_count = config.sensors.size();
+  state.digital_input_count = config.digital_inputs.size();
+  state.digital_output_count = config.digital_outputs.size();
+  state.analog_input_count = config.analog_inputs.size();
+  state.encoder_count = config.encoders.size();
+  state.pwm_output_count = config.pwm_outputs.size();
+  state.health.can_bus_count = static_cast<uint8_t>(CanBuses(config).count);
+  for (std::size_t i = 0; i < config.motors.size(); ++i) {
+    state.motors[i].id = config.motors[i].id;
+  }
+  for (std::size_t i = 0; i < config.sensors.size(); ++i) {
+    state.sensors[i].id = config.sensors[i].id;
+  }
+  for (std::size_t i = 0; i < config.digital_inputs.size(); ++i) {
+    state.digital_inputs[i].id = config.digital_inputs[i].id;
+  }
+  for (std::size_t i = 0; i < config.digital_outputs.size(); ++i) {
+    state.digital_outputs[i].id = config.digital_outputs[i].id;
+  }
+  for (std::size_t i = 0; i < config.analog_inputs.size(); ++i) {
+    state.analog_inputs[i].id = config.analog_inputs[i].id;
+  }
+  for (std::size_t i = 0; i < config.encoders.size(); ++i) {
+    state.encoders[i].id = config.encoders[i].id;
+  }
+  for (std::size_t i = 0; i < config.pwm_outputs.size(); ++i) {
+    state.pwm_outputs[i].id = config.pwm_outputs[i].id;
+  }
+}
+
 // A State no Backend::Read filled: the gateway reads no device while a
 // configure runs or after one failed, and none under a new configuration
 // before its first Read. Every motor and CAN-sensor sample is invalid with zero
@@ -70,35 +104,7 @@ Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
   }
   state_.boot_id = boot_id;
   state_.epoch = 1;
-  state_.motor_count = config_.motors.size();
-  state_.sensor_count = config_.sensors.size();
-  state_.digital_input_count = config_.digital_inputs.size();
-  state_.digital_output_count = config_.digital_outputs.size();
-  state_.analog_input_count = config_.analog_inputs.size();
-  state_.encoder_count = config_.encoders.size();
-  state_.pwm_output_count = config_.pwm_outputs.size();
-  state_.health.can_bus_count = static_cast<uint8_t>(CanBuses(config_).count);
-  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-    state_.motors[i].id = config_.motors[i].id;
-  }
-  for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
-    state_.sensors[i].id = config_.sensors[i].id;
-  }
-  for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {
-    state_.digital_inputs[i].id = config_.digital_inputs[i].id;
-  }
-  for (std::size_t i = 0; i < config_.digital_outputs.size(); ++i) {
-    state_.digital_outputs[i].id = config_.digital_outputs[i].id;
-  }
-  for (std::size_t i = 0; i < config_.analog_inputs.size(); ++i) {
-    state_.analog_inputs[i].id = config_.analog_inputs[i].id;
-  }
-  for (std::size_t i = 0; i < config_.encoders.size(); ++i) {
-    state_.encoders[i].id = config_.encoders[i].id;
-  }
-  for (std::size_t i = 0; i < config_.pwm_outputs.size(); ++i) {
-    state_.pwm_outputs[i].id = config_.pwm_outputs[i].id;
-  }
+  PlaceConfiguredDevices(state_, config_);
   configured_ = backend_.Configure(config_);
   fault_ = !configured_;
   if (!configured_) config_error_ = backend_.last_config_error();
@@ -174,35 +180,7 @@ bool Gateway::BeginReconfigure(const Config& config) {
 void Gateway::CommitConfiguration(const Config& config) {
   config_ = config;
   state_.config_id = TryConfigurationId(config_);
-  state_.motor_count = config_.motors.size();
-  state_.sensor_count = config_.sensors.size();
-  state_.digital_input_count = config_.digital_inputs.size();
-  state_.digital_output_count = config_.digital_outputs.size();
-  state_.analog_input_count = config_.analog_inputs.size();
-  state_.encoder_count = config_.encoders.size();
-  state_.pwm_output_count = config_.pwm_outputs.size();
-  state_.health.can_bus_count = static_cast<uint8_t>(CanBuses(config_).count);
-  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-    state_.motors[i].id = config_.motors[i].id;
-  }
-  for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
-    state_.sensors[i].id = config_.sensors[i].id;
-  }
-  for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {
-    state_.digital_inputs[i].id = config_.digital_inputs[i].id;
-  }
-  for (std::size_t i = 0; i < config_.digital_outputs.size(); ++i) {
-    state_.digital_outputs[i].id = config_.digital_outputs[i].id;
-  }
-  for (std::size_t i = 0; i < config_.analog_inputs.size(); ++i) {
-    state_.analog_inputs[i].id = config_.analog_inputs[i].id;
-  }
-  for (std::size_t i = 0; i < config_.encoders.size(); ++i) {
-    state_.encoders[i].id = config_.encoders[i].id;
-  }
-  for (std::size_t i = 0; i < config_.pwm_outputs.size(); ++i) {
-    state_.pwm_outputs[i].id = config_.pwm_outputs[i].id;
-  }
+  PlaceConfiguredDevices(state_, config_);
   configured_ = true;
   fault_ = false;
   consecutive_apply_failures_ = 0;

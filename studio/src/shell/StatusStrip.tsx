@@ -7,17 +7,8 @@ import type {ReactNode} from 'react';
 
 import {useChannelStale, usePlayback, useRobotStatus} from '../data/hooks';
 import {FreshnessNotice} from '../ui/FreshnessNotice';
-import type {DriverStationMode} from '../data/types';
 import {duration, number} from '../ui/formatters';
-
-const DS_LABEL: Record<DriverStationMode, string> = {
-  disconnected: 'DISCONNECTED',
-  disabled: 'DISABLED',
-  autonomous: 'AUTONOMOUS',
-  teleop: 'TELEOP',
-  test: 'TEST',
-  estop: 'E-STOP'
-};
+import {MODE_LABEL} from '../panels/robot';
 
 function Item({label, value, tone, unknown, channel}: {
   label: string; value: ReactNode; tone?: string; unknown?: boolean; channel?: string;
@@ -49,7 +40,7 @@ export function StatusStrip() {
     {playback.updates && <Item label="UI updates" value={`${playback.updates.dropped} dropped · ${playback.updates.coalesced} coalesced`}/>}
     <span className={'status-item mode' + (ds.mode ? ' ' + ds.mode : ' unknown')}>
       <small>DS</small>
-      <b>{ds.mode ? DS_LABEL[ds.mode] : '—'}{dsStale && <em className="text-warn"> · STALE</em>}</b>
+      <b>{ds.mode ? MODE_LABEL[ds.mode] : '—'}{dsStale && <em className="text-warn"> · STALE</em>}</b>
     </span>
     <Item label="Enabled" channel="hw/state/driver_station/enabled" tone={ds.enabled === null ? undefined : ds.enabled ? 'ok' : 'warn'} unknown={ds.enabled === null}
           value={ds.enabled === null ? '—' : ds.enabled ? 'yes' : 'no'}/>

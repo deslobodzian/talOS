@@ -11,6 +11,7 @@ cc_library(
     hdrs = ["recording.h"],
     deps = [
         "//talOS/vision:calibration",
+        "//talOS/vision/field_sim:json_parser",
     ],
 )
 

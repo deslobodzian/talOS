@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 
+#include "../driver_station/little_endian.h"
 #include "../protocol/frame.h"
 #include "gateway.h"
 
@@ -12,20 +13,7 @@ namespace talos::hardware {
 static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
 static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
 namespace {
-struct Writer {
-  std::span<uint8_t> data;
-  std::size_t pos{};
-  bool ok{true};
-  void Int(uint64_t value, int size) {
-    for (int i = 0; i < size; ++i) {
-      if (pos == data.size()) {
-        ok = false;
-        return;
-      }
-      data[pos++] = static_cast<uint8_t>(value);
-      value >>= 8;
-    }
-  }
+struct Writer : driver_station::LittleEndianWriter {
   void Real(double x) { Int(std::bit_cast<uint64_t>(x), 8); }
   void Float(float x) { Int(std::bit_cast<uint32_t>(x), 4); }
   void Tenths(double x) {
@@ -38,36 +26,37 @@ struct Writer {
     Int(static_cast<uint16_t>(value), 2);
   }
 };
-struct Reader {
-  std::span<const uint8_t> data;
-  std::size_t pos{};
-  bool ok{true};
-  uint64_t Int(int size) {
-    uint64_t value{};
-    for (int i = 0; i < size; ++i) {
-      if (pos == data.size()) {
-        ok = false;
-        return 0;
-      }
-      value |= uint64_t{data[pos++]} << (i * 8);
-    }
-    return value;
-  }
+struct Reader : driver_station::LittleEndianReader {
   double Real() {
     const double x = std::bit_cast<double>(Int(8));
-    ok &= std::isfinite(x);
-    return x;
-  }
-  float Float() {
-    const float x = std::bit_cast<float>(static_cast<uint32_t>(Int(4)));
     ok &= std::isfinite(x);
     return x;
   }
   double Tenths() {
     return std::bit_cast<int16_t>(static_cast<uint16_t>(Int(2))) / 10.0;
   }
-  bool Done() const { return ok && pos == data.size(); }
 };
+// A State's digital input or output sample (DigitalInputSample and
+// DigitalOutputSample have the same fields): its id, then valid and value as
+// one byte each, 0 or 1.
+template <typename Sample>
+void WriteDigitalSample(Writer& w, const Sample& d) {
+  w.Int(d.id, 2);
+  w.Int(d.valid ? 1 : 0, 1);
+  w.Int(d.value ? 1 : 0, 1);
+}
+// False, with the payload refused, on a valid or value byte other than 0 or 1.
+template <typename Sample>
+bool ReadDigitalSample(Reader& r, Sample& d) {
+  d.id = r.Int(2);
+  auto valid = r.Int(1);
+  if (valid > 1) return false;
+  d.valid = (valid == 1);
+  auto val = r.Int(1);
+  if (val > 1) return false;
+  d.value = (val == 1);
+  return true;
+}
 // A PWM request off or a pulse, and off in its one encoding: mode 0 and
 // output +0.0 (all eight bytes zero), so off and a pulse of 0 never read as
 // each other. Decode admits only this; Encode writes off this way itself.
@@ -81,7 +70,7 @@ std::size_t Encode(const Command& c, std::span<uint8_t> data) {
       c.pwm_output_count > kMaxPwmOutputs) {
     return 0;
   }
-  Writer w{data};
+  Writer w{{data}};
   w.Int(c.config_id, 8);
   w.Int(c.boot_id, 8);
   w.Int(c.epoch, 8);
@@ -119,7 +108,7 @@ std::size_t Encode(const Command& c, std::span<uint8_t> data) {
 }
 bool Decode(std::span<const uint8_t> data, Command& out) {
   Command c{};
-  Reader r{data};
+  Reader r{{data}};
   c.config_id = r.Int(8);
   c.boot_id = r.Int(8);
   c.epoch = r.Int(8);
@@ -172,7 +161,7 @@ std::size_t EncodeUnsanitizedState(const State& s, std::span<uint8_t> data) {
       s.health.can_bus.read_state > kLastCanBusReadState) {
     return 0;
   }
-  Writer w{data};
+  Writer w{{data}};
   w.Int(s.config_id, 8);
   w.Int(s.boot_id, 8);
   w.Int(s.epoch, 8);
@@ -215,16 +204,10 @@ std::size_t EncodeUnsanitizedState(const State& s, std::span<uint8_t> data) {
     w.Int(x.velocity_age_us, 4);
   }
   for (std::size_t i = 0; i < s.digital_input_count; ++i) {
-    const auto& d = s.digital_inputs[i];
-    w.Int(d.id, 2);
-    w.Int(d.valid ? 1 : 0, 1);
-    w.Int(d.value ? 1 : 0, 1);
+    WriteDigitalSample(w, s.digital_inputs[i]);
   }
   for (std::size_t i = 0; i < s.digital_output_count; ++i) {
-    const auto& d = s.digital_outputs[i];
-    w.Int(d.id, 2);
-    w.Int(d.valid ? 1 : 0, 1);
-    w.Int(d.value ? 1 : 0, 1);
+    WriteDigitalSample(w, s.digital_outputs[i]);
   }
   for (std::size_t i = 0; i < s.analog_input_count; ++i) {
     const auto& a = s.analog_inputs[i];
@@ -274,7 +257,7 @@ std::size_t Encode(const State& s, std::span<uint8_t> data) {
 }
 bool Decode(std::span<const uint8_t> data, State& out) {
   State s{};
-  Reader r{data};
+  Reader r{{data}};
   s.config_id = r.Int(8);
   s.boot_id = r.Int(8);
   s.epoch = r.Int(8);
@@ -333,24 +316,10 @@ bool Decode(std::span<const uint8_t> data, State& out) {
     x.velocity_age_us = r.Int(4);
   }
   for (std::size_t i = 0; i < s.digital_input_count; ++i) {
-    auto& d = s.digital_inputs[i];
-    d.id = r.Int(2);
-    auto valid = r.Int(1);
-    if (valid > 1) return false;
-    d.valid = (valid == 1);
-    auto val = r.Int(1);
-    if (val > 1) return false;
-    d.value = (val == 1);
+    if (!ReadDigitalSample(r, s.digital_inputs[i])) return false;
   }
   for (std::size_t i = 0; i < s.digital_output_count; ++i) {
-    auto& d = s.digital_outputs[i];
-    d.id = r.Int(2);
-    auto valid = r.Int(1);
-    if (valid > 1) return false;
-    d.valid = (valid == 1);
-    auto val = r.Int(1);
-    if (val > 1) return false;
-    d.value = (val == 1);
+    if (!ReadDigitalSample(r, s.digital_outputs[i])) return false;
   }
   for (std::size_t i = 0; i < s.analog_input_count; ++i) {
     auto& a = s.analog_inputs[i];

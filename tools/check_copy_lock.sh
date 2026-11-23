@@ -1,6 +1,7 @@
 # Sourced by tools/check_robot_repo_scaffold.sh and
 # tools/check_robot_repository.sh, which each build a copy of a robot
-# repository against this talOS checkout. The caller defines die().
+# repository against this talOS checkout. The caller defines die() and the
+# copy's path, $copy.
 #
 #   take_copy_lock LOCK WHAT   mkdir LOCK, or take it from a dead holder;
 #                              dies naming WHAT when a live run holds it.
@@ -18,6 +19,7 @@
 #                              directory. Returns 1 when RC has no such
 #                              import (RC is then unchanged but for the
 #                              status command), 2 when it cannot rewrite RC.
+#   remove_copy                removes $copy, write-protected files included.
 #
 # The pid file appears whole (written beside it, then renamed), as in
 # tools/prepush.sh, so a lock without one is being taken, or its run was
@@ -52,6 +54,13 @@ take_copy_lock() {
   else
     { echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
       die "cannot write $lock/pid"
+  fi
+}
+
+remove_copy() {
+  if [ -e "$copy" ]; then
+    chmod -R u+w "$copy" 2>/dev/null
+    rm -rf "$copy"
   fi
 }
 

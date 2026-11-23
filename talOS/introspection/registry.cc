@@ -31,6 +31,14 @@
 
 namespace talos::introspect {
 
+namespace {
+
+// kLivenessTimeout in the registry's heartbeat unit (monotonic_now_ns).
+constexpr std::int64_t kLivenessTimeoutNs =
+    std::chrono::nanoseconds{kLivenessTimeout}.count();
+
+}  // namespace
+
 RegistryLock::RegistryLock(const std::string& mapped_path)
     : RegistryLock(mapped_path, std::nullopt) {}
 
@@ -462,9 +470,6 @@ void NodeRegistration::release() {
 // session's ghosts -- and only touches slots whose owner is gone.
 void NodeRegistration::sweep_stale(RegistryHeader* header) {
   const std::int64_t now = monotonic_now_ns();
-  const std::int64_t timeout =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
-          .count();
   for (std::size_t i = 0; i < kMaxNodes; ++i) {
     NodeRecord& record = header->nodes[i];
     // A live claimant/sweeper holds RegistryLock until its state commit.
@@ -485,7 +490,7 @@ void NodeRegistration::sweep_stale(RegistryHeader* header) {
     const std::uint64_t claimant =
         (record.pid_start << kProcessPidBits) | record.pid;
     const auto& beat = record.heartbeat_monotonic_ns;
-    if (now - beat.load(std::memory_order_relaxed) < timeout &&
+    if (now - beat.load(std::memory_order_relaxed) < kLivenessTimeoutNs &&
         talos::ProcessWordAlive(claimant)) {
       continue;
     }
@@ -498,8 +503,9 @@ void NodeRegistration::sweep_stale(RegistryHeader* header) {
             std::memory_order_acq_rel)) {
       continue;
     }
-    const bool gone = now - beat.load(std::memory_order_relaxed) >= timeout ||
-                      !talos::ProcessWordAlive(claimant);
+    const bool gone =
+        now - beat.load(std::memory_order_relaxed) >= kLivenessTimeoutNs ||
+        !talos::ProcessWordAlive(claimant);
     record.state.store(gone ? static_cast<std::uint64_t>(SlotState::FREE)
                             : static_cast<std::uint64_t>(SlotState::ACTIVE),
                        std::memory_order_release);
@@ -600,16 +606,13 @@ NodeRecord* NodeRegistration::claim_oldest_free(RegistryHeader* header) {
 NodeRecord* NodeRegistration::claim_where(RegistryHeader* header,
                                           SlotState from, bool require_stale) {
   const std::int64_t now = monotonic_now_ns();
-  const std::int64_t timeout =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
-          .count();
 
   for (std::size_t i = 0; i < kMaxNodes; ++i) {
     NodeRecord& record = header->nodes[i];
     if (require_stale) {
       const std::int64_t beat =
           record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
-      if (now - beat < timeout) {
+      if (now - beat < kLivenessTimeoutNs) {
         continue;
       }
     }
@@ -679,13 +682,10 @@ std::vector<NodeSnapshot> RegistryReader::held_rows() const {
   std::vector<NodeSnapshot> out;
   const RegistryHeader* header = mapping_.header();
   const std::int64_t now = monotonic_now_ns();
-  const std::int64_t timeout =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
-          .count();
   for (std::size_t i = 0; i < kMaxNodes; ++i) {
     auto row = read_stable_row(header->nodes[i], i);
     if (!row) continue;
-    if (now - row->node.heartbeat_monotonic_ns >= timeout ||
+    if (now - row->node.heartbeat_monotonic_ns >= kLivenessTimeoutNs ||
         !talos::ProcessWordAlive(row->claimant)) {
       continue;
     }
@@ -699,18 +699,16 @@ std::vector<NodeSnapshot> RegistryReader::nodes() const {
   std::vector<NodeSnapshot> out;
   const RegistryHeader* header = mapping_.header();
   const std::int64_t now = monotonic_now_ns();
-  const std::int64_t timeout =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
-          .count();
 
   for (std::size_t i = 0; i < kMaxNodes; ++i) {
     auto row = read_stable_row(header->nodes[i], i);
     if (!row) continue;
     // A crashed owner's heartbeat stays fresh for kLivenessTimeout, so
     // its process is checked too, as the claim sweep checks it.
-    row->node.alive = now - row->node.heartbeat_monotonic_ns < timeout &&
-                      (row->node.flags & kFlagConstructing) == 0 &&
-                      talos::ProcessWordAlive(row->claimant);
+    row->node.alive =
+        now - row->node.heartbeat_monotonic_ns < kLivenessTimeoutNs &&
+        (row->node.flags & kFlagConstructing) == 0 &&
+        talos::ProcessWordAlive(row->claimant);
     out.push_back(std::move(row->node));
   }
   return out;
