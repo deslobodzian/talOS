@@ -48,6 +48,7 @@
 #include <string_view>
 #include <vector>
 
+#include "talOS/events/time.h"
 #include "talOS/node/node.h"
 #include "talOS/node/sim_access.h"
 
@@ -118,6 +119,41 @@ class Sim {
   Sim();
   struct Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+// Node class T, with the wall time of each tick recorded for an update()
+// timing benchmark: from just before T::update() to an after_update hook
+// registered after T's constructor, so it also covers the hooks T's
+// constructor registered (the devices layer's hardware-request flush).
+// Add it as sim.add<TimedNode<T>>(name), then bind() where samples go: each
+// tick appends one, in nanoseconds, while *recording is true.
+template <class T>
+class TimedNode {
+ public:
+  explicit TimedNode(Node& node) : inner_{node} {
+    node.after_update([this] {
+      const auto elapsed_ns = (event::steady_now() - tick_start_).count();
+      if (recording_ != nullptr && *recording_ && samples_ns_ != nullptr) {
+        samples_ns_->push_back(elapsed_ns);
+      }
+    });
+  }
+
+  void bind(std::vector<std::int64_t>* samples_ns, const bool* recording) {
+    samples_ns_ = samples_ns;
+    recording_ = recording;
+  }
+
+  void update() {
+    tick_start_ = event::steady_now();
+    inner_.update();
+  }
+
+ private:
+  T inner_;
+  event::MonotonicTime tick_start_{};
+  std::vector<std::int64_t>* samples_ns_ = nullptr;
+  const bool* recording_ = nullptr;
 };
 
 }  // namespace talos::testing
