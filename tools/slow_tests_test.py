@@ -161,6 +161,75 @@ class SlowTestsTest(unittest.TestCase):
                     slow_tests.query_lanes()
                 self.assertNotEqual(raised.exception.code, 0)
 
+    # REQ-DEV-25: query_lanes assigns the same lane precedence as lane_of
+    # (heavy > integration > e2e > perf) for targets carrying multiple lane tags.
+    def test_lane_query_matches_lane_of_precedence(self):
+        per_lane = {
+            "heavy": "//a:heavy_and_int\n//a:all_lanes\n",
+            "integration": "//a:heavy_and_int\n//a:int_and_perf\n",
+            "e2e": "//a:all_lanes\n//a:e2e_and_perf\n",
+            "perf": "//a:all_lanes\n//a:int_and_perf\n//a:e2e_and_perf\n",
+        }
+
+        def fake_run(cmd, **_kwargs):
+            expr = cmd[-1]
+            for lane, out in per_lane.items():
+                if lane in expr:
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout=out, stderr="")
+            raise AssertionError(f"unexpected query: {expr}")
+
+        with mock.patch.object(slow_tests.subprocess, "run",
+                               side_effect=fake_run):
+            lanes = slow_tests.query_lanes()
+        self.assertEqual(lanes["//a:heavy_and_int"],
+                         slow_tests.lane_of(["heavy", "integration"]))
+        self.assertEqual(lanes["//a:all_lanes"],
+                         slow_tests.lane_of(["heavy", "e2e", "perf"]))
+        self.assertEqual(lanes["//a:int_and_perf"],
+                         slow_tests.lane_of(["integration", "perf"]))
+        self.assertEqual(lanes["//a:e2e_and_perf"],
+                         slow_tests.lane_of(["e2e", "perf"]))
+
+    # REQ-DEV-25: exit code 3 from bazel query fails closed whenever stderr
+    # reports any non-external (workspace) package failure or no external error.
+    def test_lane_query_exit_3_fails_closed_on_workspace_errors(self):
+        external_stderr = (
+            "ERROR: /cache/_bazel/external/opencv+/BUILD.bazel:258:11: "
+            "no such package '@@androidndk//': missing and referenced by "
+            "'@@opencv+//:core'\n"
+            'ERROR: Evaluation of query "tests(//...)" failed: '
+            "errors were encountered while computing transitive closure\n"
+        )
+        ok_proc = subprocess.CompletedProcess(
+            [], 3, stdout="//a:sim_test\n", stderr=external_stderr)
+        with mock.patch.object(slow_tests.subprocess, "run",
+                               return_value=ok_proc):
+            self.assertEqual(slow_tests.query_lanes(),
+                             {"//a:sim_test": "heavy"})
+
+        for name, stderr in (
+                ("workspace_syntax_error",
+                 "ERROR: /repo/bench/arm/BUILD:1:1: syntax error\n"),
+                ("workspace_package_error",
+                 "ERROR: error loading package 'bench/arm': broken\n"),
+                ("bzlmod_main_repo_load_error",
+                 "ERROR: error loading package '@@//bench/arm': broken\n"),
+                ("mixed_external_and_workspace",
+                 external_stderr +
+                 "ERROR: Skipping '//bench/arm/...': error loading package\n"),
+                ("empty_stderr", ""),
+                ("unrecognized_error", "ERROR: no server\n")):
+            with self.subTest(name=name):
+                bad_proc = subprocess.CompletedProcess(
+                    [], 3, stdout="//a:sim_test\n", stderr=stderr)
+                with mock.patch.object(slow_tests.subprocess, "run",
+                                       return_value=bad_proc), \
+                        self.assertRaises(SystemExit) as raised, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    slow_tests.query_lanes()
+                self.assertNotEqual(raised.exception.code, 0)
+
     def test_check_holds_untagged_tests_to_five_seconds_and_tagged_to_their_lane(self):
         results = [("//a:unit_test", 5.5), ("//a:ok_test", 4.9),
                    ("//a:sim_test (shard_1_of_2)", 29.0), ("//a:sim_test", 31.0),

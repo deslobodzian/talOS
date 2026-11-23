@@ -30,6 +30,28 @@ say() { printf 'deploy: %s\n' "$*"; }
 die() { printf 'deploy: error: %s\n' "$*" >&2; exit 1; }
 run() { if [ "$DRY_RUN" = "1" ]; then printf '+ %s\n' "$*"; else "$@"; fi; }
 
+# Reject unsafe prefix paths before writing systemd units or launchd XML plists.
+validate_prefix() {
+  local p="$1"
+  [ -n "$p" ] || die "invalid --prefix: must not be empty"
+  case "$p" in
+    /*) ;;
+    *) die "invalid --prefix '$p': must be an absolute path" ;;
+  esac
+  local bad
+  bad="$(LC_ALL=C; case "$p" in *[[:space:][:cntrl:]]*|*[\<\>\&\"\'\\]*) echo 1 ;; esac)"
+  [ -z "$bad" ] ||
+    die "invalid --prefix: must not contain whitespace, control, quote, backslash, or XML-special characters"
+}
+
+validate_user() {
+  local u="$1"
+  local bad
+  bad="$(LC_ALL=C; case "$u" in [a-z_]*) case "$u" in *[!a-z0-9_.-]*) echo 1 ;; esac ;; *) echo 1 ;; esac)"
+  [ -z "$bad" ] ||
+    die "invalid --user: must match ^[a-z_][a-z0-9_.-]*$"
+}
+
 # Rename the link itself even when the destination names a directory.
 select_bundle() {
   run python3 -c '
@@ -848,6 +870,8 @@ cmd_enable_boot() {
       *) break ;;
     esac
   done
+  validate_prefix "$PREFIX"
+  validate_user "$user"
   local darwin=0
   [ "$(uname -s)" = "Darwin" ] && darwin=1
   if [ "$darwin" = "1" ]; then
@@ -901,7 +925,7 @@ StartLimitIntervalSec=0
 Type=notify
 User=$user
 Environment=\"TALOS_LOG_DIR=$PREFIX/logs\"
-ExecStart=$PREFIX/current/run.sh --serve-refusal
+ExecStart=\"$PREFIX/current/run.sh\" --serve-refusal
 TimeoutStartSec=1200
 KillMode=mixed
 TimeoutStopSec=90
@@ -1000,7 +1024,7 @@ $stderr_log $user:$group 644 4 1024 * NB"
     printf '%s\n' "$unit"
     return 0
   fi
-  echo "$unit" | sudo tee /etc/systemd/system/talos.service >/dev/null
+  printf '%s' "$unit" | sudo tee /etc/systemd/system/talos.service >/dev/null
   sudo systemctl daemon-reload
   sudo systemctl enable talos.service
   say "boot start enabled (talos.service)"
@@ -1339,7 +1363,9 @@ main() {
   # Absolute: install writes it into the `current`/`previous` link targets
   # and enable-boot into the unit; neither may depend on the caller's
   # working directory.
+  [ -n "$PREFIX" ] || die "invalid --prefix: must not be empty"
   case "$PREFIX" in /*) ;; *) PREFIX="$(pwd -P)/$PREFIX" ;; esac
+  validate_prefix "$PREFIX"
   if [ "${#rest[@]}" -gt 0 ]; then
     set -- "${rest[@]}"
   else

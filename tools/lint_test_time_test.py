@@ -513,6 +513,85 @@ class LintTestTimeTest(unittest.TestCase):
                 self.assertEqual(failures, 1, out)
                 self.assertIn(f"stale entry `{path} {kind}`", out)
 
+    # REQ-RT-17: files in subdirectories of a node package belong to that node
+    # package up to any nested BUILD / BUILD.bazel boundary.
+    def test_node_package_subdirectories_scanned_up_to_nested_build_boundary(
+            self):
+        for path, text, kind, extra in (
+                ("bench/arm/detail/helper.cc", CLOCK_GETTIME, "clock",
+                 {"bench/arm/BUILD": NODE_BUILD}),
+                ("bench/arm/sub/deep/helper.h", STD_MUTEX, "lock",
+                 {"bench/arm/BUILD": NODE_BUILD}),
+                ("examples/arm/internal/util.py", PY_IMPORT_RANDOM, "random",
+                 {"examples/arm/BUILD.bazel": PY_NODE_BUILD}),
+                ("talOS/teleop/detail/helper.cc", STD_CERR, "io", {})):
+            with self.subTest(caught=path):
+                failures, out = lint({path: text, **extra})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{path}:1: {kind}", out)
+
+        # A nested BUILD or BUILD.bazel starts a separate non-node package.
+        failures, out = lint({
+            "bench/arm/BUILD": NODE_BUILD,
+            "bench/arm/subpkg/BUILD": 'cc_library(name = "sub")\n',
+            "bench/arm/subpkg/tool.cc": CLOCK_GETTIME + STD_MUTEX + STD_COUT,
+            "bench/arm/subpkg/inner/tool.cc": STD_RAND + SLEEP,
+            "talOS/teleop/subpkg/BUILD.bazel": 'cc_library(name = "sub")\n',
+            "talOS/teleop/subpkg/helper.cc": STD_CERR + STD_MUTEX,
+        })
+        self.assertEqual(failures, 0, out)
+
+    # REQ-RT-17: multiline invocations split across lines (or comments) are
+    # still caught for clock, sleep, random, io, and lock.
+    def test_multiline_invocations_are_caught(self):
+        cc_node = ("bench/main_processor/motor/motor.cc",
+                   {"bench/main_processor/motor/BUILD": NODE_BUILD})
+        py_node = ("examples/arm/arm.py",
+                   {"examples/arm/BUILD.bazel": PY_NODE_BUILD})
+        cases = (
+            ("cc_multiline_clock", *cc_node,
+             "auto t = std::chrono::steady_clock::\n    " + "now();\n",
+             "clock", 1),
+            ("cc_multiline_sleep", *cc_node,
+             "std::this_thread::sleep" + "_for\n    (1ms);\n",
+             "sleep", 1),
+            ("cc_multiline_random", *cc_node,
+             "int x = std::" + "rand\n    ();\n",
+             "random", 1),
+            ("cc_multiline_io_stream", *cc_node,
+             "std::\n    " + "cout << 1;\n",
+             "io", 1),
+            ("cc_multiline_io_printf", *cc_node,
+             "prin" + 'tf\n    ("%d", x);\n',
+             "io", 1),
+            ("cc_multiline_lock", *cc_node,
+             "std::\n    " + "mutex mu_;\n",
+             "lock", 1),
+            ("py_multiline_clock", *py_node,
+             "t = (\n    time\n    ." + "monotonic()\n)\n",
+             "clock", 2),
+            ("py_multiline_sleep", *py_node,
+             "time.sleep \\\n    " + "(0.1)\n",
+             "sleep", 1),
+            ("py_multiline_from_os_urandom", *py_node,
+             "from os import (\n    path,\n    " + "urandom,\n)\n",
+             "random", 1),
+            ("py_multiline_io_print", *py_node,
+             "pri" + 'nt \\\n    ("hi")\n',
+             "io", 1),
+            ("py_multiline_from_threading_lock", *py_node,
+             "from threading import (\n    Event,\n    " + "Lock,\n)\n",
+             "lock", 1),
+            ("py_multiline_threading_lock_attr", *py_node,
+             "mu = (\n    threading\n    ." + "Lock()\n)\n",
+             "lock", 2),
+        )
+        for name, path, extra, text, kind, expected_line in cases:
+            with self.subTest(name=name):
+                failures, out = lint({path: text, **extra})
+                self.assertEqual(failures, 1, out)
+                self.assertIn(f"{path}:{expected_line}: {kind}", out)
+
 
 if __name__ == "__main__":
     unittest.main()

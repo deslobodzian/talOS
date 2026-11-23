@@ -2,7 +2,9 @@
 
 import collections
 import io
+import subprocess
 import unittest
+from unittest import mock
 
 from tools import check_layers
 
@@ -572,6 +574,66 @@ class CheckLayersTest(unittest.TestCase):
                 self.assertGreaterEqual(failures, 1, out)
                 if to not in ("//studio/bridge:system",):
                     self.assertIn(f"  {to}\n", out)
+
+    # REQ-CONTRACT-16, REQ-SAFE-27, REQ-SAFE-35
+    def test_bazel_query_exit_3_fails_closed_on_workspace_errors(self):
+        external_only_stderr = (
+            "ERROR: /cache/_bazel/external/rules_android_ndk+/rules.bzl:28:13: "
+            "An error occurred during the fetch of repository 'androidndk':\n"
+            "ERROR: /cache/_bazel/external/opencv+/BUILD.bazel:258:11: "
+            "no such package '@@androidndk//': missing and referenced by "
+            "'@@opencv+//:core'\n"
+            'ERROR: Evaluation of query "somepath(//talOS/..., //bench/...)" '
+            "failed: errors were encountered while computing transitive closure\n"
+        )
+        external_pkg_stderr = (
+            "ERROR: error loading package '@opencv+//': missing ndk\n"
+            'ERROR: Evaluation of query "somepath(//talOS/..., //bench/...)" '
+            "failed: errors were encountered while computing transitive closure\n"
+        )
+        bazel = check_layers.Bazel()
+        for name, stderr in (
+                ("external_path_errors", external_only_stderr),
+                ("external_at_package_error", external_pkg_stderr)):
+            with self.subTest(allowed=name):
+                proc = subprocess.CompletedProcess(
+                    [], 3, stdout="//a:b\n", stderr=stderr)
+                with mock.patch.object(check_layers.subprocess, "run",
+                                       return_value=proc):
+                    self.assertEqual(bazel.query("somepath(//a, //b)"),
+                                     ["//a:b"])
+
+        workspace_failures = (
+            ("workspace_build_syntax_error",
+             "ERROR: /repo/bench/arm/BUILD:3:1: syntax error at 'bad'\n"
+             'ERROR: Evaluation of query "x" failed: errors were encountered '
+             "while computing transitive closure\n"),
+            ("workspace_package_load_error",
+             "ERROR: error loading package 'bench/arm': cannot load '//x:y.bzl'\n"),
+            ("bzlmod_main_repo_load_error",
+             "ERROR: error loading package '@@//bench/arm': cannot load\n"),
+            ("mixed_external_and_workspace_error",
+             external_only_stderr +
+             "ERROR: Skipping '//bench/arm/...': error loading package 'bench/arm'\n"),
+            ("external_error_referenced_by_workspace_target",
+             "ERROR: /cache/_bazel/external/foo+/BUILD.bazel:1:1: "
+             "no such package '@@bar//': missing and referenced by "
+             "'//bench/arm:node'\n"),
+            ("empty_stderr", ""),
+            ("summary_only_no_external_error",
+             'ERROR: Evaluation of query "x" failed: errors were encountered '
+             "while computing transitive closure\n"),
+        )
+        for name, stderr in workspace_failures:
+            with self.subTest(rejected=name):
+                proc = subprocess.CompletedProcess(
+                    [], 3, stdout="", stderr=stderr)
+                with mock.patch.object(check_layers.subprocess, "run",
+                                       return_value=proc), \
+                        mock.patch.object(check_layers.sys, "stderr",
+                                          io.StringIO()), \
+                        self.assertRaises(RuntimeError):
+                    bazel.query("somepath(//talOS/..., //bench/...)")
 
 
 class CheckNodeSourcesTest(unittest.TestCase):
@@ -1383,6 +1445,31 @@ class CheckNodeSourcesTest(unittest.TestCase):
         failures, out = run_sources(starlark_files)
         self.assertGreaterEqual(failures, 1, out)
         self.assertIn("bench/arm/BUILD:1:", out)
+
+    # REQ-SAFE-27, REQ-CONTRACT-16
+    def test_horizontal_whitespace_vt_and_ff_in_include_directives_are_caught(
+            self):
+        cases = [
+            ("vt_before_hash", '\x0b#include "talOS/node/access.h"\n'),
+            ("ff_before_hash", '\x0c#include <talOS/rtms/rtms.h>\n'),
+            ("vt_after_hash", '#\x0binclude "talOS/node/access.h"\n'),
+            ("ff_after_hash", '#\x0cinclude "talOS/devices/access.h"\n'),
+            ("vt_before_header", '#include\x0b"talOS/ipc/publisher.h"\n'),
+            ("ff_before_header", '#include\x0c<talOS/node/internal.h>\n'),
+            ("vt_after_backslash_continuation",
+             '#inc\\\x0b\nlude "talOS/node/access.h"\n'),
+            ("ff_after_backslash_continuation",
+             '#inc\\\x0c\nlude "talOS/node/access.h"\n'),
+        ]
+        for name, body in cases:
+            with self.subTest(name=name):
+                files = {
+                    "bench/arm/BUILD": self.NODE_BUILD,
+                    "bench/arm/arm.cc": body,
+                }
+                failures, out = run_sources(files)
+                self.assertGreaterEqual(failures, 1, f"{name}: {out}")
+                self.assertIn("bench/arm/arm.cc:1:", out)
 
 
 if __name__ == "__main__":

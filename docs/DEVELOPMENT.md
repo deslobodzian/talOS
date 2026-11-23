@@ -129,7 +129,7 @@ run, and the run exits nonzero. Every robot and example config's
 `--describe-only` runs as its `talos_graph_test`, the bundle test's fixture
 `bench/main_processor/bundle_testdata` included. When the commits to push
 touch `MODULE.bazel`, `REPO.bazel`, `talos.bazelrc`, `.bazelversion`,
-`third_party/`, `talOS/`, `tools/`, `examples/robot_repo/`, or
+`third_party/`, `talOS/`, `studio/`, `tools/`, `examples/robot_repo/`, or
 `examples/wrist_repo/`, prepush also runs `dependent-robot_repo` and
 `dependent-wrist_repo` (`bazel test //... @talos//talOS/configuration:config_fuzz_test`
 in each; CI's `robot-repo` job also sets `--test_env=TALOS_REQUIRE_STUDIO_PAGES=1`) and `scaffold-robot_repo` (`tools/check_robot_repo_scaffold.sh`).
