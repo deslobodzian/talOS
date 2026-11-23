@@ -32,12 +32,12 @@ function enumLabel(s: Snapshot|null, name: string, value: number): string {
 }
 
 // A set bit list for a fault/status mask, "cleared" when the mask is zero.
-function maskDetail(value: number): string {
+function maskDetail(value: bigint): string {
   const bits: number[] = [];
-  let v = Math.trunc(value);
-  for (let i = 0; i < 53 && v !== 0; i++) {
-    if (v & 1) bits.push(i);
-    v = Math.floor(v / 2);
+  let v = value;
+  for (let i = 0; i < 64 && v !== 0n; i++) {
+    if (v & 1n) bits.push(i);
+    v >>= 1n;
   }
   return bits.length ? `bits: ${bits.join(', ')}` : 'cleared';
 }
@@ -63,18 +63,18 @@ function maskEdge(id: string, channel: string, setTitle: string,
     detect(prev, next) {
       const a = val(prev, channel), b = val(next, channel);
       if (a === undefined || b === undefined || a === b ||
-          !Number.isFinite(a) || !Number.isFinite(b)) return [];
+          !Number.isFinite(a) || !Number.isFinite(b) || a < 0 || b < 0) return [];
       const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
       const added = after & ~before, cleared = before & ~after;
       return [
         ...(added ? [{
           severity: 'warn' as const, category: 'hardware' as const,
-          title: setTitle, detail: `${prefix}${maskDetail(Number(added))}`,
+          title: setTitle, detail: `${prefix}${maskDetail(added)}`,
           channel
         }] : []),
         ...(cleared ? [{
           severity: 'info' as const, category: 'hardware' as const,
-          title: clearedTitle, detail: `${prefix}${maskDetail(Number(cleared))}`,
+          title: clearedTitle, detail: `${prefix}${maskDetail(cleared)}`,
           channel
         }] : [])
       ];
@@ -90,7 +90,8 @@ function boolEdge(id: string, channel: string, category: EventCategory,
     id,
     detect(prev, next) {
       const a = val(prev, channel), b = val(next, channel);
-      if (a === undefined || b === undefined || a === b) return [];
+      if (a === undefined || b === undefined || a === b ||
+          !Number.isFinite(a) || !Number.isFinite(b)) return [];
       if (b === 1) return [{severity: onSeverity, category, title: onTitle, channel}];
       return [{severity: offSeverity, category, title: offTitle, channel}];
     }
@@ -164,7 +165,9 @@ function incrementDetector(options: IncrementOptions): FrameDetector & {reset():
         const previous = prev?.channels[name];
         let run = runs.get(name);
         if (!run) {
-          if (previous === undefined || value <= previous) continue;
+          if (previous === undefined || !Number.isFinite(value) ||
+              !Number.isFinite(previous) || value <= previous)
+            continue;
           run = {
             severity: options.severity,
             startValue: previous,
@@ -188,13 +191,14 @@ function incrementDetector(options: IncrementOptions): FrameDetector & {reset():
           continue;
         }
 
-        const advanced = value > run.lastValue;
+        const finiteVal = Number.isFinite(value);
+        const advanced = finiteVal && value > run.lastValue;
         if (advanced) {
           run.lastValue = value;
           run.lastAdvance_ns = ts;
         } else {
           run.stillIncreasing = false;
-          if (value < run.lastValue) {
+          if (finiteVal && value < run.lastValue) {
             run.lastValue = value;
             run.lastAdvance_ns = ts;
           }
@@ -228,6 +232,26 @@ function incrementDetector(options: IncrementOptions): FrameDetector & {reset():
           drafts.push(stopDraft(name, run, ts));
           runs.delete(name);
         }
+      }
+      // Close runs whose channel disappeared from the frame past STOP_AFTER_NS
+      // so stale entries never linger in `runs` across channel/dictionary churn.
+      for (const [name, run] of runs) {
+        if (Object.hasOwn(next.channels, name)) continue;
+        run.stillIncreasing = false;
+        if (ts - run.lastAdvance_ns < STOP_AFTER_NS) continue;
+        if (run.pending) {
+          drafts.push({
+            severity: 'info',
+            category: options.category,
+            title: `${name} increasing`,
+            detail: run.sawKnownMode ? 'insufficient continuously enabled observations' :
+                'the robot state was unknown throughout the run',
+            channel: name,
+            t0_ns: run.startTime_ns.toString()
+          });
+        }
+        drafts.push(stopDraft(name, run, ts));
+        runs.delete(name);
       }
       return drafts;
     },
@@ -395,7 +419,8 @@ export function createFrameDetectors(): FrameDetector[] {
       }
       for (const name of seen) {
         const a = val(prev, name), b = val(next, name);
-        if (a === undefined || b === undefined || a === b) continue;
+        if (a === undefined || b === undefined || a === b ||
+            !Number.isFinite(a) || !Number.isFinite(b)) continue;
         drafts.push({
           severity: 'info',
           category: categoryFor(name),

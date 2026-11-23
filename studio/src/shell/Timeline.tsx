@@ -135,8 +135,15 @@ export function Timeline({stepNs, onStepNs, transportError, onTransportError}: {
       <input aria-label="Import telemetry log" type="file" accept=".tlog"
              onChange={async e => {
                const f = e.target.files?.[0];
-               if (f) actions.importLog(f);
                e.target.value = '';
+               if (!f) return;
+               try {
+                 await actions.importLog(f);
+                 onTransportError('');
+               } catch (err) {
+                 onTransportError(
+                     err instanceof Error ? err.message : 'Could not import telemetry log');
+               }
              }}/>
     </label>
     <button onClick={actions.exportLog}>Export log ↗</button>

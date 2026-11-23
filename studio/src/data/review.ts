@@ -116,11 +116,18 @@ function str(source: Record<string, unknown>, key: string, where: string): strin
   return value as string;
 }
 
+const MAX_U64 = 18446744073709551615n;
+
 export function u64(value: unknown, where: string): string {
-  if (typeof value === 'string' && /^\d{1,20}$/.test(value))
-    return BigInt(value).toString();
-  if (typeof value === 'number' && Number.isInteger(value) && value >= 0)
-    return BigInt(value).toString();
+  if (typeof value === 'string' && /^\d{1,20}$/.test(value)) {
+    const parsed = BigInt(value);
+    if (parsed <= MAX_U64) return parsed.toString();
+  }
+  if (typeof value === 'number' && Number.isFinite(value) &&
+      Number.isInteger(value) && value >= 0 && value <= 18446744073709551615) {
+    const parsed = BigInt(value);
+    if (parsed <= MAX_U64) return parsed.toString();
+  }
   return fail(`${where} must be a non-negative integer`);
 }
 
@@ -357,13 +364,16 @@ export function parseTimeline(raw: unknown): ReviewTimeline {
 // `expected` is the number of channels requested; the response must carry
 // exactly that many, in request order, and not one byte more or less.
 export function decodeSeries(buffer: ArrayBuffer, expected: number): SeriesBuckets {
+  if (!Number.isInteger(expected) || expected < 0)
+    fail(`series: invalid expected channel count ${expected}`);
   const view = new DataView(buffer);
   if (buffer.byteLength < 8) fail('series: truncated header');
   const channels = view.getUint32(0, true), buckets = view.getUint32(4, true);
   if (channels !== expected)
     fail(`series: ${channels} channels, expected ${expected}`);
-  const perChannel = buckets * (4 * 8 + 4);
-  if (buffer.byteLength !== 8 + channels * perChannel)
+  if (channels === 0 && buckets !== 0)
+    fail(`series: 0 channels cannot carry ${buckets} buckets`);
+  if (BigInt(buffer.byteLength) !== 8n + BigInt(channels) * BigInt(buckets) * 36n)
     fail(`series: ${buffer.byteLength} bytes for ${channels} channels of ${buckets} buckets`);
   const out: SeriesColumns[] = [];
   let at = 8;
