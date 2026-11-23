@@ -304,7 +304,7 @@ TEST(DriverStationReader, ReadsDuringConstantRefreshesSeeOnlyWholeRefreshes) {
 // with the old generation can drive (ARCHITECTURE.md "Targets"). The loop's
 // sequence here is Robot.cpp's: Read, then the ModeTracker observes the
 // flags and stamps the packet built from the same view.
-// REQ-SAFE-10
+// REQ-SAFE-10, REQ-RT-24
 TEST(DriverStationReader, AViewNotRefreshedWithinTheTimeoutHasNoDriverStation) {
   auto gate = std::make_shared<Gate>();
   const TestClock clock = MakeClock();
