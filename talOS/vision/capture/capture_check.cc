@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
             last_thread_cpu = -1;
     uint64_t frames = 0, missing = 0;
     std::string capture_scheduling;
-    double nominal_ms = 1000.0 / config.fps;
+    double nominal_ms = config.fps > 0.0 ? 1000.0 / config.fps : 0.0;
     talos::vision::FrameMailbox mailbox;
     source->SetConnectionCallback(
         [](talos::vision::ConnectionState state, std::string_view message) {
@@ -239,8 +239,10 @@ int main(int argc, char** argv) {
           const double interval =
               static_cast<double>(capture - last_capture_ns) * 1e-6;
           intervals_ms.push_back(interval);
-          const auto periods = std::lround(interval / nominal_ms);
-          if (periods > 1) missing += static_cast<uint64_t>(periods - 1);
+          if (nominal_ms > 0.0) {
+            const auto periods = std::lround(interval / nominal_ms);
+            if (periods > 1) missing += static_cast<uint64_t>(periods - 1);
+          }
         }
         last_capture_ns = capture;
         last_thread_cpu = cpu;
@@ -253,7 +255,10 @@ int main(int argc, char** argv) {
     const int64_t start_ns = talos::event::Poller::now().nanos();
     if (!source->Start()) throw std::runtime_error("capture did not start");
     const auto mode = source->CurrentMode();
-    nominal_ms = 1000.0 / mode.fps;
+    {
+      std::lock_guard lock(mutex);
+      nominal_ms = mode.fps > 0.0 ? 1000.0 / mode.fps : 0.0;
+    }
     std::printf(
         "requested %ux%u @ %.3f fps; source reports %ux%u @ %.6f fps %s\n",
         config.width, config.height, config.fps, mode.width, mode.height,
@@ -311,7 +316,7 @@ int main(int argc, char** argv) {
     std::printf("wall %.2f s, frames %llu, delivered %.3f fps\n", wall,
                 static_cast<unsigned long long>(frames),
                 static_cast<double>(frames) / wall);
-    if (frames > 1) {
+    if (frames > 1 && last_capture_ns > first_capture_ns) {
       std::printf("first frame %.0f ms after start, steady %.3f fps\n",
                   static_cast<double>(first_capture_ns - start_ns) * 1e-6,
                   static_cast<double>(frames - 1) * 1e9 /

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -332,6 +333,28 @@ TEST(Capture, MissingDeviceFailsAndStopIsIdempotent) {
   source->Stop();
   EXPECT_FALSE(source->Start());
   source->Stop();
+}
+
+TEST(Capture, ConnectionCallbackCanReplaceItselfWhileInvoked) {
+  CameraSourceConfig config;
+  config.device_path = "/talos-nonexistent-camera-device";
+  auto source = CreatePlatformCameraSource(config);
+  if (!source) return;  // Unsupported platforms have no capture implementation.
+  auto token = std::make_shared<int>(42);
+  std::weak_ptr<int> weak = token;
+  bool invoked = false;
+  bool expired_during_callback = true;
+  source->SetConnectionCallback(
+      [&source, &invoked, &expired_during_callback, weak,
+       owned = std::move(token)](ConnectionState, std::string_view) {
+        (void)owned;
+        invoked = true;
+        source->SetConnectionCallback({});
+        expired_during_callback = weak.expired();
+      });
+  EXPECT_FALSE(source->Start());
+  EXPECT_TRUE(invoked);
+  EXPECT_FALSE(expired_during_callback);
 }
 }  // namespace
 }  // namespace talos::vision
